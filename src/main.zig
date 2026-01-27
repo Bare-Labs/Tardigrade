@@ -3,6 +3,8 @@ const http = @import("http.zig");
 
 const MAX_REQUEST_SIZE = 64 * 1024; // 64KB max request size
 const MAX_BODY_SIZE = 1 * 1024 * 1024; // 1MB max body size
+const KEEP_ALIVE_TIMEOUT_MS = 5000; // 5 second idle timeout
+const MAX_REQUESTS_PER_CONNECTION = 100; // Max requests before closing
 
 pub fn main() !void {
     const address = try std.net.Address.parseIp("0.0.0.0", 8069);
@@ -16,75 +18,131 @@ pub fn main() !void {
 
     while (true) {
         const conn = try server.accept();
-        defer conn.stream.close();
-        handleConnection(&conn.stream) catch |err| {
+        handleConnection(conn.stream) catch |err| {
             std.log.err("Connection error: {}", .{err});
         };
+        conn.stream.close();
     }
 }
 
-fn handleConnection(stream: *const std.net.Stream) !void {
+fn handleConnection(stream: std.net.Stream) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var reader = stream.reader();
-    const writer = stream.writer();
+    var request_count: usize = 0;
 
-    // Read request data
-    var buf: [MAX_REQUEST_SIZE]u8 = undefined;
+    // Keep-alive loop
+    while (request_count < MAX_REQUESTS_PER_CONNECTION) {
+        request_count += 1;
+
+        // Read request data with timeout
+        var buf: [MAX_REQUEST_SIZE]u8 = undefined;
+        const read_result = readRequest(stream, &buf, request_count > 1);
+
+        const total_read = read_result.bytes_read;
+        if (total_read == 0) {
+            // Connection closed or timeout
+            return;
+        }
+
+        if (read_result.timed_out) {
+            // Timeout on keep-alive, close gracefully
+            return;
+        }
+
+        const request_data = buf[0..total_read];
+
+        // Parse the request
+        const parse_result = http.Request.parse(allocator, request_data, MAX_BODY_SIZE) catch |err| {
+            std.log.err("Parse error: {}", .{err});
+            try sendParseError(allocator, stream, err, false);
+            return; // Close connection on parse error
+        };
+        var request = parse_result.request;
+        defer request.deinit();
+
+        std.log.info("{s} {s} {s}", .{
+            request.method.toString(),
+            request.uri.path,
+            request.version.toString(),
+        });
+
+        // Determine if we should keep the connection alive
+        const keep_alive = request.keepAlive() and request_count < MAX_REQUESTS_PER_CONNECTION;
+
+        // Handle the request based on method
+        switch (request.method) {
+            .GET, .HEAD => {
+                try serveFile(allocator, request.uri.path, stream, request.method == .HEAD, keep_alive);
+            },
+            else => {
+                var response = http.Response.methodNotAllowed(allocator, "GET, HEAD");
+                defer response.deinit();
+                _ = response.setConnection(keep_alive);
+                try response.write(stream.writer());
+            },
+        }
+
+        // If not keeping alive, we're done
+        if (!keep_alive) {
+            return;
+        }
+    }
+}
+
+const ReadResult = struct {
+    bytes_read: usize,
+    timed_out: bool,
+};
+
+fn readRequest(stream: std.net.Stream, buf: []u8, is_keep_alive: bool) ReadResult {
     var total_read: usize = 0;
 
-    // Read until we have the complete headers (ends with \r\n\r\n)
-    while (total_read < buf.len) {
-        const n = reader.read(buf[total_read..]) catch |err| {
-            std.log.err("Read error: {}", .{err});
-            return err;
-        };
-        if (n == 0) break; // Connection closed
-        total_read += n;
+    // For keep-alive connections, we need to handle timeout for the first read
+    // For initial connection, we can wait indefinitely
+    const initial_timeout: ?u32 = if (is_keep_alive) KEEP_ALIVE_TIMEOUT_MS * 1000 else null; // microseconds
 
+    // Set read timeout for keep-alive
+    if (initial_timeout) |timeout| {
+        stream.handle.setReadTimeout(.{ .sec = 0, .usec = timeout }) catch {};
+    }
+
+    // First read - may timeout on keep-alive
+    const first_read = stream.read(buf[0..]) catch |err| {
+        if (err == error.WouldBlock) {
+            return .{ .bytes_read = 0, .timed_out = true };
+        }
+        return .{ .bytes_read = 0, .timed_out = false };
+    };
+
+    if (first_read == 0) {
+        return .{ .bytes_read = 0, .timed_out = false };
+    }
+
+    total_read = first_read;
+
+    // Remove timeout for subsequent reads
+    stream.handle.setReadTimeout(.{ .sec = 30, .usec = 0 }) catch {};
+
+    // Continue reading until we have complete headers
+    while (total_read < buf.len) {
         // Check if we have complete headers
         if (std.mem.indexOf(u8, buf[0..total_read], "\r\n\r\n")) |_| {
             break;
         }
+
+        const n = stream.read(buf[total_read..]) catch {
+            break;
+        };
+        if (n == 0) break;
+        total_read += n;
     }
 
-    if (total_read == 0) {
-        return; // Empty request, client disconnected
-    }
-
-    const request_data = buf[0..total_read];
-
-    // Parse the request
-    const parse_result = http.Request.parse(allocator, request_data, MAX_BODY_SIZE) catch |err| {
-        std.log.err("Parse error: {}", .{err});
-        try sendParseError(allocator, writer, err);
-        return;
-    };
-    var request = parse_result.request;
-    defer request.deinit();
-
-    std.log.info("{s} {s} {s}", .{
-        request.method.toString(),
-        request.uri.path,
-        request.version.toString(),
-    });
-
-    // Handle the request based on method
-    switch (request.method) {
-        .GET, .HEAD => {
-            try serveFile(allocator, request.uri.path, writer, request.method == .HEAD);
-        },
-        else => {
-            var response = http.Response.methodNotAllowed(allocator, "GET, HEAD");
-            defer response.deinit();
-            try response.write(writer);
-        },
-    }
+    return .{ .bytes_read = total_read, .timed_out = false };
 }
 
-fn sendParseError(allocator: std.mem.Allocator, writer: anytype, err: http.ParseError) !void {
+fn sendParseError(allocator: std.mem.Allocator, stream: std.net.Stream, err: http.ParseError, keep_alive: bool) !void {
     var response = switch (err) {
         error.InvalidMethod => http.Response.notImplemented(allocator),
         error.InvalidVersion => http.Response.httpVersionNotSupported(allocator),
@@ -93,14 +151,18 @@ fn sendParseError(allocator: std.mem.Allocator, writer: anytype, err: http.Parse
         else => http.Response.badRequest(allocator, "Malformed request"),
     };
     defer response.deinit();
-    try response.write(writer);
+    _ = response.setConnection(keep_alive);
+    try response.write(stream.writer());
 }
 
-fn serveFile(allocator: std.mem.Allocator, path: []const u8, writer: anytype, head_only: bool) !void {
+fn serveFile(allocator: std.mem.Allocator, path: []const u8, stream: std.net.Stream, head_only: bool, keep_alive: bool) !void {
+    const writer = stream.writer();
+
     // Prevent path traversal
     if (std.mem.indexOf(u8, path, "..") != null) {
         var response = http.Response.forbidden(allocator);
         defer response.deinit();
+        _ = response.setConnection(keep_alive);
         try response.write(writer);
         return;
     }
@@ -112,6 +174,7 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, writer: anytype, he
         const result = std.fmt.bufPrint(&buffer, "public{s}", .{path}) catch {
             var response = http.Response.uriTooLong(allocator);
             defer response.deinit();
+            _ = response.setConnection(keep_alive);
             try response.write(writer);
             return;
         };
@@ -121,6 +184,7 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, writer: anytype, he
     var file = std.fs.cwd().openFile(fs_path, .{}) catch {
         var response = http.Response.notFound(allocator);
         defer response.deinit();
+        _ = response.setConnection(keep_alive);
         try response.write(writer);
         return;
     };
@@ -130,6 +194,7 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, writer: anytype, he
     const stat = file.stat() catch {
         var response = http.Response.internalServerError(allocator);
         defer response.deinit();
+        _ = response.setConnection(keep_alive);
         try response.write(writer);
         return;
     };
@@ -141,6 +206,7 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, writer: anytype, he
         const content = allocator.alloc(u8, file_size) catch {
             var response = http.Response.internalServerError(allocator);
             defer response.deinit();
+            _ = response.setConnection(keep_alive);
             try response.write(writer);
             return;
         };
@@ -149,6 +215,7 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, writer: anytype, he
         const bytes_read = file.readAll(content) catch {
             var response = http.Response.internalServerError(allocator);
             defer response.deinit();
+            _ = response.setConnection(keep_alive);
             try response.write(writer);
             return;
         };
@@ -156,6 +223,7 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, writer: anytype, he
         const content_type = getContentType(fs_path);
         var response = http.Response.ok(allocator, content[0..bytes_read], content_type);
         defer response.deinit();
+        _ = response.setConnection(keep_alive);
 
         if (head_only) {
             try response.writeHead(writer);
@@ -168,7 +236,7 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, writer: anytype, he
 
         var response = http.Response.init(allocator);
         defer response.deinit();
-        _ = response.setStatus(.ok).setContentType(content_type);
+        _ = response.setStatus(.ok).setContentType(content_type).setConnection(keep_alive);
 
         // Manually build response with streaming body
         try writer.print("{s} {d} {s}\r\n", .{
@@ -206,6 +274,7 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, writer: anytype, he
         try writer.print("Server: {s}/{s}\r\n", .{ http.SERVER_NAME, http.SERVER_VERSION });
         try writer.print("Content-Type: {s}\r\n", .{content_type});
         try writer.print("Content-Length: {d}\r\n", .{file_size});
+        try writer.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
         try writer.writeAll("\r\n");
 
         // Stream body (unless HEAD request)

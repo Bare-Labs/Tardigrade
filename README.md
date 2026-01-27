@@ -1,58 +1,139 @@
-# Simple HTTP Server
+# Simple Server
 
-A minimal HTTP server written in Zig that serves static files from a `public` directory.
+A high-performance HTTP server written in Zig, designed as a modern replacement for nginx.
 
 ## Features
 
-- Serves static files from a `public` directory
-- Handles basic HTTP GET requests
-- Supports serving HTML files
-- Simple and lightweight implementation
+- **Fast**: Built with Zig for predictable performance and low memory usage
+- **Static File Serving**: Serves files from a configurable directory with proper MIME types
+- **HTTP/1.1 Compliant**: Full request parsing with header support
+- **Keep-Alive Connections**: Persistent connections for improved performance
+- **30+ MIME Types**: Automatic content-type detection for common file extensions
+- **Security**: Path traversal protection, request size limits
 
-## Prerequisites
+## Quick Start
 
-- Zig 0.14.1 or later
+### Prerequisites
 
-## Project Structure
+- [Zig](https://ziglang.org/) 0.14.1 or later
 
-```
-.
-├── src/
-│   └── main.zig    # Main server implementation
-├── public/         # Directory for static files
-│   └── index.html  # Default page served at root
-└── README.md
-```
+### Build and Run
 
-## Building and Running
-
-Build and run the server:
 ```bash
+# Clone the repository
+git clone https://gitlab.com/joseph.caruso/simple-server.git
+cd simple-server
+
+# Build and run
 zig build run
 ```
 
-The server will start listening on `0.0.0.0:8069`.
+The server starts on `http://localhost:8069` by default.
+
+### Build for Production
+
+```bash
+# Build optimized release binary
+zig build -Doptimize=ReleaseFast
+
+# Run the binary directly
+./zig-out/bin/simple_server
+```
 
 ## Usage
 
-Once the server is running, you can access it through your web browser or using curl:
+### Serving Static Files
 
-```bash
-# Access the root page
-curl http://localhost:8069/
+Place your files in the `public/` directory:
 
-# Access other files in the public directory
-curl http://localhost:8069/other-file.html
+```
+public/
+├── index.html      # Served at /
+├── css/
+│   └── style.css   # Served at /css/style.css
+├── js/
+│   └── app.js      # Served at /js/app.js
+└── images/
+    └── logo.png    # Served at /images/logo.png
 ```
 
-## Implementation Details
+### Example Requests
 
-- The server listens on port 8069
-- Supports basic HTTP GET requests
-- Serves files from the `public` directory
-- Returns 404 for non-existent files
-- Returns 405 for non-GET requests
+```bash
+# Get the index page
+curl http://localhost:8069/
+
+# Get a specific file
+curl http://localhost:8069/css/style.css
+
+# HEAD request (headers only)
+curl -I http://localhost:8069/
+
+# Check response headers
+curl -v http://localhost:8069/
+```
+
+### Response Headers
+
+All responses include:
+- `Date`: Current timestamp in RFC 7231 format
+- `Server`: Server identification (simple-server/0.3.0)
+- `Content-Type`: Automatically detected from file extension
+- `Content-Length`: Size of response body
+
+## Supported MIME Types
+
+| Extension | Content-Type |
+|-----------|--------------|
+| .html, .htm | text/html; charset=utf-8 |
+| .css | text/css; charset=utf-8 |
+| .js | text/javascript; charset=utf-8 |
+| .json | application/json |
+| .png | image/png |
+| .jpg, .jpeg | image/jpeg |
+| .gif | image/gif |
+| .svg | image/svg+xml |
+| .pdf | application/pdf |
+| .wasm | application/wasm |
+| ... | (30+ types supported) |
+
+## HTTP Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | OK - File served successfully |
+| 400 | Bad Request - Malformed HTTP request |
+| 403 | Forbidden - Path traversal attempt blocked |
+| 404 | Not Found - File does not exist |
+| 405 | Method Not Allowed - Only GET/HEAD supported |
+| 413 | Payload Too Large - Request body exceeds limit |
+| 414 | URI Too Long - Request URI exceeds limit |
+| 431 | Request Header Fields Too Large |
+| 500 | Internal Server Error |
+| 501 | Not Implemented - Unknown HTTP method |
+| 505 | HTTP Version Not Supported |
+
+## Project Status
+
+This project is under active development. See [CHANGELOG.md](CHANGELOG.md) for recent changes.
+
+### Roadmap
+
+- [x] HTTP/1.1 request parsing
+- [x] Response builder with proper headers
+- [x] MIME type detection
+- [x] Error responses
+- [ ] Keep-alive connections
+- [ ] Configuration file
+- [ ] TLS/HTTPS support
+- [ ] Reverse proxy
+- [ ] Load balancing
+- [ ] HTTP/2
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 
-This project is open source and available under the MIT License. 
+This project is open source and available under the MIT License.
