@@ -86,6 +86,11 @@ pub const Response = struct {
         return self.setHeader("Content-Type", content_type);
     }
 
+    /// Set Connection header (keep-alive or close)
+    pub fn setConnection(self: *Response, keep_alive: bool) *Response {
+        return self.setHeader("Connection", if (keep_alive) "keep-alive" else "close");
+    }
+
     /// Write the response to a writer
     pub fn write(self: *Response, writer: anytype) !void {
         // Status line

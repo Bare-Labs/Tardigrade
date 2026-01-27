@@ -2,3 +2,4 @@ zig-out/
 .zig-cache/
 changes/
 CLAUDE.md
+PLAN.md
