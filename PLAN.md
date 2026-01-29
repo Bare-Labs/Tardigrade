@@ -66,7 +66,7 @@ Based on comprehensive research of nginx capabilities, here is everything needed
 ### 1.2 Static File Serving
 - [x] MIME type detection (50+ common types)
 - [x] Directory index (index.html, index.htm)
-- [ ] Directory listing (autoindex)
+ - [x] Directory listing (autoindex)
 - [ ] Range requests (partial content, byte ranges)
 - [ ] ETag generation and If-None-Match
 - [ ] Last-Modified and If-Modified-Since
@@ -77,6 +77,8 @@ Based on comprehensive research of nginx capabilities, here is everything needed
 - [ ] Custom error pages (400, 401, 403, 404, 500, 502, 503, 504)
 - [ ] Error logging with levels
 - [ ] Graceful error responses
+
+Resolved: custom error pages implemented and samples added under `public/errors/`.
 
 ### 1.4 Basic Logging
 - [ ] Access log (combined format)

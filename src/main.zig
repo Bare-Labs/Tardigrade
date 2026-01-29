@@ -5,6 +5,7 @@ const MAX_REQUEST_SIZE = 64 * 1024; // 64KB max request size
 const MAX_BODY_SIZE = 1 * 1024 * 1024; // 1MB max body size
 const KEEP_ALIVE_TIMEOUT_MS = 5000; // 5 second idle timeout
 const MAX_REQUESTS_PER_CONNECTION = 100; // Max requests before closing
+const AUTO_INDEX = true; // enable directory listings when no index file
 
 pub fn main() !void {
     const address = try std.net.Address.parseIp("0.0.0.0", 8069);
@@ -225,9 +226,18 @@ fn serveFile(allocator: std.mem.Allocator, path: []const u8, stream: std.net.Str
             return serveFileContent(allocator, p, writer, head_only, keep_alive);
         }
 
-        // No index file found; if auto-index is enabled, serve directory listing
-        if (isAutoIndexEnabled()) {
-            try serveDirectoryListing(allocator, fs_path, path, writer, head_only, keep_alive);
+        // No index file found; generate autoindex listing if enabled
+        if (AUTO_INDEX or isAutoIndexEnabled()) {
+            const body = try http.autoindex.generateAutoIndex(allocator, fs_path, path);
+            var response = http.Response.init(allocator);
+            _ = response.setStatus(.ok).setBodyOwned(body).setContentType("text/html; charset=utf-8");
+            defer response.deinit();
+            _ = response.setConnection(keep_alive);
+            if (head_only) {
+                try response.writeHead(writer);
+            } else {
+                try response.write(writer);
+            }
             return;
         }
 
@@ -443,7 +453,7 @@ fn urlEncodeAppend(list: *std.ArrayList(u8), s: []const u8) !void {
 
         // Reserved or unsafe characters
         switch (b) {
-            '#' , '%' , '?' , '&' , '"' , '\'' , '<' , '>' => {
+            '#', '%', '?', '&', '"', '\'', '<', '>' => {
                 try list.append('%');
                 try list.append(hex[(b >> 4) & 0xF]);
                 try list.append(hex[b & 0xF]);

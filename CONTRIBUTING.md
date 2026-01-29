@@ -210,17 +210,7 @@ pkill simple_server
 
 ### Troubleshooting tests
 
-If `zig build test` appears to run but prints no tests or no output, try the following steps:
-
-- Ensure you are running the command from the repository root (where `build.zig` lives).
-- Run tests for a single module to confirm they run: `zig test src/http/response.zig`.
-- If individual module tests run but `zig build test` does not, verify `build.zig` exposes the test step and that the root module imports the modules with tests.
-- Check your Zig version (`zig version`) — use Zig 0.14.x as the project expects.
-- For CI/debugging, run individual module tests or create a small test runner file that imports modules with tests and run `zig test` on it.
-
-If you want, report the `zig` output and I can help diagnose further.
-
-Quick visibility tip: when everything passes `zig build test` can appear to print nothing. To force a summary of all test results, run:
+When everything passes `zig build test` can appear to print nothing. To force a summary of all test results, run:
 
 ```bash
 zig build test --summary all
@@ -246,24 +236,6 @@ When contributing, please ensure:
 ## Project Roadmap
 
 See PLAN.md for the complete nginx feature parity roadmap and contribution instructions.
-
-### Current Priority (Tier 1: MVP)
-
-1. ~~HTTP/1.1 request parser~~ ✅
-2. ~~Response builder with proper headers~~ ✅
-3. ~~MIME type detection~~ ✅
-4. ~~Error responses~~ ✅
-5. Keep-alive connections (in progress)
-6. Basic logging
-
-### Next Up (Tier 2: Production Static Server)
-
-7. Async I/O (epoll/kqueue)
-8. Worker threads
-9. Configuration file
-10. Virtual hosts
-11. Location routing
-12. TLS termination
 
 ## Contributing to the Plan
 
