@@ -13,6 +13,7 @@ pub const headers = @import("http/headers.zig");
 pub const request = @import("http/request.zig");
 pub const status = @import("http/status.zig");
 pub const response = @import("http/response.zig");
+pub const autoindex = @import("http/autoindex.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;
