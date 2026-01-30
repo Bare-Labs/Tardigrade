@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Add `Last-Modified` header for static files and support `If-Modified-Since` (returns 304 Not Modified when appropriate).
 - Add robust HTTP-date parser supporting RFC1123, RFC850, and asctime formats for conditional GET handling.
 - Add directory autoindex (directory listing) for directories without index files.
+ - Add `ETag` header for static files and support `If-None-Match` (returns 304 Not Modified when matching). ETag is generated from file size and mtime to avoid costly content hashing.
 
 ## [0.4.1] - 2026-01-27
 

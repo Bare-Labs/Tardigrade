@@ -294,7 +294,7 @@ fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_pat
     var msecs_opt: ?usize = null;
     if (os_stat) |s| {
         // Attempt to read mtime seconds (platform dependent field name)
-        const msecs = @intCast(usize, s.st_mtime);
+        const msecs = @as(usize, s.st_mtime);
         msecs_opt = msecs;
 
         const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = msecs };
@@ -341,10 +341,72 @@ fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_pat
         };
 
         const content_type = getContentType(fs_path);
+
+        // Generate ETag (based on size + mtime) for conditional requests
+        const etag_buf = try http.etag.generateETag(allocator, bytes_read, msecs_opt);
+        // Check If-None-Match before further processing
+        if (request.headers.get("if-none-match")) |inm| {
+            if (http.etag.matchesIfNoneMatch(etag_buf, inm)) {
+                var not_mod = http.Response.init(allocator);
+                _ = not_mod.setStatus(.not_modified);
+                _ = not_mod.setHeader("ETag", etag_buf);
+                _ = not_mod.setConnection(keep_alive);
+                // headers.append duplicates the header value; free our buffer now
+                allocator.free(etag_buf);
+                defer not_mod.deinit();
+                if (head_only) {
+                    try not_mod.writeHead(writer);
+                } else {
+                    try not_mod.write(writer);
+                }
+                return;
+            }
+        }
+
+        // Range support for small files only
+        if (request.headers.get("range")) |range_hdr| {
+            const total = bytes_read;
+            if (parseRangeHeader(range_hdr, total)) |r| {
+                // Valid range - return 206
+                const slice = content[r.start .. r.end + 1];
+                var resp = http.Response.init(allocator);
+                _ = resp.setStatus(.partial_content).setBody(slice).setContentType(content_type).setHeader("Content-Range", std.fmt.allocPrint(allocator, "bytes {d}-{d}/{d}", .{ r.start, r.end, total }) catch "");
+                if (last_mod_slice.len != 0) _ = resp.setHeader("Last-Modified", last_mod_slice);
+                _ = resp.setHeader("ETag", etag_buf);
+                // headers.append duplicates the header value; free our buffer now
+                allocator.free(etag_buf);
+                defer resp.deinit();
+                _ = resp.setConnection(keep_alive);
+                if (head_only) {
+                    try resp.writeHead(writer);
+                } else {
+                    try resp.write(writer);
+                }
+                return;
+            } else {
+                // Malformed or unsatisfiable -> 416
+                var resp = http.Response.init(allocator);
+                _ = resp.setStatus(.range_not_satisfiable).setHeader("Content-Range", std.fmt.allocPrint(allocator, "bytes */{d}", .{bytes_read}) catch "");
+                // free etag buffer since we won't use it further
+                allocator.free(etag_buf);
+                defer resp.deinit();
+                _ = resp.setConnection(keep_alive);
+                if (head_only) {
+                    try resp.writeHead(writer);
+                } else {
+                    try resp.write(writer);
+                }
+                return;
+            }
+        }
+
         var response = http.Response.ok(allocator, content[0..bytes_read], content_type);
         if (last_mod_slice.len != 0) {
             _ = response.setHeader("Last-Modified", last_mod_slice);
         }
+        _ = response.setHeader("ETag", etag_buf);
+        // free etag buffer since headers.append duplicates it
+        allocator.free(etag_buf);
 
         // Conditional GET: parse If-Modified-Since and compare to file mtime
         if (request.headers.get("if-modified-since")) |ims| {
@@ -380,6 +442,25 @@ fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_pat
         var response = http.Response.init(allocator);
         if (last_mod_slice.len != 0) {
             _ = response.setHeader("Last-Modified", last_mod_slice);
+        }
+        // Generate ETag for streaming responses (based on size + mtime)
+        const etag_buf = try http.etag.generateETag(allocator, file_size, msecs_opt);
+        _ = response.setHeader("ETag", etag_buf);
+        // If client provided If-None-Match and it matches, return 304
+        if (request.headers.get("if-none-match")) |inm| {
+            if (http.etag.matchesIfNoneMatch(etag_buf, inm)) {
+                var not_mod = http.Response.init(allocator);
+                _ = not_mod.setStatus(.not_modified).setHeader("ETag", etag_buf).setConnection(keep_alive);
+                // free our etag buffer now that headers copied
+                allocator.free(etag_buf);
+                defer not_mod.deinit();
+                if (head_only) {
+                    try not_mod.writeHead(writer);
+                } else {
+                    try not_mod.write(writer);
+                }
+                return;
+            }
         }
         defer response.deinit();
         _ = response.setStatus(.ok).setContentType(content_type).setConnection(keep_alive);
@@ -421,6 +502,13 @@ fn serveFileContent(allocator: std.mem.Allocator, request: *http.Request, fs_pat
         try writer.print("Content-Type: {s}\r\n", .{content_type});
         try writer.print("Content-Length: {d}\r\n", .{file_size});
         try writer.print("Connection: {s}\r\n", .{if (keep_alive) "keep-alive" else "close"});
+        // Print Last-Modified and ETag headers if present
+        if (last_mod_slice.len != 0) {
+            try writer.print("Last-Modified: {s}\r\n", .{last_mod_slice});
+        }
+        try writer.print("ETag: {s}\r\n", .{etag_buf});
+        // free etag buffer after writing
+        allocator.free(etag_buf);
         try writer.writeAll("\r\n");
 
         // Stream body (unless HEAD request)
@@ -494,6 +582,41 @@ fn getContentType(path: []const u8) []const u8 {
     });
 
     return content_types.get(extension) orelse "application/octet-stream";
+}
+
+/// Parse a single `Range: bytes=` header. Returns start..end (inclusive) or null on parse error.
+pub fn parseRangeHeader(range_hdr: []const u8, total: usize) ?struct { start: usize, end: usize } {
+    // Expect prefix "bytes="
+    if (!std.mem.startsWith(u8, range_hdr, "bytes=")) return null;
+    const spec = range_hdr[6..];
+    // Only support single range (no commas)
+    if (std.mem.indexOf(u8, spec, ",") != null) return null;
+
+    // Find dash
+    const dash = std.mem.indexOf(u8, spec, "-") orelse return null;
+    const first = spec[0..dash];
+    const second = spec[dash + 1 ..];
+
+    if (first.len == 0) {
+        // suffix: -N => last N bytes
+        const n = std.fmt.parseInt(usize, second, 10) catch return null;
+        if (n == 0) return null;
+        if (n > total) return .{ .start = 0, .end = total - 1 };
+        const start = total - n;
+        return .{ .start = start, .end = total - 1 };
+    } else {
+        const start = std.fmt.parseInt(usize, first, 10) catch return null;
+        if (second.len == 0) {
+            if (start >= total) return null;
+            return .{ .start = start, .end = total - 1 };
+        } else {
+            const end = std.fmt.parseInt(usize, second, 10) catch return null;
+            if (start > end) return null;
+            if (start >= total) return null;
+            const clamped_end = if (end >= total) total - 1 else end;
+            return .{ .start = start, .end = clamped_end };
+        }
+    }
 }
 
 /// Return true if environment enables auto-indexing.
