@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Echoes valid client-provided IDs in responses.
   - Generates `tg-<timestamp>-<random>` IDs when missing or invalid.
   - Applies to static-file and parse-error responses.
+- Bearer authorization helpers via `src/http/auth.zig`:
+  - Parses `Authorization: Bearer <token>` headers case-insensitively.
+  - Validates bearer token character set and length.
+  - Supports optional token validation hook callbacks for pluggable auth providers.
 
 # [0.6.0] - 2026-01-29
 

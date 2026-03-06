@@ -54,13 +54,16 @@ Priority: CRITICAL
 These features allow Tardigrade to become the Panda/BearClaw gateway early.
 
 ### 0.1 Identity & Authentication
-- [ ] Bearer token authentication
+- [x] Bearer token authentication
 - [ ] Device identity registration
 - [ ] Public/private key device authentication
 - [ ] Auth middleware pipeline
 - [ ] Request auth context propagation
-- [ ] Token validation hooks
+- [x] Token validation hooks
 - [ ] Token expiration / refresh logic
+
+Resolved: HTTP bearer token parsing/validation is implemented in `src/http/auth.zig`, including an optional validation hook callback for pluggable token verification.
+Decision: core HTTP layer validates RFC6750-style token shape and delegates token trust decisions to caller-provided hooks to keep auth-provider logic decoupled.
 
 ### 0.2 Session Management
 - [ ] Session token issuance
