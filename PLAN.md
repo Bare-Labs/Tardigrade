@@ -82,10 +82,12 @@ Resolved: HTTP bearer token parsing/validation is implemented in `src/http/auth.
 Decision: core HTTP layer validates RFC6750-style token shape and delegates token trust decisions to caller-provided hooks to keep auth-provider logic decoupled.
 
 ### 0.2 Session Management
-- [ ] Session token issuance
-- [ ] Session storage abstraction
-- [ ] Device session tracking
-- [ ] Revocation support
+- [x] Session token issuance
+- [x] Session storage abstraction
+- [x] Device session tracking
+- [x] Revocation support
+
+Resolved: Session management implemented in `src/http/session.zig`. In-memory session store with cryptographic token generation (32 bytes / 256 bits), per-identity revocation, device ID tracking, idle TTL expiry, and max-session enforcement. Gateway endpoints: POST /v1/sessions (create), DELETE /v1/sessions (revoke), GET /v1/sessions (list). Sessions accepted as auth alternative to bearer tokens on /v1/chat.
 
 ### 0.3 API Gateway Core
 - [x] JSON request validation
@@ -102,10 +104,12 @@ Resolved: Idempotency key support implemented in `src/http/idempotency.zig` with
 Resolved: Request metadata injection handled by `RequestContext` which captures client IP, API version, identity, and timing.
 
 ### 0.4 Agent Command Routing
-- [ ] structured command routing
-- [ ] upstream request envelope
-- [ ] authenticated request forwarding
-- [ ] request auditing
+- [x] structured command routing
+- [x] upstream request envelope
+- [x] authenticated request forwarding
+- [x] request auditing
+
+Resolved: Command routing implemented in `src/http/command.zig`. Structured command envelope with typed commands (chat, tool.list, tool.run, status), params validation, and inline idempotency key support. Gateway `POST /v1/commands` endpoint wraps commands in upstream envelope with identity, correlation ID, client IP, API version, and timestamp context. Structured `CommandAudit` log for every command.
 
 ## PHASE 1: Core HTTP Server Foundation
 
@@ -280,9 +284,11 @@ Secrets may include:
 ## PHASE 6: Security Features
 
 ### 6.1 Access Control
-- [ ] allow/deny directives (IP-based)
-- [ ] CIDR notation support
+- [x] allow/deny directives (IP-based)
+- [x] CIDR notation support
 - [ ] Geo-based blocking (via external data)
+
+Resolved: IP access control implemented in `src/http/access_control.zig`. Supports allow/deny rules with CIDR notation (IPv4 and IPv6). First-match-wins evaluation order. Configurable via `TARDIGRADE_ACCESS_CONTROL` env var (e.g. `"allow 10.0.0.0/8, deny 0.0.0.0/0"`). Applied before rate limiting in the gateway pipeline.
 
 ### 6.2 Rate Limiting
 - [x] limit_req (request rate)

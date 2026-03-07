@@ -10,6 +10,8 @@ const GatewayState = struct {
     rate_limiter: ?http.rate_limiter.RateLimiter,
     idempotency_store: ?http.idempotency.IdempotencyStore,
     security_headers: http.security_headers.SecurityHeaders,
+    session_store: ?http.session.SessionStore,
+    access_control: ?http.access_control.AccessControl,
 };
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
@@ -30,10 +32,20 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             http.security_headers.SecurityHeaders.api
         else
             http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" },
+        .session_store = if (cfg.session_ttl_seconds > 0)
+            http.session.SessionStore.init(state_allocator, cfg.session_ttl_seconds, cfg.session_max)
+        else
+            null,
+        .access_control = if (cfg.access_control_rules.len > 0)
+            http.access_control.AccessControl.fromConfig(state_allocator, cfg.access_control_rules, .allow) catch null
+        else
+            null,
     };
     defer {
         if (state.rate_limiter) |*rl| rl.deinit();
         if (state.idempotency_store) |*is| is.deinit();
+        if (state.session_store) |*ss| ss.deinit();
+        if (state.access_control) |*acl| acl.deinit();
     }
 
     const address = try std.net.Address.parseIp(cfg.listen_host, cfg.listen_port);
@@ -51,6 +63,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (state.idempotency_store != null) {
         std.log.info("Idempotency cache enabled: TTL {d}s", .{cfg.idempotency_ttl_seconds});
+    }
+    if (state.session_store != null) {
+        std.log.info("Session management enabled: TTL {d}s, max {d}", .{ cfg.session_ttl_seconds, cfg.session_max });
+    }
+    if (state.access_control != null) {
+        std.log.info("IP access control enabled", .{});
     }
 
     while (true) {
@@ -99,6 +117,15 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         ctx.setIdempotencyKey(idem_key);
     }
 
+    // --- IP Access Control ---
+    if (state.access_control) |*acl| {
+        if (acl.check(client_ip) == .denied) {
+            try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, false, state);
+            ctx.auditLog(request.uri.path, 403);
+            return;
+        }
+    }
+
     // --- Rate Limiting ---
     if (state.rate_limiter) |*rl| {
         if (rl.allow(client_ip)) |rl_result| {
@@ -132,6 +159,273 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         }
     }
 
+    // --- POST /v1/sessions (create session) ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
+        if (state.session_store == null) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 404);
+            return;
+        }
+
+        // Requires bearer auth to create a session
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (!auth_result.ok) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 401);
+            return;
+        }
+        const identity = auth_result.token_hash orelse "-";
+        ctx.setIdentity(identity);
+
+        // Optional device_id from JSON body
+        var device_id: ?[]const u8 = null;
+        if (request.body) |body| {
+            if (isJsonContentType(request.contentType())) {
+                device_id = parseDeviceId(allocator, body) catch null;
+            }
+        }
+        defer if (device_id) |d| allocator.free(d);
+
+        const session_token = state.session_store.?.create(identity, client_ip, device_id) catch |err| {
+            const msg = switch (err) {
+                error.TooManySessions => "Too many active sessions",
+                else => "Session creation failed",
+            };
+            try sendApiError(allocator, writer, .too_many_requests, "rate_limited", msg, correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 429);
+            return;
+        };
+
+        const resp_body = try std.fmt.allocPrint(allocator, "{{\"session_token\":\"{s}\"}}", .{session_token});
+        defer allocator.free(resp_body);
+
+        var response = http.Response.json(allocator, resp_body);
+        defer response.deinit();
+        _ = response.setStatus(.created)
+            .setConnection(false)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id)
+            .setHeader(http.session.SESSION_HEADER, session_token);
+        state.security_headers.apply(&response);
+        try response.write(writer);
+        ctx.auditLog("/v1/sessions", 201);
+        return;
+    }
+
+    // --- DELETE /v1/sessions (revoke session) ---
+    if (request.method == .DELETE and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
+        if (state.session_store == null) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 404);
+            return;
+        }
+
+        const session_token = http.session.fromHeaders(&request.headers) orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing or invalid X-Session-Token", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 400);
+            return;
+        };
+
+        const revoked = state.session_store.?.revoke(session_token);
+        const resp_body = if (revoked)
+            "{\"revoked\":true}"
+        else
+            "{\"revoked\":false}";
+
+        var response = http.Response.json(allocator, resp_body);
+        defer response.deinit();
+        _ = response.setConnection(false)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        state.security_headers.apply(&response);
+        try response.write(writer);
+        ctx.auditLog("/v1/sessions", 200);
+        return;
+    }
+
+    // --- GET /v1/sessions (list sessions for identity) ---
+    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
+        if (state.session_store == null) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 404);
+            return;
+        }
+
+        // Requires bearer auth
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (!auth_result.ok) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 401);
+            return;
+        }
+        const identity = auth_result.token_hash orelse "-";
+
+        const sessions = state.session_store.?.listByIdentity(allocator, identity) catch {
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to list sessions", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 500);
+            return;
+        };
+        defer allocator.free(sessions);
+
+        const resp_body = try std.fmt.allocPrint(allocator, "{{\"active_sessions\":{d}}}", .{sessions.len});
+        defer allocator.free(resp_body);
+
+        var response = http.Response.json(allocator, resp_body);
+        defer response.deinit();
+        _ = response.setConnection(false)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        state.security_headers.apply(&response);
+        try response.write(writer);
+        ctx.auditLog("/v1/sessions", 200);
+        return;
+    }
+
+    // --- POST /v1/commands (structured command routing) ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/commands")) {
+        // --- Auth (bearer token or session token) ---
+        var cmd_authenticated = false;
+        const cmd_auth_result = authorizeRequest(cfg, &request.headers);
+        if (cmd_auth_result.ok) {
+            ctx.setIdentity(cmd_auth_result.token_hash orelse "-");
+            cmd_authenticated = true;
+        }
+        if (!cmd_authenticated) {
+            if (state.session_store) |*ss| {
+                if (http.session.fromHeaders(&request.headers)) |session_token| {
+                    if (ss.validate(session_token)) |session| {
+                        ctx.setIdentity(session.identity);
+                        cmd_authenticated = true;
+                    }
+                }
+            }
+        }
+        if (!cmd_authenticated) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            ctx.auditLog("/v1/commands", 401);
+            return;
+        }
+
+        // --- Content-Type validation ---
+        if (!isJsonContentType(request.contentType())) {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, false, state);
+            ctx.auditLog("/v1/commands", 400);
+            return;
+        }
+
+        // --- Body parsing ---
+        const cmd_body = request.body orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, false, state);
+            ctx.auditLog("/v1/commands", 400);
+            return;
+        };
+
+        var cmd = http.command.parseCommand(allocator, cmd_body) catch |err| {
+            const msg = switch (err) {
+                http.command.ParseError.MissingCommand => "Missing 'command' field",
+                http.command.ParseError.UnknownCommand => "Unknown command type",
+                http.command.ParseError.InvalidParams => "Invalid or missing 'params' object",
+                else => "Invalid command envelope",
+            };
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, false, state);
+            ctx.auditLog("/v1/commands", 400);
+            return;
+        };
+        defer cmd.deinit(allocator);
+
+        // --- Idempotency (inline key overrides header) ---
+        const effective_idem_key = cmd.idempotency_key orelse ctx.idempotency_key;
+        if (effective_idem_key) |idem_key| {
+            if (state.idempotency_store) |*store| {
+                if (store.get(idem_key)) |cached| {
+                    var response = http.Response.init(allocator);
+                    defer response.deinit();
+                    _ = response.setStatus(@enumFromInt(cached.status))
+                        .setBody(cached.body)
+                        .setContentType(cached.content_type)
+                        .setConnection(false)
+                        .setHeader(http.correlation.HEADER_NAME, correlation_id)
+                        .setHeader("X-Idempotent-Replayed", "true");
+                    state.security_headers.apply(&response);
+                    try response.write(writer);
+                    ctx.auditLog("/v1/commands", cached.status);
+                    return;
+                }
+            }
+        }
+
+        // --- Build upstream envelope with context ---
+        const envelope = http.command.buildUpstreamEnvelope(
+            allocator,
+            cmd.command_type,
+            cmd.params_raw,
+            correlation_id,
+            ctx.identity orelse "-",
+            client_ip,
+            ctx.api_version,
+        ) catch {
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to build upstream request", correlation_id, false, state);
+            ctx.auditLog("/v1/commands", 500);
+            return;
+        };
+        defer allocator.free(envelope);
+
+        // --- Forward to upstream ---
+        const upstream_path = cmd.command_type.upstreamPath();
+        const cmd_proxy_result = proxyCommand(allocator, cfg, upstream_path, envelope, correlation_id) catch {
+            try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, false, state);
+            // Audit
+            const cmd_audit = http.command.CommandAudit{
+                .command = cmd.command_type.toString(),
+                .correlation_id = correlation_id,
+                .identity = ctx.identity orelse "-",
+                .status = 504,
+                .latency_ms = ctx.elapsedMs(),
+            };
+            cmd_audit.log();
+            return;
+        };
+        defer allocator.free(cmd_proxy_result.body);
+
+        var cmd_final_status: u16 = cmd_proxy_result.status;
+        var cmd_final_body: []const u8 = cmd_proxy_result.body;
+        var cmd_error_body: ?[]const u8 = null;
+        if (cmd_proxy_result.status != 200) {
+            const mapped = mapUpstreamError(cmd_proxy_result.status);
+            cmd_final_status = mapped.status;
+            cmd_final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+            cmd_error_body = cmd_final_body;
+        }
+        defer {
+            if (cmd_error_body) |eb| allocator.free(eb);
+        }
+
+        var response = http.Response.json(allocator, cmd_final_body);
+        defer response.deinit();
+        _ = response.setStatus(@enumFromInt(cmd_final_status))
+            .setConnection(false)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        state.security_headers.apply(&response);
+        try response.write(writer);
+
+        // --- Store idempotency result ---
+        if (effective_idem_key) |idem_key| {
+            if (state.idempotency_store) |*store| {
+                store.put(idem_key, cmd_final_status, cmd_final_body, JSON_CONTENT_TYPE) catch |err| {
+                    std.log.warn("idempotency store error: {}", .{err});
+                };
+            }
+        }
+
+        // --- Structured command audit ---
+        const audit = http.command.CommandAudit{
+            .command = cmd.command_type.toString(),
+            .correlation_id = correlation_id,
+            .identity = ctx.identity orelse "-",
+            .status = cmd_final_status,
+            .latency_ms = ctx.elapsedMs(),
+        };
+        audit.log();
+        return;
+    }
+
     // --- POST /v1/chat ---
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/chat")) {
         // --- Idempotency check ---
@@ -154,14 +448,30 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             }
         }
 
-        // --- Auth ---
+        // --- Auth (bearer token or session token) ---
+        var authenticated = false;
+        // Try bearer token first
         const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
+        if (auth_result.ok) {
+            ctx.setIdentity(auth_result.token_hash orelse "-");
+            authenticated = true;
+        }
+        // Fall back to session token
+        if (!authenticated) {
+            if (state.session_store) |*ss| {
+                if (http.session.fromHeaders(&request.headers)) |session_token| {
+                    if (ss.validate(session_token)) |session| {
+                        ctx.setIdentity(session.identity);
+                        authenticated = true;
+                    }
+                }
+            }
+        }
+        if (!authenticated) {
             try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
             ctx.auditLog("/v1/chat", 401);
             return;
         }
-        ctx.setIdentity(auth_result.token_hash orelse "-");
 
         // --- Content-Type validation ---
         if (!isJsonContentType(request.contentType())) {
@@ -265,6 +575,20 @@ fn isJsonContentType(content_type: ?[]const u8) bool {
     return std.mem.indexOf(u8, lower, JSON_CONTENT_TYPE) != null;
 }
 
+fn parseDeviceId(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    const device_val = obj.get("device_id") orelse return error.NoDeviceId;
+    if (device_val != .string) return error.InvalidDeviceId;
+
+    const device_id = std.mem.trim(u8, device_val.string, " \t\r\n");
+    if (device_id.len == 0) return error.EmptyDeviceId;
+    if (device_id.len > 256) return error.DeviceIdTooLong;
+    return try allocator.dupe(u8, device_id);
+}
+
 fn parseChatMessage(allocator: std.mem.Allocator, body: []const u8, max_len: usize) ![]const u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
     defer parsed.deinit();
@@ -303,6 +627,34 @@ fn proxyChat(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, m
         .location = .{ .url = url },
         .method = .POST,
         .payload = request_body,
+        .response_storage = .{ .dynamic = &body },
+        .headers = .{ .content_type = .{ .override = "application/json" } },
+        .extra_headers = &[_]std.http.Header{
+            .{ .name = http.correlation.HEADER_NAME, .value = correlation_id },
+        },
+    };
+
+    const result = try client.fetch(opts);
+    return .{
+        .status = @intFromEnum(result.status),
+        .body = try body.toOwnedSlice(),
+    };
+}
+
+fn proxyCommand(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig, upstream_path: []const u8, envelope: []const u8, correlation_id: []const u8) !ProxyResult {
+    const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ cfg.upstream_base_url, upstream_path });
+    defer allocator.free(url);
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var body = std.ArrayList(u8).init(allocator);
+    errdefer body.deinit();
+
+    const opts = std.http.Client.FetchOptions{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = envelope,
         .response_storage = .{ .dynamic = &body },
         .headers = .{ .content_type = .{ .override = "application/json" } },
         .extra_headers = &[_]std.http.Header{
@@ -418,6 +770,9 @@ test "authorizeRequest accepts valid hash" {
         .rate_limit_burst = 0,
         .security_headers_enabled = false,
         .idempotency_ttl_seconds = 0,
+        .session_ttl_seconds = 0,
+        .session_max = 0,
+        .access_control_rules = "",
     };
 
     var headers = http.Headers.init(allocator);

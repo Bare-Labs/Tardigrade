@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.0] - 2026-03-xx
+
+### Added
+- IP access control (`src/http/access_control.zig`):
+  - Allow/deny rules with CIDR notation support (IPv4 and IPv6).
+  - First-match-wins evaluation order (nginx-style).
+  - IPv4 and IPv6 address parsing with full CIDR prefix matching.
+  - Configurable via `TARDIGRADE_ACCESS_CONTROL` env var.
+  - Example: `"allow 10.0.0.0/8, deny 0.0.0.0/0"`.
+
+### Changed
+- Edge gateway applies IP access control before rate limiting (returns 403 Forbidden).
+- Edge config extended with `access_control_rules` field.
+
+## [0.10.0] - 2026-03-xx
+
+### Added
+- Structured command routing (`src/http/command.zig`):
+  - Command envelope format with typed commands (`chat`, `tool.list`, `tool.run`, `status`).
+  - Params validation (must be JSON object, max 128KB).
+  - Inline idempotency key support within command envelope.
+  - Upstream envelope builder that wraps params with gateway context (identity, correlation ID, client IP, API version, timestamp).
+  - Structured `CommandAudit` logging per command.
+- Gateway `POST /v1/commands` endpoint:
+  - Accepts bearer token or session token auth.
+  - Parses command envelope and routes to appropriate upstream path.
+  - Idempotency support (inline key or header-based).
+  - Full upstream error mapping and structured audit.
+
+### Changed
+- Edge gateway extended with `proxyCommand` for command-specific upstream forwarding.
+
+## [0.9.0] - 2026-03-xx
+
+### Added
+- Session management system (`src/http/session.zig`):
+  - Cryptographic session token generation (32 bytes / 256 bits entropy, hex-encoded).
+  - In-memory session store with per-identity tracking, device ID support, and idle TTL expiry.
+  - Session revocation (single token or all sessions for an identity).
+  - Max concurrent session enforcement via `TARDIGRADE_SESSION_MAX` env var (default 1000).
+  - Session TTL via `TARDIGRADE_SESSION_TTL` env var (default 3600s).
+  - Automatic cleanup of expired sessions.
+- Gateway session endpoints:
+  - `POST /v1/sessions` — create session (requires bearer auth, optional `X-Device-ID`).
+  - `DELETE /v1/sessions` — revoke session (requires `X-Session-Token`).
+  - `GET /v1/sessions` — list active sessions for identity (requires bearer auth).
+- Session-based auth as alternative to bearer tokens on `POST /v1/chat`.
+
+### Changed
+- Edge config extended with `session_ttl_seconds` and `session_max` fields.
+- Gateway state now includes optional `SessionStore`.
+
 ## [0.8.0] - 2026-03-xx
 
 ### Added

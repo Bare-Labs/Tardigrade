@@ -17,6 +17,13 @@ pub const EdgeConfig = struct {
     security_headers_enabled: bool,
     /// Idempotency cache TTL in seconds (0 = disabled).
     idempotency_ttl_seconds: u32,
+    /// Session idle TTL in seconds (0 = sessions disabled).
+    session_ttl_seconds: u32,
+    /// Maximum concurrent sessions (0 = unlimited).
+    session_max: u32,
+    /// IP access control rules (empty = disabled).
+    /// Format: "allow 10.0.0.0/8, deny 0.0.0.0/0"
+    access_control_rules: []const u8,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -25,6 +32,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.upstream_base_url);
         for (self.auth_token_hashes) |h| allocator.free(h);
         allocator.free(self.auth_token_hashes);
+        allocator.free(self.access_control_rules);
         self.* = undefined;
     }
 };
@@ -74,6 +82,17 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(idem_ttl_str);
     const idempotency_ttl_seconds = std.fmt.parseInt(u32, idem_ttl_str, 10) catch 300;
 
+    const session_ttl_str = envOrDefault(allocator, "TARDIGRADE_SESSION_TTL", "3600") catch unreachable;
+    defer allocator.free(session_ttl_str);
+    const session_ttl_seconds = std.fmt.parseInt(u32, session_ttl_str, 10) catch 3600;
+
+    const session_max_str = envOrDefault(allocator, "TARDIGRADE_SESSION_MAX", "1000") catch unreachable;
+    defer allocator.free(session_max_str);
+    const session_max = std.fmt.parseInt(u32, session_max_str, 10) catch 1000;
+
+    const access_control_rules = envOrDefault(allocator, "TARDIGRADE_ACCESS_CONTROL", "") catch unreachable;
+    errdefer allocator.free(access_control_rules);
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
@@ -87,6 +106,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .rate_limit_burst = rate_limit_burst,
         .security_headers_enabled = security_headers_enabled,
         .idempotency_ttl_seconds = idempotency_ttl_seconds,
+        .session_ttl_seconds = session_ttl_seconds,
+        .session_max = session_max,
+        .access_control_rules = access_control_rules,
     };
 }
 
