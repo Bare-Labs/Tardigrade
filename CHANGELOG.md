@@ -1,6 +1,14 @@
 
 # Changelog
 
+## [0.18.0] - 2026-03-xx
+
+### Added
+- Phase 2.3 graceful worker draining (`src/http/worker_pool.zig`):
+  - Worker pool now tracks in-flight jobs and blocks shutdown until queued + active work drains when requested.
+  - Added worker completion signaling for coordinated shutdown waits.
+  - Added unit test verifying `shutdownAndJoin(true)` waits for in-flight work completion.
+
 ## [0.17.0] - 2026-03-xx
 
 ### Added

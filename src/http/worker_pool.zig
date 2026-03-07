@@ -11,6 +11,7 @@ pub const WorkerPool = struct {
     cond: std.Thread.Condition = .{},
     shutting_down: bool = false,
     joined: bool = false,
+    active_jobs: usize = 0,
     handler: HandlerFn,
     handler_ctx: *anyopaque,
     max_queue_len: usize,
@@ -88,6 +89,10 @@ pub const WorkerPool = struct {
         if (!drain_pending) {
             for (self.queue.items) |fd| std.posix.close(fd);
             self.queue.clearRetainingCapacity();
+        } else {
+            while (self.queue.items.len > 0 or self.active_jobs > 0) {
+                self.cond.wait(&self.mutex);
+            }
         }
 
         self.mutex.unlock();
@@ -112,9 +117,15 @@ pub const WorkerPool = struct {
             }
 
             const fd = self.queue.pop().?;
+            self.active_jobs += 1;
             self.mutex.unlock();
 
             self.handler(self.handler_ctx, fd);
+
+            self.mutex.lock();
+            self.active_jobs -= 1;
+            self.cond.broadcast();
+            self.mutex.unlock();
         }
     }
 };
@@ -151,4 +162,35 @@ test "worker pool processes submitted items" {
     ctx.mutex.lock();
     defer ctx.mutex.unlock();
     try std.testing.expectEqual(@as(usize, 6), ctx.total);
+}
+
+test "worker pool shutdown drains in-flight work" {
+    if (builtin.single_threaded) return;
+
+    const Ctx = struct {
+        mutex: std.Thread.Mutex = .{},
+        done: bool = false,
+    };
+    var ctx = Ctx{};
+
+    const handler = struct {
+        fn run(raw_ctx: *anyopaque, _: std.posix.fd_t) void {
+            const typed: *Ctx = @ptrCast(@alignCast(raw_ctx));
+            std.time.sleep(20 * std.time.ns_per_ms);
+            typed.mutex.lock();
+            typed.done = true;
+            typed.mutex.unlock();
+        }
+    }.run;
+
+    var pool: WorkerPool = undefined;
+    try pool.init(std.testing.allocator, 1, 16, handler, &ctx);
+    defer pool.deinit();
+
+    try pool.submit(1);
+    pool.shutdownAndJoin(true);
+
+    ctx.mutex.lock();
+    defer ctx.mutex.unlock();
+    try std.testing.expect(ctx.done);
 }

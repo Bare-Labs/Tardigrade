@@ -168,11 +168,12 @@ Resolved: Timer manager (`TimerManager`) now drives periodic loop ticks for time
 - [x] Multi-threaded worker pool
 - [x] Thread-safe shared state
 - [ ] Work stealing / load balancing between workers
-- [ ] Graceful shutdown with connection draining
+- [x] Graceful shutdown with connection draining
 
 Resolved (incremental): Connection handling is now dispatched from the listener event loop into a fixed-size worker thread pool (`src/http/worker_pool.zig`). Accepted sockets are queued with bounded capacity and processed by workers so blocking upstream calls no longer stall the listener loop.
 Decision: shared mutable runtime components (rate limiter, idempotency cache, session store, circuit breaker, metrics) are synchronized behind gateway state locks to preserve existing behavior while enabling concurrent request execution.
 Decision: queue dispatch currently uses a single shared queue (basic balancing by first available worker). Work stealing and advanced scheduling remain open follow-up work under 2.3.
+Resolved: worker shutdown now supports graceful draining; when drain mode is enabled, pool shutdown waits for queued and in-flight connection jobs to finish before joining worker threads.
 
 ### 2.4 Memory Management
 - [ ] Arena allocators for request scope
