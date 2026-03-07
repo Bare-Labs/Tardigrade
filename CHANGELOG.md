@@ -1,6 +1,14 @@
 
 # Changelog
 
+## [0.21.0] - 2026-03-xx
+
+### Added
+- Phase 4.1 streaming proxy increment (`src/edge_gateway.zig`):
+  - New upstream execution path that can stream successful (200) upstream responses directly to downstream clients using chunked transfer encoding.
+  - Shared streaming response header writer for propagated content-type/disposition, correlation ID, and security headers.
+  - `/v1/chat` and `/v1/commands` now attempt streamed relay when idempotency replay storage is not required; non-200 responses still use buffered mapping path.
+
 ## [0.20.0] - 2026-03-xx
 
 ### Added

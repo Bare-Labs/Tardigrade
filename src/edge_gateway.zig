@@ -814,7 +814,7 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
             return;
         }
 
-        const cmd_proxy_result = proxyCommand(
+        const cmd_exec = proxyJsonExecute(
             allocator,
             cfg,
             upstream_path,
@@ -823,6 +823,9 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
             client_ip,
             request.headers.get("host"),
             request.headers.get("x-forwarded-for"),
+            writer,
+            state,
+            effective_idem_key == null,
         ) catch {
             state.circuitRecordFailure();
             state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
@@ -838,23 +841,44 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
             cmd_audit.log();
             return;
         };
-        defer allocator.free(cmd_proxy_result.body);
-
-        // Record circuit breaker outcome based on upstream status
-        if (cmd_proxy_result.status >= 500) {
-            state.circuitRecordFailure();
-        } else {
-            state.circuitRecordSuccess();
-        }
-
-        var cmd_final_status: u16 = cmd_proxy_result.status;
-        var cmd_final_body: []const u8 = cmd_proxy_result.body;
+        var cmd_final_status: u16 = undefined;
+        var cmd_final_body: []const u8 = "";
         var cmd_error_body: ?[]const u8 = null;
-        if (cmd_proxy_result.status != 200) {
-            const mapped = mapUpstreamError(cmd_proxy_result.status);
-            cmd_final_status = mapped.status;
-            cmd_final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
-            cmd_error_body = cmd_final_body;
+        switch (cmd_exec) {
+            .streamed_status => |status| {
+                cmd_final_status = status;
+                state.circuitRecordSuccess();
+                state.metricsRecord(status);
+
+                const streamed_audit = http.command.CommandAudit{
+                    .command = cmd.command_type.toString(),
+                    .correlation_id = correlation_id,
+                    .identity = ctx.identity orelse "-",
+                    .status = status,
+                    .latency_ms = ctx.elapsedMs(),
+                };
+                streamed_audit.log();
+                logAccess(&ctx, request.method.toString(), "/v1/commands", status, request.headers.get("user-agent") orelse "");
+                return;
+            },
+            .buffered => |proxy_result| {
+                defer allocator.free(proxy_result.body);
+
+                if (proxy_result.status >= 500) {
+                    state.circuitRecordFailure();
+                } else {
+                    state.circuitRecordSuccess();
+                }
+
+                cmd_final_status = proxy_result.status;
+                cmd_final_body = proxy_result.body;
+                if (proxy_result.status != 200) {
+                    const mapped = mapUpstreamError(proxy_result.status);
+                    cmd_final_status = mapped.status;
+                    cmd_final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+                    cmd_error_body = cmd_final_body;
+                }
+            },
         }
         defer {
             if (cmd_error_body) |eb| allocator.free(eb);
@@ -976,14 +1000,21 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
         }
 
         // --- Upstream proxy ---
-        const proxy_result = proxyChat(
+        const chat_request_body = try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(message, .{})});
+        defer allocator.free(chat_request_body);
+
+        const chat_exec = proxyJsonExecute(
             allocator,
             cfg,
-            message,
+            "/v1/chat",
+            chat_request_body,
             correlation_id,
             client_ip,
             request.headers.get("host"),
             request.headers.get("x-forwarded-for"),
+            writer,
+            state,
+            ctx.idempotency_key == null,
         ) catch {
             state.circuitRecordFailure();
             state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
@@ -991,23 +1022,37 @@ fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *G
             logAccess(&ctx, request.method.toString(), "/v1/chat", 504, request.headers.get("user-agent") orelse "");
             return;
         };
-        defer allocator.free(proxy_result.body);
+        defer allocator.free(message);
 
-        // Record circuit breaker outcome based on upstream status
-        if (proxy_result.status >= 500) {
-            state.circuitRecordFailure();
-        } else {
-            state.circuitRecordSuccess();
-        }
-
-        var final_status: u16 = proxy_result.status;
-        var final_body: []const u8 = proxy_result.body;
+        var final_status: u16 = undefined;
+        var final_body: []const u8 = "";
         var error_body_to_free: ?[]const u8 = null;
-        if (proxy_result.status != 200) {
-            const mapped = mapUpstreamError(proxy_result.status);
-            final_status = mapped.status;
-            final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
-            error_body_to_free = final_body;
+        switch (chat_exec) {
+            .streamed_status => |status| {
+                final_status = status;
+                state.circuitRecordSuccess();
+                state.metricsRecord(status);
+                logAccess(&ctx, request.method.toString(), "/v1/chat", status, request.headers.get("user-agent") orelse "");
+                return;
+            },
+            .buffered => |proxy_result| {
+                defer allocator.free(proxy_result.body);
+
+                if (proxy_result.status >= 500) {
+                    state.circuitRecordFailure();
+                } else {
+                    state.circuitRecordSuccess();
+                }
+
+                final_status = proxy_result.status;
+                final_body = proxy_result.body;
+                if (proxy_result.status != 200) {
+                    const mapped = mapUpstreamError(proxy_result.status);
+                    final_status = mapped.status;
+                    final_body = try buildApiErrorJson(allocator, mapped.code, mapped.message, correlation_id);
+                    error_body_to_free = final_body;
+                }
+            },
         }
         defer {
             if (error_body_to_free) |eb| allocator.free(eb);
@@ -1120,6 +1165,11 @@ const ProxyResult = struct {
     body: []u8,
 };
 
+const ProxyExecution = union(enum) {
+    streamed_status: u16,
+    buffered: ProxyResult,
+};
+
 fn proxyChat(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
@@ -1134,7 +1184,7 @@ fn proxyChat(
     const request_body = try std.fmt.allocPrint(allocator, "{{\"message\":{s}}}", .{std.json.fmt(message, .{})});
     defer allocator.free(request_body);
 
-    return proxyJsonRequest(
+    const result = try proxyJsonRequest(
         allocator,
         cfg,
         "/v1/chat",
@@ -1144,6 +1194,7 @@ fn proxyChat(
         incoming_host,
         incoming_x_forwarded_for,
     );
+    return result;
 }
 
 fn proxyCommand(
@@ -1156,7 +1207,7 @@ fn proxyCommand(
     incoming_host: ?[]const u8,
     incoming_x_forwarded_for: ?[]const u8,
 ) !ProxyResult {
-    return proxyJsonRequest(
+    const result = try proxyJsonRequest(
         allocator,
         cfg,
         upstream_path,
@@ -1166,6 +1217,7 @@ fn proxyCommand(
         incoming_host,
         incoming_x_forwarded_for,
     );
+    return result;
 }
 
 fn proxyJsonRequest(
@@ -1221,6 +1273,134 @@ fn proxyJsonRequest(
         .status = @intFromEnum(result.status),
         .body = try body.toOwnedSlice(),
     };
+}
+
+fn proxyJsonExecute(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    upstream_path: []const u8,
+    payload: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    incoming_host: ?[]const u8,
+    incoming_x_forwarded_for: ?[]const u8,
+    downstream_writer: anytype,
+    state: *GatewayState,
+    enable_streaming_success: bool,
+) !ProxyExecution {
+    const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ cfg.upstream_base_url, upstream_path });
+    defer allocator.free(url);
+
+    const forwarded_for = try buildForwardedFor(allocator, incoming_x_forwarded_for, client_ip);
+    defer allocator.free(forwarded_for);
+
+    const forwarded_host = incoming_host orelse "";
+    const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
+    const upstream_host = parseUpstreamHost(cfg.upstream_base_url) orelse "";
+
+    var extra_headers = std.ArrayList(std.http.Header).init(allocator);
+    defer extra_headers.deinit();
+    try extra_headers.append(.{ .name = http.correlation.HEADER_NAME, .value = correlation_id });
+    try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for });
+    try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
+    try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
+    if (forwarded_host.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = forwarded_host });
+    if (upstream_host.len > 0) try extra_headers.append(.{ .name = "Host", .value = upstream_host });
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var server_header_buffer: [16 * 1024]u8 = undefined;
+    const uri = try std.Uri.parse(url);
+    var req = try client.open(.POST, uri, .{
+        .server_header_buffer = &server_header_buffer,
+        .headers = .{ .content_type = .{ .override = "application/json" } },
+        .extra_headers = extra_headers.items,
+        .keep_alive = false,
+    });
+    defer req.deinit();
+
+    req.transfer_encoding = .{ .content_length = payload.len };
+    try req.send();
+    try req.writeAll(payload);
+    try req.finish();
+    try req.wait();
+
+    const status_code: u16 = @intFromEnum(req.response.status);
+    if (enable_streaming_success and status_code == 200) {
+        try writeStreamedUpstreamResponse(
+            downstream_writer,
+            status_code,
+            req.response.reason,
+            req.response.content_type orelse JSON_CONTENT_TYPE,
+            req.response.content_disposition,
+            correlation_id,
+            &state.security_headers,
+        );
+
+        var read_buf: [16 * 1024]u8 = undefined;
+        while (true) {
+            const n = try req.reader().read(read_buf[0..]);
+            if (n == 0) break;
+            try writeChunk(downstream_writer, read_buf[0..n]);
+        }
+        try downstream_writer.writeAll("0\r\n\r\n");
+        return .{ .streamed_status = status_code };
+    }
+
+    var body = std.ArrayList(u8).init(allocator);
+    errdefer body.deinit();
+    try req.reader().readAllArrayList(&body, 2 * 1024 * 1024);
+    return .{
+        .buffered = .{
+            .status = status_code,
+            .body = try body.toOwnedSlice(),
+        },
+    };
+}
+
+fn writeStreamedUpstreamResponse(
+    writer: anytype,
+    status_code: u16,
+    reason: []const u8,
+    content_type: []const u8,
+    content_disposition: ?[]const u8,
+    correlation_id: []const u8,
+    security: *const http.security_headers.SecurityHeaders,
+) !void {
+    const phrase = if (reason.len > 0)
+        reason
+    else
+        (@as(std.http.Status, @enumFromInt(status_code)).phrase() orelse "");
+
+    try writer.print("HTTP/1.1 {d} {s}\r\n", .{ status_code, phrase });
+    try writer.print("Server: {s}/{s}\r\n", .{ http.SERVER_NAME, http.SERVER_VERSION });
+    try writer.writeAll("Connection: close\r\n");
+    try writer.writeAll("Transfer-Encoding: chunked\r\n");
+    try writer.print("Content-Type: {s}\r\n", .{content_type});
+    try writer.print("{s}: {s}\r\n", .{ http.correlation.HEADER_NAME, correlation_id });
+    if (content_disposition) |cd| {
+        try writer.print("Content-Disposition: {s}\r\n", .{cd});
+    }
+
+    try writeSecurityHeaders(writer, security);
+    try writer.writeAll("\r\n");
+}
+
+fn writeSecurityHeaders(writer: anytype, sec: *const http.security_headers.SecurityHeaders) !void {
+    if (sec.x_frame_options.len > 0) try writer.print("X-Frame-Options: {s}\r\n", .{sec.x_frame_options});
+    if (sec.x_content_type_options.len > 0) try writer.print("X-Content-Type-Options: {s}\r\n", .{sec.x_content_type_options});
+    if (sec.content_security_policy.len > 0) try writer.print("Content-Security-Policy: {s}\r\n", .{sec.content_security_policy});
+    if (sec.strict_transport_security.len > 0) try writer.print("Strict-Transport-Security: {s}\r\n", .{sec.strict_transport_security});
+    if (sec.referrer_policy.len > 0) try writer.print("Referrer-Policy: {s}\r\n", .{sec.referrer_policy});
+    if (sec.permissions_policy.len > 0) try writer.print("Permissions-Policy: {s}\r\n", .{sec.permissions_policy});
+    if (sec.x_xss_protection.len > 0) try writer.print("X-XSS-Protection: {s}\r\n", .{sec.x_xss_protection});
+}
+
+fn writeChunk(writer: anytype, bytes: []const u8) !void {
+    try writer.print("{x}\r\n", .{bytes.len});
+    try writer.writeAll(bytes);
+    try writer.writeAll("\r\n");
 }
 
 fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, client_ip: []const u8) ![]const u8 {
