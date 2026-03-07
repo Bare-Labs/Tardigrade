@@ -18,6 +18,7 @@ const GatewayState = struct {
     metrics: http.metrics.Metrics,
     compression_config: http.compression.CompressionConfig,
     circuit_breaker: http.circuit_breaker.CircuitBreaker,
+    upstream_client: std.http.Client,
     max_connections_per_ip: u32,
     active_connections_by_ip: std.StringHashMap(u32),
     fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
@@ -27,6 +28,7 @@ const GatewayState = struct {
         if (self.idempotency_store) |*is| is.deinit();
         if (self.session_store) |*ss| ss.deinit();
         if (self.access_control) |*acl| acl.deinit();
+        self.upstream_client.deinit();
         var ip_it = self.active_connections_by_ip.iterator();
         while (ip_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.active_connections_by_ip.deinit();
@@ -234,6 +236,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .threshold = cfg.cb_threshold,
             .timeout_ms = cfg.cb_timeout_ms,
         }),
+        .upstream_client = .{ .allocator = state_allocator },
         .max_connections_per_ip = cfg.max_connections_per_ip,
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
@@ -1307,16 +1310,13 @@ fn proxyJsonExecute(
     if (forwarded_host.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = forwarded_host });
     if (upstream_host.len > 0) try extra_headers.append(.{ .name = "Host", .value = upstream_host });
 
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
     var server_header_buffer: [16 * 1024]u8 = undefined;
     const uri = try std.Uri.parse(url);
-    var req = try client.open(.POST, uri, .{
+    var req = try state.upstream_client.open(.POST, uri, .{
         .server_header_buffer = &server_header_buffer,
         .headers = .{ .content_type = .{ .override = "application/json" } },
         .extra_headers = extra_headers.items,
-        .keep_alive = false,
+        .keep_alive = true,
     });
     defer req.deinit();
 

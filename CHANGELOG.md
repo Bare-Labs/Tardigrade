@@ -1,6 +1,14 @@
 
 # Changelog
 
+## [0.22.0] - 2026-03-xx
+
+### Added
+- Phase 4.1 backend connection pooling (`src/edge_gateway.zig`):
+  - Gateway state now owns a shared upstream `std.http.Client`.
+  - Upstream proxy execution path now opens requests through the shared client with `keep_alive = true`.
+  - Upstream connections can now be reused across requests via the client connection pool instead of one-client-per-request teardown.
+
 ## [0.21.0] - 2026-03-xx
 
 ### Added
