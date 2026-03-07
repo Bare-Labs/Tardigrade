@@ -3,6 +3,7 @@ const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 
 const MAX_REQUEST_SIZE: usize = 256 * 1024;
+const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
 
 /// Persistent gateway state shared across connections.
@@ -19,6 +20,8 @@ const GatewayState = struct {
     compression_config: http.compression.CompressionConfig,
     circuit_breaker: http.circuit_breaker.CircuitBreaker,
     upstream_client: std.http.Client,
+    request_buffer_pool: http.buffer_pool.BufferPool,
+    relay_buffer_pool: http.buffer_pool.BufferPool,
     max_connections_per_ip: u32,
     active_connections_by_ip: std.StringHashMap(u32),
     fd_to_ip: std.AutoHashMap(std.posix.fd_t, []u8),
@@ -29,6 +32,8 @@ const GatewayState = struct {
         if (self.session_store) |*ss| ss.deinit();
         if (self.access_control) |*acl| acl.deinit();
         self.upstream_client.deinit();
+        self.request_buffer_pool.deinit();
+        self.relay_buffer_pool.deinit();
         var ip_it = self.active_connections_by_ip.iterator();
         while (ip_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.active_connections_by_ip.deinit();
@@ -201,7 +206,7 @@ const WorkerContext = struct {
 };
 
 const ConnectionSession = struct {
-    pending_buf: [MAX_REQUEST_SIZE]u8 = undefined,
+    pending_buf: ?[]u8 = null,
     pending_len: usize = 0,
 };
 
@@ -238,6 +243,7 @@ const ConnectionSessionPool = struct {
 
     fn release(self: *ConnectionSessionPool, session: *ConnectionSession) void {
         session.pending_len = 0;
+        session.pending_buf = null;
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -290,6 +296,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .timeout_ms = cfg.cb_timeout_ms,
         }),
         .upstream_client = .{ .allocator = state_allocator },
+        .request_buffer_pool = http.buffer_pool.BufferPool.init(state_allocator, MAX_REQUEST_SIZE, cfg.connection_pool_size),
+        .relay_buffer_pool = http.buffer_pool.BufferPool.init(state_allocator, STREAM_RELAY_BUFFER_SIZE, cfg.connection_pool_size),
         .max_connections_per_ip = cfg.max_connections_per_ip,
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
         .fd_to_ip = std.AutoHashMap(std.posix.fd_t, []u8).init(state_allocator),
@@ -376,6 +384,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     state.logger.info(null, "Worker pool enabled: workers={d} queue={d}", .{ worker_count, cfg.worker_queue_size });
     state.logger.info(null, "Keep-alive configured: timeout={d}ms max_requests={d}", .{ cfg.keep_alive_timeout_ms, cfg.max_requests_per_connection });
     state.logger.info(null, "Connection session pool configured: max_cached={d}", .{cfg.connection_pool_size});
+    if (cfg.max_connection_memory_bytes > 0) {
+        state.logger.info(null, "Per-connection memory limit configured: {d} bytes", .{cfg.max_connection_memory_bytes});
+    }
+    if (cfg.proxy_stream_all_statuses) {
+        state.logger.info(null, "Proxy streaming for all upstream statuses enabled", .{});
+    }
     if (cfg.max_connections_per_ip > 0) {
         state.logger.info(null, "Per-IP connection limit enabled: {d}", .{cfg.max_connections_per_ip});
     }
@@ -461,6 +475,13 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         std.posix.close(client_fd);
         return;
     };
+    defer {
+        if (session.pending_buf) |buf| {
+            ctx.state.request_buffer_pool.release(buf);
+            session.pending_buf = null;
+            session.pending_len = 0;
+        }
+    }
     defer ctx.session_pool.release(session);
 
     const idle_timeout_ms = if (ctx.cfg.keep_alive_timeout_ms > 0)
@@ -556,10 +577,24 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
 
-    const total_read = try readHttpRequest(conn, session.pending_buf[0..], &session.pending_len);
-    if (total_read == 0) return;
+    if (session.pending_buf == null) {
+        session.pending_buf = try state.request_buffer_pool.acquire();
+    }
+    const pending_buf = session.pending_buf.?;
+    if (cfg.max_connection_memory_bytes > 0 and pending_buf.len > cfg.max_connection_memory_bytes) {
+        try sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
+        return;
+    }
 
-    const parse_result = http.Request.parse(allocator, session.pending_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
+    const total_read = try readHttpRequest(conn, pending_buf, &session.pending_len);
+    if (total_read == 0) return;
+    if (cfg.max_connection_memory_bytes > 0 and total_read > cfg.max_connection_memory_bytes) {
+        session.pending_len = 0;
+        try sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
+        return;
+    }
+
+    const parse_result = http.Request.parse(allocator, pending_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
         try sendApiError(allocator, conn.writer(), .bad_request, "invalid_request", "Malformed request", null, keep_alive, state);
         state.logger.warn(null, "parse error: {}", .{err});
         return;
@@ -567,7 +602,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     const bytes_consumed = parse_result.bytes_consumed;
     if (bytes_consumed < total_read) {
         const remaining = total_read - bytes_consumed;
-        std.mem.copyForwards(u8, session.pending_buf[0..remaining], session.pending_buf[bytes_consumed..total_read]);
+        std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
         session.pending_len = remaining;
     } else {
         session.pending_len = 0;
@@ -966,7 +1001,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         switch (cmd_exec) {
             .streamed_status => |status| {
                 cmd_final_status = status;
-                state.circuitRecordSuccess();
+                if (status >= 500) {
+                    state.circuitRecordFailure();
+                } else {
+                    state.circuitRecordSuccess();
+                }
                 state.metricsRecord(status);
 
                 const streamed_audit = http.command.CommandAudit{
@@ -1150,7 +1189,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         switch (chat_exec) {
             .streamed_status => |status| {
                 final_status = status;
-                state.circuitRecordSuccess();
+                if (status >= 500) {
+                    state.circuitRecordFailure();
+                } else {
+                    state.circuitRecordSuccess();
+                }
                 state.metricsRecord(status);
                 logAccess(&ctx, request.method.toString(), "/v1/chat", status, request.headers.get("user-agent") orelse "");
                 return;
@@ -1348,7 +1391,8 @@ fn proxyJsonExecute(
     try req.wait();
 
     const status_code: u16 = @intFromEnum(req.response.status);
-    if (enable_streaming_success and status_code == 200) {
+    const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
+    if (stream_status) {
         try writeStreamedUpstreamResponse(
             downstream_writer,
             status_code,
@@ -1359,9 +1403,10 @@ fn proxyJsonExecute(
             &state.security_headers,
         );
 
-        var read_buf: [16 * 1024]u8 = undefined;
+        const read_buf = try state.relay_buffer_pool.acquire();
+        defer state.relay_buffer_pool.release(read_buf);
         while (true) {
-            const n = try req.reader().read(read_buf[0..]);
+            const n = try req.reader().read(read_buf);
             if (n == 0) break;
             try writeChunk(downstream_writer, read_buf[0..n]);
         }
@@ -1369,9 +1414,28 @@ fn proxyJsonExecute(
         return .{ .streamed_status = status_code };
     }
 
+    if (status_code != 200) {
+        const drain_buf = try state.relay_buffer_pool.acquire();
+        defer state.relay_buffer_pool.release(drain_buf);
+        while (true) {
+            const n = try req.reader().read(drain_buf);
+            if (n == 0) break;
+        }
+        return .{
+            .buffered = .{
+                .status = status_code,
+                .body = try allocator.alloc(u8, 0),
+            },
+        };
+    }
+
+    const max_buffered = if (cfg.max_connection_memory_bytes > 0)
+        cfg.max_connection_memory_bytes
+    else
+        2 * 1024 * 1024;
     var body = std.ArrayList(u8).init(allocator);
     errdefer body.deinit();
-    try req.reader().readAllArrayList(&body, 2 * 1024 * 1024);
+    try req.reader().readAllArrayList(&body, max_buffered);
     return .{
         .buffered = .{
             .status = status_code,
@@ -1707,6 +1771,8 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .keep_alive_timeout_ms = 5000,
         .max_requests_per_connection = 100,
         .connection_pool_size = 256,
+        .max_connection_memory_bytes = 2 * 1024 * 1024,
+        .proxy_stream_all_statuses = false,
     };
 
     const abs = try resolveProxyTarget(allocator, &cfg, "https://api.example.com/base", "/v1/chat");
@@ -1764,6 +1830,8 @@ test "authorizeRequest accepts valid hash" {
         .keep_alive_timeout_ms = 5000,
         .max_requests_per_connection = 100,
         .connection_pool_size = 256,
+        .max_connection_memory_bytes = 2 * 1024 * 1024,
+        .proxy_stream_all_statuses = false,
     };
 
     var headers = http.Headers.init(allocator);

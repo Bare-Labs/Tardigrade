@@ -56,6 +56,10 @@ pub const EdgeConfig = struct {
     max_requests_per_connection: u32,
     /// Maximum idle connection sessions cached for reuse.
     connection_pool_size: usize,
+    /// Maximum in-memory bytes retained per active connection (0 = unlimited).
+    max_connection_memory_bytes: usize,
+    /// Whether to stream all upstream statuses directly (including non-200) instead of mapping.
+    proxy_stream_all_statuses: bool,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -211,6 +215,14 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(conn_pool_size_str);
     const connection_pool_size = std.fmt.parseInt(usize, conn_pool_size_str, 10) catch 256;
 
+    const max_conn_mem_str = envOrDefault(allocator, "TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES", "2097152") catch unreachable;
+    defer allocator.free(max_conn_mem_str);
+    const max_connection_memory_bytes = std.fmt.parseInt(usize, max_conn_mem_str, 10) catch 2 * 1024 * 1024;
+
+    const stream_all_statuses_str = envOrDefault(allocator, "TARDIGRADE_PROXY_STREAM_ALL_STATUSES", "false") catch unreachable;
+    defer allocator.free(stream_all_statuses_str);
+    const proxy_stream_all_statuses = std.mem.eql(u8, stream_all_statuses_str, "true") or std.mem.eql(u8, stream_all_statuses_str, "1");
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
@@ -249,6 +261,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
         .max_requests_per_connection = max_requests_per_connection,
         .connection_pool_size = connection_pool_size,
+        .max_connection_memory_bytes = max_connection_memory_bytes,
+        .proxy_stream_all_statuses = proxy_stream_all_statuses,
     };
 }
 

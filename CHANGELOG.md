@@ -18,6 +18,14 @@
   - Listener submit path now chooses the least-loaded worker queue.
   - Workers now steal queued sockets from peer queues when local queues are empty.
   - Added unit coverage for queue selection and stealing behavior.
+- Phase 2.4 memory management completion (`src/http/buffer_pool.zig`, `src/edge_gateway.zig`, `src/edge_config.zig`):
+  - Added thread-safe reusable fixed-size buffer pool module and integrated request + proxy relay buffer pools in gateway state.
+  - Added `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES` and enforced buffer/read caps on connection and buffered upstream paths.
+  - Request/session handling now acquires request buffers from a pool and releases them on connection teardown.
+  - Proxy non-200 mapped responses now drain upstream bodies without full buffering.
+- Phase 4.1 streaming proxy extension (`src/edge_gateway.zig`, `src/edge_config.zig`):
+  - Added `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` to optionally stream non-200 upstream responses directly.
+  - Streamed-status circuit breaker accounting now treats 5xx responses as failures.
 
 ## [0.26.0] - 2026-03-xx
 

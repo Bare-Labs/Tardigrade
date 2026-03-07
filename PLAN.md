@@ -186,11 +186,14 @@ Resolved: worker shutdown now supports graceful draining; when drain mode is ena
 
 ### 2.4 Memory Management
 - [x] Arena allocators for request scope
-- [ ] Buffer pooling
-- [ ] Zero-copy where possible
-- [ ] Memory limits per connection
+- [x] Buffer pooling
+- [x] Zero-copy where possible
+- [x] Memory limits per connection
 
 Resolved (incremental): request handling path now uses a request-scoped arena allocator in `src/edge_gateway.zig`, reducing allocator churn and centralizing per-request memory cleanup at end-of-request.
+Resolved: shared thread-safe byte buffer pools are now used for both request read buffers and proxy relay buffers (`src/http/buffer_pool.zig`, integrated in gateway state), reducing allocation churn on hot connection/proxy paths.
+Resolved: per-connection memory budgets are now enforced via `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES`; oversized request/proxy buffering paths are bounded to this cap.
+Decision: zero-copy is applied where practical in current architecture by relaying upstream stream chunks directly from pooled relay buffers to downstream writers without intermediate heap copies.
 
 ## PHASE 3: Configuration System
 
@@ -251,7 +254,8 @@ Resolved (incremental): Gateway upstream proxy calls now flow through a shared p
 Resolved: basic proxy_pass-style routing now supports config-driven targets for `/v1/chat` and `/v1/commands` subpaths via `TARDIGRADE_PROXY_PASS_CHAT` and `TARDIGRADE_PROXY_PASS_COMMANDS_PREFIX` (absolute URL or path mode).
 Resolved (incremental): `/v1/chat` and `/v1/commands` now support streamed relay for successful upstream responses via chunked downstream writes, avoiding full buffering on the hot path.
 Resolved: upstream requests now use a shared `std.http.Client` in gateway state with keep-alive enabled, allowing backend connection reuse across requests.
-Decision: kept buffered fallback for non-200/error-mapped/idempotency-cached paths to preserve current API semantics; full streaming coverage for all proxy paths remains open follow-up work under 4.1.
+Resolved (incremental): added optional full-status streaming mode via `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` to relay non-200 upstream responses directly when desired.
+Decision: default behavior still maps non-200 upstream errors into stable gateway error envelopes; full-status passthrough streaming is opt-in to preserve compatibility.
 
 ### 4.2 Upstream Management
 - [ ] upstream blocks
