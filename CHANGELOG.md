@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.0] - 2026-03-xx
+
+### Added
+- IP access control (`src/http/access_control.zig`):
+  - Allow/deny rules with CIDR notation support (IPv4 and IPv6).
+  - First-match-wins evaluation order (nginx-style).
+  - IPv4 and IPv6 address parsing with full CIDR prefix matching.
+  - Configurable via `TARDIGRADE_ACCESS_CONTROL` env var.
+  - Example: `"allow 10.0.0.0/8, deny 0.0.0.0/0"`.
+
+### Changed
+- Edge gateway applies IP access control before rate limiting (returns 403 Forbidden).
+- Edge config extended with `access_control_rules` field.
+
 ## [0.10.0] - 2026-03-xx
 
 ### Added

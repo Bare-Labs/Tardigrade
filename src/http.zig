@@ -25,6 +25,7 @@ pub const api_router = @import("http/api_router.zig");
 pub const idempotency = @import("http/idempotency.zig");
 pub const session = @import("http/session.zig");
 pub const command = @import("http/command.zig");
+pub const access_control = @import("http/access_control.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

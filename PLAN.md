@@ -284,9 +284,11 @@ Secrets may include:
 ## PHASE 6: Security Features
 
 ### 6.1 Access Control
-- [ ] allow/deny directives (IP-based)
-- [ ] CIDR notation support
+- [x] allow/deny directives (IP-based)
+- [x] CIDR notation support
 - [ ] Geo-based blocking (via external data)
+
+Resolved: IP access control implemented in `src/http/access_control.zig`. Supports allow/deny rules with CIDR notation (IPv4 and IPv6). First-match-wins evaluation order. Configurable via `TARDIGRADE_ACCESS_CONTROL` env var (e.g. `"allow 10.0.0.0/8, deny 0.0.0.0/0"`). Applied before rate limiting in the gateway pipeline.
 
 ### 6.2 Rate Limiting
 - [x] limit_req (request rate)

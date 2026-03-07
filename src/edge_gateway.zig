@@ -11,6 +11,7 @@ const GatewayState = struct {
     idempotency_store: ?http.idempotency.IdempotencyStore,
     security_headers: http.security_headers.SecurityHeaders,
     session_store: ?http.session.SessionStore,
+    access_control: ?http.access_control.AccessControl,
 };
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
@@ -35,11 +36,16 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             http.session.SessionStore.init(state_allocator, cfg.session_ttl_seconds, cfg.session_max)
         else
             null,
+        .access_control = if (cfg.access_control_rules.len > 0)
+            http.access_control.AccessControl.fromConfig(state_allocator, cfg.access_control_rules, .allow) catch null
+        else
+            null,
     };
     defer {
         if (state.rate_limiter) |*rl| rl.deinit();
         if (state.idempotency_store) |*is| is.deinit();
         if (state.session_store) |*ss| ss.deinit();
+        if (state.access_control) |*acl| acl.deinit();
     }
 
     const address = try std.net.Address.parseIp(cfg.listen_host, cfg.listen_port);
@@ -60,6 +66,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (state.session_store != null) {
         std.log.info("Session management enabled: TTL {d}s, max {d}", .{ cfg.session_ttl_seconds, cfg.session_max });
+    }
+    if (state.access_control != null) {
+        std.log.info("IP access control enabled", .{});
     }
 
     while (true) {
@@ -106,6 +115,15 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
     // --- Extract idempotency key ---
     if (http.idempotency.fromHeaders(&request.headers)) |idem_key| {
         ctx.setIdempotencyKey(idem_key);
+    }
+
+    // --- IP Access Control ---
+    if (state.access_control) |*acl| {
+        if (acl.check(client_ip) == .denied) {
+            try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, false, state);
+            ctx.auditLog(request.uri.path, 403);
+            return;
+        }
     }
 
     // --- Rate Limiting ---
@@ -754,6 +772,7 @@ test "authorizeRequest accepts valid hash" {
         .idempotency_ttl_seconds = 0,
         .session_ttl_seconds = 0,
         .session_max = 0,
+        .access_control_rules = "",
     };
 
     var headers = http.Headers.init(allocator);
