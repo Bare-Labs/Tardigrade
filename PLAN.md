@@ -402,12 +402,14 @@ Resolved: Security headers middleware implemented in `src/http/security_headers.
 ## PHASE 10: Compression
 
 ### 10.1 Response Compression
-- [ ] gzip compression
+- [x] gzip compression
 - [ ] gzip_static (pre-compressed files)
 - [ ] Brotli compression
-- [ ] Compression level configuration
-- [ ] MIME type filtering
-- [ ] Minimum size threshold
+- [x] Compression level configuration
+- [x] MIME type filtering
+- [x] Minimum size threshold
+
+Resolved: Gzip response compression implemented in `src/http/compression.zig`. One-shot compression with MIME-type filtering (text/*, JSON, XML, JS, SVG, WASM), configurable min size (default 256 bytes), and compression level. Applied to proxy response paths in the gateway. Configurable via `TARDIGRADE_COMPRESSION_ENABLED` and `TARDIGRADE_COMPRESSION_MIN_SIZE`.
 
 ### 10.2 Decompression
 - [ ] gunzip for backends that don't support it
@@ -453,11 +455,13 @@ Resolved: Security headers middleware implemented in `src/http/security_headers.
 - [ ] Syslog integration
 
 ### 12.2 Metrics
-- [ ] Stub status endpoint
+- [x] Stub status endpoint
 - [ ] Connection statistics
-- [ ] Request statistics
+- [x] Request statistics
 - [ ] Upstream health status
 - [ ] Prometheus metrics export (optional)
+
+Resolved: `GET /metrics` endpoint added to gateway. `Metrics` struct in `src/http/metrics.zig` tracks total requests and status class counts (2xx/3xx/4xx/5xx) with uptime. All gateway response paths record metrics automatically.
 
 ### 12.3 Debugging
 - [ ] Debug logging
@@ -476,10 +480,12 @@ Resolved: Security headers middleware implemented in `src/http/security_headers.
 
 ### 13.1 Process Management
 - [ ] Master/worker process model
-- [ ] Graceful shutdown (SIGTERM/SIGQUIT)
+- [x] Graceful shutdown (SIGTERM/SIGQUIT)
 - [ ] Binary upgrade (SIGUSR2)
 - [ ] Worker process recycling
 - [ ] CPU affinity
+
+Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and SIGINT handlers set a global atomic flag. Gateway accept loop checks the flag before each accept and exits cleanly. Note: with the current single-threaded blocking accept, shutdown takes effect between connections; fully responsive shutdown during blocking accept will be improved when async I/O is added (Phase 2).
 
 ### 13.2 Resource Limits
 - [ ] File descriptor limits

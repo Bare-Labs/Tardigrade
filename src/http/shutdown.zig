@@ -6,17 +6,17 @@ var shutdown_requested: bool = false;
 
 /// Returns whether a graceful shutdown has been requested.
 pub fn isShutdownRequested() bool {
-    return @atomicLoad(&shutdown_requested);
+    return @atomicLoad(bool, &shutdown_requested, .seq_cst);
 }
 
 /// Manually request a shutdown (for testing or programmatic use).
 pub fn requestShutdown() void {
-    @atomicStore(&shutdown_requested, true);
+    @atomicStore(bool, &shutdown_requested, true, .seq_cst);
 }
 
 /// Reset the shutdown flag (for testing).
 pub fn reset() void {
-    @atomicStore(&shutdown_requested, false);
+    @atomicStore(bool, &shutdown_requested, false, .seq_cst);
 }
 
 /// Install signal handlers for SIGTERM and SIGINT.
@@ -38,7 +38,7 @@ pub fn installSignalHandlers() void {
 
 fn handleSignal(sig: c_int) callconv(.c) void {
     _ = sig;
-    @atomicStore(&shutdown_requested, true);
+    @atomicStore(bool, &shutdown_requested, true, .seq_cst);
 }
 
 // Tests

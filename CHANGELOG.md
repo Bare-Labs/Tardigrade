@@ -1,6 +1,30 @@
 
 # Changelog
 
+## [0.13.0] - 2026-03-07
+
+### Added
+- Gzip response compression (`src/http/compression.zig`):
+  - `compressResponse()` for one-shot gzip compression with MIME-type and size filtering.
+  - MIME allowlist: `text/*`, `application/json`, `application/xml`, `application/javascript`, `image/svg+xml`, `application/wasm`.
+  - Default minimum size threshold of 256 bytes (configurable via `TARDIGRADE_COMPRESSION_MIN_SIZE`).
+  - Only applies compressed body when result is smaller than original.
+  - Enabled by default; disable via `TARDIGRADE_COMPRESSION_ENABLED=false`.
+  - Applied to `/v1/chat` and `/v1/commands` proxy responses; sets `Content-Encoding: gzip` when used.
+- Metrics endpoint (`src/http/metrics.zig`):
+  - `Metrics` struct tracking total requests, status class counts (2xx/3xx/4xx/5xx), and uptime.
+  - `GET /metrics` endpoint returns JSON metrics (no auth required).
+  - All gateway response paths (success and error) record request status.
+- Graceful shutdown (`src/http/shutdown.zig`):
+  - SIGTERM and SIGINT signal handlers set a global shutdown flag.
+  - Accept loop exits cleanly after current connection when flag is set.
+  - `installSignalHandlers()` called at gateway startup.
+
+### Changed
+- Edge config extended with `compression_enabled` and `compression_min_size` fields.
+- Gateway startup logs compression and signal handler status.
+- `sendApiError` records every error response in metrics automatically.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).

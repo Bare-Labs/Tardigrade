@@ -204,7 +204,26 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         _ = response.setConnection(false).setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
-        ctx.auditLog("/health", @intFromEnum(response.status));
+        state.metrics.recordRequest(200);
+        ctx.auditLog("/health", 200);
+        return;
+    }
+
+    // --- Metrics endpoint ---
+    if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics")) {
+        const metrics_json = state.metrics.toJson(allocator) catch {
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, false, state);
+            return;
+        };
+        defer allocator.free(metrics_json);
+
+        var response = http.Response.json(allocator, metrics_json);
+        defer response.deinit();
+        _ = response.setConnection(false).setHeader(http.correlation.HEADER_NAME, correlation_id);
+        state.security_headers.apply(&response);
+        try response.write(writer);
+        state.metrics.recordRequest(200);
+        ctx.auditLog("/metrics", 200);
         return;
     }
 
@@ -266,6 +285,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             .setHeader(http.session.SESSION_HEADER, session_token);
         state.security_headers.apply(&response);
         try response.write(writer);
+        state.metrics.recordRequest(201);
         ctx.auditLog("/v1/sessions", 201);
         return;
     }
@@ -296,6 +316,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
+        state.metrics.recordRequest(200);
         ctx.auditLog("/v1/sessions", 200);
         return;
     }
@@ -333,6 +354,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         state.security_headers.apply(&response);
         try response.write(writer);
+        state.metrics.recordRequest(200);
         ctx.auditLog("/v1/sessions", 200);
         return;
     }
@@ -404,6 +426,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
                         .setHeader("X-Idempotent-Replayed", "true");
                     state.security_headers.apply(&response);
                     try response.write(writer);
+                    state.metrics.recordRequest(cached.status);
                     ctx.auditLog("/v1/commands", cached.status);
                     return;
                 }
@@ -456,13 +479,20 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             if (cmd_error_body) |eb| allocator.free(eb);
         }
 
-        var response = http.Response.json(allocator, cmd_final_body);
+        // --- Compress and send ---
+        const cmd_accept_encoding = request.headers.get("Accept-Encoding");
+        const cmd_comp = http.compression.compressResponse(allocator, cmd_final_body, JSON_CONTENT_TYPE, cmd_accept_encoding, state.compression_config);
+        defer if (cmd_comp.body) |cb| allocator.free(cb);
+        const cmd_resp_body = if (cmd_comp.body) |cb| cb else cmd_final_body;
+        var response = http.Response.json(allocator, cmd_resp_body);
         defer response.deinit();
         _ = response.setStatus(@enumFromInt(cmd_final_status))
             .setConnection(false)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        if (cmd_comp.compressed) _ = response.setHeader("Content-Encoding", "gzip");
         state.security_headers.apply(&response);
         try response.write(writer);
+        state.metrics.recordRequest(cmd_final_status);
 
         // --- Store idempotency result ---
         if (effective_idem_key) |idem_key| {
@@ -501,6 +531,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
                         .setHeader("X-Idempotent-Replayed", "true");
                     state.security_headers.apply(&response);
                     try response.write(writer);
+                    state.metrics.recordRequest(cached.status);
                     ctx.auditLog("/v1/chat", cached.status);
                     return;
                 }
@@ -578,13 +609,20 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             if (error_body_to_free) |eb| allocator.free(eb);
         }
 
-        var response = http.Response.json(allocator, final_body);
+        // --- Compress and send ---
+        const chat_accept_encoding = request.headers.get("Accept-Encoding");
+        const chat_comp = http.compression.compressResponse(allocator, final_body, JSON_CONTENT_TYPE, chat_accept_encoding, state.compression_config);
+        defer if (chat_comp.body) |cb| allocator.free(cb);
+        const chat_resp_body = if (chat_comp.body) |cb| cb else final_body;
+        var response = http.Response.json(allocator, chat_resp_body);
         defer response.deinit();
         _ = response.setStatus(@enumFromInt(final_status))
             .setConnection(false)
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        if (chat_comp.compressed) _ = response.setHeader("Content-Encoding", "gzip");
         state.security_headers.apply(&response);
         try response.write(writer);
+        state.metrics.recordRequest(final_status);
 
         // --- Store idempotency result ---
         if (ctx.idempotency_key) |idem_key| {
@@ -776,6 +814,7 @@ fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Stat
     }
     state.security_headers.apply(&response);
     try response.write(writer);
+    state.metrics.recordRequest(@intFromEnum(status));
 }
 
 fn readHttpRequest(stream: std.net.Stream, buf: []u8) !usize {
@@ -848,6 +887,8 @@ test "authorizeRequest accepts valid hash" {
         .request_limits = http.request_limits.RequestLimits.default,
         .basic_auth_hashes = &[_][]const u8{},
         .log_level = .info,
+        .compression_enabled = false,
+        .compression_min_size = 256,
     };
 
     var headers = http.Headers.init(allocator);
