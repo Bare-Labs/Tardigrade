@@ -63,6 +63,8 @@ These features allow Tardigrade to become the Panda/BearClaw gateway early.
 - [x] `X-Correlation-ID` propagation downstream and in responses
 - [x] stable API error mapping (`unauthorized`, `invalid_request`, `rate_limited`, `tool_unavailable`, `upstream_timeout`, `internal_error`) with `request_id`
 - [x] structured audit logging (`route`, `status`, `auth_ok`, `correlation_id`, `latency_ms`)
+- [x] publish Linux binary artifact to GitHub Releases (`tardigrade-linux-x86_64.tar.gz`)
+- [x] document release download/install path in README (`releases/latest/download`)
 - [ ] native HTTPS socket termination in Zig runtime (deferred; cert/key config is in place)
 
 ### 0.1 Identity & Authentication

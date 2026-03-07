@@ -30,6 +30,16 @@ zig build run
 
 The server starts on `http://localhost:8069` by default.
 
+### Install latest Linux binary
+
+```bash
+curl -fsSL -o tardigrade-linux-x86_64.tar.gz \
+  https://github.com/Bare-Labs/Tardigrade/releases/latest/download/tardigrade-linux-x86_64.tar.gz
+tar -xzf tardigrade-linux-x86_64.tar.gz
+chmod +x tardigrade
+./tardigrade
+```
+
 ## BearClaw Edge Gateway MVP
 
 Tardigrade now supports an edge-gateway path for BearClaw:
