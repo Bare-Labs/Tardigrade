@@ -408,6 +408,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.upstream_base_urls.len > 0) {
         state.logger.info(null, "Upstream round-robin enabled with {d} base URLs", .{cfg.upstream_base_urls.len});
     }
+    if (cfg.upstream_retry_attempts > 1) {
+        state.logger.info(null, "Upstream retry attempts configured: {d}", .{cfg.upstream_retry_attempts});
+    }
     if (cfg.max_connections_per_ip > 0) {
         state.logger.info(null, "Per-IP connection limit enabled: {d}", .{cfg.max_connections_per_ip});
     }
@@ -1417,7 +1420,59 @@ fn proxyJsonExecute(
     state: *GatewayState,
     enable_streaming_success: bool,
 ) !ProxyExecution {
-    const upstream_base_url = state.nextUpstreamBaseUrl(cfg);
+    const configured_attempts: usize = @intCast(@max(cfg.upstream_retry_attempts, @as(u32, 1)));
+    const max_attempts = if (cfg.upstream_base_urls.len > 0)
+        @min(configured_attempts, cfg.upstream_base_urls.len)
+    else
+        configured_attempts;
+
+    var attempt: usize = 0;
+    var last_err: ?anyerror = null;
+    while (attempt < max_attempts) : (attempt += 1) {
+        const upstream_base_url = state.nextUpstreamBaseUrl(cfg);
+        const exec = proxyJsonExecuteSingleAttempt(
+            allocator,
+            cfg,
+            upstream_base_url,
+            proxy_pass_target,
+            suffix_path,
+            payload,
+            correlation_id,
+            client_ip,
+            incoming_host,
+            incoming_x_forwarded_for,
+            downstream_writer,
+            state,
+            enable_streaming_success,
+        ) catch |err| {
+            last_err = err;
+            if (attempt + 1 < max_attempts) {
+                state.logger.warn(correlation_id, "upstream attempt {d}/{d} failed: {}", .{ attempt + 1, max_attempts, err });
+                continue;
+            }
+            return err;
+        };
+        return exec;
+    }
+
+    return last_err orelse error.UpstreamUnavailable;
+}
+
+fn proxyJsonExecuteSingleAttempt(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    upstream_base_url: []const u8,
+    proxy_pass_target: []const u8,
+    suffix_path: ?[]const u8,
+    payload: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    incoming_host: ?[]const u8,
+    incoming_x_forwarded_for: ?[]const u8,
+    downstream_writer: anytype,
+    state: *GatewayState,
+    enable_streaming_success: bool,
+) !ProxyExecution {
     const resolved_target = try resolveProxyTarget(allocator, upstream_base_url, proxy_pass_target, suffix_path);
     defer allocator.free(resolved_target.url);
 
@@ -1880,6 +1935,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .connection_pool_size = 256,
         .max_connection_memory_bytes = 2 * 1024 * 1024,
         .proxy_stream_all_statuses = false,
+        .upstream_retry_attempts = 1,
     };
 
     const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/v1/chat");
@@ -1940,6 +1996,7 @@ test "authorizeRequest accepts valid hash" {
         .connection_pool_size = 256,
         .max_connection_memory_bytes = 2 * 1024 * 1024,
         .proxy_stream_all_statuses = false,
+        .upstream_retry_attempts = 1,
     };
 
     var headers = http.Headers.init(allocator);

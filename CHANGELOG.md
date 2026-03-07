@@ -34,6 +34,9 @@
   - Added `TARDIGRADE_UPSTREAM_BASE_URLS` (comma-separated) for configuring multiple upstream base URLs.
   - Proxy target resolution now selects upstream base URLs via round-robin across configured backends.
   - Added deterministic unit coverage for upstream base URL round-robin selection.
+- Phase 13.4 retry policy foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` (minimum 1) for proxy upstream retries.
+  - Proxy execution now retries failed attempts and rotates upstream base URL selection between attempts.
 
 ## [0.26.0] - 2026-03-xx
 

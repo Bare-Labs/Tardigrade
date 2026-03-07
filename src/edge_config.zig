@@ -61,6 +61,8 @@ pub const EdgeConfig = struct {
     max_connection_memory_bytes: usize,
     /// Whether to stream all upstream statuses directly (including non-200) instead of mapping.
     proxy_stream_all_statuses: bool,
+    /// Number of upstream attempt retries for proxy requests (minimum 1).
+    upstream_retry_attempts: u32,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -233,6 +235,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(stream_all_statuses_str);
     const proxy_stream_all_statuses = std.mem.eql(u8, stream_all_statuses_str, "true") or std.mem.eql(u8, stream_all_statuses_str, "1");
 
+    const retry_attempts_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS", "1") catch unreachable;
+    defer allocator.free(retry_attempts_str);
+    const upstream_retry_attempts = @max(std.fmt.parseInt(u32, retry_attempts_str, 10) catch 1, 1);
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
@@ -274,6 +280,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .connection_pool_size = connection_pool_size,
         .max_connection_memory_bytes = max_connection_memory_bytes,
         .proxy_stream_all_statuses = proxy_stream_all_statuses,
+        .upstream_retry_attempts = upstream_retry_attempts,
     };
 }
 
