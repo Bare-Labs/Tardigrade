@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.0] - 2026-03-07
+
+### Added
+- HTTP Basic Auth (`src/http/basic_auth.zig`):
+  - Parse `Authorization: Basic <base64>` headers.
+  - Base64 decode to extract username:password.
+  - Verify credentials against SHA-256 hash list of "user:password" strings.
+  - Configurable via `TARDIGRADE_BASIC_AUTH_HASHES` env var.
+  - Falls back from bearer token auth automatically.
+- Structured JSON logger (`src/http/logger.zig`):
+  - Severity levels: DEBUG, INFO, WARN, ERROR.
+  - JSON-structured output to stderr with ISO 8601 timestamps.
+  - Per-request correlation ID in log entries.
+  - Configurable minimum level via `TARDIGRADE_LOG_LEVEL` env var.
+- Browser caching headers (`src/http/cache_control.zig`):
+  - `CachePolicy` struct with Cache-Control directives (max-age, public, private, no-cache, no-store, must-revalidate, immutable).
+  - Preset policies: `no_caching`, `static_immutable`, `static_default`, `api_default`.
+  - MIME-type based policy selection via `policyForMimeType()`.
+  - Expires header generation from max-age offset.
+- Request validation enforcement in gateway (Phase 6.4):
+  - Header count and header size validation functions in `request_limits.zig`.
+  - Gateway pipeline enforces body size (413), URI length (414), and header count (400) limits.
+  - Configurable via env vars: `TARDIGRADE_MAX_BODY_SIZE`, `TARDIGRADE_MAX_URI_LENGTH`, `TARDIGRADE_MAX_HEADER_COUNT`, `TARDIGRADE_MAX_HEADER_SIZE`, `TARDIGRADE_BODY_TIMEOUT_MS`, `TARDIGRADE_HEADER_TIMEOUT_MS`.
+
+### Changed
+- Gateway startup and request handling now use structured JSON logger.
+- Edge config extended with `request_limits`, `basic_auth_hashes`, and `log_level` fields.
+- `authorizeRequest` now tries bearer token first, then falls back to HTTP Basic Auth.
+
 ## [0.11.0] - 2026-03-xx
 
 ### Added

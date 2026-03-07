@@ -131,17 +131,19 @@ Resolved: Command routing implemented in `src/http/command.zig`. Structured comm
  - [x] Last-Modified and If-Modified-Since
 
 ### 1.3 Error pages
-- [ ] Custom error pages (400, 401, 403, 404, 500, 502, 503, 504)
-- [ ] Error logging with levels
-- [ ] Graceful error responses
+- [x] Custom error pages (400, 401, 403, 404, 500, 502, 503, 504)
+- [x] Error logging with levels
+- [x] Graceful error responses
 
-Resolved: custom error pages implemented and samples added under `public/errors/`.
+Resolved: custom error pages implemented and samples added under `public/errors/`. Error logging with severity levels via structured logger (see 1.4). Graceful error responses via API error envelope with request_id.
 
 ### 1.4 Basic Logging
 - [x] Access log (combined format)
-- [ ] Error log with severity levels
-- [ ] Timestamps and request IDs
+- [x] Error log with severity levels
+- [x] Timestamps and request IDs
 - [ ] Log rotation support
+
+Resolved: Structured JSON logger implemented in `src/http/logger.zig`. Configurable severity levels (DEBUG/INFO/WARN/ERROR) via `TARDIGRADE_LOG_LEVEL` env var. JSON output to stderr with ISO 8601 timestamps, correlation IDs, and component names. Gateway uses structured logger for all startup and request-level logging.
 
 ## PHASE 2: Async I/O & Performance
 
@@ -277,9 +279,11 @@ Secrets may include:
 - [ ] Memory + disk tiered caching
 
 ### 5.3 Browser Caching
-- [ ] Expires header
-- [ ] Cache-Control header
-- [ ] ETag/Last-Modified validation
+- [x] Expires header
+- [x] Cache-Control header
+- [x] ETag/Last-Modified validation
+
+Resolved: Cache-Control and Expires headers implemented in `src/http/cache_control.zig`. CachePolicy struct with directives (max-age, public, private, no-cache, no-store, must-revalidate, immutable). Preset policies for static assets, APIs, and no-caching. MIME-type based policy selection. ETag/Last-Modified already implemented in earlier phases.
 
 ## PHASE 6: Security Features
 
@@ -300,15 +304,19 @@ Resolved: IP access control implemented in `src/http/access_control.zig`. Suppor
 Resolved: Token-bucket rate limiter implemented in `src/http/rate_limiter.zig`. Per-IP tracking with configurable RPS and burst. Returns 429 with stable API error envelope.
 
 ### 6.3 Authentication
-- [ ] HTTP Basic Auth
+- [x] HTTP Basic Auth
 - [ ] Auth request (subrequest-based)
 - [ ] JWT validation (optional module)
 
+Resolved: HTTP Basic Auth implemented in `src/http/basic_auth.zig`. Parses `Authorization: Basic <base64>` headers, decodes credentials, and verifies against SHA-256 hashes of "user:password" strings. Configured via `TARDIGRADE_BASIC_AUTH_HASHES` env var. Integrated as fallback auth method after bearer token in the gateway pipeline.
+
 ### 6.4 Request Validation
-- [ ] Request body size limits (client_max_body_size)
-- [ ] Header count/size limits
-- [ ] URI length limits
+- [x] Request body size limits (client_max_body_size)
+- [x] Header count/size limits
+- [x] URI length limits
 - [ ] Timeout enforcement (client_body_timeout, etc.)
+
+Resolved: Request validation limits enforced in gateway pipeline via `src/http/request_limits.zig`. Body size (413), URI length (414), and header count (400) validated after parsing. Configurable via env vars: `TARDIGRADE_MAX_BODY_SIZE`, `TARDIGRADE_MAX_URI_LENGTH`, `TARDIGRADE_MAX_HEADER_COUNT`, `TARDIGRADE_MAX_HEADER_SIZE`. Timeout env vars (`TARDIGRADE_BODY_TIMEOUT_MS`, `TARDIGRADE_HEADER_TIMEOUT_MS`) are configured but enforcement deferred to async I/O phase.
 
 ### 6.5 Security Headers
 - [ ] add_header directive

@@ -12,6 +12,7 @@ const GatewayState = struct {
     security_headers: http.security_headers.SecurityHeaders,
     session_store: ?http.session.SessionStore,
     access_control: ?http.access_control.AccessControl,
+    logger: http.logger.Logger,
 };
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
@@ -40,6 +41,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             http.access_control.AccessControl.fromConfig(state_allocator, cfg.access_control_rules, .allow) catch null
         else
             null,
+        .logger = http.logger.Logger.init(cfg.log_level, "gateway"),
     };
     defer {
         if (state.rate_limiter) |*rl| rl.deinit();
@@ -52,29 +54,38 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     var server = try std.net.Address.listen(address, .{ .reuse_address = true });
     defer server.deinit();
 
-    std.log.info("Tardigrade edge listening on {s}:{d}", .{ cfg.listen_host, cfg.listen_port });
+    state.logger.info(null, "Tardigrade edge listening on {s}:{d}", .{ cfg.listen_host, cfg.listen_port });
     if (!edge_config.hasTlsFiles(cfg)) {
-        std.log.warn("TLS cert/key not set; serving HTTP only. Set TARDIGRADE_TLS_CERT_PATH and TARDIGRADE_TLS_KEY_PATH.", .{});
+        state.logger.warn(null, "TLS cert/key not set; serving HTTP only", .{});
     } else {
-        std.log.info("TLS cert/key configured at {s} and {s}", .{ cfg.tls_cert_path, cfg.tls_key_path });
+        state.logger.info(null, "TLS cert/key configured at {s} and {s}", .{ cfg.tls_cert_path, cfg.tls_key_path });
     }
     if (state.rate_limiter != null) {
-        std.log.info("Rate limiting enabled: {d:.0} req/s, burst {d}", .{ cfg.rate_limit_rps, cfg.rate_limit_burst });
+        state.logger.info(null, "Rate limiting enabled: {d:.0} req/s, burst {d}", .{ cfg.rate_limit_rps, cfg.rate_limit_burst });
     }
     if (state.idempotency_store != null) {
-        std.log.info("Idempotency cache enabled: TTL {d}s", .{cfg.idempotency_ttl_seconds});
+        state.logger.info(null, "Idempotency cache enabled: TTL {d}s", .{cfg.idempotency_ttl_seconds});
     }
     if (state.session_store != null) {
-        std.log.info("Session management enabled: TTL {d}s, max {d}", .{ cfg.session_ttl_seconds, cfg.session_max });
+        state.logger.info(null, "Session management enabled: TTL {d}s, max {d}", .{ cfg.session_ttl_seconds, cfg.session_max });
     }
     if (state.access_control != null) {
-        std.log.info("IP access control enabled", .{});
+        state.logger.info(null, "IP access control enabled", .{});
+    }
+    if (cfg.basic_auth_hashes.len > 0) {
+        state.logger.info(null, "HTTP Basic Auth enabled with {d} credential(s)", .{cfg.basic_auth_hashes.len});
+    }
+    {
+        const limits = cfg.request_limits;
+        if (limits.max_body_size > 0 or limits.max_uri_length > 0 or limits.max_header_count > 0) {
+            state.logger.info(null, "Request limits configured", .{});
+        }
     }
 
     while (true) {
         const conn = try server.accept();
         handleConnection(conn.stream, cfg, &state) catch |err| {
-            std.log.err("edge connection error: {}", .{err});
+            state.logger.err(null, "edge connection error: {}", .{err});
         };
         conn.stream.close();
     }
@@ -91,7 +102,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
 
     const parse_result = http.Request.parse(allocator, req_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
         try sendApiError(allocator, stream.writer(), .bad_request, "invalid_request", "Malformed request", null, false, state);
-        std.log.warn("parse error: {}", .{err});
+        state.logger.warn(null, "parse error: {}", .{err});
         return;
     };
 
@@ -106,6 +117,34 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
     // --- Request Context ---
     const client_ip = http.request_context.extractClientIp(&request, "unknown");
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
+
+    // --- Request validation (body size, URI length, header count) ---
+    const limits = cfg.request_limits;
+    const uri_check = http.request_limits.validateUriLength(request.uri.path.len, limits);
+    if (uri_check != .ok) {
+        var msg_buf: [256]u8 = undefined;
+        const msg = http.request_limits.rejectionMessage(uri_check, &msg_buf);
+        try sendApiError(allocator, writer, .uri_too_long, "invalid_request", msg, correlation_id, false, state);
+        state.logger.warn(correlation_id, "URI too long: {d} bytes", .{request.uri.path.len});
+        ctx.auditLog(request.uri.path, 414);
+        return;
+    }
+    const header_count_check = http.request_limits.validateHeaderCount(request.headers.count(), limits);
+    if (header_count_check != .ok) {
+        try sendApiError(allocator, writer, .bad_request, "invalid_request", "Too many headers", correlation_id, false, state);
+        state.logger.warn(correlation_id, "Too many headers: {d}", .{request.headers.count()});
+        ctx.auditLog(request.uri.path, 400);
+        return;
+    }
+    if (request.body) |body| {
+        const body_check = http.request_limits.validateBodySize(body.len, limits);
+        if (body_check != .ok) {
+            try sendApiError(allocator, writer, .payload_too_large, "invalid_request", "Request body too large", correlation_id, false, state);
+            state.logger.warn(correlation_id, "Body too large: {d} bytes", .{body.len});
+            ctx.auditLog(request.uri.path, 413);
+            return;
+        }
+    }
 
     // --- Extract API version ---
     if (http.api_router.parseVersionedPath(request.uri.path)) |versioned| {
@@ -550,18 +589,31 @@ const AuthResult = struct {
 };
 
 fn authorizeRequest(cfg: *const edge_config.EdgeConfig, headers: *const http.Headers) AuthResult {
-    if (cfg.auth_token_hashes.len == 0) return .{ .ok = false, .token_hash = null };
-    const token = http.auth.authorize(headers, null) catch return .{ .ok = false, .token_hash = null };
+    // Try bearer token auth first
+    if (cfg.auth_token_hashes.len > 0) {
+        if (http.auth.authorize(headers, null)) |token| {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
 
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
+            var digest_hex: [64]u8 = undefined;
+            _ = std.fmt.bufPrint(&digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch return .{ .ok = false, .token_hash = null };
 
-    var digest_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&digest)}) catch return .{ .ok = false, .token_hash = null };
-
-    for (cfg.auth_token_hashes) |allowed| {
-        if (std.mem.eql(u8, allowed, digest_hex[0..])) return .{ .ok = true, .token_hash = allowed };
+            for (cfg.auth_token_hashes) |allowed| {
+                if (std.mem.eql(u8, allowed, digest_hex[0..])) return .{ .ok = true, .token_hash = allowed };
+            }
+        } else |_| {}
     }
+
+    // Fall back to HTTP Basic Auth
+    if (cfg.basic_auth_hashes.len > 0) {
+        var cred_buf: [512]u8 = undefined;
+        if (http.basic_auth.fromHeaders(headers, &cred_buf)) |creds| {
+            if (http.basic_auth.verifyCredentials(creds, cfg.basic_auth_hashes)) {
+                return .{ .ok = true, .token_hash = null };
+            }
+        } else |_| {}
+    }
+
     return .{ .ok = false, .token_hash = null };
 }
 
@@ -773,6 +825,9 @@ test "authorizeRequest accepts valid hash" {
         .session_ttl_seconds = 0,
         .session_max = 0,
         .access_control_rules = "",
+        .request_limits = http.request_limits.RequestLimits.default,
+        .basic_auth_hashes = &[_][]const u8{},
+        .log_level = .info,
     };
 
     var headers = http.Headers.init(allocator);

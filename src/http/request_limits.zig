@@ -53,6 +53,8 @@ pub const ValidationResult = union(enum) {
     ok: void,
     body_too_large: struct { size: usize, limit: usize },
     uri_too_long: struct { length: usize, limit: usize },
+    too_many_headers: struct { count: usize, limit: usize },
+    header_too_large: struct { size: usize, limit: usize },
 };
 
 /// Validate a request body size against limits.
@@ -73,12 +75,32 @@ pub fn validateUriLength(uri_len: usize, limits: RequestLimits) ValidationResult
     return .ok;
 }
 
+/// Validate header count against limits.
+pub fn validateHeaderCount(count: usize, limits: RequestLimits) ValidationResult {
+    const max = limits.effectiveMaxHeaderCount();
+    if (count > max) {
+        return .{ .too_many_headers = .{ .count = count, .limit = max } };
+    }
+    return .ok;
+}
+
+/// Validate a single header line size against limits.
+pub fn validateHeaderSize(size: usize, limits: RequestLimits) ValidationResult {
+    const max = limits.effectiveMaxHeaderSize();
+    if (size > max) {
+        return .{ .header_too_large = .{ .size = size, .limit = max } };
+    }
+    return .ok;
+}
+
 /// Format a human-readable rejection message.
 pub fn rejectionMessage(result: ValidationResult, buf: []u8) []const u8 {
     return switch (result) {
         .ok => "OK",
         .body_too_large => |info| std.fmt.bufPrint(buf, "Request body too large: {d} bytes exceeds {d} byte limit", .{ info.size, info.limit }) catch "Request body too large",
         .uri_too_long => |info| std.fmt.bufPrint(buf, "URI too long: {d} bytes exceeds {d} byte limit", .{ info.length, info.limit }) catch "URI too long",
+        .too_many_headers => |info| std.fmt.bufPrint(buf, "Too many headers: {d} exceeds {d} limit", .{ info.count, info.limit }) catch "Too many headers",
+        .header_too_large => |info| std.fmt.bufPrint(buf, "Header too large: {d} bytes exceeds {d} byte limit", .{ info.size, info.limit }) catch "Header too large",
     };
 }
 
@@ -169,4 +191,54 @@ test "rejectionMessage formats uri_too_long" {
     var buf: [256]u8 = undefined;
     const msg = rejectionMessage(result, &buf);
     try std.testing.expect(std.mem.indexOf(u8, msg, "10000") != null);
+}
+
+test "validateHeaderCount accepts under limit" {
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 50, .max_header_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    try std.testing.expectEqual(ValidationResult.ok, validateHeaderCount(25, limits));
+    try std.testing.expectEqual(ValidationResult.ok, validateHeaderCount(50, limits));
+}
+
+test "validateHeaderCount rejects over limit" {
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 50, .max_header_size = 0, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    const result = validateHeaderCount(100, limits);
+    switch (result) {
+        .too_many_headers => |info| {
+            try std.testing.expectEqual(@as(usize, 100), info.count);
+            try std.testing.expectEqual(@as(usize, 50), info.limit);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "validateHeaderSize accepts under limit" {
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 4096, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    try std.testing.expectEqual(ValidationResult.ok, validateHeaderSize(1024, limits));
+}
+
+test "validateHeaderSize rejects over limit" {
+    const limits = RequestLimits{ .max_body_size = 0, .max_uri_length = 0, .max_header_count = 0, .max_header_size = 4096, .body_timeout_ms = 0, .header_timeout_ms = 0 };
+    const result = validateHeaderSize(8192, limits);
+    switch (result) {
+        .header_too_large => |info| {
+            try std.testing.expectEqual(@as(usize, 8192), info.size);
+            try std.testing.expectEqual(@as(usize, 4096), info.limit);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "rejectionMessage formats too_many_headers" {
+    const result = ValidationResult{ .too_many_headers = .{ .count = 200, .limit = 100 } };
+    var buf: [256]u8 = undefined;
+    const msg = rejectionMessage(result, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "100") != null);
+}
+
+test "rejectionMessage formats header_too_large" {
+    const result = ValidationResult{ .header_too_large = .{ .size = 16384, .limit = 8192 } };
+    var buf: [256]u8 = undefined;
+    const msg = rejectionMessage(result, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "16384") != null);
 }

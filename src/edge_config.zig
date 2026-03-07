@@ -1,4 +1,5 @@
 const std = @import("std");
+const http = @import("http.zig");
 
 pub const EdgeConfig = struct {
     listen_host: []const u8,
@@ -24,6 +25,12 @@ pub const EdgeConfig = struct {
     /// IP access control rules (empty = disabled).
     /// Format: "allow 10.0.0.0/8, deny 0.0.0.0/0"
     access_control_rules: []const u8,
+    /// Request validation limits.
+    request_limits: http.request_limits.RequestLimits,
+    /// Basic auth credential hashes (SHA-256 of "user:password", empty = disabled).
+    basic_auth_hashes: [][]const u8,
+    /// Minimum log level (debug, info, warn, error).
+    log_level: http.logger.Level,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -33,6 +40,8 @@ pub const EdgeConfig = struct {
         for (self.auth_token_hashes) |h| allocator.free(h);
         allocator.free(self.auth_token_hashes);
         allocator.free(self.access_control_rules);
+        for (self.basic_auth_hashes) |h| allocator.free(h);
+        allocator.free(self.basic_auth_hashes);
         self.* = undefined;
     }
 };
@@ -93,6 +102,41 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const access_control_rules = envOrDefault(allocator, "TARDIGRADE_ACCESS_CONTROL", "") catch unreachable;
     errdefer allocator.free(access_control_rules);
 
+    // Request limits
+    const max_body_str = envOrDefault(allocator, "TARDIGRADE_MAX_BODY_SIZE", "0") catch unreachable;
+    defer allocator.free(max_body_str);
+    const max_body_size = std.fmt.parseInt(usize, max_body_str, 10) catch 0;
+
+    const max_uri_str = envOrDefault(allocator, "TARDIGRADE_MAX_URI_LENGTH", "0") catch unreachable;
+    defer allocator.free(max_uri_str);
+    const max_uri_length = std.fmt.parseInt(usize, max_uri_str, 10) catch 0;
+
+    const max_hdr_count_str = envOrDefault(allocator, "TARDIGRADE_MAX_HEADER_COUNT", "0") catch unreachable;
+    defer allocator.free(max_hdr_count_str);
+    const max_header_count = std.fmt.parseInt(usize, max_hdr_count_str, 10) catch 0;
+
+    const max_hdr_size_str = envOrDefault(allocator, "TARDIGRADE_MAX_HEADER_SIZE", "0") catch unreachable;
+    defer allocator.free(max_hdr_size_str);
+    const max_header_size = std.fmt.parseInt(usize, max_hdr_size_str, 10) catch 0;
+
+    const body_timeout_str = envOrDefault(allocator, "TARDIGRADE_BODY_TIMEOUT_MS", "0") catch unreachable;
+    defer allocator.free(body_timeout_str);
+    const body_timeout_ms = std.fmt.parseInt(u32, body_timeout_str, 10) catch 0;
+
+    const header_timeout_str = envOrDefault(allocator, "TARDIGRADE_HEADER_TIMEOUT_MS", "0") catch unreachable;
+    defer allocator.free(header_timeout_str);
+    const header_timeout_ms = std.fmt.parseInt(u32, header_timeout_str, 10) catch 0;
+
+    // Basic auth
+    const raw_basic_hashes = envOrDefault(allocator, "TARDIGRADE_BASIC_AUTH_HASHES", "") catch unreachable;
+    defer allocator.free(raw_basic_hashes);
+    const basic_auth_hashes = try parseHashes(allocator, raw_basic_hashes);
+
+    // Log level
+    const log_level_str = envOrDefault(allocator, "TARDIGRADE_LOG_LEVEL", "info") catch unreachable;
+    defer allocator.free(log_level_str);
+    const log_level = http.logger.Level.parse(log_level_str) orelse .info;
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
@@ -109,6 +153,16 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .session_ttl_seconds = session_ttl_seconds,
         .session_max = session_max,
         .access_control_rules = access_control_rules,
+        .request_limits = .{
+            .max_body_size = max_body_size,
+            .max_uri_length = max_uri_length,
+            .max_header_count = max_header_count,
+            .max_header_size = max_header_size,
+            .body_timeout_ms = body_timeout_ms,
+            .header_timeout_ms = header_timeout_ms,
+        },
+        .basic_auth_hashes = basic_auth_hashes,
+        .log_level = log_level,
     };
 }
 
