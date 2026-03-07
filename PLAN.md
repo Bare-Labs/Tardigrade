@@ -65,7 +65,9 @@ These features allow Tardigrade to become the Panda/BearClaw gateway early.
 - [x] structured audit logging (`route`, `status`, `auth_ok`, `correlation_id`, `latency_ms`)
 - [x] publish Linux binary artifact to GitHub Releases (`tardigrade-linux-x86_64.tar.gz`)
 - [x] document release download/install path in README (`releases/latest/download`)
-- [ ] native HTTPS socket termination in Zig runtime (deferred; cert/key config is in place)
+- [x] native HTTPS socket termination in Zig runtime
+
+Resolved: native TLS termination implemented via OpenSSL-backed server handshake in `src/http/tls_termination.zig` and integrated into worker connection handling in `src/edge_gateway.zig`. When `TARDIGRADE_TLS_CERT_PATH` and `TARDIGRADE_TLS_KEY_PATH` are set, accepted sockets perform TLS handshake before HTTP parsing.
 
 ### 0.1 Identity & Authentication
 - [x] Bearer token authentication

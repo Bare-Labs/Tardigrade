@@ -49,8 +49,8 @@ Tardigrade now supports an edge-gateway path for BearClaw:
 Environment variables:
 - `TARDIGRADE_LISTEN_HOST` (default `0.0.0.0`)
 - `TARDIGRADE_LISTEN_PORT` (default `8069`)
-- `TARDIGRADE_TLS_CERT_PATH` (configured path, runtime TLS socket termination pending)
-- `TARDIGRADE_TLS_KEY_PATH` (configured path, runtime TLS socket termination pending)
+- `TARDIGRADE_TLS_CERT_PATH` (PEM certificate path; enables TLS termination when paired with key)
+- `TARDIGRADE_TLS_KEY_PATH` (PEM private key path; enables TLS termination when paired with cert)
 - `TARDIGRADE_UPSTREAM_BASE_URL` (default `http://127.0.0.1:8080`)
 - `TARDIGRADE_AUTH_TOKEN_HASHES` (comma-separated lowercase SHA-256 token hashes)
 - `TARDIGRADE_MAX_MESSAGE_CHARS` (default `4000`)

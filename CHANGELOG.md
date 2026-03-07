@@ -1,6 +1,15 @@
 
 # Changelog
 
+## [0.20.0] - 2026-03-xx
+
+### Added
+- Native HTTPS/TLS termination (`src/http/tls_termination.zig`, `src/edge_gateway.zig`, `build.zig`):
+  - OpenSSL-backed TLS server context with certificate/private-key loading from configured PEM files.
+  - Worker connection path now performs TLS handshake (`SSL_accept`) when TLS cert/key are configured.
+  - HTTP request parsing/response writing now supports both plain TCP streams and TLS-wrapped streams.
+  - Build linked with `ssl`/`crypto` system libraries for executable and tests.
+
 ## [0.19.0] - 2026-03-xx
 
 ### Added

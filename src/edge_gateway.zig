@@ -194,6 +194,7 @@ const GatewayState = struct {
 const WorkerContext = struct {
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
+    tls: ?*http.tls_termination.TlsTerminator,
 };
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
@@ -250,6 +251,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     defer event_loop.deinit();
     try event_loop.addReadFd(listen_fd);
     var timer = http.event_loop.TimerManager.init(250);
+    var tls_terminator: ?http.tls_termination.TlsTerminator = null;
+    if (edge_config.hasTlsFiles(cfg)) {
+        tls_terminator = try http.tls_termination.TlsTerminator.init(cfg.tls_cert_path, cfg.tls_key_path);
+    }
+    defer if (tls_terminator) |*tls| tls.deinit();
     const worker_count: usize = blk: {
         const configured = if (cfg.worker_threads == 0)
             (std.Thread.getCpuCount() catch 1)
@@ -257,7 +263,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             cfg.worker_threads;
         break :blk @intCast(@max(configured, @as(u32, 1)));
     };
-    var worker_ctx = WorkerContext{ .cfg = cfg, .state = &state };
+    var worker_ctx = WorkerContext{
+        .cfg = cfg,
+        .state = &state,
+        .tls = if (tls_terminator) |*tls| tls else null,
+    };
     var worker_pool: http.worker_pool.WorkerPool = undefined;
     try worker_pool.init(
         state_allocator,
@@ -273,7 +283,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (!edge_config.hasTlsFiles(cfg)) {
         state.logger.warn(null, "TLS cert/key not set; serving HTTP only", .{});
     } else {
-        state.logger.info(null, "TLS cert/key configured at {s} and {s}", .{ cfg.tls_cert_path, cfg.tls_key_path });
+        state.logger.info(null, "TLS termination enabled with cert/key at {s} and {s}", .{ cfg.tls_cert_path, cfg.tls_key_path });
     }
     if (state.rate_limiter != null) {
         state.logger.info(null, "Rate limiting enabled: {d:.0} req/s, burst {d}", .{ cfg.rate_limit_rps, cfg.rate_limit_burst });
@@ -388,12 +398,26 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         return;
     };
 
-    const stream = std.net.Stream{ .handle = client_fd };
-    defer stream.close();
+    if (ctx.tls) |tls| {
+        var tls_conn = tls.accept(client_fd) catch |err| {
+            ctx.state.logger.warn(null, "tls handshake error: {}", .{err});
+            std.posix.close(client_fd);
+            return;
+        };
+        defer tls_conn.deinit();
+        defer std.posix.close(client_fd);
 
-    handleConnection(stream, ctx.cfg, ctx.state) catch |err| {
-        ctx.state.logger.err(null, "edge connection error: {}", .{err});
-    };
+        handleConnection(&tls_conn, ctx.cfg, ctx.state) catch |err| {
+            ctx.state.logger.err(null, "edge connection error: {}", .{err});
+        };
+    } else {
+        const stream = std.net.Stream{ .handle = client_fd };
+        defer stream.close();
+
+        handleConnection(stream, ctx.cfg, ctx.state) catch |err| {
+            ctx.state.logger.err(null, "edge connection error: {}", .{err});
+        };
+    }
 }
 
 fn clientIpKeyFromAddress(allocator: std.mem.Allocator, address: std.net.Address) ![]const u8 {
@@ -418,24 +442,24 @@ fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
     _ = try std.posix.fcntl(fd, std.posix.F.SETFL, flags);
 }
 
-fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, state: *GatewayState) !void {
+fn handleConnection(conn: anytype, cfg: *const edge_config.EdgeConfig, state: *GatewayState) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var req_buf: [MAX_REQUEST_SIZE]u8 = undefined;
-    const total_read = try readHttpRequest(stream, req_buf[0..]);
+    const total_read = try readHttpRequest(conn, req_buf[0..]);
     if (total_read == 0) return;
 
     const parse_result = http.Request.parse(allocator, req_buf[0..total_read], MAX_REQUEST_SIZE) catch |err| {
-        try sendApiError(allocator, stream.writer(), .bad_request, "invalid_request", "Malformed request", null, false, state);
+        try sendApiError(allocator, conn.writer(), .bad_request, "invalid_request", "Malformed request", null, false, state);
         state.logger.warn(null, "parse error: {}", .{err});
         return;
     };
 
     var request = parse_result.request;
     defer request.deinit();
-    const writer = stream.writer();
+    const writer = conn.writer();
 
     // --- Correlation ID ---
     const correlation_id = try http.correlation.fromHeadersOrGenerate(allocator, &request.headers);
@@ -1276,12 +1300,12 @@ fn logAccess(ctx: *const http.request_context.RequestContext, method: []const u8
     entry.log();
 }
 
-fn readHttpRequest(stream: std.net.Stream, buf: []u8) !usize {
+fn readHttpRequest(conn: anytype, buf: []u8) !usize {
     var total_read: usize = 0;
     var header_end: ?usize = null;
 
     while (total_read < buf.len) {
-        const n = try stream.read(buf[total_read..]);
+        const n = try conn.read(buf[total_read..]);
         if (n == 0) break;
         total_read += n;
 
