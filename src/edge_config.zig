@@ -35,6 +35,10 @@ pub const EdgeConfig = struct {
     compression_enabled: bool,
     /// Minimum response body size to compress (bytes).
     compression_min_size: usize,
+    /// Circuit breaker failure threshold (0 = disabled).
+    cb_threshold: u32,
+    /// Circuit breaker open timeout in milliseconds before half-open probe.
+    cb_timeout_ms: u64,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -150,6 +154,15 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(comp_min_str);
     const compression_min_size = std.fmt.parseInt(usize, comp_min_str, 10) catch 256;
 
+    // Circuit breaker
+    const cb_threshold_str = envOrDefault(allocator, "TARDIGRADE_CB_THRESHOLD", "0") catch unreachable;
+    defer allocator.free(cb_threshold_str);
+    const cb_threshold = std.fmt.parseInt(u32, cb_threshold_str, 10) catch 0;
+
+    const cb_timeout_str = envOrDefault(allocator, "TARDIGRADE_CB_TIMEOUT_MS", "30000") catch unreachable;
+    defer allocator.free(cb_timeout_str);
+    const cb_timeout_ms = std.fmt.parseInt(u64, cb_timeout_str, 10) catch 30_000;
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
@@ -178,6 +191,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .log_level = log_level,
         .compression_enabled = compression_enabled,
         .compression_min_size = compression_min_size,
+        .cb_threshold = cb_threshold,
+        .cb_timeout_ms = cb_timeout_ms,
     };
 }
 

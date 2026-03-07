@@ -33,6 +33,8 @@ pub const cache_control = @import("http/cache_control.zig");
 pub const compression = @import("http/compression.zig");
 pub const metrics = @import("http/metrics.zig");
 pub const shutdown = @import("http/shutdown.zig");
+pub const circuit_breaker = @import("http/circuit_breaker.zig");
+pub const access_log = @import("http/access_log.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

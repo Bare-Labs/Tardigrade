@@ -15,6 +15,7 @@ const GatewayState = struct {
     logger: http.logger.Logger,
     metrics: http.metrics.Metrics,
     compression_config: http.compression.CompressionConfig,
+    circuit_breaker: http.circuit_breaker.CircuitBreaker,
 };
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
@@ -49,6 +50,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .enabled = cfg.compression_enabled,
             .min_size = cfg.compression_min_size,
         },
+        .circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{
+            .threshold = cfg.cb_threshold,
+            .timeout_ms = cfg.cb_timeout_ms,
+        }),
     };
     defer {
         if (state.rate_limiter) |*rl| rl.deinit();
@@ -90,6 +95,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (cfg.compression_enabled) {
         state.logger.info(null, "Gzip compression enabled (min size: {d} bytes)", .{cfg.compression_min_size});
+    }
+    if (cfg.cb_threshold > 0) {
+        state.logger.info(null, "Circuit breaker enabled: threshold={d} timeout={d}ms", .{ cfg.cb_threshold, cfg.cb_timeout_ms });
     }
 
     // Install signal handlers for graceful shutdown
@@ -146,14 +154,14 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         const msg = http.request_limits.rejectionMessage(uri_check, &msg_buf);
         try sendApiError(allocator, writer, .uri_too_long, "invalid_request", msg, correlation_id, false, state);
         state.logger.warn(correlation_id, "URI too long: {d} bytes", .{request.uri.path.len});
-        ctx.auditLog(request.uri.path, 414);
+        logAccess(&ctx, request.method.toString(), request.uri.path, 414, request.headers.get("user-agent") orelse "");
         return;
     }
     const header_count_check = http.request_limits.validateHeaderCount(request.headers.count(), limits);
     if (header_count_check != .ok) {
         try sendApiError(allocator, writer, .bad_request, "invalid_request", "Too many headers", correlation_id, false, state);
         state.logger.warn(correlation_id, "Too many headers: {d}", .{request.headers.count()});
-        ctx.auditLog(request.uri.path, 400);
+        logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
         return;
     }
     if (request.body) |body| {
@@ -161,7 +169,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         if (body_check != .ok) {
             try sendApiError(allocator, writer, .payload_too_large, "invalid_request", "Request body too large", correlation_id, false, state);
             state.logger.warn(correlation_id, "Body too large: {d} bytes", .{body.len});
-            ctx.auditLog(request.uri.path, 413);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 413, request.headers.get("user-agent") orelse "");
             return;
         }
     }
@@ -180,7 +188,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
     if (state.access_control) |*acl| {
         if (acl.check(client_ip) == .denied) {
             try sendApiError(allocator, writer, .forbidden, "forbidden", "Access denied", correlation_id, false, state);
-            ctx.auditLog(request.uri.path, 403);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 403, request.headers.get("user-agent") orelse "");
             return;
         }
     }
@@ -192,7 +200,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             _ = rl_result;
         } else {
             try sendApiError(allocator, writer, .too_many_requests, "rate_limited", "Rate limit exceeded", correlation_id, false, state);
-            ctx.auditLog(request.uri.path, 429);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 429, request.headers.get("user-agent") orelse "");
             return;
         }
     }
@@ -205,7 +213,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         state.security_headers.apply(&response);
         try response.write(writer);
         state.metrics.recordRequest(200);
-        ctx.auditLog("/health", 200);
+        logAccess(&ctx, request.method.toString(), "/health", 200, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -223,7 +231,28 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         state.security_headers.apply(&response);
         try response.write(writer);
         state.metrics.recordRequest(200);
-        ctx.auditLog("/metrics", 200);
+        logAccess(&ctx, request.method.toString(), "/metrics", 200, request.headers.get("user-agent") orelse "");
+        return;
+    }
+
+    // --- Prometheus metrics endpoint ---
+    if (request.method == .GET and std.mem.eql(u8, request.uri.path, "/metrics/prometheus")) {
+        const prom_text = state.metrics.toPrometheus(allocator) catch {
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to generate metrics", correlation_id, false, state);
+            return;
+        };
+        defer allocator.free(prom_text);
+
+        var response = http.Response.init(allocator);
+        defer response.deinit();
+        _ = response.setBody(prom_text)
+            .setContentType("text/plain; version=0.0.4; charset=utf-8")
+            .setConnection(false)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        state.security_headers.apply(&response);
+        try response.write(writer);
+        state.metrics.recordRequest(200);
+        logAccess(&ctx, request.method.toString(), "/metrics/prometheus", 200, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -232,7 +261,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
     if (versioned) |route| {
         if (!http.api_router.isSupportedVersion(route.version)) {
             try sendApiError(allocator, writer, .bad_request, "invalid_request", "Unsupported API version", correlation_id, false, state);
-            ctx.auditLog(request.uri.path, 400);
+            logAccess(&ctx, request.method.toString(), request.uri.path, 400, request.headers.get("user-agent") orelse "");
             return;
         }
     }
@@ -241,7 +270,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
         if (state.session_store == null) {
             try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, false, state);
-            ctx.auditLog("/v1/sessions", 404);
+            logAccess(&ctx, request.method.toString(), "/v1/sessions", 404, request.headers.get("user-agent") orelse "");
             return;
         }
 
@@ -249,7 +278,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         const auth_result = authorizeRequest(cfg, &request.headers);
         if (!auth_result.ok) {
             try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
-            ctx.auditLog("/v1/sessions", 401);
+            logAccess(&ctx, request.method.toString(), "/v1/sessions", 401, request.headers.get("user-agent") orelse "");
             return;
         }
         const identity = auth_result.token_hash orelse "-";
@@ -270,7 +299,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
                 else => "Session creation failed",
             };
             try sendApiError(allocator, writer, .too_many_requests, "rate_limited", msg, correlation_id, false, state);
-            ctx.auditLog("/v1/sessions", 429);
+            logAccess(&ctx, request.method.toString(), "/v1/sessions", 429, request.headers.get("user-agent") orelse "");
             return;
         };
 
@@ -286,7 +315,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         state.security_headers.apply(&response);
         try response.write(writer);
         state.metrics.recordRequest(201);
-        ctx.auditLog("/v1/sessions", 201);
+        logAccess(&ctx, request.method.toString(), "/v1/sessions", 201, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -294,13 +323,13 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
     if (request.method == .DELETE and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
         if (state.session_store == null) {
             try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, false, state);
-            ctx.auditLog("/v1/sessions", 404);
+            logAccess(&ctx, request.method.toString(), "/v1/sessions", 404, request.headers.get("user-agent") orelse "");
             return;
         }
 
         const session_token = http.session.fromHeaders(&request.headers) orelse {
             try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing or invalid X-Session-Token", correlation_id, false, state);
-            ctx.auditLog("/v1/sessions", 400);
+            logAccess(&ctx, request.method.toString(), "/v1/sessions", 400, request.headers.get("user-agent") orelse "");
             return;
         };
 
@@ -317,7 +346,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         state.security_headers.apply(&response);
         try response.write(writer);
         state.metrics.recordRequest(200);
-        ctx.auditLog("/v1/sessions", 200);
+        logAccess(&ctx, request.method.toString(), "/v1/sessions", 200, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -325,7 +354,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
     if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
         if (state.session_store == null) {
             try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, false, state);
-            ctx.auditLog("/v1/sessions", 404);
+            logAccess(&ctx, request.method.toString(), "/v1/sessions", 404, request.headers.get("user-agent") orelse "");
             return;
         }
 
@@ -333,14 +362,14 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         const auth_result = authorizeRequest(cfg, &request.headers);
         if (!auth_result.ok) {
             try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
-            ctx.auditLog("/v1/sessions", 401);
+            logAccess(&ctx, request.method.toString(), "/v1/sessions", 401, request.headers.get("user-agent") orelse "");
             return;
         }
         const identity = auth_result.token_hash orelse "-";
 
         const sessions = state.session_store.?.listByIdentity(allocator, identity) catch {
             try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to list sessions", correlation_id, false, state);
-            ctx.auditLog("/v1/sessions", 500);
+            logAccess(&ctx, request.method.toString(), "/v1/sessions", 500, request.headers.get("user-agent") orelse "");
             return;
         };
         defer allocator.free(sessions);
@@ -355,7 +384,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         state.security_headers.apply(&response);
         try response.write(writer);
         state.metrics.recordRequest(200);
-        ctx.auditLog("/v1/sessions", 200);
+        logAccess(&ctx, request.method.toString(), "/v1/sessions", 200, request.headers.get("user-agent") orelse "");
         return;
     }
 
@@ -380,21 +409,21 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         }
         if (!cmd_authenticated) {
             try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
-            ctx.auditLog("/v1/commands", 401);
+            logAccess(&ctx, request.method.toString(), "/v1/commands", 401, request.headers.get("user-agent") orelse "");
             return;
         }
 
         // --- Content-Type validation ---
         if (!isJsonContentType(request.contentType())) {
             try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, false, state);
-            ctx.auditLog("/v1/commands", 400);
+            logAccess(&ctx, request.method.toString(), "/v1/commands", 400, request.headers.get("user-agent") orelse "");
             return;
         }
 
         // --- Body parsing ---
         const cmd_body = request.body orelse {
             try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, false, state);
-            ctx.auditLog("/v1/commands", 400);
+            logAccess(&ctx, request.method.toString(), "/v1/commands", 400, request.headers.get("user-agent") orelse "");
             return;
         };
 
@@ -406,7 +435,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
                 else => "Invalid command envelope",
             };
             try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, false, state);
-            ctx.auditLog("/v1/commands", 400);
+            logAccess(&ctx, request.method.toString(), "/v1/commands", 400, request.headers.get("user-agent") orelse "");
             return;
         };
         defer cmd.deinit(allocator);
@@ -427,7 +456,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
                     state.security_headers.apply(&response);
                     try response.write(writer);
                     state.metrics.recordRequest(cached.status);
-                    ctx.auditLog("/v1/commands", cached.status);
+                    logAccess(&ctx, request.method.toString(), "/v1/commands", cached.status, request.headers.get("user-agent") orelse "");
                     return;
                 }
             }
@@ -444,14 +473,32 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             ctx.api_version,
         ) catch {
             try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to build upstream request", correlation_id, false, state);
-            ctx.auditLog("/v1/commands", 500);
+            logAccess(&ctx, request.method.toString(), "/v1/commands", 500, request.headers.get("user-agent") orelse "");
             return;
         };
         defer allocator.free(envelope);
 
         // --- Forward to upstream ---
         const upstream_path = cmd.command_type.upstreamPath();
+
+        // --- Circuit breaker check ---
+        if (!state.circuit_breaker.tryAcquire()) {
+            state.logger.warn(null, "circuit breaker open, rejecting /v1/commands", .{});
+            try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, false, state);
+            const cb_audit = http.command.CommandAudit{
+                .command = cmd.command_type.toString(),
+                .correlation_id = correlation_id,
+                .identity = ctx.identity orelse "-",
+                .status = 503,
+                .latency_ms = ctx.elapsedMs(),
+            };
+            cb_audit.log();
+            return;
+        }
+
         const cmd_proxy_result = proxyCommand(allocator, cfg, upstream_path, envelope, correlation_id) catch {
+            state.circuit_breaker.recordFailure();
+            state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuit_breaker.stateName()});
             try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, false, state);
             // Audit
             const cmd_audit = http.command.CommandAudit{
@@ -465,6 +512,13 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             return;
         };
         defer allocator.free(cmd_proxy_result.body);
+
+        // Record circuit breaker outcome based on upstream status
+        if (cmd_proxy_result.status >= 500) {
+            state.circuit_breaker.recordFailure();
+        } else {
+            state.circuit_breaker.recordSuccess();
+        }
 
         var cmd_final_status: u16 = cmd_proxy_result.status;
         var cmd_final_body: []const u8 = cmd_proxy_result.body;
@@ -532,7 +586,7 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
                     state.security_headers.apply(&response);
                     try response.write(writer);
                     state.metrics.recordRequest(cached.status);
-                    ctx.auditLog("/v1/chat", cached.status);
+                    logAccess(&ctx, request.method.toString(), "/v1/chat", cached.status, request.headers.get("user-agent") orelse "");
                     return;
                 }
             }
@@ -559,21 +613,21 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         }
         if (!authenticated) {
             try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
-            ctx.auditLog("/v1/chat", 401);
+            logAccess(&ctx, request.method.toString(), "/v1/chat", 401, request.headers.get("user-agent") orelse "");
             return;
         }
 
         // --- Content-Type validation ---
         if (!isJsonContentType(request.contentType())) {
             try sendApiError(allocator, writer, .bad_request, "invalid_request", "Content-Type must be application/json", correlation_id, false, state);
-            ctx.auditLog("/v1/chat", 400);
+            logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
             return;
         }
 
         // --- Body validation ---
         const body = request.body orelse {
             try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing request body", correlation_id, false, state);
-            ctx.auditLog("/v1/chat", 400);
+            logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
             return;
         };
 
@@ -584,17 +638,34 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
                 else => "invalid chat payload",
             };
             try sendApiError(allocator, writer, .bad_request, "invalid_request", msg, correlation_id, false, state);
-            ctx.auditLog("/v1/chat", 400);
+            logAccess(&ctx, request.method.toString(), "/v1/chat", 400, request.headers.get("user-agent") orelse "");
             return;
         };
 
+        // --- Circuit breaker check ---
+        if (!state.circuit_breaker.tryAcquire()) {
+            state.logger.warn(null, "circuit breaker open, rejecting /v1/chat", .{});
+            try sendApiError(allocator, writer, .service_unavailable, "upstream_unavailable", "Upstream unavailable", correlation_id, false, state);
+            logAccess(&ctx, request.method.toString(), "/v1/chat", 503, request.headers.get("user-agent") orelse "");
+            return;
+        }
+
         // --- Upstream proxy ---
         const proxy_result = proxyChat(allocator, cfg, message, correlation_id) catch {
+            state.circuit_breaker.recordFailure();
+            state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuit_breaker.stateName()});
             try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, false, state);
-            ctx.auditLog("/v1/chat", 504);
+            logAccess(&ctx, request.method.toString(), "/v1/chat", 504, request.headers.get("user-agent") orelse "");
             return;
         };
         defer allocator.free(proxy_result.body);
+
+        // Record circuit breaker outcome based on upstream status
+        if (proxy_result.status >= 500) {
+            state.circuit_breaker.recordFailure();
+        } else {
+            state.circuit_breaker.recordSuccess();
+        }
 
         var final_status: u16 = proxy_result.status;
         var final_body: []const u8 = proxy_result.body;
@@ -633,12 +704,12 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             }
         }
 
-        ctx.auditLog("/v1/chat", final_status);
+        logAccess(&ctx, request.method.toString(), "/v1/chat", final_status, request.headers.get("user-agent") orelse "");
         return;
     }
 
     try sendApiError(allocator, writer, .not_found, "invalid_request", "Not Found", correlation_id, false, state);
-    ctx.auditLog(request.uri.path, 404);
+    logAccess(&ctx, request.method.toString(), request.uri.path, 404, request.headers.get("user-agent") orelse "");
 }
 
 const AuthResult = struct {
@@ -817,6 +888,25 @@ fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.Stat
     state.metrics.recordRequest(@intFromEnum(status));
 }
 
+/// Emit a structured JSON access log entry for a completed request.
+///
+/// Supplements the existing audit log with a dedicated "type":"access" JSON line
+/// that is easy to parse by log shippers (Loki, Fluentd, etc.).
+fn logAccess(ctx: *const http.request_context.RequestContext, method: []const u8, path: []const u8, status: u16, user_agent: []const u8) void {
+    const entry = http.access_log.AccessLogEntry{
+        .method = method,
+        .path = path,
+        .status = status,
+        .latency_ms = ctx.elapsedMs(),
+        .client_ip = ctx.client_ip,
+        .correlation_id = ctx.request_id,
+        .identity = ctx.identity orelse "-",
+        .user_agent = user_agent,
+        .bytes_sent = 0,
+    };
+    entry.log();
+}
+
 fn readHttpRequest(stream: std.net.Stream, buf: []u8) !usize {
     var total_read: usize = 0;
     var header_end: ?usize = null;
@@ -889,6 +979,8 @@ test "authorizeRequest accepts valid hash" {
         .log_level = .info,
         .compression_enabled = false,
         .compression_min_size = 256,
+        .cb_threshold = 0,
+        .cb_timeout_ms = 30_000,
     };
 
     var headers = http.Headers.init(allocator);

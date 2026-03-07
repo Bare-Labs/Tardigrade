@@ -1,6 +1,29 @@
 
 # Changelog
 
+## [0.14.0] - 2026-03-07
+
+### Added
+- Circuit breaker for upstream resilience (`src/http/circuit_breaker.zig`):
+  - Three-state machine: closed → open → half-open with configurable failure threshold and recovery timeout.
+  - `tryAcquire()` allows requests through when closed or half-open (with side-effect transition from open after timeout).
+  - `recordSuccess()` / `recordFailure()` update state; half-open closes on configured success count.
+  - Disabled when `threshold = 0` (default); configure via `TARDIGRADE_CB_THRESHOLD` and `TARDIGRADE_CB_TIMEOUT_MS`.
+  - Applied to both `/v1/chat` and `/v1/commands` upstream proxy calls; returns 503 when circuit is open.
+- Prometheus metrics format (`src/http/metrics.zig`):
+  - `toPrometheus()` method emits Prometheus text exposition format with `# HELP` and `# TYPE` annotations.
+  - `GET /metrics/prometheus` endpoint returns `text/plain; version=0.0.4; charset=utf-8` (no auth required).
+- Structured access log (`src/http/access_log.zig`):
+  - `AccessLogEntry` struct emits a `"type":"access"` JSON line to stderr for every completed request.
+  - Fields: method, path, status, latency_ms, client_ip, correlation_id, identity, user_agent, bytes_sent.
+  - Replaces `ctx.auditLog()` key=value format at all 35 gateway callsites with the new `logAccess()` helper.
+  - Machine-parseable by log shippers (Loki, Fluentd, etc.).
+
+### Changed
+- Edge config extended with `cb_threshold` and `cb_timeout_ms` fields.
+- Gateway startup logs circuit breaker state on boot.
+- All 35 gateway audit log points now emit structured JSON access log entries.
+
 ## [0.13.0] - 2026-03-07
 
 ### Added

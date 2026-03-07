@@ -459,14 +459,16 @@ Resolved: Gzip response compression implemented in `src/http/compression.zig`. O
 - [ ] Connection statistics
 - [x] Request statistics
 - [ ] Upstream health status
-- [ ] Prometheus metrics export (optional)
+- [x] Prometheus metrics export (optional)
 
-Resolved: `GET /metrics` endpoint added to gateway. `Metrics` struct in `src/http/metrics.zig` tracks total requests and status class counts (2xx/3xx/4xx/5xx) with uptime. All gateway response paths record metrics automatically.
+Resolved: `GET /metrics` endpoint added to gateway. `Metrics` struct in `src/http/metrics.zig` tracks total requests and status class counts (2xx/3xx/4xx/5xx) with uptime. All gateway response paths record metrics automatically. `GET /metrics/prometheus` endpoint added returning Prometheus text exposition format (v0.0.4).
 
 ### 12.3 Debugging
-- [ ] Debug logging
-- [ ] Request tracing
+- [x] Debug logging
+- [x] Request tracing
 - [ ] Error categorization
+
+Resolved: Structured access log implemented in `src/http/access_log.zig`. `AccessLogEntry` emits a `"type":"access"` JSON line to stderr per completed request with method, path, status, latency, client IP, correlation ID, identity, and user agent fields. The `logAccess()` helper in the gateway replaces all 35 `ctx.auditLog()` key=value callsites with structured JSON output suitable for log aggregation.
 
 ### 12.4 Admin API
 - [ ] route inspection
@@ -498,16 +500,18 @@ Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and 
 - [ ] Privilege dropping after bind
 - [ ] Chroot support (optional)
 
-### 13.4 Resilience Features (NEW)
-- [ ] circuit breakers
+### 13.4 Resilience Features
+- [x] circuit breakers
 - [ ] retry policies
 - [ ] timeout budgets
 - [ ] overload protection
 - [ ] request queue management
 
-## PHASE 14: Real-Time Messaging Gateway (NEW)
+Resolved: Upstream circuit breaker implemented in `src/http/circuit_breaker.zig`. Three-state machine (closed/open/half-open) with configurable failure threshold (`TARDIGRADE_CB_THRESHOLD`, default 0 = disabled), recovery timeout (`TARDIGRADE_CB_TIMEOUT_MS`, default 30 s), and probe success count. Applied to `/v1/chat` and `/v1/commands` proxy calls; returns 503 `upstream_unavailable` when circuit is open. Circuit breaker state logged on failure and at startup.
 
-This phase enables Tardigrade to function as the Panda/BearClaw gateway.
+## PHASE 14: Real-Time Messaging Gateway
+
+This phase enables Tardigrade to function as the BearClaw gateway.
 
 ### 14.1 Command Protocol
 - [ ] structured command envelopes

@@ -48,6 +48,39 @@ pub const Metrics = struct {
         return @intCast(@divFloor(elapsed_ns, std.time.ns_per_s));
     }
 
+    /// Format metrics in Prometheus text exposition format.
+    /// Caller owns the returned memory.
+    pub fn toPrometheus(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator,
+            \\# HELP tardigrade_requests_total Total HTTP requests processed
+            \\# TYPE tardigrade_requests_total counter
+            \\tardigrade_requests_total {d}
+            \\# HELP tardigrade_requests_2xx_total Total 2xx responses
+            \\# TYPE tardigrade_requests_2xx_total counter
+            \\tardigrade_requests_2xx_total {d}
+            \\# HELP tardigrade_requests_3xx_total Total 3xx responses
+            \\# TYPE tardigrade_requests_3xx_total counter
+            \\tardigrade_requests_3xx_total {d}
+            \\# HELP tardigrade_requests_4xx_total Total 4xx responses
+            \\# TYPE tardigrade_requests_4xx_total counter
+            \\tardigrade_requests_4xx_total {d}
+            \\# HELP tardigrade_requests_5xx_total Total 5xx responses
+            \\# TYPE tardigrade_requests_5xx_total counter
+            \\tardigrade_requests_5xx_total {d}
+            \\# HELP tardigrade_uptime_seconds Server uptime in seconds
+            \\# TYPE tardigrade_uptime_seconds gauge
+            \\tardigrade_uptime_seconds {d}
+            \\
+        , .{
+            self.total_requests,
+            self.status_2xx,
+            self.status_3xx,
+            self.status_4xx,
+            self.status_5xx,
+            self.uptimeSeconds(),
+        });
+    }
+
     /// Format metrics as a JSON string.
     /// Caller owns the returned memory.
     pub fn toJson(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
@@ -92,6 +125,22 @@ test "Metrics recordRequest tracks status classes" {
 test "Metrics uptimeSeconds is non-negative" {
     const m = Metrics.init();
     try std.testing.expect(m.uptimeSeconds() <= 1);
+}
+
+test "Metrics toPrometheus produces valid Prometheus text" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+    m.recordRequest(200);
+    m.recordRequest(500);
+
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+
+    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_requests_total 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_requests_2xx_total 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prom, "tardigrade_requests_5xx_total 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prom, "# TYPE tardigrade_requests_total counter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prom, "# TYPE tardigrade_uptime_seconds gauge") != null);
 }
 
 test "Metrics toJson produces valid JSON" {
