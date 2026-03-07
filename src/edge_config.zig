@@ -49,6 +49,8 @@ pub const EdgeConfig = struct {
     worker_threads: u32,
     /// Maximum queued accepted connections waiting for workers.
     worker_queue_size: usize,
+    /// Desired soft file-descriptor limit (RLIMIT_NOFILE). 0 leaves OS default.
+    fd_soft_limit: u64,
     /// Maximum active connections per client IP (0 = unlimited).
     max_connections_per_ip: u32,
     /// Maximum total active client connections across all IPs (0 = unlimited).
@@ -61,6 +63,8 @@ pub const EdgeConfig = struct {
     connection_pool_size: usize,
     /// Maximum in-memory bytes retained per active connection (0 = unlimited).
     max_connection_memory_bytes: usize,
+    /// Maximum estimated total connection memory across active clients (0 = unlimited).
+    max_total_connection_memory_bytes: usize,
     /// Whether to stream all upstream statuses directly (including non-200) instead of mapping.
     proxy_stream_all_statuses: bool,
     /// Number of upstream attempt retries for proxy requests (minimum 1).
@@ -219,6 +223,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(worker_queue_str);
     const worker_queue_size = std.fmt.parseInt(usize, worker_queue_str, 10) catch 1024;
 
+    const fd_soft_limit_str = envOrDefault(allocator, "TARDIGRADE_FD_SOFT_LIMIT", "0") catch unreachable;
+    defer allocator.free(fd_soft_limit_str);
+    const fd_soft_limit = std.fmt.parseInt(u64, fd_soft_limit_str, 10) catch 0;
+
     const max_conn_ip_str = envOrDefault(allocator, "TARDIGRADE_MAX_CONNECTIONS_PER_IP", "0") catch unreachable;
     defer allocator.free(max_conn_ip_str);
     const max_connections_per_ip = std.fmt.parseInt(u32, max_conn_ip_str, 10) catch 0;
@@ -242,6 +250,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const max_conn_mem_str = envOrDefault(allocator, "TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES", "2097152") catch unreachable;
     defer allocator.free(max_conn_mem_str);
     const max_connection_memory_bytes = std.fmt.parseInt(usize, max_conn_mem_str, 10) catch 2 * 1024 * 1024;
+
+    const max_total_conn_mem_str = envOrDefault(allocator, "TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES", "0") catch unreachable;
+    defer allocator.free(max_total_conn_mem_str);
+    const max_total_connection_memory_bytes = std.fmt.parseInt(usize, max_total_conn_mem_str, 10) catch 0;
 
     const stream_all_statuses_str = envOrDefault(allocator, "TARDIGRADE_PROXY_STREAM_ALL_STATUSES", "false") catch unreachable;
     defer allocator.free(stream_all_statuses_str);
@@ -298,12 +310,14 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .cb_timeout_ms = cb_timeout_ms,
         .worker_threads = worker_threads,
         .worker_queue_size = worker_queue_size,
+        .fd_soft_limit = fd_soft_limit,
         .max_connections_per_ip = max_connections_per_ip,
         .max_active_connections = max_active_connections,
         .keep_alive_timeout_ms = keep_alive_timeout_ms,
         .max_requests_per_connection = max_requests_per_connection,
         .connection_pool_size = connection_pool_size,
         .max_connection_memory_bytes = max_connection_memory_bytes,
+        .max_total_connection_memory_bytes = max_total_connection_memory_bytes,
         .proxy_stream_all_statuses = proxy_stream_all_statuses,
         .upstream_retry_attempts = upstream_retry_attempts,
         .upstream_timeout_budget_ms = upstream_timeout_budget_ms,

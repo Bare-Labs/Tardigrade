@@ -529,13 +529,16 @@ Resolved: Structured access log implemented in `src/http/access_log.zig`. `Acces
 Resolved: Graceful shutdown implemented in `src/http/shutdown.zig`. SIGTERM and SIGINT handlers set a global atomic flag. With the Phase 2.1 event loop, the listener no longer blocks indefinitely in `accept()`, so shutdown is serviced on the next event-loop tick even when the server is idle.
 
 ### 13.2 Resource Limits
-- [ ] File descriptor limits
+- [x] File descriptor limits
 - [x] Worker connection limits
-- [ ] Memory limits
+- [x] Memory limits
 - [x] Request queue limits
 
 Resolved (incremental): global active worker connection cap added via `TARDIGRADE_MAX_ACTIVE_CONNECTIONS`. Listener now rejects excess connections with explicit 503 load-shedding responses.
 Resolved (incremental): worker queue saturation now triggers explicit 503 load-shedding responses (with `Retry-After`) instead of silent close.
+Resolved (incremental): startup can now apply best-effort process fd soft limits via `TARDIGRADE_FD_SOFT_LIMIT` (RLIMIT_NOFILE on supported Unix targets).
+Resolved (incremental): global estimated active-connection memory capping added via `TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES`, enforced in listener admission control.
+Decision: total memory cap is estimated from active connections and configured per-connection memory budget to keep listener-side checks lock-free and low overhead.
 
 ### 13.3 Privilege Management
 - [ ] Run as unprivileged user

@@ -48,6 +48,10 @@
   - Added `TARDIGRADE_MAX_ACTIVE_CONNECTIONS` global active-connection cap.
   - Listener now sends explicit `503 Service Unavailable` load-shedding responses when over global/per-IP limits or when worker queue submission is full.
   - Queue/connection rejections now use `Retry-After: 1` to signal transient overload.
+- Phase 13.2 resource limit controls (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_FD_SOFT_LIMIT` (best-effort RLIMIT_NOFILE soft-limit application on startup).
+  - Added `TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES` global estimated memory admission cap.
+  - Listener admission now rejects new connections with 503 when projected active-connection memory budget would be exceeded.
 
 ## [0.26.0] - 2026-03-xx
 

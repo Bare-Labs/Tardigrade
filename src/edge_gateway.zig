@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 
@@ -15,6 +16,7 @@ const ConnectionSlotResult = enum {
     accepted,
     over_ip_limit,
     over_global_limit,
+    over_global_memory_limit,
 };
 
 /// Persistent gateway state shared across connections.
@@ -36,6 +38,8 @@ const GatewayState = struct {
     max_connections_per_ip: u32,
     max_active_connections: u32,
     active_connections_total: usize,
+    connection_memory_estimate_bytes: usize,
+    max_total_connection_memory_bytes: usize,
     upstream_rr_index: usize,
     upstream_health: std.StringHashMap(UpstreamHealth),
     active_connections_by_ip: std.StringHashMap(u32),
@@ -69,6 +73,12 @@ const GatewayState = struct {
 
         if (self.max_active_connections > 0 and self.active_connections_total >= self.max_active_connections) {
             return .over_global_limit;
+        }
+        if (self.max_total_connection_memory_bytes > 0 and self.connection_memory_estimate_bytes > 0) {
+            const projected: u128 = (@as(u128, self.active_connections_total) + 1) * @as(u128, self.connection_memory_estimate_bytes);
+            if (projected > self.max_total_connection_memory_bytes) {
+                return .over_global_memory_limit;
+            }
         }
 
         var ip_slot_acquired = false;
@@ -445,6 +455,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .max_connections_per_ip = cfg.max_connections_per_ip,
         .max_active_connections = cfg.max_active_connections,
         .active_connections_total = 0,
+        .connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE,
+        .max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes,
         .upstream_rr_index = 0,
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
@@ -531,6 +543,15 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state.logger.info(null, "Circuit breaker enabled: threshold={d} timeout={d}ms", .{ cfg.cb_threshold, cfg.cb_timeout_ms });
     }
     state.logger.info(null, "Worker pool enabled: workers={d} queue={d}", .{ worker_count, cfg.worker_queue_size });
+    if (cfg.fd_soft_limit > 0) {
+        const applied = applyFdSoftLimit(cfg.fd_soft_limit) catch |err| blk: {
+            state.logger.warn(null, "failed to apply fd soft limit: {}", .{err});
+            break :blk null;
+        };
+        if (applied) |limit| {
+            state.logger.info(null, "FD soft limit configured: {d}", .{limit});
+        }
+    }
     state.logger.info(null, "Keep-alive configured: timeout={d}ms max_requests={d}", .{ cfg.keep_alive_timeout_ms, cfg.max_requests_per_connection });
     state.logger.info(null, "Connection session pool configured: max_cached={d}", .{cfg.connection_pool_size});
     if (cfg.max_connection_memory_bytes > 0) {
@@ -556,6 +577,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (cfg.max_active_connections > 0) {
         state.logger.info(null, "Global active connection limit enabled: {d}", .{cfg.max_active_connections});
+    }
+    if (cfg.max_total_connection_memory_bytes > 0) {
+        state.logger.info(null, "Global connection memory estimate limit enabled: {d} bytes", .{cfg.max_total_connection_memory_bytes});
     }
 
     // Install signal handlers for graceful shutdown
@@ -628,6 +652,11 @@ fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_p
                 rejectOverloadedClient(client_fd);
                 continue;
             },
+            .over_global_memory_limit => {
+                state.logger.warn(null, "global connection memory estimate limit reached", .{});
+                rejectOverloadedClient(client_fd);
+                continue;
+            },
         }
 
         worker_pool.submit(client_fd) catch |err| {
@@ -650,6 +679,24 @@ fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
             "\r\n",
     ) catch {};
     stream.close();
+}
+
+fn applyFdSoftLimit(desired: u64) !?u64 {
+    if (desired == 0) return null;
+    switch (builtin.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .solaris, .illumos, .ios, .tvos, .watchos, .visionos => {},
+        else => return null,
+    }
+
+    var limits = try std.posix.getrlimit(std.posix.rlimit_resource.NOFILE);
+    const current_soft: u64 = @intCast(limits.cur);
+    const hard: u64 = @intCast(limits.max);
+    const target: u64 = @min(desired, hard);
+    if (target == current_soft) return target;
+
+    limits.cur = @intCast(target);
+    try std.posix.setrlimit(std.posix.rlimit_resource.NOFILE, limits);
+    return target;
 }
 
 fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
@@ -2132,12 +2179,14 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .cb_timeout_ms = 30_000,
         .worker_threads = 0,
         .worker_queue_size = 1024,
+        .fd_soft_limit = 0,
         .max_connections_per_ip = 0,
         .max_active_connections = 0,
         .keep_alive_timeout_ms = 5000,
         .max_requests_per_connection = 100,
         .connection_pool_size = 256,
         .max_connection_memory_bytes = 2 * 1024 * 1024,
+        .max_total_connection_memory_bytes = 0,
         .proxy_stream_all_statuses = false,
         .upstream_retry_attempts = 1,
         .upstream_timeout_budget_ms = 0,
@@ -2197,12 +2246,14 @@ test "authorizeRequest accepts valid hash" {
         .cb_timeout_ms = 30_000,
         .worker_threads = 0,
         .worker_queue_size = 1024,
+        .fd_soft_limit = 0,
         .max_connections_per_ip = 0,
         .max_active_connections = 0,
         .keep_alive_timeout_ms = 5000,
         .max_requests_per_connection = 100,
         .connection_pool_size = 256,
         .max_connection_memory_bytes = 2 * 1024 * 1024,
+        .max_total_connection_memory_bytes = 0,
         .proxy_stream_all_statuses = false,
         .upstream_retry_attempts = 1,
         .upstream_timeout_budget_ms = 0,
