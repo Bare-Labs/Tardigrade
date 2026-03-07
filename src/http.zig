@@ -23,6 +23,7 @@ pub const security_headers = @import("http/security_headers.zig");
 pub const request_context = @import("http/request_context.zig");
 pub const api_router = @import("http/api_router.zig");
 pub const idempotency = @import("http/idempotency.zig");
+pub const session = @import("http/session.zig");
 
 // Re-export constants
 pub const MAX_HEADERS = headers.MAX_HEADERS;

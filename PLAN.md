@@ -82,10 +82,12 @@ Resolved: HTTP bearer token parsing/validation is implemented in `src/http/auth.
 Decision: core HTTP layer validates RFC6750-style token shape and delegates token trust decisions to caller-provided hooks to keep auth-provider logic decoupled.
 
 ### 0.2 Session Management
-- [ ] Session token issuance
-- [ ] Session storage abstraction
-- [ ] Device session tracking
-- [ ] Revocation support
+- [x] Session token issuance
+- [x] Session storage abstraction
+- [x] Device session tracking
+- [x] Revocation support
+
+Resolved: Session management implemented in `src/http/session.zig`. In-memory session store with cryptographic token generation (32 bytes / 256 bits), per-identity revocation, device ID tracking, idle TTL expiry, and max-session enforcement. Gateway endpoints: POST /v1/sessions (create), DELETE /v1/sessions (revoke), GET /v1/sessions (list). Sessions accepted as auth alternative to bearer tokens on /v1/chat.
 
 ### 0.3 API Gateway Core
 - [x] JSON request validation

@@ -10,6 +10,7 @@ const GatewayState = struct {
     rate_limiter: ?http.rate_limiter.RateLimiter,
     idempotency_store: ?http.idempotency.IdempotencyStore,
     security_headers: http.security_headers.SecurityHeaders,
+    session_store: ?http.session.SessionStore,
 };
 
 pub fn run(cfg: *const edge_config.EdgeConfig) !void {
@@ -30,10 +31,15 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             http.security_headers.SecurityHeaders.api
         else
             http.security_headers.SecurityHeaders{ .x_frame_options = "", .x_content_type_options = "", .content_security_policy = "", .strict_transport_security = "", .referrer_policy = "", .permissions_policy = "", .x_xss_protection = "" },
+        .session_store = if (cfg.session_ttl_seconds > 0)
+            http.session.SessionStore.init(state_allocator, cfg.session_ttl_seconds, cfg.session_max)
+        else
+            null,
     };
     defer {
         if (state.rate_limiter) |*rl| rl.deinit();
         if (state.idempotency_store) |*is| is.deinit();
+        if (state.session_store) |*ss| ss.deinit();
     }
 
     const address = try std.net.Address.parseIp(cfg.listen_host, cfg.listen_port);
@@ -51,6 +57,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (state.idempotency_store != null) {
         std.log.info("Idempotency cache enabled: TTL {d}s", .{cfg.idempotency_ttl_seconds});
+    }
+    if (state.session_store != null) {
+        std.log.info("Session management enabled: TTL {d}s, max {d}", .{ cfg.session_ttl_seconds, cfg.session_max });
     }
 
     while (true) {
@@ -132,6 +141,125 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
         }
     }
 
+    // --- POST /v1/sessions (create session) ---
+    if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
+        if (state.session_store == null) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 404);
+            return;
+        }
+
+        // Requires bearer auth to create a session
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (!auth_result.ok) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 401);
+            return;
+        }
+        const identity = auth_result.token_hash orelse "-";
+        ctx.setIdentity(identity);
+
+        // Optional device_id from JSON body
+        var device_id: ?[]const u8 = null;
+        if (request.body) |body| {
+            if (isJsonContentType(request.contentType())) {
+                device_id = parseDeviceId(allocator, body) catch null;
+            }
+        }
+        defer if (device_id) |d| allocator.free(d);
+
+        const session_token = state.session_store.?.create(identity, client_ip, device_id) catch |err| {
+            const msg = switch (err) {
+                error.TooManySessions => "Too many active sessions",
+                else => "Session creation failed",
+            };
+            try sendApiError(allocator, writer, .too_many_requests, "rate_limited", msg, correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 429);
+            return;
+        };
+
+        const resp_body = try std.fmt.allocPrint(allocator, "{{\"session_token\":\"{s}\"}}", .{session_token});
+        defer allocator.free(resp_body);
+
+        var response = http.Response.json(allocator, resp_body);
+        defer response.deinit();
+        _ = response.setStatus(.created)
+            .setConnection(false)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id)
+            .setHeader(http.session.SESSION_HEADER, session_token);
+        state.security_headers.apply(&response);
+        try response.write(writer);
+        ctx.auditLog("/v1/sessions", 201);
+        return;
+    }
+
+    // --- DELETE /v1/sessions (revoke session) ---
+    if (request.method == .DELETE and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
+        if (state.session_store == null) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 404);
+            return;
+        }
+
+        const session_token = http.session.fromHeaders(&request.headers) orelse {
+            try sendApiError(allocator, writer, .bad_request, "invalid_request", "Missing or invalid X-Session-Token", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 400);
+            return;
+        };
+
+        const revoked = state.session_store.?.revoke(session_token);
+        const resp_body = if (revoked)
+            "{\"revoked\":true}"
+        else
+            "{\"revoked\":false}";
+
+        var response = http.Response.json(allocator, resp_body);
+        defer response.deinit();
+        _ = response.setConnection(false)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        state.security_headers.apply(&response);
+        try response.write(writer);
+        ctx.auditLog("/v1/sessions", 200);
+        return;
+    }
+
+    // --- GET /v1/sessions (list sessions for identity) ---
+    if (request.method == .GET and http.api_router.matchRoute(request.uri.path, 1, "/sessions")) {
+        if (state.session_store == null) {
+            try sendApiError(allocator, writer, .not_found, "invalid_request", "Sessions not enabled", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 404);
+            return;
+        }
+
+        // Requires bearer auth
+        const auth_result = authorizeRequest(cfg, &request.headers);
+        if (!auth_result.ok) {
+            try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 401);
+            return;
+        }
+        const identity = auth_result.token_hash orelse "-";
+
+        const sessions = state.session_store.?.listByIdentity(allocator, identity) catch {
+            try sendApiError(allocator, writer, .internal_server_error, "internal_error", "Failed to list sessions", correlation_id, false, state);
+            ctx.auditLog("/v1/sessions", 500);
+            return;
+        };
+        defer allocator.free(sessions);
+
+        const resp_body = try std.fmt.allocPrint(allocator, "{{\"active_sessions\":{d}}}", .{sessions.len});
+        defer allocator.free(resp_body);
+
+        var response = http.Response.json(allocator, resp_body);
+        defer response.deinit();
+        _ = response.setConnection(false)
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        state.security_headers.apply(&response);
+        try response.write(writer);
+        ctx.auditLog("/v1/sessions", 200);
+        return;
+    }
+
     // --- POST /v1/chat ---
     if (request.method == .POST and http.api_router.matchRoute(request.uri.path, 1, "/chat")) {
         // --- Idempotency check ---
@@ -154,14 +282,30 @@ fn handleConnection(stream: std.net.Stream, cfg: *const edge_config.EdgeConfig, 
             }
         }
 
-        // --- Auth ---
+        // --- Auth (bearer token or session token) ---
+        var authenticated = false;
+        // Try bearer token first
         const auth_result = authorizeRequest(cfg, &request.headers);
-        if (!auth_result.ok) {
+        if (auth_result.ok) {
+            ctx.setIdentity(auth_result.token_hash orelse "-");
+            authenticated = true;
+        }
+        // Fall back to session token
+        if (!authenticated) {
+            if (state.session_store) |*ss| {
+                if (http.session.fromHeaders(&request.headers)) |session_token| {
+                    if (ss.validate(session_token)) |session| {
+                        ctx.setIdentity(session.identity);
+                        authenticated = true;
+                    }
+                }
+            }
+        }
+        if (!authenticated) {
             try sendApiError(allocator, writer, .unauthorized, "unauthorized", "Unauthorized", correlation_id, false, state);
             ctx.auditLog("/v1/chat", 401);
             return;
         }
-        ctx.setIdentity(auth_result.token_hash orelse "-");
 
         // --- Content-Type validation ---
         if (!isJsonContentType(request.contentType())) {
@@ -263,6 +407,20 @@ fn isJsonContentType(content_type: ?[]const u8) bool {
     else
         ct;
     return std.mem.indexOf(u8, lower, JSON_CONTENT_TYPE) != null;
+}
+
+fn parseDeviceId(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    const device_val = obj.get("device_id") orelse return error.NoDeviceId;
+    if (device_val != .string) return error.InvalidDeviceId;
+
+    const device_id = std.mem.trim(u8, device_val.string, " \t\r\n");
+    if (device_id.len == 0) return error.EmptyDeviceId;
+    if (device_id.len > 256) return error.DeviceIdTooLong;
+    return try allocator.dupe(u8, device_id);
 }
 
 fn parseChatMessage(allocator: std.mem.Allocator, body: []const u8, max_len: usize) ![]const u8 {
@@ -418,6 +576,8 @@ test "authorizeRequest accepts valid hash" {
         .rate_limit_burst = 0,
         .security_headers_enabled = false,
         .idempotency_ttl_seconds = 0,
+        .session_ttl_seconds = 0,
+        .session_max = 0,
     };
 
     var headers = http.Headers.init(allocator);

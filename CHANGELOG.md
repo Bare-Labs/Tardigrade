@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.0] - 2026-03-xx
+
+### Added
+- Session management system (`src/http/session.zig`):
+  - Cryptographic session token generation (32 bytes / 256 bits entropy, hex-encoded).
+  - In-memory session store with per-identity tracking, device ID support, and idle TTL expiry.
+  - Session revocation (single token or all sessions for an identity).
+  - Max concurrent session enforcement via `TARDIGRADE_SESSION_MAX` env var (default 1000).
+  - Session TTL via `TARDIGRADE_SESSION_TTL` env var (default 3600s).
+  - Automatic cleanup of expired sessions.
+- Gateway session endpoints:
+  - `POST /v1/sessions` — create session (requires bearer auth, optional `X-Device-ID`).
+  - `DELETE /v1/sessions` — revoke session (requires `X-Session-Token`).
+  - `GET /v1/sessions` — list active sessions for identity (requires bearer auth).
+- Session-based auth as alternative to bearer tokens on `POST /v1/chat`.
+
+### Changed
+- Edge config extended with `session_ttl_seconds` and `session_max` fields.
+- Gateway state now includes optional `SessionStore`.
+
 ## [0.8.0] - 2026-03-xx
 
 ### Added
