@@ -1,6 +1,14 @@
 
 # Changelog
 
+## [0.24.0] - 2026-03-xx
+
+### Added
+- Socket timeout enforcement (`src/edge_gateway.zig`):
+  - Accepted client sockets now apply configured request header timeout via `TARDIGRADE_HEADER_TIMEOUT_MS`.
+  - Upstream proxy sockets now apply configured send/receive timeout via `TARDIGRADE_UPSTREAM_TIMEOUT_MS`.
+  - Timeout settings are applied with POSIX socket timeout options on both client and upstream paths.
+
 ## [0.23.0] - 2026-03-xx
 
 ### Added

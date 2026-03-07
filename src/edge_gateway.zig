@@ -395,6 +395,12 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
     const ctx: *WorkerContext = @ptrCast(@alignCast(raw_ctx));
     defer ctx.state.releaseConnectionSlot(client_fd);
 
+    if (ctx.cfg.request_limits.header_timeout_ms > 0) {
+        setSocketTimeoutMs(client_fd, ctx.cfg.request_limits.header_timeout_ms, ctx.cfg.request_limits.header_timeout_ms) catch |err| {
+            ctx.state.logger.warn(null, "failed to set client socket timeout: {}", .{err});
+        };
+    }
+
     setNonBlocking(client_fd, false) catch |err| {
         ctx.state.logger.warn(null, "failed to switch client fd to blocking mode: {}", .{err});
         std.posix.close(client_fd);
@@ -1218,6 +1224,14 @@ fn proxyJsonExecute(
     });
     defer req.deinit();
 
+    if (cfg.upstream_timeout_ms > 0) {
+        if (req.connection) |conn| {
+            setSocketTimeoutMs(conn.stream.handle, cfg.upstream_timeout_ms, cfg.upstream_timeout_ms) catch |err| {
+                state.logger.warn(null, "failed to set upstream socket timeout: {}", .{err});
+            };
+        }
+    }
+
     req.transfer_encoding = .{ .content_length = payload.len };
     try req.send();
     try req.writeAll(payload);
@@ -1477,6 +1491,20 @@ fn parseContentLength(headers: []const u8) ?usize {
         return std.fmt.parseInt(usize, value, 10) catch null;
     }
     return null;
+}
+
+fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms: u32) !void {
+    const recv_tv = std.posix.timeval{
+        .sec = @intCast(recv_timeout_ms / 1000),
+        .usec = @intCast((recv_timeout_ms % 1000) * 1000),
+    };
+    const send_tv = std.posix.timeval{
+        .sec = @intCast(send_timeout_ms / 1000),
+        .usec = @intCast((send_timeout_ms % 1000) * 1000),
+    };
+
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_tv));
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_tv));
 }
 
 test "buildForwardedFor appends client ip" {

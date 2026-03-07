@@ -334,9 +334,10 @@ Resolved: HTTP Basic Auth implemented in `src/http/basic_auth.zig`. Parses `Auth
 - [x] Request body size limits (client_max_body_size)
 - [x] Header count/size limits
 - [x] URI length limits
-- [ ] Timeout enforcement (client_body_timeout, etc.)
+- [x] Timeout enforcement (client_body_timeout, etc.)
 
-Resolved: Request validation limits enforced in gateway pipeline via `src/http/request_limits.zig`. Body size (413), URI length (414), and header count (400) validated after parsing. Configurable via env vars: `TARDIGRADE_MAX_BODY_SIZE`, `TARDIGRADE_MAX_URI_LENGTH`, `TARDIGRADE_MAX_HEADER_COUNT`, `TARDIGRADE_MAX_HEADER_SIZE`. Timeout env vars (`TARDIGRADE_BODY_TIMEOUT_MS`, `TARDIGRADE_HEADER_TIMEOUT_MS`) are configured but enforcement deferred to async I/O phase.
+Resolved: Request validation limits enforced in gateway pipeline via `src/http/request_limits.zig`. Body size (413), URI length (414), and header count (400) validated after parsing. Configurable via env vars: `TARDIGRADE_MAX_BODY_SIZE`, `TARDIGRADE_MAX_URI_LENGTH`, `TARDIGRADE_MAX_HEADER_COUNT`, `TARDIGRADE_MAX_HEADER_SIZE`.
+Resolved (incremental): socket-level timeout enforcement is now active in `src/edge_gateway.zig`. Accepted client sockets apply configured header timeout (`TARDIGRADE_HEADER_TIMEOUT_MS`) and upstream proxy sockets apply `TARDIGRADE_UPSTREAM_TIMEOUT_MS` for send/receive operations.
 
 ### 6.5 Security Headers
 - [ ] add_header directive
