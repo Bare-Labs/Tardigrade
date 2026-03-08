@@ -296,8 +296,10 @@ Resolved (incremental): active health transitions now support configurable fail/
 Resolved (incremental): recovered upstreams now enter configurable slow-start windows (`TARDIGRADE_UPSTREAM_SLOW_START_MS`) with gradual traffic eligibility ramp before full load share.
 
 ### 4.5 Proxy Protocol Support
-- [ ] Protocol v1 and v2
-- [ ] Extracting real client IP
+- [x] Protocol v1 and v2
+- [x] Extracting real client IP
+
+Resolved (incremental): added configurable PROXY protocol parsing (`TARDIGRADE_PROXY_PROTOCOL=off|auto|v1|v2`) on plaintext listeners with v1/v2 support and request-context client IP extraction from parsed source addresses.
 
 ### 4.6 Service Trust Model (NEW)
 - [ ] trusted upstream configuration

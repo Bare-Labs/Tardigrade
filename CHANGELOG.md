@@ -98,6 +98,10 @@
   - Added dedicated chat/commands upstream block env settings for primary, weighted, and backup pools.
   - Proxy execution now chooses upstream pools by route scope and falls back to global upstream pool when route-specific pools are unset.
   - Active health probes now include configured route-scoped upstream block backends.
+- Phase 4.5 proxy protocol foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_PROXY_PROTOCOL` (`off|auto|v1|v2`) for PROXY header parsing on plaintext listeners.
+  - Added v1/v2 PROXY header parsing and request-context client IP extraction from parsed source addresses.
+  - Added parser coverage for v1, v2, and auto-mode no-header behavior.
 
 ## [0.26.0] - 2026-03-xx
 

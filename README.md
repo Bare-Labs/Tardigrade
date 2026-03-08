@@ -51,6 +51,7 @@ Environment variables:
 - `TARDIGRADE_LISTEN_PORT` (default `8069`)
 - `TARDIGRADE_TLS_CERT_PATH` (PEM certificate path; enables TLS termination when paired with key)
 - `TARDIGRADE_TLS_KEY_PATH` (PEM private key path; enables TLS termination when paired with cert)
+- `TARDIGRADE_PROXY_PROTOCOL` (default `off`; supported: `off`, `auto`, `v1`, `v2`; applies to plaintext listeners for extracting client IP from PROXY headers)
 - `TARDIGRADE_UPSTREAM_BASE_URL` (default `http://127.0.0.1:8080`)
 - `TARDIGRADE_UPSTREAM_BASE_URLS` (default empty; optional comma-separated upstream base URLs used for proxy load balancing/failover)
 - `TARDIGRADE_UPSTREAM_BASE_URL_WEIGHTS` (default empty; optional comma-separated positive integer weights aligned with `TARDIGRADE_UPSTREAM_BASE_URLS`)

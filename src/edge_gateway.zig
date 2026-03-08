@@ -777,6 +777,9 @@ const WorkerContext = struct {
 const ConnectionSession = struct {
     pending_buf: ?[]u8 = null,
     pending_len: usize = 0,
+    proxy_protocol_checked: bool = false,
+    proxy_client_ip_len: usize = 0,
+    proxy_client_ip_buf: [64]u8 = undefined,
 };
 
 const ConnectionSessionPool = struct {
@@ -813,6 +816,8 @@ const ConnectionSessionPool = struct {
     fn release(self: *ConnectionSessionPool, session: *ConnectionSession) void {
         session.pending_len = 0;
         session.pending_buf = null;
+        session.proxy_protocol_checked = false;
+        session.proxy_client_ip_len = 0;
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -948,6 +953,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (cfg.basic_auth_hashes.len > 0) {
         state.logger.info(null, "HTTP Basic Auth enabled with {d} credential(s)", .{cfg.basic_auth_hashes.len});
+    }
+    if (cfg.proxy_protocol_mode != .off) {
+        state.logger.info(null, "Proxy protocol enabled: {s}", .{@tagName(cfg.proxy_protocol_mode)});
+        if (edge_config.hasTlsFiles(cfg)) {
+            state.logger.warn(null, "proxy protocol parsing currently applies only to plaintext listeners", .{});
+        }
     }
     {
         const limits = cfg.request_limits;
@@ -1308,7 +1319,7 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         var served: u32 = 0;
         while (true) {
             var keep_alive = false;
-            handleConnection(&tls_conn, session, ctx.cfg, ctx.state, &keep_alive) catch |err| {
+            handleConnection(&tls_conn, session, ctx.cfg, ctx.state, &keep_alive, false) catch |err| {
                 ctx.state.logger.err(null, "edge connection error: {}", .{err});
                 break;
             };
@@ -1327,7 +1338,7 @@ fn handleAcceptedClient(raw_ctx: *anyopaque, client_fd: std.posix.fd_t) void {
         var served: u32 = 0;
         while (true) {
             var keep_alive = false;
-            handleConnection(stream, session, ctx.cfg, ctx.state, &keep_alive) catch |err| {
+            handleConnection(stream, session, ctx.cfg, ctx.state, &keep_alive, true) catch |err| {
                 ctx.state.logger.err(null, "edge connection error: {}", .{err});
                 break;
             };
@@ -1364,7 +1375,140 @@ fn setNonBlocking(fd: std.posix.fd_t, enabled: bool) !void {
     _ = try std.posix.fcntl(fd, std.posix.F.SETFL, flags);
 }
 
-fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool) !void {
+const ProxyHeaderOutcome = union(enum) {
+    no_header,
+    need_more,
+    invalid,
+    parsed: struct {
+        consumed: usize,
+        client_ip_len: usize,
+    },
+};
+
+const proxy_v2_signature = "\r\n\r\n\x00\r\nQUIT\n";
+
+fn maybeConsumeProxyProtocolPreface(conn: anytype, mode: edge_config.ProxyProtocolMode, pending_buf: []u8, pending_len: *usize, client_ip_buf: *[64]u8, client_ip_len: *usize) !void {
+    if (mode == .off) return;
+
+    while (true) {
+        const outcome = parseProxyHeader(pending_buf[0..pending_len.*], mode, client_ip_buf);
+        switch (outcome) {
+            .no_header => return,
+            .invalid => return error.InvalidProxyProtocolHeader,
+            .parsed => |parsed| {
+                client_ip_len.* = parsed.client_ip_len;
+                if (parsed.consumed < pending_len.*) {
+                    const remaining = pending_len.* - parsed.consumed;
+                    std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[parsed.consumed..pending_len.*]);
+                    pending_len.* = remaining;
+                } else {
+                    pending_len.* = 0;
+                }
+                return;
+            },
+            .need_more => {
+                if (pending_len.* == pending_buf.len) return error.ProxyProtocolHeaderTooLarge;
+                const n = try conn.read(pending_buf[pending_len.*..]);
+                if (n == 0) return error.ConnectionClosed;
+                pending_len.* += n;
+            },
+        }
+    }
+}
+
+fn parseProxyHeader(buf: []const u8, mode: edge_config.ProxyProtocolMode, client_ip_buf: *[64]u8) ProxyHeaderOutcome {
+    return switch (mode) {
+        .off => .no_header,
+        .v1 => parseProxyHeaderV1(buf, true, client_ip_buf),
+        .v2 => parseProxyHeaderV2(buf, true, client_ip_buf),
+        .auto => blk: {
+            if (buf.len == 0) break :blk .need_more;
+            if (buf[0] == 'P') break :blk parseProxyHeaderV1(buf, false, client_ip_buf);
+            if (buf[0] == '\r') break :blk parseProxyHeaderV2(buf, false, client_ip_buf);
+            break :blk .no_header;
+        },
+    };
+}
+
+fn parseProxyHeaderV1(buf: []const u8, strict: bool, client_ip_buf: *[64]u8) ProxyHeaderOutcome {
+    const prefix = "PROXY ";
+    if (buf.len < prefix.len) {
+        if (std.mem.eql(u8, buf, prefix[0..buf.len])) return .need_more;
+        return if (strict) .invalid else .no_header;
+    }
+    if (!std.mem.eql(u8, buf[0..prefix.len], prefix)) return if (strict) .invalid else .no_header;
+
+    const line_end = std.mem.indexOf(u8, buf, "\r\n") orelse {
+        if (buf.len >= 108) return .invalid;
+        return .need_more;
+    };
+    const line = buf[0..line_end];
+
+    var tok_it = std.mem.tokenizeScalar(u8, line, ' ');
+    const sig = tok_it.next() orelse return .invalid;
+    if (!std.mem.eql(u8, sig, "PROXY")) return .invalid;
+    const proto = tok_it.next() orelse return .invalid;
+    if (std.mem.eql(u8, proto, "UNKNOWN")) {
+        return .{ .parsed = .{ .consumed = line_end + 2, .client_ip_len = 0 } };
+    }
+
+    if (!std.mem.eql(u8, proto, "TCP4") and !std.mem.eql(u8, proto, "TCP6")) return .invalid;
+    const src_ip = tok_it.next() orelse return .invalid;
+    _ = tok_it.next() orelse return .invalid;
+    _ = tok_it.next() orelse return .invalid;
+    _ = tok_it.next() orelse return .invalid;
+    if (src_ip.len == 0 or src_ip.len > client_ip_buf.len) return .invalid;
+    @memcpy(client_ip_buf[0..src_ip.len], src_ip);
+    return .{ .parsed = .{ .consumed = line_end + 2, .client_ip_len = src_ip.len } };
+}
+
+fn parseProxyHeaderV2(buf: []const u8, strict: bool, client_ip_buf: *[64]u8) ProxyHeaderOutcome {
+    if (buf.len < proxy_v2_signature.len) {
+        if (std.mem.eql(u8, buf, proxy_v2_signature[0..buf.len])) return .need_more;
+        return if (strict) .invalid else .no_header;
+    }
+    if (!std.mem.eql(u8, buf[0..proxy_v2_signature.len], proxy_v2_signature)) return if (strict) .invalid else .no_header;
+    if (buf.len < 16) return .need_more;
+
+    const ver_cmd = buf[12];
+    if ((ver_cmd >> 4) != 0x2) return .invalid;
+    const cmd = ver_cmd & 0x0f;
+    const fam = buf[13] >> 4;
+    const addr_len = std.mem.readInt(u16, buf[14..16], .big);
+    const total_len: usize = 16 + addr_len;
+    if (total_len > 1024) return .invalid;
+    if (buf.len < total_len) return .need_more;
+
+    if (cmd != 0x1) {
+        return .{ .parsed = .{ .consumed = total_len, .client_ip_len = 0 } };
+    }
+
+    switch (fam) {
+        0x1 => {
+            if (addr_len < 12) return .invalid;
+            const src = buf[16..20];
+            const printed = std.fmt.bufPrint(client_ip_buf, "{d}.{d}.{d}.{d}", .{ src[0], src[1], src[2], src[3] }) catch return .invalid;
+            return .{ .parsed = .{ .consumed = total_len, .client_ip_len = printed.len } };
+        },
+        0x2 => {
+            if (addr_len < 36) return .invalid;
+            const src = buf[16..32];
+            const g0 = std.mem.readInt(u16, src[0..2], .big);
+            const g1 = std.mem.readInt(u16, src[2..4], .big);
+            const g2 = std.mem.readInt(u16, src[4..6], .big);
+            const g3 = std.mem.readInt(u16, src[6..8], .big);
+            const g4 = std.mem.readInt(u16, src[8..10], .big);
+            const g5 = std.mem.readInt(u16, src[10..12], .big);
+            const g6 = std.mem.readInt(u16, src[12..14], .big);
+            const g7 = std.mem.readInt(u16, src[14..16], .big);
+            const printed = std.fmt.bufPrint(client_ip_buf, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{ g0, g1, g2, g3, g4, g5, g6, g7 }) catch return .invalid;
+            return .{ .parsed = .{ .consumed = total_len, .client_ip_len = printed.len } };
+        },
+        else => return .{ .parsed = .{ .consumed = total_len, .client_ip_len = 0 } },
+    }
+}
+
+fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, keep_alive_out: *bool, enable_proxy_protocol: bool) !void {
     var keep_alive = false;
     keep_alive_out.* = false;
     defer keep_alive_out.* = keep_alive;
@@ -1380,6 +1524,24 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     if (cfg.max_connection_memory_bytes > 0 and pending_buf.len > cfg.max_connection_memory_bytes) {
         try sendApiError(allocator, conn.writer(), .payload_too_large, "invalid_request", "Connection memory limit exceeded", null, false, state);
         return;
+    }
+
+    if (enable_proxy_protocol and !session.proxy_protocol_checked) {
+        maybeConsumeProxyProtocolPreface(
+            conn,
+            cfg.proxy_protocol_mode,
+            pending_buf,
+            &session.pending_len,
+            &session.proxy_client_ip_buf,
+            &session.proxy_client_ip_len,
+        ) catch |err| {
+            state.logger.warn(null, "proxy protocol parse failed: {}", .{err});
+            try sendApiError(allocator, conn.writer(), .bad_request, "invalid_request", "Invalid proxy protocol header", null, false, state);
+            return;
+        };
+        session.proxy_protocol_checked = true;
+    } else if (!session.proxy_protocol_checked) {
+        session.proxy_protocol_checked = true;
     }
 
     const total_read = try readHttpRequest(conn, pending_buf, &session.pending_len);
@@ -1415,7 +1577,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     defer allocator.free(correlation_id);
 
     // --- Request Context ---
-    const client_ip = http.request_context.extractClientIp(&request, "unknown");
+    const connection_ip = if (session.proxy_client_ip_len > 0)
+        session.proxy_client_ip_buf[0..session.proxy_client_ip_len]
+    else
+        "unknown";
+    const client_ip = http.request_context.extractClientIp(&request, connection_ip);
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
 
     // --- Request validation (body size, URI length, header count) ---
@@ -2730,6 +2896,43 @@ test "selectUpstreamBaseUrlWeighted honors configured weights" {
     try std.testing.expectEqualStrings("http://upstream-a:8080", selectUpstreamBaseUrlWeighted(base_urls[0..], weights[0..], "http://fallback:8080", &idx));
 }
 
+test "parse proxy protocol v1 header extracts source ip" {
+    var ip_buf: [64]u8 = undefined;
+    const header = "PROXY TCP4 203.0.113.9 10.0.0.5 443 8080\r\nGET / HTTP/1.1\r\n\r\n";
+    const parsed = parseProxyHeader(header, .v1, &ip_buf);
+    switch (parsed) {
+        .parsed => |result| {
+            try std.testing.expectEqual(@as(usize, 42), result.consumed);
+            try std.testing.expectEqualStrings("203.0.113.9", ip_buf[0..result.client_ip_len]);
+        },
+        else => return error.UnexpectedTestResult,
+    }
+}
+
+test "parse proxy protocol auto mode ignores non-proxy preface" {
+    var ip_buf: [64]u8 = undefined;
+    const header = "GET / HTTP/1.1\r\nHost: example\r\n\r\n";
+    const parsed = parseProxyHeader(header, .auto, &ip_buf);
+    try std.testing.expect(parsed == .no_header);
+}
+
+test "parse proxy protocol v2 header extracts source ip" {
+    var ip_buf: [64]u8 = undefined;
+    const header = [_]u8{
+        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
+        0x21, 0x11, 0x00, 0x0c, 203,  0,    113,  44,   10,   0,    0,    2,
+        0x01, 0xbb, 0x1f, 0x90,
+    };
+    const parsed = parseProxyHeader(header[0..], .v2, &ip_buf);
+    switch (parsed) {
+        .parsed => |result| {
+            try std.testing.expectEqual(@as(usize, 28), result.consumed);
+            try std.testing.expectEqualStrings("203.0.113.44", ip_buf[0..result.client_ip_len]);
+        },
+        else => return error.UnexpectedTestResult,
+    }
+}
+
 test "firstRequestCompleteLen detects pipelined boundary" {
     const pipelined =
         "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
@@ -2775,6 +2978,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .listen_port = 8069,
         .tls_cert_path = "",
         .tls_key_path = "",
+        .proxy_protocol_mode = .off,
         .upstream_base_url = "http://127.0.0.1:8080",
         .upstream_base_urls = &[_][]const u8{},
         .upstream_base_url_weights = &[_]u32{},
@@ -2857,6 +3061,7 @@ test "authorizeRequest accepts valid hash" {
         .listen_port = 8069,
         .tls_cert_path = "",
         .tls_key_path = "",
+        .proxy_protocol_mode = .off,
         .upstream_base_url = "http://127.0.0.1:8080",
         .upstream_base_urls = &[_][]const u8{},
         .upstream_base_url_weights = &[_]u32{},

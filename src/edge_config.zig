@@ -18,11 +18,27 @@ pub const UpstreamLbAlgorithm = enum {
     }
 };
 
+pub const ProxyProtocolMode = enum {
+    off,
+    auto,
+    v1,
+    v2,
+
+    pub fn parse(value: []const u8) ?ProxyProtocolMode {
+        if (std.ascii.eqlIgnoreCase(value, "off")) return .off;
+        if (std.ascii.eqlIgnoreCase(value, "auto")) return .auto;
+        if (std.ascii.eqlIgnoreCase(value, "v1")) return .v1;
+        if (std.ascii.eqlIgnoreCase(value, "v2")) return .v2;
+        return null;
+    }
+};
+
 pub const EdgeConfig = struct {
     listen_host: []const u8,
     listen_port: u16,
     tls_cert_path: []const u8,
     tls_key_path: []const u8,
+    proxy_protocol_mode: ProxyProtocolMode,
     upstream_base_url: []const u8,
     upstream_base_urls: [][]const u8,
     upstream_base_url_weights: []u32,
@@ -159,6 +175,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
 
     const tls_key_path = envOrDefault(allocator, "TARDIGRADE_TLS_KEY_PATH", "") catch unreachable;
     errdefer allocator.free(tls_key_path);
+    const proxy_protocol_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_PROTOCOL", "off") catch unreachable;
+    defer allocator.free(proxy_protocol_mode_str);
+    const proxy_protocol_mode = ProxyProtocolMode.parse(proxy_protocol_mode_str) orelse .off;
 
     const upstream_base_url = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_BASE_URL", "http://127.0.0.1:8080") catch unreachable;
     errdefer allocator.free(upstream_base_url);
@@ -414,6 +433,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .listen_port = listen_port,
         .tls_cert_path = tls_cert_path,
         .tls_key_path = tls_key_path,
+        .proxy_protocol_mode = proxy_protocol_mode,
         .upstream_base_url = upstream_base_url,
         .upstream_base_urls = upstream_base_urls,
         .upstream_base_url_weights = upstream_base_url_weights,
@@ -575,4 +595,12 @@ test "parse upstream base url weights csv" {
     try std.testing.expectEqual(@as(u32, 1), weights[1]);
     try std.testing.expectEqual(@as(u32, 2), weights[2]);
     try std.testing.expectError(error.InvalidUpstreamBaseUrlWeight, parseCsvU32Values(allocator, "0"));
+}
+
+test "parse proxy protocol mode aliases" {
+    try std.testing.expectEqual(ProxyProtocolMode.off, ProxyProtocolMode.parse("off").?);
+    try std.testing.expectEqual(ProxyProtocolMode.auto, ProxyProtocolMode.parse("AUTO").?);
+    try std.testing.expectEqual(ProxyProtocolMode.v1, ProxyProtocolMode.parse("v1").?);
+    try std.testing.expectEqual(ProxyProtocolMode.v2, ProxyProtocolMode.parse("v2").?);
+    try std.testing.expect(ProxyProtocolMode.parse("unknown") == null);
 }
