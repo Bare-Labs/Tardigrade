@@ -25,6 +25,7 @@ pub const EdgeConfig = struct {
     tls_key_path: []const u8,
     upstream_base_url: []const u8,
     upstream_base_urls: [][]const u8,
+    upstream_base_url_weights: []u32,
     upstream_backup_base_urls: [][]const u8,
     upstream_lb_algorithm: UpstreamLbAlgorithm,
     /// Proxy target for /v1/chat. Supports absolute URL or path.
@@ -114,6 +115,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.upstream_base_url);
         for (self.upstream_base_urls) |u| allocator.free(u);
         allocator.free(self.upstream_base_urls);
+        allocator.free(self.upstream_base_url_weights);
         for (self.upstream_backup_base_urls) |u| allocator.free(u);
         allocator.free(self.upstream_backup_base_urls);
         allocator.free(self.proxy_pass_chat);
@@ -150,6 +152,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer {
         for (upstream_base_urls) |u| allocator.free(u);
         allocator.free(upstream_base_urls);
+    }
+    const upstream_base_url_weights_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_BASE_URL_WEIGHTS", "") catch unreachable;
+    defer allocator.free(upstream_base_url_weights_raw);
+    const upstream_base_url_weights = try parseCsvU32Values(allocator, upstream_base_url_weights_raw);
+    errdefer allocator.free(upstream_base_url_weights);
+    if (upstream_base_url_weights.len > 0 and upstream_base_url_weights.len != upstream_base_urls.len) {
+        return error.InvalidUpstreamBaseUrlWeightsCount;
     }
     const upstream_backup_base_urls_raw = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_BACKUP_BASE_URLS", "") catch unreachable;
     defer allocator.free(upstream_backup_base_urls_raw);
@@ -349,6 +358,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_key_path = tls_key_path,
         .upstream_base_url = upstream_base_url,
         .upstream_base_urls = upstream_base_urls,
+        .upstream_base_url_weights = upstream_base_url_weights,
         .upstream_backup_base_urls = upstream_backup_base_urls,
         .upstream_lb_algorithm = upstream_lb_algorithm,
         .proxy_pass_chat = proxy_pass_chat,
@@ -450,6 +460,22 @@ fn parseCsvValues(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
     return out.toOwnedSlice();
 }
 
+fn parseCsvU32Values(allocator: std.mem.Allocator, raw: []const u8) ![]u32 {
+    var out = std.ArrayList(u32).init(allocator);
+    errdefer out.deinit();
+
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const value = try std.fmt.parseInt(u32, trimmed, 10);
+        if (value == 0) return error.InvalidUpstreamBaseUrlWeight;
+        try out.append(value);
+    }
+
+    return out.toOwnedSlice();
+}
+
 pub fn hasTlsFiles(cfg: *const EdgeConfig) bool {
     return cfg.tls_cert_path.len > 0 and cfg.tls_key_path.len > 0;
 }
@@ -473,4 +499,16 @@ test "parse upstream lb algorithm aliases" {
     try std.testing.expectEqual(UpstreamLbAlgorithm.generic_hash, UpstreamLbAlgorithm.parse("generic-hash").?);
     try std.testing.expectEqual(UpstreamLbAlgorithm.random_two_choices, UpstreamLbAlgorithm.parse("random_two_choices").?);
     try std.testing.expect(UpstreamLbAlgorithm.parse("unknown") == null);
+}
+
+test "parse upstream base url weights csv" {
+    const allocator = std.testing.allocator;
+    const weights = try parseCsvU32Values(allocator, "3, 1,2");
+    defer allocator.free(weights);
+
+    try std.testing.expectEqual(@as(usize, 3), weights.len);
+    try std.testing.expectEqual(@as(u32, 3), weights[0]);
+    try std.testing.expectEqual(@as(u32, 1), weights[1]);
+    try std.testing.expectEqual(@as(u32, 2), weights[2]);
+    try std.testing.expectError(error.InvalidUpstreamBaseUrlWeight, parseCsvU32Values(allocator, "0"));
 }

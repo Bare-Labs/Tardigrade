@@ -90,6 +90,10 @@
   - Added `TARDIGRADE_UPSTREAM_BACKUP_BASE_URLS` for configuring backup backend pools.
   - Upstream selection now falls back to backup servers only when primaries have no healthy/eligible candidate.
   - Active health probes now include configured backup servers.
+- Phase 4.2 weighted primary upstream selection (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added `TARDIGRADE_UPSTREAM_BASE_URL_WEIGHTS` for aligned positive integer primary-backend weights.
+  - Primary round-robin selection now supports weighted ticketing for uneven traffic distribution.
+  - Added validation for invalid weight configs and weighted-selection unit coverage.
 
 ## [0.26.0] - 2026-03-xx
 

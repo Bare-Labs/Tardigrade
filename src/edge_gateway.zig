@@ -328,25 +328,28 @@ const GatewayState = struct {
             },
             .round_robin => {},
         }
-        const start = self.upstream_rr_index % cfg.upstream_base_urls.len;
+        const primary_slots = primaryWeightedSlotCount(cfg.upstream_base_urls, cfg.upstream_base_url_weights);
+        const start = self.upstream_rr_index % primary_slots;
 
         var offset: usize = 0;
-        while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
-            const idx = (start + offset) % cfg.upstream_base_urls.len;
+        while (offset < primary_slots) : (offset += 1) {
+            const ticket = (start + offset) % primary_slots;
+            const idx = weightedTicketToIndex(cfg.upstream_base_urls, cfg.upstream_base_url_weights, ticket);
             const candidate = cfg.upstream_base_urls[idx];
             if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms) and self.slowStartAllowsTrafficLocked(cfg, candidate, now_ms, @intCast(idx))) {
-                self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+                self.upstream_rr_index = (ticket + 1) % primary_slots;
                 return candidate;
             }
         }
 
         // Fallback pass: choose any healthy backend even if still in slow-start.
         offset = 0;
-        while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
-            const idx = (start + offset) % cfg.upstream_base_urls.len;
+        while (offset < primary_slots) : (offset += 1) {
+            const ticket = (start + offset) % primary_slots;
+            const idx = weightedTicketToIndex(cfg.upstream_base_urls, cfg.upstream_base_url_weights, ticket);
             const candidate = cfg.upstream_base_urls[idx];
             if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) {
-                self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+                self.upstream_rr_index = (ticket + 1) % primary_slots;
                 return candidate;
             }
         }
@@ -483,7 +486,7 @@ const GatewayState = struct {
             return backup;
         }
         // If all primary backends are currently unhealthy, still probe primaries in round-robin order.
-        return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+        return selectUpstreamBaseUrlWeighted(cfg.upstream_base_urls, cfg.upstream_base_url_weights, cfg.upstream_base_url, &self.upstream_rr_index);
     }
 
     fn selectBackupUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, now_ms: u64) ?[]const u8 {
@@ -680,6 +683,37 @@ fn selectUpstreamBaseUrl(base_urls: []const []const u8, fallback: []const u8, rr
     if (base_urls.len == 0) return fallback;
     const idx = rr_index.* % base_urls.len;
     rr_index.* = (idx + 1) % base_urls.len;
+    return base_urls[idx];
+}
+
+fn primaryWeightedSlotCount(base_urls: []const []const u8, weights: []const u32) usize {
+    if (base_urls.len == 0) return 0;
+    if (weights.len != base_urls.len or weights.len == 0) return base_urls.len;
+
+    var total: usize = 0;
+    for (weights) |w| total +|= w;
+    return if (total == 0) base_urls.len else total;
+}
+
+fn weightedTicketToIndex(base_urls: []const []const u8, weights: []const u32, ticket: usize) usize {
+    if (base_urls.len == 0) return 0;
+    if (weights.len != base_urls.len or weights.len == 0) return ticket % base_urls.len;
+
+    const total = primaryWeightedSlotCount(base_urls, weights);
+    var remaining = ticket % total;
+    for (weights, 0..) |w, idx| {
+        if (remaining < w) return idx;
+        remaining -= w;
+    }
+    return base_urls.len - 1;
+}
+
+fn selectUpstreamBaseUrlWeighted(base_urls: []const []const u8, weights: []const u32, fallback: []const u8, rr_index: *usize) []const u8 {
+    if (base_urls.len == 0) return fallback;
+    const slots = primaryWeightedSlotCount(base_urls, weights);
+    const ticket = rr_index.* % slots;
+    const idx = weightedTicketToIndex(base_urls, weights, ticket);
+    rr_index.* = (ticket + 1) % slots;
     return base_urls[idx];
 }
 
@@ -903,6 +937,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (cfg.upstream_base_urls.len > 0) {
         state.logger.info(null, "Upstream round-robin enabled with {d} base URLs", .{cfg.upstream_base_urls.len});
+        if (cfg.upstream_base_url_weights.len > 0) {
+            state.logger.info(null, "Upstream server weights enabled with {d} entries", .{cfg.upstream_base_url_weights.len});
+        }
         if (cfg.upstream_backup_base_urls.len > 0) {
             state.logger.info(null, "Upstream backup servers enabled with {d} base URLs", .{cfg.upstream_backup_base_urls.len});
         }
@@ -2596,6 +2633,24 @@ test "selectUpstreamBaseUrl round-robins across configured bases" {
     try std.testing.expectEqualStrings("http://upstream-a:8080", selectUpstreamBaseUrl(base_urls[0..], "http://fallback:8080", &idx));
 }
 
+test "selectUpstreamBaseUrlWeighted honors configured weights" {
+    var idx: usize = 0;
+    const base_urls = [_][]const u8{
+        "http://upstream-a:8080",
+        "http://upstream-b:8080",
+        "http://upstream-c:8080",
+    };
+    const weights = [_]u32{ 3, 1, 2 };
+
+    try std.testing.expectEqualStrings("http://upstream-a:8080", selectUpstreamBaseUrlWeighted(base_urls[0..], weights[0..], "http://fallback:8080", &idx));
+    try std.testing.expectEqualStrings("http://upstream-a:8080", selectUpstreamBaseUrlWeighted(base_urls[0..], weights[0..], "http://fallback:8080", &idx));
+    try std.testing.expectEqualStrings("http://upstream-a:8080", selectUpstreamBaseUrlWeighted(base_urls[0..], weights[0..], "http://fallback:8080", &idx));
+    try std.testing.expectEqualStrings("http://upstream-b:8080", selectUpstreamBaseUrlWeighted(base_urls[0..], weights[0..], "http://fallback:8080", &idx));
+    try std.testing.expectEqualStrings("http://upstream-c:8080", selectUpstreamBaseUrlWeighted(base_urls[0..], weights[0..], "http://fallback:8080", &idx));
+    try std.testing.expectEqualStrings("http://upstream-c:8080", selectUpstreamBaseUrlWeighted(base_urls[0..], weights[0..], "http://fallback:8080", &idx));
+    try std.testing.expectEqualStrings("http://upstream-a:8080", selectUpstreamBaseUrlWeighted(base_urls[0..], weights[0..], "http://fallback:8080", &idx));
+}
+
 test "firstRequestCompleteLen detects pipelined boundary" {
     const pipelined =
         "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
@@ -2643,6 +2698,7 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tls_key_path = "",
         .upstream_base_url = "http://127.0.0.1:8080",
         .upstream_base_urls = &[_][]const u8{},
+        .upstream_base_url_weights = &[_]u32{},
         .upstream_backup_base_urls = &[_][]const u8{},
         .upstream_lb_algorithm = .round_robin,
         .proxy_pass_chat = "/v1/chat",
@@ -2718,6 +2774,7 @@ test "authorizeRequest accepts valid hash" {
         .tls_key_path = "",
         .upstream_base_url = "http://127.0.0.1:8080",
         .upstream_base_urls = &[_][]const u8{},
+        .upstream_base_url_weights = &[_]u32{},
         .upstream_backup_base_urls = &[_][]const u8{},
         .upstream_lb_algorithm = .round_robin,
         .proxy_pass_chat = "/v1/chat",
