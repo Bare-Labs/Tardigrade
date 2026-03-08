@@ -302,10 +302,12 @@ Resolved (incremental): recovered upstreams now enter configurable slow-start wi
 Resolved (incremental): added configurable PROXY protocol parsing (`TARDIGRADE_PROXY_PROTOCOL=off|auto|v1|v2`) on plaintext listeners with v1/v2 support and request-context client IP extraction from parsed source addresses.
 
 ### 4.6 Service Trust Model (NEW)
-- [ ] trusted upstream configuration
-- [ ] signed upstream headers
-- [ ] auth context forwarding
-- [ ] upstream identity verification
+- [x] trusted upstream configuration
+- [x] signed upstream headers
+- [x] auth context forwarding
+- [x] upstream identity verification
+
+Resolved (incremental): added trust model configuration (`TARDIGRADE_TRUST_GATEWAY_ID`, `TARDIGRADE_TRUST_SHARED_SECRET`, `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES`, `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY`), signed upstream request headers, auth-context forwarding headers, and trusted upstream identity enforcement against configured upstream identities.
 
 ### 4.7 Unix Socket Upstreams (NEW)
 - [ ] unix domain socket backends

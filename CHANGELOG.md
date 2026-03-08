@@ -102,6 +102,10 @@
   - Added `TARDIGRADE_PROXY_PROTOCOL` (`off|auto|v1|v2`) for PROXY header parsing on plaintext listeners.
   - Added v1/v2 PROXY header parsing and request-context client IP extraction from parsed source addresses.
   - Added parser coverage for v1, v2, and auto-mode no-header behavior.
+- Phase 4.6 service trust model foundation (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added trusted-upstream configuration env vars for gateway identity, shared secret, strict trust enforcement, and trusted upstream identity allowlists.
+  - Upstream proxy requests now include signed trust headers and forwarded auth context metadata.
+  - Upstream target selection now enforces trusted identity matching when configured, with explicit `upstream_untrusted` error mapping.
 
 ## [0.26.0] - 2026-03-xx
 

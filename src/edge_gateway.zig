@@ -960,6 +960,15 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             state.logger.warn(null, "proxy protocol parsing currently applies only to plaintext listeners", .{});
         }
     }
+    if (cfg.trust_shared_secret.len > 0) {
+        state.logger.info(null, "Trusted upstream signing enabled (gateway_id={s})", .{cfg.trust_gateway_id});
+    }
+    if (cfg.trusted_upstream_identities.len > 0) {
+        state.logger.info(null, "Trusted upstream identities configured: {d}", .{cfg.trusted_upstream_identities.len});
+    }
+    if (cfg.trust_require_upstream_identity) {
+        state.logger.info(null, "Strict upstream trust verification enabled", .{});
+    }
     {
         const limits = cfg.request_limits;
         if (limits.max_body_size > 0 or limits.max_uri_length > 0 or limits.max_header_count > 0) {
@@ -1938,21 +1947,24 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             envelope,
             correlation_id,
             client_ip,
+            ctx.identity,
+            ctx.api_version,
             request.headers.get("host"),
             request.headers.get("x-forwarded-for"),
             writer,
             state,
             effective_idem_key == null,
-        ) catch {
+        ) catch |err| {
             state.circuitRecordFailure();
             state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
-            try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, keep_alive, state);
+            const mapped = mapProxyExecutionError(err);
+            try sendApiError(allocator, writer, mapped.status, mapped.code, mapped.message, correlation_id, keep_alive, state);
             // Audit
             const cmd_audit = http.command.CommandAudit{
                 .command = cmd.command_type.toString(),
                 .correlation_id = correlation_id,
                 .identity = ctx.identity orelse "-",
-                .status = 504,
+                .status = @intFromEnum(mapped.status),
                 .latency_ms = ctx.elapsedMs(),
             };
             cmd_audit.log();
@@ -2158,16 +2170,19 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             chat_request_body,
             correlation_id,
             client_ip,
+            ctx.identity,
+            ctx.api_version,
             request.headers.get("host"),
             request.headers.get("x-forwarded-for"),
             writer,
             state,
             ctx.idempotency_key == null,
-        ) catch {
+        ) catch |err| {
             state.circuitRecordFailure();
             state.logger.warn(null, "circuit breaker: recorded failure, state={s}", .{state.circuitStateName()});
-            try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream timeout", correlation_id, keep_alive, state);
-            logAccess(&ctx, request.method.toString(), "/v1/chat", 504, request.headers.get("user-agent") orelse "");
+            const mapped = mapProxyExecutionError(err);
+            try sendApiError(allocator, writer, mapped.status, mapped.code, mapped.message, correlation_id, keep_alive, state);
+            logAccess(&ctx, request.method.toString(), "/v1/chat", @intFromEnum(mapped.status), request.headers.get("user-agent") orelse "");
             return;
         };
         defer allocator.free(message);
@@ -2358,6 +2373,8 @@ fn proxyJsonExecute(
     payload: []const u8,
     correlation_id: []const u8,
     client_ip: []const u8,
+    auth_identity: ?[]const u8,
+    api_version: ?u32,
     incoming_host: ?[]const u8,
     incoming_x_forwarded_for: ?[]const u8,
     downstream_writer: anytype,
@@ -2402,6 +2419,8 @@ fn proxyJsonExecute(
                 payload,
                 correlation_id,
                 client_ip,
+                auth_identity,
+                api_version,
                 incoming_host,
                 incoming_x_forwarded_for,
                 downstream_writer,
@@ -2456,6 +2475,8 @@ fn proxyJsonExecuteSingleAttempt(
     payload: []const u8,
     correlation_id: []const u8,
     client_ip: []const u8,
+    auth_identity: ?[]const u8,
+    api_version: ?u32,
     incoming_host: ?[]const u8,
     incoming_x_forwarded_for: ?[]const u8,
     downstream_writer: anytype,
@@ -2471,15 +2492,42 @@ fn proxyJsonExecuteSingleAttempt(
     const forwarded_host = incoming_host orelse "";
     const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
     const upstream_host = resolved_target.upstream_host;
+    if (cfg.trust_require_upstream_identity and cfg.trust_shared_secret.len == 0) return error.UpstreamUntrusted;
+    if (!isTrustedUpstream(cfg, upstream_host)) return error.UpstreamUntrusted;
 
     var extra_headers = std.ArrayList(std.http.Header).init(allocator);
     defer extra_headers.deinit();
+    var owned_header_values = std.ArrayList([]u8).init(allocator);
+    defer {
+        for (owned_header_values.items) |value| allocator.free(value);
+        owned_header_values.deinit();
+    }
     try extra_headers.append(.{ .name = http.correlation.HEADER_NAME, .value = correlation_id });
     try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for });
     try extra_headers.append(.{ .name = "X-Real-IP", .value = client_ip });
     try extra_headers.append(.{ .name = "X-Forwarded-Proto", .value = forwarded_proto });
     if (forwarded_host.len > 0) try extra_headers.append(.{ .name = "X-Forwarded-Host", .value = forwarded_host });
     if (upstream_host.len > 0) try extra_headers.append(.{ .name = "Host", .value = upstream_host });
+    if (auth_identity) |identity| {
+        if (identity.len > 0) try extra_headers.append(.{ .name = "X-Tardigrade-Auth-Identity", .value = identity });
+    }
+    if (api_version) |ver| {
+        const api_version_value = try std.fmt.allocPrint(allocator, "{d}", .{ver});
+        try owned_header_values.append(api_version_value);
+        try extra_headers.append(.{ .name = "X-Tardigrade-Api-Version", .value = api_version_value });
+    }
+    try appendTrustedUpstreamHeaders(
+        allocator,
+        cfg,
+        &extra_headers,
+        &owned_header_values,
+        resolved_target.url,
+        correlation_id,
+        client_ip,
+        auth_identity,
+        api_version,
+        payload,
+    );
 
     var server_header_buffer: [16 * 1024]u8 = undefined;
     const uri = try std.Uri.parse(resolved_target.url);
@@ -2624,6 +2672,76 @@ fn writeChunk(writer: anytype, bytes: []const u8) !void {
     try writer.writeAll("\r\n");
 }
 
+fn stripPort(authority: []const u8) []const u8 {
+    if (authority.len == 0) return authority;
+    if (authority[0] == '[') {
+        const close_idx = std.mem.indexOfScalar(u8, authority, ']') orelse return authority;
+        return authority[0 .. close_idx + 1];
+    }
+    const colon_idx = std.mem.lastIndexOfScalar(u8, authority, ':') orelse return authority;
+    return authority[0..colon_idx];
+}
+
+fn isTrustedUpstream(cfg: *const edge_config.EdgeConfig, upstream_host: []const u8) bool {
+    if (!cfg.trust_require_upstream_identity and cfg.trusted_upstream_identities.len == 0) return true;
+    if (upstream_host.len == 0) return false;
+    const host = stripPort(upstream_host);
+
+    for (cfg.trusted_upstream_identities) |trusted| {
+        const trusted_host = stripPort(trusted);
+        if (std.ascii.eqlIgnoreCase(trusted, upstream_host) or std.ascii.eqlIgnoreCase(trusted_host, host)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn appendTrustedUpstreamHeaders(
+    allocator: std.mem.Allocator,
+    cfg: *const edge_config.EdgeConfig,
+    extra_headers: *std.ArrayList(std.http.Header),
+    owned_header_values: *std.ArrayList([]u8),
+    target_url: []const u8,
+    correlation_id: []const u8,
+    client_ip: []const u8,
+    auth_identity: ?[]const u8,
+    api_version: ?u32,
+    payload: []const u8,
+) !void {
+    if (cfg.trust_shared_secret.len == 0) return;
+
+    const ts = std.time.timestamp();
+    const ts_value = try std.fmt.allocPrint(allocator, "{d}", .{ts});
+    try owned_header_values.append(ts_value);
+    try extra_headers.append(.{ .name = "X-Tardigrade-Gateway-Id", .value = cfg.trust_gateway_id });
+    try extra_headers.append(.{ .name = "X-Tardigrade-Trust-Timestamp", .value = ts_value });
+
+    var payload_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &payload_digest, .{});
+    var payload_digest_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&payload_digest_hex, "{s}", .{std.fmt.fmtSliceHexLower(&payload_digest)}) catch unreachable;
+
+    const identity = auth_identity orelse "-";
+    const api_version_value = if (api_version) |ver|
+        try std.fmt.allocPrint(allocator, "{d}", .{ver})
+    else
+        try allocator.dupe(u8, "-");
+    defer allocator.free(api_version_value);
+
+    const material = try std.fmt.allocPrint(
+        allocator,
+        "POST\n{s}\n{s}\n{s}\n{s}\n{s}\n{s}\n{s}\n{s}",
+        .{ target_url, correlation_id, client_ip, cfg.trust_gateway_id, ts_value, payload_digest_hex, identity, api_version_value },
+    );
+    defer allocator.free(material);
+
+    var mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, material, cfg.trust_shared_secret);
+    const signature_hex = try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.fmtSliceHexLower(&mac)});
+    try owned_header_values.append(signature_hex);
+    try extra_headers.append(.{ .name = "X-Tardigrade-Trust-Signature", .value = signature_hex });
+}
+
 fn buildForwardedFor(allocator: std.mem.Allocator, incoming: ?[]const u8, client_ip: []const u8) ![]const u8 {
     if (incoming) |value| {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -2713,6 +2831,12 @@ const UpstreamMappedError = struct {
     message: []const u8,
 };
 
+const ProxyExecMappedError = struct {
+    status: http.status.StatusCode,
+    code: []const u8,
+    message: []const u8,
+};
+
 fn mapUpstreamError(status: u16) UpstreamMappedError {
     return switch (status) {
         401 => .{ .status = 401, .code = "unauthorized", .message = "Unauthorized" },
@@ -2720,6 +2844,26 @@ fn mapUpstreamError(status: u16) UpstreamMappedError {
         502, 503 => .{ .status = 503, .code = "tool_unavailable", .message = "Upstream unavailable" },
         504 => .{ .status = 504, .code = "upstream_timeout", .message = "Upstream timeout" },
         else => .{ .status = 500, .code = "internal_error", .message = "Internal error" },
+    };
+}
+
+fn mapProxyExecutionError(err: anyerror) ProxyExecMappedError {
+    return switch (err) {
+        error.UpstreamUntrusted => .{
+            .status = .service_unavailable,
+            .code = "upstream_untrusted",
+            .message = "Untrusted upstream response",
+        },
+        error.Timeout => .{
+            .status = .gateway_timeout,
+            .code = "upstream_timeout",
+            .message = "Upstream timeout",
+        },
+        else => .{
+            .status = .gateway_timeout,
+            .code = "upstream_timeout",
+            .message = "Upstream timeout",
+        },
     };
 }
 
@@ -2979,6 +3123,10 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .tls_cert_path = "",
         .tls_key_path = "",
         .proxy_protocol_mode = .off,
+        .trust_gateway_id = "tardigrade-edge",
+        .trust_shared_secret = "",
+        .trusted_upstream_identities = &[_][]const u8{},
+        .trust_require_upstream_identity = false,
         .upstream_base_url = "http://127.0.0.1:8080",
         .upstream_base_urls = &[_][]const u8{},
         .upstream_base_url_weights = &[_]u32{},
@@ -3062,6 +3210,10 @@ test "authorizeRequest accepts valid hash" {
         .tls_cert_path = "",
         .tls_key_path = "",
         .proxy_protocol_mode = .off,
+        .trust_gateway_id = "tardigrade-edge",
+        .trust_shared_secret = "",
+        .trusted_upstream_identities = &[_][]const u8{},
+        .trust_require_upstream_identity = false,
         .upstream_base_url = "http://127.0.0.1:8080",
         .upstream_base_urls = &[_][]const u8{},
         .upstream_base_url_weights = &[_]u32{},
