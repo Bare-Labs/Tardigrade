@@ -294,7 +294,7 @@ const GatewayState = struct {
         return self.metrics.toPrometheus(allocator);
     }
 
-    fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig, client_ip: []const u8) []const u8 {
+    fn nextUpstreamBaseUrl(self: *GatewayState, cfg: *const edge_config.EdgeConfig, client_ip: []const u8, hash_key: []const u8) []const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (cfg.upstream_base_urls.len == 0) return cfg.upstream_base_url;
@@ -309,6 +309,12 @@ const GatewayState = struct {
             },
             .ip_hash => {
                 if (self.selectIpHashUpstreamLocked(cfg, client_ip, now_ms)) |selected| {
+                    return selected;
+                }
+                return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+            },
+            .generic_hash => {
+                if (self.selectGenericHashUpstreamLocked(cfg, hash_key, now_ms)) |selected| {
                     return selected;
                 }
                 return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
@@ -371,6 +377,32 @@ const GatewayState = struct {
     fn selectIpHashUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, client_ip: []const u8, now_ms: u64) ?[]const u8 {
         if (cfg.upstream_base_urls.len == 0) return null;
         const start = ipHashIndex(client_ip, cfg.upstream_base_urls.len);
+
+        var offset: usize = 0;
+        while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
+            const idx = (start + offset) % cfg.upstream_base_urls.len;
+            const candidate = cfg.upstream_base_urls[idx];
+            if (!self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) continue;
+            if (!self.slowStartAllowsTrafficLocked(cfg, candidate, now_ms, @intCast(idx))) continue;
+            self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+            return candidate;
+        }
+
+        offset = 0;
+        while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
+            const idx = (start + offset) % cfg.upstream_base_urls.len;
+            const candidate = cfg.upstream_base_urls[idx];
+            if (self.isUpstreamHealthyLocked(cfg, candidate, now_ms)) {
+                self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    fn selectGenericHashUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, hash_key: []const u8, now_ms: u64) ?[]const u8 {
+        if (cfg.upstream_base_urls.len == 0) return null;
+        const start = ipHashIndex(hash_key, cfg.upstream_base_urls.len);
 
         var offset: usize = 0;
         while (offset < cfg.upstream_base_urls.len) : (offset += 1) {
@@ -839,6 +871,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         switch (cfg.upstream_lb_algorithm) {
             .least_connections => state.logger.info(null, "Upstream load balancing algorithm: least_connections", .{}),
             .ip_hash => state.logger.info(null, "Upstream load balancing algorithm: ip_hash", .{}),
+            .generic_hash => state.logger.info(null, "Upstream load balancing algorithm: generic_hash", .{}),
             .random_two_choices => state.logger.info(null, "Upstream load balancing algorithm: random_two_choices", .{}),
             .round_robin => {},
         }
@@ -2015,6 +2048,7 @@ fn proxyJsonExecute(
     else
         configured_attempts;
     const start_ms = http.event_loop.monotonicMs();
+    const upstream_hash_key = if (payload.len > 0) payload else (suffix_path orelse proxy_pass_target);
 
     var attempt: usize = 0;
     var last_err: ?anyerror = null;
@@ -2030,7 +2064,7 @@ fn proxyJsonExecute(
             break :blk @intCast(@min(@as(u64, cfg.upstream_timeout_ms), remaining));
         };
 
-        const upstream_base_url = state.nextUpstreamBaseUrl(cfg, client_ip);
+        const upstream_base_url = state.nextUpstreamBaseUrl(cfg, client_ip, upstream_hash_key);
         state.recordUpstreamAttemptStart(upstream_base_url);
         const exec = blk: {
             defer state.recordUpstreamAttemptEnd(upstream_base_url);

@@ -82,6 +82,10 @@
   - Extended `TARDIGRADE_UPSTREAM_LB_ALGORITHM` with `random_two_choices` mode.
   - Added power-of-two-choices backend selection that samples two random backends and chooses the lower in-flight load.
   - Random-two-choices selection is integrated with health/slow-start filters and fallback behavior.
+- Phase 4.3 generic-hash load balancing (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Extended `TARDIGRADE_UPSTREAM_LB_ALGORITHM` with `generic_hash` mode.
+  - Added deterministic hash-based backend selection using a request hash key (payload when present, otherwise proxy target path).
+  - Generic-hash selection is integrated with health/slow-start filters and fallback behavior.
 
 ## [0.26.0] - 2026-03-xx
 
