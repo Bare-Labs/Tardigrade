@@ -75,6 +75,12 @@ pub const EdgeConfig = struct {
     upstream_max_fails: u32,
     /// Passive health timeout (ms) for failed upstreams before retry eligibility.
     upstream_fail_timeout_ms: u64,
+    /// Active health-check probe interval (ms, 0 = disabled).
+    upstream_active_health_interval_ms: u64,
+    /// Active health-check probe path.
+    upstream_active_health_path: []const u8,
+    /// Active health-check per-probe timeout in ms.
+    upstream_active_health_timeout_ms: u32,
 
     pub fn deinit(self: *EdgeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.listen_host);
@@ -90,6 +96,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.access_control_rules);
         for (self.basic_auth_hashes) |h| allocator.free(h);
         allocator.free(self.basic_auth_hashes);
+        allocator.free(self.upstream_active_health_path);
         self.* = undefined;
     }
 };
@@ -275,6 +282,17 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(fail_timeout_str);
     const upstream_fail_timeout_ms = std.fmt.parseInt(u64, fail_timeout_str, 10) catch 10_000;
 
+    const active_health_interval_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS", "0") catch unreachable;
+    defer allocator.free(active_health_interval_str);
+    const upstream_active_health_interval_ms = std.fmt.parseInt(u64, active_health_interval_str, 10) catch 0;
+
+    const upstream_active_health_path = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH", "/health") catch unreachable;
+    errdefer allocator.free(upstream_active_health_path);
+
+    const active_health_timeout_str = envOrDefault(allocator, "TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS", "2000") catch unreachable;
+    defer allocator.free(active_health_timeout_str);
+    const upstream_active_health_timeout_ms = std.fmt.parseInt(u32, active_health_timeout_str, 10) catch 2000;
+
     return .{
         .listen_host = listen_host,
         .listen_port = listen_port,
@@ -323,6 +341,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_timeout_budget_ms = upstream_timeout_budget_ms,
         .upstream_max_fails = upstream_max_fails,
         .upstream_fail_timeout_ms = upstream_fail_timeout_ms,
+        .upstream_active_health_interval_ms = upstream_active_health_interval_ms,
+        .upstream_active_health_path = upstream_active_health_path,
+        .upstream_active_health_timeout_ms = upstream_active_health_timeout_ms,
     };
 }
 

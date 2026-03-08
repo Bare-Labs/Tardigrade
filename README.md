@@ -69,6 +69,9 @@ Environment variables:
 - `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS` (default `0`; total timeout budget across all upstream attempts; `0` disables budget enforcement)
 - `TARDIGRADE_UPSTREAM_MAX_FAILS` (default `0`; passive health threshold; `0` disables passive unhealthy marking)
 - `TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS` (default `10000`; cooldown window before a failed upstream is retried)
+- `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS` (default `0`; periodic active probe interval; `0` disables active probes)
+- `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH` (default `/health`; path used for active health probes)
+- `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS` (default `2000`; per-probe timeout)
 
 ### Build for Production
 

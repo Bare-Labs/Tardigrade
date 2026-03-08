@@ -41,6 +41,7 @@ const GatewayState = struct {
     connection_memory_estimate_bytes: usize,
     max_total_connection_memory_bytes: usize,
     upstream_rr_index: usize,
+    next_active_health_probe_ms: u64,
     upstream_health: std.StringHashMap(UpstreamHealth),
     active_connections_by_ip: std.StringHashMap(u32),
     active_fds: std.AutoHashMap(std.posix.fd_t, void),
@@ -486,6 +487,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE,
         .max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes,
         .upstream_rr_index = 0,
+        .next_active_health_probe_ms = 0,
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
         .active_connections_by_ip = std.StringHashMap(u32).init(state_allocator),
         .active_fds = std.AutoHashMap(std.posix.fd_t, void).init(state_allocator),
@@ -600,6 +602,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.upstream_max_fails > 0) {
         state.logger.info(null, "Passive upstream health enabled: max_fails={d} fail_timeout={d}ms", .{ cfg.upstream_max_fails, cfg.upstream_fail_timeout_ms });
     }
+    if (cfg.upstream_active_health_interval_ms > 0) {
+        state.logger.info(null, "Active upstream health checks enabled: interval={d}ms path={s} timeout={d}ms", .{ cfg.upstream_active_health_interval_ms, cfg.upstream_active_health_path, cfg.upstream_active_health_timeout_ms });
+    }
     if (cfg.max_connections_per_ip > 0) {
         state.logger.info(null, "Per-IP connection limit enabled: {d}", .{cfg.max_connections_per_ip});
     }
@@ -631,7 +636,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         }
 
         if (timer.consumeTick(http.event_loop.monotonicMs())) {
-            // Timer hook for periodic housekeeping (timeouts, cleanup) as async features expand.
+            runActiveHealthChecks(cfg, &state);
         }
     }
 
@@ -708,6 +713,88 @@ fn rejectOverloadedClient(client_fd: std.posix.fd_t) void {
             "\r\n",
     ) catch {};
     stream.close();
+}
+
+fn runActiveHealthChecks(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
+    if (cfg.upstream_active_health_interval_ms == 0) return;
+    if (cfg.upstream_max_fails == 0) return;
+
+    const now_ms = http.event_loop.monotonicMs();
+    if (state.next_active_health_probe_ms != 0 and now_ms < state.next_active_health_probe_ms) return;
+    state.next_active_health_probe_ms = now_ms + cfg.upstream_active_health_interval_ms;
+
+    var probe_client = std.http.Client{ .allocator = state.allocator };
+    defer probe_client.deinit();
+
+    if (cfg.upstream_base_urls.len > 0) {
+        for (cfg.upstream_base_urls) |base_url| {
+            probeSingleUpstream(cfg, state, &probe_client, base_url);
+        }
+    } else {
+        probeSingleUpstream(cfg, state, &probe_client, cfg.upstream_base_url);
+    }
+}
+
+fn probeSingleUpstream(cfg: *const edge_config.EdgeConfig, state: *GatewayState, probe_client: *std.http.Client, base_url: []const u8) void {
+    const probe_url = buildHealthProbeUrl(state.allocator, base_url, cfg.upstream_active_health_path) catch |err| {
+        state.logger.warn(null, "active health probe url build failed for {s}: {}", .{ base_url, err });
+        state.recordUpstreamFailure(cfg, base_url);
+        return;
+    };
+    defer state.allocator.free(probe_url);
+
+    const uri = std.Uri.parse(probe_url) catch |err| {
+        state.logger.warn(null, "active health probe uri parse failed for {s}: {}", .{ probe_url, err });
+        state.recordUpstreamFailure(cfg, base_url);
+        return;
+    };
+
+    var header_buf: [4 * 1024]u8 = undefined;
+    var req = probe_client.open(.GET, uri, .{
+        .server_header_buffer = &header_buf,
+        .keep_alive = false,
+    }) catch |err| {
+        state.logger.warn(null, "active health probe open failed for {s}: {}", .{ base_url, err });
+        state.recordUpstreamFailure(cfg, base_url);
+        return;
+    };
+    defer req.deinit();
+
+    if (cfg.upstream_active_health_timeout_ms > 0) {
+        if (req.connection) |conn| {
+            setSocketTimeoutMs(conn.stream.handle, cfg.upstream_active_health_timeout_ms, cfg.upstream_active_health_timeout_ms) catch {};
+        }
+    }
+
+    req.send() catch |err| {
+        state.logger.warn(null, "active health probe send failed for {s}: {}", .{ base_url, err });
+        state.recordUpstreamFailure(cfg, base_url);
+        return;
+    };
+    req.finish() catch |err| {
+        state.logger.warn(null, "active health probe finish failed for {s}: {}", .{ base_url, err });
+        state.recordUpstreamFailure(cfg, base_url);
+        return;
+    };
+    req.wait() catch |err| {
+        state.logger.warn(null, "active health probe wait failed for {s}: {}", .{ base_url, err });
+        state.recordUpstreamFailure(cfg, base_url);
+        return;
+    };
+
+    const status_code: u16 = @intFromEnum(req.response.status);
+    if (status_code >= 200 and status_code < 400) {
+        state.recordUpstreamSuccess(cfg, base_url);
+    } else {
+        state.recordUpstreamFailure(cfg, base_url);
+    }
+}
+
+fn buildHealthProbeUrl(allocator: std.mem.Allocator, base_url: []const u8, probe_path: []const u8) ![]u8 {
+    const base_trimmed = std.mem.trimRight(u8, base_url, "/");
+    const path_trimmed = std.mem.trimLeft(u8, probe_path, "/");
+    if (path_trimmed.len == 0) return std.fmt.allocPrint(allocator, "{s}/", .{base_trimmed});
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_trimmed, path_trimmed });
 }
 
 fn applyFdSoftLimit(desired: u64) !?u64 {
@@ -2126,6 +2213,13 @@ test "parseUpstreamHost extracts authority" {
     try std.testing.expect(parseUpstreamHost("invalid-url") == null);
 }
 
+test "buildHealthProbeUrl joins base and probe path" {
+    const allocator = std.testing.allocator;
+    const url = try buildHealthProbeUrl(allocator, "http://127.0.0.1:8080/", "/health");
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/health", url);
+}
+
 test "selectUpstreamBaseUrl round-robins across configured bases" {
     var idx: usize = 0;
     const base_urls = [_][]const u8{
@@ -2221,6 +2315,9 @@ test "resolveProxyTarget handles absolute and relative proxy_pass" {
         .upstream_timeout_budget_ms = 0,
         .upstream_max_fails = 0,
         .upstream_fail_timeout_ms = 10_000,
+        .upstream_active_health_interval_ms = 0,
+        .upstream_active_health_path = "/health",
+        .upstream_active_health_timeout_ms = 2000,
     };
 
     const abs = try resolveProxyTarget(allocator, cfg.upstream_base_url, "https://api.example.com/base", "/v1/chat");
@@ -2288,6 +2385,9 @@ test "authorizeRequest accepts valid hash" {
         .upstream_timeout_budget_ms = 0,
         .upstream_max_fails = 0,
         .upstream_fail_timeout_ms = 10_000,
+        .upstream_active_health_interval_ms = 0,
+        .upstream_active_health_path = "/health",
+        .upstream_active_health_timeout_ms = 2000,
     };
 
     var headers = http.Headers.init(allocator);

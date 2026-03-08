@@ -56,6 +56,10 @@
   - Added active connection gauge and listener rejection counters (connection-slot and queue saturation).
   - Added upstream unhealthy backend gauge derived from passive health tracking state.
   - Extended `/metrics` JSON and `/metrics/prometheus` output to include the new operational metrics.
+- Phase 4.4 active upstream health checks (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Added periodic active probe controls: `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_INTERVAL_MS`, `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_PATH`, and `TARDIGRADE_UPSTREAM_ACTIVE_HEALTH_TIMEOUT_MS`.
+  - Event-loop timer ticks now run active health probes across configured upstreams.
+  - Active probe outcomes now feed existing passive-health failover tracking.
 
 ## [0.26.0] - 2026-03-xx
 
