@@ -78,6 +78,10 @@
   - Extended `TARDIGRADE_UPSTREAM_LB_ALGORITHM` with `ip_hash` mode.
   - Added client-IP hash upstream selection for stable backend affinity across requests.
   - IP-hash selection is integrated with health/slow-start filters and falls back cleanly when candidates are unavailable.
+- Phase 4.3 random-two-choices load balancing (`src/edge_config.zig`, `src/edge_gateway.zig`):
+  - Extended `TARDIGRADE_UPSTREAM_LB_ALGORITHM` with `random_two_choices` mode.
+  - Added power-of-two-choices backend selection that samples two random backends and chooses the lower in-flight load.
+  - Random-two-choices selection is integrated with health/slow-start filters and fallback behavior.
 
 ## [0.26.0] - 2026-03-xx
 

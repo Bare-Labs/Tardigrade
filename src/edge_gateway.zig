@@ -44,6 +44,7 @@ const GatewayState = struct {
     connection_memory_estimate_bytes: usize,
     max_total_connection_memory_bytes: usize,
     upstream_rr_index: usize,
+    lb_random_state: u64,
     next_active_health_probe_ms: u64,
     upstream_health: std.StringHashMap(UpstreamHealth),
     upstream_active_requests: std.StringHashMap(usize),
@@ -312,6 +313,12 @@ const GatewayState = struct {
                 }
                 return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
             },
+            .random_two_choices => {
+                if (self.selectRandomTwoChoicesUpstreamLocked(cfg, now_ms)) |selected| {
+                    return selected;
+                }
+                return selectUpstreamBaseUrl(cfg.upstream_base_urls, cfg.upstream_base_url, &self.upstream_rr_index);
+            },
             .round_robin => {},
         }
         const start = self.upstream_rr_index % cfg.upstream_base_urls.len;
@@ -383,6 +390,58 @@ const GatewayState = struct {
                 self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
                 return candidate;
             }
+        }
+        return null;
+    }
+
+    fn nextLbRandomLocked(self: *GatewayState) u64 {
+        self.lb_random_state = self.lb_random_state *% 6364136223846793005 +% 1442695040888963407;
+        return self.lb_random_state;
+    }
+
+    fn nextRandomIndexLocked(self: *GatewayState, len: usize) usize {
+        if (len == 0) return 0;
+        return @intCast(self.nextLbRandomLocked() % len);
+    }
+
+    fn selectRandomTwoChoicesUpstreamLocked(self: *GatewayState, cfg: *const edge_config.EdgeConfig, now_ms: u64) ?[]const u8 {
+        if (cfg.upstream_base_urls.len == 0) return null;
+
+        const first_idx = self.nextRandomIndexLocked(cfg.upstream_base_urls.len);
+        var second_idx = first_idx;
+        if (cfg.upstream_base_urls.len > 1) {
+            second_idx = self.nextRandomIndexLocked(cfg.upstream_base_urls.len - 1);
+            if (second_idx >= first_idx) second_idx += 1;
+        }
+
+        const first = cfg.upstream_base_urls[first_idx];
+        const second = cfg.upstream_base_urls[second_idx];
+        const first_healthy = self.isUpstreamHealthyLocked(cfg, first, now_ms);
+        const second_healthy = self.isUpstreamHealthyLocked(cfg, second, now_ms);
+        const first_strict = first_healthy and self.slowStartAllowsTrafficLocked(cfg, first, now_ms, @intCast(first_idx));
+        const second_strict = second_healthy and self.slowStartAllowsTrafficLocked(cfg, second, now_ms, @intCast(second_idx));
+
+        const chosen_idx: ?usize = blk: {
+            if (first_strict and second_strict) {
+                const first_load = self.upstream_active_requests.get(first) orelse 0;
+                const second_load = self.upstream_active_requests.get(second) orelse 0;
+                break :blk if (second_load < first_load) second_idx else first_idx;
+            }
+            if (first_strict) break :blk first_idx;
+            if (second_strict) break :blk second_idx;
+            if (first_healthy and second_healthy) {
+                const first_load = self.upstream_active_requests.get(first) orelse 0;
+                const second_load = self.upstream_active_requests.get(second) orelse 0;
+                break :blk if (second_load < first_load) second_idx else first_idx;
+            }
+            if (first_healthy) break :blk first_idx;
+            if (second_healthy) break :blk second_idx;
+            break :blk null;
+        };
+
+        if (chosen_idx) |idx| {
+            self.upstream_rr_index = (idx + 1) % cfg.upstream_base_urls.len;
+            return cfg.upstream_base_urls[idx];
         }
         return null;
     }
@@ -670,6 +729,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE,
         .max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes,
         .upstream_rr_index = 0,
+        .lb_random_state = 0x9e3779b97f4a7c15 ^ @as(u64, @intCast(http.event_loop.monotonicMs())),
         .next_active_health_probe_ms = 0,
         .upstream_health = std.StringHashMap(UpstreamHealth).init(state_allocator),
         .upstream_active_requests = std.StringHashMap(usize).init(state_allocator),
@@ -779,6 +839,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         switch (cfg.upstream_lb_algorithm) {
             .least_connections => state.logger.info(null, "Upstream load balancing algorithm: least_connections", .{}),
             .ip_hash => state.logger.info(null, "Upstream load balancing algorithm: ip_hash", .{}),
+            .random_two_choices => state.logger.info(null, "Upstream load balancing algorithm: random_two_choices", .{}),
             .round_robin => {},
         }
     }
