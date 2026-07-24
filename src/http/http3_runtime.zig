@@ -82,6 +82,16 @@ const max_connections: usize = 1024;
 const max_connections_per_source: u32 = 32;
 const handshake_timeout_us: u64 = 10 * std.time.us_per_s;
 
+const ParkedH3Retry = struct {
+    stream_id: u64,
+    request: http3_session.StreamRequest,
+
+    fn deinit(self: *ParkedH3Retry) void {
+        self.request.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const Snapshot = struct {
     quic_port: u16 = 0,
     server_bootstrapped: bool = false,
@@ -129,8 +139,11 @@ const ConnEntry = struct {
     /// issuance (successfully or not) — issuance is best-effort and must
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
+    parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
+        for (self.parked_h3_retries.items) |*parked| parked.deinit();
+        self.parked_h3_retries.deinit(allocator);
         self.h3.deinit();
         self.conn.deinit();
         allocator.destroy(self.backend);
@@ -554,6 +567,7 @@ pub const Runtime = struct {
             entry.conn.close(code, "h3 protocol error", now);
             return;
         };
+        self.resumeParkedH3Retries(entry);
         while (true) {
             const incoming = entry.h3.pollRequest() catch {
                 entry.conn.close(entry.h3.closeCode(), "h3 request error", now);
@@ -564,6 +578,7 @@ pub const Runtime = struct {
     }
 
     fn serveRequest(self: *Runtime, entry: *ConnEntry, incoming: H3.IncomingRequest, now: u64) void {
+        _ = now;
         const allocator = self.allocator;
         const handler = self.request_handler orelse {
             entry.h3.sendResponse(entry.conn, incoming.stream_id, 404, &.{}, "") catch {};
@@ -576,6 +591,7 @@ pub const Runtime = struct {
             return;
         };
         defer request.deinit();
+        request.stream_id = incoming.stream_id;
         request.transport_early = incoming.transport_early;
         request.downstream_handshake_complete = entry.conn.isEstablished();
         request.downstream_handshake = .{
@@ -583,16 +599,50 @@ pub const Runtime = struct {
             .is_complete_fn = h3DownstreamHandshakeComplete,
             .wait_or_drive_fn = h3DownstreamWaitOrDriveHandshake,
         };
+        var park_ctx = H3ParkContext{ .runtime = self, .entry = entry, .stream_id = incoming.stream_id };
+        request.park_early_425_retry = .{
+            .ctx = &park_ctx,
+            .park_fn = parkH3Early425Retry,
+        };
 
         var response = response_mod.Response.init(allocator);
         defer response.deinit();
         handler(allocator, &request, &response, self.request_handler_ctx) catch |err| {
+            if (err == error.Http3RequestParked) return;
             self.logger.warn(null, "http3: request handler failed: {s}", .{@errorName(err)});
             entry.h3.sendResponse(entry.conn, incoming.stream_id, 500, &.{}, "") catch {};
             entry.h3.finishRequest(incoming.stream_id);
             return;
         };
 
+        self.sendHandlerResponse(entry, incoming.stream_id, &response);
+    }
+
+    fn resumeParkedH3Retries(self: *Runtime, entry: *ConnEntry) void {
+        const handler = self.request_handler orelse return;
+        while (entry.parked_h3_retries.items.len != 0) {
+            var parked = entry.parked_h3_retries.orderedRemove(0);
+            defer parked.deinit();
+            parked.request.downstream_handshake_complete = entry.conn.isEstablished();
+            parked.request.downstream_handshake = .{
+                .ctx = entry.conn,
+                .is_complete_fn = h3DownstreamHandshakeComplete,
+                .wait_or_drive_fn = h3DownstreamWaitOrDriveHandshake,
+            };
+            parked.request.park_early_425_retry = null;
+
+            var response = response_mod.Response.init(self.allocator);
+            defer response.deinit();
+            handler(self.allocator, &parked.request, &response, self.request_handler_ctx) catch |err| {
+                self.logger.warn(null, "http3: parked request retry failed: {s}", .{@errorName(err)});
+                entry.h3.sendResponse(entry.conn, parked.stream_id, 500, &.{}, "") catch {};
+                return;
+            };
+            self.sendHandlerResponse(entry, parked.stream_id, &response);
+        }
+    }
+
+    fn sendHandlerResponse(self: *Runtime, entry: *ConnEntry, stream_id: u64, response: *const response_mod.Response) void {
         var headers_buf: [64]stream_transport.Header = undefined;
         var header_count: usize = 0;
         for (response.headers.iterator()) |header| {
@@ -602,17 +652,16 @@ pub const Runtime = struct {
         }
         entry.h3.sendResponse(
             entry.conn,
-            incoming.stream_id,
+            stream_id,
             response.status.code(),
             headers_buf[0..header_count],
             response.body orelse "",
         ) catch |err| {
             self.logger.warn(null, "http3: response send failed: {s}", .{@errorName(err)});
-            entry.conn.resetStream(incoming.stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
-            entry.h3.finishRequest(incoming.stream_id);
+            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
+            entry.h3.finishRequest(stream_id);
             return;
         };
-        _ = now;
         self.noteRequestCompleted();
     }
 
@@ -631,6 +680,28 @@ pub const Runtime = struct {
     fn h3DownstreamWaitOrDriveHandshake(ctx: *anyopaque) anyerror!void {
         const conn: *Connection = @ptrCast(@alignCast(ctx));
         conn.driveAuthentication(nowUs());
+    }
+
+    const H3ParkContext = struct {
+        runtime: *Runtime,
+        entry: *ConnEntry,
+        stream_id: u64,
+    };
+
+    fn parkH3Early425Retry(ctx: *anyopaque, request: *const http3_session.StreamRequest) anyerror!void {
+        const park_ctx: *H3ParkContext = @ptrCast(@alignCast(ctx));
+        var parked_request = try request.clone(park_ctx.runtime.allocator);
+        errdefer parked_request.deinit();
+        parked_request.stream_id = park_ctx.stream_id;
+        parked_request.transport_early = false;
+        parked_request.downstream_handshake_complete = false;
+        parked_request.downstream_handshake = null;
+        parked_request.resume_early_425_retry = true;
+        parked_request.park_early_425_retry = null;
+        try park_ctx.entry.parked_h3_retries.append(park_ctx.runtime.allocator, .{
+            .stream_id = park_ctx.stream_id,
+            .request = parked_request,
+        });
     }
 
     /// #488: best-effort, exactly-once post-handshake ticket issuance for

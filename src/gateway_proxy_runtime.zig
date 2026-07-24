@@ -676,6 +676,7 @@ pub fn handleLocationProxyPass(
         &attempt_executor,
     )) {
         .response => |response| response,
+        .early_425_retry_parked => unreachable,
         .upstream_at_capacity => {
             // Fail-fast at the per-origin active cap (#239): a local
             // saturation rejection, not an origin failure — do not count
@@ -829,6 +830,7 @@ const BufferedProxyRetryState = struct {
 
 pub const BufferedProxyAttemptsResult = union(enum) {
     response: DataPlaneProxyResponse,
+    early_425_retry_parked,
     upstream_at_capacity,
     request_cancelled,
     retry_budget_exhausted,
@@ -883,12 +885,18 @@ pub fn runBufferedProxyAttempts(
             matched_block,
         )) {
             attempt_executor.recordEarlyUpstream425Action(.retried);
+            if (!early_ctx.downstreamHandshakeComplete() and try maybeParkEarly425Retry(attempt_executor, &result)) {
+                return .early_425_retry_parked;
+            }
             early_ctx.waitOrDriveDownstreamHandshake() catch |err| {
                 attempt_executor.recordEarlyRetryResult(.failure);
                 try attempt_executor.onEarly425HandshakeFailure(err);
                 return .{ .response = result };
             };
             if (!early_ctx.downstreamHandshakeComplete()) {
+                if (try maybeParkEarly425Retry(attempt_executor, &result)) {
+                    return .early_425_retry_parked;
+                }
                 attempt_executor.recordEarlyRetryResult(.failure);
                 return .{ .response = result };
             }
@@ -911,6 +919,14 @@ pub fn runBufferedProxyAttempts(
         return .{ .response = result };
     }
     return error.UpstreamUnavailable;
+}
+
+fn maybeParkEarly425Retry(attempt_executor: anytype, result: *DataPlaneProxyResponse) !bool {
+    if (comptime @hasDecl(@TypeOf(attempt_executor.*), "parkEarly425Retry")) {
+        try attempt_executor.parkEarly425Retry(result);
+        return true;
+    }
+    return false;
 }
 
 const ProductionBufferedProxyAttemptExecutor = struct {
@@ -1183,6 +1199,95 @@ const ScriptedBufferedAttemptExecutor = struct {
     }
 };
 
+const ParkingBufferedAttemptExecutor = struct {
+    inner: ScriptedBufferedAttemptExecutor,
+    parked: usize = 0,
+
+    fn recordEarlyUpstream425Action(
+        self: *ParkingBufferedAttemptExecutor,
+        action: http.metrics.EarlyDataUpstream425Action,
+    ) void {
+        self.inner.recordEarlyUpstream425Action(action);
+    }
+
+    fn recordEarlyRetryResult(
+        self: *ParkingBufferedAttemptExecutor,
+        result: http.metrics.EarlyDataRetryResult,
+    ) void {
+        self.inner.recordEarlyRetryResult(result);
+    }
+
+    fn execute(
+        self: *ParkingBufferedAttemptExecutor,
+        attempt: usize,
+        forward_early_data: bool,
+    ) !DataPlaneProxyResponse {
+        return self.inner.execute(attempt, forward_early_data);
+    }
+
+    fn onBufferedResponse(
+        self: *ParkingBufferedAttemptExecutor,
+        result: *DataPlaneProxyResponse,
+    ) !void {
+        try self.inner.onBufferedResponse(result);
+    }
+
+    fn onEarly425HandshakeFailure(
+        self: *ParkingBufferedAttemptExecutor,
+        err: anyerror,
+    ) !void {
+        try self.inner.onEarly425HandshakeFailure(err);
+    }
+
+    fn onStaleConnectionRetry(
+        self: *ParkingBufferedAttemptExecutor,
+        stale_conn_retries: usize,
+        max_stale_conn_retries: usize,
+    ) !void {
+        try self.inner.onStaleConnectionRetry(stale_conn_retries, max_stale_conn_retries);
+    }
+
+    fn onTerminalAttemptError(
+        self: *ParkingBufferedAttemptExecutor,
+        err: anyerror,
+    ) !void {
+        try self.inner.onTerminalAttemptError(err);
+    }
+
+    fn onConfiguredErrorRetry(
+        self: *ParkingBufferedAttemptExecutor,
+        configured_attempt_index: usize,
+        max_attempts: usize,
+        err: anyerror,
+    ) !void {
+        try self.inner.onConfiguredErrorRetry(configured_attempt_index, max_attempts, err);
+    }
+
+    fn onEarly425Retry(
+        self: *ParkingBufferedAttemptExecutor,
+        result: *DataPlaneProxyResponse,
+    ) !void {
+        try self.inner.onEarly425Retry(result);
+    }
+
+    fn parkEarly425Retry(
+        self: *ParkingBufferedAttemptExecutor,
+        result: *DataPlaneProxyResponse,
+    ) !void {
+        self.parked += 1;
+        result.deinit(self.inner.allocator);
+    }
+
+    fn onConfigured5xxRetry(
+        self: *ParkingBufferedAttemptExecutor,
+        configured_attempt_index: usize,
+        max_attempts: usize,
+        result: *DataPlaneProxyResponse,
+    ) !void {
+        try self.inner.onConfigured5xxRetry(configured_attempt_index, max_attempts, result);
+    }
+};
+
 const ErrorBufferedAttemptExecutor = struct {
     err: anyerror,
     execute_calls: usize = 0,
@@ -1335,7 +1440,12 @@ fn runEarly425RetryHarness(
                 .handshake_failures = executor.handshake_failures,
             };
         },
-        .upstream_at_capacity, .request_cancelled, .retry_budget_exhausted, .terminal_error => error.TestUnexpectedTerminalProxyResult,
+        .early_425_retry_parked,
+        .upstream_at_capacity,
+        .request_cancelled,
+        .retry_budget_exhausted,
+        .terminal_error,
+        => error.TestUnexpectedTerminalProxyResult,
     };
 }
 
@@ -1456,6 +1566,38 @@ test "early upstream 425 retry sends marker once then retries ordinary to 200" {
     try std.testing.expectEqual(@as(usize, 2), result.upstream_deliveries);
     try std.testing.expectEqual(@as(usize, 1), barrier.waits);
     try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, header_counts.items);
+}
+
+test "early upstream 425 can park retry until event-loop handshake completion" {
+    const allocator = std.testing.allocator;
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    };
+    var barrier = TestEarly425Barrier{};
+    var ctx = http.request_context.EarlyDataContext{ .transport_early = true, .downstream_handshake = barrier.barrier() };
+    var header_counts = std.array_list.Managed(usize).init(allocator);
+    defer header_counts.deinit();
+    var executor = ParkingBufferedAttemptExecutor{
+        .inner = .{
+            .allocator = allocator,
+            .upstream_statuses = &.{ 425, 200 },
+            .early_data_header_counts = &header_counts,
+        },
+    };
+
+    const result = try runBufferedProxyAttempts(&ctx, true, "GET", &block, 1, 0, true, &executor);
+
+    try std.testing.expectEqual(std.meta.Tag(BufferedProxyAttemptsResult).early_425_retry_parked, std.meta.activeTag(result));
+    try std.testing.expectEqual(@as(usize, 1), executor.inner.deliveries);
+    try std.testing.expectEqual(@as(usize, 0), barrier.waits);
+    try std.testing.expectEqual(@as(usize, 1), executor.parked);
+    try std.testing.expectEqual(@as(usize, 1), executor.inner.early_425_retried);
+    try std.testing.expectEqualSlices(usize, &.{1}, header_counts.items);
 }
 
 test "early upstream 425 retry forwards second 425 without third delivery" {

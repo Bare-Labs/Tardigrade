@@ -1736,6 +1736,7 @@ const Http3BufferedProxyAttemptExecutor = struct {
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     state: *GatewayState,
+    request: *const http.http3_session.StreamRequest,
     upstream_url: []const u8,
     unix_socket_path: ?[]const u8,
     method: []const u8,
@@ -1852,6 +1853,20 @@ const Http3BufferedProxyAttemptExecutor = struct {
         result.deinit(self.allocator);
     }
 
+    pub fn parkEarly425Retry(
+        self: *Http3BufferedProxyAttemptExecutor,
+        result: *gproxy_runtime.DataPlaneProxyResponse,
+    ) !void {
+        self.state.logger.debug(self.correlation_id, "h3 parking early-data upstream 425 retry until downstream handshake completion", .{});
+        self.request.parkEarly425Retry() catch |err| {
+            self.state.metricsReleaseProxyBufferedBytes(result.bodyLen());
+            result.deinit(self.allocator);
+            return err;
+        };
+        self.state.metricsReleaseProxyBufferedBytes(result.bodyLen());
+        result.deinit(self.allocator);
+    }
+
     pub fn onEarly425HandshakeFailure(
         self: *Http3BufferedProxyAttemptExecutor,
         err: anyerror,
@@ -1895,6 +1910,7 @@ fn handleHttp3LocationProxyPass(
         .allocator = allocator,
         .cfg = ctx.cfg,
         .state = ctx.state,
+        .request = request,
         .upstream_url = upstream_url.value,
         .unix_socket_path = resolved.unix_socket_path,
         .method = request.method,
@@ -1907,6 +1923,53 @@ fn handleHttp3LocationProxyPass(
         .selection_base_url = ctx.cfg.upstream_base_url,
         .budget_start_ms = http.event_loop.monotonicMs(),
     };
+
+    if (request.resume_early_425_retry) {
+        var upstream_response = attempt_executor.execute(0, false) catch |err| {
+            attempt_executor.recordEarlyRetryResult(.failure);
+            if (err == error.ProxyBudgetExhausted or err == error.RequestCancelled) {
+                try rejectHttp3ProxyError(allocator, response, ctx, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id);
+                return;
+            }
+            if (err == error.UpstreamAtCapacity) {
+                try rejectHttp3ProxyError(allocator, response, ctx, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id);
+                return;
+            }
+            try attempt_executor.onTerminalAttemptError(err);
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const err_status: http.Status = switch (err) {
+                error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
+                else => .bad_gateway,
+            };
+            const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
+            const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
+            try rejectHttp3ProxyError(allocator, response, ctx, err_status, err_code, err_msg, correlation_id);
+            return;
+        };
+        defer upstream_response.deinit(allocator);
+        try attempt_executor.onBufferedResponse(&upstream_response);
+        defer ctx.state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
+        if (upstream_response.statusCode() == @intFromEnum(http.Status.too_early)) {
+            attempt_executor.recordEarlyUpstream425Action(.forwarded);
+            attempt_executor.recordEarlyRetryResult(.too_early);
+        } else {
+            attempt_executor.recordEarlyRetryResult(.success);
+        }
+        const buffered_response = upstream_response.boundedBufferedForCompatibility();
+
+        _ = response
+            .setStatus(@enumFromInt(buffered_response.status_code))
+            .setBodyOwned(try allocator.dupe(u8, buffered_response.body))
+            .setHeader(http.correlation.HEADER_NAME, correlation_id);
+        for (buffered_response.headers) |header| {
+            _ = response.setHeader(header.name, header.value);
+        }
+        finalizeHttp3Response(response);
+        applyResponseHeaders(ctx.state, response);
+        ctx.state.metricsRecord(upstream_response.statusCode());
+        return;
+    }
+
     var upstream_response: gproxy_runtime.DataPlaneProxyResponse = switch (try gproxy_runtime.runBufferedProxyAttempts(
         early_ctx,
         forward_early_data,
@@ -1918,6 +1981,7 @@ fn handleHttp3LocationProxyPass(
         &attempt_executor,
     )) {
         .response => |upstream_response| upstream_response,
+        .early_425_retry_parked => return error.Http3RequestParked,
         .upstream_at_capacity => {
             try rejectHttp3ProxyError(allocator, response, ctx, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id);
             return;

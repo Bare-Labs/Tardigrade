@@ -21,6 +21,7 @@ pub const EncodedHeaderBlock = struct {
 
 pub const StreamRequest = struct {
     allocator: std.mem.Allocator,
+    stream_id: ?u64 = null,
     method: []u8,
     path: []u8,
     authority: ?[]u8,
@@ -29,6 +30,17 @@ pub const StreamRequest = struct {
     transport_early: bool = false,
     downstream_handshake_complete: bool = true,
     downstream_handshake: ?request_context.DownstreamHandshakeBarrier = null,
+    resume_early_425_retry: bool = false,
+    park_early_425_retry: ?ParkEarly425Retry = null,
+
+    pub const ParkEarly425Retry = struct {
+        ctx: *anyopaque,
+        park_fn: *const fn (*anyopaque, *const StreamRequest) anyerror!void,
+
+        pub fn park(self: ParkEarly425Retry, request: *const StreamRequest) !void {
+            try self.park_fn(self.ctx, request);
+        }
+    };
 
     pub fn deinit(self: *StreamRequest) void {
         self.allocator.free(self.method);
@@ -37,6 +49,33 @@ pub const StreamRequest = struct {
         self.headers.deinit();
         self.allocator.free(self.body);
         self.* = undefined;
+    }
+
+    pub fn clone(self: *const StreamRequest, allocator: std.mem.Allocator) !StreamRequest {
+        var headers = Headers.init(allocator);
+        errdefer headers.deinit();
+        for (self.headers.iterator()) |header| {
+            try headers.append(header.name, header.value);
+        }
+        return .{
+            .allocator = allocator,
+            .stream_id = self.stream_id,
+            .method = try allocator.dupe(u8, self.method),
+            .path = try allocator.dupe(u8, self.path),
+            .authority = if (self.authority) |authority| try allocator.dupe(u8, authority) else null,
+            .headers = headers,
+            .body = try allocator.dupe(u8, self.body),
+            .transport_early = self.transport_early,
+            .downstream_handshake_complete = self.downstream_handshake_complete,
+            .downstream_handshake = self.downstream_handshake,
+            .resume_early_425_retry = self.resume_early_425_retry,
+            .park_early_425_retry = self.park_early_425_retry,
+        };
+    }
+
+    pub fn parkEarly425Retry(self: *const StreamRequest) !void {
+        const parker = self.park_early_425_retry orelse return error.Http3Early425RetryCannotPark;
+        try parker.park(self);
     }
 };
 
@@ -103,6 +142,7 @@ pub const StreamAssembler = struct {
 
         return .{
             .allocator = self.allocator,
+            .stream_id = null,
             .method = try self.allocator.dupe(u8, method),
             .path = try self.allocator.dupe(u8, path),
             .authority = if (self.authority) |authority| try self.allocator.dupe(u8, authority) else null,
@@ -111,6 +151,8 @@ pub const StreamAssembler = struct {
             .transport_early = false,
             .downstream_handshake_complete = true,
             .downstream_handshake = null,
+            .resume_early_425_retry = false,
+            .park_early_425_retry = null,
         };
     }
 };
