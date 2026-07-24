@@ -772,7 +772,7 @@ pub fn isHttpMethodIdempotent(method: []const u8) bool {
 /// for any method when the operator has disabled the idempotent-only guard.
 /// The retry is bounded by `max_stale_conn_retries` so a persistently dead
 /// upstream still fails fast.
-fn shouldRetryStaleUpstreamConnection(
+pub fn shouldRetryStaleUpstreamConnection(
     err: anyerror,
     method: []const u8,
     stale_conn_retries: usize,

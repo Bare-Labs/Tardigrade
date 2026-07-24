@@ -2011,6 +2011,8 @@ const Http3Early425ProxyContinuation = struct {
     budget_start_ms: u64,
     last_attempt_start_ms: u64 = 0,
     transport_early: bool,
+    test_execute_ctx: ?*anyopaque = null,
+    test_execute_fn: ?*const fn (?*anyopaque, *Http3Early425ProxyContinuation, u32, bool) anyerror!gproxy_runtime.DataPlaneProxyResponse = null,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -2093,7 +2095,10 @@ const Http3Early425ProxyContinuation = struct {
         return @intCast(@min(@as(u64, self.cfg_snapshot.upstream_timeout_ms), remaining));
     }
 
-    fn execute(self: *Http3Early425ProxyContinuation, per_attempt_timeout_ms: u32) !gproxy_runtime.DataPlaneProxyResponse {
+    fn execute(self: *Http3Early425ProxyContinuation, per_attempt_timeout_ms: u32, forward_early_data: bool) !gproxy_runtime.DataPlaneProxyResponse {
+        if (self.test_execute_fn) |test_execute| {
+            return test_execute(self.test_execute_ctx, self, per_attempt_timeout_ms, forward_early_data);
+        }
         self.state.recordUpstreamAttemptStart(self.selection_base_url);
         self.last_attempt_start_ms = http.event_loop.monotonicMs();
         const resp = executeBufferedDataPlaneProxyRequest(
@@ -2112,7 +2117,7 @@ const Http3Early425ProxyContinuation = struct {
             null,
             null,
             null,
-            false,
+            forward_early_data,
             per_attempt_timeout_ms,
             self.cfg_snapshot.upstream_connect_timeout_ms,
             self.cfg_snapshot.upstream_response_timeout_ms,
@@ -2127,45 +2132,59 @@ const Http3Early425ProxyContinuation = struct {
     fn run(ctx: *anyopaque, allocator: std.mem.Allocator, response: *http.Response) !void {
         const self: *Http3Early425ProxyContinuation = @ptrCast(@alignCast(ctx));
         std.debug.assert(self.transport_early);
-        const per_attempt_timeout_ms = self.perAttemptTimeoutMs() catch |err| {
-            self.state.metricsRecordEarlyDataRetry(.failure);
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .gateway_timeout, "upstream_timeout", "Upstream request timed out", self.correlation_id);
-            return;
-        };
-        self.state.metricsRecordEarlyDataUpstream425(.retried);
-        var upstream_response = self.execute(per_attempt_timeout_ms) catch |err| {
-            self.state.metricsRecordEarlyDataRetry(.failure);
-            if (err == error.ProxyBudgetExhausted or err == error.RequestCancelled) {
+        const max_stale_conn_retries: usize = 2;
+        var stale_conn_retries: usize = 0;
+        var retried_recorded = false;
+        while (true) {
+            const per_attempt_timeout_ms = self.perAttemptTimeoutMs() catch |err| {
+                self.state.metricsRecordEarlyDataRetry(.failure);
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .gateway_timeout, "upstream_timeout", "Upstream request timed out", self.correlation_id);
                 return;
-            }
-            if (err == error.UpstreamAtCapacity) {
-                try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", self.correlation_id);
-                return;
-            }
-            self.state.recordUpstreamFailure(&self.cfg_snapshot, self.selection_base_url);
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            const err_status: http.Status = switch (err) {
-                error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
-                else => .bad_gateway,
             };
-            const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
-            const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
-            try rejectHttp3ProxyErrorWithState(allocator, response, self.state, err_status, err_code, err_msg, self.correlation_id);
+            if (!retried_recorded) {
+                self.state.metricsRecordEarlyDataUpstream425(.retried);
+                retried_recorded = true;
+            }
+            var upstream_response = self.execute(per_attempt_timeout_ms, false) catch |err| {
+                if (gproxy_runtime.shouldRetryStaleUpstreamConnection(err, self.method, stale_conn_retries, max_stale_conn_retries, true)) {
+                    stale_conn_retries += 1;
+                    self.state.logger.warn(self.correlation_id, "h3 parked proxy retrying on fresh connection after stale upstream keep-alive ({d}/{d})", .{ stale_conn_retries, max_stale_conn_retries });
+                    continue;
+                }
+                self.state.metricsRecordEarlyDataRetry(.failure);
+                if (err == error.ProxyBudgetExhausted or err == error.RequestCancelled) {
+                    try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .gateway_timeout, "upstream_timeout", "Upstream request timed out", self.correlation_id);
+                    return;
+                }
+                if (err == error.UpstreamAtCapacity) {
+                    try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", self.correlation_id);
+                    return;
+                }
+                self.state.recordUpstreamFailure(&self.cfg_snapshot, self.selection_base_url);
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                const err_status: http.Status = switch (err) {
+                    error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
+                    else => .bad_gateway,
+                };
+                const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
+                const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
+                try rejectHttp3ProxyErrorWithState(allocator, response, self.state, err_status, err_code, err_msg, self.correlation_id);
+                return;
+            };
+            defer upstream_response.deinit(allocator);
+            const upstream_ttfb_ms = http.event_loop.monotonicMs() - self.last_attempt_start_ms;
+            self.state.metricsRecordProxyBufferedRequest(upstream_response.bodyLen(), upstream_ttfb_ms);
+            defer self.state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
+            if (upstream_response.statusCode() == @intFromEnum(http.Status.too_early)) {
+                self.state.metricsRecordEarlyDataUpstream425(.forwarded);
+                self.state.metricsRecordEarlyDataRetry(.too_early);
+            } else {
+                self.state.metricsRecordEarlyDataRetry(.success);
+            }
+            try applyHttp3ProxyResponse(allocator, response, self.state, &upstream_response, self.correlation_id);
             return;
-        };
-        defer upstream_response.deinit(allocator);
-        const upstream_ttfb_ms = http.event_loop.monotonicMs() - self.last_attempt_start_ms;
-        self.state.metricsRecordProxyBufferedRequest(upstream_response.bodyLen(), upstream_ttfb_ms);
-        defer self.state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
-        if (upstream_response.statusCode() == @intFromEnum(http.Status.too_early)) {
-            self.state.metricsRecordEarlyDataUpstream425(.forwarded);
-            self.state.metricsRecordEarlyDataRetry(.too_early);
-        } else {
-            self.state.metricsRecordEarlyDataRetry(.success);
         }
-        try applyHttp3ProxyResponse(allocator, response, self.state, &upstream_response, self.correlation_id);
     }
 };
 
@@ -2945,6 +2964,52 @@ const TestHttp3RequestHandshake = struct {
     }
 };
 
+const H3ContinuationAttempt = union(enum) {
+    status: u16,
+    err: anyerror,
+};
+
+const H3ContinuationExecuteScript = struct {
+    allocator: std.mem.Allocator,
+    attempts: []const H3ContinuationAttempt,
+    calls: usize = 0,
+    forward_early_data: std.ArrayList(bool) = .empty,
+    timeouts_ms: std.ArrayList(u32) = .empty,
+
+    fn deinit(self: *H3ContinuationExecuteScript) void {
+        self.forward_early_data.deinit(self.allocator);
+        self.timeouts_ms.deinit(self.allocator);
+    }
+
+    fn execute(
+        ctx: ?*anyopaque,
+        continuation: *Http3Early425ProxyContinuation,
+        per_attempt_timeout_ms: u32,
+        forward_early_data: bool,
+    ) !gproxy_runtime.DataPlaneProxyResponse {
+        const self: *H3ContinuationExecuteScript = @ptrCast(@alignCast(ctx.?));
+        try self.forward_early_data.append(self.allocator, forward_early_data);
+        try self.timeouts_ms.append(self.allocator, per_attempt_timeout_ms);
+        continuation.last_attempt_start_ms = http.event_loop.monotonicMs();
+        const attempt = self.calls;
+        self.calls += 1;
+        if (attempt >= self.attempts.len) return error.TestMissingContinuationAttempt;
+        return switch (self.attempts[attempt]) {
+            .err => |err| err,
+            .status => |status| response: {
+                const body = if (status == 200) "ok" else "too early";
+                const raw = try std.fmt.allocPrint(
+                    self.allocator,
+                    "HTTP/1.1 {d} test\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+                    .{ status, body.len, body },
+                );
+                defer self.allocator.free(raw);
+                break :response .{ .bounded_buffered = try gp.parseBufferedUpstreamResponse(self.allocator, raw) };
+            },
+        };
+    }
+};
+
 test "h3 proxy early 425 parks and resumes exact ordinary continuation" {
     const allocator = std.testing.allocator;
     var origin = try H3ProxyOrigin.start(allocator, &.{ 425, 200 });
@@ -3083,6 +3148,174 @@ test "h3 proxy parked early 425 forwards second 425 without third delivery" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_upstream_425_total{action=\"retried\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_upstream_425_total{action=\"forwarded\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"too_early\"} 1") != null);
+}
+
+test "h3 proxy parked early 425 treats stale ordinary retry as transparent" {
+    const allocator = std.testing.allocator;
+    var origin = try H3ProxyOrigin.start(allocator, &.{425});
+    defer origin.stop();
+    try origin.run();
+
+    const target = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{origin.port()});
+    defer allocator.free(target);
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/proxy/",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.upstream_timeout_ms = 0;
+    cfg.upstream_timeout_budget_ms = 10_000;
+    cfg.upstream_max_fails = 1;
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var barrier = TestHttp3RequestHandshake{ .complete = false };
+    var capture = H3ParkCapture{};
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .stream_id = 13,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/proxy/item"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .transport_early = true,
+        .downstream_handshake = barrier.barrier(),
+        .park_early_425_retry = .{ .ctx = &capture, .park_fn = H3ParkCapture.park },
+    };
+    defer request.deinit();
+    var first_response = http.Response.init(allocator);
+    defer first_response.deinit();
+
+    try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &first_response, &dispatch_ctx));
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expect(origin.requestContains(0, "\r\nEarly-Data: 1\r\n"));
+
+    var continuation = capture.take();
+    defer continuation.deinit(allocator);
+    const plan: *Http3Early425ProxyContinuation = @ptrCast(@alignCast(continuation.ctx));
+    const original_budget_start_ms = plan.budget_start_ms;
+    const scripted = [_]H3ContinuationAttempt{
+        .{ .err = error.HttpConnectionClosing },
+        .{ .status = 200 },
+    };
+    var execute_script = H3ContinuationExecuteScript{
+        .allocator = allocator,
+        .attempts = &scripted,
+    };
+    defer execute_script.deinit();
+    plan.test_execute_ctx = &execute_script;
+    plan.test_execute_fn = H3ContinuationExecuteScript.execute;
+
+    var resumed_response = http.Response.init(allocator);
+    defer resumed_response.deinit();
+    try continuation.run(allocator, &resumed_response);
+
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(resumed_response.status));
+    try std.testing.expectEqualStrings("ok", resumed_response.body orelse "");
+    try std.testing.expectEqual(@as(usize, 2), execute_script.calls);
+    try std.testing.expectEqualSlices(bool, &.{ false, false }, execute_script.forward_early_data.items);
+    try std.testing.expectEqual(@as(usize, 2), execute_script.timeouts_ms.items.len);
+    try std.testing.expect(execute_script.timeouts_ms.items[1] <= execute_script.timeouts_ms.items[0]);
+    try std.testing.expectEqual(original_budget_start_ms, plan.budget_start_ms);
+    try std.testing.expectEqual(@as(usize, 0), state.upstream_health.count());
+
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_upstream_425_total{action=\"retried\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"success\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"failure\"} 0") != null);
+}
+
+test "h3 proxy parked early 425 records failure after stale recovery exhausts" {
+    const allocator = std.testing.allocator;
+    var origin = try H3ProxyOrigin.start(allocator, &.{425});
+    defer origin.stop();
+    try origin.run();
+
+    const target = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{origin.port()});
+    defer allocator.free(target);
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/proxy/",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.upstream_max_fails = 1;
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var barrier = TestHttp3RequestHandshake{ .complete = false };
+    var capture = H3ParkCapture{};
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .stream_id = 15,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/proxy/item"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .transport_early = true,
+        .downstream_handshake = barrier.barrier(),
+        .park_early_425_retry = .{ .ctx = &capture, .park_fn = H3ParkCapture.park },
+    };
+    defer request.deinit();
+    var first_response = http.Response.init(allocator);
+    defer first_response.deinit();
+
+    try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &first_response, &dispatch_ctx));
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+
+    var continuation = capture.take();
+    defer continuation.deinit(allocator);
+    const plan: *Http3Early425ProxyContinuation = @ptrCast(@alignCast(continuation.ctx));
+    const scripted = [_]H3ContinuationAttempt{
+        .{ .err = error.HttpConnectionClosing },
+        .{ .err = error.HttpConnectionClosing },
+        .{ .err = error.HttpConnectionClosing },
+    };
+    var execute_script = H3ContinuationExecuteScript{
+        .allocator = allocator,
+        .attempts = &scripted,
+    };
+    defer execute_script.deinit();
+    plan.test_execute_ctx = &execute_script;
+    plan.test_execute_fn = H3ContinuationExecuteScript.execute;
+
+    var resumed_response = http.Response.init(allocator);
+    defer resumed_response.deinit();
+    try continuation.run(allocator, &resumed_response);
+
+    try std.testing.expectEqual(@as(u16, 502), @intFromEnum(resumed_response.status));
+    try std.testing.expectEqual(@as(usize, 3), execute_script.calls);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false }, execute_script.forward_early_data.items);
+    try std.testing.expectEqual(@as(usize, 1), state.upstream_health.count());
+
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_upstream_425_total{action=\"retried\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"failure\"} 1") != null);
 }
 
 test "h3 proxy parked early 425 fails without origin retry after budget expires" {
