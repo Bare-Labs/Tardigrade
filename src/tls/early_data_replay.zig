@@ -126,21 +126,36 @@ pub const LocalStore = struct {
     /// Highest wall-clock `now_unix_ms` this store has ever observed, used
     /// only to detect backward clock movement.
     high_water_unix_ms: u64,
+    /// Entries removed (duplicate-then-expired, or reclaimed at capacity)
+    /// since the last tombstone compaction. `AutoHashMapUnmanaged` deletes
+    /// leave a tombstone behind, so a long-lived store with heavy
+    /// expire/reclaim churn across diverse keys would otherwise let probe
+    /// length grow without bound even though logical occupancy never
+    /// exceeds `limits.max_entries`. See `noteRemovalLocked`.
+    removed_since_rehash: usize = 0,
 
+    pub const InitError = error{ InvalidLimits, OutOfMemory };
+
+    /// Reserves table capacity for the full configured `limits.max_entries`
+    /// up front so the ordinary claim hot path — insert, remove, and the
+    /// at-capacity reclaim — never depends on further allocator growth
+    /// (see `claimLocked`/`reclaimOneExpiredLocked`).
     pub fn init(
         allocator: std.mem.Allocator,
         limits: Limits,
         quarantine_duration_ms: u64,
         now_unix_ms: u64,
-    ) error{InvalidLimits}!LocalStore {
+    ) InitError!LocalStore {
         try limits.validate();
-        return .{
+        var self: LocalStore = .{
             .allocator = allocator,
             .limits = limits,
             .quarantine_duration_ms = quarantine_duration_ms,
             .quarantine_until_unix_ms = now_unix_ms +| quarantine_duration_ms,
             .high_water_unix_ms = now_unix_ms,
         };
+        try self.entries.ensureTotalCapacity(allocator, @intCast(limits.max_entries));
+        return self;
     }
 
     pub fn deinit(self: *LocalStore) void {
@@ -220,6 +235,7 @@ pub const LocalStore = struct {
                 return .duplicate;
             }
             _ = self.entries.remove(c.key);
+            self.noteRemovalLocked();
             expired_removed.* += 1;
         }
 
@@ -227,12 +243,13 @@ pub const LocalStore = struct {
             return self.insertLocked(c, event);
         }
 
-        // At capacity: prune only genuinely expired entries — an unexpired
-        // entry must never be evicted to admit a new key (that would turn
-        // memory pressure into a replay bypass) — and retry.
-        expired_removed.* += self.sweepExpiredLocked(now_unix_ms);
-
-        if (self.entries.count() < self.limits.max_entries) {
+        // At capacity: this claim only needs one free slot, so reclaim at
+        // most one genuinely expired entry — an unexpired entry must never
+        // be evicted to admit a new key (that would turn memory pressure
+        // into a replay bypass) — and retry. Allocation-free: capacity was
+        // fully reserved in `init`.
+        if (self.reclaimOneExpiredLocked(now_unix_ms)) {
+            expired_removed.* += 1;
             return self.insertLocked(c, event);
         }
 
@@ -241,6 +258,13 @@ pub const LocalStore = struct {
     }
 
     fn insertLocked(self: *LocalStore, c: Claim, event: *Event) ClaimResult {
+        // Always a no-op in practice: `init` reserves capacity for
+        // `limits.max_entries` and this is only reached when
+        // `entries.count() < limits.max_entries`, so removals (which give
+        // capacity back — see `hash_map.zig`'s `available` bookkeeping)
+        // keep enough headroom for one more insert without growing.
+        // Kept as a defensive, fail-closed guard rather than an unchecked
+        // `putAssumeCapacity` given how security-sensitive this store is.
         self.entries.ensureUnusedCapacity(self.allocator, 1) catch {
             event.* = .unavailable;
             return .unavailable;
@@ -250,23 +274,39 @@ pub const LocalStore = struct {
         return .accepted;
     }
 
-    /// Removes every entry whose recording deadline has genuinely passed
-    /// (`retain_until_unix_ms < now_unix_ms`); never touches an unexpired
-    /// entry. Returns the number removed. A collection failure under
-    /// memory pressure just stops the sweep early (a partial sweep is
-    /// always safe: it never evicts anything live).
-    fn sweepExpiredLocked(self: *LocalStore, now_unix_ms: u64) usize {
-        var victims: std.ArrayListUnmanaged(Key) = .empty;
-        defer victims.deinit(self.allocator);
-
+    /// Reclaims exactly one genuinely expired entry
+    /// (`retain_until_unix_ms < now_unix_ms`) to admit the current claim;
+    /// never touches an unexpired entry. A single claim only ever needs one
+    /// free slot, so this scans and removes at most one match rather than
+    /// collecting a victim list — no allocation, so it stays safe to call
+    /// while every native worker sharing this store is serialized behind
+    /// the same mutex. Returns whether a slot was reclaimed.
+    fn reclaimOneExpiredLocked(self: *LocalStore, now_unix_ms: u64) bool {
+        var victim: ?Key = null;
         var it = self.entries.iterator();
         while (it.next()) |kv| {
             if (kv.value_ptr.retain_until_unix_ms < now_unix_ms) {
-                victims.append(self.allocator, kv.key_ptr.*) catch break;
+                victim = kv.key_ptr.*;
+                break;
             }
         }
-        for (victims.items) |k| _ = self.entries.remove(k);
-        return victims.items.len;
+        const key = victim orelse return false;
+        _ = self.entries.remove(key);
+        self.noteRemovalLocked();
+        return true;
+    }
+
+    /// Tracks removals since the last tombstone compaction and rehashes
+    /// in place (no allocation) once churn reaches half the configured
+    /// capacity, so no long-lived diverse-key expire/reclaim pattern can
+    /// degrade lookup/insert probe length without bound.
+    fn noteRemovalLocked(self: *LocalStore) void {
+        self.removed_since_rehash += 1;
+        const threshold = @max(@as(usize, 1), self.limits.max_entries / 2);
+        if (self.removed_since_rehash >= threshold) {
+            self.entries.rehash(std.hash_map.AutoContext(Key){});
+            self.removed_since_rehash = 0;
+        }
     }
 };
 
@@ -279,6 +319,14 @@ fn testLimits(max_entries: usize) Limits {
 fn keyOf(byte: u8) Key {
     var k: Key = [_]u8{0} ** 32;
     k[0] = byte;
+    return k;
+}
+
+/// Wider-range variant of `keyOf` for tests that need more than 256
+/// distinct keys (e.g. long-running churn tests).
+fn keyOfU32(value: u32) Key {
+    var k: Key = [_]u8{0} ** 32;
+    std.mem.writeInt(u32, k[0..4], value, .little);
     return k;
 }
 
@@ -397,16 +445,46 @@ test "quarantine deadline arithmetic saturates instead of wrapping on overflow" 
     try testing.expectEqual(ClaimResult.unavailable, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = near_max }, near_max));
 }
 
-test "allocation failure during insert fails closed as unavailable" {
-    var store = try LocalStore.init(testing.allocator, testLimits(4), 0, 1_000);
+test "allocation failure while reserving startup capacity fails init closed" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, LocalStore.init(failing.allocator(), testLimits(4), 0, 0));
+}
+
+test "long-lived fill/expire/reclaim/insert churn across distinct keys stays bounded with zero further allocations" {
+    // `init` reserves capacity for the full configured bound up front, and
+    // both the at-capacity reclaim and the tombstone-compaction rehash it
+    // triggers are allocation-free — so once a store is up, no amount of
+    // long-lived, diverse-key expire/reclaim churn should ever need to
+    // allocate again. Disabling the allocator entirely after the initial
+    // fill is what actually proves that, rather than merely asserting on
+    // results.
+    const limit = 8;
+    var store = try LocalStore.init(testing.allocator, testLimits(limit), 0, 0);
     defer store.deinit();
+
+    var next_key: u32 = 1;
+    var now: u64 = 0;
+    var i: usize = 0;
+    while (i < limit) : (i += 1) {
+        // Every fill entry expires the instant `now` advances at all.
+        try testing.expectEqual(ClaimResult.accepted, store.claim(.{ .key = keyOfU32(next_key), .retain_until_unix_ms = now }, now));
+        next_key += 1;
+    }
+    try testing.expectEqual(@as(usize, limit), store.count());
+
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const original_allocator = store.allocator;
     store.allocator = failing.allocator();
-    const result = store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 5_000 }, 1_000);
-    store.allocator = original_allocator;
-    try testing.expectEqual(ClaimResult.unavailable, result);
-    try testing.expectEqual(@as(usize, 0), store.count());
+    defer store.allocator = original_allocator;
+
+    var cycle: usize = 0;
+    while (cycle < 500) : (cycle += 1) {
+        now += 1;
+        const result = store.claim(.{ .key = keyOfU32(next_key), .retain_until_unix_ms = now }, now);
+        try testing.expectEqual(ClaimResult.accepted, result);
+        try testing.expectEqual(@as(usize, limit), store.count());
+        next_key += 1;
+    }
 }
 
 test "observer callbacks run without the store mutex held (reentrant-safe)" {
