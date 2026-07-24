@@ -637,7 +637,7 @@ pub const Runtime = struct {
             parked.continuation.run(self.allocator, &response) catch |err| {
                 self.logger.warn(null, "http3: parked request retry failed: {s}", .{@errorName(err)});
                 self.sendInternalErrorResponse(entry, parked.stream_id);
-                return;
+                continue;
             };
             self.sendHandlerResponse(entry, parked.stream_id, &response);
         }
@@ -1108,6 +1108,8 @@ const TestH3ResumeConn = struct {
 
 const TestH3ResumeSession = struct {
     send_calls: usize = 0,
+    ok_sends: usize = 0,
+    internal_error_sends: usize = 0,
     finish_calls: usize = 0,
     send_fail: bool = false,
     last_status: u16 = 0,
@@ -1127,6 +1129,8 @@ const TestH3ResumeSession = struct {
         self.send_calls += 1;
         self.last_status = status;
         self.last_stream_id = stream_id;
+        if (status == 200) self.ok_sends += 1;
+        if (status == 500) self.internal_error_sends += 1;
         if (self.send_fail) return error.StreamBackpressure;
     }
 
@@ -1211,6 +1215,82 @@ test "parked H3 retry fallback send failure resets and finishes stream once" {
     try testing.expectEqual(@as(usize, 1), entry.h3.finish_calls);
     try testing.expectEqual(@as(u64, 13), conn.last_reset_stream_id);
     try testing.expectEqual(@as(u64, 13), entry.h3.last_stream_id);
+}
+
+test "failed parked H3 retry does not stop later parked retry" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-parked-drain-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    defer runtime.deinit();
+
+    var conn = TestH3ResumeConn{ .established = true };
+    var entry = TestH3ResumeEntry{ .conn = &conn };
+    defer entry.deinit(allocator);
+    var failed = TestParkedContinuationState{ .fail_run = true };
+    var resumed = TestParkedContinuationState{};
+    try entry.parked_h3_retries.append(allocator, .{
+        .stream_id = 21,
+        .continuation = failed.continuation(),
+    });
+    try entry.parked_h3_retries.append(allocator, .{
+        .stream_id = 23,
+        .continuation = resumed.continuation(),
+    });
+
+    runtime.resumeParkedH3RetriesForEntry(&entry);
+
+    try testing.expectEqual(@as(usize, 0), entry.parked_h3_retries.items.len);
+    try testing.expectEqual(@as(usize, 1), failed.run_calls);
+    try testing.expectEqual(@as(usize, 1), failed.deinit_calls);
+    try testing.expectEqual(@as(usize, 1), resumed.run_calls);
+    try testing.expectEqual(@as(usize, 1), resumed.deinit_calls);
+    try testing.expectEqual(@as(usize, 2), entry.h3.send_calls);
+    try testing.expectEqual(@as(usize, 1), entry.h3.internal_error_sends);
+    try testing.expectEqual(@as(usize, 1), entry.h3.ok_sends);
+    try testing.expectEqual(@as(usize, 0), conn.reset_calls);
+    try testing.expectEqual(@as(u64, 23), entry.h3.last_stream_id);
+}
+
+test "failed parked H3 retry reset path does not stop later parked retry" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-parked-reset-drain-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    defer runtime.deinit();
+
+    var conn = TestH3ResumeConn{ .established = true };
+    var entry = TestH3ResumeEntry{
+        .conn = &conn,
+        .h3 = .{ .send_fail = true },
+    };
+    defer entry.deinit(allocator);
+    var failed = TestParkedContinuationState{ .fail_run = true };
+    var resumed = TestParkedContinuationState{};
+    try entry.parked_h3_retries.append(allocator, .{
+        .stream_id = 31,
+        .continuation = failed.continuation(),
+    });
+    try entry.parked_h3_retries.append(allocator, .{
+        .stream_id = 33,
+        .continuation = resumed.continuation(),
+    });
+
+    runtime.resumeParkedH3RetriesForEntry(&entry);
+
+    try testing.expectEqual(@as(usize, 0), entry.parked_h3_retries.items.len);
+    try testing.expectEqual(@as(usize, 1), failed.run_calls);
+    try testing.expectEqual(@as(usize, 1), failed.deinit_calls);
+    try testing.expectEqual(@as(usize, 1), resumed.run_calls);
+    try testing.expectEqual(@as(usize, 1), resumed.deinit_calls);
+    try testing.expectEqual(@as(usize, 2), entry.h3.send_calls);
+    try testing.expectEqual(@as(usize, 2), conn.reset_calls);
+    try testing.expectEqual(@as(usize, 2), entry.h3.finish_calls);
+    try testing.expectEqual(@as(u64, 33), conn.last_reset_stream_id);
 }
 
 test "runtime borrows the credential provider and owns no key material" {
