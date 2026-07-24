@@ -2708,6 +2708,10 @@ pub const ConfigLease = struct {
     version: *ManagedConfigVersion,
     cfg: *const edge_config.EdgeConfig,
 
+    pub fn retain(self: *ConfigLease) ConfigLease {
+        return self.store.retain(self.version);
+    }
+
     pub fn release(self: *ConfigLease) void {
         self.store.release(self.version);
         self.* = undefined;
@@ -2747,6 +2751,18 @@ pub const ReloadableConfigStore = struct {
             .store = self,
             .version = self.current,
             .cfg = self.current.cfg,
+        };
+    }
+
+    pub fn retain(self: *ReloadableConfigStore, version: *ManagedConfigVersion) ConfigLease {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        version.ref_count += 1;
+        return .{
+            .store = self,
+            .version = version,
+            .cfg = version.cfg,
         };
     }
 

@@ -84,10 +84,10 @@ const handshake_timeout_us: u64 = 10 * std.time.us_per_s;
 
 const ParkedH3Retry = struct {
     stream_id: u64,
-    request: http3_session.StreamRequest,
+    continuation: http3_session.StreamRequest.Early425RetryContinuation,
 
-    fn deinit(self: *ParkedH3Retry) void {
-        self.request.deinit();
+    fn deinit(self: *ParkedH3Retry, allocator: std.mem.Allocator) void {
+        self.continuation.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -142,7 +142,7 @@ const ConnEntry = struct {
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
-        for (self.parked_h3_retries.items) |*parked| parked.deinit();
+        for (self.parked_h3_retries.items) |*parked| parked.deinit(allocator);
         self.parked_h3_retries.deinit(allocator);
         self.h3.deinit();
         self.conn.deinit();
@@ -619,21 +619,13 @@ pub const Runtime = struct {
     }
 
     fn resumeParkedH3Retries(self: *Runtime, entry: *ConnEntry) void {
-        const handler = self.request_handler orelse return;
         while (entry.parked_h3_retries.items.len != 0) {
             var parked = entry.parked_h3_retries.orderedRemove(0);
-            defer parked.deinit();
-            parked.request.downstream_handshake_complete = entry.conn.isEstablished();
-            parked.request.downstream_handshake = .{
-                .ctx = entry.conn,
-                .is_complete_fn = h3DownstreamHandshakeComplete,
-                .wait_or_drive_fn = h3DownstreamWaitOrDriveHandshake,
-            };
-            parked.request.park_early_425_retry = null;
+            defer parked.deinit(self.allocator);
 
             var response = response_mod.Response.init(self.allocator);
             defer response.deinit();
-            handler(self.allocator, &parked.request, &response, self.request_handler_ctx) catch |err| {
+            parked.continuation.run(self.allocator, &response) catch |err| {
                 self.logger.warn(null, "http3: parked request retry failed: {s}", .{@errorName(err)});
                 entry.h3.sendResponse(entry.conn, parked.stream_id, 500, &.{}, "") catch {};
                 return;
@@ -688,19 +680,11 @@ pub const Runtime = struct {
         stream_id: u64,
     };
 
-    fn parkH3Early425Retry(ctx: *anyopaque, request: *const http3_session.StreamRequest) anyerror!void {
+    fn parkH3Early425Retry(ctx: *anyopaque, continuation: http3_session.StreamRequest.Early425RetryContinuation) anyerror!void {
         const park_ctx: *H3ParkContext = @ptrCast(@alignCast(ctx));
-        var parked_request = try request.clone(park_ctx.runtime.allocator);
-        errdefer parked_request.deinit();
-        parked_request.stream_id = park_ctx.stream_id;
-        parked_request.transport_early = false;
-        parked_request.downstream_handshake_complete = false;
-        parked_request.downstream_handshake = null;
-        parked_request.resume_early_425_retry = true;
-        parked_request.park_early_425_retry = null;
         try park_ctx.entry.parked_h3_retries.append(park_ctx.runtime.allocator, .{
             .stream_id = park_ctx.stream_id,
-            .request = parked_request,
+            .continuation = continuation,
         });
     }
 

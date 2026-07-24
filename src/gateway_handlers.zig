@@ -500,6 +500,73 @@ fn minimalAuthConfig(blocks: []http.location_router.LocationBlock, token_hashes:
     return cfg;
 }
 
+fn minimalHttp3ProxyConfig(blocks: []http.location_router.LocationBlock) edge_config.EdgeConfig {
+    var cfg = minimalAuthConfig(blocks, &.{});
+    cfg.server_names = &.{};
+    cfg.server_blocks = &.{};
+    cfg.upstream_base_url = "";
+    cfg.upstream_tls_verify = false;
+    cfg.upstream_tls_ca_bundle = "";
+    cfg.upstream_tls_server_name = "";
+    cfg.upstream_tls_client_cert = "";
+    cfg.upstream_tls_client_key = "";
+    cfg.upstream_protocol = .http1;
+    cfg.upstream_timeout_ms = 5000;
+    cfg.upstream_connect_timeout_ms = 5000;
+    cfg.upstream_response_timeout_ms = 5000;
+    cfg.upstream_timeout_budget_ms = 0;
+    cfg.upstream_retry_attempts = 1;
+    cfg.upstream_retry_idempotent_only = true;
+    cfg.upstream_max_fails = 0;
+    cfg.upstream_fail_timeout_ms = 0;
+    cfg.upstream_active_health_interval_ms = 0;
+    cfg.upstream_slow_start_ms = 0;
+    cfg.max_buffered_upstream_response_bytes = 64 * 1024;
+    cfg.proxy_buffer_limits = .{
+        .per_stream_low_watermark = 256 * 1024,
+        .per_stream_high_watermark = 768 * 1024,
+        .per_stream_hard_limit = 1024 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    cfg.upstream_pool_enabled = false;
+    cfg.upstream_pool_max_idle_per_host = 0;
+    cfg.upstream_pool_idle_timeout_ms = 0;
+    cfg.upstream_pool_max_lifetime_ms = 0;
+    cfg.upstream_pool_max_active_per_host = 0;
+    cfg.tls_cert_path = "";
+    cfg.tls_key_path = "";
+    cfg.add_headers = &.{};
+    return cfg;
+}
+
+fn initHttp3ProxyTestState(state: *GatewayState, allocator: std.mem.Allocator, add_headers: []const edge_config.EdgeConfig.HeaderPair) void {
+    initHandlerTestState(state, allocator, add_headers);
+    state.upstream_mutex = .{};
+    state.upstream_health = std.StringHashMap(gs.UpstreamHealth).init(allocator);
+    state.upstream_active_requests = std.StringHashMap(usize).init(allocator);
+    state.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
+    state.h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
+    state.proxy_buffer_limits = .{
+        .per_stream_low_watermark = 256 * 1024,
+        .per_stream_high_watermark = 768 * 1024,
+        .per_stream_hard_limit = 1024 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+}
+
+fn deinitHttp3ProxyTestState(state: *GatewayState) void {
+    state.upstream_pool.deinit();
+    state.h2_pool.deinit();
+    var active_it = state.upstream_active_requests.keyIterator();
+    while (active_it.next()) |key| state.allocator.free(key.*);
+    state.upstream_active_requests.deinit();
+    var health_it = state.upstream_health.keyIterator();
+    while (health_it.next()) |key| state.allocator.free(key.*);
+    state.upstream_health.deinit();
+}
+
 fn recordTestReturnMetrics(state: *GatewayState, result: ReturnResponseWriteResult) void {
     state.metricsRecord(result.status);
     if (result.error_code) |code| state.metricsRecordErrorCode(code);
@@ -1616,6 +1683,7 @@ fn executeSubrequest(allocator: std.mem.Allocator, url: []const u8, method: std.
 pub const Http3DispatchContext = struct {
     config_store: *ReloadableConfigStore,
     cfg: *const edge_config.EdgeConfig,
+    cfg_lease: ?*gs.ConfigLease = null,
     state: *GatewayState,
 };
 
@@ -1720,6 +1788,18 @@ fn rejectHttp3ProxyError(
     message: []const u8,
     correlation_id: []const u8,
 ) !void {
+    try rejectHttp3ProxyErrorWithState(allocator, response, ctx.state, status, code, message, correlation_id);
+}
+
+fn rejectHttp3ProxyErrorWithState(
+    allocator: std.mem.Allocator,
+    response: *http.Response,
+    state: *GatewayState,
+    status: http.Status,
+    code: []const u8,
+    message: []const u8,
+    correlation_id: []const u8,
+) !void {
     const payload = try buildApiErrorJson(allocator, code, message, correlation_id);
     _ = response
         .setStatus(status)
@@ -1727,14 +1807,36 @@ fn rejectHttp3ProxyError(
         .setContentType("application/json")
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
     finalizeHttp3Response(response);
-    applyResponseHeaders(ctx.state, response);
-    ctx.state.metricsRecord(@intFromEnum(status));
-    ctx.state.metricsRecordErrorCode(code);
+    applyResponseHeaders(state, response);
+    state.metricsRecord(@intFromEnum(status));
+    state.metricsRecordErrorCode(code);
+}
+
+fn applyHttp3ProxyResponse(
+    allocator: std.mem.Allocator,
+    response: *http.Response,
+    state: *GatewayState,
+    upstream_response: *const gproxy_runtime.DataPlaneProxyResponse,
+    correlation_id: []const u8,
+) !void {
+    const buffered_response = upstream_response.boundedBufferedForCompatibility();
+
+    _ = response
+        .setStatus(@enumFromInt(buffered_response.status_code))
+        .setBodyOwned(try allocator.dupe(u8, buffered_response.body))
+        .setHeader(http.correlation.HEADER_NAME, correlation_id);
+    for (buffered_response.headers) |header| {
+        _ = response.setHeader(header.name, header.value);
+    }
+    finalizeHttp3Response(response);
+    applyResponseHeaders(state, response);
+    state.metricsRecord(upstream_response.statusCode());
 }
 
 const Http3BufferedProxyAttemptExecutor = struct {
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
+    cfg_lease: ?*gs.ConfigLease,
     state: *GatewayState,
     request: *const http.http3_session.StreamRequest,
     upstream_url: []const u8,
@@ -1858,11 +1960,16 @@ const Http3BufferedProxyAttemptExecutor = struct {
         result: *gproxy_runtime.DataPlaneProxyResponse,
     ) !void {
         self.state.logger.debug(self.correlation_id, "h3 parking early-data upstream 425 retry until downstream handshake completion", .{});
-        self.request.parkEarly425Retry() catch |err| {
-            self.state.metricsReleaseProxyBufferedBytes(result.bodyLen());
-            result.deinit(self.allocator);
-            return err;
-        };
+        var plan = try Http3Early425ProxyContinuation.init(self.allocator, self);
+        errdefer {
+            plan.deinit(self.allocator);
+            self.allocator.destroy(plan);
+        }
+        try self.request.parkEarly425Retry(.{
+            .ctx = plan,
+            .resume_fn = Http3Early425ProxyContinuation.run,
+            .deinit_fn = Http3Early425ProxyContinuation.destroy,
+        });
         self.state.metricsReleaseProxyBufferedBytes(result.bodyLen());
         result.deinit(self.allocator);
     }
@@ -1884,6 +1991,181 @@ const Http3BufferedProxyAttemptExecutor = struct {
         self.state.logger.warn(self.correlation_id, "h3 proxy attempt {d}/{d} got {d}, retrying", .{ configured_attempt_index + 1, max_attempts, result.statusCode() });
         self.state.metricsReleaseProxyBufferedBytes(result.bodyLen());
         result.deinit(self.allocator);
+    }
+};
+
+const Http3Early425ProxyContinuation = struct {
+    config_lease: gs.ConfigLease,
+    cfg_snapshot: edge_config.EdgeConfig,
+    state: *GatewayState,
+    upstream_url: []u8,
+    unix_socket_path: ?[]const u8,
+    method: []u8,
+    headers: http.Headers,
+    body: []u8,
+    correlation_id: []u8,
+    client_ip: []u8,
+    forwarded_proto: []u8,
+    incoming_host: ?[]u8,
+    selection_base_url: []const u8,
+    budget_start_ms: u64,
+    last_attempt_start_ms: u64 = 0,
+    transport_early: bool,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        executor: *const Http3BufferedProxyAttemptExecutor,
+    ) !*Http3Early425ProxyContinuation {
+        const plan = try allocator.create(Http3Early425ProxyContinuation);
+        errdefer allocator.destroy(plan);
+
+        const source_lease = executor.cfg_lease orelse return error.Http3Early425RetryCannotPark;
+        var retained_lease = source_lease.retain();
+        errdefer retained_lease.release();
+
+        const method = try allocator.dupe(u8, executor.method);
+        errdefer allocator.free(method);
+        var headers = http.Headers.init(allocator);
+        errdefer headers.deinit();
+        for (executor.headers.iterator()) |header| {
+            try headers.append(header.name, header.value);
+        }
+        const body = try allocator.dupe(u8, executor.body);
+        errdefer allocator.free(body);
+        const upstream_url = try allocator.dupe(u8, executor.upstream_url);
+        errdefer allocator.free(upstream_url);
+        const correlation_id = try allocator.dupe(u8, executor.correlation_id);
+        errdefer allocator.free(correlation_id);
+        const client_ip = try allocator.dupe(u8, executor.client_ip);
+        errdefer allocator.free(client_ip);
+        const forwarded_proto = try allocator.dupe(u8, executor.forwarded_proto);
+        errdefer allocator.free(forwarded_proto);
+        const incoming_host = if (executor.incoming_host) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (incoming_host) |value| allocator.free(value);
+
+        plan.* = .{
+            .config_lease = retained_lease,
+            .cfg_snapshot = executor.cfg.*,
+            .state = executor.state,
+            .upstream_url = upstream_url,
+            .unix_socket_path = executor.unix_socket_path,
+            .method = method,
+            .headers = headers,
+            .body = body,
+            .correlation_id = correlation_id,
+            .client_ip = client_ip,
+            .forwarded_proto = forwarded_proto,
+            .incoming_host = incoming_host,
+            .selection_base_url = executor.selection_base_url,
+            .budget_start_ms = executor.budget_start_ms,
+            .transport_early = executor.request.transport_early,
+        };
+        return plan;
+    }
+
+    fn deinit(self: *Http3Early425ProxyContinuation, allocator: std.mem.Allocator) void {
+        self.config_lease.release();
+        allocator.free(self.upstream_url);
+        allocator.free(self.method);
+        self.headers.deinit();
+        allocator.free(self.body);
+        allocator.free(self.correlation_id);
+        allocator.free(self.client_ip);
+        allocator.free(self.forwarded_proto);
+        if (self.incoming_host) |value| allocator.free(value);
+        self.* = undefined;
+    }
+
+    fn destroy(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *Http3Early425ProxyContinuation = @ptrCast(@alignCast(ctx));
+        self.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    fn perAttemptTimeoutMs(self: *Http3Early425ProxyContinuation) !u32 {
+        if (self.cfg_snapshot.upstream_timeout_budget_ms == 0) return self.cfg_snapshot.upstream_timeout_ms;
+        const elapsed_ms = http.event_loop.monotonicMs() - self.budget_start_ms;
+        if (elapsed_ms >= self.cfg_snapshot.upstream_timeout_budget_ms) return error.ProxyBudgetExhausted;
+        const remaining = self.cfg_snapshot.upstream_timeout_budget_ms - elapsed_ms;
+        if (self.cfg_snapshot.upstream_timeout_ms == 0) {
+            return @intCast(@min(remaining, @as(u64, std.math.maxInt(u32))));
+        }
+        return @intCast(@min(@as(u64, self.cfg_snapshot.upstream_timeout_ms), remaining));
+    }
+
+    fn execute(self: *Http3Early425ProxyContinuation, per_attempt_timeout_ms: u32) !gproxy_runtime.DataPlaneProxyResponse {
+        self.state.recordUpstreamAttemptStart(self.selection_base_url);
+        self.last_attempt_start_ms = http.event_loop.monotonicMs();
+        const resp = executeBufferedDataPlaneProxyRequest(
+            self.headers.allocator,
+            &self.cfg_snapshot,
+            self.upstream_url,
+            self.unix_socket_path,
+            self.method,
+            &self.headers,
+            self.body,
+            self.correlation_id,
+            self.client_ip,
+            self.forwarded_proto,
+            self.incoming_host,
+            null,
+            null,
+            null,
+            null,
+            false,
+            per_attempt_timeout_ms,
+            self.cfg_snapshot.upstream_connect_timeout_ms,
+            self.cfg_snapshot.upstream_response_timeout_ms,
+            null,
+            &self.state.upstream_pool,
+            &self.state.h2_pool,
+        );
+        self.state.recordUpstreamAttemptEnd(self.selection_base_url);
+        return resp;
+    }
+
+    fn run(ctx: *anyopaque, allocator: std.mem.Allocator, response: *http.Response) !void {
+        const self: *Http3Early425ProxyContinuation = @ptrCast(@alignCast(ctx));
+        std.debug.assert(self.transport_early);
+        const per_attempt_timeout_ms = self.perAttemptTimeoutMs() catch |err| {
+            self.state.metricsRecordEarlyDataRetry(.failure);
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .gateway_timeout, "upstream_timeout", "Upstream request timed out", self.correlation_id);
+            return;
+        };
+        self.state.metricsRecordEarlyDataUpstream425(.retried);
+        var upstream_response = self.execute(per_attempt_timeout_ms) catch |err| {
+            self.state.metricsRecordEarlyDataRetry(.failure);
+            if (err == error.ProxyBudgetExhausted or err == error.RequestCancelled) {
+                try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .gateway_timeout, "upstream_timeout", "Upstream request timed out", self.correlation_id);
+                return;
+            }
+            if (err == error.UpstreamAtCapacity) {
+                try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", self.correlation_id);
+                return;
+            }
+            self.state.recordUpstreamFailure(&self.cfg_snapshot, self.selection_base_url);
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const err_status: http.Status = switch (err) {
+                error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
+                else => .bad_gateway,
+            };
+            const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
+            const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
+            try rejectHttp3ProxyErrorWithState(allocator, response, self.state, err_status, err_code, err_msg, self.correlation_id);
+            return;
+        };
+        defer upstream_response.deinit(allocator);
+        const upstream_ttfb_ms = http.event_loop.monotonicMs() - self.last_attempt_start_ms;
+        self.state.metricsRecordProxyBufferedRequest(upstream_response.bodyLen(), upstream_ttfb_ms);
+        defer self.state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
+        if (upstream_response.statusCode() == @intFromEnum(http.Status.too_early)) {
+            self.state.metricsRecordEarlyDataUpstream425(.forwarded);
+            self.state.metricsRecordEarlyDataRetry(.too_early);
+        } else {
+            self.state.metricsRecordEarlyDataRetry(.success);
+        }
+        try applyHttp3ProxyResponse(allocator, response, self.state, &upstream_response, self.correlation_id);
     }
 };
 
@@ -1909,6 +2191,7 @@ fn handleHttp3LocationProxyPass(
     var attempt_executor = Http3BufferedProxyAttemptExecutor{
         .allocator = allocator,
         .cfg = ctx.cfg,
+        .cfg_lease = ctx.cfg_lease,
         .state = ctx.state,
         .request = request,
         .upstream_url = upstream_url.value,
@@ -1923,52 +2206,6 @@ fn handleHttp3LocationProxyPass(
         .selection_base_url = ctx.cfg.upstream_base_url,
         .budget_start_ms = http.event_loop.monotonicMs(),
     };
-
-    if (request.resume_early_425_retry) {
-        var upstream_response = attempt_executor.execute(0, false) catch |err| {
-            attempt_executor.recordEarlyRetryResult(.failure);
-            if (err == error.ProxyBudgetExhausted or err == error.RequestCancelled) {
-                try rejectHttp3ProxyError(allocator, response, ctx, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id);
-                return;
-            }
-            if (err == error.UpstreamAtCapacity) {
-                try rejectHttp3ProxyError(allocator, response, ctx, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id);
-                return;
-            }
-            try attempt_executor.onTerminalAttemptError(err);
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            const err_status: http.Status = switch (err) {
-                error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
-                else => .bad_gateway,
-            };
-            const err_code = if (err_status == .gateway_timeout) "upstream_timeout" else "upstream_error";
-            const err_msg = if (err_status == .gateway_timeout) "Upstream request timed out" else "Upstream connection failed";
-            try rejectHttp3ProxyError(allocator, response, ctx, err_status, err_code, err_msg, correlation_id);
-            return;
-        };
-        defer upstream_response.deinit(allocator);
-        try attempt_executor.onBufferedResponse(&upstream_response);
-        defer ctx.state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
-        if (upstream_response.statusCode() == @intFromEnum(http.Status.too_early)) {
-            attempt_executor.recordEarlyUpstream425Action(.forwarded);
-            attempt_executor.recordEarlyRetryResult(.too_early);
-        } else {
-            attempt_executor.recordEarlyRetryResult(.success);
-        }
-        const buffered_response = upstream_response.boundedBufferedForCompatibility();
-
-        _ = response
-            .setStatus(@enumFromInt(buffered_response.status_code))
-            .setBodyOwned(try allocator.dupe(u8, buffered_response.body))
-            .setHeader(http.correlation.HEADER_NAME, correlation_id);
-        for (buffered_response.headers) |header| {
-            _ = response.setHeader(header.name, header.value);
-        }
-        finalizeHttp3Response(response);
-        applyResponseHeaders(ctx.state, response);
-        ctx.state.metricsRecord(upstream_response.statusCode());
-        return;
-    }
 
     var upstream_response: gproxy_runtime.DataPlaneProxyResponse = switch (try gproxy_runtime.runBufferedProxyAttempts(
         early_ctx,
@@ -2004,18 +2241,7 @@ fn handleHttp3LocationProxyPass(
     };
     defer upstream_response.deinit(allocator);
     defer ctx.state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
-    const buffered_response = upstream_response.boundedBufferedForCompatibility();
-
-    _ = response
-        .setStatus(@enumFromInt(buffered_response.status_code))
-        .setBodyOwned(try allocator.dupe(u8, buffered_response.body))
-        .setHeader(http.correlation.HEADER_NAME, correlation_id);
-    for (buffered_response.headers) |header| {
-        _ = response.setHeader(header.name, header.value);
-    }
-    finalizeHttp3Response(response);
-    applyResponseHeaders(ctx.state, response);
-    ctx.state.metricsRecord(upstream_response.statusCode());
+    try applyHttp3ProxyResponse(allocator, response, ctx.state, &upstream_response, correlation_id);
 }
 
 fn handleHttp3StaticLocation(
@@ -2582,6 +2808,348 @@ test "routeHttp3Location replay-safe acceptance handles combined prior-hop and c
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h3\",decision=\"accepted\"} 1") != null);
 }
 
+const H3ProxyOrigin = struct {
+    allocator: std.mem.Allocator,
+    listen_fd: std.posix.fd_t,
+    listen_port: u16,
+    thread: ?std.Thread = null,
+    statuses: []const u16,
+    mutex: compat.Mutex = .{},
+    requests: std.ArrayList([]u8) = .empty,
+
+    fn start(allocator: std.mem.Allocator, statuses: []const u16) !H3ProxyOrigin {
+        const listen_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+        try std.testing.expect(listen_fd >= 0);
+        _ = std.c.setsockopt(listen_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int));
+        var sin: std.c.sockaddr.in = .{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 0),
+            .addr = std.mem.nativeToBig(u32, 0x7f000001),
+            .zero = [_]u8{0} ** 8,
+        };
+        try std.testing.expect(std.c.bind(listen_fd, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) == 0);
+        try std.testing.expect(std.c.listen(listen_fd, 8) == 0);
+        var bound: std.c.sockaddr.in = undefined;
+        var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        try std.testing.expect(std.c.getsockname(listen_fd, @ptrCast(&bound), &bound_len) == 0);
+        return .{
+            .allocator = allocator,
+            .listen_fd = listen_fd,
+            .listen_port = std.mem.bigToNative(u16, bound.port),
+            .statuses = statuses,
+        };
+    }
+
+    fn run(self: *H3ProxyOrigin) !void {
+        self.thread = try std.Thread.spawn(.{}, H3ProxyOrigin.threadMain, .{self});
+    }
+
+    fn stop(self: *H3ProxyOrigin) void {
+        if (self.thread) |_| {
+            if (compat.tcpConnectToHost(self.allocator, "127.0.0.1", self.port())) |stream| {
+                stream.close();
+            } else |_| {}
+        }
+        if (self.thread) |thread| thread.join();
+        _ = std.c.close(self.listen_fd);
+        self.mutex.lock();
+        for (self.requests.items) |raw| self.allocator.free(raw);
+        self.requests.deinit(self.allocator);
+        self.mutex.unlock();
+        self.* = undefined;
+    }
+
+    fn port(self: *const H3ProxyOrigin) u16 {
+        return self.listen_port;
+    }
+
+    fn requestCount(self: *H3ProxyOrigin) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.requests.items.len;
+    }
+
+    fn requestContains(self: *H3ProxyOrigin, index: usize, needle: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (index >= self.requests.items.len) return false;
+        return std.mem.indexOf(u8, self.requests.items[index], needle) != null;
+    }
+
+    fn threadMain(self: *H3ProxyOrigin) void {
+        var idx: usize = 0;
+        while (idx < self.statuses.len) : (idx += 1) {
+            const fd = std.c.accept(self.listen_fd, null, null);
+            if (fd < 0) return;
+            defer _ = std.c.close(fd);
+            var raw = std.ArrayList(u8).empty;
+            defer raw.deinit(self.allocator);
+            var buf: [1024]u8 = undefined;
+            while (true) {
+                const n = std.c.read(fd, &buf, buf.len);
+                if (n == 0) return;
+                if (n < 0) return;
+                raw.appendSlice(self.allocator, buf[0..@intCast(n)]) catch return;
+                if (std.mem.indexOf(u8, raw.items, "\r\n\r\n") != null) break;
+            }
+            const owned = self.allocator.dupe(u8, raw.items) catch return;
+            self.mutex.lock();
+            self.requests.append(self.allocator, owned) catch {
+                self.mutex.unlock();
+                self.allocator.free(owned);
+                return;
+            };
+            self.mutex.unlock();
+            const body = if (self.statuses[idx] == 200) "ok" else "too early";
+            var response_buf: [256]u8 = undefined;
+            const response = std.fmt.bufPrint(&response_buf, "HTTP/1.1 {d} test\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
+                self.statuses[idx], body.len, body,
+            }) catch return;
+            _ = std.c.write(fd, response.ptr, response.len);
+        }
+    }
+};
+
+const H3ParkCapture = struct {
+    parked: ?http.http3_session.StreamRequest.Early425RetryContinuation = null,
+
+    fn park(ctx: *anyopaque, continuation: http.http3_session.StreamRequest.Early425RetryContinuation) anyerror!void {
+        const self: *H3ParkCapture = @ptrCast(@alignCast(ctx));
+        if (self.parked != null) return error.TestDuplicatePark;
+        self.parked = continuation;
+    }
+
+    fn take(self: *H3ParkCapture) http.http3_session.StreamRequest.Early425RetryContinuation {
+        const parked = self.parked.?;
+        self.parked = null;
+        return parked;
+    }
+};
+
+const TestHttp3RequestHandshake = struct {
+    complete: bool = false,
+
+    fn isComplete(ctx: *anyopaque) bool {
+        const self: *TestHttp3RequestHandshake = @ptrCast(@alignCast(ctx));
+        return self.complete;
+    }
+
+    fn waitOrDrive(_: *anyopaque) anyerror!void {}
+
+    fn barrier(self: *TestHttp3RequestHandshake) http.request_context.DownstreamHandshakeBarrier {
+        return .{
+            .ctx = self,
+            .is_complete_fn = isComplete,
+            .wait_or_drive_fn = waitOrDrive,
+        };
+    }
+};
+
+test "h3 proxy early 425 parks and resumes exact ordinary continuation" {
+    const allocator = std.testing.allocator;
+    var origin = try H3ProxyOrigin.start(allocator, &.{ 425, 200 });
+    defer origin.stop();
+    try origin.run();
+
+    const target = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{origin.port()});
+    defer allocator.free(target);
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/proxy/",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var barrier = TestHttp3RequestHandshake{ .complete = false };
+    var capture = H3ParkCapture{};
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .stream_id = 7,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/proxy/item"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .transport_early = true,
+        .downstream_handshake = barrier.barrier(),
+        .park_early_425_retry = .{ .ctx = &capture, .park_fn = H3ParkCapture.park },
+    };
+    defer request.deinit();
+    var first_response = http.Response.init(allocator);
+    defer first_response.deinit();
+
+    try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &first_response, &dispatch_ctx));
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expect(origin.requestContains(0, "\r\nEarly-Data: 1\r\n"));
+    try std.testing.expect(capture.parked != null);
+    try std.testing.expect(request.transport_early);
+
+    var continuation = capture.take();
+    defer continuation.deinit(allocator);
+    const plan: *Http3Early425ProxyContinuation = @ptrCast(@alignCast(continuation.ctx));
+    try std.testing.expect(plan.transport_early);
+    blocks[0].action = .{ .return_response = .{ .status = 418, .body = "reloaded" } };
+    blocks[0].early_data = .off;
+    var resumed_response = http.Response.init(allocator);
+    defer resumed_response.deinit();
+    try continuation.run(allocator, &resumed_response);
+
+    try std.testing.expectEqual(@as(usize, 2), origin.requestCount());
+    try std.testing.expect(!origin.requestContains(1, "\r\nEarly-Data: 1\r\n"));
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(resumed_response.status));
+    try std.testing.expectEqualStrings("ok", resumed_response.body orelse "");
+
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_requests_total{protocol=\"h3\",source=\"transport\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h3\",decision=\"forwarded\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_upstream_425_total{action=\"retried\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"success\"} 1") != null);
+}
+
+test "h3 proxy parked early 425 forwards second 425 without third delivery" {
+    const allocator = std.testing.allocator;
+    var origin = try H3ProxyOrigin.start(allocator, &.{ 425, 425, 200 });
+    defer origin.stop();
+    try origin.run();
+
+    const target = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{origin.port()});
+    defer allocator.free(target);
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/proxy/",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var barrier = TestHttp3RequestHandshake{ .complete = false };
+    var capture = H3ParkCapture{};
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .stream_id = 9,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/proxy/item"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .transport_early = true,
+        .downstream_handshake = barrier.barrier(),
+        .park_early_425_retry = .{ .ctx = &capture, .park_fn = H3ParkCapture.park },
+    };
+    defer request.deinit();
+    var first_response = http.Response.init(allocator);
+    defer first_response.deinit();
+
+    try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &first_response, &dispatch_ctx));
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expect(origin.requestContains(0, "\r\nEarly-Data: 1\r\n"));
+
+    var continuation = capture.take();
+    defer continuation.deinit(allocator);
+    var resumed_response = http.Response.init(allocator);
+    defer resumed_response.deinit();
+    try continuation.run(allocator, &resumed_response);
+
+    try std.testing.expectEqual(@as(usize, 2), origin.requestCount());
+    try std.testing.expect(!origin.requestContains(1, "\r\nEarly-Data: 1\r\n"));
+    try std.testing.expectEqual(@as(u16, 425), @intFromEnum(resumed_response.status));
+
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_upstream_425_total{action=\"retried\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_upstream_425_total{action=\"forwarded\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"too_early\"} 1") != null);
+}
+
+test "h3 proxy parked early 425 fails without origin retry after budget expires" {
+    const allocator = std.testing.allocator;
+    var origin = try H3ProxyOrigin.start(allocator, &.{ 425, 200 });
+    defer origin.stop();
+    try origin.run();
+
+    const target = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{origin.port()});
+    defer allocator.free(target);
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .prefix,
+        .pattern = "/proxy/",
+        .priority = 0,
+        .action = .{ .proxy_pass = target },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    }};
+    var cfg = minimalHttp3ProxyConfig(blocks[0..]);
+    cfg.upstream_timeout_budget_ms = 1;
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &cfg);
+    defer config_store.deinit();
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var barrier = TestHttp3RequestHandshake{ .complete = false };
+    var capture = H3ParkCapture{};
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .stream_id = 11,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/proxy/item"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .transport_early = true,
+        .downstream_handshake = barrier.barrier(),
+        .park_early_425_retry = .{ .ctx = &capture, .park_fn = H3ParkCapture.park },
+    };
+    defer request.deinit();
+    var first_response = http.Response.init(allocator);
+    defer first_response.deinit();
+
+    try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &first_response, &dispatch_ctx));
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    compat.sleepNs(3 * std.time.ns_per_ms);
+
+    var continuation = capture.take();
+    defer continuation.deinit(allocator);
+    var resumed_response = http.Response.init(allocator);
+    defer resumed_response.deinit();
+    try continuation.run(allocator, &resumed_response);
+
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expectEqual(@as(u16, 504), @intFromEnum(resumed_response.status));
+
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_upstream_425_total{action=\"retried\"} 1") == null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"failure\"} 1") != null);
+}
+
 fn handleHttp3Connection(
     allocator: std.mem.Allocator,
     request: *const http.http3_session.StreamRequest,
@@ -2660,6 +3228,7 @@ pub fn handleHttp3Request(
 
     var effective_ctx = ctx.*;
     effective_ctx.cfg = effective_cfg;
+    effective_ctx.cfg_lease = &cfg_lease;
     try handleHttp3Connection(allocator, request, response, &effective_ctx);
 }
 
