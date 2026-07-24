@@ -172,6 +172,18 @@ fn metricsEarlyDataSource(early_ctx: http.request_context.EarlyDataContext) ?htt
     };
 }
 
+fn h3ForwardEarlyDataMarker(early_ctx: http.request_context.EarlyDataContext, decision: http.early_data.Decision) bool {
+    if (decision != .forward_rfc8470) return false;
+    return early_ctx.inbound_marker or (early_ctx.transport_early and early_ctx.downstreamHandshakeComplete() == false);
+}
+
+fn h3RequestHandshakeComplete(ctx: *anyopaque) bool {
+    const request: *const http.http3_session.StreamRequest = @ptrCast(@alignCast(ctx));
+    return request.downstream_handshake_complete;
+}
+
+fn h3RequestDriveHandshake(_: *anyopaque) anyerror!void {}
+
 pub fn writeTooEarlyResponse(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -1894,6 +1906,11 @@ fn routeHttp3Location(
     const early_ctx = http.request_context.EarlyDataContext{
         .transport_early = request.transport_early,
         .inbound_marker = request.headers.hasEarlyDataMarker(),
+        .downstream_handshake = .{
+            .ctx = @constCast(request),
+            .is_complete_fn = h3RequestHandshakeComplete,
+            .wait_or_drive_fn = h3RequestDriveHandshake,
+        },
     };
     if (metricsEarlyDataSource(early_ctx)) |source| {
         ctx.state.metricsRecordEarlyDataRequest(.h3, source);
@@ -1906,7 +1923,7 @@ fn routeHttp3Location(
         request_path,
         request.body.len != 0,
     );
-    const forward_early_data = decision == .forward_rfc8470;
+    const forward_early_data = h3ForwardEarlyDataMarker(early_ctx, decision);
     switch (decision) {
         .execute_local => {
             ctx.state.metricsRecordEarlyDataDecision(.h3, .accepted);
@@ -2096,6 +2113,27 @@ test "routeHttp3Location accepts replay-safe current-hop transport provenance" {
     defer allocator.free(prom);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_requests_total{protocol=\"h3\",source=\"transport\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h3\",decision=\"accepted\"} 1") != null);
+}
+
+test "h3 RFC8470 forwarding marker uses provenance and handshake state" {
+    var dummy: u8 = 0;
+    try std.testing.expect(h3ForwardEarlyDataMarker(.{ .inbound_marker = true }, .forward_rfc8470));
+    try std.testing.expect(h3ForwardEarlyDataMarker(.{
+        .transport_early = true,
+        .downstream_handshake = .{
+            .ctx = &dummy,
+            .is_complete_fn = struct {
+                fn incomplete(_: *anyopaque) bool {
+                    return false;
+                }
+            }.incomplete,
+            .wait_or_drive_fn = struct {
+                fn drive(_: *anyopaque) anyerror!void {}
+            }.drive,
+        },
+    }, .forward_rfc8470));
+    try std.testing.expect(!h3ForwardEarlyDataMarker(.{ .transport_early = true }, .forward_rfc8470));
+    try std.testing.expect(!h3ForwardEarlyDataMarker(.{}, .ordinary));
 }
 
 test "routeHttp3Location rejects unknown replay-exposed methods before action execution" {

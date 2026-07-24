@@ -844,6 +844,13 @@ pub const Connection = struct {
                 self.handleRetry(bytes, parsed, now_us);
                 return;
             },
+            .zero_rtt => {
+                // #366 owns QUIC 0-RTT carrier acceptance. Until that gate can
+                // decide accepted vs rejected before recovery/ACK bookkeeping,
+                // fail closed and expose only the explicit sticky provenance seam.
+                self.dropPacket(.undecryptable, bytes.len);
+                return;
+            },
             else => {},
         }
         if (parsed.kind != .one_rtt and parsed.version != packet.quic_v1) {
@@ -858,7 +865,6 @@ pub const Connection = struct {
         const level: EncryptionLevel = switch (parsed.kind) {
             .initial => .initial,
             .handshake => .handshake,
-            .zero_rtt => .zero_rtt,
             .one_rtt => .application,
             else => unreachable,
         };
@@ -1016,7 +1022,7 @@ pub const Connection = struct {
                 self.afterHandshakeProgress(now_us);
             },
             .stream => |sf| {
-                if (level != .application and level != .zero_rtt) {
+                if (level != .application) {
                     self.startClose(.{ .error_code = error_protocol_violation, .is_application = false, .local = true }, "stream frame level", now_us);
                     return;
                 }
@@ -1029,9 +1035,6 @@ pub const Connection = struct {
                     self.closeOnStreamError(err, now_us);
                     return;
                 };
-                if (level == .zero_rtt) {
-                    try self.stream_transport_early.put(sf.id, {});
-                }
                 if (!known) {
                     try self.known_streams.put(sf.id, {});
                     if (quic_stream.streamInitiator(sf.id) != roleInitiator(self.role)) {
@@ -1827,6 +1830,10 @@ pub const Connection = struct {
 
     pub fn streamTransportEarly(self: *const Connection, id: StreamId) bool {
         return self.stream_transport_early.contains(id);
+    }
+
+    pub fn markStreamZeroRtt(self: *Connection, id: StreamId) !void {
+        try self.stream_transport_early.put(id, {});
     }
 
     pub fn resetStream(self: *Connection, id: StreamId, app_error_code: u64) !void {
@@ -2795,23 +2802,23 @@ test "driver: bidirectional stream data round-trips with FIN" {
     try testing.expectEqual(quic_stream.StreamState.closed, pair.server.streamState(id).?);
 }
 
-test "driver: accepted zero-rtt stream provenance stays sticky after one-rtt data" {
+test "driver: explicit zero-rtt stream provenance mark stays sticky after one-rtt data" {
     const allocator = testing.allocator;
     var pair = try TestPair.init(allocator);
     defer pair.deinit(allocator);
     try pair.pump();
 
     const id: StreamId = 0;
-    try pair.server.applyFrame(.zero_rtt, .{ .stream = .{ .id = id, .offset = 0, .data = "early" } }, pair.now_us);
+    try pair.server.markStreamZeroRtt(id);
     try testing.expect(pair.server.streamTransportEarly(id));
 
-    try pair.server.applyFrame(.application, .{ .stream = .{ .id = id, .offset = 5, .data = "-late", .fin = true } }, pair.now_us);
+    try pair.server.applyFrame(.application, .{ .stream = .{ .id = id, .offset = 0, .data = "late", .fin = true } }, pair.now_us);
     try testing.expect(pair.server.streamTransportEarly(id));
     try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
 
     var buf: [32]u8 = undefined;
     const request = try pair.server.readStream(id, &buf);
-    try testing.expectEqualStrings("early-late", buf[0..request.len]);
+    try testing.expectEqualStrings("late", buf[0..request.len]);
     try testing.expect(request.fin);
 }
 

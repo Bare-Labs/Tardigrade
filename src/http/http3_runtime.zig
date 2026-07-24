@@ -577,6 +577,7 @@ pub const Runtime = struct {
         };
         defer request.deinit();
         request.transport_early = incoming.transport_early;
+        request.downstream_handshake_complete = entry.conn.isEstablished();
 
         var response = response_mod.Response.init(allocator);
         defer response.deinit();
