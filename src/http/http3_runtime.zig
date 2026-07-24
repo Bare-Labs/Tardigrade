@@ -21,6 +21,7 @@ const compat = @import("zig_compat");
 const std = @import("std");
 const http3_session = @import("http3_session.zig");
 const logger_mod = @import("logger.zig");
+const metrics_mod = @import("metrics.zig");
 const response_mod = @import("response.zig");
 const shutdown = @import("shutdown.zig");
 const stream_transport = @import("stream_transport");
@@ -67,6 +68,8 @@ pub const Config = struct {
     max_datagram_size: usize = 1350,
     request_handler: ?RequestHandler = null,
     request_handler_ctx: ?*anyopaque = null,
+    early_data_compat_metrics_ctx: ?*anyopaque = null,
+    early_data_compat_metrics_cb: ?*const fn (*anyopaque, metrics_mod.H3EarlyDataCompatDecision) void = null,
 };
 
 /// Half-open admission limits (#328 review). The native stack does not send
@@ -78,6 +81,16 @@ pub const Config = struct {
 const max_connections: usize = 1024;
 const max_connections_per_source: u32 = 32;
 const handshake_timeout_us: u64 = 10 * std.time.us_per_s;
+
+const ParkedH3Retry = struct {
+    stream_id: u64,
+    continuation: http3_session.StreamRequest.Early425RetryContinuation,
+
+    fn deinit(self: *ParkedH3Retry, allocator: std.mem.Allocator) void {
+        self.continuation.deinit(allocator);
+        self.* = undefined;
+    }
+};
 
 pub const Snapshot = struct {
     quic_port: u16 = 0,
@@ -126,8 +139,11 @@ const ConnEntry = struct {
     /// issuance (successfully or not) — issuance is best-effort and must
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
+    parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
+        for (self.parked_h3_retries.items) |*parked| parked.deinit(allocator);
+        self.parked_h3_retries.deinit(allocator);
         self.h3.deinit();
         self.conn.deinit();
         allocator.destroy(self.backend);
@@ -148,6 +164,8 @@ pub const Runtime = struct {
     h3_settings: http3.frame.Settings,
     h3_application_compat: [http3.early_data.encoded_snapshot_len]u8 = undefined,
     h3_application_compat_len: usize = 0,
+    early_data_compat_metrics_ctx: ?*anyopaque = null,
+    early_data_compat_metrics_cb: ?*const fn (*anyopaque, metrics_mod.H3EarlyDataCompatDecision) void = null,
     snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
     stopping: std.atomic.Value(bool),
@@ -181,6 +199,8 @@ pub const Runtime = struct {
             .resumption_runtime = cfg.resumption_runtime,
             .quic_config = quicConfigFrom(cfg),
             .h3_settings = cfg.h3_settings,
+            .early_data_compat_metrics_ctx = cfg.early_data_compat_metrics_ctx,
+            .early_data_compat_metrics_cb = cfg.early_data_compat_metrics_cb,
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
         };
@@ -547,6 +567,7 @@ pub const Runtime = struct {
             entry.conn.close(code, "h3 protocol error", now);
             return;
         };
+        self.resumeParkedH3Retries(entry);
         while (true) {
             const incoming = entry.h3.pollRequest() catch {
                 entry.conn.close(entry.h3.closeCode(), "h3 request error", now);
@@ -557,6 +578,7 @@ pub const Runtime = struct {
     }
 
     fn serveRequest(self: *Runtime, entry: *ConnEntry, incoming: H3.IncomingRequest, now: u64) void {
+        _ = now;
         const allocator = self.allocator;
         const handler = self.request_handler orelse {
             entry.h3.sendResponse(entry.conn, incoming.stream_id, 404, &.{}, "") catch {};
@@ -569,16 +591,59 @@ pub const Runtime = struct {
             return;
         };
         defer request.deinit();
+        request.stream_id = incoming.stream_id;
+        request.transport_early = incoming.transport_early;
+        request.downstream_handshake_complete = entry.conn.isEstablished();
+        request.downstream_handshake = .{
+            .ctx = entry.conn,
+            .is_complete_fn = h3DownstreamHandshakeComplete,
+            .wait_or_drive_fn = h3DownstreamWaitOrDriveHandshake,
+        };
+        var park_ctx = H3ParkContext{ .runtime = self, .entry = entry, .stream_id = incoming.stream_id };
+        request.park_early_425_retry = .{
+            .ctx = &park_ctx,
+            .park_fn = parkH3Early425Retry,
+        };
 
         var response = response_mod.Response.init(allocator);
         defer response.deinit();
         handler(allocator, &request, &response, self.request_handler_ctx) catch |err| {
+            if (err == error.Http3RequestParked) return;
             self.logger.warn(null, "http3: request handler failed: {s}", .{@errorName(err)});
             entry.h3.sendResponse(entry.conn, incoming.stream_id, 500, &.{}, "") catch {};
             entry.h3.finishRequest(incoming.stream_id);
             return;
         };
 
+        self.sendHandlerResponse(entry, incoming.stream_id, &response);
+    }
+
+    fn resumeParkedH3Retries(self: *Runtime, entry: *ConnEntry) void {
+        self.resumeParkedH3RetriesForEntry(entry);
+    }
+
+    fn resumeParkedH3RetriesForEntry(self: *Runtime, entry: anytype) void {
+        if (!entry.conn.isEstablished()) return;
+        self.resumeEstablishedParkedH3Retries(entry);
+    }
+
+    fn resumeEstablishedParkedH3Retries(self: *Runtime, entry: anytype) void {
+        while (entry.parked_h3_retries.items.len != 0) {
+            var parked = entry.parked_h3_retries.orderedRemove(0);
+            defer parked.deinit(self.allocator);
+
+            var response = response_mod.Response.init(self.allocator);
+            defer response.deinit();
+            parked.continuation.run(self.allocator, &response) catch |err| {
+                self.logger.warn(null, "http3: parked request retry failed: {s}", .{@errorName(err)});
+                self.sendInternalErrorResponse(entry, parked.stream_id);
+                continue;
+            };
+            self.sendHandlerResponse(entry, parked.stream_id, &response);
+        }
+    }
+
+    fn sendHandlerResponse(self: *Runtime, entry: anytype, stream_id: u64, response: *const response_mod.Response) void {
         var headers_buf: [64]stream_transport.Header = undefined;
         var header_count: usize = 0;
         for (response.headers.iterator()) |header| {
@@ -588,17 +653,26 @@ pub const Runtime = struct {
         }
         entry.h3.sendResponse(
             entry.conn,
-            incoming.stream_id,
+            stream_id,
             response.status.code(),
             headers_buf[0..header_count],
             response.body orelse "",
         ) catch |err| {
             self.logger.warn(null, "http3: response send failed: {s}", .{@errorName(err)});
-            entry.conn.resetStream(incoming.stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
-            entry.h3.finishRequest(incoming.stream_id);
+            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
+            entry.h3.finishRequest(stream_id);
             return;
         };
-        _ = now;
+        self.noteRequestCompleted();
+    }
+
+    fn sendInternalErrorResponse(self: *Runtime, entry: anytype, stream_id: u64) void {
+        entry.h3.sendResponse(entry.conn, stream_id, 500, &.{}, "") catch |err| {
+            self.logger.warn(null, "http3: fallback response send failed: {s}", .{@errorName(err)});
+            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
+            entry.h3.finishRequest(stream_id);
+            return;
+        };
         self.noteRequestCompleted();
     }
 
@@ -607,6 +681,30 @@ pub const Runtime = struct {
         if (sent >= 0 and @as(usize, @intCast(sent)) == datagram.len) {
             self.notePacketOut(datagram.len);
         }
+    }
+
+    fn h3DownstreamHandshakeComplete(ctx: *anyopaque) bool {
+        const conn: *Connection = @ptrCast(@alignCast(ctx));
+        return conn.isEstablished();
+    }
+
+    fn h3DownstreamWaitOrDriveHandshake(ctx: *anyopaque) anyerror!void {
+        const conn: *Connection = @ptrCast(@alignCast(ctx));
+        conn.driveAuthentication(nowUs());
+    }
+
+    const H3ParkContext = struct {
+        runtime: *Runtime,
+        entry: *ConnEntry,
+        stream_id: u64,
+    };
+
+    fn parkH3Early425Retry(ctx: *anyopaque, continuation: http3_session.StreamRequest.Early425RetryContinuation) anyerror!void {
+        const park_ctx: *H3ParkContext = @ptrCast(@alignCast(ctx));
+        try park_ctx.entry.parked_h3_retries.append(park_ctx.runtime.allocator, .{
+            .stream_id = park_ctx.stream_id,
+            .continuation = continuation,
+        });
     }
 
     /// #488: best-effort, exactly-once post-handshake ticket issuance for
@@ -662,15 +760,35 @@ pub const Runtime = struct {
 
     fn h3EarlyDataCompatibility(ctx: *anyopaque, candidate: tls_core.tls13_backend.EarlyDataCompatibilityCandidate) tls_core.tls13_backend.EarlyDataCompatibilityDecision {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
-        const app = candidate.remembered_application orelse return .application_incompatible;
+        const app = candidate.remembered_application orelse {
+            self.recordH3EarlyDataCompat(.missing_state);
+            return .application_incompatible;
+        };
+
         return switch (http3.early_data.compatibility(.{
             .format_id = app.format_id,
             .format_version = app.format_version,
             .bytes = app.bytes,
         }, self.h3_settings)) {
-            .compatible => .compatible,
-            .missing_state, .malformed_state, .settings_incompatible => .application_incompatible,
+            .compatible => blk: {
+                self.recordH3EarlyDataCompat(.compatible);
+                break :blk .compatible;
+            },
+            .missing_state => blk: {
+                self.recordH3EarlyDataCompat(.missing_state);
+                break :blk .application_incompatible;
+            },
+            .malformed_state, .settings_incompatible => blk: {
+                self.recordH3EarlyDataCompat(.settings_incompatible);
+                break :blk .application_incompatible;
+            },
         };
+    }
+
+    fn recordH3EarlyDataCompat(self: *Runtime, decision: metrics_mod.H3EarlyDataCompatDecision) void {
+        const cb = self.early_data_compat_metrics_cb orelse return;
+        const cb_ctx = self.early_data_compat_metrics_ctx orelse return;
+        cb(cb_ctx, decision);
     }
 
     fn noteConnectionAccepted(self: *Runtime) void {
@@ -942,6 +1060,237 @@ test "per-source admission counter increments and prunes to empty" {
     try testing.expect(per_ip.get(0x0100007f) == null);
     // Decrementing an unknown address is a no-op, not a crash.
     decPerIp(&per_ip, 0xdeadbeef);
+}
+
+const TestParkedContinuationState = struct {
+    run_calls: usize = 0,
+    deinit_calls: usize = 0,
+    fail_run: bool = false,
+
+    fn run(ctx: *anyopaque, allocator: std.mem.Allocator, response: *response_mod.Response) !void {
+        _ = allocator;
+        const self: *TestParkedContinuationState = @ptrCast(@alignCast(ctx));
+        self.run_calls += 1;
+        if (self.fail_run) return error.TestParkedContinuationFailed;
+        _ = response.setStatus(.ok).setBody("resumed");
+    }
+
+    fn deinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        const self: *TestParkedContinuationState = @ptrCast(@alignCast(ctx));
+        self.deinit_calls += 1;
+    }
+
+    fn continuation(self: *TestParkedContinuationState) http3_session.StreamRequest.Early425RetryContinuation {
+        return .{
+            .ctx = self,
+            .resume_fn = run,
+            .deinit_fn = deinit,
+        };
+    }
+};
+
+const TestH3ResumeConn = struct {
+    established: bool = false,
+    reset_calls: usize = 0,
+    last_reset_stream_id: u64 = 0,
+
+    fn isEstablished(self: *TestH3ResumeConn) bool {
+        return self.established;
+    }
+
+    fn resetStream(self: *TestH3ResumeConn, stream_id: u64, code: u64) !void {
+        _ = code;
+        self.reset_calls += 1;
+        self.last_reset_stream_id = stream_id;
+    }
+};
+
+const TestH3ResumeSession = struct {
+    send_calls: usize = 0,
+    ok_sends: usize = 0,
+    internal_error_sends: usize = 0,
+    finish_calls: usize = 0,
+    send_fail: bool = false,
+    last_status: u16 = 0,
+    last_stream_id: u64 = 0,
+
+    fn sendResponse(
+        self: *TestH3ResumeSession,
+        conn: *TestH3ResumeConn,
+        stream_id: u64,
+        status: u16,
+        headers: []const stream_transport.Header,
+        body: []const u8,
+    ) !void {
+        _ = conn;
+        _ = headers;
+        _ = body;
+        self.send_calls += 1;
+        self.last_status = status;
+        self.last_stream_id = stream_id;
+        if (status == 200) self.ok_sends += 1;
+        if (status == 500) self.internal_error_sends += 1;
+        if (self.send_fail) return error.StreamBackpressure;
+    }
+
+    fn finishRequest(self: *TestH3ResumeSession, stream_id: u64) void {
+        self.finish_calls += 1;
+        self.last_stream_id = stream_id;
+    }
+};
+
+const TestH3ResumeEntry = struct {
+    conn: *TestH3ResumeConn,
+    h3: TestH3ResumeSession = .{},
+    parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
+
+    fn deinit(self: *TestH3ResumeEntry, allocator: std.mem.Allocator) void {
+        for (self.parked_h3_retries.items) |*parked| parked.deinit(allocator);
+        self.parked_h3_retries.deinit(allocator);
+    }
+};
+
+test "parked H3 retry resumes only after connection establishment" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-parked-resume-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    defer runtime.deinit();
+
+    var conn = TestH3ResumeConn{};
+    var entry = TestH3ResumeEntry{ .conn = &conn };
+    defer entry.deinit(allocator);
+    var continuation = TestParkedContinuationState{};
+    try entry.parked_h3_retries.append(allocator, .{
+        .stream_id = 11,
+        .continuation = continuation.continuation(),
+    });
+
+    runtime.resumeParkedH3RetriesForEntry(&entry);
+    try testing.expectEqual(@as(usize, 1), entry.parked_h3_retries.items.len);
+    try testing.expectEqual(@as(usize, 0), continuation.run_calls);
+    try testing.expectEqual(@as(usize, 0), entry.h3.send_calls);
+
+    conn.established = true;
+    runtime.resumeParkedH3RetriesForEntry(&entry);
+    try testing.expectEqual(@as(usize, 0), entry.parked_h3_retries.items.len);
+    try testing.expectEqual(@as(usize, 1), continuation.run_calls);
+    try testing.expectEqual(@as(usize, 1), continuation.deinit_calls);
+    try testing.expectEqual(@as(usize, 1), entry.h3.send_calls);
+    try testing.expectEqual(@as(u16, 200), entry.h3.last_status);
+    try testing.expectEqual(@as(u64, 11), entry.h3.last_stream_id);
+}
+
+test "parked H3 retry fallback send failure resets and finishes stream once" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-parked-fallback-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    defer runtime.deinit();
+
+    var conn = TestH3ResumeConn{ .established = true };
+    var entry = TestH3ResumeEntry{
+        .conn = &conn,
+        .h3 = .{ .send_fail = true },
+    };
+    defer entry.deinit(allocator);
+    var continuation = TestParkedContinuationState{ .fail_run = true };
+    try entry.parked_h3_retries.append(allocator, .{
+        .stream_id = 13,
+        .continuation = continuation.continuation(),
+    });
+
+    runtime.resumeParkedH3RetriesForEntry(&entry);
+
+    try testing.expectEqual(@as(usize, 0), entry.parked_h3_retries.items.len);
+    try testing.expectEqual(@as(usize, 1), continuation.run_calls);
+    try testing.expectEqual(@as(usize, 1), continuation.deinit_calls);
+    try testing.expectEqual(@as(usize, 1), entry.h3.send_calls);
+    try testing.expectEqual(@as(usize, 1), conn.reset_calls);
+    try testing.expectEqual(@as(usize, 1), entry.h3.finish_calls);
+    try testing.expectEqual(@as(u64, 13), conn.last_reset_stream_id);
+    try testing.expectEqual(@as(u64, 13), entry.h3.last_stream_id);
+}
+
+test "failed parked H3 retry does not stop later parked retry" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-parked-drain-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    defer runtime.deinit();
+
+    var conn = TestH3ResumeConn{ .established = true };
+    var entry = TestH3ResumeEntry{ .conn = &conn };
+    defer entry.deinit(allocator);
+    var failed = TestParkedContinuationState{ .fail_run = true };
+    var resumed = TestParkedContinuationState{};
+    try entry.parked_h3_retries.append(allocator, .{
+        .stream_id = 21,
+        .continuation = failed.continuation(),
+    });
+    try entry.parked_h3_retries.append(allocator, .{
+        .stream_id = 23,
+        .continuation = resumed.continuation(),
+    });
+
+    runtime.resumeParkedH3RetriesForEntry(&entry);
+
+    try testing.expectEqual(@as(usize, 0), entry.parked_h3_retries.items.len);
+    try testing.expectEqual(@as(usize, 1), failed.run_calls);
+    try testing.expectEqual(@as(usize, 1), failed.deinit_calls);
+    try testing.expectEqual(@as(usize, 1), resumed.run_calls);
+    try testing.expectEqual(@as(usize, 1), resumed.deinit_calls);
+    try testing.expectEqual(@as(usize, 2), entry.h3.send_calls);
+    try testing.expectEqual(@as(usize, 1), entry.h3.internal_error_sends);
+    try testing.expectEqual(@as(usize, 1), entry.h3.ok_sends);
+    try testing.expectEqual(@as(usize, 0), conn.reset_calls);
+    try testing.expectEqual(@as(u64, 23), entry.h3.last_stream_id);
+}
+
+test "failed parked H3 retry reset path does not stop later parked retry" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-parked-reset-drain-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    defer runtime.deinit();
+
+    var conn = TestH3ResumeConn{ .established = true };
+    var entry = TestH3ResumeEntry{
+        .conn = &conn,
+        .h3 = .{ .send_fail = true },
+    };
+    defer entry.deinit(allocator);
+    var failed = TestParkedContinuationState{ .fail_run = true };
+    var resumed = TestParkedContinuationState{};
+    try entry.parked_h3_retries.append(allocator, .{
+        .stream_id = 31,
+        .continuation = failed.continuation(),
+    });
+    try entry.parked_h3_retries.append(allocator, .{
+        .stream_id = 33,
+        .continuation = resumed.continuation(),
+    });
+
+    runtime.resumeParkedH3RetriesForEntry(&entry);
+
+    try testing.expectEqual(@as(usize, 0), entry.parked_h3_retries.items.len);
+    try testing.expectEqual(@as(usize, 1), failed.run_calls);
+    try testing.expectEqual(@as(usize, 1), failed.deinit_calls);
+    try testing.expectEqual(@as(usize, 1), resumed.run_calls);
+    try testing.expectEqual(@as(usize, 1), resumed.deinit_calls);
+    try testing.expectEqual(@as(usize, 2), entry.h3.send_calls);
+    try testing.expectEqual(@as(usize, 2), conn.reset_calls);
+    try testing.expectEqual(@as(usize, 2), entry.h3.finish_calls);
+    try testing.expectEqual(@as(u64, 33), conn.last_reset_stream_id);
 }
 
 test "runtime borrows the credential provider and owns no key material" {

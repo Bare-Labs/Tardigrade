@@ -104,6 +104,7 @@ pub const TlsBackend = struct {
         identity: []const u8,
         limits: tls_core.session.Limits,
     ) HandshakeError!void = null,
+    earlyDataAcceptedFn: ?*const fn (ptr: *anyopaque) bool = null,
 
     fn start(self: TlsBackend, role: Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void {
         return self.transport.start(role, params, sink);
@@ -170,6 +171,11 @@ pub const TlsBackend = struct {
     ) HandshakeError!void {
         const emit = self.emitPreparedNewSessionTicketFn orelse return error.InvalidHandshakeState;
         return emit(self.transport.ptr, allocator, sink, prepared, identity, limits);
+    }
+
+    pub fn earlyDataAccepted(self: TlsBackend) bool {
+        const cb = self.earlyDataAcceptedFn orelse return false;
+        return cb(self.transport.ptr);
     }
 
     pub fn deinit(self: TlsBackend) void {

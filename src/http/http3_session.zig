@@ -1,5 +1,6 @@
 const std = @import("std");
 const Headers = @import("headers.zig").Headers;
+const request_context = @import("request_context.zig");
 const Response = @import("response.zig").Response;
 
 pub const Http3SessionError = error{
@@ -20,11 +21,39 @@ pub const EncodedHeaderBlock = struct {
 
 pub const StreamRequest = struct {
     allocator: std.mem.Allocator,
+    stream_id: ?u64 = null,
     method: []u8,
     path: []u8,
     authority: ?[]u8,
     headers: Headers,
     body: []u8,
+    transport_early: bool = false,
+    downstream_handshake_complete: bool = true,
+    downstream_handshake: ?request_context.DownstreamHandshakeBarrier = null,
+    park_early_425_retry: ?ParkEarly425Retry = null,
+
+    pub const Early425RetryContinuation = struct {
+        ctx: *anyopaque,
+        resume_fn: *const fn (*anyopaque, std.mem.Allocator, *Response) anyerror!void,
+        deinit_fn: *const fn (*anyopaque, std.mem.Allocator) void,
+
+        pub fn run(self: Early425RetryContinuation, allocator: std.mem.Allocator, response: *Response) !void {
+            try self.resume_fn(self.ctx, allocator, response);
+        }
+
+        pub fn deinit(self: Early425RetryContinuation, allocator: std.mem.Allocator) void {
+            self.deinit_fn(self.ctx, allocator);
+        }
+    };
+
+    pub const ParkEarly425Retry = struct {
+        ctx: *anyopaque,
+        park_fn: *const fn (*anyopaque, Early425RetryContinuation) anyerror!void,
+
+        pub fn park(self: ParkEarly425Retry, continuation: Early425RetryContinuation) !void {
+            try self.park_fn(self.ctx, continuation);
+        }
+    };
 
     pub fn deinit(self: *StreamRequest) void {
         self.allocator.free(self.method);
@@ -33,6 +62,11 @@ pub const StreamRequest = struct {
         self.headers.deinit();
         self.allocator.free(self.body);
         self.* = undefined;
+    }
+
+    pub fn parkEarly425Retry(self: *const StreamRequest, continuation: Early425RetryContinuation) !void {
+        const parker = self.park_early_425_retry orelse return error.Http3Early425RetryCannotPark;
+        try parker.park(continuation);
     }
 };
 
@@ -99,11 +133,16 @@ pub const StreamAssembler = struct {
 
         return .{
             .allocator = self.allocator,
+            .stream_id = null,
             .method = try self.allocator.dupe(u8, method),
             .path = try self.allocator.dupe(u8, path),
             .authority = if (self.authority) |authority| try self.allocator.dupe(u8, authority) else null,
             .headers = headers,
             .body = try self.body.toOwnedSlice(self.allocator),
+            .transport_early = false,
+            .downstream_handshake_complete = true,
+            .downstream_handshake = null,
+            .park_early_425_retry = null,
         };
     }
 };

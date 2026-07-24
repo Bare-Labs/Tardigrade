@@ -389,6 +389,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .max_datagram_size = cfg.http3_max_datagram_size,
             .request_handler = ghandlers.handleHttp3Request,
             .request_handler_ctx = &http3_dispatch_ctx,
+            .early_data_compat_metrics_ctx = &state,
+            .early_data_compat_metrics_cb = recordHttp3EarlyDataCompatFromRuntime,
         }) catch |err| blk: {
             state.logger.warn(null, "HTTP/3 listener failed to initialize: {s}", .{@errorName(err)});
             break :blk null;
@@ -1591,6 +1593,7 @@ const WaitingEncryptedHttpConnection = struct {
     tls_metrics: ?*http.metrics.Metrics = null,
     tls_metrics_mutex: ?*compat.Mutex = null,
     tls_metrics_state: ?*http.metrics.TlsBufferConnectionMetrics = null,
+    read_scope_transport_early: bool = false,
 
     fn init(
         inner: http.encrypted_stream_connection.EncryptedStreamHttpConnection,
@@ -1641,8 +1644,42 @@ const WaitingEncryptedHttpConnection = struct {
                 },
                 else => return err,
             };
+            self.read_scope_transport_early = self.read_scope_transport_early or self.inner.currentReadTransportEarly();
             self.observeTlsBufferMetrics();
             return n;
+        }
+    }
+
+    pub fn beginReadScope(self: *WaitingEncryptedHttpConnection) void {
+        self.read_scope_transport_early = false;
+    }
+
+    pub fn takeReadScopeTransportEarly(self: *WaitingEncryptedHttpConnection) bool {
+        const early = self.read_scope_transport_early;
+        self.read_scope_transport_early = false;
+        return early;
+    }
+
+    pub fn downstreamHandshakeComplete(self: *const WaitingEncryptedHttpConnection) bool {
+        return self.inner.downstreamHandshakeComplete();
+    }
+
+    pub fn waitForHandshakeCompletionOrInput(self: *WaitingEncryptedHttpConnection) !void {
+        while (true) {
+            if (self.downstreamHandshakeComplete()) return;
+            if (self.pendingPlaintext() > 0) return;
+
+            const readiness = self.inner.readiness();
+            var requested = http.event_loop.Interest{ .read = true };
+            if (readiness.wants_write) requested.write = true;
+
+            self.observeTlsBufferMetrics();
+            try self.waitFor(requested, self.read_timeout_ms);
+            _ = self.inner.stream.drive() catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            self.observeTlsBufferMetrics();
         }
     }
 
@@ -1857,6 +1894,143 @@ fn parkedConnectionCloseHook(raw_state: *anyopaque, fd: std.posix.fd_t) void {
     state.releaseConnectionSlot(fd);
 }
 
+fn recordHttp3EarlyDataCompatFromRuntime(
+    raw_state: *anyopaque,
+    decision: http.metrics.H3EarlyDataCompatDecision,
+) void {
+    const state: *GatewayState = @ptrCast(@alignCast(raw_state));
+    state.metricsRecordHttp3EarlyDataCompat(decision);
+}
+
+fn h2LastReadTransportEarly(conn: anytype) bool {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "takeReadScopeTransportEarly")) return conn.takeReadScopeTransportEarly();
+    } else {
+        if (comptime @hasDecl(T, "takeReadScopeTransportEarly")) return conn.takeReadScopeTransportEarly();
+    }
+    return false;
+}
+
+fn h2BeginReadScope(conn: anytype) void {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "beginReadScope")) {
+            conn.beginReadScope();
+            return;
+        }
+    } else {
+        if (comptime @hasDecl(T, "beginReadScope")) {
+            conn.beginReadScope();
+            return;
+        }
+    }
+}
+
+fn h2DownstreamHandshakeComplete(conn: anytype) bool {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "downstreamHandshakeComplete")) return conn.downstreamHandshakeComplete();
+    } else {
+        if (comptime @hasDecl(T, "downstreamHandshakeComplete")) return conn.downstreamHandshakeComplete();
+    }
+    return true;
+}
+
+fn h2WaitForHandshakeCompletionOrInput(conn: anytype) !void {
+    const T = @TypeOf(conn);
+    if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
+        const Child = std.meta.Child(T);
+        if (comptime @hasDecl(Child, "waitForHandshakeCompletionOrInput")) return conn.waitForHandshakeCompletionOrInput();
+    } else {
+        if (comptime @hasDecl(T, "waitForHandshakeCompletionOrInput")) return conn.waitForHandshakeCompletionOrInput();
+    }
+    return;
+}
+
+fn h2HasDeferredReadyStreams(
+    pending: *const std.AutoHashMap(u31, Http2PendingStream),
+    ready_streams: *const std.array_list.Managed(u31),
+) bool {
+    for (ready_streams.items) |sid| {
+        const ps = pending.get(sid) orelse continue;
+        if (ps.transport_early and ps.dispatch_count == 0) return true;
+    }
+    return false;
+}
+
+fn h2AppendReadyStream(ready_streams: *std.array_list.Managed(u31), sid: u31) !void {
+    for (ready_streams.items) |existing| {
+        if (existing == sid) return;
+    }
+    try ready_streams.append(sid);
+}
+
+fn h2DispatchReadyStreams(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    pending: *std.AutoHashMap(u31, Http2PendingStream),
+    streams: *std.AutoHashMap(u31, http.http2_stream.Stream),
+    ready_streams: *std.array_list.Managed(u31),
+    next_server_stream_id: *u31,
+    conn_send_window: *i32,
+) !void {
+    if (ready_streams.items.len == 0) return;
+
+    const initial_ready = ready_streams.items.len;
+    var processed: usize = 0;
+    while (processed < initial_ready and ready_streams.items.len > 0) : (processed += 1) {
+        var best_idx: usize = 0;
+        var best_weight: u8 = 0;
+        for (ready_streams.items, 0..) |sid, idx| {
+            const w = if (streams.get(sid)) |s| s.priority_weight else 16;
+            if (w >= best_weight) {
+                best_weight = w;
+                best_idx = idx;
+            }
+        }
+
+        const sid = ready_streams.swapRemove(best_idx);
+        const stream_send = if (streams.get(sid)) |s| s.send_window else conn_send_window.*;
+        const ps = pending.getPtr(sid) orelse continue;
+        if (ps.dispatch_count > 0) continue;
+
+        if (ps.transport_early and !h2DownstreamHandshakeComplete(conn)) {
+            if (!ps.early_request_recorded) {
+                state.metricsRecordEarlyDataRequest(.h2, .transport);
+                ps.early_request_recorded = true;
+            }
+            if (!ps.deferred_recorded) {
+                state.metricsRecordEarlyDataDecision(.h2, .deferred);
+                ps.deferred_recorded = true;
+            }
+            try h2AppendReadyStream(ready_streams, sid);
+            continue;
+        }
+
+        if (ps.transport_early and !ps.early_request_recorded) {
+            state.metricsRecordEarlyDataRequest(.h2, .transport);
+            ps.early_request_recorded = true;
+        }
+        if (ps.transport_early) {
+            state.metricsRecordEarlyDataDecision(.h2, .accepted);
+        }
+
+        try respondHttp2Stream(conn.writer(), allocator, state, cfg, sid, ps, next_server_stream_id, conn_send_window, stream_send);
+        ps.dispatch_count += 1;
+        if (pending.fetchRemove(sid)) |removed| {
+            var tmp = removed.value;
+            tmp.deinit(allocator);
+        }
+        _ = streams.remove(sid);
+    }
+}
+
 fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, connection_ip: []const u8) !void {
     _ = session;
     _ = connection_ip;
@@ -1893,11 +2067,42 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
     }
 
     while (!http.shutdown.isShutdownRequested() and !goaway_received) {
+        try h2DispatchReadyStreams(
+            conn,
+            allocator,
+            state,
+            cfg,
+            &pending,
+            &streams,
+            &ready_streams,
+            &next_server_stream_id,
+            &conn_send_window,
+        );
+
+        if (h2HasDeferredReadyStreams(&pending, &ready_streams) and !h2DownstreamHandshakeComplete(conn)) {
+            try h2WaitForHandshakeCompletionOrInput(conn);
+            try h2DispatchReadyStreams(
+                conn,
+                allocator,
+                state,
+                cfg,
+                &pending,
+                &streams,
+                &ready_streams,
+                &next_server_stream_id,
+                &conn_send_window,
+            );
+            if (ready_streams.items.len == 0) continue;
+        }
+
+        h2BeginReadScope(conn);
+
         var frame = http.http2_frame.readFrame(conn, allocator, HTTP2_MAX_FRAME_SIZE) catch |err| switch (err) {
             error.ConnectionClosed => return,
             else => return err,
         };
         defer http.http2_frame.deinitFrame(allocator, &frame);
+        const frame_transport_early = h2LastReadTransportEarly(conn);
 
         switch (frame.typ) {
             .settings => {
@@ -1924,6 +2129,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 };
                 defer http.hpack.deinitDecoded(allocator, &decoded);
                 var ps = pending.get(frame.stream_id) orelse Http2PendingStream.init(allocator);
+                ps.transport_early = ps.transport_early or frame_transport_early;
                 if (streams.get(frame.stream_id)) |s| ps.priority_weight = s.priority_weight;
                 for (decoded.headers) |h| {
                     if (std.mem.eql(u8, h.name, ":method")) {
@@ -1939,7 +2145,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 try pending.put(frame.stream_id, ps);
                 if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
                     if (streams.getPtr(frame.stream_id)) |s| s.remoteEndStream() catch {};
-                    try ready_streams.append(frame.stream_id);
+                    try h2AppendReadyStream(&ready_streams, frame.stream_id);
                 }
             },
             .data => {
@@ -1947,6 +2153,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 if (streams.getPtr(frame.stream_id)) |s| s.send_window -= @intCast(frame.payload.len);
                 conn_send_window -= @intCast(frame.payload.len);
                 if (pending.getPtr(frame.stream_id)) |ps| {
+                    ps.transport_early = ps.transport_early or frame_transport_early;
                     try ps.body.appendSlice(frame.payload);
                     try http.http2_frame.writeWindowUpdate(conn.writer(), frame.stream_id, @intCast(frame.payload.len));
                     try http.http2_frame.writeWindowUpdate(conn.writer(), 0, @intCast(frame.payload.len));
@@ -1954,7 +2161,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     conn_send_window += @intCast(frame.payload.len);
                     if ((frame.flags & http.http2_frame.Flags.END_STREAM) != 0) {
                         if (streams.getPtr(frame.stream_id)) |s| s.remoteEndStream() catch {};
-                        try ready_streams.append(frame.stream_id);
+                        try h2AppendReadyStream(&ready_streams, frame.stream_id);
                     }
                 } else {
                     try http.http2_frame.writeGoaway(conn.writer(), frame.stream_id, 1);
@@ -1980,6 +2187,14 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     tmp.deinit(allocator);
                 }
                 _ = streams.remove(frame.stream_id);
+                var idx: usize = 0;
+                while (idx < ready_streams.items.len) {
+                    if (ready_streams.items[idx] == frame.stream_id) {
+                        _ = ready_streams.swapRemove(idx);
+                        continue;
+                    }
+                    idx += 1;
+                }
             },
             .goaway => {
                 goaway_received = true;
@@ -1987,27 +2202,17 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             .continuation, .push_promise => {},
         }
 
-        while (ready_streams.items.len > 0) {
-            var best_idx: usize = 0;
-            var best_weight: u8 = 0;
-            for (ready_streams.items, 0..) |sid, idx| {
-                const w = if (streams.get(sid)) |s| s.priority_weight else 16;
-                if (w >= best_weight) {
-                    best_weight = w;
-                    best_idx = idx;
-                }
-            }
-            const sid = ready_streams.swapRemove(best_idx);
-            const stream_send = if (streams.get(sid)) |s| s.send_window else conn_send_window;
-            if (pending.getPtr(sid)) |ps| {
-                try respondHttp2Stream(conn.writer(), allocator, state, cfg, sid, ps, &next_server_stream_id, &conn_send_window, stream_send);
-            }
-            if (pending.fetchRemove(sid)) |removed| {
-                var tmp = removed.value;
-                tmp.deinit(allocator);
-            }
-            _ = streams.remove(sid);
-        }
+        try h2DispatchReadyStreams(
+            conn,
+            allocator,
+            state,
+            cfg,
+            &pending,
+            &streams,
+            &ready_streams,
+            &next_server_stream_id,
+            &conn_send_window,
+        );
     }
 }
 
@@ -2256,6 +2461,15 @@ fn earlyDataPreflightDecisionForH1(
     );
 }
 
+fn metricsEarlyDataSource(early_ctx: http.request_context.EarlyDataContext) ?http.metrics.EarlyDataSource {
+    return switch (early_ctx.source()) {
+        .none => null,
+        .transport => .transport,
+        .header => .header,
+        .both => .both,
+    };
+}
+
 const H1PreflightSideEffectProbe = struct {
     mirror_calls: usize = 0,
     auth_calls: usize = 0,
@@ -2370,9 +2584,26 @@ fn executeH1PostPreflightOrchestration(
     lifecycle: *http.request_lifecycle.RequestLifecycle,
     hooks: anytype,
 ) !H1PostPreflightOutcome {
-    switch (earlyDataPreflightDecisionForH1(cfg, ctx.early_data, request)) {
-        .ordinary, .execute_local, .forward_rfc8470 => {},
+    if (metricsEarlyDataSource(ctx.early_data)) |source| {
+        state.metricsRecordEarlyDataRequest(.h1, source);
+    }
+
+    const early_decision = earlyDataPreflightDecisionForH1(cfg, ctx.early_data, request);
+    switch (early_decision) {
+        .ordinary => {
+            ctx.early_data_action = .ordinary;
+        },
+        .execute_local => {
+            ctx.early_data_action = .accepted;
+            state.metricsRecordEarlyDataDecision(.h1, .accepted);
+        },
+        .forward_rfc8470 => {
+            ctx.early_data_action = .forwarded;
+            state.metricsRecordEarlyDataDecision(.h1, .forwarded);
+        },
         .too_early, .defer_until_handshake => {
+            ctx.early_data_action = if (early_decision == .defer_until_handshake) .deferred else .too_early;
+            state.metricsRecordEarlyDataDecision(.h1, if (ctx.early_data_action == .deferred) .deferred else .too_early);
             const status = try hooks.rejectEarly(allocator, writer, state, ctx, request, correlation_id, keep_alive.*);
             return .{ .terminal_status = status };
         },
@@ -2630,6 +2861,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     // Reject before routing so no location block can accidentally serve it.
     if (traceRejectionStatus(request.method, ctx.early_data)) |trace_status| {
         if (trace_status == .too_early) {
+            if (metricsEarlyDataSource(ctx.early_data)) |source| {
+                state.metricsRecordEarlyDataRequest(.h1, source);
+            }
+            ctx.early_data_action = .too_early;
+            state.metricsRecordEarlyDataDecision(.h1, .too_early);
             const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
             ghandlers.logAccessForRequest(state, &ctx, &request, status);
             return;
@@ -2645,6 +2881,11 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         std.mem.startsWith(u8, request.uri.path, acme_prefix))
     {
         if (ctx.early_data.replayExposed()) {
+            if (metricsEarlyDataSource(ctx.early_data)) |source| {
+                state.metricsRecordEarlyDataRequest(.h1, source);
+            }
+            ctx.early_data_action = .too_early;
+            state.metricsRecordEarlyDataDecision(.h1, .too_early);
             const status = try ghandlers.writeTooEarlyResponse(allocator, writer, state, &ctx, correlation_id, keep_alive);
             ghandlers.logAccessForRequest(state, &ctx, &request, status);
             return;
@@ -3037,6 +3278,8 @@ test "H1 early-data 425 preflight runs before side effects" {
     defer request.request.deinit();
     var effects = H1PreflightSideEffectProbe{};
     var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
     var ctx = http.request_context.RequestContext.init(allocator, "req-early", "127.0.0.1");
     ctx.early_data.inbound_marker = true;
     var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-early", 0);
@@ -3087,6 +3330,8 @@ test "H1 early proxy with origin capability off never reaches upstream side effe
     defer request.request.deinit();
     var effects = H1PreflightSideEffectProbe{};
     var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
     var ctx = http.request_context.RequestContext.init(allocator, "req-off", "127.0.0.1");
     ctx.early_data.inbound_marker = true;
     var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-off", 0);
@@ -3705,6 +3950,359 @@ test "waiting encrypted HTTP adapter records live HTTP/2 writer TLS metrics thro
     metrics_mutex.lock();
     defer metrics_mutex.unlock();
     try metrics.releaseTlsBufferSnapshot(&metrics_state);
+}
+
+const H2DispatchTestConn = struct {
+    allocator: std.mem.Allocator,
+    out: std.Io.Writer.Allocating,
+    handshake_complete: bool = true,
+    handshake_completes_on_wait: bool = false,
+    wait_calls: usize = 0,
+
+    const Writer = struct {
+        conn: *H2DispatchTestConn,
+
+        pub fn write(self: Writer, bytes: []const u8) !usize {
+            return self.conn.out.writer.write(bytes);
+        }
+
+        pub fn writeAll(self: Writer, bytes: []const u8) !void {
+            try self.conn.out.writer.writeAll(bytes);
+        }
+    };
+
+    fn init(allocator: std.mem.Allocator) H2DispatchTestConn {
+        return .{
+            .allocator = allocator,
+            .out = .init(allocator),
+        };
+    }
+
+    fn deinit(self: *H2DispatchTestConn) void {
+        self.out.deinit();
+    }
+
+    fn writer(self: *H2DispatchTestConn) Writer {
+        return .{ .conn = self };
+    }
+
+    fn beginReadScope(_: *H2DispatchTestConn) void {}
+
+    fn takeReadScopeTransportEarly(_: *H2DispatchTestConn) bool {
+        return false;
+    }
+
+    fn downstreamHandshakeComplete(self: *const H2DispatchTestConn) bool {
+        return self.handshake_complete;
+    }
+
+    fn waitForHandshakeCompletionOrInput(self: *H2DispatchTestConn) !void {
+        self.wait_calls += 1;
+        if (self.handshake_completes_on_wait) self.handshake_complete = true;
+    }
+};
+
+test "H2 deferred ready stream wakes on handshake completion without extra H2 frame" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer {
+        var it = pending.iterator();
+        while (it.next()) |entry| {
+            var ps = entry.value_ptr.*;
+            ps.deinit(allocator);
+        }
+        pending.deinit();
+    }
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+
+    var ps = Http2PendingStream.init(allocator);
+    ps.method = try allocator.dupe(u8, "GET");
+    ps.path = try allocator.dupe(u8, "/h2-wakeup");
+    ps.transport_early = true;
+    try pending.put(1, ps);
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try ready.append(1);
+
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+    conn.handshake_complete = false;
+    conn.handshake_completes_on_wait = true;
+
+    var next_server_stream_id: u31 = 2;
+    var conn_send_window: i32 = 65_535;
+
+    try h2DispatchReadyStreams(
+        &conn,
+        allocator,
+        &state,
+        &cfg,
+        &pending,
+        &streams,
+        &ready,
+        &next_server_stream_id,
+        &conn_send_window,
+    );
+    try std.testing.expect(pending.contains(1));
+    try std.testing.expectEqual(@as(u8, 0), pending.get(1).?.dispatch_count);
+
+    try h2WaitForHandshakeCompletionOrInput(&conn);
+    try h2DispatchReadyStreams(
+        &conn,
+        allocator,
+        &state,
+        &cfg,
+        &pending,
+        &streams,
+        &ready,
+        &next_server_stream_id,
+        &conn_send_window,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), conn.wait_calls);
+    try std.testing.expect(!pending.contains(1));
+    try std.testing.expectEqual(@as(usize, 0), ready.items.len);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+}
+
+test "H2 early stream defers dispatch until handshake completion then dispatches once" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer {
+        var it = pending.iterator();
+        while (it.next()) |entry| {
+            var ps = entry.value_ptr.*;
+            ps.deinit(allocator);
+        }
+        pending.deinit();
+    }
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+
+    var ps = Http2PendingStream.init(allocator);
+    ps.method = try allocator.dupe(u8, "GET");
+    ps.path = try allocator.dupe(u8, "/h2");
+    ps.transport_early = true;
+    try pending.put(1, ps);
+    try streams.put(1, http.http2_stream.Stream.init(1, 65_535));
+    try ready.append(1);
+
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+    conn.handshake_complete = false;
+
+    var next_server_stream_id: u31 = 2;
+    var conn_send_window: i32 = 65_535;
+
+    try h2DispatchReadyStreams(
+        &conn,
+        allocator,
+        &state,
+        &cfg,
+        &pending,
+        &streams,
+        &ready,
+        &next_server_stream_id,
+        &conn_send_window,
+    );
+
+    try std.testing.expect(pending.contains(1));
+    try std.testing.expectEqual(@as(u8, 0), pending.get(1).?.dispatch_count);
+    try std.testing.expectEqual(@as(usize, 1), ready.items.len);
+    try std.testing.expectEqual(@as(u64, 0), state.metrics.total_requests);
+
+    conn.handshake_complete = true;
+    try h2DispatchReadyStreams(
+        &conn,
+        allocator,
+        &state,
+        &cfg,
+        &pending,
+        &streams,
+        &ready,
+        &next_server_stream_id,
+        &conn_send_window,
+    );
+
+    try std.testing.expect(!pending.contains(1));
+    try std.testing.expectEqual(@as(usize, 0), ready.items.len);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_requests_total{protocol=\"h2\",source=\"transport\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h2\",decision=\"deferred\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h2\",decision=\"accepted\"} 1") != null);
+}
+
+test "H2 ordinary stream dispatch remains unchanged" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.add_headers = &.{};
+    state.metrics = http.metrics.Metrics.init();
+    var cfg = std.mem.zeroes(edge_config.EdgeConfig);
+
+    var pending = std.AutoHashMap(u31, Http2PendingStream).init(allocator);
+    defer {
+        var it = pending.iterator();
+        while (it.next()) |entry| {
+            var ps = entry.value_ptr.*;
+            ps.deinit(allocator);
+        }
+        pending.deinit();
+    }
+    var streams = std.AutoHashMap(u31, http.http2_stream.Stream).init(allocator);
+    defer streams.deinit();
+    var ready = std.array_list.Managed(u31).init(allocator);
+    defer ready.deinit();
+
+    var ps = Http2PendingStream.init(allocator);
+    ps.method = try allocator.dupe(u8, "GET");
+    ps.path = try allocator.dupe(u8, "/ordinary");
+    try pending.put(3, ps);
+    try streams.put(3, http.http2_stream.Stream.init(3, 65_535));
+    try ready.append(3);
+
+    var conn = H2DispatchTestConn.init(allocator);
+    defer conn.deinit();
+    conn.handshake_complete = false;
+
+    var next_server_stream_id: u31 = 2;
+    var conn_send_window: i32 = 65_535;
+    try h2DispatchReadyStreams(
+        &conn,
+        allocator,
+        &state,
+        &cfg,
+        &pending,
+        &streams,
+        &ready,
+        &next_server_stream_id,
+        &conn_send_window,
+    );
+
+    try std.testing.expect(!pending.contains(3));
+    try std.testing.expectEqual(@as(usize, 0), ready.items.len);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
+}
+
+const H2FrameReadProvenanceHarness = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+    // Bytes in [0, early_prefix_len) are considered 0-RTT-origin.
+    early_prefix_len: usize,
+    max_chunk: usize,
+    last_read_early: bool = false,
+
+    fn stream(self: *H2FrameReadProvenanceHarness) tls_core.encrypted_stream.EncryptedStream {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn read(ptr: *anyopaque, out: []u8) tls_core.encrypted_stream.Error!usize {
+        const self: *H2FrameReadProvenanceHarness = @ptrCast(@alignCast(ptr));
+        if (self.pos >= self.bytes.len) return error.WouldBlock;
+        const n = @min(out.len, @min(self.max_chunk, self.bytes.len - self.pos));
+        self.last_read_early = self.pos < self.early_prefix_len;
+        @memcpy(out[0..n], self.bytes[self.pos .. self.pos + n]);
+        self.pos += n;
+        return n;
+    }
+
+    fn readiness(ptr: *anyopaque) tls_core.encrypted_stream.Readiness {
+        const self: *H2FrameReadProvenanceHarness = @ptrCast(@alignCast(ptr));
+        return .{ .can_read_plaintext = self.pos < self.bytes.len };
+    }
+
+    fn drive(ptr: *anyopaque) tls_core.encrypted_stream.Error!tls_core.encrypted_stream.DriveResult {
+        return .{ .made_progress = false, .readiness = readiness(ptr) };
+    }
+
+    fn backend(_: *anyopaque) tls_core.encrypted_stream.BackendKind {
+        return .pure_zig_record;
+    }
+
+    fn write(_: *anyopaque, _: []const u8) tls_core.encrypted_stream.Error!usize {
+        return error.WouldBlock;
+    }
+
+    fn close(_: *anyopaque) void {}
+
+    fn bufferSnapshot(_: *anyopaque) tls_core.encrypted_stream.BufferSnapshot {
+        return .{};
+    }
+
+    fn readTransportEarly(ptr: *anyopaque) bool {
+        const self: *H2FrameReadProvenanceHarness = @ptrCast(@alignCast(ptr));
+        return self.last_read_early;
+    }
+
+    fn handshakeComplete(_: *anyopaque) bool {
+        return true;
+    }
+
+    const vtable = tls_core.encrypted_stream.EncryptedStream.VTable{
+        .backendFn = backend,
+        .readFn = read,
+        .writeFn = write,
+        .closeFn = close,
+        .readinessFn = readiness,
+        .driveFn = drive,
+        .bufferSnapshotFn = bufferSnapshot,
+    };
+};
+
+test "H2 frame provenance stays sticky when frame is fragmented across early then 1-RTT reads" {
+    const allocator = std.testing.allocator;
+
+    const wire = [_]u8{
+        // length=4, type=DATA, flags=END_STREAM, stream_id=1
+        0x00, 0x00, 0x04,
+        0x00, 0x01, 0x00,
+        0x00, 0x00, 0x01,
+        'a',  'b',  'c',
+        'd',
+    };
+
+    var harness = H2FrameReadProvenanceHarness{
+        .bytes = wire[0..],
+        // Header + first two payload bytes come from early data; remainder is 1-RTT.
+        .early_prefix_len = 11,
+        .max_chunk = 2,
+    };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFdAndProvenance(
+        harness.stream(),
+        -1,
+        &harness,
+        H2FrameReadProvenanceHarness.readTransportEarly,
+        H2FrameReadProvenanceHarness.handshakeComplete,
+    );
+    var conn = WaitingEncryptedHttpConnection.init(inner, 1, 1);
+
+    h2BeginReadScope(&conn);
+    var frame = try http.http2_frame.readFrame(&conn, allocator, HTTP2_MAX_FRAME_SIZE);
+    defer http.http2_frame.deinitFrame(allocator, &frame);
+
+    try std.testing.expect(h2LastReadTransportEarly(&conn));
+    try std.testing.expectEqual(http.http2_frame.Type.data, frame.typ);
+    try std.testing.expectEqual(@as(u31, 1), frame.stream_id);
+    try std.testing.expectEqualStrings("abcd", frame.payload);
 }
 
 fn gatewayTestSocketPair() ![2]std.posix.fd_t {

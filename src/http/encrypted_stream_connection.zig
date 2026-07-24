@@ -5,6 +5,9 @@ pub const EncryptedStreamHttpConnection = struct {
     stream: encrypted_stream.EncryptedStream,
     fd: std.posix.fd_t = -1,
     close_on_deinit: bool = false,
+    provenance_ctx: ?*anyopaque = null,
+    read_transport_early_fn: ?*const fn (*anyopaque) bool = null,
+    handshake_complete_fn: ?*const fn (*anyopaque) bool = null,
 
     pub fn init(stream: encrypted_stream.EncryptedStream) EncryptedStreamHttpConnection {
         return .{ .stream = stream };
@@ -12,6 +15,22 @@ pub const EncryptedStreamHttpConnection = struct {
 
     pub fn initWithFd(stream: encrypted_stream.EncryptedStream, fd: std.posix.fd_t) EncryptedStreamHttpConnection {
         return .{ .stream = stream, .fd = fd };
+    }
+
+    pub fn initWithFdAndProvenance(
+        stream: encrypted_stream.EncryptedStream,
+        fd: std.posix.fd_t,
+        provenance_ctx: *anyopaque,
+        read_transport_early_fn: *const fn (*anyopaque) bool,
+        handshake_complete_fn: *const fn (*anyopaque) bool,
+    ) EncryptedStreamHttpConnection {
+        return .{
+            .stream = stream,
+            .fd = fd,
+            .provenance_ctx = provenance_ctx,
+            .read_transport_early_fn = read_transport_early_fn,
+            .handshake_complete_fn = handshake_complete_fn,
+        };
     }
 
     pub fn deinit(self: *EncryptedStreamHttpConnection) void {
@@ -53,6 +72,18 @@ pub const EncryptedStreamHttpConnection = struct {
 
     pub fn rawFd(self: *const EncryptedStreamHttpConnection) std.posix.fd_t {
         return self.fd;
+    }
+
+    pub fn currentReadTransportEarly(self: *const EncryptedStreamHttpConnection) bool {
+        const ctx = self.provenance_ctx orelse return false;
+        const cb = self.read_transport_early_fn orelse return false;
+        return cb(ctx);
+    }
+
+    pub fn downstreamHandshakeComplete(self: *const EncryptedStreamHttpConnection) bool {
+        const ctx = self.provenance_ctx orelse return true;
+        const cb = self.handshake_complete_fn orelse return true;
+        return cb(ctx);
     }
 
     pub const Writer = struct {

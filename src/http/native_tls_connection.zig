@@ -251,7 +251,21 @@ pub const NativeTlsConnection = struct {
     }
 
     pub fn httpConnection(self: *NativeTlsConnection) encrypted_stream_connection.EncryptedStreamHttpConnection {
-        return encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFd(self.stream(), self.fd);
+        return encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFdAndProvenance(
+            self.stream(),
+            self.fd,
+            self,
+            nativeReadTransportEarly,
+            nativeHandshakeComplete,
+        );
+    }
+
+    pub fn readTransportEarly(self: *const NativeTlsConnection) bool {
+        return self.record.currentReadTransportEarly();
+    }
+
+    pub fn downstreamHandshakeComplete(self: *const NativeTlsConnection) bool {
+        return self.record.applicationDataOpen();
     }
 
     pub fn rawFd(self: *const NativeTlsConnection) std.posix.fd_t {
@@ -355,6 +369,16 @@ pub const NativeTlsConnection = struct {
             .closeFn = carrierClose,
             .owns_handle = true,
         };
+    }
+
+    fn nativeReadTransportEarly(ptr: *anyopaque) bool {
+        const self: *NativeTlsConnection = @ptrCast(@alignCast(ptr));
+        return self.readTransportEarly();
+    }
+
+    fn nativeHandshakeComplete(ptr: *anyopaque) bool {
+        const self: *NativeTlsConnection = @ptrCast(@alignCast(ptr));
+        return self.downstreamHandshakeComplete();
     }
 
     fn carrierRead(ptr: *anyopaque, out: []u8) encrypted_stream.Error!usize {

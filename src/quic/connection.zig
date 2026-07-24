@@ -565,6 +565,7 @@ pub const Connection = struct {
     streams: ?quic_stream.StreamManager = null,
     send_queues: std.AutoHashMap(StreamId, *SendQueue),
     known_streams: std.AutoHashMap(StreamId, void),
+    stream_transport_early: std.AutoHashMap(StreamId, void),
     accept_queue: std.ArrayList(StreamId) = .empty,
 
     crypto_tx: [3]CryptoTx = .{ .{}, .{}, .{} },
@@ -644,6 +645,7 @@ pub const Connection = struct {
             .peer_cids = quic_cid.PeerCidPool.init(params.active_connection_id_limit),
             .send_queues = std.AutoHashMap(StreamId, *SendQueue).init(allocator),
             .known_streams = std.AutoHashMap(StreamId, void).init(allocator),
+            .stream_transport_early = std.AutoHashMap(StreamId, void).init(allocator),
             .last_activity_us = options.now_us,
         };
         // Construct the handshake before `errdefer conn.deinitPartial()` is
@@ -722,6 +724,7 @@ pub const Connection = struct {
         }
         self.send_queues.deinit();
         self.known_streams.deinit();
+        self.stream_transport_early.deinit();
         self.accept_queue.deinit(self.allocator);
         for (&self.crypto_tx) |*tx| tx.deinit(self.allocator);
         self.sent_records.deinit(self.allocator);
@@ -842,7 +845,9 @@ pub const Connection = struct {
                 return;
             },
             .zero_rtt => {
-                // 0-RTT is disabled (config default); nothing can decrypt it.
+                // #366 owns QUIC 0-RTT carrier acceptance. Until that gate can
+                // decide accepted vs rejected before recovery/ACK bookkeeping,
+                // fail closed and expose only the explicit sticky provenance seam.
                 self.dropPacket(.undecryptable, bytes.len);
                 return;
             },
@@ -1823,6 +1828,14 @@ pub const Connection = struct {
         return self.accept_queue.orderedRemove(0);
     }
 
+    pub fn streamTransportEarly(self: *const Connection, id: StreamId) bool {
+        return self.stream_transport_early.contains(id);
+    }
+
+    pub fn markStreamZeroRtt(self: *Connection, id: StreamId) !void {
+        try self.stream_transport_early.put(id, {});
+    }
+
     pub fn resetStream(self: *Connection, id: StreamId, app_error_code: u64) !void {
         var manager = self.streamManager() orelse return error.NotEstablished;
         const reset = try manager.sendResetStream(id, app_error_code);
@@ -2787,6 +2800,26 @@ test "driver: bidirectional stream data round-trips with FIN" {
 
     try testing.expectEqual(quic_stream.StreamState.closed, pair.client.streamState(id).?);
     try testing.expectEqual(quic_stream.StreamState.closed, pair.server.streamState(id).?);
+}
+
+test "driver: explicit zero-rtt stream provenance mark stays sticky after one-rtt data" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id: StreamId = 0;
+    try pair.server.markStreamZeroRtt(id);
+    try testing.expect(pair.server.streamTransportEarly(id));
+
+    try pair.server.applyFrame(.application, .{ .stream = .{ .id = id, .offset = 0, .data = "late", .fin = true } }, pair.now_us);
+    try testing.expect(pair.server.streamTransportEarly(id));
+    try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
+
+    var buf: [32]u8 = undefined;
+    const request = try pair.server.readStream(id, &buf);
+    try testing.expectEqualStrings("late", buf[0..request.len]);
+    try testing.expect(request.fin);
 }
 
 test "driver: server NewSessionTicket uses application CRYPTO retransmission and stream traffic continues" {
