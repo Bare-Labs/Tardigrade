@@ -802,6 +802,7 @@ fn shouldRetryEarlyUpstream425(
 
 const BufferedProxyRetryState = struct {
     early_425_retry_used: bool = false,
+    early_425_retry_result_pending: bool = false,
     early_425_extra_attempts: usize = 0,
     retry_as_ordinary: bool = false,
 
@@ -823,8 +824,19 @@ const BufferedProxyRetryState = struct {
 
     fn consumeEarly425Retry(self: *BufferedProxyRetryState) void {
         self.early_425_retry_used = true;
+        self.early_425_retry_result_pending = true;
         self.early_425_extra_attempts = 1;
         self.retry_as_ordinary = true;
+    }
+
+    fn recordEarly425RetryResultOnce(
+        self: *BufferedProxyRetryState,
+        attempt_executor: anytype,
+        result: http.metrics.EarlyDataRetryResult,
+    ) void {
+        if (!self.early_425_retry_result_pending) return;
+        self.early_425_retry_result_pending = false;
+        attempt_executor.recordEarlyRetryResult(result);
     }
 };
 
@@ -853,6 +865,7 @@ pub fn runBufferedProxyAttempts(
     var attempt: usize = 0;
     while (attempt < retry_state.loopBound(max_attempts, stale_conn_retries)) : (attempt += 1) {
         const resp = attempt_executor.execute(attempt, retry_state.forwardEarlyData(first_attempt_forward_early_data)) catch |err| {
+            retry_state.recordEarly425RetryResultOnce(attempt_executor, .failure);
             if (err == error.ProxyBudgetExhausted) return .retry_budget_exhausted;
             if (shouldRetryStaleUpstreamConnection(
                 err,
@@ -889,12 +902,14 @@ pub fn runBufferedProxyAttempts(
                     if (parked) return .early_425_retry_parked;
                 } else |err| {
                     attempt_executor.recordEarlyRetryResult(.failure);
+                    attempt_executor.recordEarlyUpstream425Action(.forwarded);
                     try attempt_executor.onEarly425HandshakeFailure(err);
                     return .{ .response = result };
                 }
             }
             early_ctx.waitOrDriveDownstreamHandshake() catch |err| {
                 attempt_executor.recordEarlyRetryResult(.failure);
+                attempt_executor.recordEarlyUpstream425Action(.forwarded);
                 try attempt_executor.onEarly425HandshakeFailure(err);
                 return .{ .response = result };
             };
@@ -903,10 +918,12 @@ pub fn runBufferedProxyAttempts(
                     if (parked) return .early_425_retry_parked;
                 } else |err| {
                     attempt_executor.recordEarlyRetryResult(.failure);
+                    attempt_executor.recordEarlyUpstream425Action(.forwarded);
                     try attempt_executor.onEarly425HandshakeFailure(err);
                     return .{ .response = result };
                 }
                 attempt_executor.recordEarlyRetryResult(.failure);
+                attempt_executor.recordEarlyUpstream425Action(.forwarded);
                 return .{ .response = result };
             }
             attempt_executor.recordEarlyUpstream425Action(.retried);
@@ -916,11 +933,9 @@ pub fn runBufferedProxyAttempts(
         }
         if (result.statusCode() == @intFromEnum(http.Status.too_early)) {
             attempt_executor.recordEarlyUpstream425Action(.forwarded);
-            if (retry_state.early_425_retry_used) {
-                attempt_executor.recordEarlyRetryResult(.too_early);
-            }
-        } else if (retry_state.early_425_retry_used) {
-            attempt_executor.recordEarlyRetryResult(.success);
+            retry_state.recordEarly425RetryResultOnce(attempt_executor, .too_early);
+        } else {
+            retry_state.recordEarly425RetryResultOnce(attempt_executor, .success);
         }
         if (result.statusCode() >= 500 and retry_state.hasConfiguredRetryRemaining(attempt, max_attempts)) {
             try attempt_executor.onConfigured5xxRetry(retry_state.configuredAttemptIndex(attempt), max_attempts, &result);
@@ -1094,13 +1109,21 @@ const Early425RetryHarnessResult = struct {
     downstream_status: u16,
     upstream_deliveries: usize,
     handshake_failures: usize = 0,
+    early_425_forwarded: usize = 0,
+    early_425_retried: usize = 0,
+    early_retry_success: usize = 0,
+    early_retry_too_early: usize = 0,
+    early_retry_failure: usize = 0,
 };
 
 const ScriptedBufferedAttemptExecutor = struct {
     allocator: std.mem.Allocator,
     upstream_statuses: []const u16,
     early_data_header_counts: *std.array_list.Managed(usize),
+    fail_attempt_index: ?usize = null,
+    fail_attempt_err: anyerror = error.TestRetryTransportFailed,
     deliveries: usize = 0,
+    execute_failures: usize = 0,
     terminal_attempt_errors: usize = 0,
     handshake_failures: usize = 0,
     early_425_forwarded: usize = 0,
@@ -1135,6 +1158,11 @@ const ScriptedBufferedAttemptExecutor = struct {
         attempt: usize,
         forward_early_data: bool,
     ) !DataPlaneProxyResponse {
+        if (self.fail_attempt_index == attempt) {
+            try recordCanonicalEarlyDataHeaderCount(self.allocator, self.early_data_header_counts, forward_early_data);
+            self.execute_failures += 1;
+            return self.fail_attempt_err;
+        }
         if (attempt >= self.upstream_statuses.len) return error.TestHarnessMissingStatus;
         try recordCanonicalEarlyDataHeaderCount(self.allocator, self.early_data_header_counts, forward_early_data);
         self.deliveries += 1;
@@ -1450,6 +1478,11 @@ fn runEarly425RetryHarness(
                 .downstream_status = mutable_response.statusCode(),
                 .upstream_deliveries = executor.deliveries,
                 .handshake_failures = executor.handshake_failures,
+                .early_425_forwarded = executor.early_425_forwarded,
+                .early_425_retried = executor.early_425_retried,
+                .early_retry_success = executor.early_retry_success,
+                .early_retry_too_early = executor.early_retry_too_early,
+                .early_retry_failure = executor.early_retry_failure,
             };
         },
         .early_425_retry_parked,
@@ -1577,6 +1610,8 @@ test "early upstream 425 retry sends marker once then retries ordinary to 200" {
     try std.testing.expectEqual(@as(u16, 200), result.downstream_status);
     try std.testing.expectEqual(@as(usize, 2), result.upstream_deliveries);
     try std.testing.expectEqual(@as(usize, 1), barrier.waits);
+    try std.testing.expectEqual(@as(usize, 1), result.early_425_retried);
+    try std.testing.expectEqual(@as(usize, 1), result.early_retry_success);
     try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, header_counts.items);
 }
 
@@ -1648,6 +1683,7 @@ test "early upstream 425 parking failure forwards original response" {
     try std.testing.expectEqual(@as(usize, 1), executor.inner.deliveries);
     try std.testing.expectEqual(@as(usize, 0), executor.parked);
     try std.testing.expectEqual(@as(usize, 1), executor.inner.early_retry_failure);
+    try std.testing.expectEqual(@as(usize, 1), executor.inner.early_425_forwarded);
 }
 
 test "early upstream 425 retry forwards second 425 without third delivery" {
@@ -1670,6 +1706,45 @@ test "early upstream 425 retry forwards second 425 without third delivery" {
     try std.testing.expectEqual(@as(u16, 425), result.downstream_status);
     try std.testing.expectEqual(@as(usize, 2), result.upstream_deliveries);
     try std.testing.expectEqual(@as(usize, 1), barrier.waits);
+    try std.testing.expectEqual(@as(usize, 1), result.early_425_retried);
+    try std.testing.expectEqual(@as(usize, 1), result.early_425_forwarded);
+    try std.testing.expectEqual(@as(usize, 1), result.early_retry_too_early);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, header_counts.items);
+}
+
+test "early upstream 425 ordinary retry transport failure records failure once" {
+    const allocator = std.testing.allocator;
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    };
+    var barrier = TestEarly425Barrier{};
+    var ctx = http.request_context.EarlyDataContext{ .transport_early = true, .downstream_handshake = barrier.barrier() };
+    var header_counts = std.array_list.Managed(usize).init(allocator);
+    defer header_counts.deinit();
+    var executor = ScriptedBufferedAttemptExecutor{
+        .allocator = allocator,
+        .upstream_statuses = &.{425},
+        .early_data_header_counts = &header_counts,
+        .fail_attempt_index = 1,
+        .fail_attempt_err = error.TestRetryTransportFailed,
+    };
+
+    const result = try runBufferedProxyAttempts(&ctx, true, "GET", &block, 1, 0, true, &executor);
+
+    switch (result) {
+        .terminal_error => |err| try std.testing.expectEqual(error.TestRetryTransportFailed, err),
+        else => return error.TestUnexpectedTerminalProxyResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), executor.deliveries);
+    try std.testing.expectEqual(@as(usize, 1), executor.execute_failures);
+    try std.testing.expectEqual(@as(usize, 1), executor.early_425_retried);
+    try std.testing.expectEqual(@as(usize, 1), executor.early_retry_failure);
+    try std.testing.expectEqual(@as(usize, 0), executor.early_retry_success);
     try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, header_counts.items);
 }
 
@@ -1694,6 +1769,8 @@ test "early upstream 425 handshake failure forwards original 425" {
     try std.testing.expectEqual(@as(usize, 1), result.upstream_deliveries);
     try std.testing.expectEqual(@as(usize, 1), barrier.waits);
     try std.testing.expectEqual(@as(usize, 1), result.handshake_failures);
+    try std.testing.expectEqual(@as(usize, 1), result.early_425_forwarded);
+    try std.testing.expectEqual(@as(usize, 1), result.early_retry_failure);
     try std.testing.expectEqualSlices(usize, &.{1}, header_counts.items);
 }
 
@@ -1740,6 +1817,8 @@ test "semantic upstream 425 retry does not consume configured 5xx retry budget" 
     try std.testing.expectEqual(@as(u16, 200), result.downstream_status);
     try std.testing.expectEqual(@as(usize, 3), result.upstream_deliveries);
     try std.testing.expectEqual(@as(usize, 1), barrier.waits);
+    try std.testing.expectEqual(@as(usize, 1), result.early_425_retried);
+    try std.testing.expectEqual(@as(usize, 1), result.early_retry_success);
     try std.testing.expectEqualSlices(usize, &.{ 1, 0, 0 }, header_counts.items);
 }
 

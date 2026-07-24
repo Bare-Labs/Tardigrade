@@ -619,6 +619,15 @@ pub const Runtime = struct {
     }
 
     fn resumeParkedH3Retries(self: *Runtime, entry: *ConnEntry) void {
+        self.resumeParkedH3RetriesForEntry(entry);
+    }
+
+    fn resumeParkedH3RetriesForEntry(self: *Runtime, entry: anytype) void {
+        if (!entry.conn.isEstablished()) return;
+        self.resumeEstablishedParkedH3Retries(entry);
+    }
+
+    fn resumeEstablishedParkedH3Retries(self: *Runtime, entry: anytype) void {
         while (entry.parked_h3_retries.items.len != 0) {
             var parked = entry.parked_h3_retries.orderedRemove(0);
             defer parked.deinit(self.allocator);
@@ -627,14 +636,14 @@ pub const Runtime = struct {
             defer response.deinit();
             parked.continuation.run(self.allocator, &response) catch |err| {
                 self.logger.warn(null, "http3: parked request retry failed: {s}", .{@errorName(err)});
-                entry.h3.sendResponse(entry.conn, parked.stream_id, 500, &.{}, "") catch {};
+                self.sendInternalErrorResponse(entry, parked.stream_id);
                 return;
             };
             self.sendHandlerResponse(entry, parked.stream_id, &response);
         }
     }
 
-    fn sendHandlerResponse(self: *Runtime, entry: *ConnEntry, stream_id: u64, response: *const response_mod.Response) void {
+    fn sendHandlerResponse(self: *Runtime, entry: anytype, stream_id: u64, response: *const response_mod.Response) void {
         var headers_buf: [64]stream_transport.Header = undefined;
         var header_count: usize = 0;
         for (response.headers.iterator()) |header| {
@@ -650,6 +659,16 @@ pub const Runtime = struct {
             response.body orelse "",
         ) catch |err| {
             self.logger.warn(null, "http3: response send failed: {s}", .{@errorName(err)});
+            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
+            entry.h3.finishRequest(stream_id);
+            return;
+        };
+        self.noteRequestCompleted();
+    }
+
+    fn sendInternalErrorResponse(self: *Runtime, entry: anytype, stream_id: u64) void {
+        entry.h3.sendResponse(entry.conn, stream_id, 500, &.{}, "") catch |err| {
+            self.logger.warn(null, "http3: fallback response send failed: {s}", .{@errorName(err)});
             entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
             entry.h3.finishRequest(stream_id);
             return;
@@ -1041,6 +1060,157 @@ test "per-source admission counter increments and prunes to empty" {
     try testing.expect(per_ip.get(0x0100007f) == null);
     // Decrementing an unknown address is a no-op, not a crash.
     decPerIp(&per_ip, 0xdeadbeef);
+}
+
+const TestParkedContinuationState = struct {
+    run_calls: usize = 0,
+    deinit_calls: usize = 0,
+    fail_run: bool = false,
+
+    fn run(ctx: *anyopaque, allocator: std.mem.Allocator, response: *response_mod.Response) !void {
+        _ = allocator;
+        const self: *TestParkedContinuationState = @ptrCast(@alignCast(ctx));
+        self.run_calls += 1;
+        if (self.fail_run) return error.TestParkedContinuationFailed;
+        _ = response.setStatus(.ok).setBody("resumed");
+    }
+
+    fn deinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        const self: *TestParkedContinuationState = @ptrCast(@alignCast(ctx));
+        self.deinit_calls += 1;
+    }
+
+    fn continuation(self: *TestParkedContinuationState) http3_session.StreamRequest.Early425RetryContinuation {
+        return .{
+            .ctx = self,
+            .resume_fn = run,
+            .deinit_fn = deinit,
+        };
+    }
+};
+
+const TestH3ResumeConn = struct {
+    established: bool = false,
+    reset_calls: usize = 0,
+    last_reset_stream_id: u64 = 0,
+
+    fn isEstablished(self: *TestH3ResumeConn) bool {
+        return self.established;
+    }
+
+    fn resetStream(self: *TestH3ResumeConn, stream_id: u64, code: u64) !void {
+        _ = code;
+        self.reset_calls += 1;
+        self.last_reset_stream_id = stream_id;
+    }
+};
+
+const TestH3ResumeSession = struct {
+    send_calls: usize = 0,
+    finish_calls: usize = 0,
+    send_fail: bool = false,
+    last_status: u16 = 0,
+    last_stream_id: u64 = 0,
+
+    fn sendResponse(
+        self: *TestH3ResumeSession,
+        conn: *TestH3ResumeConn,
+        stream_id: u64,
+        status: u16,
+        headers: []const stream_transport.Header,
+        body: []const u8,
+    ) !void {
+        _ = conn;
+        _ = headers;
+        _ = body;
+        self.send_calls += 1;
+        self.last_status = status;
+        self.last_stream_id = stream_id;
+        if (self.send_fail) return error.StreamBackpressure;
+    }
+
+    fn finishRequest(self: *TestH3ResumeSession, stream_id: u64) void {
+        self.finish_calls += 1;
+        self.last_stream_id = stream_id;
+    }
+};
+
+const TestH3ResumeEntry = struct {
+    conn: *TestH3ResumeConn,
+    h3: TestH3ResumeSession = .{},
+    parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
+
+    fn deinit(self: *TestH3ResumeEntry, allocator: std.mem.Allocator) void {
+        for (self.parked_h3_retries.items) |*parked| parked.deinit(allocator);
+        self.parked_h3_retries.deinit(allocator);
+    }
+};
+
+test "parked H3 retry resumes only after connection establishment" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-parked-resume-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    defer runtime.deinit();
+
+    var conn = TestH3ResumeConn{};
+    var entry = TestH3ResumeEntry{ .conn = &conn };
+    defer entry.deinit(allocator);
+    var continuation = TestParkedContinuationState{};
+    try entry.parked_h3_retries.append(allocator, .{
+        .stream_id = 11,
+        .continuation = continuation.continuation(),
+    });
+
+    runtime.resumeParkedH3RetriesForEntry(&entry);
+    try testing.expectEqual(@as(usize, 1), entry.parked_h3_retries.items.len);
+    try testing.expectEqual(@as(usize, 0), continuation.run_calls);
+    try testing.expectEqual(@as(usize, 0), entry.h3.send_calls);
+
+    conn.established = true;
+    runtime.resumeParkedH3RetriesForEntry(&entry);
+    try testing.expectEqual(@as(usize, 0), entry.parked_h3_retries.items.len);
+    try testing.expectEqual(@as(usize, 1), continuation.run_calls);
+    try testing.expectEqual(@as(usize, 1), continuation.deinit_calls);
+    try testing.expectEqual(@as(usize, 1), entry.h3.send_calls);
+    try testing.expectEqual(@as(u16, 200), entry.h3.last_status);
+    try testing.expectEqual(@as(u64, 11), entry.h3.last_stream_id);
+}
+
+test "parked H3 retry fallback send failure resets and finishes stream once" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-parked-fallback-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    defer runtime.deinit();
+
+    var conn = TestH3ResumeConn{ .established = true };
+    var entry = TestH3ResumeEntry{
+        .conn = &conn,
+        .h3 = .{ .send_fail = true },
+    };
+    defer entry.deinit(allocator);
+    var continuation = TestParkedContinuationState{ .fail_run = true };
+    try entry.parked_h3_retries.append(allocator, .{
+        .stream_id = 13,
+        .continuation = continuation.continuation(),
+    });
+
+    runtime.resumeParkedH3RetriesForEntry(&entry);
+
+    try testing.expectEqual(@as(usize, 0), entry.parked_h3_retries.items.len);
+    try testing.expectEqual(@as(usize, 1), continuation.run_calls);
+    try testing.expectEqual(@as(usize, 1), continuation.deinit_calls);
+    try testing.expectEqual(@as(usize, 1), entry.h3.send_calls);
+    try testing.expectEqual(@as(usize, 1), conn.reset_calls);
+    try testing.expectEqual(@as(usize, 1), entry.h3.finish_calls);
+    try testing.expectEqual(@as(u64, 13), conn.last_reset_stream_id);
+    try testing.expectEqual(@as(u64, 13), entry.h3.last_stream_id);
 }
 
 test "runtime borrows the credential provider and owns no key material" {
