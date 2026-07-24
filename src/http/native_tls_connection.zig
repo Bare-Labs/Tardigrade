@@ -261,9 +261,7 @@ pub const NativeTlsConnection = struct {
     }
 
     pub fn readTransportEarly(self: *const NativeTlsConnection) bool {
-        // #366 server-side provenance: accepted 0-RTT contributes replay
-        // exposure until the connection reaches authenticated application data.
-        return self.backend.earlyDataAccepted() and !self.record.applicationDataOpen();
+        return self.record.currentReadTransportEarly();
     }
 
     pub fn downstreamHandshakeComplete(self: *const NativeTlsConnection) bool {

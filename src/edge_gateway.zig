@@ -4274,10 +4274,10 @@ test "H2 frame provenance stays sticky when frame is fragmented across early the
     const wire = [_]u8{
         // length=4, type=DATA, flags=END_STREAM, stream_id=1
         0x00, 0x00, 0x04,
-        0x00,
-        0x01,
-        0x00, 0x00, 0x00, 0x01,
-        'a', 'b', 'c', 'd',
+        0x00, 0x01, 0x00,
+        0x00, 0x00, 0x01,
+        'a',  'b',  'c',
+        'd',
     };
 
     var harness = H2FrameReadProvenanceHarness{
@@ -4286,7 +4286,7 @@ test "H2 frame provenance stays sticky when frame is fragmented across early the
         .early_prefix_len = 11,
         .max_chunk = 2,
     };
-    var inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFdAndProvenance(
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFdAndProvenance(
         harness.stream(),
         -1,
         &harness,
@@ -4300,7 +4300,7 @@ test "H2 frame provenance stays sticky when frame is fragmented across early the
     defer http.http2_frame.deinitFrame(allocator, &frame);
 
     try std.testing.expect(h2LastReadTransportEarly(&conn));
-    try std.testing.expectEqual(http.http2_frame.FrameType.data, frame.typ);
+    try std.testing.expectEqual(http.http2_frame.Type.data, frame.typ);
     try std.testing.expectEqual(@as(u31, 1), frame.stream_id);
     try std.testing.expectEqualStrings("abcd", frame.payload);
 }

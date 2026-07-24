@@ -530,6 +530,11 @@ pub const PureZigRecordStream = struct {
         return self.lifecycle == .open and self.bridge.handshake_complete;
     }
 
+    pub fn currentReadTransportEarly(self: *const PureZigRecordStream) bool {
+        _ = self;
+        return false;
+    }
+
     /// Require the peer to negotiate exactly `protocol`. Configure this before
     /// the handshake starts; the value is copied because caller storage need
     /// not outlive construction.

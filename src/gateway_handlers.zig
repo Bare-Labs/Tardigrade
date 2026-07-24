@@ -82,17 +82,13 @@ pub fn resolveRoutePath(
     return .unmatched;
 }
 
-fn methodEarlyDataSafe(method: http.Method) bool {
-    return http.early_data.methodSafe(method.toString());
-}
-
 fn routeReplaySafe(block: *const http.location_router.LocationBlock) bool {
     return block.early_data == .replay_safe;
 }
 
 fn locationEarlyDataDecision(
     early_ctx: http.request_context.EarlyDataContext,
-    method: http.Method,
+    method_safe: bool,
     block: *const http.location_router.LocationBlock,
 ) http.early_data.Decision {
     if (block.auth == .required) return .too_early;
@@ -101,7 +97,7 @@ fn locationEarlyDataDecision(
             .replay_exposed = early_ctx.replayExposed(),
             .transport_early = early_ctx.transport_early,
             .inbound_marker = early_ctx.inbound_marker,
-            .method_safe = methodEarlyDataSafe(method),
+            .method_safe = method_safe,
             .route_replay_safe = routeReplaySafe(block),
             .action_class = .local,
             .proxy_origin_rfc8470 = false,
@@ -110,7 +106,7 @@ fn locationEarlyDataDecision(
             .replay_exposed = early_ctx.replayExposed(),
             .transport_early = early_ctx.transport_early,
             .inbound_marker = early_ctx.inbound_marker,
-            .method_safe = methodEarlyDataSafe(method),
+            .method_safe = method_safe,
             .route_replay_safe = routeReplaySafe(block),
             .action_class = .proxy,
             .proxy_origin_rfc8470 = block.proxy_early_data == .rfc8470,
@@ -133,14 +129,24 @@ pub fn earlyDataDecisionForRequest(
     path: []const u8,
     has_body_framing: bool,
 ) http.early_data.Decision {
+    return earlyDataDecisionForRawMethod(cfg, early_ctx, method.toString(), path, has_body_framing);
+}
+
+pub fn earlyDataDecisionForRawMethod(
+    cfg: *const edge_config.EdgeConfig,
+    early_ctx: http.request_context.EarlyDataContext,
+    method: []const u8,
+    path: []const u8,
+    has_body_framing: bool,
+) http.early_data.Decision {
     if (!early_ctx.replayExposed()) return .ordinary;
     if (has_body_framing) return .too_early;
     if (isTranscriptRoutePath(path)) return .too_early;
-    if (hasMatchingMirrorRule(cfg.mirror_rules, method.toString(), path)) return .too_early;
+    if (hasMatchingMirrorRule(cfg.mirror_rules, method, path)) return .too_early;
 
     return switch (resolveRoutePath(cfg.metrics_path, cfg.location_blocks, path)) {
         .reload_status, .metrics, .unmatched => .too_early,
-        .location => |matched| locationEarlyDataDecision(early_ctx, method, matched.block),
+        .location => |matched| locationEarlyDataDecision(early_ctx, http.early_data.methodSafe(method), matched.block),
     };
 }
 
@@ -1699,6 +1705,7 @@ fn handleHttp3LocationProxyPass(
     request_query: ?[]const u8,
     target: []const u8,
     correlation_id: []const u8,
+    forward_early_data: bool,
 ) !void {
     const resolved = try resolveProxyTarget(allocator, ctx.cfg.upstream_base_url, target, proxySuffixPathForLocation(request_path, matched, ctx.cfg.location_blocks));
     defer allocator.free(resolved.url);
@@ -1721,7 +1728,7 @@ fn handleHttp3LocationProxyPass(
         null,
         null,
         null,
-        false,
+        forward_early_data,
         ctx.cfg.upstream_timeout_ms,
         ctx.cfg.upstream_connect_timeout_ms,
         ctx.cfg.upstream_response_timeout_ms,
@@ -1892,14 +1899,14 @@ fn routeHttp3Location(
         ctx.state.metricsRecordEarlyDataRequest(.h3, source);
     }
 
-    const method = http.Method.parse(request.method) orelse .GET;
-    const decision = earlyDataDecisionForRequest(
+    const decision = earlyDataDecisionForRawMethod(
         ctx.cfg,
         early_ctx,
-        method,
+        request.method,
         request_path,
         request.body.len != 0,
     );
+    const forward_early_data = decision == .forward_rfc8470;
     switch (decision) {
         .execute_local => {
             ctx.state.metricsRecordEarlyDataDecision(.h3, .accepted);
@@ -1933,7 +1940,7 @@ fn routeHttp3Location(
     }
     switch (matched.block.action) {
         .proxy_pass => |target| {
-            try handleHttp3LocationProxyPass(allocator, request, response, ctx, matched, request_path, request_query, target, correlation_id);
+            try handleHttp3LocationProxyPass(allocator, request, response, ctx, matched, request_path, request_query, target, correlation_id, forward_early_data);
             return .handled;
         },
         .return_response => |ret| {
@@ -2089,6 +2096,49 @@ test "routeHttp3Location accepts replay-safe current-hop transport provenance" {
     defer allocator.free(prom);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_requests_total{protocol=\"h3\",source=\"transport\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h3\",decision=\"accepted\"} 1") != null);
+}
+
+test "routeHttp3Location rejects unknown replay-exposed methods before action execution" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/safe",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "side-effect" } },
+        .early_data = .replay_safe,
+    }};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "FOO"),
+        .path = try allocator.dupe(u8, "/safe"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .transport_early = true,
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    const outcome = try routeHttp3Location(allocator, &request, &response, &dispatch_ctx, "/safe", "h3-unknown-method");
+
+    try std.testing.expectEqual(std.meta.Tag(Http3LocationOutcome).handled, std.meta.activeTag(outcome));
+    try std.testing.expectEqual(@as(u16, 425), @intFromEnum(response.status));
+    try std.testing.expect(std.mem.indexOf(u8, response.body orelse "", "side-effect") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body orelse "", "\"code\":\"too_early\"") != null);
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h3\",decision=\"too_early\"} 1") != null);
 }
 
 test "routeHttp3Location replay-safe acceptance handles combined prior-hop and current-hop provenance" {

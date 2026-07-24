@@ -565,6 +565,7 @@ pub const Connection = struct {
     streams: ?quic_stream.StreamManager = null,
     send_queues: std.AutoHashMap(StreamId, *SendQueue),
     known_streams: std.AutoHashMap(StreamId, void),
+    stream_transport_early: std.AutoHashMap(StreamId, void),
     accept_queue: std.ArrayList(StreamId) = .empty,
 
     crypto_tx: [3]CryptoTx = .{ .{}, .{}, .{} },
@@ -644,6 +645,7 @@ pub const Connection = struct {
             .peer_cids = quic_cid.PeerCidPool.init(params.active_connection_id_limit),
             .send_queues = std.AutoHashMap(StreamId, *SendQueue).init(allocator),
             .known_streams = std.AutoHashMap(StreamId, void).init(allocator),
+            .stream_transport_early = std.AutoHashMap(StreamId, void).init(allocator),
             .last_activity_us = options.now_us,
         };
         // Construct the handshake before `errdefer conn.deinitPartial()` is
@@ -722,6 +724,7 @@ pub const Connection = struct {
         }
         self.send_queues.deinit();
         self.known_streams.deinit();
+        self.stream_transport_early.deinit();
         self.accept_queue.deinit(self.allocator);
         for (&self.crypto_tx) |*tx| tx.deinit(self.allocator);
         self.sent_records.deinit(self.allocator);
@@ -841,11 +844,6 @@ pub const Connection = struct {
                 self.handleRetry(bytes, parsed, now_us);
                 return;
             },
-            .zero_rtt => {
-                // 0-RTT is disabled (config default); nothing can decrypt it.
-                self.dropPacket(.undecryptable, bytes.len);
-                return;
-            },
             else => {},
         }
         if (parsed.kind != .one_rtt and parsed.version != packet.quic_v1) {
@@ -860,6 +858,7 @@ pub const Connection = struct {
         const level: EncryptionLevel = switch (parsed.kind) {
             .initial => .initial,
             .handshake => .handshake,
+            .zero_rtt => .zero_rtt,
             .one_rtt => .application,
             else => unreachable,
         };
@@ -1017,7 +1016,7 @@ pub const Connection = struct {
                 self.afterHandshakeProgress(now_us);
             },
             .stream => |sf| {
-                if (level != .application) {
+                if (level != .application and level != .zero_rtt) {
                     self.startClose(.{ .error_code = error_protocol_violation, .is_application = false, .local = true }, "stream frame level", now_us);
                     return;
                 }
@@ -1030,6 +1029,9 @@ pub const Connection = struct {
                     self.closeOnStreamError(err, now_us);
                     return;
                 };
+                if (level == .zero_rtt) {
+                    try self.stream_transport_early.put(sf.id, {});
+                }
                 if (!known) {
                     try self.known_streams.put(sf.id, {});
                     if (quic_stream.streamInitiator(sf.id) != roleInitiator(self.role)) {
@@ -1823,8 +1825,8 @@ pub const Connection = struct {
         return self.accept_queue.orderedRemove(0);
     }
 
-    pub fn streamTransportEarly(self: *const Connection, _: StreamId) bool {
-        return self.tls.earlyDataAccepted() and !self.handshake_complete;
+    pub fn streamTransportEarly(self: *const Connection, id: StreamId) bool {
+        return self.stream_transport_early.contains(id);
     }
 
     pub fn resetStream(self: *Connection, id: StreamId, app_error_code: u64) !void {
@@ -2791,6 +2793,26 @@ test "driver: bidirectional stream data round-trips with FIN" {
 
     try testing.expectEqual(quic_stream.StreamState.closed, pair.client.streamState(id).?);
     try testing.expectEqual(quic_stream.StreamState.closed, pair.server.streamState(id).?);
+}
+
+test "driver: accepted zero-rtt stream provenance stays sticky after one-rtt data" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id: StreamId = 0;
+    try pair.server.applyFrame(.zero_rtt, .{ .stream = .{ .id = id, .offset = 0, .data = "early" } }, pair.now_us);
+    try testing.expect(pair.server.streamTransportEarly(id));
+
+    try pair.server.applyFrame(.application, .{ .stream = .{ .id = id, .offset = 5, .data = "-late", .fin = true } }, pair.now_us);
+    try testing.expect(pair.server.streamTransportEarly(id));
+    try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
+
+    var buf: [32]u8 = undefined;
+    const request = try pair.server.readStream(id, &buf);
+    try testing.expectEqualStrings("early-late", buf[0..request.len]);
+    try testing.expect(request.fin);
 }
 
 test "driver: server NewSessionTicket uses application CRYPTO retransmission and stream traffic continues" {

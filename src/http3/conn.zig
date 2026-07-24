@@ -382,6 +382,7 @@ pub fn Conn(comptime Transport: type) type {
                 var qpack_scratch: [4096]u8 = undefined;
                 while (true) {
                     const result = transport.readStream(id, &buf) catch break;
+                    request.transport_early = request.transport_early or transportStreamTransportEarly(transport, id);
                     if (result.len > 0) {
                         _ = request.stream.ingestBytes(buf[0..result.len], &qpack_scratch) catch {
                             return self.fail(.message_error);
