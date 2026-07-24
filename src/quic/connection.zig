@@ -1823,6 +1823,10 @@ pub const Connection = struct {
         return self.accept_queue.orderedRemove(0);
     }
 
+    pub fn streamTransportEarly(self: *const Connection, _: StreamId) bool {
+        return self.tls.earlyDataAccepted() and !self.handshake_complete;
+    }
+
     pub fn resetStream(self: *Connection, id: StreamId, app_error_code: u64) !void {
         var manager = self.streamManager() orelse return error.NotEstablished;
         const reset = try manager.sendResetStream(id, app_error_code);

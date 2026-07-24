@@ -25,6 +25,7 @@ pub const StreamRequest = struct {
     authority: ?[]u8,
     headers: Headers,
     body: []u8,
+    transport_early: bool = false,
 
     pub fn deinit(self: *StreamRequest) void {
         self.allocator.free(self.method);
@@ -104,6 +105,7 @@ pub const StreamAssembler = struct {
             .authority = if (self.authority) |authority| try self.allocator.dupe(u8, authority) else null,
             .headers = headers,
             .body = try self.body.toOwnedSlice(self.allocator),
+            .transport_early = false,
         };
     }
 };

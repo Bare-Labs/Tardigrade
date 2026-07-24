@@ -109,7 +109,15 @@ pub fn Conn(comptime Transport: type) type {
         const ServerRequest = struct {
             stream: session.RequestStream,
             finished: bool = false,
+            transport_early: bool = false,
         };
+
+        fn transportStreamTransportEarly(transport: *Transport, stream_id: u64) bool {
+            if (comptime @hasDecl(Transport, "streamTransportEarly")) {
+                return transport.streamTransportEarly(stream_id);
+            }
+            return false;
+        }
 
         const ClientResponse = struct {
             buffer: std.ArrayList(u8) = .empty,
@@ -266,7 +274,10 @@ pub fn Conn(comptime Transport: type) type {
                     self.pending_uni.put(id, .{}) catch return error.OutOfMemory;
                 } else if (self.role == .server) {
                     const request = self.allocator.create(ServerRequest) catch return error.OutOfMemory;
-                    request.* = .{ .stream = session.RequestStream.init(self.allocator, id) };
+                    request.* = .{
+                        .stream = session.RequestStream.init(self.allocator, id),
+                        .transport_early = transportStreamTransportEarly(transport, id),
+                    };
                     self.requests.put(id, request) catch {
                         request.stream.deinit();
                         self.allocator.destroy(request);
@@ -518,6 +529,7 @@ pub fn Conn(comptime Transport: type) type {
         pub const IncomingRequest = struct {
             stream_id: u64,
             exchange: stream_transport.Exchange,
+            transport_early: bool,
         };
 
         /// Pop the next fully received request. The exchange borrows the
@@ -529,7 +541,11 @@ pub fn Conn(comptime Transport: type) type {
                 if (!request.finished or request.stream.finished) continue;
                 const exchange = request.stream.finish() catch return self.fail(.message_error);
                 self.metrics.requests_decoded += 1;
-                return .{ .stream_id = entry.key_ptr.*, .exchange = exchange };
+                return .{
+                    .stream_id = entry.key_ptr.*,
+                    .exchange = exchange,
+                    .transport_early = request.transport_early,
+                };
             }
             return null;
         }

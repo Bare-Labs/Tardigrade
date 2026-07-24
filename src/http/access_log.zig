@@ -443,6 +443,28 @@ test "formatEntry json contains required fields" {
     try std.testing.expect(std.mem.find(u8, line, "\"early_data_replay_exposed\":false") != null);
 }
 
+test "formatEntry json preserves early_data_retry_result failure label" {
+    const entry = AccessLogEntry{
+        .method = "GET",
+        .path = "/retry",
+        .status = 502,
+        .latency_ms = 7,
+        .client_ip = "127.0.0.1",
+        .correlation_id = "retry-failure",
+        .upstream_addr = "http://127.0.0.1:9001",
+        .upstream_status = 425,
+        .identity = "-",
+        .user_agent = "test",
+        .bytes_sent = 0,
+        .response_bytes = 0,
+        .error_category = "upstream_unavailable",
+        .early_data_retry_result = "failure",
+    };
+    const line = try formatEntry(std.testing.allocator, .{}, entry);
+    defer std.testing.allocator.free(line);
+    try std.testing.expect(std.mem.find(u8, line, "\"early_data_retry_result\":\"failure\"") != null);
+}
+
 test "formatEntry json encodes null upstream_status as literal null" {
     const entry = AccessLogEntry{
         .method = "GET",

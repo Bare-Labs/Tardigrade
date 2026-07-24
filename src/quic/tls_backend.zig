@@ -282,7 +282,13 @@ pub const Tls13Backend = struct {
             .setServerPskResolverFn = setServerPskResolverVtable,
             .prepareNewSessionTicketFn = prepareNewSessionTicket,
             .emitPreparedNewSessionTicketFn = emitPreparedNewSessionTicket,
+            .earlyDataAcceptedFn = earlyDataAcceptedVtable,
         };
+    }
+
+    fn earlyDataAcceptedVtable(ptr: *anyopaque) bool {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.engine.earlyDataAccepted();
     }
 
     fn authPending(ptr: *anyopaque) bool {

@@ -576,6 +576,7 @@ pub const Runtime = struct {
             return;
         };
         defer request.deinit();
+            request.transport_early = incoming.transport_early;
 
         var response = response_mod.Response.init(allocator);
         defer response.deinit();

@@ -157,6 +157,15 @@ fn hasMatchingMirrorRule(
     return false;
 }
 
+fn metricsEarlyDataSource(early_ctx: http.request_context.EarlyDataContext) ?http.metrics.EarlyDataSource {
+    return switch (early_ctx.source()) {
+        .none => null,
+        .transport => .transport,
+        .header => .header,
+        .both => .both,
+    };
+}
+
 pub fn writeTooEarlyResponse(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -1874,6 +1883,48 @@ fn routeHttp3Location(
         .location => |m| m,
         .reload_status, .metrics, .unmatched => return .not_handled,
     };
+
+    const early_ctx = http.request_context.EarlyDataContext{
+        .transport_early = request.transport_early,
+        .inbound_marker = request.headers.hasEarlyDataMarker(),
+    };
+    if (metricsEarlyDataSource(early_ctx)) |source| {
+        ctx.state.metricsRecordEarlyDataRequest(.h3, source);
+    }
+
+    const method = http.Method.parse(request.method) orelse .GET;
+    const decision = earlyDataDecisionForRequest(
+        ctx.cfg,
+        early_ctx,
+        method,
+        request_path,
+        request.body.len != 0,
+    );
+    switch (decision) {
+        .execute_local => {
+            ctx.state.metricsRecordEarlyDataDecision(.h3, .accepted);
+        },
+        .forward_rfc8470 => {
+            ctx.state.metricsRecordEarlyDataDecision(.h3, .forwarded);
+        },
+        .too_early, .defer_until_handshake => {
+            ctx.state.metricsRecordEarlyDataDecision(.h3, if (decision == .defer_until_handshake) .deferred else .too_early);
+            const payload = try buildApiErrorJson(allocator, "too_early", "Too Early", correlation_id);
+            _ = response
+                .setStatus(.too_early)
+                .setBodyOwned(payload)
+                .setContentType("application/json")
+                .setHeader("cache-control", "no-store")
+                .setHeader(http.correlation.HEADER_NAME, correlation_id);
+            finalizeHttp3Response(response);
+            applyResponseHeaders(ctx.state, response);
+            ctx.state.metricsRecord(425);
+            ctx.state.metricsRecordErrorCode("too_early");
+            return .handled;
+        },
+        .ordinary => {},
+    }
+
     const split = splitHttp3PathAndQuery(request.path);
     const request_query = split[1];
     if (matched.block.auth == .required) {
@@ -1949,6 +2000,138 @@ test "routeHttp3Location rejects auth-required locations before action execution
     try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
     try std.testing.expectEqual(@as(u64, 1), state.metrics.status_4xx);
     try std.testing.expectEqual(@as(u64, 1), state.metrics.err_unauthorized);
+}
+
+test "routeHttp3Location rejects prior-hop Early-Data on ordinary 1-RTT before auth side effects" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/private",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "secret" } },
+        .early_data = .replay_safe,
+        .auth = .required,
+    }};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/private"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .transport_early = false,
+    };
+    defer request.deinit();
+    try request.headers.append("Early-Data", "1");
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    const outcome = try routeHttp3Location(allocator, &request, &response, &dispatch_ctx, "/private", "h3-early-header");
+
+    try std.testing.expectEqual(std.meta.Tag(Http3LocationOutcome).handled, std.meta.activeTag(outcome));
+    try std.testing.expectEqual(@as(u16, 425), @intFromEnum(response.status));
+    try std.testing.expect(std.mem.indexOf(u8, response.body orelse "", "\"code\":\"too_early\"") != null);
+    try std.testing.expectEqual(@as(u64, 0), state.metrics.err_unauthorized);
+
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_requests_total{protocol=\"h3\",source=\"header\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h3\",decision=\"too_early\"} 1") != null);
+}
+
+test "routeHttp3Location accepts replay-safe current-hop transport provenance" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/safe",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+        .early_data = .replay_safe,
+    }};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/safe"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .transport_early = true,
+    };
+    defer request.deinit();
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    const outcome = try routeHttp3Location(allocator, &request, &response, &dispatch_ctx, "/safe", "h3-transport");
+
+    try std.testing.expectEqual(std.meta.Tag(Http3LocationOutcome).handled, std.meta.activeTag(outcome));
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_requests_total{protocol=\"h3\",source=\"transport\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h3\",decision=\"accepted\"} 1") != null);
+}
+
+test "routeHttp3Location replay-safe acceptance handles combined prior-hop and current-hop provenance" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHandlerTestState(&state, allocator, &.{});
+    var blocks = [_]http.location_router.LocationBlock{.{
+        .match_type = .exact,
+        .pattern = "/safe",
+        .priority = 0,
+        .action = .{ .return_response = .{ .status = 200, .body = "ok" } },
+        .early_data = .replay_safe,
+    }};
+    var token_hashes = [_][]const u8{};
+    var cfg = minimalAuthConfig(blocks[0..], token_hashes[0..]);
+    var config_store: ReloadableConfigStore = undefined;
+    var dispatch_ctx = Http3DispatchContext{
+        .config_store = &config_store,
+        .cfg = &cfg,
+        .state = &state,
+    };
+    var request = http.http3_session.StreamRequest{
+        .allocator = allocator,
+        .method = try allocator.dupe(u8, "GET"),
+        .path = try allocator.dupe(u8, "/safe"),
+        .authority = null,
+        .headers = http.Headers.init(allocator),
+        .body = try allocator.alloc(u8, 0),
+        .transport_early = true,
+    };
+    defer request.deinit();
+    try request.headers.append("Early-Data", "1");
+    var response = http.Response.init(allocator);
+    defer response.deinit();
+
+    const outcome = try routeHttp3Location(allocator, &request, &response, &dispatch_ctx, "/safe", "h3-both");
+
+    try std.testing.expectEqual(std.meta.Tag(Http3LocationOutcome).handled, std.meta.activeTag(outcome));
+    try std.testing.expectEqual(@as(u16, 200), @intFromEnum(response.status));
+    const prom = try state.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_requests_total{protocol=\"h3\",source=\"both\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_decisions_total{protocol=\"h3\",decision=\"accepted\"} 1") != null);
 }
 
 fn handleHttp3Connection(

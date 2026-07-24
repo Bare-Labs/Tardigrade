@@ -20,7 +20,7 @@ Early-data access-log fields are bounded enums/booleans only:
 - `early_data_source`: `none`, `transport`, `header`, `both`
 - `early_data_action`: `ordinary`, `accepted`, `forwarded`, `too_early`,
   `deferred`, `retried`
-- `early_data_retry_result`: `none`, `success`, `too_early`, `failed`
+- `early_data_retry_result`: `none`, `success`, `too_early`, `failure`
 - `early_data_replay_exposed`: `true` when transport and/or header provenance
   indicates replay exposure for this request
 
