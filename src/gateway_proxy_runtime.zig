@@ -295,7 +295,7 @@ fn proxyPassTargetsDiffer(
     return !std.mem.eql(u8, matched_target, candidate_target);
 }
 
-fn proxyRetryAttemptLimit(configured_attempts: u32, idempotent_only: bool, method: []const u8) usize {
+pub fn proxyRetryAttemptLimit(configured_attempts: u32, idempotent_only: bool, method: []const u8) usize {
     const attempts: usize = @intCast(@max(configured_attempts, @as(u32, 1)));
     if (attempts <= 1) return 1;
     if (idempotent_only and !isHttpMethodIdempotent(method)) return 1;
@@ -827,7 +827,7 @@ const BufferedProxyRetryState = struct {
     }
 };
 
-const BufferedProxyAttemptsResult = union(enum) {
+pub const BufferedProxyAttemptsResult = union(enum) {
     response: DataPlaneProxyResponse,
     upstream_at_capacity,
     request_cancelled,
@@ -835,7 +835,7 @@ const BufferedProxyAttemptsResult = union(enum) {
     terminal_error: anyerror,
 };
 
-fn runBufferedProxyAttempts(
+pub fn runBufferedProxyAttempts(
     early_ctx: *http.request_context.EarlyDataContext,
     first_attempt_forward_early_data: bool,
     method: []const u8,

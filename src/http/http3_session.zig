@@ -1,5 +1,6 @@
 const std = @import("std");
 const Headers = @import("headers.zig").Headers;
+const request_context = @import("request_context.zig");
 const Response = @import("response.zig").Response;
 
 pub const Http3SessionError = error{
@@ -27,6 +28,7 @@ pub const StreamRequest = struct {
     body: []u8,
     transport_early: bool = false,
     downstream_handshake_complete: bool = true,
+    downstream_handshake: ?request_context.DownstreamHandshakeBarrier = null,
 
     pub fn deinit(self: *StreamRequest) void {
         self.allocator.free(self.method);
@@ -108,6 +110,7 @@ pub const StreamAssembler = struct {
             .body = try self.body.toOwnedSlice(self.allocator),
             .transport_early = false,
             .downstream_handshake_complete = true,
+            .downstream_handshake = null,
         };
     }
 };

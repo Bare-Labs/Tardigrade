@@ -578,6 +578,11 @@ pub const Runtime = struct {
         defer request.deinit();
         request.transport_early = incoming.transport_early;
         request.downstream_handshake_complete = entry.conn.isEstablished();
+        request.downstream_handshake = .{
+            .ctx = entry.conn,
+            .is_complete_fn = h3DownstreamHandshakeComplete,
+            .wait_or_drive_fn = h3DownstreamWaitOrDriveHandshake,
+        };
 
         var response = response_mod.Response.init(allocator);
         defer response.deinit();
@@ -616,6 +621,16 @@ pub const Runtime = struct {
         if (sent >= 0 and @as(usize, @intCast(sent)) == datagram.len) {
             self.notePacketOut(datagram.len);
         }
+    }
+
+    fn h3DownstreamHandshakeComplete(ctx: *anyopaque) bool {
+        const conn: *Connection = @ptrCast(@alignCast(ctx));
+        return conn.isEstablished();
+    }
+
+    fn h3DownstreamWaitOrDriveHandshake(ctx: *anyopaque) anyerror!void {
+        const conn: *Connection = @ptrCast(@alignCast(ctx));
+        conn.driveAuthentication(nowUs());
     }
 
     /// #488: best-effort, exactly-once post-handshake ticket issuance for
