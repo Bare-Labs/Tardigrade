@@ -143,6 +143,14 @@ pub const NativeTlsConnection = struct {
         /// resumption fully disabled: no resolver is installed and no
         /// ticket is ever issued.
         resumption_runtime: ?*tls.resumption_runtime.Runtime = null,
+        /// #368 Slice 2: process-shared anti-replay gate, borrowed for the
+        /// lifetime of this connection and installed independently of
+        /// `resumption_runtime` — without a PSK resolver early data can
+        /// never be attempted anyway, but installing this gate does not
+        /// itself depend on that. `null` (the default) leaves the backend's
+        /// own default gate in place, which fails closed (`.unavailable`)
+        /// for any 0-RTT attempt.
+        early_data_replay_gate: ?tls_backend.EarlyDataReplayGate = null,
     };
 
     allocator: std.mem.Allocator,
@@ -206,6 +214,12 @@ pub const NativeTlsConnection = struct {
             if (runtime.serverResolver()) |resolver| {
                 backend.setServerPskResolver(resolver) catch unreachable;
             }
+        }
+        // #368 Slice 2: independent of `resumption_runtime` above — this is
+        // the same process-scoped store shared with every other native TCP
+        // worker and QUIC/H3, not a per-connection concern.
+        if (options.early_data_replay_gate) |gate| {
+            backend.setEarlyDataReplayGate(gate) catch unreachable;
         }
 
         const record = try allocator.create(encrypted_stream.PureZigRecordStream);
@@ -630,6 +644,32 @@ test "native TLS createWithOptions installs the shared server resolver when conf
 
     try std.testing.expect(conn.backend.psk_resolver != null);
     try std.testing.expectEqual(@as(?*tls.resumption_runtime.Runtime, &runtime), conn.resumption_runtime);
+}
+
+test "native TLS createWithOptions installs the shared early-data replay gate independently of the resumption runtime" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+    const fds = try testSocketPair();
+    defer closeFd(fds[1]);
+
+    var store = try tls.early_data_replay.LocalStore.init(std.testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    var adapter = tls.early_data_replay.GateAdapter.init(store.store());
+    const gate = adapter.gate();
+
+    // No `resumption_runtime` supplied: the replay gate must still install,
+    // proving it is not gated on resumption plumbing.
+    const conn = try NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .early_data_replay_gate = gate },
+    );
+    defer conn.destroy();
+
+    try std.testing.expectEqual(gate.ctx, conn.backend.early_data_replay_gate.ctx);
+    try std.testing.expectEqual(gate.decideFn, conn.backend.early_data_replay_gate.decideFn);
 }
 
 test "native TLS without a resumption runtime never attempts ticket issuance" {

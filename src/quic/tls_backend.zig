@@ -31,6 +31,9 @@ pub const testdata = shared.testdata;
 pub const EarlyDataCompatibilityCandidate = shared.EarlyDataCompatibilityCandidate;
 pub const EarlyDataCompatibilityDecision = shared.EarlyDataCompatibilityDecision;
 pub const EarlyDataCompatibilityGate = shared.EarlyDataCompatibilityGate;
+pub const EarlyDataReplayCandidate = shared.EarlyDataReplayCandidate;
+pub const EarlyDataReplayDecision = shared.EarlyDataReplayDecision;
+pub const EarlyDataReplayGate = shared.EarlyDataReplayGate;
 
 const ext_quic_transport_parameters: u16 = @intFromEnum(tls_core.algorithms.ExtensionType.quic_transport_parameters);
 const tp_max_idle_timeout: u64 = 0x01;
@@ -378,6 +381,13 @@ pub const Tls13Backend = struct {
 
     pub fn setEarlyDataCompatibilityGate(self: *Tls13Backend, gate: EarlyDataCompatibilityGate) HandshakeError!void {
         self.engine.setEarlyDataCompatibilityGate(gate) catch |err| return mapError(err);
+    }
+
+    /// #368 Slice 2: installs the process-shared anti-replay gate on the
+    /// shared engine — the same seam native TCP uses — so QUIC/H3 can never
+    /// fall back to worker-local replay bookkeeping.
+    pub fn setEarlyDataReplayGate(self: *Tls13Backend, gate: EarlyDataReplayGate) HandshakeError!void {
+        self.engine.setEarlyDataReplayGate(gate) catch |err| return mapError(err);
     }
 
     pub fn setResumptionDecisionObserver(self: *Tls13Backend, observer: shared.Tls13Backend.ResumptionDecisionObserver) HandshakeError!void {

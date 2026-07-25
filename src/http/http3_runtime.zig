@@ -60,6 +60,13 @@ pub const Config = struct {
     /// fully disabled for QUIC/H3: no resolver is installed on any accepted
     /// connection and no ticket is ever issued.
     resumption_runtime: ?*tls_core.resumption_runtime.Runtime = null,
+    /// #368 Slice 2: borrowed process-shared anti-replay gate, the same
+    /// instance shared with the native TCP TLS path — installed
+    /// independently of `resumption_runtime` on every accepted connection's
+    /// backend so QUIC/H3 can never fall back to worker-local replay
+    /// bookkeeping. `null` (the default) leaves the backend's own default
+    /// gate in place, which fails closed (`.unavailable`) for 0-RTT.
+    early_data_replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate = null,
     tls_min_version: []const u8 = "1.3",
     tls_max_version: []const u8 = "1.3",
     enable_0rtt: bool = false,
@@ -160,6 +167,7 @@ pub const Runtime = struct {
     request_handler_ctx: ?*anyopaque,
     credential_provider: ?tls_core.credentials.CredentialProvider,
     resumption_runtime: ?*tls_core.resumption_runtime.Runtime,
+    early_data_replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
     quic_config: quic.config.Config,
     h3_settings: http3.frame.Settings,
     h3_application_compat: [http3.early_data.encoded_snapshot_len]u8 = undefined,
@@ -197,6 +205,7 @@ pub const Runtime = struct {
             .request_handler_ctx = cfg.request_handler_ctx,
             .credential_provider = cfg.credential_provider,
             .resumption_runtime = cfg.resumption_runtime,
+            .early_data_replay_gate = cfg.early_data_replay_gate,
             .quic_config = quicConfigFrom(cfg),
             .h3_settings = cfg.h3_settings,
             .early_data_compat_metrics_ctx = cfg.early_data_compat_metrics_ctx,
@@ -477,6 +486,15 @@ pub const Runtime = struct {
                     return null;
                 };
             }
+        }
+        // #368 Slice 2: independent of `resumption_runtime` above — the
+        // same process-scoped replay store shared with every native TCP
+        // worker, not a per-connection or per-protocol concern.
+        if (self.early_data_replay_gate) |gate| {
+            backend.setEarlyDataReplayGate(gate) catch {
+                allocator.destroy(backend);
+                return null;
+            };
         }
 
         const conn = Connection.init(allocator, .{
@@ -1368,6 +1386,31 @@ test "runtime borrows the resumption runtime and installs it per accepted connec
     defer runtime.deinit();
 
     try testing.expectEqual(@as(?*tls_core.resumption_runtime.Runtime, &resumption), runtime.resumption_runtime);
+}
+
+test "runtime borrows the early-data replay gate independently of the resumption runtime" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-replay-gate-test");
+
+    var store = try tls_core.early_data_replay.LocalStore.init(testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    var adapter = tls_core.early_data_replay.GateAdapter.init(store.store());
+    const gate = adapter.gate();
+
+    // No `resumption_runtime` supplied: the replay gate must still install,
+    // proving it is not gated on resumption plumbing.
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .early_data_replay_gate = gate,
+    });
+    defer runtime.deinit();
+
+    const installed = runtime.early_data_replay_gate orelse return error.TestExpectedEqual;
+    try testing.expectEqual(gate.ctx, installed.ctx);
+    try testing.expectEqual(gate.decideFn, installed.decideFn);
 }
 
 test {

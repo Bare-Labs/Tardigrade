@@ -281,6 +281,19 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         if (native_resumption_runtime) |*rt| rt.setObserver(nativeResumptionMetricsObserver(&state));
     }
     defer if (native_resumption_runtime) |*rt| rt.deinit();
+    // #368 Slice 2: one process-scoped anti-replay store, shared by every
+    // native TCP worker and the QUIC/H3 runtime — independent of whether
+    // native resumption is enabled above, since Slice 3 owns the switch
+    // that actually lets native 0-RTT be attempted. Declared ahead of
+    // every borrower below for the same teardown-ordering reason as
+    // `native_resumption_runtime`.
+    var native_early_data_replay_store = initNativeEarlyDataReplayStore(state_allocator, @intCast(compat.milliTimestamp())) catch |err| {
+        state.logger.err(null, "native TLS/QUIC early-data replay store initialization failed ({s}); refusing to start", .{@errorName(err)});
+        return err;
+    };
+    defer native_early_data_replay_store.deinit();
+    var native_early_data_replay_gate_adapter = tls_core.early_data_replay.GateAdapter.init(native_early_data_replay_store.store());
+    const native_early_data_replay_gate = native_early_data_replay_gate_adapter.gate();
     var http3_dispatch_ctx = ghandlers.Http3DispatchContext{
         .config_store = &config_store,
         .cfg = cfg,
@@ -382,6 +395,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .quic_port = cfg.quic_port,
             .credential_provider = h3_credential_provider,
             .resumption_runtime = if (native_resumption_runtime) |*rt| rt else null,
+            .early_data_replay_gate = native_early_data_replay_gate,
             .tls_min_version = "1.3",
             .tls_max_version = "1.3",
             .enable_0rtt = cfg.http3_enable_0rtt,
@@ -422,6 +436,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .native_credentials = if (native_credentials) |*store| store else null,
         .native_tls_provider = native_tls_provider,
         .resumption_runtime = if (native_resumption_runtime) |*rt| rt else null,
+        .early_data_replay_gate = native_early_data_replay_gate,
         .session_pool = undefined,
         .event_loop = &event_loop,
         .active = undefined,
@@ -1161,7 +1176,11 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
             client_fd,
             tls_protocol_policy,
             native_provider,
-            .{ .buffer_limits = cfg.tls_buffer_limits, .resumption_runtime = ctx.resumption_runtime },
+            .{
+                .buffer_limits = cfg.tls_buffer_limits,
+                .resumption_runtime = ctx.resumption_runtime,
+                .early_data_replay_gate = ctx.early_data_replay_gate,
+            },
         ) catch |err| {
             ctx.state.logger.warn(null, "native tls connection setup failed: {}", .{err});
             return;
@@ -1386,6 +1405,26 @@ fn deadlineFromNow(now_ms: u64, timeout_ms: u32) u64 {
 /// the monotonic clock the event loop otherwise uses.
 fn systemNowUnixMs(_: *anyopaque) i64 {
     return compat.milliTimestamp();
+}
+
+/// #368 Slice 2: constructs the single process-scoped replay store `run`
+/// installs into every native TLS backend that can accept early data.
+/// Bounded defaults only (`Limits{}`) — mode/max-entries configuration and
+/// metrics are Slice 3. The startup-quarantine window reuses
+/// `ServerEarlyDataPolicy`'s default age-skew tolerance so it is never
+/// shorter than the freshness window Slice 3's eventually-configured policy
+/// will use (RFC 9846 §8.2: the recording window must not overlap startup
+/// history the store no longer has).
+fn initNativeEarlyDataReplayStore(
+    allocator: std.mem.Allocator,
+    now_unix_ms: u64,
+) tls_core.early_data_replay.LocalStore.InitError!tls_core.early_data_replay.LocalStore {
+    return tls_core.early_data_replay.LocalStore.init(
+        allocator,
+        .{},
+        (tls_core.tls13_backend.ServerEarlyDataPolicy{}).age_skew_tolerance_ms,
+        now_unix_ms,
+    );
 }
 
 fn reapActiveConnections(
@@ -4379,6 +4418,82 @@ fn gatewayTestWriteFd(fd: std.posix.fd_t, bytes: []const u8) tls_core.encrypted_
         return error.SocketWriteFailed;
     }
     return @intCast(rc);
+}
+
+test "#368 Slice 2: initNativeEarlyDataReplayStore rejects 0-RTT for the startup quarantine window then accepts fresh claims" {
+    // Exercises the exact helper `run()` calls to build the process-scoped
+    // replay store, proving the production composition path — not a
+    // reimplementation of it — rejects 0-RTT while the recording window
+    // still overlaps startup and accepts a genuinely fresh claim afterward.
+    const start_unix_ms: u64 = 1_000_000;
+    var store = try initNativeEarlyDataReplayStore(std.testing.allocator, start_unix_ms);
+    defer store.deinit();
+
+    const quarantine_duration_ms = (tls_core.tls13_backend.ServerEarlyDataPolicy{}).age_skew_tolerance_ms;
+    var key: tls_core.early_data_replay.Key = [_]u8{0} ** 32;
+    key[0] = 7;
+
+    try std.testing.expectEqual(
+        tls_core.early_data_replay.ClaimResult.unavailable,
+        store.claim(.{ .key = key, .retain_until_unix_ms = start_unix_ms + quarantine_duration_ms + 60_000 }, start_unix_ms),
+    );
+    try std.testing.expectEqual(@as(usize, 0), store.count());
+
+    try std.testing.expectEqual(
+        tls_core.early_data_replay.ClaimResult.accepted,
+        store.claim(
+            .{ .key = key, .retain_until_unix_ms = start_unix_ms + quarantine_duration_ms + 60_000 },
+            start_unix_ms + quarantine_duration_ms,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), store.count());
+}
+
+test "#368 Slice 2: one process-scoped early-data replay store is shared by native TCP and QUIC/H3" {
+    // Proves the exact composition-root pattern `run()` uses: one
+    // `LocalStore`/`GateAdapter` pair, its `.gate()` installed into both a
+    // native TCP `NativeTlsConnection` and an `http3_runtime.Runtime` — the
+    // same store instance, not a worker-local or protocol-local copy.
+    var store = try initNativeEarlyDataReplayStore(std.testing.allocator, 0);
+    defer store.deinit();
+    var adapter = tls_core.early_data_replay.GateAdapter.init(store.store());
+    const gate = adapter.gate();
+
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+
+    const fds = try gatewayTestSocketPair();
+    defer gatewayTestCloseFd(fds[0]);
+    defer gatewayTestCloseFd(fds[1]);
+    const native = try http.native_tls_connection.NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .early_data_replay_gate = gate },
+    );
+    defer native.destroy();
+
+    var logger = http.logger.Logger.init(.err, "replay-store-shared-test");
+    var h3_runtime = try http.http3_runtime.Runtime.init(std.testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .early_data_replay_gate = gate,
+    });
+    defer h3_runtime.deinit();
+
+    try std.testing.expectEqual(gate.ctx, native.backend.early_data_replay_gate.ctx);
+    const h3_installed = h3_runtime.early_data_replay_gate orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(gate.ctx, h3_installed.ctx);
+    // Same underlying `LocalStore`, proven behaviorally too: a claim made
+    // through the TCP-installed gate is visible to the H3-installed one.
+    const candidate: tls_core.tls13_backend.EarlyDataReplayCandidate = .{
+        .ticket_identity_fingerprint = [_]u8{5} ** 32,
+        .retain_until_unix_ms = std.math.maxInt(u64),
+    };
+    try std.testing.expectEqual(tls_core.tls13_backend.EarlyDataReplayDecision.allow, native.backend.early_data_replay_gate.decideFn.?(native.backend.early_data_replay_gate.ctx, candidate));
+    try std.testing.expectEqual(tls_core.tls13_backend.EarlyDataReplayDecision.replay, h3_installed.decideFn.?(h3_installed.ctx, candidate));
 }
 
 // Pull gateway_handlers (and its transitive imports, including
