@@ -1,14 +1,16 @@
-//! #369 Slice 2: process-level 0-RTT replay / anti-replay / 425 assurance —
-//! the gateway/HTTP-dispatch half. `src/tls/tls13_backend_tests.zig` proves
-//! the TLS/replay-store layer (accept, duplicate, capacity, quarantine,
-//! cross-worker sharing, no-gate-configured) with real production TLS and
-//! replay-store code. This file goes one layer further: it drives the real
-//! `gateway_proxy_runtime.runBufferedProxyAttempts` retry/425 state machine
-//! and the real production TCP HTTP client
-//! (`gateway_proxy_runtime.executeBufferedDataPlaneProxyRequest`) against
-//! an actual loopback upstream test server with an atomic execution
-//! counter — not a scripted attempt executor — so a real `425 Too Early`
-//! response and a real retry are what get proven, not a stand-in.
+//! #369 Slice 2: process-level 0-RTT replay / 425 assurance — the real
+//! upstream-retry half. `src/tls/tls13_backend_tests.zig` proves the TLS/
+//! replay-store layer with real production TLS and replay-store code, and
+//! `edge_gateway.zig` proves the real H1 orchestration/dispatch-gating and
+//! composition-decision scenarios (both need production code these files
+//! cannot see — orchestration internals and the replay-store composition
+//! helpers are private to `edge_gateway.zig`). This file's scenario needs
+//! neither: it drives the real `gateway_proxy_runtime.runBufferedProxyAttempts`
+//! retry/425 state machine and the real production TCP HTTP client
+//! (`gateway_proxy_runtime.executeBufferedDataPlaneProxyRequest`) against an
+//! actual loopback upstream test server with an atomic execution counter —
+//! not a scripted attempt executor — so a real `425 Too Early` response and
+//! a real retry are what get proven, not a stand-in.
 //!
 //! `ProductionBufferedProxyAttemptExecutor` in `gateway_proxy_runtime.zig`
 //! is the real production executor, but it is wired to a full
@@ -29,11 +31,9 @@
 //! test-local.
 
 const std = @import("std");
-const tls_core = @import("tls_core");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
-const ghandlers = @import("gateway_handlers.zig");
 
 const testing = std.testing;
 
@@ -41,8 +41,10 @@ const testing = std.testing;
 // A real loopback upstream test server with an atomic execution counter.
 // Mirrors the raw blocking-listener fixture already used by
 // `gateway_proxy.zig`'s "connectBlockingTcp + exchange round-trips a real
-// TCP origin" test (bind on an ephemeral port, accept on a thread), rather
-// than inventing a new one.
+// TCP origin" test (bind on an ephemeral port, accept on a thread), but
+// bounded throughout with `poll` so a regression that this test is meant
+// to catch (e.g. the retry never happening) makes the *test* fail with a
+// useful assertion instead of hanging `zig build test`/CI forever.
 // ---------------------------------------------------------------------
 
 const EphemeralListener = struct {
@@ -73,14 +75,29 @@ fn bindEphemeralLoopbackListener() !EphemeralListener {
     return .{ .fd = listen_fd, .port = port };
 }
 
+/// Polls `fd` for readability with a bounded timeout. Never blocks forever:
+/// returns `false` on timeout or a poll error, both of which the caller
+/// must treat as "give up", not "keep waiting".
+fn pollReadable(fd: std.posix.fd_t, timeout_ms: i32) bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const n = std.posix.poll(&fds, timeout_ms) catch return false;
+    return n > 0 and (fds[0].revents & std.posix.POLL.IN) != 0;
+}
+
 /// Bounded, non-secret record of what the real origin observed per
 /// connection — case ID, execution count, and whether each request carried
 /// the real `Early-Data: 1` header — never request bodies or ticket/PSK
-/// material (there is none here to leak).
+/// material (there is none here to leak). Only `stop` is written from the
+/// main test thread; everything else is written by the responder thread
+/// and must only be read by the main thread *after* `Thread.join` has
+/// returned, which is the real happens-before relationship this file
+/// relies on (see the test below) rather than relying on these fields
+/// being atomic.
 const OriginState = struct {
     executed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     connections_seen: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     early_header_seen: [4]bool = .{ false, false, false, false },
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 fn requestHasEarlyDataHeader(raw: []const u8) bool {
@@ -90,24 +107,64 @@ fn requestHasEarlyDataHeader(raw: []const u8) bool {
     return std.mem.indexOf(u8, lower_buf[0..n], "early-data: 1") != null;
 }
 
-/// Real blocking origin: accepts up to `max_connections` sequential
-/// connections (the buffered HTTP client always sends `Connection: close`
-/// bound responses here, so each attempt is a fresh TCP connection). Any
-/// request that actually carries `Early-Data: 1` is answered with a real
-/// `425 Too Early` and does **not** increment `executed` — modeling an
-/// origin that itself enforces RFC 8470 and refuses to treat early data as
-/// a safe side-effecting request. Any other request executes normally.
+/// Bounded wait for one inbound connection: polls in small slices, checking
+/// `state.stop` between them, up to `max_wait_ms` total. Returns `null`
+/// (never blocks indefinitely) if `stop` is requested or the deadline
+/// passes without a peer connecting — the caller must treat that as "no
+/// more connections are coming," not retry forever.
+fn acceptBounded(listen_fd: std.posix.fd_t, state: *OriginState, max_wait_ms: i64) ?std.posix.fd_t {
+    const poll_slice_ms = 25;
+    var waited_ms: i64 = 0;
+    while (waited_ms < max_wait_ms) : (waited_ms += poll_slice_ms) {
+        if (state.stop.load(.acquire)) return null;
+        if (pollReadable(listen_fd, poll_slice_ms)) {
+            const conn = std.c.accept(listen_fd, null, null);
+            if (conn < 0) return null;
+            return conn;
+        }
+    }
+    return null;
+}
+
+/// Reads one HTTP request head from `conn`, bounded both in time (via
+/// `pollReadable`) and in size (`buf.len`). Returns the bytes read so far
+/// on any of: seeing the `\r\n\r\n` head terminator, a read timeout, EOF,
+/// or a full buffer — never blocks indefinitely on a peer that stops
+/// sending mid-request.
+fn readRequestHeadBounded(conn: std.posix.fd_t, buf: []u8) []const u8 {
+    var total: usize = 0;
+    while (total < buf.len) {
+        if (!pollReadable(conn, 2_000)) break;
+        const got = std.c.read(conn, buf[total..].ptr, buf.len - total);
+        if (got <= 0) break;
+        total += @intCast(got);
+        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
+    }
+    return buf[0..total];
+}
+
+/// Real blocking-but-bounded origin: accepts up to `max_connections`
+/// sequential connections (the buffered HTTP client always sends
+/// `Connection: close` bound responses here, so each attempt is a fresh
+/// TCP connection). Any request that actually carries `Early-Data: 1` is
+/// answered with a real `425 Too Early` and does **not** increment
+/// `executed` — modeling an origin that itself enforces RFC 8470 and
+/// refuses to treat early data as a safe side-effecting request. Any other
+/// request executes normally. Every wait in this function is bounded (see
+/// `acceptBounded`/`readRequestHeadBounded`), so a regression this test is
+/// meant to catch (e.g. the client never retrying) makes this function
+/// return promptly instead of blocking the test process forever.
 fn earlyRejectingOriginResponder(listen_fd: std.posix.fd_t, state: *OriginState, max_connections: usize) void {
     var handled: usize = 0;
     while (handled < max_connections) : (handled += 1) {
-        const conn = std.c.accept(listen_fd, null, null);
-        if (conn < 0) return;
+        const conn = acceptBounded(listen_fd, state, 5_000) orelse return;
         defer _ = std.c.close(conn);
+
         var buf: [4096]u8 = undefined;
-        const got = std.c.read(conn, &buf, buf.len);
-        if (got <= 0) return;
-        const n: usize = @intCast(got);
-        const has_early = requestHasEarlyDataHeader(buf[0..n]);
+        const request_head = readRequestHeadBounded(conn, &buf);
+        if (request_head.len == 0) return;
+
+        const has_early = requestHasEarlyDataHeader(request_head);
         const idx = state.connections_seen.fetchAdd(1, .monotonic);
         if (idx < state.early_header_seen.len) state.early_header_seen[idx] = has_early;
 
@@ -254,7 +311,16 @@ test "#369 Slice 2 rt0.retry.425_exactly_once: a real early-data 425 from a real
 
     var origin = OriginState{};
     const responder = try std.Thread.spawn(.{}, earlyRejectingOriginResponder, .{ listener.fd, &origin, @as(usize, 2) });
-    defer responder.join();
+    // Belt-and-suspenders for every early-return path between here and the
+    // explicit join below (e.g. an allocation failure building the request/
+    // URL): request a bounded shutdown and join at most once. `joined`
+    // guards against the double-join UB that would result from both this
+    // defer and the explicit join below running.
+    var joined = false;
+    defer if (!joined) {
+        origin.stop.store(true, .release);
+        responder.join();
+    };
 
     var url_buf: [64]u8 = undefined;
     const upstream_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/work", .{listener.port});
@@ -302,7 +368,7 @@ test "#369 Slice 2 rt0.retry.425_exactly_once: a real early-data 425 from a real
     const before_retried = metrics.http_early_data_upstream_425_total[@intFromEnum(http.metrics.EarlyDataUpstream425Action.retried)];
     const before_success = metrics.http_early_data_retry_total[@intFromEnum(http.metrics.EarlyDataRetryResult.success)];
 
-    const outcome = try gproxy_runtime.runBufferedProxyAttempts(
+    const outcome_result = gproxy_runtime.runBufferedProxyAttempts(
         &early_ctx,
         first_attempt_forward_early_data,
         "GET",
@@ -313,7 +379,16 @@ test "#369 Slice 2 rt0.retry.425_exactly_once: a real early-data 425 from a real
         &executor,
     );
 
-    var response = switch (outcome) {
+    // Establish a real happens-before relationship with the responder
+    // thread *before* reading any of its (non-atomic) observations below —
+    // `Thread.join` synchronizes-with the thread's completion. This must
+    // run whether `outcome_result` is a value or an error, and before the
+    // `try` that would otherwise skip straight to the deferred cleanup.
+    origin.stop.store(true, .release);
+    responder.join();
+    joined = true;
+
+    var response = switch (try outcome_result) {
         .response => |r| r,
         else => return error.TestUnexpectedResult,
     };
@@ -339,84 +414,4 @@ test "#369 Slice 2 rt0.retry.425_exactly_once: a real early-data 425 from a real
     // The retry genuinely waited on the downstream handshake barrier
     // exactly once before retrying as ordinary.
     try testing.expectEqual(@as(usize, 1), handshake_barrier.waits);
-}
-
-test "#369 Slice 2 rt0.reject.unsafe_request: an unsafe method carrying current-hop early data is rejected by the real gateway decision before any upstream dispatch is even attempted" {
-    // Matches the minimal-`undefined`-`EdgeConfig` pattern already used by
-    // `edge_gateway.zig`'s own "H1 early-data 425 preflight..." tests: only
-    // the fields `earlyDataDecisionForRequest` actually reads are set, and
-    // (unlike `edge_config.loadFromEnv`) nothing here is heap-allocated, so
-    // there is no `cfg.deinit` to call and no risk of freeing
-    // literal-backed `LocationBlock`/slice memory a real `loadFromEnv`
-    // config would expect to own.
-    var cfg: edge_config.EdgeConfig = undefined;
-    cfg.metrics_path = "/status/metrics";
-
-    // Deliberately not bound by anything: if the real gateway path were to
-    // (incorrectly) attempt to dispatch this request as early data, this
-    // test would need a live responder to get a 2xx/425 back at all. Using
-    // an address nothing listens on means the only way this test can pass
-    // is by never attempting the dispatch in the first place — no thread,
-    // no sleep-based synchronization needed to prove non-contact.
-    var blocks = [_]edge_config.EdgeConfig.LocationBlock{.{
-        .match_type = .prefix,
-        .pattern = "/",
-        .priority = 0,
-        .action = .{ .proxy_pass = "http://127.0.0.1:1" },
-        .early_data = .replay_safe,
-        .proxy_early_data = .rfc8470,
-    }};
-    cfg.location_blocks = blocks[0..];
-    cfg.mirror_rules = &.{};
-
-    // POST is not method-safe (#366/#367 policy): even though the route
-    // itself is configured replay-safe and RFC-8470-aware, an unsafe
-    // method must never be admitted as early data. This is the same real,
-    // `pub` production decision function `edge_gateway.zig`'s H1 dispatch
-    // calls (via `earlyDataPreflightDecisionForH1`) before ever reaching
-    // `hooks.route`/`gproxy_runtime.handleLocationProxyPass` — see
-    // `executeH1PostPreflightOrchestration` in `edge_gateway.zig`, whose
-    // `.too_early` branch calls `hooks.rejectEarly` and returns without
-    // calling `hooks.route` at all.
-    const early_ctx = http.request_context.EarlyDataContext{ .transport_early = true };
-    const decision = ghandlers.earlyDataDecisionForRequest(&cfg, early_ctx, .POST, "/work", false);
-    try testing.expectEqual(http.early_data.Decision.too_early, decision);
-
-    // The real gateway path never reaches `runBufferedProxyAttempts` for a
-    // `.too_early` decision, so nothing here calls it — that omission is
-    // itself the proof: no upstream dispatch, real or otherwise, is even
-    // attempted for this request shape, and therefore no unsafe side
-    // effect and no double execution from any fallback/retry path either.
-}
-
-test "#369 Slice 2 rt0.reject.store_unavailable: the default configuration neither enables native 0-RTT nor accidentally accepts it — 1-RTT-equivalent policy stays available" {
-    // Cross-layer proof, tying two independently-tested facts together:
-    //  1. `edge_config.loadFromEnv`'s default configuration (no env
-    //     overrides) leaves native 0-RTT anti-replay disabled and defines
-    //     no location routes at all, so nothing could be routed as early
-    //     data even if a peer attempted it (already directly asserted in
-    //     `edge_config.zig`'s own "#368 Slice 3: early-data replay config
-    //     defaults to disabled..." test — not re-asserted in isolation
-    //     here, only combined with fact 2).
-    //  2. `tls_core.tls13_backend.EarlyDataReplayGate`'s default
-    //     (`decideFn == null`, i.e. exactly what composition leaves wired
-    //     when the operator has not configured `process_local` mode) maps
-    //     every 0-RTT attempt to `.unavailable` — fail closed — while
-    //     never touching ordinary 1-RTT resumption (already directly
-    //     proven end-to-end in `tls13_backend_tests.zig`'s "0-RTT
-    //     anti-replay defaults to unavailable (fails closed) when no gate
-    //     is configured" test).
-    //
-    // Together: a freshly started process with no operator configuration
-    // cannot accept 0-RTT anywhere, by construction, without needing a
-    // distributed or even a local replay backend to be present.
-    const allocator = testing.allocator;
-    var cfg = try edge_config.loadFromEnv(allocator);
-    defer cfg.deinit(allocator);
-
-    try testing.expectEqual(edge_config.EarlyDataReplayMode.disabled, cfg.tls_native_early_data_replay_mode);
-    try testing.expectEqual(@as(usize, 0), cfg.location_blocks.len);
-
-    const default_gate = tls_core.tls13_backend.EarlyDataReplayGate{};
-    try testing.expect(default_gate.decideFn == null);
 }

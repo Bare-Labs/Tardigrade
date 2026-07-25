@@ -52,45 +52,81 @@ real OpenSSL/QUIC peer, no CI/soak changes.
 
 Moves assurance one layer outward from Slice 1: exercises the real
 production TLS/replay-store/HTTP-early-data/gateway-retry code composed
-together, rather than each layer's own unit tests in isolation. Two new
-test areas, both reusing existing production code and harness patterns
-rather than scripted stand-ins:
+together, rather than each layer's own unit tests in isolation, and rather
+than scripted stand-ins where production code was reachable.
 
-- **`src/tls/tls13_backend_tests.zig`** (real `DirectHarness`
-  ClientHello/PSK-offer/binder handshakes, a real
-  `tls_core.early_data_replay.LocalStore`/`GateAdapter`, and an atomic
-  "application executed" counter driven strictly by the real
-  `earlyDataAccepted()` outcome — not a re-derivation of the TLS decision
-  itself):
-  - `rt0.accept.first_use` — accepted 0-RTT records the replay claim,
-    executes the application exactly once, and a diagnostic-formatting
-    check confirms the raw ticket identity never appears in what a log
-    line would show (the candidate type has no PSK field at all, so that
-    leak is impossible by construction, not merely untested).
+A review pass on the first draft of this slice found that its TLS-layer
+tests paired each real TLS/replay decision with a same-process "application
+executed" counter incremented directly from that same decision
+(`server_backend.earlyDataAccepted()`) — tautological, since it could never
+catch the actual cross-layer bug #369 cares about (HTTP/gateway dispatch
+ignoring a correct TLS decision), and, worse, unfalsifiable for the native
+TCP/H1 transport today: see "Confirmed production gap" below. The review
+also found a real test-only deadlock risk (an unbounded `accept()` a
+regression could block on forever, joined in the wrong order relative to
+socket teardown) and a test that special-cased itself around a decision
+function without actually invoking any dispatch path. All of these are
+fixed in the current state of this slice, described below.
+
+- **`src/tls/tls13_backend_tests.zig`** — TLS / replay-store layer only
+  (real `DirectHarness` ClientHello/PSK-offer/binder handshakes and a real
+  `tls_core.early_data_replay.LocalStore`/`GateAdapter`, each scenario
+  additionally asserting a real `Observer`/`Event` delta — the same
+  observer seam production composition installs
+  (`nativeEarlyDataReplayMetricsObserver`), asserted directly on the closed
+  `Event` vocabulary since this module has no dependency on `http.metrics`):
+  - `rt0.accept.first_use` — accepted 0-RTT records the replay claim, emits
+    exactly one real `.accepted` event, and a diagnostic-formatting check
+    confirms the raw ticket identity never appears in what a log line
+    would show (the candidate type has no PSK field at all, so that leak
+    is impossible by construction, not merely untested).
   - `rt0.reject.duplicate` — an exact-duplicate claim on a second,
-    independent connection never executes the application; the resumed
-    connection remains usable and a later, distinct 1-RTT request executes
-    normally (total: one execution for the accept, one more for the
-    intentionally distinct later request).
-  - `rt0.reject.capacity` — a store configured with one live slot rejects a
-    second, otherwise-valid claim with the typed capacity outcome, no
-    application side effect, occupancy stays bounded, and a later request
-    on the same connection still succeeds.
+    independent connection emits a real `.duplicate` event (not a second
+    `.accepted`); the resumed connection remains usable and a later,
+    distinct 1-RTT request round-trips real application data.
+  - `rt0.reject.capacity` — a store configured with one live slot emits a
+    real `.capacity_rejected` event for a second, otherwise-valid claim,
+    occupancy stays bounded, and a later request on the same connection
+    still succeeds.
   - `rt0.reject.startup_quarantine` — a fresh store (modeling lost replay
-    history after a restart) rejects early execution during quarantine
-    without any application side effect, and the connection remains usable
-    for an ordinary request; the exact quarantine boundary is exercised
-    against #368's existing (exclusive-end) semantics
-    (`now < quarantine_end` rejects, `now == quarantine_end` is ordinary
-    eligibility) with a deterministic injected clock, not a sleep.
+    history after a restart) emits a real `.startup_quarantine` event
+    (distinguishable from `.duplicate`) during quarantine, and the
+    connection remains usable for an ordinary request; the exact
+    quarantine boundary is exercised against #368's existing
+    (exclusive-end) semantics (`now < quarantine_end` rejects,
+    `now == quarantine_end` is ordinary eligibility, and does emit a real
+    `.accepted` event) with a deterministic injected clock, not a sleep.
   - `rt0.reject.cross_worker_duplicate` — two independent per-connection
     `DirectHarness` instances ("worker A"/"worker B") share one real
-    `LocalStore`; worker A's accepted claim executes once, and worker B's
-    replay of the same identity is rejected and never executes. See the
-    "true OS-thread/worker-routing seam" note below.
+    `LocalStore`; worker A's claim emits `.accepted`, and worker B's replay
+    of the same identity emits `.duplicate`. See the "true OS-thread/
+    worker-routing seam" note below.
+- **`src/edge_gateway.zig`** (two new tests alongside its existing H1
+  dispatch tests, reusing the same `executeH1PostPreflightOrchestration` +
+  probe-hooks and composition-decision seams those tests already use —
+  reachable only from this file, since both are private to it):
+  - `rt0.reject.unsafe_request` — an unsafe method (POST) with current-hop
+    early data is driven through the real, private
+    `executeH1PostPreflightOrchestration` orchestration (the same function
+    production H1 dispatch calls) with the existing
+    `H1CountingPostPreflightHooks` probe; asserts the probe's route hook —
+    where any upstream dispatch would originate — never runs. Isolates the
+    method-safety gate specifically, distinct from the file's pre-existing
+    mirror-rule and origin-capability-off tests.
+  - `rt0.reject.store_unavailable` — forces `tls_native_early_data_replay_mode
+    = .disabled` on an explicit, deterministic config (not ambient
+    `TARDIGRADE_*` env vars), confirms the real
+    `nativeEarlyDataReplayStoreEnabled` composition-decision function
+    withholds the store even though a native path otherwise exists, then
+    builds a real `NativeTlsConnection` exactly as `run()` would in this
+    configuration (no `.early_data_replay_gate` option) and asserts its
+    real `Tls13Backend.early_data_replay_gate.decideFn == null` — tying the
+    config decision to the real composition-built object, not just to two
+    independently-true facts asserted side by side.
 - **`src/process_early_data_integration_tests.zig`** (new file, wired into
   `zig build test` via `edge_gateway.zig`'s existing `test { _ = @import(...) }`
-  aggregator pattern):
+  aggregator pattern) — the one scenario that needs neither module's
+  private internals:
   - `rt0.retry.425_exactly_once` — drives the real
     `gateway_proxy_runtime.runBufferedProxyAttempts` retry/425 state
     machine and the real production TCP HTTP client
@@ -102,24 +138,43 @@ rather than scripted stand-ins:
     caller is the successful retry, and real
     `http.metrics.Metrics.recordHttpEarlyDataUpstream425`/
     `recordHttpEarlyDataRetry` deltas distinguish the initial 425 from the
-    successful retry — no parallel test-only metrics model.
-  - `rt0.reject.unsafe_request` — an unsafe method (POST) with current-hop
-    early data is rejected by the real, `pub`
-    `gateway_handlers.earlyDataDecisionForRequest` (the same function
-    `edge_gateway.zig`'s H1 dispatch calls) before any upstream dispatch is
-    attempted at all — the configured `proxy_pass` target is deliberately
-    nothing that listens, so the only way the test can pass is by the real
-    gateway decision short-circuiting before any network I/O, not by
-    racing a responder thread.
-  - `rt0.reject.store_unavailable` — ties two independently-proven facts
-    together: `edge_config.loadFromEnv`'s default configuration leaves
-    native 0-RTT replay mode `disabled` and defines no location routes at
-    all, and `tls13_backend.EarlyDataReplayGate`'s default (no gate
-    configured) fails closed to `.unavailable` for 0-RTT while leaving
-    ordinary 1-RTT resumption untouched (both already proven individually
-    by `edge_config.zig`'s and `tls13_backend_tests.zig`'s own suites) — so
-    a freshly started process with no operator configuration cannot accept
-    0-RTT anywhere, without needing any replay backend present.
+    successful retry — no parallel test-only metrics model. Every wait in
+    the loopback origin (`acceptBounded`/`readRequestHeadBounded`) is
+    poll-bounded rather than a raw blocking `accept()`/`read()`, and the
+    responder thread is joined (establishing a real happens-before
+    relationship) before any of its observations are read, so a regression
+    in the retry logic fails the test with a useful assertion instead of
+    hanging the test binary.
+
+### Confirmed production gap: native TCP/H1 does not yet wire `Tls13Backend.earlyDataAccepted()` into HTTP dispatch
+
+While addressing review feedback, inspection of `edge_gateway.zig`'s
+request-context setup found this existing comment and hardcoded value:
+
+```zig
+// #367 slice 2 keeps this as request-scoped handoff state. The production
+// #366 H1 record provenance carrier is not present on this branch yet, so
+// H1 transport provenance stays false rather than using connection state.
+ctx.early_data.transport_early = false;
+```
+
+That is: for the native record/TCP transport, **no production code path
+today reads the real TLS backend's `earlyDataAccepted()`/`earlyDataDecision()`
+and forwards it into `ctx.early_data.transport_early`** for the H1 request
+that follows. `transport_early` only ever becomes `true` for H1 in
+production via this hardcoded-`false` assignment (i.e. never); the only
+other `.transport_early = true` assignments in `edge_gateway.zig` are
+either H2 frame-provenance propagation (already set from elsewhere, not
+derived from the TLS backend) or test-only fixtures. Wiring this is a
+`#366`/`#367` follow-up, not this slice's scope — but it means no test,
+here or otherwise, can currently prove "an accepted real 0-RTT record over
+TCP results in a real early HTTP dispatch," because that composition does
+not exist in production yet to prove. This slice's tests are scoped
+accordingly: the TLS/replay-store decision is proven with real production
+code, and the *given an early context, does dispatch correctly gate on
+it* question is proven with a directly-constructed `EarlyDataContext` (the
+shape the real wiring would eventually produce), not by claiming to
+exercise the (currently nonexistent) wiring itself.
 
 ### Known gap: no deterministic worker-thread-routing test seam
 
