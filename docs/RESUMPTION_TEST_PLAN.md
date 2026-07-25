@@ -147,10 +147,11 @@ fixed in the current state of this slice, described below.
     in the retry logic fails the test with a useful assertion instead of
     hanging the test binary.
 
-### Confirmed production gap: native TCP/H1 does not yet wire `Tls13Backend.earlyDataAccepted()` into HTTP dispatch
+### Confirmed production gap: native TCP/H1 is not yet production-enabled end to end for real 0-RTT dispatch
 
 While addressing review feedback, inspection of `edge_gateway.zig`'s
-request-context setup found this existing comment and hardcoded value:
+request-context setup found one visible gap in this existing comment and
+hardcoded value:
 
 ```zig
 // #367 slice 2 keeps this as request-scoped handoff state. The production
@@ -159,23 +160,29 @@ request-context setup found this existing comment and hardcoded value:
 ctx.early_data.transport_early = false;
 ```
 
-That is: for the native record/TCP transport, **no production code path
-today reads the real TLS backend's `earlyDataAccepted()`/`earlyDataDecision()`
-and forwards it into `ctx.early_data.transport_early`** for the H1 request
-that follows. `transport_early` only ever becomes `true` for H1 in
-production via this hardcoded-`false` assignment (i.e. never); the only
-other `.transport_early = true` assignments in `edge_gateway.zig` are
-either H2 frame-provenance propagation (already set from elsewhere, not
-derived from the TLS backend) or test-only fixtures. Wiring this is tracked
-by #510 as a `#366`/`#367` follow-up, not this slice's scope — but it means no test,
-here or otherwise, can currently prove "an accepted real 0-RTT record over
-TCP results in a real early HTTP dispatch," because that composition does
-not exist in production yet to prove. This slice's tests are scoped
-accordingly: the TLS/replay-store decision is proven with real production
-code, and the *given an early context, does dispatch correctly gate on
-it* question is proven with a directly-constructed `EarlyDataContext` (the
-shape the real wiring would eventually produce), not by claiming to
-exercise the (currently nonexistent) wiring itself.
+That final H1 handoff is not the only missing production wiring. Native TCP
+also does not yet advertise early-capable tickets from production
+`NativeTlsConnection.issueSessionTicket()` because its
+`prepareNewSessionTicket(...)` call does not pass `max_early_data_size`, and
+`NativeTlsConnection.createWithOptions()` does not install an enabled
+`Tls13Backend.ServerEarlyDataPolicy` (whose default is disabled). Together,
+those gaps mean a production native TCP client cannot currently receive a
+server-issued early-capable ticket, have the server accept a real
+`early_data` attempt, and then carry that record-read provenance into H1
+dispatch.
+
+Wiring those prerequisites and the final `ctx.early_data.transport_early`
+handoff is tracked by #510 as a `#366`/`#367` follow-up, not this slice's
+scope. This means no test here or otherwise can currently prove "a
+production-issued native TCP ticket leads to accepted real 0-RTT records
+whose provenance gates H1 dispatch," because that composition does not
+exist in production yet to prove. This slice's tests are scoped accordingly:
+the TLS/replay-store decision is proven with real production code, and the
+*given an early context, does dispatch correctly gate on it* question is
+proven with a directly-constructed `EarlyDataContext` (the shape the real
+wiring would eventually produce), not by claiming to exercise the
+currently nonexistent production-issued-ticket → server-policy →
+record-provenance → H1-safety-gate chain.
 
 ### Known gap: no deterministic worker-thread-routing test seam
 
@@ -226,13 +233,17 @@ weakening of the "workers share one store" guarantee itself.
   The record-transport matrix is thoroughly covered
   (`src/tls/tls13_backend_tests.zig`); an equivalent pass explicitly over
   `Transport.quic` has not been added yet.
-- **True end-to-end native TCP/H1 record-provenance dispatch coverage**
-  (#510): a real accepted/rejected TLS 0-RTT record must flow through
-  native TCP/H1 request parsing into `RequestContext.early_data` and the
-  production H1 safety gate before #369's process-level H1 path is complete.
-  The current slice proves the TLS/replay-store decision and the constructed
-  H1 dispatch context on either side of that gap; it does not close the
-  missing production handoff itself.
+- **True end-to-end native TCP/H1 production 0-RTT dispatch coverage**
+  (#510): the E2E must start from a production-issued early-capable native
+  TCP ticket (`max_early_data_size` advertised by the production ticket
+  path), use production server composition to enable
+  `Tls13Backend.ServerEarlyDataPolicy` only when replay protection
+  prerequisites are satisfied, then carry accepted/rejected TLS 0-RTT
+  record provenance through native TCP/H1 request parsing into
+  `RequestContext.early_data` and the production H1 safety gate. The
+  current slice proves the TLS/replay-store decision and the constructed H1
+  dispatch context on either side of that wider gap; it does not close the
+  missing production enablement or provenance handoff itself.
 
 Acceptance criteria for #369 as a whole (interop reliability, safe
 fallback/rejection under mismatch, no double execution, bounded soak
