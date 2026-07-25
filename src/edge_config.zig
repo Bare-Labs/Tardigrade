@@ -822,13 +822,17 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     errdefer allocator.free(tls_native_resumption_ticket_usage);
     // #368 Slice 3: explicit replay mode/capacity — see `EarlyDataReplayMode`
     // and `validateEarlyDataReplayConfig`. An unrecognized mode fails at load
-    // time (like `upstream_protocol`); the capacity bound is validated in
-    // `validate()` alongside the rest of numeric config so its error message
-    // can reference the configured value.
+    // time (like `upstream_protocol`). Unlike most numeric settings, capacity
+    // deliberately does NOT use the permissive `parseIntEnv` (which silently
+    // falls back to the default on parse failure/overflow) — this is a
+    // security-sensitive bound, so a malformed value must fail startup, not
+    // silently become the default. See `parseEarlyDataReplayMaxEntriesConfig`.
     const tls_native_early_data_replay_mode_str = envOrDefault(allocator, "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE", "disabled") catch unreachable;
     defer allocator.free(tls_native_early_data_replay_mode_str);
     const tls_native_early_data_replay_mode = try parseEarlyDataReplayModeConfig(tls_native_early_data_replay_mode_str);
-    const tls_native_early_data_replay_max_entries = parseIntEnv(usize, allocator, "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES", (tls_core.early_data_replay.Limits{}).max_entries);
+    const tls_native_early_data_replay_max_entries_str = envOrDefault(allocator, "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES", "65536") catch unreachable;
+    defer allocator.free(tls_native_early_data_replay_max_entries_str);
+    const tls_native_early_data_replay_max_entries = try parseEarlyDataReplayMaxEntriesConfig(tls_native_early_data_replay_max_entries_str);
     const tls_ocsp_stapling_enabled = parseBoolEnv(allocator, "TARDIGRADE_TLS_OCSP_STAPLING", false);
     const tls_ocsp_response_path = envOrDefault(allocator, "TARDIGRADE_TLS_OCSP_RESPONSE_PATH", "") catch unreachable;
     errdefer allocator.free(tls_ocsp_response_path);
@@ -1918,6 +1922,28 @@ fn parseEarlyDataReplayModeConfig(raw: []const u8) !EarlyDataReplayMode {
         logConfigDiagnostic("config validation failed: tls_native_early_data_replay_mode must be one of disabled, process_local", .{});
         return error.InvalidConfigValue;
     };
+}
+
+/// #368 Slice 3: strict (not `parseIntEnv`-style permissive) parser for the
+/// replay-store capacity bound. `parseIntEnv` silently falls back to its
+/// default on parse failure or overflow, which would let a malformed value
+/// like `garbage`, `-1`, or something too large for `usize` silently become
+/// the default `65536` and pass validation — unacceptable for a
+/// security-sensitive bound. Non-numeric input or overflow fails config
+/// loading outright; `validateEarlyDataReplayConfig` still runs afterward
+/// (and again from `validate()` as defense in depth for programmatically
+/// constructed configs) to enforce the nonzero/hard-cap bound.
+fn parseEarlyDataReplayMaxEntriesConfig(raw: []const u8) !usize {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    const parsed = std.fmt.parseInt(usize, value, 10) catch {
+        logConfigDiagnostic("config validation failed: tls_native_early_data_replay_max_entries must be a positive integer <= {d}", .{tls_core.early_data_replay.hard_max_entries});
+        return error.InvalidConfigValue;
+    };
+    validateEarlyDataReplayConfig(parsed) catch {
+        logConfigDiagnostic("config validation failed: tls_native_early_data_replay_max_entries must be nonzero and <= {d} (got {d})", .{ tls_core.early_data_replay.hard_max_entries, parsed });
+        return error.InvalidConfigValue;
+    };
+    return parsed;
 }
 
 fn parseUpstreamLbAlgorithmConfig(raw: []const u8) !UpstreamLbAlgorithm {
@@ -3934,6 +3960,31 @@ test "#368 Slice 3: validateEarlyDataReplayConfig rejects zero and above-hard-ca
     try validateEarlyDataReplayConfig(tls_core.early_data_replay.hard_max_entries);
     try validateEarlyDataReplayConfig(1);
     try validateEarlyDataReplayConfig((tls_core.early_data_replay.Limits{}).max_entries);
+}
+
+test "#368 Slice 3: parseEarlyDataReplayMaxEntriesConfig rejects malformed input instead of silently falling back to the default" {
+    // Non-numeric, negative, and empty input must all fail loudly rather
+    // than silently becoming the permissive `parseIntEnv` default — this is
+    // a security-sensitive capacity bound.
+    try std.testing.expectError(error.InvalidConfigValue, parseEarlyDataReplayMaxEntriesConfig("garbage"));
+    try std.testing.expectError(error.InvalidConfigValue, parseEarlyDataReplayMaxEntriesConfig("-1"));
+    try std.testing.expectError(error.InvalidConfigValue, parseEarlyDataReplayMaxEntriesConfig(""));
+    try std.testing.expectError(error.InvalidConfigValue, parseEarlyDataReplayMaxEntriesConfig("12.5"));
+    // A value that overflows `usize` must fail rather than wrapping or
+    // silently truncating.
+    try std.testing.expectError(error.InvalidConfigValue, parseEarlyDataReplayMaxEntriesConfig("99999999999999999999999999999999"));
+    // Zero and above-hard-cap are well-formed integers but still rejected by
+    // the bound check reused from `validateEarlyDataReplayConfig`.
+    try std.testing.expectError(error.InvalidConfigValue, parseEarlyDataReplayMaxEntriesConfig("0"));
+    const above_cap = std.fmt.allocPrint(std.testing.allocator, "{d}", .{tls_core.early_data_replay.hard_max_entries + 1}) catch unreachable;
+    defer std.testing.allocator.free(above_cap);
+    try std.testing.expectError(error.InvalidConfigValue, parseEarlyDataReplayMaxEntriesConfig(above_cap));
+
+    // A well-formed, in-bounds value parses, including with surrounding
+    // whitespace trimmed.
+    try std.testing.expectEqual(@as(usize, 1024), try parseEarlyDataReplayMaxEntriesConfig("1024"));
+    try std.testing.expectEqual(@as(usize, 1024), try parseEarlyDataReplayMaxEntriesConfig("  1024  "));
+    try std.testing.expectEqual(tls_core.early_data_replay.hard_max_entries, try parseEarlyDataReplayMaxEntriesConfig("1048576"));
 }
 
 test "appliance profile defaults never trip validateApplianceTlsProfile" {

@@ -1136,13 +1136,45 @@ test "#368 Slice 3: a fake distributed Store (not LocalStore) behind the same Ga
     // Proves the acceptance criterion that TLS/composition depends only on
     // the `early_data_replay.Store` contract, not `LocalStore` internals:
     // the exact same `GateAdapter` wiring `edge_gateway.zig` uses, but
-    // backed by `FakeDistributedStore` — a scripted stand-in for a future
-    // networked backend — drives the same `EarlyDataDecision` outcomes as
-    // the real `LocalStore`-backed tests above.
+    // backed by a small scripted stand-in for a future networked backend —
+    // drives the same `EarlyDataDecision` outcomes as the real
+    // `LocalStore`-backed tests above. Defined locally (like
+    // `DeterministicStore` below) rather than imported, so this
+    // deliberately non-atomic, non-conforming test double never becomes
+    // reachable through `tls_core.early_data_replay`'s production surface.
+    const FakeDistributedStore = struct {
+        allocator: std.mem.Allocator,
+        mode: enum { commit, timeout, network_failure, ambiguous_commit } = .commit,
+        committed: std.AutoHashMapUnmanaged(tls_core.early_data_replay.Key, void) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.committed.deinit(self.allocator);
+        }
+
+        fn store(self: *@This()) tls_core.early_data_replay.Store {
+            return .{ .ctx = self, .claimFn = claimTrampoline };
+        }
+
+        fn claimTrampoline(ctx: *anyopaque, c: tls_core.early_data_replay.Claim) tls_core.early_data_replay.ClaimResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.claim(c);
+        }
+
+        fn claim(self: *@This(), c: tls_core.early_data_replay.Claim) tls_core.early_data_replay.ClaimResult {
+            switch (self.mode) {
+                .timeout, .network_failure, .ambiguous_commit => return .unavailable,
+                .commit => {},
+            }
+            if (self.committed.contains(c.key)) return .duplicate;
+            self.committed.put(self.allocator, c.key, {}) catch return .unavailable;
+            return .accepted;
+        }
+    };
+
     var issued = try issueEarlyCapableTicket(32);
     defer issued.deinit();
 
-    var fake = tls_core.early_data_replay.FakeDistributedStore.init(std.testing.allocator);
+    var fake = FakeDistributedStore{ .allocator = std.testing.allocator };
     defer fake.deinit();
     var adapter = tls_core.early_data_replay.GateAdapter.init(fake.store());
     const shared_gate = adapter.gate();

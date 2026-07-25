@@ -124,6 +124,35 @@ pub fn hotReloadConfig(
             return;
         }
     }
+    {
+        // #368 Slice 3: the process-owned early-data replay store/gate are
+        // constructed once in `edge_gateway.run()` from the startup config
+        // and shared for the process lifetime — there is no in-place
+        // rebuild path here (unlike `applyReloadedRuntimeConfig`'s simple
+        // field copies), because rebuilding would discard replay history
+        // and require a fresh startup-quarantine handoff. Publishing a
+        // config that claims a different replay mode/capacity than what is
+        // actually installed would be a real security/observability
+        // divergence for this security-sensitive setting, so reject the
+        // whole reload instead — the previous config and the still-active
+        // store/gate stay coherent. Operators must restart to change
+        // replay mode or capacity.
+        var current_lease = worker_ctx.config_store.acquire();
+        const replay_config_changed = earlyDataReplayConfigChanged(current_lease.cfg, cfg_ptr);
+        current_lease.release();
+        if (replay_config_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "early-data replay mode/capacity changed; restart required", .{}) catch "early-data replay configuration changed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected: TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE/_MAX_ENTRIES changed; restart the process to change replay mode or capacity (the process-owned replay store cannot be safely rebuilt without discarding replay history)", .{});
+            return;
+        }
+    }
     if (worker_ctx.native_credentials) |store| {
         var sni_specs = allocator.alloc(http.native_tls_connection.SniCertSpec, cfg_ptr.tls_sni_certs.len) catch {
             worker_ctx.config_store.destroyVersion(prepared_version);
@@ -194,6 +223,48 @@ pub fn applianceCredentialConfigChanged(
         if (!std.mem.eql(u8, a.key_path, b.key_path)) return true;
     }
     return false;
+}
+
+/// #368 Slice 3: true when a proposed configuration changes the
+/// process-owned early-data replay store's mode or capacity. The store is
+/// constructed once at startup and shared for the process lifetime (see
+/// `edge_gateway.run()`); `hotReloadConfig` rejects the whole reload rather
+/// than accept a published config that no longer matches the actually
+/// installed store/gate.
+pub fn earlyDataReplayConfigChanged(
+    current: *const edge_config.EdgeConfig,
+    proposed: *const edge_config.EdgeConfig,
+) bool {
+    return current.tls_native_early_data_replay_mode != proposed.tls_native_early_data_replay_mode or
+        current.tls_native_early_data_replay_max_entries != proposed.tls_native_early_data_replay_max_entries;
+}
+
+test "earlyDataReplayConfigChanged detects mode and capacity changes independently" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    try std.testing.expect(!earlyDataReplayConfigChanged(&base, &proposed));
+
+    // disabled -> process_local
+    proposed.tls_native_early_data_replay_mode = .process_local;
+    try std.testing.expect(earlyDataReplayConfigChanged(&base, &proposed));
+    proposed.tls_native_early_data_replay_mode = .disabled;
+    try std.testing.expect(!earlyDataReplayConfigChanged(&base, &proposed));
+
+    // process_local -> disabled (the reverse direction)
+    base.tls_native_early_data_replay_mode = .process_local;
+    try std.testing.expect(earlyDataReplayConfigChanged(&base, &proposed));
+    base.tls_native_early_data_replay_mode = .disabled;
+    try std.testing.expect(!earlyDataReplayConfigChanged(&base, &proposed));
+
+    // Capacity-only change, mode held constant.
+    proposed.tls_native_early_data_replay_max_entries = base.tls_native_early_data_replay_max_entries + 1;
+    try std.testing.expect(earlyDataReplayConfigChanged(&base, &proposed));
+    proposed.tls_native_early_data_replay_max_entries = base.tls_native_early_data_replay_max_entries;
+    try std.testing.expect(!earlyDataReplayConfigChanged(&base, &proposed));
 }
 
 test "applianceCredentialConfigChanged detects credential-affecting fields" {

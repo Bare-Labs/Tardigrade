@@ -97,17 +97,19 @@ logs are written through `src/http/logger.zig`.
 - native TLS/QUIC 0-RTT anti-replay store outcomes (#368):
   `tardigrade_tls_early_data_replay_total{outcome}` with fixed outcomes
   `accepted`, `duplicate`, `capacity_rejected`, `expired`, `unavailable`, and
-  `startup_quarantine`. Only exported once
-  `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE=process_local` and a native
-  0-RTT-capable path are both configured — the series simply stays at zero
-  otherwise. `duplicate` (a proven replay) and `capacity_rejected`/
-  `unavailable` (the store cannot currently vouch for 0-RTT) are always
-  distinguishable outcomes so operators can tell "an attacker replayed a
-  0-RTT flight" apart from "the store is saturated or not ready yet."
-  `startup_quarantine` is a separate outcome from a genuinely unavailable
-  store so a restart's expected quarantine window doesn't read the same as a
-  runtime failure. See "Native TLS 0-RTT Anti-Replay Protection" below for
-  the full guarantee this store provides.
+  `startup_quarantine`. All six series are always present (Prometheus counter
+  semantics); with replay mode `disabled` or no eligible native 0-RTT path
+  configured, they simply stay at zero, since no store is ever constructed
+  to increment them. `duplicate` (the same replay key was presented again —
+  this proves a repeat presentation, not necessarily malicious intent; a
+  legitimate client retry that happens to resend the same 0-RTT flight would
+  also count here) and `capacity_rejected`/`unavailable` (the store cannot
+  currently vouch for 0-RTT) are always distinguishable outcomes so operators
+  can tell "the same replay key was observed again" apart from "the store is
+  saturated or not ready yet." `startup_quarantine` is a separate outcome
+  from a genuinely unavailable store so a restart's expected quarantine
+  window doesn't read the same as a runtime failure. See "Native TLS 0-RTT
+  Anti-Replay Protection" below for the full guarantee this store provides.
 
 Early-data metric label sets are intentionally bounded and never include
 high-cardinality request attributes (URL, request id, stream id, host, IP,
@@ -130,6 +132,15 @@ continues as ordinary 1-RTT resumption.
 | --- | --- | --- |
 | `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE` | `disabled`, `process_local` | `disabled` |
 | `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES` | integer, `1..1048576` | `65536` |
+
+Both fields are **restart-only**: the replay store/gate are constructed once
+at startup and shared for the process lifetime, and rebuilding them on a
+config hot reload (`SIGHUP`) would discard replay history and require a
+fresh startup-quarantine handoff. A hot reload that changes either field is
+therefore rejected outright (`restart required`); the previous configuration
+and the already-installed store/gate stay active and coherent, rather than
+publishing a config that no longer matches the actually enforced replay
+behavior.
 
 `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES` bounds replay-store
 *capacity* only. It is independent of ordinary TLS session-resumption/cache

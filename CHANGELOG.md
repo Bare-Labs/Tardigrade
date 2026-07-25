@@ -13,17 +13,24 @@ All notable user-facing changes to Tardigrade are documented here.
   (`disabled` default, or `process_local`) and
   `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES` (bounded, independent
   of ordinary TLS resumption/session-cache configuration, no separately
-  configurable replay TTL) now gate whether the gateway composition root
-  constructs the shared process-scoped `LocalStore` at all: `disabled`
-  allocates no replay table and installs no gate, and a configured
-  `process_local` store that fails to initialize refuses to start rather
-  than silently falling back to an unprotected default. Replay-store
-  outcomes are exported as `tardigrade_tls_early_data_replay_total{outcome}`
-  (`accepted`, `duplicate`, `capacity_rejected`, `expired`, `unavailable`,
+  configurable replay TTL, strictly parsed so a malformed value fails
+  startup instead of silently becoming the default) now gate whether the
+  gateway composition root constructs the shared process-scoped `LocalStore`
+  at all: `disabled` allocates no replay table and installs no gate, and a
+  configured `process_local` store that fails to initialize refuses to start
+  rather than silently falling back to an unprotected default. Both fields
+  are restart-only — a config hot reload that changes either one is
+  rejected outright, keeping the previous configuration and the
+  already-installed store/gate coherent, since rebuilding the store in
+  place would discard its replay history. Replay-store outcomes are
+  exported as `tardigrade_tls_early_data_replay_total{outcome}` (`accepted`,
+  `duplicate`, `capacity_rejected`, `expired`, `unavailable`,
   `startup_quarantine`), bridged from the store's existing closed observer
   vocabulary the same way native resumption metrics are, with observer
-  callbacks running outside the store mutex. A new deterministic
-  `FakeDistributedStore` test double proves the TLS/composition layer
+  callbacks running outside the store mutex. New deterministic scripted-fake
+  `Store` test doubles (kept file-private, never part of the public
+  `tls_core` API surface, since their simplified non-atomic semantics must
+  not be mistaken for a real backend) prove the TLS/composition layer
   depends only on the existing atomic `Store.claim()` contract — never
   `LocalStore` internals — covering scripted commit, timeout, network-failure,
   and ambiguous-commit outcomes and confirming `duplicate`/`unavailable` map

@@ -156,7 +156,17 @@ pub const GateAdapter = struct {
 /// every timeout, network failure, ambiguous/partial commit, or replication
 /// uncertainty to `.unavailable` unless it can prove the claim outcome
 /// (never `.accepted` before an authoritative commit).
-pub const FakeDistributedOutcome = enum {
+/// Deliberately **not** `pub`: `tls/root.zig` re-exports this whole module
+/// publicly as `tls_core.early_data_replay`, and this fake's shortcuts
+/// (single-threaded contains()-then-put(), no synchronization, ignores
+/// `retain_until_unix_ms`, never expires an entry) are exactly the behaviors
+/// #368 says a real `Store` backend must *not* have. Keeping it file-private
+/// here means it can only ever be reached by this file's own tests, so the
+/// production `tls_core.early_data_replay` surface cannot expose a `Store`
+/// implementation that knowingly violates the contract this module defines.
+/// `tls13_backend_tests.zig` (a separate module) defines its own small local
+/// scripted double for the same purpose rather than importing this one.
+const FakeDistributedOutcome = enum {
     /// Simulates a normal atomic commit: first claim of a key succeeds,
     /// a repeated claim of an already-committed key is `.duplicate`.
     commit,
@@ -170,7 +180,7 @@ pub const FakeDistributedOutcome = enum {
     ambiguous_commit,
 };
 
-pub const FakeDistributedStore = struct {
+const FakeDistributedStore = struct {
     allocator: std.mem.Allocator,
     /// Scripted per-call outcome; tests mutate this directly between calls
     /// to simulate a backend's behavior changing (e.g. healthy, then a
@@ -178,15 +188,15 @@ pub const FakeDistributedStore = struct {
     mode: FakeDistributedOutcome = .commit,
     committed: std.AutoHashMapUnmanaged(Key, void) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator) FakeDistributedStore {
+    fn init(allocator: std.mem.Allocator) FakeDistributedStore {
         return .{ .allocator = allocator };
     }
 
-    pub fn deinit(self: *FakeDistributedStore) void {
+    fn deinit(self: *FakeDistributedStore) void {
         self.committed.deinit(self.allocator);
     }
 
-    pub fn store(self: *FakeDistributedStore) Store {
+    fn store(self: *FakeDistributedStore) Store {
         return .{ .ctx = self, .claimFn = trampolineClaim };
     }
 
