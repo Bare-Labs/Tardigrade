@@ -4693,4 +4693,5 @@ test "#368 Slice 2: one process-scoped early-data replay store is shared by nati
 test {
     _ = @import("gateway_handlers.zig");
     _ = @import("gateway_shutdown.zig");
+    _ = @import("process_early_data_integration_tests.zig");
 }

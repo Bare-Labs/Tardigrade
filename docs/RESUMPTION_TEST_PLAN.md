@@ -48,6 +48,94 @@ real OpenSSL/QUIC peer, no CI/soak changes.
   cross-layer, process-level version of this assurance to #369, which those
   predecessor suites do not exercise — see the deferred matrix below.
 
+## Slice 2 (this PR): process-level 0-RTT replay / anti-replay / 425 assurance
+
+Moves assurance one layer outward from Slice 1: exercises the real
+production TLS/replay-store/HTTP-early-data/gateway-retry code composed
+together, rather than each layer's own unit tests in isolation. Two new
+test areas, both reusing existing production code and harness patterns
+rather than scripted stand-ins:
+
+- **`src/tls/tls13_backend_tests.zig`** (real `DirectHarness`
+  ClientHello/PSK-offer/binder handshakes, a real
+  `tls_core.early_data_replay.LocalStore`/`GateAdapter`, and an atomic
+  "application executed" counter driven strictly by the real
+  `earlyDataAccepted()` outcome — not a re-derivation of the TLS decision
+  itself):
+  - `rt0.accept.first_use` — accepted 0-RTT records the replay claim,
+    executes the application exactly once, and a diagnostic-formatting
+    check confirms the raw ticket identity never appears in what a log
+    line would show (the candidate type has no PSK field at all, so that
+    leak is impossible by construction, not merely untested).
+  - `rt0.reject.duplicate` — an exact-duplicate claim on a second,
+    independent connection never executes the application; the resumed
+    connection remains usable and a later, distinct 1-RTT request executes
+    normally (total: one execution for the accept, one more for the
+    intentionally distinct later request).
+  - `rt0.reject.capacity` — a store configured with one live slot rejects a
+    second, otherwise-valid claim with the typed capacity outcome, no
+    application side effect, occupancy stays bounded, and a later request
+    on the same connection still succeeds.
+  - `rt0.reject.startup_quarantine` — a fresh store (modeling lost replay
+    history after a restart) rejects early execution during quarantine
+    without any application side effect, and the connection remains usable
+    for an ordinary request; the exact quarantine boundary is exercised
+    against #368's existing (exclusive-end) semantics
+    (`now < quarantine_end` rejects, `now == quarantine_end` is ordinary
+    eligibility) with a deterministic injected clock, not a sleep.
+  - `rt0.reject.cross_worker_duplicate` — two independent per-connection
+    `DirectHarness` instances ("worker A"/"worker B") share one real
+    `LocalStore`; worker A's accepted claim executes once, and worker B's
+    replay of the same identity is rejected and never executes. See the
+    "true OS-thread/worker-routing seam" note below.
+- **`src/process_early_data_integration_tests.zig`** (new file, wired into
+  `zig build test` via `edge_gateway.zig`'s existing `test { _ = @import(...) }`
+  aggregator pattern):
+  - `rt0.retry.425_exactly_once` — drives the real
+    `gateway_proxy_runtime.runBufferedProxyAttempts` retry/425 state
+    machine and the real production TCP HTTP client
+    (`executeBufferedDataPlaneProxyRequest`) against an actual loopback
+    upstream test server with an atomic execution counter that itself
+    returns a real `425 Too Early` whenever it sees a real `Early-Data: 1`
+    header. Proves: the retried request no longer carries the header, the
+    upstream executes exactly once total, the response returned to the
+    caller is the successful retry, and real
+    `http.metrics.Metrics.recordHttpEarlyDataUpstream425`/
+    `recordHttpEarlyDataRetry` deltas distinguish the initial 425 from the
+    successful retry — no parallel test-only metrics model.
+  - `rt0.reject.unsafe_request` — an unsafe method (POST) with current-hop
+    early data is rejected by the real, `pub`
+    `gateway_handlers.earlyDataDecisionForRequest` (the same function
+    `edge_gateway.zig`'s H1 dispatch calls) before any upstream dispatch is
+    attempted at all — the configured `proxy_pass` target is deliberately
+    nothing that listens, so the only way the test can pass is by the real
+    gateway decision short-circuiting before any network I/O, not by
+    racing a responder thread.
+  - `rt0.reject.store_unavailable` — ties two independently-proven facts
+    together: `edge_config.loadFromEnv`'s default configuration leaves
+    native 0-RTT replay mode `disabled` and defines no location routes at
+    all, and `tls13_backend.EarlyDataReplayGate`'s default (no gate
+    configured) fails closed to `.unavailable` for 0-RTT while leaving
+    ordinary 1-RTT resumption untouched (both already proven individually
+    by `edge_config.zig`'s and `tls13_backend_tests.zig`'s own suites) — so
+    a freshly started process with no operator configuration cannot accept
+    0-RTT anywhere, without needing any replay backend present.
+
+### Known gap: no deterministic worker-thread-routing test seam
+
+The cross-worker test above proves the process-shared-store guarantee
+using two independent per-connection state instances (the same object
+`edge_gateway.zig`'s real composition actually shares by reference across
+every native TCP worker and QUIC/H3 — see `initNativeEarlyDataReplayStore`/
+`GateAdapter.init` there), not two real OS worker threads. There is
+currently no API to pin a connection to a specific worker thread
+deterministically for testing, so a stronger proof (issue the accepted
+claim through worker thread A, replay it through worker thread B) is not
+available today. A future slice could add a small, explicit worker-id test
+seam to `WorkerContext` to close this gap; until then this is a
+documented, intentional limitation of this slice's assurance, not a
+weakening of the "workers share one store" guarantee itself.
+
 ## Explicitly deferred to a later slice
 
 - **External interop** with OpenSSL (`s_client`/`s_server` ticket
@@ -70,29 +158,11 @@ real OpenSSL/QUIC peer, no CI/soak changes.
   - A failed reload retains the prior snapshot rather than leaving the
     runtime with no usable key.
   - Concurrent / cross-worker restart and rotation cases.
-- **Process-level 0-RTT/replay/425 matrix** (the cross-layer assurance #326
-  assigns to #369, distinct from the unit/integration tests #367/#368
-  already carry):
-  - Drive the real gateway/native TLS or H3 path end to end with a
-    `process_local` (in-process, not distributed) anti-replay store; prove
-    a duplicate 0-RTT claim is rejected while the underlying PSK connection
-    still completes as ordinary 1-RTT.
-  - Prove anti-replay capacity exhaustion and startup-quarantine both
-    reject only the early-data attempt, never the resumed/full-handshake
-    connection.
-  - Drive a real 425 early-retry through an upstream request-execution
-    counter and prove it lands at exactly one execution, through the actual
-    proxy path rather than a scripted attempt executor.
-  - Validate the store's documented scope directly: all workers/transports
-    inside one process share one authoritative replay store (a replay
-    accepted by worker A is rejected by worker B in the same process);
-    separate Tardigrade processes are independent, so the guarantee is
-    process-local, not cluster-wide — #368 explicitly scoped out a real
-    distributed backend (Redis/etcd/similar) as out of contract for this
-    epic, so that remains this repo's committed behavior, not a gap to
-    close. This slice should validate the process-shared/multi-worker
-    guarantee and the documented non-cluster-wide limitation, not require
-    implementing a distributed backend.
+- **Deterministic worker-thread-pinning test seam** — see "Known gap"
+  above. #369 Slice 2 proves process-shared-store sharing across
+  independent per-connection state; it does not drive that proof through
+  real OS worker threads, because no seam exists yet to pin a connection to
+  one deterministically.
 - **Soak scenarios**: repeated reconnect/rotation loops with memory/metrics
   checks over long runs.
 - **CI wiring**: a smoke subset plus an optional nightly/soak job.
@@ -104,4 +174,5 @@ real OpenSSL/QUIC peer, no CI/soak changes.
 Acceptance criteria for #369 as a whole (interop reliability, safe
 fallback/rejection under mismatch, no double execution, bounded soak
 memory/cache growth, reproducible artifacts without leaking ticket keys)
-remain open until the deferred items above land in follow-up slices.
+remain open until the deferred items above land in follow-up slices. #369
+is not complete after this slice.
