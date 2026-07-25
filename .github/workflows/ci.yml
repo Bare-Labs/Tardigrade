@@ -209,6 +209,18 @@ jobs:
         if: runner.os == 'Linux'
         run: zig build test-integration -Dtls-profile=appliance --summary all --error-style verbose
 
+      # #369 stable smoke subset: external OpenSSL interop, real process
+      # restart, and a short reconnect soak. Shares the "timing-sensitive,
+      # Linux-only" scoping above -- it shells out to a real `openssl`
+      # subprocess (already installed by "Install system dependencies") and
+      # spawns/kills real Tardigrade processes, both more prone to macOS
+      # runner scheduling variance than the pure in-process native-TLS
+      # suite. The heavier soak/restart-loop variant runs on its own
+      # schedule (see resumption-soak.yml) rather than blocking PRs.
+      - name: Run resumption/0-RTT interop, restart, and soak smoke suite
+        if: runner.os == 'Linux'
+        run: zig build test-integration-resumption-interop -Dtls-profile=appliance --summary all --error-style verbose
+
   # ── PKI differential corpus ──────────────────────────────────────────────────
   # Replays the bounded core corpus against the pure-Zig validator, OpenSSL,
   # and Go crypto/x509. External validators remain out of process.
