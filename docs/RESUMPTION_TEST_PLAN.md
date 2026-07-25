@@ -83,14 +83,16 @@ real OpenSSL/QUIC peer, no CI/soak changes.
   - Drive a real 425 early-retry through an upstream request-execution
     counter and prove it lands at exactly one execution, through the actual
     proxy path rather than a scripted attempt executor.
-  - Validate the store's documented scope directly: it is process-local
-    (each worker/process anti-replay state is independent), and it is
-    *not* cluster-wide — #368 explicitly scoped out a real distributed
-    backend (Redis/etcd/similar) as out of contract for this epic, so that
-    remains this repo's committed behavior, not a gap to close. This slice
-    should validate the process-local/multi-worker guarantee and the
-    documented non-cluster-wide limitation, not require implementing a
-    distributed backend.
+  - Validate the store's documented scope directly: all workers/transports
+    inside one process share one authoritative replay store (a replay
+    accepted by worker A is rejected by worker B in the same process);
+    separate Tardigrade processes are independent, so the guarantee is
+    process-local, not cluster-wide — #368 explicitly scoped out a real
+    distributed backend (Redis/etcd/similar) as out of contract for this
+    epic, so that remains this repo's committed behavior, not a gap to
+    close. This slice should validate the process-shared/multi-worker
+    guarantee and the documented non-cluster-wide limitation, not require
+    implementing a distributed backend.
 - **Soak scenarios**: repeated reconnect/rotation loops with memory/metrics
   checks over long runs.
 - **CI wiring**: a smoke subset plus an optional nightly/soak job.
