@@ -23,6 +23,10 @@ pub const Options = struct {
     deadline_ms: u32 = default_deadline_ms,
     accepted_exit_codes: []const u8 = &.{0},
     cwd: std.process.Child.Cwd = .inherit,
+    /// Bytes written to the child's stdin immediately after spawn, then the
+    /// pipe is closed so the child sees EOF. `null` (the default) leaves
+    /// stdin closed from the start, matching every existing caller.
+    stdin: ?[]const u8 = null,
 };
 
 pub const Result = struct {
@@ -69,7 +73,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
         });
     var child = std.process.spawn(io, .{
         .argv = options.argv,
-        .stdin = .ignore,
+        .stdin = if (options.stdin != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = options.cwd,
@@ -80,6 +84,17 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
     const pgid = child.id.?;
     var reaped = false;
     defer if (!reaped) reapProcessGroup(&child, pgid);
+
+    if (options.stdin) |input| {
+        const stdin = child.stdin.?;
+        stdin.writeStreamingAll(io, input) catch |err| {
+            reapProcessGroup(&child, pgid);
+            reaped = true;
+            return launchFailureResult(allocator, "stdin write failed: {s}", .{@errorName(err)});
+        };
+        stdin.close(io);
+        child.stdin = null;
+    }
 
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;

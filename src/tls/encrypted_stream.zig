@@ -1464,6 +1464,13 @@ pub const PureZigRecordStream = struct {
                 try self.handleAlert(record.payload);
                 continue;
             }
+            // See the matching comment in `feedHandshakeToDriver`: RFC 8446
+            // Appendix D.4 middlebox-compat change_cipher_spec, dropped
+            // unopened since it was never encrypted.
+            if (record.content_type == .change_cipher_spec) {
+                if (record.payload.len != 1 or record.payload[0] != 0x01) return self.fail(error.UnexpectedRecordContent);
+                continue;
+            }
             const opened = try self.bridge.openProtected(epoch, record, &plaintext_buf);
             switch (opened.inner.content_type) {
                 .handshake => try self.appendInboundHandshake(opened.inner.content),
@@ -1523,6 +1530,19 @@ pub const PureZigRecordStream = struct {
         for (sink.items[0..sink.len]) |record| {
             if (epoch == .initial and record.content_type == .alert) {
                 try self.handleAlert(record.payload);
+                continue;
+            }
+            // RFC 8446 Appendix D.4: a middlebox-compatibility-mode peer sends
+            // an unprotected single-byte {0x01} change_cipher_spec record at
+            // any point up to its own Finished; it carries no protocol
+            // meaning and MUST be dropped without further processing rather
+            // than opened through the bridge (it was never encrypted, so
+            // `openProtected` would try to decrypt an unprotected record).
+            // `parseHeader` already bounds it to exactly one byte; any other
+            // payload here is the "any other change_cipher_spec value" case
+            // RFC 8446 requires aborting the handshake for.
+            if (record.content_type == .change_cipher_spec) {
+                if (record.payload.len != 1 or record.payload[0] != 0x01) return self.fail(error.UnexpectedRecordContent);
                 continue;
             }
             const opened = self.bridge.openProtected(epoch, record, &plaintext_buf) catch |err| return self.fail(err);
@@ -3825,6 +3845,53 @@ test "server-role stream accepts the 0x0301 ClientHello compatibility version on
     compat_server_hello[1] = 0x03;
     compat_server_hello[2] = 0x01;
     try testing.expectError(error.InvalidRecordVersion, client.feedHandshakeCiphertext(.initial, compat_server_hello[0..third.len]));
+}
+
+test "a handshake-epoch middlebox-compat change_cipher_spec is dropped without disrupting the handshake" {
+    const cp = testProvider();
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+
+    const client_hs = secret(0x51);
+    const server_hs = secret(0x52);
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &client_hs } });
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } });
+
+    // {0x14, 03, 03, 00, 01, 01}: an unprotected, single-byte compat CCS at
+    // the handshake epoch -- RFC 8446 Appendix D.4 requires this be dropped,
+    // not opened through the bridge (it was never encrypted) or treated as a
+    // handshake failure.
+    const consumed = try server.feedHandshakeCiphertext(.handshake, &.{ 20, 3, 3, 0, 1, 1 });
+    try testing.expectEqual(@as(usize, 6), consumed);
+    try testing.expectEqual(@as(?Error, null), server.failed);
+
+    // The connection is still usable afterward: real handshake content at
+    // the same epoch, sealed by an independent peer holding the matching
+    // write key, still reaches `readHandshake` normally.
+    var sender = PureZigRecordStream.init(.client, cp, .tls_aes_128_gcm_sha256);
+    defer sender.deinit();
+    try sender.bridge.installTrafficSecret(.handshake, .write, &client_hs);
+    var record_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const record = try sender.bridge.sealHandshake(.handshake, "hello", &record_buf);
+    _ = try server.feedHandshakeCiphertext(.handshake, record);
+    var out: [16]u8 = undefined;
+    const n = try server.readHandshake(&out);
+    try testing.expectEqualSlices(u8, "hello", out[0..n]);
+}
+
+test "a malformed change_cipher_spec at the handshake epoch aborts instead of silently passing" {
+    const cp = testProvider();
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+
+    const client_hs = secret(0x51);
+    const server_hs = secret(0x52);
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &client_hs } });
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } });
+
+    // Same envelope, wrong payload byte (RFC 8446: "any other
+    // change_cipher_spec value... MUST abort the handshake").
+    try testing.expectError(error.UnexpectedRecordContent, server.feedHandshakeCiphertext(.handshake, &.{ 20, 3, 3, 0, 1, 0 }));
 }
 
 test "handshake epoch discard fails closed when ciphertext_parser still holds a partial record" {
