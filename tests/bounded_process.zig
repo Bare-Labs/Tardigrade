@@ -27,6 +27,13 @@ pub const Options = struct {
     /// pipe is closed so the child sees EOF. `null` (the default) leaves
     /// stdin closed from the start, matching every existing caller.
     stdin: ?[]const u8 = null,
+    /// Bounded pause between writing `stdin` and closing the pipe. Some
+    /// protocols (e.g. a TLS post-handshake NewSessionTicket, sent after the
+    /// application response the child already read) deliver trailing data
+    /// asynchronously; closing stdin the instant the write returns can race
+    /// a peer process into shutting down before that trailing data arrives.
+    /// `0` (the default) closes immediately, matching every existing caller.
+    stdin_close_delay_ms: u32 = 0,
 };
 
 pub const Result = struct {
@@ -92,6 +99,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
             reaped = true;
             return launchFailureResult(allocator, "stdin write failed: {s}", .{@errorName(err)});
         };
+        if (options.stdin_close_delay_ms > 0) compat.sleepNs(@as(u64, options.stdin_close_delay_ms) * std.time.ns_per_ms);
         stdin.close(io);
         child.stdin = null;
     }

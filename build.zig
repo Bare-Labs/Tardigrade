@@ -222,6 +222,21 @@ pub fn build(b: *std.Build) void {
     const native_listener_integration_step = b.step("test-integration-native-tls", "Run native TLS listener HTTP integration tests");
     native_listener_integration_step.dependOn(&run_native_listener_integration_tests.step);
 
+    // Resumption/0-RTT external interop, restart, and soak suite (#369):
+    // the same live-process harness filtered to the stable `interop.`/
+    // `restart.`/`soak.` case-ID prefixes. Kept as its own step (not folded
+    // into `test-integration-native-tls`) so CI can budget it separately --
+    // it shells out to a real `openssl` subprocess per case and spawns/kills
+    // real Tardigrade processes for restart coverage.
+    const resumption_interop_tests = b.addTest(.{
+        .root_module = integration_mod,
+        .filters = &.{ "interop.", "restart.", "soak." },
+    });
+    const run_resumption_interop_tests = b.addRunArtifact(resumption_interop_tests);
+    run_resumption_interop_tests.step.dependOn(b.getInstallStep());
+    const resumption_interop_step = b.step("test-integration-resumption-interop", "Run #369 external OpenSSL interop, restart, and soak cases");
+    resumption_interop_step.dependOn(&run_resumption_interop_tests.step);
+
     // Failure-mode / chaos harness (#169): the same live-process harness filtered
     // to the `failure:`-prefixed tests so operators can exercise broken origins
     // and clients in isolation.
