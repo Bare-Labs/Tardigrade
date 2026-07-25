@@ -94,12 +94,132 @@ logs are written through `src/http/logger.zig`.
   `tardigrade_http_early_data_upstream_425_total{action}`,
   `tardigrade_http_early_data_retry_total{result}`,
   and `tardigrade_http3_early_data_compat_total{decision}`
+- native TLS/QUIC 0-RTT anti-replay store outcomes (#368):
+  `tardigrade_tls_early_data_replay_total{outcome}` with fixed outcomes
+  `accepted`, `duplicate`, `capacity_rejected`, `expired`, `unavailable`, and
+  `startup_quarantine`. Only exported once
+  `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE=process_local` and a native
+  0-RTT-capable path are both configured — the series simply stays at zero
+  otherwise. `duplicate` (a proven replay) and `capacity_rejected`/
+  `unavailable` (the store cannot currently vouch for 0-RTT) are always
+  distinguishable outcomes so operators can tell "an attacker replayed a
+  0-RTT flight" apart from "the store is saturated or not ready yet."
+  `startup_quarantine` is a separate outcome from a genuinely unavailable
+  store so a restart's expected quarantine window doesn't read the same as a
+  runtime failure. See "Native TLS 0-RTT Anti-Replay Protection" below for
+  the full guarantee this store provides.
 
 Early-data metric label sets are intentionally bounded and never include
-high-cardinality request attributes (URL, request id, stream id, host, IP).
+high-cardinality request attributes (URL, request id, stream id, host, IP,
+ticket fingerprint, PSK, or binder).
 
 The latency histogram is intentionally global rather than route-labeled to keep
 hot-path overhead predictable.
+
+## Native TLS 0-RTT Anti-Replay Protection
+
+This section documents the exact guarantee `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE`
+provides for the native (pure-Zig) TLS/QUIC 0-RTT path (#368). It governs only
+whether an accepted 0-RTT early-data claim can be replayed — a rejection here
+never fails an otherwise-valid PSK/session resumption handshake, which
+continues as ordinary 1-RTT resumption.
+
+### Configuration
+
+| Variable | Values | Default |
+| --- | --- | --- |
+| `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE` | `disabled`, `process_local` | `disabled` |
+| `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES` | integer, `1..1048576` | `65536` |
+
+`TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES` bounds replay-store
+*capacity* only. It is independent of ordinary TLS session-resumption/cache
+configuration (`TARDIGRADE_TLS_NATIVE_RESUMPTION_*`, `TARDIGRADE_TLS_SESSION_*`),
+and there is deliberately no separate replay TTL/retention setting: the
+recording window always comes from the existing TLS early-data age-skew/
+freshness policy, so replay protection can never accidentally outlive or
+undercut the freshness window that admitted the 0-RTT attempt in the first
+place. An unrecognized mode or an out-of-range entry count fails
+configuration validation at startup rather than silently falling back.
+
+### Guarantee by mode
+
+| Replay mode | Guarantee | Cluster behavior |
+| --- | --- | --- |
+| `disabled` (default) | The replay gate stays `.unavailable`; 0-RTT is never accepted. Ordinary 1-RTT resumption is unaffected. | Safe fallback — no anti-replay claim is made at all. |
+| `process_local` | **At most one successful 0-RTT claim per replay key, per Tardigrade process, during the recording window.** | A captured 0-RTT flight can potentially be accepted once by **each** independent process a load balancer can route it to. |
+| future distributed backend | Defined by the backend's advertised atomic scope (see below). | Must not be advertised as available until an authoritative distributed backend is implemented and configured. |
+
+`process_local` is **not** cluster-safe, globally at-most-once, or
+distributed replay protection. For N independent Tardigrade processes each
+running their own local store:
+
+```text
+load balancer
+    |
+    +-- process A -> LocalStore A
+    +-- process B -> LocalStore B
+    +-- process C -> LocalStore C
+```
+
+the same captured 0-RTT flight can be accepted once by each process if the
+load balancer can route the replay across them. **Operators requiring
+cluster-wide at-most-once 0-RTT must leave 0-RTT disabled** (replay mode
+`disabled`) until an authoritative distributed replay backend exists and is
+configured — `process_local` must never be described or relied on as a
+substitute.
+
+0-RTT also remains replay-exposed at the HTTP application layer regardless of
+this store's mode; the `Early-Data`/`425 Too Early` handling documented above
+(`early_data_source`/`early_data_action`/`early_data_replay_exposed`) is a
+separate, still-required layer of policy.
+
+### Startup/restart quarantine
+
+A `process_local` store is in-memory and loses its replay history on
+restart. To avoid forgetting recent replay history and reopening a window an
+attacker could exploit, a freshly constructed store rejects **all** 0-RTT
+claims (`unavailable`, surfaced as the `startup_quarantine` metric outcome)
+for an initial quarantine window before evaluating claims normally. Ordinary
+1-RTT resumption is unaffected during quarantine — only 0-RTT is rejected.
+
+### Capacity behavior
+
+The store never evicts a live (unexpired) replay record to make room for a
+new one — doing so would turn memory pressure into a replay bypass. Once the
+configured `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES` capacity is
+reached and no expired entries can be reclaimed, a new claim is rejected
+(`capacity_rejected`): that connection's 0-RTT attempt is refused, but its
+otherwise-valid 1-RTT PSK/session resumption still proceeds normally.
+
+### Process/worker sharing
+
+When enabled, exactly one process-scoped store is constructed at the gateway
+composition root and shared — via one gate — by every native TCP worker and
+the native QUIC/H3 runtime in the process. A worker-local or protocol-local
+store is not an acceptable production configuration, since it would let the
+same replay be accepted once per worker instead of once per process.
+
+### Future distributed backends
+
+`#368` defines, but does not implement, the contract a future networked
+(e.g. Redis/etcd) distributed replay backend must satisfy to safely replace
+`process_local`:
+
+- atomic insert-if-absent/compare-and-set semantics across its advertised
+  protection scope (an eventually-consistent `GET` then `SET` is explicitly
+  **not** valid — two racing processes could both observe absence and both
+  accept the same replay);
+- an expiry/TTL no shorter than the supplied recording deadline;
+- no `accepted` result before the claim is authoritatively committed;
+- a duplicate committed key always resolves to `duplicate`;
+- timeout, network failure, partial/ambiguous commit, or replication
+  uncertainty always resolve to `unavailable` unless the backend can prove
+  the claim outcome — never `accepted`;
+- no raw ticket, PSK, binder, ClientHello, request body, or other
+  application payload as stored key/value material.
+
+Until such a backend exists and is configured, `process_local` (or
+`disabled`) are the only supported modes.
 
 ## Request Tracing
 

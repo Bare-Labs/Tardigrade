@@ -5,6 +5,37 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Native TLS/QUIC 0-RTT anti-replay store: configuration, metrics, and
+  distributed-store contract proof (#368)** — completes the process-local
+  anti-replay store (#368 Slices 1–2) with an explicit operator-facing
+  configuration surface, bounded Prometheus metrics, and deployment/security
+  documentation. New `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE`
+  (`disabled` default, or `process_local`) and
+  `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES` (bounded, independent
+  of ordinary TLS resumption/session-cache configuration, no separately
+  configurable replay TTL) now gate whether the gateway composition root
+  constructs the shared process-scoped `LocalStore` at all: `disabled`
+  allocates no replay table and installs no gate, and a configured
+  `process_local` store that fails to initialize refuses to start rather
+  than silently falling back to an unprotected default. Replay-store
+  outcomes are exported as `tardigrade_tls_early_data_replay_total{outcome}`
+  (`accepted`, `duplicate`, `capacity_rejected`, `expired`, `unavailable`,
+  `startup_quarantine`), bridged from the store's existing closed observer
+  vocabulary the same way native resumption metrics are, with observer
+  callbacks running outside the store mutex. A new deterministic
+  `FakeDistributedStore` test double proves the TLS/composition layer
+  depends only on the existing atomic `Store.claim()` contract — never
+  `LocalStore` internals — covering scripted commit, timeout, network-failure,
+  and ambiguous-commit outcomes and confirming `duplicate`/`unavailable` map
+  to `replay_rejected`/`replay_unavailable` while otherwise-valid 1-RTT PSK
+  resumption is always preserved; no real networked backend (Redis/etcd/DB)
+  is implemented. `docs/OBSERVABILITY.md` documents the exact process-local
+  guarantee (at most one successful 0-RTT claim per replay key, per
+  Tardigrade process, during the recording window), startup/restart
+  quarantine, capacity behavior, and the cluster limitation: `process_local`
+  is explicitly not cluster-safe or globally at-most-once, and operators
+  requiring cluster-wide protection must leave 0-RTT disabled until an
+  authoritative distributed backend exists.
 - **TLS 1.3 session-resumption runtime foundation (#365)** — adds a
   mode-aware native resumption runtime for disabled, stateful, stateless, and
   hybrid policy. The runtime owns only the services selected by the configured
