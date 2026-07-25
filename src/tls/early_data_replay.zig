@@ -281,6 +281,21 @@ pub const LocalStore = struct {
             expired_removed.* += 1;
         }
 
+        // The caller (`tls13_backend.zig`) derived `c.retain_until_unix_ms`
+        // from an earlier wall-clock read at TLS-freshness-check time;
+        // `Store.claim`'s trampoline takes a *second*, later wall-clock
+        // reading for `now_unix_ms`. At the exact accepted negative-skew
+        // boundary those two reads can straddle `retain_until_unix_ms`
+        // itself. Inserting a claim whose own deadline has already passed
+        // relative to `now_unix_ms` would record an entry that looks
+        // already-expired to every subsequent claim of the same key —
+        // silently reopening the exact replay window #368 requires closed.
+        // Fail closed instead of recording anything.
+        if (now_unix_ms > c.retain_until_unix_ms) {
+            event.* = .unavailable;
+            return .unavailable;
+        }
+
         if (self.entries.count() < self.limits.max_entries) {
             return self.insertLocked(c, event);
         }
@@ -408,6 +423,42 @@ test "claim after the deadline expires the old entry and a new claim can be acce
     defer store.deinit();
     try testing.expectEqual(ClaimResult.accepted, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 2_000 }, 1_000));
     try testing.expectEqual(ClaimResult.accepted, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 5_000 }, 2_001));
+}
+
+test "a claim whose own deadline has already passed relative to now fails closed instead of recording an already-expired entry" {
+    // Guards the exact clock-boundary gap between the TLS-layer's earlier
+    // freshness-check read (which produced `retain_until_unix_ms = T`) and
+    // `Store.claim`'s later wall-clock read (`now_unix_ms = T + 1`):
+    // inserting anyway would record a key that looks already-expired to
+    // every subsequent claimant, letting a second concurrent replay of the
+    // same key also be accepted once it, too, observes the entry as
+    // expired and reclaims it.
+    var store = try LocalStore.init(testing.allocator, testLimits(4), 0, 1_000);
+    defer store.deinit();
+    try testing.expectEqual(ClaimResult.unavailable, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 1_000 }, 1_001));
+    try testing.expectEqual(@as(usize, 0), store.count());
+
+    // A second "concurrent" claim of the same key, at the same stale
+    // `now`, must not be recorded either — nothing was ever inserted for
+    // the first claim to protect against replay of the second.
+    try testing.expectEqual(ClaimResult.unavailable, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 1_000 }, 1_001));
+    try testing.expectEqual(@as(usize, 0), store.count());
+
+    // A fresh claim whose deadline has not yet passed still succeeds
+    // normally — this only guards claims that are stale on arrival.
+    try testing.expectEqual(ClaimResult.accepted, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 1_001 }, 1_001));
+}
+
+test "an already-stale claim also fails closed against a live entry it would otherwise expire and replace" {
+    // Same boundary gap, but with a *prior* live entry for the same key
+    // already present: the duplicate check must still win first (the key
+    // remains claimed), rather than the stale-deadline guard tearing down
+    // protection that was already established.
+    var store = try LocalStore.init(testing.allocator, testLimits(4), 0, 1_000);
+    defer store.deinit();
+    try testing.expectEqual(ClaimResult.accepted, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 5_000 }, 1_000));
+    try testing.expectEqual(ClaimResult.duplicate, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 1_000 }, 1_001));
+    try testing.expectEqual(@as(usize, 1), store.count());
 }
 
 test "two different keys are independent" {

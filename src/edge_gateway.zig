@@ -282,18 +282,19 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     defer if (native_resumption_runtime) |*rt| rt.deinit();
     // #368 Slice 2: one process-scoped anti-replay store, shared by every
-    // native TCP worker and the QUIC/H3 runtime — independent of whether
-    // native resumption is enabled above, since Slice 3 owns the switch
-    // that actually lets native 0-RTT be attempted. Declared ahead of
-    // every borrower below for the same teardown-ordering reason as
+    // native TCP worker and the QUIC/H3 runtime — but constructed only once
+    // a native PSK/early-data path can actually exist (below, once
+    // `native_tls_provider`/`h3_credential_provider` are known), so plain
+    // HTTP, OpenSSL-only, or resumption-disabled deployments never pay the
+    // default 65,536-entry reservation or gain a new startup-failure path
+    // for a security feature they cannot use. Declared (but not yet
+    // constructed) here, ahead of every borrower below, so its teardown —
+    // once present — runs last, for the same reason as
     // `native_resumption_runtime`.
-    var native_early_data_replay_store = initNativeEarlyDataReplayStore(state_allocator, @intCast(compat.milliTimestamp())) catch |err| {
-        state.logger.err(null, "native TLS/QUIC early-data replay store initialization failed ({s}); refusing to start", .{@errorName(err)});
-        return err;
-    };
-    defer native_early_data_replay_store.deinit();
-    var native_early_data_replay_gate_adapter = tls_core.early_data_replay.GateAdapter.init(native_early_data_replay_store.store());
-    const native_early_data_replay_gate = native_early_data_replay_gate_adapter.gate();
+    var native_early_data_replay_store: ?tls_core.early_data_replay.LocalStore = null;
+    defer if (native_early_data_replay_store) |*store| store.deinit();
+    var native_early_data_replay_gate_adapter: tls_core.early_data_replay.GateAdapter = undefined;
+    var native_early_data_replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate = null;
     var http3_dispatch_ctx = ghandlers.Http3DispatchContext{
         .config_store = &config_store,
         .cfg = cfg,
@@ -386,6 +387,21 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     defer if (native_credentials) |*store| store.deinit();
     defer if (tls_terminator) |*tls| tls.deinit();
+    if (nativeEarlyDataReplayStoreNeeded(
+        native_resumption_runtime != null,
+        native_tls_provider != null,
+        cfg.http3_enabled,
+        h3_credential_provider != null,
+    )) {
+        native_early_data_replay_store = initNativeEarlyDataReplayStore(state_allocator, @intCast(compat.milliTimestamp())) catch |err| {
+            state.logger.err(null, "native TLS/QUIC early-data replay store initialization failed ({s}); refusing to start", .{@errorName(err)});
+            return err;
+        };
+    }
+    if (native_early_data_replay_store) |*store| {
+        native_early_data_replay_gate_adapter = tls_core.early_data_replay.GateAdapter.init(store.store());
+        native_early_data_replay_gate = native_early_data_replay_gate_adapter.gate();
+    }
     if (cfg.http3_enabled) {
         if (!edge_config.hasTlsFiles(cfg)) {
             state.logger.warn(null, "HTTP/3 requested without TLS cert/key; QUIC bootstrap will remain incomplete", .{});
@@ -1425,6 +1441,27 @@ fn initNativeEarlyDataReplayStore(
         (tls_core.tls13_backend.ServerEarlyDataPolicy{}).age_skew_tolerance_ms,
         now_unix_ms,
     );
+}
+
+/// #368 Slice 2: whether a native PSK/early-data path can actually exist
+/// for this composition, and therefore whether `run()` should pay for
+/// constructing the process-scoped replay store at all. Native resumption
+/// being enabled is necessary but not sufficient — a native (non-OpenSSL)
+/// TLS backend that could ever accept early data must also be configured:
+/// native TCP (`native_tls_provider`) or, when HTTP/3 is enabled, native
+/// QUIC/H3 (`h3_credential_provider`). The OpenSSL terminator owns its own
+/// independent session cache and never consults this seam at all, so plain
+/// HTTP, OpenSSL-only, or resumption-disabled deployments must never gain
+/// the default 65,536-entry allocation or a new startup-failure path for a
+/// security feature they cannot use.
+fn nativeEarlyDataReplayStoreNeeded(
+    native_resumption_runtime_enabled: bool,
+    native_tls_provider_present: bool,
+    http3_enabled: bool,
+    h3_credential_provider_present: bool,
+) bool {
+    return native_resumption_runtime_enabled and
+        (native_tls_provider_present or (http3_enabled and h3_credential_provider_present));
 }
 
 fn reapActiveConnections(
@@ -4418,6 +4455,30 @@ fn gatewayTestWriteFd(fd: std.posix.fd_t, bytes: []const u8) tls_core.encrypted_
         return error.SocketWriteFailed;
     }
     return @intCast(rc);
+}
+
+test "#368 Slice 2: nativeEarlyDataReplayStoreNeeded is false for every configuration without a native PSK/early-data path" {
+    // Plain HTTP or resumption-disabled: no native resumption at all.
+    try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(false, false, false, false));
+    try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(false, true, false, false));
+    try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(false, false, true, true));
+    // OpenSSL-only TCP with HTTP/3 disabled: native resumption enabled, but
+    // neither a native TCP provider nor an eligible H3 path exists.
+    try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(true, false, false, false));
+    // HTTP/3 enabled but no native H3 credential provider actually bootstrapped
+    // (e.g. TLS files missing), and no native TCP provider either.
+    try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(true, false, true, false));
+    // A native TCP provider exists, but native resumption itself is disabled.
+    try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(false, true, true, true));
+}
+
+test "#368 Slice 2: nativeEarlyDataReplayStoreNeeded is true once native resumption and a native TCP or QUIC/H3 path both exist" {
+    try std.testing.expect(nativeEarlyDataReplayStoreNeeded(true, true, false, false));
+    try std.testing.expect(nativeEarlyDataReplayStoreNeeded(true, false, true, true));
+    try std.testing.expect(nativeEarlyDataReplayStoreNeeded(true, true, true, true));
+    // HTTP/3 disabled entirely: the H3 credential-provider flag alone must
+    // not be enough without `http3_enabled` also true.
+    try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(true, false, false, true));
 }
 
 test "#368 Slice 2: initNativeEarlyDataReplayStore rejects 0-RTT for the startup quarantine window then accepts fresh claims" {

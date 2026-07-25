@@ -947,6 +947,83 @@ test "0-RTT is rejected without ever consulting the replay gate when the retenti
     try std.testing.expectEqual(@as(?tls_backend.EarlyDataReplayCandidate, null), replay_gate.seen);
 }
 
+test "0-RTT is rejected, not accepted, when the replay store's own clock read lands past the TLS-validated retention deadline; 1-RTT resumption still completes" {
+    // The exact clock-boundary gap flagged in review: `tls13_backend.zig`
+    // derives `retain_until_unix_ms` from an earlier wall-clock read (the
+    // resolver's `now`, fixed here via `IdentityResolver.now`/
+    // `earlyDataResumedClientClock`); `Store.claim`'s trampoline then takes
+    // a *second*, later wall-clock read for its own `now_unix_ms`. If that
+    // second read lands even one millisecond past the deadline the first
+    // read produced, a naive store would insert an already-expired record
+    // and report `.accepted` — letting a second, concurrent replay of the
+    // same key also be accepted once it observes that record as expired.
+    // `LocalStore.claimLocked`'s stale-claim guard (see `early_data_replay.zig`)
+    // must fail closed here instead.
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+
+    // A real `LocalStore`, driven through a gate that simulates the
+    // replay-store clock reading exactly one millisecond past the
+    // TLS-validated deadline it is handed — rather than depending on real
+    // wall-clock timing (non-deterministic and effectively unreachable in
+    // a fast unit test), this test controls that later read directly so
+    // the boundary is hit deterministically every run.
+    var store = try tls_core.early_data_replay.LocalStore.init(std.testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    const RaceGate = struct {
+        store: *tls_core.early_data_replay.LocalStore,
+
+        fn decide(ctx: *anyopaque, candidate: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const result = self.store.claim(
+                .{ .key = candidate.ticket_identity_fingerprint, .retain_until_unix_ms = candidate.retain_until_unix_ms },
+                candidate.retain_until_unix_ms + 1,
+            );
+            return switch (result) {
+                .accepted => .allow,
+                .duplicate => .replay,
+                .rejected_capacity, .unavailable => .unavailable,
+            };
+        }
+    };
+    var race_gate = RaceGate{ .store = &store };
+    try resumed.server_backend.setEarlyDataReplayGate(.{ .ctx = &race_gate, .decideFn = RaceGate.decide });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    // Resumption itself is unaffected by the store's clock-boundary
+    // rejection — only the 0-RTT attempt is rejected.
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_unavailable, resumed.server_backend.earlyDataDecision());
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    // Nothing was recorded: a concurrent replay racing the same boundary
+    // must not find a live entry to duplicate against, nor an
+    // already-expired one it could silently reclaim and get accepted for.
+    try std.testing.expectEqual(@as(usize, 0), store.count());
+}
+
 test "#368 Slice 2: a real process-scoped LocalStore shared across two independent backends rejects the second worker's duplicate 0-RTT claim while both preserve 1-RTT resumption" {
     var issued = try issueEarlyCapableTicket(32);
     defer issued.deinit();
