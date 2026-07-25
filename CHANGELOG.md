@@ -624,6 +624,17 @@ All notable user-facing changes to Tardigrade are documented here.
   number space so Initial, Handshake, and Application ranges cannot merge.
 
 ### Fixed
+- **Native TLS listener now tolerates the RFC 8446 Appendix D.4
+  middlebox-compatibility `change_cipher_spec` record (#369)** — the
+  record layer required every post-ClientHello record's outer wire type
+  to be `application_data`, with no exception for the unprotected,
+  single-byte `change_cipher_spec` record that TLS 1.3
+  middlebox-compatibility mode sends during the handshake. Most
+  real-world TLS 1.3 clients (OpenSSL included) send this by default, so
+  any external client's connection to the native listener was torn down
+  right after its final handshake flight — discovered while building
+  external OpenSSL interoperability coverage, since existing tests only
+  ever exercised the native listener against Tardigrade's own client.
 - **Default static `index` fallback for `root`/`alias` locations (#437)** — a
   `location` block with `root` (or `alias`) set but no explicit `index`
   directive now defaults `index` to `index.html` (nginx-compatible) instead

@@ -199,54 +199,213 @@ seam to `WorkerContext` to close this gap; until then this is a
 documented, intentional limitation of this slice's assurance, not a
 weakening of the "workers share one store" guarantee itself.
 
-## Explicitly deferred to a later slice
+## Slice 3 (this PR): external OpenSSL interop, real process restart, and soak
 
-- **External interop** with OpenSSL (`s_client`/`s_server` ticket
-  round-trips) and an independent QUIC peer for H3 resumption/0-RTT. Needs
-  subprocess-driven test harnesses, not covered here.
-- **Operational restart/rotation matrix** (the part of #369's restart
-  obligation the in-process `Runtime` model above does not reach):
-  - Old ticket issued → actual process restart / composition re-init →
-    resolver miss on the old ticket → connection still completes as a
-    usable full handshake → fresh ticket issuance succeeds with bounded
-    metrics recorded for the miss and the reissue.
-  - A persistent-overlap restart: generation N retained decrypt-only
-    alongside a newly current generation N+1 (or, for the stateless
-    keyring, a fresh non-overlapping nonce lease on reload), proving live
-    traffic straddling the reload never double-uses a nonce or drops a
-    still-valid ticket.
-  - Exact lifecycle boundaries (not-yet-active, active, decrypt-only grace,
-    fully retired) driven through a real reload/composition path rather
-    than direct `ReloadableKeyRing` calls.
-  - A failed reload retains the prior snapshot rather than leaving the
-    runtime with no usable key.
-  - Concurrent / cross-worker restart and rotation cases.
-- **Deterministic worker-thread-pinning test seam** — see "Known gap"
-  above. #369 Slice 2 proves process-shared-store sharing across
-  independent per-connection state; it does not drive that proof through
-  real OS worker threads, because no seam exists yet to pin a connection to
-  one deterministically.
-- **Soak scenarios**: repeated reconnect/rotation loops with memory/metrics
-  checks over long runs.
-- **CI wiring**: a smoke subset plus an optional nightly/soak job.
-- **QUIC-transport-specific 0-RTT-rejection-falls-back-to-1-RTT variant.**
-  The record-transport matrix is thoroughly covered
-  (`src/tls/tls13_backend_tests.zig`); an equivalent pass explicitly over
-  `Transport.quic` has not been added yet.
-- **True end-to-end native TCP/H1 production 0-RTT dispatch coverage**
-  (#510): the E2E must start from a production-issued early-capable native
-  TCP ticket (`max_early_data_size` advertised by the production ticket
-  path), use production server composition to enable
-  `Tls13Backend.ServerEarlyDataPolicy` only when replay protection
-  prerequisites are satisfied, then carry accepted/rejected TLS 0-RTT
-  record provenance through native TCP/H1 request parsing into
-  `RequestContext.early_data` and the production H1 safety gate. The
-  current slice proves the TLS/replay-store decision and the constructed H1
-  dispatch context on either side of that wider gap; it does not close the
-  missing production enablement or provenance handoff itself.
+This slice is explicitly **not** the final #369 slice, and #369 stays
+open after it. Two premises the original plan for a final slice assumed
+turned out to be false once actually checked against current `main`,
+before any test code was written:
 
-Acceptance criteria for #369 as a whole (interop reliability, safe
-fallback/rejection under mismatch, no double execution, bounded soak
-memory/cache growth, reproducible artifacts without leaking ticket keys)
-remain open until the deferred items above land in follow-up slices. #369
-is not complete after this slice.
+1. **#510's remaining scope is not "wire three call sites."** Its issue
+   text was written on the assumption that `NativeTlsConnection`'s
+   record-read early-data provenance accessor already worked and just
+   needed plumbing into H1. Inspection found
+   `PureZigRecordStream.currentReadTransportEarly()` is a stub that always
+   returns `false`, `record_epoch_bridge.Bridge` rejects the `.zero_rtt`
+   epoch everywhere (`error.UnsupportedRecordEpoch`), and
+   `feedHandshakeToDriver` hard-fails any pre-handshake `application_data`
+   record — meaning real 0-RTT decryption does not exist at all for the
+   record (TCP) transport, not merely "isn't wired to HTTP yet". Native
+   QUIC 0-RTT is also unconditionally rejected in code, independent of
+   configuration. So 0-RTT does not exist end-to-end on **any** transport
+   today, and no amount of wiring closes that — it needs new record-layer
+   capability comparable in size to the #366–#368 QUIC slices. #510's
+   issue text has been corrected with this finding; it remains open as its
+   own, larger effort, and is not attempted in this PR.
+2. **#338/#358 (the external OpenSSL interop harness this slice was told
+   to reuse) do not exist yet either.** Both issues are open; the repo has
+   `tests/crypto_openssl_diff.zig`/`pki_openssl_diff.zig` (differential
+   crypto fixtures, not a live TLS-over-TCP subprocess harness) and a real
+   external QUIC/H3 harness (`scripts/interop/run-interop.sh` +
+   `tests/h3_interop_tool.zig`), but no `s_client`/`s_server` abstraction.
+   This slice adds the minimal, resumption-scoped subprocess helpers it
+   needs directly in `tests/integration.zig` (`runOpenssl`, a
+   `bounded_process.zig` stdin extension) rather than building a second
+   generic OpenSSL interoperability framework — #338/#358 still own that
+   broader effort.
+
+Given both, this slice proves everything that is honestly achievable
+against the *actual* current production surface — real 1-RTT resumption
+end to end — and leaves every 0-RTT-specific external/production
+acceptance-criteria row explicitly open, tracked against #510's corrected
+scope rather than faked with test-only configuration.
+
+### A previously undiscovered, unrelated production bug found and fixed first
+
+Pointing a real `openssl s_client` at the native TLS listener for the
+first time (for the H1 interop case below) failed every single time with
+`error.InvalidRecordType` immediately after the client's final handshake
+flight — before any resumption logic was even reachable. Root cause:
+`record_codec.parseHeader`'s ciphertext-mode parser required every
+record's outer wire type to be `application_data`, with no exception for
+the unprotected, single-byte `change_cipher_spec` record that TLS 1.3
+middlebox-compatibility mode sends during the handshake (RFC 8446 Appendix
+D.4) — which OpenSSL, and most other real-world TLS 1.3 stacks, send by
+default. This is a universal external-interop bug, unrelated to
+resumption, that self-testing (Tardigrade's own client against its own
+server) never exercised. Fixed in `record_codec.zig`/
+`encrypted_stream.zig` (see that commit) with new unit coverage; every
+interop case in this slice runs against the fixed code and would not have
+passed before it.
+
+### External OpenSSL interop (`tests/integration.zig`, real `openssl` subprocess)
+
+- `interop.openssl.h1.resume` — real native TLS listener, real
+  `openssl s_client`, full handshake, OpenSSL's own `-sess_out`
+  session-file capture, resumed reconnect via `-sess_in`, a real HTTP
+  request over the resumed connection, and cross-checked authoritative
+  indicators from **both** sides: OpenSSL's own `Reused`/`New` line
+  (backed by `SSL_session_reused()`) and Tardigrade's
+  `tardigrade_tls_resumption_outcome_total{outcome="accepted"}` metric —
+  not merely a second successful handshake.
+- `interop.openssl.h2.resume` — the same proof scoped to the TLS layer
+  under the h2 ALPN path (handshake, ticket, resumed reconnect, ALPN
+  renegotiated to h2 again). Hand-rolling HPACK/frame encoding through raw
+  `s_client` stdin to drive one real h2 request was judged out of
+  proportion to what this case needs to prove, given H1 above already
+  proves resumption carries a real served request end to end and
+  production H2 dispatch has its own independent coverage; documented in
+  the test itself rather than silently narrowed.
+- `interop.openssl.ticket.expired` — 1-second ticket lifetime, a real
+  2-second sleep past it (there is no injectable clock at this external
+  boundary), reconnect falls back to a full handshake, connection remains
+  usable, a fresh ticket is issued afterward, and the expired-ticket
+  attempt never counts as `accepted`.
+- `interop.openssl.sni_mismatch` — the appliance TLS profile (the only
+  profile the native listener builds under) supports exactly one identity
+  and rejects `TARDIGRADE_TLS_SNI_CERTS` outright, so the only honest
+  externally-observable case is: any SNI other than the configured one,
+  ticket or not, is a deterministic `handshake_failure` alert — no request
+  is ever served, no secret material appears in the failure diagnostics,
+  and the listener remains fully usable via the correct SNI immediately
+  afterward.
+- `interop.openssl.alpn_mismatch` — ticket obtained under `h2`, reconnect
+  offering only `http/1.1`: falls back to a full handshake under the new
+  ALPN, old ticket never silently reused.
+- `interop.openssl.ticket.tampered` — flips one byte inside the real
+  `ticket_protection` AEAD envelope (stateless mode; located by its public,
+  non-secret `"TDTK"` magic via a minimal DER walk of the OpenSSL session
+  file, landing the flip inside the OCTET STRING's declared length rather
+  than a tag/length byte a blind offset would otherwise corrupt — which
+  would only break OpenSSL's own local session-file parser and prove
+  nothing about the server). No crash, safe fallback to a full handshake,
+  and the still-authentic ciphertext fingerprint next to the flipped byte
+  never appears in the server's log or the client's own stdout/stderr.
+- **`interop.openssl.cipher_mismatch` deliberately not shipped.** Ad hoc
+  verification found the reconnect still negotiated the *original* cipher
+  suite despite the client restricting itself via `-ciphersuites` to a
+  disjoint one — behavior that needs its own investigation before a test
+  can assert on it honestly. Shipping a test that silently asserts nothing
+  useful would be worse than not shipping one; left as a known gap.
+
+### Real process restart (`tests/integration.zig`, real separate OS processes)
+
+- `restart.ephemeral.ticket_miss` / `restart.ephemeral.fresh_ticket` — a
+  real process A (not `Runtime.deinit()`/`Runtime.init()` reused inside
+  one test object) issues a stateless ticket, is terminated, and a real
+  fresh process B with the same operator configuration proves: the old
+  ticket resolves as a miss rather than authenticating, the connection
+  still completes via a full handshake, B issues its own fresh ticket that
+  genuinely resumes within B's own lifetime, and neither process's log
+  ever contains the raw ticket ciphertext.
+- `restart.cert_change.ticket_rejected` — process B boots with a
+  different, test-generated throwaway credential under the same
+  `server_name`; the old ticket must not (and does not) bypass the new
+  authentication binding.
+- Both use the ephemeral **stateless** ticket-key policy specifically —
+  the currently supported restart-safety policy per #369 section 6.
+  Stateful mode's cache-miss shape after a restart is a different,
+  already-covered concern (an empty cache, not a key-loss question).
+
+### Reconnect soak (`tests/integration.zig`, in-process client against one long-lived server)
+
+- `soak.reconnect_resumption` — a bounded loop of full handshake → ticket
+  → resumed reconnect against one process, using the fast in-process
+  `PureZigTlsClient` rather than spawning `openssl` per iteration (that
+  external proof is already covered by the interop cases above). Tracks
+  iteration count and asserts the required invariant exactly —
+  application executions equal legitimate requests expected to execute,
+  never derived from a TLS-layer decision function itself — plus that
+  every resumed reconnect actually resumed. `TARDIGRADE_SOAK_HEAVY=1`
+  scales the default 40-iteration run up to 2000 for the scheduled heavy
+  workflow; both sizes verified locally (2000 iterations: ~27s,
+  `accepted=2000 executions=4000`, exact match, no failures).
+- **Known gap**: there is no exposed gauge for server-side
+  resumption-cache occupancy today (only issuance/outcome counters), so
+  "memory/cache growth converges to configured bounds" is proven only via
+  the cache's own existing bounded-capacity unit tests
+  (`test-session-cache`, #364) plus this loop never regressing the counted
+  invariants over many iterations — not via a live occupancy sample.
+  Documented rather than asserted against a metric that doesn't exist.
+
+### CI
+
+- `zig build test-integration-resumption-interop` (new build step,
+  filtered to the `interop.`/`restart.`/`soak.` case-ID prefixes) is wired
+  into the existing appliance-profile CI job's Linux-only tier — the same
+  scoping that job already applies to the full integration suite, since
+  this new suite is similarly more prone to runner-scheduling variance
+  (real subprocesses, real process spawn/kill, bounded real-time sleeps)
+  than the pure in-process native-TLS suite.
+- `.github/workflows/resumption-soak.yml` runs the same suite with
+  `TARDIGRADE_SOAK_HEAVY=1` on a weekly schedule plus manual dispatch,
+  mirroring `pki-differential.yml`'s existing pattern.
+
+## Explicitly deferred beyond this slice
+
+- **0-RTT external/production interop, entirely** (the largest remaining
+  gap): accepted 0-RTT, rejected-0-RTT-falls-back-to-1-RTT, and any
+  related metrics/replay assertions against real external peers, for
+  every transport. Blocked on #510's corrected (large) scope — see above
+  — not merely "not yet wired." Do not close #369 by treating any
+  in-process/constructed-context 0-RTT test (Slices 1–2) as equivalent to
+  this.
+- **Independent QUIC/H3 external interop for resumption/0-RTT.** The repo
+  has real external QUIC/H3 tooling (`scripts/interop/run-interop.sh` +
+  `tests/h3_interop_tool.zig`, driving ngtcp2/quiche/aioquic peers) that a
+  future slice should extend with resumption-specific scenarios, but this
+  slice does not add them. H3/QUIC 0-RTT is additionally blocked by the
+  same production gap as native TCP (see above) plus native QUIC's own
+  unconditional 0-RTT rejection.
+- **Rotation / persistent-overlap key policy — Outcome B.** Inspected
+  `edge_gateway.zig`/`native_tls_connection.zig`: `ReloadableKeyRing`
+  (`src/tls/ticket_protection.zig`) is not referenced by production
+  composition at all. Persistent-overlap rotation is not a production
+  capability today, full stop — not partially wired, not test-only
+  reachable. Per #369 section 7 Outcome B, this slice does **not** build a
+  test-only persistent-key system to manufacture rotation coverage; the
+  actual supported policy is ephemeral-only restart invalidation, which
+  the restart cases above cover. If persistent-overlap rotation is still
+  required for #326/#369's closure, that needs its own production issue
+  before it can be tested here.
+- **`interop.openssl.cipher_mismatch`** — see above; needs investigation
+  of an observed discrepancy before it can be shipped as a real assertion.
+- **Deterministic worker-thread-pinning test seam** (carried over from
+  Slice 2, unchanged): #369 Slice 2 proves the process-shared replay-store
+  guarantee across independent per-connection state, not through real OS
+  worker threads, because no seam exists yet to pin a connection to one
+  deterministically.
+- **Concurrent publication/rotation soak** (#369 section 8): not
+  applicable while rotation itself is Outcome B — nothing to soak-test
+  concurrently yet.
+- **Multi-worker/process-scoped anti-replay assurance beyond Slice 2**
+  (#369 section 10): unchanged from Slice 2; still blocked on the same
+  worker-pinning seam gap above, and separately on the 0-RTT production
+  gap (there is no accepted early-data claim to route between workers
+  without it).
+
+Acceptance criteria for #369 as a whole that depend on 0-RTT (accepted/
+rejected-0-RTT interop, replay-store cross-worker proof under real
+routing) or on persistent rotation remain open. #369 is not complete
+after this slice; the honest remainder is the corrected #510 scope plus
+the items above.
