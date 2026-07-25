@@ -143,6 +143,79 @@ pub const GateAdapter = struct {
     }
 };
 
+/// #368 Slice 3: a scripted, single-threaded fake of a *future* distributed
+/// `Store` backend. Not a real networked implementation (no Redis/etcd/DB —
+/// see the module doc) and, unlike a real distributed backend, this fake's
+/// `.commit` path is a plain contains()-then-insert() rather than a genuinely
+/// atomic CAS — safe here only because tests drive it from one thread. Its
+/// only purpose is proving that `GateAdapter`/`tls13_backend.zig` depend
+/// solely on the `Store.claim()` *contract* (accepted/duplicate/unavailable)
+/// and never on `LocalStore`-specific internals: a real distributed backend
+/// must still independently satisfy true cross-node atomicity, an
+/// expiry/TTL no shorter than `Claim.retain_until_unix_ms`, and must map
+/// every timeout, network failure, ambiguous/partial commit, or replication
+/// uncertainty to `.unavailable` unless it can prove the claim outcome
+/// (never `.accepted` before an authoritative commit).
+/// Deliberately **not** `pub`: `tls/root.zig` re-exports this whole module
+/// publicly as `tls_core.early_data_replay`, and this fake's shortcuts
+/// (single-threaded contains()-then-put(), no synchronization, ignores
+/// `retain_until_unix_ms`, never expires an entry) are exactly the behaviors
+/// #368 says a real `Store` backend must *not* have. Keeping it file-private
+/// here means it can only ever be reached by this file's own tests, so the
+/// production `tls_core.early_data_replay` surface cannot expose a `Store`
+/// implementation that knowingly violates the contract this module defines.
+/// `tls13_backend_tests.zig` (a separate module) defines its own small local
+/// scripted double for the same purpose rather than importing this one.
+const FakeDistributedOutcome = enum {
+    /// Simulates a normal atomic commit: first claim of a key succeeds,
+    /// a repeated claim of an already-committed key is `.duplicate`.
+    commit,
+    /// Simulates a request that timed out before the backend could prove
+    /// whether the claim committed.
+    timeout,
+    /// Simulates a network failure reaching the backend.
+    network_failure,
+    /// Simulates a partial/ambiguous commit the backend cannot prove either
+    /// way (e.g. replication uncertainty).
+    ambiguous_commit,
+};
+
+const FakeDistributedStore = struct {
+    allocator: std.mem.Allocator,
+    /// Scripted per-call outcome; tests mutate this directly between calls
+    /// to simulate a backend's behavior changing (e.g. healthy, then a
+    /// timeout).
+    mode: FakeDistributedOutcome = .commit,
+    committed: std.AutoHashMapUnmanaged(Key, void) = .empty,
+
+    fn init(allocator: std.mem.Allocator) FakeDistributedStore {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *FakeDistributedStore) void {
+        self.committed.deinit(self.allocator);
+    }
+
+    fn store(self: *FakeDistributedStore) Store {
+        return .{ .ctx = self, .claimFn = trampolineClaim };
+    }
+
+    fn trampolineClaim(ctx: *anyopaque, c: Claim) ClaimResult {
+        const self: *FakeDistributedStore = @ptrCast(@alignCast(ctx));
+        return self.claim(c);
+    }
+
+    fn claim(self: *FakeDistributedStore, c: Claim) ClaimResult {
+        switch (self.mode) {
+            .timeout, .network_failure, .ambiguous_commit => return .unavailable,
+            .commit => {},
+        }
+        if (self.committed.contains(c.key)) return .duplicate;
+        self.committed.put(self.allocator, c.key, {}) catch return .unavailable;
+        return .accepted;
+    }
+};
+
 const Entry = struct {
     retain_until_unix_ms: u64,
 };
@@ -791,4 +864,61 @@ test "GateAdapter.gate() surfaces capacity exhaustion as unavailable without evi
     // The first key must still be protected — capacity exhaustion never
     // evicts a live entry to admit a new one.
     try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.replay, gate.decideFn.?(gate.ctx, first));
+}
+
+// ---------------------------------------------------------------------
+// #368 Slice 3: `FakeDistributedStore` — deterministic proof of the future
+// distributed-store contract, independent of `LocalStore`.
+// ---------------------------------------------------------------------
+
+test "FakeDistributedStore: first claim of a key is accepted, a repeated claim of the same key is duplicate" {
+    var fake = FakeDistributedStore.init(testing.allocator);
+    defer fake.deinit();
+    try testing.expectEqual(ClaimResult.accepted, fake.claim(.{ .key = keyOf(1), .retain_until_unix_ms = std.math.maxInt(u64) }));
+    try testing.expectEqual(ClaimResult.duplicate, fake.claim(.{ .key = keyOf(1), .retain_until_unix_ms = std.math.maxInt(u64) }));
+    // A different key is independent.
+    try testing.expectEqual(ClaimResult.accepted, fake.claim(.{ .key = keyOf(2), .retain_until_unix_ms = std.math.maxInt(u64) }));
+}
+
+test "FakeDistributedStore: simulated timeout, network failure, and ambiguous commit all fail closed to unavailable, never accepted" {
+    var fake = FakeDistributedStore.init(testing.allocator);
+    defer fake.deinit();
+
+    fake.mode = .timeout;
+    try testing.expectEqual(ClaimResult.unavailable, fake.claim(.{ .key = keyOf(1), .retain_until_unix_ms = std.math.maxInt(u64) }));
+
+    fake.mode = .network_failure;
+    try testing.expectEqual(ClaimResult.unavailable, fake.claim(.{ .key = keyOf(1), .retain_until_unix_ms = std.math.maxInt(u64) }));
+
+    fake.mode = .ambiguous_commit;
+    try testing.expectEqual(ClaimResult.unavailable, fake.claim(.{ .key = keyOf(1), .retain_until_unix_ms = std.math.maxInt(u64) }));
+
+    // None of the failed attempts committed anything: the key is still
+    // available for a genuine first claim once the backend recovers.
+    fake.mode = .commit;
+    try testing.expectEqual(ClaimResult.accepted, fake.claim(.{ .key = keyOf(1), .retain_until_unix_ms = std.math.maxInt(u64) }));
+}
+
+test "GateAdapter over a fake distributed Store (not LocalStore) drives the same allow/replay/unavailable decisions — composition depends only on the Store contract" {
+    var fake = FakeDistributedStore.init(testing.allocator);
+    defer fake.deinit();
+    var adapter = GateAdapter.init(fake.store());
+    const gate = adapter.gate();
+
+    const candidate: tls13_backend.EarlyDataReplayCandidate = .{
+        .ticket_identity_fingerprint = keyOf(9),
+        .retain_until_unix_ms = std.math.maxInt(u64),
+    };
+    // First claim on a healthy backend: allow.
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.allow, gate.decideFn.?(gate.ctx, candidate));
+    // Repeated claim of the same key: proven replay.
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.replay, gate.decideFn.?(gate.ctx, candidate));
+
+    // A distributed failure never maps to `.allow` — even for a fresh key.
+    fake.mode = .network_failure;
+    const other: tls13_backend.EarlyDataReplayCandidate = .{
+        .ticket_identity_fingerprint = keyOf(10),
+        .retain_until_unix_ms = std.math.maxInt(u64),
+    };
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.unavailable, gate.decideFn.?(gate.ctx, other));
 }

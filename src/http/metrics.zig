@@ -33,6 +33,14 @@ pub const EarlyDataUpstream425Action = enum { forwarded, retried };
 pub const EarlyDataRetryResult = enum { success, too_early, failure };
 pub const H3EarlyDataCompatDecision = enum { compatible, transport_incompatible, settings_incompatible, missing_state };
 
+/// #368 Slice 3: process-local anti-replay store outcomes. Mirrors
+/// `tls_core.early_data_replay.Event` one-for-one (bridged in
+/// `edge_gateway.zig`'s `mapEarlyDataReplayEvent`, matching the
+/// `nativeResumptionOutcomeValue`-style bridge pattern) — a fixed, closed
+/// enum, never a ticket fingerprint, ticket identity, client address,
+/// request path, user ID, PSK, or binder.
+pub const EarlyDataReplayOutcome = enum { accepted, duplicate, capacity_rejected, expired, unavailable, startup_quarantine };
+
 const resumption_transport_count = 2;
 const resumption_outcome_count = 5;
 const resumption_mode_count = 3;
@@ -43,6 +51,7 @@ const early_data_decision_count = 4;
 const early_data_upstream_425_action_count = 2;
 const early_data_retry_result_count = 3;
 const h3_early_data_compat_decision_count = 4;
+const early_data_replay_outcome_count = 6;
 
 /// Server-wide metrics counters.
 ///
@@ -192,6 +201,9 @@ pub const Metrics = struct {
     http_early_data_retry_total: [early_data_retry_result_count]u64,
     /// HTTP/3 early-data compatibility outcomes.
     http3_early_data_compat_total: [h3_early_data_compat_decision_count]u64,
+    /// #368 Slice 3: process-local anti-replay store outcomes by bounded,
+    /// closed-enum outcome. See `EarlyDataReplayOutcome`.
+    tls_early_data_replay_total: [early_data_replay_outcome_count]u64,
     /// Total graceful-shutdown drains started.
     drain_total: u64,
     /// Total drains that hit the configured drain timeout before work finished.
@@ -308,6 +320,7 @@ pub const Metrics = struct {
             .http_early_data_upstream_425_total = .{0} ** early_data_upstream_425_action_count,
             .http_early_data_retry_total = .{0} ** early_data_retry_result_count,
             .http3_early_data_compat_total = .{0} ** h3_early_data_compat_decision_count,
+            .tls_early_data_replay_total = .{0} ** early_data_replay_outcome_count,
             .drain_total = 0,
             .drain_timeouts_total = 0,
             .drain_forced_closes_total = 0,
@@ -405,6 +418,11 @@ pub const Metrics = struct {
 
     pub fn recordHttp3EarlyDataCompat(self: *Metrics, decision: H3EarlyDataCompatDecision) void {
         self.http3_early_data_compat_total[h3EarlyDataCompatDecisionIndex(decision)] += 1;
+    }
+
+    /// #368 Slice 3: record a process-local anti-replay store outcome.
+    pub fn recordEarlyDataReplay(self: *Metrics, outcome: EarlyDataReplayOutcome) void {
+        self.tls_early_data_replay_total[earlyDataReplayOutcomeIndex(outcome)] += 1;
     }
 
     /// Record the start of a config hot-reload attempt.
@@ -895,6 +913,7 @@ pub const Metrics = struct {
         try self.appendTlsBufferPrometheus(&out);
         try self.appendResumptionPrometheus(&out);
         try self.appendHttpEarlyDataPrometheus(&out);
+        try self.appendEarlyDataReplayPrometheus(&out);
 
         try out.print(
             \\# HELP tardigrade_proxy_client_aborts_total Total proxied transfers aborted by downstream clients
@@ -1342,6 +1361,31 @@ pub const Metrics = struct {
         }
     }
 
+    /// #368 Slice 3: process-local anti-replay store outcomes. Every label
+    /// comes from the fixed, closed `EarlyDataReplayOutcome` enum — never a
+    /// ticket fingerprint, ticket identity, client address, request path,
+    /// user ID, PSK, or binder.
+    fn appendEarlyDataReplayPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_early_data_replay_total Process-local 0-RTT anti-replay store outcomes by outcome
+            \\# TYPE tardigrade_tls_early_data_replay_total counter
+            \\
+        );
+        inline for (.{
+            EarlyDataReplayOutcome.accepted,
+            EarlyDataReplayOutcome.duplicate,
+            EarlyDataReplayOutcome.capacity_rejected,
+            EarlyDataReplayOutcome.expired,
+            EarlyDataReplayOutcome.unavailable,
+            EarlyDataReplayOutcome.startup_quarantine,
+        }) |outcome| {
+            try out.print("tardigrade_tls_early_data_replay_total{{outcome=\"{s}\"}} {d}\n", .{
+                earlyDataReplayOutcomeLabel(outcome),
+                self.tls_early_data_replay_total[earlyDataReplayOutcomeIndex(outcome)],
+            });
+        }
+    }
+
     /// Format metrics as a JSON string.
     /// Caller owns the returned memory.
     pub fn toJson(self: *const Metrics, allocator: std.mem.Allocator) ![]u8 {
@@ -1580,6 +1624,17 @@ fn h3EarlyDataCompatDecisionIndex(decision: H3EarlyDataCompatDecision) usize {
     };
 }
 
+fn earlyDataReplayOutcomeIndex(outcome: EarlyDataReplayOutcome) usize {
+    return switch (outcome) {
+        .accepted => 0,
+        .duplicate => 1,
+        .capacity_rejected => 2,
+        .expired => 3,
+        .unavailable => 4,
+        .startup_quarantine => 5,
+    };
+}
+
 fn httpProtocolLabel(protocol: HttpProtocol) []const u8 {
     return switch (protocol) {
         .h1 => "h1",
@@ -1626,6 +1681,17 @@ fn h3EarlyDataCompatDecisionLabel(decision: H3EarlyDataCompatDecision) []const u
         .transport_incompatible => "transport_incompatible",
         .settings_incompatible => "settings_incompatible",
         .missing_state => "missing_state",
+    };
+}
+
+fn earlyDataReplayOutcomeLabel(outcome: EarlyDataReplayOutcome) []const u8 {
+    return switch (outcome) {
+        .accepted => "accepted",
+        .duplicate => "duplicate",
+        .capacity_rejected => "capacity_rejected",
+        .expired => "expired",
+        .unavailable => "unavailable",
+        .startup_quarantine => "startup_quarantine",
     };
 }
 
@@ -1953,6 +2019,56 @@ test "resumption and ticket counters appear in Prometheus output with closed-enu
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_ticket_issue_total{transport=\"record\",mode=\"stateful\",result=\"success\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_ticket_store_total{result=\"success\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_ticket_resolve_total{mode=\"hybrid\",result=\"success\"} 1") != null);
+}
+
+test "#368 Slice 3: early-data replay counters default to zero and record by outcome" {
+    var m = Metrics.init();
+    inline for (.{
+        EarlyDataReplayOutcome.accepted,
+        EarlyDataReplayOutcome.duplicate,
+        EarlyDataReplayOutcome.capacity_rejected,
+        EarlyDataReplayOutcome.expired,
+        EarlyDataReplayOutcome.unavailable,
+        EarlyDataReplayOutcome.startup_quarantine,
+    }) |outcome| {
+        try std.testing.expectEqual(@as(u64, 0), m.tls_early_data_replay_total[earlyDataReplayOutcomeIndex(outcome)]);
+    }
+
+    m.recordEarlyDataReplay(.accepted);
+    m.recordEarlyDataReplay(.accepted);
+    m.recordEarlyDataReplay(.duplicate);
+    m.recordEarlyDataReplay(.capacity_rejected);
+    m.recordEarlyDataReplay(.expired);
+    m.recordEarlyDataReplay(.unavailable);
+    m.recordEarlyDataReplay(.startup_quarantine);
+
+    try std.testing.expectEqual(@as(u64, 2), m.tls_early_data_replay_total[earlyDataReplayOutcomeIndex(.accepted)]);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_early_data_replay_total[earlyDataReplayOutcomeIndex(.duplicate)]);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_early_data_replay_total[earlyDataReplayOutcomeIndex(.capacity_rejected)]);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_early_data_replay_total[earlyDataReplayOutcomeIndex(.expired)]);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_early_data_replay_total[earlyDataReplayOutcomeIndex(.unavailable)]);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_early_data_replay_total[earlyDataReplayOutcomeIndex(.startup_quarantine)]);
+}
+
+test "#368 Slice 3: early-data replay counters appear in Prometheus output with closed-enum labels only, duplicate and unavailable distinguishable" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+    m.recordEarlyDataReplay(.accepted);
+    m.recordEarlyDataReplay(.duplicate);
+    m.recordEarlyDataReplay(.duplicate);
+    m.recordEarlyDataReplay(.capacity_rejected);
+    m.recordEarlyDataReplay(.unavailable);
+    m.recordEarlyDataReplay(.startup_quarantine);
+
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "# TYPE tardigrade_tls_early_data_replay_total counter") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_early_data_replay_total{outcome=\"accepted\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_early_data_replay_total{outcome=\"duplicate\"} 2") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_early_data_replay_total{outcome=\"capacity_rejected\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_early_data_replay_total{outcome=\"expired\"} 0") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_early_data_replay_total{outcome=\"unavailable\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_early_data_replay_total{outcome=\"startup_quarantine\"} 1") != null);
 }
 
 test "Metrics records proxy streaming fallback reasons" {

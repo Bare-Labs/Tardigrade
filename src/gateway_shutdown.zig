@@ -82,6 +82,37 @@ pub fn hotReloadConfig(
         return;
     };
 
+    {
+        // #368 Slice 3: the process-owned early-data replay store/gate are
+        // constructed once in `edge_gateway.run()` from the startup config
+        // and shared for the process lifetime — there is no in-place
+        // rebuild path here (unlike `applyReloadedRuntimeConfig`'s simple
+        // field copies), because rebuilding would discard replay history
+        // and require a fresh startup-quarantine handoff. This check must
+        // run before any runtime mutation below (`updateProtocolPolicy` and
+        // everything after it) so a reload that fails this check never
+        // partially applies: publishing a config that claims a different
+        // replay mode/capacity than what is actually installed would be a
+        // real security/observability divergence for this security-sensitive
+        // setting, so reject the whole reload instead — the previous config,
+        // and every other still-active runtime object, stay coherent.
+        // Operators must restart to change replay mode or capacity.
+        var current_lease = worker_ctx.config_store.acquire();
+        const replay_config_changed = earlyDataReplayConfigChanged(current_lease.cfg, cfg_ptr);
+        current_lease.release();
+        if (replay_config_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "early-data replay mode/capacity changed; restart required", .{}) catch "early-data replay configuration changed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected: TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE/_MAX_ENTRIES changed; restart the process to change replay mode or capacity (the process-owned replay store cannot be safely rebuilt without discarding replay history)", .{});
+            return;
+        }
+    }
     if (worker_ctx.tls) |tls| {
         tls.updateProtocolPolicy(gprotocol_policy.listenerPolicyFromConfig(cfg_ptr)) catch |err| {
             worker_ctx.config_store.destroyVersion(prepared_version);
@@ -194,6 +225,151 @@ pub fn applianceCredentialConfigChanged(
         if (!std.mem.eql(u8, a.key_path, b.key_path)) return true;
     }
     return false;
+}
+
+/// #368 Slice 3: true when a proposed configuration changes the
+/// process-owned early-data replay store's mode or capacity. The store is
+/// constructed once at startup and shared for the process lifetime (see
+/// `edge_gateway.run()`); `hotReloadConfig` rejects the whole reload rather
+/// than accept a published config that no longer matches the actually
+/// installed store/gate.
+pub fn earlyDataReplayConfigChanged(
+    current: *const edge_config.EdgeConfig,
+    proposed: *const edge_config.EdgeConfig,
+) bool {
+    return current.tls_native_early_data_replay_mode != proposed.tls_native_early_data_replay_mode or
+        current.tls_native_early_data_replay_max_entries != proposed.tls_native_early_data_replay_max_entries;
+}
+
+test "earlyDataReplayConfigChanged detects mode and capacity changes independently" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    try std.testing.expect(!earlyDataReplayConfigChanged(&base, &proposed));
+
+    // disabled -> process_local
+    proposed.tls_native_early_data_replay_mode = .process_local;
+    try std.testing.expect(earlyDataReplayConfigChanged(&base, &proposed));
+    proposed.tls_native_early_data_replay_mode = .disabled;
+    try std.testing.expect(!earlyDataReplayConfigChanged(&base, &proposed));
+
+    // process_local -> disabled (the reverse direction)
+    base.tls_native_early_data_replay_mode = .process_local;
+    try std.testing.expect(earlyDataReplayConfigChanged(&base, &proposed));
+    base.tls_native_early_data_replay_mode = .disabled;
+    try std.testing.expect(!earlyDataReplayConfigChanged(&base, &proposed));
+
+    // Capacity-only change, mode held constant.
+    proposed.tls_native_early_data_replay_max_entries = base.tls_native_early_data_replay_max_entries + 1;
+    try std.testing.expect(earlyDataReplayConfigChanged(&base, &proposed));
+    proposed.tls_native_early_data_replay_max_entries = base.tls_native_early_data_replay_max_entries;
+    try std.testing.expect(!earlyDataReplayConfigChanged(&base, &proposed));
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "#368 Slice 3: hotReloadConfig rejects a combined replay+protocol-policy reload atomically, before the TLS protocol policy is ever mutated" {
+    // Regression for the ordering bug: the replay restart-only check must
+    // run before any runtime mutation (`updateProtocolPolicy` in
+    // particular), so a SIGHUP that changes both the replay mode/capacity
+    // *and* the TLS listener protocol policy is rejected as a whole —
+    // never partially applied. Drives the real `hotReloadConfig` end to
+    // end (real env vars, a real `TlsTerminator`) rather than only the
+    // pure `earlyDataReplayConfigChanged` comparator above, so it actually
+    // proves the ordering, not just the comparator's logic.
+    //
+    // Skipped under the appliance TLS profile (`-Dtls-profile=appliance`):
+    // that build swaps `http.tls_termination.TlsTerminator` for
+    // `tls_termination_stub.zig`, whose `init()` unconditionally returns
+    // `error.ContextInitFailed` — the appliance profile never constructs
+    // the generic OpenSSL terminator this test exercises, so there is
+    // nothing appliance-specific to prove here. `earlyDataReplayConfigChanged`
+    // above still covers the ordering-independent comparator logic in every
+    // profile.
+    if (edge_config.is_appliance_tls_profile) return;
+    const allocator = std.testing.allocator;
+
+    var current_cfg = try edge_config.loadFromEnv(allocator);
+    defer current_cfg.deinit(allocator);
+    try std.testing.expectEqual(edge_config.EarlyDataReplayMode.disabled, current_cfg.tls_native_early_data_replay_mode);
+    try std.testing.expect(current_cfg.http2_enabled);
+
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &current_cfg);
+    defer config_store.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = @embedFile("http/testdata/test_server.crt") });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = @embedFile("http/testdata/test_server.key") });
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+
+    var tls = try http.tls_termination.TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .http1_enabled = true,
+        .http2_enabled = true,
+    });
+    defer tls.deinit();
+    const original_snapshot = tls.protocolPolicySnapshot();
+    try std.testing.expect(original_snapshot.http1_enabled);
+    try std.testing.expect(original_snapshot.http2_enabled);
+
+    // Only the fields `hotReloadConfig` actually reads from `worker_ctx`
+    // need real values; the rest are never dereferenced on this path.
+    var worker_ctx: WorkerContext = undefined;
+    worker_ctx.config_store = &config_store;
+    worker_ctx.tls = &tls;
+    worker_ctx.native_credentials = null;
+
+    var state: GatewayState = undefined;
+    state.logger = http.logger.Logger.init(.err, "hot-reload-ordering-test");
+    state.reload_mutex = .{};
+    state.last_reload_ok = false;
+    state.last_reload_at_ms = 0;
+    state.last_reload_error_len = 0;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+
+    const DispatchCtx = struct { cfg: *const edge_config.EdgeConfig = undefined };
+    var dispatch_ctx = DispatchCtx{};
+
+    // Simulate a SIGHUP whose environment changes both the replay mode
+    // (forcing a restart-only rejection) and the TLS protocol policy
+    // (http2_enabled -> false) at once.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE", "process_local", 1));
+    defer _ = unsetenv("TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE");
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_HTTP2_ENABLED", "false", 1));
+    defer _ = unsetenv("TARDIGRADE_HTTP2_ENABLED");
+
+    hotReloadConfig(allocator, &worker_ctx, &state, &dispatch_ctx);
+
+    try std.testing.expect(!state.last_reload_ok);
+    try std.testing.expectEqualStrings(
+        "early-data replay mode/capacity changed; restart required",
+        state.last_reload_error[0..state.last_reload_error_len],
+    );
+
+    // The live TLS protocol policy must be completely unchanged —
+    // `updateProtocolPolicy` must never have been reached, let alone
+    // applied the proposed `http2_enabled = false`.
+    const after_snapshot = tls.protocolPolicySnapshot();
+    try std.testing.expectEqual(original_snapshot.http1_enabled, after_snapshot.http1_enabled);
+    try std.testing.expectEqual(original_snapshot.http2_enabled, after_snapshot.http2_enabled);
+    try std.testing.expect(after_snapshot.http2_enabled);
+
+    // The active config lease is unchanged too: still the pre-reload
+    // config, not the rejected proposed one.
+    var lease = config_store.acquire();
+    defer lease.release();
+    try std.testing.expectEqual(edge_config.EarlyDataReplayMode.disabled, lease.cfg.tls_native_early_data_replay_mode);
+    try std.testing.expect(lease.cfg.http2_enabled);
 }
 
 test "applianceCredentialConfigChanged detects credential-affecting fields" {
@@ -364,6 +540,14 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
     state.proxy_cache_path = "";
     state.proxy_cache_ttl_seconds = 0;
     state.runtime_mutex = .{};
+    // `metricsToPrometheus` (called below) locks this via `muxMetricsSnapshot`
+    // — left uninitialized, `.lock()` on garbage memory hangs indefinitely
+    // rather than failing loudly. This test was previously never compiled or
+    // run at all (gateway_shutdown.zig was not wired into any `zig build
+    // test` discovery path — see the `test { _ = @import(...) }` aggregator
+    // in edge_gateway.zig), so this bug went unnoticed until that gap was
+    // fixed.
+    state.connection_mutex = .{};
     state.metrics_mutex = .{};
     state.metrics = http.metrics.Metrics.init();
     state.add_headers = &.{};

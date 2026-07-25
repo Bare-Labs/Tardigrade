@@ -1132,6 +1132,125 @@ test "#368 Slice 2: a real process-scoped LocalStore shared across two independe
     try std.testing.expectEqual(@as(usize, 1), store.count());
 }
 
+test "#368 Slice 3: a fake distributed Store (not LocalStore) behind the same GateAdapter seam drives accepted, duplicate, and unavailable TLS decisions, always preserving 1-RTT resumption" {
+    // Proves the acceptance criterion that TLS/composition depends only on
+    // the `early_data_replay.Store` contract, not `LocalStore` internals:
+    // the exact same `GateAdapter` wiring `edge_gateway.zig` uses, but
+    // backed by a small scripted stand-in for a future networked backend —
+    // drives the same `EarlyDataDecision` outcomes as the real
+    // `LocalStore`-backed tests above. Defined locally (like
+    // `DeterministicStore` below) rather than imported, so this
+    // deliberately non-atomic, non-conforming test double never becomes
+    // reachable through `tls_core.early_data_replay`'s production surface.
+    const FakeDistributedStore = struct {
+        allocator: std.mem.Allocator,
+        mode: enum { commit, timeout, network_failure, ambiguous_commit } = .commit,
+        committed: std.AutoHashMapUnmanaged(tls_core.early_data_replay.Key, void) = .empty,
+
+        fn deinit(self: *@This()) void {
+            self.committed.deinit(self.allocator);
+        }
+
+        fn store(self: *@This()) tls_core.early_data_replay.Store {
+            return .{ .ctx = self, .claimFn = claimTrampoline };
+        }
+
+        fn claimTrampoline(ctx: *anyopaque, c: tls_core.early_data_replay.Claim) tls_core.early_data_replay.ClaimResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.claim(c);
+        }
+
+        fn claim(self: *@This(), c: tls_core.early_data_replay.Claim) tls_core.early_data_replay.ClaimResult {
+            switch (self.mode) {
+                .timeout, .network_failure, .ambiguous_commit => return .unavailable,
+                .commit => {},
+            }
+            if (self.committed.contains(c.key)) return .duplicate;
+            self.committed.put(self.allocator, c.key, {}) catch return .unavailable;
+            return .accepted;
+        }
+    };
+
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var fake = FakeDistributedStore{ .allocator = std.testing.allocator };
+    defer fake.deinit();
+    var adapter = tls_core.early_data_replay.GateAdapter.init(fake.store());
+    const shared_gate = adapter.gate();
+
+    const RunWorker = struct {
+        fn run(state: *session.ServerRecoverableState, ticket: *const session.ClientTicketState, gate: tls_backend.EarlyDataReplayGate) !*DirectHarness {
+            const harness = try std.testing.allocator.create(DirectHarness);
+            harness.* = DirectHarness.init();
+            errdefer {
+                harness.deinit();
+                std.testing.allocator.destroy(harness);
+            }
+
+            var ticket_clone: session.ClientTicketState = .{};
+            try ticket.cloneInto(std.testing.allocator, &ticket_clone);
+            errdefer ticket_clone.deinit();
+
+            var offers: pre_shared_key.ClientPskOfferSet = .{};
+            try offers.push(&ticket_clone);
+            var clock_dummy: u8 = 0;
+            try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+
+            var resolver_state = IdentityResolver{ .state = state };
+            try harness.server_backend.setServerPskResolver(.{
+                .ctx = &resolver_state,
+                .nowUnixMsFn = IdentityResolver.now,
+                .resolveFn = IdentityResolver.resolve,
+            });
+
+            try harness.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+            try harness.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+            try harness.server_backend.setEarlyDataReplayGate(gate);
+
+            try harness.run();
+            return harness;
+        }
+    };
+
+    // First worker: the fake backend commits normally — first claim of this
+    // ticket's replay key anywhere in the (simulated) fleet — accepted.
+    const worker_a = try RunWorker.run(&issued.server_state, &issued.ticket, shared_gate);
+    defer {
+        worker_a.deinit();
+        std.testing.allocator.destroy(worker_a);
+    }
+    try std.testing.expect(worker_a.client_backend.core.psk_authenticated);
+    try std.testing.expect(worker_a.server_backend.core.psk_authenticated);
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.accepted, worker_a.server_backend.earlyDataDecision());
+
+    // Second worker: same ticket, fake backend still `.commit` mode — proven
+    // duplicate maps to `.replay_rejected`; 1-RTT resumption still succeeds.
+    const worker_b = try RunWorker.run(&issued.server_state, &issued.ticket, shared_gate);
+    defer {
+        worker_b.deinit();
+        std.testing.allocator.destroy(worker_b);
+    }
+    try std.testing.expect(worker_b.client_backend.core.psk_authenticated);
+    try std.testing.expect(worker_b.server_backend.core.psk_authenticated);
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_rejected, worker_b.server_backend.earlyDataDecision());
+    try std.testing.expect(!worker_b.server_backend.earlyDataAccepted());
+
+    // Third worker: simulate the backend becoming unavailable (timeout) for
+    // an otherwise-fresh claim — proven unavailable maps to
+    // `.replay_unavailable`; 1-RTT resumption is still unaffected.
+    fake.mode = .timeout;
+    const worker_c = try RunWorker.run(&issued.server_state, &issued.ticket, shared_gate);
+    defer {
+        worker_c.deinit();
+        std.testing.allocator.destroy(worker_c);
+    }
+    try std.testing.expect(worker_c.client_backend.core.psk_authenticated);
+    try std.testing.expect(worker_c.server_backend.core.psk_authenticated);
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_unavailable, worker_c.server_backend.earlyDataDecision());
+    try std.testing.expect(!worker_c.server_backend.earlyDataAccepted());
+}
+
 test "0-RTT is never attempted for a resume-only ticket even with client intent enabled" {
     var issued = try issueEarlyCapableTicket(null); // resume_only: no max_early_data_size
     defer issued.deinit();

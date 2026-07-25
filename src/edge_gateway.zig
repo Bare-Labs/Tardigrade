@@ -281,16 +281,18 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         if (native_resumption_runtime) |*rt| rt.setObserver(nativeResumptionMetricsObserver(&state));
     }
     defer if (native_resumption_runtime) |*rt| rt.deinit();
-    // #368 Slice 2: one process-scoped anti-replay store, shared by every
-    // native TCP worker and the QUIC/H3 runtime — but constructed only once
+    // #368 Slice 3: one process-scoped anti-replay store, shared by every
+    // native TCP worker and the QUIC/H3 runtime — constructed only when the
+    // operator has explicitly opted into `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE=process_local`
+    // (`edge_config.EarlyDataReplayMode.disabled` is the safe default) *and*
     // a native PSK/early-data path can actually exist (below, once
     // `native_tls_provider`/`h3_credential_provider` are known), so plain
-    // HTTP, OpenSSL-only, or resumption-disabled deployments never pay the
-    // default 65,536-entry reservation or gain a new startup-failure path
-    // for a security feature they cannot use. Declared (but not yet
-    // constructed) here, ahead of every borrower below, so its teardown —
-    // once present — runs last, for the same reason as
-    // `native_resumption_runtime`.
+    // HTTP, OpenSSL-only, resumption-disabled, or replay-mode-disabled
+    // deployments never pay the configured-entry reservation or gain a new
+    // startup-failure path for a security feature they haven't enabled.
+    // Declared (but not yet constructed) here, ahead of every borrower
+    // below, so its teardown — once present — runs last, for the same
+    // reason as `native_resumption_runtime`.
     var native_early_data_replay_store: ?tls_core.early_data_replay.LocalStore = null;
     defer if (native_early_data_replay_store) |*store| store.deinit();
     var native_early_data_replay_gate_adapter: tls_core.early_data_replay.GateAdapter = undefined;
@@ -387,16 +389,26 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     defer if (native_credentials) |*store| store.deinit();
     defer if (tls_terminator) |*tls| tls.deinit();
-    if (nativeEarlyDataReplayStoreNeeded(
+    if (nativeEarlyDataReplayStoreEnabled(
+        cfg.tls_native_early_data_replay_mode,
         native_resumption_runtime != null,
         native_tls_provider != null,
         cfg.http3_enabled,
         h3_credential_provider != null,
     )) {
-        native_early_data_replay_store = initNativeEarlyDataReplayStore(state_allocator, @intCast(compat.milliTimestamp())) catch |err| {
+        // A configured `process_local` mode must never silently fall back to
+        // an unprotected/disabled implementation if store initialization
+        // fails — refusing to start (like `native_resumption_runtime` above)
+        // is the fail-closed behavior #368 requires.
+        native_early_data_replay_store = initNativeEarlyDataReplayStore(
+            state_allocator,
+            cfg.tls_native_early_data_replay_max_entries,
+            @intCast(compat.milliTimestamp()),
+        ) catch |err| {
             state.logger.err(null, "native TLS/QUIC early-data replay store initialization failed ({s}); refusing to start", .{@errorName(err)});
             return err;
         };
+        if (native_early_data_replay_store) |*store| store.setObserver(nativeEarlyDataReplayMetricsObserver(&state));
     }
     if (native_early_data_replay_store) |*store| {
         native_early_data_replay_gate_adapter = tls_core.early_data_replay.GateAdapter.init(store.store());
@@ -890,6 +902,33 @@ fn nativeResumptionOutcome(ctx: *anyopaque, transport: tls_core.resumption_runti
     state.metrics_mutex.lock();
     defer state.metrics_mutex.unlock();
     state.metrics.recordResumptionOutcome(nativeResumptionTransport(transport), nativeResumptionOutcomeValue(outcome));
+}
+
+/// #368 Slice 3: bridges the replay store's `Event` observer to `Metrics`,
+/// the same pattern `nativeResumptionMetricsObserver` uses for
+/// `resumption_runtime.Observer`. Notifications already arrive with the
+/// store's mutex released (see `early_data_replay.zig`'s `LocalStore.claim`),
+/// so this only needs to take the metrics lock.
+fn nativeEarlyDataReplayMetricsObserver(state: *GatewayState) tls_core.early_data_replay.Observer {
+    return .{ .ctx = state, .onEventFn = nativeEarlyDataReplayEvent };
+}
+
+fn mapEarlyDataReplayEvent(event: tls_core.early_data_replay.Event) http.metrics.EarlyDataReplayOutcome {
+    return switch (event) {
+        .accepted => .accepted,
+        .duplicate => .duplicate,
+        .capacity_rejected => .capacity_rejected,
+        .expired => .expired,
+        .unavailable => .unavailable,
+        .startup_quarantine => .startup_quarantine,
+    };
+}
+
+fn nativeEarlyDataReplayEvent(ctx: *anyopaque, event: tls_core.early_data_replay.Event) void {
+    const state: *GatewayState = @ptrCast(@alignCast(ctx));
+    state.metrics_mutex.lock();
+    defer state.metrics_mutex.unlock();
+    state.metrics.recordEarlyDataReplay(mapEarlyDataReplayEvent(event));
 }
 
 fn applyRuntimeIdentity(cfg: *const edge_config.EdgeConfig, logger: *const http.logger.Logger) !void {
@@ -1423,37 +1462,46 @@ fn systemNowUnixMs(_: *anyopaque) i64 {
     return compat.milliTimestamp();
 }
 
-/// #368 Slice 2: constructs the single process-scoped replay store `run`
-/// installs into every native TLS backend that can accept early data.
-/// Bounded defaults only (`Limits{}`) — mode/max-entries configuration and
-/// metrics are Slice 3. The startup-quarantine window reuses
-/// `ServerEarlyDataPolicy`'s default age-skew tolerance so it is never
-/// shorter than the freshness window Slice 3's eventually-configured policy
-/// will use (RFC 9846 §8.2: the recording window must not overlap startup
-/// history the store no longer has).
+/// #368 Slice 3: constructs the single process-scoped replay store `run`
+/// installs into every native TLS backend that can accept early data, using
+/// the operator-configured `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES`
+/// capacity (already validated by `edge_config.validateEarlyDataReplayConfig`
+/// against `early_data_replay.hard_max_entries`). The startup-quarantine
+/// window reuses `ServerEarlyDataPolicy`'s default age-skew tolerance — the
+/// production native early-data enable/age-skew config seam from #366/#367
+/// is not yet wired into composition on current `main` (`setServerEarlyDataPolicy`
+/// is not called here), so there is no distinct configured value to read
+/// yet; #368 deliberately does not add a second, independent one (see the
+/// module doc: no separately configurable replay TTL). This keeps the
+/// quarantine at least as long as that policy's default, matching RFC 9846
+/// §8.2: the recording window must not overlap startup history the store no
+/// longer has.
 fn initNativeEarlyDataReplayStore(
     allocator: std.mem.Allocator,
+    max_entries: usize,
     now_unix_ms: u64,
 ) tls_core.early_data_replay.LocalStore.InitError!tls_core.early_data_replay.LocalStore {
     return tls_core.early_data_replay.LocalStore.init(
         allocator,
-        .{},
+        .{ .max_entries = max_entries },
         (tls_core.tls13_backend.ServerEarlyDataPolicy{}).age_skew_tolerance_ms,
         now_unix_ms,
     );
 }
 
-/// #368 Slice 2: whether a native PSK/early-data path can actually exist
+/// #368 Slice 2/3: whether a native PSK/early-data path can actually exist
 /// for this composition, and therefore whether `run()` should pay for
-/// constructing the process-scoped replay store at all. Native resumption
-/// being enabled is necessary but not sufficient — a native (non-OpenSSL)
-/// TLS backend that could ever accept early data must also be configured:
-/// native TCP (`native_tls_provider`) or, when HTTP/3 is enabled, native
-/// QUIC/H3 (`h3_credential_provider`). The OpenSSL terminator owns its own
-/// independent session cache and never consults this seam at all, so plain
-/// HTTP, OpenSSL-only, or resumption-disabled deployments must never gain
-/// the default 65,536-entry allocation or a new startup-failure path for a
-/// security feature they cannot use.
+/// constructing the process-scoped replay store at all — evaluated only once
+/// the operator has also opted into `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE=process_local`
+/// (see the call site). Native resumption being enabled is necessary but not
+/// sufficient — a native (non-OpenSSL) TLS backend that could ever accept
+/// early data must also be configured: native TCP (`native_tls_provider`)
+/// or, when HTTP/3 is enabled, native QUIC/H3 (`h3_credential_provider`).
+/// The OpenSSL terminator owns its own independent session cache and never
+/// consults this seam at all, so plain HTTP, OpenSSL-only, or
+/// resumption-disabled deployments must never gain the configured-entry
+/// allocation or a new startup-failure path for a security feature they
+/// cannot use.
 fn nativeEarlyDataReplayStoreNeeded(
     native_resumption_runtime_enabled: bool,
     native_tls_provider_present: bool,
@@ -1462,6 +1510,29 @@ fn nativeEarlyDataReplayStoreNeeded(
 ) bool {
     return native_resumption_runtime_enabled and
         (native_tls_provider_present or (http3_enabled and h3_credential_provider_present));
+}
+
+/// #368 Slice 3: whether `run()` should construct the process-scoped replay
+/// store at all — the configured mode gates construction; `nativeEarlyDataReplayStoreNeeded`
+/// alone only answers "could a native PSK/early-data path exist here." The
+/// safe `disabled` default (and any mode other than `process_local`) must
+/// never construct a store, even when a native path exists, so plain HTTP,
+/// OpenSSL-only, resumption-disabled, or explicitly opted-out deployments
+/// never pay the configured-entry reservation or gain a new
+/// startup-failure path for a feature they haven't enabled.
+fn nativeEarlyDataReplayStoreEnabled(
+    replay_mode: edge_config.EarlyDataReplayMode,
+    native_resumption_runtime_enabled: bool,
+    native_tls_provider_present: bool,
+    http3_enabled: bool,
+    h3_credential_provider_present: bool,
+) bool {
+    return replay_mode == .process_local and nativeEarlyDataReplayStoreNeeded(
+        native_resumption_runtime_enabled,
+        native_tls_provider_present,
+        http3_enabled,
+        h3_credential_provider_present,
+    );
 }
 
 fn reapActiveConnections(
@@ -4481,13 +4552,62 @@ test "#368 Slice 2: nativeEarlyDataReplayStoreNeeded is true once native resumpt
     try std.testing.expect(!nativeEarlyDataReplayStoreNeeded(true, false, false, true));
 }
 
+test "#368 Slice 3: nativeEarlyDataReplayStoreEnabled requires the operator-configured process_local mode even when a native path exists" {
+    // Safe default: a usable native path alone is never enough — replay
+    // mode `disabled` must construct no store, matching the config
+    // requirement "disabled mode creates no replay store".
+    try std.testing.expect(!nativeEarlyDataReplayStoreEnabled(.disabled, true, true, false, false));
+    try std.testing.expect(!nativeEarlyDataReplayStoreEnabled(.disabled, true, false, true, true));
+
+    // `process_local` mode still requires an eligible native TLS/QUIC path —
+    // it does not itself conjure one.
+    try std.testing.expect(!nativeEarlyDataReplayStoreEnabled(.process_local, false, false, false, false));
+    try std.testing.expect(!nativeEarlyDataReplayStoreEnabled(.process_local, true, false, false, false));
+
+    // Both an opted-in mode and an eligible native path: matches "process-local
+    // mode creates one process-scoped store when an eligible native TLS/QUIC
+    // path exists".
+    try std.testing.expect(nativeEarlyDataReplayStoreEnabled(.process_local, true, true, false, false));
+    try std.testing.expect(nativeEarlyDataReplayStoreEnabled(.process_local, true, false, true, true));
+}
+
+test "#368 Slice 3: mapEarlyDataReplayEvent covers every closed Event variant" {
+    try std.testing.expectEqual(http.metrics.EarlyDataReplayOutcome.accepted, mapEarlyDataReplayEvent(.accepted));
+    try std.testing.expectEqual(http.metrics.EarlyDataReplayOutcome.duplicate, mapEarlyDataReplayEvent(.duplicate));
+    try std.testing.expectEqual(http.metrics.EarlyDataReplayOutcome.capacity_rejected, mapEarlyDataReplayEvent(.capacity_rejected));
+    try std.testing.expectEqual(http.metrics.EarlyDataReplayOutcome.expired, mapEarlyDataReplayEvent(.expired));
+    try std.testing.expectEqual(http.metrics.EarlyDataReplayOutcome.unavailable, mapEarlyDataReplayEvent(.unavailable));
+    try std.testing.expectEqual(http.metrics.EarlyDataReplayOutcome.startup_quarantine, mapEarlyDataReplayEvent(.startup_quarantine));
+}
+
+test "#368 Slice 3: initNativeEarlyDataReplayStore uses the configured max_entries, not the store's own default" {
+    var store = try initNativeEarlyDataReplayStore(std.testing.allocator, 2, 0);
+    defer store.deinit();
+
+    // Past the startup-quarantine window so claims are actually evaluated.
+    const now = (tls_core.tls13_backend.ServerEarlyDataPolicy{}).age_skew_tolerance_ms;
+    var key_a: tls_core.early_data_replay.Key = [_]u8{0} ** 32;
+    key_a[0] = 1;
+    var key_b: tls_core.early_data_replay.Key = [_]u8{0} ** 32;
+    key_b[0] = 2;
+    var key_c: tls_core.early_data_replay.Key = [_]u8{0} ** 32;
+    key_c[0] = 3;
+
+    try std.testing.expectEqual(tls_core.early_data_replay.ClaimResult.accepted, store.claim(.{ .key = key_a, .retain_until_unix_ms = std.math.maxInt(u64) }, now));
+    try std.testing.expectEqual(tls_core.early_data_replay.ClaimResult.accepted, store.claim(.{ .key = key_b, .retain_until_unix_ms = std.math.maxInt(u64) }, now));
+    // The configured capacity (2) is exhausted by two live entries — proves
+    // the caller's `max_entries` argument reached `LocalStore.Limits`,
+    // rather than the struct's own 65,536-entry default silently winning.
+    try std.testing.expectEqual(tls_core.early_data_replay.ClaimResult.rejected_capacity, store.claim(.{ .key = key_c, .retain_until_unix_ms = std.math.maxInt(u64) }, now));
+}
+
 test "#368 Slice 2: initNativeEarlyDataReplayStore rejects 0-RTT for the startup quarantine window then accepts fresh claims" {
     // Exercises the exact helper `run()` calls to build the process-scoped
     // replay store, proving the production composition path — not a
     // reimplementation of it — rejects 0-RTT while the recording window
     // still overlaps startup and accepts a genuinely fresh claim afterward.
     const start_unix_ms: u64 = 1_000_000;
-    var store = try initNativeEarlyDataReplayStore(std.testing.allocator, start_unix_ms);
+    var store = try initNativeEarlyDataReplayStore(std.testing.allocator, (tls_core.early_data_replay.Limits{}).max_entries, start_unix_ms);
     defer store.deinit();
 
     const quarantine_duration_ms = (tls_core.tls13_backend.ServerEarlyDataPolicy{}).age_skew_tolerance_ms;
@@ -4515,7 +4635,7 @@ test "#368 Slice 2: one process-scoped early-data replay store is shared by nati
     // `LocalStore`/`GateAdapter` pair, its `.gate()` installed into both a
     // native TCP `NativeTlsConnection` and an `http3_runtime.Runtime` — the
     // same store instance, not a worker-local or protocol-local copy.
-    var store = try initNativeEarlyDataReplayStore(std.testing.allocator, 0);
+    var store = try initNativeEarlyDataReplayStore(std.testing.allocator, (tls_core.early_data_replay.Limits{}).max_entries, 0);
     defer store.deinit();
     var adapter = tls_core.early_data_replay.GateAdapter.init(store.store());
     const gate = adapter.gate();
@@ -4560,6 +4680,17 @@ test "#368 Slice 2: one process-scoped early-data replay store is shared by nati
 // Pull gateway_handlers (and its transitive imports, including
 // gateway_static_runtime) into the unit-test runner so their tests are
 // discovered and executed alongside the other edge-gateway tests.
+//
+// gateway_shutdown.zig is pulled in the same way: `hotReloadConfig` is only
+// ever referenced through the plain `const gshutdown = @import(...)` at the
+// top of this file, which is not itself sufficient for Zig's test discovery
+// to find gateway_shutdown.zig's own `test` declarations (test discovery
+// follows the `_ = @import(...)` chain rooted at each file's `test {}`
+// aggregator, not arbitrary functional imports) — without this line, every
+// test in gateway_shutdown.zig (including the pre-existing
+// applianceCredentialConfigChanged/applyReloadedRuntimeConfig coverage) was
+// silently never compiled or run by `zig build test`.
 test {
     _ = @import("gateway_handlers.zig");
+    _ = @import("gateway_shutdown.zig");
 }
