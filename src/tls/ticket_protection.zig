@@ -1688,6 +1688,80 @@ test "nonce ledger persists through decrypt-only and removed snapshots" {
     try testing.expectError(error.OverlappingNonceLease, keyring.install(try keyring.buildSnapshot(&.{reintroduced}, testCapabilities())));
 }
 
+test "rotation: a resolve against a decrypt-only grace-window key still succeeds, and new seals use the new key (#369)" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+
+    const old_id = keyId(60);
+    const new_id = keyId(61);
+    const active_old = sampleKeyConfig(old_id, .aes_128_gcm, .{ .prefix = .{ 6, 0, 0, 0 }, .start = 0, .end_exclusive = 10 });
+    try keyring.install(try keyring.buildSnapshot(&.{active_old}, testCapabilities()));
+
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var old_ticket_buf: [1024]u8 = undefined;
+    const old_ticket = try protector.seal(allocator, &state, 1_000, &old_ticket_buf);
+    const old_parsed = try parseEnvelope(old_ticket, session.Limits.default);
+    try testing.expectEqualSlices(u8, &old_id, &old_parsed.key_id);
+
+    // Rotate: retire `old_id` to decrypt-only (grace window) and bring up
+    // `new_id` as the sole active encryption key, mirroring an operator
+    // pushing a new key config without yet removing the old one.
+    var decrypt_only_old = active_old;
+    decrypt_only_old.nonce_lease = null;
+    decrypt_only_old.encrypt_until_unix_ms = 1_500;
+    decrypt_only_old.decrypt_until_unix_ms = 20_000;
+    const active_new = sampleKeyConfigWithByte(new_id, .aes_128_gcm, .{ .prefix = .{ 6, 1, 0, 0 }, .start = 0, .end_exclusive = 10 }, 0x13);
+    try keyring.install(try keyring.buildSnapshot(&.{ decrypt_only_old, active_new }, testCapabilities()));
+
+    // The ticket sealed under `old_id` before rotation still decrypts
+    // during the grace window.
+    var recovered: session.ServerRecoverableState = .{};
+    defer recovered.deinit();
+    try testing.expect(try protector.resolve(allocator, old_ticket, 2_000, &recovered));
+
+    // A ticket sealed after rotation is bound to the new key, not the
+    // retired one.
+    var new_ticket_buf: [1024]u8 = undefined;
+    const new_ticket = try protector.seal(allocator, &state, 2_000, &new_ticket_buf);
+    const new_parsed = try parseEnvelope(new_ticket, session.Limits.default);
+    try testing.expectEqualSlices(u8, &new_id, &new_parsed.key_id);
+}
+
+test "rotation: a fully removed key rejects old tickets with unknown_key instead of crashing (#369)" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+
+    const old_id = keyId(70);
+    const new_id = keyId(71);
+    const active_old = sampleKeyConfig(old_id, .aes_128_gcm, .{ .prefix = .{ 7, 0, 0, 0 }, .start = 0, .end_exclusive = 10 });
+    try keyring.install(try keyring.buildSnapshot(&.{active_old}, testCapabilities()));
+
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var old_ticket_buf: [1024]u8 = undefined;
+    const old_ticket = try protector.seal(allocator, &state, 1_000, &old_ticket_buf);
+
+    // Rotate: install a replacement snapshot that no longer contains
+    // `old_id` at all (a full key removal, not a grace-window retirement).
+    const active_new = sampleKeyConfigWithByte(new_id, .aes_128_gcm, .{ .prefix = .{ 7, 1, 0, 0 }, .start = 0, .end_exclusive = 10 }, 0x13);
+    try keyring.install(try keyring.buildSnapshot(&.{active_new}, testCapabilities()));
+
+    var observer = TestObserver{};
+    defer observer.deinit(allocator);
+    protector.observer = observer.observer();
+
+    var recovered: session.ServerRecoverableState = .{};
+    defer recovered.deinit();
+    const accepted = try protector.resolve(allocator, old_ticket, 2_000, &recovered);
+    try testing.expect(!accepted);
+    try observer.expectOnly(.{ .resolve_rejected = .unknown_key });
+}
+
 test "nonce ledger rejects same key under a different id" {
     const allocator = testing.allocator;
     var keyring = ReloadableKeyRing.init(allocator);
