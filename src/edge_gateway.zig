@@ -389,13 +389,15 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     defer if (native_credentials) |*store| store.deinit();
     defer if (tls_terminator) |*tls| tls.deinit();
-    if (nativeEarlyDataReplayStoreEnabled(
+    const native_early_data_replay_composition = nativeEarlyDataReplayComposition(
         cfg.tls_native_early_data_replay_mode,
         native_resumption_runtime != null,
         native_tls_provider != null,
         cfg.http3_enabled,
         h3_credential_provider != null,
-    )) {
+        null,
+    );
+    if (native_early_data_replay_composition.store_enabled) {
         // A configured `process_local` mode must never silently fall back to
         // an unprotected/disabled implementation if store initialization
         // fails — refusing to start (like `native_resumption_runtime` above)
@@ -412,7 +414,14 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (native_early_data_replay_store) |*store| {
         native_early_data_replay_gate_adapter = tls_core.early_data_replay.GateAdapter.init(store.store());
-        native_early_data_replay_gate = native_early_data_replay_gate_adapter.gate();
+        native_early_data_replay_gate = nativeEarlyDataReplayComposition(
+            cfg.tls_native_early_data_replay_mode,
+            native_resumption_runtime != null,
+            native_tls_provider != null,
+            cfg.http3_enabled,
+            h3_credential_provider != null,
+            native_early_data_replay_gate_adapter.gate(),
+        ).early_data_replay_gate;
     }
     if (cfg.http3_enabled) {
         if (!edge_config.hasTlsFiles(cfg)) {
@@ -1533,6 +1542,37 @@ fn nativeEarlyDataReplayStoreEnabled(
         http3_enabled,
         h3_credential_provider_present,
     );
+}
+
+const NativeEarlyDataReplayComposition = struct {
+    store_enabled: bool,
+    early_data_replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
+};
+
+/// Selects the replay-store/gate options shared by `run()`'s native TCP and
+/// H3 composition. The optional gate is installed only when the same decision
+/// says the process-scoped store is enabled; disabled mode therefore flows
+/// into `NativeTlsConnection.createWithOptions` as a null gate rather than an
+/// independently reconstructed test expectation.
+fn nativeEarlyDataReplayComposition(
+    replay_mode: edge_config.EarlyDataReplayMode,
+    native_resumption_runtime_enabled: bool,
+    native_tls_provider_present: bool,
+    http3_enabled: bool,
+    h3_credential_provider_present: bool,
+    gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
+) NativeEarlyDataReplayComposition {
+    const store_enabled = nativeEarlyDataReplayStoreEnabled(
+        replay_mode,
+        native_resumption_runtime_enabled,
+        native_tls_provider_present,
+        http3_enabled,
+        h3_credential_provider_present,
+    );
+    return .{
+        .store_enabled = store_enabled,
+        .early_data_replay_gate = if (store_enabled) gate else null,
+    };
 }
 
 fn reapActiveConnections(
@@ -3567,34 +3607,29 @@ test "#369 Slice 2 rt0.reject.unsafe_request: an unsafe method carrying current-
     try std.testing.expectEqual(@as(usize, 0), effects.handler_calls);
 }
 
-test "#369 Slice 2 rt0.reject.store_unavailable: the disabled-mode composition decision installs no replay gate on the real native TLS connection, matching Tls13Backend's fail-closed default" {
-    // Deterministic, explicit config rather than depending on ambient
-    // TARDIGRADE_* env vars — forces the exact decision `run()` makes.
-    var cfg = try edge_config.loadFromEnv(std.testing.allocator);
-    defer cfg.deinit(std.testing.allocator);
-    cfg.tls_native_early_data_replay_mode = .disabled;
-
-    // Native resumption and a native TCP provider both "exist" here (so a
-    // native PSK/early-data path genuinely could exist), isolating that
-    // `.disabled` replay mode alone — not merely "no eligible path" — is
-    // what withholds the store/gate. This is the exact decision `run()`
-    // makes via `nativeEarlyDataReplayStoreEnabled` before ever deciding
-    // whether to call `initNativeEarlyDataReplayStore`.
-    try std.testing.expect(!nativeEarlyDataReplayStoreEnabled(
-        cfg.tls_native_early_data_replay_mode,
+test "#369 Slice 2 rt0.reject.store_unavailable: disabled-mode composition passes no replay gate to the real native TLS connection" {
+    // Deterministic, explicit inputs: native resumption and a native TCP
+    // provider both "exist" here, isolating `.disabled` replay mode alone
+    // as the reason `run()` withholds the process-scoped store/gate.
+    const disabled_composition = nativeEarlyDataReplayComposition(
+        .disabled,
         true, // native_resumption_runtime_enabled
         true, // native_tls_provider_present
         false,
         false,
-    ));
+        .{ .ctx = undefined, .decideFn = struct {
+            fn decide(_: *anyopaque, _: tls_core.tls13_backend.EarlyDataReplayCandidate) tls_core.tls13_backend.EarlyDataReplayDecision {
+                return .allow;
+            }
+        }.decide },
+    );
+    try std.testing.expect(!disabled_composition.store_enabled);
+    try std.testing.expect(disabled_composition.early_data_replay_gate == null);
 
-    // Exactly the production composition pattern from "#368 Slice 2: one
-    // process-scoped early-data replay store is shared by native TCP and
-    // QUIC/H3" above: `run()` only calls `initNativeEarlyDataReplayStore`/
-    // installs a gate when `nativeEarlyDataReplayStoreEnabled` is true.
-    // Since it is not here, `run()` builds `NativeTlsConnection` exactly as
-    // it would in this configuration: with no `.early_data_replay_gate`
-    // option at all.
+    // This is the production option-selection helper `run()` uses before
+    // constructing native TCP/H3 runtimes, not a parallel reproduction of
+    // its branch. Since the helper returns null here, the real native TLS
+    // connection receives the backend default gate.
     var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
     defer fixed.deinit();
     const fds = try gatewayTestSocketPair();
@@ -3605,7 +3640,7 @@ test "#369 Slice 2 rt0.reject.store_unavailable: the disabled-mode composition d
         fds[0],
         .{ .http1_enabled = true, .http2_enabled = true },
         fixed.provider(),
-        .{}, // no early_data_replay_gate — matches the `.disabled` composition decision above
+        .{ .early_data_replay_gate = disabled_composition.early_data_replay_gate },
     );
     defer native.destroy();
 
@@ -3616,11 +3651,6 @@ test "#369 Slice 2 rt0.reject.store_unavailable: the disabled-mode composition d
     // so any 0-RTT attempt on it fails closed to `.unavailable` while
     // ordinary 1-RTT resumption is untouched.
     try std.testing.expect(native.backend.early_data_replay_gate.decideFn == null);
-
-    // The default configuration also defines no location routes at all —
-    // native 0-RTT is not merely rejected but structurally unreachable.
-    try std.testing.expectEqual(edge_config.EarlyDataReplayMode.disabled, cfg.tls_native_early_data_replay_mode);
-    try std.testing.expectEqual(@as(usize, 0), cfg.location_blocks.len);
 }
 
 test "return_response method enforcement — non-GET/HEAD rejected on static returns" {

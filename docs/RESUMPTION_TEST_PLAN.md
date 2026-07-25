@@ -113,16 +113,17 @@ fixed in the current state of this slice, described below.
     where any upstream dispatch would originate — never runs. Isolates the
     method-safety gate specifically, distinct from the file's pre-existing
     mirror-rule and origin-capability-off tests.
-  - `rt0.reject.store_unavailable` — forces `tls_native_early_data_replay_mode
-    = .disabled` on an explicit, deterministic config (not ambient
-    `TARDIGRADE_*` env vars), confirms the real
-    `nativeEarlyDataReplayStoreEnabled` composition-decision function
-    withholds the store even though a native path otherwise exists, then
-    builds a real `NativeTlsConnection` exactly as `run()` would in this
-    configuration (no `.early_data_replay_gate` option) and asserts its
-    real `Tls13Backend.early_data_replay_gate.decideFn == null` — tying the
-    config decision to the real composition-built object, not just to two
-    independently-true facts asserted side by side.
+  - `rt0.reject.store_unavailable` — drives the same
+    `nativeEarlyDataReplayComposition` helper used by `run()` with explicit,
+    deterministic inputs: replay mode disabled, native resumption present,
+    and a native TCP provider present. The helper withholds both store and
+    gate options even though a native path otherwise exists, and a real
+    `NativeTlsConnection` built with that returned option retains
+    `Tls13Backend`'s fail-closed default
+    (`early_data_replay_gate.decideFn == null`). This proves the disabled
+    helper/default-backend boundary without depending on ambient
+    `TARDIGRADE_*` env vars; true record-TLS → H1 provenance → safety-gate
+    process coverage remains deferred below and is tracked by #510.
 - **`src/process_early_data_integration_tests.zig`** (new file, wired into
   `zig build test` via `edge_gateway.zig`'s existing `test { _ = @import(...) }`
   aggregator pattern) — the one scenario that needs neither module's
@@ -165,8 +166,8 @@ that follows. `transport_early` only ever becomes `true` for H1 in
 production via this hardcoded-`false` assignment (i.e. never); the only
 other `.transport_early = true` assignments in `edge_gateway.zig` are
 either H2 frame-provenance propagation (already set from elsewhere, not
-derived from the TLS backend) or test-only fixtures. Wiring this is a
-`#366`/`#367` follow-up, not this slice's scope — but it means no test,
+derived from the TLS backend) or test-only fixtures. Wiring this is tracked
+by #510 as a `#366`/`#367` follow-up, not this slice's scope — but it means no test,
 here or otherwise, can currently prove "an accepted real 0-RTT record over
 TCP results in a real early HTTP dispatch," because that composition does
 not exist in production yet to prove. This slice's tests are scoped
@@ -225,6 +226,13 @@ weakening of the "workers share one store" guarantee itself.
   The record-transport matrix is thoroughly covered
   (`src/tls/tls13_backend_tests.zig`); an equivalent pass explicitly over
   `Transport.quic` has not been added yet.
+- **True end-to-end native TCP/H1 record-provenance dispatch coverage**
+  (#510): a real accepted/rejected TLS 0-RTT record must flow through
+  native TCP/H1 request parsing into `RequestContext.early_data` and the
+  production H1 safety gate before #369's process-level H1 path is complete.
+  The current slice proves the TLS/replay-store decision and the constructed
+  H1 dispatch context on either side of that gap; it does not close the
+  missing production handoff itself.
 
 Acceptance criteria for #369 as a whole (interop reliability, safe
 fallback/rejection under mismatch, no double execution, bounded soak
