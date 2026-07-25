@@ -389,13 +389,15 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     defer if (native_credentials) |*store| store.deinit();
     defer if (tls_terminator) |*tls| tls.deinit();
-    if (nativeEarlyDataReplayStoreEnabled(
+    const native_early_data_replay_composition = nativeEarlyDataReplayComposition(
         cfg.tls_native_early_data_replay_mode,
         native_resumption_runtime != null,
         native_tls_provider != null,
         cfg.http3_enabled,
         h3_credential_provider != null,
-    )) {
+        null,
+    );
+    if (native_early_data_replay_composition.store_enabled) {
         // A configured `process_local` mode must never silently fall back to
         // an unprotected/disabled implementation if store initialization
         // fails — refusing to start (like `native_resumption_runtime` above)
@@ -412,7 +414,14 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     if (native_early_data_replay_store) |*store| {
         native_early_data_replay_gate_adapter = tls_core.early_data_replay.GateAdapter.init(store.store());
-        native_early_data_replay_gate = native_early_data_replay_gate_adapter.gate();
+        native_early_data_replay_gate = nativeEarlyDataReplayComposition(
+            cfg.tls_native_early_data_replay_mode,
+            native_resumption_runtime != null,
+            native_tls_provider != null,
+            cfg.http3_enabled,
+            h3_credential_provider != null,
+            native_early_data_replay_gate_adapter.gate(),
+        ).early_data_replay_gate;
     }
     if (cfg.http3_enabled) {
         if (!edge_config.hasTlsFiles(cfg)) {
@@ -1533,6 +1542,37 @@ fn nativeEarlyDataReplayStoreEnabled(
         http3_enabled,
         h3_credential_provider_present,
     );
+}
+
+const NativeEarlyDataReplayComposition = struct {
+    store_enabled: bool,
+    early_data_replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
+};
+
+/// Selects the replay-store/gate options shared by `run()`'s native TCP and
+/// H3 composition. The optional gate is installed only when the same decision
+/// says the process-scoped store is enabled; disabled mode therefore flows
+/// into `NativeTlsConnection.createWithOptions` as a null gate rather than an
+/// independently reconstructed test expectation.
+fn nativeEarlyDataReplayComposition(
+    replay_mode: edge_config.EarlyDataReplayMode,
+    native_resumption_runtime_enabled: bool,
+    native_tls_provider_present: bool,
+    http3_enabled: bool,
+    h3_credential_provider_present: bool,
+    gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
+) NativeEarlyDataReplayComposition {
+    const store_enabled = nativeEarlyDataReplayStoreEnabled(
+        replay_mode,
+        native_resumption_runtime_enabled,
+        native_tls_provider_present,
+        http3_enabled,
+        h3_credential_provider_present,
+    );
+    return .{
+        .store_enabled = store_enabled,
+        .early_data_replay_gate = if (store_enabled) gate else null,
+    };
 }
 
 fn reapActiveConnections(
@@ -3505,6 +3545,114 @@ test "H1 early proxy with origin capability off never reaches upstream side effe
     try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
 }
 
+test "#369 Slice 2 rt0.reject.unsafe_request: an unsafe method carrying current-hop early data is rejected by the real H1 orchestration before any route dispatch" {
+    // Drives the real, private `executeH1PostPreflightOrchestration` this
+    // file's own dispatch uses in production (see `H1ProductionPostPreflightHooks`
+    // above), with the same probe-hooks pattern the two tests directly
+    // above already use — so "the route hook never runs" is proven by the
+    // real orchestration's control flow, not merely inferred from calling
+    // the decision function in isolation. Distinct from those two tests:
+    // this isolates the *method-safety* gate in `http.early_data.decide()`
+    // specifically (no mirror rule, `proxy_early_data: rfc8470`, so an
+    // unsafe method is the only thing that can produce `.too_early` here),
+    // whereas the existing tests isolate a mirror-rule match and an
+    // origin-capability-off route respectively.
+    const allocator = std.testing.allocator;
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+            .early_data = .replay_safe,
+            .proxy_early_data = .rfc8470,
+        },
+    };
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = &.{};
+    var request = try http.Request.parseHead(allocator, "POST /work HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\n\r\n", MAX_REQUEST_SIZE);
+    defer request.request.deinit();
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    var ctx = http.request_context.RequestContext.init(allocator, "req-post-early", "127.0.0.1");
+    ctx.early_data.transport_early = true;
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-post-early", 0);
+    var keep_alive = false;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const outcome = try executeH1PostPreflightOrchestration(
+        {},
+        allocator,
+        &output.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &request.request,
+        "req-post-early",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1CountingPostPreflightHooks{ .effects = &effects },
+    );
+
+    try std.testing.expectEqual(@as(u16, @intFromEnum(http.Status.too_early)), outcome.terminal_status);
+    // The route hook — which is where any upstream dispatch, real or
+    // otherwise, would originate — never ran.
+    try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.handler_calls);
+}
+
+test "#369 Slice 2 rt0.reject.store_unavailable: disabled-mode composition passes no replay gate to the real native TLS connection" {
+    // Deterministic, explicit inputs: native resumption and a native TCP
+    // provider both "exist" here, isolating `.disabled` replay mode alone
+    // as the reason `run()` withholds the process-scoped store/gate.
+    const disabled_composition = nativeEarlyDataReplayComposition(
+        .disabled,
+        true, // native_resumption_runtime_enabled
+        true, // native_tls_provider_present
+        false,
+        false,
+        .{ .ctx = undefined, .decideFn = struct {
+            fn decide(_: *anyopaque, _: tls_core.tls13_backend.EarlyDataReplayCandidate) tls_core.tls13_backend.EarlyDataReplayDecision {
+                return .allow;
+            }
+        }.decide },
+    );
+    try std.testing.expect(!disabled_composition.store_enabled);
+    try std.testing.expect(disabled_composition.early_data_replay_gate == null);
+
+    // This is the production option-selection helper `run()` uses before
+    // constructing native TCP/H3 runtimes, not a parallel reproduction of
+    // its branch. Since the helper returns null here, the real native TLS
+    // connection receives the backend default gate.
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    const fds = try gatewayTestSocketPair();
+    defer gatewayTestCloseFd(fds[0]);
+    defer gatewayTestCloseFd(fds[1]);
+    const native = try http.native_tls_connection.NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{ .early_data_replay_gate = disabled_composition.early_data_replay_gate },
+    );
+    defer native.destroy();
+
+    // `Tls13Backend`'s own default (proven end-to-end in
+    // `tls13_backend_tests.zig`'s "0-RTT anti-replay defaults to
+    // unavailable (fails closed) when no gate is configured" test) applies
+    // to this real, composition-built connection: no callback installed,
+    // so any 0-RTT attempt on it fails closed to `.unavailable` while
+    // ordinary 1-RTT resumption is untouched.
+    try std.testing.expect(native.backend.early_data_replay_gate.decideFn == null);
+}
+
 test "return_response method enforcement — non-GET/HEAD rejected on static returns" {
     // ASVS-14.5.1: static return directives (non-redirect) must reject anything
     // other than GET and HEAD to prevent silent success on destructive methods
@@ -4693,4 +4841,5 @@ test "#368 Slice 2: one process-scoped early-data replay store is shared by nati
 test {
     _ = @import("gateway_handlers.zig");
     _ = @import("gateway_shutdown.zig");
+    _ = @import("process_early_data_integration_tests.zig");
 }

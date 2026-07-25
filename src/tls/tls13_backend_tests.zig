@@ -8124,3 +8124,412 @@ test "record mode delivers a fatal alert to the client when required client auth
     try std.testing.expect(!h.server.bridge.handshake_complete);
     try std.testing.expectEqual(tls_backend.CredentialFailure.client_certificate_required, h.server_engine.credentialFailure().?);
 }
+
+// ---------------------------------------------------------------------
+// #369 Slice 2: TLS / replay-store layer assurance.
+//
+// The tests above (#366/#367/#368) already prove the TLS-layer decision
+// (`EarlyDataDecision`) is correct for every accept/duplicate/capacity/
+// quarantine/no-gate-configured case, including two independent backends
+// sharing one real `LocalStore` (see "#368 Slice 2: a real process-scoped
+// LocalStore shared across two independent backends..." above). The tests
+// below reuse the exact same production harness helpers (`DirectHarness`,
+// `issueEarlyCapableTicket`, `IdentityResolver`, a real
+// `tls_core.early_data_replay.LocalStore`/`GateAdapter`) and add a real,
+// non-secret `Observer`/`Event` delta assertion for each scenario — the
+// same observer seam `edge_gateway.zig`'s composition installs on the
+// process-scoped store (`nativeEarlyDataReplayMetricsObserver`), just
+// asserted directly on the closed `Event` vocabulary here rather than
+// through `http.metrics`, which this module does not depend on.
+//
+// Scope note, corrected after review: an earlier version of these tests
+// paired each TLS decision with a same-process "application executed"
+// counter incremented directly from `server_backend.earlyDataAccepted()`.
+// That counter was tautological — derived from the exact decision under
+// test, so it could not catch a real cross-layer bug where HTTP/gateway
+// dispatch ignored the TLS decision. Worse, for the native TCP/H1 record
+// transport that bug is not even reachable to test today: `edge_gateway.zig`
+// currently hardcodes `ctx.early_data.transport_early = false` for every H1
+// request (see its own comment: "The production #366 H1 record provenance
+// carrier is not present on this branch yet"), i.e. **no production code
+// path yet wires `Tls13Backend.earlyDataAccepted()` into the HTTP
+// dispatch layer for this transport**. No test — here or anywhere — can
+// honestly claim to prove that wiring is correct until it exists; wiring it
+// is out of this slice's scope (a #366/#367 follow-up), so this file limits
+// itself to what real production code actually does today: the TLS/replay-
+// store decision and its observable `Event`s. The one place in this PR
+// where a real dispatch decision genuinely gates a real, non-tautological
+// execution/rejection is `rt0.reject.unsafe_request` in `edge_gateway.zig`,
+// which drives the real `executeH1PostPreflightOrchestration` orchestration
+// with a probe route hook.
+//
+// True OS-thread/worker-routing determinism is not exposed as a test seam
+// in this codebase today — no API pins a connection to a specific worker
+// thread for deterministic testing. The strongest available proof, and the
+// one that actually matches what `edge_gateway.zig`'s real composition
+// shares (one process-scoped `LocalStore`/`GateAdapter`, built once in
+// `initNativeEarlyDataReplayStore`/`GateAdapter.init` and installed by
+// reference into every native TCP worker and QUIC/H3 — see
+// "#368 Slice 2: one process-scoped early-data replay store is shared by
+// native TCP and QUIC/H3" in edge_gateway.zig), is two independent
+// per-connection `DirectHarness` instances sharing one real `LocalStore`,
+// used below in the cross-worker test. A future slice could add a
+// deterministic worker-pinning seam (e.g. an explicit worker id threaded
+// through `WorkerContext`) to drive this through real OS threads instead.
+// ---------------------------------------------------------------------
+
+const early_data_replay = tls_core.early_data_replay;
+
+/// Deterministic `Store` wrapper around a real `LocalStore` that takes an
+/// explicit `now_unix_ms` instead of reading wall-clock time, matching this
+/// suite's fixed test clocks (`IdentityResolver.now`/
+/// `earlyDataResumedClientClock` both return `2000`) — the same pattern as
+/// `DeterministicStore` in the #368 Slice 2 cross-worker test above, kept
+/// as an independent type here so each #369 test owns its own store
+/// lifetime.
+const DeterministicNowStore = struct {
+    backing: *early_data_replay.LocalStore,
+    now_unix_ms: u64,
+
+    fn asStore(self: *@This()) early_data_replay.Store {
+        return .{ .ctx = self, .claimFn = claimTrampoline };
+    }
+
+    fn claimTrampoline(ctx: *anyopaque, c: early_data_replay.Claim) early_data_replay.ClaimResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.backing.claim(c, self.now_unix_ms);
+    }
+};
+
+/// Counts each closed `early_data_replay.Event` variant, installed via the
+/// real `LocalStore.setObserver` seam production composition uses (see
+/// `edge_gateway.zig`'s `nativeEarlyDataReplayMetricsObserver`). Never
+/// records anything beyond the bounded event tag itself.
+const EventRecorder = struct {
+    counts: [6]usize = .{0} ** 6,
+
+    fn indexOf(event: early_data_replay.Event) usize {
+        return switch (event) {
+            .accepted => 0,
+            .duplicate => 1,
+            .capacity_rejected => 2,
+            .expired => 3,
+            .unavailable => 4,
+            .startup_quarantine => 5,
+        };
+    }
+
+    fn count(self: *const EventRecorder, event: early_data_replay.Event) usize {
+        return self.counts[indexOf(event)];
+    }
+
+    fn onEvent(ctx: *anyopaque, event: early_data_replay.Event) void {
+        const self: *EventRecorder = @ptrCast(@alignCast(ctx));
+        self.counts[indexOf(event)] += 1;
+    }
+
+    fn observer(self: *EventRecorder) early_data_replay.Observer {
+        return .{ .ctx = self, .onEventFn = onEvent };
+    }
+};
+
+/// Runs one resumed "connection" (a fresh `DirectHarness`) offering a clone
+/// of `ticket` against `state`, with `gate` installed as the server's
+/// anti-replay gate. Returns the harness so callers can assert on the real
+/// `EarlyDataDecision`, PSK/resumption state, and store occupancy.
+fn runResumedConnection(
+    state: *session.ServerRecoverableState,
+    ticket: *const session.ClientTicketState,
+    gate: tls_backend.EarlyDataReplayGate,
+) !*DirectHarness {
+    const harness = try std.testing.allocator.create(DirectHarness);
+    harness.* = DirectHarness.init();
+    errdefer {
+        harness.deinit();
+        std.testing.allocator.destroy(harness);
+    }
+
+    // `ClientPskOfferSet.push` moves ownership out of its argument, so
+    // offering the same ticket to independent connections needs an
+    // independent clone each time.
+    var ticket_clone: session.ClientTicketState = .{};
+    try ticket.cloneInto(std.testing.allocator, &ticket_clone);
+    errdefer ticket_clone.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket_clone);
+    var clock_dummy: u8 = 0;
+    try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+
+    var resolver_state = IdentityResolver{ .state = state };
+    try harness.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+
+    try harness.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    try harness.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+    try harness.server_backend.setEarlyDataReplayGate(gate);
+
+    try harness.run();
+    return harness;
+}
+
+fn destroyResumedConnection(harness: *DirectHarness) void {
+    harness.deinit();
+    std.testing.allocator.destroy(harness);
+}
+
+/// Formats an `EarlyDataReplayCandidate` the way a diagnostic log line
+/// might and asserts the raw ticket identity never appears in it — only the
+/// one-way fingerprint and a plain integer deadline should ever be
+/// observable this way. `EarlyDataReplayCandidate` structurally has no PSK
+/// field at all, so a PSK leak through this seam is impossible by
+/// construction rather than merely untested.
+fn assertNoRawTicketInDiagnostic(candidate: tls_backend.EarlyDataReplayCandidate, raw_ticket: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    const diagnostic = try std.fmt.bufPrint(&buf, "candidate={any}", .{candidate});
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, raw_ticket) == null);
+}
+
+test "#369 Slice 2 rt0.accept.first_use: accepted 0-RTT records the replay claim, emits exactly one real accepted Event, and leaks no raw ticket identity in diagnostics" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var store = try early_data_replay.LocalStore.init(std.testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    var recorder = EventRecorder{};
+    store.setObserver(recorder.observer());
+    var det_store = DeterministicNowStore{ .backing = &store, .now_unix_ms = 2_000 };
+    var adapter = early_data_replay.GateAdapter.init(det_store.asStore());
+    const inner_gate = adapter.gate();
+
+    const CapturingGate = struct {
+        inner: tls_backend.EarlyDataReplayGate,
+        seen: ?tls_backend.EarlyDataReplayCandidate = null,
+
+        fn decide(ctx: *anyopaque, candidate: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen = candidate;
+            return self.inner.decideFn.?(self.inner.ctx, candidate);
+        }
+    };
+    var capturing = CapturingGate{ .inner = inner_gate };
+    const gate = tls_backend.EarlyDataReplayGate{ .ctx = &capturing, .decideFn = CapturingGate.decide };
+
+    const harness = try runResumedConnection(&issued.server_state, &issued.ticket, gate);
+    defer destroyResumedConnection(harness);
+
+    try std.testing.expect(harness.server_backend.core.psk_authenticated);
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.accepted, harness.server_backend.earlyDataDecision());
+    // The replay claim was actually recorded — the store, not just the TLS
+    // decision, now has one live entry for this ticket's replay key — and
+    // the real observer seam saw exactly one `.accepted` event.
+    try std.testing.expectEqual(@as(usize, 1), store.count());
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.accepted));
+    try std.testing.expectEqual(@as(usize, 0), recorder.count(.duplicate));
+
+    const seen = capturing.seen orelse return error.TestExpectedEqual;
+    try assertNoRawTicketInDiagnostic(seen, "opaque-early-ticket");
+}
+
+test "#369 Slice 2 rt0.reject.duplicate: an exact-duplicate 0-RTT claim emits a real duplicate Event and never re-records the claim, and the connection stays usable for a later distinct 1-RTT request" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var store = try early_data_replay.LocalStore.init(std.testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    var recorder = EventRecorder{};
+    store.setObserver(recorder.observer());
+    var det_store = DeterministicNowStore{ .backing = &store, .now_unix_ms = 2_000 };
+    var adapter = early_data_replay.GateAdapter.init(det_store.asStore());
+    const gate = adapter.gate();
+
+    // First attempt: claim -> accepted.
+    const first = try runResumedConnection(&issued.server_state, &issued.ticket, gate);
+    defer destroyResumedConnection(first);
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.accepted, first.server_backend.earlyDataDecision());
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.accepted));
+
+    // Second attempt: the exact same logical replay identity (a clone of
+    // the same ticket) reused on an independent connection -> claim ->
+    // duplicate.
+    const second = try runResumedConnection(&issued.server_state, &issued.ticket, gate);
+    defer destroyResumedConnection(second);
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_rejected, second.server_backend.earlyDataDecision());
+    try std.testing.expect(!second.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.duplicate));
+    // The accepted count never grows from the duplicate.
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.accepted));
+    // The PSK/session is otherwise valid: the resumed handshake completed
+    // as ordinary 1-RTT rather than becoming a fatal TLS failure.
+    try std.testing.expect(second.client_driver.isComplete());
+    try std.testing.expect(second.server_driver.isComplete());
+    try std.testing.expect(second.server_backend.core.psk_authenticated);
+
+    // The surviving connection is actually usable: a distinct, later 1-RTT
+    // request round-trips real application data.
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try second.client_bridge.sealApplicationData("distinct 1-RTT request", &protected);
+    const opened = try second.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext);
+    try std.testing.expectEqualStrings("distinct 1-RTT request", opened.inner.content);
+
+    // Only one replay key was ever recorded; the duplicate never created a
+    // second entry.
+    try std.testing.expectEqual(@as(usize, 1), store.count());
+}
+
+test "#369 Slice 2 rt0.reject.capacity: capacity exhaustion emits a real capacity_rejected Event and ordinary resumption continues" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    // Deliberately small capacity: exactly one live entry fits.
+    var store = try early_data_replay.LocalStore.init(std.testing.allocator, .{ .max_entries = 1 }, 0, 0);
+    defer store.deinit();
+    var recorder = EventRecorder{};
+    store.setObserver(recorder.observer());
+
+    // Fill the store's one slot with a distinct, valid replay claim first —
+    // `issueEarlyCapableTicket` always mints the fixed identity
+    // "opaque-early-ticket" (see `issueEarlyCapableTicketProfile` above), so
+    // a second real ticket would collide as a *duplicate* of the same key
+    // rather than exercising capacity at all. A directly-claimed synthetic
+    // key models "some other distinct valid replay claim already occupying
+    // the store" without that collision, while the claim under test below
+    // is still a genuine production TLS/replay decision.
+    const filler_key: early_data_replay.Key = [_]u8{0xaa} ** 32;
+    try std.testing.expectEqual(early_data_replay.ClaimResult.accepted, store.claim(.{ .key = filler_key, .retain_until_unix_ms = std.math.maxInt(u64) }, 2_000));
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.accepted));
+
+    var det_store = DeterministicNowStore{ .backing = &store, .now_unix_ms = 2_000 };
+    var adapter = early_data_replay.GateAdapter.init(det_store.asStore());
+    const gate = adapter.gate();
+
+    // A real, otherwise-valid 0-RTT request finds the store full: rejected
+    // with the typed capacity outcome, but the valid PSK connection still
+    // continues as ordinary 1-RTT.
+    const rejected = try runResumedConnection(&issued.server_state, &issued.ticket, gate);
+    defer destroyResumedConnection(rejected);
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_unavailable, rejected.server_backend.earlyDataDecision());
+    try std.testing.expect(!rejected.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.capacity_rejected));
+    // The filler's accept is the only accept ever recorded.
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.accepted));
+    try std.testing.expect(rejected.client_driver.isComplete());
+    try std.testing.expect(rejected.server_driver.isComplete());
+    try std.testing.expect(rejected.server_backend.core.psk_authenticated);
+
+    // A later normal request over that connection succeeds.
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try rejected.client_bridge.sealApplicationData("after capacity rejection", &protected);
+    const opened = try rejected.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext);
+    try std.testing.expectEqualStrings("after capacity rejection", opened.inner.content);
+
+    // Occupancy stays bounded at the configured capacity — the rejected
+    // claim was never recorded.
+    try std.testing.expectEqual(@as(usize, 1), store.count());
+}
+
+test "#369 Slice 2 rt0.reject.startup_quarantine: lost replay history after restart emits a real startup_quarantine Event distinguishable from duplicate, and the exact quarantine boundary matches #368's documented (exclusive-end) semantics" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    // A 60_000ms quarantine window starting at the same fixed clock this
+    // suite's ticket/skew fixtures use (2_000), so `now == 2_000` is deep
+    // inside quarantine and `now == 62_000` is exactly at (and therefore
+    // past, per #368's `now_unix_ms < quarantine_until_unix_ms` exclusive
+    // check) the boundary.
+    var store = try early_data_replay.LocalStore.init(std.testing.allocator, .{}, 60_000, 2_000);
+    defer store.deinit();
+    var recorder = EventRecorder{};
+    store.setObserver(recorder.observer());
+
+    // now < quarantine_end -> reject early data (the "restart" case: a
+    // fresh store with no shared history from the process that issued the
+    // ticket must not blindly accept 0-RTT).
+    {
+        var det_store = DeterministicNowStore{ .backing = &store, .now_unix_ms = 2_000 };
+        var adapter = early_data_replay.GateAdapter.init(det_store.asStore());
+        const harness = try runResumedConnection(&issued.server_state, &issued.ticket, adapter.gate());
+        defer destroyResumedConnection(harness);
+        try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_unavailable, harness.server_backend.earlyDataDecision());
+        try std.testing.expect(!harness.server_backend.earlyDataAccepted());
+        // The real observer distinguishes startup quarantine from an
+        // ordinary duplicate: nothing was recorded (a duplicate would
+        // imply a live entry), and the underlying valid resumption/full
+        // handshake continues normally.
+        try std.testing.expectEqual(@as(usize, 1), recorder.count(.startup_quarantine));
+        try std.testing.expectEqual(@as(usize, 0), recorder.count(.duplicate));
+        try std.testing.expectEqual(@as(usize, 0), store.count());
+        try std.testing.expect(harness.client_driver.isComplete());
+        try std.testing.expect(harness.server_driver.isComplete());
+        try std.testing.expect(harness.server_backend.core.psk_authenticated);
+
+        // The connection remains usable for a subsequent 1-RTT request.
+        var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+        var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+        const request = try harness.client_bridge.sealApplicationData("during quarantine", &protected);
+        const opened = try harness.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext);
+        try std.testing.expectEqualStrings("during quarantine", opened.inner.content);
+    }
+
+    // now == quarantine_end (62_000) -> per #368's existing boundary
+    // semantics (`now_unix_ms < quarantine_until_unix_ms`), this is no
+    // longer quarantined and ordinary replay-store eligibility applies: a
+    // fresh, otherwise-valid claim is accepted.
+    {
+        var fresh_issued = try issueEarlyCapableTicket(32);
+        defer fresh_issued.deinit();
+        var det_store = DeterministicNowStore{ .backing = &store, .now_unix_ms = 62_000 };
+        var adapter = early_data_replay.GateAdapter.init(det_store.asStore());
+        const harness = try runResumedConnection(&fresh_issued.server_state, &fresh_issued.ticket, adapter.gate());
+        defer destroyResumedConnection(harness);
+        try std.testing.expectEqual(tls_backend.EarlyDataDecision.accepted, harness.server_backend.earlyDataDecision());
+        try std.testing.expectEqual(@as(usize, 1), recorder.count(.accepted));
+    }
+}
+
+test "#369 Slice 2 rt0.reject.cross_worker_duplicate: worker A's accepted claim emits one real accepted Event; the same replay identity replayed through worker B emits a real duplicate Event, over a real process-shared LocalStore" {
+    // Models exactly what `edge_gateway.zig`'s composition actually shares
+    // (one process-scoped `LocalStore`/`GateAdapter` handed by reference to
+    // every native TCP worker and QUIC/H3 — see
+    // `initNativeEarlyDataReplayStore`) as two independent per-connection
+    // `DirectHarness` "workers". See the module-doc note above this section
+    // for why real OS-thread pinning is not an available test seam today.
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var store = try early_data_replay.LocalStore.init(std.testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    var recorder = EventRecorder{};
+    store.setObserver(recorder.observer());
+    var det_store = DeterministicNowStore{ .backing = &store, .now_unix_ms = 2_000 };
+    var adapter = early_data_replay.GateAdapter.init(det_store.asStore());
+    const shared_gate = adapter.gate();
+
+    // Worker A: first claim of this ticket's replay key anywhere in the
+    // (simulated) process — accepted.
+    const worker_a = try runResumedConnection(&issued.server_state, &issued.ticket, shared_gate);
+    defer destroyResumedConnection(worker_a);
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.accepted, worker_a.server_backend.earlyDataDecision());
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.accepted));
+
+    // Worker B: an independent backend instance — a different native TCP
+    // worker/connection in production — offering the very same ticket. The
+    // process-shared store must reject worker B's claim as a real
+    // duplicate, not merely a different in-memory decision.
+    const worker_b = try runResumedConnection(&issued.server_state, &issued.ticket, shared_gate);
+    defer destroyResumedConnection(worker_b);
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_rejected, worker_b.server_backend.earlyDataDecision());
+    try std.testing.expect(!worker_b.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.duplicate));
+    try std.testing.expectEqual(@as(usize, 1), recorder.count(.accepted));
+    try std.testing.expect(worker_b.client_driver.isComplete());
+    try std.testing.expect(worker_b.server_driver.isComplete());
+    try std.testing.expect(worker_b.server_backend.core.psk_authenticated);
+
+    try std.testing.expectEqual(@as(usize, 1), store.count());
+}
