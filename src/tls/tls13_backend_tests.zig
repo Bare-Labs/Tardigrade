@@ -4674,9 +4674,16 @@ const CountingResolver = struct {
     state: *session.ServerRecoverableState,
     identity: []const u8,
     calls: usize = 0,
+    /// The clock the server sees when evaluating resumption eligibility
+    /// (`session.evaluateCompatibility`'s `now_unix_ms`) — defaults to 0 to
+    /// match every existing call site's fixed-at-issuance tickets; set it
+    /// past a ticket's `issued_at_unix_ms + lifetime_seconds` to model
+    /// resolving an already-expired ticket.
+    now_ms: i64 = 0,
 
-    fn now(_: *anyopaque) i64 {
-        return 0;
+    fn now(ctx: *anyopaque) i64 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.now_ms;
     }
     fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
         const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -6763,6 +6770,124 @@ test "an SNI mismatch falls back to a full handshake instead of rejecting the co
 
     try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
     try std.testing.expect(!server.core.psk_authenticated);
+    try std.testing.expect(server.credentialFailure() == null);
+}
+
+test "a ticket past its lifetime is rejected and falls back to a full handshake (#369)" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0x77} ** tls_backend.hash_len;
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    });
+    var stored_state: session.ServerRecoverableState = .{};
+    stored_state.init(&common, 0);
+    defer stored_state.deinit();
+    // Resolved well past `issued_at_unix_ms + lifetime_seconds * 1000`.
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "expired-ticket", .now_ms = 3_600_001 };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try driveServerSelection(&server, .{
+        .psk = .{ .items = &.{.{ .identity = "expired-ticket", .binder_psk = &psk }} },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(!server.core.psk_authenticated);
+    // Falls back to the ordinary full-certificate flight rather than
+    // failing the connection outright.
+    try std.testing.expectEqual(.running, server.core.handshake_lifecycle);
+    try std.testing.expect(server.credentialFailure() == null);
+}
+
+test "an ALPN mismatch falls back to a full handshake instead of rejecting the connection (#369)" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0x88} ** tls_backend.hash_len;
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        // The ticket was issued for a connection negotiated as "h3"; the
+        // resuming ClientHello below only offers/negotiates "h2".
+        .application_protocol = "h3",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    });
+    var stored_state: session.ServerRecoverableState = .{};
+    stored_state.init(&common, 0);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "alpn-ticket" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try driveServerSelection(&server, .{
+        .alpn_protocols = &.{"h2"},
+        .psk = .{ .items = &.{.{ .identity = "alpn-ticket", .binder_psk = &psk }} },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(!server.core.psk_authenticated);
+    try std.testing.expectEqual(.running, server.core.handshake_lifecycle);
+    try std.testing.expect(server.credentialFailure() == null);
+}
+
+test "a cipher-suite mismatch falls back to a full handshake instead of rejecting the connection (#369)" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    // The wire binder key (what the resuming ClientHello actually offers)
+    // stays at `hash_len` (sha256, since `buildClientHello` always derives
+    // binders with sha256) — it is never reached for this scenario, since
+    // the cipher-suite mismatch is caught before binder verification.
+    const psk = [_]u8{0x99} ** tls_backend.hash_len;
+    // The stored ticket's own PSK must match its declared cipher suite's
+    // hash length (sha384 => 48 bytes) for `common.init` to accept it.
+    const ticket_psk = [_]u8{0x99} ** 48;
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        // The ticket was bound to AES-256-GCM; `buildClientHello` only ever
+        // offers (and this server only ever negotiates) AES-128-GCM, so the
+        // resuming connection's negotiated cipher suite can never match.
+        .cipher_suite = .tls_aes_256_gcm_sha384,
+        .resumption_psk = &ticket_psk,
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    });
+    var stored_state: session.ServerRecoverableState = .{};
+    stored_state.init(&common, 0);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "cipher-ticket" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try driveServerSelection(&server, .{
+        .psk = .{ .items = &.{.{ .identity = "cipher-ticket", .binder_psk = &psk }} },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(!server.core.psk_authenticated);
+    try std.testing.expectEqual(.running, server.core.handshake_lifecycle);
     try std.testing.expect(server.credentialFailure() == null);
 }
 

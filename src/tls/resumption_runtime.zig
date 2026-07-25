@@ -1008,3 +1008,76 @@ test "createIdentity disabled runtime reports typed stateful refusal" {
     defer state.deinit();
     try std.testing.expectError(error.StatefulCapacityRefused, runtime.createIdentity(&state, clock.now_ms, &.{}));
 }
+
+test "restart: a stateless identity issued by one process is unresolvable by a fresh process with no shared state (#369)" {
+    var clock = TestClock{};
+
+    var entropy_a = TestEntropy{ .byte = 0x10 };
+    var provider_a = crypto.pure_zig.Provider.init(entropy_a.entropy());
+    var runtime_a = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless },
+        clock.clock(),
+        provider_a.cryptoProvider(),
+    );
+    defer runtime_a.deinit();
+
+    var state = try sampleServerState(std.testing.allocator, "restart-stateless.test");
+    defer state.deinit();
+    var scratch: [1024]u8 = undefined;
+    const identity = try runtime_a.createIdentity(&state, clock.now_ms, &scratch);
+
+    // A fresh process: an independent entropy source feeding an independent
+    // `Runtime.init` call, so its ephemeral stateless key
+    // (`installEphemeralStatelessKey`) shares no key material with
+    // `runtime_a`'s — exactly what a real restart looks like.
+    var entropy_b = TestEntropy{ .byte = 0x99 };
+    var provider_b = crypto.pure_zig.Provider.init(entropy_b.entropy());
+    var runtime_b = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless },
+        clock.clock(),
+        provider_b.cryptoProvider(),
+    );
+    defer runtime_b.deinit();
+
+    const resolver = runtime_b.serverResolver().?;
+    var miss = try resolver.resolve(identity.slice());
+    defer miss.deinit();
+    try std.testing.expect(miss == .miss);
+}
+
+test "restart: a stateful handle issued by one process is unresolvable by a fresh process with an empty cache (#369)" {
+    var clock = TestClock{};
+
+    var entropy_a = TestEntropy{ .byte = 0x21 };
+    var provider_a = crypto.pure_zig.Provider.init(entropy_a.entropy());
+    var runtime_a = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateful },
+        clock.clock(),
+        provider_a.cryptoProvider(),
+    );
+    defer runtime_a.deinit();
+
+    var state = try sampleServerState(std.testing.allocator, "restart-stateful.test");
+    const identity = try runtime_a.createIdentity(&state, clock.now_ms, &.{});
+    state.deinit();
+
+    // A fresh process with its own empty stateful cache — no knowledge of
+    // any handle `runtime_a` ever issued.
+    var entropy_b = TestEntropy{ .byte = 0x88 };
+    var provider_b = crypto.pure_zig.Provider.init(entropy_b.entropy());
+    var runtime_b = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateful },
+        clock.clock(),
+        provider_b.cryptoProvider(),
+    );
+    defer runtime_b.deinit();
+
+    const resolver = runtime_b.serverResolver().?;
+    var miss = try resolver.resolve(identity.slice());
+    defer miss.deinit();
+    try std.testing.expect(miss == .miss);
+}
