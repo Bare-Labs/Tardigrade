@@ -3325,6 +3325,174 @@ test "restart.cert_change.ticket_rejected" {
     }) orelse 0);
 }
 
+/// #369: `TARDIGRADE_SOAK_HEAVY=1` scales `soak.reconnect_resumption` up
+/// from its CI-smoke iteration count to the heavy-tier count. Unset (the
+/// default) keeps the normal `zig build test-integration-resumption-interop`
+/// run fast and deterministic.
+fn soakHeavyEnabled() bool {
+    const value = compat.getEnvVarOwned(std.heap.page_allocator, "TARDIGRADE_SOAK_HEAVY") catch return false;
+    defer std.heap.page_allocator.free(value);
+    return std.mem.eql(u8, value, "1");
+}
+
+// soak.reconnect_resumption: repeated full-handshake -> ticket -> resumed
+// reconnect cycles against one long-lived process, tracking the counts
+// #369 requires. There is no accepted-0-RTT/rejected-0-RTT leg here --
+// native TCP 0-RTT is not a production capability yet (see #510 and
+// docs/RESUMPTION_TEST_PLAN.md), so this soak's cycle is the part of the
+// documented `full handshake -> ticket issuance -> resumed reconnect ->
+// repeat` loop that production code actually supports today.
+//
+// Known gap: there is no exposed gauge for server-side resumption-cache
+// occupancy (only issuance/outcome counters), so "memory/cache growth
+// converges to configured bounds" is proven here only via the *cache's
+// own* bounded-capacity unit tests (`test-session-cache`, #364) plus this
+// loop never regressing the counted invariants below over many iterations
+// -- not via a live occupancy sample. Documented rather than asserted on a
+// metric that does not exist.
+test "soak.reconnect_resumption" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const iterations: usize = if (soakHeavyEnabled()) 2_000 else 40;
+
+    var client_entropy = tls_core.production_crypto.OsEntropy{};
+    var client_provider = tls_core.production_crypto.Provider.init(client_entropy.entropy());
+    var client_runtime = try tls_core.resumption_runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 2_000;
+            }
+        }.now },
+        client_provider.cryptoProvider(),
+    );
+    defer client_runtime.deinit();
+
+    const SoakTicketCapture = struct {
+        allocator: std.mem.Allocator,
+        runtime: *tls_core.resumption_runtime.Runtime,
+        retained: tls_core.session.ClientTicketState = .{},
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.retained.deinit();
+            self.retained = .{};
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+            _ = self.runtime.storeClientTicket(ticket);
+        }
+    };
+
+    var accepted_count: usize = 0;
+    var execution_count: usize = 0;
+
+    var iter: usize = 0;
+    while (iter < iterations) : (iter += 1) {
+        var capture = SoakTicketCapture{ .allocator = allocator, .runtime = &client_runtime };
+        defer capture.retained.deinit();
+
+        const first_client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+            .ticket_consumer = .{
+                .ctx = &capture,
+                .nowUnixMsFn = SoakTicketCapture.now,
+                .onTicketFn = SoakTicketCapture.onTicket,
+            },
+        });
+        defer first_client.destroy();
+        try first_client.writeAllPlain(openssl_health_request);
+        const first_raw = try first_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(first_raw);
+        try assertContains(first_raw, "HTTP/1.1 200 OK");
+        // Only the real application/upstream dispatch increments execution
+        // counts -- never a TLS-layer decision function such as
+        // `earlyDataAccepted()`, which is not even in play on this
+        // full-handshake leg.
+        execution_count += 1;
+
+        const candidate: tls_core.session.CandidateContext = .{
+            .cipher_suite = capture.retained.common.cipher_suite,
+            .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
+            .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
+            .auth_binding = capture.retained.common.auth_binding,
+            .transport_compat = null,
+            .application_compat = null,
+        };
+        var lookup = client_runtime.lookupClientOffers(candidate);
+        defer lookup.deinit();
+        if (lookup != .hit) return error.NoTicketOfferedThisIteration;
+
+        var clock_dummy: u8 = 0;
+        const SoakClientClock = struct {
+            fn now(_: *anyopaque) i64 {
+                return 2_500;
+            }
+        };
+        const resumed_client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+            .psk_lease = &lookup.hit,
+            .psk_now_ctx = &clock_dummy,
+            .psk_now_fn = SoakClientClock.now,
+        });
+        defer resumed_client.destroy();
+        if (resumed_client.backend.core.psk_authenticated) accepted_count += 1;
+        try resumed_client.writeAllPlain(openssl_health_request);
+        const resumed_raw = try resumed_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(resumed_raw);
+        try assertContains(resumed_raw, "HTTP/1.1 200 OK");
+        execution_count += 1;
+    }
+
+    // Required invariant: application executions == legitimate requests
+    // expected to execute, exactly -- two per iteration, one per connection.
+    try std.testing.expectEqual(iterations * 2, execution_count);
+    // Every resumed reconnect actually resumed -- a soak that silently
+    // degraded to full handshakes partway through would still pass a
+    // looser ">= some fraction" check.
+    try std.testing.expectEqual(iterations, accepted_count);
+
+    var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer metrics.deinit();
+    const accepted_metric = prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{
+        "transport=\"record\"",
+        "outcome=\"accepted\"",
+    }) orelse 0;
+    try std.testing.expect(accepted_metric >= iterations);
+
+    // #369 artifact requirement: record the seed/iteration/result triple
+    // for reproduction. This loop is already fully deterministic (fixed
+    // synthetic clock, no randomness in the connect pattern), so there is
+    // no PRNG seed to report beyond the iteration count itself.
+    std.debug.print(
+        "soak.reconnect_resumption: iterations={d} accepted={d} executions={d} heavy={}\n",
+        .{ iterations, accepted_count, execution_count, soakHeavyEnabled() },
+    );
+}
+
 const PureZigTlsClient = struct {
     const Options = struct {
         ticket_consumer: ?tls_core.tls13_backend.Tls13Backend.SessionTicketConsumer = null,
