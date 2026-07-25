@@ -4680,6 +4680,17 @@ test "#368 Slice 2: one process-scoped early-data replay store is shared by nati
 // Pull gateway_handlers (and its transitive imports, including
 // gateway_static_runtime) into the unit-test runner so their tests are
 // discovered and executed alongside the other edge-gateway tests.
+//
+// gateway_shutdown.zig is pulled in the same way: `hotReloadConfig` is only
+// ever referenced through the plain `const gshutdown = @import(...)` at the
+// top of this file, which is not itself sufficient for Zig's test discovery
+// to find gateway_shutdown.zig's own `test` declarations (test discovery
+// follows the `_ = @import(...)` chain rooted at each file's `test {}`
+// aggregator, not arbitrary functional imports) — without this line, every
+// test in gateway_shutdown.zig (including the pre-existing
+// applianceCredentialConfigChanged/applyReloadedRuntimeConfig coverage) was
+// silently never compiled or run by `zig build test`.
 test {
     _ = @import("gateway_handlers.zig");
+    _ = @import("gateway_shutdown.zig");
 }
