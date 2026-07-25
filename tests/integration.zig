@@ -2962,15 +2962,9 @@ test "interop.openssl.ticket.tampered" {
     }) orelse 0);
 }
 
-/// #369: flips one byte inside the opaque ticket envelope of an
-/// OpenSSL-managed `-sess_out` PEM file, in place. Walks the minimal DER
-/// TLV structure of the decoded `SSL_SESSION_ASN1` to find the specific
-/// OCTET STRING leaf whose content starts with `ticket_protection.magic`
-/// (`"TDTK"`, wire-visible and non-secret by that module's own contract),
-/// then corrupts a byte comfortably inside its declared length -- never a
-/// tag or length byte, which a real regression could otherwise trip over
-/// only in OpenSSL's own local parser, proving nothing about the server.
-fn tamperOpensslTicketFile(allocator: std.mem.Allocator, path: []const u8) ![32]u8 {
+/// #369: decodes an OpenSSL-managed `-sess_out` PEM file's base64 body to
+/// the raw `SSL_SESSION_ASN1` DER bytes.
+fn decodeOpensslSessionFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const pem = try compat.cwd().readFileAlloc(allocator, path, 64 * 1024);
     defer allocator.free(pem);
 
@@ -2985,8 +2979,38 @@ fn tamperOpensslTicketFile(allocator: std.mem.Allocator, path: []const u8) ![32]
     const decoder = std.base64.standard.Decoder;
     const decoded_len = try decoder.calcSizeForSlice(body.items);
     const raw = try allocator.alloc(u8, decoded_len);
-    defer allocator.free(raw);
+    errdefer allocator.free(raw);
     try decoder.decode(raw, body.items);
+    return raw;
+}
+
+/// #369: a non-secret-in-itself fingerprint of a captured ticket -- 32
+/// authentic ciphertext bytes right after `ticket_protection.magic`
+/// (`"TDTK"`) -- for asserting that a log or diagnostic never echoes the
+/// actual secret ticket bytes, as opposed to merely checking for the
+/// generic string "TLS session ticket" (which a legitimate fresh reissue
+/// would also trip for an unrelated reason).
+fn opensslSessionTicketFingerprint(allocator: std.mem.Allocator, path: []const u8) ![32]u8 {
+    const raw = try decodeOpensslSessionFile(allocator, path);
+    defer allocator.free(raw);
+    const ticket_start = std.mem.indexOf(u8, raw, "TDTK") orelse return error.TicketMagicNotFound;
+    if (ticket_start + 24 + 32 >= raw.len) return error.TicketTooShortToFingerprint;
+    var fingerprint: [32]u8 = undefined;
+    @memcpy(&fingerprint, raw[ticket_start + 24 ..][0..32]);
+    return fingerprint;
+}
+
+/// #369: flips one byte inside the opaque ticket envelope of an
+/// OpenSSL-managed `-sess_out` PEM file, in place. Walks the minimal DER
+/// TLV structure of the decoded `SSL_SESSION_ASN1` to find the specific
+/// OCTET STRING leaf whose content starts with `ticket_protection.magic`
+/// (`"TDTK"`, wire-visible and non-secret by that module's own contract),
+/// then corrupts a byte comfortably inside its declared length -- never a
+/// tag or length byte, which a real regression could otherwise trip over
+/// only in OpenSSL's own local parser, proving nothing about the server.
+fn tamperOpensslTicketFile(allocator: std.mem.Allocator, path: []const u8) ![32]u8 {
+    const raw = try decodeOpensslSessionFile(allocator, path);
+    defer allocator.free(raw);
 
     const magic = "TDTK";
     const ticket_start = std.mem.indexOf(u8, raw, magic) orelse return error.TicketMagicNotFound;
@@ -3022,6 +3046,283 @@ fn tamperOpensslTicketFile(allocator: std.mem.Allocator, path: []const u8) ![32]
     try out.appendSlice("-----END SSL SESSION PARAMETERS-----\n");
     try compat.cwd().writeFile(.{ .sub_path = path, .data = out.items });
     return fingerprint;
+}
+
+/// #369: a throwaway self-signed Ed25519 identity for `restart.cert_change.
+/// ticket_rejected`, generated at test time via a real `openssl req`
+/// subprocess (mirroring `scripts/interop/gen-certs.sh`'s convention) rather
+/// than checking in a fixture -- this test only needs *a* different key
+/// under the *same* subject/SAN, not any particular one.
+const GeneratedCert = struct {
+    cert_path: []u8,
+    key_path: []u8,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *GeneratedCert) void {
+        compat.cwd().deleteFile(self.cert_path) catch {};
+        compat.cwd().deleteFile(self.key_path) catch {};
+        self.allocator.free(self.cert_path);
+        self.allocator.free(self.key_path);
+        self.* = undefined;
+    }
+};
+
+fn generateAlternateServerCert(allocator: std.mem.Allocator, server_name: []const u8) !GeneratedCert {
+    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const unique = compat.milliTimestamp();
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/interop-restart-cert-{d}.pem", .{ cwd, unique });
+    errdefer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/interop-restart-key-{d}.pem", .{ cwd, unique });
+    errdefer allocator.free(key_path);
+    const san_arg = try std.fmt.allocPrint(allocator, "subjectAltName=DNS:{s}", .{server_name});
+    defer allocator.free(san_arg);
+    const subj_arg = try std.fmt.allocPrint(allocator, "/CN={s}", .{server_name});
+    defer allocator.free(subj_arg);
+
+    var result = try runOpenssl(allocator, &.{
+        "req",    "-x509",   "-newkey", "ed25519", "-keyout",                            key_path,
+        "-out",   cert_path, "-days",   "1",       "-noenc",                             "-subj",
+        subj_arg, "-addext", san_arg,
+        // Without an explicit override, this OpenSSL's default x509
+        // extensions mark a self-signed cert as `CA:TRUE`, which the
+        // appliance profile's strict leaf-certificate loader rejects
+        // outright (`appliance_credentials.zig`: a CA cert is never a
+        // valid leaf identity).
+          "-addext", "basicConstraints=critical,CA:FALSE",
+    }, null, 10_000);
+    defer result.deinit(allocator);
+    if (std.meta.activeTag(result.outcome) != .normal_exit) return error.CertGenerationFailed;
+
+    return .{ .allocator = allocator, .cert_path = cert_path, .key_path = key_path };
+}
+
+test "restart.ephemeral.ticket_miss and restart.ephemeral.fresh_ticket" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    try requireOpenssl(allocator);
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+    ;
+    // The currently supported restart policy is the ephemeral stateless
+    // ticket key: a fresh process has no way to decrypt a ticket the
+    // previous process issued (#510/#369 docs). Stateful mode's cache-miss
+    // shape is a different, already-covered concern.
+    const extra_env = &[_]EnvPair{
+        .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+        .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+        .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+    };
+
+    // 1-2: start process A, establish a connection, and obtain a ticket.
+    var process_a = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = extra_env,
+    });
+    var process_a_running = true;
+    defer if (process_a_running) process_a.stop();
+
+    const connect_a = try opensslConnectArg(allocator, process_a.port);
+    defer allocator.free(connect_a);
+    const sess_path = try opensslSessionPath(allocator, process_a.port, "restart-ephemeral");
+    defer allocator.free(sess_path);
+    defer compat.cwd().deleteFile(sess_path) catch {};
+
+    var first = try runOpenssl(allocator, &.{
+        "s_client",        "-connect", connect_a,
+        "-alpn",           "http/1.1", "-servername",
+        "tardigrade.test", "-tls1_3",  "-sess_out",
+        sess_path,
+    }, openssl_health_request, 10_000);
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
+    try assertContains(first.stdout, "HTTP/1.1 200 OK");
+
+    const fingerprint = try opensslSessionTicketFingerprint(allocator, sess_path);
+    var fingerprint_hex: [64]u8 = undefined;
+    const fingerprint_hex_slice = std.fmt.bufPrint(&fingerprint_hex, "{x}", .{fingerprint}) catch unreachable;
+    // `stop()` frees and invalidates the whole struct, including
+    // `log_path` -- capture an owned copy first so the log is still
+    // readable after A is gone.
+    const log_a_path = try allocator.dupe(u8, process_a.log_path);
+    defer allocator.free(log_a_path);
+
+    // 3: terminate process A cleanly -- a real process boundary, not
+    // `Runtime.deinit()`/`Runtime.init()` reused inside one test object.
+    process_a.stop();
+    process_a_running = false;
+
+    // 4: start process B with the same operator configuration. It gets its
+    // own naturally fresh ephemeral stateless ticket key (a new process, no
+    // shared memory with A) purely by existing as a separate process --
+    // nothing here loads or carries over any state from A.
+    var process_b = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = extra_env,
+    });
+    defer process_b.stop();
+
+    const connect_b = try opensslConnectArg(allocator, process_b.port);
+    defer allocator.free(connect_b);
+
+    // 5-7: reconnect to B with A's ticket. It must resolve as a miss, not
+    // authenticate, and the connection must remain usable via a full
+    // handshake.
+    var second = try runOpenssl(allocator, &.{
+        "s_client",        "-connect", connect_b,
+        "-alpn",           "http/1.1", "-servername",
+        "tardigrade.test", "-tls1_3",  "-sess_in",
+        sess_path,
+    }, openssl_health_request, 10_000);
+    defer second.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(second.outcome));
+    try assertContains(second.stdout, "New, TLSv1.3");
+    try assertContains(second.stdout, "HTTP/1.1 200 OK");
+    try assertContains(second.stdout, "alive");
+
+    // 8-9: process B issues its own fresh, usable ticket, proven by a real
+    // resumed reconnect within B's lifetime -- not merely a metric.
+    const b_sess_path = try opensslSessionPath(allocator, process_b.port, "restart-ephemeral-fresh");
+    defer allocator.free(b_sess_path);
+    defer compat.cwd().deleteFile(b_sess_path) catch {};
+    var third = try runOpenssl(allocator, &.{
+        "s_client",        "-connect", connect_b,
+        "-alpn",           "http/1.1", "-servername",
+        "tardigrade.test", "-tls1_3",  "-sess_out",
+        b_sess_path,
+    }, openssl_health_request, 10_000);
+    defer third.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(third.outcome));
+
+    var fourth = try runOpenssl(allocator, &.{
+        "s_client",        "-connect", connect_b,
+        "-alpn",           "http/1.1", "-servername",
+        "tardigrade.test", "-tls1_3",  "-sess_in",
+        b_sess_path,
+    }, openssl_health_request, 10_000);
+    defer fourth.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(fourth.outcome));
+    try assertContains(fourth.stdout, "Reused, TLSv1.3");
+    try assertContains(fourth.stdout, "HTTP/1.1 200 OK");
+
+    // 9: bounded miss/fallback metrics recorded for the restart, and B's
+    // real resumption of its own ticket, both on B's own metrics endpoint.
+    var metrics = try sendPureZigTlsHttp1Request(allocator, process_b.port, "/status/metrics");
+    defer metrics.deinit();
+    try std.testing.expect((prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{
+        "transport=\"record\"",
+        "outcome=\"accepted\"",
+    }) orelse 0) >= 1);
+
+    // 10: no raw ticket identity in either process's log output.
+    const log_a = try compat.cwd().readFileAlloc(allocator, log_a_path, 4 * 1024 * 1024);
+    defer allocator.free(log_a);
+    const log_b = try compat.cwd().readFileAlloc(allocator, process_b.log_path, 4 * 1024 * 1024);
+    defer allocator.free(log_b);
+    try std.testing.expect(!containsSubstring(log_a, fingerprint_hex_slice));
+    try std.testing.expect(!containsSubstring(log_b, fingerprint_hex_slice));
+}
+
+test "restart.cert_change.ticket_rejected" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    try requireOpenssl(allocator);
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    var alt_cert = try generateAlternateServerCert(allocator, "tardigrade.test");
+    defer alt_cert.deinit();
+
+    const config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+    ;
+
+    // Process A: credential generation A, issue a ticket.
+    var process_a = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+        },
+    });
+    var process_a_running = true;
+    defer if (process_a_running) process_a.stop();
+
+    const connect_a = try opensslConnectArg(allocator, process_a.port);
+    defer allocator.free(connect_a);
+    const sess_path = try opensslSessionPath(allocator, process_a.port, "restart-cert-change");
+    defer allocator.free(sess_path);
+    defer compat.cwd().deleteFile(sess_path) catch {};
+
+    var first = try runOpenssl(allocator, &.{
+        "s_client",        "-connect", connect_a,
+        "-alpn",           "http/1.1", "-servername",
+        "tardigrade.test", "-tls1_3",  "-sess_out",
+        sess_path,
+    }, openssl_health_request, 10_000);
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
+    try assertContains(first.stdout, "HTTP/1.1 200 OK");
+
+    process_a.stop();
+    process_a_running = false;
+
+    // Process B: same server_name, a different credential generation --
+    // this changes the ticket's authentication binding (RFC 9846's
+    // certificate-bound resumption contract).
+    var process_b = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = alt_cert.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = alt_cert.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+        },
+    });
+    defer process_b.stop();
+
+    const connect_b = try opensslConnectArg(allocator, process_b.port);
+    defer allocator.free(connect_b);
+
+    // The old ticket must not bypass the new authentication requirement.
+    var second = try runOpenssl(allocator, &.{
+        "s_client",        "-connect", connect_b,
+        "-alpn",           "http/1.1", "-servername",
+        "tardigrade.test", "-tls1_3",  "-sess_in",
+        sess_path,
+    }, openssl_health_request, 10_000);
+    defer second.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(second.outcome));
+    try std.testing.expect(!containsSubstring(second.stdout, "Reused, TLSv1.3"));
+    try assertContains(second.stdout, "New, TLSv1.3");
+    try assertContains(second.stdout, "HTTP/1.1 200 OK");
+    try assertContains(second.stdout, "alive");
+
+    var metrics = try sendPureZigTlsHttp1Request(allocator, process_b.port, "/status/metrics");
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{
+        "transport=\"record\"",
+        "outcome=\"accepted\"",
+    }) orelse 0);
 }
 
 const PureZigTlsClient = struct {
