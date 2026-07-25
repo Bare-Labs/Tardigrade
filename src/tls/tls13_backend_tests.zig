@@ -862,6 +862,16 @@ test "0-RTT round trip: an early-capable ticket, matching policy, and an allowin
     try std.testing.expectEqualSlices(u8, &expected_fingerprint, &seen_candidate.ticket_identity_fingerprint);
     try std.testing.expect(!std.mem.allEqual(u8, &seen_candidate.ticket_identity_fingerprint, 0));
 
+    // #368 Slice 2: the candidate the replay gate receives also carries the
+    // authoritative retention deadline — `ticket_issued_at (1000, from
+    // `issueEarlyCapableTicketProfile`) + apparent_ticket_age +
+    // age_skew_tolerance_ms (60_000, set above)` — derived once by
+    // `tls13_backend.zig` from the same validated age-skew observation the
+    // freshness check already used, not re-derived by the replay store.
+    const age_skew = resumed.server_backend.takePskAgeSkew() orelse return error.TestExpectedEqual;
+    const expected_retain_until_unix_ms: u64 = @intCast(@as(i64, 1000) + @as(i64, age_skew.apparent_age_ms) + 60_000);
+    try std.testing.expectEqual(expected_retain_until_unix_ms, seen_candidate.retain_until_unix_ms);
+
     // The client's `c e traffic` secret (derived from the final ClientHello
     // it sent) and the server's own derivation (from the same ClientHello,
     // captured pre-binder-verification) must be byte-identical — a real
@@ -880,6 +890,246 @@ test "0-RTT round trip: an early-capable ticket, matching policy, and an allowin
     const request = try resumed.client_bridge.sealApplicationData("resumed request", &protected2);
     const opened_request = try resumed.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext2);
     try std.testing.expectEqualStrings("resumed request", opened_request.inner.content);
+}
+
+test "0-RTT is rejected without ever consulting the replay gate when the retention deadline overflows" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    // An enormous tolerance still passes the `skewWithinTolerance` freshness
+    // check (any real skew is trivially within it), but overflows
+    // `computeReplayRetainUntilUnixMs`'s final addition — #368 Slice 2 must
+    // fail closed for 0-RTT there rather than hand the store a silently
+    // shortened/wrapped deadline.
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = std.math.maxInt(u64) });
+
+    const CapturingReplayGate = struct {
+        seen: ?tls_backend.EarlyDataReplayCandidate = null,
+
+        fn decide(ctx: *anyopaque, candidate: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.seen = candidate;
+            return .allow;
+        }
+    };
+    var replay_gate = CapturingReplayGate{};
+    try resumed.server_backend.setEarlyDataReplayGate(.{
+        .ctx = &replay_gate,
+        .decideFn = CapturingReplayGate.decide,
+    });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    // Resumption itself is unaffected by the deadline-overflow rejection.
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_unavailable, resumed.server_backend.earlyDataDecision());
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    try std.testing.expectEqual(@as(?tls_backend.EarlyDataReplayCandidate, null), replay_gate.seen);
+}
+
+test "0-RTT is rejected, not accepted, when the replay store's own clock read lands past the TLS-validated retention deadline; 1-RTT resumption still completes" {
+    // The exact clock-boundary gap flagged in review: `tls13_backend.zig`
+    // derives `retain_until_unix_ms` from an earlier wall-clock read (the
+    // resolver's `now`, fixed here via `IdentityResolver.now`/
+    // `earlyDataResumedClientClock`); `Store.claim`'s trampoline then takes
+    // a *second*, later wall-clock read for its own `now_unix_ms`. If that
+    // second read lands even one millisecond past the deadline the first
+    // read produced, a naive store would insert an already-expired record
+    // and report `.accepted` — letting a second, concurrent replay of the
+    // same key also be accepted once it observes that record as expired.
+    // `LocalStore.claimLocked`'s stale-claim guard (see `early_data_replay.zig`)
+    // must fail closed here instead.
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+
+    // A real `LocalStore`, driven through a gate that simulates the
+    // replay-store clock reading exactly one millisecond past the
+    // TLS-validated deadline it is handed — rather than depending on real
+    // wall-clock timing (non-deterministic and effectively unreachable in
+    // a fast unit test), this test controls that later read directly so
+    // the boundary is hit deterministically every run.
+    var store = try tls_core.early_data_replay.LocalStore.init(std.testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    const RaceGate = struct {
+        store: *tls_core.early_data_replay.LocalStore,
+
+        fn decide(ctx: *anyopaque, candidate: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const result = self.store.claim(
+                .{ .key = candidate.ticket_identity_fingerprint, .retain_until_unix_ms = candidate.retain_until_unix_ms },
+                candidate.retain_until_unix_ms + 1,
+            );
+            return switch (result) {
+                .accepted => .allow,
+                .duplicate => .replay,
+                .rejected_capacity, .unavailable => .unavailable,
+            };
+        }
+    };
+    var race_gate = RaceGate{ .store = &store };
+    try resumed.server_backend.setEarlyDataReplayGate(.{ .ctx = &race_gate, .decideFn = RaceGate.decide });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    // Resumption itself is unaffected by the store's clock-boundary
+    // rejection — only the 0-RTT attempt is rejected.
+    try std.testing.expect(resumed.client_backend.core.psk_authenticated);
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_unavailable, resumed.server_backend.earlyDataDecision());
+    try std.testing.expect(!resumed.server_backend.earlyDataAccepted());
+    // Nothing was recorded: a concurrent replay racing the same boundary
+    // must not find a live entry to duplicate against, nor an
+    // already-expired one it could silently reclaim and get accepted for.
+    try std.testing.expectEqual(@as(usize, 0), store.count());
+}
+
+test "#368 Slice 2: a real process-scoped LocalStore shared across two independent backends rejects the second worker's duplicate 0-RTT claim while both preserve 1-RTT resumption" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    // One process-scoped store, one gate adapter — exactly the composition
+    // pattern `edge_gateway.zig` installs into every native TCP worker and
+    // QUIC/H3, proven here against two independent `Tls13Backend`
+    // "workers" sharing it. `LocalStore.store()`'s adapter reads real
+    // wall-clock time at the trampoline boundary (see its doc comment), but
+    // `DirectHarness`'s ticket/skew clocks are fixed test values, so this
+    // wraps the same `LocalStore` in a small deterministic `Store` instead
+    // — matching this suite's "no sleeping tests, deterministic injected
+    // clocks" convention while still exercising the real claim semantics.
+    const DeterministicStore = struct {
+        backing: *tls_core.early_data_replay.LocalStore,
+        now_unix_ms: u64,
+
+        fn asStore(self: *@This()) tls_core.early_data_replay.Store {
+            return .{ .ctx = self, .claimFn = claimTrampoline };
+        }
+
+        fn claimTrampoline(ctx: *anyopaque, c: tls_core.early_data_replay.Claim) tls_core.early_data_replay.ClaimResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.claim(c, self.now_unix_ms);
+        }
+    };
+
+    var store = try tls_core.early_data_replay.LocalStore.init(std.testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    // Matches `IdentityResolver.now`/the server's freshness-check clock
+    // above, so the retention deadline `tls13_backend.zig` computes from
+    // the (equally fixed) ticket issuance time is measured against the same
+    // clock the store sees.
+    var det_store = DeterministicStore{ .backing = &store, .now_unix_ms = 2_000 };
+    var adapter = tls_core.early_data_replay.GateAdapter.init(det_store.asStore());
+    const shared_gate = adapter.gate();
+
+    const RunWorker = struct {
+        fn run(state: *session.ServerRecoverableState, ticket: *const session.ClientTicketState, gate: tls_backend.EarlyDataReplayGate) !*DirectHarness {
+            const harness = try std.testing.allocator.create(DirectHarness);
+            harness.* = DirectHarness.init();
+            errdefer {
+                harness.deinit();
+                std.testing.allocator.destroy(harness);
+            }
+
+            // `ClientPskOfferSet.push` moves ownership out of its argument
+            // (zero-valuing it) — offering the same ticket to two
+            // independent "worker" harnesses needs an independent clone
+            // each time, not the one shared `issued.ticket`.
+            var ticket_clone: session.ClientTicketState = .{};
+            try ticket.cloneInto(std.testing.allocator, &ticket_clone);
+            errdefer ticket_clone.deinit();
+
+            var offers: pre_shared_key.ClientPskOfferSet = .{};
+            try offers.push(&ticket_clone);
+            var clock_dummy: u8 = 0;
+            try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+
+            var resolver_state = IdentityResolver{ .state = state };
+            try harness.server_backend.setServerPskResolver(.{
+                .ctx = &resolver_state,
+                .nowUnixMsFn = IdentityResolver.now,
+                .resolveFn = IdentityResolver.resolve,
+            });
+
+            try harness.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+            try harness.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+            try harness.server_backend.setEarlyDataReplayGate(gate);
+
+            try harness.run();
+            return harness;
+        }
+    };
+
+    // Worker A: the first claim of this ticket's replay key anywhere in the
+    // (simulated) process — accepted.
+    const worker_a = try RunWorker.run(&issued.server_state, &issued.ticket, shared_gate);
+    defer {
+        worker_a.deinit();
+        std.testing.allocator.destroy(worker_a);
+    }
+    try std.testing.expect(worker_a.client_driver.isComplete());
+    try std.testing.expect(worker_a.server_driver.isComplete());
+    try std.testing.expect(worker_a.client_backend.core.psk_authenticated);
+    try std.testing.expect(worker_a.server_backend.core.psk_authenticated);
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.accepted, worker_a.server_backend.earlyDataDecision());
+
+    // Worker B: an independent backend instance (a different native TCP
+    // worker/connection in production) offering the very same ticket. The
+    // shared store — not a worker-local one — must recognize the replay key
+    // is already claimed and reject only the 0-RTT attempt; resumption
+    // itself still succeeds.
+    const worker_b = try RunWorker.run(&issued.server_state, &issued.ticket, shared_gate);
+    defer {
+        worker_b.deinit();
+        std.testing.allocator.destroy(worker_b);
+    }
+    try std.testing.expect(worker_b.client_driver.isComplete());
+    try std.testing.expect(worker_b.server_driver.isComplete());
+    try std.testing.expect(worker_b.client_backend.core.psk_authenticated);
+    try std.testing.expect(worker_b.server_backend.core.psk_authenticated);
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_rejected, worker_b.server_backend.earlyDataDecision());
+    try std.testing.expect(!worker_b.server_backend.earlyDataAccepted());
+
+    try std.testing.expectEqual(@as(usize, 1), store.count());
 }
 
 test "0-RTT is never attempted for a resume-only ticket even with client intent enabled" {

@@ -2680,6 +2680,12 @@ pub const WorkerContext = struct {
     /// `null` when native resumption is disabled (the default) or the
     /// downstream path is not native TLS.
     resumption_runtime: ?*tls_core.resumption_runtime.Runtime = null,
+    /// #368 Slice 2: process-shared anti-replay gate, borrowed for the
+    /// lifetime of every native TCP connection this worker accepts — the
+    /// same store instance shared with native QUIC/H3, so worker-local
+    /// duplicate 0-RTT acceptance is impossible. `null` leaves each
+    /// backend's own default gate in place (fail-closed `.unavailable`).
+    early_data_replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate = null,
     session_pool: *ConnectionSessionPool,
     /// Event loop used to (un)watch idle keepalive connections (#138). A worker
     /// re-arms a parked fd here; the loop thread dispatches it back on readiness.

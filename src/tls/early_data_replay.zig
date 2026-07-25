@@ -1,9 +1,9 @@
 //! Process-local anti-replay store for accepted native TLS/QUIC 0-RTT early
-//! data (#368, Slice 1). This module owns replay-key storage, atomic claim
-//! semantics, recording-window retention/expiration, capacity behavior, and
-//! startup quarantine — it does not touch the #366/#497 `EarlyDataReplayGate`
-//! seam in `tls13_backend.zig`, and replay state is deliberately kept out of
-//! `resumption_runtime.zig` (wiring this store into the gate is Slice 2).
+//! data (#368). Slice 1 landed replay-key storage, atomic claim semantics,
+//! recording-window retention/expiration, capacity behavior, and startup
+//! quarantine. Slice 2 (`GateAdapter` below) wires a `Store` into the
+//! #366/#497 `EarlyDataReplayGate` seam in `tls13_backend.zig` — replay
+//! state itself stays deliberately out of `resumption_runtime.zig`.
 //!
 //! Normative reference: RFC 9846 §8. The guarantee this store implements a
 //! single-process instance of: after a replay key is successfully claimed,
@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const zig_compat = @import("zig_compat");
+const tls13_backend = @import("tls13_backend.zig");
 
 /// One-way digest of an offered ticket's opaque wire identity — the
 /// existing `tls13_backend.EarlyDataReplayCandidate.ticket_identity_fingerprint`
@@ -98,6 +99,47 @@ pub const Store = struct {
 
     pub fn claim(self: Store, c: Claim) ClaimResult {
         return self.claimFn(self.ctx, c);
+    }
+};
+
+/// Maps a `Store`'s outcome vocabulary onto the TLS-layer decision
+/// `tls13_backend.EarlyDataReplayGate` expects: only `.duplicate` is a
+/// proven replay (`.replay`); a genuinely unavailable store, startup
+/// quarantine, and capacity exhaustion are all "this store cannot vouch for
+/// 0-RTT right now" (`.unavailable`) — every one of these rejects only
+/// early data, never an otherwise-valid PSK/session resumption.
+fn mapClaimResult(result: ClaimResult) tls13_backend.EarlyDataReplayDecision {
+    return switch (result) {
+        .accepted => .allow,
+        .duplicate => .replay,
+        .rejected_capacity, .unavailable => .unavailable,
+    };
+}
+
+/// Adapts any `Store` implementation — the bounded `LocalStore` today, a
+/// future distributed backend eventually — to the
+/// `tls13_backend.EarlyDataReplayGate` seam (#368 Slice 2). Composition owns
+/// exactly one `Store` and wraps it in exactly one `GateAdapter`, then
+/// installs the resulting gate into every native TLS backend that can
+/// accept early data (native TCP and QUIC/H3), so worker-local duplicate
+/// acceptance is impossible.
+pub const GateAdapter = struct {
+    backing: Store,
+
+    pub fn init(backing: Store) GateAdapter {
+        return .{ .backing = backing };
+    }
+
+    pub fn gate(self: *GateAdapter) tls13_backend.EarlyDataReplayGate {
+        return .{ .ctx = self, .decideFn = decide };
+    }
+
+    fn decide(ctx: *anyopaque, candidate: tls13_backend.EarlyDataReplayCandidate) tls13_backend.EarlyDataReplayDecision {
+        const self: *GateAdapter = @ptrCast(@alignCast(ctx));
+        return mapClaimResult(self.backing.claim(.{
+            .key = candidate.ticket_identity_fingerprint,
+            .retain_until_unix_ms = candidate.retain_until_unix_ms,
+        }));
     }
 };
 
@@ -239,6 +281,21 @@ pub const LocalStore = struct {
             expired_removed.* += 1;
         }
 
+        // The caller (`tls13_backend.zig`) derived `c.retain_until_unix_ms`
+        // from an earlier wall-clock read at TLS-freshness-check time;
+        // `Store.claim`'s trampoline takes a *second*, later wall-clock
+        // reading for `now_unix_ms`. At the exact accepted negative-skew
+        // boundary those two reads can straddle `retain_until_unix_ms`
+        // itself. Inserting a claim whose own deadline has already passed
+        // relative to `now_unix_ms` would record an entry that looks
+        // already-expired to every subsequent claim of the same key —
+        // silently reopening the exact replay window #368 requires closed.
+        // Fail closed instead of recording anything.
+        if (now_unix_ms > c.retain_until_unix_ms) {
+            event.* = .unavailable;
+            return .unavailable;
+        }
+
         if (self.entries.count() < self.limits.max_entries) {
             return self.insertLocked(c, event);
         }
@@ -366,6 +423,42 @@ test "claim after the deadline expires the old entry and a new claim can be acce
     defer store.deinit();
     try testing.expectEqual(ClaimResult.accepted, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 2_000 }, 1_000));
     try testing.expectEqual(ClaimResult.accepted, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 5_000 }, 2_001));
+}
+
+test "a claim whose own deadline has already passed relative to now fails closed instead of recording an already-expired entry" {
+    // Guards the exact clock-boundary gap between the TLS-layer's earlier
+    // freshness-check read (which produced `retain_until_unix_ms = T`) and
+    // `Store.claim`'s later wall-clock read (`now_unix_ms = T + 1`):
+    // inserting anyway would record a key that looks already-expired to
+    // every subsequent claimant, letting a second concurrent replay of the
+    // same key also be accepted once it, too, observes the entry as
+    // expired and reclaims it.
+    var store = try LocalStore.init(testing.allocator, testLimits(4), 0, 1_000);
+    defer store.deinit();
+    try testing.expectEqual(ClaimResult.unavailable, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 1_000 }, 1_001));
+    try testing.expectEqual(@as(usize, 0), store.count());
+
+    // A second "concurrent" claim of the same key, at the same stale
+    // `now`, must not be recorded either — nothing was ever inserted for
+    // the first claim to protect against replay of the second.
+    try testing.expectEqual(ClaimResult.unavailable, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 1_000 }, 1_001));
+    try testing.expectEqual(@as(usize, 0), store.count());
+
+    // A fresh claim whose deadline has not yet passed still succeeds
+    // normally — this only guards claims that are stale on arrival.
+    try testing.expectEqual(ClaimResult.accepted, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 1_001 }, 1_001));
+}
+
+test "an already-stale claim also fails closed against a live entry it would otherwise expire and replace" {
+    // Same boundary gap, but with a *prior* live entry for the same key
+    // already present: the duplicate check must still win first (the key
+    // remains claimed), rather than the stale-deadline guard tearing down
+    // protection that was already established.
+    var store = try LocalStore.init(testing.allocator, testLimits(4), 0, 1_000);
+    defer store.deinit();
+    try testing.expectEqual(ClaimResult.accepted, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 5_000 }, 1_000));
+    try testing.expectEqual(ClaimResult.duplicate, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 1_000 }, 1_001));
+    try testing.expectEqual(@as(usize, 1), store.count());
 }
 
 test "two different keys are independent" {
@@ -632,4 +725,70 @@ test "capacity and expiration events are observable through the closed Event voc
     try testing.expectEqual(Event.capacity_rejected, recorder.events[1]);
     try testing.expectEqual(Event.expired, recorder.events[2]);
     try testing.expectEqual(Event.accepted, recorder.events[3]);
+}
+
+// ---------------------------------------------------------------------
+// #368 Slice 2: `GateAdapter` — adapting `Store` to the TLS-layer
+// `EarlyDataReplayGate` seam.
+// ---------------------------------------------------------------------
+
+test "mapClaimResult: only duplicate maps to replay; capacity and unavailable both fail closed to unavailable" {
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.allow, mapClaimResult(.accepted));
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.replay, mapClaimResult(.duplicate));
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.unavailable, mapClaimResult(.rejected_capacity));
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.unavailable, mapClaimResult(.unavailable));
+}
+
+test "GateAdapter.gate() drives a real LocalStore: allow, then replay, preserving the candidate's key/deadline" {
+    var store = try LocalStore.init(testing.allocator, testLimits(4), 0, 1_000);
+    defer store.deinit();
+    var adapter = GateAdapter.init(store.store());
+    const gate = adapter.gate();
+
+    const candidate: tls13_backend.EarlyDataReplayCandidate = .{
+        .ticket_identity_fingerprint = keyOf(9),
+        .retain_until_unix_ms = std.math.maxInt(u64),
+    };
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.allow, gate.decideFn.?(gate.ctx, candidate));
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.replay, gate.decideFn.?(gate.ctx, candidate));
+    try testing.expectEqual(@as(usize, 1), store.count());
+}
+
+test "GateAdapter.gate() surfaces startup quarantine as unavailable, never as replay" {
+    // `Store.claim` (unlike `LocalStore.claim` called directly) reads real
+    // wall-clock time at the trampoline boundary — see `store()`'s doc
+    // comment — so the store must be seeded from that same clock for a
+    // quarantine window to still be open moments later in this test.
+    var store = try LocalStore.init(testing.allocator, testLimits(4), 60_000, @intCast(zig_compat.milliTimestamp()));
+    defer store.deinit();
+    var adapter = GateAdapter.init(store.store());
+    const gate = adapter.gate();
+
+    const candidate: tls13_backend.EarlyDataReplayCandidate = .{
+        .ticket_identity_fingerprint = keyOf(1),
+        .retain_until_unix_ms = 5_000,
+    };
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.unavailable, gate.decideFn.?(gate.ctx, candidate));
+    try testing.expectEqual(@as(usize, 0), store.count());
+}
+
+test "GateAdapter.gate() surfaces capacity exhaustion as unavailable without evicting the live entry" {
+    var store = try LocalStore.init(testing.allocator, testLimits(1), 0, 1_000);
+    defer store.deinit();
+    var adapter = GateAdapter.init(store.store());
+    const gate = adapter.gate();
+
+    const first: tls13_backend.EarlyDataReplayCandidate = .{
+        .ticket_identity_fingerprint = keyOf(1),
+        .retain_until_unix_ms = std.math.maxInt(u64),
+    };
+    const second: tls13_backend.EarlyDataReplayCandidate = .{
+        .ticket_identity_fingerprint = keyOf(2),
+        .retain_until_unix_ms = std.math.maxInt(u64),
+    };
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.allow, gate.decideFn.?(gate.ctx, first));
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.unavailable, gate.decideFn.?(gate.ctx, second));
+    // The first key must still be protected — capacity exhaustion never
+    // evicts a live entry to admit a new one.
+    try testing.expectEqual(tls13_backend.EarlyDataReplayDecision.replay, gate.decideFn.?(gate.ctx, first));
 }

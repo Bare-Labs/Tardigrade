@@ -360,6 +360,16 @@ pub const EarlyDataReplayDecision = enum { allow, replay, unavailable };
 pub const EarlyDataReplayCandidate = struct {
     ticket_identity_fingerprint: [32]u8 = [_]u8{0} ** 32,
     obfuscated_ticket_age: u32 = 0,
+    /// #368 Slice 2: the authoritative anti-replay retention deadline for
+    /// this candidate, derived by `computeReplayRetainUntilUnixMs` from the
+    /// already-validated ticket issuance time, apparent ticket age, and
+    /// age-skew tolerance — never re-derived by the replay store itself.
+    /// Only meaningful when the candidate actually reaches
+    /// `EarlyDataReplayGate.decide`; a deadline that cannot be computed
+    /// (overflow/impossible timing) short-circuits to `.replay_unavailable`
+    /// before the gate is ever consulted, so this field stays `0` in that
+    /// case.
+    retain_until_unix_ms: u64 = 0,
 };
 
 /// Server (#366/#368 seam): injectable anti-replay decision for an
@@ -3246,6 +3256,18 @@ pub const Tls13Backend = struct {
             // resumption.
             var identity_fingerprint: [hash_len]u8 = undefined;
             Sha256.hash(pair.identity.identity, &identity_fingerprint, .{});
+            // #368 Slice 2: the replay store's retention window, derived
+            // here (not re-derived from `obfuscated_ticket_age` by the
+            // store) from the same validated ticket-age observation used
+            // for the `.age_skew` freshness check above. `null` means the
+            // arithmetic overflowed or the timing is impossible — fail
+            // closed for 0-RTT below rather than silently shortening
+            // retention.
+            const replay_retain_until_unix_ms = computeReplayRetainUntilUnixMs(
+                hit.state.common.issued_at_unix_ms,
+                age_skew.apparent_age_ms,
+                self.server_early_data_policy.age_skew_tolerance_ms,
+            );
             const early_decision = self.decideServerEarlyData(.{
                 .selected_index = attempts,
                 .compatibility = decision.early_data,
@@ -3258,6 +3280,7 @@ pub const Tls13Backend = struct {
                     .ticket_identity_fingerprint = identity_fingerprint,
                     .obfuscated_ticket_age = pair.identity.obfuscated_ticket_age,
                 },
+                .replay_retain_until_unix_ms = replay_retain_until_unix_ms,
             });
             self.early_data_decision = early_decision;
             self.early_data_accepted = early_decision == .accepted;
@@ -3302,6 +3325,12 @@ pub const Tls13Backend = struct {
         age_skew: pre_shared_key.AgeSkew,
         compat_candidate: EarlyDataCompatibilityCandidate,
         replay_candidate: EarlyDataReplayCandidate,
+        /// #368 Slice 2: the replay-store retention deadline computed by
+        /// `computeReplayRetainUntilUnixMs` for `replay_candidate`, or
+        /// `null` on overflow/impossible timing — `decideServerEarlyData`
+        /// fails closed to `.replay_unavailable` without ever consulting
+        /// the replay gate in that case.
+        replay_retain_until_unix_ms: ?u64,
     };
 
     /// #366: the server's live 0-RTT decision for the just-selected,
@@ -3335,7 +3364,14 @@ pub const Tls13Backend = struct {
         }
         if (!skewWithinTolerance(inputs.age_skew.skew_ms, self.server_early_data_policy.age_skew_tolerance_ms))
             return .age_skew;
-        return switch (self.early_data_replay_gate.decide(inputs.replay_candidate)) {
+        // #368 Slice 2: a deadline that couldn't be computed (overflow or
+        // impossible ticket timing) never reaches the replay gate at all —
+        // fail closed rather than let the store record a bogus, silently
+        // shortened retention window.
+        const retain_until_unix_ms = inputs.replay_retain_until_unix_ms orelse return .replay_unavailable;
+        var candidate = inputs.replay_candidate;
+        candidate.retain_until_unix_ms = retain_until_unix_ms;
+        return switch (self.early_data_replay_gate.decide(candidate)) {
             .allow => .accepted,
             .replay => .replay_rejected,
             .unavailable => .replay_unavailable,
@@ -4209,6 +4245,63 @@ test "skewWithinTolerance handles minInt(i64) without trapping" {
 test "skewWithinTolerance handles maxInt(i64) at the u64 tolerance boundary" {
     try std.testing.expect(skewWithinTolerance(std.math.maxInt(i64), @as(u64, std.math.maxInt(i64))));
     try std.testing.expect(!skewWithinTolerance(std.math.maxInt(i64), @as(u64, std.math.maxInt(i64)) - 1));
+}
+
+/// #368 Slice 2: the authoritative anti-replay retention deadline for an
+/// accepted 0-RTT candidate — `expected_arrival_time = ticket_issued_at +
+/// apparent_ticket_age`, `retain_until = expected_arrival_time +
+/// age_skew_tolerance` (RFC 9846 §8.2/§8.3). The replay store must not
+/// reverse-engineer this from `obfuscated_ticket_age` itself, so it is
+/// derived once here from the already-validated inputs the `.age_skew`
+/// freshness check already used. Checked arithmetic throughout: a negative
+/// issuance time (never produced by legitimate ticket issuance, but not a
+/// type-level impossibility) or any addition overflow returns `null`, which
+/// the caller treats as fail-closed for 0-RTT — never a silently shortened
+/// retention window.
+fn computeReplayRetainUntilUnixMs(issued_at_unix_ms: i64, apparent_age_ms: u32, age_skew_tolerance_ms: u64) ?u64 {
+    if (issued_at_unix_ms < 0) return null;
+    const issued_at: u64 = @intCast(issued_at_unix_ms);
+    const expected_arrival = std.math.add(u64, issued_at, apparent_age_ms) catch return null;
+    return std.math.add(u64, expected_arrival, age_skew_tolerance_ms) catch return null;
+}
+
+test "computeReplayRetainUntilUnixMs sums issuance, apparent age, and tolerance" {
+    try std.testing.expectEqual(@as(?u64, 1_000 + 2_000 + 60_000), computeReplayRetainUntilUnixMs(1_000, 2_000, 60_000));
+    try std.testing.expectEqual(@as(?u64, 0), computeReplayRetainUntilUnixMs(0, 0, 0));
+}
+
+test "computeReplayRetainUntilUnixMs rejects a negative issuance time" {
+    try std.testing.expectEqual(@as(?u64, null), computeReplayRetainUntilUnixMs(-1, 0, 0));
+}
+
+test "computeReplayRetainUntilUnixMs fails closed when the tolerance addition overflows" {
+    // `issued_at_unix_ms` (`i64`) plus `apparent_age_ms` (`u32`) can never
+    // overflow `u64` on its own — the tolerance addition is where a
+    // caller-controlled `u64` can actually push the sum past `maxInt(u64)`.
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        computeReplayRetainUntilUnixMs(std.math.maxInt(i64), std.math.maxInt(u32), std.math.maxInt(u64)),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        computeReplayRetainUntilUnixMs(1_000, 0, std.math.maxInt(u64)),
+    );
+}
+
+test "computeReplayRetainUntilUnixMs accepts the exact boundary before overflow" {
+    // `issued_at_unix_ms` is `i64`, so the largest representable issuance
+    // time is `maxInt(i64)` — well short of `maxInt(u64)`. Push the
+    // remaining headroom into the tolerance term to land exactly on the
+    // `maxInt(u64)` boundary without either input overflowing its own type.
+    const headroom: u64 = std.math.maxInt(u64) - @as(u64, std.math.maxInt(i64));
+    try std.testing.expectEqual(
+        @as(?u64, std.math.maxInt(u64)),
+        computeReplayRetainUntilUnixMs(std.math.maxInt(i64), 0, headroom),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        computeReplayRetainUntilUnixMs(std.math.maxInt(i64), 0, headroom + 1),
+    );
 }
 
 /// Symmetric optional equality for a stored `CompatSnapshot` against a
