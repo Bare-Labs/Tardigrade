@@ -3020,6 +3020,160 @@ test "#510 record stream carries real accepted 0-RTT provenance before 1-RTT com
     try std.testing.expect(!replayed.server.currentReadTransportEarly());
 }
 
+test "#510 record stream enforces accepted 0-RTT byte allowance and EoED transition" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    const Resolver = struct {
+        state: *session.ServerRecoverableState,
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+        fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!std.mem.eql(u8, identity, "opaque-early-ticket")) return .miss;
+            return clonedResolveHit(self.state, std.testing.allocator);
+        }
+    };
+    const AllowGate = struct {
+        fn decide(_: *anyopaque, _: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+            return .allow;
+        }
+    };
+
+    var ticket: session.ClientTicketState = .{};
+    defer ticket.deinit();
+    try issued.ticket.cloneInto(std.testing.allocator, &ticket);
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var resolver = Resolver{ .state = &issued.server_state };
+    var dummy: u8 = 0;
+
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.client_engine.setClientPskOffers(&offers, &dummy, earlyDataResumedClientClock);
+    try h.client_engine.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 64 });
+    try h.server_engine.setServerPskResolver(.{ .ctx = &resolver, .nowUnixMsFn = Resolver.now, .resolveFn = Resolver.resolve });
+    try h.server_engine.setServerEarlyDataPolicy(.{ .enabled = true, .max_early_data_size = 64, .age_skew_tolerance_ms = 60_000 });
+    try h.server_engine.setEarlyDataReplayGate(.{ .ctx = &dummy, .decideFn = AllowGate.decide });
+
+    _ = try h.driveClient();
+    try std.testing.expect(h.client_engine.earlyDataAttempted());
+    try std.testing.expectEqual(@as(usize, 20), try h.client.stream().write("aaaaaaaaaaaaaaaaaaaa"));
+    try std.testing.expectEqual(@as(usize, 12), try h.client.stream().write("bbbbbbbbbbbbbbbbbbbb"));
+    try std.testing.expectError(error.WouldBlock, h.client.stream().write("c"));
+    try std.testing.expect(!h.client.readiness().can_write_plaintext);
+
+    var received: [64]u8 = undefined;
+    var got: usize = 0;
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.server.readiness().can_read_plaintext;
+        }
+    }.done);
+    while (got < 32) {
+        got += try h.server.stream().read(received[got..]);
+        if (got == 32) break;
+        _ = try h.driveServer();
+    }
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbb", received[0..got]);
+    try std.testing.expect(h.server.currentReadTransportEarly());
+
+    try h.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expect(!h.client.bridge.hasWriteKeys(.zero_rtt));
+    try std.testing.expect(!h.server.bridge.hasReadKeys(.zero_rtt));
+}
+
+test "#510 record stream fails accepted 0-RTT plaintext over ticket allowance" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    const Resolver = struct {
+        state: *session.ServerRecoverableState,
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+        fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!std.mem.eql(u8, identity, "opaque-early-ticket")) return .miss;
+            return clonedResolveHit(self.state, std.testing.allocator);
+        }
+    };
+    const AllowGate = struct {
+        fn decide(_: *anyopaque, _: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+            return .allow;
+        }
+    };
+
+    var ticket: session.ClientTicketState = .{};
+    defer ticket.deinit();
+    try issued.ticket.cloneInto(std.testing.allocator, &ticket);
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var resolver = Resolver{ .state = &issued.server_state };
+    var dummy: u8 = 0;
+
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.client_engine.setClientPskOffers(&offers, &dummy, earlyDataResumedClientClock);
+    try h.client_engine.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 64 });
+    try h.server_engine.setServerPskResolver(.{ .ctx = &resolver, .nowUnixMsFn = Resolver.now, .resolveFn = Resolver.resolve });
+    try h.server_engine.setServerEarlyDataPolicy(.{ .enabled = true, .max_early_data_size = 64, .age_skew_tolerance_ms = 60_000 });
+    try h.server_engine.setEarlyDataReplayGate(.{ .ctx = &dummy, .decideFn = AllowGate.decide });
+
+    _ = try h.driveClient();
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const over = try h.client.bridge.sealProtected(.zero_rtt, .application_data, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", &protected);
+    try std.testing.expectEqual(over.len, try writeFd(h.fds[0], over));
+    try std.testing.expectError(error.IllegalParameter, h.driveServer());
+}
+
+test "#510 replay-rejected early discard is bounded by ticket allowance" {
+    var issued = try issueEarlyCapableTicket(32);
+    defer issued.deinit();
+
+    const Resolver = struct {
+        state: *session.ServerRecoverableState,
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+        fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!std.mem.eql(u8, identity, "opaque-early-ticket")) return .miss;
+            return clonedResolveHit(self.state, std.testing.allocator);
+        }
+    };
+    const ReplayGate = struct {
+        fn decide(_: *anyopaque, _: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+            return .replay;
+        }
+    };
+
+    var ticket: session.ClientTicketState = .{};
+    defer ticket.deinit();
+    try issued.ticket.cloneInto(std.testing.allocator, &ticket);
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var resolver = Resolver{ .state = &issued.server_state };
+    var dummy: u8 = 0;
+
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.client_engine.setClientPskOffers(&offers, &dummy, earlyDataResumedClientClock);
+    try h.client_engine.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 32 });
+    try h.server_engine.setServerPskResolver(.{ .ctx = &resolver, .nowUnixMsFn = Resolver.now, .resolveFn = Resolver.resolve });
+    try h.server_engine.setServerEarlyDataPolicy(.{ .enabled = true, .max_early_data_size = 32, .age_skew_tolerance_ms = 60_000 });
+    try h.server_engine.setEarlyDataReplayGate(.{ .ctx = &dummy, .decideFn = ReplayGate.decide });
+
+    _ = try h.driveClient();
+    try std.testing.expectEqual(@as(usize, 32), try h.client.stream().write("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+    _ = try h.driveClient();
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const one_over = try h.client.bridge.sealProtected(.zero_rtt, .application_data, "y", &protected);
+    try std.testing.expectEqual(one_over.len, try writeFd(h.fds[0], one_over));
+    try std.testing.expectError(error.AuthenticationFailed, h.driveServer());
+}
+
 test "allocating record owner cleans up across every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator) !void {
