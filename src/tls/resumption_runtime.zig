@@ -739,6 +739,7 @@ test "stateful runtime resolves TDSH handles and misses TDTK/unknown prefixes" {
     defer hit.deinit();
     try std.testing.expect(hit == .hit);
     try std.testing.expect(hit.hit.lease == .noop);
+    try std.testing.expect(hit.hit.current_process_stateful);
 
     var unknown = try resolver.resolve("not-a-ticket");
     defer unknown.deinit();
@@ -784,6 +785,7 @@ test "stateless runtime resolves TDTK identities with a no-op lease across long-
     defer hit.deinit();
     try std.testing.expect(hit == .hit);
     try std.testing.expect(hit.hit.lease == .noop);
+    try std.testing.expect(!hit.hit.current_process_stateful);
 
     var tampered_buf: [1024]u8 = undefined;
     @memcpy(tampered_buf[0..ticket.len], ticket);

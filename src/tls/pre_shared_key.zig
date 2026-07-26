@@ -621,6 +621,11 @@ pub const ServerPskResolveResult = union(enum) {
         state: session.ServerRecoverableState,
         lease: ServerPskLease,
         on_selected: ?ServerPskSelectionHook = null,
+        /// True only for hits from the current process's stateful server
+        /// cache. Stateless identities, especially those authenticated by a
+        /// persistent key after restart, must not be treated as current
+        /// process-issued for 0-RTT replay quarantine.
+        current_process_stateful: bool = false,
     },
 
     pub fn deinit(self: *ServerPskResolveResult) void {
