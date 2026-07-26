@@ -45,6 +45,12 @@ const HarnessFailure = error{
 
 const Direction = enum { to_server, to_client };
 
+/// Unused by ordinary on-path delivery (`PathManager` only consumes fresh
+/// challenge entropy when a datagram starts a *new* candidate validation);
+/// a fixed value is fine for every scenario in this harness that never
+/// migrates its fixed client/server path pair.
+const test_challenge_entropy = [_]u8{0x5a} ** quic.path.path_challenge_len;
+
 /// Hard resource and progress limits for every deterministic scenario. These
 /// are deliberately part of the harness configuration rather than implicit
 /// test-runner timeouts, so adversarial cases fail at a reproducible boundary.
@@ -136,8 +142,9 @@ const Pipe = struct {
         return best;
     }
 
-    /// Deliver every datagram due at or before `now_us` into `conn`.
-    fn deliverDue(self: *Pipe, conn: *Connection, now_us: u64) !usize {
+    /// Deliver every datagram due at or before `now_us` into `conn`, as if it
+    /// arrived on `ingress_path`.
+    fn deliverDue(self: *Pipe, conn: *Connection, ingress_path: quic.path.PathKey, now_us: u64) !usize {
         var delivered: usize = 0;
         while (true) {
             var due_index: ?usize = null;
@@ -150,7 +157,7 @@ const Pipe = struct {
             }
             const index = due_index orelse break;
             const entry = self.queue.orderedRemove(index);
-            try conn.ingest(entry.bytes[0..entry.len], now_us);
+            try conn.ingestOnPath(entry.bytes[0..entry.len], ingress_path, test_challenge_entropy, now_us);
             delivered += 1;
         }
         return delivered;
@@ -233,6 +240,14 @@ const Sim = struct {
 
     const client_cid = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8 };
     const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const client_path = quic.path.PathKey{
+        .local = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 40_000),
+        .remote = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 40_001),
+    };
+    const server_path = quic.path.PathKey{
+        .local = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 40_001),
+        .remote = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 40_000),
+    };
 
     const Config = struct {
         scenario: []const u8 = "unnamed",
@@ -332,6 +347,7 @@ const Sim = struct {
             .original_dcid = &odcid,
             .tls = sim.client_backend.backend(),
             .now_us = sim.now_us,
+            .initial_path = client_path,
         });
         errdefer sim.client.deinit();
         sim.server = try Connection.init(allocator, .{
@@ -342,6 +358,7 @@ const Sim = struct {
             .peer_cid = &client_cid,
             .tls = sim.server_backend.backend(),
             .now_us = sim.now_us,
+            .initial_path = server_path,
         });
         return sim;
     }
@@ -429,20 +446,20 @@ const Sim = struct {
         var progressed = false;
         var packets_produced: usize = 0;
         var buf: [max_test_datagram_size]u8 = undefined;
-        while (self.client.pollTransmit(&buf, self.now_us)) |datagram| {
+        while (self.client.pollTransmitOnPath(&buf, self.now_us)) |t| {
             packets_produced += 1;
             if (packets_produced > self.limits.max_packets_per_iteration) return self.fail(error.PacketProductionLimit);
-            try self.enqueue(.to_server, datagram);
+            try self.enqueue(.to_server, t.bytes);
             progressed = true;
         }
-        while (self.server.pollTransmit(&buf, self.now_us)) |datagram| {
+        while (self.server.pollTransmitOnPath(&buf, self.now_us)) |t| {
             packets_produced += 1;
             if (packets_produced > self.limits.max_packets_per_iteration) return self.fail(error.PacketProductionLimit);
-            try self.enqueue(.to_client, datagram);
+            try self.enqueue(.to_client, t.bytes);
             progressed = true;
         }
-        if (try self.network.to_server.deliverDue(self.server, self.now_us) > 0) progressed = true;
-        if (try self.network.to_client.deliverDue(self.client, self.now_us) > 0) progressed = true;
+        if (try self.network.to_server.deliverDue(self.server, server_path, self.now_us) > 0) progressed = true;
+        if (try self.network.to_client.deliverDue(self.client, client_path, self.now_us) > 0) progressed = true;
         if (progressed) return true;
 
         // Nothing due now: jump to the earliest of in-flight delivery times

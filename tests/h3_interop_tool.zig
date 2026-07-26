@@ -63,6 +63,7 @@ fn logEvent(_: ?*anyopaque, event: connection.Event) void {
         .close_sent => |c| std.fmt.bufPrint(&buf, "close sent code={d}", .{c.error_code}),
         .close_received => |c| std.fmt.bufPrint(&buf, "close received code={d} app={}", .{ c.error_code, c.is_application }),
         .idle_timeout => std.fmt.bufPrint(&buf, "idle timeout", .{}),
+        .path_validated => |p| std.fmt.bufPrint(&buf, "path validated change={s} remote_port={d}", .{ @tagName(p.change), p.path.remote.port }),
     } catch return;
     std.debug.print("h3-interop: {s}\n", .{line});
 }
@@ -127,6 +128,10 @@ fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !Args {
 
 const UdpSocket = struct {
     fd: std.c.fd_t,
+    /// The actually-bound local address (`getsockname` semantics): with
+    /// `bind_port = 0` the OS assigns an ephemeral port only known after
+    /// bind. Used as every `PathKey`'s local half for this socket.
+    local: std.c.sockaddr.in,
 
     fn open(bind_port: u16) !UdpSocket {
         // macOS/BSD reject SOCK_CLOEXEC/SOCK_NONBLOCK in the socket type
@@ -144,7 +149,10 @@ const UdpSocket = struct {
             .addr = 0, // INADDR_ANY
         };
         if (std.c.bind(fd, @ptrCast(&bind_addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.BindFailed;
-        return .{ .fd = fd };
+        var bound: std.c.sockaddr.in = undefined;
+        var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+        if (std.c.getsockname(fd, @ptrCast(&bound), &bound_len) != 0) return error.GetSockNameFailed;
+        return .{ .fd = fd, .local = bound };
     }
 
     fn close(self: *UdpSocket) void {
@@ -191,6 +199,29 @@ fn parseIp4(host: []const u8, port: u16) !std.c.sockaddr.in {
         .addr = @bitCast(octets),
     };
 }
+
+/// Mirrors `http3_runtime.zig`'s conversion: `sockaddr_in`'s address/port are
+/// already network-byte-order, so the octets bit-cast directly and only the
+/// port needs an explicit big-to-native swap.
+fn addressFromSockaddrIn(sa: std.c.sockaddr.in) quic.udp.Address {
+    const octets: [4]u8 = @bitCast(sa.addr);
+    return quic.udp.Address.ip4(octets, std.mem.bigToNative(u16, sa.port));
+}
+
+fn sockaddrInFromAddress(addr: quic.udp.Address) std.c.sockaddr.in {
+    var octets: [4]u8 = undefined;
+    @memcpy(&octets, addr.slice());
+    return .{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, addr.port),
+        .addr = @bitCast(octets),
+    };
+}
+
+/// Unused by ordinary on-path traffic (`PathManager` only consumes fresh
+/// challenge entropy when a datagram starts a *new* candidate validation);
+/// this tool talks to exactly one fixed external peer per run.
+const test_challenge_entropy = [_]u8{0x5a} ** quic.path.path_challenge_len;
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max: usize) ![]u8 {
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -249,6 +280,10 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
         std.process.exit(2);
     }
 
+    const client_path = quic.path.PathKey{
+        .local = addressFromSockaddrIn(socket.local),
+        .remote = addressFromSockaddrIn(peer_addr),
+    };
     var backend = tls_backend.Tls13Backend.initClient(randomEntropy(), trust);
     const client = try Connection.init(allocator, .{
         .role = .client,
@@ -258,6 +293,7 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
         .now_us = nowUs(),
         .events = .{ .emitFn = logEvent },
         .allow_unverified_certificate = args.insecure,
+        .initial_path = client_path,
     });
     defer client.deinit();
 
@@ -265,22 +301,22 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     defer h3.deinit();
 
     var request_id: ?u64 = null;
-    var from: std.c.sockaddr.in = undefined;
     const deadline = nowUs() + args.timeout_ms * 1_000;
     var success = false;
 
     while (nowUs() < deadline) {
         const now = nowUs();
         var out: [2048]u8 = undefined;
-        while (client.pollTransmit(&out, now)) |datagram| {
-            try socket.sendTo(peer_addr, datagram);
+        while (client.pollTransmitOnPath(&out, now)) |t| {
+            try socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
         }
         var next: u64 = now + 50_000;
         if (client.nextTimeoutUs()) |t| next = @min(next, t);
         try socket.waitReadable(@intCast(@min((next -| now) / 1_000 + 1, 50)));
         var in: [2048]u8 = undefined;
+        var from: std.c.sockaddr.in = undefined;
         while (try socket.recvFrom(&in, &from)) |datagram| {
-            try client.ingest(datagram, nowUs());
+            try client.ingestOnPath(datagram, client_path, test_challenge_entropy, nowUs());
         }
         client.onTimeout(nowUs());
 
@@ -323,8 +359,8 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     // Orderly close.
     client.close(0, "done", nowUs());
     var out: [2048]u8 = undefined;
-    while (client.pollTransmit(&out, nowUs())) |datagram| {
-        try socket.sendTo(peer_addr, datagram);
+    while (client.pollTransmitOnPath(&out, nowUs())) |t| {
+        try socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
     }
     std.debug.print("h3-interop: client ok\n", .{});
 }
@@ -361,6 +397,10 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
             parsed.dcid.len, parsed.scid.len,
         });
 
+        const server_path = quic.path.PathKey{
+            .local = addressFromSockaddrIn(socket.local),
+            .remote = addressFromSockaddrIn(peer),
+        };
         var backend = tls_backend.Tls13Backend.initServer(randomEntropy(), identity);
         const server = try Connection.init(allocator, .{
             .role = .server,
@@ -370,18 +410,19 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
             .tls = backend.backend(),
             .now_us = nowUs(),
             .events = .{ .emitFn = logEvent },
+            .initial_path = server_path,
         });
         defer server.deinit();
         var h3 = H3.init(allocator, .server);
         defer h3.deinit();
-        try server.ingest(first_datagram, nowUs());
+        try server.ingestOnPath(first_datagram, server_path, test_challenge_entropy, nowUs());
 
         var h3_started = false;
         while (nowUs() < deadline) {
             const now = nowUs();
             var out: [2048]u8 = undefined;
-            while (server.pollTransmit(&out, now)) |datagram| {
-                try socket.sendTo(peer, datagram);
+            while (server.pollTransmitOnPath(&out, now)) |t| {
+                try socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
             }
             var next: u64 = now + 50_000;
             if (server.nextTimeoutUs()) |t| next = @min(next, t);
@@ -390,7 +431,12 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
             while (try socket.recvFrom(&in, &peer)) |datagram| {
                 // Only this connection's DCID is routable; a new Initial for a
                 // different connection would start a new accept cycle.
-                try server.ingest(datagram, nowUs());
+                // Recompute the ingress path per datagram (not the fixed
+                // `server_path` above): an interop peer that migrates or
+                // rebinds sends from a different address than the one that
+                // opened the connection.
+                const ingress_path = quic.path.PathKey{ .local = server_path.local, .remote = addressFromSockaddrIn(peer) };
+                try server.ingestOnPath(datagram, ingress_path, test_challenge_entropy, nowUs());
             }
             server.onTimeout(nowUs());
 

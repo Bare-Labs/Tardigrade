@@ -73,6 +73,30 @@ fn nowUs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1_000;
 }
 
+/// Mirrors `http3_runtime.zig`'s conversion: `sockaddr_in`'s address/port are
+/// already network-byte-order, so the octets bit-cast directly and only the
+/// port needs an explicit big-to-native swap.
+fn addressFromSockaddrIn(sa: std.c.sockaddr.in) quic.udp.Address {
+    const octets: [4]u8 = @bitCast(sa.addr);
+    return quic.udp.Address.ip4(octets, std.mem.bigToNative(u16, sa.port));
+}
+
+fn sockaddrInFromAddress(addr: quic.udp.Address) std.c.sockaddr.in {
+    var octets: [4]u8 = undefined;
+    @memcpy(&octets, addr.slice());
+    return .{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, addr.port),
+        .addr = @bitCast(octets),
+        .zero = [_]u8{0} ** 8,
+    };
+}
+
+/// Unused by ordinary on-path traffic (`PathManager` only consumes fresh
+/// challenge entropy when a datagram starts a *new* candidate validation);
+/// a fixed value is fine wherever a test never migrates.
+const test_challenge_entropy = [_]u8{0xa5} ** quic.path.path_challenge_len;
+
 test "udp smoke: native client/server complete an H3 exchange over loopback" {
     const allocator = testing.allocator;
 
@@ -96,12 +120,21 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
         ),
     );
 
+    const client_path = quic.path.PathKey{
+        .local = addressFromSockaddrIn(client_socket.addr),
+        .remote = addressFromSockaddrIn(server_socket.addr),
+    };
+    const server_path = quic.path.PathKey{
+        .local = addressFromSockaddrIn(server_socket.addr),
+        .remote = addressFromSockaddrIn(client_socket.addr),
+    };
     const client = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &client_cid,
         .original_dcid = &odcid,
         .tls = client_backend.backend(),
         .now_us = nowUs(),
+        .initial_path = client_path,
     });
     defer client.deinit();
     const server = try Connection.init(allocator, .{
@@ -111,6 +144,7 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
         .peer_cid = &client_cid,
         .tls = server_backend.backend(),
         .now_us = nowUs(),
+        .initial_path = server_path,
     });
     defer server.deinit();
 
@@ -141,13 +175,16 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
         try testing.expect(iterations < 5_000);
         const now = nowUs();
 
-        // Flush both drivers.
+        // Flush both drivers. Each transmit carries its own destination
+        // (candidate-path probes would target a different address than
+        // ordinary content); this exchange never migrates, so it always
+        // resolves to the peer socket, but the send always honors it.
         var out: [2048]u8 = undefined;
-        while (client.pollTransmit(&out, now)) |datagram| {
-            try client_socket.sendTo(server_socket.addr, datagram);
+        while (client.pollTransmitOnPath(&out, now)) |t| {
+            try client_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
         }
-        while (server.pollTransmit(&out, now)) |datagram| {
-            try server_socket.sendTo(client_socket.addr, datagram);
+        while (server.pollTransmitOnPath(&out, now)) |t| {
+            try server_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
         }
 
         // Poll with a timeout derived from driver deadlines (bounded so the
@@ -164,7 +201,7 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
 
         var in: [2048]u8 = undefined;
         while (try client_socket.recv(&in)) |datagram| {
-            try client.ingest(datagram, nowUs());
+            try client.ingestOnPath(datagram, client_path, test_challenge_entropy, nowUs());
         }
         while (try server_socket.recv(&in)) |datagram| {
             // Route by DCID exactly like a multi-connection endpoint.
@@ -172,7 +209,7 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
             const handle = routes.lookup(parsed.dcid) orelse continue;
             try testing.expectEqual(server_handle, handle);
             routed_datagrams += 1;
-            try server.ingest(datagram, nowUs());
+            try server.ingestOnPath(datagram, server_path, test_challenge_entropy, nowUs());
         }
 
         client.onTimeout(nowUs());
@@ -221,8 +258,8 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
     // Orderly close both ways; drain must not require more traffic.
     client.close(0, "udp-smoke-done", nowUs());
     var out: [2048]u8 = undefined;
-    while (client.pollTransmit(&out, nowUs())) |datagram| {
-        try client_socket.sendTo(server_socket.addr, datagram);
+    while (client.pollTransmitOnPath(&out, nowUs())) |t| {
+        try client_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
     }
     var settle: usize = 0;
     while (settle < 50 and server.state() != .draining) : (settle += 1) {
@@ -232,7 +269,7 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
         _ = try posix.poll(&fds, 5);
         var in: [2048]u8 = undefined;
         while (try server_socket.recv(&in)) |datagram| {
-            try server.ingest(datagram, nowUs());
+            try server.ingestOnPath(datagram, server_path, test_challenge_entropy, nowUs());
         }
     }
     try testing.expectEqual(connection.State.draining, server.state());
@@ -298,12 +335,21 @@ test "udp smoke: appliance credential provider authenticates native QUIC/H3" {
         appliance.provider(),
     );
 
+    const client_path = quic.path.PathKey{
+        .local = addressFromSockaddrIn(client_socket.addr),
+        .remote = addressFromSockaddrIn(server_socket.addr),
+    };
+    const server_path = quic.path.PathKey{
+        .local = addressFromSockaddrIn(server_socket.addr),
+        .remote = addressFromSockaddrIn(client_socket.addr),
+    };
     const client = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &client_cid,
         .original_dcid = &odcid,
         .tls = client_backend.backend(),
         .now_us = nowUs(),
+        .initial_path = client_path,
     });
     defer client.deinit();
     const server = try Connection.init(allocator, .{
@@ -313,6 +359,7 @@ test "udp smoke: appliance credential provider authenticates native QUIC/H3" {
         .peer_cid = &client_cid,
         .tls = server_backend.backend(),
         .now_us = nowUs(),
+        .initial_path = server_path,
     });
     defer server.deinit();
 
@@ -333,11 +380,11 @@ test "udp smoke: appliance credential provider authenticates native QUIC/H3" {
         const now = nowUs();
 
         var out: [2048]u8 = undefined;
-        while (client.pollTransmit(&out, now)) |datagram| {
-            try client_socket.sendTo(server_socket.addr, datagram);
+        while (client.pollTransmitOnPath(&out, now)) |t| {
+            try client_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
         }
-        while (server.pollTransmit(&out, now)) |datagram| {
-            try server_socket.sendTo(client_socket.addr, datagram);
+        while (server.pollTransmitOnPath(&out, now)) |t| {
+            try server_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
         }
 
         var next: u64 = now + 100_000;
@@ -352,10 +399,10 @@ test "udp smoke: appliance credential provider authenticates native QUIC/H3" {
 
         var in: [2048]u8 = undefined;
         while (try client_socket.recv(&in)) |datagram| {
-            try client.ingest(datagram, nowUs());
+            try client.ingestOnPath(datagram, client_path, test_challenge_entropy, nowUs());
         }
         while (try server_socket.recv(&in)) |datagram| {
-            try server.ingest(datagram, nowUs());
+            try server.ingestOnPath(datagram, server_path, test_challenge_entropy, nowUs());
         }
 
         client.onTimeout(nowUs());

@@ -616,6 +616,35 @@ pub const PathManager = struct {
         return self.paths[index].?.anti_amplification.canSend(bytes);
     }
 
+    /// Bytes still permitted to send on `path` before its anti-amplification
+    /// budget is exhausted, zero for an untracked path. Lets a caller size a
+    /// packet (e.g. how much PATH_CHALLENGE padding fits) without a separate
+    /// `canSendOnPath` probe for every candidate length.
+    pub fn remainingOnPath(self: *const PathManager, path: PathKey) u64 {
+        const index = self.find(path) orelse return 0;
+        return self.paths[index].?.anti_amplification.remaining();
+    }
+
+    /// The current lifecycle state of `path`, or null if untracked. Lets a
+    /// caller confirm a queued egress action (e.g. a pending PATH_CHALLENGE)
+    /// still corresponds to a live validation attempt before sending it.
+    pub fn stateOf(self: *const PathManager, path: PathKey) ?PathState {
+        const index = self.find(path) orelse return null;
+        return self.paths[index].?.state;
+    }
+
+    /// The key of a validated-but-not-yet-promoted candidate, if any. Lets a
+    /// caller retry `promoteValidated` opportunistically (e.g. once a fresh
+    /// peer CID becomes available after a NEW_CONNECTION_ID) without
+    /// re-deriving path state itself.
+    pub fn pendingPromotionCandidate(self: *const PathManager) ?PathKey {
+        for (self.paths) |slot| {
+            const path = slot orelse continue;
+            if (path.state == .validated_pending_promotion) return path.key;
+        }
+        return null;
+    }
+
     /// Earliest deadline among paths with an outstanding PATH_CHALLENGE, or
     /// null when nothing is validating. Callers fold this into their own
     /// timer wheel (e.g. `Connection.nextTimeoutUs()`) so `expireValidations`
@@ -1445,4 +1474,38 @@ test "probe storms recycle probe slots but never the active path" {
     try testing.expect(manager.activePath().key.eql(testKey(50_000)));
     try testing.expectEqual(PathState.validated, manager.activePath().state);
     try testing.expectEqual(PathDecision.on_active_path, manager.onDatagram(testKey(50_000), 1_200, test_challenge, 0));
+}
+
+test "remainingOnPath mirrors canSendOnPath and is zero for an untracked path" {
+    var manager = PathManager.init(.full, testKey(50_000), false);
+    _ = manager.onDatagram(testKey(50_000), 1_200, test_challenge, 0);
+    try testing.expectEqual(@as(u64, 3_600), manager.remainingOnPath(testKey(50_000)));
+    manager.paths[manager.active].?.anti_amplification.recordSent(1_000);
+    try testing.expectEqual(@as(u64, 2_600), manager.remainingOnPath(testKey(50_000)));
+    try testing.expectEqual(@as(u64, 0), manager.remainingOnPath(testKeyOtherHost(1)));
+}
+
+test "stateOf reports lifecycle state and null for an untracked path" {
+    var manager = PathManager.init(.full, testKey(50_000), true);
+    try testing.expectEqual(@as(?PathState, PathState.validated), manager.stateOf(testKey(50_000)));
+    try testing.expectEqual(@as(?PathState, null), manager.stateOf(testKeyOtherHost(1)));
+
+    const candidate = testKeyOtherHost(50_001);
+    _ = manager.onDatagram(candidate, 1_200, test_challenge, 0);
+    try testing.expectEqual(@as(?PathState, PathState.validating), manager.stateOf(candidate));
+}
+
+test "pendingPromotionCandidate finds a validated-but-unpromoted path and clears once promoted" {
+    var manager = PathManager.init(.full, testKey(50_000), true);
+    try testing.expectEqual(@as(?PathKey, null), manager.pendingPromotionCandidate());
+
+    const candidate = testKeyOtherHost(50_001);
+    _ = manager.onDatagram(candidate, 1_200, test_challenge, 0);
+    try testing.expectEqual(@as(?PathKey, null), manager.pendingPromotionCandidate());
+
+    _ = manager.validatePathResponse(candidate, test_challenge, 10).?;
+    try testing.expect(manager.pendingPromotionCandidate().?.eql(candidate));
+
+    _ = manager.promoteValidated(candidate).?;
+    try testing.expectEqual(@as(?PathKey, null), manager.pendingPromotionCandidate());
 }
