@@ -236,13 +236,13 @@ pub const LocalStore = struct {
     mutex: zig_compat.Mutex = .{},
     entries: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
     observer: Observer = .{},
-    /// Normally `start_unix_ms + quarantine_duration_ms`; re-armed to
-    /// `high_water_unix_ms + quarantine_duration_ms` if a later `claim`
-    /// observes wall-clock time moving backward, so a clock correction can
-    /// never shorten the window that was already committed to (a minimal,
-    /// deliberately conservative stand-in for a monotonic elapsed-time
-    /// source — see the module doc).
-    quarantine_until_unix_ms: u64,
+    /// Initial startup quarantine: process-local stores fail closed for
+    /// tickets that could have been accepted by a prior process incarnation.
+    startup_quarantine_until_unix_ms: u64,
+    /// Re-armed to `high_water_unix_ms + quarantine_duration_ms` if a later
+    /// `claim` observes wall-clock time moving backward, so a clock
+    /// correction can never make expired replay windows fresh again.
+    rollback_quarantine_until_unix_ms: u64 = 0,
     /// Highest wall-clock `now_unix_ms` this store has ever observed, used
     /// only to detect backward clock movement.
     high_water_unix_ms: u64,
@@ -271,7 +271,7 @@ pub const LocalStore = struct {
             .allocator = allocator,
             .limits = limits,
             .quarantine_duration_ms = quarantine_duration_ms,
-            .quarantine_until_unix_ms = now_unix_ms +| quarantine_duration_ms,
+            .startup_quarantine_until_unix_ms = now_unix_ms +| quarantine_duration_ms,
             .high_water_unix_ms = now_unix_ms,
         };
         try self.entries.ensureTotalCapacity(allocator, @intCast(limits.max_entries));
@@ -338,12 +338,14 @@ pub const LocalStore = struct {
             // Backward wall-clock movement: conservatively re-enter the
             // full quarantine window rather than trust the reduced
             // elapsed time.
-            self.quarantine_until_unix_ms = self.high_water_unix_ms +| self.quarantine_duration_ms;
+            self.rollback_quarantine_until_unix_ms = self.high_water_unix_ms +| self.quarantine_duration_ms;
         } else {
             self.high_water_unix_ms = now_unix_ms;
         }
 
-        if (self.quarantineApplies(c) and now_unix_ms < self.quarantine_until_unix_ms) {
+        if (now_unix_ms < self.rollback_quarantine_until_unix_ms or
+            (self.startupQuarantineApplies(c) and now_unix_ms < self.startup_quarantine_until_unix_ms))
+        {
             event.* = .startup_quarantine;
             return .unavailable;
         }
@@ -392,7 +394,7 @@ pub const LocalStore = struct {
         return .rejected_capacity;
     }
 
-    fn quarantineApplies(self: *const LocalStore, c: Claim) bool {
+    fn startupQuarantineApplies(self: *const LocalStore, c: Claim) bool {
         _ = self;
         return !c.current_process_stateful;
     }
@@ -627,8 +629,36 @@ test "backward wall-clock movement re-arms the quarantine window" {
     try testing.expectEqual(ClaimResult.unavailable, store.claim(.{ .key = keyOf(2), .retain_until_unix_ms = 300_000 }, 50_000));
     // Re-armed relative to the highest wall-clock time actually observed
     // (160_000), not the regressed value.
+    try testing.expectEqual(ClaimResult.unavailable, store.claim(.{
+        .key = keyOf(4),
+        .current_process_stateful = true,
+        .retain_until_unix_ms = 300_000,
+    }, 219_999));
     try testing.expectEqual(ClaimResult.unavailable, store.claim(.{ .key = keyOf(3), .retain_until_unix_ms = 300_000 }, 219_999));
     try testing.expectEqual(ClaimResult.accepted, store.claim(.{ .key = keyOf(3), .retain_until_unix_ms = 300_000 }, 220_000));
+}
+
+test "rollback quarantine blocks reclaimed current-process stateful replay" {
+    var store = try LocalStore.init(testing.allocator, testLimits(1), 60_000, 100_000);
+    defer store.deinit();
+
+    const stateful = Claim{
+        .key = keyOf(1),
+        .current_process_stateful = true,
+        .retain_until_unix_ms = 170_000,
+    };
+    try testing.expectEqual(ClaimResult.accepted, store.claim(stateful, 160_000));
+    try testing.expectEqual(ClaimResult.accepted, store.claim(.{
+        .key = keyOf(2),
+        .current_process_stateful = true,
+        .retain_until_unix_ms = 300_000,
+    }, 171_000));
+
+    try testing.expectEqual(ClaimResult.unavailable, store.claim(.{
+        .key = stateful.key,
+        .current_process_stateful = true,
+        .retain_until_unix_ms = 300_000,
+    }, 165_000));
 }
 
 test "quarantine deadline arithmetic saturates instead of wrapping on overflow" {
