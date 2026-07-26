@@ -276,6 +276,7 @@ pub const Tls13Backend = struct {
                 // verifier, or selector without another inbound CRYPTO frame.
                 .authPendingFn = authPending,
                 .resumeFn = resumeAuth,
+                .earlyDataAttemptedFn = earlyDataAttempted,
             },
             .setCidBindingFn = setCidBinding,
             .peerCidBindingFn = peerCidBinding,
@@ -292,6 +293,11 @@ pub const Tls13Backend = struct {
     fn earlyDataAcceptedVtable(ptr: *anyopaque) bool {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
         return self.engine.earlyDataAccepted();
+    }
+
+    fn earlyDataAttempted(ptr: *anyopaque) bool {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.engine.earlyDataAttempted();
     }
 
     fn authPending(ptr: *anyopaque) bool {

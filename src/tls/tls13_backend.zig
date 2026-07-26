@@ -338,6 +338,7 @@ pub const EarlyDataDecision = enum {
 /// not decided here.
 pub const ServerEarlyDataPolicy = struct {
     enabled: bool = false,
+    max_early_data_size: u32 = 16 * 1024,
     age_skew_tolerance_ms: u64 = 60_000,
 };
 
@@ -1230,7 +1231,13 @@ pub const Tls13Backend = struct {
             .authPendingFn = authPendingImpl,
             .resumeFn = resumeImpl,
             .setPostHandshakeAllocatorFn = setPostHandshakeAllocatorImpl,
+            .earlyDataAttemptedFn = earlyDataAttemptedImpl,
         };
+    }
+
+    fn earlyDataAttemptedImpl(ptr: *anyopaque) bool {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.earlyDataAttempted();
     }
 
     fn authPendingImpl(ptr: *anyopaque) bool {

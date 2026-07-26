@@ -2853,6 +2853,173 @@ const SocketHarness = struct {
     }
 };
 
+test "#510 record stream carries real accepted 0-RTT provenance before 1-RTT completion" {
+    const TicketCapture = struct {
+        ticket: session.ClientTicketState = .{},
+
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(std.testing.allocator, &self.ticket) catch unreachable;
+        }
+    };
+
+    var capture = TicketCapture{};
+    defer capture.ticket.deinit();
+
+    const first = try SocketHarness.create(.{ .client_alpn = "http/1.1", .server_alpn = "http/1.1" });
+    defer first.destroy();
+    try first.client_engine.setSessionTicketConsumer(std.testing.allocator, session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = TicketCapture.now,
+        .onTicketFn = TicketCapture.onTicket,
+    });
+    try first.driveUntil(struct {
+        fn done(h: *SocketHarness) bool {
+            return h.bothComplete();
+        }
+    }.done);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    var prepared = try first.server_engine.prepareNewSessionTicket(std.testing.allocator, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 500,
+        .ticket_nonce = "\x01",
+        .issued_at_unix_ms = 1000,
+        .max_early_data_size = 4096,
+    }, session.Limits.default);
+    defer prepared.deinit();
+    try first.server_engine.emitPreparedNewSessionTicket(std.testing.allocator, &sink, &prepared, "record-e2e-ticket", session.Limits.default);
+    try std.testing.expectEqual(@as(usize, 1), sink.len);
+    const ticket_hb = sink.items[0].handshake_bytes;
+    try first.server.tryQueuePostHandshake(.{ .handshake_bytes = .{ .epoch = ticket_hb.epoch, .data = ticket_hb.data } });
+    var ticket_rounds: usize = 0;
+    while (ticket_rounds < 1000 and capture.ticket.ticket.slice().len == 0) : (ticket_rounds += 1) {
+        const c = try first.driveClient();
+        const s = try first.driveServer();
+        if (!c.made_progress and !s.made_progress) return error.Stalled;
+    }
+    if (capture.ticket.ticket.slice().len == 0) return error.Stalled;
+    try std.testing.expectEqual(session.EarlyDataPolicy{ .early_data_capable = 4096 }, capture.ticket.common.early_data);
+
+    const Resolver = struct {
+        state: *session.ServerRecoverableState,
+
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+
+        fn resolve(ctx: *anyopaque, identity: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!std.mem.eql(u8, identity, "record-e2e-ticket")) return .miss;
+            return clonedResolveHit(self.state, std.testing.allocator);
+        }
+    };
+
+    const ReplayGate = struct {
+        fn decide(_: *anyopaque, _: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+            return .allow;
+        }
+    };
+
+    var accepted_ticket: session.ClientTicketState = .{};
+    defer accepted_ticket.deinit();
+    try capture.ticket.cloneInto(std.testing.allocator, &accepted_ticket);
+    var replay_ticket: session.ClientTicketState = .{};
+    defer replay_ticket.deinit();
+    try capture.ticket.cloneInto(std.testing.allocator, &replay_ticket);
+    try std.testing.expectEqual(session.EarlyDataPolicy{ .early_data_capable = 4096 }, replay_ticket.common.early_data);
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&accepted_ticket);
+    var clock_dummy: u8 = 0;
+    var resolver = Resolver{ .state = &prepared.state };
+
+    const resumed = try SocketHarness.create(.{ .client_alpn = "http/1.1", .server_alpn = "http/1.1" });
+    defer resumed.destroy();
+    try resumed.client_engine.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    try resumed.client_engine.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 4096 });
+    try resumed.server_engine.setServerPskResolver(.{
+        .ctx = &resolver,
+        .nowUnixMsFn = Resolver.now,
+        .resolveFn = Resolver.resolve,
+    });
+    try resumed.server_engine.setServerEarlyDataPolicy(.{ .enabled = true, .max_early_data_size = 4096, .age_skew_tolerance_ms = 60_000 });
+    try resumed.server_engine.setEarlyDataReplayGate(.{ .ctx = &clock_dummy, .decideFn = ReplayGate.decide });
+
+    _ = try resumed.driveClient();
+    try std.testing.expect(resumed.client_engine.earlyDataAttempted());
+    try std.testing.expect(resumed.client.readiness().can_write_plaintext);
+    const early_request = "GET /safe HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    try std.testing.expectEqual(early_request.len, try resumed.client.stream().write(early_request));
+
+    try resumed.driveUntil(struct {
+        fn done(h: *SocketHarness) bool {
+            return h.server.readiness().can_read_plaintext;
+        }
+    }.done);
+    try std.testing.expect(resumed.server_engine.earlyDataAccepted());
+    var buf: [256]u8 = undefined;
+    const n = try resumed.server.stream().read(&buf);
+    try std.testing.expectEqualStrings(early_request, buf[0..n]);
+    try std.testing.expect(resumed.server.currentReadTransportEarly());
+    try std.testing.expect(!resumed.server.applicationDataOpen());
+
+    try resumed.driveUntil(struct {
+        fn done(h: *SocketHarness) bool {
+            return h.bothComplete();
+        }
+    }.done);
+    try std.testing.expect(resumed.client.bridge.handshake_complete);
+    try std.testing.expect(resumed.server.bridge.handshake_complete);
+    try std.testing.expect(!resumed.server.bridge.hasReadKeys(.zero_rtt));
+
+    const RejectReplayGate = struct {
+        fn decide(_: *anyopaque, _: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+            return .replay;
+        }
+    };
+    const replayed = try SocketHarness.create(.{ .client_alpn = "http/1.1", .server_alpn = "http/1.1" });
+    defer replayed.destroy();
+    var replay_offers: pre_shared_key.ClientPskOfferSet = .{};
+    try replay_offers.push(&replay_ticket);
+    try replayed.client_engine.setClientPskOffers(&replay_offers, &clock_dummy, earlyDataResumedClientClock);
+    try replayed.client_engine.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 4096 });
+    try replayed.server_engine.setServerPskResolver(.{
+        .ctx = &resolver,
+        .nowUnixMsFn = Resolver.now,
+        .resolveFn = Resolver.resolve,
+    });
+    try replayed.server_engine.setServerEarlyDataPolicy(.{ .enabled = true, .max_early_data_size = 4096, .age_skew_tolerance_ms = 60_000 });
+    try replayed.server_engine.setEarlyDataReplayGate(.{ .ctx = &clock_dummy, .decideFn = RejectReplayGate.decide });
+
+    _ = try replayed.driveClient();
+    try std.testing.expect(replayed.client_engine.earlyDataAttempted());
+    try std.testing.expectEqual(early_request.len, try replayed.client.stream().write(early_request));
+    try replayed.driveUntil(struct {
+        fn done(h: *SocketHarness) bool {
+            return h.bothComplete();
+        }
+    }.done);
+    try std.testing.expectEqual(tls_backend.EarlyDataDecision.replay_rejected, replayed.server_engine.earlyDataDecision());
+    try std.testing.expect(!replayed.server.readiness().can_read_plaintext);
+    try std.testing.expectError(error.WouldBlock, replayed.server.stream().read(&buf));
+
+    const ordinary_request = "GET /after HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    try std.testing.expectEqual(ordinary_request.len, try replayed.client.stream().write(ordinary_request));
+    try replayed.driveUntil(struct {
+        fn done(h: *SocketHarness) bool {
+            return h.server.readiness().can_read_plaintext;
+        }
+    }.done);
+    const ordinary_n = try replayed.server.stream().read(&buf);
+    try std.testing.expectEqualStrings(ordinary_request, buf[0..ordinary_n]);
+    try std.testing.expect(!replayed.server.currentReadTransportEarly());
+}
+
 test "allocating record owner cleans up across every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator) !void {

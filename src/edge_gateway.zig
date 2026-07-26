@@ -1244,6 +1244,7 @@ fn startNewConnection(ctx: *WorkerContext, client_fd: std.posix.fd_t) void {
                 .buffer_limits = cfg.tls_buffer_limits,
                 .resumption_runtime = ctx.resumption_runtime,
                 .early_data_replay_gate = ctx.early_data_replay_gate,
+                .server_early_data_policy = nativeTcpServerEarlyDataPolicy(ctx.early_data_replay_gate),
             },
         ) catch |err| {
             ctx.state.logger.warn(null, "native tls connection setup failed: {}", .{err});
@@ -1573,6 +1574,12 @@ fn nativeEarlyDataReplayComposition(
         .store_enabled = store_enabled,
         .early_data_replay_gate = if (store_enabled) gate else null,
     };
+}
+
+fn nativeTcpServerEarlyDataPolicy(
+    gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
+) tls_core.tls13_backend.ServerEarlyDataPolicy {
+    return if (gate != null) .{ .enabled = true } else .{};
 }
 
 fn reapActiveConnections(
@@ -2908,6 +2915,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         session.proxy_protocol_checked = true;
     }
 
+    h2BeginReadScope(conn);
     var streaming_request_body: ?gproxy_runtime.StreamingRequestBody = null;
     var request: http.Request = undefined;
     var request_initialized = false;
@@ -3005,6 +3013,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         request = parse_result.request;
         request_initialized = true;
     }
+    const request_transport_early = h2LastReadTransportEarly(conn);
     const writer = conn.writer();
     keep_alive = request.keepAlive();
     if (streaming_request_body != null) keep_alive = false;
@@ -3023,6 +3032,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
     if (request.version == .http11 and request.headers.get("host") == null) {
         try gp.sendApiError(allocator, writer, .bad_request, "invalid_request", "HTTP/1.1 request missing required Host header", correlation_id, false, state);
         var ctx_host = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
+        ctx_host.early_data.transport_early = request_transport_early;
         ghandlers.logAccessForRequest(state, &ctx_host, &request, 400);
         return;
     }
@@ -3034,10 +3044,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         connection_ip;
     const client_ip = http.request_context.extractClientIp(&request, effective_connection_ip);
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, client_ip);
-    // #367 slice 2 keeps this as request-scoped handoff state. The production
-    // #366 H1 record provenance carrier is not present on this branch yet, so
-    // H1 transport provenance stays false rather than using connection state.
-    ctx.early_data.transport_early = false;
+    ctx.early_data.transport_early = request_transport_early;
     ctx.early_data.inbound_marker = request.headers.hasEarlyDataMarker();
 
     // --- RFC 7231 §4.3.8 / ASVS-14.5.1: Reject TRACE globally ---
@@ -3607,6 +3614,77 @@ test "#369 Slice 2 rt0.reject.unsafe_request: an unsafe method carrying current-
     try std.testing.expectEqual(@as(usize, 0), effects.handler_calls);
 }
 
+test "#510 H1 request context derives transport early provenance from connection reads before safety gate" {
+    const allocator = std.testing.allocator;
+    const wire = "POST /work HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\n\r\n";
+    var harness = H2FrameReadProvenanceHarness{
+        .bytes = wire,
+        .early_prefix_len = wire.len,
+        .max_chunk = 7,
+    };
+    const inner = http.encrypted_stream_connection.EncryptedStreamHttpConnection.initWithFdAndProvenance(
+        harness.stream(),
+        -1,
+        &harness,
+        H2FrameReadProvenanceHarness.readTransportEarly,
+        H2FrameReadProvenanceHarness.handshakeComplete,
+    );
+    var conn = WaitingEncryptedHttpConnection.init(inner, 1, 1);
+    var session = ConnectionSession{};
+    var pending_buf: [512]u8 = undefined;
+
+    h2BeginReadScope(&conn);
+    const total_read = try gconn.readHttpRequest(&conn, &pending_buf, &session.pending_len);
+    var parsed = try http.Request.parse(allocator, pending_buf[0..total_read], MAX_REQUEST_SIZE);
+    defer parsed.request.deinit();
+    const request_transport_early = h2LastReadTransportEarly(&conn);
+    try std.testing.expect(request_transport_early);
+
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+            .early_data = .replay_safe,
+            .proxy_early_data = .rfc8470,
+        },
+    };
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = &.{};
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    var ctx = http.request_context.RequestContext.init(allocator, "req-read-early", "127.0.0.1");
+    ctx.early_data.transport_early = request_transport_early;
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-read-early", 0);
+    var keep_alive = false;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const outcome = try executeH1PostPreflightOrchestration(
+        {},
+        allocator,
+        &output.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &parsed.request,
+        "req-read-early",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1CountingPostPreflightHooks{ .effects = &effects },
+    );
+
+    try std.testing.expectEqual(@as(u16, @intFromEnum(http.Status.too_early)), outcome.terminal_status);
+    try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.handler_calls);
+}
+
 test "#369 Slice 2 rt0.reject.store_unavailable: disabled-mode composition passes no replay gate to the real native TLS connection" {
     // Deterministic, explicit inputs: native resumption and a native TCP
     // provider both "exist" here, isolating `.disabled` replay mode alone
@@ -3651,6 +3729,57 @@ test "#369 Slice 2 rt0.reject.store_unavailable: disabled-mode composition passe
     // so any 0-RTT attempt on it fails closed to `.unavailable` while
     // ordinary 1-RTT resumption is untouched.
     try std.testing.expect(native.backend.early_data_replay_gate.decideFn == null);
+}
+
+test "#510 process-local composition enables native TCP server early-data policy with replay gate" {
+    const gate = tls_core.tls13_backend.EarlyDataReplayGate{ .ctx = undefined, .decideFn = struct {
+        fn decide(_: *anyopaque, _: tls_core.tls13_backend.EarlyDataReplayCandidate) tls_core.tls13_backend.EarlyDataReplayDecision {
+            return .allow;
+        }
+    }.decide };
+    const composition = nativeEarlyDataReplayComposition(
+        .process_local,
+        true,
+        true,
+        false,
+        false,
+        gate,
+    );
+    try std.testing.expect(composition.store_enabled);
+    try std.testing.expect(composition.early_data_replay_gate != null);
+    const policy = nativeTcpServerEarlyDataPolicy(composition.early_data_replay_gate);
+    try std.testing.expect(policy.enabled);
+
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var entropy = tls_core.production_crypto.OsEntropy{};
+    var provider = tls_core.production_crypto.Provider.init(entropy.entropy());
+    var runtime = try tls_core.resumption_runtime.Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = systemNowUnixMs },
+        provider.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    const fds = try gatewayTestSocketPair();
+    defer gatewayTestCloseFd(fds[0]);
+    defer gatewayTestCloseFd(fds[1]);
+    const native = try http.native_tls_connection.NativeTlsConnection.createWithOptions(
+        std.testing.allocator,
+        fds[0],
+        .{ .http1_enabled = true, .http2_enabled = true },
+        fixed.provider(),
+        .{
+            .resumption_runtime = &runtime,
+            .early_data_replay_gate = composition.early_data_replay_gate,
+            .server_early_data_policy = policy,
+        },
+    );
+    defer native.destroy();
+
+    try std.testing.expect(native.backend.server_early_data_policy.enabled);
+    try std.testing.expectEqual(composition.early_data_replay_gate.?.ctx, native.backend.early_data_replay_gate.ctx);
 }
 
 test "return_response method enforcement — non-GET/HEAD rejected on static returns" {

@@ -151,6 +151,10 @@ pub const NativeTlsConnection = struct {
         /// own default gate in place, which fails closed (`.unavailable`)
         /// for any 0-RTT attempt.
         early_data_replay_gate: ?tls_backend.EarlyDataReplayGate = null,
+        /// Enables native TCP 0-RTT only when the production composition has
+        /// also installed replay protection. Default disabled keeps tickets
+        /// resume-only and causes attempted early data to be rejected.
+        server_early_data_policy: tls_backend.ServerEarlyDataPolicy = .{},
     };
 
     allocator: std.mem.Allocator,
@@ -220,6 +224,9 @@ pub const NativeTlsConnection = struct {
         // worker and QUIC/H3, not a per-connection concern.
         if (options.early_data_replay_gate) |gate| {
             backend.setEarlyDataReplayGate(gate) catch unreachable;
+            if (options.resumption_runtime != null and options.server_early_data_policy.enabled) {
+                backend.setServerEarlyDataPolicy(options.server_early_data_policy) catch unreachable;
+            }
         }
 
         const record = try allocator.create(encrypted_stream.PureZigRecordStream);
@@ -337,6 +344,7 @@ pub const NativeTlsConnection = struct {
             .ticket_age_add = ticket_age_add,
             .ticket_nonce = &ticket_nonce,
             .issued_at_unix_ms = now_unix_ms,
+            .max_early_data_size = if (self.backend.server_early_data_policy.enabled) self.backend.server_early_data_policy.max_early_data_size else null,
         }, limits);
         defer prepared.deinit();
 
@@ -611,6 +619,32 @@ const TicketIssueProbe = struct {
     }
 };
 
+fn armNativeTicketIssuer(conn: *NativeTlsConnection) !void {
+    const hs_read = [_]u8{0x21} ** 32;
+    const hs_write = [_]u8{0x22} ** 32;
+    const app_read = [_]u8{0x23} ** 32;
+    const app_write = [_]u8{0x24} ** 32;
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &hs_read } });
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &hs_write } });
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &app_read } });
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &app_write } });
+    try conn.record.applyEvent(.{ .discard_epoch = .initial });
+    try conn.record.applyEvent(.{ .discard_epoch = .handshake });
+    try conn.record.applyEvent(.handshake_complete);
+    conn.backend.core.handshake_lifecycle = .complete;
+    try conn.backend.resumption_master_secret.replace(&([_]u8{0x42} ** tls.tls13_backend.hash_len));
+}
+
+fn expectOnlyStatefulTicketEarlyData(runtime: *tls.resumption_runtime.Runtime, expected: tls.session.EarlyDataPolicy) !void {
+    const cache = &runtime.server_cache.?;
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+    var it = cache.entries.valueIterator();
+    const entry = it.next().?.*;
+    try std.testing.expectEqual(expected, entry.state.common.early_data);
+}
+
 const CacheEventProbe = struct {
     stored: usize = 0,
 
@@ -670,6 +704,122 @@ test "native TLS createWithOptions installs the shared early-data replay gate in
 
     try std.testing.expectEqual(gate.ctx, conn.backend.early_data_replay_gate.ctx);
     try std.testing.expectEqual(gate.decideFn, conn.backend.early_data_replay_gate.decideFn);
+}
+
+test "native TLS server early data policy is disabled unless resumption and replay gate are both configured" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+
+    var runtime = try testResumptionRuntime(std.testing.allocator);
+    defer runtime.deinit();
+
+    var store = try tls.early_data_replay.LocalStore.init(std.testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    var adapter = tls.early_data_replay.GateAdapter.init(store.store());
+    const gate = adapter.gate();
+
+    {
+        const fds = try testSocketPair();
+        defer closeFd(fds[1]);
+        const conn = try NativeTlsConnection.createWithOptions(
+            std.testing.allocator,
+            fds[0],
+            .{ .http1_enabled = true, .http2_enabled = true },
+            fixed.provider(),
+            .{
+                .resumption_runtime = &runtime,
+                .server_early_data_policy = .{ .enabled = true, .max_early_data_size = 4096 },
+            },
+        );
+        defer conn.destroy();
+        try std.testing.expect(!conn.backend.server_early_data_policy.enabled);
+    }
+
+    {
+        const fds = try testSocketPair();
+        defer closeFd(fds[1]);
+        const conn = try NativeTlsConnection.createWithOptions(
+            std.testing.allocator,
+            fds[0],
+            .{ .http1_enabled = true, .http2_enabled = true },
+            fixed.provider(),
+            .{
+                .early_data_replay_gate = gate,
+                .server_early_data_policy = .{ .enabled = true, .max_early_data_size = 4096 },
+            },
+        );
+        defer conn.destroy();
+        try std.testing.expect(!conn.backend.server_early_data_policy.enabled);
+    }
+
+    {
+        const fds = try testSocketPair();
+        defer closeFd(fds[1]);
+        const conn = try NativeTlsConnection.createWithOptions(
+            std.testing.allocator,
+            fds[0],
+            .{ .http1_enabled = true, .http2_enabled = true },
+            fixed.provider(),
+            .{
+                .resumption_runtime = &runtime,
+                .early_data_replay_gate = gate,
+                .server_early_data_policy = .{ .enabled = true, .max_early_data_size = 4096 },
+            },
+        );
+        defer conn.destroy();
+        try std.testing.expect(conn.backend.server_early_data_policy.enabled);
+        try std.testing.expectEqual(@as(u32, 4096), conn.backend.server_early_data_policy.max_early_data_size);
+    }
+}
+
+test "native TLS production ticket issuance advertises early data only when policy is enabled" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+
+    {
+        const fds = try testSocketPair();
+        defer closeFd(fds[1]);
+        var runtime = try testResumptionRuntime(std.testing.allocator);
+        defer runtime.deinit();
+        const conn = try NativeTlsConnection.createWithOptions(
+            std.testing.allocator,
+            fds[0],
+            .{ .http1_enabled = true, .http2_enabled = true },
+            fixed.provider(),
+            .{ .resumption_runtime = &runtime },
+        );
+        defer conn.destroy();
+        try armNativeTicketIssuer(conn);
+        conn.maybeIssueSessionTicket();
+        try std.testing.expect(conn.ticket_issue_attempted);
+        try expectOnlyStatefulTicketEarlyData(&runtime, .resume_only);
+    }
+
+    {
+        const fds = try testSocketPair();
+        defer closeFd(fds[1]);
+        var runtime = try testResumptionRuntime(std.testing.allocator);
+        defer runtime.deinit();
+        var store = try tls.early_data_replay.LocalStore.init(std.testing.allocator, .{}, 0, 0);
+        defer store.deinit();
+        var adapter = tls.early_data_replay.GateAdapter.init(store.store());
+        const conn = try NativeTlsConnection.createWithOptions(
+            std.testing.allocator,
+            fds[0],
+            .{ .http1_enabled = true, .http2_enabled = true },
+            fixed.provider(),
+            .{
+                .resumption_runtime = &runtime,
+                .early_data_replay_gate = adapter.gate(),
+                .server_early_data_policy = .{ .enabled = true, .max_early_data_size = 8192 },
+            },
+        );
+        defer conn.destroy();
+        try armNativeTicketIssuer(conn);
+        conn.maybeIssueSessionTicket();
+        try std.testing.expect(conn.ticket_issue_attempted);
+        try expectOnlyStatefulTicketEarlyData(&runtime, .{ .early_data_capable = 8192 });
+    }
 }
 
 test "native TLS without a resumption runtime never attempts ticket issuance" {
@@ -748,19 +898,7 @@ test "native TLS post-handshake queue pressure rolls back inserted stateful hand
     );
     defer conn.destroy();
 
-    const hs_read = [_]u8{0x21} ** 32;
-    const hs_write = [_]u8{0x22} ** 32;
-    const app_read = [_]u8{0x23} ** 32;
-    const app_write = [_]u8{0x24} ** 32;
-    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &hs_read } });
-    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &hs_write } });
-    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &app_read } });
-    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &app_write } });
-    try conn.record.applyEvent(.{ .discard_epoch = .initial });
-    try conn.record.applyEvent(.{ .discard_epoch = .handshake });
-    try conn.record.applyEvent(.handshake_complete);
-    conn.backend.core.handshake_lifecycle = .complete;
-    try conn.backend.resumption_master_secret.replace(&([_]u8{0x42} ** tls.tls13_backend.hash_len));
+    try armNativeTicketIssuer(conn);
 
     try std.testing.expectEqual(@as(usize, 0), runtime.server_cache.?.count());
     conn.record.outbound_ciphertext.len = encrypted_stream.PureZigRecordStream.max_ciphertext_queue - 1;
