@@ -493,7 +493,18 @@ pub const PathState = enum {
     unvalidated,
     /// PATH_CHALLENGE outstanding.
     validating,
-    /// PATH_RESPONSE echoed the challenge; the path is usable.
+    /// PATH_RESPONSE echoed the challenge, but the path has not yet been
+    /// promoted to active (RFC 9000 §9.5: host migration must claim a fresh
+    /// peer CID first). Distinct from `.validated` so a later authenticated
+    /// datagram on this exact path cannot be mistaken for "previously active,
+    /// safe to trust indefinitely" and does not discard the completed
+    /// validation by re-probing.
+    validated_pending_promotion,
+    /// The path is (or was) promoted to active. RFC 9000 §9.3 permits
+    /// skipping validation for a previously validated address only when it
+    /// has been seen *recently*; this implementation tracks no recency, so a
+    /// non-active `.validated` path is re-probed like `.unvalidated`/`.failed`
+    /// rather than trusted forever.
     validated,
     /// The challenge expired unanswered.
     failed,
@@ -669,10 +680,15 @@ pub const PathManager = struct {
                 // Already validated but not yet promoted (e.g. blocked
                 // earlier on a fresh peer CID): keep the completed validation
                 // intact instead of discarding it for a fresh challenge.
-                .validated => return .validated_pending_promotion,
-                // Fresh traffic on a previously failed/unvalidated tuple:
-                // start a new probe.
-                .failed, .unvalidated => {},
+                .validated_pending_promotion => return .validated_pending_promotion,
+                // A previously-active/validated-but-now-non-active path has
+                // no tracked recency (RFC 9000 §9.3 permits skipping
+                // validation only for a *recently* seen address), and its
+                // stored `change` may be stale relative to the current active
+                // path. Treat it the same as unvalidated/failed: start a
+                // fresh, conservative probe rather than trusting it — and
+                // silently reusing a stale `change` — indefinitely.
+                .failed, .unvalidated, .validated => {},
             }
             path.state = .validating;
             path.change = change;
@@ -702,15 +718,18 @@ pub const PathManager = struct {
     }
 
     /// Validate a PATH_RESPONSE received from `key` without promoting it to
-    /// the active path. On a match the candidate becomes `.validated`; the
-    /// caller decides when (or whether) to call `promoteValidated` — host
-    /// migration must claim a fresh peer CID first (RFC 9000 §9.5), so
-    /// validation and promotion cannot be one atomic step. A response with no
-    /// matching outstanding challenge — wrong payload, wrong path, or expired
-    /// — is ignored (null) and counted in `path_response_mismatches`:
-    /// responses do not validate paths they were not sent on (RFC 9000
-    /// §8.2.3), but the probe itself keeps waiting (only expiry fails it
-    /// terminally).
+    /// the active path. On a match the candidate becomes
+    /// `.validated_pending_promotion` — distinct from `.validated`, which
+    /// means "is or was the active path" — so `onDatagram` cannot mistake it
+    /// for a previously-active path and re-probe it out from under a pending
+    /// promotion. The caller decides when (or whether) to call
+    /// `promoteValidated` — host migration must claim a fresh peer CID first
+    /// (RFC 9000 §9.5), so validation and promotion cannot be one atomic
+    /// step. A response with no matching outstanding challenge — wrong
+    /// payload, wrong path, or expired — is ignored (null) and counted in
+    /// `path_response_mismatches`: responses do not validate paths they were
+    /// not sent on (RFC 9000 §8.2.3), but the probe itself keeps waiting
+    /// (only expiry fails it terminally).
     pub fn validatePathResponse(
         self: *PathManager,
         key: PathKey,
@@ -735,23 +754,25 @@ pub const PathManager = struct {
             return null;
         }
 
-        candidate.state = .validated;
+        candidate.state = .validated_pending_promotion;
         self.metrics.path_validations_succeeded += 1;
         return .{ .path = key, .change = candidate.change };
     }
 
-    /// Promote a path already marked `.validated` by `validatePathResponse`
-    /// to the active path, lifting its anti-amplification limit. Returns null
-    /// if `key` is not a validated candidate. For a host migration the caller
-    /// must claim a fresh peer CID before calling this (RFC 9000 §9.5); if
-    /// none is available, call `recordMigrationBlockedNoPeerCid` instead and
-    /// leave the candidate `.validated` so a later retry can promote it
-    /// without a new challenge round trip.
+    /// Promote a path already marked `.validated_pending_promotion` by
+    /// `validatePathResponse` to the active path, transitioning it to
+    /// `.validated` and lifting its anti-amplification limit. Returns null if
+    /// `key` is not a pending-promotion candidate. For a host migration the
+    /// caller must claim a fresh peer CID before calling this (RFC 9000
+    /// §9.5); if none is available, call `recordMigrationBlockedNoPeerCid`
+    /// instead and leave the candidate `.validated_pending_promotion` so a
+    /// later retry can promote it without a new challenge round trip.
     pub fn promoteValidated(self: *PathManager, key: PathKey) ?MigrationOutcome {
         const index = self.find(key) orelse return null;
         const candidate = &self.paths[index].?;
-        if (candidate.state != .validated) return null;
+        if (candidate.state != .validated_pending_promotion) return null;
 
+        candidate.state = .validated;
         candidate.anti_amplification.markValidated();
         self.active = index;
         switch (candidate.change) {
@@ -1205,11 +1226,43 @@ test "a validated candidate blocked on a peer CID survives further datagrams ins
     try testing.expect(manager.activePath().key.eql(migrated));
 }
 
+test "a previously-active validated path is re-probed, not trusted indefinitely" {
+    const a = testKey(50_000);
+    const b = testKey(50_001); // same host, new port: NAT rebinding
+    var manager = PathManager.init(.full, a, true);
+
+    // B validates and is promoted; A is now a non-active `.validated` path.
+    _ = manager.onDatagram(b, 1_200, test_challenge, 0);
+    _ = manager.validatePathResponse(b, test_challenge, 10).?;
+    _ = manager.promoteValidated(b).?;
+    try testing.expect(manager.activePath().key.eql(b));
+
+    // Traffic later arrives back on A. A previously-active `.validated` path
+    // must not be mistaken for a pending-first-promotion candidate: it is
+    // re-probed like any unvalidated/failed path (RFC 9000 §9.3 permits
+    // skipping validation only for a *recently* seen address, which this
+    // implementation does not track).
+    const decision = manager.onDatagram(a, 1_200, test_challenge, 20);
+    try testing.expect(decision == .probe);
+
+    // The fresh probe recomputes `change` relative to the *current* active
+    // path (B), so a stale `.migration` value from A's original
+    // initialization cannot make a plain port rebind look like a host
+    // migration once it re-validates.
+    const echoed = PathManager.onPathChallenge(decision.probe);
+    const validated = manager.validatePathResponse(a, echoed, 30).?;
+    try testing.expectEqual(AddressChange.nat_rebinding, validated.change);
+    const outcome = manager.promoteValidated(a).?;
+    try testing.expectEqual(AddressChange.nat_rebinding, outcome.change);
+    try testing.expect(!outcome.reset_congestion);
+}
+
 test "promoteValidated is null for a path that never validated" {
     var manager = PathManager.init(.full, testKey(50_000), true);
     try testing.expectEqual(@as(?MigrationOutcome, null), manager.promoteValidated(testKey(50_001)));
     _ = manager.onDatagram(testKey(50_001), 1_200, test_challenge, 0);
-    // Still only .validating, not .validated: promotion must not skip validation.
+    // Still only .validating, not .validated_pending_promotion: promotion
+    // must not skip validation.
     try testing.expectEqual(@as(?MigrationOutcome, null), manager.promoteValidated(testKey(50_001)));
 }
 
