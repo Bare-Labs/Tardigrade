@@ -602,6 +602,18 @@ pub const PathManager = struct {
         self.paths[self.active].?.anti_amplification.markValidated();
     }
 
+    /// Lift a *specific tracked path's* anti-amplification limit — e.g. a
+    /// non-Retry server's Handshake-level receipt proves that exact path's
+    /// address (RFC 9001 §4.9.1), which may not be the active path if it
+    /// arrived on a not-yet-promoted candidate. A no-op if `path` is not
+    /// tracked. Prefer this over `markActiveValidated()` whenever the
+    /// authenticated packet's actual path is known, so traffic on one path
+    /// can never lift a different path's limit.
+    pub fn markValidatedOnPath(self: *PathManager, path: PathKey) void {
+        const index = self.find(path) orelse return;
+        self.paths[index].?.anti_amplification.markValidated();
+    }
+
     /// Record bytes sent on `path` against that path's own ledger. A no-op if
     /// `path` is not tracked.
     pub fn recordSentOnPath(self: *PathManager, path: PathKey, bytes: u64) void {
@@ -614,6 +626,35 @@ pub const PathManager = struct {
     pub fn canSendOnPath(self: *const PathManager, path: PathKey, bytes: u64) bool {
         const index = self.find(path) orelse return false;
         return self.paths[index].?.anti_amplification.canSend(bytes);
+    }
+
+    /// Bytes still permitted to send on `path` before its anti-amplification
+    /// budget is exhausted, zero for an untracked path. Lets a caller size a
+    /// packet (e.g. how much PATH_CHALLENGE padding fits) without a separate
+    /// `canSendOnPath` probe for every candidate length.
+    pub fn remainingOnPath(self: *const PathManager, path: PathKey) u64 {
+        const index = self.find(path) orelse return 0;
+        return self.paths[index].?.anti_amplification.remaining();
+    }
+
+    /// The current lifecycle state of `path`, or null if untracked. Lets a
+    /// caller confirm a queued egress action (e.g. a pending PATH_CHALLENGE)
+    /// still corresponds to a live validation attempt before sending it.
+    pub fn stateOf(self: *const PathManager, path: PathKey) ?PathState {
+        const index = self.find(path) orelse return null;
+        return self.paths[index].?.state;
+    }
+
+    /// The key of a validated-but-not-yet-promoted candidate, if any. Lets a
+    /// caller retry `promoteValidated` opportunistically (e.g. once a fresh
+    /// peer CID becomes available after a NEW_CONNECTION_ID) without
+    /// re-deriving path state itself.
+    pub fn pendingPromotionCandidate(self: *const PathManager) ?PathKey {
+        for (self.paths) |slot| {
+            const path = slot orelse continue;
+            if (path.state == .validated_pending_promotion) return path.key;
+        }
+        return null;
     }
 
     /// Earliest deadline among paths with an outstanding PATH_CHALLENGE, or
@@ -666,6 +707,22 @@ pub const PathManager = struct {
         };
         if (!allowed) {
             self.metrics.migrations_blocked += 1;
+            // Migration policy blocks *promotion/migration* of this tuple —
+            // it must not also block answering a PATH_CHALLENGE the peer
+            // sends from it (RFC 9000 §8.2.2 owes a PATH_RESPONSE regardless
+            // of migration policy). Track a bounded `.unvalidated` record
+            // and credit its own anti-amplification ledger so a caller can
+            // still afford to send that response on this exact path, without
+            // ever starting a challenge or becoming eligible for promotion
+            // (both require `.validating` first, which this path never
+            // reaches while blocked).
+            if (self.find(key)) |index| {
+                self.paths[index].?.anti_amplification.recordReceived(authenticated_bytes);
+            } else {
+                const slot = self.claimSlot();
+                self.paths[slot] = .{ .key = key, .state = .unvalidated, .change = change };
+                self.paths[slot].?.anti_amplification.recordReceived(authenticated_bytes);
+            }
             return .blocked;
         }
 
@@ -1084,6 +1141,21 @@ test "an unvalidated initial path keeps its amplification budget until markActiv
     try testing.expect(manager.canSendOnPath(testKey(50_000), std.math.maxInt(u64)));
 }
 
+test "markValidatedOnPath lifts only the named path's limit, never a different tracked path's" {
+    var manager = PathManager.init(.full, testKey(50_000), false);
+    const candidate = testKeyOtherHost(50_001);
+    _ = manager.onDatagram(candidate, 100, test_challenge, 0);
+
+    // Marking the candidate validated must not touch the still-unvalidated
+    // active path.
+    manager.markValidatedOnPath(candidate);
+    try testing.expect(manager.canSendOnPath(candidate, std.math.maxInt(u64)));
+    try testing.expect(!manager.canSendOnPath(testKey(50_000), 3_001));
+
+    // An untracked path is a no-op, not a crash.
+    manager.markValidatedOnPath(testKeyOtherHost(9));
+}
+
 test "the first authenticated datagram on a new candidate path credits its own budget atomically" {
     var manager = PathManager.init(.full, testKey(50_000), true);
     const candidate = testKeyOtherHost(50_000);
@@ -1445,4 +1517,66 @@ test "probe storms recycle probe slots but never the active path" {
     try testing.expect(manager.activePath().key.eql(testKey(50_000)));
     try testing.expectEqual(PathState.validated, manager.activePath().state);
     try testing.expectEqual(PathDecision.on_active_path, manager.onDatagram(testKey(50_000), 1_200, test_challenge, 0));
+}
+
+test "a policy-blocked tuple still gets its own anti-amplification ledger, never a challenge" {
+    var manager = PathManager.init(.disabled, testKey(50_000), true);
+    const blocked = testKeyOtherHost(50_001);
+
+    const decision = manager.onDatagram(blocked, 100, test_challenge, 0);
+    try testing.expectEqual(PathDecision.blocked, decision);
+    try testing.expectEqual(@as(u64, 1), manager.metrics.migrations_blocked);
+    try testing.expectEqual(@as(u64, 0), manager.metrics.path_challenges_sent);
+
+    // A budget exists (isolated from the active path) even though the
+    // tuple may never migrate or promote: enough to answer a PATH_CHALLENGE
+    // received from it, per RFC 9000 §8.2.2.
+    try testing.expectEqual(@as(u64, 300), manager.remainingOnPath(blocked));
+    try testing.expectEqual(PathState.unvalidated, manager.stateOf(blocked).?);
+
+    // More traffic from the same blocked tuple keeps crediting the same
+    // ledger rather than creating a second entry or a challenge.
+    _ = manager.onDatagram(blocked, 50, test_challenge, 0);
+    try testing.expectEqual(@as(u64, 450), manager.remainingOnPath(blocked));
+    try testing.expectEqual(@as(u64, 2), manager.metrics.migrations_blocked);
+    try testing.expectEqual(@as(u64, 0), manager.metrics.path_challenges_sent);
+
+    // Never eligible for promotion while blocked: validatePathResponse
+    // requires `.validating`, which a blocked tuple never reaches.
+    try testing.expectEqual(@as(?ValidatedCandidate, null), manager.validatePathResponse(blocked, test_challenge, 10));
+    try testing.expect(manager.activePath().key.eql(testKey(50_000)));
+}
+
+test "remainingOnPath mirrors canSendOnPath and is zero for an untracked path" {
+    var manager = PathManager.init(.full, testKey(50_000), false);
+    _ = manager.onDatagram(testKey(50_000), 1_200, test_challenge, 0);
+    try testing.expectEqual(@as(u64, 3_600), manager.remainingOnPath(testKey(50_000)));
+    manager.paths[manager.active].?.anti_amplification.recordSent(1_000);
+    try testing.expectEqual(@as(u64, 2_600), manager.remainingOnPath(testKey(50_000)));
+    try testing.expectEqual(@as(u64, 0), manager.remainingOnPath(testKeyOtherHost(1)));
+}
+
+test "stateOf reports lifecycle state and null for an untracked path" {
+    var manager = PathManager.init(.full, testKey(50_000), true);
+    try testing.expectEqual(@as(?PathState, PathState.validated), manager.stateOf(testKey(50_000)));
+    try testing.expectEqual(@as(?PathState, null), manager.stateOf(testKeyOtherHost(1)));
+
+    const candidate = testKeyOtherHost(50_001);
+    _ = manager.onDatagram(candidate, 1_200, test_challenge, 0);
+    try testing.expectEqual(@as(?PathState, PathState.validating), manager.stateOf(candidate));
+}
+
+test "pendingPromotionCandidate finds a validated-but-unpromoted path and clears once promoted" {
+    var manager = PathManager.init(.full, testKey(50_000), true);
+    try testing.expectEqual(@as(?PathKey, null), manager.pendingPromotionCandidate());
+
+    const candidate = testKeyOtherHost(50_001);
+    _ = manager.onDatagram(candidate, 1_200, test_challenge, 0);
+    try testing.expectEqual(@as(?PathKey, null), manager.pendingPromotionCandidate());
+
+    _ = manager.validatePathResponse(candidate, test_challenge, 10).?;
+    try testing.expect(manager.pendingPromotionCandidate().?.eql(candidate));
+
+    _ = manager.promoteValidated(candidate).?;
+    try testing.expectEqual(@as(?PathKey, null), manager.pendingPromotionCandidate());
 }

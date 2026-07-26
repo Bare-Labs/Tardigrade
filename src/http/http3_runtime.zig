@@ -133,11 +133,12 @@ const ConnEntry = struct {
     conn: *Connection,
     h3: H3,
     h3_started: bool = false,
-    /// Source address of the Initial that opened the connection. Fixed for the
-    /// connection's lifetime: migration is unsupported (the native stack
-    /// advertises `disable_active_migration`), so replies always target this
-    /// address regardless of later packet sources.
-    peer: std.c.sockaddr.in,
+    /// Source IPv4 address of the Initial that opened the connection,
+    /// immutable for the connection's lifetime. Used only for half-open
+    /// admission accounting (increment/decrement/teardown) — never for
+    /// routing egress, since the active path can now change and every
+    /// `pollTransmitOnPath` datagram already carries its own destination.
+    admission_source_ip: u32,
     cid_len: usize,
     /// Monotonic microseconds when the connection was accepted; used to reap
     /// connections that never complete the handshake.
@@ -163,6 +164,11 @@ pub const Runtime = struct {
     thread: ?std.Thread,
     logger: *logger_mod.Logger,
     quic_port: u16,
+    /// The actually-bound local UDP address (`getsockname` semantics), used
+    /// as every connection's and `PathKey`'s local half. Resolved once at
+    /// bind time so a `quic_port = 0` (OS-assigned ephemeral port) test still
+    /// gets a real, routable local address instead of the requested `0`.
+    local_address: quic.udp.Address,
     request_handler: ?RequestHandler,
     request_handler_ctx: ?*anyopaque,
     credential_provider: ?tls_core.credentials.CredentialProvider,
@@ -195,12 +201,24 @@ pub const Runtime = struct {
             return error.BindFailed;
         }
 
+        // Resolve the actually-bound local address/port (`getsockname`): with
+        // `quic_port = 0` the OS assigns an ephemeral port only known now.
+        var local_address = quic.udp.Address.ip4(.{ 0, 0, 0, 0 }, cfg.quic_port);
+        if (sa_family == posix.AF.INET) {
+            var bound: std.c.sockaddr.in = undefined;
+            var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+            if (std.c.getsockname(fd, @ptrCast(&bound), &bound_len) == 0) {
+                local_address = addressFromSockaddrIn(bound);
+            }
+        }
+
         var runtime = Runtime{
             .allocator = allocator,
             .socket_fd = fd,
             .thread = null,
             .logger = logger,
             .quic_port = cfg.quic_port,
+            .local_address = local_address,
             .request_handler = cfg.request_handler,
             .request_handler_ctx = cfg.request_handler_ctx,
             .credential_provider = cfg.credential_provider,
@@ -296,12 +314,12 @@ pub const Runtime = struct {
                 while (it.next()) |kv| {
                     const entry = kv.value_ptr.*;
                     entry.conn.onTimeout(now);
-                    while (entry.conn.pollTransmit(&out, now)) |datagram| {
-                        self.sendDatagram(entry.peer, datagram);
+                    while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
+                        self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
                     }
                     self.pumpH3(entry, now);
-                    while (entry.conn.pollTransmit(&out, now)) |datagram| {
-                        self.sendDatagram(entry.peer, datagram);
+                    while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
+                        self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
                     }
                     // Reap closed connections and half-open connections that
                     // blew the handshake deadline (spoofed/stalled Initials).
@@ -395,12 +413,21 @@ pub const Runtime = struct {
         // delta tells us whether this datagram authenticated — without trusting
         // its source address.
         const packets_before = entry.conn.metrics.packets_received;
-        entry.conn.ingest(datagram, now) catch {
+        // The path this datagram claims to arrive on. Unauthenticated packets
+        // never create path state or move the active path (`ingestOnPath`
+        // only credits/classifies post-AEAD), so recording it before ingest
+        // is safe regardless of whether it turns out spoofed.
+        const active_before = entry.conn.activePathKey();
+        const ingress_remote = addressFromSockaddrIn(peer);
+        const ingress_path = quic.path.PathKey{ .local = self.local_address, .remote = ingress_remote };
+        var challenge_entropy: [quic.path.path_challenge_len]u8 = undefined;
+        compat.randomBytes(&challenge_entropy);
+        entry.conn.ingestOnPath(datagram, ingress_path, challenge_entropy, now) catch {
             if (freshly_accepted) self.removeConnection(connections, routes, per_ip, found);
             return;
         };
         const authenticated = entry.conn.metrics.packets_received > packets_before;
-        switch (classifyIngest(freshly_accepted, authenticated, !sockaddrInEqual(peer, entry.peer))) {
+        switch (classifyIngest(freshly_accepted, authenticated, !active_before.remote.eql(ingress_remote))) {
             // A just-accepted connection whose first datagram authenticates
             // nothing is an unsolicited or spoofed Initial: drop the half-open
             // state now instead of holding it until the handshake deadline.
@@ -408,10 +435,10 @@ pub const Runtime = struct {
                 self.removeConnection(connections, routes, per_ip, found);
                 return;
             },
-            // An authenticated packet from a source other than the one that
-            // opened the connection is a migration attempt. The native stack
-            // does not rebind (disable_active_migration is advertised), so
-            // record it and keep replying on the original path.
+            // An authenticated packet from a source other than the active path
+            // is a NAT-rebinding/migration attempt; `Connection` itself
+            // decides whether to validate and promote it (`PathManager`), so
+            // this is purely an observability note.
             .migrated => self.noteMigrationEvent(),
             .keep => {},
         }
@@ -422,12 +449,12 @@ pub const Runtime = struct {
         self.maybeIssueSessionTicket(entry);
 
         var out: [2048]u8 = undefined;
-        while (entry.conn.pollTransmit(&out, now)) |response_datagram| {
-            self.sendDatagram(entry.peer, response_datagram);
+        while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
+            self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
         }
         self.pumpH3(entry, now);
-        while (entry.conn.pollTransmit(&out, now)) |response_datagram| {
-            self.sendDatagram(entry.peer, response_datagram);
+        while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
+            self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
         }
     }
 
@@ -505,6 +532,7 @@ pub const Runtime = struct {
             .peer_cid = parsed.scid,
             .tls = backend.backend(),
             .now_us = now,
+            .initial_path = .{ .local = self.local_address, .remote = addressFromSockaddrIn(peer) },
         }) catch {
             allocator.destroy(backend);
             return null;
@@ -519,7 +547,7 @@ pub const Runtime = struct {
             .backend = backend,
             .conn = conn,
             .h3 = H3.initWithSettings(allocator, .server, self.h3_settings),
-            .peer = peer,
+            .admission_source_ip = peer.addr,
             .cid_len = parsed.dcid.len,
             .accepted_at_us = now,
         };
@@ -564,7 +592,7 @@ pub const Runtime = struct {
     ) void {
         if (connections.fetchRemove(handle)) |kv| {
             routes.remove(quic.cid.ConnectionId.init(kv.value.conn.localCid()) catch unreachable);
-            decPerIp(per_ip, kv.value.peer.addr);
+            decPerIp(per_ip, kv.value.admission_source_ip);
             kv.value.deinit(self.allocator);
             self.allocator.destroy(kv.value);
             self.noteConnectionClosed();
@@ -897,8 +925,27 @@ fn quicConfigFrom(cfg: Config) quic.config.Config {
     };
 }
 
-fn sockaddrInEqual(a: std.c.sockaddr.in, b: std.c.sockaddr.in) bool {
-    return a.addr == b.addr and a.port == b.port;
+/// Convert a source/destination IPv4 `sockaddr_in` into the protocol-neutral
+/// `quic.udp.Address` used for `PathKey` construction. `sin_addr`/`sin_port`
+/// are already network-byte-order, so the address octets bit-cast directly
+/// (a host-endian read would byte-swap them on little-endian) and only the
+/// port needs an explicit big-to-native swap.
+fn addressFromSockaddrIn(sa: std.c.sockaddr.in) quic.udp.Address {
+    const octets: [4]u8 = @bitCast(sa.addr);
+    return quic.udp.Address.ip4(octets, std.mem.bigToNative(u16, sa.port));
+}
+
+/// The inverse of `addressFromSockaddrIn`, for sending a `Transmit`'s
+/// destination back out over the IPv4 UDP socket.
+fn sockaddrInFromAddress(addr: quic.udp.Address) std.c.sockaddr.in {
+    var octets: [4]u8 = undefined;
+    @memcpy(&octets, addr.slice());
+    return .{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, addr.port),
+        .addr = @bitCast(octets),
+        .zero = [_]u8{0} ** 8,
+    };
 }
 
 /// Whether a new half-open connection may be admitted given the current global
@@ -1411,6 +1458,52 @@ test "runtime borrows the early-data replay gate independently of the resumption
     const installed = runtime.early_data_replay_gate orelse return error.TestExpectedEqual;
     try testing.expectEqual(gate.ctx, installed.ctx);
     try testing.expectEqual(gate.decideFn, installed.decideFn);
+}
+
+test "runtime resolves the actual bound local address, including an OS-assigned port, from quic_port = 0" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-port0-test");
+
+    // `quic_port = 0` asks the OS for an ephemeral port; every connection's
+    // and PathKey's local half must reflect the address `getsockname`
+    // actually resolved, not the requested `0` (#515 required test: UDP
+    // port-0 local-address resolution round-trips through runtime PathKey
+    // construction).
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+    });
+    defer runtime.deinit();
+
+    try testing.expectEqual(quic.udp.AddressFamily.ip4, runtime.local_address.family);
+    try testing.expectEqualSlices(u8, &[_]u8{ 127, 0, 0, 1 }, runtime.local_address.slice());
+    try testing.expect(runtime.local_address.port != 0);
+    // The configured (requested) port is unaffected; only the resolved
+    // local address reflects what the OS actually bound.
+    try testing.expectEqual(@as(u16, 0), runtime.quic_port);
+}
+
+test "sockaddr_in <-> quic.udp.Address conversion round-trips family, octets, and port" {
+    const original = std.c.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 44_321),
+        .addr = @bitCast([4]u8{ 198, 51, 100, 7 }),
+    };
+    const address = addressFromSockaddrIn(original);
+    try testing.expectEqual(quic.udp.AddressFamily.ip4, address.family);
+    try testing.expectEqualSlices(u8, &[_]u8{ 198, 51, 100, 7 }, address.slice());
+    try testing.expectEqual(@as(u16, 44_321), address.port);
+
+    // Every `Transmit.path.remote` a connection returns is sent through this
+    // exact conversion (`sendDatagram(sockaddrInFromAddress(t.path.remote),
+    // t.bytes)`, never a cached or fixed peer): round-tripping it back must
+    // reproduce the original wire address exactly.
+    const round_tripped = sockaddrInFromAddress(address);
+    try testing.expectEqual(original.family, round_tripped.family);
+    try testing.expectEqual(original.port, round_tripped.port);
+    try testing.expectEqual(original.addr, round_tripped.addr);
 }
 
 test {
