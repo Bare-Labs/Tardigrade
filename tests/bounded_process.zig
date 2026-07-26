@@ -4,6 +4,17 @@ const compat = @import("zig_compat");
 
 pub const default_deadline_ms: u32 = 10_000;
 pub const extended_deadline_ms: u32 = 30_000;
+/// `options.stdin` is written in one blocking `writeStreamingAll` call
+/// before stdout/stderr draining (and its own deadline machinery) starts,
+/// so it is not itself bounded by `deadline_ms` -- a child that never reads
+/// stdin, or fills its own stdout/stderr pipe while waiting on it, could
+/// block this call indefinitely. Capping `stdin` at this size (well under
+/// the smallest realistic default pipe capacity, and at the POSIX
+/// `PIPE_BUF` atomic-write guarantee) keeps the write a single, immediate,
+/// non-blocking kernel buffer copy in practice instead of a real
+/// deadlock risk. Bytes beyond it are a caller bug, not a runtime
+/// condition to recover from -- see `run`'s `std.debug.assert`.
+pub const max_stdin_len: usize = 4096;
 
 pub const Outcome = union(enum) {
     normal_exit: u8,
@@ -23,6 +34,26 @@ pub const Options = struct {
     deadline_ms: u32 = default_deadline_ms,
     accepted_exit_codes: []const u8 = &.{0},
     cwd: std.process.Child.Cwd = .inherit,
+    /// Bytes written to the child's stdin immediately after spawn, then the
+    /// pipe is closed so the child sees EOF. `null` (the default) leaves
+    /// stdin closed from the start, matching every existing caller. Must
+    /// be at most `max_stdin_len` -- see that constant's doc comment for
+    /// why this write is not itself deadline-bounded.
+    stdin: ?[]const u8 = null,
+    /// Bounded pause between writing `stdin` and closing the pipe. Some
+    /// protocols (e.g. a TLS post-handshake NewSessionTicket, sent after the
+    /// application response the child already read) deliver trailing data
+    /// asynchronously; closing stdin the instant the write returns can race
+    /// a peer process into shutting down before that trailing data arrives.
+    /// `0` (the default) closes immediately, matching every existing caller.
+    stdin_close_delay_ms: u32 = 0,
+    /// Child environment. `null` (the default) inherits this process's own
+    /// environment, matching every existing caller; pass an explicit map to
+    /// run the child under a modified/constructed environment (e.g. a
+    /// fixture-validation subcommand that needs specific `TARDIGRADE_*`
+    /// variables set) while keeping the same bounded spawn/wait/reap
+    /// contract as every other case this helper drives.
+    environ_map: ?*const std.process.Environ.Map = null,
 };
 
 pub const Result = struct {
@@ -59,6 +90,7 @@ pub const Result = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Error!Result {
+    if (options.stdin) |input| std.debug.assert(input.len <= max_stdin_len);
     const io = compat.io();
     const deadline_end: ?std.Io.Clock.Timestamp = if (options.deadline_ms == 0)
         null
@@ -69,17 +101,30 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
         });
     var child = std.process.spawn(io, .{
         .argv = options.argv,
-        .stdin = .ignore,
+        .stdin = if (options.stdin != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = options.cwd,
         .pgid = 0,
+        .environ_map = options.environ_map,
     }) catch |err| {
         return launchFailureResult(allocator, "launch failed: {s}", .{@errorName(err)});
     };
     const pgid = child.id.?;
     var reaped = false;
     defer if (!reaped) reapProcessGroup(&child, pgid);
+
+    if (options.stdin) |input| {
+        const stdin = child.stdin.?;
+        stdin.writeStreamingAll(io, input) catch |err| {
+            reapProcessGroup(&child, pgid);
+            reaped = true;
+            return launchFailureResult(allocator, "stdin write failed: {s}", .{@errorName(err)});
+        };
+        if (options.stdin_close_delay_ms > 0) compat.sleepNs(@as(u64, options.stdin_close_delay_ms) * std.time.ns_per_ms);
+        stdin.close(io);
+        child.stdin = null;
+    }
 
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
