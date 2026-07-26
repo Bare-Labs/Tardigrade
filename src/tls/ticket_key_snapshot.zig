@@ -10,6 +10,7 @@ const crypto = @import("crypto");
 const ticket_protection = @import("ticket_protection.zig");
 
 const provider = crypto.provider;
+const owner_only_permissions: std.Io.File.Permissions = .fromMode(0o600);
 
 const ZeroingAllocator = struct {
     child: std.mem.Allocator,
@@ -62,6 +63,15 @@ pub const LoadError = error{
     OutOfMemory,
 };
 
+pub const ReservationValidator = struct {
+    ctx: *anyopaque,
+    validateFn: *const fn (*anyopaque, u64, []const ticket_protection.KeyConfig) ticket_protection.SnapshotError!void,
+
+    pub fn validate(self: ReservationValidator, generation: u64, configs: []const ticket_protection.KeyConfig) ticket_protection.SnapshotError!void {
+        try self.validateFn(self.ctx, generation, configs);
+    }
+};
+
 pub const OwnedSnapshot = struct {
     allocator: std.mem.Allocator,
     generation: u64,
@@ -93,7 +103,16 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) LoadError!Ow
     return parse(allocator, bytes);
 }
 
-pub fn reserveNonceLeasesInFile(allocator: std.mem.Allocator, path: []const u8, snapshot: *OwnedSnapshot) LoadError!void {
+pub fn reserveNonceLeasesInFile(allocator: std.mem.Allocator, path: []const u8, snapshot: *OwnedSnapshot, validator: ReservationValidator) (LoadError || ticket_protection.SnapshotError)!void {
+    var lock = try acquireReservationLock(allocator, path);
+    defer lock.release();
+
+    const current = try loadFromFile(allocator, path);
+    snapshot.deinit();
+    snapshot.* = current;
+
+    try validator.validate(snapshot.generation, snapshot.configs);
+
     var changed = false;
     for (snapshot.configs) |*cfg| {
         if (cfg.nonce_lease) |*lease| {
@@ -107,6 +126,8 @@ pub fn reserveNonceLeasesInFile(allocator: std.mem.Allocator, path: []const u8, 
     }
     if (!changed) return;
 
+    try validator.validate(snapshot.generation, snapshot.configs);
+
     var out = std.array_list.Managed(u8).init(allocator);
     defer {
         std.crypto.secureZero(u8, out.items);
@@ -114,16 +135,66 @@ pub fn reserveNonceLeasesInFile(allocator: std.mem.Allocator, path: []const u8, 
     }
     try serialize(&out, snapshot);
 
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.{d}.tmp", .{ path, std.c.getpid() });
     defer allocator.free(tmp_path);
     compat.cwd().deleteFile(tmp_path) catch {};
+    const replacement_permissions = try restrictiveReplacementPermissions(path);
     {
-        var file = compat.cwd().createFile(tmp_path, .{ .truncate = true }) catch return error.SnapshotUnwritable;
+        var file = compat.cwd().createFile(tmp_path, .{
+            .truncate = true,
+            .exclusive = true,
+            .permissions = replacement_permissions,
+        }) catch return error.SnapshotUnwritable;
         defer file.close();
         file.writeAll(out.items) catch return error.SnapshotUnwritable;
         file.flush() catch return error.SnapshotUnwritable;
     }
     compat.cwd().rename(tmp_path, compat.cwd(), path) catch return error.SnapshotUnwritable;
+    syncParentDirectory(path) catch return error.SnapshotUnwritable;
+}
+
+const ReservationLock = struct {
+    file: compat.FileCompat,
+    path: []const u8,
+    allocator: std.mem.Allocator,
+
+    fn release(self: *ReservationLock) void {
+        self.file.close();
+        self.allocator.free(self.path);
+    }
+};
+
+fn acquireReservationLock(allocator: std.mem.Allocator, path: []const u8) LoadError!ReservationLock {
+    const lock_path = std.fmt.allocPrint(allocator, "{s}.lock", .{path}) catch return error.OutOfMemory;
+    errdefer allocator.free(lock_path);
+    const file = compat.cwd().createFile(lock_path, .{
+        .read = true,
+        .truncate = false,
+        .permissions = owner_only_permissions,
+        .lock = .exclusive,
+    }) catch return error.SnapshotUnwritable;
+    return .{ .file = file, .path = lock_path, .allocator = allocator };
+}
+
+fn restrictiveReplacementPermissions(path: []const u8) LoadError!std.Io.File.Permissions {
+    if (comptime @hasDecl(std.Io.File.Permissions, "toMode")) {
+        const stat = compat.cwd().statFile(path) catch return error.SnapshotUnreadable;
+        const mode = stat.permissions.toMode() & 0o777;
+        if ((mode & 0o077) != 0) return error.SnapshotUnwritable;
+        return .fromMode(mode);
+    }
+    return owner_only_permissions;
+}
+
+fn syncParentDirectory(path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse ".";
+    var dir = if (std.fs.path.isAbsolute(parent))
+        compat.wrapDir(try std.Io.Dir.openDirAbsolute(compat.io(), parent, .{}))
+    else
+        try compat.cwd().openDir(parent, .{});
+    defer dir.close();
+    var parent_file = compat.FileCompat{ .file = .{ .handle = dir.dir.handle, .flags = .{ .nonblocking = false } } };
+    try parent_file.flush();
 }
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) LoadError!OwnedSnapshot {

@@ -512,6 +512,29 @@ pub const ReloadableKeyRing = struct {
         }
     }
 
+    pub fn validateInstallCandidate(self: *ReloadableKeyRing, replacement: *Snapshot) SnapshotError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.current) |current| {
+            if (replacement.generation != 0 and replacement.generation <= current.generation) {
+                self.record(.{ .snapshot_rejected = .stale_generation });
+                return error.StaleSnapshotGeneration;
+            }
+        }
+        if (replacement.generation == std.math.maxInt(u64)) {
+            self.record(.{ .snapshot_rejected = .generation_overflow });
+            return error.GenerationOverflow;
+        }
+        self.validateReplacementLocked(replacement) catch |err| {
+            self.record(.{ .snapshot_rejected = snapshotReason(err) });
+            return err;
+        };
+        if (replacement.generation == 0 and self.next_generation == std.math.maxInt(u64)) {
+            self.record(.{ .snapshot_rejected = .generation_overflow });
+            return error.GenerationOverflow;
+        }
+    }
+
     pub fn acquireCurrent(self: *ReloadableKeyRing) ?*Snapshot {
         self.mutex.lock();
         defer self.mutex.unlock();

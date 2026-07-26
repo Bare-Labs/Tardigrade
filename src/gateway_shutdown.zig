@@ -133,6 +133,31 @@ pub fn hotReloadConfig(
             return;
         }
     }
+    {
+        var current_lease = worker_ctx.config_store.acquire();
+        const persistent_ticket_reload_active = current_lease.cfg.tls_native_ticket_keys_path.len > 0 and cfg_ptr.tls_native_ticket_keys_path.len > 0;
+        const tls_policy_changed = !std.meta.eql(
+            gprotocol_policy.listenerPolicyFromConfig(current_lease.cfg),
+            gprotocol_policy.listenerPolicyFromConfig(cfg_ptr),
+        );
+        const native_credential_config_changed = applianceCredentialConfigChanged(current_lease.cfg, cfg_ptr);
+        current_lease.release();
+        if (persistent_ticket_reload_active and (tls_policy_changed or native_credential_config_changed)) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "persistent ticket keys with TLS protocol/credential changes require restart", .{}) catch "persistent ticket-key reload requires restart";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.metrics_mutex.lock();
+            state.metrics.recordTicketKeyReload(.reload_rejected);
+            state.metrics_mutex.unlock();
+            state.logger.warn(null, "config reload rejected: persistent native ticket-key reload cannot be combined with TLS protocol policy or credential configuration changes; restart to apply the combined change atomically", .{});
+            return;
+        }
+    }
     if (worker_ctx.tls) |tls| {
         tls.updateProtocolPolicy(gprotocol_policy.listenerPolicyFromConfig(cfg_ptr)) catch |err| {
             worker_ctx.config_store.destroyVersion(prepared_version);

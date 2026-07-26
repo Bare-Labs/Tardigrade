@@ -202,6 +202,18 @@ pub const Runtime = struct {
         self.persistent_snapshot_fingerprint = fingerprint;
     }
 
+    fn validatePersistentTicketKeys(
+        self: *Runtime,
+        generation: u64,
+        configs: []const ticket_protection.KeyConfig,
+    ) ticket_protection.SnapshotError!void {
+        if (self.config.stateless_ticket_key_source != .persistent) return error.StaleSnapshotGeneration;
+        const keyring = if (self.keyring) |*keyring| keyring else return error.TooManyKeys;
+        const snapshot = try ticket_protection.Snapshot.build(self.allocator, configs, generation, self.provider.capabilities());
+        defer snapshot.release();
+        try keyring.validateInstallCandidate(snapshot);
+    }
+
     pub fn loadPersistentTicketKeysFromFile(self: *Runtime, path: []const u8) (ticket_key_snapshot.LoadError || ticket_protection.SnapshotError)!void {
         var loaded = try ticket_key_snapshot.loadFromFile(self.allocator, path);
         defer loaded.deinit();
@@ -209,7 +221,11 @@ pub const Runtime = struct {
         if (self.persistent_snapshot_fingerprint) |accepted| {
             if (std.mem.eql(u8, &accepted, &loaded_fingerprint)) return;
         }
-        try ticket_key_snapshot.reserveNonceLeasesInFile(self.allocator, path, &loaded);
+        try self.validatePersistentTicketKeys(loaded.generation, loaded.configs);
+        try ticket_key_snapshot.reserveNonceLeasesInFile(self.allocator, path, &loaded, .{
+            .ctx = self,
+            .validateFn = validatePersistentTicketKeysForReservation,
+        });
         try self.installPersistentTicketKeys(loaded.generation, loaded.configs);
     }
 
@@ -563,6 +579,15 @@ fn sampleClientTicket(allocator: std.mem.Allocator, ticket: []const u8, sni: []c
     return state;
 }
 
+fn validatePersistentTicketKeysForReservation(
+    ctx: *anyopaque,
+    generation: u64,
+    configs: []const ticket_protection.KeyConfig,
+) ticket_protection.SnapshotError!void {
+    const runtime: *Runtime = @ptrCast(@alignCast(ctx));
+    try runtime.validatePersistentTicketKeys(generation, configs);
+}
+
 fn fingerprintPersistentTicketKeys(generation: u64, configs: []const ticket_protection.KeyConfig) [32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     defer crypto.secrets.secureZero(std.mem.asBytes(&hasher));
@@ -589,10 +614,6 @@ fn fingerprintPersistentTicketKeys(generation: u64, configs: []const ticket_prot
         if (cfg.nonce_lease) |lease| {
             hasher.update(&[_]u8{1});
             hasher.update(&lease.prefix);
-            std.mem.writeInt(u64, &int_buf, lease.start, .big);
-            hasher.update(&int_buf);
-            std.mem.writeInt(u64, &int_buf, lease.end_exclusive, .big);
-            hasher.update(&int_buf);
         } else {
             hasher.update(&[_]u8{0});
         }
@@ -955,8 +976,13 @@ test "#512 persistent file load durably advances nonce lease across sequential r
         \\{"version":1,"generation":1,"keys":[{"id":"30303030303030303030303030303030","aead":"aes_128_gcm","key":"d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0","not_before_unix_ms":1000,"encrypt_until_unix_ms":5000,"decrypt_until_unix_ms":20000,"nonce_lease":{"prefix":"09000000","start":0,"end_exclusive":1}}]}
     ;
     try compat.cwd().writeFile(.{ .sub_path = path, .data = json });
+    if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
+        var file = try compat.cwd().openFile(path, .{ .mode = .read_write });
+        defer file.close();
+        if (std.c.fchmod(file.file.handle, 0o600) != 0) return error.PermissionDenied;
+    }
     defer compat.cwd().deleteFile(path) catch {};
-    defer compat.cwd().deleteFile(".zig-cache/persistent-ticket-lease-reservation-test.json.tmp") catch {};
+    defer compat.cwd().deleteFile(".zig-cache/persistent-ticket-lease-reservation-test.json.lock") catch {};
 
     const key = testTicketKey(0x30, 0xd0);
     var state = try sampleServerState(std.testing.allocator, "persistent-file-restart.test");
@@ -998,6 +1024,45 @@ test "#512 persistent file load durably advances nonce lease across sequential r
     var identity_b = try runtime_b.createIdentity(&state, clock.now_ms, &scratch_b);
     try expectTicketKeyId(identity_b.slice(), &key.id);
     try expectTicketNonceCounter(identity_b.slice(), 2);
+    if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
+        const stat = try compat.cwd().statFile(path);
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
+    }
+}
+
+test "#512 invalid persistent ticket-key candidate does not mutate durable lease state" {
+    var clock = TestClock{ .now_ms = 1_000 };
+    const path = ".zig-cache/persistent-ticket-invalid-reservation-test.json";
+    const json =
+        \\{"version":1,"generation":1,"keys":[{"id":"31313131313131313131313131313131","aead":"aes_128_gcm","key":"d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1","not_before_unix_ms":1000,"encrypt_until_unix_ms":5000,"decrypt_until_unix_ms":20000,"nonce_lease":{"prefix":"0a000000","start":0,"end_exclusive":1}},{"id":"31313131313131313131313131313131","aead":"aes_128_gcm","key":"d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2","not_before_unix_ms":1000,"encrypt_until_unix_ms":5000,"decrypt_until_unix_ms":20000,"nonce_lease":{"prefix":"0b000000","start":0,"end_exclusive":1}}]}
+    ;
+    try compat.cwd().writeFile(.{ .sub_path = path, .data = json });
+    if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
+        var file = try compat.cwd().openFile(path, .{ .mode = .read_write });
+        defer file.close();
+        if (std.c.fchmod(file.file.handle, 0o600) != 0) return error.PermissionDenied;
+    }
+    defer compat.cwd().deleteFile(path) catch {};
+    defer compat.cwd().deleteFile(".zig-cache/persistent-ticket-invalid-reservation-test.json.lock") catch {};
+
+    const before = try compat.cwd().readFileAlloc(std.testing.allocator, path, ticket_key_snapshot.max_snapshot_bytes);
+    defer std.testing.allocator.free(before);
+
+    var entropy = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless, .stateless_ticket_key_source = .persistent },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    try std.testing.expectError(error.DuplicateKeyId, runtime.loadPersistentTicketKeysFromFile(path));
+
+    const after = try compat.cwd().readFileAlloc(std.testing.allocator, path, ticket_key_snapshot.max_snapshot_bytes);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
 }
 
 test "#512 persistent stateless runtime issues while publishing adjacent rotations concurrently" {

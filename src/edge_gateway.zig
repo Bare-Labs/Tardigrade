@@ -3015,7 +3015,6 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                         cfg.request_limits.effectiveHeaderTimeout();
                     setConnTimeouts(conn, body_timeout_ms, write_timeout_ms);
                 }
-                const fallback_old_pending_len = session.pending_len;
                 const total_read = try gconn.readHttpRequest(conn, pending_buf, &session.pending_len);
                 if (total_read == 0) return;
                 if (cfg.max_connection_memory_bytes > 0 and total_read > cfg.max_connection_memory_bytes) {
@@ -3030,7 +3029,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                     return;
                 };
                 const bytes_consumed = parse_result.bytes_consumed;
-                const request_transport_early = h1ConsumeRequestEarlyProvenance(session, fallback_old_pending_len, total_read, bytes_consumed, h2LastReadEarlyPrefixLenBounded(conn, total_read));
+                const request_transport_early = h1ConsumeRequestEarlyProvenance(session, old_pending_len, total_read, bytes_consumed, h2LastReadEarlyPrefixLenBounded(conn, total_read));
                 if (bytes_consumed < total_read) {
                     const remaining = total_read - bytes_consumed;
                     std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
@@ -3744,6 +3743,76 @@ test "#510 H1 request context derives transport early provenance from connection
     );
 
     try std.testing.expectEqual(@as(u16, @intFromEnum(http.Status.too_early)), outcome.terminal_status);
+    try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.handler_calls);
+}
+
+test "#510 H1 streaming pre-read fallback preserves head-read early provenance before safety gate" {
+    const allocator = std.testing.allocator;
+    const wire = "POST /work HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\n\r\n";
+    var session = ConnectionSession{};
+    var pending_buf: [512]u8 = undefined;
+
+    const old_pending_len = session.pending_len;
+    @memcpy(pending_buf[0..wire.len], wire);
+    session.pending_len = wire.len;
+    const total_read = wire.len;
+
+    var parsed = try http.Request.parse(allocator, pending_buf[0..total_read], MAX_REQUEST_SIZE);
+    defer parsed.request.deinit();
+    const request_transport_early = h1ConsumeRequestEarlyProvenance(
+        &session,
+        old_pending_len,
+        total_read,
+        parsed.bytes_consumed,
+        wire.len,
+    );
+    try std.testing.expect(request_transport_early);
+
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+            .early_data = .replay_safe,
+            .proxy_early_data = .rfc8470,
+        },
+    };
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = &.{};
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    var ctx = http.request_context.RequestContext.init(allocator, "req-head-fallback-early", "127.0.0.1");
+    ctx.early_data.transport_early = request_transport_early;
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-head-fallback-early", 0);
+    var keep_alive = false;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const outcome = try executeH1PostPreflightOrchestration(
+        {},
+        allocator,
+        &output.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &parsed.request,
+        "req-head-fallback-early",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1CountingPostPreflightHooks{ .effects = &effects },
+    );
+
+    try std.testing.expectEqual(@as(u16, @intFromEnum(http.Status.too_early)), outcome.terminal_status);
+    try std.testing.expectEqual(@as(usize, 0), effects.mirror_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.auth_calls);
+    try std.testing.expectEqual(@as(usize, 0), effects.rate_limit_mutations);
     try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
     try std.testing.expectEqual(@as(usize, 0), effects.handler_calls);
 }
