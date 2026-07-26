@@ -286,29 +286,89 @@ const retry_integrity_key_v1 = [16]u8{
 const retry_integrity_nonce_v1 = [12]u8{
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 };
+/// Largest Retry body (header + token, excluding the tag) this module builds
+/// a pseudo-packet for.
+const max_retry_pseudo_body_len = 1500;
+
+/// Compute the RFC 9001 §5.8 Retry integrity tag over the pseudo-packet
+/// (`ODCID length || ODCID || Retry packet without tag`). Shared by
+/// `writeRetryV1` (compute) and `verifyRetryIntegrity` (compare), so there is
+/// exactly one implementation of the AAD construction.
+fn computeRetryIntegrityTag(original_dcid: []const u8, retry_body: []const u8) error{ InvalidConnectionId, RetryBodyTooLong }![retry_integrity_tag_len]u8 {
+    if (original_dcid.len > max_cid_len) return error.InvalidConnectionId;
+    if (retry_body.len > max_retry_pseudo_body_len) return error.RetryBodyTooLong;
+    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+
+    var pseudo: [1 + max_cid_len + max_retry_pseudo_body_len]u8 = undefined;
+    pseudo[0] = @intCast(original_dcid.len);
+    @memcpy(pseudo[1..][0..original_dcid.len], original_dcid);
+    @memcpy(pseudo[1 + original_dcid.len ..][0..retry_body.len], retry_body);
+    const aad = pseudo[0 .. 1 + original_dcid.len + retry_body.len];
+
+    var tag: [retry_integrity_tag_len]u8 = undefined;
+    var empty_out: [0]u8 = undefined;
+    Aes128Gcm.encrypt(&empty_out, &tag, "", aad, retry_integrity_nonce_v1, retry_integrity_key_v1);
+    return tag;
+}
 
 /// Verify the integrity tag of a parsed Retry packet against the DCID the
 /// client sent in its first Initial (RFC 9001 §5.8). `retry_packet` is the
 /// full packet including the tag.
 pub fn verifyRetryIntegrity(retry_packet: []const u8, original_dcid: []const u8) bool {
     if (retry_packet.len < retry_integrity_tag_len) return false;
-    if (original_dcid.len > max_cid_len) return false;
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
-
-    // Retry pseudo-packet: ODCID length + ODCID + Retry packet without tag.
-    var pseudo: [1 + max_cid_len + 1500]u8 = undefined;
     const body_len = retry_packet.len - retry_integrity_tag_len;
-    if (1 + original_dcid.len + body_len > pseudo.len) return false;
-    pseudo[0] = @intCast(original_dcid.len);
-    @memcpy(pseudo[1..][0..original_dcid.len], original_dcid);
-    @memcpy(pseudo[1 + original_dcid.len ..][0..body_len], retry_packet[0..body_len]);
-    const aad = pseudo[0 .. 1 + original_dcid.len + body_len];
-
-    var expected: [retry_integrity_tag_len]u8 = undefined;
-    var empty_out: [0]u8 = undefined;
-    Aes128Gcm.encrypt(&empty_out, &expected, "", aad, retry_integrity_nonce_v1, retry_integrity_key_v1);
+    const expected = computeRetryIntegrityTag(original_dcid, retry_packet[0..body_len]) catch return false;
     const received = retry_packet[body_len..][0..retry_integrity_tag_len];
     return std.crypto.timing_safe.eql([retry_integrity_tag_len]u8, expected, received.*);
+}
+
+/// Write a complete QUIC v1 Retry packet (RFC 9000 §17.2.5): first byte, the
+/// fixed `version = 1`, the Retry packet's DCID (the client's Initial SCID)
+/// and SCID (the server-chosen Retry SCID), the opaque token, and the
+/// trailing RFC 9001 §5.8 integrity tag computed over `original_dcid` and
+/// everything written before the tag. Retry packets are never coalesced and
+/// carry no packet number.
+pub fn writeRetryV1(
+    original_dcid: []const u8,
+    client_scid: []const u8,
+    retry_scid: []const u8,
+    token: []const u8,
+    out: []u8,
+) error{ BufferTooShort, InvalidConnectionId, RetryBodyTooLong, EmptyToken, RetryScidNotDistinct }![]const u8 {
+    if (client_scid.len > max_cid_len or retry_scid.len > max_cid_len) return error.InvalidConnectionId;
+    // A Retry with no token defeats the point of Retry (there is nothing for
+    // a conforming client to echo back), and a Retry SCID equal to the
+    // client's original DCID is indistinguishable from "no Retry happened" —
+    // #387 requires a server-chosen SCID distinct from it.
+    if (token.len == 0) return error.EmptyToken;
+    if (std.mem.eql(u8, original_dcid, retry_scid)) return error.RetryScidNotDistinct;
+
+    var pos: usize = 0;
+    const header_len = 1 + 4 + 1 + client_scid.len + 1 + retry_scid.len + token.len;
+    if (out.len < header_len + retry_integrity_tag_len) return error.BufferTooShort;
+
+    // Long header, fixed bit set, type = 0b11 (Retry); the low 4 bits are
+    // unused for Retry and may be any value on send (RFC 9000 §17.2.5).
+    out[pos] = 0x80 | 0x40 | (0b11 << 4);
+    pos += 1;
+    std.mem.writeInt(u32, out[pos..][0..4], quic_v1, .big);
+    pos += 4;
+    // Retry DCID = the client's Initial SCID; Retry SCID = our fresh CID.
+    out[pos] = @intCast(client_scid.len);
+    pos += 1;
+    @memcpy(out[pos..][0..client_scid.len], client_scid);
+    pos += client_scid.len;
+    out[pos] = @intCast(retry_scid.len);
+    pos += 1;
+    @memcpy(out[pos..][0..retry_scid.len], retry_scid);
+    pos += retry_scid.len;
+    @memcpy(out[pos..][0..token.len], token);
+    pos += token.len;
+
+    const tag = try computeRetryIntegrityTag(original_dcid, out[0..pos]);
+    @memcpy(out[pos..][0..retry_integrity_tag_len], &tag);
+    pos += retry_integrity_tag_len;
+    return out[0..pos];
 }
 
 const testing = std.testing;
@@ -439,6 +499,67 @@ test "Retry packet parses and RFC 9001 A.4 integrity tag verifies" {
     var tampered = retry;
     tampered[tampered.len - 1] ^= 1;
     try testing.expect(!verifyRetryIntegrity(&tampered, &odcid));
+}
+
+test "writeRetryV1 round-trips through parsePacket and verifyRetryIntegrity" {
+    const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const client_scid = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8 };
+    const retry_scid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4 };
+    const token = "opaque-retry-token";
+
+    var buf: [128]u8 = undefined;
+    const written = try writeRetryV1(&odcid, &client_scid, &retry_scid, token, &buf);
+
+    const parsed = try parsePacket(written, 8);
+    try testing.expectEqual(PacketKind.retry, parsed.kind);
+    try testing.expectEqual(quic_v1, parsed.version);
+    try testing.expectEqualSlices(u8, &client_scid, parsed.dcid);
+    try testing.expectEqualSlices(u8, &retry_scid, parsed.scid);
+    try testing.expectEqualStrings(token, parsed.retry_token);
+    try testing.expect(verifyRetryIntegrity(written, &odcid));
+
+    // Wrong ODCID must fail integrity verification.
+    try testing.expect(!verifyRetryIntegrity(written, &client_scid));
+
+    // Any tamper to the written packet must fail integrity verification.
+    var tampered: [128]u8 = undefined;
+    @memcpy(tampered[0..written.len], written);
+    tampered[written.len - 1] ^= 0x01;
+    try testing.expect(!verifyRetryIntegrity(tampered[0..written.len], &odcid));
+}
+
+test "writeRetryV1 rejects an empty token and a Retry SCID matching the client's original DCID" {
+    const odcid = [_]u8{0x01} ** 8;
+    const client_scid = [_]u8{0x02} ** 8;
+    const retry_scid = [_]u8{0x03} ** 8;
+    var buf: [128]u8 = undefined;
+
+    // An empty token gives a conforming client nothing to echo back.
+    try testing.expectError(error.EmptyToken, writeRetryV1(&odcid, &client_scid, &retry_scid, "", &buf));
+
+    // A Retry SCID identical to the client's original DCID is indistinguishable
+    // from no Retry having happened at all — the server must choose a fresh one.
+    try testing.expectError(error.RetryScidNotDistinct, writeRetryV1(&odcid, &client_scid, &odcid, "tok", &buf));
+}
+
+test "writeRetryV1 rejects oversized connection IDs and short output buffers" {
+    const odcid = [_]u8{0x01} ** 8;
+    const client_scid = [_]u8{0x02} ** 8;
+    const retry_scid = [_]u8{0x03} ** 8;
+    const oversized_cid = [_]u8{0xff} ** (max_cid_len + 1);
+
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.InvalidConnectionId, writeRetryV1(&odcid, &oversized_cid, &retry_scid, "tok", &buf));
+    try testing.expectError(error.InvalidConnectionId, writeRetryV1(&odcid, &client_scid, &oversized_cid, "tok", &buf));
+
+    // A zero-length CID pair still round-trips, but a too-small output buffer
+    // must fail deterministically rather than write a truncated packet.
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.BufferTooShort, writeRetryV1(&odcid, &client_scid, &retry_scid, "tok", &tiny));
+
+    var exact: [1 + 4 + 1 + 8 + 1 + 8 + 3 + retry_integrity_tag_len]u8 = undefined;
+    const written = try writeRetryV1(&odcid, &client_scid, &retry_scid, "tok", &exact);
+    try testing.expectEqual(exact.len, written.len);
 }
 
 test "version negotiation packet exposes the version list" {
