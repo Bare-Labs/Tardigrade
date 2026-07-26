@@ -3146,7 +3146,7 @@ test "driver: explicit zero-rtt stream provenance mark stays sticky after one-rt
     try pair.server.markStreamZeroRtt(id);
     try testing.expect(pair.server.streamTransportEarly(id));
 
-    try pair.server.applyFrame(.application, .{ .stream = .{ .id = id, .offset = 0, .data = "late", .fin = true } }, pair.now_us);
+    try pair.server.applyFrame(.application, .{ .stream = .{ .id = id, .offset = 0, .data = "late", .fin = true } }, TestPair.server_path, pair.now_us);
     try testing.expect(pair.server.streamTransportEarly(id));
     try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
 
@@ -4308,7 +4308,7 @@ fn expectConnectionRejectsExtraCryptoWhileClientAuthPending(async_sign: bool) !v
     const stray = [_]u8{@intFromEnum(tls_core.handshake.MessageType.finished)};
     const handshake_index = @intFromEnum(EncryptionLevel.handshake);
     const offset = pair.client.adapter.reassembler.streams[handshake_index].consumed_offset;
-    try pair.client.applyFrame(.handshake, .{ .crypto = .{ .offset = offset, .data = &stray } }, pair.now_us);
+    try pair.client.applyFrame(.handshake, .{ .crypto = .{ .offset = offset, .data = &stray } }, TestPair.client_path, pair.now_us);
 
     try testing.expect(!pair.client.authPending());
     try testing.expectEqual(tls_handshake.HandshakeError.UnexpectedHandshakeMessage, pair.client.handshakeFailure().?);
