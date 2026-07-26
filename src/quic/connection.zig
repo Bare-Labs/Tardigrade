@@ -1025,14 +1025,11 @@ pub const Connection = struct {
             }
         }
         self.initial_packet_processed = true;
-        if (level == .handshake) {
-            if (self.role == .server) self.paths.markActiveValidated();
-            if (!self.processed_handshake_packet) {
-                self.processed_handshake_packet = true;
-                // Server: receiving a Handshake packet proves the client got
-                // the ServerHello; Initial keys are done (RFC 9001 §4.9.1).
-                if (self.role == .server) self.discardKeys(.initial);
-            }
+        if (level == .handshake and !self.processed_handshake_packet) {
+            self.processed_handshake_packet = true;
+            // Server: receiving a Handshake packet proves the client got
+            // the ServerHello; Initial keys are done (RFC 9001 §4.9.1).
+            if (self.role == .server) self.discardKeys(.initial);
         }
 
         // Authenticated path state (#251/#515): only a packet whose AEAD open
@@ -1046,6 +1043,15 @@ pub const Connection = struct {
         switch (self.paths.onDatagram(ingress_path, bytes.len, challenge_entropy, now_us)) {
             .probe => |data| self.queueCandidateChallenge(ingress_path, data),
             .on_active_path, .probing, .validated_pending_promotion, .blocked => {},
+        }
+        if (level == .handshake and self.role == .server) {
+            // RFC 9001 §4.9.1 / RFC 9000 §8.1: receiving an authenticated
+            // Handshake packet proves the client owns the exact address it
+            // arrived on — never implicitly "whatever path is currently
+            // active". `onDatagram` above has already classified/tracked
+            // `ingress_path` (creating it as a candidate if it differs from
+            // the active path), so this lifts only that path's limit.
+            self.paths.markValidatedOnPath(ingress_path);
         }
 
         var ack_eliciting = false;
@@ -1102,7 +1108,7 @@ pub const Connection = struct {
                     self.startClose(.{ .error_code = error_crypto_buffer_exceeded, .is_application = false, .local = true }, "crypto buffer", now_us);
                     return;
                 };
-                self.afterHandshakeProgress(now_us);
+                self.afterHandshakeProgress(ingress_path, now_us);
             },
             .stream => |sf| {
                 if (level != .application) {
@@ -1489,7 +1495,10 @@ pub const Connection = struct {
             self.startClose(.{ .error_code = error_crypto_buffer_exceeded, .is_application = false, .local = true }, "crypto buffer", now_us);
             return;
         };
-        self.afterHandshakeProgress(now_us);
+        // No freshly authenticated datagram is associated with this resumed
+        // step (it advances a previously-parked operation), so there is no
+        // better path to attribute address validation to than the active one.
+        self.afterHandshakeProgress(null, now_us);
     }
 
     pub fn emitNewSessionTicket(
@@ -1599,7 +1608,7 @@ pub const Connection = struct {
         if (appended != expected_bytes) return error.HandshakeBufferOverflow;
     }
 
-    fn afterHandshakeProgress(self: *Connection, now_us: u64) void {
+    fn afterHandshakeProgress(self: *Connection, ingress_path: ?quic_path.PathKey, now_us: u64) void {
         if (self.handshake_complete or !self.handshake.isComplete()) return;
         self.handshake_complete = true;
         self.events.emit(.handshake_complete);
@@ -1629,8 +1638,17 @@ pub const Connection = struct {
 
         if (self.role == .server) {
             // Handshake completion validates the client's address and
-            // confirms the handshake for the server (RFC 9001 §4.1.2).
-            self.paths.markActiveValidated();
+            // confirms the handshake for the server (RFC 9001 §4.1.2) — the
+            // exact path this progress is attributed to, never implicitly
+            // "whatever is active" (a candidate path can complete the
+            // handshake before it is promoted). Async-resumed progress with
+            // no associated datagram (`ingress_path == null`) has no better
+            // path to attribute this to than the active one.
+            if (ingress_path) |path| {
+                self.paths.markValidatedOnPath(path);
+            } else {
+                self.paths.markActiveValidated();
+            }
             self.handshake_confirmed = true;
             self.handshake_done_pending = true;
             self.events.emit(.handshake_confirmed);
@@ -4087,6 +4105,177 @@ test "connection: a host migration with no fresh peer CID leaves the old path ac
     try testing.expectEqual(@as(u64, 1), pair.server.pathMetrics().migrations_blocked_no_peer_cid);
 }
 
+test "connection: a Handshake packet arriving on a different tuple validates only that tuple, not the old active path" {
+    const allocator = testing.allocator;
+    var pair = try MigrationPair.init(allocator, .full);
+    defer pair.deinit(allocator);
+    // A non-Retry server's initial path starts amplification-limited.
+    try testing.expect(!pair.server.paths.activePath().anti_amplification.validated);
+
+    // The client's very first (Initial) datagram arrives normally, on the
+    // server's real active path; everything the client sends after that
+    // (including the Handshake-level flight carrying Finished, which
+    // completes the server's handshake) is delivered on a distinct
+    // alternate tuple instead, simulating a rebind mid-handshake.
+    const alternate = quic_path.PathKey{
+        .local = TestPair.server_path.local,
+        .remote = quic_udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_777),
+    };
+    var first_from_client = true;
+    var rounds: usize = 0;
+    while (rounds < 64 and !(pair.client.isEstablished() and pair.server.isEstablished())) : (rounds += 1) {
+        var progressed = false;
+        var buf: [2048]u8 = undefined;
+        while (pair.client.pollTransmitOnPath(&buf, pair.now_us)) |t| {
+            var captured: [2048]u8 = undefined;
+            @memcpy(captured[0..t.bytes.len], t.bytes);
+            const ingress = if (first_from_client) TestPair.server_path else alternate;
+            first_from_client = false;
+            try pair.server.ingestOnPath(captured[0..t.bytes.len], ingress, TestPair.test_challenge_entropy, pair.now_us);
+            progressed = true;
+            pair.now_us += 500;
+        }
+        while (pair.server.pollTransmitOnPath(&buf, pair.now_us)) |t| {
+            var captured: [2048]u8 = undefined;
+            @memcpy(captured[0..t.bytes.len], t.bytes);
+            const ingress = quic_path.PathKey{ .local = t.path.remote, .remote = t.path.local };
+            try pair.client.ingestOnPath(captured[0..t.bytes.len], ingress, TestPair.test_challenge_entropy, pair.now_us);
+            progressed = true;
+            pair.now_us += 500;
+        }
+        if (!progressed) break;
+    }
+
+    // The redirected datagram(s) really did carry the Handshake-level
+    // Finished: the server's handshake completed.
+    try testing.expect(pair.server.isEstablished());
+    // The active path never changed (ordinary Handshake-level traffic never
+    // promotes anything) ...
+    try testing.expect(pair.server.activePathKey().eql(TestPair.server_path));
+    // ... and, critically, it was never validated by a packet that actually
+    // authenticated on a *different* tuple.
+    try testing.expect(!pair.server.paths.activePath().anti_amplification.validated);
+    // The alternate tuple this traffic actually authenticated on is the one
+    // that gets validated instead.
+    try testing.expect(pair.server.paths.canSendOnPath(alternate, std.math.maxInt(u64)));
+}
+
+test "connection: a policy-blocked server still answers a PATH_CHALLENGE on its exact ingress path without migrating" {
+    const allocator = testing.allocator;
+
+    var client_backend = tls_backend_mod.Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+    );
+    var server_backend = tls_backend_mod.Tls13Backend.initServer(
+        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+        try tls_backend_mod.Identity.initPkcs8(
+            tls_backend_mod.testdata.certificate_der,
+            tls_backend_mod.testdata.private_key_pkcs8_der,
+        ),
+    );
+    var now_us: u64 = 1_000_000;
+    // The client may freely validate new paths; the server under test must
+    // not migrate/promote under its `.disabled` policy, but must still
+    // answer path-validation control traffic on its exact ingress path
+    // regardless (RFC 9000 §8.2.2 does not condition PATH_RESPONSE on
+    // migration policy).
+    const client = try Connection.init(allocator, .{
+        .role = .client,
+        .config = .{ .migration_policy = .full },
+        .local_cid = &TestPair.client_cid,
+        .original_dcid = &TestPair.odcid,
+        .peer_cid = &TestPair.odcid,
+        .tls = client_backend.backend(),
+        .now_us = now_us,
+        .initial_path = TestPair.client_path,
+    });
+    defer client.deinit();
+    const server = try Connection.init(allocator, .{
+        .role = .server,
+        .config = .{ .migration_policy = .disabled },
+        .local_cid = &TestPair.odcid,
+        .original_dcid = &TestPair.odcid,
+        .peer_cid = &TestPair.client_cid,
+        .tls = server_backend.backend(),
+        .now_us = now_us,
+        .initial_path = TestPair.server_path,
+    });
+    defer server.deinit();
+
+    {
+        var rounds: usize = 0;
+        while (rounds < 64) : (rounds += 1) {
+            var progressed = false;
+            var buf: [2048]u8 = undefined;
+            while (client.pollTransmitOnPath(&buf, now_us)) |t| {
+                var captured: [2048]u8 = undefined;
+                @memcpy(captured[0..t.bytes.len], t.bytes);
+                const ingress = quic_path.PathKey{ .local = t.path.remote, .remote = t.path.local };
+                try server.ingestOnPath(captured[0..t.bytes.len], ingress, TestPair.test_challenge_entropy, now_us);
+                progressed = true;
+                now_us += 500;
+            }
+            while (server.pollTransmitOnPath(&buf, now_us)) |t| {
+                var captured: [2048]u8 = undefined;
+                @memcpy(captured[0..t.bytes.len], t.bytes);
+                const ingress = quic_path.PathKey{ .local = t.path.remote, .remote = t.path.local };
+                try client.ingestOnPath(captured[0..t.bytes.len], ingress, TestPair.test_challenge_entropy, now_us);
+                progressed = true;
+                now_us += 500;
+            }
+            if (!progressed) break;
+        }
+    }
+    try testing.expect(client.isEstablished());
+    try testing.expect(server.isEstablished());
+
+    // Make the client believe the server just spoke from a new address:
+    // the client's own `.full` policy starts a genuine candidate
+    // validation, producing a real wire PATH_CHALLENGE.
+    const server_alt_from_client_view = quic_path.PathKey{
+        .local = TestPair.client_path.local,
+        .remote = quic_udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_555),
+    };
+    {
+        const sid = try server.openStream(.bidi);
+        _ = try server.writeStream(sid, "poke", false);
+        var buf: [2048]u8 = undefined;
+        const t = server.pollTransmitOnPath(&buf, now_us) orelse return error.TestExpectedEqual;
+        var captured: [2048]u8 = undefined;
+        @memcpy(captured[0..t.bytes.len], t.bytes);
+        try client.ingestOnPath(captured[0..t.bytes.len], server_alt_from_client_view, TestPair.test_challenge_entropy, now_us);
+    }
+    try testing.expectEqual(@as(u64, 1), client.pathMetrics().path_challenges_sent);
+
+    var challenge_buf: [2048]u8 = undefined;
+    const challenge = client.pollTransmitOnPath(&challenge_buf, now_us) orelse return error.TestExpectedEqual;
+    try testing.expect(challenge.path.eql(server_alt_from_client_view));
+    var challenge_bytes: [2048]u8 = undefined;
+    @memcpy(challenge_bytes[0..challenge.bytes.len], challenge.bytes);
+
+    // Deliver the client's real PATH_CHALLENGE to the server as if it
+    // arrived from a brand-new client tuple: the server's `.disabled`
+    // policy must block migration/promotion of that tuple, but must still
+    // answer the challenge on its exact ingress path.
+    const client_alt_from_server_view = quic_path.PathKey{
+        .local = TestPair.server_path.local,
+        .remote = quic_udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_666),
+    };
+    try server.ingestOnPath(challenge_bytes[0..challenge.bytes.len], client_alt_from_server_view, TestPair.test_challenge_entropy, now_us);
+
+    try testing.expectEqual(@as(u64, 0), server.pathMetrics().path_challenges_sent);
+    try testing.expect(server.pathMetrics().migrations_blocked > 0);
+    try testing.expectEqual(@as(u64, 0), server.pathMetrics().migrations);
+    try testing.expectEqual(@as(u64, 0), server.pathMetrics().nat_rebindings);
+    try testing.expect(server.activePathKey().eql(TestPair.server_path));
+
+    var response_buf: [2048]u8 = undefined;
+    const response = server.pollTransmitOnPath(&response_buf, now_us) orelse return error.TestExpectedEqual;
+    try testing.expect(response.path.eql(client_alt_from_server_view));
+    try testing.expect(server.activePathKey().eql(TestPair.server_path));
+}
+
 test "connection: a PATH_RESPONSE received on the wrong path does not validate the candidate" {
     const allocator = testing.allocator;
     var pair = try MigrationPair.init(allocator, .full);
@@ -4163,9 +4352,18 @@ test "connection: candidate-path egress is isolated from ordinary active-path co
     defer pair.deinit(allocator);
     try pair.pump();
 
+    // A large enough write that the candidate's 3x anti-amplification
+    // budget (credited from this one datagram) comfortably covers the
+    // mandatory 1200-byte PATH_CHALLENGE padding (RFC 9000 §8.2.1) — a tiny
+    // datagram's budget would be too small to pad to 1200 at all.
+    const sid = try pair.client.openStream(.bidi);
+    const big_payload = [_]u8{0x42} ** 900;
+    _ = try pair.client.writeStream(sid, &big_payload, false);
     var buf: [2048]u8 = undefined;
-    const datagram = try clientDatagram(pair, &buf);
-    try pair.server.ingestOnPath(datagram, rebind_candidate, TestPair.test_challenge_entropy, pair.now_us);
+    const from_client = pair.client.pollTransmitOnPath(&buf, pair.now_us) orelse return error.TestExpectedEqual;
+    var captured: [2048]u8 = undefined;
+    @memcpy(captured[0..from_client.bytes.len], from_client.bytes);
+    try pair.server.ingestOnPath(captured[0..from_client.bytes.len], rebind_candidate, TestPair.test_challenge_entropy, pair.now_us);
 
     const server_sid = try pair.server.openStream(.bidi);
     _ = try pair.server.writeStream(server_sid, "reply", false);
