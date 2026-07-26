@@ -2897,10 +2897,6 @@ fn validateApplianceTlsProfile(cfg: *const EdgeConfig) !void {
         logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS (no filesystem credential watcher)", .{});
         return error.UnsupportedApplianceConfiguration;
     }
-    if (cfg.tls_native_ticket_keys_path.len != 0) {
-        logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH (filesystem-backed ticket-key reload)", .{});
-        return error.UnsupportedApplianceConfiguration;
-    }
     if (cfg.proxy_protocol_mode != .off) {
         logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_PROXY_PROTOCOL; the native TLS path closes every connection before the handshake when a PROXY preface is expected", .{});
         return error.UnsupportedApplianceConfiguration;
@@ -4156,11 +4152,6 @@ test "appliance profile rejects PROXY protocol, credential watching, and OCSP au
     {
         var cfg = base;
         cfg.proxy_protocol_mode = .v1;
-        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
-    }
-    {
-        var cfg = base;
-        cfg.tls_native_ticket_keys_path = "ticket-keys.json";
         try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
     }
     {

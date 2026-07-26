@@ -2494,7 +2494,7 @@ fn runOpenssl(allocator: std.mem.Allocator, args: []const []const u8, stdin_data
         // the instant the write returns races that ticket into arriving
         // too late for `-sess_out` to capture it; this bounded pause (not a
         // blind test-level sleep) gives it a chance to land first.
-        .stdin_close_delay_ms = if (stdin_data != null) 400 else 0,
+        .stdin_close_delay_ms = if (stdin_data != null) 1_000 else 0,
         .stdout_limit = 256 * 1024,
         .stderr_limit = 256 * 1024,
         .deadline_ms = deadline_ms,
@@ -2540,6 +2540,26 @@ fn opensslSessionPath(allocator: std.mem.Allocator, port: u16, tag: []const u8) 
     const dir = try interopSecretsDir(allocator);
     defer allocator.free(dir);
     return std.fmt.allocPrint(allocator, "{s}/interop-{s}-{d}.sess", .{ dir, tag, port });
+}
+
+fn opensslEarlyDataPath(allocator: std.mem.Allocator, port: u16, tag: []const u8) ![]u8 {
+    const dir = try interopSecretsDir(allocator);
+    defer allocator.free(dir);
+    return std.fmt.allocPrint(allocator, "{s}/interop-{s}-{d}.early", .{ dir, tag, port });
+}
+
+fn writeInteropSecretFile(path: []const u8, data: []const u8) !void {
+    var file = try compat.cwd().createFile(path, .{
+        .truncate = true,
+        .permissions = .fromMode(0o600),
+    });
+    defer file.close();
+    try file.writeAll(data);
+    try file.flush();
+}
+
+fn expectMetricAtLeast(body: []const u8, name: []const u8, labels: []const []const u8, expected: u64) !void {
+    try std.testing.expect((prometheusLabeledMetricValue(body, name, labels) orelse 0) >= expected);
 }
 
 const openssl_health_request = "GET /healthz HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n";
@@ -2617,6 +2637,272 @@ test "interop.openssl.h1.resume" {
         "transport=\"record\"",
         "outcome=\"accepted\"",
     }) orelse 0) >= 1);
+}
+
+test "interop.openssl.h1.early.accepted" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    try requireOpenssl(allocator);
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "readiness", .connection_header = "close" },
+        .{ .body = "ticket-bootstrap", .connection_header = "close" },
+        .{ .body = "safe-early", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\    early_data replay_safe;
+        \\    proxy_early_data rfc8470;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/safe",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE", .value = "process_local" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const connect_arg = try opensslConnectArg(allocator, tardigrade.port);
+    defer allocator.free(connect_arg);
+    const sess_path = try opensslSessionPath(allocator, tardigrade.port, "h1-early-accepted");
+    defer allocator.free(sess_path);
+    defer compat.cwd().deleteFile(sess_path) catch {};
+    const early_path = try opensslEarlyDataPath(allocator, tardigrade.port, "h1-early-accepted");
+    defer allocator.free(early_path);
+    defer compat.cwd().deleteFile(early_path) catch {};
+    try writeInteropSecretFile(early_path, "GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+
+    var first = try runOpenssl(allocator, &.{
+        "s_client",        "-connect", connect_arg,
+        "-alpn",           "http/1.1", "-servername",
+        "tardigrade.test", "-tls1_3",  "-sess_out",
+        sess_path,
+    }, "GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n", 10_000);
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
+    try assertContains(first.stdout, "New, TLSv1.3");
+    try assertContains(first.stdout, "HTTP/1.1 200 OK");
+
+    const fingerprint = try opensslSessionFileMaterialSample(allocator, sess_path);
+    var fingerprint_hex: [64]u8 = undefined;
+    const fingerprint_hex_slice = std.fmt.bufPrint(&fingerprint_hex, "{x}", .{fingerprint}) catch unreachable;
+    try upstream.resetCapture();
+
+    var early = try runOpenssl(allocator, &.{
+        "s_client",        "-connect",    connect_arg,
+        "-alpn",           "http/1.1",    "-servername",
+        "tardigrade.test", "-tls1_3",     "-sess_in",
+        sess_path,         "-early_data", early_path,
+    }, "", 10_000);
+    defer early.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(early.outcome));
+    try assertContains(early.stdout, "Reused, TLSv1.3");
+    try assertContains(early.stdout, "HTTP/1.1 200 OK");
+    try assertContains(early.stdout, "safe-early");
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer metrics.deinit();
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""}, 1);
+    try expectMetricAtLeast(metrics.body, "tardigrade_http_early_data_decisions_total", &.{ "protocol=\"h1\"", "decision=\"forwarded\"" }, 1);
+
+    const log = try compat.cwd().readFileAlloc(allocator, tardigrade.log_path, 4 * 1024 * 1024);
+    defer allocator.free(log);
+    try std.testing.expect(!containsSubstring(log, fingerprint_hex_slice));
+}
+
+test "interop.openssl.h1.early.unsafe_425" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    try requireOpenssl(allocator);
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "readiness", .connection_header = "close" },
+        .{ .body = "ticket-bootstrap", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\    early_data replay_safe;
+        \\    proxy_early_data rfc8470;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/safe",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE", .value = "process_local" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const connect_arg = try opensslConnectArg(allocator, tardigrade.port);
+    defer allocator.free(connect_arg);
+    const sess_path = try opensslSessionPath(allocator, tardigrade.port, "h1-early-unsafe");
+    defer allocator.free(sess_path);
+    defer compat.cwd().deleteFile(sess_path) catch {};
+    const early_path = try opensslEarlyDataPath(allocator, tardigrade.port, "h1-early-unsafe");
+    defer allocator.free(early_path);
+    defer compat.cwd().deleteFile(early_path) catch {};
+    try writeInteropSecretFile(early_path, "POST /work HTTP/1.1\r\nHost: tardigrade.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+
+    var first = try runOpenssl(allocator, &.{
+        "s_client",        "-connect", connect_arg,
+        "-alpn",           "http/1.1", "-servername",
+        "tardigrade.test", "-tls1_3",  "-sess_out",
+        sess_path,
+    }, "GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n", 10_000);
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
+    try upstream.resetCapture();
+
+    var early = try runOpenssl(allocator, &.{
+        "s_client",        "-connect",    connect_arg,
+        "-alpn",           "http/1.1",    "-servername",
+        "tardigrade.test", "-tls1_3",     "-sess_in",
+        sess_path,         "-early_data", early_path,
+    }, "", 10_000);
+    defer early.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(early.outcome));
+    try assertContains(early.stdout, "Reused, TLSv1.3");
+    try assertContains(early.stdout, "HTTP/1.1 425 Too Early");
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer metrics.deinit();
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""}, 1);
+    try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""}) orelse 0);
+    try expectMetricAtLeast(metrics.body, "tardigrade_http_early_data_decisions_total", &.{ "protocol=\"h1\"", "decision=\"too_early\"" }, 1);
+}
+
+test "interop.openssl.h1.early.replay_fallback" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    try requireOpenssl(allocator);
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "readiness", .connection_header = "close" },
+        .{ .body = "ticket-bootstrap", .connection_header = "close" },
+        .{ .body = "safe-early", .connection_header = "close" },
+        .{ .body = "after-replay", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\    early_data replay_safe;
+        \\    proxy_early_data rfc8470;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/early",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE", .value = "process_local" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const connect_arg = try opensslConnectArg(allocator, tardigrade.port);
+    defer allocator.free(connect_arg);
+    const sess_path = try opensslSessionPath(allocator, tardigrade.port, "h1-early-replay");
+    defer allocator.free(sess_path);
+    defer compat.cwd().deleteFile(sess_path) catch {};
+    const early_path = try opensslEarlyDataPath(allocator, tardigrade.port, "h1-early-replay");
+    defer allocator.free(early_path);
+    defer compat.cwd().deleteFile(early_path) catch {};
+    try writeInteropSecretFile(early_path, "GET /early HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: keep-alive\r\n\r\n");
+
+    var first = try runOpenssl(allocator, &.{
+        "s_client",        "-connect", connect_arg,
+        "-alpn",           "http/1.1", "-servername",
+        "tardigrade.test", "-tls1_3",  "-sess_out",
+        sess_path,
+    }, "GET /early HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n", 10_000);
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
+    try upstream.resetCapture();
+
+    var accepted = try runOpenssl(allocator, &.{
+        "s_client",        "-connect",    connect_arg,
+        "-alpn",           "http/1.1",    "-servername",
+        "tardigrade.test", "-tls1_3",     "-sess_in",
+        sess_path,         "-early_data", early_path,
+    }, "", 10_000);
+    defer accepted.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(accepted.outcome));
+    try assertContains(accepted.stdout, "HTTP/1.1 200 OK");
+    try assertContains(accepted.stdout, "safe-early");
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    var replay = try runOpenssl(allocator, &.{
+        "s_client",        "-connect",    connect_arg,
+        "-alpn",           "http/1.1",    "-servername",
+        "tardigrade.test", "-tls1_3",     "-sess_in",
+        sess_path,         "-early_data", early_path,
+    }, "GET /after HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n", 10_000);
+    defer replay.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(replay.outcome));
+    try assertContains(replay.stdout, "Reused, TLSv1.3");
+    try assertContains(replay.stdout, "HTTP/1.1 200 OK");
+    try assertContains(replay.stdout, "after-replay");
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+    const first_path = try upstream.capturedPathHistoryAt(allocator, 0);
+    defer allocator.free(first_path);
+    const second_path = try upstream.capturedPathHistoryAt(allocator, 1);
+    defer allocator.free(second_path);
+    try std.testing.expectEqualStrings("/early", first_path);
+    try std.testing.expectEqualStrings("/after", second_path);
+
+    var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer metrics.deinit();
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""}, 1);
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""}, 1);
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"record\"", "outcome=\"accepted\"" }, 2);
 }
 
 // Named `h2.tls_resume`, not `h2.resume`: this proves TLS-layer PSK
@@ -3067,6 +3353,35 @@ fn opensslSessionTicketFingerprint(allocator: std.mem.Allocator, path: []const u
     return fingerprint;
 }
 
+fn opensslSessionFileMaterialSample(allocator: std.mem.Allocator, path: []const u8) ![32]u8 {
+    const raw = try decodeOpensslSessionFile(allocator, path);
+    defer allocator.free(raw);
+    if (raw.len < 32) return error.SessionFileTooShortToSample;
+    var sample: [32]u8 = undefined;
+    @memcpy(&sample, raw[raw.len - 32 ..]);
+    return sample;
+}
+
+fn persistentTicketKeySnapshotPath(allocator: std.mem.Allocator, port: u16, tag: []const u8) ![]u8 {
+    const dir = try interopSecretsDir(allocator);
+    defer allocator.free(dir);
+    return std.fmt.allocPrint(allocator, "{s}/interop-{s}-{d}-ticket-keys.json", .{ dir, tag, port });
+}
+
+fn writePersistentTicketKeySnapshot(allocator: std.mem.Allocator, path: []const u8) !void {
+    const now = compat.milliTimestamp();
+    const snapshot = try std.fmt.allocPrint(
+        allocator,
+        "{{\"version\":1,\"generation\":1,\"keys\":[{{\"id\":\"000102030405060708090a0b0c0d0e0f\",\"aead\":\"aes_128_gcm\",\"key\":\"101112131415161718191a1b1c1d1e1f\",\"not_before_unix_ms\":{d},\"encrypt_until_unix_ms\":{d},\"decrypt_until_unix_ms\":{d},\"nonce_lease\":{{\"prefix\":\"51800000\",\"start\":0,\"end_exclusive\":4096}}}}]}}",
+        .{ now - 60_000, now + 60 * 60 * 1000, now + 2 * 60 * 60 * 1000 },
+    );
+    defer {
+        std.crypto.secureZero(u8, snapshot);
+        allocator.free(snapshot);
+    }
+    try writeInteropSecretFile(path, snapshot);
+}
+
 /// #369: flips one byte inside the opaque ticket envelope of an
 /// OpenSSL-managed `-sess_out` PEM file, in place. Locates
 /// `ticket_protection`'s public, non-secret magic (`"TDTK"`) with a plain
@@ -3416,6 +3731,206 @@ test "restart.ephemeral.ticket_miss and restart.ephemeral.fresh_ticket" {
     defer allocator.free(log_b);
     try std.testing.expect(!containsSubstring(log_a, fingerprint_hex_slice));
     try std.testing.expect(!containsSubstring(log_b, fingerprint_hex_slice));
+}
+
+test "restart.persistent.early_startup_quarantine" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    try requireOpenssl(allocator);
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const key_path_probe_port = try findFreePort();
+    const ticket_keys_path = try persistentTicketKeySnapshotPath(allocator, key_path_probe_port, "persistent-early-quarantine");
+    defer allocator.free(ticket_keys_path);
+    defer compat.cwd().deleteFile(ticket_keys_path) catch {};
+    defer {
+        const lock_path = std.fmt.allocPrint(allocator, "{s}.lock", .{ticket_keys_path}) catch null;
+        if (lock_path) |path| {
+            compat.cwd().deleteFile(path) catch {};
+            allocator.free(path);
+        }
+    }
+    try writePersistentTicketKeySnapshot(allocator, ticket_keys_path);
+
+    var upstream_a = try UpstreamServer.start(allocator, &.{
+        .{ .body = "a-readiness", .connection_header = "close" },
+        .{ .body = "a-ticket", .connection_header = "close" },
+    });
+    defer upstream_a.stop();
+    try upstream_a.run();
+    const config_a = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\    early_data replay_safe;
+        \\    proxy_early_data rfc8470;
+        \\}}
+    , .{ test_host, upstream_a.port() });
+    defer allocator.free(config_a);
+
+    var process_a = try TardigradeProcess.start(allocator, .{
+        .config_text = config_a,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH", .value = ticket_keys_path },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE", .value = "process_local" },
+        },
+    });
+    var process_a_running = true;
+    defer if (process_a_running) process_a.stop();
+
+    compat.sleepNs(61 * std.time.ns_per_s);
+
+    var client_entropy = tls_core.production_crypto.OsEntropy{};
+    var client_provider = tls_core.production_crypto.Provider.init(client_entropy.entropy());
+    var client_runtime = try tls_core.resumption_runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 2_000;
+            }
+        }.now },
+        client_provider.cryptoProvider(),
+    );
+    defer client_runtime.deinit();
+
+    const TicketCapture = struct {
+        allocator: std.mem.Allocator,
+        runtime: *tls_core.resumption_runtime.Runtime,
+        retained: tls_core.session.ClientTicketState = .{},
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.retained.deinit();
+            self.retained = .{};
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+            _ = self.runtime.storeClientTicket(ticket);
+        }
+    };
+
+    var capture = TicketCapture{ .allocator = allocator, .runtime = &client_runtime };
+    defer capture.retained.deinit();
+
+    const first_client = try PureZigTlsClient.createWithOptions(allocator, process_a.port, "http/1.1", "tardigrade.test", .{
+        .ticket_consumer = .{
+            .ctx = &capture,
+            .nowUnixMsFn = TicketCapture.now,
+            .onTicketFn = TicketCapture.onTicket,
+        },
+    });
+    defer first_client.destroy();
+    try first_client.writeAllPlain("GET /ticket HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const first_raw = try first_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(first_raw);
+    try assertContains(first_raw, "HTTP/1.1 200 OK");
+    if (capture.retained.common.early_data == .resume_only) return error.SkipZigTest;
+    try std.testing.expectEqual(tls_core.session.EarlyDataPolicy{ .early_data_capable = 16 * 1024 }, capture.retained.common.early_data);
+
+    var ordinary_ticket: tls_core.session.ClientTicketState = .{};
+    defer ordinary_ticket.deinit();
+    try capture.retained.cloneInto(allocator, &ordinary_ticket);
+    var early_ticket: tls_core.session.ClientTicketState = .{};
+    defer early_ticket.deinit();
+    try capture.retained.cloneInto(allocator, &early_ticket);
+
+    process_a.stop();
+    process_a_running = false;
+
+    var upstream_b = try UpstreamServer.start(allocator, &.{
+        .{ .body = "b-readiness", .connection_header = "close" },
+        .{ .body = "ordinary-after-quarantine", .connection_header = "close" },
+    });
+    defer upstream_b.stop();
+    try upstream_b.run();
+    const config_b = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\    early_data replay_safe;
+        \\    proxy_early_data rfc8470;
+        \\}}
+    , .{ test_host, upstream_b.port() });
+    defer allocator.free(config_b);
+
+    var process_b = try TardigradeProcess.start(allocator, .{
+        .config_text = config_b,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH", .value = ticket_keys_path },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE", .value = "process_local" },
+        },
+    });
+    defer process_b.stop();
+
+    try upstream_b.resetCapture();
+
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2_500;
+        }
+    };
+
+    var ordinary_offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+    try ordinary_offers.push(&ordinary_ticket);
+    errdefer ordinary_offers.deinit();
+    const ordinary_client = try PureZigTlsClient.createWithOptions(allocator, process_b.port, "http/1.1", "tardigrade.test", .{
+        .psk_offers = &ordinary_offers,
+        .psk_now_ctx = &clock_dummy,
+        .psk_now_fn = ClientClock.now,
+    });
+    defer ordinary_client.destroy();
+    try std.testing.expect(ordinary_client.backend.core.psk_authenticated);
+    try ordinary_client.writeAllPlain("GET /ordinary HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const ordinary_raw = try ordinary_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(ordinary_raw);
+    try assertContains(ordinary_raw, "HTTP/1.1 200 OK");
+    try assertContains(ordinary_raw, "ordinary-after-quarantine");
+    try std.testing.expectEqual(@as(u32, 1), upstream_b.requestCount());
+    const path = try upstream_b.capturedPathHistoryAt(allocator, 0);
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings("/ordinary", path);
+    try upstream_b.resetCapture();
+
+    var early_offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+    try early_offers.push(&early_ticket);
+    errdefer early_offers.deinit();
+    const early_client = try PureZigTlsClient.createWithOptions(allocator, process_b.port, "http/1.1", "tardigrade.test", .{
+        .psk_offers = &early_offers,
+        .psk_now_ctx = &clock_dummy,
+        .psk_now_fn = ClientClock.now,
+        .early_data_intent = .{ .enabled = true, .max_bytes = 4096 },
+        .return_after_early_data_ready = true,
+    });
+    defer early_client.destroy();
+    try early_client.writeAllPlain("GET /early HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    try early_client.driveUntilOpen(5_000);
+    try std.testing.expectEqual(@as(u32, 0), upstream_b.requestCount());
+
+    var metrics = try sendPureZigTlsHttp1Request(allocator, process_b.port, "/status/metrics");
+    defer metrics.deinit();
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"initial_load_success\""}, 1);
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_ticket_resolve_total", &.{ "mode=\"stateless\"", "result=\"success\"" }, 1);
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"record\"", "outcome=\"accepted\"" }, 1);
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"startup_quarantine\""}, 1);
+    try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""}) orelse 0);
 }
 
 // Named `restart_and_credential_change`, not `cert_change`: process A and
