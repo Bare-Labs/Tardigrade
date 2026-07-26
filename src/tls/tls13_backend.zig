@@ -361,6 +361,10 @@ pub const EarlyDataReplayDecision = enum { allow, replay, unavailable };
 pub const EarlyDataReplayCandidate = struct {
     ticket_identity_fingerprint: [32]u8 = [_]u8{0} ** 32,
     obfuscated_ticket_age: u32 = 0,
+    /// Server-side ticket issuance time. A process-local replay store uses
+    /// this to distinguish tickets issued after store initialization from
+    /// unknown/pre-start tickets during startup quarantine.
+    ticket_issued_at_unix_ms: ?u64 = null,
     /// #368 Slice 2: the authoritative anti-replay retention deadline for
     /// this candidate, derived by `computeReplayRetainUntilUnixMs` from the
     /// already-validated ticket issuance time, apparent ticket age, and
@@ -3336,6 +3340,7 @@ pub const Tls13Backend = struct {
                 .replay_candidate = .{
                     .ticket_identity_fingerprint = identity_fingerprint,
                     .obfuscated_ticket_age = pair.identity.obfuscated_ticket_age,
+                    .ticket_issued_at_unix_ms = if (hit.state.common.issued_at_unix_ms >= 0) @intCast(hit.state.common.issued_at_unix_ms) else null,
                 },
                 .replay_retain_until_unix_ms = replay_retain_until_unix_ms,
             });

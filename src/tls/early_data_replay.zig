@@ -40,6 +40,9 @@ pub const Limits = struct {
 
 pub const Claim = struct {
     key: Key,
+    /// Server-side ticket issuance time when known. Claims without it are
+    /// treated as unknown/pre-start during startup quarantine.
+    ticket_issued_at_unix_ms: ?u64 = null,
     /// Absolute server-wall-clock deadline through which this key must
     /// remain authoritative for the currently validated freshness window
     /// (derived by the caller from the already-validated ticket-age/skew
@@ -138,6 +141,7 @@ pub const GateAdapter = struct {
         const self: *GateAdapter = @ptrCast(@alignCast(ctx));
         return mapClaimResult(self.backing.claim(.{
             .key = candidate.ticket_identity_fingerprint,
+            .ticket_issued_at_unix_ms = candidate.ticket_issued_at_unix_ms,
             .retain_until_unix_ms = candidate.retain_until_unix_ms,
         }));
     }
@@ -338,7 +342,7 @@ pub const LocalStore = struct {
             self.high_water_unix_ms = now_unix_ms;
         }
 
-        if (now_unix_ms < self.quarantine_until_unix_ms) {
+        if (self.quarantineApplies(c) and now_unix_ms < self.quarantine_until_unix_ms) {
             event.* = .startup_quarantine;
             return .unavailable;
         }
@@ -385,6 +389,12 @@ pub const LocalStore = struct {
 
         event.* = .capacity_rejected;
         return .rejected_capacity;
+    }
+
+    fn quarantineApplies(self: *const LocalStore, c: Claim) bool {
+        const issued_at = c.ticket_issued_at_unix_ms orelse return true;
+        const quarantine_started_unix_ms = self.quarantine_until_unix_ms -| self.quarantine_duration_ms;
+        return issued_at < quarantine_started_unix_ms;
     }
 
     fn insertLocked(self: *LocalStore, c: Claim, event: *Event) ClaimResult {
@@ -580,6 +590,21 @@ test "startup quarantine rejects claims as unavailable without recording anythin
     try testing.expectEqual(ClaimResult.unavailable, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 100_000 }, 1_000));
     try testing.expectEqual(ClaimResult.unavailable, store.claim(.{ .key = keyOf(1), .retain_until_unix_ms = 100_000 }, 60_999));
     try testing.expectEqual(@as(usize, 0), store.count());
+}
+
+test "startup quarantine permits tickets issued after store initialization" {
+    var store = try LocalStore.init(testing.allocator, testLimits(4), 60_000, 1_000);
+    defer store.deinit();
+    try testing.expectEqual(ClaimResult.unavailable, store.claim(.{
+        .key = keyOf(1),
+        .ticket_issued_at_unix_ms = 999,
+        .retain_until_unix_ms = 100_000,
+    }, 1_100));
+    try testing.expectEqual(ClaimResult.accepted, store.claim(.{
+        .key = keyOf(2),
+        .ticket_issued_at_unix_ms = 1_000,
+        .retain_until_unix_ms = 100_000,
+    }, 1_100));
 }
 
 test "first claim immediately after quarantine can succeed" {

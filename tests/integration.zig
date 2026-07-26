@@ -3729,6 +3729,9 @@ test "#510 native tcp production 0-rtt reaches h1 safety gate and replay fallbac
     defer tls_paths.deinit();
 
     var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "readiness", .connection_header = "close" },
+        .{ .body = "ticket-bootstrap", .connection_header = "close" },
+        .{ .body = "ticket-bootstrap", .connection_header = "close" },
         .{ .body = "safe-early", .connection_header = "keep-alive" },
         .{ .body = "safe-after-replay", .connection_header = "close" },
     });
@@ -3809,14 +3812,32 @@ test "#510 native tcp production 0-rtt reaches h1 safety gate and replay fallbac
     try assertContains(first_raw, "HTTP/1.1 200 OK");
     try std.testing.expectEqual(tls_core.session.EarlyDataPolicy{ .early_data_capable = 16 * 1024 }, capture.retained.common.early_data);
 
-    const candidate: tls_core.session.CandidateContext = .{
-        .cipher_suite = capture.retained.common.cipher_suite,
-        .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
-        .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
-        .auth_binding = capture.retained.common.auth_binding,
-        .transport_compat = null,
-        .application_compat = null,
-    };
+    var safe_ticket: tls_core.session.ClientTicketState = .{};
+    defer safe_ticket.deinit();
+    try capture.retained.cloneInto(allocator, &safe_ticket);
+    var replay_ticket: tls_core.session.ClientTicketState = .{};
+    defer replay_ticket.deinit();
+    try capture.retained.cloneInto(allocator, &replay_ticket);
+
+    const unsafe_ticket_client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+        .ticket_consumer = .{
+            .ctx = &capture,
+            .nowUnixMsFn = TicketCapture.now,
+            .onTicketFn = TicketCapture.onTicket,
+        },
+    });
+    defer unsafe_ticket_client.destroy();
+    try unsafe_ticket_client.writeAllPlain("GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const unsafe_ticket_raw = try unsafe_ticket_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(unsafe_ticket_raw);
+    try assertContains(unsafe_ticket_raw, "HTTP/1.1 200 OK");
+    try std.testing.expectEqual(tls_core.session.EarlyDataPolicy{ .early_data_capable = 16 * 1024 }, capture.retained.common.early_data);
+
+    var unsafe_ticket: tls_core.session.ClientTicketState = .{};
+    defer unsafe_ticket.deinit();
+    try capture.retained.cloneInto(allocator, &unsafe_ticket);
+    try upstream.resetCapture();
+
     var clock_dummy: u8 = 0;
     const ClientClock = struct {
         fn now(_: *anyopaque) i64 {
@@ -3824,33 +3845,46 @@ test "#510 native tcp production 0-rtt reaches h1 safety gate and replay fallbac
         }
     };
 
-    var accepted_lookup = client_runtime.lookupClientOffers(candidate);
-    defer accepted_lookup.deinit();
-    try std.testing.expect(accepted_lookup == .hit);
+    var safe_offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+    try safe_offers.push(&safe_ticket);
+    errdefer safe_offers.deinit();
     const accepted_client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
-        .psk_lease = &accepted_lookup.hit,
+        .psk_offers = &safe_offers,
         .psk_now_ctx = &clock_dummy,
         .psk_now_fn = ClientClock.now,
         .early_data_intent = .{ .enabled = true, .max_bytes = 4096 },
         .return_after_early_data_ready = true,
     });
     defer accepted_client.destroy();
-    try accepted_client.writeAllPlain(
-        "GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: keep-alive\r\n\r\n" ++
-            "POST /work HTTP/1.1\r\nHost: tardigrade.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-    );
+    try accepted_client.writeAllPlain("GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
     const accepted_raw = try accepted_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
     defer allocator.free(accepted_raw);
     try assertContains(accepted_raw, "HTTP/1.1 200 OK");
     try assertContains(accepted_raw, "safe-early");
-    try assertContains(accepted_raw, "HTTP/1.1 425 Too Early");
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 
-    var replay_lookup = client_runtime.lookupClientOffers(candidate);
-    defer replay_lookup.deinit();
-    try std.testing.expect(replay_lookup == .hit);
+    var unsafe_offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+    try unsafe_offers.push(&unsafe_ticket);
+    errdefer unsafe_offers.deinit();
+    const unsafe_client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+        .psk_offers = &unsafe_offers,
+        .psk_now_ctx = &clock_dummy,
+        .psk_now_fn = ClientClock.now,
+        .early_data_intent = .{ .enabled = true, .max_bytes = 4096 },
+        .return_after_early_data_ready = true,
+    });
+    defer unsafe_client.destroy();
+    try unsafe_client.writeAllPlain("POST /work HTTP/1.1\r\nHost: tardigrade.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    const unsafe_raw = try unsafe_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(unsafe_raw);
+    try assertContains(unsafe_raw, "HTTP/1.1 425 Too Early");
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    var replay_offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+    try replay_offers.push(&replay_ticket);
+    errdefer replay_offers.deinit();
     const replay_client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
-        .psk_lease = &replay_lookup.hit,
+        .psk_offers = &replay_offers,
         .psk_now_ctx = &clock_dummy,
         .psk_now_fn = ClientClock.now,
         .early_data_intent = .{ .enabled = true, .max_bytes = 4096 },
@@ -3878,6 +3912,7 @@ const PureZigTlsClient = struct {
         ticket_consumer: ?tls_core.tls13_backend.Tls13Backend.SessionTicketConsumer = null,
         ticket_limits: tls_core.session.Limits = tls_core.session.Limits.default,
         psk_lease: ?*tls_core.pre_shared_key.ClientOfferLease = null,
+        psk_offers: ?*tls_core.pre_shared_key.ClientPskOfferSet = null,
         psk_now_ctx: ?*anyopaque = null,
         psk_now_fn: ?*const fn (*anyopaque) i64 = null,
         early_data_intent: tls_core.tls13_backend.ClientEarlyDataIntent = .{},
@@ -3916,15 +3951,23 @@ const PureZigTlsClient = struct {
             tls_core.tls13_backend.recordConfig(alpnPolicy(alpn)),
             .{ .server_name = server_name },
         );
-        if (options.ticket_consumer != null or options.psk_lease != null) {
+        if (options.ticket_consumer != null or options.psk_lease != null or options.psk_offers != null) {
             try self.backend.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
         }
+        if (options.psk_lease != null and options.psk_offers != null) return error.InvalidTestSetup;
         if (options.ticket_consumer) |consumer| {
             try self.backend.setSessionTicketConsumer(allocator, options.ticket_limits, consumer);
         }
         if (options.psk_lease) |lease| {
             try self.backend.setClientPskOfferLease(
                 lease,
+                options.psk_now_ctx orelse return error.InvalidTestSetup,
+                options.psk_now_fn orelse return error.InvalidTestSetup,
+            );
+        }
+        if (options.psk_offers) |offers| {
+            try self.backend.setClientPskOffers(
+                offers,
                 options.psk_now_ctx orelse return error.InvalidTestSetup,
                 options.psk_now_fn orelse return error.InvalidTestSetup,
             );
