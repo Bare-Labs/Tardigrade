@@ -722,7 +722,11 @@ pub const PathManager = struct {
     /// `.validated_pending_promotion` — distinct from `.validated`, which
     /// means "is or was the active path" — so `onDatagram` cannot mistake it
     /// for a previously-active path and re-probe it out from under a pending
-    /// promotion. The caller decides when (or whether) to call
+    /// promotion. Its anti-amplification limit is lifted immediately (RFC
+    /// 9000 §8.2.3: a successful PATH_RESPONSE permits sending beyond the 3x
+    /// limit even before migration/promotion happens), so a host migration
+    /// blocked later on a fresh peer CID is not also stuck amplification
+    /// limited. The caller decides when (or whether) to call
     /// `promoteValidated` — host migration must claim a fresh peer CID first
     /// (RFC 9000 §9.5), so validation and promotion cannot be one atomic
     /// step. A response with no matching outstanding challenge — wrong
@@ -755,33 +759,56 @@ pub const PathManager = struct {
         }
 
         candidate.state = .validated_pending_promotion;
+        candidate.anti_amplification.markValidated();
         self.metrics.path_validations_succeeded += 1;
         return .{ .path = key, .change = candidate.change };
     }
 
+    /// The current NAT-rebinding-vs-migration classification of a
+    /// `.validated_pending_promotion` candidate, recomputed against
+    /// `activePath()` right now rather than returning the (possibly stale)
+    /// classification stored from when the candidate was first probed.
+    /// `PathManager` allows several pending candidates at once; if a
+    /// different one is promoted first, an older candidate's relationship to
+    /// the *new* active path can differ from its stored `change` (e.g. two
+    /// candidates on the same host: once one promotes, the other is only a
+    /// port rebind relative to it). Call this immediately before deciding
+    /// whether a fresh peer CID is required and before promoting. Returns
+    /// null if `key` is not a pending-promotion candidate.
+    pub fn promotionChange(self: *const PathManager, key: PathKey) ?AddressChange {
+        const index = self.find(key) orelse return null;
+        if (self.paths[index].?.state != .validated_pending_promotion) return null;
+        return if (key.remote.sameHost(self.activePath().key.remote))
+            .nat_rebinding
+        else
+            .migration;
+    }
+
     /// Promote a path already marked `.validated_pending_promotion` by
     /// `validatePathResponse` to the active path, transitioning it to
-    /// `.validated` and lifting its anti-amplification limit. Returns null if
-    /// `key` is not a pending-promotion candidate. For a host migration the
-    /// caller must claim a fresh peer CID before calling this (RFC 9000
-    /// §9.5); if none is available, call `recordMigrationBlockedNoPeerCid`
-    /// instead and leave the candidate `.validated_pending_promotion` so a
-    /// later retry can promote it without a new challenge round trip.
+    /// `.validated`. The returned outcome uses `promotionChange`'s current
+    /// classification, not the stored (possibly stale) one, since another
+    /// candidate may have promoted in the meantime. Returns null if `key` is
+    /// not a pending-promotion candidate. For a host migration the caller
+    /// must claim a fresh peer CID before calling this (RFC 9000 §9.5); if
+    /// none is available, call `recordMigrationBlockedNoPeerCid` instead and
+    /// leave the candidate `.validated_pending_promotion` so a later retry
+    /// can promote it without a new challenge round trip.
     pub fn promoteValidated(self: *PathManager, key: PathKey) ?MigrationOutcome {
-        const index = self.find(key) orelse return null;
+        const change = self.promotionChange(key) orelse return null;
+        const index = self.find(key).?;
         const candidate = &self.paths[index].?;
-        if (candidate.state != .validated_pending_promotion) return null;
 
         candidate.state = .validated;
-        candidate.anti_amplification.markValidated();
+        candidate.change = change;
         self.active = index;
-        switch (candidate.change) {
+        switch (change) {
             .nat_rebinding => self.metrics.nat_rebindings += 1,
             .migration => self.metrics.migrations += 1,
         }
         return .{
-            .change = candidate.change,
-            .reset_congestion = candidate.change == .migration,
+            .change = change,
+            .reset_congestion = change == .migration,
         };
     }
 
@@ -1224,6 +1251,55 @@ test "a validated candidate blocked on a peer CID survives further datagrams ins
     const outcome = manager.promoteValidated(migrated).?;
     try testing.expect(outcome.reset_congestion);
     try testing.expect(manager.activePath().key.eql(migrated));
+}
+
+test "validatePathResponse lifts the candidate's anti-amplification limit immediately, not only on promotion" {
+    var manager = PathManager.init(.full, testKey(50_000), true);
+    const migrated = testKeyOtherHost(50_000);
+    // A small receive credits only a small (3x) send budget.
+    _ = manager.onDatagram(migrated, 100, test_challenge, 0);
+    try testing.expect(manager.canSendOnPath(migrated, 300));
+    try testing.expect(!manager.canSendOnPath(migrated, 301));
+
+    _ = manager.validatePathResponse(migrated, test_challenge, 10).?;
+    // Validated but deliberately not promoted (e.g. still waiting on a fresh
+    // peer CID): RFC 9000 §8.2.3 already permits unlimited sends on this path.
+    try testing.expect(manager.canSendOnPath(migrated, std.math.maxInt(u64)));
+    // The old path is still active — validation alone does not promote.
+    try testing.expect(manager.activePath().key.eql(testKey(50_000)));
+}
+
+test "a pending candidate's promotion classification is recomputed against the current active path" {
+    var manager = PathManager.init(.full, testKey(50_000), true); // A active
+    const b = testKeyOtherHost(50_001);
+    const c = testKeyOtherHost(50_002); // same host as B, different port
+
+    // B validates while A is active: classified as a host migration.
+    _ = manager.onDatagram(b, 1_200, test_challenge, 0);
+    const validated_b = manager.validatePathResponse(b, test_challenge, 10).?;
+    try testing.expectEqual(AddressChange.migration, validated_b.change);
+    // No fresh peer CID for B yet: it stays pending.
+    manager.recordMigrationBlockedNoPeerCid();
+
+    // C also validates while A is still active (also a migration relative to
+    // A), and gets a fresh peer CID first, so it promotes.
+    _ = manager.onDatagram(c, 1_200, test_challenge, 20);
+    _ = manager.validatePathResponse(c, test_challenge, 30).?;
+    const outcome_c = manager.promoteValidated(c).?;
+    try testing.expectEqual(AddressChange.migration, outcome_c.change);
+    try testing.expect(manager.activePath().key.eql(c));
+
+    // B is still pending, and a fresh peer CID becomes available for it too.
+    // B and C share a host: relative to the now-active C, B is only a NAT
+    // rebinding, even though it was originally probed and validated as a
+    // migration relative to A.
+    try testing.expectEqual(AddressChange.nat_rebinding, manager.promotionChange(b).?);
+    const outcome_b = manager.promoteValidated(b).?;
+    try testing.expectEqual(AddressChange.nat_rebinding, outcome_b.change);
+    try testing.expect(!outcome_b.reset_congestion);
+    try testing.expect(manager.activePath().key.eql(b));
+    try testing.expectEqual(@as(u64, 1), manager.metrics.nat_rebindings);
+    try testing.expectEqual(@as(u64, 1), manager.metrics.migrations);
 }
 
 test "a previously-active validated path is re-probed, not trusted indefinitely" {
