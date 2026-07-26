@@ -3248,7 +3248,12 @@ fn verifyApplianceAcceptsCredential(allocator: std.mem.Allocator, cert_path: []c
     // child has actually terminated within the bound above -- a timeout
     // or launch failure is a real test infrastructure problem and must
     // fail loudly, not be silently folded into the same skip path.
-    if (std.meta.activeTag(checked.outcome) == .normal_exit and checked.outcome.normal_exit != 0) {
+    //
+    // `bounded_process` only classifies an exit as `.normal_exit` when the
+    // code is in `accepted_exit_codes` (default `&.{0}`), so `check`'s
+    // nonzero failure exit surfaces as `.unexpected_exit_code`, not
+    // `.normal_exit(nonzero)` -- both branches below must be checked.
+    if (std.meta.activeTag(checked.outcome) == .unexpected_exit_code) {
         return error.SkipZigTest;
     }
     if (std.meta.activeTag(checked.outcome) != .normal_exit) {
