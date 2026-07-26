@@ -2477,10 +2477,40 @@ fn opensslConnectArg(allocator: std.mem.Allocator, port: u16) ![]u8 {
     return std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{port});
 }
 
+/// #369: a resumable OpenSSL session file contains the session master
+/// key/PSK (OpenSSL's own `SSL_SESSION`/`sess_id` documentation calls this
+/// out explicitly), and a generated alternate credential's private key is
+/// obviously secret too. Neither may live under `.zig-cache` -- CI caches
+/// that whole tree (`actions/cache` in ci.yml), so a successful job could
+/// otherwise leave secret-bearing test artifacts inside a persisted cache
+/// blob even though the normal-path `defer deleteFile` cleans them up
+/// (cleanup errors are swallowed by design, so it is not a guarantee).
+/// Returns a directory outside every cache/artifact path
+/// (`$TMPDIR`/`/tmp`, never repo-relative), created with owner-only
+/// permissions so a residual file stays inaccessible to other local users
+/// even if a specific cleanup step fails.
+fn interopSecretsDir(allocator: std.mem.Allocator) ![]u8 {
+    const base = compat.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(base);
+    const trimmed = std.mem.trimEnd(u8, base, "/");
+    const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/tardigrade-tls-interop-secrets", .{trimmed}, 0);
+    defer allocator.free(path_z);
+    // `std.Io.Dir`'s directory-creation API has no mode parameter; the raw
+    // libc call is the only way to request owner-only (0700) permissions.
+    const rc = std.c.mkdir(path_z.ptr, 0o700);
+    if (rc != 0) {
+        switch (std.posix.errno(rc)) {
+            .EXIST => {},
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+    return allocator.dupe(u8, path_z);
+}
+
 fn opensslSessionPath(allocator: std.mem.Allocator, port: u16, tag: []const u8) ![]u8 {
-    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(cwd);
-    return std.fmt.allocPrint(allocator, "{s}/.zig-cache/interop-{s}-{d}.sess", .{ cwd, tag, port });
+    const dir = try interopSecretsDir(allocator);
+    defer allocator.free(dir);
+    return std.fmt.allocPrint(allocator, "{s}/interop-{s}-{d}.sess", .{ dir, tag, port });
 }
 
 const openssl_health_request = "GET /healthz HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n";
@@ -2560,17 +2590,22 @@ test "interop.openssl.h1.resume" {
     }) orelse 0) >= 1);
 }
 
-// #369 scope note: this proves TLS-layer PSK resumption under the h2 ALPN
-// path -- handshake, ticket capture/offer, and the resumed connection
-// negotiating h2 again -- not a full HTTP/2 request/response. Hand-rolling
-// HPACK/frame encoding through raw `openssl s_client` stdin to drive one
-// real h2 GET is out of proportion to what this case needs to prove and is
-// intentionally left out of scope (see docs/RESUMPTION_TEST_PLAN.md); H1
-// above already proves resumption carries a real served request end to
-// end, and production H2 dispatch itself already has its own coverage
+// Named `h2.tls_resume`, not `h2.resume`: this proves TLS-layer PSK
+// resumption under the h2 ALPN path -- handshake, ticket capture/offer, and
+// the resumed connection negotiating h2 again -- but never sends an H2
+// frame/request on the resumed connection, so it cannot detect a bug that
+// affects H2 dispatch only *after* resumption. Real application-level
+// resumed-H2 interop (one actual external H2 request/response driven over
+// a resumed connection) is intentionally left in the deferred matrix (see
+// docs/RESUMPTION_TEST_PLAN.md) rather than claimed proven here --
+// hand-rolling HPACK/frame encoding through raw `openssl s_client` stdin,
+// or sourcing an H2-capable peer for it, is real, separate work. H1 above
+// proves resumption carries a real served request end to end at the
+// protocol Tardigrade's own test infrastructure can drive directly;
+// production H2 dispatch itself has its own independent coverage
 // (`tests/integration.zig`'s "native TLS listener dispatches ALPN h2..."
-// suite) independent of resumption.
-test "interop.openssl.h2.resume" {
+// suite), just not combined with resumption.
+test "interop.openssl.h2.tls_resume" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
     try requireOpenssl(allocator);
@@ -2914,15 +2949,15 @@ test "interop.openssl.ticket.tampered" {
     defer first.deinit(allocator);
     try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
 
-    // Tamper the OpenSSL-managed session file's own opaque ticket bytes
-    // in place, without touching any other field, by locating the DER
-    // OCTET STRING carrying our own stateless ticket envelope (its first
-    // bytes are `ticket_protection`'s public magic, which is intentionally
-    // not a secret -- see that module's doc comment) and flipping a byte
-    // safely inside its declared length, away from any DER tag/length byte
-    // a blind offset could otherwise corrupt (which would just make
-    // OpenSSL's own local session-file loader refuse to even attempt the
-    // connection, proving nothing about the server).
+    // Tamper the OpenSSL-managed session file's own opaque ticket bytes in
+    // place, without touching any other field: locate `ticket_protection`'s
+    // public, non-secret magic ("TDTK") with a plain byte search (not a
+    // DER TLV walk of the surrounding structure), then flip a byte a fixed
+    // distance past the envelope's own fixed header -- inside the actual
+    // AEAD ciphertext, not the nonce or a byte a blind offset could land on
+    // in a DER length/tag field instead (which would just make OpenSSL's
+    // own local session-file loader refuse to even attempt the connection,
+    // proving nothing about the server).
     const secret_fingerprint = try tamperOpensslTicketFile(allocator, sess_path);
     var fingerprint_hex: [64]u8 = undefined;
     const fingerprint_hex_slice = std.fmt.bufPrint(&fingerprint_hex, "{x}", .{secret_fingerprint}) catch unreachable;
@@ -2985,40 +3020,44 @@ fn decodeOpensslSessionFile(allocator: std.mem.Allocator, path: []const u8) ![]u
 }
 
 /// #369: a non-secret-in-itself fingerprint of a captured ticket -- 32
-/// authentic ciphertext bytes right after `ticket_protection.magic`
-/// (`"TDTK"`) -- for asserting that a log or diagnostic never echoes the
-/// actual secret ticket bytes, as opposed to merely checking for the
-/// generic string "TLS session ticket" (which a legitimate fresh reissue
-/// would also trip for an unrelated reason).
+/// authentic ciphertext bytes starting right at the ciphertext, i.e. right
+/// after `ticket_protection`'s fixed 36-byte header (magic + version +
+/// AEAD id + reserved + key id + nonce, see `writeHeader`) -- for asserting
+/// that a log or diagnostic never echoes the actual secret ticket bytes,
+/// as opposed to merely checking for the generic string "TLS session
+/// ticket" (which a legitimate fresh reissue would also trip for an
+/// unrelated reason).
 fn opensslSessionTicketFingerprint(allocator: std.mem.Allocator, path: []const u8) ![32]u8 {
     const raw = try decodeOpensslSessionFile(allocator, path);
     defer allocator.free(raw);
     const ticket_start = std.mem.indexOf(u8, raw, "TDTK") orelse return error.TicketMagicNotFound;
-    if (ticket_start + 24 + 32 >= raw.len) return error.TicketTooShortToFingerprint;
+    const ciphertext_start = ticket_start + tls_core.ticket_protection.fixed_header_len;
+    if (ciphertext_start + 32 >= raw.len) return error.TicketTooShortToFingerprint;
     var fingerprint: [32]u8 = undefined;
-    @memcpy(&fingerprint, raw[ticket_start + 24 ..][0..32]);
+    @memcpy(&fingerprint, raw[ciphertext_start..][0..32]);
     return fingerprint;
 }
 
 /// #369: flips one byte inside the opaque ticket envelope of an
-/// OpenSSL-managed `-sess_out` PEM file, in place. Walks the minimal DER
-/// TLV structure of the decoded `SSL_SESSION_ASN1` to find the specific
-/// OCTET STRING leaf whose content starts with `ticket_protection.magic`
-/// (`"TDTK"`, wire-visible and non-secret by that module's own contract),
-/// then corrupts a byte comfortably inside its declared length -- never a
-/// tag or length byte, which a real regression could otherwise trip over
-/// only in OpenSSL's own local parser, proving nothing about the server.
+/// OpenSSL-managed `-sess_out` PEM file, in place. Locates
+/// `ticket_protection`'s public, non-secret magic (`"TDTK"`) with a plain
+/// byte search -- this is a magic-prefixed-blob search, not a DER TLV
+/// walk of the surrounding `SSL_SESSION_ASN1` structure -- then flips a
+/// byte a small, fixed distance past the envelope's fixed 36-byte header
+/// (`ticket_protection.fixed_header_len`: magic/version/AEAD id/reserved/
+/// key id/nonce), landing inside the actual AEAD ciphertext rather than
+/// the nonce or a length-prefix byte a naive offset could hit instead.
 fn tamperOpensslTicketFile(allocator: std.mem.Allocator, path: []const u8) ![32]u8 {
     const raw = try decodeOpensslSessionFile(allocator, path);
     defer allocator.free(raw);
 
     const magic = "TDTK";
     const ticket_start = std.mem.indexOf(u8, raw, magic) orelse return error.TicketMagicNotFound;
-    // The ticket envelope's fixed header (magic + key id + nonce + AEAD
-    // fields) leaves ample authenticated ciphertext after it in any
-    // realistic ticket; flipping well past the header and short of the
-    // very end stays inside the OCTET STRING's content either way.
-    const flip_at = ticket_start + 24;
+    const ciphertext_start = ticket_start + tls_core.ticket_protection.fixed_header_len;
+    // A few bytes into the ciphertext, comfortably clear of the header
+    // fields before it and the AEAD tag after it for any realistic
+    // ticket size.
+    const flip_at = ciphertext_start + 8;
     if (flip_at + 32 >= raw.len) return error.TicketTooShortToTamper;
     // A fingerprint of the still-authentic ciphertext right after the flip
     // point, captured before corrupting it, so the caller can assert this
@@ -3068,12 +3107,14 @@ const GeneratedCert = struct {
 };
 
 fn generateAlternateServerCert(allocator: std.mem.Allocator, server_name: []const u8) !GeneratedCert {
-    const cwd = try compat.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(cwd);
+    const dir = try interopSecretsDir(allocator);
+    defer allocator.free(dir);
     const unique = compat.milliTimestamp();
-    const cert_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/interop-restart-cert-{d}.pem", .{ cwd, unique });
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/interop-restart-cert-{d}.pem", .{ dir, unique });
     errdefer allocator.free(cert_path);
-    const key_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/interop-restart-key-{d}.pem", .{ cwd, unique });
+    // The private key: same reasoning as `interopSecretsDir` -- outside
+    // any cached path even though it is a throwaway test-only identity.
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/interop-restart-key-{d}.pem", .{ dir, unique });
     errdefer allocator.free(key_path);
     const san_arg = try std.fmt.allocPrint(allocator, "subjectAltName=DNS:{s}", .{server_name});
     defer allocator.free(san_arg);
@@ -3191,6 +3232,25 @@ test "restart.ephemeral.ticket_miss and restart.ephemeral.fresh_ticket" {
     try assertContains(second.stdout, "HTTP/1.1 200 OK");
     try assertContains(second.stdout, "alive");
 
+    // The reconnect above must have actually been *caused* by a real
+    // server-side miss on A's old key, not merely have succeeded for some
+    // other reason (e.g. OpenSSL silently dropping the offer): assert the
+    // typed miss outcome now, on B's own metrics, before doing anything
+    // that could also move `accepted` and blur which reconnect caused
+    // which delta. B is a fresh process, so this is B's first and only
+    // resumption attempt so far -- an absolute count, not a delta, is
+    // exact here.
+    var post_miss_metrics = try sendPureZigTlsHttp1Request(allocator, process_b.port, "/status/metrics");
+    defer post_miss_metrics.deinit();
+    try std.testing.expect((prometheusLabeledMetricValue(post_miss_metrics.body, "tardigrade_tls_resumption_outcome_total", &.{
+        "transport=\"record\"",
+        "outcome=\"miss\"",
+    }) orelse 0) >= 1);
+    try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(post_miss_metrics.body, "tardigrade_tls_resumption_outcome_total", &.{
+        "transport=\"record\"",
+        "outcome=\"accepted\"",
+    }) orelse 0);
+
     // 8-9: process B issues its own fresh, usable ticket, proven by a real
     // resumed reconnect within B's lifetime -- not merely a metric.
     const b_sess_path = try opensslSessionPath(allocator, process_b.port, "restart-ephemeral-fresh");
@@ -3234,7 +3294,27 @@ test "restart.ephemeral.ticket_miss and restart.ephemeral.fresh_ticket" {
     try std.testing.expect(!containsSubstring(log_b, fingerprint_hex_slice));
 }
 
-test "restart.cert_change.ticket_rejected" {
+// Named `restart_and_credential_change`, not `cert_change`: process A and
+// B are both `stateless` mode, so B constructs its own fresh ephemeral
+// ticket-protection key regardless of which credential it serves -- B
+// cannot decrypt A's ticket at all, for the same ephemeral-key-loss reason
+// `restart.ephemeral.ticket_miss` already covers, *before* any recovered
+// session's certificate/auth-binding field could ever be inspected. This
+// test would pass unchanged even if certificate-binding compatibility
+// checking were completely broken, so it must not be read as proving that
+// check. What it does prove: swapping the served credential across a
+// restart is *also* safe -- the old ticket still doesn't authenticate, and
+// the miss is still a real server-side miss (see the shared metric
+// assertion below), not an accident of the credential swap silently
+// producing some other rejection path. True certificate/auth-binding-change
+// coverage (the same ephemeral key, a different certificate) needs either a
+// live credential-reload path that preserves the resumption runtime across
+// the swap -- the appliance profile this suite builds under explicitly
+// forbids `TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS` -- or a persistent
+// keyring that survives a restart, which does not exist in production
+// today (see docs/RESUMPTION_TEST_PLAN.md's rotation section). Both are
+// deferred.
+test "restart.restart_and_credential_change.ticket_rejected" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
     try requireOpenssl(allocator);
@@ -3284,9 +3364,9 @@ test "restart.cert_change.ticket_rejected" {
     process_a.stop();
     process_a_running = false;
 
-    // Process B: same server_name, a different credential generation --
-    // this changes the ticket's authentication binding (RFC 9846's
-    // certificate-bound resumption contract).
+    // Process B: same server_name, a different credential generation, and
+    // (as with `restart.ephemeral.*`) its own naturally fresh ephemeral
+    // ticket key regardless.
     var process_b = try TardigradeProcess.start(allocator, .{
         .config_text = config_text,
         .ready_https_insecure = true,
@@ -3303,7 +3383,7 @@ test "restart.cert_change.ticket_rejected" {
     const connect_b = try opensslConnectArg(allocator, process_b.port);
     defer allocator.free(connect_b);
 
-    // The old ticket must not bypass the new authentication requirement.
+    // The old ticket must not authenticate against the new credential.
     var second = try runOpenssl(allocator, &.{
         "s_client",        "-connect", connect_b,
         "-alpn",           "http/1.1", "-servername",
@@ -3317,8 +3397,14 @@ test "restart.cert_change.ticket_rejected" {
     try assertContains(second.stdout, "HTTP/1.1 200 OK");
     try assertContains(second.stdout, "alive");
 
+    // Same causal check as `restart.ephemeral.ticket_miss`: this must be a
+    // real server-side miss, not merely "some rejection happened."
     var metrics = try sendPureZigTlsHttp1Request(allocator, process_b.port, "/status/metrics");
     defer metrics.deinit();
+    try std.testing.expect((prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{
+        "transport=\"record\"",
+        "outcome=\"miss\"",
+    }) orelse 0) >= 1);
     try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{
         "transport=\"record\"",
         "outcome=\"accepted\"",
@@ -3343,6 +3429,15 @@ fn soakHeavyEnabled() bool {
 // documented `full handshake -> ticket issuance -> resumed reconnect ->
 // repeat` loop that production code actually supports today.
 //
+// `/healthz` is proxied to a real loopback origin rather than served by a
+// static `return` directive, and the exactly-once invariant below is
+// counted by that origin's own atomic request counter -- not by the
+// client observing a successful HTTP response. A client-side response
+// counter cannot distinguish "the server dispatched this request exactly
+// once" from "the server dispatched it twice but only one response made
+// it back"; only a counter incremented inside the real
+// application/upstream dispatch hook can.
+//
 // Known gap: there is no exposed gauge for server-side resumption-cache
 // occupancy (only issuance/outcome counters), so "memory/cache growth
 // converges to configured bounds" is proven here only via the *cache's
@@ -3357,12 +3452,21 @@ test "soak.reconnect_resumption" {
     var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
 
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "alive", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
     var tardigrade = try TardigradeProcess.start(allocator, .{
-        .config_text =
-        \\location = /healthz {
-        \\    return 200 alive;
-        \\}
-        ,
+        .config_text = config_text,
         .ready_https_insecure = true,
         .ready_path = "/healthz",
         .extra_env = &.{
@@ -3374,6 +3478,7 @@ test "soak.reconnect_resumption" {
         },
     });
     defer tardigrade.stop();
+    try upstream.resetCapture();
 
     const iterations: usize = if (soakHeavyEnabled()) 2_000 else 40;
 
@@ -3410,7 +3515,6 @@ test "soak.reconnect_resumption" {
     };
 
     var accepted_count: usize = 0;
-    var execution_count: usize = 0;
 
     var iter: usize = 0;
     while (iter < iterations) : (iter += 1) {
@@ -3429,11 +3533,6 @@ test "soak.reconnect_resumption" {
         const first_raw = try first_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
         defer allocator.free(first_raw);
         try assertContains(first_raw, "HTTP/1.1 200 OK");
-        // Only the real application/upstream dispatch increments execution
-        // counts -- never a TLS-layer decision function such as
-        // `earlyDataAccepted()`, which is not even in play on this
-        // full-handshake leg.
-        execution_count += 1;
 
         const candidate: tls_core.session.CandidateContext = .{
             .cipher_suite = capture.retained.common.cipher_suite,
@@ -3464,12 +3563,16 @@ test "soak.reconnect_resumption" {
         const resumed_raw = try resumed_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
         defer allocator.free(resumed_raw);
         try assertContains(resumed_raw, "HTTP/1.1 200 OK");
-        execution_count += 1;
     }
 
     // Required invariant: application executions == legitimate requests
-    // expected to execute, exactly -- two per iteration, one per connection.
-    try std.testing.expectEqual(iterations * 2, execution_count);
+    // expected to execute, exactly -- two per iteration, one per
+    // connection -- counted by the real origin's own atomic counter,
+    // incremented only inside its actual dispatch handler
+    // (`handleUpstreamConnection`), never derived from the client having
+    // observed a successful response.
+    const execution_count = upstream.requestCount();
+    try std.testing.expectEqual(@as(u32, @intCast(iterations * 2)), execution_count);
     // Every resumed reconnect actually resumed -- a soak that silently
     // degraded to full handshakes partway through would still pass a
     // looser ">= some fraction" check.

@@ -268,14 +268,16 @@ passed before it.
   (backed by `SSL_session_reused()`) and Tardigrade's
   `tardigrade_tls_resumption_outcome_total{outcome="accepted"}` metric —
   not merely a second successful handshake.
-- `interop.openssl.h2.resume` — the same proof scoped to the TLS layer
-  under the h2 ALPN path (handshake, ticket, resumed reconnect, ALPN
-  renegotiated to h2 again). Hand-rolling HPACK/frame encoding through raw
-  `s_client` stdin to drive one real h2 request was judged out of
-  proportion to what this case needs to prove, given H1 above already
-  proves resumption carries a real served request end to end and
-  production H2 dispatch has its own independent coverage; documented in
-  the test itself rather than silently narrowed.
+- `interop.openssl.h2.tls_resume` — named `tls_resume`, not `resume`: the
+  same proof scoped to the TLS layer under the h2 ALPN path (handshake,
+  ticket, resumed reconnect, ALPN renegotiated to h2 again), but no H2
+  frame/request is ever sent on the resumed connection, so it cannot catch
+  a bug that affects H2 dispatch only *after* resumption. **Real
+  application-level resumed-H2 interop is not proven by this slice** and
+  stays in the deferred matrix below — H1 above proves resumption carries a
+  real served request end to end at the protocol Tardigrade's own harness
+  can drive directly, and production H2 dispatch has its own independent
+  coverage, just not combined with resumption.
 - `interop.openssl.ticket.expired` — 1-second ticket lifetime, a real
   2-second sleep past it (there is no injectable clock at this external
   boundary), reconnect falls back to a full handshake, connection remains
@@ -293,14 +295,16 @@ passed before it.
   offering only `http/1.1`: falls back to a full handshake under the new
   ALPN, old ticket never silently reused.
 - `interop.openssl.ticket.tampered` — flips one byte inside the real
-  `ticket_protection` AEAD envelope (stateless mode; located by its public,
-  non-secret `"TDTK"` magic via a minimal DER walk of the OpenSSL session
-  file, landing the flip inside the OCTET STRING's declared length rather
-  than a tag/length byte a blind offset would otherwise corrupt — which
-  would only break OpenSSL's own local session-file parser and prove
-  nothing about the server). No crash, safe fallback to a full handshake,
-  and the still-authentic ciphertext fingerprint next to the flipped byte
-  never appears in the server's log or the client's own stdout/stderr.
+  `ticket_protection` AEAD envelope (stateless mode; located by a plain
+  byte search for its public, non-secret `"TDTK"` magic — not a DER TLV
+  walk of the surrounding OpenSSL session structure — then offset by the
+  envelope's own fixed 36-byte header so the flip lands inside the actual
+  AEAD ciphertext rather than the nonce or, with a naive fixed offset, a
+  DER length/tag byte, which would only break OpenSSL's own local
+  session-file parser and prove nothing about the server). No crash, safe
+  fallback to a full handshake, and the still-authentic ciphertext
+  fingerprint next to the flipped byte never appears in the server's log
+  or the client's own stdout/stderr.
 - **`interop.openssl.cipher_mismatch` deliberately not shipped.** Ad hoc
   verification found the reconnect still negotiated the *original* cipher
   suite despite the client restricting itself via `-ciphersuites` to a
@@ -314,14 +318,28 @@ passed before it.
   real process A (not `Runtime.deinit()`/`Runtime.init()` reused inside
   one test object) issues a stateless ticket, is terminated, and a real
   fresh process B with the same operator configuration proves: the old
-  ticket resolves as a miss rather than authenticating, the connection
-  still completes via a full handshake, B issues its own fresh ticket that
-  genuinely resumes within B's own lifetime, and neither process's log
-  ever contains the raw ticket ciphertext.
-- `restart.cert_change.ticket_rejected` — process B boots with a
-  different, test-generated throwaway credential under the same
-  `server_name`; the old ticket must not (and does not) bypass the new
-  authentication binding.
+  ticket resolves as a real server-side **miss** (asserted via
+  `resumption_outcome_total{outcome="miss"}`, not merely inferred from the
+  reconnect succeeding for some other reason) rather than authenticating,
+  the connection still completes via a full handshake, B issues its own
+  fresh ticket that genuinely resumes within B's own lifetime, and neither
+  process's log ever contains the raw ticket ciphertext.
+- `restart.restart_and_credential_change.ticket_rejected` — process B boots
+  with a different, test-generated throwaway credential under the same
+  `server_name`. **This does not prove certificate/auth-binding-change
+  rejection**: both processes are `stateless`, so B constructs its own
+  fresh ephemeral ticket key regardless of which credential it serves,
+  meaning B can't decrypt A's ticket at all — for the same reason as
+  `restart.ephemeral.ticket_miss` above, before any certificate-binding
+  field could even be inspected. What it does prove is that swapping the
+  served credential across a restart is *also* safe, with the same real
+  server-side miss (not merely "the reconnect happened to not authenticate
+  for an unspecified reason"). True certificate/auth-binding-change
+  coverage needs a live credential-reload path that preserves the
+  resumption runtime across the swap — the appliance profile this suite
+  builds under forbids dynamic TLS reload outright — or a persistent
+  keyring surviving a restart, neither of which exists in production today
+  (see the rotation section below). Deferred until one does.
 - Both use the ephemeral **stateless** ticket-key policy specifically —
   the currently supported restart-safety policy per #369 section 6.
   Stateful mode's cache-miss shape after a restart is a different,
@@ -370,6 +388,21 @@ passed before it.
   — not merely "not yet wired." Do not close #369 by treating any
   in-process/constructed-context 0-RTT test (Slices 1–2) as equivalent to
   this.
+- **Certificate/auth-binding-change rejection.**
+  `restart.restart_and_credential_change.ticket_rejected` only proves a
+  combined restart-plus-credential-swap is safe via the same ephemeral-key
+  miss as an ordinary restart; it cannot exercise the certificate-binding
+  check on a ticket that could otherwise still decrypt. Needs a live
+  credential-reload path that preserves the resumption runtime (currently
+  forbidden under the appliance profile) or a persistent keyring across
+  restart (not a production capability today — see Rotation below).
+- **Application-level resumed-H2 interop.** `interop.openssl.h2.tls_resume`
+  proves TLS-layer PSK resumption under the h2 ALPN path only; it never
+  drives a real H2 request/response over the resumed connection, so it
+  cannot catch a bug specific to H2 dispatch after resumption. Closing this
+  needs either hand-rolled HPACK/frame encoding over `openssl s_client`
+  stdin or an H2-capable external peer, driving one real request over the
+  resumed connection.
 - **Independent QUIC/H3 external interop for resumption/0-RTT.** The repo
   has real external QUIC/H3 tooling (`scripts/interop/run-interop.sh` +
   `tests/h3_interop_tool.zig`, driving ngtcp2/quiche/aioquic peers) that a
@@ -385,9 +418,12 @@ passed before it.
   reachable. Per #369 section 7 Outcome B, this slice does **not** build a
   test-only persistent-key system to manufacture rotation coverage; the
   actual supported policy is ephemeral-only restart invalidation, which
-  the restart cases above cover. If persistent-overlap rotation is still
-  required for #326/#369's closure, that needs its own production issue
-  before it can be tested here.
+  the restart cases above cover. #326 explicitly requires ticket-key
+  rotation ("without invalid memory access, nonce reuse, or indefinite
+  validity"), so this is not merely optional scope — **#512** is the
+  narrowly-scoped production-composition follow-up this needs before
+  #369's rotation rows can close; #369's operational rotation matrix stays
+  blocked on it, the same way #369's 0-RTT rows stay blocked on #510.
 - **`interop.openssl.cipher_mismatch`** — see above; needs investigation
   of an observed discrepancy before it can be shipped as a real assertion.
 - **Deterministic worker-thread-pinning test seam** (carried over from

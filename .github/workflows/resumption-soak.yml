@@ -47,3 +47,14 @@ jobs:
         run: >-
           zig build test-integration-resumption-interop -Dtls-profile=appliance
           --summary all --error-style verbose --test-timeout 10m
+
+      # This job doesn't currently cache .zig-cache, but check anyway --
+      # cheap, and keeps the invariant enforced if that ever changes.
+      - name: Verify no OpenSSL interop secrets leaked into the Zig cache
+        run: |
+          leaked=$(find .zig-cache -iname 'interop-*.sess' -o -iname 'interop-restart-key-*.pem' 2>/dev/null)
+          if [ -n "$leaked" ]; then
+            echo "found leaked interop secret file(s) under .zig-cache:"
+            echo "$leaked"
+            exit 1
+          fi

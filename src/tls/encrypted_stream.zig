@@ -361,6 +361,17 @@ pub const PureZigRecordStream = struct {
     /// place afterward so its securely-wiped sink stays observable.
     driver_torn_down: bool = false,
     handshake_started: bool = false,
+    /// Server role only: whether at least one real (non-CCS) handshake
+    /// message has been received yet. The very first handshake message any
+    /// server ever receives is structurally the ClientHello (anything else
+    /// there already fails for an unrelated reason), so this doubles as
+    /// "has the first ClientHello been seen" without duplicating a second,
+    /// independent ClientHello-tracking state machine. Gates the
+    /// middlebox-compat `change_cipher_spec` acceptance window alongside
+    /// `bridge.handshake_complete` (see `feedHandshakeToDriver`); a client
+    /// checks `handshake_started` instead, since generating its own
+    /// ClientHello is what flips that flag for the client role.
+    handshake_message_seen: bool = false,
     /// Explicit protocol epochs for inbound and outbound records. Tracked as a
     /// deliberate state machine rather than inferred from which keys happen to
     /// be installed: after the server installs its application read secret the
@@ -1464,16 +1475,23 @@ pub const PureZigRecordStream = struct {
                 try self.handleAlert(record.payload);
                 continue;
             }
-            // See the matching comment in `feedHandshakeToDriver`: RFC 8446
-            // Appendix D.4 middlebox-compat change_cipher_spec, dropped
-            // unopened since it was never encrypted.
+            // See the matching comment and RFC citation in
+            // `feedHandshakeToDriver`: middlebox-compat change_cipher_spec,
+            // dropped unopened since it was never encrypted, only inside
+            // the RFC-defined post-ClientHello/pre-peer-Finished window.
             if (record.content_type == .change_cipher_spec) {
-                if (record.payload.len != 1 or record.payload[0] != 0x01) return self.fail(error.UnexpectedRecordContent);
+                const first_client_hello_seen = if (self.role == .client) self.handshake_started else self.handshake_message_seen;
+                if (record.payload.len != 1 or record.payload[0] != 0x01 or !first_client_hello_seen or self.bridge.handshake_complete) {
+                    return self.fail(error.UnexpectedRecordContent);
+                }
                 continue;
             }
             const opened = try self.bridge.openProtected(epoch, record, &plaintext_buf);
             switch (opened.inner.content_type) {
-                .handshake => try self.appendInboundHandshake(opened.inner.content),
+                .handshake => {
+                    self.handshake_message_seen = true;
+                    try self.appendInboundHandshake(opened.inner.content);
+                },
                 .alert => try self.handleAlert(opened.inner.content),
                 .application_data,
                 .change_cipher_spec,
@@ -1532,22 +1550,33 @@ pub const PureZigRecordStream = struct {
                 try self.handleAlert(record.payload);
                 continue;
             }
-            // RFC 8446 Appendix D.4: a middlebox-compatibility-mode peer sends
-            // an unprotected single-byte {0x01} change_cipher_spec record at
-            // any point up to its own Finished; it carries no protocol
-            // meaning and MUST be dropped without further processing rather
-            // than opened through the bridge (it was never encrypted, so
-            // `openProtected` would try to decrypt an unprotected record).
+            // RFC 9846 §5 (RFC 8446 Appendix D.4's mechanism, carried
+            // forward): a middlebox-compatibility-mode peer sends an
+            // unprotected single-byte {0x01} change_cipher_spec record,
+            // which carries no protocol meaning and MUST be dropped without
+            // further processing rather than opened through the bridge (it
+            // was never encrypted, so `openProtected` would try to decrypt
+            // an unprotected record) -- but only inside the RFC-defined
+            // window: after the first ClientHello has been sent or
+            // received, and before the peer's Finished has been received.
+            // Outside that window (including here, before it) it is an
+            // unexpected record and must abort, not be silently dropped.
             // `parseHeader` already bounds it to exactly one byte; any other
-            // payload here is the "any other change_cipher_spec value" case
-            // RFC 8446 requires aborting the handshake for.
+            // payload is the "any other change_cipher_spec value" case the
+            // RFC also requires aborting the handshake for.
             if (record.content_type == .change_cipher_spec) {
-                if (record.payload.len != 1 or record.payload[0] != 0x01) return self.fail(error.UnexpectedRecordContent);
+                const first_client_hello_seen = if (self.role == .client) self.handshake_started else self.handshake_message_seen;
+                if (record.payload.len != 1 or record.payload[0] != 0x01 or !first_client_hello_seen or self.bridge.handshake_complete) {
+                    return self.fail(error.UnexpectedRecordContent);
+                }
                 continue;
             }
             const opened = self.bridge.openProtected(epoch, record, &plaintext_buf) catch |err| return self.fail(err);
             switch (opened.inner.content_type) {
-                .handshake => try self.driveReceive(epoch, opened.inner.content),
+                .handshake => {
+                    self.handshake_message_seen = true;
+                    try self.driveReceive(epoch, opened.inner.content);
+                },
                 .alert => try self.handleAlert(opened.inner.content),
                 .application_data,
                 .change_cipher_spec,
@@ -3847,7 +3876,20 @@ test "server-role stream accepts the 0x0301 ClientHello compatibility version on
     try testing.expectError(error.InvalidRecordVersion, client.feedHandshakeCiphertext(.initial, compat_server_hello[0..third.len]));
 }
 
-test "a handshake-epoch middlebox-compat change_cipher_spec is dropped without disrupting the handshake" {
+test "middlebox-compat change_cipher_spec before any ClientHello is rejected, not silently dropped" {
+    const cp = testProvider();
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+
+    // RFC 9846 §5's window opens only after the first ClientHello has been
+    // sent or received. A server that has not processed any handshake
+    // message yet (`handshake_message_seen` still false) must not accept
+    // one just because the wire shape matches -- otherwise a peer could
+    // smuggle this in as the very first bytes on the connection.
+    try testing.expectError(error.UnexpectedRecordContent, server.feedHandshakeCiphertext(.initial, &.{ 20, 3, 3, 0, 1, 1 }));
+}
+
+test "middlebox-compat change_cipher_spec after ClientHello, before peer Finished, is dropped without disrupting the handshake" {
     const cp = testProvider();
     var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
     defer server.deinit();
@@ -3856,11 +3898,15 @@ test "a handshake-epoch middlebox-compat change_cipher_spec is dropped without d
     const server_hs = secret(0x52);
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &client_hs } });
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } });
+    // Simulates the server already having received the ClientHello (the
+    // actual message content and driver plumbing is exercised elsewhere;
+    // this test isolates the CCS acceptance-window check itself).
+    server.handshake_message_seen = true;
 
     // {0x14, 03, 03, 00, 01, 01}: an unprotected, single-byte compat CCS at
-    // the handshake epoch -- RFC 8446 Appendix D.4 requires this be dropped,
-    // not opened through the bridge (it was never encrypted) or treated as a
-    // handshake failure.
+    // the handshake epoch -- RFC 9846 §5 requires this be dropped, not
+    // opened through the bridge (it was never encrypted) or treated as a
+    // handshake failure, inside its defined window.
     const consumed = try server.feedHandshakeCiphertext(.handshake, &.{ 20, 3, 3, 0, 1, 1 });
     try testing.expectEqual(@as(usize, 6), consumed);
     try testing.expectEqual(@as(?Error, null), server.failed);
@@ -3879,6 +3925,26 @@ test "a handshake-epoch middlebox-compat change_cipher_spec is dropped without d
     try testing.expectEqualSlices(u8, "hello", out[0..n]);
 }
 
+test "middlebox-compat change_cipher_spec after peer Finished (handshake already complete) is rejected" {
+    const cp = testProvider();
+    var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+
+    const client_hs = secret(0x51);
+    const server_hs = secret(0x52);
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &client_hs } });
+    try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } });
+    server.handshake_message_seen = true;
+    // Simulates the handshake already having completed (peer's Finished
+    // already received and processed) without exercising the full
+    // application-key-installation precondition chain
+    // `Bridge.markHandshakeComplete()` requires -- this test isolates the
+    // CCS acceptance-window check's late-arrival boundary specifically.
+    server.bridge.handshake_complete = true;
+
+    try testing.expectError(error.UnexpectedRecordContent, server.feedHandshakeCiphertext(.handshake, &.{ 20, 3, 3, 0, 1, 1 }));
+}
+
 test "a malformed change_cipher_spec at the handshake epoch aborts instead of silently passing" {
     const cp = testProvider();
     var server = PureZigRecordStream.init(.server, cp, .tls_aes_128_gcm_sha256);
@@ -3888,8 +3954,9 @@ test "a malformed change_cipher_spec at the handshake epoch aborts instead of si
     const server_hs = secret(0x52);
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &client_hs } });
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } });
+    server.handshake_message_seen = true;
 
-    // Same envelope, wrong payload byte (RFC 8446: "any other
+    // Same envelope, wrong payload byte (RFC 9846: "any other
     // change_cipher_spec value... MUST abort the handshake").
     try testing.expectError(error.UnexpectedRecordContent, server.feedHandshakeCiphertext(.handshake, &.{ 20, 3, 3, 0, 1, 0 }));
 }

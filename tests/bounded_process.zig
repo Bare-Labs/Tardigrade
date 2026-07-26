@@ -4,6 +4,17 @@ const compat = @import("zig_compat");
 
 pub const default_deadline_ms: u32 = 10_000;
 pub const extended_deadline_ms: u32 = 30_000;
+/// `options.stdin` is written in one blocking `writeStreamingAll` call
+/// before stdout/stderr draining (and its own deadline machinery) starts,
+/// so it is not itself bounded by `deadline_ms` -- a child that never reads
+/// stdin, or fills its own stdout/stderr pipe while waiting on it, could
+/// block this call indefinitely. Capping `stdin` at this size (well under
+/// the smallest realistic default pipe capacity, and at the POSIX
+/// `PIPE_BUF` atomic-write guarantee) keeps the write a single, immediate,
+/// non-blocking kernel buffer copy in practice instead of a real
+/// deadlock risk. Bytes beyond it are a caller bug, not a runtime
+/// condition to recover from -- see `run`'s `std.debug.assert`.
+pub const max_stdin_len: usize = 4096;
 
 pub const Outcome = union(enum) {
     normal_exit: u8,
@@ -25,7 +36,9 @@ pub const Options = struct {
     cwd: std.process.Child.Cwd = .inherit,
     /// Bytes written to the child's stdin immediately after spawn, then the
     /// pipe is closed so the child sees EOF. `null` (the default) leaves
-    /// stdin closed from the start, matching every existing caller.
+    /// stdin closed from the start, matching every existing caller. Must
+    /// be at most `max_stdin_len` -- see that constant's doc comment for
+    /// why this write is not itself deadline-bounded.
     stdin: ?[]const u8 = null,
     /// Bounded pause between writing `stdin` and closing the pipe. Some
     /// protocols (e.g. a TLS post-handshake NewSessionTicket, sent after the
@@ -70,6 +83,7 @@ pub const Result = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Error!Result {
+    if (options.stdin) |input| std.debug.assert(input.len <= max_stdin_len);
     const io = compat.io();
     const deadline_end: ?std.Io.Clock.Timestamp = if (options.deadline_ms == 0)
         null
