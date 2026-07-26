@@ -352,6 +352,27 @@ fn decodeHexSlice(raw: []const u8, bytes: []u8) LoadError!void {
     _ = std.fmt.hexToBytes(bytes, trimmed) catch return error.InvalidHex;
 }
 
+pub fn fuzzPersistentSnapshot(allocator: std.mem.Allocator, input: []const u8) void {
+    var snapshot = parse(allocator, input) catch return;
+    defer snapshot.deinit();
+
+    const built = ticket_protection.Snapshot.build(
+        allocator,
+        snapshot.configs,
+        snapshot.generation,
+        fuzzCapabilities(),
+    ) catch return;
+    built.release();
+}
+
+fn fuzzCapabilities() provider.Capabilities {
+    var caps = provider.Capabilities{};
+    caps.aeads.insert(.aes_128_gcm);
+    caps.aeads.insert(.aes_256_gcm);
+    caps.aeads.insert(.chacha20_poly1305);
+    return caps;
+}
+
 test "persistent ticket key snapshot parses owned key configs" {
     const json =
         \\{"version":1,"generation":7,"keys":[{"id":"000102030405060708090a0b0c0d0e0f","aead":"aes_128_gcm","key":"101112131415161718191a1b1c1d1e1f","not_before_unix_ms":1000,"encrypt_until_unix_ms":5000,"decrypt_until_unix_ms":9000,"nonce_lease":{"prefix":"aabbccdd","start":10,"end_exclusive":20}}]}
@@ -369,4 +390,23 @@ test "persistent ticket key snapshot rejects malformed secret lengths" {
         \\{"version":1,"generation":1,"keys":[{"id":"000102030405060708090a0b0c0d0e0f","aead":"aes_128_gcm","key":"10","not_before_unix_ms":1000,"encrypt_until_unix_ms":5000,"decrypt_until_unix_ms":9000}]}
     ;
     try std.testing.expectError(error.InvalidHex, parse(std.testing.allocator, json));
+}
+
+test "fuzz: persistent ticket key snapshot parser rejects hostile JSON safely" {
+    try std.testing.fuzz({}, fuzzPersistentSnapshotInput, .{ .corpus = &.{
+        "",
+        "{}",
+        "[]",
+        "{\"version\":1,\"generation\":1,\"keys\":[]}",
+        "{\"version\":2,\"generation\":1,\"keys\":[]}",
+        "{\"version\":1,\"generation\":1,\"keys\":[{\"id\":\"000102030405060708090a0b0c0d0e0f\",\"aead\":\"aes_128_gcm\",\"key\":\"101112131415161718191a1b1c1d1e1f\",\"not_before_unix_ms\":1000,\"encrypt_until_unix_ms\":5000,\"decrypt_until_unix_ms\":9000}]}",
+        "{\"version\":1,\"generation\":1,\"keys\":[{\"id\":\"000102030405060708090a0b0c0d0e0f\",\"aead\":\"chacha20_poly1305\",\"key\":\"202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f\",\"not_before_unix_ms\":1000,\"encrypt_until_unix_ms\":5000,\"decrypt_until_unix_ms\":9000,\"nonce_lease\":{\"prefix\":\"01020304\",\"start\":0,\"end_exclusive\":1}}]}",
+        &([_]u8{0xff} ** 128),
+    } });
+}
+
+fn fuzzPersistentSnapshotInput(_: void, smith: *std.testing.Smith) !void {
+    var input_buf: [4096]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    fuzzPersistentSnapshot(std.testing.allocator, input_buf[0..len]);
 }

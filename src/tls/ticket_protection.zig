@@ -1088,6 +1088,27 @@ fn sampleServerState(allocator: std.mem.Allocator) !session.ServerRecoverableSta
     return state;
 }
 
+fn sentinelServerState(allocator: std.mem.Allocator) !session.ServerRecoverableState {
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(allocator, session.Limits.default, .{
+        .cipher_suite = .tls_chacha20_poly1305_sha256,
+        .resumption_psk = &([_]u8{0xcd} ** 32),
+        .server_name = "sentinel.example.test",
+        .application_protocol = "http/1.1",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer("sentinel-leaf"),
+        .issued_at_unix_ms = 777,
+        .lifetime_seconds = 123,
+        .early_data = .{ .early_data_capable = 99 },
+        .transport_compat = .{ .format_id = 7, .format_version = 2, .bytes = "sentinel-transport" },
+        .application_compat = .{ .format_id = 8, .format_version = 3, .bytes = "sentinel-application" },
+        .early_data_transport_compat = .{ .format_id = 9, .format_version = 4, .bytes = "sentinel-early-transport" },
+        .early_data_application_compat = .{ .format_id = 10, .format_version = 5, .bytes = "sentinel-early-application" },
+    });
+    var state: session.ServerRecoverableState = .{};
+    state.init(&common, 0x55667788);
+    return state;
+}
+
 const TestObserver = struct {
     events: std.ArrayList(Event) = .empty,
 
@@ -1188,6 +1209,65 @@ fn expectRoundTrip(
     try testing.expectEqualSlices(u8, state.common.resumption_psk.slice(), recovered.common.resumption_psk.slice());
 }
 
+fn expectCompatEqual(expected: ?*const session.CompatSnapshot, actual: ?*const session.CompatSnapshot) !void {
+    if (expected) |expected_snap| {
+        try testing.expect(actual != null);
+        try testing.expectEqual(expected_snap.format_id, actual.?.format_id);
+        try testing.expectEqual(expected_snap.format_version, actual.?.format_version);
+        try testing.expectEqualSlices(u8, expected_snap.slice(), actual.?.slice());
+    } else {
+        try testing.expect(actual == null);
+    }
+}
+
+fn expectServerStateEqual(expected: *const session.ServerRecoverableState, actual: *const session.ServerRecoverableState) !void {
+    try testing.expectEqual(expected.ticket_age_add, actual.ticket_age_add);
+    try testing.expectEqual(expected.common.cipher_suite, actual.common.cipher_suite);
+    try testing.expectEqual(expected.common.server_name == null, actual.common.server_name == null);
+    if (expected.common.server_name) |expected_sni|
+        try testing.expectEqualSlices(u8, expected_sni.slice(), actual.common.server_name.?.slice());
+    try testing.expectEqual(expected.common.application_protocol == null, actual.common.application_protocol == null);
+    if (expected.common.application_protocol) |expected_alpn|
+        try testing.expectEqualSlices(u8, expected_alpn.slice(), actual.common.application_protocol.?.slice());
+    try testing.expectEqualSlices(u8, &expected.common.auth_binding.bytes, &actual.common.auth_binding.bytes);
+    try testing.expectEqual(expected.common.issued_at_unix_ms, actual.common.issued_at_unix_ms);
+    try testing.expectEqual(expected.common.lifetime_seconds, actual.common.lifetime_seconds);
+    try testing.expectEqualDeep(expected.common.early_data, actual.common.early_data);
+    try testing.expectEqualSlices(u8, expected.common.resumption_psk.slice(), actual.common.resumption_psk.slice());
+    try expectCompatEqual(if (expected.common.transport_compat) |*snap| snap else null, if (actual.common.transport_compat) |*snap| snap else null);
+    try expectCompatEqual(if (expected.common.application_compat) |*snap| snap else null, if (actual.common.application_compat) |*snap| snap else null);
+    try expectCompatEqual(if (expected.common.early_data_transport_compat) |*snap| snap else null, if (actual.common.early_data_transport_compat) |*snap| snap else null);
+    try expectCompatEqual(if (expected.common.early_data_application_compat) |*snap| snap else null, if (actual.common.early_data_application_compat) |*snap| snap else null);
+}
+
+pub fn fuzzTicketIdentity(allocator: std.mem.Allocator, input: []const u8) !void {
+    const limits = session.Limits.default;
+    _ = parseEnvelope(input, limits) catch {};
+
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const configs = [_]KeyConfig{
+        sampleKeyConfigWithByte(keyId(0xf1), .aes_128_gcm, null, 0x11),
+        sampleKeyConfigWithByte(keyId(0xf2), .aes_256_gcm, null, 0x22),
+        sampleKeyConfigWithByte(keyId(0xf3), .chacha20_poly1305, null, 0x33),
+    };
+    keyring.install(keyring.buildSnapshot(&configs, testCapabilities()) catch return) catch return;
+
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = limits };
+    var out = try sentinelServerState(allocator);
+    defer out.deinit();
+    var expected: session.ServerRecoverableState = .{};
+    try out.cloneInto(allocator, &expected);
+    defer expected.deinit();
+
+    const result = protector.resolve(allocator, input, 2_000, &out);
+    if (result) |found| {
+        if (!found) try expectServerStateEqual(&expected, &out);
+    } else |_| {
+        try expectServerStateEqual(&expected, &out);
+    }
+}
+
 const ConcurrentSealTask = struct {
     protector: *Protector,
     state: *const session.ServerRecoverableState,
@@ -1271,6 +1351,24 @@ fn buildAuthenticatedEnvelope(
     return out[0..protected_len];
 }
 
+fn buildProtectedTicketSeed(
+    allocator: std.mem.Allocator,
+    aead: provider.Aead,
+    id: KeyId,
+    key_byte: u8,
+    nonce_prefix: [4]u8,
+    out: []u8,
+) ![]const u8 {
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    try installSingleKey(&keyring, id, aead, .{ .prefix = nonce_prefix, .start = 0, .end_exclusive = 1 }, key_byte);
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    return try protector.seal(allocator, &state, 2_000, out);
+}
+
 test "AEAD id mapping is stable and not enum ordinal dependent" {
     try testing.expectEqual(@as(u8, 1), encodeAeadId(.aes_128_gcm));
     try testing.expectEqual(@as(u8, 2), encodeAeadId(.aes_256_gcm));
@@ -1307,6 +1405,59 @@ test "parseEnvelope validates public structure without allocation" {
     identity[5] = encodeAeadId(.aes_128_gcm);
     identity[7] = 1;
     try testing.expectError(error.MalformedEnvelope, parseEnvelope(&identity, session.Limits.default));
+}
+
+test "fuzz: ticket identity parsing and miss resolution never panic or mutate output" {
+    var aes128_seed_buf = [_]u8{0} ** 512;
+    var aes256_seed_buf = [_]u8{0} ** 512;
+    var chacha_seed_buf = [_]u8{0} ** 512;
+    const aes128_seed = try buildProtectedTicketSeed(testing.allocator, .aes_128_gcm, keyId(0xf1), 0x11, .{ 0xf1, 0, 0, 0 }, &aes128_seed_buf);
+    const aes256_seed = try buildProtectedTicketSeed(testing.allocator, .aes_256_gcm, keyId(0xf2), 0x22, .{ 0xf2, 0, 0, 0 }, &aes256_seed_buf);
+    const chacha_seed = try buildProtectedTicketSeed(testing.allocator, .chacha20_poly1305, keyId(0xf3), 0x33, .{ 0xf3, 0, 0, 0 }, &chacha_seed_buf);
+
+    var corpus = [_][]const u8{
+        "",
+        "TDTK",
+        "TDTK\x01\x01\x00\x00",
+        &([_]u8{0} ** (fixed_header_len + tag_len)),
+        &([_]u8{ 0x54, 0x44, 0x54, 0x4b, 0x01, 0x01, 0x00, 0x00 } ++ [_]u8{0x00} ** (fixed_header_len + tag_len)),
+        &([_]u8{0xff} ** 256),
+        aes128_seed,
+        aes256_seed,
+        chacha_seed,
+    };
+    try testing.fuzz({}, fuzzTicketIdentityInput, .{ .corpus = &corpus });
+}
+
+fn fuzzTicketIdentityInput(_: void, smith: *testing.Smith) !void {
+    var input_buf: [session.absolute_ticket_wire_max + 16]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    try fuzzTicketIdentity(testing.allocator, input_buf[0..len]);
+}
+
+test "fuzz helper preserves output on resolver allocation errors" {
+    var ticket_buf = [_]u8{0} ** 512;
+    const ticket = try buildProtectedTicketSeed(testing.allocator, .aes_128_gcm, keyId(0xf1), 0x11, .{ 0xf1, 0, 0, 0 }, &ticket_buf);
+
+    var keyring = ReloadableKeyRing.init(testing.allocator);
+    defer keyring.deinit();
+    const config = sampleKeyConfigWithByte(keyId(0xf1), .aes_128_gcm, null, 0x11);
+    try keyring.install(try keyring.buildSnapshot(&.{config}, testCapabilities()));
+    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+
+    var out = try sentinelServerState(testing.allocator);
+    defer out.deinit();
+    var expected: session.ServerRecoverableState = .{};
+    try out.cloneInto(testing.allocator, &expected);
+    defer expected.deinit();
+
+    var plaintext_failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, protector.resolve(plaintext_failing.allocator(), ticket, 2_000, &out));
+    try expectServerStateEqual(&expected, &out);
+
+    var decode_failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    try testing.expectError(error.OutOfMemory, protector.resolve(decode_failing.allocator(), ticket, 2_000, &out));
+    try expectServerStateEqual(&expected, &out);
 }
 
 test "protectedLen reserves envelope overhead exactly" {
