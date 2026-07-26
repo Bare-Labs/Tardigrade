@@ -334,8 +334,14 @@ pub fn writeRetryV1(
     retry_scid: []const u8,
     token: []const u8,
     out: []u8,
-) error{ BufferTooShort, InvalidConnectionId, RetryBodyTooLong }![]const u8 {
+) error{ BufferTooShort, InvalidConnectionId, RetryBodyTooLong, EmptyToken, RetryScidNotDistinct }![]const u8 {
     if (client_scid.len > max_cid_len or retry_scid.len > max_cid_len) return error.InvalidConnectionId;
+    // A Retry with no token defeats the point of Retry (there is nothing for
+    // a conforming client to echo back), and a Retry SCID equal to the
+    // client's original DCID is indistinguishable from "no Retry happened" —
+    // #387 requires a server-chosen SCID distinct from it.
+    if (token.len == 0) return error.EmptyToken;
+    if (std.mem.eql(u8, original_dcid, retry_scid)) return error.RetryScidNotDistinct;
 
     var pos: usize = 0;
     const header_len = 1 + 4 + 1 + client_scid.len + 1 + retry_scid.len + token.len;
@@ -520,6 +526,20 @@ test "writeRetryV1 round-trips through parsePacket and verifyRetryIntegrity" {
     @memcpy(tampered[0..written.len], written);
     tampered[written.len - 1] ^= 0x01;
     try testing.expect(!verifyRetryIntegrity(tampered[0..written.len], &odcid));
+}
+
+test "writeRetryV1 rejects an empty token and a Retry SCID matching the client's original DCID" {
+    const odcid = [_]u8{0x01} ** 8;
+    const client_scid = [_]u8{0x02} ** 8;
+    const retry_scid = [_]u8{0x03} ** 8;
+    var buf: [128]u8 = undefined;
+
+    // An empty token gives a conforming client nothing to echo back.
+    try testing.expectError(error.EmptyToken, writeRetryV1(&odcid, &client_scid, &retry_scid, "", &buf));
+
+    // A Retry SCID identical to the client's original DCID is indistinguishable
+    // from no Retry having happened at all — the server must choose a fresh one.
+    try testing.expectError(error.RetryScidNotDistinct, writeRetryV1(&odcid, &client_scid, &odcid, "tok", &buf));
 }
 
 test "writeRetryV1 rejects oversized connection IDs and short output buffers" {

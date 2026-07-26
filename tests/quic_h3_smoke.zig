@@ -405,9 +405,9 @@ const Endpoint = struct {
         try self.openAndProcess(received.bytes, path_key, outbound, received.received_at_us);
     }
 
-    fn handleAuthenticatedPath(self: *Endpoint, path_key: quic_path.PathKey, outbound: *DatagramQueue, now_us: u64) !void {
-        switch (self.paths.onDatagram(path_key, deterministicTestChallengeForPath(path_key), now_us)) {
-            .on_active_path, .probing => {},
+    fn handleAuthenticatedPath(self: *Endpoint, path_key: quic_path.PathKey, authenticated_bytes: usize, outbound: *DatagramQueue, now_us: u64) !void {
+        switch (self.paths.onDatagram(path_key, authenticated_bytes, deterministicTestChallengeForPath(path_key), now_us)) {
+            .on_active_path, .probing, .validated_pending_promotion => {},
             .blocked => {},
             .probe => |challenge| {
                 var frame_buf: [16]u8 = undefined;
@@ -497,7 +497,7 @@ const Endpoint = struct {
         if (self.largest_recv_pn[space] == null or pn > self.largest_recv_pn[space].?) {
             self.largest_recv_pn[space] = pn;
         }
-        if (level == .application) try self.handleAuthenticatedPath(path_key, outbound, now_us);
+        if (level == .application) try self.handleAuthenticatedPath(path_key, packet_end, outbound, now_us);
         try self.processFrames(level, frames, path_key, outbound, now_us);
     }
 

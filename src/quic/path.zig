@@ -526,6 +526,11 @@ pub const PathDecision = union(enum) {
     probe: [path_challenge_len]u8,
     /// Probe already in flight for this tuple; nothing new to send.
     probing,
+    /// The tuple already validated (via `validatePathResponse`) but has not
+    /// been promoted yet — e.g. a host migration blocked earlier on a fresh
+    /// peer CID. No new challenge is needed; the completed validation stays
+    /// intact and the caller may retry `promoteValidated`.
+    validated_pending_promotion,
     /// Migration policy forbids this address change: the caller drops state
     /// changes for this tuple (packets themselves stay processed on the
     /// active path per RFC 9000 §9.1 server behavior for disabled migration).
@@ -586,15 +591,6 @@ pub const PathManager = struct {
         self.paths[self.active].?.anti_amplification.markValidated();
     }
 
-    /// Record datagram bytes authenticated on `path` against that path's own
-    /// anti-amplification ledger. The caller must only call this after packet
-    /// protection succeeds — an unauthenticated datagram must never buy
-    /// candidate-path send budget. A no-op if `path` is not tracked.
-    pub fn recordReceivedOnPath(self: *PathManager, path: PathKey, bytes: u64) void {
-        const index = self.find(path) orelse return;
-        self.paths[index].?.anti_amplification.recordReceived(bytes);
-    }
-
     /// Record bytes sent on `path` against that path's own ledger. A no-op if
     /// `path` is not tracked.
     pub fn recordSentOnPath(self: *PathManager, path: PathKey, bytes: u64) void {
@@ -623,16 +619,32 @@ pub const PathManager = struct {
         return earliest;
     }
 
-    /// Classify a datagram's tuple and drive path state. `challenge_entropy`
-    /// supplies the unpredictable PATH_CHALLENGE payload (RFC 9000 §8.2.1)
+    /// Classify a datagram's tuple, credit `authenticated_bytes` against that
+    /// path's own anti-amplification ledger, and drive path state — all as
+    /// one operation, so the very first datagram on a brand-new candidate
+    /// path is accounted atomically with the path's creation. There is no
+    /// separate "record received bytes" step a caller could invoke before
+    /// the path exists: classification and accounting happen together here,
+    /// satisfying the required ingress order (authenticate, then credit and
+    /// classify) without forcing a two-call sequence that only works once the
+    /// path has already been seen.
+    ///
+    /// The caller must only pass datagrams whose packet protection already
+    /// succeeded (RFC 9000 §8.2.1) — an unauthenticated datagram must never
+    /// create a path slot or buy candidate-path send budget.
+    /// `challenge_entropy` supplies the unpredictable PATH_CHALLENGE payload
     /// when a probe starts.
     pub fn onDatagram(
         self: *PathManager,
         key: PathKey,
+        authenticated_bytes: u64,
         challenge_entropy: [path_challenge_len]u8,
         now_us: u64,
     ) PathDecision {
-        if (key.eql(self.paths[self.active].?.key)) return .on_active_path;
+        if (key.eql(self.paths[self.active].?.key)) {
+            self.paths[self.active].?.anti_amplification.recordReceived(authenticated_bytes);
+            return .on_active_path;
+        }
 
         const change: AddressChange = if (key.remote.sameHost(self.paths[self.active].?.key.remote))
             .nat_rebinding
@@ -651,14 +663,16 @@ pub const PathManager = struct {
 
         if (self.find(key)) |index| {
             const path = &self.paths[index].?;
+            path.anti_amplification.recordReceived(authenticated_bytes);
             switch (path.state) {
                 .validating => return .probing,
+                // Already validated but not yet promoted (e.g. blocked
+                // earlier on a fresh peer CID): keep the completed validation
+                // intact instead of discarding it for a fresh challenge.
+                .validated => return .validated_pending_promotion,
                 // Fresh traffic on a previously failed/unvalidated tuple:
                 // start a new probe.
                 .failed, .unvalidated => {},
-                // A validated non-active path re-activates only through a new
-                // challenge round trip, keeping the switch deterministic.
-                .validated => {},
             }
             path.state = .validating;
             path.change = change;
@@ -676,6 +690,7 @@ pub const PathManager = struct {
             .challenge = challenge_entropy,
             .challenge_deadline_us = now_us + self.validation_timeout_us,
         };
+        self.paths[slot].?.anti_amplification.recordReceived(authenticated_bytes);
         self.metrics.path_challenges_sent += 1;
         return .{ .probe = challenge_entropy };
     }
@@ -988,7 +1003,7 @@ const test_challenge = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
 
 test "datagrams on the active path require no action" {
     var manager = PathManager.init(.full, testKey(50_000), true);
-    try testing.expectEqual(PathDecision.on_active_path, manager.onDatagram(testKey(50_000), test_challenge, 0));
+    try testing.expectEqual(PathDecision.on_active_path, manager.onDatagram(testKey(50_000), 1_200, test_challenge, 0));
     try testing.expectEqual(PathState.validated, manager.activePath().state);
 }
 
@@ -996,17 +1011,32 @@ test "an unvalidated initial path keeps its amplification budget until markActiv
     var manager = PathManager.init(.full, testKey(50_000), false);
     try testing.expect(!manager.activePath().anti_amplification.validated);
     try testing.expectEqual(PathState.validated, manager.activePath().state);
-    manager.recordReceivedOnPath(testKey(50_000), 1_000);
+    _ = manager.onDatagram(testKey(50_000), 1_000, test_challenge, 0);
     try testing.expect(!manager.canSendOnPath(testKey(50_000), 3_001));
     manager.markActiveValidated();
     try testing.expect(manager.canSendOnPath(testKey(50_000), std.math.maxInt(u64)));
+}
+
+test "the first authenticated datagram on a new candidate path credits its own budget atomically" {
+    var manager = PathManager.init(.full, testKey(50_000), true);
+    const candidate = testKeyOtherHost(50_000);
+    // No path exists yet, so there is no pre-authentication budget at all —
+    // the candidate cannot have been credited before it was even classified.
+    try testing.expect(!manager.canSendOnPath(candidate, 1));
+
+    // A single onDatagram call both creates the path and credits it: there is
+    // no separate step where a caller could try (and silently fail) to
+    // record bytes on a path that does not exist yet.
+    _ = manager.onDatagram(candidate, 1_200, test_challenge, 0);
+    try testing.expect(manager.canSendOnPath(candidate, 3_600));
+    try testing.expect(!manager.canSendOnPath(candidate, 3_601));
 }
 
 test "path validation succeeds deterministically and switches the active path" {
     var manager = PathManager.init(.full, testKey(50_000), true);
     const rebound = testKey(50_001); // same host, new port: NAT rebinding
 
-    const decision = manager.onDatagram(rebound, test_challenge, 1_000);
+    const decision = manager.onDatagram(rebound, 1_200, test_challenge, 1_000);
     try testing.expectEqualSlices(u8, &test_challenge, &decision.probe);
     try testing.expectEqual(@as(u64, 1), manager.metrics.path_challenges_sent);
 
@@ -1030,7 +1060,7 @@ test "a real migration validates and requires congestion/RTT reset" {
     var manager = PathManager.init(.full, testKey(50_000), true);
     const migrated = testKeyOtherHost(50_000); // new host: real migration
 
-    _ = manager.onDatagram(migrated, test_challenge, 0);
+    _ = manager.onDatagram(migrated, 1_200, test_challenge, 0);
     const validated = manager.validatePathResponse(migrated, test_challenge, 100).?;
     try testing.expectEqual(AddressChange.migration, validated.change);
     const outcome = manager.promoteValidated(migrated).?;
@@ -1063,7 +1093,7 @@ test "a real migration validates and requires congestion/RTT reset" {
 test "a wrong PATH_RESPONSE payload does not validate the path" {
     var manager = PathManager.init(.full, testKey(50_000), true);
     const rebound = testKey(50_001);
-    _ = manager.onDatagram(rebound, test_challenge, 0);
+    _ = manager.onDatagram(rebound, 1_200, test_challenge, 0);
 
     const wrong = [_]u8{0xff} ** path_challenge_len;
     try testing.expectEqual(@as(?ValidatedCandidate, null), manager.validatePathResponse(rebound, wrong, 100));
@@ -1083,7 +1113,7 @@ test "path validation fails deterministically when the challenge expires" {
     var manager = PathManager.init(.full, testKey(50_000), true);
     manager.validation_timeout_us = 1_000;
     const rebound = testKey(50_001);
-    _ = manager.onDatagram(rebound, test_challenge, 0);
+    _ = manager.onDatagram(rebound, 1_200, test_challenge, 0);
     try testing.expectEqual(@as(?u64, 1_000), manager.nextValidationDeadlineUs());
 
     // Not yet expired: nothing fails.
@@ -1095,36 +1125,36 @@ test "path validation fails deterministically when the challenge expires" {
     // A late response for the failed probe is ignored.
     try testing.expectEqual(@as(?ValidatedCandidate, null), manager.validatePathResponse(rebound, test_challenge, 1_002));
     // New traffic from the tuple restarts a probe.
-    const retry = manager.onDatagram(rebound, test_challenge, 2_000);
+    const retry = manager.onDatagram(rebound, 1_200, test_challenge, 2_000);
     try testing.expectEqualSlices(u8, &test_challenge, &retry.probe);
 }
 
 test "migration policy gates rebinding and migration separately" {
     // disabled: even a port-only rebinding is blocked.
     var disabled = PathManager.init(.disabled, testKey(50_000), true);
-    try testing.expectEqual(PathDecision.blocked, disabled.onDatagram(testKey(50_001), test_challenge, 0));
+    try testing.expectEqual(PathDecision.blocked, disabled.onDatagram(testKey(50_001), 1_200, test_challenge, 0));
     try testing.expectEqual(@as(u64, 1), disabled.metrics.migrations_blocked);
 
     // nat_rebinding_only: port change probes, host change is blocked.
     var rebind_only = PathManager.init(.nat_rebinding_only, testKey(50_000), true);
-    const probe = rebind_only.onDatagram(testKey(50_001), test_challenge, 0);
+    const probe = rebind_only.onDatagram(testKey(50_001), 1_200, test_challenge, 0);
     try testing.expectEqualSlices(u8, &test_challenge, &probe.probe);
-    try testing.expectEqual(PathDecision.blocked, rebind_only.onDatagram(testKeyOtherHost(50_000), test_challenge, 0));
+    try testing.expectEqual(PathDecision.blocked, rebind_only.onDatagram(testKeyOtherHost(50_000), 1_200, test_challenge, 0));
     try testing.expectEqual(@as(u64, 1), rebind_only.metrics.migrations_blocked);
 
     // full: both probe.
     var full = PathManager.init(.full, testKey(50_000), true);
-    const rebinding_probe = full.onDatagram(testKey(50_001), test_challenge, 0);
+    const rebinding_probe = full.onDatagram(testKey(50_001), 1_200, test_challenge, 0);
     try testing.expectEqualSlices(u8, &test_challenge, &rebinding_probe.probe);
-    const migration_probe = full.onDatagram(testKeyOtherHost(50_000), test_challenge, 0);
+    const migration_probe = full.onDatagram(testKeyOtherHost(50_000), 1_200, test_challenge, 0);
     try testing.expectEqualSlices(u8, &test_challenge, &migration_probe.probe);
 }
 
 test "duplicate datagrams on a probing path do not restart the challenge" {
     var manager = PathManager.init(.full, testKey(50_000), true);
     const rebound = testKey(50_001);
-    _ = manager.onDatagram(rebound, test_challenge, 0);
-    const again = manager.onDatagram(rebound, [_]u8{0xee} ** path_challenge_len, 10);
+    _ = manager.onDatagram(rebound, 1_200, test_challenge, 0);
+    const again = manager.onDatagram(rebound, 1_200, [_]u8{0xee} ** path_challenge_len, 10);
     try testing.expectEqual(PathDecision.probing, again);
     try testing.expectEqual(@as(u64, 1), manager.metrics.path_challenges_sent);
     // The original challenge still validates.
@@ -1134,7 +1164,7 @@ test "duplicate datagrams on a probing path do not restart the challenge" {
 test "host migration validates without promoting until the caller secures a fresh peer CID" {
     var manager = PathManager.init(.full, testKey(50_000), true);
     const migrated = testKeyOtherHost(50_000);
-    _ = manager.onDatagram(migrated, test_challenge, 0);
+    _ = manager.onDatagram(migrated, 1_200, test_challenge, 0);
 
     const validated = manager.validatePathResponse(migrated, test_challenge, 100).?;
     try testing.expectEqual(AddressChange.migration, validated.change);
@@ -1152,20 +1182,42 @@ test "host migration validates without promoting until the caller secures a fres
     try testing.expectEqual(@as(u64, 1), manager.metrics.migrations);
 }
 
+test "a validated candidate blocked on a peer CID survives further datagrams instead of re-probing" {
+    var manager = PathManager.init(.full, testKey(50_000), true);
+    const migrated = testKeyOtherHost(50_000);
+    _ = manager.onDatagram(migrated, 1_200, test_challenge, 0);
+    _ = manager.validatePathResponse(migrated, test_challenge, 100).?;
+    manager.recordMigrationBlockedNoPeerCid();
+    try testing.expectEqual(@as(u64, 1), manager.metrics.migrations_blocked_no_peer_cid);
+    try testing.expectEqual(@as(u64, 1), manager.metrics.path_challenges_sent);
+
+    // Another authenticated datagram arrives on the same still-validated
+    // candidate path (for example, carrying the NEW_CONNECTION_ID that will
+    // unblock it). It must not discard the completed validation and start a
+    // fresh challenge round trip.
+    const decision = manager.onDatagram(migrated, 300, test_challenge, 200);
+    try testing.expectEqual(PathDecision.validated_pending_promotion, decision);
+    try testing.expectEqual(@as(u64, 1), manager.metrics.path_challenges_sent);
+
+    // The still-validated candidate promotes without ever re-probing.
+    const outcome = manager.promoteValidated(migrated).?;
+    try testing.expect(outcome.reset_congestion);
+    try testing.expect(manager.activePath().key.eql(migrated));
+}
+
 test "promoteValidated is null for a path that never validated" {
     var manager = PathManager.init(.full, testKey(50_000), true);
     try testing.expectEqual(@as(?MigrationOutcome, null), manager.promoteValidated(testKey(50_001)));
-    _ = manager.onDatagram(testKey(50_001), test_challenge, 0);
+    _ = manager.onDatagram(testKey(50_001), 1_200, test_challenge, 0);
     // Still only .validating, not .validated: promotion must not skip validation.
     try testing.expectEqual(@as(?MigrationOutcome, null), manager.promoteValidated(testKey(50_001)));
 }
 
 test "per-path anti-amplification accounting does not leak between paths" {
     var manager = PathManager.init(.full, testKey(50_000), false);
-    manager.recordReceivedOnPath(testKey(50_000), 1_200);
+    _ = manager.onDatagram(testKey(50_000), 1_200, test_challenge, 0);
     const candidate = testKeyOtherHost(50_000);
-    _ = manager.onDatagram(candidate, test_challenge, 0);
-    manager.recordReceivedOnPath(candidate, 100);
+    _ = manager.onDatagram(candidate, 100, test_challenge, 0);
 
     // The active (still unvalidated) path's budget reflects only its own bytes.
     try testing.expect(manager.canSendOnPath(testKey(50_000), 3_600));
@@ -1184,10 +1236,10 @@ test "probe storms recycle probe slots but never the active path" {
     // More new tuples than slots: the oldest probes are recycled.
     var port: u16 = 50_001;
     while (port < 50_001 + 2 * max_paths) : (port += 1) {
-        _ = manager.onDatagram(testKey(port), test_challenge, 0);
+        _ = manager.onDatagram(testKey(port), 1_200, test_challenge, 0);
     }
     // The active path survived the storm and still routes.
     try testing.expect(manager.activePath().key.eql(testKey(50_000)));
     try testing.expectEqual(PathState.validated, manager.activePath().state);
-    try testing.expectEqual(PathDecision.on_active_path, manager.onDatagram(testKey(50_000), test_challenge, 0));
+    try testing.expectEqual(PathDecision.on_active_path, manager.onDatagram(testKey(50_000), 1_200, test_challenge, 0));
 }
