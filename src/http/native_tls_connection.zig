@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("zig_compat");
 const tls = @import("tls_core");
 const encrypted_stream_connection = @import("encrypted_stream_connection.zig");
 const event_loop = @import("event_loop.zig");
@@ -46,6 +47,25 @@ pub const NativeCredentialStore = struct {
         default_key_path: []const u8,
         sni_certs: []const SniCertSpec,
     ) !void {
+        var prepared = try self.prepareReloadFromFiles(default_cert_path, default_key_path, sni_certs);
+        try self.commitPreparedReload(&prepared);
+    }
+
+    pub const PreparedReload = struct {
+        snapshot: ?*sni_provider.Snapshot,
+
+        pub fn deinit(self: *PreparedReload) void {
+            if (self.snapshot) |snapshot| snapshot.release();
+            self.* = undefined;
+        }
+    };
+
+    pub fn prepareReloadFromFiles(
+        self: *NativeCredentialStore,
+        default_cert_path: []const u8,
+        default_key_path: []const u8,
+        sni_certs: []const SniCertSpec,
+    ) !PreparedReload {
         var loaded = try self.allocator.alloc(LoadedBundle, 1 + sni_certs.len);
         defer self.allocator.free(loaded);
         var loaded_len: usize = 0;
@@ -67,10 +87,17 @@ pub const NativeCredentialStore = struct {
         }
         for (loaded[0..loaded_len], 0..) |*bundle, i| configs[i] = bundle.config();
 
-        try self.provider_state.reload(configs, .{
+        const snapshot = try self.provider_state.buildSnapshot(configs, .{
             .absent_sni_policy = .use_default,
             .unknown_sni_policy = .fail_handshake,
         });
+        return .{ .snapshot = snapshot };
+    }
+
+    pub fn commitPreparedReload(self: *NativeCredentialStore, prepared: *PreparedReload) !void {
+        const snapshot = prepared.snapshot orelse return;
+        prepared.snapshot = null;
+        try self.provider_state.install(snapshot);
     }
 };
 
@@ -544,6 +571,47 @@ test "native readiness maps directly to event-loop interest" {
     );
 }
 
+test "prepared native credential reload does not publish same-path cert changes before commit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/server.crt", .{tmp_abs});
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/server.key", .{tmp_abs});
+    defer allocator.free(key_path);
+
+    const cert_a = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.crt", 256 * 1024);
+    defer allocator.free(cert_a);
+    const key_a = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.key", 256 * 1024);
+    defer allocator.free(key_a);
+    const cert_b = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.crt", 256 * 1024);
+    defer allocator.free(cert_b);
+    const key_b = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.key", 256 * 1024);
+    defer allocator.free(key_b);
+    const chain_a = try tls.identity_loader.certChainFromPemOrDer(allocator, cert_a);
+    defer freeTestCertChain(allocator, chain_a);
+    const chain_b = try tls.identity_loader.certChainFromPemOrDer(allocator, cert_b);
+    defer freeTestCertChain(allocator, chain_b);
+
+    try compat.cwd().writeFile(.{ .sub_path = cert_path, .data = cert_a });
+    try compat.cwd().writeFile(.{ .sub_path = key_path, .data = key_a });
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    try store.reloadFromFiles(cert_path, key_path, &.{});
+    try expectSelectedLeaf(store.provider(), chain_a[0]);
+
+    try compat.cwd().writeFile(.{ .sub_path = cert_path, .data = cert_b });
+    try compat.cwd().writeFile(.{ .sub_path = key_path, .data = key_b });
+    var prepared = try store.prepareReloadFromFiles(cert_path, key_path, &.{});
+    defer prepared.deinit();
+
+    try expectSelectedLeaf(store.provider(), chain_a[0]);
+    try store.commitPreparedReload(&prepared);
+    try expectSelectedLeaf(store.provider(), chain_b[0]);
+}
+
 test "native TLS owner heap-stabilizes backend record and owns fd close" {
     var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
     defer fixed.deinit();
@@ -589,6 +657,32 @@ test "native TLS createWithOptions applies validated buffer limits" {
 
 fn fixedNowUnixMs(_: *anyopaque) i64 {
     return 1000;
+}
+
+fn expectSelectedLeaf(provider: credentials.CredentialProvider, expected_leaf: []const u8) !void {
+    const selection = credentials.SelectionContext{
+        .role = .server,
+        .server_name = null,
+        .peer_signature_schemes = &.{ 0x0807, 0x0403 },
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    };
+    const progress = try provider.selectCredential(&selection);
+    const credential = switch (progress) {
+        .complete => |credential| credential,
+        .pending => return error.TestUnexpectedPending,
+    };
+    defer credential.release();
+    const chain = credential.certificateChain();
+    try std.testing.expectEqual(@as(usize, 1), chain.count());
+    try std.testing.expectEqualSlices(u8, expected_leaf, chain.leaf().?);
+}
+
+fn freeTestCertChain(allocator: std.mem.Allocator, chain: [][]u8) void {
+    for (chain) |entry| allocator.free(entry);
+    allocator.free(chain);
 }
 
 fn testResumptionRuntime(allocator: std.mem.Allocator) !tls.resumption_runtime.Runtime {

@@ -654,7 +654,11 @@ fn expectTicketKeyId(identity: []const u8, expected: *const ticket_protection.Ke
 }
 
 fn expectTicketNonceCounter(identity: []const u8, expected: u64) !void {
-    try std.testing.expectEqual(expected, std.mem.readInt(u64, identity[28..36], .big));
+    try std.testing.expectEqual(expected, ticketNonceCounter(identity));
+}
+
+fn ticketNonceCounter(identity: []const u8) u64 {
+    return std.mem.readInt(u64, identity[28..36], .big);
 }
 
 test "disabled runtime exposes no server resolver and no client offers" {
@@ -1063,6 +1067,97 @@ test "#512 invalid persistent ticket-key candidate does not mutate durable lease
     const after = try compat.cwd().readFileAlloc(std.testing.allocator, path, ticket_key_snapshot.max_snapshot_bytes);
     defer std.testing.allocator.free(after);
     try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "#512 competing persistent file reservations issue disjoint nonce counters" {
+    var clock = TestClock{ .now_ms = 1_000 };
+    const path = ".zig-cache/persistent-ticket-competing-reservation-test.json";
+    const json =
+        \\{"version":1,"generation":1,"keys":[{"id":"32323232323232323232323232323232","aead":"aes_128_gcm","key":"d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3","not_before_unix_ms":1000,"encrypt_until_unix_ms":5000,"decrypt_until_unix_ms":20000,"nonce_lease":{"prefix":"0c000000","start":0,"end_exclusive":1}}]}
+    ;
+    try compat.cwd().writeFile(.{ .sub_path = path, .data = json });
+    if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
+        var file = try compat.cwd().openFile(path, .{ .mode = .read_write });
+        defer file.close();
+        if (std.c.fchmod(file.file.handle, 0o600) != 0) return error.PermissionDenied;
+    }
+    defer compat.cwd().deleteFile(path) catch {};
+    defer compat.cwd().deleteFile(".zig-cache/persistent-ticket-competing-reservation-test.json.lock") catch {};
+
+    var entropy_a = TestEntropy{};
+    var provider_a = crypto.pure_zig.Provider.init(entropy_a.entropy());
+    var runtime_a = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless, .stateless_ticket_key_source = .persistent },
+        clock.clock(),
+        provider_a.cryptoProvider(),
+    );
+    defer runtime_a.deinit();
+    var entropy_b = TestEntropy{};
+    var provider_b = crypto.pure_zig.Provider.init(entropy_b.entropy());
+    var runtime_b = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless, .stateless_ticket_key_source = .persistent },
+        clock.clock(),
+        provider_b.cryptoProvider(),
+    );
+    defer runtime_b.deinit();
+
+    var state_a = try sampleServerState(std.testing.allocator, "persistent-competing-a.test");
+    defer state_a.deinit();
+    state_a.common.issued_at_unix_ms = clock.now_ms;
+    state_a.common.lifetime_seconds = 3;
+    var state_b = try sampleServerState(std.testing.allocator, "persistent-competing-b.test");
+    defer state_b.deinit();
+    state_b.common.issued_at_unix_ms = clock.now_ms;
+    state_b.common.lifetime_seconds = 3;
+
+    const Worker = struct {
+        runtime: *Runtime,
+        state: *session.ServerRecoverableState,
+        path: []const u8,
+        start: *std.atomic.Value(bool),
+        failed: *std.atomic.Value(bool),
+        counter: *std.atomic.Value(u64),
+
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.Thread.yield() catch {};
+            self.runtime.loadPersistentTicketKeysFromFile(self.path) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            var scratch: [1024]u8 = undefined;
+            var identity = self.runtime.createIdentity(self.state, 1_000, &scratch) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            self.counter.store(ticketNonceCounter(identity.slice()), .release);
+        }
+    };
+
+    var start = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    var counter_a = std.atomic.Value(u64).init(std.math.maxInt(u64));
+    var counter_b = std.atomic.Value(u64).init(std.math.maxInt(u64));
+    var worker_a = Worker{ .runtime = &runtime_a, .state = &state_a, .path = path, .start = &start, .failed = &failed, .counter = &counter_a };
+    var worker_b = Worker{ .runtime = &runtime_b, .state = &state_b, .path = path, .start = &start, .failed = &failed, .counter = &counter_b };
+    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{&worker_a});
+    const thread_b = try std.Thread.spawn(.{}, Worker.run, .{&worker_b});
+    start.store(true, .release);
+    thread_a.join();
+    thread_b.join();
+
+    try std.testing.expect(!failed.load(.acquire));
+    const a = counter_a.load(.acquire);
+    const b = counter_b.load(.acquire);
+    try std.testing.expect(a == 1 or a == 2);
+    try std.testing.expect(b == 1 or b == 2);
+    try std.testing.expect(a != b);
+
+    var reserved = try ticket_key_snapshot.loadFromFile(std.testing.allocator, path);
+    defer reserved.deinit();
+    try std.testing.expectEqual(@as(u64, 2), reserved.configs[0].nonce_lease.?.start);
+    try std.testing.expectEqual(@as(u64, 3), reserved.configs[0].nonce_lease.?.end_exclusive);
 }
 
 test "#512 persistent stateless runtime issues while publishing adjacent rotations concurrently" {

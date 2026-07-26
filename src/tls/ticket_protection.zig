@@ -514,25 +514,29 @@ pub const ReloadableKeyRing = struct {
 
     pub fn validateInstallCandidate(self: *ReloadableKeyRing, replacement: *Snapshot) SnapshotError!void {
         self.mutex.lock();
-        defer self.mutex.unlock();
         if (self.current) |current| {
             if (replacement.generation != 0 and replacement.generation <= current.generation) {
+                self.mutex.unlock();
                 self.record(.{ .snapshot_rejected = .stale_generation });
                 return error.StaleSnapshotGeneration;
             }
         }
         if (replacement.generation == std.math.maxInt(u64)) {
+            self.mutex.unlock();
             self.record(.{ .snapshot_rejected = .generation_overflow });
             return error.GenerationOverflow;
         }
         self.validateReplacementLocked(replacement) catch |err| {
+            self.mutex.unlock();
             self.record(.{ .snapshot_rejected = snapshotReason(err) });
             return err;
         };
         if (replacement.generation == 0 and self.next_generation == std.math.maxInt(u64)) {
+            self.mutex.unlock();
             self.record(.{ .snapshot_rejected = .generation_overflow });
             return error.GenerationOverflow;
         }
+        self.mutex.unlock();
     }
 
     pub fn acquireCurrent(self: *ReloadableKeyRing) ?*Snapshot {
@@ -1113,8 +1117,10 @@ const TestObserver = struct {
 const ReentrantDeinitObserver = struct {
     keyring: *ReloadableKeyRing,
     deinit_on_install: bool = true,
+    deinit_on_rejection: bool = false,
     installed_events: usize = 0,
     retired_events: usize = 0,
+    rejected_events: usize = 0,
 
     fn observer(self: *ReentrantDeinitObserver) Observer {
         return .{ .ctx = self, .recordFn = record };
@@ -1131,6 +1137,13 @@ const ReentrantDeinitObserver = struct {
                 }
             },
             .key_retired => self.retired_events += 1,
+            .snapshot_rejected => {
+                self.rejected_events += 1;
+                if (self.deinit_on_rejection) {
+                    self.deinit_on_rejection = false;
+                    self.keyring.deinit();
+                }
+            },
             else => {},
         }
     }
@@ -1664,6 +1677,27 @@ test "install observer callbacks do not dereference snapshots after reentrant de
     try testing.expectEqual(@as(usize, 1), old_deinit_count.load(.monotonic));
     try testing.expectEqual(@as(usize, 1), replacement_deinit_count.load(.monotonic));
     keyring.deinit();
+}
+
+test "candidate validation rejection observer may reenter keyring" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    const current = sampleKeyConfigWithByte(keyId(29), .aes_128_gcm, .{ .prefix = .{ 2, 9, 0, 0 }, .start = 0, .end_exclusive = 10 }, 0x11);
+    try keyring.install(try keyring.buildSnapshot(&.{current}, testCapabilities()));
+
+    var observer = ReentrantDeinitObserver{
+        .keyring = &keyring,
+        .deinit_on_install = false,
+        .deinit_on_rejection = true,
+    };
+    keyring.observer = observer.observer();
+
+    const stale = sampleKeyConfigWithByte(keyId(30), .aes_128_gcm, .{ .prefix = .{ 3, 0, 0, 0 }, .start = 0, .end_exclusive = 10 }, 0x22);
+    const candidate = try Snapshot.build(allocator, &.{stale}, 1, testCapabilities());
+    defer candidate.release();
+
+    try testing.expectError(error.StaleSnapshotGeneration, keyring.validateInstallCandidate(candidate));
+    try testing.expectEqual(@as(usize, 1), observer.rejected_events);
 }
 
 test "ambiguous encryption windows are rejected before publication" {

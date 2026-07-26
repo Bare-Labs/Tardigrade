@@ -133,45 +133,6 @@ pub fn hotReloadConfig(
             return;
         }
     }
-    {
-        var current_lease = worker_ctx.config_store.acquire();
-        const persistent_ticket_reload_active = current_lease.cfg.tls_native_ticket_keys_path.len > 0 and cfg_ptr.tls_native_ticket_keys_path.len > 0;
-        const tls_policy_changed = !std.meta.eql(
-            gprotocol_policy.listenerPolicyFromConfig(current_lease.cfg),
-            gprotocol_policy.listenerPolicyFromConfig(cfg_ptr),
-        );
-        const native_credential_config_changed = applianceCredentialConfigChanged(current_lease.cfg, cfg_ptr);
-        current_lease.release();
-        if (persistent_ticket_reload_active and (tls_policy_changed or native_credential_config_changed)) {
-            worker_ctx.config_store.destroyVersion(prepared_version);
-            const msg = std.fmt.bufPrint(&state.last_reload_error, "persistent ticket keys with TLS protocol/credential changes require restart", .{}) catch "persistent ticket-key reload requires restart";
-            state.reload_mutex.lock();
-            state.last_reload_ok = false;
-            state.last_reload_at_ms = now_ms;
-            state.last_reload_error_len = msg.len;
-            state.reload_mutex.unlock();
-            state.metricsRecordReloadFailure();
-            state.metrics_mutex.lock();
-            state.metrics.recordTicketKeyReload(.reload_rejected);
-            state.metrics_mutex.unlock();
-            state.logger.warn(null, "config reload rejected: persistent native ticket-key reload cannot be combined with TLS protocol policy or credential configuration changes; restart to apply the combined change atomically", .{});
-            return;
-        }
-    }
-    if (worker_ctx.tls) |tls| {
-        tls.updateProtocolPolicy(gprotocol_policy.listenerPolicyFromConfig(cfg_ptr)) catch |err| {
-            worker_ctx.config_store.destroyVersion(prepared_version);
-            const msg = std.fmt.bufPrint(&state.last_reload_error, "TLS policy update failed: {}", .{err}) catch "TLS policy update failed";
-            state.reload_mutex.lock();
-            state.last_reload_ok = false;
-            state.last_reload_at_ms = now_ms;
-            state.last_reload_error_len = msg.len;
-            state.reload_mutex.unlock();
-            state.metricsRecordReloadFailure();
-            state.logger.warn(null, "config reload rejected by TLS protocol policy update: {}", .{err});
-            return;
-        };
-    }
     if (edge_config.is_appliance_tls_profile) {
         // Appliance TLS profile (#392): the identity is startup-loaded and a
         // hot reload must never silently accept changed credential inputs
@@ -200,6 +161,8 @@ pub fn hotReloadConfig(
             return;
         }
     }
+    var prepared_native_credentials: ?http.native_tls_connection.NativeCredentialStore.PreparedReload = null;
+    defer if (prepared_native_credentials) |*prepared| prepared.deinit();
     if (worker_ctx.native_credentials) |store| {
         var sni_specs = allocator.alloc(http.native_tls_connection.SniCertSpec, cfg_ptr.tls_sni_certs.len) catch {
             worker_ctx.config_store.destroyVersion(prepared_version);
@@ -217,7 +180,7 @@ pub fn hotReloadConfig(
         for (cfg_ptr.tls_sni_certs, 0..) |sc, i| {
             sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
         }
-        store.reloadFromFiles(cfg_ptr.tls_cert_path, cfg_ptr.tls_key_path, sni_specs) catch |err| {
+        prepared_native_credentials = store.prepareReloadFromFiles(cfg_ptr.tls_cert_path, cfg_ptr.tls_key_path, sni_specs) catch |err| {
             worker_ctx.config_store.destroyVersion(prepared_version);
             const msg = std.fmt.bufPrint(&state.last_reload_error, "native TLS credential reload failed: {}", .{err}) catch "native TLS credential reload failed";
             state.reload_mutex.lock();
@@ -250,6 +213,37 @@ pub fn hotReloadConfig(
             state.metrics_mutex.lock();
             state.metrics.recordTicketKeyReload(.reload_accepted);
             state.metrics_mutex.unlock();
+        }
+    }
+    if (worker_ctx.tls) |tls| {
+        tls.updateProtocolPolicy(gprotocol_policy.listenerPolicyFromConfig(cfg_ptr)) catch |err| {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "TLS policy update failed: {}", .{err}) catch "TLS policy update failed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected by TLS protocol policy update: {}", .{err});
+            return;
+        };
+    }
+    if (worker_ctx.native_credentials) |store| {
+        if (prepared_native_credentials) |*prepared| {
+            store.commitPreparedReload(prepared) catch |err| {
+                worker_ctx.config_store.destroyVersion(prepared_version);
+                const msg = std.fmt.bufPrint(&state.last_reload_error, "native TLS credential publish failed: {}", .{err}) catch "native TLS credential publish failed";
+                state.reload_mutex.lock();
+                state.last_reload_ok = false;
+                state.last_reload_at_ms = now_ms;
+                state.last_reload_error_len = msg.len;
+                state.reload_mutex.unlock();
+                state.metricsRecordReloadFailure();
+                state.logger.warn(null, "config reload rejected by native TLS credential publish: {}", .{err});
+                return;
+            };
+            prepared_native_credentials = null;
         }
     }
 

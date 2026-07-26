@@ -188,13 +188,13 @@ fn restrictiveReplacementPermissions(path: []const u8) LoadError!std.Io.File.Per
 
 fn syncParentDirectory(path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse ".";
-    var dir = if (std.fs.path.isAbsolute(parent))
-        compat.wrapDir(try std.Io.Dir.openDirAbsolute(compat.io(), parent, .{}))
-    else
-        try compat.cwd().openDir(parent, .{});
-    defer dir.close();
-    var parent_file = compat.FileCompat{ .file = .{ .handle = dir.dir.handle, .flags = .{ .nonblocking = false } } };
-    try parent_file.flush();
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, parent, .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    defer _ = std.c.close(fd);
+    if (std.c.fsync(fd) != 0) return error.SyncFailed;
 }
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) LoadError!OwnedSnapshot {
