@@ -34,6 +34,8 @@ pub const EarlyDataCompatibilityGate = shared.EarlyDataCompatibilityGate;
 pub const EarlyDataReplayCandidate = shared.EarlyDataReplayCandidate;
 pub const EarlyDataReplayDecision = shared.EarlyDataReplayDecision;
 pub const EarlyDataReplayGate = shared.EarlyDataReplayGate;
+pub const ServerEarlyDataPolicy = shared.ServerEarlyDataPolicy;
+pub const ClientEarlyDataIntent = shared.ClientEarlyDataIntent;
 
 const ext_quic_transport_parameters: u16 = @intFromEnum(tls_core.algorithms.ExtensionType.quic_transport_parameters);
 const tp_max_idle_timeout: u64 = 0x01;
@@ -406,6 +408,21 @@ pub const Tls13Backend = struct {
     /// fall back to worker-local replay bookkeeping.
     pub fn setEarlyDataReplayGate(self: *Tls13Backend, gate: EarlyDataReplayGate) HandshakeError!void {
         self.engine.setEarlyDataReplayGate(gate) catch |err| return mapError(err);
+    }
+
+    /// #523: forwarding seam only — the accept/reject decision (PSK identity,
+    /// replay, compatibility, age skew) stays entirely in the shared engine.
+    /// Must be called before the handshake starts, matching every other
+    /// early-data setter here.
+    pub fn setServerEarlyDataPolicy(self: *Tls13Backend, policy: ServerEarlyDataPolicy) HandshakeError!void {
+        self.engine.setServerEarlyDataPolicy(policy) catch |err| return mapError(err);
+    }
+
+    /// #523: forwarding seam only — offer/binder selection and the resulting
+    /// early-traffic-secret export stay entirely in the shared engine. Must
+    /// be called before the handshake starts.
+    pub fn setClientEarlyDataIntent(self: *Tls13Backend, intent: ClientEarlyDataIntent) HandshakeError!void {
+        self.engine.setClientEarlyDataIntent(intent) catch |err| return mapError(err);
     }
 
     pub fn setResumptionDecisionObserver(self: *Tls13Backend, observer: shared.Tls13Backend.ResumptionDecisionObserver) HandshakeError!void {

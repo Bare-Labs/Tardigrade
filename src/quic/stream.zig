@@ -556,6 +556,25 @@ pub const StreamManager = struct {
         if (limit > stream.max_send_data) stream.max_send_data = limit;
     }
 
+    /// Swap in the peer's authenticated transport parameters once the
+    /// handshake completes, for a manager that was brought up early (before
+    /// authentication) to admit 0-RTT stream data. Only ever raises existing
+    /// send-side limits, mirroring `applyMaxData`/`applyMaxStreamData` — the
+    /// placeholder parameters used during 0-RTT are never more permissive
+    /// than what the real peer eventually grants, since nothing may be sent
+    /// through this manager until this call has already happened.
+    pub fn refreshPeerParams(self: *StreamManager, peer_params: config.TransportParameters) void {
+        self.peer = peer_params;
+        self.applyMaxData(peer_params.initial_max_data);
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            const id = entry.key_ptr.*;
+            const stream = entry.value_ptr.*;
+            const limit = streamDataLimit(peer_params, peerRole(self.role), id);
+            if (limit > stream.max_send_data) stream.max_send_data = limit;
+        }
+    }
+
     pub fn applyMaxStreams(self: *StreamManager, typ: StreamType, limit: u64) void {
         switch (typ) {
             .bidi => self.peer.initial_max_streams_bidi = @max(self.peer.initial_max_streams_bidi, limit),

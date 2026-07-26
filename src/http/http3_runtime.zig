@@ -174,6 +174,11 @@ pub const Runtime = struct {
     credential_provider: ?tls_core.credentials.CredentialProvider,
     resumption_runtime: ?*tls_core.resumption_runtime.Runtime,
     early_data_replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
+    /// #523: whether the native QUIC 0-RTT carrier is actually composed and
+    /// enabled — see `zeroRttCarrierEnabled`. Drives both `quic_config`'s
+    /// `zero_rtt_enabled` gate and whether `accept()` installs a server
+    /// early-data policy on new connections' TLS backends.
+    zero_rtt_enabled: bool,
     quic_config: quic.config.Config,
     h3_settings: http3.frame.Settings,
     h3_application_compat: [http3.early_data.encoded_snapshot_len]u8 = undefined,
@@ -224,6 +229,7 @@ pub const Runtime = struct {
             .credential_provider = cfg.credential_provider,
             .resumption_runtime = cfg.resumption_runtime,
             .early_data_replay_gate = cfg.early_data_replay_gate,
+            .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
             .quic_config = quicConfigFrom(cfg),
             .h3_settings = cfg.h3_settings,
             .early_data_compat_metrics_ctx = cfg.early_data_compat_metrics_ctx,
@@ -237,8 +243,8 @@ pub const Runtime = struct {
             &runtime.h3_application_compat,
         ) catch return error.InvalidH3Settings).len;
 
-        if (cfg.enable_0rtt) {
-            logger.warn(null, "http3: 0-RTT is not supported by the native QUIC stack; continuing without it", .{});
+        if (cfg.enable_0rtt and !runtime.zero_rtt_enabled) {
+            logger.warn(null, "http3: enable_0rtt requires both resumption_runtime and early_data_replay_gate to be configured; continuing with 0-RTT disabled", .{});
         }
         if (cfg.connection_migration) {
             logger.warn(null, "http3: connection migration is not supported by the native QUIC stack; disable_active_migration stays advertised", .{});
@@ -522,6 +528,16 @@ pub const Runtime = struct {
                 allocator.destroy(backend);
                 return null;
             };
+            // #523: only actually enable the server's early-data accept path
+            // once composition confirmed a resumption runtime, replay gate,
+            // and the QUIC carrier are all present (`zeroRttCarrierEnabled`)
+            // — mirrors `native_tls_connection.zig`'s identical gate for TCP.
+            if (self.zero_rtt_enabled) {
+                backend.setServerEarlyDataPolicy(.{ .enabled = true }) catch {
+                    allocator.destroy(backend);
+                    return null;
+                };
+            }
         }
 
         const conn = Connection.init(allocator, .{
@@ -916,13 +932,25 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
 }
 
 /// Map the operator-facing runtime config onto the native QUIC transport
-/// config. Only `max_datagram_size` is honored today (clamped to the range the
-/// 2048-byte work buffers can carry); the remaining transport knobs keep their
-/// conservative defaults, including `migration_policy = .disabled`.
+/// config. Only `max_datagram_size` and `zero_rtt_enabled` are honored today;
+/// the remaining transport knobs keep their conservative defaults, including
+/// `migration_policy = .disabled`.
 fn quicConfigFrom(cfg: Config) quic.config.Config {
     return .{
         .max_udp_payload_size = std.math.clamp(cfg.max_datagram_size, 1200, 2048),
+        .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
     };
+}
+
+/// #523: the QUIC 0-RTT carrier may only be enabled once every dependency it
+/// relies on is actually present — `enable_0rtt` alone must never install a
+/// usable early-data path. Without a resumption runtime there is no PSK
+/// resolver to select a session, and without the replay gate the backend's
+/// default gate fails closed (`.unavailable`) for every attempt anyway, so
+/// gating here keeps that fail-closed behavior visible instead of quietly
+/// letting every 0-RTT attempt dead-end downstream.
+fn zeroRttCarrierEnabled(cfg: Config) bool {
+    return cfg.enable_0rtt and cfg.resumption_runtime != null and cfg.early_data_replay_gate != null;
 }
 
 /// Convert a source/destination IPv4 `sockaddr_in` into the protocol-neutral
@@ -1044,6 +1072,55 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
     const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 });
     try testing.expectEqual(@as(u64, 1350), mid.max_udp_payload_size);
     try testing.expectEqual(quic.config.MigrationPolicy.disabled, mid.migration_policy);
+}
+
+test "quicConfigFrom (#523): enable_0rtt alone never enables the 0-RTT carrier" {
+    var entropy = tls_core.production_crypto.OsEntropy{};
+    var provider_state = tls_core.production_crypto.Provider.init(entropy.entropy());
+    var resumption = try tls_core.resumption_runtime.Runtime.init(
+        testing.allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = fixedNowUnixMsForTest },
+        provider_state.cryptoProvider(),
+    );
+    defer resumption.deinit();
+
+    var store = try tls_core.early_data_replay.LocalStore.init(testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    var gate_adapter = tls_core.early_data_replay.GateAdapter.init(store.store());
+    const gate = gate_adapter.gate();
+
+    // No dependencies at all.
+    try testing.expect(!quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .enable_0rtt = true }).zero_rtt_enabled);
+    // Only a resumption runtime.
+    try testing.expect(!quicConfigFrom(.{
+        .listen_host = "::",
+        .quic_port = 443,
+        .enable_0rtt = true,
+        .resumption_runtime = &resumption,
+    }).zero_rtt_enabled);
+    // Only a replay gate.
+    try testing.expect(!quicConfigFrom(.{
+        .listen_host = "::",
+        .quic_port = 443,
+        .enable_0rtt = true,
+        .early_data_replay_gate = gate,
+    }).zero_rtt_enabled);
+    // Both dependencies present but `enable_0rtt` false (the default): still disabled.
+    try testing.expect(!quicConfigFrom(.{
+        .listen_host = "::",
+        .quic_port = 443,
+        .resumption_runtime = &resumption,
+        .early_data_replay_gate = gate,
+    }).zero_rtt_enabled);
+    // Every dependency present: the carrier actually enables.
+    try testing.expect(quicConfigFrom(.{
+        .listen_host = "::",
+        .quic_port = 443,
+        .enable_0rtt = true,
+        .resumption_runtime = &resumption,
+        .early_data_replay_gate = gate,
+    }).zero_rtt_enabled);
 }
 
 fn expectInvalidH3SettingsAtRuntimeInit(settings: http3.frame.Settings) !void {
@@ -1458,6 +1535,66 @@ test "runtime borrows the early-data replay gate independently of the resumption
     const installed = runtime.early_data_replay_gate orelse return error.TestExpectedEqual;
     try testing.expectEqual(gate.ctx, installed.ctx);
     try testing.expectEqual(gate.decideFn, installed.decideFn);
+}
+
+test "runtime (#523): enable_0rtt enables the carrier only with complete composition, fails closed otherwise" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-0rtt-composition-test");
+
+    var entropy = tls_core.production_crypto.OsEntropy{};
+    var provider_state = tls_core.production_crypto.Provider.init(entropy.entropy());
+    var resumption = try tls_core.resumption_runtime.Runtime.init(
+        testing.allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = fixedNowUnixMsForTest },
+        provider_state.cryptoProvider(),
+    );
+    defer resumption.deinit();
+
+    var store = try tls_core.early_data_replay.LocalStore.init(testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    var gate_adapter = tls_core.early_data_replay.GateAdapter.init(store.store());
+    const gate = gate_adapter.gate();
+
+    // enable_0rtt requested but the replay gate is missing: fails closed.
+    var incomplete = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .resumption_runtime = &resumption,
+        .enable_0rtt = true,
+    });
+    defer incomplete.deinit();
+    try testing.expect(!incomplete.zero_rtt_enabled);
+    try testing.expect(!incomplete.quic_config.zero_rtt_enabled);
+
+    // `enable_0rtt = false` (the default) stays disabled even with full
+    // composition otherwise present.
+    var disabled = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .resumption_runtime = &resumption,
+        .early_data_replay_gate = gate,
+    });
+    defer disabled.deinit();
+    try testing.expect(!disabled.zero_rtt_enabled);
+
+    // Every dependency present: the carrier actually enables, and that same
+    // decision reaches the QUIC transport config `accept()` hands every new
+    // connection.
+    var complete = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .resumption_runtime = &resumption,
+        .early_data_replay_gate = gate,
+        .enable_0rtt = true,
+    });
+    defer complete.deinit();
+    try testing.expect(complete.zero_rtt_enabled);
+    try testing.expect(complete.quic_config.zero_rtt_enabled);
 }
 
 test "runtime resolves the actual bound local address, including an OS-assigned port, from quic_port = 0" {
