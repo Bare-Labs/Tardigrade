@@ -130,6 +130,32 @@ pub const Event = union(enum) {
     /// A candidate path validated and was promoted to active (RFC 9000
     /// §8.2.3/§9.5): a NAT rebinding or a host migration, per `change`.
     path_validated: PathValidatedEvent,
+    /// #523: a typed outcome for every `.zero_rtt` packet this connection
+    /// processes, distinguishing "policy/keys unavailable" from a genuine
+    /// AEAD authentication failure and from an authenticated duplicate —
+    /// `packet_received`/`packet_dropped` above collapse all of these into
+    /// generic application-space bookkeeping. Never carries ticket
+    /// identities, PSKs, traffic secrets, or other decrypted session state.
+    zero_rtt_packet: struct { outcome: ZeroRttPacketOutcome, size: usize },
+};
+
+/// See `Event.zero_rtt_packet`.
+pub const ZeroRttPacketOutcome = enum {
+    /// Authenticated and, if it carried a STREAM frame, delivered.
+    accepted,
+    /// No installed/enabled `.zero_rtt` read secret — the ordinary shape of
+    /// "TLS never authorized this attempt" (not attempted, rejected by
+    /// policy/replay/compatibility, or the carrier is simply disabled): all
+    /// of these leave the same observable state at this layer.
+    keys_unavailable,
+    /// A read secret was installed, but AEAD authentication failed —
+    /// tampered or spoofed, distinct from `keys_unavailable`.
+    authentication_failed,
+    /// Authenticated, but this packet number was already processed in the
+    /// application space; its frame effects were not reapplied.
+    duplicate,
+    /// Too short to remove header protection / locate the payload.
+    malformed,
 };
 
 pub const PathValidatedEvent = struct {
@@ -962,11 +988,13 @@ pub const Connection = struct {
         var work: [2048]u8 = undefined;
         if (bytes.len > work.len) {
             self.dropPacket(.malformed, bytes.len);
+            self.emitZeroRttOutcome(level, .malformed, bytes.len);
             return;
         }
         @memcpy(work[0..bytes.len], bytes);
         if (parsed.packet_len < parsed.pn_offset + 4 + sample_len) {
             self.dropPacket(.malformed, bytes.len);
+            self.emitZeroRttOutcome(level, .malformed, bytes.len);
             return;
         }
 
@@ -976,6 +1004,7 @@ pub const Connection = struct {
             // accepted the PSK attempt, or the carrier is disabled) rather
             // than an authentication failure, so it gets its own reason.
             self.dropPacket(if (level == .zero_rtt) .keys_unavailable else .undecryptable, bytes.len);
+            self.emitZeroRttOutcome(level, .keys_unavailable, bytes.len);
             return;
         };
         var sample: [sample_len]u8 = undefined;
@@ -1011,11 +1040,24 @@ pub const Connection = struct {
         const payload = keys.openPayload(pn, header, ciphertext, &plain) catch {
             self.adapter.metrics.deprotection_failures += 1;
             self.dropPacket(.undecryptable, bytes.len);
+            self.emitZeroRttOutcome(level, .authentication_failed, bytes.len);
             return;
         };
         self.adapter.metrics.packets_deprotected += 1;
 
         if (level == .zero_rtt) self.ensureEarlyStreamManager();
+
+        // RFC 9001 §4.9.3: a server retires its 0-RTT read key once it has
+        // received a 1-RTT packet — the client's Finished (and any coalesced
+        // 1-RTT application data) proves it has moved on, so a 0-RTT key can
+        // no longer be legitimately used. This wipes only the `.zero_rtt`
+        // secret slot; 0-RTT and 1-RTT share the application packet-number
+        // and recovery state, which is untouched. `discardSecrets` is a
+        // no-op once already discarded, so this needs no "first time only"
+        // guard.
+        if (self.role == .server and level == .application) {
+            self.adapter.discardSecrets(.zero_rtt);
+        }
 
         if (used_next_keys) {
             self.adapter.commitApplicationReadKeyUpdate() catch {};
@@ -1028,6 +1070,16 @@ pub const Connection = struct {
         if (self.largest_recv_pn[space_idx] == null or pn > self.largest_recv_pn[space_idx].?) {
             self.largest_recv_pn[space_idx] = pn;
         }
+        // An authenticated duplicate (same packet number already recorded in
+        // this space — query *before* recording this one) must never have
+        // its frame effects re-applied: 0-RTT and 1-RTT share the
+        // application space, so this is also what stops a replayed 0-RTT
+        // packet from re-crediting stream/connection state a second time.
+        // Path-validation/ACK-range bookkeeping below still runs regardless:
+        // a duplicate still proves current possession of the keys and the
+        // path, and its packet number still belongs in the next ACK.
+        const already_received = self.recovery.wasReceived(space, pn);
+        self.emitZeroRttOutcome(level, if (already_received) .duplicate else .accepted, bytes.len);
         self.recovery.onPacketReceived(space, pn) catch {
             // Pathological ACK-range fragmentation; close rather than lose ACK state.
             self.startClose(.{ .error_code = error_internal, .is_application = false, .local = true }, "ack range overflow", now_us);
@@ -1075,17 +1127,19 @@ pub const Connection = struct {
         }
 
         var ack_eliciting = false;
-        var parser = frame.Parser.init(payload);
-        while (true) {
-            const decoded = parser.next() catch {
-                self.startClose(.{ .error_code = error_frame_encoding, .is_application = false, .local = true }, "frame decode", now_us);
-                return;
-            };
-            const f = decoded orelse break;
-            if (f.isAckEliciting()) ack_eliciting = true;
-            try self.applyFrame(level, f, ingress_path, now_us);
-            if (self.state_ == .closed or self.state_ == .draining) return;
-            if (self.state_ == .closing) break;
+        if (!already_received) {
+            var parser = frame.Parser.init(payload);
+            while (true) {
+                const decoded = parser.next() catch {
+                    self.startClose(.{ .error_code = error_frame_encoding, .is_application = false, .local = true }, "frame decode", now_us);
+                    return;
+                };
+                const f = decoded orelse break;
+                if (f.isAckEliciting()) ack_eliciting = true;
+                try self.applyFrame(level, f, ingress_path, now_us);
+                if (self.state_ == .closed or self.state_ == .draining) return;
+                if (self.state_ == .closing) break;
+            }
         }
 
         if (ack_eliciting) {
@@ -1104,6 +1158,10 @@ pub const Connection = struct {
     }
 
     fn applyFrame(self: *Connection, level: EncryptionLevel, f: frame.Frame, ingress_path: quic_path.PathKey, now_us: u64) IngestError!void {
+        if (!frameAllowedAtLevel(level, f)) {
+            self.startClose(.{ .error_code = error_protocol_violation, .is_application = false, .local = true }, "0-rtt frame level", now_us);
+            return;
+        }
         const space = spaceForLevel(level);
         switch (f) {
             .padding, .ping => {},
@@ -1231,7 +1289,11 @@ pub const Connection = struct {
                 // Echo on the exact path the challenge arrived on (RFC 9000
                 // §8.2.2) — never the active path by default, since the
                 // challenge may have come from a peer address probing us.
-                if (level == .application) {
+                // Legal in 0-RTT as well as 1-RTT (RFC 9000 §12.5); the
+                // response itself always transmits under 1-RTT keys since
+                // the server never sends 0-RTT (queued the same way either
+                // way — only the trigger's level differs).
+                if (level == .application or level == .zero_rtt) {
                     try self.pending_path_responses.append(self.allocator, .{ .path = ingress_path, .data = data });
                 }
             },
@@ -1264,6 +1326,20 @@ pub const Connection = struct {
                 }
             },
         }
+    }
+
+    /// RFC 9000 §12.5 (frame types permitted per packet type): ACK, CRYPTO,
+    /// NEW_TOKEN, RETIRE_CONNECTION_ID, PATH_RESPONSE, and HANDSHAKE_DONE are
+    /// never legal in a 0-RTT packet. Checked once, before any frame-specific
+    /// side effect, so an authenticated 0-RTT packet carrying one of these
+    /// can never mutate sent/recovery/congestion state, hand bytes to the
+    /// TLS engine, or otherwise act as if it were an ordinary 1-RTT packet.
+    fn frameAllowedAtLevel(level: EncryptionLevel, f: frame.Frame) bool {
+        if (level != .zero_rtt) return true;
+        return switch (f) {
+            .ack, .crypto, .new_token, .retire_connection_id, .path_response, .handshake_done => false,
+            else => true,
+        };
     }
 
     fn processAck(self: *Connection, space: PacketNumberSpace, ack: frame.Ack, now_us: u64) void {
@@ -1425,6 +1501,14 @@ pub const Connection = struct {
     fn dropPacket(self: *Connection, reason: DropReason, size: usize) void {
         self.metrics.packets_dropped += 1;
         self.events.emit(.{ .packet_dropped = .{ .reason = reason, .size = size } });
+    }
+
+    /// See `Event.zero_rtt_packet` — a no-op for every level but `.zero_rtt`,
+    /// so call sites shared with every other level don't need their own
+    /// level check.
+    fn emitZeroRttOutcome(self: *Connection, level: EncryptionLevel, outcome: ZeroRttPacketOutcome, size: usize) void {
+        if (level != .zero_rtt) return;
+        self.events.emit(.{ .zero_rtt_packet = .{ .outcome = outcome, .size = size } });
     }
 
     fn roleInitiator(role: Role) quic_stream.Initiator {
@@ -3400,10 +3484,11 @@ test "driver: 0-RTT stream provenance survives reassembly, duplicate delivery, a
     try testing.expect(pair.server.streamTransportEarly(0));
 
     // Duplicate delivery of an already-processed 0-RTT packet re-authenticates
-    // (packet numbers aren't deduplicated pre-application — the same as any
-    // other space), but must not duplicate the bytes the application
-    // eventually reads: stream-offset dedup (pre-existing, generic to every
-    // level) is what actually suppresses it.
+    // (AEAD has no memory of prior packets), but `wasReceived`/the
+    // already-recorded application-space packet number stop its frames from
+    // ever reaching `applyFrame` a second time — see the dedicated
+    // frame-effect regression test below for the case where that actually
+    // matters (STREAM offset dedup alone would otherwise mask it).
     try pair.server.ingestOnPath(datagram_1, TestPair.server_path, TestPair.test_challenge_entropy, pair.now_us);
 
     try testing.expectEqual(@as(?StreamId, 0), pair.server.acceptStream());
@@ -3419,6 +3504,133 @@ test "driver: 0-RTT stream provenance survives reassembly, duplicate delivery, a
     const late_read = try pair.server.readStream(0, &buf);
     try testing.expectEqualStrings("!", buf[0..late_read.len]);
     try testing.expect(late_read.fin);
+}
+
+test "driver: authenticated duplicate 0-RTT packet does not re-apply a state-mutating frame" {
+    // STREAM-offset dedup happens to hide a replayed STREAM frame regardless
+    // of packet-level dedup, so it can't prove frame effects aren't
+    // reapplied. PATH_CHALLENGE has no such built-in idempotency —
+    // `applyFrame` unconditionally appends a pending response — making it a
+    // frame type where a real regression (replaying an authenticated
+    // duplicate packet re-dispatching its frames) is directly observable.
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+
+    const secret = [_]u8{0x63} ** tls_adapter.traffic_secret_len;
+    pair.server.adapter.setZeroRttEnabled(true);
+    pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
+
+    var frame_buf: [16]u8 = undefined;
+    const challenge_data = [_]u8{0xab} ** frame.path_data_len;
+    const frame_len = try frame.encodePathChallenge(challenge_data, &frame_buf);
+    var wire: [256]u8 = undefined;
+    const datagram = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 0, frame_buf[0..frame_len], &wire);
+
+    try pair.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, pair.now_us);
+    try testing.expectEqual(@as(usize, 1), pair.server.pending_path_responses.items.len);
+
+    // Replay the identical authenticated packet.
+    try pair.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, pair.now_us);
+    try testing.expectEqual(@as(usize, 1), pair.server.pending_path_responses.items.len);
+}
+
+test "driver: frames illegal in 0-RTT close the connection instead of taking effect (RFC 9000 §12.5)" {
+    const allocator = testing.allocator;
+
+    // ACK is the sharpest case: without the level gate this frame is
+    // silently accepted by `processAck` (mutating sent/recovery/congestion
+    // state) rather than erroring, so a close happening here specifically
+    // proves the gate ran — not some unrelated pre-existing failure path.
+    {
+        var pair = try TestPair.init(allocator);
+        defer pair.deinit(allocator);
+        try pair.server.applyFrame(.zero_rtt, .{ .ack = .{
+            .ranges = .{},
+            .ack_delay_raw = 0,
+            .largest_acknowledged = 0,
+        } }, TestPair.server_path, pair.now_us);
+        try testing.expectEqual(State.closing, pair.server.state());
+        try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
+    }
+
+    // CRYPTO: without the gate, `Handshake.onCrypto(.zero_rtt, ...)` would
+    // also fail (0-RTT never carries CRYPTO — `cryptoStreamIndex` rejects
+    // it), but through a different, CRYPTO_ERROR-shaped close. Asserting the
+    // plain `error_protocol_violation` code here proves the level gate
+    // itself rejected it before any TLS-engine call, not that TLS happened
+    // to reject it independently.
+    {
+        var pair = try TestPair.init(allocator);
+        defer pair.deinit(allocator);
+        try pair.server.applyFrame(.zero_rtt, .{ .crypto = .{ .offset = 0, .data = "x" } }, TestPair.server_path, pair.now_us);
+        try testing.expectEqual(State.closing, pair.server.state());
+        try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
+    }
+
+    {
+        var pair = try TestPair.init(allocator);
+        defer pair.deinit(allocator);
+        try pair.server.applyFrame(.zero_rtt, .{ .new_token = .{ .token = "t" } }, TestPair.server_path, pair.now_us);
+        try testing.expectEqual(State.closing, pair.server.state());
+        try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
+    }
+
+    {
+        var pair = try TestPair.init(allocator);
+        defer pair.deinit(allocator);
+        try pair.server.applyFrame(.zero_rtt, .{ .retire_connection_id = .{ .sequence = 0 } }, TestPair.server_path, pair.now_us);
+        try testing.expectEqual(State.closing, pair.server.state());
+        try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
+    }
+
+    {
+        var pair = try TestPair.init(allocator);
+        defer pair.deinit(allocator);
+        try pair.server.applyFrame(.zero_rtt, .{ .path_response = [_]u8{0} ** frame.path_data_len }, TestPair.server_path, pair.now_us);
+        try testing.expectEqual(State.closing, pair.server.state());
+        try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
+    }
+
+    {
+        var pair = try TestPair.init(allocator);
+        defer pair.deinit(allocator);
+        try pair.server.applyFrame(.zero_rtt, .handshake_done, TestPair.server_path, pair.now_us);
+        try testing.expectEqual(State.closing, pair.server.state());
+        try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
+    }
+}
+
+test "driver: server retires its 0-RTT read secret once it authenticates a 1-RTT packet (RFC 9001 §4.9.3)" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const secret = [_]u8{0x11} ** tls_adapter.traffic_secret_len;
+    pair.server.adapter.setZeroRttEnabled(true);
+    pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
+    try testing.expect(pair.server.adapter.protectionKeys(.zero_rtt, .read) != null);
+
+    // Force a genuine ack-eliciting `.application` exchange the server must
+    // authenticate — a delayed/unforced ACK alone might never actually
+    // transmit within a single `pump()`.
+    const id = try pair.client.openStream(.bidi);
+    _ = try pair.client.writeStream(id, "hi", true);
+    try pair.pump();
+
+    // The server has now authenticated a real 1-RTT packet; its 0-RTT read
+    // secret must be retired.
+    try testing.expect(pair.server.adapter.protectionKeys(.zero_rtt, .read) == null);
+
+    // Retirement wipes only the `.zero_rtt` secret-store slot — the
+    // application packet-number/recovery state 0-RTT and 1-RTT share is
+    // untouched, so the stream data is still intact and readable.
+    try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
+    var buf: [8]u8 = undefined;
+    const request = try pair.server.readStream(id, &buf);
+    try testing.expectEqualStrings("hi", buf[0..request.len]);
+    try testing.expect(request.fin);
 }
 
 test "driver: server NewSessionTicket uses application CRYPTO retransmission and stream traffic continues" {
@@ -3789,7 +4001,10 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
         .ticket_age_add = 500,
         .ticket_nonce = "\x01",
         .issued_at_unix_ms = 1000,
-        .max_early_data_size = 4096,
+        // RFC 9001 §4.6.1: a QUIC ticket advertises 0-RTT capability with
+        // the fixed sentinel, not a small TLS-record-style byte cap — this
+        // is the value `http3_runtime.zig`'s production issuer uses too.
+        .max_early_data_size = std.math.maxInt(u32),
     }, tls_core.session.Limits.default);
     defer prepared.deinit();
     var scratch: [256]u8 = undefined;
@@ -3878,23 +4093,35 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
     });
     defer resumed.server.deinit();
 
-    try resumed.pump();
+    // Drive only the client's first flight (Initial, carrying the
+    // PSK-resumed ClientHello) into the server. The server's accept/reject
+    // decision — and any resulting `.zero_rtt` read-key installation —
+    // happens synchronously while processing that ClientHello, strictly
+    // before the server sends anything back and long before either side is
+    // anywhere close to established. Draining every pending client
+    // datagram (not just one) is robust to the ClientHello spanning more
+    // than one Initial packet.
+    {
+        var buf: [2048]u8 = undefined;
+        while (resumed.client.pollTransmitOnPath(&buf, resumed.now_us)) |t| {
+            try resumed.server.ingestOnPath(t.bytes, TestPair.server_path, TestPair.test_challenge_entropy, resumed.now_us);
+        }
+    }
 
-    try testing.expect(resumed.client.isEstablished());
-    try testing.expect(resumed.server.isEstablished());
-    try testing.expect(resumed.client_backend.engine.core.psk_authenticated);
-    try testing.expect(resumed.server_backend.engine.core.psk_authenticated);
-
-    // The real TLS decision actually accepted 0-RTT (not just "resumed")...
+    // The real TLS decision already accepted 0-RTT (not just "will resume")
+    // — and did so before the handshake is anywhere close to complete...
+    try testing.expect(!resumed.server.isEstablished());
     try testing.expect(resumed.server_backend.engine.earlyDataAccepted());
-    // ...and that acceptance actually installed a usable QUIC 0-RTT read key
+    // ...and that acceptance already installed a usable QUIC 0-RTT read key
     // through the ordinary secret-event pipeline (#523 requirement 1) — with
     // `zero_rtt_enabled` honored via `Connection.init`'s `setZeroRttEnabled`.
     try testing.expect(resumed.server.adapter.protectionKeys(.zero_rtt, .read) != null);
 
     // That real, TLS-derived key genuinely decrypts a 0-RTT wire packet
-    // through the ordinary driver path, with correct early-data provenance —
-    // proving the pipeline end to end, not just its two halves in isolation.
+    // through the ordinary driver path *during the early-data window*, with
+    // correct early-data provenance — proving the pipeline end to end and
+    // at the actual production timing, not just its two halves in
+    // isolation after the fact.
     const real_secret = resumed.server.adapter.secret(.zero_rtt, .read).?.slice()[0..tls_adapter.traffic_secret_len].*;
     var frame_buf: [32]u8 = undefined;
     const frame_len = try frame.encodeStream(4, 0, "real early data", true, &frame_buf);
@@ -3908,6 +4135,14 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
     const request = try resumed.server.readStream(4, &buf);
     try testing.expectEqualStrings("real early data", buf[0..request.len]);
     try testing.expect(request.fin);
+
+    // The rest of the handshake now completes normally — accepted 0-RTT
+    // does not derail ordinary 1-RTT completion.
+    try resumed.pump();
+    try testing.expect(resumed.client.isEstablished());
+    try testing.expect(resumed.server.isEstablished());
+    try testing.expect(resumed.client_backend.engine.core.psk_authenticated);
+    try testing.expect(resumed.server_backend.engine.core.psk_authenticated);
 }
 
 test "driver: maximum NewSessionTicket survives real loss reordering PTO and ACK cleanup" {

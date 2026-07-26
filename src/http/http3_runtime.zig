@@ -616,11 +616,25 @@ pub const Runtime = struct {
     }
 
     fn pumpH3(self: *Runtime, entry: *ConnEntry, now: u64) void {
-        if (!entry.conn.isEstablished()) return;
-        if (!entry.h3_started) {
+        const established = entry.conn.isEstablished();
+        // The control stream/SETTINGS flight only ever goes out once
+        // established — QUIC packet building itself already refuses to
+        // transmit any `.application`-space frame before `self.state_ ==
+        // .established` (see `buildPacket`), so this is establishment-only
+        // by construction, not just by this early return.
+        if (established and !entry.h3_started) {
             entry.h3.start(entry.conn) catch return;
             entry.h3_started = true;
         }
+        // #523: accepted 0-RTT STREAM bytes must reach H3 during the
+        // early-data window, not sit unread until the handshake completes —
+        // otherwise the replay-safe/425 request-safety decision never runs
+        // as early data at all. Safe to pump pre-establishment even for an
+        // ordinary (non-0-RTT) connection: `acceptStream`/`readStream` are
+        // no-ops until something actually populated the stream layer, and
+        // any response `serveRequest` queues still can't reach the wire
+        // until `.application` packet building unlocks at establishment.
+        if (!established and !self.zero_rtt_enabled) return;
         entry.h3.pump(entry.conn) catch |err| {
             // An H3-level protocol error closes the connection with the
             // specific RFC 9114 §8.1 code the session layer recorded.
@@ -803,6 +817,14 @@ pub const Runtime = struct {
             .ticket_age_add = ticket_age_add,
             .ticket_nonce = &ticket_nonce,
             .issued_at_unix_ms = now_unix_ms,
+            // RFC 9001 §4.6.1: a QUIC NewSessionTicket that advertises 0-RTT
+            // capability carries the fixed sentinel 0xffffffff — QUIC early
+            // data isn't bounded by this TLS-record byte cap (that's the
+            // job of QUIC flow control and `ServerEarlyDataPolicy`), and
+            // the field must be omitted (`null`) entirely when the carrier
+            // isn't actually composed, or a client would offer 0-RTT the
+            // server can never accept.
+            .max_early_data_size = if (self.zero_rtt_enabled) std.math.maxInt(u32) else null,
         }, limits);
         defer prepared.deinit();
 
@@ -822,6 +844,36 @@ pub const Runtime = struct {
 
     fn h3EarlyDataCompatibility(ctx: *anyopaque, candidate: tls_core.tls13_backend.EarlyDataCompatibilityCandidate) tls_core.tls13_backend.EarlyDataCompatibilityDecision {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
+
+        // #523: the early-specific gate — deliberately independent of
+        // `ResumeCompatibilityPolicy` (`accept()` sets `.transport = .ignore`
+        // there so *ordinary* 1-RTT resumption never depends on transport
+        // parameters) — is the only owner that may reject *early data
+        // specifically* for a remembered QUIC transport snapshot that no
+        // longer holds. RFC 9001 §4.6.1: an endpoint that accepts 0-RTT must
+        // not have reduced any limit the client's early data would rely on
+        // below what was remembered.
+        const transport = candidate.remembered_transport orelse {
+            self.recordH3EarlyDataCompat(.missing_state);
+            return .transport_incompatible;
+        };
+        if (transport.format_id != quic_transport_parameters_extension_type) {
+            self.recordH3EarlyDataCompat(.transport_incompatible);
+            return .transport_incompatible;
+        }
+        const remembered_transport = quic.tls_backend.decodeTransportParameters(transport.bytes) catch {
+            self.recordH3EarlyDataCompat(.transport_incompatible);
+            return .transport_incompatible;
+        };
+        const current_transport = self.quic_config.transportParameters() catch {
+            self.recordH3EarlyDataCompat(.transport_incompatible);
+            return .transport_incompatible;
+        };
+        if (!quicEarlyDataTransportCompatible(remembered_transport, current_transport)) {
+            self.recordH3EarlyDataCompat(.transport_incompatible);
+            return .transport_incompatible;
+        }
+
         const app = candidate.remembered_application orelse {
             self.recordH3EarlyDataCompat(.missing_state);
             return .application_incompatible;
@@ -949,8 +1001,39 @@ fn quicConfigFrom(cfg: Config) quic.config.Config {
 /// default gate fails closed (`.unavailable`) for every attempt anyway, so
 /// gating here keeps that fail-closed behavior visible instead of quietly
 /// letting every 0-RTT attempt dead-end downstream.
+/// TLS extension type carrying the QUIC transport-parameters extension —
+/// matches what `quic.tls_backend` stamps as the remembered/current
+/// transport-compat snapshot's `format_id`, without needing that internal
+/// constant exported.
+const quic_transport_parameters_extension_type: u16 = @intFromEnum(tls_core.algorithms.ExtensionType.quic_transport_parameters);
+
+/// RFC 9001 §4.6.1: a 0-RTT attempt is only transport-compatible if none of
+/// the limits governing what the client may send early have been reduced
+/// since the ticket was issued. `initial_max_stream_data_bidi_local` is
+/// deliberately excluded — it governs the server's own outbound budget on
+/// server-initiated streams, which is never relevant to data the client
+/// sends (the server never sends 0-RTT).
+fn quicEarlyDataTransportCompatible(remembered: quic.config.TransportParameters, current: quic.config.TransportParameters) bool {
+    return current.initial_max_data >= remembered.initial_max_data and
+        current.initial_max_stream_data_bidi_remote >= remembered.initial_max_stream_data_bidi_remote and
+        current.initial_max_stream_data_uni >= remembered.initial_max_stream_data_uni and
+        current.initial_max_streams_bidi >= remembered.initial_max_streams_bidi and
+        current.initial_max_streams_uni >= remembered.initial_max_streams_uni;
+}
+
 fn zeroRttCarrierEnabled(cfg: Config) bool {
-    return cfg.enable_0rtt and cfg.resumption_runtime != null and cfg.early_data_replay_gate != null;
+    if (!cfg.enable_0rtt) return false;
+    // A non-null dependency isn't necessarily a *usable* one: a resumption
+    // runtime constructed with `.mode = .disabled` still exists but yields
+    // no PSK resolver, and a default-constructed `EarlyDataReplayGate`
+    // (`decideFn == null`) exists but fails closed on every attempt. Either
+    // would leave `accept()` composing a carrier that can never actually
+    // accept 0-RTT — check the thing that matters, not just presence.
+    const runtime = cfg.resumption_runtime orelse return false;
+    if (runtime.serverResolver() == null) return false;
+    const gate = cfg.early_data_replay_gate orelse return false;
+    if (gate.decideFn == null) return false;
+    return true;
 }
 
 /// Convert a source/destination IPv4 `sockaddr_in` into the protocol-neutral
@@ -1595,6 +1678,236 @@ test "runtime (#523): enable_0rtt enables the carrier only with complete composi
     defer complete.deinit();
     try testing.expect(complete.zero_rtt_enabled);
     try testing.expect(complete.quic_config.zero_rtt_enabled);
+}
+
+test "runtime (#523): a present-but-unusable resumption runtime or replay gate still fails closed" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-0rtt-usability-test");
+
+    var entropy = tls_core.production_crypto.OsEntropy{};
+    var provider_state = tls_core.production_crypto.Provider.init(entropy.entropy());
+
+    // A `.mode = .disabled` resumption runtime is non-null but yields no PSK
+    // resolver (`serverResolver() == null`) — `accept()` would install no
+    // resolver at all, so the carrier must not report itself enabled.
+    var disabled_mode_resumption = try tls_core.resumption_runtime.Runtime.init(
+        testing.allocator,
+        .{ .mode = .disabled },
+        .{ .ctx = undefined, .nowUnixMsFn = fixedNowUnixMsForTest },
+        provider_state.cryptoProvider(),
+    );
+    defer disabled_mode_resumption.deinit();
+
+    var store = try tls_core.early_data_replay.LocalStore.init(testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    var gate_adapter = tls_core.early_data_replay.GateAdapter.init(store.store());
+    const usable_gate = gate_adapter.gate();
+
+    var disabled_mode = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .resumption_runtime = &disabled_mode_resumption,
+        .early_data_replay_gate = usable_gate,
+        .enable_0rtt = true,
+    });
+    defer disabled_mode.deinit();
+    try testing.expect(!disabled_mode.zero_rtt_enabled);
+
+    // A default-constructed `EarlyDataReplayGate` (`decideFn == null`) is
+    // non-null but fails closed (`.unavailable`) for every attempt on its
+    // own — installing it doesn't make the carrier usable either.
+    var usable_resumption = try tls_core.resumption_runtime.Runtime.init(
+        testing.allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = fixedNowUnixMsForTest },
+        provider_state.cryptoProvider(),
+    );
+    defer usable_resumption.deinit();
+
+    var unconfigured_gate = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .resumption_runtime = &usable_resumption,
+        .early_data_replay_gate = .{},
+        .enable_0rtt = true,
+    });
+    defer unconfigured_gate.deinit();
+    try testing.expect(!unconfigured_gate.zero_rtt_enabled);
+
+    // Sanity: both dependencies actually usable enables it, confirming the
+    // two cases above are real negatives and not an over-broad check.
+    var usable = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .resumption_runtime = &usable_resumption,
+        .early_data_replay_gate = usable_gate,
+        .enable_0rtt = true,
+    });
+    defer usable.deinit();
+    try testing.expect(usable.zero_rtt_enabled);
+}
+
+test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT capability only when the carrier is enabled" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-ticket-issuance-test");
+
+    var entropy = tls_core.production_crypto.OsEntropy{};
+    var provider_state = tls_core.production_crypto.Provider.init(entropy.entropy());
+    var resumption = try tls_core.resumption_runtime.Runtime.init(
+        testing.allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = fixedNowUnixMsForTest },
+        provider_state.cryptoProvider(),
+    );
+    defer resumption.deinit();
+
+    var store = try tls_core.early_data_replay.LocalStore.init(testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    var gate_adapter = tls_core.early_data_replay.GateAdapter.init(store.store());
+    const gate = gate_adapter.gate();
+
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .resumption_runtime = &resumption,
+        .early_data_replay_gate = gate,
+        .enable_0rtt = true,
+    });
+    defer runtime.deinit();
+    try testing.expect(runtime.zero_rtt_enabled);
+
+    // Build a real, established client/server QUIC pair directly (not via
+    // `runtime.accept()`, which needs a real UDP round trip) —
+    // `prepareNewSessionTicket` requires a genuine post-handshake
+    // resumption master secret, so there is no shortcut around a real
+    // handshake. This mirrors `quic.connection`'s own private `TestPair`,
+    // which isn't reachable from this file.
+    const client_cid = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8 };
+    const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const client_path = quic.path.PathKey{
+        .local = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_200),
+        .remote = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_201),
+    };
+    const server_path = quic.path.PathKey{
+        .local = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_201),
+        .remote = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_200),
+    };
+    const no_challenge = [_]u8{0} ** quic.path.path_challenge_len;
+
+    var client_backend = try quic.tls_backend.Tls13Backend.initClientWithAllocator(
+        allocator,
+        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
+    );
+
+    const Capture = struct {
+        retained: tls_core.session.ClientTicketState = .{},
+        count: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(testing.allocator, &self.retained) catch unreachable;
+            self.count += 1;
+        }
+    };
+    var capture = Capture{};
+    defer capture.retained.deinit();
+    try client_backend.engine.setSessionTicketConsumer(allocator, tls_core.session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+
+    const backend = try allocator.create(quic.tls_backend.Tls13Backend);
+    backend.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
+        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+        fixed.provider(),
+    );
+
+    const client = try Connection.init(allocator, .{
+        .role = .client,
+        .local_cid = &client_cid,
+        .original_dcid = &odcid,
+        .peer_cid = &odcid,
+        .tls = client_backend.backend(),
+        .now_us = 1_000_000,
+        .initial_path = client_path,
+    });
+    defer client.deinit();
+    const server_conn = try Connection.init(allocator, .{
+        .role = .server,
+        .local_cid = &odcid,
+        .original_dcid = &odcid,
+        .peer_cid = &client_cid,
+        .tls = backend.backend(),
+        .now_us = 1_000_000,
+        .initial_path = server_path,
+    });
+
+    var entry = ConnEntry{
+        .backend = backend,
+        .conn = server_conn,
+        .h3 = H3.initWithSettings(allocator, .server, .{}),
+        .admission_source_ip = 0,
+        .cid_len = odcid.len,
+        .accepted_at_us = 1_000_000,
+    };
+    defer entry.deinit(allocator);
+
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
+        var progressed = false;
+        var buf: [2048]u8 = undefined;
+        while (client.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+            try entry.conn.ingestOnPath(t.bytes, server_path, no_challenge, 1_000_000);
+            progressed = true;
+        }
+        while (entry.conn.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+            try client.ingestOnPath(t.bytes, client_path, no_challenge, 1_000_000);
+            progressed = true;
+        }
+        if (!progressed) break;
+    }
+    try testing.expect(client.isEstablished());
+    try testing.expect(entry.conn.isEstablished());
+
+    try runtime.issueSessionTicket(&entry, &resumption);
+
+    // Deliver the queued NewSessionTicket CRYPTO data to the client.
+    var rounds2: usize = 0;
+    while (rounds2 < 16) : (rounds2 += 1) {
+        var progressed = false;
+        var buf: [2048]u8 = undefined;
+        while (entry.conn.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+            try client.ingestOnPath(t.bytes, client_path, no_challenge, 1_000_000);
+            progressed = true;
+        }
+        while (client.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+            try entry.conn.ingestOnPath(t.bytes, server_path, no_challenge, 1_000_000);
+            progressed = true;
+        }
+        if (!progressed) break;
+    }
+
+    try testing.expectEqual(@as(usize, 1), capture.count);
+    // #523: the production issuer must advertise QUIC 0-RTT capability with
+    // the RFC 9001 §4.6.1 sentinel now that the carrier is actually
+    // enabled — a ticket a resumed client can genuinely attempt 0-RTT with,
+    // not one silently limited to resume-only.
+    try testing.expectEqual(
+        tls_core.session.EarlyDataPolicy{ .early_data_capable = std.math.maxInt(u32) },
+        capture.retained.common.early_data,
+    );
 }
 
 test "runtime resolves the actual bound local address, including an OS-assigned port, from quic_port = 0" {
