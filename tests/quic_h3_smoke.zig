@@ -564,8 +564,10 @@ const Endpoint = struct {
                     if (quic_path.path_challenge_len > frames.len - pos) return error.TruncatedFrame;
                     const response = frames[pos..][0..quic_path.path_challenge_len].*;
                     pos += quic_path.path_challenge_len;
-                    if (self.paths.onPathResponse(path_key, response, now_us)) |outcome| {
-                        if (outcome.reset_congestion) self.recovery.resetForPathMigration();
+                    if (self.paths.validatePathResponse(path_key, response, now_us)) |validated| {
+                        if (self.paths.promoteValidated(validated.path)) |outcome| {
+                            if (outcome.reset_congestion) self.recovery.resetForPathMigration();
+                        }
                     }
                 },
                 else => return error.UnexpectedFrameType,
@@ -681,7 +683,7 @@ const Smoke = struct {
                     .{ .pinned_certificate = tls_backend.testdata.certificate_der },
                 ),
                 .cid_routes = quic_cid.CidRoutingTable.init(allocator),
-                .paths = quic_path.PathManager.init(.full, .{ .local = client_addr, .remote = server_addr }),
+                .paths = quic_path.PathManager.init(.full, .{ .local = client_addr, .remote = server_addr }, true),
                 .recovery = client_recovery,
                 .local_params = params,
                 .local_cid = client_cid,
@@ -700,7 +702,7 @@ const Smoke = struct {
                     ),
                 ),
                 .cid_routes = quic_cid.CidRoutingTable.init(allocator),
-                .paths = quic_path.PathManager.init(.full, .{ .local = server_addr, .remote = client_addr }),
+                .paths = quic_path.PathManager.init(.full, .{ .local = server_addr, .remote = client_addr }, true),
                 .recovery = server_recovery,
                 .local_params = params,
                 .local_cid = server_cid,

@@ -110,7 +110,10 @@ pub const Config = struct {
             .initial_max_stream_data_uni = self.initial_max_stream_data_uni,
             .initial_max_streams_bidi = self.initial_max_streams_bidi,
             .initial_max_streams_uni = self.initial_max_streams_uni,
-            .disable_active_migration = self.migration_policy == .disabled,
+            // Only `.full` advertises active migration support; `.disabled`
+            // and `.nat_rebinding_only` both disable it, since NAT rebinding
+            // is validated port-only traffic, not client-initiated migration.
+            .disable_active_migration = self.migration_policy != .full,
         };
     }
 };
@@ -200,6 +203,10 @@ test "QUIC config validation rejects unsafe combinations" {
 test "migration policy maps to transport parameter" {
     const disabled = try (Config{ .migration_policy = .disabled }).transportParameters();
     const rebinding = try (Config{ .migration_policy = .nat_rebinding_only }).transportParameters();
+    const full = try (Config{ .migration_policy = .full }).transportParameters();
+    // Only `.full` permits client-initiated migration; NAT rebinding is
+    // validated port-only traffic handled independently of this parameter.
     try std.testing.expect(disabled.disable_active_migration);
-    try std.testing.expect(!rebinding.disable_active_migration);
+    try std.testing.expect(rebinding.disable_active_migration);
+    try std.testing.expect(!full.disable_active_migration);
 }

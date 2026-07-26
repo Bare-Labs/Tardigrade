@@ -109,6 +109,14 @@ pub const CidRoutingTable = struct {
         return null;
     }
 
+    /// Whether `cid` already has a route, without touching hit/miss metrics.
+    /// Use this for a collision preflight before advertising a freshly
+    /// generated candidate CID; `lookup()` would otherwise count every
+    /// preflight as a routing hit or miss the operator never asked about.
+    pub fn contains(self: *const CidRoutingTable, cid: ConnectionId) bool {
+        return self.routes.contains(cid);
+    }
+
     /// Remove a retired CID; retired CIDs must no longer route.
     pub fn remove(self: *CidRoutingTable, cid: ConnectionId) void {
         _ = self.routes.remove(cid);
@@ -519,6 +527,18 @@ test "routing table routes by DCID independent of any address and counts misses"
     try testing.expectEqual(@as(?u64, null), table.lookup(""));
     try testing.expectEqual(@as(u64, 3), table.metrics.routing_hits);
     try testing.expectEqual(@as(u64, 2), table.metrics.routing_misses);
+}
+
+test "contains checks collisions without moving hit/miss metrics" {
+    var table = CidRoutingTable.init(testing.allocator);
+    defer table.deinit();
+    const cid_a = try ConnectionId.init(&.{ 5, 5, 5, 5 });
+    try table.insert(cid_a, 1);
+
+    try testing.expect(table.contains(cid_a));
+    try testing.expect(!table.contains(try ConnectionId.init(&.{ 6, 6, 6, 6 })));
+    try testing.expectEqual(@as(u64, 0), table.metrics.routing_hits);
+    try testing.expectEqual(@as(u64, 0), table.metrics.routing_misses);
 }
 
 test "retired local CIDs stop routing and unknown retire sequences are violations" {
