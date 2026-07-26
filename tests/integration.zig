@@ -2447,6 +2447,35 @@ fn requireOpenssl(allocator: std.mem.Allocator) !void {
     if (result.outcome != .normal_exit) return error.SkipZigTest;
 }
 
+/// #369: skip cases that generate a throwaway Ed25519 identity at test time
+/// when the local `openssl` can't do Ed25519 at all -- macOS's system
+/// `openssl` (what GitHub's macos-14 runner resolves to, with no Homebrew
+/// OpenSSL preinstalled/linked) is LibreSSL, whose `genpkey` rejects
+/// `ed25519` outright ("Algorithm ed25519 not found") and can't even load
+/// an externally-supplied Ed25519 key to sign with, let alone generate one.
+/// The appliance TLS profile these tests build under requires Ed25519 leaf
+/// certificates specifically (`appliance_credentials.zig` hard-rejects any
+/// other `key_type`), so there is no alternative algorithm to substitute
+/// here the way `generateAlternateServerCert`'s cert itself can use P-256.
+fn requireOpensslEd25519(allocator: std.mem.Allocator) !void {
+    const dir = try interopSecretsDir(allocator);
+    defer allocator.free(dir);
+    const probe_path = try std.fmt.allocPrint(allocator, "{s}/ed25519-support-probe-{d}.pem", .{ dir, compat.milliTimestamp() });
+    defer allocator.free(probe_path);
+    defer compat.cwd().deleteFile(probe_path) catch {};
+
+    var result = try bounded_process.run(allocator, .{
+        .argv = &.{ "openssl", "genpkey", "-algorithm", "ed25519", "-out", probe_path },
+        .stdout_limit = 4096,
+        .stderr_limit = 4096,
+        .deadline_ms = 5_000,
+    });
+    defer result.deinit(allocator);
+    if (std.meta.activeTag(result.outcome) != .normal_exit or result.outcome.normal_exit != 0) {
+        return error.SkipZigTest;
+    }
+}
+
 /// #369: drives a real `openssl` subprocess against the native TLS listener.
 /// Every call is bounded end to end (spawn, stdin write, read, wait) via
 /// `bounded_process`, so a regression here fails with a useful diagnostic
@@ -3121,19 +3150,50 @@ fn generateAlternateServerCert(allocator: std.mem.Allocator, server_name: []cons
     const subj_arg = try std.fmt.allocPrint(allocator, "/CN={s}", .{server_name});
     defer allocator.free(subj_arg);
 
-    var result = try runOpenssl(allocator, &.{
-        "req",    "-x509",   "-newkey", "ed25519", "-keyout",                            key_path,
-        "-out",   cert_path, "-days",   "1",       "-noenc",                             "-subj",
-        subj_arg, "-addext", san_arg,
+    // Deliberately *not* `runOpenssl`: that helper accepts exit codes {0,1}
+    // for every caller, which is specifically an `s_client`
+    // "unexpected eof while reading" shutdown-noise tolerance -- wrong for
+    // `openssl req`, where exit 1 is a real failure. Checking only
+    // `std.meta.activeTag(result.outcome) != .normal_exit` after routing
+    // through that shared tolerance would have silently treated a failed
+    // generation as success (the tag is `.normal_exit` regardless of *which*
+    // accepted code it carries), leaving no cert file at `cert_path` for
+    // `TardigradeProcess.start()` to load -- caught in CI (#511), not
+    // locally, since the exact failure was environment-specific.
+    // Ed25519 specifically: the appliance TLS profile's identity loader
+    // (`appliance_credentials.zig`) hard-rejects any other leaf key
+    // algorithm, so there is no alternative curve to substitute here (the
+    // way a generic native-profile cert could use P-256). Callers must
+    // gate on `requireOpensslEd25519` first -- macOS's system `openssl`
+    // (what GitHub's macos-14 runner resolves to, with no Homebrew OpenSSL
+    // preinstalled/linked) is LibreSSL, which cannot generate, load, or
+    // sign with an Ed25519 key at all. `-nodes`, not `-noenc` -- the
+    // latter is an OpenSSL-3.x-only spelling older/LibreSSL forks of
+    // `req` don't recognize, for whatever installations do support
+    // Ed25519 but predate that flag.
+    var argv = [_][]const u8{
+        "openssl", "req",     "-x509",                              "-newkey", "ed25519",
+        "-keyout", key_path,  "-out",                               cert_path, "-days",
+        "1",       "-nodes",  "-subj",                              subj_arg,  "-addext",
+        san_arg,
         // Without an explicit override, this OpenSSL's default x509
         // extensions mark a self-signed cert as `CA:TRUE`, which the
         // appliance profile's strict leaf-certificate loader rejects
         // outright (`appliance_credentials.zig`: a CA cert is never a
         // valid leaf identity).
           "-addext", "basicConstraints=critical,CA:FALSE",
-    }, null, 10_000);
+    };
+    var result = try bounded_process.run(allocator, .{
+        .argv = &argv,
+        .stdout_limit = 64 * 1024,
+        .stderr_limit = 64 * 1024,
+        .deadline_ms = 10_000,
+    });
     defer result.deinit(allocator);
-    if (std.meta.activeTag(result.outcome) != .normal_exit) return error.CertGenerationFailed;
+    if (std.meta.activeTag(result.outcome) != .normal_exit or result.outcome.normal_exit != 0) {
+        std.debug.print("openssl req (alternate cert generation) failed: {s}\n", .{result.diagnostic});
+        return error.CertGenerationFailed;
+    }
 
     return .{ .allocator = allocator, .cert_path = cert_path, .key_path = key_path };
 }
@@ -3318,6 +3378,7 @@ test "restart.restart_and_credential_change.ticket_rejected" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
     try requireOpenssl(allocator);
+    try requireOpensslEd25519(allocator);
 
     var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
