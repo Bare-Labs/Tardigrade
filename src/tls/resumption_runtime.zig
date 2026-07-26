@@ -7,6 +7,7 @@
 //! stay in `tls13_backend.zig`.
 
 const std = @import("std");
+const compat = @import("zig_compat");
 const crypto = @import("crypto");
 const new_session_ticket = @import("new_session_ticket.zig");
 const pre_shared_key = @import("pre_shared_key.zig");
@@ -204,6 +205,11 @@ pub const Runtime = struct {
     pub fn loadPersistentTicketKeysFromFile(self: *Runtime, path: []const u8) (ticket_key_snapshot.LoadError || ticket_protection.SnapshotError)!void {
         var loaded = try ticket_key_snapshot.loadFromFile(self.allocator, path);
         defer loaded.deinit();
+        const loaded_fingerprint = fingerprintPersistentTicketKeys(loaded.generation, loaded.configs);
+        if (self.persistent_snapshot_fingerprint) |accepted| {
+            if (std.mem.eql(u8, &accepted, &loaded_fingerprint)) return;
+        }
+        try ticket_key_snapshot.reserveNonceLeasesInFile(self.allocator, path, &loaded);
         try self.installPersistentTicketKeys(loaded.generation, loaded.configs);
     }
 
@@ -940,6 +946,58 @@ test "#512 persistent stateless restart resumes old tickets and advances nonce l
     var scratch_b: [1024]u8 = undefined;
     var identity_b = try runtime_b.createIdentity(&state, clock.now_ms, &scratch_b);
     try expectTicketNonceCounter(identity_b.slice(), 1);
+}
+
+test "#512 persistent file load durably advances nonce lease across sequential runtimes" {
+    var clock = TestClock{ .now_ms = 1_000 };
+    const path = ".zig-cache/persistent-ticket-lease-reservation-test.json";
+    const json =
+        \\{"version":1,"generation":1,"keys":[{"id":"30303030303030303030303030303030","aead":"aes_128_gcm","key":"d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0","not_before_unix_ms":1000,"encrypt_until_unix_ms":5000,"decrypt_until_unix_ms":20000,"nonce_lease":{"prefix":"09000000","start":0,"end_exclusive":1}}]}
+    ;
+    try compat.cwd().writeFile(.{ .sub_path = path, .data = json });
+    defer compat.cwd().deleteFile(path) catch {};
+    defer compat.cwd().deleteFile(".zig-cache/persistent-ticket-lease-reservation-test.json.tmp") catch {};
+
+    const key = testTicketKey(0x30, 0xd0);
+    var state = try sampleServerState(std.testing.allocator, "persistent-file-restart.test");
+    defer state.deinit();
+    state.common.issued_at_unix_ms = clock.now_ms;
+    state.common.lifetime_seconds = 3;
+
+    var entropy_a = TestEntropy{};
+    var provider_a = crypto.pure_zig.Provider.init(entropy_a.entropy());
+    var runtime_a = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless, .stateless_ticket_key_source = .persistent },
+        clock.clock(),
+        provider_a.cryptoProvider(),
+    );
+    defer runtime_a.deinit();
+    try runtime_a.loadPersistentTicketKeysFromFile(path);
+    var scratch_a: [1024]u8 = undefined;
+    var identity_a = try runtime_a.createIdentity(&state, clock.now_ms, &scratch_a);
+    try expectTicketKeyId(identity_a.slice(), &key.id);
+    try expectTicketNonceCounter(identity_a.slice(), 1);
+
+    var entropy_b = TestEntropy{};
+    var provider_b = crypto.pure_zig.Provider.init(entropy_b.entropy());
+    var runtime_b = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless, .stateless_ticket_key_source = .persistent },
+        clock.clock(),
+        provider_b.cryptoProvider(),
+    );
+    defer runtime_b.deinit();
+    try runtime_b.loadPersistentTicketKeysFromFile(path);
+    const resolver_b = runtime_b.serverResolver().?;
+    var resumed = try resolver_b.resolve(identity_a.slice());
+    defer resumed.deinit();
+    try std.testing.expect(resumed == .hit);
+
+    var scratch_b: [1024]u8 = undefined;
+    var identity_b = try runtime_b.createIdentity(&state, clock.now_ms, &scratch_b);
+    try expectTicketKeyId(identity_b.slice(), &key.id);
+    try expectTicketNonceCounter(identity_b.slice(), 2);
 }
 
 test "#512 persistent stateless runtime issues while publishing adjacent rotations concurrently" {

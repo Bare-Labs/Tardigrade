@@ -3721,6 +3721,158 @@ test "soak.reconnect_resumption" {
     );
 }
 
+test "#510 native tcp production 0-rtt reaches h1 safety gate and replay fallback" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "safe-early", .connection_header = "keep-alive" },
+        .{ .body = "safe-after-replay", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\    early_data replay_safe;
+        \\    proxy_early_data rfc8470;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/safe",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE", .value = "process_local" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    var client_entropy = tls_core.production_crypto.OsEntropy{};
+    var client_provider = tls_core.production_crypto.Provider.init(client_entropy.entropy());
+    var client_runtime = try tls_core.resumption_runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 2_000;
+            }
+        }.now },
+        client_provider.cryptoProvider(),
+    );
+    defer client_runtime.deinit();
+
+    const TicketCapture = struct {
+        allocator: std.mem.Allocator,
+        runtime: *tls_core.resumption_runtime.Runtime,
+        retained: tls_core.session.ClientTicketState = .{},
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.retained.deinit();
+            self.retained = .{};
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+            _ = self.runtime.storeClientTicket(ticket);
+        }
+    };
+
+    var capture = TicketCapture{ .allocator = allocator, .runtime = &client_runtime };
+    defer capture.retained.deinit();
+
+    const first_client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+        .ticket_consumer = .{
+            .ctx = &capture,
+            .nowUnixMsFn = TicketCapture.now,
+            .onTicketFn = TicketCapture.onTicket,
+        },
+    });
+    defer first_client.destroy();
+    try first_client.writeAllPlain("GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const first_raw = try first_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(first_raw);
+    try assertContains(first_raw, "HTTP/1.1 200 OK");
+    try std.testing.expectEqual(tls_core.session.EarlyDataPolicy{ .early_data_capable = 16 * 1024 }, capture.retained.common.early_data);
+
+    const candidate: tls_core.session.CandidateContext = .{
+        .cipher_suite = capture.retained.common.cipher_suite,
+        .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
+        .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
+        .auth_binding = capture.retained.common.auth_binding,
+        .transport_compat = null,
+        .application_compat = null,
+    };
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2_500;
+        }
+    };
+
+    var accepted_lookup = client_runtime.lookupClientOffers(candidate);
+    defer accepted_lookup.deinit();
+    try std.testing.expect(accepted_lookup == .hit);
+    const accepted_client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+        .psk_lease = &accepted_lookup.hit,
+        .psk_now_ctx = &clock_dummy,
+        .psk_now_fn = ClientClock.now,
+        .early_data_intent = .{ .enabled = true, .max_bytes = 4096 },
+        .return_after_early_data_ready = true,
+    });
+    defer accepted_client.destroy();
+    try accepted_client.writeAllPlain(
+        "GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: keep-alive\r\n\r\n" ++
+            "POST /work HTTP/1.1\r\nHost: tardigrade.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    const accepted_raw = try accepted_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(accepted_raw);
+    try assertContains(accepted_raw, "HTTP/1.1 200 OK");
+    try assertContains(accepted_raw, "safe-early");
+    try assertContains(accepted_raw, "HTTP/1.1 425 Too Early");
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    var replay_lookup = client_runtime.lookupClientOffers(candidate);
+    defer replay_lookup.deinit();
+    try std.testing.expect(replay_lookup == .hit);
+    const replay_client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+        .psk_lease = &replay_lookup.hit,
+        .psk_now_ctx = &clock_dummy,
+        .psk_now_fn = ClientClock.now,
+        .early_data_intent = .{ .enabled = true, .max_bytes = 4096 },
+        .return_after_early_data_ready = true,
+    });
+    defer replay_client.destroy();
+    try replay_client.writeAllPlain("POST /work HTTP/1.1\r\nHost: tardigrade.test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n");
+    try replay_client.driveUntilOpen(5_000);
+    try replay_client.writeAllPlain("GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+    const replay_raw = try replay_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(replay_raw);
+    try assertContains(replay_raw, "HTTP/1.1 200 OK");
+    try assertContains(replay_raw, "safe-after-replay");
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+    const first_path = try upstream.capturedPathHistoryAt(allocator, 0);
+    defer allocator.free(first_path);
+    const second_path = try upstream.capturedPathHistoryAt(allocator, 1);
+    defer allocator.free(second_path);
+    try std.testing.expectEqualStrings("/safe", first_path);
+    try std.testing.expectEqualStrings("/safe", second_path);
+}
+
 const PureZigTlsClient = struct {
     const Options = struct {
         ticket_consumer: ?tls_core.tls13_backend.Tls13Backend.SessionTicketConsumer = null,
@@ -3728,6 +3880,8 @@ const PureZigTlsClient = struct {
         psk_lease: ?*tls_core.pre_shared_key.ClientOfferLease = null,
         psk_now_ctx: ?*anyopaque = null,
         psk_now_fn: ?*const fn (*anyopaque) i64 = null,
+        early_data_intent: tls_core.tls13_backend.ClientEarlyDataIntent = .{},
+        return_after_early_data_ready: bool = false,
     };
 
     allocator: std.mem.Allocator,
@@ -3775,6 +3929,9 @@ const PureZigTlsClient = struct {
                 options.psk_now_fn orelse return error.InvalidTestSetup,
             );
         }
+        if (options.early_data_intent.enabled) {
+            try self.backend.setClientEarlyDataIntent(options.early_data_intent);
+        }
         self.record = try tls_core.encrypted_stream.PureZigRecordStream.initWithCarrierAndBackend(
             allocator,
             .client,
@@ -3785,6 +3942,10 @@ const PureZigTlsClient = struct {
         );
         self.record.allow_unverified_certificate = true;
         try self.record.setExpectedAlpn(alpn);
+        if (options.return_after_early_data_ready) {
+            try self.driveUntilEarlyDataReady(5_000);
+            return self;
+        }
         try self.driveUntilOpen(5_000);
         return self;
     }
@@ -3858,6 +4019,17 @@ const PureZigTlsClient = struct {
         while (compat.milliTimestamp() < deadline) {
             const driven = try self.record.drive();
             if (self.record.applicationDataOpen()) return;
+            if (!driven.made_progress) try self.waitForReadiness(100);
+        }
+        return error.ReadTimeout;
+    }
+
+    fn driveUntilEarlyDataReady(self: *PureZigTlsClient, timeout_ms: u64) !void {
+        const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (compat.milliTimestamp() < deadline) {
+            const driven = try self.record.drive();
+            if (self.backend.earlyDataAttempted() and self.record.stream().readiness().can_write_plaintext) return;
+            if (self.record.applicationDataOpen()) return error.EarlyDataNotAttempted;
             if (!driven.made_progress) try self.waitForReadiness(100);
         }
         return error.ReadTimeout;

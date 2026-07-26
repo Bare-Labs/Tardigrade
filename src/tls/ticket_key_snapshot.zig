@@ -58,6 +58,7 @@ pub const LoadError = error{
     UnsupportedAead,
     InvalidHex,
     InvalidField,
+    SnapshotUnwritable,
     OutOfMemory,
 };
 
@@ -90,6 +91,39 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) LoadError!Ow
         allocator.free(bytes);
     }
     return parse(allocator, bytes);
+}
+
+pub fn reserveNonceLeasesInFile(allocator: std.mem.Allocator, path: []const u8, snapshot: *OwnedSnapshot) LoadError!void {
+    var changed = false;
+    for (snapshot.configs) |*cfg| {
+        if (cfg.nonce_lease) |*lease| {
+            const width = lease.end_exclusive -| lease.start;
+            if (width == 0) return error.InvalidField;
+            const next_end = std.math.add(u64, lease.end_exclusive, width) catch return error.InvalidField;
+            lease.start = lease.end_exclusive;
+            lease.end_exclusive = next_end;
+            changed = true;
+        }
+    }
+    if (!changed) return;
+
+    var out = std.array_list.Managed(u8).init(allocator);
+    defer {
+        std.crypto.secureZero(u8, out.items);
+        out.deinit();
+    }
+    try serialize(&out, snapshot);
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    compat.cwd().deleteFile(tmp_path) catch {};
+    {
+        var file = compat.cwd().createFile(tmp_path, .{ .truncate = true }) catch return error.SnapshotUnwritable;
+        defer file.close();
+        file.writeAll(out.items) catch return error.SnapshotUnwritable;
+        file.flush() catch return error.SnapshotUnwritable;
+    }
+    compat.cwd().rename(tmp_path, compat.cwd(), path) catch return error.SnapshotUnwritable;
 }
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) LoadError!OwnedSnapshot {
@@ -153,6 +187,60 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) LoadError!OwnedSna
         .generation = generation,
         .configs = configs,
         .key_storage = key_storage,
+    };
+}
+
+fn serialize(out: *std.array_list.Managed(u8), snapshot: *const OwnedSnapshot) LoadError!void {
+    try out.print("{{\"version\":{d},\"generation\":{d},\"keys\":[", .{ format_version, snapshot.generation });
+    for (snapshot.configs, 0..) |cfg, i| {
+        if (i > 0) try out.append(',');
+        try out.print(
+            "{{\"id\":\"",
+            .{},
+        );
+        try appendHexLower(out, &cfg.id);
+        try out.print(
+            "\",\"aead\":\"{s}\",\"key\":\"",
+            .{aeadName(cfg.aead)},
+        );
+        try appendHexLower(out, cfg.key_bytes);
+        try out.print(
+            "\",\"not_before_unix_ms\":{d},\"encrypt_until_unix_ms\":{d},\"decrypt_until_unix_ms\":{d}",
+            .{
+                cfg.not_before_unix_ms,
+                cfg.encrypt_until_unix_ms,
+                cfg.decrypt_until_unix_ms,
+            },
+        );
+        if (cfg.nonce_lease) |lease| {
+            try out.print(
+                ",\"nonce_lease\":{{\"prefix\":\"",
+                .{},
+            );
+            try appendHexLower(out, &lease.prefix);
+            try out.print(
+                "\",\"start\":{d},\"end_exclusive\":{d}}}",
+                .{ lease.start, lease.end_exclusive },
+            );
+        }
+        try out.append('}');
+    }
+    try out.appendSlice("]}");
+}
+
+fn appendHexLower(out: *std.array_list.Managed(u8), bytes: []const u8) LoadError!void {
+    const alphabet = "0123456789abcdef";
+    for (bytes) |b| {
+        try out.append(alphabet[b >> 4]);
+        try out.append(alphabet[b & 0x0f]);
+    }
+}
+
+fn aeadName(aead: provider.Aead) []const u8 {
+    return switch (aead) {
+        .aes_128_gcm => "aes_128_gcm",
+        .aes_256_gcm => "aes_256_gcm",
+        .chacha20_poly1305 => "chacha20_poly1305",
     };
 }
 

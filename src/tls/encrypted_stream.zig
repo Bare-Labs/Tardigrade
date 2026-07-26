@@ -213,18 +213,18 @@ fn PlaintextProvenanceQueue(comptime capacity: usize) type {
             self.len += byte_len;
         }
 
-        fn discard(self: *Self, byte_len: usize) bool {
+        fn discard(self: *Self, byte_len: usize) usize {
             const n = @min(byte_len, self.len);
-            var saw_early = false;
-            for (self.buf[0..n]) |transport_early| {
-                saw_early = saw_early or transport_early;
+            var early_prefix_len: usize = 0;
+            while (early_prefix_len < n and self.buf[early_prefix_len]) {
+                early_prefix_len += 1;
             }
             const old_len = self.len;
             const remaining = old_len - n;
             std.mem.copyForwards(bool, self.buf[0..remaining], self.buf[n..old_len]);
             @memset(self.buf[remaining..old_len], false);
             self.len = remaining;
-            return saw_early;
+            return early_prefix_len;
         }
 
         fn available(self: *const Self) usize {
@@ -250,6 +250,7 @@ pub const EncryptedStream = struct {
         readinessFn: *const fn (*anyopaque) Readiness,
         driveFn: *const fn (*anyopaque) Error!DriveResult,
         bufferSnapshotFn: *const fn (*anyopaque) BufferSnapshot,
+        currentReadEarlyPrefixLenFn: ?*const fn (*anyopaque) usize = null,
     };
 
     pub fn backend(self: EncryptedStream) BackendKind {
@@ -281,6 +282,11 @@ pub const EncryptedStream = struct {
 
     pub fn bufferSnapshot(self: EncryptedStream) BufferSnapshot {
         return self.vtable.bufferSnapshotFn(self.ptr);
+    }
+
+    pub fn currentReadEarlyPrefixLen(self: EncryptedStream) usize {
+        const cb = self.vtable.currentReadEarlyPrefixLenFn orelse return 0;
+        return cb(self.ptr);
     }
 };
 
@@ -445,7 +451,7 @@ pub const PureZigRecordStream = struct {
     carrier_eof: bool = false,
     close_notify_queued: bool = false,
     pending_terminal_read_error: ?Error = null,
-    last_read_transport_early: bool = false,
+    last_read_early_prefix_len: usize = 0,
     zero_rtt_sent: u64 = 0,
     zero_rtt_accepted: u64 = 0,
     rejected_early_bytes: u64 = 0,
@@ -574,7 +580,11 @@ pub const PureZigRecordStream = struct {
     }
 
     pub fn currentReadTransportEarly(self: *const PureZigRecordStream) bool {
-        return self.last_read_transport_early;
+        return self.last_read_early_prefix_len > 0;
+    }
+
+    pub fn currentReadEarlyPrefixLen(self: *const PureZigRecordStream) usize {
+        return self.last_read_early_prefix_len;
     }
 
     /// Require the peer to negotiate exactly `protocol`. Configure this before
@@ -607,7 +617,7 @@ pub const PureZigRecordStream = struct {
         self.carrier_eof = false;
         self.close_notify_queued = false;
         self.pending_terminal_read_error = null;
-        self.last_read_transport_early = false;
+        self.last_read_early_prefix_len = 0;
         self.zero_rtt_sent = 0;
         self.zero_rtt_accepted = 0;
         self.rejected_early_bytes = 0;
@@ -1300,11 +1310,11 @@ pub const PureZigRecordStream = struct {
         if (self.pending_terminal) |err| return err;
         if (self.lifecycle == .closed or self.lifecycle == .failed) return error.StreamClosed;
         if (self.inbound_plaintext.read(out)) |n| {
-            self.last_read_transport_early = self.inbound_plaintext_provenance.discard(n);
+            self.last_read_early_prefix_len = self.inbound_plaintext_provenance.discard(n);
             self.noteQueueMutation();
             return n;
         }
-        self.last_read_transport_early = false;
+        self.last_read_early_prefix_len = 0;
         try self.raisePendingTerminalError();
         if (self.peer_closed) return error.EndOfStream;
         return error.WouldBlock;
@@ -1889,6 +1899,11 @@ fn pureBufferSnapshot(ptr: *anyopaque) BufferSnapshot {
     return self.bufferSnapshot();
 }
 
+fn pureCurrentReadEarlyPrefixLen(ptr: *anyopaque) usize {
+    const self: *PureZigRecordStream = @ptrCast(@alignCast(ptr));
+    return self.currentReadEarlyPrefixLen();
+}
+
 const pure_zig_record_vtable = EncryptedStream.VTable{
     .backendFn = pureBackend,
     .readFn = pureRead,
@@ -1897,6 +1912,7 @@ const pure_zig_record_vtable = EncryptedStream.VTable{
     .readinessFn = pureReadiness,
     .driveFn = pureDrive,
     .bufferSnapshotFn = pureBufferSnapshot,
+    .currentReadEarlyPrefixLenFn = pureCurrentReadEarlyPrefixLen,
 };
 
 fn ByteQueue(comptime capacity: usize, comptime full_error: Error) type {

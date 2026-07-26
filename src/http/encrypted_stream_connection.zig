@@ -7,6 +7,7 @@ pub const EncryptedStreamHttpConnection = struct {
     close_on_deinit: bool = false,
     provenance_ctx: ?*anyopaque = null,
     read_transport_early_fn: ?*const fn (*anyopaque) bool = null,
+    read_early_prefix_len_fn: ?*const fn (*anyopaque) usize = null,
     handshake_complete_fn: ?*const fn (*anyopaque) bool = null,
 
     pub fn init(stream: encrypted_stream.EncryptedStream) EncryptedStreamHttpConnection {
@@ -22,6 +23,7 @@ pub const EncryptedStreamHttpConnection = struct {
         fd: std.posix.fd_t,
         provenance_ctx: *anyopaque,
         read_transport_early_fn: *const fn (*anyopaque) bool,
+        read_early_prefix_len_fn: ?*const fn (*anyopaque) usize,
         handshake_complete_fn: *const fn (*anyopaque) bool,
     ) EncryptedStreamHttpConnection {
         return .{
@@ -29,6 +31,7 @@ pub const EncryptedStreamHttpConnection = struct {
             .fd = fd,
             .provenance_ctx = provenance_ctx,
             .read_transport_early_fn = read_transport_early_fn,
+            .read_early_prefix_len_fn = read_early_prefix_len_fn,
             .handshake_complete_fn = handshake_complete_fn,
         };
     }
@@ -78,6 +81,13 @@ pub const EncryptedStreamHttpConnection = struct {
         const ctx = self.provenance_ctx orelse return false;
         const cb = self.read_transport_early_fn orelse return false;
         return cb(ctx);
+    }
+
+    pub fn currentReadEarlyPrefixLen(self: *const EncryptedStreamHttpConnection) usize {
+        if (self.provenance_ctx) |ctx| {
+            if (self.read_early_prefix_len_fn) |cb| return cb(ctx);
+        }
+        return self.stream.currentReadEarlyPrefixLen();
     }
 
     pub fn downstreamHandshakeComplete(self: *const EncryptedStreamHttpConnection) bool {

@@ -277,12 +277,17 @@ pub const NativeTlsConnection = struct {
             self.fd,
             self,
             nativeReadTransportEarly,
+            nativeReadEarlyPrefixLen,
             nativeHandshakeComplete,
         );
     }
 
     pub fn readTransportEarly(self: *const NativeTlsConnection) bool {
         return self.record.currentReadTransportEarly();
+    }
+
+    pub fn readEarlyPrefixLen(self: *const NativeTlsConnection) usize {
+        return self.record.currentReadEarlyPrefixLen();
     }
 
     pub fn downstreamHandshakeComplete(self: *const NativeTlsConnection) bool {
@@ -396,6 +401,11 @@ pub const NativeTlsConnection = struct {
     fn nativeReadTransportEarly(ptr: *anyopaque) bool {
         const self: *NativeTlsConnection = @ptrCast(@alignCast(ptr));
         return self.readTransportEarly();
+    }
+
+    fn nativeReadEarlyPrefixLen(ptr: *anyopaque) usize {
+        const self: *NativeTlsConnection = @ptrCast(@alignCast(ptr));
+        return self.readEarlyPrefixLen();
     }
 
     fn nativeHandshakeComplete(ptr: *anyopaque) bool {

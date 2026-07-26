@@ -1800,7 +1800,8 @@ const WaitingEncryptedHttpConnection = struct {
     tls_metrics: ?*http.metrics.Metrics = null,
     tls_metrics_mutex: ?*compat.Mutex = null,
     tls_metrics_state: ?*http.metrics.TlsBufferConnectionMetrics = null,
-    read_scope_transport_early: bool = false,
+    read_scope_early_prefix_len: usize = 0,
+    read_scope_total_len: usize = 0,
 
     fn init(
         inner: http.encrypted_stream_connection.EncryptedStreamHttpConnection,
@@ -1851,20 +1852,29 @@ const WaitingEncryptedHttpConnection = struct {
                 },
                 else => return err,
             };
-            self.read_scope_transport_early = self.read_scope_transport_early or self.inner.currentReadTransportEarly();
+            const prefix_len = @min(n, self.inner.currentReadEarlyPrefixLen());
+            if (self.read_scope_early_prefix_len == self.read_scope_total_len)
+                self.read_scope_early_prefix_len += prefix_len;
+            self.read_scope_total_len += n;
             self.observeTlsBufferMetrics();
             return n;
         }
     }
 
     pub fn beginReadScope(self: *WaitingEncryptedHttpConnection) void {
-        self.read_scope_transport_early = false;
+        self.read_scope_early_prefix_len = 0;
+        self.read_scope_total_len = 0;
     }
 
     pub fn takeReadScopeTransportEarly(self: *WaitingEncryptedHttpConnection) bool {
-        const early = self.read_scope_transport_early;
-        self.read_scope_transport_early = false;
-        return early;
+        return self.takeReadScopeEarlyPrefixLen() > 0;
+    }
+
+    pub fn takeReadScopeEarlyPrefixLen(self: *WaitingEncryptedHttpConnection) usize {
+        const early_prefix_len = self.read_scope_early_prefix_len;
+        self.read_scope_early_prefix_len = 0;
+        self.read_scope_total_len = 0;
+        return early_prefix_len;
     }
 
     pub fn downstreamHandshakeComplete(self: *const WaitingEncryptedHttpConnection) bool {
@@ -2109,15 +2119,42 @@ fn recordHttp3EarlyDataCompatFromRuntime(
     state.metricsRecordHttp3EarlyDataCompat(decision);
 }
 
-fn h2LastReadTransportEarly(conn: anytype) bool {
+fn h2LastReadEarlyPrefixLen(conn: anytype) usize {
     const T = @TypeOf(conn);
     if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
         const Child = std.meta.Child(T);
-        if (comptime @hasDecl(Child, "takeReadScopeTransportEarly")) return conn.takeReadScopeTransportEarly();
+        if (comptime @hasDecl(Child, "takeReadScopeEarlyPrefixLen")) return conn.takeReadScopeEarlyPrefixLen();
+        if (comptime @hasDecl(Child, "takeReadScopeTransportEarly")) return if (conn.takeReadScopeTransportEarly()) std.math.maxInt(usize) else 0;
     } else {
-        if (comptime @hasDecl(T, "takeReadScopeTransportEarly")) return conn.takeReadScopeTransportEarly();
+        if (comptime @hasDecl(T, "takeReadScopeEarlyPrefixLen")) return conn.takeReadScopeEarlyPrefixLen();
+        if (comptime @hasDecl(T, "takeReadScopeTransportEarly")) return if (conn.takeReadScopeTransportEarly()) std.math.maxInt(usize) else 0;
     }
-    return false;
+    return 0;
+}
+
+fn h2LastReadTransportEarly(conn: anytype) bool {
+    return h2LastReadEarlyPrefixLen(conn) > 0;
+}
+
+fn h2LastReadEarlyPrefixLenBounded(conn: anytype, total_read: usize) usize {
+    return @min(total_read, h2LastReadEarlyPrefixLen(conn));
+}
+
+fn h1PendingReadEarlyPrefix(old_pending_len: usize, total_read: usize, old_early_prefix_len: usize, read_scope_early_prefix_len: usize) usize {
+    const bounded_old = @min(old_early_prefix_len, old_pending_len);
+    const new_read_len = total_read - @min(old_pending_len, total_read);
+    const bounded_new_early = @min(read_scope_early_prefix_len, new_read_len);
+    if (bounded_old < old_pending_len) return bounded_old;
+    return bounded_old + bounded_new_early;
+}
+
+fn h1ConsumeRequestEarlyProvenance(session: *ConnectionSession, old_pending_len: usize, total_read: usize, bytes_consumed: usize, read_scope_early_prefix_len: usize) bool {
+    const prefix_len = h1PendingReadEarlyPrefix(old_pending_len, total_read, session.pending_early_prefix_len, read_scope_early_prefix_len);
+    const consumed = @min(bytes_consumed, total_read);
+    const request_transport_early = consumed > 0 and prefix_len > 0;
+    session.pending_early_prefix_len = if (consumed >= prefix_len) 0 else prefix_len - consumed;
+    if (session.pending_len < session.pending_early_prefix_len) session.pending_early_prefix_len = session.pending_len;
+    return request_transport_early;
 }
 
 fn h2BeginReadScope(conn: anytype) void {
@@ -2863,21 +2900,6 @@ fn streamingRequestBodyFromHead(
     };
 }
 
-fn h1PendingReadEarlyPrefix(old_pending_len: usize, total_read: usize, old_early_prefix_len: usize, read_scope_early: bool) usize {
-    const bounded_old = @min(old_early_prefix_len, old_pending_len);
-    if (!read_scope_early) return bounded_old;
-    return total_read;
-}
-
-fn h1ConsumeRequestEarlyProvenance(session: *ConnectionSession, old_pending_len: usize, total_read: usize, bytes_consumed: usize, read_scope_early: bool) bool {
-    const prefix_len = h1PendingReadEarlyPrefix(old_pending_len, total_read, session.pending_early_prefix_len, read_scope_early);
-    const consumed = @min(bytes_consumed, total_read);
-    const request_transport_early = consumed > 0 and prefix_len > 0;
-    session.pending_early_prefix_len = if (consumed >= prefix_len) 0 else prefix_len - consumed;
-    if (session.pending_len < session.pending_early_prefix_len) session.pending_early_prefix_len = session.pending_len;
-    return request_transport_early;
-}
-
 fn connRawFd(conn: anytype) ?std.posix.fd_t {
     const T = @TypeOf(conn);
     if (comptime std.meta.activeTag(@typeInfo(T)) == .pointer) {
@@ -2970,7 +2992,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         switch (upload_eligibility) {
             .stream => {
                 streaming_request_body = streamingRequestBodyFromHead(&head_parse.request, pending_buf, head_read, head_parse.bytes_consumed);
-                const request_transport_early = h1ConsumeRequestEarlyProvenance(session, old_pending_len, head_read.total_read, head_parse.bytes_consumed, h2LastReadTransportEarly(conn));
+                const request_transport_early = h1ConsumeRequestEarlyProvenance(session, old_pending_len, head_read.total_read, head_parse.bytes_consumed, h2LastReadEarlyPrefixLenBounded(conn, head_read.total_read));
                 request = head_parse.request;
                 request_initialized = true;
                 session.pending_len = 0;
@@ -3008,7 +3030,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                     return;
                 };
                 const bytes_consumed = parse_result.bytes_consumed;
-                const request_transport_early = h1ConsumeRequestEarlyProvenance(session, fallback_old_pending_len, total_read, bytes_consumed, h2LastReadTransportEarly(conn));
+                const request_transport_early = h1ConsumeRequestEarlyProvenance(session, fallback_old_pending_len, total_read, bytes_consumed, h2LastReadEarlyPrefixLenBounded(conn, total_read));
                 if (bytes_consumed < total_read) {
                     const remaining = total_read - bytes_consumed;
                     std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
@@ -3039,7 +3061,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             return;
         };
         const bytes_consumed = parse_result.bytes_consumed;
-        const request_transport_early = h1ConsumeRequestEarlyProvenance(session, old_pending_len, total_read, bytes_consumed, h2LastReadTransportEarly(conn));
+        const request_transport_early = h1ConsumeRequestEarlyProvenance(session, old_pending_len, total_read, bytes_consumed, h2LastReadEarlyPrefixLenBounded(conn, total_read));
         if (bytes_consumed < total_read) {
             const remaining = total_read - bytes_consumed;
             std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[bytes_consumed..total_read]);
@@ -3667,6 +3689,7 @@ test "#510 H1 request context derives transport early provenance from connection
         -1,
         &harness,
         H2FrameReadProvenanceHarness.readTransportEarly,
+        H2FrameReadProvenanceHarness.readEarlyPrefixLen,
         H2FrameReadProvenanceHarness.handshakeComplete,
     );
     var conn = WaitingEncryptedHttpConnection.init(inner, 1, 1);
@@ -3745,7 +3768,7 @@ test "#510 H1 pending buffer preserves early provenance for pipelined unsafe req
         first_old_pending_len,
         first_total_read,
         first_consumed,
-        true,
+        wire.len,
     );
     try std.testing.expect(first_transport_early);
     const remaining = first_total_read - first_consumed;
@@ -3763,7 +3786,7 @@ test "#510 H1 pending buffer preserves early provenance for pipelined unsafe req
         second_old_pending_len,
         second_total_read,
         second.bytes_consumed,
-        false,
+        0,
     );
     try std.testing.expect(second_transport_early);
 
@@ -3813,6 +3836,96 @@ test "#510 H1 pending buffer preserves early provenance for pipelined unsafe req
     try std.testing.expectEqual(@as(usize, 0), effects.rate_limit_mutations);
     try std.testing.expectEqual(@as(usize, 0), effects.upstream_calls);
     try std.testing.expectEqual(@as(usize, 0), effects.handler_calls);
+}
+
+test "#510 H1 pending buffer does not extend early provenance over later 1-RTT bytes" {
+    const allocator = std.testing.allocator;
+    const first_wire = "GET /safe HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    const second_wire = "POST /work HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\n\r\n";
+    const wire = first_wire ++ second_wire;
+    var session = ConnectionSession{};
+    var pending_buf: [512]u8 = undefined;
+
+    const first_old_pending_len = session.pending_len;
+    @memcpy(pending_buf[0..wire.len], wire);
+    session.pending_len = wire.len;
+    const first_total_read = wire.len;
+    var first = try http.Request.parse(allocator, pending_buf[0..first_total_read], MAX_REQUEST_SIZE);
+    defer first.request.deinit();
+    const first_consumed = first.bytes_consumed;
+    const first_transport_early = h1ConsumeRequestEarlyProvenance(
+        &session,
+        first_old_pending_len,
+        first_total_read,
+        first_consumed,
+        first_wire.len,
+    );
+    try std.testing.expect(first_transport_early);
+    const remaining = first_total_read - first_consumed;
+    std.mem.copyForwards(u8, pending_buf[0..remaining], pending_buf[first_consumed..first_total_read]);
+    session.pending_len = remaining;
+    try std.testing.expectEqual(second_wire.len, session.pending_len);
+    try std.testing.expectEqual(@as(usize, 0), session.pending_early_prefix_len);
+
+    const second_old_pending_len = session.pending_len;
+    const second_total_read = session.pending_len;
+    var second = try http.Request.parse(allocator, pending_buf[0..second_total_read], MAX_REQUEST_SIZE);
+    defer second.request.deinit();
+    const second_transport_early = h1ConsumeRequestEarlyProvenance(
+        &session,
+        second_old_pending_len,
+        second_total_read,
+        second.bytes_consumed,
+        0,
+    );
+    try std.testing.expect(!second_transport_early);
+
+    var blocks = [_]edge_config.EdgeConfig.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/",
+            .priority = 0,
+            .action = .{ .proxy_pass = "http://127.0.0.1:1" },
+            .early_data = .replay_safe,
+            .proxy_early_data = .rfc8470,
+        },
+    };
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.metrics_path = "/status/metrics";
+    cfg.location_blocks = blocks[0..];
+    cfg.mirror_rules = &.{};
+    var effects = H1PreflightSideEffectProbe{};
+    var state: GatewayState = undefined;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    var ctx = http.request_context.RequestContext.init(allocator, "req-pipeline-ordinary", "127.0.0.1");
+    ctx.early_data.transport_early = second_transport_early;
+    var lifecycle = http.request_lifecycle.RequestLifecycle.init("req-pipeline-ordinary", 0);
+    var keep_alive = false;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const outcome = try executeH1PostPreflightOrchestration(
+        {},
+        allocator,
+        &output.writer,
+        &cfg,
+        &state,
+        &ctx,
+        &second.request,
+        "req-pipeline-ordinary",
+        &keep_alive,
+        "127.0.0.1",
+        null,
+        &lifecycle,
+        H1CountingPostPreflightHooks{ .effects = &effects },
+    );
+
+    try std.testing.expectEqual(@as(u16, @intFromEnum(http.Status.ok)), outcome.route_status);
+    try std.testing.expectEqual(@as(usize, 1), effects.mirror_calls);
+    try std.testing.expectEqual(@as(usize, 1), effects.auth_calls);
+    try std.testing.expectEqual(@as(usize, 1), effects.rate_limit_mutations);
+    try std.testing.expectEqual(@as(usize, 1), effects.upstream_calls);
+    try std.testing.expectEqual(@as(usize, 1), effects.handler_calls);
 }
 
 test "#369 Slice 2 rt0.reject.store_unavailable: disabled-mode composition passes no replay gate to the real native TLS connection" {
@@ -4764,6 +4877,7 @@ const H2FrameReadProvenanceHarness = struct {
     early_prefix_len: usize,
     max_chunk: usize,
     last_read_early: bool = false,
+    last_read_early_prefix_len: usize = 0,
 
     fn stream(self: *H2FrameReadProvenanceHarness) tls_core.encrypted_stream.EncryptedStream {
         return .{ .ptr = self, .vtable = &vtable };
@@ -4773,7 +4887,11 @@ const H2FrameReadProvenanceHarness = struct {
         const self: *H2FrameReadProvenanceHarness = @ptrCast(@alignCast(ptr));
         if (self.pos >= self.bytes.len) return error.WouldBlock;
         const n = @min(out.len, @min(self.max_chunk, self.bytes.len - self.pos));
-        self.last_read_early = self.pos < self.early_prefix_len;
+        self.last_read_early_prefix_len = if (self.pos < self.early_prefix_len)
+            @min(n, self.early_prefix_len - self.pos)
+        else
+            0;
+        self.last_read_early = self.last_read_early_prefix_len > 0;
         @memcpy(out[0..n], self.bytes[self.pos .. self.pos + n]);
         self.pos += n;
         return n;
@@ -4807,6 +4925,11 @@ const H2FrameReadProvenanceHarness = struct {
         return self.last_read_early;
     }
 
+    fn readEarlyPrefixLen(ptr: *anyopaque) usize {
+        const self: *H2FrameReadProvenanceHarness = @ptrCast(@alignCast(ptr));
+        return self.last_read_early_prefix_len;
+    }
+
     fn handshakeComplete(_: *anyopaque) bool {
         return true;
     }
@@ -4819,6 +4942,7 @@ const H2FrameReadProvenanceHarness = struct {
         .readinessFn = readiness,
         .driveFn = drive,
         .bufferSnapshotFn = bufferSnapshot,
+        .currentReadEarlyPrefixLenFn = readEarlyPrefixLen,
     };
 };
 
@@ -4845,6 +4969,7 @@ test "H2 frame provenance stays sticky when frame is fragmented across early the
         -1,
         &harness,
         H2FrameReadProvenanceHarness.readTransportEarly,
+        H2FrameReadProvenanceHarness.readEarlyPrefixLen,
         H2FrameReadProvenanceHarness.handshakeComplete,
     );
     var conn = WaitingEncryptedHttpConnection.init(inner, 1, 1);
