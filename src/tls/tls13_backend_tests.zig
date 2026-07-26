@@ -3249,6 +3249,75 @@ test "record stream completes a real TLS 1.3 handshake over a nonblocking socket
     }
 }
 
+test "middlebox-compat change_cipher_spec spliced between two records of one still-incomplete ClientHello is rejected" {
+    // The adversarial case a fragment-counting acceptance check would get
+    // wrong: `partial ClientHello record -> dummy CCS record -> rest of
+    // ClientHello record`.
+    //
+    // Empirically (verified by temporarily hardcoding
+    // `firstClientHelloAccepted()` to always return `true`, simulating the
+    // exact bug this test is meant to catch): this specific record-level
+    // splice is already rejected before `firstClientHelloAccepted()` is
+    // ever consulted, by the *lower* record-parser layer --
+    // `record_codec.nextClientHelloState` tracks the server's ClientHello
+    // reassembly window and rejects any non-`.handshake` record type
+    // interleaved with it (`error.InvalidRecordType`), independent of the
+    // CCS-specific dispatch in `feedHandshakeToDriver`/`openHandshakeSink`.
+    // So this test proves the end-to-end system property RFC 9846 §5
+    // requires (the splice is rejected, not silently tolerated), asserting
+    // the *actual* error that fires -- it is not, by itself, evidence that
+    // `firstClientHelloAccepted()`'s specific window check is what catches
+    // this particular case. That function's own boundary cases (before any
+    // ClientHello at all, and after the peer's Finished) are covered
+    // directly in `encrypted_stream.zig`, where no earlier layer intervenes.
+    var harness = try SocketHarness.create(.{});
+    defer harness.destroy();
+
+    var ch_buf: [512]u8 = undefined;
+    const client_hello = try buildClientHello(&ch_buf, .{});
+    // Split strictly inside the handshake message, not the outer record:
+    // two separate, complete, valid TLS records that together carry one
+    // fragmented ClientHello, matching how a real fragmenting client (or
+    // the tiny-chunk carriers in the test above) actually puts one on the
+    // wire -- not a record cut off mid-header, which the parser would
+    // just buffer as one still-incomplete record instead of two.
+    const split = client_hello.len / 2;
+    var record_a_buf: [600]u8 = undefined;
+    var record_b_buf: [600]u8 = undefined;
+    const record_a = try record_codec.encodePlaintextRecord(.handshake, client_hello[0..split], &record_a_buf);
+    const record_b = try record_codec.encodePlaintextRecord(.handshake, client_hello[split..], &record_b_buf);
+    const dummy_ccs = [_]u8{ 20, 3, 3, 0, 1, 1 };
+
+    // Write directly to the raw fd, bypassing the harness's own client
+    // driving entirely -- this test plays an attacker sending an exact
+    // byte sequence, not a well-behaved client.
+    _ = try writeFd(harness.fds[0], record_a);
+    for (0..10) |_| _ = try harness.driveServer();
+    // The ClientHello is genuinely still incomplete at this point: no
+    // epoch has advanced, and the server must not have failed merely for
+    // receiving a partial (but well-formed) handshake record.
+    try std.testing.expectEqual(events.EncryptionEpoch.initial, harness.server.write_epoch);
+    try std.testing.expectEqual(events.EncryptionEpoch.initial, harness.server.read_epoch);
+    try std.testing.expectEqual(@as(?es.Error, null), harness.server.failed);
+
+    _ = try writeFd(harness.fds[0], &dummy_ccs);
+    for (0..10) |_| _ = harness.driveServer() catch break;
+
+    // The spliced CCS must not be silently dropped. It is rejected by the
+    // record-parser's fragmenting-ClientHello interleaving guard (see the
+    // top-of-test comment) rather than the CCS-specific window check --
+    // assert the real error precisely instead of any-error-will-do, so a
+    // future change that silently weakens either layer is caught here.
+    try std.testing.expectEqual(@as(?es.Error, error.InvalidRecordType), harness.server.failed);
+    try std.testing.expect(!harness.server.bridge.handshake_complete);
+
+    // Confirm this is a real rejection, not a stall: even the legitimate
+    // rest of the ClientHello can no longer complete the handshake.
+    _ = try writeFd(harness.fds[0], record_b);
+    for (0..10) |_| _ = harness.driveServer() catch break;
+    try std.testing.expect(!harness.server.bridge.handshake_complete);
+}
+
 test "record stream delivers maximum post-handshake ticket and remains usable" {
     const Capture = struct {
         count: usize = 0,

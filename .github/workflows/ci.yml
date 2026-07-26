@@ -209,6 +209,37 @@ jobs:
         if: runner.os == 'Linux'
         run: zig build test-integration -Dtls-profile=appliance --summary all --error-style verbose
 
+      # #369 stable smoke subset: external OpenSSL interop, real process
+      # restart, and a short reconnect soak. The `interop.`/`restart.`/
+      # `soak.`-filtered tests it runs already live in the same
+      # tests/integration.zig file the unfiltered "Run full integration
+      # suite" step above executes on Linux, so running this step there
+      # too would just repeat them for no benefit; this step exists
+      # specifically to give macOS (which the full suite deliberately
+      # skips for scheduling-variance reasons -- see the comment above)
+      # the coverage that Linux already gets from the full suite. The
+      # heavier soak/restart-loop variant runs on its own schedule (see
+      # resumption-soak.yml) rather than blocking PRs.
+      - name: Run resumption/0-RTT interop, restart, and soak smoke suite
+        if: runner.os != 'Linux'
+        run: zig build test-integration-resumption-interop -Dtls-profile=appliance --summary all --error-style verbose
+
+      # Resumable OpenSSL session files (and the generated alternate
+      # credential's private key) belong under $TMPDIR, never under the
+      # cached .zig-cache tree -- this is a cheap invariant check for that,
+      # independent of whether the test suite's own best-effort per-file
+      # cleanup ran on every exit path. Runs on every OS: Linux exercises
+      # these tests via the full suite above, macOS via the filtered step
+      # above.
+      - name: Verify no OpenSSL interop secrets leaked into the Zig cache
+        run: |
+          leaked=$(find .zig-cache -iname 'interop-*.sess' -o -iname 'interop-restart-key-*.pem' 2>/dev/null)
+          if [ -n "$leaked" ]; then
+            echo "found leaked interop secret file(s) under .zig-cache:"
+            echo "$leaked"
+            exit 1
+          fi
+
   # ── PKI differential corpus ──────────────────────────────────────────────────
   # Replays the bounded core corpus against the pure-Zig validator, OpenSSL,
   # and Go crypto/x509. External validators remain out of process.

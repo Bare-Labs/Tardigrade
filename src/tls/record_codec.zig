@@ -422,7 +422,18 @@ pub fn parseHeader(bytes: []const u8, mode: RecordMode, version_policy: VersionP
         .ciphertext => max_ciphertext_fragment_len,
     };
     if (payload_len > max_len) return error.RecordTooLarge;
-    if (mode == .ciphertext and content_type != .application_data) return error.InvalidRecordType;
+    // RFC 8446 Appendix D.4: a peer in middlebox-compatibility mode sends an
+    // unprotected, single-byte change_cipher_spec record at this point in the
+    // handshake purely for middlebox traversal; every TLS 1.3 stack MUST
+    // tolerate it even though the ciphertext parser otherwise requires every
+    // record to carry the application_data envelope post-encryption. Any
+    // other length for it is malformed and stays rejected here; the exact
+    // {0x01} payload check happens once the body is assembled, since this
+    // function never sees the payload.
+    const is_compat_change_cipher_spec = content_type == .change_cipher_spec and payload_len == 1;
+    if (mode == .ciphertext and content_type != .application_data and !is_compat_change_cipher_spec) {
+        return error.InvalidRecordType;
+    }
     return .{ .content_type = content_type, .legacy_version = version, .payload_len = payload_len };
 }
 
@@ -997,6 +1008,23 @@ test "ciphertext parser requires application_data envelope and allows TLS 1.3 ex
 
     var bad_parser = Parser.init(.ciphertext);
     try testing.expectError(error.InvalidRecordType, bad_parser.feed(&.{ 22, 3, 3, 0, 0 }, &sink));
+}
+
+test "ciphertext parser tolerates the RFC 8446 Appendix D.4 middlebox-compat change_cipher_spec envelope" {
+    var parser = Parser.init(.ciphertext);
+    var sink = RecordSink(1, max_ciphertext_fragment_len){};
+    // {0x14, 03, 03, 00, 01, 01} == change_cipher_spec, legacy version 0x0303,
+    // length 1, payload {0x01} -- the exact wire shape a middlebox-compat
+    // peer sends unprotected at any point before its own Finished.
+    try parser.feed(&.{ 20, 3, 3, 0, 1, 1 }, &sink);
+    try testing.expectEqual(@as(usize, 1), sink.len);
+    try testing.expectEqual(ContentType.change_cipher_spec, sink.items[0].content_type);
+    try testing.expectEqualSlices(u8, &.{1}, sink.items[0].payload);
+
+    // Any other declared length for it is still rejected at the header --
+    // RFC 8446 requires aborting on "any other change_cipher_spec value".
+    var bad_parser = Parser.init(.ciphertext);
+    try testing.expectError(error.InvalidRecordType, bad_parser.feed(&.{ 20, 3, 3, 0, 2, 1, 0 }, &sink));
 }
 
 test "parser reset and discard wipe vacated pending bytes" {
