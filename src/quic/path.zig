@@ -657,10 +657,7 @@ pub const PathManager = struct {
             return .on_active_path;
         }
 
-        const change: AddressChange = if (key.remote.sameHost(self.paths[self.active].?.key.remote))
-            .nat_rebinding
-        else
-            .migration;
+        const change = self.classifyAgainstActive(key);
 
         const allowed = switch (self.policy) {
             .disabled => false,
@@ -674,6 +671,14 @@ pub const PathManager = struct {
 
         if (self.find(key)) |index| {
             const path = &self.paths[index].?;
+            // A previously-active path being re-probed starts a genuinely
+            // fresh validation attempt: its old anti-amplification
+            // validation must not carry over, or canSendOnPath() would stay
+            // unlimited throughout the new attempt even though this code
+            // deliberately chose not to skip validation (RFC 9000 §9.3.1).
+            // A path still mid-validation or awaiting promotion keeps its
+            // ledger untouched — it either hasn't validated yet or just did.
+            if (path.state == .validated) path.anti_amplification = .{};
             path.anti_amplification.recordReceived(authenticated_bytes);
             switch (path.state) {
                 .validating => return .probing,
@@ -726,14 +731,19 @@ pub const PathManager = struct {
     /// 9000 §8.2.3: a successful PATH_RESPONSE permits sending beyond the 3x
     /// limit even before migration/promotion happens), so a host migration
     /// blocked later on a fresh peer CID is not also stuck amplification
-    /// limited. The caller decides when (or whether) to call
-    /// `promoteValidated` — host migration must claim a fresh peer CID first
-    /// (RFC 9000 §9.5), so validation and promotion cannot be one atomic
-    /// step. A response with no matching outstanding challenge — wrong
-    /// payload, wrong path, or expired — is ignored (null) and counted in
-    /// `path_response_mismatches`: responses do not validate paths they were
-    /// not sent on (RFC 9000 §8.2.3), but the probe itself keeps waiting
-    /// (only expiry fails it terminally).
+    /// limited. The returned (and stored) `change` is recomputed against the
+    /// active path *right now*, not the value captured when the challenge
+    /// started — another candidate can promote while this one's challenge was
+    /// outstanding, which changes what "migration" vs. "rebinding" means for
+    /// it. `promotionChange` covers the same staleness for a promotion
+    /// delayed *after* this call returns. The caller decides when (or
+    /// whether) to call `promoteValidated` — host migration must claim a
+    /// fresh peer CID first (RFC 9000 §9.5), so validation and promotion
+    /// cannot be one atomic step. A response with no matching outstanding
+    /// challenge — wrong payload, wrong path, or expired — is ignored (null)
+    /// and counted in `path_response_mismatches`: responses do not validate
+    /// paths they were not sent on (RFC 9000 §8.2.3), but the probe itself
+    /// keeps waiting (only expiry fails it terminally).
     pub fn validatePathResponse(
         self: *PathManager,
         key: PathKey,
@@ -760,6 +770,7 @@ pub const PathManager = struct {
 
         candidate.state = .validated_pending_promotion;
         candidate.anti_amplification.markValidated();
+        candidate.change = self.classifyAgainstActive(key);
         self.metrics.path_validations_succeeded += 1;
         return .{ .path = key, .change = candidate.change };
     }
@@ -767,10 +778,10 @@ pub const PathManager = struct {
     /// The current NAT-rebinding-vs-migration classification of a
     /// `.validated_pending_promotion` candidate, recomputed against
     /// `activePath()` right now rather than returning the (possibly stale)
-    /// classification stored from when the candidate was first probed.
-    /// `PathManager` allows several pending candidates at once; if a
-    /// different one is promoted first, an older candidate's relationship to
-    /// the *new* active path can differ from its stored `change` (e.g. two
+    /// classification stored from when the candidate was first probed or last
+    /// validated. `PathManager` allows several pending candidates at once; if
+    /// a different one is promoted first, an older candidate's relationship
+    /// to the *new* active path can differ from its stored `change` (e.g. two
     /// candidates on the same host: once one promotes, the other is only a
     /// port rebind relative to it). Call this immediately before deciding
     /// whether a fresh peer CID is required and before promoting. Returns
@@ -778,6 +789,14 @@ pub const PathManager = struct {
     pub fn promotionChange(self: *const PathManager, key: PathKey) ?AddressChange {
         const index = self.find(key) orelse return null;
         if (self.paths[index].?.state != .validated_pending_promotion) return null;
+        return self.classifyAgainstActive(key);
+    }
+
+    /// Classify `key` as a NAT rebinding or a host migration relative to the
+    /// *current* active path. The one implementation shared by `onDatagram`,
+    /// `validatePathResponse`, and `promotionChange`, so "recompute against
+    /// the active path right now" always means the same thing.
+    fn classifyAgainstActive(self: *const PathManager, key: PathKey) AddressChange {
         return if (key.remote.sameHost(self.activePath().key.remote))
             .nat_rebinding
         else
@@ -1300,6 +1319,61 @@ test "a pending candidate's promotion classification is recomputed against the c
     try testing.expect(manager.activePath().key.eql(b));
     try testing.expectEqual(@as(u64, 1), manager.metrics.nat_rebindings);
     try testing.expectEqual(@as(u64, 1), manager.metrics.migrations);
+}
+
+test "validatePathResponse returns the current classification, not the one captured when the challenge started" {
+    var manager = PathManager.init(.full, testKey(50_000), true); // A active
+    const b = testKeyOtherHost(50_001);
+    const c = testKeyOtherHost(50_002); // same host as B, different port
+
+    // B and C both start validating while A is active: both would classify
+    // as migrations relative to A.
+    _ = manager.onDatagram(b, 1_200, test_challenge, 0);
+    _ = manager.onDatagram(c, 1_200, test_challenge, 0);
+
+    // C's PATH_RESPONSE arrives first and promotes it before B's does.
+    _ = manager.validatePathResponse(c, test_challenge, 10).?;
+    _ = manager.promoteValidated(c).?;
+    try testing.expect(manager.activePath().key.eql(c));
+
+    // B's PATH_RESPONSE arrives only now, after C is already active. B
+    // shares C's host, so it must be reported as a NAT rebinding relative to
+    // the *current* active path — not the `.migration` its challenge started
+    // as — the instant validation succeeds, not only via a later
+    // `promotionChange` query.
+    const validated_b = manager.validatePathResponse(b, test_challenge, 20).?;
+    try testing.expectEqual(AddressChange.nat_rebinding, validated_b.change);
+
+    const outcome_b = manager.promoteValidated(b).?;
+    try testing.expectEqual(AddressChange.nat_rebinding, outcome_b.change);
+    try testing.expect(!outcome_b.reset_congestion);
+}
+
+test "re-probing a previously-active validated path resets its stale anti-amplification ledger" {
+    const a = testKey(50_000);
+    const b = testKeyOtherHost(50_001);
+    var manager = PathManager.init(.full, a, true);
+
+    // B validates and promotes; A becomes a non-active `.validated` path
+    // whose ledger was marked validated (unlimited) during its own tenure as
+    // the active path.
+    _ = manager.onDatagram(b, 1_200, test_challenge, 0);
+    _ = manager.validatePathResponse(b, test_challenge, 10).?;
+    _ = manager.promoteValidated(b).?;
+    try testing.expect(manager.activePath().key.eql(b));
+
+    // Traffic returns to A: it is re-probed (a previously-active path has no
+    // tracked recency), and its old "unlimited" ledger must not survive into
+    // the new validation attempt — the budget reflects only the fresh
+    // datagram's 100 bytes.
+    const decision = manager.onDatagram(a, 100, test_challenge, 20);
+    try testing.expect(decision == .probe);
+    try testing.expect(manager.canSendOnPath(a, 300));
+    try testing.expect(!manager.canSendOnPath(a, 301));
+
+    // Once A re-validates, its ledger is unlimited again.
+    _ = manager.validatePathResponse(a, test_challenge, 30).?;
+    try testing.expect(manager.canSendOnPath(a, std.math.maxInt(u64)));
 }
 
 test "a previously-active validated path is re-probed, not trusted indefinitely" {
