@@ -222,7 +222,11 @@ pub const Bridge = struct {
                 const write = self.writeApplication() orelse return error.MissingWriteKeys;
                 break :blk try sealHandshakeFragments(write, bytes, out);
             },
-            .zero_rtt => error.UnsupportedRecordEpoch,
+            .zero_rtt => blk: {
+                if (self.handshake_complete) return error.UnsupportedRecordEpoch;
+                const write = self.writeZeroRtt() orelse return error.MissingWriteKeys;
+                break :blk try sealHandshakeFragments(write, bytes, out);
+            },
         };
     }
 
@@ -241,7 +245,11 @@ pub const Bridge = struct {
                 const write = self.writeApplication() orelse return error.MissingWriteKeys;
                 break :blk protectedHandshakeRecordLen(write, bytes_len);
             },
-            .zero_rtt => error.UnsupportedRecordEpoch,
+            .zero_rtt => blk: {
+                if (self.handshake_complete) return error.UnsupportedRecordEpoch;
+                const write = self.writeZeroRtt() orelse return error.MissingWriteKeys;
+                break :blk protectedHandshakeRecordLen(write, bytes_len);
+            },
         };
     }
 
@@ -269,7 +277,9 @@ pub const Bridge = struct {
                 break :blk try write.seal(content_type, bytes, 0, out);
             },
             .zero_rtt => blk: {
-                if (self.handshake_complete or content_type != .application_data) return error.UnsupportedRecordEpoch;
+                if (self.handshake_complete or
+                    !(content_type == .application_data or content_type == .handshake))
+                    return error.UnsupportedRecordEpoch;
                 const write = self.writeZeroRtt() orelse return error.MissingWriteKeys;
                 break :blk try write.seal(content_type, bytes, 0, out);
             },
@@ -645,6 +655,31 @@ test "record epoch bridge opens zero-rtt application data and wipes keys at hand
     try testing.expect(!server.hasReadKeys(.zero_rtt));
     try testing.expect(!server.hasWriteKeys(.zero_rtt));
     try testing.expectError(error.UnsupportedRecordEpoch, server.openProtected(.zero_rtt, early_record, &plaintext));
+}
+
+test "#510 record epoch bridge protects EndOfEarlyData with zero-rtt keys" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+
+    const early = secret(0x64);
+    const hs = secret(0x65);
+    try client.installTrafficSecret(.zero_rtt, .write, &early);
+    try server.installTrafficSecret(.zero_rtt, .read, &early);
+    try server.installTrafficSecret(.handshake, .read, &hs);
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const eom = [_]u8{ 5, 0, 0, 0 };
+    const record_bytes = try client.sealHandshake(.zero_rtt, &eom, &protected);
+    const record = try parseSingleRecord(.ciphertext, record_bytes);
+
+    try testing.expectError(error.AuthenticationFailed, server.openHandshake(.handshake, record, &plaintext));
+    const opened = try server.openHandshake(.zero_rtt, record, &plaintext);
+    try testing.expectEqual(events.EncryptionEpoch.zero_rtt, opened.epoch);
+    try testing.expectEqualSlices(u8, &eom, opened.inner.content);
 }
 
 test "record epoch bridge discards prior epoch keys and fails closed after discard" {

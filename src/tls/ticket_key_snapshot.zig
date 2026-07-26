@@ -11,6 +11,42 @@ const ticket_protection = @import("ticket_protection.zig");
 
 const provider = crypto.provider;
 
+const ZeroingAllocator = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *ZeroingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ZeroingAllocator = @ptrCast(@alignCast(ptr));
+        return self.child.vtable.alloc(self.child.ptr, len, alignment, ret_addr);
+    }
+
+    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *ZeroingAllocator = @ptrCast(@alignCast(ptr));
+        if (new_len < memory.len) std.crypto.secureZero(u8, memory[new_len..]);
+        return self.child.vtable.resize(self.child.ptr, memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ZeroingAllocator = @ptrCast(@alignCast(ptr));
+        std.crypto.secureZero(u8, memory);
+        self.child.vtable.free(self.child.ptr, memory, alignment, ret_addr);
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+};
+
 pub const max_snapshot_bytes: usize = 64 * 1024;
 pub const format_version: u8 = 1;
 
@@ -49,12 +85,16 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) LoadError!Ow
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.SnapshotUnreadable,
     };
-    defer allocator.free(bytes);
+    defer {
+        std.crypto.secureZero(u8, bytes);
+        allocator.free(bytes);
+    }
     return parse(allocator, bytes);
 }
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) LoadError!OwnedSnapshot {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return error.MalformedEncoding;
+    var json_allocator = ZeroingAllocator{ .child = allocator };
+    var parsed = std.json.parseFromSlice(std.json.Value, json_allocator.allocator(), bytes, .{}) catch return error.MalformedEncoding;
     defer parsed.deinit();
     const root = if (parsed.value == .object) parsed.value.object else return error.MalformedEncoding;
     const version_value = root.get("version") orelse return error.MalformedEncoding;

@@ -1666,7 +1666,7 @@ pub const PureZigRecordStream = struct {
                 else => return self.fail(err),
             };
             switch (opened.inner.content_type) {
-                .handshake => try self.driveReceive(epoch, opened.inner.content),
+                .handshake => try self.driveReceive(opened.epoch, opened.inner.content),
                 .application_data => {
                     if (opened.epoch != .zero_rtt) return self.fail(error.UnexpectedRecordContent);
                     const max_early = self.handshake_driver.?.backend.earlyDataMaxBytes();
@@ -1728,7 +1728,7 @@ pub const PureZigRecordStream = struct {
     fn rejectedEarlyWireLimit(plaintext_limit: u32) u64 {
         if (plaintext_limit == 0) return 0;
         const overhead_per_record = record_codec.header_len + 1 + 16;
-        const records = (@as(u64, plaintext_limit) + record_codec.max_plaintext_fragment_len - 1) / record_codec.max_plaintext_fragment_len;
+        const records = @as(u64, plaintext_limit) + 1;
         return @as(u64, plaintext_limit) + records * overhead_per_record;
     }
 

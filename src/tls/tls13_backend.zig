@@ -1618,7 +1618,9 @@ pub const Tls13Backend = struct {
         // handshake has completed.
         errdefer self.clearFailedHandshakeState();
         switch (level) {
-            .zero_rtt => return error.UnexpectedTransportEpoch,
+            .zero_rtt => {
+                if (self.role != .server) return error.UnexpectedTransportEpoch;
+            },
             .application => {
                 if (self.core.handshake_lifecycle != .complete) return error.UnexpectedTransportEpoch;
                 if (self.pending_op != null) return;
@@ -1636,7 +1638,8 @@ pub const Tls13Backend = struct {
         const input = switch (level) {
             .initial => &self.initial_input,
             .handshake => &self.handshake_input,
-            .zero_rtt, .application => unreachable,
+            .zero_rtt => &self.handshake_input,
+            .application => unreachable,
         };
         input.append(bytes) catch |err| return mapCoreError(err);
         // Never begin dispatching while an authentication operation is parked:
@@ -1696,11 +1699,11 @@ pub const Tls13Backend = struct {
     fn expectedLevel(kind: MessageType) HandshakeError!EncryptionLevel {
         return switch (kind) {
             .client_hello, .server_hello => .initial,
+            .end_of_early_data => .zero_rtt,
             .encrypted_extensions,
             .certificate_request,
             .certificate,
             .certificate_verify,
-            .end_of_early_data,
             .finished,
             => .handshake,
             .new_session_ticket => .application,
@@ -2765,7 +2768,7 @@ pub const Tls13Backend = struct {
             ew.patch(3, eom_len);
             const eom = ebuf[0..ew.len];
             self.core.recordSent(eom) catch |err| return mapCoreError(err);
-            try sink.emitCrypto(.handshake, eom);
+            try sink.emitCrypto(.zero_rtt, eom);
             try self.emitDiscardKeys(sink, .zero_rtt);
             finished_transcript_hash = self.core.transcriptHash();
         }

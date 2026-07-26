@@ -226,16 +226,16 @@ fn pumpDirect(
             }
         },
         .traffic_secret => |traffic_secret| {
-            if (traffic_secret.epoch == .zero_rtt) {
-                observed.zero_rtt_secret[@intFromEnum(sender_side)] = SecretSnapshot.capture(traffic_secret.data);
-                continue;
-            }
             var scratch: [1]u8 = undefined;
             _ = try sender_bridge.applyEvent(.{ .traffic_secret = .{
                 .epoch = traffic_secret.epoch,
                 .direction = traffic_secret.direction,
                 .data = traffic_secret.data,
             } }, &scratch);
+            if (traffic_secret.epoch == .zero_rtt) {
+                observed.zero_rtt_secret[@intFromEnum(sender_side)] = SecretSnapshot.capture(traffic_secret.data);
+                continue;
+            }
             const keys: *const tls_core.record_protection.TrafficKeys = switch (traffic_secret.epoch) {
                 .handshake => switch (traffic_secret.direction) {
                     .write => &sender_bridge.write_handshake.?.keys,
@@ -3171,7 +3171,19 @@ test "#510 replay-rejected early discard is bounded by ticket allowance" {
     var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
     const one_over = try h.client.bridge.sealProtected(.zero_rtt, .application_data, "y", &protected);
     try std.testing.expectEqual(one_over.len, try writeFd(h.fds[0], one_over));
-    try std.testing.expectError(error.AuthenticationFailed, h.driveServer());
+    _ = try h.driveServer();
+
+    var rejected = false;
+    for (0..64) |_| {
+        const extra = try h.client.bridge.sealProtected(.zero_rtt, .application_data, "z", &protected);
+        try std.testing.expectEqual(extra.len, try writeFd(h.fds[0], extra));
+        if (h.driveServer()) |_| {} else |err| {
+            try std.testing.expectEqual(error.AuthenticationFailed, err);
+            rejected = true;
+            break;
+        }
+    }
+    try std.testing.expect(rejected);
 }
 
 test "allocating record owner cleans up across every allocation failure" {

@@ -98,6 +98,7 @@ pub const Runtime = struct {
     client_cache: ?session_cache.ClientSessionCache = null,
     server_cache: ?session_cache.StatefulServerCache = null,
     keyring: ?ticket_protection.ReloadableKeyRing = null,
+    persistent_snapshot_fingerprint: ?[32]u8 = null,
     observer: Observer = .{},
 
     pub fn init(
@@ -191,8 +192,13 @@ pub const Runtime = struct {
     ) ticket_protection.SnapshotError!void {
         if (self.config.stateless_ticket_key_source != .persistent) return error.StaleSnapshotGeneration;
         const keyring = if (self.keyring) |*keyring| keyring else return error.TooManyKeys;
+        const fingerprint = fingerprintPersistentTicketKeys(generation, configs);
+        if (self.persistent_snapshot_fingerprint) |accepted| {
+            if (std.mem.eql(u8, &accepted, &fingerprint)) return;
+        }
         const snapshot = try ticket_protection.Snapshot.build(self.allocator, configs, generation, self.provider.capabilities());
         try keyring.install(snapshot);
+        self.persistent_snapshot_fingerprint = fingerprint;
     }
 
     pub fn loadPersistentTicketKeysFromFile(self: *Runtime, path: []const u8) (ticket_key_snapshot.LoadError || ticket_protection.SnapshotError)!void {
@@ -551,6 +557,46 @@ fn sampleClientTicket(allocator: std.mem.Allocator, ticket: []const u8, sni: []c
     return state;
 }
 
+fn fingerprintPersistentTicketKeys(generation: u64, configs: []const ticket_protection.KeyConfig) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    defer crypto.secrets.secureZero(std.mem.asBytes(&hasher));
+    hasher.update("tardigrade/tls-persistent-ticket-snapshot/v1\x00");
+
+    var int_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &int_buf, generation, .big);
+    hasher.update(&int_buf);
+    std.mem.writeInt(u64, &int_buf, configs.len, .big);
+    hasher.update(&int_buf);
+
+    for (configs) |cfg| {
+        hasher.update(&cfg.id);
+        hasher.update(&[_]u8{@intFromEnum(cfg.aead)});
+        std.mem.writeInt(u64, &int_buf, cfg.key_bytes.len, .big);
+        hasher.update(&int_buf);
+        hasher.update(cfg.key_bytes);
+        std.mem.writeInt(i64, &int_buf, cfg.not_before_unix_ms, .big);
+        hasher.update(&int_buf);
+        std.mem.writeInt(i64, &int_buf, cfg.encrypt_until_unix_ms, .big);
+        hasher.update(&int_buf);
+        std.mem.writeInt(i64, &int_buf, cfg.decrypt_until_unix_ms, .big);
+        hasher.update(&int_buf);
+        if (cfg.nonce_lease) |lease| {
+            hasher.update(&[_]u8{1});
+            hasher.update(&lease.prefix);
+            std.mem.writeInt(u64, &int_buf, lease.start, .big);
+            hasher.update(&int_buf);
+            std.mem.writeInt(u64, &int_buf, lease.end_exclusive, .big);
+            hasher.update(&int_buf);
+        } else {
+            hasher.update(&[_]u8{0});
+        }
+    }
+
+    var out: [32]u8 = undefined;
+    hasher.final(&out);
+    return out;
+}
+
 const TestTicketKey = struct {
     id: ticket_protection.KeyId,
     key: [16]u8,
@@ -812,6 +858,40 @@ test "#512 failed persistent ticket-key reload leaves previous production runtim
     var after = try runtime.createIdentity(&state, clock.now_ms, &after_scratch);
     try expectTicketKeyId(after.slice(), &key.id);
     try expectTicketNonceCounter(after.slice(), 1);
+}
+
+test "#512 unchanged persistent ticket-key reload preserves live nonce cursor" {
+    var clock = TestClock{ .now_ms = 1_000 };
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless, .stateless_ticket_key_source = .persistent },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    const key = testTicketKey(0x28, 0xc8);
+    const configs = [_]ticket_protection.KeyConfig{
+        persistentKeyConfig(&key, 1_000, 5_000, 10_000, .{ .prefix = .{ 8, 0, 0, 0 }, .start = 0, .end_exclusive = 10 }),
+    };
+    try runtime.installPersistentTicketKeys(1, &configs);
+
+    var state = try sampleServerState(std.testing.allocator, "unchanged-reload.test");
+    defer state.deinit();
+    state.common.issued_at_unix_ms = clock.now_ms;
+    state.common.lifetime_seconds = 3;
+    var scratch: [1024]u8 = undefined;
+    var first = try runtime.createIdentity(&state, clock.now_ms, &scratch);
+    try expectTicketNonceCounter(first.slice(), 0);
+
+    try runtime.installPersistentTicketKeys(1, &configs);
+
+    var after_scratch: [1024]u8 = undefined;
+    var second = try runtime.createIdentity(&state, clock.now_ms, &after_scratch);
+    try expectTicketKeyId(second.slice(), &key.id);
+    try expectTicketNonceCounter(second.slice(), 1);
 }
 
 test "#512 persistent stateless restart resumes old tickets and advances nonce lease" {
