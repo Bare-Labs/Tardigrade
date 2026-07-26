@@ -3231,16 +3231,29 @@ fn verifyApplianceAcceptsCredential(allocator: std.mem.Allocator, cert_path: []c
     try env_map.put("TARDIGRADE_TLS_KEY_PATH", key_path);
     try env_map.put("TARDIGRADE_TLS_SERVER_NAME", server_name);
 
-    const checked = try std.process.run(allocator, compat.io(), .{
+    // Through the same bounded spawn/wait/reap contract as every other
+    // external process this suite drives -- `std.process.run` waits
+    // synchronously with no deadline, which would let a `check` hang (a
+    // parser/I/O regression, say) block this test until the outer CI job
+    // timeout instead of failing with a useful diagnostic.
+    var checked = try bounded_process.run(allocator, .{
         .argv = &.{ integration_options.tardigrade_bin_path, "check", config_rel },
         .environ_map = &env_map,
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
+        .stdout_limit = 64 * 1024,
+        .stderr_limit = 64 * 1024,
+        .deadline_ms = 10_000,
     });
-    defer allocator.free(checked.stdout);
-    defer allocator.free(checked.stderr);
-    if (!std.meta.eql(checked.term, std.process.Child.Term{ .exited = 0 })) {
+    defer checked.deinit(allocator);
+    // "nonzero means this fixture is unsuitable -> skip" only after the
+    // child has actually terminated within the bound above -- a timeout
+    // or launch failure is a real test infrastructure problem and must
+    // fail loudly, not be silently folded into the same skip path.
+    if (std.meta.activeTag(checked.outcome) == .normal_exit and checked.outcome.normal_exit != 0) {
         return error.SkipZigTest;
+    }
+    if (std.meta.activeTag(checked.outcome) != .normal_exit) {
+        std.debug.print("tardi check did not exit normally: {s}\n", .{checked.diagnostic});
+        return error.ApplianceCheckDidNotExitNormally;
     }
 }
 

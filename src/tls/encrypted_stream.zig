@@ -361,17 +361,6 @@ pub const PureZigRecordStream = struct {
     /// place afterward so its securely-wiped sink stays observable.
     driver_torn_down: bool = false,
     handshake_started: bool = false,
-    /// Server role only: whether at least one real (non-CCS) handshake
-    /// message has been received yet. The very first handshake message any
-    /// server ever receives is structurally the ClientHello (anything else
-    /// there already fails for an unrelated reason), so this doubles as
-    /// "has the first ClientHello been seen" without duplicating a second,
-    /// independent ClientHello-tracking state machine. Gates the
-    /// middlebox-compat `change_cipher_spec` acceptance window alongside
-    /// `bridge.handshake_complete` (see `feedHandshakeToDriver`); a client
-    /// checks `handshake_started` instead, since generating its own
-    /// ClientHello is what flips that flag for the client role.
-    handshake_message_seen: bool = false,
     /// Explicit protocol epochs for inbound and outbound records. Tracked as a
     /// deliberate state machine rather than inferred from which keys happen to
     /// be installed: after the server installs its application read secret the
@@ -1085,6 +1074,30 @@ pub const PureZigRecordStream = struct {
         }
     }
 
+    /// RFC 9846 §5's middlebox-compat `change_cipher_spec` window opens
+    /// only after the first ClientHello has been *sent or received* -- not
+    /// merely "a handshake record fragment has arrived". A driver is free
+    /// to buffer an incomplete handshake message across several records
+    /// and only report progress once it has a complete one (so a peer
+    /// could otherwise splice `partial ClientHello record -> dummy CCS ->
+    /// rest of ClientHello` and have the CCS wrongly tolerated by a
+    /// fragment-counting check). `read_epoch`/`write_epoch` leaving
+    /// `.initial` is not that either by accident: it only happens as a
+    /// side effect of `advanceEpochOnSecret`, which only runs once the
+    /// driver has derived real handshake traffic secrets -- which for the
+    /// server requires a fully reassembled, accepted ClientHello, and for
+    /// the client only happens after it has itself sent one. So this reuses
+    /// existing driver-completion state rather than tracking ClientHello
+    /// receipt a second, independent way. The client side still checks
+    /// `handshake_started` specifically: generating and sending its own
+    /// ClientHello is what flips that flag, and happens before either
+    /// epoch could plausibly move for a client that hasn't received
+    /// anything back yet.
+    fn firstClientHelloAccepted(self: *const PureZigRecordStream) bool {
+        if (self.role == .client) return self.handshake_started;
+        return self.read_epoch != .initial or self.write_epoch != .initial;
+    }
+
     /// Capture the negotiated ALPN. RFC 7301 caps a protocol name at 255 bytes;
     /// a longer value can only be a backend bug or malformed peer data, so fail
     /// closed rather than silently truncating (which would change the protocol).
@@ -1480,18 +1493,14 @@ pub const PureZigRecordStream = struct {
             // dropped unopened since it was never encrypted, only inside
             // the RFC-defined post-ClientHello/pre-peer-Finished window.
             if (record.content_type == .change_cipher_spec) {
-                const first_client_hello_seen = if (self.role == .client) self.handshake_started else self.handshake_message_seen;
-                if (record.payload.len != 1 or record.payload[0] != 0x01 or !first_client_hello_seen or self.bridge.handshake_complete) {
+                if (record.payload.len != 1 or record.payload[0] != 0x01 or !self.firstClientHelloAccepted() or self.bridge.handshake_complete) {
                     return self.fail(error.UnexpectedRecordContent);
                 }
                 continue;
             }
             const opened = try self.bridge.openProtected(epoch, record, &plaintext_buf);
             switch (opened.inner.content_type) {
-                .handshake => {
-                    self.handshake_message_seen = true;
-                    try self.appendInboundHandshake(opened.inner.content);
-                },
+                .handshake => try self.appendInboundHandshake(opened.inner.content),
                 .alert => try self.handleAlert(opened.inner.content),
                 .application_data,
                 .change_cipher_spec,
@@ -1565,18 +1574,14 @@ pub const PureZigRecordStream = struct {
             // payload is the "any other change_cipher_spec value" case the
             // RFC also requires aborting the handshake for.
             if (record.content_type == .change_cipher_spec) {
-                const first_client_hello_seen = if (self.role == .client) self.handshake_started else self.handshake_message_seen;
-                if (record.payload.len != 1 or record.payload[0] != 0x01 or !first_client_hello_seen or self.bridge.handshake_complete) {
+                if (record.payload.len != 1 or record.payload[0] != 0x01 or !self.firstClientHelloAccepted() or self.bridge.handshake_complete) {
                     return self.fail(error.UnexpectedRecordContent);
                 }
                 continue;
             }
             const opened = self.bridge.openProtected(epoch, record, &plaintext_buf) catch |err| return self.fail(err);
             switch (opened.inner.content_type) {
-                .handshake => {
-                    self.handshake_message_seen = true;
-                    try self.driveReceive(epoch, opened.inner.content);
-                },
+                .handshake => try self.driveReceive(epoch, opened.inner.content),
                 .alert => try self.handleAlert(opened.inner.content),
                 .application_data,
                 .change_cipher_spec,
@@ -3882,10 +3887,10 @@ test "middlebox-compat change_cipher_spec before any ClientHello is rejected, no
     defer server.deinit();
 
     // RFC 9846 §5's window opens only after the first ClientHello has been
-    // sent or received. A server that has not processed any handshake
-    // message yet (`handshake_message_seen` still false) must not accept
-    // one just because the wire shape matches -- otherwise a peer could
-    // smuggle this in as the very first bytes on the connection.
+    // sent or received. A server that has not accepted any handshake
+    // message yet (`read_epoch`/`write_epoch` still `.initial`) must not
+    // accept one just because the wire shape matches -- otherwise a peer
+    // could smuggle this in as the very first bytes on the connection.
     try testing.expectError(error.UnexpectedRecordContent, server.feedHandshakeCiphertext(.initial, &.{ 20, 3, 3, 0, 1, 1 }));
 }
 
@@ -3898,10 +3903,15 @@ test "middlebox-compat change_cipher_spec after ClientHello, before peer Finishe
     const server_hs = secret(0x52);
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &client_hs } });
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } });
-    // Simulates the server already having received the ClientHello (the
-    // actual message content and driver plumbing is exercised elsewhere;
-    // this test isolates the CCS acceptance-window check itself).
-    server.handshake_message_seen = true;
+    // `applyEvent` (unlike the real per-record driver path) does not itself
+    // advance `read_epoch`/`write_epoch` as a side effect of installing a
+    // secret, so set them directly: simulates the server already having
+    // accepted a complete ClientHello (the actual message content and
+    // driver plumbing, including the adversarial fragmented-ClientHello
+    // case, is exercised in `tls13_backend_tests.zig`; this test isolates
+    // the CCS acceptance-window check itself).
+    server.read_epoch = .handshake;
+    server.write_epoch = .handshake;
 
     // {0x14, 03, 03, 00, 01, 01}: an unprotected, single-byte compat CCS at
     // the handshake epoch -- RFC 9846 §5 requires this be dropped, not
@@ -3934,7 +3944,8 @@ test "middlebox-compat change_cipher_spec after peer Finished (handshake already
     const server_hs = secret(0x52);
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &client_hs } });
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } });
-    server.handshake_message_seen = true;
+    server.read_epoch = .handshake;
+    server.write_epoch = .handshake;
     // Simulates the handshake already having completed (peer's Finished
     // already received and processed) without exercising the full
     // application-key-installation precondition chain
@@ -3954,7 +3965,8 @@ test "a malformed change_cipher_spec at the handshake epoch aborts instead of si
     const server_hs = secret(0x52);
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &client_hs } });
     try server.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &server_hs } });
-    server.handshake_message_seen = true;
+    server.read_epoch = .handshake;
+    server.write_epoch = .handshake;
 
     // Same envelope, wrong payload byte (RFC 9846: "any other
     // change_cipher_spec value... MUST abort the handshake").

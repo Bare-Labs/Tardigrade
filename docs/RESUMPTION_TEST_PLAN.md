@@ -369,14 +369,17 @@ passed before it.
 ### CI
 
 - `zig build test-integration-resumption-interop` (new build step,
-  filtered to the `interop.`/`restart.`/`soak.` case-ID prefixes) is wired
-  into the existing appliance-profile CI job's Linux-only tier — the same
-  scoping that job already applies to the full integration suite, since
-  this new suite is similarly more prone to runner-scheduling variance
-  (real subprocesses, real process spawn/kill, bounded real-time sleeps)
-  than the pure in-process native-TLS suite.
-- `.github/workflows/resumption-soak.yml` runs the same suite with
-  `TARDIGRADE_SOAK_HEAVY=1` on a weekly schedule plus manual dispatch,
+  filtered to the `interop.`/`restart.`/`soak.` case-ID prefixes) lives in
+  the same `tests/integration.zig` the existing unfiltered full
+  integration suite already runs. The appliance-profile CI job runs that
+  full suite on Linux only (an existing, unrelated scoping decision for
+  timing-sensitive assertions) — so on Linux this filtered step is
+  deliberately *not* run there too, since it would just repeat tests the
+  full suite already covers; on non-Linux (macOS), where the full suite is
+  skipped, this filtered step runs instead, so that platform isn't left
+  with zero coverage of this slice.
+- `.github/workflows/resumption-soak.yml` runs the same filtered suite
+  with `TARDIGRADE_SOAK_HEAVY=1` on a weekly schedule plus manual dispatch,
   mirroring `pki-differential.yml`'s existing pattern.
 
 ## Explicitly deferred beyond this slice

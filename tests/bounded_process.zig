@@ -47,6 +47,13 @@ pub const Options = struct {
     /// a peer process into shutting down before that trailing data arrives.
     /// `0` (the default) closes immediately, matching every existing caller.
     stdin_close_delay_ms: u32 = 0,
+    /// Child environment. `null` (the default) inherits this process's own
+    /// environment, matching every existing caller; pass an explicit map to
+    /// run the child under a modified/constructed environment (e.g. a
+    /// fixture-validation subcommand that needs specific `TARDIGRADE_*`
+    /// variables set) while keeping the same bounded spawn/wait/reap
+    /// contract as every other case this helper drives.
+    environ_map: ?*const std.process.Environ.Map = null,
 };
 
 pub const Result = struct {
@@ -99,6 +106,7 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
         .stderr = .pipe,
         .cwd = options.cwd,
         .pgid = 0,
+        .environ_map = options.environ_map,
     }) catch |err| {
         return launchFailureResult(allocator, "launch failed: {s}", .{@errorName(err)});
     };
