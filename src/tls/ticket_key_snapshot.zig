@@ -1,0 +1,173 @@
+//! Production loader for persistent TLS ticket-protection key snapshots.
+//!
+//! This module only decodes operator-supplied state into
+//! `ticket_protection.KeyConfig`. Rotation, nonce-lease validation, atomic
+//! publication, and key wiping remain owned by `ticket_protection.zig`.
+
+const std = @import("std");
+const compat = @import("zig_compat");
+const crypto = @import("crypto");
+const ticket_protection = @import("ticket_protection.zig");
+
+const provider = crypto.provider;
+
+pub const max_snapshot_bytes: usize = 64 * 1024;
+pub const format_version: u8 = 1;
+
+pub const LoadError = error{
+    SnapshotUnreadable,
+    SnapshotTooLarge,
+    MalformedEncoding,
+    UnsupportedVersion,
+    UnsupportedAead,
+    InvalidHex,
+    InvalidField,
+    OutOfMemory,
+};
+
+pub const OwnedSnapshot = struct {
+    allocator: std.mem.Allocator,
+    generation: u64,
+    configs: []ticket_protection.KeyConfig,
+    key_storage: []KeyStorage,
+
+    pub fn deinit(self: *OwnedSnapshot) void {
+        for (self.key_storage) |*storage| std.crypto.secureZero(u8, &storage.bytes);
+        self.allocator.free(self.key_storage);
+        self.allocator.free(self.configs);
+        self.* = undefined;
+    }
+};
+
+const KeyStorage = struct {
+    bytes: [provider.max_aead_key_len]u8 = [_]u8{0} ** provider.max_aead_key_len,
+};
+
+pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) LoadError!OwnedSnapshot {
+    const bytes = compat.cwd().readFileAlloc(allocator, path, max_snapshot_bytes) catch |err| switch (err) {
+        error.FileTooBig => return error.SnapshotTooLarge,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.SnapshotUnreadable,
+    };
+    defer allocator.free(bytes);
+    return parse(allocator, bytes);
+}
+
+pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) LoadError!OwnedSnapshot {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return error.MalformedEncoding;
+    defer parsed.deinit();
+    const root = if (parsed.value == .object) parsed.value.object else return error.MalformedEncoding;
+    const version_value = root.get("version") orelse return error.MalformedEncoding;
+    const version = try jsonUnsigned(u8, version_value);
+    if (version != format_version) return error.UnsupportedVersion;
+    const generation = try jsonUnsigned(u64, root.get("generation") orelse return error.MalformedEncoding);
+    const keys_value = root.get("keys") orelse return error.MalformedEncoding;
+    if (keys_value != .array) return error.MalformedEncoding;
+    const keys = keys_value.array.items;
+    if (keys.len == 0 or keys.len > ticket_protection.max_keys) return error.InvalidField;
+
+    var configs = allocator.alloc(ticket_protection.KeyConfig, keys.len) catch return error.OutOfMemory;
+    errdefer allocator.free(configs);
+    var key_storage = allocator.alloc(KeyStorage, keys.len) catch return error.OutOfMemory;
+    errdefer {
+        for (key_storage) |*storage| std.crypto.secureZero(u8, &storage.bytes);
+        allocator.free(key_storage);
+    }
+    @memset(key_storage, .{});
+
+    for (keys, 0..) |key_value, i| {
+        if (key_value != .object) return error.MalformedEncoding;
+        const obj = key_value.object;
+        const aead = try parseAead(try jsonString(obj.get("aead") orelse return error.MalformedEncoding));
+        const key_len = aead.keyLength();
+        var id: ticket_protection.KeyId = undefined;
+        try decodeFixedHex(ticket_protection.KeyId, try jsonString(obj.get("id") orelse return error.MalformedEncoding), &id);
+        try decodeHexSlice(try jsonString(obj.get("key") orelse return error.MalformedEncoding), key_storage[i].bytes[0..key_len]);
+
+        const lease = if (obj.get("nonce_lease")) |lease_value| blk: {
+            if (lease_value == .null) break :blk null;
+            if (lease_value != .object) return error.MalformedEncoding;
+            const lease_obj = lease_value.object;
+            var prefix: [4]u8 = undefined;
+            try decodeFixedHex([4]u8, try jsonString(lease_obj.get("prefix") orelse return error.MalformedEncoding), &prefix);
+            break :blk ticket_protection.NonceLeaseConfig{
+                .prefix = prefix,
+                .start = try jsonUnsigned(u64, lease_obj.get("start") orelse return error.MalformedEncoding),
+                .end_exclusive = try jsonUnsigned(u64, lease_obj.get("end_exclusive") orelse return error.MalformedEncoding),
+            };
+        } else null;
+
+        configs[i] = .{
+            .id = id,
+            .aead = aead,
+            .key_bytes = key_storage[i].bytes[0..key_len],
+            .not_before_unix_ms = try jsonSigned(i64, obj.get("not_before_unix_ms") orelse return error.MalformedEncoding),
+            .encrypt_until_unix_ms = try jsonSigned(i64, obj.get("encrypt_until_unix_ms") orelse return error.MalformedEncoding),
+            .decrypt_until_unix_ms = try jsonSigned(i64, obj.get("decrypt_until_unix_ms") orelse return error.MalformedEncoding),
+            .nonce_lease = lease,
+        };
+    }
+
+    return .{
+        .allocator = allocator,
+        .generation = generation,
+        .configs = configs,
+        .key_storage = key_storage,
+    };
+}
+
+fn parseAead(value: []const u8) LoadError!provider.Aead {
+    if (std.mem.eql(u8, value, "aes_128_gcm")) return .aes_128_gcm;
+    if (std.mem.eql(u8, value, "aes_256_gcm")) return .aes_256_gcm;
+    if (std.mem.eql(u8, value, "chacha20_poly1305")) return .chacha20_poly1305;
+    return error.UnsupportedAead;
+}
+
+fn jsonString(value: std.json.Value) LoadError![]const u8 {
+    if (value != .string) return error.MalformedEncoding;
+    return value.string;
+}
+
+fn jsonUnsigned(comptime T: type, value: std.json.Value) LoadError!T {
+    return switch (value) {
+        .integer => |n| if (n >= 0 and n <= std.math.maxInt(T)) @intCast(n) else error.InvalidField,
+        else => error.MalformedEncoding,
+    };
+}
+
+fn jsonSigned(comptime T: type, value: std.json.Value) LoadError!T {
+    return switch (value) {
+        .integer => |n| if (n >= std.math.minInt(T) and n <= std.math.maxInt(T)) @intCast(n) else error.InvalidField,
+        else => error.MalformedEncoding,
+    };
+}
+
+fn decodeFixedHex(comptime T: type, raw: []const u8, out: *T) LoadError!void {
+    const bytes = std.mem.asBytes(out);
+    try decodeHexSlice(raw, bytes);
+}
+
+fn decodeHexSlice(raw: []const u8, bytes: []u8) LoadError!void {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len != bytes.len * 2) return error.InvalidHex;
+    _ = std.fmt.hexToBytes(bytes, trimmed) catch return error.InvalidHex;
+}
+
+test "persistent ticket key snapshot parses owned key configs" {
+    const json =
+        \\{"version":1,"generation":7,"keys":[{"id":"000102030405060708090a0b0c0d0e0f","aead":"aes_128_gcm","key":"101112131415161718191a1b1c1d1e1f","not_before_unix_ms":1000,"encrypt_until_unix_ms":5000,"decrypt_until_unix_ms":9000,"nonce_lease":{"prefix":"aabbccdd","start":10,"end_exclusive":20}}]}
+    ;
+    var snapshot = try parse(std.testing.allocator, json);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 7), snapshot.generation);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.configs.len);
+    try std.testing.expectEqual(ticket_protection.NonceLeaseConfig{ .prefix = .{ 0xaa, 0xbb, 0xcc, 0xdd }, .start = 10, .end_exclusive = 20 }, snapshot.configs[0].nonce_lease.?);
+    try std.testing.expectEqual(@as(usize, 16), snapshot.configs[0].key_bytes.len);
+}
+
+test "persistent ticket key snapshot rejects malformed secret lengths" {
+    const json =
+        \\{"version":1,"generation":1,"keys":[{"id":"000102030405060708090a0b0c0d0e0f","aead":"aes_128_gcm","key":"10","not_before_unix_ms":1000,"encrypt_until_unix_ms":5000,"decrypt_until_unix_ms":9000}]}
+    ;
+    try std.testing.expectError(error.InvalidHex, parse(std.testing.allocator, json));
+}

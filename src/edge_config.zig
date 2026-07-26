@@ -212,6 +212,9 @@ pub const EdgeConfig = struct {
     /// One of "reusable" (default) or "single_use"; see
     /// `nativeResumptionTicketUsage`.
     tls_native_resumption_ticket_usage: []const u8,
+    /// Optional JSON snapshot path for persistent/reloadable native stateless
+    /// ticket keys. Empty preserves startup-only ephemeral stateless keys.
+    tls_native_ticket_keys_path: []const u8,
     /// #368 Slice 3: anti-replay mode for the process-local 0-RTT replay
     /// store. Distinct from `tls_native_resumption_mode` (ordinary PSK/
     /// session resumption) — see `EarlyDataReplayMode`. Defaults to the safe
@@ -606,6 +609,7 @@ pub const EdgeConfig = struct {
         allocator.free(self.tls_sni_certs);
         allocator.free(self.tls_native_resumption_mode);
         allocator.free(self.tls_native_resumption_ticket_usage);
+        allocator.free(self.tls_native_ticket_keys_path);
         allocator.free(self.tls_ocsp_response_path);
         allocator.free(self.tls_acme_directory_url);
         for (self.tls_acme_domains) |d| allocator.free(d);
@@ -820,6 +824,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const tls_native_resumption_ticket_lifetime_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_LIFETIME_SECONDS", 86_400);
     const tls_native_resumption_ticket_usage = envOrDefault(allocator, "TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_USAGE", "reusable") catch unreachable;
     errdefer allocator.free(tls_native_resumption_ticket_usage);
+    const tls_native_ticket_keys_path = envOrDefault(allocator, "TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH", "") catch unreachable;
+    errdefer allocator.free(tls_native_ticket_keys_path);
     // #368 Slice 3: explicit replay mode/capacity — see `EarlyDataReplayMode`
     // and `validateEarlyDataReplayConfig`. An unrecognized mode fails at load
     // time (like `upstream_protocol`). Unlike most numeric settings, capacity
@@ -1518,6 +1524,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .tls_native_resumption_mode = tls_native_resumption_mode,
         .tls_native_resumption_ticket_lifetime_seconds = tls_native_resumption_ticket_lifetime_seconds,
         .tls_native_resumption_ticket_usage = tls_native_resumption_ticket_usage,
+        .tls_native_ticket_keys_path = tls_native_ticket_keys_path,
         .tls_native_early_data_replay_mode = tls_native_early_data_replay_mode,
         .tls_native_early_data_replay_max_entries = tls_native_early_data_replay_max_entries,
         .tls_ocsp_stapling_enabled = tls_ocsp_stapling_enabled,
@@ -2762,6 +2769,12 @@ fn validateNativeResumptionConfig(cfg: *const EdgeConfig) !void {
     }
 }
 
+fn validateNativeTicketKeyPathConfig(cfg: *const EdgeConfig) !void {
+    if (cfg.tls_native_ticket_keys_path.len == 0) return;
+    const mode = nativeResumptionMode(cfg);
+    if (!(mode == .stateless or mode == .hybrid)) return error.InvalidConfigValue;
+}
+
 /// Server-name policy for the downstream TLS identity (#392). A configured
 /// name must always be one valid, non-wildcard DNS host name. The appliance
 /// profile additionally requires exactly one identity: a server name must be
@@ -2884,6 +2897,10 @@ fn validateApplianceTlsProfile(cfg: *const EdgeConfig) !void {
         logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS (no filesystem credential watcher)", .{});
         return error.UnsupportedApplianceConfiguration;
     }
+    if (cfg.tls_native_ticket_keys_path.len != 0) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH (filesystem-backed ticket-key reload)", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
     if (cfg.proxy_protocol_mode != .off) {
         logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_PROXY_PROTOCOL; the native TLS path closes every connection before the handshake when a PROXY preface is expected", .{});
         return error.UnsupportedApplianceConfiguration;
@@ -2916,6 +2933,13 @@ pub fn validate(cfg: *const EdgeConfig) !void {
         );
         return error.InvalidConfigValue;
     };
+    if (cfg.tls_native_ticket_keys_path.len > 0) {
+        try validateOptionalFile(cfg.tls_native_ticket_keys_path, "tls_native_ticket_keys_path");
+        validateNativeTicketKeyPathConfig(cfg) catch {
+            std.log.err("config validation failed: TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH requires TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE=stateless or hybrid", .{});
+            return error.InvalidConfigValue;
+        };
+    }
     validateEarlyDataReplayConfig(cfg.tls_native_early_data_replay_max_entries) catch {
         std.log.err(
             "config validation failed: TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES must be nonzero and <= {d} (got {d})",
@@ -3865,9 +3889,34 @@ test "native resumption config defaults to disabled and validates cleanly" {
 
     try std.testing.expectEqualStrings("disabled", cfg.tls_native_resumption_mode);
     try std.testing.expectEqualStrings("reusable", cfg.tls_native_resumption_ticket_usage);
+    try std.testing.expectEqualStrings("", cfg.tls_native_ticket_keys_path);
     try std.testing.expectEqual(tls_core.resumption_runtime.Mode.disabled, nativeResumptionMode(&cfg));
     try std.testing.expectEqual(tls_core.resumption_runtime.TicketUsage.reusable, nativeResumptionTicketUsage(&cfg));
     try validateNativeResumptionConfig(&cfg);
+}
+
+test "#512 native persistent ticket-key path requires stateless or hybrid resumption" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "ticket-keys.json", .data = "{}" });
+    const path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "ticket-keys.json");
+    defer allocator.free(path);
+
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+    allocator.free(cfg.tls_native_ticket_keys_path);
+    cfg.tls_native_ticket_keys_path = try allocator.dupe(u8, path);
+
+    try std.testing.expectError(error.InvalidConfigValue, validateNativeTicketKeyPathConfig(&cfg));
+
+    allocator.free(cfg.tls_native_resumption_mode);
+    cfg.tls_native_resumption_mode = try allocator.dupe(u8, "stateless");
+    try validate(&cfg);
+
+    allocator.free(cfg.tls_native_resumption_mode);
+    cfg.tls_native_resumption_mode = try allocator.dupe(u8, "hybrid");
+    try validate(&cfg);
 }
 
 test "native resumption config rejects an unrecognized mode or ticket usage" {
@@ -4107,6 +4156,11 @@ test "appliance profile rejects PROXY protocol, credential watching, and OCSP au
     {
         var cfg = base;
         cfg.proxy_protocol_mode = .v1;
+        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
+    }
+    {
+        var cfg = base;
+        cfg.tls_native_ticket_keys_path = "ticket-keys.json";
         try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
     }
     {

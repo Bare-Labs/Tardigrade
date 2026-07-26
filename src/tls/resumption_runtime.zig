@@ -12,6 +12,7 @@ const new_session_ticket = @import("new_session_ticket.zig");
 const pre_shared_key = @import("pre_shared_key.zig");
 const session = @import("session.zig");
 const session_cache = @import("session_cache.zig");
+const ticket_key_snapshot = @import("ticket_key_snapshot.zig");
 const ticket_protection = @import("ticket_protection.zig");
 const tls13_backend = @import("tls13_backend.zig");
 
@@ -22,6 +23,7 @@ pub const TicketUsage = enum { reusable, single_use };
 pub const Transport = enum { record, quic };
 pub const TicketResult = enum { success, rejected, failed };
 pub const ResumptionOutcome = enum { accepted, full_handshake, incompatible, miss, fatal };
+pub const StatelessTicketKeySource = enum { ephemeral, persistent };
 
 pub const Observer = struct {
     ctx: *anyopaque = @ptrCast(@constCast(&empty_observer_dummy)),
@@ -70,6 +72,7 @@ pub const Config = struct {
     session_limits: session.Limits = .default,
     client_cache_limits: session_cache.Limits = .client_default,
     server_cache_limits: session_cache.Limits = .stateful_server_default,
+    stateless_ticket_key_source: StatelessTicketKeySource = .ephemeral,
 
     pub fn validate(self: Config) error{InvalidConfig}!void {
         if (self.ticket_lifetime_seconds == 0 or self.ticket_lifetime_seconds > session.max_lifetime_seconds)
@@ -80,6 +83,8 @@ pub const Config = struct {
         }
         if (self.mode == .stateful or self.mode == .hybrid)
             self.server_cache_limits.validate() catch return error.InvalidConfig;
+        if (self.stateless_ticket_key_source == .persistent and !(self.mode == .stateless or self.mode == .hybrid))
+            return error.InvalidConfig;
     }
 };
 
@@ -126,7 +131,8 @@ pub const Runtime = struct {
 
         if (config.mode == .stateless or config.mode == .hybrid) {
             runtime.keyring = ticket_protection.ReloadableKeyRing.init(allocator);
-            try runtime.installEphemeralStatelessKey();
+            if (config.stateless_ticket_key_source == .ephemeral)
+                try runtime.installEphemeralStatelessKey();
         }
 
         return runtime;
@@ -176,6 +182,23 @@ pub const Runtime = struct {
             .record => .{ .ctx = self, .onDecisionFn = backendRecordDecision },
             .quic => .{ .ctx = self, .onDecisionFn = backendQuicDecision },
         };
+    }
+
+    pub fn installPersistentTicketKeys(
+        self: *Runtime,
+        generation: u64,
+        configs: []const ticket_protection.KeyConfig,
+    ) ticket_protection.SnapshotError!void {
+        if (self.config.stateless_ticket_key_source != .persistent) return error.StaleSnapshotGeneration;
+        const keyring = if (self.keyring) |*keyring| keyring else return error.TooManyKeys;
+        const snapshot = try ticket_protection.Snapshot.build(self.allocator, configs, generation, self.provider.capabilities());
+        try keyring.install(snapshot);
+    }
+
+    pub fn loadPersistentTicketKeysFromFile(self: *Runtime, path: []const u8) (ticket_key_snapshot.LoadError || ticket_protection.SnapshotError)!void {
+        var loaded = try ticket_key_snapshot.loadFromFile(self.allocator, path);
+        defer loaded.deinit();
+        try self.installPersistentTicketKeys(loaded.generation, loaded.configs);
     }
 
     /// Safe upper bound on the wire length of an identity this runtime can
@@ -528,6 +551,39 @@ fn sampleClientTicket(allocator: std.mem.Allocator, ticket: []const u8, sni: []c
     return state;
 }
 
+const TestTicketKey = struct {
+    id: ticket_protection.KeyId,
+    key: [16]u8,
+};
+
+fn testTicketKey(id_byte: u8, key_byte: u8) TestTicketKey {
+    return .{
+        .id = [_]u8{id_byte} ** ticket_protection.key_id_len,
+        .key = [_]u8{key_byte} ** 16,
+    };
+}
+
+fn persistentKeyConfig(key: *const TestTicketKey, not_before: i64, encrypt_until: i64, decrypt_until: i64, lease: ?ticket_protection.NonceLeaseConfig) ticket_protection.KeyConfig {
+    return .{
+        .id = key.id,
+        .aead = .aes_128_gcm,
+        .key_bytes = &key.key,
+        .not_before_unix_ms = not_before,
+        .encrypt_until_unix_ms = encrypt_until,
+        .decrypt_until_unix_ms = decrypt_until,
+        .nonce_lease = lease,
+    };
+}
+
+fn expectTicketKeyId(identity: []const u8, expected: *const ticket_protection.KeyId) !void {
+    try std.testing.expect(std.mem.eql(u8, identity[0..4], &ticket_protection.magic));
+    try std.testing.expectEqualSlices(u8, expected, identity[8..24]);
+}
+
+fn expectTicketNonceCounter(identity: []const u8, expected: u64) !void {
+    try std.testing.expectEqual(expected, std.mem.readInt(u64, identity[28..36], .big));
+}
+
 test "disabled runtime exposes no server resolver and no client offers" {
     var clock = TestClock{};
     var entropy_ctx = TestEntropy{};
@@ -658,6 +714,223 @@ test "stateless runtime resolves TDTK identities with a no-op lease across long-
     var tampered = try resolver.resolve(tampered_buf[0..ticket.len]);
     defer tampered.deinit();
     try std.testing.expect(tampered == .miss);
+}
+
+test "#512 persistent stateless runtime loads configured keys, rotates, and retires old tickets" {
+    var clock = TestClock{ .now_ms = 1_000 };
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless, .stateless_ticket_key_source = .persistent },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+    try std.testing.expect(runtime.keyring != null);
+    try std.testing.expect(runtime.keyring.?.current == null);
+
+    const key_n = testTicketKey(0x10, 0xa0);
+    const key_np1 = testTicketKey(0x11, 0xb0);
+    try runtime.installPersistentTicketKeys(1, &.{
+        persistentKeyConfig(&key_n, 1_000, 2_000, 5_000, .{ .prefix = .{ 1, 0, 0, 0 }, .start = 0, .end_exclusive = 10 }),
+    });
+
+    var n_state = try sampleServerState(std.testing.allocator, "persistent-n.test");
+    defer n_state.deinit();
+    n_state.common.issued_at_unix_ms = clock.now_ms;
+    n_state.common.lifetime_seconds = 3;
+    var n_scratch: [1024]u8 = undefined;
+    var n_identity = try runtime.createIdentity(&n_state, clock.now_ms, &n_scratch);
+    try expectTicketKeyId(n_identity.slice(), &key_n.id);
+    try expectTicketNonceCounter(n_identity.slice(), 0);
+
+    clock.now_ms = 2_000;
+    try runtime.installPersistentTicketKeys(2, &.{
+        persistentKeyConfig(&key_n, 1_000, 2_000, 5_000, null),
+        persistentKeyConfig(&key_np1, 2_000, 9_000, 12_000, .{ .prefix = .{ 2, 0, 0, 0 }, .start = 0, .end_exclusive = 10 }),
+    });
+
+    var np1_state = try sampleServerState(std.testing.allocator, "persistent-np1.test");
+    defer np1_state.deinit();
+    np1_state.common.issued_at_unix_ms = clock.now_ms;
+    np1_state.common.lifetime_seconds = 3;
+    var np1_scratch: [1024]u8 = undefined;
+    var np1_identity = try runtime.createIdentity(&np1_state, clock.now_ms, &np1_scratch);
+    try expectTicketKeyId(np1_identity.slice(), &key_np1.id);
+    try expectTicketNonceCounter(np1_identity.slice(), 0);
+
+    const resolver = runtime.serverResolver().?;
+    var old_grace_hit = try resolver.resolve(n_identity.slice());
+    defer old_grace_hit.deinit();
+    try std.testing.expect(old_grace_hit == .hit);
+
+    clock.now_ms = 5_000;
+    var old_retired = try resolver.resolve(n_identity.slice());
+    defer old_retired.deinit();
+    try std.testing.expect(old_retired == .miss);
+
+    clock.now_ms = 9_000;
+    try std.testing.expectError(error.SealFailed, runtime.createIdentity(&np1_state, clock.now_ms, &np1_scratch));
+}
+
+test "#512 failed persistent ticket-key reload leaves previous production runtime snapshot active" {
+    var clock = TestClock{ .now_ms = 1_000 };
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless, .stateless_ticket_key_source = .persistent },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    const key = testTicketKey(0x20, 0xc0);
+    try runtime.installPersistentTicketKeys(1, &.{
+        persistentKeyConfig(&key, 1_000, 5_000, 10_000, .{ .prefix = .{ 3, 0, 0, 0 }, .start = 0, .end_exclusive = 10 }),
+    });
+
+    var state = try sampleServerState(std.testing.allocator, "failed-reload.test");
+    defer state.deinit();
+    state.common.issued_at_unix_ms = clock.now_ms;
+    state.common.lifetime_seconds = 3;
+    var scratch: [1024]u8 = undefined;
+    var before = try runtime.createIdentity(&state, clock.now_ms, &scratch);
+    try expectTicketNonceCounter(before.slice(), 0);
+
+    try std.testing.expectError(error.OverlappingNonceLease, runtime.installPersistentTicketKeys(2, &.{
+        persistentKeyConfig(&key, 1_000, 5_000, 10_000, .{ .prefix = .{ 3, 0, 0, 0 }, .start = 5, .end_exclusive = 15 }),
+    }));
+
+    const resolver = runtime.serverResolver().?;
+    var hit = try resolver.resolve(before.slice());
+    defer hit.deinit();
+    try std.testing.expect(hit == .hit);
+
+    var after_scratch: [1024]u8 = undefined;
+    var after = try runtime.createIdentity(&state, clock.now_ms, &after_scratch);
+    try expectTicketKeyId(after.slice(), &key.id);
+    try expectTicketNonceCounter(after.slice(), 1);
+}
+
+test "#512 persistent stateless restart resumes old tickets and advances nonce lease" {
+    var clock = TestClock{ .now_ms = 1_000 };
+    const key = testTicketKey(0x30, 0xd0);
+
+    var entropy_a = TestEntropy{};
+    var provider_a = crypto.pure_zig.Provider.init(entropy_a.entropy());
+    var runtime_a = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless, .stateless_ticket_key_source = .persistent },
+        clock.clock(),
+        provider_a.cryptoProvider(),
+    );
+    defer runtime_a.deinit();
+    try runtime_a.installPersistentTicketKeys(1, &.{
+        persistentKeyConfig(&key, 1_000, 5_000, 20_000, .{ .prefix = .{ 4, 0, 0, 0 }, .start = 0, .end_exclusive = 1 }),
+    });
+
+    var state = try sampleServerState(std.testing.allocator, "persistent-restart.test");
+    defer state.deinit();
+    state.common.issued_at_unix_ms = clock.now_ms;
+    state.common.lifetime_seconds = 3;
+    var scratch_a: [1024]u8 = undefined;
+    var identity_a = try runtime_a.createIdentity(&state, clock.now_ms, &scratch_a);
+    try expectTicketNonceCounter(identity_a.slice(), 0);
+
+    var entropy_b = TestEntropy{};
+    var provider_b = crypto.pure_zig.Provider.init(entropy_b.entropy());
+    var runtime_b = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless, .stateless_ticket_key_source = .persistent },
+        clock.clock(),
+        provider_b.cryptoProvider(),
+    );
+    defer runtime_b.deinit();
+    try runtime_b.installPersistentTicketKeys(1, &.{
+        persistentKeyConfig(&key, 1_000, 5_000, 20_000, .{ .prefix = .{ 4, 0, 0, 0 }, .start = 1, .end_exclusive = 2 }),
+    });
+
+    const resolver_b = runtime_b.serverResolver().?;
+    var resumed = try resolver_b.resolve(identity_a.slice());
+    defer resumed.deinit();
+    try std.testing.expect(resumed == .hit);
+
+    var scratch_b: [1024]u8 = undefined;
+    var identity_b = try runtime_b.createIdentity(&state, clock.now_ms, &scratch_b);
+    try expectTicketNonceCounter(identity_b.slice(), 1);
+}
+
+test "#512 persistent stateless runtime issues while publishing adjacent rotations concurrently" {
+    var clock = TestClock{ .now_ms = 1_000 };
+    var entropy_ctx = TestEntropy{};
+    var provider_impl = crypto.pure_zig.Provider.init(entropy_ctx.entropy());
+    var runtime = try Runtime.init(
+        std.testing.allocator,
+        .{ .mode = .stateless, .stateless_ticket_key_source = .persistent },
+        clock.clock(),
+        provider_impl.cryptoProvider(),
+    );
+    defer runtime.deinit();
+
+    const key = testTicketKey(0x40, 0xe0);
+    try runtime.installPersistentTicketKeys(1, &.{
+        persistentKeyConfig(&key, 1_000, 10_000, 20_000, .{ .prefix = .{ 5, 0, 0, 0 }, .start = 0, .end_exclusive = 1_000 }),
+    });
+    var state = try sampleServerState(std.testing.allocator, "persistent-concurrent.test");
+    defer state.deinit();
+    state.common.issued_at_unix_ms = clock.now_ms;
+    state.common.lifetime_seconds = 3;
+
+    const Issuer = struct {
+        runtime: *Runtime,
+        state: *session.ServerRecoverableState,
+        successes: *std.atomic.Value(usize),
+
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < 100) : (i += 1) {
+                var scratch: [1024]u8 = undefined;
+                var identity = self.runtime.createIdentity(self.state, 1_000, &scratch) catch continue;
+                if (std.mem.eql(u8, identity.slice()[0..4], &ticket_protection.magic))
+                    _ = self.successes.fetchAdd(1, .acq_rel);
+            }
+        }
+    };
+    const Rotator = struct {
+        runtime: *Runtime,
+        key: *const TestTicketKey,
+        failures: *std.atomic.Value(usize),
+
+        fn run(self: *@This()) void {
+            var generation: u64 = 2;
+            while (generation < 20) : (generation += 1) {
+                const start = (generation - 1) * 1_000;
+                self.runtime.installPersistentTicketKeys(generation, &.{
+                    persistentKeyConfig(self.key, 1_000, 10_000, 20_000, .{ .prefix = .{ 5, 0, 0, 0 }, .start = start, .end_exclusive = start + 1_000 }),
+                }) catch {
+                    _ = self.failures.fetchAdd(1, .acq_rel);
+                };
+            }
+        }
+    };
+
+    var successes = std.atomic.Value(usize).init(0);
+    var failures = std.atomic.Value(usize).init(0);
+    var issuers: [4]Issuer = undefined;
+    var issuer_threads: [4]std.Thread = undefined;
+    for (&issuers, 0..) |*issuer, i| {
+        issuer.* = .{ .runtime = &runtime, .state = &state, .successes = &successes };
+        issuer_threads[i] = try std.Thread.spawn(.{}, Issuer.run, .{issuer});
+    }
+    var rotator = Rotator{ .runtime = &runtime, .key = &key, .failures = &failures };
+    const rotator_thread = try std.Thread.spawn(.{}, Rotator.run, .{&rotator});
+    for (&issuer_threads) |thread| thread.join();
+    rotator_thread.join();
+
+    try std.testing.expectEqual(@as(usize, 0), failures.load(.acquire));
+    try std.testing.expect(successes.load(.acquire) > 0);
 }
 
 test "hybrid runtime dispatches TDSH and TDTK by prefix only" {

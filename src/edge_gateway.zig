@@ -271,6 +271,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
                 .mode = edge_config.nativeResumptionMode(cfg),
                 .ticket_lifetime_seconds = cfg.tls_native_resumption_ticket_lifetime_seconds,
                 .usage = edge_config.nativeResumptionTicketUsage(cfg),
+                .stateless_ticket_key_source = if (cfg.tls_native_ticket_keys_path.len > 0) .persistent else .ephemeral,
             },
             .{ .ctx = undefined, .nowUnixMsFn = systemNowUnixMs },
             native_resumption_provider.cryptoProvider(),
@@ -279,6 +280,18 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             return err;
         };
         if (native_resumption_runtime) |*rt| rt.setObserver(nativeResumptionMetricsObserver(&state));
+        if (cfg.tls_native_ticket_keys_path.len > 0) {
+            native_resumption_runtime.?.loadPersistentTicketKeysFromFile(cfg.tls_native_ticket_keys_path) catch |err| {
+                state.metrics_mutex.lock();
+                state.metrics.recordTicketKeyReload(.initial_load_failure);
+                state.metrics_mutex.unlock();
+                state.logger.err(null, "native TLS/QUIC persistent ticket-key load failed ({s}); refusing to start", .{@errorName(err)});
+                return err;
+            };
+            state.metrics_mutex.lock();
+            state.metrics.recordTicketKeyReload(.initial_load_success);
+            state.metrics_mutex.unlock();
+        }
     }
     defer if (native_resumption_runtime) |*rt| rt.deinit();
     // #368 Slice 3: one process-scoped anti-replay store, shared by every

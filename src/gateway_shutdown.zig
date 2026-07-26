@@ -185,6 +185,46 @@ pub fn hotReloadConfig(
             return;
         };
     }
+    if (worker_ctx.resumption_runtime) |runtime| {
+        var current_lease = worker_ctx.config_store.acquire();
+        const source_changed = (current_lease.cfg.tls_native_ticket_keys_path.len == 0) != (cfg_ptr.tls_native_ticket_keys_path.len == 0);
+        current_lease.release();
+        if (source_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "native ticket-key source changed; restart required", .{}) catch "native ticket-key source changed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.metrics_mutex.lock();
+            state.metrics.recordTicketKeyReload(.reload_rejected);
+            state.metrics_mutex.unlock();
+            state.logger.warn(null, "config reload rejected: TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH source mode changed; restart the process to switch between ephemeral and persistent ticket keys", .{});
+            return;
+        }
+        if (cfg_ptr.tls_native_ticket_keys_path.len > 0) {
+            runtime.loadPersistentTicketKeysFromFile(cfg_ptr.tls_native_ticket_keys_path) catch |err| {
+                worker_ctx.config_store.destroyVersion(prepared_version);
+                const msg = std.fmt.bufPrint(&state.last_reload_error, "native ticket-key reload failed: {s}", .{@errorName(err)}) catch "native ticket-key reload failed";
+                state.reload_mutex.lock();
+                state.last_reload_ok = false;
+                state.last_reload_at_ms = now_ms;
+                state.last_reload_error_len = msg.len;
+                state.reload_mutex.unlock();
+                state.metricsRecordReloadFailure();
+                state.metrics_mutex.lock();
+                state.metrics.recordTicketKeyReload(.reload_rejected);
+                state.metrics_mutex.unlock();
+                state.logger.warn(null, "config reload rejected by native TLS/QUIC persistent ticket-key reload: {s}", .{@errorName(err)});
+                return;
+            };
+            state.metrics_mutex.lock();
+            state.metrics.recordTicketKeyReload(.reload_accepted);
+            state.metrics_mutex.unlock();
+        }
+    }
 
     applyReloadedRuntimeConfig(cfg_ptr, state);
     worker_ctx.config_store.installPrepared(prepared_version);

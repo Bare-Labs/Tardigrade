@@ -28,6 +28,7 @@ pub const session_cache = @import("session_cache.zig");
 pub const session_cache_persistence = @import("session_cache_persistence.zig");
 pub const sni_provider = @import("sni_provider.zig");
 pub const ticket_protection = @import("ticket_protection.zig");
+pub const ticket_key_snapshot = @import("ticket_key_snapshot.zig");
 pub const transcript = @import("transcript.zig");
 pub const transport = @import("transport.zig");
 pub const tls13_backend = @import("tls13_backend.zig");

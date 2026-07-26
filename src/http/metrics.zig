@@ -25,6 +25,7 @@ pub const ResumptionTransport = enum { record, quic };
 pub const ResumptionOutcome = enum { accepted, full_handshake, incompatible, miss, fatal };
 pub const ResumptionMode = enum { stateful, stateless, hybrid };
 pub const TicketResult = enum { success, rejected, failed };
+pub const TicketKeyReloadOutcome = enum { initial_load_success, initial_load_failure, reload_accepted, reload_rejected };
 
 pub const HttpProtocol = enum { h1, h2, h3 };
 pub const EarlyDataSource = enum { transport, header, both };
@@ -45,6 +46,7 @@ const resumption_transport_count = 2;
 const resumption_outcome_count = 5;
 const resumption_mode_count = 3;
 const ticket_result_count = 3;
+const ticket_key_reload_outcome_count = 4;
 const http_protocol_count = 3;
 const early_data_source_count = 3;
 const early_data_decision_count = 4;
@@ -191,6 +193,10 @@ pub const Metrics = struct {
     tls_ticket_store_total: [ticket_result_count]u64,
     /// #488: server-side ticket resolution attempts by mode and result.
     tls_ticket_resolve_total: [resumption_mode_count][ticket_result_count]u64,
+    /// #512: persistent native stateless ticket-key load/reload outcomes by
+    /// closed enum. Never contains paths, key IDs, key bytes, nonces, or
+    /// ciphertext.
+    tls_ticket_key_reload_total: [ticket_key_reload_outcome_count]u64,
     /// HTTP early-data replay-exposed requests by protocol and source.
     http_early_data_requests_total: [http_protocol_count][early_data_source_count]u64,
     /// HTTP early-data decisions by protocol.
@@ -315,6 +321,7 @@ pub const Metrics = struct {
             .tls_ticket_issue_total = .{.{.{0} ** ticket_result_count} ** resumption_mode_count} ** resumption_transport_count,
             .tls_ticket_store_total = .{0} ** ticket_result_count,
             .tls_ticket_resolve_total = .{.{0} ** ticket_result_count} ** resumption_mode_count,
+            .tls_ticket_key_reload_total = .{0} ** ticket_key_reload_outcome_count,
             .http_early_data_requests_total = .{.{0} ** early_data_source_count} ** http_protocol_count,
             .http_early_data_decisions_total = .{.{0} ** early_data_decision_count} ** http_protocol_count,
             .http_early_data_upstream_425_total = .{0} ** early_data_upstream_425_action_count,
@@ -398,6 +405,10 @@ pub const Metrics = struct {
     /// #488: record a server-side ticket/handle resolution attempt.
     pub fn recordTicketResolve(self: *Metrics, mode: ResumptionMode, result: TicketResult) void {
         self.tls_ticket_resolve_total[resumptionModeIndex(mode)][ticketResultIndex(result)] += 1;
+    }
+
+    pub fn recordTicketKeyReload(self: *Metrics, outcome: TicketKeyReloadOutcome) void {
+        self.tls_ticket_key_reload_total[ticketKeyReloadOutcomeIndex(outcome)] += 1;
     }
 
     pub fn recordHttpEarlyDataRequest(self: *Metrics, protocol: HttpProtocol, source: EarlyDataSource) void {
@@ -1291,6 +1302,18 @@ pub const Metrics = struct {
                 });
             }
         }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_tls_ticket_key_reload_total Persistent native stateless ticket-key load/reload outcomes by outcome
+            \\# TYPE tardigrade_tls_ticket_key_reload_total counter
+            \\
+        );
+        inline for (.{ TicketKeyReloadOutcome.initial_load_success, TicketKeyReloadOutcome.initial_load_failure, TicketKeyReloadOutcome.reload_accepted, TicketKeyReloadOutcome.reload_rejected }) |outcome| {
+            try out.print("tardigrade_tls_ticket_key_reload_total{{outcome=\"{s}\"}} {d}\n", .{
+                ticketKeyReloadOutcomeLabel(outcome),
+                self.tls_ticket_key_reload_total[ticketKeyReloadOutcomeIndex(outcome)],
+            });
+        }
     }
 
     fn appendHttpEarlyDataPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
@@ -1635,6 +1658,15 @@ fn earlyDataReplayOutcomeIndex(outcome: EarlyDataReplayOutcome) usize {
     };
 }
 
+fn ticketKeyReloadOutcomeIndex(outcome: TicketKeyReloadOutcome) usize {
+    return switch (outcome) {
+        .initial_load_success => 0,
+        .initial_load_failure => 1,
+        .reload_accepted => 2,
+        .reload_rejected => 3,
+    };
+}
+
 fn httpProtocolLabel(protocol: HttpProtocol) []const u8 {
     return switch (protocol) {
         .h1 => "h1",
@@ -1692,6 +1724,15 @@ fn earlyDataReplayOutcomeLabel(outcome: EarlyDataReplayOutcome) []const u8 {
         .expired => "expired",
         .unavailable => "unavailable",
         .startup_quarantine => "startup_quarantine",
+    };
+}
+
+fn ticketKeyReloadOutcomeLabel(outcome: TicketKeyReloadOutcome) []const u8 {
+    return switch (outcome) {
+        .initial_load_success => "initial_load_success",
+        .initial_load_failure => "initial_load_failure",
+        .reload_accepted => "reload_accepted",
+        .reload_rejected => "reload_rejected",
     };
 }
 
@@ -2001,6 +2042,12 @@ test "resumption and ticket counters default to zero and record by label (#488)"
     m.recordTicketResolve(.stateless, .failed);
     try std.testing.expectEqual(@as(u64, 1), m.tls_ticket_resolve_total[resumptionModeIndex(.stateless)][ticketResultIndex(.success)]);
     try std.testing.expectEqual(@as(u64, 1), m.tls_ticket_resolve_total[resumptionModeIndex(.stateless)][ticketResultIndex(.failed)]);
+
+    m.recordTicketKeyReload(.initial_load_success);
+    m.recordTicketKeyReload(.reload_rejected);
+    m.recordTicketKeyReload(.reload_rejected);
+    try std.testing.expectEqual(@as(u64, 1), m.tls_ticket_key_reload_total[ticketKeyReloadOutcomeIndex(.initial_load_success)]);
+    try std.testing.expectEqual(@as(u64, 2), m.tls_ticket_key_reload_total[ticketKeyReloadOutcomeIndex(.reload_rejected)]);
 }
 
 test "resumption and ticket counters appear in Prometheus output with closed-enum labels only (#488)" {
@@ -2011,6 +2058,7 @@ test "resumption and ticket counters appear in Prometheus output with closed-enu
     m.recordTicketIssue(.record, .stateful, .success);
     m.recordTicketStore(.success);
     m.recordTicketResolve(.hybrid, .success);
+    m.recordTicketKeyReload(.reload_accepted);
 
     const prom = try m.toPrometheus(allocator);
     defer allocator.free(prom);
@@ -2019,6 +2067,7 @@ test "resumption and ticket counters appear in Prometheus output with closed-enu
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_ticket_issue_total{transport=\"record\",mode=\"stateful\",result=\"success\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_ticket_store_total{result=\"success\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_ticket_resolve_total{mode=\"hybrid\",result=\"success\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_ticket_key_reload_total{outcome=\"reload_accepted\"} 1") != null);
 }
 
 test "#368 Slice 3: early-data replay counters default to zero and record by outcome" {
