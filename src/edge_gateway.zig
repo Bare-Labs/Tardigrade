@@ -271,6 +271,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
                 .mode = edge_config.nativeResumptionMode(cfg),
                 .ticket_lifetime_seconds = cfg.tls_native_resumption_ticket_lifetime_seconds,
                 .usage = edge_config.nativeResumptionTicketUsage(cfg),
+                .session_limits = nativeResumptionSessionLimits(cfg),
                 .stateless_ticket_key_source = if (cfg.tls_native_ticket_keys_path.len > 0) .persistent else .ephemeral,
             },
             .{ .ctx = undefined, .nowUnixMsFn = systemNowUnixMs },
@@ -1593,6 +1594,15 @@ fn nativeTcpServerEarlyDataPolicy(
     gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
 ) tls_core.tls13_backend.ServerEarlyDataPolicy {
     return if (gate != null) .{ .enabled = true } else .{};
+}
+
+fn nativeResumptionSessionLimits(cfg: *const edge_config.EdgeConfig) tls_core.session.Limits {
+    var limits = tls_core.session.Limits.default;
+    if (cfg.tls_native_ticket_keys_path.len > 0) {
+        limits.max_ticket_len = tls_core.session.absolute_ticket_wire_max;
+        limits.max_serialized_len = tls_core.session.hard_max_serialized_len;
+    }
+    return limits;
 }
 
 fn reapActiveConnections(

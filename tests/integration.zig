@@ -2700,9 +2700,11 @@ test "interop.openssl.h1.early.accepted" {
     try assertContains(first.stdout, "New, TLSv1.3");
     try assertContains(first.stdout, "HTTP/1.1 200 OK");
 
-    const fingerprint = try opensslSessionFileMaterialSample(allocator, sess_path);
-    var fingerprint_hex: [64]u8 = undefined;
-    const fingerprint_hex_slice = std.fmt.bufPrint(&fingerprint_hex, "{x}", .{fingerprint}) catch unreachable;
+    const resumption_psk_hex = try opensslSessionResumptionPskHex(allocator, sess_path);
+    defer allocator.free(resumption_psk_hex);
+    const resumption_psk_hex_lower = try allocator.dupe(u8, resumption_psk_hex);
+    defer allocator.free(resumption_psk_hex_lower);
+    _ = std.ascii.lowerString(resumption_psk_hex_lower, resumption_psk_hex_lower);
     try upstream.resetCapture();
 
     var early = try runOpenssl(allocator, &.{
@@ -2725,7 +2727,8 @@ test "interop.openssl.h1.early.accepted" {
 
     const log = try compat.cwd().readFileAlloc(allocator, tardigrade.log_path, 4 * 1024 * 1024);
     defer allocator.free(log);
-    try std.testing.expect(!containsSubstring(log, fingerprint_hex_slice));
+    try std.testing.expect(!containsSubstring(log, resumption_psk_hex));
+    try std.testing.expect(!containsSubstring(log, resumption_psk_hex_lower));
 }
 
 test "interop.openssl.h1.early.unsafe_425" {
@@ -3353,13 +3356,23 @@ fn opensslSessionTicketFingerprint(allocator: std.mem.Allocator, path: []const u
     return fingerprint;
 }
 
-fn opensslSessionFileMaterialSample(allocator: std.mem.Allocator, path: []const u8) ![32]u8 {
-    const raw = try decodeOpensslSessionFile(allocator, path);
-    defer allocator.free(raw);
-    if (raw.len < 32) return error.SessionFileTooShortToSample;
-    var sample: [32]u8 = undefined;
-    @memcpy(&sample, raw[raw.len - 32 ..]);
-    return sample;
+fn opensslSessionResumptionPskHex(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var result = try runOpenssl(allocator, &.{
+        "sess_id", "-in", path, "-text", "-noout",
+    }, null, 10_000);
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(result.outcome));
+
+    const marker = "Resumption PSK:";
+    const marker_start = std.mem.indexOf(u8, result.stdout, marker) orelse return error.ResumptionPskNotFound;
+    const value_start = marker_start + marker.len;
+    const line_end = std.mem.indexOfScalarPos(u8, result.stdout, value_start, '\n') orelse result.stdout.len;
+    const raw = std.mem.trim(u8, result.stdout[value_start..line_end], " \t\r");
+    if (raw.len < 32 or raw.len % 2 != 0) return error.ResumptionPskMalformed;
+    for (raw) |c| {
+        if (!std.ascii.isHex(c)) return error.ResumptionPskMalformed;
+    }
+    return allocator.dupe(u8, raw);
 }
 
 fn persistentTicketKeySnapshotPath(allocator: std.mem.Allocator, port: u16, tag: []const u8) ![]u8 {
@@ -3373,7 +3386,7 @@ fn writePersistentTicketKeySnapshot(allocator: std.mem.Allocator, path: []const 
     const snapshot = try std.fmt.allocPrint(
         allocator,
         "{{\"version\":1,\"generation\":1,\"keys\":[{{\"id\":\"000102030405060708090a0b0c0d0e0f\",\"aead\":\"aes_128_gcm\",\"key\":\"101112131415161718191a1b1c1d1e1f\",\"not_before_unix_ms\":{d},\"encrypt_until_unix_ms\":{d},\"decrypt_until_unix_ms\":{d},\"nonce_lease\":{{\"prefix\":\"51800000\",\"start\":0,\"end_exclusive\":4096}}}}]}}",
-        .{ now - 60_000, now + 60 * 60 * 1000, now + 2 * 60 * 60 * 1000 },
+        .{ now - 60_000, now + 25 * 60 * 60 * 1000, now + 26 * 60 * 60 * 1000 },
     );
     defer {
         std.crypto.secureZero(u8, snapshot);
@@ -3806,6 +3819,7 @@ test "restart.persistent.early_startup_quarantine" {
         allocator: std.mem.Allocator,
         runtime: *tls_core.resumption_runtime.Runtime,
         retained: tls_core.session.ClientTicketState = .{},
+        count: usize = 0,
 
         fn now(_: *anyopaque) i64 {
             return 2_000;
@@ -3817,6 +3831,7 @@ test "restart.persistent.early_startup_quarantine" {
             self.retained = .{};
             ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
             _ = self.runtime.storeClientTicket(ticket);
+            self.count += 1;
         }
     };
 
@@ -3835,7 +3850,7 @@ test "restart.persistent.early_startup_quarantine" {
     const first_raw = try first_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
     defer allocator.free(first_raw);
     try assertContains(first_raw, "HTTP/1.1 200 OK");
-    if (capture.retained.common.early_data == .resume_only) return error.SkipZigTest;
+    try std.testing.expect(capture.count > 0);
     try std.testing.expectEqual(tls_core.session.EarlyDataPolicy{ .early_data_capable = 16 * 1024 }, capture.retained.common.early_data);
 
     var ordinary_ticket: tls_core.session.ClientTicketState = .{};
