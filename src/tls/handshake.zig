@@ -79,6 +79,7 @@ pub const Core = struct {
     client_auth_inbound: ClientAuthInbound = .inactive,
     /// Client outbound sub-state for its own certificate flight.
     client_auth_outbound: ClientAuthOutbound = .inactive,
+    end_of_early_data_seen: bool = false,
     /// Set once a PSK-resumed handshake (#362) has been selected: the
     /// server flight after EncryptedExtensions goes straight to Finished
     /// (no CertificateRequest, Certificate, or CertificateVerify), and the
@@ -177,6 +178,13 @@ pub const Core = struct {
             try self.checkClientAuthInbound(message.kind);
             self.transcript.update(message.raw);
             self.advanceClientAuthInbound(message.kind);
+            return message;
+        }
+        if (message.kind == .end_of_early_data) {
+            if (self.role != .server or self.handshake_state != .finished or self.expected_inbound != null or self.end_of_early_data_seen)
+                return error.UnexpectedHandshakeMessage;
+            self.transcript.update(message.raw);
+            self.end_of_early_data_seen = true;
             return message;
         }
         if (!self.isExpectedClientFinished(message.kind)) {
@@ -300,6 +308,7 @@ pub const Core = struct {
             .client => switch (self.client_auth_outbound) {
                 // No client auth: the original client sequence.
                 .inactive => (self.handshake_state == .idle and kind == .client_hello) or
+                    (self.handshake_state == .finished and self.expected_inbound == null and kind == .end_of_early_data and !self.end_of_early_data_seen) or
                     (self.handshake_state == .finished and self.expected_inbound == null and kind == .finished),
                 // Client certificate flight (#334): Certificate, then either
                 // CertificateVerify (non-empty cert) or straight to Finished
@@ -361,6 +370,7 @@ pub const Core = struct {
                         self.handshake_state = .client_hello;
                         self.expected_inbound = .server_hello;
                     },
+                    .end_of_early_data => self.end_of_early_data_seen = true,
                     .finished => self.handshake_lifecycle = .complete,
                     else => {},
                 },

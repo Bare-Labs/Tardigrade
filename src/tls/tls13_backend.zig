@@ -338,6 +338,7 @@ pub const EarlyDataDecision = enum {
 /// not decided here.
 pub const ServerEarlyDataPolicy = struct {
     enabled: bool = false,
+    max_early_data_size: u32 = 16 * 1024,
     age_skew_tolerance_ms: u64 = 60_000,
 };
 
@@ -360,6 +361,11 @@ pub const EarlyDataReplayDecision = enum { allow, replay, unavailable };
 pub const EarlyDataReplayCandidate = struct {
     ticket_identity_fingerprint: [32]u8 = [_]u8{0} ** 32,
     obfuscated_ticket_age: u32 = 0,
+    /// True only when the resolver proved this ticket came from the current
+    /// process's stateful cache. Stateless tickets authenticated by
+    /// persistent keys must not use wall-clock ordering to bypass startup
+    /// quarantine after restart.
+    current_process_stateful: bool = false,
     /// #368 Slice 2: the authoritative anti-replay retention deadline for
     /// this candidate, derived by `computeReplayRetainUntilUnixMs` from the
     /// already-validated ticket issuance time, apparent ticket age, and
@@ -711,6 +717,11 @@ pub const Tls13Backend = struct {
     /// EncryptedExtensions. Server: ticket allowance for an accepted attempt.
     /// Cleared to zero when no early-data attempt is live/accepted.
     early_data_max_bytes: u32 = 0,
+    /// Server: bounded ciphertext skip allowance for a ClientHello that
+    /// attempted early data but was not accepted. Kept separate from
+    /// `early_data_max_bytes`, which is intentionally zero for rejected
+    /// attempts so callers never treat rejected bytes as accepted plaintext.
+    early_data_discard_limit: u32 = 0,
 
     const Slice = struct { start: usize, len: usize };
     const PendingStage = enum { server_select, server_sign, client_select, client_sign, peer_verify };
@@ -1075,6 +1086,13 @@ pub const Tls13Backend = struct {
         return self.early_data_max_bytes;
     }
 
+    /// Server-side ciphertext skip allowance for rejected early data. This is
+    /// deliberately available even when `earlyDataMaxBytes()` is zero so a
+    /// record carrier can bound RFC 8446 early-data rejection fallback.
+    pub fn earlyDataDiscardLimit(self: *const Tls13Backend) u32 {
+        return self.early_data_discard_limit;
+    }
+
     /// Client (#367): the remembered application-level compatibility state
     /// carried by the same first surviving ticket that produced
     /// `earlyDataAttempted()` / `earlyDataMaxBytes()`. HTTP/3 uses this
@@ -1230,7 +1248,25 @@ pub const Tls13Backend = struct {
             .authPendingFn = authPendingImpl,
             .resumeFn = resumeImpl,
             .setPostHandshakeAllocatorFn = setPostHandshakeAllocatorImpl,
+            .earlyDataAttemptedFn = earlyDataAttemptedImpl,
+            .earlyDataMaxBytesFn = earlyDataMaxBytesImpl,
+            .earlyDataDiscardLimitFn = earlyDataDiscardLimitImpl,
         };
+    }
+
+    fn earlyDataAttemptedImpl(ptr: *anyopaque) bool {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.earlyDataAttempted();
+    }
+
+    fn earlyDataMaxBytesImpl(ptr: *anyopaque) u32 {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.earlyDataMaxBytes();
+    }
+
+    fn earlyDataDiscardLimitImpl(ptr: *anyopaque) u32 {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.earlyDataDiscardLimit();
     }
 
     fn authPendingImpl(ptr: *anyopaque) bool {
@@ -1347,6 +1383,7 @@ pub const Tls13Backend = struct {
         self.early_data_accepted = false;
         self.early_data_decision = .not_attempted;
         self.early_data_max_bytes = 0;
+        self.early_data_discard_limit = 0;
         self.selected_client_psk.deinit();
         self.selected_client_psk_present = false;
         self.selected_server_psk.deinit();
@@ -1457,6 +1494,7 @@ pub const Tls13Backend = struct {
         self.early_data_accepted = false;
         self.early_data_decision = .not_attempted;
         self.early_data_max_bytes = 0;
+        self.early_data_discard_limit = 0;
         self.clearClientHelloPsk();
         if (self.schedule) |*schedule| schedule.wipe();
         self.schedule = null;
@@ -1585,7 +1623,9 @@ pub const Tls13Backend = struct {
         // handshake has completed.
         errdefer self.clearFailedHandshakeState();
         switch (level) {
-            .zero_rtt => return error.UnexpectedTransportEpoch,
+            .zero_rtt => {
+                if (self.role != .server) return error.UnexpectedTransportEpoch;
+            },
             .application => {
                 if (self.core.handshake_lifecycle != .complete) return error.UnexpectedTransportEpoch;
                 if (self.pending_op != null) return;
@@ -1603,7 +1643,8 @@ pub const Tls13Backend = struct {
         const input = switch (level) {
             .initial => &self.initial_input,
             .handshake => &self.handshake_input,
-            .zero_rtt, .application => unreachable,
+            .zero_rtt => &self.handshake_input,
+            .application => unreachable,
         };
         input.append(bytes) catch |err| return mapCoreError(err);
         // Never begin dispatching while an authentication operation is parked:
@@ -1663,6 +1704,7 @@ pub const Tls13Backend = struct {
     fn expectedLevel(kind: MessageType) HandshakeError!EncryptionLevel {
         return switch (kind) {
             .client_hello, .server_hello => .initial,
+            .end_of_early_data => .zero_rtt,
             .encrypted_extensions,
             .certificate_request,
             .certificate,
@@ -1769,6 +1811,7 @@ pub const Tls13Backend = struct {
             .certificate_request => try self.onCertificateRequest(body),
             .certificate => try self.onCertificate(body),
             .certificate_verify => try self.onCertificateVerify(transcript_before, body, sink),
+            .end_of_early_data => try self.onEndOfEarlyData(body, sink),
             .finished => switch (self.role) {
                 .client => try self.onServerFinished(transcript_before, body, sink),
                 .server => try self.onClientFinished(transcript_before, body, sink),
@@ -2721,17 +2764,36 @@ pub const Tls13Backend = struct {
     /// transcript through the server Finished.
     fn sendClientFinished(self: *Tls13Backend, transcript_hash: [hash_len]u8, sink: *EventSink) HandshakeError!void {
         const schedule = &self.schedule.?;
+        var finished_transcript_hash = transcript_hash;
+        if (self.profile == .record and self.early_data_accepted) {
+            var ebuf: [handshake_header_len]u8 = undefined;
+            var ew = Writer{ .buf = &ebuf };
+            try ew.u8_(@intFromEnum(MessageType.end_of_early_data));
+            const eom_len = try ew.reserve(3);
+            ew.patch(3, eom_len);
+            const eom = ebuf[0..ew.len];
+            self.core.recordSent(eom) catch |err| return mapCoreError(err);
+            try sink.emitCrypto(.zero_rtt, eom);
+            try self.emitDiscardKeys(sink, .zero_rtt);
+            finished_transcript_hash = self.core.transcriptHash();
+        }
         var buf: [4 + hash_len]u8 = undefined;
         var w = Writer{ .buf = &buf };
         try w.u8_(@intFromEnum(MessageType.finished));
         const message_len = try w.reserve(3);
-        var client_verify = KeySchedule.verifyData(&schedule.client_handshake_traffic, transcript_hash);
+        var client_verify = KeySchedule.verifyData(&schedule.client_handshake_traffic, finished_transcript_hash);
         defer crypto.secureZero(u8, &client_verify);
         try w.bytes(&client_verify);
         w.patch(3, message_len);
         const message = buf[0..w.len];
         self.core.recordSent(message) catch |err| return mapCoreError(err);
         try sink.emitCrypto(.handshake, message);
+    }
+
+    fn onEndOfEarlyData(self: *Tls13Backend, body: []const u8, sink: *EventSink) HandshakeError!void {
+        if (self.role != .server or self.profile != .record or !self.early_data_accepted or body.len != 0)
+            return error.UnexpectedHandshakeMessage;
+        try self.emitDiscardKeys(sink, .zero_rtt);
     }
 
     /// Terminal steps shared by every client completion path: discard the
@@ -3279,15 +3341,24 @@ pub const Tls13Backend = struct {
                 .replay_candidate = .{
                     .ticket_identity_fingerprint = identity_fingerprint,
                     .obfuscated_ticket_age = pair.identity.obfuscated_ticket_age,
+                    .current_process_stateful = hit.current_process_stateful,
                 },
                 .replay_retain_until_unix_ms = replay_retain_until_unix_ms,
             });
             self.early_data_decision = early_decision;
             self.early_data_accepted = early_decision == .accepted;
+            const selected_early_data_max: u32 = switch (decision.early_data) {
+                .allowed => |max| max,
+                .disabled, .incompatible => 0,
+            };
             self.early_data_max_bytes = if (early_decision == .accepted) switch (decision.early_data) {
                 .allowed => |max| max,
                 .disabled, .incompatible => 0,
             } else 0;
+            self.early_data_discard_limit = if (self.client_hello_early_data_seen and early_decision != .accepted)
+                selected_early_data_max
+            else
+                0;
             if (early_decision == .accepted) {
                 var client_hello_hash: [hash_len]u8 = undefined;
                 Sha256.hash(capture.message[0..capture.message_len], &client_hello_hash, .{});
@@ -3824,6 +3895,8 @@ pub const Tls13Backend = struct {
 
     fn onClientFinished(self: *Tls13Backend, transcript_before: [hash_len]u8, body: []const u8, sink: *EventSink) HandshakeError!void {
         const schedule = &self.schedule.?;
+        if (self.profile == .record and self.early_data_accepted and !self.core.end_of_early_data_seen)
+            return error.UnexpectedHandshakeMessage;
         if (body.len != hash_len) return error.MalformedHandshake;
         // Recompute over the transcript that actually precedes this Finished:
         // with handshake-time client authentication it includes the client's

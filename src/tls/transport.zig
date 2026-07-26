@@ -282,6 +282,9 @@ pub fn ContractWithOptions(
             authPendingFn: ?*const fn (ptr: *anyopaque) bool = null,
             resumeFn: ?*const fn (ptr: *anyopaque, sink: *EventSink) ErrorSet!void = null,
             setPostHandshakeAllocatorFn: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) ErrorSet!void = null,
+            earlyDataAttemptedFn: ?*const fn (ptr: *anyopaque) bool = null,
+            earlyDataMaxBytesFn: ?*const fn (ptr: *anyopaque) u32 = null,
+            earlyDataDiscardLimitFn: ?*const fn (ptr: *anyopaque) u32 = null,
 
             pub fn start(self: Backend, role: state.Role, params: TransportParameters, sink: *EventSink) ErrorSet!void {
                 return self.startFn(self.ptr, role, params, sink);
@@ -306,6 +309,21 @@ pub fn ContractWithOptions(
 
             pub fn setPostHandshakeAllocator(self: Backend, allocator: std.mem.Allocator) ErrorSet!void {
                 if (self.setPostHandshakeAllocatorFn) |f| return f(self.ptr, allocator);
+            }
+
+            pub fn earlyDataAttempted(self: Backend) bool {
+                if (self.earlyDataAttemptedFn) |f| return f(self.ptr);
+                return false;
+            }
+
+            pub fn earlyDataMaxBytes(self: Backend) u32 {
+                if (self.earlyDataMaxBytesFn) |f| return f(self.ptr);
+                return 0;
+            }
+
+            pub fn earlyDataDiscardLimit(self: Backend) u32 {
+                if (self.earlyDataDiscardLimitFn) |f| return f(self.ptr);
+                return 0;
             }
 
             pub fn deinit(self: Backend) void {

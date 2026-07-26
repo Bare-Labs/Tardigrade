@@ -147,42 +147,25 @@ fixed in the current state of this slice, described below.
     in the retry logic fails the test with a useful assertion instead of
     hanging the test binary.
 
-### Confirmed production gap: native TCP/H1 is not yet production-enabled end to end for real 0-RTT dispatch
+### Native TCP/H1 production 0-RTT coverage (#510)
 
-While addressing review feedback, inspection of `edge_gateway.zig`'s
-request-context setup found one visible gap in this existing comment and
-hardcoded value:
+PR #513 adds the native TCP production path that was previously documented
+as absent here: production ticket issuance advertises `max_early_data_size`
+only when the composed server early-data policy is enabled, the record layer
+installs and retires `.zero_rtt` keys, accepted plaintext carries sticky
+byte-accurate provenance into H1 request context creation, and unsafe early
+requests reach the real H1 safety gate before route/upstream side effects.
 
-```zig
-// #367 slice 2 keeps this as request-scoped handoff state. The production
-// #366 H1 record provenance carrier is not present on this branch yet, so
-// H1 transport provenance stays false rather than using connection state.
-ctx.early_data.transport_early = false;
-```
-
-That final H1 handoff is not the only missing production wiring. Native TCP
-also does not yet advertise early-capable tickets from production
-`NativeTlsConnection.issueSessionTicket()` because its
-`prepareNewSessionTicket(...)` call does not pass `max_early_data_size`, and
-`NativeTlsConnection.createWithOptions()` does not install an enabled
-`Tls13Backend.ServerEarlyDataPolicy` (whose default is disabled). Together,
-those gaps mean a production native TCP client cannot currently receive a
-server-issued early-capable ticket, have the server accept a real
-`early_data` attempt, and then carry that record-read provenance into H1
-dispatch.
-
-Wiring those prerequisites and the final `ctx.early_data.transport_early`
-handoff is tracked by #510 as a `#366`/`#367` follow-up, not this slice's
-scope. This means no test here or otherwise can currently prove "a
-production-issued native TCP ticket leads to accepted real 0-RTT records
-whose provenance gates H1 dispatch," because that composition does not
-exist in production yet to prove. This slice's tests are scoped accordingly:
-the TLS/replay-store decision is proven with real production code, and the
-*given an early context, does dispatch correctly gate on it* question is
-proven with a directly-constructed `EarlyDataContext` (the shape the real
-wiring would eventually produce), not by claiming to exercise the
-currently nonexistent production-issued-ticket → server-policy →
-record-provenance → H1-safety-gate chain.
+`tests/integration.zig` now includes
+`#510 native tcp production 0-rtt reaches h1 safety gate and replay fallback`.
+That test starts a real Tardigrade process with native TLS, native
+resumption, and process-local replay protection enabled; obtains an
+early-capable ticket from `NativeTlsConnection.issueSessionTicket()`; sends
+real resumed TLS 0-RTT H1 bytes; asserts a safe early request executes
+exactly once; asserts an unsafe early request receives `425 Too Early`
+without upstream execution; then replays the same ticket and proves rejected
+early bytes do not dispatch while a subsequent ordinary 1-RTT request on
+the resumed connection still succeeds.
 
 ### Known gap: no deterministic worker-thread-routing test seam
 
@@ -206,22 +189,14 @@ open after it. Two premises the original plan for a final slice assumed
 turned out to be false once actually checked against current `main`,
 before any test code was written:
 
-1. **#510's remaining scope is not "wire three call sites."** Its issue
-   text was written on the assumption that `NativeTlsConnection`'s
+1. **#510's remaining scope was larger than "wire three call sites."** Its
+   issue text was written on the assumption that `NativeTlsConnection`'s
    record-read early-data provenance accessor already worked and just
-   needed plumbing into H1. Inspection found
-   `PureZigRecordStream.currentReadTransportEarly()` is a stub that always
-   returns `false`, `record_epoch_bridge.Bridge` rejects the `.zero_rtt`
-   epoch everywhere (`error.UnsupportedRecordEpoch`), and
-   `feedHandshakeToDriver` hard-fails any pre-handshake `application_data`
-   record — meaning real 0-RTT decryption does not exist at all for the
-   record (TCP) transport, not merely "isn't wired to HTTP yet". Native
-   QUIC 0-RTT is also unconditionally rejected in code, independent of
-   configuration. So 0-RTT does not exist end-to-end on **any** transport
-   today, and no amount of wiring closes that — it needs new record-layer
-   capability comparable in size to the #366–#368 QUIC slices. #510's
-   issue text has been corrected with this finding; it remains open as its
-   own, larger effort, and is not attempted in this PR.
+   needed plumbing into H1. Inspection found the record layer also needed
+   real `.zero_rtt` key installation, decryption, `EndOfEarlyData`
+   handling, byte-accurate provenance, and bounded discard behavior. PR
+   #513 implements and tests that native TCP/H1 production path; native
+   QUIC 0-RTT remains outside this TCP/H1 issue.
 2. **#338/#358 (the external OpenSSL interop harness this slice was told
    to reuse) do not exist yet either.** Both issues are open; the repo has
    `tests/crypto_openssl_diff.zig`/`pki_openssl_diff.zig` (differential

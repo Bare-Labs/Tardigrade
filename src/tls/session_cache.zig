@@ -1590,6 +1590,7 @@ pub fn resolveStatefulServerPsk(
                         .arg2 = hit.lease.lease_epoch,
                         .completeFn = completeReusableServerPsk,
                     },
+                    .current_process_stateful = true,
                 } };
             }
 
@@ -1610,6 +1611,7 @@ pub fn resolveStatefulServerPsk(
                     PublicServerLeaseBox.release,
                     PublicServerLeaseBox.deinit,
                 ),
+                .current_process_stateful = true,
             } };
         },
         .miss, .expired, .busy => return .miss,

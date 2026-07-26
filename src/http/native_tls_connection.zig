@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("zig_compat");
 const tls = @import("tls_core");
 const encrypted_stream_connection = @import("encrypted_stream_connection.zig");
 const event_loop = @import("event_loop.zig");
@@ -46,6 +47,25 @@ pub const NativeCredentialStore = struct {
         default_key_path: []const u8,
         sni_certs: []const SniCertSpec,
     ) !void {
+        var prepared = try self.prepareReloadFromFiles(default_cert_path, default_key_path, sni_certs);
+        try self.commitPreparedReload(&prepared);
+    }
+
+    pub const PreparedReload = struct {
+        snapshot: ?*sni_provider.Snapshot,
+
+        pub fn deinit(self: *PreparedReload) void {
+            if (self.snapshot) |snapshot| snapshot.release();
+            self.* = undefined;
+        }
+    };
+
+    pub fn prepareReloadFromFiles(
+        self: *NativeCredentialStore,
+        default_cert_path: []const u8,
+        default_key_path: []const u8,
+        sni_certs: []const SniCertSpec,
+    ) !PreparedReload {
         var loaded = try self.allocator.alloc(LoadedBundle, 1 + sni_certs.len);
         defer self.allocator.free(loaded);
         var loaded_len: usize = 0;
@@ -67,10 +87,17 @@ pub const NativeCredentialStore = struct {
         }
         for (loaded[0..loaded_len], 0..) |*bundle, i| configs[i] = bundle.config();
 
-        try self.provider_state.reload(configs, .{
+        const snapshot = try self.provider_state.buildSnapshot(configs, .{
             .absent_sni_policy = .use_default,
             .unknown_sni_policy = .fail_handshake,
         });
+        return .{ .snapshot = snapshot };
+    }
+
+    pub fn commitPreparedReload(self: *NativeCredentialStore, prepared: *PreparedReload) !void {
+        const snapshot = prepared.snapshot orelse return;
+        prepared.snapshot = null;
+        try self.provider_state.install(snapshot);
     }
 };
 
@@ -151,6 +178,10 @@ pub const NativeTlsConnection = struct {
         /// own default gate in place, which fails closed (`.unavailable`)
         /// for any 0-RTT attempt.
         early_data_replay_gate: ?tls_backend.EarlyDataReplayGate = null,
+        /// Enables native TCP 0-RTT only when the production composition has
+        /// also installed replay protection. Default disabled keeps tickets
+        /// resume-only and causes attempted early data to be rejected.
+        server_early_data_policy: tls_backend.ServerEarlyDataPolicy = .{},
     };
 
     allocator: std.mem.Allocator,
@@ -220,6 +251,9 @@ pub const NativeTlsConnection = struct {
         // worker and QUIC/H3, not a per-connection concern.
         if (options.early_data_replay_gate) |gate| {
             backend.setEarlyDataReplayGate(gate) catch unreachable;
+            if (options.resumption_runtime != null and options.server_early_data_policy.enabled) {
+                backend.setServerEarlyDataPolicy(options.server_early_data_policy) catch unreachable;
+            }
         }
 
         const record = try allocator.create(encrypted_stream.PureZigRecordStream);
@@ -270,12 +304,17 @@ pub const NativeTlsConnection = struct {
             self.fd,
             self,
             nativeReadTransportEarly,
+            nativeReadEarlyPrefixLen,
             nativeHandshakeComplete,
         );
     }
 
     pub fn readTransportEarly(self: *const NativeTlsConnection) bool {
         return self.record.currentReadTransportEarly();
+    }
+
+    pub fn readEarlyPrefixLen(self: *const NativeTlsConnection) usize {
+        return self.record.currentReadEarlyPrefixLen();
     }
 
     pub fn downstreamHandshakeComplete(self: *const NativeTlsConnection) bool {
@@ -337,6 +376,7 @@ pub const NativeTlsConnection = struct {
             .ticket_age_add = ticket_age_add,
             .ticket_nonce = &ticket_nonce,
             .issued_at_unix_ms = now_unix_ms,
+            .max_early_data_size = if (self.backend.server_early_data_policy.enabled) self.backend.server_early_data_policy.max_early_data_size else null,
         }, limits);
         defer prepared.deinit();
 
@@ -388,6 +428,11 @@ pub const NativeTlsConnection = struct {
     fn nativeReadTransportEarly(ptr: *anyopaque) bool {
         const self: *NativeTlsConnection = @ptrCast(@alignCast(ptr));
         return self.readTransportEarly();
+    }
+
+    fn nativeReadEarlyPrefixLen(ptr: *anyopaque) usize {
+        const self: *NativeTlsConnection = @ptrCast(@alignCast(ptr));
+        return self.readEarlyPrefixLen();
     }
 
     fn nativeHandshakeComplete(ptr: *anyopaque) bool {
@@ -526,6 +571,47 @@ test "native readiness maps directly to event-loop interest" {
     );
 }
 
+test "prepared native credential reload does not publish same-path cert changes before commit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/server.crt", .{tmp_abs});
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/server.key", .{tmp_abs});
+    defer allocator.free(key_path);
+
+    const cert_a = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.crt", 256 * 1024);
+    defer allocator.free(cert_a);
+    const key_a = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.key", 256 * 1024);
+    defer allocator.free(key_a);
+    const cert_b = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.crt", 256 * 1024);
+    defer allocator.free(cert_b);
+    const key_b = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.key", 256 * 1024);
+    defer allocator.free(key_b);
+    const chain_a = try tls.identity_loader.certChainFromPemOrDer(allocator, cert_a);
+    defer freeTestCertChain(allocator, chain_a);
+    const chain_b = try tls.identity_loader.certChainFromPemOrDer(allocator, cert_b);
+    defer freeTestCertChain(allocator, chain_b);
+
+    try compat.cwd().writeFile(.{ .sub_path = cert_path, .data = cert_a });
+    try compat.cwd().writeFile(.{ .sub_path = key_path, .data = key_a });
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    try store.reloadFromFiles(cert_path, key_path, &.{});
+    try expectSelectedLeaf(store.provider(), chain_a[0]);
+
+    try compat.cwd().writeFile(.{ .sub_path = cert_path, .data = cert_b });
+    try compat.cwd().writeFile(.{ .sub_path = key_path, .data = key_b });
+    var prepared = try store.prepareReloadFromFiles(cert_path, key_path, &.{});
+    defer prepared.deinit();
+
+    try expectSelectedLeaf(store.provider(), chain_a[0]);
+    try store.commitPreparedReload(&prepared);
+    try expectSelectedLeaf(store.provider(), chain_b[0]);
+}
+
 test "native TLS owner heap-stabilizes backend record and owns fd close" {
     var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
     defer fixed.deinit();
@@ -573,6 +659,32 @@ fn fixedNowUnixMs(_: *anyopaque) i64 {
     return 1000;
 }
 
+fn expectSelectedLeaf(provider: credentials.CredentialProvider, expected_leaf: []const u8) !void {
+    const selection = credentials.SelectionContext{
+        .role = .server,
+        .server_name = null,
+        .peer_signature_schemes = &.{ 0x0807, 0x0403 },
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    };
+    const progress = try provider.selectCredential(&selection);
+    const credential = switch (progress) {
+        .complete => |credential| credential,
+        .pending => return error.TestUnexpectedPending,
+    };
+    defer credential.release();
+    const chain = credential.certificateChain();
+    try std.testing.expectEqual(@as(usize, 1), chain.count());
+    try std.testing.expectEqualSlices(u8, expected_leaf, chain.leaf().?);
+}
+
+fn freeTestCertChain(allocator: std.mem.Allocator, chain: [][]u8) void {
+    for (chain) |entry| allocator.free(entry);
+    allocator.free(chain);
+}
+
 fn testResumptionRuntime(allocator: std.mem.Allocator) !tls.resumption_runtime.Runtime {
     var entropy = production_crypto.OsEntropy{};
     var provider_state = production_crypto.Provider.init(entropy.entropy());
@@ -610,6 +722,32 @@ const TicketIssueProbe = struct {
         self.result = result;
     }
 };
+
+fn armNativeTicketIssuer(conn: *NativeTlsConnection) !void {
+    const hs_read = [_]u8{0x21} ** 32;
+    const hs_write = [_]u8{0x22} ** 32;
+    const app_read = [_]u8{0x23} ** 32;
+    const app_write = [_]u8{0x24} ** 32;
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &hs_read } });
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &hs_write } });
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &app_read } });
+    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &app_write } });
+    try conn.record.applyEvent(.{ .discard_epoch = .initial });
+    try conn.record.applyEvent(.{ .discard_epoch = .handshake });
+    try conn.record.applyEvent(.handshake_complete);
+    conn.backend.core.handshake_lifecycle = .complete;
+    try conn.backend.resumption_master_secret.replace(&([_]u8{0x42} ** tls.tls13_backend.hash_len));
+}
+
+fn expectOnlyStatefulTicketEarlyData(runtime: *tls.resumption_runtime.Runtime, expected: tls.session.EarlyDataPolicy) !void {
+    const cache = &runtime.server_cache.?;
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.count());
+    var it = cache.entries.valueIterator();
+    const entry = it.next().?.*;
+    try std.testing.expectEqual(expected, entry.state.common.early_data);
+}
 
 const CacheEventProbe = struct {
     stored: usize = 0,
@@ -670,6 +808,122 @@ test "native TLS createWithOptions installs the shared early-data replay gate in
 
     try std.testing.expectEqual(gate.ctx, conn.backend.early_data_replay_gate.ctx);
     try std.testing.expectEqual(gate.decideFn, conn.backend.early_data_replay_gate.decideFn);
+}
+
+test "native TLS server early data policy is disabled unless resumption and replay gate are both configured" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+
+    var runtime = try testResumptionRuntime(std.testing.allocator);
+    defer runtime.deinit();
+
+    var store = try tls.early_data_replay.LocalStore.init(std.testing.allocator, .{}, 0, 0);
+    defer store.deinit();
+    var adapter = tls.early_data_replay.GateAdapter.init(store.store());
+    const gate = adapter.gate();
+
+    {
+        const fds = try testSocketPair();
+        defer closeFd(fds[1]);
+        const conn = try NativeTlsConnection.createWithOptions(
+            std.testing.allocator,
+            fds[0],
+            .{ .http1_enabled = true, .http2_enabled = true },
+            fixed.provider(),
+            .{
+                .resumption_runtime = &runtime,
+                .server_early_data_policy = .{ .enabled = true, .max_early_data_size = 4096 },
+            },
+        );
+        defer conn.destroy();
+        try std.testing.expect(!conn.backend.server_early_data_policy.enabled);
+    }
+
+    {
+        const fds = try testSocketPair();
+        defer closeFd(fds[1]);
+        const conn = try NativeTlsConnection.createWithOptions(
+            std.testing.allocator,
+            fds[0],
+            .{ .http1_enabled = true, .http2_enabled = true },
+            fixed.provider(),
+            .{
+                .early_data_replay_gate = gate,
+                .server_early_data_policy = .{ .enabled = true, .max_early_data_size = 4096 },
+            },
+        );
+        defer conn.destroy();
+        try std.testing.expect(!conn.backend.server_early_data_policy.enabled);
+    }
+
+    {
+        const fds = try testSocketPair();
+        defer closeFd(fds[1]);
+        const conn = try NativeTlsConnection.createWithOptions(
+            std.testing.allocator,
+            fds[0],
+            .{ .http1_enabled = true, .http2_enabled = true },
+            fixed.provider(),
+            .{
+                .resumption_runtime = &runtime,
+                .early_data_replay_gate = gate,
+                .server_early_data_policy = .{ .enabled = true, .max_early_data_size = 4096 },
+            },
+        );
+        defer conn.destroy();
+        try std.testing.expect(conn.backend.server_early_data_policy.enabled);
+        try std.testing.expectEqual(@as(u32, 4096), conn.backend.server_early_data_policy.max_early_data_size);
+    }
+}
+
+test "native TLS production ticket issuance advertises early data only when policy is enabled" {
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    defer fixed.deinit();
+
+    {
+        const fds = try testSocketPair();
+        defer closeFd(fds[1]);
+        var runtime = try testResumptionRuntime(std.testing.allocator);
+        defer runtime.deinit();
+        const conn = try NativeTlsConnection.createWithOptions(
+            std.testing.allocator,
+            fds[0],
+            .{ .http1_enabled = true, .http2_enabled = true },
+            fixed.provider(),
+            .{ .resumption_runtime = &runtime },
+        );
+        defer conn.destroy();
+        try armNativeTicketIssuer(conn);
+        conn.maybeIssueSessionTicket();
+        try std.testing.expect(conn.ticket_issue_attempted);
+        try expectOnlyStatefulTicketEarlyData(&runtime, .resume_only);
+    }
+
+    {
+        const fds = try testSocketPair();
+        defer closeFd(fds[1]);
+        var runtime = try testResumptionRuntime(std.testing.allocator);
+        defer runtime.deinit();
+        var store = try tls.early_data_replay.LocalStore.init(std.testing.allocator, .{}, 0, 0);
+        defer store.deinit();
+        var adapter = tls.early_data_replay.GateAdapter.init(store.store());
+        const conn = try NativeTlsConnection.createWithOptions(
+            std.testing.allocator,
+            fds[0],
+            .{ .http1_enabled = true, .http2_enabled = true },
+            fixed.provider(),
+            .{
+                .resumption_runtime = &runtime,
+                .early_data_replay_gate = adapter.gate(),
+                .server_early_data_policy = .{ .enabled = true, .max_early_data_size = 8192 },
+            },
+        );
+        defer conn.destroy();
+        try armNativeTicketIssuer(conn);
+        conn.maybeIssueSessionTicket();
+        try std.testing.expect(conn.ticket_issue_attempted);
+        try expectOnlyStatefulTicketEarlyData(&runtime, .{ .early_data_capable = 8192 });
+    }
 }
 
 test "native TLS without a resumption runtime never attempts ticket issuance" {
@@ -748,19 +1002,7 @@ test "native TLS post-handshake queue pressure rolls back inserted stateful hand
     );
     defer conn.destroy();
 
-    const hs_read = [_]u8{0x21} ** 32;
-    const hs_write = [_]u8{0x22} ** 32;
-    const app_read = [_]u8{0x23} ** 32;
-    const app_write = [_]u8{0x24} ** 32;
-    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .read, .data = &hs_read } });
-    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .handshake, .direction = .write, .data = &hs_write } });
-    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .read, .data = &app_read } });
-    try conn.record.applyEvent(.{ .traffic_secret = .{ .epoch = .application, .direction = .write, .data = &app_write } });
-    try conn.record.applyEvent(.{ .discard_epoch = .initial });
-    try conn.record.applyEvent(.{ .discard_epoch = .handshake });
-    try conn.record.applyEvent(.handshake_complete);
-    conn.backend.core.handshake_lifecycle = .complete;
-    try conn.backend.resumption_master_secret.replace(&([_]u8{0x42} ** tls.tls13_backend.hash_len));
+    try armNativeTicketIssuer(conn);
 
     try std.testing.expectEqual(@as(usize, 0), runtime.server_cache.?.count());
     conn.record.outbound_ciphertext.len = encrypted_stream.PureZigRecordStream.max_ciphertext_queue - 1;
