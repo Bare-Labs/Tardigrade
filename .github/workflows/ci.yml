@@ -499,6 +499,57 @@ jobs:
       - name: Dependency review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
 
+  # External H3 resumption / 0-RTT interop
+  # #522 assurance gate: build pinned ngtcp2/nghttp3 GnuTLS examples, point the
+  # live-process integration suite at that canonical external peer, and run the
+  # general-profile H3 resumption/0-RTT cases on every PR.
+  h3-resumption-interop:
+    name: H3 resumption/0-RTT interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            g++-14 \
+            gcc-14 \
+            libev-dev \
+            libgnutls28-dev \
+            libssl-dev \
+            make \
+            pkg-config
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-h3-resumption-interop-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-h3-resumption-interop-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-h3-resumption-interop-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build pinned ngtcp2 GnuTLS peer
+        id: build-ngtcp2
+        run: ./scripts/interop/build-ngtcp2-ci.sh
+
+      - name: Run H3 resumption/0-RTT interop suite
+        env:
+          NGTCP2_GTLSCLIENT_PATH: ${{ steps.build-ngtcp2.outputs.gtlsclient_path }}
+        run: zig build test-integration-resumption-interop -Dtls-profile=general --summary all --error-style verbose
+
   # ── Integration tests ─────────────────────────────────────────────────────────
   # Runs on push to main only (not PRs). Failures block the workflow.
   integration-test:

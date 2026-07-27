@@ -45,6 +45,12 @@ NGTCP2_GTLSCLIENT_PATH=/path/to/ngtcp2/build/examples/gtlsclient \
   zig build test-integration-resumption-interop
 ```
 
+CI uses `scripts/interop/build-ngtcp2-ci.sh` to build pinned ngtcp2/nghttp3
+GnuTLS examples and exports `NGTCP2_GTLSCLIENT_PATH` before running the same
+target with `-Dtls-profile=general`. The pins default to nghttp3 `v1.18.0`
+and ngtcp2 `v1.25.0`; override `NGHTTP3_REF`/`NGTCP2_REF` only when
+deliberately advancing the interop peer.
+
 Unlike the wire-interop matrix above, these cases require the **`.general`**
 TLS build profile (the default `zig build`, no `-Dtls-profile` flag): the
 appliance profile (`-Dtls-profile=appliance`) explicitly rejects
@@ -61,11 +67,18 @@ constructed under that profile in `edge_gateway.zig`. Cases:
   early-data policy, with a real upstream execution observed exactly once.
 - `h3interop.quic.early.unsafe_425` — a POST offered as early data is
   425'd by the same shared HTTP-level policy H1/H2 use, before any upstream
-  side effect.
+  side effect. The test also follows with an ordinary post-handshake H3
+  request proving the same route still executes normally. `gtlsclient`
+  cannot express mixed "early POST, then ordinary GET" streams on one
+  connection because method/body are invocation-wide and `--delay-stream`
+  applies to every stream; the production H3 runtime's same-connection
+  post-425 behavior is covered by the deterministic `http3 (#523): ...`
+  runtime test.
 - `h3interop.quic.early.replay_fallback` — the same early ticket replayed
   within one process is rejected by the process-local replay gate
   (`tardigrade_tls_early_data_replay_total{outcome="duplicate"}`), not
-  re-executed as 0-RTT, and the connection remains usable afterward.
+  re-executed as 0-RTT, and the peer's in-connection 1-RTT fallback
+  remains usable afterward.
 
 Known **not** externally reachable through today's production
 configuration surface (verified directly against the running server, not

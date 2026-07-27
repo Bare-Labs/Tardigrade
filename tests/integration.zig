@@ -2654,12 +2654,15 @@ const GtlsClientSpec = struct {
     quic_port: u16,
     sni: []const u8 = quic_interop_server_name,
     path: []const u8,
+    extra_paths: []const []const u8 = &.{},
     method: []const u8 = "GET",
     body_file: ?[]const u8 = null,
     session_file: []const u8,
     tp_file: []const u8,
     disable_early_data: bool = false,
     wait_for_ticket: bool = false,
+    exit_on_first_stream_close: bool = true,
+    exit_on_all_streams_close: bool = false,
     deadline_ms: u32 = 15_000,
 };
 
@@ -2680,7 +2683,8 @@ fn runGtlsClient(allocator: std.mem.Allocator, client_path: []const u8, spec: Gt
     try argv.append(spec.tp_file);
     if (spec.disable_early_data) try argv.append("--disable-early-data");
     if (spec.wait_for_ticket) try argv.append("--wait-for-ticket");
-    try argv.append("--exit-on-first-stream-close");
+    if (spec.exit_on_first_stream_close) try argv.append("--exit-on-first-stream-close");
+    if (spec.exit_on_all_streams_close) try argv.append("--exit-on-all-streams-close");
     if (!std.mem.eql(u8, spec.method, "GET")) {
         try argv.append("-m");
         try argv.append(spec.method);
@@ -2696,6 +2700,17 @@ fn runGtlsClient(allocator: std.mem.Allocator, client_path: []const u8, spec: Gt
     const uri = try std.fmt.allocPrint(allocator, "https://{s}{s}", .{ spec.sni, spec.path });
     defer allocator.free(uri);
     try argv.append(uri);
+    var extra_uris = std.array_list.Managed([]u8).init(allocator);
+    defer {
+        for (extra_uris.items) |extra_uri| allocator.free(extra_uri);
+        extra_uris.deinit();
+    }
+    for (spec.extra_paths) |extra_path| {
+        const extra_uri = try std.fmt.allocPrint(allocator, "https://{s}{s}", .{ spec.sni, extra_path });
+        errdefer allocator.free(extra_uri);
+        try extra_uris.append(extra_uri);
+        try argv.append(extra_uri);
+    }
     return bounded_process.run(allocator, .{
         .argv = argv.items,
         .stdout_limit = 512 * 1024,
@@ -2732,6 +2747,68 @@ fn snapshotGtlsClientState(allocator: std.mem.Allocator, sess_path: []const u8, 
     try writeInteropSecretFile(snap_tp_path, tp_data);
 }
 
+fn appendGtlsHandshakeCryptoBytes(out: *std.array_list.Managed(u8), stderr: []const u8) !void {
+    var in_handshake_crypto = false;
+    var lines = std.mem.splitScalar(u8, stderr, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, "\r");
+        if (std.mem.startsWith(u8, line, "Ordered CRYPTO data in ")) {
+            in_handshake_crypto = std.mem.eql(u8, line, "Ordered CRYPTO data in Handshake crypto level");
+            continue;
+        }
+        if (!in_handshake_crypto) continue;
+        if (line.len == 0) {
+            in_handshake_crypto = false;
+            continue;
+        }
+
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        const offset = fields.next() orelse {
+            in_handshake_crypto = false;
+            continue;
+        };
+        if (offset.len != 8 or !std.ascii.isHex(offset[0])) {
+            in_handshake_crypto = false;
+            continue;
+        }
+        while (fields.next()) |field| {
+            if (field.len > 0 and field[0] == '|') break;
+            if (field.len != 2) continue;
+            if (!std.ascii.isHex(field[0]) or !std.ascii.isHex(field[1])) continue;
+            try out.append(try std.fmt.parseInt(u8, field, 16));
+        }
+    }
+}
+
+fn gtlsHandshakeContainsType(bytes: []const u8, handshake_type: u8) bool {
+    var index: usize = 0;
+    while (index + 4 <= bytes.len) {
+        const message_type = bytes[index];
+        const len = (@as(usize, bytes[index + 1]) << 16) |
+            (@as(usize, bytes[index + 2]) << 8) |
+            @as(usize, bytes[index + 3]);
+        if (index + 4 + len > bytes.len) break;
+        if (message_type == handshake_type) return true;
+        index += 4 + len;
+    }
+    return false;
+}
+
+fn assertGtlsSessionReused(allocator: std.mem.Allocator, stderr: []const u8) !void {
+    var handshake = std.array_list.Managed(u8).init(allocator);
+    defer handshake.deinit();
+    try appendGtlsHandshakeCryptoBytes(&handshake, stderr);
+
+    // ngtcp2's own pinned example tests distinguish resumed handshakes by
+    // the decrypted server Handshake CRYPTO flight:
+    // ServerHello:EncryptedExtensions:Finished. A full handshake contains
+    // Certificate (11) and CertificateVerify (15) before Finished.
+    try std.testing.expect(gtlsHandshakeContainsType(handshake.items, 8)); // EncryptedExtensions
+    try std.testing.expect(gtlsHandshakeContainsType(handshake.items, 20)); // Finished
+    try std.testing.expect(!gtlsHandshakeContainsType(handshake.items, 11)); // Certificate
+    try std.testing.expect(!gtlsHandshakeContainsType(handshake.items, 15)); // CertificateVerify
+}
+
 test "h3interop.quic.resume" {
     try requireGeneralTlsProfile();
     const allocator = std.testing.allocator;
@@ -2743,17 +2820,30 @@ test "h3interop.quic.resume" {
     const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
     defer allocator.free(sni_certs);
 
+    // A proxied route (not a local `return`) so the resumed request's
+    // exactly-once execution is observable at a real application/upstream
+    // seam, not merely inferred from the QUIC/TLS acceptance decision.
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "readiness", .connection_header = "close" },
+        .{ .body = "full-handshake", .connection_header = "close" },
+        .{ .body = "resumed", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
     const quic_port = try findFreeUdpPort();
     const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
     defer allocator.free(quic_port_str);
 
     var tardigrade = try TardigradeProcess.start(allocator, .{
-        .config_text =
-        \\location = /safe {
-        \\    early_data replay_safe;
-        \\    return 200 alive;
-        \\}
-        ,
+        .config_text = config_text,
         .ready_https_insecure = true,
         .ready_path = "/safe",
         .extra_env = &.{
@@ -2787,7 +2877,8 @@ test "h3interop.quic.resume" {
     });
     defer first.deinit(allocator);
     try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
-    try assertContains(first.stderr, "alive");
+    try assertContains(first.stderr, "[:status: 200]");
+    try upstream.resetCapture();
 
     // 3-4: reconnect with early data explicitly disabled -- an authoritative
     // *resumed* 1-RTT connection, not 0-RTT and not a second full handshake
@@ -2801,13 +2892,21 @@ test "h3interop.quic.resume" {
     });
     defer second.deinit(allocator);
     try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(second.outcome));
+    try assertContains(second.stderr, "[:status: 200]");
 
-    // 5-8: the resumed connection actually served a real H3 request/response
-    // exactly once, and Tardigrade's own typed QUIC resumption outcome --
-    // not just a second successful handshake -- independently reports
-    // `accepted`. No accepted 0-RTT packet proves this was ordinary 1-RTT
-    // resumption, not early data.
-    try assertContains(second.stderr, "alive");
+    // 5: independent, peer-side proof of resumption from the pinned
+    // external peer's own decrypted server Handshake CRYPTO trace, not from
+    // anything Tardigrade reports about itself.
+    try assertGtlsSessionReused(allocator, second.stderr);
+
+    // 6: exactly-once application/upstream execution for the resumed
+    // request, observed at the real upstream seam.
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    // 7-8: Tardigrade's own typed QUIC resumption outcome -- not just a
+    // second successful handshake -- independently reports `accepted`. No
+    // accepted 0-RTT packet proves this was ordinary 1-RTT resumption, not
+    // early data.
     var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
     defer metrics.deinit();
     try expectMetricAtLeast(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"quic\"", "outcome=\"accepted\"" }, 1);
@@ -2930,6 +3029,7 @@ test "h3interop.quic.early.unsafe_425" {
     var upstream = try UpstreamServer.start(allocator, &.{
         .{ .body = "readiness", .connection_header = "close" },
         .{ .body = "ticket-bootstrap", .connection_header = "close" },
+        .{ .body = "ordinary-after-425", .connection_header = "close" },
     });
     defer upstream.stop();
     try upstream.run();
@@ -3016,6 +3116,28 @@ test "h3interop.quic.early.unsafe_425" {
     // replay/compatibility failure being misattributed.
     try expectMetricAtLeast(metrics.body, "tardigrade_quic_zero_rtt_packet_total", &.{"outcome=\"accepted\""}, 1);
     try expectMetricAtLeast(metrics.body, "tardigrade_http_early_data_decisions_total", &.{ "protocol=\"h3\"", "decision=\"too_early\"" }, 1);
+
+    // `gtlsclient` has one method/body for all URIs in an invocation and
+    // opens every configured stream as soon as stream credit is available;
+    // its `--delay-stream` option delays every stream until 1-RTT. It
+    // cannot express "early unsafe POST, then ordinary GET" on one
+    // connection. The production H3 runtime's same-connection post-425
+    // behavior is covered by `http3 (#523): ... ordinary post-handshake
+    // requests still work`; this live external-peer check proves the
+    // exact same route remains usable for ordinary H3 immediately after
+    // the external early-POST 425, with one upstream side effect.
+    var ordinary = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/safe",
+        .session_file = sess_path,
+        .tp_file = tp_path,
+        .disable_early_data = true,
+    });
+    defer ordinary.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(ordinary.outcome));
+    try assertContains(ordinary.stderr, "[:status: 200]");
+    try assertContains(ordinary.stderr, "ordinary-after-425");
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
 
 test "h3interop.quic.early.replay_fallback" {
@@ -3117,9 +3239,18 @@ test "h3interop.quic.early.replay_fallback" {
     try assertContains(early.stderr, "[:status: 200]");
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 
+    var metrics_before_replay = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer metrics_before_replay.deinit();
+    const accepted_before_replay = prometheusLabeledMetricValue(
+        metrics_before_replay.body,
+        "tardigrade_quic_zero_rtt_packet_total",
+        &.{"outcome=\"accepted\""},
+    ) orelse 0;
+    try std.testing.expect(accepted_before_replay > 0);
+
     // Replay the identical early attempt (bit-identical ticket/transport
     // state, never touched by the first attempt above) within the same
-    // Tardigrade process. RFC 9001 ยง4.6.1/RFC 9000: a rejected 0-RTT PSK
+    // Tardigrade process. RFC 9001 Section 4.6.1/RFC 9000: a rejected 0-RTT PSK
     // offer does not fail the connection -- the peer transparently falls
     // back to an ordinary 1-RTT handshake and (by design, in every
     // conformant client including this one) retransmits the same request
@@ -3143,10 +3274,16 @@ test "h3interop.quic.early.replay_fallback" {
     defer metrics.deinit();
     // The replay-specific typed outcome, not a generic ticket/key miss.
     try expectMetricAtLeast(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""}, 1);
-    // Exactly one *early* execution across both attempts -- the replay was
-    // never itself accepted as 0-RTT (the second upstream hit above came
-    // from the safe 1-RTT fallback, proven independently here).
-    try std.testing.expectEqual(@as(u64, 1), prometheusLabeledMetricValue(metrics.body, "tardigrade_quic_zero_rtt_packet_total", &.{"outcome=\"accepted\""}) orelse 0);
+    // No additional accepted 0-RTT packets across the replay attempt. The
+    // first valid early request may occupy more than one QUIC packet, so
+    // compare the accepted-packet counter before/after replay rather than
+    // equating "one request" with "one packet".
+    const accepted_after_replay = prometheusLabeledMetricValue(
+        metrics.body,
+        "tardigrade_quic_zero_rtt_packet_total",
+        &.{"outcome=\"accepted\""},
+    ) orelse 0;
+    try std.testing.expectEqual(accepted_before_replay, accepted_after_replay);
 
     // The otherwise-valid connection remains usable for an ordinary,
     // non-early 1-RTT H3 request afterward (an explicit, separate
