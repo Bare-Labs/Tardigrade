@@ -2517,14 +2517,23 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
     // Ordinary (non-early) request post-handshake: even an otherwise-unsafe
     // method dispatches normally once the connection is fully established,
     // proving the 425 above was strictly an early-data-window decision, not
-    // a permanent rejection of that route. Reuses phase 1's already-
-    // established `client1`/`entry1` pair rather than continuing to drive
-    // `client2`/`entry2`: the fabricated 0-RTT packets above were sealed
-    // with a throwaway sender adapter that shares no packet-number state
-    // with `client2`'s own counters, so letting `client2` go on to send
-    // real application-space packets of its own would collide with the
-    // packet numbers (0 and 1) those fabricated packets already consumed in
-    // the space 0-RTT and 1-RTT share.
+    // a permanent rejection of that route. This deliberately reuses phase
+    // 1's already-established `client1`/`entry1` pair rather than
+    // continuing to drive `client2`/`entry2`: the fabricated 0-RTT packets
+    // above were sealed with a throwaway sender adapter operating entirely
+    // outside `client2`'s own connection state (there is no real client
+    // 0-RTT transmit path — see `sealZeroRttPacketForTest`), so the server
+    // now believes streams 40/44 exist and have received bytes that
+    // `client2`'s own `StreamManager` has no record of at all. Letting
+    // `client2` continue would need the server to never reference those
+    // stream ids again (e.g. via MAX_STREAM_DATA credit renewal, which H3
+    // request assembly triggers naturally) — and there is no way to
+    // pre-register matching stream state on `client2` first, since its
+    // `StreamManager` does not exist until *after* the handshake completes,
+    // which is exactly the step this would need to happen before. The
+    // dedicated same-connection rejection-fallback test below avoids this
+    // entirely: 0-RTT rejection never installs `.zero_rtt` read keys, so no
+    // fabricated packet — and no such divergent state — exists at all.
     const ordinary_id = try client1.openStream(.bidi);
     var ordinary_h3: [128]u8 = undefined;
     const ordinary_bytes = buildH3RequestBytesForTest("POST", "/ordinary", "example.com", &ordinary_h3);
@@ -2549,6 +2558,330 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
     try testing.expectEqual(@as(usize, 2), handler_state.executed_local);
     try testing.expectEqualStrings("POST", handler_state.last_method_buf[0..handler_state.last_method_len]);
     try testing.expectEqual(@as(usize, 1), handler_state.rejected_too_early);
+}
+
+test "http3 (#523): 0-RTT rejected by the real Runtime.h3EarlyDataCompatibility gate still serves a real H3 request over 1-RTT, same connection" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-early-request-real-gate-rejection-test");
+
+    var server_entropy = tls_core.production_crypto.OsEntropy{};
+    var server_provider_state = tls_core.production_crypto.Provider.init(server_entropy.entropy());
+    var resumption = try tls_core.resumption_runtime.Runtime.init(
+        testing.allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = fixedNowUnixMsForTest },
+        server_provider_state.cryptoProvider(),
+    );
+    defer resumption.deinit();
+
+    var client_entropy = tls_core.production_crypto.OsEntropy{};
+    var client_provider_state = tls_core.production_crypto.Provider.init(client_entropy.entropy());
+    var client_resumption = try tls_core.resumption_runtime.Runtime.init(
+        testing.allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = fixedNowUnixMsForTest },
+        client_provider_state.cryptoProvider(),
+    );
+    defer client_resumption.deinit();
+
+    const AlwaysAllow = struct {
+        fn decide(_: *anyopaque, _: tls_core.tls13_backend.EarlyDataReplayCandidate) tls_core.tls13_backend.EarlyDataReplayDecision {
+            return .allow;
+        }
+    };
+    var replay_ctx: u8 = 0;
+    const gate: tls_core.tls13_backend.EarlyDataReplayGate = .{ .ctx = &replay_ctx, .decideFn = AlwaysAllow.decide };
+
+    var handler_state = TestEarlyDataHandlerState{};
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .resumption_runtime = &resumption,
+        .early_data_replay_gate = gate,
+        .enable_0rtt = true,
+        .request_handler = testEarlyDataAwareHandler,
+        .request_handler_ctx = &handler_state,
+    });
+    defer runtime.deinit();
+    try testing.expect(runtime.zero_rtt_enabled);
+
+    // Phase 1: a real handshake, then a real ticket obtained from the
+    // production issuance path — identical setup to the accepted-case test
+    // above, except `server_conn1` is explicitly constructed with the
+    // runtime's own live `quic_config` (mirrors `accept()`'s
+    // `.config = self.quic_config`) so the transport-parameters snapshot the
+    // ticket remembers is exactly what `Runtime.h3EarlyDataCompatibility`
+    // will later compare a *reduced* live config against.
+    const client_cid = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8 };
+    const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const client_path = quic.path.PathKey{
+        .local = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_310),
+        .remote = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_311),
+    };
+    const server_path = quic.path.PathKey{
+        .local = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_311),
+        .remote = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_310),
+    };
+    const no_challenge = [_]u8{0} ** quic.path.path_challenge_len;
+
+    var client_backend = try quic.tls_backend.Tls13Backend.initClientWithAllocator(
+        allocator,
+        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
+    );
+
+    const Capture = struct {
+        runtime: *tls_core.resumption_runtime.Runtime,
+        retained: tls_core.session.ClientTicketState = .{},
+        stored: tls_core.session_cache.StoreResult = undefined,
+        count: usize = 0,
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(testing.allocator, &self.retained) catch unreachable;
+            self.stored = self.runtime.storeClientTicket(ticket);
+            self.count += 1;
+        }
+    };
+    var capture = Capture{ .runtime = &client_resumption };
+    defer capture.retained.deinit();
+    try client_backend.engine.setSessionTicketConsumer(allocator, tls_core.session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+
+    const backend1 = try allocator.create(quic.tls_backend.Tls13Backend);
+    backend1.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
+        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+        fixed.provider(),
+    );
+    const resume_policy: tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy = .{ .transport = .ignore, .application = .ignore };
+    try client_backend.setResumeCompatibilityPolicy(resume_policy);
+    try backend1.setResumeCompatibilityPolicy(resume_policy);
+
+    const client1 = try Connection.init(allocator, .{
+        .role = .client,
+        .local_cid = &client_cid,
+        .original_dcid = &odcid,
+        .peer_cid = &odcid,
+        .tls = client_backend.backend(),
+        .now_us = 1_000_000,
+        .initial_path = client_path,
+    });
+    defer client1.deinit();
+    const server_conn1 = try Connection.init(allocator, .{
+        .role = .server,
+        .config = runtime.quic_config,
+        .local_cid = &odcid,
+        .original_dcid = &odcid,
+        .peer_cid = &client_cid,
+        .tls = backend1.backend(),
+        .now_us = 1_000_000,
+        .initial_path = server_path,
+    });
+
+    var entry1 = ConnEntry{
+        .backend = backend1,
+        .conn = server_conn1,
+        .h3 = H3.initWithSettings(allocator, .server, .{}),
+        .admission_source_ip = 0,
+        .cid_len = odcid.len,
+        .accepted_at_us = 1_000_000,
+    };
+    defer entry1.deinit(allocator);
+
+    {
+        var rounds: usize = 0;
+        while (rounds < 64) : (rounds += 1) {
+            var progressed = false;
+            var buf: [2048]u8 = undefined;
+            while (client1.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+                try entry1.conn.ingestOnPath(t.bytes, server_path, no_challenge, 1_000_000);
+                progressed = true;
+            }
+            while (entry1.conn.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+                try client1.ingestOnPath(t.bytes, client_path, no_challenge, 1_000_000);
+                progressed = true;
+            }
+            if (!progressed) break;
+        }
+    }
+    try testing.expect(client1.isEstablished());
+    try testing.expect(entry1.conn.isEstablished());
+
+    try runtime.issueSessionTicket(&entry1, &resumption);
+    {
+        var rounds: usize = 0;
+        while (rounds < 16) : (rounds += 1) {
+            var progressed = false;
+            var buf: [2048]u8 = undefined;
+            while (entry1.conn.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+                try client1.ingestOnPath(t.bytes, client_path, no_challenge, 1_000_000);
+                progressed = true;
+            }
+            while (client1.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+                try entry1.conn.ingestOnPath(t.bytes, server_path, no_challenge, 1_000_000);
+                progressed = true;
+            }
+            if (!progressed) break;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), capture.count);
+    try testing.expectEqual(tls_core.session_cache.StoreResult.stored, capture.stored);
+
+    // The genuine incompatibility: reduce a *live* QUIC transport limit
+    // below what the ticket above just remembered — the same mutation the
+    // unit test "h3EarlyDataCompatibility (#523): rejects a live QUIC
+    // transport limit reduced below the remembered snapshot" above proves
+    // in isolation, but here driven through a real resumed handshake rather
+    // than a hand-built candidate.
+    runtime.quic_config.initial_max_streams_bidi -= 1;
+
+    // Phase 2: a fresh resumed connection attempting 0-RTT, wired with the
+    // *real* `Runtime.h3EarlyDataCompatibility` gate exactly as production's
+    // `accept()` does — unlike the accepted-case test above, which bypasses
+    // the compatibility gate entirely (its `backend2` never calls
+    // `setEarlyDataCompatibilityGate`, so the TLS layer's default
+    // always-compatible gate is what applies there).
+    const candidate: tls_core.session.CandidateContext = .{
+        .cipher_suite = capture.retained.common.cipher_suite,
+        .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
+        .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
+        .auth_binding = capture.retained.common.auth_binding,
+        .transport_compat = null,
+        .application_compat = null,
+    };
+    var lookup = client_resumption.lookupClientOffers(candidate);
+    defer lookup.deinit();
+    try testing.expect(lookup == .hit);
+
+    var client_backend2 = quic.tls_backend.Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0xe1} ** 32, .key_share_seed = [_]u8{0x41} ** 32 },
+        .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
+    );
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+    };
+    try client_backend2.engine.setClientPskOfferLease(&lookup.hit, &clock_dummy, ClientClock.now);
+    try client_backend2.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
+    try client_backend2.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 65536 });
+
+    const backend2 = try allocator.create(quic.tls_backend.Tls13Backend);
+    backend2.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
+        .{ .hello_random = [_]u8{0xe2} ** 32, .key_share_seed = [_]u8{0x42} ** 32 },
+        fixed.provider(),
+    );
+    try backend2.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
+    try backend2.setServerPskResolver(resumption.serverResolver().?);
+    try backend2.setEarlyDataReplayGate(gate);
+    try backend2.setServerEarlyDataPolicy(.{ .enabled = true });
+    try backend2.setEarlyDataCompatibilityGate(.{ .ctx = &runtime, .decideFn = Runtime.h3EarlyDataCompatibility });
+
+    const client2 = try Connection.init(allocator, .{
+        .role = .client,
+        .config = .{ .zero_rtt_enabled = true },
+        .local_cid = &client_cid,
+        .original_dcid = &odcid,
+        .peer_cid = &odcid,
+        .tls = client_backend2.backend(),
+        .now_us = 2_000_000,
+        .initial_path = client_path,
+    });
+    defer client2.deinit();
+    const server_conn2 = try Connection.init(allocator, .{
+        .role = .server,
+        .config = runtime.quic_config,
+        .local_cid = &odcid,
+        .original_dcid = &odcid,
+        .peer_cid = &client_cid,
+        .tls = backend2.backend(),
+        .now_us = 2_000_000,
+        .initial_path = server_path,
+    });
+
+    var entry2 = ConnEntry{
+        .backend = backend2,
+        .conn = server_conn2,
+        .h3 = H3.initWithSettings(allocator, .server, .{}),
+        .admission_source_ip = 0,
+        .cid_len = odcid.len,
+        .accepted_at_us = 2_000_000,
+    };
+    defer entry2.deinit(allocator);
+
+    // Drive only the client's first flight — enough for the server to run
+    // the resumption/early-data decision — then confirm 0-RTT was genuinely
+    // rejected: no `.zero_rtt` read key is ever installed, so there is
+    // nothing to decrypt early data with (and consequently no fabricated
+    // 0-RTT packet to inject at all, unlike the accepted-case test above).
+    {
+        var buf: [2048]u8 = undefined;
+        while (client2.pollTransmitOnPath(&buf, 2_000_000)) |t| {
+            try entry2.conn.ingestOnPath(t.bytes, server_path, no_challenge, 2_000_000);
+        }
+    }
+    try testing.expect(entry2.conn.adapter.protectionKeys(.zero_rtt, .read) == null);
+
+    // The rest of the handshake completes normally as ordinary 1-RTT
+    // resumption on this *same* connection — the real compatibility gate's
+    // rejection is strictly an early-data-window decision, not a rejection
+    // of the resumed connection itself.
+    {
+        var rounds: usize = 0;
+        while (rounds < 64) : (rounds += 1) {
+            var progressed = false;
+            var buf: [2048]u8 = undefined;
+            while (client2.pollTransmitOnPath(&buf, 2_000_000)) |t| {
+                try entry2.conn.ingestOnPath(t.bytes, server_path, no_challenge, 2_000_000);
+                progressed = true;
+            }
+            while (entry2.conn.pollTransmitOnPath(&buf, 2_000_000)) |t| {
+                try client2.ingestOnPath(t.bytes, client_path, no_challenge, 2_000_000);
+                progressed = true;
+            }
+            if (!progressed) break;
+        }
+    }
+    try testing.expect(client2.isEstablished());
+    try testing.expect(entry2.conn.isEstablished());
+
+    // A real H3 request over 1-RTT, on this *same* connection that just had
+    // its 0-RTT attempt rejected by the real, production compatibility
+    // gate — the same-connection fallback proof the review asked for, using
+    // `Runtime.h3EarlyDataCompatibility` itself rather than a synthetic gate.
+    const request_id = try client2.openStream(.bidi);
+    var request_h3: [128]u8 = undefined;
+    const request_bytes = buildH3RequestBytesForTest("GET", "/after-rejection", "example.com", &request_h3);
+    _ = try client2.writeStream(request_id, request_bytes, true);
+    {
+        var rounds: usize = 0;
+        while (rounds < 32) : (rounds += 1) {
+            var progressed = false;
+            var buf: [2048]u8 = undefined;
+            while (client2.pollTransmitOnPath(&buf, 2_000_000)) |t| {
+                try entry2.conn.ingestOnPath(t.bytes, server_path, no_challenge, 2_000_000);
+                progressed = true;
+            }
+            while (entry2.conn.pollTransmitOnPath(&buf, 2_000_000)) |t| {
+                try client2.ingestOnPath(t.bytes, client_path, no_challenge, 2_000_000);
+                progressed = true;
+            }
+            runtime.pumpH3(&entry2, 2_000_000);
+            if (!progressed) break;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), handler_state.executed_local);
+    try testing.expectEqualStrings("GET", handler_state.last_method_buf[0..handler_state.last_method_len]);
+    try testing.expectEqual(@as(usize, 0), handler_state.rejected_too_early);
 }
 
 test "accept() (#523): wires an EventSink into every accepted connection so 0-RTT events reach metrics instead of being silently discarded" {

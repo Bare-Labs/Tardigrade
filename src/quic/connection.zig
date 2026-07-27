@@ -1605,7 +1605,6 @@ pub const Connection = struct {
     // -- retry / handshake progress -------------------------------------------
 
     fn handleRetry(self: *Connection, bytes: []const u8, parsed: packet.ParsedPacket, now_us: u64) void {
-        _ = now_us;
         // RFC 9000 §17.2.5.2: only clients accept Retry, only before any
         // Initial packet from the server, and only once.
         if (self.role != .client or self.got_retry or self.initial_packet_processed) {
@@ -1640,6 +1639,13 @@ pub const Connection = struct {
         tx.pending.items.clearRetainingCapacity();
         tx.pending.insert(self.allocator, .{ .start = 0, .end = tx.data.items.len }) catch {};
         self.largest_recv_pn[0] = null;
+        // RFC 9000 §10.1: a successfully validated and processed Retry is a
+        // legitimate packet from the peer just like any other — the idle
+        // timer must restart here too, not only from the protected-packet
+        // path in `ingestPacket`. Every early return above this point
+        // (unexpected type, malformed, failed integrity check) is a
+        // never-processed/dropped packet and correctly does not reach here.
+        self.armIdle(now_us);
     }
 
     /// Drain queued TLS output into the per-level retransmission buffers.
@@ -3628,6 +3634,35 @@ test "driver: the idle timer does not refresh on a duplicate or an undecryptable
     const datagram_2 = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 1, frame_buf_2[0..frame_len_2], &wire_2);
     try pair.server.ingestOnPath(datagram_2, TestPair.server_path, TestPair.test_challenge_entropy, later);
     try testing.expect(pair.server.idle_deadline_us.? > deadline_after_fresh.?);
+}
+
+test "driver: a validated, successfully processed Retry still refreshes the idle timer (RFC 9000 §10.1)" {
+    // Fixing the duplicate/dropped-datagram idle-timer regression must not
+    // regress the legitimate Retry path: `handleRetry` returns before
+    // `ingestPacket`'s own protected-packet refresh point, so it needs its
+    // own `armIdle` call once the Retry is validated and processed.
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+
+    // RFC 9001 Appendix A.4 sample Retry packet for ODCID
+    // 0x8394c8f03e515708 — the same value `TestPair.odcid` uses, so a fresh
+    // client (which hasn't processed any Initial exchange yet, matching
+    // `TestPair.init`'s just-constructed state) validates it as genuine.
+    const retry = [_]u8{
+        0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0xf0, 0x67, 0xa5, 0x50, 0x2a,
+        0x42, 0x62, 0xb5, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x04, 0xa2, 0x65, 0xba,
+        0x2e, 0xff, 0x4d, 0x82, 0x90, 0x58, 0xfb, 0x3f, 0x0f, 0x24, 0x96, 0xba,
+    };
+
+    const before = pair.client.idle_deadline_us;
+    try testing.expect(before != null);
+    const later = pair.now_us + 5 * std.time.us_per_s;
+
+    try pair.client.ingestOnPath(&retry, TestPair.client_path, TestPair.test_challenge_entropy, later);
+
+    try testing.expect(pair.client.got_retry);
+    try testing.expect(pair.client.idle_deadline_us.? > before.?);
 }
 
 test "driver: replayed duplicate packet from a different source address does not create or credit candidate-path state" {

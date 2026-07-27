@@ -422,8 +422,12 @@ pub const RecoveryController = struct {
     /// Whether `packet_number` has already been authenticated in `space` —
     /// query *before* `onPacketReceived` records it. An authenticated
     /// duplicate (distinct from an undecryptable one, which never reaches
-    /// this point) must still count for ACK/path bookkeeping but must never
-    /// have its frame effects re-applied.
+    /// this point) must be inert: the driver (`connection.zig`) uses this to
+    /// skip re-applying its frame effects, refreshing the idle timer, and
+    /// crediting path/anti-amplification state for it — a duplicate proves
+    /// nothing new about the peer or the path. Its packet number is already
+    /// recorded from the prior `onPacketReceived` call that first saw it, so
+    /// it's already covered by the next ACK regardless.
     pub fn wasReceived(self: *const RecoveryController, space: PacketNumberSpace, packet_number: u64) bool {
         return self.ack_ranges[spaceIndex(space)].contains(packet_number);
     }
