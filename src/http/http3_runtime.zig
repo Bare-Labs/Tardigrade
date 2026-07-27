@@ -2746,25 +2746,18 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
     };
     var packet_capture = PacketCapture{};
 
-    // `quicConfigFrom`/`zeroRttCarrierEnabled` require a replay gate present
-    // on the *runtime's own* config before they'll consider 0-RTT usable at
-    // all (see the "enable_0rtt alone never enables the 0-RTT carrier" unit
-    // test above) — this placeholder is otherwise inert here, since
-    // `backend2` below is wired with `scenario.replay_gate` directly rather
-    // than going through `runtime.accept()`.
-    const RuntimeLevelAlwaysAllow = struct {
-        fn decide(_: *anyopaque, _: tls_core.tls13_backend.EarlyDataReplayCandidate) tls_core.tls13_backend.EarlyDataReplayDecision {
-            return .allow;
-        }
-    };
-    var runtime_replay_ctx: u8 = 0;
-
+    // The scenario's gate is the *runtime's own* configured gate — not a
+    // separate placeholder — so this proves the full production ownership
+    // chain: the process-shared gate configured on `Runtime` (what
+    // `accept()` actually reads) is the one driving the TLS decision, not
+    // just that some TLS backend behaves correctly with a gate handed to it
+    // directly.
     var runtime = try Runtime.init(testing.allocator, &logger, .{
         .listen_host = "127.0.0.1",
         .quic_port = 0,
         .credential_provider = fixed.provider(),
         .resumption_runtime = &resumption,
-        .early_data_replay_gate = .{ .ctx = &runtime_replay_ctx, .decideFn = RuntimeLevelAlwaysAllow.decide },
+        .early_data_replay_gate = scenario.replay_gate,
         .enable_0rtt = true,
         .request_handler = testEarlyDataAwareHandler,
         .request_handler_ctx = &handler_state,
@@ -2964,7 +2957,9 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
     );
     try backend2.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
     try backend2.setServerPskResolver(resumption.serverResolver().?);
-    try backend2.setEarlyDataReplayGate(scenario.replay_gate);
+    // Sourced from `runtime.early_data_replay_gate`, not `scenario.replay_gate`
+    // directly — the same process-shared value `accept()` reads.
+    try backend2.setEarlyDataReplayGate(runtime.early_data_replay_gate.?);
     try backend2.setServerEarlyDataPolicy(.{ .enabled = true });
     try backend2.setEarlyDataCompatibilityGate(.{ .ctx = &runtime, .decideFn = Runtime.h3EarlyDataCompatibility });
 
