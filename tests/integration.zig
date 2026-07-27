@@ -2432,6 +2432,22 @@ fn requireNativeTlsProfile() !void {
     if (build_options.tls_openssl_adapter) return error.SkipZigTest;
 }
 
+/// #522: the appliance TLS profile explicitly forbids
+/// `TARDIGRADE_HTTP3_ENABLE_0RTT` (`edge_config.zig`'s
+/// `validateApplianceTlsProfile` rejects it outright as an unsupported
+/// appliance configuration), and QUIC's `NativeCredentialStore` credential
+/// provider is itself only constructed `if (build_options.tls_openssl_
+/// adapter and cfg.http3_enabled ...)` in `edge_gateway.zig` -- native QUIC
+/// never links OpenSSL identity objects, but production 0-RTT composition
+/// for HTTP/3 is currently reachable only under the `.general` profile (the
+/// default `zig build`, no `-Dtls-profile` needed), the mirror image of
+/// `requireNativeTlsProfile` above. This is itself part of #522's finding,
+/// not a workaround: see the QUIC transport-parameter reachability note on
+/// `h3interop.quic.early.*` below.
+fn requireGeneralTlsProfile() !void {
+    if (!build_options.tls_openssl_adapter) return error.SkipZigTest;
+}
+
 /// #369: skip external OpenSSL interop cases when the local toolchain has no
 /// `openssl` binary rather than failing -- CI always installs it (see
 /// ci.yml), but a stripped-down dev environment should not fail the suite
@@ -2563,6 +2579,590 @@ fn expectMetricAtLeast(body: []const u8, name: []const u8, labels: []const []con
 }
 
 const openssl_health_request = "GET /healthz HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n";
+
+// ===========================================================================
+// #522: external ngtcp2/GnuTLS QUIC/H3 interop.
+//
+// Unlike `scripts/interop/run-interop.sh` + `tests/h3_interop_tool.zig`
+// (the direct `Tls13Backend -> quic.Connection -> H3.Conn` harness for the
+// #328 baseline wire-interop matrix), these cases drive the real production
+// composition: an external, independently-built ngtcp2/GnuTLS client against
+// the actual Tardigrade edge-gateway binary with `TARDIGRADE_HTTP3_ENABLED`,
+// exercising the shared native resumption runtime, the process-local replay
+// gate, and the shared HTTP early-data safety/routing policy end to end --
+// the same production seams the `interop.openssl.h1.*` cases below exercise
+// for TCP/H1, over real QUIC 0-RTT packets instead of TLS record early data.
+// ===========================================================================
+
+fn findFreeUdpPort() !u16 {
+    const fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    if (fd < 0) return error.SocketFailed;
+    defer _ = std.c.close(fd);
+    const bind_addr = std.c.sockaddr.in{ .family = std.posix.AF.INET, .port = 0, .addr = 0 };
+    if (std.c.bind(fd, @ptrCast(&bind_addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.BindFailed;
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getsockname(fd, @ptrCast(&bound), &bound_len) != 0) return error.GetSockNameFailed;
+    return std.mem.bigToNative(u16, bound.port);
+}
+
+/// #522: skip the external ngtcp2/GnuTLS H3/QUIC interop cases when the
+/// canonical peer (built per `scripts/interop/README.md`, `gtlsclient`) isn't
+/// available locally -- like `requireOpenssl`, an optional external peer
+/// must never fail a stripped-down dev environment; CI builds it.
+fn requireNgtcp2Client(allocator: std.mem.Allocator) ![]u8 {
+    const path = compat.getEnvVarOwned(allocator, "NGTCP2_GTLSCLIENT_PATH") catch return error.SkipZigTest;
+    errdefer allocator.free(path);
+    var result = bounded_process.run(allocator, .{
+        .argv = &.{ path, "--help" },
+        .stdout_limit = 16 * 1024,
+        .stderr_limit = 16 * 1024,
+        .deadline_ms = 5_000,
+    }) catch return error.SkipZigTest;
+    defer result.deinit(allocator);
+    if (std.meta.activeTag(result.outcome) != .normal_exit) return error.SkipZigTest;
+    return path;
+}
+
+/// #522: the checked-out ngtcp2 `gtlsclient` (every TLS backend's
+/// `tls_client_session_*.cc`) sends the literal string "localhost" as TLS
+/// SNI whenever the connect host is a numeric IP address, *regardless* of
+/// `--sni` -- confirmed directly against this suite's own server (`HOST` is
+/// always `test_host` here, an IP) and in the checked-out ngtcp2 source
+/// (`if (!config.sni.empty()) { use it } else if (host is numeric) { send
+/// "localhost" }`; the observed wire SNI is "localhost" regardless). The
+/// intended name is registered too so the response Host-routing config
+/// stays readable, and both resolve to the one QUIC-side identity below.
+const quic_interop_server_name = "tardigrade.test";
+const quic_interop_wire_sni = "localhost";
+
+/// #522: QUIC's `NativeCredentialStore` (`native_tls_connection.zig`, wired
+/// in `edge_gateway.zig` only `if (build_options.tls_openssl_adapter and
+/// cfg.http3_enabled ...)`) is a multi-identity SNI provider with
+/// `unknown_sni_policy=.fail_handshake` -- register both the peer's actual
+/// wire SNI (`quic_interop_wire_sni`) and the intended name under the same
+/// identity so the handshake succeeds regardless of which one the peer
+/// negotiates with.
+fn quicSniCertsEnv(allocator: std.mem.Allocator, cert_path: []const u8, key_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}:{s}:{s}|{s}:{s}:{s}", .{
+        quic_interop_wire_sni,    cert_path, key_path,
+        quic_interop_server_name, cert_path, key_path,
+    });
+}
+
+const GtlsClientSpec = struct {
+    quic_port: u16,
+    sni: []const u8 = quic_interop_server_name,
+    path: []const u8,
+    method: []const u8 = "GET",
+    body_file: ?[]const u8 = null,
+    session_file: []const u8,
+    tp_file: []const u8,
+    disable_early_data: bool = false,
+    wait_for_ticket: bool = false,
+    deadline_ms: u32 = 15_000,
+};
+
+/// #522: drives a real `gtlsclient` subprocess against the native QUIC/H3
+/// listener, bounded end to end via `bounded_process` like `runOpenssl`.
+/// `--session-file`/`--tp-file` are ngtcp2's TLS-session/QUIC-transport-
+/// parameter persistence -- the 0-RTT analogue of openssl's `-sess_out`/
+/// `-sess_in`/`-early_data`.
+fn runGtlsClient(allocator: std.mem.Allocator, client_path: []const u8, spec: GtlsClientSpec) !bounded_process.Result {
+    var argv = std.array_list.Managed([]const u8).init(allocator);
+    defer argv.deinit();
+    try argv.append(client_path);
+    try argv.append("--sni");
+    try argv.append(spec.sni);
+    try argv.append("--session-file");
+    try argv.append(spec.session_file);
+    try argv.append("--tp-file");
+    try argv.append(spec.tp_file);
+    if (spec.disable_early_data) try argv.append("--disable-early-data");
+    if (spec.wait_for_ticket) try argv.append("--wait-for-ticket");
+    try argv.append("--exit-on-first-stream-close");
+    if (!std.mem.eql(u8, spec.method, "GET")) {
+        try argv.append("-m");
+        try argv.append(spec.method);
+    }
+    if (spec.body_file) |p| {
+        try argv.append("-d");
+        try argv.append(p);
+    }
+    const port_str = try std.fmt.allocPrint(allocator, "{d}", .{spec.quic_port});
+    defer allocator.free(port_str);
+    try argv.append(test_host);
+    try argv.append(port_str);
+    const uri = try std.fmt.allocPrint(allocator, "https://{s}{s}", .{ spec.sni, spec.path });
+    defer allocator.free(uri);
+    try argv.append(uri);
+    return bounded_process.run(allocator, .{
+        .argv = argv.items,
+        .stdout_limit = 512 * 1024,
+        .stderr_limit = 512 * 1024,
+        .deadline_ms = spec.deadline_ms,
+        .accepted_exit_codes = &.{ 0, 1 },
+    });
+}
+
+fn ngtcp2SessionPath(allocator: std.mem.Allocator, port: u16, tag: []const u8) ![]u8 {
+    const dir = try interopSecretsDir(allocator);
+    defer allocator.free(dir);
+    return std.fmt.allocPrint(allocator, "{s}/interop-quic-{s}-{d}.sess", .{ dir, tag, port });
+}
+
+fn ngtcp2TpPath(allocator: std.mem.Allocator, port: u16, tag: []const u8) ![]u8 {
+    const dir = try interopSecretsDir(allocator);
+    defer allocator.free(dir);
+    return std.fmt.allocPrint(allocator, "{s}/interop-quic-{s}-{d}.tp", .{ dir, tag, port });
+}
+
+/// #522: snapshots the post-handshake session/transport-parameter files so a
+/// later run can offer the *identical* early-data-capable state again --
+/// `gtlsclient` overwrites `--session-file` in place with a freshly issued
+/// ticket after every successful handshake, so a genuine replay (not just a
+/// second independently-ticketed reconnect) requires copies taken before
+/// that ticket is ever used.
+fn snapshotGtlsClientState(allocator: std.mem.Allocator, sess_path: []const u8, tp_path: []const u8, snap_sess_path: []const u8, snap_tp_path: []const u8) !void {
+    const sess_data = try compat.cwd().readFileAlloc(allocator, sess_path, 64 * 1024);
+    defer allocator.free(sess_data);
+    try writeInteropSecretFile(snap_sess_path, sess_data);
+    const tp_data = try compat.cwd().readFileAlloc(allocator, tp_path, 64 * 1024);
+    defer allocator.free(tp_data);
+    try writeInteropSecretFile(snap_tp_path, tp_data);
+}
+
+test "h3interop.quic.resume" {
+    try requireGeneralTlsProfile();
+    const allocator = std.testing.allocator;
+    const client_path = try requireNgtcp2Client(allocator);
+    defer allocator.free(client_path);
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text =
+        \\location = /safe {
+        \\    early_data replay_safe;
+        \\    return 200 alive;
+        \\}
+        ,
+        .ready_https_insecure = true,
+        .ready_path = "/safe",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+        },
+    });
+    defer tardigrade.stop();
+
+    const sess_path = try ngtcp2SessionPath(allocator, quic_port, "resume");
+    defer allocator.free(sess_path);
+    defer compat.cwd().deleteFile(sess_path) catch {};
+    const tp_path = try ngtcp2TpPath(allocator, quic_port, "resume");
+    defer allocator.free(tp_path);
+    defer compat.cwd().deleteFile(tp_path) catch {};
+
+    // 1-2: real production `http3_runtime.Runtime` (via the edge-gateway
+    // binary), real ngtcp2/GnuTLS client, initial full QUIC/TLS 1.3
+    // handshake, production-issued resumption state captured to disk.
+    var first = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/safe",
+        .session_file = sess_path,
+        .tp_file = tp_path,
+        .wait_for_ticket = true,
+    });
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
+    try assertContains(first.stderr, "alive");
+
+    // 3-4: reconnect with early data explicitly disabled -- an authoritative
+    // *resumed* 1-RTT connection, not 0-RTT and not a second full handshake
+    // misclassified as resumption.
+    var second = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/safe",
+        .session_file = sess_path,
+        .tp_file = tp_path,
+        .disable_early_data = true,
+    });
+    defer second.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(second.outcome));
+
+    // 5-8: the resumed connection actually served a real H3 request/response
+    // exactly once, and Tardigrade's own typed QUIC resumption outcome --
+    // not just a second successful handshake -- independently reports
+    // `accepted`. No accepted 0-RTT packet proves this was ordinary 1-RTT
+    // resumption, not early data.
+    try assertContains(second.stderr, "alive");
+    var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer metrics.deinit();
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"quic\"", "outcome=\"accepted\"" }, 1);
+    try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_quic_zero_rtt_packet_total", &.{"outcome=\"accepted\""}) orelse 0);
+}
+
+test "h3interop.quic.early.accepted" {
+    try requireGeneralTlsProfile();
+    const allocator = std.testing.allocator;
+    const client_path = try requireNgtcp2Client(allocator);
+    defer allocator.free(client_path);
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "readiness", .connection_header = "close" },
+        .{ .body = "ticket-bootstrap", .connection_header = "close" },
+        .{ .body = "safe-early", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\    early_data replay_safe;
+        \\    proxy_early_data rfc8470;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/safe",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE", .value = "process_local" },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLE_0RTT", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const sess_path = try ngtcp2SessionPath(allocator, quic_port, "early-accepted");
+    defer allocator.free(sess_path);
+    defer compat.cwd().deleteFile(sess_path) catch {};
+    const tp_path = try ngtcp2TpPath(allocator, quic_port, "early-accepted");
+    defer allocator.free(tp_path);
+    defer compat.cwd().deleteFile(tp_path) catch {};
+
+    var first = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/safe",
+        .session_file = sess_path,
+        .tp_file = tp_path,
+        .wait_for_ticket = true,
+    });
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
+    try upstream.resetCapture();
+
+    // Reconnect with early data left enabled (the default once a captured
+    // session+transport-parameter file are supplied): the peer sends the
+    // GET as real QUIC 0-RTT packets, proven independently by the peer's own
+    // `type=0RTT` frame log alongside Tardigrade's authoritative acceptance.
+    var early = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/safe",
+        .session_file = sess_path,
+        .tp_file = tp_path,
+    });
+    defer early.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(early.outcome));
+    try assertContains(early.stderr, "type=0RTT");
+    // `[:status: N]` is a plain logged header line, safe to substring-match;
+    // the response *body* dump below it is hex+ASCII wrapped at 16-byte
+    // offsets and must not be matched this way -- a short body like the
+    // JSON error text can straddle a wrap boundary and split apart.
+    try assertContains(early.stderr, "[:status: 200]");
+    // Exactly-once application/upstream execution, observed at the real
+    // upstream seam -- not inferred from the QUIC/TLS acceptance decision.
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer metrics.deinit();
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"quic\"", "outcome=\"accepted\"" }, 1);
+    try expectMetricAtLeast(metrics.body, "tardigrade_quic_early_data_decision_total", &.{"decision=\"accepted\""}, 1);
+    try expectMetricAtLeast(metrics.body, "tardigrade_quic_zero_rtt_packet_total", &.{"outcome=\"accepted\""}, 1);
+    // Proxied via `proxy_early_data rfc8470;` (matching
+    // `interop.openssl.h1.early.accepted`'s own assertion): a proxied
+    // replay-safe early request is forwarded with the RFC 8470 marker, not
+    // executed locally, so the decision label is `forwarded`.
+    try expectMetricAtLeast(metrics.body, "tardigrade_http_early_data_decisions_total", &.{ "protocol=\"h3\"", "decision=\"forwarded\"" }, 1);
+}
+
+test "h3interop.quic.early.unsafe_425" {
+    try requireGeneralTlsProfile();
+    const allocator = std.testing.allocator;
+    const client_path = try requireNgtcp2Client(allocator);
+    defer allocator.free(client_path);
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "readiness", .connection_header = "close" },
+        .{ .body = "ticket-bootstrap", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\    early_data replay_safe;
+        \\    proxy_early_data rfc8470;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/safe",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE", .value = "process_local" },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLE_0RTT", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const sess_path = try ngtcp2SessionPath(allocator, quic_port, "early-unsafe");
+    defer allocator.free(sess_path);
+    defer compat.cwd().deleteFile(sess_path) catch {};
+    const tp_path = try ngtcp2TpPath(allocator, quic_port, "early-unsafe");
+    defer allocator.free(tp_path);
+    defer compat.cwd().deleteFile(tp_path) catch {};
+    const body_path = try std.fmt.allocPrint(allocator, "{s}.body", .{sess_path});
+    defer allocator.free(body_path);
+    defer compat.cwd().deleteFile(body_path) catch {};
+    try writeInteropSecretFile(body_path, "x");
+
+    var first = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/safe",
+        .session_file = sess_path,
+        .tp_file = tp_path,
+        .wait_for_ticket = true,
+    });
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
+    try upstream.resetCapture();
+
+    // POST is never method-safe (`http/early_data.zig`'s `methodSafe`
+    // accepts only GET/HEAD) regardless of the route's `replay_safe`
+    // marking -- the same shared HTTP-level policy the H1 case below
+    // exercises, not a QUIC-specific safety mechanism.
+    var early = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/safe",
+        .method = "POST",
+        .body_file = body_path,
+        .session_file = sess_path,
+        .tp_file = tp_path,
+    });
+    defer early.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(early.outcome));
+    try assertContains(early.stderr, "type=0RTT");
+    // See the accepted case above: match the plain logged status header,
+    // not the hex+ASCII body dump (the JSON error text can straddle a
+    // 16-byte wrap boundary and split apart mid-substring).
+    try assertContains(early.stderr, "[:status: 425]");
+    // Rejected before any application/upstream side effect.
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer metrics.deinit();
+    // The QUIC/TLS layer still authoritatively accepted the early data --
+    // the rejection is the shared HTTP-level safety policy, not a
+    // replay/compatibility failure being misattributed.
+    try expectMetricAtLeast(metrics.body, "tardigrade_quic_zero_rtt_packet_total", &.{"outcome=\"accepted\""}, 1);
+    try expectMetricAtLeast(metrics.body, "tardigrade_http_early_data_decisions_total", &.{ "protocol=\"h3\"", "decision=\"too_early\"" }, 1);
+}
+
+test "h3interop.quic.early.replay_fallback" {
+    try requireGeneralTlsProfile();
+    const allocator = std.testing.allocator;
+    const client_path = try requireNgtcp2Client(allocator);
+    defer allocator.free(client_path);
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+    const sni_certs = try quicSniCertsEnv(allocator, tls_paths.cert_path, tls_paths.key_path);
+    defer allocator.free(sni_certs);
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "readiness", .connection_header = "close" },
+        .{ .body = "ticket-bootstrap", .connection_header = "close" },
+        .{ .body = "safe-early", .connection_header = "close" },
+        .{ .body = "after-replay", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\    early_data replay_safe;
+        \\    proxy_early_data rfc8470;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/safe",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateful" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE", .value = "process_local" },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLE_0RTT", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const sess_path = try ngtcp2SessionPath(allocator, quic_port, "replay");
+    defer allocator.free(sess_path);
+    defer compat.cwd().deleteFile(sess_path) catch {};
+    const tp_path = try ngtcp2TpPath(allocator, quic_port, "replay");
+    defer allocator.free(tp_path);
+    defer compat.cwd().deleteFile(tp_path) catch {};
+
+    var first = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/safe",
+        .session_file = sess_path,
+        .tp_file = tp_path,
+        .wait_for_ticket = true,
+    });
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
+
+    // Snapshot the post-bootstrap ticket/transport-parameter state *before*
+    // either early attempt below can consume/overwrite it -- both attempts
+    // must offer the bit-identical early data for the second to be a
+    // genuine replay rather than an independently-ticketed reconnect.
+    const replay_a_sess = try std.fmt.allocPrint(allocator, "{s}.replay-a", .{sess_path});
+    defer allocator.free(replay_a_sess);
+    defer compat.cwd().deleteFile(replay_a_sess) catch {};
+    const replay_a_tp = try std.fmt.allocPrint(allocator, "{s}.replay-a", .{tp_path});
+    defer allocator.free(replay_a_tp);
+    defer compat.cwd().deleteFile(replay_a_tp) catch {};
+    try snapshotGtlsClientState(allocator, sess_path, tp_path, replay_a_sess, replay_a_tp);
+    const replay_b_sess = try std.fmt.allocPrint(allocator, "{s}.replay-b", .{sess_path});
+    defer allocator.free(replay_b_sess);
+    defer compat.cwd().deleteFile(replay_b_sess) catch {};
+    const replay_b_tp = try std.fmt.allocPrint(allocator, "{s}.replay-b", .{tp_path});
+    defer allocator.free(replay_b_tp);
+    defer compat.cwd().deleteFile(replay_b_tp) catch {};
+    try snapshotGtlsClientState(allocator, sess_path, tp_path, replay_b_sess, replay_b_tp);
+
+    try upstream.resetCapture();
+    var early = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/safe",
+        .session_file = replay_a_sess,
+        .tp_file = replay_a_tp,
+    });
+    defer early.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(early.outcome));
+    try assertContains(early.stderr, "[:status: 200]");
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    // Replay the identical early attempt (bit-identical ticket/transport
+    // state, never touched by the first attempt above) within the same
+    // Tardigrade process. RFC 9001 ยง4.6.1/RFC 9000: a rejected 0-RTT PSK
+    // offer does not fail the connection -- the peer transparently falls
+    // back to an ordinary 1-RTT handshake and (by design, in every
+    // conformant client including this one) retransmits the same request
+    // over it once established. So this run's own request *does* reach the
+    // upstream again, but safely: the replayed *early* data itself is
+    // never re-executed (`zero_rtt_packet_total{outcome="accepted"}` stays
+    // at 1, not 2, checked below), and the second upstream hit is the
+    // legitimate 1-RTT fallback response, not a duplicate of the first.
+    var replay = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/safe",
+        .session_file = replay_b_sess,
+        .tp_file = replay_b_tp,
+    });
+    defer replay.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(replay.outcome));
+    try assertContains(replay.stderr, "[:status: 200]");
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+
+    var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer metrics.deinit();
+    // The replay-specific typed outcome, not a generic ticket/key miss.
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""}, 1);
+    // Exactly one *early* execution across both attempts -- the replay was
+    // never itself accepted as 0-RTT (the second upstream hit above came
+    // from the safe 1-RTT fallback, proven independently here).
+    try std.testing.expectEqual(@as(u64, 1), prometheusLabeledMetricValue(metrics.body, "tardigrade_quic_zero_rtt_packet_total", &.{"outcome=\"accepted\""}) orelse 0);
+
+    // The otherwise-valid connection remains usable for an ordinary,
+    // non-early 1-RTT H3 request afterward (an explicit, separate
+    // reconnect, distinct from the automatic in-connection fallback above).
+    var fallback = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/safe",
+        .session_file = sess_path,
+        .tp_file = tp_path,
+        .disable_early_data = true,
+    });
+    defer fallback.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(fallback.outcome));
+    try assertContains(fallback.stderr, "[:status: 200]");
+    try std.testing.expectEqual(@as(u32, 3), upstream.requestCount());
+}
 
 test "interop.openssl.h1.resume" {
     try requireNativeTlsProfile();

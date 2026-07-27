@@ -22,6 +22,74 @@ Matrix (`run-interop.sh`):
 | 5 | native `h3_interop_tool` | aioquic             | optional |
 | 6 | aioquic               | native `h3_interop_tool` | optional |
 
+## #522: production resumption/0-RTT interop
+
+The matrix above proves baseline wire interoperability against the direct
+`Tls13Backend -> quic.Connection -> H3.Conn` harness (`h3_interop_tool`
+server mode). It does **not** exercise resumption, 0-RTT, or the shared
+HTTP early-data safety policy — those require the real production
+`http3_runtime.Runtime` composition (native resumption runtime,
+process-local replay gate, HTTP early-data policy engine), which only the
+actual Tardigrade edge-gateway binary assembles.
+
+`tests/integration.zig`'s `h3interop.quic.*` cases (run via
+`zig build test-integration-resumption-interop`, same step as the
+`interop.openssl.*`/`restart.*`/`soak.*` cases — `h3interop.` contains the
+`interop.` filter substring) drive the real `tardi` binary, with
+`TARDIGRADE_HTTP3_ENABLED`/`TARDIGRADE_HTTP3_ENABLE_0RTT` set, against the
+canonical ngtcp2/GnuTLS `gtlsclient` peer — the same binary this matrix
+already builds. Point `NGTCP2_GTLSCLIENT_PATH` at it:
+
+```sh
+NGTCP2_GTLSCLIENT_PATH=/path/to/ngtcp2/build/examples/gtlsclient \
+  zig build test-integration-resumption-interop
+```
+
+Unlike the wire-interop matrix above, these cases require the **`.general`**
+TLS build profile (the default `zig build`, no `-Dtls-profile` flag): the
+appliance profile (`-Dtls-profile=appliance`) explicitly rejects
+`TARDIGRADE_HTTP3_ENABLE_0RTT` at config-validation time
+(`edge_config.zig`'s `validateApplianceTlsProfile`), and QUIC's credential
+provider (`native_tls_connection.NativeCredentialStore`) is itself only
+constructed under that profile in `edge_gateway.zig`. Cases:
+
+- `h3interop.quic.resume` — authoritative 1-RTT resumption (`tardigrade_tls_
+  resumption_outcome_total{transport="quic",outcome="accepted"}`), not
+  0-RTT.
+- `h3interop.quic.early.accepted` — a real `type=0RTT` QUIC packet accepted
+  end to end through the production H3 runtime and the shared HTTP
+  early-data policy, with a real upstream execution observed exactly once.
+- `h3interop.quic.early.unsafe_425` — a POST offered as early data is
+  425'd by the same shared HTTP-level policy H1/H2 use, before any upstream
+  side effect.
+- `h3interop.quic.early.replay_fallback` — the same early ticket replayed
+  within one process is rejected by the process-local replay gate
+  (`tardigrade_tls_early_data_replay_total{outcome="duplicate"}`), not
+  re-executed as 0-RTT, and the connection remains usable afterward.
+
+Known **not** externally reachable through today's production
+configuration surface (verified directly against the running server, not
+assumed) — see the #522 PR body for the full writeup:
+
+- **replay-store-unavailable fail-closed**: `Runtime`'s `zeroRttCarrierEnabled`
+  couples replay-gate presence directly to whether the 0-RTT carrier is
+  enabled at all, so "resumption + 0-RTT on, replay gate absent" collapses
+  to the already-deterministically-covered `.disabled`/`keys_unavailable`
+  state rather than a distinct `replay_unavailable` outcome.
+- **H3 SETTINGS incompatibility**: `edge_gateway.zig` never threads an
+  operator-facing H3-SETTINGS config surface into `Runtime.Config.h3_
+  settings`; it always uses the compiled-in defaults.
+- **QUIC transport-parameter incompatibility**: `quicConfigFrom` in
+  `http3_runtime.zig` maps only `max_datagram_size` and `zero_rtt_enabled`
+  from operator config; `initial_max_data`/stream/stream-count/
+  `active_connection_id_limit` stay at their compile-time defaults.
+
+`gtlsclient` sends the literal string `"localhost"` as TLS SNI whenever the
+connect host is a numeric IP address, regardless of `--sni` (every
+`tls_client_session_*.cc` backend in the checked-out ngtcp2 source has this
+fallback) — the test identity is registered under both names via
+`TARDIGRADE_TLS_SNI_CERTS`.
+
 ## Certificates
 
 `gen-certs.sh` produces two self-signed identities:
