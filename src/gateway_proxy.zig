@@ -950,6 +950,13 @@ fn h2ResponseToBuffered(allocator: std.mem.Allocator, h2resp: *http.upstream_h2.
 /// `read([]u8) !usize` (satisfied by both `compat.NetStream` and
 /// `*UpstreamTlsConn`). `fd` is the underlying socket used for per-phase
 /// timeout control. The caller owns connecting and closing the transport.
+fn headerValue(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+    }
+    return null;
+}
+
 fn exchangeBoundedBufferedHttpRequest(
     allocator: std.mem.Allocator,
     transport: anytype,
@@ -979,7 +986,9 @@ fn exchangeBoundedBufferedHttpRequest(
     defer req_aw.deinit();
     const req_writer = &req_aw.writer;
     var host_buf: [256]u8 = undefined;
-    const host = if (uri.host) |value| try value.toRaw(&host_buf) else "localhost";
+    const upstream_host = if (uri.host) |value| try value.toRaw(&host_buf) else "localhost";
+    const host_override = headerValue(extra_headers, "host");
+    const host = host_override orelse upstream_host;
 
     try req_writer.print("{s} {s}", .{ method, uriComponentBytes(uri.path) });
     if (uri.query) |query| {
@@ -988,7 +997,9 @@ fn exchangeBoundedBufferedHttpRequest(
     try req_writer.writeAll(" HTTP/1.1\r\n");
     // Preserve a non-default upstream port in the Host header.
     const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
-    if (uri.port) |p| {
+    if (host_override != null) {
+        try req_writer.print("Host: {s}\r\n", .{host});
+    } else if (uri.port) |p| {
         if (p != default_port) {
             try req_writer.print("Host: {s}:{d}\r\n", .{ host, p });
         } else {
@@ -1004,6 +1015,7 @@ fn exchangeBoundedBufferedHttpRequest(
         try req_writer.print("Content-Type: {s}\r\n", .{content_type});
     }
     for (extra_headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "host")) continue;
         try req_writer.print("{s}: {s}\r\n", .{ header.name, header.value });
     }
     if (body.len > 0) {
@@ -1295,6 +1307,7 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     client_ip: []const u8,
     forwarded_proto: []const u8,
     incoming_host: ?[]const u8,
+    upstream_host_override: ?[]const u8,
     auth_identity: ?[]const u8,
     auth_user_id: ?[]const u8,
     auth_device_id: ?[]const u8,
@@ -1329,6 +1342,10 @@ pub fn executeBoundedBufferedHttpProxyRequest(
     defer extra_headers.deinit();
     try extra_headers.ensureUnusedCapacity(request_headers.count() + proxy_extra_header_slack);
     try gph.appendProxyRequestHeaders(&extra_headers, request_headers);
+    if (upstream_host_override) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len > 0) try extra_headers.append(.{ .name = "Host", .value = trimmed });
+    }
     try gph.appendCanonicalEarlyDataHeader(&extra_headers, forward_early_data);
     try gph.appendRequestIdHeaders(&extra_headers, correlation_id);
     try extra_headers.append(.{ .name = "X-Forwarded-For", .value = forwarded_for.value });

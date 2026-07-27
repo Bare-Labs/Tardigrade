@@ -30,6 +30,7 @@ pub const ConnectionSlotResult = enum {
 pub const Http2PendingStream = struct {
     method: ?[]u8 = null,
     path: ?[]u8 = null,
+    authority: ?[]u8 = null,
     headers: http.Headers,
     body: std.array_list.Managed(u8),
     priority_weight: u8 = 16,
@@ -48,6 +49,7 @@ pub const Http2PendingStream = struct {
     pub fn deinit(self: *Http2PendingStream, allocator: std.mem.Allocator) void {
         if (self.method) |m| allocator.free(m);
         if (self.path) |p| allocator.free(p);
+        if (self.authority) |a| allocator.free(a);
         self.headers.deinit();
         self.body.deinit();
         self.* = undefined;

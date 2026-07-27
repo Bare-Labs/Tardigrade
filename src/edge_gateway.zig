@@ -24,6 +24,7 @@ const ghandlers = @import("gateway_handlers.zig");
 const gproxy_runtime = @import("gateway_proxy_runtime.zig");
 const gprotocol_policy = @import("gateway_protocol_policy.zig");
 const gp = @import("gateway_proxy.zig");
+const gph = @import("gateway_proxy_headers.zig");
 const ga = @import("gateway_auth.zig");
 
 // Local runtime shorthands only. Keep this list to state/types used by
@@ -2416,6 +2417,9 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                     } else if (std.mem.eql(u8, h.name, ":path")) {
                         if (ps.path) |p| allocator.free(p);
                         ps.path = try allocator.dupe(u8, h.value);
+                    } else if (std.mem.eql(u8, h.name, ":authority")) {
+                        if (ps.authority) |a| allocator.free(a);
+                        ps.authority = try allocator.dupe(u8, h.value);
                     } else if (h.name.len > 0 and h.name[0] != ':') {
                         try ps.headers.append(h.name, h.value);
                     }
@@ -2540,42 +2544,67 @@ fn respondHttp2Stream(
     if (lifecycle.checkDeadline(.headers_read)) return error.RequestTimeout;
 
     var status_code: u16 = 404;
-    var body: []const u8 = "{\"error\":\"Not Found\"}";
+    var body: []const u8 = "{\"error\":\"not_found\"}";
     var body_alloc: ?[]u8 = null;
     defer if (body_alloc) |b| allocator.free(b);
-    var content_type: []const u8 = JSON_CONTENT_TYPE;
 
-    if (try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle)) |proxy_response| {
-        var response = proxy_response;
-        defer response.deinit(allocator);
-        status_code = response.status_code;
-        if (response.headerValue("content-type")) |ct| content_type = ct;
-        body_alloc = try allocator.dupe(u8, response.body);
+    var response_headers = std.array_list.Managed(http.hpack.HeaderField).init(allocator);
+    defer response_headers.deinit();
+    var lowered_names = std.array_list.Managed([]u8).init(allocator);
+    defer {
+        for (lowered_names.items) |n| allocator.free(n);
+        lowered_names.deinit();
+    }
+    var owned_header_values = std.array_list.Managed([]u8).init(allocator);
+    defer {
+        for (owned_header_values.items) |v| allocator.free(v);
+        owned_header_values.deinit();
+    }
+
+    if (try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle)) |result| {
+        switch (result) {
+            .response => |proxy_response| {
+                var response = proxy_response;
+                defer response.deinit(allocator);
+                status_code = response.status_code;
+                body_alloc = try allocator.dupe(u8, response.body);
+                body = body_alloc.?;
+                try appendHttp2UpstreamResponseHeaders(allocator, &response_headers, &lowered_names, &owned_header_values, &response);
+            },
+            .unauthorized => {
+                status_code = 401;
+                body_alloc = try gp.buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+                body = body_alloc.?;
+                state.metricsRecordErrorCode("unauthorized");
+            },
+        }
+    }
+
+    const effective_window: i32 = @min(conn_send_window.*, stream_send_window);
+    if (body.len > @as(usize, @intCast(@max(effective_window, 0)))) {
+        status_code = 502;
+        if (body_alloc) |b| {
+            allocator.free(b);
+            body_alloc = null;
+        }
+        body_alloc = try allocator.dupe(u8, "{\"error\":\"h2_flow_control_blocked\"}");
         body = body_alloc.?;
-    } else {
-        status_code = 404;
-        body = "{\"error\":\"not_found\"}";
+        response_headers.clearRetainingCapacity();
+        for (lowered_names.items) |n| allocator.free(n);
+        lowered_names.clearRetainingCapacity();
+        for (owned_header_values.items) |v| allocator.free(v);
+        owned_header_values.clearRetainingCapacity();
     }
 
     const status_str = try std.fmt.allocPrint(allocator, "{d}", .{status_code});
     defer allocator.free(status_str);
     const len_str = try std.fmt.allocPrint(allocator, "{d}", .{body.len});
     defer allocator.free(len_str);
-
-    var response_headers = std.array_list.Managed(http.hpack.HeaderField).init(allocator);
-    defer response_headers.deinit();
-    // HTTP/2 header field names MUST be lowercase (RFC 7540 §8.1.2); a peer
-    // treats any uppercase octet as a malformed response. The pseudo-header and
-    // static names below are already lowercase, but correlation and operator-
-    // configured names may not be, so those are lowercased before encoding.
-    var lowered_names = std.array_list.Managed([]u8).init(allocator);
-    defer {
-        for (lowered_names.items) |n| allocator.free(n);
-        lowered_names.deinit();
-    }
-    try response_headers.append(.{ .name = ":status", .value = status_str });
-    try response_headers.append(.{ .name = "content-type", .value = content_type });
+    try response_headers.insert(0, .{ .name = ":status", .value = status_str });
     try response_headers.append(.{ .name = "content-length", .value = len_str });
+    if (!hasH2Header(&response_headers, "content-type")) {
+        try response_headers.append(.{ .name = "content-type", .value = JSON_CONTENT_TYPE });
+    }
     try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, http.correlation.REQUEST_HEADER_NAME), .value = correlation_id });
     try response_headers.append(.{ .name = try lowercaseName(allocator, &lowered_names, http.correlation.HEADER_NAME), .value = correlation_id });
     for (state.add_headers) |h| {
@@ -2593,16 +2622,15 @@ fn respondHttp2Stream(
         header_block,
     );
 
-    const effective_window: i32 = @min(conn_send_window.*, stream_send_window);
-    const send_len: usize = if (effective_window > 0)
-        @min(body.len, @as(usize, @intCast(effective_window)))
-    else
-        0;
-    try http.http2_frame.writeFrame(writer, .data, http.http2_frame.Flags.END_STREAM, stream_id, body[0..send_len]);
-    conn_send_window.* -= @intCast(send_len);
+    try writeHttp2DataFrames(writer, stream_id, body, conn_send_window);
 
     state.metricsRecord(status_code);
 }
+
+const Http2ProxyRouteResult = union(enum) {
+    response: gp.BufferedUpstreamResponse,
+    unauthorized,
+};
 
 fn executeHttp2ProxyRoute(
     allocator: std.mem.Allocator,
@@ -2614,28 +2642,33 @@ fn executeHttp2ProxyRoute(
     correlation_id: []const u8,
     connection_ip: []const u8,
     lifecycle: *http.request_lifecycle.RequestLifecycle,
-) !?gp.BufferedUpstreamResponse {
-    const matched = http.location_router.matchLocation(path, cfg.location_blocks) orelse return null;
+) !?Http2ProxyRouteResult {
+    var synthesized = try synthesizeHttp2Request(allocator, method, path, ps);
+    defer synthesized.deinit(allocator);
+    var request = &synthesized.request;
+
+    var effective_cfg_storage = cfg.*;
+    const route_cfg = http2RouteConfig(cfg, request, &effective_cfg_storage) orelse return null;
+
+    const matched = http.location_router.matchLocation(request.uri.path, route_cfg.location_blocks) orelse return null;
+    if (matched.block.auth == .required) return .unauthorized;
     const target = switch (matched.block.action) {
         .proxy_pass => |value| value,
         else => return null,
     };
 
-    var request = try synthesizeHttp2Request(allocator, method, path, ps);
-    defer request.deinit();
-
-    const suffix_path = gproxy_runtime.proxySuffixPathForLocation(path, matched, cfg.location_blocks);
-    const resolved = try gp.resolveProxyTarget(allocator, cfg.upstream_base_url, target, suffix_path);
+    const suffix_path = gproxy_runtime.proxySuffixPathForLocation(request.uri.path, matched, route_cfg.location_blocks);
+    const resolved = try gp.resolveProxyTarget(allocator, route_cfg.upstream_base_url, target, suffix_path);
     defer allocator.free(resolved.url);
     var upstream_url = try gp.appendProxyQueryString(allocator, resolved.url, request.uri.query);
     defer upstream_url.deinit(allocator);
 
     var ctx = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
     ctx.lifecycle = lifecycle;
-    const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
+    const forwarded_proto = if (edge_config.hasTlsFiles(route_cfg)) "https" else "http";
     var proxy_response = try gproxy_runtime.executeBufferedDataPlaneProxyRequest(
         allocator,
-        cfg,
+        route_cfg,
         upstream_url.value,
         resolved.unix_socket_path,
         request.method.toString(),
@@ -2645,14 +2678,15 @@ fn executeHttp2ProxyRoute(
         connection_ip,
         forwarded_proto,
         request.headers.get("host"),
+        request.headers.get("host"),
         null,
         null,
         null,
         null,
         false,
-        cfg.upstream_connect_timeout_ms,
-        cfg.upstream_connect_timeout_ms,
-        cfg.upstream_response_timeout_ms,
+        http2ProxyAttemptTimeoutMs(route_cfg),
+        route_cfg.upstream_connect_timeout_ms,
+        route_cfg.upstream_response_timeout_ms,
         &lifecycle.token,
         &state.upstream_pool,
         &state.h2_pool,
@@ -2666,35 +2700,143 @@ fn executeHttp2ProxyRoute(
         null,
         connection_ip,
         upstream_url.value,
-        "",
+        request.body orelse "",
         proxy_response.statusCode(),
         proxy_response.contentTypeOr("application/octet-stream"),
         proxy_response.transcriptBody(),
-        &.{},
+        if (request.headers.get("authorization")) |raw_auth|
+            if (http.auth.parseBearerToken(raw_auth)) |token| &.{token} else &.{}
+        else
+            &.{},
     );
-    return proxy_response.bounded_buffered;
+    return .{ .response = proxy_response.bounded_buffered };
 }
+
+const Http2SyntheticRequest = struct {
+    request: http.Request,
+    raw: []u8,
+
+    fn deinit(self: *Http2SyntheticRequest, allocator: std.mem.Allocator) void {
+        self.request.deinit();
+        allocator.free(self.raw);
+        self.* = undefined;
+    }
+};
 
 fn synthesizeHttp2Request(
     allocator: std.mem.Allocator,
     method: []const u8,
     path: []const u8,
     ps: *const Http2PendingStream,
-) !http.Request {
+) !Http2SyntheticRequest {
     var raw = std.array_list.Managed(u8).init(allocator);
-    defer raw.deinit();
+    errdefer raw.deinit();
     const request_line = try std.fmt.allocPrint(allocator, "{s} {s} HTTP/1.1\r\n", .{ method, path });
     defer allocator.free(request_line);
     try raw.appendSlice(request_line);
-    if (ps.headers.get("host") == null) try raw.appendSlice("Host: tardigrade.test\r\n");
+    if (ps.authority) |authority| {
+        const host_line = try std.fmt.allocPrint(allocator, "Host: {s}\r\n", .{authority});
+        defer allocator.free(host_line);
+        try raw.appendSlice(host_line);
+    } else if (ps.headers.get("host") == null) {
+        try raw.appendSlice("Host: tardigrade.test\r\n");
+    }
+    var saw_content_length = false;
     for (ps.headers.items.items) |header| {
         if (std.mem.eql(u8, header.name, "connection")) continue;
+        if (std.mem.eql(u8, header.name, "host") and ps.authority != null) continue;
+        if (std.mem.eql(u8, header.name, "content-length")) saw_content_length = true;
         const line = try std.fmt.allocPrint(allocator, "{s}: {s}\r\n", .{ header.name, header.value });
         defer allocator.free(line);
         try raw.appendSlice(line);
     }
+    if (ps.body.items.len > 0 and !saw_content_length) {
+        const line = try std.fmt.allocPrint(allocator, "Content-Length: {d}\r\n", .{ps.body.items.len});
+        defer allocator.free(line);
+        try raw.appendSlice(line);
+    }
     try raw.appendSlice("\r\n");
-    return (try http.Request.parse(allocator, raw.items, MAX_REQUEST_SIZE)).request;
+    try raw.appendSlice(ps.body.items);
+    const owned_raw = try raw.toOwnedSlice();
+    errdefer allocator.free(owned_raw);
+    const parsed = try http.Request.parse(allocator, owned_raw, MAX_REQUEST_SIZE);
+    return .{
+        .request = parsed.request,
+        .raw = owned_raw,
+    };
+}
+
+fn http2RouteConfig(
+    cfg: *const edge_config.EdgeConfig,
+    request: *const http.Request,
+    storage: *edge_config.EdgeConfig,
+) ?*const edge_config.EdgeConfig {
+    if (ga.resolveRequestConfig(cfg, request.headers.get("host"), storage)) |effective_cfg| {
+        if (ga.hostMatchesServerNames(effective_cfg, request)) return effective_cfg;
+    }
+    if (cfg.location_blocks.len > 0) return cfg;
+    if (cfg.server_blocks.len == 1) {
+        storage.* = cfg.*;
+        const block = &cfg.server_blocks[0];
+        storage.server_names = block.server_names;
+        if (block.doc_root.len > 0) storage.doc_root = block.doc_root;
+        if (block.try_files.len > 0) storage.try_files = block.try_files;
+        if (block.location_blocks.len > 0) storage.location_blocks = block.location_blocks;
+        if (block.tls_cert_path.len > 0) storage.tls_cert_path = block.tls_cert_path;
+        if (block.tls_key_path.len > 0) storage.tls_key_path = block.tls_key_path;
+        if (block.upstream_base_url.len > 0) storage.upstream_base_url = block.upstream_base_url;
+        return storage;
+    }
+    return null;
+}
+
+fn http2ProxyAttemptTimeoutMs(cfg: *const edge_config.EdgeConfig) u32 {
+    if (cfg.upstream_timeout_budget_ms == 0) return cfg.upstream_timeout_ms;
+    return @intCast(@min(@as(u64, cfg.upstream_timeout_ms), cfg.upstream_timeout_budget_ms));
+}
+
+fn hasH2Header(headers: *const std.array_list.Managed(http.hpack.HeaderField), name: []const u8) bool {
+    for (headers.items) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return true;
+    }
+    return false;
+}
+
+fn appendHttp2UpstreamResponseHeaders(
+    allocator: std.mem.Allocator,
+    headers: *std.array_list.Managed(http.hpack.HeaderField),
+    lowered_names: *std.array_list.Managed([]u8),
+    owned_values: *std.array_list.Managed([]u8),
+    response: *const gp.BufferedUpstreamResponse,
+) !void {
+    for (response.headers) |header| {
+        if (gph.shouldSkipUpstreamResponseHeader(header.name)) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+        const name = try lowercaseName(allocator, lowered_names, header.name);
+        const value = try allocator.dupe(u8, header.value);
+        errdefer allocator.free(value);
+        try owned_values.append(value);
+        try headers.append(.{ .name = name, .value = value });
+    }
+}
+
+fn writeHttp2DataFrames(writer: anytype, stream_id: u31, body: []const u8, conn_send_window: *i32) !void {
+    const max_data_frame: usize = HTTP2_MAX_FRAME_SIZE;
+    if (body.len == 0) {
+        try http.http2_frame.writeFrame(writer, .data, http.http2_frame.Flags.END_STREAM, stream_id, &.{});
+        return;
+    }
+    var offset: usize = 0;
+    while (offset < body.len) {
+        const remaining_window: usize = @intCast(@max(conn_send_window.*, 0));
+        const n = @min(@min(max_data_frame, remaining_window), body.len - offset);
+        if (n == 0) return error.Http2FlowControlBlocked;
+        const end = offset + n;
+        const flags: u8 = if (end == body.len) http.http2_frame.Flags.END_STREAM else 0;
+        try http.http2_frame.writeFrame(writer, .data, flags, stream_id, body[offset..end]);
+        conn_send_window.* -= @intCast(n);
+        offset = end;
+    }
 }
 
 fn pushHttp2Resource(
