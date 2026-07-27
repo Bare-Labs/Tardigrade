@@ -2548,6 +2548,84 @@ fn opensslEarlyDataPath(allocator: std.mem.Allocator, port: u16, tag: []const u8
     return std.fmt.allocPrint(allocator, "{s}/interop-{s}-{d}.early", .{ dir, tag, port });
 }
 
+fn opensslH2GetRequestBytes(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const request_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const request_block = try hpack.encodeLiteralHeaderBlock(allocator, request_headers[0..]);
+    defer allocator.free(request_block);
+
+    var bytes = std.array_list.Managed(u8).init(allocator);
+    errdefer bytes.deinit();
+    try bytes.appendSlice("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try appendHttp2Frame(&bytes, 0x4, 0, 0, &.{}); // client SETTINGS
+    try appendHttp2Frame(&bytes, 0x4, 0x1, 0, &.{}); // SETTINGS ACK
+    try appendHttp2Frame(&bytes, 0x1, 0x1 | 0x4, 1, request_block); // END_STREAM | END_HEADERS
+    return bytes.toOwnedSlice();
+}
+
+fn appendHttp2Frame(bytes: *std.array_list.Managed(u8), typ: u8, flags: u8, stream_id: u31, payload: []const u8) !void {
+    var header: [9]u8 = undefined;
+    header[0] = @intCast((payload.len >> 16) & 0xff);
+    header[1] = @intCast((payload.len >> 8) & 0xff);
+    header[2] = @intCast(payload.len & 0xff);
+    header[3] = typ;
+    header[4] = flags;
+    std.mem.writeInt(u32, header[5..9], @as(u32, stream_id) & 0x7fff_ffff, .big);
+    try bytes.appendSlice(header[0..]);
+    try bytes.appendSlice(payload);
+}
+
+fn expectOpenSslH2ResponseBody(allocator: std.mem.Allocator, stdout: []const u8, expected_body: []const u8) !void {
+    var offset: usize = 0;
+    while (offset + 9 <= stdout.len) : (offset += 1) {
+        var response_body = std.array_list.Managed(u8).init(allocator);
+        defer response_body.deinit();
+        if (parseOpenSslH2Frames(stdout[offset..], &response_body) catch false) {
+            try assertContains(response_body.items, expected_body);
+            return;
+        }
+    }
+    return error.H2ResponseNotFound;
+}
+
+fn parseOpenSslH2Frames(bytes: []const u8, response_body: *std.array_list.Managed(u8)) !bool {
+    var pos: usize = 0;
+    var saw_settings = false;
+    var saw_response_headers = false;
+    var frame_count: usize = 0;
+    while (pos + 9 <= bytes.len and frame_count < 12) : (frame_count += 1) {
+        const len = (@as(usize, bytes[pos]) << 16) | (@as(usize, bytes[pos + 1]) << 8) | @as(usize, bytes[pos + 2]);
+        if (len > 16 * 1024 or pos + 9 + len > bytes.len) return false;
+        const typ = bytes[pos + 3];
+        const flags = bytes[pos + 4];
+        const stream_id = std.mem.readInt(u32, bytes[pos + 5 ..][0..4], .big) & 0x7fff_ffff;
+        const payload = bytes[pos + 9 .. pos + 9 + len];
+        pos += 9 + len;
+
+        switch (typ) {
+            0x4 => {
+                if (stream_id != 0) return false;
+                if ((flags & 0x1) == 0) saw_settings = true;
+            },
+            0x1 => {
+                if (stream_id == 1) saw_response_headers = true;
+            },
+            0x0 => {
+                if (stream_id == 1) {
+                    try response_body.appendSlice(payload);
+                    if ((flags & 0x1) != 0) return saw_settings and saw_response_headers;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 fn writeInteropSecretFile(path: []const u8, data: []const u8) !void {
     var file = try compat.cwd().createFile(path, .{
         .truncate = true,
@@ -2905,21 +2983,6 @@ test "interop.openssl.h1.early.replay_fallback" {
     try expectMetricAtLeast(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"record\"", "outcome=\"accepted\"" }, 2);
 }
 
-// Named `h2.tls_resume`, not `h2.resume`: this proves TLS-layer PSK
-// resumption under the h2 ALPN path -- handshake, ticket capture/offer, and
-// the resumed connection negotiating h2 again -- but never sends an H2
-// frame/request on the resumed connection, so it cannot detect a bug that
-// affects H2 dispatch only *after* resumption. Real application-level
-// resumed-H2 interop (one actual external H2 request/response driven over
-// a resumed connection) is intentionally left in the deferred matrix (see
-// docs/RESUMPTION_TEST_PLAN.md) rather than claimed proven here --
-// hand-rolling HPACK/frame encoding through raw `openssl s_client` stdin,
-// or sourcing an H2-capable peer for it, is real, separate work. H1 above
-// proves resumption carries a real served request end to end at the
-// protocol Tardigrade's own test infrastructure can drive directly;
-// production H2 dispatch itself has its own independent coverage
-// (`tests/integration.zig`'s "native TLS listener dispatches ALPN h2..."
-// suite), just not combined with resumption.
 test "interop.openssl.h2.tls_resume" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
@@ -2928,12 +2991,26 @@ test "interop.openssl.h2.tls_resume" {
     var tls_paths = try nativeTlsFixturePaths(allocator);
     defer tls_paths.deinit();
 
-    var tardigrade = try TardigradeProcess.start(allocator, .{
-        .config_text =
-        \\location = /healthz {
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "resumed-h2-upstream-body-521",
+        .connection_header = "close",
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
         \\    return 200 alive;
-        \\}
-        ,
+        \\}}
+        \\
+        \\location = /h2-resume {{
+        \\    proxy_pass http://{s}:{d}/h2-resume;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
         .ready_https_insecure = true,
         .ready_path = "/healthz",
         .extra_env = &.{
@@ -2962,24 +3039,42 @@ test "interop.openssl.h2.tls_resume" {
     try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
     try assertContains(first.stdout, "New, TLSv1.3");
     try assertContains(first.stdout, "ALPN protocol: h2");
+    try upstream.resetCapture();
+
+    var before_metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer before_metrics.deinit();
+    const accepted_before = prometheusLabeledMetricValue(before_metrics.body, "tardigrade_tls_resumption_outcome_total", &.{
+        "transport=\"record\"",
+        "outcome=\"accepted\"",
+    }) orelse 0;
+
+    const h2_request = try opensslH2GetRequestBytes(allocator, "/h2-resume");
+    defer allocator.free(h2_request);
 
     var second = try runOpenssl(allocator, &.{
         "s_client",        "-connect", connect_arg,
         "-alpn",           "h2",       "-servername",
         "tardigrade.test", "-tls1_3",  "-sess_in",
         sess_path,
-    }, "", 10_000);
+    }, h2_request, 10_000);
     defer second.deinit(allocator);
     try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(second.outcome));
     try assertContains(second.stdout, "Reused, TLSv1.3");
     try assertContains(second.stdout, "ALPN protocol: h2");
+    try expectOpenSslH2ResponseBody(allocator, second.stdout, "resumed-h2-upstream-body-521");
+    try waitForUpstreamCount(&upstream, 1, 2_000);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+    const resumed_path = try upstream.capturedPathHistoryAt(allocator, 0);
+    defer allocator.free(resumed_path);
+    try std.testing.expectEqualStrings("/h2-resume", resumed_path);
 
     var h2_metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
     defer h2_metrics.deinit();
-    try std.testing.expect((prometheusLabeledMetricValue(h2_metrics.body, "tardigrade_tls_resumption_outcome_total", &.{
+    const accepted_after = prometheusLabeledMetricValue(h2_metrics.body, "tardigrade_tls_resumption_outcome_total", &.{
         "transport=\"record\"",
         "outcome=\"accepted\"",
-    }) orelse 0) >= 1);
+    }) orelse 0;
+    try std.testing.expect(accepted_after >= accepted_before + 1);
 }
 
 test "interop.openssl.ticket.expired" {
@@ -3205,14 +3300,15 @@ test "interop.openssl.alpn_mismatch" {
     }) orelse 0);
 }
 
-// #369: `-ciphersuites` on the client only restricts what it offers, so the
-// server should have no other option but to negotiate the client's sole
-// offered suite -- but ad hoc verification against the real native listener
-// still observed the *original* cipher on the reconnect despite the client
-// restricting itself to a different one, which needs its own investigation
-// before a test can assert on it honestly. Deferred rather than shipped as
-// a test that would silently stop proving anything if that behavior is
-// itself a bug; see docs/RESUMPTION_TEST_PLAN.md.
+// #369/#521: a resumption-specific external cipher mismatch is unreachable
+// through the production native TLS listener today. The native profile only
+// advertises TLS_AES_128_GCM_SHA256, and cipher negotiation completes before
+// PSK/session compatibility evaluation. If the client still offers that suite,
+// there is no mismatch; if the client excludes it, the ordinary handshake fails
+// before a stored session can reach `session.evaluateCompatibility`. Keep the
+// deterministic `ResumeMismatch.cipher_suite_mismatch` coverage in
+// `src/tls/session.zig`, but do not add a test-only second cipher or mutate
+// protected session state solely to force an impossible external row.
 
 fn containsSubstring(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;

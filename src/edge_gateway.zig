@@ -2255,6 +2255,7 @@ fn h2DispatchReadyStreams(
     ready_streams: *std.array_list.Managed(u31),
     next_server_stream_id: *u31,
     conn_send_window: *i32,
+    connection_ip: []const u8,
 ) !void {
     if (ready_streams.items.len == 0) return;
 
@@ -2297,7 +2298,7 @@ fn h2DispatchReadyStreams(
             state.metricsRecordEarlyDataDecision(.h2, .accepted);
         }
 
-        try respondHttp2Stream(conn.writer(), allocator, state, cfg, sid, ps, next_server_stream_id, conn_send_window, stream_send);
+        try respondHttp2Stream(conn.writer(), allocator, state, cfg, sid, ps, next_server_stream_id, conn_send_window, stream_send, connection_ip);
         ps.dispatch_count += 1;
         if (pending.fetchRemove(sid)) |removed| {
             var tmp = removed.value;
@@ -2309,7 +2310,6 @@ fn h2DispatchReadyStreams(
 
 fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const edge_config.EdgeConfig, state: *GatewayState, connection_ip: []const u8) !void {
     _ = session;
-    _ = connection_ip;
     var preface: [HTTP2_PREFACE.len]u8 = undefined;
     try readExactConn(conn, preface[0..]);
     if (!std.mem.eql(u8, preface[0..], HTTP2_PREFACE)) return error.InvalidHttp2Preface;
@@ -2353,6 +2353,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             &ready_streams,
             &next_server_stream_id,
             &conn_send_window,
+            connection_ip,
         );
 
         if (h2HasDeferredReadyStreams(&pending, &ready_streams) and !h2DownstreamHandshakeComplete(conn)) {
@@ -2367,6 +2368,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                 &ready_streams,
                 &next_server_stream_id,
                 &conn_send_window,
+                connection_ip,
             );
             if (ready_streams.items.len == 0) continue;
         }
@@ -2488,6 +2490,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
             &ready_streams,
             &next_server_stream_id,
             &conn_send_window,
+            connection_ip,
         );
     }
 }
@@ -2522,6 +2525,7 @@ fn respondHttp2Stream(
     next_server_stream_id: *u31,
     conn_send_window: *i32,
     stream_send_window: i32,
+    connection_ip: []const u8,
 ) !void {
     _ = next_server_stream_id;
     const method = ps.method orelse return error.InvalidHttp2Request;
@@ -2537,15 +2541,21 @@ fn respondHttp2Stream(
 
     var status_code: u16 = 404;
     var body: []const u8 = "{\"error\":\"Not Found\"}";
-    const body_alloc: ?[]u8 = null;
+    var body_alloc: ?[]u8 = null;
     defer if (body_alloc) |b| allocator.free(b);
-    const content_type: []const u8 = JSON_CONTENT_TYPE;
+    var content_type: []const u8 = JSON_CONTENT_TYPE;
 
-    _ = method;
-    _ = path;
-
-    status_code = 404;
-    body = "{\"error\":\"not_found\"}";
+    if (try executeHttp2ProxyRoute(allocator, state, cfg, method, path, ps, correlation_id, connection_ip, &lifecycle)) |proxy_response| {
+        var response = proxy_response;
+        defer response.deinit(allocator);
+        status_code = response.status_code;
+        if (response.headerValue("content-type")) |ct| content_type = ct;
+        body_alloc = try allocator.dupe(u8, response.body);
+        body = body_alloc.?;
+    } else {
+        status_code = 404;
+        body = "{\"error\":\"not_found\"}";
+    }
 
     const status_str = try std.fmt.allocPrint(allocator, "{d}", .{status_code});
     defer allocator.free(status_str);
@@ -2592,6 +2602,99 @@ fn respondHttp2Stream(
     conn_send_window.* -= @intCast(send_len);
 
     state.metricsRecord(status_code);
+}
+
+fn executeHttp2ProxyRoute(
+    allocator: std.mem.Allocator,
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    method: []const u8,
+    path: []const u8,
+    ps: *const Http2PendingStream,
+    correlation_id: []const u8,
+    connection_ip: []const u8,
+    lifecycle: *http.request_lifecycle.RequestLifecycle,
+) !?gp.BufferedUpstreamResponse {
+    const matched = http.location_router.matchLocation(path, cfg.location_blocks) orelse return null;
+    const target = switch (matched.block.action) {
+        .proxy_pass => |value| value,
+        else => return null,
+    };
+
+    var request = try synthesizeHttp2Request(allocator, method, path, ps);
+    defer request.deinit();
+
+    const suffix_path = gproxy_runtime.proxySuffixPathForLocation(path, matched, cfg.location_blocks);
+    const resolved = try gp.resolveProxyTarget(allocator, cfg.upstream_base_url, target, suffix_path);
+    defer allocator.free(resolved.url);
+    var upstream_url = try gp.appendProxyQueryString(allocator, resolved.url, request.uri.query);
+    defer upstream_url.deinit(allocator);
+
+    var ctx = http.request_context.RequestContext.init(allocator, correlation_id, connection_ip);
+    ctx.lifecycle = lifecycle;
+    const forwarded_proto = if (edge_config.hasTlsFiles(cfg)) "https" else "http";
+    var proxy_response = try gproxy_runtime.executeBufferedDataPlaneProxyRequest(
+        allocator,
+        cfg,
+        upstream_url.value,
+        resolved.unix_socket_path,
+        request.method.toString(),
+        &request.headers,
+        request.body orelse "",
+        correlation_id,
+        connection_ip,
+        forwarded_proto,
+        request.headers.get("host"),
+        null,
+        null,
+        null,
+        null,
+        false,
+        cfg.upstream_connect_timeout_ms,
+        cfg.upstream_connect_timeout_ms,
+        cfg.upstream_response_timeout_ms,
+        &lifecycle.token,
+        &state.upstream_pool,
+        &state.h2_pool,
+    );
+    errdefer proxy_response.deinit(allocator);
+    ctx.setUpstreamResult(resolved.upstream_host, proxy_response.statusCode(), proxy_response.bodyLen());
+    state.appendTranscript(
+        gs.upstreamScopeName(gs.proxyScopeForPath(request.uri.path)),
+        request.uri.path,
+        correlation_id,
+        null,
+        connection_ip,
+        upstream_url.value,
+        "",
+        proxy_response.statusCode(),
+        proxy_response.contentTypeOr("application/octet-stream"),
+        proxy_response.transcriptBody(),
+        &.{},
+    );
+    return proxy_response.bounded_buffered;
+}
+
+fn synthesizeHttp2Request(
+    allocator: std.mem.Allocator,
+    method: []const u8,
+    path: []const u8,
+    ps: *const Http2PendingStream,
+) !http.Request {
+    var raw = std.array_list.Managed(u8).init(allocator);
+    defer raw.deinit();
+    const request_line = try std.fmt.allocPrint(allocator, "{s} {s} HTTP/1.1\r\n", .{ method, path });
+    defer allocator.free(request_line);
+    try raw.appendSlice(request_line);
+    if (ps.headers.get("host") == null) try raw.appendSlice("Host: tardigrade.test\r\n");
+    for (ps.headers.items.items) |header| {
+        if (std.mem.eql(u8, header.name, "connection")) continue;
+        const line = try std.fmt.allocPrint(allocator, "{s}: {s}\r\n", .{ header.name, header.value });
+        defer allocator.free(line);
+        try raw.appendSlice(line);
+    }
+    try raw.appendSlice("\r\n");
+    return (try http.Request.parse(allocator, raw.items, MAX_REQUEST_SIZE)).request;
 }
 
 fn pushHttp2Resource(
@@ -4861,6 +4964,7 @@ test "H2 deferred ready stream wakes on handshake completion without extra H2 fr
         &ready,
         &next_server_stream_id,
         &conn_send_window,
+        "127.0.0.1",
     );
     try std.testing.expect(pending.contains(1));
     try std.testing.expectEqual(@as(u8, 0), pending.get(1).?.dispatch_count);
@@ -4876,6 +4980,7 @@ test "H2 deferred ready stream wakes on handshake completion without extra H2 fr
         &ready,
         &next_server_stream_id,
         &conn_send_window,
+        "127.0.0.1",
     );
 
     try std.testing.expectEqual(@as(usize, 1), conn.wait_calls);
@@ -4931,6 +5036,7 @@ test "H2 early stream defers dispatch until handshake completion then dispatches
         &ready,
         &next_server_stream_id,
         &conn_send_window,
+        "127.0.0.1",
     );
 
     try std.testing.expect(pending.contains(1));
@@ -4949,6 +5055,7 @@ test "H2 early stream defers dispatch until handshake completion then dispatches
         &ready,
         &next_server_stream_id,
         &conn_send_window,
+        "127.0.0.1",
     );
 
     try std.testing.expect(!pending.contains(1));
@@ -5007,6 +5114,7 @@ test "H2 ordinary stream dispatch remains unchanged" {
         &ready,
         &next_server_stream_id,
         &conn_send_window,
+        "127.0.0.1",
     );
 
     try std.testing.expect(!pending.contains(3));
