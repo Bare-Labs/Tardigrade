@@ -2620,11 +2620,62 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
     try testing.expectEqual(@as(usize, 2), handler_state.executed_local);
     try testing.expectEqualStrings("POST", handler_state.last_method_buf[0..handler_state.last_method_len]);
     try testing.expectEqual(@as(usize, 1), handler_state.rejected_too_early);
+
+    // Handler counters only prove the local dispatch/rejection decision —
+    // decode the actual bytes `client2` received on the wire to prove the
+    // responses themselves were transmitted: the safe GET's 200 on stream
+    // 40, and — the specific proof this review round required — the
+    // unsafe POST's 425 on stream 44, showing the queued early-rejection
+    // response genuinely reached the client once 1-RTT became
+    // send-capable, not just that a counter was incremented server-side.
+    try expectH3ResponseStatusForTest(client2, 40, "200");
+    try expectH3ResponseStatusForTest(client2, 44, "425");
+}
+
+/// #523 test-only: read a stream to EOF-of-buffer and decode its first H3
+/// frame as a QPACK HEADERS block, asserting `:status` matches `expected`.
+fn expectH3ResponseStatusForTest(conn: *Connection, stream_id: quic.stream.StreamId, expected_status: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    const result = try conn.readStream(stream_id, &buf);
+    const raw = try http3.frame.decodeFrame(buf[0..result.len]);
+    try testing.expectEqual(http3.frame.FrameType.headers, raw.typ);
+
+    var fields: [8]http3.qpack.HeaderField = undefined;
+    var scratch: [256]u8 = undefined;
+    const count = try http3.qpack.decode(raw.payload, &fields, &scratch);
+    for (fields[0..count]) |field| {
+        if (std.mem.eql(u8, field.name, ":status")) {
+            try testing.expectEqualStrings(expected_status, field.value);
+            return;
+        }
+    }
+    return error.MissingStatusField;
 }
 
 const H3EarlyDataRejectionScenario = struct {
-    replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
+    // Always an installed, decideFn-non-null gate — never absent. Production
+    // `accept()` always wires a real gate (`zeroRttCarrierEnabled` refuses
+    // to enable 0-RTT at all otherwise); modeling "the replay store is
+    // unavailable" as literally no gate installed would test a composition
+    // that can never occur in production. An operationally-unavailable
+    // store is instead a real, installed gate whose `decide` always returns
+    // `.unavailable` (see the replay-store-unavailable test below).
+    replay_gate: tls_core.tls13_backend.EarlyDataReplayGate,
     mutate: *const fn (*Runtime) void,
+    // The H3 SETTINGS snapshot `backend1` remembers into the ticket at
+    // issuance time. Defaults to `.{}`, matching the runtime's own (always
+    // default — see below) live `h3_settings` exactly, so every scenario
+    // except the application-incompatible one is fully app-compatible and
+    // isolates its own specific rejection reason. The application-
+    // incompatible scenario overrides this to a *stricter remembered*
+    // value instead of reducing the runtime's *live* settings: phase 2's
+    // H3 session is initialized with `runtime.h3_settings` (mirroring
+    // `accept()`), and that must stay within
+    // `validateLocallySupportedSettings`'s bounds or the H3 session never
+    // starts at all (see "H3 conn: start rejects unsupported
+    // max_field_section_size" in `src/http3/conn.zig`) — silently breaking
+    // the same-connection 1-RTT fallback this whole matrix is proving.
+    remembered_app_settings: http3.frame.Settings = .{},
     expect_decision: metrics_mod.QuicEarlyDataDecision,
 };
 
@@ -2632,22 +2683,6 @@ fn h3EarlyDataRejectionNoMutation(_: *Runtime) void {}
 
 fn h3EarlyDataRejectionReduceTransportLimit(runtime: *Runtime) void {
     runtime.quic_config.initial_max_streams_bidi -= 1;
-}
-
-fn h3EarlyDataRejectionReduceSettingsLimit(runtime: *Runtime) void {
-    // `remembered` (baked into the ticket at issuance, when this field was
-    // still `null`) vs `current` (this, read live at gate-consult time):
-    // `early_data.limitCompatible` requires a null-remembered limit to stay
-    // null — introducing one where none existed before is itself the
-    // "incompatible" transition (see `src/http3/early_data.zig`). All of
-    // this codebase's *other* H3 SETTINGS fields default to `0`/`false`,
-    // which `early_data.zig`'s own compatibility rules for those fields
-    // treat as vacuously compatible (`qpackMaxTableCompatible` short-
-    // circuits `remembered == 0`; `qpack_blocked_streams`/booleans only
-    // reject a *regression* from a already-nonzero/true remembered value) —
-    // so this is the only field that can actually produce
-    // `.settings_incompatible` from this runtime's always-default settings.
-    runtime.h3_settings.max_field_section_size = 1024;
 }
 
 /// Shared production-shaped scaffold for #523's "0-RTT rejected -> same
@@ -2700,6 +2735,17 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
     };
     var decision_capture = DecisionCapture{};
 
+    const PacketCapture = struct {
+        count: usize = 0,
+        last: ?metrics_mod.QuicZeroRttPacketOutcome = null,
+        fn onPacket(ctx: *anyopaque, outcome: metrics_mod.QuicZeroRttPacketOutcome) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            self.last = outcome;
+        }
+    };
+    var packet_capture = PacketCapture{};
+
     // `quicConfigFrom`/`zeroRttCarrierEnabled` require a replay gate present
     // on the *runtime's own* config before they'll consider 0-RTT usable at
     // all (see the "enable_0rtt alone never enables the 0-RTT carrier" unit
@@ -2724,6 +2770,8 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .request_handler_ctx = &handler_state,
         .quic_early_data_decision_metrics_ctx = &decision_capture,
         .quic_early_data_decision_metrics_cb = DecisionCapture.onDecision,
+        .quic_zero_rtt_packet_metrics_ctx = &packet_capture,
+        .quic_zero_rtt_packet_metrics_cb = PacketCapture.onPacket,
     });
     defer runtime.deinit();
     try testing.expect(runtime.zero_rtt_enabled);
@@ -2784,15 +2832,23 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
     try client_backend.setResumeCompatibilityPolicy(resume_policy);
     try backend1.setResumeCompatibilityPolicy(resume_policy);
     // Mirror production `accept()`'s installation of the H3 application
-    // compat snapshot at ticket-issuance time using the runtime's own
-    // precomputed bytes — without this, the ticket has no remembered
-    // application state at all, and a scenario meant to isolate one
-    // specific rejection reason could actually be passing for a different
-    // one (`application_incompatible` via `missing_state`) instead.
+    // compat snapshot at ticket-issuance time — without this, the ticket
+    // has no remembered application state at all, and a scenario meant to
+    // isolate one specific rejection reason could actually be passing for a
+    // different one (`application_incompatible` via `missing_state`)
+    // instead. Encoded fresh from `scenario.remembered_app_settings` rather
+    // than reusing `runtime.h3_application_compat` directly: every scenario
+    // but the application-incompatible one leaves this at `.{}`, which
+    // encodes identically to the runtime's own default `h3_settings`, so
+    // this is a distinction without a difference for them — but the
+    // application-incompatible scenario needs a *stricter remembered*
+    // snapshot than the (always locally-supported-default) live settings.
+    var remembered_app_compat_buf: [http3.early_data.encoded_snapshot_len]u8 = undefined;
+    const remembered_app_compat_bytes = try http3.early_data.encodeSettingsSnapshot(scenario.remembered_app_settings, &remembered_app_compat_buf);
     try backend1.setEarlyDataApplicationCompat(.{
         .format_id = http3.early_data.format_id,
         .format_version = http3.early_data.format_version,
-        .bytes = runtime.h3_application_compat[0..runtime.h3_application_compat_len],
+        .bytes = remembered_app_compat_bytes,
     });
 
     const client1 = try Connection.init(allocator, .{
@@ -2908,10 +2964,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
     );
     try backend2.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
     try backend2.setServerPskResolver(resumption.serverResolver().?);
-    // `null` deliberately leaves no replay gate installed at all — the
-    // backend's own default gate fails closed (`.replay_unavailable`) for
-    // every attempt, exercising that fail-closed default itself.
-    if (scenario.replay_gate) |gate| try backend2.setEarlyDataReplayGate(gate);
+    try backend2.setEarlyDataReplayGate(scenario.replay_gate);
     try backend2.setServerEarlyDataPolicy(.{ .enabled = true });
     try backend2.setEarlyDataCompatibilityGate(.{ .ctx = &runtime, .decideFn = Runtime.h3EarlyDataCompatibility });
 
@@ -2941,7 +2994,11 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
     var entry2 = ConnEntry{
         .backend = backend2,
         .conn = server_conn2,
-        .h3 = H3.initWithSettings(allocator, .server, .{}),
+        // Mirrors `accept()`'s `self.h3_settings` (line ~585) — for the
+        // application-incompatible scenario, `scenario.mutate` just changed
+        // this live value, so phase 2's actual H3 session must run under
+        // those same (mutated) SETTINGS, not silently fall back to defaults.
+        .h3 = H3.initWithSettings(allocator, .server, runtime.h3_settings),
         .admission_source_ip = 0,
         .cid_len = odcid.len,
         .accepted_at_us = 2_000_000,
@@ -2962,6 +3019,31 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
     try testing.expect(entry2.conn.adapter.protectionKeys(.zero_rtt, .read) == null);
     try testing.expectEqual(@as(usize, 1), decision_capture.count);
     try testing.expectEqual(scenario.expect_decision, decision_capture.last.?);
+
+    // Prove rejection actually suppresses early delivery, not just that no
+    // read key exists: the client's own TLS engine still derives and would
+    // use a real 0-RTT write secret regardless of what the server's gate
+    // decides (it can't know the decision in advance) — extract that real
+    // secret and seal a genuine QPACK-encoded H3 GET as an early 0-RTT
+    // packet, exactly as a real client attempting (and having rejected)
+    // early data would send. The server can't have a matching read key (see
+    // above), so this must be dropped as `keys_unavailable` before ever
+    // reaching the frame/H3 layer — not merely "no packet was sent".
+    {
+        const client_write_secret = client2.adapter.secret(.zero_rtt, .write).?.slice()[0..quic.tls_adapter.traffic_secret_len].*;
+        var early_h3: [128]u8 = undefined;
+        const early_bytes = buildH3RequestBytesForTest("GET", "/early-after-rejection", "example.com", &early_h3);
+        var early_frame_buf: [160]u8 = undefined;
+        const early_frame_len = try quic.frame.encodeStream(40, 0, early_bytes, true, &early_frame_buf);
+        var early_wire: [512]u8 = undefined;
+        const early_datagram = sealZeroRttPacketForTest(&odcid, &client_cid, client_write_secret, 0, early_frame_buf[0..early_frame_len], &early_wire);
+        try entry2.conn.ingestOnPath(early_datagram, server_path, no_challenge, 2_000_000);
+        runtime.pumpH3(&entry2, 2_000_000);
+    }
+    try testing.expectEqual(@as(usize, 1), packet_capture.count);
+    try testing.expectEqual(metrics_mod.QuicZeroRttPacketOutcome.keys_unavailable, packet_capture.last.?);
+    try testing.expectEqual(@as(usize, 0), handler_state.executed_local);
+    try testing.expectEqual(@as(usize, 0), handler_state.rejected_too_early);
 
     // The rest of the handshake completes normally as ordinary 1-RTT
     // resumption on this *same* connection — rejection is strictly an
@@ -3029,8 +3111,19 @@ test "http3 (#523): replay-rejected 0-RTT falls back to a real H3 request over 1
 }
 
 test "http3 (#523): replay-store-unavailable 0-RTT falls back to a real H3 request over 1-RTT, same connection" {
+    // Models an operationally-unavailable replay store (e.g. the process
+    // shared store failing open a lookup) as a real, installed gate whose
+    // `decide` always reports `.unavailable` — not the absence of a gate,
+    // which `zeroRttCarrierEnabled` never lets a production composition
+    // reach in the first place.
+    const AlwaysUnavailable = struct {
+        fn decide(_: *anyopaque, _: tls_core.tls13_backend.EarlyDataReplayCandidate) tls_core.tls13_backend.EarlyDataReplayDecision {
+            return .unavailable;
+        }
+    };
+    var replay_ctx: u8 = 0;
     try expectH3EarlyDataRejectionFallsBackToRealRequest(.{
-        .replay_gate = null,
+        .replay_gate = .{ .ctx = &replay_ctx, .decideFn = AlwaysUnavailable.decide },
         .mutate = h3EarlyDataRejectionNoMutation,
         .expect_decision = .replay_unavailable,
     });
@@ -3059,7 +3152,15 @@ test "http3 (#523): application-incompatible (H3 SETTINGS) 0-RTT rejected by the
     var replay_ctx: u8 = 0;
     try expectH3EarlyDataRejectionFallsBackToRealRequest(.{
         .replay_gate = .{ .ctx = &replay_ctx, .decideFn = AlwaysAllow.decide },
-        .mutate = h3EarlyDataRejectionReduceSettingsLimit,
+        .mutate = h3EarlyDataRejectionNoMutation,
+        // A stricter *remembered* QPACK dynamic-table capacity than the
+        // live (always-default, `qpack_max_table_capacity == 0`) settings
+        // phase 2 actually runs under: `qpackMaxTableCompatible` treats
+        // `remembered == 0` as vacuously compatible, so this field can only
+        // ever produce `.settings_incompatible` by remembering *more* than
+        // the always-zero live default — never by reducing the live side
+        // (see `H3EarlyDataRejectionScenario.remembered_app_settings`).
+        .remembered_app_settings = .{ .qpack_max_table_capacity = 4096 },
         .expect_decision = .application_incompatible,
     });
 }
