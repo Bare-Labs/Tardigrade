@@ -2516,14 +2516,24 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                             var it = streams.valueIterator();
                             while (it.next()) |s| {
                                 const adjusted: i64 = @as(i64, s.send_window) + delta;
-                                // RFC 9113 §6.9.2 allows this to go negative
-                                // (it must not be treated as an error); it
-                                // simply blocks further sends until the peer
-                                // grants more credit. It cannot itself exceed
-                                // the 2^31-1 ceiling since both operands are
-                                // already within range and delta is bounded
-                                // by two values <= 2^31-1.
-                                s.send_window = @intCast(adjusted);
+                                // RFC 9113 §6.9.2: a stream already sitting
+                                // at (or near) maxInt(i32) from a prior
+                                // WINDOW_UPDATE can still be pushed past the
+                                // 2^31-1 ceiling by a positive delta here --
+                                // that must be a connection-level
+                                // FLOW_CONTROL_ERROR, not an unchecked cast.
+                                if (adjusted > std.math.maxInt(i32)) {
+                                    try http.http2_frame.writeGoaway(conn.writer(), last_client_stream_id, http.http2_stream.ErrorCode.flow_control_error.value());
+                                    return error.Http2FlowControlError;
+                                }
+                                // A negative result is explicitly allowed by
+                                // the RFC (it just blocks sends on this
+                                // stream until more credit arrives, not an
+                                // error); saturate rather than trap if it
+                                // falls below what `i32` can represent, since
+                                // any sufficiently negative value is equally
+                                // "blocked" for flow-control purposes.
+                                s.send_window = @intCast(@max(adjusted, @as(i64, std.math.minInt(i32))));
                             }
                         }
                     }
@@ -2639,6 +2649,7 @@ fn handleHttp2Connection(conn: anytype, session: *ConnectionSession, cfg: *const
                         _ = streams.remove(frame.stream_id);
                         if (pending.fetchRemove(frame.stream_id)) |removed| {
                             var tmp = removed.value;
+                            buffered_request_bytes -= @min(buffered_request_bytes, tmp.body.items.len);
                             tmp.deinit(allocator);
                         }
                         if (pending_responses.fetchRemove(frame.stream_id)) |removed| {

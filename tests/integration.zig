@@ -3726,6 +3726,254 @@ test "interop.h2.proxy_transfer_encoding_header_rejected_before_upstream" {
     try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
 }
 
+test "interop.h2.settings_window_delta_overflow_on_active_stream_sends_goaway" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const large_response = try allocator.alloc(u8, 80 * 1024);
+    defer allocator.free(large_response);
+    for (large_response, 0..) |*b, i| {
+        b.* = @as(u8, 'a') + @as(u8, @intCast(i % 26));
+    }
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = large_response,
+        .connection_header = "close",
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-settings-overflow {{
+        \\    proxy_pass http://{s}:{d}/h2-settings-overflow;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    defer client.destroy();
+
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{}); // client SETTINGS (default window)
+
+    const headers1 = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-settings-overflow" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const request_block1 = try hpack.encodeLiteralHeaderBlock(allocator, headers1[0..]);
+    defer allocator.free(request_block1);
+    try client.writeHttp2Frame(0x1, 0x1 | 0x4, 1, request_block1); // END_STREAM | END_HEADERS
+
+    var saw_goaway = false;
+    var stream1_bytes: usize = 0;
+    var sent_followup = false;
+
+    var frame_count: usize = 0;
+    while (frame_count < 32 and !saw_goaway) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        switch (frame.typ) {
+            0x4 => {
+                if ((frame.flags & 0x1) == 0) try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            },
+            0x0 => {
+                if (frame.stream_id == 1) {
+                    stream1_bytes += frame.payload.len;
+                    if (!sent_followup and stream1_bytes > 0) {
+                        sent_followup = true;
+                        // Push stream 1's send window to exactly
+                        // maxInt(i32) (it was fully drained to 0 by the
+                        // initial blocked burst, so this lands exactly on
+                        // the ceiling without itself overflowing).
+                        var inc: [4]u8 = undefined;
+                        std.mem.writeInt(u32, inc[0..4], 0x7FFFFFFF, .big);
+                        try client.writeHttp2Frame(0x8, 0, 1, inc[0..]);
+                        // A single-unit positive SETTINGS_INITIAL_WINDOW_SIZE
+                        // delta now overflows that already-maxed window.
+                        var settings_payload: [6]u8 = undefined;
+                        std.mem.writeInt(u16, settings_payload[0..2], 0x4, .big);
+                        std.mem.writeInt(u32, settings_payload[2..6], 65_536, .big);
+                        try client.writeHttp2Frame(0x4, 0, 0, settings_payload[0..]);
+                    }
+                }
+            },
+            0x7 => { // GOAWAY
+                try std.testing.expect(frame.payload.len >= 8);
+                const err_code = std.mem.readInt(u32, frame.payload[4..8], .big);
+                try std.testing.expectEqual(@as(u32, 3), err_code); // FLOW_CONTROL_ERROR
+                saw_goaway = true;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_goaway);
+}
+
+test "interop.h2.stream_overflow_rst_releases_connection_memory_accounting" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream1 = try UpstreamServer.start(allocator, &.{.{ .body = "must-not-run" }});
+    defer upstream1.stop();
+    try upstream1.run();
+
+    var upstream3 = try UpstreamServer.start(allocator, &.{.{ .body = "stream3-ok" }});
+    defer upstream3.stop();
+    try upstream3.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-overflow-mem-1 {{
+        \\    proxy_pass http://{s}:{d}/h2-overflow-mem-1;
+        \\}}
+        \\
+        \\location = /h2-overflow-mem-3 {{
+        \\    proxy_pass http://{s}:{d}/h2-overflow-mem-3;
+        \\}}
+    , .{ test_host, upstream1.port(), test_host, upstream3.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_MAX_BODY_SIZE", .value = "2000" },
+            .{ .name = "TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES", .value = "2000" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream1.resetCapture();
+    try upstream3.resetCapture();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    defer client.destroy();
+
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{}); // client SETTINGS
+
+    const headers1 = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/h2-overflow-mem-1" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const request_block1 = try hpack.encodeLiteralHeaderBlock(allocator, headers1[0..]);
+    defer allocator.free(request_block1);
+    try client.writeHttp2Frame(0x1, 0x4, 1, request_block1); // END_HEADERS only, body follows
+
+    const chunk1 = try allocator.alloc(u8, 1500);
+    defer allocator.free(chunk1);
+    @memset(chunk1, 'x');
+    // Stream 1 stays open (no END_STREAM); its 1,500 buffered bytes count
+    // against the connection-wide cap until the stream is torn down.
+    try client.writeHttp2Frame(0x0, 0, 1, chunk1);
+
+    // Stream 1's send window was never touched by any outbound flush (it
+    // was never dispatched), so a single max increment alone overflows it:
+    // 65,535 + 0x7FFFFFFF > maxInt(i32).
+    var inc: [4]u8 = undefined;
+    std.mem.writeInt(u32, inc[0..4], 0x7FFFFFFF, .big);
+    try client.writeHttp2Frame(0x8, 0, 1, inc[0..]);
+
+    var saw_rst_stream1 = false;
+    var frame_count: usize = 0;
+    while (frame_count < 16 and !saw_rst_stream1) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        switch (frame.typ) {
+            0x4 => {
+                if ((frame.flags & 0x1) == 0) try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            },
+            0x3 => { // RST_STREAM
+                if (frame.stream_id == 1) saw_rst_stream1 = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_rst_stream1);
+
+    // On the *same* connection: if stream 1's RST_STREAM cleanup didn't
+    // release its bytes from the connection-memory accounting, this
+    // well-under-cap request would be spuriously rejected too
+    // (1,500 stale + 1,500 new > 2,000 cap).
+    const headers3 = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/h2-overflow-mem-3" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const request_block3 = try hpack.encodeLiteralHeaderBlock(allocator, headers3[0..]);
+    defer allocator.free(request_block3);
+    try client.writeHttp2Frame(0x1, 0x4, 3, request_block3); // END_HEADERS only, body follows
+
+    const chunk3 = try allocator.alloc(u8, 1500);
+    defer allocator.free(chunk3);
+    @memset(chunk3, 'y');
+    try client.writeHttp2Frame(0x0, 0x1, 3, chunk3); // END_STREAM
+
+    var stream3_body = std.array_list.Managed(u8).init(allocator);
+    defer stream3_body.deinit();
+    var stream3_done = false;
+
+    frame_count = 0;
+    while (frame_count < 16 and !stream3_done) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        switch (frame.typ) {
+            0x4 => {
+                if ((frame.flags & 0x1) == 0) try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            },
+            0x0 => {
+                if (frame.stream_id == 3) {
+                    try stream3_body.appendSlice(frame.payload);
+                    if ((frame.flags & 0x1) != 0) stream3_done = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(stream3_done);
+    try assertContains(stream3_body.items, "stream3-ok");
+    try waitForUpstreamCount(&upstream3, 1, 2_000);
+    try std.testing.expectEqual(@as(u32, 1), upstream3.requestCount());
+    try std.testing.expectEqual(@as(u32, 0), upstream1.requestCount());
+}
+
 test "interop.h2.proxy_response_waits_for_window_update" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
