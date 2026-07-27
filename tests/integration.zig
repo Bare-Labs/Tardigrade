@@ -2700,11 +2700,8 @@ test "interop.openssl.h1.early.accepted" {
     try assertContains(first.stdout, "New, TLSv1.3");
     try assertContains(first.stdout, "HTTP/1.1 200 OK");
 
-    const resumption_psk_hex = try opensslSessionResumptionPskHex(allocator, sess_path);
-    defer allocator.free(resumption_psk_hex);
-    const resumption_psk_hex_lower = try allocator.dupe(u8, resumption_psk_hex);
-    defer allocator.free(resumption_psk_hex_lower);
-    _ = std.ascii.lowerString(resumption_psk_hex_lower, resumption_psk_hex_lower);
+    var session_secrets = try opensslSessionSecrets(allocator, sess_path);
+    defer session_secrets.deinit();
     try upstream.resetCapture();
 
     var early = try runOpenssl(allocator, &.{
@@ -2727,8 +2724,8 @@ test "interop.openssl.h1.early.accepted" {
 
     const log = try compat.cwd().readFileAlloc(allocator, tardigrade.log_path, 4 * 1024 * 1024);
     defer allocator.free(log);
-    try std.testing.expect(!containsSubstring(log, resumption_psk_hex));
-    try std.testing.expect(!containsSubstring(log, resumption_psk_hex_lower));
+    try assertHexAbsentCaseInsensitive(allocator, log, session_secrets.resumption_psk_hex);
+    try assertHexAbsentCaseInsensitive(allocator, log, session_secrets.ticket_hex);
 }
 
 test "interop.openssl.h1.early.unsafe_425" {
@@ -3356,24 +3353,107 @@ fn opensslSessionTicketFingerprint(allocator: std.mem.Allocator, path: []const u
     return fingerprint;
 }
 
-fn opensslSessionResumptionPskHex(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+const OpenSslSessionSecrets = struct {
+    allocator: std.mem.Allocator,
+    resumption_psk_hex: []u8,
+    ticket_hex: []u8,
+
+    fn deinit(self: *OpenSslSessionSecrets) void {
+        self.allocator.free(self.resumption_psk_hex);
+        self.allocator.free(self.ticket_hex);
+        self.* = undefined;
+    }
+};
+
+fn opensslSessionSecrets(allocator: std.mem.Allocator, path: []const u8) !OpenSslSessionSecrets {
     var result = try runOpenssl(allocator, &.{
         "sess_id", "-in", path, "-text", "-noout",
     }, null, 10_000);
     defer result.deinit(allocator);
     try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(result.outcome));
 
-    const marker = "Resumption PSK:";
-    const marker_start = std.mem.indexOf(u8, result.stdout, marker) orelse return error.ResumptionPskNotFound;
+    const resumption_psk_hex = try opensslSessionLineHex(allocator, result.stdout, "Resumption PSK:");
+    errdefer allocator.free(resumption_psk_hex);
+    const ticket_hex = try opensslSessionTicketHexBlock(allocator, result.stdout);
+    errdefer allocator.free(ticket_hex);
+
+    return .{
+        .allocator = allocator,
+        .resumption_psk_hex = resumption_psk_hex,
+        .ticket_hex = ticket_hex,
+    };
+}
+
+fn opensslSessionLineHex(allocator: std.mem.Allocator, text: []const u8, marker: []const u8) ![]u8 {
+    const marker_start = std.mem.indexOf(u8, text, marker) orelse return error.SessionSecretNotFound;
     const value_start = marker_start + marker.len;
-    const line_end = std.mem.indexOfScalarPos(u8, result.stdout, value_start, '\n') orelse result.stdout.len;
-    const raw = std.mem.trim(u8, result.stdout[value_start..line_end], " \t\r");
-    if (raw.len < 32 or raw.len % 2 != 0) return error.ResumptionPskMalformed;
-    for (raw) |c| {
-        if (!std.ascii.isHex(c)) return error.ResumptionPskMalformed;
-    }
+    const line_end = std.mem.indexOfScalarPos(u8, text, value_start, '\n') orelse text.len;
+    const raw = std.mem.trim(u8, text[value_start..line_end], " \t\r");
+    try validateHexSecret(raw);
     return allocator.dupe(u8, raw);
 }
+
+fn opensslSessionTicketHexBlock(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const marker = "TLS session ticket:";
+    const marker_start = std.mem.indexOf(u8, text, marker) orelse return error.SessionTicketNotFound;
+    var lines = std.mem.splitScalar(u8, text[marker_start + marker.len ..], '\n');
+    var hex = std.array_list.Managed(u8).init(allocator);
+    errdefer hex.deinit();
+
+    while (lines.next()) |line_raw| {
+        const line = compat.trimRight(u8, line_raw, " \t\r");
+        if (line.len == 0) {
+            if (hex.items.len > 0) break;
+            continue;
+        }
+        if (line[0] != ' ' and line[0] != '\t') {
+            if (hex.items.len > 0) break;
+            continue;
+        }
+        const dash = std.mem.indexOfScalar(u8, line, '-') orelse {
+            if (hex.items.len > 0) break;
+            continue;
+        };
+        const bytes_text = std.mem.trim(u8, line[dash + 1 ..], " \t");
+        var consumed = false;
+        var i: usize = 0;
+        while (i < bytes_text.len) {
+            const c = bytes_text[i];
+            if (std.ascii.isHex(c)) {
+                try hex.append(c);
+                consumed = true;
+            } else if (c == ' ' or c == '\t') {
+                // OpenSSL separates hex byte pairs with spaces.
+            } else {
+                break;
+            }
+            i += 1;
+        }
+        if (!consumed and hex.items.len > 0) break;
+    }
+
+    try validateHexSecret(hex.items);
+    return hex.toOwnedSlice();
+}
+
+fn validateHexSecret(raw: []const u8) !void {
+    if (raw.len < 32 or raw.len % 2 != 0) return error.SessionSecretMalformed;
+    for (raw) |c| {
+        if (!std.ascii.isHex(c)) return error.SessionSecretMalformed;
+    }
+}
+
+fn assertHexAbsentCaseInsensitive(allocator: std.mem.Allocator, haystack: []const u8, hex: []const u8) !void {
+    const haystack_lower = try allocator.dupe(u8, haystack);
+    defer allocator.free(haystack_lower);
+    _ = std.ascii.lowerString(haystack_lower, haystack_lower);
+    const hex_lower = try allocator.dupe(u8, hex);
+    defer allocator.free(hex_lower);
+    _ = std.ascii.lowerString(hex_lower, hex_lower);
+    try std.testing.expect(!containsSubstring(haystack_lower, hex_lower));
+}
+
+const persistent_ticket_key_fixture_hex = "101112131415161718191a1b1c1d1e1f";
 
 fn persistentTicketKeySnapshotPath(allocator: std.mem.Allocator, port: u16, tag: []const u8) ![]u8 {
     const dir = try interopSecretsDir(allocator);
@@ -3860,6 +3940,8 @@ test "restart.persistent.early_startup_quarantine" {
     defer early_ticket.deinit();
     try capture.retained.cloneInto(allocator, &early_ticket);
 
+    const log_a_path = try allocator.dupe(u8, process_a.log_path);
+    defer allocator.free(log_a_path);
     process_a.stop();
     process_a_running = false;
 
@@ -3946,6 +4028,13 @@ test "restart.persistent.early_startup_quarantine" {
     try expectMetricAtLeast(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"record\"", "outcome=\"accepted\"" }, 1);
     try expectMetricAtLeast(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"startup_quarantine\""}, 1);
     try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""}) orelse 0);
+
+    const log_a = try compat.cwd().readFileAlloc(allocator, log_a_path, 4 * 1024 * 1024);
+    defer allocator.free(log_a);
+    const log_b = try compat.cwd().readFileAlloc(allocator, process_b.log_path, 4 * 1024 * 1024);
+    defer allocator.free(log_b);
+    try assertHexAbsentCaseInsensitive(allocator, log_a, persistent_ticket_key_fixture_hex);
+    try assertHexAbsentCaseInsensitive(allocator, log_b, persistent_ticket_key_fixture_hex);
 }
 
 // Named `restart_and_credential_change`, not `cert_change`: process A and

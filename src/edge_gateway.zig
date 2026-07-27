@@ -1596,11 +1596,13 @@ fn nativeTcpServerEarlyDataPolicy(
     return if (gate != null) .{ .enabled = true } else .{};
 }
 
+const native_persistent_ticket_max: usize = 16 * 1024;
+
 fn nativeResumptionSessionLimits(cfg: *const edge_config.EdgeConfig) tls_core.session.Limits {
     var limits = tls_core.session.Limits.default;
     if (cfg.tls_native_ticket_keys_path.len > 0) {
-        limits.max_ticket_len = tls_core.session.absolute_ticket_wire_max;
-        limits.max_serialized_len = tls_core.session.hard_max_serialized_len;
+        limits.max_ticket_len = native_persistent_ticket_max;
+        limits.max_serialized_len = native_persistent_ticket_max - tls_core.ticket_protection.envelope_overhead;
     }
     return limits;
 }
@@ -4102,6 +4104,49 @@ test "#510 process-local composition enables native TCP server early-data policy
 
     try std.testing.expect(native.backend.server_early_data_policy.enabled);
     try std.testing.expectEqual(composition.early_data_replay_gate.?.ctx, native.backend.early_data_replay_gate.ctx);
+}
+
+test "#518 persistent native resumption uses bounded stateless ticket limits" {
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.tls_native_ticket_keys_path = "";
+    var limits = nativeResumptionSessionLimits(&cfg);
+    try std.testing.expectEqual(tls_core.session.Limits.default.max_ticket_len, limits.max_ticket_len);
+    try std.testing.expectEqual(tls_core.session.Limits.default.max_serialized_len, limits.max_serialized_len);
+
+    cfg.tls_native_ticket_keys_path = "ticket-keys.json";
+    limits = nativeResumptionSessionLimits(&cfg);
+    try std.testing.expectEqual(@as(usize, native_persistent_ticket_max), limits.max_ticket_len);
+    try std.testing.expectEqual(@as(usize, native_persistent_ticket_max - tls_core.ticket_protection.envelope_overhead), limits.max_serialized_len);
+    try std.testing.expect(limits.max_ticket_len < tls_core.session.absolute_ticket_wire_max);
+    try std.testing.expect(limits.max_serialized_len < tls_core.session.hard_max_serialized_len);
+
+    const max_transport = tls_core.session.Limits.default.max_transport_compat_len;
+    const max_application = tls_core.session.Limits.default.max_application_compat_len;
+    const transport_compat = [_]u8{0xa5} ** max_transport;
+    const application_compat = [_]u8{0x5a} ** max_application;
+    var common: tls_core.session.ResumableSessionCommon = .{};
+    defer common.deinit();
+    try common.init(std.testing.allocator, limits, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0x42} ** 32),
+        .server_name = "tardigrade.test",
+        .application_protocol = "http/1.1",
+        .auth_binding = tls_core.session.AuthBinding.fromLeafCertificateDer("native-h1-fixture-leaf"),
+        .issued_at_unix_ms = 2_000,
+        .lifetime_seconds = 24 * 60 * 60,
+        .early_data = .{ .early_data_capable = 16 * 1024 },
+        .transport_compat = .{ .format_id = 1, .format_version = 1, .bytes = &transport_compat },
+        .application_compat = .{ .format_id = 2, .format_version = 1, .bytes = &application_compat },
+        .early_data_transport_compat = .{ .format_id = 3, .format_version = 1, .bytes = &transport_compat },
+        .early_data_application_compat = .{ .format_id = 4, .format_version = 1, .bytes = &application_compat },
+    });
+
+    var state: tls_core.session.ServerRecoverableState = .{};
+    defer state.deinit();
+    state.init(&common, 0x01020304);
+    const encoded_len = try tls_core.session.serverEncodedLenWithLimits(&state, limits);
+    try std.testing.expect(encoded_len <= limits.max_serialized_len);
+    try std.testing.expect(encoded_len + tls_core.ticket_protection.envelope_overhead <= limits.max_ticket_len);
 }
 
 test "return_response method enforcement — non-GET/HEAD rejected on static returns" {
