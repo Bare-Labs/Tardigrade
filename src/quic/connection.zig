@@ -1646,6 +1646,14 @@ pub const Connection = struct {
         // (unexpected type, malformed, failed integrity check) is a
         // never-processed/dropped packet and correctly does not reach here.
         self.armIdle(now_us);
+        // The client handshake anti-deadlock PTO (`nextTimeoutUs`/`onTimeout`,
+        // ~line 2002/2060) bases its deadline on `last_activity_us` whenever
+        // nothing is in flight. This Retry just cleared the Initial
+        // recovery/sent state above, so without updating it here too, that
+        // deadline would still reflect pre-Retry activity and could fire
+        // before the replacement Initial (queued via `tx.pending` above) is
+        // even emitted.
+        self.last_activity_us = now_us;
     }
 
     /// Drain queued TLS output into the per-level retransmission buffers.
@@ -3663,6 +3671,12 @@ test "driver: a validated, successfully processed Retry still refreshes the idle
 
     try testing.expect(pair.client.got_retry);
     try testing.expect(pair.client.idle_deadline_us.? > before.?);
+    // The client handshake anti-deadlock PTO (`nextTimeoutUs`/`onTimeout`)
+    // bases its deadline on `last_activity_us` whenever nothing is in
+    // flight; `handleRetry` clears the Initial recovery/sent state, so this
+    // must move forward too or that deadline could still fire based on
+    // pre-Retry activity before the replacement Initial goes out.
+    try testing.expectEqual(later, pair.client.last_activity_us);
 }
 
 test "driver: replayed duplicate packet from a different source address does not create or credit candidate-path state" {
