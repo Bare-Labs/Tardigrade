@@ -105,6 +105,13 @@ pub const TlsBackend = struct {
         limits: tls_core.session.Limits,
     ) HandshakeError!void = null,
     earlyDataAcceptedFn: ?*const fn (ptr: *anyopaque) bool = null,
+    /// #523: the authoritative TLS-layer 0-RTT decision (not just the
+    /// accepted/not-accepted bool above) — surfaces *why* early data was
+    /// rejected (policy disabled, ticket not capable, replay, transport/
+    /// application incompatibility, ...), available as soon as the server
+    /// has processed the ClientHello, independent of whether any `.zero_rtt`
+    /// packet ever actually arrives on the wire.
+    earlyDataDecisionFn: ?*const fn (ptr: *anyopaque) tls_core.tls13_backend.EarlyDataDecision = null,
 
     fn start(self: TlsBackend, role: Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void {
         return self.transport.start(role, params, sink);
@@ -175,6 +182,11 @@ pub const TlsBackend = struct {
 
     pub fn earlyDataAccepted(self: TlsBackend) bool {
         const cb = self.earlyDataAcceptedFn orelse return false;
+        return cb(self.transport.ptr);
+    }
+
+    pub fn earlyDataDecision(self: TlsBackend) tls_core.tls13_backend.EarlyDataDecision {
+        const cb = self.earlyDataDecisionFn orelse return .not_attempted;
         return cb(self.transport.ptr);
     }
 

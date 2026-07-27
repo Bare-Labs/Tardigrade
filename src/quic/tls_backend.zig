@@ -291,12 +291,18 @@ pub const Tls13Backend = struct {
             .prepareNewSessionTicketFn = prepareNewSessionTicket,
             .emitPreparedNewSessionTicketFn = emitPreparedNewSessionTicket,
             .earlyDataAcceptedFn = earlyDataAcceptedVtable,
+            .earlyDataDecisionFn = earlyDataDecisionVtable,
         };
     }
 
     fn earlyDataAcceptedVtable(ptr: *anyopaque) bool {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
         return self.engine.earlyDataAccepted();
+    }
+
+    fn earlyDataDecisionVtable(ptr: *anyopaque) shared.EarlyDataDecision {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.engine.earlyDataDecision();
     }
 
     fn earlyDataAttempted(ptr: *anyopaque) bool {

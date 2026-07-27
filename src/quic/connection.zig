@@ -137,6 +137,16 @@ pub const Event = union(enum) {
     /// generic application-space bookkeeping. Never carries ticket
     /// identities, PSKs, traffic secrets, or other decrypted session state.
     zero_rtt_packet: struct { outcome: ZeroRttPacketOutcome, size: usize },
+    /// #523: the authoritative TLS-layer 0-RTT decision, bridged once per
+    /// connection as soon as the server has processed the ClientHello —
+    /// independent of whether any `.zero_rtt` packet ever actually arrives
+    /// on the wire (`zero_rtt_packet` above only exists if one does).
+    /// Distinguishes *why* early data was unavailable (disabled, ticket not
+    /// capable, replay, transport/application incompatibility, age skew,
+    /// ...) rather than collapsing every reason into one bucket. Never
+    /// carries ticket identities, PSKs, or other decrypted session state —
+    /// `EarlyDataDecision` is a closed, non-secret enum.
+    early_data_decision: tls_core.tls13_backend.EarlyDataDecision,
 };
 
 /// See `Event.zero_rtt_packet`.
@@ -694,6 +704,11 @@ pub const Connection = struct {
     /// First Handshake-level packet sent (client Initial-key discard trigger).
     sent_handshake_packet: bool = false,
     processed_handshake_packet: bool = false,
+    /// #523: whether `Event.early_data_decision` has already been reported
+    /// for this connection — emitted at most once, as soon as the TLS layer
+    /// has made a real decision, regardless of whether a `.zero_rtt` packet
+    /// ever arrives.
+    early_data_decision_reported: bool = false,
 
     pending_max_data: ?u64 = null,
     pending_max_stream_data: std.ArrayList(struct { id: StreamId, limit: u64 }) = .empty,
@@ -1071,21 +1086,27 @@ pub const Connection = struct {
             self.largest_recv_pn[space_idx] = pn;
         }
         // An authenticated duplicate (same packet number already recorded in
-        // this space — query *before* recording this one) must never have
-        // its frame effects re-applied: 0-RTT and 1-RTT share the
-        // application space, so this is also what stops a replayed 0-RTT
-        // packet from re-crediting stream/connection state a second time.
-        // Path-validation/ACK-range bookkeeping below still runs regardless:
-        // a duplicate still proves current possession of the keys and the
-        // path, and its packet number still belongs in the next ACK.
+        // this space — query *before* recording this one) must be inert
+        // beyond the fact that it authenticated: no re-applied frame
+        // effects (0-RTT and 1-RTT share the application space, so this is
+        // also what stops a replayed 0-RTT packet from re-crediting
+        // stream/connection state), no idle-timer refresh, no ACK-range
+        // insertion (already covered — the insert would be a no-op merge
+        // anyway), and critically no path classification / anti-
+        // amplification crediting: a captured-and-replayed packet resent
+        // from a *different* (possibly spoofed) source address must not be
+        // able to create or credit candidate-path state for that address
+        // just because its packet number already authenticated once.
         const already_received = self.recovery.wasReceived(space, pn);
         self.emitZeroRttOutcome(level, if (already_received) .duplicate else .accepted, bytes.len);
-        self.recovery.onPacketReceived(space, pn) catch {
-            // Pathological ACK-range fragmentation; close rather than lose ACK state.
-            self.startClose(.{ .error_code = error_internal, .is_application = false, .local = true }, "ack range overflow", now_us);
-            return;
-        };
-        self.last_activity_us = now_us;
+        if (!already_received) {
+            self.recovery.onPacketReceived(space, pn) catch {
+                // Pathological ACK-range fragmentation; close rather than lose ACK state.
+                self.startClose(.{ .error_code = error_internal, .is_application = false, .local = true }, "ack range overflow", now_us);
+                return;
+            };
+            self.last_activity_us = now_us;
+        }
 
         if (self.role == .client and parsed.kind == .initial and !self.peer_cid_adopted) {
             // RFC 9000 §7.2: the client adopts the server's SCID.
@@ -1105,25 +1126,30 @@ pub const Connection = struct {
         }
 
         // Authenticated path state (#251/#515): only a packet whose AEAD open
-        // just succeeded (we are past that point now) may create path state,
-        // credit anti-amplification budget, or start/continue a candidate
-        // validation. This never moves the active path or an outbound
-        // destination by itself — only `tryPromote` (driven by a validated
-        // PATH_RESPONSE) does that. A new validation attempt uses the #387
-        // contract for its timeout: max(default, 3x application-space PTO).
-        self.paths.validation_timeout_us = @max(quic_path.default_validation_timeout_us, 3 * self.recovery.rtt.ptoDuration(.application));
-        switch (self.paths.onDatagram(ingress_path, bytes.len, challenge_entropy, now_us)) {
-            .probe => |data| self.queueCandidateChallenge(ingress_path, data),
-            .on_active_path, .probing, .validated_pending_promotion, .blocked => {},
-        }
-        if (level == .handshake and self.role == .server) {
-            // RFC 9001 §4.9.1 / RFC 9000 §8.1: receiving an authenticated
-            // Handshake packet proves the client owns the exact address it
-            // arrived on — never implicitly "whatever path is currently
-            // active". `onDatagram` above has already classified/tracked
-            // `ingress_path` (creating it as a candidate if it differs from
-            // the active path), so this lifts only that path's limit.
-            self.paths.markValidatedOnPath(ingress_path);
+        // just succeeded (we are past that point now) *and* is not an
+        // already-processed duplicate may create path state, credit
+        // anti-amplification budget, or start/continue a candidate
+        // validation — see the comment above `already_received` for why a
+        // duplicate must not reach here. This never moves the active path
+        // or an outbound destination by itself — only `tryPromote` (driven
+        // by a validated PATH_RESPONSE) does that. A new validation attempt
+        // uses the #387 contract for its timeout: max(default, 3x
+        // application-space PTO).
+        if (!already_received) {
+            self.paths.validation_timeout_us = @max(quic_path.default_validation_timeout_us, 3 * self.recovery.rtt.ptoDuration(.application));
+            switch (self.paths.onDatagram(ingress_path, bytes.len, challenge_entropy, now_us)) {
+                .probe => |data| self.queueCandidateChallenge(ingress_path, data),
+                .on_active_path, .probing, .validated_pending_promotion, .blocked => {},
+            }
+            if (level == .handshake and self.role == .server) {
+                // RFC 9001 §4.9.1 / RFC 9000 §8.1: receiving an authenticated
+                // Handshake packet proves the client owns the exact address it
+                // arrived on — never implicitly "whatever path is currently
+                // active". `onDatagram` above has already classified/tracked
+                // `ingress_path` (creating it as a candidate if it differs from
+                // the active path), so this lifts only that path's limit.
+                self.paths.markValidatedOnPath(ingress_path);
+            }
         }
 
         var ack_eliciting = false;
@@ -1186,6 +1212,7 @@ pub const Connection = struct {
                     self.startClose(.{ .error_code = error_crypto_buffer_exceeded, .is_application = false, .local = true }, "crypto buffer", now_us);
                     return;
                 };
+                self.reportEarlyDataDecisionOnce();
                 self.afterHandshakeProgress(ingress_path, now_us);
             },
             .stream => |sf| {
@@ -1509,6 +1536,21 @@ pub const Connection = struct {
     fn emitZeroRttOutcome(self: *Connection, level: EncryptionLevel, outcome: ZeroRttPacketOutcome, size: usize) void {
         if (level != .zero_rtt) return;
         self.events.emit(.{ .zero_rtt_packet = .{ .outcome = outcome, .size = size } });
+    }
+
+    /// See `Event.early_data_decision`. Only the server ever makes this
+    /// decision (RFC 9001 §4.6.1); a client polling its own backend would
+    /// only ever see `.not_attempted`, so this is a no-op there. Emitted at
+    /// most once per connection, as soon as the decision is no longer
+    /// `.not_attempted` — CRYPTO frames arrive in order, so once the
+    /// server's transcript covers the full ClientHello, every later
+    /// `.crypto` frame observes a stable, final decision.
+    fn reportEarlyDataDecisionOnce(self: *Connection) void {
+        if (self.role != .server or self.early_data_decision_reported) return;
+        const decision = self.tls.earlyDataDecision();
+        if (decision == .not_attempted) return;
+        self.early_data_decision_reported = true;
+        self.events.emit(.{ .early_data_decision = decision });
     }
 
     fn roleInitiator(role: Role) quic_stream.Initiator {
@@ -3535,6 +3577,40 @@ test "driver: authenticated duplicate 0-RTT packet does not re-apply a state-mut
     try testing.expectEqual(@as(usize, 1), pair.server.pending_path_responses.items.len);
 }
 
+test "driver: replayed duplicate packet from a different source address does not create or credit candidate-path state" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+
+    const secret = [_]u8{0x37} ** tls_adapter.traffic_secret_len;
+    pair.server.adapter.setZeroRttEnabled(true);
+    pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
+
+    var frame_buf: [16]u8 = undefined;
+    const frame_len = try frame.encodeStream(0, 0, "hi", true, &frame_buf);
+    var wire: [256]u8 = undefined;
+    const datagram = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 0, frame_buf[0..frame_len], &wire);
+
+    // First delivery: authenticates and is processed on the server's actual
+    // (handshake) active path, as usual.
+    try pair.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, pair.now_us);
+
+    // Replay the byte-identical datagram, but claim it arrived from a
+    // different (spoofed or off-path-captured-and-resent) source address.
+    const spoofed_path = quic_path.PathKey{
+        .local = TestPair.server_path.local,
+        .remote = quic_udp.Address.ip4(.{ 203, 0, 113, 7 }, 9999),
+    };
+    try testing.expectEqual(@as(?quic_path.PathState, null), pair.server.paths.stateOf(spoofed_path));
+    try pair.server.ingestOnPath(datagram, spoofed_path, TestPair.test_challenge_entropy, pair.now_us);
+
+    // The replay authenticates (it's the same packet number, already
+    // processed once) but must not have created a candidate path or
+    // credited that address's anti-amplification ledger merely because the
+    // bytes happened to decrypt.
+    try testing.expectEqual(@as(?quic_path.PathState, null), pair.server.paths.stateOf(spoofed_path));
+}
+
 test "driver: frames illegal in 0-RTT close the connection instead of taking effect (RFC 9000 §12.5)" {
     const allocator = testing.allocator;
 
@@ -4143,6 +4219,183 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
     try testing.expect(resumed.server.isEstablished());
     try testing.expect(resumed.client_backend.engine.core.psk_authenticated);
     try testing.expect(resumed.server_backend.engine.core.psk_authenticated);
+}
+
+test "#523: Event.early_data_decision surfaces the real TLS decision once, even when the carrier is disabled" {
+    const resumption_runtime = tls_core.resumption_runtime;
+    const allocator = testing.allocator;
+
+    var server_entropy = tls_core.production_crypto.OsEntropy{};
+    var server_provider = tls_core.production_crypto.Provider.init(server_entropy.entropy());
+    var server_runtime = try resumption_runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 1000;
+            }
+        }.now },
+        server_provider.cryptoProvider(),
+    );
+    defer server_runtime.deinit();
+
+    var client_entropy = tls_core.production_crypto.OsEntropy{};
+    var client_provider = tls_core.production_crypto.Provider.init(client_entropy.entropy());
+    var client_runtime = try resumption_runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 2000;
+            }
+        }.now },
+        client_provider.cryptoProvider(),
+    );
+    defer client_runtime.deinit();
+
+    // Phase 1: same shape as the previous test — an early-data-capable
+    // ticket, issued and captured.
+    const CaptureImpl = struct {
+        runtime: *resumption_runtime.Runtime,
+        stored: tls_core.session_cache.StoreResult = undefined,
+        retained: tls_core.session.ClientTicketState = .{},
+
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(testing.allocator, &self.retained) catch unreachable;
+            self.stored = self.runtime.storeClientTicket(ticket);
+        }
+    };
+    var capture = CaptureImpl{ .runtime = &client_runtime };
+    defer capture.retained.deinit();
+    const resume_policy: tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy = .{
+        .transport = .ignore,
+        .application = .ignore,
+    };
+    var pair = try TestPair.initWithTicketConsumerAndResumePolicy(allocator, tls_core.session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = CaptureImpl.now,
+        .onTicketFn = CaptureImpl.onTicket,
+    }, resume_policy);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var prepared = try pair.server.prepareNewSessionTicket(allocator, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 500,
+        .ticket_nonce = "\x01",
+        .issued_at_unix_ms = 1000,
+        .max_early_data_size = std.math.maxInt(u32),
+    }, tls_core.session.Limits.default);
+    defer prepared.deinit();
+    var scratch: [256]u8 = undefined;
+    var identity = try server_runtime.createIdentity(&prepared.state, 1000, &scratch);
+    try testing.expect(identity == .stateful);
+    try pair.server.emitPreparedNewSessionTicket(&prepared, identity.slice(), tls_core.session.Limits.default);
+    try pair.pump();
+    try testing.expectEqual(tls_core.session_cache.StoreResult.stored, capture.stored);
+
+    const candidate: tls_core.session.CandidateContext = .{
+        .cipher_suite = capture.retained.common.cipher_suite,
+        .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
+        .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
+        .auth_binding = capture.retained.common.auth_binding,
+        .transport_compat = null,
+        .application_compat = null,
+    };
+    var lookup = client_runtime.lookupClientOffers(candidate);
+    defer lookup.deinit();
+    try testing.expect(lookup == .hit);
+
+    // Phase 2: the client attempts 0-RTT with a genuinely early-data-capable
+    // ticket, but the server never enables `ServerEarlyDataPolicy` — the
+    // carrier stays off. `decideServerEarlyData` still runs (the ClientHello
+    // did request early data) and must report `.disabled`, not silently
+    // produce nothing just because no `.zero_rtt` packet will ever be sent.
+    const EventCapture = struct {
+        decision: ?tls_core.tls13_backend.EarlyDataDecision = null,
+        count: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .early_data_decision => |d| {
+                    self.decision = d;
+                    self.count += 1;
+                },
+                else => {},
+            }
+        }
+    };
+    var event_capture = EventCapture{};
+
+    const resumed = try allocator.create(TestPair);
+    defer allocator.destroy(resumed);
+    resumed.* = .{
+        .client_backend = tls_backend_mod.Tls13Backend.initClient(
+            .{ .hello_random = [_]u8{0xf1} ** 32, .key_share_seed = [_]u8{0x51} ** 32 },
+            .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+        ),
+        .server_backend = tls_backend_mod.Tls13Backend.initServer(
+            .{ .hello_random = [_]u8{0xf2} ** 32, .key_share_seed = [_]u8{0x52} ** 32 },
+            try tls_backend_mod.Identity.initPkcs8(
+                tls_backend_mod.testdata.certificate_der,
+                tls_backend_mod.testdata.private_key_pkcs8_der,
+            ),
+        ),
+    };
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+    };
+    try resumed.client_backend.engine.setClientPskOfferLease(&lookup.hit, &clock_dummy, ClientClock.now);
+    try resumed.client_backend.setResumeCompatibilityPolicy(resume_policy);
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 4096 });
+    try resumed.server_backend.setServerPskResolver(server_runtime.serverResolver().?);
+    try resumed.server_backend.setResumeCompatibilityPolicy(resume_policy);
+    // Deliberately not called: `resumed.server_backend.setServerEarlyDataPolicy(...)`.
+
+    resumed.client = try Connection.init(allocator, .{
+        .role = .client,
+        .config = .{ .zero_rtt_enabled = true },
+        .local_cid = &TestPair.client_cid,
+        .original_dcid = &TestPair.odcid,
+        .peer_cid = &TestPair.odcid,
+        .tls = resumed.client_backend.backend(),
+        .now_us = resumed.now_us,
+        .initial_path = TestPair.client_path,
+    });
+    defer resumed.client.deinit();
+    resumed.server = try Connection.init(allocator, .{
+        .role = .server,
+        .config = .{ .zero_rtt_enabled = true },
+        .local_cid = &TestPair.odcid,
+        .original_dcid = &TestPair.odcid,
+        .peer_cid = &TestPair.client_cid,
+        .tls = resumed.server_backend.backend(),
+        .now_us = resumed.now_us,
+        .initial_path = TestPair.server_path,
+        .events = .{ .context = &event_capture, .emitFn = EventCapture.onEvent },
+    });
+    defer resumed.server.deinit();
+
+    try resumed.pump();
+
+    try testing.expect(resumed.client.isEstablished());
+    try testing.expect(resumed.server.isEstablished());
+    // The PSK still resumed (ordinary 1-RTT is unaffected by the disabled
+    // carrier)...
+    try testing.expect(resumed.server_backend.engine.core.psk_authenticated);
+    // ...but the typed decision correctly distinguishes "disabled" from
+    // "accepted", reported exactly once regardless of how many further
+    // CRYPTO/application packets the rest of the handshake exchanges.
+    try testing.expectEqual(@as(usize, 1), event_capture.count);
+    try testing.expectEqual(tls_core.tls13_backend.EarlyDataDecision.disabled, event_capture.decision.?);
 }
 
 test "driver: maximum NewSessionTicket survives real loss reordering PTO and ACK cleanup" {

@@ -19,6 +19,7 @@
 
 const compat = @import("zig_compat");
 const std = @import("std");
+const early_data_policy = @import("early_data.zig");
 const http3_session = @import("http3_session.zig");
 const logger_mod = @import("logger.zig");
 const metrics_mod = @import("metrics.zig");
@@ -857,7 +858,9 @@ pub const Runtime = struct {
             self.recordH3EarlyDataCompat(.missing_state);
             return .transport_incompatible;
         };
-        if (transport.format_id != quic_transport_parameters_extension_type) {
+        if (transport.format_id != quic_transport_parameters_extension_type or
+            transport.format_version != quic_transport_parameters_compat_format_version)
+        {
             self.recordH3EarlyDataCompat(.transport_incompatible);
             return .transport_incompatible;
         }
@@ -1007,18 +1010,31 @@ fn quicConfigFrom(cfg: Config) quic.config.Config {
 /// constant exported.
 const quic_transport_parameters_extension_type: u16 = @intFromEnum(tls_core.algorithms.ExtensionType.quic_transport_parameters);
 
-/// RFC 9001 §4.6.1: a 0-RTT attempt is only transport-compatible if none of
-/// the limits governing what the client may send early have been reduced
-/// since the ticket was issued. `initial_max_stream_data_bidi_local` is
-/// deliberately excluded — it governs the server's own outbound budget on
-/// server-initiated streams, which is never relevant to data the client
-/// sends (the server never sends 0-RTT).
+/// The snapshot format version `quic.tls_backend.localTransportCompat` /
+/// `peerTransportCompat` stamp on every remembered-transport `CompatView`
+/// (hardcoded `1` there) — validated here before decoding so a
+/// version-mismatched snapshot from a future encoding change fails closed
+/// as `.transport_incompatible` rather than being decoded under the wrong
+/// assumptions.
+const quic_transport_parameters_compat_format_version: u16 = 1;
+
+/// RFC 9000 §7.4.1 / RFC 9001 §4.6.1's no-reduction set: a 0-RTT attempt is
+/// only transport-compatible if none of the limits it depends on — or that
+/// the client otherwise remembers as a standing guarantee from the prior
+/// connection — have been reduced since the ticket was issued.
+/// `initial_max_stream_data_bidi_local` and `active_connection_id_limit`
+/// are included even though they don't gate the early-data window itself
+/// (server never sends 0-RTT, and CIDs aren't consumed by 0-RTT admission):
+/// RFC 9000 §7.4.1 requires the full remembered parameter set to hold, not
+/// just the ones 0-RTT immediately exercises.
 fn quicEarlyDataTransportCompatible(remembered: quic.config.TransportParameters, current: quic.config.TransportParameters) bool {
     return current.initial_max_data >= remembered.initial_max_data and
+        current.initial_max_stream_data_bidi_local >= remembered.initial_max_stream_data_bidi_local and
         current.initial_max_stream_data_bidi_remote >= remembered.initial_max_stream_data_bidi_remote and
         current.initial_max_stream_data_uni >= remembered.initial_max_stream_data_uni and
         current.initial_max_streams_bidi >= remembered.initial_max_streams_bidi and
-        current.initial_max_streams_uni >= remembered.initial_max_streams_uni;
+        current.initial_max_streams_uni >= remembered.initial_max_streams_uni and
+        current.active_connection_id_limit >= remembered.active_connection_id_limit;
 }
 
 fn zeroRttCarrierEnabled(cfg: Config) bool {
@@ -1155,6 +1171,107 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
     const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 });
     try testing.expectEqual(@as(u64, 1350), mid.max_udp_payload_size);
     try testing.expectEqual(quic.config.MigrationPolicy.disabled, mid.migration_policy);
+}
+
+test "quicEarlyDataTransportCompatible (#523): rejects any reduced limit in the full RFC 9000 §7.4.1 set" {
+    const base = quic.config.TransportParameters{
+        .max_idle_timeout_ms = 1000,
+        .active_connection_id_limit = 4,
+        .max_udp_payload_size = 1200,
+        .initial_max_data = 100,
+        .initial_max_stream_data_bidi_local = 50,
+        .initial_max_stream_data_bidi_remote = 50,
+        .initial_max_stream_data_uni = 25,
+        .initial_max_streams_bidi = 10,
+        .initial_max_streams_uni = 5,
+        .disable_active_migration = true,
+    };
+
+    // Identical parameters are always compatible.
+    try testing.expect(quicEarlyDataTransportCompatible(base, base));
+
+    // Raising every limit (including the two the second-pass review added)
+    // stays compatible.
+    var raised = base;
+    raised.initial_max_data += 1;
+    raised.active_connection_id_limit += 1;
+    raised.initial_max_stream_data_bidi_local += 1;
+    try testing.expect(quicEarlyDataTransportCompatible(base, raised));
+
+    // Reducing `active_connection_id_limit` alone is rejected.
+    var reduced_cid = base;
+    reduced_cid.active_connection_id_limit -= 1;
+    try testing.expect(!quicEarlyDataTransportCompatible(base, reduced_cid));
+
+    // Reducing `initial_max_stream_data_bidi_local` alone is rejected.
+    var reduced_bidi_local = base;
+    reduced_bidi_local.initial_max_stream_data_bidi_local -= 1;
+    try testing.expect(!quicEarlyDataTransportCompatible(base, reduced_bidi_local));
+}
+
+test "h3EarlyDataCompatibility (#523): rejects a remembered snapshot with the wrong format_version before decoding" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-transport-version-test");
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+    });
+    defer runtime.deinit();
+
+    const candidate: tls_core.tls13_backend.EarlyDataCompatibilityCandidate = .{
+        .remembered_transport = .{
+            .format_id = quic_transport_parameters_extension_type,
+            .format_version = quic_transport_parameters_compat_format_version + 1,
+            .bytes = "not even valid transport parameter bytes",
+        },
+    };
+    try testing.expectEqual(
+        tls_core.tls13_backend.EarlyDataCompatibilityDecision.transport_incompatible,
+        Runtime.h3EarlyDataCompatibility(@ptrCast(&runtime), candidate),
+    );
+}
+
+test "h3EarlyDataCompatibility (#523): rejects a live QUIC transport limit reduced below the remembered snapshot" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-transport-reduced-test");
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+    });
+    defer runtime.deinit();
+
+    const remembered_params = try runtime.quic_config.transportParameters();
+    var encoded: [quic.tls_backend.max_transport_parameters_len]u8 = undefined;
+    const encoded_bytes = try quic.tls_backend.encodeTransportParameters(remembered_params, &encoded);
+
+    const candidate: tls_core.tls13_backend.EarlyDataCompatibilityCandidate = .{
+        .remembered_transport = .{
+            .format_id = quic_transport_parameters_extension_type,
+            .format_version = quic_transport_parameters_compat_format_version,
+            .bytes = encoded_bytes,
+        },
+    };
+
+    // Identical to the live configuration: transport-compatible, so the
+    // decision falls through to the application/H3-SETTINGS check next —
+    // which fails closed as `.application_incompatible` here since this
+    // candidate supplies no `remembered_application` at all. That's the
+    // proof the transport check itself passed, not a transport rejection.
+    try testing.expectEqual(
+        tls_core.tls13_backend.EarlyDataCompatibilityDecision.application_incompatible,
+        Runtime.h3EarlyDataCompatibility(@ptrCast(&runtime), candidate),
+    );
+
+    // Reduce a live limit below what was remembered.
+    runtime.quic_config.initial_max_streams_bidi -= 1;
+    try testing.expectEqual(
+        tls_core.tls13_backend.EarlyDataCompatibilityDecision.transport_incompatible,
+        Runtime.h3EarlyDataCompatibility(@ptrCast(&runtime), candidate),
+    );
 }
 
 test "quicConfigFrom (#523): enable_0rtt alone never enables the 0-RTT carrier" {
@@ -1908,6 +2025,458 @@ test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT cap
         tls_core.session.EarlyDataPolicy{ .early_data_capable = std.math.maxInt(u32) },
         capture.retained.common.early_data,
     );
+}
+
+/// #523 test-only: seal a 0-RTT wire packet exactly the way a real client
+/// sender would, mirroring `quic.connection`'s private `sealTestZeroRttPacket`
+/// (not reachable from this file). Key derivation depends only on the
+/// secret bytes, so a receiver with the same bytes installed at
+/// `.zero_rtt read` genuinely decrypts this.
+fn sealZeroRttPacketForTest(
+    dcid: []const u8,
+    scid: []const u8,
+    secret: [quic.tls_adapter.traffic_secret_len]u8,
+    pn: u64,
+    plaintext: []const u8,
+    out: []u8,
+) []u8 {
+    var sender = quic.tls_adapter.QuicTlsAdapter{};
+    sender.setZeroRttEnabled(true);
+    sender.installSecret(quic.tls_adapter.Secret.init(.zero_rtt, .write, &secret) catch unreachable);
+
+    const pn_len: u3 = quic.packet.packetNumberLength(pn, null);
+    const written = quic.packet.writeLongHeader(.zero_rtt, quic.packet.quic_v1, dcid, scid, "", pn_len, out) catch unreachable;
+    const pn_offset = written.pn_offset;
+
+    var padded: [1024]u8 = undefined;
+    const sample_min = (4 - @as(usize, pn_len)) + quic.tls_adapter.header_protection_sample_len - quic.tls_adapter.packet_protection_tag_len;
+    const padded_len = @max(plaintext.len, sample_min);
+    @memcpy(padded[0..plaintext.len], plaintext);
+    @memset(padded[plaintext.len..padded_len], 0);
+
+    // The Length field precedes `pn_offset` and is covered by the AEAD
+    // associated data, so it must be patched before sealing.
+    quic.packet.patchLongHeaderLength(out, written.length_offset, pn_len + padded_len + quic.tls_adapter.packet_protection_tag_len);
+
+    const truncated = quic.packet.truncatePacketNumber(pn, pn_len);
+    var pn_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &pn_bytes, truncated, .big);
+    @memcpy(out[pn_offset..][0..pn_len], pn_bytes[4 - @as(usize, pn_len) ..][0..pn_len]);
+
+    const header = out[0 .. pn_offset + pn_len];
+    const keys = sender.protectionKeys(.zero_rtt, .write).?;
+    _ = sender.sealPacketPayload(.zero_rtt, .write, pn, header, padded[0..padded_len], out[pn_offset + pn_len ..]) catch unreachable;
+
+    var sample: [quic.tls_adapter.header_protection_sample_len]u8 = undefined;
+    @memcpy(&sample, out[pn_offset + 4 ..][0..quic.tls_adapter.header_protection_sample_len]);
+    keys.applyHeaderProtection(&out[0], out[pn_offset..][0..pn_len], sample);
+
+    return out[0 .. pn_offset + pn_len + padded_len + quic.tls_adapter.packet_protection_tag_len];
+}
+
+/// #523 test-only: encode a real HTTP/3 request (QPACK HEADERS frame, no
+/// body) — the same primitives `http3.conn.Conn.sendRequest` uses — so the
+/// production H3 request parser genuinely has to decode this, not a
+/// synthetic shortcut.
+fn buildH3RequestBytesForTest(method: []const u8, path: []const u8, authority: []const u8, out: []u8) []const u8 {
+    var fields = [_]http3.qpack.HeaderField{
+        .{ .name = ":method", .value = method },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = authority },
+        .{ .name = ":path", .value = path },
+    };
+    var block: [256]u8 = undefined;
+    const header_block = http3.qpack.encode(&fields, &block) catch unreachable;
+    return http3.frame.encodeKnownFrame(.headers, header_block, out) catch unreachable;
+}
+
+/// #523 test-only: an embedder-shaped request handler using the actual
+/// shared, transport-neutral early-data policy (`http.early_data.decide`,
+/// the same primitive `gateway_handlers.zig`'s production routing uses) —
+/// not a second, test-invented safety layer. `action_class = .local`
+/// mirrors an origin server (not a reverse proxy), the shape
+/// `http3_runtime.Config.request_handler` is meant for.
+const TestEarlyDataHandlerState = struct {
+    executed_local: usize = 0,
+    rejected_too_early: usize = 0,
+    last_method_buf: [8]u8 = undefined,
+    last_method_len: usize = 0,
+};
+
+fn testEarlyDataAwareHandler(
+    _: std.mem.Allocator,
+    request: *const http3_session.StreamRequest,
+    response: *response_mod.Response,
+    user_data: ?*anyopaque,
+) anyerror!void {
+    const state: *TestEarlyDataHandlerState = @ptrCast(@alignCast(user_data.?));
+    const decision = early_data_policy.decide(.{
+        .replay_exposed = request.transport_early,
+        .transport_early = request.transport_early,
+        .inbound_marker = false,
+        .method_safe = early_data_policy.methodSafe(request.method),
+        .route_replay_safe = true,
+        .action_class = .local,
+        .proxy_origin_rfc8470 = false,
+    });
+    switch (decision) {
+        .too_early => {
+            state.rejected_too_early += 1;
+            response.status = .too_early;
+        },
+        .ordinary, .execute_local => {
+            state.executed_local += 1;
+            const len = @min(request.method.len, state.last_method_buf.len);
+            @memcpy(state.last_method_buf[0..len], request.method[0..len]);
+            state.last_method_len = len;
+            response.status = .ok;
+        },
+        .forward_rfc8470, .defer_until_handshake => unreachable, // action_class = .local never yields these
+    }
+}
+
+test "http3 (#523): a replay-safe early request reaches the local handler exactly once; an unsafe one is rejected without dispatch; ordinary post-handshake requests still work" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-early-request-matrix-test");
+
+    var server_entropy = tls_core.production_crypto.OsEntropy{};
+    var server_provider_state = tls_core.production_crypto.Provider.init(server_entropy.entropy());
+    var resumption = try tls_core.resumption_runtime.Runtime.init(
+        testing.allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = fixedNowUnixMsForTest },
+        server_provider_state.cryptoProvider(),
+    );
+    defer resumption.deinit();
+
+    // A separate client-side runtime instance for storing/looking up the
+    // client's own tickets — the server-side `resumption` above and this
+    // one play distinct roles, exactly as they would across two real
+    // processes, matching the pattern the #488 connection-level tests use.
+    var client_entropy = tls_core.production_crypto.OsEntropy{};
+    var client_provider_state = tls_core.production_crypto.Provider.init(client_entropy.entropy());
+    var client_resumption = try tls_core.resumption_runtime.Runtime.init(
+        testing.allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = fixedNowUnixMsForTest },
+        client_provider_state.cryptoProvider(),
+    );
+    defer client_resumption.deinit();
+
+    // `LocalStore`'s real `claim()` path reads real wall-clock time
+    // (`trampolineClaim` → `zig_compat.milliTimestamp()`), while this
+    // test's resumption clock is a small fixed value for determinism —
+    // those would never agree on a retention window. An always-allow gate
+    // still installs through the exact same `EarlyDataReplayGate` seam
+    // production composition uses (proving that seam, not a second policy
+    // layer); `LocalStore`'s own real-clock claim behavior has its own
+    // dedicated test coverage elsewhere.
+    const AlwaysAllow = struct {
+        fn decide(_: *anyopaque, _: tls_core.tls13_backend.EarlyDataReplayCandidate) tls_core.tls13_backend.EarlyDataReplayDecision {
+            return .allow;
+        }
+    };
+    var replay_ctx: u8 = 0;
+    const gate: tls_core.tls13_backend.EarlyDataReplayGate = .{ .ctx = &replay_ctx, .decideFn = AlwaysAllow.decide };
+
+    var handler_state = TestEarlyDataHandlerState{};
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .resumption_runtime = &resumption,
+        .early_data_replay_gate = gate,
+        .enable_0rtt = true,
+        .request_handler = testEarlyDataAwareHandler,
+        .request_handler_ctx = &handler_state,
+    });
+    defer runtime.deinit();
+    try testing.expect(runtime.zero_rtt_enabled);
+
+    // Phase 1: a real handshake, then a real ticket obtained from the
+    // production issuance path (`runtime.issueSessionTicket`), not a
+    // manually-constructed one.
+    const client_cid = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8 };
+    const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const client_path = quic.path.PathKey{
+        .local = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_300),
+        .remote = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_301),
+    };
+    const server_path = quic.path.PathKey{
+        .local = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_301),
+        .remote = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 41_300),
+    };
+    const no_challenge = [_]u8{0} ** quic.path.path_challenge_len;
+
+    var client_backend = try quic.tls_backend.Tls13Backend.initClientWithAllocator(
+        allocator,
+        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
+    );
+
+    const Capture = struct {
+        runtime: *tls_core.resumption_runtime.Runtime,
+        retained: tls_core.session.ClientTicketState = .{},
+        stored: tls_core.session_cache.StoreResult = undefined,
+        count: usize = 0,
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(testing.allocator, &self.retained) catch unreachable;
+            self.stored = self.runtime.storeClientTicket(ticket);
+            self.count += 1;
+        }
+    };
+    var capture = Capture{ .runtime = &client_resumption };
+    defer capture.retained.deinit();
+    try client_backend.engine.setSessionTicketConsumer(allocator, tls_core.session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = Capture.now,
+        .onTicketFn = Capture.onTicket,
+    });
+
+    const backend1 = try allocator.create(quic.tls_backend.Tls13Backend);
+    backend1.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
+        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+        fixed.provider(),
+    );
+    // Native QUIC 1-RTT resumption deliberately ignores connection-specific
+    // transport/application snapshots for *ordinary* resumption matching
+    // (mirrors `accept()`'s own `.transport = .ignore` — see
+    // `h3EarlyDataCompatibility`'s doc comment) — without this, the ticket's
+    // `common.transport_compat` gets stamped non-null and the phase-2
+    // candidate lookup below (which intentionally supplies no
+    // transport/application compat context) would miss on origin-digest
+    // mismatch rather than genuinely testing 0-RTT compatibility.
+    const resume_policy: tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy = .{ .transport = .ignore, .application = .ignore };
+    try client_backend.setResumeCompatibilityPolicy(resume_policy);
+    try backend1.setResumeCompatibilityPolicy(resume_policy);
+
+    const client1 = try Connection.init(allocator, .{
+        .role = .client,
+        .local_cid = &client_cid,
+        .original_dcid = &odcid,
+        .peer_cid = &odcid,
+        .tls = client_backend.backend(),
+        .now_us = 1_000_000,
+        .initial_path = client_path,
+    });
+    defer client1.deinit();
+    const server_conn1 = try Connection.init(allocator, .{
+        .role = .server,
+        .local_cid = &odcid,
+        .original_dcid = &odcid,
+        .peer_cid = &client_cid,
+        .tls = backend1.backend(),
+        .now_us = 1_000_000,
+        .initial_path = server_path,
+    });
+
+    var entry1 = ConnEntry{
+        .backend = backend1,
+        .conn = server_conn1,
+        .h3 = H3.initWithSettings(allocator, .server, .{}),
+        .admission_source_ip = 0,
+        .cid_len = odcid.len,
+        .accepted_at_us = 1_000_000,
+    };
+    defer entry1.deinit(allocator);
+
+    {
+        var rounds: usize = 0;
+        while (rounds < 64) : (rounds += 1) {
+            var progressed = false;
+            var buf: [2048]u8 = undefined;
+            while (client1.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+                try entry1.conn.ingestOnPath(t.bytes, server_path, no_challenge, 1_000_000);
+                progressed = true;
+            }
+            while (entry1.conn.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+                try client1.ingestOnPath(t.bytes, client_path, no_challenge, 1_000_000);
+                progressed = true;
+            }
+            if (!progressed) break;
+        }
+    }
+    try testing.expect(client1.isEstablished());
+    try testing.expect(entry1.conn.isEstablished());
+
+    try runtime.issueSessionTicket(&entry1, &resumption);
+    {
+        var rounds: usize = 0;
+        while (rounds < 16) : (rounds += 1) {
+            var progressed = false;
+            var buf: [2048]u8 = undefined;
+            while (entry1.conn.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+                try client1.ingestOnPath(t.bytes, client_path, no_challenge, 1_000_000);
+                progressed = true;
+            }
+            while (client1.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+                try entry1.conn.ingestOnPath(t.bytes, server_path, no_challenge, 1_000_000);
+                progressed = true;
+            }
+            if (!progressed) break;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), capture.count);
+    try testing.expectEqual(tls_core.session_cache.StoreResult.stored, capture.stored);
+
+    // Phase 2: a fresh resumed connection actually attempting/accepting
+    // 0-RTT, composed exactly the way `accept()` wires it in production.
+    const candidate: tls_core.session.CandidateContext = .{
+        .cipher_suite = capture.retained.common.cipher_suite,
+        .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
+        .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
+        .auth_binding = capture.retained.common.auth_binding,
+        .transport_compat = null,
+        .application_compat = null,
+    };
+    var lookup = client_resumption.lookupClientOffers(candidate);
+    defer lookup.deinit();
+    try testing.expect(lookup == .hit);
+
+    var client_backend2 = quic.tls_backend.Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0xe1} ** 32, .key_share_seed = [_]u8{0x41} ** 32 },
+        .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
+    );
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+    };
+    try client_backend2.engine.setClientPskOfferLease(&lookup.hit, &clock_dummy, ClientClock.now);
+    try client_backend2.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
+    try client_backend2.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 65536 });
+
+    const backend2 = try allocator.create(quic.tls_backend.Tls13Backend);
+    backend2.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
+        .{ .hello_random = [_]u8{0xe2} ** 32, .key_share_seed = [_]u8{0x42} ** 32 },
+        fixed.provider(),
+    );
+    try backend2.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
+    try backend2.setServerPskResolver(resumption.serverResolver().?);
+    try backend2.setEarlyDataReplayGate(gate);
+    try backend2.setServerEarlyDataPolicy(.{ .enabled = true });
+
+    const client2 = try Connection.init(allocator, .{
+        .role = .client,
+        .config = .{ .zero_rtt_enabled = true },
+        .local_cid = &client_cid,
+        .original_dcid = &odcid,
+        .peer_cid = &odcid,
+        .tls = client_backend2.backend(),
+        .now_us = 2_000_000,
+        .initial_path = client_path,
+    });
+    defer client2.deinit();
+    const server_conn2 = try Connection.init(allocator, .{
+        .role = .server,
+        .config = .{ .zero_rtt_enabled = true },
+        .local_cid = &odcid,
+        .original_dcid = &odcid,
+        .peer_cid = &client_cid,
+        .tls = backend2.backend(),
+        .now_us = 2_000_000,
+        .initial_path = server_path,
+    });
+
+    var entry2 = ConnEntry{
+        .backend = backend2,
+        .conn = server_conn2,
+        .h3 = H3.initWithSettings(allocator, .server, .{}),
+        .admission_source_ip = 0,
+        .cid_len = odcid.len,
+        .accepted_at_us = 2_000_000,
+    };
+    defer entry2.deinit(allocator);
+
+    // Drive only the client's first flight so the server accepts 0-RTT and
+    // installs its read key, but is not yet established — the actual
+    // early-data window this test targets.
+    {
+        var buf: [2048]u8 = undefined;
+        while (client2.pollTransmitOnPath(&buf, 2_000_000)) |t| {
+            try entry2.conn.ingestOnPath(t.bytes, server_path, no_challenge, 2_000_000);
+        }
+    }
+    try testing.expect(!entry2.conn.isEstablished());
+    try testing.expect(entry2.conn.adapter.protectionKeys(.zero_rtt, .read) != null);
+
+    const real_secret = entry2.conn.adapter.secret(.zero_rtt, .read).?.slice()[0..quic.tls_adapter.traffic_secret_len].*;
+
+    // Two real, QPACK-encoded 0-RTT H3 requests on distinct stream ids
+    // (40/44, staying clear of the ids the client's own stream manager will
+    // naturally hand out later for the ordinary post-handshake request) —
+    // a replay-safe GET and a replay-unsafe POST.
+    var get_h3: [128]u8 = undefined;
+    const get_bytes = buildH3RequestBytesForTest("GET", "/safe", "example.com", &get_h3);
+    var get_frame_buf: [160]u8 = undefined;
+    const get_frame_len = try quic.frame.encodeStream(40, 0, get_bytes, true, &get_frame_buf);
+    var get_wire: [512]u8 = undefined;
+    const get_datagram = sealZeroRttPacketForTest(&odcid, &client_cid, real_secret, 0, get_frame_buf[0..get_frame_len], &get_wire);
+    try entry2.conn.ingestOnPath(get_datagram, server_path, no_challenge, 2_000_000);
+
+    var post_h3: [128]u8 = undefined;
+    const post_bytes = buildH3RequestBytesForTest("POST", "/unsafe", "example.com", &post_h3);
+    var post_frame_buf: [160]u8 = undefined;
+    const post_frame_len = try quic.frame.encodeStream(44, 0, post_bytes, true, &post_frame_buf);
+    var post_wire: [512]u8 = undefined;
+    const post_datagram = sealZeroRttPacketForTest(&odcid, &client_cid, real_secret, 1, post_frame_buf[0..post_frame_len], &post_wire);
+    try entry2.conn.ingestOnPath(post_datagram, server_path, no_challenge, 2_000_000);
+
+    // Drive H3 during the early-data window — before establishment. This is
+    // exactly `pumpH3`, the function the second-pass review's finding #2
+    // required to work pre-establishment.
+    runtime.pumpH3(&entry2, 2_000_000);
+
+    // The safe GET reached the local-execution path exactly once; the
+    // unsafe POST was rejected by the shared early-data policy without
+    // ever reaching that path — proving the safety decision, not just
+    // QUIC-level STREAM delivery.
+    try testing.expectEqual(@as(usize, 1), handler_state.executed_local);
+    try testing.expectEqualStrings("GET", handler_state.last_method_buf[0..handler_state.last_method_len]);
+    try testing.expectEqual(@as(usize, 1), handler_state.rejected_too_early);
+
+    // Ordinary (non-early) request post-handshake: even an otherwise-unsafe
+    // method dispatches normally once the connection is fully established,
+    // proving the 425 above was strictly an early-data-window decision, not
+    // a permanent rejection of that route. Reuses phase 1's already-
+    // established `client1`/`entry1` pair rather than continuing to drive
+    // `client2`/`entry2`: the fabricated 0-RTT packets above were sealed
+    // with a throwaway sender adapter that shares no packet-number state
+    // with `client2`'s own counters, so letting `client2` go on to send
+    // real application-space packets of its own would collide with the
+    // packet numbers (0 and 1) those fabricated packets already consumed in
+    // the space 0-RTT and 1-RTT share.
+    const ordinary_id = try client1.openStream(.bidi);
+    var ordinary_h3: [128]u8 = undefined;
+    const ordinary_bytes = buildH3RequestBytesForTest("POST", "/ordinary", "example.com", &ordinary_h3);
+    _ = try client1.writeStream(ordinary_id, ordinary_bytes, true);
+    {
+        var rounds: usize = 0;
+        while (rounds < 32) : (rounds += 1) {
+            var progressed = false;
+            var buf: [2048]u8 = undefined;
+            while (client1.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+                try entry1.conn.ingestOnPath(t.bytes, server_path, no_challenge, 1_000_000);
+                progressed = true;
+            }
+            while (entry1.conn.pollTransmitOnPath(&buf, 1_000_000)) |t| {
+                try client1.ingestOnPath(t.bytes, client_path, no_challenge, 1_000_000);
+                progressed = true;
+            }
+            runtime.pumpH3(&entry1, 1_000_000);
+            if (!progressed) break;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), handler_state.executed_local);
+    try testing.expectEqualStrings("POST", handler_state.last_method_buf[0..handler_state.last_method_len]);
+    try testing.expectEqual(@as(usize, 1), handler_state.rejected_too_early);
 }
 
 test "runtime resolves the actual bound local address, including an OS-assigned port, from quic_port = 0" {
