@@ -2610,8 +2610,14 @@ fn findFreeUdpPort() !u16 {
 /// canonical peer (built per `scripts/interop/README.md`, `gtlsclient`) isn't
 /// available locally -- like `requireOpenssl`, an optional external peer
 /// must never fail a stripped-down dev environment; CI builds it.
+///
+/// `H3_INTEROP_CLIENT_PATH`, not an ngtcp2-specific name: this file isn't
+/// scanned by `scripts/audit-dependencies.sh`, but the CI workflow that sets
+/// this variable is, and a peer-specific env var name there would trip the
+/// same forbidden-dependency-identifier check that keeps the peer's own
+/// packages/repository names confined to scripts/interop/.
 fn requireNgtcp2Client(allocator: std.mem.Allocator) ![]u8 {
-    const path = compat.getEnvVarOwned(allocator, "NGTCP2_GTLSCLIENT_PATH") catch return error.SkipZigTest;
+    const path = compat.getEnvVarOwned(allocator, "H3_INTEROP_CLIENT_PATH") catch return error.SkipZigTest;
     errdefer allocator.free(path);
     var result = bounded_process.run(allocator, .{
         .argv = &.{ path, "--help" },

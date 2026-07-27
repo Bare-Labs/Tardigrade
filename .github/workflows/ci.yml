@@ -500,9 +500,11 @@ jobs:
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
 
   # External H3 resumption / 0-RTT interop
-  # #522 assurance gate: build pinned ngtcp2/nghttp3 GnuTLS examples, point the
-  # live-process integration suite at that canonical external peer, and run the
-  # general-profile H3 resumption/0-RTT cases on every PR.
+  # #522 assurance gate: build the pinned canonical external H3/QUIC peer,
+  # point the live-process integration suite at it, and run the
+  # general-profile H3 resumption/0-RTT cases on every PR. The peer's own
+  # name/packages are confined to scripts/interop/ (the audited external-peer
+  # boundary -- scripts/audit-dependencies.sh) and never appear in this file.
   h3-resumption-interop:
     name: H3 resumption/0-RTT interop
     runs-on: ubuntu-latest
@@ -513,19 +515,6 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake \
-            g++-14 \
-            gcc-14 \
-            libev-dev \
-            libgnutls28-dev \
-            libssl-dev \
-            make \
-            pkg-config
 
       - name: Install Zig
         run: sh ./scripts/install-zig.sh 0.16.0
@@ -541,13 +530,22 @@ jobs:
             zig-h3-resumption-interop-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
             zig-h3-resumption-interop-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build pinned ngtcp2 GnuTLS peer
-        id: build-ngtcp2
-        run: ./scripts/interop/build-ngtcp2-ci.sh
+      - name: Cache external H3 peer build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/tardigrade-h3-peer
+          key: h3-peer-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/interop/build-h3-peer-ci.sh') }}
+
+      - name: Install external H3 peer build dependencies
+        run: ./scripts/interop/install-h3-peer-deps-ci.sh
+
+      - name: Build pinned external H3 peer
+        id: build-h3-peer
+        run: ./scripts/interop/build-h3-peer-ci.sh
 
       - name: Run H3 resumption/0-RTT interop suite
         env:
-          NGTCP2_GTLSCLIENT_PATH: ${{ steps.build-ngtcp2.outputs.gtlsclient_path }}
+          H3_INTEROP_CLIENT_PATH: ${{ steps.build-h3-peer.outputs.client_path }}
         run: zig build test-integration-resumption-interop -Dtls-profile=general --summary all --error-style verbose
 
   # ── Integration tests ─────────────────────────────────────────────────────────

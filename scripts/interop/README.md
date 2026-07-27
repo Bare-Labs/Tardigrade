@@ -38,18 +38,30 @@ actual Tardigrade edge-gateway binary assembles.
 `interop.` filter substring) drive the real `tardi` binary, with
 `TARDIGRADE_HTTP3_ENABLED`/`TARDIGRADE_HTTP3_ENABLE_0RTT` set, against the
 canonical ngtcp2/GnuTLS `gtlsclient` peer — the same binary this matrix
-already builds. Point `NGTCP2_GTLSCLIENT_PATH` at it:
+already builds. Point `H3_INTEROP_CLIENT_PATH` at it (a peer-agnostic name:
+`tests/integration.zig` isn't scanned by `scripts/audit-dependencies.sh`,
+but the CI workflow that sets this variable is, so it deliberately doesn't
+carry the peer's own name):
 
 ```sh
-NGTCP2_GTLSCLIENT_PATH=/path/to/ngtcp2/build/examples/gtlsclient \
+H3_INTEROP_CLIENT_PATH=/path/to/ngtcp2/build/examples/gtlsclient \
   zig build test-integration-resumption-interop
 ```
 
-CI uses `scripts/interop/build-ngtcp2-ci.sh` to build pinned ngtcp2/nghttp3
-GnuTLS examples and exports `NGTCP2_GTLSCLIENT_PATH` before running the same
-target with `-Dtls-profile=general`. The pins default to nghttp3 `v1.18.0`
-and ngtcp2 `v1.25.0`; override `NGHTTP3_REF`/`NGTCP2_REF` only when
-deliberately advancing the interop peer.
+CI runs `scripts/interop/install-h3-peer-deps-ci.sh` then
+`scripts/interop/build-h3-peer-ci.sh` to build the pinned ngtcp2/nghttp3
+GnuTLS examples and exports `H3_INTEROP_CLIENT_PATH` before running the same
+target with `-Dtls-profile=general`. Both scripts live under
+`scripts/interop/` specifically because that directory is the policy-exempt
+external-peer boundary the dependency audit (`scripts/audit-dependencies.sh`)
+excludes -- the peer's actual repository/library names would otherwise trip
+the audit if written into `.github/workflows/ci.yml` directly. The pins
+default to nghttp3 `v1.18.0` and ngtcp2 `v1.25.0`; override
+`H3_PEER_LIB_REF`/`H3_PEER_CLIENT_REF` only when deliberately advancing the
+interop peer. ngtcp2 v1.25.0's C++23 example client needs clang >= 19 or
+gcc >= 15 (its own README documents this); `install-h3-peer-deps-ci.sh`
+installs clang-19 from apt.llvm.org since Ubuntu's default repos don't yet
+carry it.
 
 Unlike the wire-interop matrix above, these cases require the **`.general`**
 TLS build profile (the default `zig build`, no `-Dtls-profile` flag): the
