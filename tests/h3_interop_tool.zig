@@ -64,6 +64,8 @@ fn logEvent(_: ?*anyopaque, event: connection.Event) void {
         .close_received => |c| std.fmt.bufPrint(&buf, "close received code={d} app={}", .{ c.error_code, c.is_application }),
         .idle_timeout => std.fmt.bufPrint(&buf, "idle timeout", .{}),
         .path_validated => |p| std.fmt.bufPrint(&buf, "path validated change={s} remote_port={d}", .{ @tagName(p.change), p.path.remote.port }),
+        .zero_rtt_packet => |z| std.fmt.bufPrint(&buf, "zero_rtt_packet outcome={s} size={d}", .{ @tagName(z.outcome), z.size }),
+        .early_data_decision => |d| std.fmt.bufPrint(&buf, "early_data_decision {s}", .{@tagName(d)}),
     } catch return;
     std.debug.print("h3-interop: {s}\n", .{line});
 }
