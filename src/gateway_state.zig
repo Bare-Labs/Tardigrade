@@ -38,6 +38,12 @@ pub const Http2PendingStream = struct {
     dispatch_count: u8 = 0,
     early_request_recorded: bool = false,
     deferred_recorded: bool = false,
+    /// Set when inbound DATA would grow `body` past the configured request
+    /// body limit. Further DATA payload is dropped (neither appended nor
+    /// credited back) once set, bounding memory regardless of how long the
+    /// client keeps streaming; the stream is rejected with 413 on dispatch
+    /// without ever reaching the upstream.
+    body_limit_exceeded: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Http2PendingStream {
         return .{

@@ -2676,6 +2676,53 @@ fn pureZigH2GetBodyWithWindowUpdates(allocator: std.mem.Allocator, port: u16, he
     return error.H2ResponseNotFound;
 }
 
+fn pureZigH2PostMultiFrameBody(
+    allocator: std.mem.Allocator,
+    port: u16,
+    headers: []const hpack.HeaderField,
+    chunks: []const []const u8,
+) ![]u8 {
+    const client = try PureZigTlsClient.create(allocator, port, "h2");
+    defer client.destroy();
+
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{}); // client SETTINGS
+
+    const request_block = try hpack.encodeLiteralHeaderBlock(allocator, headers);
+    defer allocator.free(request_block);
+    try client.writeHttp2Frame(0x1, 0x4, 1, request_block); // END_HEADERS, body follows
+
+    for (chunks, 0..) |chunk, i| {
+        const flags: u8 = if (i == chunks.len - 1) 0x1 else 0x0; // END_STREAM on last chunk
+        try client.writeHttp2Frame(0x0, flags, 1, chunk);
+    }
+
+    var response_body = std.array_list.Managed(u8).init(allocator);
+    errdefer response_body.deinit();
+
+    var frame_count: usize = 0;
+    while (frame_count < 32) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+
+        switch (frame.typ) {
+            0x4 => {
+                if ((frame.flags & 0x1) == 0) {
+                    try client.writeHttp2Frame(0x4, 0x1, 0, &.{}); // SETTINGS ACK
+                }
+            },
+            0x0 => {
+                if (frame.stream_id == 1) {
+                    try response_body.appendSlice(frame.payload);
+                    if ((frame.flags & 0x1) != 0) return response_body.toOwnedSlice();
+                }
+            },
+            else => {},
+        }
+    }
+    return error.H2ResponseNotFound;
+}
+
 fn appendHttp2Frame(bytes: *std.array_list.Managed(u8), typ: u8, flags: u8, stream_id: u31, payload: []const u8) !void {
     var header: [9]u8 = undefined;
     header[0] = @intCast((payload.len >> 16) & 0xff);
@@ -3340,6 +3387,117 @@ test "interop.openssl.h2.auth_required_proxy_fails_closed" {
     try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
 }
 
+test "interop.h2.proxy_malformed_authority_rejected_before_upstream" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "must-not-run" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-authority {{
+        \\    proxy_pass http://{s}:{d}/h2-authority;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    // A CRLF-bearing `:authority` must never be interpolated into the raw
+    // `Host: {authority}` text the synthetic HTTP/1 request is built from --
+    // otherwise it smuggles a second, attacker-controlled header past HPACK.
+    const headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-authority" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test\r\nX-Injected: evil" },
+    };
+    // The connection is torn down without ever producing a response, so the
+    // specific transport-level error observed by the client can vary; what
+    // matters is that the request never succeeds and never reaches upstream.
+    if (pureZigH2GetBody(allocator, tardigrade.port, headers[0..])) |body| {
+        allocator.free(body);
+        return error.TestUnexpectedSuccess;
+    } else |_| {}
+    compat.sleepNs(200 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+}
+
+test "interop.h2.proxy_oversized_body_across_data_frames_rejected_boundedly" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "must-not-run" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-body-limit {{
+        \\    proxy_pass http://{s}:{d}/h2-body-limit;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_MAX_BODY_SIZE", .value = "24" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":path", .value = "/h2-body-limit" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    // Three 20-byte DATA frames (60 bytes total) against a 24-byte limit:
+    // the second frame alone would already exceed it, so the ingestion-time
+    // guard must stop buffering well before the whole body is resident.
+    const chunk = "12345678901234567890"[0..20];
+    const chunks = [_][]const u8{ chunk, chunk, chunk };
+    const body = try pureZigH2PostMultiFrameBody(allocator, tardigrade.port, headers[0..], chunks[0..]);
+    defer allocator.free(body);
+    try assertContains(body, "\"code\":\"invalid_request\"");
+    compat.sleepNs(200 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+}
+
 test "interop.h2.proxy_response_waits_for_window_update" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
@@ -3396,6 +3554,145 @@ test "interop.h2.proxy_response_waits_for_window_update" {
     try std.testing.expectEqualStrings(large_response, body);
     try waitForUpstreamCount(&upstream, 1, 2_000);
     try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+}
+
+test "interop.h2.proxy_multiplexed_streams_complete_after_window_update" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const large_response = try allocator.alloc(u8, 80 * 1024);
+    defer allocator.free(large_response);
+    for (large_response, 0..) |*b, i| {
+        b.* = @as(u8, 'a') + @as(u8, @intCast(i % 26));
+    }
+
+    var large_upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = large_response,
+        .connection_header = "close",
+    }});
+    defer large_upstream.stop();
+    try large_upstream.run();
+
+    var small_upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "h2-mux-small-body",
+        .connection_header = "close",
+    }});
+    defer small_upstream.stop();
+    try small_upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-mux-large {{
+        \\    proxy_pass http://{s}:{d}/h2-mux-large;
+        \\}}
+        \\
+        \\location = /h2-mux-small {{
+        \\    proxy_pass http://{s}:{d}/h2-mux-small;
+        \\}}
+    , .{ test_host, large_upstream.port(), test_host, small_upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+    try large_upstream.resetCapture();
+    try small_upstream.resetCapture();
+
+    const client = try PureZigTlsClient.create(allocator, tardigrade.port, "h2");
+    defer client.destroy();
+
+    try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    try client.writeHttp2Frame(0x4, 0, 0, &.{}); // client SETTINGS
+
+    // Stream 1: a response bigger than the 65,535-byte default connection
+    // and stream send windows, so it blocks mid-flight on the server side.
+    const large_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-mux-large" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const large_block = try hpack.encodeLiteralHeaderBlock(allocator, large_headers[0..]);
+    defer allocator.free(large_block);
+    try client.writeHttp2Frame(0x1, 0x1 | 0x4, 1, large_block); // END_STREAM | END_HEADERS
+
+    // Stream 3: sent right behind stream 1, while its response is still
+    // flow-control blocked server-side. A response writer that reads the
+    // connection itself (instead of leaving the central frame loop as the
+    // sole reader) would consume and drop these HEADERS.
+    const small_headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-mux-small" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const small_block = try hpack.encodeLiteralHeaderBlock(allocator, small_headers[0..]);
+    defer allocator.free(small_block);
+    try client.writeHttp2Frame(0x1, 0x1 | 0x4, 3, small_block); // END_STREAM | END_HEADERS
+
+    var stream1_body = std.array_list.Managed(u8).init(allocator);
+    defer stream1_body.deinit();
+    var stream3_body = std.array_list.Managed(u8).init(allocator);
+    defer stream3_body.deinit();
+    var stream1_done = false;
+    var stream3_done = false;
+    var granted_more_credit = false;
+
+    var frame_count: usize = 0;
+    while (frame_count < 64 and !(stream1_done and stream3_done)) : (frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+
+        switch (frame.typ) {
+            0x4 => { // SETTINGS
+                if ((frame.flags & 0x1) == 0) try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+            },
+            0x0 => { // DATA
+                if (frame.stream_id == 1) {
+                    try stream1_body.appendSlice(frame.payload);
+                    if ((frame.flags & 0x1) != 0) stream1_done = true;
+                } else if (frame.stream_id == 3) {
+                    try stream3_body.appendSlice(frame.payload);
+                    if ((frame.flags & 0x1) != 0) stream3_done = true;
+                }
+                // Once stream 1 has produced its initial (blocked) burst,
+                // grant enough credit on both the connection and stream 1
+                // for everything outstanding to finish.
+                if (!granted_more_credit and stream1_body.items.len > 0 and !stream1_done) {
+                    granted_more_credit = true;
+                    var inc: [4]u8 = undefined;
+                    std.mem.writeInt(u32, inc[0..4], @as(u32, @intCast(large_response.len)), .big);
+                    try client.writeHttp2Frame(0x8, 0, 0, inc[0..]); // connection WINDOW_UPDATE
+                    try client.writeHttp2Frame(0x8, 0, 1, inc[0..]); // stream 1 WINDOW_UPDATE
+                }
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(stream1_done);
+    try std.testing.expect(stream3_done);
+    try std.testing.expectEqualStrings(large_response, stream1_body.items);
+    try std.testing.expectEqualStrings("h2-mux-small-body", stream3_body.items);
+    try waitForUpstreamCount(&large_upstream, 1, 2_000);
+    try waitForUpstreamCount(&small_upstream, 1, 2_000);
+    try std.testing.expectEqual(@as(u32, 1), large_upstream.requestCount());
+    try std.testing.expectEqual(@as(u32, 1), small_upstream.requestCount());
 }
 
 test "interop.h2.proxy_acl_denial_has_no_upstream_side_effect" {
@@ -3545,6 +3842,116 @@ test "interop.h2.proxy_retry_orchestration_fails_closed" {
     const headers = [_]hpack.HeaderField{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":path", .value = "/h2-retry" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const body = try pureZigH2GetBody(allocator, tardigrade.port, headers[0..]);
+    defer allocator.free(body);
+    try assertContains(body, "\"code\":\"h2_proxy_policy_unsupported\"");
+    compat.sleepNs(200 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+}
+
+test "interop.h2.proxy_pre_route_middleware_fails_closed" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "must-not-run" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-mirror {{
+        \\    proxy_pass http://{s}:{d}/h2-mirror;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            // A mirror rule is pre-route middleware H1 runs via
+            // `runMiddlewarePipeline` before any proxy side effect. It need
+            // not even match this request's path -- its mere presence in the
+            // config means H1 and H2 could diverge on this route, so the
+            // narrow H2 executor must fail closed whenever *any* such rule
+            // is configured, not just when it happens to apply here.
+            .{ .name = "TARDIGRADE_MIRROR_RULES", .value = "POST|^/never-matches$|http://127.0.0.1:9/mirror" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-mirror" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const body = try pureZigH2GetBody(allocator, tardigrade.port, headers[0..]);
+    defer allocator.free(body);
+    try assertContains(body, "\"code\":\"h2_proxy_policy_unsupported\"");
+    compat.sleepNs(200 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+}
+
+test "interop.h2.proxy_location_streaming_override_fails_closed" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "must-not-run" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    // The global streaming mode stays at its "off" default; only this
+    // location overrides it to `full`. The fail-closed check must inspect
+    // the matched location's *effective* policy, not just the global mode,
+    // or this override would silently bypass it over H2.
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-stream-override {{
+        \\    proxy_pass http://{s}:{d}/h2-stream-override;
+        \\    proxy_streaming full;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-stream-override" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "tardigrade.test" },
     };
