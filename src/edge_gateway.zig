@@ -2299,7 +2299,7 @@ fn h2DispatchReadyStreams(
             state.metricsRecordEarlyDataDecision(.h2, .accepted);
         }
 
-        try respondHttp2Stream(conn.writer(), allocator, state, cfg, sid, ps, next_server_stream_id, conn_send_window, stream_send, connection_ip);
+        try respondHttp2Stream(conn, allocator, state, cfg, sid, ps, next_server_stream_id, conn_send_window, stream_send, connection_ip);
         ps.dispatch_count += 1;
         if (pending.fetchRemove(sid)) |removed| {
             var tmp = removed.value;
@@ -2520,7 +2520,7 @@ fn lowercaseName(allocator: std.mem.Allocator, owned: *std.array_list.Managed([]
 }
 
 fn respondHttp2Stream(
-    writer: anytype,
+    conn: anytype,
     allocator: std.mem.Allocator,
     state: *GatewayState,
     cfg: *const edge_config.EdgeConfig,
@@ -2571,29 +2571,16 @@ fn respondHttp2Stream(
                 body = body_alloc.?;
                 try appendHttp2UpstreamResponseHeaders(allocator, &response_headers, &lowered_names, &owned_header_values, &response);
             },
-            .unauthorized => {
-                status_code = 401;
-                body_alloc = try gp.buildApiErrorJson(allocator, "unauthorized", "Unauthorized", correlation_id);
+            .local_rejection => |rejection| {
+                status_code = rejection.status_code;
+                body_alloc = try gp.buildApiErrorJson(allocator, rejection.code, rejection.message, correlation_id);
                 body = body_alloc.?;
-                state.metricsRecordErrorCode("unauthorized");
+                if (rejection.retry_after) |value| {
+                    try response_headers.append(.{ .name = "retry-after", .value = value });
+                }
+                state.metricsRecordErrorCode(rejection.code);
             },
         }
-    }
-
-    const effective_window: i32 = @min(conn_send_window.*, stream_send_window);
-    if (body.len > @as(usize, @intCast(@max(effective_window, 0)))) {
-        status_code = 502;
-        if (body_alloc) |b| {
-            allocator.free(b);
-            body_alloc = null;
-        }
-        body_alloc = try allocator.dupe(u8, "{\"error\":\"h2_flow_control_blocked\"}");
-        body = body_alloc.?;
-        response_headers.clearRetainingCapacity();
-        for (lowered_names.items) |n| allocator.free(n);
-        lowered_names.clearRetainingCapacity();
-        for (owned_header_values.items) |v| allocator.free(v);
-        owned_header_values.clearRetainingCapacity();
     }
 
     const status_str = try std.fmt.allocPrint(allocator, "{d}", .{status_code});
@@ -2615,21 +2602,29 @@ fn respondHttp2Stream(
     defer allocator.free(header_block);
 
     try http.http2_frame.writeFrame(
-        writer,
+        conn.writer(),
         .headers,
         http.http2_frame.Flags.END_HEADERS,
         stream_id,
         header_block,
     );
 
-    try writeHttp2DataFrames(writer, stream_id, body, conn_send_window);
+    var stream_window = stream_send_window;
+    try writeHttp2DataFramesFlowControlled(conn, allocator, stream_id, body, conn_send_window, &stream_window);
 
     state.metricsRecord(status_code);
 }
 
 const Http2ProxyRouteResult = union(enum) {
     response: gp.BufferedUpstreamResponse,
-    unauthorized,
+    local_rejection: Http2LocalRejection,
+};
+
+const Http2LocalRejection = struct {
+    status_code: u16,
+    code: []const u8,
+    message: []const u8,
+    retry_after: ?[]const u8 = null,
 };
 
 fn executeHttp2ProxyRoute(
@@ -2649,13 +2644,25 @@ fn executeHttp2ProxyRoute(
 
     var effective_cfg_storage = cfg.*;
     const route_cfg = http2RouteConfig(cfg, request, &effective_cfg_storage) orelse return null;
+    if (h2EvaluateRequestPolicy(route_cfg, state, request, connection_ip)) |rejection| {
+        return .{ .local_rejection = rejection };
+    }
 
     const matched = http.location_router.matchLocation(request.uri.path, route_cfg.location_blocks) orelse return null;
-    if (matched.block.auth == .required) return .unauthorized;
+    if (matched.block.auth == .required) return .{ .local_rejection = .{
+        .status_code = @intFromEnum(http.Status.unauthorized),
+        .code = "unauthorized",
+        .message = "Unauthorized",
+    } };
     const target = switch (matched.block.action) {
         .proxy_pass => |value| value,
         else => return null,
     };
+    if (h2UnsupportedProxyOrchestration(route_cfg, target)) return .{ .local_rejection = .{
+        .status_code = @intFromEnum(http.Status.not_implemented),
+        .code = "h2_proxy_policy_unsupported",
+        .message = "HTTP/2 proxy route requires unsupported proxy orchestration",
+    } };
 
     const suffix_path = gproxy_runtime.proxySuffixPathForLocation(request.uri.path, matched, route_cfg.location_blocks);
     const resolved = try gp.resolveProxyTarget(allocator, route_cfg.upstream_base_url, target, suffix_path);
@@ -2710,6 +2717,93 @@ fn executeHttp2ProxyRoute(
             &.{},
     );
     return .{ .response = proxy_response.bounded_buffered };
+}
+
+fn h2EvaluateRequestPolicy(
+    cfg: *const edge_config.EdgeConfig,
+    state: *GatewayState,
+    request: *const http.Request,
+    client_ip: []const u8,
+) ?Http2LocalRejection {
+    if (cfg.geo_blocked_countries.len > 0) {
+        const country = request.headers.get(cfg.geo_country_header);
+        if (h2IsGeoBlocked(cfg.geo_blocked_countries, country)) {
+            return .{ .status_code = 403, .code = "forbidden", .message = "Geo access denied" };
+        }
+    }
+
+    const limits = cfg.request_limits;
+    if (http.request_limits.validateUriLength(request.uri.path.len, limits) != .ok) {
+        return .{ .status_code = 414, .code = "invalid_request", .message = "URI too long" };
+    }
+    if (http.request_limits.validateHeaderCount(request.headers.count(), limits) != .ok) {
+        return .{ .status_code = 431, .code = "invalid_request", .message = "Too many headers" };
+    }
+    var headers_total: usize = 0;
+    for (request.headers.iterator()) |h| {
+        const header_len = h.name.len + h.value.len + 2;
+        if (http.request_limits.validateHeaderSize(header_len, limits) != .ok) {
+            return .{ .status_code = 431, .code = "invalid_request", .message = "Header too large" };
+        }
+        headers_total += h.name.len + h.value.len + 4;
+    }
+    if (http.request_limits.validateHeadersTotalSize(headers_total, limits) != .ok) {
+        return .{ .status_code = 431, .code = "invalid_request", .message = "Headers too large" };
+    }
+    if (request.body) |body| {
+        if (http.request_limits.validateBodySize(body.len, limits) != .ok) {
+            return .{ .status_code = 413, .code = "invalid_request", .message = "Request body too large" };
+        }
+    }
+
+    if (cfg.access_control_rules.len > 0) {
+        if (state.access_control) |*acl| {
+            if (acl.check(client_ip) == .denied) {
+                return .{ .status_code = 403, .code = "forbidden", .message = "Access denied" };
+            }
+        }
+    }
+
+    if (cfg.rate_limit_rps > 0 and cfg.rate_limit_burst > 0) {
+        var rate_limit_buf: [192]u8 = undefined;
+        const limit_key = h2RateLimitDescriptor(null, client_ip, &rate_limit_buf);
+        if (!state.rateLimitAllow(limit_key)) {
+            return .{ .status_code = 429, .code = "rate_limited", .message = "Rate limit exceeded", .retry_after = "1" };
+        }
+    }
+
+    return null;
+}
+
+fn h2UnsupportedProxyOrchestration(cfg: *const edge_config.EdgeConfig, target: []const u8) bool {
+    _ = target;
+    const pool = gs.upstreamPoolForScope(cfg, .global);
+    return cfg.upstream_retry_attempts > 1 or
+        cfg.upstream_pool_max_active_per_host > 0 or
+        pool.primary_urls.len > 0 or
+        pool.backup_urls.len > 0 or
+        cfg.proxy_streaming_mode != .off;
+}
+
+fn h2IsGeoBlocked(blocked: []const []const u8, country: ?[]const u8) bool {
+    const c = country orelse return false;
+    for (blocked) |b| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, b, " \t\r\n"), std.mem.trim(u8, c, " \t\r\n"))) return true;
+    }
+    return false;
+}
+
+fn h2RateLimitDescriptor(identity: ?[]const u8, client_ip: []const u8, buf: *[192]u8) []const u8 {
+    if (identity) |id| {
+        return std.fmt.bufPrint(buf, "identity:{s}", .{id}) catch blk: {
+            const hash = std.hash.Wyhash.hash(0, id);
+            break :blk std.fmt.bufPrint(buf, "identity-hash:{x}", .{hash}) catch "identity-hash";
+        };
+    }
+    return std.fmt.bufPrint(buf, "ip:{s}", .{client_ip}) catch blk: {
+        const hash = std.hash.Wyhash.hash(0, client_ip);
+        break :blk std.fmt.bufPrint(buf, "ip-hash:{x}", .{hash}) catch "ip-hash";
+    };
 }
 
 const Http2SyntheticRequest = struct {
@@ -2820,22 +2914,69 @@ fn appendHttp2UpstreamResponseHeaders(
     }
 }
 
-fn writeHttp2DataFrames(writer: anytype, stream_id: u31, body: []const u8, conn_send_window: *i32) !void {
+fn writeHttp2DataFramesFlowControlled(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    stream_id: u31,
+    body: []const u8,
+    conn_send_window: *i32,
+    stream_send_window: *i32,
+) !void {
     const max_data_frame: usize = HTTP2_MAX_FRAME_SIZE;
     if (body.len == 0) {
-        try http.http2_frame.writeFrame(writer, .data, http.http2_frame.Flags.END_STREAM, stream_id, &.{});
+        try http.http2_frame.writeFrame(conn.writer(), .data, http.http2_frame.Flags.END_STREAM, stream_id, &.{});
         return;
     }
     var offset: usize = 0;
     while (offset < body.len) {
-        const remaining_window: usize = @intCast(@max(conn_send_window.*, 0));
+        while (@min(conn_send_window.*, stream_send_window.*) <= 0) {
+            try waitForHttp2SendCredit(conn, allocator, stream_id, conn_send_window, stream_send_window);
+        }
+        const remaining_window: usize = @intCast(@min(conn_send_window.*, stream_send_window.*));
         const n = @min(@min(max_data_frame, remaining_window), body.len - offset);
-        if (n == 0) return error.Http2FlowControlBlocked;
         const end = offset + n;
         const flags: u8 = if (end == body.len) http.http2_frame.Flags.END_STREAM else 0;
-        try http.http2_frame.writeFrame(writer, .data, flags, stream_id, body[offset..end]);
+        try http.http2_frame.writeFrame(conn.writer(), .data, flags, stream_id, body[offset..end]);
         conn_send_window.* -= @intCast(n);
+        stream_send_window.* -= @intCast(n);
         offset = end;
+    }
+}
+
+fn waitForHttp2SendCredit(
+    conn: anytype,
+    allocator: std.mem.Allocator,
+    stream_id: u31,
+    conn_send_window: *i32,
+    stream_send_window: *i32,
+) !void {
+    while (@min(conn_send_window.*, stream_send_window.*) <= 0) {
+        var frame = http.http2_frame.readFrame(conn, allocator, HTTP2_MAX_FRAME_SIZE) catch |err| switch (err) {
+            error.ConnectionClosed => return error.ClientAborted,
+            else => return err,
+        };
+        defer http.http2_frame.deinitFrame(allocator, &frame);
+        switch (frame.typ) {
+            .settings => {
+                if ((frame.flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writeSettingsAck(conn.writer());
+            },
+            .ping => {
+                if ((frame.flags & http.http2_frame.Flags.ACK) == 0) try http.http2_frame.writePingAck(conn.writer(), frame.payload);
+            },
+            .window_update => {
+                const inc = try http.http2_frame.parseWindowUpdateIncrement(frame.payload);
+                if (frame.stream_id == 0) {
+                    conn_send_window.* += @intCast(inc);
+                } else if (frame.stream_id == stream_id) {
+                    stream_send_window.* += @intCast(inc);
+                }
+            },
+            .rst_stream => {
+                if (frame.stream_id == stream_id) return error.ClientAborted;
+            },
+            .goaway => return error.ClientAborted,
+            else => {},
+        }
     }
 }
 
@@ -5040,6 +5181,10 @@ const H2DispatchTestConn = struct {
 
     fn writer(self: *H2DispatchTestConn) Writer {
         return .{ .conn = self };
+    }
+
+    pub fn read(_: *H2DispatchTestConn, _: []u8) !usize {
+        return error.ConnectionClosed;
     }
 
     fn beginReadScope(_: *H2DispatchTestConn) void {}
