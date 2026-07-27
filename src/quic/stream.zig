@@ -556,6 +556,35 @@ pub const StreamManager = struct {
         if (limit > stream.max_send_data) stream.max_send_data = limit;
     }
 
+    /// Swap in the peer's authenticated transport parameters once the
+    /// handshake completes, for a manager that was brought up early (before
+    /// authentication) to admit 0-RTT stream data. Only ever raises existing
+    /// send-side limits, mirroring `applyMaxData`/`applyMaxStreamData` — the
+    /// placeholder parameters used during 0-RTT are never more permissive
+    /// than what the real peer eventually grants, since nothing may be sent
+    /// through this manager until this call has already happened.
+    pub fn refreshPeerParams(self: *StreamManager, peer_params: config.TransportParameters) void {
+        // MAX_STREAMS received during 0-RTT (`applyMaxStreams`, monotonic)
+        // already raised `self.peer.initial_max_streams_{bidi,uni}` above
+        // whatever the placeholder started at — preserve that credit rather
+        // than overwriting it with the peer's un-raised initial value below.
+        const max_bidi = @max(self.peer.initial_max_streams_bidi, peer_params.initial_max_streams_bidi);
+        const max_uni = @max(self.peer.initial_max_streams_uni, peer_params.initial_max_streams_uni);
+
+        self.peer = peer_params;
+        self.peer.initial_max_streams_bidi = max_bidi;
+        self.peer.initial_max_streams_uni = max_uni;
+
+        self.applyMaxData(peer_params.initial_max_data);
+        var it = self.streams.iterator();
+        while (it.next()) |entry| {
+            const id = entry.key_ptr.*;
+            const stream = entry.value_ptr.*;
+            const limit = streamDataLimit(peer_params, peerRole(self.role), id);
+            if (limit > stream.max_send_data) stream.max_send_data = limit;
+        }
+    }
+
     pub fn applyMaxStreams(self: *StreamManager, typ: StreamType, limit: u64) void {
         switch (typ) {
             .bidi => self.peer.initial_max_streams_bidi = @max(self.peer.initial_max_streams_bidi, limit),
@@ -733,6 +762,29 @@ test "local stream limits produce blocked accounting" {
     try std.testing.expectEqual(@as(StreamId, 0), try manager.openLocal(.bidi));
     try std.testing.expectError(error.StreamLimitExceeded, manager.openLocal(.bidi));
     try std.testing.expectEqual(@as(u64, 1), manager.metrics.streams_blocked_events);
+}
+
+test "refreshPeerParams (#523) preserves MAX_STREAMS credit granted during 0-RTT instead of rolling it back" {
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+
+    // Simulate an accepted 0-RTT MAX_STREAMS frame raising bidi credit well
+    // above `testParams()`'s initial value (2).
+    manager.applyMaxStreams(.bidi, 500);
+    try std.testing.expectEqual(@as(u64, 500), manager.peer.initial_max_streams_bidi);
+
+    // The handshake completes; the authenticated peer parameters only ever
+    // granted `testParams()`'s smaller initial value. Refreshing must not
+    // roll the already-raised credit back down to it.
+    manager.refreshPeerParams(testParams());
+    try std.testing.expectEqual(@as(u64, 500), manager.peer.initial_max_streams_bidi);
+
+    // And that credit is genuinely usable: opening more local bidi streams
+    // than `testParams()`'s own limit (2) would ever allow succeeds.
+    var opened: usize = 0;
+    while (opened < 5) : (opened += 1) {
+        _ = try manager.openLocal(.bidi);
+    }
 }
 
 test "send path enforces stream and connection flow control" {

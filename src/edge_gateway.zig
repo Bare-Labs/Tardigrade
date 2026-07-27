@@ -456,6 +456,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .request_handler_ctx = &http3_dispatch_ctx,
             .early_data_compat_metrics_ctx = &state,
             .early_data_compat_metrics_cb = recordHttp3EarlyDataCompatFromRuntime,
+            .quic_early_data_decision_metrics_ctx = &state,
+            .quic_early_data_decision_metrics_cb = recordQuicEarlyDataDecisionFromRuntime,
+            .quic_zero_rtt_packet_metrics_ctx = &state,
+            .quic_zero_rtt_packet_metrics_cb = recordQuicZeroRttPacketFromRuntime,
         }) catch |err| blk: {
             state.logger.warn(null, "HTTP/3 listener failed to initialize: {s}", .{@errorName(err)});
             break :blk null;
@@ -2129,6 +2133,22 @@ fn recordHttp3EarlyDataCompatFromRuntime(
 ) void {
     const state: *GatewayState = @ptrCast(@alignCast(raw_state));
     state.metricsRecordHttp3EarlyDataCompat(decision);
+}
+
+fn recordQuicEarlyDataDecisionFromRuntime(
+    raw_state: *anyopaque,
+    decision: http.metrics.QuicEarlyDataDecision,
+) void {
+    const state: *GatewayState = @ptrCast(@alignCast(raw_state));
+    state.metricsRecordQuicEarlyDataDecision(decision);
+}
+
+fn recordQuicZeroRttPacketFromRuntime(
+    raw_state: *anyopaque,
+    outcome: http.metrics.QuicZeroRttPacketOutcome,
+) void {
+    const state: *GatewayState = @ptrCast(@alignCast(raw_state));
+    state.metricsRecordQuicZeroRttPacket(outcome);
 }
 
 fn h2LastReadEarlyPrefixLen(conn: anytype) usize {
