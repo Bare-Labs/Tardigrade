@@ -193,7 +193,11 @@ pub fn run(allocator: std.mem.Allocator, options: Options) std.mem.Allocator.Err
     }
 
     multi_reader.checkAnyError() catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory => {
+            reapProcessGroup(&child, pgid);
+            reaped = true;
+            return error.OutOfMemory;
+        },
         else => return killedResult(
             allocator,
             &child,
@@ -373,6 +377,8 @@ fn killedResult(
 fn reapProcessGroup(child: *std.process.Child, pgid: std.posix.pid_t) void {
     terminateProcessGroup(pgid);
     child.kill(compat.io());
+    terminateProcessGroup(pgid);
+    waitForProcessGroupGone(pgid);
 }
 
 fn terminateProcessGroup(pid: std.posix.pid_t) void {
@@ -381,6 +387,22 @@ fn terminateProcessGroup(pid: std.posix.pid_t) void {
         error.PermissionDenied => {},
         else => {},
     };
+}
+
+fn waitForProcessGroupGone(pgid: std.posix.pid_t) void {
+    for (0..20) |_| {
+        if (!processGroupExists(pgid)) return;
+        compat.sleepNs(50 * std.time.ns_per_ms);
+    }
+}
+
+fn processGroupExists(pgid: std.posix.pid_t) bool {
+    std.posix.kill(-pgid, @enumFromInt(0)) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        error.PermissionDenied => return true,
+        else => return true,
+    };
+    return true;
 }
 
 fn failureFromBuffered(

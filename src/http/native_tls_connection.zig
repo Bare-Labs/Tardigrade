@@ -193,6 +193,7 @@ pub const NativeTlsConnection = struct {
     entropy_source: production_crypto.OsEntropy = .{},
     crypto_provider_state: production_crypto.Provider = undefined,
     resumption_runtime: ?*tls.resumption_runtime.Runtime = null,
+    server_early_data_policy: tls_backend.ServerEarlyDataPolicy = .{},
     /// Set exactly once this connection has attempted post-handshake ticket
     /// issuance (successfully or not) — issuance is best-effort and must
     /// never be retried on the same connection (#488).
@@ -266,6 +267,7 @@ pub const NativeTlsConnection = struct {
             .record = record,
             .policy = policy,
             .resumption_runtime = options.resumption_runtime,
+            .server_early_data_policy = if (options.early_data_replay_gate != null and options.resumption_runtime != null) options.server_early_data_policy else .{},
         };
         self.crypto_provider_state = production_crypto.Provider.init(self.entropy_source.entropy());
         record.* = try encrypted_stream.PureZigRecordStream.initWithCarrierBackendAndLimits(
@@ -376,7 +378,7 @@ pub const NativeTlsConnection = struct {
             .ticket_age_add = ticket_age_add,
             .ticket_nonce = &ticket_nonce,
             .issued_at_unix_ms = now_unix_ms,
-            .max_early_data_size = if (self.backend.server_early_data_policy.enabled) self.backend.server_early_data_policy.max_early_data_size else null,
+            .max_early_data_size = if (self.server_early_data_policy.enabled) self.server_early_data_policy.max_early_data_size else null,
         }, limits);
         defer prepared.deinit();
 
