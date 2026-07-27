@@ -1413,6 +1413,20 @@ pub const GatewayState = struct {
         self.metrics.recordHttp3EarlyDataCompat(decision);
     }
 
+    /// #523: the QUIC/H3 server's authoritative 0-RTT accept/reject decision.
+    pub fn metricsRecordQuicEarlyDataDecision(self: *GatewayState, decision: http.metrics.QuicEarlyDataDecision) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordQuicEarlyDataDecision(decision);
+    }
+
+    /// #523: a single 0-RTT packet's authentication/admission outcome.
+    pub fn metricsRecordQuicZeroRttPacket(self: *GatewayState, outcome: http.metrics.QuicZeroRttPacketOutcome) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordQuicZeroRttPacket(outcome);
+    }
+
     pub fn metricsRecordReloadAttempt(self: *GatewayState) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();

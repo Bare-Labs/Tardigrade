@@ -949,7 +949,10 @@ pub const Connection = struct {
             // Everything after a short-header packet is part of it.
             if (parsed.kind == .one_rtt) break;
         }
-        self.armIdle(now_us);
+        // Idle-timer refresh happens inside `ingestPacket`, only for a
+        // packet that authenticated and was not a duplicate (RFC 9000
+        // §10.1) — never unconditionally per datagram here, or a replayed
+        // or undecryptable datagram could keep the connection alive.
     }
 
     fn ingestPacket(
@@ -1106,6 +1109,15 @@ pub const Connection = struct {
                 return;
             };
             self.last_activity_us = now_us;
+            // RFC 9000 §10.1: the idle timer restarts only when a packet is
+            // received *and processed successfully* — a duplicate (or a
+            // dropped/undecryptable packet, which never reaches this point
+            // at all) must not keep the connection alive. This must live
+            // here, not as an unconditional call in `ingestOnPath` after the
+            // packet loop — that would refresh the deadline for every
+            // datagram regardless of whether anything in it actually
+            // authenticated.
+            self.armIdle(now_us);
         }
 
         if (self.role == .client and parsed.kind == .initial and !self.peer_cid_adopted) {
@@ -3577,6 +3589,47 @@ test "driver: authenticated duplicate 0-RTT packet does not re-apply a state-mut
     try testing.expectEqual(@as(usize, 1), pair.server.pending_path_responses.items.len);
 }
 
+test "driver: the idle timer does not refresh on a duplicate or an undecryptable datagram (RFC 9000 §10.1)" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+
+    const secret = [_]u8{0x29} ** tls_adapter.traffic_secret_len;
+    pair.server.adapter.setZeroRttEnabled(true);
+    pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
+
+    var frame_buf: [16]u8 = undefined;
+    const frame_len = try frame.encodeStream(0, 0, "hi", true, &frame_buf);
+    var wire: [256]u8 = undefined;
+    const datagram = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 0, frame_buf[0..frame_len], &wire);
+
+    try pair.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, pair.now_us);
+    const deadline_after_fresh = pair.server.idle_deadline_us;
+    try testing.expect(deadline_after_fresh != null);
+
+    const later = pair.now_us + 10 * std.time.us_per_s;
+
+    // Replaying the identical (now-duplicate) packet much later must not
+    // move the idle deadline out to reflect that later time.
+    try pair.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, later);
+    try testing.expectEqual(deadline_after_fresh, pair.server.idle_deadline_us);
+
+    // Neither must a tampered (undecryptable) datagram at that later time.
+    var tampered: [256]u8 = undefined;
+    @memcpy(tampered[0..datagram.len], datagram);
+    tampered[datagram.len - 1] ^= 0x01;
+    try pair.server.ingestOnPath(tampered[0..datagram.len], TestPair.server_path, TestPair.test_challenge_entropy, later);
+    try testing.expectEqual(deadline_after_fresh, pair.server.idle_deadline_us);
+
+    // A genuinely fresh authenticated packet still does refresh it.
+    var frame_buf_2: [16]u8 = undefined;
+    const frame_len_2 = try frame.encodeStream(4, 0, "bye", true, &frame_buf_2);
+    var wire_2: [256]u8 = undefined;
+    const datagram_2 = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 1, frame_buf_2[0..frame_len_2], &wire_2);
+    try pair.server.ingestOnPath(datagram_2, TestPair.server_path, TestPair.test_challenge_entropy, later);
+    try testing.expect(pair.server.idle_deadline_us.? > deadline_after_fresh.?);
+}
+
 test "driver: replayed duplicate packet from a different source address does not create or credit candidate-path state" {
     const allocator = testing.allocator;
     var pair = try TestPair.init(allocator);
@@ -4396,6 +4449,267 @@ test "#523: Event.early_data_decision surfaces the real TLS decision once, even 
     // CRYPTO/application packets the rest of the handshake exchanges.
     try testing.expectEqual(@as(usize, 1), event_capture.count);
     try testing.expectEqual(tls_core.tls13_backend.EarlyDataDecision.disabled, event_capture.decision.?);
+}
+
+/// #523 third-pass review: proves that when 0-RTT is rejected — for any of
+/// several distinct reasons, not just "disabled" — the *same* resumed PSK
+/// connection (not a fallback to a different one) still completes its
+/// handshake and serves a real request over ordinary 1-RTT afterward.
+/// Shared by the reason-specific tests below; only the server's early-data
+/// composition (and the expected `EarlyDataDecision`) varies per caller.
+const RejectedEarlyDataFallback = struct {
+    server_early_data_policy: tls_core.tls13_backend.ServerEarlyDataPolicy,
+    replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate,
+    compat_gate: ?tls_core.tls13_backend.EarlyDataCompatibilityGate,
+    expect_decision: tls_core.tls13_backend.EarlyDataDecision,
+};
+
+fn expectRejectedEarlyDataFallsBackOnSameConnection(scenario: RejectedEarlyDataFallback) !void {
+    const resumption_runtime = tls_core.resumption_runtime;
+    const allocator = testing.allocator;
+
+    var server_entropy = tls_core.production_crypto.OsEntropy{};
+    var server_provider = tls_core.production_crypto.Provider.init(server_entropy.entropy());
+    var server_runtime = try resumption_runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 1000;
+            }
+        }.now },
+        server_provider.cryptoProvider(),
+    );
+    defer server_runtime.deinit();
+
+    var client_entropy = tls_core.production_crypto.OsEntropy{};
+    var client_provider = tls_core.production_crypto.Provider.init(client_entropy.entropy());
+    var client_runtime = try resumption_runtime.Runtime.init(
+        allocator,
+        .{ .mode = .stateful },
+        .{ .ctx = undefined, .nowUnixMsFn = struct {
+            fn now(_: *anyopaque) i64 {
+                return 2000;
+            }
+        }.now },
+        client_provider.cryptoProvider(),
+    );
+    defer client_runtime.deinit();
+
+    const CaptureImpl = struct {
+        runtime: *resumption_runtime.Runtime,
+        stored: tls_core.session_cache.StoreResult = undefined,
+        retained: tls_core.session.ClientTicketState = .{},
+
+        fn now(_: *anyopaque) i64 {
+            return 1000;
+        }
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            ticket.cloneInto(testing.allocator, &self.retained) catch unreachable;
+            self.stored = self.runtime.storeClientTicket(ticket);
+        }
+    };
+    var capture = CaptureImpl{ .runtime = &client_runtime };
+    defer capture.retained.deinit();
+    const resume_policy: tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy = .{
+        .transport = .ignore,
+        .application = .ignore,
+    };
+    var pair = try TestPair.initWithTicketConsumerAndResumePolicy(allocator, tls_core.session.Limits.default, .{
+        .ctx = &capture,
+        .nowUnixMsFn = CaptureImpl.now,
+        .onTicketFn = CaptureImpl.onTicket,
+    }, resume_policy);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var prepared = try pair.server.prepareNewSessionTicket(allocator, .{
+        .ticket_lifetime = 3600,
+        .ticket_age_add = 500,
+        .ticket_nonce = "\x01",
+        .issued_at_unix_ms = 1000,
+        .max_early_data_size = std.math.maxInt(u32),
+    }, tls_core.session.Limits.default);
+    defer prepared.deinit();
+    var scratch: [256]u8 = undefined;
+    var identity = try server_runtime.createIdentity(&prepared.state, 1000, &scratch);
+    try testing.expect(identity == .stateful);
+    try pair.server.emitPreparedNewSessionTicket(&prepared, identity.slice(), tls_core.session.Limits.default);
+    try pair.pump();
+    try testing.expectEqual(tls_core.session_cache.StoreResult.stored, capture.stored);
+
+    const candidate: tls_core.session.CandidateContext = .{
+        .cipher_suite = capture.retained.common.cipher_suite,
+        .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
+        .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
+        .auth_binding = capture.retained.common.auth_binding,
+        .transport_compat = null,
+        .application_compat = null,
+    };
+    var lookup = client_runtime.lookupClientOffers(candidate);
+    defer lookup.deinit();
+    try testing.expect(lookup == .hit);
+
+    const EventCapture = struct {
+        decision: ?tls_core.tls13_backend.EarlyDataDecision = null,
+        count: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .early_data_decision => |d| {
+                    self.decision = d;
+                    self.count += 1;
+                },
+                else => {},
+            }
+        }
+    };
+    var event_capture = EventCapture{};
+
+    const resumed = try allocator.create(TestPair);
+    defer allocator.destroy(resumed);
+    resumed.* = .{
+        .client_backend = tls_backend_mod.Tls13Backend.initClient(
+            .{ .hello_random = [_]u8{0xa1} ** 32, .key_share_seed = [_]u8{0x61} ** 32 },
+            .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+        ),
+        .server_backend = tls_backend_mod.Tls13Backend.initServer(
+            .{ .hello_random = [_]u8{0xa2} ** 32, .key_share_seed = [_]u8{0x62} ** 32 },
+            try tls_backend_mod.Identity.initPkcs8(
+                tls_backend_mod.testdata.certificate_der,
+                tls_backend_mod.testdata.private_key_pkcs8_der,
+            ),
+        ),
+    };
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2000;
+        }
+    };
+    try resumed.client_backend.engine.setClientPskOfferLease(&lookup.hit, &clock_dummy, ClientClock.now);
+    try resumed.client_backend.setResumeCompatibilityPolicy(resume_policy);
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 4096 });
+    try resumed.server_backend.setServerPskResolver(server_runtime.serverResolver().?);
+    try resumed.server_backend.setResumeCompatibilityPolicy(resume_policy);
+    if (scenario.replay_gate) |gate| try resumed.server_backend.setEarlyDataReplayGate(gate);
+    if (scenario.compat_gate) |gate| try resumed.server_backend.setEarlyDataCompatibilityGate(gate);
+    try resumed.server_backend.setServerEarlyDataPolicy(scenario.server_early_data_policy);
+
+    resumed.client = try Connection.init(allocator, .{
+        .role = .client,
+        .config = .{ .zero_rtt_enabled = true },
+        .local_cid = &TestPair.client_cid,
+        .original_dcid = &TestPair.odcid,
+        .peer_cid = &TestPair.odcid,
+        .tls = resumed.client_backend.backend(),
+        .now_us = resumed.now_us,
+        .initial_path = TestPair.client_path,
+    });
+    defer resumed.client.deinit();
+    resumed.server = try Connection.init(allocator, .{
+        .role = .server,
+        .config = .{ .zero_rtt_enabled = true },
+        .local_cid = &TestPair.odcid,
+        .original_dcid = &TestPair.odcid,
+        .peer_cid = &TestPair.client_cid,
+        .tls = resumed.server_backend.backend(),
+        .now_us = resumed.now_us,
+        .initial_path = TestPair.server_path,
+        .events = .{ .context = &event_capture, .emitFn = EventCapture.onEvent },
+    });
+    defer resumed.server.deinit();
+
+    try resumed.pump();
+
+    try testing.expect(resumed.client.isEstablished());
+    try testing.expect(resumed.server.isEstablished());
+    try testing.expect(resumed.client_backend.engine.core.psk_authenticated);
+    try testing.expect(resumed.server_backend.engine.core.psk_authenticated);
+    try testing.expect(resumed.server.adapter.protectionKeys(.zero_rtt, .read) == null);
+    try testing.expectEqual(@as(usize, 1), event_capture.count);
+    try testing.expectEqual(scenario.expect_decision, event_capture.decision.?);
+
+    // The same connection — not a different, cleaner one — genuinely serves
+    // a real request over ordinary 1-RTT afterward.
+    const id = try resumed.client.openStream(.bidi);
+    _ = try resumed.client.writeStream(id, "hello", true);
+    try resumed.pump();
+    try testing.expectEqual(@as(?StreamId, id), resumed.server.acceptStream());
+    var buf: [16]u8 = undefined;
+    const request = try resumed.server.readStream(id, &buf);
+    try testing.expectEqualStrings("hello", buf[0..request.len]);
+}
+
+test "#523: replay-rejected 0-RTT falls back to a working 1-RTT connection, same connection" {
+    const AlwaysReplay = struct {
+        fn decide(_: *anyopaque, _: tls_backend_mod.EarlyDataReplayCandidate) tls_backend_mod.EarlyDataReplayDecision {
+            return .replay;
+        }
+    };
+    var ctx: u8 = 0;
+    try expectRejectedEarlyDataFallsBackOnSameConnection(.{
+        .server_early_data_policy = .{ .enabled = true },
+        .replay_gate = .{ .ctx = &ctx, .decideFn = AlwaysReplay.decide },
+        .compat_gate = null,
+        .expect_decision = .replay_rejected,
+    });
+}
+
+test "#523: replay-store-unavailable 0-RTT falls back to a working 1-RTT connection, same connection" {
+    // No replay gate installed at all: the backend's own default gate fails
+    // closed (`.unavailable`) for every attempt — proving the fail-closed
+    // default itself still leaves ordinary resumption usable.
+    try expectRejectedEarlyDataFallsBackOnSameConnection(.{
+        .server_early_data_policy = .{ .enabled = true },
+        .replay_gate = null,
+        .compat_gate = null,
+        .expect_decision = .replay_unavailable,
+    });
+}
+
+test "#523: transport-incompatible 0-RTT falls back to a working 1-RTT connection, same connection" {
+    const AlwaysTransportIncompatible = struct {
+        fn decide(_: *anyopaque, _: tls_backend_mod.EarlyDataCompatibilityCandidate) tls_backend_mod.EarlyDataCompatibilityDecision {
+            return .transport_incompatible;
+        }
+    };
+    const AlwaysAllow = struct {
+        fn decide(_: *anyopaque, _: tls_backend_mod.EarlyDataReplayCandidate) tls_backend_mod.EarlyDataReplayDecision {
+            return .allow;
+        }
+    };
+    var replay_ctx: u8 = 0;
+    var compat_ctx: u8 = 0;
+    try expectRejectedEarlyDataFallsBackOnSameConnection(.{
+        .server_early_data_policy = .{ .enabled = true },
+        .replay_gate = .{ .ctx = &replay_ctx, .decideFn = AlwaysAllow.decide },
+        .compat_gate = .{ .ctx = &compat_ctx, .decideFn = AlwaysTransportIncompatible.decide },
+        .expect_decision = .transport_incompatible,
+    });
+}
+
+test "#523: application-incompatible (H3 SETTINGS) 0-RTT falls back to a working 1-RTT connection, same connection" {
+    const AlwaysApplicationIncompatible = struct {
+        fn decide(_: *anyopaque, _: tls_backend_mod.EarlyDataCompatibilityCandidate) tls_backend_mod.EarlyDataCompatibilityDecision {
+            return .application_incompatible;
+        }
+    };
+    const AlwaysAllow = struct {
+        fn decide(_: *anyopaque, _: tls_backend_mod.EarlyDataReplayCandidate) tls_backend_mod.EarlyDataReplayDecision {
+            return .allow;
+        }
+    };
+    var replay_ctx: u8 = 0;
+    var compat_ctx: u8 = 0;
+    try expectRejectedEarlyDataFallsBackOnSameConnection(.{
+        .server_early_data_policy = .{ .enabled = true },
+        .replay_gate = .{ .ctx = &replay_ctx, .decideFn = AlwaysAllow.decide },
+        .compat_gate = .{ .ctx = &compat_ctx, .decideFn = AlwaysApplicationIncompatible.decide },
+        .expect_decision = .application_incompatible,
+    });
 }
 
 test "driver: maximum NewSessionTicket survives real loss reordering PTO and ACK cleanup" {

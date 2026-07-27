@@ -78,6 +78,16 @@ pub const Config = struct {
     request_handler_ctx: ?*anyopaque = null,
     early_data_compat_metrics_ctx: ?*anyopaque = null,
     early_data_compat_metrics_cb: ?*const fn (*anyopaque, metrics_mod.H3EarlyDataCompatDecision) void = null,
+    /// #523: the QUIC/H3 server's authoritative 0-RTT accept/reject decision
+    /// (`quic.connection.Event.early_data_decision`), bridged out of every
+    /// accepted connection's `EventSink`. `null` (the default) leaves the
+    /// event unobserved — never silently required.
+    quic_early_data_decision_metrics_ctx: ?*anyopaque = null,
+    quic_early_data_decision_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicEarlyDataDecision) void = null,
+    /// #523: per-packet 0-RTT authentication/admission outcomes
+    /// (`quic.connection.Event.zero_rtt_packet`), bridged the same way.
+    quic_zero_rtt_packet_metrics_ctx: ?*anyopaque = null,
+    quic_zero_rtt_packet_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicZeroRttPacketOutcome) void = null,
 };
 
 /// Half-open admission limits (#328 review). The native stack does not send
@@ -186,6 +196,10 @@ pub const Runtime = struct {
     h3_application_compat_len: usize = 0,
     early_data_compat_metrics_ctx: ?*anyopaque = null,
     early_data_compat_metrics_cb: ?*const fn (*anyopaque, metrics_mod.H3EarlyDataCompatDecision) void = null,
+    quic_early_data_decision_metrics_ctx: ?*anyopaque = null,
+    quic_early_data_decision_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicEarlyDataDecision) void = null,
+    quic_zero_rtt_packet_metrics_ctx: ?*anyopaque = null,
+    quic_zero_rtt_packet_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicZeroRttPacketOutcome) void = null,
     snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
     stopping: std.atomic.Value(bool),
@@ -235,6 +249,10 @@ pub const Runtime = struct {
             .h3_settings = cfg.h3_settings,
             .early_data_compat_metrics_ctx = cfg.early_data_compat_metrics_ctx,
             .early_data_compat_metrics_cb = cfg.early_data_compat_metrics_cb,
+            .quic_early_data_decision_metrics_ctx = cfg.quic_early_data_decision_metrics_ctx,
+            .quic_early_data_decision_metrics_cb = cfg.quic_early_data_decision_metrics_cb,
+            .quic_zero_rtt_packet_metrics_ctx = cfg.quic_zero_rtt_packet_metrics_ctx,
+            .quic_zero_rtt_packet_metrics_cb = cfg.quic_zero_rtt_packet_metrics_cb,
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
         };
@@ -550,6 +568,7 @@ pub const Runtime = struct {
             .tls = backend.backend(),
             .now_us = now,
             .initial_path = .{ .local = self.local_address, .remote = addressFromSockaddrIn(peer) },
+            .events = .{ .context = self, .emitFn = quicConnectionEvent },
         }) catch {
             allocator.destroy(backend);
             return null;
@@ -906,6 +925,59 @@ pub const Runtime = struct {
         const cb = self.early_data_compat_metrics_cb orelse return;
         const cb_ctx = self.early_data_compat_metrics_ctx orelse return;
         cb(cb_ctx, decision);
+    }
+
+    fn recordQuicEarlyDataDecision(self: *Runtime, decision: metrics_mod.QuicEarlyDataDecision) void {
+        const cb = self.quic_early_data_decision_metrics_cb orelse return;
+        const cb_ctx = self.quic_early_data_decision_metrics_ctx orelse return;
+        cb(cb_ctx, decision);
+    }
+
+    fn recordQuicZeroRttPacket(self: *Runtime, outcome: metrics_mod.QuicZeroRttPacketOutcome) void {
+        const cb = self.quic_zero_rtt_packet_metrics_cb orelse return;
+        const cb_ctx = self.quic_zero_rtt_packet_metrics_ctx orelse return;
+        cb(cb_ctx, outcome);
+    }
+
+    /// #523: bridges `quic.connection.Event`s from every accepted
+    /// connection into the composition root's metrics — without this,
+    /// `accept()` would construct connections with no `EventSink` at all
+    /// and the typed TLS decision / per-packet 0-RTT outcomes would be
+    /// silently discarded. Only forwards the two 0-RTT-specific event
+    /// variants; every other `Connection.Event` (packet_received,
+    /// handshake_complete, path_validated, ...) is intentionally not this
+    /// function's concern.
+    fn quicConnectionEvent(ctx: ?*anyopaque, event: quic.connection.Event) void {
+        const self: *Runtime = @ptrCast(@alignCast(ctx.?));
+        switch (event) {
+            .early_data_decision => |decision| {
+                const mapped: metrics_mod.QuicEarlyDataDecision = switch (decision) {
+                    .not_attempted => return,
+                    .accepted => .accepted,
+                    .disabled => .disabled,
+                    .ticket_not_capable => .ticket_not_capable,
+                    .selected_identity_not_zero => .selected_identity_not_zero,
+                    .age_skew => .age_skew,
+                    .transport_incompatible => .transport_incompatible,
+                    .application_incompatible => .application_incompatible,
+                    .replay_rejected => .replay_rejected,
+                    .replay_unavailable => .replay_unavailable,
+                    .resource_limited => .resource_limited,
+                };
+                self.recordQuicEarlyDataDecision(mapped);
+            },
+            .zero_rtt_packet => |packet| {
+                const mapped: metrics_mod.QuicZeroRttPacketOutcome = switch (packet.outcome) {
+                    .accepted => .accepted,
+                    .keys_unavailable => .keys_unavailable,
+                    .authentication_failed => .authentication_failed,
+                    .duplicate => .duplicate,
+                    .malformed => .malformed,
+                };
+                self.recordQuicZeroRttPacket(mapped);
+            },
+            else => {},
+        }
     }
 
     fn noteConnectionAccepted(self: *Runtime) void {
@@ -2477,6 +2549,77 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
     try testing.expectEqual(@as(usize, 2), handler_state.executed_local);
     try testing.expectEqualStrings("POST", handler_state.last_method_buf[0..handler_state.last_method_len]);
     try testing.expectEqual(@as(usize, 1), handler_state.rejected_too_early);
+}
+
+test "accept() (#523): wires an EventSink into every accepted connection so 0-RTT events reach metrics instead of being silently discarded" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-event-wiring-test");
+
+    const Capture = struct {
+        decisions: usize = 0,
+        packets: usize = 0,
+
+        fn onDecision(ctx: *anyopaque, _: metrics_mod.QuicEarlyDataDecision) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.decisions += 1;
+        }
+        fn onPacket(ctx: *anyopaque, _: metrics_mod.QuicZeroRttPacketOutcome) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.packets += 1;
+        }
+    };
+    var capture = Capture{};
+
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .quic_early_data_decision_metrics_ctx = &capture,
+        .quic_early_data_decision_metrics_cb = Capture.onDecision,
+        .quic_zero_rtt_packet_metrics_ctx = &capture,
+        .quic_zero_rtt_packet_metrics_cb = Capture.onPacket,
+    });
+    defer runtime.deinit();
+
+    var connections = std.AutoHashMap(u64, *ConnEntry).init(testing.allocator);
+    defer {
+        var it = connections.valueIterator();
+        while (it.next()) |entry| {
+            entry.*.deinit(testing.allocator);
+            testing.allocator.destroy(entry.*);
+        }
+        connections.deinit();
+    }
+    var routes = quic.cid.CidRoutingTable.init(testing.allocator);
+    defer routes.deinit();
+    var per_ip = std.AutoHashMap(u32, u32).init(testing.allocator);
+    defer per_ip.deinit();
+    var next_handle: u64 = 1;
+
+    const dcid = [_]u8{0x11} ** 8;
+    const scid = [_]u8{0x22} ** 8;
+    const parsed = quic.packet.ParsedPacket{
+        .kind = .initial,
+        .version = quic.packet.quic_v1,
+        .dcid = &dcid,
+        .scid = &scid,
+    };
+    const peer = std.c.sockaddr.in{ .family = posix.AF.INET, .port = 0, .addr = 0, .zero = [_]u8{0} ** 8 };
+
+    const handle = runtime.accept(&connections, &routes, &per_ip, &next_handle, parsed, peer, 1_000_000);
+    try testing.expect(handle != null);
+    const entry = connections.get(handle.?).?;
+
+    // Prove `accept()` genuinely attached a non-default `EventSink` (not
+    // just left it at its `.{}` no-op default) by emitting directly through
+    // it — this is what a real handshake's `Event.early_data_decision` /
+    // `Event.zero_rtt_packet` emissions from inside `Connection` would
+    // otherwise reach and, before this fix, never did.
+    entry.conn.events.emit(.{ .early_data_decision = .disabled });
+    entry.conn.events.emit(.{ .zero_rtt_packet = .{ .outcome = .keys_unavailable, .size = 0 } });
+    try testing.expectEqual(@as(usize, 1), capture.decisions);
+    try testing.expectEqual(@as(usize, 1), capture.packets);
 }
 
 test "runtime resolves the actual bound local address, including an OS-assigned port, from quic_port = 0" {

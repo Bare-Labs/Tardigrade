@@ -42,6 +42,38 @@ pub const H3EarlyDataCompatDecision = enum { compatible, transport_incompatible,
 /// request path, user ID, PSK, or binder.
 pub const EarlyDataReplayOutcome = enum { accepted, duplicate, capacity_rejected, expired, unavailable, startup_quarantine };
 
+/// #523: mirrors `tls_core.tls13_backend.EarlyDataDecision` one-for-one
+/// (bridged in `http3_runtime.zig`'s `accept()` `EventSink`) — the QUIC/H3
+/// server's authoritative 0-RTT accept/reject decision, made once per
+/// connection as soon as the ClientHello is processed, independent of
+/// whether any `.zero_rtt` packet ever actually arrives. `not_attempted`
+/// is deliberately excluded: that's the vast majority of ordinary
+/// connections and isn't itself an outcome worth counting.
+pub const QuicEarlyDataDecision = enum {
+    accepted,
+    disabled,
+    ticket_not_capable,
+    selected_identity_not_zero,
+    age_skew,
+    transport_incompatible,
+    application_incompatible,
+    replay_rejected,
+    replay_unavailable,
+    resource_limited,
+};
+
+/// #523: mirrors `quic.connection.ZeroRttPacketOutcome` one-for-one
+/// (bridged the same way) — per-packet 0-RTT authentication/admission
+/// outcomes, distinguishing policy/keys-unavailable from a genuine AEAD
+/// authentication failure and from an authenticated duplicate.
+pub const QuicZeroRttPacketOutcome = enum {
+    accepted,
+    keys_unavailable,
+    authentication_failed,
+    duplicate,
+    malformed,
+};
+
 const resumption_transport_count = 2;
 const resumption_outcome_count = 5;
 const resumption_mode_count = 3;
@@ -54,6 +86,8 @@ const early_data_upstream_425_action_count = 2;
 const early_data_retry_result_count = 3;
 const h3_early_data_compat_decision_count = 4;
 const early_data_replay_outcome_count = 6;
+const quic_early_data_decision_count = 10;
+const quic_zero_rtt_packet_outcome_count = 5;
 
 /// Server-wide metrics counters.
 ///
@@ -210,6 +244,12 @@ pub const Metrics = struct {
     /// #368 Slice 3: process-local anti-replay store outcomes by bounded,
     /// closed-enum outcome. See `EarlyDataReplayOutcome`.
     tls_early_data_replay_total: [early_data_replay_outcome_count]u64,
+    /// #523: the QUIC/H3 server's authoritative 0-RTT accept/reject
+    /// decision by outcome. See `QuicEarlyDataDecision`.
+    quic_early_data_decision_total: [quic_early_data_decision_count]u64,
+    /// #523: per-packet 0-RTT authentication/admission outcomes. See
+    /// `QuicZeroRttPacketOutcome`.
+    quic_zero_rtt_packet_total: [quic_zero_rtt_packet_outcome_count]u64,
     /// Total graceful-shutdown drains started.
     drain_total: u64,
     /// Total drains that hit the configured drain timeout before work finished.
@@ -328,6 +368,8 @@ pub const Metrics = struct {
             .http_early_data_retry_total = .{0} ** early_data_retry_result_count,
             .http3_early_data_compat_total = .{0} ** h3_early_data_compat_decision_count,
             .tls_early_data_replay_total = .{0} ** early_data_replay_outcome_count,
+            .quic_early_data_decision_total = .{0} ** quic_early_data_decision_count,
+            .quic_zero_rtt_packet_total = .{0} ** quic_zero_rtt_packet_outcome_count,
             .drain_total = 0,
             .drain_timeouts_total = 0,
             .drain_forced_closes_total = 0,
@@ -434,6 +476,17 @@ pub const Metrics = struct {
     /// #368 Slice 3: record a process-local anti-replay store outcome.
     pub fn recordEarlyDataReplay(self: *Metrics, outcome: EarlyDataReplayOutcome) void {
         self.tls_early_data_replay_total[earlyDataReplayOutcomeIndex(outcome)] += 1;
+    }
+
+    /// #523: record the QUIC/H3 server's authoritative 0-RTT accept/reject
+    /// decision for one connection.
+    pub fn recordQuicEarlyDataDecision(self: *Metrics, decision: QuicEarlyDataDecision) void {
+        self.quic_early_data_decision_total[quicEarlyDataDecisionIndex(decision)] += 1;
+    }
+
+    /// #523: record one 0-RTT packet's authentication/admission outcome.
+    pub fn recordQuicZeroRttPacket(self: *Metrics, outcome: QuicZeroRttPacketOutcome) void {
+        self.quic_zero_rtt_packet_total[quicZeroRttPacketOutcomeIndex(outcome)] += 1;
     }
 
     /// Record the start of a config hot-reload attempt.
@@ -1382,6 +1435,47 @@ pub const Metrics = struct {
                 self.http3_early_data_compat_total[h3EarlyDataCompatDecisionIndex(decision)],
             });
         }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_quic_early_data_decision_total QUIC/H3 server authoritative 0-RTT accept/reject decisions
+            \\# TYPE tardigrade_quic_early_data_decision_total counter
+            \\
+        );
+        inline for (.{
+            QuicEarlyDataDecision.accepted,
+            QuicEarlyDataDecision.disabled,
+            QuicEarlyDataDecision.ticket_not_capable,
+            QuicEarlyDataDecision.selected_identity_not_zero,
+            QuicEarlyDataDecision.age_skew,
+            QuicEarlyDataDecision.transport_incompatible,
+            QuicEarlyDataDecision.application_incompatible,
+            QuicEarlyDataDecision.replay_rejected,
+            QuicEarlyDataDecision.replay_unavailable,
+            QuicEarlyDataDecision.resource_limited,
+        }) |decision| {
+            try out.print("tardigrade_quic_early_data_decision_total{{decision=\"{s}\"}} {d}\n", .{
+                quicEarlyDataDecisionLabel(decision),
+                self.quic_early_data_decision_total[quicEarlyDataDecisionIndex(decision)],
+            });
+        }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_quic_zero_rtt_packet_total Per-packet 0-RTT authentication/admission outcomes
+            \\# TYPE tardigrade_quic_zero_rtt_packet_total counter
+            \\
+        );
+        inline for (.{
+            QuicZeroRttPacketOutcome.accepted,
+            QuicZeroRttPacketOutcome.keys_unavailable,
+            QuicZeroRttPacketOutcome.authentication_failed,
+            QuicZeroRttPacketOutcome.duplicate,
+            QuicZeroRttPacketOutcome.malformed,
+        }) |outcome| {
+            try out.print("tardigrade_quic_zero_rtt_packet_total{{outcome=\"{s}\"}} {d}\n", .{
+                quicZeroRttPacketOutcomeLabel(outcome),
+                self.quic_zero_rtt_packet_total[quicZeroRttPacketOutcomeIndex(outcome)],
+            });
+        }
     }
 
     /// #368 Slice 3: process-local anti-replay store outcomes. Every label
@@ -1658,6 +1752,31 @@ fn earlyDataReplayOutcomeIndex(outcome: EarlyDataReplayOutcome) usize {
     };
 }
 
+fn quicEarlyDataDecisionIndex(decision: QuicEarlyDataDecision) usize {
+    return switch (decision) {
+        .accepted => 0,
+        .disabled => 1,
+        .ticket_not_capable => 2,
+        .selected_identity_not_zero => 3,
+        .age_skew => 4,
+        .transport_incompatible => 5,
+        .application_incompatible => 6,
+        .replay_rejected => 7,
+        .replay_unavailable => 8,
+        .resource_limited => 9,
+    };
+}
+
+fn quicZeroRttPacketOutcomeIndex(outcome: QuicZeroRttPacketOutcome) usize {
+    return switch (outcome) {
+        .accepted => 0,
+        .keys_unavailable => 1,
+        .authentication_failed => 2,
+        .duplicate => 3,
+        .malformed => 4,
+    };
+}
+
 fn ticketKeyReloadOutcomeIndex(outcome: TicketKeyReloadOutcome) usize {
     return switch (outcome) {
         .initial_load_success => 0,
@@ -1724,6 +1843,31 @@ fn earlyDataReplayOutcomeLabel(outcome: EarlyDataReplayOutcome) []const u8 {
         .expired => "expired",
         .unavailable => "unavailable",
         .startup_quarantine => "startup_quarantine",
+    };
+}
+
+fn quicEarlyDataDecisionLabel(decision: QuicEarlyDataDecision) []const u8 {
+    return switch (decision) {
+        .accepted => "accepted",
+        .disabled => "disabled",
+        .ticket_not_capable => "ticket_not_capable",
+        .selected_identity_not_zero => "selected_identity_not_zero",
+        .age_skew => "age_skew",
+        .transport_incompatible => "transport_incompatible",
+        .application_incompatible => "application_incompatible",
+        .replay_rejected => "replay_rejected",
+        .replay_unavailable => "replay_unavailable",
+        .resource_limited => "resource_limited",
+    };
+}
+
+fn quicZeroRttPacketOutcomeLabel(outcome: QuicZeroRttPacketOutcome) []const u8 {
+    return switch (outcome) {
+        .accepted => "accepted",
+        .keys_unavailable => "keys_unavailable",
+        .authentication_failed => "authentication_failed",
+        .duplicate => "duplicate",
+        .malformed => "malformed",
     };
 }
 
