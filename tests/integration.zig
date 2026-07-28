@@ -6521,22 +6521,36 @@ fn waitForReservationAttemptCount(allocator: std.mem.Allocator, log_path: []cons
 /// lock blocks all socket I/O for that process, including finishing
 /// already-in-flight work. An earlier revision required exactly that and
 /// reliably hung for the full bounded test timeout, a real deadlock
-/// proving the property is architecturally unobservable this way. See
-/// the round loop below for what is proven instead.
+/// proving the property is architecturally unobservable this way.
+///
+/// `saw_outgoing`/`saw_incoming` are published only once a matching
+/// ticket has *also* been retained in `results`, so a visible flag always
+/// corresponds to a concrete sample -- the round loop waits for
+/// `saw_outgoing` on both workers before ever touching the reservation
+/// barrier (proving real pre-reload traffic without depending on thread
+/// scheduling luck) and, symmetrically, for `saw_incoming` on both
+/// workers only *after* the barrier is released and both processes have
+/// independently reported `reload_accepted` (when their event loops are
+/// again free to make socket progress) before stopping them -- so
+/// `expectSpansBothGenerations` below is a redundant final consistency
+/// check over the retained samples, not the primary proof.
 ///
 /// Uses `std.heap.page_allocator` rather than `std.testing.allocator`:
 /// the latter is not safe to call concurrently from multiple threads,
 /// and `results`/`failure` are only ever read by the main thread after
 /// `std.Thread.join()`, so no cross-thread synchronization on them is
-/// needed. A worker records the first error it hits (an issuance failure
-/// or an unexpected key id) and stops immediately, rather than silently
-/// swallowing it and leaving the caller to mistake an empty result set
-/// for a healthy run.
+/// needed (only the two atomic flags are read while the worker may still
+/// be running). A worker records the first error it hits (an issuance
+/// failure or an unexpected key id) and stops immediately, rather than
+/// silently swallowing it and leaving the caller to mistake an empty
+/// result set for a healthy run.
 const ChurnWorker = struct {
     port: u16,
     stop: *std.atomic.Value(bool),
     outgoing_key_id_hex: []const u8,
     incoming_key_id_hex: []const u8,
+    saw_outgoing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_incoming: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     results: std.array_list.Managed(TicketEnvelopeIds),
     failure: ?anyerror = null,
 
@@ -6571,15 +6585,34 @@ const ChurnWorker = struct {
                 self.failure = err;
                 return;
             };
+            // Published only after the successful ticket has also been
+            // retained above, so a visible flag always corresponds to a
+            // concrete sample in `results`.
+            if (is_outgoing) self.saw_outgoing.store(true, .release);
+            if (is_incoming) self.saw_incoming.store(true, .release);
         }
     }
 };
 
+/// #520: bounded wait for a `ChurnWorker` to have observed a successful
+/// ticket from a given generation -- safe to call while the worker thread
+/// is still running (a plain atomic flag, not `results.items.len`).
+fn waitForChurnGenerationSeen(seen: *const std.atomic.Value(bool), timeout_ms: u64) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        if (seen.load(.acquire)) return;
+        compat.sleepNs(5 * std.time.ns_per_ms);
+    }
+    return error.ChurnGenerationNotObserved;
+}
+
 /// #520: asserts `tuples` contains at least one ticket sealed under each
-/// of the two given key ids -- the achievable proof that continuous
-/// churn traffic actually spanned a round's generation transition (both
-/// before and after it happened), used in place of an unobservable
-/// "completed while the reload handler was confirmed blocked" claim.
+/// of the two given key ids -- a final consistency check that the
+/// retained sample set agrees with the `saw_outgoing`/`saw_incoming`
+/// flags `waitForChurnGenerationSeen` already waited on; the achievable
+/// proof that continuous churn traffic actually spanned a round's
+/// generation transition, used in place of an unobservable "completed
+/// while the reload handler was confirmed blocked" claim.
 fn expectSpansBothGenerations(tuples: []const TicketEnvelopeIds, outgoing_key_id_hex: []const u8, incoming_key_id_hex: []const u8) !void {
     var saw_outgoing = false;
     var saw_incoming = false;
@@ -9007,6 +9040,19 @@ test "soak.persistent.multi_process_nonce_safety" {
             churn_thread_a = try std.Thread.spawn(.{}, ChurnWorker.run, .{&churn_a.?});
             churn_b = ChurnWorker.init(process_b.port, &churn_stop, key_ids[retiring_index], key_ids[new_index]);
             churn_thread_b = try std.Thread.spawn(.{}, ChurnWorker.run, .{&churn_b.?});
+
+            // Establishes the pre-reload half of the continuity proof
+            // deterministically, while both event loops are completely
+            // free to process socket I/O -- must happen before touching
+            // the reservation barrier below, since waiting for churn
+            // progress once `hotReloadConfig` has blocked on it is
+            // architecturally impossible (see `ChurnWorker`'s doc
+            // comment). Without this, `expectSpansBothGenerations` at the
+            // end of the round could fail purely on thread-scheduling
+            // luck if neither worker happened to be scheduled before
+            // reload began.
+            try waitForChurnGenerationSeen(&churn_a.?.saw_outgoing, 5_000);
+            try waitForChurnGenerationSeen(&churn_b.?.saw_outgoing, 5_000);
         }
 
         // Forces the two real SIGHUP handlers to genuinely block on
@@ -9082,6 +9128,15 @@ test "soak.persistent.multi_process_nonce_safety" {
         try assertNoDuplicateTicketIds(all_tuples.items);
 
         if (soakHeavyEnabled()) {
+            // Establishes the post-reload half of the continuity proof.
+            // The reservation barrier has already been released and both
+            // processes have independently reported `reload_accepted`,
+            // so their event loops are free to process socket I/O again
+            // here -- waiting for churn progress at this point cannot
+            // recreate the held-lock deadlock.
+            try waitForChurnGenerationSeen(&churn_a.?.saw_incoming, 5_000);
+            try waitForChurnGenerationSeen(&churn_b.?.saw_incoming, 5_000);
+
             churn_stop.store(true, .release);
             churn_thread_a.?.join();
             churn_thread_b.?.join();
