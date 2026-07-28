@@ -226,17 +226,22 @@ pub fn build(b: *std.Build) void {
     // #522's `h3interop.*` QUIC/H3 cases -- `h3interop.` contains the
     // `interop.` filter substring, so they run under this same step): the
     // same live-process harness filtered to the stable `interop.`/
-    // `restart.`/`soak.` case-ID prefixes. Kept as its own step (not folded
-    // into `test-integration-native-tls`) so CI can budget it separately --
-    // it shells out to a real `openssl`/`gtlsclient` subprocess per case and
-    // spawns/kills real Tardigrade processes for restart coverage.
+    // `restart.`/`rotation.`/`soak.` case-ID prefixes (`rotation.` added by
+    // #519 for the persistent ticket-key rotation/reload-atomicity/
+    // certificate-binding composed proofs, which need the same real-process/
+    // real-SIGHUP coverage on platforms where the full `test-integration`
+    // suite is skipped -- see ci.yml). Kept as its own step (not folded into
+    // `test-integration-native-tls`) so CI can budget it separately -- it
+    // shells out to a real `openssl`/`gtlsclient` subprocess per case and
+    // spawns/kills/SIGHUPs real Tardigrade processes for restart/rotation
+    // coverage.
     const resumption_interop_tests = b.addTest(.{
         .root_module = integration_mod,
-        .filters = &.{ "interop.", "restart.", "soak." },
+        .filters = &.{ "interop.", "restart.", "rotation.", "soak." },
     });
     const run_resumption_interop_tests = b.addRunArtifact(resumption_interop_tests);
     run_resumption_interop_tests.step.dependOn(b.getInstallStep());
-    const resumption_interop_step = b.step("test-integration-resumption-interop", "Run #369 external OpenSSL interop, #522 QUIC/H3 interop, restart, and soak cases");
+    const resumption_interop_step = b.step("test-integration-resumption-interop", "Run #369 external OpenSSL interop, #522 QUIC/H3 interop, restart, #519 rotation, and soak cases");
     resumption_interop_step.dependOn(&run_resumption_interop_tests.step);
 
     // Failure-mode / chaos harness (#169): the same live-process harness filtered
