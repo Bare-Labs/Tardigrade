@@ -7759,23 +7759,74 @@ test "rotation.persistent.failed_reload_keeps_old_state" {
         }
     }.run;
 
-    // Sub-case 1: unreadable replacement -- a file that exists (so
-    // `edge_config.validate`'s own `TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH`
-    // existence check, which merely opens the path, passes) but exceeds
-    // `ticket_key_snapshot.max_snapshot_bytes` (64 KiB), so
-    // `ticket_key_snapshot.loadFromFile`'s own bounded `readFileAlloc`
-    // fails with `error.FileTooBig` -> `SnapshotTooLarge` regardless of
-    // filesystem permissions or which user/container CI runs the test as
-    // -- deterministic on every supported environment, unlike a
+    // Sub-case 1: unreadable replacement -- the configured path exists but
+    // is a directory, not a regular file, so it genuinely cannot be
+    // *opened/read* as a snapshot at all (unlike an oversized-but-otherwise-
+    // readable file, which fails a size guard instead -- a different
+    // `ticket_key_snapshot.LoadError` class, and not what "unreadable"
+    // means). Deterministic on every supported environment regardless of
+    // permissions or which user/container CI runs the test as, unlike a
     // permission-bit trick that a root/rootless-container CI job can
-    // silently fail to enforce.
+    // silently fail to enforce. The valid snapshot is moved aside and
+    // restored afterward rather than deleted, since deleting the path
+    // outright would also work but is already a distinct, separately
+    // observed condition below (this path both "exists" and "cannot be
+    // consumed", where a missing path only demonstrates the latter).
     {
-        const oversized = try allocator.alloc(u8, tls_core.ticket_key_snapshot.max_snapshot_bytes + 4096);
-        defer allocator.free(oversized);
-        @memset(oversized, 'x');
-        try writeInteropSecretFile(ticket_keys_path, oversized);
+        const backup_path = try std.fmt.allocPrint(allocator, "{s}.bak", .{ticket_keys_path});
+        defer allocator.free(backup_path);
+        try compat.cwd().rename(ticket_keys_path, compat.cwd(), backup_path);
+        // Restores the valid snapshot on every exit path, including a
+        // `MetricThresholdNotReached` bail-out below, so a failure here
+        // doesn't leave the configured path stuck as an empty directory
+        // for whatever runs next.
+        errdefer {
+            compat.cwd().deleteTree(ticket_keys_path) catch {};
+            compat.cwd().rename(backup_path, compat.cwd(), ticket_keys_path) catch {};
+        }
+        try compat.cwd().makePath(ticket_keys_path);
+
+        // On macOS/Linux as built here, `edge_config.validate`'s own
+        // `TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH` existence check
+        // (`validateOptionalFileChecked`, an `openFile` that itself
+        // succeeds on a directory) passes, and the rejection actually
+        // happens one layer in, at `ticket_key_snapshot.loadFromFile`'s own
+        // `readFileAlloc` -- which fails to read a directory as file
+        // content -- landing on the ticket-key-specific
+        // `reload_rejected` outcome (and, since every rejection in that
+        // branch of `hotReloadConfig` also calls the shared
+        // `state.metricsRecordReloadFailure()`, the general
+        // `tardigrade_reload_failure_total` counter too, confirmed
+        // together in practice). Checking both rather than assuming either
+        // one keeps this robust against a platform/`std.Io.Dir` version
+        // where the earlier existence check itself rejects a directory
+        // instead.
+        const general_before = blk: {
+            var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+            defer metrics.deinit();
+            break :blk prometheusMetricValue(metrics.body, "tardigrade_reload_failure_total") orelse 0;
+        };
+        const ticket_key_before = blk: {
+            var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+            defer metrics.deinit();
+            break :blk prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_rejected\""}) orelse 0;
+        };
+        tardigrade.sendSignal(std.posix.SIG.HUP);
+        const deadline = compat.milliTimestamp() + 5_000;
+        while (true) {
+            var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+            defer metrics.deinit();
+            const general_after = prometheusMetricValue(metrics.body, "tardigrade_reload_failure_total") orelse 0;
+            const ticket_key_after = prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_rejected\""}) orelse 0;
+            if (general_after >= general_before + 1 or ticket_key_after >= ticket_key_before + 1) break;
+            if (compat.milliTimestamp() >= deadline) return error.MetricThresholdNotReached;
+            compat.sleepNs(25 * std.time.ns_per_ms);
+        }
+
+        compat.cwd().deleteTree(ticket_keys_path) catch {};
+        try compat.cwd().rename(backup_path, compat.cwd(), ticket_keys_path);
     }
-    try rejectSighupAndVerify(allocator, &tardigrade, &ticket0, &clock_dummy);
+    try assertTicket0StillResumes(allocator, tardigrade.port, &ticket0, &clock_dummy);
 
     // Sub-case 2: malformed JSON.
     try writeInteropSecretFile(ticket_keys_path, "{not valid json");

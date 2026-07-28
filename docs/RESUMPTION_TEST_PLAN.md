@@ -497,13 +497,16 @@ native (non-OpenSSL-adapter) resumption runtime today.
   secret-free failure outcome, checked per attempt (a labeled-metric
   before/after delta via a bounded poll, not a fixed settle sleep and not a
   cumulative running-total check that an earlier sub-case's rejection could
-  mask a later regression behind): a replacement exceeding
-  `ticket_key_snapshot.max_snapshot_bytes` (deterministic on every
-  environment, unlike an earlier permission-bit-based draft of this
-  sub-case that a root/rootless-container CI job could silently fail to
-  enforce), malformed JSON, a semantically invalid keyring via an invalid
-  nonce lease, and a stale generation number. A ticket issued only *after*
-  all four rejections still seals under the original key id, proving
+  mask a later regression behind): an *unreadable* replacement (the
+  configured path replaced with a directory -- deterministic on every
+  environment regardless of permissions, unlike an earlier permission-bit
+  draft a root/rootless-container CI job could silently fail to enforce,
+  and semantically distinct from a size-limit rejection, which an
+  intermediate draft of this sub-case substituted and review correctly
+  flagged as not the same failure class), malformed JSON, a semantically
+  invalid keyring via an invalid nonce lease, and a stale generation
+  number. A ticket issued only *after* all four rejections still seals
+  under the original key id, proving
   nothing was partially applied across any of them.
   - **Finding**: this test does *not* additionally bundle a TLS credential
     change into a failing SIGHUP. Inspecting
