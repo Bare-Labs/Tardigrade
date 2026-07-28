@@ -6495,9 +6495,13 @@ fn waitForReservationAttemptCount(allocator: std.mem.Allocator, log_path: []cons
 }
 
 /// #520 heavy tier: keeps real full-handshake/ticket-issuance traffic
-/// flowing against one process for as long as `stop` is clear. Every
-/// issued ticket is validated to belong to one of the round's two known
-/// key ids (the complete outgoing or complete incoming generation,
+/// flowing against one process for as long as `stop` is clear, started
+/// before either SIGHUP is sent and stopped only after both processes'
+/// own `reload_accepted` has been confirmed -- so its collected samples
+/// necessarily span the whole round, before and after the transition.
+///
+/// Every issued ticket is validated to belong to one of the round's two
+/// known key ids (the complete outgoing or complete incoming generation,
 /// never anything else) -- this is the only invariant a concurrently
 /// running worker can check safely; the stricter "incoming key only
 /// after *this process's own* `reload_accepted`" boundary is instead
@@ -6509,30 +6513,30 @@ fn waitForReservationAttemptCount(allocator: std.mem.Allocator, log_path: []cons
 /// so it cannot establish that boundary correctly no matter which side of
 /// the request it is sampled on.
 ///
-/// `completed` is a plain atomic counter (not `results.items.len`,
-/// unsafe to read from another thread while this thread may be mutating
-/// the list) the main thread polls to confirm the worker has completed
-/// at least one real connection *while the reload SIGHUP handler is still
-/// demonstrably blocked* (see `waitForCompletedChurnAtLeast` and the
-/// round loop's held reservation-lock window below) -- proving actual
-/// traffic overlapped the stalled reload, not merely that a worker thread
-/// was runnable at some point.
+/// Deliberately does *not* attempt to prove a worker completed a
+/// connection *while* the reload SIGHUP handler is confirmed blocked on
+/// the shared reservation lock -- `edge_gateway.run`'s single-threaded
+/// event loop handles both accepting/dispatching connections and
+/// (synchronously) `hotReloadConfig`, so blocking that one thread on the
+/// lock blocks all socket I/O for that process, including finishing
+/// already-in-flight work. An earlier revision required exactly that and
+/// reliably hung for the full bounded test timeout, a real deadlock
+/// proving the property is architecturally unobservable this way. See
+/// the round loop below for what is proven instead.
 ///
 /// Uses `std.heap.page_allocator` rather than `std.testing.allocator`:
 /// the latter is not safe to call concurrently from multiple threads,
 /// and `results`/`failure` are only ever read by the main thread after
 /// `std.Thread.join()`, so no cross-thread synchronization on them is
-/// needed (only `completed` is read while the worker may still be
-/// running). A worker records the first error it hits (an issuance
-/// failure or an unexpected key id) and stops immediately, rather than
-/// silently swallowing it and leaving the caller to mistake an empty
-/// result set for a healthy run.
+/// needed. A worker records the first error it hits (an issuance failure
+/// or an unexpected key id) and stops immediately, rather than silently
+/// swallowing it and leaving the caller to mistake an empty result set
+/// for a healthy run.
 const ChurnWorker = struct {
     port: u16,
     stop: *std.atomic.Value(bool),
     outgoing_key_id_hex: []const u8,
     incoming_key_id_hex: []const u8,
-    completed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     results: std.array_list.Managed(TicketEnvelopeIds),
     failure: ?anyerror = null,
 
@@ -6567,22 +6571,25 @@ const ChurnWorker = struct {
                 self.failure = err;
                 return;
             };
-            _ = self.completed.fetchAdd(1, .release);
         }
     }
 };
 
-/// #520: bounded wait for a `ChurnWorker` to have *completed* at least
-/// `minimum` real connections -- deliberately stronger than waiting for
-/// an attempt to merely start, and safe to call while the worker thread
-/// is still running (unlike reading `results.items.len` directly).
-fn waitForCompletedChurnAtLeast(worker: *const ChurnWorker, minimum: usize, timeout_ms: u64) !void {
-    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (compat.milliTimestamp() < deadline) {
-        if (worker.completed.load(.acquire) >= minimum) return;
-        compat.sleepNs(5 * std.time.ns_per_ms);
+/// #520: asserts `tuples` contains at least one ticket sealed under each
+/// of the two given key ids -- the achievable proof that continuous
+/// churn traffic actually spanned a round's generation transition (both
+/// before and after it happened), used in place of an unobservable
+/// "completed while the reload handler was confirmed blocked" claim.
+fn expectSpansBothGenerations(tuples: []const TicketEnvelopeIds, outgoing_key_id_hex: []const u8, incoming_key_id_hex: []const u8) !void {
+    var saw_outgoing = false;
+    var saw_incoming = false;
+    for (tuples) |ids| {
+        const hex = std.fmt.bytesToHex(ids.key_id, .lower);
+        if (std.mem.eql(u8, outgoing_key_id_hex, &hex)) saw_outgoing = true;
+        if (std.mem.eql(u8, incoming_key_id_hex, &hex)) saw_incoming = true;
     }
-    return error.ChurnCompletionNotObserved;
+    try std.testing.expect(saw_outgoing);
+    try std.testing.expect(saw_incoming);
 }
 
 /// #369: flips one byte inside the opaque ticket envelope of an
@@ -9032,17 +9039,27 @@ test "soak.persistent.multi_process_nonce_safety" {
         try waitForReservationAttemptCount(allocator, process_a.log_path, reservation_marker_count_before_a + 1, 5_000);
         try waitForReservationAttemptCount(allocator, process_b.log_path, reservation_marker_count_before_b + 1, 5_000);
 
-        // Heavy tier only, while both reload handlers are confirmed still
-        // blocked on the held lock: require each worker to have
-        // *completed* at least one real connection during this stalled
-        // window -- proof that actual traffic overlapped the reload race
-        // itself, not merely that a worker thread was runnable at some
-        // point before or after it.
-        if (soakHeavyEnabled()) {
-            try waitForCompletedChurnAtLeast(&churn_a.?, 1, 5_000);
-            try waitForCompletedChurnAtLeast(&churn_b.?, 1, 5_000);
-        }
-
+        // Deliberately does *not* require a churn worker to complete a
+        // connection while the lock above is held. `edge_gateway.run`'s
+        // main loop (`http.shutdown.consumeReloadRequested()` ->
+        // `gshutdown.hotReloadConfig`) calls `hotReloadConfig`
+        // synchronously from the same single-threaded event loop that
+        // also accepts new connections (`gaccept.acceptReadyConnections`)
+        // and dispatches ready sockets to the worker pool -- with
+        // `TARDIGRADE_WORKER_THREADS=1`, blocking that one loop thread on
+        // `${path}.lock` therefore blocks *all* socket I/O for that
+        // process, including finishing already-in-flight work, not only
+        // new accepts. An earlier revision of this test required exactly
+        // that ("wait for a churn worker to complete a connection while
+        // both reload handlers are confirmed blocked") and it reliably
+        // hung for the full bounded test timeout -- a real, reproducible
+        // deadlock proving the invariant is architecturally unobservable
+        // this way, not merely hard to arrange. The honest, achievable
+        // property instead: churn traffic keeps flowing continuously
+        // across the *whole* round (started before either SIGHUP, stopped
+        // only after both post-acceptance probes below), asserted by
+        // requiring each worker's collected samples to include both the
+        // outgoing and the incoming generation's key id.
         reload_barrier.close();
 
         // Now that the lock is released, both processes' real
@@ -9080,6 +9097,13 @@ test "soak.persistent.multi_process_nonce_safety" {
             try std.testing.expect(churn_b.?.failure == null);
             try std.testing.expect(churn_a.?.results.items.len > 0);
             try std.testing.expect(churn_b.?.results.items.len > 0);
+
+            // Traffic actually spanned the transition: each worker's
+            // collected samples include both the outgoing and the
+            // incoming generation's key id, not merely "some traffic
+            // happened at some point in the round".
+            try expectSpansBothGenerations(churn_a.?.results.items, key_ids[retiring_index], key_ids[new_index]);
+            try expectSpansBothGenerations(churn_b.?.results.items, key_ids[retiring_index], key_ids[new_index]);
 
             for (churn_a.?.results.items) |ids| try all_tuples.append(ids);
             for (churn_b.?.results.items) |ids| try all_tuples.append(ids);
