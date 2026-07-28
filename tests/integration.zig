@@ -642,6 +642,154 @@ const RawTcpServer = struct {
     }
 };
 
+/// #520: a real upstream that deterministically proves a connection has
+/// been accepted, dispatched to a worker, and proxied all the way to it
+/// -- and holds it there under the test's own control -- rather than a
+/// fixed `delay_ms` sleep (the shape `UpstreamResponseSpec` already
+/// supports, used by e.g. `in-flight request completes safely across
+/// reload and new requests use new config` above, but not condition-based
+/// enough for a proof that must not depend on how long a reload happens
+/// to take). `waitEntered` confirms the request truly reached the
+/// upstream; `release` lets its response go out only once the caller
+/// chooses to, so a request can be held in flight across an arbitrarily
+/// long window (here, a real SIGHUP reload race) with no risk of the
+/// gate itself timing the proof.
+const GatedUpstream = struct {
+    allocator: std.mem.Allocator,
+    server: compat.NetServer,
+    thread: ?std.Thread,
+    stop_flag: std.atomic.Value(bool),
+    entered: std.atomic.Value(bool),
+    release_flag: std.atomic.Value(bool),
+
+    fn start(allocator: std.mem.Allocator) !GatedUpstream {
+        const server = try compat.listenTcp(test_host, 0);
+        return .{
+            .allocator = allocator,
+            .server = server,
+            .thread = null,
+            .stop_flag = std.atomic.Value(bool).init(false),
+            .entered = std.atomic.Value(bool).init(false),
+            .release_flag = std.atomic.Value(bool).init(false),
+        };
+    }
+
+    fn port(self: *const GatedUpstream) u16 {
+        return self.server.port();
+    }
+
+    fn run(self: *GatedUpstream) !void {
+        self.thread = try std.Thread.spawn(.{}, gatedUpstreamThreadMain, .{self});
+    }
+
+    fn stop(self: *GatedUpstream) void {
+        self.stop_flag.store(true, .seq_cst);
+        self.release_flag.store(true, .seq_cst);
+        wakeListener(self.port());
+        if (self.thread) |thread| thread.join();
+        self.server.deinit();
+        self.* = undefined;
+    }
+
+    /// Rearms the gate for another round: must be called before the next
+    /// request is sent, never concurrently with one already in flight.
+    fn resetGate(self: *GatedUpstream) void {
+        self.entered.store(false, .release);
+        self.release_flag.store(false, .release);
+    }
+
+    fn waitEntered(self: *const GatedUpstream, timeout_ms: u64) !void {
+        const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (compat.milliTimestamp() < deadline) {
+            if (self.entered.load(.acquire)) return;
+            compat.sleepNs(5 * std.time.ns_per_ms);
+        }
+        return error.GatedUpstreamNotEntered;
+    }
+
+    fn release(self: *GatedUpstream) void {
+        self.release_flag.store(true, .release);
+    }
+};
+
+fn gatedUpstreamThreadMain(server: *GatedUpstream) void {
+    while (!server.stop_flag.load(.seq_cst)) {
+        var conn = server.server.accept() catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("gated upstream accept failed: {}\n", .{err});
+            continue;
+        };
+        defer conn.stream.close();
+
+        const req = readHttpMessage(server.allocator, conn.stream, 1024 * 1024) catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("gated upstream read failed: {}\n", .{err});
+            continue;
+        };
+        defer server.allocator.free(req.raw);
+        if (req.request_line.len == 0) continue;
+
+        server.entered.store(true, .release);
+        while (!server.release_flag.load(.acquire)) {
+            if (server.stop_flag.load(.seq_cst)) return;
+            compat.sleepNs(2 * std.time.ns_per_ms);
+        }
+        if (server.stop_flag.load(.seq_cst)) return;
+
+        const body = "gated-ok";
+        var out = std.array_list.Managed(u8).init(server.allocator);
+        defer out.deinit();
+        out.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch continue;
+        conn.stream.writeAll(out.items) catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("gated upstream write failed: {}\n", .{err});
+            continue;
+        };
+    }
+}
+
+/// #520: drives one real native TLS H1 request against `port`'s `/race`
+/// route (proxied to a `GatedUpstream`) on its own thread, so the main
+/// test thread can hold a reservation lock and drive a SIGHUP race while
+/// this request sits blocked mid-flight at the gate. `done` is a plain
+/// atomic the main thread can poll (see `waitForRaceRequestComplete`)
+/// without joining the thread first -- joining would block until the
+/// gate is released, which is exactly the ordering this proof needs to
+/// control explicitly.
+const RaceRequestResult = struct {
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    status_ok: bool = false,
+    err: ?anyerror = null,
+};
+
+fn runTlsRaceRequest(allocator: std.mem.Allocator, port: u16, result: *RaceRequestResult) void {
+    defer result.done.store(true, .release);
+    const client = PureZigTlsClient.create(allocator, port, "http/1.1") catch |err| {
+        result.err = err;
+        return;
+    };
+    defer client.destroy();
+    client.writeAllPlain("GET /race HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n") catch |err| {
+        result.err = err;
+        return;
+    };
+    const raw = client.readPlainToEnd(allocator, 64 * 1024, 10_000) catch |err| {
+        result.err = err;
+        return;
+    };
+    defer allocator.free(raw);
+    result.status_ok = containsSubstring(raw, "HTTP/1.1 200 OK");
+}
+
+fn waitForRaceRequestComplete(result: *const RaceRequestResult, timeout_ms: u64) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        if (result.done.load(.acquire)) return;
+        compat.sleepNs(5 * std.time.ns_per_ms);
+    }
+    return error.RaceRequestNotObserved;
+}
+
 const StartTlsSmtpProcess = struct {
     allocator: std.mem.Allocator,
     child: std.process.Child,
@@ -6571,6 +6719,20 @@ const ChurnWorker = struct {
     fn run(self: *ChurnWorker) void {
         while (!self.stop.load(.acquire)) {
             const ids = issueTicketIds(std.heap.page_allocator, self.port) catch |err| {
+                // `WouldBlock` is transient local contention -- this
+                // worker's own tight reconnect loop briefly outpacing the
+                // single dispatched worker thread `TARDIGRADE_WORKER_
+                // THREADS=1` provides (e.g. while the gated race request
+                // above is deliberately occupying it), not a server-side
+                // correctness failure. Retrying past it (with a short
+                // pause so the retry doesn't just recreate the same
+                // contention) keeps the proof honest without papering
+                // over a real issuance/connection failure, which remains
+                // fatal exactly as before.
+                if (err == error.WouldBlock) {
+                    compat.sleepNs(2 * std.time.ns_per_ms);
+                    continue;
+                }
                 self.failure = err;
                 return;
             };
@@ -8852,22 +9014,58 @@ test "soak.persistent.multi_process_nonce_safety" {
         },
     });
 
-    const config_text =
-        \\location = /healthz {
+    // One gated upstream per process, proxied to from a `/race` route
+    // declared in that process's own config -- the heavy tier's real
+    // worker-overlap proof below drives one request through each of
+    // these, per round, and holds it there under the test's own control
+    // while the reservation lock is held. Created (and their `/race`
+    // route wired) regardless of tier, since the process's own config
+    // is fixed at startup and can't be changed per-round; only the
+    // smoke tier simply never drives traffic through it.
+    var gate_a = try GatedUpstream.start(allocator);
+    defer gate_a.stop();
+    try gate_a.run();
+    var gate_b = try GatedUpstream.start(allocator);
+    defer gate_b.stop();
+    try gate_b.run();
+
+    const config_text_a = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
         \\    return 200 alive;
-        \\}
-    ;
-    const process_options = TardigradeOptions{
-        .config_text = config_text,
+        \\}}
+        \\location = /race {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, gate_a.port() });
+    defer allocator.free(config_text_a);
+    const config_text_b = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location = /race {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, gate_b.port() });
+    defer allocator.free(config_text_b);
+
+    const shared_extra_env = &[_]EnvPair{
+        .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+        .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+        .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH", .value = ticket_keys_path },
+    };
+    const process_options_a = TardigradeOptions{
+        .config_text = config_text_a,
         .ready_https_insecure = true,
         .ready_path = "/healthz",
-        .extra_env = &.{
-            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
-            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
-            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
-            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
-            .{ .name = "TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH", .value = ticket_keys_path },
-        },
+        .extra_env = shared_extra_env,
+    };
+    const process_options_b = TardigradeOptions{
+        .config_text = config_text_b,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = shared_extra_env,
     };
 
     // Phase 1: *forced*, not merely likely, concurrent startup reservation.
@@ -8897,17 +9095,17 @@ test "soak.persistent.multi_process_nonce_safety" {
         .lock = .exclusive,
     });
 
-    var process_a = try TardigradeProcess.spawn(allocator, process_options);
+    var process_a = try TardigradeProcess.spawn(allocator, process_options_a);
     defer process_a.stop();
-    var process_b = try TardigradeProcess.spawn(allocator, process_options);
+    var process_b = try TardigradeProcess.spawn(allocator, process_options_b);
     defer process_b.stop();
 
     try waitForReservationAttemptCount(allocator, process_a.log_path, 1, 5_000);
     try waitForReservationAttemptCount(allocator, process_b.log_path, 1, 5_000);
     startup_barrier.close();
 
-    try process_a.waitReady(process_options);
-    try process_b.waitReady(process_options);
+    try process_a.waitReady(process_options_a);
+    try process_b.waitReady(process_options_b);
 
     const after_both_start = try readTicketKeyLeaseWindow(allocator, ticket_keys_path, key_ids[0]);
     try std.testing.expectEqual(@as(u64, 1), after_both_start.generation);
@@ -9055,6 +9253,47 @@ test "soak.persistent.multi_process_nonce_safety" {
             try waitForChurnGenerationSeen(&churn_b.?.saw_outgoing, 5_000);
         }
 
+        // The real worker-overlap proof #520 asks for, heavy tier only:
+        // `edge_gateway.run` has a separate `WorkerPool` alongside its
+        // single-threaded event loop, so once a native H1 connection has
+        // actually been accepted and dispatched (`advanceNativeHttp1`
+        // running on a worker, `WaitingEncryptedHttpConnection.waitFor`
+        // polling its own fd directly), it can keep making progress even
+        // while the main loop is blocked inside synchronous
+        // `hotReloadConfig` -- blocking that one thread only prevents
+        // *new* accepts, not already-dispatched work. `gate_{a,b}` proxy
+        // one real request per process to a point held entirely under
+        // this test's control, so `waitEntered` below deterministically
+        // proves each request has already been accepted, dispatched, and
+        // proxied all the way to its upstream *before* either reload
+        // begins -- a real condition, not a fixed delay.
+        //
+        // The cleanup defer releases both gates and joins any spawned
+        // race thread unconditionally, registered before the fallible
+        // spawns/waits below -- if a later `try` in this round fails
+        // (reload never reaching `reload_accepted`, say), a race thread
+        // left blocked waiting on a never-released gate must not leak
+        // past this scope, the same lesson the churn-worker lifetime fix
+        // already applied.
+        var race_result_a = RaceRequestResult{};
+        var race_result_b = RaceRequestResult{};
+        var race_thread_a: ?std.Thread = null;
+        var race_thread_b: ?std.Thread = null;
+        defer {
+            gate_a.release();
+            gate_b.release();
+            if (race_thread_a) |t| t.join();
+            if (race_thread_b) |t| t.join();
+        }
+        if (soakHeavyEnabled()) {
+            gate_a.resetGate();
+            gate_b.resetGate();
+            race_thread_a = try std.Thread.spawn(.{}, runTlsRaceRequest, .{ allocator, process_a.port, &race_result_a });
+            race_thread_b = try std.Thread.spawn(.{}, runTlsRaceRequest, .{ allocator, process_b.port, &race_result_b });
+            try gate_a.waitEntered(5_000);
+            try gate_b.waitEntered(5_000);
+        }
+
         // Forces the two real SIGHUP handlers to genuinely block on
         // `${ticket_keys_path}.lock` at the same time, exactly the same
         // technique the concurrent-startup phase above uses: this test
@@ -9085,28 +9324,36 @@ test "soak.persistent.multi_process_nonce_safety" {
         try waitForReservationAttemptCount(allocator, process_a.log_path, reservation_marker_count_before_a + 1, 5_000);
         try waitForReservationAttemptCount(allocator, process_b.log_path, reservation_marker_count_before_b + 1, 5_000);
 
-        // Deliberately does *not* require a churn worker to complete a
-        // connection while the lock above is held. `edge_gateway.run`'s
-        // main loop (`http.shutdown.consumeReloadRequested()` ->
-        // `gshutdown.hotReloadConfig`) calls `hotReloadConfig`
-        // synchronously from the same single-threaded event loop that
-        // also accepts new connections (`gaccept.acceptReadyConnections`)
-        // and dispatches ready sockets to the worker pool -- with
-        // `TARDIGRADE_WORKER_THREADS=1`, blocking that one loop thread on
-        // `${path}.lock` therefore blocks *all* socket I/O for that
-        // process, including finishing already-in-flight work, not only
-        // new accepts. An earlier revision of this test required exactly
-        // that ("wait for a churn worker to complete a connection while
-        // both reload handlers are confirmed blocked") and it reliably
-        // hung for the full bounded test timeout -- a real, reproducible
-        // deadlock proving the invariant is architecturally unobservable
-        // this way, not merely hard to arrange. The honest, achievable
-        // property instead: churn traffic keeps flowing continuously
-        // across the *whole* round (started before either SIGHUP, stopped
-        // only after both post-acceptance probes below), asserted by
-        // requiring each worker's collected samples to include both the
-        // outgoing and the incoming generation's key id.
+        // Both main event loops are now confirmed blocked in reload --
+        // but each gated request (heavy tier only) was already accepted
+        // and dispatched to a worker *before* that happened, so releasing
+        // it here and requiring its completion *before* the lock itself
+        // is released is the actual proof that real request/ticket-
+        // adjacent traffic was genuinely in flight during the reload
+        // race, not merely before or after it. `ChurnWorker`'s own
+        // connections deliberately are not required to complete here
+        // (see its doc comment): only an *already-dispatched* connection
+        // can make progress while the main loop is blocked, and a churn
+        // worker's next connection attempt has no such guarantee.
+        if (soakHeavyEnabled()) {
+            gate_a.release();
+            gate_b.release();
+            try waitForRaceRequestComplete(&race_result_a, 5_000);
+            try waitForRaceRequestComplete(&race_result_b, 5_000);
+        }
+
         reload_barrier.close();
+
+        if (soakHeavyEnabled()) {
+            race_thread_a.?.join();
+            race_thread_b.?.join();
+            race_thread_a = null;
+            race_thread_b = null;
+            if (race_result_a.err) |err| return err;
+            if (race_result_b.err) |err| return err;
+            try std.testing.expect(race_result_a.status_ok);
+            try std.testing.expect(race_result_b.status_ok);
+        }
 
         // Now that the lock is released, both processes' real
         // reservations proceed and each (eventually) reports its own
