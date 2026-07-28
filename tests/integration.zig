@@ -5219,21 +5219,44 @@ test "interop.h2.window_update_connection_overflow_sends_goaway" {
     try client.writeAllPlain("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
     try client.writeHttp2Frame(0x4, 0, 0, &.{}); // client SETTINGS
 
+    // Finish the initial SETTINGS/ACK handshake before injecting the
+    // overflowing WINDOW_UPDATE. Interleaving the two races the server's
+    // GOAWAY-triggered teardown against the client's own SETTINGS ACK: on
+    // some schedules the connection closes before the ACK write lands,
+    // which the test would otherwise misreport as a harness socket error
+    // rather than as evidence about the (already-correct) GOAWAY behavior.
+    var saw_server_settings = false;
+    var saw_client_settings_ack = false;
+    var setup_frame_count: usize = 0;
+    while ((!saw_server_settings or !saw_client_settings_ack) and setup_frame_count < 16) : (setup_frame_count += 1) {
+        var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
+        defer frame.deinit(allocator);
+        if (frame.typ != 0x4) continue;
+        if ((frame.flags & 0x1) != 0) {
+            saw_client_settings_ack = true;
+        } else {
+            saw_server_settings = true;
+            try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
+        }
+    }
+    try std.testing.expect(saw_server_settings);
+    try std.testing.expect(saw_client_settings_ack);
+
     // The connection-level window starts at 65,535; this legal 31-bit
     // increment alone pushes it past 2^31-1.
     var inc: [4]u8 = undefined;
     std.mem.writeInt(u32, inc[0..4], 0x7FFFFFFF, .big);
     try client.writeHttp2Frame(0x8, 0, 0, inc[0..]);
 
+    // Past this point the client sends nothing further: it only waits for
+    // and validates the server's GOAWAY. Sending a SETTINGS ACK here would
+    // reopen the same teardown race this test exists to close.
     var saw_goaway = false;
     var frame_count: usize = 0;
     while (frame_count < 16 and !saw_goaway) : (frame_count += 1) {
         var frame = try client.readHttp2Frame(allocator, 16 * 1024, 5_000);
         defer frame.deinit(allocator);
         switch (frame.typ) {
-            0x4 => {
-                if ((frame.flags & 0x1) == 0) try client.writeHttp2Frame(0x4, 0x1, 0, &.{});
-            },
             0x7 => { // GOAWAY
                 try std.testing.expect(frame.payload.len >= 8);
                 const err_code = std.mem.readInt(u32, frame.payload[4..8], .big);
