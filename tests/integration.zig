@@ -6480,7 +6480,13 @@ fn waitForReservationAttempt(allocator: std.mem.Allocator, log_path: []const u8,
 /// for `reload_accepted` *while* this traffic is in flight, which is the
 /// part that can actually expose a publication/UAF/deadlock bug in the
 /// real reload path; sampling only starts after both reloads finish (the
-/// smoke tier's shape) never overlaps the race itself. Uses
+/// smoke tier's shape) never overlaps the race itself. `attempt_started`
+/// is set immediately before the worker's very first (and every
+/// subsequent) connection attempt, so the caller can wait for a real
+/// in-flight attempt on both workers *before* sending either SIGHUP --
+/// otherwise a scheduler could let both reloads complete before either
+/// worker thread ever executes, and the heavy tier would pass without
+/// having exercised any traffic during publication at all. Uses
 /// `std.heap.page_allocator` rather than `std.testing.allocator`: the
 /// latter is not safe to call concurrently from multiple threads, and
 /// this worker's results/failure are only ever read by the main thread
@@ -6489,21 +6495,27 @@ fn waitForReservationAttempt(allocator: std.mem.Allocator, log_path: []const u8,
 ///
 /// Every issued ticket is validated against the round's two known key
 /// ids: it must belong to either the complete outgoing or complete
-/// incoming generation, never anything else -- and once the caller marks
-/// `require_new` (only after *this specific process* has independently
-/// reported `reload_accepted`), it must belong to the incoming generation
-/// only, proving fresh issuance never regresses to the retiring key after
-/// that process's own acceptance. A worker records the first error it
-/// hits (an issuance failure, an unexpected key id, or a stale-key-after-
-/// acceptance violation) and stops immediately, rather than silently
-/// swallowing it and leaving the caller to mistake an empty result set
-/// for a healthy run.
+/// incoming generation, never anything else -- and if `require_new` was
+/// already set *before this specific attempt started* (only after *this
+/// specific process* has independently reported `reload_accepted`), the
+/// ticket must belong to the incoming generation only, proving fresh
+/// issuance never regresses to the retiring key after that process's own
+/// acceptance. The phase is sampled once at the start of each attempt,
+/// not re-read after it completes -- a request that began (and was
+/// legitimately sealed with the outgoing key) before acceptance must not
+/// be retroactively misclassified as a post-acceptance regression merely
+/// because it happens to finish after `require_new` flips. A worker
+/// records the first error it hits (an issuance failure, an unexpected
+/// key id, or a stale-key-after-acceptance violation) and stops
+/// immediately, rather than silently swallowing it and leaving the
+/// caller to mistake an empty result set for a healthy run.
 const ChurnWorker = struct {
     port: u16,
     stop: *std.atomic.Value(bool),
     outgoing_key_id_hex: []const u8,
     incoming_key_id_hex: []const u8,
     require_new: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    attempt_started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     results: std.array_list.Managed(TicketEnvelopeIds),
     failure: ?anyerror = null,
 
@@ -6523,6 +6535,8 @@ const ChurnWorker = struct {
 
     fn run(self: *ChurnWorker) void {
         while (!self.stop.load(.acquire)) {
+            self.attempt_started.store(true, .release);
+            const require_new_for_this_attempt = self.require_new.load(.acquire);
             const ids = issueTicketIds(std.heap.page_allocator, self.port) catch |err| {
                 self.failure = err;
                 return;
@@ -6534,7 +6548,7 @@ const ChurnWorker = struct {
                 self.failure = error.ChurnObservedUnexpectedKeyId;
                 return;
             }
-            if (self.require_new.load(.acquire) and !is_incoming) {
+            if (require_new_for_this_attempt and !is_incoming) {
                 self.failure = error.ChurnObservedStaleKeyAfterAcceptance;
                 return;
             }
@@ -6545,6 +6559,19 @@ const ChurnWorker = struct {
         }
     }
 };
+
+/// #520: bounded wait for a `ChurnWorker`'s first real connection attempt
+/// to have started -- used so the main thread only sends SIGHUP once both
+/// workers are genuinely in flight, not merely spawned-and-maybe-still-
+/// runnable.
+fn waitForChurnAttemptStarted(worker: *const ChurnWorker, timeout_ms: u64) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        if (worker.attempt_started.load(.acquire)) return;
+        compat.sleepNs(5 * std.time.ns_per_ms);
+    }
+    return error.ChurnAttemptNotObserved;
+}
 
 /// #369: flips one byte inside the opaque ticket envelope of an
 /// OpenSSL-managed `-sess_out` PEM file, in place. Locates
@@ -8965,6 +8992,16 @@ test "soak.persistent.multi_process_nonce_safety" {
             churn_thread_a = try std.Thread.spawn(.{}, ChurnWorker.run, .{&churn_a.?});
             churn_b = ChurnWorker.init(process_b.port, &churn_stop, key_ids[retiring_index], key_ids[new_index]);
             churn_thread_b = try std.Thread.spawn(.{}, ChurnWorker.run, .{&churn_b.?});
+
+            // Spawning a thread only makes it runnable -- without this,
+            // a valid schedule could let both reloads complete before
+            // either worker ever executes `issueTicketIds()`, and the
+            // heavy tier would pass without any traffic actually
+            // overlapping publication. Wait for both workers' first real
+            // connection attempt to have genuinely started before either
+            // SIGHUP is sent.
+            try waitForChurnAttemptStarted(&churn_a.?, 5_000);
+            try waitForChurnAttemptStarted(&churn_b.?, 5_000);
         }
 
         // Sent back-to-back, without waiting between them -- both real
