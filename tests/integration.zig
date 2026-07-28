@@ -6448,6 +6448,32 @@ fn currentLabeledMetric(allocator: std.mem.Allocator, port: u16, name: []const u
     return prometheusLabeledMetricValue(metrics.body, name, labels) orelse 0;
 }
 
+/// #520: the observable arrival signal for the concurrent-startup
+/// reservation barrier -- polls a spawned-but-not-yet-waited-on process's
+/// own log file (already captured from its earliest stderr output, per
+/// `TardigradeProcess.spawn`'s `early_stderr` redirect, independent of
+/// whether its HTTP listener has started serving yet) for the fixed,
+/// secret-free marker `edge_gateway.zig` logs immediately before entering
+/// `loadPersistentTicketKeysFromFile` -- whose own first action is
+/// acquiring `${path}.lock`. Waiting for this marker on *both* processes
+/// before releasing a barrier lock the test holds is a real observed-
+/// arrival condition, not a fixed delay: a fixed sleep can never rule out
+/// a slower process reaching the lock attempt after the barrier was
+/// already released, silently turning the intended race back into
+/// sequential reservation.
+fn waitForReservationAttempt(allocator: std.mem.Allocator, log_path: []const u8, timeout_ms: u64) !void {
+    const marker = "persistent ticket-key reservation attempt starting";
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        if (compat.cwd().readFileAlloc(allocator, log_path, 4 * 1024 * 1024)) |log_data| {
+            defer allocator.free(log_data);
+            if (containsSubstring(log_data, marker)) return;
+        } else |_| {}
+        compat.sleepNs(10 * std.time.ns_per_ms);
+    }
+    return error.ReservationAttemptNotObserved;
+}
+
 /// #520 heavy tier: keeps real full-handshake/ticket-issuance traffic
 /// flowing against one process for as long as `stop` is clear -- run on
 /// its own `std.Thread` so the main thread can send both SIGHUPs and poll
@@ -6457,16 +6483,38 @@ fn currentLabeledMetric(allocator: std.mem.Allocator, port: u16, name: []const u
 /// smoke tier's shape) never overlaps the race itself. Uses
 /// `std.heap.page_allocator` rather than `std.testing.allocator`: the
 /// latter is not safe to call concurrently from multiple threads, and
-/// this worker's results are only ever read by the main thread after
-/// `std.Thread.join()`, so no cross-thread synchronization on `results`
-/// itself is needed.
+/// this worker's results/failure are only ever read by the main thread
+/// after `std.Thread.join()`, so no cross-thread synchronization on them
+/// is needed.
+///
+/// Every issued ticket is validated against the round's two known key
+/// ids: it must belong to either the complete outgoing or complete
+/// incoming generation, never anything else -- and once the caller marks
+/// `require_new` (only after *this specific process* has independently
+/// reported `reload_accepted`), it must belong to the incoming generation
+/// only, proving fresh issuance never regresses to the retiring key after
+/// that process's own acceptance. A worker records the first error it
+/// hits (an issuance failure, an unexpected key id, or a stale-key-after-
+/// acceptance violation) and stops immediately, rather than silently
+/// swallowing it and leaving the caller to mistake an empty result set
+/// for a healthy run.
 const ChurnWorker = struct {
     port: u16,
     stop: *std.atomic.Value(bool),
+    outgoing_key_id_hex: []const u8,
+    incoming_key_id_hex: []const u8,
+    require_new: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     results: std.array_list.Managed(TicketEnvelopeIds),
+    failure: ?anyerror = null,
 
-    fn init(port: u16, stop: *std.atomic.Value(bool)) ChurnWorker {
-        return .{ .port = port, .stop = stop, .results = std.array_list.Managed(TicketEnvelopeIds).init(std.heap.page_allocator) };
+    fn init(port: u16, stop: *std.atomic.Value(bool), outgoing_key_id_hex: []const u8, incoming_key_id_hex: []const u8) ChurnWorker {
+        return .{
+            .port = port,
+            .stop = stop,
+            .outgoing_key_id_hex = outgoing_key_id_hex,
+            .incoming_key_id_hex = incoming_key_id_hex,
+            .results = std.array_list.Managed(TicketEnvelopeIds).init(std.heap.page_allocator),
+        };
     }
 
     fn deinit(self: *ChurnWorker) void {
@@ -6475,8 +6523,25 @@ const ChurnWorker = struct {
 
     fn run(self: *ChurnWorker) void {
         while (!self.stop.load(.acquire)) {
-            const ids = issueTicketIds(std.heap.page_allocator, self.port) catch continue;
-            self.results.append(ids) catch {};
+            const ids = issueTicketIds(std.heap.page_allocator, self.port) catch |err| {
+                self.failure = err;
+                return;
+            };
+            const hex = std.fmt.bytesToHex(ids.key_id, .lower);
+            const is_incoming = std.mem.eql(u8, self.incoming_key_id_hex, &hex);
+            const is_outgoing = std.mem.eql(u8, self.outgoing_key_id_hex, &hex);
+            if (!is_incoming and !is_outgoing) {
+                self.failure = error.ChurnObservedUnexpectedKeyId;
+                return;
+            }
+            if (self.require_new.load(.acquire) and !is_incoming) {
+                self.failure = error.ChurnObservedStaleKeyAfterAcceptance;
+                return;
+            }
+            self.results.append(ids) catch |err| {
+                self.failure = err;
+                return;
+            };
         }
     }
 };
@@ -8738,15 +8803,12 @@ test "soak.persistent.multi_process_nonce_safety" {
     // same `createFile(..., .lock = .exclusive)` call
     // `ticket_key_snapshot.acquireReservationLock` uses, so it is a real
     // OS-level advisory lock that genuinely blocks both children's own
-    // in-startup reservation attempt, not a test-only substitute. Startup
-    // evidence elsewhere in this file (`restart.persistent.ticket_survives`)
-    // shows the reservation completes before the readiness endpoint ever
-    // comes up, so holding this lock for a bounded window comfortably
-    // longer than any real process needs to reach that call guarantees, by
-    // construction, that both children are already blocked *inside* the
-    // same lock acquisition the instant this test releases it -- forcing
-    // both real reservations to begin at the same moment rather than
-    // merely hoping the scheduler interleaves them.
+    // in-startup reservation attempt, not a test-only substitute. The lock
+    // is released only once `waitForReservationAttempt` has observed, on
+    // *both* processes, the secret-free marker `edge_gateway.zig` logs
+    // immediately before entering the reservation path -- a real observed-
+    // arrival condition, not a fixed delay that could still let a slower
+    // process reach the lock attempt only after an early release.
     const startup_barrier_lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{ticket_keys_path});
     defer allocator.free(startup_barrier_lock_path);
     var startup_barrier = try compat.cwd().createFile(startup_barrier_lock_path, .{
@@ -8761,7 +8823,8 @@ test "soak.persistent.multi_process_nonce_safety" {
     var process_b = try TardigradeProcess.spawn(allocator, process_options);
     defer process_b.stop();
 
-    compat.sleepNs(500 * std.time.ns_per_ms);
+    try waitForReservationAttempt(allocator, process_a.log_path, 5_000);
+    try waitForReservationAttempt(allocator, process_b.log_path, 5_000);
     startup_barrier.close();
 
     try process_a.waitReady(process_options);
@@ -8873,15 +8936,34 @@ test "soak.persistent.multi_process_nonce_safety" {
         // that can actually expose a publication/UAF/deadlock bug, and
         // sampling only after both reloads finish (as the smoke tier does)
         // never overlaps the race itself.
+        //
+        // The cleanup defer is registered *before* any fallible operation
+        // that could unwind this scope (`std.Thread.spawn`, the
+        // `waitForLabeledMetricAtLeast` polls below) -- if reload never
+        // reaches `reload_accepted` (exactly the failure this soak wants
+        // to diagnose), the workers must still be signaled to stop and
+        // joined here, not left running against stack-owned state after
+        // the enclosing `process_*` defers kill the children out from
+        // under them. `churn_thread_{a,b}` are set back to `null` once
+        // explicitly joined on the success path below so this deferred
+        // block's own join calls become harmless no-ops rather than an
+        // illegal double-join.
         var churn_stop = std.atomic.Value(bool).init(false);
         var churn_a: ?ChurnWorker = null;
         var churn_b: ?ChurnWorker = null;
         var churn_thread_a: ?std.Thread = null;
         var churn_thread_b: ?std.Thread = null;
+        defer {
+            churn_stop.store(true, .release);
+            if (churn_thread_a) |t| t.join();
+            if (churn_thread_b) |t| t.join();
+            if (churn_a) |*w| w.deinit();
+            if (churn_b) |*w| w.deinit();
+        }
         if (soakHeavyEnabled()) {
-            churn_a = ChurnWorker.init(process_a.port, &churn_stop);
-            churn_b = ChurnWorker.init(process_b.port, &churn_stop);
+            churn_a = ChurnWorker.init(process_a.port, &churn_stop, key_ids[retiring_index], key_ids[new_index]);
             churn_thread_a = try std.Thread.spawn(.{}, ChurnWorker.run, .{&churn_a.?});
+            churn_b = ChurnWorker.init(process_b.port, &churn_stop, key_ids[retiring_index], key_ids[new_index]);
             churn_thread_b = try std.Thread.spawn(.{}, ChurnWorker.run, .{&churn_b.?});
         }
 
@@ -8890,32 +8972,40 @@ test "soak.persistent.multi_process_nonce_safety" {
         process_a.sendSignal(std.posix.SIG.HUP);
         process_b.sendSignal(std.posix.SIG.HUP);
 
+        // Each process's own churn worker is only required to switch
+        // exclusively to the incoming key *after that same process*
+        // reports `reload_accepted` -- proving the per-process monotonic
+        // boundary the prior review flagged as unchecked, while still
+        // correctly tolerating either generation during the actual race
+        // (A's worker may keep seeing the outgoing key for a while after
+        // A's own acceptance is observed here, only until this next line
+        // runs against A specifically; B's worker is intentionally left
+        // unconstrained until B's own acceptance is confirmed below).
         try waitForLabeledMetricAtLeast(allocator, process_a.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""}, reload_accepted_before_a + 1, 5_000);
+        if (churn_a) |*w| w.require_new.store(true, .release);
         try waitForLabeledMetricAtLeast(allocator, process_b.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""}, reload_accepted_before_b + 1, 5_000);
+        if (churn_b) |*w| w.require_new.store(true, .release);
 
         if (soakHeavyEnabled()) {
             churn_stop.store(true, .release);
             churn_thread_a.?.join();
             churn_thread_b.?.join();
+            churn_thread_a = null;
+            churn_thread_b = null;
 
-            // Every tuple observed while the reload race was in flight must
-            // belong to either the complete outgoing generation or the
-            // complete incoming one -- never a key id that is active in
-            // neither, and never a duplicate against anything else this
-            // soak has ever issued.
-            for (churn_a.?.results.items) |ids| {
-                const hex = std.fmt.bytesToHex(ids.key_id, .lower);
-                try std.testing.expect(std.mem.eql(u8, key_ids[retiring_index], &hex) or std.mem.eql(u8, key_ids[new_index], &hex));
-                try all_tuples.append(ids);
-            }
-            for (churn_b.?.results.items) |ids| {
-                const hex = std.fmt.bytesToHex(ids.key_id, .lower);
-                try std.testing.expect(std.mem.eql(u8, key_ids[retiring_index], &hex) or std.mem.eql(u8, key_ids[new_index], &hex));
-                try all_tuples.append(ids);
-            }
+            // A silently swallowed issuance failure could leave a worker
+            // with zero samples while the test still sails through the
+            // post-reload probes below -- assert both stayed healthy and
+            // actually produced traffic, not merely that they didn't
+            // observe a wrong key id.
+            try std.testing.expect(churn_a.?.failure == null);
+            try std.testing.expect(churn_b.?.failure == null);
+            try std.testing.expect(churn_a.?.results.items.len > 0);
+            try std.testing.expect(churn_b.?.results.items.len > 0);
+
+            for (churn_a.?.results.items) |ids| try all_tuples.append(ids);
+            for (churn_b.?.results.items) |ids| try all_tuples.append(ids);
             try assertNoDuplicateTicketIds(all_tuples.items);
-            churn_a.?.deinit();
-            churn_b.?.deinit();
         }
 
         const lease_after_round = try readTicketKeyLeaseWindow(allocator, ticket_keys_path, key_ids[new_index]);

@@ -283,6 +283,18 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         };
         if (native_resumption_runtime) |*rt| rt.setObserver(nativeResumptionMetricsObserver(&state));
         if (cfg.tls_native_ticket_keys_path.len > 0) {
+            // #520: a secret-free, startup-only observability line (no key
+            // material, no path, just a fixed marker) logged immediately
+            // before entering the persistent ticket-key load -- which
+            // itself calls into `ticket_key_snapshot.reserveNonceLeasesInFile`,
+            // whose very first action is acquiring `${path}.lock`. This is
+            // the only observable signal (short of instrumenting the lock
+            // acquisition itself) that a process has reached this point,
+            // which `tests/integration.zig`'s multi-process startup-
+            // reservation soak polls for on both processes before
+            // releasing a barrier lock it holds, so their real reservation
+            // attempts are forced to overlap rather than merely likely to.
+            state.logger.info(null, "native TLS/QUIC persistent ticket-key reservation attempt starting", .{});
             native_resumption_runtime.?.loadPersistentTicketKeysFromFile(cfg.tls_native_ticket_keys_path) catch |err| {
                 state.metrics_mutex.lock();
                 state.metrics.recordTicketKeyReload(.initial_load_failure);
