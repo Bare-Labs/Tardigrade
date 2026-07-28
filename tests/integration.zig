@@ -6448,74 +6448,91 @@ fn currentLabeledMetric(allocator: std.mem.Allocator, port: u16, name: []const u
     return prometheusLabeledMetricValue(metrics.body, name, labels) orelse 0;
 }
 
+/// #520: `edge_gateway.zig` logs this fixed, secret-free marker every
+/// time a process is about to call `reserveNonceLeasesInFile` -- once at
+/// startup, and once per SIGHUP reload -- so it accumulates one more
+/// occurrence in a process's log per real reservation attempt over that
+/// process's lifetime. Counting occurrences (not just presence) is what
+/// lets a caller detect "this specific round's attempt has started",
+/// not just "some attempt, ever, has started".
+const reservation_attempt_marker = "persistent ticket-key reservation attempt starting";
+
+fn countReservationAttemptMarkers(allocator: std.mem.Allocator, log_path: []const u8) usize {
+    const log_data = compat.cwd().readFileAlloc(allocator, log_path, 16 * 1024 * 1024) catch return 0;
+    defer allocator.free(log_data);
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, log_data, idx, reservation_attempt_marker)) |pos| {
+        count += 1;
+        idx = pos + reservation_attempt_marker.len;
+    }
+    return count;
+}
+
 /// #520: the observable arrival signal for the concurrent-startup
 /// reservation barrier -- polls a spawned-but-not-yet-waited-on process's
 /// own log file (already captured from its earliest stderr output, per
 /// `TardigradeProcess.spawn`'s `early_stderr` redirect, independent of
-/// whether its HTTP listener has started serving yet) for the fixed,
-/// secret-free marker `edge_gateway.zig` logs immediately before entering
-/// `loadPersistentTicketKeysFromFile` -- whose own first action is
-/// acquiring `${path}.lock`. Waiting for this marker on *both* processes
-/// before releasing a barrier lock the test holds is a real observed-
-/// arrival condition, not a fixed delay: a fixed sleep can never rule out
-/// a slower process reaching the lock attempt after the barrier was
-/// already released, silently turning the intended race back into
-/// sequential reservation.
-fn waitForReservationAttempt(allocator: std.mem.Allocator, log_path: []const u8, timeout_ms: u64) !void {
-    const marker = "persistent ticket-key reservation attempt starting";
+/// whether its HTTP listener has started serving yet) for at least
+/// `minimum` occurrences of the marker `edge_gateway.zig` logs immediately
+/// before calling `reserveNonceLeasesInFile` -- whose own first action is
+/// acquiring `${path}.lock`. Waiting for this on *both* processes before
+/// releasing a barrier lock the test holds is a real observed-arrival
+/// condition, not a fixed delay: a fixed sleep can never rule out a
+/// slower process reaching the lock attempt after the barrier was already
+/// released, silently turning the intended race back into sequential
+/// reservation. Used both for the initial concurrent-startup reservation
+/// (`minimum = 1`) and, per round, to confirm *that round's* SIGHUP
+/// handler specifically has reached the same point (`minimum` = the
+/// count observed just before this round's signal was sent, plus one).
+fn waitForReservationAttemptCount(allocator: std.mem.Allocator, log_path: []const u8, minimum: usize, timeout_ms: u64) !void {
     const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (compat.milliTimestamp() < deadline) {
-        if (compat.cwd().readFileAlloc(allocator, log_path, 4 * 1024 * 1024)) |log_data| {
-            defer allocator.free(log_data);
-            if (containsSubstring(log_data, marker)) return;
-        } else |_| {}
+        if (countReservationAttemptMarkers(allocator, log_path) >= minimum) return;
         compat.sleepNs(10 * std.time.ns_per_ms);
     }
     return error.ReservationAttemptNotObserved;
 }
 
 /// #520 heavy tier: keeps real full-handshake/ticket-issuance traffic
-/// flowing against one process for as long as `stop` is clear -- run on
-/// its own `std.Thread` so the main thread can send both SIGHUPs and poll
-/// for `reload_accepted` *while* this traffic is in flight, which is the
-/// part that can actually expose a publication/UAF/deadlock bug in the
-/// real reload path; sampling only starts after both reloads finish (the
-/// smoke tier's shape) never overlaps the race itself. `attempt_started`
-/// is set immediately before the worker's very first (and every
-/// subsequent) connection attempt, so the caller can wait for a real
-/// in-flight attempt on both workers *before* sending either SIGHUP --
-/// otherwise a scheduler could let both reloads complete before either
-/// worker thread ever executes, and the heavy tier would pass without
-/// having exercised any traffic during publication at all. Uses
-/// `std.heap.page_allocator` rather than `std.testing.allocator`: the
-/// latter is not safe to call concurrently from multiple threads, and
-/// this worker's results/failure are only ever read by the main thread
-/// after `std.Thread.join()`, so no cross-thread synchronization on them
-/// is needed.
+/// flowing against one process for as long as `stop` is clear. Every
+/// issued ticket is validated to belong to one of the round's two known
+/// key ids (the complete outgoing or complete incoming generation,
+/// never anything else) -- this is the only invariant a concurrently
+/// running worker can check safely; the stricter "incoming key only
+/// after *this process's own* `reload_accepted`" boundary is instead
+/// proven by an explicit, synchronous, single-shot probe the main thread
+/// issues immediately after observing that metric (see the round loop
+/// below) -- sampling an in-flight worker's own notion of "before or
+/// after acceptance" is inherently racy (a request can legitimately begin
+/// before acceptance and only finish reading after it, or vice versa),
+/// so it cannot establish that boundary correctly no matter which side of
+/// the request it is sampled on.
 ///
-/// Every issued ticket is validated against the round's two known key
-/// ids: it must belong to either the complete outgoing or complete
-/// incoming generation, never anything else -- and if `require_new` was
-/// already set *before this specific attempt started* (only after *this
-/// specific process* has independently reported `reload_accepted`), the
-/// ticket must belong to the incoming generation only, proving fresh
-/// issuance never regresses to the retiring key after that process's own
-/// acceptance. The phase is sampled once at the start of each attempt,
-/// not re-read after it completes -- a request that began (and was
-/// legitimately sealed with the outgoing key) before acceptance must not
-/// be retroactively misclassified as a post-acceptance regression merely
-/// because it happens to finish after `require_new` flips. A worker
-/// records the first error it hits (an issuance failure, an unexpected
-/// key id, or a stale-key-after-acceptance violation) and stops
-/// immediately, rather than silently swallowing it and leaving the
-/// caller to mistake an empty result set for a healthy run.
+/// `completed` is a plain atomic counter (not `results.items.len`,
+/// unsafe to read from another thread while this thread may be mutating
+/// the list) the main thread polls to confirm the worker has completed
+/// at least one real connection *while the reload SIGHUP handler is still
+/// demonstrably blocked* (see `waitForCompletedChurnAtLeast` and the
+/// round loop's held reservation-lock window below) -- proving actual
+/// traffic overlapped the stalled reload, not merely that a worker thread
+/// was runnable at some point.
+///
+/// Uses `std.heap.page_allocator` rather than `std.testing.allocator`:
+/// the latter is not safe to call concurrently from multiple threads,
+/// and `results`/`failure` are only ever read by the main thread after
+/// `std.Thread.join()`, so no cross-thread synchronization on them is
+/// needed (only `completed` is read while the worker may still be
+/// running). A worker records the first error it hits (an issuance
+/// failure or an unexpected key id) and stops immediately, rather than
+/// silently swallowing it and leaving the caller to mistake an empty
+/// result set for a healthy run.
 const ChurnWorker = struct {
     port: u16,
     stop: *std.atomic.Value(bool),
     outgoing_key_id_hex: []const u8,
     incoming_key_id_hex: []const u8,
-    require_new: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    attempt_started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    completed: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     results: std.array_list.Managed(TicketEnvelopeIds),
     failure: ?anyerror = null,
 
@@ -6535,8 +6552,6 @@ const ChurnWorker = struct {
 
     fn run(self: *ChurnWorker) void {
         while (!self.stop.load(.acquire)) {
-            self.attempt_started.store(true, .release);
-            const require_new_for_this_attempt = self.require_new.load(.acquire);
             const ids = issueTicketIds(std.heap.page_allocator, self.port) catch |err| {
                 self.failure = err;
                 return;
@@ -6548,29 +6563,26 @@ const ChurnWorker = struct {
                 self.failure = error.ChurnObservedUnexpectedKeyId;
                 return;
             }
-            if (require_new_for_this_attempt and !is_incoming) {
-                self.failure = error.ChurnObservedStaleKeyAfterAcceptance;
-                return;
-            }
             self.results.append(ids) catch |err| {
                 self.failure = err;
                 return;
             };
+            _ = self.completed.fetchAdd(1, .release);
         }
     }
 };
 
-/// #520: bounded wait for a `ChurnWorker`'s first real connection attempt
-/// to have started -- used so the main thread only sends SIGHUP once both
-/// workers are genuinely in flight, not merely spawned-and-maybe-still-
-/// runnable.
-fn waitForChurnAttemptStarted(worker: *const ChurnWorker, timeout_ms: u64) !void {
+/// #520: bounded wait for a `ChurnWorker` to have *completed* at least
+/// `minimum` real connections -- deliberately stronger than waiting for
+/// an attempt to merely start, and safe to call while the worker thread
+/// is still running (unlike reading `results.items.len` directly).
+fn waitForCompletedChurnAtLeast(worker: *const ChurnWorker, minimum: usize, timeout_ms: u64) !void {
     const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (compat.milliTimestamp() < deadline) {
-        if (worker.attempt_started.load(.acquire)) return;
+        if (worker.completed.load(.acquire) >= minimum) return;
         compat.sleepNs(5 * std.time.ns_per_ms);
     }
-    return error.ChurnAttemptNotObserved;
+    return error.ChurnCompletionNotObserved;
 }
 
 /// #369: flips one byte inside the opaque ticket envelope of an
@@ -8850,8 +8862,8 @@ test "soak.persistent.multi_process_nonce_safety" {
     var process_b = try TardigradeProcess.spawn(allocator, process_options);
     defer process_b.stop();
 
-    try waitForReservationAttempt(allocator, process_a.log_path, 5_000);
-    try waitForReservationAttempt(allocator, process_b.log_path, 5_000);
+    try waitForReservationAttemptCount(allocator, process_a.log_path, 1, 5_000);
+    try waitForReservationAttemptCount(allocator, process_b.log_path, 1, 5_000);
     startup_barrier.close();
 
     try process_a.waitReady(process_options);
@@ -8958,11 +8970,7 @@ test "soak.persistent.multi_process_nonce_safety" {
         const reload_accepted_before_b = try currentLabeledMetric(allocator, process_b.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""});
 
         // Heavy tier only: keep real request/ticket-issuance traffic
-        // flowing against *both* processes for the entire duration of the
-        // reload race below, not just before/after it -- this is the part
-        // that can actually expose a publication/UAF/deadlock bug, and
-        // sampling only after both reloads finish (as the smoke tier does)
-        // never overlaps the race itself.
+        // flowing against *both* processes across the reload race below.
         //
         // The cleanup defer is registered *before* any fallible operation
         // that could unwind this scope (`std.Thread.spawn`, the
@@ -8992,36 +9000,69 @@ test "soak.persistent.multi_process_nonce_safety" {
             churn_thread_a = try std.Thread.spawn(.{}, ChurnWorker.run, .{&churn_a.?});
             churn_b = ChurnWorker.init(process_b.port, &churn_stop, key_ids[retiring_index], key_ids[new_index]);
             churn_thread_b = try std.Thread.spawn(.{}, ChurnWorker.run, .{&churn_b.?});
-
-            // Spawning a thread only makes it runnable -- without this,
-            // a valid schedule could let both reloads complete before
-            // either worker ever executes `issueTicketIds()`, and the
-            // heavy tier would pass without any traffic actually
-            // overlapping publication. Wait for both workers' first real
-            // connection attempt to have genuinely started before either
-            // SIGHUP is sent.
-            try waitForChurnAttemptStarted(&churn_a.?, 5_000);
-            try waitForChurnAttemptStarted(&churn_b.?, 5_000);
         }
 
-        // Sent back-to-back, without waiting between them -- both real
-        // SIGHUP handlers race the shared snapshot lock concurrently.
+        // Forces the two real SIGHUP handlers to genuinely block on
+        // `${ticket_keys_path}.lock` at the same time, exactly the same
+        // technique the concurrent-startup phase above uses: this test
+        // acquires the lock itself, *before* sending either signal, using
+        // the same `createFile(..., .lock = .exclusive)` call production
+        // uses. `reservation_marker_count_before_{a,b}` snapshots each
+        // process's own reservation-attempt log-marker count immediately
+        // before this round's signal, so `waitForReservationAttemptCount`
+        // below can detect *this round's* attempt specifically (the
+        // marker also fired once at startup and once per earlier round),
+        // not an already-satisfied earlier one.
+        const reservation_marker_count_before_a = countReservationAttemptMarkers(allocator, process_a.log_path);
+        const reservation_marker_count_before_b = countReservationAttemptMarkers(allocator, process_b.log_path);
+        var reload_barrier = try compat.cwd().createFile(startup_barrier_lock_path, .{
+            .read = true,
+            .truncate = false,
+            .permissions = .fromMode(0o600),
+            .lock = .exclusive,
+        });
+
+        // Sent back-to-back, without waiting between them.
         process_a.sendSignal(std.posix.SIG.HUP);
         process_b.sendSignal(std.posix.SIG.HUP);
 
-        // Each process's own churn worker is only required to switch
-        // exclusively to the incoming key *after that same process*
-        // reports `reload_accepted` -- proving the per-process monotonic
-        // boundary the prior review flagged as unchecked, while still
-        // correctly tolerating either generation during the actual race
-        // (A's worker may keep seeing the outgoing key for a while after
-        // A's own acceptance is observed here, only until this next line
-        // runs against A specifically; B's worker is intentionally left
-        // unconstrained until B's own acceptance is confirmed below).
+        // Both real SIGHUP handlers have now reached
+        // `reserveNonceLeasesInFile` and are demonstrably blocked on the
+        // lock this test still holds -- not merely "probably racing".
+        try waitForReservationAttemptCount(allocator, process_a.log_path, reservation_marker_count_before_a + 1, 5_000);
+        try waitForReservationAttemptCount(allocator, process_b.log_path, reservation_marker_count_before_b + 1, 5_000);
+
+        // Heavy tier only, while both reload handlers are confirmed still
+        // blocked on the held lock: require each worker to have
+        // *completed* at least one real connection during this stalled
+        // window -- proof that actual traffic overlapped the reload race
+        // itself, not merely that a worker thread was runnable at some
+        // point before or after it.
+        if (soakHeavyEnabled()) {
+            try waitForCompletedChurnAtLeast(&churn_a.?, 1, 5_000);
+            try waitForCompletedChurnAtLeast(&churn_b.?, 1, 5_000);
+        }
+
+        reload_barrier.close();
+
+        // Now that the lock is released, both processes' real
+        // reservations proceed and each (eventually) reports its own
+        // `reload_accepted` independently. Immediately after observing
+        // *that specific process's* acceptance, an explicit, synchronous,
+        // single-shot probe -- not sampled off a concurrently running
+        // churn worker, which cannot safely establish this boundary no
+        // matter which side of a request it samples -- proves fresh
+        // issuance is already exclusively the incoming key.
         try waitForLabeledMetricAtLeast(allocator, process_a.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""}, reload_accepted_before_a + 1, 5_000);
-        if (churn_a) |*w| w.require_new.store(true, .release);
+        const post_accept_ids_a = try issueTicketIds(allocator, process_a.port);
+        try std.testing.expectEqualStrings(key_ids[new_index], &std.fmt.bytesToHex(post_accept_ids_a.key_id, .lower));
+        try all_tuples.append(post_accept_ids_a);
+
         try waitForLabeledMetricAtLeast(allocator, process_b.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""}, reload_accepted_before_b + 1, 5_000);
-        if (churn_b) |*w| w.require_new.store(true, .release);
+        const post_accept_ids_b = try issueTicketIds(allocator, process_b.port);
+        try std.testing.expectEqualStrings(key_ids[new_index], &std.fmt.bytesToHex(post_accept_ids_b.key_id, .lower));
+        try all_tuples.append(post_accept_ids_b);
+        try assertNoDuplicateTicketIds(all_tuples.items);
 
         if (soakHeavyEnabled()) {
             churn_stop.store(true, .release);
