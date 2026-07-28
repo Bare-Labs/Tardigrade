@@ -243,16 +243,12 @@ passed before it.
   (backed by `SSL_session_reused()`) and Tardigrade's
   `tardigrade_tls_resumption_outcome_total{outcome="accepted"}` metric —
   not merely a second successful handshake.
-- `interop.openssl.h2.tls_resume` — named `tls_resume`, not `resume`: the
-  same proof scoped to the TLS layer under the h2 ALPN path (handshake,
-  ticket, resumed reconnect, ALPN renegotiated to h2 again), but no H2
-  frame/request is ever sent on the resumed connection, so it cannot catch
-  a bug that affects H2 dispatch only *after* resumption. **Real
-  application-level resumed-H2 interop is not proven by this slice** and
-  stays in the deferred matrix below — H1 above proves resumption carries a
-  real served request end to end at the protocol Tardigrade's own harness
-  can drive directly, and production H2 dispatch has its own independent
-  coverage, just not combined with resumption.
+- `interop.openssl.h2.tls_resume` — #521 closes the application-level
+  resumed-H2 gap: the first OpenSSL `h2` connection obtains a real ticket,
+  the second OpenSSL `h2` connection authoritatively reports `Reused`, the
+  Tardigrade `outcome="accepted"` resumption metric increments, and a
+  deterministic H2 request/response is driven over that resumed connection
+  to a dedicated upstream route exactly once.
 - `interop.openssl.ticket.expired` — 1-second ticket lifetime, a real
   2-second sleep past it (there is no injectable clock at this external
   boundary), reconnect falls back to a full handshake, connection remains
@@ -280,12 +276,17 @@ passed before it.
   fallback to a full handshake, and the still-authentic ciphertext
   fingerprint next to the flipped byte never appears in the server's log
   or the client's own stdout/stderr.
-- **`interop.openssl.cipher_mismatch` deliberately not shipped.** Ad hoc
-  verification found the reconnect still negotiated the *original* cipher
-  suite despite the client restricting itself via `-ciphersuites` to a
-  disjoint one — behavior that needs its own investigation before a test
-  can assert on it honestly. Shipping a test that silently asserts nothing
-  useful would be worse than not shipping one; left as a known gap.
+- **`interop.openssl.cipher_mismatch` deliberately not shipped.** #521
+  closes this row as externally unreachable under the production native TLS
+  profile today. The listener advertises only `TLS_AES_128_GCM_SHA256` and
+  negotiates the connection cipher before PSK/session compatibility is
+  evaluated. If an OpenSSL reconnect still offers that suite, there is no
+  resumption-specific cipher mismatch; if it excludes that suite, ordinary
+  cipher negotiation fails before the stored session can reach
+  `session.evaluateCompatibility`. Deterministic in-repo coverage for
+  `ResumeMismatch.cipher_suite_mismatch` remains in `src/tls/session.zig`;
+  no test-only second cipher or protected-session mutation is introduced to
+  manufacture an impossible external case.
 
 ### Real process restart (`tests/integration.zig`, real separate OS processes)
 
@@ -374,13 +375,6 @@ passed before it.
   credential-reload path that preserves the resumption runtime (currently
   forbidden under the appliance profile) or a persistent keyring across
   restart (not a production capability today — see Rotation below).
-- **Application-level resumed-H2 interop.** `interop.openssl.h2.tls_resume`
-  proves TLS-layer PSK resumption under the h2 ALPN path only; it never
-  drives a real H2 request/response over the resumed connection, so it
-  cannot catch a bug specific to H2 dispatch after resumption. Closing this
-  needs either hand-rolled HPACK/frame encoding over `openssl s_client`
-  stdin or an H2-capable external peer, driving one real request over the
-  resumed connection.
 - **Independent QUIC/H3 external interop for resumption/0-RTT.** The repo
   has real external QUIC/H3 tooling (`scripts/interop/run-interop.sh` +
   `tests/h3_interop_tool.zig`, driving ngtcp2/quiche/aioquic peers) that a
@@ -402,8 +396,6 @@ passed before it.
   narrowly-scoped production-composition follow-up this needs before
   #369's rotation rows can close; #369's operational rotation matrix stays
   blocked on it, the same way #369's 0-RTT rows stay blocked on #510.
-- **`interop.openssl.cipher_mismatch`** — see above; needs investigation
-  of an observed discrepancy before it can be shipped as a real assertion.
 - **Deterministic worker-thread-pinning test seam** (carried over from
   Slice 2, unchanged): #369 Slice 2 proves the process-shared replay-store
   guarantee across independent per-connection state, not through real OS

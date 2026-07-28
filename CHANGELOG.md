@@ -5,6 +5,19 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **Native H2 downstream `proxy_pass` assurance path for resumed TLS (#521,
+  refs #369)** — the native HTTP/2 listener can now drive a bounded buffered
+  `proxy_pass` request for policy-simple routes so #521 proves a real
+  application request/response over an authoritatively resumed TLS connection.
+  H2 proxy dispatch fails closed before upstream side effects for denied
+  request policy and for proxy-orchestration features this narrow path does
+  not yet share with H1/H3, and large H2 responses now pause and resume on
+  WINDOW_UPDATE instead of being rewritten as gateway errors. The interop test
+  checks upstream execution count and Tardigrade's typed resumption metric. The
+  same slice closes the external TLS 1.3 cipher-mismatch row as unreachable
+  under the current single-cipher production native TLS profile, while
+  preserving deterministic in-repo `ResumeMismatch.cipher_suite_mismatch`
+  coverage.
 - **Native TLS/QUIC 0-RTT anti-replay store: configuration, metrics, and
   distributed-store contract proof (#368)** — completes the process-local
   anti-replay store (#368 Slices 1–2) with an explicit operator-facing

@@ -135,6 +135,26 @@ pub fn parseWindowUpdateIncrement(payload: []const u8) !u31 {
     return @intCast(raw);
 }
 
+/// Scan a non-ACK SETTINGS frame payload for the last SETTINGS_INITIAL_WINDOW_SIZE
+/// (id 0x4) entry, per RFC 9113 §6.5.2 ("the value of the last setting for the
+/// same identifier ... prevails"). Returns null if the frame carries no such
+/// entry. Errors on a malformed payload length or a value exceeding 2^31-1,
+/// which callers must treat as a connection-level FLOW_CONTROL_ERROR.
+pub fn parseSettingsInitialWindowSize(payload: []const u8) !?u32 {
+    if (payload.len % 6 != 0) return error.InvalidSettingsFrame;
+    var value: ?u32 = null;
+    var i: usize = 0;
+    while (i < payload.len) : (i += 6) {
+        const id = std.mem.readInt(u16, payload[i..][0..2], .big);
+        const v = std.mem.readInt(u32, payload[i + 2 ..][0..4], .big);
+        if (id == 0x4) {
+            if (v > 0x7FFF_FFFF) return error.Http2FlowControlError;
+            value = v;
+        }
+    }
+    return value;
+}
+
 fn readExact(conn: anytype, out: []u8) !void {
     var off: usize = 0;
     while (off < out.len) {
