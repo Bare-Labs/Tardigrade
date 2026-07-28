@@ -38,9 +38,12 @@ jobs:
       # Same case-ID suite as the PR-blocking smoke tier
       # (test-integration-resumption-interop in ci.yml), scaled up via
       # TARDIGRADE_SOAK_HEAVY: soak.reconnect_resumption runs 2000
-      # iterations instead of 40. Everything else in the suite (interop.*,
-      # restart.*) is unaffected by the flag and simply reruns at its
-      # normal size.
+      # iterations instead of 40, and #520's
+      # soak.persistent.multi_process_nonce_safety and
+      # soak.replay.process_local_scope scale up their own rotation-round/
+      # ticket-sample/replay-identity counts too. Everything else in the
+      # suite (interop.*, restart.*) is unaffected by the flag and simply
+      # reruns at its normal size.
       - name: Run heavy resumption interop/restart/soak suite
         env:
           TARDIGRADE_SOAK_HEAVY: "1"
@@ -52,7 +55,7 @@ jobs:
       # cheap, and keeps the invariant enforced if that ever changes.
       - name: Verify no OpenSSL interop secrets leaked into the Zig cache
         run: |
-          leaked=$(find .zig-cache -iname 'interop-*.sess' -o -iname 'interop-restart-key-*.pem' 2>/dev/null)
+          leaked=$(find .zig-cache -iname 'interop-*.sess' -o -iname 'interop-restart-key-*.pem' -o -iname 'interop-*-ticket-keys.json' 2>/dev/null)
           if [ -n "$leaked" ]; then
             echo "found leaked interop secret file(s) under .zig-cache:"
             echo "$leaked"

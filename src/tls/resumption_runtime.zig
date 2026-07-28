@@ -33,6 +33,17 @@ pub const Observer = struct {
     onTicketResolveFn: ?*const fn (*anyopaque, Mode, TicketResult) void = null,
     onResumptionAttemptFn: ?*const fn (*anyopaque, Transport) void = null,
     onResumptionOutcomeFn: ?*const fn (*anyopaque, Transport, ResumptionOutcome) void = null,
+    // #520: fires immediately before `loadPersistentTicketKeysFromFile`
+    // calls `ticket_key_snapshot.reserveNonceLeasesInFile` -- whose very
+    // first action is acquiring `${path}.lock` -- so an external observer
+    // (a secret-free log line, in production) can mark the exact instant
+    // this process is about to attempt that lock. Used by
+    // `tests/integration.zig`'s multi-process startup-reservation soak to
+    // wait for a real per-process arrival signal, on both processes,
+    // before releasing a barrier lock it holds -- not a fixed delay that
+    // could still let a slower process reach the attempt only after an
+    // early release.
+    onTicketKeyReservationAttemptFn: ?*const fn (*anyopaque) void = null,
 
     pub fn ticketIssue(self: Observer, transport: Transport, mode: Mode, result: TicketResult) void {
         if (self.onTicketIssueFn) |f| f(self.ctx, transport, mode, result);
@@ -52,6 +63,10 @@ pub const Observer = struct {
 
     pub fn resumptionOutcome(self: Observer, transport: Transport, outcome: ResumptionOutcome) void {
         if (self.onResumptionOutcomeFn) |f| f(self.ctx, transport, outcome);
+    }
+
+    pub fn ticketKeyReservationAttempt(self: Observer) void {
+        if (self.onTicketKeyReservationAttemptFn) |f| f(self.ctx);
     }
 };
 
@@ -222,6 +237,7 @@ pub const Runtime = struct {
             if (std.mem.eql(u8, &accepted, &loaded_fingerprint)) return;
         }
         try self.validatePersistentTicketKeys(loaded.generation, loaded.configs);
+        self.observer.ticketKeyReservationAttempt();
         try ticket_key_snapshot.reserveNonceLeasesInFile(self.allocator, path, &loaded, .{
             .ctx = self,
             .validateFn = validatePersistentTicketKeysForReservation,

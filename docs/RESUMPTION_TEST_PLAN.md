@@ -573,10 +573,15 @@ gained a `rotation.` prefix alongside the existing `interop.`/`restart.`/
 ## Explicitly deferred beyond this slice (still open after #519)
 
 - **Persistent-key rotation soak / worker-thread-pinning / cross-worker
-  anti-replay under real routing** — unchanged from Slice 3's equivalent
-  bullets above; #519 proves single-worker-process rotation correctness,
-  not concurrent multi-worker rotation or the worker-pinning seam those
-  need.
+  anti-replay under real routing** — the persistent-key rotation *soak*
+  portion is now covered: **#520** (Slice 5, below) proves concurrent
+  multi-process nonce-safety and rotation soak against a shared snapshot.
+  Worker-thread-pinning and cross-worker anti-replay *under real routing*
+  remain open — #520 deliberately keeps `TARDIGRADE_WORKER_THREADS=1` per
+  process (its subject is multiple real OS processes, not deterministic
+  worker-thread scheduling within one), and its replay-locality proof is
+  process-local by construction, not a load-balancer-routed cross-worker
+  scenario.
 - **General (non-appliance) profile credential-reload two-phase atomicity**
   — `gateway_shutdown.hotReloadConfig`'s `NativeCredentialStore` prepare/
   commit path is real production code, but exercising it needs a non-
@@ -584,3 +589,94 @@ gained a `rotation.` prefix alongside the existing `interop.`/`restart.`/
   cases don't build under (`requireNativeTlsProfile()` is appliance-only).
   Not attempted here; a future slice targeting the general profile
   specifically would need its own harness path.
+
+## Slice 5 (#520): multi-process persistent-key nonce safety and
+replay-locality soak
+
+Slice 4 (#519) proved a single process's own restart/rotation/reload/
+certificate-binding lifecycle against a persistent ticket-key snapshot.
+This slice closes the remaining **multi-process** rows from #369's
+resumption/0-RTT validation matrix: the same snapshot, `${path}.lock`
+sidecar, and `ReloadableKeyRing`/SIGHUP-reload composition, but with two
+real, live Tardigrade processes genuinely contending them at once, plus
+the process-local scope of early-data replay protection proven across two
+independent processes rather than asserted only in
+`docs/OBSERVABILITY.md`'s prose.
+
+A prerequisite harness change landed alongside these cases:
+`TardigradeProcess.start()` was split into `spawn()` (creates the child,
+does not wait) and `waitReady()` (blocks until healthy), with `start()`
+kept as a thin, behavior-preserving wrapper for every existing caller.
+Calling `start()` twice in sequence only ever proves *sequential*
+reservation; calling `spawn()` twice before `waitReady()`-ing either
+process lets two real processes race the same `${path}.lock` concurrently,
+which every case below depends on.
+
+- **`soak.persistent.multi_process_nonce_safety`** — two real processes
+  `spawn()`ed back-to-back (not `start()`ed sequentially) and only then
+  waited on, both reserving from the same freshly-written generation-1
+  snapshot. The file's lease window is asserted to have advanced *exactly
+  twice* under generation 1 (`[2w, 3w)` from an initial `[0, w)`, per
+  #520's own worked example), and each process's real issued tickets are
+  asserted structurally inside exactly one of the two disjoint reserved
+  windows — resolved from each process's own first sample rather than
+  assumed, since which process wins the lock race first is scheduling-
+  dependent. A bounded number of further rounds (2 smoke / 6 heavy) then
+  drive concurrent SIGHUP rotation on both processes at once: each round
+  retires the active key (`nonce_lease = null`, per #519's own rotation-
+  lease rule) and installs a fresh successor, polls each process
+  independently for its own `reload_accepted` metric step, proves a
+  retained sample ticket from the outgoing generation still resumes on
+  *both* processes during the overlap window, and asserts every freshly
+  issued ticket across the whole run — both processes, every round — has
+  a unique `(key_id, nonce)` tuple.
+- **`soak.persistent.nonce_lease_exhaustion`** — kept separate from the
+  case above so a failure says exactly what broke. Two processes reserve
+  disjoint windows from a deliberately tiny (`width = 16`) shared lease. A
+  bounded batch of ordinary full-handshake connections against process A
+  drives its own reservation to exhaustion (a before/after metric delta
+  across batches, not a poll after every single connection — the metrics
+  endpoint is itself reached over a real TLS connection that can attempt
+  its own best-effort issuance). `NonceLeaseExhausted` is proven
+  operationally safe: `tardigrade_tls_ticket_issue_total{result="failed"}`
+  increases, but every connection that hit it still completed with `200
+  OK`, a ticket issued before exhaustion still resumes afterward, a brand
+  new ordinary handshake to A still succeeds, and process B's own disjoint
+  reservation and zero failure count are untouched throughout.
+- **`soak.replay.process_local_scope`** — two processes share one
+  persistent snapshot (so either can decrypt a ticket the other issued)
+  but run independent `process_local` early-data replay stores. Both are
+  `spawn()`ed concurrently and the real ~60s startup quarantine
+  (`age_skew_tolerance_ms`) is paid once, together — not shortened, and
+  not paid twice. The exact same ticket identity (cloned before each
+  offer, since `ClientPskOfferSet.push` moves its argument) is then
+  offered as early data four ways: accepted once by A, rejected as a
+  duplicate on A-replay, accepted once by B (B's own store has never seen
+  it — the documented scope, proven live), and rejected as a duplicate on
+  B-replay. Each duplicate rejection is shown to block only the early
+  request reaching upstream while leaving the PSK/session itself valid —
+  an explicit ordinary request on the same connection afterward still
+  succeeds.
+
+### CI
+
+No new build filter was needed: all three cases use the existing `soak.`
+case-ID prefix `build.zig`'s `test-integration-resumption-interop` step
+already filters on. `TARDIGRADE_SOAK_HEAVY=1` scales
+`soak.persistent.multi_process_nonce_safety`'s rotation-round and
+per-round ticket-sample counts and `soak.replay.process_local_scope`'s
+replay-identity count, the same way it already scaled
+`soak.reconnect_resumption`'s iteration count.
+
+## Explicitly deferred beyond this slice (still open after #520)
+
+- **Three-or-more-process contention, deterministic worker-thread pinning,
+  and cross-worker anti-replay under real routing** — unchanged from
+  Slice 4's equivalent bullet above; #520 deliberately scopes to two
+  processes (`ticket_key_snapshot.reserveNonceLeasesInFile` serializes
+  entirely on one exclusive file lock, so a third contender races the same
+  lock, not a qualitatively different one) and process-local replay
+  scope, not a distributed or cross-worker replay store.
+- **Final #369 matrix/docs reconciliation** — left to #522, per that
+  issue's own scope; this slice adds its own coverage notes above rather
+  than redoing the epic closeout.

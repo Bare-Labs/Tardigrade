@@ -642,6 +642,154 @@ const RawTcpServer = struct {
     }
 };
 
+/// #520: a real upstream that deterministically proves a connection has
+/// been accepted, dispatched to a worker, and proxied all the way to it
+/// -- and holds it there under the test's own control -- rather than a
+/// fixed `delay_ms` sleep (the shape `UpstreamResponseSpec` already
+/// supports, used by e.g. `in-flight request completes safely across
+/// reload and new requests use new config` above, but not condition-based
+/// enough for a proof that must not depend on how long a reload happens
+/// to take). `waitEntered` confirms the request truly reached the
+/// upstream; `release` lets its response go out only once the caller
+/// chooses to, so a request can be held in flight across an arbitrarily
+/// long window (here, a real SIGHUP reload race) with no risk of the
+/// gate itself timing the proof.
+const GatedUpstream = struct {
+    allocator: std.mem.Allocator,
+    server: compat.NetServer,
+    thread: ?std.Thread,
+    stop_flag: std.atomic.Value(bool),
+    entered: std.atomic.Value(bool),
+    release_flag: std.atomic.Value(bool),
+
+    fn start(allocator: std.mem.Allocator) !GatedUpstream {
+        const server = try compat.listenTcp(test_host, 0);
+        return .{
+            .allocator = allocator,
+            .server = server,
+            .thread = null,
+            .stop_flag = std.atomic.Value(bool).init(false),
+            .entered = std.atomic.Value(bool).init(false),
+            .release_flag = std.atomic.Value(bool).init(false),
+        };
+    }
+
+    fn port(self: *const GatedUpstream) u16 {
+        return self.server.port();
+    }
+
+    fn run(self: *GatedUpstream) !void {
+        self.thread = try std.Thread.spawn(.{}, gatedUpstreamThreadMain, .{self});
+    }
+
+    fn stop(self: *GatedUpstream) void {
+        self.stop_flag.store(true, .seq_cst);
+        self.release_flag.store(true, .seq_cst);
+        wakeListener(self.port());
+        if (self.thread) |thread| thread.join();
+        self.server.deinit();
+        self.* = undefined;
+    }
+
+    /// Rearms the gate for another round: must be called before the next
+    /// request is sent, never concurrently with one already in flight.
+    fn resetGate(self: *GatedUpstream) void {
+        self.entered.store(false, .release);
+        self.release_flag.store(false, .release);
+    }
+
+    fn waitEntered(self: *const GatedUpstream, timeout_ms: u64) !void {
+        const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (compat.milliTimestamp() < deadline) {
+            if (self.entered.load(.acquire)) return;
+            compat.sleepNs(5 * std.time.ns_per_ms);
+        }
+        return error.GatedUpstreamNotEntered;
+    }
+
+    fn release(self: *GatedUpstream) void {
+        self.release_flag.store(true, .release);
+    }
+};
+
+fn gatedUpstreamThreadMain(server: *GatedUpstream) void {
+    while (!server.stop_flag.load(.seq_cst)) {
+        var conn = server.server.accept() catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("gated upstream accept failed: {}\n", .{err});
+            continue;
+        };
+        defer conn.stream.close();
+
+        const req = readHttpMessage(server.allocator, conn.stream, 1024 * 1024) catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("gated upstream read failed: {}\n", .{err});
+            continue;
+        };
+        defer server.allocator.free(req.raw);
+        if (req.request_line.len == 0) continue;
+
+        server.entered.store(true, .release);
+        while (!server.release_flag.load(.acquire)) {
+            if (server.stop_flag.load(.seq_cst)) return;
+            compat.sleepNs(2 * std.time.ns_per_ms);
+        }
+        if (server.stop_flag.load(.seq_cst)) return;
+
+        const body = "gated-ok";
+        var out = std.array_list.Managed(u8).init(server.allocator);
+        defer out.deinit();
+        out.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch continue;
+        conn.stream.writeAll(out.items) catch |err| {
+            if (server.stop_flag.load(.seq_cst)) return;
+            std.debug.print("gated upstream write failed: {}\n", .{err});
+            continue;
+        };
+    }
+}
+
+/// #520: drives one real native TLS H1 request against `port`'s `/race`
+/// route (proxied to a `GatedUpstream`) on its own thread, so the main
+/// test thread can hold a reservation lock and drive a SIGHUP race while
+/// this request sits blocked mid-flight at the gate. `done` is a plain
+/// atomic the main thread can poll (see `waitForRaceRequestComplete`)
+/// without joining the thread first -- joining would block until the
+/// gate is released, which is exactly the ordering this proof needs to
+/// control explicitly.
+const RaceRequestResult = struct {
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    status_ok: bool = false,
+    err: ?anyerror = null,
+};
+
+fn runTlsRaceRequest(allocator: std.mem.Allocator, port: u16, result: *RaceRequestResult) void {
+    defer result.done.store(true, .release);
+    const client = PureZigTlsClient.create(allocator, port, "http/1.1") catch |err| {
+        result.err = err;
+        return;
+    };
+    defer client.destroy();
+    client.writeAllPlain("GET /race HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n") catch |err| {
+        result.err = err;
+        return;
+    };
+    const raw = client.readPlainToEnd(allocator, 64 * 1024, 10_000) catch |err| {
+        result.err = err;
+        return;
+    };
+    defer allocator.free(raw);
+    result.status_ok = containsSubstring(raw, "HTTP/1.1 200 OK");
+}
+
+fn waitForRaceRequestComplete(result: *const RaceRequestResult, timeout_ms: u64) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        if (result.done.load(.acquire)) return;
+        compat.sleepNs(5 * std.time.ns_per_ms);
+    }
+    return error.RaceRequestNotObserved;
+}
+
 const StartTlsSmtpProcess = struct {
     allocator: std.mem.Allocator,
     child: std.process.Child,
@@ -796,7 +944,14 @@ const TardigradeProcess = struct {
     config_path: ?[]u8,
     fixture_dir_rel: ?[]u8,
 
-    fn start(allocator: std.mem.Allocator, options: TardigradeOptions) !TardigradeProcess {
+    // #520: split out of `start()` so two (or more) processes can be
+    // spawned back-to-back before either is waited on -- `start()` itself
+    // spawns *and* blocks until ready, so calling it twice in sequence only
+    // ever proves sequential startup/lease-reservation, never genuine
+    // contention on the shared snapshot's `${path}.lock`. `start()` below
+    // remains the thin, behavior-preserving wrapper every existing caller
+    // keeps using unchanged.
+    fn spawn(allocator: std.mem.Allocator, options: TardigradeOptions) !TardigradeProcess {
         const port = try findFreePort();
         const cwd = try compat.cwd().realpathAlloc(allocator, ".");
         defer allocator.free(cwd);
@@ -902,7 +1057,7 @@ const TardigradeProcess = struct {
         });
         if (early_stderr) |f| f.close(compat.io());
 
-        var proc = TardigradeProcess{
+        return TardigradeProcess{
             .allocator = allocator,
             .child = child,
             .port = port,
@@ -910,9 +1065,17 @@ const TardigradeProcess = struct {
             .config_path = config_path,
             .fixture_dir_rel = fixture_dir_rel,
         };
-        errdefer proc.stop();
-        try waitUntilReady(port, log_path, options);
-        return proc;
+    }
+
+    fn waitReady(self: *const TardigradeProcess, options: TardigradeOptions) !void {
+        try waitUntilReady(self.port, self.log_path, options);
+    }
+
+    fn start(allocator: std.mem.Allocator, options: TardigradeOptions) !TardigradeProcess {
+        var process = try spawn(allocator, options);
+        errdefer process.stop();
+        try process.waitReady(options);
+        return process;
     }
 
     fn stop(self: *TardigradeProcess) void {
@@ -6257,6 +6420,383 @@ fn extractTicketEnvelopeIds(ticket: *const tls_core.session.ClientTicketState) T
     return out;
 }
 
+/// #520: the AEAD nonce's fixed 4-byte prefix (`TicketKeyLeaseFixture.
+/// prefix_hex`) is immediately followed by the big-endian 8-byte counter
+/// `NonceLease.reserve` actually draws from -- decoding it lets the
+/// multi-process soak assert an issued ticket's counter falls inside a
+/// specific reserved `[start, end_exclusive)` window, not merely that two
+/// sampled nonces happen to differ.
+fn ticketNonceCounter(ids: TicketEnvelopeIds) u64 {
+    return std.mem.readInt(u64, ids.nonce[4..12], .big);
+}
+
+/// #520: O(n^2) is fine here -- every #520 case caps its ticket sample
+/// count in the low tens (smoke) to low hundreds (heavy), never enough for
+/// a quadratic scan over `(key_id, nonce)` tuples to matter, and a shared
+/// `std.AutoHashMap` key type big enough to hold both fields would need
+/// nearly as much bespoke plumbing as this direct comparison.
+fn assertNoDuplicateTicketIds(tuples: []const TicketEnvelopeIds) !void {
+    for (tuples, 0..) |a, i| {
+        for (tuples[i + 1 ..]) |b| {
+            const same = std.mem.eql(u8, &a.key_id, &b.key_id) and std.mem.eql(u8, &a.nonce, &b.nonce);
+            try std.testing.expect(!same);
+        }
+    }
+}
+
+/// #520: which of the two lease windows a process installed at concurrent
+/// startup is scheduling-dependent (whichever process wins the
+/// `${path}.lock` race first reserves `[w, 2w)`; the other reserves
+/// `[2w, 3w)`) -- the soak must not assume which one any given process
+/// actually got, only that every ticket it issues stays inside exactly one
+/// of the two, and that the two real processes land in different ones.
+const ReservedWindow = struct { start: u64, end_exclusive: u64 };
+
+fn resolveReservedWindow(counter: u64, lease_width: u64) !ReservedWindow {
+    if (counter >= lease_width and counter < 2 * lease_width) return .{ .start = lease_width, .end_exclusive = 2 * lease_width };
+    if (counter >= 2 * lease_width and counter < 3 * lease_width) return .{ .start = 2 * lease_width, .end_exclusive = 3 * lease_width };
+    return error.NonceCounterOutsideReservedWindows;
+}
+
+/// #520: a real full handshake against `port`, capturing only the issued
+/// ticket's public envelope ids -- the repeated shape Case 1's concurrent-
+/// reservation and rotation phases both need many times over, factored out
+/// rather than inlining a fresh capture closure at each call site the way
+/// earlier #519 tests do (those each call it once or twice; #520 calls it
+/// in loops).
+fn issueTicketIds(allocator: std.mem.Allocator, port: u16) !TicketEnvelopeIds {
+    const IdCapture = struct {
+        ids: ?TicketEnvelopeIds = null,
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ids = extractTicketEnvelopeIds(ticket);
+        }
+    };
+    var capture = IdCapture{};
+    const client = try PureZigTlsClient.createWithOptions(allocator, port, "http/1.1", "tardigrade.test", .{
+        .ticket_consumer = .{ .ctx = &capture, .nowUnixMsFn = IdCapture.now, .onTicketFn = IdCapture.onTicket },
+    });
+    defer client.destroy();
+    try client.writeAllPlain(openssl_health_request);
+    const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(raw);
+    try assertContains(raw, "HTTP/1.1 200 OK");
+    return capture.ids orelse error.NoTicketIssued;
+}
+
+/// #520: same connection shape as `issueTicketIds`, but tolerates
+/// best-effort issuance failure (`NonceLeaseExhausted`) by returning `null`
+/// instead of erroring -- `soak.persistent.nonce_lease_exhaustion` drives a
+/// batch of ordinary connections *through* the point where issuance starts
+/// failing, and a failed issuance must not tear down the otherwise-valid
+/// connection (asserted by the caller still checking for `200 OK` here).
+fn issueTicketIdsOptional(allocator: std.mem.Allocator, port: u16) !?TicketEnvelopeIds {
+    const IdCapture = struct {
+        ids: ?TicketEnvelopeIds = null,
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ids = extractTicketEnvelopeIds(ticket);
+        }
+    };
+    var capture = IdCapture{};
+    const client = try PureZigTlsClient.createWithOptions(allocator, port, "http/1.1", "tardigrade.test", .{
+        .ticket_consumer = .{ .ctx = &capture, .nowUnixMsFn = IdCapture.now, .onTicketFn = IdCapture.onTicket },
+    });
+    defer client.destroy();
+    try client.writeAllPlain(openssl_health_request);
+    const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(raw);
+    try assertContains(raw, "HTTP/1.1 200 OK");
+    return capture.ids;
+}
+
+/// #520: issues a real ticket and clones it out to an owned, caller-freed
+/// `ClientTicketState` -- the retained-sample-ticket shape Case 1's
+/// rotation phases and Case 2's exhaustion case both need (offered again
+/// later, across a reload or past exhaustion, to prove it still resumes).
+fn issueAndRetainTicket(allocator: std.mem.Allocator, port: u16) !tls_core.session.ClientTicketState {
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        retained: tls_core.session.ClientTicketState = .{},
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.retained.deinit();
+            self.retained = .{};
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+        }
+    };
+    var capture = Capture{ .allocator = allocator };
+    defer capture.retained.deinit();
+    const client = try PureZigTlsClient.createWithOptions(allocator, port, "http/1.1", "tardigrade.test", .{
+        .ticket_consumer = .{ .ctx = &capture, .nowUnixMsFn = Capture.now, .onTicketFn = Capture.onTicket },
+    });
+    defer client.destroy();
+    try client.writeAllPlain(openssl_health_request);
+    const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(raw);
+    try assertContains(raw, "HTTP/1.1 200 OK");
+    var out: tls_core.session.ClientTicketState = .{};
+    try capture.retained.cloneInto(allocator, &out);
+    return out;
+}
+
+/// #520: offers a clone of `ticket` (offering `ticket` itself would `move`
+/// it out from under the caller, who typically still needs it for a later
+/// offer in the same soak round) and asserts the resumption is actually PSK
+/// -authenticated, not merely that the safe full-handshake fallback served
+/// the request.
+fn resumeTicketExpectAccepted(allocator: std.mem.Allocator, port: u16, ticket: *const tls_core.session.ClientTicketState) !void {
+    var offer_clone: tls_core.session.ClientTicketState = .{};
+    defer offer_clone.deinit();
+    try ticket.cloneInto(allocator, &offer_clone);
+    var offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&offer_clone);
+    errdefer offers.deinit();
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2_500;
+        }
+    };
+    const client = try PureZigTlsClient.createWithOptions(allocator, port, "http/1.1", "tardigrade.test", .{
+        .psk_offers = &offers,
+        .psk_now_ctx = &clock_dummy,
+        .psk_now_fn = ClientClock.now,
+    });
+    defer client.destroy();
+    try std.testing.expect(client.backend.core.psk_authenticated);
+    try client.writeAllPlain(openssl_health_request);
+    const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(raw);
+    try assertContains(raw, "HTTP/1.1 200 OK");
+}
+
+/// #520: a one-shot labeled-metric read (unlike `waitForLabeledMetricAtLeast`,
+/// which polls) -- used to capture a before/after baseline around a bounded
+/// batch, per the exhaustion case's own "metrics-polling trap" note: a
+/// delta across a batch, not a poll after every single connection.
+fn currentLabeledMetric(allocator: std.mem.Allocator, port: u16, name: []const u8, labels: []const []const u8) !u64 {
+    var metrics = try sendPureZigTlsHttp1Request(allocator, port, "/status/metrics");
+    defer metrics.deinit();
+    return prometheusLabeledMetricValue(metrics.body, name, labels) orelse 0;
+}
+
+/// #520: `edge_gateway.zig` logs this fixed, secret-free marker every
+/// time a process is about to call `reserveNonceLeasesInFile` -- once at
+/// startup, and once per SIGHUP reload -- so it accumulates one more
+/// occurrence in a process's log per real reservation attempt over that
+/// process's lifetime. Counting occurrences (not just presence) is what
+/// lets a caller detect "this specific round's attempt has started",
+/// not just "some attempt, ever, has started".
+const reservation_attempt_marker = "persistent ticket-key reservation attempt starting";
+
+fn countReservationAttemptMarkers(allocator: std.mem.Allocator, log_path: []const u8) usize {
+    const log_data = compat.cwd().readFileAlloc(allocator, log_path, 16 * 1024 * 1024) catch return 0;
+    defer allocator.free(log_data);
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, log_data, idx, reservation_attempt_marker)) |pos| {
+        count += 1;
+        idx = pos + reservation_attempt_marker.len;
+    }
+    return count;
+}
+
+/// #520: the observable arrival signal for the concurrent-startup
+/// reservation barrier -- polls a spawned-but-not-yet-waited-on process's
+/// own log file (already captured from its earliest stderr output, per
+/// `TardigradeProcess.spawn`'s `early_stderr` redirect, independent of
+/// whether its HTTP listener has started serving yet) for at least
+/// `minimum` occurrences of the marker `edge_gateway.zig` logs immediately
+/// before calling `reserveNonceLeasesInFile` -- whose own first action is
+/// acquiring `${path}.lock`. Waiting for this on *both* processes before
+/// releasing a barrier lock the test holds is a real observed-arrival
+/// condition, not a fixed delay: a fixed sleep can never rule out a
+/// slower process reaching the lock attempt after the barrier was already
+/// released, silently turning the intended race back into sequential
+/// reservation. Used both for the initial concurrent-startup reservation
+/// (`minimum = 1`) and, per round, to confirm *that round's* SIGHUP
+/// handler specifically has reached the same point (`minimum` = the
+/// count observed just before this round's signal was sent, plus one).
+fn waitForReservationAttemptCount(allocator: std.mem.Allocator, log_path: []const u8, minimum: usize, timeout_ms: u64) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        if (countReservationAttemptMarkers(allocator, log_path) >= minimum) return;
+        compat.sleepNs(10 * std.time.ns_per_ms);
+    }
+    return error.ReservationAttemptNotObserved;
+}
+
+/// #520 heavy tier: keeps real full-handshake/ticket-issuance traffic
+/// flowing against one process for as long as `stop` is clear, started
+/// before either SIGHUP is sent and stopped only after both processes'
+/// own `reload_accepted` has been confirmed -- so its collected samples
+/// necessarily span the whole round, before and after the transition.
+///
+/// Every issued ticket is validated to belong to one of the round's two
+/// known key ids (the complete outgoing or complete incoming generation,
+/// never anything else) -- this is the only invariant a concurrently
+/// running worker can check safely; the stricter "incoming key only
+/// after *this process's own* `reload_accepted`" boundary is instead
+/// proven by an explicit, synchronous, single-shot probe the main thread
+/// issues immediately after observing that metric (see the round loop
+/// below) -- sampling an in-flight worker's own notion of "before or
+/// after acceptance" is inherently racy (a request can legitimately begin
+/// before acceptance and only finish reading after it, or vice versa),
+/// so it cannot establish that boundary correctly no matter which side of
+/// the request it is sampled on.
+///
+/// Deliberately does *not* attempt to prove a worker *starts and
+/// completes a brand-new connection* while the reload SIGHUP handler is
+/// confirmed blocked on the shared reservation lock. `edge_gateway.run`'s
+/// single-threaded event loop owns accepting and dispatching connections
+/// as well as (synchronously) `hotReloadConfig`, so blocking that one
+/// thread on the lock blocks *new* accepts for that process -- but
+/// `edge_gateway.run` also has a separate `WorkerPool`, so a connection
+/// *already* accepted and dispatched to a worker before the block began
+/// can keep making progress regardless (see `GatedUpstream` below, which
+/// proves exactly that with a request dispatched ahead of time and held
+/// under this test's control). A `ChurnWorker`'s own next connection
+/// attempt is always a *new* one with no such guarantee, so requiring it
+/// to complete specifically while blocked would be requiring a new
+/// accept during the one window that's provably unavailable. An earlier
+/// revision required exactly that and reliably hung for the full bounded
+/// test timeout, confirming new accepts really do stall -- the fix was
+/// not to give up on proving overlap, but to prove it with a request
+/// that was already in flight (`GatedUpstream`) rather than with churn's
+/// own fresh reconnect loop.
+///
+/// `saw_outgoing`/`saw_incoming` are published only once a matching
+/// ticket has *also* been retained in `results`, so a visible flag always
+/// corresponds to a concrete sample -- the round loop waits for
+/// `saw_outgoing` on both workers before ever touching the reservation
+/// barrier (proving real pre-reload traffic without depending on thread
+/// scheduling luck) and, symmetrically, for `saw_incoming` on both
+/// workers only *after* the barrier is released and both processes have
+/// independently reported `reload_accepted` (when their event loops are
+/// again free to make socket progress) before stopping them -- so
+/// `expectSpansBothGenerations` below is a redundant final consistency
+/// check over the retained samples, not the primary proof.
+///
+/// Uses `std.heap.page_allocator` rather than `std.testing.allocator`:
+/// the latter is not safe to call concurrently from multiple threads,
+/// and `results`/`failure` are only ever read by the main thread after
+/// `std.Thread.join()`, so no cross-thread synchronization on them is
+/// needed (only the two atomic flags are read while the worker may still
+/// be running). A worker records the first error it hits (an issuance
+/// failure or an unexpected key id) and stops immediately, rather than
+/// silently swallowing it and leaving the caller to mistake an empty
+/// result set for a healthy run.
+const ChurnWorker = struct {
+    port: u16,
+    stop: *std.atomic.Value(bool),
+    outgoing_key_id_hex: []const u8,
+    incoming_key_id_hex: []const u8,
+    saw_outgoing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    saw_incoming: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    results: std.array_list.Managed(TicketEnvelopeIds),
+    failure: ?anyerror = null,
+
+    fn init(port: u16, stop: *std.atomic.Value(bool), outgoing_key_id_hex: []const u8, incoming_key_id_hex: []const u8) ChurnWorker {
+        return .{
+            .port = port,
+            .stop = stop,
+            .outgoing_key_id_hex = outgoing_key_id_hex,
+            .incoming_key_id_hex = incoming_key_id_hex,
+            .results = std.array_list.Managed(TicketEnvelopeIds).init(std.heap.page_allocator),
+        };
+    }
+
+    fn deinit(self: *ChurnWorker) void {
+        self.results.deinit();
+    }
+
+    fn run(self: *ChurnWorker) void {
+        while (!self.stop.load(.acquire)) {
+            const ids = issueTicketIds(std.heap.page_allocator, self.port) catch |err| {
+                // `WouldBlock` is transient local contention -- this
+                // worker's own tight reconnect loop briefly outpacing the
+                // single dispatched worker thread `TARDIGRADE_WORKER_
+                // THREADS=1` provides (e.g. while the gated race request
+                // above is deliberately occupying it), not a server-side
+                // correctness failure. Retrying past it (with a short
+                // pause so the retry doesn't just recreate the same
+                // contention) keeps the proof honest without papering
+                // over a real issuance/connection failure, which remains
+                // fatal exactly as before.
+                if (err == error.WouldBlock) {
+                    compat.sleepNs(2 * std.time.ns_per_ms);
+                    continue;
+                }
+                self.failure = err;
+                return;
+            };
+            const hex = std.fmt.bytesToHex(ids.key_id, .lower);
+            const is_incoming = std.mem.eql(u8, self.incoming_key_id_hex, &hex);
+            const is_outgoing = std.mem.eql(u8, self.outgoing_key_id_hex, &hex);
+            if (!is_incoming and !is_outgoing) {
+                self.failure = error.ChurnObservedUnexpectedKeyId;
+                return;
+            }
+            self.results.append(ids) catch |err| {
+                self.failure = err;
+                return;
+            };
+            // Published only after the successful ticket has also been
+            // retained above, so a visible flag always corresponds to a
+            // concrete sample in `results`.
+            if (is_outgoing) self.saw_outgoing.store(true, .release);
+            if (is_incoming) self.saw_incoming.store(true, .release);
+        }
+    }
+};
+
+/// #520: bounded wait for a `ChurnWorker` to have observed a successful
+/// ticket from a given generation -- safe to call while the worker thread
+/// is still running (a plain atomic flag, not `results.items.len`).
+fn waitForChurnGenerationSeen(seen: *const std.atomic.Value(bool), timeout_ms: u64) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        if (seen.load(.acquire)) return;
+        compat.sleepNs(5 * std.time.ns_per_ms);
+    }
+    return error.ChurnGenerationNotObserved;
+}
+
+/// #520: asserts `tuples` contains at least one ticket sealed under each
+/// of the two given key ids -- a final consistency check that the
+/// retained sample set agrees with the `saw_outgoing`/`saw_incoming`
+/// flags `waitForChurnGenerationSeen` already waited on; the achievable
+/// proof that continuous churn traffic actually spanned a round's
+/// generation transition, used in place of an unobservable "completed
+/// while the reload handler was confirmed blocked" claim.
+fn expectSpansBothGenerations(tuples: []const TicketEnvelopeIds, outgoing_key_id_hex: []const u8, incoming_key_id_hex: []const u8) !void {
+    var saw_outgoing = false;
+    var saw_incoming = false;
+    for (tuples) |ids| {
+        const hex = std.fmt.bytesToHex(ids.key_id, .lower);
+        if (std.mem.eql(u8, outgoing_key_id_hex, &hex)) saw_outgoing = true;
+        if (std.mem.eql(u8, incoming_key_id_hex, &hex)) saw_incoming = true;
+    }
+    try std.testing.expect(saw_outgoing);
+    try std.testing.expect(saw_incoming);
+}
+
 /// #369: flips one byte inside the opaque ticket envelope of an
 /// OpenSSL-managed `-sess_out` PEM file, in place. Locates
 /// `ticket_protection`'s public, non-secret magic (`"TDTK"`) with a plain
@@ -8389,6 +8929,1010 @@ test "soak.reconnect_resumption" {
         "soak.reconnect_resumption: iterations={d} accepted={d} executions={d} heavy={}\n",
         .{ iterations, accepted_count, execution_count, soakHeavyEnabled() },
     );
+}
+
+// #520: closes the remaining multi-process persistent-key rows from #369's
+// resumption/0-RTT validation matrix. #519 (Slice 4, above) proved a
+// single process's own restart/rotation/reload lifecycle against a
+// persistent snapshot; this proves the same guarantees hold when *two
+// real, live* Tardigrade processes share one on-disk snapshot and
+// genuinely contend its `${path}.lock` -- both at concurrent startup and
+// across concurrent SIGHUP rotation -- not merely in sequence.
+//
+// Deliberately scoped to two processes rather than the issue's suggested
+// heavy-tier three: `ticket_key_snapshot.reserveNonceLeasesInFile`
+// serializes entirely on one exclusive file lock, so a third contender
+// adds more races on the *same* lock, not a qualitatively different one,
+// and generalizing every phase below from named `process_a`/`process_b` to
+// an N-process loop would roughly double this test's size for that
+// marginal property. `TARDIGRADE_SOAK_HEAVY=1` instead scales rotation-
+// round count and per-round ticket sample size -- the properties the
+// acceptance criteria actually call out ("materially increases...
+// rotation... churn"), not the exact process count.
+test "soak.persistent.multi_process_nonce_safety" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const key_path_probe_port = try findFreePort();
+    const ticket_keys_path = try persistentTicketKeySnapshotPath(allocator, key_path_probe_port, "soak-multi-process-nonce-safety");
+    defer allocator.free(ticket_keys_path);
+    defer compat.cwd().deleteFile(ticket_keys_path) catch {};
+    defer {
+        const lock_path = std.fmt.allocPrint(allocator, "{s}.lock", .{ticket_keys_path}) catch null;
+        if (lock_path) |path| {
+            compat.cwd().deleteFile(path) catch {};
+            allocator.free(path);
+        }
+    }
+
+    // Generously wide: ordinary readiness/metrics connections issuing
+    // their own best-effort tickets along the way must never accidentally
+    // exhaust this and turn this soak into the (deliberately separate)
+    // exhaustion case below.
+    const lease_width: u64 = 1_000_000;
+
+    // A small fixed pool of distinct key identities -- one active
+    // generation-1 key plus up to seven successor keys, comfortably
+    // covering both the smoke tier's 2 rotation rounds and the heavy
+    // tier's 6. Generated as comptime literals rather than at runtime:
+    // every round's *new* key must be one this file has never declared
+    // before (`TicketKeyFixture.nonce_lease`'s doc comment -- a key's
+    // declared lease width is a permanent per-key-id ledger entry), and a
+    // small fixed pool sidesteps runtime hex-string allocation/lifetime
+    // bookkeeping for what is otherwise a bounded, known-in-advance count.
+    const key_ids = [_][]const u8{
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+        "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+        "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6",
+        "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+    };
+    const key_secrets = [_][]const u8{
+        "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+        "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3",
+        "b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4",
+        "b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5",
+        "b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6",
+        "b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7",
+    };
+    const key_prefixes = [_][]const u8{
+        "61000000", "62000000", "63000000", "64000000", "65000000", "66000000", "67000000",
+    };
+
+    const gen1_now = compat.milliTimestamp();
+    try writePersistentTicketKeySnapshotKeys(allocator, ticket_keys_path, 1, &.{
+        .{
+            .id_hex = key_ids[0],
+            .key_hex = key_secrets[0],
+            .not_before_unix_ms = gen1_now - 60_000,
+            // Comfortably longer than the default 24h ticket lifetime --
+            // `ticket_protection.ticketExpiresWithinKey` silently refuses
+            // to seal any ticket whose `issued_at + ticket_lifetime` would
+            // outlive the sealing key's own `decrypt_until` (`TicketOutlivesKey`),
+            // so a shorter window here would fail every issuance in this
+            // test closed before it ever reached the wire (see #519's
+            // `rotation.persistent.n_to_n_plus_1` for the same pitfall).
+            .encrypt_until_unix_ms = gen1_now + 25 * 60 * 60 * 1000,
+            .decrypt_until_unix_ms = gen1_now + 26 * 60 * 60 * 1000,
+            .nonce_lease = .{ .prefix_hex = key_prefixes[0], .start = 0, .end_exclusive = lease_width },
+        },
+    });
+
+    // One gated upstream per process, proxied to from a `/race` route
+    // declared in that process's own config -- the heavy tier's real
+    // worker-overlap proof below drives one request through each of
+    // these, per round, and holds it there under the test's own control
+    // while the reservation lock is held. Created (and their `/race`
+    // route wired) regardless of tier, since the process's own config
+    // is fixed at startup and can't be changed per-round; only the
+    // smoke tier simply never drives traffic through it.
+    //
+    // `std.heap.page_allocator`, not `allocator` (`std.testing.
+    // allocator`): the gate's own thread allocates/frees concurrently
+    // with the main test thread, and `std.testing.allocator`'s backing
+    // `DebugAllocator` is not safe for concurrent use from multiple
+    // threads (Zig 0.16 still lists that as planned, not implemented) --
+    // the same reason `ChurnWorker` already uses `std.heap.page_
+    // allocator` for its own thread's allocations.
+    var gate_a = try GatedUpstream.start(std.heap.page_allocator);
+    defer gate_a.stop();
+    try gate_a.run();
+    var gate_b = try GatedUpstream.start(std.heap.page_allocator);
+    defer gate_b.stop();
+    try gate_b.run();
+
+    const config_text_a = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location = /race {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, gate_a.port() });
+    defer allocator.free(config_text_a);
+    const config_text_b = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location = /race {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, gate_b.port() });
+    defer allocator.free(config_text_b);
+
+    const shared_extra_env = &[_]EnvPair{
+        .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+        .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+        .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH", .value = ticket_keys_path },
+    };
+    const process_options_a = TardigradeOptions{
+        .config_text = config_text_a,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = shared_extra_env,
+    };
+    const process_options_b = TardigradeOptions{
+        .config_text = config_text_b,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = shared_extra_env,
+    };
+
+    // Phase 1: *forced*, not merely likely, concurrent startup reservation.
+    // `spawn()`-then-`spawn()` alone only makes concurrent reservation
+    // probable -- on an unlucky scheduling order, process A could fully
+    // complete `reserveNonceLeasesInFile()` before B ever reaches that
+    // code, and every assertion below would still pass even if
+    // `${path}.lock` serialization were entirely broken, since the two
+    // reservations happened sequentially by accident. To make the test
+    // fail deterministically if that serialization is ever removed, this
+    // test itself first acquires `${ticket_keys_path}.lock` -- the exact
+    // same `createFile(..., .lock = .exclusive)` call
+    // `ticket_key_snapshot.acquireReservationLock` uses, so it is a real
+    // OS-level advisory lock that genuinely blocks both children's own
+    // in-startup reservation attempt, not a test-only substitute. The lock
+    // is released only once `waitForReservationAttempt` has observed, on
+    // *both* processes, the secret-free marker `edge_gateway.zig` logs
+    // immediately before entering the reservation path -- a real observed-
+    // arrival condition, not a fixed delay that could still let a slower
+    // process reach the lock attempt only after an early release.
+    const startup_barrier_lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{ticket_keys_path});
+    defer allocator.free(startup_barrier_lock_path);
+    var startup_barrier = try compat.cwd().createFile(startup_barrier_lock_path, .{
+        .read = true,
+        .truncate = false,
+        .permissions = .fromMode(0o600),
+        .lock = .exclusive,
+    });
+
+    var process_a = try TardigradeProcess.spawn(allocator, process_options_a);
+    defer process_a.stop();
+    var process_b = try TardigradeProcess.spawn(allocator, process_options_b);
+    defer process_b.stop();
+
+    try waitForReservationAttemptCount(allocator, process_a.log_path, 1, 5_000);
+    try waitForReservationAttemptCount(allocator, process_b.log_path, 1, 5_000);
+    startup_barrier.close();
+
+    try process_a.waitReady(process_options_a);
+    try process_b.waitReady(process_options_b);
+
+    const after_both_start = try readTicketKeyLeaseWindow(allocator, ticket_keys_path, key_ids[0]);
+    try std.testing.expectEqual(@as(u64, 1), after_both_start.generation);
+    try std.testing.expectEqual(2 * lease_width, after_both_start.start);
+    try std.testing.expectEqual(3 * lease_width, after_both_start.end_exclusive);
+
+    var all_tuples = std.array_list.Managed(TicketEnvelopeIds).init(allocator);
+    defer all_tuples.deinit();
+
+    const samples_per_process: usize = if (soakHeavyEnabled()) 32 else 8;
+
+    var ids_a = std.array_list.Managed(TicketEnvelopeIds).init(allocator);
+    defer ids_a.deinit();
+    var ids_b = std.array_list.Managed(TicketEnvelopeIds).init(allocator);
+    defer ids_b.deinit();
+
+    var i: usize = 0;
+    while (i < samples_per_process) : (i += 1) {
+        const ids = try issueTicketIds(allocator, process_a.port);
+        try std.testing.expectEqualStrings(key_ids[0], &std.fmt.bytesToHex(ids.key_id, .lower));
+        try all_tuples.append(ids);
+        try ids_a.append(ids);
+    }
+    i = 0;
+    while (i < samples_per_process) : (i += 1) {
+        const ids = try issueTicketIds(allocator, process_b.port);
+        try std.testing.expectEqualStrings(key_ids[0], &std.fmt.bytesToHex(ids.key_id, .lower));
+        try all_tuples.append(ids);
+        try ids_b.append(ids);
+    }
+    try assertNoDuplicateTicketIds(all_tuples.items);
+
+    // Each process's emitted nonce counters stay inside exactly one of the
+    // two disjoint reserved windows -- which one is scheduling-dependent
+    // (whichever process won the lock race first gets `[w, 2w)`), so this
+    // resolves each process's own window from its own first sample rather
+    // than assuming an ordering.
+    const a_window = try resolveReservedWindow(ticketNonceCounter(ids_a.items[0]), lease_width);
+    for (ids_a.items) |ids| {
+        const counter = ticketNonceCounter(ids);
+        try std.testing.expect(counter >= a_window.start and counter < a_window.end_exclusive);
+    }
+    const b_window = try resolveReservedWindow(ticketNonceCounter(ids_b.items[0]), lease_width);
+    for (ids_b.items) |ids| {
+        const counter = ticketNonceCounter(ids);
+        try std.testing.expect(counter >= b_window.start and counter < b_window.end_exclusive);
+    }
+    try std.testing.expect(a_window.start != b_window.start);
+
+    // Phase 2: concurrent generation rotation, `rounds` times. Each round
+    // retires the previously-active key (`nonce_lease = null` -- it will
+    // never encrypt again, so it needs no lease at all, matching #519's
+    // own rotation-lease rule) and installs a fresh encryption-capable
+    // successor with its own `[0, lease_width)` lease.
+    const rounds: usize = if (soakHeavyEnabled()) 6 else 2;
+    try std.testing.expect(rounds < key_ids.len);
+
+    var retiring_index: usize = 0;
+    var current_generation: u64 = 1;
+
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        const new_index = round + 1;
+        const new_generation = current_generation + 1;
+
+        // Retain a small bounded sample ticket from the outgoing
+        // generation before rotating -- proves in-flight state survives
+        // the reload, on both processes, below.
+        var sample_ticket = try issueAndRetainTicket(allocator, process_a.port);
+        defer sample_ticket.deinit();
+
+        const round_now = compat.milliTimestamp();
+        try writePersistentTicketKeySnapshotKeys(allocator, ticket_keys_path, new_generation, &.{
+            .{
+                .id_hex = key_ids[retiring_index],
+                .key_hex = key_secrets[retiring_index],
+                .not_before_unix_ms = round_now - 3_600_000,
+                .encrypt_until_unix_ms = round_now - 100,
+                // A generous overlap grace window: #520 is proving
+                // concurrent multi-process rotation safety, not
+                // re-proving the grace-window-closes boundary #519's
+                // `rotation.persistent.n_to_n_plus_1` already covers.
+                .decrypt_until_unix_ms = round_now + 120_000,
+                .nonce_lease = null,
+            },
+            .{
+                .id_hex = key_ids[new_index],
+                .key_hex = key_secrets[new_index],
+                .not_before_unix_ms = round_now - 100,
+                // Same 24h-ticket-lifetime headroom as the generation-1 key
+                // above -- this key must seal fresh tickets for the rest of
+                // the soak.
+                .encrypt_until_unix_ms = round_now + 25 * 60 * 60 * 1000,
+                .decrypt_until_unix_ms = round_now + 26 * 60 * 60 * 1000,
+                .nonce_lease = .{ .prefix_hex = key_prefixes[new_index], .start = 0, .end_exclusive = lease_width },
+            },
+        });
+
+        const reload_accepted_before_a = try currentLabeledMetric(allocator, process_a.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""});
+        const reload_accepted_before_b = try currentLabeledMetric(allocator, process_b.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""});
+
+        // Heavy tier only: keep real request/ticket-issuance traffic
+        // flowing against *both* processes across the reload race below.
+        //
+        // The cleanup defer is registered *before* any fallible operation
+        // that could unwind this scope (`std.Thread.spawn`, the
+        // `waitForLabeledMetricAtLeast` polls below) -- if reload never
+        // reaches `reload_accepted` (exactly the failure this soak wants
+        // to diagnose), the workers must still be signaled to stop and
+        // joined here, not left running against stack-owned state after
+        // the enclosing `process_*` defers kill the children out from
+        // under them. `churn_thread_{a,b}` are set back to `null` once
+        // explicitly joined on the success path below so this deferred
+        // block's own join calls become harmless no-ops rather than an
+        // illegal double-join.
+        var churn_stop = std.atomic.Value(bool).init(false);
+        var churn_a: ?ChurnWorker = null;
+        var churn_b: ?ChurnWorker = null;
+        var churn_thread_a: ?std.Thread = null;
+        var churn_thread_b: ?std.Thread = null;
+        defer {
+            churn_stop.store(true, .release);
+            if (churn_thread_a) |t| t.join();
+            if (churn_thread_b) |t| t.join();
+            if (churn_a) |*w| w.deinit();
+            if (churn_b) |*w| w.deinit();
+        }
+        if (soakHeavyEnabled()) {
+            churn_a = ChurnWorker.init(process_a.port, &churn_stop, key_ids[retiring_index], key_ids[new_index]);
+            churn_thread_a = try std.Thread.spawn(.{}, ChurnWorker.run, .{&churn_a.?});
+            churn_b = ChurnWorker.init(process_b.port, &churn_stop, key_ids[retiring_index], key_ids[new_index]);
+            churn_thread_b = try std.Thread.spawn(.{}, ChurnWorker.run, .{&churn_b.?});
+
+            // Establishes the pre-reload half of the continuity proof
+            // deterministically, while both event loops are completely
+            // free to process socket I/O -- must happen before touching
+            // the reservation barrier below, since waiting for churn
+            // progress once `hotReloadConfig` has blocked on it is
+            // architecturally impossible (see `ChurnWorker`'s doc
+            // comment). Without this, `expectSpansBothGenerations` at the
+            // end of the round could fail purely on thread-scheduling
+            // luck if neither worker happened to be scheduled before
+            // reload began.
+            try waitForChurnGenerationSeen(&churn_a.?.saw_outgoing, 5_000);
+            try waitForChurnGenerationSeen(&churn_b.?.saw_outgoing, 5_000);
+        }
+
+        // The real worker-overlap proof #520 asks for, heavy tier only:
+        // `edge_gateway.run` has a separate `WorkerPool` alongside its
+        // single-threaded event loop, so once a native H1 connection has
+        // actually been accepted and dispatched (`advanceNativeHttp1`
+        // running on a worker, `WaitingEncryptedHttpConnection.waitFor`
+        // polling its own fd directly), it can keep making progress even
+        // while the main loop is blocked inside synchronous
+        // `hotReloadConfig` -- blocking that one thread only prevents
+        // *new* accepts, not already-dispatched work. `gate_{a,b}` proxy
+        // one real request per process to a point held entirely under
+        // this test's control, so `waitEntered` below deterministically
+        // proves each request has already been accepted, dispatched, and
+        // proxied all the way to its upstream *before* either reload
+        // begins -- a real condition, not a fixed delay.
+        //
+        // The cleanup defer releases both gates and joins any spawned
+        // race thread unconditionally, registered before the fallible
+        // spawns/waits below -- if a later `try` in this round fails
+        // (reload never reaching `reload_accepted`, say), a race thread
+        // left blocked waiting on a never-released gate must not leak
+        // past this scope, the same lesson the churn-worker lifetime fix
+        // already applied.
+        var race_result_a = RaceRequestResult{};
+        var race_result_b = RaceRequestResult{};
+        var race_thread_a: ?std.Thread = null;
+        var race_thread_b: ?std.Thread = null;
+        defer {
+            gate_a.release();
+            gate_b.release();
+            if (race_thread_a) |t| t.join();
+            if (race_thread_b) |t| t.join();
+        }
+        if (soakHeavyEnabled()) {
+            gate_a.resetGate();
+            gate_b.resetGate();
+            // `std.heap.page_allocator`, not `allocator`: this thread runs
+            // concurrently with the main test thread (and the gate's own
+            // thread), and `std.testing.allocator` is not safe for
+            // concurrent use -- same reasoning as `GatedUpstream.start`
+            // above and `ChurnWorker` elsewhere in this file.
+            race_thread_a = try std.Thread.spawn(.{}, runTlsRaceRequest, .{ std.heap.page_allocator, process_a.port, &race_result_a });
+            race_thread_b = try std.Thread.spawn(.{}, runTlsRaceRequest, .{ std.heap.page_allocator, process_b.port, &race_result_b });
+            try gate_a.waitEntered(5_000);
+            try gate_b.waitEntered(5_000);
+        }
+
+        // Forces the two real SIGHUP handlers to genuinely block on
+        // `${ticket_keys_path}.lock` at the same time, exactly the same
+        // technique the concurrent-startup phase above uses: this test
+        // acquires the lock itself, *before* sending either signal, using
+        // the same `createFile(..., .lock = .exclusive)` call production
+        // uses. `reservation_marker_count_before_{a,b}` snapshots each
+        // process's own reservation-attempt log-marker count immediately
+        // before this round's signal, so `waitForReservationAttemptCount`
+        // below can detect *this round's* attempt specifically (the
+        // marker also fired once at startup and once per earlier round),
+        // not an already-satisfied earlier one.
+        const reservation_marker_count_before_a = countReservationAttemptMarkers(allocator, process_a.log_path);
+        const reservation_marker_count_before_b = countReservationAttemptMarkers(allocator, process_b.log_path);
+        var reload_barrier = try compat.cwd().createFile(startup_barrier_lock_path, .{
+            .read = true,
+            .truncate = false,
+            .permissions = .fromMode(0o600),
+            .lock = .exclusive,
+        });
+
+        // Sent back-to-back, without waiting between them.
+        process_a.sendSignal(std.posix.SIG.HUP);
+        process_b.sendSignal(std.posix.SIG.HUP);
+
+        // Both real SIGHUP handlers have now reached
+        // `reserveNonceLeasesInFile` and are demonstrably blocked on the
+        // lock this test still holds -- not merely "probably racing".
+        try waitForReservationAttemptCount(allocator, process_a.log_path, reservation_marker_count_before_a + 1, 5_000);
+        try waitForReservationAttemptCount(allocator, process_b.log_path, reservation_marker_count_before_b + 1, 5_000);
+
+        // Both main event loops are now confirmed blocked in reload --
+        // but each gated request (heavy tier only) was already accepted
+        // and dispatched to a worker *before* that happened, so releasing
+        // it here and requiring its completion *before* the lock itself
+        // is released is the actual proof that real request/ticket-
+        // adjacent traffic was genuinely in flight during the reload
+        // race, not merely before or after it. `ChurnWorker`'s own
+        // connections deliberately are not required to complete here
+        // (see its doc comment): only an *already-dispatched* connection
+        // can make progress while the main loop is blocked, and a churn
+        // worker's next connection attempt has no such guarantee.
+        if (soakHeavyEnabled()) {
+            gate_a.release();
+            gate_b.release();
+            try waitForRaceRequestComplete(&race_result_a, 5_000);
+            try waitForRaceRequestComplete(&race_result_b, 5_000);
+        }
+
+        reload_barrier.close();
+
+        if (soakHeavyEnabled()) {
+            race_thread_a.?.join();
+            race_thread_b.?.join();
+            race_thread_a = null;
+            race_thread_b = null;
+            if (race_result_a.err) |err| return err;
+            if (race_result_b.err) |err| return err;
+            try std.testing.expect(race_result_a.status_ok);
+            try std.testing.expect(race_result_b.status_ok);
+        }
+
+        // Now that the lock is released, both processes' real
+        // reservations proceed and each (eventually) reports its own
+        // `reload_accepted` independently. Immediately after observing
+        // *that specific process's* acceptance, an explicit, synchronous,
+        // single-shot probe -- not sampled off a concurrently running
+        // churn worker, which cannot safely establish this boundary no
+        // matter which side of a request it samples -- proves fresh
+        // issuance is already exclusively the incoming key.
+        try waitForLabeledMetricAtLeast(allocator, process_a.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""}, reload_accepted_before_a + 1, 5_000);
+        const post_accept_ids_a = try issueTicketIds(allocator, process_a.port);
+        try std.testing.expectEqualStrings(key_ids[new_index], &std.fmt.bytesToHex(post_accept_ids_a.key_id, .lower));
+        try all_tuples.append(post_accept_ids_a);
+
+        try waitForLabeledMetricAtLeast(allocator, process_b.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""}, reload_accepted_before_b + 1, 5_000);
+        const post_accept_ids_b = try issueTicketIds(allocator, process_b.port);
+        try std.testing.expectEqualStrings(key_ids[new_index], &std.fmt.bytesToHex(post_accept_ids_b.key_id, .lower));
+        try all_tuples.append(post_accept_ids_b);
+        try assertNoDuplicateTicketIds(all_tuples.items);
+
+        if (soakHeavyEnabled()) {
+            // Establishes the post-reload half of the continuity proof.
+            // The reservation barrier has already been released and both
+            // processes have independently reported `reload_accepted`,
+            // so their event loops are free to process socket I/O again
+            // here -- waiting for churn progress at this point cannot
+            // recreate the held-lock deadlock.
+            try waitForChurnGenerationSeen(&churn_a.?.saw_incoming, 5_000);
+            try waitForChurnGenerationSeen(&churn_b.?.saw_incoming, 5_000);
+
+            churn_stop.store(true, .release);
+            churn_thread_a.?.join();
+            churn_thread_b.?.join();
+            churn_thread_a = null;
+            churn_thread_b = null;
+
+            // A silently swallowed issuance failure could leave a worker
+            // with zero samples while the test still sails through the
+            // post-reload probes below -- assert both stayed healthy and
+            // actually produced traffic, not merely that they didn't
+            // observe a wrong key id.
+            try std.testing.expect(churn_a.?.failure == null);
+            try std.testing.expect(churn_b.?.failure == null);
+            try std.testing.expect(churn_a.?.results.items.len > 0);
+            try std.testing.expect(churn_b.?.results.items.len > 0);
+
+            // Traffic actually spanned the transition: each worker's
+            // collected samples include both the outgoing and the
+            // incoming generation's key id, not merely "some traffic
+            // happened at some point in the round".
+            try expectSpansBothGenerations(churn_a.?.results.items, key_ids[retiring_index], key_ids[new_index]);
+            try expectSpansBothGenerations(churn_b.?.results.items, key_ids[retiring_index], key_ids[new_index]);
+
+            for (churn_a.?.results.items) |ids| try all_tuples.append(ids);
+            for (churn_b.?.results.items) |ids| try all_tuples.append(ids);
+            try assertNoDuplicateTicketIds(all_tuples.items);
+        }
+
+        const lease_after_round = try readTicketKeyLeaseWindow(allocator, ticket_keys_path, key_ids[new_index]);
+        try std.testing.expectEqual(new_generation, lease_after_round.generation);
+        try std.testing.expectEqual(2 * lease_width, lease_after_round.start);
+        try std.testing.expectEqual(3 * lease_width, lease_after_round.end_exclusive);
+
+        // In-flight safety: the retained sample ticket from the outgoing
+        // generation still resumes on *both* processes, immediately after
+        // each has independently reported `reload_accepted`.
+        try resumeTicketExpectAccepted(allocator, process_a.port, &sample_ticket);
+        try resumeTicketExpectAccepted(allocator, process_b.port, &sample_ticket);
+
+        var round_ids_a = std.array_list.Managed(TicketEnvelopeIds).init(allocator);
+        defer round_ids_a.deinit();
+        var round_ids_b = std.array_list.Managed(TicketEnvelopeIds).init(allocator);
+        defer round_ids_b.deinit();
+
+        var s: usize = 0;
+        while (s < samples_per_process) : (s += 1) {
+            const ids_new_a = try issueTicketIds(allocator, process_a.port);
+            try std.testing.expectEqualStrings(key_ids[new_index], &std.fmt.bytesToHex(ids_new_a.key_id, .lower));
+            try all_tuples.append(ids_new_a);
+            try round_ids_a.append(ids_new_a);
+
+            const ids_new_b = try issueTicketIds(allocator, process_b.port);
+            try std.testing.expectEqualStrings(key_ids[new_index], &std.fmt.bytesToHex(ids_new_b.key_id, .lower));
+            try all_tuples.append(ids_new_b);
+            try round_ids_b.append(ids_new_b);
+        }
+        try assertNoDuplicateTicketIds(all_tuples.items);
+
+        const round_a_window = try resolveReservedWindow(ticketNonceCounter(round_ids_a.items[0]), lease_width);
+        for (round_ids_a.items) |ids| {
+            const counter = ticketNonceCounter(ids);
+            try std.testing.expect(counter >= round_a_window.start and counter < round_a_window.end_exclusive);
+        }
+        const round_b_window = try resolveReservedWindow(ticketNonceCounter(round_ids_b.items[0]), lease_width);
+        for (round_ids_b.items) |ids| {
+            const counter = ticketNonceCounter(ids);
+            try std.testing.expect(counter >= round_b_window.start and counter < round_b_window.end_exclusive);
+        }
+        try std.testing.expect(round_a_window.start != round_b_window.start);
+
+        retiring_index = new_index;
+        current_generation = new_generation;
+    }
+
+    // #369 artifact requirement: bounded, secret-free diagnostics for
+    // reproduction -- never key ids/nonces/paths.
+    std.debug.print(
+        "soak.persistent.multi_process_nonce_safety: heavy={} rounds={d} samples_per_process={d} lease_width={d} final_generation={d} tuples={d}\n",
+        .{ soakHeavyEnabled(), rounds, samples_per_process, lease_width, current_generation, all_tuples.items.len },
+    );
+}
+
+// #520: separate from the large-lease soak above so a failure says
+// exactly what broke. Drives real, bounded full-handshake traffic against
+// process A until its own deliberately tiny reserved nonce-lease window is
+// exhausted, then proves the production `NonceLeaseExhausted` failure path
+// is safely isolated: issuance stops, but decryption, resumption, and
+// ordinary handshakes on A are unaffected, and process B's own disjoint
+// reservation is untouched.
+test "soak.persistent.nonce_lease_exhaustion" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const key_path_probe_port = try findFreePort();
+    const ticket_keys_path = try persistentTicketKeySnapshotPath(allocator, key_path_probe_port, "soak-nonce-lease-exhaustion");
+    defer allocator.free(ticket_keys_path);
+    defer compat.cwd().deleteFile(ticket_keys_path) catch {};
+    defer {
+        const lock_path = std.fmt.allocPrint(allocator, "{s}.lock", .{ticket_keys_path}) catch null;
+        if (lock_path) |path| {
+            compat.cwd().deleteFile(path) catch {};
+            allocator.free(path);
+        }
+    }
+
+    const lease_width: u64 = 16;
+    const key_id = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
+    const key_secret = "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1";
+
+    const gen1_now = compat.milliTimestamp();
+    try writePersistentTicketKeySnapshotKeys(allocator, ticket_keys_path, 1, &.{
+        .{
+            .id_hex = key_id,
+            .key_hex = key_secret,
+            .not_before_unix_ms = gen1_now - 60_000,
+            // Comfortably longer than the default 24h ticket lifetime --
+            // see the matching comment in `soak.persistent.multi_process_
+            // nonce_safety` above for why a shorter window here would
+            // silently fail every issuance closed (`TicketOutlivesKey`).
+            .encrypt_until_unix_ms = gen1_now + 25 * 60 * 60 * 1000,
+            .decrypt_until_unix_ms = gen1_now + 26 * 60 * 60 * 1000,
+            .nonce_lease = .{ .prefix_hex = "71000000", .start = 0, .end_exclusive = lease_width },
+        },
+    });
+
+    const config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+    ;
+    const process_options = TardigradeOptions{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH", .value = ticket_keys_path },
+        },
+    };
+
+    var process_a = try TardigradeProcess.start(allocator, process_options);
+    defer process_a.stop();
+    var process_b = try TardigradeProcess.start(allocator, process_options);
+    defer process_b.stop();
+
+    var tuples = std.array_list.Managed(TicketEnvelopeIds).init(allocator);
+    defer tuples.deinit();
+
+    // A real ticket issued from A before exhausting its local
+    // reservation: must remain resumable after A can no longer mint a new
+    // one.
+    var pre_exhaustion_ticket = try issueAndRetainTicket(allocator, process_a.port);
+    defer pre_exhaustion_ticket.deinit();
+    try tuples.append(extractTicketEnvelopeIds(&pre_exhaustion_ticket));
+
+    const failed_before = try currentLabeledMetric(allocator, process_a.port, "tardigrade_tls_ticket_issue_total", &.{ "transport=\"record\"", "mode=\"stateless\"", "result=\"failed\"" });
+
+    // Bounded batches, not a per-connection metrics poll: `/status/metrics`
+    // is itself reached over a real TLS connection that can attempt its
+    // own best-effort ticket issuance, so polling the failure counter
+    // after every single request would conflate that with the batch's own
+    // consumption. A's own just-reserved window is at most `lease_width`
+    // wide (minus whatever its startup readiness check and the
+    // pre-exhaustion ticket above already consumed), so a handful of
+    // bounded batches comfortably reaches it without depending on the
+    // exact remaining count.
+    const batch_size: usize = 8;
+    const max_batches: usize = 6;
+    var exhausted = false;
+    var batch: usize = 0;
+    while (batch < max_batches and !exhausted) : (batch += 1) {
+        var n: usize = 0;
+        while (n < batch_size) : (n += 1) {
+            if (try issueTicketIdsOptional(allocator, process_a.port)) |ids| {
+                try tuples.append(ids);
+            }
+        }
+        const failed_now = try currentLabeledMetric(allocator, process_a.port, "tardigrade_tls_ticket_issue_total", &.{ "transport=\"record\"", "mode=\"stateless\"", "result=\"failed\"" });
+        if (failed_now > failed_before) exhausted = true;
+    }
+    try std.testing.expect(exhausted);
+
+    try assertNoDuplicateTicketIds(tuples.items);
+
+    // Exhaustion stopped new issuance, but did not tear down the
+    // connections that hit it (`issueTicketIdsOptional` already asserted
+    // every one of them still got `200 OK`) and does not disturb
+    // decryption of a ticket issued before the window closed.
+    try resumeTicketExpectAccepted(allocator, process_a.port, &pre_exhaustion_ticket);
+
+    // A brand-new ordinary full handshake to A remains usable.
+    {
+        const client = try PureZigTlsClient.create(allocator, process_a.port, "http/1.1");
+        defer client.destroy();
+        try client.writeAllPlain(openssl_health_request);
+        const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(raw);
+        try assertContains(raw, "HTTP/1.1 200 OK");
+    }
+
+    // B's own disjoint local reservation is untouched by A exhausting its
+    // own -- B still issues fresh tickets normally, and B's own failure
+    // counter stays at zero throughout.
+    const ids_b = try issueTicketIds(allocator, process_b.port);
+    try std.testing.expectEqualStrings(key_id, &std.fmt.bytesToHex(ids_b.key_id, .lower));
+    try tuples.append(ids_b);
+    try assertNoDuplicateTicketIds(tuples.items);
+
+    const failed_b = try currentLabeledMetric(allocator, process_b.port, "tardigrade_tls_ticket_issue_total", &.{ "transport=\"record\"", "mode=\"stateless\"", "result=\"failed\"" });
+    try std.testing.expectEqual(@as(u64, 0), failed_b);
+}
+
+// #520: proves the process-local early-data replay scope
+// `docs/OBSERVABILITY.md` already documents is the real production
+// behavior, not just prose: two real processes share one persistent
+// ticket-key snapshot (so either can decrypt a ticket the other issued)
+// but keep independent `process_local` replay stores, so the exact same
+// replay identity is legitimately accepted once by *each* process,
+// independently, while a same-process replay is still rejected as a
+// duplicate.
+test "soak.replay.process_local_scope" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const key_path_probe_port = try findFreePort();
+    const ticket_keys_path = try persistentTicketKeySnapshotPath(allocator, key_path_probe_port, "soak-replay-process-local-scope");
+    defer allocator.free(ticket_keys_path);
+    defer compat.cwd().deleteFile(ticket_keys_path) catch {};
+    defer {
+        const lock_path = std.fmt.allocPrint(allocator, "{s}.lock", .{ticket_keys_path}) catch null;
+        if (lock_path) |path| {
+            compat.cwd().deleteFile(path) catch {};
+            allocator.free(path);
+        }
+    }
+    try writePersistentTicketKeySnapshot(allocator, ticket_keys_path);
+
+    // Smoke: one replay identity. Heavy: several, after paying the real
+    // startup-quarantine wait once -- fixed-size response arrays sized for
+    // the heavy-tier max avoid runtime allocator lifetime bookkeeping for
+    // what is otherwise a small, known-in-advance count.
+    const max_identities = 4;
+    const identity_count: usize = if (soakHeavyEnabled()) max_identities else 1;
+
+    // Every identity iteration bootstraps its own fresh ticket through A
+    // (one more real upstream hit each time), then drives one early+
+    // after-replay pair through A and another through B -- so A needs 3
+    // response slots per identity (bootstrap, early, after-replay) and B
+    // needs 2 (early, after-replay), each laid out in the exact temporal
+    // order those connections actually arrive in, not grouped by response
+    // type.
+    var upstream_a_specs: [1 + 3 * max_identities]UpstreamResponseSpec = undefined;
+    upstream_a_specs[0] = .{ .body = "a-ready", .connection_header = "close" };
+    var upstream_b_specs: [1 + 2 * max_identities]UpstreamResponseSpec = undefined;
+    upstream_b_specs[0] = .{ .body = "b-ready", .connection_header = "close" };
+    for (0..identity_count) |idx| {
+        upstream_a_specs[1 + idx * 3] = .{ .body = "a-bootstrap", .connection_header = "close" };
+        upstream_a_specs[1 + idx * 3 + 1] = .{ .body = "a-early", .connection_header = "close" };
+        upstream_a_specs[1 + idx * 3 + 2] = .{ .body = "a-after-replay", .connection_header = "close" };
+        upstream_b_specs[1 + idx * 2] = .{ .body = "b-early", .connection_header = "close" };
+        upstream_b_specs[1 + idx * 2 + 1] = .{ .body = "b-after-replay", .connection_header = "close" };
+    }
+
+    var upstream_a = try UpstreamServer.start(allocator, upstream_a_specs[0 .. 1 + 3 * identity_count]);
+    defer upstream_a.stop();
+    try upstream_a.run();
+    var upstream_b = try UpstreamServer.start(allocator, upstream_b_specs[0 .. 1 + 2 * identity_count]);
+    defer upstream_b.stop();
+    try upstream_b.run();
+
+    const config_a = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\    early_data replay_safe;
+        \\    proxy_early_data rfc8470;
+        \\}}
+    , .{ test_host, upstream_a.port() });
+    defer allocator.free(config_a);
+    const config_b = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    proxy_pass http://{s}:{d};
+        \\    early_data replay_safe;
+        \\    proxy_early_data rfc8470;
+        \\}}
+    , .{ test_host, upstream_b.port() });
+    defer allocator.free(config_b);
+
+    // Same certificate/key on both -- ticket auth-binding
+    // (`session.evaluateCompatibility`) requires the identical served
+    // credential for the PSK to authenticate at all on either process.
+    const shared_extra_env = &[_]EnvPair{
+        .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+        .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+        .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+        .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "false" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH", .value = ticket_keys_path },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE", .value = "process_local" },
+    };
+    const options_a = TardigradeOptions{
+        .config_text = config_a,
+        .ready_https_insecure = true,
+        .ready_path = "/safe",
+        .extra_env = shared_extra_env,
+    };
+    const options_b = TardigradeOptions{
+        .config_text = config_b,
+        .ready_https_insecure = true,
+        .ready_path = "/safe",
+        .extra_env = shared_extra_env,
+    };
+
+    // Concurrent startup, then a single shared quarantine wait: the
+    // production early-data policy's startup quarantine
+    // (`age_skew_tolerance_ms = 60_000`) is real and not shortened for
+    // this test -- #518 already covers the fresh-process-rejects-during-
+    // quarantine behavior; this test owns the after-quarantine
+    // per-process scope. Both processes pay the ~60s wait once, together,
+    // since both were already started before it begins.
+    var process_a = try TardigradeProcess.spawn(allocator, options_a);
+    defer process_a.stop();
+    var process_b = try TardigradeProcess.spawn(allocator, options_b);
+    defer process_b.stop();
+    try process_a.waitReady(options_a);
+    try process_b.waitReady(options_b);
+
+    compat.sleepNs(61 * std.time.ns_per_s);
+
+    try upstream_a.resetCapture();
+    try upstream_b.resetCapture();
+
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2_500;
+        }
+    };
+
+    var identity: usize = 0;
+    while (identity < identity_count) : (identity += 1) {
+        // Per-identity metric *deltas*, captured fresh each iteration --
+        // not a cumulative `>= 1` check. With `identity_count > 1`, a
+        // cumulative check would still pass even if later identities
+        // stopped emitting replay events entirely (identity 0's own
+        // increment alone would satisfy it forever after); an exact
+        // before/after delta for each of the four actions below is the
+        // invariant #520 actually asks for. `/status/metrics` reads do not
+        // themselves create replay-store accepted/duplicate events, so
+        // these deltas are exact, not merely bounded.
+        const a_accepted_before = try currentLabeledMetric(allocator, process_a.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""});
+        const a_duplicate_before = try currentLabeledMetric(allocator, process_a.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""});
+        const b_accepted_before = try currentLabeledMetric(allocator, process_b.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""});
+        const b_duplicate_before = try currentLabeledMetric(allocator, process_b.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""});
+
+        const TicketCapture = struct {
+            allocator: std.mem.Allocator,
+            retained: tls_core.session.ClientTicketState = .{},
+
+            fn now(_: *anyopaque) i64 {
+                return 2_000;
+            }
+
+            fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                self.retained.deinit();
+                self.retained = .{};
+                ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+            }
+        };
+        var capture = TicketCapture{ .allocator = allocator };
+        defer capture.retained.deinit();
+
+        // Bootstrap: a plain (non-early) handshake against A mints the one
+        // ticket identity this iteration replays four ways below.
+        const bootstrap_client = try PureZigTlsClient.createWithOptions(allocator, process_a.port, "http/1.1", "tardigrade.test", .{
+            .ticket_consumer = .{ .ctx = &capture, .nowUnixMsFn = TicketCapture.now, .onTicketFn = TicketCapture.onTicket },
+        });
+        defer bootstrap_client.destroy();
+        try bootstrap_client.writeAllPlain("GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+        const bootstrap_raw = try bootstrap_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(bootstrap_raw);
+        try assertContains(bootstrap_raw, "HTTP/1.1 200 OK");
+        try assertContains(bootstrap_raw, "a-bootstrap");
+        try std.testing.expectEqual(tls_core.session.EarlyDataPolicy{ .early_data_capable = 16 * 1024 }, capture.retained.common.early_data);
+
+        var base_ticket: tls_core.session.ClientTicketState = .{};
+        defer base_ticket.deinit();
+        try capture.retained.cloneInto(allocator, &base_ticket);
+
+        try upstream_a.resetCapture();
+
+        // A, first use: the exact same identity, offered as early data to
+        // A for the first time -- accepted exactly once.
+        {
+            var clone: tls_core.session.ClientTicketState = .{};
+            defer clone.deinit();
+            try base_ticket.cloneInto(allocator, &clone);
+            var offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+            try offers.push(&clone);
+            errdefer offers.deinit();
+            const client = try PureZigTlsClient.createWithOptions(allocator, process_a.port, "http/1.1", "tardigrade.test", .{
+                .psk_offers = &offers,
+                .psk_now_ctx = &clock_dummy,
+                .psk_now_fn = ClientClock.now,
+                .early_data_intent = .{ .enabled = true, .max_bytes = 4096 },
+                .return_after_early_data_ready = true,
+            });
+            defer client.destroy();
+            try client.writeAllPlain("GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+            const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+            defer allocator.free(raw);
+            try assertContains(raw, "HTTP/1.1 200 OK");
+            try assertContains(raw, "a-early");
+            try std.testing.expectEqual(@as(u32, 1), upstream_a.requestCount());
+        }
+        try std.testing.expectEqual(a_accepted_before + 1, try currentLabeledMetric(allocator, process_a.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""}));
+
+        // A, replay: the identical identity offered again to A. Rejected
+        // as a duplicate -- the early bytes never reach upstream (request
+        // count below only grows by the explicit follow-up request) -- but
+        // the PSK/session itself remains valid and the connection safely
+        // falls back to a full 1-RTT resumed handshake.
+        {
+            var clone: tls_core.session.ClientTicketState = .{};
+            defer clone.deinit();
+            try base_ticket.cloneInto(allocator, &clone);
+            var offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+            try offers.push(&clone);
+            errdefer offers.deinit();
+            const client = try PureZigTlsClient.createWithOptions(allocator, process_a.port, "http/1.1", "tardigrade.test", .{
+                .psk_offers = &offers,
+                .psk_now_ctx = &clock_dummy,
+                .psk_now_fn = ClientClock.now,
+                .early_data_intent = .{ .enabled = true, .max_bytes = 4096 },
+                .return_after_early_data_ready = true,
+            });
+            defer client.destroy();
+            try client.writeAllPlain("GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: keep-alive\r\n\r\n");
+            try client.driveUntilOpen(5_000);
+            try std.testing.expect(client.backend.core.psk_authenticated);
+            try client.writeAllPlain("GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+            const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+            defer allocator.free(raw);
+            try assertContains(raw, "HTTP/1.1 200 OK");
+            try assertContains(raw, "a-after-replay");
+            try std.testing.expectEqual(@as(u32, 2), upstream_a.requestCount());
+        }
+        try std.testing.expectEqual(a_duplicate_before + 1, try currentLabeledMetric(allocator, process_a.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""}));
+
+        try upstream_b.resetCapture();
+
+        // B, first use: B's own independent process-local replay store has
+        // never seen this identity -- accepted once, even though A already
+        // consumed it above. The documented `process_local` scope, proven
+        // live rather than asserted only in prose.
+        {
+            var clone: tls_core.session.ClientTicketState = .{};
+            defer clone.deinit();
+            try base_ticket.cloneInto(allocator, &clone);
+            var offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+            try offers.push(&clone);
+            errdefer offers.deinit();
+            const client = try PureZigTlsClient.createWithOptions(allocator, process_b.port, "http/1.1", "tardigrade.test", .{
+                .psk_offers = &offers,
+                .psk_now_ctx = &clock_dummy,
+                .psk_now_fn = ClientClock.now,
+                .early_data_intent = .{ .enabled = true, .max_bytes = 4096 },
+                .return_after_early_data_ready = true,
+            });
+            defer client.destroy();
+            try client.writeAllPlain("GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+            const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+            defer allocator.free(raw);
+            try assertContains(raw, "HTTP/1.1 200 OK");
+            try assertContains(raw, "b-early");
+            try std.testing.expectEqual(@as(u32, 1), upstream_b.requestCount());
+        }
+        try std.testing.expectEqual(b_accepted_before + 1, try currentLabeledMetric(allocator, process_b.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""}));
+
+        // B, replay: rejected as a duplicate too, same as A above.
+        {
+            var clone: tls_core.session.ClientTicketState = .{};
+            defer clone.deinit();
+            try base_ticket.cloneInto(allocator, &clone);
+            var offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+            try offers.push(&clone);
+            errdefer offers.deinit();
+            const client = try PureZigTlsClient.createWithOptions(allocator, process_b.port, "http/1.1", "tardigrade.test", .{
+                .psk_offers = &offers,
+                .psk_now_ctx = &clock_dummy,
+                .psk_now_fn = ClientClock.now,
+                .early_data_intent = .{ .enabled = true, .max_bytes = 4096 },
+                .return_after_early_data_ready = true,
+            });
+            defer client.destroy();
+            try client.writeAllPlain("GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: keep-alive\r\n\r\n");
+            try client.driveUntilOpen(5_000);
+            try std.testing.expect(client.backend.core.psk_authenticated);
+            try client.writeAllPlain("GET /safe HTTP/1.1\r\nHost: tardigrade.test\r\nConnection: close\r\n\r\n");
+            const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+            defer allocator.free(raw);
+            try assertContains(raw, "HTTP/1.1 200 OK");
+            try assertContains(raw, "b-after-replay");
+            try std.testing.expectEqual(@as(u32, 2), upstream_b.requestCount());
+        }
+        try std.testing.expectEqual(b_duplicate_before + 1, try currentLabeledMetric(allocator, process_b.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""}));
+
+        try upstream_a.resetCapture();
+        try upstream_b.resetCapture();
+    }
+
+    const log_a = try compat.cwd().readFileAlloc(allocator, process_a.log_path, 4 * 1024 * 1024);
+    defer allocator.free(log_a);
+    const log_b = try compat.cwd().readFileAlloc(allocator, process_b.log_path, 4 * 1024 * 1024);
+    defer allocator.free(log_b);
+    try assertHexAbsentCaseInsensitive(allocator, log_a, persistent_ticket_key_fixture_hex);
+    try assertHexAbsentCaseInsensitive(allocator, log_b, persistent_ticket_key_fixture_hex);
 }
 
 test "#510 native tcp production 0-rtt reaches h1 safety gate and replay fallback" {

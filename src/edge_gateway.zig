@@ -861,7 +861,21 @@ fn nativeResumptionMetricsObserver(state: *GatewayState) tls_core.resumption_run
         .onTicketResolveFn = nativeResumptionTicketResolve,
         .onResumptionAttemptFn = nativeResumptionAttempt,
         .onResumptionOutcomeFn = nativeResumptionOutcome,
+        .onTicketKeyReservationAttemptFn = nativeResumptionTicketKeyReservationAttempt,
     };
+}
+
+// #520: a secret-free, fixed marker (no key material, no path) logged at
+// the exact instant `resumption_runtime.Runtime.loadPersistentTicketKeysFromFile`
+// is about to call `ticket_key_snapshot.reserveNonceLeasesInFile` -- whose
+// own first action is acquiring `${path}.lock`. `tests/integration.zig`'s
+// multi-process startup-reservation soak polls each process's own log
+// file for this marker before releasing a barrier lock it holds, so both
+// processes' real reservation attempts are forced to overlap rather than
+// merely likely to.
+fn nativeResumptionTicketKeyReservationAttempt(ctx: *anyopaque) void {
+    const state: *GatewayState = @ptrCast(@alignCast(ctx));
+    state.logger.info(null, "native TLS/QUIC persistent ticket-key reservation attempt starting", .{});
 }
 
 fn nativeResumptionTransport(transport: tls_core.resumption_runtime.Transport) http.metrics.ResumptionTransport {

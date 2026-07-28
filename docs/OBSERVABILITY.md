@@ -179,6 +179,14 @@ cluster-wide at-most-once 0-RTT must leave 0-RTT disabled** (replay mode
 configured — `process_local` must never be described or relied on as a
 substitute.
 
+This is proven live, not only asserted here: `tests/integration.zig`'s
+`soak.replay.process_local_scope` (#520) runs two real Tardigrade
+processes sharing one persistent ticket-key snapshot and replays the exact
+same ticket identity against both, showing it is legitimately accepted
+once by *each* process independently while a same-process replay is still
+rejected as a duplicate — the process-local scope this section describes,
+not a regression toward a cluster-wide guarantee.
+
 0-RTT also remains replay-exposed at the HTTP application layer regardless of
 this store's mode; the `Early-Data`/`425 Too Early` handling documented above
 (`early_data_source`/`early_data_action`/`early_data_replay_exposed`) is a
