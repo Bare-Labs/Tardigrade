@@ -6448,6 +6448,39 @@ fn currentLabeledMetric(allocator: std.mem.Allocator, port: u16, name: []const u
     return prometheusLabeledMetricValue(metrics.body, name, labels) orelse 0;
 }
 
+/// #520 heavy tier: keeps real full-handshake/ticket-issuance traffic
+/// flowing against one process for as long as `stop` is clear -- run on
+/// its own `std.Thread` so the main thread can send both SIGHUPs and poll
+/// for `reload_accepted` *while* this traffic is in flight, which is the
+/// part that can actually expose a publication/UAF/deadlock bug in the
+/// real reload path; sampling only starts after both reloads finish (the
+/// smoke tier's shape) never overlaps the race itself. Uses
+/// `std.heap.page_allocator` rather than `std.testing.allocator`: the
+/// latter is not safe to call concurrently from multiple threads, and
+/// this worker's results are only ever read by the main thread after
+/// `std.Thread.join()`, so no cross-thread synchronization on `results`
+/// itself is needed.
+const ChurnWorker = struct {
+    port: u16,
+    stop: *std.atomic.Value(bool),
+    results: std.array_list.Managed(TicketEnvelopeIds),
+
+    fn init(port: u16, stop: *std.atomic.Value(bool)) ChurnWorker {
+        return .{ .port = port, .stop = stop, .results = std.array_list.Managed(TicketEnvelopeIds).init(std.heap.page_allocator) };
+    }
+
+    fn deinit(self: *ChurnWorker) void {
+        self.results.deinit();
+    }
+
+    fn run(self: *ChurnWorker) void {
+        while (!self.stop.load(.acquire)) {
+            const ids = issueTicketIds(std.heap.page_allocator, self.port) catch continue;
+            self.results.append(ids) catch {};
+        }
+    }
+};
+
 /// #369: flips one byte inside the opaque ticket envelope of an
 /// OpenSSL-managed `-sess_out` PEM file, in place. Locates
 /// `ticket_protection`'s public, non-secret magic (`"TDTK"`) with a plain
@@ -8693,15 +8726,44 @@ test "soak.persistent.multi_process_nonce_safety" {
         },
     };
 
-    // Phase 1: genuinely concurrent startup reservation. `spawn()` returns
-    // as soon as each child is created, before either is waited on -- both
-    // are live and already racing `${ticket_keys_path}.lock` before this
-    // test ever blocks on readiness, unlike calling `start()` twice (which
-    // only ever proves *sequential* reservation).
+    // Phase 1: *forced*, not merely likely, concurrent startup reservation.
+    // `spawn()`-then-`spawn()` alone only makes concurrent reservation
+    // probable -- on an unlucky scheduling order, process A could fully
+    // complete `reserveNonceLeasesInFile()` before B ever reaches that
+    // code, and every assertion below would still pass even if
+    // `${path}.lock` serialization were entirely broken, since the two
+    // reservations happened sequentially by accident. To make the test
+    // fail deterministically if that serialization is ever removed, this
+    // test itself first acquires `${ticket_keys_path}.lock` -- the exact
+    // same `createFile(..., .lock = .exclusive)` call
+    // `ticket_key_snapshot.acquireReservationLock` uses, so it is a real
+    // OS-level advisory lock that genuinely blocks both children's own
+    // in-startup reservation attempt, not a test-only substitute. Startup
+    // evidence elsewhere in this file (`restart.persistent.ticket_survives`)
+    // shows the reservation completes before the readiness endpoint ever
+    // comes up, so holding this lock for a bounded window comfortably
+    // longer than any real process needs to reach that call guarantees, by
+    // construction, that both children are already blocked *inside* the
+    // same lock acquisition the instant this test releases it -- forcing
+    // both real reservations to begin at the same moment rather than
+    // merely hoping the scheduler interleaves them.
+    const startup_barrier_lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{ticket_keys_path});
+    defer allocator.free(startup_barrier_lock_path);
+    var startup_barrier = try compat.cwd().createFile(startup_barrier_lock_path, .{
+        .read = true,
+        .truncate = false,
+        .permissions = .fromMode(0o600),
+        .lock = .exclusive,
+    });
+
     var process_a = try TardigradeProcess.spawn(allocator, process_options);
     defer process_a.stop();
     var process_b = try TardigradeProcess.spawn(allocator, process_options);
     defer process_b.stop();
+
+    compat.sleepNs(500 * std.time.ns_per_ms);
+    startup_barrier.close();
+
     try process_a.waitReady(process_options);
     try process_b.waitReady(process_options);
 
@@ -8805,6 +8867,24 @@ test "soak.persistent.multi_process_nonce_safety" {
         const reload_accepted_before_a = try currentLabeledMetric(allocator, process_a.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""});
         const reload_accepted_before_b = try currentLabeledMetric(allocator, process_b.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""});
 
+        // Heavy tier only: keep real request/ticket-issuance traffic
+        // flowing against *both* processes for the entire duration of the
+        // reload race below, not just before/after it -- this is the part
+        // that can actually expose a publication/UAF/deadlock bug, and
+        // sampling only after both reloads finish (as the smoke tier does)
+        // never overlaps the race itself.
+        var churn_stop = std.atomic.Value(bool).init(false);
+        var churn_a: ?ChurnWorker = null;
+        var churn_b: ?ChurnWorker = null;
+        var churn_thread_a: ?std.Thread = null;
+        var churn_thread_b: ?std.Thread = null;
+        if (soakHeavyEnabled()) {
+            churn_a = ChurnWorker.init(process_a.port, &churn_stop);
+            churn_b = ChurnWorker.init(process_b.port, &churn_stop);
+            churn_thread_a = try std.Thread.spawn(.{}, ChurnWorker.run, .{&churn_a.?});
+            churn_thread_b = try std.Thread.spawn(.{}, ChurnWorker.run, .{&churn_b.?});
+        }
+
         // Sent back-to-back, without waiting between them -- both real
         // SIGHUP handlers race the shared snapshot lock concurrently.
         process_a.sendSignal(std.posix.SIG.HUP);
@@ -8812,6 +8892,31 @@ test "soak.persistent.multi_process_nonce_safety" {
 
         try waitForLabeledMetricAtLeast(allocator, process_a.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""}, reload_accepted_before_a + 1, 5_000);
         try waitForLabeledMetricAtLeast(allocator, process_b.port, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""}, reload_accepted_before_b + 1, 5_000);
+
+        if (soakHeavyEnabled()) {
+            churn_stop.store(true, .release);
+            churn_thread_a.?.join();
+            churn_thread_b.?.join();
+
+            // Every tuple observed while the reload race was in flight must
+            // belong to either the complete outgoing generation or the
+            // complete incoming one -- never a key id that is active in
+            // neither, and never a duplicate against anything else this
+            // soak has ever issued.
+            for (churn_a.?.results.items) |ids| {
+                const hex = std.fmt.bytesToHex(ids.key_id, .lower);
+                try std.testing.expect(std.mem.eql(u8, key_ids[retiring_index], &hex) or std.mem.eql(u8, key_ids[new_index], &hex));
+                try all_tuples.append(ids);
+            }
+            for (churn_b.?.results.items) |ids| {
+                const hex = std.fmt.bytesToHex(ids.key_id, .lower);
+                try std.testing.expect(std.mem.eql(u8, key_ids[retiring_index], &hex) or std.mem.eql(u8, key_ids[new_index], &hex));
+                try all_tuples.append(ids);
+            }
+            try assertNoDuplicateTicketIds(all_tuples.items);
+            churn_a.?.deinit();
+            churn_b.?.deinit();
+        }
 
         const lease_after_round = try readTicketKeyLeaseWindow(allocator, ticket_keys_path, key_ids[new_index]);
         try std.testing.expectEqual(new_generation, lease_after_round.generation);
@@ -9134,6 +9239,20 @@ test "soak.replay.process_local_scope" {
 
     var identity: usize = 0;
     while (identity < identity_count) : (identity += 1) {
+        // Per-identity metric *deltas*, captured fresh each iteration --
+        // not a cumulative `>= 1` check. With `identity_count > 1`, a
+        // cumulative check would still pass even if later identities
+        // stopped emitting replay events entirely (identity 0's own
+        // increment alone would satisfy it forever after); an exact
+        // before/after delta for each of the four actions below is the
+        // invariant #520 actually asks for. `/status/metrics` reads do not
+        // themselves create replay-store accepted/duplicate events, so
+        // these deltas are exact, not merely bounded.
+        const a_accepted_before = try currentLabeledMetric(allocator, process_a.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""});
+        const a_duplicate_before = try currentLabeledMetric(allocator, process_a.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""});
+        const b_accepted_before = try currentLabeledMetric(allocator, process_b.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""});
+        const b_duplicate_before = try currentLabeledMetric(allocator, process_b.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""});
+
         const TicketCapture = struct {
             allocator: std.mem.Allocator,
             retained: tls_core.session.ClientTicketState = .{},
@@ -9195,11 +9314,7 @@ test "soak.replay.process_local_scope" {
             try assertContains(raw, "a-early");
             try std.testing.expectEqual(@as(u32, 1), upstream_a.requestCount());
         }
-        {
-            var metrics = try sendPureZigTlsHttp1Request(allocator, process_a.port, "/status/metrics");
-            defer metrics.deinit();
-            try expectMetricAtLeast(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""}, 1);
-        }
+        try std.testing.expectEqual(a_accepted_before + 1, try currentLabeledMetric(allocator, process_a.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""}));
 
         // A, replay: the identical identity offered again to A. Rejected
         // as a duplicate -- the early bytes never reach upstream (request
@@ -9231,11 +9346,7 @@ test "soak.replay.process_local_scope" {
             try assertContains(raw, "a-after-replay");
             try std.testing.expectEqual(@as(u32, 2), upstream_a.requestCount());
         }
-        {
-            var metrics = try sendPureZigTlsHttp1Request(allocator, process_a.port, "/status/metrics");
-            defer metrics.deinit();
-            try expectMetricAtLeast(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""}, 1);
-        }
+        try std.testing.expectEqual(a_duplicate_before + 1, try currentLabeledMetric(allocator, process_a.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""}));
 
         try upstream_b.resetCapture();
 
@@ -9265,11 +9376,7 @@ test "soak.replay.process_local_scope" {
             try assertContains(raw, "b-early");
             try std.testing.expectEqual(@as(u32, 1), upstream_b.requestCount());
         }
-        {
-            var metrics = try sendPureZigTlsHttp1Request(allocator, process_b.port, "/status/metrics");
-            defer metrics.deinit();
-            try expectMetricAtLeast(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""}, 1);
-        }
+        try std.testing.expectEqual(b_accepted_before + 1, try currentLabeledMetric(allocator, process_b.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"accepted\""}));
 
         // B, replay: rejected as a duplicate too, same as A above.
         {
@@ -9297,11 +9404,7 @@ test "soak.replay.process_local_scope" {
             try assertContains(raw, "b-after-replay");
             try std.testing.expectEqual(@as(u32, 2), upstream_b.requestCount());
         }
-        {
-            var metrics = try sendPureZigTlsHttp1Request(allocator, process_b.port, "/status/metrics");
-            defer metrics.deinit();
-            try expectMetricAtLeast(metrics.body, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""}, 1);
-        }
+        try std.testing.expectEqual(b_duplicate_before + 1, try currentLabeledMetric(allocator, process_b.port, "tardigrade_tls_early_data_replay_total", &.{"outcome=\"duplicate\""}));
 
         try upstream_a.resetCapture();
         try upstream_b.resetCapture();
