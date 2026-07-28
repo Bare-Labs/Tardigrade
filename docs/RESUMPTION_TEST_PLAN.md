@@ -375,6 +375,8 @@ passed before it.
   credential-reload path that preserves the resumption runtime (currently
   forbidden under the appliance profile) or a persistent keyring across
   restart (not a production capability today — see Rotation below).
+  **Closed by #519's `rotation.persistent.certificate_binding_change`**,
+  once the persistent keyring became a real production capability (#513).
 - **Independent QUIC/H3 external interop for resumption/0-RTT.** The repo
   has real external QUIC/H3 tooling (`scripts/interop/run-interop.sh` +
   `tests/h3_interop_tool.zig`, driving ngtcp2/quiche/aioquic peers) that a
@@ -396,6 +398,10 @@ passed before it.
   narrowly-scoped production-composition follow-up this needs before
   #369's rotation rows can close; #369's operational rotation matrix stays
   blocked on it, the same way #369's 0-RTT rows stay blocked on #510.
+  **Closed by #512/#513 (production composition) and #519 (this doc's
+  Slice 4, the composed operational proof against it)** — kept here
+  unedited as the historical record of what was true when this slice
+  shipped.
 - **Deterministic worker-thread-pinning test seam** (carried over from
   Slice 2, unchanged): #369 Slice 2 proves the process-shared replay-store
   guarantee across independent per-connection state, not through real OS
@@ -415,3 +421,111 @@ rejected-0-RTT interop, replay-store cross-worker proof under real
 routing) or on persistent rotation remain open. #369 is not complete
 after this slice; the honest remainder is the corrected #510 scope plus
 the items above.
+
+## Slice 4 (#519): persistent ticket-key restart, rotation, reload
+atomicity, and certificate binding
+
+This slice closes the "Rotation / persistent-overlap key policy" gap Slice
+3 documented above as Outcome B: **#513** landed the actual production
+composition (`TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH`, `ReloadableKeyRing`
+wired into the shared native resumption runtime, SIGHUP reload of the
+snapshot). #519 is the operational proof against that real, running
+composition — real process restarts and real SIGHUPs, not the
+`resumption_runtime.zig`/`ticket_protection.zig` unit suites `#512` already
+added (which this slice reuses, not duplicates).
+
+All four new cases live in `tests/integration.zig`, gated by
+`requireNativeTlsProfile()` like every other case in this section — they
+only run under the appliance TLS profile build, the only profile with a
+native (non-OpenSSL-adapter) resumption runtime today.
+
+- **`restart.persistent.ticket_survives`** — a real process A issues a
+  stateless ticket under a persistent snapshot; a real process B, started
+  from the *same* on-disk snapshot with no manual lease editing, durably
+  reserves its own disjoint nonce-lease window before issuing anything
+  (asserted directly against the file's own `nonce_lease.start`/
+  `end_exclusive`, before and after each process starts), resumes A's
+  still-valid ticket, and issues its own fresh ticket whose (key_id, nonce)
+  is asserted distinct from every A-issued tuple — proven structurally via
+  the disjoint lease windows, not merely "happened to differ once".
+- **`rotation.persistent.n_to_n_plus_1`** — a real SIGHUP drives generation
+  N → N+1: the old N ticket resumes during the overlap grace window, a
+  freshly issued ticket uses only N+1, and — composing the live
+  `encrypt_until`/`decrypt_until` boundary pair, not just asserting the
+  reload succeeded — a bounded real sleep past N's `decrypt_until` proves N
+  stops resolving at all afterward (`miss`, not a second `accepted`).
+  `not_before` and the `session.issued_at + lifetime` boundary are not
+  re-proven here: both are exact single-key timing facts `#512`'s own unit
+  suite and `interop.openssl.ticket.expired` already cover end to end, and
+  neither depends on rotation itself.
+  - **Real production hazard found while writing this**: naively carrying
+    a retiring key forward into the new generation with its *same* declared
+    `nonce_lease` range (the range recorded in the file after the previous
+    generation's own durable reservation) is rejected with
+    `OverlappingNonceLease` — `ReloadableKeyRing`'s per-key-id ledger
+    permanently remembers the full declared width of every lease a key was
+    ever installed with, not merely how far its counter actually advanced.
+    A retiring key (`encrypt_until` already past) needs no lease at all
+    going forward, matching the shape `resumption_runtime.zig`'s own
+    `#512` rotation unit test already uses (`nonce_lease: null` for the
+    rotated-out key) — operator rotation tooling must do the same, not
+    replay a stale range.
+- **`rotation.persistent.failed_reload_keeps_old_state`** — four
+  representative rejected-reload classes (a replacement unreadable at the
+  configured path, malformed JSON, a semantically invalid keyring via an
+  invalid nonce lease, and a stale generation number) each leave a
+  previously issued ticket still resuming and the reload metrics recording
+  a bounded, secret-free failure outcome. A ticket issued only *after* all
+  four rejections still seals under the original key id, proving nothing
+  was partially applied across any of them.
+  - **Finding**: this test does *not* additionally bundle a TLS credential
+    change into a failing SIGHUP, as originally planned. Inspecting
+    `edge_gateway.run`/`gateway_shutdown.hotReloadConfig` shows the
+    appliance TLS profile's real served identity
+    (`appliance_credentials.ApplianceCredentials`) is loaded once at
+    startup and is never touched by any reload path — the
+    `NativeCredentialStore` two-phase prepare/commit mechanism this
+    criterion was written against exists, but only on the non-appliance
+    code path, which `requireNativeTlsProfile()` excludes here. What this
+    test does show, honestly: every one of its sub-cases leaves the one
+    credential this process ever serves — and the ticket bound to it —
+    both visibly untouched, even though none of them ever attempts to
+    change it.
+- **`rotation.persistent.certificate_binding_change`** — closes the gap
+  Slice 3's `restart.restart_and_credential_change.ticket_rejected` doc
+  comment explicitly left open ("[proving certificate/auth-binding
+  rejection] needs ... a persistent keyring surviving a restart, [which does
+  not exist] in production today"). It now does (#513), so this is a
+  restart (not reload, per the finding above): process A issues a ticket
+  under credential A; process B restarts from the *same* ticket-key
+  snapshot under a different credential B. B can genuinely decrypt A's
+  ticket (unlike the ephemeral-key restart cases), so the rejection is
+  provably `session.evaluateCompatibility`'s `auth_binding` check, not an
+  unknown-key miss: `tls13_backend.selectPsk` only records the
+  `incompatible` resumption outcome (as opposed to `miss`) for an identity
+  that actually resolved, and this run's `tardigrade_tls_ticket_resolve_total
+  {result="success"}` confirms the decrypt itself succeeded. The connection
+  still completes via a safe full handshake.
+
+### CI
+
+`build.zig`'s `test-integration-resumption-interop` step's filter list
+gained a `rotation.` prefix alongside the existing `interop.`/`restart.`/
+`soak.` ones, so these cases get the same macOS coverage (where the full
+`test-integration` suite is deliberately skipped — see `ci.yml`) the
+`restart.*` cases already had.
+
+## Explicitly deferred beyond this slice (still open after #519)
+
+- **Persistent-key rotation soak / worker-thread-pinning / cross-worker
+  anti-replay under real routing** — unchanged from Slice 3's equivalent
+  bullets above; #519 proves single-worker-process rotation correctness,
+  not concurrent multi-worker rotation or the worker-pinning seam those
+  need.
+- **General (non-appliance) profile credential-reload two-phase atomicity**
+  — `gateway_shutdown.hotReloadConfig`'s `NativeCredentialStore` prepare/
+  commit path is real production code, but exercising it needs a non-
+  appliance native-TLS test configuration this file's persistent-ticket-key
+  cases don't build under (`requireNativeTlsProfile()` is appliance-only).
+  Not attempted here; a future slice targeting the general profile
+  specifically would need its own harness path.

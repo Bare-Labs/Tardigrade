@@ -6112,6 +6112,7 @@ fn assertHexAbsentCaseInsensitive(allocator: std.mem.Allocator, haystack: []cons
 }
 
 const persistent_ticket_key_fixture_hex = "101112131415161718191a1b1c1d1e1f";
+const persistent_ticket_key_fixture_id_hex = "000102030405060708090a0b0c0d0e0f";
 
 fn persistentTicketKeySnapshotPath(allocator: std.mem.Allocator, port: u16, tag: []const u8) ![]u8 {
     const dir = try interopSecretsDir(allocator);
@@ -6131,6 +6132,129 @@ fn writePersistentTicketKeySnapshot(allocator: std.mem.Allocator, path: []const 
         allocator.free(snapshot);
     }
     try writeInteropSecretFile(path, snapshot);
+}
+
+/// #519: one key entry for a hand-built multi-key persistent snapshot file
+/// (`writePersistentTicketKeySnapshotKeys`), used where the fixed single-key
+/// `writePersistentTicketKeySnapshot` above (generation 1, one wide-open
+/// validity window) can't express what a test needs: distinct not_before/
+/// encrypt_until/decrypt_until windows per key (rotation overlap), or a
+/// deliberately invalid nonce lease (failed-reload coverage).
+const TicketKeyLeaseFixture = struct {
+    prefix_hex: []const u8,
+    start: u64,
+    end_exclusive: u64,
+};
+
+const TicketKeyFixture = struct {
+    id_hex: []const u8,
+    key_hex: []const u8,
+    not_before_unix_ms: i64,
+    encrypt_until_unix_ms: i64,
+    decrypt_until_unix_ms: i64,
+    // `null` for a key that must never encrypt again (a retiring key
+    // carried forward into a new generation decrypt-only, its
+    // `encrypt_until` already in the past): `ReloadableKeyRing`'s per-key-id
+    // ledger records the *full declared width* of every nonce lease a key
+    // was ever installed with as that key's permanent high-water mark, not
+    // merely how far its counter actually advanced -- so replaying the same
+    // (or any non-advanced) lease range for a key that already used it in a
+    // prior generation is rejected as `OverlappingNonceLease`, even though
+    // it is the very same key, unchanged. A retiring key has no need to
+    // encrypt again, so it needs no lease at all; this is exactly the shape
+    // `persistentKeyConfig(&key_n, ..., null)` uses for the rotated-out key
+    // in `resumption_runtime.zig`'s own "#512 ... rotates, and retires old
+    // tickets" unit test.
+    nonce_lease: ?TicketKeyLeaseFixture = null,
+};
+
+fn writePersistentTicketKeySnapshotKeys(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    generation: u64,
+    keys: []const TicketKeyFixture,
+) !void {
+    var out = std.array_list.Managed(u8).init(allocator);
+    defer {
+        std.crypto.secureZero(u8, out.items);
+        out.deinit();
+    }
+    try out.print("{{\"version\":1,\"generation\":{d},\"keys\":[", .{generation});
+    for (keys, 0..) |k, i| {
+        if (i > 0) try out.append(',');
+        try out.print(
+            "{{\"id\":\"{s}\",\"aead\":\"aes_128_gcm\",\"key\":\"{s}\",\"not_before_unix_ms\":{d},\"encrypt_until_unix_ms\":{d},\"decrypt_until_unix_ms\":{d}",
+            .{ k.id_hex, k.key_hex, k.not_before_unix_ms, k.encrypt_until_unix_ms, k.decrypt_until_unix_ms },
+        );
+        if (k.nonce_lease) |lease| {
+            try out.print(
+                ",\"nonce_lease\":{{\"prefix\":\"{s}\",\"start\":{d},\"end_exclusive\":{d}}}",
+                .{ lease.prefix_hex, lease.start, lease.end_exclusive },
+            );
+        }
+        try out.append('}');
+    }
+    try out.appendSlice("]}");
+    try writeInteropSecretFile(path, out.items);
+}
+
+/// #519: the durable, file-backed lease window `reserveNonceLeasesInFile`
+/// (`ticket_key_snapshot.zig`) advances on every accepted startup/reload --
+/// read back here, by key id, so `restart.persistent.ticket_survives` can
+/// assert two independent process incarnations actually reserved disjoint
+/// windows from the same on-disk file, rather than merely asserting each
+/// process *worked*.
+const LeaseWindow = struct { generation: u64, start: u64, end_exclusive: u64 };
+
+fn readTicketKeyLeaseWindow(allocator: std.mem.Allocator, path: []const u8, id_hex: []const u8) !LeaseWindow {
+    const bytes = try compat.cwd().readFileAlloc(allocator, path, 64 * 1024);
+    defer {
+        std.crypto.secureZero(u8, bytes);
+        allocator.free(bytes);
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const generation: u64 = @intCast(root.get("generation").?.integer);
+    const keys = root.get("keys").?.array.items;
+    for (keys) |key_value| {
+        const key_obj = key_value.object;
+        const id = (key_obj.get("id") orelse continue).string;
+        if (!std.ascii.eqlIgnoreCase(id, id_hex)) continue;
+        const lease = (key_obj.get("nonce_lease") orelse continue).object;
+        return .{
+            .generation = generation,
+            .start = @intCast(lease.get("start").?.integer),
+            .end_exclusive = @intCast(lease.get("end_exclusive").?.integer),
+        };
+    }
+    return error.KeyIdNotFound;
+}
+
+/// #519: `ticket_protection.parseEnvelope`'s own fixed field offsets (magic
+/// [0..4], version[4], aead[5], reserved[6..8], key_id[8..24], nonce
+/// [24..36]) applied directly to a captured `ClientTicketState.ticket`'s raw
+/// bytes -- the same public, non-secret envelope metadata
+/// `tamperOpensslTicketFile` above locates by magic search, not the AEAD
+/// ciphertext/tag that follows it. Used to prove restart/rotation lease
+/// disjointness at the (key_id, nonce) granularity #519 asks for, without
+/// ever inspecting the encrypted session state itself.
+// `ticket_protection.zig`'s internal `provider.aead_nonce_len` (12, for the
+// `aes_128_gcm` suite every fixture in this file uses) isn't re-exported
+// through `tls_core`; the envelope's fixed field width is stable regardless.
+const ticket_nonce_len = 12;
+
+const TicketEnvelopeIds = struct {
+    key_id: [tls_core.ticket_protection.key_id_len]u8,
+    nonce: [ticket_nonce_len]u8,
+};
+
+fn extractTicketEnvelopeIds(ticket: *const tls_core.session.ClientTicketState) TicketEnvelopeIds {
+    const raw = ticket.ticket.slice();
+    var out: TicketEnvelopeIds = undefined;
+    @memcpy(&out.key_id, raw[8..24]);
+    @memcpy(&out.nonce, raw[24..36]);
+    return out;
 }
 
 /// #369: flips one byte inside the opaque ticket envelope of an
@@ -6811,6 +6935,884 @@ test "restart.restart_and_credential_change.ticket_rejected" {
         "transport=\"record\"",
         "outcome=\"accepted\"",
     }) orelse 0);
+}
+
+// #519: the composed production proof `restart.persistent.early_startup_
+// quarantine` (#513/#369) does not cover -- that test only proves the
+// *quarantine* boundary survives a restart. This proves the persistent
+// ticket-key policy's actual headline guarantee: a real process restart,
+// against the same on-disk snapshot with *no manual lease editing*, both
+// preserves an already-issued ticket's resumability and durably reserves a
+// disjoint nonce-lease window before the fresh process ever issues its own
+// ticket -- so the two processes can never emit a colliding (key_id, nonce)
+// AEAD nonce for the same key, even though both share the identical
+// long-lived secret key material.
+test "restart.persistent.ticket_survives" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const key_path_probe_port = try findFreePort();
+    const ticket_keys_path = try persistentTicketKeySnapshotPath(allocator, key_path_probe_port, "persistent-restart-survives");
+    defer allocator.free(ticket_keys_path);
+    defer compat.cwd().deleteFile(ticket_keys_path) catch {};
+    defer {
+        const lock_path = std.fmt.allocPrint(allocator, "{s}.lock", .{ticket_keys_path}) catch null;
+        if (lock_path) |path| {
+            compat.cwd().deleteFile(path) catch {};
+            allocator.free(path);
+        }
+    }
+    try writePersistentTicketKeySnapshot(allocator, ticket_keys_path);
+
+    const config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+    ;
+    const extra_env = &[_]EnvPair{
+        .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+        .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+        .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH", .value = ticket_keys_path },
+    };
+
+    // Ground truth before any process exists: `writePersistentTicketKeySnapshot`'s
+    // own fixture lease window (see its literal above).
+    const before_any_start = try readTicketKeyLeaseWindow(allocator, ticket_keys_path, persistent_ticket_key_fixture_id_hex);
+    try std.testing.expectEqual(@as(u64, 0), before_any_start.start);
+    try std.testing.expectEqual(@as(u64, 4096), before_any_start.end_exclusive);
+
+    // 2: start process A. Startup alone (`loadPersistentTicketKeysFromFile`,
+    // reached because no fingerprint is installed yet) durably reserves A's
+    // issuance lease in the file before any connection exists.
+    var process_a = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = extra_env,
+    });
+    var process_a_running = true;
+    defer if (process_a_running) process_a.stop();
+
+    const after_a_start = try readTicketKeyLeaseWindow(allocator, ticket_keys_path, persistent_ticket_key_fixture_id_hex);
+    try std.testing.expectEqual(before_any_start.end_exclusive, after_a_start.start);
+    try std.testing.expect(after_a_start.end_exclusive > after_a_start.start);
+
+    // 2 (continued): issue a real stateless ticket from A, capturing only
+    // the public envelope metadata (key id, nonce) #519 asks for -- never
+    // the AEAD ciphertext/tag, and never logged.
+    const TicketCapture = struct {
+        allocator: std.mem.Allocator,
+        retained: tls_core.session.ClientTicketState = .{},
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.retained.deinit();
+            self.retained = .{};
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+        }
+    };
+
+    var capture_a = TicketCapture{ .allocator = allocator };
+    defer capture_a.retained.deinit();
+
+    const client_a = try PureZigTlsClient.createWithOptions(allocator, process_a.port, "http/1.1", "tardigrade.test", .{
+        .ticket_consumer = .{
+            .ctx = &capture_a,
+            .nowUnixMsFn = TicketCapture.now,
+            .onTicketFn = TicketCapture.onTicket,
+        },
+    });
+    defer client_a.destroy();
+    try client_a.writeAllPlain(openssl_health_request);
+    const a_raw = try client_a.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(a_raw);
+    try assertContains(a_raw, "HTTP/1.1 200 OK");
+    try std.testing.expect(capture_a.retained.ticket.slice().len > 0);
+
+    var ticket_a: tls_core.session.ClientTicketState = .{};
+    defer ticket_a.deinit();
+    try capture_a.retained.cloneInto(allocator, &ticket_a);
+    const ids_a = extractTicketEnvelopeIds(&ticket_a);
+
+    // 3: terminate A -- a real process boundary.
+    process_a.stop();
+    process_a_running = false;
+
+    // 4: start B from the same on-disk snapshot, same env, no manual lease
+    // edits of any kind.
+    var process_b = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = extra_env,
+    });
+    defer process_b.stop();
+
+    // 5: B's own startup must have reserved a *new, non-overlapping* lease
+    // window -- durable, file-backed state, not merely "B also works".
+    const after_b_start = try readTicketKeyLeaseWindow(allocator, ticket_keys_path, persistent_ticket_key_fixture_id_hex);
+    try std.testing.expectEqual(after_a_start.end_exclusive, after_b_start.start);
+    try std.testing.expect(after_b_start.start >= after_a_start.end_exclusive);
+    try std.testing.expect(after_b_start.end_exclusive > after_b_start.start);
+
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2_500;
+        }
+    };
+
+    // 6-7: A's still-valid ticket resumes on B -- the persistent key
+    // decrypts it even though B never shared any in-memory state with A.
+    var offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket_a);
+    errdefer offers.deinit();
+    const resumed_client = try PureZigTlsClient.createWithOptions(allocator, process_b.port, "http/1.1", "tardigrade.test", .{
+        .psk_offers = &offers,
+        .psk_now_ctx = &clock_dummy,
+        .psk_now_fn = ClientClock.now,
+    });
+    defer resumed_client.destroy();
+    try std.testing.expect(resumed_client.backend.core.psk_authenticated);
+    try resumed_client.writeAllPlain(openssl_health_request);
+    const resumed_raw = try resumed_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(resumed_raw);
+    try assertContains(resumed_raw, "HTTP/1.1 200 OK");
+
+    var resume_metrics = try sendPureZigTlsHttp1Request(allocator, process_b.port, "/status/metrics");
+    defer resume_metrics.deinit();
+    try expectMetricAtLeast(resume_metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"record\"", "outcome=\"accepted\"" }, 1);
+
+    // 8-9: B issues its own fresh ticket. Same key (only one key in this
+    // fixture, so key_id must match), but its nonce must be distinct from
+    // every A-issued nonce -- guaranteed structurally by step 5's disjoint
+    // lease windows, and asserted directly here at the wire-visible
+    // (key_id, nonce) granularity #519 asks for.
+    var capture_b = TicketCapture{ .allocator = allocator };
+    defer capture_b.retained.deinit();
+    const client_b = try PureZigTlsClient.createWithOptions(allocator, process_b.port, "http/1.1", "tardigrade.test", .{
+        .ticket_consumer = .{
+            .ctx = &capture_b,
+            .nowUnixMsFn = TicketCapture.now,
+            .onTicketFn = TicketCapture.onTicket,
+        },
+    });
+    defer client_b.destroy();
+    try client_b.writeAllPlain(openssl_health_request);
+    const b_raw = try client_b.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(b_raw);
+    try assertContains(b_raw, "HTTP/1.1 200 OK");
+
+    const ids_b = extractTicketEnvelopeIds(&capture_b.retained);
+    try std.testing.expectEqualSlices(u8, &ids_a.key_id, &ids_b.key_id);
+    try std.testing.expect(!std.mem.eql(u8, &ids_a.nonce, &ids_b.nonce));
+    // The nonce's low 8 bytes are the per-key counter `NonceLease.reserve`
+    // draws from (see the fixed 4-byte prefix + big-endian counter format);
+    // B's counter must fall inside B's own reserved window, not merely
+    // "differ from A's one sample" -- a stronger, non-coincidental proof of
+    // disjointness.
+    const b_nonce_counter = std.mem.readInt(u64, ids_b.nonce[4..12], .big);
+    try std.testing.expect(b_nonce_counter >= after_b_start.start and b_nonce_counter < after_b_start.end_exclusive);
+}
+
+// #519: drives the real SIGHUP config-reload path (the same one `location
+// block reload takes effect for new requests after sighup` above uses) to
+// rotate a persistent stateless keyring from generation N to N+1 on a live
+// process, composing what `resumption_runtime.zig`'s own in-process unit
+// suite (`#512 persistent stateless runtime loads configured keys, rotates,
+// and retires old tickets`, etc.) already proves against a bare `Runtime`
+// with an injected clock, into the real production reload path with a real
+// wall clock. Also composes the `encrypt_until`/`decrypt_until` boundary
+// pair live: N's `encrypt_until` is already in the past at the moment N+1
+// is installed (so it never re-encrypts), and N's `decrypt_until` is a
+// short, deterministic few seconds out so a real (bounded) sleep can prove
+// the grace window actually closes. `not_before` and the
+// `session.issued_at + lifetime` boundary are deliberately not re-proven
+// here: both are exact single-key timing facts already covered end to end
+// (`not_before` by `#512`'s own unit suite; ticket-lifetime expiry by
+// `interop.openssl.ticket.expired`) and neither depends on rotation itself.
+test "rotation.persistent.n_to_n_plus_1" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const key_path_probe_port = try findFreePort();
+    const ticket_keys_path = try persistentTicketKeySnapshotPath(allocator, key_path_probe_port, "persistent-rotation-n-to-np1");
+    defer allocator.free(ticket_keys_path);
+    defer compat.cwd().deleteFile(ticket_keys_path) catch {};
+    defer {
+        const lock_path = std.fmt.allocPrint(allocator, "{s}.lock", .{ticket_keys_path}) catch null;
+        if (lock_path) |path| {
+            compat.cwd().deleteFile(path) catch {};
+            allocator.free(path);
+        }
+    }
+
+    const key_n_id = "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
+    const key_n_secret = "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1";
+    const key_np1_id = "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0";
+    const key_np1_secret = "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2";
+
+    // A ticket only seals successfully when the sealing key's own
+    // `decrypt_until` outlives the session's `issued_at + ticket_lifetime`
+    // (`ticket_protection.ticketExpiresWithinKey`) -- a real, independent
+    // validity constraint from anything this test otherwise controls. The
+    // default ticket lifetime is 24h, so the short, deterministic key
+    // windows this rotation test needs (seconds, not hours) require an
+    // explicit short ticket lifetime too, or every issuance would silently
+    // fail closed with `TicketOutlivesKey` before ever reaching the wire.
+    const gen1_now = compat.milliTimestamp();
+    try writePersistentTicketKeySnapshotKeys(allocator, ticket_keys_path, 1, &.{
+        .{
+            .id_hex = key_n_id,
+            .key_hex = key_n_secret,
+            .not_before_unix_ms = gen1_now - 60_000,
+            .encrypt_until_unix_ms = gen1_now + 90_000,
+            .decrypt_until_unix_ms = gen1_now + 90_000,
+            .nonce_lease = .{ .prefix_hex = "e3000000", .start = 0, .end_exclusive = 1_000_000 },
+        },
+    });
+
+    const config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+    ;
+    const extra_env = &[_]EnvPair{
+        .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+        .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+        .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH", .value = ticket_keys_path },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_LIFETIME_SECONDS", .value = "30" },
+    };
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = extra_env,
+    });
+    defer tardigrade.stop();
+
+    const RotationTicketCapture = struct {
+        allocator: std.mem.Allocator,
+        retained: tls_core.session.ClientTicketState = .{},
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.retained.deinit();
+            self.retained = .{};
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+        }
+    };
+
+    // 1-2: obtain a real ticket under generation N.
+    var capture_n = RotationTicketCapture{ .allocator = allocator };
+    defer capture_n.retained.deinit();
+    {
+        const client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+            .ticket_consumer = .{ .ctx = &capture_n, .nowUnixMsFn = RotationTicketCapture.now, .onTicketFn = RotationTicketCapture.onTicket },
+        });
+        defer client.destroy();
+        try client.writeAllPlain(openssl_health_request);
+        const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(raw);
+        try assertContains(raw, "HTTP/1.1 200 OK");
+    }
+    var ticket_n: tls_core.session.ClientTicketState = .{};
+    defer ticket_n.deinit();
+    try capture_n.retained.cloneInto(allocator, &ticket_n);
+    const ids_n = extractTicketEnvelopeIds(&ticket_n);
+    try std.testing.expectEqualStrings(key_n_id, &std.fmt.bytesToHex(ids_n.key_id, .lower));
+
+    // 3: atomically replace the configured snapshot with N+1 while retaining
+    // N decrypt-only for a short, deterministic grace window. N's own
+    // `encrypt_until` is already in the past at this moment, so it can never
+    // be selected to encrypt a new ticket again from here on -- and since it
+    // will never encrypt again, it carries forward with `nonce_lease =
+    // null` rather than replaying its original (or any) lease range: the
+    // keyring's per-key-id ledger permanently remembers the full declared
+    // width of every lease a key was ever installed with, so replaying any
+    // such range for a key that already used it in a prior generation is
+    // rejected as `OverlappingNonceLease`, even for the very same,
+    // unchanged key. See `TicketKeyFixture.nonce_lease`'s doc comment.
+    const gen2_now = compat.milliTimestamp();
+    const grace_window_ms: i64 = 5_000;
+    try writePersistentTicketKeySnapshotKeys(allocator, ticket_keys_path, 2, &.{
+        .{
+            .id_hex = key_n_id,
+            .key_hex = key_n_secret,
+            .not_before_unix_ms = gen1_now - 60_000,
+            .encrypt_until_unix_ms = gen2_now - 100,
+            .decrypt_until_unix_ms = gen2_now + grace_window_ms,
+        },
+        .{
+            .id_hex = key_np1_id,
+            .key_hex = key_np1_secret,
+            .not_before_unix_ms = gen2_now - 100,
+            .encrypt_until_unix_ms = gen2_now + 60_000,
+            .decrypt_until_unix_ms = gen2_now + 60_000,
+            .nonce_lease = .{ .prefix_hex = "f4000000", .start = 0, .end_exclusive = 1_000_000 },
+        },
+    });
+
+    // 4: trigger the real production reload path.
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    compat.sleepNs(300 * std.time.ns_per_ms);
+
+    var reload_metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer reload_metrics.deinit();
+    try expectMetricAtLeast(reload_metrics.body, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_accepted\""}, 1);
+
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2_500;
+        }
+    };
+
+    // 5: the old N ticket resumes during the overlap grace window.
+    // `ClientPskOfferSet.push` *moves* its argument (zero-valued on
+    // success), and `ticket_n` is offered again below after the grace
+    // window closes -- so each offer pushes a fresh clone, never `ticket_n`
+    // itself.
+    {
+        var offer_clone: tls_core.session.ClientTicketState = .{};
+        defer offer_clone.deinit();
+        try ticket_n.cloneInto(allocator, &offer_clone);
+        var offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+        try offers.push(&offer_clone);
+        errdefer offers.deinit();
+        const client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+            .psk_offers = &offers,
+            .psk_now_ctx = &clock_dummy,
+            .psk_now_fn = ClientClock.now,
+        });
+        defer client.destroy();
+        try std.testing.expect(client.backend.core.psk_authenticated);
+        try client.writeAllPlain(openssl_health_request);
+        const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(raw);
+        try assertContains(raw, "HTTP/1.1 200 OK");
+    }
+    var mid_metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer mid_metrics.deinit();
+    const accepted_during_overlap = prometheusLabeledMetricValue(mid_metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"record\"", "outcome=\"accepted\"" }) orelse 0;
+    try std.testing.expect(accepted_during_overlap >= 1);
+
+    // 6: newly issued tickets use N+1 only.
+    var capture_np1 = RotationTicketCapture{ .allocator = allocator };
+    defer capture_np1.retained.deinit();
+    {
+        const client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+            .ticket_consumer = .{ .ctx = &capture_np1, .nowUnixMsFn = RotationTicketCapture.now, .onTicketFn = RotationTicketCapture.onTicket },
+        });
+        defer client.destroy();
+        try client.writeAllPlain(openssl_health_request);
+        const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(raw);
+        try assertContains(raw, "HTTP/1.1 200 OK");
+    }
+    const ids_np1 = extractTicketEnvelopeIds(&capture_np1.retained);
+    try std.testing.expectEqualStrings(key_np1_id, &std.fmt.bytesToHex(ids_np1.key_id, .lower));
+    try std.testing.expect(!std.mem.eql(u8, &ids_np1.key_id, &ids_n.key_id));
+
+    // 7: wait past N's `decrypt_until` grace boundary, then prove retired N
+    // is never used for new encryption *and* no longer resolves at all --
+    // composing the live decrypt_until boundary itself, not merely
+    // asserting the reload succeeded.
+    compat.sleepNs(@as(u64, @intCast(grace_window_ms)) * std.time.ns_per_ms + 2 * std.time.ns_per_s);
+
+    {
+        var offer_clone: tls_core.session.ClientTicketState = .{};
+        defer offer_clone.deinit();
+        try ticket_n.cloneInto(allocator, &offer_clone);
+        var offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+        try offers.push(&offer_clone);
+        errdefer offers.deinit();
+        const client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+            .psk_offers = &offers,
+            .psk_now_ctx = &clock_dummy,
+            .psk_now_fn = ClientClock.now,
+        });
+        defer client.destroy();
+        // The retired key is gone entirely, not merely "not preferred": a
+        // full handshake, not a second resumption, must serve this request.
+        try std.testing.expect(!client.backend.core.psk_authenticated);
+        try client.writeAllPlain(openssl_health_request);
+        const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(raw);
+        try assertContains(raw, "HTTP/1.1 200 OK");
+    }
+
+    var final_metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer final_metrics.deinit();
+    try expectMetricAtLeast(final_metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"record\"", "outcome=\"miss\"" }, 1);
+    // The overlap-window accept count must not have grown from this last,
+    // post-grace-window offer -- it really did fall back, not resume again.
+    try std.testing.expectEqual(accepted_during_overlap, prometheusLabeledMetricValue(final_metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"record\"", "outcome=\"accepted\"" }) orelse 0);
+}
+
+// #519: representative failure classes for a SIGHUP reload attempt against
+// a live process running persistent ticket keys -- not an exhaustive replay
+// of every `ticket_key_snapshot.zig` malformed-input unit case (those stay
+// there), but the composed proof that a rejected candidate at each class
+// never disturbs the live keyring, config, or credential: an
+// already-issued ticket keeps resuming across every rejected attempt, a
+// ticket issued only *after* every attempt still uses the original key
+// (nothing partially applied), and the reload metric records a bounded,
+// secret-free failure outcome each time.
+//
+// This test does not additionally attempt to bundle a TLS credential change
+// into a failing SIGHUP: `requireNativeTlsProfile` gates every test in this
+// file to the appliance TLS profile build (the only profile where
+// `build_options.tls_openssl_adapter` is false), and inspecting
+// `edge_gateway.run`/`gateway_shutdown.hotReloadConfig` shows the appliance
+// profile's real served identity (`appliance_credentials.ApplianceCredentials`,
+// held in `appliance_identity`) is loaded once at startup and never touched
+// by `hotReloadConfig` at all -- the `native_credentials`/`NativeCredentialStore`
+// two-phase prepare/commit path this criterion originally had in mind is
+// wired up only for the non-appliance code path (`native_tls_provider`/
+// `h3_credential_provider` construction in `edge_gateway.zig` explicitly
+// branches on `edge_config.is_appliance_tls_profile`), so it is never
+// reachable here. `rotation.persistent.certificate_binding_change` below
+// proves the credential side of this instead, through the restart
+// composition the appliance profile *does* support for credential changes.
+// What this test still demonstrates, honestly: every sub-case below leaves
+// `ticket0` (bound to the one credential this process ever serves)
+// resuming successfully, so the previous certificate credential and the
+// previous ticket state both visibly survive every rejected reload here,
+// even though none of these attempts ever touches the credential itself.
+test "rotation.persistent.failed_reload_keeps_old_state" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    const key_path_probe_port = try findFreePort();
+    const ticket_keys_path = try persistentTicketKeySnapshotPath(allocator, key_path_probe_port, "persistent-failed-reload");
+    defer allocator.free(ticket_keys_path);
+    defer compat.cwd().deleteFile(ticket_keys_path) catch {};
+    defer {
+        const lock_path = std.fmt.allocPrint(allocator, "{s}.lock", .{ticket_keys_path}) catch null;
+        if (lock_path) |path| {
+            compat.cwd().deleteFile(path) catch {};
+            allocator.free(path);
+        }
+    }
+
+    const k0_id = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
+    const k0_secret = "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5";
+    const baseline_now = compat.milliTimestamp();
+    try writePersistentTicketKeySnapshotKeys(allocator, ticket_keys_path, 5, &.{
+        .{
+            .id_hex = k0_id,
+            .key_hex = k0_secret,
+            .not_before_unix_ms = baseline_now - 60_000,
+            .encrypt_until_unix_ms = baseline_now + 3_600_000,
+            .decrypt_until_unix_ms = baseline_now + 3_600_000,
+            .nonce_lease = .{ .prefix_hex = "11110000", .start = 0, .end_exclusive = 1_000_000 },
+        },
+    });
+
+    const config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+    ;
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+            .{ .name = "TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH", .value = ticket_keys_path },
+            // See `ticketExpiresWithinKey` in `ticket_protection.zig`: a
+            // ticket only seals when the key's own `decrypt_until` outlives
+            // `issued_at + ticket_lifetime`. The default lifetime is 24h,
+            // far beyond this fixture's deliberately short 1h key window.
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_LIFETIME_SECONDS", .value = "60" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var baseline_metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+    defer baseline_metrics.deinit();
+    try expectMetricAtLeast(baseline_metrics.body, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"initial_load_success\""}, 1);
+
+    const FailedReloadTicketCapture = struct {
+        allocator: std.mem.Allocator,
+        retained: tls_core.session.ClientTicketState = .{},
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.retained.deinit();
+            self.retained = .{};
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+        }
+    };
+
+    var capture0 = FailedReloadTicketCapture{ .allocator = allocator };
+    defer capture0.retained.deinit();
+    {
+        const client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+            .ticket_consumer = .{ .ctx = &capture0, .nowUnixMsFn = FailedReloadTicketCapture.now, .onTicketFn = FailedReloadTicketCapture.onTicket },
+        });
+        defer client.destroy();
+        try client.writeAllPlain(openssl_health_request);
+        const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(raw);
+        try assertContains(raw, "HTTP/1.1 200 OK");
+    }
+    var ticket0: tls_core.session.ClientTicketState = .{};
+    defer ticket0.deinit();
+    try capture0.retained.cloneInto(allocator, &ticket0);
+
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2_500;
+        }
+    };
+
+    // Offers `ticket0` against the live process and asserts it still
+    // resumes (real PSK authentication plus a real HTTP round-trip) --
+    // proof that the previously valid ticket state was untouched by
+    // whatever rejected reload attempt preceded this call.
+    const assertTicket0StillResumes = struct {
+        fn run(alloc: std.mem.Allocator, port: u16, ticket: *const tls_core.session.ClientTicketState, now_ctx: *u8) !void {
+            // `ClientPskOfferSet.push` moves its argument (zero-valued on
+            // success); this helper is called repeatedly against the same
+            // `ticket0`, so each call offers a fresh clone and leaves the
+            // caller's retained `ticket0` untouched.
+            var offer_clone: tls_core.session.ClientTicketState = .{};
+            defer offer_clone.deinit();
+            try ticket.cloneInto(alloc, &offer_clone);
+            var offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+            try offers.push(&offer_clone);
+            errdefer offers.deinit();
+            const client = try PureZigTlsClient.createWithOptions(alloc, port, "http/1.1", "tardigrade.test", .{
+                .psk_offers = &offers,
+                .psk_now_ctx = now_ctx,
+                .psk_now_fn = ClientClock.now,
+            });
+            defer client.destroy();
+            try std.testing.expect(client.backend.core.psk_authenticated);
+            try client.writeAllPlain(openssl_health_request);
+            const raw = try client.readPlainToEnd(alloc, 64 * 1024, 5_000);
+            defer alloc.free(raw);
+            try assertContains(raw, "HTTP/1.1 200 OK");
+        }
+    }.run;
+
+    // Sub-case 1: unreadable replacement -- every permission bit stripped
+    // from the file at the configured path (it still *exists*; deleting it
+    // outright is a different, *earlier* rejection -- see below). Modeled
+    // after "a post-validation runtime failure is not misreported as a
+    // configuration error" above: a probe open after `chmod` confirms the
+    // permission bit is actually enforced before relying on it (some CI
+    // containers run as root, where it silently is not), skipping only this
+    // sub-case's own assertion -- not the rest of this test -- when it
+    // isn't.
+    //
+    // This rejection actually surfaces one layer earlier than the other
+    // three sub-cases below: `edge_config.validate`'s own
+    // `TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH` existence check
+    // (`validateOptionalFileChecked`) itself calls `openFile`, which fails
+    // identically for "does not exist" and "exists but unreadable" -- so an
+    // unreadable replacement is rejected by general config validation
+    // before `hotReloadConfig` ever reaches the ticket-key-specific load
+    // step, and is recorded on the general `tardigrade_reload_failure_total`
+    // counter rather than `tardigrade_tls_ticket_key_reload_total`. Still a
+    // bounded, secret-free failure outcome that leaves the previous
+    // keyring/config active, which is what this sub-case actually needs to
+    // prove.
+    const ticket_keys_path_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{ticket_keys_path}, 0);
+    defer allocator.free(ticket_keys_path_z);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(ticket_keys_path_z.ptr, 0o000));
+    const permission_enforced = if (compat.cwd().openFile(ticket_keys_path, .{})) |f| blk: {
+        var file = f;
+        file.close();
+        break :blk false;
+    } else |_| true;
+    const failure_count_before_subcase1 = blk: {
+        var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+        defer metrics.deinit();
+        break :blk prometheusMetricValue(metrics.body, "tardigrade_reload_failure_total") orelse 0;
+    };
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    compat.sleepNs(300 * std.time.ns_per_ms);
+    if (permission_enforced) {
+        var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+        defer metrics.deinit();
+        try std.testing.expect((prometheusMetricValue(metrics.body, "tardigrade_reload_failure_total") orelse 0) >= failure_count_before_subcase1 + 1);
+    }
+    _ = std.c.chmod(ticket_keys_path_z.ptr, 0o600);
+    try assertTicket0StillResumes(allocator, tardigrade.port, &ticket0, &clock_dummy);
+
+    // Sub-case 2: malformed JSON.
+    try writeInteropSecretFile(ticket_keys_path, "{not valid json");
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    compat.sleepNs(300 * std.time.ns_per_ms);
+    {
+        var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+        defer metrics.deinit();
+        try expectMetricAtLeast(metrics.body, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_rejected\""}, 1);
+    }
+    try assertTicket0StillResumes(allocator, tardigrade.port, &ticket0, &clock_dummy);
+
+    // Sub-case 3: semantically invalid keyring -- an otherwise well-formed
+    // key with an invalid nonce lease (`start >= end_exclusive`), rejected
+    // by `ticket_protection.NonceLease.init`, not by JSON parsing.
+    try writePersistentTicketKeySnapshotKeys(allocator, ticket_keys_path, 6, &.{
+        .{
+            .id_hex = k0_id,
+            .key_hex = k0_secret,
+            .not_before_unix_ms = baseline_now - 60_000,
+            .encrypt_until_unix_ms = baseline_now + 3_600_000,
+            .decrypt_until_unix_ms = baseline_now + 3_600_000,
+            .nonce_lease = .{ .prefix_hex = "11110000", .start = 100, .end_exclusive = 100 },
+        },
+    });
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    compat.sleepNs(300 * std.time.ns_per_ms);
+    {
+        var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+        defer metrics.deinit();
+        try expectMetricAtLeast(metrics.body, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_rejected\""}, 1);
+    }
+    try assertTicket0StillResumes(allocator, tardigrade.port, &ticket0, &clock_dummy);
+
+    // Sub-case 4: stale generation -- otherwise identical, valid key
+    // content, but a generation number not newer than the currently
+    // installed one (5). Reusing the baseline's own lease range unchanged
+    // is fine here (unlike `rotation.persistent.n_to_n_plus_1`'s carried-
+    // forward key): staleness is checked before the ledger/overlap check
+    // (`ReloadableKeyRing.validateInstallCandidate`), so this is rejected
+    // for the intended reason regardless.
+    try writePersistentTicketKeySnapshotKeys(allocator, ticket_keys_path, 3, &.{
+        .{
+            .id_hex = k0_id,
+            .key_hex = k0_secret,
+            .not_before_unix_ms = baseline_now - 60_000,
+            .encrypt_until_unix_ms = baseline_now + 3_600_000,
+            .decrypt_until_unix_ms = baseline_now + 3_600_000,
+            .nonce_lease = .{ .prefix_hex = "11110000", .start = 0, .end_exclusive = 1_000_000 },
+        },
+    });
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    compat.sleepNs(300 * std.time.ns_per_ms);
+    {
+        var metrics = try sendPureZigTlsHttp1Request(allocator, tardigrade.port, "/status/metrics");
+        defer metrics.deinit();
+        try expectMetricAtLeast(metrics.body, "tardigrade_tls_ticket_key_reload_total", &.{"outcome=\"reload_rejected\""}, 1);
+    }
+    try assertTicket0StillResumes(allocator, tardigrade.port, &ticket0, &clock_dummy);
+
+    // After four rejected attempts, a *freshly issued* ticket must still be
+    // sealed under the original key id -- proof that nothing was partially
+    // applied to the live keyring across any of them.
+    {
+        var capture = FailedReloadTicketCapture{ .allocator = allocator };
+        defer capture.retained.deinit();
+        const client = try PureZigTlsClient.createWithOptions(allocator, tardigrade.port, "http/1.1", "tardigrade.test", .{
+            .ticket_consumer = .{ .ctx = &capture, .nowUnixMsFn = FailedReloadTicketCapture.now, .onTicketFn = FailedReloadTicketCapture.onTicket },
+        });
+        defer client.destroy();
+        try client.writeAllPlain(openssl_health_request);
+        const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(raw);
+        try assertContains(raw, "HTTP/1.1 200 OK");
+        const ids = extractTicketEnvelopeIds(&capture.retained);
+        try std.testing.expectEqualStrings(k0_id, &std.fmt.bytesToHex(ids.key_id, .lower));
+    }
+}
+
+// #519: with persistent ticket keys, a restart no longer implies key loss
+// (unlike `restart.restart_and_credential_change.ticket_rejected`, whose own
+// doc comment explains it cannot prove certificate/auth-binding rejection
+// for exactly this reason -- both processes there are ephemeral, so B can
+// never decrypt A's ticket at all, and its own comment names a persistent
+// keyring surviving a restart as exactly the missing production capability
+// that would let a real cert-binding test exist). This is a restart, not a
+// SIGHUP reload, deliberately: inspecting `edge_gateway.run`/
+// `gateway_shutdown.hotReloadConfig` shows the appliance TLS profile's real
+// served identity (`appliance_credentials.ApplianceCredentials`) is loaded
+// once at startup and never touched by any reload path at all, so there is
+// no live way to change the served credential without a restart under this
+// profile -- exactly the "supported reload/restart composition" #519 asks
+// for. Process B here reuses process A's ticket-keys file unedited (the
+// same durable-lease-reservation contract `restart.persistent.ticket_survives`
+// exercises), so the persistent key is unchanged across the restart and
+// decryption genuinely succeeds; the only thing that can reject A's old
+// ticket on B is `session.evaluateCompatibility`'s `auth_binding` check.
+// `tls13_backend.selectPsk` only reaches that check, and only records
+// `.incompatible` (as opposed to `.miss`), for an identity that actually
+// resolved -- so the `incompatible` resumption outcome alongside a
+// successful ticket-resolve metric is the live, composed proof this is a
+// compatibility rejection, not an unknown-key/decryption miss.
+test "rotation.persistent.certificate_binding_change" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+    try requireOpensslEd25519(allocator);
+
+    var cred_a = try generateAlternateServerCert(allocator, "tardigrade.test");
+    defer cred_a.deinit();
+    var cred_b = try generateAlternateServerCert(allocator, "tardigrade.test");
+    defer cred_b.deinit();
+
+    const key_path_probe_port = try findFreePort();
+    const ticket_keys_path = try persistentTicketKeySnapshotPath(allocator, key_path_probe_port, "persistent-cert-binding-change");
+    defer allocator.free(ticket_keys_path);
+    defer compat.cwd().deleteFile(ticket_keys_path) catch {};
+    defer {
+        const lock_path = std.fmt.allocPrint(allocator, "{s}.lock", .{ticket_keys_path}) catch null;
+        if (lock_path) |path| {
+            compat.cwd().deleteFile(path) catch {};
+            allocator.free(path);
+        }
+    }
+    try writePersistentTicketKeySnapshot(allocator, ticket_keys_path);
+
+    const config_text =
+        \\location = /healthz {
+        \\    return 200 alive;
+        \\}
+    ;
+    const extra_env = &[_]EnvPair{
+        .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+        .{ .name = "TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH", .value = ticket_keys_path },
+    };
+
+    var process_a = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &(extra_env.* ++ [_]EnvPair{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = cred_a.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = cred_a.key_path },
+        }),
+    });
+    var process_a_running = true;
+    defer if (process_a_running) process_a.stop();
+
+    const CertBindingTicketCapture = struct {
+        allocator: std.mem.Allocator,
+        retained: tls_core.session.ClientTicketState = .{},
+
+        fn now(_: *anyopaque) i64 {
+            return 2_000;
+        }
+
+        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.retained.deinit();
+            self.retained = .{};
+            ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
+        }
+    };
+
+    // Issue a ticket while process A serves credential A.
+    var capture_a = CertBindingTicketCapture{ .allocator = allocator };
+    defer capture_a.retained.deinit();
+    {
+        const client = try PureZigTlsClient.createWithOptions(allocator, process_a.port, "http/1.1", "tardigrade.test", .{
+            .ticket_consumer = .{ .ctx = &capture_a, .nowUnixMsFn = CertBindingTicketCapture.now, .onTicketFn = CertBindingTicketCapture.onTicket },
+        });
+        defer client.destroy();
+        try client.writeAllPlain(openssl_health_request);
+        const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+        defer allocator.free(raw);
+        try assertContains(raw, "HTTP/1.1 200 OK");
+    }
+    var ticket_a: tls_core.session.ClientTicketState = .{};
+    defer ticket_a.deinit();
+    try capture_a.retained.cloneInto(allocator, &ticket_a);
+
+    // A real process boundary, not `Runtime.deinit()`/`Runtime.init()` reused
+    // inside one test object.
+    process_a.stop();
+    process_a_running = false;
+
+    // Process B: same server_name, same on-disk persistent ticket-key
+    // snapshot (unedited), but credential B. B's own startup durably
+    // reserves its own nonce-lease window from the same file (as in
+    // `restart.persistent.ticket_survives`), so it can decrypt A's ticket.
+    var process_b = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &(extra_env.* ++ [_]EnvPair{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = cred_b.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = cred_b.key_path },
+        }),
+    });
+    defer process_b.stop();
+
+    var clock_dummy: u8 = 0;
+    const ClientClock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 2_500;
+        }
+    };
+
+    // Offer the A ticket to B, which now serves credential B.
+    var offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket_a);
+    errdefer offers.deinit();
+    const client = try PureZigTlsClient.createWithOptions(allocator, process_b.port, "http/1.1", "tardigrade.test", .{
+        .psk_offers = &offers,
+        .psk_now_ctx = &clock_dummy,
+        .psk_now_fn = ClientClock.now,
+    });
+    defer client.destroy();
+    // Not selected/binder-verified: `selectPsk` skips straight past an
+    // incompatible candidate without ever reaching binder verification, so
+    // this is not merely "psk_authenticated happens to be false."
+    try std.testing.expect(!client.backend.core.psk_authenticated);
+    // Safe full-handshake fallback: the connection still works.
+    try client.writeAllPlain(openssl_health_request);
+    const raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
+    defer allocator.free(raw);
+    try assertContains(raw, "HTTP/1.1 200 OK");
+    try assertContains(raw, "alive");
+
+    var metrics = try sendPureZigTlsHttp1Request(allocator, process_b.port, "/status/metrics");
+    defer metrics.deinit();
+    // The compatibility/auth-binding outcome specifically, not a decryption
+    // miss -- both asserted on B's own metrics, B's first and only
+    // resumption attempt so far, so an absolute count is exact here.
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"record\"", "outcome=\"incompatible\"" }, 1);
+    try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"record\"", "outcome=\"accepted\"" }) orelse 0);
+    try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"record\"", "outcome=\"miss\"" }) orelse 0);
+    // The ticket-resolve layer (key lookup + decrypt) genuinely succeeded --
+    // ruling out "unknown key"/decryption failure as the actual cause.
+    try expectMetricAtLeast(metrics.body, "tardigrade_tls_ticket_resolve_total", &.{ "mode=\"stateless\"", "result=\"success\"" }, 1);
 }
 
 /// #369: `TARDIGRADE_SOAK_HEAVY=1` scales `soak.reconnect_resumption` up
