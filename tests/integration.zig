@@ -6661,15 +6661,25 @@ fn waitForReservationAttemptCount(allocator: std.mem.Allocator, log_path: []cons
 /// so it cannot establish that boundary correctly no matter which side of
 /// the request it is sampled on.
 ///
-/// Deliberately does *not* attempt to prove a worker completed a
-/// connection *while* the reload SIGHUP handler is confirmed blocked on
-/// the shared reservation lock -- `edge_gateway.run`'s single-threaded
-/// event loop handles both accepting/dispatching connections and
-/// (synchronously) `hotReloadConfig`, so blocking that one thread on the
-/// lock blocks all socket I/O for that process, including finishing
-/// already-in-flight work. An earlier revision required exactly that and
-/// reliably hung for the full bounded test timeout, a real deadlock
-/// proving the property is architecturally unobservable this way.
+/// Deliberately does *not* attempt to prove a worker *starts and
+/// completes a brand-new connection* while the reload SIGHUP handler is
+/// confirmed blocked on the shared reservation lock. `edge_gateway.run`'s
+/// single-threaded event loop owns accepting and dispatching connections
+/// as well as (synchronously) `hotReloadConfig`, so blocking that one
+/// thread on the lock blocks *new* accepts for that process -- but
+/// `edge_gateway.run` also has a separate `WorkerPool`, so a connection
+/// *already* accepted and dispatched to a worker before the block began
+/// can keep making progress regardless (see `GatedUpstream` below, which
+/// proves exactly that with a request dispatched ahead of time and held
+/// under this test's control). A `ChurnWorker`'s own next connection
+/// attempt is always a *new* one with no such guarantee, so requiring it
+/// to complete specifically while blocked would be requiring a new
+/// accept during the one window that's provably unavailable. An earlier
+/// revision required exactly that and reliably hung for the full bounded
+/// test timeout, confirming new accepts really do stall -- the fix was
+/// not to give up on proving overlap, but to prove it with a request
+/// that was already in flight (`GatedUpstream`) rather than with churn's
+/// own fresh reconnect loop.
 ///
 /// `saw_outgoing`/`saw_incoming` are published only once a matching
 /// ticket has *also* been retained in `results`, so a visible flag always
@@ -9022,10 +9032,18 @@ test "soak.persistent.multi_process_nonce_safety" {
     // route wired) regardless of tier, since the process's own config
     // is fixed at startup and can't be changed per-round; only the
     // smoke tier simply never drives traffic through it.
-    var gate_a = try GatedUpstream.start(allocator);
+    //
+    // `std.heap.page_allocator`, not `allocator` (`std.testing.
+    // allocator`): the gate's own thread allocates/frees concurrently
+    // with the main test thread, and `std.testing.allocator`'s backing
+    // `DebugAllocator` is not safe for concurrent use from multiple
+    // threads (Zig 0.16 still lists that as planned, not implemented) --
+    // the same reason `ChurnWorker` already uses `std.heap.page_
+    // allocator` for its own thread's allocations.
+    var gate_a = try GatedUpstream.start(std.heap.page_allocator);
     defer gate_a.stop();
     try gate_a.run();
-    var gate_b = try GatedUpstream.start(allocator);
+    var gate_b = try GatedUpstream.start(std.heap.page_allocator);
     defer gate_b.stop();
     try gate_b.run();
 
@@ -9288,8 +9306,13 @@ test "soak.persistent.multi_process_nonce_safety" {
         if (soakHeavyEnabled()) {
             gate_a.resetGate();
             gate_b.resetGate();
-            race_thread_a = try std.Thread.spawn(.{}, runTlsRaceRequest, .{ allocator, process_a.port, &race_result_a });
-            race_thread_b = try std.Thread.spawn(.{}, runTlsRaceRequest, .{ allocator, process_b.port, &race_result_b });
+            // `std.heap.page_allocator`, not `allocator`: this thread runs
+            // concurrently with the main test thread (and the gate's own
+            // thread), and `std.testing.allocator` is not safe for
+            // concurrent use -- same reasoning as `GatedUpstream.start`
+            // above and `ChurnWorker` elsewhere in this file.
+            race_thread_a = try std.Thread.spawn(.{}, runTlsRaceRequest, .{ std.heap.page_allocator, process_a.port, &race_result_a });
+            race_thread_b = try std.Thread.spawn(.{}, runTlsRaceRequest, .{ std.heap.page_allocator, process_b.port, &race_result_b });
             try gate_a.waitEntered(5_000);
             try gate_b.waitEntered(5_000);
         }
