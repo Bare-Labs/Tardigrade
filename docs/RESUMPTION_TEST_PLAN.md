@@ -1,12 +1,176 @@
 # Resumption / 0-RTT Test Plan
 
 Tracks test coverage for the session-resumption and 0-RTT epic (#326) against
-the validation scope in issue #369 (326-J). #369 itself is XL and spans
-external interop, restart/rotation soak runs, and CI wiring — too large for
-one PR, so it is being landed in slices. This doc records what each slice
-covers so gaps are visible instead of implied.
+the validation scope in issue #369 (326-J). #369's combined scope — external
+interop, restart/rotation soak runs, and CI wiring — was too large for one PR
+and landed across slices spanning in-repo scenario tests, process-level
+composition proof, external interop, persistent-key rotation/reload,
+concurrency soak, and independent-peer H2/H3 proof (#508, #509, #511, #518,
+#519, #520, #521, #522, #523). The **Final #369 status** section immediately
+below is the authoritative closeout #522 was filed to produce. The
+historical slice record after it is retained as context for how each row was
+reached — including dead ends and premises that turned out wrong — not as a
+second source of truth; where it conflicts with the final matrix, the final
+matrix wins.
 
-## Slice 1 (this PR): in-repo scenario tests
+## Final #369 status — authoritative
+
+| #369 requirement | transport / profile | production capability | proof of record | proof level | status |
+|---|---|---|---|---|---|
+| Expiry, key rotation/removal, restart/lost-state models, ALPN/cipher compatibility scenarios | native TLS record layer, all profiles | `Tls13Backend` / `ReloadableKeyRing` | `tls13_backend_tests.zig`, `ticket_protection.zig`, `resumption_runtime.zig` scenario tests (#508) | deterministic | complete |
+| Process-level replay decisions, capacity/quarantine, 425/retry exactly-once composition | native TCP/H1, all profiles | process-local replay gate + gateway retry state machine | `rt0.*` cases (`tls13_backend_tests.zig`/`edge_gateway.zig`), `rt0.retry.425_exactly_once` (#509) | process (real composition, in-process) | complete |
+| Production native TCP/H1 record 0-RTT carrier + persistent ticket-key composition | native TCP/H1; persistent keys are general-profile only | `NativeTlsConnection` 0-RTT record path; `TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH` | `#510 native tcp production 0-rtt reaches h1 safety gate and replay fallback` (#513) | process (real production composition) | complete |
+| Production QUIC/H3 0-RTT packet carrier, provenance, policy/configuration, deterministic compatibility | native QUIC/H3, general profile | `http3_runtime.zeroRttCarrierEnabled` / `quicConfigFrom` / `quicEarlyDataTransportCompatible` | `quicConfigFrom`/H3 runtime deterministic tests (#523/PR #524) | deterministic + process | complete |
+| External ordinary resumption, ephemeral restart, reconnect soak baseline | native TCP/H1, both profiles | native TLS listener | `interop.openssl.h1.resume`, `restart.ephemeral.*`, `soak.reconnect_resumption` (#511) | external peer (OpenSSL) | complete |
+| External accepted 0-RTT, unsafe 425, replay fallback, persistent-restart startup quarantine | native TCP/H1, general profile (persistent keys) | production replay gate + H1 safety gate | `interop.openssl.h1.early.accepted`, `interop.openssl.h1.early.unsafe_425`, `interop.openssl.h1.early.replay_fallback`, `restart.persistent.early_startup_quarantine` (#518/PR #525) | external peer (OpenSSL) | complete |
+| Real application-level H2 request/response on an authoritatively resumed external connection | native TCP/H2, both profiles | H2 dispatch over resumed TLS | `interop.openssl.h2.tls_resume` (#521/PR #526) | external peer (OpenSSL `h2`) + app dispatch | complete |
+| External H3 1-RTT resumption + accepted/unsafe/replay QUIC 0-RTT production composition | QUIC/H3, general profile | `http3_runtime.Runtime` composition | `h3interop.quic.resume`, `h3interop.quic.early.accepted`, `h3interop.quic.early.unsafe_425`, `h3interop.quic.early.replay_fallback` (#522/PR #527) | external peer (ngtcp2/GnuTLS `gtlsclient`) | complete |
+| Persistent restart, N→N+1 SIGHUP rotation, live validity boundaries, failed-reload atomicity, QUIC credential/ticket two-phase reload atomicity, certificate-binding incompatibility | native TCP/H1 (appliance profile) + QUIC/H3 (general profile, credential-atomicity case) | `ReloadableKeyRing`, `gateway_shutdown.hotReloadConfig`, `native_credentials.prepareReloadFromFiles` | `restart.persistent.ticket_survives`, `rotation.persistent.n_to_n_plus_1`, `rotation.persistent.failed_reload_keeps_old_state`, `rotation.persistent.quic_credential_reload_atomicity`, `rotation.persistent.certificate_binding_change` (#519/PR #528) | process (real restarts/SIGHUPs) | complete |
+| Concurrent multi-process nonce safety, rotation soak, lease exhaustion, process-local replay scope | native TCP/H1 persistent keys, general profile | `ticket_key_snapshot.reserveNonceLeasesInFile` sidecar lock | `soak.persistent.multi_process_nonce_safety`, `soak.persistent.nonce_lease_exhaustion`, `soak.replay.process_local_scope` (#520/PR #529) | process (real OS processes) | complete |
+| Ticket expiry (negative, external) | native TCP/H1 | — | `interop.openssl.ticket.expired` (#511) | external peer | complete |
+| SNI mismatch (negative, external) | native TCP/H1, appliance profile | — | `interop.openssl.sni_mismatch` (#511) | external peer | complete |
+| ALPN mismatch (negative, external) | native TCP/H1 | — | `interop.openssl.alpn_mismatch` (#511) | external peer | complete |
+| Ticket tamper (negative, external) | native TCP/H1 | — | `interop.openssl.ticket.tampered` (#511) | external peer | complete |
+| Cipher-suite resumption mismatch (negative) | native TLS, appliance profile (single supported cipher) | — | `ResumeMismatch.cipher_suite_mismatch` unit coverage (`src/tls/session.zig`) (#508/#521) | deterministic | intentionally unreachable externally — see limitations below |
+| H3 SETTINGS early-data incompatibility (negative) | QUIC/H3, general profile | — | remembered-SETTINGS compatibility coverage (`http3_runtime.zig`) (#523) | deterministic | intentionally unreachable externally — see limitations below |
+| QUIC transport-parameter early-data incompatibility (negative) | QUIC/H3, general profile | — | `quicEarlyDataTransportCompatible` deterministic coverage (#523) | deterministic | intentionally unreachable externally — see limitations below |
+| H3 replay-store-unavailable fail-closed state (negative) | QUIC/H3, general profile | `http3_runtime.zeroRttCarrierEnabled` | deterministic fail-closed carrier-disabled coverage (#523) | deterministic | intentionally unreachable as a distinct external state — see limitations below |
+
+Every #369 acceptance criterion maps to one of the rows above, either as a
+named deterministic/process/external proof or as an explicit
+unsupported/unreachable capability with the reason recorded in the section
+immediately below. No row required a new production configuration knob to
+close.
+
+## Intentional limitations / unreachable external cases
+
+- **Cipher-suite resumption mismatch.** The appliance native TLS profile
+  advertises exactly `TLS_AES_128_GCM_SHA256`. An external reconnect either
+  offers that suite (nothing to mismatch) or excludes it (ordinary cipher
+  negotiation fails before `session.evaluateCompatibility` is ever reached).
+  Deterministic `ResumeMismatch.cipher_suite_mismatch` coverage remains the
+  proof of record. Do not add a second supported cipher or mutate a
+  protected session to manufacture this externally.
+- **H3 SETTINGS early-data incompatibility.** `http3_runtime.Config` carries
+  an `h3_settings` snapshot, but `edge_gateway.zig` has no operator-facing
+  knob to set it, so production runs the compiled default on both sides of
+  any external reconnect. Deterministic remembered-SETTINGS compatibility
+  coverage is the proof of record. Do not add a test-only SETTINGS override
+  to manufacture mismatch; if H3 SETTINGS become operator-configurable later,
+  external mismatch interop becomes applicable then, as its own follow-up.
+- **QUIC transport-parameter early-data incompatibility.**
+  `http3_runtime.quicConfigFrom()` maps only `max_datagram_size` and
+  `zero_rtt_enabled`; every other early-data-compatibility-sensitive
+  transport parameter (`initial_max_data`, stream/CID limits, etc.) stays at
+  the fixed native QUIC default and isn't operator-configurable between
+  external runs. Deterministic `quicEarlyDataTransportCompatible` coverage is
+  the proof of record. If #326 later requires configurable
+  flow-control/stream/CID parameters, own external mismatch proof as a
+  separate production-configurability feature rather than expanding this
+  ticket by stealth.
+- **H3 replay-store-unavailable as a distinct enabled-carrier state.**
+  `http3_runtime.zeroRttCarrierEnabled()` only enables the 0-RTT carrier when
+  `enable_0rtt` is true **and** a resumption runtime with a server resolver
+  **and** a replay gate with a real `decideFn` are all present. A
+  missing/unusable replay gate therefore collapses into the already-covered
+  disabled/keys-unavailable fail-closed path rather than producing a separate
+  externally observable "carrier enabled, no replay protection" state.
+- **Deterministic worker-thread-pinning test seam.** There is no API to pin a
+  connection to a specific worker thread for testing, so the shared-store
+  guarantee across real OS worker threads (as opposed to independent
+  per-connection state, or independent real OS processes per #520) stays
+  unproven at that specific granularity. This is a known test-seam gap, not
+  evidence workers don't share one store: production composes one
+  process-scoped replay store/gate shared by reference across every native
+  worker and H3 (`initNativeEarlyDataReplayStore`/`GateAdapter.init` in
+  `edge_gateway.zig`). #520's two real OS processes are the operational proof
+  of the process-local scope #369 actually requires; a worker-affinity seam
+  is only worth adding if a future issue explicitly strengthens the
+  requirement to need it.
+- **Distributed/cluster-wide replay storage.** Out of scope by design (a
+  #369 non-goal) — see process-local replay semantics below.
+
+## 1-RTT vs 0-RTT compatibility contract
+
+Ordinary 1-RTT resumption and 0-RTT early-data admission are
+compatibility-gated separately; the final matrix above must not be read as
+implying otherwise:
+
+- **1-RTT resumption** is gated by `session.evaluateCompatibility`'s own
+  contract (SNI, ALPN, cipher suite, certificate/auth binding, ticket
+  expiry/rotation state) — proven end to end by #508/#511/#519/#521/#522.
+- **0-RTT early-data admission** additionally requires the remembered H3
+  SETTINGS and QUIC transport-parameter snapshots to be compatibility-safe
+  (`quicEarlyDataTransportCompatible`, RFC 9001 §4.6.1 / RFC 9000 §7.4.1), on
+  top of everything 1-RTT already checks.
+
+A session can therefore legitimately resume at 1-RTT while its remembered
+application/transport state is no longer eligible for 0-RTT — that is a
+real, working fallback shape, not a defect. `h3interop.quic.resume` proves
+exactly this fallback path is usable independent of 0-RTT eligibility.
+
+## Process-local replay semantics
+
+The supported anti-replay guarantee is **process-local**, not cluster-wide.
+`soak.replay.process_local_scope` (#520) proves this operationally with two
+real OS processes sharing one persistent ticket-key snapshot but independent
+replay stores: first use on process A is accepted; replay on A is rejected;
+the identical claim is independently accepted once by process B (a different
+process, a different store); replay on B is then also rejected. Do not
+describe this as cluster-wide at-most-once behavior anywhere in
+documentation, and do not add Redis/etcd/distributed replay storage — that
+remains an explicit #369 non-goal.
+
+## Transport / profile support
+
+- **Native TCP/H1 record 0-RTT** is proven through the native/appliance-profile
+  integration path (#513/#518).
+- **Native QUIC/H3 0-RTT** is proven through the **general-profile**
+  production H3 composition (#523/#522); the appliance profile rejects
+  `TARDIGRADE_HTTP3_ENABLE_0RTT` outright at configuration validation.
+- **H2** has application-level resumed-connection proof (#521), but that is
+  1-RTT resumption plus a real H2 request/response — it does not imply H2
+  early-data enablement, which stays the more conservative supported policy
+  HTTP/2 has always had relative to H1.
+- **Persistent file-backed ticket keys**
+  (`TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH`) are a general-profile
+  capability; the appliance profile intentionally rejects that configuration
+  and keeps ephemeral-only ticket keys.
+- Every matrix row above is scoped to the actual transport/profile its proof
+  exercises — do not infer cross-transport ticket portability from "shared
+  resumption runtime."
+
+## CI and reproducibility
+
+- `zig build test-integration-resumption-interop` runs the
+  `interop.`/`restart.`/`soak.`/`rotation.` prefixed cases; required on macOS
+  (where the full integration suite is skipped) and not duplicated on the
+  Linux job that already runs the unfiltered suite.
+- `.github/workflows/resumption-soak.yml` runs the same filtered suite with
+  `TARDIGRADE_SOAK_HEAVY=1` on a weekly schedule plus manual dispatch.
+- The H3 interop cases require a built ngtcp2/GnuTLS `gtlsclient` peer
+  (`scripts/interop/build-h3-peer-ci.sh`); CI builds and pins it, and those
+  cases skip locally when it isn't built.
+- Every subprocess/socket wait across this suite is bounded (poll-based, not
+  raw blocking `accept()`/`read()`), and session/transport-state files use
+  restrictive permissions.
+- Failure artifacts may include case ID, seed where applicable, peer/version,
+  non-secret public ticket-envelope identifiers (key ID, public nonce),
+  configured timing windows, and typed metric outcomes. They must never
+  include ticket encryption keys, PSKs/RMS/binder secrets, raw private keys,
+  decrypted ticket/session state, or reusable ticket ciphertext.
+
+## Historical slice record
+
+The sections below (originally Slices 1–5, plus the external H1/H2/H3 and
+QUIC-carrier proof landed via #518/#521/#523/#522) are retained as the record
+of how each row in the final matrix above was reached — including dead ends,
+review findings, and premises that turned out wrong before any test code was
+written. Treat the **Final #369 status** section above as current; where
+"deferred"/"blocked" language below has not been explicitly marked resolved,
+cross-check it against the final matrix rather than assuming it still holds.
+
+### Slice 1 (this PR): in-repo scenario tests
 
 Fast, deterministic, single-process Zig tests exercising the resumption/
 0-RTT/anti-replay code already landed by #365–#368. No external process, no
@@ -48,7 +212,7 @@ real OpenSSL/QUIC peer, no CI/soak changes.
   cross-layer, process-level version of this assurance to #369, which those
   predecessor suites do not exercise — see the deferred matrix below.
 
-## Slice 2 (this PR): process-level 0-RTT replay / anti-replay / 425 assurance
+### Slice 2 (this PR): process-level 0-RTT replay / anti-replay / 425 assurance
 
 Moves assurance one layer outward from Slice 1: exercises the real
 production TLS/replay-store/HTTP-early-data/gateway-retry code composed
@@ -147,7 +311,7 @@ fixed in the current state of this slice, described below.
     in the retry logic fails the test with a useful assertion instead of
     hanging the test binary.
 
-### Native TCP/H1 production 0-RTT coverage (#510)
+#### Native TCP/H1 production 0-RTT coverage (#510)
 
 PR #513 adds the native TCP production path that was previously documented
 as absent here: production ticket issuance advertises `max_early_data_size`
@@ -167,7 +331,7 @@ without upstream execution; then replays the same ticket and proves rejected
 early bytes do not dispatch while a subsequent ordinary 1-RTT request on
 the resumed connection still succeeds.
 
-### Known gap: no deterministic worker-thread-routing test seam
+#### Known gap: no deterministic worker-thread-routing test seam
 
 The cross-worker test above proves the process-shared-store guarantee
 using two independent per-connection state instances (the same object
@@ -182,7 +346,7 @@ seam to `WorkerContext` to close this gap; until then this is a
 documented, intentional limitation of this slice's assurance, not a
 weakening of the "workers share one store" guarantee itself.
 
-## Slice 3 (this PR): external OpenSSL interop, real process restart, and soak
+### Slice 3 (this PR): external OpenSSL interop, real process restart, and soak
 
 This slice is explicitly **not** the final #369 slice, and #369 stays
 open after it. Two premises the original plan for a final slice assumed
@@ -215,7 +379,7 @@ end to end — and leaves every 0-RTT-specific external/production
 acceptance-criteria row explicitly open, tracked against #510's corrected
 scope rather than faked with test-only configuration.
 
-### A previously undiscovered, unrelated production bug found and fixed first
+#### A previously undiscovered, unrelated production bug found and fixed first
 
 Pointing a real `openssl s_client` at the native TLS listener for the
 first time (for the H1 interop case below) failed every single time with
@@ -233,7 +397,7 @@ server) never exercised. Fixed in `record_codec.zig`/
 interop case in this slice runs against the fixed code and would not have
 passed before it.
 
-### External OpenSSL interop (`tests/integration.zig`, real `openssl` subprocess)
+#### External OpenSSL interop (`tests/integration.zig`, real `openssl` subprocess)
 
 - `interop.openssl.h1.resume` — real native TLS listener, real
   `openssl s_client`, full handshake, OpenSSL's own `-sess_out`
@@ -288,7 +452,7 @@ passed before it.
   no test-only second cipher or protected-session mutation is introduced to
   manufacture an impossible external case.
 
-### Real process restart (`tests/integration.zig`, real separate OS processes)
+#### Real process restart (`tests/integration.zig`, real separate OS processes)
 
 - `restart.ephemeral.ticket_miss` / `restart.ephemeral.fresh_ticket` — a
   real process A (not `Runtime.deinit()`/`Runtime.init()` reused inside
@@ -321,7 +485,7 @@ passed before it.
   Stateful mode's cache-miss shape after a restart is a different,
   already-covered concern (an empty cache, not a key-loss question).
 
-### Reconnect soak (`tests/integration.zig`, in-process client against one long-lived server)
+#### Reconnect soak (`tests/integration.zig`, in-process client against one long-lived server)
 
 - `soak.reconnect_resumption` — a bounded loop of full handshake → ticket
   → resumed reconnect against one process, using the fast in-process
@@ -342,7 +506,7 @@ passed before it.
   invariants over many iterations — not via a live occupancy sample.
   Documented rather than asserted against a metric that doesn't exist.
 
-### CI
+#### CI
 
 - `zig build test-integration-resumption-interop` (new build step,
   filtered to the `interop.`/`restart.`/`soak.` case-ID prefixes) lives in
@@ -358,7 +522,7 @@ passed before it.
   with `TARDIGRADE_SOAK_HEAVY=1` on a weekly schedule plus manual dispatch,
   mirroring `pki-differential.yml`'s existing pattern.
 
-## Explicitly deferred beyond this slice
+### Explicitly deferred beyond this slice
 
 - **0-RTT external/production interop, entirely** (the largest remaining
   gap): accepted 0-RTT, rejected-0-RTT-falls-back-to-1-RTT, and any
@@ -367,6 +531,11 @@ passed before it.
   — not merely "not yet wired." Do not close #369 by treating any
   in-process/constructed-context 0-RTT test (Slices 1–2) as equivalent to
   this.
+  **Resolved:** native TCP/H1 external 0-RTT accepted/unsafe-425/
+  replay-fallback landed via #518/PR #525; native QUIC/H3 external 0-RTT
+  landed via #522/PR #527 (see the Final #369 status matrix above). Kept
+  here unedited otherwise as the historical record of what was true when
+  this slice shipped.
 - **Certificate/auth-binding-change rejection.**
   `restart.restart_and_credential_change.ticket_rejected` only proves a
   combined restart-plus-credential-swap is safe via the same ephemeral-key
@@ -384,6 +553,11 @@ passed before it.
   slice does not add them. H3/QUIC 0-RTT is additionally blocked by the
   same production gap as native TCP (see above) plus native QUIC's own
   unconditional 0-RTT rejection.
+  **Resolved:** production QUIC/H3 0-RTT carrier landed via #523/PR #524;
+  external H3 1-RTT resumption and accepted/unsafe/replay 0-RTT proof
+  against a real ngtcp2/GnuTLS peer landed via #522/PR #527 (see the Final
+  #369 status matrix above). Kept here unedited otherwise as the historical
+  record of what was true when this slice shipped.
 - **Rotation / persistent-overlap key policy — Outcome B.** Inspected
   `edge_gateway.zig`/`native_tls_connection.zig`: `ReloadableKeyRing`
   (`src/tls/ticket_protection.zig`) is not referenced by production
@@ -422,7 +596,7 @@ routing) or on persistent rotation remain open. #369 is not complete
 after this slice; the honest remainder is the corrected #510 scope plus
 the items above.
 
-## Slice 4 (#519): persistent ticket-key restart, rotation, reload
+### Slice 4 (#519): persistent ticket-key restart, rotation, reload
 atomicity, and certificate binding
 
 This slice closes the "Rotation / persistent-overlap key policy" gap Slice
@@ -562,7 +736,7 @@ native (non-OpenSSL-adapter) resumption runtime today.
   {result="success"}` confirms the decrypt itself succeeded. The connection
   still completes via a safe full handshake.
 
-### CI
+#### CI
 
 `build.zig`'s `test-integration-resumption-interop` step's filter list
 gained a `rotation.` prefix alongside the existing `interop.`/`restart.`/
@@ -570,7 +744,7 @@ gained a `rotation.` prefix alongside the existing `interop.`/`restart.`/
 `test-integration` suite is deliberately skipped — see `ci.yml`) the
 `restart.*` cases already had.
 
-## Explicitly deferred beyond this slice (still open after #519)
+### Explicitly deferred beyond this slice (still open after #519)
 
 - **Persistent-key rotation soak / worker-thread-pinning / cross-worker
   anti-replay under real routing** — the persistent-key rotation *soak*
@@ -586,11 +760,16 @@ gained a `rotation.` prefix alongside the existing `interop.`/`restart.`/
   — `gateway_shutdown.hotReloadConfig`'s `NativeCredentialStore` prepare/
   commit path is real production code, but exercising it needs a non-
   appliance native-TLS test configuration this file's persistent-ticket-key
-  cases don't build under (`requireNativeTlsProfile()` is appliance-only).
-  Not attempted here; a future slice targeting the general profile
-  specifically would need its own harness path.
+  cases (`requireNativeTlsProfile()` is appliance-only) don't build under.
+  **Resolved in this same slice, through QUIC/H3 rather than native TCP/H1:**
+  `rotation.persistent.quic_credential_reload_atomicity` (above) exercises
+  this exact shared `NativeCredentialStore` prepare/commit path under the
+  general profile via real QUIC/H3, since the credential store itself is
+  not transport-specific. A native-TCP/H1-specific general-profile harness
+  was not additionally built, as it would exercise the same shared
+  prepare/commit code this test already reaches.
 
-## Slice 5 (#520): multi-process persistent-key nonce safety and
+### Slice 5 (#520): multi-process persistent-key nonce safety and
 replay-locality soak
 
 Slice 4 (#519) proved a single process's own restart/rotation/reload/
@@ -658,7 +837,7 @@ which every case below depends on.
   an explicit ordinary request on the same connection afterward still
   succeeds.
 
-### CI
+#### CI
 
 No new build filter was needed: all three cases use the existing `soak.`
 case-ID prefix `build.zig`'s `test-integration-resumption-interop` step
@@ -668,7 +847,7 @@ per-round ticket-sample counts and `soak.replay.process_local_scope`'s
 replay-identity count, the same way it already scaled
 `soak.reconnect_resumption`'s iteration count.
 
-## Explicitly deferred beyond this slice (still open after #520)
+### Explicitly deferred beyond this slice (still open after #520)
 
 - **Three-or-more-process contention, deterministic worker-thread pinning,
   and cross-worker anti-replay under real routing** — unchanged from
@@ -680,3 +859,4 @@ replay-identity count, the same way it already scaled
 - **Final #369 matrix/docs reconciliation** — left to #522, per that
   issue's own scope; this slice adds its own coverage notes above rather
   than redoing the epic closeout.
+  **Resolved by this document's Final #369 status section, above.**
