@@ -755,6 +755,13 @@ test "fuzz: canonical frame encoders round-trip supported families" {
     } });
 }
 
+test "parser accepts valid prefix before typed malformed tail" {
+    var parser = Parser.init(&.{ 0x01, 0x21 });
+    const ping = (try parser.next()).?;
+    try testing.expect(ping == .ping);
+    try testing.expectError(error.UnknownFrameType, parser.next());
+}
+
 test "every decoded frame length covers exactly the consumed bytes" {
     // A payload with several frames back to back must parse to the end.
     var buf: [128]u8 = undefined;
@@ -786,7 +793,9 @@ fn fuzzFrameDecodeInvariants(_: void, smith: *testing.Smith) !void {
     var parser = Parser.init(input);
     var last_pos: usize = 0;
     var count: usize = 0;
-    while (try parser.next()) |frame| {
+    while (true) {
+        const maybe_frame = parser.next() catch return;
+        const frame = maybe_frame orelse break;
         try testing.expect(parser.pos > last_pos);
         try testing.expect(parser.pos <= input.len);
         try expectFrameSlicesWithin(input, frame);
@@ -803,39 +812,125 @@ fn fuzzCanonicalFrameRoundTrip(_: void, smith: *testing.Smith) !void {
     const limit = @as(u64, smith.value(u32));
     var buf: [256]u8 = undefined;
 
-    switch (smith.value(u4) % 12) {
-        0 => _ = try roundtripOne(buf[0..try encodePing(&buf)]),
-        1 => _ = try roundtripOne(buf[0..try encodeHandshakeDone(&buf)]),
+    switch (smith.value(u5) % 15) {
+        0 => {
+            const frame = try roundtripOne(buf[0..try encodePing(&buf)]);
+            try testing.expect(frame == .ping);
+        },
+        1 => {
+            const frame = try roundtripOne(buf[0..try encodeHandshakeDone(&buf)]);
+            try testing.expect(frame == .handshake_done);
+        },
         2 => {
-            const frame = try roundtripOne(buf[0..try encodeCrypto(@as(u64, smith.value(u16)), data[0..data_len], &buf)]);
+            const offset = @as(u64, smith.value(u16));
+            const frame = try roundtripOne(buf[0..try encodeCrypto(offset, data[0..data_len], &buf)]);
+            try testing.expectEqual(offset, frame.crypto.offset);
             try testing.expectEqualSlices(u8, data[0..data_len], frame.crypto.data);
         },
         3 => {
-            const frame = try roundtripOne(buf[0..try encodeStream(id, @as(u64, smith.value(u16)), data[0..data_len], smith.value(u1) == 1, &buf)]);
+            const offset = @as(u64, smith.value(u16));
+            const fin = smith.value(u1) == 1;
+            const frame = try roundtripOne(buf[0..try encodeStream(id, offset, data[0..data_len], fin, &buf)]);
+            try testing.expectEqual(id, frame.stream.id);
+            try testing.expectEqual(offset, frame.stream.offset);
+            try testing.expectEqual(fin, frame.stream.fin);
             try testing.expectEqualSlices(u8, data[0..data_len], frame.stream.data);
         },
-        4 => _ = try roundtripOne(buf[0..try encodeMaxData(limit, &buf)]),
-        5 => _ = try roundtripOne(buf[0..try encodeMaxStreamData(id, limit, &buf)]),
-        6 => _ = try roundtripOne(buf[0..try encodeMaxStreams(.bidi, limit, &buf)]),
-        7 => _ = try roundtripOne(buf[0..try encodeMaxStreams(.uni, limit, &buf)]),
-        8 => _ = try roundtripOne(buf[0..try encodeResetStream(.{ .id = id, .app_error_code = smith.value(u16), .final_size = limit }, &buf)]),
-        9 => _ = try roundtripOne(buf[0..try encodeStopSending(.{ .id = id, .app_error_code = smith.value(u16) }, &buf)]),
+        4 => {
+            const frame = try roundtripOne(buf[0..try encodeMaxData(limit, &buf)]);
+            try testing.expectEqual(limit, frame.max_data);
+        },
+        5 => {
+            const frame = try roundtripOne(buf[0..try encodeMaxStreamData(id, limit, &buf)]);
+            try testing.expectEqual(id, frame.max_stream_data.id);
+            try testing.expectEqual(limit, frame.max_stream_data.limit);
+        },
+        6 => {
+            const frame = try roundtripOne(buf[0..try encodeMaxStreams(.bidi, limit, &buf)]);
+            try testing.expectEqual(limit, frame.max_streams_bidi);
+        },
+        7 => {
+            const frame = try roundtripOne(buf[0..try encodeMaxStreams(.uni, limit, &buf)]);
+            try testing.expectEqual(limit, frame.max_streams_uni);
+        },
+        8 => {
+            const app_error_code = @as(u64, smith.value(u16));
+            const frame = try roundtripOne(buf[0..try encodeResetStream(.{ .id = id, .app_error_code = app_error_code, .final_size = limit }, &buf)]);
+            try testing.expectEqual(id, frame.reset_stream.id);
+            try testing.expectEqual(app_error_code, frame.reset_stream.app_error_code);
+            try testing.expectEqual(limit, frame.reset_stream.final_size);
+        },
+        9 => {
+            const app_error_code = @as(u64, smith.value(u16));
+            const frame = try roundtripOne(buf[0..try encodeStopSending(.{ .id = id, .app_error_code = app_error_code }, &buf)]);
+            try testing.expectEqual(id, frame.stop_sending.id);
+            try testing.expectEqual(app_error_code, frame.stop_sending.app_error_code);
+        },
         10 => {
             var path_data: [path_data_len]u8 = undefined;
             @memset(&path_data, 0);
             _ = smith.slice(&path_data);
-            _ = try roundtripOne(buf[0..try encodePathChallenge(path_data, &buf)]);
-            _ = try roundtripOne(buf[0..try encodePathResponse(path_data, &buf)]);
+            const challenge = try roundtripOne(buf[0..try encodePathChallenge(path_data, &buf)]);
+            try testing.expectEqualSlices(u8, &path_data, &challenge.path_challenge);
+            const response = try roundtripOne(buf[0..try encodePathResponse(path_data, &buf)]);
+            try testing.expectEqualSlices(u8, &path_data, &response.path_response);
+        },
+        11 => {
+            var set = recovery.AckRangeSet{};
+            const largest = @as(u64, smith.value(u16)) + 2;
+            try set.insertRange(.{ .first = largest - 2, .last = largest });
+            if (smith.value(u1) == 1 and largest >= 5) {
+                try set.insertRange(.{ .first = 0, .last = 1 });
+            }
+            const ack_delay_us = @as(u64, smith.value(u16)) * 8;
+            const model = set.toAckFrame(ack_delay_us).?;
+            const frame = try roundtripOne(buf[0..try encodeAck(model, 3, &buf)]);
+            try testing.expectEqual(model.largest_acknowledged, frame.ack.largest_acknowledged);
+            try testing.expectEqual(ack_delay_us, frame.ack.ackDelayUs(3));
+            try testing.expect(frame.ack.ranges.contains(largest));
+            try testing.expect(frame.ack.ranges.contains(largest - 2));
+            if (largest >= 5 and set.contains(0)) {
+                try testing.expect(frame.ack.ranges.contains(0));
+                try testing.expect(frame.ack.ranges.contains(1));
+            }
+        },
+        12 => {
+            var cid_bytes: [8]u8 = undefined;
+            @memset(&cid_bytes, 0);
+            _ = smith.slice(&cid_bytes);
+            const value = cid.NewConnectionIdFrame{
+                .sequence = @as(u64, smith.value(u16)) + 1,
+                .retire_prior_to = 0,
+                .cid = try cid.ConnectionId.init(&cid_bytes),
+                .stateless_reset_token = [_]u8{smith.value(u8)} ** cid.stateless_reset_token_len,
+            };
+            const frame = try roundtripOne(buf[0..try encodeNewConnectionId(value, &buf)]);
+            const decoded = frame.new_connection_id.frame;
+            try testing.expectEqual(value.sequence, decoded.sequence);
+            try testing.expectEqual(value.retire_prior_to, decoded.retire_prior_to);
+            try testing.expectEqualSlices(u8, value.cid.slice(), decoded.cid.slice());
+            try testing.expectEqualSlices(u8, &value.stateless_reset_token, &decoded.stateless_reset_token);
+        },
+        13 => {
+            const sequence = @as(u64, smith.value(u32));
+            const frame = try roundtripOne(buf[0..try encodeRetireConnectionId(sequence, &buf)]);
+            try testing.expectEqual(sequence, frame.retire_connection_id.sequence);
         },
         else => {
             const is_app = smith.value(u1) == 1;
             const reason = data[0..@min(data_len, 16)];
-            _ = try roundtripOne(buf[0..try encodeConnectionClose(.{
-                .error_code = smith.value(u16),
-                .frame_type = frame_stream_base,
+            const error_code = @as(u64, smith.value(u16));
+            const frame_type = frame_stream_base | @as(u64, smith.value(u3));
+            const frame = try roundtripOne(buf[0..try encodeConnectionClose(.{
+                .error_code = error_code,
+                .frame_type = frame_type,
                 .reason = reason,
                 .is_application = is_app,
             }, &buf)]);
+            try testing.expectEqual(error_code, frame.connection_close.error_code);
+            try testing.expectEqual(is_app, frame.connection_close.is_application);
+            try testing.expectEqual(if (is_app) null else frame_type, frame.connection_close.frame_type);
+            try testing.expectEqualSlices(u8, reason, frame.connection_close.reason);
         },
     }
 }
