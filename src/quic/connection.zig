@@ -198,6 +198,11 @@ pub const Transmit = struct {
     path: quic_path.PathKey,
 };
 
+pub const StreamSchedulingHint = struct {
+    urgency: u3 = 3,
+    incremental: bool = false,
+};
+
 pub const DropReason = enum {
     unknown_cid,
     keys_unavailable,
@@ -569,6 +574,7 @@ const SendQueue = struct {
     fin_retransmit: bool = false,
     /// Stream was reset locally; drop all queued data.
     reset_sent: bool = false,
+    scheduling_hint: StreamSchedulingHint = .{},
 
     fn deinit(self: *SendQueue, allocator: std.mem.Allocator) void {
         self.data.deinit(allocator);
@@ -700,6 +706,7 @@ pub const Connection = struct {
     known_streams: std.AutoHashMap(StreamId, void),
     stream_transport_early: std.AutoHashMap(StreamId, void),
     accept_queue: std.ArrayList(StreamId) = .empty,
+    stream_scheduling_cursor: StreamId = 0,
 
     crypto_tx: [3]CryptoTx = .{ .{}, .{}, .{} },
     sent_records: std.ArrayList(SentRecord) = .empty,
@@ -2266,6 +2273,14 @@ pub const Connection = struct {
         return accepted;
     }
 
+    pub fn setStreamSchedulingHint(self: *Connection, id: StreamId, hint: StreamSchedulingHint) !void {
+        var manager = self.streamManager() orelse return error.NotEstablished;
+        const s = manager.get(id) orelse return error.UnknownStream;
+        if (!s.canSend()) return error.RecvOnlyStream;
+        const queue = try self.sendQueue(id);
+        queue.scheduling_hint = hint;
+    }
+
     pub fn readStream(self: *Connection, id: StreamId, out: []u8) !quic_stream.ReadResult {
         var manager = self.streamManager() orelse return error.NotEstablished;
         const result = try manager.read(id, out);
@@ -2984,14 +2999,15 @@ pub const Connection = struct {
             }
         }
 
-        // Stream data: retransmissions first, then new bytes.
-        var it = self.send_queues.iterator();
-        while (it.next()) |entry| {
-            if (record.stream_count == record.streams.len) break;
+        // Stream data: retransmissions first, then new bytes. Pick by the
+        // stream scheduling hint instead of hash-map order: lower urgency
+        // wins, equal urgency rotates by stream id from a bounded cursor.
+        while (record.stream_count < record.streams.len) {
             if (plain_len + frame.max_stream_overhead + 1 >= budget) break;
-            const id = entry.key_ptr.*;
-            const queue = entry.value_ptr.*;
-            if (queue.reset_sent) continue;
+            const selected = self.selectReadySendQueue(plain_len, budget) orelse break;
+            const id = selected.id;
+            const queue = selected.queue;
+            const before_stream_count = record.stream_count;
 
             // Retransmit ranges.
             while (!queue.retransmit.isEmpty() and record.stream_count < record.streams.len) {
@@ -3008,6 +3024,11 @@ pub const Connection = struct {
                 record.ack_eliciting = true;
                 record.streams[record.stream_count] = .{ .id = id, .range = range, .fin = is_fin_range };
                 record.stream_count += 1;
+                break;
+            }
+            if (record.stream_count != before_stream_count) {
+                self.stream_scheduling_cursor = id +% 1;
+                continue;
             }
 
             // A lost FIN whose data range was empty (or fully acked) needs an
@@ -3022,9 +3043,12 @@ pub const Connection = struct {
                     record.stream_count += 1;
                 } else |_| {}
             }
+            if (record.stream_count != before_stream_count) {
+                self.stream_scheduling_cursor = id +% 1;
+                continue;
+            }
 
             // New data within flow control.
-            if (record.stream_count == record.streams.len) continue;
             var manager = self.streamManager() orelse continue;
             const s = manager.get(id) orelse continue;
             const unsent = queue.bufferedEnd() -| queue.reserved_end;
@@ -3045,8 +3069,57 @@ pub const Connection = struct {
             record.ack_eliciting = true;
             record.streams[record.stream_count] = .{ .id = id, .range = range, .fin = grant.fin };
             record.stream_count += 1;
+            self.stream_scheduling_cursor = id +% 1;
         }
         return plain_len;
+    }
+
+    const SelectedSendQueue = struct {
+        id: StreamId,
+        queue: *SendQueue,
+    };
+
+    fn selectReadySendQueue(self: *Connection, plain_len: usize, budget: usize) ?SelectedSendQueue {
+        var selected: ?SelectedSendQueue = null;
+        var it = self.send_queues.iterator();
+        while (it.next()) |entry| {
+            const id = entry.key_ptr.*;
+            const queue = entry.value_ptr.*;
+            if (!self.sendQueueReady(id, queue, plain_len, budget)) continue;
+            const candidate = SelectedSendQueue{ .id = id, .queue = queue };
+            if (selected) |current| {
+                if (sendQueueBefore(candidate, current, self.stream_scheduling_cursor)) selected = candidate;
+            } else {
+                selected = candidate;
+            }
+        }
+        return selected;
+    }
+
+    fn sendQueueReady(self: *Connection, id: StreamId, queue: *SendQueue, plain_len: usize, budget: usize) bool {
+        if (queue.reset_sent) return false;
+        if (!queue.retransmit.isEmpty() or queue.fin_retransmit) return true;
+        const manager = self.streamManager() orelse return false;
+        const s = manager.get(id) orelse return false;
+        const unsent = queue.bufferedEnd() -| queue.reserved_end;
+        const want_fin = queue.fin_requested and !queue.fin_reserved;
+        if (unsent == 0 and !want_fin) return false;
+        const stream_window = s.max_send_data -| s.send_offset;
+        const conn_window = manager.max_data_send -| manager.bytes_sent;
+        const frame_room: u64 = @intCast(budget -| plain_len -| frame.max_stream_overhead);
+        const n_bytes = @min(@min(unsent, @min(stream_window, conn_window)), frame_room);
+        return n_bytes != 0 or (want_fin and unsent == 0);
+    }
+
+    fn sendQueueBefore(lhs: SelectedSendQueue, rhs: SelectedSendQueue, cursor: StreamId) bool {
+        const lhs_hint = lhs.queue.scheduling_hint;
+        const rhs_hint = rhs.queue.scheduling_hint;
+        if (lhs_hint.urgency != rhs_hint.urgency) return lhs_hint.urgency < rhs_hint.urgency;
+        return distanceFromCursor(lhs.id, cursor) < distanceFromCursor(rhs.id, cursor);
+    }
+
+    fn distanceFromCursor(id: StreamId, cursor: StreamId) u64 {
+        return id -% cursor;
     }
 
     fn buildCloseDatagram(self: *Connection, out: []u8, now_us: u64) ?Transmit {
@@ -3629,6 +3702,107 @@ test "driver: bidirectional stream data round-trips with FIN" {
 
     try testing.expectEqual(quic_stream.StreamState.closed, pair.client.streamState(id).?);
     try testing.expectEqual(quic_stream.StreamState.closed, pair.server.streamState(id).?);
+}
+
+test "driver: stream scheduling hint sends lower urgency first" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const low = try pair.client.openStream(.bidi);
+    const high = try pair.client.openStream(.bidi);
+    _ = try pair.client.writeStream(low, "request-a", false);
+    _ = try pair.client.writeStream(high, "request-b", false);
+    try pair.pump();
+
+    try pair.server.setStreamSchedulingHint(low, .{ .urgency = 1 });
+    try pair.server.setStreamSchedulingHint(high, .{ .urgency = 6 });
+    _ = try pair.server.writeStream(high, "less urgent response", false);
+    _ = try pair.server.writeStream(low, "more urgent response", false);
+
+    var out: [max_datagram_size]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    const record = lastSentRecordWithStreams(pair.server) orelse return error.TestExpectedEqual;
+    try testing.expect(record.stream_count > 0);
+    try testing.expectEqual(low, record.streams[0].id);
+}
+
+test "driver: equal urgency stream scheduling gives peers progress" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const first = try pair.client.openStream(.bidi);
+    const second = try pair.client.openStream(.bidi);
+    _ = try pair.client.writeStream(first, "request-a", false);
+    _ = try pair.client.writeStream(second, "request-b", false);
+    try pair.pump();
+
+    try pair.server.setStreamSchedulingHint(first, .{ .urgency = 3, .incremental = true });
+    try pair.server.setStreamSchedulingHint(second, .{ .urgency = 3, .incremental = true });
+    _ = try pair.server.writeStream(first, "first response chunk", false);
+    _ = try pair.server.writeStream(second, "second response chunk", false);
+
+    var out: [max_datagram_size]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    const record = lastSentRecordWithStreams(pair.server) orelse return error.TestExpectedEqual;
+    try testing.expect(streamRecordContains(record.*, first));
+    try testing.expect(streamRecordContains(record.*, second));
+}
+
+test "driver: equal urgency mixed incremental streams both make repeated progress" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const incremental = try pair.client.openStream(.bidi);
+    const non_incremental = try pair.client.openStream(.bidi);
+    _ = try pair.client.writeStream(incremental, "request-a", false);
+    _ = try pair.client.writeStream(non_incremental, "request-b", false);
+    try pair.pump();
+
+    try pair.server.setStreamSchedulingHint(incremental, .{ .urgency = 2, .incremental = true });
+    try pair.server.setStreamSchedulingHint(non_incremental, .{ .urgency = 2, .incremental = false });
+
+    const large_incremental = [_]u8{'i'} ** (max_datagram_size * 3);
+    const large_non_incremental = [_]u8{'n'} ** (max_datagram_size * 3);
+    _ = try pair.server.writeStream(incremental, &large_incremental, false);
+    _ = try pair.server.writeStream(non_incremental, &large_non_incremental, false);
+
+    var out: [max_datagram_size]u8 = undefined;
+    var incremental_records: usize = 0;
+    var non_incremental_records: usize = 0;
+    var polls: usize = 0;
+    while (polls < 6) : (polls += 1) {
+        _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse break;
+        const record = lastSentRecordWithStreams(pair.server) orelse continue;
+        if (streamRecordContains(record.*, incremental)) incremental_records += 1;
+        if (streamRecordContains(record.*, non_incremental)) non_incremental_records += 1;
+        pair.now_us += 500;
+    }
+
+    try testing.expect(incremental_records >= 2);
+    try testing.expect(non_incremental_records >= 2);
+}
+
+fn lastSentRecordWithStreams(conn: *Connection) ?*const SentRecord {
+    var i = conn.sent_records.items.len;
+    while (i > 0) {
+        i -= 1;
+        const record = &conn.sent_records.items[i];
+        if (record.space == .application and record.stream_count > 0) return record;
+    }
+    return null;
+}
+
+fn streamRecordContains(record: SentRecord, id: StreamId) bool {
+    for (record.streams[0..record.stream_count]) |stream_range| {
+        if (stream_range.id == id) return true;
+    }
+    return false;
 }
 
 test "driver: explicit zero-rtt stream provenance mark stays sticky after one-rtt data" {

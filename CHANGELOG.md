@@ -5,6 +5,17 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **HTTP/3 RFC 9218 priority hints (#254)** — the pure-Zig HTTP/3 path now
+  parses and validates `priority` request headers, applies request
+  `PRIORITY_UPDATE` frames on the peer control stream, exposes the effective
+  urgency/incremental hint with completed requests, and carries that hint down
+  to QUIC stream egress so lower-urgency response streams are sent first and
+  equal-urgency streams rotate from a bounded cursor. Client-side receipt of
+  any `PRIORITY_UPDATE`, invalid request targets, and push updates close the
+  connection with the RFC 9114 error code because server push remains
+  unsupported. Priority parse errors, invalid parameters, duplicate parameters,
+  request updates, and retained pre-request updates are counted in the HTTP/3
+  connection metrics.
 - **QUIC Retry admission and migration-policy runtime wiring (#387 Slice 4)** —
   adds `TARDIGRADE_HTTP3_RETRY_POLICY=off|address_validation` for the native
   HTTP/3 listener. Address-validation mode sends stateless QUIC Retry for
