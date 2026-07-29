@@ -1096,6 +1096,206 @@ test "retry token survives key rotation while a key is retained" {
     try testing.expectError(error.UnknownTokenKey, tokens.validateRetry(token, loopbackV4(4433), 1_000_000));
 }
 
+test "retry token deterministic boundary matrix rejects malformed public input" {
+    var tokens = RetryTokens{ .lifetime_us = 1_000_000 };
+    tokens.keys.install(0, [_]u8{0x31} ** token_key_len);
+
+    try testing.expectError(error.MalformedToken, tokens.validateRetry(&([_]u8{0xaa} ** (1 + token_nonce_len + token_min_plaintext_len + token_tag_len - 1)), loopbackV4(4433), 0));
+    try testing.expectError(error.MalformedToken, tokens.validateRetry(&([_]u8{0xaa} ** (max_token_len + 1)), loopbackV4(4433), 0));
+
+    var buf: [max_token_len]u8 = undefined;
+    const token = try tokens.issueRetry(&test_odcid, &test_retry_scid, test_version, loopbackV4(4433), 100, [_]u8{0x9a} ** token_nonce_len, &buf);
+
+    var mutated: [max_token_len]u8 = undefined;
+    @memcpy(mutated[0..token.len], token);
+    mutated[0] = max_token_keys;
+    try testing.expectError(error.UnknownTokenKey, tokens.validateRetry(mutated[0..token.len], loopbackV4(4433), 100));
+
+    @memcpy(mutated[0..token.len], token);
+    mutated[1] ^= 0x01;
+    try testing.expectError(error.TokenAuthenticationFailed, tokens.validateRetry(mutated[0..token.len], loopbackV4(4433), 100));
+
+    @memcpy(mutated[0..token.len], token);
+    mutated[1 + token_nonce_len] ^= 0x01;
+    try testing.expectError(error.TokenAuthenticationFailed, tokens.validateRetry(mutated[0..token.len], loopbackV4(4433), 100));
+
+    @memcpy(mutated[0..token.len], token);
+    mutated[token.len - 1] ^= 0x01;
+    try testing.expectError(error.TokenAuthenticationFailed, tokens.validateRetry(mutated[0..token.len], loopbackV4(4433), 100));
+
+    try testing.expectError(error.TokenAuthenticationFailed, tokens.validateRetry(token[0 .. token.len - token_tag_len], loopbackV4(4433), 100));
+    try testing.expectError(error.TokenAuthenticationFailed, tokens.validateRetry(token[0 .. token.len - 1], loopbackV4(4433), 100));
+}
+
+test "retry token validates exact time boundaries and u64 saturation" {
+    var tokens = RetryTokens{ .lifetime_us = 5_000, .allowed_clock_skew_us = 100 };
+    tokens.keys.install(0, [_]u8{0x41} ** token_key_len);
+
+    var buf: [max_token_len]u8 = undefined;
+    var token = try tokens.issueRetry(&test_odcid, &test_retry_scid, test_version, loopbackV4(4433), 10_000, [_]u8{0x42} ** token_nonce_len, &buf);
+    _ = try tokens.validateRetry(token, loopbackV4(4433), 10_000);
+    _ = try tokens.validateRetry(token, loopbackV4(4433), 15_000);
+    try testing.expectError(error.TokenExpired, tokens.validateRetry(token, loopbackV4(4433), 15_001));
+
+    token = try tokens.issueRetry(&test_odcid, &test_retry_scid, test_version, loopbackV4(4433), 20_000, [_]u8{0x43} ** token_nonce_len, &buf);
+    _ = try tokens.validateRetry(token, loopbackV4(4433), 19_900);
+    try testing.expectError(error.TokenExpired, tokens.validateRetry(token, loopbackV4(4433), 19_899));
+
+    token = try tokens.issueRetry(&test_odcid, &test_retry_scid, test_version, loopbackV4(4433), std.math.maxInt(u64), [_]u8{0x44} ** token_nonce_len, &buf);
+    _ = try tokens.validateRetry(token, loopbackV4(4433), std.math.maxInt(u64));
+    try testing.expectError(error.TokenExpired, tokens.validateRetry(token, loopbackV4(4433), std.math.maxInt(u64) - 101));
+}
+
+test "retry token authenticated malformed plaintext maps to public rejection classes" {
+    var tokens = RetryTokens{ .lifetime_us = 1_000_000 };
+    tokens.keys.install(0, [_]u8{0x51} ** token_key_len);
+    const nonce = [_]u8{0x52} ** token_nonce_len;
+    const address = loopbackV4(4433);
+    var plaintext: [token_max_plaintext_len]u8 = undefined;
+    var token: [max_token_len]u8 = undefined;
+
+    const wrong_kind_len = encodeTokenPlaintext(.address_validation, test_version, &test_odcid, &test_retry_scid, address, 1_000, &plaintext);
+    const wrong_kind = try sealTokenPlaintextForTest(&tokens, 0, nonce, plaintext[0..wrong_kind_len], &token);
+    try testing.expectError(error.UnexpectedTokenKind, tokens.validateRetry(wrong_kind, address, 1_000));
+
+    var len = minimalRetryPlaintextForTest(&plaintext, address, 1_000);
+    plaintext[13] = udp.MaxConnectionIdLen + 1;
+    const bad_odcid = try sealTokenPlaintextForTest(&tokens, 0, nonce, plaintext[0..len], &token);
+    try testing.expectError(error.MalformedToken, tokens.validateRetry(bad_odcid, address, 1_000));
+
+    len = minimalRetryPlaintextForTest(&plaintext, address, 1_000);
+    plaintext[14] = udp.MaxConnectionIdLen + 1;
+    const bad_retry_scid = try sealTokenPlaintextForTest(&tokens, 0, nonce, plaintext[0..len], &token);
+    try testing.expectError(error.MalformedToken, tokens.validateRetry(bad_retry_scid, address, 1_000));
+
+    len = minimalRetryPlaintextForTest(&plaintext, address, 1_000);
+    plaintext[15] = 0xff;
+    const bad_family = try sealTokenPlaintextForTest(&tokens, 0, nonce, plaintext[0..len], &token);
+    try testing.expectError(error.MalformedToken, tokens.validateRetry(bad_family, address, 1_000));
+
+    len = minimalRetryPlaintextForTest(&plaintext, address, 1_000);
+    plaintext[16] = 16;
+    const bad_addr_len = try sealTokenPlaintextForTest(&tokens, 0, nonce, plaintext[0..len], &token);
+    try testing.expectError(error.MalformedToken, tokens.validateRetry(bad_addr_len, address, 1_000));
+}
+
+test "fuzz: Retry token issue validate and mutation boundary is deterministic" {
+    try testing.fuzz({}, fuzzRetryTokenIssueValidate, .{ .corpus = &.{
+        "\x00",
+        "\x01\x02\x03\x04",
+        "\xff\x00\x7f\x40",
+        "\x14\x00\x14\x01",
+    } });
+}
+
+fn minimalRetryPlaintextForTest(out: *[token_max_plaintext_len]u8, address: udp.Address, issued_at_us: u64) usize {
+    return encodeTokenPlaintext(.retry, test_version, &.{}, &.{}, address, issued_at_us, out);
+}
+
+fn sealTokenPlaintextForTest(
+    tokens: *const RetryTokens,
+    key_id: u8,
+    nonce: [token_nonce_len]u8,
+    plaintext: []const u8,
+    out: []u8,
+) ![]const u8 {
+    const key = tokens.keys.get(key_id) orelse return error.TestUnexpectedResult;
+    const total = 1 + token_nonce_len + plaintext.len + token_tag_len;
+    if (out.len < total) return error.TestUnexpectedResult;
+    out[0] = key_id;
+    @memcpy(out[1..][0..token_nonce_len], &nonce);
+    const cipher = out[1 + token_nonce_len ..][0..plaintext.len];
+    var tag: [token_tag_len]u8 = undefined;
+    Aes128Gcm.encrypt(cipher, &tag, plaintext, &.{}, nonce, key);
+    @memcpy(out[1 + token_nonce_len + plaintext.len ..][0..token_tag_len], &tag);
+    return out[0..total];
+}
+
+fn fuzzRetryTokenIssueValidate(_: void, smith: *testing.Smith) !void {
+    var tokens = RetryTokens{
+        .lifetime_us = 1 + @as(u64, smith.value(u16)),
+        .allowed_clock_skew_us = @as(u64, smith.value(u8)),
+    };
+    tokens.keys.install(0, [_]u8{0x61} ** token_key_len);
+    tokens.keys.install(1, [_]u8{0x62} ** token_key_len);
+
+    var odcid_storage: [udp.MaxConnectionIdLen]u8 = undefined;
+    var retry_scid_storage: [udp.MaxConnectionIdLen]u8 = undefined;
+    @memset(&odcid_storage, 0);
+    @memset(&retry_scid_storage, 0);
+    _ = smith.slice(&odcid_storage);
+    _ = smith.slice(&retry_scid_storage);
+    const odcid_len = @as(usize, smith.value(u8)) % (udp.MaxConnectionIdLen + 1);
+    const retry_scid_len = @as(usize, smith.value(u8)) % (udp.MaxConnectionIdLen + 1);
+    const odcid = odcid_storage[0..odcid_len];
+    const retry_scid = retry_scid_storage[0..retry_scid_len];
+
+    var nonce: [token_nonce_len]u8 = undefined;
+    @memset(&nonce, 0);
+    _ = smith.slice(&nonce);
+    const issued_at = @as(u64, smith.value(u32));
+    const address = fuzzAddress(smith);
+    const version = smith.value(u32);
+
+    var buf: [max_token_len]u8 = undefined;
+    const token = try tokens.issueRetry(odcid, retry_scid, version, address, issued_at, nonce, &buf);
+    const ctx = try tokens.validateRetry(token, address, issued_at);
+    try testing.expectEqualSlices(u8, odcid, ctx.original_dcid.slice());
+    try testing.expectEqualSlices(u8, retry_scid, ctx.retry_scid.slice());
+    try testing.expectEqual(version, ctx.quic_version);
+
+    tokens.keys.install(2, [_]u8{0x63} ** token_key_len);
+    _ = try tokens.validateRetry(token, address, issued_at);
+
+    var mutated: [max_token_len]u8 = undefined;
+    @memcpy(mutated[0..token.len], token);
+    switch (smith.value(u3)) {
+        0 => {
+            mutated[0] = max_token_keys;
+            try testing.expectError(error.UnknownTokenKey, tokens.validateRetry(mutated[0..token.len], address, issued_at));
+        },
+        1 => {
+            mutated[1] ^= 0x01;
+            try testing.expectError(error.TokenAuthenticationFailed, tokens.validateRetry(mutated[0..token.len], address, issued_at));
+        },
+        2 => {
+            mutated[1 + token_nonce_len] ^= 0x01;
+            try testing.expectError(error.TokenAuthenticationFailed, tokens.validateRetry(mutated[0..token.len], address, issued_at));
+        },
+        3 => {
+            mutated[token.len - 1] ^= 0x01;
+            try testing.expectError(error.TokenAuthenticationFailed, tokens.validateRetry(mutated[0..token.len], address, issued_at));
+        },
+        4 => {
+            try testing.expectError(error.TokenAddressMismatch, tokens.validateRetry(token, mutateAddressPort(address), issued_at));
+        },
+        5 => {
+            try testing.expectError(error.TokenExpired, tokens.validateRetry(token, address, issued_at + tokens.lifetime_us + 1));
+        },
+        else => {
+            tokens.keys.retire(token[0]);
+            try testing.expectError(error.UnknownTokenKey, tokens.validateRetry(token, address, issued_at));
+        },
+    }
+}
+
+fn fuzzAddress(smith: *testing.Smith) udp.Address {
+    if (smith.value(u1) == 0) {
+        return udp.Address.ip4(.{ smith.value(u8), smith.value(u8), smith.value(u8), smith.value(u8) }, smith.value(u16));
+    }
+    var bytes: [16]u8 = undefined;
+    @memset(&bytes, 0);
+    _ = smith.slice(&bytes);
+    return udp.Address.ip6(bytes, smith.value(u16), smith.value(u32));
+}
+
+fn mutateAddressPort(address: udp.Address) udp.Address {
+    return switch (address.family) {
+        .ip4 => udp.Address.ip4(address.bytes[0..4].*, address.port +% 1),
+        .ip6 => udp.Address.ip6(address.bytes, address.port +% 1, address.scope_id),
+    };
+}
+
 test "retry integrity tag matches the RFC 9001 Appendix A.4 vector" {
     var odcid: [8]u8 = undefined;
     _ = try std.fmt.hexToBytes(&odcid, "8394c8f03e515708");

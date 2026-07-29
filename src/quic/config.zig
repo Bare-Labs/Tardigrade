@@ -63,6 +63,9 @@ pub const QpackConfig = struct {
     blocked_streams: u64 = 0,
 };
 
+/// RFC 9000 §4.6: stream-count transport parameters above 2^60 are invalid.
+pub const max_initial_streams_transport_parameter: u64 = 1 << 60;
+
 pub const Config = struct {
     enabled: bool = false,
     versions: VersionSet = .{},
@@ -93,6 +96,8 @@ pub const Config = struct {
         if (self.initial_max_stream_data_bidi_remote > self.initial_max_data) return error.InvalidFlowControlWindow;
         if (self.initial_max_stream_data_uni > self.initial_max_data) return error.InvalidFlowControlWindow;
         if (self.initial_max_streams_bidi == 0) return error.InvalidStreamLimit;
+        if (self.initial_max_streams_bidi > max_initial_streams_transport_parameter) return error.InvalidStreamLimit;
+        if (self.initial_max_streams_uni > max_initial_streams_transport_parameter) return error.InvalidStreamLimit;
         if (self.qpack.mode == .static_only and (self.qpack.dynamic_table_capacity != 0 or self.qpack.blocked_streams != 0)) {
             return error.InvalidQpackConfig;
         }
@@ -191,6 +196,8 @@ test "QUIC config validation rejects unsafe combinations" {
     try std.testing.expectError(error.UnsupportedQuicVersion, (Config{ .versions = .{ .v1 = false, .v2 = false } }).validate());
     try std.testing.expectError(error.InvalidActiveConnectionIdLimit, (Config{ .active_connection_id_limit = 1 }).validate());
     try std.testing.expectError(error.InvalidMaxUdpPayloadSize, (Config{ .max_udp_payload_size = 1199 }).validate());
+    try std.testing.expectError(error.InvalidStreamLimit, (Config{ .initial_max_streams_bidi = max_initial_streams_transport_parameter + 1 }).validate());
+    try std.testing.expectError(error.InvalidStreamLimit, (Config{ .initial_max_streams_uni = max_initial_streams_transport_parameter + 1 }).validate());
     try std.testing.expectError(error.InvalidFlowControlWindow, (Config{
         .initial_max_data = 1024,
         .initial_max_stream_data_bidi_local = 2048,

@@ -66,6 +66,12 @@ pub fn encodeTransportParametersBound(
     binding: config.CidBinding,
     buf: []u8,
 ) HandshakeError![]const u8 {
+    if (params.initial_max_streams_bidi > config.max_initial_streams_transport_parameter or
+        params.initial_max_streams_uni > config.max_initial_streams_transport_parameter)
+    {
+        return error.InvalidTransportParameters;
+    }
+
     var len: usize = 0;
     const entries = [_]struct { id: u64, value: u64 }{
         .{ .id = tp_max_idle_timeout, .value = params.max_idle_timeout_ms },
@@ -113,7 +119,7 @@ pub fn encodeTransportParametersBound(
     return buf[0..len];
 }
 
-pub const max_distinct_transport_parameters = 64;
+pub const max_tracked_unknown_transport_parameters = 64;
 
 pub fn decodeTransportParameters(bytes: []const u8) HandshakeError!config.TransportParameters {
     var binding = config.CidBinding{};
@@ -136,8 +142,9 @@ pub fn decodeTransportParametersBound(
         .initial_max_streams_uni = 0,
         .disable_active_migration = false,
     };
-    var seen_ids: [max_distinct_transport_parameters]u64 = undefined;
-    var seen_count: usize = 0;
+    var seen_known: u32 = 0;
+    var seen_unknown: [max_tracked_unknown_transport_parameters]u64 = undefined;
+    var seen_unknown_count: usize = 0;
     var offset: usize = 0;
     while (offset < bytes.len) {
         const id = varint.decode(bytes[offset..]) catch return error.InvalidTransportParameters;
@@ -148,12 +155,20 @@ pub fn decodeTransportParametersBound(
         const value_bytes = bytes[offset..][0..@intCast(value_len.value)];
         offset += value_bytes.len;
 
-        for (seen_ids[0..seen_count]) |seen_id| {
-            if (seen_id == id.value) return error.InvalidTransportParameters;
+        if (knownTransportParameterBit(id.value)) |bit| {
+            if (seen_known & bit != 0) return error.InvalidTransportParameters;
+            seen_known |= bit;
+        } else {
+            for (seen_unknown[0..seen_unknown_count]) |seen_id| {
+                if (seen_id == id.value) return error.InvalidTransportParameters;
+            }
+            // Unknown parameters must remain skippable. Once this bounded
+            // duplicate cache fills, keep ignoring further distinct unknown IDs.
+            if (seen_unknown_count < seen_unknown.len) {
+                seen_unknown[seen_unknown_count] = id.value;
+                seen_unknown_count += 1;
+            }
         }
-        if (seen_count == seen_ids.len) return error.InvalidTransportParameters;
-        seen_ids[seen_count] = id.value;
-        seen_count += 1;
 
         switch (id.value) {
             tp_max_idle_timeout => params.max_idle_timeout_ms = try integerParameter(value_bytes),
@@ -162,8 +177,16 @@ pub fn decodeTransportParametersBound(
             tp_initial_max_stream_data_bidi_local => params.initial_max_stream_data_bidi_local = try integerParameter(value_bytes),
             tp_initial_max_stream_data_bidi_remote => params.initial_max_stream_data_bidi_remote = try integerParameter(value_bytes),
             tp_initial_max_stream_data_uni => params.initial_max_stream_data_uni = try integerParameter(value_bytes),
-            tp_initial_max_streams_bidi => params.initial_max_streams_bidi = try integerParameter(value_bytes),
-            tp_initial_max_streams_uni => params.initial_max_streams_uni = try integerParameter(value_bytes),
+            tp_initial_max_streams_bidi => {
+                const value = try integerParameter(value_bytes);
+                if (value > config.max_initial_streams_transport_parameter) return error.InvalidTransportParameters;
+                params.initial_max_streams_bidi = value;
+            },
+            tp_initial_max_streams_uni => {
+                const value = try integerParameter(value_bytes);
+                if (value > config.max_initial_streams_transport_parameter) return error.InvalidTransportParameters;
+                params.initial_max_streams_uni = value;
+            },
             tp_disable_active_migration => {
                 if (value_bytes.len != 0) return error.InvalidTransportParameters;
                 params.disable_active_migration = true;
@@ -198,6 +221,29 @@ fn integerParameter(value_bytes: []const u8) HandshakeError!u64 {
     const decoded = varint.decode(value_bytes) catch return error.InvalidTransportParameters;
     if (decoded.len != value_bytes.len) return error.InvalidTransportParameters;
     return decoded.value;
+}
+
+fn knownTransportParameterBit(id: u64) ?u32 {
+    const index: u5 = switch (id) {
+        tp_original_destination_connection_id => 0,
+        tp_max_idle_timeout => 1,
+        tp_stateless_reset_token => 2,
+        tp_max_udp_payload_size => 3,
+        tp_initial_max_data => 4,
+        tp_initial_max_stream_data_bidi_local => 5,
+        tp_initial_max_stream_data_bidi_remote => 6,
+        tp_initial_max_stream_data_uni => 7,
+        tp_initial_max_streams_bidi => 8,
+        tp_initial_max_streams_uni => 9,
+        tp_ack_delay_exponent => 10,
+        tp_max_ack_delay => 11,
+        tp_disable_active_migration => 12,
+        tp_active_connection_id_limit => 13,
+        tp_initial_source_connection_id => 14,
+        tp_retry_source_connection_id => 15,
+        else => return null,
+    };
+    return @as(u32, 1) << index;
 }
 
 pub const Tls13Backend = struct {
@@ -597,6 +643,259 @@ test "QUIC adapter owns CID binding round trip" {
     var peer = config.CidBinding{};
     _ = try decodeTransportParametersBound(encoded, &peer);
     try std.testing.expectEqualDeep(local, peer);
+}
+
+test "transport parameter encoder rejects outbound stream count violations" {
+    var params = (config.Config{
+        .initial_max_streams_bidi = config.max_initial_streams_transport_parameter,
+        .initial_max_streams_uni = config.max_initial_streams_transport_parameter,
+    }).transportParameters() catch unreachable;
+    var buf: [max_transport_parameters_len]u8 = undefined;
+    _ = try encodeTransportParameters(params, &buf);
+
+    params.initial_max_streams_bidi = config.max_initial_streams_transport_parameter + 1;
+    try std.testing.expectError(error.InvalidTransportParameters, encodeTransportParameters(params, &buf));
+    params.initial_max_streams_bidi = config.max_initial_streams_transport_parameter;
+    params.initial_max_streams_uni = config.max_initial_streams_transport_parameter + 1;
+    try std.testing.expectError(error.InvalidTransportParameters, encodeTransportParameters(params, &buf));
+}
+
+test "transport parameter structural fuzz seeds preserve typed boundaries" {
+    try std.testing.expectEqualDeep(config.TransportParameters{
+        .max_idle_timeout_ms = 0,
+        .active_connection_id_limit = 2,
+        .max_udp_payload_size = 65_527,
+        .initial_max_data = 0,
+        .initial_max_stream_data_bidi_local = 0,
+        .initial_max_stream_data_bidi_remote = 0,
+        .initial_max_stream_data_uni = 0,
+        .initial_max_streams_bidi = 0,
+        .initial_max_streams_uni = 0,
+        .disable_active_migration = false,
+    }, try decodeTransportParameters(&.{}));
+
+    try std.testing.expectError(error.InvalidTransportParameters, decodeTransportParameters(&.{0xff}));
+    try std.testing.expectError(error.InvalidTransportParameters, decodeTransportParameters(&.{ tp_initial_max_data, 0xff }));
+    try std.testing.expectError(error.InvalidTransportParameters, decodeTransportParameters(&.{ tp_initial_max_data, 0x02, 0x00 }));
+    try std.testing.expectError(error.InvalidTransportParameters, decodeTransportParameters(&.{ tp_initial_max_data, 0x01, 0x40 }));
+    try std.testing.expectError(error.InvalidTransportParameters, decodeTransportParameters(&.{ tp_initial_max_data, 0x02, 0x01, 0xff }));
+
+    const unknown = [_]u8{ 0x21, 0x03, 0xaa, 0xbb, 0xcc };
+    _ = try decodeTransportParameters(&unknown);
+    const duplicate_unknown = [_]u8{ 0x21, 0x00, 0x21, 0x00 };
+    try std.testing.expectError(error.InvalidTransportParameters, decodeTransportParameters(&duplicate_unknown));
+
+    var many: [512]u8 = undefined;
+    var pos: usize = 0;
+    var id: u64 = 0x21;
+    while (id < 0x21 + max_tracked_unknown_transport_parameters + 8) : (id += 1) {
+        try appendTpRaw(&many, &pos, id, &.{});
+    }
+    _ = try decodeTransportParameters(many[0..pos]);
+}
+
+test "transport parameter semantic boundary regressions" {
+    try expectTpIntRejected(tp_max_udp_payload_size, 1199);
+    try std.testing.expectEqual(@as(u64, 1200), (try decodeOneTpInt(tp_max_udp_payload_size, 1200)).max_udp_payload_size);
+    try std.testing.expectEqual(@as(u64, 65_527), (try decodeOneTpInt(tp_max_udp_payload_size, 65_527)).max_udp_payload_size);
+    try expectTpIntRejected(tp_max_udp_payload_size, 65_528);
+
+    try expectTpIntRejected(tp_active_connection_id_limit, 0);
+    try expectTpIntRejected(tp_active_connection_id_limit, 1);
+    try std.testing.expectEqual(@as(u64, 2), (try decodeOneTpInt(tp_active_connection_id_limit, 2)).active_connection_id_limit);
+    try std.testing.expectEqual(@as(u64, max_quic_varint), (try decodeOneTpInt(tp_active_connection_id_limit, max_quic_varint)).active_connection_id_limit);
+
+    try std.testing.expectEqual(@as(u8, 20), (try decodeOneTpInt(tp_ack_delay_exponent, 20)).ack_delay_exponent);
+    try expectTpIntRejected(tp_ack_delay_exponent, 21);
+    try std.testing.expectEqual(@as(u64, (1 << 14) - 1), (try decodeOneTpInt(tp_max_ack_delay, (1 << 14) - 1)).max_ack_delay_ms);
+    try expectTpIntRejected(tp_max_ack_delay, 1 << 14);
+
+    try std.testing.expectEqual(@as(u64, 0), (try decodeOneTpInt(tp_initial_max_data, 0)).initial_max_data);
+    try std.testing.expectEqual(@as(u64, 7), (try decodeOneTpInt(tp_initial_max_stream_data_bidi_local, 7)).initial_max_stream_data_bidi_local);
+    try std.testing.expectEqual(max_quic_varint, (try decodeOneTpInt(tp_initial_max_stream_data_bidi_remote, max_quic_varint)).initial_max_stream_data_bidi_remote);
+    try std.testing.expectEqual(@as(u64, 0), (try decodeOneTpInt(tp_initial_max_stream_data_uni, 0)).initial_max_stream_data_uni);
+    try std.testing.expectEqual(@as(u64, 3), (try decodeOneTpInt(tp_initial_max_streams_bidi, 3)).initial_max_streams_bidi);
+    try std.testing.expectEqual(config.max_initial_streams_transport_parameter, (try decodeOneTpInt(tp_initial_max_streams_bidi, config.max_initial_streams_transport_parameter)).initial_max_streams_bidi);
+    try expectTpIntRejected(tp_initial_max_streams_bidi, config.max_initial_streams_transport_parameter + 1);
+    try std.testing.expectEqual(config.max_initial_streams_transport_parameter, (try decodeOneTpInt(tp_initial_max_streams_uni, config.max_initial_streams_transport_parameter)).initial_max_streams_uni);
+    try expectTpIntRejected(tp_initial_max_streams_uni, config.max_initial_streams_transport_parameter + 1);
+
+    var flag: [8]u8 = undefined;
+    var pos: usize = 0;
+    try appendTpRaw(&flag, &pos, tp_disable_active_migration, &.{});
+    try std.testing.expect((try decodeTransportParameters(flag[0..pos])).disable_active_migration);
+    pos = 0;
+    try appendTpRaw(&flag, &pos, tp_disable_active_migration, &.{0});
+    try std.testing.expectError(error.InvalidTransportParameters, decodeTransportParameters(flag[0..pos]));
+}
+
+test "transport parameter CID binding boundary regressions" {
+    const max_cid = [_]u8{0xcd} ** config.max_cid_len;
+    const cid_ids = [_]u64{
+        tp_initial_source_connection_id,
+        tp_original_destination_connection_id,
+        tp_retry_source_connection_id,
+    };
+    inline for (cid_ids) |id| {
+        var zero: [8]u8 = undefined;
+        var pos: usize = 0;
+        try appendTpRaw(&zero, &pos, id, &.{});
+        var zero_binding = config.CidBinding{};
+        _ = try decodeTransportParametersBound(zero[0..pos], &zero_binding);
+        try expectBindingCidLen(zero_binding, id, 0);
+
+        var exact: [64]u8 = undefined;
+        pos = 0;
+        try appendTpRaw(&exact, &pos, id, &max_cid);
+        var exact_binding = config.CidBinding{};
+        _ = try decodeTransportParametersBound(exact[0..pos], &exact_binding);
+        try expectBindingCidLen(exact_binding, id, config.max_cid_len);
+
+        var one_over: [64]u8 = undefined;
+        pos = 0;
+        try appendTpRaw(&one_over, &pos, id, &([_]u8{0xee} ** (config.max_cid_len + 1)));
+        var rejected_binding = config.CidBinding{};
+        try std.testing.expectError(error.InvalidTransportParameters, decodeTransportParametersBound(one_over[0..pos], &rejected_binding));
+    }
+
+    var reset: [64]u8 = undefined;
+    var pos: usize = 0;
+    try appendTpRaw(&reset, &pos, tp_stateless_reset_token, &([_]u8{0xa5} ** 16));
+    var binding = config.CidBinding{};
+    _ = try decodeTransportParametersBound(reset[0..pos], &binding);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 16), &binding.stateless_reset_token.?);
+    pos = 0;
+    try appendTpRaw(&reset, &pos, tp_stateless_reset_token, &([_]u8{0xa5} ** 15));
+    try std.testing.expectError(error.InvalidTransportParameters, decodeTransportParametersBound(reset[0..pos], &binding));
+    pos = 0;
+    try appendTpRaw(&reset, &pos, tp_stateless_reset_token, &([_]u8{0xa5} ** 17));
+    try std.testing.expectError(error.InvalidTransportParameters, decodeTransportParametersBound(reset[0..pos], &binding));
+}
+
+test "fuzz: transport parameter decoder preserves bounded structural contract" {
+    try std.testing.fuzz({}, fuzzTransportParameterDecode, .{ .corpus = &.{
+        "",
+        "\xff",
+        "\x04\xff",
+        "\x04\x02\x00",
+        "\x04\x01\x40",
+        "\x04\x02\x01\xff",
+        "\x21\x03\xaa\xbb\xcc",
+        "\x21\x00\x21\x00",
+        "\x03\x02\x44\xb0",
+        "\x0e\x01\x02",
+        "\x0c\x00",
+        "\x0c\x01\x00",
+        "\x0f\x00",
+        "\x02\x10abcdefghijklmnop",
+    } });
+}
+
+test "fuzz: transport parameters canonical encode and binding round-trip" {
+    try std.testing.fuzz({}, fuzzTransportParameterRoundTrip, .{ .corpus = &.{
+        "\x00",
+        "\x01\x02\x03\x04",
+        "\x14\x00\x10\x08",
+        "\xff\x00\x7f\x40",
+    } });
+}
+
+const max_quic_varint = (1 << 62) - 1;
+
+fn appendTpRaw(out: []u8, pos: *usize, id: u64, value: []const u8) !void {
+    pos.* += varint.encode(id, out[pos.*..]) catch return error.TestUnexpectedResult;
+    pos.* += varint.encode(value.len, out[pos.*..]) catch return error.TestUnexpectedResult;
+    if (value.len > out.len - pos.*) return error.TestUnexpectedResult;
+    @memcpy(out[pos.*..][0..value.len], value);
+    pos.* += value.len;
+}
+
+fn appendTpInt(out: []u8, pos: *usize, id: u64, value: u64) !void {
+    var encoded: [8]u8 = undefined;
+    const value_len = varint.encode(value, &encoded) catch return error.TestUnexpectedResult;
+    try appendTpRaw(out, pos, id, encoded[0..value_len]);
+}
+
+fn decodeOneTpInt(id: u64, value: u64) !config.TransportParameters {
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    try appendTpInt(&buf, &pos, id, value);
+    return try decodeTransportParameters(buf[0..pos]);
+}
+
+fn expectTpIntRejected(id: u64, value: u64) !void {
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    try appendTpInt(&buf, &pos, id, value);
+    try std.testing.expectError(error.InvalidTransportParameters, decodeTransportParameters(buf[0..pos]));
+}
+
+fn expectBindingCidLen(binding: config.CidBinding, id: u64, expected_len: usize) !void {
+    const value = switch (id) {
+        tp_initial_source_connection_id => binding.initial_source_connection_id,
+        tp_original_destination_connection_id => binding.original_destination_connection_id,
+        tp_retry_source_connection_id => binding.retry_source_connection_id,
+        else => unreachable,
+    } orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(expected_len, value.slice().len);
+}
+
+fn fuzzTransportParameterDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len = smith.slice(&buf);
+    var binding = config.CidBinding{};
+    const decoded = decodeTransportParametersBound(buf[0..len], &binding) catch return;
+    try std.testing.expect(decoded.max_udp_payload_size >= 1200);
+    try std.testing.expect(decoded.max_udp_payload_size <= 65_527);
+    try std.testing.expect(decoded.active_connection_id_limit >= 2);
+    try std.testing.expect(decoded.ack_delay_exponent <= 20);
+    try std.testing.expect(decoded.max_ack_delay_ms < 1 << 14);
+    if (binding.initial_source_connection_id) |value| try std.testing.expect(value.slice().len <= config.max_cid_len);
+    if (binding.original_destination_connection_id) |value| try std.testing.expect(value.slice().len <= config.max_cid_len);
+    if (binding.retry_source_connection_id) |value| try std.testing.expect(value.slice().len <= config.max_cid_len);
+}
+
+fn fuzzTransportParameterRoundTrip(_: void, smith: *std.testing.Smith) !void {
+    var cid_bytes: [config.max_cid_len]u8 = undefined;
+    var odcid_bytes: [config.max_cid_len]u8 = undefined;
+    var retry_bytes: [config.max_cid_len]u8 = undefined;
+    @memset(&cid_bytes, 0);
+    @memset(&odcid_bytes, 0);
+    @memset(&retry_bytes, 0);
+    _ = smith.slice(&cid_bytes);
+    _ = smith.slice(&odcid_bytes);
+    _ = smith.slice(&retry_bytes);
+    const cid_len = @as(usize, smith.value(u8)) % (config.max_cid_len + 1);
+    const odcid_len = @as(usize, smith.value(u8)) % (config.max_cid_len + 1);
+    const retry_len = @as(usize, smith.value(u8)) % (config.max_cid_len + 1);
+
+    const params = config.TransportParameters{
+        .max_idle_timeout_ms = @as(u64, smith.value(u32)),
+        .active_connection_id_limit = 2 + @as(u64, smith.value(u16)),
+        .max_udp_payload_size = 1200 + (@as(u64, smith.value(u16)) % (65_527 - 1200 + 1)),
+        .initial_max_data = smith.value(u64) & max_quic_varint,
+        .initial_max_stream_data_bidi_local = smith.value(u64) & max_quic_varint,
+        .initial_max_stream_data_bidi_remote = smith.value(u64) & max_quic_varint,
+        .initial_max_stream_data_uni = smith.value(u64) & max_quic_varint,
+        .initial_max_streams_bidi = smith.value(u64) % (config.max_initial_streams_transport_parameter + 1),
+        .initial_max_streams_uni = smith.value(u64) % (config.max_initial_streams_transport_parameter + 1),
+        .disable_active_migration = smith.value(u1) == 1,
+        .ack_delay_exponent = @as(u8, smith.value(u5)) % 21,
+        .max_ack_delay_ms = @as(u64, smith.value(u16)) % (1 << 14),
+    };
+    const binding = config.CidBinding{
+        .initial_source_connection_id = try config.CidValue.init(cid_bytes[0..cid_len]),
+        .original_destination_connection_id = try config.CidValue.init(odcid_bytes[0..odcid_len]),
+        .retry_source_connection_id = try config.CidValue.init(retry_bytes[0..retry_len]),
+        .stateless_reset_token = [_]u8{smith.value(u8)} ** 16,
+    };
+
+    var encoded: [max_transport_parameters_len]u8 = undefined;
+    const bytes = try encodeTransportParametersBound(params, binding, &encoded);
+    var decoded_binding = config.CidBinding{};
+    const decoded = try decodeTransportParametersBound(bytes, &decoded_binding);
+    try std.testing.expectEqualDeep(params, decoded);
+    try std.testing.expectEqualDeep(binding, decoded_binding);
 }
 
 test "QUIC TLS backend does not embed maximum ticket storage" {
