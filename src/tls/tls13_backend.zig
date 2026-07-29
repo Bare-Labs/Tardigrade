@@ -1860,9 +1860,17 @@ pub const Tls13Backend = struct {
                 self.core.retry_state == .none and hello_retry.isHelloRetryRequest(message.body);
             const is_second_client_hello = self.role == .server and message.kind == .client_hello and
                 self.core.retry_state == .hrr_sent;
+            // #484: `acceptHelloRetryRequest`/`acceptSecondClientHello` are
+            // not read-only — they immediately rebind/update the transcript
+            // and advance handshake state. A sentinel-shaped-but-illegal
+            // HRR, or an illegal ClientHello2 mutation, must be rejected
+            // *before* either mutation ever runs, not only afterward by
+            // `onHelloRetryRequest`/`onClientHello`.
             if (is_hello_retry_request) {
+                try self.validateHelloRetryRequest(message.body);
                 _ = self.core.acceptHelloRetryRequest(message.raw) catch |err| return mapCoreError(err);
             } else if (is_second_client_hello) {
+                try self.validateSecondClientHelloAgainstRetained(message.raw);
                 _ = self.core.acceptSecondClientHello(message.raw) catch |err| return mapCoreError(err);
             } else {
                 _ = self.core.acceptReceived(message.raw) catch |err| return mapCoreError(err);
@@ -1878,6 +1886,36 @@ pub const Tls13Backend = struct {
             // may batch several NewSessionTickets).
             if ((self.core.handshake_lifecycle == .complete or self.core.handshake_lifecycle == .failed) and level != .application) break;
         }
+    }
+
+    /// Client (#484): validates a HelloRetryRequest's wire bytes against
+    /// the retained ClientHello1 — called from `drainInput` *before*
+    /// `Core.acceptHelloRetryRequest` ever runs, since that transition
+    /// immediately rebinds and updates the transcript and must never
+    /// commit an illegal/malformed HRR. `onHelloRetryRequest` repeats this
+    /// same decode to obtain the `Request` it needs to build
+    /// ClientHello2; that second decode is deterministic over the same
+    /// retained bytes and cannot diverge from this one.
+    fn validateHelloRetryRequest(self: *const Tls13Backend, body: []const u8) HandshakeError!void {
+        const ch1_capture = self.client_hello_psk orelse return error.InvalidHandshakeState;
+        const ch1_body = ch1_capture.message[0..ch1_capture.message_len][handshake_header_len..];
+        const parsed = tls_negotiation.parseClientHelloObserved(ch1_body, null) catch |err| return mapNegotiationError(err);
+        _ = hello_retry.decode(body, "", &parsed.offers) catch |err| return mapCoreError(err);
+    }
+
+    /// Server (#484): validates ClientHello2's wire bytes against the
+    /// retained ClientHello1 and the committed HRR request — called from
+    /// `drainInput` *before* `Core.acceptSecondClientHello` ever runs,
+    /// since that transition updates the transcript and advances
+    /// handshake state and must never commit an illegal CH2 mutation.
+    /// `onClientHello` trusts that this already succeeded for any dispatch
+    /// reaching it with `core.retry_state == .hrr_sent` and does not
+    /// repeat it.
+    fn validateSecondClientHelloAgainstRetained(self: *Tls13Backend, raw: []const u8) HandshakeError!void {
+        const request = self.retry.request orelse return error.InvalidHandshakeState;
+        const ch1_capture = self.client_hello_psk orelse return error.InvalidHandshakeState;
+        hello_retry.validateSecondClientHello(ch1_capture.message[0..ch1_capture.message_len], raw, request) catch |err| return mapCoreError(err);
+        if (request.cookie) |cookie| try self.hello_retry_cookie_provider.validate(cookie);
     }
 
     fn expectedLevel(kind: MessageType) HandshakeError!EncryptionLevel {
@@ -3412,24 +3450,16 @@ pub const Tls13Backend = struct {
             .observeFn = ClientHelloObserver.observe,
         }) catch |err| return mapNegotiationError(err);
         const offers = parsed.offers;
-        // #484: ClientHello2 must be validated against the retained
-        // ClientHello1 and the committed HRR parameters *before*
-        // re-negotiating or committing any peer metadata below (negotiated
-        // tuple, ALPN, transport extension, SNI, PSK capture) — otherwise an
-        // illegal CH2 mutation could be classified by ordinary negotiation
-        // first (e.g. a CH2 that drops the HRR-required key_share would
-        // surface as `MissingExtension` instead of being rejected by the
-        // canonical mutation validator). `hello_retry.validateSecondClientHello`
-        // decodes `raw`/the retained ClientHello1 itself; it does not need
-        // `offers`. Only clear the retained retry context once this
-        // succeeds — the `.retry` arm below still needs it if negotiation
-        // (impossible under this backend's fixed policy, but not something
-        // this check can assume) somehow decides to retry a second time.
+        // #484: `drainInput`'s preflight (`validateSecondClientHelloAgainstRetained`)
+        // already validated this ClientHello2 against the retained
+        // ClientHello1/HRR request — and did so *before*
+        // `Core.acceptSecondClientHello` ever mutated the transcript/handshake
+        // state — for any dispatch reaching this point with
+        // `retry_state == .hrr_sent`. Just clear the now-unneeded retry
+        // capture here, still before any of the peer metadata below
+        // (negotiated tuple, ALPN, transport extension, SNI, PSK capture)
+        // is committed from this second hello.
         if (self.core.retry_state == .hrr_sent) {
-            const request = self.retry.request orelse return error.InvalidHandshakeState;
-            const ch1_capture = self.client_hello_psk orelse return error.InvalidHandshakeState;
-            hello_retry.validateSecondClientHello(ch1_capture.message[0..ch1_capture.message_len], raw, request) catch |err| return mapCoreError(err);
-            if (request.cookie) |cookie| try self.hello_retry_cookie_provider.validate(cookie);
             self.clearClientHelloPsk();
             self.retry.wipe();
         }
