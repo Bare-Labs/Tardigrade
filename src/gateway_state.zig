@@ -3531,6 +3531,7 @@ fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) voi
     // counters, so the pool must be a valid (empty) instance here.
     gs.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
     gs.h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
+    gs.http3_advertisement_state = .disabled;
     gs.proxy_buffer_limits = .{
         .per_stream_low_watermark = 256 * 1024,
         .per_stream_high_watermark = 768 * 1024,
@@ -3594,6 +3595,7 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_upstream_h2_streaming_upload_fallback_total 1\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 786432\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_config_limit_bytes{queue=\"outbound_ciphertext\",limit=\"hard\"}") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_effective_state{state=\"disabled\"} 1\n") != null);
 }
 
 test "served Prometheus metrics reflect updated proxy buffer limit snapshot" {

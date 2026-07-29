@@ -24,7 +24,6 @@ const http3_session = @import("http3_session.zig");
 const logger_mod = @import("logger.zig");
 const metrics_mod = @import("metrics.zig");
 const response_mod = @import("response.zig");
-const shutdown = @import("shutdown.zig");
 const stream_transport = @import("stream_transport");
 const quic = @import("quic");
 const http3 = @import("http3");
@@ -155,6 +154,9 @@ pub const Snapshot = struct {
     migrations_blocked_no_peer_cid: usize = 0,
     last_error_code: i32 = 0,
     draining: bool = false,
+    h3_goaway_sent: usize = 0,
+    h3_drain_request_rejections: usize = 0,
+    active_cid_routes: usize = 0,
 
     pub fn handshakeState(self: Snapshot) []const u8 {
         if (!self.server_bootstrapped) return "bootstrap_incomplete";
@@ -393,7 +395,7 @@ pub const Runtime = struct {
 
         while (!self.stopping.load(.acquire)) {
             const now = nowUs();
-            const draining = self.drain_requested.load(.acquire) or shutdown.isShutdownRequested();
+            const draining = self.drain_requested.load(.acquire);
             const drain_deadline = self.drain_deadline_us.load(.acquire);
             const drain_expired = draining and drain_deadline != 0 and now >= drain_deadline;
 
@@ -690,8 +692,10 @@ pub const Runtime = struct {
             allocator.destroy(entry);
             return null;
         };
+        self.noteCidRouteCount(routes.count());
         connections.put(handle, entry) catch {
             routes.remove(cid);
+            self.noteCidRouteCount(routes.count());
             entry.deinit(allocator);
             allocator.destroy(entry);
             return null;
@@ -699,6 +703,7 @@ pub const Runtime = struct {
         incPerIp(per_ip, peer.addr) catch {
             _ = connections.remove(handle);
             routes.remove(cid);
+            self.noteCidRouteCount(routes.count());
             entry.deinit(allocator);
             allocator.destroy(entry);
             return null;
@@ -784,6 +789,7 @@ pub const Runtime = struct {
     ) void {
         if (connections.fetchRemove(handle)) |kv| {
             for (kv.value.owned_cids[0..kv.value.owned_cid_count]) |cid| routes.remove(cid);
+            self.noteCidRouteCount(routes.count());
             decPerIp(per_ip, kv.value.admission_source_ip);
             kv.value.deinit(self.allocator);
             self.allocator.destroy(kv.value);
@@ -792,13 +798,13 @@ pub const Runtime = struct {
     }
 
     fn syncCidRoutes(self: *Runtime, entry: *ConnEntry, routes: *quic.cid.CidRoutingTable) void {
-        _ = self;
         var active: [quic.cid.max_local_active_cids]quic.cid.ConnectionId = undefined;
         const active_count = entry.conn.copyActiveLocalCids(&active);
         var i: usize = 0;
         while (i < entry.owned_cid_count) {
             if (!cidSliceContains(active[0..active_count], entry.owned_cids[i])) {
                 routes.remove(entry.owned_cids[i]);
+                self.noteCidRouteCount(routes.count());
                 entry.owned_cids[i] = entry.owned_cids[entry.owned_cid_count - 1];
                 entry.owned_cid_count -= 1;
                 continue;
@@ -808,7 +814,6 @@ pub const Runtime = struct {
     }
 
     fn maintainLocalCidRoutes(self: *Runtime, entry: *ConnEntry, handle: u64, routes: *quic.cid.CidRoutingTable) void {
-        _ = self;
         while (entry.conn.needsLocalCid() and entry.owned_cid_count < entry.owned_cids.len) {
             var cid_value: ?quic.cid.ConnectionId = null;
             var entropy: [quic.udp.MaxConnectionIdLen]u8 = undefined;
@@ -821,7 +826,7 @@ pub const Runtime = struct {
             }
             const cid = cid_value orelse return;
             switch (registerLocalCidRoute(entry, handle, routes, cid)) {
-                .registered => {},
+                .registered => self.noteCidRouteCount(routes.count()),
                 .collision => continue,
                 .queue_failed => return,
             }
@@ -888,6 +893,7 @@ pub const Runtime = struct {
                 if (requestRejectedByDrainBoundary(incoming.stream_id, boundary)) {
                     entry.conn.resetStream(incoming.stream_id, 0x010b) catch {}; // H3_REQUEST_REJECTED
                     entry.h3.finishRequest(incoming.stream_id);
+                    self.noteDrainRequestRejected();
                     continue;
                 }
             }
@@ -904,6 +910,7 @@ pub const Runtime = struct {
             return;
         };
         entry.drain_goaway_sent = true;
+        self.noteDrainGoawaySent();
     }
 
     fn serveRequest(self: *Runtime, entry: *ConnEntry, incoming: H3.IncomingRequest, now: u64) void {
@@ -1261,6 +1268,24 @@ pub const Runtime = struct {
         self.snapshot_state.native_connections -|= 1;
         self.snapshot_state.tracked_connections -|= 1;
         if (self.snapshot_state.tracked_connections == 0) self.snapshot_state.draining = false;
+    }
+
+    fn noteCidRouteCount(self: *Runtime, count: usize) void {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        self.snapshot_state.active_cid_routes = count;
+    }
+
+    fn noteDrainGoawaySent(self: *Runtime) void {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        self.snapshot_state.h3_goaway_sent += 1;
+    }
+
+    fn noteDrainRequestRejected(self: *Runtime) void {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        self.snapshot_state.h3_drain_request_rejections += 1;
     }
 
     fn noteHandshakeComplete(self: *Runtime) void {

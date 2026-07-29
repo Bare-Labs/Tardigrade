@@ -799,6 +799,166 @@ test "udp smoke: HTTP/3 runtime Retry round trip completes a native H3 request" 
     try testing.expect(snapshot.nat_rebindings > before_rebind.nat_rebindings);
 }
 
+test "udp smoke: HTTP/3 runtime drain lets admitted work finish and rejects new work" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = http3_runtime.Logger.init(.err, "udp-runtime-drain-lifecycle-test");
+    var handler_state = RuntimeHandlerState{};
+    var runtime = try http3_runtime.Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .request_handler = runtimeSmokeHandler,
+        .request_handler_ctx = &handler_state,
+    });
+    defer runtime.deinit();
+    runtime.start();
+
+    var client_socket = try UdpSocket.open();
+    defer client_socket.close();
+
+    const client_cid = [_]u8{ 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8 };
+    const odcid = [_]u8{ 0xa3, 0xa4, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const client_path = quic.path.PathKey{
+        .local = addressFromSockaddrIn(client_socket.addr),
+        .remote = runtime.local_address,
+    };
+    var client_backend = tls_backend.Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0xe1} ** 32, .key_share_seed = [_]u8{0x41} ** 32, .retry_key_share_seed = [_]u8{0x41} ** 32 },
+        .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
+    );
+    const client = try Connection.init(allocator, .{
+        .role = .client,
+        .local_cid = &client_cid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
+        .tls = client_backend.backend(),
+        .now_us = nowUs(),
+        .initial_path = client_path,
+    });
+    defer client.deinit();
+    var client_h3 = H3.init(allocator, .client);
+    defer client_h3.deinit();
+
+    var h3_started = false;
+    var request_a: ?u64 = null;
+    var request_a_done = false;
+    var request_b: ?u64 = null;
+    var request_b_sent = false;
+    var drain_started = false;
+    var sent_new_initial = false;
+    var new_initial_seen = false;
+    var new_conn_socket = try UdpSocket.open();
+    defer new_conn_socket.close();
+    var tracked_at_new_initial: usize = 0;
+    var datagrams_before_new_initial: usize = 0;
+
+    const deadline = nowUs() + 10_000_000;
+    var iterations: usize = 0;
+    while (nowUs() < deadline and !new_initial_seen) : (iterations += 1) {
+        try testing.expect(iterations < 5_000);
+        const now = nowUs();
+
+        var out: [2048]u8 = undefined;
+        while (client.pollTransmitOnPath(&out, now)) |t| {
+            try client_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
+        }
+
+        var next: u64 = now + 50_000;
+        if (client.nextTimeoutUs()) |t| next = @min(next, t);
+        const timeout_ms: i32 = @intCast(@min((next -| now) / 1_000 + 1, 50));
+        var fds = [_]posix.pollfd{.{ .fd = client_socket.fd, .events = posix.POLL.IN, .revents = 0 }};
+        _ = try posix.poll(&fds, timeout_ms);
+
+        var in: [2048]u8 = undefined;
+        while (try client_socket.recv(&in)) |datagram| {
+            try client.ingestOnPath(datagram, client_path, test_challenge_entropy, nowUs());
+        }
+        client.onTimeout(nowUs());
+
+        if (!h3_started and client.isEstablished()) {
+            try client_h3.start(client);
+            h3_started = true;
+        }
+        if (h3_started and request_a == null) {
+            request_a = try client_h3.sendRequest(client, .{
+                .authority = "tardigrade.test",
+                .path = "/runtime-retry",
+                .body = "runtime-drain-admitted",
+            });
+        }
+        try client_h3.pump(client);
+
+        if (!drain_started and handler_state.requests.load(.monotonic) == 1) {
+            runtime.beginDrain(http3_runtime.Runtime.nowUsPublic() + 5_000_000);
+            drain_started = true;
+        }
+
+        if (request_a) |id| {
+            if (!request_a_done) {
+                if (try client_h3.pollResponse(id)) |response| {
+                    try testing.expectEqual(@as(u16, 200), response.status);
+                    try testing.expectEqualStrings("runtime-retry-response", response.body);
+                    request_a_done = true;
+                    client_h3.releaseResponse(id);
+                }
+            }
+        }
+
+        if (drain_started and request_a_done and request_b == null) {
+            request_b = try client_h3.sendRequest(client, .{
+                .authority = "tardigrade.test",
+                .path = "/runtime-retry",
+                .body = "runtime-drain-rejected",
+            });
+            request_b_sent = true;
+        }
+
+        const snapshot = runtime.snapshot();
+        if (request_b_sent and snapshot.h3_drain_request_rejections >= 1 and !sent_new_initial) {
+            tracked_at_new_initial = snapshot.tracked_connections;
+            datagrams_before_new_initial = snapshot.datagrams_seen;
+            var initial_buf: [128]u8 = undefined;
+            const new_initial = try writeSyntheticInitial(
+                quic.packet.quic_v1,
+                &[_]u8{ 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8 },
+                &[_]u8{ 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8 },
+                "",
+                &initial_buf,
+            );
+            try new_conn_socket.sendTo(sockaddrInFromAddress(runtime.local_address), new_initial);
+            sent_new_initial = true;
+        }
+        if (sent_new_initial) {
+            const after_new = runtime.snapshot();
+            if (after_new.datagrams_seen > datagrams_before_new_initial) {
+                try testing.expectEqual(tracked_at_new_initial, after_new.tracked_connections);
+                new_initial_seen = true;
+            }
+        }
+    }
+
+    try testing.expect(drain_started);
+    try testing.expect(request_a_done);
+    try testing.expect(request_b_sent);
+    try testing.expect(new_initial_seen);
+    try testing.expectEqual(@as(usize, 1), handler_state.requests.load(.monotonic));
+    const drained_snapshot = runtime.snapshot();
+    try testing.expect(drained_snapshot.h3_goaway_sent >= 1);
+    try testing.expect(drained_snapshot.h3_drain_request_rejections >= 1);
+
+    client.close(0, "runtime-drain-done", nowUs());
+    var close_out: [2048]u8 = undefined;
+    while (client.pollTransmitOnPath(&close_out, nowUs())) |t| {
+        try client_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
+    }
+    const final_snapshot = try waitRuntimeSnapshot(&runtime, hasNoTrackedConnections);
+    try testing.expectEqual(@as(usize, 0), final_snapshot.tracked_connections);
+    try testing.expectEqual(@as(usize, 0), final_snapshot.active_cid_routes);
+    try testing.expect(runtime.isDrained());
+}
+
 // ---------------------------------------------------------------------------
 // Appliance credential provider over native QUIC (#392): the same strict
 // Ed25519 owner that authenticates native TCP TLS drives a real loopback QUIC
