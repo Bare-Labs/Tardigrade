@@ -15,6 +15,7 @@
 const std = @import("std");
 const early_data = @import("early_data.zig");
 const frame = @import("frame.zig");
+const priority = @import("priority.zig");
 const qpack = @import("qpack.zig");
 const session = @import("session.zig");
 const stream_transport = @import("stream_transport");
@@ -40,6 +41,7 @@ pub const ErrorCode = enum(u64) {
     closed_critical_stream = 0x0104,
     frame_unexpected = 0x0105,
     frame_error = 0x0106,
+    excessive_load = 0x0107,
     id_error = 0x0108,
     settings_error = 0x0109,
     missing_settings = 0x010a,
@@ -86,6 +88,9 @@ pub fn Conn(comptime Transport: type) type {
         pending_uni: std.AutoHashMap(u64, PendingUni),
         /// Server: in-flight request decoding sessions by stream id.
         requests: std.AutoHashMap(u64, *ServerRequest),
+        /// PRIORITY_UPDATE frames may overtake their request streams; retain
+        /// the newest bounded update until the stream appears.
+        pending_priority_updates: std.AutoHashMap(u64, priority.Priority),
         /// Client: in-flight response accumulation by stream id.
         responses: std.AutoHashMap(u64, *ClientResponse),
         /// Bidirectional streams the peer opened that we haven't classified.
@@ -99,7 +104,15 @@ pub fn Conn(comptime Transport: type) type {
             responses_decoded: u64 = 0,
             settings_received: bool = false,
             unknown_uni_streams: u64 = 0,
+            priority_updates_received: u64 = 0,
+            priority_updates_ignored_push: u64 = 0,
+            priority_parse_errors: u64 = 0,
+            priority_invalid_parameters: u64 = 0,
+            priority_duplicate_parameters: u64 = 0,
+            priority_updates_buffered: u64 = 0,
         };
+
+        const max_pending_priority_updates: usize = 64;
 
         const PendingUni = struct {
             classified: bool = false,
@@ -110,6 +123,8 @@ pub fn Conn(comptime Transport: type) type {
             stream: session.RequestStream,
             finished: bool = false,
             transport_early: bool = false,
+            priority_metrics_recorded: bool = false,
+            pending_priority_update: ?priority.Priority = null,
         };
 
         fn transportStreamTransportEarly(transport: *Transport, stream_id: u64) bool {
@@ -137,6 +152,7 @@ pub fn Conn(comptime Transport: type) type {
                 .local_settings = settings,
                 .pending_uni = std.AutoHashMap(u64, PendingUni).init(allocator),
                 .requests = std.AutoHashMap(u64, *ServerRequest).init(allocator),
+                .pending_priority_updates = std.AutoHashMap(u64, priority.Priority).init(allocator),
                 .responses = std.AutoHashMap(u64, *ClientResponse).init(allocator),
             };
         }
@@ -150,6 +166,7 @@ pub fn Conn(comptime Transport: type) type {
                 self.allocator.destroy(request.*);
             }
             self.requests.deinit();
+            self.pending_priority_updates.deinit();
             var response_it = self.responses.valueIterator();
             while (response_it.next()) |response| {
                 response.*.buffer.deinit(self.allocator);
@@ -278,6 +295,9 @@ pub fn Conn(comptime Transport: type) type {
                         .stream = session.RequestStream.init(self.allocator, id),
                         .transport_early = transportStreamTransportEarly(transport, id),
                     };
+                    if (self.pending_priority_updates.fetchRemove(id)) |pending| {
+                        request.pending_priority_update = pending.value;
+                    }
                     self.requests.put(id, request) catch {
                         request.stream.deinit();
                         self.allocator.destroy(request);
@@ -350,9 +370,7 @@ pub fn Conn(comptime Transport: type) type {
                     }
                     if (bytes.len > 0 and state.typ == .control) {
                         const had_settings = self.peer_control_view.saw_settings;
-                        _ = self.peer_control_view.ingest(self.allocator, bytes) catch |err| {
-                            return self.failControl(err);
-                        };
+                        _ = try self.ingestControlBytes(transport, bytes);
                         if (self.peer_control_view.saw_settings) self.metrics.settings_received = true;
                         if (self.role == .client and !had_settings and self.peer_control_view.saw_settings) {
                             try self.publishEarlyTicketSnapshot(transport);
@@ -372,6 +390,78 @@ pub fn Conn(comptime Transport: type) type {
             }
         }
 
+        fn ingestControlBytes(self: *Self, transport: *Transport, bytes: []const u8) H3Error!usize {
+            if (self.peer_control_view.closed) return self.fail(.closed_critical_stream);
+            self.peer_control_view.pending.appendSlice(self.allocator, bytes) catch return error.OutOfMemory;
+
+            while (true) {
+                if (!self.peer_control_view.saw_type) {
+                    const stream_type = frame.decodeStreamType(self.peer_control_view.pending.items) catch |err| switch (err) {
+                        error.BufferTooShort => return bytes.len,
+                        else => return self.failControl(err),
+                    };
+                    if (self.peer_control_view.pending.items.len == stream_type.len) return bytes.len;
+                    const frame_preview = frame.decodeFrameWithLimit(self.peer_control_view.pending.items[stream_type.len..], frame.ControlStream.max_frame_payload_len) catch |err| switch (err) {
+                        error.BufferTooShort => return bytes.len,
+                        else => return self.failControl(err),
+                    };
+                    if (frame_preview.typ != .settings) return self.fail(.missing_settings);
+                    if (stream_type.typ != .control) return self.fail(.stream_creation_error);
+                    self.peer_control_view.saw_type = true;
+                    discardPrefix(&self.peer_control_view.pending, stream_type.len);
+                }
+
+                const raw = frame.decodeFrameWithLimit(self.peer_control_view.pending.items, frame.ControlStream.max_frame_payload_len) catch |err| switch (err) {
+                    error.BufferTooShort => return bytes.len,
+                    else => return self.failControl(err),
+                };
+                try self.ingestControlFrame(transport, raw);
+                discardPrefix(&self.peer_control_view.pending, raw.len);
+            }
+        }
+
+        fn ingestControlFrame(self: *Self, transport: *Transport, raw: frame.RawFrame) H3Error!void {
+            switch (raw.typ) {
+                .priority_update_request, .priority_update_push => {
+                    if (!self.peer_control_view.saw_settings) return self.fail(.missing_settings);
+                    try self.applyPriorityUpdate(transport, raw);
+                },
+                else => self.peer_control_view.ingestFrame(raw) catch |err| return self.failControl(err),
+            }
+        }
+
+        fn applyPriorityUpdate(self: *Self, transport: *Transport, raw: frame.RawFrame) H3Error!void {
+            if (self.role == .client) return self.fail(.frame_unexpected);
+            const kind = priority.kindFromFrameType(raw.typ) orelse return;
+            const update = priority.decodePayload(raw.payload) catch return self.fail(.frame_error);
+            switch (kind) {
+                .push => return self.fail(.id_error),
+                .request => if (!isClientRequestStream(update.element_id)) return self.fail(.id_error),
+            }
+
+            self.metrics.priority_updates_received += 1;
+            const parsed = priority.parse(update.field_value) catch {
+                self.metrics.priority_parse_errors += 1;
+                return;
+            };
+            if (parsed.invalid_parameter) self.metrics.priority_invalid_parameters += 1;
+            if (parsed.duplicate_parameter) self.metrics.priority_duplicate_parameters += 1;
+            if (self.requests.get(update.element_id)) |request| {
+                request.pending_priority_update = parsed.effective();
+                if (request.stream.saw_headers) self.applyPendingPriorityUpdate(request);
+                _ = applyTransportPriority(transport, update.element_id, parsed.effective());
+            } else {
+                if (applyTransportPriority(transport, update.element_id, parsed.effective())) return;
+                if (!self.pending_priority_updates.contains(update.element_id) and
+                    self.pending_priority_updates.count() >= max_pending_priority_updates)
+                {
+                    return self.fail(.excessive_load);
+                }
+                self.pending_priority_updates.put(update.element_id, parsed.effective()) catch return error.OutOfMemory;
+                self.metrics.priority_updates_buffered += 1;
+            }
+        }
+
         fn pumpRequests(self: *Self, transport: *Transport) H3Error!void {
             var it = self.requests.iterator();
             while (it.next()) |entry| {
@@ -384,9 +474,12 @@ pub fn Conn(comptime Transport: type) type {
                     const result = transport.readStream(id, &buf) catch break;
                     request.transport_early = request.transport_early or transportStreamTransportEarly(transport, id);
                     if (result.len > 0) {
-                        _ = request.stream.ingestBytes(buf[0..result.len], &qpack_scratch) catch {
+                        _ = request.stream.ingestBytes(buf[0..result.len], &qpack_scratch) catch |err| {
+                            if (err == error.UnexpectedFrame) return self.fail(.frame_unexpected);
                             return self.fail(.message_error);
                         };
+                        self.recordPriorityHeaderMetrics(request);
+                        self.applyPendingPriorityUpdate(request);
                     }
                     if (result.fin) {
                         request.finished = true;
@@ -395,6 +488,48 @@ pub fn Conn(comptime Transport: type) type {
                     if (result.len == 0) break;
                 }
             }
+        }
+
+        fn applyPendingPriorityUpdate(_: *Self, request: *ServerRequest) void {
+            if (!request.stream.saw_headers) return;
+            if (request.pending_priority_update) |update| {
+                request.stream.priority = update;
+                request.pending_priority_update = null;
+            }
+        }
+
+        fn applyTransportPriority(transport: *Transport, id: u64, p: priority.Priority) bool {
+            if (comptime @hasDecl(Transport, "setStreamSchedulingHint")) {
+                transport.setStreamSchedulingHint(id, .{
+                    .urgency = p.urgency,
+                    .incremental = p.incremental,
+                }) catch return false;
+                return true;
+            }
+            return false;
+        }
+
+        fn recordPriorityHeaderMetrics(self: *Self, request: *ServerRequest) void {
+            if (request.priority_metrics_recorded) return;
+            if (request.stream.priority_parse_error) {
+                self.metrics.priority_parse_errors += 1;
+                request.priority_metrics_recorded = true;
+                return;
+            }
+            if (request.stream.priority_invalid_parameter) {
+                self.metrics.priority_invalid_parameters += 1;
+                request.priority_metrics_recorded = true;
+            }
+            if (request.stream.priority_duplicate_parameter) {
+                self.metrics.priority_duplicate_parameters += 1;
+                request.priority_metrics_recorded = true;
+            }
+        }
+
+        fn priorityBefore(lhs_priority: priority.Priority, lhs_stream_id: u64, rhs_priority: priority.Priority, rhs_stream_id: u64) bool {
+            if (lhs_priority.urgency != rhs_priority.urgency) return lhs_priority.urgency < rhs_priority.urgency;
+            if (lhs_priority.incremental != rhs_priority.incremental) return lhs_priority.incremental and !rhs_priority.incremental;
+            return lhs_stream_id < rhs_stream_id;
         }
 
         fn pumpResponses(self: *Self, transport: *Transport) H3Error!void {
@@ -409,6 +544,7 @@ pub fn Conn(comptime Transport: type) type {
                     if (result.len > 0) {
                         if (response.buffer.items.len + result.len > max_response_len) return error.ResponseTooLarge;
                         response.buffer.appendSlice(self.allocator, buf[0..result.len]) catch return error.OutOfMemory;
+                        if (containsPriorityUpdateFrame(response.buffer.items)) return self.fail(.frame_unexpected);
                     }
                     if (result.fin) {
                         response.fin = true;
@@ -505,6 +641,7 @@ pub fn Conn(comptime Transport: type) type {
                         }
                         body_len += raw.payload.len;
                     },
+                    .priority_update_request, .priority_update_push => return self.fail(.frame_unexpected),
                     else => {}, // unknown frames on request streams are ignored (RFC 9114 §9)
                 }
                 offset += raw.len;
@@ -531,21 +668,35 @@ pub fn Conn(comptime Transport: type) type {
             stream_id: u64,
             exchange: stream_transport.Exchange,
             transport_early: bool,
+            priority: priority.Priority,
         };
 
         /// Pop the next fully received request. The exchange borrows the
         /// request session's memory; call `finishRequest` after responding.
         pub fn pollRequest(self: *Self) H3Error!?IncomingRequest {
+            var selected_id: ?u64 = null;
+            var selected_request: ?*ServerRequest = null;
             var it = self.requests.iterator();
             while (it.next()) |entry| {
+                const stream_id = entry.key_ptr.*;
                 const request = entry.value_ptr.*;
                 if (!request.finished or request.stream.finished) continue;
+                if (selected_request) |current| {
+                    if (!priorityBefore(request.stream.priority, stream_id, current.stream.priority, selected_id.?)) continue;
+                }
+                selected_id = stream_id;
+                selected_request = request;
+            }
+            if (selected_request) |request| {
+                const stream_id = selected_id.?;
+                const request_priority = request.stream.priority;
                 const exchange = request.stream.finish() catch return self.fail(.message_error);
                 self.metrics.requests_decoded += 1;
                 return .{
-                    .stream_id = entry.key_ptr.*,
+                    .stream_id = stream_id,
                     .exchange = exchange,
                     .transport_early = request.transport_early,
+                    .priority = request_priority,
                 };
             }
             return null;
@@ -602,6 +753,30 @@ pub fn Conn(comptime Transport: type) type {
     };
 }
 
+fn discardPrefix(list: *std.ArrayList(u8), len: usize) void {
+    if (len == 0) return;
+    if (len >= list.items.len) {
+        list.clearRetainingCapacity();
+        return;
+    }
+    std.mem.copyForwards(u8, list.items[0 .. list.items.len - len], list.items[len..]);
+    list.shrinkRetainingCapacity(list.items.len - len);
+}
+
+fn isClientRequestStream(stream_id: u64) bool {
+    return (stream_id & 0x3) == 0;
+}
+
+fn containsPriorityUpdateFrame(bytes: []const u8) bool {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const raw = frame.decodeFrameWithLimit(bytes[offset..], std.math.maxInt(usize)) catch return false;
+        if (raw.typ == .priority_update_request or raw.typ == .priority_update_push) return true;
+        offset += raw.len;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Tests with an in-memory mock transport (the full QUIC-backed end-to-end
 // path is exercised in tests/quic_h3_e2e.zig).
@@ -621,6 +796,7 @@ const MockTransport = struct {
     allocator: std.mem.Allocator,
     is_client: bool,
     streams: std.AutoHashMap(u64, *MockStream),
+    scheduling_hints: std.AutoHashMap(u64, priority.Priority),
     peer: ?*MockTransport = null,
     next_bidi: u64 = 0,
     next_uni: u64 = 0,
@@ -631,6 +807,7 @@ const MockTransport = struct {
             .allocator = allocator,
             .is_client = is_client,
             .streams = std.AutoHashMap(u64, *MockStream).init(allocator),
+            .scheduling_hints = std.AutoHashMap(u64, priority.Priority).init(allocator),
         };
     }
 
@@ -641,6 +818,7 @@ const MockTransport = struct {
             self.allocator.destroy(s.*);
         }
         self.streams.deinit();
+        self.scheduling_hints.deinit();
         self.accepted.deinit(self.allocator);
     }
 
@@ -690,6 +868,14 @@ const MockTransport = struct {
         if (self.accepted.items.len == 0) return null;
         return self.accepted.orderedRemove(0);
     }
+
+    pub fn setStreamSchedulingHint(self: *MockTransport, id: u64, hint: anytype) !void {
+        if (!self.streams.contains(id)) return error.UnknownStream;
+        try self.scheduling_hints.put(id, .{
+            .urgency = hint.urgency,
+            .incremental = hint.incremental,
+        });
+    }
 };
 
 test "H3 conn: SETTINGS exchange and request/response over a mock transport" {
@@ -734,6 +920,393 @@ test "H3 conn: SETTINGS exchange and request/response over a mock transport" {
     try testing.expectEqualStrings("pong", response.body);
     try testing.expectEqualStrings("server", response.headers[0].name);
     client.releaseResponse(id);
+}
+
+test "H3 conn: polls completed requests by urgency and reports priority" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    _ = try client.sendRequest(&client_transport, .{
+        .authority = "tardigrade.test",
+        .path = "/slow",
+        .headers = &.{.{ .name = "priority", .value = "u=6" }},
+    });
+    _ = try client.sendRequest(&client_transport, .{
+        .authority = "tardigrade.test",
+        .path = "/urgent",
+        .headers = &.{.{ .name = "priority", .value = "u=1, i" }},
+    });
+
+    try server.pump(&server_transport);
+    const first = (try server.pollRequest()).?;
+    try testing.expectEqualStrings("/urgent", first.exchange.request.path);
+    try testing.expectEqual(priority.Priority{ .urgency = 1, .incremental = true }, first.priority);
+    server.finishRequest(first.stream_id);
+
+    const second = (try server.pollRequest()).?;
+    try testing.expectEqualStrings("/slow", second.exchange.request.path);
+    try testing.expectEqual(priority.Priority{ .urgency = 6, .incremental = false }, second.priority);
+    server.finishRequest(second.stream_id);
+}
+
+test "H3 conn: PRIORITY_UPDATE on control stream updates request priority" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    const request_id = try client.sendRequest(&client_transport, .{
+        .authority = "tardigrade.test",
+        .path = "/reprioritized",
+        .headers = &.{.{ .name = "priority", .value = "u=7" }},
+    });
+    try server.pump(&server_transport);
+
+    var update_buf: [64]u8 = undefined;
+    const update = try priority.encodeFrame(.request, .{ .element_id = request_id, .field_value = "u=0, i" }, &update_buf);
+    _ = try client_transport.writeStream(client.control_out.?, update, false);
+
+    try server.pump(&server_transport);
+    const incoming = (try server.pollRequest()).?;
+    try testing.expectEqualStrings("/reprioritized", incoming.exchange.request.path);
+    try testing.expectEqual(priority.Priority{ .urgency = 0, .incremental = true }, incoming.priority);
+    try testing.expectEqual(@as(u64, 1), server.metrics.priority_updates_received);
+    server.finishRequest(incoming.stream_id);
+}
+
+test "H3 conn: client rejects server-sent PRIORITY_UPDATE" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    var update_buf: [64]u8 = undefined;
+    const update = try priority.encodeFrame(.request, .{ .element_id = 0, .field_value = "u=0" }, &update_buf);
+    _ = try server_transport.writeStream(server.control_out.?, update, false);
+
+    try testing.expectError(error.ProtocolError, client.pump(&client_transport));
+    try testing.expectEqual(ErrorCode.frame_unexpected.wire(), client.closeCode());
+}
+
+test "H3 conn: invalid PRIORITY_UPDATE targets close with H3_ID_ERROR" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    var update_buf: [64]u8 = undefined;
+    const bad_request = try priority.encodeFrame(.request, .{ .element_id = 1, .field_value = "u=0" }, &update_buf);
+    _ = try client_transport.writeStream(client.control_out.?, bad_request, false);
+    try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+    try testing.expectEqual(ErrorCode.id_error.wire(), server.closeCode());
+
+    var client_transport2 = MockTransport.init(allocator, true);
+    defer client_transport2.deinit();
+    var server_transport2 = MockTransport.init(allocator, false);
+    defer server_transport2.deinit();
+    client_transport2.peer = &server_transport2;
+    server_transport2.peer = &client_transport2;
+    var client2 = H3.init(allocator, .client);
+    defer client2.deinit();
+    var server2 = H3.init(allocator, .server);
+    defer server2.deinit();
+
+    try client2.start(&client_transport2);
+    try server2.start(&server_transport2);
+    try server2.pump(&server_transport2);
+    try client2.pump(&client_transport2);
+
+    const push_update = try priority.encodeFrame(.push, .{ .element_id = 0, .field_value = "u=0" }, &update_buf);
+    _ = try client_transport2.writeStream(client2.control_out.?, push_update, false);
+    try testing.expectError(error.ProtocolError, server2.pump(&server_transport2));
+    try testing.expectEqual(ErrorCode.id_error.wire(), server2.closeCode());
+}
+
+test "H3 conn: PRIORITY_UPDATE before request stream is retained" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    var update_buf: [64]u8 = undefined;
+    const update1 = try priority.encodeFrame(.request, .{ .element_id = 0, .field_value = "u=6" }, &update_buf);
+    _ = try client_transport.writeStream(client.control_out.?, update1, false);
+    const update2 = try priority.encodeFrame(.request, .{ .element_id = 0, .field_value = "u=0, i" }, &update_buf);
+    _ = try client_transport.writeStream(client.control_out.?, update2, false);
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(u64, 2), server.metrics.priority_updates_buffered);
+
+    _ = try client.sendRequest(&client_transport, .{
+        .authority = "tardigrade.test",
+        .path = "/raced",
+        .headers = &.{.{ .name = "priority", .value = "u=7" }},
+    });
+    try server.pump(&server_transport);
+
+    const incoming = (try server.pollRequest()).?;
+    try testing.expectEqualStrings("/raced", incoming.exchange.request.path);
+    try testing.expectEqual(priority.Priority{ .urgency = 0, .incremental = true }, incoming.priority);
+    server.finishRequest(incoming.stream_id);
+}
+
+test "H3 conn: PRIORITY_UPDATE overrides later decoded request priority header" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    const request_id = try client_transport.openStream(.bidi);
+    var qpack_buf: [512]u8 = undefined;
+    const block = try qpack.encode(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+        .{ .name = ":path", .value = "/fragmented" },
+        .{ .name = "priority", .value = "u=7" },
+    }, &qpack_buf);
+    var request_buf: [1024]u8 = undefined;
+    const request = try frame.encodeKnownFrame(.headers, block, &request_buf);
+    _ = try client_transport.writeStream(request_id, request[0..1], false);
+    try server.pump(&server_transport);
+
+    var update_buf: [64]u8 = undefined;
+    const update = try priority.encodeFrame(.request, .{ .element_id = request_id, .field_value = "u=0, i" }, &update_buf);
+    _ = try client_transport.writeStream(client.control_out.?, update, false);
+    try server.pump(&server_transport);
+
+    _ = try client_transport.writeStream(request_id, request[1..2], false);
+    try server.pump(&server_transport);
+
+    _ = try client_transport.writeStream(request_id, request[2..], true);
+    try server.pump(&server_transport);
+
+    const incoming = (try server.pollRequest()).?;
+    try testing.expectEqualStrings("/fragmented", incoming.exchange.request.path);
+    try testing.expectEqual(priority.Priority{ .urgency = 0, .incremental = true }, incoming.priority);
+    server.finishRequest(incoming.stream_id);
+}
+
+test "H3 conn: late PRIORITY_UPDATE updates active response transport hint" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    const request_id = try client.sendRequest(&client_transport, .{
+        .authority = "tardigrade.test",
+        .path = "/active",
+        .headers = &.{.{ .name = "priority", .value = "u=7" }},
+    });
+    try server.pump(&server_transport);
+    const incoming = (try server.pollRequest()).?;
+    try server.sendResponse(&server_transport, incoming.stream_id, 200, &.{}, "large-ish response body");
+    try testing.expectEqual(@as(?priority.Priority, null), server_transport.scheduling_hints.get(request_id));
+
+    var update_buf: [64]u8 = undefined;
+    const update = try priority.encodeFrame(.request, .{ .element_id = request_id, .field_value = "u=0" }, &update_buf);
+    _ = try client_transport.writeStream(client.control_out.?, update, false);
+    try server.pump(&server_transport);
+
+    try testing.expectEqual(priority.Priority{ .urgency = 0, .incremental = false }, server_transport.scheduling_hints.get(request_id).?);
+    try testing.expectEqual(@as(usize, 0), server.pending_priority_updates.count());
+}
+
+test "H3 conn: PRIORITY_UPDATE on request stream closes with frame unexpected" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    const request_id = try client_transport.openStream(.bidi);
+    var update_buf: [64]u8 = undefined;
+    const update = try priority.encodeFrame(.request, .{ .element_id = request_id, .field_value = "u=0" }, &update_buf);
+    _ = try client_transport.writeStream(request_id, update, true);
+
+    try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+    try testing.expectEqual(ErrorCode.frame_unexpected.wire(), server.closeCode());
+}
+
+test "H3 conn: PRIORITY_UPDATE on response stream closes with frame unexpected" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    const request_id = try client.sendRequest(&client_transport, .{
+        .authority = "tardigrade.test",
+        .path = "/bad-response-frame",
+    });
+    try server.pump(&server_transport);
+    _ = (try server.pollRequest()).?;
+
+    var update_buf: [64]u8 = undefined;
+    const update = try priority.encodeFrame(.request, .{ .element_id = request_id, .field_value = "u=0" }, &update_buf);
+    _ = try server_transport.writeStream(request_id, update, true);
+    try testing.expectError(error.ProtocolError, client.pump(&client_transport));
+    try testing.expectEqual(ErrorCode.frame_unexpected.wire(), client.closeCode());
+}
+
+test "H3 conn: priority parse metrics cover headers and updates" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try server.pump(&server_transport);
+    try client.pump(&client_transport);
+
+    const request_id = try client.sendRequest(&client_transport, .{
+        .authority = "tardigrade.test",
+        .path = "/invalid",
+        .headers = &.{.{ .name = "priority", .value = "u=8" }},
+    });
+    var malformed_buf: [64]u8 = undefined;
+    const malformed_update = try priority.encodeFrame(.request, .{ .element_id = request_id, .field_value = "=bad" }, &malformed_buf);
+    _ = try client_transport.writeStream(client.control_out.?, malformed_update, false);
+
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(u64, 1), server.metrics.priority_updates_received);
+    try testing.expectEqual(@as(u64, 1), server.metrics.priority_parse_errors);
+    try testing.expectEqual(@as(u64, 1), server.metrics.priority_invalid_parameters);
 }
 
 test "H3 conn: start emits default SETTINGS" {

@@ -843,6 +843,10 @@ pub const Runtime = struct {
 
     fn serveRequest(self: *Runtime, entry: *ConnEntry, incoming: H3.IncomingRequest, now: u64) void {
         _ = now;
+        entry.conn.setStreamSchedulingHint(incoming.stream_id, .{
+            .urgency = incoming.priority.urgency,
+            .incremental = incoming.priority.incremental,
+        }) catch {};
         const allocator = self.allocator;
         const handler = self.request_handler orelse {
             entry.h3.sendResponse(entry.conn, incoming.stream_id, 404, &.{}, "") catch {};

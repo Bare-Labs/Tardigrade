@@ -11,6 +11,7 @@
 const std = @import("std");
 
 const frame = @import("frame.zig");
+const priority = @import("priority.zig");
 const qpack = @import("qpack.zig");
 const varint = @import("quic_varint");
 const stream_transport = @import("stream_transport");
@@ -28,6 +29,7 @@ pub const SessionError = error{
     DuplicatePseudoHeader,
     PseudoHeaderAfterRegularHeader,
     InvalidPseudoHeader,
+    UnexpectedFrame,
     InvalidStatus,
     QpackDecodeFailed,
     OutputOverflow,
@@ -55,6 +57,10 @@ pub const RequestStream = struct {
     path: ?[]u8 = null,
     headers: std.ArrayList(stream_transport.Header) = .empty,
     body: std.ArrayList(u8) = .empty,
+    priority: priority.Priority = priority.Priority.default,
+    priority_parse_error: bool = false,
+    priority_invalid_parameter: bool = false,
+    priority_duplicate_parameter: bool = false,
     saw_headers: bool = false,
     saw_data: bool = false,
     finished: bool = false,
@@ -103,7 +109,8 @@ pub const RequestStream = struct {
                 try self.body.appendSlice(self.allocator, raw.payload);
             },
             .goaway => return error.InvalidRequestFrame,
-            .settings, .cancel_push, .push_promise, .max_push_id, .priority_update_request, .priority_update_push => return error.InvalidRequestFrame,
+            .priority_update_request, .priority_update_push => return error.UnexpectedFrame,
+            .settings, .cancel_push, .push_promise, .max_push_id => return error.InvalidRequestFrame,
             .unknown => {},
         }
     }
@@ -112,13 +119,34 @@ pub const RequestStream = struct {
         var fields: [128]qpack.HeaderField = undefined;
         const count = qpack.decode(payload, &fields, qpack_scratch) catch return error.QpackDecodeFailed;
         var regular_seen = false;
+        var priority_seen = false;
+        var priority_value: std.ArrayList(u8) = .empty;
+        defer priority_value.deinit(self.allocator);
         for (fields[0..count]) |field| {
             if (field.name.len > 0 and field.name[0] == ':') {
                 if (regular_seen) return error.PseudoHeaderAfterRegularHeader;
                 try self.applyPseudoHeader(field);
             } else {
                 regular_seen = true;
+                if (std.ascii.eqlIgnoreCase(field.name, "priority")) {
+                    if (priority_seen) try priority_value.appendSlice(self.allocator, ", ");
+                    try priority_value.appendSlice(self.allocator, field.value);
+                    priority_seen = true;
+                }
                 try self.appendHeader(field.name, field.value);
+            }
+        }
+        if (priority_seen) {
+            if (priority.parse(priority_value.items)) |parsed| {
+                self.priority = parsed.effective();
+                self.priority_parse_error = false;
+                self.priority_invalid_parameter = parsed.invalid_parameter;
+                self.priority_duplicate_parameter = parsed.duplicate_parameter;
+            } else |_| {
+                self.priority = priority.Priority.default;
+                self.priority_parse_error = true;
+                self.priority_invalid_parameter = false;
+                self.priority_duplicate_parameter = false;
             }
         }
         self.saw_headers = true;
@@ -249,6 +277,139 @@ test "request stream maps HEADERS and DATA onto stream_transport Exchange" {
     try testing.expectEqualStrings("content-type", exchange.request.headers[0].name);
     try testing.expectEqualStrings("application/json", exchange.request.headers[0].value);
     try testing.expectEqualStrings("{\"ok\":true}", exchange.body.buffered);
+}
+
+test "request stream parses RFC 9218 priority header as a scheduling hint" {
+    const allocator = testing.allocator;
+    var qpack_buf: [512]u8 = undefined;
+    const block = try qpack.encode(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "priority", .value = "u=1, i" },
+    }, &qpack_buf);
+
+    var req = RequestStream.init(allocator, 0);
+    defer req.deinit();
+    var scratch: [512]u8 = undefined;
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch);
+    const exchange = try req.finish();
+
+    try testing.expectEqual(priority.Priority{ .urgency = 1, .incremental = true }, req.priority);
+    try testing.expectEqualStrings("priority", exchange.request.headers[0].name);
+    try testing.expectEqualStrings("u=1, i", exchange.request.headers[0].value);
+}
+
+test "request stream combines multiple priority field lines before parsing" {
+    const allocator = testing.allocator;
+    var qpack_buf: [512]u8 = undefined;
+    const block = try qpack.encode(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "priority", .value = "u=1" },
+        .{ .name = "priority", .value = "i" },
+    }, &qpack_buf);
+
+    var req = RequestStream.init(allocator, 0);
+    defer req.deinit();
+    var scratch: [512]u8 = undefined;
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch);
+    const exchange = try req.finish();
+
+    try testing.expectEqual(priority.Priority{ .urgency = 1, .incremental = true }, req.priority);
+    try testing.expectEqual(@as(usize, 2), exchange.request.headers.len);
+    try testing.expectEqualStrings("u=1", exchange.request.headers[0].value);
+    try testing.expectEqualStrings("i", exchange.request.headers[1].value);
+}
+
+test "request stream treats malformed combined priority field as default" {
+    var qpack_buf: [512]u8 = undefined;
+    const block = try qpack.encode(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "priority", .value = "u=1" },
+        .{ .name = "priority", .value = "=bad" },
+    }, &qpack_buf);
+
+    var req = RequestStream.init(testing.allocator, 0);
+    defer req.deinit();
+    var scratch: [512]u8 = undefined;
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = block, .len = block.len + 2 }, &scratch);
+    try testing.expectEqual(priority.Priority.default, req.priority);
+    try testing.expect(req.priority_parse_error);
+}
+
+test "request stream combines empty priority field lines by presence" {
+    var qpack_buf: [512]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+
+    const empty_first = try qpack.encode(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "priority", .value = "" },
+        .{ .name = "priority", .value = "u=1" },
+    }, &qpack_buf);
+    var req_empty_first = RequestStream.init(testing.allocator, 0);
+    defer req_empty_first.deinit();
+    try req_empty_first.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = empty_first, .len = empty_first.len + 2 }, &scratch);
+    try testing.expectEqual(priority.Priority.default, req_empty_first.priority);
+    try testing.expect(req_empty_first.priority_parse_error);
+
+    const empty_last = try qpack.encode(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "priority", .value = "u=1" },
+        .{ .name = "priority", .value = "" },
+    }, &qpack_buf);
+    var req_empty_last = RequestStream.init(testing.allocator, 4);
+    defer req_empty_last.deinit();
+    try req_empty_last.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = empty_last, .len = empty_last.len + 2 }, &scratch);
+    try testing.expectEqual(priority.Priority.default, req_empty_last.priority);
+    try testing.expect(req_empty_last.priority_parse_error);
+}
+
+test "request stream ignores malformed priority header and records parse quality" {
+    var qpack_buf: [512]u8 = undefined;
+    const malformed = try qpack.encode(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "priority", .value = "=bad" },
+    }, &qpack_buf);
+
+    var req = RequestStream.init(testing.allocator, 0);
+    defer req.deinit();
+    var scratch: [512]u8 = undefined;
+    try req.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = malformed, .len = malformed.len + 2 }, &scratch);
+    const exchange = try req.finish();
+    try testing.expectEqual(priority.Priority.default, req.priority);
+    try testing.expect(req.priority_parse_error);
+    try testing.expectEqualStrings("priority", exchange.request.headers[0].name);
+    try testing.expectEqualStrings("=bad", exchange.request.headers[0].value);
+
+    const invalid = try qpack.encode(&.{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = "priority", .value = "u=8, i=5" },
+    }, &qpack_buf);
+
+    var req_invalid = RequestStream.init(testing.allocator, 4);
+    defer req_invalid.deinit();
+    try req_invalid.ingestFrame(.{ .typ = .headers, .type_value = 1, .payload = invalid, .len = invalid.len + 2 }, &scratch);
+    try testing.expectEqual(priority.Priority.default, req_invalid.priority);
+    try testing.expect(req_invalid.priority_invalid_parameter);
 }
 
 test "request stream ingests split frame type length and payload incrementally" {
