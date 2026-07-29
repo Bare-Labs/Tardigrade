@@ -188,6 +188,8 @@ const ConnEntry = struct {
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
     drain_goaway_sent: bool = false,
+    highest_admitted_request_stream_id: ?u64 = null,
+    drain_goaway_boundary: ?u64 = null,
     last_path_metrics: quic.path.Metrics = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
 
@@ -460,7 +462,6 @@ pub const Runtime = struct {
                 if (n == 0) continue;
                 const datagram = buf[0..@intCast(n)];
                 if (from.family != posix.AF.INET) continue;
-                if (draining) continue;
                 const peer: *const std.c.sockaddr.in = @ptrCast(&from);
                 self.ingest(&connections, &routes, &per_ip, &next_handle, datagram, peer.*, nowUs());
             }
@@ -570,6 +571,7 @@ pub const Runtime = struct {
         peer: std.c.sockaddr.in,
         now: u64,
     ) ?u64 {
+        if (self.drain_requested.load(.acquire)) return null;
         const credential_provider = self.credential_provider orelse return null;
         if (parsed.dcid.len < 8 or parsed.scid.len == 0) return null;
         const retry_context: ?quic.path.RetryContext = switch (self.classifyRetry(routes, parsed, peer, now)) {
@@ -881,9 +883,13 @@ pub const Runtime = struct {
                 return;
             } orelse break;
             if (self.drain_requested.load(.acquire)) {
-                entry.conn.resetStream(incoming.stream_id, 0x0107) catch {}; // H3_REQUEST_REJECTED
-                entry.h3.finishRequest(incoming.stream_id);
-                continue;
+                const boundary = entry.drain_goaway_boundary orelse drainBoundaryAfter(entry.highest_admitted_request_stream_id);
+                entry.drain_goaway_boundary = boundary;
+                if (requestRejectedByDrainBoundary(incoming.stream_id, boundary)) {
+                    entry.conn.resetStream(incoming.stream_id, 0x010b) catch {}; // H3_REQUEST_REJECTED
+                    entry.h3.finishRequest(incoming.stream_id);
+                    continue;
+                }
             }
             self.serveRequest(entry, incoming, now);
         }
@@ -891,7 +897,9 @@ pub const Runtime = struct {
 
     fn sendDrainGoaway(self: *Runtime, entry: *ConnEntry) void {
         if (!entry.conn.isEstablished() or !entry.h3_started) return;
-        entry.h3.sendGoaway(entry.conn, 0) catch |err| {
+        const boundary = entry.drain_goaway_boundary orelse drainBoundaryAfter(entry.highest_admitted_request_stream_id);
+        entry.drain_goaway_boundary = boundary;
+        entry.h3.sendGoaway(entry.conn, boundary) catch |err| {
             self.logger.warn(null, "http3: failed to queue GOAWAY during drain: {s}", .{@errorName(err)});
             return;
         };
@@ -900,6 +908,7 @@ pub const Runtime = struct {
 
     fn serveRequest(self: *Runtime, entry: *ConnEntry, incoming: H3.IncomingRequest, now: u64) void {
         _ = now;
+        entry.highest_admitted_request_stream_id = maxOptional(entry.highest_admitted_request_stream_id, incoming.stream_id);
         entry.conn.setStreamSchedulingHint(incoming.stream_id, .{
             .urgency = incoming.priority.urgency,
             .incremental = incoming.priority.incremental,
@@ -1446,6 +1455,19 @@ fn admissionAllowed(total: usize, per_source: u32) bool {
     return total < max_connections and per_source < max_connections_per_source;
 }
 
+fn maxOptional(current: ?u64, candidate: u64) u64 {
+    return if (current) |value| @max(value, candidate) else candidate;
+}
+
+fn drainBoundaryAfter(highest_admitted_request_stream_id: ?u64) u64 {
+    const highest = highest_admitted_request_stream_id orelse return 0;
+    return highest +| 4;
+}
+
+fn requestRejectedByDrainBoundary(stream_id: u64, boundary: u64) bool {
+    return stream_id >= boundary;
+}
+
 /// What to do with a tracked connection after ingesting a datagram, decided
 /// purely from whether the datagram authenticated (the post-AEAD
 /// `packets_received` delta), whether the connection was just accepted for this
@@ -1962,6 +1984,16 @@ test "admissionAllowed enforces global and per-source caps at the boundary" {
     try testing.expect(!admissionAllowed(0, max_connections_per_source + 1));
     // Either cap alone is sufficient to reject.
     try testing.expect(!admissionAllowed(max_connections, max_connections_per_source));
+}
+
+test "drainBoundaryAfter permits admitted client-bidi streams" {
+    try testing.expectEqual(@as(u64, 0), drainBoundaryAfter(null));
+    try testing.expectEqual(@as(u64, 4), drainBoundaryAfter(0));
+    try testing.expectEqual(@as(u64, 12), drainBoundaryAfter(8));
+
+    try testing.expect(!requestRejectedByDrainBoundary(0, 4));
+    try testing.expect(requestRejectedByDrainBoundary(4, 4));
+    try testing.expect(requestRejectedByDrainBoundary(8, 4));
 }
 
 test "classifyIngest routes spoofed Initials, migration, and normal traffic" {

@@ -380,6 +380,27 @@ test "http3ListenerConfigChanged permits advertisement-only reloads" {
     try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
 }
 
+test "computeReloadedHttp3Advertisement withdraws active auto advertisement when reloaded off" {
+    const allocator = std.testing.allocator;
+    var cfg = try edge_config.loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+
+    cfg.http3_enabled = true;
+    cfg.http3_alt_svc = .off;
+    cfg.http3_alt_svc_max_age_seconds = 60;
+
+    const withdrawal = computeReloadedHttp3Advertisement(&cfg, true, 8443, .advertising);
+    try std.testing.expectEqual(http.http3_handler.Advertisement.clear, withdrawal);
+    try std.testing.expectEqual(http.http3_runtime.EffectiveAdvertisementState.clearing, stateForHttp3Advertisement(true, true, withdrawal));
+
+    const already_off = computeReloadedHttp3Advertisement(&cfg, true, 8443, .ready_advertisement_disabled);
+    try std.testing.expectEqual(http.http3_handler.Advertisement.disabled, already_off);
+
+    cfg.http3_alt_svc = .auto;
+    const active = computeReloadedHttp3Advertisement(&cfg, true, 8443, .clearing);
+    try std.testing.expectEqualDeep(http.http3_handler.Advertisement{ .active = .{ .port = 8443, .max_age_seconds = 60 } }, active);
+}
+
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
@@ -582,21 +603,17 @@ pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Ga
 
     state.runtime_mutex.lock();
     state.add_headers = cfg.add_headers;
+    const previous_h3_advertisement_state = state.http3_advertisement_state;
     if (state.http3_alt_svc) |value| state.allocator.free(value);
     const runtime_ready = if (state.http3_runtime) |runtime| runtime.snapshot().server_bootstrapped else false;
-    const advertisement: http.http3_handler.Advertisement = if (!cfg.http3_enabled or !runtime_ready or cfg.http3_alt_svc == .off)
-        .disabled
-    else
-        .{ .active = .{
-            .port = if (state.http3_runtime) |runtime| runtime.snapshot().quic_port else cfg.quic_port,
-            .max_age_seconds = cfg.http3_alt_svc_max_age_seconds,
-        } };
+    const advertisement = computeReloadedHttp3Advertisement(
+        cfg,
+        runtime_ready,
+        if (state.http3_runtime) |runtime| runtime.snapshot().quic_port else cfg.quic_port,
+        previous_h3_advertisement_state,
+    );
     state.http3_alt_svc = http.http3_handler.formatAdvertisement(state.allocator, advertisement) catch null;
-    state.http3_advertisement_state = switch (advertisement) {
-        .disabled => if (!cfg.http3_enabled) .disabled else if (!runtime_ready) .configured_unavailable else .ready_advertisement_disabled,
-        .clear => .clearing,
-        .active => .advertising,
-    };
+    state.http3_advertisement_state = stateForHttp3Advertisement(cfg.http3_enabled, runtime_ready, advertisement);
     if (state.hsts_value.len > 0) state.allocator.free(state.hsts_value);
     state.hsts_value = computeHstsValue(state.allocator, cfg) catch &.{};
     state.security_headers = blk: {
@@ -622,6 +639,37 @@ pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Ga
     };
     state.logger.min_level = cfg.log_level;
     state.runtime_mutex.unlock();
+}
+
+fn computeReloadedHttp3Advertisement(
+    cfg: *const edge_config.EdgeConfig,
+    runtime_ready: bool,
+    runtime_port: u16,
+    previous_state: http.http3_runtime.EffectiveAdvertisementState,
+) http.http3_handler.Advertisement {
+    if (!cfg.http3_enabled or !runtime_ready) return .disabled;
+    if (cfg.http3_alt_svc == .off) {
+        return switch (previous_state) {
+            .advertising, .clearing, .draining => .clear,
+            else => .disabled,
+        };
+    }
+    return .{ .active = .{
+        .port = runtime_port,
+        .max_age_seconds = cfg.http3_alt_svc_max_age_seconds,
+    } };
+}
+
+fn stateForHttp3Advertisement(
+    http3_enabled: bool,
+    runtime_ready: bool,
+    advertisement: http.http3_handler.Advertisement,
+) http.http3_runtime.EffectiveAdvertisementState {
+    return switch (advertisement) {
+        .disabled => if (!http3_enabled) .disabled else if (!runtime_ready) .configured_unavailable else .ready_advertisement_disabled,
+        .clear => .clearing,
+        .active => .advertising,
+    };
 }
 
 pub fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {

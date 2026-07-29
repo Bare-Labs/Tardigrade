@@ -19,8 +19,9 @@ itself.
 
 `TARDIGRADE_HTTP3_ALT_SVC=auto` advertises only while the runtime is actually
 ready to accept QUIC/H3 connections. `TARDIGRADE_HTTP3_ALT_SVC=off` keeps the
-listener running without emitting an active `Alt-Svc` alternative, which allows
-staged rollout and rollback.
+listener running without emitting an active `Alt-Svc` alternative. When a hot
+reload changes an actively advertised listener from `auto` to `off`, TCP
+responses emit `Alt-Svc: clear` to withdraw cached alternatives.
 
 `TARDIGRADE_HTTP3_ALT_SVC_MAX_AGE_SECONDS` controls the bounded `ma` value
 emitted with active advertisements. Values above 86400 are rejected.
