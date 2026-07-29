@@ -1310,12 +1310,12 @@ const RuntimeCidHarness = struct {
         const entry = try allocator.create(ConnEntry);
         errdefer allocator.destroy(entry);
         server_backend.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
-            .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+            .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
             credential_provider,
         );
         self.* = .{
             .client_backend = quic.tls_backend.Tls13Backend.initClient(
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
                 .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
             ),
             .server_backend = server_backend,

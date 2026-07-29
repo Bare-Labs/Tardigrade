@@ -1651,6 +1651,13 @@ pub const Tls13Backend = struct {
         self.retry.wipe();
         self.wipeRetryKeyShareSeed();
         self.client_hrr_selection = null;
+        // #484: a terminal failure anywhere between generating an ephemeral
+        // key pair (the initial-flight one, or the fresh one
+        // `onHelloRetryRequest` generates for ClientHello2) and
+        // `onServerHello`'s own success-path `wipeEphemeral()` call must
+        // still destroy that private key here — it must not linger until
+        // some later `deinit()`.
+        self.wipeEphemeral();
         if (self.schedule) |*schedule| schedule.wipe();
         self.schedule = null;
         self.resumption_master_secret.deinit();
@@ -3529,9 +3536,17 @@ pub const Tls13Backend = struct {
     /// provider's own buffer right after, on every path (no provider
     /// configured, the provider declines, or a later step fails).
     fn takeHelloRetryCookie(self: *Tls13Backend, selected_group: ?tls_algorithms.NamedGroup) HandshakeError!?[]const u8 {
-        defer self.hello_retry_cookie_provider.release();
         const provided = try self.hello_retry_cookie_provider.create(selected_group);
+        // #484: the provider only transfers ownership of a buffer when it
+        // actually returns one — `createFn` returning `null` or erroring
+        // means there was never an acquisition, so `releaseFn` must not run
+        // in either case (a provider that only marks ownership on a
+        // successful non-null return could double-release/assert/free
+        // stale state otherwise). Once `bytes` is non-null, ownership has
+        // transferred, so release must run regardless of what happens next
+        // in this function (including the bounds check below).
         const bytes = provided orelse return null;
+        defer self.hello_retry_cookie_provider.release();
         if (bytes.len == 0 or bytes.len > self.retry.cookie.len) return error.CredentialProviderFailed;
         @memcpy(self.retry.cookie[0..bytes.len], bytes);
         self.retry.cookie_len = bytes.len;
@@ -5086,7 +5101,13 @@ test "transport profile validation fails before lifecycle or transcript advance"
         try std.testing.expectEqual(tls_handshake_codec.HandshakeLifecycle.idle, backend.core.handshake_lifecycle);
         try std.testing.expectEqual(@as(usize, 0), sink.len);
         try std.testing.expect(!backend.key_pair_present);
-        try std.testing.expectEqualSlices(u8, &entropy.key_share_seed, &backend.entropy.key_share_seed);
+        // #484: `clearFailedHandshakeState`'s `errdefer` now wipes ephemeral
+        // key-generation material on every terminal failure, including one
+        // this early (before a key pair is ever generated from it) — once
+        // this backend has failed, the seed is no longer needed and is
+        // zeroed proactively rather than left resident until `deinit`.
+        try std.testing.expect(std.mem.allEqual(u8, &backend.entropy.key_share_seed, 0));
+        try std.testing.expect(std.mem.allEqual(u8, &backend.entropy.retry_key_share_seed, 0));
         backend.deinit();
     }
 

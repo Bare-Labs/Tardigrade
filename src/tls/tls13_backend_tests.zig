@@ -3035,6 +3035,103 @@ test "#484 client rejects a final ServerHello whose cipher suite does not match 
     try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, server_hello_raw, &sink));
 }
 
+test "#484 a terminal failure after ClientHello2's fresh key pair is generated still destroys that private key immediately" {
+    var client = tls_backend.Tls13Backend.initClientWithOptions(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+        .{ .initial_key_share_mode = .empty },
+    );
+    defer client.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+
+    var hrr_buf: [256]u8 = undefined;
+    const hrr = try tls_core.hello_retry.encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+    }, &hrr_buf);
+    try client.backend().receive(.initial, hrr, &sink);
+    // ClientHello2's fresh key pair now exists.
+    try std.testing.expect(client.key_pair_present);
+    try std.testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&client.key_pair), 0));
+
+    // A final "ServerHello" with a cipher suite this backend's policy never
+    // offers — a terminal failure that arrives strictly after the fresh
+    // ClientHello2 key pair was generated and stored.
+    var mismatched_buf: [256]u8 = undefined;
+    const mismatched = try buildServerHello(&mismatched_buf, .{ .cipher_suite = 0x1302 });
+    try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, mismatched, &sink));
+
+    // `clearFailedHandshakeState`'s `errdefer` must have destroyed the
+    // private key immediately — not left it resident until some later
+    // `deinit()`.
+    try std.testing.expect(!client.key_pair_present);
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&client.key_pair), 0));
+}
+
+test "#484 a declining or erroring cookie provider is never released, only a provider that actually returns a cookie is" {
+    const Fixture = struct {
+        mode: enum { decline, err },
+        create_calls: usize = 0,
+        release_calls: usize = 0,
+
+        fn create(ctx: *anyopaque, _: ?tls_core.algorithms.NamedGroup) tls13_transport.Error!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.create_calls += 1;
+            return switch (self.mode) {
+                .decline => null,
+                .err => error.CredentialProviderFailed,
+            };
+        }
+
+        fn release(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.release_calls += 1;
+        }
+
+        fn provider(self: *@This()) tls_backend.Tls13Backend.HelloRetryCookieProvider {
+            return .{ .ctx = self, .createFn = create, .releaseFn = release };
+        }
+    };
+
+    // Declining: forced into a real group-retry via an `.empty` client, the
+    // provider says "no cookie" (`createFn` returns `null`) — there was
+    // never an acquisition, so `releaseFn` must not run, and the group-only
+    // HRR still completes the handshake normally.
+    {
+        var fixture = Fixture{ .mode = .decline };
+        var harness = directHarnessWithClientKeyShareMode(.record, .record, .empty);
+        defer harness.deinit();
+        try harness.server_backend.setHelloRetryCookieProvider(fixture.provider());
+        try harness.run();
+        try std.testing.expect(harness.client_driver.isComplete());
+        try std.testing.expect(harness.server_driver.isComplete());
+        try std.testing.expectEqual(@as(usize, 1), fixture.create_calls);
+        try std.testing.expectEqual(@as(usize, 0), fixture.release_calls);
+    }
+
+    // Erroring: same forced retry, but the provider fails outright —
+    // `createFn` never returns a buffer at all, so again there is nothing
+    // to release, and the failure propagates as the handshake's own error.
+    {
+        var fixture = Fixture{ .mode = .err };
+        var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+        defer server.deinit();
+        try server.setHelloRetryCookieProvider(fixture.provider());
+        var sink = DirectSink{};
+        defer sink.deinit();
+        try server.backend().start(.server, {}, &sink);
+        var buf: [2048]u8 = undefined;
+        const hello = try buildClientHello(&buf, .{ .empty_key_share = true });
+        try std.testing.expectError(error.CredentialProviderFailed, server.backend().receive(.initial, hello, &sink));
+        try std.testing.expectEqual(@as(usize, 1), fixture.create_calls);
+        try std.testing.expectEqual(@as(usize, 0), fixture.release_calls);
+    }
+}
+
 // ===========================================================================
 // #334: handshake-time client authentication over the record transport. The
 // server issues a CertificateRequest; the client answers with its own
