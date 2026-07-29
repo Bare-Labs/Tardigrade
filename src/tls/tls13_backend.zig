@@ -32,6 +32,7 @@ const pre_shared_key = @import("pre_shared_key.zig");
 const session = @import("session.zig");
 const tls_state = @import("state.zig");
 const tls13_transport = @import("tls13_transport.zig");
+const tls_transcript = @import("transcript.zig");
 
 const crypto = std.crypto;
 const X25519 = crypto.dh.X25519;
@@ -789,6 +790,19 @@ pub const Tls13Backend = struct {
         /// within `message`.
         ext_data_offset: usize = 0,
         ext_data_len: usize = 0,
+        /// #485: the exact transcript digest this capture's offered
+        /// binder(s) must be verified against — `Hash(Truncate(CH1))` for
+        /// an ordinary capture, or `Hash(message_hash(Hash(CH1)) || HRR ||
+        /// Truncate(CH2))` for a post-retry capture. Computed once at
+        /// capture time (`onClientHello`), so `selectPsk` — including
+        /// across an asynchronous credential/PSK resolution suspend — never
+        /// needs to re-hash the truncated message or touch the live
+        /// (by-then further advanced) handshake transcript. Only meaningful
+        /// when this capture actually carries a `pre_shared_key` offer;
+        /// left `undefined` for the transient ClientHello1-retention-only
+        /// capture `emitHelloRetryRequest` writes on the `.retry` path,
+        /// which is always cleared before any offer capture reads it.
+        binder_transcript_hash: [hash_len]u8 = undefined,
 
         /// Zeroizes the captured bytes in place. Exposed (`pub`) so its
         /// zeroing behavior can be proven directly, on a plain value, in
@@ -801,6 +815,7 @@ pub const Tls13Backend = struct {
         pub fn wipe(self: *ClientHelloPskCapture) void {
             crypto.secureZero(u8, self.message[0..self.message_len]);
             self.message_len = 0;
+            crypto.secureZero(u8, &self.binder_transcript_hash);
         }
     };
 
@@ -1866,6 +1881,19 @@ pub const Tls13Backend = struct {
             // HRR, or an illegal ClientHello2 mutation, must be rejected
             // *before* either mutation ever runs, not only afterward by
             // `onHelloRetryRequest`/`onClientHello`.
+            // #485: for a second ClientHello, freeze the pre-ClientHello2
+            // transcript state (`message_hash(Hash(CH1)) || HRR`) as a
+            // plain stack value *before* `Core.acceptSecondClientHello`
+            // mutates it below — `onClientHello`'s PSK capture uses this
+            // snapshot's `peekWith(Truncate(ClientHello2))` to compute the
+            // rebound binder transcript digest, since by the time it runs
+            // the live transcript has already moved on to include the
+            // complete ClientHello2. Threaded through as a call argument
+            // (like `transcript_before` below), never stored on the
+            // backend, so it costs nothing in `Tls13Backend`'s own
+            // size budget.
+            const ch2_transcript_snapshot: ?tls_transcript.Transcript =
+                if (is_second_client_hello) self.core.transcript else null;
             if (is_hello_retry_request) {
                 try self.validateHelloRetryRequest(message.body);
                 _ = self.core.acceptHelloRetryRequest(message.raw) catch |err| return mapCoreError(err);
@@ -1875,7 +1903,7 @@ pub const Tls13Backend = struct {
             } else {
                 _ = self.core.acceptReceived(message.raw) catch |err| return mapCoreError(err);
             }
-            try self.onMessage(message, level, transcript_before, is_hello_retry_request, sink);
+            try self.onMessage(message, level, transcript_before, is_hello_retry_request, ch2_transcript_snapshot, sink);
             input.discard(message.raw.len) catch |err| return mapCoreError(err);
             // A parked async authentication operation suspends the handshake:
             // stop consuming buffered messages until the driver resumes it (any
@@ -2000,6 +2028,7 @@ pub const Tls13Backend = struct {
         level: EncryptionLevel,
         transcript_before: [hash_len]u8,
         is_hello_retry_request: bool,
+        ch2_transcript_snapshot: ?tls_transcript.Transcript,
         sink: *EventSink,
     ) HandshakeError!void {
         // Enforce the transport epoch each message belongs to before anything
@@ -2023,7 +2052,7 @@ pub const Tls13Backend = struct {
         // Dispatch the shared TLS semantics; transport extension contents stay
         // opaque and are consumed by the owning adapter.
         switch (kind) {
-            .client_hello => try self.onClientHello(message.raw, sink),
+            .client_hello => try self.onClientHello(message.raw, ch2_transcript_snapshot, sink),
             .server_hello => if (is_hello_retry_request)
                 try self.onHelloRetryRequest(body, sink)
             else
@@ -2777,8 +2806,87 @@ pub const Tls13Backend = struct {
             try w.bytes(cookie);
         }
 
+        // #485: retain the original PSK offer set across the retry and
+        // re-emit it verbatim (same identities, same wire order as
+        // ClientHello1 — `self.client_offer_lease.offers` is untouched
+        // since `onServerHello` is what eventually consumes it) with a
+        // freshly recomputed `obfuscated_ticket_age` per identity and
+        // placeholder binders sized to each identity's digest length. Must
+        // be the last extension (RFC 8446 §4.2.11), so this goes after
+        // every other extension above (including a requested cookie) and
+        // right before the outer length patches. Identities are never
+        // dropped to make room for the cookie: if the retained set no
+        // longer fits, the fixed-size `buf` write below fails with
+        // `error.HandshakeBufferOverflow` (propagated to the caller, which
+        // wipes all retained PSK state via `clearFailedHandshakeState`)
+        // rather than silently narrowing the offer.
+        var psk_secrets: [pre_shared_key.max_offered_identities][hash_len]u8 = undefined;
+        defer crypto.secureZero(u8, std.mem.asBytes(&psk_secrets));
+        var psk_count: usize = 0;
+        var psk_offer_write: ?pre_shared_key.ClientOfferWrite = null;
+        const active_offers = self.constClientPskOffers();
+        if (!active_offers.isEmpty()) {
+            const now_ms = self.psk_now_fn.?(self.psk_now_ctx.?);
+            var psk_items: [pre_shared_key.max_offered_identities]pre_shared_key.OfferItem = undefined;
+            for (active_offers.constSlice()) |*ticket| {
+                @memcpy(&psk_secrets[psk_count], ticket.common.resumption_psk.slice());
+                psk_items[psk_count] = .{
+                    .identity = ticket.ticket.slice(),
+                    .obfuscated_ticket_age = pre_shared_key.obfuscateTicketAge(ticket.ageMillis(now_ms), ticket.ticket_age_add),
+                    .digest_len = hash_len,
+                };
+                psk_count += 1;
+            }
+            try w.u16_(pre_shared_key.ext_psk_key_exchange_modes);
+            const modes_ext_len = try w.reserve(2);
+            pre_shared_key.writeModes(&w, &.{.psk_dhe_ke}) catch |err| switch (err) {
+                error.EmptyModes, error.TooManyModes => unreachable,
+                error.HandshakeBufferOverflow => return error.HandshakeBufferOverflow,
+            };
+            w.patch(2, modes_ext_len);
+            psk_offer_write = pre_shared_key.writeOffer(&w, psk_items[0..psk_count]) catch |err| switch (err) {
+                error.TooManyIdentities => unreachable, // bounded by ClientPskOfferSet's own capacity
+                // Every retained ticket already survived `planPskOffer`'s
+                // identity-shape checks (non-empty, wire-representable) when
+                // ClientHello1 was built — none of these are reachable
+                // through this concrete backend.
+                error.EmptyIdentity,
+                error.IdentityTooLarge,
+                error.IdentitiesVectorTooLarge,
+                error.InvalidBinderLength,
+                error.BindersVectorTooLarge,
+                error.ExtensionTooLarge,
+                => unreachable,
+                error.HandshakeBufferOverflow => return error.HandshakeBufferOverflow,
+            };
+        }
+
         w.patch(2, extensions_len);
         w.patch(3, message_len);
+
+        // #485: every enclosing length field (message, extensions block, the
+        // PSK extension itself, identities, binders) is now patched to its
+        // final value, so `buf[0..offer.truncated_len]` is exactly
+        // `Truncate(ClientHello2)`. Each binder is derived not from
+        // `Hash(Truncate(ClientHello2))` in isolation, but from the rebound
+        // transcript `message_hash(Hash(ClientHello1)) || HelloRetryRequest
+        // || Truncate(ClientHello2)` — obtained via `peekWith`, which reads
+        // the live transcript (already exactly `message_hash(Hash(CH1)) ||
+        // HRR` at this point, since ClientHello2 itself has not been
+        // recorded yet) without mutating it.
+        if (psk_offer_write) |offer| {
+            const prefix = buf[0..offer.truncated_len];
+            const rebound_transcript_hash = self.core.transcript.peekWith(prefix);
+            for (0..psk_count) |i| {
+                var binder: [hash_len]u8 = undefined;
+                defer crypto.secureZero(u8, &binder);
+                pre_shared_key.deriveBinderFromTranscriptHash(.sha256, &psk_secrets[i], &rebound_transcript_hash, &binder) catch
+                    return error.SecretExportFailed;
+                const slot = offer.slots[i];
+                @memcpy(buf[slot.offset..][0..slot.len], &binder);
+            }
+        }
+
         const message = buf[0..w.len];
 
         // Self-check before emission: proves this ClientHello2 is a legal
@@ -3393,7 +3501,12 @@ pub const Tls13Backend = struct {
     // Server flight.
     // -----------------------------------------------------------------------
 
-    fn onClientHello(self: *Tls13Backend, raw: []const u8, sink: *EventSink) HandshakeError!void {
+    fn onClientHello(
+        self: *Tls13Backend,
+        raw: []const u8,
+        ch2_transcript_snapshot: ?tls_transcript.Transcript,
+        sink: *EventSink,
+    ) HandshakeError!void {
         const body = raw[handshake_header_len..];
         // A server needs a credential source: the fixed identity or an external
         // provider. Which signature scheme is usable is decided later by
@@ -3543,6 +3656,26 @@ pub const Tls13Backend = struct {
             capture.message_len = raw.len;
             capture.ext_data_offset = handshake_header_len + info.body_offset;
             capture.ext_data_len = info.len;
+
+            // #485: compute the exact transcript digest this ClientHello's
+            // binder(s) must verify against, once, at capture time. The
+            // observer callback above already validated this same
+            // `ext_data` via `OfferedPsks.parse`, so re-parsing it here
+            // cannot fail.
+            const ext_data = capture.message[capture.ext_data_offset..][0..capture.ext_data_len];
+            const offered_for_capture = pre_shared_key.OfferedPsks.parse(ext_data) catch unreachable;
+            const truncated_len = capture.ext_data_offset + offered_for_capture.binder_vector_offset;
+            const truncated_prefix = capture.message[0..truncated_len];
+            if (self.core.retry_state == .hrr_sent) {
+                // Post-retry: binders must verify only against the rebound
+                // transcript `message_hash(Hash(CH1)) || HRR ||
+                // Truncate(CH2)` — never `Hash(Truncate(CH2))` alone.
+                const snapshot = ch2_transcript_snapshot orelse return error.InvalidHandshakeState;
+                capture.binder_transcript_hash = snapshot.peekWith(truncated_prefix);
+            } else {
+                Sha256.hash(truncated_prefix, &capture.binder_transcript_hash, .{});
+            }
+
             self.client_hello_psk = capture;
             self.offered_psk_modes_seen = true;
             self.offered_psk_dhe_ke = observer.psk_dhe_ke_offered;
@@ -3791,8 +3924,6 @@ pub const Tls13Backend = struct {
             self.resumption_decision_observer.notify(.fatal);
             return null;
         };
-        const truncated_len = capture.ext_data_offset + offered.binder_vector_offset;
-        const truncated_prefix = capture.message[0..truncated_len];
         const now = resolver.nowUnixMs();
 
         var it = offered.pairs();
@@ -3835,7 +3966,12 @@ pub const Tls13Backend = struct {
             defer crypto.secureZero(u8, &psk_buf);
             @memcpy(&psk_buf, psk_slice);
 
-            const ok = pre_shared_key.verifyBinder(.sha256, &psk_buf, truncated_prefix, pair.binder) catch
+            // #485: verify against the digest captured at parse time
+            // (`Hash(Truncate(CH1))`, or after a HelloRetryRequest
+            // `Hash(message_hash(Hash(CH1)) || HRR || Truncate(CH2))`) —
+            // never re-hash the truncated message in isolation, which would
+            // silently accept a pre-#485-shaped binder after a retry.
+            const ok = pre_shared_key.verifyBinderFromTranscriptHash(.sha256, &psk_buf, &capture.binder_transcript_hash, pair.binder) catch
                 return error.InvalidHandshakeState;
             if (!ok) {
                 self.resumption_decision_observer.notify(.fatal);

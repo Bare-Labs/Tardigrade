@@ -292,23 +292,33 @@ pub fn writeOffer(w: *messages.Writer, items: []const OfferItem) WriteError!Clie
 //   early_secret  = HKDF-Extract(0, PSK)
 //   binder_key    = Derive-Secret(early_secret, "res binder", "")
 //   finished_key  = HKDF-Expand-Label(binder_key, "finished", "", L)
-//   binder        = HMAC(finished_key, Hash(truncated ClientHello))
+//   binder        = HMAC(finished_key, transcript_hash)
+//
+// `transcript_hash` is ordinarily `Hash(truncated ClientHello)`; after a
+// HelloRetryRequest it is instead `Hash(message_hash(Hash(ClientHello1)) ||
+// HelloRetryRequest || Truncate(ClientHello2))` (#485) — the caller supplies
+// this precomputed digest so this module never has to know which case it is.
 // -----------------------------------------------------------------------
 
 /// Derives the resumption binder for `psk` (already exactly
 /// `hash.digestLength()` bytes — the caller derives it via
-/// `key_schedule.KeySchedule.resumptionPsk`) over `truncated_client_hello`
-/// (the exact framed-message prefix ending just before the binders
-/// vector's own length field) into `out` (must be exactly
-/// `hash.digestLength()` bytes).
-pub fn deriveBinder(
+/// `key_schedule.KeySchedule.resumptionPsk`) over a precomputed
+/// `transcript_hash` (exactly `hash.digestLength()` bytes: either
+/// `Hash(Truncate(ClientHello1))` or, after a HelloRetryRequest,
+/// `Hash(message_hash(Hash(ClientHello1)) || HelloRetryRequest ||
+/// Truncate(ClientHello2))`) into `out` (must be exactly
+/// `hash.digestLength()` bytes). Never touches the live transcript itself —
+/// obtaining `transcript_hash` without mutating it is the caller's
+/// responsibility (see `transcript.Transcript.peekWith`).
+pub fn deriveBinderFromTranscriptHash(
     hash: provider.Hash,
     psk: []const u8,
-    truncated_client_hello: []const u8,
+    transcript_hash: []const u8,
     out: []u8,
 ) BinderError!void {
     const expected_len = hash.digestLength();
-    if (psk.len != expected_len or out.len != expected_len) return error.InvalidSecretLength;
+    if (psk.len != expected_len or out.len != expected_len or transcript_hash.len != expected_len)
+        return error.InvalidSecretLength;
     switch (hash) {
         .sha256 => {
             var empty_hash: [Sha256.digest_length]u8 = undefined;
@@ -325,10 +335,8 @@ pub fn deriveBinder(
             var finished_key = tls.hkdfExpandLabel(HkdfSha256, binder_key, "finished", "", Sha256.digest_length);
             defer crypto.secureZero(u8, &finished_key);
 
-            var transcript_hash: [Sha256.digest_length]u8 = undefined;
-            Sha256.hash(truncated_client_hello, &transcript_hash, .{});
             var mac: [HmacSha256.mac_length]u8 = undefined;
-            HmacSha256.create(&mac, &transcript_hash, &finished_key);
+            HmacSha256.create(&mac, transcript_hash[0..Sha256.digest_length], &finished_key);
             @memcpy(out, &mac);
         },
         .sha384 => {
@@ -346,36 +354,72 @@ pub fn deriveBinder(
             var finished_key = tls.hkdfExpandLabel(HkdfSha384, binder_key, "finished", "", HmacSha384.mac_length);
             defer crypto.secureZero(u8, &finished_key);
 
-            var transcript_hash: [Sha384.digest_length]u8 = undefined;
-            Sha384.hash(truncated_client_hello, &transcript_hash, .{});
             var mac: [HmacSha384.mac_length]u8 = undefined;
-            HmacSha384.create(&mac, &transcript_hash, &finished_key);
+            HmacSha384.create(&mac, transcript_hash[0..Sha384.digest_length], &finished_key);
             @memcpy(out, &mac);
         },
     }
 }
 
-/// Constant-time binder verification: derives the expected binder for `psk`
-/// over `truncated_client_hello` and compares it against `candidate_binder`
-/// without early-exiting on a byte mismatch. A length mismatch (the binder
-/// on the wire is not `hash.digestLength()` bytes) is reported as a
-/// non-match, not an error — a wrong-length binder is simply wrong.
-pub fn verifyBinder(
+/// Constant-time binder verification against a precomputed `transcript_hash`
+/// (see `deriveBinderFromTranscriptHash`): derives the expected binder for
+/// `psk` and compares it against `candidate_binder` without early-exiting on
+/// a byte mismatch. A length mismatch (the binder on the wire is not
+/// `hash.digestLength()` bytes) is reported as a non-match, not an error —
+/// a wrong-length binder is simply wrong.
+pub fn verifyBinderFromTranscriptHash(
     hash: provider.Hash,
     psk: []const u8,
-    truncated_client_hello: []const u8,
+    transcript_hash: []const u8,
     candidate_binder: []const u8,
 ) BinderError!bool {
     var computed: [provider.max_digest_len]u8 = undefined;
     const out = computed[0..hash.digestLength()];
     defer crypto.secureZero(u8, out);
-    try deriveBinder(hash, psk, truncated_client_hello, out);
+    try deriveBinderFromTranscriptHash(hash, psk, transcript_hash, out);
     if (out.len != candidate_binder.len) return false;
     return switch (out.len) {
         32 => crypto.timing_safe.eql([32]u8, out[0..32].*, candidate_binder[0..32].*),
         48 => crypto.timing_safe.eql([48]u8, out[0..48].*, candidate_binder[0..48].*),
         else => false,
     };
+}
+
+/// Ordinary (non-HRR) ClientHello wrapper: hashes `truncated_client_hello`
+/// (the exact framed-message prefix ending just before the binders vector's
+/// own length field) with `hash` and derives the binder over that digest via
+/// `deriveBinderFromTranscriptHash`.
+pub fn deriveBinder(
+    hash: provider.Hash,
+    psk: []const u8,
+    truncated_client_hello: []const u8,
+    out: []u8,
+) BinderError!void {
+    var transcript_hash_buf: [provider.max_digest_len]u8 = undefined;
+    const transcript_hash = transcript_hash_buf[0..hash.digestLength()];
+    switch (hash) {
+        .sha256 => Sha256.hash(truncated_client_hello, transcript_hash[0..Sha256.digest_length], .{}),
+        .sha384 => Sha384.hash(truncated_client_hello, transcript_hash[0..Sha384.digest_length], .{}),
+    }
+    return deriveBinderFromTranscriptHash(hash, psk, transcript_hash, out);
+}
+
+/// Ordinary (non-HRR) ClientHello wrapper around
+/// `verifyBinderFromTranscriptHash` — see `deriveBinder` for the digest
+/// computed over `truncated_client_hello`.
+pub fn verifyBinder(
+    hash: provider.Hash,
+    psk: []const u8,
+    truncated_client_hello: []const u8,
+    candidate_binder: []const u8,
+) BinderError!bool {
+    var transcript_hash_buf: [provider.max_digest_len]u8 = undefined;
+    const transcript_hash = transcript_hash_buf[0..hash.digestLength()];
+    switch (hash) {
+        .sha256 => Sha256.hash(truncated_client_hello, transcript_hash[0..Sha256.digest_length], .{}),
+        .sha384 => Sha384.hash(truncated_client_hello, transcript_hash[0..Sha384.digest_length], .{}),
+    }
+    return verifyBinderFromTranscriptHash(hash, psk, transcript_hash, candidate_binder);
 }
 
 // -----------------------------------------------------------------------
@@ -1163,6 +1207,100 @@ test "verifyBinder rejects a wrong-length candidate without erroring" {
     var binder: [32]u8 = undefined;
     try deriveBinder(.sha256, &psk, "prefix", &binder);
     try testing.expect(!try verifyBinder(.sha256, &psk, "prefix", binder[0..31]));
+}
+
+test "the ordinary ClientHello wrapper matches direct deriveBinderFromTranscriptHash output" {
+    const psk = [_]u8{0x42} ** 32;
+    const truncated_client_hello = "an arbitrary truncated ClientHello prefix";
+
+    var expected_via_wrapper: [32]u8 = undefined;
+    try deriveBinder(.sha256, &psk, truncated_client_hello, &expected_via_wrapper);
+
+    var transcript_hash: [32]u8 = undefined;
+    Sha256.hash(truncated_client_hello, &transcript_hash, .{});
+    var direct: [32]u8 = undefined;
+    try deriveBinderFromTranscriptHash(.sha256, &psk, &transcript_hash, &direct);
+
+    try testing.expectEqualSlices(u8, &expected_via_wrapper, &direct);
+    try testing.expect(try verifyBinderFromTranscriptHash(.sha256, &psk, &transcript_hash, &direct));
+
+    const psk384 = [_]u8{0x99} ** 48;
+    var expected_via_wrapper384: [48]u8 = undefined;
+    try deriveBinder(.sha384, &psk384, truncated_client_hello, &expected_via_wrapper384);
+    var transcript_hash384: [48]u8 = undefined;
+    Sha384.hash(truncated_client_hello, &transcript_hash384, .{});
+    var direct384: [48]u8 = undefined;
+    try deriveBinderFromTranscriptHash(.sha384, &psk384, &transcript_hash384, &direct384);
+    try testing.expectEqualSlices(u8, &expected_via_wrapper384, &direct384);
+}
+
+test "a deterministic HRR fixture matches an independently computed rebound binder" {
+    // Independently computed (Python hashlib/hmac, not this module's own
+    // `std.crypto.tls.hkdfExpandLabel`/transcript code) over
+    // `Hash(message_hash(Hash(CH1)) || HRR || Truncate(CH2))` — the exact
+    // #485 rebound-transcript binder input RFC 8446 §4.2.11.2 requires after
+    // a HelloRetryRequest. `ch1`/`hrr`/`ch2_truncated` are arbitrary
+    // fixed-shape "framed message" byte strings (only their bytes matter to
+    // the hash, not real TLS semantics).
+    const psk = [_]u8{0x5a} ** 32;
+    const ch1 = [_]u8{ 1, 0, 0, 3, 0xAA, 0xBB, 0xCC };
+    const hrr = [_]u8{ 2, 0, 0, 2, 0xDD, 0xEE };
+    const ch2_truncated = [_]u8{ 1, 0, 0, 4, 0x11, 0x22, 0x33, 0x44 };
+
+    var ch1_hash: [32]u8 = undefined;
+    Sha256.hash(&ch1, &ch1_hash, .{});
+
+    // message_hash record: type 254, 3-byte length (32), then the digest —
+    // matching `transcript.Transcript.rebindClientHello`'s synthetic record.
+    var msg_hash_record: [4 + 32]u8 = undefined;
+    msg_hash_record[0] = 254;
+    std.mem.writeInt(u24, msg_hash_record[1..4], 32, .big);
+    @memcpy(msg_hash_record[4..], &ch1_hash);
+
+    var rebound_input: [msg_hash_record.len + hrr.len + ch2_truncated.len]u8 = undefined;
+    @memcpy(rebound_input[0..msg_hash_record.len], &msg_hash_record);
+    @memcpy(rebound_input[msg_hash_record.len..][0..hrr.len], &hrr);
+    @memcpy(rebound_input[msg_hash_record.len + hrr.len ..], &ch2_truncated);
+
+    var transcript_hash: [32]u8 = undefined;
+    Sha256.hash(&rebound_input, &transcript_hash, .{});
+    const expected_transcript_hash = hexBytes("bf7ceeb56705cefb2742d47a3914c98ebe0c873c594107cd25a727a10fc2cba8");
+    try testing.expectEqualSlices(u8, &expected_transcript_hash, &transcript_hash);
+
+    var binder: [32]u8 = undefined;
+    try deriveBinderFromTranscriptHash(.sha256, &psk, &transcript_hash, &binder);
+    const expected_binder = hexBytes("70ba04b488fd16cec6afb692457754c26e577cfcdcaee4811c254baa10ffc4a5");
+    try testing.expectEqualSlices(u8, &expected_binder, &binder);
+    try testing.expect(try verifyBinderFromTranscriptHash(.sha256, &psk, &transcript_hash, &binder));
+
+    // A binder computed as `Hash(Truncate(CH2))` in isolation — the
+    // pre-#485, non-HRR-aware mistake — must not accidentally match.
+    var isolated_transcript_hash: [32]u8 = undefined;
+    Sha256.hash(&ch2_truncated, &isolated_transcript_hash, .{});
+    try testing.expect(!std.mem.eql(u8, &isolated_transcript_hash, &transcript_hash));
+    try testing.expect(!try verifyBinderFromTranscriptHash(.sha256, &psk, &isolated_transcript_hash, &binder));
+}
+
+test "deriveBinderFromTranscriptHash rejects malformed secret/digest lengths without partial output" {
+    const psk = [_]u8{0x11} ** 32;
+    var transcript_hash: [32]u8 = undefined;
+    Sha256.hash("prefix", &transcript_hash, .{});
+
+    var out: [32]u8 = undefined;
+    // Wrong PSK length.
+    try testing.expectError(error.InvalidSecretLength, deriveBinderFromTranscriptHash(.sha256, psk[0..31], &transcript_hash, &out));
+    // Wrong transcript-hash length.
+    try testing.expectError(error.InvalidSecretLength, deriveBinderFromTranscriptHash(.sha256, &psk, transcript_hash[0..31], &out));
+    // Wrong output length.
+    var short_out: [31]u8 = undefined;
+    try testing.expectError(error.InvalidSecretLength, deriveBinderFromTranscriptHash(.sha256, &psk, &transcript_hash, &short_out));
+
+    // A SHA-384 transcript hash/PSK against the SHA-256 primitive is also a
+    // length mismatch, not silently truncated/extended.
+    const psk384 = [_]u8{0x22} ** 48;
+    var transcript_hash384: [48]u8 = undefined;
+    Sha384.hash("prefix", &transcript_hash384, .{});
+    try testing.expectError(error.InvalidSecretLength, deriveBinderFromTranscriptHash(.sha256, &psk384, &transcript_hash384, &out));
 }
 
 test "obfuscated ticket age round-trips including u32 wraparound" {
