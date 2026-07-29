@@ -1520,7 +1520,12 @@ test "fuzz: QPACK stateful dynamic table and instruction streams preserve invari
         "\x07\x01\x08\x01\x09\x02\x0a\x09\x0b\x09",
         "\x0c\x00\x0d\x01\x0e\x02\x0f\xff\xff\xff",
         "\x10\x20\x1f\x11\x81\x00\x12\x51\x81\x00",
+        "\x27\x02\x01\x01\x02\x01\x01\x00\x27\x02\x01\x01",
     } });
+}
+
+test "QPACK stateful command sequence keeps insert count monotonic across capacity churn" {
+    try runQpackStatefulCommands("\x27\x02\x01\x01\x02\x01\x01\x00\x27\x02\x01\x01");
 }
 
 fn fuzzQpackStatefulCommands(_: void, smith: *testing.Smith) !void {

@@ -664,7 +664,11 @@ fn requeueSendQueueRange(allocator: std.mem.Allocator, queue: *SendQueue, range:
     if (queue.reset_sent) return;
     var live = range;
     if (live.start < queue.base) live.start = queue.base;
+    if (live.start >= live.end) return;
     queue.retransmit.insert(allocator, live) catch {};
+    for (queue.acked.items.items) |acked| {
+        queue.retransmit.subtract(allocator, acked) catch {};
+    }
     if (fin) queue.fin_retransmit = true;
 }
 
@@ -3388,11 +3392,25 @@ test "stream send queue subtracts acked overlap from lost retransmit ranges" {
     try testing.expectEqual(Range{ .start = 6, .end = 8 }, queue.retransmit.items.items[1]);
 }
 
+test "stream send queue does not resurrect acked bytes on later duplicate loss" {
+    var queue = SendQueue{};
+    defer queue.deinit(testing.allocator);
+
+    try queue.data.appendSlice(testing.allocator, "abcdefgh");
+    queue.reserved_end = 8;
+
+    markSendQueueRangeAcked(testing.allocator, &queue, .{ .start = 2, .end = 6 });
+    requeueSendQueueRange(testing.allocator, &queue, .{ .start = 2, .end = 6 }, false);
+
+    try testing.expect(queue.retransmit.isEmpty());
+}
+
 test "fuzz: stream send queue ack loss close command sequences preserve retransmission invariants" {
     try testing.fuzz({}, fuzzStreamSendQueueCommands, .{ .corpus = &.{
         "",
         "\x00\x08abcdefgh\x01\x00\x04\x02\x02\x04\x03\x03\x04",
         "\x00\x08abcdefgh\x02\x02\x06\x02\x04\x08\x01\x00\x08\x04\x03",
+        "\x00\x08abcdefgh\x01\x02\x04\x02\x02\x04",
         "\x00\x04test\x05\x00\x02\x03\x02\x04\x06",
     } });
 }
@@ -3438,7 +3456,7 @@ fn runStreamSendQueueCommands(input: []const u8) !void {
                 pos +|= @as(usize, @intFromBool(pos < input.len));
                 if (queue.retransmit.takeFirst(@max(max_len, 1))) |lost| {
                     try testing.expect(lost.start >= queue.base);
-                    if ((op & 0x80) == 0) try queue.retransmit.insert(testing.allocator, lost);
+                    if ((op & 0x80) == 0) requeueSendQueueRange(testing.allocator, &queue, lost, false);
                 }
             },
             4 => {

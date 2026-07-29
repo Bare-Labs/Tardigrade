@@ -1447,6 +1447,7 @@ test "H3 conn: request stream reset cleanup handles default concurrency" {
 test "fuzz: H3 connection state command sequences preserve critical stream and request invariants" {
     try testing.fuzz({}, fuzzH3ConnStateCommands, .{ .corpus = &.{
         "",
+        "\x00\x07",
         "\x00\x01\x02\x03",
         "\x04\x00\x05\x00",
         "\x06\x07\x08\x09",
@@ -1529,8 +1530,12 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                 break :blk conn.pump(&local_transport);
             },
             7 => blk: {
+                if (peer_control == null and before_close == null) {
+                    try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control);
+                    try conn.pump(&local_transport);
+                }
                 expected_close = .closed_critical_stream;
-                try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], true, &peer_control);
+                if (peer_control) |id| _ = try peer_transport.writeStream(id, "", true);
                 break :blk conn.pump(&local_transport);
             },
             8 => blk: {
