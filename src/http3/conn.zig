@@ -796,6 +796,7 @@ const MockStream = struct {
     data: std.ArrayList(u8) = .empty,
     read_pos: usize = 0,
     fin: bool = false,
+    reset: bool = false,
 };
 
 /// Two mock transports joined back-to-back: writes on one side become reads
@@ -865,6 +866,7 @@ const MockTransport = struct {
 
     pub fn readStream(self: *MockTransport, id: u64, out: []u8) !struct { len: usize, fin: bool } {
         const s = self.streams.get(id) orelse return error.UnknownStream;
+        if (s.reset) return error.StreamReset;
         const available = s.data.items.len - s.read_pos;
         const n = @min(available, out.len);
         @memcpy(out[0..n], s.data.items[s.read_pos..][0..n]);
@@ -883,6 +885,11 @@ const MockTransport = struct {
             .urgency = hint.urgency,
             .incremental = hint.incremental,
         });
+    }
+
+    fn resetStreamForTest(self: *MockTransport, id: u64) !void {
+        const s = try self.stream(id);
+        s.reset = true;
     }
 };
 
@@ -1248,6 +1255,240 @@ test "H3 conn: late PRIORITY_UPDATE updates active response transport hint" {
 
     try testing.expectEqual(priority.Priority{ .urgency = 0, .incremental = false }, server_transport.scheduling_hints.get(request_id).?);
     try testing.expectEqual(@as(usize, 0), server.pending_priority_updates.count());
+}
+
+test "fuzz: H3 connection state command sequences preserve critical stream and request invariants" {
+    try testing.fuzz({}, fuzzH3ConnStateCommands, .{ .corpus = &.{
+        "",
+        "\x00\x01\x02\x03",
+        "\x04\x00\x05\x00",
+        "\x06\x07\x08\x09",
+        "\x0a\x0b\x0c\x0d",
+        "\x0e\x0f\x10\x11",
+    } });
+}
+
+fn fuzzH3ConnStateCommands(_: void, smith: *testing.Smith) !void {
+    var input: [192]u8 = undefined;
+    const len = smith.slice(&input);
+    try runH3ConnStateCommands(input[0..len], .server);
+    try runH3ConnStateCommands(input[0..len], .client);
+}
+
+fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
+    const allocator = testing.allocator;
+    var peer_transport = MockTransport.init(allocator, role == .server);
+    defer peer_transport.deinit();
+    var local_transport = MockTransport.init(allocator, role == .client);
+    defer local_transport.deinit();
+    peer_transport.peer = &local_transport;
+    local_transport.peer = &peer_transport;
+
+    const H3 = Conn(MockTransport);
+    var conn = H3.init(allocator, role);
+    defer conn.deinit();
+
+    var peer_control: ?u64 = null;
+    var peer_qpack_encoder: ?u64 = null;
+    var peer_qpack_decoder: ?u64 = null;
+    var peer_request: ?u64 = null;
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const op = input[pos];
+        pos += 1;
+        const before_close = conn.close_code;
+        const before_settings = conn.peer_control_view.saw_settings;
+        const before_requests = conn.requests.count();
+
+        const result = switch (op % 18) {
+            0 => blk: {
+                try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            1 => blk: {
+                try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder);
+                break :blk conn.pump(&local_transport);
+            },
+            2 => blk: {
+                try writePeerUni(&peer_transport, .qpack_decoder, "", false, &peer_qpack_decoder);
+                break :blk conn.pump(&local_transport);
+            },
+            3 => blk: {
+                const id = try peer_transport.openStream(.uni);
+                var bytes: [16]u8 = undefined;
+                const typ_len = try varint.encode(0x21, &bytes);
+                _ = try peer_transport.writeStream(id, bytes[0..typ_len], false);
+                break :blk conn.pump(&local_transport);
+            },
+            4 => blk: {
+                var duplicate: ?u64 = null;
+                try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &duplicate);
+                break :blk conn.pump(&local_transport);
+            },
+            5 => blk: {
+                try writePeerUni(&peer_transport, .control, forbiddenControlDataBytes()[0..], false, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            6 => blk: {
+                try writePeerUni(&peer_transport, .control, duplicateSettingsBytes()[0..], false, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            7 => blk: {
+                try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], true, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            8 => blk: {
+                try writePeerUni(&peer_transport, .qpack_encoder, "", true, &peer_qpack_encoder);
+                break :blk conn.pump(&local_transport);
+            },
+            9 => blk: {
+                if (peer_control) |id| try local_transport.resetStreamForTest(id);
+                break :blk conn.pump(&local_transport);
+            },
+            10 => blk: {
+                if (role == .server) {
+                    const id = try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    _ = try peer_transport.writeStream(id, dataFrameBytes()[0..], false);
+                } else {
+                    _ = try peer_transport.openStream(.bidi);
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            11 => blk: {
+                if (role == .server) {
+                    const id = peer_request orelse try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    _ = try peer_transport.writeStream(id, requestHeadersBytes()[0..], false);
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            12 => blk: {
+                if (role == .server) {
+                    const id = peer_request orelse try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    _ = try peer_transport.writeStream(id, requestHeadersBytes()[0..], false);
+                    _ = try peer_transport.writeStream(id, dataFrameBytes()[0..], true);
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            13 => blk: {
+                if (role == .server) {
+                    const id = peer_request orelse try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    _ = try peer_transport.writeStream(id, duplicateRequestHeadersBytes()[0..], false);
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            14 => blk: {
+                if (role == .server) {
+                    const id = peer_request orelse try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    _ = try peer_transport.writeStream(id, requestWithTrailersThenDataBytes()[0..], false);
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            15 => blk: {
+                if (role == .server) {
+                    const id = peer_request orelse try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    const s = try local_transport.stream(id);
+                    s.fin = true;
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            16 => blk: {
+                try writePeerUni(&peer_transport, .control, goawayBytes()[0..], false, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            else => conn.pump(&local_transport),
+        };
+
+        if (result) |_| {
+            try expectH3ConnInvariants(&conn, role, before_settings, before_requests);
+        } else |err| {
+            try testing.expect(err == error.ProtocolError or err == error.OutOfMemory);
+            try testing.expect(conn.close_code != null);
+            if (before_close) |code| try testing.expectEqual(code, conn.close_code.?);
+        }
+    }
+}
+
+fn writePeerUni(peer_transport: *MockTransport, typ: frame.StreamType, payload_after_type: []const u8, fin: bool, slot: *?u64) !void {
+    const id = slot.* orelse try peer_transport.openStream(.uni);
+    slot.* = id;
+    var prefix: [8]u8 = undefined;
+    const stream_type = try frame.encodeStreamType(typ, &prefix);
+    if (payload_after_type.len == 0 and typ != .control) {
+        _ = try peer_transport.writeStream(id, stream_type, fin);
+        return;
+    }
+    if (peer_transport.peer) |target| {
+        const s = try target.stream(id);
+        if (s.data.items.len == 0) try s.data.appendSlice(target.allocator, stream_type);
+    }
+    _ = try peer_transport.writeStream(id, payload_after_type, fin);
+}
+
+fn validSettingsBytes() [2]u8 {
+    return .{ 0x04, 0x00 };
+}
+
+fn forbiddenControlDataBytes() [2]u8 {
+    return .{ 0x00, 0x00 };
+}
+
+fn duplicateSettingsBytes() [4]u8 {
+    return .{ 0x04, 0x00, 0x04, 0x00 };
+}
+
+fn goawayBytes() [3]u8 {
+    return .{ 0x07, 0x01, 0x00 };
+}
+
+fn dataFrameBytes() [5]u8 {
+    return .{ 0x00, 0x03, 'b', 'o', 'd' };
+}
+
+fn requestHeadersBytes() [9]u8 {
+    return .{ 0x01, 0x07, 0x00, 0x00, 0xd1, 0xd7, 0x50, 0x00, 0xc1 };
+}
+
+fn duplicateRequestHeadersBytes() [18]u8 {
+    const h = requestHeadersBytes();
+    return h ++ h;
+}
+
+fn requestWithTrailersThenDataBytes() [23]u8 {
+    const h = requestHeadersBytes();
+    const d = dataFrameBytes();
+    return h ++ h ++ d;
+}
+
+fn expectH3ConnInvariants(conn: anytype, role: Role, before_settings: bool, before_requests: u32) !void {
+    if (conn.peer_control) |id| {
+        try testing.expect((id & 0x2) != 0);
+    }
+    if (conn.peer_qpack_encoder) |id| {
+        try testing.expect((id & 0x2) != 0);
+    }
+    if (conn.peer_qpack_decoder) |id| {
+        try testing.expect((id & 0x2) != 0);
+    }
+    try testing.expect(conn.pending_uni.count() <= 32);
+    try testing.expect(conn.requests.count() >= before_requests or role == .client);
+    if (before_settings) try testing.expect(conn.peer_control_view.saw_settings);
+    if (conn.peer_control_view.saw_settings) try testing.expect(conn.metrics.settings_received);
+
+    if (role == .server) {
+        var it = conn.requests.iterator();
+        while (it.next()) |entry| {
+            const request = entry.value_ptr.*;
+            try testing.expect(isClientRequestStream(entry.key_ptr.*));
+            if (request.stream.saw_data) try testing.expect(request.stream.saw_headers);
+            try testing.expect(!request.stream.finished or request.finished);
+        }
+    }
 }
 
 test "H3 conn: PRIORITY_UPDATE on request stream closes with frame unexpected" {

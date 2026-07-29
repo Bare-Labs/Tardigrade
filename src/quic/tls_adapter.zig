@@ -356,13 +356,21 @@ pub const CryptoStream = struct {
         if (data.len == 0) return;
         var start = offset;
         var bytes = data;
-        if (start + bytes.len <= self.consumed_offset) return;
+        const original_end = std.math.add(u64, start, @as(u64, @intCast(bytes.len))) catch return error.CryptoBufferTooLarge;
+        if (original_end <= self.consumed_offset) return;
         if (start < self.consumed_offset) {
             const skip: usize = @intCast(self.consumed_offset - start);
             start = self.consumed_offset;
             bytes = bytes[skip..];
         }
-        const end = start + bytes.len;
+        const end = std.math.add(u64, start, @as(u64, @intCast(bytes.len))) catch return error.CryptoBufferTooLarge;
+        const window_base = self.consumed_offset;
+        if (start < window_base) return error.CryptoBufferTooLarge;
+        const checked_relative_start = start - window_base;
+        if (checked_relative_start >= max_crypto_buffer) return error.CryptoBufferTooLarge;
+        const checked_relative_end = end - window_base;
+        if (checked_relative_end > max_crypto_buffer) return error.CryptoBufferTooLarge;
+
         self.compactConsumed();
         if (start < self.base_offset) return error.CryptoBufferTooLarge;
         const relative_start = start - self.base_offset;
@@ -1342,6 +1350,121 @@ test "CRYPTO insert ignores and trims consumed retransmits" {
     try stream.insert(3, "lo world");
     try testing.expectEqualStrings(" world", stream.contiguous());
     stream.discardContiguous(" world".len);
+}
+
+test "CRYPTO reassembly rejects offset overflow without partial mutation" {
+    var stream = CryptoStream{};
+    try stream.insert(0, "abc");
+
+    const before_range_count = stream.range_count;
+    const before_consumed = stream.consumed_offset;
+    const before_base = stream.base_offset;
+    try testing.expectError(error.CryptoBufferTooLarge, stream.insert(std.math.maxInt(u64) - 1, "abcd"));
+    try testing.expectEqual(before_range_count, stream.range_count);
+    try testing.expectEqual(before_consumed, stream.consumed_offset);
+    try testing.expectEqual(before_base, stream.base_offset);
+    try testing.expectEqualStrings("abc", stream.contiguous());
+}
+
+test "CRYPTO reassembly enforces exact sliding capacity boundary" {
+    var stream = CryptoStream{};
+    try stream.insert(max_crypto_buffer - 1, "x");
+    try testing.expectError(error.CryptoBufferTooLarge, stream.insert(max_crypto_buffer, "x"));
+
+    var prefix = CryptoStream{};
+    try prefix.insert(0, "abc");
+    prefix.discardContiguous(3);
+    try prefix.insert(3 + max_crypto_buffer - 1, "x");
+    try testing.expectError(error.CryptoBufferTooLarge, prefix.insert(3 + max_crypto_buffer, "x"));
+}
+
+test "fuzz: CRYPTO reassembly command sequences preserve bounded invariants" {
+    try testing.fuzz({}, fuzzCryptoReassemblyCommands, .{ .corpus = &.{
+        "",
+        "\x00\x00\x05hello\x08\x00\x05hello\x01\x05\x05world",
+        "\x01\x06\x05world\x00\x00\x06hello \x07\x00\x0b",
+        "\x02\x00\x03abc\x02\x02\x04cdef\x02\x06\x01g\x07\x00\x07",
+        "\x00\x00\x00\x00\x00\x01x\x00\xff\x04oops",
+        "\x03\x00\x04test\x03\x00\x04test\x07\x00\x04\x09",
+    } });
+}
+
+fn fuzzCryptoReassemblyCommands(_: void, smith: *testing.Smith) !void {
+    var input: [192]u8 = undefined;
+    const len = smith.slice(&input);
+    try runCryptoReassemblyCommands(input[0..len]);
+}
+
+fn runCryptoReassemblyCommands(input: []const u8) !void {
+    var reassembler = CryptoReassembler{};
+    defer reassembler.deinit();
+
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const op = input[pos];
+        pos += 1;
+        const level = fuzzCryptoLevel(op);
+        const level_index = try cryptoStreamIndex(level);
+
+        switch (op % 10) {
+            0...6 => {
+                const offset = if (pos < input.len) input[pos] else 0;
+                pos +|= @as(usize, @intFromBool(pos < input.len));
+                const want = if (pos < input.len) @as(usize, input[pos] & 0x0f) else 0;
+                pos +|= @as(usize, @intFromBool(pos < input.len));
+                const take = @min(want, input.len - pos);
+                const result = reassembler.insert(level, offset, input[pos..][0..take]);
+                pos += take;
+                if (result) |_| {
+                    try expectCryptoStreamInvariants(&reassembler.streams[level_index]);
+                } else |err| {
+                    try testing.expect(err == error.CryptoBufferTooLarge or err == error.TooManyCryptoRanges);
+                }
+            },
+            7 => {
+                const available = (try reassembler.contiguous(level)).len;
+                const discard_len = if (pos < input.len) @min(@as(usize, input[pos]), available) else available;
+                pos +|= @as(usize, @intFromBool(pos < input.len));
+                try reassembler.discardContiguous(level, discard_len);
+            },
+            8 => {
+                const boundary_offset = std.math.add(u64, reassembler.streams[level_index].base_offset, max_crypto_buffer - 1) catch std.math.maxInt(u64);
+                const beyond_offset = std.math.add(u64, reassembler.streams[level_index].base_offset, max_crypto_buffer) catch std.math.maxInt(u64);
+                _ = reassembler.insert(level, boundary_offset, "x") catch {};
+                _ = reassembler.insert(level, beyond_offset, "x") catch {};
+            },
+            else => {
+                reassembler.deinit();
+            },
+        }
+
+        const contiguous_after = (try reassembler.contiguous(level)).len;
+        try testing.expect(contiguous_after <= max_crypto_buffer);
+    }
+}
+
+fn fuzzCryptoLevel(op: u8) EncryptionLevel {
+    return switch ((op >> 4) % 3) {
+        0 => .initial,
+        1 => .handshake,
+        else => .application,
+    };
+}
+
+fn expectCryptoStreamInvariants(stream: *const CryptoStream) !void {
+    try testing.expect(stream.range_count <= max_crypto_ranges);
+    var previous_end = stream.consumed_offset;
+    var buffered: u64 = 0;
+    for (stream.ranges[0..stream.range_count]) |range| {
+        try testing.expect(range.start < range.end);
+        try testing.expect(range.start >= stream.consumed_offset);
+        try testing.expect(range.start >= previous_end);
+        try testing.expect(range.end - stream.base_offset <= max_crypto_buffer);
+        buffered += range.end - range.start;
+        previous_end = range.end;
+    }
+    try testing.expect(buffered <= max_crypto_buffer);
+    try testing.expect(stream.contiguous().len <= max_crypto_buffer);
 }
 
 test "adapter tracks transport parameters ALPN secrets and handshake input" {

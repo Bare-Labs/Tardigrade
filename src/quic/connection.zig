@@ -3311,6 +3311,33 @@ test "application CRYPTO reservation failure leaves empty state retryable" {
     }
 }
 
+test "stream send queue keeps lost ranges retransmittable across duplicate ACK and loss signals" {
+    var queue = SendQueue{};
+    defer queue.deinit(testing.allocator);
+
+    try queue.data.appendSlice(testing.allocator, "abcdefgh");
+    queue.reserved_end = 8;
+
+    try queue.retransmit.insert(testing.allocator, .{ .start = 2, .end = 6 });
+    try queue.retransmit.insert(testing.allocator, .{ .start = 4, .end = 8 });
+    try testing.expectEqual(@as(usize, 1), queue.retransmit.items.items.len);
+    try testing.expectEqual(Range{ .start = 2, .end = 8 }, queue.retransmit.items.items[0]);
+
+    try queue.acked.insert(testing.allocator, .{ .start = 0, .end = 8 });
+    try queue.acked.insert(testing.allocator, .{ .start = 0, .end = 8 });
+    queue.compact(testing.allocator);
+    try testing.expectEqual(@as(u64, 2), queue.base);
+    try testing.expectEqualStrings("cdefgh", queue.data.items[queue.start..]);
+    try testing.expectEqual(Range{ .start = 2, .end = 8 }, queue.retransmit.items.items[0]);
+
+    const first_lost = queue.retransmit.takeFirst(3).?;
+    try testing.expectEqual(Range{ .start = 2, .end = 5 }, first_lost);
+    try testing.expectEqual(Range{ .start = 5, .end = 8 }, queue.retransmit.items.items[0]);
+
+    try queue.retransmit.insert(testing.allocator, first_lost);
+    try testing.expectEqual(Range{ .start = 2, .end = 8 }, queue.retransmit.items.items[0]);
+}
+
 const TestPair = struct {
     client_backend: tls_backend_mod.Tls13Backend,
     server_backend: tls_backend_mod.Tls13Backend,
