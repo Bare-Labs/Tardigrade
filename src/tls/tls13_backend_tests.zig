@@ -3300,6 +3300,68 @@ test "#485 an incompatible PSK identity through HelloRetryRequest falls back to 
     try expectHrrRetryStateCleared(&harness.server_backend);
 }
 
+test "#485 an expired PSK identity through HelloRetryRequest falls back to a full certificate handshake" {
+    var harness = directHarnessWithClientKeyShareMode(.record, .record, .empty);
+    defer harness.deinit();
+
+    const psk = [_]u8{0x94} ** tls_backend.hash_len;
+    // The client's own local record of this ticket is generously live —
+    // this offer must actually reach the wire (not be filtered by the
+    // client's own `ticketEligibleToOffer` recheck) so the server's
+    // compatibility/fallback path is what's actually exercised.
+    var ticket = try makeH2CacheTicket(&psk, "expired-after-hrr-ticket");
+    defer ticket.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 5_000;
+        }
+    };
+    try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    // The server's own authoritative recovered session disagrees: issued at
+    // 0 with only a 1-second lifetime, observed at the resolver's clock of
+    // 5000ms — already well past expiry.
+    var expired_common: session.ResumableSessionCommon = .{};
+    try expired_common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 1,
+    });
+    var expired_state: session.ServerRecoverableState = .{};
+    expired_state.init(&expired_common, 0);
+    defer expired_state.deinit();
+    var resolver_state = CountingResolver{ .state = &expired_state, .identity = "expired-after-hrr-ticket", .now_ms = 5_000 };
+    try harness.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+    var decisions = DecisionProbe{};
+    try harness.server_backend.setResumptionDecisionObserver(decisions.observer());
+
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, harness.client_backend.core.retry_state);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, harness.server_backend.core.retry_state);
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(!harness.client_backend.core.psk_authenticated);
+    try std.testing.expect(!harness.server_backend.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.incompatible, decisions.last.?);
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+
+    try expectHrrRetryStateCleared(&harness.client_backend);
+    try expectHrrRetryStateCleared(&harness.server_backend);
+}
+
 test "#485 handshake-time client authentication forces a full handshake through HelloRetryRequest even when a PSK is offered" {
     var harness = directHarnessWithClientKeyShareMode(.record, .record, .empty);
     defer harness.deinit();
