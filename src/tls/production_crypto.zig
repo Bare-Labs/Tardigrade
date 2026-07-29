@@ -19,6 +19,7 @@ pub fn freshHandshakeEntropy() crypto.provider.EntropyError!tls13_backend.Entrop
     var entropy: tls13_backend.Entropy = undefined;
     try fillSecure(&entropy.hello_random);
     try fillSecure(&entropy.key_share_seed);
+    try fillSecure(&entropy.retry_key_share_seed);
     return entropy;
 }
 
@@ -26,6 +27,7 @@ test "fresh handshake entropy fills both backend inputs" {
     const entropy = try freshHandshakeEntropy();
     try std.testing.expect(!allZero(&entropy.hello_random));
     try std.testing.expect(!allZero(&entropy.key_share_seed));
+    try std.testing.expect(!allZero(&entropy.retry_key_share_seed));
 }
 
 fn fillSecure(buffer: []u8) crypto.provider.EntropyError!void {

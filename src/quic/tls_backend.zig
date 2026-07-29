@@ -605,7 +605,7 @@ test "QUIC TLS backend does not embed maximum ticket storage" {
 }
 
 test "QUIC adapter teardown wipes private scratch, parameters, and shared engine ownership" {
-    const entropy = Entropy{ .hello_random = [_]u8{0x31} ** 32, .key_share_seed = [_]u8{0x32} ** 32 };
+    const entropy = Entropy{ .hello_random = [_]u8{0x31} ** 32, .key_share_seed = [_]u8{0x32} ** 32, .retry_key_share_seed = [_]u8{0x33} ** 32 };
     var backend = Tls13Backend.initServer(
         entropy,
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
@@ -641,12 +641,12 @@ const RealHandshakeHarness = struct {
         return .{
             .client_backend = try Tls13Backend.initClientWithAllocator(
                 std.testing.allocator,
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
                 .{ .pinned_certificate = testdata.certificate_der },
             ),
             .server_backend = Tls13Backend.initServerWithAllocator(
                 std.testing.allocator,
-                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
                 try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
             ),
         };
@@ -656,13 +656,13 @@ const RealHandshakeHarness = struct {
         const harness = RealHandshakeHarness{
             .client_backend = try Tls13Backend.initClientWithAllocatorAndOptions(
                 std.testing.allocator,
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
                 .{ .pinned_certificate = testdata.certificate_der },
                 .{ .server_name = server_name },
             ),
             .server_backend = Tls13Backend.initServerWithAllocatorAndProvider(
                 std.testing.allocator,
-                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
                 provider,
             ),
         };
@@ -910,11 +910,11 @@ test "the QUIC production driver resumes an async server signature without anoth
     var client_adapter = tls_adapter.QuicTlsAdapter{};
     var server_adapter = tls_adapter.QuicTlsAdapter{};
     var client_backend = Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
         .{ .pinned_certificate = testdata.certificate_der },
     );
     var server_backend = Tls13Backend.initServer(
-        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
     );
     // Serve the server credential through the async mock rather than the fixed
