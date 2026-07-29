@@ -2621,6 +2621,241 @@ test "#484 HRR round trip completes over the extension (QUIC-style) profile too"
     try expectHrrRetryStateCleared(&harness.server_backend);
 }
 
+// ==========================================================================
+// #485: PSK binders become HelloRetryRequest-aware — ClientHello2 carries
+// the retained PSK offer with binders derived from the rebound transcript
+// (`message_hash(Hash(CH1)) || HRR || Truncate(CH2)`), not
+// `Hash(Truncate(CH2))` alone.
+// ==========================================================================
+
+/// Independently reconstructs the #485 rebound binder-transcript digest from
+/// raw wire bytes: `Hash(message_hash(Hash(ch1_raw)) || hrr_raw ||
+/// truncated_ch2)`. Mirrors `transcript.Transcript.rebindClientHello`'s
+/// synthetic `message_hash` record, built by hand here (not by calling that
+/// method) so this actually cross-checks the production transcript/binder
+/// code rather than assuming it.
+fn reboundTranscriptHashFixture(ch1_raw: []const u8, hrr_raw: []const u8, truncated_ch2: []const u8) [tls_backend.hash_len]u8 {
+    var ch1_hash: [tls_backend.hash_len]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(ch1_raw, &ch1_hash, .{});
+
+    var msg_hash_record: [4 + tls_backend.hash_len]u8 = undefined;
+    msg_hash_record[0] = @intFromEnum(tls_core.messages.MessageType.message_hash);
+    std.mem.writeInt(u24, msg_hash_record[1..4], tls_backend.hash_len, .big);
+    @memcpy(msg_hash_record[4..], &ch1_hash);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(&msg_hash_record);
+    hasher.update(hrr_raw);
+    hasher.update(truncated_ch2);
+    var out: [tls_backend.hash_len]u8 = undefined;
+    hasher.final(&out);
+    return out;
+}
+
+/// Like `makeCacheTicket`, but stamped with the "h2" ALPN both
+/// `directHarnessWithClientKeyShareMode`'s default record policy and
+/// `pskStoredState`'s server-side state expect — required for any test that
+/// drives the connection through a real `onEncryptedExtensions`, which
+/// checks the selected ticket's stored ALPN against the just-negotiated one.
+fn makeH2CacheTicket(psk: []const u8, ticket: []const u8) !session.ClientTicketState {
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = psk,
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    });
+    var state: session.ClientTicketState = .{};
+    try state.init(std.testing.allocator, session.Limits.default, &common, .{
+        .ticket = ticket,
+        .ticket_age_add = 0,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    return state;
+}
+
+const PskExtensionObserver = struct {
+    psk_ext: ?[]const u8 = null,
+
+    fn observe(ctx: *anyopaque, observation: tls_core.negotiation.ExtensionObservation) tls_core.negotiation.Error!void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (observation.id == pre_shared_key.ext_pre_shared_key) self.psk_ext = observation.data;
+    }
+};
+
+test "#485 client re-offers PSK identities across HelloRetryRequest with binders derived from the rebound transcript, preserving order and updating ages" {
+    var client = tls_backend.Tls13Backend.initClientWithOptions(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+        .{ .initial_key_share_mode = .empty },
+    );
+    defer client.deinit();
+
+    const psk_a = [_]u8{0x5a} ** tls_backend.hash_len;
+    const psk_b = [_]u8{0x6b} ** tls_backend.hash_len;
+    var ticket_a = try makeCacheTicket(&psk_a, "ticket-a");
+    defer ticket_a.deinit();
+    var ticket_b = try makeCacheTicket(&psk_b, "ticket-b");
+    defer ticket_b.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket_a);
+    try offers.push(&ticket_b);
+
+    // Mutable clock: CH1 and the HRR/CH2 must be observed at genuinely
+    // different times, or a test that merely echoes ClientHello1's own age
+    // would pass just as easily as one that actually recomputes it.
+    const Clock = struct {
+        now_ms: i64,
+        fn now(ctx: *anyopaque) i64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.now_ms;
+        }
+    };
+    var clock = Clock{ .now_ms = 5_000 };
+    try client.setClientPskOffers(&offers, &clock, Clock.now);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    const ch1_raw = nthInitialCryptoBytes(&sink, 0);
+
+    const ch1_message = try tls_core.messages.decode(ch1_raw);
+    var ch1_observer = PskExtensionObserver{};
+    _ = try tls_core.negotiation.parseClientHelloObserved(ch1_message.body, .{ .ctx = &ch1_observer, .observeFn = PskExtensionObserver.observe });
+    var ch1_offered = try pre_shared_key.OfferedPsks.parse(ch1_observer.psk_ext orelse return error.TestUnexpectedResult);
+    var ch1_it = ch1_offered.pairs();
+    const ch1_first = (try ch1_it.next()).?;
+    const ch1_second = (try ch1_it.next()).?;
+    // Both tickets were received at `received_at_unix_ms = 0` with
+    // `ticket_age_add = 0`, so ClientHello1's age is exactly `now_ms`.
+    try std.testing.expectEqual(@as(u32, 5_000), ch1_first.identity.obfuscated_ticket_age);
+    try std.testing.expectEqual(@as(u32, 5_000), ch1_second.identity.obfuscated_ticket_age);
+
+    // Advance the clock before the HRR arrives, so ClientHello2's
+    // recomputed age must differ from ClientHello1's by exactly this delta.
+    clock.now_ms = 6_250;
+
+    // A cookie-bearing, group-requesting HRR — proving both "PSK stays the
+    // last extension even once a cookie is inserted" and correct binder
+    // derivation through a non-trivial rebound transcript in one exchange.
+    const cookie = "hrr-cookie-fixture";
+    var hrr_buf: [256]u8 = undefined;
+    const hrr_raw = try tls_core.hello_retry.encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+        .cookie = cookie,
+    }, &hrr_buf);
+    try client.backend().receive(.initial, hrr_raw, &sink);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, client.core.retry_state);
+    const ch2_raw = nthInitialCryptoBytes(&sink, 1);
+
+    const ch2_message = try tls_core.messages.decode(ch2_raw);
+    var observer = PskExtensionObserver{};
+    _ = try tls_core.negotiation.parseClientHelloObserved(ch2_message.body, .{ .ctx = &observer, .observeFn = PskExtensionObserver.observe });
+    const ext_data = observer.psk_ext orelse return error.TestUnexpectedResult;
+
+    var offered = try pre_shared_key.OfferedPsks.parse(ext_data);
+    try std.testing.expectEqual(@as(usize, 2), offered.count);
+
+    // Identity order preserved from ClientHello1's own wire order.
+    var it = offered.pairs();
+    const first = (try it.next()).?;
+    const second = (try it.next()).?;
+    try std.testing.expectEqualStrings("ticket-a", first.identity.identity);
+    try std.testing.expectEqualStrings("ticket-b", second.identity.identity);
+    // Ages were genuinely recomputed at ClientHello2 emission time — each
+    // changed by exactly the clock advance since ClientHello1, not merely
+    // echoed from ClientHello1's own age.
+    try std.testing.expectEqual(@as(u32, 6_250), first.identity.obfuscated_ticket_age);
+    try std.testing.expectEqual(@as(u32, 6_250), second.identity.obfuscated_ticket_age);
+    try std.testing.expectEqual(ch1_first.identity.obfuscated_ticket_age + 1_250, first.identity.obfuscated_ticket_age);
+    try std.testing.expectEqual(ch1_second.identity.obfuscated_ticket_age + 1_250, second.identity.obfuscated_ticket_age);
+
+    // Each binder verifies only against the rebound transcript.
+    const ext_data_offset_in_ch2 = @intFromPtr(ext_data.ptr) - @intFromPtr(ch2_raw.ptr);
+    const truncated_len = ext_data_offset_in_ch2 + offered.binder_vector_offset;
+    const truncated_ch2 = ch2_raw[0..truncated_len];
+    const rebound_hash = reboundTranscriptHashFixture(ch1_raw, hrr_raw, truncated_ch2);
+
+    try std.testing.expect(try pre_shared_key.verifyBinderFromTranscriptHash(.sha256, &psk_a, &rebound_hash, first.binder));
+    try std.testing.expect(try pre_shared_key.verifyBinderFromTranscriptHash(.sha256, &psk_b, &rebound_hash, second.binder));
+
+    // A binder over `Hash(Truncate(ClientHello2))` alone — the pre-#485
+    // shape — must not accidentally verify.
+    var isolated_hash: [tls_backend.hash_len]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(truncated_ch2, &isolated_hash, .{});
+    try std.testing.expect(!try pre_shared_key.verifyBinderFromTranscriptHash(.sha256, &psk_a, &isolated_hash, first.binder));
+
+    try expectHrrRetryStateCleared(&client);
+}
+
+test "#485 an oversized ClientHello2 PSK offer fails locally and wipes all retained PSK/retry state" {
+    var client = tls_backend.Tls13Backend.initClientWithOptions(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+        .{ .initial_key_share_mode = .empty },
+    );
+    defer client.deinit();
+
+    // Eight identities (the offer-set maximum), each well under
+    // `session.Limits.default.max_ticket_len` individually, but packed close
+    // enough to `max_message_len` in total that ClientHello1 still fits
+    // while ClientHello2 — the same offer plus a real key share and a large
+    // HRR cookie — no longer does.
+    const item_identity = [_]u8{'x'} ** 950;
+    var tickets: [pre_shared_key.max_offered_identities]session.ClientTicketState = undefined;
+    for (&tickets) |*t| t.* = try makeCacheTicket(&([_]u8{0x5a} ** tls_backend.hash_len), &item_identity);
+    defer for (&tickets) |*t| t.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    for (&tickets) |*t| try offers.push(t);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 5_000;
+        }
+    };
+    try client.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    try std.testing.expectEqual(@as(usize, 1), countCryptoEvents(&sink, .initial));
+
+    const big_cookie = [_]u8{0xcc} ** 440;
+    var hrr_buf: [768]u8 = undefined;
+    const hrr_raw = try tls_core.hello_retry.encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+        .cookie = &big_cookie,
+    }, &hrr_buf);
+
+    // Fails locally — the retained identity is never silently dropped to
+    // make room for the cookie.
+    try std.testing.expectError(error.HandshakeBufferOverflow, client.backend().receive(.initial, hrr_raw, &sink));
+
+    // No ClientHello2 was ever emitted...
+    try std.testing.expectEqual(@as(usize, 1), countCryptoEvents(&sink, .initial));
+    // ...and every retained PSK/retry field was wiped by
+    // `clearFailedHandshakeState`, not left half-consumed.
+    try std.testing.expect(client.client_offer_lease.offers.isEmpty());
+    try std.testing.expect(client.client_hello_psk == null);
+    try std.testing.expect(client.retry.request == null);
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.failed, client.core.handshake_lifecycle);
+}
+
+fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
+    var bytes: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
+    return bytes;
+}
+
 fn nthInitialCryptoBytes(sink: *const DirectSink, index: usize) []const u8 {
     var seen: usize = 0;
     for (sink.items[0..sink.len]) |event| switch (event) {
@@ -2633,6 +2868,546 @@ fn nthInitialCryptoBytes(sink: *const DirectSink, index: usize) []const u8 {
         else => {},
     };
     unreachable;
+}
+
+test "#485 PSK resumption completes through one HelloRetryRequest, with matching transcripts and traffic secrets on both sides" {
+    var harness = directHarnessWithClientKeyShareMode(.record, .record, .empty);
+    defer harness.deinit();
+
+    const psk = [_]u8{0x64} ** tls_backend.hash_len;
+    var ticket = try makeH2CacheTicket(&psk, "hrr-resumption-ticket");
+    defer ticket.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 5_000;
+        }
+    };
+    try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "hrr-resumption-ticket" };
+    try harness.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, harness.client_backend.core.retry_state);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, harness.server_backend.core.retry_state);
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(harness.client_backend.core.psk_authenticated);
+    try std.testing.expect(harness.server_backend.core.psk_authenticated);
+
+    // Both sides derived the same transcript hash, so no side used a
+    // divergent (e.g. isolated `Hash(Truncate(CH2))`) binder transcript
+    // internally without it showing up here.
+    const client_hash = harness.client_backend.core.transcriptHash();
+    const server_hash = harness.server_backend.core.transcriptHash();
+    try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
+
+    // No traffic secret was derived at the HRR itself, only after the final
+    // ServerHello — same assertions as the non-PSK #484 HRR round trip.
+    try std.testing.expect(harness.observed.handshake_write_secret[0] != null);
+    try std.testing.expect(harness.observed.handshake_write_secret[1] != null);
+    try std.testing.expect(harness.observed.application_write_secret[0] != null);
+    try std.testing.expect(harness.observed.application_write_secret[1] != null);
+    try std.testing.expect(harness.observed.initial_discarded[0]);
+    try std.testing.expect(harness.observed.initial_discarded[1]);
+
+    try expectHrrRetryStateCleared(&harness.client_backend);
+    try expectHrrRetryStateCleared(&harness.server_backend);
+
+    // Genuinely usable: application data flows both ways under the
+    // PSK-resumed, post-HRR keys.
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try harness.client_bridge.sealApplicationData("resumed after hrr", &protected);
+    const opened_request = try harness.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext);
+    try std.testing.expectEqualStrings("resumed after hrr", opened_request.inner.content);
+}
+
+fn findSecretEvent(sink: *const DirectSink, epoch: events.EncryptionEpoch, direction: events.SecretDirection) []const u8 {
+    for (sink.items[0..sink.len]) |event| switch (event) {
+        .traffic_secret => |ts| if (ts.epoch == epoch and ts.direction == direction) return ts.data,
+        else => {},
+    };
+    unreachable;
+}
+
+/// Independently generated (Python `cryptography` X25519 + hashlib/hmac
+/// HKDF, not this codebase's own `std.crypto.tls.hkdfExpandLabel` or
+/// `transcript.zig`) known-answer values for the "#485 KAT" test below, over
+/// the exact wire bytes that fixed test's fixed entropy
+/// (`clientEntropy().retry_key_share_seed = 0x13*32`,
+/// `serverEntropy().key_share_seed = 0x22*32`) and PSK (`0x64*32`) produce:
+/// the rebound binder-transcript hash and ClientHello2's own PSK binder
+/// (cross-checking the full CH1-rebind/HRR/Truncate(CH2) chain the same way
+/// the pre_shared_key.zig primitive fixture does), the post-ServerHello
+/// handshake traffic secrets, and the post-server-Finished application
+/// traffic secrets (RFC 8446 §7.1's Derive-Secret/HKDF-Expand-Label chain
+/// from PSK-derived early_secret through ECDHE-derived handshake_secret to
+/// master_secret). The independent script also recomputed the client
+/// Finished `verify_data` from these same secrets/transcript and confirmed
+/// it matches the wire bytes, cross-checking that the whole transcript
+/// chain (not just the isolated HKDF calls) is threaded correctly.
+const kat_rebound_transcript_hash = "74bcded7fdd3c4c74e2825fa5d9b07862dbc83157fd5bc8448b6ec4330a45ee3";
+const kat_ch2_binder = "d5f5ca74be00bec75fb93a09ee3465a81240833bd20221e70ee97ed3f1543a3c";
+const kat_client_hs_traffic = "e314b50f3740ee9bfc9a73f46aaf73cdd5e5194a3b3fef0e35ecc08980910a41";
+const kat_server_hs_traffic = "28a14344d5e36f0dc876d5aaaa57496f5d5da86e5a11ac77335df56a5194d9ca";
+const kat_client_ap_traffic = "ed507f15754fcab4e0a4603ecb04ffebcffc21390b20de367196c0d3613e1a52";
+const kat_server_ap_traffic = "632f7e12de3c8853a19c91436cb487b61dd50ce2a6edad93d30628d5723a14bd";
+
+test "#485 KAT: PSK-resumed HRR handshake/application secrets match an independently computed RFC 8446 key schedule" {
+    var client = tls_backend.Tls13Backend.initClientWithOptions(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+        .{ .initial_key_share_mode = .empty },
+    );
+    defer client.deinit();
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0x64} ** tls_backend.hash_len;
+    var ticket = try makeH2CacheTicket(&psk, "kat-resumption-ticket");
+    defer ticket.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 5_000;
+        }
+    };
+    try client.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "kat-resumption-ticket" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try client.backend().start(.client, {}, &client_sink);
+    const ch1_raw = nthInitialCryptoBytes(&client_sink, 0);
+
+    try server.backend().start(.server, {}, &server_sink);
+    try server.backend().receive(.initial, ch1_raw, &server_sink);
+    const hrr_raw = nthInitialCryptoBytes(&server_sink, 0);
+
+    try client.backend().receive(.initial, hrr_raw, &client_sink);
+    const ch2_raw = nthInitialCryptoBytes(&client_sink, 1);
+
+    // The rebound binder-transcript digest and ClientHello2's own PSK
+    // binder, checked against the independent KAT before the handshake is
+    // even allowed to proceed to the server.
+    const ch2_message = try tls_core.messages.decode(ch2_raw);
+    var psk_observer = PskExtensionObserver{};
+    _ = try tls_core.negotiation.parseClientHelloObserved(ch2_message.body, .{ .ctx = &psk_observer, .observeFn = PskExtensionObserver.observe });
+    const ext_data = psk_observer.psk_ext orelse return error.TestUnexpectedResult;
+    const offered = try pre_shared_key.OfferedPsks.parse(ext_data);
+    var pairs = offered.pairs();
+    const pair = (try pairs.next()).?;
+    const ext_data_offset_in_ch2 = @intFromPtr(ext_data.ptr) - @intFromPtr(ch2_raw.ptr);
+    const truncated_ch2 = ch2_raw[0 .. ext_data_offset_in_ch2 + offered.binder_vector_offset];
+    const rebound_hash = reboundTranscriptHashFixture(ch1_raw, hrr_raw, truncated_ch2);
+    try std.testing.expectEqualSlices(u8, &hexBytes(kat_rebound_transcript_hash), &rebound_hash);
+    try std.testing.expectEqualSlices(u8, &hexBytes(kat_ch2_binder), pair.binder);
+
+    try server.backend().receive(.initial, ch2_raw, &server_sink);
+    const server_hello_raw = nthInitialCryptoBytes(&server_sink, 1);
+    var ee_finished_buf: [4096]u8 = undefined;
+    const ee_finished_raw = collectHandshakeCrypto(&server_sink, &ee_finished_buf);
+
+    try client.backend().receive(.initial, server_hello_raw, &client_sink);
+    try client.backend().receive(.handshake, ee_finished_raw, &client_sink);
+    var client_finished_buf: [512]u8 = undefined;
+    const client_finished_raw = collectHandshakeCrypto(&client_sink, &client_finished_buf);
+
+    try server.backend().receive(.handshake, client_finished_raw, &server_sink);
+
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.complete, client.core.handshake_lifecycle);
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.complete, server.core.handshake_lifecycle);
+    try std.testing.expect(client.core.psk_authenticated);
+    try std.testing.expect(server.core.psk_authenticated);
+
+    // Client-observed secrets, checked against the independent KAT.
+    // "hs_write"/"ap_write" are the client's own direction (matches
+    // `client_hs_traffic`/`client_ap_traffic` in the independent script);
+    // "hs_read"/"ap_read" are the server's direction as seen by the client.
+    try std.testing.expectEqualSlices(u8, &hexBytes(kat_client_hs_traffic), findSecretEvent(&client_sink, .handshake, .write));
+    try std.testing.expectEqualSlices(u8, &hexBytes(kat_server_hs_traffic), findSecretEvent(&client_sink, .handshake, .read));
+    try std.testing.expectEqualSlices(u8, &hexBytes(kat_client_ap_traffic), findSecretEvent(&client_sink, .application, .write));
+    try std.testing.expectEqualSlices(u8, &hexBytes(kat_server_ap_traffic), findSecretEvent(&client_sink, .application, .read));
+
+    // The server's own view of each secret must be the identical bytes —
+    // both sides agree with the independent KAT, not merely with each other.
+    try std.testing.expectEqualSlices(u8, &hexBytes(kat_client_hs_traffic), findSecretEvent(&server_sink, .handshake, .read));
+    try std.testing.expectEqualSlices(u8, &hexBytes(kat_server_hs_traffic), findSecretEvent(&server_sink, .handshake, .write));
+    try std.testing.expectEqualSlices(u8, &hexBytes(kat_client_ap_traffic), findSecretEvent(&server_sink, .application, .read));
+    try std.testing.expectEqualSlices(u8, &hexBytes(kat_server_ap_traffic), findSecretEvent(&server_sink, .application, .write));
+}
+
+test "#485 server rejects a ClientHello2 PSK binder computed only over Hash(Truncate(CH2)), requiring the rebound transcript instead" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+
+    const psk = [_]u8{0x77} ** tls_backend.hash_len;
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "ticket-1" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    // ClientHello1: an empty key share (forces `.retry`) with the same PSK
+    // offer CH2 will also carry — CH2 must mutate CH1 only in permitted
+    // ways, so the two extension sets must match.
+    var buf1: [2048]u8 = undefined;
+    const ch1 = try buildClientHello(&buf1, .{
+        .empty_key_share = true,
+        .psk = .{ .items = &.{.{ .identity = "ticket-1", .binder_psk = &psk }} },
+    });
+    try server.backend().receive(.initial, ch1, &sink);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, server.core.retry_state);
+    // The `.retry` decision returns before PSK selection ever runs.
+    try std.testing.expectEqual(@as(usize, 0), resolver_state.calls);
+
+    // ClientHello2: a real key share this time, and `buildClientHello`'s own
+    // binder helper — which computes `Hash(Truncate(this message))` in
+    // isolation, the pre-#485 shape — is deliberately reused unmodified
+    // here (not patched to the rebound-transcript binder) to prove that
+    // shape is now rejected.
+    var buf2: [2048]u8 = undefined;
+    const ch2 = try buildClientHello(&buf2, .{
+        .psk = .{ .items = &.{.{ .identity = "ticket-1", .binder_psk = &psk }} },
+    });
+    try std.testing.expectError(error.DecryptError, server.backend().receive(.initial, ch2, &sink));
+
+    // The candidate was resolved (compatible) but its binder was fatally
+    // wrong — never silently treated as a miss/fallback.
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(!server.selected_server_psk_present);
+    try std.testing.expect(!server.core.psk_authenticated);
+    // Every retained PSK/retry field was wiped on this failure path too.
+    try std.testing.expect(server.client_hello_psk == null);
+    try std.testing.expect(server.retry.request == null);
+}
+
+test "#485 asynchronous PSK resolution after a HelloRetryRequest uses the captured rebound-transcript binder, not a re-hash" {
+    var client = tls_backend.Tls13Backend.initClientWithOptions(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+        .{ .initial_key_share_mode = .empty },
+    );
+    defer client.deinit();
+
+    const psk = [_]u8{0x5a} ** tls_backend.hash_len;
+    var ticket = try makeH2CacheTicket(&psk, "retry-async-ticket");
+    defer ticket.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 5_000;
+        }
+    };
+    try client.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    mock.async_select = true;
+    mock.pending_polls = 2;
+    var server = serverWithProvider(&mock);
+    defer server.deinit();
+
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "retry-async-ticket" };
+    try server.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try client.backend().start(.client, {}, &client_sink);
+    const ch1_raw = nthInitialCryptoBytes(&client_sink, 0);
+
+    try server.backend().start(.server, {}, &server_sink);
+    try server.backend().receive(.initial, ch1_raw, &server_sink);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, server.core.retry_state);
+    const hrr_raw = nthInitialCryptoBytes(&server_sink, 0);
+
+    try client.backend().receive(.initial, hrr_raw, &client_sink);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, client.core.retry_state);
+    const ch2_raw = nthInitialCryptoBytes(&client_sink, 1);
+
+    try server.backend().receive(.initial, ch2_raw, &server_sink);
+    // Parked awaiting the async credential selection: PSK selection (and
+    // therefore binder verification against the captured rebound-transcript
+    // digest) has not run yet.
+    try std.testing.expect(server.authPending());
+    try std.testing.expectEqual(@as(usize, 0), resolver_state.calls);
+
+    try server.resumeAuth(&server_sink); // poll #1: still pending
+    try server.resumeAuth(&server_sink); // poll #2: still pending
+    try server.resumeAuth(&server_sink); // poll #3: completes, runs PSK selection
+    try std.testing.expect(!server.authPending());
+
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(server.core.psk_authenticated);
+    try std.testing.expect(server.credentialFailure() == null);
+    try std.testing.expect(server.client_hello_psk == null);
+}
+
+// --------------------------------------------------------------------------
+// #485: ordinary fallback/cleanup semantics must survive a HelloRetryRequest
+// unchanged. #536 changed what `onClientHello` retains for ClientHello2's
+// binder capture — these prove that change never leaks into the paths where
+// `selectPsk` declines to resume and the connection falls back to full
+// certificate authentication.
+// --------------------------------------------------------------------------
+
+test "#485 an unknown PSK identity through HelloRetryRequest falls back to a full certificate handshake" {
+    var harness = directHarnessWithClientKeyShareMode(.record, .record, .empty);
+    defer harness.deinit();
+
+    const psk = [_]u8{0x91} ** tls_backend.hash_len;
+    var ticket = try makeH2CacheTicket(&psk, "unknown-after-hrr-ticket");
+    defer ticket.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 5_000;
+        }
+    };
+    try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    // The server has never heard of this identity: every resolve attempt is
+    // a miss.
+    const Resolver = struct {
+        calls: usize = 0,
+        fn now(_: *anyopaque) i64 {
+            return 0;
+        }
+        fn resolve(ctx: *anyopaque, _: []const u8) pre_shared_key.ResolveError!pre_shared_key.ServerPskResolveResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return .miss;
+        }
+    };
+    var resolver_state = Resolver{};
+    try harness.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = Resolver.now,
+        .resolveFn = Resolver.resolve,
+    });
+    var decisions = DecisionProbe{};
+    try harness.server_backend.setResumptionDecisionObserver(decisions.observer());
+
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, harness.client_backend.core.retry_state);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, harness.server_backend.core.retry_state);
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(!harness.client_backend.core.psk_authenticated);
+    try std.testing.expect(!harness.server_backend.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.miss, decisions.last.?);
+    // The full certificate flight actually ran and was trusted.
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+
+    try expectHrrRetryStateCleared(&harness.client_backend);
+    try expectHrrRetryStateCleared(&harness.server_backend);
+}
+
+test "#485 an incompatible PSK identity through HelloRetryRequest falls back to a full certificate handshake" {
+    var harness = directHarnessWithClientKeyShareMode(.record, .record, .empty);
+    defer harness.deinit();
+
+    const psk = [_]u8{0x92} ** tls_backend.hash_len;
+    var ticket = try makeH2CacheTicket(&psk, "incompatible-after-hrr-ticket");
+    defer ticket.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 5_000;
+        }
+    };
+    try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    // Resolves, but the stored ticket was issued under a different leaf
+    // certificate than the server's current identity — incompatible, not a
+    // miss.
+    var incompatible_state = pskStoredStateWithBinding(&psk, session.AuthBinding.fromLeafCertificateDer("different-leaf"));
+    defer incompatible_state.deinit();
+    var resolver_state = CountingResolver{ .state = &incompatible_state, .identity = "incompatible-after-hrr-ticket" };
+    try harness.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+    var decisions = DecisionProbe{};
+    try harness.server_backend.setResumptionDecisionObserver(decisions.observer());
+
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, harness.client_backend.core.retry_state);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, harness.server_backend.core.retry_state);
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(!harness.client_backend.core.psk_authenticated);
+    try std.testing.expect(!harness.server_backend.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.incompatible, decisions.last.?);
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+
+    try expectHrrRetryStateCleared(&harness.client_backend);
+    try expectHrrRetryStateCleared(&harness.server_backend);
+}
+
+test "#485 an expired PSK identity through HelloRetryRequest falls back to a full certificate handshake" {
+    var harness = directHarnessWithClientKeyShareMode(.record, .record, .empty);
+    defer harness.deinit();
+
+    const psk = [_]u8{0x94} ** tls_backend.hash_len;
+    // The client's own local record of this ticket is generously live —
+    // this offer must actually reach the wire (not be filtered by the
+    // client's own `ticketEligibleToOffer` recheck) so the server's
+    // compatibility/fallback path is what's actually exercised.
+    var ticket = try makeH2CacheTicket(&psk, "expired-after-hrr-ticket");
+    defer ticket.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 5_000;
+        }
+    };
+    try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    // The server's own authoritative recovered session disagrees: issued at
+    // 0 with only a 1-second lifetime, observed at the resolver's clock of
+    // 5000ms — already well past expiry.
+    var expired_common: session.ResumableSessionCommon = .{};
+    try expired_common.init(std.testing.allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .application_protocol = "h2",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer(tls_backend.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 1,
+    });
+    var expired_state: session.ServerRecoverableState = .{};
+    expired_state.init(&expired_common, 0);
+    defer expired_state.deinit();
+    var resolver_state = CountingResolver{ .state = &expired_state, .identity = "expired-after-hrr-ticket", .now_ms = 5_000 };
+    try harness.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+    var decisions = DecisionProbe{};
+    try harness.server_backend.setResumptionDecisionObserver(decisions.observer());
+
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, harness.client_backend.core.retry_state);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, harness.server_backend.core.retry_state);
+    try std.testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try std.testing.expect(!harness.client_backend.core.psk_authenticated);
+    try std.testing.expect(!harness.server_backend.core.psk_authenticated);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.incompatible, decisions.last.?);
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+
+    try expectHrrRetryStateCleared(&harness.client_backend);
+    try expectHrrRetryStateCleared(&harness.server_backend);
+}
+
+test "#485 handshake-time client authentication forces a full handshake through HelloRetryRequest even when a PSK is offered" {
+    var harness = directHarnessWithClientKeyShareMode(.record, .record, .empty);
+    defer harness.deinit();
+    harness.configureClientAuth(.required, true, .{ .pinned_certificate = tls_backend.testdata.certificate_der });
+
+    const psk = [_]u8{0x93} ** tls_backend.hash_len;
+    var ticket = try makeH2CacheTicket(&psk, "client-auth-after-hrr-ticket");
+    defer ticket.deinit();
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 5_000;
+        }
+    };
+    try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+
+    var stored_state = pskStoredState(&psk);
+    defer stored_state.deinit();
+    var resolver_state = CountingResolver{ .state = &stored_state, .identity = "client-auth-after-hrr-ticket" };
+    try harness.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = CountingResolver.now,
+        .resolveFn = CountingResolver.resolve,
+    });
+    var decisions = DecisionProbe{};
+    try harness.server_backend.setResumptionDecisionObserver(decisions.observer());
+
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, harness.client_backend.core.retry_state);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, harness.server_backend.core.retry_state);
+    try std.testing.expect(!harness.client_backend.core.psk_authenticated);
+    try std.testing.expect(!harness.server_backend.core.psk_authenticated);
+    // The resolver is never even consulted: client_auth forces the full
+    // fallback before PSK selection begins, exactly as it does without HRR.
+    try std.testing.expectEqual(@as(usize, 0), resolver_state.calls);
+    try std.testing.expectEqual(@as(usize, 1), decisions.count);
+    try std.testing.expectEqual(tls_backend.Tls13Backend.ResumptionDecision.full_handshake, decisions.last.?);
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+
+    try expectHrrRetryStateCleared(&harness.client_backend);
+    try expectHrrRetryStateCleared(&harness.server_backend);
 }
 
 test "#484 server emits exactly one HelloRetryRequest for an external-style ClientHello1 with a present, empty key_share" {
