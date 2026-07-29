@@ -1177,6 +1177,26 @@ test "dynamic table capacity is capped by negotiated SETTINGS and can be lowered
     try testing.expectEqual(@as(u64, 0), table.capacity);
     try testing.expectEqual(@as(u64, 0), table.bytes_used);
     try testing.expectEqual(@as(usize, 0), table.entries.items.len);
+    try testing.expectEqual(@as(u64, 1), table.inserted_count);
+    try testing.expectEqual(@as(u64, 1), table.evicted_count);
+}
+
+test "dynamic table insertion count remains monotonic across capacity eviction" {
+    var table = DynamicTable.initNegotiated(testing.allocator, 128);
+    defer table.deinit();
+
+    try table.setCapacity(128);
+    _ = try table.insert("x-one", "one");
+    _ = try table.insert("x-two", "two");
+    const before = table.inserted_count;
+
+    try table.setCapacity(0);
+    try testing.expectEqual(before, table.inserted_count);
+    try testing.expectEqual(before, table.evicted_count);
+
+    try table.setCapacity(128);
+    _ = try table.insert("x-three", "three");
+    try testing.expectEqual(before + 1, table.inserted_count);
 }
 
 test "encoder stream applies capacity insert and duplicate instructions" {
