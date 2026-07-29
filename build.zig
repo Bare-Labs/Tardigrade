@@ -18,6 +18,8 @@ pub fn build(b: *std.Build) void {
     const static_executable = b.option(bool, "static-executable", "Build the tardi executable as a static binary") orelse false;
     const app_version = b.option([]const u8, "version", "Version string embedded in the tardi binary") orelse "dev";
     const go_bin = b.option([]const u8, "go-bin", "Go command used to build the PKI crypto/x509 oracle") orelse "go";
+    const quic_test_filter = b.option([]const u8, "quic-test-filter", "Filter tests run by the test-quic step");
+    const quic_test_filters: []const []const u8 = if (quic_test_filter) |filter| &.{filter} else &.{};
     const tls_profile = b.option(
         TlsProfile,
         "tls-profile",
@@ -291,9 +293,9 @@ pub fn build(b: *std.Build) void {
     security_corpus_step.dependOn(&run_security_corpus_tests.step);
 
     // varint.zig lives in its own module, so its tests need their own run.
-    const quic_varint_tests = b.addTest(.{ .root_module = quic_varint_mod });
+    const quic_varint_tests = b.addTest(.{ .root_module = quic_varint_mod, .filters = quic_test_filters });
     const run_quic_varint_tests = b.addRunArtifact(quic_varint_tests);
-    const quic_tests = b.addTest(.{ .root_module = quic_mod });
+    const quic_tests = b.addTest(.{ .root_module = quic_mod, .filters = quic_test_filters });
     const run_quic_tests = b.addRunArtifact(quic_tests);
     const quic_step = b.step("test-quic", "Run pure-Zig QUIC/HTTP-3 unit tests");
     quic_step.dependOn(&run_quic_tests.step);
@@ -426,7 +428,7 @@ pub fn build(b: *std.Build) void {
     quic_step.dependOn(&run_record_mode_handshake_tests.step);
     test_step.dependOn(&run_record_mode_handshake_tests.step);
 
-    const http3_tests = b.addTest(.{ .root_module = http3_mod });
+    const http3_tests = b.addTest(.{ .root_module = http3_mod, .filters = quic_test_filters });
     const run_http3_tests = b.addRunArtifact(http3_tests);
     quic_step.dependOn(&run_http3_tests.step);
     test_step.dependOn(&run_http3_tests.step);
@@ -442,7 +444,7 @@ pub fn build(b: *std.Build) void {
     quic_h3_smoke_mod.addImport("quic", quic_mod);
     quic_h3_smoke_mod.addImport("http3", http3_mod);
     quic_h3_smoke_mod.addImport("stream_transport", stream_transport_mod);
-    const quic_h3_smoke_tests = b.addTest(.{ .root_module = quic_h3_smoke_mod });
+    const quic_h3_smoke_tests = b.addTest(.{ .root_module = quic_h3_smoke_mod, .filters = quic_test_filters });
     const run_quic_h3_smoke_tests = b.addRunArtifact(quic_h3_smoke_tests);
     quic_step.dependOn(&run_quic_h3_smoke_tests.step);
     test_step.dependOn(&run_quic_h3_smoke_tests.step);
@@ -458,7 +460,7 @@ pub fn build(b: *std.Build) void {
     quic_h3_e2e_mod.addImport("quic", quic_mod);
     quic_h3_e2e_mod.addImport("http3", http3_mod);
     quic_h3_e2e_mod.addImport("stream_transport", stream_transport_mod);
-    const quic_h3_e2e_tests = b.addTest(.{ .root_module = quic_h3_e2e_mod });
+    const quic_h3_e2e_tests = b.addTest(.{ .root_module = quic_h3_e2e_mod, .filters = quic_test_filters });
     const run_quic_h3_e2e_tests = b.addRunArtifact(quic_h3_e2e_tests);
     const quic_h3_driver_step = b.step("test-quic-h3-driver", "Run deterministic native QUIC/H3 driver scenarios");
     quic_h3_driver_step.dependOn(&run_quic_h3_e2e_tests.step);
@@ -492,7 +494,7 @@ pub fn build(b: *std.Build) void {
     udp_http3_runtime_mod.addImport("tls_core", tls_core_mod);
     udp_http3_runtime_mod.addImport("build_options", build_options.createModule());
     quic_h3_udp_mod.addImport("http3_runtime", udp_http3_runtime_mod);
-    const quic_h3_udp_tests = b.addTest(.{ .root_module = quic_h3_udp_mod });
+    const quic_h3_udp_tests = b.addTest(.{ .root_module = quic_h3_udp_mod, .filters = quic_test_filters });
     const run_quic_h3_udp_tests = b.addRunArtifact(quic_h3_udp_tests);
     quic_step.dependOn(&run_quic_h3_udp_tests.step);
     test_step.dependOn(&run_quic_h3_udp_tests.step);
