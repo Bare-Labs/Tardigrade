@@ -3439,6 +3439,124 @@ test "driver: client and server complete the handshake over protected packets" {
     }
 }
 
+// #484: a genuine two-`Connection` loopback (real QUIC packets, real
+// Initial-space CRYPTO reassembly, real key install/discard) proving the
+// shared TLS engine's HelloRetryRequest support works through the QUIC
+// adapter, not only through the direct-TLS-backend harness in
+// `src/tls/tls13_backend_tests.zig`.
+test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data" {
+    const allocator = testing.allocator;
+
+    const LoggedEvent = union(enum) { packet_sent: PacketNumberSpace, keys_discarded: PacketNumberSpace };
+    const EventCapture = struct {
+        log: [64]LoggedEvent = undefined,
+        len: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const logged: LoggedEvent = switch (event) {
+                .packet_sent => |p| .{ .packet_sent = p.space },
+                .keys_discarded => |space| .{ .keys_discarded = space },
+                else => return,
+            };
+            if (self.len == self.log.len) return;
+            self.log[self.len] = logged;
+            self.len += 1;
+        }
+
+        /// How many `.initial`-space packets were sent strictly before this
+        /// side's first `.initial` `keys_discarded` event (or before the
+        /// end of the log, if Initial keys were never discarded).
+        fn initialPacketsSentBeforeInitialDiscard(self: *const @This()) usize {
+            var count: usize = 0;
+            for (self.log[0..self.len]) |entry| {
+                switch (entry) {
+                    .packet_sent => |space| if (space == .initial) {
+                        count += 1;
+                    },
+                    .keys_discarded => |space| if (space == .initial) return count,
+                }
+            }
+            return count;
+        }
+
+        fn discardedInitialKeys(self: *const @This()) bool {
+            for (self.log[0..self.len]) |entry| {
+                if (entry == .keys_discarded and entry.keys_discarded == .initial) return true;
+            }
+            return false;
+        }
+    };
+    var client_capture = EventCapture{};
+    var server_capture = EventCapture{};
+
+    const pair = try allocator.create(TestPair);
+    errdefer allocator.destroy(pair);
+    pair.* = .{
+        .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocatorAndOptions(
+            allocator,
+            .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x13} ** 32 },
+            .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+            .{ .initial_key_share_mode = .empty },
+        ),
+        .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
+            allocator,
+            .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x23} ** 32 },
+            try tls_backend_mod.Identity.initPkcs8(
+                tls_backend_mod.testdata.certificate_der,
+                tls_backend_mod.testdata.private_key_pkcs8_der,
+            ),
+        ),
+    };
+    pair.client = try Connection.init(allocator, .{
+        .role = .client,
+        .local_cid = &TestPair.client_cid,
+        .original_dcid = &TestPair.odcid,
+        .peer_cid = &TestPair.odcid,
+        .tls = pair.client_backend.backend(),
+        .now_us = pair.now_us,
+        .initial_path = TestPair.client_path,
+        .events = .{ .context = &client_capture, .emitFn = EventCapture.onEvent },
+    });
+    errdefer pair.client.deinit();
+    pair.server = try Connection.init(allocator, .{
+        .role = .server,
+        .local_cid = &TestPair.odcid,
+        .original_dcid = &TestPair.odcid,
+        .peer_cid = &TestPair.client_cid,
+        .tls = pair.server_backend.backend(),
+        .now_us = pair.now_us,
+        .initial_path = TestPair.server_path,
+        .events = .{ .context = &server_capture, .emitFn = EventCapture.onEvent },
+    });
+    defer pair.deinit(allocator);
+
+    try pair.pump();
+
+    try testing.expectEqual(State.established, pair.client.state());
+    try testing.expectEqual(State.established, pair.server.state());
+
+    // The shared TLS engine actually exercised exactly one HelloRetryRequest.
+    try testing.expectEqual(tls_core.handshake.RetryState.hrr_received, pair.client_backend.engine.core.retry_state);
+    try testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, pair.server_backend.engine.core.retry_state);
+
+    // Both the server's HelloRetryRequest and its final ServerHello, and
+    // the client's ClientHello1 and ClientHello2, travel as Initial-space
+    // QUIC packets — never Handshake/Application — and Initial keys are
+    // discarded only once both of a side's Initial-space flight packets
+    // (HRR + real ServerHello on the server; ClientHello1 + ClientHello2
+    // on the client) have already gone out.
+    try testing.expect(server_capture.initialPacketsSentBeforeInitialDiscard() >= 2);
+    try testing.expect(client_capture.initialPacketsSentBeforeInitialDiscard() >= 2);
+    try testing.expect(client_capture.discardedInitialKeys());
+    try testing.expect(server_capture.discardedInitialKeys());
+
+    inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |level| {
+        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.client.adapter.protectionKeys(level, .write));
+        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.server.adapter.protectionKeys(level, .write));
+    }
+}
+
 test "driver: bidirectional stream data round-trips with FIN" {
     const allocator = testing.allocator;
     var pair = try TestPair.init(allocator);

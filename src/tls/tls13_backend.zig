@@ -579,6 +579,12 @@ pub const Tls13Backend = struct {
     /// default (`createFn == null`) means no cookie is offered and
     /// group-only HRR stays valid — see `HelloRetryCookieProvider`.
     hello_retry_cookie_provider: HelloRetryCookieProvider = .{},
+    /// Client (#484): the version/cipher/group committed to when this
+    /// connection accepted a HelloRetryRequest, retained through
+    /// ClientHello2 so the final ServerHello can be checked against it.
+    /// `null` until an HRR is accepted; cleared once the final ServerHello
+    /// has been checked. See `ClientHrrSelection`.
+    client_hrr_selection: ?ClientHrrSelection = null,
     core: tls_handshake_codec.Core,
     schedule: ?KeySchedule = null,
     resumption_master_secret: crypto_pkg.secrets.FixedSecret(session.max_psk_len) = .{},
@@ -835,6 +841,18 @@ pub const Tls13Backend = struct {
             self.cookie_len = 0;
             self.request = null;
         }
+    };
+
+    /// Client (#484): the RFC 8446 §4.1.4 "final ServerHello consistency"
+    /// fields a connection committed to when it accepted a
+    /// HelloRetryRequest. Deliberately does not include `Request.cookie` —
+    /// a borrowed slice into the HRR's transient input bytes, and not
+    /// something the final ServerHello ever echoes, so there is nothing to
+    /// check it against here.
+    pub const ClientHrrSelection = struct {
+        selected_version: tls_algorithms.ProtocolVersion,
+        cipher_suite: tls_algorithms.CipherSuite,
+        selected_group: ?tls_algorithms.NamedGroup,
     };
 
     /// Server (#484): optional cookie contribution to an outgoing
@@ -1511,8 +1529,10 @@ pub const Tls13Backend = struct {
         self.clearClientHelloPsk();
         self.retry.wipe();
         self.hello_retry_cookie_provider = .{};
+        self.client_hrr_selection = null;
         crypto.secureZero(u8, &self.expected_client_verify);
         self.wipeEphemeral();
+        self.wipeRetryKeyShareSeed();
         self.wipeIdentity();
         crypto.secureZero(u8, &self.peer_chain);
         self.peer_chain_count = 0;
@@ -1550,6 +1570,17 @@ pub const Tls13Backend = struct {
         crypto.secureZero(u8, &self.entropy.key_share_seed);
         crypto.secureZero(u8, std.mem.asBytes(&self.key_pair));
         self.key_pair_present = false;
+    }
+
+    /// Client (#484): zeroes the HelloRetryRequest-only key-share seed.
+    /// Deliberately separate from `wipeEphemeral` — on the retry path,
+    /// `wipeEphemeral` runs *before* this seed is consumed (to destroy
+    /// ClientHello1's superseded key pair), so folding this into it would
+    /// zero the seed before it could be used. Called immediately after the
+    /// fresh key pair is generated from it, and unconditionally on
+    /// teardown so an unconsumed seed never outlives the connection.
+    fn wipeRetryKeyShareSeed(self: *Tls13Backend) void {
+        crypto.secureZero(u8, &self.entropy.retry_key_share_seed);
     }
 
     fn wipeIdentity(self: *Tls13Backend) void {
@@ -1618,6 +1649,8 @@ pub const Tls13Backend = struct {
         self.early_data_discard_limit = 0;
         self.clearClientHelloPsk();
         self.retry.wipe();
+        self.wipeRetryKeyShareSeed();
+        self.client_hrr_selection = null;
         if (self.schedule) |*schedule| schedule.wipe();
         self.schedule = null;
         self.resumption_master_secret.deinit();
@@ -1987,12 +2020,6 @@ pub const Tls13Backend = struct {
     // -----------------------------------------------------------------------
 
     fn sendClientHello(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
-        var key_pair = X25519.KeyPair.generateDeterministic(self.entropy.key_share_seed) catch
-            return error.SecretExportFailed;
-        defer crypto.secureZero(u8, &key_pair.secret_key);
-        self.key_pair = key_pair;
-        self.key_pair_present = true;
-
         // Sized for the worst case, not the common one: maximum ALPN (255,
         // bounded by `TransportProfile.validate`), maximum SNI
         // (`max_server_name_len` = 256), and a maximum transport extension
@@ -2046,6 +2073,12 @@ pub const Tls13Backend = struct {
         try w.u16_(ext_key_share);
         switch (self.initial_key_share_mode) {
             .normal => {
+                var key_pair = X25519.KeyPair.generateDeterministic(self.entropy.key_share_seed) catch
+                    return error.SecretExportFailed;
+                defer crypto.secureZero(u8, &key_pair.secret_key);
+                self.key_pair = key_pair;
+                self.key_pair_present = true;
+
                 try w.u16_(2 + 2 + 2 + X25519.public_length);
                 try w.u16_(2 + 2 + X25519.public_length); // client_shares
                 try w.u16_(group_x25519);
@@ -2055,7 +2088,13 @@ pub const Tls13Backend = struct {
             // #484: advertise the group in `supported_groups` above but send
             // a legal empty `client_shares` vector, so a native server
             // negotiates `.retry` and this backend can exercise
-            // HelloRetryRequest before #335 adds a second key-exchange group.
+            // HelloRetryRequest before #335 adds a second key-exchange
+            // group. Deliberately generates *no* key pair at all —
+            // `self.key_pair_present` stays `false`, so if a peer
+            // incorrectly answers with an ordinary ServerHello instead of
+            // an HRR, `onServerHello`'s existing `!key_pair_present` guard
+            // rejects it before any ECDH, rather than deriving secrets
+            // from a private key whose public half was never offered.
             .empty => {
                 try w.u16_(2); // extension_data length: just the vector length field
                 try w.u16_(0); // client_shares: zero-length vector
@@ -2410,8 +2449,22 @@ pub const Tls13Backend = struct {
         if (try r.u16_() != legacy_version) return error.IllegalParameter;
         const random = try r.slice(32);
         if (std.mem.eql(u8, random, &hello_retry_request_random)) return error.IllegalParameter;
+        // #484: this is a genuine, non-HRR ServerHello (the sentinel check
+        // above already rejected an HRR-shaped one) — no retry occurred or
+        // ever will for this connection, so the ClientHello1 capture
+        // `sendClientHello` retained for a possible HelloRetryRequest is no
+        // longer needed. For a resumed handshake this buffer holds the
+        // bearer ticket identity and its binder, so this must run here —
+        // not only on the retry path — or a successful long-lived
+        // connection would retain those bytes until `deinit`.
+        self.clearClientHelloPsk();
         const session_id_len = try r.u8_();
         _ = try r.slice(session_id_len);
+        // RFC 8446 §4.1.3: `legacy_session_id_echo` must equal the
+        // ClientHello's `legacy_session_id`, which this profile always
+        // sends empty (no TLS 1.3 compatibility-mode session echo, on
+        // either ClientHello1 or ClientHello2).
+        if (session_id_len != 0) return error.IllegalParameter;
         const selected_cipher = tls_algorithms.fromInt(tls_algorithms.CipherSuite, try r.u16_()) orelse return error.IllegalParameter;
         if (try r.u8_() != 0) return error.IllegalParameter;
 
@@ -2454,6 +2507,18 @@ pub const Tls13Backend = struct {
             .alpn = null,
         }) catch |err| return mapNegotiationError(err);
         if (selected_cipher != .tls_aes_128_gcm_sha256 or named_group != .x25519 or protocol_version != .tls13) return error.IllegalParameter;
+        // #484: the final ServerHello must remain consistent with what this
+        // connection's HelloRetryRequest actually selected — a check on top
+        // of (not a substitute for) the ordinary policy-tuple check above,
+        // which alone cannot express "matches this connection's own
+        // accepted retry" as opposed to "matches policy in general."
+        if (self.client_hrr_selection) |selection| {
+            if (protocol_version != selection.selected_version or
+                selected_cipher != selection.cipher_suite or
+                (selection.selected_group != null and named_group != selection.selected_group.?))
+                return error.IllegalParameter;
+            self.client_hrr_selection = null;
+        }
         self.negotiated_version = protocol_version;
         self.negotiated_cipher_suite = selected_cipher;
         self.negotiated_named_group = named_group;
@@ -2552,6 +2617,17 @@ pub const Tls13Backend = struct {
         // ClientHello1 always carries an empty legacy_session_id (this
         // profile does not use TLS 1.3's compatibility-mode session echo).
         const request = hello_retry.decode(body, "", &parsed.offers) catch |err| return mapCoreError(err);
+        // #484: retain the committed version/cipher/group (never the HRR's
+        // `cookie`, a borrowed slice into this call's transient `body`) so
+        // `onServerHello` can check the *final* ServerHello against exactly
+        // what this connection's HRR selected — not only against local
+        // policy, which alone cannot express "matches this connection's own
+        // accepted retry."
+        self.client_hrr_selection = .{
+            .selected_version = request.selected_version,
+            .cipher_suite = request.cipher_suite,
+            .selected_group = request.selected_group,
+        };
 
         var buf: [max_message_len]u8 = undefined;
         defer crypto.secureZero(u8, &buf);
@@ -2602,6 +2678,10 @@ pub const Tls13Backend = struct {
             defer crypto.secureZero(u8, &key_pair.secret_key);
             self.key_pair = key_pair;
             self.key_pair_present = true;
+            // #484: the retry seed is consumed exactly once per connection;
+            // zero it immediately rather than leaving it resident for the
+            // rest of the backend's lifetime.
+            self.wipeRetryKeyShareSeed();
 
             try w.u16_(2 + 2 + 2 + X25519.public_length);
             try w.u16_(2 + 2 + X25519.public_length); // client_shares
@@ -3325,6 +3405,27 @@ pub const Tls13Backend = struct {
             .observeFn = ClientHelloObserver.observe,
         }) catch |err| return mapNegotiationError(err);
         const offers = parsed.offers;
+        // #484: ClientHello2 must be validated against the retained
+        // ClientHello1 and the committed HRR parameters *before*
+        // re-negotiating or committing any peer metadata below (negotiated
+        // tuple, ALPN, transport extension, SNI, PSK capture) — otherwise an
+        // illegal CH2 mutation could be classified by ordinary negotiation
+        // first (e.g. a CH2 that drops the HRR-required key_share would
+        // surface as `MissingExtension` instead of being rejected by the
+        // canonical mutation validator). `hello_retry.validateSecondClientHello`
+        // decodes `raw`/the retained ClientHello1 itself; it does not need
+        // `offers`. Only clear the retained retry context once this
+        // succeeds — the `.retry` arm below still needs it if negotiation
+        // (impossible under this backend's fixed policy, but not something
+        // this check can assume) somehow decides to retry a second time.
+        if (self.core.retry_state == .hrr_sent) {
+            const request = self.retry.request orelse return error.InvalidHandshakeState;
+            const ch1_capture = self.client_hello_psk orelse return error.InvalidHandshakeState;
+            hello_retry.validateSecondClientHello(ch1_capture.message[0..ch1_capture.message_len], raw, request) catch |err| return mapCoreError(err);
+            if (request.cookie) |cookie| try self.hello_retry_cookie_provider.validate(cookie);
+            self.clearClientHelloPsk();
+            self.retry.wipe();
+        }
         const hello_selection = tls_negotiation.negotiateServerHello(self.policy, &offers) catch |err| return mapNegotiationError(err);
         if (observer.psk_ext != null and !observer.psk_modes_seen) return error.MissingExtension;
         // #366: early_data without an accompanying PSK offer is malformed —
@@ -3340,7 +3441,18 @@ pub const Tls13Backend = struct {
         @memcpy(self.peer_sig_schemes[0..offers.raw_signature_schemes_len], offers.raw_signature_schemes[0..offers.raw_signature_schemes_len]);
         self.peer_sig_scheme_count = offers.raw_signature_schemes_len;
         const selected_key_share = switch (hello_selection.key_share) {
-            .use => |share| share.key_exchange,
+            .use => |share| blk: {
+                // #484: a usable share doesn't preclude a *cookie-only*
+                // retry — consulted only on ClientHello1 (never on an
+                // already-validated ClientHello2), preserving the original
+                // key_share untouched. No provider configured, or the
+                // provider declines, and this proceeds exactly as before.
+                if (self.core.retry_state == .none) {
+                    const cookie = try self.takeHelloRetryCookie(null);
+                    if (cookie) |c| return self.emitHelloRetryRequest(raw, null, c, hello_selection, parsed.legacy_session_id, sink);
+                }
+                break :blk share.key_exchange;
+            },
             .retry => |group| {
                 // #484: RFC 8446 permits exactly one HelloRetryRequest. This
                 // handler runs again for ClientHello2 with
@@ -3349,24 +3461,12 @@ pub const Tls13Backend = struct {
                 // share for the requested group and must fail closed rather
                 // than emit a second HRR.
                 if (self.core.retry_state == .hrr_sent) return error.IllegalParameter;
-                return self.emitHelloRetryRequest(raw, group, hello_selection, parsed.legacy_session_id, sink);
+                const cookie = try self.takeHelloRetryCookie(group);
+                return self.emitHelloRetryRequest(raw, group, cookie, hello_selection, parsed.legacy_session_id, sink);
             },
         };
         if (selected_key_share.len != X25519.public_length) return error.MalformedHandshake;
         const client_share = selected_key_share[0..X25519.public_length].*;
-        // #484: ClientHello2 must be validated against the retained
-        // ClientHello1 and the committed HRR parameters *before* any of the
-        // peer metadata below (negotiated tuple, ALPN, transport extension,
-        // SNI, PSK capture) is overwritten with values parsed from this
-        // second hello.
-        if (self.core.retry_state == .hrr_sent) {
-            const request = self.retry.request orelse return error.InvalidHandshakeState;
-            const ch1_capture = self.client_hello_psk orelse return error.InvalidHandshakeState;
-            hello_retry.validateSecondClientHello(ch1_capture.message[0..ch1_capture.message_len], raw, request) catch |err| return mapCoreError(err);
-            if (request.cookie) |cookie| try self.hello_retry_cookie_provider.validate(cookie);
-            self.clearClientHelloPsk();
-            self.retry.wipe();
-        }
         if (hello_selection.cipher_suite != .tls_aes_128_gcm_sha256 or
             hello_selection.named_group != .x25519 or
             hello_selection.version != .tls13)
@@ -3420,43 +3520,51 @@ pub const Tls13Backend = struct {
         try self.beginServerSelection(parsed.legacy_session_id, client_share, sink);
     }
 
-    /// Server (#484): negotiation returned `.retry` for `ch1_raw` — no
-    /// offered `key_share` matches `group`, but the client did offer the
-    /// `key_share` extension (an offer that omitted it entirely is
-    /// `error.MissingExtension` from `negotiateServerHello` itself, handled
-    /// before this is ever reached). Retains `ch1_raw`, optionally asks the
-    /// configured cookie provider for a cookie, and emits exactly one
-    /// HelloRetryRequest at the Initial epoch. No key pair is generated and
-    /// no secret is derived here — the server's one ECDH happens later, in
-    /// `emitServerHelloAndAuthFlight`, once ClientHello2 has been validated.
+    /// Server (#484): asks the configured cookie provider for a cookie —
+    /// `selected_group == null` means "the client's offered share is
+    /// already usable; would you like a cookie-only retry anyway?",
+    /// non-null means "this group needs a retry regardless; would you also
+    /// like to attach a cookie?" — copies any returned bytes into the
+    /// durable `self.retry.cookie` immediately, and releases the
+    /// provider's own buffer right after, on every path (no provider
+    /// configured, the provider declines, or a later step fails).
+    fn takeHelloRetryCookie(self: *Tls13Backend, selected_group: ?tls_algorithms.NamedGroup) HandshakeError!?[]const u8 {
+        defer self.hello_retry_cookie_provider.release();
+        const provided = try self.hello_retry_cookie_provider.create(selected_group);
+        const bytes = provided orelse return null;
+        if (bytes.len == 0 or bytes.len > self.retry.cookie.len) return error.CredentialProviderFailed;
+        @memcpy(self.retry.cookie[0..bytes.len], bytes);
+        self.retry.cookie_len = bytes.len;
+        return self.retry.cookie[0..bytes.len];
+    }
+
+    /// Server (#484): retains `ch1_raw`, commits the HRR parameters, and
+    /// emits exactly one HelloRetryRequest at the Initial epoch — either a
+    /// group-retry (`group` non-null, negotiation found no usable share)
+    /// or a cookie-only retry (`group` null, the share was already usable
+    /// but `takeHelloRetryCookie` opted to retry anyway). No key pair is
+    /// generated and no secret is derived here — the server's one ECDH
+    /// happens later, in `emitServerHelloAndAuthFlight`, once ClientHello2
+    /// has been validated.
     fn emitHelloRetryRequest(
         self: *Tls13Backend,
         ch1_raw: []const u8,
-        group: tls_algorithms.NamedGroup,
+        group: ?tls_algorithms.NamedGroup,
+        cookie: ?[]const u8,
         selection: tls_negotiation.HelloSelection,
         legacy_session_id: []const u8,
         sink: *EventSink,
     ) HandshakeError!void {
         // #484: reuses `client_hello_psk`'s storage for the retained
         // ClientHello1 bytes — see `RetryContext`'s doc comment for why
-        // this is safe. `.retry` is decided before this connection's own
-        // PSK-capture code (further down in `onClientHello`) ever runs, so
-        // the field is always empty here.
+        // this is safe. `.retry`/the cookie-only probe are both decided
+        // before this connection's own PSK-capture code (further down in
+        // `onClientHello`) ever runs, so the field is always empty here.
         var capture: ClientHelloPskCapture = .{};
         if (ch1_raw.len > capture.message.len) return error.MalformedHandshake;
         @memcpy(capture.message[0..ch1_raw.len], ch1_raw);
         capture.message_len = ch1_raw.len;
         self.client_hello_psk = capture;
-
-        defer self.hello_retry_cookie_provider.release();
-        const provided_cookie = try self.hello_retry_cookie_provider.create(group);
-        var cookie: ?[]const u8 = null;
-        if (provided_cookie) |bytes| {
-            if (bytes.len == 0 or bytes.len > self.retry.cookie.len) return error.CredentialProviderFailed;
-            @memcpy(self.retry.cookie[0..bytes.len], bytes);
-            self.retry.cookie_len = bytes.len;
-            cookie = self.retry.cookie[0..bytes.len];
-        }
 
         self.retry.request = .{
             .selected_version = selection.version,
