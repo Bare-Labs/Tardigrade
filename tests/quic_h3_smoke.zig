@@ -679,7 +679,7 @@ const Smoke = struct {
                 .allocator = allocator,
                 .role = .client,
                 .backend = tls_backend.Tls13Backend.initClient(
-                    .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+                    .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
                     .{ .pinned_certificate = tls_backend.testdata.certificate_der },
                 ),
                 .cid_routes = quic_cid.CidRoutingTable.init(allocator),
@@ -695,7 +695,7 @@ const Smoke = struct {
                 .allocator = allocator,
                 .role = .server,
                 .backend = tls_backend.Tls13Backend.initServer(
-                    .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+                    .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
                     try tls_backend.Identity.initPkcs8(
                         tls_backend.testdata.certificate_der,
                         tls_backend.testdata.private_key_pkcs8_der,

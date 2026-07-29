@@ -24,11 +24,11 @@ const session_cache = tls_core.session_cache;
 const sni_provider = tls_core.sni_provider;
 
 fn clientEntropy() tls_backend.Entropy {
-    return .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 };
+    return .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x13} ** 32 };
 }
 
 fn serverEntropy() tls_backend.Entropy {
-    return .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 };
+    return .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x23} ** 32 };
 }
 
 fn fixtureIdentity() tls_backend.Identity {
@@ -2533,6 +2533,708 @@ fn recordOrEmpty(bytes: ?[]const u8) []const u8 {
 }
 
 // ===========================================================================
+// #484: non-PSK HelloRetryRequest. `DirectHarness` end-to-end coverage for
+// both transports, plus targeted unit coverage of the client's and server's
+// HRR handling built directly on `buildClientHello`/`hello_retry`, the same
+// low-level primitives the rest of this file already uses for negative and
+// boundary cases.
+// ===========================================================================
+
+fn directHarnessWithClientKeyShareMode(
+    client_profile: tls_backend.TransportProfile,
+    server_profile: tls_backend.TransportProfile,
+    mode: tls_backend.Tls13Backend.InitialKeyShareMode,
+) DirectHarness {
+    return .{
+        .client_backend = tls_backend.Tls13Backend.initClientWithOptions(
+            clientEntropy(),
+            .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+            client_profile,
+            .{ .initial_key_share_mode = mode },
+        ),
+        .server_backend = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), server_profile),
+        .client_bridge = Bridge.init(clientProvider(), .tls_aes_128_gcm_sha256),
+        .server_bridge = Bridge.init(serverProvider(), .tls_aes_128_gcm_sha256),
+    };
+}
+
+fn expectHrrRetryStateCleared(backend: *const tls_backend.Tls13Backend) !void {
+    try std.testing.expect(backend.client_hello_psk == null);
+    try std.testing.expect(backend.retry.request == null);
+}
+
+test "#484 HRR round trip: record client with an empty key share completes via native server HelloRetryRequest" {
+    var harness = directHarnessWithClientKeyShareMode(.record, .record, .empty);
+    defer harness.deinit();
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, harness.client_backend.core.retry_state);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, harness.server_backend.core.retry_state);
+
+    // Both sides folded the same messages into their transcript hash: the
+    // synthetic `message_hash(ClientHello1)` at the retry boundary, the
+    // real HRR, ClientHello2, and the rest of the flight through Finished.
+    const client_hash = harness.client_backend.core.transcriptHash();
+    const server_hash = harness.server_backend.core.transcriptHash();
+    try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
+
+    // Traffic secrets were derived exactly once, from the final
+    // ServerHello — `DirectObserved.captureSecret` never records anything
+    // for `.initial`, so their presence here already proves no handshake
+    // secret was mistakenly derived at the HRR itself, only afterward.
+    try std.testing.expect(harness.observed.handshake_write_secret[0] != null);
+    try std.testing.expect(harness.observed.handshake_write_secret[1] != null);
+    try std.testing.expect(harness.observed.application_write_secret[0] != null);
+    try std.testing.expect(harness.observed.application_write_secret[1] != null);
+    try std.testing.expect(harness.observed.initial_discarded[0]);
+    try std.testing.expect(harness.observed.initial_discarded[1]);
+
+    try expectHrrRetryStateCleared(&harness.client_backend);
+    try expectHrrRetryStateCleared(&harness.server_backend);
+}
+
+test "#484 HRR round trip completes over the extension (QUIC-style) profile too" {
+    var harness = directHarnessWithClientKeyShareMode(
+        .{ .extension = .{ .extension_type = 57, .local = "client transport parameters" } },
+        .{ .extension = .{ .extension_type = 57, .local = "server transport parameters" } },
+        .empty,
+    );
+    defer harness.deinit();
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, harness.client_backend.core.retry_state);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, harness.server_backend.core.retry_state);
+    const client_hash = harness.client_backend.core.transcriptHash();
+    const server_hash = harness.server_backend.core.transcriptHash();
+    try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
+
+    // The local transport-extension payload contract survives HelloRetryRequest
+    // and ClientHello2 unchanged, on both sides.
+    try std.testing.expectEqualStrings("server transport parameters", recordOrEmpty(harness.client_backend.takePeerTransportExtension()));
+    try std.testing.expectEqualStrings("client transport parameters", recordOrEmpty(harness.server_backend.takePeerTransportExtension()));
+
+    try expectHrrRetryStateCleared(&harness.client_backend);
+    try expectHrrRetryStateCleared(&harness.server_backend);
+}
+
+fn nthInitialCryptoBytes(sink: *const DirectSink, index: usize) []const u8 {
+    var seen: usize = 0;
+    for (sink.items[0..sink.len]) |event| switch (event) {
+        .handshake_bytes => |bytes| {
+            if (bytes.epoch == .initial) {
+                if (seen == index) return bytes.data;
+                seen += 1;
+            }
+        },
+        else => {},
+    };
+    unreachable;
+}
+
+test "#484 server emits exactly one HelloRetryRequest for an external-style ClientHello1 with a present, empty key_share" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [2048]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .empty_key_share = true });
+    try server.backend().receive(.initial, hello, &sink);
+
+    try std.testing.expectEqual(@as(usize, 1), countCryptoEvents(&sink, .initial));
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, server.core.retry_state);
+    const hrr_raw = nthInitialCryptoBytes(&sink, 0);
+    const decoded = try tls_core.messages.decode(hrr_raw);
+    try std.testing.expect(tls_core.hello_retry.isHelloRetryRequest(decoded.body));
+    // No secret was derived or the Initial epoch discarded for an HRR.
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&sink, .handshake));
+}
+
+test "#484 server rejects a ClientHello1 that omits key_share entirely as MissingExtension, not a retry" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [2048]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .omit_key_share = true });
+    try std.testing.expectError(error.MissingExtension, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(tls_core.handshake.RetryState.none, server.core.retry_state);
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&sink, .initial));
+}
+
+test "#484 server rejects a ClientHello2 that still lacks the requested share, via the canonical mutation validator, without emitting a second HelloRetryRequest" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [2048]u8 = undefined;
+    const ch1 = try buildClientHello(&buf, .{ .empty_key_share = true });
+    try server.backend().receive(.initial, ch1, &sink);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, server.core.retry_state);
+
+    // A "ClientHello2" that still omits a share for the requested group is
+    // never a legal mutation of ClientHello1 under the committed HRR
+    // request — `hello_retry.validateSecondClientHello` now runs (and
+    // rejects it) before negotiation ever gets a chance to re-decide
+    // `.retry`, so the `.retry` arm's own second-retry guard is
+    // unreachable through any legally-structured message; this is what
+    // actually stops a second HelloRetryRequest in practice.
+    var buf2: [2048]u8 = undefined;
+    const ch2_still_empty = try buildClientHello(&buf2, .{ .empty_key_share = true });
+    try std.testing.expectError(error.MalformedHandshake, server.backend().receive(.initial, ch2_still_empty, &sink));
+    // Still exactly one HRR in the whole exchange — the second attempt was
+    // rejected, not answered with another one.
+    try std.testing.expectEqual(@as(usize, 1), countCryptoEvents(&sink, .initial));
+    try expectHrrRetryStateCleared(&server);
+}
+
+test "#484 server clears retry state on a ClientHello2 failure, not only on success" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [2048]u8 = undefined;
+    const ch1 = try buildClientHello(&buf, .{ .empty_key_share = true });
+    try server.backend().receive(.initial, ch1, &sink);
+
+    // Omitting `key_share` entirely changes the second hello's extension
+    // set, which the canonical mutation validator (run before negotiation,
+    // per #484) rejects directly as `IllegalParameter` — negotiation's own
+    // `MissingExtension` for an absent `key_share` is never reached here.
+    var buf2: [2048]u8 = undefined;
+    const ch2_missing_share = try buildClientHello(&buf2, .{ .omit_key_share = true });
+    try std.testing.expectError(error.IllegalParameter, server.backend().receive(.initial, ch2_missing_share, &sink));
+    try expectHrrRetryStateCleared(&server);
+}
+
+test "#484 server's cookie provider is consulted exactly once per retry and its cookie round-trips through a full handshake" {
+    const Fixture = struct {
+        const cookie_bytes = "hrr-cookie-fixture";
+        create_calls: usize = 0,
+        release_calls: usize = 0,
+        validate_calls: usize = 0,
+
+        fn create(ctx: *anyopaque, _: ?tls_core.algorithms.NamedGroup) tls13_transport.Error!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.create_calls += 1;
+            return cookie_bytes;
+        }
+
+        fn release(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.release_calls += 1;
+        }
+
+        fn validate(ctx: *anyopaque, cookie: []const u8) tls13_transport.Error!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.validate_calls += 1;
+            return std.mem.eql(u8, cookie, cookie_bytes);
+        }
+
+        fn provider(self: *@This()) tls_backend.Tls13Backend.HelloRetryCookieProvider {
+            return .{ .ctx = self, .createFn = create, .releaseFn = release, .validateFn = validate };
+        }
+    };
+    var fixture = Fixture{};
+
+    var harness = directHarnessWithClientKeyShareMode(.record, .record, .empty);
+    defer harness.deinit();
+    try harness.server_backend.setHelloRetryCookieProvider(fixture.provider());
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(@as(usize, 1), fixture.create_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.release_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.validate_calls);
+    try expectHrrRetryStateCleared(&harness.client_backend);
+    try expectHrrRetryStateCleared(&harness.server_backend);
+}
+
+test "#484 client accepts exactly one cookie-only HelloRetryRequest and echoes the original key share unchanged" {
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer client.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    try std.testing.expectEqual(@as(usize, 1), countCryptoEvents(&sink, .initial));
+
+    var hrr_buf: [256]u8 = undefined;
+    const hrr = try tls_core.hello_retry.encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .cookie = "cookie-only-fixture",
+    }, &hrr_buf);
+    try client.backend().receive(.initial, hrr, &sink);
+
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, client.core.retry_state);
+    try std.testing.expectEqual(@as(usize, 2), countCryptoEvents(&sink, .initial));
+
+    const ch1_body = (try tls_core.messages.decode(nthInitialCryptoBytes(&sink, 0))).body;
+    const ch2_body = (try tls_core.messages.decode(nthInitialCryptoBytes(&sink, 1))).body;
+    const ch1_offers = try tls_core.negotiation.parseClientHello(ch1_body);
+    const ch2_offers = try tls_core.negotiation.parseClientHello(ch2_body);
+    try std.testing.expectEqual(@as(usize, 1), ch1_offers.key_shares_len);
+    try std.testing.expectEqual(@as(usize, 1), ch2_offers.key_shares_len);
+    try std.testing.expectEqualSlices(u8, ch1_offers.key_shares[0].key_exchange, ch2_offers.key_shares[0].key_exchange);
+
+    try expectHrrRetryStateCleared(&client);
+}
+
+test "#484 client emits exactly one fresh X25519 share, derived from the retry seed, when HelloRetryRequest requests a group" {
+    var client = tls_backend.Tls13Backend.initClientWithOptions(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+        .{ .initial_key_share_mode = .empty },
+    );
+    defer client.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+
+    const ch1_body = (try tls_core.messages.decode(nthInitialCryptoBytes(&sink, 0))).body;
+    const ch1_offers = try tls_core.negotiation.parseClientHello(ch1_body);
+    try std.testing.expectEqual(@as(usize, 0), ch1_offers.key_shares_len);
+
+    var hrr_buf: [256]u8 = undefined;
+    const hrr = try tls_core.hello_retry.encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+    }, &hrr_buf);
+    try client.backend().receive(.initial, hrr, &sink);
+
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, client.core.retry_state);
+    const ch2_body = (try tls_core.messages.decode(nthInitialCryptoBytes(&sink, 1))).body;
+    const ch2_offers = try tls_core.negotiation.parseClientHello(ch2_body);
+    try std.testing.expectEqual(@as(usize, 1), ch2_offers.key_shares_len);
+    try std.testing.expectEqual(tls_core.algorithms.NamedGroup.x25519, ch2_offers.key_shares[0].group);
+
+    const expected_key_pair = try X25519.KeyPair.generateDeterministic(clientEntropy().retry_key_share_seed);
+    try std.testing.expectEqualSlices(u8, &expected_key_pair.public_key, ch2_offers.key_shares[0].key_exchange);
+    // The fresh share is genuinely distinct from what the (unused, now
+    // destroyed) initial-flight seed would have produced.
+    const superseded_key_pair = try X25519.KeyPair.generateDeterministic(clientEntropy().key_share_seed);
+    try std.testing.expect(!std.mem.eql(u8, &superseded_key_pair.public_key, ch2_offers.key_shares[0].key_exchange));
+
+    try std.testing.expect(client.key_pair_present);
+    try std.testing.expectEqualSlices(u8, &expected_key_pair.public_key, &client.key_pair.public_key);
+
+    try expectHrrRetryStateCleared(&client);
+}
+
+test "#484 client rejects an ordinary or HelloRetryRequest-shaped ServerHello before ClientHello1 has been sent" {
+    // Deliberately no `start()` call on either backend below: ClientHello1
+    // was never sent, so `core.handshake_lifecycle` is still `.idle`. An
+    // ordinary ServerHello routes through `Core.acceptReceived`, whose
+    // lifecycle check reports `InvalidHandshakeState`. An HRR-shaped one is
+    // now rejected even earlier, by `drainInput`'s
+    // `validateHelloRetryRequest` preflight — with no ClientHello1 ever
+    // sent, `self.client_hello_psk` is null, so the preflight itself
+    // reports `InvalidHandshakeState` before `Core.acceptHelloRetryRequest`
+    // (whose own precondition would otherwise report
+    // `UnexpectedHandshakeMessage`) ever runs. Two fresh backends, one
+    // message each, so a rejected first message's still-buffered bytes
+    // can't shadow the second (a real client would tear down the
+    // connection after a fatal handshake error, never feed it more bytes).
+    var ordinary_client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer ordinary_client.deinit();
+    var ordinary_sink = DirectSink{};
+    defer ordinary_sink.deinit();
+    var ordinary_buf: [64]u8 = undefined;
+    const ordinary = try tls_core.messages.encode(.server_hello, "not a real server hello", &ordinary_buf);
+    try std.testing.expectError(error.InvalidHandshakeState, ordinary_client.backend().receive(.initial, ordinary, &ordinary_sink));
+
+    var hrr_client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer hrr_client.deinit();
+    var hrr_sink = DirectSink{};
+    defer hrr_sink.deinit();
+    var hrr_buf: [256]u8 = undefined;
+    const hrr = try tls_core.hello_retry.encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+    }, &hrr_buf);
+    try std.testing.expectError(error.InvalidHandshakeState, hrr_client.backend().receive(.initial, hrr, &hrr_sink));
+}
+
+test "#484 client zeroes the retry key-share seed once consumed by a real HelloRetryRequest" {
+    var harness = directHarnessWithClientKeyShareMode(.record, .record, .empty);
+    defer harness.deinit();
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(std.mem.allEqual(u8, &harness.client_backend.entropy.retry_key_share_seed, 0));
+}
+
+test "#484 client zeroes an unused retry key-share seed on teardown" {
+    var backend = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    // Never started, so the seed was never touched by a handshake at all —
+    // `deinit` must still zero it rather than leaving caller-supplied
+    // key-generation material resident for the backend's whole lifetime.
+    try std.testing.expect(!std.mem.allEqual(u8, &backend.entropy.retry_key_share_seed, 0));
+    backend.deinit();
+    try std.testing.expect(std.mem.allEqual(u8, &backend.entropy.retry_key_share_seed, 0));
+}
+
+test "#484 client clears the retry ClientHello1 capture after an ordinary (non-HRR) ServerHello, not only after a real retry" {
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    // No retry happened on this connection at all.
+    try std.testing.expectEqual(tls_core.handshake.RetryState.none, harness.client_backend.core.retry_state);
+    try expectHrrRetryStateCleared(&harness.client_backend);
+}
+
+test "#484 a resumed (PSK) handshake with no retry still clears the client's retry ClientHello1 capture, including its bearer ticket bytes" {
+    var issued = try issueEarlyCapableTicket(64);
+    defer issued.deinit();
+
+    var resumed = DirectHarness.init();
+    defer resumed.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+
+    try resumed.run();
+
+    try std.testing.expect(resumed.client_driver.isComplete());
+    try std.testing.expect(resumed.server_driver.isComplete());
+    try std.testing.expect(resumed.server_backend.core.psk_authenticated);
+    try expectHrrRetryStateCleared(&resumed.client_backend);
+}
+
+test "#484 server-side cookie provider triggers a cookie-only HelloRetryRequest even when the client's own share is already usable, and the handshake still completes" {
+    const Fixture = struct {
+        const cookie_bytes = "cookie-only-server-fixture";
+        create_calls: usize = 0,
+        release_calls: usize = 0,
+        validate_calls: usize = 0,
+        last_selected_group: ?tls_core.algorithms.NamedGroup = undefined,
+
+        fn create(ctx: *anyopaque, selected_group: ?tls_core.algorithms.NamedGroup) tls13_transport.Error!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.create_calls += 1;
+            self.last_selected_group = selected_group;
+            return cookie_bytes;
+        }
+
+        fn release(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.release_calls += 1;
+        }
+
+        fn validate(ctx: *anyopaque, cookie: []const u8) tls13_transport.Error!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.validate_calls += 1;
+            return std.mem.eql(u8, cookie, cookie_bytes);
+        }
+
+        fn provider(self: *@This()) tls_backend.Tls13Backend.HelloRetryCookieProvider {
+            return .{ .ctx = self, .createFn = create, .releaseFn = release, .validateFn = validate };
+        }
+    };
+    var fixture = Fixture{};
+
+    // Default `.normal` client: it offers a real, immediately usable
+    // x25519 share — negotiation alone would go straight to an ordinary
+    // ServerHello. The configured provider forces a cookie-only retry
+    // anyway, and the client must echo the cookie while keeping its
+    // original share unchanged.
+    var harness = DirectHarness.init();
+    defer harness.deinit();
+    try harness.server_backend.setHelloRetryCookieProvider(fixture.provider());
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, harness.client_backend.core.retry_state);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, harness.server_backend.core.retry_state);
+    try std.testing.expectEqual(@as(usize, 1), fixture.create_calls);
+    try std.testing.expectEqual(@as(?tls_core.algorithms.NamedGroup, null), fixture.last_selected_group);
+    try std.testing.expectEqual(@as(usize, 1), fixture.release_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.validate_calls);
+    try expectHrrRetryStateCleared(&harness.client_backend);
+    try expectHrrRetryStateCleared(&harness.server_backend);
+}
+
+test "#484 client rejects a final ServerHello whose cipher suite does not match what its accepted HelloRetryRequest selected" {
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer client.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+
+    // Simulate having already accepted a HelloRetryRequest that committed
+    // to a *different* cipher suite than the one this backend's fixed
+    // policy will ever actually offer in a real ServerHello — this
+    // backend's policy allows exactly one cipher suite, so no real message
+    // could otherwise distinguish "the ordinary policy check" from "the
+    // committed-HRR-selection check" this test targets.
+    client.client_hrr_selection = .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_256_gcm_sha384,
+        .selected_group = .x25519,
+    };
+
+    // A native server, driven with an ordinary (non-`.empty`, real share)
+    // ClientHello, produces a real ServerHello per this backend's one and
+    // only policy tuple — the exact thing the client above never actually
+    // asked for, per the `client_hrr_selection` planted above.
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+    try server.backend().start(.server, {}, &server_sink);
+    var hello_buf: [2048]u8 = undefined;
+    const hello = try buildClientHello(&hello_buf, .{});
+    try server.backend().receive(.initial, hello, &server_sink);
+    const server_hello_raw = nthInitialCryptoBytes(&server_sink, 0);
+
+    try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, server_hello_raw, &sink));
+}
+
+test "#484 a terminal failure after ClientHello2's fresh key pair is generated still destroys that private key immediately" {
+    var client = tls_backend.Tls13Backend.initClientWithOptions(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+        .{ .initial_key_share_mode = .empty },
+    );
+    defer client.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+
+    var hrr_buf: [256]u8 = undefined;
+    const hrr = try tls_core.hello_retry.encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+    }, &hrr_buf);
+    try client.backend().receive(.initial, hrr, &sink);
+    // ClientHello2's fresh key pair now exists.
+    try std.testing.expect(client.key_pair_present);
+    try std.testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&client.key_pair), 0));
+
+    // A final "ServerHello" with a cipher suite this backend's policy never
+    // offers — a terminal failure that arrives strictly after the fresh
+    // ClientHello2 key pair was generated and stored.
+    var mismatched_buf: [256]u8 = undefined;
+    const mismatched = try buildServerHello(&mismatched_buf, .{ .cipher_suite = 0x1302 });
+    try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, mismatched, &sink));
+
+    // `clearFailedHandshakeState`'s `errdefer` must have destroyed the
+    // private key immediately — not left it resident until some later
+    // `deinit()`.
+    try std.testing.expect(!client.key_pair_present);
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&client.key_pair), 0));
+}
+
+test "#484 a declining or erroring cookie provider is never released, only a provider that actually returns a cookie is" {
+    const Fixture = struct {
+        mode: enum { decline, err },
+        create_calls: usize = 0,
+        release_calls: usize = 0,
+
+        fn create(ctx: *anyopaque, _: ?tls_core.algorithms.NamedGroup) tls13_transport.Error!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.create_calls += 1;
+            return switch (self.mode) {
+                .decline => null,
+                .err => error.CredentialProviderFailed,
+            };
+        }
+
+        fn release(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.release_calls += 1;
+        }
+
+        fn provider(self: *@This()) tls_backend.Tls13Backend.HelloRetryCookieProvider {
+            return .{ .ctx = self, .createFn = create, .releaseFn = release };
+        }
+    };
+
+    // Declining: forced into a real group-retry via an `.empty` client, the
+    // provider says "no cookie" (`createFn` returns `null`) — there was
+    // never an acquisition, so `releaseFn` must not run, and the group-only
+    // HRR still completes the handshake normally.
+    {
+        var fixture = Fixture{ .mode = .decline };
+        var harness = directHarnessWithClientKeyShareMode(.record, .record, .empty);
+        defer harness.deinit();
+        try harness.server_backend.setHelloRetryCookieProvider(fixture.provider());
+        try harness.run();
+        try std.testing.expect(harness.client_driver.isComplete());
+        try std.testing.expect(harness.server_driver.isComplete());
+        try std.testing.expectEqual(@as(usize, 1), fixture.create_calls);
+        try std.testing.expectEqual(@as(usize, 0), fixture.release_calls);
+    }
+
+    // Erroring: same forced retry, but the provider fails outright —
+    // `createFn` never returns a buffer at all, so again there is nothing
+    // to release, and the failure propagates as the handshake's own error.
+    {
+        var fixture = Fixture{ .mode = .err };
+        var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+        defer server.deinit();
+        try server.setHelloRetryCookieProvider(fixture.provider());
+        var sink = DirectSink{};
+        defer sink.deinit();
+        try server.backend().start(.server, {}, &sink);
+        var buf: [2048]u8 = undefined;
+        const hello = try buildClientHello(&buf, .{ .empty_key_share = true });
+        try std.testing.expectError(error.CredentialProviderFailed, server.backend().receive(.initial, hello, &sink));
+        try std.testing.expectEqual(@as(usize, 1), fixture.create_calls);
+        try std.testing.expectEqual(@as(usize, 0), fixture.release_calls);
+    }
+}
+
+test "#484 client rejects a second HelloRetryRequest sent after ClientHello2 was already recorded, without emitting a third ClientHello" {
+    var client = tls_backend.Tls13Backend.initClientWithOptions(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+        .{ .initial_key_share_mode = .empty },
+    );
+    defer client.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+
+    var hrr_buf: [256]u8 = undefined;
+    const hrr = try tls_core.hello_retry.encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+    }, &hrr_buf);
+    try client.backend().receive(.initial, hrr, &sink);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, client.core.retry_state);
+    // ClientHello1, then ClientHello2 — exactly two Initial crypto events.
+    try std.testing.expectEqual(@as(usize, 2), countCryptoEvents(&sink, .initial));
+
+    // A second HelloRetryRequest-shaped ServerHello, sent after
+    // ClientHello2 was already recorded. `core.retry_state != .none` now,
+    // so `drainInput` no longer routes it through the dedicated HRR path
+    // at all — it falls to the ordinary `acceptReceived`/`onServerHello`,
+    // whose own HRR-sentinel check rejects it.
+    var second_hrr_buf: [256]u8 = undefined;
+    const second_hrr = try tls_core.hello_retry.encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .cookie = "second-attempt",
+    }, &second_hrr_buf);
+    try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, second_hrr, &sink));
+
+    // No third ClientHello was ever emitted, and no secret transition
+    // happened either — the rejection was purely a parse/ordering failure.
+    try std.testing.expectEqual(@as(usize, 2), countCryptoEvents(&sink, .initial));
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&sink, .handshake));
+}
+
+test "#484 client rejects an invalid HelloRetryRequest without committing it into the rebound transcript" {
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer client.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+    const transcript_before = client.core.transcriptHash();
+
+    // This client uses `.normal` mode, so ClientHello1 already offers an
+    // x25519 share — an HRR requesting that same group is illegal per RFC
+    // 8446 §4.1.4 (`hello_retry.decode` rejects it:
+    // `original_offers.keyShareFor(group) != null`).
+    var hrr_buf: [256]u8 = undefined;
+    const hrr = try tls_core.hello_retry.encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+    }, &hrr_buf);
+    try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, hrr, &sink));
+
+    // `drainInput`'s preflight rejected it *before* `Core.acceptHelloRetryRequest`
+    // ever rebound/updated the transcript — the running hash is exactly
+    // what it was right after ClientHello1, and no retry was recorded.
+    try std.testing.expectEqualSlices(u8, &transcript_before, &client.core.transcriptHash());
+    try std.testing.expectEqual(tls_core.handshake.RetryState.none, client.core.retry_state);
+}
+
+test "#484 server rejects an invalid ClientHello2 mutation without committing it into the transcript or handshake state" {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), fixtureIdentity(), .record);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [2048]u8 = undefined;
+    const ch1 = try buildClientHello(&buf, .{ .empty_key_share = true });
+    try server.backend().receive(.initial, ch1, &sink);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, server.core.retry_state);
+    const transcript_before = server.core.transcriptHash();
+
+    // A "ClientHello2" that omits `key_share` entirely — an illegal
+    // mutation per `hello_retry.validateSecondClientHello` (the extension
+    // set no longer matches ClientHello1's).
+    var buf2: [2048]u8 = undefined;
+    const ch2_missing_share = try buildClientHello(&buf2, .{ .omit_key_share = true });
+    try std.testing.expectError(error.IllegalParameter, server.backend().receive(.initial, ch2_missing_share, &sink));
+
+    // `drainInput`'s preflight rejected it *before* `Core.acceptSecondClientHello`
+    // ever updated the transcript or advanced `handshake_state` — both are
+    // exactly what they were right after the HRR was recorded.
+    try std.testing.expectEqualSlices(u8, &transcript_before, &server.core.transcriptHash());
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, server.core.retry_state);
+}
+
+// ===========================================================================
 // #334: handshake-time client authentication over the record transport. The
 // server issues a CertificateRequest; the client answers with its own
 // Certificate / CertificateVerify / Finished flight (or declines with an empty
@@ -4159,6 +4861,12 @@ const ClientHelloOptions = struct {
     sig_schemes: []const u16 = &.{ 0x0807, 0x0403 },
     alpn_protocols: ?[]const []const u8 = &.{"h2"},
     duplicate_supported_versions: bool = false,
+    /// #484: send `key_share` with a legal empty `client_shares` vector
+    /// instead of a real x25519 entry.
+    empty_key_share: bool = false,
+    /// #484: omit the `key_share` extension entirely (distinct from
+    /// `empty_key_share`, which sends it present-but-empty).
+    omit_key_share: bool = false,
     /// The opaque transport extension (e.g. QUIC transport parameters) to
     /// offer, for driving an extension-profile (#392 HTTP/3) server through
     /// selection the same way a real QUIC client would.
@@ -4233,13 +4941,24 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
         try w.u16_(@intCast(2 * opts.sig_schemes.len));
         for (opts.sig_schemes) |scheme| try w.u16_(scheme);
     }
-    // key_share
-    try w.u16_(51);
-    try w.u16_(2 + 2 + 2 + X25519.public_length);
-    try w.u16_(2 + 2 + X25519.public_length);
-    try w.u16_(0x001d);
-    try w.u16_(X25519.public_length);
-    try w.bytes(&key_pair.public_key);
+    // key_share (#484: `empty_key_share` sends the extension with a legal
+    // zero-length `client_shares` vector, an "external-style" encoding of
+    // the same offer this module's own `.empty` `InitialKeyShareMode`
+    // produces — present, but matching no group, so a native server
+    // negotiates `.retry` rather than `MissingExtension`.)
+    if (!opts.omit_key_share) {
+        try w.u16_(51);
+        if (opts.empty_key_share) {
+            try w.u16_(2);
+            try w.u16_(0);
+        } else {
+            try w.u16_(2 + 2 + 2 + X25519.public_length);
+            try w.u16_(2 + 2 + X25519.public_length);
+            try w.u16_(0x001d);
+            try w.u16_(X25519.public_length);
+            try w.bytes(&key_pair.public_key);
+        }
+    }
     // alpn
     if (opts.alpn_protocols) |protocols| {
         try w.u16_(16);

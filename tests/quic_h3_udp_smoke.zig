@@ -162,11 +162,11 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
     const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
 
     var client_backend = tls_backend.Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
         .{ .pinned_certificate = tls_backend.testdata.certificate_der },
     );
     var server_backend = tls_backend.Tls13Backend.initServer(
-        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
         try tls_backend.Identity.initPkcs8(
             tls_backend.testdata.certificate_der,
             tls_backend.testdata.private_key_pkcs8_der,
@@ -744,11 +744,11 @@ test "udp smoke: appliance credential provider authenticates native QUIC/H3" {
     const odcid = [_]u8{ 0x18, 0x27, 0x36, 0x45, 0x54, 0x63, 0x72, 0x81 };
 
     var client_backend = tls_backend.Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xa9} ** 32, .key_share_seed = [_]u8{0x33} ** 32 },
+        .{ .hello_random = [_]u8{0xa9} ** 32, .key_share_seed = [_]u8{0x33} ** 32, .retry_key_share_seed = [_]u8{0x33} ** 32 },
         .{ .pinned_certificate = leaf_der },
     );
     var server_backend = tls_backend.Tls13Backend.initServerWithProvider(
-        .{ .hello_random = [_]u8{0x77} ** 32, .key_share_seed = [_]u8{0x44} ** 32 },
+        .{ .hello_random = [_]u8{0x77} ** 32, .key_share_seed = [_]u8{0x44} ** 32, .retry_key_share_seed = [_]u8{0x44} ** 32 },
         appliance.provider(),
     );
 
