@@ -452,6 +452,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .tls_max_version = "1.3",
             .enable_0rtt = cfg.http3_enable_0rtt,
             .connection_migration = cfg.http3_connection_migration,
+            .retry_policy = cfg.http3_retry_policy,
             .max_datagram_size = cfg.http3_max_datagram_size,
             .request_handler = ghandlers.handleHttp3Request,
             .request_handler_ctx = &http3_dispatch_ctx,
@@ -570,10 +571,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state.logger.info(null, "Proxy protocol enabled: {s} (plaintext and TLS listeners)", .{@tagName(cfg.proxy_protocol_mode)});
     }
     if (cfg.http3_enabled) {
-        state.logger.info(null, "HTTP/3 foundation enabled: quic_port={d} 0rtt={} migration={} max_datagram={d}", .{
+        state.logger.info(null, "HTTP/3 foundation enabled: quic_port={d} 0rtt={} migration={} retry_policy={s} max_datagram={d}", .{
             cfg.quic_port,
             cfg.http3_enable_0rtt,
             cfg.http3_connection_migration,
+            @tagName(cfg.http3_retry_policy),
             cfg.http3_max_datagram_size,
         });
     }

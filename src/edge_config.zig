@@ -272,6 +272,7 @@ pub const EdgeConfig = struct {
     quic_port: u16,
     http3_enable_0rtt: bool,
     http3_connection_migration: bool,
+    http3_retry_policy: http.quic.config.RetryPolicy,
     http3_max_datagram_size: usize,
     proxy_protocol_mode: ProxyProtocolMode,
     /// Gateway identity used in signed upstream trust headers.
@@ -896,6 +897,9 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const quic_port = try parseConfigPort("quic_port", quic_port_str);
     const http3_enable_0rtt = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ENABLE_0RTT", false);
     const http3_connection_migration = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_CONNECTION_MIGRATION", false);
+    const http3_retry_policy_str = envOrDefault(allocator, "TARDIGRADE_HTTP3_RETRY_POLICY", "off") catch unreachable;
+    defer allocator.free(http3_retry_policy_str);
+    const http3_retry_policy = try parseHttp3RetryPolicyConfig(http3_retry_policy_str);
     const http3_max_datagram_size = parseIntEnv(usize, allocator, "TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE", 1350);
     const proxy_protocol_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_PROTOCOL", "off") catch unreachable;
     defer allocator.free(proxy_protocol_mode_str);
@@ -1558,6 +1562,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .quic_port = quic_port,
         .http3_enable_0rtt = http3_enable_0rtt,
         .http3_connection_migration = http3_connection_migration,
+        .http3_retry_policy = http3_retry_policy,
         .http3_max_datagram_size = http3_max_datagram_size,
         .proxy_protocol_mode = proxy_protocol_mode,
         .trust_gateway_id = trust_gateway_id,
@@ -1921,6 +1926,14 @@ fn parseProxyProtocolModeConfig(raw: []const u8) !ProxyProtocolMode {
         logConfigDiagnostic("config validation failed: proxy_protocol must be one of off, auto, v1, v2", .{});
         return error.InvalidConfigValue;
     };
+}
+
+fn parseHttp3RetryPolicyConfig(raw: []const u8) !http.quic.config.RetryPolicy {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(value, "off")) return .off;
+    if (std.ascii.eqlIgnoreCase(value, "address_validation") or std.ascii.eqlIgnoreCase(value, "address-validation")) return .address_validation;
+    logConfigDiagnostic("config validation failed: http3_retry_policy must be one of off, address_validation", .{});
+    return error.InvalidConfigValue;
 }
 
 fn parseEarlyDataReplayModeConfig(raw: []const u8) !EarlyDataReplayMode {
@@ -2854,6 +2867,10 @@ fn validateApplianceTlsProfile(cfg: *const EdgeConfig) !void {
         logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_HTTP3_CONNECTION_MIGRATION", .{});
         return error.UnsupportedApplianceConfiguration;
     }
+    if (cfg.http3_enabled and cfg.http3_retry_policy != .off) {
+        logConfigDiagnostic("config validation failed: the appliance TLS profile does not support TARDIGRADE_HTTP3_RETRY_POLICY", .{});
+        return error.UnsupportedApplianceConfiguration;
+    }
 
     if (!hasTlsFiles(cfg)) return;
 
@@ -3399,6 +3416,9 @@ test "config enum parsers reject invalid values" {
     try std.testing.expectError(error.InvalidConfigValue, parseProxyStreamingModeConfig("streaming"));
     try std.testing.expectEqual(ProxyProtocolMode.v2, try parseProxyProtocolModeConfig("v2"));
     try std.testing.expectError(error.InvalidConfigValue, parseProxyProtocolModeConfig("v3"));
+    try std.testing.expectEqual(http.quic.config.RetryPolicy.off, try parseHttp3RetryPolicyConfig("off"));
+    try std.testing.expectEqual(http.quic.config.RetryPolicy.address_validation, try parseHttp3RetryPolicyConfig("address-validation"));
+    try std.testing.expectError(error.InvalidConfigValue, parseHttp3RetryPolicyConfig("public"));
     try std.testing.expectEqual(UpstreamProtocol.h2c, try parseUpstreamProtocolConfig("h2c"));
     try std.testing.expectError(error.InvalidConfigValue, parseUpstreamProtocolConfig("spdy"));
 }
@@ -4110,6 +4130,12 @@ test "appliance profile rejects unsupported TLS settings one at a time" {
         var cfg = base;
         cfg.http3_enabled = true;
         cfg.http3_connection_migration = true;
+        try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
+    }
+    {
+        var cfg = base;
+        cfg.http3_enabled = true;
+        cfg.http3_retry_policy = .address_validation;
         try std.testing.expectError(error.UnsupportedApplianceConfiguration, validateApplianceTlsProfile(&cfg));
     }
 }

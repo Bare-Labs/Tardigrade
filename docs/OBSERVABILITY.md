@@ -115,6 +115,16 @@ Early-data metric label sets are intentionally bounded and never include
 high-cardinality request attributes (URL, request id, stream id, host, IP,
 ticket fingerprint, PSK, or binder).
 
+Native HTTP/3/QUIC also publishes bounded runtime snapshot counters for
+connection and path state. Retry counters are `retry_packets_sent`,
+`retry_tokens_accepted`, and `invalid_tokens`; path counters folded from the
+QUIC connection layer are `path_challenges_sent`,
+`path_validations_succeeded`, `path_validations_failed`,
+`path_response_mismatches`, `nat_rebindings`, `migrations`,
+`migrations_blocked`, and `migrations_blocked_no_peer_cid`. These snapshots
+use fixed counter names only and never include client IPs, connection IDs, or
+tokens.
+
 The latency histogram is intentionally global rather than route-labeled to keep
 hot-path overhead predictable.
 

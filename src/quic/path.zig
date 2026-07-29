@@ -534,7 +534,7 @@ pub const PathDecision = union(enum) {
     /// A new/unvalidated tuple is being probed: send PATH_CHALLENGE with this
     /// payload on that path (RFC 9000 §9.3: packets from the new address are
     /// processed, but the path is validated before it becomes the active one).
-    probe: [path_challenge_len]u8,
+    probe: PathProbe,
     /// Probe already in flight for this tuple; nothing new to send.
     probing,
     /// The tuple already validated (via `validatePathResponse`) but has not
@@ -545,12 +545,27 @@ pub const PathDecision = union(enum) {
     /// Migration policy forbids this address change: the caller drops state
     /// changes for this tuple (packets themselves stay processed on the
     /// active path per RFC 9000 §9.1 server behavior for disabled migration).
-    blocked,
+    blocked: BlockedPath,
+};
+
+pub const PathProbe = struct {
+    data: [path_challenge_len]u8,
+    change: AddressChange,
+};
+
+pub const BlockedPath = struct {
+    change: AddressChange,
+    first_observation: bool,
 };
 
 /// A candidate path whose PATH_RESPONSE validated, returned by
 /// `validatePathResponse` before any active-path mutation.
 pub const ValidatedCandidate = struct {
+    path: PathKey,
+    change: AddressChange,
+};
+
+pub const FailedValidation = struct {
     path: PathKey,
     change: AddressChange,
 };
@@ -718,12 +733,13 @@ pub const PathManager = struct {
             // reaches while blocked).
             if (self.find(key)) |index| {
                 self.paths[index].?.anti_amplification.recordReceived(authenticated_bytes);
+                return .{ .blocked = .{ .change = change, .first_observation = false } };
             } else {
                 const slot = self.claimSlot();
                 self.paths[slot] = .{ .key = key, .state = .unvalidated, .change = change };
                 self.paths[slot].?.anti_amplification.recordReceived(authenticated_bytes);
+                return .{ .blocked = .{ .change = change, .first_observation = true } };
             }
-            return .blocked;
         }
 
         if (self.find(key)) |index| {
@@ -757,7 +773,7 @@ pub const PathManager = struct {
             path.challenge = challenge_entropy;
             path.challenge_deadline_us = now_us + self.validation_timeout_us;
             self.metrics.path_challenges_sent += 1;
-            return .{ .probe = challenge_entropy };
+            return .{ .probe = .{ .data = challenge_entropy, .change = change } };
         }
 
         const slot = self.claimSlot();
@@ -770,7 +786,7 @@ pub const PathManager = struct {
         };
         self.paths[slot].?.anti_amplification.recordReceived(authenticated_bytes);
         self.metrics.path_challenges_sent += 1;
-        return .{ .probe = challenge_entropy };
+        return .{ .probe = .{ .data = challenge_entropy, .change = change } };
     }
 
     /// PATH_CHALLENGE handling is stateless: echo the payload in a
@@ -897,15 +913,25 @@ pub const PathManager = struct {
     /// Fail every probe whose challenge deadline has passed. Returns how many
     /// validations failed; callers run this off their timer wheel.
     pub fn expireValidations(self: *PathManager, now_us: u64) usize {
+        var failures: [max_paths]FailedValidation = undefined;
+        return self.expireValidationsInto(now_us, &failures).len;
+    }
+
+    /// Fail every probe whose challenge deadline has passed and return the
+    /// bounded path/change records that fit in `out`.
+    pub fn expireValidationsInto(self: *PathManager, now_us: u64, out: []FailedValidation) []const FailedValidation {
         var failed: usize = 0;
         for (&self.paths) |*slot| {
             const path = &(slot.* orelse continue);
             if (path.state != .validating) continue;
             if (now_us <= path.challenge_deadline_us) continue;
+            if (failed < out.len) {
+                out[failed] = .{ .path = path.key, .change = path.change };
+                failed += 1;
+            }
             self.failValidation(path);
-            failed += 1;
         }
-        return failed;
+        return out[0..failed];
     }
 
     fn failValidation(self: *PathManager, path: *Path) void {
@@ -1176,7 +1202,7 @@ test "path validation succeeds deterministically and switches the active path" {
     const rebound = testKey(50_001); // same host, new port: NAT rebinding
 
     const decision = manager.onDatagram(rebound, 1_200, test_challenge, 1_000);
-    try testing.expectEqualSlices(u8, &test_challenge, &decision.probe);
+    try testing.expectEqualSlices(u8, &test_challenge, &decision.probe.data);
     try testing.expectEqual(@as(u64, 1), manager.metrics.path_challenges_sent);
 
     // Peer echoes the challenge (PATH_RESPONSE semantics are a pure echo).
@@ -1265,28 +1291,35 @@ test "path validation fails deterministically when the challenge expires" {
     try testing.expectEqual(@as(?ValidatedCandidate, null), manager.validatePathResponse(rebound, test_challenge, 1_002));
     // New traffic from the tuple restarts a probe.
     const retry = manager.onDatagram(rebound, 1_200, test_challenge, 2_000);
-    try testing.expectEqualSlices(u8, &test_challenge, &retry.probe);
+    try testing.expectEqualSlices(u8, &test_challenge, &retry.probe.data);
 }
 
 test "migration policy gates rebinding and migration separately" {
     // disabled: even a port-only rebinding is blocked.
     var disabled = PathManager.init(.disabled, testKey(50_000), true);
-    try testing.expectEqual(PathDecision.blocked, disabled.onDatagram(testKey(50_001), 1_200, test_challenge, 0));
-    try testing.expectEqual(@as(u64, 1), disabled.metrics.migrations_blocked);
+    const disabled_blocked = disabled.onDatagram(testKey(50_001), 1_200, test_challenge, 0).blocked;
+    try testing.expectEqual(AddressChange.nat_rebinding, disabled_blocked.change);
+    try testing.expect(disabled_blocked.first_observation);
+    const disabled_repeat = disabled.onDatagram(testKey(50_001), 1_200, test_challenge, 0).blocked;
+    try testing.expectEqual(AddressChange.nat_rebinding, disabled_repeat.change);
+    try testing.expect(!disabled_repeat.first_observation);
+    try testing.expectEqual(@as(u64, 2), disabled.metrics.migrations_blocked);
 
     // nat_rebinding_only: port change probes, host change is blocked.
     var rebind_only = PathManager.init(.nat_rebinding_only, testKey(50_000), true);
     const probe = rebind_only.onDatagram(testKey(50_001), 1_200, test_challenge, 0);
-    try testing.expectEqualSlices(u8, &test_challenge, &probe.probe);
-    try testing.expectEqual(PathDecision.blocked, rebind_only.onDatagram(testKeyOtherHost(50_000), 1_200, test_challenge, 0));
+    try testing.expectEqualSlices(u8, &test_challenge, &probe.probe.data);
+    const migration_blocked = rebind_only.onDatagram(testKeyOtherHost(50_000), 1_200, test_challenge, 0).blocked;
+    try testing.expectEqual(AddressChange.migration, migration_blocked.change);
+    try testing.expect(migration_blocked.first_observation);
     try testing.expectEqual(@as(u64, 1), rebind_only.metrics.migrations_blocked);
 
     // full: both probe.
     var full = PathManager.init(.full, testKey(50_000), true);
     const rebinding_probe = full.onDatagram(testKey(50_001), 1_200, test_challenge, 0);
-    try testing.expectEqualSlices(u8, &test_challenge, &rebinding_probe.probe);
+    try testing.expectEqualSlices(u8, &test_challenge, &rebinding_probe.probe.data);
     const migration_probe = full.onDatagram(testKeyOtherHost(50_000), 1_200, test_challenge, 0);
-    try testing.expectEqualSlices(u8, &test_challenge, &migration_probe.probe);
+    try testing.expectEqualSlices(u8, &test_challenge, &migration_probe.probe.data);
 }
 
 test "duplicate datagrams on a probing path do not restart the challenge" {
@@ -1471,7 +1504,7 @@ test "a previously-active validated path is re-probed, not trusted indefinitely"
     // path (B), so a stale `.migration` value from A's original
     // initialization cannot make a plain port rebind look like a host
     // migration once it re-validates.
-    const echoed = PathManager.onPathChallenge(decision.probe);
+    const echoed = PathManager.onPathChallenge(decision.probe.data);
     const validated = manager.validatePathResponse(a, echoed, 30).?;
     try testing.expectEqual(AddressChange.nat_rebinding, validated.change);
     const outcome = manager.promoteValidated(a).?;
@@ -1524,7 +1557,8 @@ test "a policy-blocked tuple still gets its own anti-amplification ledger, never
     const blocked = testKeyOtherHost(50_001);
 
     const decision = manager.onDatagram(blocked, 100, test_challenge, 0);
-    try testing.expectEqual(PathDecision.blocked, decision);
+    try testing.expectEqual(AddressChange.migration, decision.blocked.change);
+    try testing.expect(decision.blocked.first_observation);
     try testing.expectEqual(@as(u64, 1), manager.metrics.migrations_blocked);
     try testing.expectEqual(@as(u64, 0), manager.metrics.path_challenges_sent);
 

@@ -63,7 +63,11 @@ fn logEvent(_: ?*anyopaque, event: connection.Event) void {
         .close_sent => |c| std.fmt.bufPrint(&buf, "close sent code={d}", .{c.error_code}),
         .close_received => |c| std.fmt.bufPrint(&buf, "close received code={d} app={}", .{ c.error_code, c.is_application }),
         .idle_timeout => std.fmt.bufPrint(&buf, "idle timeout", .{}),
-        .path_validated => |p| std.fmt.bufPrint(&buf, "path validated change={s} remote_port={d}", .{ @tagName(p.change), p.path.remote.port }),
+        .path_validation_started => |p| std.fmt.bufPrint(&buf, "path validation started change={s} remote_port={d}", .{ @tagName(p.change), p.path.remote.port }),
+        .path_validation_succeeded => |p| std.fmt.bufPrint(&buf, "path validation succeeded change={s} remote_port={d}", .{ @tagName(p.change), p.path.remote.port }),
+        .path_validation_failed => |p| std.fmt.bufPrint(&buf, "path validation failed change={s} remote_port={d}", .{ @tagName(p.change), p.path.remote.port }),
+        .path_migration_blocked => |p| std.fmt.bufPrint(&buf, "path blocked change={s} reason={s} remote_port={d}", .{ @tagName(p.change), @tagName(p.reason), p.path.remote.port }),
+        .path_promoted => |p| std.fmt.bufPrint(&buf, "path promoted change={s} remote_port={d}", .{ @tagName(p.change), p.path.remote.port }),
         .zero_rtt_packet => |z| std.fmt.bufPrint(&buf, "zero_rtt_packet outcome={s} size={d}", .{ @tagName(z.outcome), z.size }),
         .early_data_decision => |d| std.fmt.bufPrint(&buf, "early_data_decision {s}", .{@tagName(d)}),
     } catch return;
@@ -291,7 +295,8 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     const client = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &local_cid,
-        .original_dcid = &odcid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
         .tls = backend.backend(),
         .now_us = nowUs(),
         .events = .{ .emitFn = logEvent },
@@ -408,7 +413,8 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         const server = try Connection.init(allocator, .{
             .role = .server,
             .local_cid = parsed.dcid,
-            .original_dcid = parsed.dcid,
+            .original_destination_cid = parsed.dcid,
+            .initial_secret_dcid = parsed.dcid,
             .peer_cid = parsed.scid,
             .tls = backend.backend(),
             .now_us = nowUs(),

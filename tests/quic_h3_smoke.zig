@@ -409,9 +409,9 @@ const Endpoint = struct {
         switch (self.paths.onDatagram(path_key, authenticated_bytes, deterministicTestChallengeForPath(path_key), now_us)) {
             .on_active_path, .probing, .validated_pending_promotion => {},
             .blocked => {},
-            .probe => |challenge| {
+            .probe => |probe| {
                 var frame_buf: [16]u8 = undefined;
-                const encoded = try encodePathFrame(.{ .challenge = challenge }, &frame_buf);
+                const encoded = try encodePathFrame(.{ .challenge = probe.data }, &frame_buf);
                 try self.sendPacketOnPath(.application, encoded, 0, path_key.local, path_key.remote, outbound);
             },
         }

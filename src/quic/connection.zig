@@ -127,9 +127,13 @@ pub const Event = union(enum) {
     close_sent: struct { error_code: u64 },
     close_received: struct { error_code: u64, is_application: bool },
     idle_timeout,
-    /// A candidate path validated and was promoted to active (RFC 9000
-    /// §8.2.3/§9.5): a NAT rebinding or a host migration, per `change`.
-    path_validated: PathValidatedEvent,
+    path_validation_started: PathTransitionEvent,
+    path_validation_succeeded: PathTransitionEvent,
+    path_validation_failed: PathTransitionEvent,
+    path_migration_blocked: PathMigrationBlockedEvent,
+    /// A candidate path was promoted to active (RFC 9000 §9.3/§9.5): a NAT
+    /// rebinding or a host migration, per `change`.
+    path_promoted: PathTransitionEvent,
     /// #523: a typed outcome for every `.zero_rtt` packet this connection
     /// processes, distinguishing "policy/keys unavailable" from a genuine
     /// AEAD authentication failure and from an authenticated duplicate —
@@ -168,9 +172,20 @@ pub const ZeroRttPacketOutcome = enum {
     malformed,
 };
 
-pub const PathValidatedEvent = struct {
+pub const PathTransitionEvent = struct {
     path: quic_path.PathKey,
     change: quic_path.AddressChange,
+};
+
+pub const PathMigrationBlockedReason = enum {
+    policy,
+    no_peer_cid,
+};
+
+pub const PathMigrationBlockedEvent = struct {
+    path: quic_path.PathKey,
+    change: quic_path.AddressChange,
+    reason: PathMigrationBlockedReason,
 };
 
 /// A datagram `pollTransmitOnPath` produced, and the exact destination it
@@ -223,14 +238,20 @@ pub const CloseInfo = struct {
 pub const Options = struct {
     role: Role,
     config: config.Config = .{},
-    /// This side's connection ID (server: the client's original DCID, adopted).
+    /// This side's connection ID.
     local_cid: []const u8,
-    /// Client: the random original DCID choosing the Initial secrets.
-    /// Server: the client's original DCID (same as `local_cid` here).
-    original_dcid: []const u8,
     /// Client: leave empty; adopted from the server's first Initial SCID.
     /// Server: the client's SCID.
     peer_cid: []const u8 = &.{},
+    /// The client Initial DCID before any Retry. Servers bind this into
+    /// `original_destination_connection_id`; clients use it to verify the
+    /// server binding after the handshake.
+    original_destination_cid: []const u8,
+    /// Server-only after Retry: the SCID the server used in its Retry packet.
+    retry_source_cid: ?[]const u8 = null,
+    /// DCID used to derive Initial secrets. This is the ODCID without Retry
+    /// and the retried Initial DCID/Retry SCID after Retry.
+    initial_secret_dcid: []const u8,
     tls: tls_handshake.TlsBackend,
     now_us: u64,
     events: EventSink = .{},
@@ -756,7 +777,11 @@ pub const Connection = struct {
                 try config.CidValue.init(options.peer_cid)
             else
                 .{},
-            .original_dcid = try config.CidValue.init(options.original_dcid),
+            .original_dcid = try config.CidValue.init(options.original_destination_cid),
+            .retry_scid = if (options.retry_source_cid) |retry_source|
+                try config.CidValue.init(retry_source)
+            else
+                null,
             .stateless_reset_key = options.stateless_reset_key,
             .peer_cids = quic_cid.PeerCidPool.init(params.active_connection_id_limit),
             .send_queues = std.AutoHashMap(StreamId, *SendQueue).init(allocator),
@@ -790,6 +815,7 @@ pub const Connection = struct {
         };
         if (options.role == .server) {
             binding.original_destination_connection_id = conn.original_dcid;
+            if (conn.retry_scid) |retry_source| binding.retry_source_connection_id = retry_source;
             binding.stateless_reset_token = quic_cid.statelessResetToken(options.stateless_reset_key, conn.local_cid.slice());
         }
         options.tls.setCidBinding(binding);
@@ -806,7 +832,7 @@ pub const Connection = struct {
                 .client => .client,
                 .server => .server,
             },
-            conn.original_dcid.slice(),
+            options.initial_secret_dcid,
         );
         conn.handshake.manual_key_discard = true;
         conn.handshake.allow_unverified_certificate = options.allow_unverified_certificate;
@@ -1201,8 +1227,16 @@ pub const Connection = struct {
         if (!already_received) {
             self.paths.validation_timeout_us = @max(quic_path.default_validation_timeout_us, 3 * self.recovery.rtt.ptoDuration(.application));
             switch (self.paths.onDatagram(ingress_path, bytes.len, challenge_entropy, now_us)) {
-                .probe => |data| self.queueCandidateChallenge(ingress_path, data),
-                .on_active_path, .probing, .validated_pending_promotion, .blocked => {},
+                .probe => |probe| {
+                    self.queueCandidateChallenge(ingress_path, probe.data);
+                    self.events.emit(.{ .path_validation_started = .{ .path = ingress_path, .change = probe.change } });
+                },
+                .blocked => |blocked| {
+                    if (blocked.first_observation) {
+                        self.events.emit(.{ .path_migration_blocked = .{ .path = ingress_path, .change = blocked.change, .reason = .policy } });
+                    }
+                },
+                .on_active_path, .probing, .validated_pending_promotion => {},
             }
             if (level == .handshake and self.role == .server) {
                 // RFC 9001 §4.9.1 / RFC 9000 §8.1: receiving an authenticated
@@ -1415,6 +1449,7 @@ pub const Connection = struct {
                 // permitted (§19.18 makes the connection error optional).
                 if (level != .application) return;
                 const validated = self.paths.validatePathResponse(ingress_path, data, now_us) orelse return;
+                self.events.emit(.{ .path_validation_succeeded = .{ .path = validated.path, .change = validated.change } });
                 self.tryPromote(validated.path);
             },
             .connection_close => |cc| {
@@ -2129,7 +2164,10 @@ pub const Connection = struct {
         // (RFC 9000 §8.2.4). This never changes the active path — a failed
         // candidate just stops being a candidate; egress notices via
         // `pathIsValidating` and drops the stale challenge hint.
-        _ = self.paths.expireValidations(now_us);
+        var failed_validations: [quic_path.max_paths]quic_path.FailedValidation = undefined;
+        for (self.paths.expireValidationsInto(now_us, &failed_validations)) |failed| {
+            self.events.emit(.{ .path_validation_failed = .{ .path = failed.path, .change = failed.change } });
+        }
         // Time-threshold loss detection.
         for ([_]PacketNumberSpace{ .initial, .handshake, .application }) |space| {
             self.detectAndRequeueLost(space, now_us);
@@ -2321,6 +2359,7 @@ pub const Connection = struct {
         if (change == .migration) {
             const claimed = self.peer_cids.claimForMigration() orelse {
                 self.paths.recordMigrationBlockedNoPeerCid();
+                self.events.emit(.{ .path_migration_blocked = .{ .path = candidate, .change = change, .reason = .no_peer_cid } });
                 return;
             };
             self.peer_cid = config.CidValue.init(claimed.cid.slice()) catch self.peer_cid;
@@ -2328,7 +2367,7 @@ pub const Connection = struct {
         const outcome = self.paths.promoteValidated(candidate) orelse return;
         if (outcome.reset_congestion) self.recovery.resetForPathMigration();
         self.removeCandidateChallenge(candidate);
-        self.events.emit(.{ .path_validated = .{ .path = candidate, .change = outcome.change } });
+        self.events.emit(.{ .path_promoted = .{ .path = candidate, .change = outcome.change } });
     }
 
     pub fn stopSending(self: *Connection, id: StreamId, app_error_code: u64) !void {
@@ -3241,7 +3280,8 @@ const TestPair = struct {
         pair.client = try Connection.init(allocator, .{
             .role = .client,
             .local_cid = &client_cid,
-            .original_dcid = &odcid,
+            .original_destination_cid = &odcid,
+            .initial_secret_dcid = &odcid,
             .peer_cid = &odcid,
             .tls = pair.client_backend.backend(),
             .now_us = pair.now_us,
@@ -3251,7 +3291,8 @@ const TestPair = struct {
         pair.server = try Connection.init(allocator, .{
             .role = .server,
             .local_cid = &odcid,
-            .original_dcid = &odcid,
+            .original_destination_cid = &odcid,
+            .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = pair.server_backend.backend(),
             .now_us = pair.now_us,
@@ -3299,7 +3340,8 @@ const TestPair = struct {
         pair.client = try Connection.init(allocator, .{
             .role = .client,
             .local_cid = &client_cid,
-            .original_dcid = &odcid,
+            .original_destination_cid = &odcid,
+            .initial_secret_dcid = &odcid,
             .peer_cid = &odcid,
             .tls = pair.client_backend.backend(),
             .now_us = pair.now_us,
@@ -3309,7 +3351,8 @@ const TestPair = struct {
         pair.server = try Connection.init(allocator, .{
             .role = .server,
             .local_cid = &odcid,
-            .original_dcid = &odcid,
+            .original_destination_cid = &odcid,
+            .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = pair.server_backend.backend(),
             .now_us = pair.now_us,
@@ -3345,7 +3388,8 @@ const TestPair = struct {
         pair.client = try Connection.init(allocator, .{
             .role = .client,
             .local_cid = &client_cid,
-            .original_dcid = &odcid,
+            .original_destination_cid = &odcid,
+            .initial_secret_dcid = &odcid,
             .peer_cid = &odcid,
             .tls = pair.client_backend.backend(),
             .now_us = pair.now_us,
@@ -3355,7 +3399,8 @@ const TestPair = struct {
         pair.server = try Connection.init(allocator, .{
             .role = .server,
             .local_cid = &odcid,
-            .original_dcid = &odcid,
+            .original_destination_cid = &odcid,
+            .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = pair.server_backend.backend(),
             .now_us = pair.now_us,
@@ -3411,7 +3456,8 @@ test "Connection.init failure before the handshake is assigned does not deinit u
     try testing.expectError(error.InvalidConnectionId, Connection.init(allocator, .{
         .role = .client,
         .local_cid = &TestPair.client_cid,
-        .original_dcid = &too_short_dcid,
+        .original_destination_cid = &too_short_dcid,
+        .initial_secret_dcid = &too_short_dcid,
         .peer_cid = &too_short_dcid,
         .tls = backend.backend(),
         .now_us = 1_000_000,
@@ -3511,7 +3557,8 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
     pair.client = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &TestPair.client_cid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = pair.client_backend.backend(),
         .now_us = pair.now_us,
@@ -3522,7 +3569,8 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
     pair.server = try Connection.init(allocator, .{
         .role = .server,
         .local_cid = &TestPair.odcid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = pair.server_backend.backend(),
         .now_us = pair.now_us,
@@ -4291,7 +4339,8 @@ test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake v
     resumed.client = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &TestPair.client_cid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = resumed.client_backend.backend(),
         .now_us = resumed.now_us,
@@ -4301,7 +4350,8 @@ test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake v
     resumed.server = try Connection.init(allocator, .{
         .role = .server,
         .local_cid = &TestPair.odcid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = resumed.server_backend.backend(),
         .now_us = resumed.now_us,
@@ -4468,7 +4518,8 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
         .role = .client,
         .config = .{ .zero_rtt_enabled = true },
         .local_cid = &TestPair.client_cid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = resumed.client_backend.backend(),
         .now_us = resumed.now_us,
@@ -4479,7 +4530,8 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
         .role = .server,
         .config = .{ .zero_rtt_enabled = true },
         .local_cid = &TestPair.odcid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = resumed.server_backend.backend(),
         .now_us = resumed.now_us,
@@ -4682,7 +4734,8 @@ test "#523: Event.early_data_decision surfaces the real TLS decision once, even 
         .role = .client,
         .config = .{ .zero_rtt_enabled = true },
         .local_cid = &TestPair.client_cid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = resumed.client_backend.backend(),
         .now_us = resumed.now_us,
@@ -4693,7 +4746,8 @@ test "#523: Event.early_data_decision surfaces the real TLS decision once, even 
         .role = .server,
         .config = .{ .zero_rtt_enabled = true },
         .local_cid = &TestPair.odcid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = resumed.server_backend.backend(),
         .now_us = resumed.now_us,
@@ -4867,7 +4921,8 @@ fn expectRejectedEarlyDataFallsBackOnSameConnection(scenario: RejectedEarlyDataF
         .role = .client,
         .config = .{ .zero_rtt_enabled = true },
         .local_cid = &TestPair.client_cid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = resumed.client_backend.backend(),
         .now_us = resumed.now_us,
@@ -4878,7 +4933,8 @@ fn expectRejectedEarlyDataFallsBackOnSameConnection(scenario: RejectedEarlyDataF
         .role = .server,
         .config = .{ .zero_rtt_enabled = true },
         .local_cid = &TestPair.odcid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = resumed.server_backend.backend(),
         .now_us = resumed.now_us,
@@ -5350,7 +5406,8 @@ const MigrationPair = struct {
             .role = .client,
             .config = .{ .migration_policy = policy },
             .local_cid = &TestPair.client_cid,
-            .original_dcid = &TestPair.odcid,
+            .original_destination_cid = &TestPair.odcid,
+            .initial_secret_dcid = &TestPair.odcid,
             .peer_cid = &TestPair.odcid,
             .tls = pair.client_backend.backend(),
             .now_us = pair.now_us,
@@ -5361,7 +5418,8 @@ const MigrationPair = struct {
             .role = .server,
             .config = .{ .migration_policy = policy },
             .local_cid = &TestPair.odcid,
-            .original_dcid = &TestPair.odcid,
+            .original_destination_cid = &TestPair.odcid,
+            .initial_secret_dcid = &TestPair.odcid,
             .peer_cid = &TestPair.client_cid,
             .tls = pair.server_backend.backend(),
             .now_us = pair.now_us,
@@ -5688,7 +5746,8 @@ test "connection: a policy-blocked server still answers a PATH_CHALLENGE on its 
         .role = .client,
         .config = .{ .migration_policy = .full },
         .local_cid = &TestPair.client_cid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = client_backend.backend(),
         .now_us = now_us,
@@ -5699,7 +5758,8 @@ test "connection: a policy-blocked server still answers a PATH_CHALLENGE on its 
         .role = .server,
         .config = .{ .migration_policy = .disabled },
         .local_cid = &TestPair.odcid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = server_backend.backend(),
         .now_us = now_us,
@@ -6185,7 +6245,8 @@ test "a real Connection closes with handshake_failure when the server has no app
         pair.client = try Connection.init(allocator, .{
             .role = .client,
             .local_cid = &TestPair.client_cid,
-            .original_dcid = &TestPair.odcid,
+            .original_destination_cid = &TestPair.odcid,
+            .initial_secret_dcid = &TestPair.odcid,
             .peer_cid = &TestPair.odcid,
             .tls = pair.client_backend.backend(),
             .now_us = pair.now_us,
@@ -6194,7 +6255,8 @@ test "a real Connection closes with handshake_failure when the server has no app
         pair.server = try Connection.init(allocator, .{
             .role = .server,
             .local_cid = &TestPair.odcid,
-            .original_dcid = &TestPair.odcid,
+            .original_destination_cid = &TestPair.odcid,
+            .initial_secret_dcid = &TestPair.odcid,
             .peer_cid = &TestPair.client_cid,
             .tls = pair.server_backend.backend(),
             .now_us = pair.now_us,
