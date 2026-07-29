@@ -38,6 +38,15 @@ pub const StreamRequest = http3_session.StreamRequest;
 pub const Response = response_mod.Response;
 pub const Logger = logger_mod.Logger;
 
+pub const EffectiveAdvertisementState = enum {
+    disabled,
+    configured_unavailable,
+    ready_advertisement_disabled,
+    advertising,
+    clearing,
+    draining,
+};
+
 pub const Http3RuntimeError = error{
     OutOfMemory,
     DependencyUnavailable,
@@ -145,6 +154,7 @@ pub const Snapshot = struct {
     migrations_blocked: usize = 0,
     migrations_blocked_no_peer_cid: usize = 0,
     last_error_code: i32 = 0,
+    draining: bool = false,
 
     pub fn handshakeState(self: Snapshot) []const u8 {
         if (!self.server_bootstrapped) return "bootstrap_incomplete";
@@ -177,6 +187,7 @@ const ConnEntry = struct {
     /// issuance (successfully or not) — issuance is best-effort and must
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
+    drain_goaway_sent: bool = false,
     last_path_metrics: quic.path.Metrics = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
 
@@ -226,6 +237,8 @@ pub const Runtime = struct {
     snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
     stopping: std.atomic.Value(bool),
+    drain_requested: std.atomic.Value(bool),
+    drain_deadline_us: std.atomic.Value(u64),
 
     pub fn init(allocator: std.mem.Allocator, logger: *logger_mod.Logger, cfg: Config) Http3RuntimeError!Runtime {
         const address = compat.parseIpAddress(cfg.listen_host, cfg.quic_port) catch |err| {
@@ -281,6 +294,8 @@ pub const Runtime = struct {
             .quic_zero_rtt_packet_metrics_cb = cfg.quic_zero_rtt_packet_metrics_cb,
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
+            .drain_requested = std.atomic.Value(bool).init(false),
+            .drain_deadline_us = std.atomic.Value(u64).init(0),
         };
         var retry_key: [quic.path.token_key_len]u8 = undefined;
         compat.randomBytes(&retry_key);
@@ -326,10 +341,28 @@ pub const Runtime = struct {
         return self.snapshot_state;
     }
 
+    pub fn beginDrain(self: *Runtime, deadline_us: u64) void {
+        if (self.drain_requested.swap(true, .acq_rel)) return;
+        self.drain_deadline_us.store(deadline_us, .release);
+        self.snapshot_mutex.lock();
+        self.snapshot_state.draining = true;
+        self.snapshot_mutex.unlock();
+        self.logger.info(null, "http3: graceful drain started deadline_us={d}", .{deadline_us});
+    }
+
+    pub fn isDrained(self: *Runtime) bool {
+        const snap = self.snapshot();
+        return snap.tracked_connections == 0;
+    }
+
     fn nowUs() u64 {
         var ts: std.c.timespec = undefined;
         _ = std.c.clock_gettime(.MONOTONIC, &ts);
         return @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1_000;
+    }
+
+    pub fn nowUsPublic() u64 {
+        return nowUs();
     }
 
     fn loopMain(self: *Runtime) void {
@@ -356,8 +389,11 @@ pub const Runtime = struct {
             per_ip.deinit();
         }
 
-        while (!self.stopping.load(.acquire) and !shutdown.isShutdownRequested()) {
+        while (!self.stopping.load(.acquire)) {
             const now = nowUs();
+            const draining = self.drain_requested.load(.acquire) or shutdown.isShutdownRequested();
+            const drain_deadline = self.drain_deadline_us.load(.acquire);
+            const drain_expired = draining and drain_deadline != 0 and now >= drain_deadline;
 
             // 1) Timers and transmission for every connection.
             var wake_us: u64 = now + 100_000;
@@ -372,10 +408,15 @@ pub const Runtime = struct {
                     self.syncCidRoutes(entry, &routes);
                     self.maintainLocalCidRoutes(entry, kv.key_ptr.*, &routes);
                     self.foldPathMetrics(entry);
+                    if (draining and !entry.drain_goaway_sent) self.sendDrainGoaway(entry);
                     while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
                         self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
                     }
-                    self.pumpH3(entry, now);
+                    if (drain_expired) {
+                        entry.conn.close(0x0100, "h3 drain deadline", now);
+                    } else {
+                        self.pumpH3(entry, now);
+                    }
                     while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
                         self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
                     }
@@ -395,6 +436,7 @@ pub const Runtime = struct {
                     self.removeConnection(&connections, &routes, &per_ip, handle);
                 }
             }
+            if (draining and connections.count() == 0) break;
 
             // 2) Sleep until the earliest deadline or socket readability.
             const timeout_ms: i32 = @intCast(@min((wake_us -| nowUs()) / 1_000 + 1, 100));
@@ -418,6 +460,7 @@ pub const Runtime = struct {
                 if (n == 0) continue;
                 const datagram = buf[0..@intCast(n)];
                 if (from.family != posix.AF.INET) continue;
+                if (draining) continue;
                 const peer: *const std.c.sockaddr.in = @ptrCast(&from);
                 self.ingest(&connections, &routes, &per_ip, &next_handle, datagram, peer.*, nowUs());
             }
@@ -837,8 +880,22 @@ pub const Runtime = struct {
                 entry.conn.close(entry.h3.closeCode(), "h3 request error", now);
                 return;
             } orelse break;
+            if (self.drain_requested.load(.acquire)) {
+                entry.conn.resetStream(incoming.stream_id, 0x0107) catch {}; // H3_REQUEST_REJECTED
+                entry.h3.finishRequest(incoming.stream_id);
+                continue;
+            }
             self.serveRequest(entry, incoming, now);
         }
+    }
+
+    fn sendDrainGoaway(self: *Runtime, entry: *ConnEntry) void {
+        if (!entry.conn.isEstablished() or !entry.h3_started) return;
+        entry.h3.sendGoaway(entry.conn, 0) catch |err| {
+            self.logger.warn(null, "http3: failed to queue GOAWAY during drain: {s}", .{@errorName(err)});
+            return;
+        };
+        entry.drain_goaway_sent = true;
     }
 
     fn serveRequest(self: *Runtime, entry: *ConnEntry, incoming: H3.IncomingRequest, now: u64) void {
@@ -1194,6 +1251,7 @@ pub const Runtime = struct {
         defer self.snapshot_mutex.unlock();
         self.snapshot_state.native_connections -|= 1;
         self.snapshot_state.tracked_connections -|= 1;
+        if (self.snapshot_state.tracked_connections == 0) self.snapshot_state.draining = false;
     }
 
     fn noteHandshakeComplete(self: *Runtime) void {

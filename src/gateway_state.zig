@@ -434,7 +434,8 @@ pub const GatewayState = struct {
     /// configured. Heap-owned; re-derived (old value freed) on reload. [runtime_mutex]
     hsts_value: []u8 = &.{},
     add_headers: []const edge_config.EdgeConfig.HeaderPair, // borrowed from cfg; rebound on reload [runtime_mutex]
-    http3_alt_svc: ?[]u8, // owned; re-derived (old freed) on reload [runtime_mutex]
+    http3_alt_svc: ?[]u8, // owned effective advertisement; re-derived (old freed) on reload [runtime_mutex]
+    http3_advertisement_state: http.http3_runtime.EffectiveAdvertisementState, // cfg/runtime-derived [runtime_mutex]
     http3_runtime: ?*http.http3_runtime.Runtime, // owned pointer; main-event-loop-only
     session_store: ?http.session.SessionStore, // owned [session_mutex]
     session_store_path: []const u8, // borrowed from startup cfg; restart-only (warns on change at reload)
@@ -1758,9 +1759,16 @@ pub const GatewayState = struct {
         self.runtime_mutex.lock();
         const proxy_buffer_limits = self.proxy_buffer_limits;
         const tls_buffer_limits = self.tls_buffer_limits;
+        const http3_advertisement_state = self.http3_advertisement_state;
         self.runtime_mutex.unlock();
         try appendProxyBufferConfigPrometheus(&combined, proxy_buffer_limits);
         try appendTlsBufferConfigPrometheus(&combined, tls_buffer_limits);
+        try combined.appendSlice(
+            \\# HELP tardigrade_http3_effective_state HTTP/3 effective listener and advertisement state
+            \\# TYPE tardigrade_http3_effective_state gauge
+            \\
+        );
+        try combined.print("tardigrade_http3_effective_state{{state=\"{s}\"}} 1\n", .{@tagName(http3_advertisement_state)});
         if (mux_snapshot.device_counts.len > 0) {
             try combined.appendSlice(
                 \\# HELP tardigrade_mux_device_channels Current active mux channels by device

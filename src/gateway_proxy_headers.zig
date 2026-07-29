@@ -71,6 +71,7 @@ pub fn shouldSkipUpstreamResponseHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "trailer") or
         std.ascii.eqlIgnoreCase(name, "transfer-encoding") or
         std.ascii.eqlIgnoreCase(name, "upgrade") or
+        std.ascii.eqlIgnoreCase(name, "alt-svc") or
         // Strip upstream technology-disclosure headers. Tardigrade emits its
         // own Server header; leaking the upstream value exposes backend stack
         // details to external clients (WSTG-INFO-02, ASVS-14.3.3).

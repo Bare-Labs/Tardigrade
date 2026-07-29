@@ -698,6 +698,7 @@ fn streamViaH2Pool(
     downstream_conn: anytype,
     downstream_writer: anytype,
     security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
     correlation_id: []const u8,
     connect_timeout_ms: u32,
@@ -730,7 +731,7 @@ fn streamViaH2Pool(
                 if (h1_pool) |p| p.recordProtocol(false);
                 const start_ms = http.event_loop.monotonicMs();
                 var wrote_downstream = false;
-                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, read_buf, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer);
+                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, read_buf, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer);
                 if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
                 return res.result;
             },
@@ -858,6 +859,7 @@ fn streamViaH2Pool(
                     body_allowed,
                     correlation_id,
                     security,
+                    alt_svc,
                     sticky_set_cookie,
                 ) catch {
                     conn.finishStreaming(stream); // resets the unfinished stream
@@ -1755,6 +1757,7 @@ fn streamProxyOverTransport(
     downstream_conn: anytype,
     downstream_writer: anytype,
     security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
     correlation_id: []const u8,
     connect_timeout_ms: u32,
@@ -1804,6 +1807,7 @@ fn streamProxyOverTransport(
         body_allowed,
         correlation_id,
         security,
+        alt_svc,
         sticky_set_cookie,
     ) catch return error.ClientAborted;
     wrote_downstream.* = true;
@@ -1861,6 +1865,7 @@ pub fn executeStreamingHttpProxyRequest(
     auth_device_id: ?[]const u8,
     auth_scopes: ?[]const u8,
     security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
     cancel_token: ?*const CancellationToken,
     proxy_buffer_observer: proxy_buffer_account.Observer,
@@ -1926,7 +1931,7 @@ pub fn executeStreamingHttpProxyRequest(
     if (stream_h2) {
         if (h2_pool) |hp| {
             const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) tls_options.? else null;
-            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, read_buf, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer);
+            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, read_buf, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer);
         }
         if (streaming_body != null) {
             if (pool) |p| p.recordH2StreamingUploadFallback();
@@ -1995,9 +2000,9 @@ pub fn executeStreamingHttpProxyRequest(
         const exchange_start_ms = http.event_loop.monotonicMs();
         const fd = conn.stream.handle;
         const res = (if (conn.tls) |tls|
-            streamProxyOverTransport(allocator, tls, fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer)
+            streamProxyOverTransport(allocator, tls, fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer)
         else
-            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer)) catch |err| {
+            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer)) catch |err| {
             // Tear down the connection (release handles active-- and close).
             if (active_pool) |p| {
                 p.release(key, conn, false, http.event_loop.monotonicMs());

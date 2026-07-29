@@ -538,6 +538,7 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
                 upstream_content_disposition,
                 correlation_id,
                 &state.security_headers,
+                state.http3_alt_svc,
                 sticky_set_cookie,
             );
             if (buffered_resp.body.len > 0) {

@@ -728,6 +728,13 @@ pub fn Conn(comptime Transport: type) type {
             self.finishRequest(stream_id);
         }
 
+        pub fn sendGoaway(self: *Self, transport: *Transport, stream_id: u64) !void {
+            const control = self.control_out orelse return error.MissingControlStream;
+            var wire: [32]u8 = undefined;
+            const goaway = try session.ResponseEncoder.encodeGoaway(stream_id, &wire);
+            try self.writeAll(transport, control, goaway, false);
+        }
+
         fn writeAll(self: *Self, transport: *Transport, stream_id: u64, bytes: []const u8, fin: bool) !void {
             _ = self;
             // The transport records FIN only when it accepts the whole slice
