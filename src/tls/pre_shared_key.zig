@@ -336,6 +336,7 @@ pub fn deriveBinderFromTranscriptHash(
             defer crypto.secureZero(u8, &finished_key);
 
             var mac: [HmacSha256.mac_length]u8 = undefined;
+            defer crypto.secureZero(u8, &mac);
             HmacSha256.create(&mac, transcript_hash[0..Sha256.digest_length], &finished_key);
             @memcpy(out, &mac);
         },
@@ -355,6 +356,7 @@ pub fn deriveBinderFromTranscriptHash(
             defer crypto.secureZero(u8, &finished_key);
 
             var mac: [HmacSha384.mac_length]u8 = undefined;
+            defer crypto.secureZero(u8, &mac);
             HmacSha384.create(&mac, transcript_hash[0..Sha384.digest_length], &finished_key);
             @memcpy(out, &mac);
         },

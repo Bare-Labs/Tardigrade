@@ -3605,6 +3605,212 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
     }
 }
 
+// #485: a genuine two-`Connection` loopback proving PSK resumption itself
+// (not just the non-PSK HRR retry mechanics the #484 test above covers)
+// survives a real HelloRetryRequest over the QUIC adapter — the client's
+// retained offer is re-emitted in ClientHello2 with a binder derived from
+// the rebound transcript, and the server verifies it against that same
+// digest, exactly as `src/tls/tls13_backend_tests.zig`'s direct-harness
+// tests prove at the TLS-backend level.
+test "driver: PSK resumption completes through a real HelloRetryRequest over QUIC" {
+    const allocator = testing.allocator;
+
+    const LoggedEvent = union(enum) { packet_sent: PacketNumberSpace, keys_discarded: PacketNumberSpace };
+    const EventCapture = struct {
+        log: [64]LoggedEvent = undefined,
+        len: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const logged: LoggedEvent = switch (event) {
+                .packet_sent => |p| .{ .packet_sent = p.space },
+                .keys_discarded => |space| .{ .keys_discarded = space },
+                else => return,
+            };
+            if (self.len == self.log.len) return;
+            self.log[self.len] = logged;
+            self.len += 1;
+        }
+
+        fn initialPacketsSentBeforeInitialDiscard(self: *const @This()) usize {
+            var count: usize = 0;
+            for (self.log[0..self.len]) |entry| {
+                switch (entry) {
+                    .packet_sent => |space| if (space == .initial) {
+                        count += 1;
+                    },
+                    .keys_discarded => |space| if (space == .initial) return count,
+                }
+            }
+            return count;
+        }
+    };
+    var client_capture = EventCapture{};
+    var server_capture = EventCapture{};
+
+    const psk = [_]u8{0x64} ** tls_core.tls13_backend.hash_len;
+    var common: tls_core.session.ResumableSessionCommon = .{};
+    try common.init(allocator, tls_core.session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        // QUIC negotiates "h3", not the record profile's "h2" — must match
+        // what `onEncryptedExtensions` actually negotiates or the resumed
+        // connection is fatally rejected as an ALPN mismatch, not merely
+        // falling back to a full handshake.
+        .application_protocol = "h3",
+        .auth_binding = tls_core.session.AuthBinding.fromLeafCertificateDer(tls_backend_mod.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    });
+    var ticket: tls_core.session.ClientTicketState = .{};
+    try ticket.init(allocator, tls_core.session.Limits.default, &common, .{
+        .ticket = "quic-hrr-resumption-ticket",
+        .ticket_age_add = 0,
+        .ticket_nonce = "n",
+        .received_at_unix_ms = 0,
+    });
+    var offers: tls_core.pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&ticket);
+    var clock_dummy: u8 = 0;
+    const Clock = struct {
+        fn now(_: *anyopaque) i64 {
+            return 5_000;
+        }
+    };
+
+    var stored_common: tls_core.session.ResumableSessionCommon = .{};
+    try stored_common.init(allocator, tls_core.session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &psk,
+        .application_protocol = "h3",
+        .auth_binding = tls_core.session.AuthBinding.fromLeafCertificateDer(tls_backend_mod.testdata.certificate_der),
+        .issued_at_unix_ms = 0,
+        .lifetime_seconds = 3600,
+    });
+    var stored_state: tls_core.session.ServerRecoverableState = .{};
+    stored_state.init(&stored_common, 0);
+    defer stored_state.deinit();
+
+    const Resolver = struct {
+        state: *tls_core.session.ServerRecoverableState,
+        calls: usize = 0,
+
+        fn now(_: *anyopaque) i64 {
+            return 0;
+        }
+        fn resolve(ctx: *anyopaque, identity: []const u8) tls_core.pre_shared_key.ResolveError!tls_core.pre_shared_key.ServerPskResolveResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (!std.mem.eql(u8, identity, "quic-hrr-resumption-ticket")) return .miss;
+            var out: tls_core.session.ServerRecoverableState = .{};
+            self.state.cloneInto(testing.allocator, &out) catch return error.ResolverFailed;
+            return .{ .hit = .{ .state = out, .lease = tls_core.pre_shared_key.ServerPskLease.initNoop() } };
+        }
+    };
+    var resolver_state = Resolver{ .state = &stored_state };
+    const DecisionProbe = struct {
+        count: usize = 0,
+        last: ?tls_core.tls13_backend.Tls13Backend.ResumptionDecision = null,
+        fn onDecision(ctx: *anyopaque, decision: tls_core.tls13_backend.Tls13Backend.ResumptionDecision) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+            self.last = decision;
+        }
+    };
+    var decision_probe = DecisionProbe{};
+
+    const pair = try allocator.create(TestPair);
+    errdefer allocator.destroy(pair);
+    pair.* = .{
+        .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocatorAndOptions(
+            allocator,
+            .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x13} ** 32 },
+            .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+            .{ .initial_key_share_mode = .empty },
+        ),
+        .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
+            allocator,
+            .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x23} ** 32 },
+            try tls_backend_mod.Identity.initPkcs8(
+                tls_backend_mod.testdata.certificate_der,
+                tls_backend_mod.testdata.private_key_pkcs8_der,
+            ),
+        ),
+    };
+    // Native QUIC 1-RTT resumption deliberately ignores connection-specific
+    // transport/application snapshots (matching the runtime-composition PSK
+    // tests elsewhere in this file) — a hand-built stored ticket has no
+    // transport_compat of its own to match against this fresh connection's.
+    const resume_policy: tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy = .{
+        .transport = .ignore,
+        .application = .ignore,
+    };
+    try pair.client_backend.engine.setClientPskOffers(&offers, &clock_dummy, Clock.now);
+    try pair.client_backend.setResumeCompatibilityPolicy(resume_policy);
+    try pair.server_backend.setResumeCompatibilityPolicy(resume_policy);
+    try pair.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = Resolver.now,
+        .resolveFn = Resolver.resolve,
+    });
+    try pair.server_backend.setResumptionDecisionObserver(.{ .ctx = &decision_probe, .onDecisionFn = DecisionProbe.onDecision });
+
+    pair.client = try Connection.init(allocator, .{
+        .role = .client,
+        .local_cid = &TestPair.client_cid,
+        .original_dcid = &TestPair.odcid,
+        .peer_cid = &TestPair.odcid,
+        .tls = pair.client_backend.backend(),
+        .now_us = pair.now_us,
+        .initial_path = TestPair.client_path,
+        .events = .{ .context = &client_capture, .emitFn = EventCapture.onEvent },
+    });
+    errdefer pair.client.deinit();
+    pair.server = try Connection.init(allocator, .{
+        .role = .server,
+        .local_cid = &TestPair.odcid,
+        .original_dcid = &TestPair.odcid,
+        .peer_cid = &TestPair.client_cid,
+        .tls = pair.server_backend.backend(),
+        .now_us = pair.now_us,
+        .initial_path = TestPair.server_path,
+        .events = .{ .context = &server_capture, .emitFn = EventCapture.onEvent },
+    });
+    defer pair.deinit(allocator);
+
+    try pair.pump();
+
+    try testing.expectEqual(State.established, pair.client.state());
+    try testing.expectEqual(State.established, pair.server.state());
+
+    // The resumption itself actually succeeded (not merely a plain HRR
+    // retry that happened to fall back to a full handshake), and it went
+    // through exactly one HelloRetryRequest.
+    try testing.expectEqual(@as(usize, 1), resolver_state.calls);
+    try testing.expectEqual(@as(usize, 1), decision_probe.count);
+    try testing.expectEqual(tls_core.tls13_backend.Tls13Backend.ResumptionDecision.accepted, decision_probe.last.?);
+    try testing.expect(pair.client_backend.engine.core.psk_authenticated);
+    try testing.expect(pair.server_backend.engine.core.psk_authenticated);
+    try testing.expectEqual(tls_core.handshake.RetryState.hrr_received, pair.client_backend.engine.core.retry_state);
+    try testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, pair.server_backend.engine.core.retry_state);
+
+    // HRR and ClientHello2 (like the non-PSK #484 case) stayed at the
+    // Initial epoch, and Initial keys were not discarded before both of a
+    // side's Initial-space flight packets had already gone out.
+    try testing.expect(server_capture.initialPacketsSentBeforeInitialDiscard() >= 2);
+    try testing.expect(client_capture.initialPacketsSentBeforeInitialDiscard() >= 2);
+
+    // The resumed connection is genuinely usable under the post-HRR,
+    // PSK-derived keys.
+    const id = try pair.client.openStream(.bidi);
+    try testing.expectEqual(@as(usize, 5), try pair.client.writeStream(id, "hello", true));
+    try pair.pump();
+    try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
+    var buf: [16]u8 = undefined;
+    const request = try pair.server.readStream(id, &buf);
+    try testing.expectEqualStrings("hello", buf[0..request.len]);
+}
+
 test "driver: bidirectional stream data round-trips with FIN" {
     const allocator = testing.allocator;
     var pair = try TestPair.init(allocator);
