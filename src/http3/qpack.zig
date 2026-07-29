@@ -810,7 +810,10 @@ pub const EncoderStreamReader = struct {
         try self.pending.appendSlice(allocator, bytes);
         var consumed: usize = 0;
         while (consumed < self.pending.items.len) {
-            const applied = try EncoderStream.applyOne(table, self.pending.items[consumed..]) orelse break;
+            const applied = EncoderStream.applyOne(table, self.pending.items[consumed..]) catch |err| {
+                discardPendingPrefix(&self.pending, consumed);
+                return err;
+            } orelse break;
             consumed += applied;
         }
         discardPendingPrefix(&self.pending, consumed);
@@ -911,7 +914,10 @@ pub const DecoderStreamReader = struct {
         try self.pending.appendSlice(allocator, bytes);
         var consumed: usize = 0;
         while (consumed < self.pending.items.len) {
-            const applied = try stream.applyOne(self.pending.items[consumed..]) orelse break;
+            const applied = stream.applyOne(self.pending.items[consumed..]) catch |err| {
+                discardPendingPrefix(&self.pending, consumed);
+                return err;
+            } orelse break;
             consumed += applied;
         }
         discardPendingPrefix(&self.pending, consumed);
@@ -1432,6 +1438,45 @@ test "decoder stream reader handles split varints" {
     try testing.expectEqual(encoded.len - 1, try reader.ingest(testing.allocator, &stream, encoded[1..]));
     try testing.expectEqual(@as(u64, 128), stream.known_received_count);
     try testing.expectEqual(@as(usize, 0), reader.pending.items.len);
+}
+
+test "encoder stream reader does not replay committed prefix before malformed tail" {
+    var table = DynamicTable.init(testing.allocator, 128);
+    defer table.deinit();
+    var reader = EncoderStreamReader{};
+    defer reader.deinit(testing.allocator);
+
+    var valid_buf: [64]u8 = undefined;
+    const valid = try EncoderStream.encodeInsertLiteral("x-ok", "one", &valid_buf);
+    var combined: [80]u8 = undefined;
+    @memcpy(combined[0..valid.len], valid);
+    const bad = try EncoderStream.encodeInsertNameRefStatic(static_table_len, "bad", combined[valid.len..]);
+
+    try testing.expectError(error.InvalidStaticIndex, reader.ingest(testing.allocator, &table, combined[0 .. valid.len + bad.len]));
+    try testing.expectEqual(@as(u64, 1), table.inserted_count);
+    try testing.expectEqual(bad.len, reader.pending.items.len);
+
+    _ = reader.ingest(testing.allocator, &table, "") catch {};
+    try testing.expectEqual(@as(u64, 1), table.inserted_count);
+}
+
+test "decoder stream reader does not replay committed prefix before overflowing tail" {
+    var valid_buf: [16]u8 = undefined;
+    const valid = try DecoderStream.encode(.{ .insert_count_increment = 1 }, &valid_buf);
+    var combined: [32]u8 = undefined;
+    @memcpy(combined[0..valid.len], valid);
+    combined[valid.len] = 0x3f;
+    @memset(combined[valid.len + 1 .. valid.len + 12], 0xff);
+
+    var stream = DecoderStream{};
+    var reader = DecoderStreamReader{};
+    defer reader.deinit(testing.allocator);
+
+    try testing.expectError(error.IntegerOverflow, reader.ingest(testing.allocator, &stream, combined[0 .. valid.len + 12]));
+    try testing.expectEqual(@as(u64, 1), stream.known_received_count);
+
+    _ = reader.ingest(testing.allocator, &stream, "") catch {};
+    try testing.expectEqual(@as(u64, 1), stream.known_received_count);
 }
 
 test "dynamic table memory remains bounded under repeated inserts" {

@@ -94,6 +94,8 @@ pub fn Conn(comptime Transport: type) type {
         pending_priority_updates: std.AutoHashMap(u64, priority.Priority),
         /// Client: in-flight response accumulation by stream id.
         responses: std.AutoHashMap(u64, *ClientResponse),
+        peer_goaway_id: ?u64 = null,
+        local_goaway_id: ?u64 = null,
         /// Bidirectional streams the peer opened that we haven't classified.
         metrics: Metrics = .{},
         /// The RFC 9114 code to close the QUIC connection with after a
@@ -111,6 +113,7 @@ pub fn Conn(comptime Transport: type) type {
             priority_invalid_parameters: u64 = 0,
             priority_duplicate_parameters: u64 = 0,
             priority_updates_buffered: u64 = 0,
+            goaway_received: u64 = 0,
         };
 
         const max_pending_priority_updates: usize = 64;
@@ -291,6 +294,10 @@ pub fn Conn(comptime Transport: type) type {
                     // Peer unidirectional stream: classify by type varint.
                     self.pending_uni.put(id, .{}) catch return error.OutOfMemory;
                 } else if (self.role == .server) {
+                    if (!isClientRequestStream(id)) return self.fail(.stream_creation_error);
+                    if (self.local_goaway_id) |limit| {
+                        if (id > limit) return self.fail(.id_error);
+                    }
                     const request = self.allocator.create(ServerRequest) catch return error.OutOfMemory;
                     request.* = .{
                         .stream = session.RequestStream.init(self.allocator, id),
@@ -427,8 +434,24 @@ pub fn Conn(comptime Transport: type) type {
                     if (!self.peer_control_view.saw_settings) return self.fail(.missing_settings);
                     try self.applyPriorityUpdate(transport, raw);
                 },
+                .goaway => {
+                    if (!self.peer_control_view.saw_settings) return self.fail(.missing_settings);
+                    try self.applyGoaway(raw);
+                },
                 else => self.peer_control_view.ingestFrame(raw) catch |err| return self.failControl(err),
             }
+        }
+
+        fn applyGoaway(self: *Self, raw: frame.RawFrame) H3Error!void {
+            const decoded = varint.decode(raw.payload) catch return self.fail(.frame_error);
+            if (decoded.len != raw.payload.len) return self.fail(.frame_error);
+            const id = decoded.value;
+            if (self.role == .client and !isClientRequestStream(id)) return self.fail(.id_error);
+            if (self.peer_goaway_id) |previous| {
+                if (id > previous) return self.fail(.id_error);
+            }
+            self.peer_goaway_id = id;
+            self.metrics.goaway_received += 1;
         }
 
         fn applyPriorityUpdate(self: *Self, transport: *Transport, raw: frame.RawFrame) H3Error!void {
@@ -464,6 +487,8 @@ pub fn Conn(comptime Transport: type) type {
         }
 
         fn pumpRequests(self: *Self, transport: *Transport) H3Error!void {
+            var reset_requests: [32]u64 = undefined;
+            var reset_count: usize = 0;
             var it = self.requests.iterator();
             while (it.next()) |entry| {
                 const id = entry.key_ptr.*;
@@ -472,7 +497,14 @@ pub fn Conn(comptime Transport: type) type {
                 var buf: [2048]u8 = undefined;
                 var qpack_scratch: [4096]u8 = undefined;
                 while (true) {
-                    const result = transport.readStream(id, &buf) catch break;
+                    const result = transport.readStream(id, &buf) catch |err| {
+                        if (err == error.StreamReset) {
+                            if (reset_count == reset_requests.len) return self.fail(.excessive_load);
+                            reset_requests[reset_count] = id;
+                            reset_count += 1;
+                        }
+                        break;
+                    };
                     request.transport_early = request.transport_early or transportStreamTransportEarly(transport, id);
                     if (result.len > 0) {
                         _ = request.stream.ingestBytes(buf[0..result.len], &qpack_scratch) catch |err| {
@@ -489,6 +521,7 @@ pub fn Conn(comptime Transport: type) type {
                     if (result.len == 0) break;
                 }
             }
+            for (reset_requests[0..reset_count]) |id| self.finishRequest(id);
         }
 
         fn applyPendingPriorityUpdate(_: *Self, request: *ServerRequest) void {
@@ -571,6 +604,9 @@ pub fn Conn(comptime Transport: type) type {
         pub fn sendRequest(self: *Self, transport: *Transport, request: Request) !u64 {
             std.debug.assert(self.role == .client);
             const id = try transport.openStream(.bidi);
+            if (self.peer_goaway_id) |limit| {
+                if (id > limit) return self.fail(.id_error);
+            }
 
             var fields_buf: [68]qpack.HeaderField = undefined;
             fields_buf[0] = .{ .name = ":method", .value = request.method };
@@ -731,9 +767,13 @@ pub fn Conn(comptime Transport: type) type {
 
         pub fn sendGoaway(self: *Self, transport: *Transport, stream_id: u64) !void {
             const control = self.control_out orelse return error.MissingControlStream;
+            if (self.local_goaway_id) |previous| {
+                if (stream_id > previous) return self.fail(.id_error);
+            }
             var wire: [32]u8 = undefined;
             const goaway = try session.ResponseEncoder.encodeGoaway(stream_id, &wire);
             try self.writeAll(transport, control, goaway, false);
+            self.local_goaway_id = stream_id;
         }
 
         fn writeAll(self: *Self, transport: *Transport, stream_id: u64, bytes: []const u8, fin: bool) !void {
@@ -966,6 +1006,68 @@ test "H3 conn: sendGoaway writes the selected request boundary on the control st
     try testing.expectEqual(frame.FrameType.goaway, goaway.typ);
     const boundary = try varint.decode(goaway.payload);
     try testing.expectEqual(@as(u64, 4), boundary.value);
+}
+
+test "H3 conn: inbound GOAWAY is monotonic and gates later client requests" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try client.pump(&client_transport);
+
+    var goaway_buf: [16]u8 = undefined;
+    const goaway_4 = try encodeGoawayFrameForTest(4, &goaway_buf);
+    _ = try server_transport.writeStream(server.control_out.?, goaway_4, false);
+    try client.pump(&client_transport);
+    try testing.expectEqual(@as(?u64, 4), client.peer_goaway_id);
+    try testing.expectEqual(@as(u64, 1), client.metrics.goaway_received);
+
+    _ = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/allowed" });
+    _ = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/boundary" });
+    try testing.expectError(error.ProtocolError, client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/rejected" }));
+    try testing.expectEqual(ErrorCode.id_error.wire(), client.closeCode());
+}
+
+test "H3 conn: inbound GOAWAY cannot increase the advertised boundary" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try client.pump(&client_transport);
+
+    var goaway_buf: [16]u8 = undefined;
+    const goaway_4 = try encodeGoawayFrameForTest(4, &goaway_buf);
+    _ = try server_transport.writeStream(server.control_out.?, goaway_4, false);
+    try client.pump(&client_transport);
+
+    const goaway_8 = try encodeGoawayFrameForTest(8, &goaway_buf);
+    _ = try server_transport.writeStream(server.control_out.?, goaway_8, false);
+    try testing.expectError(error.ProtocolError, client.pump(&client_transport));
+    try testing.expectEqual(ErrorCode.id_error.wire(), client.closeCode());
 }
 
 test "H3 conn: polls completed requests by urgency and reports priority" {
@@ -1257,6 +1359,29 @@ test "H3 conn: late PRIORITY_UPDATE updates active response transport hint" {
     try testing.expectEqual(@as(usize, 0), server.pending_priority_updates.count());
 }
 
+test "H3 conn: request stream reset releases request state" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    const request_id = try client_transport.openStream(.bidi);
+    _ = try client_transport.writeStream(request_id, requestHeadersBytes()[0..1], false);
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(u32, 1), server.requests.count());
+
+    try server_transport.resetStreamForTest(request_id);
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(u32, 0), server.requests.count());
+}
+
 test "fuzz: H3 connection state command sequences preserve critical stream and request invariants" {
     try testing.fuzz({}, fuzzH3ConnStateCommands, .{ .corpus = &.{
         "",
@@ -1299,8 +1424,9 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
         const before_close = conn.close_code;
         const before_settings = conn.peer_control_view.saw_settings;
         const before_requests = conn.requests.count();
+        var expected_close: ?ErrorCode = null;
 
-        const result = switch (op % 18) {
+        const result = switch (op % 25) {
             0 => blk: {
                 try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control);
                 break :blk conn.pump(&local_transport);
@@ -1321,31 +1447,38 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                 break :blk conn.pump(&local_transport);
             },
             4 => blk: {
+                expected_close = .stream_creation_error;
                 var duplicate: ?u64 = null;
                 try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &duplicate);
                 break :blk conn.pump(&local_transport);
             },
             5 => blk: {
+                expected_close = if (before_settings) .frame_unexpected else .missing_settings;
                 try writePeerUni(&peer_transport, .control, forbiddenControlDataBytes()[0..], false, &peer_control);
                 break :blk conn.pump(&local_transport);
             },
             6 => blk: {
+                expected_close = if (before_settings) .frame_unexpected else null;
                 try writePeerUni(&peer_transport, .control, duplicateSettingsBytes()[0..], false, &peer_control);
                 break :blk conn.pump(&local_transport);
             },
             7 => blk: {
+                expected_close = .closed_critical_stream;
                 try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], true, &peer_control);
                 break :blk conn.pump(&local_transport);
             },
             8 => blk: {
+                expected_close = .closed_critical_stream;
                 try writePeerUni(&peer_transport, .qpack_encoder, "", true, &peer_qpack_encoder);
                 break :blk conn.pump(&local_transport);
             },
             9 => blk: {
+                expected_close = .closed_critical_stream;
                 if (peer_control) |id| try local_transport.resetStreamForTest(id);
                 break :blk conn.pump(&local_transport);
             },
             10 => blk: {
+                expected_close = if (role == .client) .stream_creation_error else .message_error;
                 if (role == .server) {
                     const id = try peer_transport.openStream(.bidi);
                     peer_request = id;
@@ -1373,6 +1506,7 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                 break :blk conn.pump(&local_transport);
             },
             13 => blk: {
+                expected_close = if (role == .server) .message_error else null;
                 if (role == .server) {
                     const id = peer_request orelse try peer_transport.openStream(.bidi);
                     peer_request = id;
@@ -1381,6 +1515,7 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                 break :blk conn.pump(&local_transport);
             },
             14 => blk: {
+                expected_close = if (role == .server) .message_error else null;
                 if (role == .server) {
                     const id = peer_request orelse try peer_transport.openStream(.bidi);
                     peer_request = id;
@@ -1398,18 +1533,68 @@ fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
                 break :blk conn.pump(&local_transport);
             },
             16 => blk: {
+                expected_close = if (before_settings) null else .missing_settings;
                 try writePeerUni(&peer_transport, .control, goawayBytes()[0..], false, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            17 => blk: {
+                expected_close = .stream_creation_error;
+                var duplicate: ?u64 = null;
+                try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder);
+                try writePeerUni(&peer_transport, .qpack_encoder, "", false, &duplicate);
+                break :blk conn.pump(&local_transport);
+            },
+            18 => blk: {
+                expected_close = .stream_creation_error;
+                var duplicate: ?u64 = null;
+                try writePeerUni(&peer_transport, .qpack_decoder, "", false, &peer_qpack_decoder);
+                try writePeerUni(&peer_transport, .qpack_decoder, "", false, &duplicate);
+                break :blk conn.pump(&local_transport);
+            },
+            19 => blk: {
+                expected_close = .closed_critical_stream;
+                try writePeerUni(&peer_transport, .qpack_decoder, "", true, &peer_qpack_decoder);
+                break :blk conn.pump(&local_transport);
+            },
+            20 => blk: {
+                expected_close = .closed_critical_stream;
+                try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder);
+                if (peer_qpack_encoder) |id| try local_transport.resetStreamForTest(id);
+                break :blk conn.pump(&local_transport);
+            },
+            21 => blk: {
+                if (role == .server) {
+                    const id = peer_request orelse try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    try local_transport.resetStreamForTest(id);
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            22 => blk: {
+                expected_close = if (before_settings) .id_error else .missing_settings;
+                try writePeerUni(&peer_transport, .control, goawayBytes()[0..], false, &peer_control);
+                try writePeerUni(&peer_transport, .control, largerGoawayBytes()[0..], false, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            23 => blk: {
+                expected_close = if (!before_settings) .missing_settings else if (role == .client) .id_error else null;
+                try writePeerUni(&peer_transport, .control, invalidClientGoawayBytes()[0..], false, &peer_control);
                 break :blk conn.pump(&local_transport);
             },
             else => conn.pump(&local_transport),
         };
 
         if (result) |_| {
+            if (expected_close) |code| if (before_close == null) {
+                try testing.expect(conn.close_code != null);
+                try testing.expectEqual(code.wire(), conn.closeCode());
+            };
             try expectH3ConnInvariants(&conn, role, before_settings, before_requests);
         } else |err| {
             try testing.expect(err == error.ProtocolError or err == error.OutOfMemory);
             try testing.expect(conn.close_code != null);
             if (before_close) |code| try testing.expectEqual(code, conn.close_code.?);
+            if (expected_close) |code| if (before_close == null) try testing.expectEqual(code.wire(), conn.closeCode());
         }
     }
 }
@@ -1443,7 +1628,21 @@ fn duplicateSettingsBytes() [4]u8 {
 }
 
 fn goawayBytes() [3]u8 {
-    return .{ 0x07, 0x01, 0x00 };
+    return .{ 0x07, 0x01, 0x04 };
+}
+
+fn encodeGoawayFrameForTest(id: u64, out: []u8) ![]u8 {
+    var payload: [8]u8 = undefined;
+    const payload_len = try varint.encode(id, &payload);
+    return frame.encodeKnownFrame(.goaway, payload[0..payload_len], out);
+}
+
+fn largerGoawayBytes() [3]u8 {
+    return .{ 0x07, 0x01, 0x08 };
+}
+
+fn invalidClientGoawayBytes() [3]u8 {
+    return .{ 0x07, 0x01, 0x01 };
 }
 
 fn dataFrameBytes() [5]u8 {
@@ -1476,7 +1675,8 @@ fn expectH3ConnInvariants(conn: anytype, role: Role, before_settings: bool, befo
         try testing.expect((id & 0x2) != 0);
     }
     try testing.expect(conn.pending_uni.count() <= 32);
-    try testing.expect(conn.requests.count() >= before_requests or role == .client);
+    _ = before_requests;
+    try testing.expect(conn.requests.count() <= 32 or role == .client);
     if (before_settings) try testing.expect(conn.peer_control_view.saw_settings);
     if (conn.peer_control_view.saw_settings) try testing.expect(conn.metrics.settings_received);
 

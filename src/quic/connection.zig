@@ -3338,6 +3338,124 @@ test "stream send queue keeps lost ranges retransmittable across duplicate ACK a
     try testing.expectEqual(Range{ .start = 2, .end = 8 }, queue.retransmit.items.items[0]);
 }
 
+test "fuzz: stream send queue ack loss close command sequences preserve retransmission invariants" {
+    try testing.fuzz({}, fuzzStreamSendQueueCommands, .{ .corpus = &.{
+        "",
+        "\x00\x08abcdefgh\x01\x00\x04\x02\x02\x04\x03\x03\x04",
+        "\x00\x08abcdefgh\x02\x02\x06\x02\x04\x08\x01\x00\x08\x04\x03",
+        "\x00\x04test\x05\x00\x02\x03\x02\x04\x06",
+    } });
+}
+
+fn fuzzStreamSendQueueCommands(_: void, smith: *testing.Smith) !void {
+    var input: [192]u8 = undefined;
+    const len = smith.slice(&input);
+    try runStreamSendQueueCommands(input[0..len]);
+}
+
+fn runStreamSendQueueCommands(input: []const u8) !void {
+    var queue = SendQueue{};
+    defer queue.deinit(testing.allocator);
+
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const op = input[pos];
+        pos += 1;
+        switch (op % 7) {
+            0 => {
+                const take = if (pos < input.len) @min(@as(usize, input[pos] & 0x0f), input.len - pos -| 1) else 0;
+                pos +|= @as(usize, @intFromBool(pos < input.len));
+                if (!queue.reset_sent) {
+                    try queue.data.appendSlice(testing.allocator, input[pos..][0..take]);
+                    const old_reserved = queue.reserved_end;
+                    queue.reserved_end += @intCast(take);
+                    try queue.retransmit.insert(testing.allocator, .{ .start = old_reserved, .end = queue.reserved_end });
+                }
+                pos += take;
+            },
+            1 => {
+                const range = takeQueueRange(input, &pos, queue.reserved_end);
+                try queue.acked.insert(testing.allocator, range);
+                try queue.acked.insert(testing.allocator, range);
+                queue.compact(testing.allocator);
+            },
+            2 => {
+                const range = takeQueueRange(input, &pos, queue.reserved_end);
+                if (!queue.reset_sent) {
+                    try queue.retransmit.insert(testing.allocator, range);
+                    try queue.retransmit.insert(testing.allocator, range);
+                }
+            },
+            3 => {
+                const max_len = if (pos < input.len) @as(u64, input[pos] & 0x0f) else 1;
+                pos +|= @as(usize, @intFromBool(pos < input.len));
+                if (queue.retransmit.takeFirst(@max(max_len, 1))) |lost| {
+                    try testing.expect(lost.start >= queue.base);
+                    if ((op & 0x80) == 0) try queue.retransmit.insert(testing.allocator, lost);
+                }
+            },
+            4 => {
+                if (!queue.reset_sent) {
+                    queue.fin_retransmit = true;
+                    queue.fin_requested = true;
+                    queue.fin_reserved = true;
+                }
+            },
+            5 => {
+                queue.reset_sent = true;
+                queue.retransmit.items.clearRetainingCapacity();
+                queue.fin_retransmit = false;
+            },
+            else => {
+                queue.deinit(testing.allocator);
+                queue = .{};
+            },
+        }
+        try expectSendQueueInvariants(&queue);
+    }
+}
+
+fn takeQueueRange(input: []const u8, pos: *usize, limit: u64) Range {
+    if (limit == 0) return .{ .start = 0, .end = 0 };
+    const start_seed = if (pos.* < input.len) input[pos.*] else 0;
+    pos.* +|= @as(usize, @intFromBool(pos.* < input.len));
+    const len_seed = if (pos.* < input.len) input[pos.*] else 0;
+    pos.* +|= @as(usize, @intFromBool(pos.* < input.len));
+    const start = @min(@as(u64, start_seed), limit);
+    const end = @min(limit, start + @as(u64, len_seed & 0x0f));
+    return .{ .start = start, .end = end };
+}
+
+fn expectSendQueueInvariants(queue: *const SendQueue) !void {
+    try testing.expect(queue.base <= queue.reserved_end);
+    try testing.expect(queue.bufferedEnd() >= queue.base);
+    try testing.expect(queue.start <= queue.data.items.len);
+
+    var previous_end = queue.base;
+    for (queue.retransmit.items.items) |range| {
+        try testing.expect(range.start < range.end);
+        try testing.expect(range.start >= queue.base);
+        try testing.expect(range.end <= queue.reserved_end);
+        try testing.expect(range.start >= previous_end);
+        previous_end = range.end;
+    }
+
+    previous_end = queue.base;
+    for (queue.acked.items.items) |range| {
+        try testing.expect(range.start < range.end);
+        try testing.expect(range.end <= queue.reserved_end);
+        if (range.end <= queue.base) continue;
+        const effective_start = @max(range.start, queue.base);
+        try testing.expect(effective_start >= previous_end);
+        previous_end = range.end;
+    }
+
+    if (queue.reset_sent) {
+        try testing.expect(queue.retransmit.isEmpty());
+        try testing.expect(!queue.fin_retransmit);
+    }
+}
+
 const TestPair = struct {
     client_backend: tls_backend_mod.Tls13Backend,
     server_backend: tls_backend_mod.Tls13Backend,
