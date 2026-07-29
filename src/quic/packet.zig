@@ -418,6 +418,37 @@ test "fuzz: packet number truncation reconstructs recent sends" {
     } });
 }
 
+test "fuzz: packet parser preserves bounded slice and progress invariants" {
+    try testing.fuzz({}, fuzzPacketParserInvariants, .{ .corpus = &.{
+        "",
+        "\x00",
+        "\x40\x01\x02\x03\x04",
+        "\x80\x00\x00\x00\x00",
+        "\x80\x00\x00\x00\x00\x00\x00\x00\x00",
+        "\xc0\x00\x00\x00\x01\x08\x01\x02\x03\x04\x05\x06\x07\x08\x00\x00\x01\x00",
+        "\xd0\x00\x00\x00\x01\x00\x00\x01\x00",
+        "\xe0\x00\x00\x00\x01\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x14",
+        "\xf0\x00\x00\x00\x01\x00\x00abcdefghijklmnop",
+        "\x80\x00\x00\x00\x00\x01a\x01b\x00\x00\x00\x01",
+    } });
+}
+
+test "coalesced parser stops at the first invalid packet without losing progress" {
+    var buf: [128]u8 = undefined;
+    const dcid = [_]u8{0x11} ** 8;
+    const scid = [_]u8{0x22} ** 8;
+    const written = try writeLongHeader(.initial, quic_v1, &dcid, &scid, "", 1, &buf);
+    patchLongHeaderLength(&buf, written.length_offset, 1 + 16);
+    const first_end = written.pn_offset + 1 + 16;
+    @memset(buf[written.pn_offset..first_end], 0xaa);
+    buf[first_end] = 0x80;
+    buf[first_end + 1] = 0x00;
+
+    const parsed = try parsePacket(buf[0 .. first_end + 2], dcid.len);
+    try testing.expectEqual(first_end, parsed.packet_len);
+    try testing.expectError(error.TruncatedPacket, parsePacket(buf[parsed.packet_len .. first_end + 2], dcid.len));
+}
+
 test "long header roundtrips through parsePacket" {
     var buf: [128]u8 = undefined;
     const dcid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
@@ -589,4 +620,51 @@ fn fuzzPacketNumberRoundTrip(_: void, smith: *testing.Smith) !void {
     const bits: u6 = @as(u6, len) * 8;
     try testing.expect(truncated < (@as(u64, 1) << bits));
     try testing.expectEqual(full, decodePacketNumber(largest, truncated, bits));
+}
+
+fn fuzzPacketParserInvariants(_: void, smith: *testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len = smith.slice(&buf);
+    const short_dcid_len = @as(usize, smith.value(u8)) % (max_cid_len + 2);
+    const input = buf[0..len];
+
+    var pos: usize = 0;
+    var parsed_count: usize = 0;
+    while (pos < input.len and parsed_count < 8) : (parsed_count += 1) {
+        const parsed = parsePacket(input[pos..], short_dcid_len) catch return;
+        try expectParsedPacketSlicesWithin(input[pos..], parsed);
+        try testing.expect(parsed.packet_len > 0);
+        try testing.expect(parsed.packet_len <= input.len - pos);
+        pos += parsed.packet_len;
+    }
+    try testing.expect(parsed_count <= 8);
+}
+
+fn expectParsedPacketSlicesWithin(input: []const u8, parsed: ParsedPacket) !void {
+    try expectSliceWithin(input, parsed.dcid);
+    try expectSliceWithin(input, parsed.scid);
+    try expectSliceWithin(input, parsed.token);
+    try expectSliceWithin(input, parsed.retry_token);
+    try expectSliceWithin(input, parsed.retry_tag);
+    try expectSliceWithin(input, parsed.supported_versions);
+    if (parsed.kind != .version_negotiation and parsed.kind != .retry) {
+        try testing.expect(parsed.pn_offset <= parsed.packet_len);
+    }
+    if (parsed.kind == .retry) {
+        try testing.expectEqual(@as(usize, retry_integrity_tag_len), parsed.retry_tag.len);
+    }
+    if (parsed.kind == .version_negotiation) {
+        try testing.expect(parsed.supported_versions.len > 0);
+        try testing.expectEqual(@as(usize, 0), parsed.supported_versions.len % 4);
+    }
+}
+
+fn expectSliceWithin(input: []const u8, slice: []const u8) !void {
+    if (slice.len == 0) return;
+    const input_start = @intFromPtr(input.ptr);
+    const input_end = input_start + input.len;
+    const slice_start = @intFromPtr(slice.ptr);
+    const slice_end = slice_start + slice.len;
+    try testing.expect(slice_start >= input_start);
+    try testing.expect(slice_end <= input_end);
 }
