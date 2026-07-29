@@ -686,12 +686,10 @@ pub const Runtime = struct {
         }
         const ctx = self.retry_tokens.validateRetry(parsed.token, remote, now) catch {
             self.noteInvalidToken();
-            self.logger.info(null, "http3: rejected invalid QUIC Retry token", .{});
             return .drop;
         };
         if (parsed.version != quic.packet.quic_v1 or ctx.quic_version != parsed.version or !std.mem.eql(u8, parsed.dcid, ctx.retry_scid.slice())) {
             self.noteInvalidToken();
-            self.logger.info(null, "http3: rejected QUIC Retry token with mismatched version or Retry SCID", .{});
             return .drop;
         }
         return .{ .accept_validated = ctx };
@@ -714,7 +712,6 @@ pub const Runtime = struct {
         const retry = quic.packet.writeRetryV1(parsed.dcid, parsed.scid, retry_scid.slice(), token, &retry_buf) catch return;
         self.sendDatagram(peer, retry);
         self.noteRetryPacketSent();
-        self.logger.info(null, "http3: issued QUIC Retry for unvalidated Initial", .{});
     }
 
     fn generateRetryScid(self: *Runtime, routes: *quic.cid.CidRoutingTable, cid_len: usize, original_dcid: []const u8) ?quic.cid.ConnectionId {

@@ -545,12 +545,17 @@ pub const PathDecision = union(enum) {
     /// Migration policy forbids this address change: the caller drops state
     /// changes for this tuple (packets themselves stay processed on the
     /// active path per RFC 9000 §9.1 server behavior for disabled migration).
-    blocked,
+    blocked: BlockedPath,
 };
 
 pub const PathProbe = struct {
     data: [path_challenge_len]u8,
     change: AddressChange,
+};
+
+pub const BlockedPath = struct {
+    change: AddressChange,
+    first_observation: bool,
 };
 
 /// A candidate path whose PATH_RESPONSE validated, returned by
@@ -728,12 +733,13 @@ pub const PathManager = struct {
             // reaches while blocked).
             if (self.find(key)) |index| {
                 self.paths[index].?.anti_amplification.recordReceived(authenticated_bytes);
+                return .{ .blocked = .{ .change = change, .first_observation = false } };
             } else {
                 const slot = self.claimSlot();
                 self.paths[slot] = .{ .key = key, .state = .unvalidated, .change = change };
                 self.paths[slot].?.anti_amplification.recordReceived(authenticated_bytes);
+                return .{ .blocked = .{ .change = change, .first_observation = true } };
             }
-            return .blocked;
         }
 
         if (self.find(key)) |index| {
@@ -1291,14 +1297,21 @@ test "path validation fails deterministically when the challenge expires" {
 test "migration policy gates rebinding and migration separately" {
     // disabled: even a port-only rebinding is blocked.
     var disabled = PathManager.init(.disabled, testKey(50_000), true);
-    try testing.expectEqual(PathDecision.blocked, disabled.onDatagram(testKey(50_001), 1_200, test_challenge, 0));
-    try testing.expectEqual(@as(u64, 1), disabled.metrics.migrations_blocked);
+    const disabled_blocked = disabled.onDatagram(testKey(50_001), 1_200, test_challenge, 0).blocked;
+    try testing.expectEqual(AddressChange.nat_rebinding, disabled_blocked.change);
+    try testing.expect(disabled_blocked.first_observation);
+    const disabled_repeat = disabled.onDatagram(testKey(50_001), 1_200, test_challenge, 0).blocked;
+    try testing.expectEqual(AddressChange.nat_rebinding, disabled_repeat.change);
+    try testing.expect(!disabled_repeat.first_observation);
+    try testing.expectEqual(@as(u64, 2), disabled.metrics.migrations_blocked);
 
     // nat_rebinding_only: port change probes, host change is blocked.
     var rebind_only = PathManager.init(.nat_rebinding_only, testKey(50_000), true);
     const probe = rebind_only.onDatagram(testKey(50_001), 1_200, test_challenge, 0);
     try testing.expectEqualSlices(u8, &test_challenge, &probe.probe.data);
-    try testing.expectEqual(PathDecision.blocked, rebind_only.onDatagram(testKeyOtherHost(50_000), 1_200, test_challenge, 0));
+    const migration_blocked = rebind_only.onDatagram(testKeyOtherHost(50_000), 1_200, test_challenge, 0).blocked;
+    try testing.expectEqual(AddressChange.migration, migration_blocked.change);
+    try testing.expect(migration_blocked.first_observation);
     try testing.expectEqual(@as(u64, 1), rebind_only.metrics.migrations_blocked);
 
     // full: both probe.
@@ -1544,7 +1557,8 @@ test "a policy-blocked tuple still gets its own anti-amplification ledger, never
     const blocked = testKeyOtherHost(50_001);
 
     const decision = manager.onDatagram(blocked, 100, test_challenge, 0);
-    try testing.expectEqual(PathDecision.blocked, decision);
+    try testing.expectEqual(AddressChange.migration, decision.blocked.change);
+    try testing.expect(decision.blocked.first_observation);
     try testing.expectEqual(@as(u64, 1), manager.metrics.migrations_blocked);
     try testing.expectEqual(@as(u64, 0), manager.metrics.path_challenges_sent);
 

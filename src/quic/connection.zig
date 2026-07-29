@@ -1231,12 +1231,10 @@ pub const Connection = struct {
                     self.queueCandidateChallenge(ingress_path, probe.data);
                     self.events.emit(.{ .path_validation_started = .{ .path = ingress_path, .change = probe.change } });
                 },
-                .blocked => {
-                    const change = if (ingress_path.remote.sameHost(self.paths.activePath().key.remote))
-                        quic_path.AddressChange.nat_rebinding
-                    else
-                        quic_path.AddressChange.migration;
-                    self.events.emit(.{ .path_migration_blocked = .{ .path = ingress_path, .change = change, .reason = .policy } });
+                .blocked => |blocked| {
+                    if (blocked.first_observation) {
+                        self.events.emit(.{ .path_migration_blocked = .{ .path = ingress_path, .change = blocked.change, .reason = .policy } });
+                    }
                 },
                 .on_active_path, .probing, .validated_pending_promotion => {},
             }
