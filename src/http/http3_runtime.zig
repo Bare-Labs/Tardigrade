@@ -99,6 +99,7 @@ pub const Config = struct {
 const max_connections: usize = 1024;
 const max_connections_per_source: u32 = 32;
 const handshake_timeout_us: u64 = 10 * std.time.us_per_s;
+const cid_generation_retries: usize = 16;
 
 const ParkedH3Retry = struct {
     stream_id: u64,
@@ -154,6 +155,8 @@ const ConnEntry = struct {
     /// Monotonic microseconds when the connection was accepted; used to reap
     /// connections that never complete the handshake.
     accepted_at_us: u64,
+    owned_cids: [quic.cid.max_local_active_cids]quic.cid.ConnectionId = undefined,
+    owned_cid_count: usize = 0,
     /// Set exactly once this connection has attempted post-handshake ticket
     /// issuance (successfully or not) — issuance is best-effort and must
     /// never be retried on the same connection (#488).
@@ -190,6 +193,7 @@ pub const Runtime = struct {
     /// `zero_rtt_enabled` gate and whether `accept()` installs a server
     /// early-data policy on new connections' TLS backends.
     zero_rtt_enabled: bool,
+    stateless_reset_key: [32]u8,
     quic_config: quic.config.Config,
     h3_settings: http3.frame.Settings,
     h3_application_compat: [http3.early_data.encoded_snapshot_len]u8 = undefined,
@@ -245,6 +249,7 @@ pub const Runtime = struct {
             .resumption_runtime = cfg.resumption_runtime,
             .early_data_replay_gate = cfg.early_data_replay_gate,
             .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
+            .stateless_reset_key = undefined,
             .quic_config = quicConfigFrom(cfg),
             .h3_settings = cfg.h3_settings,
             .early_data_compat_metrics_ctx = cfg.early_data_compat_metrics_ctx,
@@ -256,6 +261,7 @@ pub const Runtime = struct {
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
         };
+        compat.randomBytes(&runtime.stateless_reset_key);
         http3.frame.validateLocallySupportedSettings(runtime.h3_settings) catch return error.InvalidH3Settings;
         runtime.h3_application_compat_len = (http3.early_data.encodeSettingsSnapshot(
             runtime.h3_settings,
@@ -339,6 +345,8 @@ pub const Runtime = struct {
                 while (it.next()) |kv| {
                     const entry = kv.value_ptr.*;
                     entry.conn.onTimeout(now);
+                    self.syncCidRoutes(entry, &routes);
+                    self.maintainLocalCidRoutes(entry, kv.key_ptr.*, &routes);
                     while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
                         self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
                     }
@@ -451,6 +459,8 @@ pub const Runtime = struct {
             if (freshly_accepted) self.removeConnection(connections, routes, per_ip, found);
             return;
         };
+        self.syncCidRoutes(entry, routes);
+        self.maintainLocalCidRoutes(entry, found, routes);
         const authenticated = entry.conn.metrics.packets_received > packets_before;
         switch (classifyIngest(freshly_accepted, authenticated, !active_before.remote.eql(ingress_remote))) {
             // A just-accepted connection whose first datagram authenticates
@@ -568,6 +578,7 @@ pub const Runtime = struct {
             .tls = backend.backend(),
             .now_us = now,
             .initial_path = .{ .local = self.local_address, .remote = addressFromSockaddrIn(peer) },
+            .stateless_reset_key = self.stateless_reset_key,
             .events = .{ .context = self, .emitFn = quicConnectionEvent },
         }) catch {
             allocator.destroy(backend);
@@ -595,6 +606,8 @@ pub const Runtime = struct {
             allocator.destroy(entry);
             return null;
         };
+        entry.owned_cids[0] = cid;
+        entry.owned_cid_count = 1;
         routes.insert(cid, handle) catch {
             entry.deinit(allocator);
             allocator.destroy(entry);
@@ -627,11 +640,50 @@ pub const Runtime = struct {
         handle: u64,
     ) void {
         if (connections.fetchRemove(handle)) |kv| {
-            routes.remove(quic.cid.ConnectionId.init(kv.value.conn.localCid()) catch unreachable);
+            for (kv.value.owned_cids[0..kv.value.owned_cid_count]) |cid| routes.remove(cid);
             decPerIp(per_ip, kv.value.admission_source_ip);
             kv.value.deinit(self.allocator);
             self.allocator.destroy(kv.value);
             self.noteConnectionClosed();
+        }
+    }
+
+    fn syncCidRoutes(self: *Runtime, entry: *ConnEntry, routes: *quic.cid.CidRoutingTable) void {
+        _ = self;
+        var active: [quic.cid.max_local_active_cids]quic.cid.ConnectionId = undefined;
+        const active_count = entry.conn.copyActiveLocalCids(&active);
+        var i: usize = 0;
+        while (i < entry.owned_cid_count) {
+            if (!cidSliceContains(active[0..active_count], entry.owned_cids[i])) {
+                routes.remove(entry.owned_cids[i]);
+                entry.owned_cids[i] = entry.owned_cids[entry.owned_cid_count - 1];
+                entry.owned_cid_count -= 1;
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    fn maintainLocalCidRoutes(self: *Runtime, entry: *ConnEntry, handle: u64, routes: *quic.cid.CidRoutingTable) void {
+        _ = self;
+        while (entry.conn.needsLocalCid() and entry.owned_cid_count < entry.owned_cids.len) {
+            var cid_value: ?quic.cid.ConnectionId = null;
+            var entropy: [quic.udp.MaxConnectionIdLen]u8 = undefined;
+            for (0..cid_generation_retries) |_| {
+                compat.randomBytes(&entropy);
+                const candidate = quic.cid.generateCid(&entropy, @intCast(entry.cid_len)) catch return;
+                if (routes.contains(candidate)) continue;
+                cid_value = candidate;
+                break;
+            }
+            const cid = cid_value orelse return;
+            routes.insert(cid, handle) catch return;
+            entry.conn.advertiseLocalCid(cid) catch {
+                routes.remove(cid);
+                return;
+            };
+            entry.owned_cids[entry.owned_cid_count] = cid;
+            entry.owned_cid_count += 1;
         }
     }
 
@@ -1186,6 +1238,13 @@ fn decPerIp(per_ip: *std.AutoHashMap(u32, u32), addr: u32) void {
         count.* -= 1;
         if (count.* == 0) _ = per_ip.remove(addr);
     }
+}
+
+fn cidSliceContains(cids: []const quic.cid.ConnectionId, needle: quic.cid.ConnectionId) bool {
+    for (cids) |cid| {
+        if (std.mem.eql(u8, cid.slice(), needle.slice())) return true;
+    }
+    return false;
 }
 
 /// Create a non-blocking, close-on-exec UDP socket for `sa_family`. Returns a

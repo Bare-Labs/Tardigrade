@@ -248,6 +248,9 @@ pub const Options = struct {
     /// server's initial path stays amplification-limited until the
     /// handshake completes unless this is true.
     initial_address_validated: bool = false,
+    /// Process-lifetime stateless reset secret supplied by the runtime. The
+    /// transport derives a token for every locally issued CID from this key.
+    stateless_reset_key: [32]u8 = [_]u8{0} ** 32,
 };
 
 // ---------------------------------------------------------------------------
@@ -603,6 +606,7 @@ const SentRecord = struct {
     carried_handshake_done: bool = false,
     carried_reset_stream: ?quic_stream.ResetStreamFrame = null,
     carried_stop_sending: ?quic_stream.StopSendingFrame = null,
+    carried_new_connection_id: ?quic_cid.NewConnectionIdFrame = null,
     /// PATH_CHALLENGE re-arms on loss; PATH_RESPONSE does not (the peer
     /// re-challenges, RFC 9000 §8.2.2). Both force datagram expansion.
     /// Non-null when this record carried a PATH_CHALLENGE for the given
@@ -666,6 +670,8 @@ pub const Connection = struct {
     original_dcid: config.CidValue,
     retry_scid: ?config.CidValue = null,
     retry_token: std.ArrayList(u8) = .empty,
+    local_cids: ?quic_cid.LocalCidRegistry = null,
+    stateless_reset_key: [32]u8,
     peer_cids: quic_cid.PeerCidPool,
 
     streams: ?quic_stream.StreamManager = null,
@@ -715,6 +721,7 @@ pub const Connection = struct {
     pending_resets: std.ArrayList(quic_stream.ResetStreamFrame) = .empty,
     pending_stop_sending: std.ArrayList(quic_stream.StopSendingFrame) = .empty,
     pending_retires: std.ArrayList(u64) = .empty,
+    pending_new_connection_ids: std.ArrayList(quic_cid.NewConnectionIdFrame) = .empty,
     pending_path_responses: std.ArrayList(PendingPathResponse) = .empty,
     /// Candidate paths currently being validated (RFC 9000 §8.2), keyed by
     /// path so multiple concurrent probes (bounded by `quic_path.max_paths`)
@@ -750,6 +757,7 @@ pub const Connection = struct {
             else
                 .{},
             .original_dcid = try config.CidValue.init(options.original_dcid),
+            .stateless_reset_key = options.stateless_reset_key,
             .peer_cids = quic_cid.PeerCidPool.init(params.active_connection_id_limit),
             .send_queues = std.AutoHashMap(StreamId, *SendQueue).init(allocator),
             .known_streams = std.AutoHashMap(StreamId, void).init(allocator),
@@ -782,6 +790,7 @@ pub const Connection = struct {
         };
         if (options.role == .server) {
             binding.original_destination_connection_id = conn.original_dcid;
+            binding.stateless_reset_token = quic_cid.statelessResetToken(options.stateless_reset_key, conn.local_cid.slice());
         }
         options.tls.setCidBinding(binding);
 
@@ -843,6 +852,7 @@ pub const Connection = struct {
         self.pending_resets.deinit(self.allocator);
         self.pending_stop_sending.deinit(self.allocator);
         self.pending_retires.deinit(self.allocator);
+        self.pending_new_connection_ids.deinit(self.allocator);
         self.pending_path_responses.deinit(self.allocator);
         self.candidate_challenges.deinit(self.allocator);
         self.retry_token.deinit(self.allocator);
@@ -883,6 +893,47 @@ pub const Connection = struct {
     /// The connection ID the peer routes to us with (for endpoint routing).
     pub fn localCid(self: *const Connection) []const u8 {
         return self.local_cid.slice();
+    }
+
+    pub fn activeLocalCidCount(self: *const Connection) usize {
+        if (self.local_cids) |registry| return registry.activeCount();
+        return 1;
+    }
+
+    pub fn copyActiveLocalCids(self: *const Connection, out: []quic_cid.ConnectionId) usize {
+        var count: usize = 0;
+        if (self.local_cids) |registry| {
+            for (registry.entries) |entry| {
+                if (entry) |value| {
+                    if (count == out.len) return count;
+                    out[count] = value.cid;
+                    count += 1;
+                }
+            }
+            return count;
+        }
+        if (out.len > 0) {
+            out[0] = quic_cid.ConnectionId.init(self.local_cid.slice()) catch return 0;
+            return 1;
+        }
+        return 0;
+    }
+
+    pub fn needsLocalCid(self: *const Connection) bool {
+        if (self.state_ != .established) return false;
+        const registry = if (self.local_cids) |*registry| registry else return false;
+        const target = @min(@as(usize, 2), @as(usize, @intCast(registry.active_limit)));
+        return registry.activeCount() < target;
+    }
+
+    pub fn advertiseLocalCid(self: *Connection, cid_value: quic_cid.ConnectionId) error{ CidLimitExceeded, DuplicateCid, OutOfMemory }!void {
+        const registry = if (self.local_cids) |*registry| registry else return error.CidLimitExceeded;
+        const ncid = registry.issueCid(cid_value) catch |err| switch (err) {
+            error.CidLimitExceeded => return error.CidLimitExceeded,
+            error.DuplicateCid => return error.DuplicateCid,
+        };
+        errdefer _ = registry.retire(.{ .sequence = ncid.sequence }) catch null;
+        try self.pending_new_connection_ids.append(self.allocator, ncid);
     }
 
     fn setState(self: *Connection, next: State) void {
@@ -984,10 +1035,10 @@ pub const Connection = struct {
             self.dropPacket(.unsupported_version, bytes.len);
             return;
         }
-        if (!std.mem.eql(u8, parsed.dcid, self.local_cid.slice())) {
+        const local_cid_sequence = self.localCidSequence(parsed.dcid) orelse {
             self.dropPacket(.unknown_cid, bytes.len);
             return;
-        }
+        };
 
         const level: EncryptionLevel = switch (parsed.kind) {
             .initial => .initial,
@@ -1174,7 +1225,7 @@ pub const Connection = struct {
                 };
                 const f = decoded orelse break;
                 if (f.isAckEliciting()) ack_eliciting = true;
-                try self.applyFrame(level, f, ingress_path, now_us);
+                try self.applyFrame(level, f, ingress_path, local_cid_sequence, now_us);
                 if (self.state_ == .closed or self.state_ == .draining) return;
                 if (self.state_ == .closing) break;
             }
@@ -1195,7 +1246,14 @@ pub const Connection = struct {
         }
     }
 
-    fn applyFrame(self: *Connection, level: EncryptionLevel, f: frame.Frame, ingress_path: quic_path.PathKey, now_us: u64) IngestError!void {
+    fn localCidSequence(self: *const Connection, dcid: []const u8) ?u64 {
+        const parsed = quic_cid.ConnectionId.init(dcid) catch return null;
+        if (self.local_cids) |registry| return registry.sequenceForCid(parsed);
+        if (std.mem.eql(u8, dcid, self.local_cid.slice())) return 0;
+        return null;
+    }
+
+    fn applyFrame(self: *Connection, level: EncryptionLevel, f: frame.Frame, ingress_path: quic_path.PathKey, local_cid_sequence: u64, now_us: u64) IngestError!void {
         if (!frameAllowedAtLevel(level, f)) {
             self.startClose(.{ .error_code = error_protocol_violation, .is_application = false, .local = true }, "0-rtt frame level", now_us);
             return;
@@ -1320,9 +1378,21 @@ pub const Connection = struct {
                 // waiting for another challenge round trip.
                 if (self.paths.pendingPromotionCandidate()) |candidate| self.tryPromote(candidate);
             },
-            .retire_connection_id => {
-                // We never issue additional CIDs, so there is nothing to
-                // retire; tolerate the frame (it can only name sequence 0).
+            .retire_connection_id => |retire| {
+                if (retire.sequence == local_cid_sequence) {
+                    self.startClose(.{ .error_code = error_protocol_violation, .is_application = false, .local = true }, "retire active cid", now_us);
+                    return;
+                }
+                const registry = if (self.local_cids) |*registry| registry else {
+                    if (retire.sequence == 0) return;
+                    self.startClose(.{ .error_code = error_protocol_violation, .is_application = false, .local = true }, "RETIRE_CONNECTION_ID", now_us);
+                    return;
+                };
+                const retired = registry.retire(retire) catch {
+                    self.startClose(.{ .error_code = error_protocol_violation, .is_application = false, .local = true }, "RETIRE_CONNECTION_ID", now_us);
+                    return;
+                };
+                _ = retired;
             },
             .path_challenge => |data| {
                 // Echo on the exact path the challenge arrived on (RFC 9000
@@ -1502,6 +1572,9 @@ pub const Connection = struct {
         }
         if (record.carried_stop_sending) |stop| {
             self.pending_stop_sending.append(self.allocator, stop) catch {};
+        }
+        if (record.carried_new_connection_id) |ncid| {
+            self.pending_new_connection_ids.append(self.allocator, ncid) catch {};
         }
         if (record.carried_path_challenge_path) |path| {
             for (self.candidate_challenges.items) |*candidate| {
@@ -1828,6 +1901,18 @@ pub const Connection = struct {
             self.startClose(.{ .error_code = error_transport_parameter, .is_application = false, .local = true }, "missing peer params", now_us);
             return;
         };
+        if (self.local_cids == null) {
+            var registry = quic_cid.LocalCidRegistry.init(peer_params.active_connection_id_limit, self.stateless_reset_key);
+            const initial = quic_cid.ConnectionId.init(self.local_cid.slice()) catch {
+                self.startClose(.{ .error_code = error_internal, .is_application = false, .local = true }, "local cid registry", now_us);
+                return;
+            };
+            _ = registry.registerInitial(initial) catch {
+                self.startClose(.{ .error_code = error_internal, .is_application = false, .local = true }, "local cid registry", now_us);
+                return;
+            };
+            self.local_cids = registry;
+        }
         if (self.streams) |*manager| {
             // 0-RTT already brought the stream layer up early with a
             // zero-send-credit placeholder peer side (see
@@ -2760,6 +2845,7 @@ pub const Connection = struct {
         if (self.pending_resets.items.len > 0) return true;
         if (self.pending_stop_sending.items.len > 0) return true;
         if (self.pending_retires.items.len > 0) return true;
+        if (self.pending_new_connection_ids.items.len > 0) return true;
         if (self.hasActivePathResponsePending()) return true;
         var it = self.send_queues.iterator();
         while (it.next()) |entry| {
@@ -2825,6 +2911,14 @@ pub const Connection = struct {
             plain_len += n;
             record.ack_eliciting = true;
             _ = self.pending_retires.orderedRemove(0);
+        }
+        while (self.pending_new_connection_ids.items.len > 0) {
+            const ncid = self.pending_new_connection_ids.items[0];
+            const n = frame.encodeNewConnectionId(ncid, plain[plain_len..budget]) catch break;
+            plain_len += n;
+            record.ack_eliciting = true;
+            record.carried_new_connection_id = ncid;
+            _ = self.pending_new_connection_ids.orderedRemove(0);
         }
         // Only a PATH_RESPONSE queued for the active path rides along with
         // ordinary content; one queued for a candidate path is sent in
@@ -3377,7 +3471,7 @@ test "driver: explicit zero-rtt stream provenance mark stays sticky after one-rt
     try pair.server.markStreamZeroRtt(id);
     try testing.expect(pair.server.streamTransportEarly(id));
 
-    try pair.server.applyFrame(.application, .{ .stream = .{ .id = id, .offset = 0, .data = "late", .fin = true } }, TestPair.server_path, pair.now_us);
+    try pair.server.applyFrame(.application, .{ .stream = .{ .id = id, .offset = 0, .data = "late", .fin = true } }, TestPair.server_path, 0, pair.now_us);
     try testing.expect(pair.server.streamTransportEarly(id));
     try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
 
@@ -3567,7 +3661,7 @@ test "driver: 0-RTT stream provenance survives reassembly, duplicate delivery, a
 
     // Later 1-RTT bytes on the same stream must not retroactively lose the
     // sticky early marking, and read correctly alongside the early bytes.
-    try pair.server.applyFrame(.application, .{ .stream = .{ .id = 0, .offset = 5, .data = "!", .fin = true } }, TestPair.server_path, pair.now_us);
+    try pair.server.applyFrame(.application, .{ .stream = .{ .id = 0, .offset = 5, .data = "!", .fin = true } }, TestPair.server_path, 0, pair.now_us);
     try testing.expect(pair.server.streamTransportEarly(0));
     const late_read = try pair.server.readStream(0, &buf);
     try testing.expectEqualStrings("!", buf[0..late_read.len]);
@@ -3727,7 +3821,7 @@ test "driver: frames illegal in 0-RTT close the connection instead of taking eff
             .ranges = .{},
             .ack_delay_raw = 0,
             .largest_acknowledged = 0,
-        } }, TestPair.server_path, pair.now_us);
+        } }, TestPair.server_path, 0, pair.now_us);
         try testing.expectEqual(State.closing, pair.server.state());
         try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
     }
@@ -3741,7 +3835,7 @@ test "driver: frames illegal in 0-RTT close the connection instead of taking eff
     {
         var pair = try TestPair.init(allocator);
         defer pair.deinit(allocator);
-        try pair.server.applyFrame(.zero_rtt, .{ .crypto = .{ .offset = 0, .data = "x" } }, TestPair.server_path, pair.now_us);
+        try pair.server.applyFrame(.zero_rtt, .{ .crypto = .{ .offset = 0, .data = "x" } }, TestPair.server_path, 0, pair.now_us);
         try testing.expectEqual(State.closing, pair.server.state());
         try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
     }
@@ -3749,7 +3843,7 @@ test "driver: frames illegal in 0-RTT close the connection instead of taking eff
     {
         var pair = try TestPair.init(allocator);
         defer pair.deinit(allocator);
-        try pair.server.applyFrame(.zero_rtt, .{ .new_token = .{ .token = "t" } }, TestPair.server_path, pair.now_us);
+        try pair.server.applyFrame(.zero_rtt, .{ .new_token = .{ .token = "t" } }, TestPair.server_path, 0, pair.now_us);
         try testing.expectEqual(State.closing, pair.server.state());
         try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
     }
@@ -3757,7 +3851,7 @@ test "driver: frames illegal in 0-RTT close the connection instead of taking eff
     {
         var pair = try TestPair.init(allocator);
         defer pair.deinit(allocator);
-        try pair.server.applyFrame(.zero_rtt, .{ .retire_connection_id = .{ .sequence = 0 } }, TestPair.server_path, pair.now_us);
+        try pair.server.applyFrame(.zero_rtt, .{ .retire_connection_id = .{ .sequence = 0 } }, TestPair.server_path, 0, pair.now_us);
         try testing.expectEqual(State.closing, pair.server.state());
         try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
     }
@@ -3765,7 +3859,7 @@ test "driver: frames illegal in 0-RTT close the connection instead of taking eff
     {
         var pair = try TestPair.init(allocator);
         defer pair.deinit(allocator);
-        try pair.server.applyFrame(.zero_rtt, .{ .path_response = [_]u8{0} ** frame.path_data_len }, TestPair.server_path, pair.now_us);
+        try pair.server.applyFrame(.zero_rtt, .{ .path_response = [_]u8{0} ** frame.path_data_len }, TestPair.server_path, 0, pair.now_us);
         try testing.expectEqual(State.closing, pair.server.state());
         try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
     }
@@ -3773,7 +3867,7 @@ test "driver: frames illegal in 0-RTT close the connection instead of taking eff
     {
         var pair = try TestPair.init(allocator);
         defer pair.deinit(allocator);
-        try pair.server.applyFrame(.zero_rtt, .handshake_done, TestPair.server_path, pair.now_us);
+        try pair.server.applyFrame(.zero_rtt, .handshake_done, TestPair.server_path, 0, pair.now_us);
         try testing.expectEqual(State.closing, pair.server.state());
         try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
     }
@@ -5711,6 +5805,58 @@ test "connection: a path validation deadline is folded into nextTimeoutUs and ex
     try testing.expectEqual(quic_path.PathState.failed, pair.server.paths.stateOf(rebind_candidate).?);
 }
 
+test "connection: local CID registry maintains a spare and accepts packets addressed to it" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    try testing.expect(pair.server.needsLocalCid());
+    const spare = try quic_cid.ConnectionId.init(&.{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 });
+    try pair.server.advertiseLocalCid(spare);
+    try testing.expect(!pair.server.needsLocalCid());
+    try testing.expectEqual(@as(?u64, 1), pair.server.localCidSequence(spare.slice()));
+
+    pair.client.peer_cid = try config.CidValue.init(spare.slice());
+    const id = try pair.client.openStream(.bidi);
+    try testing.expectEqual(@as(usize, 5), try pair.client.writeStream(id, "spare", false));
+
+    var out: [2048]u8 = undefined;
+    const t = pair.client.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    const parsed = packet.parsePacket(t.bytes, spare.len) catch return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, spare.slice(), parsed.dcid);
+
+    const before = pair.server.metrics.packets_received;
+    try pair.server.ingestOnPath(t.bytes, TestPair.server_path, TestPair.test_challenge_entropy, pair.now_us);
+    try testing.expect(pair.server.metrics.packets_received > before);
+}
+
+test "connection: lost NEW_CONNECTION_ID retransmits the same frame identity" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const spare = try quic_cid.ConnectionId.init(&.{ 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8 });
+    try pair.server.advertiseLocalCid(spare);
+
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    const first_record = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
+    const first = first_record.carried_new_connection_id orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u64, 1), first.sequence);
+    try testing.expectEqualSlices(u8, spare.slice(), first.cid.slice());
+
+    pair.server.requeueRecord(first_record);
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us + 1_000) orelse return error.TestExpectedEqual;
+    const second_record = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
+    const second = second_record.carried_new_connection_id orelse return error.TestExpectedEqual;
+    try testing.expectEqual(first.sequence, second.sequence);
+    try testing.expectEqual(first.retire_prior_to, second.retire_prior_to);
+    try testing.expectEqualSlices(u8, first.cid.slice(), second.cid.slice());
+    try testing.expectEqualSlices(u8, &first.stateless_reset_token, &second.stateless_reset_token);
+}
+
 test "driver: idle timeout closes silently" {
     const allocator = testing.allocator;
     var pair = try TestPair.init(allocator);
@@ -5794,7 +5940,7 @@ fn expectConnectionRejectsExtraCryptoWhileClientAuthPending(async_sign: bool) !v
     const stray = [_]u8{@intFromEnum(tls_core.handshake.MessageType.finished)};
     const handshake_index = @intFromEnum(EncryptionLevel.handshake);
     const offset = pair.client.adapter.reassembler.streams[handshake_index].consumed_offset;
-    try pair.client.applyFrame(.handshake, .{ .crypto = .{ .offset = offset, .data = &stray } }, TestPair.client_path, pair.now_us);
+    try pair.client.applyFrame(.handshake, .{ .crypto = .{ .offset = offset, .data = &stray } }, TestPair.client_path, 0, pair.now_us);
 
     try testing.expect(!pair.client.authPending());
     try testing.expectEqual(tls_handshake.HandshakeError.UnexpectedHandshakeMessage, pair.client.handshakeFailure().?);

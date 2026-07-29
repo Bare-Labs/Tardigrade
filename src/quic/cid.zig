@@ -170,6 +170,13 @@ pub const LocalCidRegistry = struct {
     /// more CIDs than the peer's limit).
     pub fn issue(self: *LocalCidRegistry, entropy: []const u8, cid_len: u8) !NewConnectionIdFrame {
         const cid = try generateCid(entropy, cid_len);
+        return try self.issueCid(cid);
+    }
+
+    /// Issue a caller-generated CID. Production endpoints use this
+    /// transactional form so a route table entry can be reserved before the
+    /// exact CID is queued in a NEW_CONNECTION_ID frame.
+    pub fn issueCid(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!NewConnectionIdFrame {
         const entry = try self.store(cid);
         self.metrics.cids_issued += 1;
         return .{
@@ -232,6 +239,24 @@ pub const LocalCidRegistry = struct {
         for (self.entries) |entry| {
             if (entry) |value| {
                 if (value.sequence == sequence) return value;
+            }
+        }
+        return null;
+    }
+
+    pub fn containsCid(self: *const LocalCidRegistry, cid: ConnectionId) bool {
+        for (self.entries) |entry| {
+            if (entry) |value| {
+                if (std.mem.eql(u8, value.cid.slice(), cid.slice())) return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn sequenceForCid(self: *const LocalCidRegistry, cid: ConnectionId) ?u64 {
+        for (self.entries) |entry| {
+            if (entry) |value| {
+                if (std.mem.eql(u8, value.cid.slice(), cid.slice())) return value.sequence;
             }
         }
         return null;
