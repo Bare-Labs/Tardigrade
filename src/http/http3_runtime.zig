@@ -34,6 +34,10 @@ const Connection = quic.connection.Connection;
 const H3 = http3.conn.Conn(Connection);
 const posix = std.posix;
 
+pub const StreamRequest = http3_session.StreamRequest;
+pub const Response = response_mod.Response;
+pub const Logger = logger_mod.Logger;
+
 pub const Http3RuntimeError = error{
     OutOfMemory,
     DependencyUnavailable,
@@ -524,7 +528,6 @@ pub const Runtime = struct {
         now: u64,
     ) ?u64 {
         const credential_provider = self.credential_provider orelse return null;
-        if (parsed.version != quic.packet.quic_v1) return null;
         if (parsed.dcid.len < 8 or parsed.scid.len == 0) return null;
         const retry_context: ?quic.path.RetryContext = switch (self.classifyRetry(routes, parsed, peer, now)) {
             .accept_unvalidated => null,
@@ -672,9 +675,12 @@ pub const Runtime = struct {
         peer: std.c.sockaddr.in,
         now: u64,
     ) RetryAcceptDecision {
-        if (self.retry_policy == .off) return .accept_unvalidated;
+        if (self.retry_policy == .off) {
+            return if (parsed.version == quic.packet.quic_v1) .accept_unvalidated else .drop;
+        }
         const remote = addressFromSockaddrIn(peer);
         if (parsed.token.len == 0) {
+            if (parsed.version != quic.packet.quic_v1) return .drop;
             self.issueRetry(routes, parsed, peer, remote, now);
             return .drop;
         }
@@ -683,7 +689,7 @@ pub const Runtime = struct {
             self.logger.info(null, "http3: rejected invalid QUIC Retry token", .{});
             return .drop;
         };
-        if (ctx.quic_version != parsed.version or !std.mem.eql(u8, parsed.dcid, ctx.retry_scid.slice())) {
+        if (parsed.version != quic.packet.quic_v1 or ctx.quic_version != parsed.version or !std.mem.eql(u8, parsed.dcid, ctx.retry_scid.slice())) {
             self.noteInvalidToken();
             self.logger.info(null, "http3: rejected QUIC Retry token with mismatched version or Retry SCID", .{});
             return .drop;
@@ -1107,10 +1113,9 @@ pub const Runtime = struct {
     /// connection into the composition root's metrics — without this,
     /// `accept()` would construct connections with no `EventSink` at all
     /// and the typed TLS decision / per-packet 0-RTT outcomes would be
-    /// silently discarded. Only forwards the two 0-RTT-specific event
-    /// variants; every other `Connection.Event` (packet_received,
-    /// handshake_complete, path_validated, ...) is intentionally not this
-    /// function's concern.
+    /// silently discarded. Path lifecycle events are logged with bounded
+    /// enum/family context only; no connection IDs, tokens, packet payloads,
+    /// or IP addresses are emitted.
     fn quicConnectionEvent(ctx: ?*anyopaque, event: quic.connection.Event) void {
         const self: *Runtime = @ptrCast(@alignCast(ctx.?));
         switch (event) {
@@ -1139,6 +1144,37 @@ pub const Runtime = struct {
                     .malformed => .malformed,
                 };
                 self.recordQuicZeroRttPacket(mapped);
+            },
+            .path_validation_started => |path| {
+                self.logger.info(null, "http3: QUIC path validation started change={s} family={s}", .{
+                    @tagName(path.change),
+                    @tagName(path.path.remote.family),
+                });
+            },
+            .path_validation_succeeded => |path| {
+                self.logger.info(null, "http3: QUIC path validation succeeded change={s} family={s}", .{
+                    @tagName(path.change),
+                    @tagName(path.path.remote.family),
+                });
+            },
+            .path_validation_failed => |path| {
+                self.logger.info(null, "http3: QUIC path validation failed change={s} family={s}", .{
+                    @tagName(path.change),
+                    @tagName(path.path.remote.family),
+                });
+            },
+            .path_migration_blocked => |blocked| {
+                self.logger.warn(null, "http3: QUIC path migration blocked change={s} reason={s} family={s}", .{
+                    @tagName(blocked.change),
+                    @tagName(blocked.reason),
+                    @tagName(blocked.path.remote.family),
+                });
+            },
+            .path_promoted => |path| {
+                self.logger.info(null, "http3: QUIC path promoted change={s} family={s}", .{
+                    @tagName(path.change),
+                    @tagName(path.path.remote.family),
+                });
             },
             else => {},
         }
@@ -1450,7 +1486,8 @@ const RuntimeCidHarness = struct {
         self.client = try Connection.init(allocator, .{
             .role = .client,
             .local_cid = &client_cid,
-            .original_dcid = &odcid,
+            .original_destination_cid = &odcid,
+            .initial_secret_dcid = &odcid,
             .peer_cid = &odcid,
             .tls = self.client_backend.backend(),
             .now_us = self.now_us,
@@ -1460,7 +1497,8 @@ const RuntimeCidHarness = struct {
         const server = try Connection.init(allocator, .{
             .role = .server,
             .local_cid = &odcid,
-            .original_dcid = &odcid,
+            .original_destination_cid = &odcid,
+            .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = server_backend.backend(),
             .now_us = self.now_us,
@@ -2454,7 +2492,8 @@ test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT cap
     const client = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &client_cid,
-        .original_dcid = &odcid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend.backend(),
         .now_us = 1_000_000,
@@ -2464,7 +2503,8 @@ test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT cap
     const server_conn = try Connection.init(allocator, .{
         .role = .server,
         .local_cid = &odcid,
-        .original_dcid = &odcid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend.backend(),
         .now_us = 1_000_000,
@@ -2759,7 +2799,8 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
     const client1 = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &client_cid,
-        .original_dcid = &odcid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend.backend(),
         .now_us = 1_000_000,
@@ -2769,7 +2810,8 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
     const server_conn1 = try Connection.init(allocator, .{
         .role = .server,
         .local_cid = &odcid,
-        .original_dcid = &odcid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend1.backend(),
         .now_us = 1_000_000,
@@ -2867,7 +2909,8 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         .role = .client,
         .config = .{ .zero_rtt_enabled = true },
         .local_cid = &client_cid,
-        .original_dcid = &odcid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend2.backend(),
         .now_us = 2_000_000,
@@ -2910,7 +2953,8 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         .role = .server,
         .config = .{ .zero_rtt_enabled = true },
         .local_cid = &odcid,
-        .original_dcid = &odcid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend2.backend(),
         .now_us = 2_000_000,
@@ -3275,7 +3319,8 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
     const client1 = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &client_cid,
-        .original_dcid = &odcid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend.backend(),
         .now_us = 1_000_000,
@@ -3286,7 +3331,8 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .role = .server,
         .config = runtime.quic_config,
         .local_cid = &odcid,
-        .original_dcid = &odcid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend1.backend(),
         .now_us = 1_000_000,
@@ -3395,7 +3441,8 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .role = .client,
         .config = .{ .zero_rtt_enabled = true },
         .local_cid = &client_cid,
-        .original_dcid = &odcid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend2.backend(),
         .now_us = 2_000_000,
@@ -3406,7 +3453,8 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .role = .server,
         .config = runtime.quic_config,
         .local_cid = &odcid,
-        .original_dcid = &odcid,
+        .original_destination_cid = &odcid,
+        .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend2.backend(),
         .now_us = 2_000_000,
@@ -3859,6 +3907,60 @@ test "http3 runtime Retry rejects valid tokens replayed with the wrong Retry SCI
         .kind = .initial,
         .version = quic.packet.quic_v1,
         .dcid = &wrong_retry_scid,
+        .scid = &client_scid,
+        .token = token,
+    };
+
+    const handle = runtime.accept(&connections, &routes, &per_ip, &next_handle, parsed, peer, now + 500);
+    try testing.expectEqual(@as(?u64, null), handle);
+    try testing.expectEqual(@as(usize, 0), connections.count());
+    try testing.expectEqual(@as(usize, 0), routes.count());
+    try testing.expectEqual(@as(usize, 0), per_ip.count());
+    const snapshot = runtime.snapshot();
+    try testing.expectEqual(@as(usize, 0), snapshot.retry_packets_sent);
+    try testing.expectEqual(@as(usize, 0), snapshot.retry_tokens_accepted);
+    try testing.expectEqual(@as(usize, 1), snapshot.invalid_tokens);
+}
+
+test "http3 runtime Retry counts valid tokens replayed with the wrong QUIC version as invalid" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-retry-wrong-version-test");
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .retry_policy = .address_validation,
+    });
+    defer runtime.deinit();
+
+    var connections = std.AutoHashMap(u64, *ConnEntry).init(testing.allocator);
+    defer deinitTestConnections(&connections, testing.allocator);
+    var routes = quic.cid.CidRoutingTable.init(testing.allocator);
+    defer routes.deinit();
+    var per_ip = std.AutoHashMap(u32, u32).init(testing.allocator);
+    defer per_ip.deinit();
+    var next_handle: u64 = 1;
+
+    const now: u64 = 1_000_000;
+    const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const retry_scid = [_]u8{ 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48 };
+    const client_scid = [_]u8{0x22} ** 8;
+    const peer = testPeerSockaddr(44_334);
+    var token_buf: [quic.path.max_token_len]u8 = undefined;
+    const token = try runtime.retry_tokens.issueRetry(
+        &odcid,
+        &retry_scid,
+        quic.packet.quic_v1,
+        addressFromSockaddrIn(peer),
+        now,
+        [_]u8{0x5b} ** quic.path.token_nonce_len,
+        &token_buf,
+    );
+    const parsed = quic.packet.ParsedPacket{
+        .kind = .initial,
+        .version = 0xff00_001d,
+        .dcid = &retry_scid,
         .scid = &client_scid,
         .token = token,
     };

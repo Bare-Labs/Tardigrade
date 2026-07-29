@@ -477,6 +477,21 @@ pub fn build(b: *std.Build) void {
     quic_h3_udp_mod.addImport("http3", http3_mod);
     quic_h3_udp_mod.addImport("stream_transport", stream_transport_mod);
     quic_h3_udp_mod.addImport("tls_core", tls_core_mod);
+    quic_h3_udp_mod.addImport("zig_compat", compat_mod);
+    quic_h3_udp_mod.addImport("build_options", build_options.createModule());
+    const udp_http3_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/http/http3_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    udp_http3_runtime_mod.addImport("zig_compat", compat_mod);
+    udp_http3_runtime_mod.addImport("stream_transport", stream_transport_mod);
+    udp_http3_runtime_mod.addImport("quic", quic_mod);
+    udp_http3_runtime_mod.addImport("http3", http3_mod);
+    udp_http3_runtime_mod.addImport("tls_core", tls_core_mod);
+    udp_http3_runtime_mod.addImport("build_options", build_options.createModule());
+    quic_h3_udp_mod.addImport("http3_runtime", udp_http3_runtime_mod);
     const quic_h3_udp_tests = b.addTest(.{ .root_module = quic_h3_udp_mod });
     const run_quic_h3_udp_tests = b.addRunArtifact(quic_h3_udp_tests);
     quic_step.dependOn(&run_quic_h3_udp_tests.step);
