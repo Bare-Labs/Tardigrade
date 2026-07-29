@@ -147,8 +147,8 @@ they need public control.
 | Initial connection window | `initial_max_data` | 8 MiB | internal initially |
 | Initial stream windows | `initial_max_stream_data_*` | 1 MiB bidi, 256 KiB uni | internal initially |
 | Max streams | `initial_max_streams_*` | 100 bidi, 16 uni | internal initially |
-| Retry policy | address validation / tokens | off for upstream-first | user-facing for downstream listener work |
-| Migration policy | `disable_active_migration` | disabled | user-facing only when downstream listener exists |
+| Retry policy | address validation / tokens | `off` | `TARDIGRADE_HTTP3_RETRY_POLICY=off\|address_validation`; `address_validation` sends stateless QUIC Retry before allocating connection state |
+| Migration policy | `disable_active_migration` | NAT rebinding only | `TARDIGRADE_HTTP3_CONNECTION_MIGRATION=false` permits same-IP NAT rebinding but not active migration; `true` enables full migration |
 | qlog / keylog | debug artifact emission | off | local-debug toggle |
 | QPACK | SETTINGS | static-only, zero dynamic capacity | internal until dynamic QPACK lands |
 

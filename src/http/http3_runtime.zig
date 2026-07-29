@@ -73,6 +73,7 @@ pub const Config = struct {
     enable_0rtt: bool = false,
     h3_settings: http3.frame.Settings = .{},
     connection_migration: bool = false,
+    retry_policy: quic.config.RetryPolicy = .off,
     max_datagram_size: usize = 1350,
     request_handler: ?RequestHandler = null,
     request_handler_ctx: ?*anyopaque = null,
@@ -128,6 +129,17 @@ pub const Snapshot = struct {
     packets_emitted: usize = 0,
     bytes_emitted: usize = 0,
     migration_events: usize = 0,
+    retry_packets_sent: usize = 0,
+    retry_tokens_accepted: usize = 0,
+    invalid_tokens: usize = 0,
+    path_challenges_sent: usize = 0,
+    path_validations_succeeded: usize = 0,
+    path_validations_failed: usize = 0,
+    path_response_mismatches: usize = 0,
+    nat_rebindings: usize = 0,
+    migrations: usize = 0,
+    migrations_blocked: usize = 0,
+    migrations_blocked_no_peer_cid: usize = 0,
     last_error_code: i32 = 0,
 
     pub fn handshakeState(self: Snapshot) []const u8 {
@@ -161,6 +173,7 @@ const ConnEntry = struct {
     /// issuance (successfully or not) — issuance is best-effort and must
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
+    last_path_metrics: quic.path.Metrics = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
@@ -193,6 +206,8 @@ pub const Runtime = struct {
     /// `zero_rtt_enabled` gate and whether `accept()` installs a server
     /// early-data policy on new connections' TLS backends.
     zero_rtt_enabled: bool,
+    retry_policy: quic.config.RetryPolicy,
+    retry_tokens: quic.path.RetryTokens,
     stateless_reset_key: [32]u8,
     quic_config: quic.config.Config,
     h3_settings: http3.frame.Settings,
@@ -249,6 +264,8 @@ pub const Runtime = struct {
             .resumption_runtime = cfg.resumption_runtime,
             .early_data_replay_gate = cfg.early_data_replay_gate,
             .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
+            .retry_policy = cfg.retry_policy,
+            .retry_tokens = .{},
             .stateless_reset_key = undefined,
             .quic_config = quicConfigFrom(cfg),
             .h3_settings = cfg.h3_settings,
@@ -261,6 +278,9 @@ pub const Runtime = struct {
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
         };
+        var retry_key: [quic.path.token_key_len]u8 = undefined;
+        compat.randomBytes(&retry_key);
+        runtime.retry_tokens.keys.install(0, retry_key);
         compat.randomBytes(&runtime.stateless_reset_key);
         http3.frame.validateLocallySupportedSettings(runtime.h3_settings) catch return error.InvalidH3Settings;
         runtime.h3_application_compat_len = (http3.early_data.encodeSettingsSnapshot(
@@ -271,8 +291,8 @@ pub const Runtime = struct {
         if (cfg.enable_0rtt and !runtime.zero_rtt_enabled) {
             logger.warn(null, "http3: enable_0rtt requires both resumption_runtime and early_data_replay_gate to be configured; continuing with 0-RTT disabled", .{});
         }
-        if (cfg.connection_migration) {
-            logger.warn(null, "http3: connection migration is not supported by the native QUIC stack; disable_active_migration stays advertised", .{});
+        if (cfg.retry_policy == .address_validation) {
+            logger.info(null, "http3: QUIC Retry address validation enabled", .{});
         }
         if (!std.mem.eql(u8, cfg.tls_min_version, "1.3") or !std.mem.eql(u8, cfg.tls_max_version, "1.3")) {
             logger.warn(null, "http3: native QUIC requires TLS 1.3; ignoring tls_min_version={s}/tls_max_version={s}", .{ cfg.tls_min_version, cfg.tls_max_version });
@@ -347,6 +367,7 @@ pub const Runtime = struct {
                     entry.conn.onTimeout(now);
                     self.syncCidRoutes(entry, &routes);
                     self.maintainLocalCidRoutes(entry, kv.key_ptr.*, &routes);
+                    self.foldPathMetrics(entry);
                     while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
                         self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
                     }
@@ -461,6 +482,7 @@ pub const Runtime = struct {
         };
         self.syncCidRoutes(entry, routes);
         self.maintainLocalCidRoutes(entry, found, routes);
+        self.foldPathMetrics(entry);
         const authenticated = entry.conn.metrics.packets_received > packets_before;
         switch (classifyIngest(freshly_accepted, authenticated, !active_before.remote.eql(ingress_remote))) {
             // A just-accepted connection whose first datagram authenticates
@@ -470,11 +492,9 @@ pub const Runtime = struct {
                 self.removeConnection(connections, routes, per_ip, found);
                 return;
             },
-            // An authenticated packet from a source other than the active path
-            // is a NAT-rebinding/migration attempt; `Connection` itself
-            // decides whether to validate and promote it (`PathManager`), so
-            // this is purely an observability note.
-            .migrated => self.noteMigrationEvent(),
+            // `Connection` owns migration validation; runtime counters fold
+            // authoritative validated outcomes from `PathManager` metrics.
+            .migrated => {},
             .keep => {},
         }
 
@@ -506,6 +526,11 @@ pub const Runtime = struct {
         const credential_provider = self.credential_provider orelse return null;
         if (parsed.version != quic.packet.quic_v1) return null;
         if (parsed.dcid.len < 8 or parsed.scid.len == 0) return null;
+        const retry_context: ?quic.path.RetryContext = switch (self.classifyRetry(routes, parsed, peer, now)) {
+            .accept_unvalidated => null,
+            .accept_validated => |ctx| ctx,
+            .drop => return null,
+        };
         // Bound half-open state before allocating anything for this Initial.
         if (!admissionAllowed(connections.count(), per_ip.get(peer.addr) orelse 0)) return null;
         const allocator = self.allocator;
@@ -573,11 +598,14 @@ pub const Runtime = struct {
             .role = .server,
             .config = self.quic_config,
             .local_cid = parsed.dcid,
-            .original_dcid = parsed.dcid,
+            .original_destination_cid = if (retry_context) |ctx| ctx.original_dcid.slice() else parsed.dcid,
+            .retry_source_cid = if (retry_context) |ctx| ctx.retry_scid.slice() else null,
+            .initial_secret_dcid = if (retry_context) |ctx| ctx.retry_scid.slice() else parsed.dcid,
             .peer_cid = parsed.scid,
             .tls = backend.backend(),
             .now_us = now,
             .initial_path = .{ .local = self.local_address, .remote = addressFromSockaddrIn(peer) },
+            .initial_address_validated = retry_context != null,
             .stateless_reset_key = self.stateless_reset_key,
             .events = .{ .context = self, .emitFn = quicConnectionEvent },
         }) catch {
@@ -627,7 +655,73 @@ pub const Runtime = struct {
             return null;
         };
         self.noteConnectionAccepted();
+        if (retry_context != null) self.noteRetryTokenAccepted();
         return handle;
+    }
+
+    const RetryAcceptDecision = union(enum) {
+        accept_unvalidated,
+        accept_validated: quic.path.RetryContext,
+        drop,
+    };
+
+    fn classifyRetry(
+        self: *Runtime,
+        routes: *quic.cid.CidRoutingTable,
+        parsed: quic.packet.ParsedPacket,
+        peer: std.c.sockaddr.in,
+        now: u64,
+    ) RetryAcceptDecision {
+        if (self.retry_policy == .off) return .accept_unvalidated;
+        const remote = addressFromSockaddrIn(peer);
+        if (parsed.token.len == 0) {
+            self.issueRetry(routes, parsed, peer, remote, now);
+            return .drop;
+        }
+        const ctx = self.retry_tokens.validateRetry(parsed.token, remote, now) catch {
+            self.noteInvalidToken();
+            self.logger.info(null, "http3: rejected invalid QUIC Retry token", .{});
+            return .drop;
+        };
+        if (ctx.quic_version != parsed.version or !std.mem.eql(u8, parsed.dcid, ctx.retry_scid.slice())) {
+            self.noteInvalidToken();
+            self.logger.info(null, "http3: rejected QUIC Retry token with mismatched version or Retry SCID", .{});
+            return .drop;
+        }
+        return .{ .accept_validated = ctx };
+    }
+
+    fn issueRetry(
+        self: *Runtime,
+        routes: *quic.cid.CidRoutingTable,
+        parsed: quic.packet.ParsedPacket,
+        peer: std.c.sockaddr.in,
+        remote: quic.udp.Address,
+        now: u64,
+    ) void {
+        const retry_scid = self.generateRetryScid(routes, parsed.dcid.len, parsed.dcid) orelse return;
+        var nonce: [quic.path.token_nonce_len]u8 = undefined;
+        compat.randomBytes(&nonce);
+        var token_buf: [quic.path.max_token_len]u8 = undefined;
+        const token = self.retry_tokens.issueRetry(parsed.dcid, retry_scid.slice(), parsed.version, remote, now, nonce, &token_buf) catch return;
+        var retry_buf: [512]u8 = undefined;
+        const retry = quic.packet.writeRetryV1(parsed.dcid, parsed.scid, retry_scid.slice(), token, &retry_buf) catch return;
+        self.sendDatagram(peer, retry);
+        self.noteRetryPacketSent();
+        self.logger.info(null, "http3: issued QUIC Retry for unvalidated Initial", .{});
+    }
+
+    fn generateRetryScid(self: *Runtime, routes: *quic.cid.CidRoutingTable, cid_len: usize, original_dcid: []const u8) ?quic.cid.ConnectionId {
+        _ = self;
+        var entropy: [quic.udp.MaxConnectionIdLen]u8 = undefined;
+        for (0..cid_generation_retries) |_| {
+            compat.randomBytes(&entropy);
+            const candidate = quic.cid.generateCid(&entropy, @intCast(cid_len)) catch return null;
+            if (std.mem.eql(u8, candidate.slice(), original_dcid)) continue;
+            if (routes.contains(candidate)) continue;
+            return candidate;
+        }
+        return null;
     }
 
     /// Remove a tracked connection: drop its CID route, release its per-source
@@ -1076,10 +1170,42 @@ pub const Runtime = struct {
         self.snapshot_state.requests_completed += 1;
     }
 
-    fn noteMigrationEvent(self: *Runtime) void {
+    fn foldPathMetrics(self: *Runtime, entry: *ConnEntry) void {
+        const current = entry.conn.pathMetrics();
+        const previous = entry.last_path_metrics;
+        entry.last_path_metrics = current;
+
         self.snapshot_mutex.lock();
         defer self.snapshot_mutex.unlock();
-        self.snapshot_state.migration_events += 1;
+        const nat = current.nat_rebindings -| previous.nat_rebindings;
+        const migrations = current.migrations -| previous.migrations;
+        self.snapshot_state.path_challenges_sent += @intCast(current.path_challenges_sent -| previous.path_challenges_sent);
+        self.snapshot_state.path_validations_succeeded += @intCast(current.path_validations_succeeded -| previous.path_validations_succeeded);
+        self.snapshot_state.path_validations_failed += @intCast(current.path_validations_failed -| previous.path_validations_failed);
+        self.snapshot_state.path_response_mismatches += @intCast(current.path_response_mismatches -| previous.path_response_mismatches);
+        self.snapshot_state.nat_rebindings += @intCast(nat);
+        self.snapshot_state.migrations += @intCast(migrations);
+        self.snapshot_state.migrations_blocked += @intCast(current.migrations_blocked -| previous.migrations_blocked);
+        self.snapshot_state.migrations_blocked_no_peer_cid += @intCast(current.migrations_blocked_no_peer_cid -| previous.migrations_blocked_no_peer_cid);
+        self.snapshot_state.migration_events += @intCast(nat +| migrations);
+    }
+
+    fn noteRetryPacketSent(self: *Runtime) void {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        self.snapshot_state.retry_packets_sent += 1;
+    }
+
+    fn noteRetryTokenAccepted(self: *Runtime) void {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        self.snapshot_state.retry_tokens_accepted += 1;
+    }
+
+    fn noteInvalidToken(self: *Runtime) void {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        self.snapshot_state.invalid_tokens += 1;
     }
 
     fn noteDatagram(self: *Runtime, len: usize) void {
@@ -1129,13 +1255,13 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
 }
 
 /// Map the operator-facing runtime config onto the native QUIC transport
-/// config. Only `max_datagram_size` and `zero_rtt_enabled` are honored today;
-/// the remaining transport knobs keep their conservative defaults, including
-/// `migration_policy = .disabled`.
+/// config.
 fn quicConfigFrom(cfg: Config) quic.config.Config {
     return .{
         .max_udp_payload_size = std.math.clamp(cfg.max_datagram_size, 1200, 2048),
         .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
+        .retry_policy = cfg.retry_policy,
+        .migration_policy = if (cfg.connection_migration) .full else .nat_rebinding_only,
     };
 }
 
@@ -1418,10 +1544,22 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
         .quic_port = 443,
         .max_datagram_size = 9000,
     }).max_udp_payload_size);
-    // An in-range value passes through, and migration stays disabled.
+    // An in-range value passes through, and default migration allows validated
+    // same-IP NAT rebinding while still advertising disable_active_migration.
     const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 });
     try testing.expectEqual(@as(u64, 1350), mid.max_udp_payload_size);
-    try testing.expectEqual(quic.config.MigrationPolicy.disabled, mid.migration_policy);
+    try testing.expectEqual(quic.config.MigrationPolicy.nat_rebinding_only, mid.migration_policy);
+    try testing.expectEqual(quic.config.RetryPolicy.off, mid.retry_policy);
+    try testing.expectEqual(quic.config.MigrationPolicy.full, quicConfigFrom(.{
+        .listen_host = "::",
+        .quic_port = 443,
+        .connection_migration = true,
+    }).migration_policy);
+    try testing.expectEqual(quic.config.RetryPolicy.address_validation, quicConfigFrom(.{
+        .listen_host = "::",
+        .quic_port = 443,
+        .retry_policy = .address_validation,
+    }).retry_policy);
 }
 
 test "http3 runtime: spare CID route is registered before NEW_CONNECTION_ID is pollable" {
@@ -3519,6 +3657,221 @@ test "accept() (#523): wires an EventSink into every accepted connection so 0-RT
     entry.conn.events.emit(.{ .zero_rtt_packet = .{ .outcome = .keys_unavailable, .size = 0 } });
     try testing.expectEqual(@as(usize, 1), capture.decisions);
     try testing.expectEqual(@as(usize, 1), capture.packets);
+}
+
+fn deinitTestConnections(connections: *std.AutoHashMap(u64, *ConnEntry), allocator: std.mem.Allocator) void {
+    var it = connections.valueIterator();
+    while (it.next()) |entry| {
+        entry.*.deinit(allocator);
+        allocator.destroy(entry.*);
+    }
+    connections.deinit();
+}
+
+fn testPeerSockaddr(port: u16) std.c.sockaddr.in {
+    return .{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        .zero = [_]u8{0} ** 8,
+    };
+}
+
+test "http3 runtime Retry sends tokenless Initials without allocating connection state" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-retry-tokenless-test");
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .retry_policy = .address_validation,
+    });
+    defer runtime.deinit();
+
+    var connections = std.AutoHashMap(u64, *ConnEntry).init(testing.allocator);
+    defer deinitTestConnections(&connections, testing.allocator);
+    var routes = quic.cid.CidRoutingTable.init(testing.allocator);
+    defer routes.deinit();
+    var per_ip = std.AutoHashMap(u32, u32).init(testing.allocator);
+    defer per_ip.deinit();
+    var next_handle: u64 = 1;
+
+    const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const client_scid = [_]u8{0x22} ** 8;
+    const parsed = quic.packet.ParsedPacket{
+        .kind = .initial,
+        .version = quic.packet.quic_v1,
+        .dcid = &odcid,
+        .scid = &client_scid,
+        .token = &.{},
+    };
+
+    const handle = runtime.accept(&connections, &routes, &per_ip, &next_handle, parsed, testPeerSockaddr(44_330), 1_000_000);
+    try testing.expectEqual(@as(?u64, null), handle);
+    try testing.expectEqual(@as(usize, 0), connections.count());
+    try testing.expectEqual(@as(usize, 0), routes.count());
+    try testing.expectEqual(@as(usize, 0), per_ip.count());
+    const snapshot = runtime.snapshot();
+    try testing.expectEqual(@as(usize, 1), snapshot.retry_packets_sent);
+    try testing.expectEqual(@as(usize, 0), snapshot.retry_tokens_accepted);
+    try testing.expectEqual(@as(usize, 0), snapshot.invalid_tokens);
+    try testing.expectEqual(@as(usize, 0), snapshot.tracked_connections);
+}
+
+test "http3 runtime Retry drops invalid tokens without sending a second Retry" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-retry-invalid-token-test");
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .retry_policy = .address_validation,
+    });
+    defer runtime.deinit();
+
+    var connections = std.AutoHashMap(u64, *ConnEntry).init(testing.allocator);
+    defer deinitTestConnections(&connections, testing.allocator);
+    var routes = quic.cid.CidRoutingTable.init(testing.allocator);
+    defer routes.deinit();
+    var per_ip = std.AutoHashMap(u32, u32).init(testing.allocator);
+    defer per_ip.deinit();
+    var next_handle: u64 = 1;
+
+    const retry_scid = [_]u8{0x44} ** 8;
+    const client_scid = [_]u8{0x22} ** 8;
+    const parsed = quic.packet.ParsedPacket{
+        .kind = .initial,
+        .version = quic.packet.quic_v1,
+        .dcid = &retry_scid,
+        .scid = &client_scid,
+        .token = "tampered",
+    };
+
+    const handle = runtime.accept(&connections, &routes, &per_ip, &next_handle, parsed, testPeerSockaddr(44_331), 1_000_000);
+    try testing.expectEqual(@as(?u64, null), handle);
+    try testing.expectEqual(@as(usize, 0), connections.count());
+    const snapshot = runtime.snapshot();
+    try testing.expectEqual(@as(usize, 0), snapshot.retry_packets_sent);
+    try testing.expectEqual(@as(usize, 0), snapshot.retry_tokens_accepted);
+    try testing.expectEqual(@as(usize, 1), snapshot.invalid_tokens);
+}
+
+test "http3 runtime Retry accepts validated tokens with split CID roles and validated path" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-retry-valid-token-test");
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .retry_policy = .address_validation,
+    });
+    defer runtime.deinit();
+
+    var connections = std.AutoHashMap(u64, *ConnEntry).init(testing.allocator);
+    defer deinitTestConnections(&connections, testing.allocator);
+    var routes = quic.cid.CidRoutingTable.init(testing.allocator);
+    defer routes.deinit();
+    var per_ip = std.AutoHashMap(u32, u32).init(testing.allocator);
+    defer per_ip.deinit();
+    var next_handle: u64 = 1;
+
+    const now: u64 = 1_000_000;
+    const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const retry_scid = [_]u8{ 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48 };
+    const client_scid = [_]u8{0x22} ** 8;
+    const peer = testPeerSockaddr(44_332);
+    var token_buf: [quic.path.max_token_len]u8 = undefined;
+    const token = try runtime.retry_tokens.issueRetry(
+        &odcid,
+        &retry_scid,
+        quic.packet.quic_v1,
+        addressFromSockaddrIn(peer),
+        now,
+        [_]u8{0x59} ** quic.path.token_nonce_len,
+        &token_buf,
+    );
+    const parsed = quic.packet.ParsedPacket{
+        .kind = .initial,
+        .version = quic.packet.quic_v1,
+        .dcid = &retry_scid,
+        .scid = &client_scid,
+        .token = token,
+    };
+
+    const handle = runtime.accept(&connections, &routes, &per_ip, &next_handle, parsed, peer, now + 500);
+    try testing.expect(handle != null);
+    const entry = connections.get(handle.?).?;
+    try testing.expectEqual(@as(usize, 1), connections.count());
+    try testing.expectEqual(@as(usize, 1), routes.count());
+    try testing.expect(routes.contains(try quic.cid.ConnectionId.init(&retry_scid)));
+    try testing.expectEqualStrings(&retry_scid, entry.conn.localCid());
+    try testing.expectEqualStrings(&odcid, entry.conn.original_dcid.slice());
+    try testing.expect(entry.conn.retry_scid != null);
+    try testing.expectEqualStrings(&retry_scid, entry.conn.retry_scid.?.slice());
+    try testing.expect(entry.conn.paths.activePath().anti_amplification.validated);
+    const snapshot = runtime.snapshot();
+    try testing.expectEqual(@as(usize, 0), snapshot.retry_packets_sent);
+    try testing.expectEqual(@as(usize, 1), snapshot.retry_tokens_accepted);
+    try testing.expectEqual(@as(usize, 0), snapshot.invalid_tokens);
+    try testing.expectEqual(@as(usize, 1), snapshot.tracked_connections);
+}
+
+test "http3 runtime Retry rejects valid tokens replayed with the wrong Retry SCID" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-retry-wrong-scid-test");
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .retry_policy = .address_validation,
+    });
+    defer runtime.deinit();
+
+    var connections = std.AutoHashMap(u64, *ConnEntry).init(testing.allocator);
+    defer deinitTestConnections(&connections, testing.allocator);
+    var routes = quic.cid.CidRoutingTable.init(testing.allocator);
+    defer routes.deinit();
+    var per_ip = std.AutoHashMap(u32, u32).init(testing.allocator);
+    defer per_ip.deinit();
+    var next_handle: u64 = 1;
+
+    const now: u64 = 1_000_000;
+    const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const retry_scid = [_]u8{ 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48 };
+    const wrong_retry_scid = [_]u8{ 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68 };
+    const client_scid = [_]u8{0x22} ** 8;
+    const peer = testPeerSockaddr(44_333);
+    var token_buf: [quic.path.max_token_len]u8 = undefined;
+    const token = try runtime.retry_tokens.issueRetry(
+        &odcid,
+        &retry_scid,
+        quic.packet.quic_v1,
+        addressFromSockaddrIn(peer),
+        now,
+        [_]u8{0x5a} ** quic.path.token_nonce_len,
+        &token_buf,
+    );
+    const parsed = quic.packet.ParsedPacket{
+        .kind = .initial,
+        .version = quic.packet.quic_v1,
+        .dcid = &wrong_retry_scid,
+        .scid = &client_scid,
+        .token = token,
+    };
+
+    const handle = runtime.accept(&connections, &routes, &per_ip, &next_handle, parsed, peer, now + 500);
+    try testing.expectEqual(@as(?u64, null), handle);
+    try testing.expectEqual(@as(usize, 0), connections.count());
+    try testing.expectEqual(@as(usize, 0), routes.count());
+    try testing.expectEqual(@as(usize, 0), per_ip.count());
+    const snapshot = runtime.snapshot();
+    try testing.expectEqual(@as(usize, 0), snapshot.retry_packets_sent);
+    try testing.expectEqual(@as(usize, 0), snapshot.retry_tokens_accepted);
+    try testing.expectEqual(@as(usize, 1), snapshot.invalid_tokens);
 }
 
 test "runtime resolves the actual bound local address, including an OS-assigned port, from quic_port = 0" {

@@ -54,8 +54,8 @@ explicit override to something else is rejected); `tls_cipher_list`/
 appliance builds; these are OpenSSL-terminator-only features this owner
 never constructs); and if `http3_enabled` is set, a complete identity must
 also be configured and `http3_enable_0rtt`/`http3_connection_migration` must
-be off. Each violation is a distinct `UnsupportedApplianceConfiguration`
-failure, not a silent no-op.
+be off, and `http3_retry_policy` must remain `off`. Each violation is a
+distinct `UnsupportedApplianceConfiguration` failure, not a silent no-op.
 
 ### SNI behavior
 

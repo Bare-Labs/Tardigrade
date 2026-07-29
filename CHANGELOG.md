@@ -5,6 +5,16 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **QUIC Retry admission and migration-policy runtime wiring (#387 Slice 4)** —
+  adds `TARDIGRADE_HTTP3_RETRY_POLICY=off|address_validation` for the native
+  HTTP/3 listener. Address-validation mode sends stateless QUIC Retry for
+  tokenless Initials without allocating connection state, accepts only valid
+  address/version/Retry-SCID-bound tokens, records invalid tokens without
+  issuing a second Retry, and initializes accepted retried connections with
+  split original-destination, Retry-source, and Initial-secret DCID roles. The
+  runtime now keeps process-lifetime Retry token keys, maps disabled migration
+  to NAT-rebinding-only instead of fully disabled, exposes bounded Retry/path
+  snapshot counters, and rejects Retry in the fixed appliance TLS profile.
 - **Native H2 downstream `proxy_pass` assurance path for resumed TLS (#521,
   refs #369)** — the native HTTP/2 listener can now drive a bounded buffered
   `proxy_pass` request for policy-simple routes so #521 proves a real

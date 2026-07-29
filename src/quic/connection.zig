@@ -223,14 +223,23 @@ pub const CloseInfo = struct {
 pub const Options = struct {
     role: Role,
     config: config.Config = .{},
-    /// This side's connection ID (server: the client's original DCID, adopted).
+    /// This side's connection ID.
     local_cid: []const u8,
-    /// Client: the random original DCID choosing the Initial secrets.
-    /// Server: the client's original DCID (same as `local_cid` here).
-    original_dcid: []const u8,
     /// Client: leave empty; adopted from the server's first Initial SCID.
     /// Server: the client's SCID.
     peer_cid: []const u8 = &.{},
+    /// The client Initial DCID before any Retry. Servers bind this into
+    /// `original_destination_connection_id`; clients use it to verify the
+    /// server binding after the handshake.
+    original_destination_cid: []const u8 = &.{},
+    /// Backwards-compatible alias for callers not yet migrated. When
+    /// `original_destination_cid` is empty, this supplies the same value.
+    original_dcid: []const u8 = &.{},
+    /// Server-only after Retry: the SCID the server used in its Retry packet.
+    retry_source_cid: ?[]const u8 = null,
+    /// DCID used to derive Initial secrets. This is the ODCID without Retry
+    /// and the retried Initial DCID/Retry SCID after Retry.
+    initial_secret_dcid: []const u8 = &.{},
     tls: tls_handshake.TlsBackend,
     now_us: u64,
     events: EventSink = .{},
@@ -756,7 +765,11 @@ pub const Connection = struct {
                 try config.CidValue.init(options.peer_cid)
             else
                 .{},
-            .original_dcid = try config.CidValue.init(options.original_dcid),
+            .original_dcid = try config.CidValue.init(resolveOriginalDestinationCid(options)),
+            .retry_scid = if (options.retry_source_cid) |retry_source|
+                try config.CidValue.init(retry_source)
+            else
+                null,
             .stateless_reset_key = options.stateless_reset_key,
             .peer_cids = quic_cid.PeerCidPool.init(params.active_connection_id_limit),
             .send_queues = std.AutoHashMap(StreamId, *SendQueue).init(allocator),
@@ -790,6 +803,7 @@ pub const Connection = struct {
         };
         if (options.role == .server) {
             binding.original_destination_connection_id = conn.original_dcid;
+            if (conn.retry_scid) |retry_source| binding.retry_source_connection_id = retry_source;
             binding.stateless_reset_token = quic_cid.statelessResetToken(options.stateless_reset_key, conn.local_cid.slice());
         }
         options.tls.setCidBinding(binding);
@@ -806,7 +820,7 @@ pub const Connection = struct {
                 .client => .client,
                 .server => .server,
             },
-            conn.original_dcid.slice(),
+            resolveInitialSecretDcid(options),
         );
         conn.handshake.manual_key_discard = true;
         conn.handshake.allow_unverified_certificate = options.allow_unverified_certificate;
@@ -831,6 +845,16 @@ pub const Connection = struct {
         try conn.collectCryptoOutput();
         conn.armIdle(options.now_us);
         return conn;
+    }
+
+    fn resolveOriginalDestinationCid(options: Options) []const u8 {
+        if (options.original_destination_cid.len > 0) return options.original_destination_cid;
+        return options.original_dcid;
+    }
+
+    fn resolveInitialSecretDcid(options: Options) []const u8 {
+        if (options.initial_secret_dcid.len > 0) return options.initial_secret_dcid;
+        return resolveOriginalDestinationCid(options);
     }
 
     fn deinitPartial(self: *Connection) void {
