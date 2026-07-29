@@ -128,6 +128,14 @@ fn writeSyntheticInitial(
     return out[0 .. header.pn_offset + 1];
 }
 
+fn writeSpoofedShortHeader(dcid: []const u8, out: []u8) ![]const u8 {
+    const pn_offset = try quic.packet.writeShortHeader(dcid, 0, 1, out);
+    if (out.len < pn_offset + 32) return error.BufferTooShort;
+    out[pn_offset] = 0;
+    @memset(out[pn_offset + 1 .. pn_offset + 32], 0xa5);
+    return out[0 .. pn_offset + 32];
+}
+
 fn waitRuntimeSnapshot(
     runtime: *http3_runtime.Runtime,
     comptime predicate: fn (http3_runtime.Snapshot) bool,
@@ -148,6 +156,73 @@ fn hasNoTrackedConnections(snapshot: http3_runtime.Snapshot) bool {
 
 fn sawFiveInvalidTokens(snapshot: http3_runtime.Snapshot) bool {
     return snapshot.invalid_tokens >= 5 and snapshot.tracked_connections == 0;
+}
+
+fn hasPathValidationFailure(snapshot: http3_runtime.Snapshot) bool {
+    return snapshot.path_validations_failed > 0 and snapshot.tracked_connections > 0;
+}
+
+fn driveRuntimeRetryRequest(
+    client_socket: *UdpSocket,
+    client: *Connection,
+    client_h3: *H3,
+    client_path: quic.path.PathKey,
+    h3_started: *bool,
+    body: []const u8,
+    saw_retry: *bool,
+) !void {
+    var request_id: ?u64 = null;
+    var response_done = false;
+    const deadline = nowUs() + 10_000_000;
+    var iterations: usize = 0;
+    while (nowUs() < deadline and !response_done) : (iterations += 1) {
+        try testing.expect(iterations < 5_000);
+        const now = nowUs();
+
+        var out: [2048]u8 = undefined;
+        while (client.pollTransmitOnPath(&out, now)) |t| {
+            try client_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
+        }
+
+        var next: u64 = now + 50_000;
+        if (client.nextTimeoutUs()) |t| next = @min(next, t);
+        const timeout_ms: i32 = @intCast(@min((next -| now) / 1_000 + 1, 50));
+        var fds = [_]posix.pollfd{.{ .fd = client_socket.fd, .events = posix.POLL.IN, .revents = 0 }};
+        _ = try posix.poll(&fds, timeout_ms);
+
+        var in: [2048]u8 = undefined;
+        while (try client_socket.recv(&in)) |datagram| {
+            if (quic.packet.parsePacket(datagram, 0)) |parsed| {
+                if (parsed.kind == .retry) saw_retry.* = true;
+            } else |_| {}
+            try client.ingestOnPath(datagram, client_path, test_challenge_entropy, nowUs());
+        }
+        client.onTimeout(nowUs());
+
+        if (!h3_started.* and client.isEstablished()) {
+            try client_h3.start(client);
+            h3_started.* = true;
+        }
+        if (h3_started.*) {
+            if (request_id == null) {
+                request_id = try client_h3.sendRequest(client, .{
+                    .authority = "tardigrade.test",
+                    .path = "/runtime-retry",
+                    .body = body,
+                });
+            }
+            try client_h3.pump(client);
+            if (request_id) |id| {
+                if (try client_h3.pollResponse(id)) |response| {
+                    try testing.expectEqual(@as(u16, 200), response.status);
+                    try testing.expectEqualStrings("runtime-retry-response", response.body);
+                    response_done = true;
+                    client_h3.releaseResponse(id);
+                }
+            }
+        }
+    }
+    try testing.expect(response_done);
 }
 
 test "udp smoke: native client/server complete an H3 exchange over loopback" {
@@ -362,7 +437,7 @@ test "udp smoke: HTTP/3 runtime Retry sends tokenless Initials without tracked s
             var odcid = [_]u8{0x83} ** 8;
             odcid[7] = @intCast(i);
             var client_backend = tls_backend.Tls13Backend.initClient(
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
                 .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
             );
             const client = try Connection.init(allocator, .{
@@ -552,7 +627,7 @@ test "udp smoke: HTTP/3 runtime Retry round trip completes a native H3 request" 
         .remote = runtime.local_address,
     };
     var client_backend = tls_backend.Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xd1} ** 32, .key_share_seed = [_]u8{0x31} ** 32 },
+        .{ .hello_random = [_]u8{0xd1} ** 32, .key_share_seed = [_]u8{0x31} ** 32, .retry_key_share_seed = [_]u8{0x31} ** 32 },
         .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
     );
     const client = try Connection.init(allocator, .{
@@ -569,68 +644,57 @@ test "udp smoke: HTTP/3 runtime Retry round trip completes a native H3 request" 
     defer client_h3.deinit();
 
     var h3_started = false;
-    var request_id: ?u64 = null;
-    var response_done = false;
     var saw_retry = false;
-
-    const deadline = nowUs() + 10_000_000;
-    var iterations: usize = 0;
-    while (nowUs() < deadline and !response_done) : (iterations += 1) {
-        try testing.expect(iterations < 5_000);
-        const now = nowUs();
-
-        var out: [2048]u8 = undefined;
-        while (client.pollTransmitOnPath(&out, now)) |t| {
-            try client_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
-        }
-
-        var next: u64 = now + 50_000;
-        if (client.nextTimeoutUs()) |t| next = @min(next, t);
-        const timeout_ms: i32 = @intCast(@min((next -| now) / 1_000 + 1, 50));
-        var fds = [_]posix.pollfd{.{ .fd = client_socket.fd, .events = posix.POLL.IN, .revents = 0 }};
-        _ = try posix.poll(&fds, timeout_ms);
-
-        var in: [2048]u8 = undefined;
-        while (try client_socket.recv(&in)) |datagram| {
-            if (quic.packet.parsePacket(datagram, 0)) |parsed| {
-                if (parsed.kind == .retry) saw_retry = true;
-            } else |_| {}
-            try client.ingestOnPath(datagram, client_path, test_challenge_entropy, nowUs());
-        }
-        client.onTimeout(nowUs());
-
-        if (!h3_started and client.isEstablished()) {
-            try client_h3.start(client);
-            h3_started = true;
-        }
-        if (h3_started) {
-            if (request_id == null) {
-                request_id = try client_h3.sendRequest(client, .{
-                    .authority = "tardigrade.test",
-                    .path = "/runtime-retry",
-                    .body = "runtime-retry-request",
-                });
-            }
-            try client_h3.pump(client);
-            if (request_id) |id| {
-                if (try client_h3.pollResponse(id)) |response| {
-                    try testing.expectEqual(@as(u16, 200), response.status);
-                    try testing.expectEqualStrings("runtime-retry-response", response.body);
-                    response_done = true;
-                    client_h3.releaseResponse(id);
-                }
-            }
-        }
-    }
+    try driveRuntimeRetryRequest(&client_socket, client, &client_h3, client_path, &h3_started, "runtime-retry-request", &saw_retry);
 
     try testing.expect(saw_retry);
-    try testing.expect(response_done);
     try testing.expectEqual(@as(usize, 1), handler_state.requests.load(.monotonic));
     const retry_snapshot = runtime.snapshot();
     try testing.expectEqual(@as(usize, 1), retry_snapshot.retry_packets_sent);
     try testing.expectEqual(@as(usize, 1), retry_snapshot.retry_tokens_accepted);
     try testing.expectEqual(@as(usize, 0), retry_snapshot.invalid_tokens);
     try testing.expect(retry_snapshot.tracked_connections > 0);
+
+    var spoof_socket = try UdpSocket.open();
+    defer spoof_socket.close();
+    const before_spoof = runtime.snapshot();
+    var spoofed_packet: [128]u8 = undefined;
+    const spoofed = try writeSpoofedShortHeader(client.peer_cid.slice(), &spoofed_packet);
+    try spoof_socket.sendTo(sockaddrInFromAddress(runtime.local_address), spoofed);
+    const spoof_deadline = nowUs() + 500_000;
+    while (nowUs() < spoof_deadline and runtime.snapshot().datagrams_seen <= before_spoof.datagrams_seen) {
+        var ts = std.c.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = std.posix.system.nanosleep(&ts, &ts);
+    }
+    const after_spoof = runtime.snapshot();
+    try testing.expect(after_spoof.datagrams_seen > before_spoof.datagrams_seen);
+    try testing.expectEqual(before_spoof.path_challenges_sent, after_spoof.path_challenges_sent);
+    try testing.expectEqual(before_spoof.path_validations_succeeded, after_spoof.path_validations_succeeded);
+    try testing.expectEqual(before_spoof.nat_rebindings, after_spoof.nat_rebindings);
+    try testing.expectEqual(before_spoof.tracked_connections, after_spoof.tracked_connections);
+
+    var timeout_socket = try UdpSocket.open();
+    defer timeout_socket.close();
+    const before_timeout = runtime.snapshot();
+    const timeout_request_id = try client_h3.sendRequest(client, .{
+        .authority = "tardigrade.test",
+        .path = "/runtime-retry",
+        .body = "runtime-retry-timeout-request",
+    });
+    try client_h3.pump(client);
+    var timeout_out: [2048]u8 = undefined;
+    var sent_timeout_candidate = false;
+    while (client.pollTransmitOnPath(&timeout_out, nowUs())) |t| {
+        try timeout_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
+        sent_timeout_candidate = true;
+    }
+    try testing.expect(sent_timeout_candidate);
+    _ = timeout_request_id;
+    const timeout_snapshot = try waitRuntimeSnapshot(&runtime, hasPathValidationFailure);
+    try testing.expect(timeout_snapshot.path_validations_failed > before_timeout.path_validations_failed);
+    try testing.expectEqual(before_timeout.nat_rebindings, timeout_snapshot.nat_rebindings);
+    try testing.expectEqual(before_timeout.migrations, timeout_snapshot.migrations);
+    try testing.expect(timeout_snapshot.tracked_connections > 0);
 
     var rebind_socket = try UdpSocket.open();
     defer rebind_socket.close();
@@ -639,50 +703,8 @@ test "udp smoke: HTTP/3 runtime Retry round trip completes a native H3 request" 
         .remote = runtime.local_address,
     };
     const before_rebind = runtime.snapshot();
-    request_id = null;
-    response_done = false;
-    iterations = 0;
-    const rebind_deadline = nowUs() + 10_000_000;
-    while (nowUs() < rebind_deadline and !response_done) : (iterations += 1) {
-        try testing.expect(iterations < 5_000);
-        if (request_id == null) {
-            request_id = try client_h3.sendRequest(client, .{
-                .authority = "tardigrade.test",
-                .path = "/runtime-retry",
-                .body = "runtime-retry-rebind-request",
-            });
-        }
-        try client_h3.pump(client);
-
-        var out: [2048]u8 = undefined;
-        while (client.pollTransmitOnPath(&out, nowUs())) |t| {
-            try rebind_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
-        }
-
-        var next: u64 = nowUs() + 50_000;
-        if (client.nextTimeoutUs()) |t| next = @min(next, t);
-        const timeout_ms: i32 = @intCast(@min((next -| nowUs()) / 1_000 + 1, 50));
-        var fds = [_]posix.pollfd{.{ .fd = rebind_socket.fd, .events = posix.POLL.IN, .revents = 0 }};
-        _ = try posix.poll(&fds, timeout_ms);
-
-        var in: [2048]u8 = undefined;
-        while (try rebind_socket.recv(&in)) |datagram| {
-            try client.ingestOnPath(datagram, rebind_path, test_challenge_entropy, nowUs());
-        }
-        client.onTimeout(nowUs());
-        try client_h3.pump(client);
-        if (request_id) |id| {
-            if (try client_h3.pollResponse(id)) |response| {
-                try testing.expectEqual(@as(u16, 200), response.status);
-                try testing.expectEqualStrings("runtime-retry-response", response.body);
-                response_done = true;
-                client_h3.releaseResponse(id);
-            }
-        }
-    }
-
-    try testing.expect(response_done);
-    try testing.expectEqual(@as(usize, 2), handler_state.requests.load(.monotonic));
+    try driveRuntimeRetryRequest(&rebind_socket, client, &client_h3, rebind_path, &h3_started, "runtime-retry-rebind-request", &saw_retry);
+    try testing.expectEqual(@as(usize, 3), handler_state.requests.load(.monotonic));
     const snapshot = runtime.snapshot();
     try testing.expectEqual(@as(usize, 1), snapshot.retry_packets_sent);
     try testing.expectEqual(@as(usize, 1), snapshot.retry_tokens_accepted);

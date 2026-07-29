@@ -3557,7 +3557,8 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
     pair.client = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &TestPair.client_cid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = pair.client_backend.backend(),
         .now_us = pair.now_us,
@@ -3568,7 +3569,8 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
     pair.server = try Connection.init(allocator, .{
         .role = .server,
         .local_cid = &TestPair.odcid,
-        .original_dcid = &TestPair.odcid,
+        .original_destination_cid = &TestPair.odcid,
+        .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = pair.server_backend.backend(),
         .now_us = pair.now_us,
