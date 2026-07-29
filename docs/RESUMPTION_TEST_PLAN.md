@@ -19,14 +19,15 @@ matrix wins.
 |---|---|---|---|---|---|
 | Expiry, key rotation/removal, restart/lost-state models, ALPN/cipher compatibility scenarios | native TLS record layer, all profiles | `Tls13Backend` / `ReloadableKeyRing` | `tls13_backend_tests.zig`, `ticket_protection.zig`, `resumption_runtime.zig` scenario tests (#508) | deterministic | complete |
 | Process-level replay decisions, capacity/quarantine, 425/retry exactly-once composition | native TCP/H1, all profiles | process-local replay gate + gateway retry state machine | `rt0.*` cases (`tls13_backend_tests.zig`/`edge_gateway.zig`), `rt0.retry.425_exactly_once` (#509) | process (real composition, in-process) | complete |
-| Production native TCP/H1 record 0-RTT carrier + persistent ticket-key composition | native TCP/H1; persistent keys are general-profile only | `NativeTlsConnection` 0-RTT record path; `TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH` | `#510 native tcp production 0-rtt reaches h1 safety gate and replay fallback` (#513) | process (real production composition) | complete |
+| Production native TCP/H1 record 0-RTT carrier | native TCP/H1, appliance profile | `NativeTlsConnection` 0-RTT record path | `#510 native tcp production 0-rtt reaches h1 safety gate and replay fallback` (#513) | process (real production composition) | complete |
+| Persistent stateless/hybrid ticket-key composition | shared native resumption runtime; exercised by appliance-profile H1 (#519/#520) and general-profile QUIC/H3 (#519's credential-atomicity case) | `TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH` / `ReloadableKeyRing` | #513, composed by #519/#520's proofs | process (real production composition) | complete |
 | Production QUIC/H3 0-RTT packet carrier, provenance, policy/configuration, deterministic compatibility | native QUIC/H3, general profile | `http3_runtime.zeroRttCarrierEnabled` / `quicConfigFrom` / `quicEarlyDataTransportCompatible` | `quicConfigFrom`/H3 runtime deterministic tests (#523/PR #524) | deterministic + process | complete |
-| External ordinary resumption, ephemeral restart, reconnect soak baseline | native TCP/H1, both profiles | native TLS listener | `interop.openssl.h1.resume`, `restart.ephemeral.*`, `soak.reconnect_resumption` (#511) | external peer (OpenSSL) | complete |
-| External accepted 0-RTT, unsafe 425, replay fallback, persistent-restart startup quarantine | native TCP/H1, general profile (persistent keys) | production replay gate + H1 safety gate | `interop.openssl.h1.early.accepted`, `interop.openssl.h1.early.unsafe_425`, `interop.openssl.h1.early.replay_fallback`, `restart.persistent.early_startup_quarantine` (#518/PR #525) | external peer (OpenSSL) | complete |
-| Real application-level H2 request/response on an authoritatively resumed external connection | native TCP/H2, both profiles | H2 dispatch over resumed TLS | `interop.openssl.h2.tls_resume` (#521/PR #526) | external peer (OpenSSL `h2`) + app dispatch | complete |
+| External ordinary resumption, ephemeral restart, reconnect soak baseline | native TCP/H1, appliance profile | native TLS listener | `interop.openssl.h1.resume`, `restart.ephemeral.*`, `soak.reconnect_resumption` (#511) | external peer (OpenSSL) | complete |
+| External accepted 0-RTT, unsafe 425, replay fallback, persistent-restart startup quarantine | native TCP/H1, appliance profile (persistent keys) | production replay gate + H1 safety gate | `interop.openssl.h1.early.accepted`, `interop.openssl.h1.early.unsafe_425`, `interop.openssl.h1.early.replay_fallback`, `restart.persistent.early_startup_quarantine` (#518/PR #525) | external peer (OpenSSL) | complete |
+| Real application-level H2 request/response on an authoritatively resumed external connection | native TCP/H2, appliance profile | H2 dispatch over resumed TLS | `interop.openssl.h2.tls_resume` (#521/PR #526) | external peer (OpenSSL `h2`) + app dispatch | complete |
 | External H3 1-RTT resumption + accepted/unsafe/replay QUIC 0-RTT production composition | QUIC/H3, general profile | `http3_runtime.Runtime` composition | `h3interop.quic.resume`, `h3interop.quic.early.accepted`, `h3interop.quic.early.unsafe_425`, `h3interop.quic.early.replay_fallback` (#522/PR #527) | external peer (ngtcp2/GnuTLS `gtlsclient`) | complete |
 | Persistent restart, N→N+1 SIGHUP rotation, live validity boundaries, failed-reload atomicity, QUIC credential/ticket two-phase reload atomicity, certificate-binding incompatibility | native TCP/H1 (appliance profile) + QUIC/H3 (general profile, credential-atomicity case) | `ReloadableKeyRing`, `gateway_shutdown.hotReloadConfig`, `native_credentials.prepareReloadFromFiles` | `restart.persistent.ticket_survives`, `rotation.persistent.n_to_n_plus_1`, `rotation.persistent.failed_reload_keeps_old_state`, `rotation.persistent.quic_credential_reload_atomicity`, `rotation.persistent.certificate_binding_change` (#519/PR #528) | process (real restarts/SIGHUPs) | complete |
-| Concurrent multi-process nonce safety, rotation soak, lease exhaustion, process-local replay scope | native TCP/H1 persistent keys, general profile | `ticket_key_snapshot.reserveNonceLeasesInFile` sidecar lock | `soak.persistent.multi_process_nonce_safety`, `soak.persistent.nonce_lease_exhaustion`, `soak.replay.process_local_scope` (#520/PR #529) | process (real OS processes) | complete |
+| Concurrent multi-process nonce safety, rotation soak, lease exhaustion, process-local replay scope | native TCP/H1 persistent keys, appliance profile | `ticket_key_snapshot.reserveNonceLeasesInFile` sidecar lock | `soak.persistent.multi_process_nonce_safety`, `soak.persistent.nonce_lease_exhaustion`, `soak.replay.process_local_scope` (#520/PR #529) | process (real OS processes) | complete |
 | Ticket expiry (negative, external) | native TCP/H1 | — | `interop.openssl.ticket.expired` (#511) | external peer | complete |
 | SNI mismatch (negative, external) | native TCP/H1, appliance profile | — | `interop.openssl.sni_mismatch` (#511) | external peer | complete |
 | ALPN mismatch (negative, external) | native TCP/H1 | — | `interop.openssl.alpn_mismatch` (#511) | external peer | complete |
@@ -35,6 +36,8 @@ matrix wins.
 | H3 SETTINGS early-data incompatibility (negative) | QUIC/H3, general profile | — | remembered-SETTINGS compatibility coverage (`http3_runtime.zig`) (#523) | deterministic | intentionally unreachable externally — see limitations below |
 | QUIC transport-parameter early-data incompatibility (negative) | QUIC/H3, general profile | — | `quicEarlyDataTransportCompatible` deterministic coverage (#523) | deterministic | intentionally unreachable externally — see limitations below |
 | H3 replay-store-unavailable fail-closed state (negative) | QUIC/H3, general profile | `http3_runtime.zeroRttCarrierEnabled` | deterministic fail-closed carrier-disabled coverage (#523) | deterministic | intentionally unreachable as a distinct external state — see limitations below |
+| Bounded smoke + scheduled/manual heavy soak; no crash/UAF/deadlock/secret leak | resumption suite: appliance-profile filtered smoke + general-profile H3 interop | bounded process/socket harness (poll-based waits, hard subprocess deadlines) + existing soak workflow | `test-integration-resumption-interop`, `.github/workflows/resumption-soak.yml`, CI's `h3-resumption-interop` job (#511/#520/#522) | CI + process soak | complete |
+| Secret-safe reproducibility artifacts | all resumption/interop transports | bounded artifacts + cache-leak checks + typed/public metadata only | interop secret-file helpers, CI's "Verify no OpenSSL interop secrets leaked into the Zig cache" check, typed metric/event vocabularies exposing only public envelope metadata (#511/#513/#519/#520) | CI / assurance | complete |
 
 Every #369 acceptance criterion maps to one of the rows above, either as a
 named deterministic/process/external proof or as an explicit
@@ -105,9 +108,15 @@ implying otherwise:
   top of everything 1-RTT already checks.
 
 A session can therefore legitimately resume at 1-RTT while its remembered
-application/transport state is no longer eligible for 0-RTT — that is a
-real, working fallback shape, not a defect. `h3interop.quic.resume` proves
-exactly this fallback path is usable independent of 0-RTT eligibility.
+application/transport state is no longer eligible for 0-RTT. The actual
+SETTINGS/transport-mismatch cases are externally unreachable through today's
+operator configuration and remain covered by #523's deterministic
+compatibility tests (see limitations above). `h3interop.quic.resume`
+independently proves that ordinary H3 1-RTT resumption and real application
+traffic work when early data is not attempted at all
+(`disable_early_data = true` against the same saved session/transport-
+parameter state, not an incompatible one) — it does not itself exercise a
+SETTINGS/transport-parameter mismatch.
 
 ## Process-local replay semantics
 
@@ -133,24 +142,37 @@ remains an explicit #369 non-goal.
   early-data enablement, which stays the more conservative supported policy
   HTTP/2 has always had relative to H1.
 - **Persistent file-backed ticket keys**
-  (`TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH`) are a general-profile
-  capability; the appliance profile intentionally rejects that configuration
-  and keeps ephemeral-only ticket keys.
+  (`TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH`) are a shared native-resumption-
+  runtime capability, not restricted to one profile: #525 removed the
+  earlier appliance-profile rejection, so persistent-key restart/rotation/
+  soak proof (#519/#520) runs under the **appliance** profile
+  (`requireNativeTlsProfile()`). The general profile's own QUIC/H3
+  credential-reload atomicity case
+  (`rotation.persistent.quic_credential_reload_atomicity`) additionally
+  exercises the same shared credential-store composition through QUIC.
 - Every matrix row above is scoped to the actual transport/profile its proof
   exercises — do not infer cross-transport ticket portability from "shared
   resumption runtime."
 
 ## CI and reproducibility
 
-- `zig build test-integration-resumption-interop` runs the
-  `interop.`/`restart.`/`soak.`/`rotation.` prefixed cases; required on macOS
-  (where the full integration suite is skipped) and not duplicated on the
-  Linux job that already runs the unfiltered suite.
-- `.github/workflows/resumption-soak.yml` runs the same filtered suite with
-  `TARDIGRADE_SOAK_HEAVY=1` on a weekly schedule plus manual dispatch.
-- The H3 interop cases require a built ngtcp2/GnuTLS `gtlsclient` peer
-  (`scripts/interop/build-h3-peer-ci.sh`); CI builds and pins it, and those
-  cases skip locally when it isn't built.
+- Appliance-profile `test-integration-resumption-interop` (the
+  `interop.`/`restart.`/`soak.`/`rotation.` prefixed cases, `-Dtls-profile=
+  appliance`) runs on macOS in the `test-appliance` CI job, where the full
+  appliance integration suite is deliberately skipped for scheduling-
+  variance reasons; Linux appliance CI gets the same cases through the
+  unfiltered `test-integration -Dtls-profile=appliance` suite instead, so
+  they aren't duplicated there.
+- General-profile H3 resumption/0-RTT interop (`h3interop.quic.*`) runs in
+  its own dedicated Linux `h3-resumption-interop` PR job
+  (`.github/workflows/ci.yml`), which builds the pinned ngtcp2/GnuTLS
+  `gtlsclient` peer (`scripts/interop/build-h3-peer-ci.sh`), sets
+  `H3_INTEROP_CLIENT_PATH`, and runs `test-integration-resumption-interop
+  -Dtls-profile=general`. Those cases skip locally when no such peer is
+  built.
+- `.github/workflows/resumption-soak.yml` runs the same appliance-profile
+  filtered suite with `TARDIGRADE_SOAK_HEAVY=1` on a weekly schedule plus
+  manual dispatch.
 - Every subprocess/socket wait across this suite is bounded (poll-based, not
   raw blocking `accept()`/`read()`), and session/transport-state files use
   restrictive permissions.
