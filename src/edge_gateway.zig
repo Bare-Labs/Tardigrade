@@ -77,7 +77,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         },
         .hsts_value = initial_hsts,
         .add_headers = cfg.add_headers,
-        .http3_alt_svc = if (cfg.http3_enabled) http.http3_handler.formatAltSvc(state_allocator, cfg.quic_port) catch null else null,
+        .http3_alt_svc = null,
+        .http3_advertisement_state = if (cfg.http3_enabled) .configured_unavailable else .disabled,
         .http3_runtime = null,
         .session_store = if (cfg.session_ttl_seconds > 0)
             http.session.SessionStore.init(state_allocator, cfg.session_ttl_seconds, cfg.session_max)
@@ -467,6 +468,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             break :blk null;
         };
         if (http3_runtime) |*runtime| runtime.start();
+        updateHttp3Advertisement(&state, cfg, if (http3_runtime) |*runtime| runtime else null, .steady);
     }
     state.http3_runtime = if (http3_runtime) |*runtime| runtime else null;
     defer if (http3_runtime) |*runtime| runtime.deinit();
@@ -847,12 +849,57 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         break :blk state.active_connections_total;
     };
     state.logger.info(null, "Shutdown requested; draining active connection work (timeout={}ms active_connections={d})", .{ cfg.shutdown_drain_timeout_ms, active_at_drain_start });
+    const h3_deadline_us = http.http3_runtime.Runtime.nowUsPublic() + cfg.shutdown_drain_timeout_ms * std.time.us_per_ms;
+    if (http3_runtime) |*runtime| {
+        updateHttp3Advertisement(&state, cfg, runtime, .draining);
+        runtime.beginDrain(h3_deadline_us);
+    }
     const drain_result = worker_pool.shutdownAndJoin(cfg.shutdown_drain_timeout_ms);
+    if (http3_runtime) |*runtime| {
+        while (!runtime.isDrained() and http.http3_runtime.Runtime.nowUsPublic() < h3_deadline_us) {
+            std.Io.sleep(compat.io(), .fromMilliseconds(10), .awake) catch {};
+        }
+    }
     state.metricsRecordDrain(drain_result.timed_out, drain_result.forced_closes);
     if (drain_result.timed_out) {
         state.logger.warn(null, "drain timeout elapsed; force-closed {d} queued connection(s)", .{drain_result.forced_closes});
     }
     state.logger.info(null, "Graceful shutdown complete (forced_closes={d} drain_timed_out={})", .{ drain_result.forced_closes, drain_result.timed_out });
+}
+
+const Http3AdvertisementPhase = enum {
+    steady,
+    draining,
+};
+
+fn updateHttp3Advertisement(
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    runtime: ?*http.http3_runtime.Runtime,
+    phase: Http3AdvertisementPhase,
+) void {
+    const runtime_ready = if (runtime) |rt| rt.snapshot().server_bootstrapped else false;
+    const advertisement: http.http3_handler.Advertisement = blk: {
+        if (!cfg.http3_enabled) break :blk .disabled;
+        if (phase == .draining) break :blk .clear;
+        if (!runtime_ready) break :blk .disabled;
+        if (cfg.http3_alt_svc == .off) break :blk .disabled;
+        break :blk .{ .active = .{
+            .port = if (runtime) |rt| rt.snapshot().quic_port else cfg.quic_port,
+            .max_age_seconds = cfg.http3_alt_svc_max_age_seconds,
+        } };
+    };
+    const effective = http.http3_handler.formatAdvertisement(state.allocator, advertisement) catch null;
+    state.runtime_mutex.lock();
+    if (state.http3_alt_svc) |old| state.allocator.free(old);
+    state.http3_alt_svc = effective;
+    state.http3_advertisement_state = switch (advertisement) {
+        .disabled => if (!cfg.http3_enabled) .disabled else if (!runtime_ready) .configured_unavailable else .ready_advertisement_disabled,
+        .clear => .clearing,
+        .active => .advertising,
+    };
+    if (phase == .draining) state.http3_advertisement_state = .draining;
+    state.runtime_mutex.unlock();
 }
 
 fn nativeResumptionMetricsObserver(state: *GatewayState) tls_core.resumption_runtime.Observer {

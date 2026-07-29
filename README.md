@@ -209,6 +209,7 @@ operate without guessing which config file or pid file is active.
 | Topic | Location |
 | --- | --- |
 | Core v1 support matrix | [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) |
+| HTTP/3 rollout and lifecycle | [docs/HTTP3_ROLLOUT.md](docs/HTTP3_ROLLOUT.md) |
 | Concurrency & hot-path audit | [docs/CONCURRENCY.md](docs/CONCURRENCY.md) |
 | Observability | [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
 | Proxy security | [docs/PROXY_SECURITY.md](docs/PROXY_SECURITY.md) |

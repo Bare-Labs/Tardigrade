@@ -270,6 +270,8 @@ pub const EdgeConfig = struct {
     upstream_tls_client_key: []const u8,
     http3_enabled: bool,
     quic_port: u16,
+    http3_alt_svc: http.http3_handler.AltSvcMode,
+    http3_alt_svc_max_age_seconds: u32,
     http3_enable_0rtt: bool,
     http3_connection_migration: bool,
     http3_retry_policy: http.quic.config.RetryPolicy,
@@ -895,6 +897,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const quic_port_str = envOrDefault(allocator, "TARDIGRADE_QUIC_PORT", "443") catch unreachable;
     defer allocator.free(quic_port_str);
     const quic_port = try parseConfigPort("quic_port", quic_port_str);
+    const http3_alt_svc_str = envOrDefault(allocator, "TARDIGRADE_HTTP3_ALT_SVC", "off") catch unreachable;
+    defer allocator.free(http3_alt_svc_str);
+    const http3_alt_svc = try parseHttp3AltSvcConfig(http3_alt_svc_str);
+    const http3_alt_svc_max_age_seconds = parseIntEnv(u32, allocator, "TARDIGRADE_HTTP3_ALT_SVC_MAX_AGE_SECONDS", 300);
     const http3_enable_0rtt = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ENABLE_0RTT", false);
     const http3_connection_migration = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_CONNECTION_MIGRATION", false);
     const http3_retry_policy_str = envOrDefault(allocator, "TARDIGRADE_HTTP3_RETRY_POLICY", "off") catch unreachable;
@@ -1560,6 +1566,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .upstream_tls_client_key = upstream_tls_client_key,
         .http3_enabled = http3_enabled,
         .quic_port = quic_port,
+        .http3_alt_svc = http3_alt_svc,
+        .http3_alt_svc_max_age_seconds = http3_alt_svc_max_age_seconds,
         .http3_enable_0rtt = http3_enable_0rtt,
         .http3_connection_migration = http3_connection_migration,
         .http3_retry_policy = http3_retry_policy,
@@ -1934,6 +1942,14 @@ fn parseHttp3RetryPolicyConfig(raw: []const u8) !http.quic.config.RetryPolicy {
     if (std.ascii.eqlIgnoreCase(value, "address_validation") or std.ascii.eqlIgnoreCase(value, "address-validation")) return .address_validation;
     logConfigDiagnostic("config validation failed: http3_retry_policy must be one of off, address_validation", .{});
     return error.InvalidConfigValue;
+}
+
+fn parseHttp3AltSvcConfig(raw: []const u8) !http.http3_handler.AltSvcMode {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    return http.http3_handler.AltSvcMode.parse(value) orelse {
+        logConfigDiagnostic("config validation failed: http3_alt_svc must be one of off, auto", .{});
+        return error.InvalidConfigValue;
+    };
 }
 
 fn parseEarlyDataReplayModeConfig(raw: []const u8) !EarlyDataReplayMode {
@@ -2928,6 +2944,10 @@ pub fn validate(cfg: *const EdgeConfig) !void {
     if (cfg.http3_enabled and cfg.quic_port == 0) {
         std.log.err("config validation failed: quic_port must be between 1 and 65535 when HTTP/3 is enabled", .{});
         return error.InvalidConfigPort;
+    }
+    if (cfg.http3_alt_svc_max_age_seconds > 86_400) {
+        std.log.err("config validation failed: http3_alt_svc_max_age_seconds must be <= 86400", .{});
+        return error.InvalidConfigValue;
     }
     try validateListenerProtocolPolicy(cfg.http1_enabled, cfg.http2_enabled, hasTlsFiles(cfg), true);
 

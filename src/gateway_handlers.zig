@@ -483,6 +483,8 @@ fn initHandlerTestState(state: *GatewayState, allocator: std.mem.Allocator, add_
     };
     state.add_headers = add_headers;
     state.http3_alt_svc = null;
+    state.http3_advertisement_state = .disabled;
+    state.http3_runtime = null;
     state.session_store = null;
 }
 

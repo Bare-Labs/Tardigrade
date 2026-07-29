@@ -434,7 +434,8 @@ pub const GatewayState = struct {
     /// configured. Heap-owned; re-derived (old value freed) on reload. [runtime_mutex]
     hsts_value: []u8 = &.{},
     add_headers: []const edge_config.EdgeConfig.HeaderPair, // borrowed from cfg; rebound on reload [runtime_mutex]
-    http3_alt_svc: ?[]u8, // owned; re-derived (old freed) on reload [runtime_mutex]
+    http3_alt_svc: ?[]u8, // owned effective advertisement; re-derived (old freed) on reload [runtime_mutex]
+    http3_advertisement_state: http.http3_runtime.EffectiveAdvertisementState, // cfg/runtime-derived [runtime_mutex]
     http3_runtime: ?*http.http3_runtime.Runtime, // owned pointer; main-event-loop-only
     session_store: ?http.session.SessionStore, // owned [session_mutex]
     session_store_path: []const u8, // borrowed from startup cfg; restart-only (warns on change at reload)
@@ -1758,9 +1759,16 @@ pub const GatewayState = struct {
         self.runtime_mutex.lock();
         const proxy_buffer_limits = self.proxy_buffer_limits;
         const tls_buffer_limits = self.tls_buffer_limits;
+        const http3_advertisement_state = self.http3_advertisement_state;
         self.runtime_mutex.unlock();
         try appendProxyBufferConfigPrometheus(&combined, proxy_buffer_limits);
         try appendTlsBufferConfigPrometheus(&combined, tls_buffer_limits);
+        try combined.appendSlice(
+            \\# HELP tardigrade_http3_effective_state HTTP/3 effective listener and advertisement state
+            \\# TYPE tardigrade_http3_effective_state gauge
+            \\
+        );
+        try combined.print("tardigrade_http3_effective_state{{state=\"{s}\"}} 1\n", .{@tagName(http3_advertisement_state)});
         if (mux_snapshot.device_counts.len > 0) {
             try combined.appendSlice(
                 \\# HELP tardigrade_mux_device_channels Current active mux channels by device
@@ -3523,6 +3531,7 @@ fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) voi
     // counters, so the pool must be a valid (empty) instance here.
     gs.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
     gs.h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
+    gs.http3_advertisement_state = .disabled;
     gs.proxy_buffer_limits = .{
         .per_stream_low_watermark = 256 * 1024,
         .per_stream_high_watermark = 768 * 1024,
@@ -3586,6 +3595,7 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_upstream_h2_streaming_upload_fallback_total 1\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 786432\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_config_limit_bytes{queue=\"outbound_ciphertext\",limit=\"hard\"}") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_effective_state{state=\"disabled\"} 1\n") != null);
 }
 
 test "served Prometheus metrics reflect updated proxy buffer limit snapshot" {

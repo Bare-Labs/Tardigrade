@@ -24,7 +24,6 @@ const http3_session = @import("http3_session.zig");
 const logger_mod = @import("logger.zig");
 const metrics_mod = @import("metrics.zig");
 const response_mod = @import("response.zig");
-const shutdown = @import("shutdown.zig");
 const stream_transport = @import("stream_transport");
 const quic = @import("quic");
 const http3 = @import("http3");
@@ -37,6 +36,15 @@ const posix = std.posix;
 pub const StreamRequest = http3_session.StreamRequest;
 pub const Response = response_mod.Response;
 pub const Logger = logger_mod.Logger;
+
+pub const EffectiveAdvertisementState = enum {
+    disabled,
+    configured_unavailable,
+    ready_advertisement_disabled,
+    advertising,
+    clearing,
+    draining,
+};
 
 pub const Http3RuntimeError = error{
     OutOfMemory,
@@ -145,6 +153,10 @@ pub const Snapshot = struct {
     migrations_blocked: usize = 0,
     migrations_blocked_no_peer_cid: usize = 0,
     last_error_code: i32 = 0,
+    draining: bool = false,
+    h3_goaway_sent: usize = 0,
+    h3_drain_request_rejections: usize = 0,
+    active_cid_routes: usize = 0,
 
     pub fn handshakeState(self: Snapshot) []const u8 {
         if (!self.server_bootstrapped) return "bootstrap_incomplete";
@@ -177,6 +189,9 @@ const ConnEntry = struct {
     /// issuance (successfully or not) — issuance is best-effort and must
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
+    drain_goaway_sent: bool = false,
+    highest_admitted_request_stream_id: ?u64 = null,
+    drain_goaway_boundary: ?u64 = null,
     last_path_metrics: quic.path.Metrics = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
 
@@ -226,6 +241,8 @@ pub const Runtime = struct {
     snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
     stopping: std.atomic.Value(bool),
+    drain_requested: std.atomic.Value(bool),
+    drain_deadline_us: std.atomic.Value(u64),
 
     pub fn init(allocator: std.mem.Allocator, logger: *logger_mod.Logger, cfg: Config) Http3RuntimeError!Runtime {
         const address = compat.parseIpAddress(cfg.listen_host, cfg.quic_port) catch |err| {
@@ -281,6 +298,8 @@ pub const Runtime = struct {
             .quic_zero_rtt_packet_metrics_cb = cfg.quic_zero_rtt_packet_metrics_cb,
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
+            .drain_requested = std.atomic.Value(bool).init(false),
+            .drain_deadline_us = std.atomic.Value(u64).init(0),
         };
         var retry_key: [quic.path.token_key_len]u8 = undefined;
         compat.randomBytes(&retry_key);
@@ -326,10 +345,28 @@ pub const Runtime = struct {
         return self.snapshot_state;
     }
 
+    pub fn beginDrain(self: *Runtime, deadline_us: u64) void {
+        if (self.drain_requested.swap(true, .acq_rel)) return;
+        self.drain_deadline_us.store(deadline_us, .release);
+        self.snapshot_mutex.lock();
+        self.snapshot_state.draining = true;
+        self.snapshot_mutex.unlock();
+        self.logger.info(null, "http3: graceful drain started deadline_us={d}", .{deadline_us});
+    }
+
+    pub fn isDrained(self: *Runtime) bool {
+        const snap = self.snapshot();
+        return snap.tracked_connections == 0;
+    }
+
     fn nowUs() u64 {
         var ts: std.c.timespec = undefined;
         _ = std.c.clock_gettime(.MONOTONIC, &ts);
         return @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1_000;
+    }
+
+    pub fn nowUsPublic() u64 {
+        return nowUs();
     }
 
     fn loopMain(self: *Runtime) void {
@@ -356,8 +393,11 @@ pub const Runtime = struct {
             per_ip.deinit();
         }
 
-        while (!self.stopping.load(.acquire) and !shutdown.isShutdownRequested()) {
+        while (!self.stopping.load(.acquire)) {
             const now = nowUs();
+            const draining = self.drain_requested.load(.acquire);
+            const drain_deadline = self.drain_deadline_us.load(.acquire);
+            const drain_expired = draining and drain_deadline != 0 and now >= drain_deadline;
 
             // 1) Timers and transmission for every connection.
             var wake_us: u64 = now + 100_000;
@@ -372,10 +412,15 @@ pub const Runtime = struct {
                     self.syncCidRoutes(entry, &routes);
                     self.maintainLocalCidRoutes(entry, kv.key_ptr.*, &routes);
                     self.foldPathMetrics(entry);
+                    if (draining and !entry.drain_goaway_sent) self.sendDrainGoaway(entry);
                     while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
                         self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
                     }
-                    self.pumpH3(entry, now);
+                    if (drain_expired) {
+                        entry.conn.close(0x0100, "h3 drain deadline", now);
+                    } else {
+                        self.pumpH3(entry, now);
+                    }
                     while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
                         self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
                     }
@@ -395,6 +440,7 @@ pub const Runtime = struct {
                     self.removeConnection(&connections, &routes, &per_ip, handle);
                 }
             }
+            if (draining and connections.count() == 0) break;
 
             // 2) Sleep until the earliest deadline or socket readability.
             const timeout_ms: i32 = @intCast(@min((wake_us -| nowUs()) / 1_000 + 1, 100));
@@ -527,6 +573,7 @@ pub const Runtime = struct {
         peer: std.c.sockaddr.in,
         now: u64,
     ) ?u64 {
+        if (self.drain_requested.load(.acquire)) return null;
         const credential_provider = self.credential_provider orelse return null;
         if (parsed.dcid.len < 8 or parsed.scid.len == 0) return null;
         const retry_context: ?quic.path.RetryContext = switch (self.classifyRetry(routes, parsed, peer, now)) {
@@ -645,8 +692,10 @@ pub const Runtime = struct {
             allocator.destroy(entry);
             return null;
         };
+        self.noteCidRouteCount(routes.count());
         connections.put(handle, entry) catch {
             routes.remove(cid);
+            self.noteCidRouteCount(routes.count());
             entry.deinit(allocator);
             allocator.destroy(entry);
             return null;
@@ -654,6 +703,7 @@ pub const Runtime = struct {
         incPerIp(per_ip, peer.addr) catch {
             _ = connections.remove(handle);
             routes.remove(cid);
+            self.noteCidRouteCount(routes.count());
             entry.deinit(allocator);
             allocator.destroy(entry);
             return null;
@@ -739,6 +789,7 @@ pub const Runtime = struct {
     ) void {
         if (connections.fetchRemove(handle)) |kv| {
             for (kv.value.owned_cids[0..kv.value.owned_cid_count]) |cid| routes.remove(cid);
+            self.noteCidRouteCount(routes.count());
             decPerIp(per_ip, kv.value.admission_source_ip);
             kv.value.deinit(self.allocator);
             self.allocator.destroy(kv.value);
@@ -747,13 +798,13 @@ pub const Runtime = struct {
     }
 
     fn syncCidRoutes(self: *Runtime, entry: *ConnEntry, routes: *quic.cid.CidRoutingTable) void {
-        _ = self;
         var active: [quic.cid.max_local_active_cids]quic.cid.ConnectionId = undefined;
         const active_count = entry.conn.copyActiveLocalCids(&active);
         var i: usize = 0;
         while (i < entry.owned_cid_count) {
             if (!cidSliceContains(active[0..active_count], entry.owned_cids[i])) {
                 routes.remove(entry.owned_cids[i]);
+                self.noteCidRouteCount(routes.count());
                 entry.owned_cids[i] = entry.owned_cids[entry.owned_cid_count - 1];
                 entry.owned_cid_count -= 1;
                 continue;
@@ -763,7 +814,6 @@ pub const Runtime = struct {
     }
 
     fn maintainLocalCidRoutes(self: *Runtime, entry: *ConnEntry, handle: u64, routes: *quic.cid.CidRoutingTable) void {
-        _ = self;
         while (entry.conn.needsLocalCid() and entry.owned_cid_count < entry.owned_cids.len) {
             var cid_value: ?quic.cid.ConnectionId = null;
             var entropy: [quic.udp.MaxConnectionIdLen]u8 = undefined;
@@ -776,7 +826,7 @@ pub const Runtime = struct {
             }
             const cid = cid_value orelse return;
             switch (registerLocalCidRoute(entry, handle, routes, cid)) {
-                .registered => {},
+                .registered => self.noteCidRouteCount(routes.count()),
                 .collision => continue,
                 .queue_failed => return,
             }
@@ -837,12 +887,35 @@ pub const Runtime = struct {
                 entry.conn.close(entry.h3.closeCode(), "h3 request error", now);
                 return;
             } orelse break;
+            if (self.drain_requested.load(.acquire)) {
+                const boundary = entry.drain_goaway_boundary orelse drainBoundaryAfter(entry.highest_admitted_request_stream_id);
+                entry.drain_goaway_boundary = boundary;
+                if (requestRejectedByDrainBoundary(incoming.stream_id, boundary)) {
+                    entry.conn.resetStream(incoming.stream_id, 0x010b) catch {}; // H3_REQUEST_REJECTED
+                    entry.h3.finishRequest(incoming.stream_id);
+                    self.noteDrainRequestRejected();
+                    continue;
+                }
+            }
             self.serveRequest(entry, incoming, now);
         }
     }
 
+    fn sendDrainGoaway(self: *Runtime, entry: *ConnEntry) void {
+        if (!entry.conn.isEstablished() or !entry.h3_started) return;
+        const boundary = entry.drain_goaway_boundary orelse drainBoundaryAfter(entry.highest_admitted_request_stream_id);
+        entry.drain_goaway_boundary = boundary;
+        entry.h3.sendGoaway(entry.conn, boundary) catch |err| {
+            self.logger.warn(null, "http3: failed to queue GOAWAY during drain: {s}", .{@errorName(err)});
+            return;
+        };
+        entry.drain_goaway_sent = true;
+        self.noteDrainGoawaySent();
+    }
+
     fn serveRequest(self: *Runtime, entry: *ConnEntry, incoming: H3.IncomingRequest, now: u64) void {
         _ = now;
+        entry.highest_admitted_request_stream_id = maxOptional(entry.highest_admitted_request_stream_id, incoming.stream_id);
         entry.conn.setStreamSchedulingHint(incoming.stream_id, .{
             .urgency = incoming.priority.urgency,
             .incremental = incoming.priority.incremental,
@@ -1194,6 +1267,25 @@ pub const Runtime = struct {
         defer self.snapshot_mutex.unlock();
         self.snapshot_state.native_connections -|= 1;
         self.snapshot_state.tracked_connections -|= 1;
+        if (self.snapshot_state.tracked_connections == 0) self.snapshot_state.draining = false;
+    }
+
+    fn noteCidRouteCount(self: *Runtime, count: usize) void {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        self.snapshot_state.active_cid_routes = count;
+    }
+
+    fn noteDrainGoawaySent(self: *Runtime) void {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        self.snapshot_state.h3_goaway_sent += 1;
+    }
+
+    fn noteDrainRequestRejected(self: *Runtime) void {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        self.snapshot_state.h3_drain_request_rejections += 1;
     }
 
     fn noteHandshakeComplete(self: *Runtime) void {
@@ -1386,6 +1478,19 @@ fn sockaddrInFromAddress(addr: quic.udp.Address) std.c.sockaddr.in {
 /// pin with forged Initials (the native stack sends no Retry).
 fn admissionAllowed(total: usize, per_source: u32) bool {
     return total < max_connections and per_source < max_connections_per_source;
+}
+
+fn maxOptional(current: ?u64, candidate: u64) u64 {
+    return if (current) |value| @max(value, candidate) else candidate;
+}
+
+fn drainBoundaryAfter(highest_admitted_request_stream_id: ?u64) u64 {
+    const highest = highest_admitted_request_stream_id orelse return 0;
+    return highest +| 4;
+}
+
+fn requestRejectedByDrainBoundary(stream_id: u64, boundary: u64) bool {
+    return stream_id >= boundary;
 }
 
 /// What to do with a tracked connection after ingesting a datagram, decided
@@ -1904,6 +2009,16 @@ test "admissionAllowed enforces global and per-source caps at the boundary" {
     try testing.expect(!admissionAllowed(0, max_connections_per_source + 1));
     // Either cap alone is sufficient to reject.
     try testing.expect(!admissionAllowed(max_connections, max_connections_per_source));
+}
+
+test "drainBoundaryAfter permits admitted client-bidi streams" {
+    try testing.expectEqual(@as(u64, 0), drainBoundaryAfter(null));
+    try testing.expectEqual(@as(u64, 4), drainBoundaryAfter(0));
+    try testing.expectEqual(@as(u64, 12), drainBoundaryAfter(8));
+
+    try testing.expect(!requestRejectedByDrainBoundary(0, 4));
+    try testing.expect(requestRejectedByDrainBoundary(4, 4));
+    try testing.expect(requestRejectedByDrainBoundary(8, 4));
 }
 
 test "classifyIngest routes spoofed Initials, migration, and normal traffic" {

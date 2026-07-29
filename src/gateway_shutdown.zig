@@ -115,6 +115,23 @@ pub fn hotReloadConfig(
     }
     {
         var current_lease = worker_ctx.config_store.acquire();
+        const h3_listener_config_changed = http3ListenerConfigChanged(current_lease.cfg, cfg_ptr);
+        current_lease.release();
+        if (h3_listener_config_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "HTTP/3 listener configuration changed; restart required", .{}) catch "HTTP/3 listener configuration changed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected: HTTP/3 listener-owned configuration changed; restart the process to change http3_enabled, quic_port, migration, Retry, 0-RTT, or datagram sizing", .{});
+            return;
+        }
+    }
+    {
+        var current_lease = worker_ctx.config_store.acquire();
         const source_changed = (current_lease.cfg.tls_native_ticket_keys_path.len == 0) != (cfg_ptr.tls_native_ticket_keys_path.len == 0);
         current_lease.release();
         if (source_changed or (cfg_ptr.tls_native_ticket_keys_path.len > 0 and worker_ctx.resumption_runtime == null)) {
@@ -302,6 +319,18 @@ pub fn earlyDataReplayConfigChanged(
         current.tls_native_early_data_replay_max_entries != proposed.tls_native_early_data_replay_max_entries;
 }
 
+pub fn http3ListenerConfigChanged(
+    current: *const edge_config.EdgeConfig,
+    proposed: *const edge_config.EdgeConfig,
+) bool {
+    return current.http3_enabled != proposed.http3_enabled or
+        current.quic_port != proposed.quic_port or
+        current.http3_enable_0rtt != proposed.http3_enable_0rtt or
+        current.http3_connection_migration != proposed.http3_connection_migration or
+        current.http3_retry_policy != proposed.http3_retry_policy or
+        current.http3_max_datagram_size != proposed.http3_max_datagram_size;
+}
+
 test "earlyDataReplayConfigChanged detects mode and capacity changes independently" {
     const allocator = std.testing.allocator;
     var base = try edge_config.loadFromEnv(allocator);
@@ -328,6 +357,48 @@ test "earlyDataReplayConfigChanged detects mode and capacity changes independent
     try std.testing.expect(earlyDataReplayConfigChanged(&base, &proposed));
     proposed.tls_native_early_data_replay_max_entries = base.tls_native_early_data_replay_max_entries;
     try std.testing.expect(!earlyDataReplayConfigChanged(&base, &proposed));
+}
+
+test "http3ListenerConfigChanged permits advertisement-only reloads" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    base.http3_enabled = true;
+    proposed.http3_enabled = true;
+    proposed.http3_alt_svc = .auto;
+    proposed.http3_alt_svc_max_age_seconds = base.http3_alt_svc_max_age_seconds + 1;
+    try std.testing.expect(!http3ListenerConfigChanged(&base, &proposed));
+
+    proposed.quic_port = base.quic_port + 1;
+    try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
+    proposed.quic_port = base.quic_port;
+
+    proposed.http3_retry_policy = .address_validation;
+    try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
+}
+
+test "computeReloadedHttp3Advertisement withdraws active auto advertisement when reloaded off" {
+    const allocator = std.testing.allocator;
+    var cfg = try edge_config.loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+
+    cfg.http3_enabled = true;
+    cfg.http3_alt_svc = .off;
+    cfg.http3_alt_svc_max_age_seconds = 60;
+
+    const withdrawal = computeReloadedHttp3Advertisement(&cfg, true, 8443, .advertising);
+    try std.testing.expectEqual(http.http3_handler.Advertisement.clear, withdrawal);
+    try std.testing.expectEqual(http.http3_runtime.EffectiveAdvertisementState.clearing, stateForHttp3Advertisement(true, true, withdrawal));
+
+    const already_off = computeReloadedHttp3Advertisement(&cfg, true, 8443, .ready_advertisement_disabled);
+    try std.testing.expectEqual(http.http3_handler.Advertisement.disabled, already_off);
+
+    cfg.http3_alt_svc = .auto;
+    const active = computeReloadedHttp3Advertisement(&cfg, true, 8443, .clearing);
+    try std.testing.expectEqualDeep(http.http3_handler.Advertisement{ .active = .{ .port = 8443, .max_age_seconds = 60 } }, active);
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -532,8 +603,17 @@ pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Ga
 
     state.runtime_mutex.lock();
     state.add_headers = cfg.add_headers;
+    const previous_h3_advertisement_state = state.http3_advertisement_state;
     if (state.http3_alt_svc) |value| state.allocator.free(value);
-    state.http3_alt_svc = if (cfg.http3_enabled) http.http3_handler.formatAltSvc(state.allocator, cfg.quic_port) catch null else null;
+    const runtime_ready = if (state.http3_runtime) |runtime| runtime.snapshot().server_bootstrapped else false;
+    const advertisement = computeReloadedHttp3Advertisement(
+        cfg,
+        runtime_ready,
+        if (state.http3_runtime) |runtime| runtime.snapshot().quic_port else cfg.quic_port,
+        previous_h3_advertisement_state,
+    );
+    state.http3_alt_svc = http.http3_handler.formatAdvertisement(state.allocator, advertisement) catch null;
+    state.http3_advertisement_state = stateForHttp3Advertisement(cfg.http3_enabled, runtime_ready, advertisement);
     if (state.hsts_value.len > 0) state.allocator.free(state.hsts_value);
     state.hsts_value = computeHstsValue(state.allocator, cfg) catch &.{};
     state.security_headers = blk: {
@@ -559,6 +639,37 @@ pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Ga
     };
     state.logger.min_level = cfg.log_level;
     state.runtime_mutex.unlock();
+}
+
+fn computeReloadedHttp3Advertisement(
+    cfg: *const edge_config.EdgeConfig,
+    runtime_ready: bool,
+    runtime_port: u16,
+    previous_state: http.http3_runtime.EffectiveAdvertisementState,
+) http.http3_handler.Advertisement {
+    if (!cfg.http3_enabled or !runtime_ready) return .disabled;
+    if (cfg.http3_alt_svc == .off) {
+        return switch (previous_state) {
+            .advertising, .clearing, .draining => .clear,
+            else => .disabled,
+        };
+    }
+    return .{ .active = .{
+        .port = runtime_port,
+        .max_age_seconds = cfg.http3_alt_svc_max_age_seconds,
+    } };
+}
+
+fn stateForHttp3Advertisement(
+    http3_enabled: bool,
+    runtime_ready: bool,
+    advertisement: http.http3_handler.Advertisement,
+) http.http3_runtime.EffectiveAdvertisementState {
+    return switch (advertisement) {
+        .disabled => if (!http3_enabled) .disabled else if (!runtime_ready) .configured_unavailable else .ready_advertisement_disabled,
+        .clear => .clearing,
+        .active => .advertising,
+    };
 }
 
 pub fn reopenErrorLog(cfg: *const edge_config.EdgeConfig) !void {
@@ -613,6 +724,8 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
     state.metrics = http.metrics.Metrics.init();
     state.add_headers = &.{};
     state.http3_alt_svc = null;
+    state.http3_advertisement_state = .disabled;
+    state.http3_runtime = null;
     state.hsts_value = "";
     state.security_headers = http.security_headers.SecurityHeaders.api;
     state.max_connections_per_ip = 0;

@@ -36,6 +36,7 @@ pub fn writeStreamedUpstreamResponse(
     content_disposition: ?[]const u8,
     correlation_id: []const u8,
     security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
 ) !void {
     var header_buf: [4096]u8 = undefined;
@@ -48,6 +49,7 @@ pub fn writeStreamedUpstreamResponse(
         content_disposition,
         correlation_id,
         security,
+        alt_svc,
         sticky_set_cookie,
     ) catch {
         try writeStreamedUpstreamResponseHead(
@@ -58,6 +60,7 @@ pub fn writeStreamedUpstreamResponse(
             content_disposition,
             correlation_id,
             security,
+            alt_svc,
             sticky_set_cookie,
         );
         return;
@@ -73,6 +76,7 @@ pub fn writeStreamedUpstreamResponseHead(
     content_disposition: ?[]const u8,
     correlation_id: []const u8,
     security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
 ) !void {
     const phrase = if (reason.len > 0)
@@ -94,6 +98,7 @@ pub fn writeStreamedUpstreamResponseHead(
     }
 
     try writeSecurityHeaders(writer, security);
+    if (alt_svc) |value| try writer.print("Alt-Svc: {s}\r\n", .{value});
     try writer.writeAll("\r\n");
 }
 
@@ -105,6 +110,7 @@ pub fn writeStreamedUpstreamResponseHeadFromHeaders(
     body_allowed: bool,
     correlation_id: []const u8,
     security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
 ) !void {
     const phrase = if (reason.len > 0)
@@ -125,6 +131,7 @@ pub fn writeStreamedUpstreamResponseHeadFromHeaders(
         try writer.print("Set-Cookie: {s}\r\n", .{cookie});
     }
     try writeSecurityHeadersFiltered(writer, security, upstream_headers);
+    if (alt_svc) |value| try writer.print("Alt-Svc: {s}\r\n", .{value});
     try writer.writeAll("\r\n");
 }
 
@@ -134,6 +141,7 @@ pub fn writeBufferedUpstreamResponse(
     keep_alive: bool,
     correlation_id: []const u8,
     security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
 ) !void {
     var response_buf: [8192]u8 = undefined;
@@ -144,6 +152,7 @@ pub fn writeBufferedUpstreamResponse(
         keep_alive,
         correlation_id,
         security,
+        alt_svc,
         sticky_set_cookie,
     ) catch {
         try writeBufferedUpstreamResponseHead(
@@ -152,6 +161,7 @@ pub fn writeBufferedUpstreamResponse(
             keep_alive,
             correlation_id,
             security,
+            alt_svc,
             sticky_set_cookie,
         );
         if (upstream_response.body.len > 0) try writer.writeAll(upstream_response.body);
@@ -176,6 +186,7 @@ pub fn writeBufferedUpstreamResponseHead(
     keep_alive: bool,
     correlation_id: []const u8,
     security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
     sticky_set_cookie: ?[]const u8,
 ) !void {
     const phrase = if (upstream_response.reason.len > 0)
@@ -201,6 +212,7 @@ pub fn writeBufferedUpstreamResponseHead(
     // Only inject security headers that the upstream did not already supply,
     // preventing duplicate / conflicting headers (e.g. double CSP).
     try writeSecurityHeadersFiltered(writer, security, upstream_response.headers);
+    if (alt_svc) |value| try writer.print("Alt-Svc: {s}\r\n", .{value});
     try writer.writeAll("\r\n");
 }
 
@@ -342,6 +354,7 @@ test "writeBufferedUpstreamResponse preserves oversized body bytes exactly" {
         "req-large-body",
         &http.security_headers.SecurityHeaders.api,
         null,
+        null,
     );
 
     const raw = output.written();
@@ -376,6 +389,7 @@ test "writeBufferedUpstreamResponse serializes a single forwarded response head"
         true,
         "tg-1778460305668-bfebecb410803023",
         &http.security_headers.SecurityHeaders.api,
+        null,
         "tg_sticky=proxy",
     );
 
@@ -392,4 +406,38 @@ test "writeBufferedUpstreamResponse serializes a single forwarded response head"
     try std.testing.expect(std.mem.find(u8, output, "X-Correlation-ID: tg-1778460305668-bfebecb410803023\r\n") != null);
     try std.testing.expect(std.mem.find(u8, output, "Server: python\r\n") == null);
     try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\npong"));
+}
+
+test "writeBufferedUpstreamResponse strips upstream Alt-Svc and emits effective policy once" {
+    const allocator = std.testing.allocator;
+    const body = try allocator.dupe(u8, "pong");
+    var upstream_headers = [_]TestUpstreamHeader{
+        .{ .name = "Content-Type", .value = "text/plain" },
+        .{ .name = "Alt-Svc", .value = "h3=\":443\"; ma=86400" },
+    };
+
+    var response = TestBufferedUpstreamResponse{
+        .metadata_arena = std.heap.ArenaAllocator.init(allocator),
+        .status_code = 200,
+        .reason = "OK",
+        .headers = upstream_headers[0..],
+        .body = body,
+    };
+    defer response.deinit(allocator);
+
+    var buf: [4096]u8 = undefined;
+    var stream = compat.fixedBufferStream(&buf);
+    try writeBufferedUpstreamResponse(
+        stream.writer(),
+        &response,
+        true,
+        "req-alt-svc",
+        &http.security_headers.SecurityHeaders.api,
+        "clear",
+        null,
+    );
+
+    const output = stream.getWritten();
+    try std.testing.expect(std.mem.find(u8, output, "Alt-Svc: h3=\":443\"") == null);
+    try std.testing.expect(std.mem.find(u8, output, "Alt-Svc: clear\r\n") != null);
 }

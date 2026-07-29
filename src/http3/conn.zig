@@ -19,6 +19,7 @@ const priority = @import("priority.zig");
 const qpack = @import("qpack.zig");
 const session = @import("session.zig");
 const stream_transport = @import("stream_transport");
+const varint = @import("quic_varint");
 
 pub const Role = enum { client, server };
 
@@ -728,6 +729,13 @@ pub fn Conn(comptime Transport: type) type {
             self.finishRequest(stream_id);
         }
 
+        pub fn sendGoaway(self: *Self, transport: *Transport, stream_id: u64) !void {
+            const control = self.control_out orelse return error.MissingControlStream;
+            var wire: [32]u8 = undefined;
+            const goaway = try session.ResponseEncoder.encodeGoaway(stream_id, &wire);
+            try self.writeAll(transport, control, goaway, false);
+        }
+
         fn writeAll(self: *Self, transport: *Transport, stream_id: u64, bytes: []const u8, fin: bool) !void {
             _ = self;
             // The transport records FIN only when it accepts the whole slice
@@ -920,6 +928,37 @@ test "H3 conn: SETTINGS exchange and request/response over a mock transport" {
     try testing.expectEqualStrings("pong", response.body);
     try testing.expectEqualStrings("server", response.headers[0].name);
     client.releaseResponse(id);
+}
+
+test "H3 conn: sendGoaway writes the selected request boundary on the control stream" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try server.start(&server_transport);
+    try server.sendGoaway(&server_transport, 4);
+
+    const control_id = server.control_out.?;
+    const stream = client_transport.streams.get(control_id).?;
+    const bytes = stream.data.items;
+    const stream_type = try frame.decodeStreamType(bytes);
+    try testing.expectEqual(frame.StreamType.control, stream_type.typ);
+
+    const settings = try frame.decodeFrame(bytes[stream_type.len..]);
+    try testing.expectEqual(frame.FrameType.settings, settings.typ);
+
+    const goaway = try frame.decodeFrame(bytes[stream_type.len + settings.len ..]);
+    try testing.expectEqual(frame.FrameType.goaway, goaway.typ);
+    const boundary = try varint.decode(goaway.payload);
+    try testing.expectEqual(@as(u64, 4), boundary.value);
 }
 
 test "H3 conn: polls completed requests by urgency and reports priority" {

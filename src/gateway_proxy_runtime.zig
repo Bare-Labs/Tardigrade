@@ -115,11 +115,12 @@ pub const DataPlaneProxyResponse = union(enum) {
         keep_alive: bool,
         correlation_id: []const u8,
         security: *const http.security_headers.SecurityHeaders,
+        alt_svc: ?[]const u8,
         sticky_set_cookie: ?[]const u8,
     ) !void {
         switch (self.*) {
             .bounded_buffered => |*response| {
-                try writeBufferedUpstreamResponse(writer, response, keep_alive, correlation_id, security, sticky_set_cookie);
+                try writeBufferedUpstreamResponse(writer, response, keep_alive, correlation_id, security, alt_svc, sticky_set_cookie);
             },
         }
     }
@@ -558,6 +559,7 @@ pub fn handleLocationProxyPass(
                 auth_device_id,
                 auth_scopes,
                 &state.security_headers,
+                state.http3_alt_svc,
                 sticky_set_cookie,
                 if (ctx.lifecycle) |lc| &lc.token else null,
                 proxy_buffer_observer,
@@ -740,7 +742,7 @@ pub fn handleLocationProxyPass(
         }
     }
     ctx.setUpstreamResult(resolved.upstream_host, upstream_response.statusCode(), upstream_response.bodyLen());
-    try upstream_response.writeHttp1(writer, keep_alive, correlation_id, &state.security_headers, sticky_set_cookie);
+    try upstream_response.writeHttp1(writer, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, sticky_set_cookie);
     const status_code = upstream_response.statusCode();
     state.metricsRecord(status_code);
     return status_code;
