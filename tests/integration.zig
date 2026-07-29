@@ -10018,6 +10018,7 @@ test "#510 native tcp production 0-rtt reaches h1 safety gate and replay fallbac
         allocator: std.mem.Allocator,
         runtime: *tls_core.resumption_runtime.Runtime,
         retained: tls_core.session.ClientTicketState = .{},
+        ticket_count: u32 = 0,
 
         fn now(_: *anyopaque) i64 {
             return 2_000;
@@ -10029,6 +10030,7 @@ test "#510 native tcp production 0-rtt reaches h1 safety gate and replay fallbac
             self.retained = .{};
             ticket.cloneInto(self.allocator, &self.retained) catch unreachable;
             _ = self.runtime.storeClientTicket(ticket);
+            self.ticket_count += 1;
         }
     };
 
@@ -10047,6 +10049,7 @@ test "#510 native tcp production 0-rtt reaches h1 safety gate and replay fallbac
     const first_raw = try first_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
     defer allocator.free(first_raw);
     try assertContains(first_raw, "HTTP/1.1 200 OK");
+    try first_client.driveUntilTicketCount(&capture.ticket_count, 1, 5_000);
     try std.testing.expectEqual(tls_core.session.EarlyDataPolicy{ .early_data_capable = 16 * 1024 }, capture.retained.common.early_data);
 
     var safe_ticket: tls_core.session.ClientTicketState = .{};
@@ -10068,11 +10071,13 @@ test "#510 native tcp production 0-rtt reaches h1 safety gate and replay fallbac
     const unsafe_ticket_raw = try unsafe_ticket_client.readPlainToEnd(allocator, 64 * 1024, 5_000);
     defer allocator.free(unsafe_ticket_raw);
     try assertContains(unsafe_ticket_raw, "HTTP/1.1 200 OK");
+    try unsafe_ticket_client.driveUntilTicketCount(&capture.ticket_count, 2, 5_000);
     try std.testing.expectEqual(tls_core.session.EarlyDataPolicy{ .early_data_capable = 16 * 1024 }, capture.retained.common.early_data);
 
     var unsafe_ticket: tls_core.session.ClientTicketState = .{};
     defer unsafe_ticket.deinit();
     try capture.retained.cloneInto(allocator, &unsafe_ticket);
+    try std.testing.expect(!std.mem.eql(u8, unsafe_ticket.ticket.slice(), safe_ticket.ticket.slice()));
     try upstream.resetCapture();
 
     var clock_dummy: u8 = 0;
@@ -10312,6 +10317,24 @@ const PureZigTlsClient = struct {
             if (self.record.applicationDataOpen()) return error.EarlyDataNotAttempted;
             if (!driven.made_progress) try self.waitForReadiness(100);
         }
+        return error.ReadTimeout;
+    }
+
+    fn driveUntilTicketCount(self: *PureZigTlsClient, ticket_count: *const u32, expected: u32, timeout_ms: u64) !void {
+        const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (compat.milliTimestamp() < deadline) {
+            if (ticket_count.* >= expected) return;
+            const driven = self.record.drive() catch |err| switch (err) {
+                error.EndOfStream, error.TruncatedStream => break,
+                else => return err,
+            };
+            if (!driven.made_progress) self.waitForReadiness(100) catch |err| switch (err) {
+                error.ConnectionResetByPeer => break,
+                error.WouldBlock => {},
+                else => return err,
+            };
+        }
+        if (ticket_count.* >= expected) return;
         return error.ReadTimeout;
     }
 
