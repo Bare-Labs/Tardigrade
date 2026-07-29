@@ -726,6 +726,54 @@ test "fixed-size frames reject exact-short truncations" {
     try testing.expectError(error.TruncatedFrame, decodeFrame(&[_]u8{ 0x18, 0, 0, 1, 0xaa } ++ [_]u8{0xbb} ** 15));
 }
 
+test "decoder covers frame families without production encoders" {
+    try testing.expectError(error.MalformedFrame, decodeFrame(&[_]u8{ 0x07, 0x00 }));
+    const new_token = try decodeFrame(&[_]u8{ 0x07, 0x03, 't', 'o', 'k' });
+    try testing.expectEqualStrings("tok", new_token.frame.new_token.token);
+    try testing.expectEqual(@as(usize, 5), new_token.len);
+
+    try testing.expectEqual(@as(u64, 0x1234), (try decodeFrame(&[_]u8{ 0x14, 0x52, 0x34 })).frame.data_blocked);
+    const stream_blocked = (try decodeFrame(&[_]u8{ 0x15, 0x04, 0x40, 0x80 })).frame.stream_data_blocked;
+    try testing.expectEqual(@as(u64, 4), stream_blocked.id);
+    try testing.expectEqual(@as(u64, 128), stream_blocked.limit);
+    try testing.expectEqual(@as(u64, 5), (try decodeFrame(&[_]u8{ 0x16, 0x05 })).frame.streams_blocked_bidi);
+    try testing.expectEqual(@as(u64, 7), (try decodeFrame(&[_]u8{ 0x17, 0x07 })).frame.streams_blocked_uni);
+
+    const implicit = try decodeFrame(&[_]u8{ 0x08, 0x04, 'a', 'b' });
+    try testing.expectEqual(@as(u64, 4), implicit.frame.stream.id);
+    try testing.expectEqual(@as(u64, 0), implicit.frame.stream.offset);
+    try testing.expect(!implicit.frame.stream.fin);
+    try testing.expectEqualStrings("ab", implicit.frame.stream.data);
+    try testing.expectEqual(@as(usize, 4), implicit.len);
+}
+
+test "ACK ECN and arithmetic boundaries consume exactly or fail typed" {
+    const ack_ecn = [_]u8{ 0x03, 10, 0, 1, 2, 0, 2, 1, 2, 3 };
+    const parsed = try decodeFrame(&ack_ecn);
+    try testing.expectEqual(ack_ecn.len, parsed.len);
+    try testing.expect(parsed.frame.ack.ranges.contains(4));
+    try testing.expect(parsed.frame.ack.ranges.contains(6));
+    try testing.expect(parsed.frame.ack.ranges.contains(8));
+    try testing.expect(parsed.frame.ack.ranges.contains(10));
+    try testing.expectEqual(@as(u64, 1), parsed.frame.ack.ecn.?.ect0);
+    try testing.expectEqual(@as(u64, 2), parsed.frame.ack.ecn.?.ect1);
+    try testing.expectEqual(@as(u64, 3), parsed.frame.ack.ecn.?.ce);
+
+    try testing.expectError(error.TruncatedFrame, decodeFrame(ack_ecn[0 .. ack_ecn.len - 1]));
+    try testing.expectError(error.MalformedFrame, decodeFrame(&[_]u8{ 0x02, 0, 0, 1, 0, 0, 1 }));
+
+    var huge_gap: [16]u8 = undefined;
+    var pos: usize = 0;
+    pos += try varint.encode(frame_ack, huge_gap[pos..]);
+    pos += try varint.encode(5, huge_gap[pos..]);
+    pos += try varint.encode(0, huge_gap[pos..]);
+    pos += try varint.encode(1, huge_gap[pos..]);
+    pos += try varint.encode(0, huge_gap[pos..]);
+    pos += try varint.encode(4611686018427387903, huge_gap[pos..]);
+    pos += try varint.encode(0, huge_gap[pos..]);
+    try testing.expectError(error.MalformedFrame, decodeFrame(huge_gap[0..pos]));
+}
+
 test "fuzz: frame decoder preserves bounded consumption and slice invariants" {
     try testing.fuzz({}, fuzzFrameDecodeInvariants, .{ .corpus = &.{
         "",

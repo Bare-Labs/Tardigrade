@@ -510,6 +510,44 @@ test "coalesced packets split on the long-header Length field" {
     try testing.expectEqual(second_end - first_end, two.packet_len);
 }
 
+test "coalesced parser preserves valid prefixes around malformed packets" {
+    var buf: [384]u8 = undefined;
+    const dcid = [_]u8{0x51} ** 8;
+    const scid = [_]u8{0x52} ** 8;
+
+    const initial = try writeLongHeader(.initial, quic_v1, &dcid, &scid, "", 1, &buf);
+    patchLongHeaderLength(&buf, initial.length_offset, 1 + 16);
+    const initial_end = initial.pn_offset + 1 + 16;
+    @memset(buf[initial.pn_offset..initial_end], 0xa1);
+
+    const handshake = try writeLongHeader(.handshake, quic_v1, &dcid, &scid, "", 2, buf[initial_end..]);
+    patchLongHeaderLength(buf[initial_end..], handshake.length_offset, 2 + 16);
+    const handshake_end = initial_end + handshake.pn_offset + 2 + 16;
+    @memset(buf[initial_end + handshake.pn_offset .. handshake_end], 0xa2);
+
+    buf[handshake_end] = 0x80;
+    buf[handshake_end + 1] = 0x00;
+
+    const one = try parsePacket(buf[0 .. handshake_end + 2], dcid.len);
+    try testing.expectEqual(initial_end, one.packet_len);
+    const two = try parsePacket(buf[one.packet_len .. handshake_end + 2], dcid.len);
+    try testing.expectEqual(PacketKind.handshake, two.kind);
+    try testing.expectEqual(handshake_end - initial_end, two.packet_len);
+    try testing.expectError(error.TruncatedPacket, parsePacket(buf[one.packet_len + two.packet_len .. handshake_end + 2], dcid.len));
+
+    var invalid_first: [256]u8 = undefined;
+    invalid_first[0] = 0xc0;
+    std.mem.writeInt(u32, invalid_first[1..5], quic_v1, .big);
+    invalid_first[5] = max_cid_len + 1;
+    @memset(invalid_first[6..][0 .. max_cid_len + 1], 0);
+    const valid_start = 6 + max_cid_len + 1;
+    const valid = try writeLongHeader(.handshake, quic_v1, &dcid, &scid, "", 1, invalid_first[valid_start..]);
+    patchLongHeaderLength(invalid_first[valid_start..], valid.length_offset, 1);
+    invalid_first[valid_start + valid.pn_offset] = 0xa3;
+    const invalid_first_end = valid_start + valid.pn_offset + 1;
+    try testing.expectError(error.InvalidConnectionId, parsePacket(invalid_first[0..invalid_first_end], dcid.len));
+}
+
 test "short header parses with caller-provided DCID length" {
     var buf: [64]u8 = undefined;
     const dcid = [_]u8{7} ** 8;
@@ -520,6 +558,53 @@ test "short header parses with caller-provided DCID length" {
     try testing.expectEqual(PacketKind.one_rtt, parsed.kind);
     try testing.expectEqualSlices(u8, &dcid, parsed.dcid);
     try testing.expectEqual(pn_offset, parsed.pn_offset);
+}
+
+test "long header parser covers CID, version-list, and length boundaries" {
+    var buf: [192]u8 = undefined;
+    const max_dcid = [_]u8{0xd1} ** max_cid_len;
+    const max_scid = [_]u8{0xd2} ** max_cid_len;
+
+    const written = try writeLongHeader(.initial, quic_v1, &max_dcid, &max_scid, "", 1, &buf);
+    patchLongHeaderLength(&buf, written.length_offset, 1);
+    buf[written.pn_offset] = 0xaa;
+    const parsed = try parsePacket(buf[0 .. written.pn_offset + 1], max_dcid.len);
+    try testing.expectEqual(PacketKind.initial, parsed.kind);
+    try testing.expectEqualSlices(u8, &max_dcid, parsed.dcid);
+    try testing.expectEqualSlices(u8, &max_scid, parsed.scid);
+    try testing.expectEqual(@as(usize, written.pn_offset + 1), parsed.packet_len);
+
+    buf[0] = 0xc0;
+    std.mem.writeInt(u32, buf[1..5], 0, .big);
+    buf[5] = 0;
+    buf[6] = 0;
+    try testing.expectError(error.MalformedPacket, parsePacket(buf[0..7], 0));
+    std.mem.writeInt(u32, buf[7..11], quic_v1, .big);
+    const vn = try parsePacket(buf[0..11], 0);
+    try testing.expectEqual(PacketKind.version_negotiation, vn.kind);
+    try testing.expectEqual(@as(usize, 4), vn.supported_versions.len);
+    try testing.expectError(error.MalformedPacket, parsePacket(buf[0..10], 0));
+
+    const one_over = [_]u8{ 0xc0, 0, 0, 0, 1, max_cid_len + 1 } ++ [_]u8{0} ** (max_cid_len + 1);
+    try testing.expectError(error.InvalidConnectionId, parsePacket(&one_over, 0));
+    const scid_one_over = [_]u8{ 0xc0, 0, 0, 0, 1, 0, max_cid_len + 1 } ++ [_]u8{0} ** (max_cid_len + 1);
+    try testing.expectError(error.InvalidConnectionId, parsePacket(&scid_one_over, 0));
+
+    const len_exact = try writeLongHeader(.handshake, quic_v1, &.{}, &.{}, "", 1, &buf);
+    patchLongHeaderLength(&buf, len_exact.length_offset, 1);
+    buf[len_exact.pn_offset] = 0xbb;
+    try testing.expectEqual(len_exact.pn_offset + 1, (try parsePacket(buf[0 .. len_exact.pn_offset + 1], 0)).packet_len);
+    try testing.expectError(error.TruncatedPacket, parsePacket(buf[0..len_exact.pn_offset], 0));
+
+    buf[len_exact.length_offset] = 0xff;
+    buf[len_exact.length_offset + 1] = 0xff;
+    buf[len_exact.length_offset + 2] = 0xff;
+    buf[len_exact.length_offset + 3] = 0xff;
+    buf[len_exact.length_offset + 4] = 0xff;
+    buf[len_exact.length_offset + 5] = 0xff;
+    buf[len_exact.length_offset + 6] = 0xff;
+    buf[len_exact.length_offset + 7] = 0xff;
+    try testing.expectError(error.TruncatedPacket, parsePacket(buf[0 .. len_exact.length_offset + 8], 0));
 }
 
 test "fixed-bit violations and truncations are typed errors" {
