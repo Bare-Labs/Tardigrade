@@ -148,6 +148,7 @@ pub const LocalCidRegistry = struct {
     reset_token_key: [32]u8,
     entries: [max_local_active_cids]?Entry = [_]?Entry{null} ** max_local_active_cids,
     next_sequence: u64 = 0,
+    largest_advertised_sequence: ?u64 = null,
     metrics: Metrics = .{},
 
     pub fn init(peer_active_connection_id_limit: u64, reset_token_key: [32]u8) LocalCidRegistry {
@@ -161,7 +162,9 @@ pub const LocalCidRegistry = struct {
     /// (RFC 9000 §5.1.1). Call once, before any `issue`.
     pub fn registerInitial(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!Entry {
         std.debug.assert(self.next_sequence == 0);
-        return self.store(cid);
+        const entry = try self.store(cid);
+        self.largest_advertised_sequence = entry.sequence;
+        return entry;
     }
 
     /// Issue a fresh CID from caller-supplied entropy and return the
@@ -170,6 +173,13 @@ pub const LocalCidRegistry = struct {
     /// more CIDs than the peer's limit).
     pub fn issue(self: *LocalCidRegistry, entropy: []const u8, cid_len: u8) !NewConnectionIdFrame {
         const cid = try generateCid(entropy, cid_len);
+        return try self.issueCid(cid);
+    }
+
+    /// Issue a caller-generated CID. Production endpoints use this
+    /// transactional form so a route table entry can be reserved before the
+    /// exact CID is queued in a NEW_CONNECTION_ID frame.
+    pub fn issueCid(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!NewConnectionIdFrame {
         const entry = try self.store(cid);
         self.metrics.cids_issued += 1;
         return .{
@@ -207,7 +217,8 @@ pub const LocalCidRegistry = struct {
     /// permitted retransmit of an already-retired sequence. A sequence this
     /// endpoint never issued is a protocol violation (RFC 9000 §19.16).
     pub fn retire(self: *LocalCidRegistry, frame: RetireConnectionIdFrame) error{ProtocolViolation}!?ConnectionId {
-        if (frame.sequence >= self.next_sequence) return error.ProtocolViolation;
+        const largest = self.largest_advertised_sequence orelse return error.ProtocolViolation;
+        if (frame.sequence > largest) return error.ProtocolViolation;
         for (&self.entries) |*slot| {
             const entry = &(slot.* orelse continue);
             if (entry.sequence != frame.sequence) continue;
@@ -218,6 +229,17 @@ pub const LocalCidRegistry = struct {
         }
         // Issued in the past and already retired: a permitted retransmit.
         return null;
+    }
+
+    pub fn markAdvertised(self: *LocalCidRegistry, sequence: u64) error{ProtocolViolation}!void {
+        if (sequence >= self.next_sequence) return error.ProtocolViolation;
+        if (self.largest_advertised_sequence) |largest| {
+            if (sequence <= largest) return;
+            if (sequence != largest + 1) return error.ProtocolViolation;
+        } else if (sequence != 0) {
+            return error.ProtocolViolation;
+        }
+        self.largest_advertised_sequence = sequence;
     }
 
     pub fn activeCount(self: *const LocalCidRegistry) usize {
@@ -232,6 +254,24 @@ pub const LocalCidRegistry = struct {
         for (self.entries) |entry| {
             if (entry) |value| {
                 if (value.sequence == sequence) return value;
+            }
+        }
+        return null;
+    }
+
+    pub fn containsCid(self: *const LocalCidRegistry, cid: ConnectionId) bool {
+        for (self.entries) |entry| {
+            if (entry) |value| {
+                if (std.mem.eql(u8, value.cid.slice(), cid.slice())) return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn sequenceForCid(self: *const LocalCidRegistry, cid: ConnectionId) ?u64 {
+        for (self.entries) |entry| {
+            if (entry) |value| {
+                if (std.mem.eql(u8, value.cid.slice(), cid.slice())) return value.sequence;
             }
         }
         return null;
@@ -553,6 +593,7 @@ test "retired local CIDs stop routing and unknown retire sequences are violation
     var entropy = [_]u8{0x10} ** 8;
     const issued = try registry.issue(&entropy, 8);
     try table.insert(issued.cid, 1);
+    try registry.markAdvertised(issued.sequence);
     try testing.expectEqual(@as(u64, 1), issued.sequence);
     try testing.expectEqual(@as(?u64, 1), table.lookup(issued.cid.slice()));
 
@@ -575,6 +616,7 @@ test "local registry enforces the peer's active CID limit and derives reset toke
 
     var entropy = [_]u8{0x20} ** 8;
     const issued = try registry.issue(&entropy, 8);
+    try registry.markAdvertised(issued.sequence);
     // The frame's token matches the RFC 9000 §10.3.1 derivation for the CID.
     try testing.expectEqualSlices(u8, &statelessResetToken(key, issued.cid.slice()), &issued.stateless_reset_token);
 
@@ -714,6 +756,7 @@ test "CID issue/retire churn does not leak routing table entries" {
         std.mem.writeInt(u64, &entropy, iteration + 1, .big);
         const issued = try registry.issue(&entropy, 8);
         try table.insert(issued.cid, 1);
+        try registry.markAdvertised(issued.sequence);
         if (try registry.retire(.{ .sequence = previous_sequence })) |retired| {
             table.remove(retired);
         }
