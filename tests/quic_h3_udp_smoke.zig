@@ -158,16 +158,23 @@ fn processedRetryOffFlood(snapshot: http3_runtime.Snapshot) bool {
     return snapshot.datagrams_seen >= 8 and snapshot.tracked_connections == 0;
 }
 
-fn processedAdmissionCapFlood(snapshot: http3_runtime.Snapshot) bool {
-    return snapshot.datagrams_seen >= 48 and snapshot.tracked_connections <= 32;
-}
-
 fn sawFiveInvalidTokens(snapshot: http3_runtime.Snapshot) bool {
     return snapshot.invalid_tokens >= 5 and snapshot.tracked_connections == 0;
 }
 
 fn hasPathValidationFailure(snapshot: http3_runtime.Snapshot) bool {
     return snapshot.path_validations_failed > 0 and snapshot.tracked_connections > 0;
+}
+
+fn waitRuntimeDatagrams(runtime: *http3_runtime.Runtime, target: usize) !http3_runtime.Snapshot {
+    const deadline = nowUs() + 5_000_000;
+    while (nowUs() < deadline) {
+        const snapshot = runtime.snapshot();
+        if (snapshot.datagrams_seen >= target) return snapshot;
+        var ts = std.c.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = std.posix.system.nanosleep(&ts, &ts);
+    }
+    return error.TestTimedOut;
 }
 
 fn driveRuntimeRetryRequest(
@@ -554,6 +561,13 @@ test "udp smoke: HTTP/3 runtime Retry-off flood cleans unauthenticated state" {
     try testing.expect(!saw_retry);
     try testing.expectEqual(@as(usize, 1), handler_state.requests.load(.monotonic));
 
+    var cap_socket = try UdpSocket.open();
+    defer cap_socket.close();
+    const cap_path = quic.path.PathKey{
+        .local = addressFromSockaddrIn(cap_socket.addr),
+        .remote = runtime.local_address,
+    };
+    const before_cap = runtime.snapshot();
     const cap_attempts: usize = 40;
     for (0..cap_attempts) |i| {
         var cap_client_cid = [_]u8{0x31} ** 8;
@@ -573,21 +587,19 @@ test "udp smoke: HTTP/3 runtime Retry-off flood cleans unauthenticated state" {
             .initial_secret_dcid = &cap_odcid,
             .tls = cap_backend.backend(),
             .now_us = nowUs(),
-            .initial_path = client_path,
+            .initial_path = cap_path,
         });
         errdefer cap_client.deinit();
         var out: [2048]u8 = undefined;
         while (cap_client.pollTransmitOnPath(&out, nowUs())) |t| {
-            try client_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
+            try cap_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
         }
         cap_client.deinit();
     }
 
-    const cap_snapshot = try waitRuntimeSnapshot(&runtime, processedAdmissionCapFlood);
-    try testing.expect(cap_snapshot.datagrams_seen >= flood_attempts + cap_attempts);
-    try testing.expect(cap_snapshot.tracked_connections <= 32);
-    try testing.expect(cap_snapshot.tracked_connections > 0);
-    try testing.expect(cap_snapshot.native_connections <= 32);
+    const cap_snapshot = try waitRuntimeDatagrams(&runtime, before_cap.datagrams_seen + cap_attempts);
+    try testing.expectEqual(@as(usize, 32), cap_snapshot.tracked_connections);
+    try testing.expectEqual(@as(usize, 32), cap_snapshot.native_connections);
 }
 
 test "udp smoke: HTTP/3 runtime Retry rejects invalid token matrix without allocation" {
