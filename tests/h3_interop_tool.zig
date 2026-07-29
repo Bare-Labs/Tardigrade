@@ -238,6 +238,7 @@ fn randomEntropy() tls_backend.Entropy {
     var entropy: tls_backend.Entropy = undefined;
     randomBytes(&entropy.hello_random);
     randomBytes(&entropy.key_share_seed);
+    randomBytes(&entropy.retry_key_share_seed);
     return entropy;
 }
 

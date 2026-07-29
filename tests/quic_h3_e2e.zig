@@ -302,6 +302,7 @@ const Sim = struct {
                 .{
                     .hello_random = deterministicBytes(sim_config.seed, 0x01),
                     .key_share_seed = deterministicBytes(sim_config.seed, 0x02),
+                    .retry_key_share_seed = deterministicBytes(sim_config.seed, 0x05),
                 },
                 .{ .pinned_certificate = tls_backend.testdata.certificate_der },
             ),
@@ -309,6 +310,7 @@ const Sim = struct {
                 .{
                     .hello_random = deterministicBytes(sim_config.seed, 0x03),
                     .key_share_seed = deterministicBytes(sim_config.seed, 0x04),
+                    .retry_key_share_seed = deterministicBytes(sim_config.seed, 0x06),
                 },
                 try tls_backend.Identity.initPkcs8(
                     tls_backend.testdata.certificate_der,
