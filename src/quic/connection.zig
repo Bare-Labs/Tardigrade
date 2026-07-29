@@ -927,13 +927,13 @@ pub const Connection = struct {
     }
 
     pub fn advertiseLocalCid(self: *Connection, cid_value: quic_cid.ConnectionId) error{ CidLimitExceeded, DuplicateCid, OutOfMemory }!void {
+        try self.pending_new_connection_ids.ensureUnusedCapacity(self.allocator, 1);
         const registry = if (self.local_cids) |*registry| registry else return error.CidLimitExceeded;
         const ncid = registry.issueCid(cid_value) catch |err| switch (err) {
             error.CidLimitExceeded => return error.CidLimitExceeded,
             error.DuplicateCid => return error.DuplicateCid,
         };
-        errdefer _ = registry.retire(.{ .sequence = ncid.sequence }) catch null;
-        try self.pending_new_connection_ids.append(self.allocator, ncid);
+        self.pending_new_connection_ids.appendAssumeCapacity(ncid);
     }
 
     fn setState(self: *Connection, next: State) void {
@@ -2816,6 +2816,9 @@ pub const Connection = struct {
             self.last_ack_eliciting_sent_us[space_idx] = now_us;
             if (tracked) self.sent_records.append(self.allocator, record) catch {};
         }
+        if (record.carried_new_connection_id) |ncid| {
+            if (self.local_cids) |*registry| registry.markAdvertised(ncid.sequence) catch {};
+        }
         self.metrics.packets_sent += 1;
         self.events.emit(.{ .packet_sent = .{
             .space = space,
@@ -2912,13 +2915,14 @@ pub const Connection = struct {
             record.ack_eliciting = true;
             _ = self.pending_retires.orderedRemove(0);
         }
-        while (self.pending_new_connection_ids.items.len > 0) {
+        if (self.pending_new_connection_ids.items.len > 0) {
             const ncid = self.pending_new_connection_ids.items[0];
-            const n = frame.encodeNewConnectionId(ncid, plain[plain_len..budget]) catch break;
-            plain_len += n;
-            record.ack_eliciting = true;
-            record.carried_new_connection_id = ncid;
-            _ = self.pending_new_connection_ids.orderedRemove(0);
+            if (frame.encodeNewConnectionId(ncid, plain[plain_len..budget])) |n| {
+                plain_len += n;
+                record.ack_eliciting = true;
+                record.carried_new_connection_id = ncid;
+                _ = self.pending_new_connection_ids.orderedRemove(0);
+            } else |_| {}
         }
         // Only a PATH_RESPONSE queued for the active path rides along with
         // ordinary content; one queued for a candidate path is sent in
@@ -5855,6 +5859,76 @@ test "connection: lost NEW_CONNECTION_ID retransmits the same frame identity" {
     try testing.expectEqual(first.retire_prior_to, second.retire_prior_to);
     try testing.expectEqualSlices(u8, first.cid.slice(), second.cid.slice());
     try testing.expectEqualSlices(u8, &first.stateless_reset_token, &second.stateless_reset_token);
+}
+
+test "connection: unadvertised local CID retirement is a protocol violation" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const spare = try quic_cid.ConnectionId.init(&.{ 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8 });
+    try pair.server.advertiseLocalCid(spare);
+    try testing.expectEqual(@as(usize, 1), pair.server.pending_new_connection_ids.items.len);
+
+    try pair.server.applyFrame(.application, .{ .retire_connection_id = .{ .sequence = 1 } }, TestPair.server_path, 0, pair.now_us);
+    try testing.expectEqual(State.closing, pair.server.state());
+    try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
+}
+
+test "connection: advertised local CID can be retired from another active CID" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const spare = try quic_cid.ConnectionId.init(&.{ 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8 });
+    try pair.server.advertiseLocalCid(spare);
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+
+    try pair.server.applyFrame(.application, .{ .retire_connection_id = .{ .sequence = 1 } }, TestPair.server_path, 0, pair.now_us);
+    try testing.expectEqual(State.established, pair.server.state());
+    try testing.expectEqual(@as(?u64, null), pair.server.localCidSequence(spare.slice()));
+    try testing.expect(pair.server.needsLocalCid());
+}
+
+test "connection: losing one NEW_CONNECTION_ID leaves all queued CID identities pending" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const first_cid = try quic_cid.ConnectionId.init(&.{ 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8 });
+    const second_cid = try quic_cid.ConnectionId.init(&.{ 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8 });
+    try pair.server.advertiseLocalCid(first_cid);
+    try pair.server.advertiseLocalCid(second_cid);
+    try testing.expectEqual(@as(usize, 2), pair.server.pending_new_connection_ids.items.len);
+
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    const sent = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
+    const first = sent.carried_new_connection_id orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u64, 1), first.sequence);
+    try testing.expectEqualSlices(u8, first_cid.slice(), first.cid.slice());
+    try testing.expectEqual(@as(usize, 1), pair.server.pending_new_connection_ids.items.len);
+    try testing.expectEqualSlices(u8, second_cid.slice(), pair.server.pending_new_connection_ids.items[0].cid.slice());
+
+    pair.server.requeueRecord(sent);
+    try testing.expectEqual(@as(usize, 2), pair.server.pending_new_connection_ids.items.len);
+    var saw_first = false;
+    var saw_second = false;
+    for (pair.server.pending_new_connection_ids.items) |pending| {
+        if (pending.sequence == 1 and std.mem.eql(u8, pending.cid.slice(), first_cid.slice())) {
+            try testing.expectEqualSlices(u8, &first.stateless_reset_token, &pending.stateless_reset_token);
+            saw_first = true;
+        }
+        if (pending.sequence == 2 and std.mem.eql(u8, pending.cid.slice(), second_cid.slice())) {
+            saw_second = true;
+        }
+    }
+    try testing.expect(saw_first);
+    try testing.expect(saw_second);
 }
 
 test "driver: idle timeout closes silently" {

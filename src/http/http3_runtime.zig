@@ -677,14 +677,32 @@ pub const Runtime = struct {
                 break;
             }
             const cid = cid_value orelse return;
-            routes.insert(cid, handle) catch return;
-            entry.conn.advertiseLocalCid(cid) catch {
-                routes.remove(cid);
-                return;
-            };
-            entry.owned_cids[entry.owned_cid_count] = cid;
-            entry.owned_cid_count += 1;
+            switch (registerLocalCidRoute(entry, handle, routes, cid)) {
+                .registered => {},
+                .collision => continue,
+                .queue_failed => return,
+            }
         }
+    }
+
+    const RegisterLocalCidRouteResult = enum {
+        registered,
+        collision,
+        queue_failed,
+    };
+
+    fn registerLocalCidRoute(entry: *ConnEntry, handle: u64, routes: *quic.cid.CidRoutingTable, cid: quic.cid.ConnectionId) RegisterLocalCidRouteResult {
+        routes.insert(cid, handle) catch |err| switch (err) {
+            error.CidCollision => return .collision,
+            error.OutOfMemory => return .queue_failed,
+        };
+        entry.conn.advertiseLocalCid(cid) catch {
+            routes.remove(cid);
+            return .queue_failed;
+        };
+        entry.owned_cids[entry.owned_cid_count] = cid;
+        entry.owned_cid_count += 1;
+        return .registered;
     }
 
     fn pumpH3(self: *Runtime, entry: *ConnEntry, now: u64) void {
@@ -1264,6 +1282,108 @@ fn openUdpSocket(sa_family: u32) std.c.fd_t {
 
 const testing = std.testing;
 
+const RuntimeCidHarness = struct {
+    client_backend: quic.tls_backend.Tls13Backend,
+    server_backend: *quic.tls_backend.Tls13Backend,
+    client: *Connection,
+    entry: *ConnEntry,
+    now_us: u64 = 1_000_000,
+
+    const client_cid = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8 };
+    const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const client_path = quic.path.PathKey{
+        .local = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 42_000),
+        .remote = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 42_001),
+    };
+    const server_path = quic.path.PathKey{
+        .local = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 42_001),
+        .remote = quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 42_000),
+    };
+    const no_challenge = [_]u8{0} ** quic.path.path_challenge_len;
+
+    fn init(allocator: std.mem.Allocator, credential_provider: tls_core.credentials.CredentialProvider) !*RuntimeCidHarness {
+        const self = try allocator.create(RuntimeCidHarness);
+        errdefer allocator.destroy(self);
+        const server_backend = try allocator.create(quic.tls_backend.Tls13Backend);
+        errdefer allocator.destroy(server_backend);
+        const entry = try allocator.create(ConnEntry);
+        errdefer allocator.destroy(entry);
+        server_backend.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
+            .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32 },
+            credential_provider,
+        );
+        self.* = .{
+            .client_backend = quic.tls_backend.Tls13Backend.initClient(
+                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
+            ),
+            .server_backend = server_backend,
+            .client = undefined,
+            .entry = entry,
+        };
+        self.client = try Connection.init(allocator, .{
+            .role = .client,
+            .local_cid = &client_cid,
+            .original_dcid = &odcid,
+            .peer_cid = &odcid,
+            .tls = self.client_backend.backend(),
+            .now_us = self.now_us,
+            .initial_path = client_path,
+        });
+        errdefer self.client.deinit();
+        const server = try Connection.init(allocator, .{
+            .role = .server,
+            .local_cid = &odcid,
+            .original_dcid = &odcid,
+            .peer_cid = &client_cid,
+            .tls = server_backend.backend(),
+            .now_us = self.now_us,
+            .initial_path = server_path,
+            .stateless_reset_key = [_]u8{0x44} ** 32,
+        });
+        entry.* = .{
+            .backend = server_backend,
+            .conn = server,
+            .h3 = H3.initWithSettings(allocator, .server, .{}),
+            .admission_source_ip = 0x0100007f,
+            .cid_len = odcid.len,
+            .accepted_at_us = self.now_us,
+        };
+        entry.owned_cids[0] = try quic.cid.ConnectionId.init(&odcid);
+        entry.owned_cid_count = 1;
+        try self.pump();
+        return self;
+    }
+
+    fn deinit(self: *RuntimeCidHarness, allocator: std.mem.Allocator) void {
+        self.client.deinit();
+        self.entry.deinit(allocator);
+        allocator.destroy(self.entry);
+        allocator.destroy(self);
+    }
+
+    fn pump(self: *RuntimeCidHarness) !void {
+        var rounds: usize = 0;
+        while (rounds < 64) : (rounds += 1) {
+            var progressed = false;
+            var buf: [2048]u8 = undefined;
+            while (self.client.pollTransmitOnPath(&buf, self.now_us)) |t| {
+                try self.entry.conn.ingestOnPath(t.bytes, server_path, no_challenge, self.now_us);
+                progressed = true;
+                self.now_us += 500;
+            }
+            while (self.entry.conn.pollTransmitOnPath(&buf, self.now_us)) |t| {
+                try self.client.ingestOnPath(t.bytes, client_path, no_challenge, self.now_us);
+                progressed = true;
+                self.now_us += 500;
+            }
+            if (!progressed) break;
+        }
+        try testing.expect(self.client.isEstablished());
+        try testing.expect(self.entry.conn.isEstablished());
+    }
+};
+
 test "stream request bridge maps exchange fields and Host" {
     const allocator = testing.allocator;
     var request = try buildStreamRequest(allocator, .{
@@ -1302,6 +1422,117 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
     const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 });
     try testing.expectEqual(@as(u64, 1350), mid.max_udp_payload_size);
     try testing.expectEqual(quic.config.MigrationPolicy.disabled, mid.migration_policy);
+}
+
+test "http3 runtime: spare CID route is registered before NEW_CONNECTION_ID is pollable" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-cid-route-order-test");
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
+    defer harness.deinit(testing.allocator);
+
+    var routes = quic.cid.CidRoutingTable.init(testing.allocator);
+    defer routes.deinit();
+    const handle: u64 = 7;
+    const initial = harness.entry.owned_cids[0];
+    try routes.insert(initial, handle);
+    try testing.expect(routes.contains(initial));
+    try testing.expectEqual(@as(usize, 1), harness.entry.owned_cid_count);
+    try testing.expectEqual(@as(usize, 0), harness.entry.conn.pending_new_connection_ids.items.len);
+
+    runtime.maintainLocalCidRoutes(harness.entry, handle, &routes);
+    try testing.expectEqual(@as(usize, 2), harness.entry.owned_cid_count);
+    try testing.expectEqual(@as(usize, 1), harness.entry.conn.pending_new_connection_ids.items.len);
+    const spare = harness.entry.owned_cids[1];
+    try testing.expect(routes.contains(spare));
+
+    var out: [2048]u8 = undefined;
+    _ = harness.entry.conn.pollTransmitOnPath(&out, harness.now_us) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(usize, 0), harness.entry.conn.pending_new_connection_ids.items.len);
+}
+
+test "http3 runtime: CID route collision rolls back without stealing an existing route" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
+    defer harness.deinit(testing.allocator);
+
+    var routes = quic.cid.CidRoutingTable.init(testing.allocator);
+    defer routes.deinit();
+    const handle: u64 = 7;
+    const collision_owner: u64 = 99;
+    const candidate = try quic.cid.ConnectionId.init(&.{ 9, 8, 7, 6, 5, 4, 3, 2 });
+    try routes.insert(harness.entry.owned_cids[0], handle);
+    try routes.insert(candidate, collision_owner);
+
+    const before_routes = routes.count();
+    const before_owned = harness.entry.owned_cid_count;
+    const before_pending = harness.entry.conn.pending_new_connection_ids.items.len;
+    try testing.expectEqual(Runtime.RegisterLocalCidRouteResult.collision, Runtime.registerLocalCidRoute(harness.entry, handle, &routes, candidate));
+    try testing.expectEqual(before_routes, routes.count());
+    try testing.expectEqual(before_owned, harness.entry.owned_cid_count);
+    try testing.expectEqual(before_pending, harness.entry.conn.pending_new_connection_ids.items.len);
+    try testing.expectEqual(@as(?u64, collision_owner), routes.lookup(candidate.slice()));
+}
+
+test "http3 runtime: retired CIDs stop routing, replenish, and teardown removes every route" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-cid-teardown-test");
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
+    defer {
+        harness.client.deinit();
+        testing.allocator.destroy(harness);
+    }
+
+    var routes = quic.cid.CidRoutingTable.init(testing.allocator);
+    defer routes.deinit();
+    const handle: u64 = 7;
+    const initial = harness.entry.owned_cids[0];
+    try routes.insert(initial, handle);
+    runtime.maintainLocalCidRoutes(harness.entry, handle, &routes);
+    const spare = harness.entry.owned_cids[1];
+    try testing.expect(routes.contains(spare));
+
+    var out: [2048]u8 = undefined;
+    _ = harness.entry.conn.pollTransmitOnPath(&out, harness.now_us) orelse return error.TestExpectedEqual;
+    _ = try harness.entry.conn.local_cids.?.retire(.{ .sequence = 1 });
+    runtime.syncCidRoutes(harness.entry, &routes);
+    try testing.expect(!routes.contains(spare));
+    try testing.expectEqual(@as(?u64, null), routes.lookup(spare.slice()));
+
+    runtime.maintainLocalCidRoutes(harness.entry, handle, &routes);
+    try testing.expectEqual(@as(usize, 2), harness.entry.owned_cid_count);
+    try testing.expect(routes.contains(initial));
+    const replacement = for (harness.entry.owned_cids[0..harness.entry.owned_cid_count]) |cid| {
+        if (!std.mem.eql(u8, cid.slice(), initial.slice())) break cid;
+    } else return error.TestExpectedEqual;
+    try testing.expect(!std.mem.eql(u8, replacement.slice(), spare.slice()));
+    try testing.expect(routes.contains(replacement));
+
+    var connections = std.AutoHashMap(u64, *ConnEntry).init(testing.allocator);
+    defer connections.deinit();
+    var per_ip = std.AutoHashMap(u32, u32).init(testing.allocator);
+    defer per_ip.deinit();
+    const admission_ip = harness.entry.admission_source_ip;
+    try connections.put(handle, harness.entry);
+    try incPerIp(&per_ip, admission_ip);
+    runtime.removeConnection(&connections, &routes, &per_ip, handle);
+    try testing.expectEqual(@as(usize, 0), connections.count());
+    try testing.expectEqual(@as(usize, 0), routes.count());
+    try testing.expectEqual(@as(?u32, null), per_ip.get(admission_ip));
 }
 
 test "quicEarlyDataTransportCompatible (#523): rejects any reduced limit in the full RFC 9000 §7.4.1 set" {
