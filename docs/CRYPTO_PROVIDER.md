@@ -30,8 +30,9 @@ boundary is what keeps the two from coupling to each other.
   `SigningKey` handle, and the `CryptoProvider` interface (a `context` pointer
   plus a `*const VTable`, the same seam shape as the QUIC `TlsBackend`).
 - `src/crypto/profile.zig` — the checked-in capability matrix: every
-  TLS/QUIC/PKI algorithm name, implementation family, pure-Zig/OpenSSL status,
-  tests, consumers, and Zig version floor.
+  TLS/QUIC/PKI algorithm name, implementation family, primitive-provider
+  status, protocol-integration consumers, product-profile notes, tests, and
+  Zig version floor.
 - `src/tls/crypto_profile.zig` — the TLS-side adapter that maps provider
   capabilities to TLS policy capabilities without making crypto import TLS.
 - `src/crypto/secrets.zig` — fixed-size and bounded dynamic secret containers,
@@ -40,6 +41,8 @@ boundary is what keeps the two from coupling to each other.
 - `src/crypto/pure_zig.zig` — the first concrete backend, built entirely on
   `std.crypto`. Implements the narrow first profile and advertises exactly that.
 - `src/crypto/root.zig` — the package aggregator.
+- `docs/CRYPTO_PROVIDER_AUDIT.md` — the current native TLS/QUIC/PKI/resumption
+  direct-crypto ownership audit and exception list.
 - Tests run under `zig build test-crypto` and as part of `zig build test`.
 
 The OpenSSL adapter is future work: a second file implementing the same
@@ -50,6 +53,8 @@ changes when it lands.
 
 - **HKDF** extract and expand-label over SHA-256 and SHA-384.
 - **AEAD** seal/open for AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305.
+- **QUIC header protection** for the AES-128 profile, exposed as a narrow
+  packet-protection mask operation rather than as a reusable AES block API.
 - **Key exchange** — ephemeral key-share generation and shared-secret derivation
   for X25519 and (declared, not yet implemented in pure Zig) secp256r1.
 - **Signatures** — verification for Ed25519, ECDSA-P256, and RSA-PSS, plus
@@ -60,11 +65,18 @@ changes when it lands.
 - **Opaque private-key handles** and **capability discovery**.
 
 The pure-Zig backend implements the overlap the TLS/QUIC engines need today:
-HKDF (SHA-256/384), all three AEADs, X25519, Ed25519, ECDSA-P256
-verification, and RSA-PSS verification. The remaining algorithms are named by
-the interface so protocol and negotiation code is written once; capability
-discovery reports them absent and every entry point returns
-`error.UnsupportedCapability` until a backend provides them.
+HKDF (SHA-256/384), all three AEAD primitives, AES-128 QUIC header protection,
+X25519, Ed25519, ECDSA-P256 verification, and RSA-PSS verification. The
+remaining algorithms are named by the interface so protocol and negotiation
+code is written once; capability discovery reports them absent and every entry
+point returns `error.UnsupportedCapability` until a backend provides them.
+
+Primitive support is not the same thing as protocol integration. For example,
+the provider can seal/open AES-256-GCM and ChaCha20-Poly1305, but native QUIC
+currently integrates only the TLS_AES_128_GCM_SHA256 packet-protection profile
+end to end. `src/crypto/profile.zig` records both facts: provider status in the
+status columns, and live consumers/product-profile constraints in the consumer
+set and review text.
 
 ## Supported profile matrix
 
@@ -75,7 +87,10 @@ The table below summarizes the checked-in profile for review:
 | --- | --- | --- | --- | --- |
 | SHA-256, SHA-384 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF, QUIC TLS bridge |
 | HKDF-SHA256, HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule, QUIC packet protection |
-| AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | TLS records, QUIC packet protection |
+| AES-128-GCM | supported | `std.crypto` | provider deferred | TLS records, QUIC packet protection |
+| AES-256-GCM | supported | `std.crypto` | provider deferred | TLS records; QUIC integration deferred |
+| ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | protocol integration deferred |
+| QUIC AES-128 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection |
 | X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge |
 | secp256r1 / P-256 | provider deferred | unavailable | provider deferred | TLS key share, PKI |
 | Ed25519 | supported | `std.crypto` | provider deferred | CertificateVerify, PKI |
@@ -98,6 +113,14 @@ implements it. When a call site must accept hand-written TLS capability lists,
 it should preflight them with `tls.crypto_profile.validateAgainstProvider`
 before handshake execution.
 
+The native appliance profile remains the deliberately narrow in-process
+pure-Zig path: no OpenSSL or libcrypto linkage, native QUIC/H3 packet
+protection through `CryptoProvider`, and general-purpose OpenSSL TLS available
+only through the existing non-native backend. OpenSSL remains valid as the
+general-purpose TLS backend and as an out-of-process deterministic/differential
+oracle; it is not required as an in-process native `CryptoProvider` for this
+profile.
+
 ## Design rules
 
 ### Capability discovery is explicit
@@ -113,6 +136,11 @@ Every algorithm addition or status change must update `src/crypto/profile.zig`
 in the same PR as the implementation. Reviewers should check that the row names
 the implementation family, provider status, test coverage, consumers, and
 security assumptions before accepting a new negotiated algorithm.
+
+`zig build audit-crypto-boundary` and `zig build test-crypto` run the checked-in
+source guard in `scripts/audit-crypto-boundary.sh`. The guard blocks new direct
+keyed crypto shortcuts in QUIC protocol modules outside the approved
+provider-owned adapter and documented exceptions.
 
 ### Errors are classified
 

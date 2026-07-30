@@ -70,6 +70,7 @@ const case_registry = [_]CaseMeta{
     .{ .id = "tls13-record-aes128-gcm-independent", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .positive, .source = "tests/vectors/generate_crypto_vectors.js", .license = "project fixture", .reproduction = "node tests/vectors/generate_crypto_vectors.js" },
     .{ .id = "quic-v1-initial-rfc9001", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .positive, .source = "RFC 9001 Appendix A.1/A.3", .license = "IETF Trust", .reproduction = "fixed RFC literals plus tests/vectors/generate_crypto_vectors.js small packet" },
     .{ .id = "quic-v1-initial-auth-failure", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "quic-header-protection-aes128-rfc9001", .algorithm = .{ .quic_header_protection = .aes_128 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 9001 Appendix A.3", .license = "IETF Trust", .reproduction = "fixed RFC sample" },
     .{ .id = "aes-128-gcm-nist-zero-block", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .positive, .source = "NIST SP 800-38D / CAVP GCM zero-block vector", .license = "public domain", .reproduction = "published NIST vector" },
     .{ .id = "aes-128-gcm-tag-rejection", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "aes-256-gcm-nist-zero-block", .algorithm = .{ .aead = .aes_256_gcm }, .providers = pure_zig_only, .class = .positive, .source = "NIST SP 800-38D / CAVP GCM zero-block vector", .license = "public domain", .reproduction = "published NIST vector" },
@@ -180,6 +181,7 @@ fn algorithmEql(a: profile.Algorithm, b: profile.Algorithm) bool {
         .hash => |value| b == .hash and b.hash == value,
         .hkdf => |value| b == .hkdf and b.hkdf == value,
         .aead => |value| b == .aead and b.aead == value,
+        .quic_header_protection => |value| b == .quic_header_protection and b.quic_header_protection == value,
         .group => |value| b == .group and b.group == value,
         .signature => |value| b == .signature and b.signature == value,
         .certificate_helper => |value| b == .certificate_helper and b.certificate_helper == value,
@@ -216,7 +218,7 @@ fn rowStatus(kind: ProviderKind, row: profile.Row) profile.Status {
 fn requiresNegativeCase(algorithm: profile.Algorithm) bool {
     return switch (algorithm) {
         .aead, .group, .signature, .hkdf => true,
-        .hash, .certificate_helper, .entropy => false,
+        .hash, .quic_header_protection, .certificate_helper, .entropy => false,
     };
 }
 
@@ -379,8 +381,11 @@ fn runTlsRecordVector(log: *ExecutionLog) !void {
 fn runQuicInitialVector(log: *ExecutionLog) !void {
     _ = try log.execute("quic-v1-initial-rfc9001");
     _ = try log.execute("quic-v1-initial-auth-failure");
+    _ = try log.execute("quic-header-protection-aes128-rfc9001");
+    const cp = cryptoProvider();
     const dcid = hexBytes("8394c8f03e515708");
     const secrets = try quic.tls_adapter.deriveInitialSecretsV1(&dcid);
+    const provider_secrets = try quic.tls_adapter.deriveInitialSecretsV1WithProvider(cp, &dcid);
 
     try expectStage("quic initial secret / RFC 9001 A.1", &hexBytes("7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44"), &secrets.initial_secret);
     try expectStage("quic client initial secret / RFC 9001 A.1", &hexBytes("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"), &secrets.client.secret);
@@ -396,6 +401,8 @@ fn runQuicInitialVector(log: *ExecutionLog) !void {
 
     const sample = hexBytes("d1b1c98dd7689fb8ec11d242b123dc9b");
     try expectStage("quic header-protection mask / RFC 9001 A.3", &hexBytes("437b9aec36"), &secrets.client.headerProtectionMask(sample));
+    const provider_mask = try provider_secrets.client.headerProtectionMaskWithProvider(cp, sample);
+    try expectStage("quic provider header-protection mask / RFC 9001 A.3", &hexBytes("437b9aec36"), &provider_mask);
 
     var header = hexBytes("c300000001088394c8f03e5157080000403400000002");
     var plaintext = [_]u8{0} ** 32;

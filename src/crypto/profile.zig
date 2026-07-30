@@ -31,6 +31,7 @@ pub const Category = enum {
     hash,
     hkdf,
     aead,
+    quic_header_protection,
     group,
     signature,
     certificate_helper,
@@ -62,6 +63,7 @@ pub const Algorithm = union(Category) {
     hash: provider.Hash,
     hkdf: provider.Hash,
     aead: provider.Aead,
+    quic_header_protection: provider.QuicHeaderProtection,
     group: provider.Group,
     signature: provider.SignatureScheme,
     certificate_helper: CertificateHelper,
@@ -87,9 +89,10 @@ pub const rows = [_]Row{
     row(.{ .hash = .sha384 }, "SHA-384", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "provider capability and HKDF tests", .{.tls_handshake}, "Hash additions require TLS 1.3 suite mapping."),
     row(.{ .hkdf = .sha256 }, "HKDF-SHA256", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "RFC 5869/std.crypto and TLS expand-label parity", .{ .tls_handshake, .quic_tls_bridge, .quic_packet_protection }, "HKDF additions require extract and expand-label vectors."),
     row(.{ .hkdf = .sha384 }, "HKDF-SHA384", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "provider capability and expand-label tests", .{.tls_handshake}, "HKDF additions require TLS 1.3 label coverage."),
-    row(.{ .aead = .aes_128_gcm }, "AES-128-GCM", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "seal/open round-trip, tamper rejection, AD mismatch", .{ .tls_record, .quic_packet_protection }, "AEAD additions require auth-failure zeroing tests."),
-    row(.{ .aead = .aes_256_gcm }, "AES-256-GCM", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "seal/open round-trip, tamper rejection, AD mismatch", .{ .tls_record, .quic_packet_protection }, "AEAD additions require TLS cipher-suite mapping."),
-    row(.{ .aead = .chacha20_poly1305 }, "ChaCha20-Poly1305", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "seal/open round-trip, tamper rejection, AD mismatch", .{ .tls_record, .quic_packet_protection }, "AEAD additions require QUIC packet-protection coverage."),
+    row(.{ .aead = .aes_128_gcm }, "AES-128-GCM", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "seal/open round-trip, tamper rejection, AD mismatch", .{ .tls_record, .quic_packet_protection }, "Provider primitive is implemented; protocol integration is TLS_AES_128_GCM_SHA256 records and QUIC packet payload protection."),
+    row(.{ .aead = .aes_256_gcm }, "AES-256-GCM", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "seal/open round-trip, tamper rejection, AD mismatch", .{.tls_record}, "Provider primitive exists; QUIC/TLS protocol integration is deferred until TLS_AES_256_GCM_SHA384 negotiation lands."),
+    row(.{ .aead = .chacha20_poly1305 }, "ChaCha20-Poly1305", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "seal/open round-trip, tamper rejection, AD mismatch", .{}, "Provider primitive exists; TLS/QUIC protocol integration is deferred until the suite is negotiated end to end."),
+    row(.{ .quic_header_protection = .aes_128 }, "QUIC AES-128 header protection", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "RFC 9001 header-protection sample and provider mask parity", .{.quic_packet_protection}, "Narrow provider-owned keyed QUIC header-protection operation for TLS_AES_128_GCM_SHA256."),
     row(.{ .group = .x25519 }, "X25519", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "std.crypto scalar multiplication parity, low-order rejection", .{ .tls_handshake, .quic_tls_bridge }, "Group additions require key-share and shared-secret vectors."),
     row(.{ .group = .secp256r1 }, "secp256r1 (P-256)", .unavailable, .provider_deferred, .openssl_provider, .provider_deferred, "capability rejection tests", .{ .tls_handshake, .quic_tls_bridge, .pki }, "P-256 support requires explicit provider implementation and ECDH vectors."),
     row(.{ .signature = .ed25519 }, "Ed25519", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "sign/verify, tamper rejection, wrong-key rejection", .{ .tls_handshake, .pki }, "Signature additions require CertificateVerify vectors."),
@@ -152,6 +155,7 @@ pub fn capabilities(kind: ProviderKind) provider.Capabilities {
         switch (entry.algorithm) {
             .hash => |hash| caps.hashes.insert(hash),
             .aead => |aead| caps.aeads.insert(aead),
+            .quic_header_protection => |hp| caps.quic_header_protection.insert(hp),
             .group => |group| caps.groups.insert(group),
             .signature => |scheme| caps.signatures.insert(scheme),
             .hkdf, .certificate_helper, .entropy => {},
@@ -172,6 +176,7 @@ fn algorithmEql(a: Algorithm, b: Algorithm) bool {
         .hash => |value| b == .hash and b.hash == value,
         .hkdf => |value| b == .hkdf and b.hkdf == value,
         .aead => |value| b == .aead and b.aead == value,
+        .quic_header_protection => |value| b == .quic_header_protection and b.quic_header_protection == value,
         .group => |value| b == .group and b.group == value,
         .signature => |value| b == .signature and b.signature == value,
         .certificate_helper => |value| b == .certificate_helper and b.certificate_helper == value,
@@ -193,6 +198,7 @@ test "matrix covers every provider algorithm enum" {
         try expectRow(.{ .hkdf = hash });
     }
     inline for (std.enums.values(provider.Aead)) |aead| try expectRow(.{ .aead = aead });
+    inline for (std.enums.values(provider.QuicHeaderProtection)) |hp| try expectRow(.{ .quic_header_protection = hp });
     inline for (std.enums.values(provider.Group)) |group| try expectRow(.{ .group = group });
     inline for (std.enums.values(provider.SignatureScheme)) |scheme| try expectRow(.{ .signature = scheme });
     inline for (std.enums.values(CertificateHelper)) |helper| try expectRow(.{ .certificate_helper = helper });
@@ -206,6 +212,7 @@ test "pure-Zig profile capabilities are queryable" {
     try std.testing.expect(caps.supportsAead(.aes_128_gcm));
     try std.testing.expect(caps.supportsAead(.aes_256_gcm));
     try std.testing.expect(caps.supportsAead(.chacha20_poly1305));
+    try std.testing.expect(caps.supportsQuicHeaderProtection(.aes_128));
     try std.testing.expect(caps.supportsGroup(.x25519));
     try std.testing.expect(!caps.supportsGroup(.secp256r1));
     try std.testing.expect(caps.supportsSignature(.ed25519));

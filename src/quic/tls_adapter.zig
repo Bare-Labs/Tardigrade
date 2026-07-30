@@ -19,11 +19,13 @@
 const std = @import("std");
 const config = @import("config.zig");
 const crypto_secrets = @import("crypto_secrets");
+const crypto_pkg = @import("crypto");
 const packet = @import("packet.zig");
 const tls_core = @import("tls_core");
 
 const crypto = std.crypto;
 const tls = std.crypto.tls;
+const crypto_provider = crypto_pkg.provider;
 const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 const Aes128 = crypto.core.aes.Aes128;
@@ -206,6 +208,28 @@ pub const PacketProtectionKeys = struct {
         return out[0..required_len];
     }
 
+    pub fn sealPayloadWithProvider(
+        self: *const PacketProtectionKeys,
+        provider: crypto_provider.CryptoProvider,
+        packet_number: u64,
+        header: []const u8,
+        plaintext: []const u8,
+        out: []u8,
+    ) error{ InvalidPacketNumber, OutputTooSmall, ProviderUnsupported }![]u8 {
+        try validatePacketNumber(packet_number);
+        if (plaintext.len > std.math.maxInt(usize) - packet_protection_tag_len) return error.OutputTooSmall;
+        const required_len = plaintext.len + packet_protection_tag_len;
+        if (out.len < required_len) return error.OutputTooSmall;
+
+        var tag: [packet_protection_tag_len]u8 = undefined;
+        provider.aeadSeal(.aes_128_gcm, &self.key, &self.nonce(packet_number), header, plaintext, out[0..plaintext.len], &tag) catch |err| switch (err) {
+            error.UnsupportedCapability => return error.ProviderUnsupported,
+            error.InvalidInput => return error.OutputTooSmall,
+        };
+        @memcpy(out[plaintext.len..][0..packet_protection_tag_len], &tag);
+        return out[0..required_len];
+    }
+
     pub fn openPayload(
         self: *const PacketProtectionKeys,
         packet_number: u64,
@@ -231,11 +255,53 @@ pub const PacketProtectionKeys = struct {
         return out[0..ciphertext_len];
     }
 
+    pub fn openPayloadWithProvider(
+        self: *const PacketProtectionKeys,
+        provider: crypto_provider.CryptoProvider,
+        packet_number: u64,
+        header: []const u8,
+        protected_payload: []const u8,
+        out: []u8,
+    ) error{ InvalidPacketNumber, ProtectedPayloadTooShort, OutputTooSmall, AuthenticationFailed, ProviderUnsupported }![]u8 {
+        try validatePacketNumber(packet_number);
+        if (protected_payload.len < packet_protection_tag_len) return error.ProtectedPayloadTooShort;
+        const ciphertext_len = protected_payload.len - packet_protection_tag_len;
+        if (out.len < ciphertext_len) return error.OutputTooSmall;
+
+        provider.aeadOpen(
+            .aes_128_gcm,
+            &self.key,
+            &self.nonce(packet_number),
+            header,
+            protected_payload[0..ciphertext_len],
+            protected_payload[ciphertext_len..][0..packet_protection_tag_len],
+            out[0..ciphertext_len],
+        ) catch |err| switch (err) {
+            error.UnsupportedCapability => return error.ProviderUnsupported,
+            error.InvalidInput => return error.OutputTooSmall,
+            error.AuthenticationFailed => return error.AuthenticationFailed,
+        };
+        return out[0..ciphertext_len];
+    }
+
     pub fn headerProtectionMask(self: *const PacketProtectionKeys, sample: [header_protection_sample_len]u8) [5]u8 {
         const aes = Aes128.initEnc(self.hp);
         var block: [header_protection_sample_len]u8 = undefined;
         aes.encrypt(&block, &sample);
         return block[0..5].*;
+    }
+
+    pub fn headerProtectionMaskWithProvider(
+        self: *const PacketProtectionKeys,
+        provider: crypto_provider.CryptoProvider,
+        sample: [header_protection_sample_len]u8,
+    ) error{ProviderUnsupported}![5]u8 {
+        var mask: [5]u8 = undefined;
+        provider.quicHeaderProtectionMask(.aes_128, &self.hp, &sample, &mask) catch |err| switch (err) {
+            error.UnsupportedCapability => return error.ProviderUnsupported,
+            error.InvalidInput => return error.ProviderUnsupported,
+        };
+        return mask;
     }
 
     /// Apply QUIC header protection in place (RFC 9001 §5.4.1). `first_byte` is
@@ -251,6 +317,19 @@ pub const PacketProtectionKeys = struct {
     ) void {
         std.debug.assert(packet_number_field.len >= 1 and packet_number_field.len <= max_packet_number_length);
         const mask = self.headerProtectionMask(sample);
+        first_byte.* ^= mask[0] & firstByteMask(first_byte.*);
+        for (packet_number_field, 0..) |*byte, index| byte.* ^= mask[1 + index];
+    }
+
+    pub fn applyHeaderProtectionWithProvider(
+        self: *const PacketProtectionKeys,
+        provider: crypto_provider.CryptoProvider,
+        first_byte: *u8,
+        packet_number_field: []u8,
+        sample: [header_protection_sample_len]u8,
+    ) error{ProviderUnsupported}!void {
+        std.debug.assert(packet_number_field.len >= 1 and packet_number_field.len <= max_packet_number_length);
+        const mask = try self.headerProtectionMaskWithProvider(provider, sample);
         first_byte.* ^= mask[0] & firstByteMask(first_byte.*);
         for (packet_number_field, 0..) |*byte, index| byte.* ^= mask[1 + index];
     }
@@ -276,6 +355,25 @@ pub const PacketProtectionKeys = struct {
         sample: [header_protection_sample_len]u8,
     ) RemovedHeaderProtection {
         const mask = self.headerProtectionMask(sample);
+        first_byte.* ^= mask[0] & firstByteMask(first_byte.*);
+        const packet_number_length: usize = @as(usize, first_byte.* & 0x03) + 1;
+        var truncated: u64 = 0;
+        var index: usize = 0;
+        while (index < packet_number_length) : (index += 1) {
+            sampled_pn[index] ^= mask[1 + index];
+            truncated = (truncated << 8) | sampled_pn[index];
+        }
+        return .{ .packet_number_length = packet_number_length, .truncated_packet_number = truncated };
+    }
+
+    pub fn removeHeaderProtectionWithProvider(
+        self: *const PacketProtectionKeys,
+        provider: crypto_provider.CryptoProvider,
+        first_byte: *u8,
+        sampled_pn: *[max_packet_number_length]u8,
+        sample: [header_protection_sample_len]u8,
+    ) error{ProviderUnsupported}!RemovedHeaderProtection {
+        const mask = try self.headerProtectionMaskWithProvider(provider, sample);
         first_byte.* ^= mask[0] & firstByteMask(first_byte.*);
         const packet_number_length: usize = @as(usize, first_byte.* & 0x03) + 1;
         var truncated: u64 = 0;
@@ -319,6 +417,24 @@ pub fn deriveInitialSecretsV1(client_initial_dcid: []const u8) error{InvalidConn
     };
 }
 
+pub fn deriveInitialSecretsV1WithProvider(provider: crypto_provider.CryptoProvider, client_initial_dcid: []const u8) error{ InvalidConnectionId, ProviderUnsupported }!InitialSecrets {
+    if (client_initial_dcid.len < min_initial_dcid_len or client_initial_dcid.len > max_connection_id_len) {
+        return error.InvalidConnectionId;
+    }
+
+    var initial_secret: [traffic_secret_len]u8 = undefined;
+    provider.hkdfExtract(.sha256, &initial_salt_v1, client_initial_dcid, &initial_secret) catch return error.ProviderUnsupported;
+    var client_secret: [traffic_secret_len]u8 = undefined;
+    var server_secret: [traffic_secret_len]u8 = undefined;
+    provider.hkdfExpandLabel(.sha256, &initial_secret, "client in", "", &client_secret) catch return error.ProviderUnsupported;
+    provider.hkdfExpandLabel(.sha256, &initial_secret, "server in", "", &server_secret) catch return error.ProviderUnsupported;
+    return .{
+        .initial_secret = initial_secret,
+        .client = try deriveAes128GcmKeysWithProvider(provider, client_secret),
+        .server = try deriveAes128GcmKeysWithProvider(provider, server_secret),
+    };
+}
+
 /// Derive AEAD packet-protection keys for the TLS_AES_128_GCM_SHA256 suite from
 /// a traffic `secret`, per RFC 9001 §5.1. The `secret` is the Initial secret for
 /// Initial packets, or the TLS-exported Handshake / 1-RTT traffic secret for the
@@ -333,11 +449,25 @@ pub fn deriveAes128GcmKeys(secret: [traffic_secret_len]u8) PacketProtectionKeys 
     };
 }
 
+pub fn deriveAes128GcmKeysWithProvider(provider: crypto_provider.CryptoProvider, secret: [traffic_secret_len]u8) error{ProviderUnsupported}!PacketProtectionKeys {
+    var keys = PacketProtectionKeys{ .secret = secret, .key = undefined, .iv = undefined, .hp = undefined };
+    provider.hkdfExpandLabel(.sha256, &secret, "quic key", "", &keys.key) catch return error.ProviderUnsupported;
+    provider.hkdfExpandLabel(.sha256, &secret, "quic iv", "", &keys.iv) catch return error.ProviderUnsupported;
+    provider.hkdfExpandLabel(.sha256, &secret, "quic hp", "", &keys.hp) catch return error.ProviderUnsupported;
+    return keys;
+}
+
 /// Derive the next-generation application traffic secret for a key update
 /// (RFC 9001 §6.1): `secret_<n+1> = HKDF-Expand-Label(secret_<n>, "quic ku")`.
 /// Applies to the 1-RTT read and write secrets only.
 pub fn deriveNextGenerationSecret(secret: [traffic_secret_len]u8) [traffic_secret_len]u8 {
     return tls.hkdfExpandLabel(HkdfSha256, secret, "quic ku", "", traffic_secret_len);
+}
+
+pub fn deriveNextGenerationSecretWithProvider(provider: crypto_provider.CryptoProvider, secret: [traffic_secret_len]u8) error{ProviderUnsupported}![traffic_secret_len]u8 {
+    var out: [traffic_secret_len]u8 = undefined;
+    provider.hkdfExpandLabel(.sha256, &secret, "quic ku", "", &out) catch return error.ProviderUnsupported;
+    return out;
 }
 
 pub const ByteRange = struct {

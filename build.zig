@@ -313,6 +313,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     crypto_mod.addImport("crypto_secrets", crypto_secrets_mod);
+    quic_mod.addImport("crypto", crypto_mod);
     tls_core_mod.addImport("crypto", crypto_mod);
     const crypto_tests = b.addTest(.{ .root_module = crypto_mod });
     const run_crypto_tests = b.addRunArtifact(crypto_tests);
@@ -323,6 +324,12 @@ pub fn build(b: *std.Build) void {
     crypto_step.dependOn(&run_crypto_secret_tests.step);
     test_step.dependOn(&run_crypto_tests.step);
     test_step.dependOn(&run_crypto_secret_tests.step);
+
+    const crypto_boundary_audit = b.addSystemCommand(&.{ "sh", "scripts/audit-crypto-boundary.sh", "." });
+    const crypto_boundary_step = b.step("audit-crypto-boundary", "Audit direct keyed crypto usage outside provider-owned modules");
+    crypto_boundary_step.dependOn(&crypto_boundary_audit.step);
+    crypto_step.dependOn(&crypto_boundary_audit.step);
+    test_step.dependOn(&crypto_boundary_audit.step);
 
     // Bounded session-resumption cache (#364/#365). Kept as a standalone
     // test target for focused cache/persistence coverage, while also exported
