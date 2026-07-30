@@ -48,9 +48,9 @@ conformance suite:
   `tls hello_retry_request=true`.
 
 Prerequisites are the pinned nghttp3 `v1.18.0` and ngtcp2 `v1.25.0`
-GnuTLS example builds documented below, built with a GnuTLS version that
-supports `GNUTLS_KEY_SHARE_TOP` (CI uses Ubuntu 24.04's GnuTLS 3.8.x
-package). The easiest reproducible build path is:
+GnuTLS example builds documented below, built with GnuTLS >= 3.8.1,
+supporting both `GNUTLS_KEY_SHARE_TOP` and `%NO_SHUFFLE_EXTENSIONS`
+(CI currently uses 3.8.3). The easiest reproducible build path is:
 
 ```sh
 scripts/interop/install-h3-peer-deps-ci.sh
@@ -230,8 +230,9 @@ Everything below stays outside the Tardigrade build graph.
 
 ### ngtcp2 / nghttp3 (GnuTLS example client/server)
 
-Needs `libgnutls28-dev` (>= 3.7.2), `gnutls-bin`, `libev-dev`, cmake, and a
-C++23 compiler (clang >= 19 or gcc >= 15 for `<print>`):
+Needs `libgnutls28-dev` (GnuTLS >= 3.8.1; CI tested with 3.8.3),
+`gnutls-bin`, `libev-dev`, cmake, and a C++23 compiler (clang >= 19 or
+gcc >= 15 for `<print>`):
 
 ```sh
 git clone --depth 1 --branch v1.18.0 https://github.com/ngtcp2/nghttp3 && cd nghttp3
