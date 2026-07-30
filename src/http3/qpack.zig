@@ -478,6 +478,7 @@ pub const DynamicTable = struct {
             try self.evictOldest();
         }
 
+        if (self.inserted_count < self.evicted_count) self.inserted_count = self.evicted_count;
         self.inserted_count = std.math.add(u64, self.inserted_count, 1) catch return error.IntegerOverflow;
         try self.entries.append(self.allocator, .{
             .absolute_index = self.inserted_count,
@@ -517,6 +518,7 @@ pub const DynamicTable = struct {
 
     fn evictToCapacity(self: *DynamicTable) !void {
         while (self.bytes_used > self.capacity) try self.evictOldest();
+        if (self.inserted_count < self.evicted_count) self.inserted_count = self.evicted_count;
         self.metrics.table_bytes = self.bytes_used;
     }
 
@@ -524,7 +526,8 @@ pub const DynamicTable = struct {
         if (self.entries.items.len == 0) return;
         const removed = self.entries.orderedRemove(0);
         self.bytes_used -= removed.size();
-        self.evicted_count = removed.absolute_index;
+        self.evicted_count = @max(self.evicted_count, removed.absolute_index);
+        if (self.inserted_count < self.evicted_count) self.inserted_count = self.evicted_count;
         self.metrics.evictions += 1;
         removed.deinit(self.allocator);
     }
@@ -1674,6 +1677,7 @@ fn expectQpackStateInvariants(table: *const DynamicTable, decoder: *const Dynami
     try testing.expect(table.capacity <= table.max_capacity);
     try testing.expect(table.bytes_used <= table.capacity);
     try testing.expect(table.inserted_count >= before_inserted);
+    try testing.expect(table.inserted_count >= table.evicted_count);
     try testing.expect(decoder.blocked.streams.count() <= decoder.blocked.max_blocked);
 
     var expected_bytes: u64 = 0;

@@ -608,6 +608,9 @@ const SendQueue = struct {
     acked: RangeList = .{},
     /// A lost packet carried this stream's FIN; resend it.
     fin_retransmit: bool = false,
+    /// A sent STREAM+FIN was acknowledged; later duplicate loss must not
+    /// resurrect the final-size signal.
+    fin_acked: bool = false,
     /// Stream was reset locally; drop all queued data.
     reset_sent: bool = false,
     scheduling_hint: StreamSchedulingHint = .{},
@@ -654,14 +657,19 @@ const SendQueue = struct {
     }
 };
 
-fn markSendQueueRangeAcked(allocator: std.mem.Allocator, queue: *SendQueue, range: Range) void {
+fn markSendQueueRangeAcked(allocator: std.mem.Allocator, queue: *SendQueue, range: Range, fin: bool) void {
     queue.retransmit.subtract(allocator, range) catch {};
     queue.acked.insert(allocator, range) catch {};
+    if (fin) {
+        queue.fin_acked = true;
+        queue.fin_retransmit = false;
+    }
     queue.compact(allocator);
 }
 
 fn requeueSendQueueRange(allocator: std.mem.Allocator, queue: *SendQueue, range: Range, fin: bool) void {
     if (queue.reset_sent) return;
+    if (fin and !queue.fin_acked) queue.fin_retransmit = true;
     var live = range;
     if (live.start < queue.base) live.start = queue.base;
     if (live.start >= live.end) return;
@@ -669,7 +677,6 @@ fn requeueSendQueueRange(allocator: std.mem.Allocator, queue: *SendQueue, range:
     for (queue.acked.items.items) |acked| {
         queue.retransmit.subtract(allocator, acked) catch {};
     }
-    if (fin) queue.fin_retransmit = true;
 }
 
 /// What a sent packet carried, for retransmission on loss and release on ack.
@@ -1589,7 +1596,7 @@ pub const Connection = struct {
         }
         for (record.streams[0..record.stream_count]) |sr| {
             if (self.send_queues.get(sr.id)) |queue| {
-                markSendQueueRangeAcked(self.allocator, queue, sr.range);
+                markSendQueueRangeAcked(self.allocator, queue, sr.range, sr.fin);
             }
         }
         // Acked CRYPTO ranges need no explicit bookkeeping: pending ranges
@@ -3370,8 +3377,8 @@ test "stream send queue keeps lost ranges retransmittable across duplicate ACK a
     try testing.expectEqual(@as(usize, 1), queue.retransmit.items.items.len);
     try testing.expectEqual(Range{ .start = 2, .end = 8 }, queue.retransmit.items.items[0]);
 
-    markSendQueueRangeAcked(testing.allocator, &queue, .{ .start = 0, .end = 8 });
-    markSendQueueRangeAcked(testing.allocator, &queue, .{ .start = 0, .end = 8 });
+    markSendQueueRangeAcked(testing.allocator, &queue, .{ .start = 0, .end = 8 }, false);
+    markSendQueueRangeAcked(testing.allocator, &queue, .{ .start = 0, .end = 8 }, false);
     try testing.expectEqual(@as(u64, 8), queue.base);
     try testing.expectEqualStrings("", queue.data.items[queue.start..]);
     try testing.expect(queue.retransmit.isEmpty());
@@ -3385,7 +3392,7 @@ test "stream send queue subtracts acked overlap from lost retransmit ranges" {
     queue.reserved_end = 8;
 
     requeueSendQueueRange(testing.allocator, &queue, .{ .start = 0, .end = 8 }, false);
-    markSendQueueRangeAcked(testing.allocator, &queue, .{ .start = 2, .end = 6 });
+    markSendQueueRangeAcked(testing.allocator, &queue, .{ .start = 2, .end = 6 }, false);
 
     try testing.expectEqual(@as(usize, 2), queue.retransmit.items.items.len);
     try testing.expectEqual(Range{ .start = 0, .end = 2 }, queue.retransmit.items.items[0]);
@@ -3399,10 +3406,41 @@ test "stream send queue does not resurrect acked bytes on later duplicate loss" 
     try queue.data.appendSlice(testing.allocator, "abcdefgh");
     queue.reserved_end = 8;
 
-    markSendQueueRangeAcked(testing.allocator, &queue, .{ .start = 2, .end = 6 });
+    markSendQueueRangeAcked(testing.allocator, &queue, .{ .start = 2, .end = 6 }, false);
     requeueSendQueueRange(testing.allocator, &queue, .{ .start = 2, .end = 6 }, false);
 
     try testing.expect(queue.retransmit.isEmpty());
+}
+
+test "stream send queue re-arms lost empty fin" {
+    var queue = SendQueue{};
+    defer queue.deinit(testing.allocator);
+
+    queue.reserved_end = 8;
+    queue.fin_requested = true;
+    queue.fin_reserved = true;
+
+    requeueSendQueueRange(testing.allocator, &queue, .{ .start = 8, .end = 8 }, true);
+
+    try testing.expect(queue.retransmit.isEmpty());
+    try testing.expect(queue.fin_retransmit);
+    try testing.expect(!queue.fin_acked);
+}
+
+test "stream send queue does not resurrect acked fin on later duplicate loss" {
+    var queue = SendQueue{};
+    defer queue.deinit(testing.allocator);
+
+    queue.reserved_end = 8;
+    queue.fin_requested = true;
+    queue.fin_reserved = true;
+
+    markSendQueueRangeAcked(testing.allocator, &queue, .{ .start = 8, .end = 8 }, true);
+    requeueSendQueueRange(testing.allocator, &queue, .{ .start = 8, .end = 8 }, true);
+
+    try testing.expect(queue.retransmit.isEmpty());
+    try testing.expect(!queue.fin_retransmit);
+    try testing.expect(queue.fin_acked);
 }
 
 test "fuzz: stream send queue ack loss close command sequences preserve retransmission invariants" {
@@ -3411,6 +3449,7 @@ test "fuzz: stream send queue ack loss close command sequences preserve retransm
         "\x00\x08abcdefgh\x01\x00\x04\x02\x02\x04\x03\x03\x04",
         "\x00\x08abcdefgh\x02\x02\x06\x02\x04\x08\x01\x00\x08\x04\x03",
         "\x00\x08abcdefgh\x01\x02\x04\x02\x02\x04",
+        "\x00\x08abcdefgh\x04\x86\x08\x00\x04",
         "\x00\x04test\x05\x00\x02\x03\x02\x04\x06",
     } });
 }
@@ -3443,8 +3482,9 @@ fn runStreamSendQueueCommands(input: []const u8) !void {
             },
             1 => {
                 const range = takeQueueRange(input, &pos, queue.reserved_end);
-                markSendQueueRangeAcked(testing.allocator, &queue, range);
-                markSendQueueRangeAcked(testing.allocator, &queue, range);
+                const ack_fin = (op & 0x80) != 0 and queue.fin_reserved;
+                markSendQueueRangeAcked(testing.allocator, &queue, range, ack_fin);
+                markSendQueueRangeAcked(testing.allocator, &queue, range, ack_fin);
             },
             2 => {
                 const range = takeQueueRange(input, &pos, queue.reserved_end);
@@ -3461,9 +3501,9 @@ fn runStreamSendQueueCommands(input: []const u8) !void {
             },
             4 => {
                 if (!queue.reset_sent) {
-                    queue.fin_retransmit = true;
                     queue.fin_requested = true;
                     queue.fin_reserved = true;
+                    requeueSendQueueRange(testing.allocator, &queue, .{ .start = queue.reserved_end, .end = queue.reserved_end }, true);
                 }
             },
             5 => {
@@ -3526,6 +3566,7 @@ fn expectSendQueueInvariants(queue: *const SendQueue) !void {
         try testing.expect(queue.retransmit.isEmpty());
         try testing.expect(!queue.fin_retransmit);
     }
+    if (queue.fin_acked) try testing.expect(!queue.fin_retransmit);
 }
 
 fn rangesOverlap(a: Range, b: Range) bool {
