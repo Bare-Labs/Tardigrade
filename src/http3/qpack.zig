@@ -478,7 +478,6 @@ pub const DynamicTable = struct {
             try self.evictOldest();
         }
 
-        if (self.inserted_count < self.evicted_count) self.inserted_count = self.evicted_count;
         self.inserted_count = std.math.add(u64, self.inserted_count, 1) catch return error.IntegerOverflow;
         try self.entries.append(self.allocator, .{
             .absolute_index = self.inserted_count,
@@ -518,7 +517,6 @@ pub const DynamicTable = struct {
 
     fn evictToCapacity(self: *DynamicTable) !void {
         while (self.bytes_used > self.capacity) try self.evictOldest();
-        if (self.inserted_count < self.evicted_count) self.inserted_count = self.evicted_count;
         self.metrics.table_bytes = self.bytes_used;
     }
 
@@ -527,7 +525,6 @@ pub const DynamicTable = struct {
         const removed = self.entries.orderedRemove(0);
         self.bytes_used -= removed.size();
         self.evicted_count = @max(self.evicted_count, removed.absolute_index);
-        if (self.inserted_count < self.evicted_count) self.inserted_count = self.evicted_count;
         self.metrics.evictions += 1;
         removed.deinit(self.allocator);
     }
@@ -1202,6 +1199,29 @@ test "dynamic table insertion count remains monotonic across capacity eviction" 
     try testing.expectEqual(before + 1, table.inserted_count);
 }
 
+test "dynamic table insertion count is independent of capacity eviction" {
+    var table = DynamicTable.initNegotiated(testing.allocator, 128);
+    defer table.deinit();
+
+    try table.setCapacity(71);
+    try testing.expectEqual(@as(u64, 0), table.inserted_count);
+    _ = try table.insert("a", "b");
+    try testing.expectEqual(@as(u64, 1), table.inserted_count);
+    _ = try table.insert("c", "d");
+    try testing.expectEqual(@as(u64, 2), table.inserted_count);
+
+    try table.setCapacity(0);
+    try testing.expectEqual(@as(u64, 2), table.inserted_count);
+    try testing.expectEqual(@as(u64, 2), table.evicted_count);
+    try testing.expectEqual(@as(usize, 0), table.entries.items.len);
+    try testing.expectEqual(@as(u64, 0), table.bytes_used);
+
+    try table.setCapacity(71);
+    try testing.expectEqual(@as(u64, 2), table.inserted_count);
+    _ = try table.insert("e", "f");
+    try testing.expectEqual(@as(u64, 3), table.inserted_count);
+}
+
 test "encoder stream applies capacity insert and duplicate instructions" {
     var table = DynamicTable.init(testing.allocator, 128);
     defer table.deinit();
@@ -1523,12 +1543,12 @@ test "fuzz: QPACK stateful dynamic table and instruction streams preserve invari
         "\x07\x01\x08\x01\x09\x02\x0a\x09\x0b\x09",
         "\x0c\x00\x0d\x01\x0e\x02\x0f\xff\xff\xff",
         "\x10\x20\x1f\x11\x81\x00\x12\x51\x81\x00",
-        "\x27\x02\x01\x01\x02\x01\x01\x00\x27\x02\x01\x01",
+        "\x27\x02\x01a\x01b\x02\x01c\x01d\x00\x27\x02\x01e\x01f",
     } });
 }
 
 test "QPACK stateful command sequence keeps insert count monotonic across capacity churn" {
-    try runQpackStatefulCommands("\x27\x02\x01\x01\x02\x01\x01\x00\x27\x02\x01\x01");
+    try runQpackStatefulCommands("\x27\x02\x01a\x01b\x02\x01c\x01d\x00\x27\x02\x01e\x01f");
 }
 
 fn fuzzQpackStatefulCommands(_: void, smith: *testing.Smith) !void {
@@ -1667,7 +1687,9 @@ fn runQpackStatefulCommands(input: []const u8) !void {
 
 fn takeQpackBytes(input: []const u8, pos: *usize, max_len: usize) []const u8 {
     if (pos.* >= input.len) return "";
-    const len = @min(@as(usize, input[pos.*] % @as(u8, @intCast(max_len + 1))), input.len - pos.*);
+    const len_seed = input[pos.*];
+    pos.* += 1;
+    const len = @min(@as(usize, len_seed % @as(u8, @intCast(max_len + 1))), input.len - pos.*);
     const bytes = input[pos.*..][0..len];
     pos.* += len;
     return bytes;

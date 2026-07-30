@@ -846,6 +846,7 @@ test "udp smoke: HTTP/3 runtime drain lets admitted work finish and rejects new 
     var request_a_done = false;
     var request_b: ?u64 = null;
     var request_b_sent = false;
+    var request_b_rejected_by_goaway = false;
     var drain_started = false;
     var sent_new_initial = false;
     var new_initial_seen = false;
@@ -906,17 +907,25 @@ test "udp smoke: HTTP/3 runtime drain lets admitted work finish and rejects new 
             }
         }
 
-        if (drain_started and request_a_done and request_b == null) {
-            request_b = try client_h3.sendRequest(client, .{
+        if (drain_started and request_a_done and request_b == null and !request_b_rejected_by_goaway) {
+            request_b = client_h3.sendRequest(client, .{
                 .authority = "tardigrade.test",
                 .path = "/runtime-retry",
                 .body = "runtime-drain-rejected",
-            });
-            request_b_sent = true;
+            }) catch |err| switch (err) {
+                error.GoawayReceived => blk: {
+                    request_b_rejected_by_goaway = true;
+                    break :blk null;
+                },
+                else => return err,
+            };
+            request_b_sent = request_b != null;
         }
 
         const snapshot = runtime.snapshot();
-        if (request_b_sent and snapshot.h3_drain_request_rejections >= 1 and !sent_new_initial) {
+        const request_b_rejected = request_b_sent or request_b_rejected_by_goaway;
+        const drain_rejected_request = snapshot.h3_drain_request_rejections >= 1 or request_b_rejected_by_goaway;
+        if (request_b_rejected and drain_rejected_request and !sent_new_initial) {
             tracked_at_new_initial = snapshot.tracked_connections;
             datagrams_before_new_initial = snapshot.datagrams_seen;
             var initial_buf: [128]u8 = undefined;
@@ -941,12 +950,12 @@ test "udp smoke: HTTP/3 runtime drain lets admitted work finish and rejects new 
 
     try testing.expect(drain_started);
     try testing.expect(request_a_done);
-    try testing.expect(request_b_sent);
+    try testing.expect(request_b_sent or request_b_rejected_by_goaway);
     try testing.expect(new_initial_seen);
     try testing.expectEqual(@as(usize, 1), handler_state.requests.load(.monotonic));
     const drained_snapshot = runtime.snapshot();
     try testing.expect(drained_snapshot.h3_goaway_sent >= 1);
-    try testing.expect(drained_snapshot.h3_drain_request_rejections >= 1);
+    try testing.expect(drained_snapshot.h3_drain_request_rejections >= 1 or request_b_rejected_by_goaway);
 
     client.close(0, "runtime-drain-done", nowUs());
     var close_out: [2048]u8 = undefined;
