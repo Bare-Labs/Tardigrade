@@ -315,6 +315,7 @@ pub fn build(b: *std.Build) void {
     crypto_mod.addImport("crypto_secrets", crypto_secrets_mod);
     quic_mod.addImport("crypto", crypto_mod);
     tls_core_mod.addImport("crypto", crypto_mod);
+    exe_mod.addImport("crypto", crypto_mod);
     const crypto_tests = b.addTest(.{ .root_module = crypto_mod });
     const run_crypto_tests = b.addRunArtifact(crypto_tests);
     const crypto_secret_tests = b.addTest(.{ .root_module = crypto_secrets_mod });
@@ -325,10 +326,31 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_crypto_tests.step);
     test_step.dependOn(&run_crypto_secret_tests.step);
 
-    const crypto_boundary_audit = b.addSystemCommand(&.{ "sh", "scripts/audit-crypto-boundary.sh", "." });
+    // Deterministic, dependency-free crypto-boundary audit (#490): a checked-in
+    // Zig program rather than a shell script shelling out to an ambient `rg`,
+    // so every CI runner and platform enforces it identically with nothing
+    // extra to install.
+    const crypto_boundary_audit_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/audit_crypto_boundary.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crypto_boundary_audit_mod.addImport("zig_compat", compat_mod);
+    const crypto_boundary_audit_exe = b.addExecutable(.{
+        .name = "audit_crypto_boundary",
+        .root_module = crypto_boundary_audit_mod,
+    });
+    const crypto_boundary_audit_tests = b.addTest(.{ .root_module = crypto_boundary_audit_mod });
+    const run_crypto_boundary_audit_tests = b.addRunArtifact(crypto_boundary_audit_tests);
+    const crypto_boundary_audit = b.addRunArtifact(crypto_boundary_audit_exe);
+    crypto_boundary_audit.addArg(".");
+    crypto_boundary_audit.setCwd(b.path("."));
     const crypto_boundary_step = b.step("audit-crypto-boundary", "Audit direct keyed crypto usage outside provider-owned modules");
+    crypto_boundary_step.dependOn(&run_crypto_boundary_audit_tests.step);
     crypto_boundary_step.dependOn(&crypto_boundary_audit.step);
+    crypto_step.dependOn(&run_crypto_boundary_audit_tests.step);
     crypto_step.dependOn(&crypto_boundary_audit.step);
+    test_step.dependOn(&run_crypto_boundary_audit_tests.step);
     test_step.dependOn(&crypto_boundary_audit.step);
 
     // Bounded session-resumption cache (#364/#365). Kept as a standalone
@@ -499,6 +521,7 @@ pub fn build(b: *std.Build) void {
     udp_http3_runtime_mod.addImport("quic", quic_mod);
     udp_http3_runtime_mod.addImport("http3", http3_mod);
     udp_http3_runtime_mod.addImport("tls_core", tls_core_mod);
+    udp_http3_runtime_mod.addImport("crypto", crypto_mod);
     udp_http3_runtime_mod.addImport("build_options", build_options.createModule());
     quic_h3_udp_mod.addImport("http3_runtime", udp_http3_runtime_mod);
     const quic_h3_udp_tests = b.addTest(.{ .root_module = quic_h3_udp_mod, .filters = quic_test_filters });

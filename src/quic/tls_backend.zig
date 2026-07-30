@@ -927,8 +927,8 @@ test "QUIC adapter teardown wipes private scratch, parameters, and shared engine
 }
 
 const RealHandshakeHarness = struct {
-    client_adapter: tls_adapter.QuicTlsAdapter = .{},
-    server_adapter: tls_adapter.QuicTlsAdapter = .{},
+    client_adapter: tls_adapter.QuicTlsAdapter = .{ .provider = tls_adapter.testOnlyDefaultProvider() },
+    server_adapter: tls_adapter.QuicTlsAdapter = .{ .provider = tls_adapter.testOnlyDefaultProvider() },
     client_backend: Tls13Backend,
     server_backend: Tls13Backend,
     client: tls_handshake.Handshake = undefined,
@@ -1206,8 +1206,8 @@ test "the QUIC production driver resumes an async server signature without anoth
     mock.async_sign = true;
     mock.pending_polls = 2;
 
-    var client_adapter = tls_adapter.QuicTlsAdapter{};
-    var server_adapter = tls_adapter.QuicTlsAdapter{};
+    var client_adapter = tls_adapter.QuicTlsAdapter{ .provider = tls_adapter.testOnlyDefaultProvider() };
+    var server_adapter = tls_adapter.QuicTlsAdapter{ .provider = tls_adapter.testOnlyDefaultProvider() };
     var client_backend = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
         .{ .pinned_certificate = testdata.certificate_der },

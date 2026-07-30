@@ -71,19 +71,34 @@ remaining algorithms are named by the interface so protocol and negotiation
 code is written once; capability discovery reports them absent and every entry
 point returns `error.UnsupportedCapability` until a backend provides them.
 
-Primitive support is not the same thing as protocol integration, and
-integration is itself per consumer: an algorithm can be live for QUIC packet
-protection while the TLS 1.3 handshake engine still calls a parallel
-`std.crypto` path for the same primitive. `src/crypto/profile.zig` records
-all three dimensions as typed data, not prose: `pure_zig_status` /
-`openssl_status` for primitive support, `Row.integrations` (a
-`(Consumer, IntegrationStatus)` list) for whether each consumer's *live*
-runtime actually calls the provider, and `Row.enabled_product_profiles` for
-which product profile that support reaches. `IntegrationStatus.live` means
-the live runtime calls `CryptoProvider` for that consumer today, not that it
-could if wired up — see `profile.zig`'s "QUIC packet protection is
-live-integrated through CryptoProvider" test, which pins the two rows this
-holds for.
+Primitive support, protocol integration, and product enablement are three
+separate dimensions, and `src/crypto/profile.zig` records all three as typed
+data, not prose:
+
+- **Primitive support** — `pure_zig_status` / `openssl_status`: can a backend
+  do this at all.
+- **Protocol integration** — `Row.integrations`, a `(Consumer,
+  IntegrationStatus)` list: whether each consumer's *live* runtime actually
+  calls the provider for it today. This is per consumer because it commonly
+  differs within one row — e.g. HKDF-SHA256 is `.live` for QUIC packet
+  protection but `.not_integrated` for the TLS 1.3 handshake engine, which
+  still calls a parallel `std.crypto` path for the same primitive.
+  `IntegrationStatus.live` means the live runtime calls `CryptoProvider`
+  today, not that it could if wired up — see `profile.zig`'s "QUIC packet
+  protection is live-integrated through CryptoProvider" test, which pins the
+  two rows this holds for.
+- **Product enablement** — `Row.enabled_product_profiles`, a named
+  `EnumSet(ProductProfile)` (`.native_appliance`, `.general_purpose_openssl`):
+  which product actually selects this capability. This is authored per row,
+  not derived from `pure_zig_status`/`openssl_status` — primitive support
+  does not imply product selectability. AES-256-GCM and ChaCha20-Poly1305
+  both report `pure_zig_status = .supported` but neither is negotiated by the
+  native appliance, so neither claims `.native_appliance`; secp256r1 has
+  `openssl_status = .provider_deferred` (no in-process OpenSSL
+  `CryptoProvider` yet) but the real general-purpose OpenSSL product supports
+  P-256 ECDH outside this seam, so it still claims `.general_purpose_openssl`.
+  See `profile.zig`'s "enabled product profiles are not a mechanical copy of
+  primitive support" test.
 
 ## Supported profile matrix
 
@@ -92,21 +107,22 @@ The table below summarizes the checked-in profile for review; "Integration"
 lists only the consumers whose live runtime calls `CryptoProvider` today
 (`.live`), not every consumer the row names:
 
-| Capability | Pure-Zig status | Pure-Zig implementation | OpenSSL status | Consumers | Live integration |
-| --- | --- | --- | --- | --- | --- |
-| SHA-256, SHA-384 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF, QUIC TLS bridge | none — unkeyed hashing has no `CryptoProvider` entry point by design |
-| HKDF-SHA256, HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule, QUIC packet protection | QUIC packet protection and the QUIC/TLS secret bridge (SHA-256 only); the TLS 1.3 key schedule (`src/tls/key_schedule.zig`) still calls `std.crypto` directly |
-| AES-128-GCM | supported | `std.crypto` | provider deferred | TLS records, QUIC packet protection | both — TLS record protection and QUIC packet protection seal/open through `CryptoProvider` |
-| AES-256-GCM | supported | `std.crypto` | provider deferred | TLS records; QUIC integration deferred | none — TLS_AES_256_GCM_SHA384 is not negotiated by either engine yet |
-| ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | protocol integration deferred | none |
-| QUIC AES-128 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection | live — every send/receive path in `src/quic/tls_adapter.zig` applies/removes header protection through `CryptoProvider` |
-| X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge | none — `src/tls/tls13_backend.zig` generates the TLS key share via `X25519.KeyPair.generateDeterministic` directly |
-| secp256r1 / P-256 | provider deferred | unavailable | provider deferred | TLS key share, PKI | none |
-| Ed25519 | supported | `std.crypto` | provider deferred | CertificateVerify, PKI | PKI chain-signature verification only; the handshake's own CertificateVerify message calls a local verifier directly |
-| ECDSA-P256-SHA256 | supported | `std.crypto` verification | provider deferred | CertificateVerify, PKI | PKI chain-signature verification only, same split as Ed25519 |
-| RSA-PSS-RSAE-SHA256 | supported | project verifier | provider deferred | CertificateVerify, PKI | PKI chain-signature verification only, same split as Ed25519 |
-| DER parser, chain builder, WebPKI validation | provider deferred | project code / unavailable | provider deferred | PKI | none — parsing/chain-building has no `CryptoProvider` entry point |
-| injected random bytes, secure zero, constant-time compare | supported | project code | provider deferred / project code | all secret-bearing paths | none through `CryptoProvider.entropy` — TLS/QUIC/resumption inject randomness through their own longer-standing `Entropy` parameters instead; secure-zero/constant-time-compare are shared helpers, not vtable dispatch targets |
+| Capability | Pure-Zig status | Pure-Zig implementation | OpenSSL status | Consumers | Live integration | Product profiles |
+| --- | --- | --- | --- | --- | --- | --- |
+| SHA-256, SHA-384 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF, QUIC TLS bridge | none — unkeyed hashing has no `CryptoProvider` entry point by design | native appliance, general-purpose OpenSSL |
+| HKDF-SHA256, HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule, QUIC packet protection | QUIC packet protection and the QUIC/TLS secret bridge (SHA-256 only); the TLS 1.3 key schedule (`src/tls/key_schedule.zig`) still calls `std.crypto` directly | native appliance, general-purpose OpenSSL |
+| AES-128-GCM | supported | `std.crypto` | provider deferred | TLS records, QUIC packet protection | both — TLS record protection and QUIC packet protection seal/open through `CryptoProvider` | native appliance, general-purpose OpenSSL |
+| AES-256-GCM | supported | `std.crypto` | provider deferred | TLS records; QUIC integration deferred | none — TLS_AES_256_GCM_SHA384 is not negotiated by the native appliance's engine | general-purpose OpenSSL only (negotiated there outside this seam) |
+| ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | protocol integration deferred | none | general-purpose OpenSSL only |
+| QUIC AES-128 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection | live — every send/receive path in `src/quic/tls_adapter.zig` applies/removes header protection through `CryptoProvider` | native appliance only (QUIC-specific; the general-purpose backend is TLS-over-TCP) |
+| X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge | none — `src/tls/tls13_backend.zig` generates the TLS key share via `X25519.KeyPair.generateDeterministic` directly | native appliance, general-purpose OpenSSL |
+| secp256r1 / P-256 | provider deferred | unavailable | provider deferred | TLS key share, PKI | none | general-purpose OpenSSL only (P-256 ECDH outside this seam; not implemented in pure Zig at all) |
+| Ed25519 | supported | `std.crypto` | provider deferred | CertificateVerify, PKI | PKI chain-signature verification only; the handshake's own CertificateVerify message calls a local verifier directly | native appliance, general-purpose OpenSSL |
+| ECDSA-P256-SHA256 | supported | `std.crypto` verification | provider deferred | CertificateVerify, PKI | PKI chain-signature verification only, same split as Ed25519 | native appliance, general-purpose OpenSSL |
+| RSA-PSS-RSAE-SHA256 | supported | project verifier | provider deferred | CertificateVerify, PKI | PKI chain-signature verification only, same split as Ed25519 | native appliance, general-purpose OpenSSL |
+| DER parser | provider deferred | project code | provider deferred | PKI | none — parsing has no `CryptoProvider` entry point | native appliance, general-purpose OpenSSL (shared protocol-local code) |
+| chain builder, WebPKI validation | provider deferred | unavailable | provider deferred | PKI | none | neither — not implemented yet |
+| injected random bytes, secure zero, constant-time compare | supported | project code | provider deferred / project code | all secret-bearing paths | none through `CryptoProvider.entropy` — TLS/QUIC/resumption inject randomness through their own longer-standing `Entropy` parameters instead; secure-zero/constant-time-compare are shared helpers, not vtable dispatch targets | native appliance, general-purpose OpenSSL |
 
 The Zig compatibility floor for this matrix is `0.16.0`; when the project moves
 to a newer compiler or starts carrying compatibility shims for crypto APIs, the
@@ -150,9 +166,13 @@ the implementation family, provider status, test coverage, consumers, and
 security assumptions before accepting a new negotiated algorithm.
 
 `zig build audit-crypto-boundary` and `zig build test-crypto` run the checked-in
-source guard in `scripts/audit-crypto-boundary.sh`. The guard blocks new direct
-keyed crypto shortcuts in QUIC protocol modules outside the approved
-provider-owned adapter and documented exceptions.
+source guard, `scripts/audit_crypto_boundary.zig` — a small Zig program, not a
+shell script depending on an ambient tool like `rg`, so it runs identically on
+every CI runner. The guard blocks new direct keyed crypto shortcuts and the
+AES block-cipher form in QUIC protocol modules outside the approved
+provider-owned adapter and documented exceptions, and separately blocks the
+concrete legacy `tls_adapter` wrapper call names from the live runtime
+modules that migrated onto the `*WithProvider` entry points.
 
 ### Errors are classified
 

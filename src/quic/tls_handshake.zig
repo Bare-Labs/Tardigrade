@@ -738,8 +738,8 @@ fn defaultParams() config.TransportParameters {
 }
 
 const Harness = struct {
-    client_adapter: QuicTlsAdapter = .{},
-    server_adapter: QuicTlsAdapter = .{},
+    client_adapter: QuicTlsAdapter = .{ .provider = tls_adapter.testOnlyDefaultProvider() },
+    server_adapter: QuicTlsAdapter = .{ .provider = tls_adapter.testOnlyDefaultProvider() },
     client_backend: TestTlsBackend = .{},
     server_backend: TestTlsBackend = .{},
     client: Handshake = undefined,
@@ -783,8 +783,8 @@ const Harness = struct {
 
 fn expectSecretsMatch(a: *const QuicTlsAdapter, b: *const QuicTlsAdapter, level: EncryptionLevel) !void {
     // What one side writes, the other must read (RFC 9001 secrets are shared).
-    const a_write = a.protectionKeys(level, .write) orelse return error.TestUnexpectedResult;
-    const b_read = b.protectionKeys(level, .read) orelse return error.TestUnexpectedResult;
+    const a_write = (try a.protectionKeys(level, .write)) orelse return error.TestUnexpectedResult;
+    const b_read = (try b.protectionKeys(level, .read)) orelse return error.TestUnexpectedResult;
     try testing.expectEqualSlices(u8, &a_write.key, &b_read.key);
 }
 
@@ -804,9 +804,9 @@ test "in-memory client<->server handshake completes and installs matching 1-RTT 
 
     // Phase ordering: Initial and Handshake keys are discarded by completion,
     // 1-RTT keys remain.
-    try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), h.client_adapter.protectionKeys(.initial, .write));
-    try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), h.server_adapter.protectionKeys(.handshake, .read));
-    try testing.expect(h.client_adapter.protectionKeys(.application, .write) != null);
+    try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), h.client_adapter.protectionKeys(.initial, .write) catch unreachable);
+    try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), h.server_adapter.protectionKeys(.handshake, .read) catch unreachable);
+    try testing.expect((h.client_adapter.protectionKeys(.application, .write) catch unreachable) != null);
 
     // ALPN negotiated h3; server certificate reported valid to the client.
     try testing.expect(h.client_adapter.negotiatedH3());
@@ -926,12 +926,12 @@ test "initial write keys survive until the queued ServerHello is drained" {
     var buf: [2048]u8 = undefined;
     const ch = (try h.client.pollOutput(.initial, &buf)).?;
     try h.server.onCrypto(.initial, ch.offset, ch.bytes);
-    try testing.expect(h.server_adapter.protectionKeys(.initial, .write) != null);
+    try testing.expect((h.server_adapter.protectionKeys(.initial, .write) catch unreachable) != null);
 
     // Draining hands out the final chunk with keys still live; the discard
     // lands on the next poll.
     while (try h.server.pollOutput(.initial, &buf)) |_| {
-        try testing.expect(h.server_adapter.protectionKeys(.initial, .write) != null);
+        try testing.expect((h.server_adapter.protectionKeys(.initial, .write) catch unreachable) != null);
     }
     try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), h.server_adapter.protectionKeys(.initial, .write));
 }
@@ -980,7 +980,7 @@ test "a well-formed message for the wrong role is an unexpected_message error" {
 }
 
 test "a 0-RTT CRYPTO fragment is rejected while 0-RTT is disabled" {
-    var adapter = QuicTlsAdapter{};
+    var adapter = QuicTlsAdapter{ .provider = tls_adapter.testOnlyDefaultProvider() };
     var backend = TestTlsBackend{};
     var handshake = Handshake.initServer(&adapter, backend.backend());
     // 0-RTT has no CRYPTO stream (RFC 9001); feeding one is a deterministic error.
@@ -989,7 +989,7 @@ test "a 0-RTT CRYPTO fragment is rejected while 0-RTT is disabled" {
 }
 
 test "the connection-facing driver exposes only the backend interface, not a concrete backend" {
-    var adapter = QuicTlsAdapter{};
+    var adapter = QuicTlsAdapter{ .provider = tls_adapter.testOnlyDefaultProvider() };
     var backend = TestTlsBackend{};
     const handshake = Handshake.initClient(&adapter, backend.backend());
     // The wrapper holds the protocol-neutral core driver over the runtime

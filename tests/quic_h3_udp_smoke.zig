@@ -277,6 +277,7 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
         .original_destination_cid = &odcid,
         .initial_secret_dcid = &odcid,
         .tls = client_backend.backend(),
+        .crypto_provider = quic.tls_adapter.testOnlyDefaultProvider(),
         .now_us = nowUs(),
         .initial_path = client_path,
     });
@@ -288,6 +289,7 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
         .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = server_backend.backend(),
+        .crypto_provider = quic.tls_adapter.testOnlyDefaultProvider(),
         .now_us = nowUs(),
         .initial_path = server_path,
     });
@@ -461,6 +463,7 @@ test "udp smoke: HTTP/3 runtime Retry sends tokenless Initials without tracked s
                 .original_destination_cid = &odcid,
                 .initial_secret_dcid = &odcid,
                 .tls = client_backend.backend(),
+                .crypto_provider = quic.tls_adapter.testOnlyDefaultProvider(),
                 .now_us = nowUs(),
                 .initial_path = client_path,
             });
@@ -549,6 +552,7 @@ test "udp smoke: HTTP/3 runtime Retry-off flood cleans unauthenticated state" {
         .original_destination_cid = &odcid,
         .initial_secret_dcid = &odcid,
         .tls = client_backend.backend(),
+        .crypto_provider = quic.tls_adapter.testOnlyDefaultProvider(),
         .now_us = nowUs(),
         .initial_path = client_path,
     });
@@ -586,6 +590,7 @@ test "udp smoke: HTTP/3 runtime Retry-off flood cleans unauthenticated state" {
             .original_destination_cid = &cap_odcid,
             .initial_secret_dcid = &cap_odcid,
             .tls = cap_backend.backend(),
+            .crypto_provider = quic.tls_adapter.testOnlyDefaultProvider(),
             .now_us = nowUs(),
             .initial_path = cap_path,
         });
@@ -721,6 +726,7 @@ test "udp smoke: HTTP/3 runtime Retry round trip completes a native H3 request" 
         .original_destination_cid = &odcid,
         .initial_secret_dcid = &odcid,
         .tls = client_backend.backend(),
+        .crypto_provider = quic.tls_adapter.testOnlyDefaultProvider(),
         .now_us = nowUs(),
         .initial_path = client_path,
     });
@@ -834,6 +840,7 @@ test "udp smoke: HTTP/3 runtime drain lets admitted work finish and rejects new 
         .original_destination_cid = &odcid,
         .initial_secret_dcid = &odcid,
         .tls = client_backend.backend(),
+        .crypto_provider = quic.tls_adapter.testOnlyDefaultProvider(),
         .now_us = nowUs(),
         .initial_path = client_path,
     });
@@ -1051,6 +1058,7 @@ test "udp smoke: appliance credential provider authenticates native QUIC/H3" {
         .original_destination_cid = &odcid,
         .initial_secret_dcid = &odcid,
         .tls = client_backend.backend(),
+        .crypto_provider = quic.tls_adapter.testOnlyDefaultProvider(),
         .now_us = nowUs(),
         .initial_path = client_path,
     });
@@ -1062,6 +1070,7 @@ test "udp smoke: appliance credential provider authenticates native QUIC/H3" {
         .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = server_backend.backend(),
+        .crypto_provider = quic.tls_adapter.testOnlyDefaultProvider(),
         .now_us = nowUs(),
         .initial_path = server_path,
     });

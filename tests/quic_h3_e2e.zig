@@ -349,6 +349,7 @@ const Sim = struct {
             .original_destination_cid = &odcid,
             .initial_secret_dcid = &odcid,
             .tls = sim.client_backend.backend(),
+            .crypto_provider = quic.tls_adapter.testOnlyDefaultProvider(),
             .now_us = sim.now_us,
             .initial_path = client_path,
         });
@@ -361,6 +362,7 @@ const Sim = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = sim.server_backend.backend(),
+            .crypto_provider = quic.tls_adapter.testOnlyDefaultProvider(),
             .now_us = sim.now_us,
             .initial_path = server_path,
         });
