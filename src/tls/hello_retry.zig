@@ -214,25 +214,18 @@ const ClientHelloView = struct {
 };
 
 fn compareExtensions(first: []const ExtensionView, second: []const ExtensionView, request: Request) Error!void {
-    var first_index: usize = 0;
-    var second_index: usize = 0;
+    try compareStableExtensionOrder(first, second);
 
-    while (true) {
-        first_index = nextComparable(first, first_index, false);
-        second_index = nextComparable(second, second_index, true);
-        if (first_index == first.len or second_index == second.len) break;
-
-        const lhs = first[first_index];
-        const rhs = second[second_index];
-        if (lhs.id != rhs.id) return error.IllegalParameter;
+    for (first) |lhs| {
+        if (!isComparable(lhs.id, false)) continue;
+        const rhs = findComparable(second, lhs.id, true) orelse return error.IllegalParameter;
         try compareExtensionPayload(lhs, rhs, request);
-        first_index += 1;
-        second_index += 1;
     }
 
-    if (nextComparable(first, first_index, false) != first.len or
-        nextComparable(second, second_index, true) != second.len)
-        return error.IllegalParameter;
+    for (second) |rhs| {
+        if (!isComparable(rhs.id, true)) continue;
+        _ = findComparable(first, rhs.id, false) orelse return error.IllegalParameter;
+    }
 
     if (findExtension(second, @intFromEnum(algorithms.ExtensionType.early_data)) != null)
         return error.IllegalParameter;
@@ -245,17 +238,42 @@ fn compareExtensions(first: []const ExtensionView, second: []const ExtensionView
     }
 }
 
-fn nextComparable(extensions: []const ExtensionView, start: usize, skip_cookie: bool) usize {
-    var index = start;
-    while (index < extensions.len) : (index += 1) {
-        const id = extensions[index].id;
-        if (id == @intFromEnum(algorithms.ExtensionType.padding) or
-            id == @intFromEnum(algorithms.ExtensionType.early_data) or
-            (skip_cookie and id == @intFromEnum(algorithms.ExtensionType.cookie)))
-            continue;
-        return index;
+fn compareStableExtensionOrder(first: []const ExtensionView, second: []const ExtensionView) Error!void {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (true) {
+        while (i < first.len and !isOrderStable(first[i].id)) : (i += 1) {}
+        while (j < second.len and !isOrderStable(second[j].id)) : (j += 1) {}
+        if (i == first.len or j == second.len) break;
+        if (first[i].id != second[j].id) return error.IllegalParameter;
+        i += 1;
+        j += 1;
     }
-    return index;
+    while (i < first.len and !isOrderStable(first[i].id)) : (i += 1) {}
+    while (j < second.len and !isOrderStable(second[j].id)) : (j += 1) {}
+    if (i != first.len or j != second.len) return error.IllegalParameter;
+}
+
+fn isOrderStable(id: u16) bool {
+    return id != @intFromEnum(algorithms.ExtensionType.padding) and
+        id != @intFromEnum(algorithms.ExtensionType.early_data) and
+        id != @intFromEnum(algorithms.ExtensionType.cookie) and
+        id != @intFromEnum(algorithms.ExtensionType.key_share) and
+        id != @intFromEnum(algorithms.ExtensionType.pre_shared_key);
+}
+
+fn isComparable(id: u16, skip_cookie: bool) bool {
+    return id != @intFromEnum(algorithms.ExtensionType.padding) and
+        id != @intFromEnum(algorithms.ExtensionType.early_data) and
+        !(skip_cookie and id == @intFromEnum(algorithms.ExtensionType.cookie));
+}
+
+fn findComparable(extensions: []const ExtensionView, id: u16, skip_cookie: bool) ?ExtensionView {
+    for (extensions) |extension| {
+        if (!isComparable(extension.id, skip_cookie)) continue;
+        if (extension.id == id) return extension;
+    }
+    return null;
 }
 
 fn compareExtensionPayload(lhs: ExtensionView, rhs: ExtensionView, request: Request) Error!void {
@@ -642,6 +660,78 @@ fn clientHelloWithExtensionList(
     return messages.encode(.client_hello, w.written(), out);
 }
 
+fn clientHelloWithReorderedExtensions(
+    out: []u8,
+    random_byte: u8,
+    key_share_group: algorithms.NamedGroup,
+) ![]const u8 {
+    var body: [512]u8 = undefined;
+    var w = messages.Writer{ .buf = &body };
+    try w.u16_(algorithms.legacy_version);
+    try w.bytes(&([_]u8{random_byte} ** 32));
+    try w.u8_(3);
+    try w.bytes("sid");
+    try w.u16_(2);
+    try w.u16_(@intFromEnum(algorithms.CipherSuite.tls_aes_128_gcm_sha256));
+    try w.u8_(1);
+    try w.u8_(0);
+    const extensions_len = try w.reserve(2);
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.supported_versions));
+    try w.u16_(3);
+    try w.u8_(2);
+    try w.u16_(@intFromEnum(algorithms.ProtocolVersion.tls13));
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.key_share));
+    const key_share_ext = try w.reserve(2);
+    const key_shares = try w.reserve(2);
+    try w.u16_(@intFromEnum(key_share_group));
+    try w.u16_(5);
+    try w.bytes("share");
+    w.patch(2, key_shares);
+    w.patch(2, key_share_ext);
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.supported_groups));
+    try w.u16_(4);
+    try w.u16_(2);
+    try w.u16_(@intFromEnum(algorithms.NamedGroup.x25519));
+    w.patch(2, extensions_len);
+    return messages.encode(.client_hello, w.written(), out);
+}
+
+fn clientHelloWithReorderedStableExtensions(
+    out: []u8,
+    random_byte: u8,
+    key_share_group: algorithms.NamedGroup,
+) ![]const u8 {
+    var body: [512]u8 = undefined;
+    var w = messages.Writer{ .buf = &body };
+    try w.u16_(algorithms.legacy_version);
+    try w.bytes(&([_]u8{random_byte} ** 32));
+    try w.u8_(3);
+    try w.bytes("sid");
+    try w.u16_(2);
+    try w.u16_(@intFromEnum(algorithms.CipherSuite.tls_aes_128_gcm_sha256));
+    try w.u8_(1);
+    try w.u8_(0);
+    const extensions_len = try w.reserve(2);
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.supported_groups));
+    try w.u16_(4);
+    try w.u16_(2);
+    try w.u16_(@intFromEnum(algorithms.NamedGroup.x25519));
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.supported_versions));
+    try w.u16_(3);
+    try w.u8_(2);
+    try w.u16_(@intFromEnum(algorithms.ProtocolVersion.tls13));
+    try w.u16_(@intFromEnum(algorithms.ExtensionType.key_share));
+    const key_share_ext = try w.reserve(2);
+    const key_shares = try w.reserve(2);
+    try w.u16_(@intFromEnum(key_share_group));
+    try w.u16_(5);
+    try w.bytes("share");
+    w.patch(2, key_shares);
+    w.patch(2, key_share_ext);
+    w.patch(2, extensions_len);
+    return messages.encode(.client_hello, w.written(), out);
+}
+
 fn pskExtension(
     out: []u8,
     identity_a: []const u8,
@@ -686,6 +776,32 @@ test "ClientHello2 validator permits requested key share and cookie" {
         .selected_group = .x25519,
         .cookie = "cookie",
     });
+}
+
+test "ClientHello2 validator permits key_share relocation" {
+    var first_buf: [768]u8 = undefined;
+    var second_buf: [768]u8 = undefined;
+    const first = try clientHello(&first_buf, 0xaa, null, null, null);
+    const second = try clientHelloWithReorderedExtensions(&second_buf, 0xaa, .x25519);
+    try validateSecondClientHello(first, second, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+        .cookie = null,
+    });
+}
+
+test "ClientHello2 validator rejects reordered unaffected extensions" {
+    var first_buf: [768]u8 = undefined;
+    var second_buf: [768]u8 = undefined;
+    const first = try clientHello(&first_buf, 0xaa, null, null, null);
+    const second = try clientHelloWithReorderedStableExtensions(&second_buf, 0xaa, .x25519);
+    try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, second, .{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+        .cookie = null,
+    }));
 }
 
 test "ClientHello2 validator rejects changed random and cookie" {

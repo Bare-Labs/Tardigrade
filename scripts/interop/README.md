@@ -21,6 +21,93 @@ Matrix (`run-interop.sh`):
 | 4 | quiche `http3-client` | native `h3_interop_tool` | yes |
 | 5 | native `h3_interop_tool` | aioquic             | optional |
 | 6 | aioquic               | native `h3_interop_tool` | optional |
+| 7 | native HRR client (`h3_interop_tool --empty-initial-key-share`) | ngtcp2 `gtlsserver` | #333 closure |
+| 8 | ngtcp2 HRR `gtlsclient` (`--groups=-GROUP-ALL:+GROUP-SECP256R1:+GROUP-X25519:%NO_SHUFFLE_EXTENSIONS`) | native `h3_interop_tool --expect-hrr` | #333 closure |
+
+## #333: focused HelloRetryRequest smoke evidence
+
+The matrix includes two bounded, out-of-process HRR smokes that close the
+remaining #333 evidence gap without expanding this script into #338's broad
+conformance suite:
+
+- `#333 native HRR client -> ngtcp2 gtlsserver` runs the native client with
+  `--empty-initial-key-share`. The ClientHello still advertises X25519, but
+  carries an empty initial key-share vector, so the external GnuTLS server must
+  send HelloRetryRequest before the HTTP/3 request can complete. The native
+  tool asserts `--expect-hrr` by checking its TLS retry state and logs
+  `tls retry_state=hrr_received`.
+- `#333 ngtcp2 HRR gtlsclient -> native server` runs the external GnuTLS
+  client with
+  `--groups=-GROUP-ALL:+GROUP-SECP256R1:+GROUP-X25519:%NO_SHUFFLE_EXTENSIONS`
+  and the `GNUTLS_KEY_SHARE_TOP` / `%NO_SHUFFLE_EXTENSIONS` patches applied by
+  `build-h3-peer-ci.sh`. That keeps X25519 advertised while sending only the
+  first P-256 key share in ClientHello1, and keeps ClientHello2 extension order
+  deterministic; the native server supports/selects X25519, emits
+  HelloRetryRequest, accepts ClientHello2, and completes the HTTP/3 exchange.
+  The native server asserts `--expect-hrr` and logs
+  `tls hello_retry_request=true`.
+
+Prerequisites are the pinned nghttp3 `v1.18.0` and ngtcp2 `v1.25.0`
+GnuTLS example builds documented below, built with a GnuTLS version that
+supports `GNUTLS_KEY_SHARE_TOP` (CI uses Ubuntu 24.04's GnuTLS 3.8.x
+package). The easiest reproducible build path is:
+
+```sh
+scripts/interop/install-h3-peer-deps-ci.sh
+H3_PEER_WORKDIR=/tmp/tardigrade-h3-peer scripts/interop/build-h3-peer-ci.sh
+gnutls-cli --version
+```
+
+Then run the normal matrix command:
+
+```sh
+zig build build-h3-interop
+NGTCP2_EXAMPLES_DIR=/tmp/tardigrade-h3-peer/client/build/examples \
+  scripts/interop/run-interop.sh
+```
+
+The exact single-case commands are:
+
+```sh
+# native HRR client against external server
+mkdir -p /tmp/tardi-hrr/certs /tmp/tardi-hrr/docroot
+scripts/interop/gen-certs.sh /tmp/tardi-hrr/certs
+printf '%s\n' hello-from-ngtcp2-hrr >/tmp/tardi-hrr/docroot/hrr.txt
+/path/to/ngtcp2/build/examples/gtlsserver 127.0.0.1 24434 \
+  /tmp/tardi-hrr/certs/ed25519-key.pem \
+  /tmp/tardi-hrr/certs/ed25519-cert.pem \
+  -d /tmp/tardi-hrr/docroot --quiet \
+  >/tmp/tardi-hrr/gtlsserver-hrr.log 2>&1 &
+server_pid=$!
+trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+sleep 1.5
+zig-out/bin/h3_interop_tool client --host 127.0.0.1 --port 24434 \
+  --authority tardigrade.test --path /hrr.txt --insecure \
+  --empty-initial-key-share --expect-hrr --timeout-ms 10000
+kill "$server_pid" 2>/dev/null || true
+wait "$server_pid" 2>/dev/null || true
+trap - EXIT
+
+# external HRR client against native server
+zig-out/bin/h3_interop_tool server --port 24435 \
+  --cert /tmp/tardi-hrr/certs/ed25519-cert.der \
+  --key /tmp/tardi-hrr/certs/ed25519-key.pkcs8.der \
+  --expect-hrr --timeout-ms 15000 \
+  >/tmp/tardi-hrr/native-server-hrr.log 2>&1 &
+server_pid=$!
+trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+sleep 1.5
+/path/to/ngtcp2/build/examples/gtlsclient \
+  --groups=-GROUP-ALL:+GROUP-SECP256R1:+GROUP-X25519:%NO_SHUFFLE_EXTENSIONS \
+  127.0.0.1 24435 https://tardigrade.test/from-ngtcp2-hrr \
+  --exit-on-first-stream-close
+wait "$server_pid"
+trap - EXIT
+```
+
+The matrix logs stdout/stderr for each side under the printed `logs:` path.
+They contain request/response status and the explicit HRR assertion lines
+above, but no keylog output or secret material.
 
 ## #522: production resumption/0-RTT interop
 
@@ -50,8 +137,18 @@ H3_INTEROP_CLIENT_PATH=/path/to/ngtcp2/build/examples/gtlsclient \
 
 CI runs `scripts/interop/install-h3-peer-deps-ci.sh` then
 `scripts/interop/build-h3-peer-ci.sh` to build the pinned ngtcp2/nghttp3
-GnuTLS examples and exports `H3_INTEROP_CLIENT_PATH` before running the same
-target with `-Dtls-profile=general`. Both scripts live under
+GnuTLS examples. It exports `H3_INTEROP_CLIENT_PATH` before running the same
+target with `-Dtls-profile=general`, then passes the peer-neutral
+`H3_PEER_EXAMPLES_DIR` output to `scripts/interop/run-h3-peer-ci.sh`. That
+wrapper runs the bounded external-peer matrix and asserts both #333 HRR lines
+are present as `PASS`:
+
+```text
+#333 native HRR client -> ngtcp2 gtlsserver PASS
+#333 ngtcp2 HRR gtlsclient -> native server PASS
+```
+
+Both scripts live under
 `scripts/interop/` specifically because that directory is the policy-exempt
 external-peer boundary the dependency audit (`scripts/audit-dependencies.sh`)
 excludes -- the peer's actual repository/library names would otherwise trip
@@ -133,16 +230,18 @@ Everything below stays outside the Tardigrade build graph.
 
 ### ngtcp2 / nghttp3 (GnuTLS example client/server)
 
-Needs `libgnutls28-dev` (>= 3.7.2), `libev-dev`, cmake, and a C++23 compiler
-(g++ >= 14 for `<print>`):
+Needs `libgnutls28-dev` (>= 3.7.2), `gnutls-bin`, `libev-dev`, cmake, and a
+C++23 compiler (clang >= 19 or gcc >= 15 for `<print>`):
 
 ```sh
-git clone --depth 1 https://github.com/ngtcp2/nghttp3 && cd nghttp3
+git clone --depth 1 --branch v1.18.0 https://github.com/ngtcp2/nghttp3 && cd nghttp3
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$PREFIX -DENABLE_LIB_ONLY=ON
 make -C build install
 cd ../
-git clone --depth 1 https://github.com/ngtcp2/ngtcp2 && cd ngtcp2
-PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig CC=gcc-14 CXX=g++-14 \
+git clone --depth 1 --branch v1.25.0 https://github.com/ngtcp2/ngtcp2 && cd ngtcp2
+perl -0pi -e 's/GNUTLS_CLIENT \| GNUTLS_ENABLE_EARLY_DATA \|\n\s+GNUTLS_NO_END_OF_EARLY_DATA/GNUTLS_CLIENT | GNUTLS_ENABLE_EARLY_DATA |\n                                 GNUTLS_NO_END_OF_EARLY_DATA |\n                                 GNUTLS_KEY_SHARE_TOP/' examples/tls_client_session_gnutls.cc
+gnutls-cli --version
+PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig CC=clang-19 CXX=clang++-19 \
   cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$PREFIX \
   -DENABLE_GNUTLS=ON -DENABLE_OPENSSL=OFF
 make -C build

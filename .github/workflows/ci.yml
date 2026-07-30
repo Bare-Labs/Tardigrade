@@ -548,6 +548,11 @@ jobs:
           H3_INTEROP_CLIENT_PATH: ${{ steps.build-h3-peer.outputs.client_path }}
         run: zig build test-integration-resumption-interop -Dtls-profile=general --summary all --error-style verbose
 
+      - name: Run focused H3 HRR peer matrix
+        env:
+          H3_PEER_EXAMPLES_DIR: ${{ steps.build-h3-peer.outputs.examples_dir }}
+        run: ./scripts/interop/run-h3-peer-ci.sh
+
   # ── Integration tests ─────────────────────────────────────────────────────────
   # Runs on push to main only (not PRs). Failures block the workflow.
   integration-test:

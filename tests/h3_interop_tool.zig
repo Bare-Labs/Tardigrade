@@ -7,9 +7,10 @@
 //!
 //! Usage:
 //!   h3_interop_tool server --port N --cert cert.der --key key.pkcs8.der \
-//!       [--response-body STR] [--requests N] [--verbose]
+//!       [--response-body STR] [--requests N] [--expect-hrr] [--verbose]
 //!   h3_interop_tool client --host A.B.C.D --port N --authority NAME \
-//!       --path /p [--body STR] [--insecure | --pin cert.der] [--verbose]
+//!       --path /p [--body STR] [--empty-initial-key-share] \
+//!       [--expect-hrr] [--insecure | --pin cert.der] [--verbose]
 //!
 //! The client exits 0 once it has received a complete response (status and
 //! body are printed to stdout). The server exits 0 after serving --requests
@@ -88,6 +89,8 @@ const Args = struct {
     response_body: []const u8 = "hello from tardigrade native h3\n",
     requests: usize = 1,
     timeout_ms: u64 = 15_000,
+    empty_initial_key_share: bool = false,
+    expect_hrr: bool = false,
 };
 
 fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !Args {
@@ -102,6 +105,10 @@ fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !Args {
             verbose = true;
         } else if (std.mem.eql(u8, arg, "--insecure")) {
             args.insecure = true;
+        } else if (std.mem.eql(u8, arg, "--empty-initial-key-share")) {
+            args.empty_initial_key_share = true;
+        } else if (std.mem.eql(u8, arg, "--expect-hrr")) {
+            args.expect_hrr = true;
         } else if (std.mem.eql(u8, arg, "--host")) {
             args.host = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
         } else if (std.mem.eql(u8, arg, "--port")) {
@@ -255,8 +262,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const args = parseArgs(allocator, init.args) catch |err| {
         std.debug.print(
             "h3-interop: bad arguments ({s})\n" ++
-                "usage: h3_interop_tool server --port N --cert cert.der --key key.pkcs8.der [--requests N]\n" ++
-                "       h3_interop_tool client --host IP --port N --authority NAME --path /p [--insecure|--pin cert.der]\n",
+                "usage: h3_interop_tool server --port N --cert cert.der --key key.pkcs8.der [--requests N] [--expect-hrr]\n" ++
+                "       h3_interop_tool client --host IP --port N --authority NAME --path /p [--empty-initial-key-share] [--expect-hrr] [--insecure|--pin cert.der]\n",
             .{@errorName(err)},
         );
         std.process.exit(2);
@@ -291,7 +298,10 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
         .local = addressFromSockaddrIn(socket.local),
         .remote = addressFromSockaddrIn(peer_addr),
     };
-    var backend = tls_backend.Tls13Backend.initClient(randomEntropy(), trust);
+    const client_options = tls_backend.ClientOptions{
+        .initial_key_share_mode = if (args.empty_initial_key_share) .empty else .normal,
+    };
+    var backend = tls_backend.Tls13Backend.initClientWithOptions(randomEntropy(), trust, client_options);
     const client = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &local_cid,
@@ -364,6 +374,12 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
         });
         std.process.exit(1);
     }
+    const saw_hrr = backend.engine.core.retry_state == .hrr_received;
+    std.debug.print("h3-interop: tls retry_state={s}\n", .{@tagName(backend.engine.core.retry_state)});
+    if (args.expect_hrr and !saw_hrr) {
+        std.debug.print("h3-interop: expected HelloRetryRequest but none was observed\n", .{});
+        std.process.exit(1);
+    }
     // Orderly close.
     client.close(0, "done", nowUs());
     var out: [2048]u8 = undefined;
@@ -390,6 +406,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
 
     var served: usize = 0;
     const deadline = nowUs() + args.timeout_ms * 1_000;
+    var saw_hrr = false;
 
     // One connection at a time: enough for focused interop runs, and each
     // connection exercises the full accept path.
@@ -451,9 +468,11 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
 
             switch (server.state()) {
                 .closed, .draining, .closing => {
-                    std.debug.print("h3-interop: connection ended state={s} served={d}\n", .{
+                    saw_hrr = saw_hrr or backend.engine.core.retry_state == .hrr_sent;
+                    std.debug.print("h3-interop: connection ended state={s} served={d} handshake_error={any}\n", .{
                         @tagName(server.state()),
                         served,
+                        server.handshakeFailure(),
                     });
                     if (served >= args.requests) break :accept_loop;
                     continue :accept_loop;
@@ -486,10 +505,16 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
                 }
             }
         }
+        saw_hrr = saw_hrr or backend.engine.core.retry_state == .hrr_sent;
     }
 
     if (served < args.requests) {
         std.debug.print("h3-interop: server timed out with served={d}/{d}\n", .{ served, args.requests });
+        std.process.exit(1);
+    }
+    std.debug.print("h3-interop: tls hello_retry_request={}\n", .{saw_hrr});
+    if (args.expect_hrr and !saw_hrr) {
+        std.debug.print("h3-interop: expected HelloRetryRequest but none was observed\n", .{});
         std.process.exit(1);
     }
     std.debug.print("h3-interop: server ok, served={d}\n", .{served});

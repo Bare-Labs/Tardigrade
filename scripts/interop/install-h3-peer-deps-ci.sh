@@ -28,4 +28,4 @@ fi
 # headers are present too.
 sudo apt-get install -y libstdc++-14-dev
 
-sudo apt-get install -y libgnutls28-dev
+sudo apt-get install -y libgnutls28-dev gnutls-bin

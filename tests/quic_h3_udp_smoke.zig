@@ -920,6 +920,9 @@ test "udp smoke: HTTP/3 runtime drain lets admitted work finish and rejects new 
                 else => return err,
             };
             request_b_sent = request_b != null;
+            while (client.pollTransmitOnPath(&out, nowUs())) |t| {
+                try client_socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
+            }
         }
 
         const snapshot = runtime.snapshot();

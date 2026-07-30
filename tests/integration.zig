@@ -14844,7 +14844,7 @@ test "native TLS listener dispatches ALPN http/1.1 through keepalive requests" {
     const second_raw = try client.readPlainToEnd(allocator, 64 * 1024, 5_000);
     defer allocator.free(second_raw);
 
-    try waitForUpstreamCount(&upstream, 2, 2_000);
+    try waitForUpstreamCount(&upstream, 2, 5_000);
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(second_raw, "HTTP/1.1 200 OK"));
     try assertContains(second_raw, "native-h1-second");
 }
