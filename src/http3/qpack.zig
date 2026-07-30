@@ -445,11 +445,29 @@ pub const DynamicTable = struct {
     metrics: DynamicMetrics = .{},
 
     pub fn init(allocator: std.mem.Allocator, capacity: u64) DynamicTable {
-        return .{ .allocator = allocator, .max_capacity = capacity, .capacity = capacity };
+        return .{
+            .allocator = allocator,
+            .max_capacity = capacity,
+            .capacity = capacity,
+            .entries = .empty,
+            .bytes_used = 0,
+            .inserted_count = 0,
+            .evicted_count = 0,
+            .metrics = .{},
+        };
     }
 
     pub fn initNegotiated(allocator: std.mem.Allocator, max_capacity: u64) DynamicTable {
-        return .{ .allocator = allocator, .max_capacity = max_capacity, .capacity = 0 };
+        return .{
+            .allocator = allocator,
+            .max_capacity = max_capacity,
+            .capacity = 0,
+            .entries = .empty,
+            .bytes_used = 0,
+            .inserted_count = 0,
+            .evicted_count = 0,
+            .metrics = .{},
+        };
     }
 
     pub fn deinit(self: *DynamicTable) void {
@@ -1569,10 +1587,10 @@ fn runQpackStatefulCommands(input: []const u8) !void {
     defer dec_reader.deinit(testing.allocator);
 
     var pos: usize = 0;
+    var previous_inserted = table.inserted_count;
     while (pos < input.len) {
         const op = input[pos];
         pos += 1;
-        const before_inserted = table.inserted_count;
         const before_bytes = table.bytes_used;
         const before_capacity = table.capacity;
 
@@ -1675,13 +1693,15 @@ fn runQpackStatefulCommands(input: []const u8) !void {
                 var scratch: [32]u8 = undefined;
                 const truncated = [_]u8{ 0x00, 0x00, 0x51, 0x05, 'x' };
                 try testing.expectError(error.TruncatedBlock, decode(&truncated, &fields, &scratch));
-                try testing.expectEqual(before_inserted, table.inserted_count);
+                try testing.expectEqual(previous_inserted, table.inserted_count);
                 try testing.expectEqual(before_bytes, table.bytes_used);
             },
             else => table.setCapacity(before_capacity) catch {},
         }
 
-        try expectQpackStateInvariants(&table, &decoder, before_inserted);
+        try testing.expect(table.inserted_count >= previous_inserted);
+        previous_inserted = table.inserted_count;
+        try expectQpackStateInvariants(&table, &decoder);
     }
 }
 
@@ -1695,10 +1715,9 @@ fn takeQpackBytes(input: []const u8, pos: *usize, max_len: usize) []const u8 {
     return bytes;
 }
 
-fn expectQpackStateInvariants(table: *const DynamicTable, decoder: *const DynamicDecoder, before_inserted: u64) !void {
+fn expectQpackStateInvariants(table: *const DynamicTable, decoder: *const DynamicDecoder) !void {
     try testing.expect(table.capacity <= table.max_capacity);
     try testing.expect(table.bytes_used <= table.capacity);
-    try testing.expect(table.inserted_count >= before_inserted);
     try testing.expect(table.inserted_count >= table.evicted_count);
     try testing.expect(decoder.blocked.streams.count() <= decoder.blocked.max_blocked);
 

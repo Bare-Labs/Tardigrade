@@ -948,6 +948,12 @@ test "udp smoke: HTTP/3 runtime drain lets admitted work finish and rejects new 
         }
     }
 
+    if (sent_new_initial and !new_initial_seen) {
+        const after_new = try waitRuntimeDatagrams(&runtime, datagrams_before_new_initial + 1);
+        try testing.expectEqual(tracked_at_new_initial, after_new.tracked_connections);
+        new_initial_seen = true;
+    }
+
     try testing.expect(drain_started);
     try testing.expect(request_a_done);
     try testing.expect(request_b_sent or request_b_rejected_by_goaway);
