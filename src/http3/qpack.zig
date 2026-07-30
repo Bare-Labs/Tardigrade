@@ -445,11 +445,29 @@ pub const DynamicTable = struct {
     metrics: DynamicMetrics = .{},
 
     pub fn init(allocator: std.mem.Allocator, capacity: u64) DynamicTable {
-        return .{ .allocator = allocator, .max_capacity = capacity, .capacity = capacity };
+        return .{
+            .allocator = allocator,
+            .max_capacity = capacity,
+            .capacity = capacity,
+            .entries = .empty,
+            .bytes_used = 0,
+            .inserted_count = 0,
+            .evicted_count = 0,
+            .metrics = .{},
+        };
     }
 
     pub fn initNegotiated(allocator: std.mem.Allocator, max_capacity: u64) DynamicTable {
-        return .{ .allocator = allocator, .max_capacity = max_capacity, .capacity = 0 };
+        return .{
+            .allocator = allocator,
+            .max_capacity = max_capacity,
+            .capacity = 0,
+            .entries = .empty,
+            .bytes_used = 0,
+            .inserted_count = 0,
+            .evicted_count = 0,
+            .metrics = .{},
+        };
     }
 
     pub fn deinit(self: *DynamicTable) void {
@@ -524,7 +542,7 @@ pub const DynamicTable = struct {
         if (self.entries.items.len == 0) return;
         const removed = self.entries.orderedRemove(0);
         self.bytes_used -= removed.size();
-        self.evicted_count = removed.absolute_index;
+        self.evicted_count = @max(self.evicted_count, removed.absolute_index);
         self.metrics.evictions += 1;
         removed.deinit(self.allocator);
     }
@@ -810,7 +828,10 @@ pub const EncoderStreamReader = struct {
         try self.pending.appendSlice(allocator, bytes);
         var consumed: usize = 0;
         while (consumed < self.pending.items.len) {
-            const applied = try EncoderStream.applyOne(table, self.pending.items[consumed..]) orelse break;
+            const applied = EncoderStream.applyOne(table, self.pending.items[consumed..]) catch |err| {
+                discardPendingPrefix(&self.pending, consumed);
+                return err;
+            } orelse break;
             consumed += applied;
         }
         discardPendingPrefix(&self.pending, consumed);
@@ -911,7 +932,10 @@ pub const DecoderStreamReader = struct {
         try self.pending.appendSlice(allocator, bytes);
         var consumed: usize = 0;
         while (consumed < self.pending.items.len) {
-            const applied = try stream.applyOne(self.pending.items[consumed..]) orelse break;
+            const applied = stream.applyOne(self.pending.items[consumed..]) catch |err| {
+                discardPendingPrefix(&self.pending, consumed);
+                return err;
+            } orelse break;
             consumed += applied;
         }
         discardPendingPrefix(&self.pending, consumed);
@@ -1171,6 +1195,49 @@ test "dynamic table capacity is capped by negotiated SETTINGS and can be lowered
     try testing.expectEqual(@as(u64, 0), table.capacity);
     try testing.expectEqual(@as(u64, 0), table.bytes_used);
     try testing.expectEqual(@as(usize, 0), table.entries.items.len);
+    try testing.expectEqual(@as(u64, 1), table.inserted_count);
+    try testing.expectEqual(@as(u64, 1), table.evicted_count);
+}
+
+test "dynamic table insertion count remains monotonic across capacity eviction" {
+    var table = DynamicTable.initNegotiated(testing.allocator, 128);
+    defer table.deinit();
+
+    try table.setCapacity(128);
+    _ = try table.insert("x-one", "one");
+    _ = try table.insert("x-two", "two");
+    const before = table.inserted_count;
+
+    try table.setCapacity(0);
+    try testing.expectEqual(before, table.inserted_count);
+    try testing.expectEqual(before, table.evicted_count);
+
+    try table.setCapacity(128);
+    _ = try table.insert("x-three", "three");
+    try testing.expectEqual(before + 1, table.inserted_count);
+}
+
+test "dynamic table insertion count is independent of capacity eviction" {
+    var table = DynamicTable.initNegotiated(testing.allocator, 128);
+    defer table.deinit();
+
+    try table.setCapacity(71);
+    try testing.expectEqual(@as(u64, 0), table.inserted_count);
+    _ = try table.insert("a", "b");
+    try testing.expectEqual(@as(u64, 1), table.inserted_count);
+    _ = try table.insert("c", "d");
+    try testing.expectEqual(@as(u64, 2), table.inserted_count);
+
+    try table.setCapacity(0);
+    try testing.expectEqual(@as(u64, 2), table.inserted_count);
+    try testing.expectEqual(@as(u64, 2), table.evicted_count);
+    try testing.expectEqual(@as(usize, 0), table.entries.items.len);
+    try testing.expectEqual(@as(u64, 0), table.bytes_used);
+
+    try table.setCapacity(71);
+    try testing.expectEqual(@as(u64, 2), table.inserted_count);
+    _ = try table.insert("e", "f");
+    try testing.expectEqual(@as(u64, 3), table.inserted_count);
 }
 
 test "encoder stream applies capacity insert and duplicate instructions" {
@@ -1434,6 +1501,45 @@ test "decoder stream reader handles split varints" {
     try testing.expectEqual(@as(usize, 0), reader.pending.items.len);
 }
 
+test "encoder stream reader does not replay committed prefix before malformed tail" {
+    var table = DynamicTable.init(testing.allocator, 128);
+    defer table.deinit();
+    var reader = EncoderStreamReader{};
+    defer reader.deinit(testing.allocator);
+
+    var valid_buf: [64]u8 = undefined;
+    const valid = try EncoderStream.encodeInsertLiteral("x-ok", "one", &valid_buf);
+    var combined: [80]u8 = undefined;
+    @memcpy(combined[0..valid.len], valid);
+    const bad = try EncoderStream.encodeInsertNameRefStatic(static_table_len, "bad", combined[valid.len..]);
+
+    try testing.expectError(error.InvalidStaticIndex, reader.ingest(testing.allocator, &table, combined[0 .. valid.len + bad.len]));
+    try testing.expectEqual(@as(u64, 1), table.inserted_count);
+    try testing.expectEqual(bad.len, reader.pending.items.len);
+
+    _ = reader.ingest(testing.allocator, &table, "") catch {};
+    try testing.expectEqual(@as(u64, 1), table.inserted_count);
+}
+
+test "decoder stream reader does not replay committed prefix before overflowing tail" {
+    var valid_buf: [16]u8 = undefined;
+    const valid = try DecoderStream.encode(.{ .insert_count_increment = 1 }, &valid_buf);
+    var combined: [32]u8 = undefined;
+    @memcpy(combined[0..valid.len], valid);
+    combined[valid.len] = 0x3f;
+    @memset(combined[valid.len + 1 .. valid.len + 12], 0xff);
+
+    var stream = DecoderStream{};
+    var reader = DecoderStreamReader{};
+    defer reader.deinit(testing.allocator);
+
+    try testing.expectError(error.IntegerOverflow, reader.ingest(testing.allocator, &stream, combined[0 .. valid.len + 12]));
+    try testing.expectEqual(@as(u64, 1), stream.known_received_count);
+
+    _ = reader.ingest(testing.allocator, &stream, "") catch {};
+    try testing.expectEqual(@as(u64, 1), stream.known_received_count);
+}
+
 test "dynamic table memory remains bounded under repeated inserts" {
     var table = DynamicTable.init(testing.allocator, 160);
     defer table.deinit();
@@ -1445,6 +1551,185 @@ test "dynamic table memory remains bounded under repeated inserts" {
         try testing.expect(table.bytes_used <= table.capacity);
     }
     try testing.expect(table.metrics.evictions > 0);
+}
+
+test "fuzz: QPACK stateful dynamic table and instruction streams preserve invariants" {
+    try testing.fuzz({}, fuzzQpackStatefulCommands, .{ .corpus = &.{
+        "",
+        "\x00\x80\x01\x01\x01\x02\x04namevalue",
+        "\x01\x40\x02x1\x02\x02x2\x03\x00\x05\x00\x06\x00",
+        "\x07\x01\x08\x01\x09\x02\x0a\x09\x0b\x09",
+        "\x0c\x00\x0d\x01\x0e\x02\x0f\xff\xff\xff",
+        "\x10\x20\x1f\x11\x81\x00\x12\x51\x81\x00",
+        "\x27\x02\x01a\x01b\x02\x01c\x01d\x00\x27\x02\x01e\x01f",
+    } });
+}
+
+test "QPACK stateful command sequence keeps insert count monotonic across capacity churn" {
+    try runQpackStatefulCommands("\x27\x02\x01a\x01b\x02\x01c\x01d\x00\x27\x02\x01e\x01f");
+}
+
+fn fuzzQpackStatefulCommands(_: void, smith: *testing.Smith) !void {
+    var input: [256]u8 = undefined;
+    const len = smith.slice(&input);
+    try runQpackStatefulCommands(input[0..len]);
+}
+
+fn runQpackStatefulCommands(input: []const u8) !void {
+    var table = DynamicTable.initNegotiated(testing.allocator, 256);
+    defer table.deinit();
+    var decoder = DynamicDecoder.init(testing.allocator, &table, 2);
+    defer decoder.deinit();
+    var enc_reader = EncoderStreamReader{};
+    defer enc_reader.deinit(testing.allocator);
+    var dec_stream = DecoderStream{};
+    var dec_reader = DecoderStreamReader{};
+    defer dec_reader.deinit(testing.allocator);
+
+    var pos: usize = 0;
+    var previous_inserted = table.inserted_count;
+    while (pos < input.len) {
+        const op = input[pos];
+        pos += 1;
+        const before_bytes = table.bytes_used;
+        const before_capacity = table.capacity;
+
+        switch (op % 19) {
+            0 => table.setCapacity(@as(u64, op) & 0x1f) catch {},
+            1 => table.setCapacity(@as(u64, 32 + (op & 0x7f))) catch {},
+            2 => {
+                const name = takeQpackBytes(input, &pos, 8);
+                const value = takeQpackBytes(input, &pos, 16);
+                _ = table.insert(name, value) catch {};
+            },
+            3 => {
+                const rel = if (pos < input.len) @as(u64, input[pos] & 0x07) else 0;
+                pos +|= @as(usize, @intFromBool(pos < input.len));
+                if (rel <= table.inserted_count) {
+                    const absolute = table.inserted_count - rel;
+                    _ = table.duplicate(absolute) catch {};
+                } else {
+                    _ = table.duplicate(rel) catch {};
+                }
+            },
+            4 => {
+                var buf: [128]u8 = undefined;
+                const value = takeQpackBytes(input, &pos, 16);
+                const encoded = EncoderStream.encodeInsertNameRefStatic(op % static_table_len, value, &buf) catch &.{};
+                _ = EncoderStream.apply(&table, encoded) catch {};
+            },
+            5 => {
+                var buf: [128]u8 = undefined;
+                const name = takeQpackBytes(input, &pos, 8);
+                const value = takeQpackBytes(input, &pos, 16);
+                const encoded = EncoderStream.encodeInsertLiteral(name, value, &buf) catch &.{};
+                _ = enc_reader.ingest(testing.allocator, &table, encoded[0..@min(encoded.len, @as(usize, op & 0x07))]) catch {};
+                if (encoded.len > @min(encoded.len, @as(usize, op & 0x07))) {
+                    _ = enc_reader.ingest(testing.allocator, &table, encoded[@min(encoded.len, @as(usize, op & 0x07))..]) catch {};
+                }
+            },
+            6 => {
+                var buf: [16]u8 = undefined;
+                const encoded = EncoderStream.encodeDuplicate(op & 0x07, &buf) catch &.{};
+                _ = EncoderStream.apply(&table, encoded) catch {};
+            },
+            7 => {
+                var block: [64]u8 = undefined;
+                if (table.inserted_count > 0) {
+                    const absolute = table.inserted_count;
+                    const encoded = encodeDynamicIndexed(&table, absolute, &block) catch &.{};
+                    var fields: [4]HeaderField = undefined;
+                    var scratch: [64]u8 = undefined;
+                    const result = decoder.decodeOrBlock(op, encoded, &fields, &scratch) catch null;
+                    if (result) |decoded| switch (decoded) {
+                        .decoded => |count| try testing.expect(count <= fields.len),
+                        .blocked => |required| try testing.expect(required > table.inserted_count),
+                    };
+                }
+            },
+            8 => {
+                const block = [_]u8{ 0x02, 0x00, 0x80 };
+                var fields: [4]HeaderField = undefined;
+                var scratch: [64]u8 = undefined;
+                _ = decoder.decodeOrBlock(op, &block, &fields, &scratch) catch {};
+            },
+            9 => decoder.blocked.cancel(op, &table.metrics),
+            10 => {
+                var out: [4]u64 = undefined;
+                _ = decoder.blocked.unblockAvailable(table.inserted_count, &out, &table.metrics);
+            },
+            11 => {
+                var buf: [16]u8 = undefined;
+                const encoded = DecoderStream.encode(.{ .section_ack = op }, &buf) catch &.{};
+                _ = dec_reader.ingest(testing.allocator, &dec_stream, encoded) catch {};
+            },
+            12 => {
+                var buf: [16]u8 = undefined;
+                const encoded = DecoderStream.encode(.{ .stream_cancel = op }, &buf) catch &.{};
+                _ = dec_reader.ingest(testing.allocator, &dec_stream, encoded) catch {};
+            },
+            13 => {
+                var buf: [16]u8 = undefined;
+                const encoded = DecoderStream.encode(.{ .insert_count_increment = op & 0x3f }, &buf) catch &.{};
+                _ = dec_reader.ingest(testing.allocator, &dec_stream, encoded[0..@min(encoded.len, @as(usize, 1))]) catch {};
+                if (encoded.len > 1) _ = dec_reader.ingest(testing.allocator, &dec_stream, encoded[1..]) catch {};
+            },
+            14 => {
+                const raw = takeQpackBytes(input, &pos, 12);
+                _ = enc_reader.ingest(testing.allocator, &table, raw) catch {};
+            },
+            15 => {
+                const raw = takeQpackBytes(input, &pos, 12);
+                _ = dec_reader.ingest(testing.allocator, &dec_stream, raw) catch {};
+            },
+            16 => {
+                var fields: [2]HeaderField = undefined;
+                var scratch: [32]u8 = undefined;
+                const malformed = [_]u8{ 0x00, 0x00, 0x51, 0x81, 0x00 };
+                try testing.expectError(error.InvalidHuffmanCode, decode(&malformed, &fields, &scratch));
+            },
+            17 => {
+                var fields: [2]HeaderField = undefined;
+                var scratch: [32]u8 = undefined;
+                const truncated = [_]u8{ 0x00, 0x00, 0x51, 0x05, 'x' };
+                try testing.expectError(error.TruncatedBlock, decode(&truncated, &fields, &scratch));
+                try testing.expectEqual(previous_inserted, table.inserted_count);
+                try testing.expectEqual(before_bytes, table.bytes_used);
+            },
+            else => table.setCapacity(before_capacity) catch {},
+        }
+
+        try testing.expect(table.inserted_count >= previous_inserted);
+        previous_inserted = table.inserted_count;
+        try expectQpackStateInvariants(&table, &decoder);
+    }
+}
+
+fn takeQpackBytes(input: []const u8, pos: *usize, max_len: usize) []const u8 {
+    if (pos.* >= input.len) return "";
+    const len_seed = input[pos.*];
+    pos.* += 1;
+    const len = @min(@as(usize, len_seed % @as(u8, @intCast(max_len + 1))), input.len - pos.*);
+    const bytes = input[pos.*..][0..len];
+    pos.* += len;
+    return bytes;
+}
+
+fn expectQpackStateInvariants(table: *const DynamicTable, decoder: *const DynamicDecoder) !void {
+    try testing.expect(table.capacity <= table.max_capacity);
+    try testing.expect(table.bytes_used <= table.capacity);
+    try testing.expect(table.inserted_count >= table.evicted_count);
+    try testing.expect(decoder.blocked.streams.count() <= decoder.blocked.max_blocked);
+
+    var expected_bytes: u64 = 0;
+    var previous_absolute = table.evicted_count;
+    for (table.entries.items) |entry| {
+        try testing.expect(entry.absolute_index > previous_absolute);
+        expected_bytes += entry.size();
+        previous_absolute = entry.absolute_index;
+    }
+    try testing.expectEqual(expected_bytes, table.bytes_used);
+    try testing.expectEqual(table.bytes_used, table.metrics.table_bytes);
 }
 
 test "fuzz: QPACK static decoder never panics on arbitrary field sections" {

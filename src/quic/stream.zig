@@ -1015,6 +1015,185 @@ test "STOP_SENDING received blocks future sends" {
     try std.testing.expectError(error.StopSending, manager.reserveSend(id, 1, false));
 }
 
+test "fuzz: stream manager command sequences preserve flow-control invariants" {
+    try std.testing.fuzz({}, fuzzStreamManagerCommands, .{ .corpus = &.{
+        "",
+        "\x00\x00\x01\x02\x03\x00\x00\x03abc\x07\x00\x08",
+        "\x04\x00\x08abcdefgh\x04\x00\x09abcdefghi\x08\x00\x08",
+        "\x03\x00\x00\x03abc\x03\x02\x03cde\x03\x02\x03cXe",
+        "\x09\x00\x03abc\x0a\x00\x03\x0a\x00\x04\x0b\x00\x0c",
+        "\x0c\x00\x01\x0d\x00\x20\x0e\x00\x02\x0f\x00\x02",
+    } });
+}
+
+fn fuzzStreamManagerCommands(_: void, smith: *std.testing.Smith) !void {
+    var input: [256]u8 = undefined;
+    const len = smith.slice(&input);
+    try runStreamManagerCommands(input[0..len], .client);
+    try runStreamManagerCommands(input[0..len], .server);
+}
+
+const StreamManagerSnapshot = struct {
+    bytes_sent: u64,
+    bytes_received: u64,
+    bytes_consumed: u64,
+    max_data_send: u64,
+    max_data_recv: u64,
+    local_bidi_limit: u64,
+    local_uni_limit: u64,
+    peer_bidi_limit: u64,
+    peer_uni_limit: u64,
+    active_streams: u64,
+    opened_streams: u64,
+    closed_streams: u64,
+};
+
+fn snapshotStreamManager(manager: StreamManager) StreamManagerSnapshot {
+    return .{
+        .bytes_sent = manager.bytes_sent,
+        .bytes_received = manager.bytes_received,
+        .bytes_consumed = manager.bytes_consumed,
+        .max_data_send = manager.max_data_send,
+        .max_data_recv = manager.max_data_recv,
+        .local_bidi_limit = manager.local.initial_max_streams_bidi,
+        .local_uni_limit = manager.local.initial_max_streams_uni,
+        .peer_bidi_limit = manager.peer.initial_max_streams_bidi,
+        .peer_uni_limit = manager.peer.initial_max_streams_uni,
+        .active_streams = manager.metrics.active_streams,
+        .opened_streams = manager.metrics.opened_streams,
+        .closed_streams = manager.metrics.closed_streams,
+    };
+}
+
+fn runStreamManagerCommands(input: []const u8, role: EndpointRole) !void {
+    var local = testParams();
+    var peer = testParams();
+    local.initial_max_data = 24;
+    local.initial_max_stream_data_bidi_remote = 8;
+    local.initial_max_stream_data_uni = 8;
+    local.initial_max_streams_bidi = 2;
+    local.initial_max_streams_uni = 1;
+    peer.initial_max_data = 24;
+    peer.initial_max_stream_data_bidi_remote = 8;
+    peer.initial_max_stream_data_bidi_local = 8;
+    peer.initial_max_stream_data_uni = 8;
+    peer.initial_max_streams_bidi = 2;
+    peer.initial_max_streams_uni = 1;
+
+    var manager = StreamManager.init(std.testing.allocator, role, local, peer);
+    defer manager.deinit();
+
+    var remembered_local_bidi: ?StreamId = null;
+    var remembered_peer_bidi: ?StreamId = null;
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const op = input[pos];
+        pos += 1;
+        const before = snapshotStreamManager(manager);
+        const ordinal = if (pos < input.len) @as(u64, input[pos] & 0x03) else 0;
+        pos +|= @as(usize, @intFromBool(pos < input.len));
+        const peer_init = peerRole(role).initiator();
+        const local_init = role.initiator();
+        const peer_bidi = makeStreamId(peer_init, .bidi, ordinal) catch 0;
+        const peer_uni = makeStreamId(peer_init, .uni, ordinal) catch 0;
+        const local_bidi = remembered_local_bidi orelse makeStreamId(local_init, .bidi, 0) catch 0;
+
+        switch (op % 16) {
+            0 => if (manager.openLocal(.bidi)) |id| {
+                remembered_local_bidi = id;
+            } else |_| {},
+            1 => if (manager.openLocal(.uni)) |_| {} else |_| {},
+            2 => {
+                const id = if ((op & 0x80) != 0) peer_uni else peer_bidi;
+                const len = boundedPayloadLen(input, pos);
+                const data = input[pos..][0..len];
+                pos += len;
+                _ = manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = data, .fin = (op & 0x20) != 0 }) catch {};
+                if (manager.get(peer_bidi) != null) remembered_peer_bidi = peer_bidi;
+            },
+            3 => {
+                const id = remembered_peer_bidi orelse peer_bidi;
+                const offset = if (pos < input.len) @as(u64, input[pos] & 0x0f) else 0;
+                pos +|= @as(usize, @intFromBool(pos < input.len));
+                const len = boundedPayloadLen(input, pos);
+                const data = input[pos..][0..len];
+                pos += len;
+                _ = manager.receiveStreamFrame(.{ .id = id, .offset = offset, .data = data, .fin = (op & 0x40) != 0 }) catch {};
+                if (manager.get(id) != null) remembered_peer_bidi = id;
+            },
+            4 => {
+                const id = remembered_local_bidi orelse manager.openLocal(.bidi) catch local_bidi;
+                remembered_local_bidi = id;
+                const len = if (pos < input.len) @as(usize, input[pos] & 0x0f) else 0;
+                pos +|= @as(usize, @intFromBool(pos < input.len));
+                _ = manager.reserveSend(id, len, (op & 0x20) != 0) catch {};
+            },
+            5 => {
+                const id = remembered_peer_bidi orelse peer_bidi;
+                var out: [16]u8 = undefined;
+                _ = manager.read(id, &out) catch {};
+            },
+            6 => manager.applyMaxData(before.max_data_send),
+            7 => manager.applyMaxData(before.max_data_send +| 8),
+            8 => if (remembered_local_bidi) |id| manager.applyMaxStreamData(id, before.max_data_send) catch {} else {},
+            9 => if (remembered_local_bidi) |id| manager.applyMaxStreamData(id, before.max_data_send +| 8) catch {} else {},
+            10 => {
+                const id = remembered_peer_bidi orelse peer_bidi;
+                const final_size = if (pos < input.len) @as(u64, input[pos] & 0x1f) else 0;
+                pos +|= @as(usize, @intFromBool(pos < input.len));
+                _ = manager.receiveResetStream(.{ .id = id, .app_error_code = op, .final_size = final_size }) catch {};
+                if (manager.get(id) != null) remembered_peer_bidi = id;
+            },
+            11 => {
+                if (remembered_local_bidi) |id| _ = manager.sendResetStream(id, op) catch {};
+            },
+            12 => {
+                if (remembered_local_bidi) |id| manager.receiveStopSending(.{ .id = id, .app_error_code = op }) catch {};
+            },
+            13 => {
+                if (remembered_peer_bidi) |id| _ = manager.sendStopSending(id, op) catch {};
+            },
+            14 => manager.applyMaxStreams(.bidi, before.peer_bidi_limit +| 1),
+            else => manager.applyMaxStreams(.uni, before.peer_uni_limit +| 1),
+        }
+
+        try expectStreamManagerInvariants(&manager, before);
+    }
+}
+
+fn boundedPayloadLen(input: []const u8, pos: usize) usize {
+    if (pos >= input.len) return 0;
+    return @min(@as(usize, input[pos] & 0x07), input.len - pos);
+}
+
+fn expectStreamManagerInvariants(manager: *StreamManager, before: StreamManagerSnapshot) !void {
+    try std.testing.expect(manager.bytes_sent >= before.bytes_sent);
+    try std.testing.expect(manager.bytes_received >= before.bytes_received);
+    try std.testing.expect(manager.bytes_consumed >= before.bytes_consumed);
+    try std.testing.expect(manager.bytes_consumed <= manager.bytes_received);
+    try std.testing.expect(manager.bytes_received <= manager.max_data_recv);
+    try std.testing.expect(manager.max_data_send >= before.max_data_send);
+    try std.testing.expect(manager.peer.initial_max_streams_bidi >= before.peer_bidi_limit);
+    try std.testing.expect(manager.peer.initial_max_streams_uni >= before.peer_uni_limit);
+    try std.testing.expect(manager.metrics.opened_streams >= manager.metrics.closed_streams);
+    try std.testing.expect(manager.metrics.active_streams <= manager.metrics.opened_streams);
+
+    var per_stream_unique: u64 = 0;
+    var it = manager.streams.iterator();
+    while (it.next()) |entry| {
+        const s = entry.value_ptr.*;
+        try std.testing.expect(s.recv_offset <= s.receivedUnique());
+        try std.testing.expect(s.receivedUnique() <= s.max_recv_data);
+        try std.testing.expect(s.send_offset <= s.max_send_data);
+        if (s.recv_final_size) |final_size| {
+            try std.testing.expect(s.recv_offset <= final_size);
+        }
+        per_stream_unique += s.receivedUnique();
+    }
+    try std.testing.expect(per_stream_unique >= manager.bytes_consumed);
+    try std.testing.expect(per_stream_unique <= manager.bytes_received);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

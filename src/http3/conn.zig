@@ -26,6 +26,7 @@ pub const Role = enum { client, server };
 pub const H3Error = error{
     OutOfMemory,
     ProtocolError,
+    GoawayReceived,
     ResponseTooLarge,
     UnknownStream,
     UnsupportedH3Setting,
@@ -94,6 +95,8 @@ pub fn Conn(comptime Transport: type) type {
         pending_priority_updates: std.AutoHashMap(u64, priority.Priority),
         /// Client: in-flight response accumulation by stream id.
         responses: std.AutoHashMap(u64, *ClientResponse),
+        peer_goaway_id: ?u64 = null,
+        local_goaway_id: ?u64 = null,
         /// Bidirectional streams the peer opened that we haven't classified.
         metrics: Metrics = .{},
         /// The RFC 9114 code to close the QUIC connection with after a
@@ -111,6 +114,7 @@ pub fn Conn(comptime Transport: type) type {
             priority_invalid_parameters: u64 = 0,
             priority_duplicate_parameters: u64 = 0,
             priority_updates_buffered: u64 = 0,
+            goaway_received: u64 = 0,
         };
 
         const max_pending_priority_updates: usize = 64;
@@ -133,6 +137,14 @@ pub fn Conn(comptime Transport: type) type {
                 return transport.streamTransportEarly(stream_id);
             }
             return false;
+        }
+
+        fn rejectRequestStream(transport: *Transport, stream_id: u64) void {
+            if (comptime @hasDecl(Transport, "resetStream")) {
+                transport.resetStream(stream_id, 0x010b) catch {};
+            } else if (comptime @hasDecl(Transport, "resetStreamForTest")) {
+                transport.resetStreamForTest(stream_id) catch {};
+            }
         }
 
         const ClientResponse = struct {
@@ -291,6 +303,13 @@ pub fn Conn(comptime Transport: type) type {
                     // Peer unidirectional stream: classify by type varint.
                     self.pending_uni.put(id, .{}) catch return error.OutOfMemory;
                 } else if (self.role == .server) {
+                    if (!isClientRequestStream(id)) return self.fail(.stream_creation_error);
+                    if (self.local_goaway_id) |limit| {
+                        if (id >= limit) {
+                            rejectRequestStream(transport, id);
+                            continue;
+                        }
+                    }
                     const request = self.allocator.create(ServerRequest) catch return error.OutOfMemory;
                     request.* = .{
                         .stream = session.RequestStream.init(self.allocator, id),
@@ -427,8 +446,24 @@ pub fn Conn(comptime Transport: type) type {
                     if (!self.peer_control_view.saw_settings) return self.fail(.missing_settings);
                     try self.applyPriorityUpdate(transport, raw);
                 },
+                .goaway => {
+                    if (!self.peer_control_view.saw_settings) return self.fail(.missing_settings);
+                    try self.applyGoaway(raw);
+                },
                 else => self.peer_control_view.ingestFrame(raw) catch |err| return self.failControl(err),
             }
+        }
+
+        fn applyGoaway(self: *Self, raw: frame.RawFrame) H3Error!void {
+            const decoded = varint.decode(raw.payload) catch return self.fail(.frame_error);
+            if (decoded.len != raw.payload.len) return self.fail(.frame_error);
+            const id = decoded.value;
+            if (self.role == .client and !isClientRequestStream(id)) return self.fail(.id_error);
+            if (self.peer_goaway_id) |previous| {
+                if (id > previous) return self.fail(.id_error);
+            }
+            self.peer_goaway_id = id;
+            self.metrics.goaway_received += 1;
         }
 
         fn applyPriorityUpdate(self: *Self, transport: *Transport, raw: frame.RawFrame) H3Error!void {
@@ -464,6 +499,8 @@ pub fn Conn(comptime Transport: type) type {
         }
 
         fn pumpRequests(self: *Self, transport: *Transport) H3Error!void {
+            var reset_requests: std.ArrayList(u64) = .empty;
+            defer reset_requests.deinit(self.allocator);
             var it = self.requests.iterator();
             while (it.next()) |entry| {
                 const id = entry.key_ptr.*;
@@ -472,7 +509,12 @@ pub fn Conn(comptime Transport: type) type {
                 var buf: [2048]u8 = undefined;
                 var qpack_scratch: [4096]u8 = undefined;
                 while (true) {
-                    const result = transport.readStream(id, &buf) catch break;
+                    const result = transport.readStream(id, &buf) catch |err| {
+                        if (err == error.StreamReset) {
+                            reset_requests.append(self.allocator, id) catch return error.OutOfMemory;
+                        }
+                        break;
+                    };
                     request.transport_early = request.transport_early or transportStreamTransportEarly(transport, id);
                     if (result.len > 0) {
                         _ = request.stream.ingestBytes(buf[0..result.len], &qpack_scratch) catch |err| {
@@ -489,6 +531,7 @@ pub fn Conn(comptime Transport: type) type {
                     if (result.len == 0) break;
                 }
             }
+            for (reset_requests.items) |id| self.finishRequest(id);
         }
 
         fn applyPendingPriorityUpdate(_: *Self, request: *ServerRequest) void {
@@ -570,6 +613,7 @@ pub fn Conn(comptime Transport: type) type {
         /// Encode and send one request; returns the request stream id.
         pub fn sendRequest(self: *Self, transport: *Transport, request: Request) !u64 {
             std.debug.assert(self.role == .client);
+            if (self.peer_goaway_id != null) return error.GoawayReceived;
             const id = try transport.openStream(.bidi);
 
             var fields_buf: [68]qpack.HeaderField = undefined;
@@ -731,9 +775,13 @@ pub fn Conn(comptime Transport: type) type {
 
         pub fn sendGoaway(self: *Self, transport: *Transport, stream_id: u64) !void {
             const control = self.control_out orelse return error.MissingControlStream;
+            if (self.local_goaway_id) |previous| {
+                if (stream_id > previous) return self.fail(.id_error);
+            }
             var wire: [32]u8 = undefined;
             const goaway = try session.ResponseEncoder.encodeGoaway(stream_id, &wire);
             try self.writeAll(transport, control, goaway, false);
+            self.local_goaway_id = stream_id;
         }
 
         fn writeAll(self: *Self, transport: *Transport, stream_id: u64, bytes: []const u8, fin: bool) !void {
@@ -796,6 +844,7 @@ const MockStream = struct {
     data: std.ArrayList(u8) = .empty,
     read_pos: usize = 0,
     fin: bool = false,
+    reset: bool = false,
 };
 
 /// Two mock transports joined back-to-back: writes on one side become reads
@@ -865,6 +914,7 @@ const MockTransport = struct {
 
     pub fn readStream(self: *MockTransport, id: u64, out: []u8) !struct { len: usize, fin: bool } {
         const s = self.streams.get(id) orelse return error.UnknownStream;
+        if (s.reset) return error.StreamReset;
         const available = s.data.items.len - s.read_pos;
         const n = @min(available, out.len);
         @memcpy(out[0..n], s.data.items[s.read_pos..][0..n]);
@@ -883,6 +933,11 @@ const MockTransport = struct {
             .urgency = hint.urgency,
             .incremental = hint.incremental,
         });
+    }
+
+    fn resetStreamForTest(self: *MockTransport, id: u64) !void {
+        const s = try self.stream(id);
+        s.reset = true;
     }
 };
 
@@ -959,6 +1014,95 @@ test "H3 conn: sendGoaway writes the selected request boundary on the control st
     try testing.expectEqual(frame.FrameType.goaway, goaway.typ);
     const boundary = try varint.decode(goaway.payload);
     try testing.expectEqual(@as(u64, 4), boundary.value);
+}
+
+test "H3 conn: inbound GOAWAY is monotonic and stops new local requests" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try client.pump(&client_transport);
+
+    var goaway_buf: [16]u8 = undefined;
+    const goaway_4 = try encodeGoawayFrameForTest(4, &goaway_buf);
+    _ = try server_transport.writeStream(server.control_out.?, goaway_4, false);
+    try client.pump(&client_transport);
+    try testing.expectEqual(@as(?u64, 4), client.peer_goaway_id);
+    try testing.expectEqual(@as(u64, 1), client.metrics.goaway_received);
+
+    try testing.expectError(error.GoawayReceived, client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/rejected" }));
+    try testing.expectEqual(@as(?ErrorCode, null), client.close_code);
+    try testing.expectEqual(@as(u64, 0), client_transport.next_bidi);
+}
+
+test "H3 conn: inbound GOAWAY cannot increase the advertised boundary" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try client.pump(&client_transport);
+
+    var goaway_buf: [16]u8 = undefined;
+    const goaway_4 = try encodeGoawayFrameForTest(4, &goaway_buf);
+    _ = try server_transport.writeStream(server.control_out.?, goaway_4, false);
+    try client.pump(&client_transport);
+
+    const goaway_8 = try encodeGoawayFrameForTest(8, &goaway_buf);
+    _ = try server_transport.writeStream(server.control_out.?, goaway_8, false);
+    try testing.expectError(error.ProtocolError, client.pump(&client_transport));
+    try testing.expectEqual(ErrorCode.id_error.wire(), client.closeCode());
+}
+
+test "H3 conn: sent GOAWAY rejects boundary and later peer requests without closing" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    server.local_goaway_id = 0;
+    const first_rejected = try client_transport.openStream(.bidi);
+    try testing.expectEqual(@as(u64, 0), first_rejected);
+    _ = try client_transport.writeStream(first_rejected, requestHeadersBytes()[0..], true);
+    const second_rejected = try client_transport.openStream(.bidi);
+    try testing.expectEqual(@as(u64, 4), second_rejected);
+    _ = try client_transport.writeStream(second_rejected, requestHeadersBytes()[0..], true);
+
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(u32, 0), server.requests.count());
+    try testing.expectEqual(@as(?ErrorCode, null), server.close_code);
+    try testing.expect((try server_transport.stream(first_rejected)).reset);
+    try testing.expect((try server_transport.stream(second_rejected)).reset);
 }
 
 test "H3 conn: polls completed requests by urgency and reports priority" {
@@ -1248,6 +1392,389 @@ test "H3 conn: late PRIORITY_UPDATE updates active response transport hint" {
 
     try testing.expectEqual(priority.Priority{ .urgency = 0, .incremental = false }, server_transport.scheduling_hints.get(request_id).?);
     try testing.expectEqual(@as(usize, 0), server.pending_priority_updates.count());
+}
+
+test "H3 conn: request stream reset releases request state" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    const request_id = try client_transport.openStream(.bidi);
+    _ = try client_transport.writeStream(request_id, requestHeadersBytes()[0..1], false);
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(u32, 1), server.requests.count());
+
+    try server_transport.resetStreamForTest(request_id);
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(u32, 0), server.requests.count());
+}
+
+test "H3 conn: request stream reset cleanup handles default concurrency" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+
+    var ids: [100]u64 = undefined;
+    for (&ids) |*id| {
+        id.* = try client_transport.openStream(.bidi);
+        _ = try client_transport.writeStream(id.*, requestHeadersBytes()[0..1], false);
+    }
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(u32, ids.len), server.requests.count());
+
+    for (ids) |id| try server_transport.resetStreamForTest(id);
+    try server.pump(&server_transport);
+    try testing.expectEqual(@as(u32, 0), server.requests.count());
+    try testing.expectEqual(@as(?ErrorCode, null), server.close_code);
+}
+
+test "fuzz: H3 connection state command sequences preserve critical stream and request invariants" {
+    try testing.fuzz({}, fuzzH3ConnStateCommands, .{ .corpus = &.{
+        "",
+        "\x00\x07",
+        "\x00\x01\x02\x03",
+        "\x04\x00\x05\x00",
+        "\x06\x07\x08\x09",
+        "\x0a\x0b\x0c\x0d",
+        "\x0e\x0f\x10\x11",
+    } });
+}
+
+fn fuzzH3ConnStateCommands(_: void, smith: *testing.Smith) !void {
+    var input: [192]u8 = undefined;
+    const len = smith.slice(&input);
+    try runH3ConnStateCommands(input[0..len], .server);
+    try runH3ConnStateCommands(input[0..len], .client);
+}
+
+fn runH3ConnStateCommands(input: []const u8, role: Role) !void {
+    const allocator = testing.allocator;
+    var peer_transport = MockTransport.init(allocator, role == .server);
+    defer peer_transport.deinit();
+    var local_transport = MockTransport.init(allocator, role == .client);
+    defer local_transport.deinit();
+    peer_transport.peer = &local_transport;
+    local_transport.peer = &peer_transport;
+
+    const H3 = Conn(MockTransport);
+    var conn = H3.init(allocator, role);
+    defer conn.deinit();
+
+    var peer_control: ?u64 = null;
+    var peer_qpack_encoder: ?u64 = null;
+    var peer_qpack_decoder: ?u64 = null;
+    var peer_request: ?u64 = null;
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const op = input[pos];
+        pos += 1;
+        const before_close = conn.close_code;
+        const before_settings = conn.peer_control_view.saw_settings;
+        const before_requests = conn.requests.count();
+        var expected_close: ?ErrorCode = null;
+
+        const result = switch (op % 25) {
+            0 => blk: {
+                try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            1 => blk: {
+                try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder);
+                break :blk conn.pump(&local_transport);
+            },
+            2 => blk: {
+                try writePeerUni(&peer_transport, .qpack_decoder, "", false, &peer_qpack_decoder);
+                break :blk conn.pump(&local_transport);
+            },
+            3 => blk: {
+                const id = try peer_transport.openStream(.uni);
+                var bytes: [16]u8 = undefined;
+                const typ_len = try varint.encode(0x21, &bytes);
+                _ = try peer_transport.writeStream(id, bytes[0..typ_len], false);
+                break :blk conn.pump(&local_transport);
+            },
+            4 => blk: {
+                if (peer_control == null and before_close == null) {
+                    try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control);
+                    try conn.pump(&local_transport);
+                }
+                expected_close = .stream_creation_error;
+                var duplicate: ?u64 = null;
+                try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &duplicate);
+                break :blk conn.pump(&local_transport);
+            },
+            5 => blk: {
+                expected_close = if (before_settings) .frame_unexpected else .missing_settings;
+                try writePeerUni(&peer_transport, .control, forbiddenControlDataBytes()[0..], false, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            6 => blk: {
+                expected_close = .frame_unexpected;
+                try writePeerUni(&peer_transport, .control, duplicateSettingsBytes()[0..], false, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            7 => blk: {
+                if (peer_control == null and before_close == null) {
+                    try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control);
+                    try conn.pump(&local_transport);
+                }
+                expected_close = .closed_critical_stream;
+                if (peer_control) |id| _ = try peer_transport.writeStream(id, "", true);
+                break :blk conn.pump(&local_transport);
+            },
+            8 => blk: {
+                expected_close = .closed_critical_stream;
+                try writePeerUni(&peer_transport, .qpack_encoder, "", true, &peer_qpack_encoder);
+                break :blk conn.pump(&local_transport);
+            },
+            9 => blk: {
+                if (peer_control == null and before_close == null) {
+                    try writePeerUni(&peer_transport, .control, validSettingsBytes()[0..], false, &peer_control);
+                    try conn.pump(&local_transport);
+                }
+                expected_close = .closed_critical_stream;
+                if (peer_control) |id| try local_transport.resetStreamForTest(id);
+                break :blk conn.pump(&local_transport);
+            },
+            10 => blk: {
+                expected_close = if (role == .client) .stream_creation_error else .message_error;
+                if (role == .server) {
+                    const id = try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    _ = try peer_transport.writeStream(id, dataFrameBytes()[0..], false);
+                } else {
+                    _ = try peer_transport.openStream(.bidi);
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            11 => blk: {
+                if (role == .server) {
+                    const id = peer_request orelse try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    _ = try peer_transport.writeStream(id, requestHeadersBytes()[0..], false);
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            12 => blk: {
+                if (role == .server) {
+                    const id = peer_request orelse try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    _ = try peer_transport.writeStream(id, requestHeadersBytes()[0..], false);
+                    _ = try peer_transport.writeStream(id, dataFrameBytes()[0..], true);
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            13 => blk: {
+                expected_close = if (role == .server) .message_error else null;
+                if (role == .server) {
+                    const id = peer_request orelse try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    _ = try peer_transport.writeStream(id, duplicateRequestHeadersBytes()[0..], false);
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            14 => blk: {
+                expected_close = if (role == .server) .message_error else null;
+                if (role == .server) {
+                    const id = peer_request orelse try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    _ = try peer_transport.writeStream(id, requestWithTrailersThenDataBytes()[0..], false);
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            15 => blk: {
+                if (role == .server) {
+                    const id = peer_request orelse try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    const s = try local_transport.stream(id);
+                    s.fin = true;
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            16 => blk: {
+                expected_close = if (before_settings) null else .missing_settings;
+                try writePeerUni(&peer_transport, .control, goawayBytes()[0..], false, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            17 => blk: {
+                expected_close = .stream_creation_error;
+                var duplicate: ?u64 = null;
+                try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder);
+                try writePeerUni(&peer_transport, .qpack_encoder, "", false, &duplicate);
+                break :blk conn.pump(&local_transport);
+            },
+            18 => blk: {
+                expected_close = .stream_creation_error;
+                var duplicate: ?u64 = null;
+                try writePeerUni(&peer_transport, .qpack_decoder, "", false, &peer_qpack_decoder);
+                try writePeerUni(&peer_transport, .qpack_decoder, "", false, &duplicate);
+                break :blk conn.pump(&local_transport);
+            },
+            19 => blk: {
+                expected_close = .closed_critical_stream;
+                try writePeerUni(&peer_transport, .qpack_decoder, "", true, &peer_qpack_decoder);
+                break :blk conn.pump(&local_transport);
+            },
+            20 => blk: {
+                if (peer_qpack_encoder == null and before_close == null) {
+                    try writePeerUni(&peer_transport, .qpack_encoder, "", false, &peer_qpack_encoder);
+                    try conn.pump(&local_transport);
+                }
+                expected_close = .closed_critical_stream;
+                if (peer_qpack_encoder) |id| try local_transport.resetStreamForTest(id);
+                break :blk conn.pump(&local_transport);
+            },
+            21 => blk: {
+                if (role == .server) {
+                    const id = peer_request orelse try peer_transport.openStream(.bidi);
+                    peer_request = id;
+                    try local_transport.resetStreamForTest(id);
+                }
+                break :blk conn.pump(&local_transport);
+            },
+            22 => blk: {
+                expected_close = if (before_settings) .id_error else .missing_settings;
+                try writePeerUni(&peer_transport, .control, goawayBytes()[0..], false, &peer_control);
+                try writePeerUni(&peer_transport, .control, largerGoawayBytes()[0..], false, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            23 => blk: {
+                expected_close = if (!before_settings) .missing_settings else if (role == .client) .id_error else null;
+                try writePeerUni(&peer_transport, .control, invalidClientGoawayBytes()[0..], false, &peer_control);
+                break :blk conn.pump(&local_transport);
+            },
+            else => blk: {
+                if (peer_qpack_decoder == null and before_close == null) {
+                    try writePeerUni(&peer_transport, .qpack_decoder, "", false, &peer_qpack_decoder);
+                    try conn.pump(&local_transport);
+                }
+                expected_close = .closed_critical_stream;
+                if (peer_qpack_decoder) |id| try local_transport.resetStreamForTest(id);
+                break :blk conn.pump(&local_transport);
+            },
+        };
+
+        if (result) |_| {
+            if (expected_close) |code| if (before_close == null) {
+                try testing.expect(conn.close_code != null);
+                try testing.expectEqual(code.wire(), conn.closeCode());
+            };
+            try expectH3ConnInvariants(&conn, role, before_settings, before_requests);
+        } else |err| {
+            try testing.expect(err == error.ProtocolError or err == error.OutOfMemory);
+            try testing.expect(conn.close_code != null);
+            if (before_close) |code| try testing.expectEqual(code, conn.close_code.?);
+            if (expected_close) |code| if (before_close == null) try testing.expectEqual(code.wire(), conn.closeCode());
+        }
+    }
+}
+
+fn writePeerUni(peer_transport: *MockTransport, typ: frame.StreamType, payload_after_type: []const u8, fin: bool, slot: *?u64) !void {
+    const id = slot.* orelse try peer_transport.openStream(.uni);
+    slot.* = id;
+    var prefix: [8]u8 = undefined;
+    const stream_type = try frame.encodeStreamType(typ, &prefix);
+    if (payload_after_type.len == 0 and typ != .control) {
+        _ = try peer_transport.writeStream(id, stream_type, fin);
+        return;
+    }
+    if (peer_transport.peer) |target| {
+        const s = try target.stream(id);
+        if (s.data.items.len == 0) try s.data.appendSlice(target.allocator, stream_type);
+    }
+    _ = try peer_transport.writeStream(id, payload_after_type, fin);
+}
+
+fn validSettingsBytes() [2]u8 {
+    return .{ 0x04, 0x00 };
+}
+
+fn forbiddenControlDataBytes() [2]u8 {
+    return .{ 0x00, 0x00 };
+}
+
+fn duplicateSettingsBytes() [4]u8 {
+    return .{ 0x04, 0x00, 0x04, 0x00 };
+}
+
+fn goawayBytes() [3]u8 {
+    return .{ 0x07, 0x01, 0x04 };
+}
+
+fn encodeGoawayFrameForTest(id: u64, out: []u8) ![]u8 {
+    var payload: [8]u8 = undefined;
+    const payload_len = try varint.encode(id, &payload);
+    return frame.encodeKnownFrame(.goaway, payload[0..payload_len], out);
+}
+
+fn largerGoawayBytes() [3]u8 {
+    return .{ 0x07, 0x01, 0x08 };
+}
+
+fn invalidClientGoawayBytes() [3]u8 {
+    return .{ 0x07, 0x01, 0x01 };
+}
+
+fn dataFrameBytes() [5]u8 {
+    return .{ 0x00, 0x03, 'b', 'o', 'd' };
+}
+
+fn requestHeadersBytes() [9]u8 {
+    return .{ 0x01, 0x07, 0x00, 0x00, 0xd1, 0xd7, 0x50, 0x00, 0xc1 };
+}
+
+fn duplicateRequestHeadersBytes() [18]u8 {
+    const h = requestHeadersBytes();
+    return h ++ h;
+}
+
+fn requestWithTrailersThenDataBytes() [23]u8 {
+    const h = requestHeadersBytes();
+    const d = dataFrameBytes();
+    return h ++ h ++ d;
+}
+
+fn expectH3ConnInvariants(conn: anytype, role: Role, before_settings: bool, before_requests: u32) !void {
+    if (conn.peer_control) |id| {
+        try testing.expect((id & 0x2) != 0);
+    }
+    if (conn.peer_qpack_encoder) |id| {
+        try testing.expect((id & 0x2) != 0);
+    }
+    if (conn.peer_qpack_decoder) |id| {
+        try testing.expect((id & 0x2) != 0);
+    }
+    try testing.expect(conn.pending_uni.count() <= 32);
+    _ = before_requests;
+    try testing.expect(conn.requests.count() <= 32 or role == .client);
+    if (before_settings) try testing.expect(conn.peer_control_view.saw_settings);
+    if (conn.peer_control_view.saw_settings) try testing.expect(conn.metrics.settings_received);
+
+    if (role == .server) {
+        var it = conn.requests.iterator();
+        while (it.next()) |entry| {
+            const request = entry.value_ptr.*;
+            try testing.expect(isClientRequestStream(entry.key_ptr.*));
+            if (request.stream.saw_data) try testing.expect(request.stream.saw_headers);
+            try testing.expect(!request.stream.finished or request.finished);
+        }
+    }
 }
 
 test "H3 conn: PRIORITY_UPDATE on request stream closes with frame unexpected" {
