@@ -2726,7 +2726,7 @@ fn sealZeroRttPacketForTest(
 
     var sample: [quic.tls_adapter.header_protection_sample_len]u8 = undefined;
     @memcpy(&sample, out[pn_offset + 4 ..][0..quic.tls_adapter.header_protection_sample_len]);
-    keys.applyHeaderProtection(&out[0], out[pn_offset..][0..pn_len], sample);
+    keys.applyHeaderProtectionWithProvider(sender.provider, &out[0], out[pn_offset..][0..pn_len], sample) catch unreachable;
 
     return out[0 .. pn_offset + pn_len + padded_len + quic.tls_adapter.packet_protection_tag_len];
 }

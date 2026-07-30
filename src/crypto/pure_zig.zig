@@ -59,9 +59,11 @@ pub const Provider = struct {
     }
 
     /// Erase to the boundary type. The returned view borrows `self`, so `self`
-    /// must outlive every use of it.
-    pub fn cryptoProvider(self: *Provider) provider.CryptoProvider {
-        return .{ .context = self, .vtable = &vtable, .entropy = self.entropy };
+    /// must outlive every use of it. Takes a const pointer because no vtable
+    /// entry mutates the provider; this lets comptime-constant `Provider`
+    /// values (e.g. a package-default instance) erase without a runtime copy.
+    pub fn cryptoProvider(self: *const Provider) provider.CryptoProvider {
+        return .{ .context = @constCast(self), .vtable = &vtable, .entropy = self.entropy };
     }
 
     /// The static algorithm profile this backend advertises.

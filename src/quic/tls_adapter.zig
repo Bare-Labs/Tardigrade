@@ -15,6 +15,14 @@
 //! place for the TLS_AES_128_GCM_SHA256 suite. A concrete TLS 1.3 engine
 //! drives this seam via `tls_handshake.zig` + `tls_backend.zig` (#296); adding
 //! further cipher suites remains follow-up work.
+//!
+//! Crypto ownership (#490): `QuicTlsAdapter` owns a `crypto.provider.CryptoProvider`
+//! (`provider`, defaulted to the pure-Zig backend via `setProvider`), and the
+//! adapter's own key derivation/update methods plus every send/receive call
+//! site in `src/quic/connection.zig` and `src/http/http3_runtime.zig` call the
+//! `*WithProvider` entry points on `PacketProtectionKeys`. The non-provider
+//! functions and methods below remain only as differential test-vector
+//! fixtures compared against the provider path; they are not the live path.
 
 const std = @import("std");
 const config = @import("config.zig");
@@ -52,6 +60,25 @@ pub const header_protection_sample_len = 16;
 /// Largest QUIC packet-number encoding (RFC 9000 §17.1: 1..4 bytes).
 pub const max_packet_number_length = 4;
 pub const max_packet_number: u64 = (@as(u64, 1) << 62) - 1;
+
+/// Entropy for the package-default `CryptoProvider` (#490). QUIC packet
+/// protection only drives HKDF, AEAD, and header-protection-mask vtable
+/// entries, none of which read `entropy` (see `src/crypto/pure_zig.zig`), so
+/// this fill function is never called; it exists only to satisfy
+/// `pure_zig.Provider.init`'s signature for the default instance below.
+/// Callers that route signing or key-share generation through this seam must
+/// supply their own provider via `QuicTlsAdapter.setProvider`.
+fn unusedDefaultProviderEntropyFill(_: *anyopaque, buffer: []u8) crypto_provider.EntropyError!void {
+    _ = buffer;
+    return error.EntropyFailure;
+}
+
+const default_provider_entropy_context: u8 = 0;
+
+const default_provider_backing: crypto_pkg.pure_zig.Provider = crypto_pkg.pure_zig.Provider.init(.{
+    .context = @constCast(&default_provider_entropy_context),
+    .fillFn = unusedDefaultProviderEntropyFill,
+});
 
 pub const EncryptionLevel = enum(u2) {
     initial,
@@ -729,6 +756,15 @@ pub const QuicTlsAdapter = struct {
     application_write_key_phase: u1 = 0,
     application_read_key_phase: u1 = 0,
     metrics: Metrics = .{},
+    /// Provider-owned crypto for HKDF, AEAD, and QUIC header-protection
+    /// operations (#490). Defaults to the pure-Zig provider so the live send/
+    /// receive path is provider-backed without every call site threading one
+    /// through; override with `setProvider` to select a different backend.
+    provider: crypto_provider.CryptoProvider = default_provider_backing.cryptoProvider(),
+
+    pub fn setProvider(self: *QuicTlsAdapter, provider: crypto_provider.CryptoProvider) void {
+        self.provider = provider;
+    }
 
     pub fn deinit(self: *QuicTlsAdapter) void {
         self.secrets.deinit();
@@ -816,8 +852,8 @@ pub const QuicTlsAdapter = struct {
         return self.secrets.get(level, direction);
     }
 
-    pub fn installInitialSecrets(self: *QuicTlsAdapter, perspective: Perspective, client_initial_dcid: []const u8) error{ InvalidConnectionId, SecretTooLarge }!InitialSecrets {
-        const secrets = try deriveInitialSecretsV1(client_initial_dcid);
+    pub fn installInitialSecrets(self: *QuicTlsAdapter, perspective: Perspective, client_initial_dcid: []const u8) error{ InvalidConnectionId, SecretTooLarge, ProviderUnsupported }!InitialSecrets {
+        const secrets = try deriveInitialSecretsV1WithProvider(self.provider, client_initial_dcid);
         switch (perspective) {
             .client => {
                 self.installSecret(try Secret.init(.initial, .write, &secrets.client.secret));
@@ -843,7 +879,7 @@ pub const QuicTlsAdapter = struct {
         const installed_secret = self.secret(level, direction) orelse return null;
         const secret_bytes = installed_secret.slice();
         if (secret_bytes.len != traffic_secret_len) return null;
-        return deriveAes128GcmKeys(secret_bytes[0..traffic_secret_len].*);
+        return deriveAes128GcmKeysWithProvider(self.provider, secret_bytes[0..traffic_secret_len].*) catch null;
     }
 
     /// Seal `plaintext` for `level`/`direction` into `out`, tracking a protected
@@ -857,9 +893,9 @@ pub const QuicTlsAdapter = struct {
         header: []const u8,
         plaintext: []const u8,
         out: []u8,
-    ) error{ KeysUnavailable, InvalidPacketNumber, OutputTooSmall }![]u8 {
+    ) error{ KeysUnavailable, InvalidPacketNumber, OutputTooSmall, ProviderUnsupported }![]u8 {
         const keys = self.protectionKeys(level, direction) orelse return error.KeysUnavailable;
-        const sealed = try keys.sealPayload(packet_number, header, plaintext, out);
+        const sealed = try keys.sealPayloadWithProvider(self.provider, packet_number, header, plaintext, out);
         self.metrics.packets_protected += 1;
         return sealed;
     }
@@ -875,9 +911,9 @@ pub const QuicTlsAdapter = struct {
         header: []const u8,
         protected_payload: []const u8,
         out: []u8,
-    ) error{ KeysUnavailable, InvalidPacketNumber, ProtectedPayloadTooShort, OutputTooSmall, AuthenticationFailed }![]u8 {
+    ) error{ KeysUnavailable, InvalidPacketNumber, ProtectedPayloadTooShort, OutputTooSmall, AuthenticationFailed, ProviderUnsupported }![]u8 {
         const keys = self.protectionKeys(level, direction) orelse return error.KeysUnavailable;
-        const plaintext = keys.openPayload(packet_number, header, protected_payload, out) catch |err| {
+        const plaintext = keys.openPayloadWithProvider(self.provider, packet_number, header, protected_payload, out) catch |err| {
             if (err == error.AuthenticationFailed) self.metrics.deprotection_failures += 1;
             return err;
         };
@@ -900,9 +936,9 @@ pub const QuicTlsAdapter = struct {
     /// generation and flip the outgoing key phase bit (RFC 9001 §6.1). Read keys
     /// are untouched — the peer's key phase rolls only when its updated packets
     /// are observed. Requires the application write secret to be installed.
-    pub fn updateApplicationWriteKeys(self: *QuicTlsAdapter) error{ApplicationSecretsMissing}!void {
+    pub fn updateApplicationWriteKeys(self: *QuicTlsAdapter) error{ ApplicationSecretsMissing, ProviderUnsupported }!void {
         const write_secret = self.applicationTrafficSecret(.write) orelse return error.ApplicationSecretsMissing;
-        const next_write = deriveNextGenerationSecret(write_secret);
+        const next_write = try deriveNextGenerationSecretWithProvider(self.provider, write_secret);
         // Secrets are exactly traffic_secret_len, so Secret.init cannot overflow.
         self.installSecret(Secret.init(.application, .write, &next_write) catch unreachable);
         self.application_write_key_phase ^= 1;
@@ -915,15 +951,16 @@ pub const QuicTlsAdapter = struct {
     /// authenticates.
     pub fn nextApplicationReadKeys(self: *const QuicTlsAdapter) ?PacketProtectionKeys {
         const read_secret = self.applicationTrafficSecret(.read) orelse return null;
-        return deriveAes128GcmKeys(deriveNextGenerationSecret(read_secret));
+        const next_read = deriveNextGenerationSecretWithProvider(self.provider, read_secret) catch return null;
+        return deriveAes128GcmKeysWithProvider(self.provider, next_read) catch null;
     }
 
     /// Commit the next-generation 1-RTT *read* secret after a peer key update
     /// has been authenticated, flipping the incoming key phase bit (RFC 9001
     /// §6.3). Write keys and the outgoing phase are untouched.
-    pub fn commitApplicationReadKeyUpdate(self: *QuicTlsAdapter) error{ApplicationSecretsMissing}!void {
+    pub fn commitApplicationReadKeyUpdate(self: *QuicTlsAdapter) error{ ApplicationSecretsMissing, ProviderUnsupported }!void {
         const read_secret = self.applicationTrafficSecret(.read) orelse return error.ApplicationSecretsMissing;
-        const next_read = deriveNextGenerationSecret(read_secret);
+        const next_read = try deriveNextGenerationSecretWithProvider(self.provider, read_secret);
         self.installSecret(Secret.init(.application, .read, &next_read) catch unreachable);
         self.application_read_key_phase ^= 1;
     }

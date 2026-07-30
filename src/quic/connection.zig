@@ -1173,7 +1173,11 @@ pub const Connection = struct {
         var sample: [sample_len]u8 = undefined;
         @memcpy(&sample, work[parsed.pn_offset + 4 ..][0..sample_len]);
         var sampled_pn: [4]u8 = work[parsed.pn_offset..][0..4].*;
-        const removed = keys.removeHeaderProtection(&work[0], &sampled_pn, sample);
+        const removed = keys.removeHeaderProtectionWithProvider(self.adapter.provider, &work[0], &sampled_pn, sample) catch {
+            self.dropPacket(.undecryptable, bytes.len);
+            self.emitZeroRttOutcome(level, .authentication_failed, bytes.len);
+            return;
+        };
         @memcpy(work[parsed.pn_offset..][0..removed.packet_number_length], sampled_pn[0..removed.packet_number_length]);
 
         const space_idx = spaceIndex(space);
@@ -1200,7 +1204,7 @@ pub const Connection = struct {
         const header = work[0 .. parsed.pn_offset + removed.packet_number_length];
         const ciphertext = work[parsed.pn_offset + removed.packet_number_length .. parsed.packet_len];
         var plain: [2048]u8 = undefined;
-        const payload = keys.openPayload(pn, header, ciphertext, &plain) catch {
+        const payload = keys.openPayloadWithProvider(self.adapter.provider, pn, header, ciphertext, &plain) catch {
             self.adapter.metrics.deprotection_failures += 1;
             self.dropPacket(.undecryptable, bytes.len);
             self.emitZeroRttOutcome(level, .authentication_failed, bytes.len);
@@ -2670,7 +2674,7 @@ pub const Connection = struct {
 
         var sample: [sample_len]u8 = undefined;
         @memcpy(&sample, out[pn_offset + 4 ..][0..sample_len]);
-        keys.applyHeaderProtection(&out[0], out[pn_offset..][0..pn_len], sample);
+        keys.applyHeaderProtectionWithProvider(self.adapter.provider, &out[0], out[pn_offset..][0..pn_len], sample) catch unreachable;
 
         const total = pn_offset + pn_len + sealed.len;
         self.next_pn[space_idx] = pn + 1;
@@ -2899,7 +2903,7 @@ pub const Connection = struct {
 
         var sample: [sample_len]u8 = undefined;
         @memcpy(&sample, out[pn_offset + 4 ..][0..sample_len]);
-        keys.applyHeaderProtection(&out[0], out[pn_offset..][0..pn_len], sample);
+        keys.applyHeaderProtectionWithProvider(self.adapter.provider, &out[0], out[pn_offset..][0..pn_len], sample) catch unreachable;
 
         const total = pn_offset + pn_len + sealed.len;
         self.next_pn[space_idx] = pn + 1;
@@ -3236,7 +3240,7 @@ pub const Connection = struct {
         const sealed = self.adapter.sealPacketPayload(level, .write, pn, header, plain[0..plain_len], out[pn_offset + pn_len ..]) catch return null;
         var sample: [sample_len]u8 = undefined;
         @memcpy(&sample, out[pn_offset + 4 ..][0..sample_len]);
-        keys.applyHeaderProtection(&out[0], out[pn_offset..][0..pn_len], sample);
+        keys.applyHeaderProtectionWithProvider(self.adapter.provider, &out[0], out[pn_offset..][0..pn_len], sample) catch unreachable;
         self.next_pn[space_idx] = pn + 1;
 
         var total = pn_offset + pn_len + sealed.len;
@@ -4344,7 +4348,7 @@ fn sealTestZeroRttPacket(
 
     var sample: [sample_len]u8 = undefined;
     @memcpy(&sample, out[pn_offset + 4 ..][0..sample_len]);
-    keys.applyHeaderProtection(&out[0], out[pn_offset..][0..pn_len], sample);
+    keys.applyHeaderProtectionWithProvider(sender.provider, &out[0], out[pn_offset..][0..pn_len], sample) catch unreachable;
 
     return out[0 .. pn_offset + pn_len + padded_len + aead_tag_len];
 }
