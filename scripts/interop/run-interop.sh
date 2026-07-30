@@ -9,6 +9,8 @@
 #   4. quiche http3-client -> native server
 #   5. native client -> aioquic server        (optional)
 #   6. aioquic client -> native server        (optional)
+#   7. native HRR client -> ngtcp2/nghttp3 server
+#   8. ngtcp2/nghttp3 HRR client -> native server
 #
 # Peer discovery via environment variables (unset peers are skipped, but
 # ngtcp2 and quiche are required for the #328 gate):
@@ -99,6 +101,54 @@ if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ]
   fi
 else
   result "ngtcp2 gtlsclient -> native server" SKIP
+fi
+
+# --- 333-1. native HRR client -> ngtcp2 gtlsserver ------------------------
+next_port
+if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsserver" ]; then
+  mkdir -p "$workdir/hrr-docroot"
+  echo "hello-from-ngtcp2-hrr" >"$workdir/hrr-docroot/hrr.txt"
+  "$NGTCP2_EXAMPLES_DIR/gtlsserver" 127.0.0.1 "$port" "$certs/ed25519-key.pem" "$certs/ed25519-cert.pem" \
+    -d "$workdir/hrr-docroot" --quiet >"$logs/333-1-gtlsserver-hrr.log" 2>&1 &
+  peer=$!
+  wait_udp_listen
+  if "$tool" client --host 127.0.0.1 --port "$port" --authority tardigrade.test \
+    --path /hrr.txt --insecure --empty-initial-key-share --expect-hrr --timeout-ms 10000 \
+    >"$logs/333-1-native-client-hrr.log" 2>&1 &&
+    grep -q "hello-from-ngtcp2-hrr" "$logs/333-1-native-client-hrr.log" &&
+    grep -q "tls retry_state=hrr_received" "$logs/333-1-native-client-hrr.log"; then
+    result "#333 native HRR client -> ngtcp2 gtlsserver" PASS
+  else
+    result "#333 native HRR client -> ngtcp2 gtlsserver" FAIL
+  fi
+  kill "$peer" 2>/dev/null
+  wait "$peer" 2>/dev/null
+else
+  result "#333 native HRR client -> ngtcp2 gtlsserver" SKIP
+fi
+
+# --- 333-2. ngtcp2 HRR gtlsclient -> native server ------------------------
+next_port
+if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ]; then
+  "$tool" server --port "$port" --cert "$certs/ed25519-cert.der" --key "$certs/ed25519-key.pkcs8.der" \
+    --expect-hrr --verbose --timeout-ms 15000 >"$logs/333-2-native-server-hrr.log" 2>&1 &
+  peer=$!
+  wait_udp_listen
+  "$NGTCP2_EXAMPLES_DIR/gtlsclient" --groups=-GROUP-ALL:+GROUP-SECP256R1:+GROUP-X25519:%NO_SHUFFLE_EXTENSIONS \
+    127.0.0.1 "$port" "https://tardigrade.test/from-ngtcp2-hrr" \
+    --exit-on-first-stream-close >"$logs/333-2-gtlsclient-hrr.log" 2>&1
+  client_rc=$?
+  wait "$peer"
+  server_rc=$?
+  if [ "$client_rc" -eq 0 ] && [ "$server_rc" -eq 0 ] &&
+    grep -q "server ok, served=1" "$logs/333-2-native-server-hrr.log" &&
+    grep -q "tls hello_retry_request=true" "$logs/333-2-native-server-hrr.log"; then
+    result "#333 ngtcp2 HRR gtlsclient -> native server" PASS
+  else
+    result "#333 ngtcp2 HRR gtlsclient -> native server" FAIL
+  fi
+else
+  result "#333 ngtcp2 HRR gtlsclient -> native server" SKIP
 fi
 
 # --- 3. native client -> quiche http3-server ------------------------------

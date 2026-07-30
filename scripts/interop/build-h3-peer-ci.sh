@@ -10,8 +10,9 @@
 #
 # usage: build-h3-peer-ci.sh
 #
-# Writes the built client binary's path to $GITHUB_OUTPUT as `client_path`
-# (or prints it to stdout when GITHUB_OUTPUT isn't set, e.g. run locally).
+# Writes the built client binary's path to $GITHUB_OUTPUT as `client_path` and
+# the peer-neutral examples directory as `examples_dir` (or prints both when
+# GITHUB_OUTPUT isn't set, e.g. run locally).
 set -euo pipefail
 
 # Pinned release tags, not HEAD: tests/integration.zig's h3interop.quic.*
@@ -51,6 +52,33 @@ fi
 # consumes an object library built from a submodule there).
 git -C "$root/client" submodule update --init --depth 1
 
+# #333 HRR smoke: force the GnuTLS example client to send only the top
+# configured group's key share in ClientHello1. With
+# `--groups=-GROUP-ALL:+GROUP-SECP256R1:+GROUP-X25519`, P-256 is then present
+# as the first share while X25519 remains advertised but shareless, so the
+# native X25519-only server must emit HelloRetryRequest.
+gtls_client_source="$root/client/examples/tls_client_session_gnutls.cc"
+if ! grep -q "GNUTLS_KEY_SHARE_TOP" "$gtls_client_source"; then
+  perl -0pi -e 's/GNUTLS_CLIENT \| GNUTLS_ENABLE_EARLY_DATA \|\n\s+GNUTLS_NO_END_OF_EARLY_DATA/GNUTLS_CLIENT | GNUTLS_ENABLE_EARLY_DATA |\n                                 GNUTLS_NO_END_OF_EARLY_DATA |\n                                 GNUTLS_KEY_SHARE_TOP/' "$gtls_client_source"
+fi
+grep -q "GNUTLS_KEY_SHARE_TOP" "$gtls_client_source" || {
+  echo "build-h3-peer-ci.sh: failed to apply GnuTLS key-share-top patch" >&2
+  exit 1
+}
+# GnuTLS shuffles ClientHello extensions by default for fingerprinting
+# resistance. Disable that in the pinned interop peer so ClientHello2 remains
+# conforming to RFC 8446 §4.1.2's stable-extension-order requirement.
+if ! grep -q "%NO_SHUFFLE_EXTENSIONS" "$gtls_client_source"; then
+  perl -0pi -e 's/%DISABLE_TLS13_COMPAT_MODE:/%DISABLE_TLS13_COMPAT_MODE:%NO_SHUFFLE_EXTENSIONS:/' "$gtls_client_source"
+fi
+grep -q "%NO_SHUFFLE_EXTENSIONS" "$gtls_client_source" || {
+  echo "build-h3-peer-ci.sh: failed to apply GnuTLS no-shuffle patch" >&2
+  exit 1
+}
+if command -v gnutls-cli >/dev/null 2>&1; then
+  gnutls-cli --version | head -n 1
+fi
+
 export PKG_CONFIG_PATH="$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 export CMAKE_PREFIX_PATH="$prefix${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 
@@ -74,13 +102,18 @@ cmake -S "$root/client" -B "$root/client/build" \
   -DCMAKE_PREFIX_PATH="$prefix" \
   -DENABLE_GNUTLS=ON \
   -DENABLE_OPENSSL=OFF
-cmake --build "$root/client/build" --parallel "$jobs" --target gtlsclient
+cmake --build "$root/client/build" --parallel "$jobs" --target gtlsclient gtlsserver
 
 client_path="$root/client/build/examples/gtlsclient"
+server_path="$root/client/build/examples/gtlsserver"
+examples_dir="$root/client/build/examples"
 test -x "$client_path"
+test -x "$server_path"
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   printf 'client_path=%s\n' "$client_path" >> "$GITHUB_OUTPUT"
+  printf 'examples_dir=%s\n' "$examples_dir" >> "$GITHUB_OUTPUT"
 else
-  printf '%s\n' "$client_path"
+  printf 'client_path=%s\n' "$client_path"
+  printf 'examples_dir=%s\n' "$examples_dir"
 fi
