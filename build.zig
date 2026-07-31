@@ -321,7 +321,12 @@ pub fn build(b: *std.Build) void {
     // `pure_zig.Provider` construction so `src/quic/` and the native HTTP/3
     // composition root never do. Every module whose test blocks or tools
     // exercise the QUIC seam directly (without the real Runtime composition
-    // root) imports this; production code must never call it.
+    // root) imports this; production code must never call it. Zig's module
+    // system has no way to make this import resolvable only from `test`
+    // blocks within a shared module, so the boundary is enforced by
+    // `scripts/audit_crypto_boundary.zig` instead: it rejects any
+    // `test_quic_crypto.` usage that falls before a file's test boundary
+    // (see `test_quic_crypto_import_checks`), not just by this comment.
     const test_quic_crypto_mod = b.createModule(.{
         .root_source_file = b.path("tests/support/quic_crypto.zig"),
         .target = target,
