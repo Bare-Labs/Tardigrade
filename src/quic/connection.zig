@@ -3637,7 +3637,8 @@ const TestPair = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &odcid,
             .tls = pair.client_backend.backend(),
-            .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+            var test_crypto_storage_17 = tls_core.production_crypto.StackProviderStorage{};
+            .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_17),
             .now_us = pair.now_us,
             .initial_path = client_path,
         });
@@ -3649,7 +3650,8 @@ const TestPair = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = pair.server_backend.backend(),
-            .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+            var test_crypto_storage_18 = tls_core.production_crypto.StackProviderStorage{};
+            .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_18),
             .now_us = pair.now_us,
             .initial_path = server_path,
         });
@@ -3699,7 +3701,8 @@ const TestPair = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &odcid,
             .tls = pair.client_backend.backend(),
-            .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+            var test_crypto_storage_19 = tls_core.production_crypto.StackProviderStorage{};
+            .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_19),
             .now_us = pair.now_us,
             .initial_path = client_path,
         });
@@ -3711,7 +3714,8 @@ const TestPair = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = pair.server_backend.backend(),
-            .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+            var test_crypto_storage_20 = tls_core.production_crypto.StackProviderStorage{};
+            .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_20),
             .now_us = pair.now_us,
             .initial_path = server_path,
         });
@@ -3749,7 +3753,8 @@ const TestPair = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &odcid,
             .tls = pair.client_backend.backend(),
-            .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+            var test_crypto_storage_21 = tls_core.production_crypto.StackProviderStorage{};
+            .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_21),
             .now_us = pair.now_us,
             .initial_path = client_path,
         });
@@ -3761,7 +3766,8 @@ const TestPair = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = pair.server_backend.backend(),
-            .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+            var test_crypto_storage_22 = tls_core.production_crypto.StackProviderStorage{};
+            .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_22),
             .now_us = pair.now_us,
             .initial_path = server_path,
         });
@@ -3819,7 +3825,8 @@ test "Connection.init failure before the handshake is assigned does not deinit u
         .initial_secret_dcid = &too_short_dcid,
         .peer_cid = &too_short_dcid,
         .tls = backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_23 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_23),
         .now_us = 1_000_000,
         .initial_path = TestPair.client_path,
     }));
@@ -3921,7 +3928,8 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = pair.client_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_24 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_24),
         .now_us = pair.now_us,
         .initial_path = TestPair.client_path,
         .events = .{ .context = &client_capture, .emitFn = EventCapture.onEvent },
@@ -3934,7 +3942,8 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = pair.server_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_25 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_25),
         .now_us = pair.now_us,
         .initial_path = TestPair.server_path,
         .events = .{ .context = &server_capture, .emitFn = EventCapture.onEvent },
@@ -4124,7 +4133,8 @@ test "driver: PSK resumption completes through a real HelloRetryRequest over QUI
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = pair.client_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_26 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_26),
         .now_us = pair.now_us,
         .initial_path = TestPair.client_path,
         .events = .{ .context = &client_capture, .emitFn = EventCapture.onEvent },
@@ -4137,7 +4147,8 @@ test "driver: PSK resumption completes through a real HelloRetryRequest over QUI
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = pair.server_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_27 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_27),
         .now_us = pair.now_us,
         .initial_path = TestPair.server_path,
         .events = .{ .context = &server_capture, .emitFn = EventCapture.onEvent },
@@ -4340,7 +4351,8 @@ fn sealTestZeroRttPacket(
     plaintext: []const u8,
     out: []u8,
 ) []u8 {
-    var sender = tls_adapter.QuicTlsAdapter{ .provider = tls_adapter.testOnlyDefaultProvider() };
+    var test_crypto_storage_28 = tls_core.production_crypto.StackProviderStorage{};
+    var sender = tls_adapter.QuicTlsAdapter{ .provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_28) };
     sender.setZeroRttEnabled(true);
     sender.installSecret(tls_adapter.Secret.init(.zero_rtt, .write, &secret) catch unreachable);
 
@@ -5016,7 +5028,8 @@ test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake v
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = resumed.client_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_29 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_29),
         .now_us = resumed.now_us,
         .initial_path = TestPair.client_path,
     });
@@ -5028,7 +5041,8 @@ test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake v
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = resumed.server_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_30 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_30),
         .now_us = resumed.now_us,
         .initial_path = TestPair.server_path,
     });
@@ -5197,7 +5211,8 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = resumed.client_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_31 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_31),
         .now_us = resumed.now_us,
         .initial_path = TestPair.client_path,
     });
@@ -5210,7 +5225,8 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = resumed.server_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_32 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_32),
         .now_us = resumed.now_us,
         .initial_path = TestPair.server_path,
     });
@@ -5415,7 +5431,8 @@ test "#523: Event.early_data_decision surfaces the real TLS decision once, even 
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = resumed.client_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_33 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_33),
         .now_us = resumed.now_us,
         .initial_path = TestPair.client_path,
     });
@@ -5428,7 +5445,8 @@ test "#523: Event.early_data_decision surfaces the real TLS decision once, even 
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = resumed.server_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_34 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_34),
         .now_us = resumed.now_us,
         .initial_path = TestPair.server_path,
         .events = .{ .context = &event_capture, .emitFn = EventCapture.onEvent },
@@ -5604,7 +5622,8 @@ fn expectRejectedEarlyDataFallsBackOnSameConnection(scenario: RejectedEarlyDataF
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = resumed.client_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_35 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_35),
         .now_us = resumed.now_us,
         .initial_path = TestPair.client_path,
     });
@@ -5617,7 +5636,8 @@ fn expectRejectedEarlyDataFallsBackOnSameConnection(scenario: RejectedEarlyDataF
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = resumed.server_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_36 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_36),
         .now_us = resumed.now_us,
         .initial_path = TestPair.server_path,
         .events = .{ .context = &event_capture, .emitFn = EventCapture.onEvent },
@@ -6091,7 +6111,8 @@ const MigrationPair = struct {
             .initial_secret_dcid = &TestPair.odcid,
             .peer_cid = &TestPair.odcid,
             .tls = pair.client_backend.backend(),
-            .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+            var test_crypto_storage_37 = tls_core.production_crypto.StackProviderStorage{};
+            .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_37),
             .now_us = pair.now_us,
             .initial_path = TestPair.client_path,
         });
@@ -6104,7 +6125,8 @@ const MigrationPair = struct {
             .initial_secret_dcid = &TestPair.odcid,
             .peer_cid = &TestPair.client_cid,
             .tls = pair.server_backend.backend(),
-            .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+            var test_crypto_storage_38 = tls_core.production_crypto.StackProviderStorage{};
+            .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_38),
             .now_us = pair.now_us,
             .initial_path = TestPair.server_path,
         });
@@ -6433,7 +6455,8 @@ test "connection: a policy-blocked server still answers a PATH_CHALLENGE on its 
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = client_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_39 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_39),
         .now_us = now_us,
         .initial_path = TestPair.client_path,
     });
@@ -6446,7 +6469,8 @@ test "connection: a policy-blocked server still answers a PATH_CHALLENGE on its 
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = server_backend.backend(),
-        .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+        var test_crypto_storage_40 = tls_core.production_crypto.StackProviderStorage{};
+        .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_40),
         .now_us = now_us,
         .initial_path = TestPair.server_path,
     });
@@ -6934,7 +6958,8 @@ test "a real Connection closes with handshake_failure when the server has no app
             .initial_secret_dcid = &TestPair.odcid,
             .peer_cid = &TestPair.odcid,
             .tls = pair.client_backend.backend(),
-            .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+            var test_crypto_storage_41 = tls_core.production_crypto.StackProviderStorage{};
+            .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_41),
             .now_us = pair.now_us,
             .initial_path = TestPair.client_path,
         });
@@ -6945,7 +6970,8 @@ test "a real Connection closes with handshake_failure when the server has no app
             .initial_secret_dcid = &TestPair.odcid,
             .peer_cid = &TestPair.client_cid,
             .tls = pair.server_backend.backend(),
-            .crypto_provider = tls_adapter.testOnlyDefaultProvider(),
+            var test_crypto_storage_42 = tls_core.production_crypto.StackProviderStorage{};
+            .crypto_provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_42),
             .now_us = pair.now_us,
             .initial_path = TestPair.server_path,
         });

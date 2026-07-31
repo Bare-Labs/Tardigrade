@@ -738,12 +738,21 @@ fn defaultParams() config.TransportParameters {
 }
 
 const Harness = struct {
-    client_adapter: QuicTlsAdapter = .{ .provider = tls_adapter.testOnlyDefaultProvider() },
-    server_adapter: QuicTlsAdapter = .{ .provider = tls_adapter.testOnlyDefaultProvider() },
+    client_crypto: tls_core.production_crypto.StackProviderStorage = .{},
+    server_crypto: tls_core.production_crypto.StackProviderStorage = .{},
+    client_adapter: QuicTlsAdapter = undefined,
+    server_adapter: QuicTlsAdapter = undefined,
     client_backend: TestTlsBackend = .{},
     server_backend: TestTlsBackend = .{},
     client: Handshake = undefined,
     server: Handshake = undefined,
+
+    fn init() Harness {
+        var harness: Harness = .{};
+        harness.client_adapter = .{ .provider = tls_core.production_crypto.stackProvider(&harness.client_crypto) };
+        harness.server_adapter = .{ .provider = tls_core.production_crypto.stackProvider(&harness.server_crypto) };
+        return harness;
+    }
 
     fn wire(self: *Harness) !void {
         // Initial secrets come from the client DCID (installed by the connection
@@ -980,7 +989,8 @@ test "a well-formed message for the wrong role is an unexpected_message error" {
 }
 
 test "a 0-RTT CRYPTO fragment is rejected while 0-RTT is disabled" {
-    var adapter = QuicTlsAdapter{ .provider = tls_adapter.testOnlyDefaultProvider() };
+    var test_crypto_storage_49 = tls_core.production_crypto.StackProviderStorage{};
+    var adapter = QuicTlsAdapter{ .provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_49) };
     var backend = TestTlsBackend{};
     var handshake = Handshake.initServer(&adapter, backend.backend());
     // 0-RTT has no CRYPTO stream (RFC 9001); feeding one is a deterministic error.
@@ -989,7 +999,8 @@ test "a 0-RTT CRYPTO fragment is rejected while 0-RTT is disabled" {
 }
 
 test "the connection-facing driver exposes only the backend interface, not a concrete backend" {
-    var adapter = QuicTlsAdapter{ .provider = tls_adapter.testOnlyDefaultProvider() };
+    var test_crypto_storage_50 = tls_core.production_crypto.StackProviderStorage{};
+    var adapter = QuicTlsAdapter{ .provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_50) };
     var backend = TestTlsBackend{};
     const handshake = Handshake.initClient(&adapter, backend.backend());
     // The wrapper holds the protocol-neutral core driver over the runtime

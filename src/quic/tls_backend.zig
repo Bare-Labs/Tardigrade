@@ -9,6 +9,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const varint = @import("quic_varint");
 const tls_adapter = @import("tls_adapter.zig");
+const tls_core = @import("tls_core");
 const tls_handshake = @import("tls_handshake.zig");
 const tls_core = @import("tls_core");
 
@@ -927,8 +928,10 @@ test "QUIC adapter teardown wipes private scratch, parameters, and shared engine
 }
 
 const RealHandshakeHarness = struct {
-    client_adapter: tls_adapter.QuicTlsAdapter = .{ .provider = tls_adapter.testOnlyDefaultProvider() },
-    server_adapter: tls_adapter.QuicTlsAdapter = .{ .provider = tls_adapter.testOnlyDefaultProvider() },
+    client_crypto: tls_core.production_crypto.StackProviderStorage = .{},
+    server_crypto: tls_core.production_crypto.StackProviderStorage = .{},
+    client_adapter: tls_adapter.QuicTlsAdapter = undefined,
+    server_adapter: tls_adapter.QuicTlsAdapter = undefined,
     client_backend: Tls13Backend,
     server_backend: Tls13Backend,
     client: tls_handshake.Handshake = undefined,
@@ -937,7 +940,7 @@ const RealHandshakeHarness = struct {
     deinitialized: bool = false,
 
     fn init() !RealHandshakeHarness {
-        return .{
+        var harness: RealHandshakeHarness = .{
             .client_backend = try Tls13Backend.initClientWithAllocator(
                 std.testing.allocator,
                 .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
@@ -949,6 +952,10 @@ const RealHandshakeHarness = struct {
                 try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
             ),
         };
+        harness.client_adapter = .{ .provider = tls_core.production_crypto.stackProvider(&harness.client_crypto) };
+        harness.server_adapter = .{ .provider = tls_core.production_crypto.stackProvider(&harness.server_crypto) };
+        return harness;
+    }
     }
 
     fn initWithSniProvider(server_name: []const u8, provider: tls_core.credentials.CredentialProvider) !RealHandshakeHarness {
@@ -1206,8 +1213,10 @@ test "the QUIC production driver resumes an async server signature without anoth
     mock.async_sign = true;
     mock.pending_polls = 2;
 
-    var client_adapter = tls_adapter.QuicTlsAdapter{ .provider = tls_adapter.testOnlyDefaultProvider() };
-    var server_adapter = tls_adapter.QuicTlsAdapter{ .provider = tls_adapter.testOnlyDefaultProvider() };
+    var test_crypto_storage_45 = tls_core.production_crypto.StackProviderStorage{};
+    var client_adapter = tls_adapter.QuicTlsAdapter{ .provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_45) };
+    var test_crypto_storage_46 = tls_core.production_crypto.StackProviderStorage{};
+    var server_adapter = tls_adapter.QuicTlsAdapter{ .provider = tls_core.production_crypto.stackProvider(&test_crypto_storage_46) };
     var client_backend = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
         .{ .pinned_certificate = testdata.certificate_der },
