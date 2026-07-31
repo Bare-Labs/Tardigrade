@@ -362,20 +362,22 @@ pub fn build(b: *std.Build) void {
 
     // Test-only QUIC/H3 crypto provider composition (#490): owns concrete
     // `pure_zig.Provider` construction so `src/quic/` and the native HTTP/3
-    // composition root never do. Wired *only* into quic_test_mod and
-    // exe_test_mod (used solely by quic_tests/exe_unit_tests below) -- never
-    // into quic_mod/exe_mod, the modules every production consumer
-    // (exe/run_cmd, and everything that imports "quic") actually builds
-    // against. Renaming the local binding, using an inline `@import`, or any
-    // other indirection cannot resolve a module this import isn't wired
-    // into: the compiler itself enforces the boundary, not a source-text
-    // scanner trying to approximate it (#490 sixth-pass review: a prior
-    // version of this comment relied on `scripts/audit_crypto_boundary.zig`
-    // pattern-matching for this, which a renamed binding or an inline
-    // `@import` bypassed, and which couldn't see that Zig declarations are
-    // order-independent -- a public production declaration can call a
-    // private helper physically written after a "test boundary" marker, so
-    // no text-position heuristic can make that region truly unreachable).
+    // composition root never do. Wired only into explicit test/tool roots --
+    // quic_test_mod and exe_test_mod (used solely by quic_tests/
+    // exe_unit_tests below), the QUIC/H3 smoke/e2e/UDP test modules further
+    // down, the test-only Runtime clone those UDP tests build against, and
+    // the opt-in H3 interop tool -- never into quic_mod, exe_mod, or any
+    // other module that feeds the shipped `tardi` build. Renaming the local
+    // binding, using an inline `@import`, or any other indirection cannot
+    // resolve a module this import isn't wired into: the compiler itself
+    // enforces the boundary, not a source-text scanner trying to
+    // approximate it (#490 sixth-pass review: a prior version of this
+    // comment relied on `scripts/audit_crypto_boundary.zig` pattern-matching
+    // for this, which a renamed binding or an inline `@import` bypassed, and
+    // which couldn't see that Zig declarations are order-independent -- a
+    // public production declaration can call a private helper physically
+    // written after a "test boundary" marker, so no text-position heuristic
+    // can make that region truly unreachable).
     const test_quic_crypto_mod = b.createModule(.{
         .root_source_file = b.path("tests/support/quic_crypto.zig"),
         .target = target,
