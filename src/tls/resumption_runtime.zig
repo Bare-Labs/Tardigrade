@@ -1340,6 +1340,10 @@ test "stateless runtime initialization fails without AES-128-GCM capability" {
             return error.UnsupportedCapability;
         }
 
+        fn quicHeaderProtectionMask(_: *anyopaque, _: provider.QuicHeaderProtection, _: []const u8, _: []const u8, _: []u8) provider.QuicHeaderProtectionError!void {
+            return error.UnsupportedCapability;
+        }
+
         fn generateKeyShare(_: *anyopaque, _: provider.Group, _: []u8, _: []u8) provider.KeyShareError!void {
             return error.UnsupportedCapability;
         }
@@ -1358,6 +1362,7 @@ test "stateless runtime initialization fails without AES-128-GCM capability" {
             .hkdfExpandLabel = hkdfExpandLabel,
             .aeadSeal = aeadSeal,
             .aeadOpen = aeadOpen,
+            .quicHeaderProtectionMask = quicHeaderProtectionMask,
             .generateKeyShare = generateKeyShare,
             .deriveSharedSecret = deriveSharedSecret,
             .verify = verify,

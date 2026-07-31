@@ -1054,6 +1054,7 @@ const BadAeadProvider = struct {
         .hkdfExpandLabel = hkdfExpandLabel,
         .aeadSeal = aeadSeal,
         .aeadOpen = aeadOpen,
+        .quicHeaderProtectionMask = quicHeaderProtectionMask,
         .generateKeyShare = generateKeyShare,
         .deriveSharedSecret = deriveSharedSecret,
         .verify = verify,
@@ -1116,6 +1117,15 @@ const BadAeadProvider = struct {
         @memset(plaintext, 0x42);
     }
 
+    fn quicHeaderProtectionMask(ctx: *anyopaque, hp: provider.QuicHeaderProtection, key: []const u8, sample: []const u8, mask: []u8) provider.QuicHeaderProtectionError!void {
+        _ = ctx;
+        _ = hp;
+        _ = key;
+        _ = sample;
+        _ = mask;
+        return error.UnsupportedCapability;
+    }
+
     fn generateKeyShare(ctx: *anyopaque, group: provider.Group, public_out: []u8, private_out: []u8) provider.KeyShareError!void {
         _ = ctx;
         _ = group;
@@ -1158,6 +1168,7 @@ const UnsupportedAeadProvider = struct {
         .hkdfExpandLabel = BadAeadProvider.hkdfExpandLabel,
         .aeadSeal = BadAeadProvider.aeadSeal,
         .aeadOpen = aeadOpen,
+        .quicHeaderProtectionMask = BadAeadProvider.quicHeaderProtectionMask,
         .generateKeyShare = BadAeadProvider.generateKeyShare,
         .deriveSharedSecret = BadAeadProvider.deriveSharedSecret,
         .verify = BadAeadProvider.verify,

@@ -45,16 +45,55 @@ pub const TlsCapabilities = struct {
     }
 };
 
-pub fn fromProvider(caps: provider.Capabilities) TlsCapabilities {
+/// Derive TLS policy capabilities for a named product profile, intersecting
+/// provider primitive support with the profile row's `enabled_product_profiles`
+/// (#490). Every call site must name the product explicitly — there is no
+/// caller-agnostic default, since which cipher suites/groups/signatures a
+/// product actually negotiates is a product decision, not something a
+/// provider's raw capability set can answer on its own.
+pub fn fromProfile(product: profile.ProductProfile, caps: provider.Capabilities) TlsCapabilities {
     var out = TlsCapabilities{};
-    if (supportsCipherSuite(caps, .tls_aes_128_gcm_sha256)) out.appendCipher(.tls_aes_128_gcm_sha256);
-    if (supportsCipherSuite(caps, .tls_aes_256_gcm_sha384)) out.appendCipher(.tls_aes_256_gcm_sha384);
-    if (supportsCipherSuite(caps, .tls_chacha20_poly1305_sha256)) out.appendCipher(.tls_chacha20_poly1305_sha256);
-    if (supportsNamedGroup(caps, .x25519)) out.appendGroup(.x25519);
-    if (supportsNamedGroup(caps, .secp256r1)) out.appendGroup(.secp256r1);
-    if (supportsSignatureScheme(caps, .ed25519)) out.appendSignature(.ed25519);
-    if (supportsSignatureScheme(caps, .ecdsa_secp256r1_sha256)) out.appendSignature(.ecdsa_secp256r1_sha256);
-    if (supportsSignatureScheme(caps, .rsa_pss_rsae_sha256)) out.appendSignature(.rsa_pss_rsae_sha256);
+    // Each cipher suite is gated on every profile dimension the suite
+    // actually binds together (AEAD, transcript hash, and HKDF hash), not
+    // only its AEAD row: a suite is only truly selectable for `product` when
+    // the whole triple is enabled there, so the derivation does not depend
+    // on those rows being kept in lockstep by hand.
+    if (profile.productEnables(product, .{ .aead = .aes_128_gcm }) and
+        profile.productEnables(product, .{ .hash = .sha256 }) and
+        profile.productEnables(product, .{ .hkdf = .sha256 }) and
+        supportsCipherSuite(caps, .tls_aes_128_gcm_sha256))
+    {
+        out.appendCipher(.tls_aes_128_gcm_sha256);
+    }
+    if (profile.productEnables(product, .{ .aead = .aes_256_gcm }) and
+        profile.productEnables(product, .{ .hash = .sha384 }) and
+        profile.productEnables(product, .{ .hkdf = .sha384 }) and
+        supportsCipherSuite(caps, .tls_aes_256_gcm_sha384))
+    {
+        out.appendCipher(.tls_aes_256_gcm_sha384);
+    }
+    if (profile.productEnables(product, .{ .aead = .chacha20_poly1305 }) and
+        profile.productEnables(product, .{ .hash = .sha256 }) and
+        profile.productEnables(product, .{ .hkdf = .sha256 }) and
+        supportsCipherSuite(caps, .tls_chacha20_poly1305_sha256))
+    {
+        out.appendCipher(.tls_chacha20_poly1305_sha256);
+    }
+    if (profile.productEnables(product, .{ .group = .x25519 }) and supportsNamedGroup(caps, .x25519)) {
+        out.appendGroup(.x25519);
+    }
+    if (profile.productEnables(product, .{ .group = .secp256r1 }) and supportsNamedGroup(caps, .secp256r1)) {
+        out.appendGroup(.secp256r1);
+    }
+    if (profile.productEnables(product, .{ .signature = .ed25519 }) and supportsSignatureScheme(caps, .ed25519)) {
+        out.appendSignature(.ed25519);
+    }
+    if (profile.productEnables(product, .{ .signature = .ecdsa_secp256r1_sha256 }) and supportsSignatureScheme(caps, .ecdsa_secp256r1_sha256)) {
+        out.appendSignature(.ecdsa_secp256r1_sha256);
+    }
+    if (profile.productEnables(product, .{ .signature = .rsa_pss_rsae_sha256 }) and supportsSignatureScheme(caps, .rsa_pss_rsae_sha256)) {
+        out.appendSignature(.rsa_pss_rsae_sha256);
+    }
     return out;
 }
 
@@ -96,7 +135,8 @@ pub fn supportsSignatureScheme(caps: provider.Capabilities, scheme: policy_mod.S
 }
 
 test "TLS policy capabilities are derived from provider support" {
-    const tls_caps = fromProvider(profile.capabilities(.pure_zig));
+    const caps = profile.capabilities(.pure_zig);
+    const tls_caps = fromProfile(.general_purpose_openssl, caps);
     try std.testing.expectEqual(@as(usize, 3), tls_caps.cipher_suites_len);
     try std.testing.expectEqual(policy_mod.CipherSuite.tls_aes_128_gcm_sha256, tls_caps.cipher_suites[0]);
     try std.testing.expectEqual(policy_mod.CipherSuite.tls_aes_256_gcm_sha384, tls_caps.cipher_suites[1]);
@@ -109,9 +149,21 @@ test "TLS policy capabilities are derived from provider support" {
     try std.testing.expectEqual(policy_mod.SignatureScheme.rsa_pss_rsae_sha256, tls_caps.signature_schemes[2]);
 }
 
+test "native appliance profile selects only what the live engine negotiates" {
+    const caps = profile.capabilities(.pure_zig);
+    const native = fromProfile(.native_appliance, caps);
+    try std.testing.expectEqual(@as(usize, 1), native.cipher_suites_len);
+    try std.testing.expectEqual(policy_mod.CipherSuite.tls_aes_128_gcm_sha256, native.cipher_suites[0]);
+    try std.testing.expectEqual(@as(usize, 1), native.named_groups_len);
+    try std.testing.expectEqual(policy_mod.NamedGroup.x25519, native.named_groups[0]);
+    try std.testing.expectEqual(@as(usize, 2), native.signature_schemes_len);
+    try std.testing.expectEqual(policy_mod.SignatureScheme.ed25519, native.signature_schemes[0]);
+    try std.testing.expectEqual(policy_mod.SignatureScheme.ecdsa_secp256r1_sha256, native.signature_schemes[1]);
+}
+
 test "hand-written TLS policy capabilities are rejected when provider cannot support them" {
     const caps = profile.capabilities(.pure_zig);
-    const derived = fromProvider(caps);
+    const derived = fromProfile(.general_purpose_openssl, caps);
     try validateAgainstProvider(caps, derived.asPolicyCapabilities());
 
     // The secp256r1 ECDH group is still provider-deferred (only the signature

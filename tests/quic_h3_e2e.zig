@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const quic = @import("quic");
+const test_quic_crypto = @import("test_quic_crypto");
 const http3 = @import("http3");
 const tls_core = quic.tls_core;
 
@@ -349,6 +350,7 @@ const Sim = struct {
             .original_destination_cid = &odcid,
             .initial_secret_dcid = &odcid,
             .tls = sim.client_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = sim.now_us,
             .initial_path = client_path,
         });
@@ -361,6 +363,7 @@ const Sim = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = sim.server_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = sim.now_us,
             .initial_path = server_path,
         });

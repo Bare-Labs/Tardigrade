@@ -44,6 +44,7 @@ const HmacSha384 = crypto.auth.hmac.sha2.HmacSha384;
 const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 const Aes256Gcm = crypto.aead.aes_gcm.Aes256Gcm;
 const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
+const Aes128 = crypto.core.aes.Aes128;
 const X25519 = crypto.dh.X25519;
 const Ed25519 = crypto.sign.Ed25519;
 const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
@@ -58,9 +59,11 @@ pub const Provider = struct {
     }
 
     /// Erase to the boundary type. The returned view borrows `self`, so `self`
-    /// must outlive every use of it.
-    pub fn cryptoProvider(self: *Provider) provider.CryptoProvider {
-        return .{ .context = self, .vtable = &vtable, .entropy = self.entropy };
+    /// must outlive every use of it. Takes a const pointer because no vtable
+    /// entry mutates the provider; this lets comptime-constant `Provider`
+    /// values (e.g. a package-default instance) erase without a runtime copy.
+    pub fn cryptoProvider(self: *const Provider) provider.CryptoProvider {
+        return .{ .context = @constCast(self), .vtable = &vtable, .entropy = self.entropy };
     }
 
     /// The static algorithm profile this backend advertises.
@@ -71,6 +74,7 @@ pub const Provider = struct {
         caps.aeads.insert(.aes_128_gcm);
         caps.aeads.insert(.aes_256_gcm);
         caps.aeads.insert(.chacha20_poly1305);
+        caps.quic_header_protection.insert(.aes_128);
         caps.groups.insert(.x25519);
         caps.signatures.insert(.ed25519);
         caps.signatures.insert(.ecdsa_secp256r1_sha256);
@@ -84,6 +88,7 @@ pub const Provider = struct {
         .hkdfExpandLabel = hkdfExpandLabelImpl,
         .aeadSeal = aeadSealImpl,
         .aeadOpen = aeadOpenImpl,
+        .quicHeaderProtectionMask = quicHeaderProtectionMaskImpl,
         .generateKeyShare = generateKeyShareImpl,
         .deriveSharedSecret = deriveSharedSecretImpl,
         .verify = verifyImpl,
@@ -305,6 +310,34 @@ fn openWith(
         crypto.secureZero(u8, plaintext);
         return error.AuthenticationFailed;
     };
+}
+
+fn quicHeaderProtectionMaskImpl(
+    context: *anyopaque,
+    hp: provider.QuicHeaderProtection,
+    key: []const u8,
+    sample: []const u8,
+    mask: []u8,
+) provider.QuicHeaderProtectionError!void {
+    _ = context;
+    switch (hp) {
+        .aes_128 => {
+            if (key.len != provider.QuicHeaderProtection.aes_128.keyLength()) return error.InvalidInput;
+            if (sample.len != provider.quic_header_protection_sample_len) return error.InvalidInput;
+            if (mask.len != provider.quic_header_protection_mask_len) return error.InvalidInput;
+
+            var k: [16]u8 = undefined;
+            var s: [provider.quic_header_protection_sample_len]u8 = undefined;
+            @memcpy(&k, key);
+            @memcpy(&s, sample);
+            defer crypto.secureZero(u8, &k);
+
+            const aes = Aes128.initEnc(k);
+            var block: [provider.quic_header_protection_sample_len]u8 = undefined;
+            aes.encrypt(&block, &s);
+            @memcpy(mask, block[0..provider.quic_header_protection_mask_len]);
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +576,7 @@ test "capabilities advertise exactly the implemented profile" {
     const profiled = profile.capabilities(.pure_zig);
     try testing.expectEqual(caps.hashes, profiled.hashes);
     try testing.expectEqual(caps.aeads, profiled.aeads);
+    try testing.expectEqual(caps.quic_header_protection, profiled.quic_header_protection);
     try testing.expectEqual(caps.groups, profiled.groups);
     try testing.expectEqual(caps.signatures, profiled.signatures);
     try testing.expect(caps.supportsHash(.sha256));
@@ -550,11 +584,30 @@ test "capabilities advertise exactly the implemented profile" {
     try testing.expect(caps.supportsAead(.aes_128_gcm));
     try testing.expect(caps.supportsAead(.aes_256_gcm));
     try testing.expect(caps.supportsAead(.chacha20_poly1305));
+    try testing.expect(caps.supportsQuicHeaderProtection(.aes_128));
     try testing.expect(caps.supportsGroup(.x25519));
     try testing.expect(!caps.supportsGroup(.secp256r1));
     try testing.expect(caps.supportsSignature(.ed25519));
     try testing.expect(caps.supportsSignature(.ecdsa_secp256r1_sha256));
     try testing.expect(caps.supportsSignature(.rsa_pss_rsae_sha256));
+}
+
+test "QUIC AES header protection mask matches std.crypto directly" {
+    var det = DeterministicEntropy.init(9);
+    var p = Provider.init(det.entropy());
+    const cp = p.cryptoProvider();
+
+    const key = [_]u8{0x11} ** 16;
+    const sample = [_]u8{0x22} ** provider.quic_header_protection_sample_len;
+
+    const aes = Aes128.initEnc(key);
+    var block: [provider.quic_header_protection_sample_len]u8 = undefined;
+    aes.encrypt(&block, &sample);
+
+    var mask: [provider.quic_header_protection_mask_len]u8 = undefined;
+    try cp.quicHeaderProtectionMask(.aes_128, &key, &sample, &mask);
+    try testing.expectEqualSlices(u8, block[0..provider.quic_header_protection_mask_len], &mask);
+    try testing.expectError(error.InvalidInput, cp.quicHeaderProtectionMask(.aes_128, key[0..15], &sample, &mask));
 }
 
 test "unsupported algorithms return UnsupportedCapability, not undefined behaviour" {

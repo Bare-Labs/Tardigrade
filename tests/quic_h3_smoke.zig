@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const quic = @import("quic");
+const test_quic_crypto = @import("test_quic_crypto");
 const http3 = @import("http3");
 const stream_transport = @import("stream_transport");
 
@@ -235,7 +236,7 @@ const Endpoint = struct {
 
     allocator: std.mem.Allocator,
     role: tls_adapter.Perspective,
-    adapter: QuicTlsAdapter = .{},
+    adapter: QuicTlsAdapter = .{ .provider = test_quic_crypto.testDefaultProvider() },
     backend: tls_backend.Tls13Backend,
     handshake: tls_handshake.Handshake = undefined,
     cid_routes: quic_cid.CidRoutingTable,
@@ -303,7 +304,7 @@ const Endpoint = struct {
         remote_addr: quic_udp.Address,
         queue: *DatagramQueue,
     ) !void {
-        const keys = self.adapter.protectionKeys(level, .write) orelse return error.KeysUnavailableForLevel;
+        const keys = (try self.adapter.protectionKeys(level, .write)) orelse return error.KeysUnavailableForLevel;
         const space = spaceIndex(level);
         const pn = self.next_pn[space];
         self.next_pn[space] += 1;
@@ -468,7 +469,7 @@ const Endpoint = struct {
             pos += cid_len;
         }
 
-        const keys = self.adapter.protectionKeys(level, .read) orelse return error.KeysUnavailableForLevel;
+        const keys = (try self.adapter.protectionKeys(level, .read)) orelse return error.KeysUnavailableForLevel;
         const pn_offset = pos;
         if (packet_end < pn_offset + 4 + sample_len) return error.TruncatedPacket;
 
@@ -789,12 +790,12 @@ test "pure-Zig QUIC/TLS/H3 local smoke: handshake, request, response, close" {
     // both adapters, 1-RTT keys usable.
     inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |level| {
         inline for (.{ tls_adapter.Direction.read, tls_adapter.Direction.write }) |direction| {
-            try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), smoke.client.adapter.protectionKeys(level, direction));
-            try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), smoke.server.adapter.protectionKeys(level, direction));
+            try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), smoke.client.adapter.protectionKeys(level, direction) catch unreachable);
+            try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), smoke.server.adapter.protectionKeys(level, direction) catch unreachable);
         }
     }
-    try testing.expect(smoke.client.adapter.protectionKeys(.application, .write) != null);
-    try testing.expect(smoke.server.adapter.protectionKeys(.application, .write) != null);
+    try testing.expect((smoke.client.adapter.protectionKeys(.application, .write) catch unreachable) != null);
+    try testing.expect((smoke.server.adapter.protectionKeys(.application, .write) catch unreachable) != null);
 
     // Peer transport parameters are exposed only post-authentication.
     try testing.expect(smoke.client.adapter.peerTransportParameters() != null);

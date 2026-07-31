@@ -5,15 +5,33 @@ const tls13_backend = @import("tls13_backend.zig");
 
 pub const Provider = crypto.pure_zig.Provider;
 
+/// Stateless OS entropy callback context. `fill` ignores `context`, so the
+/// pointer need not refer to a live `OsEntropy` value — avoiding a dangling
+/// self-reference when a `Provider` outlives a copied/moved `Runtime`.
+const os_entropy_context: u8 = 0;
+
 pub const OsEntropy = struct {
-    pub fn entropy(self: *OsEntropy) crypto.provider.Entropy {
-        return .{ .context = self, .fillFn = fill };
+    pub fn entropy(_: *OsEntropy) crypto.provider.Entropy {
+        return .{ .context = @constCast(&os_entropy_context), .fillFn = fill };
     }
 
     fn fill(_: *anyopaque, buffer: []u8) crypto.provider.EntropyError!void {
         fillSecure(buffer) catch return error.EntropyFailure;
     }
 };
+
+/// Stack-stable pure-Zig provider storage for tests and short-lived composition
+/// roots. Keeps `entropy` and `provider` in one struct so the provider vtable
+/// context remains valid for the storage lifetime.
+pub const StackProviderStorage = struct {
+    entropy: OsEntropy = .{},
+    provider: Provider = undefined,
+};
+
+pub fn stackProvider(storage: *StackProviderStorage) crypto.provider.CryptoProvider {
+    storage.provider = Provider.init(storage.entropy.entropy());
+    return storage.provider.cryptoProvider();
+}
 
 pub fn freshHandshakeEntropy() crypto.provider.EntropyError!tls13_backend.Entropy {
     var entropy: tls13_backend.Entropy = undefined;

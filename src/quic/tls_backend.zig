@@ -9,8 +9,9 @@ const std = @import("std");
 const config = @import("config.zig");
 const varint = @import("quic_varint");
 const tls_adapter = @import("tls_adapter.zig");
-const tls_handshake = @import("tls_handshake.zig");
 const tls_core = @import("tls_core");
+const tls_handshake = @import("tls_handshake.zig");
+const test_quic_crypto = @import("test_quic_crypto");
 
 const shared = tls_core.tls13_backend;
 const RecordSink = tls_core.tls13_transport.EventSink;
@@ -927,8 +928,8 @@ test "QUIC adapter teardown wipes private scratch, parameters, and shared engine
 }
 
 const RealHandshakeHarness = struct {
-    client_adapter: tls_adapter.QuicTlsAdapter = .{},
-    server_adapter: tls_adapter.QuicTlsAdapter = .{},
+    client_adapter: tls_adapter.QuicTlsAdapter = .{ .provider = test_quic_crypto.testDefaultProvider() },
+    server_adapter: tls_adapter.QuicTlsAdapter = .{ .provider = test_quic_crypto.testDefaultProvider() },
     client_backend: Tls13Backend,
     server_backend: Tls13Backend,
     client: tls_handshake.Handshake = undefined,
@@ -952,7 +953,7 @@ const RealHandshakeHarness = struct {
     }
 
     fn initWithSniProvider(server_name: []const u8, provider: tls_core.credentials.CredentialProvider) !RealHandshakeHarness {
-        const harness = RealHandshakeHarness{
+        return .{
             .client_backend = try Tls13Backend.initClientWithAllocatorAndOptions(
                 std.testing.allocator,
                 .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
@@ -965,7 +966,6 @@ const RealHandshakeHarness = struct {
                 provider,
             ),
         };
-        return harness;
     }
 
     fn wire(self: *RealHandshakeHarness) !void {
@@ -1206,8 +1206,8 @@ test "the QUIC production driver resumes an async server signature without anoth
     mock.async_sign = true;
     mock.pending_polls = 2;
 
-    var client_adapter = tls_adapter.QuicTlsAdapter{};
-    var server_adapter = tls_adapter.QuicTlsAdapter{};
+    var client_adapter = tls_adapter.QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
+    var server_adapter = tls_adapter.QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     var client_backend = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
         .{ .pinned_certificate = testdata.certificate_der },

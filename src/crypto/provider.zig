@@ -70,6 +70,10 @@ pub const max_public_key_len = 65;
 pub const max_private_scalar_len = 32;
 /// Largest shared secret an ECDH group in the supported profile derives.
 pub const max_shared_secret_len = 32;
+/// QUIC AES header protection samples one AES block and consumes the first
+/// five mask bytes (RFC 9001 section 5.4.1).
+pub const quic_header_protection_sample_len = 16;
+pub const quic_header_protection_mask_len = 5;
 
 // ---------------------------------------------------------------------------
 // Error taxonomy
@@ -126,6 +130,8 @@ pub const SignError = InputError || CapabilityError || ProviderError;
 pub const VerifyError = InputError || CapabilityError || AuthError;
 /// Random-byte generation only fails when the entropy source does.
 pub const RandomError = ProviderError;
+/// QUIC header protection is keyed but does not authenticate.
+pub const QuicHeaderProtectionError = InputError || CapabilityError;
 
 /// Entropy sources report failure with this narrow set; the provider maps it
 /// onto `ProviderError.EntropyFailure`.
@@ -178,6 +184,28 @@ pub const Aead = enum {
     }
 };
 
+/// Keyed QUIC header-protection algorithms owned by the provider. This is
+/// deliberately narrower than a generic block-cipher API.
+pub const QuicHeaderProtection = enum {
+    aes_128,
+
+    pub fn keyLength(self: QuicHeaderProtection) usize {
+        return switch (self) {
+            .aes_128 => 16,
+        };
+    }
+
+    pub fn sampleLength(self: QuicHeaderProtection) usize {
+        _ = self;
+        return quic_header_protection_sample_len;
+    }
+
+    pub fn maskLength(self: QuicHeaderProtection) usize {
+        _ = self;
+        return quic_header_protection_mask_len;
+    }
+};
+
 /// Key-exchange groups (ECDH). Names match the TLS `NamedGroup` registry.
 pub const Group = enum {
     x25519,
@@ -219,6 +247,7 @@ pub const SignatureScheme = enum {
 pub const Capabilities = struct {
     hashes: std.EnumSet(Hash) = .{},
     aeads: std.EnumSet(Aead) = .{},
+    quic_header_protection: std.EnumSet(QuicHeaderProtection) = .{},
     groups: std.EnumSet(Group) = .{},
     signatures: std.EnumSet(SignatureScheme) = .{},
 
@@ -227,6 +256,9 @@ pub const Capabilities = struct {
     }
     pub fn supportsAead(self: Capabilities, aead: Aead) bool {
         return self.aeads.contains(aead);
+    }
+    pub fn supportsQuicHeaderProtection(self: Capabilities, hp: QuicHeaderProtection) bool {
+        return self.quic_header_protection.contains(hp);
     }
     pub fn supportsGroup(self: Capabilities, group: Group) bool {
         return self.groups.contains(group);
@@ -384,6 +416,17 @@ pub const CryptoProvider = struct {
             plaintext: []u8,
         ) OpenError!void,
 
+        /// QUIC header-protection mask for RFC 9001 packet number protection.
+        /// This is keyed cryptography, but kept deliberately protocol-shaped so
+        /// protocol code does not learn a reusable concrete AES primitive.
+        quicHeaderProtectionMask: *const fn (
+            context: *anyopaque,
+            hp: QuicHeaderProtection,
+            key: []const u8,
+            sample: []const u8,
+            mask: []u8,
+        ) QuicHeaderProtectionError!void,
+
         /// Generate an ephemeral key share for `group`. Writes the public value
         /// to `public_out` and the private scalar to `private_out` (both sized
         /// to the group). The private scalar is caller-owned; the caller wipes
@@ -468,6 +511,16 @@ pub const CryptoProvider = struct {
         return self.vtable.aeadOpen(self.context, aead, key, nonce, associated_data, ciphertext, tag, plaintext);
     }
 
+    pub fn quicHeaderProtectionMask(
+        self: CryptoProvider,
+        hp: QuicHeaderProtection,
+        key: []const u8,
+        sample: []const u8,
+        mask: []u8,
+    ) QuicHeaderProtectionError!void {
+        return self.vtable.quicHeaderProtectionMask(self.context, hp, key, sample, mask);
+    }
+
     pub fn generateKeyShare(self: CryptoProvider, group: Group, public_out: []u8, private_out: []u8) KeyShareError!void {
         return self.vtable.generateKeyShare(self.context, group, public_out, private_out);
     }
@@ -535,6 +588,9 @@ test "algorithm metadata is self-consistent" {
         try testing.expectEqual(aead_nonce_len, aead.nonceLength());
         try testing.expectEqual(aead_tag_len, aead.tagLength());
     }
+    try testing.expectEqual(@as(usize, 16), QuicHeaderProtection.aes_128.keyLength());
+    try testing.expectEqual(quic_header_protection_sample_len, QuicHeaderProtection.aes_128.sampleLength());
+    try testing.expectEqual(quic_header_protection_mask_len, QuicHeaderProtection.aes_128.maskLength());
 
     try testing.expect(Group.secp256r1.publicKeyLength() <= max_public_key_len);
     try testing.expect(Group.x25519.sharedSecretLength() <= max_shared_secret_len);

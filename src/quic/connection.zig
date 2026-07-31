@@ -28,12 +28,14 @@ const packet = @import("packet.zig");
 const frame = @import("frame.zig");
 const tls_adapter = @import("tls_adapter.zig");
 const tls_handshake = @import("tls_handshake.zig");
+const crypto_pkg = @import("crypto");
 const tls_core = @import("tls_core");
 const recovery = @import("recovery.zig");
 const quic_stream = @import("stream.zig");
 const quic_cid = @import("cid.zig");
 const quic_path = @import("path.zig");
 const quic_udp = @import("udp.zig");
+const test_quic_crypto = @import("test_quic_crypto");
 
 const EncryptionLevel = tls_adapter.EncryptionLevel;
 const PacketNumberSpace = recovery.PacketNumberSpace;
@@ -258,6 +260,12 @@ pub const Options = struct {
     /// and the retried Initial DCID/Retry SCID after Retry.
     initial_secret_dcid: []const u8,
     tls: tls_handshake.TlsBackend,
+    /// The provider-owned crypto QUIC packet protection uses (#490). Required,
+    /// with no default: `src/quic/` does not choose a concrete backend —
+    /// selecting one (e.g. the pure-Zig provider) is the native HTTP/QUIC
+    /// composition root's job. `Connection.init` rejects a provider missing
+    /// the fixed profile's required capabilities.
+    crypto_provider: crypto_pkg.provider.CryptoProvider,
     now_us: u64,
     events: EventSink = .{},
     /// Local escape hatch for interop tests against peers whose certificates
@@ -743,7 +751,7 @@ pub const Connection = struct {
     events: EventSink,
     metrics: Metrics = .{},
 
-    adapter: tls_adapter.QuicTlsAdapter = .{},
+    adapter: tls_adapter.QuicTlsAdapter,
     handshake: tls_handshake.Handshake = undefined,
     tls: tls_handshake.TlsBackend,
 
@@ -840,6 +848,7 @@ pub const Connection = struct {
             .local_params = params,
             .events = options.events,
             .tls = options.tls,
+            .adapter = try tls_adapter.QuicTlsAdapter.init(options.crypto_provider),
             .local_cid = try config.CidValue.init(options.local_cid),
             .peer_cid = if (options.peer_cid.len > 0)
                 try config.CidValue.init(options.peer_cid)
@@ -1161,7 +1170,13 @@ pub const Connection = struct {
             return;
         }
 
-        var keys = self.adapter.protectionKeys(level, .read) orelse {
+        // `error.ProviderUnsupported` is distinct from "no keys installed":
+        // `setProvider`/`init` already reject a provider missing the fixed
+        // profile's capabilities, so it cannot occur here — `unreachable`
+        // documents that invariant instead of folding a provider
+        // misconfiguration into the ordinary "no secret at this level" path
+        // below, which would misreport it as this being about peer behavior.
+        var keys = (self.adapter.protectionKeys(level, .read) catch unreachable) orelse {
             // No installed/enabled read secret at this level. For 0-RTT this
             // is the ordinary "early data not authorized yet" case (TLS never
             // accepted the PSK attempt, or the carrier is disabled) rather
@@ -1173,7 +1188,11 @@ pub const Connection = struct {
         var sample: [sample_len]u8 = undefined;
         @memcpy(&sample, work[parsed.pn_offset + 4 ..][0..sample_len]);
         var sampled_pn: [4]u8 = work[parsed.pn_offset..][0..4].*;
-        const removed = keys.removeHeaderProtection(&work[0], &sampled_pn, sample);
+        const removed = keys.removeHeaderProtectionWithProvider(self.adapter.provider, &work[0], &sampled_pn, sample) catch {
+            self.dropPacket(.undecryptable, bytes.len);
+            self.emitZeroRttOutcome(level, .authentication_failed, bytes.len);
+            return;
+        };
         @memcpy(work[parsed.pn_offset..][0..removed.packet_number_length], sampled_pn[0..removed.packet_number_length]);
 
         const space_idx = spaceIndex(space);
@@ -1189,7 +1208,7 @@ pub const Connection = struct {
         if (level == .application) {
             const wire_phase: u1 = @intCast((work[0] >> 2) & 1);
             if (wire_phase != self.adapter.applicationReadKeyPhase()) {
-                keys = self.adapter.nextApplicationReadKeys() orelse {
+                keys = (self.adapter.nextApplicationReadKeys() catch unreachable) orelse {
                     self.dropPacket(.undecryptable, bytes.len);
                     return;
                 };
@@ -1200,7 +1219,7 @@ pub const Connection = struct {
         const header = work[0 .. parsed.pn_offset + removed.packet_number_length];
         const ciphertext = work[parsed.pn_offset + removed.packet_number_length .. parsed.packet_len];
         var plain: [2048]u8 = undefined;
-        const payload = keys.openPayload(pn, header, ciphertext, &plain) catch {
+        const payload = keys.openPayloadWithProvider(self.adapter.provider, pn, header, ciphertext, &plain) catch {
             self.adapter.metrics.deprotection_failures += 1;
             self.dropPacket(.undecryptable, bytes.len);
             self.emitZeroRttOutcome(level, .authentication_failed, bytes.len);
@@ -2087,8 +2106,8 @@ pub const Connection = struct {
     /// recovery accounting (RFC 9002 §6.4).
     fn discardKeys(self: *Connection, space: PacketNumberSpace) void {
         const level = levelForSpace(space);
-        if (self.adapter.protectionKeys(level, .write) == null and
-            self.adapter.protectionKeys(level, .read) == null) return;
+        if ((self.adapter.protectionKeys(level, .write) catch unreachable) == null and
+            (self.adapter.protectionKeys(level, .read) catch unreachable) == null) return;
         self.adapter.discardSecrets(level);
         _ = self.recovery.onKeysDiscarded(space);
         const tx: ?*CryptoTx = switch (space) {
@@ -2251,7 +2270,7 @@ pub const Connection = struct {
         if (!fired and !any_in_flight and !self.handshake_confirmed and self.role == .client) {
             if (now_us >= self.last_activity_us + self.recovery.rtt.ptoDuration(.handshake) * backoff) {
                 // Anti-deadlock probe: resend the lowest-level flight we can.
-                if (self.adapter.protectionKeys(.handshake, .write) != null) {
+                if ((self.adapter.protectionKeys(.handshake, .write) catch unreachable) != null) {
                     self.firePto(.handshake);
                 } else {
                     self.firePto(.initial);
@@ -2513,13 +2532,13 @@ pub const Connection = struct {
 
         const levels = [_]EncryptionLevel{ .initial, .handshake, .application };
         for (levels, 0..) |level, i| {
-            if (self.adapter.protectionKeys(level, .write) == null) continue;
+            if ((self.adapter.protectionKeys(level, .write) catch unreachable) == null) continue;
             const space = spaceForLevel(level);
             // Is this the last level that could contribute? Needed for the
             // Initial padding rule.
             var last_level = true;
             for (levels[i + 1 ..]) |later| {
-                if (self.adapter.protectionKeys(later, .write) != null) last_level = false;
+                if ((self.adapter.protectionKeys(later, .write) catch unreachable) != null) last_level = false;
             }
             const written = self.buildPacket(level, space, out[datagram_len..budget], now_us, .{
                 .datagram_has_initial = has_initial or level == .initial,
@@ -2594,7 +2613,7 @@ pub const Connection = struct {
     /// content — that stays exclusively on the active path until promotion.
     fn buildCandidatePacket(self: *Connection, path: quic_path.PathKey, out: []u8, now_us: u64) ?Transmit {
         if (out.len < max_datagram_size) return null;
-        const keys = self.adapter.protectionKeys(.application, .write) orelse return null;
+        const keys = (self.adapter.protectionKeys(.application, .write) catch unreachable) orelse return null;
 
         const remaining = self.paths.remainingOnPath(path);
         if (remaining == 0) return null;
@@ -2670,7 +2689,7 @@ pub const Connection = struct {
 
         var sample: [sample_len]u8 = undefined;
         @memcpy(&sample, out[pn_offset + 4 ..][0..sample_len]);
-        keys.applyHeaderProtection(&out[0], out[pn_offset..][0..pn_len], sample);
+        keys.applyHeaderProtectionWithProvider(self.adapter.provider, &out[0], out[pn_offset..][0..pn_len], sample) catch unreachable;
 
         const total = pn_offset + pn_len + sealed.len;
         self.next_pn[space_idx] = pn + 1;
@@ -2894,12 +2913,12 @@ pub const Connection = struct {
         @memcpy(out[pn_offset..][0..pn_len], pn_bytes[4 - @as(usize, pn_len) ..][0..pn_len]);
 
         const header = out[0 .. pn_offset + pn_len];
-        const keys = self.adapter.protectionKeys(level, .write) orelse return null;
+        const keys = (self.adapter.protectionKeys(level, .write) catch unreachable) orelse return null;
         const sealed = self.adapter.sealPacketPayload(level, .write, pn, header, plain[0..plain_len], out[pn_offset + pn_len ..]) catch return null;
 
         var sample: [sample_len]u8 = undefined;
         @memcpy(&sample, out[pn_offset + 4 ..][0..sample_len]);
-        keys.applyHeaderProtection(&out[0], out[pn_offset..][0..pn_len], sample);
+        keys.applyHeaderProtectionWithProvider(self.adapter.provider, &out[0], out[pn_offset..][0..pn_len], sample) catch unreachable;
 
         const total = pn_offset + pn_len + sealed.len;
         self.next_pn[space_idx] = pn + 1;
@@ -3183,11 +3202,11 @@ pub const Connection = struct {
         // application closes at lower levels are converted to transport
         // closes to avoid leaking application state pre-handshake).
         var level: EncryptionLevel = .application;
-        if (self.adapter.protectionKeys(.application, .write) == null) {
+        if ((self.adapter.protectionKeys(.application, .write) catch unreachable) == null) {
             level = .handshake;
-            if (self.adapter.protectionKeys(.handshake, .write) == null) level = .initial;
+            if ((self.adapter.protectionKeys(.handshake, .write) catch unreachable) == null) level = .initial;
         }
-        if (self.adapter.protectionKeys(level, .write) == null) return null;
+        if ((self.adapter.protectionKeys(level, .write) catch unreachable) == null) return null;
 
         const space = spaceForLevel(level);
         const space_idx = spaceIndex(space);
@@ -3232,11 +3251,11 @@ pub const Connection = struct {
         std.mem.writeInt(u32, &pn_bytes, truncated, .big);
         @memcpy(out[pn_offset..][0..pn_len], pn_bytes[4 - @as(usize, pn_len) ..][0..pn_len]);
         const header = out[0 .. pn_offset + pn_len];
-        const keys = self.adapter.protectionKeys(level, .write) orelse return null;
+        const keys = (self.adapter.protectionKeys(level, .write) catch unreachable) orelse return null;
         const sealed = self.adapter.sealPacketPayload(level, .write, pn, header, plain[0..plain_len], out[pn_offset + pn_len ..]) catch return null;
         var sample: [sample_len]u8 = undefined;
         @memcpy(&sample, out[pn_offset + 4 ..][0..sample_len]);
-        keys.applyHeaderProtection(&out[0], out[pn_offset..][0..pn_len], sample);
+        keys.applyHeaderProtectionWithProvider(self.adapter.provider, &out[0], out[pn_offset..][0..pn_len], sample) catch unreachable;
         self.next_pn[space_idx] = pn + 1;
 
         var total = pn_offset + pn_len + sealed.len;
@@ -3619,6 +3638,7 @@ const TestPair = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &odcid,
             .tls = pair.client_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = pair.now_us,
             .initial_path = client_path,
         });
@@ -3630,6 +3650,7 @@ const TestPair = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = pair.server_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = pair.now_us,
             .initial_path = server_path,
         });
@@ -3679,6 +3700,7 @@ const TestPair = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &odcid,
             .tls = pair.client_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = pair.now_us,
             .initial_path = client_path,
         });
@@ -3690,6 +3712,7 @@ const TestPair = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = pair.server_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = pair.now_us,
             .initial_path = server_path,
         });
@@ -3727,6 +3750,7 @@ const TestPair = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &odcid,
             .tls = pair.client_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = pair.now_us,
             .initial_path = client_path,
         });
@@ -3738,6 +3762,7 @@ const TestPair = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = pair.server_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = pair.now_us,
             .initial_path = server_path,
         });
@@ -3795,6 +3820,7 @@ test "Connection.init failure before the handshake is assigned does not deinit u
         .initial_secret_dcid = &too_short_dcid,
         .peer_cid = &too_short_dcid,
         .tls = backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = TestPair.client_path,
     }));
@@ -3815,8 +3841,8 @@ test "driver: client and server complete the handshake over protected packets" {
 
     // Initial and Handshake keys discarded on both sides after confirmation.
     inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |level| {
-        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.client.adapter.protectionKeys(level, .write));
-        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.server.adapter.protectionKeys(level, .write));
+        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.client.adapter.protectionKeys(level, .write) catch unreachable);
+        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.server.adapter.protectionKeys(level, .write) catch unreachable);
     }
 }
 
@@ -3896,6 +3922,7 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = pair.client_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = pair.now_us,
         .initial_path = TestPair.client_path,
         .events = .{ .context = &client_capture, .emitFn = EventCapture.onEvent },
@@ -3908,6 +3935,7 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = pair.server_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = pair.now_us,
         .initial_path = TestPair.server_path,
         .events = .{ .context = &server_capture, .emitFn = EventCapture.onEvent },
@@ -3935,8 +3963,8 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
     try testing.expect(server_capture.discardedInitialKeys());
 
     inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |level| {
-        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.client.adapter.protectionKeys(level, .write));
-        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.server.adapter.protectionKeys(level, .write));
+        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.client.adapter.protectionKeys(level, .write) catch unreachable);
+        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.server.adapter.protectionKeys(level, .write) catch unreachable);
     }
 }
 
@@ -4097,6 +4125,7 @@ test "driver: PSK resumption completes through a real HelloRetryRequest over QUI
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = pair.client_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = pair.now_us,
         .initial_path = TestPair.client_path,
         .events = .{ .context = &client_capture, .emitFn = EventCapture.onEvent },
@@ -4109,6 +4138,7 @@ test "driver: PSK resumption completes through a real HelloRetryRequest over QUI
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = pair.server_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = pair.now_us,
         .initial_path = TestPair.server_path,
         .events = .{ .context = &server_capture, .emitFn = EventCapture.onEvent },
@@ -4311,7 +4341,7 @@ fn sealTestZeroRttPacket(
     plaintext: []const u8,
     out: []u8,
 ) []u8 {
-    var sender = tls_adapter.QuicTlsAdapter{};
+    var sender = tls_adapter.QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     sender.setZeroRttEnabled(true);
     sender.installSecret(tls_adapter.Secret.init(.zero_rtt, .write, &secret) catch unreachable);
 
@@ -4339,12 +4369,12 @@ fn sealTestZeroRttPacket(
     @memcpy(out[pn_offset..][0..pn_len], pn_bytes[4 - @as(usize, pn_len) ..][0..pn_len]);
 
     const header = out[0 .. pn_offset + pn_len];
-    const keys = sender.protectionKeys(.zero_rtt, .write).?;
+    const keys = (sender.protectionKeys(.zero_rtt, .write) catch unreachable).?;
     _ = sender.sealPacketPayload(.zero_rtt, .write, pn, header, padded[0..padded_len], out[pn_offset + pn_len ..]) catch unreachable;
 
     var sample: [sample_len]u8 = undefined;
     @memcpy(&sample, out[pn_offset + 4 ..][0..sample_len]);
-    keys.applyHeaderProtection(&out[0], out[pn_offset..][0..pn_len], sample);
+    keys.applyHeaderProtectionWithProvider(sender.provider, &out[0], out[pn_offset..][0..pn_len], sample) catch unreachable;
 
     return out[0 .. pn_offset + pn_len + padded_len + aead_tag_len];
 }
@@ -4696,7 +4726,7 @@ test "driver: server retires its 0-RTT read secret once it authenticates a 1-RTT
     const secret = [_]u8{0x11} ** tls_adapter.traffic_secret_len;
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
-    try testing.expect(pair.server.adapter.protectionKeys(.zero_rtt, .read) != null);
+    try testing.expect((pair.server.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) != null);
 
     // Force a genuine ack-eliciting `.application` exchange the server must
     // authenticate — a delayed/unforced ACK alone might never actually
@@ -4707,7 +4737,7 @@ test "driver: server retires its 0-RTT read secret once it authenticates a 1-RTT
 
     // The server has now authenticated a real 1-RTT packet; its 0-RTT read
     // secret must be retired.
-    try testing.expect(pair.server.adapter.protectionKeys(.zero_rtt, .read) == null);
+    try testing.expect((pair.server.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) == null);
 
     // Retirement wipes only the `.zero_rtt` secret-store slot — the
     // application packet-number/recovery state 0-RTT and 1-RTT share is
@@ -4987,6 +5017,7 @@ test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake v
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = resumed.client_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = resumed.now_us,
         .initial_path = TestPair.client_path,
     });
@@ -4998,6 +5029,7 @@ test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake v
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = resumed.server_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = resumed.now_us,
         .initial_path = TestPair.server_path,
     });
@@ -5166,6 +5198,7 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = resumed.client_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = resumed.now_us,
         .initial_path = TestPair.client_path,
     });
@@ -5178,6 +5211,7 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = resumed.server_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = resumed.now_us,
         .initial_path = TestPair.server_path,
     });
@@ -5205,7 +5239,7 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
     // ...and that acceptance already installed a usable QUIC 0-RTT read key
     // through the ordinary secret-event pipeline (#523 requirement 1) — with
     // `zero_rtt_enabled` honored via `Connection.init`'s `setZeroRttEnabled`.
-    try testing.expect(resumed.server.adapter.protectionKeys(.zero_rtt, .read) != null);
+    try testing.expect((resumed.server.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) != null);
 
     // That real, TLS-derived key genuinely decrypts a 0-RTT wire packet
     // through the ordinary driver path *during the early-data window*, with
@@ -5382,6 +5416,7 @@ test "#523: Event.early_data_decision surfaces the real TLS decision once, even 
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = resumed.client_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = resumed.now_us,
         .initial_path = TestPair.client_path,
     });
@@ -5394,6 +5429,7 @@ test "#523: Event.early_data_decision surfaces the real TLS decision once, even 
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = resumed.server_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = resumed.now_us,
         .initial_path = TestPair.server_path,
         .events = .{ .context = &event_capture, .emitFn = EventCapture.onEvent },
@@ -5569,6 +5605,7 @@ fn expectRejectedEarlyDataFallsBackOnSameConnection(scenario: RejectedEarlyDataF
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = resumed.client_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = resumed.now_us,
         .initial_path = TestPair.client_path,
     });
@@ -5581,6 +5618,7 @@ fn expectRejectedEarlyDataFallsBackOnSameConnection(scenario: RejectedEarlyDataF
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = resumed.server_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = resumed.now_us,
         .initial_path = TestPair.server_path,
         .events = .{ .context = &event_capture, .emitFn = EventCapture.onEvent },
@@ -5593,7 +5631,7 @@ fn expectRejectedEarlyDataFallsBackOnSameConnection(scenario: RejectedEarlyDataF
     try testing.expect(resumed.server.isEstablished());
     try testing.expect(resumed.client_backend.engine.core.psk_authenticated);
     try testing.expect(resumed.server_backend.engine.core.psk_authenticated);
-    try testing.expect(resumed.server.adapter.protectionKeys(.zero_rtt, .read) == null);
+    try testing.expect((resumed.server.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) == null);
     try testing.expectEqual(@as(usize, 1), event_capture.count);
     try testing.expectEqual(scenario.expect_decision, event_capture.decision.?);
 
@@ -6054,6 +6092,7 @@ const MigrationPair = struct {
             .initial_secret_dcid = &TestPair.odcid,
             .peer_cid = &TestPair.odcid,
             .tls = pair.client_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = pair.now_us,
             .initial_path = TestPair.client_path,
         });
@@ -6066,6 +6105,7 @@ const MigrationPair = struct {
             .initial_secret_dcid = &TestPair.odcid,
             .peer_cid = &TestPair.client_cid,
             .tls = pair.server_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = pair.now_us,
             .initial_path = TestPair.server_path,
         });
@@ -6394,6 +6434,7 @@ test "connection: a policy-blocked server still answers a PATH_CHALLENGE on its 
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.odcid,
         .tls = client_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = now_us,
         .initial_path = TestPair.client_path,
     });
@@ -6406,6 +6447,7 @@ test "connection: a policy-blocked server still answers a PATH_CHALLENGE on its 
         .initial_secret_dcid = &TestPair.odcid,
         .peer_cid = &TestPair.client_cid,
         .tls = server_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = now_us,
         .initial_path = TestPair.server_path,
     });
@@ -6893,6 +6935,7 @@ test "a real Connection closes with handshake_failure when the server has no app
             .initial_secret_dcid = &TestPair.odcid,
             .peer_cid = &TestPair.odcid,
             .tls = pair.client_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = pair.now_us,
             .initial_path = TestPair.client_path,
         });
@@ -6903,6 +6946,7 @@ test "a real Connection closes with handshake_failure when the server has no app
             .initial_secret_dcid = &TestPair.odcid,
             .peer_cid = &TestPair.client_cid,
             .tls = pair.server_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = pair.now_us,
             .initial_path = TestPair.server_path,
         });

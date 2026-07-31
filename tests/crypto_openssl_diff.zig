@@ -103,6 +103,7 @@ fn algorithmEql(a: profile.Algorithm, b: profile.Algorithm) bool {
         .hash => |value| b == .hash and b.hash == value,
         .hkdf => |value| b == .hkdf and b.hkdf == value,
         .aead => |value| b == .aead and b.aead == value,
+        .quic_header_protection => |value| b == .quic_header_protection and b.quic_header_protection == value,
         .group => |value| b == .group and b.group == value,
         .signature => |value| b == .signature and b.signature == value,
         .certificate_helper => |value| b == .certificate_helper and b.certificate_helper == value,

@@ -28,6 +28,8 @@ const stream_transport = @import("stream_transport");
 const quic = @import("quic");
 const http3 = @import("http3");
 const tls_core = @import("tls_core");
+const crypto_pkg = @import("crypto");
+const test_quic_crypto = @import("test_quic_crypto");
 
 const Connection = quic.connection.Connection;
 const H3 = http3.conn.Conn(Connection);
@@ -243,6 +245,20 @@ pub const Runtime = struct {
     stopping: std.atomic.Value(bool),
     drain_requested: std.atomic.Value(bool),
     drain_deadline_us: std.atomic.Value(u64),
+    /// The concrete `CryptoProvider` backend for native QUIC packet
+    /// protection (#490). This is the native HTTP/QUIC composition root:
+    /// `src/quic/` never selects a backend itself, only this module does,
+    /// via `tls_core.production_crypto.Provider` (the pure-Zig backend) fed
+    /// by real OS entropy.
+    crypto_provider_entropy: tls_core.production_crypto.OsEntropy = .{},
+    crypto_provider_state: tls_core.production_crypto.Provider = undefined,
+
+    /// Erase `crypto_provider_state` to the boundary type for a `Connection`.
+    /// Borrows `self`, so the returned value must not outlive this `Runtime`
+    /// (true for every connection it accepts, since it outlives them all).
+    fn cryptoProvider(self: *Runtime) crypto_pkg.provider.CryptoProvider {
+        return self.crypto_provider_state.cryptoProvider();
+    }
 
     pub fn init(allocator: std.mem.Allocator, logger: *logger_mod.Logger, cfg: Config) Http3RuntimeError!Runtime {
         const address = compat.parseIpAddress(cfg.listen_host, cfg.quic_port) catch |err| {
@@ -300,7 +316,9 @@ pub const Runtime = struct {
             .stopping = std.atomic.Value(bool).init(false),
             .drain_requested = std.atomic.Value(bool).init(false),
             .drain_deadline_us = std.atomic.Value(u64).init(0),
+            .crypto_provider_state = undefined,
         };
+        runtime.crypto_provider_state = tls_core.production_crypto.Provider.init(runtime.crypto_provider_entropy.entropy());
         var retry_key: [quic.path.token_key_len]u8 = undefined;
         compat.randomBytes(&retry_key);
         runtime.retry_tokens.keys.install(0, retry_key);
@@ -654,6 +672,7 @@ pub const Runtime = struct {
             .initial_secret_dcid = if (retry_context) |ctx| ctx.retry_scid.slice() else parsed.dcid,
             .peer_cid = parsed.scid,
             .tls = backend.backend(),
+            .crypto_provider = self.cryptoProvider(),
             .now_us = now,
             .initial_path = .{ .local = self.local_address, .remote = addressFromSockaddrIn(peer) },
             .initial_address_validated = retry_context != null,
@@ -1597,6 +1616,7 @@ const RuntimeCidHarness = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &odcid,
             .tls = self.client_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = self.now_us,
             .initial_path = client_path,
         });
@@ -1608,6 +1628,7 @@ const RuntimeCidHarness = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = server_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = self.now_us,
             .initial_path = server_path,
             .stateless_reset_key = [_]u8{0x44} ** 32,
@@ -2613,6 +2634,7 @@ test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT cap
         .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = client_path,
     });
@@ -2624,6 +2646,7 @@ test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT cap
         .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = server_path,
     });
@@ -2697,7 +2720,7 @@ fn sealZeroRttPacketForTest(
     plaintext: []const u8,
     out: []u8,
 ) []u8 {
-    var sender = quic.tls_adapter.QuicTlsAdapter{};
+    var sender = quic.tls_adapter.QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     sender.setZeroRttEnabled(true);
     sender.installSecret(quic.tls_adapter.Secret.init(.zero_rtt, .write, &secret) catch unreachable);
 
@@ -2721,12 +2744,12 @@ fn sealZeroRttPacketForTest(
     @memcpy(out[pn_offset..][0..pn_len], pn_bytes[4 - @as(usize, pn_len) ..][0..pn_len]);
 
     const header = out[0 .. pn_offset + pn_len];
-    const keys = sender.protectionKeys(.zero_rtt, .write).?;
+    const keys = (sender.protectionKeys(.zero_rtt, .write) catch unreachable).?;
     _ = sender.sealPacketPayload(.zero_rtt, .write, pn, header, padded[0..padded_len], out[pn_offset + pn_len ..]) catch unreachable;
 
     var sample: [quic.tls_adapter.header_protection_sample_len]u8 = undefined;
     @memcpy(&sample, out[pn_offset + 4 ..][0..quic.tls_adapter.header_protection_sample_len]);
-    keys.applyHeaderProtection(&out[0], out[pn_offset..][0..pn_len], sample);
+    keys.applyHeaderProtectionWithProvider(sender.provider, &out[0], out[pn_offset..][0..pn_len], sample) catch unreachable;
 
     return out[0 .. pn_offset + pn_len + padded_len + quic.tls_adapter.packet_protection_tag_len];
 }
@@ -2920,6 +2943,7 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = client_path,
     });
@@ -2931,6 +2955,7 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend1.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = server_path,
     });
@@ -3030,6 +3055,7 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend2.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 2_000_000,
         .initial_path = client_path,
     });
@@ -3074,6 +3100,7 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend2.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 2_000_000,
         .initial_path = server_path,
     });
@@ -3098,7 +3125,7 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         }
     }
     try testing.expect(!entry2.conn.isEstablished());
-    try testing.expect(entry2.conn.adapter.protectionKeys(.zero_rtt, .read) != null);
+    try testing.expect((entry2.conn.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) != null);
 
     const real_secret = entry2.conn.adapter.secret(.zero_rtt, .read).?.slice()[0..quic.tls_adapter.traffic_secret_len].*;
 
@@ -3440,6 +3467,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = client_path,
     });
@@ -3452,6 +3480,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend1.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = server_path,
     });
@@ -3562,6 +3591,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend2.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 2_000_000,
         .initial_path = client_path,
     });
@@ -3574,6 +3604,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend2.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 2_000_000,
         .initial_path = server_path,
         .events = .{ .context = &runtime, .emitFn = Runtime.quicConnectionEvent },
@@ -3604,7 +3635,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
             try entry2.conn.ingestOnPath(t.bytes, server_path, no_challenge, 2_000_000);
         }
     }
-    try testing.expect(entry2.conn.adapter.protectionKeys(.zero_rtt, .read) == null);
+    try testing.expect((entry2.conn.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) == null);
     try testing.expectEqual(@as(usize, 1), decision_capture.count);
     try testing.expectEqual(scenario.expect_decision, decision_capture.last.?);
 

@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const quic = @import("quic");
+const test_quic_crypto = @import("test_quic_crypto");
 const http3 = @import("http3");
 
 const connection = quic.connection;
@@ -308,6 +309,7 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
         .original_destination_cid = &odcid,
         .initial_secret_dcid = &odcid,
         .tls = backend.backend(),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = nowUs(),
         .events = .{ .emitFn = logEvent },
         .allow_unverified_certificate = args.insecure,
@@ -434,6 +436,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
             .initial_secret_dcid = parsed.dcid,
             .peer_cid = parsed.scid,
             .tls = backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = nowUs(),
             .events = .{ .emitFn = logEvent },
             .initial_path = server_path,
