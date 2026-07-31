@@ -116,14 +116,21 @@ const aes_block_cipher = [_][]const u8{
 /// as differential test-vector fixtures in `src/quic/tls_adapter.zig` and
 /// `tests/crypto_vectors.zig` / `tests/crypto_openssl_diff.zig`; a runtime
 /// module calling one directly is exactly the regression this audit exists
-/// to catch. Each literal ends at the call parenthesis so it does not also
-/// match its own `...WithProvider(` sibling.
+/// to catch. Unqualified, not dot-prefixed: a `*WithProvider` implementation
+/// and its legacy sibling share one Zig container, so the sibling can be
+/// called unqualified (`sealPayload(self, ...)`) as well as by dot-call
+/// (`self.sealPayload(...)` / `keys.sealPayload(...)`); both forms are the
+/// same regression and #490's fifth-pass review found the dot-only form
+/// missed the unqualified one. Each literal still ends at the call
+/// parenthesis so it does not also match its own `...WithProvider(` sibling
+/// (`sealPayload(` is not a substring of `sealPayloadWithProvider(` because
+/// `With...` intervenes before the paren).
 const legacy_wrapper_calls = [_][]const u8{
-    ".sealPayload(",
-    ".openPayload(",
-    ".applyHeaderProtection(",
-    ".removeHeaderProtection(",
-    ".headerProtectionMask(",
+    "sealPayload(",
+    "openPayload(",
+    "applyHeaderProtection(",
+    "removeHeaderProtection(",
+    "headerProtectionMask(",
     "deriveAes128GcmKeys(",
     "deriveInitialSecretsV1(",
     "deriveNextGenerationSecret(",
@@ -205,15 +212,24 @@ const file_checks_with_exceptions = [_]FileCheckWithExceptions{
     },
     .{
         .path = "src/quic/cid.zig",
-        .forbidden = &full_forbidden,
+        // Blanking the alias declaration only removes the fully-qualified
+        // `std.crypto.auth.` spelling from the scan; the locally-aliased
+        // short name `HmacSha256` is not itself in `full_forbidden`, so
+        // without this addition a second, unrelated `HmacSha256.` call
+        // anywhere else in the file would pass (#490 fifth-pass review).
+        .forbidden = &(full_forbidden ++ [_][]const u8{"HmacSha256."}),
         .exempt_exact = &.{"const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;"},
-        .rationale = "Connection-ID/stateless-reset-token derivation (RFC 9000 §10.3.1) is a documented HMAC-SHA256 exception under a static process-lifetime key (docs/CRYPTO_PROVIDER_AUDIT.md), not TLS/QUIC-negotiated packet protection; no AEAD, ECDH, signature, KDF, or AES header-protection shortcuts may be added here.",
+        .exempt_functions = &.{"statelessResetToken"},
+        .rationale = "Connection-ID/stateless-reset-token derivation (RFC 9000 §10.3.1) is a documented HMAC-SHA256 exception under a static process-lifetime key (docs/CRYPTO_PROVIDER_AUDIT.md), not TLS/QUIC-negotiated packet protection; no AEAD, ECDH, signature, KDF, or AES header-protection shortcuts, and no other HmacSha256 use, may be added here.",
     },
     .{
         .path = "src/quic/tls_handshake.zig",
-        .forbidden = &full_forbidden,
+        // Same alias-name gap as cid.zig, for the locally-aliased
+        // `HkdfSha256` (#490 fifth-pass review).
+        .forbidden = &(full_forbidden ++ [_][]const u8{"HkdfSha256."}),
         .exempt_exact = &.{"const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;"},
-        .rationale = "The backend-agnostic handshake driver must not add keyed crypto of its own. TestTlsBackend's deterministic transcript HKDF (one type alias) is the one documented exception; everything else, including the legacy wrapper names, stays forbidden throughout the file.",
+        .exempt_functions = &.{"deriveSecret"},
+        .rationale = "The backend-agnostic handshake driver must not add keyed crypto of its own. TestTlsBackend.deriveSecret's deterministic transcript HKDF (one type alias, one method) is the one documented exception; everything else, including the legacy wrapper names and any other HkdfSha256 use, stays forbidden throughout the file.",
     },
     .{
         .path = "src/quic/tls_adapter.zig",
@@ -254,7 +270,12 @@ const file_checks_with_exceptions = [_]FileCheckWithExceptions{
     },
 };
 
-const quic_dir_forbidden = keyed_crypto_core ++ aes_block_cipher;
+// Includes legacy_wrapper_calls (#490 fifth-pass review): the recursive scan
+// is the catch-all for every QUIC module without its own narrower check, so
+// packet-protection code refactored out of connection.zig into a new file
+// (e.g. src/quic/nested/protection.zig) must still be rejected for calling
+// the legacy wrapper names, not just for raw concrete primitives.
+const quic_dir_forbidden = full_forbidden;
 
 const dir_checks = [_]DirCheck{
     .{
@@ -281,25 +302,23 @@ const dir_checks = [_]DirCheck{
 /// pure-Zig provider construction for tests/tools that exercise the QUIC
 /// seam directly; no production (non-test) code path may reference it, only
 /// `test` blocks and the test-only structs/fixtures that share a file with
-/// them (#490 fourth-pass review). Enforced the same way as
-/// `production_only_marker` above: only usages *before* the file's test
-/// boundary are violations.
-const TestOnlyImportCheck = struct {
-    path: []const u8,
-    boundary_marker: []const u8,
-    rationale: []const u8,
-};
+/// them. Rather than a fixed list of today's importers (#490 fifth-pass
+/// review: a new file reachable from `quic_mod`/`exe_mod` — e.g. a new
+/// `src/quic/*.zig`, or an executable-module file such as `src/main.zig` —
+/// could import it without appearing in such a list), every `.zig` file
+/// under this root is scanned recursively for the import itself, and every
+/// file found is checked, whatever its path.
+const test_quic_crypto_scan_root = "src";
 
-const test_quic_crypto_import_checks = [_]TestOnlyImportCheck{
-    .{ .path = "src/quic/tls_adapter.zig", .boundary_marker = "\nconst testing = std.testing;", .rationale = "test_quic_crypto is a test-only provider; production QuicTlsAdapter code must be injected a provider by its caller, never construct one." },
-    .{ .path = "src/quic/connection.zig", .boundary_marker = "\nconst testing = std.testing;", .rationale = "test_quic_crypto is a test-only provider; production Connection code must be injected a provider by its caller, never construct one." },
-    .{ .path = "src/quic/tls_handshake.zig", .boundary_marker = "\nconst testing = std.testing;", .rationale = "test_quic_crypto is a test-only provider; the production Handshake/CoreDriver must be injected a provider by its caller, never construct one." },
-    // tls_backend.zig has no single `const testing = std.testing;` marker
-    // (it calls std.testing.* fully qualified throughout); its first test
-    // block is the boundary instead.
-    .{ .path = "src/quic/tls_backend.zig", .boundary_marker = "\ntest \"", .rationale = "test_quic_crypto is a test-only provider; production QUIC-profile code must be injected a provider by its caller, never construct one." },
-    .{ .path = "src/http/http3_runtime.zig", .boundary_marker = "\nconst testing = std.testing;", .rationale = "test_quic_crypto is a test-only provider; the production Runtime composition root builds its own provider from real OS entropy (production_crypto.OsEntropy) instead." },
-};
+/// A file's presumed test-only region starts at the first of these two
+/// markers (this codebase's two conventions for it), or end of file if
+/// neither is present.
+fn findTestBoundary(contents: []const u8) usize {
+    var boundary = contents.len;
+    if (std.mem.indexOf(u8, contents, "\nconst testing = std.testing;")) |p| boundary = @min(boundary, p);
+    if (std.mem.indexOf(u8, contents, "\ntest \"")) |p| boundary = @min(boundary, p);
+    return boundary;
+}
 
 // ---------------------------------------------------------------------------
 // Scanning
@@ -424,21 +443,74 @@ fn checkFileWithExceptions(allocator: std.mem.Allocator, root: compat.DirCompat,
     }
 }
 
-fn checkTestOnlyImport(allocator: std.mem.Allocator, root: compat.DirCompat, check: TestOnlyImportCheck, violations: *std.ArrayList(Violation)) !void {
-    const contents = root.readFileAlloc(allocator, check.path, 16 * 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer allocator.free(contents);
+/// `pub` declaration patterns at either 0-space top-level or 4-space
+/// struct-method indentation — the two conventions this codebase uses.
+const pub_declaration_patterns = [_][]const u8{
+    "\npub fn ",    "\n    pub fn ",
+    "\npub const ", "\n    pub const ",
+    "\npub var ",   "\n    pub var ",
+};
 
-    const boundary = std.mem.indexOf(u8, contents, check.boundary_marker) orelse contents.len;
+/// Checks one file already known to import `test_quic_crypto`: no usage
+/// before its test boundary, and — independent of what it references — no
+/// `pub` declaration after that boundary at all. A textual marker only
+/// establishes a *presumption* that everything after it is test-only and
+/// unreachable from outside the file; only a `pub` declaration could
+/// actually break that presumption by being reachable from elsewhere, so
+/// this is the structural check that makes the presumption enforceable
+/// rather than merely assumed (#490 fifth-pass review).
+fn checkTestOnlyBoundary(allocator: std.mem.Allocator, path: []const u8, contents: []const u8, violations: *std.ArrayList(Violation)) !void {
+    const boundary = findTestBoundary(contents);
+
     const production_region = contents[0..boundary];
     if (std.mem.indexOf(u8, production_region, "test_quic_crypto.") != null) {
         try violations.append(allocator, .{
-            .path = try allocator.dupe(u8, check.path),
+            .path = try allocator.dupe(u8, path),
             .needle = "test_quic_crypto.",
-            .rationale = check.rationale,
+            .rationale = "test_quic_crypto is a test-only provider; production code must be injected a provider by its caller, never construct one, and this usage falls before the file's test boundary.",
         });
+    }
+
+    const post_boundary_region = contents[boundary..];
+    for (pub_declaration_patterns) |pattern| {
+        if (std.mem.indexOf(u8, post_boundary_region, pattern) != null) {
+            try violations.append(allocator, .{
+                .path = try allocator.dupe(u8, path),
+                .needle = pattern,
+                .rationale = "This file imports test_quic_crypto, so everything after its test boundary is presumed test-only and unreachable from outside the file; a `pub` declaration there breaks that presumption regardless of what it references.",
+            });
+            return;
+        }
+    }
+}
+
+/// Recursively finds every `.zig` file under `dir_path` that imports
+/// `test_quic_crypto` and checks each one, so a new importer is covered
+/// without being named in a fixed list.
+fn scanTestQuicCryptoImporters(allocator: std.mem.Allocator, root: compat.DirCompat, dir_path: []const u8, violations: *std.ArrayList(Violation)) !void {
+    var dir = root.openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next(compat.io())) |entry| {
+        const rel = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(rel);
+        switch (entry.kind) {
+            .directory => try scanTestQuicCryptoImporters(allocator, root, rel, violations),
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+                const contents = root.readFileAlloc(allocator, rel, 16 * 1024 * 1024) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+                defer allocator.free(contents);
+                if (std.mem.indexOf(u8, contents, "@import(\"test_quic_crypto\")") == null) continue;
+                try checkTestOnlyBoundary(allocator, rel, contents, violations);
+            },
+            else => {},
+        }
     }
 }
 
@@ -487,9 +559,7 @@ fn runAudit(allocator: std.mem.Allocator, root: compat.DirCompat) !std.ArrayList
     for (file_checks_with_exceptions) |check| {
         try checkFileWithExceptions(allocator, root, check, &violations);
     }
-    for (test_quic_crypto_import_checks) |check| {
-        try checkTestOnlyImport(allocator, root, check, &violations);
-    }
+    try scanTestQuicCryptoImporters(allocator, root, test_quic_crypto_scan_root, &violations);
     for (dir_checks) |check| {
         try checkDir(allocator, root, check, check.dir, &violations);
     }
@@ -549,21 +619,27 @@ test "detects the exact AES header-protection block-cipher form" {
     try testing.expectEqualStrings("crypto.core.aes.", firstForbidden("const Aes128 = crypto.core.aes.Aes128;", &aes_block_cipher).?);
 }
 
-test "detects each legacy wrapper call name without matching its WithProvider sibling" {
-    try testing.expectEqualStrings(".sealPayload(", firstForbidden("const sealed = keys.sealPayload(pn, header, plain, out);", &legacy_wrapper_calls).?);
-    try testing.expectEqualStrings(".openPayload(", firstForbidden("const p = keys.openPayload(pn, header, ct, out);", &legacy_wrapper_calls).?);
-    try testing.expectEqualStrings(".applyHeaderProtection(", firstForbidden("keys.applyHeaderProtection(&out[0], pn_field, sample);", &legacy_wrapper_calls).?);
-    try testing.expectEqualStrings(".removeHeaderProtection(", firstForbidden("const r = keys.removeHeaderProtection(&b, &pn, sample);", &legacy_wrapper_calls).?);
-    try testing.expectEqualStrings(".headerProtectionMask(", firstForbidden("const m = keys.headerProtectionMask(sample);", &legacy_wrapper_calls).?);
+test "detects each legacy wrapper call name, dot-called or unqualified, without matching its WithProvider sibling" {
+    try testing.expectEqualStrings("sealPayload(", firstForbidden("const sealed = keys.sealPayload(pn, header, plain, out);", &legacy_wrapper_calls).?);
+    try testing.expectEqualStrings("openPayload(", firstForbidden("const p = keys.openPayload(pn, header, ct, out);", &legacy_wrapper_calls).?);
+    try testing.expectEqualStrings("applyHeaderProtection(", firstForbidden("keys.applyHeaderProtection(&out[0], pn_field, sample);", &legacy_wrapper_calls).?);
+    try testing.expectEqualStrings("removeHeaderProtection(", firstForbidden("const r = keys.removeHeaderProtection(&b, &pn, sample);", &legacy_wrapper_calls).?);
+    try testing.expectEqualStrings("headerProtectionMask(", firstForbidden("const m = keys.headerProtectionMask(sample);", &legacy_wrapper_calls).?);
     try testing.expectEqualStrings("deriveAes128GcmKeys(", firstForbidden("return deriveAes128GcmKeys(secret);", &legacy_wrapper_calls).?);
     try testing.expectEqualStrings("deriveInitialSecretsV1(", firstForbidden("const s = try deriveInitialSecretsV1(dcid);", &legacy_wrapper_calls).?);
     try testing.expectEqualStrings("deriveNextGenerationSecret(", firstForbidden("return deriveNextGenerationSecret(secret);", &legacy_wrapper_calls).?);
+
+    // The unqualified same-container form (#490 fifth-pass review): a
+    // *WithProvider method can call its legacy sibling without a receiver.
+    try testing.expectEqualStrings("sealPayload(", firstForbidden("return sealPayload(self, pn, header, plain, out);", &legacy_wrapper_calls).?);
+    try testing.expectEqualStrings("headerProtectionMask(", firstForbidden("const mask = headerProtectionMask(self, sample);", &legacy_wrapper_calls).?);
 
     // The WithProvider siblings must NOT trip the same check — that would
     // make the audit reject the migration this PR performed.
     try testing.expectEqual(@as(?[]const u8, null), firstForbidden("const sealed = keys.sealPayloadWithProvider(cp, pn, header, plain, out);", &legacy_wrapper_calls));
     try testing.expectEqual(@as(?[]const u8, null), firstForbidden("keys.applyHeaderProtectionWithProvider(cp, &out[0], pn_field, sample);", &legacy_wrapper_calls));
     try testing.expectEqual(@as(?[]const u8, null), firstForbidden("return deriveAes128GcmKeysWithProvider(cp, secret);", &legacy_wrapper_calls));
+    try testing.expectEqual(@as(?[]const u8, null), firstForbidden("return sealPayloadWithProvider(self, provider, pn, header, plain, out);", &legacy_wrapper_calls));
 }
 
 test "tls_adapter_zig_forbidden allows provider.hkdfExpandLabel but forbids the legacy tls.hkdfExpandLabel" {
@@ -826,31 +902,59 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
     try root.writeFile(.{ .sub_path = "src/quic/cid.zig", .data = "" });
 }
 
-test "test_quic_crypto usage before a file's test boundary is a violation" {
+test "checkTestOnlyBoundary rejects test_quic_crypto usage before the boundary and any pub declaration after it" {
+    const allocator = testing.allocator;
+
+    // Clean: test_quic_crypto used only after the boundary, nothing pub
+    // after it either.
+    {
+        var violations: std.ArrayList(Violation) = .empty;
+        defer violations.deinit(allocator);
+        try checkTestOnlyBoundary(allocator, "fake.zig", clean_tls_adapter_fixture ++ "test_quic_crypto.testDefaultProvider();\n", &violations);
+        try testing.expectEqual(@as(usize, 0), violations.items.len);
+    }
+
+    // A production call site before the boundary must fail.
+    {
+        var violations: std.ArrayList(Violation) = .empty;
+        defer violations.deinit(allocator);
+        const content = "pub fn live() void { _ = test_quic_crypto.testDefaultProvider(); }\n" ++ clean_tls_adapter_fixture;
+        try checkTestOnlyBoundary(allocator, "fake.zig", content, &violations);
+        try testing.expect(violations.items.len > 0);
+        for (violations.items) |v| allocator.free(v.path);
+    }
+
+    // The exact bypass #490's fifth-pass review demonstrated: a `pub fn`
+    // physically placed after the boundary is still reachable from outside
+    // the file, so a textual marker alone must not treat it as exempt --
+    // this must fail even independent of what the function references.
+    {
+        var violations: std.ArrayList(Violation) = .empty;
+        defer violations.deinit(allocator);
+        const content = clean_tls_adapter_fixture ++
+            "\npub fn liveProvider() CryptoProvider {\n    return test_quic_crypto.testDefaultProvider();\n}\n";
+        try checkTestOnlyBoundary(allocator, "fake.zig", content, &violations);
+        try testing.expect(violations.items.len > 0);
+        for (violations.items) |v| allocator.free(v.path);
+    }
+}
+
+test "scanTestQuicCryptoImporters finds a new importer that appears in no fixed list" {
     const allocator = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = compat.wrapDir(tmp.dir);
 
-    try root.makePath("src/quic");
+    try root.makePath("src/quic/newly_added");
+    try root.writeFile(.{
+        .sub_path = "src/quic/newly_added/provider_helper.zig",
+        .data = "const test_quic_crypto = @import(\"test_quic_crypto\");\npub fn live() void { _ = test_quic_crypto.testDefaultProvider(); }\n",
+    });
 
-    // Clean: test_quic_crypto used only after the test boundary.
-    try root.writeFile(.{ .sub_path = "src/quic/tls_adapter.zig", .data = clean_tls_adapter_fixture ++ "test_quic_crypto.testDefaultProvider();\n" });
-    {
-        var violations: std.ArrayList(Violation) = .empty;
-        defer violations.deinit(allocator);
-        try checkTestOnlyImport(allocator, root, test_quic_crypto_import_checks[0], &violations);
-        try testing.expectEqual(@as(usize, 0), violations.items.len);
-    }
-
-    // A production call site before the boundary must fail.
-    try root.writeFile(.{ .sub_path = "src/quic/tls_adapter.zig", .data = "pub fn live() void { _ = test_quic_crypto.testDefaultProvider(); }\n" ++ clean_tls_adapter_fixture });
-    {
-        var violations: std.ArrayList(Violation) = .empty;
-        defer violations.deinit(allocator);
-        try checkTestOnlyImport(allocator, root, test_quic_crypto_import_checks[0], &violations);
-        try testing.expectEqual(@as(usize, 1), violations.items.len);
-        allocator.free(violations.items[0].path);
-    }
+    var violations: std.ArrayList(Violation) = .empty;
+    defer violations.deinit(allocator);
+    try scanTestQuicCryptoImporters(allocator, root, "src", &violations);
+    try testing.expect(violations.items.len > 0);
+    for (violations.items) |v| allocator.free(v.path);
 }
