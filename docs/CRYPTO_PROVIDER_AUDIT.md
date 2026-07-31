@@ -20,7 +20,7 @@ fixed public constants, and documented temporary exceptions.
 | `src/tls/record_protection.zig`, `ticket_protection.zig`, resumption runtime | provider-owned keyed crypto | Provider-owned. Record AEAD and stateless ticket protection consume provider/security abstractions; unsupported-provider test doubles carry complete provider vtables. |
 | `src/pki/` | signature verification and public DER parsing | Provider-owned for signature verification; public DER/name/policy parsing remains protocol-local. |
 | Native TLS/HTTP/QUIC composition roots | provider selection and OpenSSL policy | Allowed to construct concrete providers and backends — this is the only place permitted to choose one. `src/http/http3_runtime.zig`'s `Runtime` is the native QUIC/H3 composition root: it owns the pure-Zig `CryptoProvider` (fed by OS entropy) and injects it into every `Connection.Options.crypto_provider`. It is otherwise fully scanned like `connection.zig` — the composition root may select/construct a provider, but must not perform packet crypto itself. Native appliance paths stay OpenSSL/libcrypto-free; general-purpose OpenSSL TLS and out-of-process OpenSSL oracles remain separate roles. |
-| `tests/support/quic_crypto.zig` | test-only concrete provider | Owns the pure-Zig provider singleton used by QUIC/H3 tests and tools that exercise the seam without the native `Runtime` composition root. `build.zig` wires it into `src/quic/`, `src/http/http3_runtime.zig`, and the QUIC/H3 test tools so their `test` blocks and test-only fixtures can reach it, but no production (non-test) code path may reference it. `scripts/audit_crypto_boundary.zig` recursively finds every `.zig` file under `src/` that imports it (not a fixed list — a new file anywhere in the production module graph is covered automatically) and, for each one, checks both that no usage falls before the file's test boundary (`const testing = std.testing;`, or the first `test "..."` block where that marker doesn't exist) *and* that no `pub` declaration appears after that boundary at all, independent of what it references — a textual marker only establishes a presumption that everything after it is test-only, and only a `pub` declaration could actually break that presumption by being reachable from outside the file. |
+| `tests/support/quic_crypto.zig` | test-only concrete provider | Owns the pure-Zig provider singleton used by QUIC/H3 tests and tools that exercise the seam without the native `Runtime` composition root. Isolation from production code is structural, not scanned: `build.zig` wires it only into `quic_test_mod`/`exe_test_mod` (used solely by `zig build test-quic`/`zig build test`'s `quic_tests`/`exe_unit_tests`), never into `quic_mod`/`exe_mod` (used by `exe`/`run_cmd` and every other production consumer). Any reachable reference to it from code compiled as part of the production module graph — under any local binding name, any indirection such as an inline `@import`, at any position in the file — is therefore a Zig compiler error, not something `scripts/audit_crypto_boundary.zig` has to detect after the fact (#490 sixth-pass review: an earlier revision tried a source-text scan for this — a fixed importer list, then a "before/after a textual test-boundary marker" heuristic — which a renamed binding or an inline `@import` defeated, and which couldn't see that Zig declarations are order-independent, so a public declaration before the marker could call a private helper physically written after it). See the comment beside `test_quic_crypto_mod` in `build.zig`. |
 
 The automated guard (`scripts/audit_crypto_boundary.zig`, run via
 `zig build audit-crypto-boundary`) is a small checked-in Zig program, not a
@@ -68,8 +68,15 @@ exception to be reviewed in this document and the tool's allowlist, and its
 own fixture tests (`zig build audit-crypto-boundary` runs them) prove each
 bypass class it exists to catch actually fails the audit, including the
 narrow-exception-doesn't-cover-a-second-call-site, unqualified-call,
-missing-file, nested-directory, undiscovered-importer, and
-declaration-after-the-test-boundary cases above. This is a source-audit
+missing-file, and nested-directory cases above. This is a source-audit
 build tool, not part of the shipped product, so it (and its `zig_compat`
 dependency) are always built for the build host — not whatever `-Dtarget`
 the rest of the build graph is cross-compiling for.
+
+Not every boundary in this document is enforced by source-text scanning.
+`test_quic_crypto`'s production/test isolation (see the table row above) is
+instead a property of `build.zig`'s module graph, checked by the Zig
+compiler itself on every build — the more direct tool for a property that
+depends on true reachability rather than a pattern in the source text, which
+is exactly what pattern-matching text cannot soundly decide (#490
+sixth-pass review).

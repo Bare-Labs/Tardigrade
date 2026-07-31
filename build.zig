@@ -106,6 +106,20 @@ pub fn build(b: *std.Build) void {
     quic_mod.addImport("quic_varint", quic_varint_mod);
     quic_mod.addImport("tls_core", tls_core_mod);
     quic_mod.addImport("crypto_secrets", crypto_secrets_mod);
+
+    // Test-only twin of quic_mod (#490 sixth-pass review), same shape as
+    // exe_test_mod above: used only for quic_tests below, so quic_mod
+    // itself -- the module every production consumer (exe_mod, http3_mod's
+    // siblings, allocation_regression_mod, ...) actually imports -- never
+    // resolves test_quic_crypto at all.
+    const quic_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/quic/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    quic_test_mod.addImport("quic_varint", quic_varint_mod);
+    quic_test_mod.addImport("tls_core", tls_core_mod);
+    quic_test_mod.addImport("crypto_secrets", crypto_secrets_mod);
     const http3_mod = b.createModule(.{
         .root_source_file = b.path("src/http3/root.zig"),
         .target = target,
@@ -130,6 +144,33 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("http3", http3_mod);
     exe_mod.addImport("tls_core", tls_core_mod);
 
+    // Test-only twin of exe_mod (#490 sixth-pass review): same root file and
+    // dependencies, used *only* for exe_unit_tests below. Production code
+    // reachable from `exe`/`run_cmd` is exe_mod itself, which never gets the
+    // test_quic_crypto import wired in (added further down, once
+    // test_quic_crypto_mod exists) -- so referencing it from production
+    // code, under any local binding name or via an inline `@import`, is a
+    // compile error, not something a source-text scanner has to catch.
+    // Zig's per-module "a source file belongs to exactly one module" rule is
+    // scoped to one compilation graph; exe_mod (the `exe`/`exe_unit_tests`
+    // graph) and exe_test_mod (its own independent `zig test` invocation)
+    // never appear in the same graph together, so both rooting at
+    // src/main.zig is not the ambiguity that rule guards against.
+    const exe_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    exe_test_mod.addImport("build_options", build_options.createModule());
+    exe_test_mod.addImport("zig_compat", compat_mod);
+    exe_test_mod.addImport("quic_varint", quic_varint_mod);
+    exe_test_mod.addImport("hpack_huffman", hpack_huffman_mod);
+    exe_test_mod.addImport("stream_transport", stream_transport_mod);
+    exe_test_mod.addImport("quic", quic_mod);
+    exe_test_mod.addImport("http3", http3_mod);
+    exe_test_mod.addImport("tls_core", tls_core_mod);
+
     const exe = b.addExecutable(.{
         .name = "tardi",
         .root_module = exe_mod,
@@ -145,7 +186,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const exe_unit_tests = b.addTest(.{
-        .root_module = exe_mod,
+        .root_module = exe_test_mod,
     });
     if (link_openssl_adapter) configureSsl(exe_unit_tests, prefer_static_system_libs, require_static_system_libs);
 
@@ -295,7 +336,7 @@ pub fn build(b: *std.Build) void {
     // varint.zig lives in its own module, so its tests need their own run.
     const quic_varint_tests = b.addTest(.{ .root_module = quic_varint_mod, .filters = quic_test_filters });
     const run_quic_varint_tests = b.addRunArtifact(quic_varint_tests);
-    const quic_tests = b.addTest(.{ .root_module = quic_mod, .filters = quic_test_filters });
+    const quic_tests = b.addTest(.{ .root_module = quic_test_mod, .filters = quic_test_filters });
     const run_quic_tests = b.addRunArtifact(quic_tests);
     const quic_step = b.step("test-quic", "Run pure-Zig QUIC/HTTP-3 unit tests");
     quic_step.dependOn(&run_quic_tests.step);
@@ -314,27 +355,35 @@ pub fn build(b: *std.Build) void {
     });
     crypto_mod.addImport("crypto_secrets", crypto_secrets_mod);
     quic_mod.addImport("crypto", crypto_mod);
+    quic_test_mod.addImport("crypto", crypto_mod);
     tls_core_mod.addImport("crypto", crypto_mod);
     exe_mod.addImport("crypto", crypto_mod);
+    exe_test_mod.addImport("crypto", crypto_mod);
 
     // Test-only QUIC/H3 crypto provider composition (#490): owns concrete
     // `pure_zig.Provider` construction so `src/quic/` and the native HTTP/3
-    // composition root never do. Every module whose test blocks or tools
-    // exercise the QUIC seam directly (without the real Runtime composition
-    // root) imports this; production code must never call it. Zig's module
-    // system has no way to make this import resolvable only from `test`
-    // blocks within a shared module, so the boundary is enforced by
-    // `scripts/audit_crypto_boundary.zig` instead: it rejects any
-    // `test_quic_crypto.` usage that falls before a file's test boundary
-    // (see `test_quic_crypto_import_checks`), not just by this comment.
+    // composition root never do. Wired *only* into quic_test_mod and
+    // exe_test_mod (used solely by quic_tests/exe_unit_tests below) -- never
+    // into quic_mod/exe_mod, the modules every production consumer
+    // (exe/run_cmd, and everything that imports "quic") actually builds
+    // against. Renaming the local binding, using an inline `@import`, or any
+    // other indirection cannot resolve a module this import isn't wired
+    // into: the compiler itself enforces the boundary, not a source-text
+    // scanner trying to approximate it (#490 sixth-pass review: a prior
+    // version of this comment relied on `scripts/audit_crypto_boundary.zig`
+    // pattern-matching for this, which a renamed binding or an inline
+    // `@import` bypassed, and which couldn't see that Zig declarations are
+    // order-independent -- a public production declaration can call a
+    // private helper physically written after a "test boundary" marker, so
+    // no text-position heuristic can make that region truly unreachable).
     const test_quic_crypto_mod = b.createModule(.{
         .root_source_file = b.path("tests/support/quic_crypto.zig"),
         .target = target,
         .optimize = optimize,
     });
     test_quic_crypto_mod.addImport("crypto", crypto_mod);
-    quic_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
-    exe_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
+    quic_test_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
+    exe_test_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
 
     const crypto_tests = b.addTest(.{ .root_module = crypto_mod });
     const run_crypto_tests = b.addRunArtifact(crypto_tests);

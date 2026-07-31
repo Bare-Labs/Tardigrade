@@ -298,27 +298,27 @@ const dir_checks = [_]DirCheck{
     },
 };
 
-/// `test_quic_crypto` (`tests/support/quic_crypto.zig`) owns concrete
-/// pure-Zig provider construction for tests/tools that exercise the QUIC
-/// seam directly; no production (non-test) code path may reference it, only
-/// `test` blocks and the test-only structs/fixtures that share a file with
-/// them. Rather than a fixed list of today's importers (#490 fifth-pass
-/// review: a new file reachable from `quic_mod`/`exe_mod` — e.g. a new
-/// `src/quic/*.zig`, or an executable-module file such as `src/main.zig` —
-/// could import it without appearing in such a list), every `.zig` file
-/// under this root is scanned recursively for the import itself, and every
-/// file found is checked, whatever its path.
-const test_quic_crypto_scan_root = "src";
-
-/// A file's presumed test-only region starts at the first of these two
-/// markers (this codebase's two conventions for it), or end of file if
-/// neither is present.
-fn findTestBoundary(contents: []const u8) usize {
-    var boundary = contents.len;
-    if (std.mem.indexOf(u8, contents, "\nconst testing = std.testing;")) |p| boundary = @min(boundary, p);
-    if (std.mem.indexOf(u8, contents, "\ntest \"")) |p| boundary = @min(boundary, p);
-    return boundary;
-}
+// `test_quic_crypto` (`tests/support/quic_crypto.zig`) owns concrete
+// pure-Zig provider construction for tests/tools that exercise the QUIC seam
+// directly. Earlier revisions of this audit tried to enforce "no production
+// code path may reference it" with a source-text scan: a fixed list of
+// importers, then a marker-based "before/after the test boundary" heuristic.
+// #490's sixth-pass review found that unsound on two independent axes: a
+// renamed import binding or an inline `@import("test_quic_crypto")` defeats
+// any scan looking for the literal identifier, and Zig declarations are
+// order-independent, so a public declaration before a textual marker can
+// call a private helper physically written after it — no text-position
+// heuristic makes that region actually unreachable.
+//
+// The sound fix is structural, not textual: `build.zig` wires
+// `test_quic_crypto` only into `quic_test_mod`/`exe_test_mod` (used solely
+// by `quic_tests`/`exe_unit_tests`), never into `quic_mod`/`exe_mod` (used
+// by `exe`/`run_cmd` and every other production consumer). Any reachable
+// reference to it from code compiled as part of the production module graph
+// — under any binding name, any indirection, any position in the file — is
+// therefore a compiler error ("no module named 'test_quic_crypto' available
+// within module 'quic'"), not something this tool has to detect after the
+// fact. See the comment beside `test_quic_crypto_mod` in `build.zig`.
 
 // ---------------------------------------------------------------------------
 // Scanning
@@ -443,77 +443,6 @@ fn checkFileWithExceptions(allocator: std.mem.Allocator, root: compat.DirCompat,
     }
 }
 
-/// `pub` declaration patterns at either 0-space top-level or 4-space
-/// struct-method indentation — the two conventions this codebase uses.
-const pub_declaration_patterns = [_][]const u8{
-    "\npub fn ",    "\n    pub fn ",
-    "\npub const ", "\n    pub const ",
-    "\npub var ",   "\n    pub var ",
-};
-
-/// Checks one file already known to import `test_quic_crypto`: no usage
-/// before its test boundary, and — independent of what it references — no
-/// `pub` declaration after that boundary at all. A textual marker only
-/// establishes a *presumption* that everything after it is test-only and
-/// unreachable from outside the file; only a `pub` declaration could
-/// actually break that presumption by being reachable from elsewhere, so
-/// this is the structural check that makes the presumption enforceable
-/// rather than merely assumed (#490 fifth-pass review).
-fn checkTestOnlyBoundary(allocator: std.mem.Allocator, path: []const u8, contents: []const u8, violations: *std.ArrayList(Violation)) !void {
-    const boundary = findTestBoundary(contents);
-
-    const production_region = contents[0..boundary];
-    if (std.mem.indexOf(u8, production_region, "test_quic_crypto.") != null) {
-        try violations.append(allocator, .{
-            .path = try allocator.dupe(u8, path),
-            .needle = "test_quic_crypto.",
-            .rationale = "test_quic_crypto is a test-only provider; production code must be injected a provider by its caller, never construct one, and this usage falls before the file's test boundary.",
-        });
-    }
-
-    const post_boundary_region = contents[boundary..];
-    for (pub_declaration_patterns) |pattern| {
-        if (std.mem.indexOf(u8, post_boundary_region, pattern) != null) {
-            try violations.append(allocator, .{
-                .path = try allocator.dupe(u8, path),
-                .needle = pattern,
-                .rationale = "This file imports test_quic_crypto, so everything after its test boundary is presumed test-only and unreachable from outside the file; a `pub` declaration there breaks that presumption regardless of what it references.",
-            });
-            return;
-        }
-    }
-}
-
-/// Recursively finds every `.zig` file under `dir_path` that imports
-/// `test_quic_crypto` and checks each one, so a new importer is covered
-/// without being named in a fixed list.
-fn scanTestQuicCryptoImporters(allocator: std.mem.Allocator, root: compat.DirCompat, dir_path: []const u8, violations: *std.ArrayList(Violation)) !void {
-    var dir = root.openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer dir.close();
-    var it = dir.iterate();
-    while (try it.next(compat.io())) |entry| {
-        const rel = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
-        defer allocator.free(rel);
-        switch (entry.kind) {
-            .directory => try scanTestQuicCryptoImporters(allocator, root, rel, violations),
-            .file => {
-                if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
-                const contents = root.readFileAlloc(allocator, rel, 16 * 1024 * 1024) catch |err| switch (err) {
-                    error.FileNotFound => continue,
-                    else => return err,
-                };
-                defer allocator.free(contents);
-                if (std.mem.indexOf(u8, contents, "@import(\"test_quic_crypto\")") == null) continue;
-                try checkTestOnlyBoundary(allocator, rel, contents, violations);
-            },
-            else => {},
-        }
-    }
-}
-
 fn checkDir(allocator: std.mem.Allocator, root: compat.DirCompat, check: DirCheck, dir_path: []const u8, violations: *std.ArrayList(Violation)) !void {
     var dir = root.openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
@@ -559,7 +488,6 @@ fn runAudit(allocator: std.mem.Allocator, root: compat.DirCompat) !std.ArrayList
     for (file_checks_with_exceptions) |check| {
         try checkFileWithExceptions(allocator, root, check, &violations);
     }
-    try scanTestQuicCryptoImporters(allocator, root, test_quic_crypto_scan_root, &violations);
     for (dir_checks) |check| {
         try checkDir(allocator, root, check, check.dir, &violations);
     }
@@ -902,59 +830,7 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
     try root.writeFile(.{ .sub_path = "src/quic/cid.zig", .data = "" });
 }
 
-test "checkTestOnlyBoundary rejects test_quic_crypto usage before the boundary and any pub declaration after it" {
-    const allocator = testing.allocator;
-
-    // Clean: test_quic_crypto used only after the boundary, nothing pub
-    // after it either.
-    {
-        var violations: std.ArrayList(Violation) = .empty;
-        defer violations.deinit(allocator);
-        try checkTestOnlyBoundary(allocator, "fake.zig", clean_tls_adapter_fixture ++ "test_quic_crypto.testDefaultProvider();\n", &violations);
-        try testing.expectEqual(@as(usize, 0), violations.items.len);
-    }
-
-    // A production call site before the boundary must fail.
-    {
-        var violations: std.ArrayList(Violation) = .empty;
-        defer violations.deinit(allocator);
-        const content = "pub fn live() void { _ = test_quic_crypto.testDefaultProvider(); }\n" ++ clean_tls_adapter_fixture;
-        try checkTestOnlyBoundary(allocator, "fake.zig", content, &violations);
-        try testing.expect(violations.items.len > 0);
-        for (violations.items) |v| allocator.free(v.path);
-    }
-
-    // The exact bypass #490's fifth-pass review demonstrated: a `pub fn`
-    // physically placed after the boundary is still reachable from outside
-    // the file, so a textual marker alone must not treat it as exempt --
-    // this must fail even independent of what the function references.
-    {
-        var violations: std.ArrayList(Violation) = .empty;
-        defer violations.deinit(allocator);
-        const content = clean_tls_adapter_fixture ++
-            "\npub fn liveProvider() CryptoProvider {\n    return test_quic_crypto.testDefaultProvider();\n}\n";
-        try checkTestOnlyBoundary(allocator, "fake.zig", content, &violations);
-        try testing.expect(violations.items.len > 0);
-        for (violations.items) |v| allocator.free(v.path);
-    }
-}
-
-test "scanTestQuicCryptoImporters finds a new importer that appears in no fixed list" {
-    const allocator = testing.allocator;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = compat.wrapDir(tmp.dir);
-
-    try root.makePath("src/quic/newly_added");
-    try root.writeFile(.{
-        .sub_path = "src/quic/newly_added/provider_helper.zig",
-        .data = "const test_quic_crypto = @import(\"test_quic_crypto\");\npub fn live() void { _ = test_quic_crypto.testDefaultProvider(); }\n",
-    });
-
-    var violations: std.ArrayList(Violation) = .empty;
-    defer violations.deinit(allocator);
-    try scanTestQuicCryptoImporters(allocator, root, "src", &violations);
-    try testing.expect(violations.items.len > 0);
-    for (violations.items) |v| allocator.free(v.path);
-}
+// test_quic_crypto production/test isolation is no longer this tool's job to
+// prove by fixture: it's enforced by build.zig's module graph and the Zig
+// compiler, not by pattern-matching source text. See the "Scanning" section
+// comment above and build.zig's `test_quic_crypto_mod`.
