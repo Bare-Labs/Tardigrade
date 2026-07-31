@@ -32,12 +32,25 @@ const FileCheck = struct {
     rationale: []const u8,
 };
 
-/// A directory-wide check: every `*.zig` file directly inside `dir` (no
-/// recursion — matches the existing `src/quic` layout) except `excluded`
-/// must not contain any of `forbidden`.
+/// A directory-wide check: every `*.zig` file inside `dir`, recursively,
+/// except `excluded` (matched by name, at any depth) must not contain any of
+/// `forbidden`.
 const DirCheck = struct {
     dir: []const u8,
     excluded: []const []const u8,
+    forbidden: []const []const u8,
+    rationale: []const u8,
+};
+
+/// A check scoped to one named function's body rather than a whole file —
+/// for files like `src/quic/tls_adapter.zig` that legitimately define the
+/// legacy concrete primitives (as differential test-vector fixtures) and so
+/// cannot be scanned wholesale, but whose canonical `QuicTlsAdapter` methods
+/// must never regress to calling those legacy names internally (#490
+/// third-pass review).
+const FunctionBodyCheck = struct {
+    path: []const u8,
+    function_name: []const u8,
     forbidden: []const []const u8,
     rationale: []const u8,
 };
@@ -134,6 +147,55 @@ const path_zig_forbidden = [_][]const u8{
 
 const connection_zig_forbidden = keyed_crypto_core ++ aes_block_cipher ++ legacy_wrapper_calls;
 
+/// Same as `keyed_crypto_core` except for KDF: `tls_handshake.zig`'s
+/// in-memory `TestTlsBackend` test fixture builds a deterministic transcript
+/// hash with `std.crypto.kdf.hkdf.HkdfSha256` directly, since it stands in
+/// for a TLS engine rather than driving one. The production `Handshake`/
+/// `CoreDriver` code sharing this file has no keyed-crypto dependency at
+/// all, so this file is fully scannable for every other category, including
+/// the legacy wrapper names (#490 third-pass review: this file must not stay
+/// wholesale-excluded from the guard just because a test fixture shares it).
+const tls_handshake_zig_forbidden = [_][]const u8{
+    "std.crypto.aead.",
+    "crypto.aead.",
+    "std.crypto.auth.",
+    "crypto.auth.",
+    "std.crypto.dh.",
+    "crypto.dh.",
+    "std.crypto.sign.",
+    "crypto.sign.",
+    "Aes128Gcm.encrypt(",
+    "Aes128Gcm.decrypt(",
+    "Aes256Gcm.encrypt(",
+    "Aes256Gcm.decrypt(",
+    "ChaCha20Poly1305.encrypt(",
+    "ChaCha20Poly1305.decrypt(",
+    "X25519.",
+    "Ed25519.",
+    "Ecdsa",
+    "Rsa",
+    "hkdfExpandLabel(",
+} ++ aes_block_cipher ++ legacy_wrapper_calls;
+
+/// Canonical `QuicTlsAdapter` methods that must always reach packet
+/// protection through the `*WithProvider` entry points. `tls_adapter.zig`
+/// itself stays excluded from the whole-file/whole-directory scans above
+/// because it legitimately defines the legacy concrete primitives as
+/// differential test-vector fixtures (and its own tests call them to compare
+/// against the provider path) — a blanket scan of the file cannot tell that
+/// apart from a live call site regressing. This targets exactly the
+/// regression the third-pass review named: reverting `sealPacketPayload`
+/// back to `keys.sealPayload(...)`, or `protectionKeys` back to
+/// `deriveAes128GcmKeys(...)`.
+const function_body_checks = [_]FunctionBodyCheck{
+    .{ .path = "src/quic/tls_adapter.zig", .function_name = "protectionKeys", .forbidden = &legacy_wrapper_calls, .rationale = "QuicTlsAdapter.protectionKeys must derive packet-protection keys through deriveAes128GcmKeysWithProvider, not the legacy deriveAes128GcmKeys." },
+    .{ .path = "src/quic/tls_adapter.zig", .function_name = "sealPacketPayload", .forbidden = &legacy_wrapper_calls, .rationale = "QuicTlsAdapter.sealPacketPayload must seal through sealPayloadWithProvider, not the legacy sealPayload." },
+    .{ .path = "src/quic/tls_adapter.zig", .function_name = "openPacketPayload", .forbidden = &legacy_wrapper_calls, .rationale = "QuicTlsAdapter.openPacketPayload must open through openPayloadWithProvider, not the legacy openPayload." },
+    .{ .path = "src/quic/tls_adapter.zig", .function_name = "updateApplicationWriteKeys", .forbidden = &legacy_wrapper_calls, .rationale = "QuicTlsAdapter.updateApplicationWriteKeys must derive the next secret through deriveNextGenerationSecretWithProvider, not the legacy deriveNextGenerationSecret." },
+    .{ .path = "src/quic/tls_adapter.zig", .function_name = "nextApplicationReadKeys", .forbidden = &legacy_wrapper_calls, .rationale = "QuicTlsAdapter.nextApplicationReadKeys must derive keys through the *WithProvider entry points, not the legacy free functions." },
+    .{ .path = "src/quic/tls_adapter.zig", .function_name = "commitApplicationReadKeyUpdate", .forbidden = &legacy_wrapper_calls, .rationale = "QuicTlsAdapter.commitApplicationReadKeyUpdate must derive the next secret through deriveNextGenerationSecretWithProvider, not the legacy deriveNextGenerationSecret." },
+};
+
 /// `src/quic/cid.zig` keeps one documented exception: RFC 9000 §10.3.1
 /// stateless-reset-token derivation is HMAC-SHA256 under a static
 /// process-lifetime key, not TLS/QUIC-negotiated packet protection — the
@@ -194,6 +256,11 @@ const file_checks = [_]FileCheck{
         .forbidden = &cid_zig_forbidden,
         .rationale = "Connection-ID/stateless-reset-token derivation (RFC 9000 §10.3.1) is a documented HMAC-SHA256 exception under a static process-lifetime key (docs/CRYPTO_PROVIDER_AUDIT.md), not TLS/QUIC-negotiated packet protection; no AEAD, ECDH, signature, KDF, or AES header-protection shortcuts may be added here.",
     },
+    .{
+        .path = "src/quic/tls_handshake.zig",
+        .forbidden = &tls_handshake_zig_forbidden,
+        .rationale = "The backend-agnostic handshake driver must not add keyed crypto of its own; TestTlsBackend's deterministic transcript HKDF (std.crypto.kdf) is the one documented exception (see the forbidden-list comment), everything else stays forbidden including the legacy wrapper names.",
+    },
 };
 
 const quic_dir_forbidden = keyed_crypto_core ++ aes_block_cipher;
@@ -201,13 +268,16 @@ const quic_dir_forbidden = keyed_crypto_core ++ aes_block_cipher;
 const dir_checks = [_]DirCheck{
     .{
         .dir = "src/quic",
-        // tls_adapter.zig is the approved provider-owned adapter (and the
+        // tls_adapter.zig is the approved provider-owned adapter and the
         // one file allowed to define the legacy wrapper names as
-        // differential fixtures); tls_handshake.zig's in-memory handshake
-        // test backend uses deterministic transcript/HKDF fixtures and is
-        // excluded from the protocol guard; path.zig, connection.zig, and
-        // packet.zig have their own narrower checks above.
-        .excluded = &.{ "tls_adapter.zig", "tls_handshake.zig", "path.zig", "connection.zig", "packet.zig", "cid.zig" },
+        // differential fixtures, so it cannot be scanned wholesale for
+        // either keyed-crypto primitives or the legacy names themselves —
+        // `function_body_checks` above targets its canonical methods
+        // specifically instead. path.zig, connection.zig, packet.zig,
+        // cid.zig, and tls_handshake.zig have their own narrower checks in
+        // `file_checks` above. Recursive: a new nested directory under
+        // src/quic gets no free pass.
+        .excluded = &.{ "tls_adapter.zig", "path.zig", "connection.zig", "packet.zig", "cid.zig", "tls_handshake.zig" },
         .forbidden = &quic_dir_forbidden,
         .rationale = "QUIC protocol modules outside the allowlist must not add direct keyed crypto or AES block-cipher dependencies.",
     },
@@ -232,9 +302,23 @@ const Violation = struct {
     rationale: []const u8,
 };
 
-fn checkFile(allocator: std.mem.Allocator, root: compat.DirCompat, path: []const u8, forbidden: []const []const u8, rationale: []const u8, violations: *std.ArrayList(Violation)) !void {
+/// `required`: whether a missing file is itself a violation. `file_checks`
+/// entries name specific protected files the audit exists to enforce, so a
+/// renamed or deleted one must fail closed rather than silently pass with
+/// zero violations (#490 third-pass review) — unlike `checkDir`'s per-entry
+/// calls, where the file is already known to exist from directory iteration.
+fn checkFile(allocator: std.mem.Allocator, root: compat.DirCompat, path: []const u8, forbidden: []const []const u8, rationale: []const u8, required: bool, violations: *std.ArrayList(Violation)) !void {
     const contents = root.readFileAlloc(allocator, path, 16 * 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => {
+            if (required) {
+                try violations.append(allocator, .{
+                    .path = try allocator.dupe(u8, path),
+                    .needle = "<file missing>",
+                    .rationale = rationale,
+                });
+            }
+            return;
+        },
         else => return err,
     };
     defer allocator.free(contents);
@@ -243,13 +327,71 @@ fn checkFile(allocator: std.mem.Allocator, root: compat.DirCompat, path: []const
     }
 }
 
-fn checkDir(allocator: std.mem.Allocator, root: compat.DirCompat, check: DirCheck, violations: *std.ArrayList(Violation)) !void {
-    var dir = try root.openDir(check.dir, .{ .iterate = true });
+/// Extracts one struct method's source span: from `fn <function_name>(` to
+/// (but not including) the next sibling `pub fn `/`fn ` declaration at the
+/// same 4-space struct-method indentation, or end of file. Narrow and
+/// deterministic like the rest of this audit rather than a general Zig
+/// parser — a real parser would have to distinguish the function body's
+/// opening brace from inline return-type groups like `error{Foo}`, which
+/// every target function here has.
+fn extractFunctionBody(contents: []const u8, function_name: []const u8) ?[]const u8 {
+    var search_from: usize = 0;
+    while (true) {
+        const rel = std.mem.indexOfPos(u8, contents, search_from, function_name) orelse return null;
+        const before_ok = rel >= 3 and std.mem.eql(u8, contents[rel - 3 .. rel], "fn ");
+        const after_name = rel + function_name.len;
+        const after_ok = after_name < contents.len and contents[after_name] == '(';
+        if (before_ok and after_ok) {
+            var end = contents.len;
+            if (std.mem.indexOfPos(u8, contents, after_name, "\n    pub fn ")) |p| end = @min(end, p);
+            if (std.mem.indexOfPos(u8, contents, after_name, "\n    fn ")) |p| end = @min(end, p);
+            return contents[rel..end];
+        }
+        search_from = rel + 1;
+    }
+}
+
+fn checkFunctionBody(allocator: std.mem.Allocator, root: compat.DirCompat, check: FunctionBodyCheck, violations: *std.ArrayList(Violation)) !void {
+    const contents = root.readFileAlloc(allocator, check.path, 16 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => {
+            try violations.append(allocator, .{
+                .path = try allocator.dupe(u8, check.path),
+                .needle = "<file missing>",
+                .rationale = check.rationale,
+            });
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(contents);
+    const body = extractFunctionBody(contents, check.function_name) orelse {
+        try violations.append(allocator, .{
+            .path = try allocator.dupe(u8, check.path),
+            .needle = "<function not found>",
+            .rationale = check.rationale,
+        });
+        return;
+    };
+    if (firstForbidden(body, check.forbidden)) |needle| {
+        try violations.append(allocator, .{ .path = try allocator.dupe(u8, check.path), .needle = needle, .rationale = check.rationale });
+    }
+}
+
+fn checkDir(allocator: std.mem.Allocator, root: compat.DirCompat, check: DirCheck, dir_path: []const u8, violations: *std.ArrayList(Violation)) !void {
+    var dir = root.openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            try violations.append(allocator, .{
+                .path = try allocator.dupe(u8, dir_path),
+                .needle = "<directory missing>",
+                .rationale = check.rationale,
+            });
+            return;
+        },
+        else => return err,
+    };
     defer dir.close();
     var it = dir.iterate();
     while (try it.next(compat.io())) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
         var excluded = false;
         for (check.excluded) |name| {
             if (std.mem.eql(u8, entry.name, name)) {
@@ -258,9 +400,16 @@ fn checkDir(allocator: std.mem.Allocator, root: compat.DirCompat, check: DirChec
             }
         }
         if (excluded) continue;
-        const rel = try std.fs.path.join(allocator, &.{ check.dir, entry.name });
+        const rel = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
         defer allocator.free(rel);
-        try checkFile(allocator, root, rel, check.forbidden, check.rationale, violations);
+        switch (entry.kind) {
+            .directory => try checkDir(allocator, root, check, rel, violations),
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+                try checkFile(allocator, root, rel, check.forbidden, check.rationale, false, violations);
+            },
+            else => {},
+        }
     }
 }
 
@@ -268,10 +417,13 @@ fn runAudit(allocator: std.mem.Allocator, root: compat.DirCompat) !std.ArrayList
     var violations: std.ArrayList(Violation) = .empty;
     errdefer violations.deinit(allocator);
     for (file_checks) |check| {
-        try checkFile(allocator, root, check.path, check.forbidden, check.rationale, &violations);
+        try checkFile(allocator, root, check.path, check.forbidden, check.rationale, true, &violations);
+    }
+    for (function_body_checks) |check| {
+        try checkFunctionBody(allocator, root, check, &violations);
     }
     for (dir_checks) |check| {
-        try checkDir(allocator, root, check, &violations);
+        try checkDir(allocator, root, check, check.dir, &violations);
     }
     return violations;
 }
@@ -353,6 +505,62 @@ test "clean protocol-module content produces no violation" {
     ));
 }
 
+/// Minimal but realistic stand-in for `src/quic/tls_adapter.zig`'s six
+/// canonical `QuicTlsAdapter` methods, reproducing the exact shape that
+/// makes `extractFunctionBody` non-trivial (an inline `error{...}` group in
+/// the return type before the real body opens) so the fixture tree actually
+/// exercises the same parsing path as the real file.
+const clean_tls_adapter_fixture =
+    \\pub const QuicTlsAdapter = struct {
+    \\    pub fn protectionKeys(self: *const QuicTlsAdapter, level: EncryptionLevel, direction: Direction) error{ProviderUnsupported}!?PacketProtectionKeys {
+    \\        return deriveAes128GcmKeysWithProvider(self.provider, secret);
+    \\    }
+    \\    pub fn sealPacketPayload(self: *QuicTlsAdapter, level: EncryptionLevel) error{ProviderUnsupported}![]u8 {
+    \\        return keys.sealPayloadWithProvider(self.provider, packet_number, header, plaintext, out);
+    \\    }
+    \\    pub fn openPacketPayload(self: *QuicTlsAdapter, level: EncryptionLevel) error{ProviderUnsupported}![]u8 {
+    \\        return keys.openPayloadWithProvider(self.provider, packet_number, header, protected_payload, out);
+    \\    }
+    \\    pub fn updateApplicationWriteKeys(self: *QuicTlsAdapter) error{ProviderUnsupported}!void {
+    \\        const next_write = try deriveNextGenerationSecretWithProvider(self.provider, write_secret);
+    \\    }
+    \\    pub fn nextApplicationReadKeys(self: *const QuicTlsAdapter) error{ProviderUnsupported}!?PacketProtectionKeys {
+    \\        return try deriveAes128GcmKeysWithProvider(self.provider, next_read);
+    \\    }
+    \\    pub fn commitApplicationReadKeyUpdate(self: *QuicTlsAdapter) error{ProviderUnsupported}!void {
+    \\        const next_read = try deriveNextGenerationSecretWithProvider(self.provider, read_secret);
+    \\    }
+    \\};
+    \\
+;
+
+/// `clean_tls_adapter_fixture` with `sealPacketPayload` reverted to the
+/// legacy `keys.sealPayload(...)` call — the exact regression #490's
+/// third-pass review named.
+const regressed_tls_adapter_fixture =
+    \\pub const QuicTlsAdapter = struct {
+    \\    pub fn protectionKeys(self: *const QuicTlsAdapter, level: EncryptionLevel, direction: Direction) error{ProviderUnsupported}!?PacketProtectionKeys {
+    \\        return deriveAes128GcmKeysWithProvider(self.provider, secret);
+    \\    }
+    \\    pub fn sealPacketPayload(self: *QuicTlsAdapter, level: EncryptionLevel) error{ProviderUnsupported}![]u8 {
+    \\        return keys.sealPayload(packet_number, header, plaintext, out);
+    \\    }
+    \\    pub fn openPacketPayload(self: *QuicTlsAdapter, level: EncryptionLevel) error{ProviderUnsupported}![]u8 {
+    \\        return keys.openPayloadWithProvider(self.provider, packet_number, header, protected_payload, out);
+    \\    }
+    \\    pub fn updateApplicationWriteKeys(self: *QuicTlsAdapter) error{ProviderUnsupported}!void {
+    \\        const next_write = try deriveNextGenerationSecretWithProvider(self.provider, write_secret);
+    \\    }
+    \\    pub fn nextApplicationReadKeys(self: *const QuicTlsAdapter) error{ProviderUnsupported}!?PacketProtectionKeys {
+    \\        return try deriveAes128GcmKeysWithProvider(self.provider, next_read);
+    \\    }
+    \\    pub fn commitApplicationReadKeyUpdate(self: *QuicTlsAdapter) error{ProviderUnsupported}!void {
+    \\        const next_read = try deriveNextGenerationSecretWithProvider(self.provider, read_secret);
+    \\    }
+    \\};
+    \\
+;
+
 test "end-to-end: the audit fails against a fixture tree reproducing each bypass, and passes once fixed" {
     const allocator = testing.allocator;
 
@@ -360,8 +568,15 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
     defer tmp.cleanup();
     const root = compat.wrapDir(tmp.dir);
 
-    try root.makePath("src/quic");
+    try root.makePath("src/quic/nested");
     try root.makePath("src/http");
+
+    // The protected files/functions the fixture tree must carry so the
+    // "clean" baseline below is actually clean, not just missing every
+    // fail-closed target.
+    try root.writeFile(.{ .sub_path = "src/quic/tls_adapter.zig", .data = clean_tls_adapter_fixture });
+    try root.writeFile(.{ .sub_path = "src/quic/cid.zig", .data = "" });
+    try root.writeFile(.{ .sub_path = "src/quic/tls_handshake.zig", .data = "" });
 
     const bypass_cases = [_]struct { rel: []const u8, contents: []const u8 }{
         .{ .rel = "src/quic/connection.zig", .contents = "const mask = Aes128.initEnc(self.hp);\n" },
@@ -369,6 +584,15 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
         .{ .rel = "src/quic/path.zig", .contents = "Ed25519.verify(sig, msg, key) catch return error.Bad;\n" },
         .{ .rel = "src/http/http3_runtime.zig", .contents = "keys.applyHeaderProtection(&out[0], pn_field, sample);\n" },
         .{ .rel = "src/quic/frame.zig", .contents = "const tag = std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(...);\n" },
+        // A nested subdirectory under src/quic gets no free pass from the
+        // (now recursive) directory-wide scan.
+        .{ .rel = "src/quic/nested/packet_crypto.zig", .contents = "const tag = std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(...);\n" },
+        // tls_handshake.zig is fully scannable now; a legacy wrapper call
+        // there must fail too.
+        .{ .rel = "src/quic/tls_handshake.zig", .contents = "keys.sealPayload(pn, header, plain, out);\n" },
+        // The exact regression the function-body checks exist to catch:
+        // a canonical method reverting to a legacy wrapper call internally.
+        .{ .rel = "src/quic/tls_adapter.zig", .contents = regressed_tls_adapter_fixture },
     };
 
     for (bypass_cases) |case| {
@@ -377,13 +601,27 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
         defer violations.deinit(allocator);
         for (violations.items) |v| allocator.free(v.path);
         try testing.expect(violations.items.len > 0);
-        // Clean up before the next case so violations don't accumulate across
-        // cases sharing a file path.
-        try root.writeFile(.{ .sub_path = case.rel, .data = "" });
+        // Clean up before the next case so violations don't accumulate
+        // across cases sharing a file path.
+        const clean = if (std.mem.eql(u8, case.rel, "src/quic/tls_adapter.zig"))
+            clean_tls_adapter_fixture
+        else
+            "";
+        try root.writeFile(.{ .sub_path = case.rel, .data = clean });
     }
+    try root.deleteFile("src/quic/nested/packet_crypto.zig");
 
     var clean_violations = try runAudit(allocator, root);
     defer clean_violations.deinit(allocator);
     for (clean_violations.items) |v| allocator.free(v.path);
     try testing.expectEqual(@as(usize, 0), clean_violations.items.len);
+
+    // Fail-closed: deleting a protected file must itself be a violation,
+    // not a silent pass.
+    try root.deleteFile("src/quic/cid.zig");
+    var missing_file_violations = try runAudit(allocator, root);
+    defer missing_file_violations.deinit(allocator);
+    defer for (missing_file_violations.items) |v| allocator.free(v.path);
+    try testing.expect(missing_file_violations.items.len > 0);
+    try root.writeFile(.{ .sub_path = "src/quic/cid.zig", .data = "" });
 }

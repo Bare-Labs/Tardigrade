@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const quic = @import("quic");
+const test_quic_crypto = @import("test_quic_crypto");
 const http3 = @import("http3");
 const stream_transport = @import("stream_transport");
 
@@ -235,7 +236,7 @@ const Endpoint = struct {
 
     allocator: std.mem.Allocator,
     role: tls_adapter.Perspective,
-    adapter: QuicTlsAdapter = .{ .provider = tls_adapter.testOnlyDefaultProvider() },
+    adapter: QuicTlsAdapter = .{ .provider = test_quic_crypto.testDefaultProvider() },
     backend: tls_backend.Tls13Backend,
     handshake: tls_handshake.Handshake = undefined,
     cid_routes: quic_cid.CidRoutingTable,

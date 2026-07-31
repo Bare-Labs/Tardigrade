@@ -29,6 +29,7 @@ const quic = @import("quic");
 const http3 = @import("http3");
 const tls_core = @import("tls_core");
 const crypto_pkg = @import("crypto");
+const test_quic_crypto = @import("test_quic_crypto");
 
 const Connection = quic.connection.Connection;
 const H3 = http3.conn.Conn(Connection);
@@ -1615,8 +1616,7 @@ const RuntimeCidHarness = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &odcid,
             .tls = self.client_backend.backend(),
-            var test_crypto_storage_51 = tls_core.production_crypto.StackProviderStorage{};
-            .crypto_provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_51),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = self.now_us,
             .initial_path = client_path,
         });
@@ -1628,8 +1628,7 @@ const RuntimeCidHarness = struct {
             .initial_secret_dcid = &odcid,
             .peer_cid = &client_cid,
             .tls = server_backend.backend(),
-            var test_crypto_storage_52 = tls_core.production_crypto.StackProviderStorage{};
-            .crypto_provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_52),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = self.now_us,
             .initial_path = server_path,
             .stateless_reset_key = [_]u8{0x44} ** 32,
@@ -2635,8 +2634,7 @@ test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT cap
         .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend.backend(),
-        var test_crypto_storage_53 = tls_core.production_crypto.StackProviderStorage{};
-        .crypto_provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_53),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = client_path,
     });
@@ -2648,8 +2646,7 @@ test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT cap
         .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend.backend(),
-        var test_crypto_storage_54 = tls_core.production_crypto.StackProviderStorage{};
-        .crypto_provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_54),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = server_path,
     });
@@ -2723,8 +2720,7 @@ fn sealZeroRttPacketForTest(
     plaintext: []const u8,
     out: []u8,
 ) []u8 {
-    var test_crypto_storage_55 = tls_core.production_crypto.StackProviderStorage{};
-    var sender = quic.tls_adapter.QuicTlsAdapter{ .provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_55) };
+    var sender = quic.tls_adapter.QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     sender.setZeroRttEnabled(true);
     sender.installSecret(quic.tls_adapter.Secret.init(.zero_rtt, .write, &secret) catch unreachable);
 
@@ -2947,8 +2943,7 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend.backend(),
-        var test_crypto_storage_56 = tls_core.production_crypto.StackProviderStorage{};
-        .crypto_provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_56),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = client_path,
     });
@@ -2960,8 +2955,7 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend1.backend(),
-        var test_crypto_storage_57 = tls_core.production_crypto.StackProviderStorage{};
-        .crypto_provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_57),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = server_path,
     });
@@ -3061,8 +3055,7 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend2.backend(),
-        var test_crypto_storage_58 = tls_core.production_crypto.StackProviderStorage{};
-        .crypto_provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_58),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 2_000_000,
         .initial_path = client_path,
     });
@@ -3107,8 +3100,7 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend2.backend(),
-        var test_crypto_storage_59 = tls_core.production_crypto.StackProviderStorage{};
-        .crypto_provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_59),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 2_000_000,
         .initial_path = server_path,
     });
@@ -3475,8 +3467,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend.backend(),
-        var test_crypto_storage_60 = tls_core.production_crypto.StackProviderStorage{};
-        .crypto_provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_60),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = client_path,
     });
@@ -3489,8 +3480,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend1.backend(),
-        var test_crypto_storage_61 = tls_core.production_crypto.StackProviderStorage{};
-        .crypto_provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_61),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 1_000_000,
         .initial_path = server_path,
     });
@@ -3601,8 +3591,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .initial_secret_dcid = &odcid,
         .peer_cid = &odcid,
         .tls = client_backend2.backend(),
-        var test_crypto_storage_62 = tls_core.production_crypto.StackProviderStorage{};
-        .crypto_provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_62),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 2_000_000,
         .initial_path = client_path,
     });
@@ -3615,8 +3604,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .initial_secret_dcid = &odcid,
         .peer_cid = &client_cid,
         .tls = backend2.backend(),
-        var test_crypto_storage_63 = tls_core.production_crypto.StackProviderStorage{};
-        .crypto_provider = quic.tls_core.production_crypto.stackProvider(&test_crypto_storage_63),
+        .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 2_000_000,
         .initial_path = server_path,
         .events = .{ .context = &runtime, .emitFn = Runtime.quicConnectionEvent },

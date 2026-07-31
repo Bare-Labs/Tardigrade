@@ -34,6 +34,7 @@ const crypto_secrets = @import("crypto_secrets");
 const crypto_pkg = @import("crypto");
 const packet = @import("packet.zig");
 const tls_core = @import("tls_core");
+const test_quic_crypto = @import("test_quic_crypto");
 
 const crypto = std.crypto;
 const tls = std.crypto.tls;
@@ -1178,16 +1179,14 @@ test "adapter installs Initial secrets by endpoint perspective" {
     var dcid: [8]u8 = undefined;
     _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
 
-    var test_crypto_storage_1 = tls_core.production_crypto.StackProviderStorage{};
-    var client = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var client = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     const client_secrets = try client.installInitialSecrets(.client, &dcid);
     try testing.expectEqualSlices(u8, &client_secrets.client.secret, client.secret(.initial, .write).?.slice());
     try testing.expectEqualSlices(u8, &client_secrets.server.secret, client.secret(.initial, .read).?.slice());
     const client_write_keys = (try client.protectionKeys(.initial, .write)).?;
     try testing.expectEqualSlices(u8, &client_secrets.client.key, &client_write_keys.key);
 
-    var test_crypto_storage_2 = tls_core.production_crypto.StackProviderStorage{};
-    var server = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var server = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     const server_secrets = try server.installInitialSecrets(.server, &dcid);
     try testing.expectEqualSlices(u8, &server_secrets.client.secret, server.secret(.initial, .read).?.slice());
     try testing.expectEqualSlices(u8, &server_secrets.server.secret, server.secret(.initial, .write).?.slice());
@@ -1196,8 +1195,7 @@ test "adapter installs Initial secrets by endpoint perspective" {
 }
 
 test "adapter derives Handshake and 1-RTT protection keys from installed traffic secrets" {
-    var test_crypto_storage_3 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
 
     // No secret installed yet: every non-Initial level reports no keys.
     try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.protectionKeys(.handshake, .write));
@@ -1227,8 +1225,7 @@ test "adapter derives Handshake and 1-RTT protection keys from installed traffic
 }
 
 test "packet protection round-trips at Handshake and 1-RTT levels" {
-    var test_crypto_storage_4 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     const secret = hexBytes("0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
     adapter.installSecret(try Secret.init(.handshake, .write, &secret));
     adapter.installSecret(try Secret.init(.application, .write, &secret));
@@ -1253,8 +1250,7 @@ test "packet protection round-trips at Handshake and 1-RTT levels" {
 }
 
 test "protection keys reject a traffic secret of the wrong length" {
-    var test_crypto_storage_5 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     const short_secret = [_]u8{0xab} ** (traffic_secret_len - 1);
     adapter.installSecret(try Secret.init(.application, .write, &short_secret));
     try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.protectionKeys(.application, .write));
@@ -1316,8 +1312,7 @@ test "key update derives chained next-generation secrets" {
 }
 
 test "local key update rolls only write keys and outgoing phase" {
-    var test_crypto_storage_6 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     try testing.expectError(error.ApplicationSecretsMissing, adapter.updateApplicationWriteKeys());
 
     const read_secret = hexBytes("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
@@ -1341,8 +1336,7 @@ test "local key update rolls only write keys and outgoing phase" {
 }
 
 test "peer key update advances only read keys and incoming phase" {
-    var test_crypto_storage_7 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     const read_secret = hexBytes("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
     const write_secret = hexBytes("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100");
     adapter.installSecret(try Secret.init(.application, .read, &read_secret));
@@ -1372,16 +1366,14 @@ test "peer key update advances only read keys and incoming phase" {
 }
 
 test "key update helpers require the corresponding application secret" {
-    var test_crypto_storage_8 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     try testing.expectError(error.ApplicationSecretsMissing, adapter.updateApplicationWriteKeys());
     try testing.expectError(error.ApplicationSecretsMissing, adapter.commitApplicationReadKeyUpdate());
     try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.nextApplicationReadKeys() catch unreachable);
 }
 
 test "adapter guards 0-RTT keys behind explicit config" {
-    var test_crypto_storage_9 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     const secret = hexBytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
     adapter.installSecret(try Secret.init(.zero_rtt, .write, &secret));
 
@@ -1393,8 +1385,7 @@ test "adapter guards 0-RTT keys behind explicit config" {
 }
 
 test "peer transport parameters require handshake authentication" {
-    var test_crypto_storage_10 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     try testing.expectEqual(@as(?config.TransportParameters, null), adapter.peerTransportParameters());
 
     const params = try (config.Config{}).transportParameters();
@@ -1408,8 +1399,7 @@ test "peer transport parameters require handshake authentication" {
 }
 
 test "adapter reports ALPN and certificate validation state" {
-    var test_crypto_storage_11 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     try testing.expect(!adapter.negotiatedH3());
     adapter.markAlpn("h3");
     try testing.expect(adapter.negotiatedH3());
@@ -1422,8 +1412,7 @@ test "adapter reports ALPN and certificate validation state" {
 }
 
 test "adapter packet protection tracks metrics and counts deprotection failures" {
-    var test_crypto_storage_12 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     var out: [64]u8 = undefined;
 
     // No keys installed yet: deprotection is unavailable, not a failure.
@@ -1659,8 +1648,7 @@ fn expectCryptoStreamInvariants(stream: *const CryptoStream) !void {
 }
 
 test "adapter tracks transport parameters ALPN secrets and handshake input" {
-    var test_crypto_storage_13 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     const params = try (config.Config{}).transportParameters();
     adapter.setLocalTransportParameters(params);
     try testing.expect(adapter.local_transport_parameters != null);
@@ -1704,8 +1692,7 @@ test "secret store returns pointers and wipes discarded secret bytes" {
 }
 
 test "adapter queues outbound TLS handshake bytes as CRYPTO stream data" {
-    var test_crypto_storage_14 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
 
     try adapter.queueHandshakeOutput(.initial, "client");
     try adapter.queueHandshakeOutput(.initial, " hello");
@@ -1731,8 +1718,7 @@ test "adapter queues outbound TLS handshake bytes as CRYPTO stream data" {
 }
 
 test "adapter wipes consumed CRYPTO input and drained output bytes" {
-    var test_crypto_storage_15 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     const input_pattern = "ticket-input-pattern";
     try adapter.receiveCrypto(.application, 0, input_pattern);
     const input = (try adapter.nextHandshakeInput(.application)).?;
@@ -1763,8 +1749,7 @@ test "CRYPTO input storage is bounded by outstanding data, not lifetime offset" 
 }
 
 test "0-RTT secrets are allowed but CRYPTO streams reject zero_rtt level" {
-    var test_crypto_storage_16 = tls_core.production_crypto.StackProviderStorage{};
-    var adapter = QuicTlsAdapter{ .provider = testOnlyDefaultProvider() };
+    var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     adapter.installSecret(try Secret.init(.zero_rtt, .read, "early-data-secret"));
     try testing.expectEqualStrings("early-data-secret", adapter.secret(.zero_rtt, .read).?.slice());
 

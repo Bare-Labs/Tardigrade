@@ -316,6 +316,21 @@ pub fn build(b: *std.Build) void {
     quic_mod.addImport("crypto", crypto_mod);
     tls_core_mod.addImport("crypto", crypto_mod);
     exe_mod.addImport("crypto", crypto_mod);
+
+    // Test-only QUIC/H3 crypto provider composition (#490): owns concrete
+    // `pure_zig.Provider` construction so `src/quic/` and the native HTTP/3
+    // composition root never do. Every module whose test blocks or tools
+    // exercise the QUIC seam directly (without the real Runtime composition
+    // root) imports this; production code must never call it.
+    const test_quic_crypto_mod = b.createModule(.{
+        .root_source_file = b.path("tests/support/quic_crypto.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_quic_crypto_mod.addImport("crypto", crypto_mod);
+    quic_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
+    exe_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
+
     const crypto_tests = b.addTest(.{ .root_module = crypto_mod });
     const run_crypto_tests = b.addRunArtifact(crypto_tests);
     const crypto_secret_tests = b.addTest(.{ .root_module = crypto_secrets_mod });
@@ -329,13 +344,24 @@ pub fn build(b: *std.Build) void {
     // Deterministic, dependency-free crypto-boundary audit (#490): a checked-in
     // Zig program rather than a shell script shelling out to an ambient `rg`,
     // so every CI runner and platform enforces it identically with nothing
-    // extra to install.
+    // extra to install. This is a source-audit build tool that inspects the
+    // repository and must run on the machine doing the build, so it (and its
+    // `zig_compat` dependency) are built for the build host, not the
+    // user-selected `-Dtarget` — a cross build (e.g. `-Dtarget=aarch64-linux`
+    // on an x86 host) would otherwise produce a foreign executable that
+    // `addRunArtifact` cannot execute.
+    const host_compat_mod = b.createModule(.{
+        .root_source_file = b.path("src/zig_compat.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .link_libc = true,
+    });
     const crypto_boundary_audit_mod = b.createModule(.{
         .root_source_file = b.path("scripts/audit_crypto_boundary.zig"),
-        .target = target,
+        .target = b.graph.host,
         .optimize = optimize,
     });
-    crypto_boundary_audit_mod.addImport("zig_compat", compat_mod);
+    crypto_boundary_audit_mod.addImport("zig_compat", host_compat_mod);
     const crypto_boundary_audit_exe = b.addExecutable(.{
         .name = "audit_crypto_boundary",
         .root_module = crypto_boundary_audit_mod,
@@ -473,6 +499,7 @@ pub fn build(b: *std.Build) void {
     quic_h3_smoke_mod.addImport("quic", quic_mod);
     quic_h3_smoke_mod.addImport("http3", http3_mod);
     quic_h3_smoke_mod.addImport("stream_transport", stream_transport_mod);
+    quic_h3_smoke_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
     const quic_h3_smoke_tests = b.addTest(.{ .root_module = quic_h3_smoke_mod, .filters = quic_test_filters });
     const run_quic_h3_smoke_tests = b.addRunArtifact(quic_h3_smoke_tests);
     quic_step.dependOn(&run_quic_h3_smoke_tests.step);
@@ -489,6 +516,7 @@ pub fn build(b: *std.Build) void {
     quic_h3_e2e_mod.addImport("quic", quic_mod);
     quic_h3_e2e_mod.addImport("http3", http3_mod);
     quic_h3_e2e_mod.addImport("stream_transport", stream_transport_mod);
+    quic_h3_e2e_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
     const quic_h3_e2e_tests = b.addTest(.{ .root_module = quic_h3_e2e_mod, .filters = quic_test_filters });
     const run_quic_h3_e2e_tests = b.addRunArtifact(quic_h3_e2e_tests);
     const quic_h3_driver_step = b.step("test-quic-h3-driver", "Run deterministic native QUIC/H3 driver scenarios");
@@ -510,6 +538,7 @@ pub fn build(b: *std.Build) void {
     quic_h3_udp_mod.addImport("tls_core", tls_core_mod);
     quic_h3_udp_mod.addImport("zig_compat", compat_mod);
     quic_h3_udp_mod.addImport("build_options", build_options.createModule());
+    quic_h3_udp_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
     const udp_http3_runtime_mod = b.createModule(.{
         .root_source_file = b.path("src/http/http3_runtime.zig"),
         .target = target,
@@ -523,6 +552,7 @@ pub fn build(b: *std.Build) void {
     udp_http3_runtime_mod.addImport("tls_core", tls_core_mod);
     udp_http3_runtime_mod.addImport("crypto", crypto_mod);
     udp_http3_runtime_mod.addImport("build_options", build_options.createModule());
+    udp_http3_runtime_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
     quic_h3_udp_mod.addImport("http3_runtime", udp_http3_runtime_mod);
     const quic_h3_udp_tests = b.addTest(.{ .root_module = quic_h3_udp_mod, .filters = quic_test_filters });
     const run_quic_h3_udp_tests = b.addRunArtifact(quic_h3_udp_tests);
@@ -541,6 +571,7 @@ pub fn build(b: *std.Build) void {
     h3_interop_mod.addImport("quic", quic_mod);
     h3_interop_mod.addImport("http3", http3_mod);
     h3_interop_mod.addImport("stream_transport", stream_transport_mod);
+    h3_interop_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
     const h3_interop_tool = b.addExecutable(.{
         .name = "h3_interop_tool",
         .root_module = h3_interop_mod,

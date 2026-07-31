@@ -129,14 +129,21 @@ to a newer compiler or starts carrying compatibility shims for crypto APIs, the
 floor and each affected row must be updated together.
 
 Protocol configuration must not hand-write provider-derived TLS capabilities.
-Use `tls.crypto_profile.fromProvider(provider.capabilities())`, then pass the
-returned `asPolicyCapabilities()` slice set to `tls.Policy`. That path filters
-cipher suites, named groups, and signature schemes through the selected
-provider's typed support, so pure-Zig configuration advertises Ed25519,
-ECDSA-P256, RSA-PSS, and X25519, but not P-256 ECDH until a backend actually
-implements it. When a call site must accept hand-written TLS capability lists,
-it should preflight them with `tls.crypto_profile.validateAgainstProvider`
-before handshake execution.
+Use `tls.crypto_profile.fromProfile(product, provider.capabilities())`, naming
+the caller's `crypto.profile.ProductProfile` explicitly (`.native_appliance`
+for the pure-Zig in-process path, `.general_purpose_openssl` for the OpenSSL
+backend), then pass the returned `asPolicyCapabilities()` slice set to
+`tls.Policy`. There is no product-agnostic shortcut: which cipher suites,
+named groups, and signature schemes a product actually negotiates is a
+product decision, not something a provider's raw capability set can answer on
+its own — a pure-Zig provider reports AES-256-GCM/ChaCha20-Poly1305/RSA-PSS
+support, but `fromProfile` still withholds them for `.native_appliance`
+because that product's engine doesn't negotiate them, while
+`.general_purpose_openssl` advertises the full set. Each cipher suite is
+gated on every profile dimension it binds together (AEAD, transcript hash,
+HKDF hash), not only its AEAD row. When a call site must accept hand-written
+TLS capability lists, it should preflight them with
+`tls.crypto_profile.validateAgainstProvider` before handshake execution.
 
 The native appliance profile remains the deliberately narrow in-process
 pure-Zig path: no OpenSSL or libcrypto linkage, and general-purpose OpenSSL
