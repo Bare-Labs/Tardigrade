@@ -990,6 +990,16 @@ test "udp smoke: HTTP/3 runtime drain lets admitted work finish and rejects new 
     try testing.expect(drain_started);
     try testing.expect(request_a_done);
     try testing.expect(request_b_sent or request_b_rejected_by_goaway);
+    // #546: split what used to be a single `new_initial_seen` assertion into
+    // two, so a future failure here tells apart the two very different
+    // causes: `sent_new_initial == false` means the drain rejection (via
+    // either the client-side GoawayReceived race or the server-side
+    // `h3_drain_request_rejections` counter — see the loop above) was never
+    // observed within the deadline, while `sent_new_initial == true` but
+    // `new_initial_seen == false` means the rejection *was* observed and the
+    // synthetic unknown-DCID Initial was sent, but the runtime never
+    // ingested it.
+    try testing.expect(sent_new_initial);
     try testing.expect(new_initial_seen);
     try testing.expectEqual(@as(usize, 1), handler_state.requests.load(.monotonic));
     const drained_snapshot = runtime.snapshot();

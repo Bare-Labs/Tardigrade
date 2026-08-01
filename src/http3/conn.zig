@@ -115,6 +115,12 @@ pub fn Conn(comptime Transport: type) type {
             priority_duplicate_parameters: u64 = 0,
             priority_updates_buffered: u64 = 0,
             goaway_received: u64 = 0,
+            /// Peer request streams rejected directly by `pump()` because
+            /// they arrived at or above `local_goaway_id` — never surfaced
+            /// as an `IncomingRequest`, so `Runtime` cannot observe them via
+            /// `pollRequest()`. See `Metrics.goaway_request_rejections` at
+            /// the call site in `pump()`.
+            goaway_request_rejections: u64 = 0,
         };
 
         const max_pending_priority_updates: usize = 64;
@@ -307,6 +313,7 @@ pub fn Conn(comptime Transport: type) type {
                     if (self.local_goaway_id) |limit| {
                         if (id >= limit) {
                             rejectRequestStream(transport, id);
+                            self.metrics.goaway_request_rejections += 1;
                             continue;
                         }
                     }
@@ -1103,6 +1110,11 @@ test "H3 conn: sent GOAWAY rejects boundary and later peer requests without clos
     try testing.expectEqual(@as(?ErrorCode, null), server.close_code);
     try testing.expect((try server_transport.stream(first_rejected)).reset);
     try testing.expect((try server_transport.stream(second_rejected)).reset);
+    // #546: both peer request streams landed at/above `local_goaway_id`
+    // directly during `pump()`'s admission check, never becoming an
+    // `IncomingRequest` — this is the only place that observes them, so the
+    // runtime-level `h3_drain_request_rejections` fold depends on this count.
+    try testing.expectEqual(@as(u64, 2), server.metrics.goaway_request_rejections);
 }
 
 test "H3 conn: polls completed requests by urgency and reports priority" {
