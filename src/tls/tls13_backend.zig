@@ -5357,20 +5357,28 @@ fn buildMaxNewSessionTicketMessage(allocator: std.mem.Allocator) ![]u8 {
 /// Re-exported here so existing callers and tests keep their spelling.
 pub const testdata = credentials.testdata;
 
-/// A fresh deterministic pure-Zig `CryptoProvider` for this module's own
-/// tests (#490), matching the fixture pattern `key_schedule.zig`'s test
-/// block uses: `DeterministicEntropy` (explicitly not a CSPRNG) plus the
-/// pure-Zig `Provider`, held as a persistent local so every call in this
-/// file's test block gets a live, valid provider without a hidden global
-/// default.
-fn testCryptoProvider() crypto_provider_pkg.CryptoProvider {
-    const pure_zig = crypto_pkg.pure_zig;
-    const State = struct {
-        var entropy = pure_zig.DeterministicEntropy.init(0x71357_490);
-        var backing = pure_zig.Provider.init(entropy.entropy());
-    };
-    return State.backing.cryptoProvider();
-}
+/// Per-instance deterministic `CryptoProvider` storage for this module's own
+/// tests (#490 review): deliberately *not* a function-static shared `State`
+/// (the previous `testCryptoProvider()` shape here) — a single process-wide
+/// mutable `DeterministicEntropy` stream every call advanced together made a
+/// test's captured key-share/traffic-secret bytes depend on which other
+/// tests ran before it, and would race under parallel test execution. Every
+/// test instead declares its own local `var storage: TestProviderStorage =
+/// .{};` and calls `storage.init(seed)` — `self` must have a stable address
+/// for as long as the returned `CryptoProvider` is used, which a same-
+/// function local satisfies (stable for that test's own stack frame).
+const TestProviderStorage = struct {
+    entropy: crypto_pkg.pure_zig.DeterministicEntropy = crypto_pkg.pure_zig.DeterministicEntropy.init(0),
+    backing: crypto_pkg.pure_zig.Provider = undefined,
+
+    fn init(self: *TestProviderStorage, seed: u64) crypto_provider_pkg.CryptoProvider {
+        self.entropy = crypto_pkg.pure_zig.DeterministicEntropy.init(seed);
+        self.backing = crypto_pkg.pure_zig.Provider.init(self.entropy.entropy());
+        return self.backing.cryptoProvider();
+    }
+};
+
+const test_crypto_provider_seed: u64 = 0x71357_490;
 
 test "TLS-owned backend does not embed maximum ticket storage" {
     try std.testing.expect(@sizeOf(Tls13Backend) < 64 * 1024);
@@ -5378,9 +5386,10 @@ test "TLS-owned backend does not embed maximum ticket storage" {
 }
 
 test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
+    var test_provider_storage: TestProviderStorage = .{};
     var backend = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x41} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5402,6 +5411,11 @@ test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
 }
 
 test "transport profile validation fails before lifecycle or transcript advance" {
+    var test_provider_storage1: TestProviderStorage = .{};
+    var test_provider_storage2: TestProviderStorage = .{};
+    var test_provider_storage3: TestProviderStorage = .{};
+    var test_provider_storage4: TestProviderStorage = .{};
+    var test_provider_storage5: TestProviderStorage = .{};
     const entropy = Entropy{ .hello_random = [_]u8{0x41} ** 32 };
     const oversized_alpn = [_]u8{'a'} ** 256;
     const invalid_alpn_sets = [_][]const tls_algorithms.ProtocolName{
@@ -5415,7 +5429,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
         policy.alpn_protocols = alpns;
         var backend = Tls13Backend.initClientConfigured(
             entropy,
-            testCryptoProvider(),
+            test_provider_storage1.init(test_crypto_provider_seed),
             .{ .pinned_certificate = testdata.certificate_der },
             recordConfig(policy),
             .{},
@@ -5447,7 +5461,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
     too_large_policy.alpn_protocols = &too_large_alpns;
     var too_large_backend = Tls13Backend.initClientConfigured(
         entropy,
-        testCryptoProvider(),
+        test_provider_storage2.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         recordConfig(too_large_policy),
         .{},
@@ -5472,7 +5486,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
     near_policy.alpn_protocols = &near_alpns;
     var near_backend = Tls13Backend.initClientConfigured(
         entropy,
-        testCryptoProvider(),
+        test_provider_storage3.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         recordConfig(near_policy),
         .{},
@@ -5487,7 +5501,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
     var oversized = [_]u8{0xa5} ** (max_transport_extension_len + 1);
     var extension_backend = Tls13Backend.initClient(
         entropy,
-        testCryptoProvider(),
+        test_provider_storage4.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         .{ .extension = .{ .extension_type = 57, .local = &oversized } },
     );
@@ -5501,7 +5515,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
 
     var collision_backend = Tls13Backend.initClient(
         entropy,
-        testCryptoProvider(),
+        test_provider_storage5.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         .{ .extension = .{ .extension_type = ext_supported_versions, .local = "valid" } },
     );
@@ -5514,9 +5528,10 @@ test "transport profile validation fails before lifecycle or transcript advance"
 }
 
 test "client rejects malformed encrypted extensions ALPN framing" {
+    var test_provider_storage: TestProviderStorage = .{};
     var backend = Tls13Backend.initClient(
         Entropy{ .hello_random = [_]u8{0x51} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5546,6 +5561,7 @@ test "client rejects malformed encrypted extensions ALPN framing" {
 }
 
 test "client NewSessionTicket callback receives owned state and lifetime zero is dropped" {
+    var test_provider_storage: TestProviderStorage = .{};
     const TicketCapture = struct {
         count: usize = 0,
         received_at: i64 = 123_456,
@@ -5575,7 +5591,7 @@ test "client NewSessionTicket callback receives owned state and lifetime zero is
     var capture = TicketCapture{};
     var backend = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x41} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5613,9 +5629,10 @@ test "client NewSessionTicket callback receives owned state and lifetime zero is
 }
 
 test "client parses and drops NewSessionTicket when no consumer is configured" {
+    var test_provider_storage: TestProviderStorage = .{};
     var backend = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x45} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5669,9 +5686,10 @@ test "post-handshake input rejects allocator replacement while a frame is active
 }
 
 test "server explicitly emits NewSessionTicket and returns recoverable state" {
+    var test_provider_storage: TestProviderStorage = .{};
     var server = Tls13Backend.initServer(
         .{ .hello_random = [_]u8{0x51} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage.init(test_crypto_provider_seed),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
         .record,
     );
@@ -5713,9 +5731,10 @@ test "server explicitly emits NewSessionTicket and returns recoverable state" {
 }
 
 test "prepare/emit two-phase ticket issuance matches single-phase wire output" {
+    var test_provider_storage: TestProviderStorage = .{};
     var server = Tls13Backend.initServer(
         .{ .hello_random = [_]u8{0x51} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage.init(test_crypto_provider_seed),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
         .record,
     );
@@ -5749,9 +5768,10 @@ test "prepare/emit two-phase ticket issuance matches single-phase wire output" {
 }
 
 test "emitPreparedNewSessionTicket rejects an empty or oversized identity" {
+    var test_provider_storage: TestProviderStorage = .{};
     var server = Tls13Backend.initServer(
         .{ .hello_random = [_]u8{0x53} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage.init(test_crypto_provider_seed),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
         .record,
     );
@@ -5777,9 +5797,10 @@ test "emitPreparedNewSessionTicket rejects an empty or oversized identity" {
 }
 
 test "server ticket output failure is atomic and retryable" {
+    var test_provider_storage: TestProviderStorage = .{};
     var server = Tls13Backend.initServer(
         .{ .hello_random = [_]u8{0x61} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage.init(test_crypto_provider_seed),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
         .record,
     );
@@ -5813,6 +5834,7 @@ test "server ticket output failure is atomic and retryable" {
 }
 
 test "server ticket emission allocation failures leave transcript and sink clean" {
+    var test_provider_storage: TestProviderStorage = .{};
     var saw_injected_failure = false;
     var saw_success = false;
 
@@ -5820,7 +5842,7 @@ test "server ticket emission allocation failures leave transcript and sink clean
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         var server = Tls13Backend.initServer(
             .{ .hello_random = [_]u8{0x63} ** 32 },
-            testCryptoProvider(),
+            test_provider_storage.init(test_crypto_provider_seed),
             try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
             .record,
         );
@@ -5862,6 +5884,8 @@ test "server ticket emission allocation failures leave transcript and sink clean
 }
 
 test "large emitted ticket is delivered once after fragmented application receives" {
+    var test_provider_storage1: TestProviderStorage = .{};
+    var test_provider_storage2: TestProviderStorage = .{};
     const Capture = struct {
         count: usize = 0,
         psk: [hash_len]u8 = undefined,
@@ -5886,7 +5910,7 @@ test "large emitted ticket is delivered once after fragmented application receiv
 
     var server = Tls13Backend.initServer(
         .{ .hello_random = [_]u8{0x71} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage1.init(test_crypto_provider_seed),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
         .record,
     );
@@ -5896,7 +5920,7 @@ test "large emitted ticket is delivered once after fragmented application receiv
 
     var client = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x73} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage2.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5934,9 +5958,11 @@ test "large emitted ticket is delivered once after fragmented application receiv
 }
 
 test "application reassembler accepts exact maximum ticket and rejects one byte over" {
+    var test_provider_storage1: TestProviderStorage = .{};
+    var test_provider_storage2: TestProviderStorage = .{};
     var client = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x81} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage1.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5955,7 +5981,7 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
 
     var over_client = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x83} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage2.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5971,9 +5997,10 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
 }
 
 test "client cannot emit NewSessionTicket" {
+    var test_provider_storage: TestProviderStorage = .{};
     var client = Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0x91} ** 32 },
-        testCryptoProvider(),
+        test_provider_storage.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5992,10 +6019,12 @@ test "client cannot emit NewSessionTicket" {
 }
 
 test "abandoned backend teardown wipes ephemeral and server identity storage" {
+    var test_provider_storage1: TestProviderStorage = .{};
+    var test_provider_storage2: TestProviderStorage = .{};
     const entropy = Entropy{ .hello_random = [_]u8{0x31} ** 32 };
     var client = Tls13Backend.initClient(
         entropy,
-        testCryptoProvider(),
+        test_provider_storage1.init(test_crypto_provider_seed),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -6009,7 +6038,7 @@ test "abandoned backend teardown wipes ephemeral and server identity storage" {
 
     var server = Tls13Backend.initServer(
         entropy,
-        testCryptoProvider(),
+        test_provider_storage2.init(test_crypto_provider_seed),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
         .record,
     );

@@ -51,14 +51,28 @@ against a forbidden-pattern variant that permits the provider-routed
 `crypto_provider.hkdfExpandLabel(`/`self.provider.hkdfExpandLabel(` calls
 while still blocking the legacy `crypto.tls.hkdfExpandLabel(` spelling — the
 same qualified/bare-call distinction `tls_adapter_zig_forbidden` already
-makes for the QUIC seam. `key_schedule.zig`'s own test block, after a
-`production_only_marker`, is exempt from scanning because it legitimately
-cross-checks the provider-routed Finished `verify_data` derivation against a
-direct `std.crypto.auth.hmac.sha2.HmacSha256` computation and builds raw
-`CryptoProvider` test vtables to prove typed-error propagation — the same
-"test-only direct crypto is not production code" carve-out
-`tls_adapter.zig`'s differential-vector region and `tls_handshake.zig`'s test
-backend already use.
+makes for the QUIC seam. `key_schedule.zig` carries no `production_only_marker`
+and no test-block exemption at all (#490 second review pass): a textual
+"scan only content before this position" boundary is not a sound production/
+test reachability proof, since Zig declarations are order-independent and a
+production declaration positioned before such a marker could still call a
+private helper positioned after it without the scan ever seeing the call —
+the same structural class of bug `test_quic_crypto`'s isolation (described
+below) exists to avoid. `key_schedule.zig`'s direct-crypto test fixtures —
+the cross-check of the provider-routed Finished `verify_data` derivation
+against a direct `std.crypto.auth.hmac.sha2.HmacSha256` computation, and the
+raw `CryptoProvider` test vtables proving typed-error propagation — instead
+live in `src/tls/key_schedule_tests.zig`, a file this tool never scans at
+all, and which is *not* reachable from the production `tls_core` module
+(`src/tls/root.zig`) even transitively: `key_schedule_tests.zig` is compiled
+only as part of a dedicated `key_schedule_test_root_mod` in `build.zig`,
+wired solely into the `test-tls`/`test-crypto`/`test` test artifacts, never
+into `quic_mod`/`exe_mod`/the shipped `tardi` executable. That isolation is
+therefore a Zig compiler property (a production file that tried to `@import`
+`key_schedule_tests.zig` would be a compile error, the same class of
+guarantee `test_quic_crypto`'s module-graph isolation below provides), not a
+scanned convention — the same reason this tool does not scan
+`tests/support/quic_crypto.zig` or `tests/crypto_vectors.zig` either.
 
 Every approved exception is narrow and named (#490 fourth-pass review): a
 specific function/method body or an exact top-level declaration, blanked out

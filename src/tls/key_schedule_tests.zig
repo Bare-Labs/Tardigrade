@@ -20,7 +20,14 @@ const crypto = std.crypto;
 
 const provider = @import("crypto").provider;
 const pure_zig = @import("crypto").pure_zig;
-const key_schedule = @import("key_schedule.zig");
+// Through the named `tls_core` module, not a raw `@import("key_schedule.zig")`
+// file-relative import: this file is compiled as part of its own dedicated
+// test-only module (`key_schedule_test_root_mod` in build.zig, rooted at
+// `key_schedule_test_root.zig`), and Zig does not allow the same on-disk
+// file to belong to two different modules — a raw file import here would
+// otherwise re-claim `key_schedule.zig`, which already belongs to the
+// production `tls_core` module via `src/tls/root.zig`.
+const key_schedule = @import("tls_core").key_schedule;
 
 const KeySchedule = key_schedule.KeySchedule;
 const hash_len = key_schedule.hash_len;
