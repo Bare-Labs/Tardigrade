@@ -38,6 +38,7 @@ const Algorithm = enum {
     chacha20_poly1305,
     x25519,
     ed25519,
+    ecdsa_secp256r1_sha256,
 
     fn name(self: Algorithm) []const u8 {
         return switch (self) {
@@ -46,6 +47,7 @@ const Algorithm = enum {
             .chacha20_poly1305 => "CHACHA20-POLY1305",
             .x25519 => "X25519",
             .ed25519 => "ED25519",
+            .ecdsa_secp256r1_sha256 => "ECDSA-P256-SHA256",
         };
     }
 
@@ -54,7 +56,15 @@ const Algorithm = enum {
             .aes_128_gcm => .aes_128_gcm,
             .aes_256_gcm => .aes_256_gcm,
             .chacha20_poly1305 => .chacha20_poly1305,
-            .x25519, .ed25519 => null,
+            .x25519, .ed25519, .ecdsa_secp256r1_sha256 => null,
+        };
+    }
+
+    fn signatureScheme(self: Algorithm) ?provider.SignatureScheme {
+        return switch (self) {
+            .ed25519 => .ed25519,
+            .ecdsa_secp256r1_sha256 => .ecdsa_secp256r1_sha256,
+            .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305, .x25519 => null,
         };
     }
 };
@@ -420,7 +430,7 @@ fn executeCase(cp: provider.CryptoProvider, suite: Suite, group: Group, case: Ca
     const observed = switch (suite.operation) {
         .aead_open => try executeAeadOpen(cp, suite.algorithm.aead().?, case),
         .derive_shared_secret => try executeX25519(cp, case),
-        .verify => try executeEd25519Verify(cp, case),
+        .verify => try executeVerify(cp, suite.algorithm.signatureScheme().?, case),
     };
     if (observed != expectedObserved(case.expected)) {
         std.debug.print(
@@ -461,8 +471,8 @@ fn executeX25519(cp: provider.CryptoProvider, case: Case) !Observed {
     return .success;
 }
 
-fn executeEd25519Verify(cp: provider.CryptoProvider, case: Case) !Observed {
-    cp.verify(.ed25519, case.public_key, case.message, case.signature) catch |err| {
+fn executeVerify(cp: provider.CryptoProvider, scheme: provider.SignatureScheme, case: Case) !Observed {
+    cp.verify(scheme, case.public_key, case.message, case.signature) catch |err| {
         return try observedFromError(err);
     };
     return .success;
@@ -518,6 +528,7 @@ fn profileAlgorithm(algorithm: Algorithm) profile.Algorithm {
         .chacha20_poly1305 => .{ .aead = .chacha20_poly1305 },
         .x25519 => .{ .group = .x25519 },
         .ed25519 => .{ .signature = .ed25519 },
+        .ecdsa_secp256r1_sha256 => .{ .signature = .ecdsa_secp256r1_sha256 },
     };
 }
 
@@ -533,6 +544,7 @@ fn parseAlgorithm(raw: []const u8) !Algorithm {
     if (std.mem.eql(u8, raw, "CHACHA20-POLY1305")) return .chacha20_poly1305;
     if (std.mem.eql(u8, raw, "X25519")) return .x25519;
     if (std.mem.eql(u8, raw, "ED25519")) return .ed25519;
+    if (std.mem.eql(u8, raw, "ECDSA-P256-SHA256")) return .ecdsa_secp256r1_sha256;
     return error.UnsupportedAlgorithm;
 }
 
@@ -547,7 +559,7 @@ fn validateOperation(algorithm: Algorithm, operation: Operation) !void {
     switch (algorithm) {
         .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305 => if (operation != .aead_open) return error.UnsupportedOperation,
         .x25519 => if (operation != .derive_shared_secret) return error.UnsupportedOperation,
-        .ed25519 => if (operation != .verify) return error.UnsupportedOperation,
+        .ed25519, .ecdsa_secp256r1_sha256 => if (operation != .verify) return error.UnsupportedOperation,
     }
 }
 
@@ -715,8 +727,8 @@ fn maxJsonDepth(input: []const u8) usize {
 test "crypto corpus parser accepts checked-in corpus" {
     var corpus = try parseCorpus(testing.allocator, corpus_bytes, .{});
     defer corpus.deinit();
-    try testing.expectEqual(@as(usize, 5), corpus.suites.len);
-    try testing.expectEqual(@as(usize, 3), corpus.skipped_suites.len);
+    try testing.expectEqual(@as(usize, 6), corpus.suites.len);
+    try testing.expectEqual(@as(usize, 2), corpus.skipped_suites.len);
 }
 
 test "crypto corpus parser rejects bounded failure paths" {
@@ -743,12 +755,12 @@ test "crypto corpus executes through provider and registered manifest" {
     var corpus = try parseCorpus(testing.allocator, corpus_bytes, .{});
     defer corpus.deinit();
     const report = try runCorpus(&corpus);
-    try testing.expectEqual(@as(usize, 5), report.executed_suites);
-    try testing.expectEqual(@as(usize, 11), report.executed_cases);
-    try testing.expectEqual(@as(usize, 5), report.valid);
-    try testing.expectEqual(@as(usize, 5), report.invalid);
+    try testing.expectEqual(@as(usize, 6), report.executed_suites);
+    try testing.expectEqual(@as(usize, 18), report.executed_cases);
+    try testing.expectEqual(@as(usize, 7), report.valid);
+    try testing.expectEqual(@as(usize, 10), report.invalid);
     try testing.expectEqual(@as(usize, 1), report.acceptable);
-    try testing.expectEqual(@as(usize, 3), report.skipped_suites);
+    try testing.expectEqual(@as(usize, 2), report.skipped_suites);
 }
 
 test "crypto corpus validates classification policy through parser" {
@@ -831,9 +843,9 @@ test "crypto corpus manifest rejects algorithm mismatch" {
     corpus.suites[0].algorithm = .chacha20_poly1305;
     try testing.expectError(error.TestUnexpectedResult, validateManifestCoverage(&corpus, .{
         .executed_suites = corpus_manifest.suites.len,
-        .executed_cases = 11,
-        .valid = 5,
-        .invalid = 5,
+        .executed_cases = 18,
+        .valid = 7,
+        .invalid = 10,
         .acceptable = 1,
         .skipped_suites = corpus_manifest.skipped_suites.len,
     }));

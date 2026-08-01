@@ -47,17 +47,18 @@ pub const suites = [_]Suite{
         .source_file = "testvectors_v1/ed25519_test.json",
         .case_count = 2,
     },
+    .{
+        .id = "wycheproof-ecdsa-p256-sha256-verify-reduced",
+        .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 },
+        .source_file = "testvectors_v1/ecdsa_secp256r1_sha256_test.json",
+        .case_count = 7,
+    },
 };
 
 pub const skipped_suites = [_]SkippedSuite{
     .{
         .algorithm = "RSA-PSS",
-        .reason = "Dedicated RSA-PSS project fixtures cover the supported verifier; broad Wycheproof RSA-PSS corpus import remains outside this #374 slice.",
-        .tracking_issue = "#374",
-    },
-    .{
-        .algorithm = "ECDSA-P256-SHA256",
-        .reason = "Supported provider operation, but outside this first merge-sized #374 corpus slice.",
+        .reason = "Permanent waiver: independent strict RSA-PSS coverage (#413 / PR #428, src/crypto/rsa.zig) already exercises RSAPublicKey DER parsing, supported modulus sizes, EMSA-PSS zero-padding validation, and malformed key/signature/wrong-message handling. No Wycheproof RSA-PSS corpus slice is planned.",
         .tracking_issue = "#374",
     },
     .{
