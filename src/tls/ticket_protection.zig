@@ -428,7 +428,12 @@ pub const ReloadableKeyRing = struct {
     mutex: SpinMutex = .{},
     current: ?*Snapshot = null,
     next_generation: u64 = 1,
-    ledger: std.ArrayList(LeaseHighWater) = .empty,
+    // Entries are individually heap-allocated (rather than stored by value in
+    // this list) so that growing the list never copies a `key_fingerprint`
+    // through an intermediate allocation that gets freed unwiped: only the
+    // pointers move, and the fingerprint bytes stay in one stable allocation
+    // until `LeaseHighWater.deinit()` wipes it before the entry is destroyed.
+    ledger: std.ArrayList(*LeaseHighWater) = .empty,
     observer: ?Observer = null,
 
     pub fn init(allocator: std.mem.Allocator) ReloadableKeyRing {
@@ -444,7 +449,10 @@ pub const ReloadableKeyRing = struct {
         self.mutex.unlock();
         if (retired) |snapshot| snapshot.release();
         var mutable_ledger = ledger;
-        for (mutable_ledger.items) |*entry| entry.deinit();
+        for (mutable_ledger.items) |entry| {
+            entry.deinit();
+            self.allocator.destroy(entry);
+        }
         mutable_ledger.deinit(self.allocator);
     }
 
@@ -563,10 +571,10 @@ pub const ReloadableKeyRing = struct {
             var key_fingerprint = fingerprintKey(key.aead, key.key.slice());
             defer secrets.secureZero(&key_fingerprint);
             if (self.findLedger(&key.id)) |entry| {
-                if (entry.aead != key.aead or !std.mem.eql(u8, &entry.key_fingerprint, &key_fingerprint)) return error.DuplicateKeyId;
+                if (entry.aead != key.aead or !secrets.constantTimeEqual(&entry.key_fingerprint, &key_fingerprint)) return error.DuplicateKeyId;
             } else {
-                for (self.ledger.items) |*entry| {
-                    if (entry.aead == key.aead and std.mem.eql(u8, &entry.key_fingerprint, &key_fingerprint)) return error.DuplicateKeyId;
+                for (self.ledger.items) |entry| {
+                    if (entry.aead == key.aead and secrets.constantTimeEqual(&entry.key_fingerprint, &key_fingerprint)) return error.DuplicateKeyId;
                 }
                 new_ledger_entries += 1;
             }
@@ -601,18 +609,25 @@ pub const ReloadableKeyRing = struct {
         for (snapshot.keys) |*key| {
             if (self.findLedgerIndex(&key.id)) |idx| {
                 if (key.nonce_lease) |*lease| {
-                    self.ledger.items[idx].has_lease = true;
-                    self.ledger.items[idx].prefix = lease.prefix;
-                    self.ledger.items[idx].end_exclusive = @max(self.ledger.items[idx].end_exclusive, lease.currentEnd());
+                    const entry = self.ledger.items[idx];
+                    entry.has_lease = true;
+                    entry.prefix = lease.prefix;
+                    entry.end_exclusive = @max(entry.end_exclusive, lease.currentEnd());
                 }
             } else {
-                self.ledger.appendAssumeCapacity(LeaseHighWater.init(key));
+                // `validateReplacementLocked` already reserved pointer-array
+                // capacity for every entry counted here, so only the
+                // individual entry allocation can fail; skip on OOM rather
+                // than leaving the ledger inconsistent post-commit.
+                const entry = self.allocator.create(LeaseHighWater) catch continue;
+                entry.* = LeaseHighWater.init(key);
+                self.ledger.appendAssumeCapacity(entry);
             }
         }
     }
 
     fn findLedger(self: *const ReloadableKeyRing, key_id: *const KeyId) ?*const LeaseHighWater {
-        if (self.findLedgerIndex(key_id)) |idx| return &self.ledger.items[idx];
+        if (self.findLedgerIndex(key_id)) |idx| return self.ledger.items[idx];
         return null;
     }
 
@@ -900,16 +915,7 @@ fn checkedProtectedLen(plaintext_len: usize, limits: session.Limits) SealError!u
 }
 
 fn zeroAndFree(allocator: std.mem.Allocator, buffer: []u8) void {
-    if (buffer.len == 0) return;
-    secrets.secureZero(buffer);
-    // Keep an explicit volatile clear so test allocators that inspect bytes
-    // before free observe deterministic zeroized memory.
-    for (buffer) |*byte| {
-        const volatile_byte: *volatile u8 = @ptrCast(byte);
-        volatile_byte.* = 0;
-    }
-    for (buffer) |byte| std.debug.assert(byte == 0);
-    allocator.rawFree(buffer, .fromByteUnits(@alignOf(u8)), @returnAddress());
+    secrets.secureZeroAndFree(allocator, buffer);
 }
 
 fn ticketExpiresWithinKey(state: *const session.ServerRecoverableState, key_decrypt_until_unix_ms: i64) bool {
@@ -2058,6 +2064,99 @@ test "nonce ledger supports more than fixed live-snapshot rotations" {
         try keyring.install(try keyring.buildSnapshot(&.{config}, testCapabilities()));
     }
     try testing.expectEqual(@as(usize, 70), keyring.ledger.items.len);
+}
+
+test "ledger growth across many installs never leaves a stale fingerprint copy behind" {
+    // Each `LeaseHighWater` is individually heap-allocated and the ledger
+    // stores pointers to them, so growing the pointer array (which this
+    // loop forces several times over) only ever moves pointers, never the
+    // fingerprint bytes themselves. A regression to storing entries by
+    // value in the growable list would leave old, unwiped fingerprint
+    // copies behind at each prior backing allocation.
+    var backing = [_]u8{0xcc} ** (64 * 1024);
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const allocator = fba.allocator();
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+
+    var key_storage: [40][16]u8 = undefined;
+    for (&key_storage, 0..) |*bytes, i| {
+        @memset(bytes, @intCast(i + 1));
+        const config = KeyConfig{
+            .id = keyId(@intCast(i + 100)),
+            .aead = .aes_128_gcm,
+            .key_bytes = bytes,
+            .not_before_unix_ms = 1_000,
+            .encrypt_until_unix_ms = 5_000,
+            .decrypt_until_unix_ms = 20_000,
+            .nonce_lease = .{ .prefix = .{ 9, 0, 0, @intCast(i) }, .start = 0, .end_exclusive = 10 },
+        };
+        try keyring.install(try keyring.buildSnapshot(&.{config}, testCapabilities()));
+    }
+    try testing.expectEqual(@as(usize, 40), keyring.ledger.items.len);
+
+    for (keyring.ledger.items) |entry| {
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, &backing, &entry.key_fingerprint));
+    }
+}
+
+test "ledger fingerprint check catches a mismatch at the first, middle, or last byte" {
+    const allocator = testing.allocator;
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+
+    const retiring_id = keyId(200);
+    var base_key = [_]u8{0xaa} ** 16;
+    const base = KeyConfig{
+        .id = retiring_id,
+        .aead = .aes_128_gcm,
+        .key_bytes = &base_key,
+        .not_before_unix_ms = 1_000,
+        .encrypt_until_unix_ms = 5_000,
+        .decrypt_until_unix_ms = 20_000,
+        .nonce_lease = .{ .prefix = .{ 9, 9, 0, 0 }, .start = 0, .end_exclusive = 10 },
+    };
+    try keyring.install(try keyring.buildSnapshot(&.{base}, testCapabilities()));
+
+    // Rotate `retiring_id` out of the current snapshot entirely, so only
+    // the ledger (not `current.findKey`) remembers its fingerprint.
+    const other = sampleKeyConfig(keyId(201), .aes_128_gcm, .{ .prefix = .{ 9, 9, 1, 0 }, .start = 0, .end_exclusive = 10 });
+    try keyring.install(try keyring.buildSnapshot(&.{other}, testCapabilities()));
+
+    // Each variant replaces `current` outright (a single-key snapshot), so
+    // only the ledger's memory of `retiring_id` — not `current.findKey` —
+    // can be catching the mismatch.
+    const mismatch_positions = [_]usize{ 0, 8, 15 };
+    for (mismatch_positions) |pos| {
+        var variant_key = base_key;
+        variant_key[pos] ^= 0x01;
+        const variant = KeyConfig{
+            .id = retiring_id,
+            .aead = .aes_128_gcm,
+            .key_bytes = &variant_key,
+            .not_before_unix_ms = 1_000,
+            .encrypt_until_unix_ms = 5_000,
+            .decrypt_until_unix_ms = 20_000,
+            .nonce_lease = null,
+        };
+        try testing.expectError(
+            error.DuplicateKeyId,
+            keyring.install(try keyring.buildSnapshot(&.{variant}, testCapabilities())),
+        );
+    }
+
+    // Reasserting the exact same key bytes under the retired id is not a
+    // conflict — only the ledger fingerprint has to agree.
+    const same = KeyConfig{
+        .id = retiring_id,
+        .aead = .aes_128_gcm,
+        .key_bytes = &base_key,
+        .not_before_unix_ms = 1_000,
+        .encrypt_until_unix_ms = 5_000,
+        .decrypt_until_unix_ms = 20_000,
+        .nonce_lease = null,
+    };
+    try keyring.install(try keyring.buildSnapshot(&.{same}, testCapabilities()));
 }
 
 test "invalid issuance limits fail before reserving a nonce" {

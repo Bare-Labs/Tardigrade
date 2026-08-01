@@ -61,7 +61,10 @@ pub fn readSmallFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     defer _ = std.c.close(fd);
 
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
+    errdefer {
+        secrets.secureZero(out.items);
+        out.deinit(allocator);
+    }
     var buf: [4096]u8 = undefined;
     defer secrets.secureZero(&buf);
     while (true) {
@@ -186,6 +189,27 @@ test "PEM certificate chain decoding preserves every certificate block in order"
     try std.testing.expectEqual(@as(usize, 2), chain.len);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x00 }, chain[0]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x01 }, chain[1]);
+}
+
+test "readSmallFile wipes the accumulated buffer when the size limit trips" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const data = try std.testing.allocator.alloc(u8, 256 * 1024 + 4096);
+    defer std.testing.allocator.free(data);
+    @memset(data, 0xab);
+    try tmp.dir.writeFile(io, .{ .sub_path = "big.key", .data = data });
+
+    const path = try tmp.dir.realPathFileAlloc(io, "big.key", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    const backing = try std.testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer std.testing.allocator.free(backing);
+    var fba = std.heap.FixedBufferAllocator.init(backing);
+
+    try std.testing.expectError(error.FileTooBig, readSmallFile(fba.allocator(), path));
+    try std.testing.expect(std.mem.indexOfScalar(u8, backing, 0xab) == null);
 }
 
 test "PEM certificate chain decoding rejects truncated trailing certificate" {

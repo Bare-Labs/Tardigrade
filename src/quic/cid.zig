@@ -654,9 +654,50 @@ test "local registry deinit clears issued entries" {
     _ = try registry.issue(&entropy, 8);
     try testing.expect(registry.activeCount() > 0);
 
+    // Capture raw pointers into the still-populated storage before deinit:
+    // `activeCount() == 0` and `reset_token_key.len == 0` alone would also
+    // pass an implementation that only flips the `?Entry` option tags
+    // without ever touching the token/key payload bytes.
+    var token_ptrs: [max_local_active_cids]?*const [stateless_reset_token_len]u8 = .{null} ** max_local_active_cids;
+    for (&registry.entries, 0..) |*slot, i| {
+        if (slot.*) |*entry| token_ptrs[i] = &entry.stateless_reset_token;
+    }
+    try testing.expect(token_ptrs[0] != null);
+    const key_ptr = &registry.reset_token_key.bytes;
+
     registry.deinit();
     try testing.expectEqual(@as(usize, 0), registry.activeCount());
     try testing.expectEqual(@as(usize, 0), registry.reset_token_key.len);
+    for (token_ptrs) |maybe_ptr| {
+        const ptr = maybe_ptr orelse continue;
+        for (ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    }
+    for (key_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "retire wipes the stateless reset token bytes, not just the entry slot" {
+    var registry = LocalCidRegistry.init(4, [_]u8{0x66} ** 32);
+    defer registry.deinit();
+    _ = try registry.registerInitial(try ConnectionId.init(&.{ 9, 9, 9, 9 }));
+    var entropy = [_]u8{0x77} ** 8;
+    const issued = try registry.issue(&entropy, 8);
+    try registry.markAdvertised(issued.sequence);
+
+    var token_ptr: ?*const [stateless_reset_token_len]u8 = null;
+    for (&registry.entries) |*slot| {
+        if (slot.*) |*entry| {
+            if (entry.sequence == issued.sequence) token_ptr = &entry.stateless_reset_token;
+        }
+    }
+    const token = token_ptr orelse return error.TestUnexpectedResult;
+    var saw_nonzero = false;
+    for (token) |byte| {
+        if (byte != 0) saw_nonzero = true;
+    }
+    try testing.expect(saw_nonzero);
+
+    _ = try registry.retire(.{ .sequence = issued.sequence });
+    for (token) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "peer pool validates NEW_CONNECTION_ID and sweeps retire_prior_to" {

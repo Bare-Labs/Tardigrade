@@ -322,7 +322,9 @@ pub const Runtime = struct {
         var retry_key: [quic.path.token_key_len]u8 = undefined;
         compat.randomBytes(&retry_key);
         runtime.retry_tokens.keys.install(0, retry_key);
+        crypto_pkg.secrets.secureZero(&retry_key);
         compat.randomBytes(&runtime.stateless_reset_key);
+        errdefer runtime.wipeSecrets();
         http3.frame.validateLocallySupportedSettings(runtime.h3_settings) catch return error.InvalidH3Settings;
         runtime.h3_application_compat_len = (http3.early_data.encodeSettingsSnapshot(
             runtime.h3_settings,
@@ -354,7 +356,20 @@ pub const Runtime = struct {
         self.stopping.store(true, .release);
         if (self.thread) |thread| thread.join();
         _ = std.c.close(self.socket_fd);
+        self.wipeSecrets();
         self.* = undefined;
+    }
+
+    /// Wipe the Retry token key ring and the stateless-reset key. Factored
+    /// out of `deinit` (rather than inlined before its trailing
+    /// `self.* = undefined`) so it stays independently callable — including
+    /// from tests, which would otherwise be unable to observe the wipe at
+    /// all: safety-checked builds poison-fill a whole struct on `= undefined`,
+    /// which would overwrite the very zero bytes a post-`deinit` byte-level
+    /// assertion is trying to verify.
+    fn wipeSecrets(self: *Runtime) void {
+        self.retry_tokens.keys.deinit();
+        crypto_pkg.secrets.secureZero(&self.stateless_reset_key);
     }
 
     pub fn snapshot(self: *Runtime) Snapshot {
@@ -2043,6 +2058,45 @@ test "runtime init rejects unsupported local H3 setting h3_datagram" {
 
 test "runtime init rejects unsupported local H3 setting max_field_section_size" {
     try expectInvalidH3SettingsAtRuntimeInit(.{ .max_field_section_size = 1024 });
+}
+
+test "Runtime.deinit wipes the retry token key ring and the stateless reset key" {
+    var logger = logger_mod.Logger.init(.err, "http3-runtime-deinit-wipe-test");
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    // `deinit()` ends with `self.* = undefined`, and safety-checked builds
+    // poison-fill the *whole* struct on that assignment — which would
+    // overwrite our zeroed bytes with poison before a post-`deinit` byte
+    // check ever ran, making the wipe unobservable either way. Call
+    // `wipeSecrets()` (the exact cleanup `deinit()` delegates to) directly
+    // instead, on this real `Runtime.init`-produced key material, and close
+    // the socket by hand since we're bypassing `deinit()`.
+    defer _ = std.c.close(runtime.socket_fd);
+
+    // Capture raw pointers into the still-installed key storage before the
+    // wipe: asserting only that lookups fail afterward would also pass an
+    // implementation that just cleared option tags without ever touching
+    // the key bytes.
+    const key0_ptr: *const [quic.path.token_key_len]u8 = &(runtime.retry_tokens.keys.keys[0].?);
+    const reset_key_ptr = &runtime.stateless_reset_key;
+
+    var saw_key_nonzero = false;
+    for (key0_ptr) |b| {
+        if (b != 0) saw_key_nonzero = true;
+    }
+    try testing.expect(saw_key_nonzero);
+    var saw_reset_nonzero = false;
+    for (reset_key_ptr) |b| {
+        if (b != 0) saw_reset_nonzero = true;
+    }
+    try testing.expect(saw_reset_nonzero);
+
+    runtime.wipeSecrets();
+
+    for (key0_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    for (reset_key_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "admissionAllowed enforces global and per-source caps at the boundary" {

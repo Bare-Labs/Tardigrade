@@ -1110,16 +1110,53 @@ test "retry token survives key rotation while a key is retained" {
     try testing.expectError(error.UnknownTokenKey, tokens.validateRetry(token, loopbackV4(4433), 1_000_000));
 }
 
-test "retry token key ring deinit clears installed keys" {
+test "retry token key ring deinit clears installed keys down to the byte level" {
     var ring = RetryTokenKeyRing{};
     ring.install(0, [_]u8{0x9c} ** token_key_len);
     ring.install(1, [_]u8{0x8d} ** token_key_len);
     try testing.expect(ring.get(0) != null);
     try testing.expect(ring.get(1) != null);
 
+    // Capture raw pointers into the still-installed key storage before
+    // deinit: asserting only `get(id) == null` afterward would also pass an
+    // implementation that just flips the `?[N]u8` option tag without ever
+    // touching the key bytes.
+    const key0_ptr: *const [token_key_len]u8 = &(ring.keys[0].?);
+    const key1_ptr: *const [token_key_len]u8 = &(ring.keys[1].?);
+
     ring.deinit();
     try testing.expect(ring.get(0) == null);
     try testing.expect(ring.get(1) == null);
+    for (key0_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    for (key1_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "retry token key ring retire wipes the retired key, not just its slot tag" {
+    var ring = RetryTokenKeyRing{};
+    defer ring.deinit();
+    ring.install(0, [_]u8{0x9c} ** token_key_len);
+    const key0_ptr: *const [token_key_len]u8 = &(ring.keys[0].?);
+    var saw_nonzero = false;
+    for (key0_ptr) |byte| {
+        if (byte != 0) saw_nonzero = true;
+    }
+    try testing.expect(saw_nonzero);
+
+    ring.retire(0);
+    try testing.expect(ring.get(0) == null);
+    for (key0_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "retry token key ring install wipes a replaced key before the new one takes over" {
+    var ring = RetryTokenKeyRing{};
+    defer ring.deinit();
+    ring.install(0, [_]u8{0xaa} ** token_key_len);
+    const key0_ptr: *const [token_key_len]u8 = &(ring.keys[0].?);
+
+    ring.install(0, [_]u8{0xbb} ** token_key_len);
+    // The old 0xaa key must not survive anywhere in the slot's storage —
+    // only the new key's bytes.
+    for (key0_ptr) |byte| try testing.expectEqual(@as(u8, 0xbb), byte);
 }
 
 test "retry token deterministic boundary matrix rejects malformed public input" {
