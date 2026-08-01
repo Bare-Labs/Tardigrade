@@ -284,7 +284,10 @@ pub const Options = struct {
     initial_address_validated: bool = false,
     /// Process-lifetime stateless reset secret supplied by the runtime. The
     /// transport derives a token for every locally issued CID from this key.
-    stateless_reset_key: [32]u8 = [_]u8{0} ** 32,
+    /// Borrowed rather than taken by value so the caller's owned key is
+    /// never duplicated through this struct or through `Connection.init`'s
+    /// by-value `options` parameter.
+    stateless_reset_key: *const [32]u8 = &([_]u8{0} ** 32),
 };
 
 // ---------------------------------------------------------------------------
@@ -900,7 +903,7 @@ pub const Connection = struct {
                 try config.CidValue.init(retry_source)
             else
                 null,
-            .stateless_reset_key = options.stateless_reset_key,
+            .stateless_reset_key = options.stateless_reset_key.*,
             .peer_cids = quic_cid.PeerCidPool.init(params.active_connection_id_limit),
             .send_queues = std.AutoHashMap(StreamId, *SendQueue).init(allocator),
             .known_streams = std.AutoHashMap(StreamId, void).init(allocator),
@@ -1096,11 +1099,18 @@ pub const Connection = struct {
     pub fn advertiseLocalCid(self: *Connection, cid_value: quic_cid.ConnectionId) error{ CidLimitExceeded, DuplicateCid, OutOfMemory }!void {
         try self.pending_new_connection_ids.ensureUnusedCapacity(self.allocator, 1);
         const registry = if (self.local_cids) |*registry| registry else return error.CidLimitExceeded;
-        const ncid = registry.issueCid(cid_value) catch |err| switch (err) {
-            error.CidLimitExceeded => return error.CidLimitExceeded,
-            error.DuplicateCid => return error.DuplicateCid,
+        // Write the issued frame directly into the reserved queue slot: the
+        // registry entry is the only prior owner of the reset token, so this
+        // is its single copy into caller-owned storage, rather than a
+        // separate local plus a second copy into the queue.
+        const dst = self.pending_new_connection_ids.addOneAssumeCapacity();
+        registry.issueCidInto(cid_value, dst) catch |err| {
+            self.pending_new_connection_ids.shrinkRetainingCapacity(self.pending_new_connection_ids.items.len - 1);
+            switch (err) {
+                error.CidLimitExceeded => return error.CidLimitExceeded,
+                error.DuplicateCid => return error.DuplicateCid,
+            }
         };
-        self.pending_new_connection_ids.appendAssumeCapacity(ncid);
     }
 
     fn setState(self: *Connection, next: State) void {
@@ -1770,7 +1780,7 @@ pub const Connection = struct {
         if (record.carried_new_connection_id) |ncid_value| {
             var ncid = ncid_value;
             defer crypto_secrets.secureZero(&ncid.stateless_reset_token);
-            self.pending_new_connection_ids.append(self.allocator, ncid) catch {};
+            self.queueNewConnectionId(&ncid);
         }
         if (record.carried_path_challenge_path) |path| {
             for (self.candidate_challenges.items) |*candidate| {
@@ -1780,6 +1790,21 @@ pub const Connection = struct {
                 }
             }
         }
+    }
+
+    /// Queue `source` for (re)transmission, deduplicating by sequence.
+    /// `firePto` can requeue the same in-flight sent record more than once
+    /// before it is finally acked or declared lost (it does not remove the
+    /// record it requeues from), so without this guard a repeated PTO would
+    /// append duplicate copies of the same NEW_CONNECTION_ID frame — pushing
+    /// `pending_new_connection_ids` past the capacity `init()` reserves once
+    /// up front and reopening the unwiped-growth path that reservation
+    /// exists to close.
+    fn queueNewConnectionId(self: *Connection, source: *const quic_cid.NewConnectionIdFrame) void {
+        for (self.pending_new_connection_ids.items) |*queued| {
+            if (queued.sequence == source.sequence) return;
+        }
+        self.pending_new_connection_ids.append(self.allocator, source.*) catch {};
     }
 
     fn queueMaxDataUpdate(self: *Connection) void {
@@ -3159,7 +3184,7 @@ pub const Connection = struct {
             // would leave a third, unwiped stack copy of the reset token
             // (beyond the queue's own copy and the one `record` ends up
             // owning) sitting around for the rest of this function.
-            if (frame.encodeNewConnectionId(self.pending_new_connection_ids.items[0], plain[plain_len..budget])) |n| {
+            if (frame.encodeNewConnectionId(&self.pending_new_connection_ids.items[0], plain[plain_len..budget])) |n| {
                 plain_len += n;
                 record.ack_eliciting = true;
                 record.carried_new_connection_id = self.pending_new_connection_ids.items[0];

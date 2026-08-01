@@ -56,24 +56,73 @@ pub fn loadIdentity(
     };
 }
 
+const read_small_file_max_len = 256 * 1024;
+
+/// Reads `path` into a freshly allocated, exactly-sized buffer, bounded by
+/// `read_small_file_max_len`. The file may contain private-key bytes, so
+/// every intermediate allocation this function creates — not just the one it
+/// finally returns — must be wiped before it is freed. `std.ArrayList`'s
+/// grow-and-copy and `toOwnedSlice`'s final move both free a retired
+/// backing allocation through `Allocator.free`, which only `@memset`s it
+/// with `undefined` (a no-op in ReleaseFast); using one for accumulation
+/// would leave earlier chunks of the file recoverable in freed heap memory.
+/// This manages its own growth instead, so every allocation this function
+/// retires is explicitly zeroed via `secrets.secureZeroAndFree` first.
 pub fn readSmallFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{}, 0);
     defer _ = std.c.close(fd);
 
-    var out: std.ArrayList(u8) = .empty;
-    errdefer {
-        secrets.secureZero(out.items);
-        out.deinit(allocator);
-    }
-    var buf: [4096]u8 = undefined;
-    defer secrets.secureZero(&buf);
+    var capacity: usize = 4096;
+    var buf = try allocator.alloc(u8, capacity);
+    errdefer secrets.secureZeroAndFree(allocator, buf);
+    var len: usize = 0;
     while (true) {
-        const n = try std.posix.read(fd, &buf);
+        if (len == capacity) {
+            if (capacity >= read_small_file_max_len) {
+                // Confirm there is really more data before failing: the
+                // file may be exactly `read_small_file_max_len` bytes, in
+                // which case the next read legitimately returns EOF.
+                var probe: [1]u8 = undefined;
+                defer secrets.secureZero(&probe);
+                if (try std.posix.read(fd, &probe) == 0) break;
+                return error.FileTooBig;
+            }
+            const grown = @min(capacity * 2, read_small_file_max_len);
+            buf = try growSecretBuffer(allocator, buf, grown);
+            capacity = grown;
+        }
+        const n = try std.posix.read(fd, buf[len..capacity]);
         if (n == 0) break;
-        if (out.items.len + n > 256 * 1024) return error.FileTooBig;
-        try out.appendSlice(allocator, buf[0..n]);
+        len += n;
     }
-    return out.toOwnedSlice(allocator);
+    return shrinkSecretBufferToExact(allocator, buf, len);
+}
+
+/// Grows `buf` to `new_capacity`, in place when the allocator permits it, or
+/// via copy-then-wipe-then-free of the retired allocation otherwise.
+fn growSecretBuffer(allocator: std.mem.Allocator, buf: []u8, new_capacity: usize) ![]u8 {
+    if (allocator.resize(buf, new_capacity)) return buf.ptr[0..new_capacity];
+    const grown = try allocator.alloc(u8, new_capacity);
+    @memcpy(grown[0..buf.len], buf);
+    secrets.secureZeroAndFree(allocator, buf);
+    return grown;
+}
+
+/// Shrinks `buf` down to its live `len` bytes, in place when the allocator
+/// permits it, or via copy-then-wipe-then-free of the retired allocation
+/// otherwise. This is the buffer's final owner-to-owner transfer, mirroring
+/// what `toOwnedSlice` would otherwise do without wiping.
+fn shrinkSecretBufferToExact(allocator: std.mem.Allocator, buf: []u8, len: usize) ![]u8 {
+    if (buf.len == len) return buf;
+    if (len == 0) {
+        secrets.secureZeroAndFree(allocator, buf);
+        return &.{};
+    }
+    if (allocator.resize(buf, len)) return buf.ptr[0..len];
+    const exact = try allocator.alloc(u8, len);
+    @memcpy(exact, buf[0..len]);
+    secrets.secureZeroAndFree(allocator, buf);
+    return exact;
 }
 
 pub fn derFromPemOrDer(allocator: std.mem.Allocator, raw: []const u8, block_name: []const u8) ![]u8 {
@@ -189,6 +238,92 @@ test "PEM certificate chain decoding preserves every certificate block in order"
     try std.testing.expectEqual(@as(usize, 2), chain.len);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x00 }, chain[0]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x30, 0x03, 0x02, 0x01, 0x01 }, chain[1]);
+}
+
+/// Test-only allocator wrapper that always refuses in-place `resize`,
+/// forcing every grow (and the final shrink-to-exact) through the
+/// alloc-copy-free path. Real allocators sometimes resize in place, which
+/// would let a broken implementation skip the wipe-before-free step
+/// entirely and still pass; this proves the wipe happens even when a move
+/// is unavoidable.
+const ForceMoveAllocator = struct {
+    backing: std.mem.Allocator,
+    moved_allocations: usize = 0,
+    saw_nonzero_at_free: bool = false,
+
+    fn allocator(self: *ForceMoveAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = vtableAlloc,
+        .resize = vtableResize,
+        .remap = vtableRemap,
+        .free = vtableFree,
+    };
+
+    fn vtableAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *ForceMoveAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn vtableResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        const self: *ForceMoveAllocator = @ptrCast(@alignCast(ctx));
+        self.moved_allocations += 1;
+        return false;
+    }
+
+    fn vtableRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        return null;
+    }
+
+    fn vtableFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *ForceMoveAllocator = @ptrCast(@alignCast(ctx));
+        for (memory) |b| {
+            if (b != 0) {
+                self.saw_nonzero_at_free = true;
+                break;
+            }
+        }
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "readSmallFile scrubs every allocation retired during growth, not just the final one" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Larger than the function's initial 4096-byte capacity so at least one
+    // grow-and-copy cycle happens; well under the size cap so the read
+    // succeeds and the buffer's final shrink-to-exact also moves.
+    const data = try std.testing.allocator.alloc(u8, 20 * 1024);
+    defer std.testing.allocator.free(data);
+    @memset(data, 0xcd);
+    try tmp.dir.writeFile(io, .{ .sub_path = "medium.key", .data = data });
+
+    const path = try tmp.dir.realPathFileAlloc(io, "medium.key", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var forced = ForceMoveAllocator{ .backing = std.testing.allocator };
+    const out = try readSmallFile(forced.allocator(), path);
+    defer std.testing.allocator.free(out);
+
+    try std.testing.expectEqualSlices(u8, data, out);
+    // Every grow step and the final shrink asked to resize in place and was
+    // refused, so this only passes if the wipe-then-copy-then-free path ran
+    // more than once.
+    try std.testing.expect(forced.moved_allocations > 1);
+    try std.testing.expect(!forced.saw_nonzero_at_free);
 }
 
 test "readSmallFile wipes the accumulated buffer when the size limit trips" {

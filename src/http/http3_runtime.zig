@@ -338,7 +338,7 @@ pub const Runtime = struct {
         runtime.crypto_provider_state = tls_core.production_crypto.Provider.init(runtime.crypto_provider_entropy.entropy());
         var retry_key: [quic.path.token_key_len]u8 = undefined;
         compat.randomBytes(&retry_key);
-        runtime.secrets.retry_tokens.keys.install(0, retry_key);
+        runtime.secrets.retry_tokens.keys.install(0, &retry_key);
         crypto_pkg.secrets.secureZero(&retry_key);
         compat.randomBytes(&runtime.secrets.stateless_reset_key);
         errdefer runtime.secrets.deinit();
@@ -694,7 +694,7 @@ pub const Runtime = struct {
             .now_us = now,
             .initial_path = .{ .local = self.local_address, .remote = addressFromSockaddrIn(peer) },
             .initial_address_validated = retry_context != null,
-            .stateless_reset_key = self.secrets.stateless_reset_key,
+            .stateless_reset_key = &self.secrets.stateless_reset_key,
             .events = .{ .context = self, .emitFn = quicConnectionEvent },
         }) catch {
             allocator.destroy(backend);
@@ -1678,7 +1678,7 @@ const RuntimeCidHarness = struct {
             .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = self.now_us,
             .initial_path = server_path,
-            .stateless_reset_key = [_]u8{0x44} ** 32,
+            .stateless_reset_key = &([_]u8{0x44} ** 32),
         });
         entry.* = .{
             .backend = server_backend,
