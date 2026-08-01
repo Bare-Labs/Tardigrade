@@ -22,21 +22,43 @@ contract.
 - `wycheproof-chacha20-poly1305-reduced`
 - `wycheproof-x25519-reduced`
 - `wycheproof-ed25519-verify-reduced`
+- `wycheproof-ecdsa-p256-sha256-verify-reduced`
 
-These suites are the first pure-Zig-provider slice for issue `#374`. They cover
-only operations currently supported through the shared provider boundary.
+This is the final executable-coverage set for issue `#374`. It covers every
+provider-routed operation with a Wycheproof-shaped corpus; algorithms that are
+unsupported, provider-deferred, or better covered by dedicated fixtures are
+recorded as explicit waivers below instead of imported.
+
+The ECDSA suite verifies through `.ecdsa_secp256r1_sha256` using the upstream
+group's raw SEC1 `publicKey.uncompressed` value (not SPKI DER/PEM) as
+`publicKey`, and the upstream DER `sig` as `signature`. It covers a canonical
+valid signature, an edge-case public key with trailing-zero coordinates, and
+malformed/non-canonical signature encodings (missing sign-padding zero,
+BER long-form length, truncated length, and out-of-range/zero `r`/`s`) that
+must all resolve to `authentication-failed` without panicking.
 
 ## Skipped Suites
 
-- RSA-PSS: dedicated project fixtures cover the supported verifier; broad
-  Wycheproof corpus import remains outside this `#374` slice.
-- ECDSA-P256-SHA256: supported provider operation, but outside this first
-  merge-sized `#374` corpus slice.
+- RSA-PSS: **permanent waiver**, not unfinished work. Independent strict
+  RSA-PSS coverage (#413 / PR #428, `src/crypto/rsa.zig`) already exercises
+  `RSAPublicKey` DER parsing, exact supported modulus sizes, complete
+  EMSA-PSS zero-padding validation, and malformed key/signature/wrong-message
+  handling. No Wycheproof RSA-PSS corpus slice is planned.
 - X448 and broader asymmetric formats: unsupported by the current provider
-  capability matrix.
+  capability matrix; deferred, not an accidental gap.
 
 Every skipped suite must name a reason and tracking issue in both
 `corpus.json` and `tests/crypto_corpus_manifest.zig`.
+
+## Suites Intentionally Not Covered Here
+
+Unkeyed hashes, HKDF, QUIC header protection, entropy injection, secure zero,
+and constant-time comparison have no executable suite in this corpus. They
+are either not provider-routed corpus inputs (no `CryptoProvider.verify` /
+`aeadOpen` / `deriveSharedSecret` call shape applies) or are already covered
+by their own deterministic vector/unit tests closer to the owning primitive.
+This is a deliberate scope boundary, not a gap: adding a corpus entry for
+these would duplicate coverage without adding assurance.
 
 ## Acceptable Case Policy
 

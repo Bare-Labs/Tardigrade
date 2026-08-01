@@ -91,6 +91,8 @@ const case_registry = [_]CaseMeta{
     .{ .id = "wycheproof-chacha20-poly1305-reduced", .algorithm = .{ .aead = .chacha20_poly1305 }, .providers = pure_zig_only, .class = .negative, .source = "tests/vectors/wycheproof/corpus.json", .license = "Apache-2.0", .reproduction = "zig build test-crypto-corpus" },
     .{ .id = "wycheproof-x25519-reduced", .algorithm = .{ .group = .x25519 }, .providers = pure_zig_only, .class = .negative, .source = "tests/vectors/wycheproof/corpus.json", .license = "Apache-2.0", .reproduction = "zig build test-crypto-corpus" },
     .{ .id = "wycheproof-ed25519-verify-reduced", .algorithm = .{ .signature = .ed25519 }, .providers = pure_zig_only, .class = .negative, .source = "tests/vectors/wycheproof/corpus.json", .license = "Apache-2.0", .reproduction = "zig build test-crypto-corpus" },
+    .{ .id = "wycheproof-ecdsa-p256-sha256-verify-reduced", .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .providers = pure_zig_only, .class = .negative, .source = "tests/vectors/wycheproof/corpus.json", .license = "Apache-2.0", .reproduction = "zig build test-crypto-corpus" },
+    .{ .id = "ecdsa-p256-sha256-wycheproof-tc7-valid", .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .providers = pure_zig_only, .class = .positive, .source = "C2SP Project Wycheproof, testvectors_v1/ecdsa_secp256r1_sha256_test.json, tcId 7, commit fc24cd5b787d8e496bff31b0468af693a652b0f2", .license = "Apache-2.0", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "deterministic-entropy-positive", .algorithm = .{ .entropy = .injected_random_bytes }, .providers = pure_zig_only, .class = .positive, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "secure-zero-positive", .algorithm = .{ .entropy = .secure_zero }, .providers = pure_zig_only, .class = .positive, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "constant-time-compare-positive", .algorithm = .{ .entropy = .constant_time_compare }, .providers = pure_zig_only, .class = .positive, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
@@ -114,7 +116,6 @@ const provider_waivers = [_]ProviderWaiver{
 };
 
 const waivers = [_]Waiver{
-    .{ .provider_kind = .pure_zig, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .reason = "ECDSA verification exists in provider unit tests, but this top-level vector harness does not yet carry an independent DER fixture.", .tracking_issue = "#373" },
     .{ .provider_kind = .pure_zig, .algorithm = .{ .certificate_helper = .der_parser }, .reason = "Certificate parser corpus coverage is owned by PKI stories; this crypto-provider slice does not add X.509 fixtures.", .tracking_issue = "#373" },
     .{ .provider_kind = .pure_zig, .algorithm = .{ .certificate_helper = .chain_builder }, .reason = "Chain building is provider-deferred and covered by future PKI work.", .tracking_issue = "#373" },
     .{ .provider_kind = .pure_zig, .algorithm = .{ .certificate_helper = .webpki_validation }, .reason = "WebPKI validation is provider-deferred and covered by future PKI work.", .tracking_issue = "#373" },
@@ -525,6 +526,12 @@ fn runKeyExchangeAndSignatureVectors(log: *ExecutionLog) !void {
     var bad_signature = ed_signature;
     bad_signature[0] ^= 0x80;
     try testing.expectError(error.AuthenticationFailed, cp.verify(.ed25519, &ed_public, "", &bad_signature));
+
+    _ = try log.execute("ecdsa-p256-sha256-wycheproof-tc7-valid");
+    const ecdsa_public_key = hexBytes("042927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e");
+    const ecdsa_message = hexBytes("313233343030");
+    const ecdsa_signature = hexBytes("304502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db");
+    try cp.verify(.ecdsa_secp256r1_sha256, &ecdsa_public_key, &ecdsa_message, &ecdsa_signature);
 
     _ = try log.execute("rsa-pss-sha256-openssl-2048");
     _ = try log.execute("rsa-pss-sha256-openssl-3072");

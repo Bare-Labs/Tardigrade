@@ -12,17 +12,13 @@
     "AES-256-GCM",
     "CHACHA20-POLY1305",
     "X25519",
-    "ED25519"
+    "ED25519",
+    "ECDSA-P256-SHA256"
   ],
   "skippedSuites": [
     {
       "algorithm": "RSA-PSS",
-      "reason": "Dedicated RSA-PSS project fixtures cover the supported verifier; broad Wycheproof RSA-PSS corpus import remains outside this #374 slice.",
-      "trackingIssue": "#374"
-    },
-    {
-      "algorithm": "ECDSA-P256-SHA256",
-      "reason": "Supported provider operation, but outside this first merge-sized #374 corpus slice.",
+      "reason": "Permanent waiver: independent strict RSA-PSS coverage (#413 / PR #428, src/crypto/rsa.zig) already exercises RSAPublicKey DER parsing, supported modulus sizes, EMSA-PSS zero-padding validation, and malformed key/signature/wrong-message handling. No Wycheproof RSA-PSS corpus slice is planned.",
       "trackingIssue": "#374"
     },
     {
@@ -251,6 +247,103 @@
               "publicKey": "7d4d0e7f6153a69b6242b522abbee685fda4420f8834b108c3bdae369ef549fa",
               "message": "3f",
               "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "wycheproof-ecdsa-p256-sha256-verify-reduced",
+      "algorithm": "ECDSA-P256-SHA256",
+      "operation": "verify",
+      "sourceFile": "testvectors_v1/ecdsa_secp256r1_sha256_test.json",
+      "groups": [
+        {
+          "id": "ecdsa-p256-sha256-verify-group",
+          "upstreamGroupIndex": 1,
+          "cases": [
+            {
+              "id": "ecdsa-p256-sha256-7",
+              "upstreamTcId": 7,
+              "classification": "valid",
+              "expected": "success",
+              "comment": "valid",
+              "flags": ["ValidSignature"],
+              "publicKey": "042927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e",
+              "message": "313233343030",
+              "signature": "304502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db"
+            },
+            {
+              "id": "ecdsa-p256-sha256-6",
+              "upstreamTcId": 6,
+              "classification": "invalid",
+              "expected": "authentication-failed",
+              "comment": "Legacy: ASN encoding of s misses leading 0",
+              "flags": ["MissingZero"],
+              "publicKey": "042927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e",
+              "message": "313233343030",
+              "signature": "304402202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e180220b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db"
+            },
+            {
+              "id": "ecdsa-p256-sha256-8",
+              "upstreamTcId": 8,
+              "classification": "invalid",
+              "expected": "authentication-failed",
+              "comment": "length of sequence [r, s] uses long form encoding",
+              "flags": ["BerEncodedSignature"],
+              "publicKey": "042927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e",
+              "message": "313233343030",
+              "signature": "30814502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db"
+            },
+            {
+              "id": "ecdsa-p256-sha256-33",
+              "upstreamTcId": 33,
+              "classification": "invalid",
+              "expected": "authentication-failed",
+              "comment": "truncated length of sequence [r, s]",
+              "flags": ["InvalidEncoding"],
+              "publicKey": "042927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e",
+              "message": "313233343030",
+              "signature": "3081"
+            },
+            {
+              "id": "ecdsa-p256-sha256-168",
+              "upstreamTcId": 168,
+              "classification": "invalid",
+              "expected": "authentication-failed",
+              "comment": "Signature with special case values r=0 and s=0",
+              "flags": ["InvalidSignature"],
+              "publicKey": "042927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e",
+              "message": "313233343030",
+              "signature": "3006020100020100"
+            },
+            {
+              "id": "ecdsa-p256-sha256-192",
+              "upstreamTcId": 192,
+              "classification": "invalid",
+              "expected": "authentication-failed",
+              "comment": "Signature with special case values r=n and s=0",
+              "flags": ["InvalidSignature"],
+              "publicKey": "042927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e",
+              "message": "313233343030",
+              "signature": "3026022100ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551020100"
+            }
+          ]
+        },
+        {
+          "id": "ecdsa-p256-sha256-edge-public-key-group",
+          "upstreamGroupIndex": 95,
+          "cases": [
+            {
+              "id": "ecdsa-p256-sha256-448",
+              "upstreamTcId": 448,
+              "classification": "valid",
+              "expected": "success",
+              "comment": "x-coordinate of the public key has many trailing 0's",
+              "flags": ["EdgeCasePublicKey"],
+              "publicKey": "044f337ccfd67726a805e4f1600ae2849df3807eca117380239fbd816900000000ed9dea124cc8c396416411e988c30f427eb504af43a3146cd5df7ea60666d685",
+              "message": "4d657373616765",
+              "signature": "3046022100d434e262a49eab7781e353a3565e482550dd0fd5defa013c7f29745eff3569f10221009b0c0a93f267fb6052fd8077be769c2b98953195d7bc10de844218305c6ba17a"
             }
           ]
         }
