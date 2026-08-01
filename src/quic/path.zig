@@ -20,6 +20,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const udp = @import("udp.zig");
+const secrets = @import("crypto_secrets");
 
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 
@@ -133,17 +134,30 @@ pub const RetryTokenKeyRing = struct {
 
     pub fn install(self: *RetryTokenKeyRing, key_id: u8, key: [token_key_len]u8) void {
         std.debug.assert(key_id < max_token_keys);
+        if (self.keys[key_id]) |*slot| secrets.secureZero(slot);
         self.keys[key_id] = key;
         self.current = key_id;
     }
 
     pub fn retire(self: *RetryTokenKeyRing, key_id: u8) void {
-        if (key_id < max_token_keys) self.keys[key_id] = null;
+        if (key_id >= max_token_keys) return;
+        if (self.keys[key_id]) |*slot| secrets.secureZero(slot);
+        self.keys[key_id] = null;
     }
 
-    fn get(self: *const RetryTokenKeyRing, key_id: u8) ?[token_key_len]u8 {
+    pub fn deinit(self: *RetryTokenKeyRing) void {
+        for (&self.keys) |*entry| {
+            if (entry.*) |*slot| secrets.secureZero(slot);
+            entry.* = null;
+        }
+        self.current = 0;
+    }
+
+    fn get(self: *const RetryTokenKeyRing, key_id: u8) ?*const [token_key_len]u8 {
         if (key_id >= max_token_keys) return null;
-        return self.keys[key_id];
+        const entry = &self.keys[key_id];
+        if (entry.*) |*slot| return slot;
+        return null;
     }
 };
 
@@ -196,7 +210,7 @@ pub const RetryTokens = struct {
         @memcpy(out[1..][0..token_nonce_len], &nonce);
         const cipher = out[1 + token_nonce_len ..][0..plaintext_len];
         var tag: [token_tag_len]u8 = undefined;
-        Aes128Gcm.encrypt(cipher, &tag, plaintext[0..plaintext_len], &.{}, nonce, key);
+        Aes128Gcm.encrypt(cipher, &tag, plaintext[0..plaintext_len], &.{}, nonce, key.*);
         @memcpy(out[1 + token_nonce_len + plaintext_len ..][0..token_tag_len], &tag);
         return out[0..total];
     }
@@ -217,7 +231,7 @@ pub const RetryTokens = struct {
         @memcpy(&tag, token[1 + token_nonce_len + plaintext_len ..][0..token_tag_len]);
 
         var plaintext: [token_max_plaintext_len]u8 = undefined;
-        Aes128Gcm.decrypt(plaintext[0..plaintext_len], cipher, tag, &.{}, nonce, key) catch return error.TokenAuthenticationFailed;
+        Aes128Gcm.decrypt(plaintext[0..plaintext_len], cipher, tag, &.{}, nonce, key.*) catch return error.TokenAuthenticationFailed;
 
         const decoded = decodeTokenPlaintext(plaintext[0..plaintext_len]) catch return error.MalformedToken;
         if (decoded.kind != .retry) return error.UnexpectedTokenKind;
@@ -1096,6 +1110,18 @@ test "retry token survives key rotation while a key is retained" {
     try testing.expectError(error.UnknownTokenKey, tokens.validateRetry(token, loopbackV4(4433), 1_000_000));
 }
 
+test "retry token key ring deinit clears installed keys" {
+    var ring = RetryTokenKeyRing{};
+    ring.install(0, [_]u8{0x9c} ** token_key_len);
+    ring.install(1, [_]u8{0x8d} ** token_key_len);
+    try testing.expect(ring.get(0) != null);
+    try testing.expect(ring.get(1) != null);
+
+    ring.deinit();
+    try testing.expect(ring.get(0) == null);
+    try testing.expect(ring.get(1) == null);
+}
+
 test "retry token deterministic boundary matrix rejects malformed public input" {
     var tokens = RetryTokens{ .lifetime_us = 1_000_000 };
     tokens.keys.install(0, [_]u8{0x31} ** token_key_len);
@@ -1206,7 +1232,7 @@ fn sealTokenPlaintextForTest(
     @memcpy(out[1..][0..token_nonce_len], &nonce);
     const cipher = out[1 + token_nonce_len ..][0..plaintext.len];
     var tag: [token_tag_len]u8 = undefined;
-    Aes128Gcm.encrypt(cipher, &tag, plaintext, &.{}, nonce, key);
+    Aes128Gcm.encrypt(cipher, &tag, plaintext, &.{}, nonce, key.*);
     @memcpy(out[1 + token_nonce_len + plaintext.len ..][0..token_tag_len], &tag);
     return out[0..total];
 }

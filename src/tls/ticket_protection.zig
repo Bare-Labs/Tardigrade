@@ -416,6 +416,11 @@ const LeaseHighWater = struct {
             .key_fingerprint = fingerprintKey(record.aead, record.key.slice()),
         };
     }
+
+    fn deinit(self: *LeaseHighWater) void {
+        secrets.secureZero(&self.key_fingerprint);
+        self.* = undefined;
+    }
 };
 
 pub const ReloadableKeyRing = struct {
@@ -439,6 +444,7 @@ pub const ReloadableKeyRing = struct {
         self.mutex.unlock();
         if (retired) |snapshot| snapshot.release();
         var mutable_ledger = ledger;
+        for (mutable_ledger.items) |*entry| entry.deinit();
         mutable_ledger.deinit(self.allocator);
     }
 
@@ -554,7 +560,8 @@ pub const ReloadableKeyRing = struct {
                 if (prior.aead == key.aead and prior.key.eql(&key.key)) return error.DuplicateKeyId;
             }
 
-            const key_fingerprint = fingerprintKey(key.aead, key.key.slice());
+            var key_fingerprint = fingerprintKey(key.aead, key.key.slice());
+            defer secrets.secureZero(&key_fingerprint);
             if (self.findLedger(&key.id)) |entry| {
                 if (entry.aead != key.aead or !std.mem.eql(u8, &entry.key_fingerprint, &key_fingerprint)) return error.DuplicateKeyId;
             } else {
@@ -893,12 +900,15 @@ fn checkedProtectedLen(plaintext_len: usize, limits: session.Limits) SealError!u
 }
 
 fn zeroAndFree(allocator: std.mem.Allocator, buffer: []u8) void {
+    if (buffer.len == 0) return;
+    secrets.secureZero(buffer);
+    // Keep an explicit volatile clear so test allocators that inspect bytes
+    // before free observe deterministic zeroized memory.
     for (buffer) |*byte| {
         const volatile_byte: *volatile u8 = @ptrCast(byte);
         volatile_byte.* = 0;
     }
-    for (buffer) |byte| std.debug.assert(byte == 0);
-    allocator.rawFree(buffer, .fromByteUnits(@alignOf(u8)), @returnAddress());
+    allocator.free(buffer);
 }
 
 fn ticketExpiresWithinKey(state: *const session.ServerRecoverableState, key_decrypt_until_unix_ms: i64) bool {

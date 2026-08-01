@@ -893,7 +893,7 @@ pub const Connection = struct {
         if (options.role == .server) {
             binding.original_destination_connection_id = conn.original_dcid;
             if (conn.retry_scid) |retry_source| binding.retry_source_connection_id = retry_source;
-            binding.stateless_reset_token = quic_cid.statelessResetToken(options.stateless_reset_key, conn.local_cid.slice());
+            binding.stateless_reset_token = quic_cid.statelessResetToken(options.stateless_reset_key[0..], conn.local_cid.slice());
         }
         options.tls.setCidBinding(binding);
 
@@ -959,6 +959,9 @@ pub const Connection = struct {
         self.pending_path_responses.deinit(self.allocator);
         self.candidate_challenges.deinit(self.allocator);
         self.retry_token.deinit(self.allocator);
+        if (self.local_cids) |*registry| registry.deinit();
+        self.local_cids = null;
+        crypto_secrets.secureZero(&self.stateless_reset_key);
     }
 
     pub fn deinit(self: *Connection) void {

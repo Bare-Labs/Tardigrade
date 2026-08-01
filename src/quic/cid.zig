@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const udp = @import("udp.zig");
+const secrets = @import("crypto_secrets");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
@@ -145,17 +146,31 @@ pub const LocalCidRegistry = struct {
     /// min(peer's active_connection_id_limit, local storage bound).
     active_limit: u64,
     /// Static secret for stateless-reset token derivation (RFC 9000 §10.3.1).
-    reset_token_key: [32]u8,
+    reset_token_key: secrets.FixedSecret(32),
     entries: [max_local_active_cids]?Entry = [_]?Entry{null} ** max_local_active_cids,
     next_sequence: u64 = 0,
     largest_advertised_sequence: ?u64 = null,
     metrics: Metrics = .{},
 
     pub fn init(peer_active_connection_id_limit: u64, reset_token_key: [32]u8) LocalCidRegistry {
+        var key = secrets.FixedSecret(32){};
+        key.replace(&reset_token_key) catch unreachable;
         return .{
             .active_limit = @min(peer_active_connection_id_limit, max_local_active_cids),
-            .reset_token_key = reset_token_key,
+            .reset_token_key = key,
         };
+    }
+
+    pub fn deinit(self: *LocalCidRegistry) void {
+        for (&self.entries) |*slot| {
+            if (slot.*) |*entry| {
+                secrets.secureZero(&entry.stateless_reset_token);
+            }
+            slot.* = null;
+        }
+        self.reset_token_key.deinit();
+        self.next_sequence = 0;
+        self.largest_advertised_sequence = null;
     }
 
     /// Register the CID chosen during the handshake as sequence 0
@@ -205,7 +220,7 @@ pub const LocalCidRegistry = struct {
         const entry = Entry{
             .sequence = self.next_sequence,
             .cid = cid,
-            .stateless_reset_token = statelessResetToken(self.reset_token_key, cid.slice()),
+            .stateless_reset_token = statelessResetToken(self.reset_token_key.slice(), cid.slice()),
         };
         slot.* = entry;
         self.next_sequence += 1;
@@ -223,6 +238,7 @@ pub const LocalCidRegistry = struct {
             const entry = &(slot.* orelse continue);
             if (entry.sequence != frame.sequence) continue;
             const cid = entry.cid;
+            secrets.secureZero(&entry.stateless_reset_token);
             slot.* = null;
             self.metrics.local_cids_retired += 1;
             return cid;
@@ -436,10 +452,13 @@ pub const stateless_reset_token_len = 16;
 /// static server key (RFC 9000 §10.3.1). The token is the first 16 bytes of
 /// HMAC-SHA256(static_key, connection_id); it MUST be hard to guess, so the
 /// static key must be secret and stable across the connection's lifetime.
-pub fn statelessResetToken(static_key: [32]u8, connection_id: []const u8) [stateless_reset_token_len]u8 {
+pub fn statelessResetToken(static_key: []const u8, connection_id: []const u8) [stateless_reset_token_len]u8 {
     var mac: [HmacSha256.mac_length]u8 = undefined;
-    HmacSha256.create(&mac, connection_id, &static_key);
-    return mac[0..stateless_reset_token_len].*;
+    defer secrets.secureZero(&mac);
+    HmacSha256.create(&mac, connection_id, static_key);
+    var token: [stateless_reset_token_len]u8 = undefined;
+    @memcpy(&token, mac[0..stateless_reset_token_len]);
+    return token;
 }
 
 /// Emission rules and packet construction for stateless resets (RFC 9000 §10.3).
@@ -491,15 +510,15 @@ test "stateless reset token is a stable function of the connection ID" {
     const key = [_]u8{0xab} ** 32;
     const cid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
 
-    const token = statelessResetToken(key, &cid);
+    const token = statelessResetToken(key[0..], &cid);
     // Deterministic for a given key + CID.
-    try testing.expectEqualSlices(u8, &token, &statelessResetToken(key, &cid));
+    try testing.expectEqualSlices(u8, &token, &statelessResetToken(key[0..], &cid));
 
     // A different CID or key yields a different token.
     const other_cid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x09 };
-    try testing.expect(!std.mem.eql(u8, &token, &statelessResetToken(key, &other_cid)));
+    try testing.expect(!std.mem.eql(u8, &token, &statelessResetToken(key[0..], &other_cid)));
     const other_key = [_]u8{0xcd} ** 32;
-    try testing.expect(!std.mem.eql(u8, &token, &statelessResetToken(other_key, &cid)));
+    try testing.expect(!std.mem.eql(u8, &token, &statelessResetToken(other_key[0..], &cid)));
 }
 
 test "stateless reset is only emitted for packets large enough to answer safely" {
@@ -618,7 +637,7 @@ test "local registry enforces the peer's active CID limit and derives reset toke
     const issued = try registry.issue(&entropy, 8);
     try registry.markAdvertised(issued.sequence);
     // The frame's token matches the RFC 9000 §10.3.1 derivation for the CID.
-    try testing.expectEqualSlices(u8, &statelessResetToken(key, issued.cid.slice()), &issued.stateless_reset_token);
+    try testing.expectEqualSlices(u8, &statelessResetToken(key[0..], issued.cid.slice()), &issued.stateless_reset_token);
 
     // Limit of 2 is reached: further issuance must fail until one retires.
     var more_entropy = [_]u8{0x30} ** 8;
@@ -626,6 +645,18 @@ test "local registry enforces the peer's active CID limit and derives reset toke
     _ = try registry.retire(.{ .sequence = issued.sequence });
     _ = try registry.issue(&more_entropy, 8);
     try testing.expectEqual(@as(usize, 2), registry.activeCount());
+}
+
+test "local registry deinit clears issued entries" {
+    var registry = LocalCidRegistry.init(4, [_]u8{0x55} ** 32);
+    _ = try registry.registerInitial(try ConnectionId.init(&.{ 1, 2, 3, 4 }));
+    var entropy = [_]u8{0x42} ** 8;
+    _ = try registry.issue(&entropy, 8);
+    try testing.expect(registry.activeCount() > 0);
+
+    registry.deinit();
+    try testing.expectEqual(@as(usize, 0), registry.activeCount());
+    try testing.expectEqual(@as(usize, 0), registry.reset_token_key.len);
 }
 
 test "peer pool validates NEW_CONNECTION_ID and sweeps retire_prior_to" {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const credentials = @import("credentials.zig");
+const secrets = @import("crypto_secrets");
 
 pub const LoadedIdentity = struct {
     allocator: std.mem.Allocator,
@@ -8,12 +9,15 @@ pub const LoadedIdentity = struct {
     identity: credentials.Identity,
 
     pub fn deinit(self: *LoadedIdentity) void {
-        std.crypto.secureZero(u8, std.mem.asBytes(&self.identity.key));
+        secrets.secureZero(std.mem.asBytes(&self.identity.key));
         for (self.cert_chain) |cert_der| {
             if (cert_der.len > 0) self.allocator.free(cert_der);
         }
         if (self.cert_chain.len > 0) self.allocator.free(self.cert_chain);
-        if (self.key_der.len > 0) self.allocator.free(self.key_der);
+        if (self.key_der.len > 0) {
+            secrets.secureZero(self.key_der);
+            self.allocator.free(self.key_der);
+        }
         self.* = undefined;
     }
 };
@@ -24,14 +28,23 @@ pub fn loadIdentity(
     key_path: []const u8,
 ) !LoadedIdentity {
     const cert_raw = try readSmallFile(allocator, cert_path);
-    defer allocator.free(cert_raw);
+    defer {
+        secrets.secureZero(cert_raw);
+        allocator.free(cert_raw);
+    }
     const key_raw = try readSmallFile(allocator, key_path);
-    defer allocator.free(key_raw);
+    defer {
+        secrets.secureZero(key_raw);
+        allocator.free(key_raw);
+    }
 
     const cert_chain = try certChainFromPemOrDer(allocator, cert_raw);
     errdefer freeCertChain(allocator, cert_chain);
     const key_der = try keyDerFromPemOrDer(allocator, key_raw);
-    errdefer allocator.free(key_der);
+    errdefer {
+        secrets.secureZero(key_der);
+        allocator.free(key_der);
+    }
 
     if (cert_chain.len == 0) return error.PemBlockNotFound;
     const identity = try credentials.Identity.initPkcs8(cert_chain[0], key_der);
@@ -50,6 +63,7 @@ pub fn readSmallFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var buf: [4096]u8 = undefined;
+    defer secrets.secureZero(&buf);
     while (true) {
         const n = try std.posix.read(fd, &buf);
         if (n == 0) break;
@@ -121,7 +135,10 @@ fn pemBlockToDerFrom(allocator: std.mem.Allocator, pem: []const u8, block_name: 
     const body = pem[body_start..end_at];
 
     var compact = try allocator.alloc(u8, body.len);
-    defer allocator.free(compact);
+    defer {
+        secrets.secureZero(compact);
+        allocator.free(compact);
+    }
     var len: usize = 0;
     for (body) |char| {
         if (char == '\n' or char == '\r' or char == ' ' or char == '\t') continue;
@@ -131,7 +148,10 @@ fn pemBlockToDerFrom(allocator: std.mem.Allocator, pem: []const u8, block_name: 
     const decoder = std.base64.standard.Decoder;
     const der_len = try decoder.calcSizeForSlice(compact[0..len]);
     const der = try allocator.alloc(u8, der_len);
-    errdefer allocator.free(der);
+    errdefer {
+        secrets.secureZero(der);
+        allocator.free(der);
+    }
     try decoder.decode(der, compact[0..len]);
     return der;
 }
