@@ -231,7 +231,9 @@ static int cmd_ecdsa_p256_verify(int argc, char **argv) {
     EVP_MD_CTX_free(ctx);
     EVP_PKEY_free(key);
     if (!ok) return status("oracle_error");
-    return status(result == 1 ? "ok" : "auth_fail");
+    if (result == 1) return status("ok");
+    if (result == 0) return status("auth_fail");
+    return status("malformed");
 }
 
 int main(int argc, char **argv) {

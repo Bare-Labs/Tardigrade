@@ -19,6 +19,10 @@ const pure_zig = crypto_pkg.pure_zig;
 const X25519 = std.crypto.dh.X25519;
 const Ed25519 = std.crypto.sign.Ed25519;
 
+const evp_oracle_max_input = 4096;
+const evp_oracle_stdout_limit = 2 * evp_oracle_max_input + 128;
+const evp_oracle_stderr_limit = 1024;
+
 const OpenSslError = error{
     MissingOpenSslKdfOracle,
     OpenSslOracleFailed,
@@ -196,16 +200,11 @@ fn evpStatus(raw: []const u8) ?EvpStatus {
     return null;
 }
 
-fn runEvpOracleRaw(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
-    var argv = try allocator.alloc([]const u8, args.len + 1);
-    defer allocator.free(argv);
-    argv[0] = diff_options.evp_oracle_path;
-    for (args, 0..) |arg, i| argv[i + 1] = arg;
-
+fn runBoundedChildRaw(allocator: std.mem.Allocator, argv: []const []const u8, stdout_limit: std.Io.Limit, stderr_limit: std.Io.Limit) ![]u8 {
     const result = try std.process.run(allocator, compat.io(), .{
         .argv = argv,
-        .stdout_limit = .limited(8 * 1024),
-        .stderr_limit = .limited(1024),
+        .stdout_limit = stdout_limit,
+        .stderr_limit = stderr_limit,
     });
     defer allocator.free(result.stderr);
 
@@ -214,9 +213,17 @@ fn runEvpOracleRaw(allocator: std.mem.Allocator, args: []const []const u8) ![]u8
         else => {},
     }
 
-    std.debug.print("EVP oracle process failed; stderr: {s}\n", .{result.stderr});
+    if (result.stderr.len > 0) std.debug.print("EVP oracle process failed; stderr: {s}\n", .{result.stderr});
     allocator.free(result.stdout);
     return error.EvpOracleFailed;
+}
+
+fn runEvpOracleRaw(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
+    var argv = try allocator.alloc([]const u8, args.len + 1);
+    defer allocator.free(argv);
+    argv[0] = diff_options.evp_oracle_path;
+    for (args, 0..) |arg, i| argv[i + 1] = arg;
+    return runBoundedChildRaw(allocator, argv, .limited(evp_oracle_stdout_limit), .limited(evp_oracle_stderr_limit));
 }
 
 fn runEvpOracle(allocator: std.mem.Allocator, args: []const []const u8) !EvpOracleResult {
@@ -561,7 +568,7 @@ fn runEcdsaP256VerifyNegative(allocator: std.mem.Allocator) !void {
     try testing.expectError(error.AuthenticationFailed, cp.verify(.ecdsa_secp256r1_sha256, &public_key, &message, &malformed_sig));
     var malformed_sig_oracle = try runEvpEcdsaP256Verify(allocator, &public_key, &message, &malformed_sig);
     defer malformed_sig_oracle.deinit(allocator);
-    try expectEvpStatus(&malformed_sig_oracle, .auth_fail);
+    try expectEvpStatus(&malformed_sig_oracle, .malformed);
 }
 
 fn tlsHkdfLabel(allocator: std.mem.Allocator, out_len: usize, label: []const u8, context: []const u8) ![]u8 {
@@ -1182,6 +1189,43 @@ fn runTranscriptAndFinished(allocator: std.mem.Allocator) !void {
 
 test "OpenSSL digest and HMAC oracles match transcript and Finished values" {
     try runTranscriptAndFinished(testing.allocator);
+}
+
+test "EVP oracle harness accepts maximum AEAD seal response" {
+    const allocator = testing.allocator;
+    const key = [_]u8{0x5a} ** 16;
+    const nonce = hexBytes("202122232425262728292a2b");
+    const aad = "max-aead-boundary";
+    const plaintext = try allocator.alloc(u8, evp_oracle_max_input);
+    defer allocator.free(plaintext);
+    @memset(plaintext, 0x7b);
+
+    var sealed = try runEvpAeadSeal(allocator, .aes_128_gcm, &key, &nonce, aad, plaintext);
+    defer sealed.deinit(allocator);
+    try expectEvpStatus(&sealed, .ok);
+    try testing.expectEqual(@as(usize, evp_oracle_max_input), sealed.fields[0].?.len);
+    try testing.expectEqual(@as(usize, provider.aead_tag_len), sealed.fields[1].?.len);
+}
+
+test "EVP oracle harness classifies child process termination and output caps" {
+    const allocator = testing.allocator;
+
+    try testing.expectError(
+        error.EvpOracleFailed,
+        runBoundedChildRaw(allocator, &.{ "/bin/sh", "-c", "exit 7" }, .limited(evp_oracle_stdout_limit), .limited(evp_oracle_stderr_limit)),
+    );
+    try testing.expectError(
+        error.EvpOracleFailed,
+        runBoundedChildRaw(allocator, &.{ "/bin/sh", "-c", "kill -TERM $$" }, .limited(evp_oracle_stdout_limit), .limited(evp_oracle_stderr_limit)),
+    );
+    try testing.expectError(
+        error.StreamTooLong,
+        runBoundedChildRaw(allocator, &.{ "/bin/sh", "-c", "printf 123456" }, .limited(4), .limited(evp_oracle_stderr_limit)),
+    );
+    try testing.expectError(
+        error.StreamTooLong,
+        runBoundedChildRaw(allocator, &.{ "/bin/sh", "-c", "printf 123456 >&2" }, .limited(evp_oracle_stdout_limit), .limited(4)),
+    );
 }
 
 test "OpenSSL differential coverage registry has explicit coverage or waivers" {
