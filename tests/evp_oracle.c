@@ -1,5 +1,6 @@
 #include <openssl/evp.h>
 #include <openssl/ec.h>
+#include <openssl/bn.h>
 #include <openssl/obj_mac.h>
 #include <stdio.h>
 #include <string.h>
@@ -202,6 +203,72 @@ static int cmd_ed25519_verify(int argc, char **argv) {
     return status(result == 1 ? "ok" : "auth_fail");
 }
 
+static EVP_PKEY *ecdsa_p256_private_from_scalar(
+    const unsigned char *scalar,
+    size_t scalar_len,
+    unsigned char *pub,
+    size_t *pub_len
+) {
+    if (scalar_len != 32) return NULL;
+    EC_KEY *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    if (ec == NULL) return NULL;
+    const EC_GROUP *group = EC_KEY_get0_group(ec);
+    BIGNUM *priv = BN_bin2bn(scalar, (int)scalar_len, NULL);
+    EC_POINT *point = group == NULL ? NULL : EC_POINT_new(group);
+    if (priv == NULL ||
+        point == NULL ||
+        BN_is_zero(priv) ||
+        EC_KEY_set_private_key(ec, priv) != 1 ||
+        EC_POINT_mul(group, point, priv, NULL, NULL, NULL) != 1 ||
+        EC_KEY_set_public_key(ec, point) != 1) {
+        BN_clear_free(priv);
+        EC_POINT_free(point);
+        EC_KEY_free(ec);
+        return NULL;
+    }
+    *pub_len = EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED, pub, *pub_len, NULL);
+    BN_clear_free(priv);
+    EC_POINT_free(point);
+    if (*pub_len != 65) {
+        EC_KEY_free(ec);
+        return NULL;
+    }
+    EVP_PKEY *key = EVP_PKEY_new();
+    if (key == NULL || EVP_PKEY_assign_EC_KEY(key, ec) != 1) {
+        EVP_PKEY_free(key);
+        EC_KEY_free(ec);
+        return NULL;
+    }
+    return key;
+}
+
+static int cmd_ecdsa_p256_sign(int argc, char **argv) {
+    if (argc != 4) return status("malformed");
+    Blob scalar, message;
+    if (!parse_hex(argv[2], &scalar) || !parse_hex(argv[3], &message) || scalar.len != 32) {
+        return status("malformed");
+    }
+    unsigned char pub[65];
+    size_t pub_len = sizeof(pub);
+    EVP_PKEY *key = ecdsa_p256_private_from_scalar(scalar.bytes, scalar.len, pub, &pub_len);
+    if (key == NULL) return status("malformed");
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    unsigned char sig[128];
+    size_t sig_len = sizeof(sig);
+    int ok = ctx != NULL &&
+        EVP_DigestSignInit(ctx, NULL, EVP_sha256(), NULL, key) == 1 &&
+        EVP_DigestSign(ctx, sig, &sig_len, message.bytes, message.len) == 1;
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(key);
+    if (!ok) return status("oracle_error");
+    fputs("ok ", stdout);
+    print_hex(sig, sig_len);
+    putchar(' ');
+    print_hex(pub, pub_len);
+    putchar('\n');
+    return 0;
+}
+
 static int cmd_ecdsa_p256_verify(int argc, char **argv) {
     if (argc != 5) return status("malformed");
     Blob pub, message, sig;
@@ -243,6 +310,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "x25519") == 0) return cmd_x25519(argc, argv);
     if (strcmp(argv[1], "ed25519-sign") == 0) return cmd_ed25519_sign(argc, argv);
     if (strcmp(argv[1], "ed25519-verify") == 0) return cmd_ed25519_verify(argc, argv);
+    if (strcmp(argv[1], "ecdsa-p256-sign") == 0) return cmd_ecdsa_p256_sign(argc, argv);
     if (strcmp(argv[1], "ecdsa-p256-verify") == 0) return cmd_ecdsa_p256_verify(argc, argv);
     return status("malformed");
 }
