@@ -406,20 +406,44 @@ const LeaseHighWater = struct {
     aead: provider.Aead,
     key_fingerprint: KeyFingerprint,
 
-    fn init(record: *const KeyRecord) LeaseHighWater {
-        return .{
-            .key_id = record.id,
-            .prefix = if (record.nonce_lease) |*value| value.prefix else [_]u8{0} ** 4,
-            .end_exclusive = if (record.nonce_lease) |*value| value.currentEnd() else 0,
-            .has_lease = record.nonce_lease != null,
-            .aead = record.aead,
-            .key_fingerprint = fingerprintKey(record.aead, record.key.slice()),
-        };
+    /// Initialize `out` in place rather than returning a `LeaseHighWater` by
+    /// value: a return-by-value constructor would copy the fingerprint
+    /// through an unwiped stack temporary as part of copying the whole
+    /// struct into its final (heap-allocated) home. The one remaining
+    /// fingerprint temporary here is explicitly wiped once copied in.
+    fn initInto(out: *LeaseHighWater, record: *const KeyRecord) void {
+        out.key_id = record.id;
+        out.prefix = if (record.nonce_lease) |*value| value.prefix else [_]u8{0} ** 4;
+        out.end_exclusive = if (record.nonce_lease) |*value| value.currentEnd() else 0;
+        out.has_lease = record.nonce_lease != null;
+        out.aead = record.aead;
+        var fingerprint = fingerprintKey(record.aead, record.key.slice());
+        defer secrets.secureZero(&fingerprint);
+        out.key_fingerprint = fingerprint;
     }
 
     fn deinit(self: *LeaseHighWater) void {
         secrets.secureZero(&self.key_fingerprint);
         self.* = undefined;
+    }
+};
+
+/// Entries allocated while validating a replacement snapshot, held here
+/// until the whole validation pass succeeds. `validateReplacementLocked`
+/// allocates every ledger entry a replacement needs *before* `install()`
+/// mutates `self.current`, so an allocation failure anywhere in validation
+/// rejects the whole install — it can no longer commit a key while silently
+/// omitting its ledger fingerprint/nonce high-water mark.
+const PendingLedgerEntries = struct {
+    entries: [max_keys]*LeaseHighWater = undefined,
+    count: usize = 0,
+
+    fn destroyAll(self: *PendingLedgerEntries, allocator: std.mem.Allocator) void {
+        for (self.entries[0..self.count]) |entry| {
+            entry.deinit();
+            allocator.destroy(entry);
+        }
+        self.count = 0;
     }
 };
 
@@ -494,7 +518,8 @@ pub const ReloadableKeyRing = struct {
             return error.GenerationOverflow;
         }
 
-        self.validateReplacementLocked(replacement) catch |err| {
+        var pending: PendingLedgerEntries = .{};
+        self.validateReplacementLocked(replacement, &pending) catch |err| {
             self.mutex.unlock();
             replacement.release();
             self.record(.{ .snapshot_rejected = snapshotReason(err) });
@@ -503,6 +528,7 @@ pub const ReloadableKeyRing = struct {
         if (replacement.generation == 0) {
             if (self.next_generation == std.math.maxInt(u64)) {
                 self.mutex.unlock();
+                pending.destroyAll(self.allocator);
                 replacement.release();
                 self.record(.{ .snapshot_rejected = .generation_overflow });
                 return error.GenerationOverflow;
@@ -516,7 +542,9 @@ pub const ReloadableKeyRing = struct {
         const retired_key_count = if (retired) |snapshot| retiredKeyCount(snapshot, replacement) else 0;
         self.current = replacement;
         self.next_generation = @max(self.next_generation, replacement.generation + 1);
-        self.updateLedgerLocked(replacement);
+        // Every entry `updateLedgerLocked` needs was already allocated (and
+        // validated) above, so publication from here on is infallible.
+        self.updateLedgerLocked(replacement, &pending);
         self.mutex.unlock();
 
         self.record(.{ .snapshot_installed = installed_generation });
@@ -540,7 +568,13 @@ pub const ReloadableKeyRing = struct {
             self.record(.{ .snapshot_rejected = .generation_overflow });
             return error.GenerationOverflow;
         }
-        self.validateReplacementLocked(replacement) catch |err| {
+        // This is a dry run — it never installs `replacement` — so any
+        // ledger entries `validateReplacementLocked` allocates for it must
+        // be destroyed here regardless of outcome; nothing else will ever
+        // consume them.
+        var pending: PendingLedgerEntries = .{};
+        defer pending.destroyAll(self.allocator);
+        self.validateReplacementLocked(replacement, &pending) catch |err| {
             self.mutex.unlock();
             self.record(.{ .snapshot_rejected = snapshotReason(err) });
             return err;
@@ -561,8 +595,8 @@ pub const ReloadableKeyRing = struct {
         return snapshot;
     }
 
-    fn validateReplacementLocked(self: *ReloadableKeyRing, replacement: *Snapshot) SnapshotError!void {
-        var new_ledger_entries: usize = 0;
+    fn validateReplacementLocked(self: *ReloadableKeyRing, replacement: *Snapshot, pending: *PendingLedgerEntries) SnapshotError!void {
+        errdefer pending.destroyAll(self.allocator);
         for (replacement.keys, 0..) |*key, i| {
             for (replacement.keys[0..i]) |*prior| {
                 if (prior.aead == key.aead and prior.key.eql(&key.key)) return error.DuplicateKeyId;
@@ -573,10 +607,22 @@ pub const ReloadableKeyRing = struct {
             if (self.findLedger(&key.id)) |entry| {
                 if (entry.aead != key.aead or !secrets.constantTimeEqual(&entry.key_fingerprint, &key_fingerprint)) return error.DuplicateKeyId;
             } else {
+                var duplicate = false;
                 for (self.ledger.items) |entry| {
-                    if (entry.aead == key.aead and secrets.constantTimeEqual(&entry.key_fingerprint, &key_fingerprint)) return error.DuplicateKeyId;
+                    if (entry.aead == key.aead and secrets.constantTimeEqual(&entry.key_fingerprint, &key_fingerprint)) {
+                        duplicate = true;
+                        break;
+                    }
                 }
-                new_ledger_entries += 1;
+                if (duplicate) return error.DuplicateKeyId;
+                // Allocate and initialize the entry now, before any state is
+                // committed: if this fails, the whole install is rejected
+                // rather than later silently omitting this key's ledger
+                // fingerprint after `self.current` has already moved.
+                const entry = self.allocator.create(LeaseHighWater) catch return error.OutOfMemory;
+                LeaseHighWater.initInto(entry, key);
+                pending.entries[pending.count] = entry;
+                pending.count += 1;
             }
 
             if (key.nonce_lease) |*lease| {
@@ -602,10 +648,16 @@ pub const ReloadableKeyRing = struct {
                 }
             }
         }
-        self.ledger.ensureUnusedCapacity(self.allocator, new_ledger_entries) catch return error.OutOfMemory;
+        self.ledger.ensureUnusedCapacity(self.allocator, pending.count) catch return error.OutOfMemory;
     }
 
-    fn updateLedgerLocked(self: *ReloadableKeyRing, snapshot: *Snapshot) void {
+    /// Publish `pending`'s entries into the ledger. Every entry this needs
+    /// was already allocated and validated by `validateReplacementLocked`
+    /// (which reserved ledger pointer-array capacity for exactly
+    /// `pending.count` entries too), so this cannot fail — publication after
+    /// `self.current` has moved must be infallible.
+    fn updateLedgerLocked(self: *ReloadableKeyRing, snapshot: *Snapshot, pending: *PendingLedgerEntries) void {
+        var pending_idx: usize = 0;
         for (snapshot.keys) |*key| {
             if (self.findLedgerIndex(&key.id)) |idx| {
                 if (key.nonce_lease) |*lease| {
@@ -615,15 +667,13 @@ pub const ReloadableKeyRing = struct {
                     entry.end_exclusive = @max(entry.end_exclusive, lease.currentEnd());
                 }
             } else {
-                // `validateReplacementLocked` already reserved pointer-array
-                // capacity for every entry counted here, so only the
-                // individual entry allocation can fail; skip on OOM rather
-                // than leaving the ledger inconsistent post-commit.
-                const entry = self.allocator.create(LeaseHighWater) catch continue;
-                entry.* = LeaseHighWater.init(key);
+                const entry = pending.entries[pending_idx];
+                pending_idx += 1;
                 self.ledger.appendAssumeCapacity(entry);
             }
         }
+        // Ownership of every entry moved into `self.ledger` above.
+        pending.count = 0;
     }
 
     fn findLedger(self: *const ReloadableKeyRing, key_id: *const KeyId) ?*const LeaseHighWater {

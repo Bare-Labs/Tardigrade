@@ -734,27 +734,31 @@ fn wipeSentRecordTokens(records: []SentRecord) void {
 }
 
 /// `std.ArrayList.swapRemove` moves the last live element into the removed
-/// slot but only assigns `undefined` (a no-op at runtime, not a real write)
-/// to the vacated tail slot, so a byte-for-byte duplicate of whatever
-/// occupied that tail position survives at `items.ptr[items.len]` — within
-/// the backing allocation, just past the shrunk `.items` slice — until the
-/// allocator reuses it. Call this immediately after every
-/// `sent_records.swapRemove(...)` to scrub that residue.
+/// slot, then assigns `undefined` to the vacated tail slot — which is a
+/// real poison-fill in safety-checked builds (not a no-op) and may be no
+/// write at all in `ReleaseFast`. Either way, that slot is no longer a
+/// validly-typed `SentRecord`: its optional tags may be garbage. Call this
+/// immediately after every `sent_records.swapRemove(...)` — it scrubs the
+/// vacated slot as raw bytes only, never interpreting any field, so it
+/// cannot read an undefined optional tag the way pattern-matching
+/// `carried_new_connection_id` on that slot would. Callers must wipe the
+/// *live* element's own token (via `wipeSentRecordToken`) before calling
+/// `swapRemove`, since this only cleans up the residue the swap leaves
+/// behind, not the record being removed.
 fn wipeSentRecordsSwapRemoveResidue(records: *std.ArrayList(SentRecord)) void {
-    wipeSentRecordToken(&records.allocatedSlice()[records.items.len]);
+    crypto_secrets.secureZero(std.mem.asBytes(&records.allocatedSlice()[records.items.len]));
 }
 
 fn wipePendingNewConnectionIdTokens(frames: []quic_cid.NewConnectionIdFrame) void {
     for (frames) |*ncid| crypto_secrets.secureZero(&ncid.stateless_reset_token);
 }
 
-/// Same residue as `wipeSentRecordsSwapRemoveResidue`, but for
-/// `pending_new_connection_ids.orderedRemove(0)`: `replaceRangeAssumeCapacity`
-/// shifts the remaining frames down and marks the vacated tail slot
-/// `undefined`, which is not guaranteed to actually clear the bytes in every
-/// build mode. Scrub it explicitly.
+/// Same hazard as `wipeSentRecordsSwapRemoveResidue`, but for
+/// `pending_new_connection_ids.orderedRemove(0)`: scrub the vacated slot as
+/// raw bytes rather than selecting a field from a `NewConnectionIdFrame`
+/// whose representation is no longer guaranteed valid.
 fn wipePendingNewConnectionIdsOrderedRemoveResidue(frames: *std.ArrayList(quic_cid.NewConnectionIdFrame)) void {
-    crypto_secrets.secureZero(&frames.allocatedSlice()[frames.items.len].stateless_reset_token);
+    crypto_secrets.secureZero(std.mem.asBytes(&frames.allocatedSlice()[frames.items.len]));
 }
 
 /// A candidate path (RFC 9000 §9.3/§9.5) we are validating: the
@@ -922,6 +926,20 @@ pub const Connection = struct {
         conn.paths = quic_path.PathManager.init(conn.cfg.migration_policy, options.initial_path, initial_validated);
         errdefer conn.deinitPartial();
 
+        // Reserve the full capacity these two collections can ever need,
+        // before any locally-generated stateless-reset token is queued into
+        // them: `sent_records` cannot exceed `recovery.max_tracked_packets`
+        // (every append is gated by a successful recovery-tracker insert,
+        // itself bounded there), and `pending_new_connection_ids` cannot
+        // exceed `quic_cid.max_local_active_cids` (the local CID registry's
+        // own issuance limit). With capacity reserved up front, later
+        // `append`/`ensureUnusedCapacity` calls never trigger `std.ArrayList`'s
+        // grow-and-free-the-old-backing-unwiped path, which would otherwise
+        // copy a live reset token into a new allocation and free the old one
+        // without scrubbing it.
+        try conn.sent_records.ensureTotalCapacityPrecise(allocator, recovery.max_tracked_packets);
+        try conn.pending_new_connection_ids.ensureTotalCapacityPrecise(allocator, quic_cid.max_local_active_cids);
+
         // RFC 9000 §7.3 binding: commit our CIDs into the TLS transport
         // parameters before the first flight.
         var binding = config.CidBinding{
@@ -1052,10 +1070,10 @@ pub const Connection = struct {
     pub fn copyActiveLocalCids(self: *const Connection, out: []quic_cid.ConnectionId) usize {
         var count: usize = 0;
         if (self.local_cids) |registry| {
-            for (registry.entries) |entry| {
-                if (entry) |value| {
+            for (registry.entries, registry.occupied) |entry, occupied| {
+                if (occupied) {
                     if (count == out.len) return count;
-                    out[count] = value.cid;
+                    out[count] = entry.cid;
                     count += 1;
                 }
             }
@@ -1634,7 +1652,7 @@ pub const Connection = struct {
         // comes from the largest acked packet (RFC 9002 §5.1).
         var index: usize = 0;
         while (index < self.sent_records.items.len) {
-            const record = self.sent_records.items[index];
+            const record = &self.sent_records.items[index];
             if (record.space != space or !ack.ranges.contains(record.packet_number)) {
                 index += 1;
                 continue;
@@ -1646,6 +1664,14 @@ pub const Connection = struct {
                 }
             }
             self.onRecordAcked(record);
+            // Delivery is confirmed: any reset token this record carried
+            // has done its job (the registry keeps the durable copy for as
+            // long as the CID stays active) and is now redundant. Wipe it
+            // here, on the still-live, validly-typed element, before
+            // `swapRemove` — the vacated slot the swap leaves behind gets a
+            // separate raw-byte wipe below, since it is no longer safe to
+            // interpret as a typed `SentRecord`.
+            wipeSentRecordToken(record);
             _ = self.sent_records.swapRemove(index);
             wipeSentRecordsSwapRemoveResidue(&self.sent_records);
         }
@@ -1655,7 +1681,7 @@ pub const Connection = struct {
         self.detectAndRequeueLost(space, now_us);
     }
 
-    fn onRecordAcked(self: *Connection, record: SentRecord) void {
+    fn onRecordAcked(self: *Connection, record: *const SentRecord) void {
         if (record.carried_handshake_done) self.handshake_done_acked = true;
         if (record.crypto) |range| {
             if (record.space == .application) self.crypto_tx[2].markAcked(self.allocator, range);
@@ -1678,13 +1704,18 @@ pub const Connection = struct {
         var index: usize = 0;
         var lost_count: u64 = 0;
         while (index < self.sent_records.items.len) {
-            const record = self.sent_records.items[index];
+            const record = &self.sent_records.items[index];
             if (record.space != space or self.trackerContains(space, record.packet_number)) {
                 index += 1;
                 continue;
             }
             lost_count += 1;
+            // Read the live element to requeue its content (a fresh copy of
+            // any carried reset token lands in `pending_new_connection_ids`
+            // via `requeueRecord`) before wiping this now-redundant copy and
+            // removing the record.
             self.requeueRecord(record);
+            wipeSentRecordToken(record);
             _ = self.sent_records.swapRemove(index);
             wipeSentRecordsSwapRemoveResidue(&self.sent_records);
         }
@@ -1702,7 +1733,7 @@ pub const Connection = struct {
     }
 
     /// Requeue everything a lost packet carried.
-    fn requeueRecord(self: *Connection, record: SentRecord) void {
+    fn requeueRecord(self: *Connection, record: *const SentRecord) void {
         if (record.crypto) |range| {
             const tx = switch (record.space) {
                 .initial => &self.crypto_tx[0],
@@ -1736,7 +1767,9 @@ pub const Connection = struct {
         if (record.carried_stop_sending) |stop| {
             self.pending_stop_sending.append(self.allocator, stop) catch {};
         }
-        if (record.carried_new_connection_id) |ncid| {
+        if (record.carried_new_connection_id) |ncid_value| {
+            var ncid = ncid_value;
+            defer crypto_secrets.secureZero(&ncid.stateless_reset_token);
             self.pending_new_connection_ids.append(self.allocator, ncid) catch {};
         }
         if (record.carried_path_challenge_path) |path| {
@@ -1868,6 +1901,11 @@ pub const Connection = struct {
         var index: usize = 0;
         while (index < self.sent_records.items.len) {
             if (self.sent_records.items[index].space == .initial) {
+                // NEW_CONNECTION_ID frames are only ever attached to
+                // `.application`-space records, so this is a no-op in
+                // practice; wipe defensively so that invariant is never
+                // load-bearing for correctness here.
+                wipeSentRecordToken(&self.sent_records.items[index]);
                 _ = self.sent_records.swapRemove(index);
                 wipeSentRecordsSwapRemoveResidue(&self.sent_records);
             } else index += 1;
@@ -2066,13 +2104,15 @@ pub const Connection = struct {
             return;
         };
         if (self.local_cids == null) {
-            // Construct the registry directly in `self.local_cids` rather
-            // than through a stack-local intermediate: the latter would
-            // leave a second, never-wiped copy of the reset-token key
-            // behind in this frame after the assignment below. Once the
-            // registry holds its own copy, `self.stateless_reset_key` is
-            // redundant and gets wiped immediately.
-            self.local_cids = quic_cid.LocalCidRegistry.init(peer_params.active_connection_id_limit, self.stateless_reset_key);
+            // Construct the registry in place via `initInto`, which borrows
+            // `self.stateless_reset_key` instead of taking it by value: a
+            // by-value parameter (or a return-by-value constructor) would
+            // leave an extra semantic copy of the secret that the compiler
+            // is not guaranteed to elide. Once the registry holds its own
+            // copy, `self.stateless_reset_key` is redundant and gets wiped
+            // immediately.
+            self.local_cids = .{};
+            quic_cid.LocalCidRegistry.initInto(&self.local_cids.?, peer_params.active_connection_id_limit, &self.stateless_reset_key);
             crypto_secrets.secureZero(&self.stateless_reset_key);
             const registry = &self.local_cids.?;
             const initial = quic_cid.ConnectionId.init(self.local_cid.slice()) catch {
@@ -2182,6 +2222,9 @@ pub const Connection = struct {
         var index: usize = 0;
         while (index < self.sent_records.items.len) {
             if (self.sent_records.items[index].space == space) {
+                // Defensive, as above: NEW_CONNECTION_ID frames only ever
+                // ride `.application`-space records.
+                wipeSentRecordToken(&self.sent_records.items[index]);
                 _ = self.sent_records.swapRemove(index);
                 wipeSentRecordsSwapRemoveResidue(&self.sent_records);
             } else index += 1;
@@ -2357,7 +2400,7 @@ pub const Connection = struct {
                 oldest = i;
             }
         }
-        if (oldest) |i| self.requeueRecord(self.sent_records.items[i]);
+        if (oldest) |i| self.requeueRecord(&self.sent_records.items[i]);
     }
 
     fn armIdle(self: *Connection, now_us: u64) void {
@@ -2867,6 +2910,13 @@ pub const Connection = struct {
             .packet_number = pn,
             .ack_eliciting = false,
         };
+        // `record` may pick up a dequeued NEW_CONNECTION_ID's reset token
+        // below; `self.sent_records.append` (if reached) copies it into the
+        // owned, tracked record, but this local stays around until every
+        // return path below (including early failures after the token was
+        // already dequeued and encoded) unwinds. Wipe it unconditionally on
+        // the way out — a no-op when no token was ever attached.
+        defer wipeSentRecordToken(&record);
 
         // 1) ACK
         if (want_ack) {
@@ -3104,11 +3154,15 @@ pub const Connection = struct {
             _ = self.pending_retires.orderedRemove(0);
         }
         if (self.pending_new_connection_ids.items.len > 0) {
-            const ncid = self.pending_new_connection_ids.items[0];
-            if (frame.encodeNewConnectionId(ncid, plain[plain_len..budget])) |n| {
+            // Encode and assign directly from the queued element rather
+            // than through an intermediate `const ncid = ...` local: that
+            // would leave a third, unwiped stack copy of the reset token
+            // (beyond the queue's own copy and the one `record` ends up
+            // owning) sitting around for the rest of this function.
+            if (frame.encodeNewConnectionId(self.pending_new_connection_ids.items[0], plain[plain_len..budget])) |n| {
                 plain_len += n;
                 record.ack_eliciting = true;
-                record.carried_new_connection_id = ncid;
+                record.carried_new_connection_id = self.pending_new_connection_ids.items[0];
                 _ = self.pending_new_connection_ids.orderedRemove(0);
                 wipePendingNewConnectionIdsOrderedRemoveResidue(&self.pending_new_connection_ids);
             } else |_| {}
@@ -4889,7 +4943,7 @@ test "driver: server NewSessionTicket uses application CRYPTO retransmission and
     const sent = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
     try testing.expectEqual(PacketNumberSpace.application, sent.space);
     try testing.expect(sent.crypto != null);
-    pair.server.requeueRecord(sent);
+    pair.server.requeueRecord(&sent);
 
     try pair.pump();
     try testing.expectEqual(@as(usize, 1), capture.count);
@@ -4947,7 +5001,7 @@ test "driver: two-phase prepare/emit NewSessionTicket delivers over application 
     const sent = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
     try testing.expectEqual(PacketNumberSpace.application, sent.space);
     try testing.expect(sent.crypto != null);
-    pair.server.requeueRecord(sent);
+    pair.server.requeueRecord(&sent);
 
     try pair.pump();
     try testing.expectEqual(@as(usize, 1), capture.count);
@@ -6852,7 +6906,7 @@ test "connection: lost NEW_CONNECTION_ID retransmits the same frame identity" {
     try testing.expectEqual(@as(u64, 1), first.sequence);
     try testing.expectEqualSlices(u8, spare.slice(), first.cid.slice());
 
-    pair.server.requeueRecord(first_record);
+    pair.server.requeueRecord(&first_record);
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us + 1_000) orelse return error.TestExpectedEqual;
     const second_record = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
     const second = second_record.carried_new_connection_id orelse return error.TestExpectedEqual;
@@ -6915,7 +6969,7 @@ test "connection: losing one NEW_CONNECTION_ID leaves all queued CID identities 
     try testing.expectEqual(@as(usize, 1), pair.server.pending_new_connection_ids.items.len);
     try testing.expectEqualSlices(u8, second_cid.slice(), pair.server.pending_new_connection_ids.items[0].cid.slice());
 
-    pair.server.requeueRecord(sent);
+    pair.server.requeueRecord(&sent);
     try testing.expectEqual(@as(usize, 2), pair.server.pending_new_connection_ids.items.len);
     var saw_first = false;
     var saw_second = false;
@@ -6930,6 +6984,86 @@ test "connection: losing one NEW_CONNECTION_ID leaves all queued CID identities 
     }
     try testing.expect(saw_first);
     try testing.expect(saw_second);
+}
+
+test "wipeSentRecordsSwapRemoveResidue zeroes the vacated slot regardless of its prior byte pattern" {
+    var records: std.ArrayList(SentRecord) = .empty;
+    defer records.deinit(testing.allocator);
+    try records.ensureTotalCapacityPrecise(testing.allocator, 4);
+    records.appendAssumeCapacity(.{ .space = .application, .packet_number = 1, .ack_eliciting = false });
+    records.appendAssumeCapacity(.{ .space = .application, .packet_number = 2, .ack_eliciting = false });
+
+    _ = records.swapRemove(0);
+    // Simulate whatever a safety-checked build's poison-fill (or a
+    // `ReleaseFast` build's leftover live data) might put in the vacated
+    // slot: an arbitrary, non-zero byte pattern that would be an invalid
+    // `?NewConnectionIdFrame` tag if ever misinterpreted as a typed
+    // `SentRecord` rather than treated as opaque bytes.
+    const ghost = std.mem.asBytes(&records.allocatedSlice()[records.items.len]);
+    @memset(ghost, 0xaa);
+
+    wipeSentRecordsSwapRemoveResidue(&records);
+    for (ghost) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "wipePendingNewConnectionIdsOrderedRemoveResidue zeroes the vacated slot regardless of its prior byte pattern" {
+    var frames: std.ArrayList(quic_cid.NewConnectionIdFrame) = .empty;
+    defer frames.deinit(testing.allocator);
+    try frames.ensureTotalCapacityPrecise(testing.allocator, 4);
+    frames.appendAssumeCapacity(.{
+        .sequence = 1,
+        .retire_prior_to = 0,
+        .cid = try quic_cid.ConnectionId.init(&.{ 1, 2, 3, 4 }),
+        .stateless_reset_token = [_]u8{0xcd} ** quic_cid.stateless_reset_token_len,
+    });
+    frames.appendAssumeCapacity(.{
+        .sequence = 2,
+        .retire_prior_to = 0,
+        .cid = try quic_cid.ConnectionId.init(&.{ 5, 6, 7, 8 }),
+        .stateless_reset_token = [_]u8{0xef} ** quic_cid.stateless_reset_token_len,
+    });
+
+    _ = frames.orderedRemove(0);
+    const ghost = std.mem.asBytes(&frames.allocatedSlice()[frames.items.len]);
+    @memset(ghost, 0xaa);
+
+    wipePendingNewConnectionIdsOrderedRemoveResidue(&frames);
+    for (ghost) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "connection: sent_records and pending_new_connection_ids reserve capacity once and never regrow" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+
+    // `Connection.init` reserves the full protocol-bounded capacity for
+    // both collections before either can ever hold a locally-generated
+    // reset token.
+    try testing.expect(pair.server.sent_records.capacity >= recovery.max_tracked_packets);
+    try testing.expect(pair.server.pending_new_connection_ids.capacity >= quic_cid.max_local_active_cids);
+
+    const sent_records_backing = pair.server.sent_records.items.ptr;
+    const pending_backing = pair.server.pending_new_connection_ids.items.ptr;
+
+    // Push `sent_records` all the way to the protocol bound directly
+    // (bypassing the recovery-tracker gate, which is exactly what keeps it
+    // under that bound in production): if capacity were not already
+    // reserved, appends anywhere in this loop would trigger
+    // `std.ArrayList`'s grow-and-free-the-old-backing-unwiped path. The
+    // backing pointer staying fixed throughout proves that never happens.
+    var i: usize = 0;
+    while (i < recovery.max_tracked_packets) : (i += 1) {
+        try pair.server.sent_records.append(pair.server.allocator, .{
+            .space = .application,
+            .packet_number = i,
+            .ack_eliciting = false,
+        });
+    }
+    try testing.expectEqual(sent_records_backing, pair.server.sent_records.items.ptr);
+    try testing.expectEqual(@as(usize, recovery.max_tracked_packets), pair.server.sent_records.capacity);
+
+    try pair.pump();
+    try testing.expectEqual(pending_backing, pair.server.pending_new_connection_ids.items.ptr);
 }
 
 test "connection: teardown scrubs a still-pending and an in-flight NEW_CONNECTION_ID's reset token" {

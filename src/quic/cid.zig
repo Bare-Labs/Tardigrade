@@ -138,35 +138,51 @@ pub const max_local_active_cids = 8;
 
 pub const LocalCidRegistry = struct {
     pub const Entry = struct {
-        sequence: u64,
-        cid: ConnectionId,
-        stateless_reset_token: [stateless_reset_token_len]u8,
+        sequence: u64 = 0,
+        cid: ConnectionId = .{},
+        stateless_reset_token: [stateless_reset_token_len]u8 = [_]u8{0} ** stateless_reset_token_len,
     };
 
     /// min(peer's active_connection_id_limit, local storage bound).
-    active_limit: u64,
+    active_limit: u64 = 0,
     /// Static secret for stateless-reset token derivation (RFC 9000 §10.3.1).
-    reset_token_key: secrets.FixedSecret(32),
-    entries: [max_local_active_cids]?Entry = [_]?Entry{null} ** max_local_active_cids,
+    reset_token_key: secrets.FixedSecret(32) = .{},
+    /// Always-live entry storage; `occupied` tracks which slots hold a live
+    /// CID rather than wrapping each entry in `?Entry`. An optional wrapper
+    /// would make a retired (or never-issued) slot's payload logically
+    /// inactive, and safety-checked builds are free to poison-fill an
+    /// inactive optional payload — observably so on Linux x64 — which would
+    /// make it impossible to assert the token bytes were actually zeroed
+    /// rather than merely tagged absent.
+    entries: [max_local_active_cids]Entry = [_]Entry{.{}} ** max_local_active_cids,
+    occupied: [max_local_active_cids]bool = [_]bool{false} ** max_local_active_cids,
     next_sequence: u64 = 0,
     largest_advertised_sequence: ?u64 = null,
     metrics: Metrics = .{},
 
-    pub fn init(peer_active_connection_id_limit: u64, reset_token_key: [32]u8) LocalCidRegistry {
-        var key = secrets.FixedSecret(32){};
-        key.replace(&reset_token_key) catch unreachable;
-        return .{
+    /// Construct the registry in place, borrowing `reset_key` rather than
+    /// taking it by value. `init` (below) is convenient for tests, but a
+    /// by-value `[32]u8` parameter plus a return-by-value result both leave
+    /// an extra semantic copy of the secret that the compiler is not
+    /// guaranteed to elide — the production owner (`Connection`) uses this
+    /// instead.
+    pub fn initInto(out: *LocalCidRegistry, peer_active_connection_id_limit: u64, reset_key: []const u8) void {
+        out.* = .{
             .active_limit = @min(peer_active_connection_id_limit, max_local_active_cids),
-            .reset_token_key = key,
         };
+        out.reset_token_key.replace(reset_key) catch unreachable;
+    }
+
+    pub fn init(peer_active_connection_id_limit: u64, reset_token_key: [32]u8) LocalCidRegistry {
+        var out: LocalCidRegistry = undefined;
+        initInto(&out, peer_active_connection_id_limit, &reset_token_key);
+        return out;
     }
 
     pub fn deinit(self: *LocalCidRegistry) void {
-        for (&self.entries) |*slot| {
-            if (slot.*) |*entry| {
-                secrets.secureZero(&entry.stateless_reset_token);
-            }
-            slot.* = null;
+        for (&self.entries, &self.occupied) |*entry, *occupied| {
+            if (occupied.*) secrets.secureZero(&entry.stateless_reset_token);
+            occupied.* = false;
         }
         self.reset_token_key.deinit();
         self.next_sequence = 0;
@@ -209,20 +225,19 @@ pub const LocalCidRegistry = struct {
         if (self.activeCount() >= self.active_limit) return error.CidLimitExceeded;
         // Repeated caller entropy must not mint the same CID twice under
         // different sequence numbers.
-        for (self.entries) |existing| {
-            if (existing) |entry| {
-                if (std.mem.eql(u8, entry.cid.slice(), cid.slice())) return error.DuplicateCid;
-            }
+        for (self.entries, self.occupied) |entry, occupied| {
+            if (occupied and std.mem.eql(u8, entry.cid.slice(), cid.slice())) return error.DuplicateCid;
         }
-        const slot = for (&self.entries) |*entry| {
-            if (entry.* == null) break entry;
+        const slot_idx = for (self.occupied, 0..) |occupied, i| {
+            if (!occupied) break i;
         } else return error.CidLimitExceeded;
         const entry = Entry{
             .sequence = self.next_sequence,
             .cid = cid,
             .stateless_reset_token = statelessResetToken(self.reset_token_key.slice(), cid.slice()),
         };
-        slot.* = entry;
+        self.entries[slot_idx] = entry;
+        self.occupied[slot_idx] = true;
         self.next_sequence += 1;
         return entry;
     }
@@ -234,12 +249,12 @@ pub const LocalCidRegistry = struct {
     pub fn retire(self: *LocalCidRegistry, frame: RetireConnectionIdFrame) error{ProtocolViolation}!?ConnectionId {
         const largest = self.largest_advertised_sequence orelse return error.ProtocolViolation;
         if (frame.sequence > largest) return error.ProtocolViolation;
-        for (&self.entries) |*slot| {
-            const entry = &(slot.* orelse continue);
+        for (&self.entries, &self.occupied) |*entry, *occupied| {
+            if (!occupied.*) continue;
             if (entry.sequence != frame.sequence) continue;
             const cid = entry.cid;
             secrets.secureZero(&entry.stateless_reset_token);
-            slot.* = null;
+            occupied.* = false;
             self.metrics.local_cids_retired += 1;
             return cid;
         }
@@ -260,35 +275,29 @@ pub const LocalCidRegistry = struct {
 
     pub fn activeCount(self: *const LocalCidRegistry) usize {
         var active: usize = 0;
-        for (self.entries) |entry| {
-            if (entry != null) active += 1;
+        for (self.occupied) |occupied| {
+            if (occupied) active += 1;
         }
         return active;
     }
 
     pub fn get(self: *const LocalCidRegistry, sequence: u64) ?Entry {
-        for (self.entries) |entry| {
-            if (entry) |value| {
-                if (value.sequence == sequence) return value;
-            }
+        for (self.entries, self.occupied) |entry, occupied| {
+            if (occupied and entry.sequence == sequence) return entry;
         }
         return null;
     }
 
     pub fn containsCid(self: *const LocalCidRegistry, cid: ConnectionId) bool {
-        for (self.entries) |entry| {
-            if (entry) |value| {
-                if (std.mem.eql(u8, value.cid.slice(), cid.slice())) return true;
-            }
+        for (self.entries, self.occupied) |entry, occupied| {
+            if (occupied and std.mem.eql(u8, entry.cid.slice(), cid.slice())) return true;
         }
         return false;
     }
 
     pub fn sequenceForCid(self: *const LocalCidRegistry, cid: ConnectionId) ?u64 {
-        for (self.entries) |entry| {
-            if (entry) |value| {
-                if (std.mem.eql(u8, value.cid.slice(), cid.slice())) return value.sequence;
-            }
+        for (self.entries, self.occupied) |entry, occupied| {
+            if (occupied and std.mem.eql(u8, entry.cid.slice(), cid.slice())) return entry.sequence;
         }
         return null;
     }
@@ -654,23 +663,23 @@ test "local registry deinit clears issued entries" {
     _ = try registry.issue(&entropy, 8);
     try testing.expect(registry.activeCount() > 0);
 
-    // Capture raw pointers into the still-populated storage before deinit:
+    // Capture raw pointers into the always-live entry storage before deinit:
     // `activeCount() == 0` and `reset_token_key.len == 0` alone would also
-    // pass an implementation that only flips the `?Entry` option tags
-    // without ever touching the token/key payload bytes.
-    var token_ptrs: [max_local_active_cids]?*const [stateless_reset_token_len]u8 = .{null} ** max_local_active_cids;
-    for (&registry.entries, 0..) |*slot, i| {
-        if (slot.*) |*entry| token_ptrs[i] = &entry.stateless_reset_token;
-    }
-    try testing.expect(token_ptrs[0] != null);
+    // pass an implementation that only flipped `occupied` without ever
+    // touching the token/key payload bytes. `entries[i].stateless_reset_token`
+    // stays addressable regardless of `occupied[i]`, so this read is
+    // well-defined even after the slot is cleared.
+    var was_occupied: [max_local_active_cids]bool = undefined;
+    for (&was_occupied, registry.occupied) |*w, occupied| w.* = occupied;
+    try testing.expect(was_occupied[0]);
     const key_ptr = &registry.reset_token_key.bytes;
 
     registry.deinit();
     try testing.expectEqual(@as(usize, 0), registry.activeCount());
     try testing.expectEqual(@as(usize, 0), registry.reset_token_key.len);
-    for (token_ptrs) |maybe_ptr| {
-        const ptr = maybe_ptr orelse continue;
-        for (ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    for (registry.entries, was_occupied) |entry, occupied| {
+        if (!occupied) continue;
+        for (entry.stateless_reset_token) |byte| try testing.expectEqual(@as(u8, 0), byte);
     }
     for (key_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
@@ -683,13 +692,15 @@ test "retire wipes the stateless reset token bytes, not just the entry slot" {
     const issued = try registry.issue(&entropy, 8);
     try registry.markAdvertised(issued.sequence);
 
-    var token_ptr: ?*const [stateless_reset_token_len]u8 = null;
-    for (&registry.entries) |*slot| {
-        if (slot.*) |*entry| {
-            if (entry.sequence == issued.sequence) token_ptr = &entry.stateless_reset_token;
-        }
+    var slot_idx: ?usize = null;
+    for (registry.entries, registry.occupied, 0..) |entry, occupied, i| {
+        if (occupied and entry.sequence == issued.sequence) slot_idx = i;
     }
-    const token = token_ptr orelse return error.TestUnexpectedResult;
+    const idx = slot_idx orelse return error.TestUnexpectedResult;
+    // `entries[idx].stateless_reset_token` stays addressable regardless of
+    // `occupied[idx]`, so reading it after `retire()` clears the slot below
+    // is well-defined — unlike reading through a dead `?Entry` payload.
+    const token = &registry.entries[idx].stateless_reset_token;
     var saw_nonzero = false;
     for (token) |byte| {
         if (byte != 0) saw_nonzero = true;

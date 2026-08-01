@@ -129,35 +129,37 @@ pub const TokenError = error{
 /// Installing a key makes it current; older keys remain valid for verification
 /// until explicitly retired, so tokens issued before a rotation still validate.
 pub const RetryTokenKeyRing = struct {
-    keys: [max_token_keys]?[token_key_len]u8 = .{null} ** max_token_keys,
+    /// `FixedSecret` keeps each slot's byte storage live for the ring's
+    /// entire lifetime — installed/retired is tracked by `.len` (0 vs
+    /// `token_key_len`), never by wrapping the array in an outer
+    /// `?[N]u8`. An optional wrapper would make the payload logically
+    /// inactive the moment a key is retired, and safety-checked builds are
+    /// free to poison-fill an inactive optional payload — observably so on
+    /// Linux x64 — which would make it impossible to assert the bytes were
+    /// actually zeroed rather than merely tagged absent.
+    keys: [max_token_keys]secrets.FixedSecret(token_key_len) = [_]secrets.FixedSecret(token_key_len){secrets.FixedSecret(token_key_len){}} ** max_token_keys,
     current: u8 = 0,
 
     pub fn install(self: *RetryTokenKeyRing, key_id: u8, key: [token_key_len]u8) void {
         std.debug.assert(key_id < max_token_keys);
-        if (self.keys[key_id]) |*slot| secrets.secureZero(slot);
-        self.keys[key_id] = key;
+        self.keys[key_id].replace(&key) catch unreachable;
         self.current = key_id;
     }
 
     pub fn retire(self: *RetryTokenKeyRing, key_id: u8) void {
         if (key_id >= max_token_keys) return;
-        if (self.keys[key_id]) |*slot| secrets.secureZero(slot);
-        self.keys[key_id] = null;
+        self.keys[key_id].deinit();
     }
 
     pub fn deinit(self: *RetryTokenKeyRing) void {
-        for (&self.keys) |*entry| {
-            if (entry.*) |*slot| secrets.secureZero(slot);
-            entry.* = null;
-        }
+        for (&self.keys) |*slot| slot.deinit();
         self.current = 0;
     }
 
     fn get(self: *const RetryTokenKeyRing, key_id: u8) ?*const [token_key_len]u8 {
         if (key_id >= max_token_keys) return null;
-        const entry = &self.keys[key_id];
-        if (entry.*) |*slot| return slot;
-        return null;
+        if (self.keys[key_id].len == 0) return null;
+        return &self.keys[key_id].bytes;
     }
 };
 
@@ -1117,12 +1119,13 @@ test "retry token key ring deinit clears installed keys down to the byte level" 
     try testing.expect(ring.get(0) != null);
     try testing.expect(ring.get(1) != null);
 
-    // Capture raw pointers into the still-installed key storage before
-    // deinit: asserting only `get(id) == null` afterward would also pass an
-    // implementation that just flips the `?[N]u8` option tag without ever
-    // touching the key bytes.
-    const key0_ptr: *const [token_key_len]u8 = &(ring.keys[0].?);
-    const key1_ptr: *const [token_key_len]u8 = &(ring.keys[1].?);
+    // Capture raw pointers into the always-live key storage before deinit:
+    // asserting only `get(id) == null` afterward would also pass an
+    // implementation that never actually touched the key bytes, only the
+    // occupancy length. `.bytes` stays addressable regardless of `.len`, so
+    // this read is well-defined even after the slot is cleared.
+    const key0_ptr: *const [token_key_len]u8 = &ring.keys[0].bytes;
+    const key1_ptr: *const [token_key_len]u8 = &ring.keys[1].bytes;
 
     ring.deinit();
     try testing.expect(ring.get(0) == null);
@@ -1135,7 +1138,7 @@ test "retry token key ring retire wipes the retired key, not just its slot tag" 
     var ring = RetryTokenKeyRing{};
     defer ring.deinit();
     ring.install(0, [_]u8{0x9c} ** token_key_len);
-    const key0_ptr: *const [token_key_len]u8 = &(ring.keys[0].?);
+    const key0_ptr: *const [token_key_len]u8 = &ring.keys[0].bytes;
     var saw_nonzero = false;
     for (key0_ptr) |byte| {
         if (byte != 0) saw_nonzero = true;
@@ -1151,7 +1154,7 @@ test "retry token key ring install wipes a replaced key before the new one takes
     var ring = RetryTokenKeyRing{};
     defer ring.deinit();
     ring.install(0, [_]u8{0xaa} ** token_key_len);
-    const key0_ptr: *const [token_key_len]u8 = &(ring.keys[0].?);
+    const key0_ptr: *const [token_key_len]u8 = &ring.keys[0].bytes;
 
     ring.install(0, [_]u8{0xbb} ** token_key_len);
     // The old 0xaa key must not survive anywhere in the slot's storage —
