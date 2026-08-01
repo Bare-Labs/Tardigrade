@@ -3619,11 +3619,13 @@ const TestPair = struct {
         const pair = try allocator.create(TestPair);
         pair.* = .{
             .client_backend = tls_backend_mod.Tls13Backend.initClient(
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .hello_random = [_]u8{0xc1} ** 32 },
+                test_quic_crypto.testHandshakeProvider(),
                 .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             ),
             .server_backend = tls_backend_mod.Tls13Backend.initServer(
-                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+                .{ .hello_random = [_]u8{0x51} ** 32 },
+                test_quic_crypto.testHandshakeProvider(),
                 try tls_backend_mod.Identity.initPkcs8(
                     tls_backend_mod.testdata.certificate_der,
                     tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -3675,12 +3677,14 @@ const TestPair = struct {
         pair.* = .{
             .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
                 allocator,
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .hello_random = [_]u8{0xc1} ** 32 },
+                test_quic_crypto.testHandshakeProvider(),
                 .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             ),
             .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
                 allocator,
-                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+                .{ .hello_random = [_]u8{0x51} ** 32 },
+                test_quic_crypto.testHandshakeProvider(),
                 try tls_backend_mod.Identity.initPkcs8(
                     tls_backend_mod.testdata.certificate_der,
                     tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -3728,12 +3732,14 @@ const TestPair = struct {
         pair.* = .{
             .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
                 allocator,
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .hello_random = [_]u8{0xc1} ** 32 },
+                test_quic_crypto.testHandshakeProvider(),
                 .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             ),
             .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
                 allocator,
-                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+                .{ .hello_random = [_]u8{0x51} ** 32 },
+                test_quic_crypto.testHandshakeProvider(),
                 try tls_backend_mod.Identity.initPkcs8(
                     tls_backend_mod.testdata.certificate_der,
                     tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -3810,7 +3816,8 @@ test "Connection.init failure before the handshake is assigned does not deinit u
     const too_short_dcid = [_]u8{0xaa} ** (tls_adapter.min_initial_dcid_len - 1);
     var backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
         allocator,
-        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .hello_random = [_]u8{0xc1} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
     );
     try testing.expectError(error.InvalidConnectionId, Connection.init(allocator, .{
@@ -3902,13 +3909,15 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
     pair.* = .{
         .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocatorAndOptions(
             allocator,
-            .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x13} ** 32 },
+            .{ .hello_random = [_]u8{0xc1} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             .{ .initial_key_share_mode = .empty },
         ),
         .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
             allocator,
-            .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x23} ** 32 },
+            .{ .hello_random = [_]u8{0x51} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             try tls_backend_mod.Identity.initPkcs8(
                 tls_backend_mod.testdata.certificate_der,
                 tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -4087,13 +4096,15 @@ test "driver: PSK resumption completes through a real HelloRetryRequest over QUI
     pair.* = .{
         .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocatorAndOptions(
             allocator,
-            .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x13} ** 32 },
+            .{ .hello_random = [_]u8{0xc1} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             .{ .initial_key_share_mode = .empty },
         ),
         .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
             allocator,
-            .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x23} ** 32 },
+            .{ .hello_random = [_]u8{0x51} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             try tls_backend_mod.Identity.initPkcs8(
                 tls_backend_mod.testdata.certificate_der,
                 tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -4988,11 +4999,13 @@ test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake v
     defer allocator.destroy(resumed);
     resumed.* = .{
         .client_backend = tls_backend_mod.Tls13Backend.initClient(
-            .{ .hello_random = [_]u8{0xd1} ** 32, .key_share_seed = [_]u8{0x31} ** 32, .retry_key_share_seed = [_]u8{0x31} ** 32 },
+            .{ .hello_random = [_]u8{0xd1} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
         ),
         .server_backend = tls_backend_mod.Tls13Backend.initServer(
-            .{ .hello_random = [_]u8{0xd2} ** 32, .key_share_seed = [_]u8{0x32} ** 32, .retry_key_share_seed = [_]u8{0x32} ** 32 },
+            .{ .hello_random = [_]u8{0xd2} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             try tls_backend_mod.Identity.initPkcs8(
                 tls_backend_mod.testdata.certificate_der,
                 tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -5156,11 +5169,13 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
     defer allocator.destroy(resumed);
     resumed.* = .{
         .client_backend = tls_backend_mod.Tls13Backend.initClient(
-            .{ .hello_random = [_]u8{0xe1} ** 32, .key_share_seed = [_]u8{0x41} ** 32, .retry_key_share_seed = [_]u8{0x41} ** 32 },
+            .{ .hello_random = [_]u8{0xe1} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
         ),
         .server_backend = tls_backend_mod.Tls13Backend.initServer(
-            .{ .hello_random = [_]u8{0xe2} ** 32, .key_share_seed = [_]u8{0x42} ** 32, .retry_key_share_seed = [_]u8{0x42} ** 32 },
+            .{ .hello_random = [_]u8{0xe2} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             try tls_backend_mod.Identity.initPkcs8(
                 tls_backend_mod.testdata.certificate_der,
                 tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -5384,11 +5399,13 @@ test "#523: Event.early_data_decision surfaces the real TLS decision once, even 
     defer allocator.destroy(resumed);
     resumed.* = .{
         .client_backend = tls_backend_mod.Tls13Backend.initClient(
-            .{ .hello_random = [_]u8{0xf1} ** 32, .key_share_seed = [_]u8{0x51} ** 32, .retry_key_share_seed = [_]u8{0x51} ** 32 },
+            .{ .hello_random = [_]u8{0xf1} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
         ),
         .server_backend = tls_backend_mod.Tls13Backend.initServer(
-            .{ .hello_random = [_]u8{0xf2} ** 32, .key_share_seed = [_]u8{0x52} ** 32, .retry_key_share_seed = [_]u8{0x52} ** 32 },
+            .{ .hello_random = [_]u8{0xf2} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             try tls_backend_mod.Identity.initPkcs8(
                 tls_backend_mod.testdata.certificate_der,
                 tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -5571,11 +5588,13 @@ fn expectRejectedEarlyDataFallsBackOnSameConnection(scenario: RejectedEarlyDataF
     defer allocator.destroy(resumed);
     resumed.* = .{
         .client_backend = tls_backend_mod.Tls13Backend.initClient(
-            .{ .hello_random = [_]u8{0xa1} ** 32, .key_share_seed = [_]u8{0x61} ** 32, .retry_key_share_seed = [_]u8{0x61} ** 32 },
+            .{ .hello_random = [_]u8{0xa1} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
         ),
         .server_backend = tls_backend_mod.Tls13Backend.initServer(
-            .{ .hello_random = [_]u8{0xa2} ** 32, .key_share_seed = [_]u8{0x62} ** 32, .retry_key_share_seed = [_]u8{0x62} ** 32 },
+            .{ .hello_random = [_]u8{0xa2} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             try tls_backend_mod.Identity.initPkcs8(
                 tls_backend_mod.testdata.certificate_der,
                 tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -6072,11 +6091,13 @@ const MigrationPair = struct {
         const pair = try allocator.create(MigrationPair);
         pair.* = .{
             .client_backend = tls_backend_mod.Tls13Backend.initClient(
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .hello_random = [_]u8{0xc1} ** 32 },
+                test_quic_crypto.testHandshakeProvider(),
                 .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             ),
             .server_backend = tls_backend_mod.Tls13Backend.initServer(
-                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+                .{ .hello_random = [_]u8{0x51} ** 32 },
+                test_quic_crypto.testHandshakeProvider(),
                 try tls_backend_mod.Identity.initPkcs8(
                     tls_backend_mod.testdata.certificate_der,
                     tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -6410,11 +6431,13 @@ test "connection: a policy-blocked server still answers a PATH_CHALLENGE on its 
     const allocator = testing.allocator;
 
     var client_backend = tls_backend_mod.Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .hello_random = [_]u8{0xc1} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
     );
     var server_backend = tls_backend_mod.Tls13Backend.initServer(
-        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+        .{ .hello_random = [_]u8{0x51} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         try tls_backend_mod.Identity.initPkcs8(
             tls_backend_mod.testdata.certificate_der,
             tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -6917,12 +6940,14 @@ test "a real Connection closes with handshake_failure when the server has no app
         pair.* = .{
             .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
                 allocator,
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .hello_random = [_]u8{0xc1} ** 32 },
+                test_quic_crypto.testHandshakeProvider(),
                 .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             ),
             .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
                 allocator,
-                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+                .{ .hello_random = [_]u8{0x51} ** 32 },
+                test_quic_crypto.testHandshakeProvider(),
                 try tls_backend_mod.Identity.initPkcs8(tls_backend_mod.testdata.certificate_der, tls_backend_mod.testdata.private_key_pkcs8_der),
             ),
         };

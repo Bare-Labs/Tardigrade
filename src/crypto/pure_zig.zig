@@ -534,6 +534,76 @@ pub const SoftwareSigningKey = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Software signing key (opaque private-key handle) — ECDSA-P256/SHA-256
+// ---------------------------------------------------------------------------
+
+/// A software ECDSA-P256/SHA-256 signing key, the P-256 sibling of
+/// `SoftwareSigningKey` (#490): TLS `credentials.zig` holds one of these (or
+/// the Ed25519 variant) behind the opaque `provider.SigningKey` handle rather
+/// than a raw `std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair`, so private-key
+/// bytes never cross into `Identity.sign`'s caller. Same lifetime contract as
+/// `SoftwareSigningKey`: keep it alive for as long as the handle is used and
+/// call `deinit` explicitly — Zig does not zero a value's bytes on scope exit.
+pub const SoftwareEcdsaP256SigningKey = struct {
+    key_pair: EcdsaP256Sha256.KeyPair,
+
+    /// Load from an already-parsed P-256 private scalar (the caller has
+    /// already validated its PKCS#8/SEC1 encoding and extracted the raw
+    /// 32-byte scalar; this type only owns the derived key pair).
+    pub fn fromSecretKey(secret_key: EcdsaP256Sha256.SecretKey) provider.SignError!SoftwareEcdsaP256SigningKey {
+        const key_pair = EcdsaP256Sha256.KeyPair.fromSecretKey(secret_key) catch return error.ProviderFailure;
+        return .{ .key_pair = key_pair };
+    }
+
+    /// Securely erase the private key material. Callers must invoke this when
+    /// the key is no longer needed; letting the value go out of scope does not
+    /// scrub its bytes.
+    pub fn deinit(self: *SoftwareEcdsaP256SigningKey) void {
+        crypto.secureZero(u8, &self.key_pair.secret_key.bytes);
+    }
+
+    /// Raw SEC1 uncompressed public key, for pinning or diagnostics.
+    pub fn publicKeySec1(self: *const SoftwareEcdsaP256SigningKey) [EcdsaP256Sha256.PublicKey.uncompressed_sec1_encoded_length]u8 {
+        return self.key_pair.public_key.toUncompressedSec1();
+    }
+
+    /// Erase to the opaque signing-key interface. Borrows `self`.
+    pub fn signingKey(self: *SoftwareEcdsaP256SigningKey) provider.SigningKey {
+        return .{ .context = self, .vtable = &signing_vtable };
+    }
+
+    const signing_vtable = provider.SigningKey.VTable{
+        .scheme = signingSchemeImpl,
+        .sign = signingSignImpl,
+    };
+
+    fn signingSchemeImpl(context: *anyopaque) provider.SignatureScheme {
+        _ = context;
+        return .ecdsa_secp256r1_sha256;
+    }
+
+    fn signingSignImpl(
+        context: *anyopaque,
+        message: []const u8,
+        entropy: provider.Entropy,
+        out: []u8,
+    ) provider.SignError!usize {
+        // ECDSA-P256 signing here is deterministic (RFC 6979-style nonce
+        // derivation inside std.crypto.sign.ecdsa's `noise = null` path),
+        // matching the direct `key_pair.sign(input, null)` call this
+        // migrates from — no extra hedging noise is needed.
+        _ = entropy;
+        const self: *SoftwareEcdsaP256SigningKey = @ptrCast(@alignCast(context));
+        const signature = self.key_pair.sign(message, null) catch return error.ProviderFailure;
+        var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+        const der = signature.toDer(&der_buf);
+        if (out.len < der.len) return error.InvalidInput;
+        @memcpy(out[0..der.len], der);
+        return der.len;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Deterministic entropy (tests and reproducible flows)
 // ---------------------------------------------------------------------------
 
@@ -826,6 +896,46 @@ test "Ed25519 sign then verify, with tamper and wrong-key rejection" {
     defer other_key.deinit();
     const other_public = other_key.publicKey();
     try testing.expectError(error.AuthenticationFailed, cp.verify(.ed25519, &other_public, message, &signature));
+}
+
+test "SoftwareEcdsaP256SigningKey signs then verifies, with tamper and wrong-key rejection" {
+    var det = DeterministicEntropy.init(10);
+    var p = Provider.init(det.entropy());
+    const cp = p.cryptoProvider();
+
+    var seed: [EcdsaP256Sha256.KeyPair.seed_length]u8 = undefined;
+    try cp.randomBytes(&seed);
+    const kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(seed);
+    var software_key = try SoftwareEcdsaP256SigningKey.fromSecretKey(kp.secret_key);
+    defer software_key.deinit();
+    const signer = software_key.signingKey();
+    try testing.expectEqual(provider.SignatureScheme.ecdsa_secp256r1_sha256, signer.scheme());
+
+    const message = "certificate verify transcript";
+    var signature: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const sig_len = try signer.sign(message, cp.entropy, &signature);
+    const public_key = software_key.publicKeySec1();
+
+    try cp.verify(.ecdsa_secp256r1_sha256, &public_key, message, signature[0..sig_len]);
+
+    // Flip a signature byte: authentication must fail.
+    var bad_sig = signature;
+    bad_sig[sig_len - 1] ^= 0x01;
+    try testing.expectError(error.AuthenticationFailed, cp.verify(.ecdsa_secp256r1_sha256, &public_key, message, bad_sig[0..sig_len]));
+
+    // Verify under an unrelated key: authentication must fail.
+    var other_seed: [EcdsaP256Sha256.KeyPair.seed_length]u8 = undefined;
+    try cp.randomBytes(&other_seed);
+    const other_kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(other_seed);
+    var other_key = try SoftwareEcdsaP256SigningKey.fromSecretKey(other_kp.secret_key);
+    defer other_key.deinit();
+    const other_public = other_key.publicKeySec1();
+    try testing.expectError(error.AuthenticationFailed, cp.verify(.ecdsa_secp256r1_sha256, &other_public, message, signature[0..sig_len]));
+
+    // An output buffer too small for any DER-encoded ECDSA signature
+    // reports InvalidInput rather than silently truncating.
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.InvalidInput, signer.sign(message, cp.entropy, &tiny));
 }
 
 test "fromSeedSecret clears the caller's typed secret immediately and derives the same key as fromSeed" {

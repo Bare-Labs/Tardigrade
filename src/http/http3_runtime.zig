@@ -606,9 +606,7 @@ pub const Runtime = struct {
         const backend = allocator.create(quic.tls_backend.Tls13Backend) catch return null;
         var entropy: quic.tls_backend.Entropy = undefined;
         compat.randomBytes(&entropy.hello_random);
-        compat.randomBytes(&entropy.key_share_seed);
-        compat.randomBytes(&entropy.retry_key_share_seed);
-        backend.* = quic.tls_backend.Tls13Backend.initServerWithProvider(entropy, credential_provider);
+        backend.* = quic.tls_backend.Tls13Backend.initServerWithProvider(entropy, self.cryptoProvider(), credential_provider);
         // #488: install the same process-shared server resolver used by
         // native TCP, before the handshake can start — `Connection.init`
         // below arms the responder.
@@ -1597,12 +1595,14 @@ const RuntimeCidHarness = struct {
         const entry = try allocator.create(ConnEntry);
         errdefer allocator.destroy(entry);
         server_backend.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
-            .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+            .{ .hello_random = [_]u8{0x51} ** 32 },
+            test_quic_crypto.testHandshakeProvider(),
             credential_provider,
         );
         self.* = .{
             .client_backend = quic.tls_backend.Tls13Backend.initClient(
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .hello_random = [_]u8{0xc1} ** 32 },
+                test_quic_crypto.testHandshakeProvider(),
                 .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
             ),
             .server_backend = server_backend,
@@ -2596,7 +2596,8 @@ test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT cap
 
     var client_backend = try quic.tls_backend.Tls13Backend.initClientWithAllocator(
         allocator,
-        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .hello_random = [_]u8{0xc1} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
     );
 
@@ -2623,7 +2624,8 @@ test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT cap
 
     const backend = try allocator.create(quic.tls_backend.Tls13Backend);
     backend.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
-        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+        .{ .hello_random = [_]u8{0x51} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         fixed.provider(),
     );
 
@@ -2892,7 +2894,8 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
 
     var client_backend = try quic.tls_backend.Tls13Backend.initClientWithAllocator(
         allocator,
-        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .hello_random = [_]u8{0xc1} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
     );
 
@@ -2921,7 +2924,8 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
 
     const backend1 = try allocator.create(quic.tls_backend.Tls13Backend);
     backend1.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
-        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+        .{ .hello_random = [_]u8{0x51} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         fixed.provider(),
     );
     // Native QUIC 1-RTT resumption deliberately ignores connection-specific
@@ -3024,7 +3028,8 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
     try testing.expect(lookup == .hit);
 
     var client_backend2 = quic.tls_backend.Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xe1} ** 32, .key_share_seed = [_]u8{0x41} ** 32, .retry_key_share_seed = [_]u8{0x41} ** 32 },
+        .{ .hello_random = [_]u8{0xe1} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
     );
     var clock_dummy: u8 = 0;
@@ -3039,7 +3044,8 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
 
     const backend2 = try allocator.create(quic.tls_backend.Tls13Backend);
     backend2.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
-        .{ .hello_random = [_]u8{0xe2} ** 32, .key_share_seed = [_]u8{0x42} ** 32, .retry_key_share_seed = [_]u8{0x42} ** 32 },
+        .{ .hello_random = [_]u8{0xe2} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         fixed.provider(),
     );
     try backend2.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });
@@ -3405,7 +3411,8 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
 
     var client_backend = try quic.tls_backend.Tls13Backend.initClientWithAllocator(
         allocator,
-        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .hello_random = [_]u8{0xc1} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
     );
 
@@ -3434,7 +3441,8 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
 
     const backend1 = try allocator.create(quic.tls_backend.Tls13Backend);
     backend1.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
-        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+        .{ .hello_random = [_]u8{0x51} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         fixed.provider(),
     );
     const resume_policy: tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy = .{ .transport = .ignore, .application = .ignore };
@@ -3557,7 +3565,8 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
     try testing.expect(lookup == .hit);
 
     var client_backend2 = quic.tls_backend.Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xe1} ** 32, .key_share_seed = [_]u8{0x41} ** 32, .retry_key_share_seed = [_]u8{0x41} ** 32 },
+        .{ .hello_random = [_]u8{0xe1} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
     );
     var clock_dummy: u8 = 0;
@@ -3572,7 +3581,8 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
 
     const backend2 = try allocator.create(quic.tls_backend.Tls13Backend);
     backend2.* = quic.tls_backend.Tls13Backend.initServerWithProvider(
-        .{ .hello_random = [_]u8{0xe2} ** 32, .key_share_seed = [_]u8{0x42} ** 32, .retry_key_share_seed = [_]u8{0x42} ** 32 },
+        .{ .hello_random = [_]u8{0xe2} ** 32 },
+        test_quic_crypto.testHandshakeProvider(),
         fixed.provider(),
     );
     try backend2.setResumeCompatibilityPolicy(.{ .transport = .ignore, .application = .ignore });

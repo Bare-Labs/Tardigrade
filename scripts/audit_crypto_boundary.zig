@@ -2,8 +2,9 @@
 //!
 //! A small, dependency-free Zig program — not a shell script shelling out to
 //! an ambient `rg` — so the checked-in enforcement runs identically on every
-//! CI runner and platform without an extra tool to install. It blocks two
-//! things in QUIC protocol modules and the native HTTP/QUIC composition root:
+//! CI runner and platform without an extra tool to install. It blocks three
+//! things in QUIC protocol modules, the native TLS 1.3 engine, and the native
+//! HTTP/QUIC composition root:
 //!
 //!   1. New direct keyed-crypto calls (`std.crypto`'s AEAD/KDF/ECDH/signature
 //!      APIs and the `crypto.core.aes` block-cipher form QUIC header
@@ -17,6 +18,12 @@
 //!      migrated onto the `*WithProvider` entry points. This is what catches a
 //!      revert of that migration even though the names themselves are
 //!      "approved" inside `tls_adapter.zig` and test vector files.
+//!   3. The same class of direct keyed-crypto reintroduction in the native
+//!      TLS 1.3 key schedule and handshake engine (#490's second migration
+//!      target, `src/tls/key_schedule.zig` and `src/tls/tls13_backend.zig`):
+//!      HKDF, X25519 key exchange, and CertificateVerify signing/verification
+//!      must stay routed through `crypto.provider.CryptoProvider`, with the
+//!      same narrow named-exception discipline as the QUIC files above.
 //!
 //! Every approved exception is narrow: a named function/method body or an
 //! exact top-level declaration, blanked out of a file's content before that
@@ -170,6 +177,40 @@ const tls_adapter_zig_forbidden = [_][]const u8{
     "tls.hkdfExpandLabel(",
 } ++ aes_block_cipher ++ legacy_wrapper_calls;
 
+/// Same as `keyed_crypto_core` except `hkdfExpandLabel(` is qualified with
+/// the `crypto.tls.` prefix the one documented comptime exception in
+/// `src/tls/key_schedule.zig` uses, rather than matching bare. Every live
+/// (non-comptime) HKDF-Expand-Label call in that file goes through the
+/// provider vtable method `crypto_provider.hkdfExpandLabel(...)` /
+/// `self.provider.hkdfExpandLabel(...)`, which also contains the bare
+/// substring `hkdfExpandLabel(` — this variant is the only way to forbid the
+/// legacy `std.crypto`-backed spelling without also flagging its own
+/// approved provider call sites (same shape as `tls_adapter_zig_forbidden`
+/// above, #490 fourth-pass review).
+const key_schedule_zig_forbidden = [_][]const u8{
+    "std.crypto.aead.",
+    "crypto.aead.",
+    "std.crypto.auth.",
+    "crypto.auth.",
+    "std.crypto.dh.",
+    "crypto.dh.",
+    "std.crypto.sign.",
+    "crypto.sign.",
+    "std.crypto.kdf.",
+    "crypto.kdf.",
+    "Aes128Gcm.encrypt(",
+    "Aes128Gcm.decrypt(",
+    "Aes256Gcm.encrypt(",
+    "Aes256Gcm.decrypt(",
+    "ChaCha20Poly1305.encrypt(",
+    "ChaCha20Poly1305.decrypt(",
+    "X25519.",
+    "Ed25519.",
+    "Ecdsa",
+    "Rsa",
+    "crypto.tls.hkdfExpandLabel(",
+} ++ aes_block_cipher ++ legacy_wrapper_calls;
+
 const file_checks = [_]FileCheck{
     .{
         .path = "src/quic/connection.zig",
@@ -180,6 +221,11 @@ const file_checks = [_]FileCheck{
         .path = "src/http/http3_runtime.zig",
         .forbidden = &full_forbidden,
         .rationale = "The native HTTP/QUIC composition root selects/constructs a CryptoProvider and injects it into Connection/QuicTlsAdapter, but must not perform packet crypto itself: no direct concrete AEAD/KDF/ECDH/signature primitive, AES block-cipher form, or legacy tls_adapter wrapper call.",
+    },
+    .{
+        .path = "src/tls/tls13_backend.zig",
+        .forbidden = &full_forbidden,
+        .rationale = "The TLS 1.3 handshake state machine performs no concrete keyed primitive work (#490): X25519 key-share generation and shared-secret derivation route through CryptoProvider.generateKeyShare/.deriveSharedSecret, and CertificateVerify authentication routes through CryptoProvider.verify. Local signing stays behind the opaque CredentialProvider/SelectedCredential contract in credentials.zig, which this file only calls through, never a concrete std.crypto.sign type.",
     },
 };
 
@@ -267,6 +313,31 @@ const file_checks_with_exceptions = [_]FileCheckWithExceptions{
         // provider path.
         .production_only_marker = "\nconst testing = std.testing;",
         .rationale = "QuicTlsAdapter owns provider-backed QUIC packet protection; every canonical method and every *WithProvider entry point must reach CryptoProvider only, never a concrete primitive or its own legacy differential-fixture sibling.",
+    },
+    .{
+        .path = "src/tls/key_schedule.zig",
+        .forbidden = &key_schedule_zig_forbidden,
+        // `derived_early_secret` is the one documented comptime exception
+        // (#490, see docs/CRYPTO_PROVIDER_AUDIT.md): the "derived" early
+        // secret for the zero-PSK schedule is a fixed public constant (the
+        // all-zero PSK, not connection-specific secret material), computed
+        // once at compile time because no provider is available at comptime
+        // and none is needed. Two exact lines, not the whole block: the
+        // block-scoped `HkdfSha256` alias and the one `crypto.tls.
+        // hkdfExpandLabel` call it feeds, each narrow enough that a second,
+        // unrelated direct-crypto call added anywhere else in the file still
+        // fails (#490 fourth-pass review).
+        .exempt_exact = &.{
+            "const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;",
+            "break :blk crypto.tls.hkdfExpandLabel(HkdfSha256, early_secret, \"derived\", &empty_transcript_hash, hash_len);",
+        },
+        // This module's own test block (after the marker) cross-checks the
+        // HKDF-Extract-as-HMAC `verifyData` trick against a direct
+        // `std.crypto.auth.hmac.sha2.HmacSha256` computation and builds raw
+        // `CryptoProvider` vtables for typed-error-propagation fixtures —
+        // legitimate test-only direct crypto use, not production code.
+        .production_only_marker = "\nconst testing = std.testing;",
+        .rationale = "The TLS 1.3 key schedule performs no keyed HKDF/Finished-MAC work directly (#490): HKDF-Extract, HKDF-Expand-Label, and Finished verify_data (itself expressed as HKDF-Extract per RFC 5869) cross CryptoProvider. derived_early_secret's comptime derivation is the one documented public-constant exception; unkeyed transcript hashing (Sha256.hash) stays provider-independent by design and is not itself a forbidden pattern.",
     },
 };
 
@@ -581,6 +652,21 @@ test "tls_adapter_zig_forbidden allows provider.hkdfExpandLabel but forbids the 
     ).?);
 }
 
+test "key_schedule_zig_forbidden allows provider.hkdfExpandLabel but forbids the legacy crypto.tls.hkdfExpandLabel" {
+    try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
+        "try crypto_provider.hkdfExpandLabel(.sha256, &secret, \"c hs traffic\", &hash, &out);",
+        &key_schedule_zig_forbidden,
+    ));
+    try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
+        "try self.provider.hkdfExpandLabel(.sha256, &self.master_secret, \"c ap traffic\", &hash, &out);",
+        &key_schedule_zig_forbidden,
+    ));
+    try testing.expectEqualStrings("crypto.tls.hkdfExpandLabel(", firstForbidden(
+        "break :blk crypto.tls.hkdfExpandLabel(HkdfSha256, early_secret, \"derived\", &empty, hash_len);",
+        &key_schedule_zig_forbidden,
+    ).?);
+}
+
 test "clean protocol-module content produces no violation" {
     try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
         "keys.applyHeaderProtectionWithProvider(self.adapter.provider, &out[0], pn_field, sample) catch unreachable;",
@@ -752,6 +838,7 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
 
     try root.makePath("src/quic/nested");
     try root.makePath("src/http");
+    try root.makePath("src/tls");
 
     // The protected files/functions the fixture tree must carry so the
     // "clean" baseline below is actually clean, not just missing every
@@ -761,6 +848,8 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
     try root.writeFile(.{ .sub_path = "src/quic/tls_handshake.zig", .data = "" });
     try root.writeFile(.{ .sub_path = "src/quic/path.zig", .data = "" });
     try root.writeFile(.{ .sub_path = "src/quic/packet.zig", .data = "" });
+    try root.writeFile(.{ .sub_path = "src/tls/key_schedule.zig", .data = "" });
+    try root.writeFile(.{ .sub_path = "src/tls/tls13_backend.zig", .data = "" });
 
     const bypass_cases = [_]struct { rel: []const u8, contents: []const u8 }{
         .{ .rel = "src/quic/connection.zig", .contents = "const mask = Aes128.initEnc(self.hp);\n" },
@@ -794,6 +883,26 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
         // delegating to its own legacy concrete sibling instead of the
         // provider.
         .{ .rel = "src/quic/tls_adapter.zig", .contents = with_provider_delegates_to_legacy_fixture },
+
+        // #490's second migration target: src/tls/key_schedule.zig and
+        // src/tls/tls13_backend.zig. Each of the three bypass classes the
+        // issue calls out — a direct call, an aliased call, and a
+        // helper-function indirection — proven separately for both files.
+        .{ .rel = "src/tls/key_schedule.zig", .contents = "const shared = crypto.dh.X25519.scalarmult(a, b) catch unreachable;\n" },
+        // A differently-named local alias for the same concrete HKDF type:
+        // proves the guard catches the underlying crypto.kdf. qualifier
+        // regardless of what a caller names the alias, not just the one
+        // exact declaration this file's own comptime exception is scoped to.
+        .{ .rel = "src/tls/key_schedule.zig", .contents = "const RogueHkdf = crypto.kdf.hkdf.HkdfSha256;\n" },
+        // A forbidden call wrapped inside an arbitrarily-named helper
+        // function: the audit scans the whole file, not just the one named
+        // exempt function, so indirection through a new helper does not
+        // evade it. Argument shape deliberately differs from the one exact
+        // exempted expand-label call so this does not collide with it.
+        .{ .rel = "src/tls/key_schedule.zig", .contents = "fn helperDerive(s: []const u8) [32]u8 { var out: [32]u8 = undefined; crypto.tls.hkdfExpandLabel(HkdfSha256, s, \"other\", \"\", &out); return out; }\n" },
+        .{ .rel = "src/tls/tls13_backend.zig", .contents = "var kp = X25519.KeyPair.generateDeterministic(seed) catch unreachable;\n" },
+        .{ .rel = "src/tls/tls13_backend.zig", .contents = "const LocalEd25519 = crypto.sign.Ed25519;\n" },
+        .{ .rel = "src/tls/tls13_backend.zig", .contents = "fn helperVerify(sig: []const u8, msg: []const u8, key: []const u8) void { Ed25519.verify(sig, msg, key) catch unreachable; }\n" },
     };
 
     for (bypass_cases) |case| {

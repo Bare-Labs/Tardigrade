@@ -35,11 +35,35 @@ const tls13_transport = @import("tls13_transport.zig");
 const tls_transcript = @import("transcript.zig");
 
 const crypto = std.crypto;
-const X25519 = crypto.dh.X25519;
-const Ed25519 = crypto.sign.Ed25519;
-const EcdsaP256 = crypto.sign.ecdsa.EcdsaP256Sha256;
 const Certificate = crypto.Certificate;
 const Sha256 = crypto.hash.sha2.Sha256;
+const crypto_provider_pkg = crypto_pkg.provider;
+
+/// The one key-exchange group this profile negotiates. Key-share generation
+/// and shared-secret derivation both go through `CryptoProvider` (#490), so
+/// this file names only the provider's `Group` enum value and the wire
+/// lengths derived from it — never a concrete `std` X25519 Diffie-Hellman
+/// type.
+const key_share_group = crypto_provider_pkg.Group.x25519;
+const key_share_public_len = key_share_group.publicKeyLength();
+const key_share_shared_len = key_share_group.sharedSecretLength();
+/// X25519 private scalar length (RFC 7748). The provider boundary does not
+/// separately name a "private scalar length" per group (only the public key
+/// and shared-secret lengths, which happen to coincide with it for this
+/// curve); this local constant exists so `EphemeralKeyShare` below can size
+/// its private-key buffer without importing a concrete crypto type.
+const key_share_private_len = 32;
+
+/// This backend's own ephemeral key-share storage: raw public/private bytes
+/// produced by `CryptoProvider.generateKeyShare`/consumed by
+/// `.deriveSharedSecret`, not a concrete `std` X25519 key-pair type (#490) —
+/// the provider owns key-exchange primitives, this struct only holds the
+/// caller-owned buffers the provider boundary's borrowed-secret contract
+/// requires.
+const EphemeralKeyShare = struct {
+    public_key: [key_share_public_len]u8 = undefined,
+    private_key: [key_share_private_len]u8 = undefined,
+};
 
 const EncryptionLevel = events.EncryptionEpoch;
 const CertificateState = events.CertificateState;
@@ -498,14 +522,16 @@ const max_server_name_len = 256;
 
 /// Caller-supplied entropy for one handshake, consistent with the rest of
 /// `src/quic/` where unpredictable bytes always come from the caller.
+///
+/// Ephemeral X25519 key-share generation is *not* seeded from here (#490):
+/// it draws randomness from the injected `CryptoProvider`'s own `Entropy`
+/// (wired at the provider's construction — `production_crypto.OsEntropy` in
+/// production, `pure_zig.DeterministicEntropy` in tests), the same seam
+/// every other keyed TLS/QUIC operation uses. `hello_random` is unrelated
+/// key-exchange material — the TLS ClientHello/ServerHello `random` field —
+/// and stays here, unchanged.
 pub const Entropy = struct {
     hello_random: [32]u8,
-    key_share_seed: [X25519.seed_length]u8,
-    /// Client-only: seeds the fresh X25519 share ClientHello2 emits when a
-    /// HelloRetryRequest requests a group. Never consumed by the server,
-    /// which generates at most one key pair per connection (for the final
-    /// ServerHello, after any retry has already been resolved).
-    retry_key_share_seed: [X25519.seed_length]u8,
 };
 
 // ===========================================================================
@@ -517,6 +543,13 @@ pub const Tls13Backend = struct {
     profile: TransportProfile,
     policy: tls_policy.Policy,
     entropy: Entropy,
+    /// The shared cryptographic-provider boundary (#490): every keyed
+    /// operation this engine performs — the TLS 1.3 HKDF key schedule,
+    /// X25519 key-share generation and shared-secret derivation, and
+    /// CertificateVerify signature verification — goes through this value,
+    /// injected explicitly by the caller's composition root. There is no
+    /// default; every constructor below requires one.
+    crypto_provider: crypto_provider_pkg.CryptoProvider,
     identity: Identity = undefined,
     identity_present: bool = false,
     trust: Trust = .insecure_no_verification,
@@ -567,7 +600,7 @@ pub const Tls13Backend = struct {
     peer_transport_extension: [max_transport_extension_len]u8 = undefined,
     peer_transport_extension_len: usize = 0,
     peer_transport_extension_pending: bool = false,
-    key_pair: X25519.KeyPair = undefined,
+    key_pair: EphemeralKeyShare = .{},
     key_pair_present: bool = false,
     /// Client (#484): which key-share strategy ClientHello1 uses, configured
     /// via `ClientOptions.initial_key_share_mode` before `start`.
@@ -620,7 +653,7 @@ pub const Tls13Backend = struct {
     pending_signature: [max_signature_len]u8 = undefined,
     pending_client_session_id: [32]u8 = undefined,
     pending_client_session_id_len: usize = 0,
-    pending_client_share: [X25519.public_length]u8 = undefined,
+    pending_client_share: [key_share_public_len]u8 = undefined,
     pending_client_hello_ready: bool = false,
     /// Client (#362): resumption tickets this backend may offer, owned until
     /// moved out at ClientHello emission or wiped after ServerHello selects
@@ -959,17 +992,27 @@ pub const Tls13Backend = struct {
     }
 
     /// Allocation-free. The returned backend owns its copied entropy until
-    /// `deinit`, which securely clears all private material.
-    pub fn initClient(entropy: Entropy, trust: Trust, profile: TransportProfile) Tls13Backend {
-        return initClientConfigured(entropy, trust, defaultConfigForTransport(profile), .{});
+    /// `deinit`, which securely clears all private material. `crypto_provider`
+    /// is the shared cryptographic-provider boundary (#490) this handshake's
+    /// HKDF key schedule, key-share generation, and signature verification
+    /// run through — required explicitly, with no default.
+    pub fn initClient(entropy: Entropy, crypto_provider: crypto_provider_pkg.CryptoProvider, trust: Trust, profile: TransportProfile) Tls13Backend {
+        return initClientConfigured(entropy, crypto_provider, trust, defaultConfigForTransport(profile), .{});
     }
 
-    pub fn initClientConfigured(entropy: Entropy, trust: Trust, config: BackendConfig, options: ClientOptions) Tls13Backend {
+    pub fn initClientConfigured(
+        entropy: Entropy,
+        crypto_provider: crypto_provider_pkg.CryptoProvider,
+        trust: Trust,
+        config: BackendConfig,
+        options: ClientOptions,
+    ) Tls13Backend {
         var self: Tls13Backend = .{
             .role = .client,
             .profile = config.transport,
             .policy = config.policy,
             .entropy = entropy,
+            .crypto_provider = crypto_provider,
             .trust = trust,
             .auth_policy = policyFromTrust(trust),
             .core = tls_handshake_codec.Core.init(.client),
@@ -980,8 +1023,14 @@ pub const Tls13Backend = struct {
 
     /// Client construction with the built-in fixed trust policy plus explicit
     /// client options such as intended SNI.
-    pub fn initClientWithOptions(entropy: Entropy, trust: Trust, profile: TransportProfile, options: ClientOptions) Tls13Backend {
-        return initClientConfigured(entropy, trust, defaultConfigForTransport(profile), options);
+    pub fn initClientWithOptions(
+        entropy: Entropy,
+        crypto_provider: crypto_provider_pkg.CryptoProvider,
+        trust: Trust,
+        profile: TransportProfile,
+        options: ClientOptions,
+    ) Tls13Backend {
+        return initClientConfigured(entropy, crypto_provider, trust, defaultConfigForTransport(profile), options);
     }
 
     fn applyClientOptions(self: *Tls13Backend, options: ClientOptions) void {
@@ -1002,17 +1051,24 @@ pub const Tls13Backend = struct {
     /// Allocation-free. The returned backend owns its copy of `identity` and
     /// securely clears the private signing key in `deinit`. The fixed identity
     /// is served to the engine through the production `CredentialProvider`
-    /// contract, identical to an external provider.
-    pub fn initServer(entropy: Entropy, identity: Identity, profile: TransportProfile) Tls13Backend {
-        return initServerConfigured(entropy, identity, defaultConfigForTransport(profile));
+    /// contract, identical to an external provider. `crypto_provider` is the
+    /// shared cryptographic-provider boundary (#490); required explicitly.
+    pub fn initServer(entropy: Entropy, crypto_provider: crypto_provider_pkg.CryptoProvider, identity: Identity, profile: TransportProfile) Tls13Backend {
+        return initServerConfigured(entropy, crypto_provider, identity, defaultConfigForTransport(profile));
     }
 
-    pub fn initServerConfigured(entropy: Entropy, identity: Identity, config: BackendConfig) Tls13Backend {
+    pub fn initServerConfigured(
+        entropy: Entropy,
+        crypto_provider: crypto_provider_pkg.CryptoProvider,
+        identity: Identity,
+        config: BackendConfig,
+    ) Tls13Backend {
         return .{
             .role = .server,
             .profile = config.transport,
             .policy = config.policy,
             .entropy = entropy,
+            .crypto_provider = crypto_provider,
             .identity = identity,
             .identity_present = true,
             .core = tls_handshake_codec.Core.init(.server),
@@ -1021,17 +1077,31 @@ pub const Tls13Backend = struct {
 
     /// Server construction against an external credential provider (SNI
     /// selector, external/asynchronous signer, ...). The provider's storage
-    /// must outlive the handshake. No fixed identity is held.
-    pub fn initServerWithProvider(entropy: Entropy, provider: CredentialProvider, profile: TransportProfile) Tls13Backend {
-        return initServerWithProviderConfigured(entropy, provider, defaultConfigForTransport(profile));
+    /// must outlive the handshake. No fixed identity is held. `crypto_provider`
+    /// is the shared cryptographic-provider boundary (#490); required
+    /// explicitly and distinct from `provider` (the credential/SNI selection
+    /// contract, `credentials.CredentialProvider`).
+    pub fn initServerWithProvider(
+        entropy: Entropy,
+        crypto_provider: crypto_provider_pkg.CryptoProvider,
+        provider: CredentialProvider,
+        profile: TransportProfile,
+    ) Tls13Backend {
+        return initServerWithProviderConfigured(entropy, crypto_provider, provider, defaultConfigForTransport(profile));
     }
 
-    pub fn initServerWithProviderConfigured(entropy: Entropy, provider: CredentialProvider, config: BackendConfig) Tls13Backend {
+    pub fn initServerWithProviderConfigured(
+        entropy: Entropy,
+        crypto_provider: crypto_provider_pkg.CryptoProvider,
+        provider: CredentialProvider,
+        config: BackendConfig,
+    ) Tls13Backend {
         return .{
             .role = .server,
             .profile = config.transport,
             .policy = config.policy,
             .entropy = entropy,
+            .crypto_provider = crypto_provider,
             .external_provider = provider,
             .core = tls_handshake_codec.Core.init(.server),
         };
@@ -1042,16 +1112,31 @@ pub const Tls13Backend = struct {
     /// handshake. `options` carries the intended server name (emitted as SNI and
     /// passed to the verifier for hostname verification) and the explicit
     /// policy — the verifier never inherits the insecure trust default.
-    pub fn initClientWithVerifier(entropy: Entropy, verifier: PeerVerifier, profile: TransportProfile, options: ClientOptions) Tls13Backend {
-        return initClientWithVerifierConfigured(entropy, verifier, defaultConfigForTransport(profile), options);
+    /// `crypto_provider` is the shared cryptographic-provider boundary (#490);
+    /// required explicitly.
+    pub fn initClientWithVerifier(
+        entropy: Entropy,
+        crypto_provider: crypto_provider_pkg.CryptoProvider,
+        verifier: PeerVerifier,
+        profile: TransportProfile,
+        options: ClientOptions,
+    ) Tls13Backend {
+        return initClientWithVerifierConfigured(entropy, crypto_provider, verifier, defaultConfigForTransport(profile), options);
     }
 
-    pub fn initClientWithVerifierConfigured(entropy: Entropy, verifier: PeerVerifier, config: BackendConfig, options: ClientOptions) Tls13Backend {
+    pub fn initClientWithVerifierConfigured(
+        entropy: Entropy,
+        crypto_provider: crypto_provider_pkg.CryptoProvider,
+        verifier: PeerVerifier,
+        config: BackendConfig,
+        options: ClientOptions,
+    ) Tls13Backend {
         var self: Tls13Backend = .{
             .role = .client,
             .profile = config.transport,
             .policy = config.policy,
             .entropy = entropy,
+            .crypto_provider = crypto_provider,
             .external_verifier = verifier,
             .auth_policy = options.policy,
             .core = tls_handshake_codec.Core.init(.client),
@@ -1547,7 +1632,6 @@ pub const Tls13Backend = struct {
         self.client_hrr_selection = null;
         crypto.secureZero(u8, &self.expected_client_verify);
         self.wipeEphemeral();
-        self.wipeRetryKeyShareSeed();
         self.wipeIdentity();
         crypto.secureZero(u8, &self.peer_chain);
         self.peer_chain_count = 0;
@@ -1582,20 +1666,8 @@ pub const Tls13Backend = struct {
     }
 
     fn wipeEphemeral(self: *Tls13Backend) void {
-        crypto.secureZero(u8, &self.entropy.key_share_seed);
         crypto.secureZero(u8, std.mem.asBytes(&self.key_pair));
         self.key_pair_present = false;
-    }
-
-    /// Client (#484): zeroes the HelloRetryRequest-only key-share seed.
-    /// Deliberately separate from `wipeEphemeral` — on the retry path,
-    /// `wipeEphemeral` runs *before* this seed is consumed (to destroy
-    /// ClientHello1's superseded key pair), so folding this into it would
-    /// zero the seed before it could be used. Called immediately after the
-    /// fresh key pair is generated from it, and unconditionally on
-    /// teardown so an unconsumed seed never outlives the connection.
-    fn wipeRetryKeyShareSeed(self: *Tls13Backend) void {
-        crypto.secureZero(u8, &self.entropy.retry_key_share_seed);
     }
 
     fn wipeIdentity(self: *Tls13Backend) void {
@@ -1664,7 +1736,6 @@ pub const Tls13Backend = struct {
         self.early_data_discard_limit = 0;
         self.clearClientHelloPsk();
         self.retry.wipe();
-        self.wipeRetryKeyShareSeed();
         self.client_hrr_selection = null;
         // #484: a terminal failure anywhere between generating an ephemeral
         // key pair (the initial-flight one, or the fresh one
@@ -2077,6 +2148,7 @@ pub const Tls13Backend = struct {
         const received_at = configured.consumer.nowUnixMsFn(configured.consumer.ctx);
         var state = new_session_ticket.buildClientTicketState(
             configured.allocator,
+            self.crypto_provider,
             parsed,
             self.resumptionContextForTicket(parsed.max_early_data_size != null),
             self.resumption_master_secret.slice(),
@@ -2147,17 +2219,18 @@ pub const Tls13Backend = struct {
         try w.u16_(ext_key_share);
         switch (self.initial_key_share_mode) {
             .normal => {
-                var key_pair = X25519.KeyPair.generateDeterministic(self.entropy.key_share_seed) catch
+                var share: EphemeralKeyShare = .{};
+                self.crypto_provider.generateKeyShare(key_share_group, &share.public_key, &share.private_key) catch
                     return error.SecretExportFailed;
-                defer crypto.secureZero(u8, &key_pair.secret_key);
-                self.key_pair = key_pair;
+                defer crypto.secureZero(u8, &share.private_key);
+                self.key_pair = share;
                 self.key_pair_present = true;
 
-                try w.u16_(2 + 2 + 2 + X25519.public_length);
-                try w.u16_(2 + 2 + X25519.public_length); // client_shares
+                try w.u16_(2 + 2 + 2 + key_share_public_len);
+                try w.u16_(2 + 2 + key_share_public_len); // client_shares
                 try w.u16_(group_x25519);
-                try w.u16_(X25519.public_length);
-                try w.bytes(&key_pair.public_key);
+                try w.u16_(key_share_public_len);
+                try w.bytes(&share.public_key);
             },
             // #484: advertise the group in `supported_groups` above but send
             // a legal empty `client_shares` vector, so a native server
@@ -2286,7 +2359,8 @@ pub const Tls13Backend = struct {
             var client_hello_hash: [hash_len]u8 = undefined;
             Sha256.hash(message, &client_hello_hash, .{});
 
-            var early = KeySchedule.clientEarlyTrafficSecret(&psk_secrets[0], client_hello_hash);
+            var early = KeySchedule.clientEarlyTrafficSecret(self.crypto_provider, &psk_secrets[0], client_hello_hash) catch
+                return error.SecretExportFailed;
             defer crypto.secureZero(u8, &early);
 
             try self.emitSecret(sink, .zero_rtt, .write, &early);
@@ -2475,7 +2549,7 @@ pub const Tls13Backend = struct {
         len = try checkedAdd(len, 2 + 2 + 1 + 2 * self.policy.protocol_versions.len); // supported_versions
         len = try checkedAdd(len, 2 + 2 + 2 + 2 * self.policy.named_groups.len); // supported_groups
         len = try checkedAdd(len, 2 + 2 + 2 + 2 * self.policy.signature_schemes.len); // signature_algorithms
-        len = try checkedAdd(len, 2 + 2 + 2 + 2 + 2 + X25519.public_length); // key_share
+        len = try checkedAdd(len, 2 + 2 + 2 + 2 + 2 + key_share_public_len); // key_share
         len = try checkedAdd(len, try self.policyAlpnOfferEncodedLen());
         if (self.serverNameSlice()) |name| {
             len = try checkedAdd(len, 2 + 2 + 2 + 1 + 2 + name.len);
@@ -2544,7 +2618,7 @@ pub const Tls13Backend = struct {
 
         var selected_version: ?tls_algorithms.ProtocolVersion = null;
         var selected_group: ?tls_algorithms.NamedGroup = null;
-        var peer_share: ?[X25519.public_length]u8 = null;
+        var peer_share: ?[key_share_public_len]u8 = null;
         var selected_identity: ?u16 = null;
         var guard = ExtensionGuard{};
         var extensions = Reader{ .bytes = try r.slice(try r.u16_()) };
@@ -2560,8 +2634,8 @@ pub const Tls13Backend = struct {
                 },
                 ext_key_share => {
                     const group = tls_algorithms.fromInt(tls_algorithms.NamedGroup, try ext.u16_()) orelse return error.IllegalParameter;
-                    if (try ext.u16_() != X25519.public_length) return error.IllegalParameter;
-                    peer_share = (try ext.slice(X25519.public_length))[0..X25519.public_length].*;
+                    if (try ext.u16_() != key_share_public_len) return error.IllegalParameter;
+                    peer_share = (try ext.slice(key_share_public_len))[0..key_share_public_len].*;
                     selected_group = group;
                     try ext.expectEnd();
                 },
@@ -2602,8 +2676,11 @@ pub const Tls13Backend = struct {
         // illegal value (predictable all-zero shared secret), not malformed wire
         // data.
         if (!self.key_pair_present) return error.InvalidHandshakeState;
-        var shared = X25519.scalarmult(self.key_pair.secret_key, share) catch
-            return error.IllegalParameter;
+        var shared: [key_share_shared_len]u8 = undefined;
+        self.crypto_provider.deriveSharedSecret(key_share_group, &self.key_pair.private_key, &share, &shared) catch |err| return switch (err) {
+            error.InvalidInput => error.IllegalParameter,
+            error.UnsupportedCapability => error.SecretExportFailed,
+        };
         defer crypto.secureZero(u8, &shared);
 
         // #362: consistency-check the server's selected_identity (if any)
@@ -2657,10 +2734,12 @@ pub const Tls13Backend = struct {
             // ticket's PSK — so the client may treat the peer as
             // equivalently authenticated without a fresh Certificate flight.
             try sink.emitCertificate(.valid);
-            self.schedule = KeySchedule.initWithPsk(psk, &shared, self.core.transcriptHash());
+            self.schedule = KeySchedule.initWithPsk(self.crypto_provider, psk, &shared, self.core.transcriptHash()) catch
+                return error.SecretExportFailed;
             crypto.secureZero(u8, psk);
         } else {
-            self.schedule = KeySchedule.init(&shared, self.core.transcriptHash());
+            self.schedule = KeySchedule.init(self.crypto_provider, &shared, self.core.transcriptHash()) catch
+                return error.SecretExportFailed;
         }
         try self.emitHandshakeSecrets(sink);
         try sink.emitDiscardKeys(.initial);
@@ -2747,21 +2826,18 @@ pub const Tls13Backend = struct {
             // the fresh share ClientHello2 requires — never hold two live
             // private keys, and never reuse the superseded one.
             self.wipeEphemeral();
-            var key_pair = X25519.KeyPair.generateDeterministic(self.entropy.retry_key_share_seed) catch
+            var share: EphemeralKeyShare = .{};
+            self.crypto_provider.generateKeyShare(key_share_group, &share.public_key, &share.private_key) catch
                 return error.SecretExportFailed;
-            defer crypto.secureZero(u8, &key_pair.secret_key);
-            self.key_pair = key_pair;
+            defer crypto.secureZero(u8, &share.private_key);
+            self.key_pair = share;
             self.key_pair_present = true;
-            // #484: the retry seed is consumed exactly once per connection;
-            // zero it immediately rather than leaving it resident for the
-            // rest of the backend's lifetime.
-            self.wipeRetryKeyShareSeed();
 
-            try w.u16_(2 + 2 + 2 + X25519.public_length);
-            try w.u16_(2 + 2 + X25519.public_length); // client_shares
+            try w.u16_(2 + 2 + 2 + key_share_public_len);
+            try w.u16_(2 + 2 + key_share_public_len); // client_shares
             try w.u16_(group_x25519);
-            try w.u16_(X25519.public_length);
-            try w.bytes(&key_pair.public_key);
+            try w.u16_(key_share_public_len);
+            try w.bytes(&share.public_key);
         } else {
             // Cookie-only retry: ClientHello2's `key_share` extension must be
             // byte-identical to ClientHello1's. Rebuilding it from the
@@ -3239,53 +3315,70 @@ pub const Tls13Backend = struct {
     /// Verify the CertificateVerify signature against the peer leaf's public
     /// key: proof that the peer holds the private key for the presented
     /// certificate. This is not a trust decision — that is the verifier's job.
+    ///
+    /// Routed through `CryptoProvider.verify` (#490), the same shape
+    /// `src/pki/verify.zig` already uses for chain-signature verification:
+    /// preflight the scheme against the provider's advertised capabilities,
+    /// then map its typed error onto this function's own `ProofResult`
+    /// without exposing provider-specific detail. `parsed.pubKey()` is the
+    /// certificate's raw public-key encoding (SEC1 for ECDSA, raw 32 bytes
+    /// for Ed25519); the provider parses/validates it internally, so this
+    /// function no longer names a concrete `std.crypto.sign` type at all.
     fn checkProofOfPossession(self: *const Tls13Backend, algorithm: u16, signature: []const u8, content: []const u8) ProofResult {
         if (!self.locallyOfferedSignatureAlgorithm(algorithm)) return .unoffered_algorithm;
         if (self.peer_chain_count == 0) return .invalid_certificate;
         const e = self.peer_chain_entries[0];
         const leaf = self.peer_chain[e.start..][0..e.len];
         const parsed = (Certificate{ .buffer = leaf, .index = 0 }).parse() catch return .invalid_certificate;
-        switch (algorithm) {
-            sigalg_ed25519 => {
-                if (signature.len != Ed25519.Signature.encoded_length) return .invalid_signature;
+        const scheme: crypto_provider_pkg.SignatureScheme = switch (algorithm) {
+            sigalg_ed25519 => blk: {
                 if (parsed.pub_key_algo != .curveEd25519) {
                     return switch (parsed.pub_key_algo) {
                         .X9_62_id_ecPublicKey => |curve| if (curve == .X9_62_prime256v1) .invalid_signature else .unsupported_certificate,
                         else => .unsupported_certificate,
                     };
                 }
-                const pub_key_bytes = parsed.pubKey();
-                if (pub_key_bytes.len != Ed25519.PublicKey.encoded_length) return .invalid_certificate;
-                const public_key = Ed25519.PublicKey.fromBytes(pub_key_bytes[0..Ed25519.PublicKey.encoded_length].*) catch return .invalid_certificate;
-                const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
-                sig.verify(content, public_key) catch return .invalid_signature;
+                break :blk .ed25519;
             },
-            sigalg_ecdsa_secp256r1_sha256 => {
+            sigalg_ecdsa_secp256r1_sha256 => blk: {
                 switch (parsed.pub_key_algo) {
                     .X9_62_id_ecPublicKey => |curve| if (curve != .X9_62_prime256v1) return .unsupported_certificate,
                     .curveEd25519 => return .invalid_signature,
                     else => return .unsupported_certificate,
                 }
-                const public_key = EcdsaP256.PublicKey.fromSec1(parsed.pubKey()) catch return .invalid_certificate;
-                const sig = EcdsaP256.Signature.fromDer(signature) catch return .invalid_signature;
-                sig.verify(content, public_key) catch return .invalid_signature;
+                break :blk .ecdsa_secp256r1_sha256;
             },
             else => unreachable,
-        }
+        };
+        if (!self.crypto_provider.capabilities().supportsSignature(scheme)) return .unsupported_certificate;
+        self.crypto_provider.verify(scheme, parsed.pubKey(), content, signature) catch |err| return switch (err) {
+            // A well-formed signature that does not check out is a proof-of-
+            // possession failure (decrypt_error, RFC 8446 §4.4.3).
+            error.AuthenticationFailed => .invalid_signature,
+            // `provider.verify` reports `InvalidInput` for a structurally
+            // malformed public-key or signature encoding (see
+            // `pure_zig.verifyImpl`) — the same defect class the
+            // pre-migration code caught with its own `PublicKey.fromBytes`
+            // check and mapped to `.invalid_certificate` (bad_certificate),
+            // distinct from a validly-encoded signature that simply fails to
+            // verify.
+            error.InvalidInput => .invalid_certificate,
+            error.UnsupportedCapability => .unsupported_certificate,
+        };
         return .valid;
     }
 
     fn onServerFinished(self: *Tls13Backend, transcript_before: [hash_len]u8, body: []const u8, sink: *EventSink) HandshakeError!void {
         const schedule = &self.schedule.?;
         if (body.len != hash_len) return error.MalformedHandshake;
-        var expected = KeySchedule.verifyData(&schedule.server_handshake_traffic, transcript_before);
+        var expected = KeySchedule.verifyData(schedule.provider, &schedule.server_handshake_traffic, transcript_before) catch return error.SecretExportFailed;
         defer crypto.secureZero(u8, &expected);
         if (!crypto.timing_safe.eql([hash_len]u8, expected, body[0..hash_len].*)) return error.DecryptError;
 
         // 1-RTT secrets exist from the transcript through server Finished,
         // independent of any client certificate flight that follows.
         const finished_hash = self.core.transcriptHash();
-        var app = schedule.applicationSecrets(finished_hash);
+        var app = schedule.applicationSecrets(finished_hash) catch return error.SecretExportFailed;
         defer app.wipe();
         try self.emitSecret(sink, .application, .write, &app.client);
         try self.emitSecret(sink, .application, .read, &app.server);
@@ -3324,7 +3417,7 @@ pub const Tls13Backend = struct {
         var w = Writer{ .buf = &buf };
         try w.u8_(@intFromEnum(MessageType.finished));
         const message_len = try w.reserve(3);
-        var client_verify = KeySchedule.verifyData(&schedule.client_handshake_traffic, finished_transcript_hash);
+        var client_verify = KeySchedule.verifyData(schedule.provider, &schedule.client_handshake_traffic, finished_transcript_hash) catch return error.SecretExportFailed;
         defer crypto.secureZero(u8, &client_verify);
         try w.bytes(&client_verify);
         w.patch(3, message_len);
@@ -3485,7 +3578,7 @@ pub const Tls13Backend = struct {
         const finished_start = w.len;
         try w.u8_(@intFromEnum(MessageType.finished));
         const finished_len = try w.reserve(3);
-        var client_verify = KeySchedule.verifyData(&schedule.client_handshake_traffic, self.core.transcriptHash());
+        var client_verify = KeySchedule.verifyData(schedule.provider, &schedule.client_handshake_traffic, self.core.transcriptHash()) catch return error.SecretExportFailed;
         defer crypto.secureZero(u8, &client_verify);
         try w.bytes(&client_verify);
         w.patch(3, finished_len);
@@ -3615,8 +3708,8 @@ pub const Tls13Backend = struct {
                 return self.emitHelloRetryRequest(raw, group, cookie, hello_selection, parsed.legacy_session_id, sink);
             },
         };
-        if (selected_key_share.len != X25519.public_length) return error.MalformedHandshake;
-        const client_share = selected_key_share[0..X25519.public_length].*;
+        if (selected_key_share.len != key_share_public_len) return error.MalformedHandshake;
+        const client_share = selected_key_share[0..key_share_public_len].*;
         if (hello_selection.cipher_suite != .tls_aes_128_gcm_sha256 or
             hello_selection.named_group != .x25519 or
             hello_selection.version != .tls13)
@@ -3765,7 +3858,7 @@ pub const Tls13Backend = struct {
     fn beginServerSelection(
         self: *Tls13Backend,
         session_id: []const u8,
-        client_share: [X25519.public_length]u8,
+        client_share: [key_share_public_len]u8,
         sink: *EventSink,
     ) HandshakeError!void {
         if (session_id.len > self.pending_client_session_id.len) return error.IllegalParameter;
@@ -3803,25 +3896,29 @@ pub const Tls13Backend = struct {
     fn emitServerHelloAndAuthFlight(
         self: *Tls13Backend,
         session_id: []const u8,
-        client_share: [X25519.public_length]u8,
+        client_share: [key_share_public_len]u8,
         credential: credentials.SelectedCredential,
         sink: *EventSink,
     ) HandshakeError!void {
         var owned = true;
         errdefer if (owned) credential.release();
 
-        // Validate the peer share before emitting anything: X25519.scalarmult
+        // Validate the peer share before emitting anything: deriveSharedSecret
         // rejects low-order/identity public keys (all-zero shared secret)
         // rather than deriving a predictable secret.
-        var key_pair = X25519.KeyPair.generateDeterministic(self.entropy.key_share_seed) catch
+        var share: EphemeralKeyShare = .{};
+        self.crypto_provider.generateKeyShare(key_share_group, &share.public_key, &share.private_key) catch
             return error.SecretExportFailed;
-        defer crypto.secureZero(u8, &key_pair.secret_key);
-        self.key_pair = key_pair;
+        defer crypto.secureZero(u8, &share.private_key);
+        self.key_pair = share;
         self.key_pair_present = true;
-        var shared = X25519.scalarmult(key_pair.secret_key, client_share) catch
-            return error.IllegalParameter;
+        var shared: [key_share_shared_len]u8 = undefined;
+        self.crypto_provider.deriveSharedSecret(key_share_group, &share.private_key, &client_share, &shared) catch |err| return switch (err) {
+            error.InvalidInput => error.IllegalParameter,
+            error.UnsupportedCapability => error.SecretExportFailed,
+        };
         defer crypto.secureZero(u8, &shared);
-        crypto.secureZero(u8, &key_pair.secret_key);
+        crypto.secureZero(u8, &share.private_key);
         self.wipeEphemeral();
 
         // #362: credential selection (above, by the caller) happens before
@@ -3857,10 +3954,10 @@ pub const Tls13Backend = struct {
         try hello.u16_(2);
         try hello.u16_(self.negotiatedVersionCode());
         try hello.u16_(ext_key_share);
-        try hello.u16_(2 + 2 + X25519.public_length);
+        try hello.u16_(2 + 2 + key_share_public_len);
         try hello.u16_(self.negotiatedGroupCode());
-        try hello.u16_(X25519.public_length);
-        try hello.bytes(&key_pair.public_key);
+        try hello.u16_(key_share_public_len);
+        try hello.bytes(&share.public_key);
         if (psk_selected) |sel| {
             try hello.u16_(pre_shared_key.ext_pre_shared_key);
             try hello.u16_(2);
@@ -3874,9 +3971,11 @@ pub const Tls13Backend = struct {
         if (self.selectedAlpn()) |protocol| try sink.emitAlpn(protocol);
 
         if (psk_selected) |*sel| {
-            self.schedule = KeySchedule.initWithPsk(&sel.psk, &shared, self.core.transcriptHash());
+            self.schedule = KeySchedule.initWithPsk(self.crypto_provider, &sel.psk, &shared, self.core.transcriptHash()) catch
+                return error.SecretExportFailed;
         } else {
-            self.schedule = KeySchedule.init(&shared, self.core.transcriptHash());
+            self.schedule = KeySchedule.init(self.crypto_provider, &shared, self.core.transcriptHash()) catch
+                return error.SecretExportFailed;
         }
         try self.emitHandshakeSecrets(sink);
         try sink.emitDiscardKeys(.initial);
@@ -4040,7 +4139,8 @@ pub const Tls13Backend = struct {
                 var client_hello_hash: [hash_len]u8 = undefined;
                 Sha256.hash(capture.message[0..capture.message_len], &client_hello_hash, .{});
 
-                var early = KeySchedule.clientEarlyTrafficSecret(&psk_buf, client_hello_hash);
+                var early = KeySchedule.clientEarlyTrafficSecret(self.crypto_provider, &psk_buf, client_hello_hash) catch
+                    return error.SecretExportFailed;
                 defer crypto.secureZero(u8, &early);
 
                 // The server never emits a 0-RTT *write* key; server
@@ -4184,7 +4284,7 @@ pub const Tls13Backend = struct {
         var fw = Writer{ .buf = &fbuf };
         try fw.u8_(@intFromEnum(MessageType.finished));
         const finished_len = try fw.reserve(3);
-        var server_verify = KeySchedule.verifyData(&schedule.server_handshake_traffic, self.core.transcriptHash());
+        var server_verify = KeySchedule.verifyData(schedule.provider, &schedule.server_handshake_traffic, self.core.transcriptHash()) catch return error.SecretExportFailed;
         defer crypto.secureZero(u8, &server_verify);
         try fw.bytes(&server_verify);
         fw.patch(3, finished_len);
@@ -4193,7 +4293,7 @@ pub const Tls13Backend = struct {
         try sink.emitCrypto(.handshake, finished);
 
         const finished_hash = self.core.transcriptHash();
-        var app = schedule.applicationSecrets(finished_hash);
+        var app = schedule.applicationSecrets(finished_hash) catch return error.SecretExportFailed;
         defer app.wipe();
         try self.emitSecret(sink, .application, .read, &app.client);
         try self.emitSecret(sink, .application, .write, &app.server);
@@ -4349,7 +4449,7 @@ pub const Tls13Backend = struct {
         const finished_start = w.len;
         try w.u8_(@intFromEnum(MessageType.finished));
         const finished_len = try w.reserve(3);
-        var server_verify = KeySchedule.verifyData(&schedule.server_handshake_traffic, self.core.transcriptHash());
+        var server_verify = KeySchedule.verifyData(schedule.provider, &schedule.server_handshake_traffic, self.core.transcriptHash()) catch return error.SecretExportFailed;
         defer crypto.secureZero(u8, &server_verify);
         try w.bytes(&server_verify);
         w.patch(3, finished_len);
@@ -4362,7 +4462,7 @@ pub const Tls13Backend = struct {
         // 1-RTT secrets from the transcript through server Finished; the
         // client Finished we will require is fixed by the same hash.
         const finished_hash = self.core.transcriptHash();
-        var app = schedule.applicationSecrets(finished_hash);
+        var app = schedule.applicationSecrets(finished_hash) catch return error.SecretExportFailed;
         defer app.wipe();
         try self.emitSecret(sink, .application, .read, &app.client);
         try self.emitSecret(sink, .application, .write, &app.server);
@@ -4579,7 +4679,7 @@ pub const Tls13Backend = struct {
         // with handshake-time client authentication it includes the client's
         // Certificate and CertificateVerify, so the MAC cannot be fixed when the
         // server flight was sent.
-        var expected = KeySchedule.verifyData(&schedule.client_handshake_traffic, transcript_before);
+        var expected = KeySchedule.verifyData(schedule.provider, &schedule.client_handshake_traffic, transcript_before) catch return error.SecretExportFailed;
         defer crypto.secureZero(u8, &expected);
         if (!crypto.timing_safe.eql([hash_len]u8, expected, body[0..hash_len].*)) return error.DecryptError;
         // Client Finished confirms the handshake for the server (RFC 8446 §4.4.4).
@@ -4845,6 +4945,7 @@ pub const Tls13Backend = struct {
 
         const state = new_session_ticket.buildServerRecoverableStateNoIdentity(
             allocator,
+            self.crypto_provider,
             .{
                 .ticket_lifetime = params.ticket_lifetime,
                 .ticket_age_add = params.ticket_age_add,
@@ -5095,7 +5196,7 @@ fn mapTicketEncodeError(err: new_session_ticket.EncodeError) HandshakeError {
 fn mapTicketBuildServerError(err: new_session_ticket.BuildServerError) HandshakeError {
     return switch (err) {
         error.IllegalParameter => error.IllegalParameter,
-        error.InvalidSecretLength => error.SecretExportFailed,
+        error.InvalidSecretLength, error.InvalidInput, error.UnsupportedCapability => error.SecretExportFailed,
         error.TicketTooLarge => error.TicketTooLarge,
         error.InvalidLimits => error.InvalidTransportProfile,
         error.OutOfMemory => error.CredentialProviderFailed,
@@ -5119,6 +5220,8 @@ fn mapTicketBuildClientError(err: new_session_ticket.BuildError) HandshakeError!
         => {},
         error.InvalidSecretLength,
         error.InvalidPskLength,
+        error.InvalidInput,
+        error.UnsupportedCapability,
         => error.SecretExportFailed,
         error.InvalidLimits,
         error.InvalidDnsName,
@@ -5214,6 +5317,21 @@ fn buildMaxNewSessionTicketMessage(allocator: std.mem.Allocator) ![]u8 {
 /// Re-exported here so existing callers and tests keep their spelling.
 pub const testdata = credentials.testdata;
 
+/// A fresh deterministic pure-Zig `CryptoProvider` for this module's own
+/// tests (#490), matching the fixture pattern `key_schedule.zig`'s test
+/// block uses: `DeterministicEntropy` (explicitly not a CSPRNG) plus the
+/// pure-Zig `Provider`, held as a persistent local so every call in this
+/// file's test block gets a live, valid provider without a hidden global
+/// default.
+fn testCryptoProvider() crypto_provider_pkg.CryptoProvider {
+    const pure_zig = crypto_pkg.pure_zig;
+    const State = struct {
+        var entropy = pure_zig.DeterministicEntropy.init(0x71357_490);
+        var backing = pure_zig.Provider.init(entropy.entropy());
+    };
+    return State.backing.cryptoProvider();
+}
+
 test "TLS-owned backend does not embed maximum ticket storage" {
     try std.testing.expect(@sizeOf(Tls13Backend) < 64 * 1024);
     try std.testing.expect(@sizeOf(Tls13Backend) + EventSink.max_bytes < max_new_session_ticket_message_len);
@@ -5221,7 +5339,8 @@ test "TLS-owned backend does not embed maximum ticket storage" {
 
 test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
     var backend = Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0x41} ** 32, .key_share_seed = [_]u8{0x42} ** 32, .retry_key_share_seed = [_]u8{0x42} ** 32 },
+        .{ .hello_random = [_]u8{0x41} ** 32 },
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5235,7 +5354,6 @@ test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
 
     try std.testing.expect(std.mem.allEqual(u8, &backend.expected_client_verify, 0));
     try std.testing.expect(std.mem.allEqual(u8, &backend.peer_chain, 0));
-    try std.testing.expect(std.mem.allEqual(u8, &backend.entropy.key_share_seed, 0));
     try std.testing.expect(!backend.key_pair_present);
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.key_pair), 0));
     try std.testing.expectEqual(@as(usize, 0), backend.peer_chain_count);
@@ -5244,7 +5362,7 @@ test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
 }
 
 test "transport profile validation fails before lifecycle or transcript advance" {
-    const entropy = Entropy{ .hello_random = [_]u8{0x41} ** 32, .key_share_seed = [_]u8{0x42} ** 32, .retry_key_share_seed = [_]u8{0x43} ** 32 };
+    const entropy = Entropy{ .hello_random = [_]u8{0x41} ** 32 };
     const oversized_alpn = [_]u8{'a'} ** 256;
     const invalid_alpn_sets = [_][]const tls_algorithms.ProtocolName{
         &.{.{ .bytes = "" }},
@@ -5257,6 +5375,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
         policy.alpn_protocols = alpns;
         var backend = Tls13Backend.initClientConfigured(
             entropy,
+            testCryptoProvider(),
             .{ .pinned_certificate = testdata.certificate_der },
             recordConfig(policy),
             .{},
@@ -5269,11 +5388,9 @@ test "transport profile validation fails before lifecycle or transcript advance"
         try std.testing.expect(!backend.key_pair_present);
         // #484: `clearFailedHandshakeState`'s `errdefer` now wipes ephemeral
         // key-generation material on every terminal failure, including one
-        // this early (before a key pair is ever generated from it) — once
-        // this backend has failed, the seed is no longer needed and is
-        // zeroed proactively rather than left resident until `deinit`.
-        try std.testing.expect(std.mem.allEqual(u8, &backend.entropy.key_share_seed, 0));
-        try std.testing.expect(std.mem.allEqual(u8, &backend.entropy.retry_key_share_seed, 0));
+        // this early (before a key pair is ever generated) — once this
+        // backend has failed, no ephemeral key resides in `key_pair`.
+        try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.key_pair), 0));
         backend.deinit();
     }
 
@@ -5290,6 +5407,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
     too_large_policy.alpn_protocols = &too_large_alpns;
     var too_large_backend = Tls13Backend.initClientConfigured(
         entropy,
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         recordConfig(too_large_policy),
         .{},
@@ -5314,6 +5432,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
     near_policy.alpn_protocols = &near_alpns;
     var near_backend = Tls13Backend.initClientConfigured(
         entropy,
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         recordConfig(near_policy),
         .{},
@@ -5328,6 +5447,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
     var oversized = [_]u8{0xa5} ** (max_transport_extension_len + 1);
     var extension_backend = Tls13Backend.initClient(
         entropy,
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         .{ .extension = .{ .extension_type = 57, .local = &oversized } },
     );
@@ -5341,6 +5461,7 @@ test "transport profile validation fails before lifecycle or transcript advance"
 
     var collision_backend = Tls13Backend.initClient(
         entropy,
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         .{ .extension = .{ .extension_type = ext_supported_versions, .local = "valid" } },
     );
@@ -5354,7 +5475,8 @@ test "transport profile validation fails before lifecycle or transcript advance"
 
 test "client rejects malformed encrypted extensions ALPN framing" {
     var backend = Tls13Backend.initClient(
-        Entropy{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x52} ** 32, .retry_key_share_seed = [_]u8{0x53} ** 32 },
+        Entropy{ .hello_random = [_]u8{0x51} ** 32 },
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5412,7 +5534,8 @@ test "client NewSessionTicket callback receives owned state and lifetime zero is
 
     var capture = TicketCapture{};
     var backend = Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0x41} ** 32, .key_share_seed = [_]u8{0x42} ** 32, .retry_key_share_seed = [_]u8{0x42} ** 32 },
+        .{ .hello_random = [_]u8{0x41} ** 32 },
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5451,7 +5574,8 @@ test "client NewSessionTicket callback receives owned state and lifetime zero is
 
 test "client parses and drops NewSessionTicket when no consumer is configured" {
     var backend = Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0x45} ** 32, .key_share_seed = [_]u8{0x46} ** 32, .retry_key_share_seed = [_]u8{0x46} ** 32 },
+        .{ .hello_random = [_]u8{0x45} ** 32 },
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5506,7 +5630,8 @@ test "post-handshake input rejects allocator replacement while a frame is active
 
 test "server explicitly emits NewSessionTicket and returns recoverable state" {
     var server = Tls13Backend.initServer(
-        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x52} ** 32, .retry_key_share_seed = [_]u8{0x52} ** 32 },
+        .{ .hello_random = [_]u8{0x51} ** 32 },
+        testCryptoProvider(),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
         .record,
     );
@@ -5549,7 +5674,8 @@ test "server explicitly emits NewSessionTicket and returns recoverable state" {
 
 test "prepare/emit two-phase ticket issuance matches single-phase wire output" {
     var server = Tls13Backend.initServer(
-        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x52} ** 32, .retry_key_share_seed = [_]u8{0x52} ** 32 },
+        .{ .hello_random = [_]u8{0x51} ** 32 },
+        testCryptoProvider(),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
         .record,
     );
@@ -5584,7 +5710,8 @@ test "prepare/emit two-phase ticket issuance matches single-phase wire output" {
 
 test "emitPreparedNewSessionTicket rejects an empty or oversized identity" {
     var server = Tls13Backend.initServer(
-        .{ .hello_random = [_]u8{0x53} ** 32, .key_share_seed = [_]u8{0x54} ** 32, .retry_key_share_seed = [_]u8{0x54} ** 32 },
+        .{ .hello_random = [_]u8{0x53} ** 32 },
+        testCryptoProvider(),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
         .record,
     );
@@ -5611,7 +5738,8 @@ test "emitPreparedNewSessionTicket rejects an empty or oversized identity" {
 
 test "server ticket output failure is atomic and retryable" {
     var server = Tls13Backend.initServer(
-        .{ .hello_random = [_]u8{0x61} ** 32, .key_share_seed = [_]u8{0x62} ** 32, .retry_key_share_seed = [_]u8{0x62} ** 32 },
+        .{ .hello_random = [_]u8{0x61} ** 32 },
+        testCryptoProvider(),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
         .record,
     );
@@ -5651,7 +5779,8 @@ test "server ticket emission allocation failures leave transcript and sink clean
     for (0..16) |fail_index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         var server = Tls13Backend.initServer(
-            .{ .hello_random = [_]u8{0x63} ** 32, .key_share_seed = [_]u8{0x64} ** 32, .retry_key_share_seed = [_]u8{0x64} ** 32 },
+            .{ .hello_random = [_]u8{0x63} ** 32 },
+            testCryptoProvider(),
             try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
             .record,
         );
@@ -5716,7 +5845,8 @@ test "large emitted ticket is delivered once after fragmented application receiv
     @memset(opaque_ticket, 0xa5);
 
     var server = Tls13Backend.initServer(
-        .{ .hello_random = [_]u8{0x71} ** 32, .key_share_seed = [_]u8{0x72} ** 32, .retry_key_share_seed = [_]u8{0x72} ** 32 },
+        .{ .hello_random = [_]u8{0x71} ** 32 },
+        testCryptoProvider(),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
         .record,
     );
@@ -5725,7 +5855,8 @@ test "large emitted ticket is delivered once after fragmented application receiv
     try server.resumption_master_secret.replace(&([_]u8{0x44} ** hash_len));
 
     var client = Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0x73} ** 32, .key_share_seed = [_]u8{0x74} ** 32, .retry_key_share_seed = [_]u8{0x74} ** 32 },
+        .{ .hello_random = [_]u8{0x73} ** 32 },
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5764,7 +5895,8 @@ test "large emitted ticket is delivered once after fragmented application receiv
 
 test "application reassembler accepts exact maximum ticket and rejects one byte over" {
     var client = Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0x81} ** 32, .key_share_seed = [_]u8{0x82} ** 32, .retry_key_share_seed = [_]u8{0x82} ** 32 },
+        .{ .hello_random = [_]u8{0x81} ** 32 },
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5782,7 +5914,8 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
     try client.backend().receive(.application, max_message[4099..], &sink);
 
     var over_client = Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0x83} ** 32, .key_share_seed = [_]u8{0x84} ** 32, .retry_key_share_seed = [_]u8{0x84} ** 32 },
+        .{ .hello_random = [_]u8{0x83} ** 32 },
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5799,7 +5932,8 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
 
 test "client cannot emit NewSessionTicket" {
     var client = Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0x91} ** 32, .key_share_seed = [_]u8{0x92} ** 32, .retry_key_share_seed = [_]u8{0x92} ** 32 },
+        .{ .hello_random = [_]u8{0x91} ** 32 },
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5818,9 +5952,10 @@ test "client cannot emit NewSessionTicket" {
 }
 
 test "abandoned backend teardown wipes ephemeral and server identity storage" {
-    const entropy = Entropy{ .hello_random = [_]u8{0x31} ** 32, .key_share_seed = [_]u8{0x32} ** 32, .retry_key_share_seed = [_]u8{0x33} ** 32 };
+    const entropy = Entropy{ .hello_random = [_]u8{0x31} ** 32 };
     var client = Tls13Backend.initClient(
         entropy,
+        testCryptoProvider(),
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
@@ -5829,17 +5964,16 @@ test "abandoned backend teardown wipes ephemeral and server identity storage" {
     try client.backend().start(.client, {}, &sink);
     try std.testing.expect(client.key_pair_present);
     client.deinit();
-    try std.testing.expect(std.mem.allEqual(u8, &client.entropy.key_share_seed, 0));
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&client.key_pair), 0));
     try std.testing.expect(!client.key_pair_present);
 
     var server = Tls13Backend.initServer(
         entropy,
+        testCryptoProvider(),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
         .record,
     );
     server.deinit();
     try std.testing.expect(!server.identity_present);
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&server.identity), 0));
-    try std.testing.expect(std.mem.allEqual(u8, &server.entropy.key_share_seed, 0));
 }

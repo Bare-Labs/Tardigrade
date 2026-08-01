@@ -33,19 +33,21 @@ pub fn stackProvider(storage: *StackProviderStorage) crypto.provider.CryptoProvi
     return storage.provider.cryptoProvider();
 }
 
+/// Fresh entropy for one handshake's `Tls13Backend.Entropy`. Only
+/// `hello_random` (the TLS ClientHello/ServerHello `random` field) lives
+/// here: ephemeral X25519 key-share generation draws from the injected
+/// `CryptoProvider`'s own entropy source instead (#490) — see `OsEntropy`
+/// above, which composition roots pass to the pure-Zig `Provider` they hand
+/// to `Tls13Backend`'s `crypto_provider` parameter.
 pub fn freshHandshakeEntropy() crypto.provider.EntropyError!tls13_backend.Entropy {
     var entropy: tls13_backend.Entropy = undefined;
     try fillSecure(&entropy.hello_random);
-    try fillSecure(&entropy.key_share_seed);
-    try fillSecure(&entropy.retry_key_share_seed);
     return entropy;
 }
 
-test "fresh handshake entropy fills both backend inputs" {
+test "fresh handshake entropy fills the backend's hello_random input" {
     const entropy = try freshHandshakeEntropy();
     try std.testing.expect(!allZero(&entropy.hello_random));
-    try std.testing.expect(!allZero(&entropy.key_share_seed));
-    try std.testing.expect(!allZero(&entropy.retry_key_share_seed));
 }
 
 fn fillSecure(buffer: []u8) crypto.provider.EntropyError!void {

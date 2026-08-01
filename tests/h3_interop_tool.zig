@@ -249,8 +249,6 @@ fn randomBytes(buffer: []u8) void {
 fn randomEntropy() tls_backend.Entropy {
     var entropy: tls_backend.Entropy = undefined;
     randomBytes(&entropy.hello_random);
-    randomBytes(&entropy.key_share_seed);
-    randomBytes(&entropy.retry_key_share_seed);
     return entropy;
 }
 
@@ -302,7 +300,7 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     const client_options = tls_backend.ClientOptions{
         .initial_key_share_mode = if (args.empty_initial_key_share) .empty else .normal,
     };
-    var backend = tls_backend.Tls13Backend.initClientWithOptions(randomEntropy(), trust, client_options);
+    var backend = tls_backend.Tls13Backend.initClientWithOptions(randomEntropy(), test_quic_crypto.testHandshakeProvider(), trust, client_options);
     const client = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &local_cid,
@@ -428,7 +426,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
             .local = addressFromSockaddrIn(socket.local),
             .remote = addressFromSockaddrIn(peer),
         };
-        var backend = tls_backend.Tls13Backend.initServer(randomEntropy(), identity);
+        var backend = tls_backend.Tls13Backend.initServer(randomEntropy(), test_quic_crypto.testHandshakeProvider(), identity);
         const server = try Connection.init(allocator, .{
             .role = .server,
             .local_cid = parsed.dcid,

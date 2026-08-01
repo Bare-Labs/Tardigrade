@@ -80,13 +80,13 @@ data, not prose:
 - **Protocol integration** — `Row.integrations`, a `(Consumer,
   IntegrationStatus)` list: whether each consumer's *live* runtime actually
   calls the provider for it today. This is per consumer because it commonly
-  differs within one row — e.g. HKDF-SHA256 is `.live` for QUIC packet
-  protection but `.not_integrated` for the TLS 1.3 handshake engine, which
-  still calls a parallel `std.crypto` path for the same primitive.
-  `IntegrationStatus.live` means the live runtime calls `CryptoProvider`
-  today, not that it could if wired up — see `profile.zig`'s "QUIC packet
-  protection is live-integrated through CryptoProvider" test, which pins the
-  two rows this holds for.
+  differs within one row — e.g. RSA-PSS-RSAE-SHA256 is `.live` for PKI
+  chain-signature verification but `.not_integrated` for the TLS 1.3
+  handshake engine, which negotiates only Ed25519/ECDSA-P256 CertificateVerify
+  and does not claim RSA support it cannot execute (#490). `IntegrationStatus.
+  live` means the live runtime calls `CryptoProvider` today, not that it could
+  if wired up — see `profile.zig`'s integration-status tests, which pin the
+  rows this holds for.
 - **Product enablement** — `Row.enabled_product_profiles`, a named
   `EnumSet(ProductProfile)` (`.native_appliance`, `.general_purpose_openssl`):
   which product actually selects this capability. This is authored per row,
@@ -111,20 +111,20 @@ lists only the consumers whose live runtime calls `CryptoProvider` today
 | --- | --- | --- | --- | --- | --- | --- |
 | SHA-256 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF, QUIC TLS bridge | none — unkeyed hashing has no `CryptoProvider` entry point by design | native appliance, general-purpose OpenSSL |
 | SHA-384 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF | none — unkeyed hashing has no `CryptoProvider` entry point by design | general-purpose OpenSSL only (the native appliance's engine negotiates TLS_AES_128_GCM_SHA256 only, so SHA-384 is never selected there) |
-| HKDF-SHA256 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule, QUIC packet protection | QUIC packet protection and the QUIC/TLS secret bridge; the TLS 1.3 key schedule (`src/tls/key_schedule.zig`) still calls `std.crypto` directly | native appliance, general-purpose OpenSSL |
-| HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule | none — `src/tls/key_schedule.zig` still calls `std.crypto` directly | general-purpose OpenSSL only (the native appliance's engine negotiates TLS_AES_128_GCM_SHA256 only, so HKDF-SHA384 is never selected there) |
+| HKDF-SHA256 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule, QUIC packet protection | live — QUIC packet protection, the QUIC/TLS secret bridge, and the TLS 1.3 key schedule (`src/tls/key_schedule.zig`) all call `CryptoProvider.hkdfExtract`/`.hkdfExpandLabel` | native appliance, general-purpose OpenSSL |
+| HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule | live for the TLS 1.3 key schedule's SHA-384 resumption derivations (`src/tls/key_schedule.zig`) | general-purpose OpenSSL only (the native appliance's engine negotiates TLS_AES_128_GCM_SHA256 only, so HKDF-SHA384 is never selected there) |
 | AES-128-GCM | supported | `std.crypto` | provider deferred | TLS records, QUIC packet protection | both — TLS record protection and QUIC packet protection seal/open through `CryptoProvider` | native appliance, general-purpose OpenSSL |
 | AES-256-GCM | supported | `std.crypto` | provider deferred | TLS records; QUIC integration deferred | none — TLS_AES_256_GCM_SHA384 is not negotiated by the native appliance's engine | general-purpose OpenSSL only (negotiated there outside this seam) |
 | ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | protocol integration deferred | none | general-purpose OpenSSL only |
 | QUIC AES-128 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection | live — every send/receive path in `src/quic/tls_adapter.zig` applies/removes header protection through `CryptoProvider` | native appliance only (QUIC-specific; the general-purpose backend is TLS-over-TCP) |
-| X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge | none — `src/tls/tls13_backend.zig` generates the TLS key share via `X25519.KeyPair.generateDeterministic` directly | native appliance, general-purpose OpenSSL |
+| X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge | live — `src/tls/tls13_backend.zig` generates its ephemeral key share and derives the shared secret through `CryptoProvider.generateKeyShare`/`.deriveSharedSecret` | native appliance, general-purpose OpenSSL |
 | secp256r1 / P-256 | provider deferred | unavailable | provider deferred | TLS key share, PKI | none | general-purpose OpenSSL only (P-256 ECDH outside this seam; not implemented in pure Zig at all) |
-| Ed25519 | supported | `std.crypto` | provider deferred | CertificateVerify, PKI | PKI chain-signature verification only; the handshake's own CertificateVerify message calls a local verifier directly | native appliance, general-purpose OpenSSL |
-| ECDSA-P256-SHA256 | supported | `std.crypto` verification | provider deferred | CertificateVerify, PKI | PKI chain-signature verification only, same split as Ed25519 | native appliance, general-purpose OpenSSL |
+| Ed25519 | supported | `std.crypto` | provider deferred | CertificateVerify, PKI | live for both — PKI chain-signature verification and the handshake's own CertificateVerify proof-of-possession (`src/tls/tls13_backend.zig`) call `CryptoProvider.verify`; local CertificateVerify signing (`src/tls/credentials.zig`'s `Identity.sign`) signs through the opaque `provider.SigningKey` handle rather than a concrete `std.crypto.sign.Ed25519.KeyPair` | native appliance, general-purpose OpenSSL |
+| ECDSA-P256-SHA256 | supported | `std.crypto` verification | provider deferred | CertificateVerify, PKI | live for both, same split as Ed25519 — chain verification and CertificateVerify both call `CryptoProvider.verify`, and local signing goes through `provider.SigningKey` | native appliance, general-purpose OpenSSL |
 | RSA-PSS-RSAE-SHA256 | supported | project verifier | provider deferred | CertificateVerify, PKI | PKI chain-signature verification only, same split as Ed25519 | general-purpose OpenSSL only (the native appliance negotiates Ed25519/ECDSA only) |
 | DER parser | provider deferred | project code | provider deferred | PKI | none — parsing has no `CryptoProvider` entry point | native appliance, general-purpose OpenSSL (shared protocol-local code) |
 | chain builder, WebPKI validation | provider deferred | unavailable | provider deferred | PKI | none | neither — not implemented yet |
-| injected random bytes, secure zero, constant-time compare | supported | project code | provider deferred / project code | all secret-bearing paths | none through `CryptoProvider.entropy` — TLS/QUIC/resumption inject randomness through their own longer-standing `Entropy` parameters instead; secure-zero/constant-time-compare are shared helpers, not vtable dispatch targets | native appliance, general-purpose OpenSSL |
+| injected random bytes, secure zero, constant-time compare | supported | project code | provider deferred / project code | all secret-bearing paths | live for X25519 ephemeral key-share generation — `CryptoProvider.generateKeyShare` draws its randomness from the provider's own injected `Entropy` (#490); TLS ClientHello/ServerHello random and QUIC/resumption nonces still inject through their own longer-standing `Entropy` parameters instead of `CryptoProvider.entropy`, since that randomness is not itself a provider operation; secure-zero/constant-time-compare are shared helpers, not vtable dispatch targets | native appliance, general-purpose OpenSSL |
 
 The Zig compatibility floor for this matrix is `0.16.0`; when the project moves
 to a newer compiler or starts carrying compatibility shims for crypto APIs, the
@@ -151,9 +151,14 @@ The native appliance profile remains the deliberately narrow in-process
 pure-Zig path: no OpenSSL or libcrypto linkage, and general-purpose OpenSSL
 TLS available only through the existing non-native backend. QUIC packet
 protection — AEAD seal/open and header protection on every send/receive path
-in `src/quic/tls_adapter.zig` — runs through `CryptoProvider`; the TLS 1.3
-handshake engine underneath it (key schedule, key share generation,
-CertificateVerify) does not yet and is tracked as open follow-up for #490.
+in `src/quic/tls_adapter.zig` — runs through `CryptoProvider`, and so does the
+TLS 1.3 handshake engine underneath it: the key schedule (HKDF-Extract,
+HKDF-Expand-Label, and Finished `verify_data`), X25519 key-share generation
+and shared-secret derivation, and CertificateVerify authentication all cross
+`CryptoProvider` (#490). Local CertificateVerify signing keeps using the
+existing opaque `CredentialProvider`/`SelectedCredential` contract
+(`src/tls/credentials.zig`), whose concrete fixed/native implementation signs
+through `provider.SigningKey` rather than a named `std.crypto.sign` type.
 OpenSSL remains valid as the general-purpose TLS backend and as an
 out-of-process deterministic/differential oracle; it is not required as an
 in-process native `CryptoProvider` for this profile.
@@ -228,6 +233,12 @@ randomness — ephemeral scalars, nonces, per-signature noise — from the
 the OS CSPRNG in production; tests and reproducible fixtures use
 `pure_zig.DeterministicEntropy` (a seedable splitmix64 source that is explicitly
 *not* a CSPRNG). Entropy failure surfaces as `ProviderError.EntropyFailure`.
+The native TLS 1.3 engine's ephemeral X25519 scalar is one concrete instance
+of this (#490): `Tls13Backend` no longer carries its own key-share seed —
+`CryptoProvider.generateKeyShare` draws that randomness from the same
+injected `Entropy` every other provider operation uses, and a production
+composition root's `EntropyFailure` there surfaces through the engine's
+existing error taxonomy rather than a silent fallback.
 
 ### Private keys can move off-host later
 
@@ -235,7 +246,17 @@ the OS CSPRNG in production; tests and reproducible fixtures use
 an HSM or remote signer tomorrow present the identical interface. The TLS engine
 holds a `SigningKey` and calls `sign`; it never learns where the private key
 lives. This is why signing goes through the handle rather than through the main
-provider vtable.
+provider vtable. `src/tls/credentials.zig`'s fixed/native `Identity` — the
+concrete credential the native TLS engine actually signs CertificateVerify
+with — is this abstraction's first real user rather than only its documented
+intent (#490): it holds a `pure_zig.SoftwareSigningKey` (Ed25519) or
+`pure_zig.SoftwareEcdsaP256SigningKey` (ECDSA-P256) and signs through
+`provider.SigningKey.sign`, never a named `std.crypto.sign.Ed25519.KeyPair`/
+`EcdsaP256Sha256.KeyPair` type. The engine-facing `CredentialProvider`/
+`SelectedCredential` async contract in the same file is unchanged by this —
+it already only ever handed the engine an opaque signing capability, never
+key bytes; what changed is what the *concrete* credential behind that
+contract calls internally.
 
 ## Acceptance criteria mapping (#370)
 
