@@ -890,7 +890,20 @@ pub const Runtime = struct {
         // any response `serveRequest` queues still can't reach the wire
         // until `.application` packet building unlocks at establishment.
         if (!established and !self.zero_rtt_enabled) return;
-        entry.h3.pump(entry.conn) catch |err| {
+        // #546: a peer request stream that arrives at/above `local_goaway_id`
+        // is rejected by `entry.h3.pump()` itself, during admission, before
+        // it can ever become a `pollRequest()`-visible `IncomingRequest` —
+        // the boundary-rejection branch below never sees it. That's a
+        // distinct, mutually-exclusive rejection owner from this one, so
+        // fold its delta into the same snapshot counter here, unconditionally
+        // (a result-first shape, not inside the `catch`) so an unrelated
+        // protocol error from this same `pump()` call can't suppress an
+        // already-real rejection that happened earlier in the same call.
+        const rejected_before = entry.h3.metrics.goaway_request_rejections;
+        const pump_result = entry.h3.pump(entry.conn);
+        const rejected_after = entry.h3.metrics.goaway_request_rejections;
+        self.noteDrainRequestRejections(@intCast(rejected_after - rejected_before));
+        pump_result catch |err| {
             // An H3-level protocol error closes the connection with the
             // specific RFC 9114 §8.1 code the session layer recorded.
             const code = entry.h3.closeCode();
@@ -910,7 +923,7 @@ pub const Runtime = struct {
                 if (requestRejectedByDrainBoundary(incoming.stream_id, boundary)) {
                     entry.conn.resetStream(incoming.stream_id, 0x010b) catch {}; // H3_REQUEST_REJECTED
                     entry.h3.finishRequest(incoming.stream_id);
-                    self.noteDrainRequestRejected();
+                    self.noteDrainRequestRejections(1);
                     continue;
                 }
             }
@@ -1299,10 +1312,11 @@ pub const Runtime = struct {
         self.snapshot_state.h3_goaway_sent += 1;
     }
 
-    fn noteDrainRequestRejected(self: *Runtime) void {
+    fn noteDrainRequestRejections(self: *Runtime, count: usize) void {
+        if (count == 0) return;
         self.snapshot_mutex.lock();
         defer self.snapshot_mutex.unlock();
-        self.snapshot_state.h3_drain_request_rejections += 1;
+        self.snapshot_state.h3_drain_request_rejections += count;
     }
 
     fn noteHandshakeComplete(self: *Runtime) void {
@@ -2053,6 +2067,44 @@ test "drainBoundaryAfter permits admitted client-bidi streams" {
     try testing.expect(!requestRejectedByDrainBoundary(0, 4));
     try testing.expect(requestRejectedByDrainBoundary(4, 4));
     try testing.expect(requestRejectedByDrainBoundary(8, 4));
+}
+
+test "http3 runtime (#546): a request stream rejected by Conn.pump() at local_goaway_id folds into Snapshot.h3_drain_request_rejections" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-goaway-admission-fold-test");
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
+    defer harness.deinit(testing.allocator);
+
+    // Install the local GOAWAY boundary directly on the H3 session, exactly
+    // as the "H3 conn: sent GOAWAY rejects boundary..." unit test does in
+    // conn.zig — this isolates the admission-time rejection path from the
+    // full drain/GOAWAY-frame machinery, which is covered separately by the
+    // `drain_requested` branch this test does not touch.
+    harness.entry.h3.local_goaway_id = 0;
+
+    // The client's first bidi stream (id 0) lands exactly at that boundary,
+    // so `entry.h3.pump()` rejects it during admission before it can ever
+    // reach `pollRequest()` — the ordering this issue's UDP smoke flake
+    // depended on being observable.
+    var request_bytes: [128]u8 = undefined;
+    const bytes = buildH3RequestBytesForTest("GET", "/after-goaway", "example.com", &request_bytes);
+    const stream_id = try harness.client.openStream(.bidi);
+    try testing.expectEqual(@as(u64, 0), stream_id);
+    _ = try harness.client.writeStream(stream_id, bytes, true);
+    try harness.pump();
+
+    runtime.pumpH3(harness.entry, harness.now_us);
+
+    try testing.expectEqual(@as(u64, 1), harness.entry.h3.metrics.goaway_request_rejections);
+    try testing.expectEqual(@as(u32, 0), harness.entry.h3.requests.count());
+    try testing.expectEqual(@as(usize, 1), runtime.snapshot().h3_drain_request_rejections);
 }
 
 test "classifyIngest routes spoofed Initials, migration, and normal traffic" {
