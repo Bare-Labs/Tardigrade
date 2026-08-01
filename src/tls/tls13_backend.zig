@@ -3901,7 +3901,7 @@ pub const Tls13Backend = struct {
         var using_fixed = false;
         const provider = if (self.external_provider) |p| p else blk: {
             if (!self.identity_present) return self.failCredential(.no_credential_available);
-            fixed_provider = credentials.FixedCredentialProvider.init(self.identity);
+            fixed_provider = credentials.FixedCredentialProvider.init(self.identity, self.crypto_provider.entropy);
             using_fixed = true;
             break :blk fixed_provider.provider();
         };

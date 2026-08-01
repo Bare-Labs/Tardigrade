@@ -66,6 +66,8 @@ const ProviderStorage = struct {
 
 const client_provider_seed: u64 = 0x442_c;
 const server_provider_seed: u64 = 0x442_5;
+var sni_identity_entropy = crypto.pure_zig.DeterministicEntropy.init(0x432);
+var direct_identity_sign_entropy = crypto.pure_zig.DeterministicEntropy.init(0x433);
 
 fn recordPolicyForNames(names: []const []const u8, allow_absent_alpn: bool) tls_core.policy.Policy {
     if (names.len == 1 and std.mem.eql(u8, names[0], "h2")) return tls_core.policy.Policy.recordH2Only();
@@ -320,7 +322,7 @@ const DirectHarness = struct {
         self.server_client_verifier = credentials.FixedVerifier.init(verifier_trust);
         self.server_backend.requestClientAuthentication(mode, self.server_client_verifier.?.verifier());
         if (client_cert) {
-            self.client_credential = credentials.FixedCredentialProvider.init(fixtureIdentity());
+            self.client_credential = credentials.FixedCredentialProvider.init(fixtureIdentity(), self.client_provider_storage.provider.cryptoProvider().entropy);
             self.client_backend.setLocalCredentialProvider(self.client_credential.?.provider());
         }
     }
@@ -5321,7 +5323,7 @@ fn sniIdentityConfig(patterns: []const []const u8, chain: []const []const u8, de
     return .{
         .chain = chain,
         .patterns = patterns,
-        .signer = sni_provider.SignAdapter.fromIdentity(fixtureIdentity()),
+        .signer = sni_provider.SignAdapter.fromIdentity(fixtureIdentity(), sni_identity_entropy.entropy()),
         .key_kind = .ed25519,
         .is_default = default,
     };
@@ -5399,7 +5401,7 @@ test "record engine pins selected SNI generation across provider reload" {
             }
             var identity = fixtureIdentity();
             defer std.crypto.secureZero(u8, std.mem.asBytes(&identity.key));
-            return identity.sign(input, out);
+            return identity.sign(input, direct_identity_sign_entropy.entropy(), out);
         }
 
         fn release(ctx: *anyopaque) void {
@@ -10245,7 +10247,7 @@ const BigChainSigningProvider = struct {
     fn sign(handle: *anyopaque, _: credentials.SignatureScheme, input: []const u8, out: []u8) credentials.SignError!credentials.Progress(usize) {
         const self: *BigChainSigningProvider = @ptrCast(@alignCast(handle));
         self.sign_count += 1;
-        return .{ .complete = try self.identity.sign(input, out) };
+        return .{ .complete = try self.identity.sign(input, direct_identity_sign_entropy.entropy(), out) };
     }
     fn release(_: *anyopaque) void {}
 };

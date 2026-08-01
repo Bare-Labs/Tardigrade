@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("zig_compat");
 const tls = @import("tls_core");
+const crypto_pkg = @import("crypto");
 const encrypted_stream_connection = @import("encrypted_stream_connection.zig");
 const event_loop = @import("event_loop.zig");
 const negotiated_dispatch = @import("negotiated_dispatch.zig");
@@ -11,6 +12,11 @@ const production_crypto = tls.production_crypto;
 const tls_backend = tls.tls13_backend;
 const sni_provider = tls.sni_provider;
 const credentials = tls.credentials;
+var fixed_credential_entropy = crypto_pkg.pure_zig.DeterministicEntropy.init(0x432);
+
+fn fixedCredentialEntropy() crypto_pkg.provider.Entropy {
+    return fixed_credential_entropy.entropy();
+}
 
 pub const ListenerProtocolPolicy = negotiated_dispatch.ListenerProtocolPolicy;
 pub const NegotiatedProtocol = negotiated_dispatch.NegotiatedProtocol;
@@ -24,11 +30,13 @@ pub const SniCertSpec = struct {
 pub const NativeCredentialStore = struct {
     allocator: std.mem.Allocator,
     provider_state: sni_provider.ReloadableProvider,
+    entropy_source: production_crypto.OsEntropy = .{},
 
     pub fn init(allocator: std.mem.Allocator) NativeCredentialStore {
         return .{
             .allocator = allocator,
             .provider_state = sni_provider.ReloadableProvider.init(allocator),
+            .entropy_source = .{},
         };
     }
 
@@ -85,7 +93,8 @@ pub const NativeCredentialStore = struct {
             for (configs) |*config| config.signer.release();
             self.allocator.free(configs);
         }
-        for (loaded[0..loaded_len], 0..) |*bundle, i| configs[i] = bundle.config();
+        const signer_entropy = self.entropy_source.entropy();
+        for (loaded[0..loaded_len], 0..) |*bundle, i| configs[i] = bundle.config(signer_entropy);
 
         const snapshot = try self.provider_state.buildSnapshot(configs, .{
             .absent_sni_policy = .use_default,
@@ -137,11 +146,11 @@ const LoadedBundle = struct {
         self.is_default = is_default;
     }
 
-    fn config(self: *const LoadedBundle) sni_provider.CredentialBundleConfig {
+    fn config(self: *const LoadedBundle, entropy: @import("crypto").provider.Entropy) sni_provider.CredentialBundleConfig {
         return .{
             .chain = self.chain,
             .patterns = self.patterns[0..],
-            .signer = sni_provider.SignAdapter.fromIdentity(self.loaded.identity),
+            .signer = sni_provider.SignAdapter.fromIdentity(self.loaded.identity, entropy),
             .key_kind = keyKindForScheme(self.supported_schemes[0]),
             .supported_schemes = self.supported_schemes[0..],
             .is_default = self.is_default,
@@ -627,7 +636,7 @@ test "prepared native credential reload does not publish same-path cert changes 
 }
 
 test "native TLS owner heap-stabilizes backend record and owns fd close" {
-    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), fixedCredentialEntropy());
     defer fixed.deinit();
     const fds = try testSocketPair();
     defer closeFd(fds[1]);
@@ -648,7 +657,7 @@ test "native TLS owner heap-stabilizes backend record and owns fd close" {
 }
 
 test "native TLS createWithOptions applies validated buffer limits" {
-    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), fixedCredentialEntropy());
     defer fixed.deinit();
     const fds = try testSocketPair();
     defer closeFd(fds[1]);
@@ -777,7 +786,7 @@ const CacheEventProbe = struct {
 };
 
 test "native TLS createWithOptions installs the shared server resolver when configured" {
-    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), fixedCredentialEntropy());
     defer fixed.deinit();
     const fds = try testSocketPair();
     defer closeFd(fds[1]);
@@ -799,7 +808,7 @@ test "native TLS createWithOptions installs the shared server resolver when conf
 }
 
 test "native TLS createWithOptions installs the shared early-data replay gate independently of the resumption runtime" {
-    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), fixedCredentialEntropy());
     defer fixed.deinit();
     const fds = try testSocketPair();
     defer closeFd(fds[1]);
@@ -825,7 +834,7 @@ test "native TLS createWithOptions installs the shared early-data replay gate in
 }
 
 test "native TLS server early data policy is disabled unless resumption and replay gate are both configured" {
-    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), fixedCredentialEntropy());
     defer fixed.deinit();
 
     var runtime = try testResumptionRuntime(std.testing.allocator);
@@ -891,7 +900,7 @@ test "native TLS server early data policy is disabled unless resumption and repl
 }
 
 test "native TLS production ticket issuance advertises early data only when policy is enabled" {
-    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), fixedCredentialEntropy());
     defer fixed.deinit();
 
     {
@@ -941,7 +950,7 @@ test "native TLS production ticket issuance advertises early data only when poli
 }
 
 test "native TLS without a resumption runtime never attempts ticket issuance" {
-    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), fixedCredentialEntropy());
     defer fixed.deinit();
     const fds = try testSocketPair();
     defer closeFd(fds[1]);
@@ -960,7 +969,7 @@ test "native TLS without a resumption runtime never attempts ticket issuance" {
 }
 
 test "native TLS failed post-handshake issuance notifies the runtime observer once" {
-    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), fixedCredentialEntropy());
     defer fixed.deinit();
     const fds = try testSocketPair();
     defer closeFd(fds[1]);
@@ -995,7 +1004,7 @@ test "native TLS failed post-handshake issuance notifies the runtime observer on
 }
 
 test "native TLS post-handshake queue pressure rolls back inserted stateful handle and keeps stream open" {
-    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), fixedCredentialEntropy());
     defer fixed.deinit();
     const fds = try testSocketPair();
     defer closeFd(fds[1]);
@@ -1037,7 +1046,7 @@ test "native TLS post-handshake queue pressure rolls back inserted stateful hand
 }
 
 test "native TLS never attempts ticket issuance before application data opens" {
-    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), fixedCredentialEntropy());
     defer fixed.deinit();
     const fds = try testSocketPair();
     defer closeFd(fds[1]);
@@ -1060,7 +1069,7 @@ test "native TLS never attempts ticket issuance before application data opens" {
 }
 
 test "native TLS negotiated protocol is unavailable before application data opens" {
-    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity());
+    var fixed = credentials.FixedCredentialProvider.init(credentials.testdata.identity(), fixedCredentialEntropy());
     defer fixed.deinit();
     const fds = try testSocketPair();
     defer closeFd(fds[1]);

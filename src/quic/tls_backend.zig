@@ -43,6 +43,7 @@ pub const ClientEarlyDataIntent = shared.ClientEarlyDataIntent;
 const ext_quic_transport_parameters: u16 = @intFromEnum(tls_core.algorithms.ExtensionType.quic_transport_parameters);
 const tp_max_idle_timeout: u64 = 0x01;
 const tp_max_udp_payload_size: u64 = 0x03;
+var quic_sni_test_entropy = crypto_pkg.pure_zig.DeterministicEntropy.init(0x432);
 const tp_initial_max_data: u64 = 0x04;
 const tp_initial_max_stream_data_bidi_local: u64 = 0x05;
 const tp_initial_max_stream_data_bidi_remote: u64 = 0x06;
@@ -1197,7 +1198,7 @@ fn quicSniConfig(patterns: []const []const u8, chain: []const []const u8) tls_co
     return .{
         .chain = chain,
         .patterns = patterns,
-        .signer = tls_core.sni_provider.SignAdapter.fromIdentity(Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der) catch unreachable),
+        .signer = tls_core.sni_provider.SignAdapter.fromIdentity(Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der) catch unreachable, quic_sni_test_entropy.entropy()),
         .key_kind = .ed25519,
         .is_default = true,
     };

@@ -71,26 +71,6 @@ const pure_zig = crypto_pkg.pure_zig;
 const crypto_provider_pkg = crypto_pkg.provider;
 
 const Ed25519 = crypto.sign.Ed25519;
-const EcdsaP256 = crypto.sign.ecdsa.EcdsaP256Sha256;
-
-/// `Identity.sign` (below) never needs external randomness: Ed25519 (RFC
-/// 8032) is fully deterministic, and the ECDSA-P256 software signing key
-/// (`pure_zig.SoftwareEcdsaP256SigningKey`) also derives its nonce
-/// deterministically, matching this module's pre-existing
-/// `key_pair.sign(input, null)` behavior before #490's migration onto the
-/// opaque `provider.SigningKey` handle. This fill function exists only to
-/// satisfy `provider.SigningKey.sign`'s type signature — it must never
-/// actually be invoked by either scheme this file supports, so it fails
-/// loudly rather than silently handing back predictable "randomness" if a
-/// future signature scheme changes that assumption without revisiting this
-/// call site.
-fn unreachableEntropyFill(context: *anyopaque, buffer: []u8) crypto_provider_pkg.EntropyError!void {
-    _ = context;
-    _ = buffer;
-    unreachable;
-}
-var no_entropy_sentinel: u8 = 0;
-const no_entropy = crypto_provider_pkg.Entropy{ .context = &no_entropy_sentinel, .fillFn = unreachableEntropyFill };
 
 pub const Role = tls_state.Role;
 
@@ -551,9 +531,11 @@ pub const Identity = struct {
             const software_key = pure_zig.SoftwareSigningKey.fromSeed(seed) catch return error.InvalidPrivateKey;
             return .{ .certificate_der = certificate_der, .key = .{ .ed25519 = software_key } };
         } else |_| {}
-        const scalar = try ecdsaP256KeyFromPkcs8(pkcs8_key_der);
-        const secret = EcdsaP256.SecretKey.fromBytes(scalar) catch return error.InvalidPrivateKey;
-        const software_key = pure_zig.SoftwareEcdsaP256SigningKey.fromSecretKey(secret) catch return error.InvalidPrivateKey;
+        var scalar = try ecdsaP256KeyFromPkcs8(pkcs8_key_der);
+        defer crypto.secureZero(u8, &scalar);
+        var scalar_secret = crypto_pkg.secrets.FixedSecret(32).init(&scalar) catch return error.InvalidPrivateKey;
+        defer scalar_secret.deinit();
+        const software_key = pure_zig.SoftwareEcdsaP256SigningKey.fromScalarSecret(&scalar_secret) catch return error.InvalidPrivateKey;
         return .{ .certificate_der = certificate_der, .key = .{ .ecdsa_p256 = software_key } };
     }
 
@@ -575,7 +557,7 @@ pub const Identity = struct {
     /// This is the single place the fixed private key is used for signing —
     /// through the opaque `provider.SigningKey` handle, never a named
     /// `std.crypto.sign` primitive directly (#490).
-    pub fn sign(self: *const Identity, input: []const u8, out: []u8) SignError!usize {
+    pub fn sign(self: *const Identity, input: []const u8, entropy: crypto_provider_pkg.Entropy, out: []u8) SignError!usize {
         // `signingKey()` takes a mutable receiver purely for vtable-context
         // shape; neither supported scheme's `sign` mutates key state, so
         // reborrowing the const union payload as mutable here is sound —
@@ -585,7 +567,7 @@ pub const Identity = struct {
             .ed25519 => |*key| @constCast(key).signingKey(),
             .ecdsa_p256 => |*key| @constCast(key).signingKey(),
         };
-        return signer.sign(input, no_entropy, out) catch |err| switch (err) {
+        return signer.sign(input, entropy, out) catch |err| switch (err) {
             error.InvalidInput => error.SignatureOutputOverflow,
             error.UnsupportedCapability, error.EntropyFailure, error.ProviderFailure => error.SigningProviderFailure,
         };
@@ -704,9 +686,10 @@ pub const Identity = struct {
 pub const FixedCredentialProvider = struct {
     identity: Identity,
     chain_entry: [1][]const u8,
+    entropy: crypto_provider_pkg.Entropy,
 
-    pub fn init(identity: Identity) FixedCredentialProvider {
-        return .{ .identity = identity, .chain_entry = .{identity.certificate_der} };
+    pub fn init(identity: Identity, entropy: crypto_provider_pkg.Entropy) FixedCredentialProvider {
+        return .{ .identity = identity, .chain_entry = .{identity.certificate_der}, .entropy = entropy };
     }
 
     pub fn provider(self: *FixedCredentialProvider) CredentialProvider {
@@ -748,7 +731,7 @@ pub const FixedCredentialProvider = struct {
         // The engine signs with the scheme the credential reported; a mismatch
         // would be an engine bug, guarded here defensively.
         if (scheme != self.identity.signatureScheme()) return error.InvalidCallbackBehavior;
-        return .{ .complete = try self.identity.sign(input, out) };
+        return .{ .complete = try self.identity.sign(input, self.entropy, out) };
     }
 
     fn credentialRelease(handle: *anyopaque) void {
@@ -817,12 +800,27 @@ pub const testdata = struct {
     pub const certificate_der: []const u8 = &certificate_bytes;
     pub const private_key_pkcs8_der: []const u8 = &private_key_bytes;
 
+    const p256_certificate_bytes = hexBytes(
+        "308201b030820156a003020102021440bf2f15168b53a2f36de45a8fe10f2a0dc90eab300a06082a8648ce3d04030230143112301006035504030c093132372e302e302e31301e170d3236303731393137313834355a170d3237303731393137313834355a30143112301006035504030c093132372e302e302e313059301306072a8648ce3d020106082a8648ce3d030107034200047815574399f47ac6876fc8889dd4258cb451d7caa5293b3619800f018f02085861a5ae3a35bb3547d5b4f5c9aae142884961d39722778bfbc07223723afe2386a38185308182301d0603551d0e041604149b4daf99d1f484024795bf2e133c15c7614ec6af301f0603551d230418301680149b4daf99d1f484024795bf2e133c15c7614ec6af300f0603551d130101ff040530030101ff301a0603551d110413301187047f00000182096c6f63616c686f737430130603551d25040c300a06082b06010505070301300a06082a8648ce3d04030203480030450220675306f8aa6f9d82bf45acfbc4c273f4dc52bd60f49115dad4f0bc26e3e1cd29022100cad745d5dbcdf7f910dfc5afcdaf4a0dad09222842fbee61436fc90bc004ffdc",
+    );
+    const p256_private_key_bytes = hexBytes(
+        "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b0201010420f017bbb44ed9ea2263b59c0c04fe83433f432014a80782af0710384ef5452234a144034200047815574399f47ac6876fc8889dd4258cb451d7caa5293b3619800f018f02085861a5ae3a35bb3547d5b4f5c9aae142884961d39722778bfbc07223723afe2386",
+    );
+
+    pub const p256_certificate_der: []const u8 = &p256_certificate_bytes;
+    pub const p256_private_key_pkcs8_der: []const u8 = &p256_private_key_bytes;
+
     pub fn identity() Identity {
         return Identity.initPkcs8(certificate_der, private_key_pkcs8_der) catch unreachable;
+    }
+
+    pub fn p256Identity() Identity {
+        return Identity.initPkcs8(p256_certificate_der, p256_private_key_pkcs8_der) catch unreachable;
     }
 };
 
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
+    @setEvalBranchQuota(4096);
     var bytes: [hex.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
     return bytes;
@@ -995,7 +993,7 @@ pub const MockCredentialProvider = struct {
                     return true;
                 }
                 self.sign_count += 1;
-                const written = self.identity.sign(self.pending_input[0..self.pending_input_len], self.pending_out) catch
+                const written = self.identity.sign(self.pending_input[0..self.pending_input_len], mockSignEntropy(), self.pending_out) catch
                     return error.OperationFailed;
                 out.* = .{ .signature_len = written };
             },
@@ -1046,7 +1044,7 @@ pub const MockCredentialProvider = struct {
         self.sign_count += 1;
         if (self.force_sign_error) |err| return err;
         if (self.force_sign_len) |forced| return .{ .complete = forced }; // may exceed out.len on purpose
-        const written = try self.identity.sign(input, out);
+        const written = try self.identity.sign(input, mockSignEntropy(), out);
         if (self.flip_signature and written > 0) out[0] ^= 0xff;
         return .{ .complete = written };
     }
@@ -1163,6 +1161,11 @@ pub const MockVerifier = struct {
 // ===========================================================================
 
 const testing = std.testing;
+var mock_sign_entropy = pure_zig.DeterministicEntropy.init(0x4325);
+
+fn mockSignEntropy() crypto_provider_pkg.Entropy {
+    return mock_sign_entropy.entropy();
+}
 
 fn testSelection(schemes: []const u16) SelectionContext {
     return .{
@@ -1198,7 +1201,8 @@ fn syncVerify(v: PeerVerifier, context: *const VerificationContext) !Verdict {
 }
 
 test "fixed provider selects and exposes its public chain without private-key bytes" {
-    var fixed = FixedCredentialProvider.init(testdata.identity());
+    var det = pure_zig.DeterministicEntropy.init(0x4320);
+    var fixed = FixedCredentialProvider.init(testdata.identity(), det.entropy());
     defer fixed.deinit();
     const provider = fixed.provider();
 
@@ -1213,7 +1217,8 @@ test "fixed provider selects and exposes its public chain without private-key by
 }
 
 test "fixed provider signs a bounded output the certificate can verify" {
-    var fixed = FixedCredentialProvider.init(testdata.identity());
+    var det = pure_zig.DeterministicEntropy.init(0x4321);
+    var fixed = FixedCredentialProvider.init(testdata.identity(), det.entropy());
     defer fixed.deinit();
     const provider = fixed.provider();
     const selection = testSelection(&.{0x0807});
@@ -1232,8 +1237,34 @@ test "fixed provider signs a bounded output the certificate can verify" {
     try sig.verify(message, public_key);
 }
 
+test "fixed provider selects and signs ECDSA only for compatible offers" {
+    var det = pure_zig.DeterministicEntropy.init(0x4326);
+    var fixed = FixedCredentialProvider.init(testdata.p256Identity(), det.entropy());
+    defer fixed.deinit();
+    const provider_view = fixed.provider();
+
+    const incompatible = testSelection(&.{0x0807});
+    try testing.expectError(error.NoCompatibleSignatureAlgorithm, provider_view.selectCredential(&incompatible));
+
+    const selection = testSelection(&.{0x0403});
+    const credential = try syncSelect(provider_view, &selection);
+    defer credential.release();
+    try testing.expectEqual(SignatureScheme.ecdsa_secp256r1_sha256, credential.scheme);
+
+    const message = "ECDSA CertificateVerify credential path";
+    var sig_buf: [128]u8 = undefined;
+    const written = try syncSign(credential, message, &sig_buf);
+
+    var verify_entropy = pure_zig.DeterministicEntropy.init(0x4327);
+    var verify_provider = pure_zig.Provider.init(verify_entropy.entropy());
+    const cp = verify_provider.cryptoProvider();
+    const parsed = try (crypto.Certificate{ .buffer = testdata.p256_certificate_der, .index = 0 }).parse();
+    try cp.verify(.ecdsa_secp256r1_sha256, parsed.pubKey(), message, sig_buf[0..written]);
+}
+
 test "fixed provider rejects an output buffer too small for the signature" {
-    var fixed = FixedCredentialProvider.init(testdata.identity());
+    var det = pure_zig.DeterministicEntropy.init(0x4322);
+    var fixed = FixedCredentialProvider.init(testdata.identity(), det.entropy());
     defer fixed.deinit();
     const provider = fixed.provider();
     const selection = testSelection(&.{0x0807});
@@ -1245,7 +1276,8 @@ test "fixed provider rejects an output buffer too small for the signature" {
 }
 
 test "fixed provider filters on the peer's offered signature algorithms" {
-    var fixed = FixedCredentialProvider.init(testdata.identity()); // Ed25519 identity
+    var det = pure_zig.DeterministicEntropy.init(0x4323);
+    var fixed = FixedCredentialProvider.init(testdata.identity(), det.entropy()); // Ed25519 identity
     defer fixed.deinit();
     const provider = fixed.provider();
 
@@ -1427,7 +1459,8 @@ test "error classifiers cover every select, sign, and verify error" {
 }
 
 test "fixed provider teardown zeroes the private key exactly once" {
-    var fixed = FixedCredentialProvider.init(testdata.identity());
+    var det = pure_zig.DeterministicEntropy.init(0x4324);
+    var fixed = FixedCredentialProvider.init(testdata.identity(), det.entropy());
     fixed.deinit();
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&fixed.identity.key), 0));
 }
