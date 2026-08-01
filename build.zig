@@ -627,7 +627,6 @@ pub fn build(b: *std.Build) void {
     h3_interop_mod.addImport("quic", quic_mod);
     h3_interop_mod.addImport("http3", http3_mod);
     h3_interop_mod.addImport("stream_transport", stream_transport_mod);
-    h3_interop_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
     const h3_interop_tool = b.addExecutable(.{
         .name = "h3_interop_tool",
         .root_module = h3_interop_mod,

@@ -142,7 +142,7 @@ pub const rows = [_]Row{
     row(.{ .hash = .sha256 }, "SHA-256", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "std.crypto cross-checks, transcript tests", .{ .{ .tls_handshake, .not_provider_routed }, .{ .quic_tls_bridge, .not_provider_routed } }, .{ .native_appliance, .general_purpose_openssl }, "Unkeyed transcript hashing never crosses the CryptoProvider vtable by design (no `hash` entry point exists); both product profiles use it for TLS transcripts regardless. Hash additions require transcript/HKDF vectors."),
     row(.{ .hash = .sha384 }, "SHA-384", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "provider capability and HKDF tests", .{.{ .tls_handshake, .not_provider_routed }}, .{.general_purpose_openssl}, "Unkeyed transcript hashing; the native appliance negotiates TLS_AES_128_GCM_SHA256 only, so SHA-384 is not selected there. Hash additions require TLS 1.3 suite mapping."),
     row(.{ .hkdf = .sha256 }, "HKDF-SHA256", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "RFC 5869/std.crypto and TLS expand-label parity", .{ .{ .tls_handshake, .live }, .{ .quic_tls_bridge, .live }, .{ .quic_packet_protection, .live } }, .{ .native_appliance, .general_purpose_openssl }, "QUIC Initial/Handshake/1-RTT key derivation in src/quic/tls_adapter.zig and the TLS 1.3 key schedule (src/tls/key_schedule.zig: HKDF-Extract, HKDF-Expand-Label, and Finished verify_data) both run through CryptoProvider (#490)."),
-    row(.{ .hkdf = .sha384 }, "HKDF-SHA384", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "provider capability and expand-label tests", .{.{ .tls_handshake, .live }}, .{.general_purpose_openssl}, "The TLS 1.3 key schedule's SHA-384 resumption-master-secret/PSK derivations (src/tls/key_schedule.zig) run through CryptoProvider (#490); the native appliance negotiates TLS_AES_128_GCM_SHA256 only, so HKDF-SHA384 is not selected there. HKDF additions require TLS 1.3 label coverage."),
+    row(.{ .hkdf = .sha384 }, "HKDF-SHA384", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "provider capability and expand-label tests", .{.{ .tls_handshake, .not_integrated }}, .{.general_purpose_openssl}, "The generic hash-parameterized helpers in src/tls/key_schedule.zig (deriveResumptionMasterSecret, resumptionPsk) accept and correctly route .sha384 through CryptoProvider when called with it (#490), but no live native TLS path ever calls them that way: the native engine negotiates TLS_AES_128_GCM_SHA256 only, so its own resumption/ticket flow always derives SHA-256 secrets, and the general-purpose OpenSSL backend that can negotiate SHA-384 runs entirely outside this CryptoProvider seam. Helper capability/testability is not the same as a live protocol path selecting it — stays not_integrated for tls_handshake until a native suite can actually select SHA-384."),
     row(.{ .aead = .aes_128_gcm }, "AES-128-GCM", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "seal/open round-trip, tamper rejection, AD mismatch", .{ .{ .tls_record, .live }, .{ .quic_packet_protection, .live } }, .{ .native_appliance, .general_purpose_openssl }, "TLS record protection and QUIC packet payload protection (TLS_AES_128_GCM_SHA256) both seal/open through CryptoProvider."),
     row(.{ .aead = .aes_256_gcm }, "AES-256-GCM", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "seal/open round-trip, tamper rejection, AD mismatch", .{.{ .tls_record, .not_integrated }}, .{.general_purpose_openssl}, "Provider primitive exists and the record layer is provider-routed generically, but TLS_AES_256_GCM_SHA384 is not negotiated by the native appliance's engine yet, so this AEAD is never selected there; the general-purpose OpenSSL backend negotiates it outside this seam."),
     row(.{ .aead = .chacha20_poly1305 }, "ChaCha20-Poly1305", .zig_std_crypto, .supported, .openssl_provider, .provider_deferred, "seal/open round-trip, tamper rejection, AD mismatch", .{}, .{.general_purpose_openssl}, "Provider primitive exists; the native appliance does not negotiate this suite. The general-purpose OpenSSL backend negotiates it outside this seam."),
@@ -315,16 +315,19 @@ test "QUIC packet protection is live-integrated through CryptoProvider" {
 
 // Anchors the native TLS 1.3 engine claims this PR made true (#490): the
 // handshake's key schedule, key exchange, and CertificateVerify all call
-// CryptoProvider, not a parallel std.crypto path — and RSA-PSS stays
-// deliberately not_integrated for tls_handshake since the engine's
-// CertificateVerify never negotiates it, even though the provider primitive
-// and PKI's own integration are both .live. A future regression that quietly
-// reintroduces a concrete bypass, or over-claims RSA support the live
-// protocol path cannot execute, is now a typed test failure, not just stale
-// prose.
+// CryptoProvider, not a parallel std.crypto path — and RSA-PSS and
+// HKDF-SHA384 both stay deliberately not_integrated for tls_handshake, since
+// the engine's CertificateVerify never negotiates RSA and its live protocol
+// path (TLS_AES_128_GCM_SHA256 only) never selects SHA-384, even though the
+// provider primitives exist, key_schedule.zig's generic helpers correctly
+// route .sha384 when called with it, and RSA's PKI integration is .live. A
+// helper being capable and tested is not the same as a live protocol path
+// selecting it. A future regression that quietly reintroduces a concrete
+// bypass, or over-claims support the live protocol path cannot execute, is
+// now a typed test failure, not just stale prose.
 test "native TLS 1.3 handshake engine is live-integrated through CryptoProvider" {
     try expectIntegration(.{ .hkdf = .sha256 }, .tls_handshake, .live);
-    try expectIntegration(.{ .hkdf = .sha384 }, .tls_handshake, .live);
+    try expectIntegration(.{ .hkdf = .sha384 }, .tls_handshake, .not_integrated);
     try expectIntegration(.{ .group = .x25519 }, .tls_handshake, .live);
     try expectIntegration(.{ .signature = .ed25519 }, .tls_handshake, .live);
     try expectIntegration(.{ .signature = .ecdsa_secp256r1_sha256 }, .tls_handshake, .live);

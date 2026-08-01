@@ -422,21 +422,36 @@ fn verifyImpl(
     _ = context;
     switch (scheme) {
         .ed25519 => {
+            // Malformed/invalid *public-key* material is `InvalidInput` — the
+            // caller's certificate is structurally defective, distinct from a
+            // proof-of-possession failure. A malformed *signature* encoding
+            // is `AuthenticationFailed`, not `InvalidInput` (#490 review): a
+            // signature that cannot even be parsed is, per RFC 8446 §4.4.3,
+            // the same `decrypt_error` outcome as one that parses but does
+            // not verify — TLS does not distinguish "your signature bytes
+            // are the wrong shape" from "your signature bytes are wrong" the
+            // way it distinguishes a bad key from a bad signature.
             if (public_key.len != Ed25519.PublicKey.encoded_length) return error.InvalidInput;
-            if (signature.len != Ed25519.Signature.encoded_length) return error.InvalidInput;
             const pk = Ed25519.PublicKey.fromBytes(public_key[0..Ed25519.PublicKey.encoded_length].*) catch
                 return error.InvalidInput;
+            if (signature.len != Ed25519.Signature.encoded_length) return error.AuthenticationFailed;
             const sig = Ed25519.Signature.fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
             sig.verify(message, pk) catch return error.AuthenticationFailed;
         },
         .ecdsa_secp256r1_sha256 => {
             // `public_key` is the SEC1 point (uncompressed 0x04||X||Y or
             // compressed); `signature` is the DER SEQUENCE { r, s } used by
-            // both TLS CertificateVerify and X.509. A malformed key or
-            // signature encoding is InputError; a well-formed but wrong
-            // signature is AuthenticationFailed.
+            // both TLS CertificateVerify and X.509. Same split as Ed25519
+            // above: a malformed key is `InvalidInput`, a malformed
+            // signature DER encoding is `AuthenticationFailed` (not
+            // `InvalidInput`), matching a well-formed-but-wrong signature.
+            // `src/pki/verify.zig`'s chain-signature path is unaffected: it
+            // pre-validates DER signature structure itself
+            // (`validateEcdsaDerSignature`) before ever calling this, so a
+            // malformed signature never reaches this function from that
+            // caller in the first place.
             const pk = EcdsaP256Sha256.PublicKey.fromSec1(public_key) catch return error.InvalidInput;
-            const sig = EcdsaP256Sha256.Signature.fromDer(signature) catch return error.InvalidInput;
+            const sig = EcdsaP256Sha256.Signature.fromDer(signature) catch return error.AuthenticationFailed;
             sig.verify(message, pk) catch return error.AuthenticationFailed;
         },
         .rsa_pss_rsae_sha256 => {

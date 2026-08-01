@@ -2220,9 +2220,13 @@ pub const Tls13Backend = struct {
         switch (self.initial_key_share_mode) {
             .normal => {
                 var share: EphemeralKeyShare = .{};
+                // Armed before the fallible call (#490 review): the provider
+                // interface does not promise `share.private_key` stays
+                // untouched on failure, so a conforming provider that writes
+                // a partial scalar and then fails must still have it wiped.
+                defer crypto_provider_pkg.secureZero(&share.private_key);
                 self.crypto_provider.generateKeyShare(key_share_group, &share.public_key, &share.private_key) catch
                     return error.SecretExportFailed;
-                defer crypto.secureZero(u8, &share.private_key);
                 self.key_pair = share;
                 self.key_pair_present = true;
 
@@ -2677,11 +2681,13 @@ pub const Tls13Backend = struct {
         // data.
         if (!self.key_pair_present) return error.InvalidHandshakeState;
         var shared: [key_share_shared_len]u8 = undefined;
+        // Armed before the fallible call (#490 review): a conforming
+        // provider may write a partial shared secret and then fail.
+        defer crypto_provider_pkg.secureZero(&shared);
         self.crypto_provider.deriveSharedSecret(key_share_group, &self.key_pair.private_key, &share, &shared) catch |err| return switch (err) {
             error.InvalidInput => error.IllegalParameter,
             error.UnsupportedCapability => error.SecretExportFailed,
         };
-        defer crypto.secureZero(u8, &shared);
 
         // #362: consistency-check the server's selected_identity (if any)
         // against our own offers — `self.client_offer_lease.offers` was already
@@ -2827,9 +2833,11 @@ pub const Tls13Backend = struct {
             // private keys, and never reuse the superseded one.
             self.wipeEphemeral();
             var share: EphemeralKeyShare = .{};
+            // Armed before the fallible call (#490 review) — see the
+            // matching comment in `sendClientHello`.
+            defer crypto_provider_pkg.secureZero(&share.private_key);
             self.crypto_provider.generateKeyShare(key_share_group, &share.public_key, &share.private_key) catch
                 return error.SecretExportFailed;
-            defer crypto.secureZero(u8, &share.private_key);
             self.key_pair = share;
             self.key_pair_present = true;
 
@@ -3244,6 +3252,13 @@ pub const Tls13Backend = struct {
             .unsupported_certificate => return self.failCredential(.unsupported_peer_certificate),
             .unoffered_algorithm => return error.IllegalParameter,
             .invalid_signature => return self.failCredential(.certificate_verify_invalid),
+            // A local provider/configuration fault, not a peer-attributed
+            // outcome (#490 review): the peer offered and presented a
+            // scheme this side's own policy negotiates, but the injected
+            // CryptoProvider cannot perform it. Blaming the peer with
+            // unsupported_certificate here would be wrong — their
+            // certificate and CertificateVerify are perfectly valid.
+            .provider_failure => return error.SecretExportFailed,
         }
 
         // Delegate the trust verdict to the peer verifier — the fixed pin/
@@ -3305,6 +3320,12 @@ pub const Tls13Backend = struct {
         invalid_certificate,
         unsupported_certificate,
         unoffered_algorithm,
+        /// The scheme is one this side's own policy negotiates and the peer
+        /// legitimately offered/used, but the injected CryptoProvider itself
+        /// cannot perform it (missing capability, or a provider-internal
+        /// failure surfaced through `error.UnsupportedCapability`) — a local
+        /// configuration/provider fault, never the peer's.
+        provider_failure,
     };
 
     fn locallyOfferedSignatureAlgorithm(self: *const Tls13Backend, algorithm: u16) bool {
@@ -3350,20 +3371,34 @@ pub const Tls13Backend = struct {
             },
             else => unreachable,
         };
-        if (!self.crypto_provider.capabilities().supportsSignature(scheme)) return .unsupported_certificate;
+        // A provider missing a scheme this side's own negotiated policy
+        // claims to support is a local misconfiguration between the policy
+        // and the injected provider's actual capabilities — not something
+        // the peer did wrong (#490 review). `scheme` here was derived only
+        // from the peer's offered algorithm cross-checked against the
+        // certificate's own key type, both already screened against local
+        // policy above; the provider is the only thing that can still be
+        // missing it.
+        if (!self.crypto_provider.capabilities().supportsSignature(scheme)) return .provider_failure;
         self.crypto_provider.verify(scheme, parsed.pubKey(), content, signature) catch |err| return switch (err) {
-            // A well-formed signature that does not check out is a proof-of-
-            // possession failure (decrypt_error, RFC 8446 §4.4.3).
+            // A well-formed signature that does not check out — or a
+            // structurally malformed signature encoding, which
+            // `pure_zig.verifyImpl` also reports as `AuthenticationFailed`
+            // rather than `InvalidInput` (#490 review) since RFC 8446 §4.4.3
+            // does not distinguish "the signature bytes are the wrong shape"
+            // from "the signature bytes are wrong" — is a proof-of-
+            // possession failure (decrypt_error).
             error.AuthenticationFailed => .invalid_signature,
-            // `provider.verify` reports `InvalidInput` for a structurally
-            // malformed public-key or signature encoding (see
-            // `pure_zig.verifyImpl`) — the same defect class the
-            // pre-migration code caught with its own `PublicKey.fromBytes`
-            // check and mapped to `.invalid_certificate` (bad_certificate),
-            // distinct from a validly-encoded signature that simply fails to
-            // verify.
+            // `provider.verify` now reports `InvalidInput` only for a
+            // structurally malformed *public key* — the same defect class
+            // the pre-migration code caught with its own `PublicKey.fromBytes`
+            // check and mapped to `.invalid_certificate` (bad_certificate).
             error.InvalidInput => .invalid_certificate,
-            error.UnsupportedCapability => .unsupported_certificate,
+            // Negotiation already confirmed the provider supports `scheme`
+            // (the capability check above), so reaching this is the
+            // provider itself failing internally, not a capability gap —
+            // still a local fault, never the peer's.
+            error.UnsupportedCapability => .provider_failure,
         };
         return .valid;
     }
@@ -3907,18 +3942,23 @@ pub const Tls13Backend = struct {
         // rejects low-order/identity public keys (all-zero shared secret)
         // rather than deriving a predictable secret.
         var share: EphemeralKeyShare = .{};
+        // Armed before the fallible call (#490 review) — see the matching
+        // comment in `sendClientHello`.
+        defer crypto_provider_pkg.secureZero(&share.private_key);
         self.crypto_provider.generateKeyShare(key_share_group, &share.public_key, &share.private_key) catch
             return error.SecretExportFailed;
-        defer crypto.secureZero(u8, &share.private_key);
         self.key_pair = share;
         self.key_pair_present = true;
         var shared: [key_share_shared_len]u8 = undefined;
+        defer crypto_provider_pkg.secureZero(&shared);
         self.crypto_provider.deriveSharedSecret(key_share_group, &share.private_key, &client_share, &shared) catch |err| return switch (err) {
             error.InvalidInput => error.IllegalParameter,
             error.UnsupportedCapability => error.SecretExportFailed,
         };
-        defer crypto.secureZero(u8, &shared);
-        crypto.secureZero(u8, &share.private_key);
+        // Wipe the moment it's no longer needed rather than waiting for
+        // function exit — the `defer` above is the failure-path/belt-and-
+        // braces guarantee, this is the success-path minimize-retention one.
+        crypto_provider_pkg.secureZero(&share.private_key);
         self.wipeEphemeral();
 
         // #362: credential selection (above, by the caller) happens before

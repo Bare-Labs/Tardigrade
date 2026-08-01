@@ -32,7 +32,7 @@ pub fn testDefaultProvider() crypto.provider.CryptoProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Handshake-capable provider (#490)
+// Handshake-capable provider storage (#490)
 // ---------------------------------------------------------------------------
 //
 // `testDefaultProvider` above deliberately fails every entropy draw — correct
@@ -41,34 +41,35 @@ pub fn testDefaultProvider() crypto.provider.CryptoProvider {
 // never need ambient randomness. Ephemeral X25519 key-share generation is
 // different: it is itself a real entropy draw, now routed through the same
 // injected `CryptoProvider` (#490's native TLS engine migration), so a QUIC/H3
-// test or tool that constructs a full `Tls13Backend` end-to-end needs a
-// provider whose entropy source actually produces bytes.
+// test that constructs a full `Tls13Backend` end-to-end needs a provider
+// whose entropy source actually produces bytes.
+//
+// There is deliberately no shared/global `testHandshakeProvider()` helper
+// here (#490 review — an earlier revision had one, backed by one process-wide
+// mutable `DeterministicEntropy` stream every caller advanced together): a
+// test's captured key share/traffic-secret bytes would then depend on which
+// other tests ran before it in the same process, and on whether a test
+// filter skipped some of them — order- and filter-dependent, not hermetic.
+// Every caller instead owns a `HandshakeProviderStorage` (a struct field for
+// a harness/backend pair that outlives one call, a local variable for a
+// single self-contained test), so a given seed reproduces byte-for-byte
+// regardless of what else runs in the process.
 
-var handshake_entropy_state = crypto.pure_zig.DeterministicEntropy.init(0x71a5_c0de);
-var handshake_provider_backing: crypto.pure_zig.Provider = crypto.pure_zig.Provider.init(handshake_entropy_state.entropy());
-
-/// A working (non-failing) deterministic pure-Zig provider for QUIC/H3 tests
-/// and tools that drive a native TLS handshake end-to-end. Backed by
-/// `pure_zig.DeterministicEntropy` (explicitly not a CSPRNG, matching the
-/// convention `src/crypto/pure_zig.zig`'s own tests use) over one shared,
-/// persistent byte stream: safe for multiple backends (a client and a server,
-/// say) drawing from it in sequence within one single-threaded test, since
-/// each draw simply consumes the stream's next bytes rather than needing to
-/// be independent of any other caller's draws.
-pub fn testHandshakeProvider() crypto.provider.CryptoProvider {
-    return handshake_provider_backing.cryptoProvider();
-}
-
-/// Per-instance deterministic `CryptoProvider` storage, for a caller that
-/// needs its own independent entropy stream instead of sharing
-/// `testHandshakeProvider`'s single global one — e.g. a seeded simulation
-/// harness where a given seed must reproduce byte-for-byte regardless of what
-/// else in the process draws from the shared stream. Zero-initializable
-/// (`= .{}`) so it can be embedded as a struct field default; call `init`
-/// with the caller's own seed before use. `self` must have a stable address
-/// for as long as the returned `CryptoProvider` is used (same rule as
+/// Per-instance deterministic `CryptoProvider` storage for a caller that
+/// drives a full TLS handshake end-to-end and needs its own independent
+/// entropy stream — e.g. a seeded simulation harness, or a client/server
+/// backend pair in a single test. Backed by `pure_zig.DeterministicEntropy`
+/// (explicitly not a CSPRNG, matching the convention `src/crypto/pure_zig.
+/// zig`'s own tests use). Zero-initializable (`= .{}`) so it can be embedded
+/// as a struct field default or declared as a plain local; call `init` with
+/// the caller's own seed before use. `self` must have a stable address for
+/// as long as the returned `CryptoProvider` is used (same rule as
 /// `production_crypto.StackProviderStorage`), since the provider erases to a
-/// view that borrows `self`.
+/// view that borrows `self` — a struct field (stable for the owning
+/// instance's lifetime) or a local in the same function that uses the
+/// resulting backend (stable for that function's own stack frame), never a
+/// local inside a separate factory function that returns before the backend
+/// is done being used.
 pub const HandshakeProviderStorage = struct {
     entropy: crypto.pure_zig.DeterministicEntropy = crypto.pure_zig.DeterministicEntropy.init(0),
     provider: crypto.pure_zig.Provider = undefined,

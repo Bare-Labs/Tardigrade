@@ -3595,6 +3595,11 @@ fn rangesOverlap(a: Range, b: Range) bool {
 const TestPair = struct {
     client_backend: tls_backend_mod.Tls13Backend,
     server_backend: tls_backend_mod.Tls13Backend,
+    // Owned, per-instance deterministic TLS-engine provider storage (#490
+    // review), not the shared `test_quic_crypto.testHandshakeProvider()`
+    // stream: every `TestPair` instance gets its own independent entropy.
+    client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{},
+    server_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{},
     client: *Connection = undefined,
     server: *Connection = undefined,
     now_us: u64 = 1_000_000,
@@ -3617,15 +3622,19 @@ const TestPair = struct {
 
     fn init(allocator: std.mem.Allocator) !*TestPair {
         const pair = try allocator.create(TestPair);
+        const client_crypto_provider = pair.client_provider_storage.init(0x442_c);
+        const server_crypto_provider = pair.server_provider_storage.init(0x442_5);
         pair.* = .{
+            .client_provider_storage = pair.client_provider_storage,
+            .server_provider_storage = pair.server_provider_storage,
             .client_backend = tls_backend_mod.Tls13Backend.initClient(
                 .{ .hello_random = [_]u8{0xc1} ** 32 },
-                test_quic_crypto.testHandshakeProvider(),
+                client_crypto_provider,
                 .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             ),
             .server_backend = tls_backend_mod.Tls13Backend.initServer(
                 .{ .hello_random = [_]u8{0x51} ** 32 },
-                test_quic_crypto.testHandshakeProvider(),
+                server_crypto_provider,
                 try tls_backend_mod.Identity.initPkcs8(
                     tls_backend_mod.testdata.certificate_der,
                     tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -3674,17 +3683,21 @@ const TestPair = struct {
         resume_compat: ?tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy,
     ) !*TestPair {
         const pair = try allocator.create(TestPair);
+        const client_crypto_provider = pair.client_provider_storage.init(0x442_c);
+        const server_crypto_provider = pair.server_provider_storage.init(0x442_5);
         pair.* = .{
+            .client_provider_storage = pair.client_provider_storage,
+            .server_provider_storage = pair.server_provider_storage,
             .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
                 allocator,
                 .{ .hello_random = [_]u8{0xc1} ** 32 },
-                test_quic_crypto.testHandshakeProvider(),
+                client_crypto_provider,
                 .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             ),
             .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
                 allocator,
                 .{ .hello_random = [_]u8{0x51} ** 32 },
-                test_quic_crypto.testHandshakeProvider(),
+                server_crypto_provider,
                 try tls_backend_mod.Identity.initPkcs8(
                     tls_backend_mod.testdata.certificate_der,
                     tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -3729,17 +3742,21 @@ const TestPair = struct {
         server_verifier: tls_core.credentials.PeerVerifier,
     ) !*TestPair {
         const pair = try allocator.create(TestPair);
+        const client_crypto_provider = pair.client_provider_storage.init(0x442_c);
+        const server_crypto_provider = pair.server_provider_storage.init(0x442_5);
         pair.* = .{
+            .client_provider_storage = pair.client_provider_storage,
+            .server_provider_storage = pair.server_provider_storage,
             .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
                 allocator,
                 .{ .hello_random = [_]u8{0xc1} ** 32 },
-                test_quic_crypto.testHandshakeProvider(),
+                client_crypto_provider,
                 .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             ),
             .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
                 allocator,
                 .{ .hello_random = [_]u8{0x51} ** 32 },
-                test_quic_crypto.testHandshakeProvider(),
+                server_crypto_provider,
                 try tls_backend_mod.Identity.initPkcs8(
                     tls_backend_mod.testdata.certificate_der,
                     tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -3814,10 +3831,11 @@ test "Connection.init failure before the handshake is assigned does not deinit u
     // was assigned -- deinitPartial()'s errdefer would then call
     // .deinit() on undefined storage. This must fail cleanly instead.
     const too_short_dcid = [_]u8{0xaa} ** (tls_adapter.min_initial_dcid_len - 1);
+    var provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
     var backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
         allocator,
         .{ .hello_random = [_]u8{0xc1} ** 32 },
-        test_quic_crypto.testHandshakeProvider(),
+        provider_storage.init(0x442_c),
         .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
     );
     try testing.expectError(error.InvalidConnectionId, Connection.init(allocator, .{
@@ -3906,18 +3924,22 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
 
     const pair = try allocator.create(TestPair);
     errdefer allocator.destroy(pair);
+    const client_crypto_provider = pair.client_provider_storage.init(0x442_c);
+    const server_crypto_provider = pair.server_provider_storage.init(0x442_5);
     pair.* = .{
+        .client_provider_storage = pair.client_provider_storage,
+        .server_provider_storage = pair.server_provider_storage,
         .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocatorAndOptions(
             allocator,
             .{ .hello_random = [_]u8{0xc1} ** 32 },
-            test_quic_crypto.testHandshakeProvider(),
+            client_crypto_provider,
             .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             .{ .initial_key_share_mode = .empty },
         ),
         .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
             allocator,
             .{ .hello_random = [_]u8{0x51} ** 32 },
-            test_quic_crypto.testHandshakeProvider(),
+            server_crypto_provider,
             try tls_backend_mod.Identity.initPkcs8(
                 tls_backend_mod.testdata.certificate_der,
                 tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -4093,18 +4115,22 @@ test "driver: PSK resumption completes through a real HelloRetryRequest over QUI
 
     const pair = try allocator.create(TestPair);
     errdefer allocator.destroy(pair);
+    const client_crypto_provider = pair.client_provider_storage.init(0x442_c);
+    const server_crypto_provider = pair.server_provider_storage.init(0x442_5);
     pair.* = .{
+        .client_provider_storage = pair.client_provider_storage,
+        .server_provider_storage = pair.server_provider_storage,
         .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocatorAndOptions(
             allocator,
             .{ .hello_random = [_]u8{0xc1} ** 32 },
-            test_quic_crypto.testHandshakeProvider(),
+            client_crypto_provider,
             .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             .{ .initial_key_share_mode = .empty },
         ),
         .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
             allocator,
             .{ .hello_random = [_]u8{0x51} ** 32 },
-            test_quic_crypto.testHandshakeProvider(),
+            server_crypto_provider,
             try tls_backend_mod.Identity.initPkcs8(
                 tls_backend_mod.testdata.certificate_der,
                 tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -4997,15 +5023,19 @@ test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake v
 
     const resumed = try allocator.create(TestPair);
     defer allocator.destroy(resumed);
+    const client_crypto_provider = resumed.client_provider_storage.init(0x442_c);
+    const server_crypto_provider = resumed.server_provider_storage.init(0x442_5);
     resumed.* = .{
+        .client_provider_storage = resumed.client_provider_storage,
+        .server_provider_storage = resumed.server_provider_storage,
         .client_backend = tls_backend_mod.Tls13Backend.initClient(
             .{ .hello_random = [_]u8{0xd1} ** 32 },
-            test_quic_crypto.testHandshakeProvider(),
+            client_crypto_provider,
             .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
         ),
         .server_backend = tls_backend_mod.Tls13Backend.initServer(
             .{ .hello_random = [_]u8{0xd2} ** 32 },
-            test_quic_crypto.testHandshakeProvider(),
+            server_crypto_provider,
             try tls_backend_mod.Identity.initPkcs8(
                 tls_backend_mod.testdata.certificate_der,
                 tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -5167,15 +5197,19 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
 
     const resumed = try allocator.create(TestPair);
     defer allocator.destroy(resumed);
+    const client_crypto_provider = resumed.client_provider_storage.init(0x442_c);
+    const server_crypto_provider = resumed.server_provider_storage.init(0x442_5);
     resumed.* = .{
+        .client_provider_storage = resumed.client_provider_storage,
+        .server_provider_storage = resumed.server_provider_storage,
         .client_backend = tls_backend_mod.Tls13Backend.initClient(
             .{ .hello_random = [_]u8{0xe1} ** 32 },
-            test_quic_crypto.testHandshakeProvider(),
+            client_crypto_provider,
             .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
         ),
         .server_backend = tls_backend_mod.Tls13Backend.initServer(
             .{ .hello_random = [_]u8{0xe2} ** 32 },
-            test_quic_crypto.testHandshakeProvider(),
+            server_crypto_provider,
             try tls_backend_mod.Identity.initPkcs8(
                 tls_backend_mod.testdata.certificate_der,
                 tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -5397,15 +5431,19 @@ test "#523: Event.early_data_decision surfaces the real TLS decision once, even 
 
     const resumed = try allocator.create(TestPair);
     defer allocator.destroy(resumed);
+    const client_crypto_provider = resumed.client_provider_storage.init(0x442_c);
+    const server_crypto_provider = resumed.server_provider_storage.init(0x442_5);
     resumed.* = .{
+        .client_provider_storage = resumed.client_provider_storage,
+        .server_provider_storage = resumed.server_provider_storage,
         .client_backend = tls_backend_mod.Tls13Backend.initClient(
             .{ .hello_random = [_]u8{0xf1} ** 32 },
-            test_quic_crypto.testHandshakeProvider(),
+            client_crypto_provider,
             .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
         ),
         .server_backend = tls_backend_mod.Tls13Backend.initServer(
             .{ .hello_random = [_]u8{0xf2} ** 32 },
-            test_quic_crypto.testHandshakeProvider(),
+            server_crypto_provider,
             try tls_backend_mod.Identity.initPkcs8(
                 tls_backend_mod.testdata.certificate_der,
                 tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -5586,15 +5624,19 @@ fn expectRejectedEarlyDataFallsBackOnSameConnection(scenario: RejectedEarlyDataF
 
     const resumed = try allocator.create(TestPair);
     defer allocator.destroy(resumed);
+    const client_crypto_provider = resumed.client_provider_storage.init(0x442_c);
+    const server_crypto_provider = resumed.server_provider_storage.init(0x442_5);
     resumed.* = .{
+        .client_provider_storage = resumed.client_provider_storage,
+        .server_provider_storage = resumed.server_provider_storage,
         .client_backend = tls_backend_mod.Tls13Backend.initClient(
             .{ .hello_random = [_]u8{0xa1} ** 32 },
-            test_quic_crypto.testHandshakeProvider(),
+            client_crypto_provider,
             .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
         ),
         .server_backend = tls_backend_mod.Tls13Backend.initServer(
             .{ .hello_random = [_]u8{0xa2} ** 32 },
-            test_quic_crypto.testHandshakeProvider(),
+            server_crypto_provider,
             try tls_backend_mod.Identity.initPkcs8(
                 tls_backend_mod.testdata.certificate_der,
                 tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -6083,21 +6125,29 @@ test "driver: stream reset propagates" {
 const MigrationPair = struct {
     client_backend: tls_backend_mod.Tls13Backend,
     server_backend: tls_backend_mod.Tls13Backend,
+    // Owned, per-instance deterministic TLS-engine provider storage (#490
+    // review) — see the matching comment on `TestPair`.
+    client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{},
+    server_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{},
     client: *Connection = undefined,
     server: *Connection = undefined,
     now_us: u64 = 1_000_000,
 
     fn init(allocator: std.mem.Allocator, policy: config.MigrationPolicy) !*MigrationPair {
         const pair = try allocator.create(MigrationPair);
+        const client_crypto_provider = pair.client_provider_storage.init(0x442_c);
+        const server_crypto_provider = pair.server_provider_storage.init(0x442_5);
         pair.* = .{
+            .client_provider_storage = pair.client_provider_storage,
+            .server_provider_storage = pair.server_provider_storage,
             .client_backend = tls_backend_mod.Tls13Backend.initClient(
                 .{ .hello_random = [_]u8{0xc1} ** 32 },
-                test_quic_crypto.testHandshakeProvider(),
+                client_crypto_provider,
                 .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             ),
             .server_backend = tls_backend_mod.Tls13Backend.initServer(
                 .{ .hello_random = [_]u8{0x51} ** 32 },
-                test_quic_crypto.testHandshakeProvider(),
+                server_crypto_provider,
                 try tls_backend_mod.Identity.initPkcs8(
                     tls_backend_mod.testdata.certificate_der,
                     tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -6430,14 +6480,16 @@ test "connection: a Handshake packet arriving on a different tuple validates onl
 test "connection: a policy-blocked server still answers a PATH_CHALLENGE on its exact ingress path without migrating" {
     const allocator = testing.allocator;
 
+    var client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
+    var server_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
     var client_backend = tls_backend_mod.Tls13Backend.initClient(
         .{ .hello_random = [_]u8{0xc1} ** 32 },
-        test_quic_crypto.testHandshakeProvider(),
+        client_provider_storage.init(0x442_c),
         .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
     );
     var server_backend = tls_backend_mod.Tls13Backend.initServer(
         .{ .hello_random = [_]u8{0x51} ** 32 },
-        test_quic_crypto.testHandshakeProvider(),
+        server_provider_storage.init(0x442_5),
         try tls_backend_mod.Identity.initPkcs8(
             tls_backend_mod.testdata.certificate_der,
             tls_backend_mod.testdata.private_key_pkcs8_der,
@@ -6937,17 +6989,21 @@ test "a real Connection closes with handshake_failure when the server has no app
         mock.pending_polls = 1;
 
         const pair = try allocator.create(TestPair);
+        const client_crypto_provider = pair.client_provider_storage.init(0x442_c);
+        const server_crypto_provider = pair.server_provider_storage.init(0x442_5);
         pair.* = .{
+            .client_provider_storage = pair.client_provider_storage,
+            .server_provider_storage = pair.server_provider_storage,
             .client_backend = try tls_backend_mod.Tls13Backend.initClientWithAllocator(
                 allocator,
                 .{ .hello_random = [_]u8{0xc1} ** 32 },
-                test_quic_crypto.testHandshakeProvider(),
+                client_crypto_provider,
                 .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
             ),
             .server_backend = tls_backend_mod.Tls13Backend.initServerWithAllocator(
                 allocator,
                 .{ .hello_random = [_]u8{0x51} ** 32 },
-                test_quic_crypto.testHandshakeProvider(),
+                server_crypto_provider,
                 try tls_backend_mod.Identity.initPkcs8(tls_backend_mod.testdata.certificate_der, tls_backend_mod.testdata.private_key_pkcs8_der),
             ),
         };

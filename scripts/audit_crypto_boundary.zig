@@ -331,13 +331,23 @@ const file_checks_with_exceptions = [_]FileCheckWithExceptions{
             "const HkdfSha256 = crypto.kdf.hkdf.HkdfSha256;",
             "break :blk crypto.tls.hkdfExpandLabel(HkdfSha256, early_secret, \"derived\", &empty_transcript_hash, hash_len);",
         },
-        // This module's own test block (after the marker) cross-checks the
-        // HKDF-Extract-as-HMAC `verifyData` trick against a direct
-        // `std.crypto.auth.hmac.sha2.HmacSha256` computation and builds raw
-        // `CryptoProvider` vtables for typed-error-propagation fixtures —
-        // legitimate test-only direct crypto use, not production code.
-        .production_only_marker = "\nconst testing = std.testing;",
-        .rationale = "The TLS 1.3 key schedule performs no keyed HKDF/Finished-MAC work directly (#490): HKDF-Extract, HKDF-Expand-Label, and Finished verify_data (itself expressed as HKDF-Extract per RFC 5869) cross CryptoProvider. derived_early_secret's comptime derivation is the one documented public-constant exception; unkeyed transcript hashing (Sha256.hash) stays provider-independent by design and is not itself a forbidden pattern.",
+        // No `production_only_marker` (#490 review): a textual "scan only
+        // before this position" boundary is not a sound production/test
+        // reachability proof — Zig declarations are order-independent, so a
+        // production function positioned before such a marker could still
+        // call a private helper positioned after it, and the scan would
+        // never see the forbidden call (the same structural class of bug
+        // #544 fixed for `test_quic_crypto` by moving to a build.zig
+        // module-graph boundary instead of a text scan). This module's own
+        // tests — including the direct-HMAC cross-check of the
+        // HKDF-Extract-as-HMAC `verifyData` trick and the raw
+        // `CryptoProvider` vtable fixtures for typed-error-propagation — live
+        // in `key_schedule_tests.zig`, a separate file this tool never scans
+        // at all (the same way `tests/support/quic_crypto.zig` and
+        // `tests/crypto_vectors.zig` aren't scanned), so `key_schedule.zig`
+        // itself has no test-only content left to exempt and is scanned in
+        // full.
+        .rationale = "The TLS 1.3 key schedule performs no keyed HKDF/Finished-MAC work directly (#490): HKDF-Extract, HKDF-Expand-Label, and Finished verify_data (itself expressed as HKDF-Extract per RFC 5869) cross CryptoProvider. derived_early_secret's comptime derivation is the one documented public-constant exception; unkeyed transcript hashing (Sha256.hash) stays provider-independent by design and is not itself a forbidden pattern. Tests live in the separate, unscanned key_schedule_tests.zig.",
     },
 };
 
@@ -900,6 +910,17 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
         // evade it. Argument shape deliberately differs from the one exact
         // exempted expand-label call so this does not collide with it.
         .{ .rel = "src/tls/key_schedule.zig", .contents = "fn helperDerive(s: []const u8) [32]u8 { var out: [32]u8 = undefined; crypto.tls.hkdfExpandLabel(HkdfSha256, s, \"other\", \"\", &out); return out; }\n" },
+        // #490 review: `key_schedule.zig` has no `production_only_marker` at
+        // all, specifically so this exact shape of bug cannot recur — a
+        // production declaration positioned before a `const testing =
+        // std.testing;`-shaped line, calling a private helper positioned
+        // after it, must still fail even though that line would have been a
+        // marker under the (now-removed) text-position-based scheme other
+        // files in this tool still use.
+        .{
+            .rel = "src/tls/key_schedule.zig",
+            .contents = "pub fn callsHelperBeforeDecoyMarker() [32]u8 { return legacyHelperAfterDecoyMarker(); }\n\nconst testing = std.testing;\n\nfn legacyHelperAfterDecoyMarker() [32]u8 { var out: [32]u8 = undefined; crypto.tls.hkdfExpandLabel(HkdfSha256, \"s\", \"other\", \"\", &out); return out; }\n",
+        },
         .{ .rel = "src/tls/tls13_backend.zig", .contents = "var kp = X25519.KeyPair.generateDeterministic(seed) catch unreachable;\n" },
         .{ .rel = "src/tls/tls13_backend.zig", .contents = "const LocalEd25519 = crypto.sign.Ed25519;\n" },
         .{ .rel = "src/tls/tls13_backend.zig", .contents = "fn helperVerify(sig: []const u8, msg: []const u8, key: []const u8) void { Ed25519.verify(sig, msg, key) catch unreachable; }\n" },
