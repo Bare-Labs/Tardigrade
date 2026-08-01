@@ -18,6 +18,8 @@ const profile = crypto_pkg.profile;
 const pure_zig = crypto_pkg.pure_zig;
 const X25519 = std.crypto.dh.X25519;
 const Ed25519 = std.crypto.sign.Ed25519;
+const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const P256Scalar = std.crypto.ecc.P256.scalar.Scalar;
 
 const evp_oracle_max_input = 4096;
 const evp_oracle_stdout_limit = 2 * evp_oracle_max_input + 128;
@@ -89,6 +91,7 @@ const differential_cases = [_]DifferentialCase{
     .{ .kind = .key_exchange, .algorithm = .{ .group = .x25519 }, .class = .positive, .rationale = "provider raw X25519 shared secret compared to EVP oracle", .run = runX25519Positive },
     .{ .kind = .key_exchange, .algorithm = .{ .group = .x25519 }, .class = .negative, .rationale = "provider X25519 malformed and low-order peer handling compared to EVP oracle status", .run = runX25519Negative },
     .{ .kind = .signature_sign, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .rationale = "provider raw Ed25519 signing compared to EVP oracle", .run = runEd25519SignPositive },
+    .{ .kind = .signature_sign, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .positive, .rationale = "pure-Zig ECDSA-P256 signatures cross-verify with the OpenSSL EVP oracle", .run = runEcdsaP256SignPositive },
     .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .rationale = "provider raw Ed25519 verification compared to EVP oracle", .run = runEd25519VerifyPositive },
     .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .negative, .rationale = "provider raw Ed25519 invalid signature/message/key handling compared to EVP oracle", .run = runEd25519VerifyNegative },
     .{ .kind = .signature_verify, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .positive, .rationale = "provider SEC1 ECDSA-P256-SHA256 verification compared to EVP oracle", .run = runEcdsaP256VerifyPositive },
@@ -519,6 +522,151 @@ fn runEvpEcdsaP256Verify(allocator: std.mem.Allocator, public_key: []const u8, m
     const signature_hex = try hexAlloc(allocator, signature);
     defer allocator.free(signature_hex);
     return runEvpOracle(allocator, &.{ "ecdsa-p256-verify", public_hex, message_hex, signature_hex });
+}
+
+fn runEvpEcdsaP256Sign(allocator: std.mem.Allocator, private_scalar: []const u8, message: []const u8) !EvpOracleResult {
+    const private_hex = try hexAlloc(allocator, private_scalar);
+    defer allocator.free(private_hex);
+    const message_hex = try hexAlloc(allocator, message);
+    defer allocator.free(message_hex);
+    return runEvpOracle(allocator, &.{ "ecdsa-p256-sign", private_hex, message_hex });
+}
+
+fn readDerLen(bytes: []const u8, pos: *usize) !usize {
+    if (pos.* >= bytes.len) return error.InvalidDer;
+    const first = bytes[pos.*];
+    pos.* += 1;
+    if (first < 0x80) return first;
+    const len_len = first & 0x7f;
+    if (len_len == 0 or len_len > 2 or pos.* + len_len > bytes.len) return error.InvalidDer;
+    if (bytes[pos.*] == 0) return error.InvalidDer;
+    var len: usize = 0;
+    for (0..len_len) |_| {
+        len = (len << 8) | bytes[pos.*];
+        pos.* += 1;
+    }
+    if (len < 0x80) return error.InvalidDer;
+    return len;
+}
+
+fn readDerInteger32(der: []const u8, pos: *usize) ![32]u8 {
+    if (pos.* >= der.len or der[pos.*] != 0x02) return error.InvalidDer;
+    pos.* += 1;
+    const len = try readDerLen(der, pos);
+    if (len == 0 or len > 33 or pos.* + len > der.len) return error.InvalidDer;
+    const int_bytes = der[pos.*..][0..len];
+    pos.* += len;
+
+    if (int_bytes[0] & 0x80 != 0) return error.InvalidDer;
+    if (len > 1 and int_bytes[0] == 0 and int_bytes[1] & 0x80 == 0) return error.InvalidDer;
+
+    const unsigned = if (len == 33) blk: {
+        if (int_bytes[0] != 0) return error.InvalidDer;
+        break :blk int_bytes[1..];
+    } else int_bytes;
+    var out = [_]u8{0} ** 32;
+    @memcpy(out[32 - unsigned.len ..], unsigned);
+    var non_zero: u8 = 0;
+    for (out) |byte| non_zero |= byte;
+    if (non_zero == 0) return error.InvalidDer;
+    _ = P256Scalar.fromBytes(out, .big) catch return error.InvalidDer;
+    return out;
+}
+
+fn expectCanonicalEcdsaP256Der(der: []const u8) !void {
+    var pos: usize = 0;
+    if (der.len == 0 or der[pos] != 0x30) return error.InvalidDer;
+    pos += 1;
+    const seq_len = try readDerLen(der, &pos);
+    if (seq_len != der.len - pos) return error.InvalidDer;
+    _ = try readDerInteger32(der, &pos);
+    _ = try readDerInteger32(der, &pos);
+    if (pos != der.len) return error.InvalidDer;
+}
+
+fn expectEcdsaP256Rejects(allocator: std.mem.Allocator, cp: provider.CryptoProvider, public_key: []const u8, message: []const u8, signature: []const u8, expected_native: anyerror, expected_oracle: EvpStatus) !void {
+    try testing.expectError(expected_native, cp.verify(.ecdsa_secp256r1_sha256, public_key, message, signature));
+    var oracle = try runEvpEcdsaP256Verify(allocator, public_key, message, signature);
+    defer oracle.deinit(allocator);
+    try expectEvpStatus(&oracle, expected_oracle);
+}
+
+fn expectEcdsaP256AcceptsBoth(allocator: std.mem.Allocator, cp: provider.CryptoProvider, public_key: []const u8, message: []const u8, signature: []const u8) !void {
+    try cp.verify(.ecdsa_secp256r1_sha256, public_key, message, signature);
+    var oracle = try runEvpEcdsaP256Verify(allocator, public_key, message, signature);
+    defer oracle.deinit(allocator);
+    try expectEvpStatus(&oracle, .ok);
+}
+
+fn runEcdsaP256SignPositive(allocator: std.mem.Allocator) !void {
+    const cp = cryptoProvider();
+    const private_scalar = hexBytes("519b423d715f8b581f4fa8ee59f4771a5b44c8130b4e3eacb259e1aa2c4ad49d");
+    const message = "ecdsa p256 signing differential fixture";
+
+    var native_key = try pure_zig.SoftwareEcdsaP256SigningKey.fromScalarBytes(&private_scalar);
+    defer native_key.deinit();
+    const public_key = native_key.publicKeySec1();
+    const signer = native_key.signingKey();
+    try testing.expectEqual(provider.SignatureScheme.ecdsa_secp256r1_sha256, signer.scheme());
+
+    var native_entropy = pure_zig.DeterministicEntropy.init(0x433);
+    var native_signature: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const native_len = try signer.sign(message, native_entropy.entropy(), &native_signature);
+    const native_der = native_signature[0..native_len];
+    try expectCanonicalEcdsaP256Der(native_der);
+
+    var oracle_sign = try runEvpEcdsaP256Sign(allocator, &private_scalar, message);
+    defer oracle_sign.deinit(allocator);
+    try expectEvpStatus(&oracle_sign, .ok);
+    const oracle_der = oracle_sign.fields[0].?;
+    const oracle_public = oracle_sign.fields[1].?;
+    try testing.expectEqualSlices(u8, &public_key, oracle_public);
+    try expectCanonicalEcdsaP256Der(oracle_der);
+
+    try expectEcdsaP256AcceptsBoth(allocator, cp, &public_key, message, native_der);
+    try expectEcdsaP256AcceptsBoth(allocator, cp, &public_key, message, oracle_der);
+
+    try expectEcdsaP256Rejects(allocator, cp, &public_key, "mutated message", native_der, error.AuthenticationFailed, .auth_fail);
+    try expectEcdsaP256Rejects(allocator, cp, &public_key, "mutated message", oracle_der, error.AuthenticationFailed, .auth_fail);
+
+    var wrong_key_owner = try pure_zig.SoftwareEcdsaP256SigningKey.fromSeed([_]u8{0x77} ** 32);
+    defer wrong_key_owner.deinit();
+    const wrong_key = wrong_key_owner.publicKeySec1();
+    try expectEcdsaP256Rejects(allocator, cp, &wrong_key, message, native_der, error.AuthenticationFailed, .auth_fail);
+    try expectEcdsaP256Rejects(allocator, cp, &wrong_key, message, oracle_der, error.AuthenticationFailed, .auth_fail);
+
+    var modified_sig = try allocator.dupe(u8, native_der);
+    defer allocator.free(modified_sig);
+    modified_sig[modified_sig.len - 1] ^= 0x01;
+    try expectEcdsaP256Rejects(allocator, cp, &public_key, message, modified_sig, error.AuthenticationFailed, .auth_fail);
+
+    const malformed_der = [_]u8{0x30};
+    try expectEcdsaP256Rejects(allocator, cp, &public_key, message, &malformed_der, error.AuthenticationFailed, .malformed);
+
+    const zero_r_der = hexBytes("3006020100020101");
+    try expectEcdsaP256Rejects(allocator, cp, &public_key, message, &zero_r_der, error.AuthenticationFailed, .auth_fail);
+
+    const zero_s_der = hexBytes("3006020101020100");
+    try expectEcdsaP256Rejects(allocator, cp, &public_key, message, &zero_s_der, error.AuthenticationFailed, .auth_fail);
+
+    const order_r_der = hexBytes("3026022100ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551020101");
+    try testing.expectError(error.InvalidDer, expectCanonicalEcdsaP256Der(&order_r_der));
+    try expectEcdsaP256Rejects(allocator, cp, &public_key, message, &order_r_der, error.AuthenticationFailed, .auth_fail);
+
+    const order_s_der = hexBytes("3026020101022100ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
+    try testing.expectError(error.InvalidDer, expectCanonicalEcdsaP256Der(&order_s_der));
+    try expectEcdsaP256Rejects(allocator, cp, &public_key, message, &order_s_der, error.AuthenticationFailed, .auth_fail);
+
+    const non_canonical_der = hexBytes("300702020001020101");
+    try testing.expectError(error.InvalidDer, expectCanonicalEcdsaP256Der(&non_canonical_der));
+    try expectEcdsaP256Rejects(allocator, cp, &public_key, message, &non_canonical_der, error.AuthenticationFailed, .malformed);
+
+    const non_minimal_len_der = hexBytes("308106020101020101");
+    try testing.expectError(error.InvalidDer, expectCanonicalEcdsaP256Der(&non_minimal_len_der));
+    try expectEcdsaP256Rejects(allocator, cp, &public_key, message, &non_minimal_len_der, error.AuthenticationFailed, .malformed);
+
+    const malformed_key = [_]u8{0x04};
+    try expectEcdsaP256Rejects(allocator, cp, &malformed_key, message, native_der, error.InvalidInput, .malformed);
 }
 
 fn runEcdsaP256VerifyPositive(allocator: std.mem.Allocator) !void {
@@ -1264,6 +1412,7 @@ test "OpenSSL differential coverage registry has explicit coverage or waivers" {
     try expectCoverageOrWaiver(.key_exchange, .{ .group = .x25519 }, .positive);
     try expectCoverageOrWaiver(.key_exchange, .{ .group = .x25519 }, .negative);
     try expectCoverageOrWaiver(.signature_sign, .{ .signature = .ed25519 }, .positive);
+    try expectCoverageOrWaiver(.signature_sign, .{ .signature = .ecdsa_secp256r1_sha256 }, .positive);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ed25519 }, .positive);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ed25519 }, .negative);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ecdsa_secp256r1_sha256 }, .positive);
