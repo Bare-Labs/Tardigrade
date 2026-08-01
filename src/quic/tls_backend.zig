@@ -112,11 +112,11 @@ pub fn encodeTransportParametersBound(
         @memcpy(buf[len..][0..value.len], value.slice());
         len += value.len;
     }
-    if (binding.stateless_reset_token) |token| {
+    if (binding.stateless_reset_token) |*token| {
         len += varint.encode(tp_stateless_reset_token, buf[len..]) catch return error.HandshakeBufferOverflow;
         len += varint.encode(token.len, buf[len..]) catch return error.HandshakeBufferOverflow;
         if (token.len > buf.len - len) return error.HandshakeBufferOverflow;
-        @memcpy(buf[len..][0..token.len], &token);
+        @memcpy(buf[len..][0..token.len], token);
         len += token.len;
     }
     return buf[0..len];
@@ -126,6 +126,7 @@ pub const max_tracked_unknown_transport_parameters = 64;
 
 pub fn decodeTransportParameters(bytes: []const u8) HandshakeError!config.TransportParameters {
     var binding = config.CidBinding{};
+    defer binding.deinit();
     return decodeTransportParametersBound(bytes, &binding);
 }
 
@@ -419,12 +420,17 @@ pub const Tls13Backend = struct {
 
     fn setCidBinding(ptr: *anyopaque, binding: *const config.CidBinding) void {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        // Wipe the prior owner before replacing it: if this hook is ever
+        // called more than once, assigning straight over a binding whose
+        // token is `Some` would otherwise leave the old payload bytes
+        // resident until final teardown instead of only until replacement.
+        self.cid_binding.deinit();
         self.cid_binding = binding.*;
     }
 
-    fn peerCidBinding(ptr: *anyopaque) config.CidBinding {
+    fn peerCidBinding(ptr: *anyopaque) *const config.CidBinding {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
-        return self.peer_cid_binding;
+        return &self.peer_cid_binding;
     }
 
     fn setPostHandshakeAllocator(ptr: *anyopaque, allocator: std.mem.Allocator) HandshakeError!void {

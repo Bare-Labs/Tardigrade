@@ -1126,9 +1126,17 @@ pub const Connection = struct {
         return registry.activeCount() < target;
     }
 
-    pub fn advertiseLocalCid(self: *Connection, cid_value: quic_cid.ConnectionId) error{ CidLimitExceeded, DuplicateCid, OutOfMemory }!void {
-        try self.pending_new_connection_ids.ensureUnusedCapacity(self.allocator, 1);
+    pub fn advertiseLocalCid(self: *Connection, cid_value: quic_cid.ConnectionId) error{ CidLimitExceeded, DuplicateCid }!void {
         const registry = if (self.local_cids) |*registry| registry else return error.CidLimitExceeded;
+        // The queue was deliberately preallocated to its hard bound
+        // (`quic_cid.max_local_active_cids`) in `init()`, so this path must
+        // never call a grow-capable API — not even to discover afterward
+        // that the registry would have rejected the CID. Reject here, before
+        // ever touching the queue, rather than letting `ensureUnusedCapacity`
+        // grow-and-free the backing allocation unwiped first.
+        if (self.pending_new_connection_ids.items.len == self.pending_new_connection_ids.capacity) {
+            return error.CidLimitExceeded;
+        }
         // Write the issued frame directly into the reserved queue slot: the
         // registry entry is the only prior owner of the reset token, so this
         // is its single copy into caller-owned storage, rather than a
@@ -2190,8 +2198,13 @@ pub const Connection = struct {
         self.events.emit(.handshake_complete);
 
         // RFC 9000 §7.3: validate the peer's authenticated CID binding
-        // against what we actually observed on the wire.
-        const peer_binding = self.tls.peerCidBinding();
+        // against what we actually observed on the wire. `peerCidBinding()`
+        // borrows the backend's retained copy rather than returning one by
+        // value; a backend without binding support (the in-memory test
+        // backend) has no hook installed and returns null, equivalent to an
+        // empty binding.
+        const empty_peer_binding = config.CidBinding{};
+        const peer_binding = self.tls.peerCidBinding() orelse &empty_peer_binding;
         if (!self.validateCidBinding(peer_binding)) {
             self.startClose(.{ .error_code = error_transport_parameter, .is_application = false, .local = true }, "cid binding mismatch", now_us);
             return;
@@ -2269,7 +2282,7 @@ pub const Connection = struct {
         }
     }
 
-    fn validateCidBinding(self: *const Connection, peer_binding: config.CidBinding) bool {
+    fn validateCidBinding(self: *const Connection, peer_binding: *const config.CidBinding) bool {
         // Backends without binding support (the in-memory test backend)
         // return an empty binding; there is nothing to check.
         const peer_initial_scid = peer_binding.initial_source_connection_id orelse {
@@ -7044,6 +7057,96 @@ test "connection: advertised local CID can be retired from another active CID" {
     try testing.expectEqual(State.established, pair.server.state());
     try testing.expectEqual(@as(?u64, null), pair.server.localCidSequence(spare.slice()));
     try testing.expect(pair.server.needsLocalCid());
+}
+
+test "connection: RETIRE_CONNECTION_ID cancels a queued and an in-flight copy of the same sequence and neither is ever resurrected" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    // 1) Issue sequence 1 and send it, so it becomes an in-flight sent
+    // record; then manually requeue that same record — mirroring exactly
+    // what a PTO does without removing the record it requeues from — so a
+    // second, pending copy of sequence 1 also exists simultaneously.
+    const spare = try quic_cid.ConnectionId.init(&.{ 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8 });
+    try pair.server.advertiseLocalCid(spare);
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    const sent_index = pair.server.sent_records.items.len - 1;
+    const in_flight = pair.server.sent_records.items[sent_index].carried_new_connection_id orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(u64, 1), in_flight.sequence);
+    // Captured while still live, not read back through the optional after
+    // it is nulled below: safety-checked builds poison-fill an optional's
+    // payload on that transition, so a pointer captured beforehand would
+    // observe poison, not proof of a real wipe.
+    const original_token = in_flight.stateless_reset_token;
+
+    const sent_copy = pair.server.sent_records.items[sent_index];
+    pair.server.requeueRecord(&sent_copy);
+    try testing.expectEqual(@as(usize, 1), pair.server.pending_new_connection_ids.items.len);
+    try testing.expectEqual(@as(u64, 1), pair.server.pending_new_connection_ids.items[0].sequence);
+
+    // 2) The peer retires sequence 1 from a packet bound to a still-active
+    // local CID (sequence 0, the handshake-issued one) — not the sequence
+    // being retired.
+    try pair.server.applyFrame(.application, .{ .retire_connection_id = .{ .sequence = 1 } }, TestPair.server_path, 0, pair.now_us);
+    try testing.expectEqual(State.established, pair.server.state());
+
+    // 3) Both the pending and the in-flight copy are gone. The sent
+    // record's storage no longer contains the original token bytes
+    // anywhere, proven via a raw byte scan rather than reading the
+    // optional's payload after it has been nulled.
+    try testing.expectEqual(@as(usize, 0), pair.server.pending_new_connection_ids.items.len);
+    try testing.expectEqual(@as(?quic_cid.NewConnectionIdFrame, null), pair.server.sent_records.items[sent_index].carried_new_connection_id);
+    const record_bytes = std.mem.asBytes(&pair.server.sent_records.items[sent_index]);
+    try testing.expect(std.mem.indexOf(u8, record_bytes, &original_token) == null);
+
+    // 4) Neither a repeated PTO nor another manual requeue (loss
+    // processing's own primitive) resurrects the retired sequence: the
+    // record that would have carried it forward no longer does.
+    pair.server.firePto(.application);
+    pair.server.firePto(.application);
+    pair.server.requeueRecord(&pair.server.sent_records.items[sent_index]);
+    try testing.expectEqual(@as(usize, 0), pair.server.pending_new_connection_ids.items.len);
+    for (pair.server.pending_new_connection_ids.items) |queued| {
+        try testing.expect(queued.sequence != 1);
+    }
+}
+
+test "connection: issue/send/retire cycling past the active-CID count never regrows pending_new_connection_ids" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const pending_backing = pair.server.pending_new_connection_ids.items.ptr;
+    const pending_capacity = pair.server.pending_new_connection_ids.capacity;
+
+    // More cycles than `max_local_active_cids`: each cycle issues, sends,
+    // and immediately retires one CID, so `next_sequence` climbs well past
+    // 8 while `activeCount()` never exceeds 1 beyond the handshake CID.
+    // If retirement ever stopped canceling in-flight/queued copies, this
+    // would eventually exceed the queue's reserved capacity and force the
+    // unwiped-growth path back open.
+    var out: [2048]u8 = undefined;
+    var i: u8 = 0;
+    while (i < quic_cid.max_local_active_cids + 2) : (i += 1) {
+        const cid = try quic_cid.ConnectionId.init(&[_]u8{ 0xd0, i, i, i, i, i, i, i });
+        try pair.server.advertiseLocalCid(cid);
+        _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+        try pair.server.applyFrame(
+            .application,
+            .{ .retire_connection_id = .{ .sequence = @as(u64, i) + 1 } },
+            TestPair.server_path,
+            0,
+            pair.now_us,
+        );
+        try testing.expectEqual(State.established, pair.server.state());
+    }
+
+    try testing.expectEqual(pending_backing, pair.server.pending_new_connection_ids.items.ptr);
+    try testing.expectEqual(pending_capacity, pair.server.pending_new_connection_ids.capacity);
 }
 
 test "connection: losing one NEW_CONNECTION_ID leaves all queued CID identities pending" {

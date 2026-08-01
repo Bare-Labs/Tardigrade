@@ -71,7 +71,7 @@ pub const TlsBackend = struct {
     /// carries connection IDs in its transport parameters implements both; the
     /// in-memory test backend leaves them null.
     setCidBindingFn: ?*const fn (ptr: *anyopaque, binding: *const config.CidBinding) void = null,
-    peerCidBindingFn: ?*const fn (ptr: *anyopaque) config.CidBinding = null,
+    peerCidBindingFn: ?*const fn (ptr: *anyopaque) *const config.CidBinding = null,
     setPostHandshakeAllocatorFn: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) HandshakeError!void = null,
     setEarlyDataApplicationCompatFn: ?*const fn (
         ptr: *anyopaque,
@@ -126,9 +126,15 @@ pub const TlsBackend = struct {
         if (self.setCidBindingFn) |set| set(self.transport.ptr, binding);
     }
 
-    pub fn peerCidBinding(self: TlsBackend) config.CidBinding {
-        if (self.peerCidBindingFn) |get| return get(self.transport.ptr);
-        return .{};
+    /// Borrows the backend's retained peer binding rather than returning a
+    /// copy: the binding may carry the peer's stateless-reset token, and a
+    /// by-value return would leave an unowned, never-wiped stack copy at
+    /// every layer between here and the eventual caller. `null` means no
+    /// backend hook is installed (equivalent to the prior default-`CidBinding`
+    /// behavior, just without a copy to hand back).
+    pub fn peerCidBinding(self: TlsBackend) ?*const config.CidBinding {
+        const get = self.peerCidBindingFn orelse return null;
+        return get(self.transport.ptr);
     }
 
     pub fn setPostHandshakeAllocator(self: TlsBackend, allocator: std.mem.Allocator) HandshakeError!void {
