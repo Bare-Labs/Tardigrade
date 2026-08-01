@@ -486,19 +486,38 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_crypto_vector_tests.step);
 
     // Differential OpenSSL oracle checks (#377): spawn the system `openssl`
-    // command out-of-process for deterministic TLS/QUIC derivation stages.
+    // command and a test-only EVP child process out-of-process for
+    // deterministic TLS/QUIC derivation and primitive stages.
     if (link_openssl_adapter) {
+        const evp_oracle_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        evp_oracle_mod.addCSourceFile(.{ .file = b.path("tests/evp_oracle.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wno-deprecated-declarations" } });
+        const evp_oracle = b.addExecutable(.{
+            .name = "evp_oracle",
+            .root_module = evp_oracle_mod,
+        });
+        configureSystemLibrarySearchPaths(evp_oracle, prefer_static_system_libs);
+        linkSystemLibrary(evp_oracle, "crypto", prefer_static_system_libs, require_static_system_libs);
+        const evp_oracle_install = b.addInstallArtifact(evp_oracle, .{});
+        const crypto_openssl_diff_options = b.addOptions();
+        crypto_openssl_diff_options.addOption([]const u8, "evp_oracle_path", b.getInstallPath(.bin, "evp_oracle"));
+
         const crypto_openssl_diff_mod = b.createModule(.{
             .root_source_file = b.path("tests/crypto_openssl_diff.zig"),
             .target = target,
             .optimize = optimize,
         });
+        crypto_openssl_diff_mod.addImport("crypto_openssl_diff_options", crypto_openssl_diff_options.createModule());
         crypto_openssl_diff_mod.addImport("crypto", crypto_mod);
         crypto_openssl_diff_mod.addImport("tls_core", tls_core_mod);
         crypto_openssl_diff_mod.addImport("quic", quic_mod);
         crypto_openssl_diff_mod.addImport("zig_compat", compat_mod);
         const crypto_openssl_diff_tests = b.addTest(.{ .root_module = crypto_openssl_diff_mod });
         const run_crypto_openssl_diff_tests = b.addRunArtifact(crypto_openssl_diff_tests);
+        run_crypto_openssl_diff_tests.step.dependOn(&evp_oracle_install.step);
         const crypto_openssl_diff_step = b.step("test-crypto-openssl", "Run out-of-process OpenSSL differential crypto checks");
         crypto_openssl_diff_step.dependOn(&run_crypto_openssl_diff_tests.step);
         crypto_step.dependOn(&run_crypto_openssl_diff_tests.step);
