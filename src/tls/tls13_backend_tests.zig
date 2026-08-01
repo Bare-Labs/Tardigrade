@@ -3236,6 +3236,7 @@ test "#485 server rejects a ClientHello2 PSK binder computed only over Hash(Trun
 }
 
 test "#485 asynchronous PSK resolution after a HelloRetryRequest uses the captured rebound-transcript binder, not a re-hash" {
+    var server_provider_storage: ProviderStorage = .{};
     var client_provider_storage: ProviderStorage = .{};
     var client = tls_backend.Tls13Backend.initClientWithOptions(
         clientEntropy(),
@@ -3262,7 +3263,7 @@ test "#485 asynchronous PSK resolution after a HelloRetryRequest uses the captur
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_select = true;
     mock.pending_polls = 2;
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
 
     var stored_state = pskStoredState(&psk);
@@ -5581,10 +5582,11 @@ test "record stream SNI provider fails exact incompatible signature without wild
 }
 
 test "pending server credential selection emits no ServerHello until resume" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_select = true;
     mock.pending_polls = 1;
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -6444,16 +6446,18 @@ test "provider and verifier mocks under allocation failure clean up" {
 
 /// `Tls13Backend` (the production type) has no field to hold owned provider
 /// storage, and this helper returns one by value, so a same-function local
-/// would dangle (#490 review). Function-static storage scoped to just this
-/// one helper's callers, *reset* to the same seed on every call rather than
-/// advanced — every call is independent of process history, which is
-/// sufficient here since no single test calls this helper more than once for
-/// two simultaneously-live backends.
-fn serverWithProvider(mock: *credentials.MockCredentialProvider) tls_backend.Tls13Backend {
-    const State = struct {
-        var storage: ProviderStorage = .{};
-    };
-    return tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), State.storage.init(server_provider_seed), mock.provider(), .record);
+/// would dangle (#490 review). Caller-owned out-parameter instead of
+/// function-static storage (#490 second review pass): a function-static
+/// `State`, even reset every call, is still one storage instance shared by
+/// every caller — a second invocation before the first returned backend is
+/// done being used (parallel test execution, or a future test needing two
+/// simultaneously-live instances) would overwrite the entropy/provider
+/// backing the first backend's `crypto_provider` still borrows. The caller
+/// declares `var provider_storage: ProviderStorage = .{};` and passes
+/// `&provider_storage`, giving each returned backend a distinct, stable
+/// owner.
+fn serverWithProvider(storage: *ProviderStorage, mock: *credentials.MockCredentialProvider) tls_backend.Tls13Backend {
+    return tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), storage.init(server_provider_seed), mock.provider(), .record);
 }
 
 fn expectServerReceiveError(server: *tls_backend.Tls13Backend, opts: ClientHelloOptions, want: anyerror) !void {
@@ -6477,8 +6481,9 @@ fn countCryptoEvents(sink: *const DirectSink, epoch: events.EncryptionEpoch) usi
 }
 
 fn expectMalformedSniRejectedBeforeSelection(raw_sni: []const u8) !void {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -6574,9 +6579,10 @@ test "malformed SNI is rejected rather than collapsed into the default path" {
 }
 
 test "a provider returning an unoffered scheme is rejected before signing" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity()); // ed25519
     mock.ignore_offer = true; // hand back ed25519 even though the peer omits it
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -6590,9 +6596,10 @@ test "a provider returning an unoffered scheme is rejected before signing" {
 }
 
 test "a provider chain exceeding the bounds is rejected without signing" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.chain_repeat = 12; // beyond max_chain_entries
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -6606,9 +6613,10 @@ test "a provider chain exceeding the bounds is rejected without signing" {
 }
 
 test "a provider internal failure is attributed to the provider, not the verifier" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.force_select_error = error.ProviderInternalFailure;
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -6705,10 +6713,11 @@ fn firstInitialCrypto(sink: *const DirectSink, out: []u8) []const u8 {
 }
 
 test "an async credential selection suspends the handshake and resumes to completion" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_select = true;
     mock.pending_polls = 2;
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -6867,10 +6876,11 @@ const TwoIdentityLeaseResolver = struct {
 };
 
 test "async credential selection resumes PSK selection identically to the synchronous path" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_select = true;
     mock.pending_polls = 2;
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
 
     const psk = [_]u8{0x5a} ** tls_backend.hash_len;
@@ -6910,11 +6920,12 @@ test "async credential selection resumes PSK selection identically to the synchr
 }
 
 test "async credential selection failure clears the captured PSK offer" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_select = true;
     mock.pending_polls = 0;
     mock.pending_fails = true;
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
 
     const psk = [_]u8{0x5a} ** tls_backend.hash_len;
@@ -6942,11 +6953,12 @@ test "async credential selection failure clears the captured PSK offer" {
 }
 
 test "async credential selection failure zeroes the captured ClientHello bytes, not just the pointer" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_select = true;
     mock.pending_polls = 0;
     mock.pending_fails = true;
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
 
     const psk = [_]u8{0x5a} ** tls_backend.hash_len;
@@ -9055,10 +9067,11 @@ test "a cipher-suite mismatch falls back to a full handshake instead of rejectin
 }
 
 test "an async signature suspends after the certificate and resumes to completion" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_sign = true;
     mock.pending_polls = 1;
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -9080,10 +9093,11 @@ test "an async signature suspends after the certificate and resumes to completio
 }
 
 test "a cancelled async signature releases the operation and credential exactly once" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_sign = true;
     mock.pending_polls = 5; // never completes before teardown
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     var sink = DirectSink{};
     try server.backend().start(.server, {}, &sink);
     var buf: [1024]u8 = undefined;
@@ -9100,11 +9114,12 @@ test "a cancelled async signature releases the operation and credential exactly 
 }
 
 test "an async signing failure latches the typed signing-provider failure" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_sign = true;
     mock.pending_polls = 0;
     mock.pending_fails = true;
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -9124,12 +9139,13 @@ test "an async signing failure latches the typed signing-provider failure" {
 }
 
 test "a poll error reports InvalidCallbackBehavior distinctly from an ordinary operation failure" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_select = true;
     mock.pending_polls = 0;
     mock.pending_fails = true;
     mock.pending_fail_invalid_callback = true;
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
     var sink = DirectSink{};
     defer sink.deinit();
@@ -9148,8 +9164,9 @@ test "a poll error reports InvalidCallbackBehavior distinctly from an ordinary o
 }
 
 test "resumeAuth is a safe no-op before any suspend and after completion" {
+    var server_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     defer server.deinit();
     var driver = DirectDriver.init(.server, server.backend());
     defer driver.deinit();
@@ -9305,15 +9322,12 @@ test "a server rejects trailing handshake bytes after the client Finished" {
 /// A client backend configured to authenticate with `provider` and to trust
 /// the fixture server certificate by pin (its own server verification stays
 /// synchronous, so the only suspends come from client selection/signing).
-/// Function-static storage, reset every call (#490 review) — see the
-/// matching comment on `serverWithProvider`.
-fn clientWithLocalCredential(provider: credentials.CredentialProvider) tls_backend.Tls13Backend {
-    const State = struct {
-        var storage: ProviderStorage = .{};
-    };
+/// Caller-owned storage (#490 second review pass) — see the matching comment
+/// on `serverWithProvider`.
+fn clientWithLocalCredential(storage: *ProviderStorage, provider: credentials.CredentialProvider) tls_backend.Tls13Backend {
     var client = tls_backend.Tls13Backend.initClient(
         clientEntropy(),
-        State.storage.init(client_provider_seed),
+        storage.init(client_provider_seed),
         .{ .pinned_certificate = tls_backend.testdata.certificate_der },
         .record,
     );
@@ -9412,24 +9426,23 @@ test "absent ALPN reaches server selector and client verifier as null" {
     try std.testing.expect(verifier.lastApplicationProtocol() == null);
 }
 
-/// Function-static storage, reset every call (#490 review) — see the
-/// matching comment on `serverWithProvider`.
-fn serverRequestingClientAuth(mode: tls_backend.ClientAuthMode, verifier: credentials.PeerVerifier) tls_backend.Tls13Backend {
-    const State = struct {
-        var storage: ProviderStorage = .{};
-    };
-    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), State.storage.init(server_provider_seed), fixtureIdentity(), .record);
+/// Caller-owned storage (#490 second review pass) — see the matching
+/// comment on `serverWithProvider`.
+fn serverRequestingClientAuth(storage: *ProviderStorage, mode: tls_backend.ClientAuthMode, verifier: credentials.PeerVerifier) tls_backend.Tls13Backend {
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), storage.init(server_provider_seed), fixtureIdentity(), .record);
     server.requestClientAuthentication(mode, verifier);
     return server;
 }
 
 test "client rejects selected signature scheme incompatible with leaf key before Certificate flight" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.scheme_override = .ecdsa_secp256r1_sha256;
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted);
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -9445,14 +9458,16 @@ test "client rejects selected signature scheme incompatible with leaf key before
 }
 
 test "async client selection rejects signature scheme incompatible with leaf key before Certificate flight" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.scheme_override = .ecdsa_secp256r1_sha256;
     mock.async_select = true;
     mock.pending_polls = 0;
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted);
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -9471,13 +9486,15 @@ test "async client selection rejects signature scheme incompatible with leaf key
 }
 
 test "async client credential selection suspends the client flight and resumes to mutual completion" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_select = true;
     mock.pending_polls = 2;
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted);
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -9507,13 +9524,15 @@ test "async client credential selection suspends the client flight and resumes t
 }
 
 test "async client signing suspends after the client Certificate and resumes to completion" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_sign = true;
     mock.pending_polls = 1;
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted);
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -9539,13 +9558,15 @@ test "async client signing suspends after the client Certificate and resumes to 
 }
 
 test "pending client credential selection rejects later handshake bytes and cancels once" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_select = true;
     mock.pending_polls = 5;
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted);
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -9568,13 +9589,15 @@ test "pending client credential selection rejects later handshake bytes and canc
 }
 
 test "pending client signing rejects later handshake bytes and releases the held credential once" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_sign = true;
     mock.pending_polls = 5;
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted);
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -9596,13 +9619,15 @@ test "pending client signing rejects later handshake bytes and releases the held
 }
 
 test "async server verification of a coalesced client flight drains the buffered Finished on resume" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted);
     verifier.async_mode = true;
     verifier.pending_polls = 2;
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -9631,11 +9656,13 @@ test "async server verification of a coalesced client flight drains the buffered
 }
 
 test "a client certificate flight fragmented byte-by-byte still completes on the server" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted); // synchronous
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -9655,12 +9682,14 @@ test "a client certificate flight fragmented byte-by-byte still completes on the
 }
 
 test "a cancelled async client signature releases the operation and credential exactly once" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_sign = true;
     mock.pending_polls = 5; // never completes before teardown
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     var verifier = credentials.MockVerifier.init(.accepted);
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -9711,11 +9740,13 @@ const WrongKindSelectProvider = struct {
 };
 
 test "a malformed async client selection completion is rejected as invalid callback behavior" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var wrong = WrongKindSelectProvider{};
-    var client = clientWithLocalCredential(wrong.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, wrong.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted);
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -9862,13 +9893,14 @@ test "the record stream production driver resumes async client authentication en
 }
 
 test "the generic engine driver exposes authPending and resumeAuth for the concrete backend" {
+    var server_provider_storage: ProviderStorage = .{};
     // Drive a server backend through the generic Driver (not the concrete
     // backend) and prove the async credential selection suspends and resumes
     // through the Driver's own authPending/resumeAuth surface.
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_select = true;
     mock.pending_polls = 1;
-    var server = serverWithProvider(&mock);
+    var server = serverWithProvider(&server_provider_storage, &mock);
     var driver = DirectDriver.init(.server, server.backend());
     defer driver.deinit();
 
@@ -9894,13 +9926,15 @@ test "the generic engine driver exposes authPending and resumeAuth for the concr
 //         pending must not be processed until an accepted resume. ---
 
 test "a Finished in a separate receive while client verification is pending is not processed early" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted);
     verifier.async_mode = true;
     verifier.pending_polls = 1;
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -9936,13 +9970,15 @@ test "a Finished in a separate receive while client verification is pending is n
 }
 
 test "a rejected client verification never processes the buffered Finished" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.rejected);
     verifier.async_mode = true;
     verifier.pending_polls = 1;
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -9972,12 +10008,14 @@ test "a rejected client verification never processes the buffered Finished" {
 //         authentication of a presented certificate. ---
 
 test "a not_checked verdict fails a presented client certificate under optional and required" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     for ([_]tls_backend.ClientAuthMode{ .optional, .required }) |mode| {
         var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
-        var client = clientWithLocalCredential(mock.provider());
+        var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
         defer client.deinit();
         var verifier = credentials.MockVerifier.init(.not_checked);
-        var server = serverRequestingClientAuth(mode, verifier.verifier());
+        var server = serverRequestingClientAuth(&server_auth_provider_storage, mode, verifier.verifier());
         defer server.deinit();
 
         var client_sink = DirectSink{};
@@ -10000,14 +10038,18 @@ test "a not_checked verdict fails a presented client certificate under optional 
 // --- F4: a client with no suitable credential sends an empty Certificate. ---
 
 test "a client with no credential declines with an empty Certificate (optional completes, required fails)" {
+    var client_provider_storage1: ProviderStorage = .{};
+    var client_provider_storage2: ProviderStorage = .{};
+    var server_auth_provider_storage1: ProviderStorage = .{};
+    var server_auth_provider_storage2: ProviderStorage = .{};
     // Optional: the empty Certificate is accepted and the handshake completes.
     {
         var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
         mock.force_select_error = error.NoCredentialAvailable;
-        var client = clientWithLocalCredential(mock.provider());
+        var client = clientWithLocalCredential(&client_provider_storage1, mock.provider());
         defer client.deinit();
         var verifier = credentials.MockVerifier.init(.accepted);
-        var server = serverRequestingClientAuth(.optional, verifier.verifier());
+        var server = serverRequestingClientAuth(&server_auth_provider_storage1, .optional, verifier.verifier());
         defer server.deinit();
 
         var client_sink = DirectSink{};
@@ -10029,10 +10071,10 @@ test "a client with no credential declines with an empty Certificate (optional c
     {
         var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
         mock.force_select_error = error.NoCompatibleSignatureAlgorithm;
-        var client = clientWithLocalCredential(mock.provider());
+        var client = clientWithLocalCredential(&client_provider_storage2, mock.provider());
         defer client.deinit();
         var verifier = credentials.MockVerifier.init(.accepted);
-        var server = serverRequestingClientAuth(.required, verifier.verifier());
+        var server = serverRequestingClientAuth(&server_auth_provider_storage2, .required, verifier.verifier());
         defer server.deinit();
 
         var client_sink = DirectSink{};
@@ -10050,14 +10092,16 @@ test "a client with no credential declines with an empty Certificate (optional c
 }
 
 test "an async selector that resolves to no credential declines with an empty Certificate" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_select = true;
     mock.async_no_credential = true;
     mock.pending_polls = 1;
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted);
-    var server = serverRequestingClientAuth(.optional, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .optional, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -10131,6 +10175,7 @@ test "the server flight preflight rejects a chain that fits entries but overflow
 }
 
 test "the client flight preflight rejects a chain that overflows with the message header" {
+    var server_auth_provider_storage: ProviderStorage = .{};
     var client_provider_storage: ProviderStorage = .{};
     var big = BigChainProvider{ .entry_len = 2043, .entry_count = 4 };
     var client = tls_backend.Tls13Backend.initClient(
@@ -10142,7 +10187,7 @@ test "the client flight preflight rejects a chain that overflows with the messag
     client.setLocalCredentialProvider(big.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted);
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
@@ -10273,14 +10318,16 @@ test "a chain at appliance's flight-size boundary serializes through the real HT
 // --- F8: a wrong-kind async completion releases every owned handle once. ---
 
 test "a sign stage that completes with a credential releases the held and returned handles once" {
+    var client_provider_storage: ProviderStorage = .{};
+    var server_auth_provider_storage: ProviderStorage = .{};
     var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
     mock.async_sign = true;
     mock.pending_polls = 0;
     mock.sign_returns_credential = true; // contract violation
-    var client = clientWithLocalCredential(mock.provider());
+    var client = clientWithLocalCredential(&client_provider_storage, mock.provider());
     defer client.deinit();
     var verifier = credentials.MockVerifier.init(.accepted);
-    var server = serverRequestingClientAuth(.required, verifier.verifier());
+    var server = serverRequestingClientAuth(&server_auth_provider_storage, .required, verifier.verifier());
     defer server.deinit();
 
     var client_sink = DirectSink{};
