@@ -61,12 +61,12 @@ const tp_retry_source_connection_id: u64 = 0x10;
 pub const max_transport_parameters_len = 11 * (2 + 1 + 8) + 3 + 3 * (2 + 1 + config.max_cid_len) + (2 + 1 + 16);
 
 pub fn encodeTransportParameters(params: config.TransportParameters, buf: []u8) HandshakeError![]const u8 {
-    return encodeTransportParametersBound(params, .{}, buf);
+    return encodeTransportParametersBound(params, &.{}, buf);
 }
 
 pub fn encodeTransportParametersBound(
     params: config.TransportParameters,
-    binding: config.CidBinding,
+    binding: *const config.CidBinding,
     buf: []u8,
 ) HandshakeError![]const u8 {
     if (params.initial_max_streams_bidi > config.max_initial_streams_transport_parameter or
@@ -408,6 +408,8 @@ pub const Tls13Backend = struct {
         self.scratch.deinit();
         self.engine.deinit();
         std.crypto.secureZero(u8, &self.local_transport_parameters);
+        self.cid_binding.deinit();
+        self.peer_cid_binding.deinit();
     }
 
     fn deinitImpl(ptr: *anyopaque) void {
@@ -415,9 +417,9 @@ pub const Tls13Backend = struct {
         self.deinit();
     }
 
-    fn setCidBinding(ptr: *anyopaque, binding: config.CidBinding) void {
+    fn setCidBinding(ptr: *anyopaque, binding: *const config.CidBinding) void {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
-        self.cid_binding = binding;
+        self.cid_binding = binding.*;
     }
 
     fn peerCidBinding(ptr: *anyopaque) config.CidBinding {
@@ -536,7 +538,7 @@ pub const Tls13Backend = struct {
 
     fn start(ptr: *anyopaque, role: tls_handshake.Role, params: config.TransportParameters, sink: *EventSink) HandshakeError!void {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
-        const encoded = try encodeTransportParametersBound(params, self.cid_binding, &self.local_transport_parameters);
+        const encoded = try encodeTransportParametersBound(params, &self.cid_binding, &self.local_transport_parameters);
         self.engine.profile = .{ .extension = .{
             .extension_type = ext_quic_transport_parameters,
             .local = encoded,
@@ -663,7 +665,7 @@ test "QUIC adapter owns CID binding round trip" {
         .stateless_reset_token = [_]u8{0xa5} ** 16,
     };
     var buf: [max_transport_parameters_len]u8 = undefined;
-    const encoded = try encodeTransportParametersBound(params, local, &buf);
+    const encoded = try encodeTransportParametersBound(params, &local, &buf);
     var peer = config.CidBinding{};
     _ = try decodeTransportParametersBound(encoded, &peer);
     try std.testing.expectEqualDeep(local, peer);
@@ -915,7 +917,7 @@ fn fuzzTransportParameterRoundTrip(_: void, smith: *std.testing.Smith) !void {
     };
 
     var encoded: [max_transport_parameters_len]u8 = undefined;
-    const bytes = try encodeTransportParametersBound(params, binding, &encoded);
+    const bytes = try encodeTransportParametersBound(params, &binding, &encoded);
     var decoded_binding = config.CidBinding{};
     const decoded = try decodeTransportParametersBound(bytes, &decoded_binding);
     try std.testing.expectEqualDeep(params, decoded);

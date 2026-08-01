@@ -173,7 +173,13 @@ pub const LocalCidRegistry = struct {
         out.reset_token_key.replace(reset_key) catch unreachable;
     }
 
-    pub fn init(peer_active_connection_id_limit: u64, reset_token_key: [32]u8) LocalCidRegistry {
+    /// Return-by-value convenience for tests only. `initInto` is the only
+    /// production-facing constructor: a by-value parameter plus a
+    /// return-by-value result both leave an unowned semantic copy of the
+    /// secret, and this is not one of the compile-time-known-safe call
+    /// sites (a test literal wiped by nothing) that would make that
+    /// acceptable in production.
+    fn init(peer_active_connection_id_limit: u64, reset_token_key: [32]u8) LocalCidRegistry {
         var out: LocalCidRegistry = undefined;
         initInto(&out, peer_active_connection_id_limit, &reset_token_key);
         return out;
@@ -201,11 +207,17 @@ pub const LocalCidRegistry = struct {
         return entry.cid;
     }
 
-    /// Issue a fresh CID from caller-supplied entropy and return the
-    /// NEW_CONNECTION_ID frame model to send. Fails when the peer's active
-    /// CID limit is reached (RFC 9000 §5.1.1: an endpoint MUST NOT provide
-    /// more CIDs than the peer's limit).
-    pub fn issue(self: *LocalCidRegistry, entropy: []const u8, cid_len: u8) !NewConnectionIdFrame {
+    /// Issue a fresh CID from caller-supplied entropy, writing the
+    /// NEW_CONNECTION_ID frame model directly into `out`. Production
+    /// entry point mirroring `issueCidInto` for callers that generate the
+    /// CID from entropy rather than supplying one directly.
+    pub fn issueInto(self: *LocalCidRegistry, entropy: []const u8, cid_len: u8, out: *NewConnectionIdFrame) !void {
+        const cid = try generateCid(entropy, cid_len);
+        try self.issueCidInto(cid, out);
+    }
+
+    /// Return-by-value convenience for tests only; see `issueCidInto`.
+    fn issue(self: *LocalCidRegistry, entropy: []const u8, cid_len: u8) !NewConnectionIdFrame {
         const cid = try generateCid(entropy, cid_len);
         return try self.issueCid(cid);
     }
@@ -227,9 +239,11 @@ pub const LocalCidRegistry = struct {
         };
     }
 
-    /// Convenience wrapper over `issueCidInto` for callers (mostly tests)
-    /// that want an owned return value rather than a destination pointer.
-    pub fn issueCid(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!NewConnectionIdFrame {
+    /// Return-by-value convenience for tests only. `issueCidInto` is the
+    /// only production-facing form: a caller with a real queue/record
+    /// destination should write into it directly rather than round-tripping
+    /// the reset token through an intermediate by-value return.
+    fn issueCid(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!NewConnectionIdFrame {
         var out: NewConnectionIdFrame = undefined;
         try self.issueCidInto(cid, &out);
         return out;
@@ -299,8 +313,12 @@ pub const LocalCidRegistry = struct {
         return active;
     }
 
-    pub fn get(self: *const LocalCidRegistry, sequence: u64) ?Entry {
-        for (self.entries, self.occupied) |entry, occupied| {
+    /// Returns a pointer into the registry's own storage rather than a
+    /// by-value `Entry`, so a caller cannot walk away with an unowned copy
+    /// of the reset token. Callers must not retain the pointer past their
+    /// next mutating call into the registry.
+    pub fn get(self: *const LocalCidRegistry, sequence: u64) ?*const Entry {
+        for (&self.entries, self.occupied) |*entry, occupied| {
             if (occupied and entry.sequence == sequence) return entry;
         }
         return null;
@@ -489,7 +507,7 @@ pub fn statelessResetToken(static_key: []const u8, connection_id: []const u8) [s
 /// instead of returning by value. Production issuance paths use this so the
 /// token is written once into its final owner, rather than materializing an
 /// extra by-value stack copy that a caller then copies again.
-fn statelessResetTokenInto(out: *[stateless_reset_token_len]u8, static_key: []const u8, connection_id: []const u8) void {
+pub fn statelessResetTokenInto(out: *[stateless_reset_token_len]u8, static_key: []const u8, connection_id: []const u8) void {
     var mac: [HmacSha256.mac_length]u8 = undefined;
     defer secrets.secureZero(&mac);
     HmacSha256.create(&mac, connection_id, static_key);

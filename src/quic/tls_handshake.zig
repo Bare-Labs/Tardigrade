@@ -70,7 +70,7 @@ pub const TlsBackend = struct {
     /// Optional RFC 9000 §7.3 authentication-binding hooks. A backend that
     /// carries connection IDs in its transport parameters implements both; the
     /// in-memory test backend leaves them null.
-    setCidBindingFn: ?*const fn (ptr: *anyopaque, binding: config.CidBinding) void = null,
+    setCidBindingFn: ?*const fn (ptr: *anyopaque, binding: *const config.CidBinding) void = null,
     peerCidBindingFn: ?*const fn (ptr: *anyopaque) config.CidBinding = null,
     setPostHandshakeAllocatorFn: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator) HandshakeError!void = null,
     setEarlyDataApplicationCompatFn: ?*const fn (
@@ -122,7 +122,7 @@ pub const TlsBackend = struct {
         return self.transport.receive(level, bytes, sink);
     }
 
-    pub fn setCidBinding(self: TlsBackend, binding: config.CidBinding) void {
+    pub fn setCidBinding(self: TlsBackend, binding: *const config.CidBinding) void {
         if (self.setCidBindingFn) |set| set(self.transport.ptr, binding);
     }
 

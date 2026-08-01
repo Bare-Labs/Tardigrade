@@ -736,6 +736,29 @@ fn wipeSentRecordTokens(records: []SentRecord) void {
     for (records) |*record| wipeSentRecordToken(record);
 }
 
+/// Publish `source` (a function-local `SentRecord` about to be sealed and
+/// sent) into `self.sent_records` by writing directly into the reserved
+/// destination slot, rather than passing it by value into
+/// `ArrayList.append` — which would create an unowned intermediate copy of
+/// any carried reset token. Capacity is always available here: every call
+/// site only reaches this after `self.recovery.onPacketSent` accepted the
+/// packet, and that tracker is itself bounded by `recovery.max_tracked_packets`
+/// — the same bound `init()` reserves `sent_records`' capacity to once, up
+/// front.
+fn publishSentRecord(self: *Connection, source: *const SentRecord) void {
+    // Real traffic can never exceed capacity here: `sent_records` only ever
+    // grows in lockstep with `self.recovery.tracker` (both gated by
+    // `onPacketSent`) and shrinks in lockstep with it (ACK/loss processing
+    // remove from both together), and the tracker is bounded by the same
+    // `recovery.max_tracked_packets` this reserves capacity to. If that ever
+    // desyncs, degrade to an untracked send — like recovery-tracker
+    // exhaustion itself, just above — rather than growing the backing
+    // allocation and reopening the unwiped-growth path capacity reservation
+    // exists to close.
+    if (self.sent_records.items.len == self.sent_records.capacity) return;
+    self.sent_records.addOneAssumeCapacity().* = source.*;
+}
+
 /// `std.ArrayList.swapRemove` moves the last live element into the removed
 /// slot, then assigns `undefined` to the vacated tail slot — which is a
 /// real poison-fill in safety-checked builds (not a no-op) and may be no
@@ -944,16 +967,23 @@ pub const Connection = struct {
         try conn.pending_new_connection_ids.ensureTotalCapacityPrecise(allocator, quic_cid.max_local_active_cids);
 
         // RFC 9000 §7.3 binding: commit our CIDs into the TLS transport
-        // parameters before the first flight.
+        // parameters before the first flight. `binding` is a local, owned
+        // copy; `setCidBinding` borrows it so the retained backend copy is
+        // the only further duplicate, and that copy is wiped in the
+        // backend's own `deinit()`. `defer binding.deinit()` wipes this
+        // local's token on every path out of `init`, including the early
+        // handshake-construction failures below.
         var binding = config.CidBinding{
             .initial_source_connection_id = conn.local_cid,
         };
+        defer binding.deinit();
         if (options.role == .server) {
             binding.original_destination_connection_id = conn.original_dcid;
             if (conn.retry_scid) |retry_source| binding.retry_source_connection_id = retry_source;
-            binding.stateless_reset_token = quic_cid.statelessResetToken(options.stateless_reset_key[0..], conn.local_cid.slice());
+            binding.stateless_reset_token = [_]u8{0} ** quic_cid.stateless_reset_token_len;
+            quic_cid.statelessResetTokenInto(&binding.stateless_reset_token.?, options.stateless_reset_key[0..], conn.local_cid.slice());
         }
-        options.tls.setCidBinding(binding);
+        options.tls.setCidBinding(&binding);
 
         if (options.role == .client and conn.peer_cid.len == 0) {
             conn.peer_cid = conn.original_dcid;
@@ -1583,11 +1613,16 @@ pub const Connection = struct {
                     self.startClose(.{ .error_code = error_protocol_violation, .is_application = false, .local = true }, "RETIRE_CONNECTION_ID", now_us);
                     return;
                 };
-                const retired = registry.retire(retire) catch {
+                _ = registry.retire(retire) catch {
                     self.startClose(.{ .error_code = error_protocol_violation, .is_application = false, .local = true }, "RETIRE_CONNECTION_ID", now_us);
                     return;
                 };
-                _ = retired;
+                // Cancel every owned copy of this sequence's frame, not only
+                // the registry entry `retire()` already wiped — including on
+                // an idempotent repeated retire, since a duplicate
+                // RETIRE_CONNECTION_ID for an already-retired sequence still
+                // means no in-flight copy of it should survive.
+                self.cancelLocalCidFrameCopies(retire.sequence);
             },
             .path_challenge => |data| {
                 // Echo on the exact path the challenge arrived on (RFC 9000
@@ -1777,10 +1812,8 @@ pub const Connection = struct {
         if (record.carried_stop_sending) |stop| {
             self.pending_stop_sending.append(self.allocator, stop) catch {};
         }
-        if (record.carried_new_connection_id) |ncid_value| {
-            var ncid = ncid_value;
-            defer crypto_secrets.secureZero(&ncid.stateless_reset_token);
-            self.queueNewConnectionId(&ncid);
+        if (record.carried_new_connection_id) |*ncid| {
+            self.queueNewConnectionId(ncid);
         }
         if (record.carried_path_challenge_path) |path| {
             for (self.candidate_challenges.items) |*candidate| {
@@ -1804,7 +1837,47 @@ pub const Connection = struct {
         for (self.pending_new_connection_ids.items) |*queued| {
             if (queued.sequence == source.sequence) return;
         }
-        self.pending_new_connection_ids.append(self.allocator, source.*) catch {};
+        // `cancelLocalCidFrameCopies` removes every queued/in-flight copy of
+        // a sequence the instant it is retired, so the registry's
+        // `max_local_active_cids` bound on simultaneously issued-and-not-
+        // yet-retired sequences also bounds this queue — exactly the
+        // capacity `init()` reserves once up front. If that invariant is
+        // ever wrong, drop the requeue rather than growing the backing
+        // allocation and reopening the unwiped-growth path the reservation
+        // exists to close.
+        if (self.pending_new_connection_ids.items.len == self.pending_new_connection_ids.capacity) return;
+        const dst = self.pending_new_connection_ids.addOneAssumeCapacity();
+        dst.* = source.*;
+    }
+
+    /// A peer's RETIRE_CONNECTION_ID only tells `LocalCidRegistry.retire()`
+    /// to wipe its own entry; it says nothing about copies of that
+    /// sequence's NEW_CONNECTION_ID frame already queued or in flight.
+    /// Without also canceling those: a later PTO/loss could retransmit a
+    /// frame for a sequence the peer already retired, and retiring frees a
+    /// registry slot that `needsLocalCid()` may immediately reuse while the
+    /// old sequence's copies are still live, silently reopening the
+    /// capacity bound `queueNewConnectionId` depends on staying fixed.
+    /// Called for every valid retire, including an idempotent repeat of an
+    /// already-retired sequence.
+    fn cancelLocalCidFrameCopies(self: *Connection, sequence: u64) void {
+        var i: usize = 0;
+        while (i < self.pending_new_connection_ids.items.len) {
+            if (self.pending_new_connection_ids.items[i].sequence != sequence) {
+                i += 1;
+                continue;
+            }
+            crypto_secrets.secureZero(&self.pending_new_connection_ids.items[i].stateless_reset_token);
+            _ = self.pending_new_connection_ids.orderedRemove(i);
+            wipePendingNewConnectionIdsOrderedRemoveResidue(&self.pending_new_connection_ids);
+        }
+        for (self.sent_records.items) |*record| {
+            if (record.carried_new_connection_id) |*ncid| {
+                if (ncid.sequence != sequence) continue;
+                crypto_secrets.secureZero(&ncid.stateless_reset_token);
+                record.carried_new_connection_id = null;
+            }
+        }
     }
 
     fn queueMaxDataUpdate(self: *Connection) void {
@@ -2836,7 +2909,7 @@ pub const Connection = struct {
                 tracked = false;
             };
             self.last_ack_eliciting_sent_us[space_idx] = now_us;
-            if (tracked) self.sent_records.append(self.allocator, record) catch {};
+            if (tracked) publishSentRecord(self, &record);
         }
         self.paths.recordSentOnPath(path, total);
         self.metrics.packets_sent += 1;
@@ -3077,7 +3150,7 @@ pub const Connection = struct {
                 tracked = false;
             };
             self.last_ack_eliciting_sent_us[space_idx] = now_us;
-            if (tracked) self.sent_records.append(self.allocator, record) catch {};
+            if (tracked) publishSentRecord(self, &record);
         }
         if (record.carried_new_connection_id) |ncid| {
             if (self.local_cids) |*registry| registry.markAdvertised(ncid.sequence) catch {};
