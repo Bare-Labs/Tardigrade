@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const compat = @import("zig_compat");
+const diff_options = @import("crypto_openssl_diff_options");
 const crypto_pkg = @import("crypto");
 const quic = @import("quic");
 const tls_core = @import("tls_core");
@@ -15,10 +16,13 @@ const testing = std.testing;
 const provider = crypto_pkg.provider;
 const profile = crypto_pkg.profile;
 const pure_zig = crypto_pkg.pure_zig;
+const X25519 = std.crypto.dh.X25519;
+const Ed25519 = std.crypto.sign.Ed25519;
 
 const OpenSslError = error{
     MissingOpenSslKdfOracle,
     OpenSslOracleFailed,
+    EvpOracleFailed,
     DifferentialMismatch,
 };
 
@@ -72,22 +76,22 @@ const differential_cases = [_]DifferentialCase{
     .{ .kind = .transcript_hash, .algorithm = .{ .hash = .sha256 }, .class = .negative, .rationale = "mutated handshake byte rebuilds Transcript and OpenSSL transcript hash", .run = runTranscriptAndFinished },
     .{ .kind = .finished_hmac, .algorithm = .{ .hkdf = .sha256 }, .class = .positive, .rationale = "KeySchedule Finished key and HMAC compared to independent OpenSSL HKDF/HMAC", .run = runTranscriptAndFinished },
     .{ .kind = .finished_hmac, .algorithm = .{ .hkdf = .sha256 }, .class = .negative, .rationale = "mutated transcript changes Zig and OpenSSL Finished verify_data", .run = runTranscriptAndFinished },
+    .{ .kind = .aead, .algorithm = .{ .aead = .aes_128_gcm }, .class = .positive, .rationale = "provider AES-128-GCM seal/open compared to detached-tag EVP oracle", .run = runAeadAes128Positive },
+    .{ .kind = .aead, .algorithm = .{ .aead = .aes_128_gcm }, .class = .negative, .rationale = "provider AES-128-GCM invalid tag/ciphertext/AAD/key handling compared to EVP oracle", .run = runAeadAes128Negative },
+    .{ .kind = .aead, .algorithm = .{ .aead = .aes_256_gcm }, .class = .positive, .rationale = "provider AES-256-GCM seal/open compared to detached-tag EVP oracle", .run = runAeadAes256Positive },
+    .{ .kind = .aead, .algorithm = .{ .aead = .aes_256_gcm }, .class = .negative, .rationale = "provider AES-256-GCM invalid tag/ciphertext/AAD/key handling compared to EVP oracle", .run = runAeadAes256Negative },
+    .{ .kind = .aead, .algorithm = .{ .aead = .chacha20_poly1305 }, .class = .positive, .rationale = "provider ChaCha20-Poly1305 seal/open compared to detached-tag EVP oracle", .run = runAeadChacha20Positive },
+    .{ .kind = .aead, .algorithm = .{ .aead = .chacha20_poly1305 }, .class = .negative, .rationale = "provider ChaCha20-Poly1305 invalid tag/ciphertext/AAD/key handling compared to EVP oracle", .run = runAeadChacha20Negative },
+    .{ .kind = .key_exchange, .algorithm = .{ .group = .x25519 }, .class = .positive, .rationale = "provider raw X25519 shared secret compared to EVP oracle", .run = runX25519Positive },
+    .{ .kind = .key_exchange, .algorithm = .{ .group = .x25519 }, .class = .negative, .rationale = "provider X25519 malformed and low-order peer handling compared to EVP oracle status", .run = runX25519Negative },
+    .{ .kind = .signature_sign, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .rationale = "provider raw Ed25519 signing compared to EVP oracle", .run = runEd25519SignPositive },
+    .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .rationale = "provider raw Ed25519 verification compared to EVP oracle", .run = runEd25519VerifyPositive },
+    .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .negative, .rationale = "provider raw Ed25519 invalid signature/message/key handling compared to EVP oracle", .run = runEd25519VerifyNegative },
+    .{ .kind = .signature_verify, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .positive, .rationale = "provider SEC1 ECDSA-P256-SHA256 verification compared to EVP oracle", .run = runEcdsaP256VerifyPositive },
+    .{ .kind = .signature_verify, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .negative, .rationale = "provider SEC1 ECDSA-P256-SHA256 malformed and invalid verification compared to EVP oracle", .run = runEcdsaP256VerifyNegative },
 };
 
 const waivers = [_]Waiver{
-    .{ .kind = .aead, .algorithm = .{ .aead = .aes_128_gcm }, .class = .positive, .reason = "OpenSSL CLI cannot seal/open AEAD with detached tags portably; blocked on a dedicated out-of-process EVP oracle follow-up.", .tracking_issue = "#431" },
-    .{ .kind = .aead, .algorithm = .{ .aead = .aes_128_gcm }, .class = .negative, .reason = "Invalid-tag parity requires the same dedicated EVP oracle follow-up.", .tracking_issue = "#431" },
-    .{ .kind = .aead, .algorithm = .{ .aead = .aes_256_gcm }, .class = .positive, .reason = "OpenSSL CLI cannot seal/open AEAD with detached tags portably; blocked on a dedicated out-of-process EVP oracle follow-up.", .tracking_issue = "#431" },
-    .{ .kind = .aead, .algorithm = .{ .aead = .aes_256_gcm }, .class = .negative, .reason = "Invalid-tag parity requires the same dedicated EVP oracle follow-up.", .tracking_issue = "#431" },
-    .{ .kind = .aead, .algorithm = .{ .aead = .chacha20_poly1305 }, .class = .positive, .reason = "OpenSSL CLI cannot seal/open AEAD with detached tags portably; blocked on a dedicated out-of-process EVP oracle follow-up.", .tracking_issue = "#431" },
-    .{ .kind = .aead, .algorithm = .{ .aead = .chacha20_poly1305 }, .class = .negative, .reason = "Invalid-tag parity requires the same dedicated EVP oracle follow-up.", .tracking_issue = "#431" },
-    .{ .kind = .key_exchange, .algorithm = .{ .group = .x25519 }, .class = .positive, .reason = "X25519 parity needs stable raw-key EVP derive commands; tracked with the dedicated EVP oracle follow-up.", .tracking_issue = "#431" },
-    .{ .kind = .key_exchange, .algorithm = .{ .group = .x25519 }, .class = .negative, .reason = "Low-order/invalid-key parity needs the same raw-key EVP derive oracle.", .tracking_issue = "#431" },
-    .{ .kind = .signature_sign, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .reason = "OpenSSL CLI raw Ed25519 signing fixtures require the dedicated EVP oracle follow-up.", .tracking_issue = "#431" },
-    .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .reason = "Raw-key Ed25519 verify parity requires the dedicated EVP oracle follow-up.", .tracking_issue = "#431" },
-    .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .negative, .reason = "Invalid-signature Ed25519 parity requires the same raw-key EVP oracle.", .tracking_issue = "#431" },
-    .{ .kind = .signature_verify, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .positive, .reason = "SEC1-key ECDSA verification parity requires the dedicated EVP oracle follow-up.", .tracking_issue = "#431" },
-    .{ .kind = .signature_verify, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .negative, .reason = "Invalid-signature ECDSA parity requires the same SEC1-key EVP oracle.", .tracking_issue = "#431" },
     .{ .kind = .psk_binder, .algorithm = .{ .hkdf = .sha256 }, .class = .negative, .reason = "Pure-Zig PSK binder generation/verification is not implemented yet.", .tracking_issue = "#362" },
     .{ .kind = .psk_binder, .algorithm = .{ .hkdf = .sha384 }, .class = .negative, .reason = "Pure-Zig PSK binder generation/verification is not implemented yet.", .tracking_issue = "#362" },
 };
@@ -155,6 +159,409 @@ fn hexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
         out[index * 2 + 1] = alphabet[byte & 0x0f];
     }
     return out;
+}
+
+fn hexDecodeAlloc(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
+    if ((hex.len & 1) != 0) return error.InvalidInput;
+    const out = try allocator.alloc(u8, hex.len / 2);
+    errdefer allocator.free(out);
+    _ = std.fmt.hexToBytes(out, hex) catch return error.InvalidInput;
+    return out;
+}
+
+const EvpStatus = enum {
+    ok,
+    auth_fail,
+    malformed,
+    oracle_error,
+};
+
+const EvpOracleResult = struct {
+    status: EvpStatus,
+    fields: [2]?[]u8 = .{ null, null },
+
+    fn deinit(self: *EvpOracleResult, allocator: std.mem.Allocator) void {
+        for (&self.fields) |*field| {
+            if (field.*) |bytes| allocator.free(bytes);
+            field.* = null;
+        }
+    }
+};
+
+fn evpStatus(raw: []const u8) ?EvpStatus {
+    if (std.mem.eql(u8, raw, "ok")) return .ok;
+    if (std.mem.eql(u8, raw, "auth_fail")) return .auth_fail;
+    if (std.mem.eql(u8, raw, "malformed")) return .malformed;
+    if (std.mem.eql(u8, raw, "oracle_error")) return .oracle_error;
+    return null;
+}
+
+fn runEvpOracleRaw(allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
+    var argv = try allocator.alloc([]const u8, args.len + 1);
+    defer allocator.free(argv);
+    argv[0] = diff_options.evp_oracle_path;
+    for (args, 0..) |arg, i| argv[i + 1] = arg;
+
+    const result = try std.process.run(allocator, compat.io(), .{
+        .argv = argv,
+        .stdout_limit = .limited(8 * 1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code == 0) return result.stdout,
+        else => {},
+    }
+
+    std.debug.print("EVP oracle process failed; stderr: {s}\n", .{result.stderr});
+    allocator.free(result.stdout);
+    return error.EvpOracleFailed;
+}
+
+fn runEvpOracle(allocator: std.mem.Allocator, args: []const []const u8) !EvpOracleResult {
+    const stdout = try runEvpOracleRaw(allocator, args);
+    defer allocator.free(stdout);
+    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+    var tokens = std.mem.tokenizeScalar(u8, trimmed, ' ');
+    const status_token = tokens.next() orelse return error.EvpOracleFailed;
+    var parsed = EvpOracleResult{ .status = evpStatus(status_token) orelse return error.EvpOracleFailed };
+    errdefer parsed.deinit(allocator);
+    var index: usize = 0;
+    while (tokens.next()) |token| {
+        if (index >= parsed.fields.len) return error.EvpOracleFailed;
+        parsed.fields[index] = try hexDecodeAlloc(allocator, token);
+        index += 1;
+    }
+    return parsed;
+}
+
+fn expectEvpStatus(result: *const EvpOracleResult, expected: EvpStatus) !void {
+    if (result.status != expected) {
+        std.debug.print("unexpected EVP oracle status: expected={s} actual={s}\n", .{ @tagName(expected), @tagName(result.status) });
+        return error.DifferentialMismatch;
+    }
+}
+
+fn expectProviderOpenError(actual: anyerror!void, expected: anyerror) !void {
+    actual catch |err| {
+        try testing.expectEqual(expected, err);
+        return;
+    };
+    return error.DifferentialMismatch;
+}
+
+fn evpAeadName(aead: provider.Aead) []const u8 {
+    return switch (aead) {
+        .aes_128_gcm => "aes-128-gcm",
+        .aes_256_gcm => "aes-256-gcm",
+        .chacha20_poly1305 => "chacha20-poly1305",
+    };
+}
+
+fn runEvpAeadSeal(allocator: std.mem.Allocator, aead: provider.Aead, key: []const u8, nonce: []const u8, aad: []const u8, plaintext: []const u8) !EvpOracleResult {
+    const key_hex = try hexAlloc(allocator, key);
+    defer allocator.free(key_hex);
+    const nonce_hex = try hexAlloc(allocator, nonce);
+    defer allocator.free(nonce_hex);
+    const aad_hex = try hexAlloc(allocator, aad);
+    defer allocator.free(aad_hex);
+    const plaintext_hex = try hexAlloc(allocator, plaintext);
+    defer allocator.free(plaintext_hex);
+    return runEvpOracle(allocator, &.{ "aead-seal", evpAeadName(aead), key_hex, nonce_hex, aad_hex, plaintext_hex });
+}
+
+fn runEvpAeadOpen(allocator: std.mem.Allocator, aead: provider.Aead, key: []const u8, nonce: []const u8, aad: []const u8, ciphertext: []const u8, tag: []const u8) !EvpOracleResult {
+    const key_hex = try hexAlloc(allocator, key);
+    defer allocator.free(key_hex);
+    const nonce_hex = try hexAlloc(allocator, nonce);
+    defer allocator.free(nonce_hex);
+    const aad_hex = try hexAlloc(allocator, aad);
+    defer allocator.free(aad_hex);
+    const ciphertext_hex = try hexAlloc(allocator, ciphertext);
+    defer allocator.free(ciphertext_hex);
+    const tag_hex = try hexAlloc(allocator, tag);
+    defer allocator.free(tag_hex);
+    return runEvpOracle(allocator, &.{ "aead-open", evpAeadName(aead), key_hex, nonce_hex, aad_hex, ciphertext_hex, tag_hex });
+}
+
+fn runAeadPositive(allocator: std.mem.Allocator, aead: provider.Aead) !void {
+    const cp = cryptoProvider();
+    var key_storage = [_]u8{0x31} ** provider.max_aead_key_len;
+    const key = key_storage[0..aead.keyLength()];
+    const nonce = hexBytes("000102030405060708090a0b");
+    const aad = "tls-record-header";
+    const plaintext = "primitive detached tag fixture";
+
+    var ciphertext: [plaintext.len]u8 = undefined;
+    var tag: [provider.aead_tag_len]u8 = undefined;
+    try cp.aeadSeal(aead, key, &nonce, aad, plaintext, &ciphertext, &tag);
+
+    var sealed = try runEvpAeadSeal(allocator, aead, key, &nonce, aad, plaintext);
+    defer sealed.deinit(allocator);
+    try expectEvpStatus(&sealed, .ok);
+    try testing.expectEqualSlices(u8, &ciphertext, sealed.fields[0].?);
+    try testing.expectEqualSlices(u8, &tag, sealed.fields[1].?);
+
+    var opened = try runEvpAeadOpen(allocator, aead, key, &nonce, aad, &ciphertext, &tag);
+    defer opened.deinit(allocator);
+    try expectEvpStatus(&opened, .ok);
+    try testing.expectEqualSlices(u8, plaintext, opened.fields[0].?);
+}
+
+fn runAeadNegative(allocator: std.mem.Allocator, aead: provider.Aead) !void {
+    const cp = cryptoProvider();
+    var key_storage = [_]u8{0x41} ** provider.max_aead_key_len;
+    const key = key_storage[0..aead.keyLength()];
+    const nonce = hexBytes("101112131415161718191a1b");
+    const aad = "aad";
+    const plaintext = "negative aead fixture";
+    var ciphertext: [plaintext.len]u8 = undefined;
+    var tag: [provider.aead_tag_len]u8 = undefined;
+    try cp.aeadSeal(aead, key, &nonce, aad, plaintext, &ciphertext, &tag);
+
+    var recovered: [plaintext.len]u8 = undefined;
+    var bad_tag = tag;
+    bad_tag[0] ^= 0x80;
+    try expectProviderOpenError(cp.aeadOpen(aead, key, &nonce, aad, &ciphertext, &bad_tag, &recovered), error.AuthenticationFailed);
+    var bad_tag_result = try runEvpAeadOpen(allocator, aead, key, &nonce, aad, &ciphertext, &bad_tag);
+    defer bad_tag_result.deinit(allocator);
+    try expectEvpStatus(&bad_tag_result, .auth_fail);
+
+    var bad_ciphertext = ciphertext;
+    bad_ciphertext[0] ^= 0x01;
+    try expectProviderOpenError(cp.aeadOpen(aead, key, &nonce, aad, &bad_ciphertext, &tag, &recovered), error.AuthenticationFailed);
+    var bad_cipher_result = try runEvpAeadOpen(allocator, aead, key, &nonce, aad, &bad_ciphertext, &tag);
+    defer bad_cipher_result.deinit(allocator);
+    try expectEvpStatus(&bad_cipher_result, .auth_fail);
+
+    try expectProviderOpenError(cp.aeadOpen(aead, key, &nonce, "wrong", &ciphertext, &tag, &recovered), error.AuthenticationFailed);
+    var bad_aad_result = try runEvpAeadOpen(allocator, aead, key, &nonce, "wrong", &ciphertext, &tag);
+    defer bad_aad_result.deinit(allocator);
+    try expectEvpStatus(&bad_aad_result, .auth_fail);
+
+    var wrong_key_storage = key_storage;
+    wrong_key_storage[aead.keyLength() - 1] ^= 0x55;
+    const wrong_key = wrong_key_storage[0..aead.keyLength()];
+    try expectProviderOpenError(cp.aeadOpen(aead, wrong_key, &nonce, aad, &ciphertext, &tag, &recovered), error.AuthenticationFailed);
+    var wrong_key_result = try runEvpAeadOpen(allocator, aead, wrong_key, &nonce, aad, &ciphertext, &tag);
+    defer wrong_key_result.deinit(allocator);
+    try expectEvpStatus(&wrong_key_result, .auth_fail);
+
+    const short_key = key[0 .. key.len - 1];
+    try testing.expectError(error.InvalidInput, cp.aeadSeal(aead, short_key, &nonce, aad, plaintext, &ciphertext, &tag));
+    var malformed = try runEvpAeadSeal(allocator, aead, short_key, &nonce, aad, plaintext);
+    defer malformed.deinit(allocator);
+    try expectEvpStatus(&malformed, .malformed);
+
+    const too_large = try allocator.alloc(u8, 4097);
+    defer allocator.free(too_large);
+    @memset(too_large, 0xaa);
+    var bounded = try runEvpAeadSeal(allocator, aead, key, &nonce, aad, too_large);
+    defer bounded.deinit(allocator);
+    try expectEvpStatus(&bounded, .malformed);
+}
+
+fn runAeadAes128Positive(allocator: std.mem.Allocator) !void {
+    try runAeadPositive(allocator, .aes_128_gcm);
+}
+fn runAeadAes128Negative(allocator: std.mem.Allocator) !void {
+    try runAeadNegative(allocator, .aes_128_gcm);
+}
+fn runAeadAes256Positive(allocator: std.mem.Allocator) !void {
+    try runAeadPositive(allocator, .aes_256_gcm);
+}
+fn runAeadAes256Negative(allocator: std.mem.Allocator) !void {
+    try runAeadNegative(allocator, .aes_256_gcm);
+}
+fn runAeadChacha20Positive(allocator: std.mem.Allocator) !void {
+    try runAeadPositive(allocator, .chacha20_poly1305);
+}
+fn runAeadChacha20Negative(allocator: std.mem.Allocator) !void {
+    try runAeadNegative(allocator, .chacha20_poly1305);
+}
+
+fn runEvpX25519(allocator: std.mem.Allocator, private_scalar: []const u8, peer_public: []const u8) !EvpOracleResult {
+    const private_hex = try hexAlloc(allocator, private_scalar);
+    defer allocator.free(private_hex);
+    const public_hex = try hexAlloc(allocator, peer_public);
+    defer allocator.free(public_hex);
+    return runEvpOracle(allocator, &.{ "x25519", private_hex, public_hex });
+}
+
+fn runX25519Positive(allocator: std.mem.Allocator) !void {
+    const cp = cryptoProvider();
+    const alice_private = hexBytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    const bob_public = hexBytes("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+    const expected_shared = hexBytes("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+    var shared: [X25519.shared_length]u8 = undefined;
+    try cp.deriveSharedSecret(.x25519, &alice_private, &bob_public, &shared);
+    try expectStage("x25519 shared secret / RFC 7748", &expected_shared, &shared);
+
+    var oracle = try runEvpX25519(allocator, &alice_private, &bob_public);
+    defer oracle.deinit(allocator);
+    try expectEvpStatus(&oracle, .ok);
+    try testing.expectEqualSlices(u8, &shared, oracle.fields[0].?);
+}
+
+fn runX25519Negative(allocator: std.mem.Allocator) !void {
+    const cp = cryptoProvider();
+    const alice_private = hexBytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    const zero_point = [_]u8{0} ** X25519.public_length;
+    var shared: [X25519.shared_length]u8 = undefined;
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.x25519, &alice_private, &zero_point, &shared));
+    var low_order = try runEvpX25519(allocator, &alice_private, &zero_point);
+    defer low_order.deinit(allocator);
+    try expectEvpStatus(&low_order, .auth_fail);
+
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.x25519, alice_private[0..31], &zero_point, &shared));
+    var malformed = try runEvpX25519(allocator, alice_private[0..31], &zero_point);
+    defer malformed.deinit(allocator);
+    try expectEvpStatus(&malformed, .malformed);
+}
+
+fn runEvpEd25519Sign(allocator: std.mem.Allocator, seed: []const u8, message: []const u8) !EvpOracleResult {
+    const seed_hex = try hexAlloc(allocator, seed);
+    defer allocator.free(seed_hex);
+    const message_hex = try hexAlloc(allocator, message);
+    defer allocator.free(message_hex);
+    return runEvpOracle(allocator, &.{ "ed25519-sign", seed_hex, message_hex });
+}
+
+fn runEvpEd25519Verify(allocator: std.mem.Allocator, public_key: []const u8, message: []const u8, signature: []const u8) !EvpOracleResult {
+    const public_hex = try hexAlloc(allocator, public_key);
+    defer allocator.free(public_hex);
+    const message_hex = try hexAlloc(allocator, message);
+    defer allocator.free(message_hex);
+    const signature_hex = try hexAlloc(allocator, signature);
+    defer allocator.free(signature_hex);
+    return runEvpOracle(allocator, &.{ "ed25519-verify", public_hex, message_hex, signature_hex });
+}
+
+fn runEd25519SignPositive(allocator: std.mem.Allocator) !void {
+    const cp = cryptoProvider();
+    const seed = hexBytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+    const expected_public = hexBytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+    const message = "";
+    var key = try pure_zig.SoftwareSigningKey.fromSeed(seed);
+    defer key.deinit();
+    const actual_public = key.publicKey();
+    try expectStage("ed25519 public key / RFC 8032", &expected_public, &actual_public);
+    var signature: [Ed25519.Signature.encoded_length]u8 = undefined;
+    const len = try key.signingKey().sign(message, cp.entropy, &signature);
+    try testing.expectEqual(@as(usize, Ed25519.Signature.encoded_length), len);
+
+    var oracle = try runEvpEd25519Sign(allocator, &seed, message);
+    defer oracle.deinit(allocator);
+    try expectEvpStatus(&oracle, .ok);
+    try testing.expectEqualSlices(u8, &signature, oracle.fields[0].?);
+}
+
+fn runEd25519VerifyPositive(allocator: std.mem.Allocator) !void {
+    const cp = cryptoProvider();
+    const public_key = hexBytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+    const signature = hexBytes("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
+    try cp.verify(.ed25519, &public_key, "", &signature);
+    var oracle = try runEvpEd25519Verify(allocator, &public_key, "", &signature);
+    defer oracle.deinit(allocator);
+    try expectEvpStatus(&oracle, .ok);
+}
+
+fn runEd25519VerifyNegative(allocator: std.mem.Allocator) !void {
+    const cp = cryptoProvider();
+    const seed = hexBytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+    const public_key = hexBytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+    const signature = hexBytes("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
+
+    var bad_signature = signature;
+    bad_signature[0] ^= 0x80;
+    try testing.expectError(error.AuthenticationFailed, cp.verify(.ed25519, &public_key, "", &bad_signature));
+    var bad_sig_oracle = try runEvpEd25519Verify(allocator, &public_key, "", &bad_signature);
+    defer bad_sig_oracle.deinit(allocator);
+    try expectEvpStatus(&bad_sig_oracle, .auth_fail);
+
+    try testing.expectError(error.AuthenticationFailed, cp.verify(.ed25519, &public_key, "mutated", &signature));
+    var bad_msg_oracle = try runEvpEd25519Verify(allocator, &public_key, "mutated", &signature);
+    defer bad_msg_oracle.deinit(allocator);
+    try expectEvpStatus(&bad_msg_oracle, .auth_fail);
+
+    var wrong_key = public_key;
+    wrong_key[0] ^= 0x01;
+    try testing.expectError(error.AuthenticationFailed, cp.verify(.ed25519, &wrong_key, "", &signature));
+    var wrong_key_oracle = try runEvpEd25519Verify(allocator, &wrong_key, "", &signature);
+    defer wrong_key_oracle.deinit(allocator);
+    try expectEvpStatus(&wrong_key_oracle, .auth_fail);
+
+    try testing.expectError(error.InvalidInput, cp.verify(.ed25519, public_key[0..31], "", &signature));
+    var malformed = try runEvpEd25519Verify(allocator, public_key[0..31], "", &signature);
+    defer malformed.deinit(allocator);
+    try expectEvpStatus(&malformed, .malformed);
+
+    const seed_hex = try hexAlloc(allocator, &seed);
+    defer allocator.free(seed_hex);
+    const raw = try runEvpOracleRaw(allocator, &.{ "ed25519-sign", seed_hex[0..62], "" });
+    defer allocator.free(raw);
+    try testing.expect(!std.mem.containsAtLeast(u8, raw, 1, seed_hex));
+}
+
+fn runEvpEcdsaP256Verify(allocator: std.mem.Allocator, public_key: []const u8, message: []const u8, signature: []const u8) !EvpOracleResult {
+    const public_hex = try hexAlloc(allocator, public_key);
+    defer allocator.free(public_hex);
+    const message_hex = try hexAlloc(allocator, message);
+    defer allocator.free(message_hex);
+    const signature_hex = try hexAlloc(allocator, signature);
+    defer allocator.free(signature_hex);
+    return runEvpOracle(allocator, &.{ "ecdsa-p256-verify", public_hex, message_hex, signature_hex });
+}
+
+fn runEcdsaP256VerifyPositive(allocator: std.mem.Allocator) !void {
+    const cp = cryptoProvider();
+    const public_key = hexBytes("042927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e");
+    const message = hexBytes("313233343030");
+    const signature = hexBytes("304502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db");
+    try cp.verify(.ecdsa_secp256r1_sha256, &public_key, &message, &signature);
+    var oracle = try runEvpEcdsaP256Verify(allocator, &public_key, &message, &signature);
+    defer oracle.deinit(allocator);
+    try expectEvpStatus(&oracle, .ok);
+}
+
+fn runEcdsaP256VerifyNegative(allocator: std.mem.Allocator) !void {
+    const cp = cryptoProvider();
+    const public_key = hexBytes("042927b10512bae3eddcfe467828128bad2903269919f7086069c8c4df6c732838c7787964eaac00e5921fb1498a60f4606766b3d9685001558d1a974e7341513e");
+    const message = hexBytes("313233343030");
+    const signature = hexBytes("304502202ba3a8be6b94d5ec80a6d9d1190a436effe50d85a1eee859b8cc6af9bd5c2e18022100b329f479a2bbd0a5c384ee1493b1f5186a87139cac5df4087c134b49156847db");
+
+    try testing.expectError(error.AuthenticationFailed, cp.verify(.ecdsa_secp256r1_sha256, &public_key, "wrong", &signature));
+    var bad_message = try runEvpEcdsaP256Verify(allocator, &public_key, "wrong", &signature);
+    defer bad_message.deinit(allocator);
+    try expectEvpStatus(&bad_message, .auth_fail);
+
+    var bad_sig = signature;
+    bad_sig[bad_sig.len - 1] ^= 0x01;
+    try testing.expectError(error.AuthenticationFailed, cp.verify(.ecdsa_secp256r1_sha256, &public_key, &message, &bad_sig));
+    var bad_sig_oracle = try runEvpEcdsaP256Verify(allocator, &public_key, &message, &bad_sig);
+    defer bad_sig_oracle.deinit(allocator);
+    try expectEvpStatus(&bad_sig_oracle, .auth_fail);
+
+    var wrong_key_owner = try pure_zig.SoftwareEcdsaP256SigningKey.fromSeed([_]u8{0x77} ** 32);
+    defer wrong_key_owner.deinit();
+    const wrong_key = wrong_key_owner.publicKeySec1();
+    try testing.expectError(error.AuthenticationFailed, cp.verify(.ecdsa_secp256r1_sha256, &wrong_key, &message, &signature));
+    var wrong_key_oracle = try runEvpEcdsaP256Verify(allocator, &wrong_key, &message, &signature);
+    defer wrong_key_oracle.deinit(allocator);
+    try expectEvpStatus(&wrong_key_oracle, .auth_fail);
+
+    const malformed_key = [_]u8{0x04};
+    try testing.expectError(error.InvalidInput, cp.verify(.ecdsa_secp256r1_sha256, &malformed_key, &message, &signature));
+    var malformed_key_oracle = try runEvpEcdsaP256Verify(allocator, &malformed_key, &message, &signature);
+    defer malformed_key_oracle.deinit(allocator);
+    try expectEvpStatus(&malformed_key_oracle, .malformed);
+
+    const malformed_sig = [_]u8{0x30};
+    try testing.expectError(error.AuthenticationFailed, cp.verify(.ecdsa_secp256r1_sha256, &public_key, &message, &malformed_sig));
+    var malformed_sig_oracle = try runEvpEcdsaP256Verify(allocator, &public_key, &message, &malformed_sig);
+    defer malformed_sig_oracle.deinit(allocator);
+    try expectEvpStatus(&malformed_sig_oracle, .auth_fail);
 }
 
 fn tlsHkdfLabel(allocator: std.mem.Allocator, out_len: usize, label: []const u8, context: []const u8) ![]u8 {
