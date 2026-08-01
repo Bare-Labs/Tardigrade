@@ -908,7 +908,8 @@ fn zeroAndFree(allocator: std.mem.Allocator, buffer: []u8) void {
         const volatile_byte: *volatile u8 = @ptrCast(byte);
         volatile_byte.* = 0;
     }
-    allocator.free(buffer);
+    for (buffer) |byte| std.debug.assert(byte == 0);
+    allocator.rawFree(buffer, .fromByteUnits(@alignOf(u8)), @returnAddress());
 }
 
 fn ticketExpiresWithinKey(state: *const session.ServerRecoverableState, key_decrypt_until_unix_ms: i64) bool {
