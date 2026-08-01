@@ -6,7 +6,6 @@ const edge_config = @import("edge_config.zig");
 const runtime_allocator = @import("runtime_allocator.zig");
 const build_options = @import("build_options");
 const tls_core = @import("tls_core");
-const crypto_pkg = @import("crypto");
 
 const STREAM_RELAY_BUFFER_SIZE: usize = 16 * 1024;
 const JSON_CONTENT_TYPE = "application/json";
@@ -42,11 +41,6 @@ const Http2PendingStream = gs.Http2PendingStream;
 const CommandLifecycleEntry = gs.CommandLifecycleEntry;
 const ApprovalEntry = gs.ApprovalEntry;
 const MuxResumeState = gs.MuxResumeState;
-var fixed_credential_entropy = crypto_pkg.pure_zig.DeterministicEntropy.init(0x432);
-
-fn fixedCredentialEntropy() crypto_pkg.provider.Entropy {
-    return fixed_credential_entropy.entropy();
-}
 
 const ActiveDrivePollRemoveFn = *const fn (*anyopaque, std.posix.fd_t) anyerror!void;
 const ActiveDrivePollSubmitFn = *const fn (*anyopaque, std.posix.fd_t) anyerror!void;
@@ -4752,7 +4746,7 @@ test "#369 Slice 2 rt0.reject.store_unavailable: disabled-mode composition passe
     // constructing native TCP/H3 runtimes, not a parallel reproduction of
     // its branch. Since the helper returns null here, the real native TLS
     // connection receives the backend default gate.
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     const fds = try gatewayTestSocketPair();
     defer gatewayTestCloseFd(fds[0]);
@@ -4794,7 +4788,7 @@ test "#510 process-local composition enables native TCP server early-data policy
     const policy = nativeTcpServerEarlyDataPolicy(composition.early_data_replay_gate);
     try std.testing.expect(policy.enabled);
 
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var entropy = tls_core.production_crypto.OsEntropy{};
     var provider = tls_core.production_crypto.Provider.init(entropy.entropy());
@@ -6057,7 +6051,7 @@ test "#368 Slice 2: one process-scoped early-data replay store is shared by nati
     var adapter = tls_core.early_data_replay.GateAdapter.init(store.store());
     const gate = adapter.gate();
 
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
 
     const fds = try gatewayTestSocketPair();

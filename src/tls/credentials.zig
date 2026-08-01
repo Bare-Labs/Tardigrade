@@ -552,6 +552,15 @@ pub const Identity = struct {
         return self.signatureScheme().code();
     }
 
+    pub fn format(
+        _: Identity,
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        _: anytype,
+    ) !void {
+        @compileError("TLS identities must not be formatted or logged");
+    }
+
     /// Sign `input` into `out`, returning the signature length. Bounded: never
     /// writes past `out`; reports `SignatureOutputOverflow` when it would.
     /// This is the single place the fixed private key is used for signing —
@@ -816,6 +825,16 @@ pub const testdata = struct {
 
     pub fn p256Identity() Identity {
         return Identity.initPkcs8(p256_certificate_der, p256_private_key_pkcs8_der) catch unreachable;
+    }
+
+    const ignored_entropy_context: u8 = 0;
+
+    fn ignoredEntropyFill(_: *anyopaque, out: []u8) crypto_provider_pkg.EntropyError!void {
+        @memset(out, 0);
+    }
+
+    pub fn ignoredEntropy() crypto_provider_pkg.Entropy {
+        return .{ .context = @ptrCast(@constCast(&ignored_entropy_context)), .fillFn = ignoredEntropyFill };
     }
 };
 
@@ -1161,10 +1180,9 @@ pub const MockVerifier = struct {
 // ===========================================================================
 
 const testing = std.testing;
-var mock_sign_entropy = pure_zig.DeterministicEntropy.init(0x4325);
 
 fn mockSignEntropy() crypto_provider_pkg.Entropy {
-    return mock_sign_entropy.entropy();
+    return testdata.ignoredEntropy();
 }
 
 fn testSelection(schemes: []const u16) SelectionContext {
@@ -1201,8 +1219,7 @@ fn syncVerify(v: PeerVerifier, context: *const VerificationContext) !Verdict {
 }
 
 test "fixed provider selects and exposes its public chain without private-key bytes" {
-    var det = pure_zig.DeterministicEntropy.init(0x4320);
-    var fixed = FixedCredentialProvider.init(testdata.identity(), det.entropy());
+    var fixed = FixedCredentialProvider.init(testdata.identity(), testdata.ignoredEntropy());
     defer fixed.deinit();
     const provider = fixed.provider();
 
@@ -1217,8 +1234,7 @@ test "fixed provider selects and exposes its public chain without private-key by
 }
 
 test "fixed provider signs a bounded output the certificate can verify" {
-    var det = pure_zig.DeterministicEntropy.init(0x4321);
-    var fixed = FixedCredentialProvider.init(testdata.identity(), det.entropy());
+    var fixed = FixedCredentialProvider.init(testdata.identity(), testdata.ignoredEntropy());
     defer fixed.deinit();
     const provider = fixed.provider();
     const selection = testSelection(&.{0x0807});
@@ -1263,8 +1279,7 @@ test "fixed provider selects and signs ECDSA only for compatible offers" {
 }
 
 test "fixed provider rejects an output buffer too small for the signature" {
-    var det = pure_zig.DeterministicEntropy.init(0x4322);
-    var fixed = FixedCredentialProvider.init(testdata.identity(), det.entropy());
+    var fixed = FixedCredentialProvider.init(testdata.identity(), testdata.ignoredEntropy());
     defer fixed.deinit();
     const provider = fixed.provider();
     const selection = testSelection(&.{0x0807});
@@ -1276,8 +1291,7 @@ test "fixed provider rejects an output buffer too small for the signature" {
 }
 
 test "fixed provider filters on the peer's offered signature algorithms" {
-    var det = pure_zig.DeterministicEntropy.init(0x4323);
-    var fixed = FixedCredentialProvider.init(testdata.identity(), det.entropy()); // Ed25519 identity
+    var fixed = FixedCredentialProvider.init(testdata.identity(), testdata.ignoredEntropy()); // Ed25519 identity
     defer fixed.deinit();
     const provider = fixed.provider();
 
@@ -1459,13 +1473,13 @@ test "error classifiers cover every select, sign, and verify error" {
 }
 
 test "fixed provider teardown zeroes the private key exactly once" {
-    var det = pure_zig.DeterministicEntropy.init(0x4324);
-    var fixed = FixedCredentialProvider.init(testdata.identity(), det.entropy());
+    var fixed = FixedCredentialProvider.init(testdata.identity(), testdata.ignoredEntropy());
     fixed.deinit();
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&fixed.identity.key), 0));
 }
 
 test "identity parser loads and rejects malformed PKCS#8" {
+    try testing.expect(@hasDecl(Identity, "format"));
     const identity = try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der);
     const parsed = try (crypto.Certificate{ .buffer = testdata.certificate_der, .index = 0 }).parse();
     try testing.expect(parsed.pub_key_algo == .curveEd25519);

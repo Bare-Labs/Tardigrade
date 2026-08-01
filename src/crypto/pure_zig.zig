@@ -513,6 +513,15 @@ pub const SoftwareSigningKey = struct {
         crypto.secureZero(u8, &self.key_pair.secret_key.bytes);
     }
 
+    pub fn format(
+        _: SoftwareSigningKey,
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        _: anytype,
+    ) !void {
+        @compileError("signing keys must not be formatted or logged");
+    }
+
     /// Raw 32-byte Ed25519 public key, for pinning or CertificateVerify checks.
     pub fn publicKey(self: *const SoftwareSigningKey) [Ed25519.PublicKey.encoded_length]u8 {
         return self.key_pair.public_key.toBytes();
@@ -576,11 +585,11 @@ pub const SoftwareEcdsaP256SigningKey = struct {
     /// Load from a seed already held in a typed secret container, consuming
     /// and clearing it before key derivation.
     pub fn fromSeedSecret(seed: *secrets.FixedSecret(EcdsaP256Sha256.KeyPair.seed_length)) provider.SignError!SoftwareEcdsaP256SigningKey {
+        defer seed.deinit();
         if (seed.len != EcdsaP256Sha256.KeyPair.seed_length) return error.InvalidInput;
         var bridge: [EcdsaP256Sha256.KeyPair.seed_length]u8 = undefined;
         defer crypto.secureZero(u8, &bridge);
         @memcpy(&bridge, seed.slice());
-        seed.deinit();
         const key_pair = EcdsaP256Sha256.KeyPair.generateDeterministic(bridge) catch return error.ProviderFailure;
         return .{ .key_pair = key_pair };
     }
@@ -593,37 +602,49 @@ pub const SoftwareEcdsaP256SigningKey = struct {
         var local_scalar: [EcdsaP256Sha256.SecretKey.encoded_length]u8 = undefined;
         defer crypto.secureZero(u8, &local_scalar);
         @memcpy(&local_scalar, scalar);
-        const secret_key = try validatedSecretKey(local_scalar);
-        return fromSecretKey(secret_key);
+        var secret_key = try validatedSecretKey(local_scalar);
+        defer crypto.secureZero(u8, &secret_key.bytes);
+        return deriveValidatedSecretKey(&secret_key);
     }
 
     /// Load a raw scalar from typed secret storage, consuming and clearing the
     /// source container before key derivation.
     pub fn fromScalarSecret(scalar: *secrets.FixedSecret(EcdsaP256Sha256.SecretKey.encoded_length)) provider.SignError!SoftwareEcdsaP256SigningKey {
+        defer scalar.deinit();
         if (scalar.len != EcdsaP256Sha256.SecretKey.encoded_length) return error.InvalidInput;
         var bridge: [EcdsaP256Sha256.SecretKey.encoded_length]u8 = undefined;
         defer crypto.secureZero(u8, &bridge);
         @memcpy(&bridge, scalar.slice());
-        scalar.deinit();
-        const secret_key = try validatedSecretKey(bridge);
-        return fromSecretKey(secret_key);
+        var secret_key = try validatedSecretKey(bridge);
+        defer crypto.secureZero(u8, &secret_key.bytes);
+        return deriveValidatedSecretKey(&secret_key);
     }
 
     /// Load from an already-parsed P-256 private scalar (the caller has
     /// already validated its PKCS#8/SEC1 encoding and extracted the raw
     /// 32-byte scalar; this type only owns the derived key pair).
     pub fn fromSecretKey(secret_key: EcdsaP256Sha256.SecretKey) provider.SignError!SoftwareEcdsaP256SigningKey {
-        _ = try validatedSecretKey(secret_key.bytes);
-        const key_pair = EcdsaP256Sha256.KeyPair.fromSecretKey(secret_key) catch return error.ProviderFailure;
+        var local_secret_key = secret_key;
+        defer crypto.secureZero(u8, &local_secret_key.bytes);
+        try validateScalarBytes(local_secret_key.bytes);
+        return deriveValidatedSecretKey(&local_secret_key);
+    }
+
+    fn deriveValidatedSecretKey(secret_key: *const EcdsaP256Sha256.SecretKey) provider.SignError!SoftwareEcdsaP256SigningKey {
+        const key_pair = EcdsaP256Sha256.KeyPair.fromSecretKey(secret_key.*) catch return error.ProviderFailure;
         return .{ .key_pair = key_pair };
     }
 
     fn validatedSecretKey(bytes: [EcdsaP256Sha256.SecretKey.encoded_length]u8) provider.SignError!EcdsaP256Sha256.SecretKey {
+        try validateScalarBytes(bytes);
+        return EcdsaP256Sha256.SecretKey.fromBytes(bytes) catch return error.InvalidInput;
+    }
+
+    fn validateScalarBytes(bytes: [EcdsaP256Sha256.SecretKey.encoded_length]u8) provider.SignError!void {
         var non_zero: u8 = 0;
         for (bytes) |byte| non_zero |= byte;
         if (non_zero == 0) return error.InvalidInput;
         _ = P256Scalar.fromBytes(bytes, .big) catch return error.InvalidInput;
-        return EcdsaP256Sha256.SecretKey.fromBytes(bytes) catch return error.InvalidInput;
     }
 
     /// Securely erase the private key material. Callers must invoke this when
@@ -631,6 +652,15 @@ pub const SoftwareEcdsaP256SigningKey = struct {
     /// scrub its bytes.
     pub fn deinit(self: *SoftwareEcdsaP256SigningKey) void {
         crypto.secureZero(u8, &self.key_pair.secret_key.bytes);
+    }
+
+    pub fn format(
+        _: SoftwareEcdsaP256SigningKey,
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        _: anytype,
+    ) !void {
+        @compileError("signing keys must not be formatted or logged");
     }
 
     /// Raw SEC1 uncompressed public key, for pinning or diagnostics.
@@ -1050,14 +1080,19 @@ fn readDerInteger32(der: []const u8, pos: *usize) ![32]u8 {
 }
 
 fn expectCanonicalEcdsaDer(der: []const u8) !void {
+    _ = try parseDerSignatureScalars(der);
+}
+
+fn parseDerSignatureScalars(der: []const u8) !struct { r: [32]u8, s: [32]u8 } {
     var pos: usize = 0;
     if (der.len == 0 or der[pos] != 0x30) return error.InvalidDer;
     pos += 1;
     const seq_len = try readDerLen(der, &pos);
     if (seq_len != der.len - pos) return error.InvalidDer;
-    _ = try readDerInteger32(der, &pos);
-    _ = try readDerInteger32(der, &pos);
+    const r = try readDerInteger32(der, &pos);
+    const s = try readDerInteger32(der, &pos);
     if (pos != der.len) return error.InvalidDer;
+    return .{ .r = r, .s = s };
 }
 
 test "SoftwareEcdsaP256SigningKey uses injected entropy and emits canonical DER" {
@@ -1088,6 +1123,20 @@ test "SoftwareEcdsaP256SigningKey uses injected entropy and emits canonical DER"
     try expectCanonicalEcdsaDer(sig_b[0..len_b]);
     try cp.verify(.ecdsa_secp256r1_sha256, &public_key, message, sig_a1[0..len_a1]);
     try cp.verify(.ecdsa_secp256r1_sha256, &public_key, message, sig_b[0..len_b]);
+
+    const scalars = try parseDerSignatureScalars(sig_a1[0..len_a1]);
+    const s_scalar = try P256Scalar.fromBytes(scalars.s, .big);
+    const alternate_s = s_scalar.neg().toBytes(.big);
+    try testing.expect(!std.mem.eql(u8, &scalars.s, &alternate_s));
+    var alternate_raw: [EcdsaP256Sha256.Signature.encoded_length]u8 = undefined;
+    @memcpy(alternate_raw[0..32], &scalars.r);
+    @memcpy(alternate_raw[32..64], &alternate_s);
+    const alternate_signature = EcdsaP256Sha256.Signature.fromBytes(alternate_raw);
+    var alternate_der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    defer crypto.secureZero(u8, &alternate_der_buf);
+    const alternate_der = alternate_signature.toDer(&alternate_der_buf);
+    try expectCanonicalEcdsaDer(alternate_der);
+    try cp.verify(.ecdsa_secp256r1_sha256, &public_key, message, alternate_der);
 }
 
 test "SoftwareEcdsaP256SigningKey rejects small output before entropy and leaves output unchanged on entropy failure" {
@@ -1137,6 +1186,9 @@ test "SoftwareEcdsaP256SigningKey rejects small output before entropy and leaves
 }
 
 test "SoftwareEcdsaP256SigningKey rejects invalid scalar inputs and clears typed sources" {
+    try testing.expect(@hasDecl(SoftwareSigningKey, "format"));
+    try testing.expect(@hasDecl(SoftwareEcdsaP256SigningKey, "format"));
+
     try testing.expectError(error.InvalidInput, SoftwareEcdsaP256SigningKey.fromScalarBytes(&.{0x01}));
     try testing.expectError(error.InvalidInput, SoftwareEcdsaP256SigningKey.fromScalarBytes(&([_]u8{0} ** 32)));
     try testing.expectError(error.InvalidInput, SoftwareEcdsaP256SigningKey.fromScalarBytes(&([_]u8{0xff} ** 32)));
@@ -1152,6 +1204,16 @@ test "SoftwareEcdsaP256SigningKey rejects invalid scalar inputs and clears typed
     for (scalar_secret.bytes) |byte| try testing.expectEqual(@as(u8, 0), byte);
     key.deinit();
     try testing.expect(std.mem.allEqual(u8, &key.key_pair.secret_key.bytes, 0));
+
+    var short_scalar_secret = try secrets.FixedSecret(32).init(&[_]u8{0x01});
+    try testing.expectError(error.InvalidInput, SoftwareEcdsaP256SigningKey.fromScalarSecret(&short_scalar_secret));
+    try testing.expectEqual(@as(usize, 0), short_scalar_secret.len);
+    for (short_scalar_secret.bytes) |byte| try testing.expectEqual(@as(u8, 0), byte);
+
+    var short_seed_secret = try secrets.FixedSecret(EcdsaP256Sha256.KeyPair.seed_length).init(&[_]u8{0x02});
+    try testing.expectError(error.InvalidInput, SoftwareEcdsaP256SigningKey.fromSeedSecret(&short_seed_secret));
+    try testing.expectEqual(@as(usize, 0), short_seed_secret.len);
+    for (short_seed_secret.bytes) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "fromSeedSecret clears the caller's typed secret immediately and derives the same key as fromSeed" {

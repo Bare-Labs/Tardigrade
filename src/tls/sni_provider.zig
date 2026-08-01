@@ -10,7 +10,6 @@ const std = @import("std");
 const std_crypto = std.crypto;
 const crypto_pkg = @import("crypto");
 const crypto_provider = crypto_pkg.provider;
-const pure_zig = crypto_pkg.pure_zig;
 const credentials = @import("credentials.zig");
 const dns_name = @import("dns_name.zig");
 
@@ -736,11 +735,6 @@ fn tlsToProviderScheme(scheme: credentials.SignatureScheme) ?crypto_provider.Sig
 }
 
 const testing = std.testing;
-var test_identity_entropy = pure_zig.DeterministicEntropy.init(0x347);
-
-fn testIdentityEntropy() crypto_provider.Entropy {
-    return test_identity_entropy.entropy();
-}
 
 const p256_test_certificate_pem =
     \\-----BEGIN CERTIFICATE-----
@@ -772,7 +766,7 @@ fn identityConfig(patterns: []const []const u8, default: bool) CredentialBundleC
     return .{
         .chain = &.{credentials.testdata.certificate_der},
         .patterns = patterns,
-        .signer = SignAdapter.fromIdentity(credentials.testdata.identity(), testIdentityEntropy()),
+        .signer = SignAdapter.fromIdentity(credentials.testdata.identity(), credentials.testdata.ignoredEntropy()),
         .key_kind = .ed25519,
         .is_default = default,
     };
@@ -976,7 +970,7 @@ test "snapshot owns chain and pattern copies after caller mutation" {
     const config = CredentialBundleConfig{
         .chain = chain_entries[0..],
         .patterns = &.{pattern},
-        .signer = SignAdapter.fromIdentity(credentials.testdata.identity(), testIdentityEntropy()),
+        .signer = SignAdapter.fromIdentity(credentials.testdata.identity(), credentials.testdata.ignoredEntropy()),
         .key_kind = .ed25519,
         .is_default = true,
     };
@@ -1212,7 +1206,7 @@ fn sniIdentityConfigForFuzz(patterns: []const []const u8, chain: []const []const
     return .{
         .chain = chain,
         .patterns = patterns,
-        .signer = SignAdapter.fromIdentity(credentials.testdata.identity(), testIdentityEntropy()),
+        .signer = SignAdapter.fromIdentity(credentials.testdata.identity(), credentials.testdata.ignoredEntropy()),
         .key_kind = .ed25519,
         .is_default = default,
     };

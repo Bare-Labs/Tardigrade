@@ -1581,11 +1581,6 @@ fn openUdpSocket(sa_family: u32) std.c.fd_t {
 }
 
 const testing = std.testing;
-var fixed_credential_entropy = crypto_pkg.pure_zig.DeterministicEntropy.init(0x432);
-
-fn fixedCredentialEntropy() crypto_pkg.provider.Entropy {
-    return fixed_credential_entropy.entropy();
-}
 
 const RuntimeCidHarness = struct {
     client_backend: quic.tls_backend.Tls13Backend,
@@ -1761,7 +1756,7 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
 }
 
 test "http3 runtime: spare CID route is registered before NEW_CONNECTION_ID is pollable" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-cid-route-order-test");
     var runtime = try Runtime.init(testing.allocator, &logger, .{
@@ -1794,7 +1789,7 @@ test "http3 runtime: spare CID route is registered before NEW_CONNECTION_ID is p
 }
 
 test "http3 runtime: CID route collision rolls back without stealing an existing route" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
     defer harness.deinit(testing.allocator);
@@ -1818,7 +1813,7 @@ test "http3 runtime: CID route collision rolls back without stealing an existing
 }
 
 test "http3 runtime: retired CIDs stop routing, replenish, and teardown removes every route" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-cid-teardown-test");
     var runtime = try Runtime.init(testing.allocator, &logger, .{
@@ -1908,7 +1903,7 @@ test "quicEarlyDataTransportCompatible (#523): rejects any reduced limit in the 
 }
 
 test "h3EarlyDataCompatibility (#523): rejects a remembered snapshot with the wrong format_version before decoding" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-transport-version-test");
     var runtime = try Runtime.init(testing.allocator, &logger, .{
@@ -1932,7 +1927,7 @@ test "h3EarlyDataCompatibility (#523): rejects a remembered snapshot with the wr
 }
 
 test "h3EarlyDataCompatibility (#523): rejects a live QUIC transport limit reduced below the remembered snapshot" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-transport-reduced-test");
     var runtime = try Runtime.init(testing.allocator, &logger, .{
@@ -2075,7 +2070,7 @@ test "drainBoundaryAfter permits admitted client-bidi streams" {
 }
 
 test "http3 runtime (#546): a request stream rejected by Conn.pump() at local_goaway_id folds into Snapshot.h3_drain_request_rejections" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-goaway-admission-fold-test");
     var runtime = try Runtime.init(testing.allocator, &logger, .{
@@ -2392,7 +2387,7 @@ test "runtime borrows the credential provider and owns no key material" {
         }
     }
 
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-test");
 
@@ -2433,7 +2428,7 @@ fn fixedNowUnixMsForTest(_: *anyopaque) i64 {
 }
 
 test "runtime borrows the resumption runtime and installs it per accepted connection" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-resumption-test");
 
@@ -2459,7 +2454,7 @@ test "runtime borrows the resumption runtime and installs it per accepted connec
 }
 
 test "runtime borrows the early-data replay gate independently of the resumption runtime" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-replay-gate-test");
 
@@ -2484,7 +2479,7 @@ test "runtime borrows the early-data replay gate independently of the resumption
 }
 
 test "runtime (#523): enable_0rtt enables the carrier only with complete composition, fails closed otherwise" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-0rtt-composition-test");
 
@@ -2544,7 +2539,7 @@ test "runtime (#523): enable_0rtt enables the carrier only with complete composi
 }
 
 test "runtime (#523): a present-but-unusable resumption runtime or replay gate still fails closed" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-0rtt-usability-test");
 
@@ -2616,7 +2611,7 @@ test "runtime (#523): a present-but-unusable resumption runtime or replay gate s
 
 test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT capability only when the carrier is enabled" {
     const allocator = testing.allocator;
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-ticket-issuance-test");
 
@@ -2891,7 +2886,7 @@ fn testEarlyDataAwareHandler(
 
 test "http3 (#523): a replay-safe early request reaches the local handler exactly once; an unsafe one is rejected without dispatch; ordinary post-handshake requests still work" {
     const allocator = testing.allocator;
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-early-request-matrix-test");
 
@@ -3396,7 +3391,7 @@ fn h3EarlyDataRejectionReduceTransportLimit(runtime: *Runtime) void {
 /// actually reach metrics in production, not a synthetic stand-in.
 fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejectionScenario) !void {
     const allocator = testing.allocator;
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-early-request-rejection-matrix-test");
 
@@ -3875,7 +3870,7 @@ test "http3 (#523): application-incompatible (H3 SETTINGS) 0-RTT rejected by the
 }
 
 test "accept() (#523): wires an EventSink into every accepted connection so 0-RTT events reach metrics instead of being silently discarded" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-event-wiring-test");
 
@@ -3964,7 +3959,7 @@ fn testPeerSockaddr(port: u16) std.c.sockaddr.in {
 }
 
 test "http3 runtime Retry sends tokenless Initials without allocating connection state" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-retry-tokenless-test");
     var runtime = try Runtime.init(testing.allocator, &logger, .{
@@ -4006,7 +4001,7 @@ test "http3 runtime Retry sends tokenless Initials without allocating connection
 }
 
 test "http3 runtime Retry drops invalid tokens without sending a second Retry" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-retry-invalid-token-test");
     var runtime = try Runtime.init(testing.allocator, &logger, .{
@@ -4045,7 +4040,7 @@ test "http3 runtime Retry drops invalid tokens without sending a second Retry" {
 }
 
 test "http3 runtime Retry accepts validated tokens with split CID roles and validated path" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-retry-valid-token-test");
     var runtime = try Runtime.init(testing.allocator, &logger, .{
@@ -4106,7 +4101,7 @@ test "http3 runtime Retry accepts validated tokens with split CID roles and vali
 }
 
 test "http3 runtime Retry rejects valid tokens replayed with the wrong Retry SCID" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-retry-wrong-scid-test");
     var runtime = try Runtime.init(testing.allocator, &logger, .{
@@ -4161,7 +4156,7 @@ test "http3 runtime Retry rejects valid tokens replayed with the wrong Retry SCI
 }
 
 test "http3 runtime Retry counts valid tokens replayed with the wrong QUIC version as invalid" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-retry-wrong-version-test");
     var runtime = try Runtime.init(testing.allocator, &logger, .{
@@ -4215,7 +4210,7 @@ test "http3 runtime Retry counts valid tokens replayed with the wrong QUIC versi
 }
 
 test "runtime resolves the actual bound local address, including an OS-assigned port, from quic_port = 0" {
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), fixedCredentialEntropy());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-port0-test");
 
