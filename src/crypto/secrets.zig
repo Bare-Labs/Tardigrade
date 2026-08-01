@@ -17,6 +17,25 @@ pub fn constantTimeEqual(a: []const u8, b: []const u8) bool {
     return std.crypto.timing_safe.compare(u8, a, b, .big) == .eq;
 }
 
+/// Wipes a secret-bearing heap allocation and returns it to `allocator`,
+/// guaranteeing the bytes the backing allocator observes are zero rather
+/// than whatever `std.mem.Allocator.free` would otherwise leave behind.
+///
+/// `Allocator.free` runs `@memset(bytes, undefined)` before dispatching to
+/// the backing implementation. In safety builds that fills the buffer with a
+/// poison pattern *after* any zeroing we've already done, which trips
+/// allocator-level "was this zeroized before free" assertions; in
+/// ReleaseFast, "undefined" carries no required bit pattern so the compiler
+/// is free to emit no write at all, meaning the plain `free()` path is not
+/// actually guaranteed to scrub secrets in a production build. Bypassing the
+/// wrapper and calling `rawFree` directly ensures the zeroed bytes are what
+/// the allocator (and anything that reuses the memory next) actually sees.
+pub fn secureZeroAndFree(allocator: std.mem.Allocator, buffer: []u8) void {
+    if (buffer.len == 0) return;
+    secureZero(buffer);
+    allocator.rawFree(buffer, .fromByteUnits(@alignOf(u8)), @returnAddress());
+}
+
 pub fn FixedSecret(comptime capacity: usize) type {
     return struct {
         bytes: [capacity]u8 = [_]u8{0} ** capacity,
@@ -238,6 +257,26 @@ test "bounded secret replace handles self-overlapping input" {
     try secret.replace(secret.slice()[1..4]);
     try testing.expectEqualStrings("bcd", secret.slice());
     try testing.expectEqual(@as(u8, 0), secret.bytes[3]);
+}
+
+test "secureZeroAndFree hands the allocator zeroed bytes, not Allocator.free's undefined-poison" {
+    var backing = [_]u8{0xcc} ** 64;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const buf = try fba.allocator().alloc(u8, 16);
+    @memset(buf, 0xab);
+
+    secureZeroAndFree(fba.allocator(), buf);
+
+    // A plain `allocator.free(buf)` would have run `@memset(buf, undefined)`
+    // first in safety builds, leaving poison bytes rather than zeros.
+    try testing.expect(std.mem.indexOfScalar(u8, &backing, 0xab) == null);
+    for (backing[0..16]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "secureZeroAndFree tolerates an empty buffer" {
+    var backing = [_]u8{0xcc} ** 8;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    secureZeroAndFree(fba.allocator(), &.{});
 }
 
 test "secret helpers expose non-formatting APIs" {

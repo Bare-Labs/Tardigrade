@@ -265,7 +265,7 @@ const file_checks_with_exceptions = [_]FileCheckWithExceptions{
         // anywhere else in the file would pass (#490 fifth-pass review).
         .forbidden = &(full_forbidden ++ [_][]const u8{"HmacSha256."}),
         .exempt_exact = &.{"const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;"},
-        .exempt_functions = &.{"statelessResetToken"},
+        .exempt_functions = &.{"statelessResetTokenInto"},
         .rationale = "Connection-ID/stateless-reset-token derivation (RFC 9000 §10.3.1) is a documented HMAC-SHA256 exception under a static process-lifetime key (docs/CRYPTO_PROVIDER_AUDIT.md), not TLS/QUIC-negotiated packet protection; no AEAD, ECDH, signature, KDF, or AES header-protection shortcuts, and no other HmacSha256 use, may be added here.",
     },
     .{

@@ -206,6 +206,25 @@ const ConnEntry = struct {
     }
 };
 
+/// The Retry token key ring and the process stateless-reset key are the
+/// only long-lived secrets `Runtime` owns. Grouping them here makes their
+/// lifecycle (installed at `init`, wiped on teardown or a later init
+/// failure) independently testable via `deinit` — including calling the
+/// exact cleanup the production owner uses — without fighting
+/// `Runtime.deinit`'s own trailing `self.* = undefined`, which
+/// safety-checked builds use to poison-fill the *entire* enclosing struct
+/// and would otherwise make any post-deinit byte-level assertion on these
+/// fields meaningless.
+const RuntimeSecrets = struct {
+    retry_tokens: quic.path.RetryTokens = .{},
+    stateless_reset_key: [32]u8 = [_]u8{0} ** 32,
+
+    fn deinit(self: *RuntimeSecrets) void {
+        self.retry_tokens.keys.deinit();
+        crypto_pkg.secrets.secureZero(&self.stateless_reset_key);
+    }
+};
+
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
     socket_fd: std.c.fd_t,
@@ -228,8 +247,7 @@ pub const Runtime = struct {
     /// early-data policy on new connections' TLS backends.
     zero_rtt_enabled: bool,
     retry_policy: quic.config.RetryPolicy,
-    retry_tokens: quic.path.RetryTokens,
-    stateless_reset_key: [32]u8,
+    secrets: RuntimeSecrets,
     quic_config: quic.config.Config,
     h3_settings: http3.frame.Settings,
     h3_application_compat: [http3.early_data.encoded_snapshot_len]u8 = undefined,
@@ -302,8 +320,7 @@ pub const Runtime = struct {
             .early_data_replay_gate = cfg.early_data_replay_gate,
             .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
             .retry_policy = cfg.retry_policy,
-            .retry_tokens = .{},
-            .stateless_reset_key = undefined,
+            .secrets = .{},
             .quic_config = quicConfigFrom(cfg),
             .h3_settings = cfg.h3_settings,
             .early_data_compat_metrics_ctx = cfg.early_data_compat_metrics_ctx,
@@ -321,8 +338,10 @@ pub const Runtime = struct {
         runtime.crypto_provider_state = tls_core.production_crypto.Provider.init(runtime.crypto_provider_entropy.entropy());
         var retry_key: [quic.path.token_key_len]u8 = undefined;
         compat.randomBytes(&retry_key);
-        runtime.retry_tokens.keys.install(0, retry_key);
-        compat.randomBytes(&runtime.stateless_reset_key);
+        runtime.secrets.retry_tokens.keys.install(0, &retry_key);
+        crypto_pkg.secrets.secureZero(&retry_key);
+        compat.randomBytes(&runtime.secrets.stateless_reset_key);
+        errdefer runtime.secrets.deinit();
         http3.frame.validateLocallySupportedSettings(runtime.h3_settings) catch return error.InvalidH3Settings;
         runtime.h3_application_compat_len = (http3.early_data.encodeSettingsSnapshot(
             runtime.h3_settings,
@@ -354,6 +373,7 @@ pub const Runtime = struct {
         self.stopping.store(true, .release);
         if (self.thread) |thread| thread.join();
         _ = std.c.close(self.socket_fd);
+        self.secrets.deinit();
         self.* = undefined;
     }
 
@@ -674,7 +694,7 @@ pub const Runtime = struct {
             .now_us = now,
             .initial_path = .{ .local = self.local_address, .remote = addressFromSockaddrIn(peer) },
             .initial_address_validated = retry_context != null,
-            .stateless_reset_key = self.stateless_reset_key,
+            .stateless_reset_key = &self.secrets.stateless_reset_key,
             .events = .{ .context = self, .emitFn = quicConnectionEvent },
         }) catch {
             allocator.destroy(backend);
@@ -752,7 +772,7 @@ pub const Runtime = struct {
             self.issueRetry(routes, parsed, peer, remote, now);
             return .drop;
         }
-        const ctx = self.retry_tokens.validateRetry(parsed.token, remote, now) catch {
+        const ctx = self.secrets.retry_tokens.validateRetry(parsed.token, remote, now) catch {
             self.noteInvalidToken();
             return .drop;
         };
@@ -775,7 +795,7 @@ pub const Runtime = struct {
         var nonce: [quic.path.token_nonce_len]u8 = undefined;
         compat.randomBytes(&nonce);
         var token_buf: [quic.path.max_token_len]u8 = undefined;
-        const token = self.retry_tokens.issueRetry(parsed.dcid, retry_scid.slice(), parsed.version, remote, now, nonce, &token_buf) catch return;
+        const token = self.secrets.retry_tokens.issueRetry(parsed.dcid, retry_scid.slice(), parsed.version, remote, now, nonce, &token_buf) catch return;
         var retry_buf: [512]u8 = undefined;
         const retry = quic.packet.writeRetryV1(parsed.dcid, parsed.scid, retry_scid.slice(), token, &retry_buf) catch return;
         self.sendDatagram(peer, retry);
@@ -1658,7 +1678,7 @@ const RuntimeCidHarness = struct {
             .crypto_provider = test_quic_crypto.testDefaultProvider(),
             .now_us = self.now_us,
             .initial_path = server_path,
-            .stateless_reset_key = [_]u8{0x44} ** 32,
+            .stateless_reset_key = &([_]u8{0x44} ** 32),
         });
         entry.* = .{
             .backend = server_backend,
@@ -2043,6 +2063,47 @@ test "runtime init rejects unsupported local H3 setting h3_datagram" {
 
 test "runtime init rejects unsupported local H3 setting max_field_section_size" {
     try expectInvalidH3SettingsAtRuntimeInit(.{ .max_field_section_size = 1024 });
+}
+
+test "RuntimeSecrets.deinit wipes the retry token key ring and the stateless reset key" {
+    var logger = logger_mod.Logger.init(.err, "http3-runtime-deinit-wipe-test");
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    });
+    // Exercise `RuntimeSecrets.deinit()` directly — the exact cleanup
+    // `Runtime.deinit()` delegates to via `self.secrets.deinit()` — rather
+    // than the full `Runtime.deinit()`, whose trailing `self.* = undefined`
+    // poison-fills the *whole* struct in safety-checked builds. That would
+    // overwrite these zeroed bytes with poison before any post-deinit byte
+    // check ran, making the wipe unobservable regardless of whether it
+    // happened. `RuntimeSecrets` has no such trailing assignment, so its
+    // fields stay genuinely inspectable after `deinit()`. Close the socket
+    // by hand since we're bypassing `Runtime.deinit()`.
+    defer _ = std.c.close(runtime.socket_fd);
+
+    // Capture raw pointers into the still-installed key storage before the
+    // wipe: asserting only that lookups fail afterward would also pass an
+    // implementation that never touched the key bytes, only an occupancy
+    // flag/length.
+    const key0_ptr: *const [quic.path.token_key_len]u8 = &runtime.secrets.retry_tokens.keys.keys[0].bytes;
+    const reset_key_ptr = &runtime.secrets.stateless_reset_key;
+
+    var saw_key_nonzero = false;
+    for (key0_ptr) |b| {
+        if (b != 0) saw_key_nonzero = true;
+    }
+    try testing.expect(saw_key_nonzero);
+    var saw_reset_nonzero = false;
+    for (reset_key_ptr) |b| {
+        if (b != 0) saw_reset_nonzero = true;
+    }
+    try testing.expect(saw_reset_nonzero);
+
+    runtime.secrets.deinit();
+
+    for (key0_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    for (reset_key_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "admissionAllowed enforces global and per-source caps at the boundary" {
@@ -4065,7 +4126,7 @@ test "http3 runtime Retry accepts validated tokens with split CID roles and vali
     const client_scid = [_]u8{0x22} ** 8;
     const peer = testPeerSockaddr(44_332);
     var token_buf: [quic.path.max_token_len]u8 = undefined;
-    const token = try runtime.retry_tokens.issueRetry(
+    const token = try runtime.secrets.retry_tokens.issueRetry(
         &odcid,
         &retry_scid,
         quic.packet.quic_v1,
@@ -4127,7 +4188,7 @@ test "http3 runtime Retry rejects valid tokens replayed with the wrong Retry SCI
     const client_scid = [_]u8{0x22} ** 8;
     const peer = testPeerSockaddr(44_333);
     var token_buf: [quic.path.max_token_len]u8 = undefined;
-    const token = try runtime.retry_tokens.issueRetry(
+    const token = try runtime.secrets.retry_tokens.issueRetry(
         &odcid,
         &retry_scid,
         quic.packet.quic_v1,
@@ -4181,7 +4242,7 @@ test "http3 runtime Retry counts valid tokens replayed with the wrong QUIC versi
     const client_scid = [_]u8{0x22} ** 8;
     const peer = testPeerSockaddr(44_334);
     var token_buf: [quic.path.max_token_len]u8 = undefined;
-    const token = try runtime.retry_tokens.issueRetry(
+    const token = try runtime.secrets.retry_tokens.issueRetry(
         &odcid,
         &retry_scid,
         quic.packet.quic_v1,

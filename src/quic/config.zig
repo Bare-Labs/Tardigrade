@@ -6,6 +6,7 @@
 //! defaults until benchmarks or interop require public knobs.
 
 const std = @import("std");
+const secrets = @import("crypto_secrets");
 
 pub const QuicVersion = enum(u32) {
     v1 = 0x00000001,
@@ -176,6 +177,13 @@ pub const CidBinding = struct {
     retry_source_connection_id: ?CidValue = null,
     /// Server only.
     stateless_reset_token: ?[16]u8 = null,
+
+    /// Wipes the only secret-bearing field before this binding (a local, a
+    /// retained backend copy, or a peer-supplied copy) is discarded.
+    pub fn deinit(self: *CidBinding) void {
+        if (self.stateless_reset_token) |*token| secrets.secureZero(token);
+        self.stateless_reset_token = null;
+    }
 };
 
 test "default QUIC config maps to conservative transport parameters" {

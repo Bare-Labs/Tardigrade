@@ -460,7 +460,7 @@ pub fn encodePathResponse(data: [path_data_len]u8, buf: []u8) EncodeError!usize 
 /// Encode a NEW_CONNECTION_ID frame (type 0x18, RFC 9000 §19.15): sequence,
 /// retire_prior_to, a length-prefixed CID (single byte, not a varint), and
 /// the 16-byte stateless reset token.
-pub fn encodeNewConnectionId(value: cid.NewConnectionIdFrame, buf: []u8) EncodeError!usize {
+pub fn encodeNewConnectionId(value: *const cid.NewConnectionIdFrame, buf: []u8) EncodeError!usize {
     var w = FrameWriter{ .buf = buf };
     try w.int(frame_new_connection_id);
     try w.int(value.sequence);
@@ -655,7 +655,7 @@ test "encodeNewConnectionId round-trips through decodeFrame" {
         .cid = try cid.ConnectionId.init(&[_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 }),
         .stateless_reset_token = [_]u8{0xee} ** cid.stateless_reset_token_len,
     };
-    const len = try encodeNewConnectionId(value, &buf);
+    const len = try encodeNewConnectionId(&value, &buf);
     const decoded = try roundtripOne(buf[0..len]);
     const ncid = decoded.new_connection_id.frame;
     try testing.expectEqual(@as(u64, 3), ncid.sequence);
@@ -672,7 +672,7 @@ test "encodeNewConnectionId fails deterministically on a too-short buffer" {
         .stateless_reset_token = [_]u8{0} ** cid.stateless_reset_token_len,
     };
     var tiny: [4]u8 = undefined;
-    try testing.expectError(error.BufferTooShort, encodeNewConnectionId(value, &tiny));
+    try testing.expectError(error.BufferTooShort, encodeNewConnectionId(&value, &tiny));
 }
 
 test "NEW_CONNECTION_ID with retire_prior_to above sequence is malformed" {
@@ -952,7 +952,7 @@ fn fuzzCanonicalFrameRoundTrip(_: void, smith: *testing.Smith) !void {
                 .cid = try cid.ConnectionId.init(&cid_bytes),
                 .stateless_reset_token = [_]u8{smith.value(u8)} ** cid.stateless_reset_token_len,
             };
-            const frame = try roundtripOne(buf[0..try encodeNewConnectionId(value, &buf)]);
+            const frame = try roundtripOne(buf[0..try encodeNewConnectionId(&value, &buf)]);
             const decoded = frame.new_connection_id.frame;
             try testing.expectEqual(value.sequence, decoded.sequence);
             try testing.expectEqual(value.retire_prior_to, decoded.retire_prior_to);

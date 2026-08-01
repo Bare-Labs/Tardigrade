@@ -655,7 +655,7 @@ test "udp smoke: HTTP/3 runtime Retry rejects invalid token matrix without alloc
     const wrong_retry_scid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
     const client_scid = [_]u8{ 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8 };
     var token_buf: [quic.path.max_token_len]u8 = undefined;
-    const fresh_token = try runtime.retry_tokens.issueRetry(
+    const fresh_token = try runtime.secrets.retry_tokens.issueRetry(
         &odcid,
         &retry_scid,
         quic.packet.quic_v1,
@@ -670,7 +670,7 @@ test "udp smoke: HTTP/3 runtime Retry rejects invalid token matrix without alloc
     tampered_storage[fresh_token.len - 1] ^= 0x01;
 
     var expired_buf: [quic.path.max_token_len]u8 = undefined;
-    const expired_token = try runtime.retry_tokens.issueRetry(
+    const expired_token = try runtime.secrets.retry_tokens.issueRetry(
         &odcid,
         &retry_scid,
         quic.packet.quic_v1,

@@ -20,6 +20,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const udp = @import("udp.zig");
+const secrets = @import("crypto_secrets");
 
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 
@@ -128,22 +129,37 @@ pub const TokenError = error{
 /// Installing a key makes it current; older keys remain valid for verification
 /// until explicitly retired, so tokens issued before a rotation still validate.
 pub const RetryTokenKeyRing = struct {
-    keys: [max_token_keys]?[token_key_len]u8 = .{null} ** max_token_keys,
+    /// `FixedSecret` keeps each slot's byte storage live for the ring's
+    /// entire lifetime — installed/retired is tracked by `.len` (0 vs
+    /// `token_key_len`), never by wrapping the array in an outer
+    /// `?[N]u8`. An optional wrapper would make the payload logically
+    /// inactive the moment a key is retired, and safety-checked builds are
+    /// free to poison-fill an inactive optional payload — observably so on
+    /// Linux x64 — which would make it impossible to assert the bytes were
+    /// actually zeroed rather than merely tagged absent.
+    keys: [max_token_keys]secrets.FixedSecret(token_key_len) = [_]secrets.FixedSecret(token_key_len){secrets.FixedSecret(token_key_len){}} ** max_token_keys,
     current: u8 = 0,
 
-    pub fn install(self: *RetryTokenKeyRing, key_id: u8, key: [token_key_len]u8) void {
+    pub fn install(self: *RetryTokenKeyRing, key_id: u8, key: *const [token_key_len]u8) void {
         std.debug.assert(key_id < max_token_keys);
-        self.keys[key_id] = key;
+        self.keys[key_id].replace(key) catch unreachable;
         self.current = key_id;
     }
 
     pub fn retire(self: *RetryTokenKeyRing, key_id: u8) void {
-        if (key_id < max_token_keys) self.keys[key_id] = null;
+        if (key_id >= max_token_keys) return;
+        self.keys[key_id].deinit();
     }
 
-    fn get(self: *const RetryTokenKeyRing, key_id: u8) ?[token_key_len]u8 {
+    pub fn deinit(self: *RetryTokenKeyRing) void {
+        for (&self.keys) |*slot| slot.deinit();
+        self.current = 0;
+    }
+
+    fn get(self: *const RetryTokenKeyRing, key_id: u8) ?*const [token_key_len]u8 {
         if (key_id >= max_token_keys) return null;
-        return self.keys[key_id];
+        if (self.keys[key_id].len == 0) return null;
+        return &self.keys[key_id].bytes;
     }
 };
 
@@ -196,7 +212,7 @@ pub const RetryTokens = struct {
         @memcpy(out[1..][0..token_nonce_len], &nonce);
         const cipher = out[1 + token_nonce_len ..][0..plaintext_len];
         var tag: [token_tag_len]u8 = undefined;
-        Aes128Gcm.encrypt(cipher, &tag, plaintext[0..plaintext_len], &.{}, nonce, key);
+        Aes128Gcm.encrypt(cipher, &tag, plaintext[0..plaintext_len], &.{}, nonce, key.*);
         @memcpy(out[1 + token_nonce_len + plaintext_len ..][0..token_tag_len], &tag);
         return out[0..total];
     }
@@ -217,7 +233,7 @@ pub const RetryTokens = struct {
         @memcpy(&tag, token[1 + token_nonce_len + plaintext_len ..][0..token_tag_len]);
 
         var plaintext: [token_max_plaintext_len]u8 = undefined;
-        Aes128Gcm.decrypt(plaintext[0..plaintext_len], cipher, tag, &.{}, nonce, key) catch return error.TokenAuthenticationFailed;
+        Aes128Gcm.decrypt(plaintext[0..plaintext_len], cipher, tag, &.{}, nonce, key.*) catch return error.TokenAuthenticationFailed;
 
         const decoded = decodeTokenPlaintext(plaintext[0..plaintext_len]) catch return error.MalformedToken;
         if (decoded.kind != .retry) return error.UnexpectedTokenKind;
@@ -1004,7 +1020,7 @@ const test_version: u32 = 0x0000_0001;
 
 test "retry token round-trips and recovers the original DCID, Retry SCID, and version" {
     var tokens = RetryTokens{ .lifetime_us = 10_000_000 };
-    tokens.keys.install(0, [_]u8{0xa5} ** token_key_len);
+    tokens.keys.install(0, &([_]u8{0xa5} ** token_key_len));
 
     var buf: [max_token_len]u8 = undefined;
     const token = try tokens.issueRetry(&test_odcid, &test_retry_scid, test_version, loopbackV4(4433), 1_000_000, [_]u8{0x11} ** token_nonce_len, &buf);
@@ -1021,7 +1037,7 @@ test "retry token round-trips and recovers the original DCID, Retry SCID, and ve
 
 test "retry token binds scoped IPv6 addresses including the scope id" {
     var tokens = RetryTokens{ .lifetime_us = 10_000_000 };
-    tokens.keys.install(0, [_]u8{0xa5} ** token_key_len);
+    tokens.keys.install(0, &([_]u8{0xa5} ** token_key_len));
 
     const scoped = udp.Address.ip6([_]u8{0xfe} ++ [_]u8{0x80} ++ [_]u8{0} ** 13 ++ [_]u8{0x01}, 4433, 7);
     var buf: [max_token_len]u8 = undefined;
@@ -1035,7 +1051,7 @@ test "retry token binds scoped IPv6 addresses including the scope id" {
 
 test "retry token expires after its lifetime" {
     var tokens = RetryTokens{ .lifetime_us = 5_000_000 };
-    tokens.keys.install(1, [_]u8{0x5a} ** token_key_len);
+    tokens.keys.install(1, &([_]u8{0x5a} ** token_key_len));
 
     var buf: [max_token_len]u8 = undefined;
     const token = try tokens.issueRetry(&test_odcid, &test_retry_scid, test_version, loopbackV4(443), 2_000_000, [_]u8{0x22} ** token_nonce_len, &buf);
@@ -1046,7 +1062,7 @@ test "retry token expires after its lifetime" {
 
 test "retry token dated in the future is rejected" {
     var tokens = RetryTokens{ .lifetime_us = 5_000_000, .allowed_clock_skew_us = 1_000 };
-    tokens.keys.install(0, [_]u8{0x7a} ** token_key_len);
+    tokens.keys.install(0, &([_]u8{0x7a} ** token_key_len));
 
     var buf: [max_token_len]u8 = undefined;
     const token = try tokens.issueRetry(&test_odcid, &test_retry_scid, test_version, loopbackV4(443), 5_000_000, [_]u8{0x77} ** token_nonce_len, &buf);
@@ -1059,7 +1075,7 @@ test "retry token dated in the future is rejected" {
 
 test "retry token rejects tampering and unknown keys" {
     var tokens = RetryTokens{ .lifetime_us = 10_000_000 };
-    tokens.keys.install(0, [_]u8{0x01} ** token_key_len);
+    tokens.keys.install(0, &([_]u8{0x01} ** token_key_len));
 
     var buf: [max_token_len]u8 = undefined;
     const token = try tokens.issueRetry(&test_odcid, &test_retry_scid, test_version, loopbackV4(4433), 1_000_000, [_]u8{0x33} ** token_nonce_len, &buf);
@@ -1082,13 +1098,13 @@ test "retry token rejects tampering and unknown keys" {
 
 test "retry token survives key rotation while a key is retained" {
     var tokens = RetryTokens{ .lifetime_us = 10_000_000 };
-    tokens.keys.install(0, [_]u8{0x01} ** token_key_len);
+    tokens.keys.install(0, &([_]u8{0x01} ** token_key_len));
 
     var buf: [max_token_len]u8 = undefined;
     const token = try tokens.issueRetry(&test_odcid, &test_retry_scid, test_version, loopbackV4(4433), 1_000_000, [_]u8{0x44} ** token_nonce_len, &buf);
 
     // Rotate to a new current key; the old key still validates prior tokens.
-    tokens.keys.install(1, [_]u8{0x02} ** token_key_len);
+    tokens.keys.install(1, &([_]u8{0x02} ** token_key_len));
     _ = try tokens.validateRetry(token, loopbackV4(4433), 1_000_000);
 
     // Retiring the issuing key invalidates its tokens.
@@ -1096,9 +1112,59 @@ test "retry token survives key rotation while a key is retained" {
     try testing.expectError(error.UnknownTokenKey, tokens.validateRetry(token, loopbackV4(4433), 1_000_000));
 }
 
+test "retry token key ring deinit clears installed keys down to the byte level" {
+    var ring = RetryTokenKeyRing{};
+    ring.install(0, &([_]u8{0x9c} ** token_key_len));
+    ring.install(1, &([_]u8{0x8d} ** token_key_len));
+    try testing.expect(ring.get(0) != null);
+    try testing.expect(ring.get(1) != null);
+
+    // Capture raw pointers into the always-live key storage before deinit:
+    // asserting only `get(id) == null` afterward would also pass an
+    // implementation that never actually touched the key bytes, only the
+    // occupancy length. `.bytes` stays addressable regardless of `.len`, so
+    // this read is well-defined even after the slot is cleared.
+    const key0_ptr: *const [token_key_len]u8 = &ring.keys[0].bytes;
+    const key1_ptr: *const [token_key_len]u8 = &ring.keys[1].bytes;
+
+    ring.deinit();
+    try testing.expect(ring.get(0) == null);
+    try testing.expect(ring.get(1) == null);
+    for (key0_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    for (key1_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "retry token key ring retire wipes the retired key, not just its slot tag" {
+    var ring = RetryTokenKeyRing{};
+    defer ring.deinit();
+    ring.install(0, &([_]u8{0x9c} ** token_key_len));
+    const key0_ptr: *const [token_key_len]u8 = &ring.keys[0].bytes;
+    var saw_nonzero = false;
+    for (key0_ptr) |byte| {
+        if (byte != 0) saw_nonzero = true;
+    }
+    try testing.expect(saw_nonzero);
+
+    ring.retire(0);
+    try testing.expect(ring.get(0) == null);
+    for (key0_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "retry token key ring install wipes a replaced key before the new one takes over" {
+    var ring = RetryTokenKeyRing{};
+    defer ring.deinit();
+    ring.install(0, &([_]u8{0xaa} ** token_key_len));
+    const key0_ptr: *const [token_key_len]u8 = &ring.keys[0].bytes;
+
+    ring.install(0, &([_]u8{0xbb} ** token_key_len));
+    // The old 0xaa key must not survive anywhere in the slot's storage —
+    // only the new key's bytes.
+    for (key0_ptr) |byte| try testing.expectEqual(@as(u8, 0xbb), byte);
+}
+
 test "retry token deterministic boundary matrix rejects malformed public input" {
     var tokens = RetryTokens{ .lifetime_us = 1_000_000 };
-    tokens.keys.install(0, [_]u8{0x31} ** token_key_len);
+    tokens.keys.install(0, &([_]u8{0x31} ** token_key_len));
 
     try testing.expectError(error.MalformedToken, tokens.validateRetry(&([_]u8{0xaa} ** (1 + token_nonce_len + token_min_plaintext_len + token_tag_len - 1)), loopbackV4(4433), 0));
     try testing.expectError(error.MalformedToken, tokens.validateRetry(&([_]u8{0xaa} ** (max_token_len + 1)), loopbackV4(4433), 0));
@@ -1129,7 +1195,7 @@ test "retry token deterministic boundary matrix rejects malformed public input" 
 
 test "retry token validates exact time boundaries and u64 saturation" {
     var tokens = RetryTokens{ .lifetime_us = 5_000, .allowed_clock_skew_us = 100 };
-    tokens.keys.install(0, [_]u8{0x41} ** token_key_len);
+    tokens.keys.install(0, &([_]u8{0x41} ** token_key_len));
 
     var buf: [max_token_len]u8 = undefined;
     var token = try tokens.issueRetry(&test_odcid, &test_retry_scid, test_version, loopbackV4(4433), 10_000, [_]u8{0x42} ** token_nonce_len, &buf);
@@ -1148,7 +1214,7 @@ test "retry token validates exact time boundaries and u64 saturation" {
 
 test "retry token authenticated malformed plaintext maps to public rejection classes" {
     var tokens = RetryTokens{ .lifetime_us = 1_000_000 };
-    tokens.keys.install(0, [_]u8{0x51} ** token_key_len);
+    tokens.keys.install(0, &([_]u8{0x51} ** token_key_len));
     const nonce = [_]u8{0x52} ** token_nonce_len;
     const address = loopbackV4(4433);
     var plaintext: [token_max_plaintext_len]u8 = undefined;
@@ -1206,7 +1272,7 @@ fn sealTokenPlaintextForTest(
     @memcpy(out[1..][0..token_nonce_len], &nonce);
     const cipher = out[1 + token_nonce_len ..][0..plaintext.len];
     var tag: [token_tag_len]u8 = undefined;
-    Aes128Gcm.encrypt(cipher, &tag, plaintext, &.{}, nonce, key);
+    Aes128Gcm.encrypt(cipher, &tag, plaintext, &.{}, nonce, key.*);
     @memcpy(out[1 + token_nonce_len + plaintext.len ..][0..token_tag_len], &tag);
     return out[0..total];
 }
@@ -1216,8 +1282,8 @@ fn fuzzRetryTokenIssueValidate(_: void, smith: *testing.Smith) !void {
         .lifetime_us = 1 + @as(u64, smith.value(u16)),
         .allowed_clock_skew_us = @as(u64, smith.value(u8)),
     };
-    tokens.keys.install(0, [_]u8{0x61} ** token_key_len);
-    tokens.keys.install(1, [_]u8{0x62} ** token_key_len);
+    tokens.keys.install(0, &([_]u8{0x61} ** token_key_len));
+    tokens.keys.install(1, &([_]u8{0x62} ** token_key_len));
 
     var odcid_storage: [udp.MaxConnectionIdLen]u8 = undefined;
     var retry_scid_storage: [udp.MaxConnectionIdLen]u8 = undefined;
@@ -1244,7 +1310,7 @@ fn fuzzRetryTokenIssueValidate(_: void, smith: *testing.Smith) !void {
     try testing.expectEqualSlices(u8, retry_scid, ctx.retry_scid.slice());
     try testing.expectEqual(version, ctx.quic_version);
 
-    tokens.keys.install(2, [_]u8{0x63} ** token_key_len);
+    tokens.keys.install(2, &([_]u8{0x63} ** token_key_len));
     _ = try tokens.validateRetry(token, address, issued_at);
 
     var mutated: [max_token_len]u8 = undefined;
@@ -1322,7 +1388,7 @@ test "retry integrity tag matches the RFC 9001 Appendix A.4 vector" {
 
 test "metrics distinguish invalid tokens from normal retry usage" {
     var tokens = RetryTokens{ .lifetime_us = 1_000_000 };
-    tokens.keys.install(0, [_]u8{0x09} ** token_key_len);
+    tokens.keys.install(0, &([_]u8{0x09} ** token_key_len));
     var metrics = Metrics{};
 
     var buf: [max_token_len]u8 = undefined;

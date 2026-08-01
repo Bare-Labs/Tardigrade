@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const udp = @import("udp.zig");
+const secrets = @import("crypto_secrets");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
@@ -38,10 +39,10 @@ pub fn generateCid(entropy: []const u8, len: u8) error{ InvalidCidLength, NotEno
 // ---------------------------------------------------------------------------
 
 pub const NewConnectionIdFrame = struct {
-    sequence: u64,
-    retire_prior_to: u64,
-    cid: ConnectionId,
-    stateless_reset_token: [stateless_reset_token_len]u8,
+    sequence: u64 = 0,
+    retire_prior_to: u64 = 0,
+    cid: ConnectionId = .{},
+    stateless_reset_token: [stateless_reset_token_len]u8 = [_]u8{0} ** stateless_reset_token_len,
 };
 
 pub const RetireConnectionIdFrame = struct {
@@ -137,52 +138,100 @@ pub const max_local_active_cids = 8;
 
 pub const LocalCidRegistry = struct {
     pub const Entry = struct {
-        sequence: u64,
-        cid: ConnectionId,
-        stateless_reset_token: [stateless_reset_token_len]u8,
+        sequence: u64 = 0,
+        cid: ConnectionId = .{},
+        stateless_reset_token: [stateless_reset_token_len]u8 = [_]u8{0} ** stateless_reset_token_len,
     };
 
     /// min(peer's active_connection_id_limit, local storage bound).
-    active_limit: u64,
+    active_limit: u64 = 0,
     /// Static secret for stateless-reset token derivation (RFC 9000 §10.3.1).
-    reset_token_key: [32]u8,
-    entries: [max_local_active_cids]?Entry = [_]?Entry{null} ** max_local_active_cids,
+    reset_token_key: secrets.FixedSecret(32) = .{},
+    /// Always-live entry storage; `occupied` tracks which slots hold a live
+    /// CID rather than wrapping each entry in `?Entry`. An optional wrapper
+    /// would make a retired (or never-issued) slot's payload logically
+    /// inactive, and safety-checked builds are free to poison-fill an
+    /// inactive optional payload — observably so on Linux x64 — which would
+    /// make it impossible to assert the token bytes were actually zeroed
+    /// rather than merely tagged absent.
+    entries: [max_local_active_cids]Entry = [_]Entry{.{}} ** max_local_active_cids,
+    occupied: [max_local_active_cids]bool = [_]bool{false} ** max_local_active_cids,
     next_sequence: u64 = 0,
     largest_advertised_sequence: ?u64 = null,
     metrics: Metrics = .{},
 
-    pub fn init(peer_active_connection_id_limit: u64, reset_token_key: [32]u8) LocalCidRegistry {
-        return .{
+    /// Construct the registry in place, borrowing `reset_key` rather than
+    /// taking it by value. `init` (below) is convenient for tests, but a
+    /// by-value `[32]u8` parameter plus a return-by-value result both leave
+    /// an extra semantic copy of the secret that the compiler is not
+    /// guaranteed to elide — the production owner (`Connection`) uses this
+    /// instead.
+    pub fn initInto(out: *LocalCidRegistry, peer_active_connection_id_limit: u64, reset_key: []const u8) void {
+        out.* = .{
             .active_limit = @min(peer_active_connection_id_limit, max_local_active_cids),
-            .reset_token_key = reset_token_key,
         };
+        out.reset_token_key.replace(reset_key) catch unreachable;
+    }
+
+    /// Return-by-value convenience for tests only. `initInto` is the only
+    /// production-facing constructor: a by-value parameter plus a
+    /// return-by-value result both leave an unowned semantic copy of the
+    /// secret, and this is not one of the compile-time-known-safe call
+    /// sites (a test literal wiped by nothing) that would make that
+    /// acceptable in production.
+    fn init(peer_active_connection_id_limit: u64, reset_token_key: [32]u8) LocalCidRegistry {
+        var out: LocalCidRegistry = undefined;
+        initInto(&out, peer_active_connection_id_limit, &reset_token_key);
+        return out;
+    }
+
+    pub fn deinit(self: *LocalCidRegistry) void {
+        for (&self.entries, &self.occupied) |*entry, *occupied| {
+            if (occupied.*) secrets.secureZero(&entry.stateless_reset_token);
+            occupied.* = false;
+        }
+        self.reset_token_key.deinit();
+        self.next_sequence = 0;
+        self.largest_advertised_sequence = null;
     }
 
     /// Register the CID chosen during the handshake as sequence 0
-    /// (RFC 9000 §5.1.1). Call once, before any `issue`.
-    pub fn registerInitial(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!Entry {
+    /// (RFC 9000 §5.1.1). Call once, before any `issue`. Returns only the
+    /// (public, wire-visible) CID rather than the full `Entry`, so the
+    /// registry's copy of the derived reset token is never duplicated onto
+    /// the caller's stack.
+    pub fn registerInitial(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!ConnectionId {
         std.debug.assert(self.next_sequence == 0);
         const entry = try self.store(cid);
         self.largest_advertised_sequence = entry.sequence;
-        return entry;
+        return entry.cid;
     }
 
-    /// Issue a fresh CID from caller-supplied entropy and return the
-    /// NEW_CONNECTION_ID frame model to send. Fails when the peer's active
-    /// CID limit is reached (RFC 9000 §5.1.1: an endpoint MUST NOT provide
-    /// more CIDs than the peer's limit).
-    pub fn issue(self: *LocalCidRegistry, entropy: []const u8, cid_len: u8) !NewConnectionIdFrame {
+    /// Issue a fresh CID from caller-supplied entropy, writing the
+    /// NEW_CONNECTION_ID frame model directly into `out`. Production
+    /// entry point mirroring `issueCidInto` for callers that generate the
+    /// CID from entropy rather than supplying one directly.
+    pub fn issueInto(self: *LocalCidRegistry, entropy: []const u8, cid_len: u8, out: *NewConnectionIdFrame) !void {
+        const cid = try generateCid(entropy, cid_len);
+        try self.issueCidInto(cid, out);
+    }
+
+    /// Return-by-value convenience for tests only; see `issueCidInto`.
+    fn issue(self: *LocalCidRegistry, entropy: []const u8, cid_len: u8) !NewConnectionIdFrame {
         const cid = try generateCid(entropy, cid_len);
         return try self.issueCid(cid);
     }
 
-    /// Issue a caller-generated CID. Production endpoints use this
-    /// transactional form so a route table entry can be reserved before the
-    /// exact CID is queued in a NEW_CONNECTION_ID frame.
-    pub fn issueCid(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!NewConnectionIdFrame {
+    /// Issue a caller-generated CID, writing the NEW_CONNECTION_ID frame
+    /// model directly into `out`. Production endpoints use this
+    /// destination-oriented form so the reset token is copied exactly once,
+    /// from the registry's owned entry into the caller's owned destination
+    /// (e.g. a queue slot), instead of round-tripping through an
+    /// intermediate by-value return.
+    pub fn issueCidInto(self: *LocalCidRegistry, cid: ConnectionId, out: *NewConnectionIdFrame) error{ CidLimitExceeded, DuplicateCid }!void {
         const entry = try self.store(cid);
         self.metrics.cids_issued += 1;
-        return .{
+        out.* = .{
             .sequence = entry.sequence,
             .retire_prior_to = 0,
             .cid = entry.cid,
@@ -190,24 +239,37 @@ pub const LocalCidRegistry = struct {
         };
     }
 
-    fn store(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!Entry {
+    /// Return-by-value convenience for tests only. `issueCidInto` is the
+    /// only production-facing form: a caller with a real queue/record
+    /// destination should write into it directly rather than round-tripping
+    /// the reset token through an intermediate by-value return.
+    fn issueCid(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!NewConnectionIdFrame {
+        var out: NewConnectionIdFrame = undefined;
+        try self.issueCidInto(cid, &out);
+        return out;
+    }
+
+    /// Reserve and populate a fresh entry for `cid`, returning a pointer into
+    /// the registry's own storage. Callers must not retain the pointer past
+    /// their next mutating call into the registry.
+    fn store(self: *LocalCidRegistry, cid: ConnectionId) error{ CidLimitExceeded, DuplicateCid }!*Entry {
         if (self.activeCount() >= self.active_limit) return error.CidLimitExceeded;
         // Repeated caller entropy must not mint the same CID twice under
         // different sequence numbers.
-        for (self.entries) |existing| {
-            if (existing) |entry| {
-                if (std.mem.eql(u8, entry.cid.slice(), cid.slice())) return error.DuplicateCid;
-            }
+        for (self.entries, self.occupied) |entry, occupied| {
+            if (occupied and std.mem.eql(u8, entry.cid.slice(), cid.slice())) return error.DuplicateCid;
         }
-        const slot = for (&self.entries) |*entry| {
-            if (entry.* == null) break entry;
+        const slot_idx = for (self.occupied, 0..) |occupied, i| {
+            if (!occupied) break i;
         } else return error.CidLimitExceeded;
-        const entry = Entry{
+        const entry = &self.entries[slot_idx];
+        entry.* = .{
             .sequence = self.next_sequence,
             .cid = cid,
-            .stateless_reset_token = statelessResetToken(self.reset_token_key, cid.slice()),
+            .stateless_reset_token = [_]u8{0} ** stateless_reset_token_len,
         };
-        slot.* = entry;
+        statelessResetTokenInto(&entry.stateless_reset_token, self.reset_token_key.slice(), cid.slice());
+        self.occupied[slot_idx] = true;
         self.next_sequence += 1;
         return entry;
     }
@@ -219,11 +281,12 @@ pub const LocalCidRegistry = struct {
     pub fn retire(self: *LocalCidRegistry, frame: RetireConnectionIdFrame) error{ProtocolViolation}!?ConnectionId {
         const largest = self.largest_advertised_sequence orelse return error.ProtocolViolation;
         if (frame.sequence > largest) return error.ProtocolViolation;
-        for (&self.entries) |*slot| {
-            const entry = &(slot.* orelse continue);
+        for (&self.entries, &self.occupied) |*entry, *occupied| {
+            if (!occupied.*) continue;
             if (entry.sequence != frame.sequence) continue;
             const cid = entry.cid;
-            slot.* = null;
+            secrets.secureZero(&entry.stateless_reset_token);
+            occupied.* = false;
             self.metrics.local_cids_retired += 1;
             return cid;
         }
@@ -244,35 +307,33 @@ pub const LocalCidRegistry = struct {
 
     pub fn activeCount(self: *const LocalCidRegistry) usize {
         var active: usize = 0;
-        for (self.entries) |entry| {
-            if (entry != null) active += 1;
+        for (self.occupied) |occupied| {
+            if (occupied) active += 1;
         }
         return active;
     }
 
-    pub fn get(self: *const LocalCidRegistry, sequence: u64) ?Entry {
-        for (self.entries) |entry| {
-            if (entry) |value| {
-                if (value.sequence == sequence) return value;
-            }
+    /// Returns a pointer into the registry's own storage rather than a
+    /// by-value `Entry`, so a caller cannot walk away with an unowned copy
+    /// of the reset token. Callers must not retain the pointer past their
+    /// next mutating call into the registry.
+    pub fn get(self: *const LocalCidRegistry, sequence: u64) ?*const Entry {
+        for (&self.entries, self.occupied) |*entry, occupied| {
+            if (occupied and entry.sequence == sequence) return entry;
         }
         return null;
     }
 
     pub fn containsCid(self: *const LocalCidRegistry, cid: ConnectionId) bool {
-        for (self.entries) |entry| {
-            if (entry) |value| {
-                if (std.mem.eql(u8, value.cid.slice(), cid.slice())) return true;
-            }
+        for (self.entries, self.occupied) |entry, occupied| {
+            if (occupied and std.mem.eql(u8, entry.cid.slice(), cid.slice())) return true;
         }
         return false;
     }
 
     pub fn sequenceForCid(self: *const LocalCidRegistry, cid: ConnectionId) ?u64 {
-        for (self.entries) |entry| {
-            if (entry) |value| {
-                if (std.mem.eql(u8, value.cid.slice(), cid.slice())) return value.sequence;
-            }
+        for (self.entries, self.occupied) |entry, occupied| {
+            if (occupied and std.mem.eql(u8, entry.cid.slice(), cid.slice())) return entry.sequence;
         }
         return null;
     }
@@ -436,10 +497,21 @@ pub const stateless_reset_token_len = 16;
 /// static server key (RFC 9000 §10.3.1). The token is the first 16 bytes of
 /// HMAC-SHA256(static_key, connection_id); it MUST be hard to guess, so the
 /// static key must be secret and stable across the connection's lifetime.
-pub fn statelessResetToken(static_key: [32]u8, connection_id: []const u8) [stateless_reset_token_len]u8 {
+pub fn statelessResetToken(static_key: []const u8, connection_id: []const u8) [stateless_reset_token_len]u8 {
+    var token: [stateless_reset_token_len]u8 = undefined;
+    statelessResetTokenInto(&token, static_key, connection_id);
+    return token;
+}
+
+/// Same derivation as `statelessResetToken`, writing directly into `out`
+/// instead of returning by value. Production issuance paths use this so the
+/// token is written once into its final owner, rather than materializing an
+/// extra by-value stack copy that a caller then copies again.
+pub fn statelessResetTokenInto(out: *[stateless_reset_token_len]u8, static_key: []const u8, connection_id: []const u8) void {
     var mac: [HmacSha256.mac_length]u8 = undefined;
-    HmacSha256.create(&mac, connection_id, &static_key);
-    return mac[0..stateless_reset_token_len].*;
+    defer secrets.secureZero(&mac);
+    HmacSha256.create(&mac, connection_id, static_key);
+    @memcpy(out, mac[0..stateless_reset_token_len]);
 }
 
 /// Emission rules and packet construction for stateless resets (RFC 9000 §10.3).
@@ -491,15 +563,15 @@ test "stateless reset token is a stable function of the connection ID" {
     const key = [_]u8{0xab} ** 32;
     const cid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
 
-    const token = statelessResetToken(key, &cid);
+    const token = statelessResetToken(key[0..], &cid);
     // Deterministic for a given key + CID.
-    try testing.expectEqualSlices(u8, &token, &statelessResetToken(key, &cid));
+    try testing.expectEqualSlices(u8, &token, &statelessResetToken(key[0..], &cid));
 
     // A different CID or key yields a different token.
     const other_cid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x09 };
-    try testing.expect(!std.mem.eql(u8, &token, &statelessResetToken(key, &other_cid)));
+    try testing.expect(!std.mem.eql(u8, &token, &statelessResetToken(key[0..], &other_cid)));
     const other_key = [_]u8{0xcd} ** 32;
-    try testing.expect(!std.mem.eql(u8, &token, &statelessResetToken(other_key, &cid)));
+    try testing.expect(!std.mem.eql(u8, &token, &statelessResetToken(other_key[0..], &cid)));
 }
 
 test "stateless reset is only emitted for packets large enough to answer safely" {
@@ -587,8 +659,8 @@ test "retired local CIDs stop routing and unknown retire sequences are violation
     var registry = LocalCidRegistry.init(4, [_]u8{0xab} ** 32);
 
     const initial = try ConnectionId.init(&.{ 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa });
-    const initial_entry = try registry.registerInitial(initial);
-    try table.insert(initial_entry.cid, 1);
+    const initial_cid = try registry.registerInitial(initial);
+    try table.insert(initial_cid, 1);
 
     var entropy = [_]u8{0x10} ** 8;
     const issued = try registry.issue(&entropy, 8);
@@ -618,7 +690,7 @@ test "local registry enforces the peer's active CID limit and derives reset toke
     const issued = try registry.issue(&entropy, 8);
     try registry.markAdvertised(issued.sequence);
     // The frame's token matches the RFC 9000 §10.3.1 derivation for the CID.
-    try testing.expectEqualSlices(u8, &statelessResetToken(key, issued.cid.slice()), &issued.stateless_reset_token);
+    try testing.expectEqualSlices(u8, &statelessResetToken(key[0..], issued.cid.slice()), &issued.stateless_reset_token);
 
     // Limit of 2 is reached: further issuance must fail until one retires.
     var more_entropy = [_]u8{0x30} ** 8;
@@ -626,6 +698,61 @@ test "local registry enforces the peer's active CID limit and derives reset toke
     _ = try registry.retire(.{ .sequence = issued.sequence });
     _ = try registry.issue(&more_entropy, 8);
     try testing.expectEqual(@as(usize, 2), registry.activeCount());
+}
+
+test "local registry deinit clears issued entries" {
+    var registry = LocalCidRegistry.init(4, [_]u8{0x55} ** 32);
+    _ = try registry.registerInitial(try ConnectionId.init(&.{ 1, 2, 3, 4 }));
+    var entropy = [_]u8{0x42} ** 8;
+    _ = try registry.issue(&entropy, 8);
+    try testing.expect(registry.activeCount() > 0);
+
+    // Capture raw pointers into the always-live entry storage before deinit:
+    // `activeCount() == 0` and `reset_token_key.len == 0` alone would also
+    // pass an implementation that only flipped `occupied` without ever
+    // touching the token/key payload bytes. `entries[i].stateless_reset_token`
+    // stays addressable regardless of `occupied[i]`, so this read is
+    // well-defined even after the slot is cleared.
+    var was_occupied: [max_local_active_cids]bool = undefined;
+    for (&was_occupied, registry.occupied) |*w, occupied| w.* = occupied;
+    try testing.expect(was_occupied[0]);
+    const key_ptr = &registry.reset_token_key.bytes;
+
+    registry.deinit();
+    try testing.expectEqual(@as(usize, 0), registry.activeCount());
+    try testing.expectEqual(@as(usize, 0), registry.reset_token_key.len);
+    for (registry.entries, was_occupied) |entry, occupied| {
+        if (!occupied) continue;
+        for (entry.stateless_reset_token) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    }
+    for (key_ptr) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "retire wipes the stateless reset token bytes, not just the entry slot" {
+    var registry = LocalCidRegistry.init(4, [_]u8{0x66} ** 32);
+    defer registry.deinit();
+    _ = try registry.registerInitial(try ConnectionId.init(&.{ 9, 9, 9, 9 }));
+    var entropy = [_]u8{0x77} ** 8;
+    const issued = try registry.issue(&entropy, 8);
+    try registry.markAdvertised(issued.sequence);
+
+    var slot_idx: ?usize = null;
+    for (registry.entries, registry.occupied, 0..) |entry, occupied, i| {
+        if (occupied and entry.sequence == issued.sequence) slot_idx = i;
+    }
+    const idx = slot_idx orelse return error.TestUnexpectedResult;
+    // `entries[idx].stateless_reset_token` stays addressable regardless of
+    // `occupied[idx]`, so reading it after `retire()` clears the slot below
+    // is well-defined — unlike reading through a dead `?Entry` payload.
+    const token = &registry.entries[idx].stateless_reset_token;
+    var saw_nonzero = false;
+    for (token) |byte| {
+        if (byte != 0) saw_nonzero = true;
+    }
+    try testing.expect(saw_nonzero);
+
+    _ = try registry.retire(.{ .sequence = issued.sequence });
+    for (token) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "peer pool validates NEW_CONNECTION_ID and sweeps retire_prior_to" {
