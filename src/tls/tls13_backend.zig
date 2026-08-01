@@ -21,6 +21,7 @@ const dns_name = @import("dns_name.zig");
 const events = @import("events.zig");
 const credentials = @import("credentials.zig");
 const tls_algorithms = @import("algorithms.zig");
+const tls_crypto_profile = @import("crypto_profile.zig");
 const tls_negotiation = @import("negotiation.zig");
 const tls_policy = @import("policy.zig");
 const crypto_pkg = @import("crypto");
@@ -3901,7 +3902,7 @@ pub const Tls13Backend = struct {
         var using_fixed = false;
         const provider = if (self.external_provider) |p| p else blk: {
             if (!self.identity_present) return self.failCredential(.no_credential_available);
-            fixed_provider = credentials.FixedCredentialProvider.init(self.identity);
+            fixed_provider = credentials.FixedCredentialProvider.init(self.identity, self.crypto_provider.entropy);
             using_fixed = true;
             break :blk fixed_provider.provider();
         };
@@ -4882,6 +4883,8 @@ pub const Tls13Backend = struct {
             self.peer_sig_schemes[0..self.peer_sig_scheme_count],
             selected,
         ) catch return self.failCredential(.invalid_callback_behavior);
+        if (!tls_crypto_profile.supportsSignatureScheme(self.crypto_provider.capabilities(), selected))
+            return self.failCredential(.no_compatible_signature_algorithm);
 
         const chain = credential.certificateChain();
         if (chain.count() == 0 or chain.count() > credentials.max_chain_entries)

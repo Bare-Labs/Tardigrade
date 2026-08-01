@@ -432,7 +432,7 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
 
 test "udp smoke: HTTP/3 runtime Retry sends tokenless Initials without tracked state" {
     const allocator = testing.allocator;
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = http3_runtime.Logger.init(.err, "udp-runtime-retry-flood-test");
     var handler_state = RuntimeHandlerState{};
@@ -512,7 +512,7 @@ test "udp smoke: HTTP/3 runtime Retry sends tokenless Initials without tracked s
 
 test "udp smoke: HTTP/3 runtime Retry-off flood cleans unauthenticated state" {
     const allocator = testing.allocator;
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = http3_runtime.Logger.init(.err, "udp-runtime-retry-off-flood-test");
     var handler_state = RuntimeHandlerState{};
@@ -628,7 +628,7 @@ test "udp smoke: HTTP/3 runtime Retry-off flood cleans unauthenticated state" {
 
 test "udp smoke: HTTP/3 runtime Retry rejects invalid token matrix without allocation" {
     const allocator = testing.allocator;
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = http3_runtime.Logger.init(.err, "udp-runtime-retry-invalid-matrix-test");
     var handler_state = RuntimeHandlerState{};
@@ -711,7 +711,7 @@ test "udp smoke: HTTP/3 runtime Retry rejects invalid token matrix without alloc
 
 test "udp smoke: HTTP/3 runtime Retry round trip completes a native H3 request" {
     const allocator = testing.allocator;
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = http3_runtime.Logger.init(.err, "udp-runtime-retry-success-test");
     var handler_state = RuntimeHandlerState{};
@@ -828,7 +828,7 @@ test "udp smoke: HTTP/3 runtime Retry round trip completes a native H3 request" 
 
 test "udp smoke: HTTP/3 runtime drain lets admitted work finish and rejects new work" {
     const allocator = testing.allocator;
-    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity());
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = http3_runtime.Logger.init(.err, "udp-runtime-drain-lifecycle-test");
     var handler_state = RuntimeHandlerState{};

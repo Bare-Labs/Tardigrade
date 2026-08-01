@@ -64,6 +64,78 @@ const ProviderStorage = struct {
     }
 };
 
+const CapabilityOverrideProvider = struct {
+    backing: crypto.provider.CryptoProvider,
+    caps: crypto.provider.Capabilities,
+
+    fn initWithoutEcdsa(backing: crypto.provider.CryptoProvider) CapabilityOverrideProvider {
+        var caps = backing.capabilities();
+        caps.signatures.remove(.ecdsa_secp256r1_sha256);
+        return .{ .backing = backing, .caps = caps };
+    }
+
+    fn provider(self: *CapabilityOverrideProvider) crypto.provider.CryptoProvider {
+        return .{ .context = self, .vtable = &vtable, .entropy = self.backing.entropy };
+    }
+
+    const vtable = crypto.provider.CryptoProvider.VTable{
+        .capabilities = capabilities,
+        .hkdfExtract = hkdfExtract,
+        .hkdfExpandLabel = hkdfExpandLabel,
+        .aeadSeal = aeadSeal,
+        .aeadOpen = aeadOpen,
+        .quicHeaderProtectionMask = quicHeaderProtectionMask,
+        .generateKeyShare = generateKeyShare,
+        .deriveSharedSecret = deriveSharedSecret,
+        .verify = verify,
+    };
+
+    fn capabilities(ctx: *anyopaque) crypto.provider.Capabilities {
+        const self: *CapabilityOverrideProvider = @ptrCast(@alignCast(ctx));
+        return self.caps;
+    }
+
+    fn hkdfExtract(ctx: *anyopaque, hash: crypto.provider.Hash, salt: []const u8, ikm: []const u8, out: []u8) crypto.provider.HkdfError!void {
+        const self: *CapabilityOverrideProvider = @ptrCast(@alignCast(ctx));
+        return self.backing.hkdfExtract(hash, salt, ikm, out);
+    }
+
+    fn hkdfExpandLabel(ctx: *anyopaque, hash: crypto.provider.Hash, secret: []const u8, label: []const u8, hash_context: []const u8, out: []u8) crypto.provider.HkdfError!void {
+        const self: *CapabilityOverrideProvider = @ptrCast(@alignCast(ctx));
+        return self.backing.hkdfExpandLabel(hash, secret, label, hash_context, out);
+    }
+
+    fn aeadSeal(ctx: *anyopaque, aead: crypto.provider.Aead, key: []const u8, nonce: []const u8, associated_data: []const u8, plaintext: []const u8, ciphertext: []u8, tag: []u8) crypto.provider.SealError!void {
+        const self: *CapabilityOverrideProvider = @ptrCast(@alignCast(ctx));
+        return self.backing.aeadSeal(aead, key, nonce, associated_data, plaintext, ciphertext, tag);
+    }
+
+    fn aeadOpen(ctx: *anyopaque, aead: crypto.provider.Aead, key: []const u8, nonce: []const u8, associated_data: []const u8, ciphertext: []const u8, tag: []const u8, plaintext: []u8) crypto.provider.OpenError!void {
+        const self: *CapabilityOverrideProvider = @ptrCast(@alignCast(ctx));
+        return self.backing.aeadOpen(aead, key, nonce, associated_data, ciphertext, tag, plaintext);
+    }
+
+    fn quicHeaderProtectionMask(ctx: *anyopaque, hp: crypto.provider.QuicHeaderProtection, key: []const u8, sample: []const u8, mask: []u8) crypto.provider.QuicHeaderProtectionError!void {
+        const self: *CapabilityOverrideProvider = @ptrCast(@alignCast(ctx));
+        return self.backing.quicHeaderProtectionMask(hp, key, sample, mask);
+    }
+
+    fn generateKeyShare(ctx: *anyopaque, group: crypto.provider.Group, public_out: []u8, private_out: []u8) crypto.provider.KeyShareError!void {
+        const self: *CapabilityOverrideProvider = @ptrCast(@alignCast(ctx));
+        return self.backing.generateKeyShare(group, public_out, private_out);
+    }
+
+    fn deriveSharedSecret(ctx: *anyopaque, group: crypto.provider.Group, private_scalar: []const u8, peer_public: []const u8, out: []u8) crypto.provider.DeriveError!void {
+        const self: *CapabilityOverrideProvider = @ptrCast(@alignCast(ctx));
+        return self.backing.deriveSharedSecret(group, private_scalar, peer_public, out);
+    }
+
+    fn verify(ctx: *anyopaque, scheme: crypto.provider.SignatureScheme, public_key: []const u8, message: []const u8, signature: []const u8) crypto.provider.VerifyError!void {
+        const self: *CapabilityOverrideProvider = @ptrCast(@alignCast(ctx));
+        return self.backing.verify(scheme, public_key, message, signature);
+    }
+};
+
 const client_provider_seed: u64 = 0x442_c;
 const server_provider_seed: u64 = 0x442_5;
 
@@ -320,7 +392,7 @@ const DirectHarness = struct {
         self.server_client_verifier = credentials.FixedVerifier.init(verifier_trust);
         self.server_backend.requestClientAuthentication(mode, self.server_client_verifier.?.verifier());
         if (client_cert) {
-            self.client_credential = credentials.FixedCredentialProvider.init(fixtureIdentity());
+            self.client_credential = credentials.FixedCredentialProvider.init(fixtureIdentity(), self.client_provider_storage.provider.cryptoProvider().entropy);
             self.client_backend.setLocalCredentialProvider(self.client_credential.?.provider());
         }
     }
@@ -5321,7 +5393,7 @@ fn sniIdentityConfig(patterns: []const []const u8, chain: []const []const u8, de
     return .{
         .chain = chain,
         .patterns = patterns,
-        .signer = sni_provider.SignAdapter.fromIdentity(fixtureIdentity()),
+        .signer = sni_provider.SignAdapter.fromIdentity(fixtureIdentity(), credentials.testdata.ignoredEntropy()),
         .key_kind = .ed25519,
         .is_default = default,
     };
@@ -5399,7 +5471,7 @@ test "record engine pins selected SNI generation across provider reload" {
             }
             var identity = fixtureIdentity();
             defer std.crypto.secureZero(u8, std.mem.asBytes(&identity.key));
-            return identity.sign(input, out);
+            return identity.sign(input, credentials.testdata.ignoredEntropy(), out);
         }
 
         fn release(ctx: *anyopaque) void {
@@ -6206,6 +6278,28 @@ test "no compatible signature algorithm fails with handshake_failure attribution
         tls_core.alerts.AlertDescription.handshake_failure,
         server.credentialFailure().?.alert(),
     );
+}
+
+test "provider signature capability withdrawal prevents ECDSA credential selection before flight" {
+    var caps = crypto.pure_zig.Provider.capabilities();
+    caps.signatures.remove(.ecdsa_secp256r1_sha256);
+    const tls_caps = tls_core.crypto_profile.fromProfile(.native_appliance, caps);
+    try std.testing.expectEqual(@as(usize, 1), tls_caps.signature_schemes_len);
+    try std.testing.expectEqual(tls_core.policy.SignatureScheme.ed25519, tls_caps.signature_schemes[0]);
+
+    var server_provider_storage: ProviderStorage = .{};
+    var crypto_provider = CapabilityOverrideProvider.initWithoutEcdsa(server_provider_storage.init(server_provider_seed));
+    var server = tls_backend.Tls13Backend.initServer(serverEntropy(), crypto_provider.provider(), credentials.testdata.p256Identity(), .record);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .sig_schemes = &.{0x0403} });
+    try std.testing.expectError(error.NoApplicableCredential, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.no_compatible_signature_algorithm, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&sink, .initial));
 }
 
 test "no credential available fails deterministically and preserves the failure" {
@@ -10245,7 +10339,7 @@ const BigChainSigningProvider = struct {
     fn sign(handle: *anyopaque, _: credentials.SignatureScheme, input: []const u8, out: []u8) credentials.SignError!credentials.Progress(usize) {
         const self: *BigChainSigningProvider = @ptrCast(@alignCast(handle));
         self.sign_count += 1;
-        return .{ .complete = try self.identity.sign(input, out) };
+        return .{ .complete = try self.identity.sign(input, credentials.testdata.ignoredEntropy(), out) };
     }
     fn release(_: *anyopaque) void {}
 };

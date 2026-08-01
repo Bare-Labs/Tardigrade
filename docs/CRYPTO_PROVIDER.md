@@ -58,7 +58,7 @@ changes when it lands.
 - **Key exchange** — ephemeral key-share generation and shared-secret derivation
   for X25519 and (declared, not yet implemented in pure Zig) secp256r1.
 - **Signatures** — verification for Ed25519, ECDSA-P256, and RSA-PSS, plus
-  signing through the opaque `SigningKey` handle for Ed25519.
+  signing through the opaque `SigningKey` handle for Ed25519 and ECDSA-P256.
 - **Random bytes**, **constant-time comparison**, and **secure zeroing**.
 - **Secret containers** for fixed-size stack material and bounded heap material,
   with explicit replacement and deinitialization rules.
@@ -66,7 +66,7 @@ changes when it lands.
 
 The pure-Zig backend implements the overlap the TLS/QUIC engines need today:
 HKDF (SHA-256/384), all three AEAD primitives, AES-128 QUIC header protection,
-X25519, Ed25519, ECDSA-P256 verification, and RSA-PSS verification. The
+X25519, Ed25519, ECDSA-P256 signing/verification, and RSA-PSS verification. The
 remaining algorithms are named by the interface so protocol and negotiation
 code is written once; capability discovery reports them absent and every entry
 point returns `error.UnsupportedCapability` until a backend provides them.
@@ -120,7 +120,7 @@ lists only the consumers whose live runtime calls `CryptoProvider` today
 | X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge | live — `src/tls/tls13_backend.zig` generates its ephemeral key share and derives the shared secret through `CryptoProvider.generateKeyShare`/`.deriveSharedSecret` | native appliance, general-purpose OpenSSL |
 | secp256r1 / P-256 | provider deferred | unavailable | provider deferred | TLS key share, PKI | none | general-purpose OpenSSL only (P-256 ECDH outside this seam; not implemented in pure Zig at all) |
 | Ed25519 | supported | `std.crypto` | provider deferred | CertificateVerify, PKI | live for both — PKI chain-signature verification and the handshake's own CertificateVerify proof-of-possession (`src/tls/tls13_backend.zig`) call `CryptoProvider.verify`; local CertificateVerify signing (`src/tls/credentials.zig`'s `Identity.sign`) signs through the opaque `provider.SigningKey` handle rather than a concrete `std.crypto.sign.Ed25519.KeyPair` | native appliance, general-purpose OpenSSL |
-| ECDSA-P256-SHA256 | supported | `std.crypto` verification | provider deferred | CertificateVerify, PKI | live for both, same split as Ed25519 — chain verification and CertificateVerify both call `CryptoProvider.verify`, and local signing goes through `provider.SigningKey` | native appliance, general-purpose OpenSSL |
+| ECDSA-P256-SHA256 | supported | `std.crypto` signing/verification | provider deferred | CertificateVerify, PKI | live for both, same split as Ed25519 — chain verification and CertificateVerify both call `CryptoProvider.verify`, and local signing goes through `provider.SigningKey` with per-signature noise from injected provider entropy. Signatures are canonical DER, but are **not** low-S normalized; valid in-range high-S and low-S forms verify without rewriting | native appliance, general-purpose OpenSSL |
 | RSA-PSS-RSAE-SHA256 | supported | project verifier | provider deferred | CertificateVerify, PKI | PKI chain-signature verification only, same split as Ed25519 | general-purpose OpenSSL only (the native appliance negotiates Ed25519/ECDSA only) |
 | DER parser | provider deferred | project code | provider deferred | PKI | none — parsing has no `CryptoProvider` entry point | native appliance, general-purpose OpenSSL (shared protocol-local code) |
 | chain builder, WebPKI validation | provider deferred | unavailable | provider deferred | PKI | none | neither — not implemented yet |
@@ -252,7 +252,12 @@ with — is this abstraction's first real user rather than only its documented
 intent (#490): it holds a `pure_zig.SoftwareSigningKey` (Ed25519) or
 `pure_zig.SoftwareEcdsaP256SigningKey` (ECDSA-P256) and signs through
 `provider.SigningKey.sign`, never a named `std.crypto.sign.Ed25519.KeyPair`/
-`EcdsaP256Sha256.KeyPair` type. The engine-facing `CredentialProvider`/
+`EcdsaP256Sha256.KeyPair` type. The ECDSA implementation rejects undersized
+output buffers before drawing entropy and publishes bytes only after a complete
+canonical DER signature exists. Canonical DER does not imply low-S
+normalization in this provider: ECDSA signing emits the primitive's `s` value
+directly, and verification accepts any valid non-zero in-range `r`/`s` pair
+without silently normalizing or rewriting it. The engine-facing `CredentialProvider`/
 `SelectedCredential` async contract in the same file is unchanged by this —
 it already only ever handed the engine an opaque signing capability, never
 key bytes; what changed is what the *concrete* credential behind that

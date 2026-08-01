@@ -1197,7 +1197,7 @@ fn quicSniConfig(patterns: []const []const u8, chain: []const []const u8) tls_co
     return .{
         .chain = chain,
         .patterns = patterns,
-        .signer = tls_core.sni_provider.SignAdapter.fromIdentity(Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der) catch unreachable),
+        .signer = tls_core.sni_provider.SignAdapter.fromIdentity(Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der) catch unreachable, tls_core.credentials.testdata.ignoredEntropy()),
         .key_kind = .ed25519,
         .is_default = true,
     };

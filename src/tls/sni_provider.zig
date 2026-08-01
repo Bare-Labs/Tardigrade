@@ -8,7 +8,8 @@
 
 const std = @import("std");
 const std_crypto = std.crypto;
-const crypto_provider = @import("crypto").provider;
+const crypto_pkg = @import("crypto");
+const crypto_provider = crypto_pkg.provider;
 const credentials = @import("credentials.zig");
 const dns_name = @import("dns_name.zig");
 
@@ -75,9 +76,14 @@ pub const PublicationError = error{
 pub const ReloadError = BuildError || PublicationError;
 
 pub const SignAdapter = union(enum) {
-    identity: credentials.Identity,
+    identity: IdentityAdapter,
     external: ExternalSigner,
     signing_key: SigningKeyAdapter,
+
+    pub const IdentityAdapter = struct {
+        identity: credentials.Identity,
+        entropy: crypto_provider.Entropy,
+    };
 
     pub const ExternalSigner = struct {
         context: *anyopaque,
@@ -100,8 +106,8 @@ pub const SignAdapter = union(enum) {
         invalid_release_contract,
     };
 
-    pub fn fromIdentity(identity: credentials.Identity) SignAdapter {
-        return .{ .identity = identity };
+    pub fn fromIdentity(identity: credentials.Identity, entropy: crypto_provider.Entropy) SignAdapter {
+        return .{ .identity = .{ .identity = identity, .entropy = entropy } };
     }
 
     pub fn fromExternal(
@@ -127,9 +133,9 @@ pub const SignAdapter = union(enum) {
 
     fn sign(self: *SignAdapter, scheme: credentials.SignatureScheme, input: []const u8, out: []u8) credentials.SignError!usize {
         return switch (self.*) {
-            .identity => |*identity| blk: {
-                if (identity.signatureScheme() != scheme) return error.InvalidCallbackBehavior;
-                break :blk try identity.sign(input, out);
+            .identity => |*adapter| blk: {
+                if (adapter.identity.signatureScheme() != scheme) return error.InvalidCallbackBehavior;
+                break :blk try adapter.identity.sign(input, adapter.entropy, out);
             },
             .external => |external| try external.sign(external.context, scheme, input, out),
             .signing_key => |adapter| blk: {
@@ -149,7 +155,7 @@ pub const SignAdapter = union(enum) {
 
     pub fn release(self: *SignAdapter) void {
         switch (self.*) {
-            .identity => |*identity| std_crypto.secureZero(u8, std.mem.asBytes(&identity.key)),
+            .identity => |*adapter| std_crypto.secureZero(u8, std.mem.asBytes(&adapter.identity.key)),
             .external => |external| external.release(external.context),
             .signing_key => |adapter| switch (adapter.ownership) {
                 .borrowed, .invalid_release_contract => {},
@@ -552,7 +558,7 @@ fn buildBundle(
             if (!schemeLegalForKeyKind(config.key_kind, actual) or !containsScheme(schemes, actual))
                 return error.KeySignerMismatch;
         },
-        .identity => |*identity| if (identity.signatureScheme() != schemes[0] or !schemeLegalForKeyKind(config.key_kind, identity.signatureScheme()))
+        .identity => |*adapter| if (adapter.identity.signatureScheme() != schemes[0] or !schemeLegalForKeyKind(config.key_kind, adapter.identity.signatureScheme()))
             return error.KeySignerMismatch,
     }
 
@@ -574,9 +580,9 @@ fn copySupportedSchemes(allocator: std.mem.Allocator, config: CredentialBundleCo
         return out;
     }
     switch (config.signer) {
-        .identity => |*identity| {
+        .identity => |*adapter| {
             const out = allocator.alloc(credentials.SignatureScheme, 1) catch return error.OutOfMemory;
-            out[0] = identity.signatureScheme();
+            out[0] = adapter.identity.signatureScheme();
             return out;
         },
         .signing_key => |adapter| {
@@ -760,7 +766,7 @@ fn identityConfig(patterns: []const []const u8, default: bool) CredentialBundleC
     return .{
         .chain = &.{credentials.testdata.certificate_der},
         .patterns = patterns,
-        .signer = SignAdapter.fromIdentity(credentials.testdata.identity()),
+        .signer = SignAdapter.fromIdentity(credentials.testdata.identity(), credentials.testdata.ignoredEntropy()),
         .key_kind = .ed25519,
         .is_default = default,
     };
@@ -964,7 +970,7 @@ test "snapshot owns chain and pattern copies after caller mutation" {
     const config = CredentialBundleConfig{
         .chain = chain_entries[0..],
         .patterns = &.{pattern},
-        .signer = SignAdapter.fromIdentity(credentials.testdata.identity()),
+        .signer = SignAdapter.fromIdentity(credentials.testdata.identity(), credentials.testdata.ignoredEntropy()),
         .key_kind = .ed25519,
         .is_default = true,
     };
@@ -1200,7 +1206,7 @@ fn sniIdentityConfigForFuzz(patterns: []const []const u8, chain: []const []const
     return .{
         .chain = chain,
         .patterns = patterns,
-        .signer = SignAdapter.fromIdentity(credentials.testdata.identity()),
+        .signer = SignAdapter.fromIdentity(credentials.testdata.identity(), credentials.testdata.ignoredEntropy()),
         .key_kind = .ed25519,
         .is_default = default,
     };
