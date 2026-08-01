@@ -705,7 +705,15 @@ const SentRecord = struct {
     carried_handshake_done: bool = false,
     carried_reset_stream: ?quic_stream.ResetStreamFrame = null,
     carried_stop_sending: ?quic_stream.StopSendingFrame = null,
-    carried_new_connection_id: ?quic_cid.NewConnectionIdFrame = null,
+    /// Always-live payload; `has_new_connection_id` tracks whether it holds
+    /// a real, currently-carried frame. An `?NewConnectionIdFrame` would
+    /// make the payload logically inactive the moment it is cleared, and
+    /// safety-checked builds are free to poison-fill an inactive optional
+    /// payload on that very transition — which would make it impossible for
+    /// a test (or any code) to tell "wiped, then cleared" apart from "just
+    /// cleared" by inspecting the bytes afterward.
+    carried_new_connection_id: quic_cid.NewConnectionIdFrame = .{},
+    has_new_connection_id: bool = false,
     /// PATH_CHALLENGE re-arms on loss; PATH_RESPONSE does not (the peer
     /// re-challenges, RFC 9000 §8.2.2). Both force datagram expansion.
     /// Non-null when this record carried a PATH_CHALLENGE for the given
@@ -729,7 +737,7 @@ const SentRecord = struct {
 /// independent copy of it; each of those copies must be scrubbed once it is
 /// no longer needed rather than left for the allocator to reclaim unwiped.
 fn wipeSentRecordToken(record: *SentRecord) void {
-    if (record.carried_new_connection_id) |*ncid| crypto_secrets.secureZero(&ncid.stateless_reset_token);
+    if (record.has_new_connection_id) crypto_secrets.secureZero(&record.carried_new_connection_id.stateless_reset_token);
 }
 
 fn wipeSentRecordTokens(records: []SentRecord) void {
@@ -1820,8 +1828,8 @@ pub const Connection = struct {
         if (record.carried_stop_sending) |stop| {
             self.pending_stop_sending.append(self.allocator, stop) catch {};
         }
-        if (record.carried_new_connection_id) |*ncid| {
-            self.queueNewConnectionId(ncid);
+        if (record.has_new_connection_id) {
+            self.queueNewConnectionId(&record.carried_new_connection_id);
         }
         if (record.carried_path_challenge_path) |path| {
             for (self.candidate_challenges.items) |*candidate| {
@@ -1880,11 +1888,10 @@ pub const Connection = struct {
             wipePendingNewConnectionIdsOrderedRemoveResidue(&self.pending_new_connection_ids);
         }
         for (self.sent_records.items) |*record| {
-            if (record.carried_new_connection_id) |*ncid| {
-                if (ncid.sequence != sequence) continue;
-                crypto_secrets.secureZero(&ncid.stateless_reset_token);
-                record.carried_new_connection_id = null;
-            }
+            if (!record.has_new_connection_id) continue;
+            if (record.carried_new_connection_id.sequence != sequence) continue;
+            crypto_secrets.secureZero(&record.carried_new_connection_id.stateless_reset_token);
+            record.has_new_connection_id = false;
         }
     }
 
@@ -3165,8 +3172,8 @@ pub const Connection = struct {
             self.last_ack_eliciting_sent_us[space_idx] = now_us;
             if (tracked) publishSentRecord(self, &record);
         }
-        if (record.carried_new_connection_id) |ncid| {
-            if (self.local_cids) |*registry| registry.markAdvertised(ncid.sequence) catch {};
+        if (record.has_new_connection_id) {
+            if (self.local_cids) |*registry| registry.markAdvertised(record.carried_new_connection_id.sequence) catch {};
         }
         self.metrics.packets_sent += 1;
         self.events.emit(.{ .packet_sent = .{
@@ -3274,6 +3281,7 @@ pub const Connection = struct {
                 plain_len += n;
                 record.ack_eliciting = true;
                 record.carried_new_connection_id = self.pending_new_connection_ids.items[0];
+                record.has_new_connection_id = true;
                 _ = self.pending_new_connection_ids.orderedRemove(0);
                 wipePendingNewConnectionIdsOrderedRemoveResidue(&self.pending_new_connection_ids);
             } else |_| {}
@@ -7013,14 +7021,16 @@ test "connection: lost NEW_CONNECTION_ID retransmits the same frame identity" {
     var out: [2048]u8 = undefined;
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
     const first_record = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
-    const first = first_record.carried_new_connection_id orelse return error.TestExpectedEqual;
+    try testing.expect(first_record.has_new_connection_id);
+    const first = first_record.carried_new_connection_id;
     try testing.expectEqual(@as(u64, 1), first.sequence);
     try testing.expectEqualSlices(u8, spare.slice(), first.cid.slice());
 
     pair.server.requeueRecord(&first_record);
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us + 1_000) orelse return error.TestExpectedEqual;
     const second_record = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
-    const second = second_record.carried_new_connection_id orelse return error.TestExpectedEqual;
+    try testing.expect(second_record.has_new_connection_id);
+    const second = second_record.carried_new_connection_id;
     try testing.expectEqual(first.sequence, second.sequence);
     try testing.expectEqual(first.retire_prior_to, second.retire_prior_to);
     try testing.expectEqualSlices(u8, first.cid.slice(), second.cid.slice());
@@ -7066,7 +7076,7 @@ test "connection: RETIRE_CONNECTION_ID cancels a queued and an in-flight copy of
     try pair.pump();
 
     // 1) Issue sequence 1 and send it, so it becomes an in-flight sent
-    // record; then manually requeue that same record — mirroring exactly
+    // record; then requeue that exact record in place — mirroring exactly
     // what a PTO does without removing the record it requeues from — so a
     // second, pending copy of sequence 1 also exists simultaneously.
     const spare = try quic_cid.ConnectionId.init(&.{ 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8 });
@@ -7074,18 +7084,13 @@ test "connection: RETIRE_CONNECTION_ID cancels a queued and an in-flight copy of
     var out: [2048]u8 = undefined;
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
     const sent_index = pair.server.sent_records.items.len - 1;
-    const in_flight = pair.server.sent_records.items[sent_index].carried_new_connection_id orelse return error.TestExpectedEqual;
-    try testing.expectEqual(@as(u64, 1), in_flight.sequence);
-    // Captured while still live, not read back through the optional after
-    // it is nulled below: safety-checked builds poison-fill an optional's
-    // payload on that transition, so a pointer captured beforehand would
-    // observe poison, not proof of a real wipe.
-    const original_token = in_flight.stateless_reset_token;
+    try testing.expect(pair.server.sent_records.items[sent_index].has_new_connection_id);
+    try testing.expectEqual(@as(u64, 1), pair.server.sent_records.items[sent_index].carried_new_connection_id.sequence);
 
-    const sent_copy = pair.server.sent_records.items[sent_index];
-    pair.server.requeueRecord(&sent_copy);
+    pair.server.requeueRecord(&pair.server.sent_records.items[sent_index]);
     try testing.expectEqual(@as(usize, 1), pair.server.pending_new_connection_ids.items.len);
     try testing.expectEqual(@as(u64, 1), pair.server.pending_new_connection_ids.items[0].sequence);
+    const pending_backing = pair.server.pending_new_connection_ids.items.ptr;
 
     // 2) The peer retires sequence 1 from a packet bound to a still-active
     // local CID (sequence 0, the handshake-issued one) — not the sequence
@@ -7093,18 +7098,29 @@ test "connection: RETIRE_CONNECTION_ID cancels a queued and an in-flight copy of
     try pair.server.applyFrame(.application, .{ .retire_connection_id = .{ .sequence = 1 } }, TestPair.server_path, 0, pair.now_us);
     try testing.expectEqual(State.established, pair.server.state());
 
-    // 3) Both the pending and the in-flight copy are gone. The sent
-    // record's storage no longer contains the original token bytes
-    // anywhere, proven via a raw byte scan rather than reading the
-    // optional's payload after it has been nulled.
+    // 3) The pending copy is gone — including its raw vacated backing
+    // slot, not just the logical length dropping — and the in-flight
+    // copy's flag and token bytes are both cleared. Every check reads the
+    // always-live payload directly, never through an optional whose own
+    // tag transition a safety-checked build is free to poison-fill: that
+    // representation change is exactly what makes these assertions prove
+    // a real wipe happened, rather than merely being consistent with one.
     try testing.expectEqual(@as(usize, 0), pair.server.pending_new_connection_ids.items.len);
-    try testing.expectEqual(@as(?quic_cid.NewConnectionIdFrame, null), pair.server.sent_records.items[sent_index].carried_new_connection_id);
-    const record_bytes = std.mem.asBytes(&pair.server.sent_records.items[sent_index]);
-    try testing.expect(std.mem.indexOf(u8, record_bytes, &original_token) == null);
+    try testing.expectEqual(pending_backing, pair.server.pending_new_connection_ids.items.ptr);
+    const vacated_pending_slot = std.mem.asBytes(
+        &pair.server.pending_new_connection_ids.allocatedSlice()[pair.server.pending_new_connection_ids.items.len],
+    );
+    for (vacated_pending_slot) |byte| try testing.expectEqual(@as(u8, 0), byte);
 
-    // 4) Neither a repeated PTO nor another manual requeue (loss
-    // processing's own primitive) resurrects the retired sequence: the
-    // record that would have carried it forward no longer does.
+    try testing.expect(!pair.server.sent_records.items[sent_index].has_new_connection_id);
+    for (pair.server.sent_records.items[sent_index].carried_new_connection_id.stateless_reset_token) |byte| {
+        try testing.expectEqual(@as(u8, 0), byte);
+    }
+
+    // 4) Neither a repeated PTO nor another direct requeue (loss
+    // processing's own primitive) resurrects the retired sequence: both
+    // consult the same `has_new_connection_id` flag on this record, and it
+    // is now false.
     pair.server.firePto(.application);
     pair.server.firePto(.application);
     pair.server.requeueRecord(&pair.server.sent_records.items[sent_index]);
@@ -7126,15 +7142,19 @@ test "connection: issue/send/retire cycling past the active-CID count never regr
     // More cycles than `max_local_active_cids`: each cycle issues, sends,
     // and immediately retires one CID, so `next_sequence` climbs well past
     // 8 while `activeCount()` never exceeds 1 beyond the handshake CID.
-    // If retirement ever stopped canceling in-flight/queued copies, this
-    // would eventually exceed the queue's reserved capacity and force the
-    // unwiped-growth path back open.
+    // Each cycle also directly requeues the exact record that just carried
+    // the now-retired sequence: a retirement that failed to cancel that
+    // in-flight copy would resurrect it right here, re-queued and counted
+    // against the very capacity this test bounds. Without driving that
+    // retransmission after every retire, a stale copy could accumulate
+    // silently across cycles without this test ever observing it.
     var out: [2048]u8 = undefined;
     var i: u8 = 0;
     while (i < quic_cid.max_local_active_cids + 2) : (i += 1) {
         const cid = try quic_cid.ConnectionId.init(&[_]u8{ 0xd0, i, i, i, i, i, i, i });
         try pair.server.advertiseLocalCid(cid);
         _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+        const sent_index = pair.server.sent_records.items.len - 1;
         try pair.server.applyFrame(
             .application,
             .{ .retire_connection_id = .{ .sequence = @as(u64, i) + 1 } },
@@ -7143,6 +7163,8 @@ test "connection: issue/send/retire cycling past the active-CID count never regr
             pair.now_us,
         );
         try testing.expectEqual(State.established, pair.server.state());
+        pair.server.requeueRecord(&pair.server.sent_records.items[sent_index]);
+        try testing.expectEqual(@as(usize, 0), pair.server.pending_new_connection_ids.items.len);
     }
 
     try testing.expectEqual(pending_backing, pair.server.pending_new_connection_ids.items.ptr);
@@ -7164,7 +7186,8 @@ test "connection: losing one NEW_CONNECTION_ID leaves all queued CID identities 
     var out: [2048]u8 = undefined;
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
     const sent = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
-    const first = sent.carried_new_connection_id orelse return error.TestExpectedEqual;
+    try testing.expect(sent.has_new_connection_id);
+    const first = sent.carried_new_connection_id;
     try testing.expectEqual(@as(u64, 1), first.sequence);
     try testing.expectEqualSlices(u8, first_cid.slice(), first.cid.slice());
     try testing.expectEqual(@as(usize, 1), pair.server.pending_new_connection_ids.items.len);
@@ -7285,10 +7308,10 @@ test "connection: teardown scrubs a still-pending and an in-flight NEW_CONNECTIO
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
     try testing.expectEqual(@as(usize, 1), pair.server.pending_new_connection_ids.items.len);
     const sent_index = pair.server.sent_records.items.len - 1;
-    try testing.expect(pair.server.sent_records.items[sent_index].carried_new_connection_id != null);
+    try testing.expect(pair.server.sent_records.items[sent_index].has_new_connection_id);
 
     var in_flight_nonzero = false;
-    for (pair.server.sent_records.items[sent_index].carried_new_connection_id.?.stateless_reset_token) |b| {
+    for (pair.server.sent_records.items[sent_index].carried_new_connection_id.stateless_reset_token) |b| {
         if (b != 0) in_flight_nonzero = true;
     }
     try testing.expect(in_flight_nonzero);
@@ -7309,7 +7332,7 @@ test "connection: teardown scrubs a still-pending and an in-flight NEW_CONNECTIO
     wipeSentRecordTokens(pair.server.sent_records.items);
     wipePendingNewConnectionIdTokens(pair.server.pending_new_connection_ids.items);
 
-    for (pair.server.sent_records.items[sent_index].carried_new_connection_id.?.stateless_reset_token) |byte| {
+    for (pair.server.sent_records.items[sent_index].carried_new_connection_id.stateless_reset_token) |byte| {
         try testing.expectEqual(@as(u8, 0), byte);
     }
     for (pair.server.pending_new_connection_ids.items[0].stateless_reset_token) |byte| {

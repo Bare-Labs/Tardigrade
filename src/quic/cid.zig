@@ -39,10 +39,10 @@ pub fn generateCid(entropy: []const u8, len: u8) error{ InvalidCidLength, NotEno
 // ---------------------------------------------------------------------------
 
 pub const NewConnectionIdFrame = struct {
-    sequence: u64,
-    retire_prior_to: u64,
-    cid: ConnectionId,
-    stateless_reset_token: [stateless_reset_token_len]u8,
+    sequence: u64 = 0,
+    retire_prior_to: u64 = 0,
+    cid: ConnectionId = .{},
+    stateless_reset_token: [stateless_reset_token_len]u8 = [_]u8{0} ** stateless_reset_token_len,
 };
 
 pub const RetireConnectionIdFrame = struct {
