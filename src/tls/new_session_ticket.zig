@@ -9,6 +9,7 @@ const crypto = std.crypto;
 const algorithms = @import("algorithms.zig");
 const key_schedule = @import("key_schedule.zig");
 const session = @import("session.zig");
+const provider = @import("crypto").provider;
 
 pub const max_lifetime_seconds = session.max_lifetime_seconds;
 pub const max_ticket_nonce_len = session.max_ticket_nonce_len;
@@ -148,6 +149,7 @@ pub fn decode(body: []const u8) DecodeError!Parsed {
 
 pub fn buildClientTicketState(
     allocator: std.mem.Allocator,
+    crypto_provider: provider.CryptoProvider,
     parsed: Parsed,
     connection: ConnectionResumptionContext,
     resumption_master_secret: []const u8,
@@ -161,6 +163,7 @@ pub fn buildClientTicketState(
     var psk: [session.max_psk_len]u8 = undefined;
     defer crypto.secureZero(u8, &psk);
     try key_schedule.KeySchedule.resumptionPsk(
+        crypto_provider,
         hash,
         resumption_master_secret,
         parsed.ticket_nonce,
@@ -215,6 +218,7 @@ pub const PrepareParams = struct {
 /// should use `buildServerRecoverableState` instead.
 pub fn buildServerRecoverableStateNoIdentity(
     allocator: std.mem.Allocator,
+    crypto_provider: provider.CryptoProvider,
     params: PrepareParams,
     connection: ConnectionResumptionContext,
     resumption_master_secret: []const u8,
@@ -229,6 +233,7 @@ pub fn buildServerRecoverableStateNoIdentity(
     var psk: [session.max_psk_len]u8 = undefined;
     defer crypto.secureZero(u8, &psk);
     try key_schedule.KeySchedule.resumptionPsk(
+        crypto_provider,
         hash,
         resumption_master_secret,
         params.ticket_nonce,
@@ -259,6 +264,7 @@ pub fn buildServerRecoverableStateNoIdentity(
 
 pub fn buildServerRecoverableState(
     allocator: std.mem.Allocator,
+    crypto_provider: provider.CryptoProvider,
     params: EmitParams,
     connection: ConnectionResumptionContext,
     resumption_master_secret: []const u8,
@@ -267,7 +273,7 @@ pub fn buildServerRecoverableState(
 ) BuildServerError!session.ServerRecoverableState {
     validateEmitParams(params) catch return error.IllegalParameter;
     if (params.ticket.len == 0 or params.ticket.len > limits.max_ticket_len) return error.TicketTooLarge;
-    return buildServerRecoverableStateNoIdentity(allocator, .{
+    return buildServerRecoverableStateNoIdentity(allocator, crypto_provider, .{
         .ticket_lifetime = params.ticket_lifetime,
         .ticket_age_add = params.ticket_age_add,
         .ticket_nonce = params.ticket_nonce,
@@ -355,6 +361,20 @@ fn writeU16(out: *[2]u8, value: u16) void {
 
 fn writeU32(out: *[4]u8, value: u32) void {
     std.mem.writeInt(u32, out, value, .big);
+}
+
+/// A fresh deterministic pure-Zig `CryptoProvider` for this module's own
+/// tests (#490), matching the fixture pattern `key_schedule.zig`'s test
+/// block uses: `DeterministicEntropy` (explicitly not a CSPRNG) plus the
+/// pure-Zig `Provider`, held as a per-call-site persistent local so every
+/// test call gets a live, valid provider without a hidden global default.
+fn testCryptoProvider() provider.CryptoProvider {
+    const pure_zig = @import("crypto").pure_zig;
+    const State = struct {
+        var entropy = pure_zig.DeterministicEntropy.init(0x1cec_5);
+        var backing = pure_zig.Provider.init(entropy.entropy());
+    };
+    return State.backing.cryptoProvider();
 }
 
 test "NewSessionTicket codec round trips without extensions" {
@@ -635,6 +655,7 @@ test "server recoverable state honors caller ticket limits" {
     var default_over = [_]u8{0xa5} ** (session.Limits.default.max_ticket_len + 1);
     try std.testing.expectError(error.TicketTooLarge, buildServerRecoverableState(
         std.testing.allocator,
+        testCryptoProvider(),
         .{
             .ticket_lifetime = 1,
             .ticket_age_add = 0,
@@ -650,6 +671,7 @@ test "server recoverable state honors caller ticket limits" {
     const custom_limits = session.Limits{ .max_ticket_len = default_over.len };
     var custom_state = try buildServerRecoverableState(
         std.testing.allocator,
+        testCryptoProvider(),
         .{
             .ticket_lifetime = 1,
             .ticket_age_add = 0,
@@ -668,6 +690,7 @@ test "server recoverable state honors caller ticket limits" {
     @memset(max_ticket, 0x5a);
     var max_state = try buildServerRecoverableState(
         std.testing.allocator,
+        testCryptoProvider(),
         .{
             .ticket_lifetime = 1,
             .ticket_age_add = 0,
@@ -686,6 +709,7 @@ test "server recoverable state honors caller ticket limits" {
     @memset(one_over, 0x5b);
     try std.testing.expectError(error.IllegalParameter, buildServerRecoverableState(
         std.testing.allocator,
+        testCryptoProvider(),
         .{
             .ticket_lifetime = 1,
             .ticket_age_add = 0,
@@ -702,6 +726,7 @@ test "server recoverable state honors caller ticket limits" {
     var nonce_256 = [_]u8{0x02} ** 256;
     var nonce_state = try buildServerRecoverableState(
         std.testing.allocator,
+        testCryptoProvider(),
         .{
             .ticket_lifetime = 1,
             .ticket_age_add = 0,
@@ -716,6 +741,7 @@ test "server recoverable state honors caller ticket limits" {
     nonce_state.deinit();
     try std.testing.expectError(error.IllegalParameter, buildServerRecoverableState(
         std.testing.allocator,
+        testCryptoProvider(),
         .{
             .ticket_lifetime = 1,
             .ticket_age_add = 0,
@@ -739,6 +765,7 @@ test "lifetime zero parses but does not build cacheable client state" {
     };
     const state = try buildClientTicketState(
         std.testing.allocator,
+        testCryptoProvider(),
         parsed,
         .{
             .cipher_suite = .tls_aes_128_gcm_sha256,
@@ -759,6 +786,7 @@ test "client ticket state derives distinct PSKs for distinct nonces" {
     const rms = [_]u8{0x42} ** 32;
     var first = (try buildClientTicketState(
         std.testing.allocator,
+        testCryptoProvider(),
         .{
             .ticket_lifetime = 60,
             .ticket_age_add = 0,
@@ -774,6 +802,7 @@ test "client ticket state derives distinct PSKs for distinct nonces" {
     defer first.deinit();
     var second = (try buildClientTicketState(
         std.testing.allocator,
+        testCryptoProvider(),
         .{
             .ticket_lifetime = 60,
             .ticket_age_add = 0,
@@ -813,6 +842,7 @@ fn exerciseClientTicketBuild(allocator: std.mem.Allocator) !void {
     const rms = [_]u8{0x42} ** 32;
     var state = (try buildClientTicketState(
         allocator,
+        testCryptoProvider(),
         .{
             .ticket_lifetime = 60,
             .ticket_age_add = 0x11223344,
@@ -840,6 +870,7 @@ fn exerciseServerTicketBuild(allocator: std.mem.Allocator) !void {
     const rms = [_]u8{0x42} ** 32;
     var state = try buildServerRecoverableState(
         allocator,
+        testCryptoProvider(),
         .{
             .ticket_lifetime = 60,
             .ticket_age_add = 0x11223344,
@@ -865,6 +896,7 @@ fn exerciseClientTicketClone(allocator: std.mem.Allocator) !void {
     const rms = [_]u8{0x42} ** 32;
     var source = (try buildClientTicketState(
         std.testing.allocator,
+        testCryptoProvider(),
         .{
             .ticket_lifetime = 60,
             .ticket_age_add = 0x11223344,

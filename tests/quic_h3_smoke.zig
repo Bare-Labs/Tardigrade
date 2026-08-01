@@ -651,6 +651,12 @@ const Smoke = struct {
     server: Endpoint,
     to_server: *DatagramQueue,
     to_client: *DatagramQueue,
+    /// Owned per-instance deterministic TLS-engine provider storage (#490
+    /// review), not the shared `test_quic_crypto.testHandshakeProvider()`
+    /// stream: every `Smoke` instance gets its own independent entropy,
+    /// order/filter-independent of any other test in the process.
+    client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{},
+    server_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{},
 
     /// The client's initial DCID: both sides derive Initial secrets from it
     /// (RFC 9001 §5.2) and the server adopts it as its connection ID.
@@ -675,12 +681,25 @@ const Smoke = struct {
         to_client.* = .{};
         const smoke = try allocator.create(Smoke);
         errdefer allocator.destroy(smoke);
+        // #490: initialize the deterministic provider storage directly in
+        // `smoke`'s already-allocated memory first (stable address, matching
+        // `HandshakeProviderStorage`'s requirement), then re-thread the same
+        // storage values through the struct literal below — `smoke.* =
+        // .{...}` constructs a fresh value for every field it does not
+        // itself read from `smoke`, so omitting these two fields would
+        // reset them to their `.{}` default and dangle the `CryptoProvider`
+        // values captured just below.
+        const client_crypto_provider = smoke.client_provider_storage.init(0x442_c);
+        const server_crypto_provider = smoke.server_provider_storage.init(0x442_5);
         smoke.* = .{
+            .client_provider_storage = smoke.client_provider_storage,
+            .server_provider_storage = smoke.server_provider_storage,
             .client = .{
                 .allocator = allocator,
                 .role = .client,
                 .backend = tls_backend.Tls13Backend.initClient(
-                    .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+                    .{ .hello_random = [_]u8{0xc1} ** 32 },
+                    client_crypto_provider,
                     .{ .pinned_certificate = tls_backend.testdata.certificate_der },
                 ),
                 .cid_routes = quic_cid.CidRoutingTable.init(allocator),
@@ -696,7 +715,8 @@ const Smoke = struct {
                 .allocator = allocator,
                 .role = .server,
                 .backend = tls_backend.Tls13Backend.initServer(
-                    .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+                    .{ .hello_random = [_]u8{0x51} ** 32 },
+                    server_crypto_provider,
                     try tls_backend.Identity.initPkcs8(
                         tls_backend.testdata.certificate_der,
                         tls_backend.testdata.private_key_pkcs8_der,

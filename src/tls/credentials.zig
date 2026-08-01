@@ -66,9 +66,31 @@ const crypto = std.crypto;
 const alerts = @import("alerts.zig");
 const events = @import("events.zig");
 const tls_state = @import("state.zig");
+const crypto_pkg = @import("crypto");
+const pure_zig = crypto_pkg.pure_zig;
+const crypto_provider_pkg = crypto_pkg.provider;
 
 const Ed25519 = crypto.sign.Ed25519;
 const EcdsaP256 = crypto.sign.ecdsa.EcdsaP256Sha256;
+
+/// `Identity.sign` (below) never needs external randomness: Ed25519 (RFC
+/// 8032) is fully deterministic, and the ECDSA-P256 software signing key
+/// (`pure_zig.SoftwareEcdsaP256SigningKey`) also derives its nonce
+/// deterministically, matching this module's pre-existing
+/// `key_pair.sign(input, null)` behavior before #490's migration onto the
+/// opaque `provider.SigningKey` handle. This fill function exists only to
+/// satisfy `provider.SigningKey.sign`'s type signature — it must never
+/// actually be invoked by either scheme this file supports, so it fails
+/// loudly rather than silently handing back predictable "randomness" if a
+/// future signature scheme changes that assumption without revisiting this
+/// call site.
+fn unreachableEntropyFill(context: *anyopaque, buffer: []u8) crypto_provider_pkg.EntropyError!void {
+    _ = context;
+    _ = buffer;
+    unreachable;
+}
+var no_entropy_sentinel: u8 = 0;
+const no_entropy = crypto_provider_pkg.Entropy{ .context = &no_entropy_sentinel, .fillFn = unreachableEntropyFill };
 
 pub const Role = tls_state.Role;
 
@@ -510,22 +532,29 @@ pub const Identity = struct {
     certificate_der: []const u8,
     key: Key,
 
+    /// The private-key material behind each supported scheme, held as the
+    /// pure-Zig software implementation of the opaque `provider.SigningKey`
+    /// handle rather than a raw `std.crypto` key pair (#490): `sign` below
+    /// calls through `SigningKey.sign`, so `Identity` never exposes private
+    /// bytes to a caller, and this is the single place they are constructed
+    /// or read directly. A future HSM/remote signer would present the same
+    /// `provider.SigningKey` shape without `Identity`'s public API changing.
     pub const Key = union(enum) {
-        ed25519: Ed25519.KeyPair,
-        ecdsa_p256: EcdsaP256.KeyPair,
+        ed25519: pure_zig.SoftwareSigningKey,
+        ecdsa_p256: pure_zig.SoftwareEcdsaP256SigningKey,
     };
 
     pub const InitError = error{InvalidPrivateKey};
 
     pub fn initPkcs8(certificate_der: []const u8, pkcs8_key_der: []const u8) InitError!Identity {
         if (ed25519SeedFromPkcs8(pkcs8_key_der)) |seed| {
-            const key_pair = Ed25519.KeyPair.generateDeterministic(seed) catch return error.InvalidPrivateKey;
-            return .{ .certificate_der = certificate_der, .key = .{ .ed25519 = key_pair } };
+            const software_key = pure_zig.SoftwareSigningKey.fromSeed(seed) catch return error.InvalidPrivateKey;
+            return .{ .certificate_der = certificate_der, .key = .{ .ed25519 = software_key } };
         } else |_| {}
         const scalar = try ecdsaP256KeyFromPkcs8(pkcs8_key_der);
         const secret = EcdsaP256.SecretKey.fromBytes(scalar) catch return error.InvalidPrivateKey;
-        const key_pair = EcdsaP256.KeyPair.fromSecretKey(secret) catch return error.InvalidPrivateKey;
-        return .{ .certificate_der = certificate_der, .key = .{ .ecdsa_p256 = key_pair } };
+        const software_key = pure_zig.SoftwareEcdsaP256SigningKey.fromSecretKey(secret) catch return error.InvalidPrivateKey;
+        return .{ .certificate_der = certificate_der, .key = .{ .ecdsa_p256 = software_key } };
     }
 
     /// The TLS SignatureScheme this identity signs CertificateVerify with.
@@ -543,25 +572,23 @@ pub const Identity = struct {
 
     /// Sign `input` into `out`, returning the signature length. Bounded: never
     /// writes past `out`; reports `SignatureOutputOverflow` when it would.
-    /// This is the single place the fixed private key is used for signing.
+    /// This is the single place the fixed private key is used for signing —
+    /// through the opaque `provider.SigningKey` handle, never a named
+    /// `std.crypto.sign` primitive directly (#490).
     pub fn sign(self: *const Identity, input: []const u8, out: []u8) SignError!usize {
-        switch (self.key) {
-            .ed25519 => |*key_pair| {
-                if (out.len < Ed25519.Signature.encoded_length) return error.SignatureOutputOverflow;
-                const signature = key_pair.sign(input, null) catch return error.SigningProviderFailure;
-                const bytes = signature.toBytes();
-                @memcpy(out[0..bytes.len], &bytes);
-                return bytes.len;
-            },
-            .ecdsa_p256 => |*key_pair| {
-                const signature = key_pair.sign(input, null) catch return error.SigningProviderFailure;
-                var der_buf: [EcdsaP256.Signature.der_encoded_length_max]u8 = undefined;
-                const der = signature.toDer(&der_buf);
-                if (out.len < der.len) return error.SignatureOutputOverflow;
-                @memcpy(out[0..der.len], der);
-                return der.len;
-            },
-        }
+        // `signingKey()` takes a mutable receiver purely for vtable-context
+        // shape; neither supported scheme's `sign` mutates key state, so
+        // reborrowing the const union payload as mutable here is sound —
+        // `Identity.sign` itself stays a read-only operation from its
+        // caller's point of view, matching its `*const Identity` signature.
+        const signer: crypto_provider_pkg.SigningKey = switch (self.key) {
+            .ed25519 => |*key| @constCast(key).signingKey(),
+            .ecdsa_p256 => |*key| @constCast(key).signingKey(),
+        };
+        return signer.sign(input, no_entropy, out) catch |err| switch (err) {
+            error.InvalidInput => error.SignatureOutputOverflow,
+            error.UnsupportedCapability, error.EntropyFailure, error.ProviderFailure => error.SigningProviderFailure,
+        };
     }
 
     /// Extract the P-256 private scalar from PKCS#8 DER (RFC 5915 inside
@@ -1409,7 +1436,7 @@ test "identity parser loads and rejects malformed PKCS#8" {
     const identity = try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der);
     const parsed = try (crypto.Certificate{ .buffer = testdata.certificate_der, .index = 0 }).parse();
     try testing.expect(parsed.pub_key_algo == .curveEd25519);
-    try testing.expectEqualSlices(u8, parsed.pubKey(), &identity.key.ed25519.public_key.toBytes());
+    try testing.expectEqualSlices(u8, parsed.pubKey(), &identity.key.ed25519.publicKey());
     try testing.expectError(
         error.InvalidPrivateKey,
         Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der[0 .. testdata.private_key_pkcs8_der.len - 1]),

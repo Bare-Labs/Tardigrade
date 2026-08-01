@@ -252,12 +252,19 @@ test "udp smoke: native client/server complete an H3 exchange over loopback" {
     const client_cid = [_]u8{ 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8 };
     const odcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
 
+    // Owned, per-test deterministic TLS-engine provider storage (#490
+    // review), not the shared `test_quic_crypto.testHandshakeProvider()`
+    // stream: independent of any other test in the process.
+    var client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
+    var server_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
     var client_backend = tls_backend.Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .hello_random = [_]u8{0xc1} ** 32 },
+        client_provider_storage.init(0x442_c),
         .{ .pinned_certificate = tls_backend.testdata.certificate_der },
     );
     var server_backend = tls_backend.Tls13Backend.initServer(
-        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+        .{ .hello_random = [_]u8{0x51} ** 32 },
+        server_provider_storage.init(0x442_5),
         try tls_backend.Identity.initPkcs8(
             tls_backend.testdata.certificate_der,
             tls_backend.testdata.private_key_pkcs8_der,
@@ -454,8 +461,13 @@ test "udp smoke: HTTP/3 runtime Retry sends tokenless Initials without tracked s
             client_cid[7] = @intCast(i);
             var odcid = [_]u8{0x83} ** 8;
             odcid[7] = @intCast(i);
+            // Fresh per-iteration storage (#490 review): each attempt gets
+            // its own independent deterministic provider, not a shared
+            // stream advancing across iterations or other tests.
+            var client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
             var client_backend = tls_backend.Tls13Backend.initClient(
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+                .{ .hello_random = [_]u8{0xc1} ** 32 },
+                client_provider_storage.init(0x442_c),
                 .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
             );
             const client = try Connection.init(allocator, .{
@@ -543,8 +555,10 @@ test "udp smoke: HTTP/3 runtime Retry-off flood cleans unauthenticated state" {
         .local = addressFromSockaddrIn(client_socket.addr),
         .remote = runtime.local_address,
     };
+    var client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
     var client_backend = tls_backend.Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xe1} ** 32, .key_share_seed = [_]u8{0x51} ** 32, .retry_key_share_seed = [_]u8{0x51} ** 32 },
+        .{ .hello_random = [_]u8{0xe1} ** 32 },
+        client_provider_storage.init(0x442_c),
         .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
     );
     const client = try Connection.init(allocator, .{
@@ -581,8 +595,12 @@ test "udp smoke: HTTP/3 runtime Retry-off flood cleans unauthenticated state" {
         var cap_odcid = [_]u8{0x41} ** 8;
         cap_odcid[6] = @intCast(i / 256);
         cap_odcid[7] = @intCast(i);
+        // Fresh per-iteration storage (#490 review) — see the matching
+        // comment above.
+        var cap_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
         var cap_backend = tls_backend.Tls13Backend.initClient(
-            .{ .hello_random = [_]u8{0xa1} ** 32, .key_share_seed = [_]u8{0x61} ** 32, .retry_key_share_seed = [_]u8{0x61} ** 32 },
+            .{ .hello_random = [_]u8{0xa1} ** 32 },
+            cap_provider_storage.init(0x442_c),
             .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
         );
         const cap_client = try Connection.init(allocator, .{
@@ -717,8 +735,10 @@ test "udp smoke: HTTP/3 runtime Retry round trip completes a native H3 request" 
         .local = addressFromSockaddrIn(client_socket.addr),
         .remote = runtime.local_address,
     };
+    var client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
     var client_backend = tls_backend.Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xd1} ** 32, .key_share_seed = [_]u8{0x31} ** 32, .retry_key_share_seed = [_]u8{0x31} ** 32 },
+        .{ .hello_random = [_]u8{0xd1} ** 32 },
+        client_provider_storage.init(0x442_c),
         .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
     );
     const client = try Connection.init(allocator, .{
@@ -831,8 +851,10 @@ test "udp smoke: HTTP/3 runtime drain lets admitted work finish and rejects new 
         .local = addressFromSockaddrIn(client_socket.addr),
         .remote = runtime.local_address,
     };
+    var client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
     var client_backend = tls_backend.Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xe1} ** 32, .key_share_seed = [_]u8{0x41} ** 32, .retry_key_share_seed = [_]u8{0x41} ** 32 },
+        .{ .hello_random = [_]u8{0xe1} ** 32 },
+        client_provider_storage.init(0x442_c),
         .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
     );
     const client = try Connection.init(allocator, .{
@@ -1036,12 +1058,16 @@ test "udp smoke: appliance credential provider authenticates native QUIC/H3" {
     const client_cid = [_]u8{ 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8 };
     const odcid = [_]u8{ 0x18, 0x27, 0x36, 0x45, 0x54, 0x63, 0x72, 0x81 };
 
+    var client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
+    var server_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
     var client_backend = tls_backend.Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xa9} ** 32, .key_share_seed = [_]u8{0x33} ** 32, .retry_key_share_seed = [_]u8{0x33} ** 32 },
+        .{ .hello_random = [_]u8{0xa9} ** 32 },
+        client_provider_storage.init(0x442_c),
         .{ .pinned_certificate = leaf_der },
     );
     var server_backend = tls_backend.Tls13Backend.initServerWithProvider(
-        .{ .hello_random = [_]u8{0x77} ** 32, .key_share_seed = [_]u8{0x44} ** 32, .retry_key_share_seed = [_]u8{0x44} ** 32 },
+        .{ .hello_random = [_]u8{0x77} ** 32 },
+        server_provider_storage.init(0x442_5),
         appliance.provider(),
     );
 

@@ -10189,6 +10189,7 @@ const PureZigTlsClient = struct {
         self.crypto_provider_state = tls_core.production_crypto.Provider.init(self.entropy_source.entropy());
         self.backend = tls_core.tls13_backend.Tls13Backend.initClientConfigured(
             try tls_core.production_crypto.freshHandshakeEntropy(),
+            self.cryptoProviderState().cryptoProvider(),
             .insecure_no_verification,
             tls_core.tls13_backend.recordConfig(alpnPolicy(alpn)),
             .{ .server_name = server_name },
@@ -10252,6 +10253,7 @@ const PureZigTlsClient = struct {
         self.crypto_provider_state = tls_core.production_crypto.Provider.init(self.entropy_source.entropy());
         self.backend = tls_core.tls13_backend.Tls13Backend.initClientConfigured(
             try tls_core.production_crypto.freshHandshakeEntropy(),
+            self.cryptoProviderState().cryptoProvider(),
             .insecure_no_verification,
             tls_core.tls13_backend.recordConfig(alpnPolicy(alpn)),
             .{ .server_name = server_name },

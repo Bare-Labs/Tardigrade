@@ -222,6 +222,16 @@ pub const NativeTlsConnection = struct {
 
         const self = try allocator.create(NativeTlsConnection);
         errdefer allocator.destroy(self);
+        // #490: the shared `CryptoProvider` must exist before the TLS
+        // handshake engine is constructed (it now takes one explicitly, for
+        // its own HKDF key schedule, X25519 key-share generation, and
+        // CertificateVerify signature verification) — built directly into
+        // `self`'s already-allocated storage here, ahead of the `self.* =
+        // .{...}` below, which re-threads this same value through
+        // explicitly so it is not reset to `undefined`.
+        self.entropy_source = .{};
+        self.crypto_provider_state = production_crypto.Provider.init(self.entropy_source.entropy());
+        const crypto_provider = self.crypto_provider_state.cryptoProvider();
 
         const backend = try allocator.create(tls_backend.Tls13Backend);
         var backend_owned_by_record = false;
@@ -231,6 +241,7 @@ pub const NativeTlsConnection = struct {
         };
         backend.* = tls_backend.Tls13Backend.initServerWithProviderConfigured(
             handshake_entropy,
+            crypto_provider,
             provider,
             .{
                 .policy = policy.nativeTlsPolicy(),
@@ -266,14 +277,15 @@ pub const NativeTlsConnection = struct {
             .backend = backend,
             .record = record,
             .policy = policy,
+            .entropy_source = self.entropy_source,
+            .crypto_provider_state = self.crypto_provider_state,
             .resumption_runtime = options.resumption_runtime,
             .server_early_data_policy = if (options.early_data_replay_gate != null and options.resumption_runtime != null) options.server_early_data_policy else .{},
         };
-        self.crypto_provider_state = production_crypto.Provider.init(self.entropy_source.entropy());
         record.* = try encrypted_stream.PureZigRecordStream.initWithCarrierBackendAndLimits(
             allocator,
             .server,
-            self.crypto_provider_state.cryptoProvider(),
+            crypto_provider,
             .tls_aes_128_gcm_sha256,
             self.socketCarrier(),
             backend.backend(),

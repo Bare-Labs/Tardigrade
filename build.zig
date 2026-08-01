@@ -539,6 +539,30 @@ pub fn build(b: *std.Build) void {
     quic_step.dependOn(&run_record_mode_handshake_tests.step);
     test_step.dependOn(&run_record_mode_handshake_tests.step);
 
+    // Dedicated test-only root for key_schedule_tests.zig (#490 review): a
+    // standalone module, structurally separate from tls_core_mod (src/tls/
+    // root.zig, the production TLS module every native TLS/QUIC/HTTP/exe
+    // consumer depends on). key_schedule_tests.zig carries approved direct-
+    // crypto fixtures (a std.crypto.auth.hmac.sha2.HmacSha256 cross-check,
+    // raw CryptoProvider vtable construction) that scripts/
+    // audit_crypto_boundary.zig deliberately never scans, on the invariant
+    // that no production code path can resolve the file that carries them —
+    // this module is wired only into test artifacts below, never into
+    // quic_mod/exe_mod/the tardi executable, so that invariant is structural
+    // (a Zig compiler property), not merely a convention.
+    const key_schedule_test_root_mod = b.createModule(.{
+        .root_source_file = b.path("src/tls/key_schedule_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    key_schedule_test_root_mod.addImport("tls_core", tls_core_mod);
+    key_schedule_test_root_mod.addImport("crypto", crypto_mod);
+    const key_schedule_tests_artifact = b.addTest(.{ .root_module = key_schedule_test_root_mod });
+    const run_key_schedule_tests = b.addRunArtifact(key_schedule_tests_artifact);
+    tls_step.dependOn(&run_key_schedule_tests.step);
+    crypto_step.dependOn(&run_key_schedule_tests.step);
+    test_step.dependOn(&run_key_schedule_tests.step);
+
     const http3_tests = b.addTest(.{ .root_module = http3_mod, .filters = quic_test_filters });
     const run_http3_tests = b.addRunArtifact(http3_tests);
     quic_step.dependOn(&run_http3_tests.step);
@@ -627,7 +651,6 @@ pub fn build(b: *std.Build) void {
     h3_interop_mod.addImport("quic", quic_mod);
     h3_interop_mod.addImport("http3", http3_mod);
     h3_interop_mod.addImport("stream_transport", stream_transport_mod);
-    h3_interop_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
     const h3_interop_tool = b.addExecutable(.{
         .name = "h3_interop_tool",
         .root_module = h3_interop_mod,

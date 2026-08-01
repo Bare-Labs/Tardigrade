@@ -12,7 +12,9 @@ const tls_adapter = @import("tls_adapter.zig");
 const tls_core = @import("tls_core");
 const tls_handshake = @import("tls_handshake.zig");
 const test_quic_crypto = @import("test_quic_crypto");
+const crypto_pkg = @import("crypto");
 
+const crypto_provider = crypto_pkg.provider;
 const shared = tls_core.tls13_backend;
 const RecordSink = tls_core.tls13_transport.EventSink;
 const HandshakeError = tls_handshake.HandshakeError;
@@ -256,12 +258,12 @@ pub const Tls13Backend = struct {
     local_transport_parameters: [max_transport_parameters_len]u8 = undefined,
     scratch: RecordSink = .{},
 
-    pub fn initClient(entropy: Entropy, trust: Trust) Tls13Backend {
-        return initClientWithOptions(entropy, trust, .{});
+    pub fn initClient(entropy: Entropy, tls_crypto_provider: crypto_provider.CryptoProvider, trust: Trust) Tls13Backend {
+        return initClientWithOptions(entropy, tls_crypto_provider, trust, .{});
     }
 
-    pub fn initClientWithOptions(entropy: Entropy, trust: Trust, options: ClientOptions) Tls13Backend {
-        return .{ .engine = shared.Tls13Backend.initClientConfigured(entropy, trust, .{
+    pub fn initClientWithOptions(entropy: Entropy, tls_crypto_provider: crypto_provider.CryptoProvider, trust: Trust, options: ClientOptions) Tls13Backend {
+        return .{ .engine = shared.Tls13Backend.initClientConfigured(entropy, tls_crypto_provider, trust, .{
             .policy = tls_core.policy.Policy.quicDefault(),
             .transport = .{ .extension = .{
                 .extension_type = ext_quic_transport_parameters,
@@ -270,19 +272,30 @@ pub const Tls13Backend = struct {
         }, options) };
     }
 
-    pub fn initClientWithAllocator(allocator: std.mem.Allocator, entropy: Entropy, trust: Trust) HandshakeError!Tls13Backend {
-        return initClientWithAllocatorAndOptions(allocator, entropy, trust, .{});
+    pub fn initClientWithAllocator(
+        allocator: std.mem.Allocator,
+        entropy: Entropy,
+        tls_crypto_provider: crypto_provider.CryptoProvider,
+        trust: Trust,
+    ) HandshakeError!Tls13Backend {
+        return initClientWithAllocatorAndOptions(allocator, entropy, tls_crypto_provider, trust, .{});
     }
 
-    pub fn initClientWithAllocatorAndOptions(allocator: std.mem.Allocator, entropy: Entropy, trust: Trust, options: ClientOptions) HandshakeError!Tls13Backend {
-        var self = initClientWithOptions(entropy, trust, options);
+    pub fn initClientWithAllocatorAndOptions(
+        allocator: std.mem.Allocator,
+        entropy: Entropy,
+        tls_crypto_provider: crypto_provider.CryptoProvider,
+        trust: Trust,
+        options: ClientOptions,
+    ) HandshakeError!Tls13Backend {
+        var self = initClientWithOptions(entropy, tls_crypto_provider, trust, options);
         self.allocator = allocator;
         self.engine.setPostHandshakeAllocator(allocator) catch |err| return mapError(err);
         return self;
     }
 
-    pub fn initServer(entropy: Entropy, identity: Identity) Tls13Backend {
-        return .{ .engine = shared.Tls13Backend.initServerConfigured(entropy, identity, .{
+    pub fn initServer(entropy: Entropy, tls_crypto_provider: crypto_provider.CryptoProvider, identity: Identity) Tls13Backend {
+        return .{ .engine = shared.Tls13Backend.initServerConfigured(entropy, tls_crypto_provider, identity, .{
             .policy = tls_core.policy.Policy.quicDefault(),
             .transport = .{ .extension = .{
                 .extension_type = ext_quic_transport_parameters,
@@ -291,14 +304,19 @@ pub const Tls13Backend = struct {
         }) };
     }
 
-    pub fn initServerWithAllocator(allocator: std.mem.Allocator, entropy: Entropy, identity: Identity) Tls13Backend {
-        var self = initServer(entropy, identity);
+    pub fn initServerWithAllocator(
+        allocator: std.mem.Allocator,
+        entropy: Entropy,
+        tls_crypto_provider: crypto_provider.CryptoProvider,
+        identity: Identity,
+    ) Tls13Backend {
+        var self = initServer(entropy, tls_crypto_provider, identity);
         self.allocator = allocator;
         return self;
     }
 
-    pub fn initServerWithProvider(entropy: Entropy, provider: CredentialProvider) Tls13Backend {
-        return .{ .engine = shared.Tls13Backend.initServerWithProviderConfigured(entropy, provider, .{
+    pub fn initServerWithProvider(entropy: Entropy, tls_crypto_provider: crypto_provider.CryptoProvider, provider: CredentialProvider) Tls13Backend {
+        return .{ .engine = shared.Tls13Backend.initServerWithProviderConfigured(entropy, tls_crypto_provider, provider, .{
             .policy = tls_core.policy.Policy.quicDefault(),
             .transport = .{ .extension = .{
                 .extension_type = ext_quic_transport_parameters,
@@ -307,8 +325,13 @@ pub const Tls13Backend = struct {
         }) };
     }
 
-    pub fn initServerWithAllocatorAndProvider(allocator: std.mem.Allocator, entropy: Entropy, provider: CredentialProvider) Tls13Backend {
-        var self = initServerWithProvider(entropy, provider);
+    pub fn initServerWithAllocatorAndProvider(
+        allocator: std.mem.Allocator,
+        entropy: Entropy,
+        tls_crypto_provider: crypto_provider.CryptoProvider,
+        provider: CredentialProvider,
+    ) Tls13Backend {
+        var self = initServerWithProvider(entropy, tls_crypto_provider, provider);
         self.allocator = allocator;
         return self;
     }
@@ -905,9 +928,10 @@ test "QUIC TLS backend does not embed maximum ticket storage" {
 }
 
 test "QUIC adapter teardown wipes private scratch, parameters, and shared engine ownership" {
-    const entropy = Entropy{ .hello_random = [_]u8{0x31} ** 32, .key_share_seed = [_]u8{0x32} ** 32, .retry_key_share_seed = [_]u8{0x33} ** 32 };
+    const entropy = Entropy{ .hello_random = [_]u8{0x31} ** 32 };
     var backend = Tls13Backend.initServer(
         entropy,
+        test_quic_crypto.testDefaultProvider(),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
     );
     @memset(&backend.local_transport_parameters, 0xa5);
@@ -921,7 +945,6 @@ test "QUIC adapter teardown wipes private scratch, parameters, and shared engine
     try std.testing.expectEqual(@as(usize, 0), backend.scratch.used);
     try std.testing.expect(std.mem.allEqual(u8, backend.scratch.scratch[0..used], 0));
     try std.testing.expect(std.mem.allEqual(u8, &backend.local_transport_parameters, 0));
-    try std.testing.expect(std.mem.allEqual(u8, &backend.engine.entropy.key_share_seed, 0));
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.engine.identity), 0));
     try std.testing.expect(!backend.engine.identity_present);
     try std.testing.expect(std.mem.allEqual(u8, &backend.engine.peer_transport_extension, 0));
@@ -930,42 +953,73 @@ test "QUIC adapter teardown wipes private scratch, parameters, and shared engine
 const RealHandshakeHarness = struct {
     client_adapter: tls_adapter.QuicTlsAdapter = .{ .provider = test_quic_crypto.testDefaultProvider() },
     server_adapter: tls_adapter.QuicTlsAdapter = .{ .provider = test_quic_crypto.testDefaultProvider() },
-    client_backend: Tls13Backend,
-    server_backend: Tls13Backend,
+    // Owned, per-instance deterministic TLS-engine provider storage (#490
+    // review), not the shared `test_quic_crypto.testHandshakeProvider()`
+    // stream: every harness instance gets its own independent entropy.
+    // `undefined` until `init`/`initWithSniProvider` seed it in place —
+    // never read before then.
+    client_provider_storage: test_quic_crypto.HandshakeProviderStorage = undefined,
+    server_provider_storage: test_quic_crypto.HandshakeProviderStorage = undefined,
+    client_backend: Tls13Backend = undefined,
+    server_backend: Tls13Backend = undefined,
     client: tls_handshake.Handshake = undefined,
     server: tls_handshake.Handshake = undefined,
     wired: bool = false,
     deinitialized: bool = false,
 
-    fn init() !RealHandshakeHarness {
-        return .{
-            .client_backend = try Tls13Backend.initClientWithAllocator(
-                std.testing.allocator,
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
-                .{ .pinned_certificate = testdata.certificate_der },
-            ),
-            .server_backend = Tls13Backend.initServerWithAllocator(
-                std.testing.allocator,
-                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
-                try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
-            ),
-        };
+    /// Out-parameter style rather than `fn init() !RealHandshakeHarness`
+    /// (#490 review): `self.client_provider_storage`/`.server_provider_
+    /// storage` must be seeded at their *final* address before the
+    /// `CryptoProvider` values borrowing that storage are constructed, which
+    /// a `return .{...}` struct literal cannot guarantee — the literal is
+    /// not necessarily built in place at the eventual call site's storage.
+    /// Callers declare `var harness: RealHandshakeHarness = undefined;`
+    /// then `try harness.init();`.
+    fn init(self: *RealHandshakeHarness) !void {
+        const client_crypto_provider = self.client_provider_storage.init(0x442_c);
+        const server_crypto_provider = self.server_provider_storage.init(0x442_5);
+        self.client_adapter = .{ .provider = test_quic_crypto.testDefaultProvider() };
+        self.server_adapter = .{ .provider = test_quic_crypto.testDefaultProvider() };
+        self.client_backend = try Tls13Backend.initClientWithAllocator(
+            std.testing.allocator,
+            .{ .hello_random = [_]u8{0xc1} ** 32 },
+            client_crypto_provider,
+            .{ .pinned_certificate = testdata.certificate_der },
+        );
+        self.server_backend = Tls13Backend.initServerWithAllocator(
+            std.testing.allocator,
+            .{ .hello_random = [_]u8{0x51} ** 32 },
+            server_crypto_provider,
+            try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
+        );
+        self.client = undefined;
+        self.server = undefined;
+        self.wired = false;
+        self.deinitialized = false;
     }
 
-    fn initWithSniProvider(server_name: []const u8, provider: tls_core.credentials.CredentialProvider) !RealHandshakeHarness {
-        return .{
-            .client_backend = try Tls13Backend.initClientWithAllocatorAndOptions(
-                std.testing.allocator,
-                .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
-                .{ .pinned_certificate = testdata.certificate_der },
-                .{ .server_name = server_name },
-            ),
-            .server_backend = Tls13Backend.initServerWithAllocatorAndProvider(
-                std.testing.allocator,
-                .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
-                provider,
-            ),
-        };
+    fn initWithSniProvider(self: *RealHandshakeHarness, server_name: []const u8, provider: tls_core.credentials.CredentialProvider) !void {
+        const client_crypto_provider = self.client_provider_storage.init(0x442_c);
+        const server_crypto_provider = self.server_provider_storage.init(0x442_5);
+        self.client_adapter = .{ .provider = test_quic_crypto.testDefaultProvider() };
+        self.server_adapter = .{ .provider = test_quic_crypto.testDefaultProvider() };
+        self.client_backend = try Tls13Backend.initClientWithAllocatorAndOptions(
+            std.testing.allocator,
+            .{ .hello_random = [_]u8{0xc1} ** 32 },
+            client_crypto_provider,
+            .{ .pinned_certificate = testdata.certificate_der },
+            .{ .server_name = server_name },
+        );
+        self.server_backend = Tls13Backend.initServerWithAllocatorAndProvider(
+            std.testing.allocator,
+            .{ .hello_random = [_]u8{0x51} ** 32 },
+            server_crypto_provider,
+            provider,
+        );
+        self.client = undefined;
+        self.server = undefined;
+        self.wired = false;
+        self.deinitialized = false;
     }
 
     fn wire(self: *RealHandshakeHarness) !void {
@@ -1014,7 +1068,6 @@ const RealHandshakeHarness = struct {
 fn expectQuicBackendWiped(backend: *const Tls13Backend) !void {
     try std.testing.expectEqual(@as(usize, 0), backend.scratch.used);
     try std.testing.expect(std.mem.allEqual(u8, &backend.local_transport_parameters, 0));
-    try std.testing.expect(std.mem.allEqual(u8, &backend.engine.entropy.key_share_seed, 0));
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.engine.key_pair), 0));
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&backend.engine.identity), 0));
     try std.testing.expect(!backend.engine.key_pair_present);
@@ -1023,7 +1076,8 @@ fn expectQuicBackendWiped(backend: *const Tls13Backend) !void {
 }
 
 test "QUIC handshake owner tears down shared and adapter storage on success" {
-    var harness = try RealHandshakeHarness.init();
+    var harness: RealHandshakeHarness = undefined;
+    try harness.init();
     defer harness.deinit();
     try harness.wire();
     try harness.run();
@@ -1052,7 +1106,8 @@ test "QUIC TLS backend delivers large post-handshake tickets through application
         }
     };
 
-    var harness = try RealHandshakeHarness.init();
+    var harness: RealHandshakeHarness = undefined;
+    try harness.init();
     defer harness.deinit();
     var capture = Capture{};
     const limits = tls_core.session.Limits{ .max_ticket_len = tls_core.session.absolute_ticket_wire_max, .max_serialized_len = 128 * 1024 };
@@ -1102,7 +1157,8 @@ test "QUIC TLS backend delivers large post-handshake tickets through application
 }
 
 test "QUIC TLS backend drops valid post-handshake ticket with no consumer" {
-    var harness = try RealHandshakeHarness.init();
+    var harness: RealHandshakeHarness = undefined;
+    try harness.init();
     defer harness.deinit();
     try harness.wire();
     try harness.run();
@@ -1155,7 +1211,8 @@ test "QUIC handshake uses the shared reloadable SNI provider" {
     const first_patterns = [_][]const u8{"quic-one.example.test"};
     try provider.reload(&.{quicSniConfig(first_patterns[0..], chain[0..])}, .{ .unknown_sni_policy = .fail_handshake });
     {
-        var harness = try RealHandshakeHarness.initWithSniProvider("quic-one.example.test", provider.provider());
+        var harness: RealHandshakeHarness = undefined;
+        try harness.initWithSniProvider("quic-one.example.test", provider.provider());
         defer harness.deinit();
         try harness.wire();
         try harness.run();
@@ -1166,7 +1223,8 @@ test "QUIC handshake uses the shared reloadable SNI provider" {
     const second_patterns = [_][]const u8{"quic-two.example.test"};
     try provider.reload(&.{quicSniConfig(second_patterns[0..], chain[0..])}, .{ .unknown_sni_policy = .fail_handshake });
     {
-        var harness = try RealHandshakeHarness.initWithSniProvider("quic-two.example.test", provider.provider());
+        var harness: RealHandshakeHarness = undefined;
+        try harness.initWithSniProvider("quic-two.example.test", provider.provider());
         defer harness.deinit();
         try harness.wire();
         try harness.run();
@@ -1176,7 +1234,8 @@ test "QUIC handshake uses the shared reloadable SNI provider" {
 }
 
 test "QUIC handshake owner tears down shared and adapter storage on failure" {
-    var harness = try RealHandshakeHarness.init();
+    var harness: RealHandshakeHarness = undefined;
+    try harness.init();
     defer harness.deinit();
     harness.client_backend.engine.trust = .{ .pinned_certificate = "not the server certificate" };
     try harness.wire();
@@ -1187,7 +1246,8 @@ test "QUIC handshake owner tears down shared and adapter storage on failure" {
 }
 
 test "QUIC handshake owner tears down shared and adapter storage when abandoned" {
-    var harness = try RealHandshakeHarness.init();
+    var harness: RealHandshakeHarness = undefined;
+    try harness.init();
     defer harness.deinit();
     try harness.wire();
     harness.deinit();
@@ -1208,12 +1268,16 @@ test "the QUIC production driver resumes an async server signature without anoth
 
     var client_adapter = tls_adapter.QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
     var server_adapter = tls_adapter.QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
+    var client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
+    var server_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{};
     var client_backend = Tls13Backend.initClient(
-        .{ .hello_random = [_]u8{0xc1} ** 32, .key_share_seed = [_]u8{0x11} ** 32, .retry_key_share_seed = [_]u8{0x11} ** 32 },
+        .{ .hello_random = [_]u8{0xc1} ** 32 },
+        client_provider_storage.init(0x442_c),
         .{ .pinned_certificate = testdata.certificate_der },
     );
     var server_backend = Tls13Backend.initServer(
-        .{ .hello_random = [_]u8{0x51} ** 32, .key_share_seed = [_]u8{0x22} ** 32, .retry_key_share_seed = [_]u8{0x22} ** 32 },
+        .{ .hello_random = [_]u8{0x51} ** 32 },
+        server_provider_storage.init(0x442_5),
         try Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der),
     );
     // Serve the server credential through the async mock rather than the fixed

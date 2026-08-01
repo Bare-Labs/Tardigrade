@@ -233,6 +233,13 @@ const Sim = struct {
     iterations: usize = 0,
     timer_events: usize = 0,
     last_failure: ?FailureSnapshot = null,
+    /// #490: caller-owned deterministic `CryptoProvider` storage for the TLS
+    /// handshake engine's own key-share generation, seeded from `seed` (not
+    /// `test_quic_crypto.testHandshakeProvider`'s shared global stream) so a
+    /// given seed reproduces byte-for-byte regardless of what else in this
+    /// process called that shared helper.
+    client_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{},
+    server_provider_storage: test_quic_crypto.HandshakeProviderStorage = .{},
     client_backend: tls_backend.Tls13Backend,
     server_backend: tls_backend.Tls13Backend,
     client: *Connection,
@@ -290,29 +297,43 @@ const Sim = struct {
         return output;
     }
 
+    /// A domain-separated `u64` seed for the TLS handshake `CryptoProvider`
+    /// storage below, derived the same way `deterministicBytes` derives
+    /// `hello_random` — so provider entropy stays a pure function of
+    /// `sim_config.seed` and the domain byte, not of unrelated global state.
+    fn deterministicProviderSeed(seed: u64, domain: u8) u64 {
+        const bytes = deterministicBytes(seed, domain);
+        return std.mem.readInt(u64, bytes[0..8], .little);
+    }
+
     fn init(allocator: std.mem.Allocator, sim_config: Config) !*Sim {
         const sim = try allocator.create(Sim);
         errdefer allocator.destroy(sim);
+        // #490: initialize the per-simulation deterministic `CryptoProvider`
+        // storage directly in `sim`'s already-allocated memory first, then
+        // explicitly re-thread the same (unchanged) storage values through
+        // the big literal below — `sim.* = .{...}` constructs a fresh value
+        // for every field it does not otherwise read from `sim` itself, so
+        // omitting these two fields would reset them to `undefined` and
+        // dangle the `CryptoProvider` values captured just below.
+        const client_crypto_provider = sim.client_provider_storage.init(deterministicProviderSeed(sim_config.seed, 0x07));
+        const server_crypto_provider = sim.server_provider_storage.init(deterministicProviderSeed(sim_config.seed, 0x08));
         sim.* = .{
             .allocator = allocator,
             .scenario = sim_config.scenario,
             .seed = sim_config.seed,
             .limits = sim_config.limits,
             .log_failures = sim_config.log_failures,
+            .client_provider_storage = sim.client_provider_storage,
+            .server_provider_storage = sim.server_provider_storage,
             .client_backend = tls_backend.Tls13Backend.initClient(
-                .{
-                    .hello_random = deterministicBytes(sim_config.seed, 0x01),
-                    .key_share_seed = deterministicBytes(sim_config.seed, 0x02),
-                    .retry_key_share_seed = deterministicBytes(sim_config.seed, 0x05),
-                },
+                .{ .hello_random = deterministicBytes(sim_config.seed, 0x01) },
+                client_crypto_provider,
                 .{ .pinned_certificate = tls_backend.testdata.certificate_der },
             ),
             .server_backend = tls_backend.Tls13Backend.initServer(
-                .{
-                    .hello_random = deterministicBytes(sim_config.seed, 0x03),
-                    .key_share_seed = deterministicBytes(sim_config.seed, 0x04),
-                    .retry_key_share_seed = deterministicBytes(sim_config.seed, 0x06),
-                },
+                .{ .hello_random = deterministicBytes(sim_config.seed, 0x03) },
+                server_crypto_provider,
                 try tls_backend.Identity.initPkcs8(
                     tls_backend.testdata.certificate_der,
                     tls_backend.testdata.private_key_pkcs8_der,

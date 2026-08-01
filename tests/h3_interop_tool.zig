@@ -20,11 +20,11 @@
 
 const std = @import("std");
 const quic = @import("quic");
-const test_quic_crypto = @import("test_quic_crypto");
 const http3 = @import("http3");
 
 const connection = quic.connection;
 const tls_backend = quic.tls_backend;
+const production_crypto = quic.tls_core.production_crypto;
 const Connection = connection.Connection;
 const H3 = http3.conn.Conn(Connection);
 const posix = std.posix;
@@ -249,8 +249,6 @@ fn randomBytes(buffer: []u8) void {
 fn randomEntropy() tls_backend.Entropy {
     var entropy: tls_backend.Entropy = undefined;
     randomBytes(&entropy.hello_random);
-    randomBytes(&entropy.key_share_seed);
-    randomBytes(&entropy.retry_key_share_seed);
     return entropy;
 }
 
@@ -302,14 +300,21 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     const client_options = tls_backend.ClientOptions{
         .initial_key_share_mode = if (args.empty_initial_key_share) .empty else .normal,
     };
-    var backend = tls_backend.Tls13Backend.initClientWithOptions(randomEntropy(), trust, client_options);
+    // A real OS-backed provider, owned for this process's lifetime (#490
+    // review): this tool drives real network handshakes against real peers,
+    // so ephemeral X25519 keys must not be predictable the way a
+    // deterministic test provider's would be.
+    var crypto_provider_entropy = production_crypto.OsEntropy{};
+    var crypto_provider_state = production_crypto.Provider.init(crypto_provider_entropy.entropy());
+    const crypto_provider = crypto_provider_state.cryptoProvider();
+    var backend = tls_backend.Tls13Backend.initClientWithOptions(randomEntropy(), crypto_provider, trust, client_options);
     const client = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &local_cid,
         .original_destination_cid = &odcid,
         .initial_secret_dcid = &odcid,
         .tls = backend.backend(),
-        .crypto_provider = test_quic_crypto.testDefaultProvider(),
+        .crypto_provider = crypto_provider,
         .now_us = nowUs(),
         .events = .{ .emitFn = logEvent },
         .allow_unverified_certificate = args.insecure,
@@ -428,7 +433,12 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
             .local = addressFromSockaddrIn(socket.local),
             .remote = addressFromSockaddrIn(peer),
         };
-        var backend = tls_backend.Tls13Backend.initServer(randomEntropy(), identity);
+        // A real OS-backed provider, owned for this process's lifetime
+        // (#490 review) — see the matching comment in `runClient`.
+        var crypto_provider_entropy = production_crypto.OsEntropy{};
+        var crypto_provider_state = production_crypto.Provider.init(crypto_provider_entropy.entropy());
+        const crypto_provider = crypto_provider_state.cryptoProvider();
+        var backend = tls_backend.Tls13Backend.initServer(randomEntropy(), crypto_provider, identity);
         const server = try Connection.init(allocator, .{
             .role = .server,
             .local_cid = parsed.dcid,
@@ -436,7 +446,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
             .initial_secret_dcid = parsed.dcid,
             .peer_cid = parsed.scid,
             .tls = backend.backend(),
-            .crypto_provider = test_quic_crypto.testDefaultProvider(),
+            .crypto_provider = crypto_provider,
             .now_us = nowUs(),
             .events = .{ .emitFn = logEvent },
             .initial_path = server_path,
