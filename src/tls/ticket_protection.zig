@@ -1335,13 +1335,64 @@ pub fn fuzzTicketIdentity(allocator: std.mem.Allocator, input: []const u8) !void
     }
 }
 
+const snapshot_fuzz_control_len = 4;
+const snapshot_fuzz_config_stride = 28;
+const SnapshotFuzzOutcome = enum {
+    build_success,
+    too_many_keys,
+    duplicate_key_id,
+    invalid_key_length,
+    unsupported_capability,
+    invalid_validity_window,
+    invalid_nonce_lease,
+    ambiguous_encryption_window,
+    generation_overflow,
+    overlapping_nonce_lease,
+};
+
 pub fn fuzzSnapshotConfig(allocator: std.mem.Allocator, input: []const u8) !void {
-    const config_count = if (input.len == 0) 0 else @as(usize, input[0] % (max_keys + 2));
     var key_storage: [max_keys + 1][provider.max_aead_key_len + 1]u8 = undefined;
     var configs: [max_keys + 1]KeyConfig = undefined;
+    const configs_slice = decodeSnapshotFuzzConfigs(input, &key_storage, &configs);
+    const caps = fuzzCapabilities(input);
+    const generation = fuzzGeneration(input);
+    const mode = fuzzMode(input);
 
-    for (configs[0..@min(config_count, configs.len)], 0..) |*config, i| {
-        const base = i * 13 + 1;
+    const snapshot = Snapshot.build(allocator, configs_slice, generation, caps) catch {
+        try expectPartialBuildWipesCopiedKey(input);
+        try expectBuildErrorLeavesPublicationUnchanged(allocator, configs_slice, generation, caps);
+        return;
+    };
+    defer snapshot.release();
+
+    try testing.expect(configs_slice.len >= 1 and configs_slice.len <= max_keys);
+    try testing.expectEqual(configs_slice.len, snapshot.keys.len);
+    for (snapshot.keys) |*key| {
+        try testing.expect(caps.supportsAead(key.aead));
+        try testing.expectEqual(key.aead.keyLength(), key.key.len);
+        try testing.expect(key.not_before_unix_ms < key.encrypt_until_unix_ms);
+        try testing.expect(key.encrypt_until_unix_ms <= key.decrypt_until_unix_ms);
+        if (key.nonce_lease) |*lease| {
+            try testing.expect(lease.next_counter.load(.acquire) < lease.currentEnd());
+        }
+    }
+
+    if (mode == 3 and configs_slice.len > 0 and configs_slice[0].nonce_lease != null) {
+        try exerciseReplacementInstall(allocator, configs_slice[0], generation, caps, false);
+    } else {
+        try exerciseCandidateDryRun(allocator, configs_slice, generation, caps);
+    }
+}
+
+fn decodeSnapshotFuzzConfigs(
+    input: []const u8,
+    key_storage: *[max_keys + 1][provider.max_aead_key_len + 1]u8,
+    configs: *[max_keys + 1]KeyConfig,
+) []KeyConfig {
+    const config_count = if (input.len == 0) 0 else @as(usize, input[0] % (max_keys + 2));
+    const bounded_count = @min(config_count, configs.len);
+    for (configs.*[0..bounded_count], 0..) |*config, i| {
+        const base = snapshot_fuzz_control_len + i * snapshot_fuzz_config_stride;
         const aead = fuzzAead(byteAt(input, base));
         const exact_len = aead.keyLength();
         const len = switch (byteAt(input, base + 1) % 5) {
@@ -1351,7 +1402,7 @@ pub fn fuzzSnapshotConfig(allocator: std.mem.Allocator, input: []const u8) !void
             3 => exact_len + 1,
             else => @min(provider.max_aead_key_len + 1, exact_len + (byteAt(input, base + 2) % 3)),
         };
-        for (key_storage[i][0..], 0..) |*byte, j| {
+        for (key_storage.*[i][0..], 0..) |*byte, j| {
             byte.* = @truncate(byteAt(input, base + 3) +% @as(u8, @truncate(i * 17 + j)));
         }
 
@@ -1364,9 +1415,9 @@ pub fn fuzzSnapshotConfig(allocator: std.mem.Allocator, input: []const u8) !void
             fuzzLease(input, base + 6);
 
         config.* = .{
-            .id = fuzzKeyId(input, base + 10, @intCast(i)),
+            .id = fuzzKeyId(input, base + 12, @intCast(i)),
             .aead = aead,
-            .key_bytes = key_storage[i][0..len],
+            .key_bytes = key_storage.*[i][0..len],
             .not_before_unix_ms = not_before,
             .encrypt_until_unix_ms = encrypt_until,
             .decrypt_until_unix_ms = decrypt_until,
@@ -1375,57 +1426,149 @@ pub fn fuzzSnapshotConfig(allocator: std.mem.Allocator, input: []const u8) !void
     }
 
     if (config_count > 1) {
-        switch (byteAt(input, 2) % 4) {
-            0 => configs[1].id = configs[0].id,
-            1 => configs[1].key_bytes = configs[0].key_bytes,
+        switch (fuzzMode(input)) {
+            0 => configs.*[1].id = configs.*[0].id,
+            1 => configs.*[1].key_bytes = configs.*[0].key_bytes,
             2 => {
-                configs[1].nonce_lease = configs[0].nonce_lease;
-                configs[1].not_before_unix_ms = configs[0].not_before_unix_ms;
-                configs[1].encrypt_until_unix_ms = configs[0].encrypt_until_unix_ms;
+                configs.*[1].nonce_lease = configs.*[0].nonce_lease;
+                configs.*[1].not_before_unix_ms = configs.*[0].not_before_unix_ms;
+                configs.*[1].encrypt_until_unix_ms = configs.*[0].encrypt_until_unix_ms;
             },
             else => {},
         }
     }
+    return configs.*[0..bounded_count];
+}
 
-    const caps = fuzzCapabilities(input);
-    const generation = fuzzGeneration(input);
-    const snapshot = Snapshot.build(allocator, configs[0..@min(config_count, configs.len)], generation, caps) catch {
-        try expectKeyringStillPublishesCurrent(allocator);
-        return;
-    };
-    defer snapshot.release();
-
-    try testing.expect(config_count >= 1 and config_count <= max_keys);
-    try testing.expectEqual(config_count, snapshot.keys.len);
-    for (snapshot.keys) |*key| {
-        try testing.expect(caps.supportsAead(key.aead));
-        try testing.expectEqual(key.aead.keyLength(), key.key.len);
-        try testing.expect(key.not_before_unix_ms < key.encrypt_until_unix_ms);
-        try testing.expect(key.encrypt_until_unix_ms <= key.decrypt_until_unix_ms);
-        if (key.nonce_lease) |*lease| {
-            try testing.expect(lease.next_counter.load(.acquire) < lease.currentEnd());
-        }
-    }
-
+fn exerciseCandidateDryRun(
+    allocator: std.mem.Allocator,
+    configs: []const KeyConfig,
+    generation: u64,
+    caps: provider.Capabilities,
+) !void {
     var keyring = ReloadableKeyRing.init(allocator);
     defer keyring.deinit();
     const current = sampleKeyConfigWithByte(keyId(0xee), .aes_128_gcm, .{ .prefix = .{ 0xee, 0, 0, 0 }, .start = 0, .end_exclusive = 4 }, 0x11);
     try keyring.install(try keyring.buildSnapshot(&.{current}, testCapabilities()));
-    const before_current = keyring.current.?;
-    const before_generation = before_current.generation;
-    const before_next_generation = keyring.next_generation;
-    const before_ledger_len = keyring.ledger.items.len;
+    const before = captureKeyringState(&keyring);
 
-    const candidate = Snapshot.build(allocator, configs[0..@min(config_count, configs.len)], generation, caps) catch return;
+    const candidate = Snapshot.build(allocator, configs, generation, caps) catch return;
     keyring.validateInstallCandidate(candidate) catch {
         candidate.release();
-        try testing.expectEqual(before_current, keyring.current.?);
-        try testing.expectEqual(before_generation, keyring.current.?.generation);
-        try testing.expectEqual(before_next_generation, keyring.next_generation);
-        try testing.expectEqual(before_ledger_len, keyring.ledger.items.len);
+        try expectKeyringStateEqual(before, &keyring);
         return;
     };
     candidate.release();
+}
+
+fn exerciseReplacementInstall(
+    allocator: std.mem.Allocator,
+    candidate_config: KeyConfig,
+    generation: u64,
+    caps: provider.Capabilities,
+    comptime expect_overlap: bool,
+) !void {
+    if (!caps.supportsAead(candidate_config.aead)) return;
+    if (candidate_config.key_bytes.len != candidate_config.aead.keyLength()) return;
+    const candidate_lease = candidate_config.nonce_lease orelse return;
+    if (candidate_lease.start >= candidate_lease.end_exclusive) return;
+
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+
+    var baseline = candidate_config;
+    baseline.nonce_lease = .{
+        .prefix = candidate_lease.prefix,
+        .start = 0,
+        .end_exclusive = @max(candidate_lease.start + 1, candidate_lease.end_exclusive),
+    };
+    baseline.not_before_unix_ms = 0;
+    baseline.encrypt_until_unix_ms = 1_000;
+    baseline.decrypt_until_unix_ms = 20_000;
+    try keyring.install(try keyring.buildSnapshot(&.{baseline}, caps));
+    const before = captureKeyringState(&keyring);
+
+    const candidate = try Snapshot.build(allocator, &.{candidate_config}, generation, caps);
+    keyring.install(candidate) catch |err| {
+        if (expect_overlap) try testing.expectEqual(error.OverlappingNonceLease, err);
+        try expectKeyringStateEqual(before, &keyring);
+        return;
+    };
+    if (expect_overlap) return error.TestUnexpectedResult;
+}
+
+const KeyringState = struct {
+    current: ?*Snapshot,
+    current_generation: u64,
+    next_generation: u64,
+    ledger_len: usize,
+};
+
+fn captureKeyringState(keyring: *ReloadableKeyRing) KeyringState {
+    return .{
+        .current = keyring.current,
+        .current_generation = if (keyring.current) |current| current.generation else 0,
+        .next_generation = keyring.next_generation,
+        .ledger_len = keyring.ledger.items.len,
+    };
+}
+
+fn expectKeyringStateEqual(expected: KeyringState, keyring: *ReloadableKeyRing) !void {
+    try testing.expectEqual(expected.current, keyring.current);
+    try testing.expectEqual(expected.current_generation, if (keyring.current) |current| current.generation else 0);
+    try testing.expectEqual(expected.next_generation, keyring.next_generation);
+    try testing.expectEqual(expected.ledger_len, keyring.ledger.items.len);
+}
+
+fn expectBuildErrorLeavesPublicationUnchanged(
+    allocator: std.mem.Allocator,
+    configs: []const KeyConfig,
+    _: u64,
+    caps: provider.Capabilities,
+) !void {
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const current = sampleKeyConfigWithByte(keyId(0xed), .aes_128_gcm, .{ .prefix = .{ 0xed, 0, 0, 0 }, .start = 0, .end_exclusive = 4 }, 0x11);
+    try keyring.install(try keyring.buildSnapshot(&.{current}, testCapabilities()));
+    const before = captureKeyringState(&keyring);
+
+    const candidate = keyring.buildSnapshot(configs, caps) catch {
+        try expectKeyringStateEqual(before, &keyring);
+        return;
+    };
+    candidate.release();
+    try expectKeyringStateEqual(before, &keyring);
+}
+
+fn expectPartialBuildWipesCopiedKey(input: []const u8) !void {
+    var backing = [_]u8{0xcc} ** 16384;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var key_storage: [max_keys + 1][provider.max_aead_key_len + 1]u8 = undefined;
+    var configs: [max_keys + 1]KeyConfig = undefined;
+    const configs_slice = decodeSnapshotFuzzConfigs(input, &key_storage, &configs);
+    const caps = fuzzCapabilities(input);
+    const generation = fuzzGeneration(input);
+    const should_copy_first_key = configs_slice.len > 1 and firstConfigCopiesKey(configs_slice[0], caps);
+    const copied_key = if (should_copy_first_key) configs_slice[0].key_bytes else "";
+
+    const snapshot = Snapshot.build(fba.allocator(), configs_slice, generation, caps) catch {
+        if (should_copy_first_key) {
+            try testing.expect(std.mem.indexOf(u8, &backing, copied_key) == null);
+        }
+        return;
+    };
+    snapshot.release();
+}
+
+fn firstConfigCopiesKey(config: KeyConfig, caps: provider.Capabilities) bool {
+    if (!caps.supportsAead(config.aead)) return false;
+    if (config.key_bytes.len != config.aead.keyLength()) return false;
+    if (!(config.not_before_unix_ms < config.encrypt_until_unix_ms and
+        config.encrypt_until_unix_ms <= config.decrypt_until_unix_ms)) return false;
+    if (config.nonce_lease) |lease| {
+        if (lease.start >= lease.end_exclusive) return false;
+    }
+    return true;
 }
 
 fn byteAt(input: []const u8, idx: usize) u8 {
@@ -1490,6 +1633,10 @@ fn fuzzCapabilities(input: []const u8) provider.Capabilities {
     if (input.len > 1 and (input[1] & 0x04) != 0) caps.aeads.insert(.aes_256_gcm);
     if (input.len > 1 and (input[1] & 0x08) != 0) caps.aeads.insert(.chacha20_poly1305);
     return caps;
+}
+
+fn fuzzMode(input: []const u8) u8 {
+    return if (input.len > 2) input[2] % 4 else 3;
 }
 
 fn fuzzGeneration(input: []const u8) u64 {
@@ -1708,85 +1855,69 @@ test "fuzz helper preserves output on resolver allocation errors" {
 }
 
 test "fuzz: ticket snapshot configs preserve bounded build invariants" {
-    const empty_config_count = [_]u8{};
-    const exact_one_aes128 = [_]u8{
-        1,    0xff, 0xff, 0,
-        0,    2,    0x11, 1,
-        0,    1,    0x10, 0x10,
-        0x10, 0x10, 0x10, 0x10,
-        0x10, 0x10, 0x10, 0x10,
-        0x10, 0x10, 0x10, 0x10,
-        0x10, 0x10,
-    };
-    const exact_one_aes256 = [_]u8{
-        1,    0xff, 0xff, 0,
-        1,    2,    0x22, 1,
-        0,    1,    0x20, 0x20,
-        0x20, 0x20, 0x20, 0x20,
-        0x20, 0x20, 0x20, 0x20,
-        0x20, 0x20, 0x20, 0x20,
-        0x20, 0x20,
-    };
-    const exact_one_chacha = [_]u8{
-        1,    0xff, 0xff, 0,
-        2,    2,    0x33, 1,
-        0,    1,    0x30, 0x30,
-        0x30, 0x30, 0x30, 0x30,
-        0x30, 0x30, 0x30, 0x30,
-        0x30, 0x30, 0x30, 0x30,
-        0x30, 0x30,
-    };
-    const duplicate_id = [_]u8{
-        2,    0xff, 0,    0,
-        0,    2,    0x11, 1,
-        0,    1,    0xaa, 0xaa,
-        0xaa, 0xaa, 0xaa, 0xaa,
-        0xaa, 0xaa, 0xaa, 0xaa,
-        0xaa, 0xaa, 0xaa, 0xaa,
-        0xaa, 0xaa, 1,    2,
-        0x22, 1,    0,    1,
-        0xbb, 0xbb, 0xbb, 0xbb,
-        0xbb, 0xbb, 0xbb, 0xbb,
-        0xbb, 0xbb, 0xbb, 0xbb,
-        0xbb, 0xbb, 0xbb, 0xbb,
-    };
-    const unsupported_capability = [_]u8{
-        1,    0,    0xff, 0,
-        2,    2,    0x44, 1,
-        0,    1,    0x40, 0x40,
-        0x40, 0x40, 0x40, 0x40,
-        0x40, 0x40, 0x40, 0x40,
-        0x40, 0x40, 0x40, 0x40,
-        0x40, 0x40,
-    };
-    const invalid_window = [_]u8{
-        1,    0xff, 0xff, 0,
-        0,    2,    0x55, 2,
-        0,    1,    0x50, 0x50,
-        0x50, 0x50, 0x50, 0x50,
-        0x50, 0x50, 0x50, 0x50,
-        0x50, 0x50, 0x50, 0x50,
-        0x50, 0x50,
-    };
-    const invalid_lease = [_]u8{
-        1,    0xff, 0xff, 0,
-        0,    2,    0x66, 1,
-        1,    1,    0x60, 0x60,
-        0x60, 0x60, 0x60, 0x60,
-        0x60, 0x60, 0x60, 0x60,
-        0x60, 0x60, 0x60, 0x60,
-        0x60, 0x60,
-    };
-    const max_plus_one_keys = [_]u8{ max_keys + 1, 0xff, 0xff, 0 };
-    const generation_overflow = [_]u8{
-        1,    0xff, 0xff, 3,
-        0,    2,    0x77, 1,
-        0,    1,    0x70, 0x70,
-        0x70, 0x70, 0x70, 0x70,
-        0x70, 0x70, 0x70, 0x70,
-        0x70, 0x70, 0x70, 0x70,
-        0x70, 0x70,
-    };
+    var empty_config_count = snapshotSeed(0, 0xff, 3, 0);
+    var exact_one_aes128 = snapshotSeed(1, 0xff, 3, 0);
+    writeSnapshotSeedRecord(&exact_one_aes128, 0, .{ .aead = 0, .key_seed = 0x10, .id_seed = 0x10 });
+    var exact_one_aes256 = snapshotSeed(1, 0xff, 3, 0);
+    writeSnapshotSeedRecord(&exact_one_aes256, 0, .{ .aead = 1, .key_seed = 0x20, .id_seed = 0x20 });
+    var exact_one_chacha = snapshotSeed(1, 0xff, 3, 0);
+    writeSnapshotSeedRecord(&exact_one_chacha, 0, .{ .aead = 2, .key_seed = 0x30, .id_seed = 0x30 });
+
+    var duplicate_id = snapshotSeed(2, 0xff, 0, 0);
+    writeSnapshotSeedRecord(&duplicate_id, 0, .{ .aead = 0, .key_seed = 0x40, .id_seed = 0x40 });
+    writeSnapshotSeedRecord(&duplicate_id, 1, .{ .aead = 1, .key_seed = 0x50, .id_seed = 0x50 });
+
+    var unsupported_capability = snapshotSeed(1, 0x02, 3, 0);
+    writeSnapshotSeedRecord(&unsupported_capability, 0, .{ .aead = 2, .key_seed = 0x60, .id_seed = 0x60 });
+
+    var invalid_window = snapshotSeed(1, 0xff, 3, 0);
+    writeSnapshotSeedRecord(&invalid_window, 0, .{ .aead = 0, .key_seed = 0x70, .id_seed = 0x70, .time_case = 2 });
+
+    var invalid_lease = snapshotSeed(1, 0xff, 3, 0);
+    writeSnapshotSeedRecord(&invalid_lease, 0, .{
+        .aead = 0,
+        .key_seed = 0x80,
+        .id_seed = 0x80,
+        .lease_enabled = true,
+        .lease_case = 1,
+    });
+
+    var partial_build_wipe = snapshotSeed(2, 0xff, 3, 0);
+    writeSnapshotSeedRecord(&partial_build_wipe, 0, .{ .aead = 0, .key_seed = 0x90, .id_seed = 0x90 });
+    writeSnapshotSeedRecord(&partial_build_wipe, 1, .{ .aead = 1, .key_seed = 0xa0, .id_seed = 0xa0, .key_len_mode = 1 });
+
+    var exact_max_keys = snapshotSeed(max_keys, 0xff, 3, 0);
+    for (0..max_keys) |i| {
+        writeSnapshotSeedRecord(&exact_max_keys, i, .{ .aead = @truncate(i % 3), .key_seed = @intCast(0x20 + i), .id_seed = @intCast(0x40 + i), .lease_enabled = false });
+    }
+    var max_plus_one_keys = snapshotSeed(max_keys + 1, 0xff, 3, 0);
+
+    var generation_overflow = snapshotSeed(1, 0xff, 3, 3);
+    writeSnapshotSeedRecord(&generation_overflow, 0, .{ .aead = 0, .key_seed = 0xb0, .id_seed = 0xb0 });
+
+    var overlapping_replacement_lease = snapshotSeed(1, 0xff, 3, 0);
+    writeSnapshotSeedRecord(&overlapping_replacement_lease, 0, .{
+        .aead = 0,
+        .key_seed = 0xc0,
+        .id_seed = 0xc0,
+        .lease_enabled = true,
+        .lease_case = 6,
+        .lease_value = 1,
+    });
+
+    try expectSnapshotSeedOutcome(&empty_config_count, .too_many_keys);
+    try expectSnapshotSeedOutcome(&exact_one_aes128, .build_success);
+    try expectSnapshotSeedOutcome(&exact_one_aes256, .build_success);
+    try expectSnapshotSeedOutcome(&exact_one_chacha, .build_success);
+    try expectSnapshotSeedOutcome(&duplicate_id, .duplicate_key_id);
+    try expectSnapshotSeedOutcome(&unsupported_capability, .unsupported_capability);
+    try expectSnapshotSeedOutcome(&invalid_window, .invalid_validity_window);
+    try expectSnapshotSeedOutcome(&invalid_lease, .invalid_nonce_lease);
+    try expectSnapshotSeedOutcome(&partial_build_wipe, .invalid_key_length);
+    try expectSnapshotSeedOutcome(&exact_max_keys, .build_success);
+    try expectSnapshotSeedOutcome(&max_plus_one_keys, .too_many_keys);
+    try expectSnapshotSeedOutcome(&generation_overflow, .generation_overflow);
+    try expectSnapshotSeedOutcome(&overlapping_replacement_lease, .overlapping_nonce_lease);
 
     try testing.fuzz({}, fuzzTicketSnapshotConfigInput, .{ .corpus = &.{
         &empty_config_count,
@@ -1797,15 +1928,101 @@ test "fuzz: ticket snapshot configs preserve bounded build invariants" {
         &unsupported_capability,
         &invalid_window,
         &invalid_lease,
+        &partial_build_wipe,
+        &exact_max_keys,
         &max_plus_one_keys,
         &generation_overflow,
+        &overlapping_replacement_lease,
     } });
 }
 
 fn fuzzTicketSnapshotConfigInput(_: void, smith: *testing.Smith) !void {
-    var input_buf: [1 + (max_keys + 1) * 13]u8 = undefined;
+    var input_buf: [snapshot_fuzz_control_len + (max_keys + 1) * snapshot_fuzz_config_stride]u8 = undefined;
     const len = smith.slice(&input_buf);
     try fuzzSnapshotConfig(testing.allocator, input_buf[0..len]);
+}
+
+const SnapshotSeedRecord = struct {
+    aead: u8,
+    key_len_mode: u8 = 2,
+    key_seed: u8,
+    time_case: u8 = 1,
+    lease_enabled: bool = false,
+    lease_prefix: [4]u8 = .{ 0xaa, 0xbb, 0xcc, 0xdd },
+    lease_case: u8 = 0,
+    lease_value: u8 = 0,
+    id_seed: u8,
+};
+
+fn snapshotSeed(count: u8, caps: u8, mode: u8, generation_mode: u8) [snapshot_fuzz_control_len + (max_keys + 1) * snapshot_fuzz_config_stride]u8 {
+    var seed = [_]u8{0} ** (snapshot_fuzz_control_len + (max_keys + 1) * snapshot_fuzz_config_stride);
+    seed[0] = count;
+    seed[1] = caps;
+    seed[2] = mode;
+    seed[3] = generation_mode;
+    return seed;
+}
+
+fn writeSnapshotSeedRecord(
+    seed: *[snapshot_fuzz_control_len + (max_keys + 1) * snapshot_fuzz_config_stride]u8,
+    index: usize,
+    record: SnapshotSeedRecord,
+) void {
+    const base = snapshot_fuzz_control_len + index * snapshot_fuzz_config_stride;
+    seed[base] = record.aead;
+    seed[base + 1] = record.key_len_mode;
+    seed[base + 3] = record.key_seed;
+    seed[base + 4] = record.time_case;
+    seed[base + 5] = if (record.lease_enabled) 1 else 0;
+    seed[base + 6] = record.lease_prefix[0];
+    seed[base + 7] = record.lease_prefix[1];
+    seed[base + 8] = record.lease_prefix[2];
+    seed[base + 9] = record.lease_prefix[3];
+    seed[base + 10] = record.lease_case;
+    seed[base + 11] = record.lease_value;
+    @memset(seed[base + 12 .. base + 12 + key_id_len], record.id_seed);
+}
+
+fn expectSnapshotSeedOutcome(input: []const u8, outcome: SnapshotFuzzOutcome) !void {
+    var key_storage: [max_keys + 1][provider.max_aead_key_len + 1]u8 = undefined;
+    var configs: [max_keys + 1]KeyConfig = undefined;
+    const configs_slice = decodeSnapshotFuzzConfigs(input, &key_storage, &configs);
+    const caps = fuzzCapabilities(input);
+    const generation = fuzzGeneration(input);
+
+    if (outcome == .overlapping_nonce_lease) {
+        try testing.expect(configs_slice.len > 0);
+        try exerciseReplacementInstall(testing.allocator, configs_slice[0], generation, caps, true);
+        return;
+    }
+    if (outcome == .generation_overflow) {
+        const candidate = try Snapshot.build(testing.allocator, configs_slice, generation, caps);
+        var keyring = ReloadableKeyRing.init(testing.allocator);
+        defer keyring.deinit();
+        const before = captureKeyringState(&keyring);
+        try testing.expectError(error.GenerationOverflow, keyring.install(candidate));
+        try expectKeyringStateEqual(before, &keyring);
+        return;
+    }
+
+    const result = Snapshot.build(testing.allocator, configs_slice, generation, caps);
+    switch (outcome) {
+        .build_success => {
+            const snapshot = try result;
+            snapshot.release();
+        },
+        .too_many_keys => try testing.expectError(error.TooManyKeys, result),
+        .duplicate_key_id => try testing.expectError(error.DuplicateKeyId, result),
+        .invalid_key_length => {
+            try testing.expectError(error.InvalidKeyLength, result);
+            try expectPartialBuildWipesCopiedKey(input);
+        },
+        .unsupported_capability => try testing.expectError(error.UnsupportedCapability, result),
+        .invalid_validity_window => try testing.expectError(error.InvalidValidityWindow, result),
+        .invalid_nonce_lease => try testing.expectError(error.InvalidNonceLease, result),
+        .ambiguous_encryption_window => try testing.expectError(error.AmbiguousEncryptionWindow, result),
+        .generation_overflow, .overlapping_nonce_lease => unreachable,
+    }
 }
 
 test "protectedLen reserves envelope overhead exactly" {
