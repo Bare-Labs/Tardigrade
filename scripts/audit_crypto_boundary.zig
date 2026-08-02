@@ -249,12 +249,11 @@ const file_checks_with_exceptions = [_]FileCheckWithExceptions{
         .path = "src/quic/path.zig",
         .forbidden = &full_forbidden,
         .exempt_exact = &.{"const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;"},
-        // Address-validation token issuance/validation and the Retry
-        // integrity tag use AES-GCM with process keys or RFC-fixed public
-        // constants; sealTokenPlaintextForTest is the one test-only helper
+        // Address-validation token issuance/validation uses AES-GCM with
+        // process keys; sealTokenPlaintextForTest is the one test-only helper
         // building a token payload the same way for fuzz coverage.
-        .exempt_functions = &.{ "issueRetry", "validateRetry", "retryIntegrityTag", "sealTokenPlaintextForTest" },
-        .rationale = "QUIC path validation may use public constants and the existing token/Retry-integrity exception, but must not add key exchange, signatures, KDF, or AES block-cipher shortcuts anywhere else in this file.",
+        .exempt_functions = &.{ "issueRetry", "validateRetry", "sealTokenPlaintextForTest" },
+        .rationale = "QUIC path validation may use the existing token-protection exception, but must not add key exchange, signatures, KDF, AES block-cipher shortcuts, or a second Retry-integrity implementation anywhere else in this file.",
     },
     .{
         .path = "src/quic/cid.zig",
