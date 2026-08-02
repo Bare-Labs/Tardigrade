@@ -396,6 +396,7 @@ const UpstreamServer = struct {
     thread: ?std.Thread,
     stop_flag: std.atomic.Value(bool),
     mutex: compat.Mutex = .{},
+    active_stream_fd: ?std.posix.fd_t = null,
     capture: RequestCapture,
     responses: []const UpstreamResponseSpec,
     next_response_index: usize,
@@ -427,6 +428,11 @@ const UpstreamServer = struct {
 
     fn stop(self: *UpstreamServer) void {
         self.stop_flag.store(true, .seq_cst);
+        self.mutex.lock();
+        if (self.active_stream_fd) |fd| {
+            _ = std.c.shutdown(fd, std.posix.SHUT.RDWR);
+        }
+        self.mutex.unlock();
         wakeListener(self.port());
         if (self.thread) |thread| thread.join();
         self.server.deinit();
@@ -1491,7 +1497,17 @@ fn rawTcpThreadMain(server: *RawTcpServer) void {
 }
 
 fn handleUpstreamConnection(server: *UpstreamServer, conn: compat.NetConnection) !void {
-    defer conn.stream.close();
+    server.mutex.lock();
+    server.active_stream_fd = conn.stream.handle;
+    server.mutex.unlock();
+    defer {
+        server.mutex.lock();
+        if (server.active_stream_fd) |fd| {
+            if (fd == conn.stream.handle) server.active_stream_fd = null;
+        }
+        server.mutex.unlock();
+        conn.stream.close();
+    }
     while (!server.stop_flag.load(.seq_cst)) {
         const req = readHttpMessage(server.allocator, conn.stream, 1024 * 1024) catch |err| switch (err) {
             error.InvalidHttpMessage => return,
@@ -11482,6 +11498,73 @@ test "proxy evicts stale pooled upstream connection after backend restart" {
     try std.testing.expectEqual(@as(u16, 200), third.status_code);
     try std.testing.expectEqualStrings("{\"version\":\"new\"}", third.body);
     try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+}
+
+test "proxy does not replay non-idempotent request on stale pooled upstream connection after backend restart" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "{\"version\":\"old\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .connection_header = "keep-alive",
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const upstream_port = upstream.port();
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream_port });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS", .value = "1" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var first = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/version",
+        .body = null,
+        .headers = &.{},
+    });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try std.testing.expectEqualStrings("{\"version\":\"old\"}", first.body);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+
+    upstream.stop();
+    upstream = try UpstreamServer.startOnPort(allocator, upstream_port, &.{.{
+        .body = "{\"version\":\"new\"}",
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    }});
+    try upstream.run();
+
+    var post = try sendRequest(allocator, tardigrade.port, .{
+        .method = "POST",
+        .path = "/proxy/version",
+        .body = "{\"write\":true}",
+        .headers = &.{},
+    });
+    defer post.deinit();
+    try std.testing.expectEqual(@as(u16, 502), post.status_code);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+
+    var second = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/version",
+        .body = null,
+        .headers = &.{},
+    });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 200), second.status_code);
+    try std.testing.expectEqualStrings("{\"version\":\"new\"}", second.body);
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
 }
 
 test "proxy forwards POST with an explicit zero-length body" {

@@ -78,6 +78,15 @@ fn setSocketTimeoutMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeout_ms:
     try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&send_tv));
 }
 
+fn isHttpMethodIdempotent(method: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(method, "GET") or
+        std.ascii.eqlIgnoreCase(method, "HEAD") or
+        std.ascii.eqlIgnoreCase(method, "PUT") or
+        std.ascii.eqlIgnoreCase(method, "DELETE") or
+        std.ascii.eqlIgnoreCase(method, "OPTIONS") or
+        std.ascii.eqlIgnoreCase(method, "TRACE");
+}
+
 pub const UpstreamHeader = struct {
     name: []const u8,
     value: []const u8,
@@ -315,7 +324,7 @@ pub fn executeBoundedBufferedUnixSocketHttpRequest(
             return resp;
         } else |err| {
             p.release(key, conn, false, http.event_loop.monotonicMs());
-            if (reused and err == error.UpstreamConnectionClosed and attempt == 0) {
+            if (reused and err == error.UpstreamConnectionClosed and attempt == 0 and isHttpMethodIdempotent(method)) {
                 p.recordStaleRetry(key);
                 continue; // request never delivered — retry once on a fresh conn
             }
@@ -484,7 +493,7 @@ pub fn executeBoundedBufferedTcpHttpRequest(
             return resp;
         } else |err| {
             p.release(key, conn, false, http.event_loop.monotonicMs()); // active--, close (deinits TLS)
-            if (reused and err == error.UpstreamConnectionClosed and attempt == 0) {
+            if (reused and err == error.UpstreamConnectionClosed and attempt == 0 and isHttpMethodIdempotent(method)) {
                 p.recordStaleRetry(key);
                 continue; // retry once on a fresh connection
             }
