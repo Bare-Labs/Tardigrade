@@ -27,6 +27,17 @@ const key_fingerprint_domain = "tardigrade/tls-ticket/key-fingerprint/v1\x00";
 pub const KeyId = [key_id_len]u8;
 const TicketKeySecret = secrets.FixedSecret(provider.max_aead_key_len);
 const KeyFingerprint = [32]u8;
+const KeyDeinitProbe = struct {
+    observed: usize = 0,
+
+    fn record(self: *KeyDeinitProbe, key: *const TicketKeySecret, logical_len: usize) void {
+        for (key.bytes[0..logical_len]) |byte| {
+            if (byte != 0) @panic("ticket key was not zeroized before cleanup observation");
+        }
+        self.observed += 1;
+    }
+};
+var test_key_deinit_probe: ?*KeyDeinitProbe = null;
 
 pub const ParseError = error{
     MalformedEnvelope,
@@ -269,7 +280,9 @@ const KeyRecord = struct {
     }
 
     fn deinit(self: *KeyRecord) void {
+        const key_len = self.key.len;
         self.key.deinit();
+        if (test_key_deinit_probe) |probe| probe.record(&self.key, key_len);
     }
 
     fn canEncryptAt(self: *const KeyRecord, now_unix_ms: i64) bool {
@@ -1346,7 +1359,9 @@ const SnapshotFuzzOutcome = enum {
     invalid_validity_window,
     invalid_nonce_lease,
     ambiguous_encryption_window,
+    stale_generation,
     generation_overflow,
+    non_overlapping_nonce_lease,
     overlapping_nonce_lease,
 };
 
@@ -1472,15 +1487,23 @@ fn exerciseReplacementInstall(
     if (candidate_config.key_bytes.len != candidate_config.aead.keyLength()) return;
     const candidate_lease = candidate_config.nonce_lease orelse return;
     if (candidate_lease.start >= candidate_lease.end_exclusive) return;
+    if (!expect_overlap) {
+        if (candidate_lease.start == 0) return;
+        if (generation == 1 or generation == std.math.maxInt(u64)) return;
+    }
 
     var keyring = ReloadableKeyRing.init(allocator);
     defer keyring.deinit();
 
+    const baseline_end = if (expect_overlap)
+        candidate_lease.end_exclusive
+    else
+        candidate_lease.start;
     var baseline = candidate_config;
     baseline.nonce_lease = .{
         .prefix = candidate_lease.prefix,
         .start = 0,
-        .end_exclusive = @max(candidate_lease.start + 1, candidate_lease.end_exclusive),
+        .end_exclusive = baseline_end,
     };
     baseline.not_before_unix_ms = 0;
     baseline.encrypt_until_unix_ms = 1_000;
@@ -1495,6 +1518,9 @@ fn exerciseReplacementInstall(
         return;
     };
     if (expect_overlap) return error.TestUnexpectedResult;
+    try testing.expect(keyring.current != before.current);
+    try testing.expect(keyring.current != null);
+    try testing.expectEqual(candidate_config.id, keyring.current.?.keys[0].id);
 }
 
 const KeyringState = struct {
@@ -1502,15 +1528,74 @@ const KeyringState = struct {
     current_generation: u64,
     next_generation: u64,
     ledger_len: usize,
+    current_key_count: usize,
+    ledger_count: usize,
+    current_keys: [max_keys]KeyState = undefined,
+    ledger_entries: [max_keys + 4]LedgerState = undefined,
+};
+
+const KeyState = struct {
+    id: KeyId,
+    aead: provider.Aead,
+    not_before_unix_ms: i64,
+    encrypt_until_unix_ms: i64,
+    decrypt_until_unix_ms: i64,
+    lease: LeaseState,
+};
+
+const LeaseState = struct {
+    key_id: KeyId = [_]u8{0} ** key_id_len,
+    prefix: [4]u8 = [_]u8{0} ** 4,
+    next_counter: u64 = 0,
+    end_exclusive: u64 = 0,
+    has_lease: bool = false,
+};
+
+const LedgerState = struct {
+    lease: LeaseState,
+    aead: provider.Aead,
+    key_fingerprint: KeyFingerprint,
 };
 
 fn captureKeyringState(keyring: *ReloadableKeyRing) KeyringState {
-    return .{
+    var state = KeyringState{
         .current = keyring.current,
         .current_generation = if (keyring.current) |current| current.generation else 0,
         .next_generation = keyring.next_generation,
         .ledger_len = keyring.ledger.items.len,
+        .current_key_count = 0,
+        .ledger_count = 0,
     };
+    if (keyring.current) |current| {
+        std.debug.assert(current.keys.len <= state.current_keys.len);
+        state.current_key_count = current.keys.len;
+        for (current.keys, 0..) |*key, i| {
+            state.current_keys[i] = .{
+                .id = key.id,
+                .aead = key.aead,
+                .not_before_unix_ms = key.not_before_unix_ms,
+                .encrypt_until_unix_ms = key.encrypt_until_unix_ms,
+                .decrypt_until_unix_ms = key.decrypt_until_unix_ms,
+                .lease = leaseStateFromKey(key),
+            };
+        }
+    }
+    std.debug.assert(keyring.ledger.items.len <= state.ledger_entries.len);
+    state.ledger_count = keyring.ledger.items.len;
+    for (keyring.ledger.items, 0..) |entry, i| {
+        state.ledger_entries[i] = .{
+            .lease = .{
+                .key_id = entry.key_id,
+                .prefix = entry.prefix,
+                .next_counter = 0,
+                .end_exclusive = entry.end_exclusive,
+                .has_lease = entry.has_lease,
+            },
+            .aead = entry.aead,
+            .key_fingerprint = entry.key_fingerprint,
+        };
+    }
+    return state;
 }
 
 fn expectKeyringStateEqual(expected: KeyringState, keyring: *ReloadableKeyRing) !void {
@@ -1518,6 +1603,58 @@ fn expectKeyringStateEqual(expected: KeyringState, keyring: *ReloadableKeyRing) 
     try testing.expectEqual(expected.current_generation, if (keyring.current) |current| current.generation else 0);
     try testing.expectEqual(expected.next_generation, keyring.next_generation);
     try testing.expectEqual(expected.ledger_len, keyring.ledger.items.len);
+    try testing.expectEqual(expected.current_key_count, if (keyring.current) |current| current.keys.len else 0);
+    if (keyring.current) |current| {
+        for (current.keys, 0..) |*key, i| {
+            try expectKeyStateEqual(expected.current_keys[i], key);
+        }
+    }
+    try testing.expectEqual(expected.ledger_count, keyring.ledger.items.len);
+    for (keyring.ledger.items, 0..) |entry, i| {
+        try expectLedgerStateEqual(expected.ledger_entries[i], entry);
+    }
+}
+
+fn leaseStateFromKey(key: *const KeyRecord) LeaseState {
+    if (key.nonce_lease) |*lease| {
+        return .{
+            .key_id = key.id,
+            .prefix = lease.prefix,
+            .next_counter = lease.next_counter.load(.acquire),
+            .end_exclusive = lease.currentEnd(),
+            .has_lease = true,
+        };
+    }
+    return .{ .key_id = key.id };
+}
+
+fn expectKeyStateEqual(expected: KeyState, key: *const KeyRecord) !void {
+    try testing.expectEqualSlices(u8, &expected.id, &key.id);
+    try testing.expectEqual(expected.aead, key.aead);
+    try testing.expectEqual(expected.not_before_unix_ms, key.not_before_unix_ms);
+    try testing.expectEqual(expected.encrypt_until_unix_ms, key.encrypt_until_unix_ms);
+    try testing.expectEqual(expected.decrypt_until_unix_ms, key.decrypt_until_unix_ms);
+    try expectLeaseStateEqual(expected.lease, leaseStateFromKey(key));
+}
+
+fn expectLedgerStateEqual(expected: LedgerState, entry: *const LeaseHighWater) !void {
+    try expectLeaseStateEqual(expected.lease, .{
+        .key_id = entry.key_id,
+        .prefix = entry.prefix,
+        .next_counter = 0,
+        .end_exclusive = entry.end_exclusive,
+        .has_lease = entry.has_lease,
+    });
+    try testing.expectEqual(expected.aead, entry.aead);
+    try testing.expectEqualSlices(u8, &expected.key_fingerprint, &entry.key_fingerprint);
+}
+
+fn expectLeaseStateEqual(expected: LeaseState, actual: LeaseState) !void {
+    try testing.expectEqualSlices(u8, &expected.key_id, &actual.key_id);
+    try testing.expectEqualSlices(u8, &expected.prefix, &actual.prefix);
+    try testing.expectEqual(expected.next_counter, actual.next_counter);
+    try testing.expectEqual(expected.end_exclusive, actual.end_exclusive);
+    try testing.expectEqual(expected.has_lease, actual.has_lease);
 }
 
 fn expectBuildErrorLeavesPublicationUnchanged(
@@ -1541,34 +1678,42 @@ fn expectBuildErrorLeavesPublicationUnchanged(
 }
 
 fn expectPartialBuildWipesCopiedKey(input: []const u8) !void {
-    var backing = [_]u8{0xcc} ** 16384;
-    var fba = std.heap.FixedBufferAllocator.init(&backing);
     var key_storage: [max_keys + 1][provider.max_aead_key_len + 1]u8 = undefined;
     var configs: [max_keys + 1]KeyConfig = undefined;
     const configs_slice = decodeSnapshotFuzzConfigs(input, &key_storage, &configs);
     const caps = fuzzCapabilities(input);
     const generation = fuzzGeneration(input);
-    const should_copy_first_key = configs_slice.len > 1 and firstConfigCopiesKey(configs_slice[0], caps);
-    const copied_key = if (should_copy_first_key) configs_slice[0].key_bytes else "";
+    const expected_deinit_count = initializedPrefixBeforeBuildFailure(configs_slice, caps);
+    if (expected_deinit_count == 0) return;
 
-    const snapshot = Snapshot.build(fba.allocator(), configs_slice, generation, caps) catch {
-        if (should_copy_first_key) {
-            try testing.expect(std.mem.indexOf(u8, &backing, copied_key) == null);
-        }
+    var probe = KeyDeinitProbe{};
+    test_key_deinit_probe = &probe;
+    defer test_key_deinit_probe = null;
+
+    const snapshot = Snapshot.build(testing.allocator, configs_slice, generation, caps) catch {
+        try testing.expectEqual(expected_deinit_count, probe.observed);
         return;
     };
     snapshot.release();
 }
 
-fn firstConfigCopiesKey(config: KeyConfig, caps: provider.Capabilities) bool {
-    if (!caps.supportsAead(config.aead)) return false;
-    if (config.key_bytes.len != config.aead.keyLength()) return false;
-    if (!(config.not_before_unix_ms < config.encrypt_until_unix_ms and
-        config.encrypt_until_unix_ms <= config.decrypt_until_unix_ms)) return false;
-    if (config.nonce_lease) |lease| {
-        if (lease.start >= lease.end_exclusive) return false;
+fn initializedPrefixBeforeBuildFailure(configs: []const KeyConfig, caps: provider.Capabilities) usize {
+    var initialized: usize = 0;
+    for (configs, 0..) |config, i| {
+        for (configs[0..i]) |prior| {
+            if (std.mem.eql(u8, &prior.id, &config.id)) return initialized;
+            if (prior.aead == config.aead and std.mem.eql(u8, prior.key_bytes, config.key_bytes)) return initialized;
+        }
+        if (!caps.supportsAead(config.aead)) return initialized;
+        if (config.key_bytes.len != config.aead.keyLength()) return initialized;
+        if (!(config.not_before_unix_ms < config.encrypt_until_unix_ms and
+            config.encrypt_until_unix_ms <= config.decrypt_until_unix_ms)) return initialized;
+        if (config.nonce_lease) |lease| {
+            if (lease.start >= lease.end_exclusive) return initialized;
+        }
+        initialized += 1;
     }
-    return true;
+    return 0;
 }
 
 fn byteAt(input: []const u8, idx: usize) u8 {
@@ -1895,6 +2040,19 @@ test "fuzz: ticket snapshot configs preserve bounded build invariants" {
     var generation_overflow = snapshotSeed(1, 0xff, 3, 3);
     writeSnapshotSeedRecord(&generation_overflow, 0, .{ .aead = 0, .key_seed = 0xb0, .id_seed = 0xb0 });
 
+    var stale_generation = snapshotSeed(1, 0xff, 3, 1);
+    writeSnapshotSeedRecord(&stale_generation, 0, .{ .aead = 0, .key_seed = 0xb8, .id_seed = 0xb8 });
+
+    var non_overlapping_replacement_lease = snapshotSeed(1, 0xff, 3, 0);
+    writeSnapshotSeedRecord(&non_overlapping_replacement_lease, 0, .{
+        .aead = 0,
+        .key_seed = 0xbc,
+        .id_seed = 0xbc,
+        .lease_enabled = true,
+        .lease_case = 6,
+        .lease_value = 1,
+    });
+
     var overlapping_replacement_lease = snapshotSeed(1, 0xff, 3, 0);
     writeSnapshotSeedRecord(&overlapping_replacement_lease, 0, .{
         .aead = 0,
@@ -1917,6 +2075,8 @@ test "fuzz: ticket snapshot configs preserve bounded build invariants" {
     try expectSnapshotSeedOutcome(&exact_max_keys, .build_success);
     try expectSnapshotSeedOutcome(&max_plus_one_keys, .too_many_keys);
     try expectSnapshotSeedOutcome(&generation_overflow, .generation_overflow);
+    try expectSnapshotSeedOutcome(&stale_generation, .stale_generation);
+    try expectSnapshotSeedOutcome(&non_overlapping_replacement_lease, .non_overlapping_nonce_lease);
     try expectSnapshotSeedOutcome(&overlapping_replacement_lease, .overlapping_nonce_lease);
 
     try testing.fuzz({}, fuzzTicketSnapshotConfigInput, .{ .corpus = &.{
@@ -1932,6 +2092,8 @@ test "fuzz: ticket snapshot configs preserve bounded build invariants" {
         &exact_max_keys,
         &max_plus_one_keys,
         &generation_overflow,
+        &stale_generation,
+        &non_overlapping_replacement_lease,
         &overlapping_replacement_lease,
     } });
 }
@@ -1990,9 +2152,25 @@ fn expectSnapshotSeedOutcome(input: []const u8, outcome: SnapshotFuzzOutcome) !v
     const caps = fuzzCapabilities(input);
     const generation = fuzzGeneration(input);
 
+    if (outcome == .non_overlapping_nonce_lease) {
+        try testing.expect(configs_slice.len > 0);
+        try exerciseReplacementInstall(testing.allocator, configs_slice[0], generation, caps, false);
+        return;
+    }
     if (outcome == .overlapping_nonce_lease) {
         try testing.expect(configs_slice.len > 0);
         try exerciseReplacementInstall(testing.allocator, configs_slice[0], generation, caps, true);
+        return;
+    }
+    if (outcome == .stale_generation) {
+        const candidate = try Snapshot.build(testing.allocator, configs_slice, generation, caps);
+        var keyring = ReloadableKeyRing.init(testing.allocator);
+        defer keyring.deinit();
+        const current = sampleKeyConfigWithByte(keyId(0xd1), .aes_128_gcm, .{ .prefix = .{ 0xd1, 0, 0, 0 }, .start = 0, .end_exclusive = 4 }, 0x11);
+        try keyring.install(try keyring.buildSnapshot(&.{current}, testCapabilities()));
+        const before = captureKeyringState(&keyring);
+        try testing.expectError(error.StaleSnapshotGeneration, keyring.install(candidate));
+        try expectKeyringStateEqual(before, &keyring);
         return;
     }
     if (outcome == .generation_overflow) {
@@ -2021,7 +2199,7 @@ fn expectSnapshotSeedOutcome(input: []const u8, outcome: SnapshotFuzzOutcome) !v
         .invalid_validity_window => try testing.expectError(error.InvalidValidityWindow, result),
         .invalid_nonce_lease => try testing.expectError(error.InvalidNonceLease, result),
         .ambiguous_encryption_window => try testing.expectError(error.AmbiguousEncryptionWindow, result),
-        .generation_overflow, .overlapping_nonce_lease => unreachable,
+        .stale_generation, .generation_overflow, .non_overlapping_nonce_lease, .overlapping_nonce_lease => unreachable,
     }
 }
 
