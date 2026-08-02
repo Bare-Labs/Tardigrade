@@ -296,7 +296,7 @@ const max_retry_pseudo_body_len = 1500;
 /// (`ODCID length || ODCID || Retry packet without tag`). Shared by
 /// `writeRetryV1` (compute) and `verifyRetryIntegrity` (compare), so there is
 /// exactly one implementation of the AAD construction.
-fn computeRetryIntegrityTag(original_dcid: []const u8, retry_body: []const u8) error{ InvalidConnectionId, RetryBodyTooLong }![retry_integrity_tag_len]u8 {
+pub fn computeRetryIntegrityTag(original_dcid: []const u8, retry_body: []const u8) error{ InvalidConnectionId, RetryBodyTooLong }![retry_integrity_tag_len]u8 {
     if (original_dcid.len > max_cid_len) return error.InvalidConnectionId;
     if (retry_body.len > max_retry_pseudo_body_len) return error.RetryBodyTooLong;
     const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;

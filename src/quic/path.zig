@@ -6,8 +6,6 @@
 //! - `AntiAmplification` enforces the 3x send budget per unvalidated path.
 //! - `RetryTokens` issues and verifies integrity-protected address-validation
 //!   tokens (timestamp/expiry, address binding, key rotation, tamper rejection).
-//! - `retryIntegrityTag` / `verifyRetryIntegrity` implement the RFC 9001 Retry
-//!   integrity tag. Stateless-reset tokens/packets live in `cid.zig`.
 //! - `PathManager` (#251) owns the per-connection path table keyed by the
 //!   (local, remote) address tuple: PATH_CHALLENGE/PATH_RESPONSE validation,
 //!   NAT-rebinding vs. migration classification, the configurable migration
@@ -19,6 +17,7 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const packet = @import("packet.zig");
 const udp = @import("udp.zig");
 const secrets = @import("crypto_secrets");
 
@@ -364,60 +363,6 @@ fn addressEql(a: udp.Address, b: udp.Address) bool {
     if (!std.mem.eql(u8, a.slice(), b.slice())) return false;
     // scope_id distinguishes link-local IPv6 paths and now round-trips in tokens.
     return a.scope_id == b.scope_id;
-}
-
-// ---------------------------------------------------------------------------
-// Retry integrity tag (RFC 9001 §5.8)
-// ---------------------------------------------------------------------------
-
-/// QUIC v1 Retry integrity AEAD key (RFC 9001 §5.8).
-pub const retry_integrity_key_v1 = [16]u8{
-    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
-    0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
-};
-/// QUIC v1 Retry integrity AEAD nonce (RFC 9001 §5.8).
-pub const retry_integrity_nonce_v1 = [12]u8{
-    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2,
-    0x23, 0x98, 0x25, 0xbb,
-};
-pub const retry_integrity_tag_len = 16;
-
-/// Largest Retry packet body (everything before the integrity tag) this module
-/// assembles a pseudo-packet for.
-pub const max_retry_body_len = 512;
-const max_retry_pseudo_len = 1 + udp.MaxConnectionIdLen + max_retry_body_len;
-
-/// Compute the Retry integrity tag over the Retry pseudo-packet
-/// (`ODCID length || ODCID || Retry packet without tag`), RFC 9001 §5.8.
-pub fn retryIntegrityTag(
-    original_dcid: []const u8,
-    retry_body: []const u8,
-) error{ ConnectionIdTooLong, RetryBodyTooLong }![retry_integrity_tag_len]u8 {
-    if (original_dcid.len > udp.MaxConnectionIdLen) return error.ConnectionIdTooLong;
-    if (retry_body.len > max_retry_body_len) return error.RetryBodyTooLong;
-
-    var pseudo: [max_retry_pseudo_len]u8 = undefined;
-    var len: usize = 0;
-    pseudo[len] = @intCast(original_dcid.len);
-    len += 1;
-    @memcpy(pseudo[len..][0..original_dcid.len], original_dcid);
-    len += original_dcid.len;
-    @memcpy(pseudo[len..][0..retry_body.len], retry_body);
-    len += retry_body.len;
-
-    var tag: [retry_integrity_tag_len]u8 = undefined;
-    Aes128Gcm.encrypt(&.{}, &tag, &.{}, pseudo[0..len], retry_integrity_nonce_v1, retry_integrity_key_v1);
-    return tag;
-}
-
-/// Verify a received Retry packet's trailing integrity tag against `original_dcid`.
-/// `retry_packet` includes the 16-byte tag. Returns false on tamper.
-pub fn verifyRetryIntegrity(original_dcid: []const u8, retry_packet: []const u8) bool {
-    if (retry_packet.len < retry_integrity_tag_len) return false;
-    const body = retry_packet[0 .. retry_packet.len - retry_integrity_tag_len];
-    const received_tag = retry_packet[retry_packet.len - retry_integrity_tag_len ..][0..retry_integrity_tag_len];
-    const expected = retryIntegrityTag(original_dcid, body) catch return false;
-    return secrets.constantTimeEqual(&expected, received_tag);
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,7 +1313,7 @@ test "retry integrity tag matches the RFC 9001 Appendix A.4 vector" {
     var retry_body: [20]u8 = undefined;
     _ = try std.fmt.hexToBytes(&retry_body, "ff000000010008f067a5502a4262b5746f6b656e");
 
-    const tag = try retryIntegrityTag(&odcid, &retry_body);
+    const tag = try packet.computeRetryIntegrityTag(&odcid, &retry_body);
     var expected: [16]u8 = undefined;
     _ = try std.fmt.hexToBytes(&expected, "04a265ba2eff4d829058fb3f0f2496ba");
     try testing.expectEqualSlices(u8, &expected, &tag);
@@ -1377,13 +1322,13 @@ test "retry integrity tag matches the RFC 9001 Appendix A.4 vector" {
     var retry_packet: [36]u8 = undefined;
     @memcpy(retry_packet[0..20], &retry_body);
     @memcpy(retry_packet[20..], &tag);
-    try testing.expect(verifyRetryIntegrity(&odcid, &retry_packet));
+    try testing.expect(packet.verifyRetryIntegrity(&retry_packet, &odcid));
 
     retry_packet[35] ^= 0x01;
-    try testing.expect(!verifyRetryIntegrity(&odcid, &retry_packet));
+    try testing.expect(!packet.verifyRetryIntegrity(&retry_packet, &odcid));
     // Wrong original DCID must also fail.
     @memcpy(retry_packet[20..], &tag);
-    try testing.expect(!verifyRetryIntegrity("wrongdcid", &retry_packet));
+    try testing.expect(!packet.verifyRetryIntegrity(&retry_packet, "wrongdcid"));
 }
 
 test "metrics distinguish invalid tokens from normal retry usage" {
