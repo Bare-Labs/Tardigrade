@@ -42,6 +42,14 @@ const TestKeyDeinitProbeStorage = if (builtin.is_test) struct {
     threadlocal var probe: ?*KeyDeinitProbe = null;
 } else struct {};
 
+fn deinitTicketKey(key: *TicketKeySecret) void {
+    const key_len = key.len;
+    key.deinit();
+    if (builtin.is_test) {
+        if (TestKeyDeinitProbeStorage.probe) |probe| probe.record(key, key_len);
+    }
+}
+
 pub const ParseError = error{
     MalformedEnvelope,
     UnsupportedVersion,
@@ -264,7 +272,7 @@ const KeyRecord = struct {
             return error.InvalidValidityWindow;
 
         var key = TicketKeySecret.init(config.key_bytes) catch return error.InvalidKeyLength;
-        errdefer key.deinit();
+        errdefer deinitTicketKey(&key);
 
         const lease = if (config.nonce_lease) |lease_config|
             try NonceLease.init(lease_config)
@@ -283,11 +291,7 @@ const KeyRecord = struct {
     }
 
     fn deinit(self: *KeyRecord) void {
-        const key_len = self.key.len;
-        self.key.deinit();
-        if (builtin.is_test) {
-            if (TestKeyDeinitProbeStorage.probe) |probe| probe.record(&self.key, key_len);
-        }
+        deinitTicketKey(&self.key);
     }
 
     fn canEncryptAt(self: *const KeyRecord, now_unix_ms: i64) bool {
@@ -1700,6 +1704,7 @@ fn expectPartialBuildWipesCopiedKey(input: []const u8) !void {
 }
 
 fn initializedPrefixBeforeBuildFailure(configs: []const KeyConfig, caps: provider.Capabilities) usize {
+    if (configs.len == 0 or configs.len > max_keys) return 0;
     var initialized: usize = 0;
     for (configs, 0..) |config, i| {
         for (configs[0..i]) |prior| {
@@ -1711,7 +1716,7 @@ fn initializedPrefixBeforeBuildFailure(configs: []const KeyConfig, caps: provide
         if (!(config.not_before_unix_ms < config.encrypt_until_unix_ms and
             config.encrypt_until_unix_ms <= config.decrypt_until_unix_ms)) return initialized;
         if (config.nonce_lease) |lease| {
-            if (lease.start >= lease.end_exclusive) return initialized;
+            if (lease.start >= lease.end_exclusive) return initialized + 1;
         }
         initialized += 1;
     }
@@ -2052,6 +2057,9 @@ test "fuzz: ticket snapshot configs preserve bounded build invariants" {
         writeSnapshotSeedRecord(&exact_max_keys, i, .{ .aead = @truncate(i % 3), .key_seed = @intCast(0x20 + i), .id_seed = @intCast(0x40 + i), .lease_enabled = false });
     }
     var max_plus_one_keys = snapshotSeed(max_keys + 1, 0xff, 3, 0);
+    for (0..max_keys + 1) |i| {
+        writeSnapshotSeedRecord(&max_plus_one_keys, i, .{ .aead = @truncate(i % 3), .key_seed = @intCast(0x50 + i), .id_seed = @intCast(0x70 + i), .lease_enabled = false });
+    }
 
     var generation_overflow = snapshotSeed(1, 0xff, 3, 3);
     writeSnapshotSeedRecord(&generation_overflow, 0, .{ .aead = 0, .key_seed = 0xb0, .id_seed = 0xb0 });
@@ -2215,7 +2223,10 @@ fn expectSnapshotSeedOutcome(input: []const u8, outcome: SnapshotFuzzOutcome) !v
         },
         .unsupported_capability => try testing.expectError(error.UnsupportedCapability, result),
         .invalid_validity_window => try testing.expectError(error.InvalidValidityWindow, result),
-        .invalid_nonce_lease => try testing.expectError(error.InvalidNonceLease, result),
+        .invalid_nonce_lease => {
+            try testing.expectError(error.InvalidNonceLease, result);
+            try expectPartialBuildWipesCopiedKey(input);
+        },
         .ambiguous_encryption_window => {
             try testing.expectError(error.AmbiguousEncryptionWindow, result);
             try expectPartialBuildWipesCopiedKey(input);
