@@ -9,7 +9,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 BINARY="${REPO_ROOT}/zig-out/bin/tardi"
 VERSION="0.0.0-smoke"
 OUTPUT_DIR="${TMPDIR}/dist"
-DEB_TEST_IMAGE="${DEB_TEST_IMAGE:-ubuntu@sha256:d7be1c094cc5845ee815d4632fe377514ee6ebcf8efaed6892889657e5ddaaa6}"
+DEB_TEST_IMAGE="${DEB_TEST_IMAGE:-ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90}"
 
 retry() {
     local attempts="$1"
