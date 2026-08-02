@@ -702,7 +702,15 @@ All notable user-facing changes to Tardigrade are documented here.
   `std.crypto.secureZero` spelling on its own: most of `src/tls`/`src/quic`
   legitimately zeroes a stack-local buffer with nothing to free, and #375
   itself classifies several comparisons in this scope as public and
-  correctly left ordinary.
+  correctly left ordinary. A second review round found the `timing_safe`
+  needles still qualifier-dependent (aliasing `std.crypto` itself, one level
+  higher, defeated them — fixed by matching the bare `timing_safe` token,
+  qualifier-independent) and the zero-then-free scanner still defeated by a
+  callee alias of `secureZero` or a buffer rename between the zero call and
+  the free (fixed with one-hop alias resolution for both) and by
+  `BoundedSecret.deinit`'s exact original regression reintroduced via a local
+  rename that survives across its sibling `clearAll` method (fixed with a
+  dedicated, asset-specific structural check for that one type).
 - **Native TLS listener now tolerates the RFC 8446 Appendix D.4
   middlebox-compatibility `change_cipher_spec` record (#369)** — the
   record layer required every post-ClientHello record's outer wire type

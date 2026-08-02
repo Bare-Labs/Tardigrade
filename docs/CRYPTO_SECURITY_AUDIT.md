@@ -253,30 +253,48 @@ before the story closes:
 
 - **#554** — done. `scripts/audit_crypto_boundary.zig` (`zig build
   audit-crypto-boundary`, part of `zig build test`) now also guards the two
-  regression classes this story fixed. Went through a review round after the
-  first version merged: that version scanned only `src/tls`/`src/quic`/
-  `src/pki` for raw `timing_safe`, missed `src/crypto`'s own non-implementation
-  consumers, used dot-suffixed needles a namespace-capture alias could evade,
-  and protected the zero-and-free finding in exactly three files by exact
-  historical variable name — passable by a new file or a harmless rename. The
-  merged version instead:
-  - Forbids a raw `std.crypto.timing_safe`/`crypto.timing_safe` call (no
-    trailing-dot requirement, so a `const timing_safe = std.crypto.timing_safe;`
-    capture-and-call is caught too) reappearing anywhere in `src/tls`,
-    `src/quic`, `src/pki`, or `src/crypto` outside `secrets.zig`'s own
+  regression classes this story fixed. Went through two review rounds before
+  landing:
+  - **First pass** found the initial version scanned only `src/tls`/
+    `src/quic`/`src/pki` for raw `timing_safe` (missing `src/crypto`'s own
+    non-implementation consumers, e.g. `rsa.zig`), used dot-suffixed needles
+    a namespace-capture alias (`const timing_safe = std.crypto.timing_safe;`)
+    could evade, and protected the zero-and-free finding in exactly three
+    files by four exact historical variable names — passable by a new file
+    or a harmless rename.
+  - **Second pass**, after fixing the above, found the fixes were still
+    incomplete: (a) the timing-safe needles remained *qualifier*-dependent,
+    so aliasing `std.crypto` itself one level higher
+    (`const std_crypto = std.crypto; std_crypto.timing_safe.eql(...)`, the
+    exact spelling `sni_provider.zig` already uses elsewhere in this repo)
+    defeated them; (b) the general zero-then-plain-free scanner matched
+    literal `secureZero(` calls and exact buffer-expression text, which a
+    *callee* alias (`const wipe = crypto.secrets.secureZero; wipe(buf);`) or
+    a *buffer* rename between the zero call and the free
+    (`const doomed = buf; allocator.free(doomed);`) both defeated; (c)
+    excluding all of `secrets.zig` from the structural scan left
+    `BoundedSecret.deinit`'s exact original regression reintroducible under a
+    local rename, since the zeroing (`clearAll`) and the free (`deinit`) live
+    in different, textually-out-of-order sibling methods no forward-only
+    single-function scan can connect.
+
+  The merged version:
+  - Matches the bare `timing_safe` token itself, independent of any
+    qualifier — sound because Zig aliasing can rename the path *to* a
+    namespace member but never the member's own name, so `timing_safe` must
+    appear literally in the source for any access to reach it, at any
+    aliasing depth — reappearing anywhere in `src/tls`, `src/quic`,
+    `src/pki`, or `src/crypto` outside `secrets.zig`'s own
     `constantTimeEqual` implementation (excluded by exact path, checked
-    separately with a named exception) — recursive, no other exceptions,
-    since every secret/authentication-derived comparison in these trees,
-    including `src/crypto/rsa.zig`'s EMSA-PSS final hash comparison, already
-    routes through `crypto.secrets.constantTimeEqual`/
-    `crypto.provider.constantTimeEqual`. Does not flag the public/
+    separately with a named exception). Does not flag the public/
     attacker-controlled comparisons in the "representative public
     comparisons" table below — those use ordinary `std.mem.eql`, never
     `timing_safe`.
   - A general zero-then-plain-free scanner, not a three-file/exact-variable-
     name list: it extracts the buffer expression every `secureZero(...)` call
-    (any qualifier) zeroes and looks for that same expression — including
-    through a `std.mem.sliceAsBytes`/`&`/local-rename indirection, and the
+    (any qualifier, or a local callee alias of it, one hop) zeroes and looks
+    for that same expression — including through a
+    `std.mem.sliceAsBytes`/`&`/local-rename indirection (one hop), and the
     `ArrayList`-style "zero `.items`, `.deinit()` the container" shape —
     handed to an ordinary `allocator.free`/`.deinit()` within the rest of the
     enclosing function, across `src/tls`, `src/quic`, `src/pki`, and
@@ -297,6 +315,13 @@ before the story closes:
     `.save`, all four `save*Cache`/`load*Cache` plaintext/sealed buffers, and
     every test helper following the same shape) — all fixed alongside the
     guard, routed through `secureZeroAndFree`/`secureZeroAndFreeAligned`.
+  - A dedicated structural check for `BoundedSecret.deinit` specifically: it
+    tracks only `self.bytes` (the one secret buffer that type owns), through
+    at most one local rename, across the type's *entire* struct body (every
+    method, not just one function) — narrow and asset-specific rather than a
+    generic "any zero + any free anywhere in the file" rule, which would
+    immediately misfire on this same file's own tests calling
+    `secret.deinit()` (the type's own, correct, public API, not a bypass).
   - Still not a project-wide ban on the raw `std.crypto.secureZero` spelling
     on its own (a separate, narrower named-file check retained for
     `ticket_key_snapshot.zig`/`sni_provider.zig`/`secrets.zig`): many call
@@ -305,6 +330,12 @@ before the story closes:
     toolchain-assumptions section above) — banning the raw spelling
     everywhere would flag every one of them, the same "mechanical
     conversion" this section's opening paragraph warns against.
+  - Not a claim of soundness against arbitrary aliasing depth for the
+    zero-and-free scanner (unlike the `timing_safe` token match, which is
+    complete for that one narrower question): buffer/callee alias
+    resolution goes one hop, and no lexical scan can fully replace real
+    semantic analysis. Each mechanism is scoped to catch the specific
+    bypasses found in review, not to prove no lexical bypass can ever exist.
 - **#555** — consolidate the duplicate RFC 9001 §5.8 Retry-integrity-tag
   implementations in `src/quic/packet.zig` (production) and `src/quic/path.zig`
   (unreachable, KAT-fixture-only). Both copies were fixed for constant-time
