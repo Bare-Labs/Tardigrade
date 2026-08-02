@@ -1012,6 +1012,15 @@ pub const PureZigRecordStream = struct {
                 .handshake_bytes => |hb| {
                     self.emitHandshakeRecords(hb.epoch, hb.data) catch |err| return self.fail(err);
                 },
+                // #564: must be applied before this batch's own traffic
+                // secrets are installed below — `EventSink.emitNegotiatedParameters`'s
+                // contract guarantees the backend emits it first — so
+                // `self.bridge.installTrafficSecret` derives `TrafficKeys`
+                // for the suite this connection actually negotiated.
+                .negotiated_parameters => |params| {
+                    self.bridge.cipher_suite = algorithms.fromInt(algorithms.CipherSuite, params.cipher_suite) orelse
+                        return self.fail(error.MalformedHandshake);
+                },
                 .traffic_secret => |ts| {
                     self.bridge.installTrafficSecret(ts.epoch, ts.direction, ts.data) catch |err| return self.fail(err);
                     self.advanceEpochOnSecret(ts.epoch, ts.direction);

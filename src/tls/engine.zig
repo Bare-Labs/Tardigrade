@@ -10,6 +10,7 @@ pub const state = @import("state.zig");
 pub const events = @import("events.zig");
 pub const handshake = @import("handshake.zig");
 pub const key_schedule = @import("key_schedule.zig");
+pub const transcript = @import("transcript.zig");
 
 pub const EngineConfig = struct {
     role: state.Role,
@@ -44,7 +45,7 @@ pub const Engine = struct {
         return self.core.handshake_state;
     }
 
-    pub fn transcriptHash(self: *const Engine) [key_schedule.hash_len]u8 {
+    pub fn transcriptHash(self: *const Engine) transcript.Digest {
         return self.core.transcriptHash();
     }
 
@@ -203,6 +204,11 @@ test "core engine can be instantiated for record mode without record framing" {
 test "engine drives protocol-neutral handshake state" {
     var engine = Engine.init(.{ .role = .server, .transport_mode = .record });
     try engine.start();
+    // This shell is protocol-neutral and never selects a cipher suite on
+    // its own (#564) — select a family explicitly so `transcriptHash()`
+    // below reflects real hashed bytes rather than the empty pre-selection
+    // digest.
+    engine.core.transcript.selectFamily(.sha256);
 
     var buffer: [32]u8 = undefined;
     var writer = handshake.Writer{ .buf = &buffer };
@@ -212,7 +218,8 @@ test "engine drives protocol-neutral handshake state" {
     _ = try engine.receiveHandshake(writer.written());
     try std.testing.expectEqual(state.HandshakeState.server_hello, engine.handshakeState());
     const transcript_hash = engine.transcriptHash();
-    try std.testing.expect(!std.mem.eql(u8, &transcript_hash, &([_]u8{0} ** key_schedule.hash_len)));
+    try std.testing.expectEqual(@as(usize, 32), transcript_hash.len);
+    try std.testing.expect(!std.mem.allEqual(u8, transcript_hash.slice(), 0));
 }
 
 test "engine retains fragmented input and drains coalesced messages" {

@@ -2,9 +2,9 @@
 //!
 //! Kept in a separate file from the production module (#490 review): this
 //! file's own cross-check against a direct `std.crypto.auth.hmac.sha2.
-//! HmacSha256` computation, and its raw `CryptoProvider` vtable fixture for
-//! typed-error-propagation, are legitimate test-only direct-crypto use, but a
-//! textual "scan everything before this marker" boundary inside the
+//! HmacSha256`/`HmacSha384` computation, and its raw `CryptoProvider` vtable
+//! fixture for typed-error-propagation, are legitimate test-only direct-crypto
+//! use, but a textual "scan everything before this marker" boundary inside the
 //! production file is not a sound reachability proof — Zig declarations are
 //! order-independent, so a production function declared before such a marker
 //! could still call a private helper declared after it, and the scan would
@@ -13,6 +13,12 @@
 //! `tests/support/quic_crypto.zig` and `tests/crypto_vectors.zig` aren't
 //! scanned either) is the sound fix: `key_schedule.zig` itself now has zero
 //! test-only content and is scanned in full, with no marker.
+//!
+//! SHA-384 fixtures below (independent of the SHA-256 RFC 8448 trace) were
+//! computed with plain Python `hmac`/`hashlib` implementing RFC 8446's
+//! HKDF-Expand-Label directly — not by re-deriving with the helpers under
+//! test — matching this codebase's existing differential-fixture convention
+//! (see `record_protection.zig`'s AES-256-GCM/ChaCha20 known-answer tests).
 
 const std = @import("std");
 const testing = std.testing;
@@ -30,8 +36,12 @@ const pure_zig = @import("crypto").pure_zig;
 const key_schedule = @import("tls_core").key_schedule;
 
 const KeySchedule = key_schedule.KeySchedule;
-const hash_len = key_schedule.hash_len;
 const shared_secret_len = key_schedule.shared_secret_len;
+/// SHA-256's digest length, used throughout the SHA-256 fixtures below. Not
+/// re-exported by `key_schedule.zig` itself (#564): the production module no
+/// longer names a single fixed digest length, since it is hash-agile.
+const hash_len = 32;
+const hash_len_384 = 48;
 
 /// A fresh deterministic pure-Zig `CryptoProvider` for this module's own
 /// tests, built the same way `src/crypto/pure_zig.zig`'s own test block
@@ -49,11 +59,11 @@ test "record-mode users can instantiate the protocol-neutral key schedule" {
 
     const shared = [_]u8{0x42} ** shared_secret_len;
     const transcript = [_]u8{0x24} ** hash_len;
-    var schedule = try KeySchedule.init(cp, &shared, transcript);
+    var schedule = try KeySchedule.init(cp, .sha256, &shared, &transcript);
     defer schedule.wipe();
-    var app = try schedule.applicationSecrets(transcript);
+    var app = try schedule.applicationSecrets(&transcript);
     defer app.wipe();
-    try testing.expect(!std.mem.eql(u8, &app.client, &app.server));
+    try testing.expect(!std.mem.eql(u8, app.clientSecret(), app.serverSecret()));
 }
 
 test "shared TLS 1.3 key schedule matches the RFC 8448 simple 1-RTT trace" {
@@ -63,21 +73,23 @@ test "shared TLS 1.3 key schedule matches the RFC 8448 simple 1-RTT trace" {
 
     const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
     const hello_hash = hexBytes("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
-    var schedule = try KeySchedule.init(cp, &shared, hello_hash);
+    var schedule = try KeySchedule.init(cp, .sha256, &shared, &hello_hash);
     defer schedule.wipe();
 
-    try testing.expectEqualSlices(u8, &hexBytes("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), &schedule.handshake_secret);
-    try testing.expectEqualSlices(u8, &hexBytes("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"), &schedule.client_handshake_traffic);
-    try testing.expectEqualSlices(u8, &hexBytes("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"), &schedule.server_handshake_traffic);
-    try testing.expectEqualSlices(u8, &hexBytes("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"), &schedule.master_secret);
+    try testing.expectEqualSlices(u8, &hexBytes("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), schedule.handshake_secret[0..hash_len]);
+    try testing.expectEqualSlices(u8, &hexBytes("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"), schedule.client_handshake_traffic[0..hash_len]);
+    try testing.expectEqualSlices(u8, &hexBytes("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"), schedule.server_handshake_traffic[0..hash_len]);
+    try testing.expectEqualSlices(u8, &hexBytes("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"), schedule.master_secret[0..hash_len]);
 
     const finished_hash = hexBytes("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
-    var app = try schedule.applicationSecrets(finished_hash);
+    var app = try schedule.applicationSecrets(&finished_hash);
     defer app.wipe();
-    try testing.expectEqualSlices(u8, &hexBytes("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"), &app.client);
-    try testing.expectEqualSlices(u8, &hexBytes("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"), &app.server);
-    var finished_key = try KeySchedule.finishedKey(cp, &schedule.server_handshake_traffic);
+    try testing.expectEqualSlices(u8, &hexBytes("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"), app.clientSecret());
+    try testing.expectEqualSlices(u8, &hexBytes("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"), app.serverSecret());
+
+    var finished_key: [hash_len]u8 = undefined;
     defer crypto.secureZero(u8, &finished_key);
+    try KeySchedule.finishedKey(cp, .sha256, schedule.server_handshake_traffic[0..hash_len], &finished_key);
     try testing.expectEqualSlices(u8, &hexBytes("008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8"), &finished_key);
 
     // The HKDF-Extract-as-HMAC verify_data trick documented on `verifyData`
@@ -89,8 +101,99 @@ test "shared TLS 1.3 key schedule matches the RFC 8448 simple 1-RTT trace" {
     const HmacSha256 = crypto.auth.hmac.sha2.HmacSha256;
     var direct_mac: [HmacSha256.mac_length]u8 = undefined;
     HmacSha256.create(&direct_mac, &finished_hash, &finished_key);
-    const verify_data = try KeySchedule.verifyData(cp, &schedule.server_handshake_traffic, finished_hash);
+    var verify_data: [hash_len]u8 = undefined;
+    try KeySchedule.verifyData(cp, .sha256, schedule.server_handshake_traffic[0..hash_len], &finished_hash, &verify_data);
     try testing.expectEqualSlices(u8, &direct_mac, &verify_data);
+}
+
+test "SHA-384 key schedule matches an independently computed known-answer fixture" {
+    // Checked-in literals computed independently of this module (plain
+    // Python hmac/hashlib implementing RFC 8446 HKDF-Expand-Label directly),
+    // for shared=0x42*32, transcript=0x24*48 — the SHA-384 analogue of the
+    // zero-PSK fixtures above.
+    var det = pure_zig.DeterministicEntropy.init(14);
+    var backing: pure_zig.Provider = undefined;
+    const cp = testProvider(&det, &backing);
+
+    const shared = [_]u8{0x42} ** shared_secret_len;
+    const transcript = [_]u8{0x24} ** hash_len_384;
+    var schedule = try KeySchedule.init(cp, .sha384, &shared, &transcript);
+    defer schedule.wipe();
+    try testing.expectEqual(provider.Hash.sha384, schedule.hash);
+    try testing.expectEqual(@as(usize, hash_len_384), schedule.digestLen());
+
+    try testing.expectEqualSlices(u8, &hexBytes("d6dc3f5d0217df1301fb9479d8aadd88e542306d6cdcf197913593658a5f2c50f526964fbaf5e4587be563272eda583d"), schedule.handshake_secret[0..hash_len_384]);
+    try testing.expectEqualSlices(u8, &hexBytes("8df0e42bc34170cf567790494d4fbb5b61538895bdaa2cf8a0ad2db0b588b46d52853504d8713db39e4c28f396cab7b0"), schedule.master_secret[0..hash_len_384]);
+    try testing.expectEqualSlices(u8, &hexBytes("3ce66a169e12ab6927d5832cba1abaabb6c5237b1f129ff8e18e355c2e8f6f56e53ab195579da5131217e94aa57f18ac"), schedule.client_handshake_traffic[0..hash_len_384]);
+    try testing.expectEqualSlices(u8, &hexBytes("062cc3bc2f786fd4d738bcf21d14ab173386513f5a98e99656b46865b373062768ff77f69b58467715667f56c7fd3353"), schedule.server_handshake_traffic[0..hash_len_384]);
+
+    var app = try schedule.applicationSecrets(&transcript);
+    defer app.wipe();
+    try testing.expectEqual(@as(usize, hash_len_384), app.len);
+    try testing.expectEqualSlices(u8, &hexBytes("8d2c41fc2f30630d9924bae6ff52df22d94939379fcd7de4b31f6bf7ceb0ec40c46c744a69ab217dc5c6e797ebebc291"), app.clientSecret());
+    try testing.expectEqualSlices(u8, &hexBytes("776852783850e21c01a86b5d5a861a7851f98a14189e6c58bfa941c9d99815317304e2deb0d74185ee97aa415ea74eb0"), app.serverSecret());
+
+    var finished_key: [hash_len_384]u8 = undefined;
+    defer crypto.secureZero(u8, &finished_key);
+    try KeySchedule.finishedKey(cp, .sha384, schedule.server_handshake_traffic[0..hash_len_384], &finished_key);
+    try testing.expectEqualSlices(u8, &hexBytes("0618d45ecd47b39463530464a6a91a50394c343442f3ec4491a8d0ecbcfb79ba24163c3a3a035676253e5c08ebe7b22e"), &finished_key);
+
+    const HmacSha384 = crypto.auth.hmac.sha2.HmacSha384;
+    var direct_mac: [HmacSha384.mac_length]u8 = undefined;
+    HmacSha384.create(&direct_mac, &transcript, &finished_key);
+    var verify_data: [hash_len_384]u8 = undefined;
+    try KeySchedule.verifyData(cp, .sha384, schedule.server_handshake_traffic[0..hash_len_384], &transcript, &verify_data);
+    try testing.expectEqualSlices(u8, &hexBytes("c9df95efc74c3e4ad63513ef86662693b2c52ceb0365773697c35d99a0ae7895a103993cad47021f0f55d0148d375daf"), &verify_data);
+    try testing.expectEqualSlices(u8, &direct_mac, &verify_data);
+}
+
+test "SHA-384 initWithPsk matches an independently computed known-answer fixture" {
+    var det = pure_zig.DeterministicEntropy.init(15);
+    var backing: pure_zig.Provider = undefined;
+    const cp = testProvider(&det, &backing);
+
+    const shared = [_]u8{0x42} ** shared_secret_len;
+    const transcript = [_]u8{0x24} ** hash_len_384;
+    const psk = [_]u8{0x99} ** hash_len_384;
+
+    var schedule = try KeySchedule.initWithPsk(cp, .sha384, &psk, &shared, &transcript);
+    defer schedule.wipe();
+
+    try testing.expectEqualSlices(u8, &hexBytes("219ee43b44c170016081d9116317eab9b749cd4a6f3c7f0ba4f33594ba2889c3636f74b6ca205763519447a4fbb2bbd6"), schedule.handshake_secret[0..hash_len_384]);
+    try testing.expectEqualSlices(u8, &hexBytes("c29de3d70cc9b39002b526cd3da32b39898e2b3a92fb167edfe18eb8df87da96a2ba26ba178b9062d6f2c85ea5d35bb6"), schedule.master_secret[0..hash_len_384]);
+    try testing.expectEqualSlices(u8, &hexBytes("f69664bafa4dff4ba0d22cb285225af79da35d46b7f2c5315fdb3479ebedfb612912473b798499cd6f69c61a201cabec"), schedule.client_handshake_traffic[0..hash_len_384]);
+    try testing.expectEqualSlices(u8, &hexBytes("f64f8f854a4fed3eb56a6f2587881b36c7b03ec941e611fee8a400fe3259a922110da51cde297e420f65a8fb47bee8c0"), schedule.server_handshake_traffic[0..hash_len_384]);
+}
+
+test "SHA-384 clientEarlyTrafficSecret matches an independently computed known-answer fixture" {
+    var det = pure_zig.DeterministicEntropy.init(16);
+    var backing: pure_zig.Provider = undefined;
+    const cp = testProvider(&det, &backing);
+
+    const psk = [_]u8{0x99} ** hash_len_384;
+    const hello_hash = [_]u8{0x24} ** hash_len_384;
+    var out: [hash_len_384]u8 = undefined;
+    defer crypto.secureZero(u8, &out);
+    try KeySchedule.clientEarlyTrafficSecret(cp, .sha384, &psk, &hello_hash, &out);
+    try testing.expectEqualSlices(u8, &hexBytes("c40401d9bf363b9677cc95cb7de19c7ce0bb56eac777b92d7b89235ef7c9c68947bba378116f1abcaf1e9bcb7211807c"), &out);
+}
+
+test "SHA-384 KeySchedule.init and applicationSecrets reject SHA-256-sized inputs" {
+    var det = pure_zig.DeterministicEntropy.init(17);
+    var backing: pure_zig.Provider = undefined;
+    const cp = testProvider(&det, &backing);
+
+    const shared = [_]u8{0x42} ** shared_secret_len;
+    const wrong_transcript = [_]u8{0x24} ** hash_len;
+    try testing.expectError(error.InvalidSecretLength, KeySchedule.init(cp, .sha384, &shared, &wrong_transcript));
+
+    const transcript384 = [_]u8{0x24} ** hash_len_384;
+    var schedule = try KeySchedule.init(cp, .sha384, &shared, &transcript384);
+    defer schedule.wipe();
+    try testing.expectError(error.InvalidSecretLength, schedule.applicationSecrets(&wrong_transcript));
+
+    const wrong_psk = [_]u8{0x99} ** hash_len;
+    try testing.expectError(error.InvalidSecretLength, KeySchedule.initWithPsk(cp, .sha384, &wrong_psk, &shared, &transcript384));
 }
 
 test "application traffic secret storage has explicit cleanup" {
@@ -100,9 +203,9 @@ test "application traffic secret storage has explicit cleanup" {
 
     const shared = [_]u8{0x42} ** shared_secret_len;
     const transcript = [_]u8{0x24} ** hash_len;
-    var schedule = try KeySchedule.init(cp, &shared, transcript);
+    var schedule = try KeySchedule.init(cp, .sha256, &shared, &transcript);
     defer schedule.wipe();
-    var app = try schedule.applicationSecrets(transcript);
+    var app = try schedule.applicationSecrets(&transcript);
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&app), 0));
     app.wipe();
     try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&app), 0));
@@ -123,7 +226,7 @@ test "KeySchedule.wipe zeroizes every derived secret" {
 
     const shared = [_]u8{0x77} ** shared_secret_len;
     const transcript = [_]u8{0x88} ** hash_len;
-    var schedule = try KeySchedule.init(cp, &shared, transcript);
+    var schedule = try KeySchedule.init(cp, .sha256, &shared, &transcript);
     const bytes = std.mem.asBytes(&schedule);
     try testing.expect(!std.mem.allEqual(u8, bytes, 0));
     schedule.wipe();
@@ -137,7 +240,7 @@ test "resumption master secret and PSK derivation are deterministic" {
 
     const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
     const hello_hash = hexBytes("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
-    var schedule = try KeySchedule.init(cp, &shared, hello_hash);
+    var schedule = try KeySchedule.init(cp, .sha256, &shared, &hello_hash);
     defer schedule.wipe();
 
     const complete_hash = hexBytes("209145a96ee8e5751f3b7e74e573c01c384cff1b902e8ae503d6d3469c698d1c");
@@ -196,11 +299,11 @@ test "initWithPsk diverges from the zero-PSK schedule and is deterministic" {
     const transcript = [_]u8{0x24} ** hash_len;
     const psk = [_]u8{0x99} ** hash_len;
 
-    var zero_psk_schedule = try KeySchedule.init(cp, &shared, transcript);
+    var zero_psk_schedule = try KeySchedule.init(cp, .sha256, &shared, &transcript);
     defer zero_psk_schedule.wipe();
-    var psk_schedule = try KeySchedule.initWithPsk(cp, &psk, &shared, transcript);
+    var psk_schedule = try KeySchedule.initWithPsk(cp, .sha256, &psk, &shared, &transcript);
     defer psk_schedule.wipe();
-    var psk_schedule_again = try KeySchedule.initWithPsk(cp, &psk, &shared, transcript);
+    var psk_schedule_again = try KeySchedule.initWithPsk(cp, .sha256, &psk, &shared, &transcript);
     defer psk_schedule_again.wipe();
 
     try testing.expect(!std.mem.eql(u8, &zero_psk_schedule.handshake_secret, &psk_schedule.handshake_secret));
@@ -209,9 +312,9 @@ test "initWithPsk diverges from the zero-PSK schedule and is deterministic" {
     try testing.expectEqualSlices(u8, &psk_schedule.master_secret, &psk_schedule_again.master_secret);
     try testing.expect(!std.mem.eql(u8, &psk_schedule.client_handshake_traffic, &psk_schedule.server_handshake_traffic));
 
-    var app = try psk_schedule.applicationSecrets(transcript);
+    var app = try psk_schedule.applicationSecrets(&transcript);
     defer app.wipe();
-    try testing.expect(!std.mem.eql(u8, &app.client, &app.server));
+    try testing.expect(!std.mem.eql(u8, app.clientSecret(), app.serverSecret()));
 }
 
 test "initWithPsk matches independently computed secrets" {
@@ -227,18 +330,18 @@ test "initWithPsk matches independently computed secrets" {
     const transcript = [_]u8{0x24} ** hash_len;
     const psk = [_]u8{0x99} ** hash_len;
 
-    var schedule = try KeySchedule.initWithPsk(cp, &psk, &shared, transcript);
+    var schedule = try KeySchedule.initWithPsk(cp, .sha256, &psk, &shared, &transcript);
     defer schedule.wipe();
 
-    try testing.expectEqualSlices(u8, &hexBytes("ab0803d6203c8feddfe8adc74f986c9d89b817b3d4132fc55c866a3522d9ff49"), &schedule.handshake_secret);
-    try testing.expectEqualSlices(u8, &hexBytes("e92139285417b6a9a54a7a9153f4b6dcce44b99cdc0937b83dfea5c79805c920"), &schedule.client_handshake_traffic);
-    try testing.expectEqualSlices(u8, &hexBytes("739483d9d6a9508c73b4656de22fedd85a2a8d00e9a6ca1449d8cba678c94baf"), &schedule.server_handshake_traffic);
-    try testing.expectEqualSlices(u8, &hexBytes("abe96cce65361235f3126971c67760888b79d4c1724a6cb1e15f6d2ae128ff44"), &schedule.master_secret);
+    try testing.expectEqualSlices(u8, &hexBytes("ab0803d6203c8feddfe8adc74f986c9d89b817b3d4132fc55c866a3522d9ff49"), schedule.handshake_secret[0..hash_len]);
+    try testing.expectEqualSlices(u8, &hexBytes("e92139285417b6a9a54a7a9153f4b6dcce44b99cdc0937b83dfea5c79805c920"), schedule.client_handshake_traffic[0..hash_len]);
+    try testing.expectEqualSlices(u8, &hexBytes("739483d9d6a9508c73b4656de22fedd85a2a8d00e9a6ca1449d8cba678c94baf"), schedule.server_handshake_traffic[0..hash_len]);
+    try testing.expectEqualSlices(u8, &hexBytes("abe96cce65361235f3126971c67760888b79d4c1724a6cb1e15f6d2ae128ff44"), schedule.master_secret[0..hash_len]);
 
-    var app = try schedule.applicationSecrets(transcript);
+    var app = try schedule.applicationSecrets(&transcript);
     defer app.wipe();
-    try testing.expectEqualSlices(u8, &hexBytes("d1ba0b1be9862f1bd4c3bcc0d53b5a98c6a4951c4bad19243051237bc735031c"), &app.client);
-    try testing.expectEqualSlices(u8, &hexBytes("c7428c93109f1b656dcbf0971e5d1bad9c2d38b79420038b7e165a17c7f61fa1"), &app.server);
+    try testing.expectEqualSlices(u8, &hexBytes("d1ba0b1be9862f1bd4c3bcc0d53b5a98c6a4951c4bad19243051237bc735031c"), app.clientSecret());
+    try testing.expectEqualSlices(u8, &hexBytes("c7428c93109f1b656dcbf0971e5d1bad9c2d38b79420038b7e165a17c7f61fa1"), app.serverSecret());
 }
 
 test "a different resumption PSK produces a different PSK-resumed schedule" {
@@ -251,9 +354,9 @@ test "a different resumption PSK produces a different PSK-resumed schedule" {
     const psk_a = [_]u8{0xaa} ** hash_len;
     const psk_b = [_]u8{0xbb} ** hash_len;
 
-    var schedule_a = try KeySchedule.initWithPsk(cp, &psk_a, &shared, transcript);
+    var schedule_a = try KeySchedule.initWithPsk(cp, .sha256, &psk_a, &shared, &transcript);
     defer schedule_a.wipe();
-    var schedule_b = try KeySchedule.initWithPsk(cp, &psk_b, &shared, transcript);
+    var schedule_b = try KeySchedule.initWithPsk(cp, .sha256, &psk_b, &shared, &transcript);
     defer schedule_b.wipe();
 
     try testing.expect(!std.mem.eql(u8, &schedule_a.master_secret, &schedule_b.master_secret));
@@ -270,7 +373,8 @@ test "clientEarlyTrafficSecret matches an independently computed known-answer fi
     const psk = [_]u8{0x99} ** hash_len;
     const hello_hash = [_]u8{0x24} ** hash_len;
 
-    const early = try KeySchedule.clientEarlyTrafficSecret(cp, &psk, hello_hash);
+    var early: [hash_len]u8 = undefined;
+    try KeySchedule.clientEarlyTrafficSecret(cp, .sha256, &psk, &hello_hash, &early);
     try testing.expectEqualSlices(u8, &hexBytes("16d133c56483399331d093c3389c265a9547962c6b494b215e02e4eb92900afd"), &early);
 }
 
@@ -284,8 +388,10 @@ test "clientEarlyTrafficSecret differs when the PSK differs" {
     const hello_hash_a = [_]u8{0x24} ** hash_len;
     const hello_hash_b = [_]u8{0x11} ** hash_len;
 
-    const early_a = try KeySchedule.clientEarlyTrafficSecret(cp, &psk_a, hello_hash_a);
-    const early_b = try KeySchedule.clientEarlyTrafficSecret(cp, &psk_b, hello_hash_b);
+    var early_a: [hash_len]u8 = undefined;
+    var early_b: [hash_len]u8 = undefined;
+    try KeySchedule.clientEarlyTrafficSecret(cp, .sha256, &psk_a, &hello_hash_a, &early_a);
+    try KeySchedule.clientEarlyTrafficSecret(cp, .sha256, &psk_b, &hello_hash_b, &early_b);
     try testing.expectEqualSlices(u8, &hexBytes("e69f3f7132880345ceda14cd7dcef6aeec62182cb3973d19a50371d75832f596"), &early_b);
     try testing.expect(!std.mem.eql(u8, &early_a, &early_b));
 }
@@ -301,7 +407,8 @@ test "clientEarlyTrafficSecret differs when only the ClientHello hash differs" {
     const psk = [_]u8{0x99} ** hash_len;
     const hello_hash = [_]u8{0x77} ** hash_len;
 
-    const early = try KeySchedule.clientEarlyTrafficSecret(cp, &psk, hello_hash);
+    var early: [hash_len]u8 = undefined;
+    try KeySchedule.clientEarlyTrafficSecret(cp, .sha256, &psk, &hello_hash, &early);
     try testing.expectEqualSlices(u8, &hexBytes("7d693eba9b582d3867e21784c2682d6ecef79deacbd28089a705e45ea8273310"), &early);
 }
 
@@ -382,11 +489,12 @@ test "init/initWithPsk/applicationSecrets propagate a typed provider error rathe
 
     const shared = [_]u8{0x42} ** shared_secret_len;
     const transcript = [_]u8{0x24} ** hash_len;
-    try testing.expectError(error.UnsupportedCapability, KeySchedule.init(cp, &shared, transcript));
+    try testing.expectError(error.UnsupportedCapability, KeySchedule.init(cp, .sha256, &shared, &transcript));
 
     const psk = [_]u8{0x99} ** hash_len;
-    try testing.expectError(error.UnsupportedCapability, KeySchedule.initWithPsk(cp, &psk, &shared, transcript));
-    try testing.expectError(error.UnsupportedCapability, KeySchedule.clientEarlyTrafficSecret(cp, &psk, transcript));
+    try testing.expectError(error.UnsupportedCapability, KeySchedule.initWithPsk(cp, .sha256, &psk, &shared, &transcript));
+    var early: [hash_len]u8 = undefined;
+    try testing.expectError(error.UnsupportedCapability, KeySchedule.clientEarlyTrafficSecret(cp, .sha256, &psk, &transcript, &early));
 
     var out: [hash_len]u8 = undefined;
     try testing.expectError(error.UnsupportedCapability, KeySchedule.resumptionPsk(cp, .sha256, &psk, "n", &out));
@@ -477,11 +585,23 @@ test "every fallible HKDF entry point wipes its own output buffer(s) when the pr
     const transcript = [_]u8{0x24} ** hash_len;
     const psk = [_]u8{0x99} ** hash_len;
 
-    try testing.expectError(error.UnsupportedCapability, KeySchedule.init(cp, &shared, transcript));
-    try testing.expectError(error.UnsupportedCapability, KeySchedule.initWithPsk(cp, &psk, &shared, transcript));
-    try testing.expectError(error.UnsupportedCapability, KeySchedule.clientEarlyTrafficSecret(cp, &psk, transcript));
-    try testing.expectError(error.UnsupportedCapability, KeySchedule.finishedKey(cp, &psk));
-    try testing.expectError(error.UnsupportedCapability, KeySchedule.verifyData(cp, &psk, transcript));
+    try testing.expectError(error.UnsupportedCapability, KeySchedule.init(cp, .sha256, &shared, &transcript));
+    try testing.expectError(error.UnsupportedCapability, KeySchedule.initWithPsk(cp, .sha256, &psk, &shared, &transcript));
+
+    // clientEarlyTrafficSecret and verifyData both fail at an earlier
+    // *internal* HKDF call (into a local secret, not the caller's `out`)
+    // before ever writing to `out` itself, so there is nothing to wipe
+    // there — only `expectError` applies. finishedKey passes `out` directly
+    // to its one HKDF call, so its own `errdefer` wipe is checked below.
+    var early: [hash_len]u8 = undefined;
+    try testing.expectError(error.UnsupportedCapability, KeySchedule.clientEarlyTrafficSecret(cp, .sha256, &psk, &transcript, &early));
+
+    var fkey: [hash_len]u8 = undefined;
+    try testing.expectError(error.UnsupportedCapability, KeySchedule.finishedKey(cp, .sha256, &psk, &fkey));
+    try testing.expect(std.mem.allEqual(u8, &fkey, 0));
+
+    var vdata: [hash_len]u8 = undefined;
+    try testing.expectError(error.UnsupportedCapability, KeySchedule.verifyData(cp, .sha256, &psk, &transcript, &vdata));
 
     var out: [hash_len]u8 = undefined;
     try testing.expectError(error.UnsupportedCapability, KeySchedule.resumptionPsk(cp, .sha256, &psk, "n", &out));
@@ -495,10 +615,10 @@ test "every fallible HKDF entry point wipes its own output buffer(s) when the pr
     var real_det = pure_zig.DeterministicEntropy.init(20);
     var real_backing: pure_zig.Provider = undefined;
     const real_cp = testProvider(&real_det, &real_backing);
-    var schedule = try KeySchedule.init(real_cp, &shared, transcript);
+    var schedule = try KeySchedule.init(real_cp, .sha256, &shared, &transcript);
     defer schedule.wipe();
     schedule.provider = cp;
-    try testing.expectError(error.UnsupportedCapability, schedule.applicationSecrets(transcript));
+    try testing.expectError(error.UnsupportedCapability, schedule.applicationSecrets(&transcript));
 }
 
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {

@@ -193,11 +193,21 @@ const KeySnapshot = struct {
 };
 
 const SecretSnapshot = struct {
-    bytes: [tls_backend.hash_len]u8,
+    // #564: sized for the largest negotiable suite's digest (SHA-384), not
+    // just the SHA-256 baseline `tls_backend.hash_len` — a snapshot taken
+    // during an AES-256-GCM/SHA-384 handshake is 48 bytes.
+    bytes: [tls_core.key_schedule.max_digest_len]u8 = undefined,
+    len: usize,
 
     fn capture(secret: []const u8) SecretSnapshot {
-        std.debug.assert(secret.len == tls_backend.hash_len);
-        return .{ .bytes = secret[0..tls_backend.hash_len].* };
+        std.debug.assert(secret.len <= tls_core.key_schedule.max_digest_len);
+        var out = SecretSnapshot{ .len = secret.len };
+        @memcpy(out.bytes[0..secret.len], secret);
+        return out;
+    }
+
+    fn slice(self: *const SecretSnapshot) []const u8 {
+        return self.bytes[0..self.len];
     }
 };
 
@@ -341,6 +351,10 @@ fn pumpDirect(
             var scratch: [1]u8 = undefined;
             _ = try sender_bridge.applyEvent(.handshake_complete, &scratch);
             sender_driver.complete();
+        },
+        .negotiated_parameters => |params| {
+            var scratch: [1]u8 = undefined;
+            _ = try sender_bridge.applyEvent(.{ .negotiated_parameters = params }, &scratch);
         },
         .peer_transport_parameters => {},
         .alpn => |protocol| observed.noteAlpn(protocol),
@@ -996,8 +1010,8 @@ test "0-RTT round trip: an early-capable ticket, matching policy, and an allowin
     // `KeySchedule.clientEarlyTrafficSecret` independently.
     try std.testing.expectEqualSlices(
         u8,
-        &resumed.observed.zero_rtt_secret[0].?.bytes,
-        &resumed.observed.zero_rtt_secret[1].?.bytes,
+        resumed.observed.zero_rtt_secret[0].?.slice(),
+        resumed.observed.zero_rtt_secret[1].?.slice(),
     );
 
     // The resumed 1-RTT connection remains usable afterward regardless of
@@ -2664,16 +2678,16 @@ test "record and extension profiles preserve independent traffic-secret goldens"
         secretGolden("262f66c237c5ff9cf867b242fa37ba707b2dcd06d0188ce3b3c60a069f05588b"),
     };
     const record_actual = [_][tls_backend.hash_len]u8{
-        record.observed.handshake_write_secret[0].?.bytes,
-        record.observed.handshake_write_secret[1].?.bytes,
-        record.observed.application_write_secret[0].?.bytes,
-        record.observed.application_write_secret[1].?.bytes,
+        record.observed.handshake_write_secret[0].?.bytes[0..tls_backend.hash_len].*,
+        record.observed.handshake_write_secret[1].?.bytes[0..tls_backend.hash_len].*,
+        record.observed.application_write_secret[0].?.bytes[0..tls_backend.hash_len].*,
+        record.observed.application_write_secret[1].?.bytes[0..tls_backend.hash_len].*,
     };
     const extension_actual = [_][tls_backend.hash_len]u8{
-        extension.observed.handshake_write_secret[0].?.bytes,
-        extension.observed.handshake_write_secret[1].?.bytes,
-        extension.observed.application_write_secret[0].?.bytes,
-        extension.observed.application_write_secret[1].?.bytes,
+        extension.observed.handshake_write_secret[0].?.bytes[0..tls_backend.hash_len].*,
+        extension.observed.handshake_write_secret[1].?.bytes[0..tls_backend.hash_len].*,
+        extension.observed.application_write_secret[0].?.bytes[0..tls_backend.hash_len].*,
+        extension.observed.application_write_secret[1].?.bytes[0..tls_backend.hash_len].*,
     };
     for (record_goldens, record_actual) |expected, actual| {
         try std.testing.expectEqualSlices(u8, &expected, &actual);
@@ -2728,6 +2742,103 @@ fn directHarnessWithClientKeyShareMode(
     };
 }
 
+/// #564: out-parameter style (see `DirectHarness.initProfiles`'s doc
+/// comment) — both roles are configured with a policy offering only
+/// `suite`, so the native engine must negotiate exactly that suite's AEAD
+/// and transcript/HKDF hash end to end, through the same generic
+/// `record_protection`/key-schedule paths the SHA-256 baseline already
+/// exercises elsewhere in this file. `client_bridge`/`server_bridge` are
+/// still constructed with the SHA-256 baseline as their placeholder initial
+/// suite — `pumpDirect` forwards the backend's `negotiated_parameters`
+/// event to `Bridge.applyEvent`, which corrects it before either bridge
+/// ever derives a traffic key (see `record_epoch_bridge.Bridge.applyEvent`).
+fn directHarnessWithCipherSuite(self: *DirectHarness, comptime cipher_suite: tls_core.algorithms.CipherSuite) void {
+    const client_crypto_provider = self.client_provider_storage.init(client_provider_seed);
+    const server_crypto_provider = self.server_provider_storage.init(server_provider_seed);
+    const client_bridge_crypto_provider = self.client_bridge_provider_storage.init(client_provider_seed);
+    const server_bridge_crypto_provider = self.server_bridge_provider_storage.init(server_provider_seed);
+    // `comptime cipher_suite` (not a runtime parameter) so these arrays get
+    // static storage duration: `Policy.cipher_suites`/`.alpn_protocols` are
+    // borrowed slices retained inside both backends for the life of the
+    // harness, well past this function returning — a runtime-local array
+    // here would dangle the moment it did.
+    const suites = [_]tls_core.algorithms.CipherSuite{cipher_suite};
+    const alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.h2};
+    const policy = tls_core.policy.Policy.fromCapabilities(.record, .{ .cipher_suites = &suites }, &alpns);
+    self.* = .{
+        .client_provider_storage = self.client_provider_storage,
+        .server_provider_storage = self.server_provider_storage,
+        .client_bridge_provider_storage = self.client_bridge_provider_storage,
+        .server_bridge_provider_storage = self.server_bridge_provider_storage,
+        .client_backend = tls_backend.Tls13Backend.initClientConfigured(
+            clientEntropy(),
+            client_crypto_provider,
+            .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+            tls_backend.recordConfig(policy),
+            .{},
+        ),
+        .server_backend = tls_backend.Tls13Backend.initServerConfigured(
+            serverEntropy(),
+            server_crypto_provider,
+            fixtureIdentity(),
+            tls_backend.recordConfig(policy),
+        ),
+        .client_bridge = Bridge.init(client_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+        .server_bridge = Bridge.init(server_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+    };
+}
+
+fn expectNativeSuiteLoopback(comptime cipher_suite: tls_core.algorithms.CipherSuite, expected_digest_len: usize) !void {
+    var harness: DirectHarness = undefined;
+    directHarnessWithCipherSuite(&harness, cipher_suite);
+    defer harness.deinit();
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(cipher_suite, harness.client_backend.negotiated_cipher_suite);
+    try std.testing.expectEqual(cipher_suite, harness.server_backend.negotiated_cipher_suite);
+
+    // Both sides end up with byte-identical transcripts under the
+    // negotiated suite's own hash — the same cross-role invariant the
+    // SHA-256 baseline tests above check, now for a suite whose transcript
+    // hash may differ in length from SHA-256's.
+    const client_hash = harness.client_backend.core.transcriptHash();
+    const server_hash = harness.server_backend.core.transcriptHash();
+    try std.testing.expectEqual(expected_digest_len, client_hash.len);
+    try std.testing.expectEqualSlices(u8, client_hash.slice(), server_hash.slice());
+
+    // Application data actually round-trips under the negotiated suite's
+    // AEAD, proving `record_protection.TrafficKeys.derive` was driven with
+    // the right suite (not silently defaulted to AES-128-GCM) on both
+    // directions and both bridges.
+    var client_out: [64]u8 = undefined;
+    const client_record_bytes = try harness.client_bridge.sealApplicationData("hello from client", &client_out);
+    const client_record = try parseSingleRecord(.ciphertext, client_record_bytes);
+    var server_in: [64]u8 = undefined;
+    const from_client = try harness.server_bridge.openApplicationData(client_record, &server_in);
+    try std.testing.expectEqualStrings("hello from client", from_client.inner.content);
+
+    var server_out: [64]u8 = undefined;
+    const server_record_bytes = try harness.server_bridge.sealApplicationData("hello from server", &server_out);
+    const server_record = try parseSingleRecord(.ciphertext, server_record_bytes);
+    var client_in: [64]u8 = undefined;
+    const from_server = try harness.client_bridge.openApplicationData(server_record, &client_in);
+    try std.testing.expectEqualStrings("hello from server", from_server.inner.content);
+}
+
+test "#564 native record-mode loopback negotiates AES-256-GCM/SHA-384 end to end" {
+    try expectNativeSuiteLoopback(.tls_aes_256_gcm_sha384, 48);
+}
+
+test "#564 native record-mode loopback negotiates ChaCha20-Poly1305/SHA-256 end to end" {
+    try expectNativeSuiteLoopback(.tls_chacha20_poly1305_sha256, 32);
+}
+
+test "#564 native record-mode loopback still negotiates the AES-128-GCM/SHA-256 baseline end to end" {
+    try expectNativeSuiteLoopback(.tls_aes_128_gcm_sha256, 32);
+}
+
 fn expectHrrRetryStateCleared(backend: *const tls_backend.Tls13Backend) !void {
     try std.testing.expect(backend.client_hello_psk == null);
     try std.testing.expect(backend.retry.request == null);
@@ -2749,7 +2860,7 @@ test "#484 HRR round trip: record client with an empty key share completes via n
     // real HRR, ClientHello2, and the rest of the flight through Finished.
     const client_hash = harness.client_backend.core.transcriptHash();
     const server_hash = harness.server_backend.core.transcriptHash();
-    try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
+    try std.testing.expectEqualSlices(u8, client_hash.slice(), server_hash.slice());
 
     // Traffic secrets were derived exactly once, from the final
     // ServerHello — `DirectObserved.captureSecret` never records anything
@@ -2783,7 +2894,7 @@ test "#484 HRR round trip completes over the extension (QUIC-style) profile too"
     try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, harness.server_backend.core.retry_state);
     const client_hash = harness.client_backend.core.transcriptHash();
     const server_hash = harness.server_backend.core.transcriptHash();
-    try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
+    try std.testing.expectEqualSlices(u8, client_hash.slice(), server_hash.slice());
 
     // The local transport-extension payload contract survives HelloRetryRequest
     // and ClientHello2 unchanged, on both sides.
@@ -3089,7 +3200,7 @@ test "#485 PSK resumption completes through one HelloRetryRequest, with matching
     // internally without it showing up here.
     const client_hash = harness.client_backend.core.transcriptHash();
     const server_hash = harness.server_backend.core.transcriptHash();
-    try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
+    try std.testing.expectEqualSlices(u8, client_hash.slice(), server_hash.slice());
 
     // No traffic secret was derived at the HRR itself, only after the final
     // ServerHello — same assertions as the non-PSK #484 HRR round trip.
@@ -4194,7 +4305,7 @@ test "#484 client rejects an invalid HelloRetryRequest without committing it int
     // `drainInput`'s preflight rejected it *before* `Core.acceptHelloRetryRequest`
     // ever rebound/updated the transcript — the running hash is exactly
     // what it was right after ClientHello1, and no retry was recorded.
-    try std.testing.expectEqualSlices(u8, &transcript_before, &client.core.transcriptHash());
+    try std.testing.expectEqualSlices(u8, transcript_before.slice(), client.core.transcriptHash().slice());
     try std.testing.expectEqual(tls_core.handshake.RetryState.none, client.core.retry_state);
 }
 
@@ -4222,7 +4333,7 @@ test "#484 server rejects an invalid ClientHello2 mutation without committing it
     // `drainInput`'s preflight rejected it *before* `Core.acceptSecondClientHello`
     // ever updated the transcript or advanced `handshake_state` — both are
     // exactly what they were right after the HRR was recorded.
-    try std.testing.expectEqualSlices(u8, &transcript_before, &server.core.transcriptHash());
+    try std.testing.expectEqualSlices(u8, transcript_before.slice(), server.core.transcriptHash().slice());
     try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, server.core.retry_state);
 }
 
@@ -7802,10 +7913,12 @@ test "cache-backed client offer filtering preserves selected index token mapping
 /// these server-only tests.
 fn feedValidClientFinished(server: *tls_backend.Tls13Backend) !void {
     const schedule = &server.schedule.?;
-    var client_verify = try tls_backend.KeySchedule.verifyData(schedule.provider, &schedule.client_handshake_traffic, server.core.transcriptHash());
-    defer std.crypto.secureZero(u8, &client_verify);
-    var finished_buf: [4 + tls_backend.hash_len]u8 = undefined;
-    const finished = try tls_core.messages.encode(.finished, &client_verify, &finished_buf);
+    const n = schedule.digestLen();
+    var client_verify: [tls_core.key_schedule.max_digest_len]u8 = undefined;
+    try tls_backend.KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.client_handshake_traffic[0..n], server.core.transcriptHash().slice(), client_verify[0..n]);
+    defer std.crypto.secureZero(u8, client_verify[0..n]);
+    var finished_buf: [4 + tls_core.key_schedule.max_digest_len]u8 = undefined;
+    const finished = try tls_core.messages.encode(.finished, client_verify[0..n], &finished_buf);
     var sink = DirectSink{};
     defer sink.deinit();
     try server.backend().receive(.handshake, finished, &sink);

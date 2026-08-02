@@ -152,8 +152,13 @@ test "TLS policy capabilities are derived from provider support" {
 test "native appliance profile selects only what the live engine negotiates" {
     const caps = profile.capabilities(.pure_zig);
     const native = fromProfile(.native_appliance, caps);
-    try std.testing.expectEqual(@as(usize, 1), native.cipher_suites_len);
+    // #564: the native engine's handshake/transcript/key-schedule are
+    // cipher/hash-agile and negotiate all three checked-in suites now, not
+    // just the SHA-256 baseline.
+    try std.testing.expectEqual(@as(usize, 3), native.cipher_suites_len);
     try std.testing.expectEqual(policy_mod.CipherSuite.tls_aes_128_gcm_sha256, native.cipher_suites[0]);
+    try std.testing.expectEqual(policy_mod.CipherSuite.tls_aes_256_gcm_sha384, native.cipher_suites[1]);
+    try std.testing.expectEqual(policy_mod.CipherSuite.tls_chacha20_poly1305_sha256, native.cipher_suites[2]);
     try std.testing.expectEqual(@as(usize, 1), native.named_groups_len);
     try std.testing.expectEqual(policy_mod.NamedGroup.x25519, native.named_groups[0]);
     try std.testing.expectEqual(@as(usize, 2), native.signature_schemes_len);

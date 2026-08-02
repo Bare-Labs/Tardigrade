@@ -362,6 +362,11 @@ pub const Handshake = struct {
                     error.InvalidCryptoLevel => error.UnexpectedCryptoLevel,
                     error.CryptoBufferTooLarge => error.HandshakeBufferOverflow,
                 }),
+                // #564 scopes QUIC negotiated-suite packet/header protection
+                // as a separate child issue; this backend's own QUIC adapter
+                // still only negotiates TLS_AES_128_GCM_SHA256 (#335), so
+                // there is nothing for QUIC to do with this event yet.
+                .negotiated_parameters => {},
                 .traffic_secret => |s| {
                     const secret = Secret.init(s.epoch, s.direction, s.data) catch return self.fail(error.SecretExportFailed);
                     if (s.data.len != traffic_secret_len) return self.fail(error.SecretExportFailed);

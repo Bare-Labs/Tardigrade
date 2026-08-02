@@ -38,6 +38,7 @@ const tls_transcript = @import("transcript.zig");
 const crypto = std.crypto;
 const Certificate = crypto.Certificate;
 const Sha256 = crypto.hash.sha2.Sha256;
+const Sha384 = crypto.hash.sha2.Sha384;
 const crypto_provider_pkg = crypto_pkg.provider;
 
 /// The one key-exchange group this profile negotiates. Key-share generation
@@ -76,7 +77,21 @@ const MessageType = tls_handshake_codec.MessageType;
 const Reader = tls_handshake_codec.Reader;
 const Writer = tls_handshake_codec.Writer;
 
-pub const hash_len = tls_key_schedule.hash_len;
+/// Largest transcript/HKDF digest this engine's negotiable suites can
+/// select (SHA-384, #564) — the bound every per-connection digest buffer
+/// below is sized to; the negotiated suite's actual `provider.Hash.
+/// digestLength()` (via `negotiatedHash`/`negotiatedDigestLen`) says how
+/// much of it is meaningful for a given connection.
+const max_digest_len = crypto_provider_pkg.max_digest_len;
+/// SHA-256's digest length (`TLS_AES_128_GCM_SHA256`/
+/// `TLS_CHACHA20_POLY1305_SHA256`'s transcript/HKDF hash) — the fixed
+/// digest length QUIC's single-suite adapter (`quic/tls_backend.zig`,
+/// `quic/connection.zig`) and other callers that never negotiate anything
+/// but the SHA-256 baseline still use. Never the right constant for
+/// suite-agile record-mode code in *this* file (#564): use
+/// `negotiatedHash()`/`negotiatedDigestLen()` there instead, since a live
+/// connection's own digest length can also be SHA-384's 48 bytes.
+pub const hash_len = 32;
 /// Largest framed handshake message we accept during the main handshake.
 pub const max_message_len = 8 * 1024;
 /// Largest framed post-handshake NewSessionTicket message: a 65535-byte opaque
@@ -221,7 +236,18 @@ const ext_cookie: u16 = @intFromEnum(tls_algorithms.ExtensionType.cookie);
 pub const max_transport_extension_len = 512;
 
 const native_protocol_versions = [_]tls_algorithms.ProtocolVersion{.tls13};
-const native_cipher_suites = [_]tls_algorithms.CipherSuite{.tls_aes_128_gcm_sha256};
+/// #564: every cipher suite this engine's handshake/transcript/key-schedule
+/// logic can now negotiate natively. Whether a given product actually
+/// offers all three (versus just the SHA-256 baseline) is a product-profile
+/// decision, not this engine's — see `crypto_profile.zig`'s
+/// `enabled_product_profiles` and `TlsCapabilities.fromProfile`, which
+/// intersect this protocol-level capability with what the live
+/// `CryptoProvider` and the product's checked-in profile actually enable.
+const native_cipher_suites = [_]tls_algorithms.CipherSuite{
+    .tls_aes_128_gcm_sha256,
+    .tls_aes_256_gcm_sha384,
+    .tls_chacha20_poly1305_sha256,
+};
 const native_named_groups = [_]tls_algorithms.NamedGroup{.x25519};
 const native_signature_schemes = [_]tls_algorithms.SignatureScheme{ .ed25519, .ecdsa_secp256r1_sha256 };
 
@@ -622,7 +648,7 @@ pub const Tls13Backend = struct {
     session_ticket_consumer: ?ConfiguredSessionTicketConsumer = null,
     /// The client Finished verify_data the server expects (computed when its
     /// own flight is sent).
-    expected_client_verify: [hash_len]u8 = undefined,
+    expected_client_verify: [max_digest_len]u8 = undefined,
     /// Reassembled-but-unparsed handshake bytes per transport epoch; a message
     /// may arrive split across TLS records or QUIC CRYPTO frames.
     initial_input: tls_handshake_codec.Reassembler(max_message_len + 4) = .{},
@@ -784,7 +810,7 @@ pub const Tls13Backend = struct {
 
     const Slice = struct { start: usize, len: usize };
     const PendingStage = enum { server_select, server_sign, client_select, client_sign, peer_verify };
-    const PskSelected = struct { index: usize, psk: [hash_len]u8, early_data: EarlyDataDecision = .not_attempted };
+    const PskSelected = struct { index: usize, psk: [max_digest_len]u8, early_data: EarlyDataDecision = .not_attempted };
     pub const ResumptionDecision = enum { accepted, miss, incompatible, full_handshake, fatal };
 
     pub const ResumptionDecisionObserver = struct {
@@ -832,7 +858,7 @@ pub const Tls13Backend = struct {
         /// left `undefined` for the transient ClientHello1-retention-only
         /// capture `emitHelloRetryRequest` writes on the `.retry` path,
         /// which is always cleared before any offer capture reads it.
-        binder_transcript_hash: [hash_len]u8 = undefined,
+        binder_transcript_hash: [max_digest_len]u8 = undefined,
 
         /// Zeroizes the captured bytes in place. Exposed (`pub`) so its
         /// zeroing behavior can be proven directly, on a plain value, in
@@ -1542,6 +1568,33 @@ pub const Tls13Backend = struct {
         return @intFromEnum(self.negotiated_cipher_suite);
     }
 
+    /// The transcript/HKDF hash `self.negotiated_cipher_suite` selects
+    /// (`algorithms.transcriptHash`) — the single source of truth every
+    /// hash-agile call site in this file derives its digest length from.
+    /// Never re-derived independently, so it can never disagree with the
+    /// negotiated suite (#564).
+    fn negotiatedHash(self: *const Tls13Backend) crypto_provider_pkg.Hash {
+        return tls_algorithms.transcriptHash(self.negotiated_cipher_suite);
+    }
+
+    fn negotiatedDigestLen(self: *const Tls13Backend) usize {
+        return self.negotiatedHash().digestLength();
+    }
+
+    /// #564: confirm the injected `CryptoProvider` can actually perform the
+    /// negotiated suite's complete tuple (AEAD + transcript hash + HKDF)
+    /// before this side ever derives a secret under it. Ordinary policy
+    /// negotiation (`negotiation.zig`) already restricts both sides to
+    /// suites present in `self.policy.cipher_suites`; this is the
+    /// belt-and-braces check that the live provider backing that policy
+    /// actually agrees, so a provider/policy mismatch fails closed right at
+    /// selection instead of surfacing later as an opaque HKDF capability
+    /// error deep in the key schedule.
+    fn validateNegotiatedSuiteCapability(self: *const Tls13Backend) HandshakeError!void {
+        const caps = self.crypto_provider.capabilities();
+        if (!tls_crypto_profile.supportsCipherSuite(caps, self.negotiated_cipher_suite)) return error.SecretExportFailed;
+    }
+
     fn negotiatedGroupCode(self: *const Tls13Backend) u16 {
         return @intFromEnum(self.negotiated_named_group);
     }
@@ -1806,7 +1859,7 @@ pub const Tls13Backend = struct {
             if (containsEnum(tls_algorithms.ProtocolVersion, self.policy.protocol_versions[0..i], version)) return error.InvalidTransportProfile;
         }
         for (self.policy.cipher_suites, 0..) |cipher, i| {
-            if (cipher != .tls_aes_128_gcm_sha256) return error.InvalidTransportProfile;
+            if (!containsEnum(tls_algorithms.CipherSuite, &native_cipher_suites, cipher)) return error.InvalidTransportProfile;
             if (containsEnum(tls_algorithms.CipherSuite, self.policy.cipher_suites[0..i], cipher)) return error.InvalidTransportProfile;
         }
         for (self.policy.named_groups, 0..) |group, i| {
@@ -2043,6 +2096,12 @@ pub const Tls13Backend = struct {
             error.TooManyExtensions,
             => error.MalformedHandshake,
             error.HandshakeBufferOverflow => error.HandshakeBufferOverflow,
+            // #564: a peer whose ServerHello/HRR never lets a hash family
+            // resolve (or a stray extra message reaching the transcript
+            // before one does) is bounded by `Transcript.max_pending_len`
+            // — the same buffer-exhaustion class as any other framing
+            // overflow.
+            error.TranscriptOverflow => error.HandshakeBufferOverflow,
             error.IllegalParameter => error.IllegalParameter,
             error.UnexpectedHandshakeMessage => error.UnexpectedHandshakeMessage,
             error.MissingExtension => error.MissingExtension,
@@ -2094,7 +2153,7 @@ pub const Tls13Backend = struct {
         self: *Tls13Backend,
         message: tls_handshake_codec.Message,
         level: EncryptionLevel,
-        transcript_before: [hash_len]u8,
+        transcript_before: tls_transcript.Digest,
         is_hello_retry_request: bool,
         ch2_transcript_snapshot: ?tls_transcript.Transcript,
         sink: *EventSink,
@@ -2122,7 +2181,7 @@ pub const Tls13Backend = struct {
         switch (kind) {
             .client_hello => try self.onClientHello(message.raw, ch2_transcript_snapshot, sink),
             .server_hello => if (is_hello_retry_request)
-                try self.onHelloRetryRequest(body, sink)
+                try self.onHelloRetryRequest(message.raw, body, sink)
             else
                 try self.onServerHello(body, sink),
             .encrypted_extensions => try self.onEncryptedExtensions(body, sink),
@@ -2288,8 +2347,15 @@ pub const Tls13Backend = struct {
         // wire index aligned with `onServerHello`'s `selected_identity`.
         // RFC 8446 §4.2.11's "last extension" rule is what puts this block
         // after every other extension above and before the length patches.
-        var psk_secrets: [pre_shared_key.max_offered_identities][hash_len]u8 = undefined;
+        // #564: each offered ticket's binder hash follows *that ticket's
+        // own* negotiated suite (`ticket.common.cipher_suite`), fixed when
+        // the ticket was issued — never `self.negotiated_cipher_suite`,
+        // which is not yet chosen at ClientHello time on this (offering)
+        // side. Distinct tickets may legally carry distinct hashes, so
+        // `psk_hashes` tracks one per offered identity alongside its secret.
+        var psk_secrets: [pre_shared_key.max_offered_identities][max_digest_len]u8 = undefined;
         defer crypto.secureZero(u8, std.mem.asBytes(&psk_secrets));
+        var psk_hashes: [pre_shared_key.max_offered_identities]crypto_provider_pkg.Hash = undefined;
         var psk_count: usize = 0;
         var psk_offer_write: ?pre_shared_key.ClientOfferWrite = null;
         const active_offers = self.constClientPskOffers();
@@ -2297,11 +2363,14 @@ pub const Tls13Backend = struct {
             const now_ms = self.psk_now_fn.?(self.psk_now_ctx.?);
             var psk_items: [pre_shared_key.max_offered_identities]pre_shared_key.OfferItem = undefined;
             for (active_offers.constSlice()) |*ticket| {
-                @memcpy(&psk_secrets[psk_count], ticket.common.resumption_psk.slice());
+                const ticket_hash = tls_algorithms.transcriptHash(ticket.common.cipher_suite);
+                const psk_slice = ticket.common.resumption_psk.slice();
+                @memcpy(psk_secrets[psk_count][0..psk_slice.len], psk_slice);
+                psk_hashes[psk_count] = ticket_hash;
                 psk_items[psk_count] = .{
                     .identity = ticket.ticket.slice(),
                     .obfuscated_ticket_age = pre_shared_key.obfuscateTicketAge(ticket.ageMillis(now_ms), ticket.ticket_age_add),
-                    .digest_len = hash_len,
+                    .digest_len = ticket_hash.digestLength(),
                 };
                 psk_count += 1;
             }
@@ -2341,11 +2410,12 @@ pub const Tls13Backend = struct {
         if (psk_offer_write) |offer| {
             const prefix = buf[0..offer.truncated_len];
             for (0..psk_count) |i| {
-                var binder: [hash_len]u8 = undefined;
+                const n = psk_hashes[i].digestLength();
+                var binder: [max_digest_len]u8 = undefined;
                 defer crypto.secureZero(u8, &binder);
-                pre_shared_key.deriveBinder(.sha256, &psk_secrets[i], prefix, &binder) catch return error.SecretExportFailed;
+                pre_shared_key.deriveBinder(psk_hashes[i], psk_secrets[i][0..n], prefix, binder[0..n]) catch return error.SecretExportFailed;
                 const slot = offer.slots[i];
-                @memcpy(buf[slot.offset..][0..slot.len], &binder);
+                @memcpy(buf[slot.offset..][0..slot.len], binder[0..n]);
             }
         }
 
@@ -2357,14 +2427,21 @@ pub const Tls13Backend = struct {
         // is identity 0's PSK (the only identity 0-RTT may use), matching
         // `planEarlyDataAttempt`'s "first surviving offer only" rule.
         if (self.client_early_data_attempted) {
-            var client_hello_hash: [hash_len]u8 = undefined;
-            Sha256.hash(message, &client_hello_hash, .{});
+            // #564: identity 0's own hash, not the not-yet-negotiated
+            // suite — the server has not even seen this ClientHello yet.
+            const n0 = psk_hashes[0].digestLength();
+            var client_hello_hash: [max_digest_len]u8 = undefined;
+            switch (psk_hashes[0]) {
+                .sha256 => Sha256.hash(message, client_hello_hash[0..Sha256.digest_length], .{}),
+                .sha384 => Sha384.hash(message, client_hello_hash[0..Sha384.digest_length], .{}),
+            }
 
-            var early = KeySchedule.clientEarlyTrafficSecret(self.crypto_provider, &psk_secrets[0], client_hello_hash) catch
-                return error.SecretExportFailed;
+            var early: [max_digest_len]u8 = undefined;
             defer crypto.secureZero(u8, &early);
+            KeySchedule.clientEarlyTrafficSecret(self.crypto_provider, psk_hashes[0], psk_secrets[0][0..n0], client_hello_hash[0..n0], early[0..n0]) catch
+                return error.SecretExportFailed;
 
-            try self.emitSecret(sink, .zero_rtt, .write, &early);
+            try self.emitSecret(sink, .zero_rtt, .write, early[0..n0]);
         }
 
         // #484: retained (reusing `client_hello_psk`'s storage — see
@@ -2413,7 +2490,8 @@ pub const Tls13Backend = struct {
                         keep = false;
                     } else {
                         const entry_len = try checkedAdd(try checkedAdd(2, identity_len), 4);
-                        var candidate_total = try checkedAdd(try checkedAdd(total, entry_len), 1 + hash_len);
+                        const ticket_digest_len = tls_algorithms.transcriptHash(ticket.common.cipher_suite).digestLength();
+                        var candidate_total = try checkedAdd(try checkedAdd(total, entry_len), 1 + ticket_digest_len);
                         if (kept == 0 and self.clientEarlyDataBudget(ticket) != null)
                             candidate_total = try checkedAdd(candidate_total, 4);
                         if (candidate_total > max_message_len) {
@@ -2451,7 +2529,8 @@ pub const Tls13Backend = struct {
             if (identity_len == 0 or identity_len > std.math.maxInt(u16)) continue;
             // identity: 2 len + bytes + 4 age; binder: 1 len + digest.
             const entry_len = try checkedAdd(try checkedAdd(2, identity_len), 4);
-            var candidate_total = try checkedAdd(try checkedAdd(total, entry_len), 1 + hash_len);
+            const ticket_digest_len = tls_algorithms.transcriptHash(ticket.common.cipher_suite).digestLength();
+            var candidate_total = try checkedAdd(try checkedAdd(total, entry_len), 1 + ticket_digest_len);
             if (emitted.len == 0 and self.clientEarlyDataBudget(ticket) != null)
                 candidate_total = try checkedAdd(candidate_total, 4);
             if (candidate_total > max_message_len) break; // does not fit: stop, in offer order
@@ -2503,7 +2582,7 @@ pub const Tls13Backend = struct {
         const common = &ticket.common;
         if (common.isExpired(now_ms) or common.isNotYetValid(now_ms)) return false;
         if (!self.policy.containsCipherSuite(common.cipher_suite)) return false;
-        if (common.resumption_psk.slice().len != hash_len) return false;
+        if (common.resumption_psk.slice().len != tls_algorithms.transcriptHash(common.cipher_suite).digestLength()) return false;
         if (common.server_name) |*stored| {
             const intended = self.serverNameSlice() orelse return false;
             if (!stored.eqlIgnoreCase(intended)) return false;
@@ -2655,7 +2734,7 @@ pub const Tls13Backend = struct {
             .named_group = named_group,
             .alpn = null,
         }) catch |err| return mapNegotiationError(err);
-        if (selected_cipher != .tls_aes_128_gcm_sha256 or named_group != .x25519 or protocol_version != .tls13) return error.IllegalParameter;
+        if (named_group != .x25519 or protocol_version != .tls13) return error.IllegalParameter;
         // #484: the final ServerHello must remain consistent with what this
         // connection's HelloRetryRequest actually selected — a check on top
         // of (not a substitute for) the ordinary policy-tuple check above,
@@ -2671,6 +2750,11 @@ pub const Tls13Backend = struct {
         self.negotiated_version = protocol_version;
         self.negotiated_cipher_suite = selected_cipher;
         self.negotiated_named_group = named_group;
+        // #564: idempotent once an HRR already selected the family (checked
+        // consistent with it above); the one-and-only selection point for a
+        // connection that never retried.
+        try self.validateNegotiatedSuiteCapability();
+        self.core.transcript.selectFamily(self.negotiatedHash());
         const share = peer_share orelse return error.MalformedHandshake;
 
         // A low-order/identity peer share is a well-formed 32-byte field with an
@@ -2696,7 +2780,7 @@ pub const Tls13Backend = struct {
         // it against the negotiated context and carried its `auth_binding`
         // forward. Every other offer is wiped here, on every path (selected
         // or not, malformed or not).
-        var psk_secret: ?[hash_len]u8 = null;
+        var psk_secret: ?[max_digest_len]u8 = null;
         const active_offers = self.mutableClientPskOffers();
         // #366: retained regardless of `idx`'s value so
         // `onEncryptedExtensions` can check an accepted `early_data`
@@ -2709,10 +2793,16 @@ pub const Tls13Backend = struct {
             self.client_offer_lease = .{};
             self.selected_client_psk_present = true;
             const psk_slice = self.selected_client_psk.common.resumption_psk.slice();
-            if (psk_slice.len != hash_len) return error.IllegalParameter;
-            var buf: [hash_len]u8 = undefined;
+            // #564: a well-behaved server only ever selects an identity
+            // whose own suite matches the one it just negotiated (this
+            // engine's own `selectPsk`/`session.evaluateCompatibility`
+            // enforce exactly that on the server side); defensively check
+            // it here too rather than deriving a schedule from a
+            // wrong-length secret.
+            if (psk_slice.len != self.negotiatedDigestLen()) return error.IllegalParameter;
+            var buf: [max_digest_len]u8 = undefined;
             defer crypto.secureZero(u8, &buf);
-            @memcpy(&buf, psk_slice);
+            @memcpy(buf[0..psk_slice.len], psk_slice);
             psk_secret = buf;
         } else {
             if (self.client_offer_lease.active) {
@@ -2737,11 +2827,12 @@ pub const Tls13Backend = struct {
             // ticket's PSK — so the client may treat the peer as
             // equivalently authenticated without a fresh Certificate flight.
             try sink.emitCertificate(.valid);
-            self.schedule = KeySchedule.initWithPsk(self.crypto_provider, psk, &shared, self.core.transcriptHash()) catch
+            const n = self.negotiatedDigestLen();
+            self.schedule = KeySchedule.initWithPsk(self.crypto_provider, self.negotiatedHash(), psk[0..n], &shared, self.core.transcriptHash().slice()) catch
                 return error.SecretExportFailed;
             crypto.secureZero(u8, psk);
         } else {
-            self.schedule = KeySchedule.init(self.crypto_provider, &shared, self.core.transcriptHash()) catch
+            self.schedule = KeySchedule.init(self.crypto_provider, self.negotiatedHash(), &shared, self.core.transcriptHash().slice()) catch
                 return error.SecretExportFailed;
         }
         try self.emitHandshakeSecrets(sink);
@@ -2756,7 +2847,7 @@ pub const Tls13Backend = struct {
     /// Builds and emits ClientHello2 from the retained ClientHello1; never
     /// derives, installs, or discards a traffic secret — Initial stays live
     /// through both messages.
-    fn onHelloRetryRequest(self: *Tls13Backend, body: []const u8, sink: *EventSink) HandshakeError!void {
+    fn onHelloRetryRequest(self: *Tls13Backend, hrr_raw: []const u8, body: []const u8, sink: *EventSink) HandshakeError!void {
         // #484: reuses `client_hello_psk`'s storage — see `RetryContext`'s
         // doc comment; this field is otherwise never touched by the client
         // role, so it can only ever hold `sendClientHello`'s retry capture.
@@ -2784,6 +2875,16 @@ pub const Tls13Backend = struct {
             .cipher_suite = request.cipher_suite,
             .selected_group = request.selected_group,
         };
+        // #564: commit the suite the moment it is known from the HRR body,
+        // before anything below reads the live transcript (the PSK binder
+        // rebind further down, and `recordSecondClientHello`'s own hashing
+        // of ClientHello2). `Core.acceptHelloRetryRequest` already rebound/
+        // buffered ClientHello1 and this HRR under an unresolved family;
+        // `selectFamily` replays exactly those bytes now that the family is
+        // known, losing nothing.
+        self.negotiated_cipher_suite = request.cipher_suite;
+        try self.validateNegotiatedSuiteCapability();
+        self.core.transcript.selectFamily(self.negotiatedHash());
 
         var buf: [max_message_len]u8 = undefined;
         defer crypto.secureZero(u8, &buf);
@@ -2901,8 +3002,11 @@ pub const Tls13Backend = struct {
         // `error.HandshakeBufferOverflow` (propagated to the caller, which
         // wipes all retained PSK state via `clearFailedHandshakeState`)
         // rather than silently narrowing the offer.
-        var psk_secrets: [pre_shared_key.max_offered_identities][hash_len]u8 = undefined;
+        // #564: same per-ticket-hash reasoning as `sendClientHello`'s
+        // ClientHello1 offer — see its comment on `psk_hashes`.
+        var psk_secrets: [pre_shared_key.max_offered_identities][max_digest_len]u8 = undefined;
         defer crypto.secureZero(u8, std.mem.asBytes(&psk_secrets));
+        var psk_hashes: [pre_shared_key.max_offered_identities]crypto_provider_pkg.Hash = undefined;
         var psk_count: usize = 0;
         var psk_offer_write: ?pre_shared_key.ClientOfferWrite = null;
         const active_offers = self.constClientPskOffers();
@@ -2910,11 +3014,14 @@ pub const Tls13Backend = struct {
             const now_ms = self.psk_now_fn.?(self.psk_now_ctx.?);
             var psk_items: [pre_shared_key.max_offered_identities]pre_shared_key.OfferItem = undefined;
             for (active_offers.constSlice()) |*ticket| {
-                @memcpy(&psk_secrets[psk_count], ticket.common.resumption_psk.slice());
+                const ticket_hash = tls_algorithms.transcriptHash(ticket.common.cipher_suite);
+                const psk_slice = ticket.common.resumption_psk.slice();
+                @memcpy(psk_secrets[psk_count][0..psk_slice.len], psk_slice);
+                psk_hashes[psk_count] = ticket_hash;
                 psk_items[psk_count] = .{
                     .identity = ticket.ticket.slice(),
                     .obfuscated_ticket_age = pre_shared_key.obfuscateTicketAge(ticket.ageMillis(now_ms), ticket.ticket_age_add),
-                    .digest_len = hash_len,
+                    .digest_len = ticket_hash.digestLength(),
                 };
                 psk_count += 1;
             }
@@ -2955,16 +3062,44 @@ pub const Tls13Backend = struct {
         // the live transcript (already exactly `message_hash(Hash(CH1)) ||
         // HRR` at this point, since ClientHello2 itself has not been
         // recorded yet) without mutating it.
+        //
+        // #564: `peekWith` reads the live transcript, which is hashed under
+        // this connection's *negotiated* suite — correct for any ticket
+        // whose own hash matches it. A ticket offered under a different
+        // hash (a rarer case: distinct past connections can issue tickets
+        // under distinct suites) needs the same `message_hash(Hash(CH1)) ||
+        // HRR` prefix rehashed under *its* hash instead; a fresh throwaway
+        // `Transcript` reproduces exactly that from the still-retained raw
+        // ClientHello1/HRR bytes. Either way the resulting binder is
+        // correct wire framing; a ticket whose hash cannot match the
+        // negotiated suite can never actually be selected regardless
+        // (`session.evaluateCompatibility`'s `cipher_suite_mismatch` gate),
+        // so getting its binder's cryptographic content exactly right
+        // matters only for not corrupting the wire message, not for
+        // security.
         if (psk_offer_write) |offer| {
             const prefix = buf[0..offer.truncated_len];
-            const rebound_transcript_hash = self.core.transcript.peekWith(prefix);
+            const negotiated_hash = self.negotiatedHash();
+            const negotiated_rebound = self.core.transcript.peekWith(prefix);
             for (0..psk_count) |i| {
-                var binder: [hash_len]u8 = undefined;
+                const n = psk_hashes[i].digestLength();
+                var binder: [max_digest_len]u8 = undefined;
                 defer crypto.secureZero(u8, &binder);
-                pre_shared_key.deriveBinderFromTranscriptHash(.sha256, &psk_secrets[i], &rebound_transcript_hash, &binder) catch
-                    return error.SecretExportFailed;
+                if (psk_hashes[i] == negotiated_hash) {
+                    pre_shared_key.deriveBinderFromTranscriptHash(psk_hashes[i], psk_secrets[i][0..n], negotiated_rebound.slice(), binder[0..n]) catch
+                        return error.SecretExportFailed;
+                } else {
+                    var rehash = tls_transcript.Transcript{};
+                    rehash.selectFamily(psk_hashes[i]);
+                    rehash.update(ch1) catch return error.SecretExportFailed;
+                    rehash.rebindClientHello();
+                    rehash.update(hrr_raw) catch return error.SecretExportFailed;
+                    const rebound = rehash.peekWith(prefix);
+                    pre_shared_key.deriveBinderFromTranscriptHash(psk_hashes[i], psk_secrets[i][0..n], rebound.slice(), binder[0..n]) catch
+                        return error.SecretExportFailed;
+                }
                 const slot = offer.slots[i];
-                @memcpy(buf[slot.offset..][0..slot.len], &binder);
+                @memcpy(buf[slot.offset..][0..slot.len], binder[0..n]);
             }
         }
 
@@ -3225,7 +3360,7 @@ pub const Tls13Backend = struct {
         return if (self.server_name_present) self.server_name[0..self.server_name_len] else null;
     }
 
-    fn onCertificateVerify(self: *Tls13Backend, transcript_before: [hash_len]u8, body: []const u8, sink: *EventSink) HandshakeError!void {
+    fn onCertificateVerify(self: *Tls13Backend, transcript_before: tls_transcript.Digest, body: []const u8, sink: *EventSink) HandshakeError!void {
         var r = Reader{ .bytes = body };
         const algorithm = try r.u16_();
         const signature = try r.slice(try r.u16_());
@@ -3400,20 +3535,22 @@ pub const Tls13Backend = struct {
         return .valid;
     }
 
-    fn onServerFinished(self: *Tls13Backend, transcript_before: [hash_len]u8, body: []const u8, sink: *EventSink) HandshakeError!void {
+    fn onServerFinished(self: *Tls13Backend, transcript_before: tls_transcript.Digest, body: []const u8, sink: *EventSink) HandshakeError!void {
         const schedule = &self.schedule.?;
-        if (body.len != hash_len) return error.MalformedHandshake;
-        var expected = KeySchedule.verifyData(schedule.provider, &schedule.server_handshake_traffic, transcript_before) catch return error.SecretExportFailed;
-        defer crypto.secureZero(u8, &expected);
-        if (!crypto_pkg.provider.constantTimeEqual(&expected, body[0..hash_len])) return error.DecryptError;
+        const n = schedule.digestLen();
+        if (body.len != n) return error.MalformedHandshake;
+        var expected: [max_digest_len]u8 = undefined;
+        KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.server_handshake_traffic[0..n], transcript_before.slice(), expected[0..n]) catch return error.SecretExportFailed;
+        defer crypto.secureZero(u8, expected[0..n]);
+        if (!crypto_pkg.provider.constantTimeEqual(expected[0..n], body[0..n])) return error.DecryptError;
 
         // 1-RTT secrets exist from the transcript through server Finished,
         // independent of any client certificate flight that follows.
         const finished_hash = self.core.transcriptHash();
-        var app = schedule.applicationSecrets(finished_hash) catch return error.SecretExportFailed;
+        var app = schedule.applicationSecrets(finished_hash.slice()) catch return error.SecretExportFailed;
         defer app.wipe();
-        try self.emitSecret(sink, .application, .write, &app.client);
-        try self.emitSecret(sink, .application, .read, &app.server);
+        try self.emitSecret(sink, .application, .write, app.clientSecret());
+        try self.emitSecret(sink, .application, .read, app.serverSecret());
 
         // When the server requested handshake-time client authentication
         // (#334) the client answers with Certificate, an optional
@@ -3430,8 +3567,9 @@ pub const Tls13Backend = struct {
 
     /// Emit a lone client Finished (no client authentication) covering the
     /// transcript through the server Finished.
-    fn sendClientFinished(self: *Tls13Backend, transcript_hash: [hash_len]u8, sink: *EventSink) HandshakeError!void {
+    fn sendClientFinished(self: *Tls13Backend, transcript_hash: tls_transcript.Digest, sink: *EventSink) HandshakeError!void {
         const schedule = &self.schedule.?;
+        const n = schedule.digestLen();
         var finished_transcript_hash = transcript_hash;
         if (self.profile == .record and self.early_data_accepted) {
             var ebuf: [handshake_header_len]u8 = undefined;
@@ -3445,13 +3583,14 @@ pub const Tls13Backend = struct {
             try self.emitDiscardKeys(sink, .zero_rtt);
             finished_transcript_hash = self.core.transcriptHash();
         }
-        var buf: [4 + hash_len]u8 = undefined;
+        var buf: [4 + max_digest_len]u8 = undefined;
         var w = Writer{ .buf = &buf };
         try w.u8_(@intFromEnum(MessageType.finished));
         const message_len = try w.reserve(3);
-        var client_verify = KeySchedule.verifyData(schedule.provider, &schedule.client_handshake_traffic, finished_transcript_hash) catch return error.SecretExportFailed;
-        defer crypto.secureZero(u8, &client_verify);
-        try w.bytes(&client_verify);
+        var client_verify: [max_digest_len]u8 = undefined;
+        KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.client_handshake_traffic[0..n], finished_transcript_hash.slice(), client_verify[0..n]) catch return error.SecretExportFailed;
+        defer crypto.secureZero(u8, client_verify[0..n]);
+        try w.bytes(client_verify[0..n]);
         w.patch(3, message_len);
         const message = buf[0..w.len];
         self.core.recordSent(message) catch |err| return mapCoreError(err);
@@ -3610,9 +3749,11 @@ pub const Tls13Backend = struct {
         const finished_start = w.len;
         try w.u8_(@intFromEnum(MessageType.finished));
         const finished_len = try w.reserve(3);
-        var client_verify = KeySchedule.verifyData(schedule.provider, &schedule.client_handshake_traffic, self.core.transcriptHash()) catch return error.SecretExportFailed;
-        defer crypto.secureZero(u8, &client_verify);
-        try w.bytes(&client_verify);
+        const n = schedule.digestLen();
+        var client_verify: [max_digest_len]u8 = undefined;
+        KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.client_handshake_traffic[0..n], self.core.transcriptHash().slice(), client_verify[0..n]) catch return error.SecretExportFailed;
+        defer crypto.secureZero(u8, client_verify[0..n]);
+        try w.bytes(client_verify[0..n]);
         w.patch(3, finished_len);
         self.core.recordSent(buf[finished_start..w.len]) catch |err| return mapCoreError(err);
         // Emit CertificateVerify (when present) and Finished together; the
@@ -3702,6 +3843,21 @@ pub const Tls13Backend = struct {
             self.retry.wipe();
         }
         const hello_selection = tls_negotiation.negotiateServerHello(self.policy, &offers) catch |err| return mapNegotiationError(err);
+        if (hello_selection.version != .tls13 or hello_selection.named_group != .x25519) return error.IllegalParameter;
+        // #564: commit the negotiated suite — and select the transcript's
+        // hash family accordingly — as soon as it is known, before any
+        // possible HelloRetryRequest: `Core.acceptReceived` has already fed
+        // this ClientHello's raw bytes to the transcript with the family
+        // still unresolved (buffered), and `emitHelloRetryRequest` below
+        // would otherwise rebind/hash the HRR itself under an unresolved
+        // family. Re-negotiating ClientHello2 after a retry reaches this
+        // same point and re-selects the identical suite; `selectFamily` is
+        // a no-op once already selected.
+        self.negotiated_version = hello_selection.version;
+        self.negotiated_cipher_suite = hello_selection.cipher_suite;
+        self.negotiated_named_group = hello_selection.named_group;
+        try self.validateNegotiatedSuiteCapability();
+        self.core.transcript.selectFamily(self.negotiatedHash());
         if (observer.psk_ext != null and !observer.psk_modes_seen) return error.MissingExtension;
         // #366: early_data without an accompanying PSK offer is malformed —
         // 0-RTT is only meaningful alongside a resumption attempt.
@@ -3742,13 +3898,6 @@ pub const Tls13Backend = struct {
         };
         if (selected_key_share.len != key_share_public_len) return error.MalformedHandshake;
         const client_share = selected_key_share[0..key_share_public_len].*;
-        if (hello_selection.cipher_suite != .tls_aes_128_gcm_sha256 or
-            hello_selection.named_group != .x25519 or
-            hello_selection.version != .tls13)
-            return error.IllegalParameter;
-        self.negotiated_version = hello_selection.version;
-        self.negotiated_cipher_suite = hello_selection.cipher_suite;
-        self.negotiated_named_group = hello_selection.named_group;
 
         if (hello_selection.alpn) |protocol| {
             self.setSelectedAlpn(protocol.bytes);
@@ -3796,9 +3945,14 @@ pub const Tls13Backend = struct {
                 // transcript `message_hash(Hash(CH1)) || HRR ||
                 // Truncate(CH2)` — never `Hash(Truncate(CH2))` alone.
                 const snapshot = ch2_transcript_snapshot orelse return error.InvalidHandshakeState;
-                capture.binder_transcript_hash = snapshot.peekWith(truncated_prefix);
+                capture.binder_transcript_hash = snapshot.peekWith(truncated_prefix).bytes;
             } else {
-                Sha256.hash(truncated_prefix, &capture.binder_transcript_hash, .{});
+                // #564: the negotiated suite's hash — committed above,
+                // before this ClientHello's PSK offer is ever captured.
+                switch (self.negotiatedHash()) {
+                    .sha256 => Sha256.hash(truncated_prefix, capture.binder_transcript_hash[0..Sha256.digest_length], .{}),
+                    .sha384 => Sha384.hash(truncated_prefix, capture.binder_transcript_hash[0..Sha384.digest_length], .{}),
+                }
             }
 
             self.client_hello_psk = capture;
@@ -4008,10 +4162,11 @@ pub const Tls13Backend = struct {
         if (self.selectedAlpn()) |protocol| try sink.emitAlpn(protocol);
 
         if (psk_selected) |*sel| {
-            self.schedule = KeySchedule.initWithPsk(self.crypto_provider, &sel.psk, &shared, self.core.transcriptHash()) catch
+            const n = self.negotiatedDigestLen();
+            self.schedule = KeySchedule.initWithPsk(self.crypto_provider, self.negotiatedHash(), sel.psk[0..n], &shared, self.core.transcriptHash().slice()) catch
                 return error.SecretExportFailed;
         } else {
-            self.schedule = KeySchedule.init(self.crypto_provider, &shared, self.core.transcriptHash()) catch
+            self.schedule = KeySchedule.init(self.crypto_provider, self.negotiatedHash(), &shared, self.core.transcriptHash().slice()) catch
                 return error.SecretExportFailed;
         }
         try self.emitHandshakeSecrets(sink);
@@ -4096,18 +4251,25 @@ pub const Tls13Backend = struct {
                 continue;
             }
 
+            // #564: `evaluateCompatibility` above already enforced
+            // `hit.state.common.cipher_suite == self.negotiated_cipher_suite`
+            // (its `cipher_suite_mismatch` eligibility check) for any
+            // candidate reaching this point, so the negotiated suite's own
+            // hash is provably this candidate's PSK hash too — never a
+            // guess independent of that check.
+            const n = self.negotiatedDigestLen();
             const psk_slice = hit.state.common.resumption_psk.slice();
-            if (psk_slice.len != hash_len) return error.InvalidHandshakeState;
-            var psk_buf: [hash_len]u8 = undefined;
+            if (psk_slice.len != n) return error.InvalidHandshakeState;
+            var psk_buf: [max_digest_len]u8 = undefined;
             defer crypto.secureZero(u8, &psk_buf);
-            @memcpy(&psk_buf, psk_slice);
+            @memcpy(psk_buf[0..n], psk_slice);
 
             // #485: verify against the digest captured at parse time
             // (`Hash(Truncate(CH1))`, or after a HelloRetryRequest
             // `Hash(message_hash(Hash(CH1)) || HRR || Truncate(CH2))`) —
             // never re-hash the truncated message in isolation, which would
             // silently accept a pre-#485-shaped binder after a retry.
-            const ok = pre_shared_key.verifyBinderFromTranscriptHash(.sha256, &psk_buf, &capture.binder_transcript_hash, pair.binder) catch
+            const ok = pre_shared_key.verifyBinderFromTranscriptHash(self.negotiatedHash(), psk_buf[0..n], capture.binder_transcript_hash[0..n], pair.binder) catch
                 return error.InvalidHandshakeState;
             if (!ok) {
                 self.resumption_decision_observer.notify(.fatal);
@@ -4129,7 +4291,11 @@ pub const Tls13Backend = struct {
             // first-flight data) and only after binder verification, so an
             // early-data rejection never rejects an otherwise-valid PSK
             // resumption.
-            var identity_fingerprint: [hash_len]u8 = undefined;
+            // Always SHA-256 regardless of the negotiated suite: an
+            // internal replay-cache key over the opaque ticket identity
+            // bytes, never a TLS wire value — see
+            // `EarlyDataReplayCandidate.ticket_identity_fingerprint`.
+            var identity_fingerprint: [32]u8 = undefined;
             Sha256.hash(pair.identity.identity, &identity_fingerprint, .{});
             // #368 Slice 2: the replay store's retention window, derived
             // here (not re-derived from `obfuscated_ticket_age` by the
@@ -4173,16 +4339,20 @@ pub const Tls13Backend = struct {
             else
                 0;
             if (early_decision == .accepted) {
-                var client_hello_hash: [hash_len]u8 = undefined;
-                Sha256.hash(capture.message[0..capture.message_len], &client_hello_hash, .{});
+                var client_hello_hash: [max_digest_len]u8 = undefined;
+                switch (self.negotiatedHash()) {
+                    .sha256 => Sha256.hash(capture.message[0..capture.message_len], client_hello_hash[0..Sha256.digest_length], .{}),
+                    .sha384 => Sha384.hash(capture.message[0..capture.message_len], client_hello_hash[0..Sha384.digest_length], .{}),
+                }
 
-                var early = KeySchedule.clientEarlyTrafficSecret(self.crypto_provider, &psk_buf, client_hello_hash) catch
-                    return error.SecretExportFailed;
+                var early: [max_digest_len]u8 = undefined;
                 defer crypto.secureZero(u8, &early);
+                KeySchedule.clientEarlyTrafficSecret(self.crypto_provider, self.negotiatedHash(), psk_buf[0..n], client_hello_hash[0..n], early[0..n]) catch
+                    return error.SecretExportFailed;
 
                 // The server never emits a 0-RTT *write* key; server
                 // responses always use 1-RTT keys.
-                try self.emitSecret(sink, .zero_rtt, .read, &early);
+                try self.emitSecret(sink, .zero_rtt, .read, early[0..n]);
             }
 
             if (hit.on_selected) |hook| hook.complete();
@@ -4317,23 +4487,25 @@ pub const Tls13Backend = struct {
         try sink.emitCrypto(.handshake, buf[0..w.len]);
 
         const schedule = &self.schedule.?;
-        var fbuf: [handshake_header_len + hash_len]u8 = undefined;
+        const n = schedule.digestLen();
+        var fbuf: [handshake_header_len + max_digest_len]u8 = undefined;
         var fw = Writer{ .buf = &fbuf };
         try fw.u8_(@intFromEnum(MessageType.finished));
         const finished_len = try fw.reserve(3);
-        var server_verify = KeySchedule.verifyData(schedule.provider, &schedule.server_handshake_traffic, self.core.transcriptHash()) catch return error.SecretExportFailed;
-        defer crypto.secureZero(u8, &server_verify);
-        try fw.bytes(&server_verify);
+        var server_verify: [max_digest_len]u8 = undefined;
+        KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.server_handshake_traffic[0..n], self.core.transcriptHash().slice(), server_verify[0..n]) catch return error.SecretExportFailed;
+        defer crypto.secureZero(u8, server_verify[0..n]);
+        try fw.bytes(server_verify[0..n]);
         fw.patch(3, finished_len);
         const finished = fbuf[0..fw.len];
         self.core.recordSent(finished) catch |err| return mapCoreError(err);
         try sink.emitCrypto(.handshake, finished);
 
         const finished_hash = self.core.transcriptHash();
-        var app = schedule.applicationSecrets(finished_hash) catch return error.SecretExportFailed;
+        var app = schedule.applicationSecrets(finished_hash.slice()) catch return error.SecretExportFailed;
         defer app.wipe();
-        try self.emitSecret(sink, .application, .read, &app.client);
-        try self.emitSecret(sink, .application, .write, &app.server);
+        try self.emitSecret(sink, .application, .read, app.clientSecret());
+        try self.emitSecret(sink, .application, .write, app.serverSecret());
     }
 
     /// Validate the selected credential, emit EncryptedExtensions+Certificate,
@@ -4486,9 +4658,11 @@ pub const Tls13Backend = struct {
         const finished_start = w.len;
         try w.u8_(@intFromEnum(MessageType.finished));
         const finished_len = try w.reserve(3);
-        var server_verify = KeySchedule.verifyData(schedule.provider, &schedule.server_handshake_traffic, self.core.transcriptHash()) catch return error.SecretExportFailed;
-        defer crypto.secureZero(u8, &server_verify);
-        try w.bytes(&server_verify);
+        const n = schedule.digestLen();
+        var server_verify: [max_digest_len]u8 = undefined;
+        KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.server_handshake_traffic[0..n], self.core.transcriptHash().slice(), server_verify[0..n]) catch return error.SecretExportFailed;
+        defer crypto.secureZero(u8, server_verify[0..n]);
+        try w.bytes(server_verify[0..n]);
         w.patch(3, finished_len);
         const finished = buf[finished_start..w.len];
         self.core.recordSent(finished) catch |err| return mapCoreError(err);
@@ -4499,10 +4673,10 @@ pub const Tls13Backend = struct {
         // 1-RTT secrets from the transcript through server Finished; the
         // client Finished we will require is fixed by the same hash.
         const finished_hash = self.core.transcriptHash();
-        var app = schedule.applicationSecrets(finished_hash) catch return error.SecretExportFailed;
+        var app = schedule.applicationSecrets(finished_hash.slice()) catch return error.SecretExportFailed;
         defer app.wipe();
-        try self.emitSecret(sink, .application, .read, &app.client);
-        try self.emitSecret(sink, .application, .write, &app.server);
+        try self.emitSecret(sink, .application, .read, app.clientSecret());
+        try self.emitSecret(sink, .application, .write, app.serverSecret());
         // The client Finished MAC is (re)computed when the client Finished
         // arrives, over the transcript actually preceding it — which, under
         // handshake-time client authentication, includes the client's own
@@ -4707,18 +4881,20 @@ pub const Tls13Backend = struct {
         }
     }
 
-    fn onClientFinished(self: *Tls13Backend, transcript_before: [hash_len]u8, body: []const u8, sink: *EventSink) HandshakeError!void {
+    fn onClientFinished(self: *Tls13Backend, transcript_before: tls_transcript.Digest, body: []const u8, sink: *EventSink) HandshakeError!void {
         const schedule = &self.schedule.?;
+        const n = schedule.digestLen();
         if (self.profile == .record and self.early_data_accepted and !self.core.end_of_early_data_seen)
             return error.UnexpectedHandshakeMessage;
-        if (body.len != hash_len) return error.MalformedHandshake;
+        if (body.len != n) return error.MalformedHandshake;
         // Recompute over the transcript that actually precedes this Finished:
         // with handshake-time client authentication it includes the client's
         // Certificate and CertificateVerify, so the MAC cannot be fixed when the
         // server flight was sent.
-        var expected = KeySchedule.verifyData(schedule.provider, &schedule.client_handshake_traffic, transcript_before) catch return error.SecretExportFailed;
-        defer crypto.secureZero(u8, &expected);
-        if (!crypto_pkg.provider.constantTimeEqual(&expected, body[0..hash_len])) return error.DecryptError;
+        var expected: [max_digest_len]u8 = undefined;
+        KeySchedule.verifyData(schedule.provider, schedule.hash, schedule.client_handshake_traffic[0..n], transcript_before.slice(), expected[0..n]) catch return error.SecretExportFailed;
+        defer crypto.secureZero(u8, expected[0..n]);
+        if (!crypto_pkg.provider.constantTimeEqual(expected[0..n], body[0..n])) return error.DecryptError;
         // Client Finished confirms the handshake for the server (RFC 8446 §4.4.4).
         try self.captureResumptionMasterSecret();
         try self.emitDiscardKeys(sink, .handshake);
@@ -4735,14 +4911,26 @@ pub const Tls13Backend = struct {
 
     fn emitHandshakeSecrets(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
         const schedule = &self.schedule.?;
+        const n = schedule.digestLen();
+        // #564: the one canonical point both roles' full and resumed
+        // handshakes alike reach right after constructing `self.schedule`
+        // and before either handshake traffic secret below — satisfying
+        // `EventSink.emitNegotiatedParameters`'s ordering contract.
+        try sink.emitNegotiatedParameters(.{
+            .cipher_suite = self.negotiatedCipherCode(),
+            .transcript_hash = switch (self.negotiated_cipher_suite) {
+                .tls_aes_128_gcm_sha256, .tls_chacha20_poly1305_sha256 => .sha256,
+                .tls_aes_256_gcm_sha384 => .sha384,
+            },
+        });
         switch (self.role) {
             .client => {
-                try self.emitSecret(sink, .handshake, .write, &schedule.client_handshake_traffic);
-                try self.emitSecret(sink, .handshake, .read, &schedule.server_handshake_traffic);
+                try self.emitSecret(sink, .handshake, .write, schedule.client_handshake_traffic[0..n]);
+                try self.emitSecret(sink, .handshake, .read, schedule.server_handshake_traffic[0..n]);
             },
             .server => {
-                try self.emitSecret(sink, .handshake, .read, &schedule.client_handshake_traffic);
-                try self.emitSecret(sink, .handshake, .write, &schedule.server_handshake_traffic);
+                try self.emitSecret(sink, .handshake, .read, schedule.client_handshake_traffic[0..n]);
+                try self.emitSecret(sink, .handshake, .write, schedule.server_handshake_traffic[0..n]);
             },
         }
     }
@@ -4777,10 +4965,11 @@ pub const Tls13Backend = struct {
     fn captureResumptionMasterSecret(self: *Tls13Backend) HandshakeError!void {
         if (self.resumption_master_secret.slice().len != 0) return error.InvalidHandshakeState;
         const schedule = &(self.schedule orelse return error.InvalidHandshakeState);
-        var rms: [hash_len]u8 = undefined;
-        defer crypto.secureZero(u8, &rms);
-        schedule.resumptionMasterSecret(&self.core.transcriptHash(), &rms) catch return error.SecretExportFailed;
-        self.resumption_master_secret.replace(&rms) catch return error.SecretExportFailed;
+        const n = schedule.digestLen();
+        var rms: [max_digest_len]u8 = undefined;
+        defer crypto.secureZero(u8, rms[0..n]);
+        schedule.resumptionMasterSecret(self.core.transcriptHash().slice(), rms[0..n]) catch return error.SecretExportFailed;
+        self.resumption_master_secret.replace(rms[0..n]) catch return error.SecretExportFailed;
     }
 
     fn resumptionContext(self: *const Tls13Backend) new_session_ticket.ConnectionResumptionContext {
@@ -5047,7 +5236,7 @@ pub const Tls13Backend = struct {
         w.patch(3, body_len_index);
         const message = buf[0..w.len];
         try sink.emitOwnedCrypto(allocator, .application, message);
-        self.core.transcript.update(message);
+        self.core.transcript.update(message) catch return error.HandshakeBufferOverflow;
     }
 
     /// Single-phase issuance, retained for callers (and tests) that already
@@ -5274,7 +5463,7 @@ fn mapTicketBuildClientError(err: new_session_ticket.BuildError) HandshakeError!
 /// RFC 8446 §4.4.3 CertificateVerify content: 64 spaces, context string,
 /// separator, transcript hash.
 const CertificateVerifyContent = struct {
-    buf: [64 + 64 + 1 + hash_len]u8,
+    buf: [64 + 64 + 1 + max_digest_len]u8,
     len: usize,
 
     fn slice(self: *const CertificateVerifyContent) []const u8 {
@@ -5282,7 +5471,7 @@ const CertificateVerifyContent = struct {
     }
 };
 
-fn certificateVerifyContent(signer: Role, transcript_hash: [hash_len]u8) CertificateVerifyContent {
+fn certificateVerifyContent(signer: Role, transcript_hash: tls_transcript.Digest) CertificateVerifyContent {
     const context = switch (signer) {
         .server => "TLS 1.3, server CertificateVerify",
         .client => "TLS 1.3, client CertificateVerify",
@@ -5295,8 +5484,8 @@ fn certificateVerifyContent(signer: Role, transcript_hash: [hash_len]u8) Certifi
     len += context.len;
     content.buf[len] = 0x00;
     len += 1;
-    @memcpy(content.buf[len..][0..hash_len], &transcript_hash);
-    len += hash_len;
+    @memcpy(content.buf[len..][0..transcript_hash.len], transcript_hash.slice());
+    len += transcript_hash.len;
     content.len = len;
     return content;
 }
@@ -5377,7 +5566,14 @@ const TestProviderStorage = struct {
 const test_crypto_provider_seed: u64 = 0x71357_490;
 
 test "TLS-owned backend does not embed maximum ticket storage" {
-    try std.testing.expect(@sizeOf(Tls13Backend) < 64 * 1024);
+    // #564: the budget grew from 64 KiB to accommodate exactly one framed
+    // handshake message's worth of transcript pre-selection buffering
+    // (`transcript.max_pending_len`) — see that constant's doc comment for
+    // why a client cannot hash its own ClientHello until the negotiated
+    // suite (learned only from the server's response) is known. This is
+    // still nowhere near `max_new_session_ticket_message_len`, checked
+    // below, so ticket storage itself remains unaffected.
+    try std.testing.expect(@sizeOf(Tls13Backend) < 96 * 1024);
     try std.testing.expect(@sizeOf(Tls13Backend) + EventSink.max_bytes < max_new_session_ticket_message_len);
 }
 
@@ -5389,7 +5585,7 @@ test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
         .{ .pinned_certificate = testdata.certificate_der },
         .record,
     );
-    backend.core.transcript.update("transcript-adjacent state");
+    try backend.core.transcript.update("transcript-adjacent state");
     @memset(&backend.expected_client_verify, 0xa5);
     @memset(&backend.peer_chain, 0x5a);
     backend.peer_chain_entries[0] = .{ .start = 0, .len = 32 };
@@ -5598,6 +5794,7 @@ test "client NewSessionTicket callback receives owned state and lifetime zero is
         .onTicketFn = TicketCapture.onTicket,
     });
     backend.core.handshake_lifecycle = .complete;
+    backend.core.transcript.selectFamily(.sha256);
     try backend.resumption_master_secret.replace(&([_]u8{0x42} ** hash_len));
 
     var body_buf: [128]u8 = undefined;
@@ -5635,6 +5832,7 @@ test "client parses and drops NewSessionTicket when no consumer is configured" {
     defer backend.deinit();
     try backend.setPostHandshakeAllocator(std.testing.allocator);
     backend.core.handshake_lifecycle = .complete;
+    backend.core.transcript.selectFamily(.sha256);
 
     var body_buf: [128]u8 = undefined;
     const body = try new_session_ticket.encode(.{
@@ -5702,6 +5900,7 @@ test "server explicitly emits NewSessionTicket and returns recoverable state" {
     }, session.Limits.default));
 
     server.core.handshake_lifecycle = .complete;
+    server.core.transcript.selectFamily(.sha256);
     try server.resumption_master_secret.replace(&([_]u8{0x33} ** hash_len));
     var state = try server.emitNewSessionTicket(std.testing.allocator, &sink, .{
         .ticket_lifetime = 60,
@@ -5736,6 +5935,7 @@ test "prepare/emit two-phase ticket issuance matches single-phase wire output" {
     );
     defer server.deinit();
     server.core.handshake_lifecycle = .complete;
+    server.core.transcript.selectFamily(.sha256);
     try server.resumption_master_secret.replace(&([_]u8{0x33} ** hash_len));
 
     var sink = EventSink{};
@@ -5773,6 +5973,7 @@ test "emitPreparedNewSessionTicket rejects an empty or oversized identity" {
     );
     defer server.deinit();
     server.core.handshake_lifecycle = .complete;
+    server.core.transcript.selectFamily(.sha256);
     try server.resumption_master_secret.replace(&([_]u8{0x33} ** hash_len));
 
     var sink = EventSink{};
@@ -5802,6 +6003,7 @@ test "server ticket output failure is atomic and retryable" {
     );
     defer server.deinit();
     server.core.handshake_lifecycle = .complete;
+    server.core.transcript.selectFamily(.sha256);
     try server.resumption_master_secret.replace(&([_]u8{0x33} ** hash_len));
 
     var full_sink = EventSink{};
@@ -5815,7 +6017,7 @@ test "server ticket output failure is atomic and retryable" {
         .opaque_ticket = "ticket",
         .issued_at_unix_ms = 10,
     }, session.Limits.default));
-    try std.testing.expectEqualSlices(u8, &before, &server.core.transcriptHash());
+    try std.testing.expectEqualSlices(u8, before.slice(), server.core.transcriptHash().slice());
 
     full_sink.reset();
     var state = try server.emitNewSessionTicket(std.testing.allocator, &full_sink, .{
@@ -5843,6 +6045,7 @@ test "server ticket emission allocation failures leave transcript and sink clean
             .record,
         );
         server.core.handshake_lifecycle = .complete;
+        server.core.transcript.selectFamily(.sha256);
         try server.resumption_master_secret.replace(&([_]u8{0x33} ** hash_len));
         var sink = EventSink{};
         const before = server.core.transcriptHash();
@@ -5858,7 +6061,7 @@ test "server ticket emission allocation failures leave transcript and sink clean
             if (!failing.has_induced_failure) return err;
             saw_injected_failure = true;
             try std.testing.expectEqual(error.CredentialProviderFailed, err);
-            try std.testing.expectEqualSlices(u8, &before, &server.core.transcriptHash());
+            try std.testing.expectEqualSlices(u8, before.slice(), server.core.transcriptHash().slice());
             try std.testing.expectEqual(@as(usize, 0), sink.len);
             sink.deinit();
             server.deinit();
@@ -5912,6 +6115,7 @@ test "large emitted ticket is delivered once after fragmented application receiv
     );
     defer server.deinit();
     server.core.handshake_lifecycle = .complete;
+    server.core.transcript.selectFamily(.sha256);
     try server.resumption_master_secret.replace(&([_]u8{0x44} ** hash_len));
 
     var client = Tls13Backend.initClient(
@@ -5928,6 +6132,7 @@ test "large emitted ticket is delivered once after fragmented application receiv
         .onTicketFn = Capture.onTicket,
     });
     client.core.handshake_lifecycle = .complete;
+    client.core.transcript.selectFamily(.sha256);
     try client.resumption_master_secret.replace(&([_]u8{0x44} ** hash_len));
 
     var sink = EventSink{};
@@ -5965,6 +6170,7 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
     defer client.deinit();
     try client.setPostHandshakeAllocator(std.testing.allocator);
     client.core.handshake_lifecycle = .complete;
+    client.core.transcript.selectFamily(.sha256);
 
     const max_message = try buildMaxNewSessionTicketMessage(std.testing.allocator);
     defer std.testing.allocator.free(max_message);
@@ -5984,6 +6190,7 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
     defer over_client.deinit();
     try over_client.setPostHandshakeAllocator(std.testing.allocator);
     over_client.core.handshake_lifecycle = .complete;
+    over_client.core.transcript.selectFamily(.sha256);
     const over = try std.testing.allocator.alloc(u8, max_new_session_ticket_message_len + 1);
     defer std.testing.allocator.free(over);
     // Non-zero filler: only the header this test explicitly overwrites
@@ -6007,6 +6214,7 @@ test "client cannot emit NewSessionTicket" {
     );
     defer client.deinit();
     client.core.handshake_lifecycle = .complete;
+    client.core.transcript.selectFamily(.sha256);
     try client.resumption_master_secret.replace(&([_]u8{0x44} ** hash_len));
     var sink = EventSink{};
     defer sink.deinit();

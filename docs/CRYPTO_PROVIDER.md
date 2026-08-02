@@ -91,14 +91,18 @@ data, not prose:
   `EnumSet(ProductProfile)` (`.native_appliance`, `.general_purpose_openssl`):
   which product actually selects this capability. This is authored per row,
   not derived from `pure_zig_status`/`openssl_status` — primitive support
-  does not imply product selectability. AES-256-GCM and ChaCha20-Poly1305
-  both report `pure_zig_status = .supported` but neither is negotiated by the
-  native appliance, so neither claims `.native_appliance`; secp256r1 has
+  does not imply product selectability. secp256r1 is the standing example:
   `openssl_status = .provider_deferred` (no in-process OpenSSL
-  `CryptoProvider` yet) but the real general-purpose OpenSSL product supports
-  P-256 ECDH outside this seam, so it still claims `.general_purpose_openssl`.
-  See `profile.zig`'s "enabled product profiles are not a mechanical copy of
-  primitive support" test.
+  `CryptoProvider` yet), but the real general-purpose OpenSSL product
+  supports P-256 ECDH outside this seam, so it still claims
+  `.general_purpose_openssl` even though the pure-Zig backend does not
+  implement the group at all and can never claim `.native_appliance`.
+  AES-256-GCM and ChaCha20-Poly1305 used to illustrate the same asymmetry
+  (`pure_zig_status = .supported` but not negotiated by the native
+  appliance); since #564 made the native engine's handshake/transcript/key
+  schedule cipher/hash-agile, both are negotiated there too and now claim
+  `.native_appliance`. See `profile.zig`'s "enabled product profiles are not
+  a mechanical copy of primitive support" test.
 
 ## Supported profile matrix
 
@@ -110,12 +114,12 @@ lists only the consumers whose live runtime calls `CryptoProvider` today
 | Capability | Pure-Zig status | Pure-Zig implementation | OpenSSL status | Consumers | Live integration | Product profiles |
 | --- | --- | --- | --- | --- | --- | --- |
 | SHA-256 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF, QUIC TLS bridge | none — unkeyed hashing has no `CryptoProvider` entry point by design | native appliance, general-purpose OpenSSL |
-| SHA-384 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF | none — unkeyed hashing has no `CryptoProvider` entry point by design | general-purpose OpenSSL only (the native appliance's engine negotiates TLS_AES_128_GCM_SHA256 only, so SHA-384 is never selected there) |
+| SHA-384 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF | none — unkeyed hashing has no `CryptoProvider` entry point by design | native appliance, general-purpose OpenSSL (the native engine's transcript/key schedule are cipher/hash-agile, #564; SHA-384 is live whenever TLS_AES_256_GCM_SHA384 is negotiated) |
 | HKDF-SHA256 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule, QUIC packet protection | live — QUIC packet protection, the QUIC/TLS secret bridge, and the TLS 1.3 key schedule (`src/tls/key_schedule.zig`) all call `CryptoProvider.hkdfExtract`/`.hkdfExpandLabel` | native appliance, general-purpose OpenSSL |
-| HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule | not integrated — `src/tls/key_schedule.zig`'s generic resumption helpers correctly route `.sha384` through `CryptoProvider` when called with it, but no live native TLS path ever calls them that way: the native engine negotiates TLS_AES_128_GCM_SHA256 only, so its resumption/ticket flow always derives SHA-256 secrets | general-purpose OpenSSL only (the native appliance's engine negotiates TLS_AES_128_GCM_SHA256 only, so HKDF-SHA384 is never selected there) |
+| HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule | live — `src/tls/key_schedule.zig` is hash-agile (#564): `KeySchedule` and every resumption/ticket helper derive their hash from the negotiated suite (`algorithms.transcriptHash`) and route it through `CryptoProvider`, so a native handshake negotiating TLS_AES_256_GCM_SHA384 really does derive under SHA-384 | native appliance, general-purpose OpenSSL |
 | AES-128-GCM | supported | `std.crypto` | provider deferred | TLS records, QUIC packet protection | both — TLS record protection and QUIC packet protection seal/open through `CryptoProvider` | native appliance, general-purpose OpenSSL |
-| AES-256-GCM | supported | `std.crypto` | provider deferred | TLS records; QUIC integration deferred | none — TLS_AES_256_GCM_SHA384 is not negotiated by the native appliance's engine | general-purpose OpenSSL only (negotiated there outside this seam) |
-| ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | protocol integration deferred | none | general-purpose OpenSSL only |
+| AES-256-GCM | supported | `std.crypto` | provider deferred | TLS records | live — the native engine now negotiates TLS_AES_256_GCM_SHA384 (#564) through the existing generic `record_protection.TrafficKeys.derive` path, the same CryptoProvider-routed seal/open every suite uses | native appliance, general-purpose OpenSSL |
+| ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | TLS records | live — the native engine now negotiates TLS_CHACHA20_POLY1305_SHA256 (#564) through the same generic record-protection path | native appliance, general-purpose OpenSSL |
 | QUIC AES-128 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection | live — every send/receive path in `src/quic/tls_adapter.zig` applies/removes header protection through `CryptoProvider` | native appliance only (QUIC-specific; the general-purpose backend is TLS-over-TCP) |
 | X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge | live — `src/tls/tls13_backend.zig` generates its ephemeral key share and derives the shared secret through `CryptoProvider.generateKeyShare`/`.deriveSharedSecret` | native appliance, general-purpose OpenSSL |
 | secp256r1 / P-256 | provider deferred | unavailable | provider deferred | TLS key share, PKI | none | general-purpose OpenSSL only (P-256 ECDH outside this seam; not implemented in pure Zig at all) |

@@ -11,7 +11,7 @@ const messages = @import("messages.zig");
 const state = @import("state.zig");
 const transcript_mod = @import("transcript.zig");
 
-pub const Error = events.HandshakeError || messages.ReassemblerError;
+pub const Error = events.HandshakeError || messages.ReassemblerError || transcript_mod.Error;
 pub const Message = messages.HandshakeMessage;
 pub const MessageType = messages.MessageType;
 pub const Reader = messages.Reader;
@@ -153,7 +153,7 @@ pub const Core = struct {
         if (message.kind == .new_session_ticket) {
             if (self.handshake_lifecycle != .complete or self.role != .client)
                 return error.UnexpectedHandshakeMessage;
-            self.transcript.update(message.raw);
+            try self.transcript.update(message.raw);
             return message;
         }
         // A CertificateRequest (server->client, #334) is an optional message the
@@ -170,20 +170,20 @@ pub const Core = struct {
                 self.client_certificate_requested)
                 return error.UnexpectedHandshakeMessage;
             self.client_certificate_requested = true;
-            self.transcript.update(message.raw);
+            try self.transcript.update(message.raw);
             return message;
         }
         // Server inbound for the client's post-Finished certificate flight.
         if (self.client_auth_inbound != .inactive) {
             try self.checkClientAuthInbound(message.kind);
-            self.transcript.update(message.raw);
+            try self.transcript.update(message.raw);
             self.advanceClientAuthInbound(message.kind);
             return message;
         }
         if (message.kind == .end_of_early_data) {
             if (self.role != .server or self.handshake_state != .finished or self.expected_inbound != null or self.end_of_early_data_seen)
                 return error.UnexpectedHandshakeMessage;
-            self.transcript.update(message.raw);
+            try self.transcript.update(message.raw);
             self.end_of_early_data_seen = true;
             return message;
         }
@@ -191,7 +191,7 @@ pub const Core = struct {
             if (self.expected_inbound != message.kind)
                 return error.UnexpectedHandshakeMessage;
         }
-        self.transcript.update(message.raw);
+        try self.transcript.update(message.raw);
         self.advanceAfterReceive(message.kind);
         return message;
     }
@@ -228,7 +228,7 @@ pub const Core = struct {
         if (message.kind == .client_hello and self.retry_state == .hrr_received)
             return error.UnexpectedHandshakeMessage;
         if (!self.validOutbound(message.kind)) return error.UnexpectedHandshakeMessage;
-        self.transcript.update(message.raw);
+        try self.transcript.update(message.raw);
         self.advanceAfterSend(message.kind);
     }
 
@@ -242,7 +242,7 @@ pub const Core = struct {
         const message = messages.decode(raw) catch return error.MalformedHandshake;
         if (message.kind != .server_hello) return error.UnexpectedHandshakeMessage;
         self.transcript.rebindClientHello();
-        self.transcript.update(message.raw);
+        try self.transcript.update(message.raw);
         self.retry_state = .hrr_received;
         self.expected_inbound = null;
         return message;
@@ -257,7 +257,7 @@ pub const Core = struct {
         const message = messages.decode(raw) catch return error.MalformedHandshake;
         if (message.kind != .server_hello) return error.UnexpectedHandshakeMessage;
         self.transcript.rebindClientHello();
-        self.transcript.update(message.raw);
+        try self.transcript.update(message.raw);
         self.retry_state = .hrr_sent;
         self.handshake_state = .idle;
         self.expected_inbound = .client_hello;
@@ -271,7 +271,7 @@ pub const Core = struct {
             return error.UnexpectedHandshakeMessage;
         const message = messages.decode(raw) catch return error.MalformedHandshake;
         if (message.kind != .client_hello) return error.UnexpectedHandshakeMessage;
-        self.transcript.update(message.raw);
+        try self.transcript.update(message.raw);
         self.expected_inbound = .server_hello;
     }
 
@@ -283,7 +283,7 @@ pub const Core = struct {
             return error.UnexpectedHandshakeMessage;
         const message = messages.decode(raw) catch return error.MalformedHandshake;
         if (message.kind != .client_hello) return error.UnexpectedHandshakeMessage;
-        self.transcript.update(message.raw);
+        try self.transcript.update(message.raw);
         self.handshake_state = .server_hello;
         self.expected_inbound = null;
         return message;
@@ -293,7 +293,7 @@ pub const Core = struct {
         return self.acceptReceived(raw);
     }
 
-    pub fn transcriptHash(self: *const Core) [transcript_mod.digest_len]u8 {
+    pub fn transcriptHash(self: *const Core) transcript_mod.Digest {
         return self.transcript.peek();
     }
 
@@ -413,6 +413,8 @@ test "core records both directions of a client and server flight" {
     var server = Core.init(.server);
     try client.start();
     try server.start();
+    client.transcript.selectFamily(.sha256);
+    server.transcript.selectFamily(.sha256);
 
     var bytes: [8]u8 = undefined;
     const ch = try messages.encode(.client_hello, "", &bytes);
@@ -440,7 +442,7 @@ test "core records both directions of a client and server flight" {
     try std.testing.expectEqual(.complete, server.handshake_lifecycle);
     const client_hash = client.transcriptHash();
     const server_hash = server.transcriptHash();
-    try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
+    try std.testing.expect(client_hash.eql(&server_hash));
 }
 
 test "PSK-authenticated core skips Certificate/CertificateVerify and still completes both directions" {
@@ -448,6 +450,8 @@ test "PSK-authenticated core skips Certificate/CertificateVerify and still compl
     var server = Core.init(.server);
     try client.start();
     try server.start();
+    client.transcript.selectFamily(.sha256);
+    server.transcript.selectFamily(.sha256);
 
     var bytes: [8]u8 = undefined;
     const ch = try messages.encode(.client_hello, "", &bytes);
@@ -481,7 +485,7 @@ test "PSK-authenticated core skips Certificate/CertificateVerify and still compl
     try std.testing.expectEqual(.complete, server.handshake_lifecycle);
     const client_hash = client.transcriptHash();
     const server_hash = server.transcriptHash();
-    try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
+    try std.testing.expect(client_hash.eql(&server_hash));
 }
 
 test "core supports one HelloRetryRequest followed by ClientHello2" {
@@ -489,6 +493,8 @@ test "core supports one HelloRetryRequest followed by ClientHello2" {
     var server = Core.init(.server);
     try client.start();
     try server.start();
+    client.transcript.selectFamily(.sha256);
+    server.transcript.selectFamily(.sha256);
 
     var bytes: [16]u8 = undefined;
     const ch1 = try messages.encode(.client_hello, "one", &bytes);
@@ -511,7 +517,7 @@ test "core supports one HelloRetryRequest followed by ClientHello2" {
     try std.testing.expectEqual(RetryState.hrr_sent, server.retry_state);
     const client_hash = client.transcriptHash();
     const server_hash = server.transcriptHash();
-    try std.testing.expectEqualSlices(u8, &client_hash, &server_hash);
+    try std.testing.expect(client_hash.eql(&server_hash));
 }
 
 test "core rejects repeated HRR and ClientHello2 without retry state" {
@@ -543,7 +549,7 @@ test "core rejects HRR before ClientHello1 was recorded without rebinding transc
     const hrr = try messages.encode(.server_hello, "hrr", &bytes);
     try std.testing.expectError(error.UnexpectedHandshakeMessage, client.acceptHelloRetryRequest(hrr));
     const after = client.transcriptHash();
-    try std.testing.expectEqualSlices(u8, &before, &after);
+    try std.testing.expect(before.eql(&after));
     try std.testing.expectEqual(RetryState.none, client.retry_state);
 }
 
@@ -556,7 +562,7 @@ test "core rejects normal ServerHello before ClientHello1 was recorded" {
     const sh = try messages.encode(.server_hello, "sh", &bytes);
     try std.testing.expectError(error.UnexpectedHandshakeMessage, client.acceptReceived(sh));
     const after = client.transcriptHash();
-    try std.testing.expectEqualSlices(u8, &before, &after);
+    try std.testing.expect(before.eql(&after));
     try std.testing.expectEqual(state.HandshakeState.idle, client.handshake_state);
 }
 

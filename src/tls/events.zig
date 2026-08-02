@@ -95,8 +95,29 @@ pub const HandshakeError = error{
     DecryptError,
 };
 
+/// The transcript/HKDF hash a negotiated cipher suite selects
+/// (`algorithms.transcriptHash`), re-exported here so a record or QUIC
+/// consumer can size/interpret traffic secrets without importing
+/// `algorithms.zig` or guessing from secret length alone (#564: two of the
+/// three negotiable suites share a hash, so length is not an implicit
+/// signal either way).
+pub const TranscriptHash = enum { sha256, sha384 };
+
+/// Negotiated cipher-suite metadata (#564), emitted exactly once per
+/// connection — for a full or a resumed handshake alike — before any
+/// `traffic_secret` event for the `handshake` epoch. `cipher_suite` is the
+/// wire code point (`algorithms.CipherSuite`'s backing `u16`); consumers
+/// that need the enum value convert it with `algorithms.fromInt`. This is
+/// the one canonical negotiated-parameters signal — transports must not
+/// infer the suite from secret length or any other side channel.
+pub const NegotiatedParameters = struct {
+    cipher_suite: u16,
+    transcript_hash: TranscriptHash,
+};
+
 pub const Event = union(enum) {
     handshake_bytes: struct { epoch: EncryptionEpoch, data: []const u8 },
+    negotiated_parameters: NegotiatedParameters,
     traffic_secret: struct { epoch: EncryptionEpoch, direction: SecretDirection, data: []const u8 },
     alpn: []const u8,
     certificate: CertificateState,
@@ -126,6 +147,14 @@ test "shared handshake errors include TLS-level failure cases" {
 
     const err: HandshakeError = error.MalformedHandshake;
     try std.testing.expectEqual(error.MalformedHandshake, err);
+}
+
+test "negotiated_parameters event carries the wire cipher suite and its transcript hash" {
+    const std = @import("std");
+
+    const event = Event{ .negotiated_parameters = .{ .cipher_suite = 0x1302, .transcript_hash = .sha384 } };
+    try std.testing.expectEqual(@as(u16, 0x1302), event.negotiated_parameters.cipher_suite);
+    try std.testing.expectEqual(TranscriptHash.sha384, event.negotiated_parameters.transcript_hash);
 }
 
 test "syntax, semantic, and ordering failures are distinct cases" {
