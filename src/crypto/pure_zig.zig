@@ -1073,6 +1073,9 @@ test "secp256r1 rejects invalid scalars, peer encodings, and preserves outputs o
     var off_curve = valid_peer;
     off_curve[64] ^= 0x01;
     try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &valid_scalar, &off_curve, &out));
+    var identity = [_]u8{0} ** 65;
+    identity[0] = 0x04;
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &valid_scalar, &identity, &out));
     var noncanonical = valid_peer;
     @memset(noncanonical[1..33], 0xff);
     try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &valid_scalar, &noncanonical, &out));
