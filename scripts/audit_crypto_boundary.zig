@@ -423,16 +423,32 @@ const dir_checks = [_]DirCheck{
 
 /// The raw, non-canonical spelling of a constant-time comparison. #375
 /// migrated every secret/authentication-derived comparison in `src/tls`,
-/// `src/quic`, and `src/pki` onto `crypto.secrets.constantTimeEqual` /
+/// `src/quic`, `src/pki`, and `src/crypto`'s non-implementation consumers
+/// (e.g. `rsa.zig`) onto `crypto.secrets.constantTimeEqual` /
 /// `crypto.provider.constantTimeEqual`; a new raw call over either spelling
 /// reappearing anywhere in those trees is exactly the regression this guards
 /// against. The one legitimate raw call left project-wide is inside
 /// `crypto.secrets.constantTimeEqual` itself, in `src/crypto/secrets.zig`,
-/// which this check's directory scope (`src/tls`/`src/quic`/`src/pki`) never
-/// reaches.
+/// which the `src/crypto` directory check below excludes by exact path.
+///
+/// No trailing `.` on either needle (#554 review, first pass): a
+/// namespace-capture alias reads and calls the member off a *different*
+/// token than the qualifier —
+///
+///     const timing_safe = std.crypto.timing_safe;
+///     return timing_safe.eql(...);
+///
+/// — so the declaration contains `std.crypto.timing_safe;`, never
+/// `std.crypto.timing_safe.`, and the call contains only `timing_safe.eql`,
+/// neither of which the dot-suffixed needle would catch. Dropping the
+/// trailing dot catches the qualified spelling regardless of what follows it
+/// (`.eql(`, `.compare(`, `;`, `,`, `)`) at the cost of also matching inside
+/// a hypothetical unrelated identifier that happens to start with
+/// `timing_safe` (e.g. a contrived `timing_safeguard`) — no such identifier
+/// exists in `std.crypto` or this project today.
 const timing_safe_forbidden = [_][]const u8{
-    "std.crypto.timing_safe.",
-    "crypto.timing_safe.",
+    "std.crypto.timing_safe",
+    "crypto.timing_safe",
 };
 
 /// The raw, non-canonical spelling of a secret-buffer zero. Reserved for
@@ -464,7 +480,19 @@ const dir_checks_375 = [_]DirCheck{
         .dir = "src/pki",
         .excluded_paths = &.{},
         .forbidden = &timing_safe_forbidden,
-        .rationale = "src/pki has no raw std.crypto.timing_safe call today (RSA-PSS's final hash comparison routes through crypto.secrets.constantTimeEqual; its EMSA-PSS structural checks are public/attacker-controlled and correctly left as ordinary std.mem.eql, per #375). A new raw timing_safe call anywhere in this tree needs the same audit-and-classify treatment #375 gave rsa.zig, not a silent reintroduction.",
+        .rationale = "src/pki has no raw std.crypto.timing_safe call today: its EMSA-PSS-adjacent structural checks live in src/crypto/rsa.zig (see that check below), and everything in src/pki itself is public certificate/DER structure, correctly left as ordinary std.mem.eql per #375. A new raw timing_safe call anywhere in this tree needs the same audit-and-classify treatment #375 gave rsa.zig, not a silent reintroduction.",
+    },
+    .{
+        .dir = "src/crypto",
+        // secrets.zig owns constantTimeEqual's one legitimate raw
+        // implementation; excluded by exact path (not scanned at all) so it
+        // gets its own narrower FileCheckWithExceptions entry below instead,
+        // the same "excluded from the recursive scan, checked separately
+        // with a named exception" shape src/quic's #490 DirCheck already
+        // uses for tls_adapter.zig and friends.
+        .excluded_paths = &.{"src/crypto/secrets.zig"},
+        .forbidden = &timing_safe_forbidden,
+        .rationale = "#554 review: src/crypto/rsa.zig's EMSA-PSS final authentication hash comparison is explicitly in #375's audit matrix and must route through crypto.secrets.constantTimeEqual like every other secret/authentication-derived comparison; the original version of this guard scanned only src/tls/src/quic/src/pki and missed this consumer entirely. Every other src/crypto file (provider.zig, pure_zig.zig, profile.zig, root.zig) has no legitimate raw timing_safe call either.",
     },
 };
 
@@ -475,13 +503,8 @@ const dir_checks_375 = [_]DirCheck{
 const file_checks_375 = [_]FileCheck{
     .{
         .path = "src/tls/ticket_key_snapshot.zig",
-        .forbidden = &(zeroization_forbidden ++ [_][]const u8{
-            ".free(self.key_storage)",
-            "allocator.free(key_storage)",
-            "allocator.free(bytes)",
-            "out.deinit()",
-        }),
-        .rationale = "#375 fixed four ad hoc zero-then-plain-free sites here — OwnedSnapshot.deinit and parse's key_storage errdefer both looped a raw std.crypto.secureZero over each KeyStorage before an ordinary allocator.free; loadFromFile and reserveNonceLeasesInFile zeroed their buffer then called allocator.free/out.deinit directly — instead of crypto.secrets.secureZeroAndFree/secureZeroAndFreeAligned. None of these literal legacy shapes, nor the raw std.crypto.secureZero spelling ZeroingAllocator.resize/.free were also migrated off of, may reappear anywhere in this file.",
+        .forbidden = &zeroization_forbidden,
+        .rationale = "#375 fixed ZeroingAllocator.resize/.free and OwnedSnapshot.deinit's KeyStorage loop from a raw std.crypto.secureZero to the canonical provider.secureZero/crypto.secrets wrapper; no raw std.crypto.secureZero/std_crypto.secureZero call has any legitimate purpose in this file. The structural zero-then-plain-free shapes #375 also fixed here (loadFromFile, reserveNonceLeasesInFile, parse's key_storage errdefer) are covered generically by the zero-then-plain-free scan below, which — unlike this literal check — also catches the same defect under a renamed variable or in a file this list does not name.",
     },
     .{
         .path = "src/tls/sni_provider.zig",
@@ -493,13 +516,14 @@ const file_checks_375 = [_]FileCheck{
 const file_checks_with_exceptions_375 = [_]FileCheckWithExceptions{
     .{
         .path = "src/crypto/secrets.zig",
-        .forbidden = &(zeroization_forbidden ++ [_][]const u8{".free(self.bytes)"}),
-        // The one legitimate raw std.crypto.secureZero call project-wide:
-        // crypto.secrets.secureZero's own implementation, which every other
-        // container/method in this file (and every other file) is supposed
-        // to call instead of reaching for std.crypto directly.
-        .exempt_functions = &.{"secureZero"},
-        .rationale = "#375 fixed BoundedSecret.deinit calling clearAll() (which correctly zeroes via the secureZero wrapper) followed by a plain allocator.free(self.bytes) — a zero-then-poisoned-or-unzeroed free, not a zero-then-genuinely-zero one — to route through secureZeroAndFree instead. self.bytes must never be freed any other way, and no code outside secureZero() itself may call std.crypto.secureZero directly.",
+        .forbidden = &(zeroization_forbidden ++ timing_safe_forbidden ++ [_][]const u8{".free(self.bytes)"}),
+        // The two legitimate raw-primitive call sites project-wide:
+        // secureZero's own implementation (std.crypto.secureZero) and
+        // constantTimeEqual's own implementation (std.crypto.timing_safe),
+        // which every other file/function is supposed to reach only through
+        // these wrappers.
+        .exempt_functions = &.{ "secureZero", "constantTimeEqual" },
+        .rationale = "#375 fixed BoundedSecret.deinit calling clearAll() (which correctly zeroes via the secureZero wrapper) followed by a plain allocator.free(self.bytes) — a zero-then-poisoned-or-unzeroed free, not a zero-then-genuinely-zero one — to route through secureZeroAndFree instead. self.bytes must never be freed any other way, and no code outside secureZero()/constantTimeEqual() may call std.crypto.secureZero/std.crypto.timing_safe directly.",
     },
 };
 
@@ -580,6 +604,20 @@ fn checkFile(allocator: std.mem.Allocator, root: compat.DirCompat, path: []const
 /// parser — a real parser would have to distinguish the function body's
 /// opening brace from inline return-type groups like `error{Foo}`, which
 /// several target functions here have.
+/// Shared "next sibling declaration" boundary markers: a `pub fn `/`fn ` at
+/// either 4-space struct-method or 0-space top-level indentation, or a
+/// 0-space `pub const `/`const ` (for a declaration immediately followed by
+/// a container declaration, e.g. the struct its own methods belong to).
+/// Used both by `extractFunctionBody` (bound a *named* function's body) and
+/// by the zero-then-plain-free scanner below (bound a forward scan from an
+/// arbitrary interior position to "the rest of the enclosing
+/// function/declaration" without needing to know where it started).
+const declaration_boundaries = [_][]const u8{
+    "\n    pub fn ", "\n    fn ",
+    "\npub fn ",     "\nfn ",
+    "\npub const ",  "\nconst ",
+};
+
 fn extractFunctionBody(contents: []const u8, function_name: []const u8) ?[]const u8 {
     var search_from: usize = 0;
     while (true) {
@@ -588,19 +626,19 @@ fn extractFunctionBody(contents: []const u8, function_name: []const u8) ?[]const
         const after_name = rel + function_name.len;
         const after_ok = after_name < contents.len and contents[after_name] == '(';
         if (before_ok and after_ok) {
-            var end = contents.len;
-            const boundaries = [_][]const u8{
-                "\n    pub fn ", "\n    fn ",
-                "\npub fn ",     "\nfn ",
-                "\npub const ",  "\nconst ",
-            };
-            for (boundaries) |boundary| {
-                if (std.mem.indexOfPos(u8, contents, after_name, boundary)) |p| end = @min(end, p);
-            }
-            return contents[rel..end];
+            return contents[rel..nextDeclarationBoundary(contents, after_name)];
         }
         search_from = rel + 1;
     }
+}
+
+/// The nearest declaration boundary at or after `from`, or `contents.len`.
+fn nextDeclarationBoundary(contents: []const u8, from: usize) usize {
+    var end = contents.len;
+    for (declaration_boundaries) |boundary| {
+        if (std.mem.indexOfPos(u8, contents, from, boundary)) |p| end = @min(end, p);
+    }
+    return end;
 }
 
 /// Redacts every occurrence of `needle` in `buf` in place (same length, so
@@ -612,6 +650,259 @@ fn blank(buf: []u8, needle: []const u8) void {
         search_from = idx + needle.len;
     }
 }
+
+// ---------------------------------------------------------------------------
+// #554: general zero-then-plain-free scanner
+// ---------------------------------------------------------------------------
+//
+// The named-file/exact-variable-name check above (`file_checks_375`'s
+// `zeroization_forbidden` entries) only catches the raw-spelling half of
+// #375's zero-and-free findings. #554 review (second pass) found it does
+// not satisfy the "new ad hoc zero-and-free implementation" half of the
+// acceptance criteria at all: a zero routed correctly through the canonical
+// `secureZero` wrapper, followed by a plain `allocator.free`/`.deinit()`
+// instead of `secureZeroAndFree`/`secureZeroAndFreeAligned`, passes under
+// any variable name this list doesn't happen to spell out — including the
+// exact historical finding under a harmless local rename. This scanner
+// instead extracts the buffer expression every `secureZero(...)` call
+// zeroes and looks for that same expression handed to an ordinary free
+// within the rest of the enclosing function, so it generalizes to a new
+// file, a new function, or a renamed variable without needing a name listed
+// anywhere.
+
+/// Extracts the text between a call's opening `(` (`open_paren`, which must
+/// index a `(` byte) and its matching `)`, tracking `(`/`[`/`{` nesting so
+/// an argument containing its own call or slice expression
+/// (`std.mem.sliceAsBytes(storage)`, `self.bytes[a..b]`) does not end the
+/// scan early. `null` if the parens never balance before end of file.
+fn extractCallArgs(contents: []const u8, open_paren: usize) ?[]const u8 {
+    var depth: i32 = 0;
+    var i = open_paren;
+    while (i < contents.len) : (i += 1) {
+        switch (contents[i]) {
+            '(', '[', '{' => depth += 1,
+            ')', ']', '}' => {
+                depth -= 1;
+                if (depth == 0) return contents[open_paren + 1 .. i];
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// The text after the last top-level (bracket/paren/brace depth 0) comma in
+/// `args`, trimmed — i.e. the last positional argument of a call. Both
+/// `secureZero(buffer)` and the raw two-argument
+/// `std.crypto.secureZero(u8, buffer)` spelling reduce to the buffer
+/// expression this way, without needing to know which spelling was used.
+fn lastArgument(args: []const u8) []const u8 {
+    var depth: i32 = 0;
+    var last_comma: ?usize = null;
+    for (args, 0..) |c, i| {
+        switch (c) {
+            '(', '[', '{' => depth += 1,
+            ')', ']', '}' => depth -= 1,
+            ',' => if (depth == 0) {
+                last_comma = i;
+            },
+            else => {},
+        }
+    }
+    const start = if (last_comma) |c| c + 1 else 0;
+    return std.mem.trim(u8, args[start..], " \t\r\n");
+}
+
+fn isIdentStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+fn isIdentCont(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// Iterates the maximal dotted-identifier-path tokens inside an expression:
+/// `std.mem.sliceAsBytes(storage)` yields `std.mem.sliceAsBytes` then
+/// `storage`; `self.bytes[value.len..old_len]` yields `self.bytes`,
+/// `value.len`, `old_len`. A syntax-agnostic, deliberately over-inclusive
+/// stand-in for "every plausible buffer-identity expression this argument
+/// could name" — the scan below tries each token as a candidate freed-buffer
+/// identity rather than committing to a single guess about which one is the
+/// real buffer.
+const TokenIterator = struct {
+    text: []const u8,
+    pos: usize = 0,
+
+    fn next(self: *TokenIterator) ?[]const u8 {
+        while (self.pos < self.text.len and !isIdentStart(self.text[self.pos])) : (self.pos += 1) {}
+        if (self.pos >= self.text.len) return null;
+        const start = self.pos;
+        while (self.pos < self.text.len and isIdentCont(self.text[self.pos])) : (self.pos += 1) {}
+        while (self.pos + 1 < self.text.len and self.text[self.pos] == '.' and isIdentStart(self.text[self.pos + 1])) {
+            self.pos += 1;
+            while (self.pos < self.text.len and isIdentCont(self.text[self.pos])) : (self.pos += 1) {}
+        }
+        return self.text[start..self.pos];
+    }
+};
+
+/// True if `window` contains an ordinary free/deinit of `key`: `key` handed
+/// to a `.free(`/`allocator.free(` call as its sole argument, or
+/// `.deinit(`/`.free(` called *on* `key` as receiver (the
+/// `ArrayList`/similar-container shape). Deliberately agnostic about what
+/// precedes `free(` (the allocator expression — `allocator.free(key)`,
+/// `self.allocator.free(key)`, and `fba.allocator().free(key)` are all
+/// caught the same way) by searching for the bare `free(` substring rather
+/// than requiring a specific receiver spelling.
+fn containsPlainFreeOf(window: []const u8, key: []const u8) bool {
+    if (key.len == 0) return false;
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, window, search_from, "free(")) |p| {
+        const after = p + "free(".len;
+        if (after + key.len < window.len and
+            std.mem.eql(u8, window[after..][0..key.len], key) and
+            window[after + key.len] == ')')
+        {
+            return true;
+        }
+        search_from = p + 1;
+    }
+    search_from = 0;
+    while (std.mem.indexOfPos(u8, window, search_from, key)) |p| {
+        const after = p + key.len;
+        if (after + ".deinit(".len <= window.len and std.mem.eql(u8, window[after..][0..".deinit(".len], ".deinit(")) return true;
+        if (after + ".free(".len <= window.len and std.mem.eql(u8, window[after..][0..".free(".len], ".free(")) return true;
+        search_from = p + 1;
+    }
+    return false;
+}
+
+/// The buffer-identity token of the first zero call in `contents` whose
+/// zeroed buffer is later handed to an ordinary free/deinit instead of
+/// `secureZeroAndFree`/`secureZeroAndFreeAligned`, scoped to the rest of the
+/// enclosing function/declaration — or `null` if every zero call in the
+/// file is either not followed by a plain free of the same buffer, or is
+/// itself part of `secureZeroAndFree`/`secureZeroAndFreeAligned`'s own
+/// implementation (neither contains the literal substring `secureZero(`:
+/// the character right after `secureZero` in both is `A`, not `(`, the same
+/// exact-boundary trick `extractFunctionBody` uses to tell `sealPayload` and
+/// `sealPayloadWithProvider` apart).
+fn firstZeroThenPlainFree(contents: []const u8) ?[]const u8 {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, contents, search_from, "secureZero(")) |m| {
+        const open_paren = m + "secureZero(".len - 1;
+        search_from = m + 1;
+        const args = extractCallArgs(contents, open_paren) orelse continue;
+        const buf_expr = lastArgument(args);
+        const window_start = open_paren + args.len + 2; // past the matching ')'
+        if (window_start >= contents.len) continue;
+        const window_end = nextDeclarationBoundary(contents, window_start);
+        const window = contents[window_start..window_end];
+        var tokens = TokenIterator{ .text = buf_expr };
+        while (tokens.next()) |key| {
+            if (key.len < 2) continue;
+            if (containsPlainFreeOf(window, key)) return key;
+            // The container-field fallback: `secureZero(out.items)` zeroes
+            // an `ArrayList`'s current contents, but the matching free is
+            // `out.deinit()` on the container itself, not
+            // `out.items.deinit()` — so also try the path with its last
+            // `.field` segment stripped. `self.bytes[a..b]` (a sub-range,
+            // not the whole buffer) reduces the same way to `self`, which
+            // `containsPlainFreeOf` still requires an *exact* `free(self)`/
+            // `self.deinit(`/`self.free(` match for — a real hit here is
+            // still the same true regression class, just via one more field
+            // of indirection than the field-only case.
+            if (std.mem.lastIndexOfScalar(u8, key, '.')) |dot| {
+                const parent = key[0..dot];
+                if (parent.len >= 2 and containsPlainFreeOf(window, parent)) return parent;
+            }
+        }
+    }
+    return null;
+}
+
+const ZeroThenFreeDirCheck = struct {
+    dir: []const u8,
+    excluded_paths: []const []const u8 = &.{},
+    rationale: []const u8,
+};
+
+fn checkZeroThenFreeFile(allocator: std.mem.Allocator, root: compat.DirCompat, path: []const u8, rationale: []const u8, violations: *std.ArrayList(Violation)) !void {
+    const contents = root.readFileAlloc(allocator, path, 16 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(contents);
+    if (firstZeroThenPlainFree(contents) != null) {
+        try violations.append(allocator, .{
+            .path = try allocator.dupe(u8, path),
+            .needle = "zero-then-plain-free",
+            .rationale = rationale,
+        });
+    }
+}
+
+fn checkZeroThenFreeDir(allocator: std.mem.Allocator, root: compat.DirCompat, check: ZeroThenFreeDirCheck, dir_path: []const u8, violations: *std.ArrayList(Violation)) !void {
+    var dir = root.openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next(compat.io())) |entry| {
+        const rel = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(rel);
+        var excluded = false;
+        for (check.excluded_paths) |excluded_path| {
+            if (std.mem.eql(u8, rel, excluded_path)) {
+                excluded = true;
+                break;
+            }
+        }
+        if (excluded) continue;
+        switch (entry.kind) {
+            .directory => try checkZeroThenFreeDir(allocator, root, check, rel, violations),
+            .file => {
+                if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+                try checkZeroThenFreeFile(allocator, root, rel, check.rationale, violations);
+            },
+            else => {},
+        }
+    }
+}
+
+const zero_then_free_checks_375 = [_]ZeroThenFreeDirCheck{
+    .{
+        .dir = "src/tls",
+        // secrets.zig's own secureZeroAndFree/secureZeroAndFreeAligned
+        // implementation legitimately zeroes then frees the same buffer —
+        // that *is* the canonical helper, not an ad hoc reimplementation of
+        // it — but secrets.zig lives in src/crypto, outside this dir.
+        .excluded_paths = &.{},
+        .rationale = "A secureZero call whose buffer is later handed to an ordinary allocator.free/.deinit within the same function, instead of crypto.secrets.secureZeroAndFree/secureZeroAndFreeAligned, is the ad hoc zero-and-free defect #375 fixed (BoundedSecret.deinit and four ticket_key_snapshot.zig sites) — general over every file/variable name in src/tls, not just those four historical sites.",
+    },
+    .{
+        .dir = "src/quic",
+        .excluded_paths = &.{},
+        .rationale = "Same defect class as src/tls, general over src/quic.",
+    },
+    .{
+        .dir = "src/pki",
+        .excluded_paths = &.{},
+        .rationale = "Same defect class as src/tls, general over src/pki.",
+    },
+    .{
+        .dir = "src/crypto",
+        // secureZero/secureZeroAndFree/secureZeroAndFreeAligned's own
+        // implementations in secrets.zig legitimately zero then free/rawFree
+        // the same buffer — that pairing *is* the canonical helper.
+        // rawFree/vtable.free spellings don't match `containsPlainFreeOf`'s
+        // lowercase-`free(`/`.free(`/`.deinit(` patterns in the first place
+        // (capital F in `rawFree`), but excluding the file entirely avoids
+        // relying on that incidentally rather than by design.
+        .excluded_paths = &.{"src/crypto/secrets.zig"},
+        .rationale = "Same defect class as src/tls, general over src/crypto outside secrets.zig's own canonical-helper implementation.",
+    },
+};
 
 fn checkFileWithExceptions(allocator: std.mem.Allocator, root: compat.DirCompat, check: FileCheckWithExceptions, violations: *std.ArrayList(Violation)) !void {
     const contents = root.readFileAlloc(allocator, check.path, 16 * 1024 * 1024) catch |err| switch (err) {
@@ -704,6 +995,9 @@ fn runAudit(allocator: std.mem.Allocator, root: compat.DirCompat) !std.ArrayList
     }
     for (dir_checks_375) |check| {
         try checkDir(allocator, root, check, check.dir, &violations);
+    }
+    for (zero_then_free_checks_375) |check| {
+        try checkZeroThenFreeDir(allocator, root, check, check.dir, &violations);
     }
     return violations;
 }
@@ -822,12 +1116,23 @@ test "clean protocol-module content produces no violation" {
 // through the real directory/file checks.
 
 test "detects a raw constant-time-comparison call, qualified either way a call site might spell it" {
-    try testing.expectEqualStrings("std.crypto.timing_safe.", firstForbidden(
+    try testing.expectEqualStrings("std.crypto.timing_safe", firstForbidden(
         "if (!std.crypto.timing_safe.eql([32]u8, expected, candidate)) return error.Bad;",
         &timing_safe_forbidden,
     ).?);
-    try testing.expectEqualStrings("crypto.timing_safe.", firstForbidden(
+    try testing.expectEqualStrings("crypto.timing_safe", firstForbidden(
         "const ok = crypto.timing_safe.eql([16]u8, tag, received);",
+        &timing_safe_forbidden,
+    ).?);
+}
+
+test "detects a namespace-capture alias of timing_safe, not just direct member access" {
+    // #554 review (first pass): `const timing_safe = std.crypto.timing_safe;`
+    // followed by a call off the captured alias defeated the original
+    // dot-suffixed needle entirely — the declaration ends in `;`, and the
+    // call site only ever spells the bare `timing_safe.eql(`.
+    try testing.expectEqualStrings("std.crypto.timing_safe", firstForbidden(
+        "const timing_safe = std.crypto.timing_safe;\nreturn timing_safe.eql([32]u8, expected, candidate);",
         &timing_safe_forbidden,
     ).?);
 }
@@ -869,40 +1174,6 @@ test "canonical secureZero/secureZeroAndFree routing does not trip the raw-spell
     ));
 }
 
-test "detects each ad hoc zero-then-plain-free literal shape #375 fixed in ticket_key_snapshot.zig" {
-    const forbidden = zeroization_forbidden ++ [_][]const u8{
-        ".free(self.key_storage)",
-        "allocator.free(key_storage)",
-        "allocator.free(bytes)",
-        "out.deinit()",
-    };
-    try testing.expectEqualStrings(".free(self.key_storage)", firstForbidden(
-        "self.allocator.free(self.key_storage);",
-        &forbidden,
-    ).?);
-    try testing.expectEqualStrings("allocator.free(key_storage)", firstForbidden(
-        "errdefer allocator.free(key_storage);",
-        &forbidden,
-    ).?);
-    try testing.expectEqualStrings("allocator.free(bytes)", firstForbidden(
-        "defer allocator.free(bytes);",
-        &forbidden,
-    ).?);
-    try testing.expectEqualStrings("out.deinit()", firstForbidden(
-        "defer out.deinit();",
-        &forbidden,
-    ).?);
-    // The fixed shapes must NOT trip this check.
-    try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
-        "crypto.secrets.secureZeroAndFreeAligned(KeyStorage, self.allocator, self.key_storage);",
-        &forbidden,
-    ));
-    try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
-        "self.allocator.free(self.configs);",
-        &forbidden,
-    ));
-}
-
 test "BoundedSecret.deinit reverting to clearAll + plain allocator.free trips the secrets.zig guard" {
     const forbidden = zeroization_forbidden ++ [_][]const u8{".free(self.bytes)"};
     try testing.expectEqualStrings(".free(self.bytes)", firstForbidden(
@@ -912,6 +1183,70 @@ test "BoundedSecret.deinit reverting to clearAll + plain allocator.free trips th
     try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
         "secureZeroAndFree(allocator, self.bytes);",
         &forbidden,
+    ));
+}
+
+test "raw std.crypto.timing_safe in src/crypto/rsa.zig's shape trips the guard once src/crypto is in scope" {
+    // #554 review (second pass): the original guard only scanned
+    // src/tls/src/quic/src/pki and missed src/crypto/rsa.zig's own
+    // EMSA-PSS final authentication comparison, which #375's audit matrix
+    // explicitly covers. This is a unit-level proof that the shape trips
+    // timing_safe_forbidden at all (the end-to-end test below proves it's
+    // actually wired into a src/crypto directory scan).
+    try testing.expectEqualStrings("crypto.timing_safe", firstForbidden(
+        "if (!crypto.timing_safe.eql([h_len]u8, expected, h_array)) return error.InvalidInput;",
+        &timing_safe_forbidden,
+    ).?);
+}
+
+// #554 review (second pass): the general zero-then-plain-free scanner.
+// The prior version of this guard protected exactly three files by exact
+// historical variable name (`self.key_storage`, `key_storage`, `bytes`,
+// `out`), which a new file or a harmless local rename defeated entirely.
+// These prove the general, buffer-identity-tracking replacement instead.
+
+test "firstZeroThenPlainFree detects the canonical BoundedSecret.deinit regression" {
+    try testing.expectEqualStrings("self.bytes", firstZeroThenPlainFree(
+        "pub fn deinit(self: *BoundedSecret) void {\n    secureZero(self.bytes);\n    const allocator = self.allocator orelse return;\n    allocator.free(self.bytes);\n}\n",
+    ).?);
+}
+
+test "firstZeroThenPlainFree follows a local rename to the same buffer" {
+    // The reviewer's exact bypass example: a plain local alias defeats a
+    // check keyed on the original field name, but not one that extracts the
+    // buffer expression from the zero call itself.
+    try testing.expectEqualStrings("storage", firstZeroThenPlainFree(
+        "fn release(self: *Thing) void {\n    const storage = self.key_storage;\n    crypto.secrets.secureZero(std.mem.sliceAsBytes(storage));\n    self.allocator.free(storage);\n}\n",
+    ).?);
+}
+
+test "firstZeroThenPlainFree catches the ArrayList zero-then-.deinit shape under any variable name" {
+    try testing.expectEqualStrings("out", firstZeroThenPlainFree(
+        "fn f(allocator: std.mem.Allocator) void {\n    var out = std.array_list.Managed(u8).init(allocator);\n    defer {\n        secrets.secureZero(out.items);\n        out.deinit();\n    }\n}\n",
+    ).?);
+}
+
+test "firstZeroThenPlainFree does not flag secureZeroAndFree/secureZeroAndFreeAligned's own zero-then-rawFree" {
+    try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
+        "pub fn secureZeroAndFreeAligned(comptime T: type, allocator: std.mem.Allocator, buffer: []T) void {\n    const bytes = std.mem.sliceAsBytes(buffer);\n    secureZero(bytes);\n    allocator.rawFree(bytes, .fromByteUnits(@alignOf(T)), @returnAddress());\n}\n",
+    ));
+}
+
+test "firstZeroThenPlainFree does not flag a zero call whose buffer is never freed at all" {
+    try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
+        "fn f(out: []u8) void {\n    defer crypto.secureZero(u8, out);\n    doSomething(out);\n}\n",
+    ));
+}
+
+test "firstZeroThenPlainFree does not flag freeing an unrelated buffer in the same function" {
+    try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
+        "pub fn deinit(self: *Thing) void {\n    std.crypto.secureZero(u8, &self.local_transport_parameters);\n    self.cid_binding.deinit();\n}\n",
+    ));
+}
+
+test "firstZeroThenPlainFree correctly routed through secureZeroAndFree trips nothing" {
+    try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
+        "pub fn deinit(self: *OwnedSnapshot) void {\n    crypto.secrets.secureZeroAndFreeAligned(KeyStorage, self.allocator, self.key_storage);\n    self.allocator.free(self.configs);\n}\n",
     ));
 }
 
@@ -1247,22 +1582,44 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
         .{ .rel = "src/tls/tls13_backend.zig", .contents = "fn helperVerify(sig: []const u8, msg: []const u8, key: []const u8) void { Ed25519.verify(sig, msg, key) catch unreachable; }\n" },
 
         // #554: a raw constant-time-comparison call reappearing anywhere in
-        // src/tls, src/quic, or src/pki, qualified either way a call site
-        // might spell it.
+        // src/tls, src/quic, src/pki, or src/crypto (outside secrets.zig's
+        // own implementation), qualified either way a call site might spell
+        // it. The src/crypto case reproduces rsa.zig's actual EMSA-PSS final
+        // authentication comparison shape — #554 review (second pass) found
+        // the original guard's directory scope missed this file entirely.
         .{ .rel = "src/tls/timing_safe_regression.zig", .contents = "if (!std.crypto.timing_safe.eql([32]u8, expected, candidate)) return error.Bad;\n" },
         .{ .rel = "src/quic/timing_safe_regression.zig", .contents = "const ok = crypto.timing_safe.eql([16]u8, tag, received);\n" },
         .{ .rel = "src/pki/timing_safe_regression.zig", .contents = "return std.crypto.timing_safe.compare(u8, expected, h_array, .big) == .eq;\n" },
+        .{ .rel = "src/crypto/rsa_timing_safe_regression.zig", .contents = "if (!crypto.timing_safe.eql([h_len]u8, expected, h_array)) return error.InvalidInput;\n" },
+        // The namespace-capture-alias bypass #554 review (first pass) found:
+        // neither needle used to end without a trailing `.`, so an aliased
+        // capture followed by a call off the alias evaded both.
+        .{ .rel = "src/tls/timing_safe_regression.zig", .contents = "const timing_safe = std.crypto.timing_safe;\nreturn timing_safe.eql([32]u8, expected, candidate);\n" },
 
-        // #554: the specific ad hoc zero-and-free / raw-secureZero-spelling
-        // findings #375 fixed, reproduced one shape at a time.
+        // #554: the raw-secureZero-spelling findings #375 fixed.
         .{ .rel = "src/tls/ticket_key_snapshot.zig", .contents = "fn f(x: []u8) void { std.crypto.secureZero(u8, x); }\n" },
-        .{ .rel = "src/tls/ticket_key_snapshot.zig", .contents = "pub fn deinit(self: *OwnedSnapshot) void { self.allocator.free(self.key_storage); }\n" },
-        .{ .rel = "src/tls/ticket_key_snapshot.zig", .contents = "pub fn parse(allocator: std.mem.Allocator) void { errdefer allocator.free(key_storage); }\n" },
-        .{ .rel = "src/tls/ticket_key_snapshot.zig", .contents = "pub fn loadFromFile(allocator: std.mem.Allocator) void { defer allocator.free(bytes); }\n" },
-        .{ .rel = "src/tls/ticket_key_snapshot.zig", .contents = "pub fn reserveNonceLeasesInFile() void { defer out.deinit(); }\n" },
         .{ .rel = "src/tls/sni_provider.zig", .contents = "pub fn release(self: *SignAdapter) void { std_crypto.secureZero(u8, std.mem.asBytes(&self.identity.key)); }\n" },
         .{ .rel = "src/crypto/secrets.zig", .contents = secrets_zig_deinit_regression_fixture },
         .{ .rel = "src/crypto/secrets.zig", .contents = secrets_zig_new_raw_call_fixture },
+
+        // #554 review (second pass): the general zero-then-plain-free
+        // scanner, general over file and variable name rather than three
+        // named files and four exact historical strings.
+        //
+        // The exact historical shape, reproduced generically (no literal
+        // variable-name list involved — this passes because the scanner
+        // pairs the zero call's own argument with a later free of the same
+        // expression, not because "self.key_storage" is spelled out
+        // anywhere in the tool).
+        .{ .rel = "src/tls/ticket_key_snapshot.zig", .contents = "pub fn deinit(self: *OwnedSnapshot) void { crypto.secrets.secureZero(self.key_storage); self.allocator.free(self.key_storage); }\n" },
+        // The reviewer's exact bypass example: the same defect survives a
+        // harmless local rename that a name-keyed check would miss.
+        .{ .rel = "src/tls/ticket_key_snapshot.zig", .contents = "pub fn deinit(self: *OwnedSnapshot) void { const storage = self.key_storage; crypto.secrets.secureZero(std.mem.sliceAsBytes(storage)); self.allocator.free(storage); }\n" },
+        // A brand-new ad hoc zero-and-free implementation in a file this
+        // tool names nowhere at all.
+        .{ .rel = "src/tls/new_ad_hoc_zero_free_site.zig", .contents = "pub fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    crypto.secrets.secureZero(secret_buf);\n    allocator.free(secret_buf);\n}\n" },
+        // The ArrayList zero-then-.deinit shape, in a new file.
+        .{ .rel = "src/quic/new_ad_hoc_zero_free_site.zig", .contents = "fn f(allocator: std.mem.Allocator) void {\n    var out = std.array_list.Managed(u8).init(allocator);\n    defer {\n        secrets.secureZero(out.items);\n        out.deinit();\n    }\n}\n" },
     };
 
     for (bypass_cases) |case| {
@@ -1288,6 +1645,9 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
     try root.deleteFile("src/tls/timing_safe_regression.zig");
     try root.deleteFile("src/quic/timing_safe_regression.zig");
     try root.deleteFile("src/pki/timing_safe_regression.zig");
+    try root.deleteFile("src/crypto/rsa_timing_safe_regression.zig");
+    try root.deleteFile("src/tls/new_ad_hoc_zero_free_site.zig");
+    try root.deleteFile("src/quic/new_ad_hoc_zero_free_site.zig");
 
     var clean_violations = try runAudit(allocator, root);
     defer clean_violations.deinit(allocator);

@@ -14,10 +14,7 @@ pub const LoadedIdentity = struct {
             if (cert_der.len > 0) self.allocator.free(cert_der);
         }
         if (self.cert_chain.len > 0) self.allocator.free(self.cert_chain);
-        if (self.key_der.len > 0) {
-            secrets.secureZero(self.key_der);
-            self.allocator.free(self.key_der);
-        }
+        secrets.secureZeroAndFree(self.allocator, self.key_der);
         self.* = undefined;
     }
 };
@@ -28,23 +25,14 @@ pub fn loadIdentity(
     key_path: []const u8,
 ) !LoadedIdentity {
     const cert_raw = try readSmallFile(allocator, cert_path);
-    defer {
-        secrets.secureZero(cert_raw);
-        allocator.free(cert_raw);
-    }
+    defer secrets.secureZeroAndFree(allocator, cert_raw);
     const key_raw = try readSmallFile(allocator, key_path);
-    defer {
-        secrets.secureZero(key_raw);
-        allocator.free(key_raw);
-    }
+    defer secrets.secureZeroAndFree(allocator, key_raw);
 
     const cert_chain = try certChainFromPemOrDer(allocator, cert_raw);
     errdefer freeCertChain(allocator, cert_chain);
     const key_der = try keyDerFromPemOrDer(allocator, key_raw);
-    errdefer {
-        secrets.secureZero(key_der);
-        allocator.free(key_der);
-    }
+    errdefer secrets.secureZeroAndFree(allocator, key_der);
 
     if (cert_chain.len == 0) return error.PemBlockNotFound;
     const identity = try credentials.Identity.initPkcs8(cert_chain[0], key_der);
@@ -187,10 +175,7 @@ fn pemBlockToDerFrom(allocator: std.mem.Allocator, pem: []const u8, block_name: 
     const body = pem[body_start..end_at];
 
     var compact = try allocator.alloc(u8, body.len);
-    defer {
-        secrets.secureZero(compact);
-        allocator.free(compact);
-    }
+    defer secrets.secureZeroAndFree(allocator, compact);
     var len: usize = 0;
     for (body) |char| {
         if (char == '\n' or char == '\r' or char == ' ' or char == '\t') continue;
@@ -200,10 +185,7 @@ fn pemBlockToDerFrom(allocator: std.mem.Allocator, pem: []const u8, block_name: 
     const decoder = std.base64.standard.Decoder;
     const der_len = try decoder.calcSizeForSlice(compact[0..len]);
     const der = try allocator.alloc(u8, der_len);
-    errdefer {
-        secrets.secureZero(der);
-        allocator.free(der);
-    }
+    errdefer secrets.secureZeroAndFree(allocator, der);
     try decoder.decode(der, compact[0..len]);
     return der;
 }

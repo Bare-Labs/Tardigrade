@@ -99,10 +99,7 @@ const PostHandshakeInput = struct {
     }
 
     fn deinit(self: *PostHandshakeInput) void {
-        if (self.buf.len > 0) {
-            crypto.secureZero(u8, self.buf);
-            self.buf_allocator.?.free(self.buf);
-        }
+        if (self.buf.len > 0) crypto_pkg.secrets.secureZeroAndFree(self.buf_allocator.?, self.buf);
         if (self.header_len > 0) crypto.secureZero(u8, self.header[0..self.header_len]);
         self.* = .{};
     }
@@ -147,8 +144,7 @@ const PostHandshakeInput = struct {
 
     fn discard(self: *PostHandshakeInput, len: usize) tls_handshake_codec.Error!void {
         if (self.buf.len == 0 or len != self.buf.len) return error.MalformedHandshake;
-        crypto.secureZero(u8, self.buf);
-        self.buf_allocator.?.free(self.buf);
+        crypto_pkg.secrets.secureZeroAndFree(self.buf_allocator.?, self.buf);
         self.buf_allocator = null;
         self.buf = &.{};
         self.len = 0;
@@ -5042,10 +5038,7 @@ pub const Tls13Backend = struct {
         const message_len = handshake_header_len + body_len;
 
         const buf = allocator.alloc(u8, message_len) catch return error.CredentialProviderFailed;
-        errdefer {
-            crypto.secureZero(u8, buf);
-            allocator.free(buf);
-        }
+        errdefer crypto_pkg.secrets.secureZeroAndFree(allocator, buf);
         var w = Writer{ .buf = buf };
         try w.u8_(@intFromEnum(MessageType.new_session_ticket));
         const body_len_index = try w.reserve(3);

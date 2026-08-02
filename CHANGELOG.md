@@ -683,16 +683,26 @@ All notable user-facing changes to Tardigrade are documented here.
   implementation (#555).
 - **`audit_crypto_boundary` now guards #375's constant-time/zeroization
   findings, not just #490's provider boundary (#554)** — `zig build
-  audit-crypto-boundary` fails if a raw `std.crypto.timing_safe.*`/
-  `crypto.timing_safe.*` call reappears anywhere in `src/tls`, `src/quic`,
-  or `src/pki`, or if the specific ad hoc zero-and-free/raw-`secureZero`-
-  spelling regressions #375 fixed reappear in `BoundedSecret.deinit`
-  (`src/crypto/secrets.zig`), `ticket_key_snapshot.zig`'s four fixed sites,
-  or `sni_provider.zig`'s `SignAdapter.release`. Named-exception scoped like
-  the tool's pre-existing #490 checks, not a project-wide ban on either raw
-  spelling — most of `src/tls`/`src/quic` legitimately zeroes a stack-local
-  buffer with nothing to free, and #375 itself classifies several
-  comparisons in this scope as public and correctly left ordinary.
+  audit-crypto-boundary` fails if a raw `std.crypto.timing_safe`/
+  `crypto.timing_safe` call (direct or captured into a local alias)
+  reappears anywhere in `src/tls`, `src/quic`, `src/pki`, or `src/crypto`
+  outside `secrets.zig`'s own `constantTimeEqual`; or if a `secureZero(...)`
+  call's buffer — tracked through `sliceAsBytes`/`&`/rename indirection, not
+  just by historical variable name — is later handed to a plain
+  `allocator.free`/`.deinit()` instead of
+  `secureZeroAndFree`/`secureZeroAndFreeAligned`, anywhere in that same
+  scope. Applying the zero-then-free scan generally (not just to the three
+  files #375 fixed) surfaced six more real instances of the identical defect
+  that #375's own inventory missed — `identity_loader.zig`,
+  `tls13_backend.zig`'s `PostHandshakeInput`/`NewSessionTicket` buffer,
+  `transport.zig`'s `EventSink`, `quic/connection.zig`'s `CryptoTx`,
+  `quic/tls_backend.zig`'s oversized-payload error path, and
+  `session_cache_persistence.zig`'s `MemoryBackend`/save/load paths and test
+  helpers — all fixed alongside the guard. Not a project-wide ban on the raw
+  `std.crypto.secureZero` spelling on its own: most of `src/tls`/`src/quic`
+  legitimately zeroes a stack-local buffer with nothing to free, and #375
+  itself classifies several comparisons in this scope as public and
+  correctly left ordinary.
 - **Native TLS listener now tolerates the RFC 8446 Appendix D.4
   middlebox-compatibility `change_cipher_spec` record (#369)** — the
   record layer required every post-ClientHello record's outer wire type

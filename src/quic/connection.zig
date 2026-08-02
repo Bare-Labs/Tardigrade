@@ -430,10 +430,7 @@ const CryptoTx = struct {
         acked: ?[]Range = null,
 
         fn deinit(self: *Reservation) void {
-            if (self.data) |buf| {
-                crypto_secrets.secureZero(buf);
-                self.allocator.free(buf);
-            }
+            if (self.data) |buf| crypto_secrets.secureZeroAndFree(self.allocator, buf);
             if (self.pending) |buf| self.allocator.free(buf);
             if (self.acked) |buf| self.allocator.free(buf);
             self.* = .{ .allocator = self.allocator };
@@ -441,8 +438,8 @@ const CryptoTx = struct {
     };
 
     fn deinit(self: *CryptoTx, allocator: std.mem.Allocator) void {
-        crypto_secrets.secureZero(self.data.allocatedSlice());
-        self.data.deinit(allocator);
+        crypto_secrets.secureZeroAndFree(allocator, self.data.allocatedSlice());
+        self.data = .empty;
         self.pending.deinit(allocator);
         self.acked.deinit(allocator);
     }

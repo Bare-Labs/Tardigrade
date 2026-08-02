@@ -253,31 +253,53 @@ before the story closes:
 
 - **#554** — done. `scripts/audit_crypto_boundary.zig` (`zig build
   audit-crypto-boundary`, part of `zig build test`) now also guards the two
-  regression classes this story fixed, using the same named-exception
-  approach as its pre-existing #490 keyed-crypto-boundary checks rather than
-  a mechanical "convert everything" pattern denylist:
-  - A raw `std.crypto.timing_safe.*`/`crypto.timing_safe.*` call reappearing
-    anywhere in `src/tls`, `src/quic`, or `src/pki` (recursive, no
-    exceptions — every secret/authentication-derived comparison in these
-    trees already routes through `crypto.secrets.constantTimeEqual`/
-    `crypto.provider.constantTimeEqual`, and the tool's directory scope never
-    reaches the one legitimate raw call inside `constantTimeEqual`'s own
-    implementation in `src/crypto/secrets.zig`). This does not flag the
-    public/attacker-controlled comparisons in the "representative public
+  regression classes this story fixed. Went through a review round after the
+  first version merged: that version scanned only `src/tls`/`src/quic`/
+  `src/pki` for raw `timing_safe`, missed `src/crypto`'s own non-implementation
+  consumers, used dot-suffixed needles a namespace-capture alias could evade,
+  and protected the zero-and-free finding in exactly three files by exact
+  historical variable name — passable by a new file or a harmless rename. The
+  merged version instead:
+  - Forbids a raw `std.crypto.timing_safe`/`crypto.timing_safe` call (no
+    trailing-dot requirement, so a `const timing_safe = std.crypto.timing_safe;`
+    capture-and-call is caught too) reappearing anywhere in `src/tls`,
+    `src/quic`, `src/pki`, or `src/crypto` outside `secrets.zig`'s own
+    `constantTimeEqual` implementation (excluded by exact path, checked
+    separately with a named exception) — recursive, no other exceptions,
+    since every secret/authentication-derived comparison in these trees,
+    including `src/crypto/rsa.zig`'s EMSA-PSS final hash comparison, already
+    routes through `crypto.secrets.constantTimeEqual`/
+    `crypto.provider.constantTimeEqual`. Does not flag the public/
+    attacker-controlled comparisons in the "representative public
     comparisons" table below — those use ordinary `std.mem.eql`, never
-    `timing_safe`, so they were never in scope.
-  - The specific ad hoc zero-and-free / raw-`secureZero`-spelling findings
-    this story fixed, reappearing in the same three files/functions:
-    `BoundedSecret.deinit` (`src/crypto/secrets.zig`) freeing its backing
-    storage through a plain `allocator.free` after a separate zero call
-    instead of `secureZeroAndFree`/`secureZeroAndFreeAligned`; the four
-    `ticket_key_snapshot.zig` sites that did the same
-    (`OwnedSnapshot.deinit`, `loadFromFile`, `reserveNonceLeasesInFile`,
-    `parse`'s `key_storage` `errdefer`); and `sni_provider.zig`'s
-    `SignAdapter.release` reverting from the canonical
-    `crypto.provider.secureZero` wrapper back to a raw `std.crypto.secureZero`
-    call. Scoped to these named files/functions rather than a project-wide
-    ban on the raw `std.crypto.secureZero` spelling, since many other call
+    `timing_safe`.
+  - A general zero-then-plain-free scanner, not a three-file/exact-variable-
+    name list: it extracts the buffer expression every `secureZero(...)` call
+    (any qualifier) zeroes and looks for that same expression — including
+    through a `std.mem.sliceAsBytes`/`&`/local-rename indirection, and the
+    `ArrayList`-style "zero `.items`, `.deinit()` the container" shape —
+    handed to an ordinary `allocator.free`/`.deinit()` within the rest of the
+    enclosing function, across `src/tls`, `src/quic`, `src/pki`, and
+    `src/crypto` (excluding `secrets.zig`'s own
+    `secureZeroAndFree`/`secureZeroAndFreeAligned`, whose zero-then-`rawFree`
+    pairing *is* the canonical helper). Applying this generally — rather than
+    to the three files this story originally fixed — surfaced six more
+    genuine instances of the same defect this story's own inventory command
+    missed: `src/tls/identity_loader.zig` (`LoadedIdentity.deinit`,
+    `loadIdentity`'s `cert_raw`/`key_raw`/`key_der` cleanup,
+    `pemBlockToDerFrom`'s `compact`/`der` scratch), `src/tls/tls13_backend.zig`
+    (`PostHandshakeInput.deinit`/`.discard`, the `NewSessionTicket` message
+    buffer `errdefer`), `src/tls/transport.zig` (`EventSink.freeOwnedPayloads`,
+    `emitOwnedHandshakeBytesCopy`'s `errdefer`), `src/quic/connection.zig`
+    (`CryptoTx.Reservation.deinit`, `CryptoTx.deinit`'s `ArrayList`),
+    `src/quic/tls_backend.zig` (`translate`'s oversized-payload error path),
+    and `src/tls/session_cache_persistence.zig` (`MemoryBackend.deinit`/
+    `.save`, all four `save*Cache`/`load*Cache` plaintext/sealed buffers, and
+    every test helper following the same shape) — all fixed alongside the
+    guard, routed through `secureZeroAndFree`/`secureZeroAndFreeAligned`.
+  - Still not a project-wide ban on the raw `std.crypto.secureZero` spelling
+    on its own (a separate, narrower named-file check retained for
+    `ticket_key_snapshot.zig`/`sni_provider.zig`/`secrets.zig`): many call
     sites throughout `src/tls`/`src/quic`/`src/http` legitimately zero a
     stack-local buffer with no accompanying free at all (see this document's
     toolchain-assumptions section above) — banning the raw spelling
