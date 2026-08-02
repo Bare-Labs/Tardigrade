@@ -12,6 +12,22 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
+RPM_TEST_IMAGE="${RPM_TEST_IMAGE:-rockylinux@sha256:d7be1c094cc5845ee815d4632fe377514ee6ebcf8efaed6892889657e5ddaaa6}"
+
+retry() {
+    local attempts="$1"
+    shift
+    local delay=2
+    local n=1
+    while ! "$@"; do
+        if (( n >= attempts )); then
+            return 1
+        fi
+        sleep "$delay"
+        delay=$((delay * 2))
+        n=$((n + 1))
+    done
+}
 
 if [[ "$(uname -s)" != "Linux" ]]; then
     echo "skipping RPM smoke test outside Linux" >&2
@@ -45,15 +61,23 @@ fi
 OUTPUT_DIR="${TMPDIR}/dist"
 mkdir -p "$OUTPUT_DIR"
 
-docker run --rm \
+if ! retry 3 docker pull "$RPM_TEST_IMAGE"; then
+    echo "CI infrastructure failure: unable to pull RPM smoke test image ($RPM_TEST_IMAGE)" >&2
+    exit 75
+fi
+
+docker run --pull=never --rm \
     --volume "${REPO_ROOT}:/repo:ro" \
     --volume "${OUTPUT_DIR}:/output" \
     --volume "${ZIG_DIR}:/opt/zig:ro" \
-    rockylinux:9 bash -euxc '
+    "$RPM_TEST_IMAGE" bash -euxc '
         # Rocky minor repos can briefly offer a newer best candidate before all
         # matching dependency packages are mirrored. The smoke test only needs a
         # coherent distro-provided OpenSSL development stack.
-        dnf --nobest install -y rpm-build openssl-devel openssl-libs systemd-rpm-macros
+        if ! dnf --setopt=retries=3 --nobest install -y rpm-build openssl-devel openssl-libs systemd-rpm-macros; then
+            echo "CI infrastructure failure: dnf dependency bootstrap failed in RPM smoke setup" >&2
+            exit 75
+        fi
 
         export PATH="/opt/zig:${PATH}"
 
@@ -73,7 +97,7 @@ docker run --rm \
         test -n "$rpm_path"
         test -f "$rpm_path"
 
-        dnf install -y "$rpm_path"
+        dnf --setopt=retries=3 install -y "$rpm_path"
 
         test -x /usr/bin/tardi
         /usr/bin/tardi version >/dev/null
