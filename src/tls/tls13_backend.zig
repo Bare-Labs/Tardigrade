@@ -2327,6 +2327,15 @@ pub const Tls13Backend = struct {
         // ordinary no-mutual-suite path.
         var suites_storage: [native_cipher_suites.len]tls_algorithms.CipherSuite = undefined;
         const offered_suites = self.effectiveCipherSuites(&suites_storage);
+        // #568 review: an empty intersection must fail locally, before any
+        // byte reaches the wire — otherwise this would emit a ClientHello
+        // with a zero-length `cipher_suites` vector, which is not a legal
+        // offer RFC 8446 §4.1.2 permits a peer to answer at all. Reported as
+        // the same `IllegalParameter` the server-side no-mutual-suite path
+        // (`mapNegotiationError`) surfaces, since this is exactly that
+        // failure discovered one step earlier — a local capability gap, not
+        // a distinct capability error.
+        if (offered_suites.len == 0) return error.IllegalParameter;
         try w.u16_(@intCast(2 * offered_suites.len)); // cipher_suites
         for (offered_suites) |cipher_suite| {
             try w.u16_(@intFromEnum(cipher_suite));
@@ -2666,6 +2675,14 @@ pub const Tls13Backend = struct {
         const common = &ticket.common;
         if (common.isExpired(now_ms) or common.isNotYetValid(now_ms)) return false;
         if (!self.policy.containsCipherSuite(common.cipher_suite)) return false;
+        // #568 review: policy membership alone is not enough — a ticket
+        // whose suite the *live* provider cannot actually perform (e.g.
+        // SHA-384 support withdrawn at runtime while policy still lists it)
+        // must be dropped here too, or `sendClientHello`'s binder
+        // derivation reaches an unsupported HKDF call and fails the whole
+        // ClientHello with `SecretExportFailed` instead of quietly falling
+        // back to a full handshake or another, capability-supported ticket.
+        if (!tls_crypto_profile.supportsCipherSuite(self.crypto_provider.capabilities(), common.cipher_suite)) return false;
         if (common.resumption_psk.slice().len != tls_algorithms.transcriptHash(common.cipher_suite).digestLength()) return false;
         if (common.server_name) |*stored| {
             const intended = self.serverNameSlice() orelse return false;
@@ -2984,6 +3001,11 @@ pub const Tls13Backend = struct {
         // ever computed differently between the two calls.
         var suites_storage: [native_cipher_suites.len]tls_algorithms.CipherSuite = undefined;
         const offered_suites = self.effectiveCipherSuites(&suites_storage);
+        // #568 review: same local fail-closed guard as `sendClientHello` —
+        // ClientHello1 already proved this list non-empty, so this is only
+        // reachable if capability changed mid-handshake, but it must still
+        // never encode a zero-length `cipher_suites` vector onto the wire.
+        if (offered_suites.len == 0) return error.IllegalParameter;
         try w.u16_(@intCast(2 * offered_suites.len));
         for (offered_suites) |cipher_suite| {
             try w.u16_(@intFromEnum(cipher_suite));

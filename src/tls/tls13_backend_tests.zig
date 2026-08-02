@@ -87,6 +87,17 @@ const CapabilityOverrideProvider = struct {
         return .{ .backing = backing, .caps = caps };
     }
 
+    /// #568 review: models a provider that cannot perform AES-128-GCM/SHA-256
+    /// — the *only* suite the plain `.record` transport default
+    /// (`Policy.recordH2Only`) configures — so `effectiveCipherSuites`
+    /// resolves to the empty list for a client using that default policy,
+    /// without needing to strip every native suite one at a time.
+    fn initWithoutAes128Gcm(backing: crypto.provider.CryptoProvider) CapabilityOverrideProvider {
+        var caps = backing.capabilities();
+        caps.aeads.remove(.aes_128_gcm);
+        return .{ .backing = backing, .caps = caps };
+    }
+
     fn provider(self: *CapabilityOverrideProvider) crypto.provider.CryptoProvider {
         return .{ .context = self, .vtable = &vtable, .entropy = self.backing.entropy };
     }
@@ -3047,6 +3058,44 @@ fn directHarnessWithCipherSuite(self: *DirectHarness, comptime cipher_suite: tls
     };
 }
 
+/// #568 review: `directHarnessWithCipherSuite`, but the server authenticates
+/// with the ECDSA-P256 fixture identity (`tls_backend.testdata.p256Identity`)
+/// instead of the file's usual Ed25519 one, and the client pins the
+/// matching P-256 certificate — every other SHA-384 loopback/HRR/resumption
+/// test in this file happens to exercise only Ed25519 CertificateVerify,
+/// leaving the ECDSA-P256 signature path's own transcript-hash-under-SHA-384
+/// dependency unexercised.
+fn directHarnessWithCipherSuiteAndP256Identity(self: *DirectHarness, comptime cipher_suite: tls_core.algorithms.CipherSuite) void {
+    const client_crypto_provider = self.client_provider_storage.init(client_provider_seed);
+    const server_crypto_provider = self.server_provider_storage.init(server_provider_seed);
+    const client_bridge_crypto_provider = self.client_bridge_provider_storage.init(client_provider_seed);
+    const server_bridge_crypto_provider = self.server_bridge_provider_storage.init(server_provider_seed);
+    const suites = [_]tls_core.algorithms.CipherSuite{cipher_suite};
+    const alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.h2};
+    const policy = tls_core.policy.Policy.fromCapabilities(.record, .{ .cipher_suites = &suites }, &alpns);
+    self.* = .{
+        .client_provider_storage = self.client_provider_storage,
+        .server_provider_storage = self.server_provider_storage,
+        .client_bridge_provider_storage = self.client_bridge_provider_storage,
+        .server_bridge_provider_storage = self.server_bridge_provider_storage,
+        .client_backend = tls_backend.Tls13Backend.initClientConfigured(
+            clientEntropy(),
+            client_crypto_provider,
+            .{ .pinned_certificate = tls_backend.testdata.p256_certificate_der },
+            tls_backend.recordConfig(policy),
+            .{},
+        ),
+        .server_backend = tls_backend.Tls13Backend.initServerConfigured(
+            serverEntropy(),
+            server_crypto_provider,
+            tls_backend.testdata.p256Identity(),
+            tls_backend.recordConfig(policy),
+        ),
+        .client_bridge = Bridge.init(client_bridge_crypto_provider, cipher_suite),
+        .server_bridge = Bridge.init(server_bridge_crypto_provider, cipher_suite),
+    };
+}
+
 /// #564: `directHarnessWithCipherSuite`, plus an empty initial client key
 /// share — combines suite restriction with #484's HRR trigger so the
 /// non-baseline suites get their own HelloRetryRequest coverage, not only
@@ -3082,30 +3131,94 @@ fn directHarnessWithCipherSuiteAndEmptyKeyShare(self: *DirectHarness, comptime c
     };
 }
 
-/// #564: wires the harness's server to a caller-supplied provider (e.g. a
-/// `CapabilityOverrideProvider` withdrawing a suite's crypto support)
-/// instead of the harness's own deterministic storage, while the client
-/// keeps the harness's normal provider and the default (all-native-suites)
-/// policy. `server_crypto_provider` must stay valid for the harness's whole
-/// lifetime, so callers own its storage in the test function itself (see
-/// `ProviderStorage`'s doc comment).
-fn directHarnessWithServerProvider(self: *DirectHarness, server_crypto_provider: crypto.provider.CryptoProvider) void {
+/// #568 review: wires the harness's server to a caller-supplied provider
+/// (e.g. a `CapabilityOverrideProvider` withdrawing a suite's crypto
+/// support). Both roles get an explicit multi-suite policy instead of the
+/// plain `.record` transport
+/// default — which, contrary to this file's other helpers' assumption,
+/// resolves through `defaultConfigForTransport`/`Policy.recordH2Only` to
+/// *one* suite (AES-128-GCM/SHA-256 only, see `policy.zig`'s
+/// `default_cipher_suites`), not all three native suites. Without an
+/// explicit policy here, a capability override removing SHA-384 would be a
+/// no-op against a server that never offered SHA-384 in the first place —
+/// exactly the gap the second-pass review flagged. The server always gets
+/// the full native preference order (`tls_backend.native_capabilities`,
+/// AES-128 first); the client's own policy is restricted to exactly
+/// `client_suites` (in that preference order), so callers can force a case
+/// where the server's capability-filtered suite is genuinely the one that
+/// would otherwise have been selected. `client_suites` must stay valid for
+/// the harness's whole lifetime — declare it as a local in the test
+/// function itself, matching `ProviderStorage`'s doc comment.
+fn directHarnessWithClientCipherSuitesAndServerProvider(
+    self: *DirectHarness,
+    client_suites: []const tls_core.algorithms.CipherSuite,
+    server_crypto_provider: crypto.provider.CryptoProvider,
+) void {
     const client_crypto_provider = self.client_provider_storage.init(client_provider_seed);
     _ = self.server_provider_storage.init(server_provider_seed);
     const client_bridge_crypto_provider = self.client_bridge_provider_storage.init(client_provider_seed);
     const server_bridge_crypto_provider = self.server_bridge_provider_storage.init(server_provider_seed);
+    const alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.h2};
+    const client_policy = tls_core.policy.Policy.fromCapabilities(.record, .{ .cipher_suites = client_suites }, &alpns);
+    const server_policy = tls_core.policy.Policy.fromCapabilities(.record, tls_backend.native_capabilities, &alpns);
     self.* = .{
         .client_provider_storage = self.client_provider_storage,
         .server_provider_storage = self.server_provider_storage,
         .client_bridge_provider_storage = self.client_bridge_provider_storage,
         .server_bridge_provider_storage = self.server_bridge_provider_storage,
-        .client_backend = tls_backend.Tls13Backend.initClient(
+        .client_backend = tls_backend.Tls13Backend.initClientConfigured(
             clientEntropy(),
             client_crypto_provider,
             .{ .pinned_certificate = tls_backend.testdata.certificate_der },
-            .record,
+            tls_backend.recordConfig(client_policy),
+            .{},
         ),
-        .server_backend = tls_backend.Tls13Backend.initServer(serverEntropy(), server_crypto_provider, fixtureIdentity(), .record),
+        .server_backend = tls_backend.Tls13Backend.initServerConfigured(
+            serverEntropy(),
+            server_crypto_provider,
+            fixtureIdentity(),
+            tls_backend.recordConfig(server_policy),
+        ),
+        .client_bridge = Bridge.init(client_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+        .server_bridge = Bridge.init(server_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+    };
+}
+
+/// #568 review: wires the harness's *client* to a caller-supplied provider
+/// (e.g. a `CapabilityOverrideProvider` withdrawing a suite's crypto
+/// support) with the full native multi-suite policy — the client-side
+/// mirror of `directHarnessWithClientCipherSuitesAndServerProvider`, needed
+/// to prove `ticketEligibleToOffer` drops a PSK ticket whose suite the
+/// client's own live provider cannot perform, even though the ticket's
+/// suite is still listed in policy. The server keeps the harness's normal
+/// (full-capability) provider. `client_crypto_provider` must stay valid for
+/// the harness's whole lifetime, so callers own its storage in the test
+/// function itself (see `ProviderStorage`'s doc comment).
+fn directHarnessWithClientProvider(self: *DirectHarness, client_crypto_provider: crypto.provider.CryptoProvider) void {
+    _ = self.client_provider_storage.init(client_provider_seed);
+    const server_crypto_provider = self.server_provider_storage.init(server_provider_seed);
+    const client_bridge_crypto_provider = self.client_bridge_provider_storage.init(client_provider_seed);
+    const server_bridge_crypto_provider = self.server_bridge_provider_storage.init(server_provider_seed);
+    const alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.h2};
+    const policy = tls_core.policy.Policy.fromCapabilities(.record, tls_backend.native_capabilities, &alpns);
+    self.* = .{
+        .client_provider_storage = self.client_provider_storage,
+        .server_provider_storage = self.server_provider_storage,
+        .client_bridge_provider_storage = self.client_bridge_provider_storage,
+        .server_bridge_provider_storage = self.server_bridge_provider_storage,
+        .client_backend = tls_backend.Tls13Backend.initClientConfigured(
+            clientEntropy(),
+            client_crypto_provider,
+            .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+            tls_backend.recordConfig(policy),
+            .{},
+        ),
+        .server_backend = tls_backend.Tls13Backend.initServerConfigured(
+            serverEntropy(),
+            server_crypto_provider,
+            fixtureIdentity(),
+            tls_backend.recordConfig(policy),
+        ),
         .client_bridge = Bridge.init(client_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
         .server_bridge = Bridge.init(server_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
     };
@@ -3162,30 +3275,150 @@ test "#564 native record-mode loopback still negotiates the AES-128-GCM/SHA-256 
     try expectNativeSuiteLoopback(.tls_aes_128_gcm_sha256, 32);
 }
 
-test "#564 a server whose provider lacks SHA-384/AES-256-GCM drops that suite from negotiation instead of failing" {
+test "#568 native record-mode loopback negotiates AES-256-GCM/SHA-384 with an ECDSA-P256 CertificateVerify, not only Ed25519" {
+    // #568 second-pass review: every other SHA-384 test in this file
+    // authenticates with the fixture Ed25519 identity, so the ECDSA-P256
+    // CertificateVerify path — its own signature over the SHA-384
+    // transcript hash, distinct code from Ed25519's — was never exercised
+    // under a non-baseline hash.
     var harness: DirectHarness = undefined;
-    var server_provider_storage: ProviderStorage = .{};
-    var server_capability_override = CapabilityOverrideProvider.initWithoutSha384(server_provider_storage.init(server_provider_seed));
-    directHarnessWithServerProvider(&harness, server_capability_override.provider());
+    directHarnessWithCipherSuiteAndP256Identity(&harness, .tls_aes_256_gcm_sha384);
     defer harness.deinit();
     try harness.run();
 
     try std.testing.expect(harness.client_driver.isComplete());
     try std.testing.expect(harness.server_driver.isComplete());
-    // The server's own preference list still lists AES-256-GCM/SHA-384 (the
-    // default `.record` policy offers all three native suites) — capability
-    // filtering must have quietly removed it from `effectiveCipherSuites`
-    // before negotiation, landing on one of the two suites the provider can
-    // actually perform, rather than selecting SHA-384 and only discovering
-    // the gap later at `SecretExportFailed`.
-    try std.testing.expect(harness.server_backend.negotiated_cipher_suite != .tls_aes_256_gcm_sha384);
-    try std.testing.expectEqual(harness.client_backend.negotiated_cipher_suite, harness.server_backend.negotiated_cipher_suite);
+    try std.testing.expectEqual(tls_core.algorithms.CipherSuite.tls_aes_256_gcm_sha384, harness.client_backend.negotiated_cipher_suite);
+    try std.testing.expectEqual(tls_core.algorithms.CipherSuite.tls_aes_256_gcm_sha384, harness.server_backend.negotiated_cipher_suite);
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+
+    const client_hash = harness.client_backend.core.transcriptHash();
+    const server_hash = harness.server_backend.core.transcriptHash();
+    try std.testing.expectEqual(@as(usize, 48), client_hash.len);
+    try std.testing.expectEqualSlices(u8, client_hash.slice(), server_hash.slice());
+
+    var client_out: [64]u8 = undefined;
+    const client_record_bytes = try harness.client_bridge.sealApplicationData("ecdsa p256 sha384", &client_out);
+    var server_in: [64]u8 = undefined;
+    const from_client = try harness.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, client_record_bytes), &server_in);
+    try std.testing.expectEqualStrings("ecdsa p256 sha384", from_client.inner.content);
+}
+
+test "#568 a server whose provider lacks SHA-384/AES-256-GCM falls back past it to a suite the client did not prefer first" {
+    // #568 second-pass review: the previous version of this test left the
+    // client on the harness default (all 3 suites, AES-128 first), so the
+    // server's *unfiltered* preference order (also AES-128 first) would
+    // have landed on the same AES-128 selection with or without
+    // `effectiveCipherSuites` ever running — it did not actually prove the
+    // filtering did anything. Restricting the client to [SHA-384, ChaCha]
+    // (no AES-128) forces a real fork: without filtering, the server's
+    // unfiltered preference order would still try AES-256-GCM/SHA-384
+    // first, the client offered it, so it would be *selected* — and only
+    // then fail closed at `SecretExportFailed` once the (capability-absent)
+    // provider is asked to actually derive under it. With filtering, the
+    // server's effective candidate list drops AES-256-GCM/SHA-384 before
+    // selection ever runs, so negotiation continues past it to ChaCha20-
+    // Poly1305/SHA-256 — the first suite both sides can actually execute —
+    // and the handshake completes normally instead of failing at all.
+    var harness: DirectHarness = undefined;
+    var server_provider_storage: ProviderStorage = .{};
+    var server_capability_override = CapabilityOverrideProvider.initWithoutSha384(server_provider_storage.init(server_provider_seed));
+    const client_suites = [_]tls_core.algorithms.CipherSuite{ .tls_aes_256_gcm_sha384, .tls_chacha20_poly1305_sha256 };
+    directHarnessWithClientCipherSuitesAndServerProvider(&harness, &client_suites, server_capability_override.provider());
+    defer harness.deinit();
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(tls_core.algorithms.CipherSuite.tls_chacha20_poly1305_sha256, harness.client_backend.negotiated_cipher_suite);
+    try std.testing.expectEqual(tls_core.algorithms.CipherSuite.tls_chacha20_poly1305_sha256, harness.server_backend.negotiated_cipher_suite);
 
     var client_out: [64]u8 = undefined;
     const client_record_bytes = try harness.client_bridge.sealApplicationData("still usable", &client_out);
     var server_in: [64]u8 = undefined;
     const from_client = try harness.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, client_record_bytes), &server_in);
     try std.testing.expectEqualStrings("still usable", from_client.inner.content);
+}
+
+test "#568 a server whose provider lacks SHA-384/AES-256-GCM fails the ordinary no-mutual-suite way when that is all the client offers" {
+    // The true no-overlap case #568's second-pass review asked for,
+    // distinct from the fallback case above: the client offers *only*
+    // AES-256-GCM/SHA-384, which the server's capability-filtered
+    // candidate list no longer contains at all, so there is no suite left
+    // to fall back to. This must fail during negotiation itself — the
+    // ordinary `NoMutualCipherSuite`/`IllegalParameter` path — not reach
+    // key-schedule installation and fail there as `SecretExportFailed`.
+    var harness: DirectHarness = undefined;
+    var server_provider_storage: ProviderStorage = .{};
+    var server_capability_override = CapabilityOverrideProvider.initWithoutSha384(server_provider_storage.init(server_provider_seed));
+    const client_suites = [_]tls_core.algorithms.CipherSuite{.tls_aes_256_gcm_sha384};
+    directHarnessWithClientCipherSuitesAndServerProvider(&harness, &client_suites, server_capability_override.provider());
+    defer harness.deinit();
+    try std.testing.expectError(error.IllegalParameter, harness.run());
+    try std.testing.expect(harness.server_backend.schedule == null);
+}
+
+test "#568 a client whose provider lacks SHA-384 drops a SHA-384 ticket from its PSK offer and falls back to a full handshake" {
+    // #568 second-pass review: `ticketEligibleToOffer` used to filter a
+    // stored ticket against policy membership alone. A ticket whose suite
+    // the *live* provider cannot perform (capability withdrawn at runtime,
+    // policy unchanged) used to survive that filter, reach
+    // `sendClientHello`'s binder derivation, and fail the whole ClientHello
+    // with `SecretExportFailed` — aborting startup instead of quietly
+    // falling back to a full handshake, which is what should happen here:
+    // the ticket is dropped before it is ever offered, and the connection
+    // completes normally without PSK authentication.
+    var issued = try issueEarlyCapableTicketWithCipherSuite(.tls_aes_256_gcm_sha384, null);
+    defer issued.deinit();
+
+    var harness: DirectHarness = undefined;
+    var client_provider_storage: ProviderStorage = .{};
+    var client_capability_override = CapabilityOverrideProvider.initWithoutSha384(client_provider_storage.init(client_provider_seed));
+    directHarnessWithClientProvider(&harness, client_capability_override.provider());
+    defer harness.deinit();
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try harness.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try harness.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expect(!harness.client_backend.core.psk_authenticated);
+    try std.testing.expect(!harness.server_backend.core.psk_authenticated);
+    try std.testing.expect(harness.client_backend.negotiated_cipher_suite != .tls_aes_256_gcm_sha384);
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+}
+
+test "#568 a client whose provider cannot perform any policy-configured suite fails locally instead of emitting an empty cipher_suites vector" {
+    // #568 second-pass review: an empty `effectiveCipherSuites` result used
+    // to still be encoded onto the wire as a zero-length `cipher_suites`
+    // vector — not a ClientHello any RFC 8446 peer could legally answer.
+    // `sendClientHello` must instead fail closed, locally, before any byte
+    // is ever emitted.
+    var client_provider_storage: ProviderStorage = .{};
+    var client_capability_override = CapabilityOverrideProvider.initWithoutAes128Gcm(client_provider_storage.init(client_provider_seed));
+    var client = tls_backend.Tls13Backend.initClient(
+        clientEntropy(),
+        client_capability_override.provider(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+    );
+    defer client.deinit();
+
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try std.testing.expectError(error.IllegalParameter, client.backend().start(.client, {}, &sink));
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
 }
 
 fn expectHrrRetryStateCleared(backend: *const tls_backend.Tls13Backend) !void {
@@ -3227,25 +3460,75 @@ test "#484 HRR round trip: record client with an empty key share completes via n
 }
 
 test "#564 HRR round trip completes end to end under AES-256-GCM/SHA-384, not only the SHA-256 baseline" {
+    // #568 second-pass review: comparing `client_hash` to `server_hash`
+    // alone proves the two sides *agree*, not that either is *correct* —
+    // both are computed by the same production `Transcript` code, so a
+    // shared bug (e.g. the rebind hash silently using SHA-256 length/
+    // algorithm on both sides) would still make that comparison pass. This
+    // drives the handshake manually (bypassing `harness.run()`/
+    // `record_epoch_bridge.Bridge`, the same `backend().receive`-direct
+    // style the `#485 KAT` test above uses) so every message's raw wire
+    // bytes can be captured and independently rehashed through
+    // `std.crypto.hash.sha2.Sha384` — mirroring `reboundTranscriptHashFixture`'s
+    // exact RFC 8446 §4.4.1 `message_hash`-rebinding algorithm, but for
+    // SHA-384 instead of that fixture's hardcoded SHA-256.
     var harness: DirectHarness = undefined;
     directHarnessWithCipherSuiteAndEmptyKeyShare(&harness, .tls_aes_256_gcm_sha384);
     defer harness.deinit();
-    try harness.run();
 
-    try std.testing.expect(harness.client_driver.isComplete());
-    try std.testing.expect(harness.server_driver.isComplete());
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try harness.client_backend.backend().start(.client, {}, &client_sink);
+    const ch1_raw = nthInitialCryptoBytes(&client_sink, 0);
+
+    try harness.server_backend.backend().start(.server, {}, &server_sink);
+    try harness.server_backend.backend().receive(.initial, ch1_raw, &server_sink);
+    const hrr_raw = nthInitialCryptoBytes(&server_sink, 0);
+
+    try harness.client_backend.backend().receive(.initial, hrr_raw, &client_sink);
+    const ch2_raw = nthInitialCryptoBytes(&client_sink, 1);
+
+    try harness.server_backend.backend().receive(.initial, ch2_raw, &server_sink);
+    const server_hello_raw = nthInitialCryptoBytes(&server_sink, 1);
+    var ee_finished_buf: [4096]u8 = undefined;
+    const ee_finished_raw = collectHandshakeCrypto(&server_sink, &ee_finished_buf);
+
+    try harness.client_backend.backend().receive(.initial, server_hello_raw, &client_sink);
+    try harness.client_backend.backend().receive(.handshake, ee_finished_raw, &client_sink);
+    var client_finished_buf: [512]u8 = undefined;
+    const client_finished_raw = collectHandshakeCrypto(&client_sink, &client_finished_buf);
+
+    try harness.server_backend.backend().receive(.handshake, client_finished_raw, &server_sink);
+
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.complete, harness.client_backend.core.handshake_lifecycle);
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.complete, harness.server_backend.core.handshake_lifecycle);
     try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, harness.client_backend.core.retry_state);
     try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, harness.server_backend.core.retry_state);
     try std.testing.expectEqual(tls_core.algorithms.CipherSuite.tls_aes_256_gcm_sha384, harness.client_backend.negotiated_cipher_suite);
     try std.testing.expectEqual(tls_core.algorithms.CipherSuite.tls_aes_256_gcm_sha384, harness.server_backend.negotiated_cipher_suite);
 
-    // The rebound `message_hash(ClientHello1)` at the retry boundary must
-    // itself be folded under SHA-384 (not silently pinned to SHA-256's
-    // length/algorithm) for both sides to land on the same 48-byte digest.
-    const client_hash = harness.client_backend.core.transcriptHash();
-    const server_hash = harness.server_backend.core.transcriptHash();
-    try std.testing.expectEqual(@as(usize, 48), client_hash.len);
-    try std.testing.expectEqualSlices(u8, client_hash.slice(), server_hash.slice());
+    var ch1_hash: [48]u8 = undefined;
+    std.crypto.hash.sha2.Sha384.hash(ch1_raw, &ch1_hash, .{});
+    var msg_hash_record: [4 + 48]u8 = undefined;
+    msg_hash_record[0] = @intFromEnum(tls_core.messages.MessageType.message_hash);
+    std.mem.writeInt(u24, msg_hash_record[1..4], 48, .big);
+    @memcpy(msg_hash_record[4..], &ch1_hash);
+
+    var hasher = std.crypto.hash.sha2.Sha384.init(.{});
+    hasher.update(&msg_hash_record);
+    hasher.update(hrr_raw);
+    hasher.update(ch2_raw);
+    hasher.update(server_hello_raw);
+    hasher.update(ee_finished_raw);
+    hasher.update(client_finished_raw);
+    var expected: [48]u8 = undefined;
+    hasher.final(&expected);
+
+    try std.testing.expectEqualSlices(u8, &expected, harness.client_backend.core.transcriptHash().slice());
+    try std.testing.expectEqualSlices(u8, &expected, harness.server_backend.core.transcriptHash().slice());
 
     try expectHrrRetryStateCleared(&harness.client_backend);
     try expectHrrRetryStateCleared(&harness.server_backend);
@@ -8763,6 +9046,60 @@ test "#564 a bad client Finished after a full AES-256-GCM/SHA-384 handshake clea
     try std.testing.expectError(
         error.DecryptError,
         harness.server_backend.backend().receive(.handshake, corrupted[0..client_finished_len], &final_sink),
+    );
+
+    try std.testing.expectEqual(.failed, harness.server_backend.core.handshake_lifecycle);
+    try std.testing.expect(harness.server_backend.schedule == null);
+}
+
+test "#568 a wrong-length client Finished under SHA-384 is rejected as malformed, not as a MAC mismatch" {
+    // #568 second-pass review: the tamper test above corrupts a
+    // *correctly-sized* Finished's content, exercising the MAC-comparison
+    // (`DecryptError`) branch of `onClientFinished`. This instead sends a
+    // well-framed Finished whose `verify_data` is the SHA-256 baseline's
+    // 32 bytes rather than the negotiated SHA-384 suite's 48 — exercising
+    // `onClientFinished`'s separate `if (body.len != n) return
+    // error.MalformedHandshake` guard, which must reject the wrong length
+    // itself rather than reading/comparing past the too-short buffer or
+    // silently truncating the expected 48-byte MAC to compare only 32.
+    var harness: DirectHarness = undefined;
+    directHarnessWithCipherSuite(&harness, .tls_aes_256_gcm_sha384);
+    defer harness.deinit();
+
+    var start_sink = DirectSink{};
+    defer start_sink.deinit();
+    try harness.client_backend.backend().start(.client, {}, &start_sink);
+    var client_hello: ?[]const u8 = null;
+    for (start_sink.items[0..start_sink.len]) |event| {
+        if (event == .handshake_bytes) client_hello = event.handshake_bytes.data;
+    }
+    const ch = client_hello orelse return error.TestExpectedEqual;
+
+    var server_flight_sink = DirectSink{};
+    defer server_flight_sink.deinit();
+    try harness.server_backend.backend().start(.server, {}, &server_flight_sink);
+    try harness.server_backend.backend().receive(.initial, ch, &server_flight_sink);
+
+    // Drive the client through the server's flight so the server reaches a
+    // real, negotiated-under-SHA-384 state (schedule installed, digest
+    // length 48) before it is asked to verify a Finished — the client's own
+    // resulting Finished bytes are unused, since this test replaces them
+    // with a deliberately wrong-length one.
+    for (server_flight_sink.items[0..server_flight_sink.len]) |event| {
+        if (event != .handshake_bytes) continue;
+        var client_step_sink = DirectSink{};
+        defer client_step_sink.deinit();
+        try harness.client_backend.backend().receive(event.handshake_bytes.epoch, event.handshake_bytes.data, &client_step_sink);
+    }
+
+    var wrong_length_buf: [4 + 32]u8 = undefined;
+    const wrong_length_finished = try tls_core.messages.encode(.finished, &([_]u8{0xaa} ** 32), &wrong_length_buf);
+
+    var final_sink = DirectSink{};
+    defer final_sink.deinit();
+    try std.testing.expectError(
+        error.MalformedHandshake,
+        harness.server_backend.backend().receive(.handshake, wrong_length_finished, &final_sink),
     );
 
     try std.testing.expectEqual(.failed, harness.server_backend.core.handshake_lifecycle);
