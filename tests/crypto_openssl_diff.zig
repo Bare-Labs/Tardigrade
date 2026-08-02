@@ -116,6 +116,8 @@ const differential_cases = [_]DifferentialCase{
     .{ .kind = .protected_ticket, .algorithm = .{ .aead = .chacha20_poly1305 }, .class = .negative, .rationale = "ChaCha20-Poly1305 ticket resolver normalizes ciphertext/tag/header/key mutations to misses", .run = runProtectedTicketChacha20 },
     .{ .kind = .key_exchange, .algorithm = .{ .group = .x25519 }, .class = .positive, .rationale = "provider raw X25519 shared secret compared to EVP oracle", .run = runX25519Positive },
     .{ .kind = .key_exchange, .algorithm = .{ .group = .x25519 }, .class = .negative, .rationale = "provider X25519 malformed and low-order peer handling compared to EVP oracle status", .run = runX25519Negative },
+    .{ .kind = .key_exchange, .algorithm = .{ .group = .secp256r1 }, .class = .positive, .rationale = "provider raw P-256 ECDH shared secret compared to EVP oracle", .run = runP256EcdhPositive },
+    .{ .kind = .key_exchange, .algorithm = .{ .group = .secp256r1 }, .class = .negative, .rationale = "provider P-256 ECDH malformed scalar and peer handling compared to EVP oracle status", .run = runP256EcdhNegative },
     .{ .kind = .signature_sign, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .rationale = "provider raw Ed25519 signing compared to EVP oracle", .run = runEd25519SignPositive },
     .{ .kind = .signature_sign, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .positive, .rationale = "pure-Zig ECDSA-P256 signatures cross-verify with the OpenSSL EVP oracle", .run = runEcdsaP256SignPositive },
     .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .rationale = "provider raw Ed25519 verification compared to EVP oracle", .run = runEd25519VerifyPositive },
@@ -454,6 +456,62 @@ fn runX25519Negative(allocator: std.mem.Allocator) !void {
     var malformed = try runEvpX25519(allocator, alice_private[0..31], &zero_point);
     defer malformed.deinit(allocator);
     try expectEvpStatus(&malformed, .malformed);
+}
+
+fn runEvpP256Ecdh(allocator: std.mem.Allocator, private_scalar: []const u8, peer_public: []const u8) !EvpOracleResult {
+    const private_hex = try hexAlloc(allocator, private_scalar);
+    defer allocator.free(private_hex);
+    const public_hex = try hexAlloc(allocator, peer_public);
+    defer allocator.free(public_hex);
+    return runEvpOracle(allocator, &.{ "p256-ecdh", private_hex, public_hex });
+}
+
+fn runP256EcdhPositive(allocator: std.mem.Allocator) !void {
+    const cp = cryptoProvider();
+    const scalar_one = [_]u8{0} ** 31 ++ [_]u8{1};
+    const scalar_two_public = hexBytes("047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1");
+    const expected_shared = hexBytes("7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978");
+    var shared: [provider.max_shared_secret_len]u8 = undefined;
+    try cp.deriveSharedSecret(.secp256r1, &scalar_one, &scalar_two_public, &shared);
+    try expectStage("p256 ecdh shared secret / SEC 2", &expected_shared, &shared);
+
+    var oracle = try runEvpP256Ecdh(allocator, &scalar_one, &scalar_two_public);
+    defer oracle.deinit(allocator);
+    try expectEvpStatus(&oracle, .ok);
+    try testing.expectEqualSlices(u8, &shared, oracle.fields[0].?);
+}
+
+fn runP256EcdhNegative(allocator: std.mem.Allocator) !void {
+    const cp = cryptoProvider();
+    const scalar_one = [_]u8{0} ** 31 ++ [_]u8{1};
+    const scalar_zero = [_]u8{0} ** 32;
+    const scalar_out_of_range = [_]u8{0xff} ** 32;
+    const scalar_two_public = hexBytes("047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1");
+    var shared: [provider.max_shared_secret_len]u8 = undefined;
+
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &scalar_zero, &scalar_two_public, &shared));
+    var zero_scalar = try runEvpP256Ecdh(allocator, &scalar_zero, &scalar_two_public);
+    defer zero_scalar.deinit(allocator);
+    try expectEvpStatus(&zero_scalar, .malformed);
+
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &scalar_out_of_range, &scalar_two_public, &shared));
+    var out_of_range_scalar = try runEvpP256Ecdh(allocator, &scalar_out_of_range, &scalar_two_public);
+    defer out_of_range_scalar.deinit(allocator);
+    try expectEvpStatus(&out_of_range_scalar, .malformed);
+
+    var malformed_peer = scalar_two_public;
+    malformed_peer[0] = 0x02;
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &scalar_one, &malformed_peer, &shared));
+    var wrong_prefix = try runEvpP256Ecdh(allocator, &scalar_one, &malformed_peer);
+    defer wrong_prefix.deinit(allocator);
+    try expectEvpStatus(&wrong_prefix, .malformed);
+
+    var off_curve = scalar_two_public;
+    off_curve[64] ^= 0x01;
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &scalar_one, &off_curve, &shared));
+    var off_curve_result = try runEvpP256Ecdh(allocator, &scalar_one, &off_curve);
+    defer off_curve_result.deinit(allocator);
+    try expectEvpStatus(&off_curve_result, .malformed);
 }
 
 fn runEvpEd25519Sign(allocator: std.mem.Allocator, seed: []const u8, message: []const u8) !EvpOracleResult {
@@ -2057,6 +2115,8 @@ test "OpenSSL differential coverage registry has explicit coverage or waivers" {
     try expectCoverageOrWaiver(.protected_ticket, .{ .aead = .chacha20_poly1305 }, .negative);
     try expectCoverageOrWaiver(.key_exchange, .{ .group = .x25519 }, .positive);
     try expectCoverageOrWaiver(.key_exchange, .{ .group = .x25519 }, .negative);
+    try expectCoverageOrWaiver(.key_exchange, .{ .group = .secp256r1 }, .positive);
+    try expectCoverageOrWaiver(.key_exchange, .{ .group = .secp256r1 }, .negative);
     try expectCoverageOrWaiver(.signature_sign, .{ .signature = .ed25519 }, .positive);
     try expectCoverageOrWaiver(.signature_sign, .{ .signature = .ecdsa_secp256r1_sha256 }, .positive);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ed25519 }, .positive);

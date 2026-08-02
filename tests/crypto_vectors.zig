@@ -79,7 +79,8 @@ const case_registry = [_]CaseMeta{
     .{ .id = "chacha20-poly1305-tag-rejection", .algorithm = .{ .aead = .chacha20_poly1305 }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "x25519-rfc7748-alice-bob", .algorithm = .{ .group = .x25519 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 7748 Section 6.1", .license = "IETF Trust", .reproduction = "published RFC vector" },
     .{ .id = "x25519-low-order-rejection", .algorithm = .{ .group = .x25519 }, .providers = pure_zig_only, .class = .negative, .source = "RFC 7748 low-order input rejection", .license = "IETF Trust", .reproduction = "zig build test-crypto-vectors" },
-    .{ .id = "secp256r1-unsupported", .algorithm = .{ .group = .secp256r1 }, .providers = pure_zig_only, .class = .negative, .source = "provider capability matrix", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "secp256r1-fixed-scalar-ecdh", .algorithm = .{ .group = .secp256r1 }, .providers = pure_zig_only, .class = .positive, .source = "SEC 2 P-256 base point and derived 2*G point", .license = "public standard", .reproduction = "zig build test-crypto-vectors" },
+    .{ .id = "secp256r1-invalid-input-rejection", .algorithm = .{ .group = .secp256r1 }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "ed25519-rfc8032-test-1", .algorithm = .{ .signature = .ed25519 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 8032 Section 7.1", .license = "IETF Trust", .reproduction = "published RFC vector" },
     .{ .id = "ed25519-signature-rejection", .algorithm = .{ .signature = .ed25519 }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "rsa-pss-sha256-openssl-2048", .algorithm = .{ .signature = .rsa_pss_rsae_sha256 }, .providers = pure_zig_only, .class = .positive, .source = "OpenSSL 3.0.13 fixed fixture", .license = "project fixture", .reproduction = "openssl genrsa -traditional -3 2048; openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32" },
@@ -504,6 +505,8 @@ fn runAeadVector(
 fn runKeyExchangeAndSignatureVectors(log: *ExecutionLog) !void {
     _ = try log.execute("x25519-rfc7748-alice-bob");
     _ = try log.execute("x25519-low-order-rejection");
+    _ = try log.execute("secp256r1-fixed-scalar-ecdh");
+    _ = try log.execute("secp256r1-invalid-input-rejection");
     _ = try log.execute("ed25519-rfc8032-test-1");
     _ = try log.execute("ed25519-signature-rejection");
     const cp = cryptoProvider();
@@ -517,6 +520,17 @@ fn runKeyExchangeAndSignatureVectors(log: *ExecutionLog) !void {
 
     const zero_point = [_]u8{0} ** 32;
     try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.x25519, &alice_private, &zero_point, &shared));
+
+    const p256_scalar_one = [_]u8{0} ** 31 ++ [_]u8{1};
+    const p256_scalar_two_public = hexBytes("047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1");
+    const p256_expected_shared = hexBytes("7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978");
+    try cp.deriveSharedSecret(.secp256r1, &p256_scalar_one, &p256_scalar_two_public, &shared);
+    try expectStage("secp256r1 shared secret / SEC 2 base point", &p256_expected_shared, &shared);
+
+    var malformed_p256 = p256_scalar_two_public;
+    malformed_p256[0] = 0x02;
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &p256_scalar_one, &malformed_p256, &shared));
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &([_]u8{0} ** 32), &p256_scalar_two_public, &shared));
 
     const ed_seed = hexBytes("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
     const ed_public = hexBytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
@@ -585,12 +599,8 @@ fn runEntropyAndSecretHelperVectors(log: *ExecutionLog) !void {
 }
 
 fn runUnsupportedCapabilityVectors(log: *ExecutionLog) !void {
-    _ = try log.execute("secp256r1-unsupported");
+    _ = log;
     const cp = cryptoProvider();
-    var scalar: [32]u8 = undefined;
-    var public: [65]u8 = undefined;
-    try testing.expectError(error.UnsupportedCapability, cp.generateKeyShare(.secp256r1, &public, &scalar));
-    try testing.expectError(error.UnsupportedCapability, cp.deriveSharedSecret(.secp256r1, &scalar, public[0..32], &scalar));
     try testing.expectError(error.InvalidInput, cp.verify(.rsa_pss_rsae_sha256, "", "", ""));
 }
 

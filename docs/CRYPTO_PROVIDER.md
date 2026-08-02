@@ -56,7 +56,7 @@ changes when it lands.
 - **QUIC header protection** for the AES-128 profile, exposed as a narrow
   packet-protection mask operation rather than as a reusable AES block API.
 - **Key exchange** — ephemeral key-share generation and shared-secret derivation
-  for X25519 and (declared, not yet implemented in pure Zig) secp256r1.
+  for X25519 and secp256r1.
 - **Signatures** — verification for Ed25519, ECDSA-P256, and RSA-PSS, plus
   signing through the opaque `SigningKey` handle for Ed25519 and ECDSA-P256.
 - **Random bytes**, **constant-time comparison**, and **secure zeroing**.
@@ -66,10 +66,11 @@ changes when it lands.
 
 The pure-Zig backend implements the overlap the TLS/QUIC engines need today:
 HKDF (SHA-256/384), all three AEAD primitives, AES-128 QUIC header protection,
-X25519, Ed25519, ECDSA-P256 signing/verification, and RSA-PSS verification. The
-remaining algorithms are named by the interface so protocol and negotiation
-code is written once; capability discovery reports them absent and every entry
-point returns `error.UnsupportedCapability` until a backend provides them.
+X25519, secp256r1 ECDH, Ed25519, ECDSA-P256 signing/verification, and RSA-PSS
+verification. The remaining algorithms are named by the interface so protocol
+and negotiation code is written once; capability discovery reports them absent
+and every entry point returns `error.UnsupportedCapability` until a backend
+provides them.
 
 Primitive support, protocol integration, and product enablement are three
 separate dimensions, and `src/crypto/profile.zig` records all three as typed
@@ -91,18 +92,21 @@ data, not prose:
   `EnumSet(ProductProfile)` (`.native_appliance`, `.general_purpose_openssl`):
   which product actually selects this capability. This is authored per row,
   not derived from `pure_zig_status`/`openssl_status` — primitive support
-  does not imply product selectability. secp256r1 is the standing example:
-  `openssl_status = .provider_deferred` (no in-process OpenSSL
-  `CryptoProvider` yet), but the real general-purpose OpenSSL product
-  supports P-256 ECDH outside this seam, so it still claims
-  `.general_purpose_openssl` even though the pure-Zig backend does not
-  implement the group at all and can never claim `.native_appliance`.
-  AES-256-GCM and ChaCha20-Poly1305 used to illustrate the same asymmetry
-  (`pure_zig_status = .supported` but not negotiated by the native
-  appliance); since #564 made the native engine's handshake/transcript/key
-  schedule cipher/hash-agile, both are negotiated there too and now claim
-  `.native_appliance`. See `profile.zig`'s "enabled product profiles are not
-  a mechanical copy of primitive support" test.
+  does not imply product selectability. AES-256-GCM and ChaCha20-Poly1305
+  used to illustrate this asymmetry (`pure_zig_status = .supported` but not
+  negotiated by the native appliance); since #564 made the native engine's
+  handshake/transcript/key schedule cipher/hash-agile, both are negotiated
+  there too and now claim `.native_appliance`. secp256r1 is the current
+  standing example, for a different reason since #567: the pure-Zig backend
+  now implements P-256 ECDH key-share generation and shared-secret
+  derivation behind `CryptoProvider`, but the native appliance's TLS
+  handshake matrix does not yet select the group (#335), so it still does
+  not claim `.native_appliance`; `openssl_status = .provider_deferred` (no
+  in-process OpenSSL `CryptoProvider` yet) is beside the point, since the
+  real general-purpose OpenSSL product supports P-256 ECDH outside this
+  seam and so still claims `.general_purpose_openssl`. See `profile.zig`'s
+  "enabled product profiles are not a mechanical copy of primitive support"
+  test.
 
 ## Supported profile matrix
 
@@ -122,13 +126,13 @@ lists only the consumers whose live runtime calls `CryptoProvider` today
 | ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | TLS records | live — the native engine now negotiates TLS_CHACHA20_POLY1305_SHA256 (#564) through the same generic record-protection path | native appliance, general-purpose OpenSSL |
 | QUIC AES-128 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection | live — every send/receive path in `src/quic/tls_adapter.zig` applies/removes header protection through `CryptoProvider` | native appliance only (QUIC-specific; the general-purpose backend is TLS-over-TCP) |
 | X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge | live — `src/tls/tls13_backend.zig` generates its ephemeral key share and derives the shared secret through `CryptoProvider.generateKeyShare`/`.deriveSharedSecret` | native appliance, general-purpose OpenSSL |
-| secp256r1 / P-256 | provider deferred | unavailable | provider deferred | TLS key share, PKI | none | general-purpose OpenSSL only (P-256 ECDH outside this seam; not implemented in pure Zig at all) |
+| secp256r1 / P-256 | supported | `std.crypto` | provider deferred | TLS key share, PKI | not integrated — provider ECDH key-share generation and shared-secret derivation are available, but live native TLS negotiation does not select the group until #335 | general-purpose OpenSSL only |
 | Ed25519 | supported | `std.crypto` | provider deferred | CertificateVerify, PKI | live for both — PKI chain-signature verification and the handshake's own CertificateVerify proof-of-possession (`src/tls/tls13_backend.zig`) call `CryptoProvider.verify`; local CertificateVerify signing (`src/tls/credentials.zig`'s `Identity.sign`) signs through the opaque `provider.SigningKey` handle rather than a concrete `std.crypto.sign.Ed25519.KeyPair` | native appliance, general-purpose OpenSSL |
 | ECDSA-P256-SHA256 | supported | `std.crypto` signing/verification | provider deferred | CertificateVerify, PKI | live for both, same split as Ed25519 — chain verification and CertificateVerify both call `CryptoProvider.verify`, and local signing goes through `provider.SigningKey` with per-signature noise from injected provider entropy. Signatures are canonical DER, but are **not** low-S normalized; valid in-range high-S and low-S forms verify without rewriting | native appliance, general-purpose OpenSSL |
 | RSA-PSS-RSAE-SHA256 | supported | project verifier | provider deferred | CertificateVerify, PKI | PKI chain-signature verification only, same split as Ed25519 | general-purpose OpenSSL only (the native appliance negotiates Ed25519/ECDSA only) |
 | DER parser | provider deferred | project code | provider deferred | PKI | none — parsing has no `CryptoProvider` entry point | native appliance, general-purpose OpenSSL (shared protocol-local code) |
 | chain builder, WebPKI validation | provider deferred | unavailable | provider deferred | PKI | none | neither — not implemented yet |
-| injected random bytes, secure zero, constant-time compare | supported | project code | provider deferred / project code | all secret-bearing paths | live for X25519 ephemeral key-share generation — `CryptoProvider.generateKeyShare` draws its randomness from the provider's own injected `Entropy` (#490); TLS ClientHello/ServerHello random and QUIC/resumption nonces still inject through their own longer-standing `Entropy` parameters instead of `CryptoProvider.entropy`, since that randomness is not itself a provider operation; secure-zero/constant-time-compare are shared helpers, not vtable dispatch targets | native appliance, general-purpose OpenSSL |
+| injected random bytes, secure zero, constant-time compare | supported | project code | provider deferred / project code | all secret-bearing paths | live for X25519 and secp256r1 ephemeral key-share generation — `CryptoProvider.generateKeyShare` draws randomness from the provider's own injected `Entropy` (#490/#563); TLS ClientHello/ServerHello random and QUIC/resumption nonces still inject through their own longer-standing `Entropy` parameters instead of `CryptoProvider.entropy`, since that randomness is not itself a provider operation; secure-zero/constant-time-compare are shared helpers, not vtable dispatch targets | native appliance, general-purpose OpenSSL |
 
 The Zig compatibility floor for this matrix is `0.16.0`; when the project moves
 to a newer compiler or starts carrying compatibility shims for crypto APIs, the
@@ -214,10 +218,12 @@ opaque handle; its owner scrubs it explicitly when retiring the key (for the
 pure-Zig backend, `SoftwareSigningKey.deinit` — a Zig value is not zeroed just
 by going out of scope). Internally, backends copy secrets into fixed buffers
 only as long as a primitive needs them and `secureZero` those buffers on the
-way out — including HKDF's per-block temporaries, the X25519 seed, ephemeral
-private scalar, and shared-secret copies. AEAD-open zeroes its output buffer on
-authentication failure so no unauthenticated plaintext is ever left for the
-caller to read.
+way out — including HKDF's per-block temporaries, X25519 and secp256r1
+key-share seeds/scalars, and shared-secret copies. P-256 ECDH accepts only
+canonical uncompressed SEC1 peer points and rejects malformed, off-curve,
+infinity, non-canonical, zero-scalar, and out-of-range scalar inputs as
+`InvalidInput`. AEAD-open zeroes its output buffer on authentication failure so
+no unauthenticated plaintext is ever left for the caller to read.
 
 Secret-bearing protocol state should use `crypto.secrets.FixedSecret(N)` for
 fixed-capacity storage and `crypto.secrets.BoundedSecret` for heap-backed

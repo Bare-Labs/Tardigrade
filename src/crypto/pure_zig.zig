@@ -12,19 +12,12 @@
 //!
 //!   * HKDF-Extract / Expand-Label over SHA-256 and SHA-384
 //!   * AEAD seal/open for AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305
-//!   * X25519 key-share generation and shared-secret derivation
+//!   * X25519 and secp256r1 key-share generation and shared-secret derivation
 //!   * Ed25519 signing (via `SoftwareSigningKey`) and verification
 //!   * ECDSA-P256/SHA-256 signing (via
 //!     `SoftwareEcdsaP256SigningKey`) and verification
 //!   * injected-entropy random bytes, constant-time compare, secure zero
 //!
-//! Declared by the interface but not yet implemented here — capability
-//! discovery reports them absent, and every entry point returns
-//! `error.UnsupportedCapability`:
-//!
-//!   * secp256r1 (P-256) ECDH key-share generation and shared-secret
-//!     derivation (the signature scheme over the same curve is implemented;
-//!     the ECDH group is not)
 //! RSA-PSS-RSAE/SHA-256 verification is implemented in `rsa.zig` with strict
 //! DER, 2048/3072/4096-bit RSA key-size, and EMSA-PSS validation.
 //!
@@ -48,7 +41,10 @@ const Aes128 = crypto.core.aes.Aes128;
 const X25519 = crypto.dh.X25519;
 const Ed25519 = crypto.sign.Ed25519;
 const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
+const P256 = crypto.ecc.P256;
 const P256Scalar = crypto.ecc.P256.scalar.Scalar;
+
+const p256_keygen_attempts = 16;
 
 /// The pure-Zig provider. Construct with an entropy source, then hand the
 /// interface view to protocol code via `cryptoProvider`.
@@ -77,6 +73,7 @@ pub const Provider = struct {
         caps.aeads.insert(.chacha20_poly1305);
         caps.quic_header_protection.insert(.aes_128);
         caps.groups.insert(.x25519);
+        caps.groups.insert(.secp256r1);
         caps.signatures.insert(.ed25519);
         caps.signatures.insert(.ecdsa_secp256r1_sha256);
         caps.signatures.insert(.rsa_pss_rsae_sha256);
@@ -373,7 +370,27 @@ fn generateKeyShareImpl(
             @memcpy(public_out, &key_pair.public_key);
             @memcpy(private_out, &key_pair.secret_key);
         },
-        .secp256r1 => return error.UnsupportedCapability,
+        .secp256r1 => {
+            if (public_out.len != provider.Group.secp256r1.publicKeyLength()) return error.InvalidInput;
+            if (private_out.len != provider.max_private_scalar_len) return error.InvalidInput;
+
+            var scalar_bytes: [provider.max_private_scalar_len]u8 = undefined;
+            defer crypto.secureZero(u8, &scalar_bytes);
+
+            var attempts: usize = 0;
+            while (attempts < p256_keygen_attempts) : (attempts += 1) {
+                self.entropy.fill(&scalar_bytes) catch return error.EntropyFailure;
+                _ = validateP256ScalarBytes(scalar_bytes) catch continue;
+
+                var public_point = P256.basePoint.mul(scalar_bytes, .big) catch return error.ProviderFailure;
+                defer crypto.secureZero(u8, std.mem.asBytes(&public_point));
+                const sec1 = public_point.toUncompressedSec1();
+                @memcpy(public_out, &sec1);
+                @memcpy(private_out, &scalar_bytes);
+                return;
+            }
+            return error.EntropyFailure;
+        },
     }
 }
 
@@ -405,8 +422,38 @@ fn deriveSharedSecretImpl(
             defer crypto.secureZero(u8, &shared);
             @memcpy(out, &shared);
         },
-        .secp256r1 => return error.UnsupportedCapability,
+        .secp256r1 => {
+            if (private_scalar.len != provider.max_private_scalar_len) return error.InvalidInput;
+            if (peer_public.len != provider.Group.secp256r1.publicKeyLength()) return error.InvalidInput;
+            if (out.len != provider.Group.secp256r1.sharedSecretLength()) return error.InvalidInput;
+            if (peer_public[0] != 0x04) return error.InvalidInput;
+
+            var scalar: [provider.max_private_scalar_len]u8 = undefined;
+            @memcpy(&scalar, private_scalar);
+            defer crypto.secureZero(u8, &scalar);
+            try validateP256ScalarBytes(scalar);
+
+            var peer = P256.fromSec1(peer_public) catch return error.InvalidInput;
+            defer crypto.secureZero(u8, std.mem.asBytes(&peer));
+            peer.rejectIdentity() catch return error.InvalidInput;
+            const canonical = peer.toUncompressedSec1();
+            if (!std.mem.eql(u8, &canonical, peer_public)) return error.InvalidInput;
+
+            var shared_point = peer.mul(scalar, .big) catch return error.InvalidInput;
+            defer crypto.secureZero(u8, std.mem.asBytes(&shared_point));
+            var affine = shared_point.affineCoordinates();
+            defer crypto.secureZero(u8, std.mem.asBytes(&affine));
+            var shared_x = affine.x.toBytes(.big);
+            defer crypto.secureZero(u8, &shared_x);
+            @memcpy(out, &shared_x);
+        },
     }
+}
+
+fn validateP256ScalarBytes(bytes: [provider.max_private_scalar_len]u8) provider.InputError!void {
+    var scalar = P256Scalar.fromBytes(bytes, .big) catch return error.InvalidInput;
+    defer crypto.secureZero(u8, std.mem.asBytes(&scalar));
+    if (scalar.isZero()) return error.InvalidInput;
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +790,12 @@ pub const DeterministicEntropy = struct {
 
 const testing = std.testing;
 
+fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
+    var bytes: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
+    return bytes;
+}
+
 test "capabilities advertise exactly the implemented profile" {
     const caps = Provider.capabilities();
     const profiled = profile.capabilities(.pure_zig);
@@ -758,7 +811,7 @@ test "capabilities advertise exactly the implemented profile" {
     try testing.expect(caps.supportsAead(.chacha20_poly1305));
     try testing.expect(caps.supportsQuicHeaderProtection(.aes_128));
     try testing.expect(caps.supportsGroup(.x25519));
-    try testing.expect(!caps.supportsGroup(.secp256r1));
+    try testing.expect(caps.supportsGroup(.secp256r1));
     try testing.expect(caps.supportsSignature(.ed25519));
     try testing.expect(caps.supportsSignature(.ecdsa_secp256r1_sha256));
     try testing.expect(caps.supportsSignature(.rsa_pss_rsae_sha256));
@@ -786,14 +839,6 @@ test "unsupported algorithms return UnsupportedCapability, not undefined behavio
     var det = DeterministicEntropy.init(1);
     var p = Provider.init(det.entropy());
     const cp = p.cryptoProvider();
-
-    // The secp256r1 ECDH group remains unimplemented (only the signature
-    // scheme over that curve is implemented), so key-share operations still
-    // fail closed.
-    var pub_buf: [65]u8 = undefined;
-    var priv_buf: [32]u8 = undefined;
-    try testing.expectError(error.UnsupportedCapability, cp.generateKeyShare(.secp256r1, &pub_buf, &priv_buf));
-    try testing.expectError(error.UnsupportedCapability, cp.deriveSharedSecret(.secp256r1, &priv_buf, pub_buf[0..32], priv_buf[0..32]));
 
     // Malformed RSA-PSS inputs are rejected as ordinary input errors.
     var sig: [8]u8 = @splat(0);
@@ -953,6 +998,162 @@ test "X25519 rejects an all-zero (low-order) peer point as InvalidInput" {
     try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.x25519, &a_priv, &zero_point, &out));
 }
 
+test "secp256r1 fixed scalar vector derives affine X coordinate" {
+    var det = DeterministicEntropy.init(563);
+    var p = Provider.init(det.entropy());
+    const cp = p.cryptoProvider();
+
+    const scalar_one = [_]u8{0} ** 31 ++ [_]u8{1};
+    const base_point = hexBytes("046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5");
+    const scalar_two_public = hexBytes("047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1");
+    const expected_shared = hexBytes("7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978");
+
+    var shared: [provider.max_shared_secret_len]u8 = undefined;
+    try cp.deriveSharedSecret(.secp256r1, &scalar_one, &scalar_two_public, &shared);
+    try testing.expectEqualSlices(u8, &expected_shared, &shared);
+
+    var base_shared: [provider.max_shared_secret_len]u8 = undefined;
+    try cp.deriveSharedSecret(.secp256r1, &scalar_one, &base_point, &base_shared);
+    try testing.expectEqualSlices(u8, base_point[1..33], &base_shared);
+}
+
+test "secp256r1 generated key shares are deterministic and symmetric" {
+    var alice_entropy = DeterministicEntropy.init(0x563);
+    var alice_provider = Provider.init(alice_entropy.entropy());
+    const alice_cp = alice_provider.cryptoProvider();
+    var bob_entropy = DeterministicEntropy.init(0x564);
+    var bob_provider = Provider.init(bob_entropy.entropy());
+    const bob_cp = bob_provider.cryptoProvider();
+
+    var alice_pub: [65]u8 = undefined;
+    var alice_priv: [32]u8 = undefined;
+    var bob_pub: [65]u8 = undefined;
+    var bob_priv: [32]u8 = undefined;
+    try alice_cp.generateKeyShare(.secp256r1, &alice_pub, &alice_priv);
+    try bob_cp.generateKeyShare(.secp256r1, &bob_pub, &bob_priv);
+
+    var alice_repeat_entropy = DeterministicEntropy.init(0x563);
+    var alice_repeat_provider = Provider.init(alice_repeat_entropy.entropy());
+    const alice_repeat_cp = alice_repeat_provider.cryptoProvider();
+    var alice_repeat_pub: [65]u8 = undefined;
+    var alice_repeat_priv: [32]u8 = undefined;
+    try alice_repeat_cp.generateKeyShare(.secp256r1, &alice_repeat_pub, &alice_repeat_priv);
+    try testing.expectEqualSlices(u8, &alice_pub, &alice_repeat_pub);
+    try testing.expectEqualSlices(u8, &alice_priv, &alice_repeat_priv);
+
+    const parsed_alice = try P256.fromSec1(&alice_pub);
+    try parsed_alice.rejectIdentity();
+    const parsed_bob = try P256.fromSec1(&bob_pub);
+    try parsed_bob.rejectIdentity();
+
+    var alice_shared: [32]u8 = undefined;
+    var bob_shared: [32]u8 = undefined;
+    try alice_cp.deriveSharedSecret(.secp256r1, &alice_priv, &bob_pub, &alice_shared);
+    try bob_cp.deriveSharedSecret(.secp256r1, &bob_priv, &alice_pub, &bob_shared);
+    try testing.expectEqualSlices(u8, &alice_shared, &bob_shared);
+}
+
+test "secp256r1 rejects invalid scalars, peer encodings, and preserves outputs on failure" {
+    var det = DeterministicEntropy.init(563);
+    var p = Provider.init(det.entropy());
+    const cp = p.cryptoProvider();
+
+    const valid_scalar = [_]u8{0} ** 31 ++ [_]u8{1};
+    const valid_peer = hexBytes("046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5");
+    var out = [_]u8{0xcc} ** 32;
+
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &([_]u8{0} ** 32), &valid_peer, &out));
+    for (out) |byte| try testing.expectEqual(@as(u8, 0xcc), byte);
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &([_]u8{0xff} ** 32), &valid_peer, &out));
+    for (out) |byte| try testing.expectEqual(@as(u8, 0xcc), byte);
+
+    var wrong_prefix = valid_peer;
+    wrong_prefix[0] = 0x02;
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &valid_scalar, &wrong_prefix, &out));
+    var off_curve = valid_peer;
+    off_curve[64] ^= 0x01;
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &valid_scalar, &off_curve, &out));
+    var identity = [_]u8{0} ** 65;
+    identity[0] = 0x04;
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &valid_scalar, &identity, &out));
+    var noncanonical = valid_peer;
+    @memset(noncanonical[1..33], 0xff);
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &valid_scalar, &noncanonical, &out));
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &valid_scalar, valid_peer[0..64], &out));
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &valid_scalar, &valid_peer, out[0..31]));
+    for (out) |byte| try testing.expectEqual(@as(u8, 0xcc), byte);
+}
+
+test "secp256r1 key-share generation rejects bad buffers before entropy and handles entropy failure" {
+    const CountingEntropy = struct {
+        calls: usize = 0,
+
+        fn fill(context: *anyopaque, buffer: []u8) provider.EntropyError!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            @memset(buffer, 0x01);
+        }
+
+        fn entropy(self: *@This()) provider.Entropy {
+            return .{ .context = self, .fillFn = fill };
+        }
+    };
+    const FailingEntropy = struct {
+        calls: usize = 0,
+
+        fn fill(context: *anyopaque, buffer: []u8) provider.EntropyError!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            if (buffer.len > 0) buffer[0] = 0xa5;
+            return error.EntropyFailure;
+        }
+
+        fn entropy(self: *@This()) provider.Entropy {
+            return .{ .context = self, .fillFn = fill };
+        }
+    };
+    const UnusableEntropy = struct {
+        calls: usize = 0,
+
+        fn fill(context: *anyopaque, buffer: []u8) provider.EntropyError!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            @memset(buffer, 0);
+        }
+
+        fn entropy(self: *@This()) provider.Entropy {
+            return .{ .context = self, .fillFn = fill };
+        }
+    };
+
+    var counting = CountingEntropy{};
+    var counting_provider = Provider.init(counting.entropy());
+    const counting_cp = counting_provider.cryptoProvider();
+    var full_pub = [_]u8{0xcc} ** 65;
+    var full_priv = [_]u8{0xdd} ** 32;
+    try testing.expectError(error.InvalidInput, counting_cp.generateKeyShare(.secp256r1, full_pub[0..64], &full_priv));
+    try testing.expectError(error.InvalidInput, counting_cp.generateKeyShare(.secp256r1, &full_pub, full_priv[0..31]));
+    try testing.expectEqual(@as(usize, 0), counting.calls);
+    for (full_pub) |byte| try testing.expectEqual(@as(u8, 0xcc), byte);
+    for (full_priv) |byte| try testing.expectEqual(@as(u8, 0xdd), byte);
+
+    var failing = FailingEntropy{};
+    var failing_provider = Provider.init(failing.entropy());
+    const failing_cp = failing_provider.cryptoProvider();
+    try testing.expectError(error.EntropyFailure, failing_cp.generateKeyShare(.secp256r1, &full_pub, &full_priv));
+    try testing.expectEqual(@as(usize, 1), failing.calls);
+    for (full_pub) |byte| try testing.expectEqual(@as(u8, 0xcc), byte);
+    for (full_priv) |byte| try testing.expectEqual(@as(u8, 0xdd), byte);
+
+    var unusable = UnusableEntropy{};
+    var unusable_provider = Provider.init(unusable.entropy());
+    const unusable_cp = unusable_provider.cryptoProvider();
+    try testing.expectError(error.EntropyFailure, unusable_cp.generateKeyShare(.secp256r1, &full_pub, &full_priv));
+    try testing.expectEqual(@as(usize, p256_keygen_attempts), unusable.calls);
+    for (full_pub) |byte| try testing.expectEqual(@as(u8, 0xcc), byte);
+    for (full_priv) |byte| try testing.expectEqual(@as(u8, 0xdd), byte);
+}
+
 test "key-share generation rejects wrong-sized output buffers as InvalidInput" {
     var det = DeterministicEntropy.init(8);
     var p = Provider.init(det.entropy());
@@ -964,6 +1165,10 @@ test "key-share generation rejects wrong-sized output buffers as InvalidInput" {
     var too_small: [16]u8 = undefined;
     try testing.expectError(error.InvalidInput, cp.generateKeyShare(.x25519, &too_small, &full));
     try testing.expectError(error.InvalidInput, cp.generateKeyShare(.x25519, &full, &too_small));
+
+    var p256_pub: [65]u8 = undefined;
+    try testing.expectError(error.InvalidInput, cp.generateKeyShare(.secp256r1, p256_pub[0..64], &full));
+    try testing.expectError(error.InvalidInput, cp.generateKeyShare(.secp256r1, &p256_pub, too_small[0..]));
 }
 
 test "Ed25519 sign then verify, with tamper and wrong-key rejection" {
