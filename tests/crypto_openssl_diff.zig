@@ -13,6 +13,10 @@ const quic = @import("quic");
 const tls_core = @import("tls_core");
 
 const testing = std.testing;
+const key_schedule = tls_core.key_schedule;
+const pre_shared_key = tls_core.pre_shared_key;
+const session = tls_core.session;
+const ticket_protection = tls_core.ticket_protection;
 const provider = crypto_pkg.provider;
 const profile = crypto_pkg.profile;
 const pure_zig = crypto_pkg.pure_zig;
@@ -41,9 +45,13 @@ const CoverageKind = enum {
     transcript_hash,
     finished_hmac,
     aead,
+    resumption_master_secret,
+    resumption_psk,
+    protected_ticket,
     key_exchange,
     signature_sign,
     signature_verify,
+    rsa_pss_verify,
     psk_binder,
 };
 
@@ -88,6 +96,24 @@ const differential_cases = [_]DifferentialCase{
     .{ .kind = .aead, .algorithm = .{ .aead = .aes_256_gcm }, .class = .negative, .rationale = "provider AES-256-GCM invalid tag/ciphertext/AAD/key handling compared to EVP oracle", .run = runAeadAes256Negative },
     .{ .kind = .aead, .algorithm = .{ .aead = .chacha20_poly1305 }, .class = .positive, .rationale = "provider ChaCha20-Poly1305 seal/open compared to detached-tag EVP oracle", .run = runAeadChacha20Positive },
     .{ .kind = .aead, .algorithm = .{ .aead = .chacha20_poly1305 }, .class = .negative, .rationale = "provider ChaCha20-Poly1305 invalid tag/ciphertext/AAD/key handling compared to EVP oracle", .run = runAeadChacha20Negative },
+    .{ .kind = .resumption_master_secret, .algorithm = .{ .hkdf = .sha256 }, .class = .positive, .rationale = "KeySchedule.deriveResumptionMasterSecret SHA-256 compared to OpenSSL HKDF-Expand-Label", .run = runResumptionSha256 },
+    .{ .kind = .resumption_master_secret, .algorithm = .{ .hkdf = .sha256 }, .class = .negative, .rationale = "SHA-256 resumption master secret mutation and length checks", .run = runResumptionSha256 },
+    .{ .kind = .resumption_master_secret, .algorithm = .{ .hkdf = .sha384 }, .class = .positive, .rationale = "KeySchedule.deriveResumptionMasterSecret SHA-384 compared to OpenSSL HKDF-Expand-Label", .run = runResumptionSha384 },
+    .{ .kind = .resumption_master_secret, .algorithm = .{ .hkdf = .sha384 }, .class = .negative, .rationale = "SHA-384 resumption master secret mutation and length checks", .run = runResumptionSha384 },
+    .{ .kind = .resumption_psk, .algorithm = .{ .hkdf = .sha256 }, .class = .positive, .rationale = "KeySchedule.resumptionPsk SHA-256 compared to OpenSSL HKDF-Expand-Label for multiple ticket nonces", .run = runResumptionSha256 },
+    .{ .kind = .resumption_psk, .algorithm = .{ .hkdf = .sha256 }, .class = .negative, .rationale = "SHA-256 per-ticket PSK nonce mutation and length checks", .run = runResumptionSha256 },
+    .{ .kind = .resumption_psk, .algorithm = .{ .hkdf = .sha384 }, .class = .positive, .rationale = "KeySchedule.resumptionPsk SHA-384 compared to OpenSSL HKDF-Expand-Label for multiple ticket nonces", .run = runResumptionSha384 },
+    .{ .kind = .resumption_psk, .algorithm = .{ .hkdf = .sha384 }, .class = .negative, .rationale = "SHA-384 per-ticket PSK nonce mutation and length checks", .run = runResumptionSha384 },
+    .{ .kind = .psk_binder, .algorithm = .{ .hkdf = .sha256 }, .class = .positive, .rationale = "SHA-256 pre_shared_key write/parse/derive/verify fixture compared to independent OpenSSL HKDF/HMAC", .run = runPskBinderSha256 },
+    .{ .kind = .psk_binder, .algorithm = .{ .hkdf = .sha256 }, .class = .negative, .rationale = "SHA-256 binder transcript, PSK, identity, binder, and length mutation checks", .run = runPskBinderSha256 },
+    .{ .kind = .psk_binder, .algorithm = .{ .hkdf = .sha384 }, .class = .positive, .rationale = "SHA-384 pre_shared_key write/parse/derive/verify fixture compared to independent OpenSSL HKDF/HMAC", .run = runPskBinderSha384 },
+    .{ .kind = .psk_binder, .algorithm = .{ .hkdf = .sha384 }, .class = .negative, .rationale = "SHA-384 binder transcript, PSK, identity, binder, and length mutation checks", .run = runPskBinderSha384 },
+    .{ .kind = .protected_ticket, .algorithm = .{ .aead = .aes_128_gcm }, .class = .positive, .rationale = "AES-128-GCM ticket envelope matches native provider, EVP oracle, and Protector.seal/resolve", .run = runProtectedTicketAes128 },
+    .{ .kind = .protected_ticket, .algorithm = .{ .aead = .aes_128_gcm }, .class = .negative, .rationale = "AES-128-GCM ticket resolver normalizes ciphertext/tag/header/key mutations to misses", .run = runProtectedTicketAes128 },
+    .{ .kind = .protected_ticket, .algorithm = .{ .aead = .aes_256_gcm }, .class = .positive, .rationale = "AES-256-GCM ticket envelope matches native provider, EVP oracle, and Protector.seal/resolve", .run = runProtectedTicketAes256 },
+    .{ .kind = .protected_ticket, .algorithm = .{ .aead = .aes_256_gcm }, .class = .negative, .rationale = "AES-256-GCM ticket resolver normalizes ciphertext/tag/header/key mutations to misses", .run = runProtectedTicketAes256 },
+    .{ .kind = .protected_ticket, .algorithm = .{ .aead = .chacha20_poly1305 }, .class = .positive, .rationale = "ChaCha20-Poly1305 ticket envelope matches native provider, EVP oracle, and Protector.seal/resolve", .run = runProtectedTicketChacha20 },
+    .{ .kind = .protected_ticket, .algorithm = .{ .aead = .chacha20_poly1305 }, .class = .negative, .rationale = "ChaCha20-Poly1305 ticket resolver normalizes ciphertext/tag/header/key mutations to misses", .run = runProtectedTicketChacha20 },
     .{ .kind = .key_exchange, .algorithm = .{ .group = .x25519 }, .class = .positive, .rationale = "provider raw X25519 shared secret compared to EVP oracle", .run = runX25519Positive },
     .{ .kind = .key_exchange, .algorithm = .{ .group = .x25519 }, .class = .negative, .rationale = "provider X25519 malformed and low-order peer handling compared to EVP oracle status", .run = runX25519Negative },
     .{ .kind = .signature_sign, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .rationale = "provider raw Ed25519 signing compared to EVP oracle", .run = runEd25519SignPositive },
@@ -99,8 +125,8 @@ const differential_cases = [_]DifferentialCase{
 };
 
 const waivers = [_]Waiver{
-    .{ .kind = .psk_binder, .algorithm = .{ .hkdf = .sha256 }, .class = .negative, .reason = "Pure-Zig PSK binder generation/verification is not implemented yet.", .tracking_issue = "#362" },
-    .{ .kind = .psk_binder, .algorithm = .{ .hkdf = .sha384 }, .class = .negative, .reason = "Pure-Zig PSK binder generation/verification is not implemented yet.", .tracking_issue = "#362" },
+    .{ .kind = .rsa_pss_verify, .algorithm = .{ .signature = .rsa_pss_rsae_sha256 }, .class = .positive, .reason = "RSA-PSS verification is already covered by the OpenSSL-derived strict corpus in tests/crypto_vectors.zig (rsa-pss-sha256-openssl-2048/3072/4096), completed by #413/#428; duplicating it here would add no new oracle boundary.", .tracking_issue = "#413/#428" },
+    .{ .kind = .rsa_pss_verify, .algorithm = .{ .signature = .rsa_pss_rsae_sha256 }, .class = .negative, .reason = "RSA-PSS signature/message/key corruption and malformed-input behavior is already exercised by tests/crypto_vectors.zig's rsa-pss-sha256-signature-corruption and invalid-input checks, completed by #413/#428.", .tracking_issue = "#413/#428" },
 };
 
 fn hexBytes(comptime hex: []const u8) [hex.len / 2]u8 {
@@ -930,9 +956,17 @@ fn opensslHkdfExpandLabel(
 }
 
 fn opensslSha256File(allocator: std.mem.Allocator, stage: []const u8, path: []const u8) ![]u8 {
+    return opensslDigestFile(allocator, stage, .sha256, path);
+}
+
+fn opensslDigestFile(allocator: std.mem.Allocator, stage: []const u8, hash: provider.Hash, path: []const u8) ![]u8 {
     const openssl = try opensslBinary(allocator);
     defer openssl.deinit(allocator);
-    return runOpenSsl(allocator, stage, &.{ openssl.path, "dgst", "-sha256", "-binary", path });
+    const digest = switch (hash) {
+        .sha256 => "-sha256",
+        .sha384 => "-sha384",
+    };
+    return runOpenSsl(allocator, stage, &.{ openssl.path, "dgst", digest, "-binary", path });
 }
 
 fn expectOpenSslSha256File(allocator: std.mem.Allocator, stage: []const u8, expected: []const u8, path: []const u8) !void {
@@ -947,16 +981,30 @@ fn opensslHmacSha256File(
     key: []const u8,
     path: []const u8,
 ) ![]u8 {
+    return opensslHmacFile(allocator, stage, .sha256, key, path);
+}
+
+fn opensslHmacFile(
+    allocator: std.mem.Allocator,
+    stage: []const u8,
+    hash: provider.Hash,
+    key: []const u8,
+    path: []const u8,
+) ![]u8 {
     const key_hex = try hexAlloc(allocator, key);
     defer allocator.free(key_hex);
     const key_opt = try std.fmt.allocPrint(allocator, "hexkey:{s}", .{key_hex});
     defer allocator.free(key_opt);
     const openssl = try opensslBinary(allocator);
     defer openssl.deinit(allocator);
+    const digest = switch (hash) {
+        .sha256 => "-sha256",
+        .sha384 => "-sha384",
+    };
     return runOpenSsl(allocator, stage, &.{
         openssl.path,
         "dgst",
-        "-sha256",
+        digest,
         "-mac",
         "HMAC",
         "-macopt",
@@ -1150,6 +1198,572 @@ fn runTlsKeySchedule(allocator: std.mem.Allocator) !void {
     const server_app = try opensslHkdfExpandLabel(allocator, "tls13 server application traffic secret", .sha256, master_secret, "s ap traffic", &finished_hash, provider.Hash.sha256.digestLength());
     defer allocator.free(server_app);
     try expectStage("tls13 server application traffic secret", &app.server, server_app);
+}
+
+fn fillPattern(out: []u8, seed: u8) void {
+    for (out, 0..) |*byte, index| byte.* = seed +% @as(u8, @truncate(index * 17 + 3));
+}
+
+fn hashBytes(hash: provider.Hash, bytes: []const u8, out: []u8) !void {
+    if (out.len != hash.digestLength()) return error.InvalidInput;
+    switch (hash) {
+        .sha256 => std.crypto.hash.sha2.Sha256.hash(bytes, out[0..32], .{}),
+        .sha384 => std.crypto.hash.sha2.Sha384.hash(bytes, out[0..48], .{}),
+    }
+}
+
+fn runResumptionForHash(allocator: std.mem.Allocator, hash: provider.Hash) !void {
+    const cp = cryptoProvider();
+    const digest_len = hash.digestLength();
+    var master_secret_storage: [provider.max_digest_len]u8 = undefined;
+    var transcript_hash_storage: [provider.max_digest_len]u8 = undefined;
+    const master_secret = master_secret_storage[0..digest_len];
+    const transcript_hash = transcript_hash_storage[0..digest_len];
+    fillPattern(master_secret, 0x21);
+    fillPattern(transcript_hash, 0x75);
+
+    var rms_storage: [provider.max_digest_len]u8 = undefined;
+    const rms = rms_storage[0..digest_len];
+    try key_schedule.KeySchedule.deriveResumptionMasterSecret(cp, hash, master_secret, transcript_hash, rms);
+    const expected_rms = try opensslHkdfExpandLabel(allocator, "resumption master secret", hash, master_secret, "res master", transcript_hash, digest_len);
+    defer allocator.free(expected_rms);
+    try expectStage("resumption master secret", rms, expected_rms);
+
+    var mutated_transcript = transcript_hash_storage;
+    mutated_transcript[0] ^= 0x01;
+    var mutated_rms_storage: [provider.max_digest_len]u8 = undefined;
+    const mutated_rms = mutated_rms_storage[0..digest_len];
+    try key_schedule.KeySchedule.deriveResumptionMasterSecret(cp, hash, master_secret, mutated_transcript[0..digest_len], mutated_rms);
+    try testing.expect(!std.mem.eql(u8, rms, mutated_rms));
+
+    const nonces = [_][]const u8{ "", "\x01", "\x02distinct nonce" };
+    for (nonces, 0..) |nonce, index| {
+        var psk_storage: [provider.max_digest_len]u8 = undefined;
+        const psk = psk_storage[0..digest_len];
+        try key_schedule.KeySchedule.resumptionPsk(cp, hash, rms, nonce, psk);
+        const stage = try std.fmt.allocPrint(allocator, "resumption psk nonce {d}", .{index});
+        defer allocator.free(stage);
+        const expected_psk = try opensslHkdfExpandLabel(allocator, stage, hash, rms, "resumption", nonce, digest_len);
+        defer allocator.free(expected_psk);
+        try expectStage(stage, psk, expected_psk);
+    }
+
+    var psk_a_storage: [provider.max_digest_len]u8 = undefined;
+    var psk_b_storage: [provider.max_digest_len]u8 = undefined;
+    const psk_a = psk_a_storage[0..digest_len];
+    const psk_b = psk_b_storage[0..digest_len];
+    try key_schedule.KeySchedule.resumptionPsk(cp, hash, rms, "\x01", psk_a);
+    var rms_mutated_storage = rms_storage;
+    rms_mutated_storage[0] ^= 0x01;
+    try key_schedule.KeySchedule.resumptionPsk(cp, hash, rms_mutated_storage[0..digest_len], "\x01", psk_b);
+    try testing.expect(!std.mem.eql(u8, psk_a, psk_b));
+
+    var nonce_mut = [_]u8{0x01};
+    nonce_mut[0] ^= 0x80;
+    try key_schedule.KeySchedule.resumptionPsk(cp, hash, rms, &nonce_mut, psk_b);
+    try testing.expect(!std.mem.eql(u8, psk_a, psk_b));
+
+    var short_out: [provider.max_digest_len]u8 = undefined;
+    try testing.expectError(error.InvalidSecretLength, key_schedule.KeySchedule.deriveResumptionMasterSecret(cp, hash, master_secret[0 .. digest_len - 1], transcript_hash, rms));
+    try testing.expectError(error.InvalidSecretLength, key_schedule.KeySchedule.deriveResumptionMasterSecret(cp, hash, master_secret, transcript_hash[0 .. digest_len - 1], rms));
+    try testing.expectError(error.InvalidSecretLength, key_schedule.KeySchedule.deriveResumptionMasterSecret(cp, hash, master_secret, transcript_hash, short_out[0 .. digest_len - 1]));
+    try testing.expectError(error.InvalidSecretLength, key_schedule.KeySchedule.resumptionPsk(cp, hash, rms[0 .. digest_len - 1], "\x01", psk_a));
+    try testing.expectError(error.InvalidSecretLength, key_schedule.KeySchedule.resumptionPsk(cp, hash, rms, "\x01", short_out[0 .. digest_len - 1]));
+}
+
+fn runResumptionSha256(allocator: std.mem.Allocator) !void {
+    try runResumptionForHash(allocator, .sha256);
+}
+
+fn runResumptionSha384(allocator: std.mem.Allocator) !void {
+    try runResumptionForHash(allocator, .sha384);
+}
+
+const BinderFixture = struct {
+    full: []const u8,
+    truncated: []const u8,
+    ext_data: []const u8,
+    slot: pre_shared_key.BinderSlot,
+};
+
+const expected_binder_truncated_sha256 = hexBytes("010000700303111111111111111111111111111111111111111111111111111111111111111100000213010100004500290041001c00167469636b65742d6964656e746974792d73686132353610203040");
+const expected_binder_truncated_sha384 = hexBytes("010000800303111111111111111111111111111111111111111111111111111111111111111100000213010100005500290051001c00167469636b65742d6964656e746974792d73686133383410203040");
+const expected_binder_hash_sha256 = hexBytes("9136468c5ddea96b88cdfc816087bc23b820b42646335d609c82b99320a4364e");
+const expected_binder_hash_sha384 = hexBytes("e6f3b0ea1616e04d028eff2e3ed727e088b711cf985a60c0b02ea999522183becd01cd0f8a1392e7e2603f93cf2ce949");
+const expected_binder_sha256 = hexBytes("5d93fb0a6d879504d8ada12cb6484fc3dbe9e0ae6f46e3c3131fa4941d0ac057");
+const expected_binder_sha384 = hexBytes("d1b2ab1ddf233db1f82ae5748987b65180564038960391930320455f7cbfba5177d71099a59448c51bddb44cad526e10");
+
+fn expectedBinderTruncated(hash: provider.Hash) []const u8 {
+    return switch (hash) {
+        .sha256 => &expected_binder_truncated_sha256,
+        .sha384 => &expected_binder_truncated_sha384,
+    };
+}
+
+fn expectedBinderTranscriptHash(hash: provider.Hash) []const u8 {
+    return switch (hash) {
+        .sha256 => &expected_binder_hash_sha256,
+        .sha384 => &expected_binder_hash_sha384,
+    };
+}
+
+fn expectedBinderBytes(hash: provider.Hash) []const u8 {
+    return switch (hash) {
+        .sha256 => &expected_binder_sha256,
+        .sha384 => &expected_binder_sha384,
+    };
+}
+
+fn buildBinderFixture(hash: provider.Hash, identity: []const u8, binder: []const u8, out: []u8) !BinderFixture {
+    var w = tls_core.messages.Writer{ .buf = out };
+    try w.u8_(@intFromEnum(tls_core.messages.MessageType.client_hello));
+    const message_len_idx = try w.reserve(3);
+    try w.u16_(0x0303);
+    try w.bytes(&([_]u8{0x11} ** 32));
+    try w.u8_(0);
+    try w.u16_(2);
+    try w.u16_(@intFromEnum(tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256));
+    try w.u8_(1);
+    try w.u8_(0);
+    const extensions_len_idx = try w.reserve(2);
+    const ext_start = w.len;
+    const offer = try pre_shared_key.writeOffer(&w, &.{
+        .{ .identity = identity, .obfuscated_ticket_age = 0x10203040, .digest_len = hash.digestLength() },
+    });
+    w.patch(2, extensions_len_idx);
+    w.patch(3, message_len_idx);
+    try testing.expectEqual(@as(usize, 1), offer.count);
+    try testing.expectEqual(offer.slots[0].len, binder.len);
+    @memcpy(out[offer.slots[0].offset..][0..binder.len], binder);
+
+    const ext_total = w.written()[ext_start..];
+    var r = tls_core.messages.Reader{ .bytes = ext_total };
+    try testing.expectEqual(pre_shared_key.ext_pre_shared_key, try r.u16_());
+    const ext_len = try r.u16_();
+    const ext_data = try r.slice(ext_len);
+    try r.expectEnd();
+    const parsed = try pre_shared_key.OfferedPsks.parse(ext_data);
+    try testing.expectEqual(offer.truncated_len, ext_start + 4 + parsed.binder_vector_offset);
+
+    return .{
+        .full = w.written(),
+        .truncated = w.written()[0..offer.truncated_len],
+        .ext_data = ext_data,
+        .slot = offer.slots[0],
+    };
+}
+
+fn opensslBinder(allocator: std.mem.Allocator, hash: provider.Hash, psk: []const u8, transcript_hash: []const u8) ![]u8 {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "binder-transcript-hash.bin", .data = transcript_hash });
+    const path = try tmp.dir.realPathFileAlloc(testing.io, "binder-transcript-hash.bin", allocator);
+    defer allocator.free(path);
+
+    const zero = [_]u8{0} ** provider.max_digest_len;
+    const early_secret = try opensslHkdfExtract(allocator, "psk binder early secret", hash, "", psk);
+    defer allocator.free(early_secret);
+    const empty_hash = try opensslDigestFile(allocator, "psk binder empty hash", hash, "/dev/null");
+    defer allocator.free(empty_hash);
+    const binder_key = try opensslHkdfExpandLabel(allocator, "psk binder res binder key", hash, early_secret, "res binder", empty_hash, hash.digestLength());
+    defer allocator.free(binder_key);
+    const finished_key = try opensslHkdfExpandLabel(allocator, "psk binder finished key", hash, binder_key, "finished", "", hash.digestLength());
+    defer allocator.free(finished_key);
+    _ = zero;
+    return opensslHmacFile(allocator, "psk binder hmac", hash, finished_key, path);
+}
+
+fn runPskBinderForHash(allocator: std.mem.Allocator, hash: provider.Hash) !void {
+    const digest_len = hash.digestLength();
+    var psk_storage: [provider.max_digest_len]u8 = undefined;
+    const psk = psk_storage[0..digest_len];
+    fillPattern(psk, if (hash == .sha256) 0x31 else 0x49);
+    const identity = if (hash == .sha256) "ticket-identity-sha256" else "ticket-identity-sha384";
+
+    var zero_binder_storage = [_]u8{0} ** provider.max_digest_len;
+    var ch_buf: [512]u8 = undefined;
+    var fixture = try buildBinderFixture(hash, identity, zero_binder_storage[0..digest_len], &ch_buf);
+    try expectStage("psk binder exact truncated ClientHello", expectedBinderTruncated(hash), fixture.truncated);
+
+    var transcript_hash_storage: [provider.max_digest_len]u8 = undefined;
+    const transcript_hash = transcript_hash_storage[0..digest_len];
+    try hashBytes(hash, fixture.truncated, transcript_hash);
+    try expectStage("psk binder exact transcript hash", expectedBinderTranscriptHash(hash), transcript_hash);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "truncated-client-hello.bin", .data = fixture.truncated });
+    const truncated_path = try tmp.dir.realPathFileAlloc(testing.io, "truncated-client-hello.bin", allocator);
+    defer allocator.free(truncated_path);
+    const openssl_transcript_hash = try opensslDigestFile(allocator, "psk binder truncated ClientHello hash", hash, truncated_path);
+    defer allocator.free(openssl_transcript_hash);
+    try expectStage("psk binder truncated ClientHello hash", transcript_hash, openssl_transcript_hash);
+
+    const expected_binder = try opensslBinder(allocator, hash, psk, transcript_hash);
+    defer allocator.free(expected_binder);
+    try expectStage("psk binder exact binder bytes", expectedBinderBytes(hash), expected_binder);
+    var from_transcript: [provider.max_digest_len]u8 = undefined;
+    try pre_shared_key.deriveBinderFromTranscriptHash(hash, psk, transcript_hash, from_transcript[0..digest_len]);
+    try expectStage("psk binder from transcript hash", expected_binder, from_transcript[0..digest_len]);
+    var from_client_hello: [provider.max_digest_len]u8 = undefined;
+    try pre_shared_key.deriveBinder(hash, psk, fixture.truncated, from_client_hello[0..digest_len]);
+    try expectStage("psk binder from ClientHello", expected_binder, from_client_hello[0..digest_len]);
+
+    fixture = try buildBinderFixture(hash, identity, expected_binder, &ch_buf);
+    const parsed = try pre_shared_key.OfferedPsks.parse(fixture.ext_data);
+    try testing.expectEqual(@as(usize, 1), parsed.count);
+    try testing.expectEqual(parsed.binder_vector_offset + 2 + 1, fixture.slot.offset - (fixture.full.len - fixture.ext_data.len));
+    var pairs = parsed.pairs();
+    const pair = (try pairs.next()).?;
+    try testing.expectEqualSlices(u8, identity, pair.identity.identity);
+    try testing.expectEqualSlices(u8, expected_binder, pair.binder);
+    try testing.expect(try pre_shared_key.verifyBinder(hash, psk, fixture.truncated, pair.binder));
+    try testing.expect(try pre_shared_key.verifyBinderFromTranscriptHash(hash, psk, transcript_hash, pair.binder));
+    try testing.expect((try pairs.next()) == null);
+
+    var mutated_truncated = try allocator.dupe(u8, fixture.truncated);
+    defer allocator.free(mutated_truncated);
+    mutated_truncated[mutated_truncated.len - 1] ^= 0x01;
+    try testing.expect(!try pre_shared_key.verifyBinder(hash, psk, mutated_truncated, pair.binder));
+
+    var mutated_psk = psk_storage;
+    mutated_psk[0] ^= 0x01;
+    try testing.expect(!try pre_shared_key.verifyBinder(hash, mutated_psk[0..digest_len], fixture.truncated, pair.binder));
+
+    var identity_mutated_buf: [512]u8 = undefined;
+    const identity_mutated = try buildBinderFixture(hash, "mutated-ticket-identity", expected_binder, &identity_mutated_buf);
+    try testing.expect(!try pre_shared_key.verifyBinder(hash, psk, identity_mutated.truncated, expected_binder));
+
+    var bad_binder = try allocator.dupe(u8, expected_binder);
+    defer allocator.free(bad_binder);
+    bad_binder[0] ^= 0x80;
+    try testing.expect(!try pre_shared_key.verifyBinder(hash, psk, fixture.truncated, bad_binder));
+    try testing.expect(!try pre_shared_key.verifyBinder(hash, psk, fixture.truncated, bad_binder[0 .. bad_binder.len - 1]));
+
+    var short: [provider.max_digest_len]u8 = undefined;
+    try testing.expectError(error.InvalidSecretLength, pre_shared_key.deriveBinderFromTranscriptHash(hash, psk[0 .. digest_len - 1], transcript_hash, short[0..digest_len]));
+    try testing.expectError(error.InvalidSecretLength, pre_shared_key.deriveBinderFromTranscriptHash(hash, psk, transcript_hash[0 .. digest_len - 1], short[0..digest_len]));
+    try testing.expectError(error.InvalidSecretLength, pre_shared_key.deriveBinderFromTranscriptHash(hash, psk, transcript_hash, short[0 .. digest_len - 1]));
+}
+
+fn runPskBinderSha256(allocator: std.mem.Allocator) !void {
+    try runPskBinderForHash(allocator, .sha256);
+}
+
+fn runPskBinderSha384(allocator: std.mem.Allocator) !void {
+    try runPskBinderForHash(allocator, .sha384);
+}
+
+const ticket_aad_prefix = "tardigrade/tls-ticket/v1\x00";
+
+fn makeTicketState(allocator: std.mem.Allocator, hash: provider.Hash) !session.ServerRecoverableState {
+    const suite: tls_core.algorithms.CipherSuite = if (hash == .sha384) .tls_aes_256_gcm_sha384 else .tls_aes_128_gcm_sha256;
+    var psk_storage: [provider.max_digest_len]u8 = undefined;
+    const psk = psk_storage[0..hash.digestLength()];
+    fillPattern(psk, if (hash == .sha384) 0x91 else 0x61);
+    var common: session.ResumableSessionCommon = .{};
+    defer common.deinit();
+    try common.init(allocator, session.Limits.default, .{
+        .cipher_suite = suite,
+        .resumption_psk = psk,
+        .server_name = "ticket.example",
+        .application_protocol = "h3",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer("ticket-fixture-leaf"),
+        .issued_at_unix_ms = 1_000_000,
+        .lifetime_seconds = 3600,
+        .early_data = .{ .early_data_capable = 4096 },
+        .transport_compat = .{ .format_id = 7, .format_version = 1, .bytes = "transport" },
+        .application_compat = .{ .format_id = 9, .format_version = 2, .bytes = "application" },
+    });
+    var state: session.ServerRecoverableState = .{};
+    state.init(&common, 0xa1b2c3d4);
+    return state;
+}
+
+fn ticketKeyForAead(aead: provider.Aead) [provider.max_aead_key_len]u8 {
+    var out: [provider.max_aead_key_len]u8 = undefined;
+    fillPattern(out[0..aead.keyLength()], switch (aead) {
+        .aes_128_gcm => 0x10,
+        .aes_256_gcm => 0x20,
+        .chacha20_poly1305 => 0x30,
+    });
+    return out;
+}
+
+fn buildTicketAad(header: []const u8, out: *[ticket_aad_prefix.len + ticket_protection.fixed_header_len]u8) void {
+    @memcpy(out[0..ticket_aad_prefix.len], ticket_aad_prefix);
+    @memcpy(out[ticket_aad_prefix.len..], header);
+}
+
+const expected_ticket_ciphertext_aes128 = hexBytes("c8a6da034a177480f14d9c792c1bce52d79b45d6ce6e9979a1ed932a0c19524c3e91a65ebc88ed4a707cb4fbed0243b33a9074c0a5113a09544c80b729f2bd1f982ce05146259033b7b7a60904bc295262fe725dabb59a77080ef7989961e00db923beeae0d126a966a4ce2bcd194ccdfb8a766fb9730d7225ca23dc42ae48ba73e816e95f68518478011d37e8a021bbc1d19101366bf0fddf9578def815624e0b7cec115fe2327339d9118d31d7fe9d01c366bb8b8ba08a8d");
+const expected_ticket_ciphertext_aes256 = hexBytes("d44e63bba33981f43100d675d38184cfa2e23552c289cb8766278a3a9fd668f4722267bea776dc38304546ac8bcacb535cafa708fda436df0731009cc4c524277621ca9b26ffa25140e3c99f8c2536c63d9e04567c951de491165eead7e305edcf8d26ca7f6f0f826714c2dc50e733e6f8fb8074249d51fb16d38412945c7ddb62c7961ab592004c5dde614644695f102f063c535447b80fa1c50ed352fd2c9218ebcbd3595546e4e4c6dc28d7fec4cfcce89d5c5ffb64b556c0d92fb2cc5d73dd41c28c2bde82963c");
+const expected_ticket_ciphertext_chacha20 = hexBytes("8e8db3658013fde33ef8a9ac26a49921417cac8b71e56e89d36bd4c4e90f742a289a4e7f72c09b70917b1f30cf25bdc313bfb3757cf9986ffd944344b6bf3f0f130338c820ead63b7ac2fe8e7de99e2775c099a5f169706cce41fc6f66677055294309168b1e30e82ed04f8ce47f1353840a20a69edcff463cb15506f7e7020ef725d37009aed9e533eb9048982f53a15638d7de4aaa1eaef0249cc846634d9c497866c7ac02dbbf95ae1aca51382a742c389cee2a3ae88997");
+const expected_ticket_tag_aes128 = hexBytes("ba11b6e8aa17eb5ff5e035df9c1d1fe0");
+const expected_ticket_tag_aes256 = hexBytes("132365a4fe41ecf4f36a1f6e4c667e3c");
+const expected_ticket_tag_chacha20 = hexBytes("026dc5c35bf97bf642a3d5cf580a2a0a");
+const expected_ticket_envelope_aes128 = hexBytes("5444544b0101000000112233445566778899aabbccddeeffa0a1a2a30000000000000377c8a6da034a177480f14d9c792c1bce52d79b45d6ce6e9979a1ed932a0c19524c3e91a65ebc88ed4a707cb4fbed0243b33a9074c0a5113a09544c80b729f2bd1f982ce05146259033b7b7a60904bc295262fe725dabb59a77080ef7989961e00db923beeae0d126a966a4ce2bcd194ccdfb8a766fb9730d7225ca23dc42ae48ba73e816e95f68518478011d37e8a021bbc1d19101366bf0fddf9578def815624e0b7cec115fe2327339d9118d31d7fe9d01c366bb8b8ba08a8dba11b6e8aa17eb5ff5e035df9c1d1fe0");
+const expected_ticket_envelope_aes256 = hexBytes("5444544b0102000000112233445566778899aabbccddeeffa0a1a2a30000000000000377d44e63bba33981f43100d675d38184cfa2e23552c289cb8766278a3a9fd668f4722267bea776dc38304546ac8bcacb535cafa708fda436df0731009cc4c524277621ca9b26ffa25140e3c99f8c2536c63d9e04567c951de491165eead7e305edcf8d26ca7f6f0f826714c2dc50e733e6f8fb8074249d51fb16d38412945c7ddb62c7961ab592004c5dde614644695f102f063c535447b80fa1c50ed352fd2c9218ebcbd3595546e4e4c6dc28d7fec4cfcce89d5c5ffb64b556c0d92fb2cc5d73dd41c28c2bde82963c132365a4fe41ecf4f36a1f6e4c667e3c");
+const expected_ticket_envelope_chacha20 = hexBytes("5444544b0103000000112233445566778899aabbccddeeffa0a1a2a300000000000003778e8db3658013fde33ef8a9ac26a49921417cac8b71e56e89d36bd4c4e90f742a289a4e7f72c09b70917b1f30cf25bdc313bfb3757cf9986ffd944344b6bf3f0f130338c820ead63b7ac2fe8e7de99e2775c099a5f169706cce41fc6f66677055294309168b1e30e82ed04f8ce47f1353840a20a69edcff463cb15506f7e7020ef725d37009aed9e533eb9048982f53a15638d7de4aaa1eaef0249cc846634d9c497866c7ac02dbbf95ae1aca51382a742c389cee2a3ae88997026dc5c35bf97bf642a3d5cf580a2a0a");
+
+fn expectedTicketCiphertext(aead: provider.Aead) []const u8 {
+    return switch (aead) {
+        .aes_128_gcm => &expected_ticket_ciphertext_aes128,
+        .aes_256_gcm => &expected_ticket_ciphertext_aes256,
+        .chacha20_poly1305 => &expected_ticket_ciphertext_chacha20,
+    };
+}
+
+fn expectedTicketTag(aead: provider.Aead) []const u8 {
+    return switch (aead) {
+        .aes_128_gcm => &expected_ticket_tag_aes128,
+        .aes_256_gcm => &expected_ticket_tag_aes256,
+        .chacha20_poly1305 => &expected_ticket_tag_chacha20,
+    };
+}
+
+fn expectedTicketEnvelope(aead: provider.Aead) []const u8 {
+    return switch (aead) {
+        .aes_128_gcm => &expected_ticket_envelope_aes128,
+        .aes_256_gcm => &expected_ticket_envelope_aes256,
+        .chacha20_poly1305 => &expected_ticket_envelope_chacha20,
+    };
+}
+
+fn expectTicketResolveMiss(protector: *ticket_protection.Protector, allocator: std.mem.Allocator, identity: []const u8) !void {
+    var out: session.ServerRecoverableState = .{};
+    defer out.deinit();
+    try testing.expect(!try protector.resolve(allocator, identity, 1_500_000, &out));
+    try testing.expectEqual(@as(usize, 0), out.common.resumption_psk.slice().len);
+}
+
+fn expectRawAeadAuthFailureParity(
+    allocator: std.mem.Allocator,
+    cp: provider.CryptoProvider,
+    aead: provider.Aead,
+    key: []const u8,
+    nonce: []const u8,
+    aad: []const u8,
+    ciphertext: []const u8,
+    tag: []const u8,
+) !void {
+    const plaintext = try allocator.alloc(u8, ciphertext.len);
+    defer allocator.free(plaintext);
+    try testing.expectError(error.AuthenticationFailed, cp.aeadOpen(aead, key, nonce, aad, ciphertext, tag, plaintext));
+    var oracle = try runEvpAeadOpen(allocator, aead, key, nonce, aad, ciphertext, tag);
+    defer oracle.deinit(allocator);
+    try expectEvpStatus(&oracle, .auth_fail);
+}
+
+const CapabilityDenyProvider = struct {
+    base: provider.CryptoProvider,
+    denied_aead: provider.Aead,
+
+    fn cryptoProvider(self: *CapabilityDenyProvider) provider.CryptoProvider {
+        return .{ .context = self, .vtable = &vtable, .entropy = self.base.entropy };
+    }
+
+    fn fromContext(ctx: *anyopaque) *CapabilityDenyProvider {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn capabilities(ctx: *anyopaque) provider.Capabilities {
+        const me = fromContext(ctx);
+        var caps = me.base.capabilities();
+        caps.aeads.remove(me.denied_aead);
+        return caps;
+    }
+
+    fn hkdfExtract(ctx: *anyopaque, hash: provider.Hash, salt: []const u8, ikm: []const u8, out: []u8) provider.HkdfError!void {
+        return fromContext(ctx).base.hkdfExtract(hash, salt, ikm, out);
+    }
+
+    fn hkdfExpandLabel(ctx: *anyopaque, hash: provider.Hash, secret: []const u8, label: []const u8, hash_context: []const u8, out: []u8) provider.HkdfError!void {
+        return fromContext(ctx).base.hkdfExpandLabel(hash, secret, label, hash_context, out);
+    }
+
+    fn aeadSeal(ctx: *anyopaque, aead: provider.Aead, key: []const u8, nonce: []const u8, associated_data: []const u8, plaintext: []const u8, ciphertext: []u8, tag: []u8) provider.SealError!void {
+        return fromContext(ctx).base.aeadSeal(aead, key, nonce, associated_data, plaintext, ciphertext, tag);
+    }
+
+    fn aeadOpen(ctx: *anyopaque, aead: provider.Aead, key: []const u8, nonce: []const u8, associated_data: []const u8, ciphertext: []const u8, tag: []const u8, plaintext: []u8) provider.OpenError!void {
+        return fromContext(ctx).base.aeadOpen(aead, key, nonce, associated_data, ciphertext, tag, plaintext);
+    }
+
+    fn quicHeaderProtectionMask(ctx: *anyopaque, hp: provider.QuicHeaderProtection, key: []const u8, sample: []const u8, mask: []u8) provider.QuicHeaderProtectionError!void {
+        return fromContext(ctx).base.quicHeaderProtectionMask(hp, key, sample, mask);
+    }
+
+    fn generateKeyShare(ctx: *anyopaque, group: provider.Group, public_out: []u8, private_out: []u8) provider.KeyShareError!void {
+        return fromContext(ctx).base.generateKeyShare(group, public_out, private_out);
+    }
+
+    fn deriveSharedSecret(ctx: *anyopaque, group: provider.Group, private_scalar: []const u8, peer_public: []const u8, out: []u8) provider.DeriveError!void {
+        return fromContext(ctx).base.deriveSharedSecret(group, private_scalar, peer_public, out);
+    }
+
+    fn verify(ctx: *anyopaque, scheme: provider.SignatureScheme, public_key: []const u8, message: []const u8, signature: []const u8) provider.VerifyError!void {
+        return fromContext(ctx).base.verify(scheme, public_key, message, signature);
+    }
+
+    const vtable = provider.CryptoProvider.VTable{
+        .capabilities = capabilities,
+        .hkdfExtract = hkdfExtract,
+        .hkdfExpandLabel = hkdfExpandLabel,
+        .aeadSeal = aeadSeal,
+        .aeadOpen = aeadOpen,
+        .quicHeaderProtectionMask = quicHeaderProtectionMask,
+        .generateKeyShare = generateKeyShare,
+        .deriveSharedSecret = deriveSharedSecret,
+        .verify = verify,
+    };
+};
+
+fn runProtectedTicketForAead(allocator: std.mem.Allocator, aead: provider.Aead) !void {
+    const cp = cryptoProvider();
+    const hash: provider.Hash = if (aead == .aes_256_gcm) .sha384 else .sha256;
+    var state = try makeTicketState(allocator, hash);
+    defer state.deinit();
+
+    const key_id = hexBytes("00112233445566778899aabbccddeeff");
+    var nonce = hexBytes("a0a1a2a30000000000000377");
+    const key_storage = ticketKeyForAead(aead);
+    const key = key_storage[0..aead.keyLength()];
+    var plaintext_buf: [1024]u8 = undefined;
+    const plaintext = try session.encodeServer(&state, session.Limits.default, &plaintext_buf);
+
+    var header: [ticket_protection.fixed_header_len]u8 = undefined;
+    @memcpy(header[0..4], &ticket_protection.magic);
+    header[4] = ticket_protection.format_version;
+    header[5] = ticket_protection.encodeAeadId(aead);
+    std.mem.writeInt(u16, header[6..8], 0, .big);
+    @memcpy(header[8..24], &key_id);
+    @memcpy(header[24..36], &nonce);
+    var aad: [ticket_aad_prefix.len + ticket_protection.fixed_header_len]u8 = undefined;
+    buildTicketAad(&header, &aad);
+
+    const native_ciphertext = try allocator.alloc(u8, plaintext.len);
+    defer allocator.free(native_ciphertext);
+    var native_tag: [provider.aead_tag_len]u8 = undefined;
+    try cp.aeadSeal(aead, key, &nonce, &aad, plaintext, native_ciphertext, &native_tag);
+    var oracle = try runEvpAeadSeal(allocator, aead, key, &nonce, &aad, plaintext);
+    defer oracle.deinit(allocator);
+    try expectEvpStatus(&oracle, .ok);
+    try expectStage("protected ticket provider ciphertext", native_ciphertext, oracle.fields[0].?);
+    try expectStage("protected ticket provider tag", &native_tag, oracle.fields[1].?);
+    try expectStage("protected ticket pinned ciphertext", expectedTicketCiphertext(aead), native_ciphertext);
+    try expectStage("protected ticket pinned tag", expectedTicketTag(aead), &native_tag);
+
+    var expected_envelope = try allocator.alloc(u8, ticket_protection.fixed_header_len + plaintext.len + provider.aead_tag_len);
+    defer allocator.free(expected_envelope);
+    @memcpy(expected_envelope[0..ticket_protection.fixed_header_len], &header);
+    @memcpy(expected_envelope[ticket_protection.fixed_header_len..][0..plaintext.len], native_ciphertext);
+    @memcpy(expected_envelope[ticket_protection.fixed_header_len + plaintext.len ..], &native_tag);
+    try expectStage("protected ticket pinned envelope", expectedTicketEnvelope(aead), expected_envelope);
+
+    const parsed = try ticket_protection.parseEnvelope(expected_envelope, session.Limits.default);
+    try testing.expectEqual(aead, parsed.aead);
+    try testing.expectEqualSlices(u8, &ticket_protection.magic, expected_envelope[0..4]);
+    try testing.expectEqual(@as(u8, 1), expected_envelope[4]);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, expected_envelope[6..8], .big));
+    try testing.expectEqual(@as(u8, 1), ticket_protection.encodeAeadId(.aes_128_gcm));
+    try testing.expectEqual(@as(u8, 2), ticket_protection.encodeAeadId(.aes_256_gcm));
+    try testing.expectEqual(@as(u8, 3), ticket_protection.encodeAeadId(.chacha20_poly1305));
+    try testing.expectEqualSlices(u8, &key_id, &parsed.key_id);
+    try testing.expectEqualSlices(u8, &nonce, &parsed.nonce);
+
+    var keyring = ticket_protection.ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const config = ticket_protection.KeyConfig{
+        .id = key_id,
+        .aead = aead,
+        .key_bytes = key,
+        .not_before_unix_ms = 0,
+        .encrypt_until_unix_ms = 2_000_000,
+        .decrypt_until_unix_ms = 10_000_000,
+        .nonce_lease = .{ .prefix = nonce[0..4].*, .start = 0x377, .end_exclusive = 0x378 },
+    };
+    const snapshot = try keyring.buildSnapshot(&.{config}, cp.capabilities());
+    try keyring.install(snapshot);
+    var protector = ticket_protection.Protector{ .provider = cp, .keyring = &keyring, .limits = session.Limits.default };
+    try testing.expectEqual(expected_envelope.len, try protector.protectedLen(&state));
+    var sealed_buf: [2048]u8 = undefined;
+    const sealed = try protector.seal(allocator, &state, 1_500_000, &sealed_buf);
+    try expectStage("protected ticket complete envelope", expected_envelope, sealed);
+
+    var recovered: session.ServerRecoverableState = .{};
+    defer recovered.deinit();
+    try testing.expect(try protector.resolve(allocator, sealed, 1_500_000, &recovered));
+    var recovered_plaintext_buf: [1024]u8 = undefined;
+    const recovered_plaintext = try session.encodeServer(&recovered, session.Limits.default, &recovered_plaintext_buf);
+    try expectStage("protected ticket recovered canonical state", plaintext, recovered_plaintext);
+
+    var bad_tag = try allocator.dupe(u8, sealed);
+    defer allocator.free(bad_tag);
+    bad_tag[bad_tag.len - 1] ^= 0x01;
+    try expectRawAeadAuthFailureParity(allocator, cp, aead, key, &nonce, &aad, parsed.ciphertext, bad_tag[bad_tag.len - provider.aead_tag_len ..]);
+    try expectTicketResolveMiss(&protector, allocator, bad_tag);
+
+    var bad_ciphertext = try allocator.dupe(u8, sealed);
+    defer allocator.free(bad_ciphertext);
+    bad_ciphertext[ticket_protection.fixed_header_len] ^= 0x01;
+    try expectRawAeadAuthFailureParity(allocator, cp, aead, key, &nonce, &aad, bad_ciphertext[ticket_protection.fixed_header_len .. bad_ciphertext.len - provider.aead_tag_len], parsed.tag);
+    try expectTicketResolveMiss(&protector, allocator, bad_ciphertext);
+
+    var bad_header = try allocator.dupe(u8, sealed);
+    defer allocator.free(bad_header);
+    bad_header[24] ^= 0x01;
+    try expectTicketResolveMiss(&protector, allocator, bad_header);
+
+    var wrong_aead = try allocator.dupe(u8, sealed);
+    defer allocator.free(wrong_aead);
+    wrong_aead[5] = if (aead == .aes_128_gcm) ticket_protection.encodeAeadId(.aes_256_gcm) else ticket_protection.encodeAeadId(.aes_128_gcm);
+    try expectTicketResolveMiss(&protector, allocator, wrong_aead);
+
+    var bad_aad = aad;
+    bad_aad[bad_aad.len - 1] ^= 0x01;
+    try expectRawAeadAuthFailureParity(allocator, cp, aead, key, &nonce, &bad_aad, parsed.ciphertext, parsed.tag);
+
+    var truncated_ciphertext = try allocator.alloc(u8, sealed.len - 1);
+    defer allocator.free(truncated_ciphertext);
+    @memcpy(truncated_ciphertext[0..ticket_protection.fixed_header_len], sealed[0..ticket_protection.fixed_header_len]);
+    @memcpy(truncated_ciphertext[ticket_protection.fixed_header_len..][0 .. plaintext.len - 1], sealed[ticket_protection.fixed_header_len..][0 .. plaintext.len - 1]);
+    @memcpy(truncated_ciphertext[ticket_protection.fixed_header_len + plaintext.len - 1 ..], sealed[ticket_protection.fixed_header_len + plaintext.len ..]);
+    try expectTicketResolveMiss(&protector, allocator, truncated_ciphertext);
+    try expectTicketResolveMiss(&protector, allocator, sealed[0 .. sealed.len - 1]);
+
+    var wrong_keyring = ticket_protection.ReloadableKeyRing.init(allocator);
+    defer wrong_keyring.deinit();
+    var wrong_key_storage = key_storage;
+    wrong_key_storage[0] ^= 0x44;
+    var wrong_config = config;
+    wrong_config.key_bytes = wrong_key_storage[0..aead.keyLength()];
+    wrong_config.nonce_lease = null;
+    const wrong_snapshot = try wrong_keyring.buildSnapshot(&.{wrong_config}, cp.capabilities());
+    try wrong_keyring.install(wrong_snapshot);
+    var wrong_protector = ticket_protection.Protector{ .provider = cp, .keyring = &wrong_keyring, .limits = session.Limits.default };
+    try expectTicketResolveMiss(&wrong_protector, allocator, sealed);
+
+    var deny = CapabilityDenyProvider{ .base = cp, .denied_aead = aead };
+    var unsupported_protector = ticket_protection.Protector{ .provider = deny.cryptoProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var unsupported_out: session.ServerRecoverableState = .{};
+    defer unsupported_out.deinit();
+    try testing.expectError(error.UnsupportedCapability, unsupported_protector.resolve(allocator, sealed, 1_500_000, &unsupported_out));
+
+    var opened = try runEvpAeadOpen(allocator, aead, key, &nonce, &aad, parsed.ciphertext, parsed.tag);
+    defer opened.deinit(allocator);
+    try expectEvpStatus(&opened, .ok);
+    try expectStage("protected ticket oracle open plaintext", plaintext, opened.fields[0].?);
+}
+
+fn runProtectedTicketAes128(allocator: std.mem.Allocator) !void {
+    try runProtectedTicketForAead(allocator, .aes_128_gcm);
+}
+
+fn runProtectedTicketAes256(allocator: std.mem.Allocator) !void {
+    try runProtectedTicketForAead(allocator, .aes_256_gcm);
+}
+
+fn runProtectedTicketChacha20(allocator: std.mem.Allocator) !void {
+    try runProtectedTicketForAead(allocator, .chacha20_poly1305);
 }
 
 test "OpenSSL HKDF oracle matches provider and TLS record derivations" {
@@ -1409,6 +2023,24 @@ test "OpenSSL differential coverage registry has explicit coverage or waivers" {
     try expectCoverageOrWaiver(.aead, .{ .aead = .aes_256_gcm }, .negative);
     try expectCoverageOrWaiver(.aead, .{ .aead = .chacha20_poly1305 }, .positive);
     try expectCoverageOrWaiver(.aead, .{ .aead = .chacha20_poly1305 }, .negative);
+    try expectCoverageOrWaiver(.resumption_master_secret, .{ .hkdf = .sha256 }, .positive);
+    try expectCoverageOrWaiver(.resumption_master_secret, .{ .hkdf = .sha256 }, .negative);
+    try expectCoverageOrWaiver(.resumption_master_secret, .{ .hkdf = .sha384 }, .positive);
+    try expectCoverageOrWaiver(.resumption_master_secret, .{ .hkdf = .sha384 }, .negative);
+    try expectCoverageOrWaiver(.resumption_psk, .{ .hkdf = .sha256 }, .positive);
+    try expectCoverageOrWaiver(.resumption_psk, .{ .hkdf = .sha256 }, .negative);
+    try expectCoverageOrWaiver(.resumption_psk, .{ .hkdf = .sha384 }, .positive);
+    try expectCoverageOrWaiver(.resumption_psk, .{ .hkdf = .sha384 }, .negative);
+    try expectCoverageOrWaiver(.psk_binder, .{ .hkdf = .sha256 }, .positive);
+    try expectCoverageOrWaiver(.psk_binder, .{ .hkdf = .sha256 }, .negative);
+    try expectCoverageOrWaiver(.psk_binder, .{ .hkdf = .sha384 }, .positive);
+    try expectCoverageOrWaiver(.psk_binder, .{ .hkdf = .sha384 }, .negative);
+    try expectCoverageOrWaiver(.protected_ticket, .{ .aead = .aes_128_gcm }, .positive);
+    try expectCoverageOrWaiver(.protected_ticket, .{ .aead = .aes_128_gcm }, .negative);
+    try expectCoverageOrWaiver(.protected_ticket, .{ .aead = .aes_256_gcm }, .positive);
+    try expectCoverageOrWaiver(.protected_ticket, .{ .aead = .aes_256_gcm }, .negative);
+    try expectCoverageOrWaiver(.protected_ticket, .{ .aead = .chacha20_poly1305 }, .positive);
+    try expectCoverageOrWaiver(.protected_ticket, .{ .aead = .chacha20_poly1305 }, .negative);
     try expectCoverageOrWaiver(.key_exchange, .{ .group = .x25519 }, .positive);
     try expectCoverageOrWaiver(.key_exchange, .{ .group = .x25519 }, .negative);
     try expectCoverageOrWaiver(.signature_sign, .{ .signature = .ed25519 }, .positive);
@@ -1417,6 +2049,6 @@ test "OpenSSL differential coverage registry has explicit coverage or waivers" {
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ed25519 }, .negative);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ecdsa_secp256r1_sha256 }, .positive);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ecdsa_secp256r1_sha256 }, .negative);
-    try expectCoverageOrWaiver(.psk_binder, .{ .hkdf = .sha256 }, .negative);
-    try expectCoverageOrWaiver(.psk_binder, .{ .hkdf = .sha384 }, .negative);
+    try expectCoverageOrWaiver(.rsa_pss_verify, .{ .signature = .rsa_pss_rsae_sha256 }, .positive);
+    try expectCoverageOrWaiver(.rsa_pss_verify, .{ .signature = .rsa_pss_rsae_sha256 }, .negative);
 }
