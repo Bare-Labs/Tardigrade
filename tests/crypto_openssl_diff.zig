@@ -1162,7 +1162,8 @@ fn runTlsKeySchedule(allocator: std.mem.Allocator) !void {
     const cp = cryptoProvider();
     const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
     const hello_hash = hexBytes("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
-    var schedule = try KeySchedule.init(cp, .sha256, &shared, &hello_hash);
+    var schedule: KeySchedule = undefined;
+    try KeySchedule.init(cp, .sha256, &shared, &hello_hash, &schedule);
     defer schedule.wipe();
 
     const zero = [_]u8{0} ** provider.Hash.sha256.digestLength();
@@ -1190,7 +1191,8 @@ fn runTlsKeySchedule(allocator: std.mem.Allocator) !void {
     try expectStage("tls13 master secret", schedule.master_secret[0..32], master_secret);
 
     const finished_hash = hexBytes("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
-    var app = try schedule.applicationSecrets(&finished_hash);
+    var app: KeySchedule.ApplicationSecrets = undefined;
+    try schedule.applicationSecrets(&finished_hash, &app);
     defer app.wipe();
     const client_app = try opensslHkdfExpandLabel(allocator, "tls13 client application traffic secret", .sha256, master_secret, "c ap traffic", &finished_hash, provider.Hash.sha256.digestLength());
     defer allocator.free(client_app);

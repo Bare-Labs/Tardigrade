@@ -1595,6 +1595,43 @@ pub const Tls13Backend = struct {
         if (!tls_crypto_profile.supportsCipherSuite(caps, self.negotiated_cipher_suite)) return error.SecretExportFailed;
     }
 
+    /// #564 review: `self.policy.cipher_suites` in preference order,
+    /// intersected with what the live `CryptoProvider` can actually
+    /// perform (AEAD + transcript hash + HKDF, via
+    /// `crypto_profile.supportsCipherSuite`). Both roles negotiate from
+    /// *this* list, never `self.policy.cipher_suites` directly — capability
+    /// absence must remove a suite from consideration before ServerHello,
+    /// so a provider that only partially supports the configured policy
+    /// still negotiates a mutually usable suite instead of selecting an
+    /// unsupported one and failing closed afterward with
+    /// `SecretExportFailed` (`validateNegotiatedSuiteCapability` above
+    /// stays as a belt-and-braces backstop, not the primary mechanism).
+    /// Order is preserved, so preference is unaffected; an empty result
+    /// means every configured suite is unsupported, which negotiation
+    /// reports as the ordinary `NoMutualCipherSuite`/no-mutual-suite
+    /// failure, not a capability error.
+    fn effectiveCipherSuites(self: *const Tls13Backend, out: *[native_cipher_suites.len]tls_algorithms.CipherSuite) []const tls_algorithms.CipherSuite {
+        const caps = self.crypto_provider.capabilities();
+        var len: usize = 0;
+        for (self.policy.cipher_suites) |suite| {
+            if (tls_crypto_profile.supportsCipherSuite(caps, suite)) {
+                out[len] = suite;
+                len += 1;
+            }
+        }
+        return out[0..len];
+    }
+
+    /// `self.policy` with `cipher_suites` replaced by `effectiveCipherSuites`
+    /// — for callers (`tls_negotiation.negotiateServerHello`,
+    /// `hello_retry` validation) that take a whole `Policy` rather than a
+    /// bare suite list. `suites_storage` must outlive the returned value.
+    fn effectivePolicy(self: *const Tls13Backend, suites_storage: *[native_cipher_suites.len]tls_algorithms.CipherSuite) tls_policy.Policy {
+        var policy = self.policy;
+        policy.cipher_suites = self.effectiveCipherSuites(suites_storage);
+        return policy;
+    }
+
     fn negotiatedGroupCode(self: *const Tls13Backend) u16 {
         return @intFromEnum(self.negotiated_named_group);
     }
@@ -1965,6 +2002,25 @@ pub const Tls13Backend = struct {
         }
     }
 
+    /// #564: a lightweight, non-authoritative read of a ServerHello/HRR's
+    /// `cipher_suite` field straight off the wire — `legacy_version`(2) +
+    /// `random`(32) + `legacy_session_id`(1-byte length + data) +
+    /// `cipher_suite`(2). Used only to resolve the transcript's hash family
+    /// as early as possible (see `drainInput`); every field this reads is
+    /// re-read and fully validated moments later by `onServerHello`/
+    /// `onHelloRetryRequest`, so a wrong or malformed value here never
+    /// reaches a security decision — it just leaves the family unresolved,
+    /// same as if this peek did not exist at all.
+    fn peekServerHelloCipherSuite(body: []const u8) ?tls_algorithms.CipherSuite {
+        var r = Reader{ .bytes = body };
+        _ = r.u16_() catch return null;
+        _ = r.slice(32) catch return null;
+        const session_id_len = r.u8_() catch return null;
+        _ = r.slice(session_id_len) catch return null;
+        const raw_suite = r.u16_() catch return null;
+        return tls_algorithms.fromInt(tls_algorithms.CipherSuite, raw_suite);
+    }
+
     /// Consume whole handshake messages from a reassembly buffer, dispatching
     /// each. Stops early when an async authentication operation parks (so the
     /// suspend point is never crossed) or when the handshake completes or fails.
@@ -2015,6 +2071,27 @@ pub const Tls13Backend = struct {
             // size budget.
             const ch2_transcript_snapshot: ?tls_transcript.Transcript =
                 if (is_second_client_hello) self.core.transcript else null;
+            // #564 review: the client is the one role that can still reach
+            // this point with the transcript's hash family unresolved (the
+            // server always resolves it synchronously while processing
+            // ClientHello1, before `onClientHello` returns). Left
+            // unresolved, `Core.acceptReceived`/`acceptHelloRetryRequest`
+            // below would buffer *this* message too — on top of the
+            // client's own already-buffered ClientHello1 — needing two
+            // messages' worth of pre-selection storage instead of one.
+            // Peeking the wire `cipher_suite` field here, before either
+            // Core function ever mutates the transcript, resolves the
+            // family from ClientHello1 alone in the common case; a
+            // malformed/unrecognized field is simply left unresolved and
+            // falls through to `onServerHello`/`onHelloRetryRequest`'s own
+            // parse, which rejects it the same way it always did (at the
+            // cost of needing the second message's buffering, but that
+            // path was going to fail closed regardless).
+            if (self.role == .client and message.kind == .server_hello and self.core.transcript.family() == null) {
+                if (peekServerHelloCipherSuite(message.body)) |suite| {
+                    self.core.transcript.selectFamily(tls_algorithms.transcriptHash(suite));
+                }
+            }
             if (is_hello_retry_request) {
                 try self.validateHelloRetryRequest(message.body);
                 _ = self.core.acceptHelloRetryRequest(message.raw) catch |err| return mapCoreError(err);
@@ -2243,8 +2320,15 @@ pub const Tls13Backend = struct {
         try w.u16_(legacy_version);
         try w.bytes(&self.entropy.hello_random);
         try w.u8_(0); // legacy_session_id: this profile does not use compatibility mode
-        try w.u16_(@intCast(2 * self.policy.cipher_suites.len)); // cipher_suites
-        for (self.policy.cipher_suites) |cipher_suite| {
+        // #564 review: offer only what the live provider can actually
+        // perform — see `effectiveCipherSuites`. A capability-unsupported
+        // suite must never reach the wire, or the server could select it
+        // and this side would fail closed after ServerHello instead of the
+        // ordinary no-mutual-suite path.
+        var suites_storage: [native_cipher_suites.len]tls_algorithms.CipherSuite = undefined;
+        const offered_suites = self.effectiveCipherSuites(&suites_storage);
+        try w.u16_(@intCast(2 * offered_suites.len)); // cipher_suites
+        for (offered_suites) |cipher_suite| {
             try w.u16_(@intFromEnum(cipher_suite));
         }
         try w.u8_(1); // legacy_compression_methods
@@ -2828,12 +2912,10 @@ pub const Tls13Backend = struct {
             // equivalently authenticated without a fresh Certificate flight.
             try sink.emitCertificate(.valid);
             const n = self.negotiatedDigestLen();
-            self.schedule = KeySchedule.initWithPsk(self.crypto_provider, self.negotiatedHash(), psk[0..n], &shared, self.core.transcriptHash().slice()) catch
-                return error.SecretExportFailed;
+            try self.installScheduleWithPsk(psk[0..n], &shared, self.core.transcriptHash().slice());
             crypto.secureZero(u8, psk);
         } else {
-            self.schedule = KeySchedule.init(self.crypto_provider, self.negotiatedHash(), &shared, self.core.transcriptHash().slice()) catch
-                return error.SecretExportFailed;
+            try self.installSchedule(&shared, self.core.transcriptHash().slice());
         }
         try self.emitHandshakeSecrets(sink);
         try sink.emitDiscardKeys(.initial);
@@ -2894,8 +2976,16 @@ pub const Tls13Backend = struct {
         try w.u16_(legacy_version);
         try w.bytes(&self.entropy.hello_random);
         try w.u8_(0); // legacy_session_id: unchanged from ClientHello1
-        try w.u16_(@intCast(2 * self.policy.cipher_suites.len));
-        for (self.policy.cipher_suites) |cipher_suite| {
+        // #564 review: must reoffer exactly the same (capability-filtered)
+        // list ClientHello1 did — see `sendClientHello`'s matching comment
+        // — so ClientHello2 remains a legal mutation of ClientHello1
+        // (`hello_retry.validateSecondClientHello` requires an identical
+        // cipher_suites vector) rather than drifting if capabilities were
+        // ever computed differently between the two calls.
+        var suites_storage: [native_cipher_suites.len]tls_algorithms.CipherSuite = undefined;
+        const offered_suites = self.effectiveCipherSuites(&suites_storage);
+        try w.u16_(@intCast(2 * offered_suites.len));
+        for (offered_suites) |cipher_suite| {
             try w.u16_(@intFromEnum(cipher_suite));
         }
         try w.u8_(1);
@@ -3547,8 +3637,9 @@ pub const Tls13Backend = struct {
         // 1-RTT secrets exist from the transcript through server Finished,
         // independent of any client certificate flight that follows.
         const finished_hash = self.core.transcriptHash();
-        var app = schedule.applicationSecrets(finished_hash.slice()) catch return error.SecretExportFailed;
+        var app: KeySchedule.ApplicationSecrets = undefined;
         defer app.wipe();
+        schedule.applicationSecrets(finished_hash.slice(), &app) catch return error.SecretExportFailed;
         try self.emitSecret(sink, .application, .write, app.clientSecret());
         try self.emitSecret(sink, .application, .read, app.serverSecret());
 
@@ -3842,7 +3933,15 @@ pub const Tls13Backend = struct {
             self.clearClientHelloPsk();
             self.retry.wipe();
         }
-        const hello_selection = tls_negotiation.negotiateServerHello(self.policy, &offers) catch |err| return mapNegotiationError(err);
+        // #564 review: select only from what the live provider can
+        // actually perform — see `effectiveCipherSuites`/`effectivePolicy`.
+        // A capability-unsupported suite must never be selected in the
+        // first place, or a mutually usable suite further down the offered
+        // preference list would be missed and this side would fail closed
+        // afterward with `SecretExportFailed` instead of negotiating the
+        // fallback.
+        var suites_storage: [native_cipher_suites.len]tls_algorithms.CipherSuite = undefined;
+        const hello_selection = tls_negotiation.negotiateServerHello(self.effectivePolicy(&suites_storage), &offers) catch |err| return mapNegotiationError(err);
         if (hello_selection.version != .tls13 or hello_selection.named_group != .x25519) return error.IllegalParameter;
         // #564: commit the negotiated suite — and select the transcript's
         // hash family accordingly — as soon as it is known, before any
@@ -4163,11 +4262,9 @@ pub const Tls13Backend = struct {
 
         if (psk_selected) |*sel| {
             const n = self.negotiatedDigestLen();
-            self.schedule = KeySchedule.initWithPsk(self.crypto_provider, self.negotiatedHash(), sel.psk[0..n], &shared, self.core.transcriptHash().slice()) catch
-                return error.SecretExportFailed;
+            try self.installScheduleWithPsk(sel.psk[0..n], &shared, self.core.transcriptHash().slice());
         } else {
-            self.schedule = KeySchedule.init(self.crypto_provider, self.negotiatedHash(), &shared, self.core.transcriptHash().slice()) catch
-                return error.SecretExportFailed;
+            try self.installSchedule(&shared, self.core.transcriptHash().slice());
         }
         try self.emitHandshakeSecrets(sink);
         try sink.emitDiscardKeys(.initial);
@@ -4502,8 +4599,9 @@ pub const Tls13Backend = struct {
         try sink.emitCrypto(.handshake, finished);
 
         const finished_hash = self.core.transcriptHash();
-        var app = schedule.applicationSecrets(finished_hash.slice()) catch return error.SecretExportFailed;
+        var app: KeySchedule.ApplicationSecrets = undefined;
         defer app.wipe();
+        schedule.applicationSecrets(finished_hash.slice(), &app) catch return error.SecretExportFailed;
         try self.emitSecret(sink, .application, .read, app.clientSecret());
         try self.emitSecret(sink, .application, .write, app.serverSecret());
     }
@@ -4673,8 +4771,9 @@ pub const Tls13Backend = struct {
         // 1-RTT secrets from the transcript through server Finished; the
         // client Finished we will require is fixed by the same hash.
         const finished_hash = self.core.transcriptHash();
-        var app = schedule.applicationSecrets(finished_hash.slice()) catch return error.SecretExportFailed;
+        var app: KeySchedule.ApplicationSecrets = undefined;
         defer app.wipe();
+        schedule.applicationSecrets(finished_hash.slice(), &app) catch return error.SecretExportFailed;
         try self.emitSecret(sink, .application, .read, app.clientSecret());
         try self.emitSecret(sink, .application, .write, app.serverSecret());
         // The client Finished MAC is (re)computed when the client Finished
@@ -4908,6 +5007,33 @@ pub const Tls13Backend = struct {
     // -----------------------------------------------------------------------
     // Shared helpers.
     // -----------------------------------------------------------------------
+
+    /// #564 review: constructs `self.schedule` in place through
+    /// `KeySchedule`'s out-parameter API — no separate stack-local
+    /// `KeySchedule` is ever created and then copied in by value, so there
+    /// is no successful-path stack copy left unwiped. Preserves the
+    /// original null-on-failure contract (`self.schedule` reverts to
+    /// `null` if derivation fails), exactly as when `KeySchedule.init`
+    /// returned by value and was only assigned to `self.schedule` on the
+    /// success path.
+    fn installSchedule(self: *Tls13Backend, shared: []const u8, hello_transcript_hash: []const u8) HandshakeError!void {
+        const hash = self.negotiatedHash();
+        self.schedule = KeySchedule{ .provider = self.crypto_provider, .hash = hash };
+        KeySchedule.init(self.crypto_provider, hash, shared, hello_transcript_hash, &self.schedule.?) catch {
+            self.schedule = null;
+            return error.SecretExportFailed;
+        };
+    }
+
+    /// PSK-resumed counterpart of `installSchedule` — see its doc comment.
+    fn installScheduleWithPsk(self: *Tls13Backend, psk: []const u8, shared: []const u8, hello_transcript_hash: []const u8) HandshakeError!void {
+        const hash = self.negotiatedHash();
+        self.schedule = KeySchedule{ .provider = self.crypto_provider, .hash = hash };
+        KeySchedule.initWithPsk(self.crypto_provider, hash, psk, shared, hello_transcript_hash, &self.schedule.?) catch {
+            self.schedule = null;
+            return error.SecretExportFailed;
+        };
+    }
 
     fn emitHandshakeSecrets(self: *Tls13Backend, sink: *EventSink) HandshakeError!void {
         const schedule = &self.schedule.?;

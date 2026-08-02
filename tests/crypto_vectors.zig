@@ -303,7 +303,8 @@ fn runTlsKeyScheduleVector(log: *ExecutionLog) !void {
 
     const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
     const hello_hash = hexBytes("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
-    var schedule = try KeySchedule.init(cp, .sha256, &shared, &hello_hash);
+    var schedule: KeySchedule = undefined;
+    try KeySchedule.init(cp, .sha256, &shared, &hello_hash, &schedule);
     defer schedule.wipe();
 
     try expectStage("tls13 handshake secret / RFC 8448", &hexBytes("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), schedule.handshake_secret[0..32]);
@@ -312,7 +313,8 @@ fn runTlsKeyScheduleVector(log: *ExecutionLog) !void {
     try expectStage("tls13 master secret / RFC 8448", &hexBytes("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"), schedule.master_secret[0..32]);
 
     const finished_hash = hexBytes("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
-    var app = try schedule.applicationSecrets(&finished_hash);
+    var app: KeySchedule.ApplicationSecrets = undefined;
+    try schedule.applicationSecrets(&finished_hash, &app);
     defer app.wipe();
     try expectStage("tls13 client application traffic secret / RFC 8448", &hexBytes("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"), app.clientSecret());
     try expectStage("tls13 server application traffic secret / RFC 8448", &hexBytes("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"), app.serverSecret());

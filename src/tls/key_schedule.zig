@@ -115,12 +115,17 @@ fn emptyTranscriptHashFor(hash: provider.Hash) [max_digest_len]u8 {
 }
 
 /// The "derived" early secret for the zero-PSK key-schedule chain, under
-/// whichever hash the negotiated suite selected. SHA-256 returns the
-/// precomputed public constant; every other hash derives it fresh through
-/// the provider (two HKDF calls, once per full handshake — not worth a
-/// second comptime/audit exemption).
-fn zeroPskDerivedEarlySecret(crypto_provider: provider.CryptoProvider, hash: provider.Hash) provider.HkdfError![max_digest_len]u8 {
-    var out: [max_digest_len]u8 = [_]u8{0} ** max_digest_len;
+/// whichever hash the negotiated suite selected, written into `out`
+/// (zeroed first so bytes beyond the active hash's digest length are never
+/// left uninitialized). SHA-256 copies the precomputed public constant;
+/// every other hash derives it fresh through the provider (two HKDF calls,
+/// once per full handshake — not worth a second comptime/audit exemption).
+/// Out-parameter style (#564 review), like every other retained-or-caller-
+/// owned secret in this file: writing directly into caller storage means
+/// there is never a separate successful-path local left unwiped after a
+/// by-value return.
+fn zeroPskDerivedEarlySecret(crypto_provider: provider.CryptoProvider, hash: provider.Hash, out: *[max_digest_len]u8) provider.HkdfError!void {
+    out.* = [_]u8{0} ** max_digest_len;
     switch (hash) {
         .sha256 => @memcpy(out[0..hash_len], &derived_early_secret_sha256),
         .sha384 => {
@@ -133,7 +138,6 @@ fn zeroPskDerivedEarlySecret(crypto_provider: provider.CryptoProvider, hash: pro
             try crypto_provider.hkdfExpandLabel(.sha384, &early_secret, "derived", empty_hash[0..n], out[0..n]);
         },
     }
-    return out;
 }
 
 pub const KeySchedule = struct {
@@ -156,12 +160,14 @@ pub const KeySchedule = struct {
         hash: provider.Hash,
         shared: []const u8,
         hello_transcript_hash: []const u8,
-    ) Error!KeySchedule {
+        out: *KeySchedule,
+    ) Error!void {
         const n = hash.digestLength();
         if (hello_transcript_hash.len != n) return error.InvalidSecretLength;
-        var derived_early = try zeroPskDerivedEarlySecret(crypto_provider, hash);
+        var derived_early: [max_digest_len]u8 = undefined;
         defer provider.secureZero(&derived_early);
-        return initFromEarlySecret(crypto_provider, hash, derived_early[0..n], shared, hello_transcript_hash);
+        try zeroPskDerivedEarlySecret(crypto_provider, hash, &derived_early);
+        try initFromEarlySecret(crypto_provider, hash, derived_early[0..n], shared, hello_transcript_hash, out);
     }
 
     /// PSK-resumed (`psk_dhe_ke`) handshake: the same key-schedule chain as
@@ -178,7 +184,8 @@ pub const KeySchedule = struct {
         psk: []const u8,
         shared: []const u8,
         hello_transcript_hash: []const u8,
-    ) Error!KeySchedule {
+        out: *KeySchedule,
+    ) Error!void {
         const n = hash.digestLength();
         if (psk.len != n) return error.InvalidSecretLength;
 
@@ -191,7 +198,7 @@ pub const KeySchedule = struct {
         const empty_hash = emptyTranscriptHashFor(hash);
         try crypto_provider.hkdfExpandLabel(hash, early_secret[0..n], "derived", empty_hash[0..n], derived_early[0..n]);
 
-        return initFromEarlySecret(crypto_provider, hash, derived_early[0..n], shared, hello_transcript_hash);
+        try initFromEarlySecret(crypto_provider, hash, derived_early[0..n], shared, hello_transcript_hash, out);
     }
 
     /// Shared continuation from a "derived" early secret (RFC 8446 §7.1)
@@ -204,47 +211,37 @@ pub const KeySchedule = struct {
         derived_early: []const u8,
         shared: []const u8,
         hello_transcript_hash: []const u8,
-    ) Error!KeySchedule {
+        out: *KeySchedule,
+    ) Error!void {
         const n = hash.digestLength();
         if (shared.len != shared_secret_len or derived_early.len != n or hello_transcript_hash.len != n)
             return error.InvalidSecretLength;
         const zeros = [_]u8{0} ** max_digest_len;
 
-        // handshake_secret, master_secret, client_handshake_traffic, and
-        // server_handshake_traffic are all retained in the returned
-        // KeySchedule on success, so each gets an errdefer (wipe only on
-        // failure) rather than an unconditional defer.
-        var handshake_secret: [max_digest_len]u8 = [_]u8{0} ** max_digest_len;
-        errdefer provider.secureZero(&handshake_secret);
-        try crypto_provider.hkdfExtract(hash, derived_early, shared, handshake_secret[0..n]);
+        // #564 review: every retained secret is derived directly into
+        // `out.*` — never a separate local later copied in by a by-value
+        // `return .{...}` — so there is no successful-path stack copy left
+        // unwiped once this returns. `out.*` is reset to its (zeroed)
+        // default field values first so a single `errdefer out.wipe()`,
+        // armed from that point on, covers every failure below uniformly,
+        // partial writes included.
+        out.* = .{ .provider = crypto_provider, .hash = hash };
+        errdefer out.wipe();
+
+        try crypto_provider.hkdfExtract(hash, derived_early, shared, out.handshake_secret[0..n]);
 
         // derived_handshake is purely transient — never retained — so it
         // always gets wiped, success or failure.
         var derived_handshake: [max_digest_len]u8 = [_]u8{0} ** max_digest_len;
         defer provider.secureZero(&derived_handshake);
         const empty_hash = emptyTranscriptHashFor(hash);
-        try crypto_provider.hkdfExpandLabel(hash, handshake_secret[0..n], "derived", empty_hash[0..n], derived_handshake[0..n]);
+        try crypto_provider.hkdfExpandLabel(hash, out.handshake_secret[0..n], "derived", empty_hash[0..n], derived_handshake[0..n]);
 
-        var master_secret: [max_digest_len]u8 = [_]u8{0} ** max_digest_len;
-        errdefer provider.secureZero(&master_secret);
-        try crypto_provider.hkdfExtract(hash, derived_handshake[0..n], zeros[0..n], master_secret[0..n]);
+        try crypto_provider.hkdfExtract(hash, derived_handshake[0..n], zeros[0..n], out.master_secret[0..n]);
 
-        var client_handshake_traffic: [max_digest_len]u8 = [_]u8{0} ** max_digest_len;
-        errdefer provider.secureZero(&client_handshake_traffic);
-        try crypto_provider.hkdfExpandLabel(hash, handshake_secret[0..n], "c hs traffic", hello_transcript_hash, client_handshake_traffic[0..n]);
+        try crypto_provider.hkdfExpandLabel(hash, out.handshake_secret[0..n], "c hs traffic", hello_transcript_hash, out.client_handshake_traffic[0..n]);
 
-        var server_handshake_traffic: [max_digest_len]u8 = [_]u8{0} ** max_digest_len;
-        errdefer provider.secureZero(&server_handshake_traffic);
-        try crypto_provider.hkdfExpandLabel(hash, handshake_secret[0..n], "s hs traffic", hello_transcript_hash, server_handshake_traffic[0..n]);
-
-        return .{
-            .provider = crypto_provider,
-            .hash = hash,
-            .handshake_secret = handshake_secret,
-            .master_secret = master_secret,
-            .client_handshake_traffic = client_handshake_traffic,
-            .server_handshake_traffic = server_handshake_traffic,
-        };
+        try crypto_provider.hkdfExpandLabel(hash, out.handshake_secret[0..n], "s hs traffic", hello_transcript_hash, out.server_handshake_traffic[0..n]);
     }
 
     pub const ApplicationSecrets = struct {
@@ -265,19 +262,16 @@ pub const KeySchedule = struct {
         }
     };
 
-    pub fn applicationSecrets(self: *const KeySchedule, finished_transcript_hash: []const u8) Error!ApplicationSecrets {
+    /// Out-parameter style (#564 review): both secrets are derived directly
+    /// into `out.*`, never a pair of locals copied in by a by-value return.
+    pub fn applicationSecrets(self: *const KeySchedule, finished_transcript_hash: []const u8, out: *ApplicationSecrets) Error!void {
         const n = self.digestLen();
         if (finished_transcript_hash.len != n) return error.InvalidSecretLength;
 
-        var client: [max_digest_len]u8 = [_]u8{0} ** max_digest_len;
-        errdefer provider.secureZero(&client);
-        try self.provider.hkdfExpandLabel(self.hash, self.master_secret[0..n], "c ap traffic", finished_transcript_hash, client[0..n]);
-
-        var server: [max_digest_len]u8 = [_]u8{0} ** max_digest_len;
-        errdefer provider.secureZero(&server);
-        try self.provider.hkdfExpandLabel(self.hash, self.master_secret[0..n], "s ap traffic", finished_transcript_hash, server[0..n]);
-
-        return .{ .client = client, .server = server, .len = n };
+        out.* = .{ .len = n };
+        errdefer out.wipe();
+        try self.provider.hkdfExpandLabel(self.hash, self.master_secret[0..n], "c ap traffic", finished_transcript_hash, out.client[0..n]);
+        try self.provider.hkdfExpandLabel(self.hash, self.master_secret[0..n], "s ap traffic", finished_transcript_hash, out.server[0..n]);
     }
 
     pub fn resumptionMasterSecret(
