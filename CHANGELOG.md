@@ -710,7 +710,21 @@ All notable user-facing changes to Tardigrade are documented here.
   the free (fixed with one-hop alias resolution for both) and by
   `BoundedSecret.deinit`'s exact original regression reintroduced via a local
   rename that survives across its sibling `clearAll` method (fixed with a
-  dedicated, asset-specific structural check for that one type).
+  dedicated, asset-specific structural check for that one type). A third
+  round found the scanner still forward-only (missing the ordinary
+  `defer`-runs-LIFO idiom, where a free's `defer` written before a zero's
+  `defer` still executes after it — fixed by widening the scan to the whole
+  enclosing function), missing manual `@memset(buf, 0)` clears outside the
+  `secureZero` wrapper entirely (added, scoped to skip `test` blocks, which
+  zero-fill fixture data for reasons unrelated to secret hygiene in a way
+  indistinguishable from a real wipe), returning only the first buffer
+  rename instead of every one (a harmless first alias was shadowing the
+  actually-freed second), and blacklisting known-bad `BoundedSecret` frees
+  instead of positively requiring the canonical call (`allocator.rawFree`
+  bypassed the blacklist entirely, being the *correct* spelling inside
+  `secureZeroAndFree`'s own body). Widening the window also surfaced an
+  identifier-suffix false positive (`self.selected_client_psk.deinit()`
+  matching a candidate key `psk`), fixed with a token-boundary check.
 - **Native TLS listener now tolerates the RFC 8446 Appendix D.4
   middlebox-compatibility `change_cipher_spec` record (#369)** — the
   record layer required every post-ClientHello record's outer wire type

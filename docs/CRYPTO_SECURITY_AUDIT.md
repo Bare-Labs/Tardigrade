@@ -253,8 +253,8 @@ before the story closes:
 
 - **#554** — done. `scripts/audit_crypto_boundary.zig` (`zig build
   audit-crypto-boundary`, part of `zig build test`) now also guards the two
-  regression classes this story fixed. Went through two review rounds before
-  landing:
+  regression classes this story fixed. Went through three review rounds
+  before landing:
   - **First pass** found the initial version scanned only `src/tls`/
     `src/quic`/`src/pki` for raw `timing_safe` (missing `src/crypto`'s own
     non-implementation consumers, e.g. `rsa.zig`), used dot-suffixed needles
@@ -277,6 +277,29 @@ before the story closes:
     local rename, since the zeroing (`clearAll`) and the free (`deinit`) live
     in different, textually-out-of-order sibling methods no forward-only
     single-function scan can connect.
+  - **Third pass**, after fixing all of the above, found four more gaps: (a)
+    scanning only the text *after* the zero call misses the ordinary Zig
+    `defer` idiom, since defers run LIFO — a free's `defer` written textually
+    *before* a zero's `defer` still executes *after* it at runtime; (b) the
+    scanner recognized only `secureZero` (direct or aliased) as a "zero,"
+    missing a new ad hoc manual clear (`@memset(secret_buf, 0)`) entirely
+    outside the wrapper, which is itself explicitly part of #375's scope;
+    (c) `resolveBufferRenames` returned only the first alias of a buffer, so
+    a harmless first rename shadowed the actually-freed second rename; (d)
+    the `BoundedSecret` check blacklisted known-bad free spellings, so a
+    direct `allocator.rawFree(self.bytes, ...)` — bypassing
+    `secureZeroAndFree` (and its zeroing) entirely — matched no forbidden
+    substring and passed, since `rawFree` is also the *correct* spelling
+    inside `secureZeroAndFree`'s own implementation. Widening the scan
+    window to the whole enclosing function (fixing (a)) also surfaced a
+    latent false-positive risk the narrower window had been masking: a
+    candidate key that is merely a *suffix* of a longer identifier
+    (`self.selected_client_psk.deinit()` matching a candidate key `psk`) —
+    fixed with an identifier-boundary check — and `@memset`-based detection
+    specifically misfired on `test` blocks deliberately zero-filling
+    fixture data (indistinguishable, lexically, from a secret wipe), fixed
+    by scoping the `@memset` trigger to skip `test` blocks (the unambiguous
+    `secureZero` trigger still scans them in full).
 
   The merged version:
   - Matches the bare `timing_safe` token itself, independent of any
@@ -292,20 +315,28 @@ before the story closes:
     `timing_safe`.
   - A general zero-then-plain-free scanner, not a three-file/exact-variable-
     name list: it extracts the buffer expression every `secureZero(...)` call
-    (any qualifier, or a local callee alias of it, one hop) zeroes and looks
-    for that same expression — including through a
-    `std.mem.sliceAsBytes`/`&`/local-rename indirection (one hop), and the
-    `ArrayList`-style "zero `.items`, `.deinit()` the container" shape —
-    handed to an ordinary `allocator.free`/`.deinit()` within the rest of the
-    enclosing function, across `src/tls`, `src/quic`, `src/pki`, and
+    (any qualifier, a local callee alias of it, or a manual
+    `@memset(buf, 0)` clear) zeroes and looks for that same expression —
+    including through a `std.mem.sliceAsBytes`/`&`/local-rename indirection
+    (every matching rename, not just the first), and the `ArrayList`-style
+    "zero `.items`, `.deinit()` the container" shape — handed to an ordinary
+    `allocator.free`/`.deinit()` anywhere in the *whole* enclosing function
+    (not just the text after the zero call — `defer` runs LIFO, so a free's
+    own `defer` written textually before a zero's `defer` still executes
+    after it at runtime), across `src/tls`, `src/quic`, `src/pki`, and
     `src/crypto` (excluding `secrets.zig`'s own
     `secureZeroAndFree`/`secureZeroAndFreeAligned`, whose zero-then-`rawFree`
-    pairing *is* the canonical helper). Applying this generally — rather than
-    to the three files this story originally fixed — surfaced six more
-    genuine instances of the same defect this story's own inventory command
-    missed: `src/tls/identity_loader.zig` (`LoadedIdentity.deinit`,
-    `loadIdentity`'s `cert_raw`/`key_raw`/`key_der` cleanup,
-    `pemBlockToDerFrom`'s `compact`/`der` scratch), `src/tls/tls13_backend.zig`
+    pairing *is* the canonical helper). The `@memset` trigger specifically
+    skips `test` blocks: `@memset(_, 0)` cannot be told apart, lexically,
+    from deliberately zero-filling test fixture data, and pairing it with a
+    test's own ordinary cleanup is not the regression class this trigger
+    exists to catch — the unambiguous `secureZero` trigger still scans test
+    blocks in full. Applying this generally — rather than to the three files
+    this story originally fixed — surfaced six more genuine instances of the
+    same defect this story's own inventory command missed:
+    `src/tls/identity_loader.zig` (`LoadedIdentity.deinit`, `loadIdentity`'s
+    `cert_raw`/`key_raw`/`key_der` cleanup, `pemBlockToDerFrom`'s
+    `compact`/`der` scratch), `src/tls/tls13_backend.zig`
     (`PostHandshakeInput.deinit`/`.discard`, the `NewSessionTicket` message
     buffer `errdefer`), `src/tls/transport.zig` (`EventSink.freeOwnedPayloads`,
     `emitOwnedHandshakeBytesCopy`'s `errdefer`), `src/quic/connection.zig`
@@ -315,13 +346,19 @@ before the story closes:
     `.save`, all four `save*Cache`/`load*Cache` plaintext/sealed buffers, and
     every test helper following the same shape) — all fixed alongside the
     guard, routed through `secureZeroAndFree`/`secureZeroAndFreeAligned`.
-  - A dedicated structural check for `BoundedSecret.deinit` specifically: it
-    tracks only `self.bytes` (the one secret buffer that type owns), through
-    at most one local rename, across the type's *entire* struct body (every
-    method, not just one function) — narrow and asset-specific rather than a
-    generic "any zero + any free anywhere in the file" rule, which would
-    immediately misfire on this same file's own tests calling
-    `secret.deinit()` (the type's own, correct, public API, not a bypass).
+  - A dedicated *positive-requirement* check for `BoundedSecret.deinit`
+    specifically: rather than blacklisting known-bad free spellings (which
+    `allocator.rawFree(self.bytes, ...)` — bypassing `secureZeroAndFree`
+    entirely — proved unbounded against), it requires `deinit`'s body to
+    literally call `secureZeroAndFree(<allocator>, self.bytes)` (or a
+    resolved rename of `self.bytes`), searched across the type's *entire*
+    struct body so `clearAll`'s zeroing and `deinit`'s free are seen
+    together even though they're different, textually-out-of-order sibling
+    methods. Asset-specific (`self.bytes`, the one secret buffer this type
+    owns) rather than a generic "any zero + any free anywhere in the file"
+    rule, which would immediately misfire on this same file's own tests
+    calling `secret.deinit()` (the type's own, correct, public API, not a
+    bypass).
   - Still not a project-wide ban on the raw `std.crypto.secureZero` spelling
     on its own (a separate, narrower named-file check retained for
     `ticket_key_snapshot.zig`/`sni_provider.zig`/`secrets.zig`): many call

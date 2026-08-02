@@ -623,6 +623,7 @@ const declaration_boundaries = [_][]const u8{
     "\n    pub fn ", "\n    fn ",
     "\npub fn ",     "\nfn ",
     "\npub const ",  "\nconst ",
+    "\ntest ",
 };
 
 fn extractFunctionBody(contents: []const u8, function_name: []const u8) ?[]const u8 {
@@ -646,6 +647,25 @@ fn nextDeclarationBoundary(contents: []const u8, from: usize) usize {
         if (std.mem.indexOfPos(u8, contents, from, boundary)) |p| end = @min(end, p);
     }
     return end;
+}
+
+/// The nearest declaration boundary strictly before `from`, or `0` — the
+/// mirror of `nextDeclarationBoundary`, used to find where the *current*
+/// enclosing function/declaration starts, scanning backward from an
+/// arbitrary interior position (#554 review, third pass: `defer` runs LIFO,
+/// so a zero call declared textually *after* a `free`'s own `defer` still
+/// executes before it at runtime — a forward-only window from the zero call
+/// would never see that earlier `defer`).
+fn previousDeclarationBoundary(contents: []const u8, from: usize) usize {
+    var start: usize = 0;
+    for (declaration_boundaries) |boundary| {
+        if (std.mem.lastIndexOf(u8, contents[0..from], boundary)) |p| {
+            // `p` is the boundary's own position (starting at its leading
+            // `\n`); the declaration itself starts one byte later.
+            start = @max(start, p + 1);
+        }
+    }
+    return start;
 }
 
 /// Redacts every occurrence of `needle` in `buf` in place (same length, so
@@ -720,6 +740,32 @@ fn lastArgument(args: []const u8) []const u8 {
     return std.mem.trim(u8, args[start..], " \t\r\n");
 }
 
+/// The text before the first top-level comma in `args`, trimmed — the
+/// *first* positional argument. `@memset(dest, value)` names the buffer
+/// being cleared as its first argument, unlike `secureZero`'s single-buffer
+/// (or `std.crypto.secureZero(u8, buffer)`'s buffer-last) shape.
+fn firstArgument(args: []const u8) []const u8 {
+    var depth: i32 = 0;
+    for (args, 0..) |c, i| {
+        switch (c) {
+            '(', '[', '{' => depth += 1,
+            ')', ']', '}' => depth -= 1,
+            ',' => if (depth == 0) return std.mem.trim(u8, args[0..i], " \t\r\n"),
+            else => {},
+        }
+    }
+    return std.mem.trim(u8, args, " \t\r\n");
+}
+
+/// True for a literal-zero expression (`0`, `0x0`, `0x00`) — the narrow
+/// shape that makes `@memset(dest, <this>)` a manual zero-clear rather than
+/// an ordinary fill (`@memset(buf, 0xAA)` poison-filling a test buffer is
+/// not zeroization, and #554's own non-goals warn against treating every
+/// `@memset` as security-relevant).
+fn isZeroLiteral(text: []const u8) bool {
+    return std.mem.eql(u8, text, "0") or std.mem.eql(u8, text, "0x0") or std.mem.eql(u8, text, "0x00");
+}
+
 fn isIdentStart(c: u8) bool {
     return std.ascii.isAlphabetic(c) or c == '_';
 }
@@ -775,10 +821,17 @@ fn containsPlainFreeOf(window: []const u8, key: []const u8) bool {
     }
     search_from = 0;
     while (std.mem.indexOfPos(u8, window, search_from, key)) |p| {
+        search_from = p + 1;
+        // `key` must start a genuine identifier token here, not be a
+        // trailing suffix of a longer one (`self.selected_client_psk` must
+        // not match key `psk` just because it ends in "psk" immediately
+        // followed by `.deinit(` — #554 review, third pass surfaced this as
+        // a real false-positive risk once the scan window widened to the
+        // whole function).
+        if (p > 0 and isIdentCont(window[p - 1])) continue;
         const after = p + key.len;
         if (after + ".deinit(".len <= window.len and std.mem.eql(u8, window[after..][0..".deinit(".len], ".deinit(")) return true;
         if (after + ".free(".len <= window.len and std.mem.eql(u8, window[after..][0..".free(".len], ".free(")) return true;
-        search_from = p + 1;
     }
     return false;
 }
@@ -851,10 +904,21 @@ fn findSecureZeroAliases(contents: []const u8, out: *[max_aliases][]const u8) us
 /// one hop of "the buffer got a new local name" resolution (#554 review,
 /// second pass: `const doomed = secret_buf; allocator.free(doomed);` defeats
 /// a check keyed only on the zero call's own argument expression).
-fn resolveBufferRename(text: []const u8, key: []const u8) ?[]const u8 {
-    if (key.len == 0) return null;
+/// Every local rebinding `const NAME = <expr>;` in `text` whose right-hand
+/// side (trimmed, one leading `&` stripped) is exactly `key` — up to
+/// `out.len` matches, not just the first (#554 review, third pass: a
+/// harmless first alias preceding the actually-freed second alias shadowed
+/// the real one when only the first match was returned). Still one hop:
+/// each returned name is a rename of `key` itself, not of a rename of a
+/// rename — `scanZeroCalls`'s caller may re-invoke this on a returned name
+/// for a second hop if that becomes necessary, but no current bypass needs
+/// it.
+fn resolveBufferRenames(text: []const u8, key: []const u8, out: *[max_aliases][]const u8) usize {
+    var count: usize = 0;
+    if (key.len == 0) return count;
     var search_from: usize = 0;
-    while (std.mem.indexOfPos(u8, text, search_from, "const ")) |kw_pos| {
+    while (count < out.len) {
+        const kw_pos = std.mem.indexOfPos(u8, text, search_from, "const ") orelse break;
         search_from = kw_pos + 1;
         const after_kw = kw_pos + "const ".len;
         const eq_rel = std.mem.indexOfScalarPos(u8, text, after_kw, '=') orelse continue;
@@ -863,9 +927,12 @@ fn resolveBufferRename(text: []const u8, key: []const u8) ?[]const u8 {
         const semi_rel = std.mem.indexOfScalarPos(u8, text, eq_rel, ';') orelse continue;
         var rhs = std.mem.trim(u8, text[eq_rel + 1 .. semi_rel], " \t\r\n");
         if (rhs.len > 0 and rhs[0] == '&') rhs = std.mem.trim(u8, rhs[1..], " \t\r\n");
-        if (std.mem.eql(u8, rhs, key)) return name;
+        if (std.mem.eql(u8, rhs, key)) {
+            out[count] = name;
+            count += 1;
+        }
     }
-    return null;
+    return count;
 }
 
 /// The position of the next call `NAME(` in `contents` at or after `from` —
@@ -896,7 +963,21 @@ fn firstZeroThenPlainFree(contents: []const u8) ?[]const u8 {
     for (alias_buf[0..alias_count]) |alias| {
         if (scanZeroCalls(contents, alias)) |key| return key;
     }
+    // Manual zero-and-free / volatile-clear (#554 review, third pass): a
+    // clear implementation outside the canonical `secureZero` wrapper
+    // entirely, e.g. `@memset(secret_buf, 0)` followed by a plain free.
+    if (scanZeroCalls(contents, "@memset")) |key| return key;
     return null;
+}
+
+/// The buffer-expression argument for a given zero-call `trigger`: the last
+/// positional argument for `secureZero`/its aliases (`secureZero(buffer)`,
+/// or the raw two-argument `std.crypto.secureZero(u8, buffer)` — both
+/// reduce to the buffer this way), but the *first* argument for `@memset`
+/// (`@memset(dest, value)` — `dest` is the buffer being cleared).
+fn argForTrigger(trigger: []const u8, args: []const u8) []const u8 {
+    if (std.mem.eql(u8, trigger, "@memset")) return firstArgument(args);
+    return lastArgument(args);
 }
 
 fn scanZeroCalls(contents: []const u8, trigger: []const u8) ?[]const u8 {
@@ -905,16 +986,34 @@ fn scanZeroCalls(contents: []const u8, trigger: []const u8) ?[]const u8 {
         search_from = m + 1;
         const open_paren = m + trigger.len;
         const args = extractCallArgs(contents, open_paren) orelse continue;
-        const buf_expr = lastArgument(args);
-        const window_start = open_paren + args.len + 2; // past the matching ')'
-        if (window_start >= contents.len) continue;
-        const window_end = nextDeclarationBoundary(contents, window_start);
+        const call_end = open_paren + args.len + 2; // past the matching ')'
+        // The whole enclosing function/declaration, not just the text after
+        // the zero call: `defer` runs LIFO, so a free's own `defer` written
+        // textually *before* a zero call's `defer` still executes *after*
+        // it at runtime (#554 review, third pass) — a forward-only window
+        // would miss that free entirely.
+        const window_start = previousDeclarationBoundary(contents, m);
+        if (std.mem.eql(u8, trigger, "@memset")) {
+            if (!isZeroLiteral(lastArgument(args))) continue;
+            // `@memset(buf, 0)` alone cannot be told apart, lexically, from
+            // deliberately zero-filling test fixture data — `test` blocks
+            // do this constantly for reasons unrelated to secret hygiene,
+            // and pairing it with the test's own ordinary
+            // `defer allocator.free(buf)` is not the #375 regression class
+            // this trigger exists to catch. `secureZero`, unambiguous
+            // either way, still scans test blocks in full.
+            if (std.mem.startsWith(u8, contents[window_start..], "test ")) continue;
+        }
+        const buf_expr = argForTrigger(trigger, args);
+        const window_end = nextDeclarationBoundary(contents, call_end);
         const window = contents[window_start..window_end];
         var tokens = TokenIterator{ .text = buf_expr };
         while (tokens.next()) |key| {
             if (key.len < 2) continue;
             if (containsPlainFreeOf(window, key)) return key;
-            if (resolveBufferRename(window, key)) |renamed| {
+            var renames: [max_aliases][]const u8 = undefined;
+            const rename_count = resolveBufferRenames(window, key, &renames);
+            for (renames[0..rename_count]) |renamed| {
                 if (containsPlainFreeOf(window, renamed)) return renamed;
             }
             // The container-field fallback: `secureZero(out.items)` zeroes
@@ -1000,10 +1099,32 @@ fn isAllWhitespace(text: []const u8) bool {
 /// character right after `secureZero` in each is `A`, not the case-sensitive
 /// lowercase `f` `containsPlainFreeOf` looks for immediately after `free`),
 /// so no separate exemption is needed for the canonical call itself.
-fn boundedSecretFreesBytesPlainly(struct_body: []const u8) bool {
-    if (containsPlainFreeOf(struct_body, "self.bytes")) return true;
-    if (resolveBufferRename(struct_body, "self.bytes")) |renamed| {
-        if (containsPlainFreeOf(struct_body, renamed)) return true;
+/// True if `struct_body`'s `deinit` method positively calls
+/// `secureZeroAndFree(<allocator>, self.bytes)` (or a resolved one-hop
+/// rename of `self.bytes`) — the *only* authorized way to release
+/// `BoundedSecret`'s backing storage. #554 review (third pass): blacklisting
+/// known-bad free spellings is unbounded — `allocator.rawFree(self.bytes,
+/// ...)` releases the live, unwiped buffer directly, bypassing
+/// `secureZeroAndFree` entirely, without matching any forbidden substring
+/// (`containsPlainFreeOf` deliberately excludes `rawFree` — the
+/// case-sensitive capital `F` — because it's the correct spelling *inside*
+/// `secureZeroAndFree`'s own implementation). Positively requiring the
+/// canonical call instead means a violation is always "the call isn't
+/// there," not "a new bypass spelling wasn't on the blacklist."
+fn boundedSecretDeinitCallsCanonicalFree(struct_body: []const u8) bool {
+    const deinit_body = extractFunctionBody(struct_body, "deinit") orelse return false;
+    var search_from: usize = 0;
+    while (findNextCall(deinit_body, search_from, "secureZeroAndFree")) |m| {
+        search_from = m + 1;
+        const open_paren = m + "secureZeroAndFree".len;
+        const args = extractCallArgs(deinit_body, open_paren) orelse continue;
+        const buf_expr = lastArgument(args);
+        if (std.mem.eql(u8, buf_expr, "self.bytes")) return true;
+        var renames: [max_aliases][]const u8 = undefined;
+        const rename_count = resolveBufferRenames(deinit_body, "self.bytes", &renames);
+        for (renames[0..rename_count]) |renamed| {
+            if (std.mem.eql(u8, buf_expr, renamed)) return true;
+        }
     }
     return false;
 }
@@ -1029,10 +1150,10 @@ fn checkBoundedSecretFile(allocator: std.mem.Allocator, root: compat.DirCompat, 
         });
         return;
     };
-    if (boundedSecretFreesBytesPlainly(struct_body)) {
+    if (!boundedSecretDeinitCallsCanonicalFree(struct_body)) {
         try violations.append(allocator, .{
             .path = try allocator.dupe(u8, path),
-            .needle = "BoundedSecret frees self.bytes without secureZeroAndFree",
+            .needle = "BoundedSecret.deinit does not call secureZeroAndFree(allocator, self.bytes)",
             .rationale = rationale,
         });
     }
@@ -1429,7 +1550,7 @@ test "BoundedSecret.deinit reverting to clearAll + plain allocator.free trips th
 // *before* `clearAll` in the real file, so a forward-only scan starting from
 // `clearAll`'s zero call never reaches back into `deinit`.
 
-test "boundedSecretFreesBytesPlainly detects the exact historical regression via a local rename" {
+test "boundedSecretDeinitCallsCanonicalFree rejects the exact historical regression via a local rename" {
     const struct_body =
         \\const BoundedSecret = struct {
         \\    allocator: ?std.mem.Allocator = null,
@@ -1449,10 +1570,10 @@ test "boundedSecretFreesBytesPlainly detects the exact historical regression via
         \\    }
         \\};
     ;
-    try testing.expect(boundedSecretFreesBytesPlainly(struct_body));
+    try testing.expect(!boundedSecretDeinitCallsCanonicalFree(struct_body));
 }
 
-test "boundedSecretFreesBytesPlainly does not misfire on the correct secureZeroAndFree routing" {
+test "boundedSecretDeinitCallsCanonicalFree accepts the correct secureZeroAndFree routing" {
     const struct_body =
         \\const BoundedSecret = struct {
         \\    allocator: ?std.mem.Allocator = null,
@@ -1473,7 +1594,33 @@ test "boundedSecretFreesBytesPlainly does not misfire on the correct secureZeroA
         \\    }
         \\};
     ;
-    try testing.expect(!boundedSecretFreesBytesPlainly(struct_body));
+    try testing.expect(boundedSecretDeinitCallsCanonicalFree(struct_body));
+}
+
+test "boundedSecretDeinitCallsCanonicalFree rejects a direct rawFree bypassing secureZeroAndFree entirely" {
+    const struct_body =
+        \\const BoundedSecret = struct {
+        \\    allocator: ?std.mem.Allocator = null,
+        \\    bytes: []u8 = &.{},
+        \\    len: usize = 0,
+        \\
+        \\    pub fn deinit(self: *BoundedSecret) void {
+        \\        self.len = 0;
+        \\        const allocator = self.allocator orelse return;
+        \\        allocator.rawFree(
+        \\            self.bytes,
+        \\            .fromByteUnits(@alignOf(u8)),
+        \\            @returnAddress(),
+        \\        );
+        \\    }
+        \\
+        \\    fn clearAll(self: *BoundedSecret) void {
+        \\        secureZero(self.bytes);
+        \\        self.len = 0;
+        \\    }
+        \\};
+    ;
+    try testing.expect(!boundedSecretDeinitCallsCanonicalFree(struct_body));
 }
 
 test "extractContainerBody isolates one struct from a sibling declared right after it" {
@@ -1586,6 +1733,78 @@ test "firstZeroThenPlainFree does not misfire on an unrelated const binding shar
     try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
         "fn release(allocator: std.mem.Allocator, secret_buf: []u8, other: []u8) void {\n    crypto.secrets.secureZero(secret_buf);\n    const label = \"unrelated\";\n    _ = label;\n    allocator.free(other);\n}\n",
     ));
+}
+
+// #554 review (third pass): three more bypasses of the general scanner.
+
+test "firstZeroThenPlainFree sees a free whose own defer is written before the zero call's defer" {
+    // defer runs LIFO: the free's defer (declared first) actually executes
+    // *after* the zero's defer (declared second) at runtime, so this is the
+    // exact prohibited zero-then-plain-free sequence — but a forward-only
+    // scan starting from the zero call would never see the earlier defer.
+    try testing.expectEqualStrings("secret_buf", firstZeroThenPlainFree(
+        "fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    defer allocator.free(secret_buf);\n    defer crypto.secrets.secureZero(secret_buf);\n}\n",
+    ).?);
+}
+
+test "firstZeroThenPlainFree recognizes a manual @memset(buf, 0) clear, not just the secureZero wrapper" {
+    try testing.expectEqualStrings("secret_buf", firstZeroThenPlainFree(
+        "fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    @memset(secret_buf, 0);\n    allocator.free(secret_buf);\n}\n",
+    ).?);
+}
+
+test "firstZeroThenPlainFree ignores @memset with a non-zero fill value" {
+    // @memset(buf, 0xAA) is an ordinary poison/pattern fill, not a
+    // zero-clear — #375's own non-goals warn against treating every
+    // @memset as security-relevant.
+    try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
+        "fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    @memset(secret_buf, 0xAA);\n    allocator.free(secret_buf);\n}\n",
+    ));
+}
+
+test "firstZeroThenPlainFree ignores a test-block @memset(buf, 0) zero-filling ordinary fixture data" {
+    // @memset(_, 0) cannot be told apart, lexically, from deliberately
+    // zero-filling test fixture data — pairing it with the test's own
+    // ordinary defer-free is not the #375 regression class this trigger
+    // exists to catch. The bare secureZero trigger is unaffected and still
+    // scans test blocks in full (see the next test).
+    try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
+        "test \"some fixture behavior\" {\n    const buf = try testing.allocator.alloc(u8, 16);\n    defer testing.allocator.free(buf);\n    @memset(buf, 0);\n    buf[0] = 1;\n}\n",
+    ));
+}
+
+test "firstZeroThenPlainFree still catches a real secureZero-then-free bug inside a test block" {
+    try testing.expectEqualStrings("buf", firstZeroThenPlainFree(
+        "test \"some fixture behavior\" {\n    const buf = try testing.allocator.alloc(u8, 16);\n    defer testing.allocator.free(buf);\n    crypto.secrets.secureZero(buf);\n}\n",
+    ).?);
+}
+
+test "firstZeroThenPlainFree does not misfire on a longer identifier that merely ends with the same suffix" {
+    // `self.selected_client_psk.deinit()` must not match a candidate key
+    // `psk` just because it ends in "psk" immediately followed by
+    // `.deinit(` — #554 review, third pass, found this once the scan
+    // window widened to the whole function.
+    try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
+        "fn f(self: *Thing) void {\n    crypto.secrets.secureZero(std.mem.asBytes(&self.psk));\n    self.selected_client_psk.deinit();\n}\n",
+    ));
+}
+
+test "resolveBufferRenames follows the second alias when a harmless first alias precedes it" {
+    var out: [max_aliases][]const u8 = undefined;
+    const count = resolveBufferRenames(
+        "const retained_view = secret_buf;\n_ = retained_view;\nconst doomed = secret_buf;\nallocator.free(doomed);\n",
+        "secret_buf",
+        &out,
+    );
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqualStrings("retained_view", out[0]);
+    try testing.expectEqualStrings("doomed", out[1]);
+}
+
+test "firstZeroThenPlainFree follows a second alias past a harmless first one" {
+    try testing.expectEqualStrings("doomed", firstZeroThenPlainFree(
+        "fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    crypto.secrets.secureZero(secret_buf);\n    const retained_view = secret_buf;\n    _ = retained_view;\n    const doomed = secret_buf;\n    allocator.free(doomed);\n}\n",
+    ).?);
 }
 
 test "extractFunctionBody isolates a struct method from its WithProvider sibling and from the next method" {
@@ -1865,6 +2084,45 @@ const secrets_zig_deinit_rename_regression_fixture =
     \\
 ;
 
+/// `clean_secrets_zig_fixture` with `BoundedSecret.deinit` releasing
+/// `self.bytes` through a direct `rawFree` call — bypassing
+/// `secureZeroAndFree` (and its zeroing) entirely — instead of calling it
+/// (#554 review, third pass). Proves the positive-requirement check: a
+/// blacklist of known-bad free spellings would never have named `rawFree`,
+/// since it's the *correct* spelling inside `secureZeroAndFree`'s own body.
+const secrets_zig_deinit_rawfree_regression_fixture =
+    \\pub fn secureZero(buffer: []u8) void {
+    \\    std.crypto.secureZero(u8, buffer);
+    \\}
+    \\
+    \\pub fn secureZeroAndFree(allocator: std.mem.Allocator, buffer: []u8) void {
+    \\    secureZero(buffer);
+    \\    allocator.rawFree(buffer, .fromByteUnits(@alignOf(u8)), @returnAddress());
+    \\}
+    \\
+    \\pub const BoundedSecret = struct {
+    \\    allocator: ?std.mem.Allocator = null,
+    \\    bytes: []u8 = &.{},
+    \\    len: usize = 0,
+    \\
+    \\    pub fn deinit(self: *BoundedSecret) void {
+    \\        self.len = 0;
+    \\        const allocator = self.allocator orelse return;
+    \\        allocator.rawFree(
+    \\            self.bytes,
+    \\            .fromByteUnits(@alignOf(u8)),
+    \\            @returnAddress(),
+    \\        );
+    \\    }
+    \\
+    \\    fn clearAll(self: *BoundedSecret) void {
+    \\        secureZero(self.bytes);
+    \\        self.len = 0;
+    \\    }
+    \\};
+    \\
+;
+
 test "end-to-end: the audit fails against a fixture tree reproducing each bypass, and passes once fixed" {
     const allocator = testing.allocator;
 
@@ -2020,6 +2278,25 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
         // each, in a file this tool names nowhere.
         .{ .rel = "src/pki/callee_alias_zero_free_site.zig", .contents = "pub fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    const wipe = crypto.secrets.secureZero;\n    wipe(secret_buf);\n    allocator.free(secret_buf);\n}\n" },
         .{ .rel = "src/pki/buffer_rename_zero_free_site.zig", .contents = "pub fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    crypto.secrets.secureZero(secret_buf);\n    const doomed = secret_buf;\n    allocator.free(doomed);\n}\n" },
+
+        // #554 review (third pass): three more bypasses of the general
+        // scanner, plus one of the dedicated BoundedSecret check.
+        // The defer-LIFO bypass: the free's own defer is written *before*
+        // the zero's defer, but defers run LIFO, so the free still executes
+        // *after* the zero at runtime — the exact prohibited sequence, in a
+        // file this tool names nowhere.
+        .{ .rel = "src/quic/defer_order_zero_free_site.zig", .contents = "pub fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    defer allocator.free(secret_buf);\n    defer crypto.secrets.secureZero(secret_buf);\n}\n" },
+        // The manual-clear (not `secureZero` at all) bypass.
+        .{ .rel = "src/pki/manual_clear_zero_free_site.zig", .contents = "pub fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    @memset(secret_buf, 0);\n    allocator.free(secret_buf);\n}\n" },
+        // The chained-alias bypass: a harmless first rename must not shadow
+        // the actually-freed second rename.
+        .{ .rel = "src/crypto/rsa_chained_alias_zero_free_site.zig", .contents = "pub fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    crypto.secrets.secureZero(secret_buf);\n    const retained_view = secret_buf;\n    _ = retained_view;\n    const doomed = secret_buf;\n    allocator.free(doomed);\n}\n" },
+        // BoundedSecret.deinit releasing self.bytes through a direct
+        // rawFree call, bypassing secureZeroAndFree (and its zeroing)
+        // entirely — the blacklist-style check this replaced would never
+        // have named `rawFree`, since it's the *correct* spelling inside
+        // secureZeroAndFree's own implementation.
+        .{ .rel = "src/crypto/secrets.zig", .contents = secrets_zig_deinit_rawfree_regression_fixture },
     };
 
     for (bypass_cases) |case| {
@@ -2050,6 +2327,9 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
     try root.deleteFile("src/quic/new_ad_hoc_zero_free_site.zig");
     try root.deleteFile("src/pki/callee_alias_zero_free_site.zig");
     try root.deleteFile("src/pki/buffer_rename_zero_free_site.zig");
+    try root.deleteFile("src/quic/defer_order_zero_free_site.zig");
+    try root.deleteFile("src/pki/manual_clear_zero_free_site.zig");
+    try root.deleteFile("src/crypto/rsa_chained_alias_zero_free_site.zig");
 
     var clean_violations = try runAudit(allocator, root);
     defer clean_violations.deinit(allocator);
