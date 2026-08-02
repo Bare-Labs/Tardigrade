@@ -155,7 +155,7 @@ pub const SignAdapter = union(enum) {
 
     pub fn release(self: *SignAdapter) void {
         switch (self.*) {
-            .identity => |*adapter| std_crypto.secureZero(u8, std.mem.asBytes(&adapter.identity.key)),
+            .identity => |*adapter| crypto_provider.secureZero(std.mem.asBytes(&adapter.identity.key)),
             .external => |external| external.release(external.context),
             .signing_key => |adapter| switch (adapter.ownership) {
                 .borrowed, .invalid_release_contract => {},

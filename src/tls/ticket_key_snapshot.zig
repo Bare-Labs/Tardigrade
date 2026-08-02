@@ -26,7 +26,7 @@ const ZeroingAllocator = struct {
 
     fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *ZeroingAllocator = @ptrCast(@alignCast(ptr));
-        if (new_len < memory.len) std.crypto.secureZero(u8, memory[new_len..]);
+        if (new_len < memory.len) provider.secureZero(memory[new_len..]);
         return self.child.vtable.resize(self.child.ptr, memory, alignment, new_len, ret_addr);
     }
 
@@ -36,7 +36,7 @@ const ZeroingAllocator = struct {
 
     fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *ZeroingAllocator = @ptrCast(@alignCast(ptr));
-        std.crypto.secureZero(u8, memory);
+        provider.secureZero(memory);
         self.child.vtable.free(self.child.ptr, memory, alignment, ret_addr);
     }
 
@@ -79,7 +79,7 @@ pub const OwnedSnapshot = struct {
     key_storage: []KeyStorage,
 
     pub fn deinit(self: *OwnedSnapshot) void {
-        for (self.key_storage) |*storage| std.crypto.secureZero(u8, &storage.bytes);
+        for (self.key_storage) |*storage| provider.secureZero(&storage.bytes);
         self.allocator.free(self.key_storage);
         self.allocator.free(self.configs);
         self.* = undefined;
@@ -97,7 +97,7 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) LoadError!Ow
         else => return error.SnapshotUnreadable,
     };
     defer {
-        std.crypto.secureZero(u8, bytes);
+        provider.secureZero(bytes);
         allocator.free(bytes);
     }
     return parse(allocator, bytes);
@@ -130,7 +130,7 @@ pub fn reserveNonceLeasesInFile(allocator: std.mem.Allocator, path: []const u8, 
 
     var out = std.array_list.Managed(u8).init(allocator);
     defer {
-        std.crypto.secureZero(u8, out.items);
+        provider.secureZero(out.items);
         out.deinit();
     }
     try serialize(&out, snapshot);
@@ -215,7 +215,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) LoadError!OwnedSna
     errdefer allocator.free(configs);
     var key_storage = allocator.alloc(KeyStorage, keys.len) catch return error.OutOfMemory;
     errdefer {
-        for (key_storage) |*storage| std.crypto.secureZero(u8, &storage.bytes);
+        for (key_storage) |*storage| provider.secureZero(&storage.bytes);
         allocator.free(key_storage);
     }
     @memset(key_storage, .{});

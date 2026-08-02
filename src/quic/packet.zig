@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const varint = @import("quic_varint");
+const secrets = @import("crypto_secrets");
 
 /// Largest valid packet number (RFC 9000 §17.1: 2^62 - 1).
 pub const max_packet_number: u64 = (1 << 62) - 1;
@@ -320,7 +321,7 @@ pub fn verifyRetryIntegrity(retry_packet: []const u8, original_dcid: []const u8)
     const body_len = retry_packet.len - retry_integrity_tag_len;
     const expected = computeRetryIntegrityTag(original_dcid, retry_packet[0..body_len]) catch return false;
     const received = retry_packet[body_len..][0..retry_integrity_tag_len];
-    return std.crypto.timing_safe.eql([retry_integrity_tag_len]u8, expected, received.*);
+    return secrets.constantTimeEqual(&expected, received);
 }
 
 /// Write a complete QUIC v1 Retry packet (RFC 9000 §17.2.5): first byte, the

@@ -3,6 +3,7 @@
 const std = @import("std");
 const crypto = std.crypto;
 const ff = crypto.ff;
+const secrets = @import("crypto_secrets");
 
 const Sha256 = crypto.hash.sha2.Sha256;
 const max_modulus_bits = 4096;
@@ -135,7 +136,7 @@ fn verifyPss(em: []const u8, em_bits: usize, message: []const u8) Error!void {
     @memcpy(hash_input[8 + h_len ..], salt);
     var expected: [h_len]u8 = undefined;
     Sha256.hash(&hash_input, &expected, .{});
-    if (!crypto.timing_safe.eql([h_len]u8, expected, h_array)) return error.InvalidInput;
+    if (!secrets.constantTimeEqual(&expected, &h_array)) return error.InvalidInput;
 }
 
 /// Verify an RSA-PSS-RSAE-SHA256 signature.

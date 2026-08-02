@@ -1,0 +1,288 @@
+# Native crypto side-channel, secret-lifetime, and observability audit (#375)
+
+This is the checked-in audit matrix required by #375 (epic #327, research
+story 327-F). It covers constant-time comparison requirements, secret
+ownership/lifetime, zeroization on every exit path, timing/oracle behavior at
+protocol boundaries, and logging/diagnostic exposure for native TLS 1.3,
+QUIC, PKI, record protection, and ticket/resumption code.
+
+This document is a companion to, not a replacement for,
+`docs/CRYPTO_PROVIDER_AUDIT.md` (#490): that document answers "does this code
+call a concrete crypto primitive where it should call
+`crypto.provider.CryptoProvider` instead?"; this document answers "for every
+secret/authentication-derived value that exists once #490's architecture is
+in place, is it compared safely, owned by exactly one place, wiped on every
+exit, and never leaked through an observable side channel?" #490 closed
+before this audit started, so every row below is scoped against its final
+architecture, not the direct-`std.crypto` shortcuts it removed.
+
+Audited commit: `728f154cc5d347e579094400ce423e83aa4ffc9c` (main, the same
+commit PR #549 — the first #375 installment, secret-lifecycle cleanup paths
+— merged as). Toolchain: Zig `0.16.0` (matches `build.zig.zon`'s
+`.minimum_zig_version` and `docs/CRYPTO_PROVIDER.md`'s stated floor).
+
+Use `docs/SECURITY_REVIEW_CHECKLIST.md` for reviewing new changes against
+the rules this audit establishes; use this document to look up the current
+disposition of an existing module.
+
+## Methodology
+
+Inventory seed (repeated against the audited commit; every hit below was
+individually classified, not mechanically converted):
+
+```sh
+rg -n 'timing_safe|std\.mem\.(eql|order)|constantTimeEqual' src/crypto src/tls src/quic src/pki
+rg -n 'secureZero|@memset|volatile|rawFree' src/crypto src/tls src/quic src/pki
+rg -n '(key|secret|psk|binder|ticket|nonce|tag|token|private|scalar|fingerprint)' src/crypto src/tls src/quic src/pki
+rg -n '(log|debug|print|fmt|metrics|trace|observer|panic)' src/crypto src/tls src/quic src/pki
+```
+
+Every secret-bearing struct's `deinit`/replacement/retirement path was
+checked against the transitions #375 requires: successful completion,
+parse/decrypt/authentication failure, allocation failure,
+cancellation/teardown, replacement/reload, rotation/retirement, cache
+eviction, snapshot release, and provider/credential destruction.
+
+## Toolchain and platform assumptions
+
+- **Zig floor**: `0.16.0`. `docs/CRYPTO_PROVIDER.md` requires the floor and
+  every affected capability-matrix row to be updated together when this
+  changes; the same rule applies to any constant-time/zeroization claim in
+  this document.
+- **Zeroization** is a project-code guarantee, not a toolchain or OS one:
+  `crypto.secrets.secureZero` wraps `std.crypto.secureZero(u8, buffer)`.
+  `std.crypto.secureZero` uses a compiler-recognized volatile-style clear
+  intended to survive dead-store elimination; this project does not layer
+  any additional guarantee (no `mlock`, no core-dump suppression, no
+  explicit compiler-barrier intrinsic) on top of what `std.crypto.secureZero`
+  itself provides. `crypto.secrets.secureZeroAndFree` exists specifically
+  because plain `Allocator.free` is **not** sufficient on its own: safety
+  builds run `@memset(bytes, undefined)` *after* any zeroing already done
+  (re-poisoning the buffer, which trips allocator "was this zeroized"
+  assertions), and in `ReleaseFast` "undefined" carries no required bit
+  pattern, so the compiler is free to emit no write at all. Any code path
+  that zeroizes and then calls plain `allocator.free`/`.free()` instead of
+  `secureZeroAndFree` is not actually guaranteed to scrub the buffer in a
+  production build — see `src/tls/identity_loader.zig`'s doc comment for the
+  same reasoning, independently arrived at, on the loader's PEM/DER cleanup
+  path.
+- **Constant-time comparison**: `crypto.secrets.constantTimeEqual` /
+  `crypto.provider.constantTimeEqual` route through `std.crypto.timing_safe`
+  (see `src/crypto/secrets.zig`). This project relies on `std.crypto`'s own
+  documented constant-time behavior for its comparison and AEAD/signature
+  primitives; it does not independently verify constant-time behavior at the
+  instruction or microarchitectural level. Whether a given primitive's
+  constant-time property holds is therefore inherited from the Zig standard
+  library and, transitively, from the target's C/assembly codegen — it is
+  target- and optimizer-version-dependent in the same way upstream
+  `std.crypto` is, and this project makes no stronger claim.
+- **Residual side-channel risk**: cache-timing, branch-prediction, and other
+  microarchitectural side channels are explicitly out of scope (#375
+  non-goal: "proving arbitrary hardware is immune to microarchitectural side
+  channels"). The controlled-appliance hardware profile (#391) may narrow
+  the practically relevant threat model (fixed, operator-controlled
+  hardware and co-tenancy assumptions) but this document makes no claim that
+  it eliminates microarchitectural leakage — only that software-level
+  timing/lookup dependence on secret data is what this audit's "constant
+  time" language refers to.
+- RSA-PSS, Ed25519, ECDSA-P256, X25519, and the AEAD/HKDF primitives used
+  under the provider boundary are the pure-Zig `std.crypto`-backed
+  implementation (`src/crypto/pure_zig.zig`) per #490; the approved OpenSSL
+  production backend is future work and has no code to audit here yet.
+
+## Audit matrix
+
+Status values: `compliant` (already correct, no change), `fixed-in-375`
+(this story changed it), `public-no-ct-required` (classified public/
+attacker-controlled, ordinary comparison is correct), `follow-up`
+(deferred, tracked by a linked issue).
+
+### TLS handshake secrets
+
+| module / function | value | classification | operation | attacker observable? | owner / lifetime | cleanup paths | required treatment | status | rationale |
+|---|---|---|---|---|---|---|---|---|---|
+| `src/tls/pre_shared_key.zig:verifyBinderFromTranscriptHash` | computed PSK binder vs. wire `candidate_binder` | secret-derived (HMAC output over transcript hash + PSK) | compare | remotely observable (peer controls `candidate_binder` and the transcript that shapes the computed side) | `computed` is a stack buffer local to the call; wiped by `defer crypto.secureZero(u8, out)` before every return, including the early length-mismatch return | wiped on every exit (success, mismatch, length mismatch) | CT compare after ordinary public-length check | fixed-in-375 | Was a direct `crypto.timing_safe.eql` per fixed-length branch (32/48); now routes through `provider.constantTimeEqual` after the same public length check (RFC 8446 §4.2.11.2 fixes binder length to the hash digest length, so the length check itself is public). Wipe coverage was already correct and is unchanged. |
+| `src/tls/pre_shared_key.zig:deriveBinderFromTranscriptHash` (both sha256/sha384 branches) | `psk_fixed`, `early_secret`, `binder_key`, `finished_key`, `mac` intermediates | secret / secret-derived | derive (HKDF-Extract/Expand, HMAC) | not directly observable (never returned whole) | stack-local to the function | `defer crypto.secureZero(...)` on every intermediate, unconditionally | wipe on every exit | compliant | Pre-existing; unaffected by this story's changes. |
+| `src/tls/tls13_backend.zig:onServerFinished` | computed `expected` verify_data vs. wire Finished `body` | secret-derived (HMAC-based Finished value per RFC 8446 §4.4.4) | compare | remotely observable | `expected` is a local `[hash_len]u8`; `defer crypto.secureZero(u8, &expected)` covers every exit | wiped on every exit | CT compare after ordinary length check (`body.len != hash_len`) | fixed-in-375 | Was `crypto.timing_safe.eql([hash_len]u8, expected, body[0..hash_len].*)`; now `crypto_pkg.provider.constantTimeEqual(&expected, body[0..hash_len])`. Wipe coverage unchanged, already correct. |
+| `src/tls/tls13_backend.zig:onClientFinished` | computed `expected` verify_data vs. wire Finished `body` | secret-derived | compare | remotely observable | same shape as `onServerFinished` | wiped on every exit | CT compare after ordinary length check | fixed-in-375 | Same fix, client side. |
+| `src/tls/key_schedule.zig` | HKDF-Extract/Expand-Label outputs (early/handshake/master/resumption/PSK secrets, traffic keys, Finished `verify_data` derivation) | secret / secret-derived | derive | not directly observable | provider-owned per #490; `KeySchedule` holds derived secrets, `errdefer`/`defer` armed before the fallible provider call fills the buffer | wipe via `provider.secureZero` on every exit, including a fault-provider partial write (covered by `key_schedule_tests.zig`'s fault-provider fixture) | N/A (no raw comparison here; see #490 for the provider-boundary story) | compliant | Out of #375's direct-fix scope — #490 already completed this migration and its error-cleanup-ordering hardening. Re-audited here and found correct: no raw `std.crypto` HKDF calls remain, cleanup is armed before the fallible call, not after. |
+| `src/crypto/rsa.zig` (PSS verification, final hash comparison) | computed `expected` EMSA-PSS hash vs. `h_array` from the encoded message | secret-derived in the sense that this is the authentication decision, though both operands are computed from public signature/message bytes — the *decision* (accept/reject) is what must not leak via timing, not the operand values themselves | compare | remotely observable (signature verification result gates authentication) | both `expected` and `h_array` are stack-local `[h_len]u8`, not retained | no retention, nothing to wipe beyond normal stack reuse | CT compare | fixed-in-375 | Was `crypto.timing_safe.eql([h_len]u8, expected, h_array)`; now `secrets.constantTimeEqual(&expected, &h_array)`. |
+| `src/crypto/rsa.zig` (EMSA-PSS structural checks: `em[em.len-1] != 0xbc`, `db_len` bound, unused-bit mask, `masked_db[0]` high-bit check, `PS` zero-padding loop, `db[ps_len] != 1`) | encoded message structure, DB padding | attacker-controlled / public (the signature/message encoding itself, not a secret) | branch / early-reject | remotely observable, but over attacker-supplied structural data, not secret material | N/A | N/A | ordinary branch — explicitly **not** flattened to constant time | public-no-ct-required | #375 explicitly instructs against mechanically converting structural/format validation over attacker-controlled encodings; only the final authentication comparison (above) requires CT treatment. Early-rejecting a malformed signature encoding faster than a well-formed-but-wrong one is a standard, accepted PSS verifier property (RFC 8017 does not require these structural checks to be constant-time, and no PSK/ticket-style decryption oracle exists downstream of an RSA-PSS verification failure — see #490's `tls13_backend.zig` mapping of both malformed-signature and wrong-signature to the single `.invalid_signature`/`decrypt_error` outcome, so the *result* returned to the peer is uniform even though internal rejection speed is not). |
+| `src/tls/credentials.zig` (`Identity.sign` / `SigningKey` opaque handle) | private scalar / seed | secret | sign, store | not observable (never leaves the opaque handle) | `crypto_pkg.secrets.FixedSecret(32)` for the ECDSA scalar; `defer crypto.secureZero(u8, &scalar)` wipes the raw scalar immediately after wrapping it; `FixedCredentialProvider.deinit` wipes `identity.key` | wiped on init failure, and on `deinit` | N/A (opaque signing, no raw comparison) | compliant | Per #490, private-key bytes never cross into the TLS state machine; signing goes through `provider.SigningKey`. Re-audited for #375 and found the raw-scalar-to-`FixedSecret` handoff wipes the transient plaintext copy. |
+
+### QUIC
+
+| module / function | value | classification | operation | attacker observable? | owner / lifetime | cleanup paths | required treatment | status | rationale |
+|---|---|---|---|---|---|---|---|---|---|
+| `src/quic/packet.zig:verifyRetryIntegrity` | computed Retry integrity tag vs. wire tag | authentication result over public RFC-fixed key/nonce — the tag values themselves are not secret (the AEAD key is a public constant from RFC 9001 §5.8), but the comparison gates whether a received Retry packet is accepted, i.e. input-validation-sensitive | compare | remotely observable — this is the live production call site (`src/quic/connection.zig:2000`, client-side Retry acceptance) | `expected`/`received` are stack-local, not retained | N/A (no secret retention; the AEAD key/nonce are fixed public constants, not connection-specific secrets) | CT compare (hygiene: treat the accept/reject decision as timing-sensitive input validation even though the key material is public) | fixed-in-375 | Was `std.crypto.timing_safe.eql([retry_integrity_tag_len]u8, expected, received.*)`; now `secrets.constantTimeEqual(&expected, received)`. This is the disposition #375 names explicitly: "document that fixed RFC Retry key/nonce constants are public while the authentication result remains timing-sensitive input validation." |
+| `src/quic/path.zig:verifyRetryIntegrity` / `retryIntegrityTag` | same RFC 9001 §5.8 construction, independent second implementation | same as above | compare | **not** reachable from production — no production caller exists; the only caller is this file's own `"retry integrity tag matches the RFC 9001 Appendix A.4 vector"` unit test | N/A | N/A | CT compare (hygiene, matches the live implementation's treatment even though unreachable) | fixed-in-375, follow-up | Migrated to `secrets.constantTimeEqual` for consistency with `packet.zig`'s live copy. The duplication itself (two same-named, argument-order-reversed functions implementing the same RFC construction in sibling files, only one of which is production-reachable) is a real hygiene gap this audit surfaces but does not resolve — tracked as #555. |
+| `src/quic/path.zig:validatePathResponse` (PATH_CHALLENGE/PATH_RESPONSE) | locally-generated unpredictable challenge value vs. peer-echoed response | secret-derived in effect: an unpredictable, locally-chosen anti-spoofing nonce (RFC 9000 §8.2) whose correct-guess probability is the entire security property being enforced; not "secret" in the key-material sense, but its comparison functions as authentication of path ownership | compare | remotely observable (an off-path or blind attacker could, in principle, use timing to improve a guessing strategy across repeated PATH_RESPONSE attempts) | `candidate.challenge` is owned by the `PathCandidate` entry in `PathManager.paths`, cleared implicitly when the slot is reused/promoted (no long-lived retention beyond the validation window) | N/A beyond normal candidate-slot reuse; the challenge is not secret material requiring wipe-on-teardown (it is discarded, not retained as a credential) | CT compare (hygiene — the call site already used `timing_safe.eql`, so #375 only routes it through the canonical helper rather than newly introducing CT treatment where none existed) | fixed-in-375 | Was `std.crypto.timing_safe.eql([path_challenge_len]u8, candidate.challenge, data)`; now `secrets.constantTimeEqual(&candidate.challenge, &data)`. Not named explicitly in #375's "known concrete review targets" list, but caught by the issue's own inventory command (`rg 'timing_safe|...' src/quic`) and migrated for the same reason `packet.zig`'s Retry check was: the call was already constant-time, this is a canonical-helper consistency fix, not a new CT requirement being introduced over a value #375's "do not mechanically convert" warning would otherwise protect. |
+| `src/quic/path.zig:RetryTokenKeyRing` (`install`/`retire`/`deinit`) | address-validation token AEAD keys | secret | store, retire, replace | not observable | `secrets.FixedSecret(token_key_len)` per slot | `install` → `FixedSecret.replace` wipes the old slot's tail before reuse; `retire`/`deinit` → `FixedSecret.deinit` wipes | wipe on install (replace), retire, and deinit | compliant | Fixed by PR #549 (the first #375 installment, merged as `728f154c`). Re-verified here: no `?[N]u8`-wrapped optional payload (which safety builds could poison-fill, defeating a"was this wiped" assertion — see the type's own doc comment), tracked by `.len` instead. |
+| `src/quic/cid.zig:LocalCidRegistry` | stateless-reset derivation key (`reset_token_key`); per-entry stateless reset tokens | derivation key: secret; per-entry tokens: authentication/security-sensitive (locally-derived, used to prove "this reset came from us" if a peer ever needs to recognize it) | store, derive, retire | derivation key: not observable; per-entry tokens: sent to the peer as part of `NewConnectionIdFrame`/transport-parameter reset tokens, so they are intentionally peer-visible once issued — what must not leak is the *derivation key* they came from | `reset_token_key: secrets.FixedSecret(32)`, registry-lifetime; per-entry `stateless_reset_token: [16]u8` inside each `Entry`, entry-lifetime | `deinit` wipes the derivation key and every still-occupied entry's token; `retire` wipes the retired entry's token immediately | wipe on retire and deinit | compliant | Fixed by PR #549. Re-verified: `statelessResetTokenInto`'s intermediate HMAC buffer is also wiped (`defer secrets.secureZero(&mac)`). |
+| `src/quic/cid.zig:PeerCidPool.onNewConnectionId` (`std.mem.eql(u8, &token, &frame.stateless_reset_token)`) | previously-stored vs. newly-framed stateless reset token, for the *peer's* connection IDs | public/protocol bookkeeping — this detects an exact-duplicate `NEW_CONNECTION_ID` frame retransmission for the same sequence number, not stateless-reset authentication; the peer already sent us this exact token once, we are only checking it matches on retransmit | compare | remotely observable, but the comparison result only affects idempotent frame-processing (accept/reject a retransmit as a duplicate), not an authentication decision | N/A | N/A | ordinary compare — explicitly **not** CT | public-no-ct-required | #375 explicitly warns against CT-converting CID/token comparisons "merely because they are adjacent to secret material." This is peer-echoed data compared for protocol bookkeeping, not a value this endpoint derived from its own secret; it is the mirror case of the `LocalCidRegistry` row above, not the same value. |
+| `src/tls/ticket_protection.zig` / `RetryTokenKeyRing` / `LocalCidRegistry` production callers (`http3_runtime.zig`, `connection.zig`) | — | — | — | — | — | full teardown paths added by PR #549: `Connection` deinit now deinitializes the local CID registry and wipes stateless-reset key material | wipe on connection teardown | N/A | compliant | Confirms #549 closed the "QUIC connection teardown must deinitialize local CID registry and wipe stateless reset key material" gap #375 named explicitly. |
+
+### Ticket protection and resumption
+
+| module / function | value | classification | operation | attacker observable? | owner / lifetime | cleanup paths | required treatment | status | rationale |
+|---|---|---|---|---|---|---|---|---|---|
+| `src/tls/ticket_protection.zig:validateReplacementLocked` (`entry.key_fingerprint` vs. `key_fingerprint`, both occurrences) | SHA-256-based fingerprint of a configured ticket AEAD key, used to detect duplicate key material on reload | secret-derived (deterministic function of secret key bytes) | compare | local/configuration path (reload-time), not peer-triggered, but #375 explicitly treats this as secret-dependent control flow regardless of remote observability | `key_fingerprint` is a stack-local `defer secrets.secureZero(&key_fingerprint)`-wiped buffer; `entry.key_fingerprint` lives in the ledger, wiped on deinit | wiped on every fingerprint-computation exit and on ledger-entry teardown | CT compare | compliant | Already used `secrets.constantTimeEqual` before this story; no change needed. #375 names this exact site ("Ticket protection: secret-derived fingerprints") as a required-disposition target, and it was already compliant, presumably from earlier #372/#490-adjacent hardening. |
+| `src/tls/ticket_protection.zig` (`prior.key.eql(&key.key)`, duplicate-key-in-one-batch check) | configured ticket AEAD key equality (raw key bytes, not fingerprint) | secret | compare | local/configuration path | `key.key` is a `secrets.FixedSecret`; `.eql` is `FixedSecret.eql`, which calls `constantTimeEqual` internally | N/A (comparison only) | CT compare | compliant | #375 names "ordinary equality on raw configured key bytes" as a required audit target; the actual comparison already goes through `FixedSecret.eql` (constant-time), not raw `std.mem.eql`. |
+| `src/tls/ticket_protection.zig:zeroAndFree` | ticket plaintext / key buffers | secret | free | N/A | delegates to `secrets.secureZeroAndFree` | wipe-then-free in one call | canonical helper, no custom primitive | compliant | #375 names "ad hoc zero-and-free" as a required audit target; the function already delegates entirely to the canonical helper — it is a one-line named wrapper for call-site clarity, not a reimplementation. |
+| `src/tls/ticket_key_snapshot.zig` (`ZeroingAllocator.resize`/`.free`, `OwnedSnapshot.deinit`, `loadFromFile`, `reserveNonceLeasesInFile`'s serialize buffer, `parse`'s `errdefer`) | raw snapshot file bytes, JSON-parser scratch allocations, decoded AEAD key storage, re-serialized plaintext buffer | secret (raw ticket-protection keys) and secret-adjacent (any buffer that held them during decode/encode, including transient JSON parser allocations) | wipe-then-free | not observable (local file I/O) | `key_storage: []KeyStorage` owned by `OwnedSnapshot`; every JSON-parser allocation routed through a purpose-built `ZeroingAllocator` so *any* freed/resized parse-scratch buffer is wiped regardless of which JSON value it backed | wiped on `OwnedSnapshot.deinit`, on `parse`'s `errdefer` (partial `key_storage` on a later field failing), on `loadFromFile`'s raw-bytes `defer`, and on the reload path's re-serialization buffer | canonical helper | fixed-in-375 | The zeroization coverage itself was already complete and correct (six call sites, every exit path covered) — #375 found no missing wipe here. What #375 fixed is that all six sites called `std.crypto.secureZero(u8, ...)` directly instead of the canonical `crypto.provider.secureZero`/`crypto.secrets.secureZero` wrapper this project's own convention requires; migrated all six for consistency with the rest of the codebase (functionally identical — `secureZero` is a one-line wrapper — so this is pure hygiene, not a behavior change). |
+| `src/tls/sni_provider.zig:SignAdapter.release` (`.identity` branch) | `Identity.key` (private scalar/seed wrapper) | secret | wipe on release | not observable | released once per `SignAdapter`, called from `releaseConfiguredSigners` and `CredentialBundle.deinit` | wipe on release | canonical helper | fixed-in-375 | Was `std_crypto.secureZero(u8, ...)` (a locally aliased `std.crypto`, not the canonical wrapper); now `crypto_provider.secureZero(...)`. Same hygiene class as the `ticket_key_snapshot.zig` fixes above. |
+| `src/tls/ticket_protection.zig:Protector.resolve` / `resolveInner` | ticket AEAD key, decrypted plaintext, `ResolveRejectReason` classification | secret (key, plaintext) / non-secret-bearing closed enum (rejection reason) | lookup, decrypt, classify | see "Resumption and ticket oracle review" below | key/plaintext scoped to the resolve call; `ResolveRejectReason` is a stack value passed only to the local `Observer` | plaintext/key buffers wiped via `zeroAndFree/secureZero` on every resolve exit | oracle-uniform external result; rich classification kept strictly local | compliant | See the dedicated oracle-review section below for the full failure-class enumeration and the one documented, spec-required asymmetry. |
+| `src/tls/session_cache.zig` (`ClientSessionCache`/`StatefulServerCache` `deinit` family; `secrets.constantTimeEqual(&e.handle, &key)` bearer-handle confirmation) | session ticket/PSK bearer handles, persisted entries, resumption state | secret / secret-derived | store, compare, retire | handle-confirmation compare: this endpoint holds the bearer secret and is confirming a caller-supplied one against it, not accepting peer input directly at this layer | entries owned by the cache, `PersistedClientEntry`/`PersistedServerEntry`/`ServerLease`/`ResolveLeaseResult` each wipe their own state in `deinit` | wiped on every listed `deinit`, and explicitly via `secrets.secureZero(std.mem.asBytes(entry))` at the persistence boundary | CT compare for the bearer-handle confirmation; canonical wipe helpers elsewhere | compliant | Already using `secrets.constantTimeEqual`; no change. Included here as an audited, not merely assumed-fine, row per #375's resumption/ticket scope list. |
+| `src/tls/appliance_credentials.zig` (`secrets.constantTimeEqual(&leaf_public, &derived_public)`) | leaf certificate's public key vs. the public key derived from the provisioned private-key seed | secret-derived in effect (confirms the private key actually corresponds to the certificate; a mismatch here is a misconfiguration-detection gate, not peer-facing, but the comparison still guards a security property) | compare | local (startup/reload-time credential validation, not peer-triggered) | both operands are stack-local at validation time | N/A (both are public-key bytes, not secret scalars — the *scalar* itself is wiped separately via `FixedSecret`/`BoundedSecret`, see below) | CT compare (defense in depth per the module's own comment) | compliant | Already compliant; included for completeness since #375's scope map names `appliance_credentials.zig` explicitly. `loadPrivateKey`'s intermediate `BoundedSecret`/`FixedSecret` buffers (PEM/base64/DER scratch, PKCS#8 body, extracted seed) are wiped on every path per the module's own "every intermediate secret buffer is wiped on all paths" comment, re-verified here. |
+| `src/tls/identity_loader.zig:LoadedIdentity.deinit` and buffer-decode helpers | PEM/base64/DER-decode scratch, retained `key_der`, `Identity.key` | secret (private key material) / public (`cert_raw`, `cert_der` — certificate bytes are not secret) | wipe on deinit / decode-failure | not observable | scratch buffers scoped to the decode call; `key_der`/`identity.key` owned by `LoadedIdentity` | `secrets.secureZero`/`secureZeroAndFree` on every decode exit (success and failure) and on `deinit`; certificate bytes are correctly left un-wiped (public) | canonical helper for key material only | compliant | Fixed by PR #549 ("route TLS identity-loader key-material cleanup through canonical secret helpers"); re-verified for #375, including that the module correctly does *not* wipe certificate bytes (they are public DER, not secret, and wiping them would be a wasted operation, not a bug). |
+
+### Resumption and ticket oracle review
+
+Per #375's required review of the #360–#365 surfaces (PSK binder
+verification, selected identity handling, RMS/PSKs, ticket key
+lookup/rotation/decryption, cache/session identity comparisons, stateless
+ticket resolver normalization, replacement/retirement/eviction cleanup):
+
+- `ticket_protection.Protector.resolveInner` computes a specific
+  `ResolveRejectReason` for every distinct peer-controlled failure class
+  named by #375: malformed envelope, unsupported version, unsupported AEAD,
+  unknown key ID, future key, retired key, authentication failure, invalid
+  plaintext, not-yet-valid, and expired. This classification is real and
+  detailed — but it is only ever handed to the local `Observer` (a
+  closed, non-secret-bearing enum consumed for operator metrics), never
+  returned to the caller. `Protector.resolve`'s public signature collapses
+  every one of those causes to `ResolveError!bool`.
+- `ServerPskResolverAdapter.resolve` (the PSK-binder-facing consumer)
+  collapses this further to a `.hit`/`.miss` result. `pre_shared_key.zig`
+  documents `.miss` explicitly as covering "malformed, unknown, retired,
+  expired, or otherwise unusable" identities uniformly — i.e. the resolver
+  boundary #375 asks about ("does public key-ID lookup alone ever mark an
+  identity selected, or leak detailed peer-visible failure behavior beyond
+  the uniform miss contract?") is already answering "no" by construction: a
+  key-ID lookup miss and a decrypt/authentication failure both surface as
+  the same `.miss`.
+- **One deliberate, spec-required asymmetry exists** and is worth stating
+  explicitly rather than leaving implicit: once a PSK identity's binder
+  fails verification (as opposed to the identity simply not resolving),
+  `tls13_backend.zig` aborts the handshake immediately with a fatal error
+  rather than falling back to probe a later offered identity (`onServerHello`
+  path, `error.DecryptError` on binder mismatch). An unresolved (`.miss`)
+  identity, by contrast, causes the offer-processing loop to continue to the
+  next offered identity. This is RFC 8446 §4.2.11.2's required behavior
+  ("if any check fails, the server MUST abort the handshake") and #362's
+  existing "selected-binder failure remains fatal, never probes a later
+  identity" contract — #375 asks explicitly to verify this remains true, and
+  it does. It is peer-observable differential behavior between "no PSK of
+  mine matched" and "a PSK of mine matched but the binder was wrong," which
+  is unavoidable and specification-mandated, not a resolver-boundary leak:
+  the peer already knows which identities it offered, so this reveals
+  nothing beyond "the server's identity selection landed on one of them,"
+  not which one or why the binder failed.
+- No decrypted ticket plaintext, PSK, binder, key, or tag is ever compared
+  with a raw `std.mem.eql`/`std.mem.order` anywhere in the ticket/resumption
+  code path audited here — every such comparison found routes through
+  `secrets.constantTimeEqual` (see the matrix rows above).
+
+## Representative public comparisons intentionally left ordinary
+
+So a future reviewer does not infer from the rows above that all
+`std.mem.eql` is forbidden project-wide:
+
+| Location | Value | Why ordinary comparison is correct |
+|---|---|---|
+| `src/quic/cid.zig:PeerCidPool.onNewConnectionId` | peer-echoed stateless-reset token, exact-retransmit detection | Protocol bookkeeping over peer-echoed data, not an authentication decision (see matrix row above). |
+| `src/crypto/rsa.zig` EMSA-PSS structural checks | signature/message encoding shape | Attacker-controlled structural data, not secret; RFC 8017 does not require constant-time structural rejection, and downstream authentication results are uniform regardless of which structural check failed. |
+| TLS/QUIC algorithm, cipher, group, and signature-scheme selection throughout `src/tls/negotiation.zig`, `src/tls/policy.zig`, `src/tls/algorithms.zig` | negotiated identifiers | Public protocol values by design; RFC 8446/9000 negotiation is not confidential. |
+| `src/tls/hello_retry.zig` HRR fixed random value | the RFC 8446 §4.1.3 constant | A fixed public constant, not connection-specific secret material. |
+| Certificate/public-key DER encodings throughout `src/pki/` | X.509 bytes | Public by definition; only the final chain-signature *verification* result requires provider-routed, capability-checked treatment (see `docs/CRYPTO_PROVIDER_AUDIT.md`). |
+| IP addresses and connection IDs throughout `src/quic/` | routing/path identifiers | Public protocol identifiers (#375 explicitly warns against CT-converting these). |
+| `src/tls/ticket_protection.zig` public ticket key IDs used for lookup | key ID bytes | Used only as a routing index into the key ring; #375's own text: "Public key-ID lookup may branch on public data." |
+
+## Observability
+
+No production `std.log`/`std.debug.print`/`std.fmt`-based diagnostic in
+`src/crypto`, `src/tls`, `src/quic`, or `src/pki` formats private keys,
+traffic secrets, RMS/PSKs/binder keys, ticket encryption keys, decrypted
+session state, raw session tickets, or secret-derived fingerprints. This is
+enforced structurally, not just by convention, in the highest-risk types:
+
+- `crypto.secrets.FixedSecret`/`BoundedSecret` `format()` methods
+  `@compileError` unconditionally (`src/crypto/secrets.zig`).
+- `pure_zig.SoftwareSigningKey`/`SoftwareEcdsaP256SigningKey`,
+  `credentials.Identity`, and `ticket_protection`'s key-record and snapshot
+  types carry the same non-formatting guarantee.
+- Observer/event-sink seams (`ticket_protection.Event`,
+  `session_cache`'s `CacheEvent`, `early_data_replay`'s observer) are closed
+  enums documented as carrying only non-secret classification data — never a
+  fingerprint, ticket, or key — even for local diagnostics.
+
+The one `std.debug.print` call found in a file this audit covers
+(`pre_shared_key.zig`) is inside a test-only fuzz corpus helper printing an
+integer truncation index, not secret material.
+
+## Provider/ownership boundary
+
+No new direct `std.crypto` keyed-crypto call was introduced by this story
+outside what `docs/CRYPTO_PROVIDER_AUDIT.md` already allowlists; the fixes
+in this document are comparison/zeroization *helper routing* changes within
+files #490 already classified, not new crypto call sites. `zig build
+audit-crypto-boundary` (part of `zig build test`) passes against every
+change in this story.
+
+## Deferred findings and follow-ups
+
+Per #375's requirement that every deferred finding have a tracking issue
+before the story closes:
+
+- **#554** — extend `scripts/audit_crypto_boundary.zig` (or a companion
+  checked-in guard) to prevent regression of the raw-`timing_safe`/ad-hoc-
+  zeroization findings this story fixed. Not done in this story because
+  building a precise allowlist (distinguishing the public comparisons in
+  the table above from the secret-derived ones this story migrated) is
+  itself a small architecture/tooling project, not a local fix, and #375's
+  own non-goals warn against a mechanical "convert everything" guard.
+- **#555** — consolidate the duplicate RFC 9001 §5.8 Retry-integrity-tag
+  implementations in `src/quic/packet.zig` (production) and `src/quic/path.zig`
+  (unreachable, KAT-fixture-only). Both copies were fixed for constant-time
+  hygiene by this story, but the duplication itself — which is exactly the
+  shape of gap that let this story's first pass miss the production copy
+  while fixing the unreachable one — is a larger structural cleanup better
+  scoped as its own focused change.
+
+No other finding in this audit required a larger redesign, package-
+architecture change, persistent data-format migration, or protocol/state-
+machine change; every other gap identified was fixed directly in this
+story (see `status: fixed-in-375` rows above) or was already compliant.
+
+## Regression tests
+
+The six constant-time-helper migrations and the zeroization-helper-routing
+migration are refactors of already-correct behavior (the prior code already
+used `std.crypto.timing_safe.eql`/`std.crypto.secureZero`; this story
+changes *which* wrapper is called, not the comparison/zeroization semantics
+themselves), so the existing test suites already exercise both the accept
+and reject paths for every touched comparison:
+
+- `src/tls/pre_shared_key.zig`: `"resumption binder derivation matches an
+  independently computed SHA-256/384 binder"`, `"verifyBinder rejects a
+  wrong-length candidate without erroring"`, HRR binder tests.
+- `src/tls/tls13_backend*_tests.zig`: full handshake integration tests drive
+  both Finished paths on every successful handshake; tamper/mismatch
+  coverage exists at the transport layer.
+- `src/quic/packet.zig`: `"writeRetryV1 roundtrips..."`,
+  `"...rejects a tampered token"`, the RFC 9001 Appendix A.4 vector test.
+- `src/quic/path.zig`: the full `retry token ...` test group, `"a wrong
+  PATH_RESPONSE payload does not validate the path"`.
+- `src/crypto/rsa.zig`: `"RSA-PSS rejects short, long, and out-of-range
+  signatures"`, `"EMSA-PSS rejects every nonzero PS byte and structural
+  corruption"`.
+- `src/crypto/secrets.zig` / `src/crypto/provider.zig`: the canonical
+  helper's own equal/unequal/length-mismatch battery
+  (`"secret helpers expose non-formatting APIs"`,
+  `"constantTimeEqual matches semantic equality"`).
+- `src/tls/ticket_key_snapshot.zig`: the existing parse/reject/fuzz tests
+  exercise every zeroization call site touched by the wrapper-routing fix.
+
+`zig build test` (2977 tests, 1 pre-existing skip unrelated to this story)
+and `zig build audit-crypto-boundary` both pass against every change in
+this document.
