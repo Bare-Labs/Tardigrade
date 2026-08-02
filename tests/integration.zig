@@ -1492,83 +1492,97 @@ fn rawTcpThreadMain(server: *RawTcpServer) void {
 
 fn handleUpstreamConnection(server: *UpstreamServer, conn: compat.NetConnection) !void {
     defer conn.stream.close();
-    const req = try readHttpMessage(server.allocator, conn.stream, 1024 * 1024);
-    defer server.allocator.free(req.raw);
-    if (req.request_line.len == 0) return;
+    while (!server.stop_flag.load(.seq_cst)) {
+        const req = readHttpMessage(server.allocator, conn.stream, 1024 * 1024) catch |err| switch (err) {
+            error.InvalidHttpMessage => return,
+            else => return err,
+        };
+        defer server.allocator.free(req.raw);
+        if (req.request_line.len == 0) return;
 
-    server.mutex.lock();
-    defer server.mutex.unlock();
-    try server.capture.record(req);
+        const response_spec = blk: {
+            server.mutex.lock();
+            defer server.mutex.unlock();
+            try server.capture.record(req);
 
-    const response_spec = if (server.responses.len == 0)
-        UpstreamResponseSpec{
-            .status_code = 200,
-            .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-            .body = "{\"ok\":true}",
+            break :blk if (server.responses.len == 0)
+                UpstreamResponseSpec{
+                    .status_code = 200,
+                    .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+                    .body = "{\"ok\":true}",
+                }
+            else blk_response: {
+                const idx = if (server.next_response_index < server.responses.len) server.next_response_index else server.responses.len - 1;
+                if (server.next_response_index < server.responses.len) server.next_response_index += 1;
+                break :blk_response server.responses[idx];
+            };
+        };
+
+        if (response_spec.delay_ms > 0) {
+            compat.sleepNs(@as(u64, response_spec.delay_ms) * std.time.ns_per_ms);
         }
-    else blk: {
-        const idx = if (server.next_response_index < server.responses.len) server.next_response_index else server.responses.len - 1;
-        if (server.next_response_index < server.responses.len) server.next_response_index += 1;
-        break :blk server.responses[idx];
-    };
 
-    if (response_spec.delay_ms > 0) {
-        compat.sleepNs(@as(u64, response_spec.delay_ms) * std.time.ns_per_ms);
-    }
+        const reason = switch (response_spec.status_code) {
+            200 => "OK",
+            201 => "Created",
+            202 => "Accepted",
+            302 => "Found",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            502 => "Bad Gateway",
+            503 => "Service Unavailable",
+            504 => "Gateway Timeout",
+            else => "OK",
+        };
 
-    const reason = switch (response_spec.status_code) {
-        200 => "OK",
-        201 => "Created",
-        202 => "Accepted",
-        302 => "Found",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        else => "OK",
-    };
+        try conn.stream.writer().print("HTTP/1.1 {d} {s}\r\n", .{
+            response_spec.status_code,
+            reason,
+        });
+        if (response_spec.chunked) {
+            try conn.stream.writer().writeAll("Transfer-Encoding: chunked\r\n");
+        } else {
+            try conn.stream.writer().print("Content-Length: {d}\r\n", .{if (response_spec.omit_body) 0 else response_spec.body.len});
+        }
+        try conn.stream.writer().print("Connection: {s}\r\n", .{
+            response_spec.connection_header,
+        });
+        for (response_spec.headers) |header| {
+            try conn.stream.writer().print("{s}: {s}\r\n", .{ header.name, header.value });
+        }
+        try conn.stream.writer().writeAll("\r\n");
+        if (!response_spec.omit_body) {
+            const body_to_write = if (response_spec.truncate_body_after) |limit|
+                response_spec.body[0..@min(limit, response_spec.body.len)]
+            else
+                response_spec.body;
+            if (response_spec.chunked) {
+                const split = @min(body_to_write.len, @max(@as(usize, 1), body_to_write.len / 2));
+                if (split > 0) {
+                    try conn.stream.writer().print("{x}\r\n", .{split});
+                    try conn.stream.writer().writeAll(body_to_write[0..split]);
+                    try conn.stream.writer().writeAll("\r\n");
+                }
+                if (split < body_to_write.len) {
+                    try conn.stream.writer().print("{x}\r\n", .{body_to_write.len - split});
+                    try conn.stream.writer().writeAll(body_to_write[split..]);
+                    try conn.stream.writer().writeAll("\r\n");
+                }
+                if (response_spec.truncate_body_after == null) {
+                    try conn.stream.writer().writeAll("0\r\n\r\n");
+                }
+            } else {
+                try conn.stream.writer().writeAll(body_to_write);
+            }
+        }
 
-    try conn.stream.writer().print("HTTP/1.1 {d} {s}\r\n", .{
-        response_spec.status_code,
-        reason,
-    });
-    if (response_spec.chunked) {
-        try conn.stream.writer().writeAll("Transfer-Encoding: chunked\r\n");
-    } else {
-        try conn.stream.writer().print("Content-Length: {d}\r\n", .{if (response_spec.omit_body) 0 else response_spec.body.len});
-    }
-    try conn.stream.writer().print("Connection: {s}\r\n", .{
-        response_spec.connection_header,
-    });
-    for (response_spec.headers) |header| {
-        try conn.stream.writer().print("{s}: {s}\r\n", .{ header.name, header.value });
-    }
-    try conn.stream.writer().writeAll("\r\n");
-    if (response_spec.omit_body) return;
-    const body_to_write = if (response_spec.truncate_body_after) |limit|
-        response_spec.body[0..@min(limit, response_spec.body.len)]
-    else
-        response_spec.body;
-    if (response_spec.chunked) {
-        const split = @min(body_to_write.len, @max(@as(usize, 1), body_to_write.len / 2));
-        if (split > 0) {
-            try conn.stream.writer().print("{x}\r\n", .{split});
-            try conn.stream.writer().writeAll(body_to_write[0..split]);
-            try conn.stream.writer().writeAll("\r\n");
+        if (headerHasToken(req.headers_raw, "Connection", "close") or
+            std.ascii.eqlIgnoreCase(response_spec.connection_header, "close"))
+        {
+            return;
         }
-        if (split < body_to_write.len) {
-            try conn.stream.writer().print("{x}\r\n", .{body_to_write.len - split});
-            try conn.stream.writer().writeAll(body_to_write[split..]);
-            try conn.stream.writer().writeAll("\r\n");
-        }
-        if (response_spec.truncate_body_after == null) {
-            try conn.stream.writer().writeAll("0\r\n\r\n");
-        }
-    } else {
-        try conn.stream.writer().writeAll(body_to_write);
     }
 }
 
@@ -1891,6 +1905,15 @@ fn headerValue(headers_raw: []const u8, name: []const u8) ?[]const u8 {
         return std.mem.trim(u8, line[sep + 1 ..], " \t");
     }
     return null;
+}
+
+fn headerHasToken(headers_raw: []const u8, name: []const u8, token: []const u8) bool {
+    const value = headerValue(headers_raw, name) orelse return false;
+    var parts = std.mem.splitScalar(u8, value, ',');
+    while (parts.next()) |part| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, part, " \t"), token)) return true;
+    }
+    return false;
 }
 
 fn countHeaderOccurrences(headers_raw: []const u8, name: []const u8) usize {
@@ -11352,6 +11375,45 @@ test "proxy requests strip hop-by-hop headers before reaching upstreams" {
     try std.testing.expect(upstream.capturedHeader("X-Another-Hop") == null);
     try std.testing.expectEqualStrings("integration-client/1.0", upstream.capturedHeader("User-Agent").?);
     try std.testing.expectEqualStrings("still-here", upstream.capturedHeader("X-Custom-Pass").?);
+}
+
+test "upstream fixture serves multiple requests on one keep-alive connection" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "fixture-first", .connection_header = "keep-alive" },
+        .{ .body = "fixture-second", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    var stream = try compat.tcpConnectToHost(allocator, test_host, upstream.port());
+    defer stream.close();
+    try setStreamTimeouts(&stream, 5_000);
+
+    try stream.writeAll(
+        "GET /first HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Connection: keep-alive\r\n\r\n",
+    );
+    var first = try readHttpResponse(allocator, stream);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+    try assertContains(first.body, "fixture-first");
+    try std.testing.expect(headerHasToken(first.headers_raw, "Connection", "keep-alive"));
+
+    try stream.writeAll(
+        "GET /second HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Connection: close\r\n\r\n",
+    );
+    var second = try readHttpResponse(allocator, stream);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 200), second.status_code);
+    try assertContains(second.body, "fixture-second");
+
+    try waitForUpstreamCount(&upstream, 2, 2_000);
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
 }
 
 test "proxy evicts stale pooled upstream connection after backend restart" {
