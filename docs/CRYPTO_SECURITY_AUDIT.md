@@ -61,11 +61,27 @@ eviction, snapshot release, and provider/credential destruction.
   (re-poisoning the buffer, which trips allocator "was this zeroized"
   assertions), and in `ReleaseFast` "undefined" carries no required bit
   pattern, so the compiler is free to emit no write at all. Any code path
-  that zeroizes and then calls plain `allocator.free`/`.free()` instead of
-  `secureZeroAndFree` is not actually guaranteed to scrub the buffer in a
-  production build — see `src/tls/identity_loader.zig`'s doc comment for the
-  same reasoning, independently arrived at, on the loader's PEM/DER cleanup
-  path.
+  that zeroizes and then calls plain `allocator.free`/`.free()` (or, for an
+  `ArrayList`, `.deinit()`) instead of `secureZeroAndFree` is not actually
+  guaranteed to scrub the buffer in a production build — see
+  `src/tls/identity_loader.zig`'s doc comment for the same reasoning,
+  independently arrived at, on the loader's PEM/DER cleanup path. This audit
+  found and fixed four more instances of exactly that pattern in
+  `src/tls/ticket_key_snapshot.zig` (`OwnedSnapshot.deinit`, `loadFromFile`,
+  `reserveNonceLeasesInFile`'s serialize buffer, `parse`'s `key_storage`
+  `errdefer` — see the ticket-protection row below) and one in
+  `crypto.secrets.BoundedSecret.deinit` itself, the shared bounded-secret
+  container `appliance_credentials.zig`/`identity_loader.zig` build their
+  own PEM/DER/PKCS#8 scratch cleanup on top of — `deinit` called `clearAll()`
+  (a real, volatile zero) followed by plain `allocator.free(self.bytes)`,
+  so every caller of the shared primitive inherited the same gap even
+  though each individually looked correct at the call site. Fixed to route
+  through `secureZeroAndFree`. `secureZeroAndFreeAligned(T, allocator, buf)`
+  was added alongside these fixes: `secureZeroAndFree` hardcodes
+  `alignOf(u8)` when calling `rawFree`, which is safe only for a `[]u8` (or
+  a same-alignment byte-cast of a wider type); a typed secret-bearing slice
+  whose element alignment differs must go through the generic form instead,
+  so `rawFree` receives the same alignment `alloc` originally did.
 - **Constant-time comparison**: `crypto.secrets.constantTimeEqual` /
   `crypto.provider.constantTimeEqual` route through `std.crypto.timing_safe`
   (see `src/crypto/secrets.zig`). This project relies on `std.crypto`'s own
@@ -129,7 +145,7 @@ attacker-controlled, ordinary comparison is correct), `follow-up`
 | `src/tls/ticket_protection.zig:validateReplacementLocked` (`entry.key_fingerprint` vs. `key_fingerprint`, both occurrences) | SHA-256-based fingerprint of a configured ticket AEAD key, used to detect duplicate key material on reload | secret-derived (deterministic function of secret key bytes) | compare | local/configuration path (reload-time), not peer-triggered, but #375 explicitly treats this as secret-dependent control flow regardless of remote observability | `key_fingerprint` is a stack-local `defer secrets.secureZero(&key_fingerprint)`-wiped buffer; `entry.key_fingerprint` lives in the ledger, wiped on deinit | wiped on every fingerprint-computation exit and on ledger-entry teardown | CT compare | compliant | Already used `secrets.constantTimeEqual` before this story; no change needed. #375 names this exact site ("Ticket protection: secret-derived fingerprints") as a required-disposition target, and it was already compliant, presumably from earlier #372/#490-adjacent hardening. |
 | `src/tls/ticket_protection.zig` (`prior.key.eql(&key.key)`, duplicate-key-in-one-batch check) | configured ticket AEAD key equality (raw key bytes, not fingerprint) | secret | compare | local/configuration path | `key.key` is a `secrets.FixedSecret`; `.eql` is `FixedSecret.eql`, which calls `constantTimeEqual` internally | N/A (comparison only) | CT compare | compliant | #375 names "ordinary equality on raw configured key bytes" as a required audit target; the actual comparison already goes through `FixedSecret.eql` (constant-time), not raw `std.mem.eql`. |
 | `src/tls/ticket_protection.zig:zeroAndFree` | ticket plaintext / key buffers | secret | free | N/A | delegates to `secrets.secureZeroAndFree` | wipe-then-free in one call | canonical helper, no custom primitive | compliant | #375 names "ad hoc zero-and-free" as a required audit target; the function already delegates entirely to the canonical helper — it is a one-line named wrapper for call-site clarity, not a reimplementation. |
-| `src/tls/ticket_key_snapshot.zig` (`ZeroingAllocator.resize`/`.free`, `OwnedSnapshot.deinit`, `loadFromFile`, `reserveNonceLeasesInFile`'s serialize buffer, `parse`'s `errdefer`) | raw snapshot file bytes, JSON-parser scratch allocations, decoded AEAD key storage, re-serialized plaintext buffer | secret (raw ticket-protection keys) and secret-adjacent (any buffer that held them during decode/encode, including transient JSON parser allocations) | wipe-then-free | not observable (local file I/O) | `key_storage: []KeyStorage` owned by `OwnedSnapshot`; every JSON-parser allocation routed through a purpose-built `ZeroingAllocator` so *any* freed/resized parse-scratch buffer is wiped regardless of which JSON value it backed | wiped on `OwnedSnapshot.deinit`, on `parse`'s `errdefer` (partial `key_storage` on a later field failing), on `loadFromFile`'s raw-bytes `defer`, and on the reload path's re-serialization buffer | canonical helper | fixed-in-375 | The zeroization coverage itself was already complete and correct (six call sites, every exit path covered) — #375 found no missing wipe here. What #375 fixed is that all six sites called `std.crypto.secureZero(u8, ...)` directly instead of the canonical `crypto.provider.secureZero`/`crypto.secrets.secureZero` wrapper this project's own convention requires; migrated all six for consistency with the rest of the codebase (functionally identical — `secureZero` is a one-line wrapper — so this is pure hygiene, not a behavior change). |
+| `src/tls/ticket_key_snapshot.zig` (`ZeroingAllocator.resize`/`.free`, `OwnedSnapshot.deinit`, `loadFromFile`, `reserveNonceLeasesInFile`'s serialize buffer, `parse`'s `key_storage` `errdefer`) | raw snapshot file bytes, JSON-parser scratch allocations, decoded AEAD key storage, re-serialized plaintext buffer | secret (raw ticket-protection keys) and secret-adjacent (any buffer that held them during decode/encode, including transient JSON parser allocations) | wipe-then-free | not observable (local file I/O) | `key_storage: []KeyStorage` owned by `OwnedSnapshot`; every JSON-parser allocation routed through a purpose-built `ZeroingAllocator` so *any* freed/resized parse-scratch buffer is wiped regardless of which JSON value it backed | wiped on `OwnedSnapshot.deinit`, on `parse`'s `errdefer` (partial `key_storage` on a later field failing), on `loadFromFile`'s raw-bytes `defer`, and on the reload path's re-serialization buffer | canonical helper, freed through `rawFree` | fixed-in-375 | An earlier pass of this audit incorrectly marked this row `fixed-in-375` for only migrating the four listed sites from `std.crypto.secureZero`/`std_crypto` to the canonical `secureZero` wrapper, while `OwnedSnapshot.deinit`, `loadFromFile`, `reserveNonceLeasesInFile`'s serialize buffer, and `parse`'s `key_storage` `errdefer` still handed the zeroed buffer to ordinary `Allocator.free`/`ArrayList.deinit` afterward — exactly the pattern this document's own toolchain-assumptions section says is insufficient (`Allocator.free`'s `@memset(bytes, undefined)` can re-poison the buffer in safety builds, or the compiler may elide it entirely in `ReleaseFast`, so the backing allocator was never guaranteed to observe zero). Re-reviewed and corrected: all four now route through `secrets.secureZeroAndFree` (`loadFromFile`'s raw bytes, the serialize buffer via its full `allocatedSlice()`, matching the exact region handed to `rawFree`) or the new `secrets.secureZeroAndFreeAligned` (`OwnedSnapshot.deinit` and `parse`'s `key_storage` `errdefer` — `secureZeroAndFree` hardcodes `alignOf(u8)`, which understates the alignment contract for a typed `[]KeyStorage` even though `KeyStorage`'s own alignment happens to coincide with `u8`'s). `ZeroingAllocator.resize`/`.free` were already correct: they call the child allocator's vtable function pointer directly, which is the raw-free path, not the poisoning `Allocator.free` wrapper. `crypto.secrets.BoundedSecret.deinit` had the identical zero-then-ordinary-free defect and is fixed alongside these; see its own row below. |
 | `src/tls/sni_provider.zig:SignAdapter.release` (`.identity` branch) | `Identity.key` (private scalar/seed wrapper) | secret | wipe on release | not observable | released once per `SignAdapter`, called from `releaseConfiguredSigners` and `CredentialBundle.deinit` | wipe on release | canonical helper | fixed-in-375 | Was `std_crypto.secureZero(u8, ...)` (a locally aliased `std.crypto`, not the canonical wrapper); now `crypto_provider.secureZero(...)`. Same hygiene class as the `ticket_key_snapshot.zig` fixes above. |
 | `src/tls/ticket_protection.zig:Protector.resolve` / `resolveInner` | ticket AEAD key, decrypted plaintext, `ResolveRejectReason` classification | secret (key, plaintext) / non-secret-bearing closed enum (rejection reason) | lookup, decrypt, classify | see "Resumption and ticket oracle review" below | key/plaintext scoped to the resolve call; `ResolveRejectReason` is a stack value passed only to the local `Observer` | plaintext/key buffers wiped via `zeroAndFree/secureZero` on every resolve exit | oracle-uniform external result; rich classification kept strictly local | compliant | See the dedicated oracle-review section below for the full failure-class enumeration and the one documented, spec-required asymmetry. |
 | `src/tls/session_cache.zig` (`ClientSessionCache`/`StatefulServerCache` `deinit` family; `secrets.constantTimeEqual(&e.handle, &key)` bearer-handle confirmation) | session ticket/PSK bearer handles, persisted entries, resumption state | secret / secret-derived | store, compare, retire | handle-confirmation compare: this endpoint holds the bearer secret and is confirming a caller-supplied one against it, not accepting peer input directly at this layer | entries owned by the cache, `PersistedClientEntry`/`PersistedServerEntry`/`ServerLease`/`ResolveLeaseResult` each wipe their own state in `deinit` | wiped on every listed `deinit`, and explicitly via `secrets.secureZero(std.mem.asBytes(entry))` at the persistence boundary | CT compare for the bearer-handle confirmation; canonical wipe helpers elsewhere | compliant | Already using `secrets.constantTimeEqual`; no change. Included here as an audited, not merely assumed-fine, row per #375's resumption/ticket scope list. |
@@ -283,6 +299,26 @@ and reject paths for every touched comparison:
 - `src/tls/ticket_key_snapshot.zig`: the existing parse/reject/fuzz tests
   exercise every zeroization call site touched by the wrapper-routing fix.
 
-`zig build test` (2977 tests, 1 pre-existing skip unrelated to this story)
+The zero-then-raw-free correction (`OwnedSnapshot.deinit`, `loadFromFile`,
+`reserveNonceLeasesInFile`'s serialize buffer, `parse`'s `key_storage`
+`errdefer`, and `BoundedSecret.deinit`) is a real behavior change — from a
+buffer the backing allocator was not guaranteed to observe as zero, to one
+it is — so it gets allocator-observable regression coverage rather than
+relying on existing accept/reject tests that never inspected freed memory:
+
+- `src/crypto/secrets.zig`: `"secureZeroAndFreeAligned hands the allocator
+  zeroed bytes for a wider-than-u8-aligned element"`,
+  `"secureZeroAndFreeAligned tolerates an empty buffer"`, `"bounded secret
+  deinit hands the allocator zeroed bytes, not Allocator.free's
+  undefined-poison"` — each drives a `FixedBufferAllocator` so the freed
+  bytes are directly inspectable, the way `"secureZeroAndFree hands the
+  allocator zeroed bytes..."` already did for the plain `[]u8` case.
+- `src/tls/ticket_key_snapshot.zig`: `"OwnedSnapshot.deinit hands the
+  allocator zeroed key bytes, not Allocator.free's undefined-poison"` runs
+  the real `parse`/`deinit` pair against a `FixedBufferAllocator`, captures
+  the decoded key bytes before `deinit`, and asserts that exact byte
+  pattern is absent anywhere in the shared backing buffer afterward.
+
+`zig build test` (2980 tests, 1 pre-existing skip unrelated to this story)
 and `zig build audit-crypto-boundary` both pass against every change in
 this document.

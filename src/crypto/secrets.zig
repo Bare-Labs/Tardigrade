@@ -30,10 +30,25 @@ pub fn constantTimeEqual(a: []const u8, b: []const u8) bool {
 /// actually guaranteed to scrub secrets in a production build. Bypassing the
 /// wrapper and calling `rawFree` directly ensures the zeroed bytes are what
 /// the allocator (and anything that reuses the memory next) actually sees.
+///
+/// This is the `[]u8` special case of `secureZeroAndFreeAligned`; use that
+/// directly for a typed slice whose element alignment may exceed `u8`.
 pub fn secureZeroAndFree(allocator: std.mem.Allocator, buffer: []u8) void {
+    secureZeroAndFreeAligned(u8, allocator, buffer);
+}
+
+/// Generic form of `secureZeroAndFree` for a secret-bearing `[]T` whose
+/// element alignment may be stricter than `u8`. Passing a byte-cast view of
+/// such a slice to `secureZeroAndFree` would call `rawFree` with
+/// `alignOf(u8)`, understating the alignment the backing allocator was
+/// originally told to use for this allocation — some allocators rely on
+/// `free`/`rawFree` receiving the same alignment `alloc` received to locate
+/// or validate the allocation's bookkeeping.
+pub fn secureZeroAndFreeAligned(comptime T: type, allocator: std.mem.Allocator, buffer: []T) void {
     if (buffer.len == 0) return;
-    secureZero(buffer);
-    allocator.rawFree(buffer, .fromByteUnits(@alignOf(u8)), @returnAddress());
+    const bytes = std.mem.sliceAsBytes(buffer);
+    secureZero(bytes);
+    allocator.rawFree(bytes, .fromByteUnits(@alignOf(T)), @returnAddress());
 }
 
 pub fn FixedSecret(comptime capacity: usize) type {
@@ -136,12 +151,16 @@ pub const BoundedSecret = struct {
     }
 
     pub fn deinit(self: *BoundedSecret) void {
-        self.clearAll();
+        self.len = 0;
         const allocator = self.allocator orelse return;
-        allocator.free(self.bytes);
+        // `secureZeroAndFree`, not `clearAll()` + ordinary `allocator.free`:
+        // the latter hands the allocator a zeroed-then-poisoned (or, in
+        // ReleaseFast, possibly never-actually-zeroed) buffer instead of one
+        // it can observe as genuinely zero. See `secureZeroAndFree`'s doc
+        // comment for why `Allocator.free` on its own is not sufficient here.
+        secureZeroAndFree(allocator, self.bytes);
         self.allocator = null;
         self.bytes = self.bytes[0..0];
-        self.len = 0;
     }
 
     fn clear(self: *BoundedSecret) void {
@@ -259,6 +278,18 @@ test "bounded secret replace handles self-overlapping input" {
     try testing.expectEqual(@as(u8, 0), secret.bytes[3]);
 }
 
+test "bounded secret deinit hands the allocator zeroed bytes, not Allocator.free's undefined-poison" {
+    var backing = [_]u8{0xcc} ** 64;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var secret = BoundedSecret{};
+    try secret.init(fba.allocator(), 32, &([_]u8{0xab} ** 16));
+
+    secret.deinit();
+
+    try testing.expect(std.mem.indexOfScalar(u8, &backing, 0xab) == null);
+    for (backing[0..32]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
 test "secureZeroAndFree hands the allocator zeroed bytes, not Allocator.free's undefined-poison" {
     var backing = [_]u8{0xcc} ** 64;
     var fba = std.heap.FixedBufferAllocator.init(&backing);
@@ -277,6 +308,24 @@ test "secureZeroAndFree tolerates an empty buffer" {
     var backing = [_]u8{0xcc} ** 8;
     var fba = std.heap.FixedBufferAllocator.init(&backing);
     secureZeroAndFree(fba.allocator(), &.{});
+}
+
+test "secureZeroAndFreeAligned hands the allocator zeroed bytes for a wider-than-u8-aligned element" {
+    var backing: [64]u8 align(8) = [_]u8{0xcc} ** 64;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const buf = try fba.allocator().alloc(u64, 4);
+    @memset(buf, 0xabab_abab_abab_abab);
+
+    secureZeroAndFreeAligned(u64, fba.allocator(), buf);
+
+    try testing.expect(std.mem.indexOfScalar(u8, &backing, 0xab) == null);
+    for (backing[0..32]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "secureZeroAndFreeAligned tolerates an empty buffer" {
+    var backing = [_]u8{0xcc} ** 8;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    secureZeroAndFreeAligned(u64, fba.allocator(), &.{});
 }
 
 test "secret helpers expose non-formatting APIs" {

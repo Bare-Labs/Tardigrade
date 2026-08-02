@@ -79,8 +79,14 @@ pub const OwnedSnapshot = struct {
     key_storage: []KeyStorage,
 
     pub fn deinit(self: *OwnedSnapshot) void {
-        for (self.key_storage) |*storage| provider.secureZero(&storage.bytes);
-        self.allocator.free(self.key_storage);
+        // `secureZeroAndFreeAligned`, not a zero loop followed by ordinary
+        // `allocator.free`: the latter hands the backing allocator a buffer
+        // `Allocator.free`'s own `@memset(bytes, undefined)` may re-poison
+        // (safety builds) or never actually clear (ReleaseFast), rather than
+        // one it observes as genuinely zero. `configs` holds no secret bytes
+        // of its own — `key_bytes` is a view into `key_storage` — so it is
+        // freed ordinarily.
+        crypto.secrets.secureZeroAndFreeAligned(KeyStorage, self.allocator, self.key_storage);
         self.allocator.free(self.configs);
         self.* = undefined;
     }
@@ -96,10 +102,7 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) LoadError!Ow
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.SnapshotUnreadable,
     };
-    defer {
-        provider.secureZero(bytes);
-        allocator.free(bytes);
-    }
+    defer crypto.secrets.secureZeroAndFree(allocator, bytes);
     return parse(allocator, bytes);
 }
 
@@ -129,10 +132,12 @@ pub fn reserveNonceLeasesInFile(allocator: std.mem.Allocator, path: []const u8, 
     try validator.validate(snapshot.generation, snapshot.configs);
 
     var out = std.array_list.Managed(u8).init(allocator);
-    defer {
-        provider.secureZero(out.items);
-        out.deinit();
-    }
+    // Zero-and-raw-free the whole backing allocation via `allocatedSlice()`
+    // (not `out.deinit()`, which frees through ordinary `Allocator.free`)
+    // so the region handed to `rawFree` matches the region wiped exactly —
+    // `out.items` alone would under-cover any unused capacity `serialize`'s
+    // growth reserved past the logical length.
+    defer crypto.secrets.secureZeroAndFree(allocator, out.allocatedSlice());
     try serialize(&out, snapshot);
 
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.{d}.tmp", .{ path, std.c.getpid() });
@@ -214,10 +219,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) LoadError!OwnedSna
     var configs = allocator.alloc(ticket_protection.KeyConfig, keys.len) catch return error.OutOfMemory;
     errdefer allocator.free(configs);
     var key_storage = allocator.alloc(KeyStorage, keys.len) catch return error.OutOfMemory;
-    errdefer {
-        for (key_storage) |*storage| provider.secureZero(&storage.bytes);
-        allocator.free(key_storage);
-    }
+    errdefer crypto.secrets.secureZeroAndFreeAligned(KeyStorage, allocator, key_storage);
     @memset(key_storage, .{});
 
     for (keys, 0..) |key_value, i| {
@@ -383,6 +385,30 @@ test "persistent ticket key snapshot parses owned key configs" {
     try std.testing.expectEqual(@as(usize, 1), snapshot.configs.len);
     try std.testing.expectEqual(ticket_protection.NonceLeaseConfig{ .prefix = .{ 0xaa, 0xbb, 0xcc, 0xdd }, .start = 10, .end_exclusive = 20 }, snapshot.configs[0].nonce_lease.?);
     try std.testing.expectEqual(@as(usize, 16), snapshot.configs[0].key_bytes.len);
+}
+
+test "OwnedSnapshot.deinit hands the allocator zeroed key bytes, not Allocator.free's undefined-poison" {
+    const json =
+        \\{"version":1,"generation":1,"keys":[{"id":"000102030405060708090a0b0c0d0e0f","aead":"aes_128_gcm","key":"101112131415161718191a1b1c1d1e1f","not_before_unix_ms":1000,"encrypt_until_unix_ms":5000,"decrypt_until_unix_ms":9000}]}
+    ;
+    var backing: [65536]u8 align(8) = [_]u8{0xcc} ** 65536;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var snapshot = try parse(fba.allocator(), json);
+
+    var key_copy: [16]u8 = undefined;
+    @memcpy(&key_copy, snapshot.configs[0].key_bytes);
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    }, &key_copy);
+
+    snapshot.deinit();
+
+    // A plain `allocator.free(key_storage)` would leave these bytes intact
+    // (or replaced with build-mode-dependent poison, never guaranteed
+    // zero); `secureZeroAndFreeAligned` must scrub them before `deinit`
+    // returns, anywhere in the shared backing buffer.
+    try std.testing.expect(std.mem.indexOf(u8, &backing, &key_copy) == null);
 }
 
 test "persistent ticket key snapshot rejects malformed secret lengths" {
