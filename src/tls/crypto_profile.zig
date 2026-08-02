@@ -141,8 +141,9 @@ test "TLS policy capabilities are derived from provider support" {
     try std.testing.expectEqual(policy_mod.CipherSuite.tls_aes_128_gcm_sha256, tls_caps.cipher_suites[0]);
     try std.testing.expectEqual(policy_mod.CipherSuite.tls_aes_256_gcm_sha384, tls_caps.cipher_suites[1]);
     try std.testing.expectEqual(policy_mod.CipherSuite.tls_chacha20_poly1305_sha256, tls_caps.cipher_suites[2]);
-    try std.testing.expectEqual(@as(usize, 1), tls_caps.named_groups_len);
+    try std.testing.expectEqual(@as(usize, 2), tls_caps.named_groups_len);
     try std.testing.expectEqual(policy_mod.NamedGroup.x25519, tls_caps.named_groups[0]);
+    try std.testing.expectEqual(policy_mod.NamedGroup.secp256r1, tls_caps.named_groups[1]);
     try std.testing.expectEqual(@as(usize, 3), tls_caps.signature_schemes_len);
     try std.testing.expectEqual(policy_mod.SignatureScheme.ed25519, tls_caps.signature_schemes[0]);
     try std.testing.expectEqual(policy_mod.SignatureScheme.ecdsa_secp256r1_sha256, tls_caps.signature_schemes[1]);
@@ -166,10 +167,12 @@ test "hand-written TLS policy capabilities are rejected when provider cannot sup
     const derived = fromProfile(.general_purpose_openssl, caps);
     try validateAgainstProvider(caps, derived.asPolicyCapabilities());
 
-    // The secp256r1 ECDH group is still provider-deferred (only the signature
-    // scheme over that curve is implemented).
+    // A hand-authored policy naming a group absent from the provider's
+    // advertised capability set is still rejected.
+    var without_p256 = caps;
+    without_p256.groups.remove(.secp256r1);
     const bad_groups = [_]policy_mod.NamedGroup{.secp256r1};
-    try std.testing.expectError(error.UnsupportedCapability, validateAgainstProvider(caps, .{ .named_groups = &bad_groups }));
+    try std.testing.expectError(error.UnsupportedCapability, validateAgainstProvider(without_p256, .{ .named_groups = &bad_groups }));
 
     // PKCS#1 v1.5 remains outside the provider profile.
     const bad_pkcs1 = [_]policy_mod.SignatureScheme{.rsa_pkcs1_sha256};

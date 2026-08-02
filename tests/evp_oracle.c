@@ -303,6 +303,63 @@ static int cmd_ecdsa_p256_verify(int argc, char **argv) {
     return status("malformed");
 }
 
+static int cmd_p256_ecdh(int argc, char **argv) {
+    if (argc != 4) return status("malformed");
+    Blob scalar, peer;
+    if (!parse_hex(argv[2], &scalar) || !parse_hex(argv[3], &peer) || scalar.len != 32 || peer.len != 65 || peer.bytes[0] != 0x04) {
+        return status("malformed");
+    }
+
+    unsigned char pub[65];
+    size_t pub_len = sizeof(pub);
+    EVP_PKEY *private_key = ecdsa_p256_private_from_scalar(scalar.bytes, scalar.len, pub, &pub_len);
+    if (private_key == NULL) return status("malformed");
+
+    EC_KEY *peer_ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    if (peer_ec == NULL) {
+        EVP_PKEY_free(private_key);
+        return status("oracle_error");
+    }
+    const EC_GROUP *group = EC_KEY_get0_group(peer_ec);
+    EC_POINT *peer_point = group == NULL ? NULL : EC_POINT_new(group);
+    if (peer_point == NULL ||
+        EC_POINT_oct2point(group, peer_point, peer.bytes, peer.len, NULL) != 1 ||
+        EC_POINT_is_at_infinity(group, peer_point) == 1 ||
+        EC_KEY_set_public_key(peer_ec, peer_point) != 1) {
+        EC_POINT_free(peer_point);
+        EC_KEY_free(peer_ec);
+        EVP_PKEY_free(private_key);
+        return status("malformed");
+    }
+    EC_POINT_free(peer_point);
+
+    EVP_PKEY *peer_key = EVP_PKEY_new();
+    if (peer_key == NULL || EVP_PKEY_assign_EC_KEY(peer_key, peer_ec) != 1) {
+        EVP_PKEY_free(peer_key);
+        EC_KEY_free(peer_ec);
+        EVP_PKEY_free(private_key);
+        return status("oracle_error");
+    }
+    peer_ec = NULL;
+
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(private_key, NULL);
+    unsigned char shared[32];
+    size_t shared_len = sizeof(shared);
+    int ok = ctx != NULL &&
+        EVP_PKEY_derive_init(ctx) == 1 &&
+        EVP_PKEY_derive_set_peer(ctx, peer_key) == 1 &&
+        EVP_PKEY_derive(ctx, shared, &shared_len) == 1 &&
+        shared_len == sizeof(shared);
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(private_key);
+    EVP_PKEY_free(peer_key);
+    if (!ok) return status("auth_fail");
+    fputs("ok ", stdout);
+    print_hex(shared, shared_len);
+    putchar('\n');
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return status("malformed");
     if (strcmp(argv[1], "aead-seal") == 0) return cmd_aead_seal(argc, argv);
@@ -312,5 +369,6 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "ed25519-verify") == 0) return cmd_ed25519_verify(argc, argv);
     if (strcmp(argv[1], "ecdsa-p256-sign") == 0) return cmd_ecdsa_p256_sign(argc, argv);
     if (strcmp(argv[1], "ecdsa-p256-verify") == 0) return cmd_ecdsa_p256_verify(argc, argv);
+    if (strcmp(argv[1], "p256-ecdh") == 0) return cmd_p256_ecdh(argc, argv);
     return status("malformed");
 }
