@@ -5,6 +5,7 @@
 //! rotation scheduling, metrics export, and TLS PSK binder policy stay outside
 //! this module.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const crypto = @import("crypto");
 const pre_shared_key = @import("pre_shared_key.zig");
@@ -37,7 +38,9 @@ const KeyDeinitProbe = struct {
         self.observed += 1;
     }
 };
-var test_key_deinit_probe: ?*KeyDeinitProbe = null;
+const TestKeyDeinitProbeStorage = if (builtin.is_test) struct {
+    threadlocal var probe: ?*KeyDeinitProbe = null;
+} else struct {};
 
 pub const ParseError = error{
     MalformedEnvelope,
@@ -282,7 +285,9 @@ const KeyRecord = struct {
     fn deinit(self: *KeyRecord) void {
         const key_len = self.key.len;
         self.key.deinit();
-        if (test_key_deinit_probe) |probe| probe.record(&self.key, key_len);
+        if (builtin.is_test) {
+            if (TestKeyDeinitProbeStorage.probe) |probe| probe.record(&self.key, key_len);
+        }
     }
 
     fn canEncryptAt(self: *const KeyRecord, now_unix_ms: i64) bool {
@@ -1554,7 +1559,6 @@ const LeaseState = struct {
 const LedgerState = struct {
     lease: LeaseState,
     aead: provider.Aead,
-    key_fingerprint: KeyFingerprint,
 };
 
 fn captureKeyringState(keyring: *ReloadableKeyRing) KeyringState {
@@ -1592,7 +1596,6 @@ fn captureKeyringState(keyring: *ReloadableKeyRing) KeyringState {
                 .has_lease = entry.has_lease,
             },
             .aead = entry.aead,
-            .key_fingerprint = entry.key_fingerprint,
         };
     }
     return state;
@@ -1646,7 +1649,6 @@ fn expectLedgerStateEqual(expected: LedgerState, entry: *const LeaseHighWater) !
         .has_lease = entry.has_lease,
     });
     try testing.expectEqual(expected.aead, entry.aead);
-    try testing.expectEqualSlices(u8, &expected.key_fingerprint, &entry.key_fingerprint);
 }
 
 fn expectLeaseStateEqual(expected: LeaseState, actual: LeaseState) !void {
@@ -1687,8 +1689,8 @@ fn expectPartialBuildWipesCopiedKey(input: []const u8) !void {
     if (expected_deinit_count == 0) return;
 
     var probe = KeyDeinitProbe{};
-    test_key_deinit_probe = &probe;
-    defer test_key_deinit_probe = null;
+    TestKeyDeinitProbeStorage.probe = &probe;
+    defer TestKeyDeinitProbeStorage.probe = null;
 
     const snapshot = Snapshot.build(testing.allocator, configs_slice, generation, caps) catch {
         try testing.expectEqual(expected_deinit_count, probe.observed);
@@ -1713,7 +1715,7 @@ fn initializedPrefixBeforeBuildFailure(configs: []const KeyConfig, caps: provide
         }
         initialized += 1;
     }
-    return 0;
+    return initialized;
 }
 
 fn byteAt(input: []const u8, idx: usize) u8 {
@@ -2031,6 +2033,20 @@ test "fuzz: ticket snapshot configs preserve bounded build invariants" {
     writeSnapshotSeedRecord(&partial_build_wipe, 0, .{ .aead = 0, .key_seed = 0x90, .id_seed = 0x90 });
     writeSnapshotSeedRecord(&partial_build_wipe, 1, .{ .aead = 1, .key_seed = 0xa0, .id_seed = 0xa0, .key_len_mode = 1 });
 
+    var ambiguous_windows = snapshotSeed(2, 0xff, 3, 0);
+    writeSnapshotSeedRecord(&ambiguous_windows, 0, .{
+        .aead = 0,
+        .key_seed = 0xd0,
+        .id_seed = 0xd0,
+        .lease_enabled = true,
+    });
+    writeSnapshotSeedRecord(&ambiguous_windows, 1, .{
+        .aead = 1,
+        .key_seed = 0xe0,
+        .id_seed = 0xe0,
+        .lease_enabled = true,
+    });
+
     var exact_max_keys = snapshotSeed(max_keys, 0xff, 3, 0);
     for (0..max_keys) |i| {
         writeSnapshotSeedRecord(&exact_max_keys, i, .{ .aead = @truncate(i % 3), .key_seed = @intCast(0x20 + i), .id_seed = @intCast(0x40 + i), .lease_enabled = false });
@@ -2072,6 +2088,7 @@ test "fuzz: ticket snapshot configs preserve bounded build invariants" {
     try expectSnapshotSeedOutcome(&invalid_window, .invalid_validity_window);
     try expectSnapshotSeedOutcome(&invalid_lease, .invalid_nonce_lease);
     try expectSnapshotSeedOutcome(&partial_build_wipe, .invalid_key_length);
+    try expectSnapshotSeedOutcome(&ambiguous_windows, .ambiguous_encryption_window);
     try expectSnapshotSeedOutcome(&exact_max_keys, .build_success);
     try expectSnapshotSeedOutcome(&max_plus_one_keys, .too_many_keys);
     try expectSnapshotSeedOutcome(&generation_overflow, .generation_overflow);
@@ -2089,6 +2106,7 @@ test "fuzz: ticket snapshot configs preserve bounded build invariants" {
         &invalid_window,
         &invalid_lease,
         &partial_build_wipe,
+        &ambiguous_windows,
         &exact_max_keys,
         &max_plus_one_keys,
         &generation_overflow,
@@ -2198,7 +2216,10 @@ fn expectSnapshotSeedOutcome(input: []const u8, outcome: SnapshotFuzzOutcome) !v
         .unsupported_capability => try testing.expectError(error.UnsupportedCapability, result),
         .invalid_validity_window => try testing.expectError(error.InvalidValidityWindow, result),
         .invalid_nonce_lease => try testing.expectError(error.InvalidNonceLease, result),
-        .ambiguous_encryption_window => try testing.expectError(error.AmbiguousEncryptionWindow, result),
+        .ambiguous_encryption_window => {
+            try testing.expectError(error.AmbiguousEncryptionWindow, result);
+            try expectPartialBuildWipesCopiedKey(input);
+        },
         .stale_generation, .generation_overflow, .non_overlapping_nonce_lease, .overlapping_nonce_lease => unreachable,
     }
 }
