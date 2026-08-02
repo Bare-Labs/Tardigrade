@@ -1335,6 +1335,186 @@ pub fn fuzzTicketIdentity(allocator: std.mem.Allocator, input: []const u8) !void
     }
 }
 
+pub fn fuzzSnapshotConfig(allocator: std.mem.Allocator, input: []const u8) !void {
+    const config_count = if (input.len == 0) 0 else @as(usize, input[0] % (max_keys + 2));
+    var key_storage: [max_keys + 1][provider.max_aead_key_len + 1]u8 = undefined;
+    var configs: [max_keys + 1]KeyConfig = undefined;
+
+    for (configs[0..@min(config_count, configs.len)], 0..) |*config, i| {
+        const base = i * 13 + 1;
+        const aead = fuzzAead(byteAt(input, base));
+        const exact_len = aead.keyLength();
+        const len = switch (byteAt(input, base + 1) % 5) {
+            0 => 0,
+            1 => exact_len - 1,
+            2 => exact_len,
+            3 => exact_len + 1,
+            else => @min(provider.max_aead_key_len + 1, exact_len + (byteAt(input, base + 2) % 3)),
+        };
+        for (key_storage[i][0..], 0..) |*byte, j| {
+            byte.* = @truncate(byteAt(input, base + 3) +% @as(u8, @truncate(i * 17 + j)));
+        }
+
+        const time_case = byteAt(input, base + 4) % 8;
+        const not_before, const encrypt_until, const decrypt_until = fuzzWindows(time_case);
+
+        const lease = if ((byteAt(input, base + 5) & 0x01) == 0)
+            null
+        else
+            fuzzLease(input, base + 6);
+
+        config.* = .{
+            .id = fuzzKeyId(input, base + 10, @intCast(i)),
+            .aead = aead,
+            .key_bytes = key_storage[i][0..len],
+            .not_before_unix_ms = not_before,
+            .encrypt_until_unix_ms = encrypt_until,
+            .decrypt_until_unix_ms = decrypt_until,
+            .nonce_lease = lease,
+        };
+    }
+
+    if (config_count > 1) {
+        switch (byteAt(input, 2) % 4) {
+            0 => configs[1].id = configs[0].id,
+            1 => configs[1].key_bytes = configs[0].key_bytes,
+            2 => {
+                configs[1].nonce_lease = configs[0].nonce_lease;
+                configs[1].not_before_unix_ms = configs[0].not_before_unix_ms;
+                configs[1].encrypt_until_unix_ms = configs[0].encrypt_until_unix_ms;
+            },
+            else => {},
+        }
+    }
+
+    const caps = fuzzCapabilities(input);
+    const generation = fuzzGeneration(input);
+    const snapshot = Snapshot.build(allocator, configs[0..@min(config_count, configs.len)], generation, caps) catch {
+        try expectKeyringStillPublishesCurrent(allocator);
+        return;
+    };
+    defer snapshot.release();
+
+    try testing.expect(config_count >= 1 and config_count <= max_keys);
+    try testing.expectEqual(config_count, snapshot.keys.len);
+    for (snapshot.keys) |*key| {
+        try testing.expect(caps.supportsAead(key.aead));
+        try testing.expectEqual(key.aead.keyLength(), key.key.len);
+        try testing.expect(key.not_before_unix_ms < key.encrypt_until_unix_ms);
+        try testing.expect(key.encrypt_until_unix_ms <= key.decrypt_until_unix_ms);
+        if (key.nonce_lease) |*lease| {
+            try testing.expect(lease.next_counter.load(.acquire) < lease.currentEnd());
+        }
+    }
+
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const current = sampleKeyConfigWithByte(keyId(0xee), .aes_128_gcm, .{ .prefix = .{ 0xee, 0, 0, 0 }, .start = 0, .end_exclusive = 4 }, 0x11);
+    try keyring.install(try keyring.buildSnapshot(&.{current}, testCapabilities()));
+    const before_current = keyring.current.?;
+    const before_generation = before_current.generation;
+    const before_next_generation = keyring.next_generation;
+    const before_ledger_len = keyring.ledger.items.len;
+
+    const candidate = Snapshot.build(allocator, configs[0..@min(config_count, configs.len)], generation, caps) catch return;
+    keyring.validateInstallCandidate(candidate) catch {
+        candidate.release();
+        try testing.expectEqual(before_current, keyring.current.?);
+        try testing.expectEqual(before_generation, keyring.current.?.generation);
+        try testing.expectEqual(before_next_generation, keyring.next_generation);
+        try testing.expectEqual(before_ledger_len, keyring.ledger.items.len);
+        return;
+    };
+    candidate.release();
+}
+
+fn byteAt(input: []const u8, idx: usize) u8 {
+    return if (idx < input.len) input[idx] else 0;
+}
+
+fn fuzzAead(byte: u8) provider.Aead {
+    return switch (byte % 3) {
+        0 => .aes_128_gcm,
+        1 => .aes_256_gcm,
+        else => .chacha20_poly1305,
+    };
+}
+
+fn fuzzKeyId(input: []const u8, offset: usize, fallback: u8) KeyId {
+    var id = [_]u8{fallback} ** key_id_len;
+    for (&id, 0..) |*byte, i| {
+        byte.* = byteAt(input, offset + i);
+    }
+    return id;
+}
+
+fn fuzzWindows(case: u8) struct { i64, i64, i64 } {
+    return switch (case) {
+        0 => .{ 0, 1, 1 },
+        1 => .{ 1_000, 5_000, 20_000 },
+        2 => .{ 5_000, 5_000, 20_000 },
+        3 => .{ 5_000, 4_999, 20_000 },
+        4 => .{ 1_000, 20_000, 19_999 },
+        5 => .{ std.math.minInt(i64), -1, 0 },
+        6 => .{ std.math.maxInt(i64) - 2, std.math.maxInt(i64) - 1, std.math.maxInt(i64) },
+        else => .{ 1_000, 5_000, 5_000 },
+    };
+}
+
+fn fuzzLease(input: []const u8, offset: usize) NonceLeaseConfig {
+    const start, const end = switch (byteAt(input, offset + 4) % 7) {
+        0 => .{ @as(u64, 0), @as(u64, 1) },
+        1 => .{ @as(u64, 0), @as(u64, 0) },
+        2 => .{ @as(u64, 2), @as(u64, 1) },
+        3 => .{ std.math.maxInt(u64) - 1, std.math.maxInt(u64) },
+        4 => .{ std.math.maxInt(u64), std.math.maxInt(u64) },
+        5 => .{ @as(u64, 65_534), @as(u64, 65_535) },
+        else => .{ @as(u64, byteAt(input, offset + 5)), @as(u64, byteAt(input, offset + 5)) + 2 },
+    };
+    return .{
+        .prefix = .{
+            byteAt(input, offset),
+            byteAt(input, offset + 1),
+            byteAt(input, offset + 2),
+            byteAt(input, offset + 3),
+        },
+        .start = start,
+        .end_exclusive = end,
+    };
+}
+
+fn fuzzCapabilities(input: []const u8) provider.Capabilities {
+    if (input.len > 1 and (input[1] & 0x01) != 0) return testCapabilities();
+    var caps = provider.Capabilities{};
+    if (input.len > 1 and (input[1] & 0x02) != 0) caps.aeads.insert(.aes_128_gcm);
+    if (input.len > 1 and (input[1] & 0x04) != 0) caps.aeads.insert(.aes_256_gcm);
+    if (input.len > 1 and (input[1] & 0x08) != 0) caps.aeads.insert(.chacha20_poly1305);
+    return caps;
+}
+
+fn fuzzGeneration(input: []const u8) u64 {
+    if (input.len < 4) return 0;
+    return switch (input[3] % 5) {
+        0 => 0,
+        1 => 1,
+        2 => std.math.maxInt(u64) - 1,
+        3 => std.math.maxInt(u64),
+        else => std.mem.readInt(u16, input[0..2], .big),
+    };
+}
+
+fn expectKeyringStillPublishesCurrent(allocator: std.mem.Allocator) !void {
+    var keyring = ReloadableKeyRing.init(allocator);
+    defer keyring.deinit();
+    const current = sampleKeyConfigWithByte(keyId(0xed), .aes_128_gcm, .{ .prefix = .{ 0xed, 0, 0, 0 }, .start = 0, .end_exclusive = 4 }, 0x11);
+    try keyring.install(try keyring.buildSnapshot(&.{current}, testCapabilities()));
+    const before_current = keyring.current.?;
+    const before_generation = before_current.generation;
+    try testing.expectError(error.TooManyKeys, keyring.buildSnapshot(&.{}, testCapabilities()));
+    try testing.expectEqual(before_current, keyring.current.?);
+    try testing.expectEqual(before_generation, keyring.current.?.generation);
+}
+
 const ConcurrentSealTask = struct {
     protector: *Protector,
     state: *const session.ServerRecoverableState,
@@ -1525,6 +1705,107 @@ test "fuzz helper preserves output on resolver allocation errors" {
     var decode_failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
     try testing.expectError(error.OutOfMemory, protector.resolve(decode_failing.allocator(), ticket, 2_000, &out));
     try expectServerStateEqual(&expected, &out);
+}
+
+test "fuzz: ticket snapshot configs preserve bounded build invariants" {
+    const empty_config_count = [_]u8{};
+    const exact_one_aes128 = [_]u8{
+        1,    0xff, 0xff, 0,
+        0,    2,    0x11, 1,
+        0,    1,    0x10, 0x10,
+        0x10, 0x10, 0x10, 0x10,
+        0x10, 0x10, 0x10, 0x10,
+        0x10, 0x10, 0x10, 0x10,
+        0x10, 0x10,
+    };
+    const exact_one_aes256 = [_]u8{
+        1,    0xff, 0xff, 0,
+        1,    2,    0x22, 1,
+        0,    1,    0x20, 0x20,
+        0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20,
+    };
+    const exact_one_chacha = [_]u8{
+        1,    0xff, 0xff, 0,
+        2,    2,    0x33, 1,
+        0,    1,    0x30, 0x30,
+        0x30, 0x30, 0x30, 0x30,
+        0x30, 0x30, 0x30, 0x30,
+        0x30, 0x30, 0x30, 0x30,
+        0x30, 0x30,
+    };
+    const duplicate_id = [_]u8{
+        2,    0xff, 0,    0,
+        0,    2,    0x11, 1,
+        0,    1,    0xaa, 0xaa,
+        0xaa, 0xaa, 0xaa, 0xaa,
+        0xaa, 0xaa, 0xaa, 0xaa,
+        0xaa, 0xaa, 0xaa, 0xaa,
+        0xaa, 0xaa, 1,    2,
+        0x22, 1,    0,    1,
+        0xbb, 0xbb, 0xbb, 0xbb,
+        0xbb, 0xbb, 0xbb, 0xbb,
+        0xbb, 0xbb, 0xbb, 0xbb,
+        0xbb, 0xbb, 0xbb, 0xbb,
+    };
+    const unsupported_capability = [_]u8{
+        1,    0,    0xff, 0,
+        2,    2,    0x44, 1,
+        0,    1,    0x40, 0x40,
+        0x40, 0x40, 0x40, 0x40,
+        0x40, 0x40, 0x40, 0x40,
+        0x40, 0x40, 0x40, 0x40,
+        0x40, 0x40,
+    };
+    const invalid_window = [_]u8{
+        1,    0xff, 0xff, 0,
+        0,    2,    0x55, 2,
+        0,    1,    0x50, 0x50,
+        0x50, 0x50, 0x50, 0x50,
+        0x50, 0x50, 0x50, 0x50,
+        0x50, 0x50, 0x50, 0x50,
+        0x50, 0x50,
+    };
+    const invalid_lease = [_]u8{
+        1,    0xff, 0xff, 0,
+        0,    2,    0x66, 1,
+        1,    1,    0x60, 0x60,
+        0x60, 0x60, 0x60, 0x60,
+        0x60, 0x60, 0x60, 0x60,
+        0x60, 0x60, 0x60, 0x60,
+        0x60, 0x60,
+    };
+    const max_plus_one_keys = [_]u8{ max_keys + 1, 0xff, 0xff, 0 };
+    const generation_overflow = [_]u8{
+        1,    0xff, 0xff, 3,
+        0,    2,    0x77, 1,
+        0,    1,    0x70, 0x70,
+        0x70, 0x70, 0x70, 0x70,
+        0x70, 0x70, 0x70, 0x70,
+        0x70, 0x70, 0x70, 0x70,
+        0x70, 0x70,
+    };
+
+    try testing.fuzz({}, fuzzTicketSnapshotConfigInput, .{ .corpus = &.{
+        &empty_config_count,
+        &exact_one_aes128,
+        &exact_one_aes256,
+        &exact_one_chacha,
+        &duplicate_id,
+        &unsupported_capability,
+        &invalid_window,
+        &invalid_lease,
+        &max_plus_one_keys,
+        &generation_overflow,
+    } });
+}
+
+fn fuzzTicketSnapshotConfigInput(_: void, smith: *testing.Smith) !void {
+    var input_buf: [1 + (max_keys + 1) * 13]u8 = undefined;
+    const len = smith.slice(&input_buf);
+    try fuzzSnapshotConfig(testing.allocator, input_buf[0..len]);
 }
 
 test "protectedLen reserves envelope overhead exactly" {
