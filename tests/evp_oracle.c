@@ -214,19 +214,25 @@ static EVP_PKEY *ecdsa_p256_private_from_scalar(
     if (ec == NULL) return NULL;
     const EC_GROUP *group = EC_KEY_get0_group(ec);
     BIGNUM *priv = BN_bin2bn(scalar, (int)scalar_len, NULL);
+    BIGNUM *order = group == NULL ? NULL : BN_new();
     EC_POINT *point = group == NULL ? NULL : EC_POINT_new(group);
     if (priv == NULL ||
+        order == NULL ||
+        EC_GROUP_get_order(group, order, NULL) != 1 ||
         point == NULL ||
         BN_is_zero(priv) ||
+        BN_cmp(priv, order) >= 0 ||
         EC_KEY_set_private_key(ec, priv) != 1 ||
         EC_POINT_mul(group, point, priv, NULL, NULL, NULL) != 1 ||
         EC_KEY_set_public_key(ec, point) != 1) {
+        BN_clear_free(order);
         BN_clear_free(priv);
         EC_POINT_free(point);
         EC_KEY_free(ec);
         return NULL;
     }
     *pub_len = EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED, pub, *pub_len, NULL);
+    BN_clear_free(order);
     BN_clear_free(priv);
     EC_POINT_free(point);
     if (*pub_len != 65) {

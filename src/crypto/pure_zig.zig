@@ -441,7 +441,8 @@ fn deriveSharedSecretImpl(
 
             var shared_point = peer.mul(scalar, .big) catch return error.InvalidInput;
             defer crypto.secureZero(u8, std.mem.asBytes(&shared_point));
-            const affine = shared_point.affineCoordinates();
+            var affine = shared_point.affineCoordinates();
+            defer crypto.secureZero(u8, std.mem.asBytes(&affine));
             var shared_x = affine.x.toBytes(.big);
             defer crypto.secureZero(u8, &shared_x);
             @memcpy(out, &shared_x);
@@ -1108,6 +1109,19 @@ test "secp256r1 key-share generation rejects bad buffers before entropy and hand
             return .{ .context = self, .fillFn = fill };
         }
     };
+    const UnusableEntropy = struct {
+        calls: usize = 0,
+
+        fn fill(context: *anyopaque, buffer: []u8) provider.EntropyError!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            @memset(buffer, 0);
+        }
+
+        fn entropy(self: *@This()) provider.Entropy {
+            return .{ .context = self, .fillFn = fill };
+        }
+    };
 
     var counting = CountingEntropy{};
     var counting_provider = Provider.init(counting.entropy());
@@ -1125,6 +1139,14 @@ test "secp256r1 key-share generation rejects bad buffers before entropy and hand
     const failing_cp = failing_provider.cryptoProvider();
     try testing.expectError(error.EntropyFailure, failing_cp.generateKeyShare(.secp256r1, &full_pub, &full_priv));
     try testing.expectEqual(@as(usize, 1), failing.calls);
+    for (full_pub) |byte| try testing.expectEqual(@as(u8, 0xcc), byte);
+    for (full_priv) |byte| try testing.expectEqual(@as(u8, 0xdd), byte);
+
+    var unusable = UnusableEntropy{};
+    var unusable_provider = Provider.init(unusable.entropy());
+    const unusable_cp = unusable_provider.cryptoProvider();
+    try testing.expectError(error.EntropyFailure, unusable_cp.generateKeyShare(.secp256r1, &full_pub, &full_priv));
+    try testing.expectEqual(@as(usize, p256_keygen_attempts), unusable.calls);
     for (full_pub) |byte| try testing.expectEqual(@as(u8, 0xcc), byte);
     for (full_priv) |byte| try testing.expectEqual(@as(u8, 0xdd), byte);
 }

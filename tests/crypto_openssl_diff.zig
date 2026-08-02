@@ -485,6 +485,7 @@ fn runP256EcdhNegative(allocator: std.mem.Allocator) !void {
     const cp = cryptoProvider();
     const scalar_one = [_]u8{0} ** 31 ++ [_]u8{1};
     const scalar_zero = [_]u8{0} ** 32;
+    const scalar_out_of_range = [_]u8{0xff} ** 32;
     const scalar_two_public = hexBytes("047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1");
     var shared: [provider.max_shared_secret_len]u8 = undefined;
 
@@ -492,6 +493,11 @@ fn runP256EcdhNegative(allocator: std.mem.Allocator) !void {
     var zero_scalar = try runEvpP256Ecdh(allocator, &scalar_zero, &scalar_two_public);
     defer zero_scalar.deinit(allocator);
     try expectEvpStatus(&zero_scalar, .malformed);
+
+    try testing.expectError(error.InvalidInput, cp.deriveSharedSecret(.secp256r1, &scalar_out_of_range, &scalar_two_public, &shared));
+    var out_of_range_scalar = try runEvpP256Ecdh(allocator, &scalar_out_of_range, &scalar_two_public);
+    defer out_of_range_scalar.deinit(allocator);
+    try expectEvpStatus(&out_of_range_scalar, .malformed);
 
     var malformed_peer = scalar_two_public;
     malformed_peer[0] = 0x02;
