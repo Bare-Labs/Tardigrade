@@ -1253,6 +1253,11 @@ fn runResumptionForHash(allocator: std.mem.Allocator, hash: provider.Hash) !void
     const psk_a = psk_a_storage[0..digest_len];
     const psk_b = psk_b_storage[0..digest_len];
     try key_schedule.KeySchedule.resumptionPsk(cp, hash, rms, "\x01", psk_a);
+    var rms_mutated_storage = rms_storage;
+    rms_mutated_storage[0] ^= 0x01;
+    try key_schedule.KeySchedule.resumptionPsk(cp, hash, rms_mutated_storage[0..digest_len], "\x01", psk_b);
+    try testing.expect(!std.mem.eql(u8, psk_a, psk_b));
+
     var nonce_mut = [_]u8{0x01};
     nonce_mut[0] ^= 0x80;
     try key_schedule.KeySchedule.resumptionPsk(cp, hash, rms, &nonce_mut, psk_b);
@@ -1280,6 +1285,34 @@ const BinderFixture = struct {
     ext_data: []const u8,
     slot: pre_shared_key.BinderSlot,
 };
+
+const expected_binder_truncated_sha256 = hexBytes("010000700303111111111111111111111111111111111111111111111111111111111111111100000213010100004500290041001c00167469636b65742d6964656e746974792d73686132353610203040");
+const expected_binder_truncated_sha384 = hexBytes("010000800303111111111111111111111111111111111111111111111111111111111111111100000213010100005500290051001c00167469636b65742d6964656e746974792d73686133383410203040");
+const expected_binder_hash_sha256 = hexBytes("9136468c5ddea96b88cdfc816087bc23b820b42646335d609c82b99320a4364e");
+const expected_binder_hash_sha384 = hexBytes("e6f3b0ea1616e04d028eff2e3ed727e088b711cf985a60c0b02ea999522183becd01cd0f8a1392e7e2603f93cf2ce949");
+const expected_binder_sha256 = hexBytes("5d93fb0a6d879504d8ada12cb6484fc3dbe9e0ae6f46e3c3131fa4941d0ac057");
+const expected_binder_sha384 = hexBytes("d1b2ab1ddf233db1f82ae5748987b65180564038960391930320455f7cbfba5177d71099a59448c51bddb44cad526e10");
+
+fn expectedBinderTruncated(hash: provider.Hash) []const u8 {
+    return switch (hash) {
+        .sha256 => &expected_binder_truncated_sha256,
+        .sha384 => &expected_binder_truncated_sha384,
+    };
+}
+
+fn expectedBinderTranscriptHash(hash: provider.Hash) []const u8 {
+    return switch (hash) {
+        .sha256 => &expected_binder_hash_sha256,
+        .sha384 => &expected_binder_hash_sha384,
+    };
+}
+
+fn expectedBinderBytes(hash: provider.Hash) []const u8 {
+    return switch (hash) {
+        .sha256 => &expected_binder_sha256,
+        .sha384 => &expected_binder_sha384,
+    };
+}
 
 fn buildBinderFixture(hash: provider.Hash, identity: []const u8, binder: []const u8, out: []u8) !BinderFixture {
     var w = tls_core.messages.Writer{ .buf = out };
@@ -1350,10 +1383,12 @@ fn runPskBinderForHash(allocator: std.mem.Allocator, hash: provider.Hash) !void 
     var zero_binder_storage = [_]u8{0} ** provider.max_digest_len;
     var ch_buf: [512]u8 = undefined;
     var fixture = try buildBinderFixture(hash, identity, zero_binder_storage[0..digest_len], &ch_buf);
+    try expectStage("psk binder exact truncated ClientHello", expectedBinderTruncated(hash), fixture.truncated);
 
     var transcript_hash_storage: [provider.max_digest_len]u8 = undefined;
     const transcript_hash = transcript_hash_storage[0..digest_len];
     try hashBytes(hash, fixture.truncated, transcript_hash);
+    try expectStage("psk binder exact transcript hash", expectedBinderTranscriptHash(hash), transcript_hash);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "truncated-client-hello.bin", .data = fixture.truncated });
@@ -1365,6 +1400,7 @@ fn runPskBinderForHash(allocator: std.mem.Allocator, hash: provider.Hash) !void 
 
     const expected_binder = try opensslBinder(allocator, hash, psk, transcript_hash);
     defer allocator.free(expected_binder);
+    try expectStage("psk binder exact binder bytes", expectedBinderBytes(hash), expected_binder);
     var from_transcript: [provider.max_digest_len]u8 = undefined;
     try pre_shared_key.deriveBinderFromTranscriptHash(hash, psk, transcript_hash, from_transcript[0..digest_len]);
     try expectStage("psk binder from transcript hash", expected_binder, from_transcript[0..digest_len]);
@@ -1458,12 +1494,128 @@ fn buildTicketAad(header: []const u8, out: *[ticket_aad_prefix.len + ticket_prot
     @memcpy(out[ticket_aad_prefix.len..], header);
 }
 
+const expected_ticket_ciphertext_aes128 = hexBytes("c8a6da034a177480f14d9c792c1bce52d79b45d6ce6e9979a1ed932a0c19524c3e91a65ebc88ed4a707cb4fbed0243b33a9074c0a5113a09544c80b729f2bd1f982ce05146259033b7b7a60904bc295262fe725dabb59a77080ef7989961e00db923beeae0d126a966a4ce2bcd194ccdfb8a766fb9730d7225ca23dc42ae48ba73e816e95f68518478011d37e8a021bbc1d19101366bf0fddf9578def815624e0b7cec115fe2327339d9118d31d7fe9d01c366bb8b8ba08a8d");
+const expected_ticket_ciphertext_aes256 = hexBytes("d44e63bba33981f43100d675d38184cfa2e23552c289cb8766278a3a9fd668f4722267bea776dc38304546ac8bcacb535cafa708fda436df0731009cc4c524277621ca9b26ffa25140e3c99f8c2536c63d9e04567c951de491165eead7e305edcf8d26ca7f6f0f826714c2dc50e733e6f8fb8074249d51fb16d38412945c7ddb62c7961ab592004c5dde614644695f102f063c535447b80fa1c50ed352fd2c9218ebcbd3595546e4e4c6dc28d7fec4cfcce89d5c5ffb64b556c0d92fb2cc5d73dd41c28c2bde82963c");
+const expected_ticket_ciphertext_chacha20 = hexBytes("8e8db3658013fde33ef8a9ac26a49921417cac8b71e56e89d36bd4c4e90f742a289a4e7f72c09b70917b1f30cf25bdc313bfb3757cf9986ffd944344b6bf3f0f130338c820ead63b7ac2fe8e7de99e2775c099a5f169706cce41fc6f66677055294309168b1e30e82ed04f8ce47f1353840a20a69edcff463cb15506f7e7020ef725d37009aed9e533eb9048982f53a15638d7de4aaa1eaef0249cc846634d9c497866c7ac02dbbf95ae1aca51382a742c389cee2a3ae88997");
+const expected_ticket_tag_aes128 = hexBytes("ba11b6e8aa17eb5ff5e035df9c1d1fe0");
+const expected_ticket_tag_aes256 = hexBytes("132365a4fe41ecf4f36a1f6e4c667e3c");
+const expected_ticket_tag_chacha20 = hexBytes("026dc5c35bf97bf642a3d5cf580a2a0a");
+const expected_ticket_envelope_aes128 = hexBytes("5444544b0101000000112233445566778899aabbccddeeffa0a1a2a30000000000000377c8a6da034a177480f14d9c792c1bce52d79b45d6ce6e9979a1ed932a0c19524c3e91a65ebc88ed4a707cb4fbed0243b33a9074c0a5113a09544c80b729f2bd1f982ce05146259033b7b7a60904bc295262fe725dabb59a77080ef7989961e00db923beeae0d126a966a4ce2bcd194ccdfb8a766fb9730d7225ca23dc42ae48ba73e816e95f68518478011d37e8a021bbc1d19101366bf0fddf9578def815624e0b7cec115fe2327339d9118d31d7fe9d01c366bb8b8ba08a8dba11b6e8aa17eb5ff5e035df9c1d1fe0");
+const expected_ticket_envelope_aes256 = hexBytes("5444544b0102000000112233445566778899aabbccddeeffa0a1a2a30000000000000377d44e63bba33981f43100d675d38184cfa2e23552c289cb8766278a3a9fd668f4722267bea776dc38304546ac8bcacb535cafa708fda436df0731009cc4c524277621ca9b26ffa25140e3c99f8c2536c63d9e04567c951de491165eead7e305edcf8d26ca7f6f0f826714c2dc50e733e6f8fb8074249d51fb16d38412945c7ddb62c7961ab592004c5dde614644695f102f063c535447b80fa1c50ed352fd2c9218ebcbd3595546e4e4c6dc28d7fec4cfcce89d5c5ffb64b556c0d92fb2cc5d73dd41c28c2bde82963c132365a4fe41ecf4f36a1f6e4c667e3c");
+const expected_ticket_envelope_chacha20 = hexBytes("5444544b0103000000112233445566778899aabbccddeeffa0a1a2a300000000000003778e8db3658013fde33ef8a9ac26a49921417cac8b71e56e89d36bd4c4e90f742a289a4e7f72c09b70917b1f30cf25bdc313bfb3757cf9986ffd944344b6bf3f0f130338c820ead63b7ac2fe8e7de99e2775c099a5f169706cce41fc6f66677055294309168b1e30e82ed04f8ce47f1353840a20a69edcff463cb15506f7e7020ef725d37009aed9e533eb9048982f53a15638d7de4aaa1eaef0249cc846634d9c497866c7ac02dbbf95ae1aca51382a742c389cee2a3ae88997026dc5c35bf97bf642a3d5cf580a2a0a");
+
+fn expectedTicketCiphertext(aead: provider.Aead) []const u8 {
+    return switch (aead) {
+        .aes_128_gcm => &expected_ticket_ciphertext_aes128,
+        .aes_256_gcm => &expected_ticket_ciphertext_aes256,
+        .chacha20_poly1305 => &expected_ticket_ciphertext_chacha20,
+    };
+}
+
+fn expectedTicketTag(aead: provider.Aead) []const u8 {
+    return switch (aead) {
+        .aes_128_gcm => &expected_ticket_tag_aes128,
+        .aes_256_gcm => &expected_ticket_tag_aes256,
+        .chacha20_poly1305 => &expected_ticket_tag_chacha20,
+    };
+}
+
+fn expectedTicketEnvelope(aead: provider.Aead) []const u8 {
+    return switch (aead) {
+        .aes_128_gcm => &expected_ticket_envelope_aes128,
+        .aes_256_gcm => &expected_ticket_envelope_aes256,
+        .chacha20_poly1305 => &expected_ticket_envelope_chacha20,
+    };
+}
+
 fn expectTicketResolveMiss(protector: *ticket_protection.Protector, allocator: std.mem.Allocator, identity: []const u8) !void {
     var out: session.ServerRecoverableState = .{};
     defer out.deinit();
     try testing.expect(!try protector.resolve(allocator, identity, 1_500_000, &out));
     try testing.expectEqual(@as(usize, 0), out.common.resumption_psk.slice().len);
 }
+
+fn expectRawAeadAuthFailureParity(
+    allocator: std.mem.Allocator,
+    cp: provider.CryptoProvider,
+    aead: provider.Aead,
+    key: []const u8,
+    nonce: []const u8,
+    aad: []const u8,
+    ciphertext: []const u8,
+    tag: []const u8,
+) !void {
+    const plaintext = try allocator.alloc(u8, ciphertext.len);
+    defer allocator.free(plaintext);
+    try testing.expectError(error.AuthenticationFailed, cp.aeadOpen(aead, key, nonce, aad, ciphertext, tag, plaintext));
+    var oracle = try runEvpAeadOpen(allocator, aead, key, nonce, aad, ciphertext, tag);
+    defer oracle.deinit(allocator);
+    try expectEvpStatus(&oracle, .auth_fail);
+}
+
+const CapabilityDenyProvider = struct {
+    base: provider.CryptoProvider,
+    denied_aead: provider.Aead,
+
+    fn cryptoProvider(self: *CapabilityDenyProvider) provider.CryptoProvider {
+        return .{ .context = self, .vtable = &vtable, .entropy = self.base.entropy };
+    }
+
+    fn fromContext(ctx: *anyopaque) *CapabilityDenyProvider {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn capabilities(ctx: *anyopaque) provider.Capabilities {
+        const me = fromContext(ctx);
+        var caps = me.base.capabilities();
+        caps.aeads.remove(me.denied_aead);
+        return caps;
+    }
+
+    fn hkdfExtract(ctx: *anyopaque, hash: provider.Hash, salt: []const u8, ikm: []const u8, out: []u8) provider.HkdfError!void {
+        return fromContext(ctx).base.hkdfExtract(hash, salt, ikm, out);
+    }
+
+    fn hkdfExpandLabel(ctx: *anyopaque, hash: provider.Hash, secret: []const u8, label: []const u8, hash_context: []const u8, out: []u8) provider.HkdfError!void {
+        return fromContext(ctx).base.hkdfExpandLabel(hash, secret, label, hash_context, out);
+    }
+
+    fn aeadSeal(ctx: *anyopaque, aead: provider.Aead, key: []const u8, nonce: []const u8, associated_data: []const u8, plaintext: []const u8, ciphertext: []u8, tag: []u8) provider.SealError!void {
+        return fromContext(ctx).base.aeadSeal(aead, key, nonce, associated_data, plaintext, ciphertext, tag);
+    }
+
+    fn aeadOpen(ctx: *anyopaque, aead: provider.Aead, key: []const u8, nonce: []const u8, associated_data: []const u8, ciphertext: []const u8, tag: []const u8, plaintext: []u8) provider.OpenError!void {
+        return fromContext(ctx).base.aeadOpen(aead, key, nonce, associated_data, ciphertext, tag, plaintext);
+    }
+
+    fn quicHeaderProtectionMask(ctx: *anyopaque, hp: provider.QuicHeaderProtection, key: []const u8, sample: []const u8, mask: []u8) provider.QuicHeaderProtectionError!void {
+        return fromContext(ctx).base.quicHeaderProtectionMask(hp, key, sample, mask);
+    }
+
+    fn generateKeyShare(ctx: *anyopaque, group: provider.Group, public_out: []u8, private_out: []u8) provider.KeyShareError!void {
+        return fromContext(ctx).base.generateKeyShare(group, public_out, private_out);
+    }
+
+    fn deriveSharedSecret(ctx: *anyopaque, group: provider.Group, private_scalar: []const u8, peer_public: []const u8, out: []u8) provider.DeriveError!void {
+        return fromContext(ctx).base.deriveSharedSecret(group, private_scalar, peer_public, out);
+    }
+
+    fn verify(ctx: *anyopaque, scheme: provider.SignatureScheme, public_key: []const u8, message: []const u8, signature: []const u8) provider.VerifyError!void {
+        return fromContext(ctx).base.verify(scheme, public_key, message, signature);
+    }
+
+    const vtable = provider.CryptoProvider.VTable{
+        .capabilities = capabilities,
+        .hkdfExtract = hkdfExtract,
+        .hkdfExpandLabel = hkdfExpandLabel,
+        .aeadSeal = aeadSeal,
+        .aeadOpen = aeadOpen,
+        .quicHeaderProtectionMask = quicHeaderProtectionMask,
+        .generateKeyShare = generateKeyShare,
+        .deriveSharedSecret = deriveSharedSecret,
+        .verify = verify,
+    };
+};
 
 fn runProtectedTicketForAead(allocator: std.mem.Allocator, aead: provider.Aead) !void {
     const cp = cryptoProvider();
@@ -1497,12 +1649,15 @@ fn runProtectedTicketForAead(allocator: std.mem.Allocator, aead: provider.Aead) 
     try expectEvpStatus(&oracle, .ok);
     try expectStage("protected ticket provider ciphertext", native_ciphertext, oracle.fields[0].?);
     try expectStage("protected ticket provider tag", &native_tag, oracle.fields[1].?);
+    try expectStage("protected ticket pinned ciphertext", expectedTicketCiphertext(aead), native_ciphertext);
+    try expectStage("protected ticket pinned tag", expectedTicketTag(aead), &native_tag);
 
     var expected_envelope = try allocator.alloc(u8, ticket_protection.fixed_header_len + plaintext.len + provider.aead_tag_len);
     defer allocator.free(expected_envelope);
     @memcpy(expected_envelope[0..ticket_protection.fixed_header_len], &header);
     @memcpy(expected_envelope[ticket_protection.fixed_header_len..][0..plaintext.len], native_ciphertext);
     @memcpy(expected_envelope[ticket_protection.fixed_header_len + plaintext.len ..], &native_tag);
+    try expectStage("protected ticket pinned envelope", expectedTicketEnvelope(aead), expected_envelope);
 
     const parsed = try ticket_protection.parseEnvelope(expected_envelope, session.Limits.default);
     try testing.expectEqual(aead, parsed.aead);
@@ -1544,11 +1699,13 @@ fn runProtectedTicketForAead(allocator: std.mem.Allocator, aead: provider.Aead) 
     var bad_tag = try allocator.dupe(u8, sealed);
     defer allocator.free(bad_tag);
     bad_tag[bad_tag.len - 1] ^= 0x01;
+    try expectRawAeadAuthFailureParity(allocator, cp, aead, key, &nonce, &aad, parsed.ciphertext, bad_tag[bad_tag.len - provider.aead_tag_len ..]);
     try expectTicketResolveMiss(&protector, allocator, bad_tag);
 
     var bad_ciphertext = try allocator.dupe(u8, sealed);
     defer allocator.free(bad_ciphertext);
     bad_ciphertext[ticket_protection.fixed_header_len] ^= 0x01;
+    try expectRawAeadAuthFailureParity(allocator, cp, aead, key, &nonce, &aad, bad_ciphertext[ticket_protection.fixed_header_len .. bad_ciphertext.len - provider.aead_tag_len], parsed.tag);
     try expectTicketResolveMiss(&protector, allocator, bad_ciphertext);
 
     var bad_header = try allocator.dupe(u8, sealed);
@@ -1560,6 +1717,10 @@ fn runProtectedTicketForAead(allocator: std.mem.Allocator, aead: provider.Aead) 
     defer allocator.free(wrong_aead);
     wrong_aead[5] = if (aead == .aes_128_gcm) ticket_protection.encodeAeadId(.aes_256_gcm) else ticket_protection.encodeAeadId(.aes_128_gcm);
     try expectTicketResolveMiss(&protector, allocator, wrong_aead);
+
+    var bad_aad = aad;
+    bad_aad[bad_aad.len - 1] ^= 0x01;
+    try expectRawAeadAuthFailureParity(allocator, cp, aead, key, &nonce, &bad_aad, parsed.ciphertext, parsed.tag);
 
     var truncated_ciphertext = try allocator.alloc(u8, sealed.len - 1);
     defer allocator.free(truncated_ciphertext);
@@ -1580,6 +1741,12 @@ fn runProtectedTicketForAead(allocator: std.mem.Allocator, aead: provider.Aead) 
     try wrong_keyring.install(wrong_snapshot);
     var wrong_protector = ticket_protection.Protector{ .provider = cp, .keyring = &wrong_keyring, .limits = session.Limits.default };
     try expectTicketResolveMiss(&wrong_protector, allocator, sealed);
+
+    var deny = CapabilityDenyProvider{ .base = cp, .denied_aead = aead };
+    var unsupported_protector = ticket_protection.Protector{ .provider = deny.cryptoProvider(), .keyring = &keyring, .limits = session.Limits.default };
+    var unsupported_out: session.ServerRecoverableState = .{};
+    defer unsupported_out.deinit();
+    try testing.expectError(error.UnsupportedCapability, unsupported_protector.resolve(allocator, sealed, 1_500_000, &unsupported_out));
 
     var opened = try runEvpAeadOpen(allocator, aead, key, &nonce, &aad, parsed.ciphertext, parsed.tag);
     defer opened.deinit(allocator);
