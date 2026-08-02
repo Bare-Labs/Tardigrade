@@ -133,8 +133,8 @@ pub fn reserveNonceLeasesInFile(allocator: std.mem.Allocator, path: []const u8, 
 
     var out = std.array_list.Managed(u8).init(allocator);
     // Zero-and-raw-free the whole backing allocation via `allocatedSlice()`
-    // (not `out.deinit()`, which frees through ordinary `Allocator.free`)
-    // so the region handed to `rawFree` matches the region wiped exactly —
+    // (not `out`'s own plain-`Allocator.free`-backed deinit method) so the
+    // region handed to `rawFree` matches the region wiped exactly —
     // `out.items` alone would under-cover any unused capacity `serialize`'s
     // growth reserved past the logical length.
     defer crypto.secrets.secureZeroAndFree(allocator, out.allocatedSlice());
@@ -404,10 +404,10 @@ test "OwnedSnapshot.deinit hands the allocator zeroed key bytes, not Allocator.f
 
     snapshot.deinit();
 
-    // A plain `allocator.free(key_storage)` would leave these bytes intact
-    // (or replaced with build-mode-dependent poison, never guaranteed
-    // zero); `secureZeroAndFreeAligned` must scrub them before `deinit`
-    // returns, anywhere in the shared backing buffer.
+    // A plain ordinary `Allocator.free` of `key_storage` would leave these
+    // bytes intact (or replaced with build-mode-dependent poison, never
+    // guaranteed zero); `secureZeroAndFreeAligned` must scrub them before
+    // `deinit` returns, anywhere in the shared backing buffer.
     try std.testing.expect(std.mem.indexOf(u8, &backing, &key_copy) == null);
 }
 

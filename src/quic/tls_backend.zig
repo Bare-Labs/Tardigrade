@@ -581,8 +581,7 @@ fn translate(allocator: ?std.mem.Allocator, source: *RecordSink, destination: *E
                     try destination.emitHandshakeBytes(toLevel(item.epoch), item.data);
                 } else if (source.takeOwnedHandshakePayload(index)) |payload| {
                     destination.emitOwnedHandshakeBytes(payload.allocator, toLevel(item.epoch), payload.bytes) catch |err| {
-                        std.crypto.secureZero(u8, payload.bytes);
-                        payload.allocator.free(payload.bytes);
+                        crypto_pkg.secrets.secureZeroAndFree(payload.allocator, payload.bytes);
                         return err;
                     };
                 } else {

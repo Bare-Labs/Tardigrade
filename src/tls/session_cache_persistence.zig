@@ -125,7 +125,8 @@ fn readHeader(bytes: []const u8, max_plaintext_bytes: usize) SnapshotDecodeError
 
 /// Encodes every live client entry into a single owned plaintext buffer.
 /// The returned buffer contains bearer secrets (raw tickets, PSKs): the
-/// caller must wipe it (`secrets.secureZero`) before freeing, on every path.
+/// caller must wipe it (`secrets.secureZeroAndFree`, not a separate zero
+/// then an ordinary free) on every path.
 pub fn encodeClientSnapshotAlloc(
     allocator: std.mem.Allocator,
     entries: []const session_cache.PersistedClientEntry,
@@ -139,10 +140,7 @@ pub fn encodeClientSnapshotAlloc(
     }
 
     const buf = try allocator.alloc(u8, total);
-    errdefer {
-        secrets.secureZero(buf);
-        allocator.free(buf);
-    }
+    errdefer secrets.secureZeroAndFree(allocator, buf);
 
     writeHeader(buf, .client, @intCast(entries.len));
     var pos: usize = header_len;
@@ -179,10 +177,7 @@ pub fn encodeServerSnapshotAlloc(
     }
 
     const buf = try allocator.alloc(u8, total);
-    errdefer {
-        secrets.secureZero(buf);
-        allocator.free(buf);
-    }
+    errdefer secrets.secureZeroAndFree(allocator, buf);
 
     writeHeader(buf, .server, @intCast(entries.len));
     var pos: usize = header_len;
@@ -411,17 +406,11 @@ pub fn saveClientCache(
     }
 
     const plaintext = encodeClientSnapshotAlloc(cache.allocator, snapshot.items, limits) catch return .allocation_failed;
-    defer {
-        secrets.secureZero(plaintext);
-        cache.allocator.free(plaintext);
-    }
+    defer secrets.secureZeroAndFree(cache.allocator, plaintext);
 
     const sealed_len = protector.sealedLen(plaintext.len);
     const sealed_buf = cache.allocator.alloc(u8, sealed_len) catch return .allocation_failed;
-    defer {
-        secrets.secureZero(sealed_buf);
-        cache.allocator.free(sealed_buf);
-    }
+    defer secrets.secureZeroAndFree(cache.allocator, sealed_buf);
     const sealed = protector.seal(plaintext, sealed_buf) catch return .protection_failed;
 
     backend.save(sealed) catch return .backend_failed;
@@ -443,19 +432,13 @@ pub fn loadClientCache(
     defer cache.endPersistenceOperation(token);
 
     const sealed = (backend.load(cache.allocator) catch return .backend_failed) orelse return .absent;
-    defer {
-        secrets.secureZero(sealed);
-        cache.allocator.free(sealed);
-    }
+    defer secrets.secureZeroAndFree(cache.allocator, sealed);
 
     const max_plaintext_bytes = maxPlaintextBytesFor(cache.limits);
     const plaintext_len = protector.openLen(sealed.len);
     if (plaintext_len > max_plaintext_bytes) return .corrupted;
     const plaintext_buf = cache.allocator.alloc(u8, plaintext_len) catch return .allocation_failed;
-    defer {
-        secrets.secureZero(plaintext_buf);
-        cache.allocator.free(plaintext_buf);
-    }
+    defer secrets.secureZeroAndFree(cache.allocator, plaintext_buf);
     const plaintext = protector.open(sealed, plaintext_buf) catch return .protection_failed;
 
     var entries = decodeClientSnapshotAlloc(cache.allocator, limits, cache.limits.max_entries, max_plaintext_bytes, plaintext) catch |err| return mapDecodeError(err);
@@ -512,17 +495,11 @@ pub fn saveServerCache(
     }
 
     const plaintext = encodeServerSnapshotAlloc(cache.allocator, snapshot.items, limits) catch return .allocation_failed;
-    defer {
-        secrets.secureZero(plaintext);
-        cache.allocator.free(plaintext);
-    }
+    defer secrets.secureZeroAndFree(cache.allocator, plaintext);
 
     const sealed_len = protector.sealedLen(plaintext.len);
     const sealed_buf = cache.allocator.alloc(u8, sealed_len) catch return .allocation_failed;
-    defer {
-        secrets.secureZero(sealed_buf);
-        cache.allocator.free(sealed_buf);
-    }
+    defer secrets.secureZeroAndFree(cache.allocator, sealed_buf);
     const sealed = protector.seal(plaintext, sealed_buf) catch return .protection_failed;
 
     backend.save(sealed) catch return .backend_failed;
@@ -545,19 +522,13 @@ pub fn loadServerCache(
     defer cache.endPersistenceOperation(token);
 
     const sealed = (backend.load(cache.allocator) catch return .backend_failed) orelse return .absent;
-    defer {
-        secrets.secureZero(sealed);
-        cache.allocator.free(sealed);
-    }
+    defer secrets.secureZeroAndFree(cache.allocator, sealed);
 
     const max_plaintext_bytes = maxPlaintextBytesFor(cache.limits);
     const plaintext_len = protector.openLen(sealed.len);
     if (plaintext_len > max_plaintext_bytes) return .corrupted;
     const plaintext_buf = cache.allocator.alloc(u8, plaintext_len) catch return .allocation_failed;
-    defer {
-        secrets.secureZero(plaintext_buf);
-        cache.allocator.free(plaintext_buf);
-    }
+    defer secrets.secureZeroAndFree(cache.allocator, plaintext_buf);
     const plaintext = protector.open(sealed, plaintext_buf) catch return .protection_failed;
 
     var entries = decodeServerSnapshotAlloc(cache.allocator, limits, cache.limits.max_entries, max_plaintext_bytes, plaintext) catch |err| return mapDecodeError(err);
@@ -634,10 +605,7 @@ const MemoryBackend = struct {
     bytes: ?[]u8 = null,
 
     fn deinit(self: *MemoryBackend) void {
-        if (self.bytes) |b| {
-            secrets.secureZero(b);
-            self.allocator.free(b);
-        }
+        if (self.bytes) |b| secrets.secureZeroAndFree(self.allocator, b);
         self.bytes = null;
     }
 
@@ -657,10 +625,7 @@ const MemoryBackend = struct {
         const self: *MemoryBackend = @ptrCast(@alignCast(ctx));
         const copy = self.allocator.alloc(u8, bytes.len) catch return error.BackendFailed;
         @memcpy(copy, bytes);
-        if (self.bytes) |old| {
-            secrets.secureZero(old);
-            self.allocator.free(old);
-        }
+        if (self.bytes) |old| secrets.secureZeroAndFree(self.allocator, old);
         self.bytes = copy;
     }
 };
@@ -726,10 +691,7 @@ test "client snapshot round trips through encode/decode, including order metadat
     defer for (&entries) |*e| e.deinit();
 
     const bytes = try encodeClientSnapshotAlloc(testing.allocator, &entries, session.Limits.default);
-    defer {
-        secrets.secureZero(bytes);
-        testing.allocator.free(bytes);
-    }
+    defer secrets.secureZeroAndFree(testing.allocator, bytes);
 
     var decoded = try decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, bytes);
     defer {
@@ -754,10 +716,7 @@ test "server snapshot preserves the exact handle and LRU sequence" {
     defer for (&entries) |*e| e.deinit();
 
     const bytes = try encodeServerSnapshotAlloc(testing.allocator, &entries, session.Limits.default);
-    defer {
-        secrets.secureZero(bytes);
-        testing.allocator.free(bytes);
-    }
+    defer secrets.secureZeroAndFree(testing.allocator, bytes);
     var decoded = try decodeServerSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, bytes);
     defer {
         for (decoded.items) |*p| p.deinit();
@@ -773,10 +732,7 @@ test "decode rejects truncated, bad-magic, and unsupported-version snapshots" {
     var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = t1, .usage = .reusable }};
     defer for (&entries) |*e| e.deinit();
     const bytes = try encodeClientSnapshotAlloc(testing.allocator, &entries, session.Limits.default);
-    defer {
-        secrets.secureZero(bytes);
-        testing.allocator.free(bytes);
-    }
+    defer secrets.secureZeroAndFree(testing.allocator, bytes);
 
     try testing.expectError(error.Truncated, decodeClientSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, bytes[0..5]));
 
@@ -800,10 +756,7 @@ test "decode rejects a declared record count over the target cache's entry limit
     var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = t1, .usage = .reusable }};
     defer for (&entries) |*e| e.deinit();
     const bytes = try encodeClientSnapshotAlloc(testing.allocator, &entries, session.Limits.default);
-    defer {
-        secrets.secureZero(bytes);
-        testing.allocator.free(bytes);
-    }
+    defer secrets.secureZeroAndFree(testing.allocator, bytes);
 
     // A single real record, but a corrupted count claiming ~4 billion.
     const bombed = try testing.allocator.dupe(u8, bytes);
@@ -822,10 +775,7 @@ test "decode rejects trailing bytes after the declared record count, even with a
     var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = t1, .usage = .reusable }};
     defer for (&entries) |*e| e.deinit();
     const bytes = try encodeClientSnapshotAlloc(testing.allocator, &entries, session.Limits.default);
-    defer {
-        secrets.secureZero(bytes);
-        testing.allocator.free(bytes);
-    }
+    defer secrets.secureZeroAndFree(testing.allocator, bytes);
     var with_trailer = try testing.allocator.alloc(u8, bytes.len + 3);
     defer testing.allocator.free(with_trailer);
     @memcpy(with_trailer[0..bytes.len], bytes);
@@ -842,10 +792,7 @@ test "decode rejects a server handle with a non-zero reserved field or wrong mag
     var entries = [_]session_cache.PersistedServerEntry{.{ .handle = handle, .usage = .reusable, .state = s1 }};
     defer for (&entries) |*e| e.deinit();
     const bytes = try encodeServerSnapshotAlloc(testing.allocator, &entries, session.Limits.default);
-    defer {
-        secrets.secureZero(bytes);
-        testing.allocator.free(bytes);
-    }
+    defer secrets.secureZeroAndFree(testing.allocator, bytes);
     try testing.expectError(error.InvalidHandle, decodeServerSnapshotAlloc(testing.allocator, session.Limits.default, session_cache.hard_max_entries, fallback_max_snapshot_bytes, bytes));
 }
 
@@ -1276,10 +1223,7 @@ test "restoreEntries duplicate-handle rejection propagates through loadServerCac
         .{ .handle = dup_handle, .usage = .reusable, .state = sb },
     };
     const bytes = try encodeServerSnapshotAlloc(testing.allocator, &dup_entries, session.Limits.default);
-    defer {
-        secrets.secureZero(bytes);
-        testing.allocator.free(bytes);
-    }
+    defer secrets.secureZeroAndFree(testing.allocator, bytes);
     for (&dup_entries) |*e| e.deinit();
 
     var backend = MemoryBackend{ .allocator = testing.allocator };
@@ -1304,10 +1248,7 @@ test "restore allocation failure aborts the load atomically, leaving the live ca
     var to_persist = try testClient(testing.allocator, "incoming", "example.test");
     var entries = [_]session_cache.PersistedClientEntry{.{ .ticket = to_persist, .usage = .reusable }};
     const bytes = try encodeClientSnapshotAlloc(testing.allocator, &entries, session.Limits.default);
-    defer {
-        secrets.secureZero(bytes);
-        testing.allocator.free(bytes);
-    }
+    defer secrets.secureZeroAndFree(testing.allocator, bytes);
     to_persist.deinit();
 
     var backend = MemoryBackend{ .allocator = fba.allocator() };

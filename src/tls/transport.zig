@@ -123,8 +123,7 @@ pub fn ContractWithOptions(
             fn freeOwnedPayloads(self: *EventSink) void {
                 for (self.owned[0..self.len]) |*owned| {
                     if (owned.*) |payload| {
-                        crypto_secrets.secureZero(payload.bytes);
-                        payload.allocator.free(payload.bytes);
+                        crypto_secrets.secureZeroAndFree(payload.allocator, payload.bytes);
                         owned.* = null;
                     }
                 }
@@ -200,10 +199,7 @@ pub fn ContractWithOptions(
                 if (self.hasByteCapacity(data.len)) return self.emitHandshakeBytes(epoch, data);
                 if (!self.hasEventCapacity()) return buffer_overflow_error;
                 const copy = allocator.alloc(u8, data.len) catch return buffer_overflow_error;
-                errdefer {
-                    crypto_secrets.secureZero(copy);
-                    allocator.free(copy);
-                }
+                errdefer crypto_secrets.secureZeroAndFree(allocator, copy);
                 @memcpy(copy, data);
                 try self.emitOwnedHandshakeBytes(allocator, epoch, copy);
             }

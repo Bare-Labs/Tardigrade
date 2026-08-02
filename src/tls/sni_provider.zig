@@ -975,7 +975,11 @@ test "snapshot owns chain and pattern copies after caller mutation" {
         .is_default = true,
     };
     try provider.reload(&.{config}, .{});
-    @memset(cert_copy, 0);
+    // Corrupt the caller's own copies (a non-zero fill, not a wipe — these
+    // are public certificate/hostname-pattern bytes, not secrets) to prove
+    // `reload` took its own independent copies rather than retaining these
+    // buffers.
+    @memset(cert_copy, 0xaa);
     @memset(pattern, 'x');
 
     var selection = testSelection("mutable.example.test", &.{0x0807});

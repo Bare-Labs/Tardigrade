@@ -678,9 +678,53 @@ All notable user-facing changes to Tardigrade are documented here.
   QUIC Retry-token key ring and stateless-reset key lifecycle, session
   cache, credentials, identity loading) was already compliant, largely from
   #549's earlier secret-lifecycle hardening. Deferred: extending
-  `scripts/audit_crypto_boundary.zig` to guard against regression (#554)
-  and consolidating the duplicate Retry-integrity-tag implementation
-  (#555).
+  `scripts/audit_crypto_boundary.zig` to guard against regression (#554,
+  done below) and consolidating the duplicate Retry-integrity-tag
+  implementation (#555).
+- **`audit_crypto_boundary` now guards #375's constant-time/zeroization
+  findings, not just #490's provider boundary (#554)** — `zig build
+  audit-crypto-boundary` fails if a raw `std.crypto.timing_safe`/
+  `crypto.timing_safe` call (direct or captured into a local alias)
+  reappears anywhere in `src/tls`, `src/quic`, `src/pki`, or `src/crypto`
+  outside `secrets.zig`'s own `constantTimeEqual`; or if a `secureZero(...)`
+  call's buffer — tracked through `sliceAsBytes`/`&`/rename indirection, not
+  just by historical variable name — is later handed to a plain
+  `allocator.free`/`.deinit()` instead of
+  `secureZeroAndFree`/`secureZeroAndFreeAligned`, anywhere in that same
+  scope. Applying the zero-then-free scan generally (not just to the three
+  files #375 fixed) surfaced six more real instances of the identical defect
+  that #375's own inventory missed — `identity_loader.zig`,
+  `tls13_backend.zig`'s `PostHandshakeInput`/`NewSessionTicket` buffer,
+  `transport.zig`'s `EventSink`, `quic/connection.zig`'s `CryptoTx`,
+  `quic/tls_backend.zig`'s oversized-payload error path, and
+  `session_cache_persistence.zig`'s `MemoryBackend`/save/load paths and test
+  helpers — all fixed alongside the guard. Not a project-wide ban on the raw
+  `std.crypto.secureZero` spelling on its own: most of `src/tls`/`src/quic`
+  legitimately zeroes a stack-local buffer with nothing to free, and #375
+  itself classifies several comparisons in this scope as public and
+  correctly left ordinary. A second review round found the `timing_safe`
+  needles still qualifier-dependent (aliasing `std.crypto` itself, one level
+  higher, defeated them — fixed by matching the bare `timing_safe` token,
+  qualifier-independent) and the zero-then-free scanner still defeated by a
+  callee alias of `secureZero` or a buffer rename between the zero call and
+  the free (fixed with one-hop alias resolution for both) and by
+  `BoundedSecret.deinit`'s exact original regression reintroduced via a local
+  rename that survives across its sibling `clearAll` method (fixed with a
+  dedicated, asset-specific structural check for that one type). A third
+  round found the scanner still forward-only (missing the ordinary
+  `defer`-runs-LIFO idiom, where a free's `defer` written before a zero's
+  `defer` still executes after it — fixed by widening the scan to the whole
+  enclosing function), missing manual `@memset(buf, 0)` clears outside the
+  `secureZero` wrapper entirely (added, scoped to skip `test` blocks, which
+  zero-fill fixture data for reasons unrelated to secret hygiene in a way
+  indistinguishable from a real wipe), returning only the first buffer
+  rename instead of every one (a harmless first alias was shadowing the
+  actually-freed second), and blacklisting known-bad `BoundedSecret` frees
+  instead of positively requiring the canonical call (`allocator.rawFree`
+  bypassed the blacklist entirely, being the *correct* spelling inside
+  `secureZeroAndFree`'s own body). Widening the window also surfaced an
+  identifier-suffix false positive (`self.selected_client_psk.deinit()`
+  matching a candidate key `psk`), fixed with a token-boundary check.
 - **Native TLS listener now tolerates the RFC 8446 Appendix D.4
   middlebox-compatibility `change_cipher_spec` record (#369)** — the
   record layer required every post-ClientHello record's outer wire type
