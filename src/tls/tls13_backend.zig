@@ -5986,7 +5986,12 @@ test "application reassembler accepts exact maximum ticket and rejects one byte 
     over_client.core.handshake_lifecycle = .complete;
     const over = try std.testing.allocator.alloc(u8, max_new_session_ticket_message_len + 1);
     defer std.testing.allocator.free(over);
-    @memset(over, 0);
+    // Non-zero filler: only the header this test explicitly overwrites
+    // below actually matters, and using a non-zero pattern keeps this
+    // ordinary test-fixture initialization from resembling a secret
+    // zero-clear-then-free (this buffer is oversized ticket-message
+    // filler, not secret material).
+    @memset(over, 0xcc);
     over[0] = @intFromEnum(MessageType.new_session_ticket);
     std.mem.writeInt(u24, over[1..4], max_new_session_ticket_message_len - 3, .big);
     try std.testing.expectError(error.HandshakeBufferOverflow, over_client.backend().receive(.application, over, &sink));

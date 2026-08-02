@@ -798,28 +798,46 @@ const TokenIterator = struct {
     }
 };
 
+/// True if some call `NAME(` in `window` has `key` as its first positional
+/// argument, tolerant of interior whitespace/newlines and a trailing comma
+/// (`allocator.free(\n    secret_buf,\n)` must match exactly like
+/// `allocator.free(secret_buf)` — #554 review, fourth pass: the naive
+/// "identifier immediately after `free(`, immediately before `)`" check this
+/// replaced rejected anything reformatted across lines). Reuses
+/// `extractCallArgs`/`firstArgument` — the same balanced-bracket argument
+/// parser the zero-call side already relies on — instead of a second,
+/// less careful ad hoc scan.
+fn callArgumentMatches(window: []const u8, name: []const u8, key: []const u8) bool {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, window, search_from, name)) |p| {
+        search_from = p + 1;
+        const open_paren = p + name.len - 1;
+        const args = extractCallArgs(window, open_paren) orelse continue;
+        if (std.mem.eql(u8, firstArgument(args), key)) return true;
+    }
+    return false;
+}
+
 /// True if `window` contains an ordinary free/deinit of `key`: `key` handed
-/// to a `.free(`/`allocator.free(` call as its sole argument, or
-/// `.deinit(`/`.free(` called *on* `key` as receiver (the
-/// `ArrayList`/similar-container shape). Deliberately agnostic about what
-/// precedes `free(` (the allocator expression — `allocator.free(key)`,
-/// `self.allocator.free(key)`, and `fba.allocator().free(key)` are all
-/// caught the same way) by searching for the bare `free(` substring rather
-/// than requiring a specific receiver spelling.
+/// to a `.free(`/`.rawFree(`/`allocator.free(`/`allocator.rawFree(` call as
+/// its first argument, or `.deinit(`/`.free(`/`.rawFree(` called *on* `key`
+/// as receiver (the `ArrayList`/similar-container shape). Deliberately
+/// agnostic about what precedes `free(`/`rawFree(` (the allocator
+/// expression — `allocator.free(key)`, `self.allocator.free(key)`, and
+/// `fba.allocator().free(key)` are all caught the same way) by searching for
+/// the bare call substring rather than requiring a specific receiver
+/// spelling. `rawFree` is included (#554 review, fourth pass): it is part of
+/// #375's inventory and releases the live buffer directly, bypassing
+/// `secureZeroAndFree`/`secureZeroAndFreeAligned` entirely, without matching
+/// any of the other forbidden spellings — `src/crypto/secrets.zig`'s own
+/// canonical implementations are excluded from this scan by file, not by
+/// this function ignoring `rawFree`, so no separate exemption is needed here
+/// for the canonical call itself.
 fn containsPlainFreeOf(window: []const u8, key: []const u8) bool {
     if (key.len == 0) return false;
+    if (callArgumentMatches(window, "free(", key)) return true;
+    if (callArgumentMatches(window, "rawFree(", key)) return true;
     var search_from: usize = 0;
-    while (std.mem.indexOfPos(u8, window, search_from, "free(")) |p| {
-        const after = p + "free(".len;
-        if (after + key.len < window.len and
-            std.mem.eql(u8, window[after..][0..key.len], key) and
-            window[after + key.len] == ')')
-        {
-            return true;
-        }
-        search_from = p + 1;
-    }
-    search_from = 0;
     while (std.mem.indexOfPos(u8, window, search_from, key)) |p| {
         search_from = p + 1;
         // `key` must start a genuine identifier token here, not be a
@@ -832,6 +850,7 @@ fn containsPlainFreeOf(window: []const u8, key: []const u8) bool {
         const after = p + key.len;
         if (after + ".deinit(".len <= window.len and std.mem.eql(u8, window[after..][0..".deinit(".len], ".deinit(")) return true;
         if (after + ".free(".len <= window.len and std.mem.eql(u8, window[after..][0..".free(".len], ".free(")) return true;
+        if (after + ".rawFree(".len <= window.len and std.mem.eql(u8, window[after..][0..".rawFree(".len], ".rawFree(")) return true;
     }
     return false;
 }
@@ -863,6 +882,18 @@ fn statementStart(contents: []const u8, at: usize) usize {
 
 const max_aliases = 8;
 
+/// A local callee alias of the zero helper, together with the span of the
+/// enclosing function/declaration it was bound in. Calls to `name` are only
+/// evidence of zeroing *within* `[scope_start, scope_end)` — resolving the
+/// alias's callee scan against the whole file would misattribute an
+/// unrelated same-named function or local elsewhere in the file to this
+/// alias (#554 review, fourth pass).
+const AliasInfo = struct {
+    name: []const u8,
+    scope_start: usize,
+    scope_end: usize,
+};
+
 /// Local callee aliases of the zero helper — `const wipe =
 /// crypto.secrets.secureZero;` followed by `wipe(buf)` — bound anywhere in
 /// `contents` (#554 review, second pass: a check that only recognizes the
@@ -873,7 +904,7 @@ const max_aliases = 8;
 /// char is 'A'` check, same as the direct-call scan) by a simple dotted-path
 /// expression, not an arbitrary computation. Bounded to `max_aliases`
 /// entries.
-fn findSecureZeroAliases(contents: []const u8, out: *[max_aliases][]const u8) usize {
+fn findSecureZeroAliases(contents: []const u8, out: *[max_aliases]AliasInfo) usize {
     var count: usize = 0;
     var search_from: usize = 0;
     while (count < max_aliases) {
@@ -893,7 +924,11 @@ fn findSecureZeroAliases(contents: []const u8, out: *[max_aliases][]const u8) us
         const kw_at = std.mem.lastIndexOf(u8, before_eq, kw) orelse continue;
         const name = std.mem.trim(u8, before_eq[kw_at + kw.len ..], " \t\r\n");
         if (!isSimpleIdent(name)) continue;
-        out[count] = name;
+        out[count] = .{
+            .name = name,
+            .scope_start = previousDeclarationBoundary(contents, rel),
+            .scope_end = nextDeclarationBoundary(contents, rel),
+        };
         count += 1;
     }
     return count;
@@ -956,17 +991,27 @@ fn findNextCall(contents: []const u8, from: usize, name: []const u8) ?usize {
 /// `secureZeroAndFree`/`secureZeroAndFreeAligned`, scoped to the rest of the
 /// enclosing function/declaration.
 fn firstZeroThenPlainFree(contents: []const u8) ?[]const u8 {
-    var alias_buf: [max_aliases][]const u8 = undefined;
+    var alias_buf: [max_aliases]AliasInfo = undefined;
     const alias_count = findSecureZeroAliases(contents, &alias_buf);
 
     if (scanZeroCalls(contents, "secureZero")) |key| return key;
     for (alias_buf[0..alias_count]) |alias| {
-        if (scanZeroCalls(contents, alias)) |key| return key;
+        // Scoped to the alias's own enclosing declaration, not the whole
+        // file (#554 review, fourth pass): searching all of `contents` for
+        // calls spelled `alias.name` would treat an unrelated same-named
+        // top-level function or a different local elsewhere in the file as
+        // if it were this alias.
+        if (scanZeroCalls(contents[alias.scope_start..alias.scope_end], alias.name)) |key| return key;
     }
     // Manual zero-and-free / volatile-clear (#554 review, third pass): a
     // clear implementation outside the canonical `secureZero` wrapper
     // entirely, e.g. `@memset(secret_buf, 0)` followed by a plain free.
     if (scanZeroCalls(contents, "@memset")) |key| return key;
+    // A hand-written zero-clear loop instead of a builtin/wrapper call
+    // (#554 review, fourth pass): neither `secureZero(` nor `@memset(`
+    // appears in source that clears a buffer one element at a time through
+    // `for (buf) |*byte| byte.* = 0;`.
+    if (scanZeroClearLoops(contents)) |key| return key;
     return null;
 }
 
@@ -980,6 +1025,71 @@ fn argForTrigger(trigger: []const u8, args: []const u8) []const u8 {
     return lastArgument(args);
 }
 
+/// True if `window` contains a `return <expr>;` whose expression is exactly
+/// `key` (one leading `&` stripped) — evidence the buffer is being handed
+/// back to the caller, not destroyed. A zero-fill paired with an
+/// `errdefer`-guarded free earlier in the same function (fallible
+/// initialization: allocate, `errdefer free` as a failure-path safety net,
+/// zero-initialize, then return the buffer to the caller) is ordinary
+/// initialization, not the #375 zero-then-destroy defect this scanner
+/// exists to catch (#554 review, fourth pass) — the buffer's lifetime
+/// continues in the caller, it is not being wiped before release.
+fn containsReturnOf(window: []const u8, key: []const u8) bool {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, window, search_from, "return ")) |p| {
+        const after = p + "return ".len;
+        search_from = after;
+        const semi = std.mem.indexOfScalarPos(u8, window, after, ';') orelse continue;
+        var expr = std.mem.trim(u8, window[after..semi], " \t\r\n");
+        if (expr.len > 0 and expr[0] == '&') expr = std.mem.trim(u8, expr[1..], " \t\r\n");
+        if (std.mem.eql(u8, expr, key)) return true;
+    }
+    return false;
+}
+
+/// Checks whether `buf_expr` (the buffer a zero call/loop at `trigger_pos`,
+/// ending at `call_end`, clears) is later handed to an ordinary free/deinit
+/// within the enclosing function/declaration — the shared "now that we have
+/// a zeroed buffer, is it plainly freed?" logic every trigger
+/// (`secureZero`, `@memset`, and the manual zero-clear loop) reduces to.
+fn checkBufferAgainstPlainFree(contents: []const u8, trigger_pos: usize, call_end: usize, buf_expr: []const u8) ?[]const u8 {
+    // The whole enclosing function/declaration, not just the text after the
+    // zero call: `defer` runs LIFO, so a free's own `defer` written
+    // textually *before* a zero call's `defer` still executes *after* it at
+    // runtime (#554 review, third pass) — a forward-only window would miss
+    // that free entirely.
+    const window_start = previousDeclarationBoundary(contents, trigger_pos);
+    const window_end = nextDeclarationBoundary(contents, call_end);
+    const window = contents[window_start..window_end];
+    var tokens = TokenIterator{ .text = buf_expr };
+    while (tokens.next()) |key| {
+        if (key.len < 2) continue;
+        if (containsReturnOf(window, key)) continue;
+        if (containsPlainFreeOf(window, key)) return key;
+        var renames: [max_aliases][]const u8 = undefined;
+        const rename_count = resolveBufferRenames(window, key, &renames);
+        for (renames[0..rename_count]) |renamed| {
+            if (containsReturnOf(window, renamed)) continue;
+            if (containsPlainFreeOf(window, renamed)) return renamed;
+        }
+        // The container-field fallback: `secureZero(out.items)` zeroes
+        // an `ArrayList`'s current contents, but the matching free is
+        // `out.deinit()` on the container itself, not
+        // `out.items.deinit()` — so also try the path with its last
+        // `.field` segment stripped. `self.bytes[a..b]` (a sub-range,
+        // not the whole buffer) reduces the same way to `self`, which
+        // `containsPlainFreeOf` still requires an *exact* `free(self)`/
+        // `self.deinit(`/`self.free(` match for — a real hit here is
+        // still the same true regression class, just via one more field
+        // of indirection than the field-only case.
+        if (std.mem.lastIndexOfScalar(u8, key, '.')) |dot| {
+            const parent = key[0..dot];
+            if (parent.len >= 2 and !containsReturnOf(window, parent) and containsPlainFreeOf(window, parent)) return parent;
+        }
+    }
+    return null;
+}
+
 fn scanZeroCalls(contents: []const u8, trigger: []const u8) ?[]const u8 {
     var search_from: usize = 0;
     while (findNextCall(contents, search_from, trigger)) |m| {
@@ -987,52 +1097,83 @@ fn scanZeroCalls(contents: []const u8, trigger: []const u8) ?[]const u8 {
         const open_paren = m + trigger.len;
         const args = extractCallArgs(contents, open_paren) orelse continue;
         const call_end = open_paren + args.len + 2; // past the matching ')'
-        // The whole enclosing function/declaration, not just the text after
-        // the zero call: `defer` runs LIFO, so a free's own `defer` written
-        // textually *before* a zero call's `defer` still executes *after*
-        // it at runtime (#554 review, third pass) — a forward-only window
-        // would miss that free entirely.
-        const window_start = previousDeclarationBoundary(contents, m);
-        if (std.mem.eql(u8, trigger, "@memset")) {
-            if (!isZeroLiteral(lastArgument(args))) continue;
-            // `@memset(buf, 0)` alone cannot be told apart, lexically, from
-            // deliberately zero-filling test fixture data — `test` blocks
-            // do this constantly for reasons unrelated to secret hygiene,
-            // and pairing it with the test's own ordinary
-            // `defer allocator.free(buf)` is not the #375 regression class
-            // this trigger exists to catch. `secureZero`, unambiguous
-            // either way, still scans test blocks in full.
-            if (std.mem.startsWith(u8, contents[window_start..], "test ")) continue;
-        }
+        if (std.mem.eql(u8, trigger, "@memset") and !isZeroLiteral(lastArgument(args))) continue;
         const buf_expr = argForTrigger(trigger, args);
-        const window_end = nextDeclarationBoundary(contents, call_end);
-        const window = contents[window_start..window_end];
-        var tokens = TokenIterator{ .text = buf_expr };
-        while (tokens.next()) |key| {
-            if (key.len < 2) continue;
-            if (containsPlainFreeOf(window, key)) return key;
-            var renames: [max_aliases][]const u8 = undefined;
-            const rename_count = resolveBufferRenames(window, key, &renames);
-            for (renames[0..rename_count]) |renamed| {
-                if (containsPlainFreeOf(window, renamed)) return renamed;
-            }
-            // The container-field fallback: `secureZero(out.items)` zeroes
-            // an `ArrayList`'s current contents, but the matching free is
-            // `out.deinit()` on the container itself, not
-            // `out.items.deinit()` — so also try the path with its last
-            // `.field` segment stripped. `self.bytes[a..b]` (a sub-range,
-            // not the whole buffer) reduces the same way to `self`, which
-            // `containsPlainFreeOf` still requires an *exact* `free(self)`/
-            // `self.deinit(`/`self.free(` match for — a real hit here is
-            // still the same true regression class, just via one more field
-            // of indirection than the field-only case.
-            if (std.mem.lastIndexOfScalar(u8, key, '.')) |dot| {
-                const parent = key[0..dot];
-                if (parent.len >= 2 and containsPlainFreeOf(window, parent)) return parent;
-            }
-        }
+        if (checkBufferAgainstPlainFree(contents, m, call_end, buf_expr)) |key| return key;
     }
     return null;
+}
+
+/// A hand-written zero-clear loop — `for (buf) |*byte| byte.* = 0;` (a
+/// braced or single-statement body, with or without a second index capture
+/// via `for (buf, 0..) |*byte, _|`) — clears a buffer one element at a time
+/// without ever calling `secureZero(` or `@memset(`, so neither existing
+/// trigger sees it (#554 review, fourth pass). Reduces to the same
+/// `checkBufferAgainstPlainFree` plain-free/rename detection as the other
+/// two triggers once the loop's iterable expression and element-assignment
+/// body are recognized.
+fn scanZeroClearLoops(contents: []const u8) ?[]const u8 {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, contents, search_from, "for (")) |for_pos| {
+        search_from = for_pos + 1;
+        const open_paren = for_pos + "for (".len - 1;
+        const loop_args = extractCallArgs(contents, open_paren) orelse continue;
+        const args_end = open_paren + loop_args.len + 2; // past the matching ')'
+
+        var i = args_end;
+        while (i < contents.len and std.ascii.isWhitespace(contents[i])) : (i += 1) {}
+        if (i >= contents.len or contents[i] != '|') continue;
+        i += 1;
+        if (i >= contents.len or contents[i] != '*') continue;
+        i += 1;
+        const name_start = i;
+        while (i < contents.len and isIdentCont(contents[i])) : (i += 1) {}
+        const elem_name = contents[name_start..i];
+        if (!isSimpleIdent(elem_name)) continue;
+        const capture_close = std.mem.indexOfScalarPos(u8, contents, i, '|') orelse continue;
+
+        var body_start = capture_close + 1;
+        while (body_start < contents.len and std.ascii.isWhitespace(contents[body_start])) : (body_start += 1) {}
+        const has_braces = body_start < contents.len and contents[body_start] == '{';
+        const body = if (has_braces)
+            extractCallArgs(contents, body_start) orelse continue
+        else blk: {
+            const semi = std.mem.indexOfScalarPos(u8, contents, body_start, ';') orelse continue;
+            break :blk contents[body_start..semi];
+        };
+        const body_end = if (has_braces) body_start + body.len + 2 else body_start + body.len + 1;
+
+        if (!isByteZeroClearBody(body, elem_name)) continue;
+        const buf_expr = firstArgument(loop_args);
+        if (checkBufferAgainstPlainFree(contents, for_pos, body_end, buf_expr)) |key| return key;
+    }
+    return null;
+}
+
+/// True if `body` (a zero-clear loop's element-capture body) assigns a zero
+/// literal through the element pointer `name`: `name.* = 0` (or `0x0`/
+/// `0x00`), tolerant of whitespace around `.*`/`=`.
+fn isByteZeroClearBody(body: []const u8, name: []const u8) bool {
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, body, search_from, name)) |p| {
+        search_from = p + 1;
+        if (p > 0 and isIdentCont(body[p - 1])) continue;
+        const after = p + name.len;
+        if (after + 2 > body.len or body[after] != '.' or body[after + 1] != '*') continue;
+        var i = after + 2;
+        while (i < body.len and std.ascii.isWhitespace(body[i])) : (i += 1) {}
+        if (i >= body.len or body[i] != '=') continue;
+        i += 1;
+        // The single-statement (unbraced) loop-body form strips its own
+        // trailing `;` before reaching here, so a missing `;` means "the
+        // assignment's RHS runs to the end of this body," not "no match" —
+        // falling back to `continue` here would silently reject exactly the
+        // `for (buf) |*byte| byte.* = 0;` shape this function exists to
+        // recognize.
+        const semi = std.mem.indexOfScalarPos(u8, body, i, ';') orelse body.len;
+        if (isZeroLiteral(std.mem.trim(u8, body[i..semi], " \t\r\n"))) return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1684,10 +1825,25 @@ test "firstZeroThenPlainFree catches the ArrayList zero-then-.deinit shape under
     ).?);
 }
 
-test "firstZeroThenPlainFree does not flag secureZeroAndFree/secureZeroAndFreeAligned's own zero-then-rawFree" {
-    try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
+test "firstZeroThenPlainFree now catches a direct rawFree bypass (#554 review, fourth pass)" {
+    // This is textually identical to `secureZeroAndFreeAligned`'s own body
+    // in `src/crypto/secrets.zig` — taken in isolation, a function-level
+    // scan cannot distinguish the canonical helper's own implementation
+    // from a copy-pasted bypass of it elsewhere. That is exactly why
+    // `zero_then_free_checks_375` excludes `src/crypto/secrets.zig` by
+    // *path* at the directory-scan level (see that check's own
+    // `excluded_paths`) rather than teaching this function to recognize its
+    // own canonical shape: `rawFree` is part of #375's inventory and must
+    // be flagged everywhere else.
+    try testing.expectEqualStrings("bytes", firstZeroThenPlainFree(
         "pub fn secureZeroAndFreeAligned(comptime T: type, allocator: std.mem.Allocator, buffer: []T) void {\n    const bytes = std.mem.sliceAsBytes(buffer);\n    secureZero(bytes);\n    allocator.rawFree(bytes, .fromByteUnits(@alignOf(T)), @returnAddress());\n}\n",
-    ));
+    ).?);
+}
+
+test "firstZeroThenPlainFree catches a multiline/trailing-comma allocator.free bypass (#554 review, fourth pass)" {
+    try testing.expectEqualStrings("secret_buf", firstZeroThenPlainFree(
+        "fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    crypto.secrets.secureZero(secret_buf);\n    allocator.free(\n        secret_buf,\n    );\n}\n",
+    ).?);
 }
 
 test "firstZeroThenPlainFree does not flag a zero call whose buffer is never freed at all" {
@@ -1762,15 +1918,19 @@ test "firstZeroThenPlainFree ignores @memset with a non-zero fill value" {
     ));
 }
 
-test "firstZeroThenPlainFree ignores a test-block @memset(buf, 0) zero-filling ordinary fixture data" {
-    // @memset(_, 0) cannot be told apart, lexically, from deliberately
-    // zero-filling test fixture data — pairing it with the test's own
-    // ordinary defer-free is not the #375 regression class this trigger
-    // exists to catch. The bare secureZero trigger is unaffected and still
-    // scans test blocks in full (see the next test).
-    try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
-        "test \"some fixture behavior\" {\n    const buf = try testing.allocator.alloc(u8, 16);\n    defer testing.allocator.free(buf);\n    @memset(buf, 0);\n    buf[0] = 1;\n}\n",
-    ));
+test "firstZeroThenPlainFree catches a zero-then-free inside a test block same as production (#554 review, fourth pass)" {
+    // An earlier version of this scanner exempted every `@memset(_, 0)`
+    // inside a `test` block wholesale, reasoning that ordinary
+    // zero-filled fixture data is indistinguishable from a real wipe. The
+    // review correctly pointed out that reasoning cuts both ways: a
+    // genuine ad hoc secret-zero-then-free bug written inside a test is
+    // exactly as real a regression as one in production code, and a
+    // blanket "it's a test" escape hatch is not a reviewed, fail-closed
+    // exception. There is no blanket test exemption anymore — the bare
+    // `secureZero` trigger never had one either (see the next test).
+    try testing.expectEqualStrings("buf", firstZeroThenPlainFree(
+        "test \"secret fixture cleanup\" {\n    const buf = try testing.allocator.alloc(u8, 32);\n    defer testing.allocator.free(buf);\n    @memset(buf, 0);\n}\n",
+    ).?);
 }
 
 test "firstZeroThenPlainFree still catches a real secureZero-then-free bug inside a test block" {
@@ -1805,6 +1965,50 @@ test "firstZeroThenPlainFree follows a second alias past a harmless first one" {
     try testing.expectEqualStrings("doomed", firstZeroThenPlainFree(
         "fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    crypto.secrets.secureZero(secret_buf);\n    const retained_view = secret_buf;\n    _ = retained_view;\n    const doomed = secret_buf;\n    allocator.free(doomed);\n}\n",
     ).?);
+}
+
+// #554 review (fourth pass): a manual zero-clear loop, an alias-scope false
+// positive, and the zero-init-vs-zero-then-destroy distinction.
+
+test "firstZeroThenPlainFree recognizes a manual zero-clear loop, not just @memset/secureZero" {
+    try testing.expectEqualStrings("secret_buf", firstZeroThenPlainFree(
+        "fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    for (secret_buf) |*byte| byte.* = 0;\n    allocator.free(secret_buf);\n}\n",
+    ).?);
+}
+
+test "firstZeroThenPlainFree recognizes a braced manual zero-clear loop with an index capture" {
+    try testing.expectEqualStrings("secret_buf", firstZeroThenPlainFree(
+        "fn release(allocator: std.mem.Allocator, secret_buf: []u8) void {\n    for (secret_buf, 0..) |*byte, _| {\n        byte.* = 0;\n    }\n    allocator.free(secret_buf);\n}\n",
+    ).?);
+}
+
+test "firstZeroThenPlainFree does not misfire on an ordinary mutating loop that never zeroes its element" {
+    try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
+        "fn release(allocator: std.mem.Allocator, entries: []Entry) void {\n    for (entries) |*entry| entry.active = false;\n    allocator.free(entries);\n}\n",
+    ));
+}
+
+test "firstZeroThenPlainFree does not misattribute an unrelated same-named function to a local secureZero alias" {
+    // `scrub` is bound as a local alias of `secureZero` only inside
+    // `actualWipe`; the unrelated top-level `scrub` in `transform` has
+    // nothing to do with zeroing. A file-wide alias-callee scan would
+    // wrongly treat `release`'s call to the *unrelated* top-level `scrub`
+    // as if it were the local alias, and flag `release`'s ordinary free —
+    // #554 review, fourth pass.
+    try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
+        "fn actualWipe(buf: []u8) void {\n    const scrub = crypto.secrets.secureZero;\n    scrub(buf);\n}\n\nfn scrub(buf: []u8) void {\n    transform(buf);\n}\n\nfn release(allocator: std.mem.Allocator, buf: []u8) void {\n    scrub(buf);\n    allocator.free(buf);\n}\n",
+    ));
+}
+
+test "firstZeroThenPlainFree does not flag a zero-initialized buffer returned to the caller" {
+    // Fallible initialization — allocate, install an `errdefer` free as a
+    // failure-path safety net, zero-initialize, then hand the buffer back
+    // to the caller — is not the #375 zero-then-destroy defect: the
+    // buffer's lifetime continues in the caller, it is not being wiped
+    // before release. #554 review, fourth pass.
+    try testing.expectEqual(@as(?[]const u8, null), firstZeroThenPlainFree(
+        "fn allocateFrame(allocator: std.mem.Allocator, len: usize) ![]u8 {\n    const frame = try allocator.alloc(u8, len);\n    errdefer allocator.free(frame);\n    @memset(frame, 0);\n    return frame;\n}\n",
+    ));
 }
 
 test "extractFunctionBody isolates a struct method from its WithProvider sibling and from the next method" {
