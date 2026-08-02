@@ -34,6 +34,44 @@
 //! Not a semantic proof: a deterministic, narrow pattern match that prevents
 //! accidental reintroduction and forces any new exception to be reviewed here
 //! and in `docs/CRYPTO_PROVIDER_AUDIT.md`.
+//!
+//! #554 extends this same tool with two more regression guards, scoped
+//! against `docs/CRYPTO_SECURITY_AUDIT.md` (#375) instead of
+//! `docs/CRYPTO_PROVIDER_AUDIT.md` (#490):
+//!
+//!   4. A raw `std.crypto.timing_safe.*`/`crypto.timing_safe.*` call
+//!      reappearing anywhere in `src/tls`, `src/quic`, or `src/pki`
+//!      (recursive, no exceptions — #375 migrated every such call in these
+//!      trees to `crypto.secrets.constantTimeEqual`/
+//!      `crypto.provider.constantTimeEqual`, and the one legitimate raw call
+//!      left project-wide lives in `src/crypto/secrets.zig`'s own
+//!      `constantTimeEqual` implementation, outside this scan entirely).
+//!      Deliberately *not* "flag every `std.mem.eql`/`std.mem.order`" — #375
+//!      itself classifies several comparisons in this same scope as
+//!      public/attacker-controlled and explicitly correct left ordinary (see
+//!      that document's "Representative public comparisons intentionally
+//!      left ordinary" table); a bare pattern denylist over all comparisons
+//!      would flag those too, which is exactly the mechanical
+//!      "convert-everything" guard #375 warns against building.
+//!   5. The specific ad hoc zero-and-free/raw-secureZero-spelling findings
+//!      #375 fixed, reappearing in the same three files: `BoundedSecret`
+//!      freeing its backing storage through a plain `allocator.free` after a
+//!      separate zero call instead of `secureZeroAndFree`/
+//!      `secureZeroAndFreeAligned` (`src/crypto/secrets.zig`); the four
+//!      `ticket_key_snapshot.zig` sites that did the same
+//!      (`OwnedSnapshot.deinit`, `loadFromFile`,
+//!      `reserveNonceLeasesInFile`, `parse`'s `key_storage` `errdefer`); and
+//!      `sni_provider.zig`'s `SignAdapter.release` reverting from the
+//!      canonical `crypto.provider.secureZero` wrapper back to a raw
+//!      `std.crypto.secureZero`/`std_crypto.secureZero` call. Not a
+//!      project-wide "raw `std.crypto.secureZero` is forbidden" rule: dozens
+//!      of already-compliant call sites throughout `src/tls`/`src/quic`/
+//!      `src/http` zero a stack-local buffer with no accompanying free at
+//!      all (see `docs/CRYPTO_SECURITY_AUDIT.md`'s toolchain-assumptions
+//!      section), and banning the raw spelling project-wide would flag every
+//!      one of them — the same "mechanical conversion" #375 and #554 both
+//!      warn against. Scoped instead, named-exception style, to the exact
+//!      three files/functions #375 found and fixed.
 
 const std = @import("std");
 const compat = @import("zig_compat");
@@ -379,6 +417,92 @@ const dir_checks = [_]DirCheck{
     },
 };
 
+// ---------------------------------------------------------------------------
+// #554: constant-time-comparison and zeroization regression guards
+// ---------------------------------------------------------------------------
+
+/// The raw, non-canonical spelling of a constant-time comparison. #375
+/// migrated every secret/authentication-derived comparison in `src/tls`,
+/// `src/quic`, and `src/pki` onto `crypto.secrets.constantTimeEqual` /
+/// `crypto.provider.constantTimeEqual`; a new raw call over either spelling
+/// reappearing anywhere in those trees is exactly the regression this guards
+/// against. The one legitimate raw call left project-wide is inside
+/// `crypto.secrets.constantTimeEqual` itself, in `src/crypto/secrets.zig`,
+/// which this check's directory scope (`src/tls`/`src/quic`/`src/pki`) never
+/// reaches.
+const timing_safe_forbidden = [_][]const u8{
+    "std.crypto.timing_safe.",
+    "crypto.timing_safe.",
+};
+
+/// The raw, non-canonical spelling of a secret-buffer zero. Reserved for
+/// `crypto.secrets.secureZero`'s own one-line implementation
+/// (`src/crypto/secrets.zig`) and the handful of named files below that must
+/// route every zero exclusively through the canonical wrapper because #375
+/// found and fixed a zero-then-plain-free defect there; *not* forbidden
+/// project-wide, since many other files legitimately call this directly on a
+/// stack-local buffer with nothing to free at all.
+const zeroization_forbidden = [_][]const u8{
+    "std.crypto.secureZero(",
+    "std_crypto.secureZero(",
+};
+
+const dir_checks_375 = [_]DirCheck{
+    .{
+        .dir = "src/tls",
+        .excluded_paths = &.{},
+        .forbidden = &timing_safe_forbidden,
+        .rationale = "Every secret/authentication-derived comparison in src/tls routes through crypto.secrets.constantTimeEqual/crypto.provider.constantTimeEqual per #375; a raw std.crypto.timing_safe (or locally-aliased crypto.timing_safe) call reappearing anywhere in this tree is a constant-time-comparison regression, not a new public comparison (those use ordinary std.mem.eql, never timing_safe, per docs/CRYPTO_SECURITY_AUDIT.md's public-comparisons table).",
+    },
+    .{
+        .dir = "src/quic",
+        .excluded_paths = &.{},
+        .forbidden = &timing_safe_forbidden,
+        .rationale = "Same regression class as src/tls: #375 migrated packet.zig's Retry-integrity check, path.zig's Retry-integrity and PATH_RESPONSE checks, and every other secret/authentication-derived comparison in src/quic onto the canonical constant-time helper. A raw timing_safe call reappearing here — including inside a new nested module, since this scan is recursive — is the regression.",
+    },
+    .{
+        .dir = "src/pki",
+        .excluded_paths = &.{},
+        .forbidden = &timing_safe_forbidden,
+        .rationale = "src/pki has no raw std.crypto.timing_safe call today (RSA-PSS's final hash comparison routes through crypto.secrets.constantTimeEqual; its EMSA-PSS structural checks are public/attacker-controlled and correctly left as ordinary std.mem.eql, per #375). A new raw timing_safe call anywhere in this tree needs the same audit-and-classify treatment #375 gave rsa.zig, not a silent reintroduction.",
+    },
+};
+
+/// Named-exception guards for the specific ad hoc zero-and-free /
+/// raw-secureZero-spelling findings #375 fixed (see the file-level doc
+/// comment's point 5). Reuses `file_checks`'/`file_checks_with_exceptions`'
+/// mechanism and struct types rather than inventing a new one.
+const file_checks_375 = [_]FileCheck{
+    .{
+        .path = "src/tls/ticket_key_snapshot.zig",
+        .forbidden = &(zeroization_forbidden ++ [_][]const u8{
+            ".free(self.key_storage)",
+            "allocator.free(key_storage)",
+            "allocator.free(bytes)",
+            "out.deinit()",
+        }),
+        .rationale = "#375 fixed four ad hoc zero-then-plain-free sites here — OwnedSnapshot.deinit and parse's key_storage errdefer both looped a raw std.crypto.secureZero over each KeyStorage before an ordinary allocator.free; loadFromFile and reserveNonceLeasesInFile zeroed their buffer then called allocator.free/out.deinit directly — instead of crypto.secrets.secureZeroAndFree/secureZeroAndFreeAligned. None of these literal legacy shapes, nor the raw std.crypto.secureZero spelling ZeroingAllocator.resize/.free were also migrated off of, may reappear anywhere in this file.",
+    },
+    .{
+        .path = "src/tls/sni_provider.zig",
+        .forbidden = &zeroization_forbidden,
+        .rationale = "SignAdapter.release must wipe the retained signing key through the canonical crypto.provider.secureZero wrapper; #375 fixed this file's one call site from a raw std_crypto.secureZero back to the wrapper, and no raw std.crypto.secureZero/std_crypto.secureZero call has any other legitimate purpose in this file.",
+    },
+};
+
+const file_checks_with_exceptions_375 = [_]FileCheckWithExceptions{
+    .{
+        .path = "src/crypto/secrets.zig",
+        .forbidden = &(zeroization_forbidden ++ [_][]const u8{".free(self.bytes)"}),
+        // The one legitimate raw std.crypto.secureZero call project-wide:
+        // crypto.secrets.secureZero's own implementation, which every other
+        // container/method in this file (and every other file) is supposed
+        // to call instead of reaching for std.crypto directly.
+        .exempt_functions = &.{"secureZero"},
+        .rationale = "#375 fixed BoundedSecret.deinit calling clearAll() (which correctly zeroes via the secureZero wrapper) followed by a plain allocator.free(self.bytes) — a zero-then-poisoned-or-unzeroed free, not a zero-then-genuinely-zero one — to route through secureZeroAndFree instead. self.bytes must never be freed any other way, and no code outside secureZero() itself may call std.crypto.secureZero directly.",
+    },
+};
+
 // `test_quic_crypto` (`tests/support/quic_crypto.zig`) owns concrete
 // pure-Zig provider construction for tests/tools that exercise the QUIC seam
 // directly. Earlier revisions of this audit tried to enforce "no production
@@ -572,6 +696,15 @@ fn runAudit(allocator: std.mem.Allocator, root: compat.DirCompat) !std.ArrayList
     for (dir_checks) |check| {
         try checkDir(allocator, root, check, check.dir, &violations);
     }
+    for (file_checks_375) |check| {
+        try checkFile(allocator, root, check.path, check.forbidden, check.rationale, true, &violations);
+    }
+    for (file_checks_with_exceptions_375) |check| {
+        try checkFileWithExceptions(allocator, root, check, &violations);
+    }
+    for (dir_checks_375) |check| {
+        try checkDir(allocator, root, check, check.dir, &violations);
+    }
     return violations;
 }
 
@@ -681,6 +814,104 @@ test "clean protocol-module content produces no violation" {
     try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
         "keys.applyHeaderProtectionWithProvider(self.adapter.provider, &out[0], pn_field, sample) catch unreachable;",
         &full_forbidden,
+    ));
+}
+
+// #554 unit-level fixtures: fast, isolated proof for each new forbidden set
+// before the slower end-to-end fixture-tree test exercises them wired
+// through the real directory/file checks.
+
+test "detects a raw constant-time-comparison call, qualified either way a call site might spell it" {
+    try testing.expectEqualStrings("std.crypto.timing_safe.", firstForbidden(
+        "if (!std.crypto.timing_safe.eql([32]u8, expected, candidate)) return error.Bad;",
+        &timing_safe_forbidden,
+    ).?);
+    try testing.expectEqualStrings("crypto.timing_safe.", firstForbidden(
+        "const ok = crypto.timing_safe.eql([16]u8, tag, received);",
+        &timing_safe_forbidden,
+    ).?);
+}
+
+test "canonical constantTimeEqual routing does not trip the raw timing_safe guard" {
+    try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
+        "if (!secrets.constantTimeEqual(&expected, candidate)) return error.Bad;",
+        &timing_safe_forbidden,
+    ));
+    try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
+        "if (!provider.constantTimeEqual(&expected, candidate)) return error.Bad;",
+        &timing_safe_forbidden,
+    ));
+}
+
+test "detects the raw secureZero spelling, aliased either way a call site might spell it" {
+    try testing.expectEqualStrings("std.crypto.secureZero(", firstForbidden(
+        "std.crypto.secureZero(u8, buf);",
+        &zeroization_forbidden,
+    ).?);
+    try testing.expectEqualStrings("std_crypto.secureZero(", firstForbidden(
+        "std_crypto.secureZero(u8, buf);",
+        &zeroization_forbidden,
+    ).?);
+}
+
+test "canonical secureZero/secureZeroAndFree routing does not trip the raw-spelling guard" {
+    try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
+        "secrets.secureZero(buf);",
+        &zeroization_forbidden,
+    ));
+    try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
+        "crypto.secrets.secureZeroAndFree(allocator, buf);",
+        &zeroization_forbidden,
+    ));
+    try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
+        "provider.secureZero(memory);",
+        &zeroization_forbidden,
+    ));
+}
+
+test "detects each ad hoc zero-then-plain-free literal shape #375 fixed in ticket_key_snapshot.zig" {
+    const forbidden = zeroization_forbidden ++ [_][]const u8{
+        ".free(self.key_storage)",
+        "allocator.free(key_storage)",
+        "allocator.free(bytes)",
+        "out.deinit()",
+    };
+    try testing.expectEqualStrings(".free(self.key_storage)", firstForbidden(
+        "self.allocator.free(self.key_storage);",
+        &forbidden,
+    ).?);
+    try testing.expectEqualStrings("allocator.free(key_storage)", firstForbidden(
+        "errdefer allocator.free(key_storage);",
+        &forbidden,
+    ).?);
+    try testing.expectEqualStrings("allocator.free(bytes)", firstForbidden(
+        "defer allocator.free(bytes);",
+        &forbidden,
+    ).?);
+    try testing.expectEqualStrings("out.deinit()", firstForbidden(
+        "defer out.deinit();",
+        &forbidden,
+    ).?);
+    // The fixed shapes must NOT trip this check.
+    try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
+        "crypto.secrets.secureZeroAndFreeAligned(KeyStorage, self.allocator, self.key_storage);",
+        &forbidden,
+    ));
+    try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
+        "self.allocator.free(self.configs);",
+        &forbidden,
+    ));
+}
+
+test "BoundedSecret.deinit reverting to clearAll + plain allocator.free trips the secrets.zig guard" {
+    const forbidden = zeroization_forbidden ++ [_][]const u8{".free(self.bytes)"};
+    try testing.expectEqualStrings(".free(self.bytes)", firstForbidden(
+        "self.clearAll(); const allocator = self.allocator orelse return; allocator.free(self.bytes);",
+        &forbidden,
+    ).?);
+    try testing.expectEqual(@as(?[]const u8, null), firstForbidden(
+        "secureZeroAndFree(allocator, self.bytes);",
+        &forbidden,
     ));
 }
 
@@ -839,6 +1070,89 @@ const with_provider_delegates_to_legacy_fixture =
     \\
 ;
 
+/// Minimal stand-in for `src/crypto/secrets.zig` (#554): the one legitimate
+/// raw `std.crypto.secureZero` call — inside `secureZero` itself, the
+/// function every other container/method must call instead — and
+/// `BoundedSecret.deinit` wired the fixed way (`secureZeroAndFree`, not
+/// `clearAll()` followed by a plain `allocator.free`).
+const clean_secrets_zig_fixture =
+    \\pub fn secureZero(buffer: []u8) void {
+    \\    std.crypto.secureZero(u8, buffer);
+    \\}
+    \\
+    \\pub fn secureZeroAndFree(allocator: std.mem.Allocator, buffer: []u8) void {
+    \\    secureZero(buffer);
+    \\    allocator.rawFree(buffer, .fromByteUnits(@alignOf(u8)), @returnAddress());
+    \\}
+    \\
+    \\pub const BoundedSecret = struct {
+    \\    allocator: ?std.mem.Allocator = null,
+    \\    bytes: []u8 = &.{},
+    \\    len: usize = 0,
+    \\
+    \\    fn clearAll(self: *BoundedSecret) void {
+    \\        secureZero(self.bytes);
+    \\        self.len = 0;
+    \\    }
+    \\
+    \\    pub fn deinit(self: *BoundedSecret) void {
+    \\        self.len = 0;
+    \\        const allocator = self.allocator orelse return;
+    \\        secureZeroAndFree(allocator, self.bytes);
+    \\        self.allocator = null;
+    \\        self.bytes = self.bytes[0..0];
+    \\    }
+    \\};
+    \\
+;
+
+/// `clean_secrets_zig_fixture` with `BoundedSecret.deinit` reverted to the
+/// exact historical shape: zero via the already-correct `clearAll()` helper,
+/// then hand the buffer to a plain `allocator.free` instead of
+/// `secureZeroAndFree` — the regression #375 fixed and #554 exists to catch.
+const secrets_zig_deinit_regression_fixture =
+    \\pub fn secureZero(buffer: []u8) void {
+    \\    std.crypto.secureZero(u8, buffer);
+    \\}
+    \\
+    \\pub fn secureZeroAndFree(allocator: std.mem.Allocator, buffer: []u8) void {
+    \\    secureZero(buffer);
+    \\    allocator.rawFree(buffer, .fromByteUnits(@alignOf(u8)), @returnAddress());
+    \\}
+    \\
+    \\pub const BoundedSecret = struct {
+    \\    allocator: ?std.mem.Allocator = null,
+    \\    bytes: []u8 = &.{},
+    \\    len: usize = 0,
+    \\
+    \\    fn clearAll(self: *BoundedSecret) void {
+    \\        secureZero(self.bytes);
+    \\        self.len = 0;
+    \\    }
+    \\
+    \\    pub fn deinit(self: *BoundedSecret) void {
+    \\        self.clearAll();
+    \\        const allocator = self.allocator orelse return;
+    \\        allocator.free(self.bytes);
+    \\        self.allocator = null;
+    \\        self.bytes = self.bytes[0..0];
+    \\    }
+    \\};
+    \\
+;
+
+/// `clean_secrets_zig_fixture` with a brand-new helper function added
+/// outside `secureZero` itself that reaches for the raw `std.crypto`
+/// spelling directly — proves the guard is not scoped to `BoundedSecret`
+/// specifically, but to the raw spelling appearing anywhere in the file
+/// outside the one exempted wrapper function.
+const secrets_zig_new_raw_call_fixture = clean_secrets_zig_fixture ++
+    \\fn helperZero(buf: []u8) void {
+    \\    std.crypto.secureZero(u8, buf);
+    \\}
+    \\
+;
+
 test "end-to-end: the audit fails against a fixture tree reproducing each bypass, and passes once fixed" {
     const allocator = testing.allocator;
 
@@ -849,6 +1163,8 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
     try root.makePath("src/quic/nested");
     try root.makePath("src/http");
     try root.makePath("src/tls");
+    try root.makePath("src/pki");
+    try root.makePath("src/crypto");
 
     // The protected files/functions the fixture tree must carry so the
     // "clean" baseline below is actually clean, not just missing every
@@ -860,6 +1176,11 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
     try root.writeFile(.{ .sub_path = "src/quic/packet.zig", .data = "" });
     try root.writeFile(.{ .sub_path = "src/tls/key_schedule.zig", .data = "" });
     try root.writeFile(.{ .sub_path = "src/tls/tls13_backend.zig", .data = "" });
+
+    // #554's protected files/functions, same fail-closed requirement.
+    try root.writeFile(.{ .sub_path = "src/crypto/secrets.zig", .data = clean_secrets_zig_fixture });
+    try root.writeFile(.{ .sub_path = "src/tls/ticket_key_snapshot.zig", .data = "" });
+    try root.writeFile(.{ .sub_path = "src/tls/sni_provider.zig", .data = "" });
 
     const bypass_cases = [_]struct { rel: []const u8, contents: []const u8 }{
         .{ .rel = "src/quic/connection.zig", .contents = "const mask = Aes128.initEnc(self.hp);\n" },
@@ -924,6 +1245,24 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
         .{ .rel = "src/tls/tls13_backend.zig", .contents = "var kp = X25519.KeyPair.generateDeterministic(seed) catch unreachable;\n" },
         .{ .rel = "src/tls/tls13_backend.zig", .contents = "const LocalEd25519 = crypto.sign.Ed25519;\n" },
         .{ .rel = "src/tls/tls13_backend.zig", .contents = "fn helperVerify(sig: []const u8, msg: []const u8, key: []const u8) void { Ed25519.verify(sig, msg, key) catch unreachable; }\n" },
+
+        // #554: a raw constant-time-comparison call reappearing anywhere in
+        // src/tls, src/quic, or src/pki, qualified either way a call site
+        // might spell it.
+        .{ .rel = "src/tls/timing_safe_regression.zig", .contents = "if (!std.crypto.timing_safe.eql([32]u8, expected, candidate)) return error.Bad;\n" },
+        .{ .rel = "src/quic/timing_safe_regression.zig", .contents = "const ok = crypto.timing_safe.eql([16]u8, tag, received);\n" },
+        .{ .rel = "src/pki/timing_safe_regression.zig", .contents = "return std.crypto.timing_safe.compare(u8, expected, h_array, .big) == .eq;\n" },
+
+        // #554: the specific ad hoc zero-and-free / raw-secureZero-spelling
+        // findings #375 fixed, reproduced one shape at a time.
+        .{ .rel = "src/tls/ticket_key_snapshot.zig", .contents = "fn f(x: []u8) void { std.crypto.secureZero(u8, x); }\n" },
+        .{ .rel = "src/tls/ticket_key_snapshot.zig", .contents = "pub fn deinit(self: *OwnedSnapshot) void { self.allocator.free(self.key_storage); }\n" },
+        .{ .rel = "src/tls/ticket_key_snapshot.zig", .contents = "pub fn parse(allocator: std.mem.Allocator) void { errdefer allocator.free(key_storage); }\n" },
+        .{ .rel = "src/tls/ticket_key_snapshot.zig", .contents = "pub fn loadFromFile(allocator: std.mem.Allocator) void { defer allocator.free(bytes); }\n" },
+        .{ .rel = "src/tls/ticket_key_snapshot.zig", .contents = "pub fn reserveNonceLeasesInFile() void { defer out.deinit(); }\n" },
+        .{ .rel = "src/tls/sni_provider.zig", .contents = "pub fn release(self: *SignAdapter) void { std_crypto.secureZero(u8, std.mem.asBytes(&self.identity.key)); }\n" },
+        .{ .rel = "src/crypto/secrets.zig", .contents = secrets_zig_deinit_regression_fixture },
+        .{ .rel = "src/crypto/secrets.zig", .contents = secrets_zig_new_raw_call_fixture },
     };
 
     for (bypass_cases) |case| {
@@ -936,6 +1275,8 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
         // across cases sharing a file path.
         const clean = if (std.mem.eql(u8, case.rel, "src/quic/tls_adapter.zig"))
             clean_tls_adapter_fixture
+        else if (std.mem.eql(u8, case.rel, "src/crypto/secrets.zig"))
+            clean_secrets_zig_fixture
         else if (std.mem.eql(u8, case.rel, "src/http/http3_runtime.zig"))
             ""
         else
@@ -944,6 +1285,9 @@ test "end-to-end: the audit fails against a fixture tree reproducing each bypass
     }
     try root.deleteFile("src/quic/nested/packet_crypto.zig");
     try root.deleteFile("src/quic/nested/connection.zig");
+    try root.deleteFile("src/tls/timing_safe_regression.zig");
+    try root.deleteFile("src/quic/timing_safe_regression.zig");
+    try root.deleteFile("src/pki/timing_safe_regression.zig");
 
     var clean_violations = try runAudit(allocator, root);
     defer clean_violations.deinit(allocator);

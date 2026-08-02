@@ -243,20 +243,46 @@ outside what `docs/CRYPTO_PROVIDER_AUDIT.md` already allowlists; the fixes
 in this document are comparison/zeroization *helper routing* changes within
 files #490 already classified, not new crypto call sites. `zig build
 audit-crypto-boundary` (part of `zig build test`) passes against every
-change in this story.
+change in this story, and — per #554 below — now also enforces that this
+remains true going forward, not just at the moment this story closed.
 
 ## Deferred findings and follow-ups
 
 Per #375's requirement that every deferred finding have a tracking issue
 before the story closes:
 
-- **#554** — extend `scripts/audit_crypto_boundary.zig` (or a companion
-  checked-in guard) to prevent regression of the raw-`timing_safe`/ad-hoc-
-  zeroization findings this story fixed. Not done in this story because
-  building a precise allowlist (distinguishing the public comparisons in
-  the table above from the secret-derived ones this story migrated) is
-  itself a small architecture/tooling project, not a local fix, and #375's
-  own non-goals warn against a mechanical "convert everything" guard.
+- **#554** — done. `scripts/audit_crypto_boundary.zig` (`zig build
+  audit-crypto-boundary`, part of `zig build test`) now also guards the two
+  regression classes this story fixed, using the same named-exception
+  approach as its pre-existing #490 keyed-crypto-boundary checks rather than
+  a mechanical "convert everything" pattern denylist:
+  - A raw `std.crypto.timing_safe.*`/`crypto.timing_safe.*` call reappearing
+    anywhere in `src/tls`, `src/quic`, or `src/pki` (recursive, no
+    exceptions — every secret/authentication-derived comparison in these
+    trees already routes through `crypto.secrets.constantTimeEqual`/
+    `crypto.provider.constantTimeEqual`, and the tool's directory scope never
+    reaches the one legitimate raw call inside `constantTimeEqual`'s own
+    implementation in `src/crypto/secrets.zig`). This does not flag the
+    public/attacker-controlled comparisons in the "representative public
+    comparisons" table below — those use ordinary `std.mem.eql`, never
+    `timing_safe`, so they were never in scope.
+  - The specific ad hoc zero-and-free / raw-`secureZero`-spelling findings
+    this story fixed, reappearing in the same three files/functions:
+    `BoundedSecret.deinit` (`src/crypto/secrets.zig`) freeing its backing
+    storage through a plain `allocator.free` after a separate zero call
+    instead of `secureZeroAndFree`/`secureZeroAndFreeAligned`; the four
+    `ticket_key_snapshot.zig` sites that did the same
+    (`OwnedSnapshot.deinit`, `loadFromFile`, `reserveNonceLeasesInFile`,
+    `parse`'s `key_storage` `errdefer`); and `sni_provider.zig`'s
+    `SignAdapter.release` reverting from the canonical
+    `crypto.provider.secureZero` wrapper back to a raw `std.crypto.secureZero`
+    call. Scoped to these named files/functions rather than a project-wide
+    ban on the raw `std.crypto.secureZero` spelling, since many other call
+    sites throughout `src/tls`/`src/quic`/`src/http` legitimately zero a
+    stack-local buffer with no accompanying free at all (see this document's
+    toolchain-assumptions section above) — banning the raw spelling
+    everywhere would flag every one of them, the same "mechanical
+    conversion" this section's opening paragraph warns against.
 - **#555** — consolidate the duplicate RFC 9001 §5.8 Retry-integrity-tag
   implementations in `src/quic/packet.zig` (production) and `src/quic/path.zig`
   (unreachable, KAT-fixture-only). Both copies were fixed for constant-time
