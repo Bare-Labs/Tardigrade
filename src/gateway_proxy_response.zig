@@ -439,5 +439,61 @@ test "writeBufferedUpstreamResponse strips upstream Alt-Svc and emits effective 
 
     const output = stream.getWritten();
     try std.testing.expect(std.mem.find(u8, output, "Alt-Svc: h3=\":443\"") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Alt-Svc:"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Alt-Svc: clear\r\n"));
     try std.testing.expect(std.mem.find(u8, output, "Alt-Svc: clear\r\n") != null);
+}
+
+test "writeStreamedUpstreamResponse emits effective Alt-Svc policy" {
+    var buf: [4096]u8 = undefined;
+    var stream = compat.fixedBufferStream(&buf);
+
+    try writeStreamedUpstreamResponse(
+        stream.writer(),
+        200,
+        "OK",
+        "text/plain",
+        null,
+        "req-stream-alt-svc",
+        &http.security_headers.SecurityHeaders.api,
+        "h3=\":8443\"; ma=120",
+        null,
+    );
+
+    const output = stream.getWritten();
+    try std.testing.expect(std.mem.find(u8, output, "Transfer-Encoding: chunked\r\n") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Alt-Svc:"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Alt-Svc: h3=\":8443\"; ma=120\r\n"));
+    try std.testing.expect(std.mem.find(u8, output, "Alt-Svc: h3=\":8443\"; ma=120\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\n"));
+}
+
+test "writeStreamedUpstreamResponseHeadFromHeaders strips upstream Alt-Svc and emits effective policy once" {
+    var upstream_headers = [_]TestUpstreamHeader{
+        .{ .name = "Content-Type", .value = "text/plain" },
+        .{ .name = "Alt-Svc", .value = "h3=\":443\"; ma=86400" },
+        .{ .name = "Server", .value = "origin" },
+    };
+    var buf: [4096]u8 = undefined;
+    var stream = compat.fixedBufferStream(&buf);
+
+    try writeStreamedUpstreamResponseHeadFromHeaders(
+        stream.writer(),
+        200,
+        "OK",
+        upstream_headers[0..],
+        true,
+        "req-stream-headers-alt-svc",
+        &http.security_headers.SecurityHeaders.api,
+        "clear",
+        null,
+    );
+
+    const output = stream.getWritten();
+    try std.testing.expect(std.mem.find(u8, output, "Alt-Svc: h3=\":443\"") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Alt-Svc:"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Alt-Svc: clear\r\n"));
+    try std.testing.expect(std.mem.find(u8, output, "Alt-Svc: clear\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "Server: origin\r\n") == null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\n"));
 }
