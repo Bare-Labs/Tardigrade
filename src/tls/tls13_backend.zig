@@ -3409,7 +3409,7 @@ pub const Tls13Backend = struct {
         if (body.len != hash_len) return error.MalformedHandshake;
         var expected = KeySchedule.verifyData(schedule.provider, &schedule.server_handshake_traffic, transcript_before) catch return error.SecretExportFailed;
         defer crypto.secureZero(u8, &expected);
-        if (!crypto.timing_safe.eql([hash_len]u8, expected, body[0..hash_len].*)) return error.DecryptError;
+        if (!crypto_pkg.provider.constantTimeEqual(&expected, body[0..hash_len])) return error.DecryptError;
 
         // 1-RTT secrets exist from the transcript through server Finished,
         // independent of any client certificate flight that follows.
@@ -4722,7 +4722,7 @@ pub const Tls13Backend = struct {
         // server flight was sent.
         var expected = KeySchedule.verifyData(schedule.provider, &schedule.client_handshake_traffic, transcript_before) catch return error.SecretExportFailed;
         defer crypto.secureZero(u8, &expected);
-        if (!crypto.timing_safe.eql([hash_len]u8, expected, body[0..hash_len].*)) return error.DecryptError;
+        if (!crypto_pkg.provider.constantTimeEqual(&expected, body[0..hash_len])) return error.DecryptError;
         // Client Finished confirms the handshake for the server (RFC 8446 §4.4.4).
         try self.captureResumptionMasterSecret();
         try self.emitDiscardKeys(sink, .handshake);

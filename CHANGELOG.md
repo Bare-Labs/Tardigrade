@@ -658,6 +658,29 @@ All notable user-facing changes to Tardigrade are documented here.
   number space so Initial, Handshake, and Application ranges cannot merge.
 
 ### Fixed
+- **Checked-in side-channel, secret-lifetime, and observability audit for
+  native TLS/QUIC/PKI (#375)** — adds `docs/CRYPTO_SECURITY_AUDIT.md` (the
+  audit matrix) and `docs/SECURITY_REVIEW_CHECKLIST.md` (the reusable
+  review checklist), and routes the remaining raw `std.crypto.timing_safe`
+  comparisons over secret/authentication-derived material — TLS PSK binder
+  verification, TLS Finished verification (client and server), the QUIC
+  Retry integrity tag (both the live `packet.zig` check and the unreachable
+  `path.zig` duplicate), QUIC PATH_RESPONSE validation, and the RSA-PSS
+  final hash comparison — through the canonical
+  `crypto.secrets.constantTimeEqual`/`crypto.provider.constantTimeEqual`
+  helper. Also routes several `std.crypto.secureZero` call sites in
+  `ticket_key_snapshot.zig` and `sni_provider.zig` through the canonical
+  `secureZero` wrapper for consistency. No comparison or zeroization
+  semantics changed — every touched site already used a constant-time
+  compare or a functionally equivalent zero call; this is helper-routing
+  hygiene plus the audit trail proving it, not a behavior fix. Every other
+  location the audit reviewed (ticket-protection key/fingerprint equality,
+  QUIC Retry-token key ring and stateless-reset key lifecycle, session
+  cache, credentials, identity loading) was already compliant, largely from
+  #549's earlier secret-lifecycle hardening. Deferred: extending
+  `scripts/audit_crypto_boundary.zig` to guard against regression (#554)
+  and consolidating the duplicate Retry-integrity-tag implementation
+  (#555).
 - **Native TLS listener now tolerates the RFC 8446 Appendix D.4
   middlebox-compatibility `change_cipher_spec` record (#369)** — the
   record layer required every post-ClientHello record's outer wire type

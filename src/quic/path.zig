@@ -417,7 +417,7 @@ pub fn verifyRetryIntegrity(original_dcid: []const u8, retry_packet: []const u8)
     const body = retry_packet[0 .. retry_packet.len - retry_integrity_tag_len];
     const received_tag = retry_packet[retry_packet.len - retry_integrity_tag_len ..][0..retry_integrity_tag_len];
     const expected = retryIntegrityTag(original_dcid, body) catch return false;
-    return std.crypto.timing_safe.eql([retry_integrity_tag_len]u8, expected, received_tag.*);
+    return secrets.constantTimeEqual(&expected, received_tag);
 }
 
 // ---------------------------------------------------------------------------
@@ -852,7 +852,7 @@ pub const PathManager = struct {
             self.failValidation(candidate);
             return null;
         }
-        if (!std.crypto.timing_safe.eql([path_challenge_len]u8, candidate.challenge, data)) {
+        if (!secrets.constantTimeEqual(&candidate.challenge, &data)) {
             self.metrics.path_response_mismatches += 1;
             return null;
         }

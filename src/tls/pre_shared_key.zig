@@ -379,12 +379,12 @@ pub fn verifyBinderFromTranscriptHash(
     const out = computed[0..hash.digestLength()];
     defer crypto.secureZero(u8, out);
     try deriveBinderFromTranscriptHash(hash, psk, transcript_hash, out);
+    // Length is public wire framing (RFC 8446 §4.2.11.2 fixes it to the
+    // hash's digest length), so the length check is an ordinary branch;
+    // `constantTimeEqual` performs it again internally but that redundant
+    // check is itself over public data, not a second secret-dependent branch.
     if (out.len != candidate_binder.len) return false;
-    return switch (out.len) {
-        32 => crypto.timing_safe.eql([32]u8, out[0..32].*, candidate_binder[0..32].*),
-        48 => crypto.timing_safe.eql([48]u8, out[0..48].*, candidate_binder[0..48].*),
-        else => false,
-    };
+    return provider.constantTimeEqual(out, candidate_binder);
 }
 
 /// Ordinary (non-HRR) ClientHello wrapper: hashes `truncated_client_hello`
