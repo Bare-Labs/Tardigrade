@@ -526,21 +526,21 @@ pub const Identity = struct {
         rsa: pure_zig.SoftwareRsaSigningKey,
     };
 
-    /// Error type for the legacy no-entropy `initPkcs8`: with `entropy` fixed
-    /// to `null`, `initPkcs8Impl`'s RSA branch always returns
-    /// `error.InvalidPrivateKey` before it can ever reach the
-    /// entropy-consuming code that could produce `EntropyFailure` — see
-    /// `initPkcs8`'s body — so this entry point's public error set stays
-    /// exactly what it can actually produce, not `InitError`'s wider set.
-    pub const LegacyInitError = error{InvalidPrivateKey};
+    /// Pre-existing public error type for `initPkcs8`, unchanged by RSA
+    /// support: callers that reference `Identity.InitError` directly stay
+    /// source-compatible. `initPkcs8` never returns `EntropyFailure` (see
+    /// its body), so it does not belong in this set — that case lives only
+    /// on `InitWithEntropyError`, the wider type `initPkcs8WithEntropy`
+    /// actually needs.
+    pub const InitError = error{InvalidPrivateKey};
 
-    /// `EntropyFailure` is distinct from `InvalidPrivateKey`: it means the
-    /// key itself may well be fine but `initPkcs8WithEntropy`'s injected
-    /// entropy source failed mid-RSA-import (drawing Miller-Rabin
-    /// witnesses), a transient/local provider fault, not malformed
-    /// credential data — callers that log or alert on these should not
-    /// conflate "bad key on disk" with "entropy source is unhealthy."
-    pub const InitError = error{ InvalidPrivateKey, EntropyFailure };
+    /// Error type for `initPkcs8WithEntropy`. `EntropyFailure` is distinct
+    /// from `InvalidPrivateKey`: it means the key itself may well be fine
+    /// but the injected entropy source failed mid-RSA-import (drawing
+    /// Miller-Rabin witnesses), a transient/local provider fault, not
+    /// malformed credential data — callers that log or alert on these should
+    /// not conflate "bad key on disk" with "entropy source is unhealthy."
+    pub const InitWithEntropyError = error{ InvalidPrivateKey, EntropyFailure };
 
     /// Load an Ed25519 or ECDSA-P256 PKCS#8 private key. Returns
     /// `error.InvalidPrivateKey` for an RSA key — RSA's `p`/`q` primality
@@ -549,7 +549,7 @@ pub const Identity = struct {
     /// adversarially chosen key; see `rsa.isProbablePrime`'s doc comment),
     /// which this entry point has none of. Use `initPkcs8WithEntropy` for
     /// RSA support.
-    pub fn initPkcs8(certificate_der: []const u8, pkcs8_key_der: []const u8) LegacyInitError!Identity {
+    pub fn initPkcs8(certificate_der: []const u8, pkcs8_key_der: []const u8) InitError!Identity {
         return initPkcs8Impl(certificate_der, pkcs8_key_der, null) catch |err| switch (err) {
             error.InvalidPrivateKey => error.InvalidPrivateKey,
             // Unreachable: with `entropy = null`, `initPkcs8Impl`'s RSA
@@ -564,11 +564,11 @@ pub const Identity = struct {
     /// required only for RSA — Ed25519/ECDSA-P256 parsing never touches it —
     /// but every caller must supply one since the key type isn't known until
     /// parsing is underway.
-    pub fn initPkcs8WithEntropy(certificate_der: []const u8, pkcs8_key_der: []const u8, entropy: crypto_provider_pkg.Entropy) InitError!Identity {
+    pub fn initPkcs8WithEntropy(certificate_der: []const u8, pkcs8_key_der: []const u8, entropy: crypto_provider_pkg.Entropy) InitWithEntropyError!Identity {
         return initPkcs8Impl(certificate_der, pkcs8_key_der, entropy);
     }
 
-    fn initPkcs8Impl(certificate_der: []const u8, pkcs8_key_der: []const u8, entropy: ?crypto_provider_pkg.Entropy) InitError!Identity {
+    fn initPkcs8Impl(certificate_der: []const u8, pkcs8_key_der: []const u8, entropy: ?crypto_provider_pkg.Entropy) InitWithEntropyError!Identity {
         if (ed25519SeedFromPkcs8(pkcs8_key_der)) |seed| {
             const software_key = pure_zig.SoftwareSigningKey.fromSeed(seed) catch return error.InvalidPrivateKey;
             return .{ .certificate_der = certificate_der, .key = .{ .ed25519 = software_key } };
