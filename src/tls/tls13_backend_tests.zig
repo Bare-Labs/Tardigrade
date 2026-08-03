@@ -9052,16 +9052,39 @@ test "#564 a bad client Finished after a full AES-256-GCM/SHA-384 handshake clea
     try std.testing.expect(harness.server_backend.schedule == null);
 }
 
-test "#568 a wrong-length client Finished under SHA-384 is rejected as malformed, not as a MAC mismatch" {
-    // #568 second-pass review: the tamper test above corrupts a
-    // *correctly-sized* Finished's content, exercising the MAC-comparison
-    // (`DecryptError`) branch of `onClientFinished`. This instead sends a
-    // well-framed Finished whose `verify_data` is the SHA-256 baseline's
-    // 32 bytes rather than the negotiated SHA-384 suite's 48 — exercising
-    // `onClientFinished`'s separate `if (body.len != n) return
-    // error.MalformedHandshake` guard, which must reject the wrong length
-    // itself rather than reading/comparing past the too-short buffer or
-    // silently truncating the expected 48-byte MAC to compare only 32.
+/// Splits a buffer of one or more concatenated, framed TLS handshake
+/// messages (1-byte type + 3-byte big-endian length + body, repeated) into
+/// everything before the last message and the last message alone. Used to
+/// isolate a trailing Finished from whatever the backend bundled ahead of
+/// it in the same emitted buffer (e.g. Certificate + CertificateVerify).
+fn splitOffLastHandshakeMessage(blob: []const u8) struct { prefix: []const u8, last: []const u8 } {
+    var offset: usize = 0;
+    var last_start: usize = 0;
+    while (offset < blob.len) {
+        last_start = offset;
+        const body_len = std.mem.readInt(u24, blob[offset + 1 ..][0..3], .big);
+        offset += 4 + body_len;
+    }
+    std.debug.assert(offset == blob.len);
+    return .{ .prefix = blob[0..last_start], .last = blob[last_start..] };
+}
+
+/// #568 review (third pass): the previous version of this test sent a
+/// wrong-length *client* Finished to the server — but by the time the
+/// server verifies the client's Finished, it has already derived and
+/// emitted its own application secrets (`onServerFinished` does that before
+/// the client ever gets a chance to answer), so that ordering can never be
+/// proven wrong-length-safe from the server side. `onServerFinished`
+/// (`src/tls/tls13_backend.zig`) is the function that actually gates
+/// application-secret installation on Finished verification — its own
+/// `if (body.len != n) return error.MalformedHandshake` runs first, before
+/// any `applicationSecrets`/`emitSecret` call — so this drives the
+/// *client* through a real SHA-384 handshake up to the server's Finished,
+/// replaces just that message with a `wrong_len`-byte `verify_data`, and
+/// confirms both the correct error and that nothing was emitted for that
+/// call (proving the length check really did run first, not merely that
+/// the overall handshake ended up failed).
+fn expectWrongLengthServerFinishedRejected(comptime wrong_len: usize) !void {
     var harness: DirectHarness = undefined;
     directHarnessWithCipherSuite(&harness, .tls_aes_256_gcm_sha384);
     defer harness.deinit();
@@ -9080,30 +9103,65 @@ test "#568 a wrong-length client Finished under SHA-384 is rejected as malformed
     try harness.server_backend.backend().start(.server, {}, &server_flight_sink);
     try harness.server_backend.backend().receive(.initial, ch, &server_flight_sink);
 
-    // Drive the client through the server's flight so the server reaches a
-    // real, negotiated-under-SHA-384 state (schedule installed, digest
-    // length 48) before it is asked to verify a Finished — the client's own
-    // resulting Finished bytes are unused, since this test replaces them
-    // with a deliberately wrong-length one.
+    // The server's own Finished is the last `handshake_bytes` event in its
+    // flight (RFC 8446 §4.4: ServerHello, EncryptedExtensions, Certificate,
+    // CertificateVerify, Finished, in that order) — feed every earlier
+    // message to the client normally, then replace only that last one with
+    // a deliberately wrong-length `verify_data`.
+    var handshake_event_count: usize = 0;
+    for (server_flight_sink.items[0..server_flight_sink.len]) |event| {
+        if (event == .handshake_bytes) handshake_event_count += 1;
+    }
+    try std.testing.expect(handshake_event_count > 0);
+
+    var seen: usize = 0;
     for (server_flight_sink.items[0..server_flight_sink.len]) |event| {
         if (event != .handshake_bytes) continue;
-        var client_step_sink = DirectSink{};
-        defer client_step_sink.deinit();
-        try harness.client_backend.backend().receive(event.handshake_bytes.epoch, event.handshake_bytes.data, &client_step_sink);
+        seen += 1;
+        if (seen < handshake_event_count) {
+            var client_step_sink = DirectSink{};
+            defer client_step_sink.deinit();
+            try harness.client_backend.backend().receive(event.handshake_bytes.epoch, event.handshake_bytes.data, &client_step_sink);
+        } else {
+            // The last `.handshake_bytes` event may bundle more than one
+            // message (e.g. Certificate + CertificateVerify + Finished all
+            // written into the same buffer before being emitted together) —
+            // Finished is always the flight's trailing message (RFC 8446
+            // §4.4), so feed everything *before* it normally and leave only
+            // the trailing Finished itself to be replaced below.
+            const split = splitOffLastHandshakeMessage(event.handshake_bytes.data);
+            if (split.prefix.len > 0) {
+                var prefix_sink = DirectSink{};
+                defer prefix_sink.deinit();
+                try harness.client_backend.backend().receive(event.handshake_bytes.epoch, split.prefix, &prefix_sink);
+            }
+        }
     }
 
-    var wrong_length_buf: [4 + 32]u8 = undefined;
-    const wrong_length_finished = try tls_core.messages.encode(.finished, &([_]u8{0xaa} ** 32), &wrong_length_buf);
+    var wrong_length_buf: [4 + wrong_len]u8 = undefined;
+    const wrong_length_finished = try tls_core.messages.encode(.finished, &([_]u8{0xaa} ** wrong_len), &wrong_length_buf);
 
     var final_sink = DirectSink{};
     defer final_sink.deinit();
     try std.testing.expectError(
         error.MalformedHandshake,
-        harness.server_backend.backend().receive(.handshake, wrong_length_finished, &final_sink),
+        harness.client_backend.backend().receive(.handshake, wrong_length_finished, &final_sink),
     );
 
-    try std.testing.expectEqual(.failed, harness.server_backend.core.handshake_lifecycle);
-    try std.testing.expect(harness.server_backend.schedule == null);
+    // Nothing was emitted for this call at all — not just no *application*
+    // secret event specifically — confirming the length guard is the very
+    // first thing `onServerFinished` does, before any state-changing work.
+    try std.testing.expectEqual(@as(usize, 0), final_sink.len);
+    try std.testing.expectEqual(.failed, harness.client_backend.core.handshake_lifecycle);
+    try std.testing.expect(harness.client_backend.schedule == null);
+}
+
+test "#568 a too-short (SHA-256-length) server Finished under SHA-384 is rejected before application secrets are installed" {
+    try expectWrongLengthServerFinishedRejected(32);
+}
+
+test "#568 a too-long server Finished under SHA-384 is rejected before application secrets are installed" {
+    try expectWrongLengthServerFinishedRejected(64);
 }
 
 /// Writes a raw `pre_shared_key` extension_data with `count` identities

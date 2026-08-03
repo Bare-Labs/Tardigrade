@@ -1855,6 +1855,18 @@ pub const Tls13Backend = struct {
         // advance rather than emitting SNI for a truncated (wrong) host.
         if (self.server_name_overflow) return error.InvalidHandshakeState;
         if (self.role == .client) {
+            // #568 review: this must run before `planPskOffer`/
+            // `planEarlyDataAttempt` (which prune/commit offer-lease state)
+            // and `core.start()` (which advances the handshake lifecycle) —
+            // previously this same check lived inside `sendClientHello`,
+            // after all of that had already run, so a capability gap
+            // aborted with partially-consumed offer state and a
+            // lifecycle already advanced past `.idle`, instead of behaving
+            // like every other local startup preflight above (profile,
+            // policy, server-name overflow): fail closed before any of
+            // this call's state is touched at all.
+            var suites_storage: [native_cipher_suites.len]tls_algorithms.CipherSuite = undefined;
+            if (self.effectiveCipherSuites(&suites_storage).len == 0) return error.IllegalParameter;
             const base_len = try self.clientHelloEncodedLen();
             if (base_len > max_message_len) return error.InvalidTransportProfile;
             // #362: decide which offered tickets fit — and in what wire
@@ -2327,14 +2339,12 @@ pub const Tls13Backend = struct {
         // ordinary no-mutual-suite path.
         var suites_storage: [native_cipher_suites.len]tls_algorithms.CipherSuite = undefined;
         const offered_suites = self.effectiveCipherSuites(&suites_storage);
-        // #568 review: an empty intersection must fail locally, before any
-        // byte reaches the wire — otherwise this would emit a ClientHello
-        // with a zero-length `cipher_suites` vector, which is not a legal
-        // offer RFC 8446 §4.1.2 permits a peer to answer at all. Reported as
-        // the same `IllegalParameter` the server-side no-mutual-suite path
-        // (`mapNegotiationError`) surfaces, since this is exactly that
-        // failure discovered one step earlier — a local capability gap, not
-        // a distinct capability error.
+        // #568 review: `startImpl` already fails closed on an empty
+        // intersection before any lifecycle/offer-lease state is touched
+        // (see its matching comment), so this is unreachable in practice —
+        // kept as a backstop so this function can never itself encode a
+        // zero-length `cipher_suites` vector onto the wire, which is not a
+        // legal offer RFC 8446 §4.1.2 permits a peer to answer at all.
         if (offered_suites.len == 0) return error.IllegalParameter;
         try w.u16_(@intCast(2 * offered_suites.len)); // cipher_suites
         for (offered_suites) |cipher_suite| {
