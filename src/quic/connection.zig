@@ -5404,224 +5404,239 @@ test "#488: resumption_runtime.Runtime drives a genuine resumed QUIC handshake v
 test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end to end" {
     const resumption_runtime = tls_core.resumption_runtime;
     const allocator = testing.allocator;
+    inline for (.{
+        tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256,
+        tls_core.algorithms.CipherSuite.tls_aes_256_gcm_sha384,
+        tls_core.algorithms.CipherSuite.tls_chacha20_poly1305_sha256,
+    }) |suite| {
+        const suites = [_]tls_core.algorithms.CipherSuite{suite};
 
-    var server_entropy = tls_core.production_crypto.OsEntropy{};
-    var server_provider = tls_core.production_crypto.Provider.init(server_entropy.entropy());
-    var server_runtime = try resumption_runtime.Runtime.init(
-        allocator,
-        .{ .mode = .stateful },
-        .{ .ctx = undefined, .nowUnixMsFn = struct {
+        var server_entropy = tls_core.production_crypto.OsEntropy{};
+        var server_provider = tls_core.production_crypto.Provider.init(server_entropy.entropy());
+        var server_runtime = try resumption_runtime.Runtime.init(
+            allocator,
+            .{ .mode = .stateful },
+            .{ .ctx = undefined, .nowUnixMsFn = struct {
+                fn now(_: *anyopaque) i64 {
+                    return 1000;
+                }
+            }.now },
+            server_provider.cryptoProvider(),
+        );
+        defer server_runtime.deinit();
+
+        var client_entropy = tls_core.production_crypto.OsEntropy{};
+        var client_provider = tls_core.production_crypto.Provider.init(client_entropy.entropy());
+        var client_runtime = try resumption_runtime.Runtime.init(
+            allocator,
+            .{ .mode = .stateful },
+            .{ .ctx = undefined, .nowUnixMsFn = struct {
+                fn now(_: *anyopaque) i64 {
+                    return 2000;
+                }
+            }.now },
+            client_provider.cryptoProvider(),
+        );
+        defer client_runtime.deinit();
+
+        // Phase 1: an ordinary full handshake, then an early-data-capable ticket
+        // (#523: `max_early_data_size` set) issued through the #488 two-phase API
+        // and captured into the client's own runtime — same shape as the #488
+        // test above, plus early-data capability on the ticket.
+        const CaptureImpl = struct {
+            runtime: *resumption_runtime.Runtime,
+            stored: tls_core.session_cache.StoreResult = undefined,
+            retained: tls_core.session.ClientTicketState = .{},
+
             fn now(_: *anyopaque) i64 {
                 return 1000;
             }
-        }.now },
-        server_provider.cryptoProvider(),
-    );
-    defer server_runtime.deinit();
+            fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                ticket.cloneInto(testing.allocator, &self.retained) catch unreachable;
+                self.stored = self.runtime.storeClientTicket(ticket);
+            }
+        };
+        var capture = CaptureImpl{ .runtime = &client_runtime };
+        defer capture.retained.deinit();
+        const resume_policy: tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy = .{
+            .transport = .ignore,
+            .application = .ignore,
+        };
+        var pair = try TestPair.initWithTicketConsumerAndResumePolicy(allocator, tls_core.session.Limits.default, .{
+            .ctx = &capture,
+            .nowUnixMsFn = CaptureImpl.now,
+            .onTicketFn = CaptureImpl.onTicket,
+        }, resume_policy);
+        defer pair.deinit(allocator);
+        pair.client_backend.engine.policy.cipher_suites = &suites;
+        pair.server_backend.engine.policy.cipher_suites = &suites;
+        try pair.pump();
 
-    var client_entropy = tls_core.production_crypto.OsEntropy{};
-    var client_provider = tls_core.production_crypto.Provider.init(client_entropy.entropy());
-    var client_runtime = try resumption_runtime.Runtime.init(
-        allocator,
-        .{ .mode = .stateful },
-        .{ .ctx = undefined, .nowUnixMsFn = struct {
+        var prepared = try pair.server.prepareNewSessionTicket(allocator, .{
+            .ticket_lifetime = 3600,
+            .ticket_age_add = 500,
+            .ticket_nonce = "\x01",
+            .issued_at_unix_ms = 1000,
+            // RFC 9001 §4.6.1: a QUIC ticket advertises 0-RTT capability with
+            // the fixed sentinel, not a small TLS-record-style byte cap — this
+            // is the value `http3_runtime.zig`'s production issuer uses too.
+            .max_early_data_size = std.math.maxInt(u32),
+        }, tls_core.session.Limits.default);
+        defer prepared.deinit();
+        var scratch: [256]u8 = undefined;
+        var identity = try server_runtime.createIdentity(&prepared.state, 1000, &scratch);
+        try testing.expect(identity == .stateful);
+        try pair.server.emitPreparedNewSessionTicket(&prepared, identity.slice(), tls_core.session.Limits.default);
+        try pair.pump();
+        try testing.expectEqual(tls_core.session_cache.StoreResult.stored, capture.stored);
+
+        // Phase 2: a fresh QUIC connection pair, resuming with the client
+        // actually attempting 0-RTT and the server actually configured to accept
+        // it — the full #523 composition (`setClientEarlyDataIntent`,
+        // `setServerEarlyDataPolicy`, an allow replay gate, `zero_rtt_enabled` on
+        // both `Connection.init` configs) that `http3_runtime.zig` wires for
+        // production.
+        const candidate: tls_core.session.CandidateContext = .{
+            .cipher_suite = capture.retained.common.cipher_suite,
+            .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
+            .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
+            .auth_binding = capture.retained.common.auth_binding,
+            .transport_compat = null,
+            .application_compat = null,
+        };
+        var lookup = client_runtime.lookupClientOffers(candidate);
+        defer lookup.deinit();
+        try testing.expect(lookup == .hit);
+        try testing.expectEqual(suite, capture.retained.common.cipher_suite);
+
+        const resumed = try allocator.create(TestPair);
+        defer allocator.destroy(resumed);
+        const client_crypto_provider = resumed.client_provider_storage.init(0x442_c);
+        const server_crypto_provider = resumed.server_provider_storage.init(0x442_5);
+        resumed.* = .{
+            .client_provider_storage = resumed.client_provider_storage,
+            .server_provider_storage = resumed.server_provider_storage,
+            .client_backend = tls_backend_mod.Tls13Backend.initClient(
+                .{ .hello_random = [_]u8{0xe1} ** 32 },
+                client_crypto_provider,
+                .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+            ),
+            .server_backend = tls_backend_mod.Tls13Backend.initServer(
+                .{ .hello_random = [_]u8{0xe2} ** 32 },
+                server_crypto_provider,
+                try tls_backend_mod.Identity.initPkcs8(
+                    tls_backend_mod.testdata.certificate_der,
+                    tls_backend_mod.testdata.private_key_pkcs8_der,
+                ),
+            ),
+        };
+        resumed.client_backend.engine.policy.cipher_suites = &suites;
+        resumed.server_backend.engine.policy.cipher_suites = &suites;
+        var clock_dummy: u8 = 0;
+        const ClientClock = struct {
             fn now(_: *anyopaque) i64 {
                 return 2000;
             }
-        }.now },
-        client_provider.cryptoProvider(),
-    );
-    defer client_runtime.deinit();
+        };
+        try resumed.client_backend.engine.setClientPskOfferLease(&lookup.hit, &clock_dummy, ClientClock.now);
+        try resumed.client_backend.setResumeCompatibilityPolicy(resume_policy);
+        try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 4096 });
+        try resumed.server_backend.setServerPskResolver(server_runtime.serverResolver().?);
+        try resumed.server_backend.setResumeCompatibilityPolicy(resume_policy);
 
-    // Phase 1: an ordinary full handshake, then an early-data-capable ticket
-    // (#523: `max_early_data_size` set) issued through the #488 two-phase API
-    // and captured into the client's own runtime — same shape as the #488
-    // test above, plus early-data capability on the ticket.
-    const CaptureImpl = struct {
-        runtime: *resumption_runtime.Runtime,
-        stored: tls_core.session_cache.StoreResult = undefined,
-        retained: tls_core.session.ClientTicketState = .{},
+        // Always-allow replay gate: proves the #368 seam is what the QUIC/H3
+        // composition installs, not a QUIC-local replay mechanism.
+        const AlwaysAllow = struct {
+            fn decide(_: *anyopaque, _: tls_backend_mod.EarlyDataReplayCandidate) tls_backend_mod.EarlyDataReplayDecision {
+                return .allow;
+            }
+        };
+        var replay_ctx: u8 = 0;
+        try resumed.server_backend.setEarlyDataReplayGate(.{ .ctx = &replay_ctx, .decideFn = AlwaysAllow.decide });
+        try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true });
 
-        fn now(_: *anyopaque) i64 {
-            return 1000;
+        resumed.client = try Connection.init(allocator, .{
+            .role = .client,
+            .config = .{ .zero_rtt_enabled = true },
+            .local_cid = &TestPair.client_cid,
+            .original_destination_cid = &TestPair.odcid,
+            .initial_secret_dcid = &TestPair.odcid,
+            .peer_cid = &TestPair.odcid,
+            .tls = resumed.client_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
+            .now_us = resumed.now_us,
+            .initial_path = TestPair.client_path,
+        });
+        defer resumed.client.deinit();
+        resumed.server = try Connection.init(allocator, .{
+            .role = .server,
+            .config = .{ .zero_rtt_enabled = true },
+            .local_cid = &TestPair.odcid,
+            .original_destination_cid = &TestPair.odcid,
+            .initial_secret_dcid = &TestPair.odcid,
+            .peer_cid = &TestPair.client_cid,
+            .tls = resumed.server_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
+            .now_us = resumed.now_us,
+            .initial_path = TestPair.server_path,
+        });
+        defer resumed.server.deinit();
+
+        // Drive only the client's first flight (Initial, carrying the
+        // PSK-resumed ClientHello) into the server. The server's accept/reject
+        // decision — and any resulting `.zero_rtt` read-key installation —
+        // happens synchronously while processing that ClientHello, strictly
+        // before the server sends anything back and long before either side is
+        // anywhere close to established. Draining every pending client
+        // datagram (not just one) is robust to the ClientHello spanning more
+        // than one Initial packet.
+        {
+            var buf: [2048]u8 = undefined;
+            while (resumed.client.pollTransmitOnPath(&buf, resumed.now_us)) |t| {
+                try resumed.server.ingestOnPath(t.bytes, TestPair.server_path, TestPair.test_challenge_entropy, resumed.now_us);
+            }
         }
-        fn onTicket(ctx: *anyopaque, ticket: *const tls_core.session.ClientTicketState) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            ticket.cloneInto(testing.allocator, &self.retained) catch unreachable;
-            self.stored = self.runtime.storeClientTicket(ticket);
-        }
-    };
-    var capture = CaptureImpl{ .runtime = &client_runtime };
-    defer capture.retained.deinit();
-    const resume_policy: tls_core.tls13_backend.Tls13Backend.ResumeCompatibilityPolicy = .{
-        .transport = .ignore,
-        .application = .ignore,
-    };
-    var pair = try TestPair.initWithTicketConsumerAndResumePolicy(allocator, tls_core.session.Limits.default, .{
-        .ctx = &capture,
-        .nowUnixMsFn = CaptureImpl.now,
-        .onTicketFn = CaptureImpl.onTicket,
-    }, resume_policy);
-    defer pair.deinit(allocator);
-    try pair.pump();
 
-    var prepared = try pair.server.prepareNewSessionTicket(allocator, .{
-        .ticket_lifetime = 3600,
-        .ticket_age_add = 500,
-        .ticket_nonce = "\x01",
-        .issued_at_unix_ms = 1000,
-        // RFC 9001 §4.6.1: a QUIC ticket advertises 0-RTT capability with
-        // the fixed sentinel, not a small TLS-record-style byte cap — this
-        // is the value `http3_runtime.zig`'s production issuer uses too.
-        .max_early_data_size = std.math.maxInt(u32),
-    }, tls_core.session.Limits.default);
-    defer prepared.deinit();
-    var scratch: [256]u8 = undefined;
-    var identity = try server_runtime.createIdentity(&prepared.state, 1000, &scratch);
-    try testing.expect(identity == .stateful);
-    try pair.server.emitPreparedNewSessionTicket(&prepared, identity.slice(), tls_core.session.Limits.default);
-    try pair.pump();
-    try testing.expectEqual(tls_core.session_cache.StoreResult.stored, capture.stored);
+        // The real TLS decision already accepted 0-RTT (not just "will resume")
+        // — and did so before the handshake is anywhere close to complete...
+        try testing.expect(!resumed.server.isEstablished());
+        try testing.expect(resumed.server_backend.engine.earlyDataAccepted());
+        try testing.expectEqual(suite, resumed.client.adapter.zeroRttCipherSuite().?);
+        try testing.expectEqual(suite, resumed.server.adapter.zeroRttCipherSuite().?);
+        try testing.expectEqual(@as(?tls_core.algorithms.CipherSuite, null), resumed.client.adapter.negotiatedCipherSuite());
+        // ...and that acceptance already installed a usable QUIC 0-RTT read key
+        // through the ordinary secret-event pipeline (#523 requirement 1) — with
+        // `zero_rtt_enabled` honored via `Connection.init`'s `setZeroRttEnabled`.
+        try testing.expect(resumed.server.adapter.hasProtectionKeys(.zero_rtt, .read) catch unreachable);
 
-    // Phase 2: a fresh QUIC connection pair, resuming with the client
-    // actually attempting 0-RTT and the server actually configured to accept
-    // it — the full #523 composition (`setClientEarlyDataIntent`,
-    // `setServerEarlyDataPolicy`, an allow replay gate, `zero_rtt_enabled` on
-    // both `Connection.init` configs) that `http3_runtime.zig` wires for
-    // production.
-    const candidate: tls_core.session.CandidateContext = .{
-        .cipher_suite = capture.retained.common.cipher_suite,
-        .server_name = if (capture.retained.common.server_name) |*s| s.slice() else null,
-        .application_protocol = if (capture.retained.common.application_protocol) |*a| a.slice() else null,
-        .auth_binding = capture.retained.common.auth_binding,
-        .transport_compat = null,
-        .application_compat = null,
-    };
-    var lookup = client_runtime.lookupClientOffers(candidate);
-    defer lookup.deinit();
-    try testing.expect(lookup == .hit);
+        // That real, TLS-derived key genuinely decrypts a 0-RTT wire packet
+        // through the ordinary driver path *during the early-data window*, with
+        // correct early-data provenance — proving the pipeline end to end and
+        // at the actual production timing, not just its two halves in
+        // isolation after the fact.
+        const real_secret = resumed.client.adapter.secret(.zero_rtt, .write).?.slice();
+        var frame_buf: [32]u8 = undefined;
+        const frame_len = try frame.encodeStream(4, 0, "real early data", true, &frame_buf);
+        var wire: [256]u8 = undefined;
+        const datagram = sealTestZeroRttPacket(suite, &TestPair.odcid, &TestPair.client_cid, real_secret, 0, frame_buf[0..frame_len], &wire);
+        try resumed.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, resumed.now_us);
 
-    const resumed = try allocator.create(TestPair);
-    defer allocator.destroy(resumed);
-    const client_crypto_provider = resumed.client_provider_storage.init(0x442_c);
-    const server_crypto_provider = resumed.server_provider_storage.init(0x442_5);
-    resumed.* = .{
-        .client_provider_storage = resumed.client_provider_storage,
-        .server_provider_storage = resumed.server_provider_storage,
-        .client_backend = tls_backend_mod.Tls13Backend.initClient(
-            .{ .hello_random = [_]u8{0xe1} ** 32 },
-            client_crypto_provider,
-            .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
-        ),
-        .server_backend = tls_backend_mod.Tls13Backend.initServer(
-            .{ .hello_random = [_]u8{0xe2} ** 32 },
-            server_crypto_provider,
-            try tls_backend_mod.Identity.initPkcs8(
-                tls_backend_mod.testdata.certificate_der,
-                tls_backend_mod.testdata.private_key_pkcs8_der,
-            ),
-        ),
-    };
-    var clock_dummy: u8 = 0;
-    const ClientClock = struct {
-        fn now(_: *anyopaque) i64 {
-            return 2000;
-        }
-    };
-    try resumed.client_backend.engine.setClientPskOfferLease(&lookup.hit, &clock_dummy, ClientClock.now);
-    try resumed.client_backend.setResumeCompatibilityPolicy(resume_policy);
-    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 4096 });
-    try resumed.server_backend.setServerPskResolver(server_runtime.serverResolver().?);
-    try resumed.server_backend.setResumeCompatibilityPolicy(resume_policy);
+        try testing.expect(resumed.server.streamTransportEarly(4));
+        try testing.expectEqual(@as(?StreamId, 4), resumed.server.acceptStream());
+        var buf: [32]u8 = undefined;
+        const request = try resumed.server.readStream(4, &buf);
+        try testing.expectEqualStrings("real early data", buf[0..request.len]);
+        try testing.expect(request.fin);
 
-    // Always-allow replay gate: proves the #368 seam is what the QUIC/H3
-    // composition installs, not a QUIC-local replay mechanism.
-    const AlwaysAllow = struct {
-        fn decide(_: *anyopaque, _: tls_backend_mod.EarlyDataReplayCandidate) tls_backend_mod.EarlyDataReplayDecision {
-            return .allow;
-        }
-    };
-    var replay_ctx: u8 = 0;
-    try resumed.server_backend.setEarlyDataReplayGate(.{ .ctx = &replay_ctx, .decideFn = AlwaysAllow.decide });
-    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true });
-
-    resumed.client = try Connection.init(allocator, .{
-        .role = .client,
-        .config = .{ .zero_rtt_enabled = true },
-        .local_cid = &TestPair.client_cid,
-        .original_destination_cid = &TestPair.odcid,
-        .initial_secret_dcid = &TestPair.odcid,
-        .peer_cid = &TestPair.odcid,
-        .tls = resumed.client_backend.backend(),
-        .crypto_provider = test_quic_crypto.testDefaultProvider(),
-        .now_us = resumed.now_us,
-        .initial_path = TestPair.client_path,
-    });
-    defer resumed.client.deinit();
-    resumed.server = try Connection.init(allocator, .{
-        .role = .server,
-        .config = .{ .zero_rtt_enabled = true },
-        .local_cid = &TestPair.odcid,
-        .original_destination_cid = &TestPair.odcid,
-        .initial_secret_dcid = &TestPair.odcid,
-        .peer_cid = &TestPair.client_cid,
-        .tls = resumed.server_backend.backend(),
-        .crypto_provider = test_quic_crypto.testDefaultProvider(),
-        .now_us = resumed.now_us,
-        .initial_path = TestPair.server_path,
-    });
-    defer resumed.server.deinit();
-
-    // Drive only the client's first flight (Initial, carrying the
-    // PSK-resumed ClientHello) into the server. The server's accept/reject
-    // decision — and any resulting `.zero_rtt` read-key installation —
-    // happens synchronously while processing that ClientHello, strictly
-    // before the server sends anything back and long before either side is
-    // anywhere close to established. Draining every pending client
-    // datagram (not just one) is robust to the ClientHello spanning more
-    // than one Initial packet.
-    {
-        var buf: [2048]u8 = undefined;
-        while (resumed.client.pollTransmitOnPath(&buf, resumed.now_us)) |t| {
-            try resumed.server.ingestOnPath(t.bytes, TestPair.server_path, TestPair.test_challenge_entropy, resumed.now_us);
-        }
+        // The rest of the handshake now completes normally — accepted 0-RTT
+        // does not derail ordinary 1-RTT completion.
+        try resumed.pump();
+        try testing.expect(resumed.client.isEstablished());
+        try testing.expect(resumed.server.isEstablished());
+        try testing.expect(resumed.client_backend.engine.core.psk_authenticated);
+        try testing.expect(resumed.server_backend.engine.core.psk_authenticated);
     }
-
-    // The real TLS decision already accepted 0-RTT (not just "will resume")
-    // — and did so before the handshake is anywhere close to complete...
-    try testing.expect(!resumed.server.isEstablished());
-    try testing.expect(resumed.server_backend.engine.earlyDataAccepted());
-    // ...and that acceptance already installed a usable QUIC 0-RTT read key
-    // through the ordinary secret-event pipeline (#523 requirement 1) — with
-    // `zero_rtt_enabled` honored via `Connection.init`'s `setZeroRttEnabled`.
-    try testing.expect(resumed.server.adapter.hasProtectionKeys(.zero_rtt, .read) catch unreachable);
-
-    // That real, TLS-derived key genuinely decrypts a 0-RTT wire packet
-    // through the ordinary driver path *during the early-data window*, with
-    // correct early-data provenance — proving the pipeline end to end and
-    // at the actual production timing, not just its two halves in
-    // isolation after the fact.
-    const real_secret = resumed.server.adapter.secret(.zero_rtt, .read).?.slice()[0..tls_adapter.traffic_secret_len].*;
-    var frame_buf: [32]u8 = undefined;
-    const frame_len = try frame.encodeStream(4, 0, "real early data", true, &frame_buf);
-    var wire: [256]u8 = undefined;
-    const datagram = sealTestZeroRttPacket(.tls_aes_128_gcm_sha256, &TestPair.odcid, &TestPair.client_cid, &real_secret, 0, frame_buf[0..frame_len], &wire);
-    try resumed.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, resumed.now_us);
-
-    try testing.expect(resumed.server.streamTransportEarly(4));
-    try testing.expectEqual(@as(?StreamId, 4), resumed.server.acceptStream());
-    var buf: [32]u8 = undefined;
-    const request = try resumed.server.readStream(4, &buf);
-    try testing.expectEqualStrings("real early data", buf[0..request.len]);
-    try testing.expect(request.fin);
-
-    // The rest of the handshake now completes normally — accepted 0-RTT
-    // does not derail ordinary 1-RTT completion.
-    try resumed.pump();
-    try testing.expect(resumed.client.isEstablished());
-    try testing.expect(resumed.server.isEstablished());
-    try testing.expect(resumed.client_backend.engine.core.psk_authenticated);
-    try testing.expect(resumed.server_backend.engine.core.psk_authenticated);
 }
 
 test "#523: Event.early_data_decision surfaces the real TLS decision once, even when the carrier is disabled" {
