@@ -304,23 +304,27 @@ fn runTlsKeyScheduleVector(log: *ExecutionLog) !void {
 
     const shared = hexBytes("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
     const hello_hash = hexBytes("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
-    var schedule = try KeySchedule.init(cp, &shared, hello_hash);
+    var schedule: KeySchedule = undefined;
+    try KeySchedule.init(cp, .sha256, &shared, &hello_hash, &schedule);
     defer schedule.wipe();
 
-    try expectStage("tls13 handshake secret / RFC 8448", &hexBytes("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), &schedule.handshake_secret);
-    try expectStage("tls13 client handshake traffic secret / RFC 8448", &hexBytes("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"), &schedule.client_handshake_traffic);
-    try expectStage("tls13 server handshake traffic secret / RFC 8448", &hexBytes("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"), &schedule.server_handshake_traffic);
-    try expectStage("tls13 master secret / RFC 8448", &hexBytes("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"), &schedule.master_secret);
+    try expectStage("tls13 handshake secret / RFC 8448", &hexBytes("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), schedule.handshake_secret[0..32]);
+    try expectStage("tls13 client handshake traffic secret / RFC 8448", &hexBytes("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"), schedule.client_handshake_traffic[0..32]);
+    try expectStage("tls13 server handshake traffic secret / RFC 8448", &hexBytes("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"), schedule.server_handshake_traffic[0..32]);
+    try expectStage("tls13 master secret / RFC 8448", &hexBytes("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"), schedule.master_secret[0..32]);
 
     const finished_hash = hexBytes("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
-    var app = try schedule.applicationSecrets(finished_hash);
+    var app: KeySchedule.ApplicationSecrets = undefined;
+    try schedule.applicationSecrets(&finished_hash, &app);
     defer app.wipe();
-    try expectStage("tls13 client application traffic secret / RFC 8448", &hexBytes("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"), &app.client);
-    try expectStage("tls13 server application traffic secret / RFC 8448", &hexBytes("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"), &app.server);
-    var finished_key = try KeySchedule.finishedKey(cp, &schedule.server_handshake_traffic);
+    try expectStage("tls13 client application traffic secret / RFC 8448", &hexBytes("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"), app.clientSecret());
+    try expectStage("tls13 server application traffic secret / RFC 8448", &hexBytes("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"), app.serverSecret());
+    var finished_key: [32]u8 = undefined;
+    try KeySchedule.finishedKey(cp, .sha256, schedule.server_handshake_traffic[0..32], &finished_key);
     defer std.crypto.secureZero(u8, &finished_key);
     try expectStage("tls13 server Finished key / RFC 8448", &hexBytes("008d3b66f816ea559f96b537e885c31fc068bf492c652f01f288a1d8cdc19fc8"), &finished_key);
-    var verify_data = try KeySchedule.verifyData(cp, &schedule.server_handshake_traffic, finished_hash);
+    var verify_data: [32]u8 = undefined;
+    try KeySchedule.verifyData(cp, .sha256, schedule.server_handshake_traffic[0..32], &finished_hash, &verify_data);
     defer std.crypto.secureZero(u8, &verify_data);
     try expectStage("tls13 server Finished verify_data / RFC 8448", &hexBytes("c5486af1426697c43c18dab6a79ef816a2188023ea743133b7e3b15a2c05c955"), &verify_data);
 }
@@ -334,18 +338,22 @@ fn runTranscriptVector(log: *ExecutionLog) !void {
     const client_hello_2 = hexBytes("01000002ddee");
 
     var transcript = Transcript{};
-    transcript.update(&client_hello_1);
+    transcript.selectFamily(.sha256);
+    try transcript.update(&client_hello_1);
     const ch1_hash = hexBytes("93e26e55d8fd5b5236e00556a269142fc88e0d9616836ca9b8607841ac0287a0");
-    try expectStage("tls transcript ClientHello1 hash", &ch1_hash, &transcript.peek());
+    try expectStage("tls transcript ClientHello1 hash", &ch1_hash, transcript.peek().slice());
 
-    transcript.replace(ch1_hash);
-    try expectStage("tls transcript HRR synthetic message_hash", &hexBytes("42a5f8938f2b4f45f63df268cf67218045831c80b841bdb54f46afefceee6218"), &transcript.peek());
+    var ch1_digest = tls_core.transcript.Digest{};
+    ch1_digest.len = ch1_hash.len;
+    @memcpy(ch1_digest.bytes[0..ch1_hash.len], &ch1_hash);
+    transcript.replace(ch1_digest);
+    try expectStage("tls transcript HRR synthetic message_hash", &hexBytes("42a5f8938f2b4f45f63df268cf67218045831c80b841bdb54f46afefceee6218"), transcript.peek().slice());
 
-    transcript.update(&hello_retry_request);
-    try expectStage("tls transcript after HelloRetryRequest", &hexBytes("cb0a3fbd3c60144a08852ceb18f319fd65f5b352026cb23036f568a209d6a036"), &transcript.peek());
+    try transcript.update(&hello_retry_request);
+    try expectStage("tls transcript after HelloRetryRequest", &hexBytes("cb0a3fbd3c60144a08852ceb18f319fd65f5b352026cb23036f568a209d6a036"), transcript.peek().slice());
 
-    transcript.update(&client_hello_2);
-    try expectStage("tls transcript after ClientHello2", &hexBytes("7ec9461d8bac7434b8ae63e99899d1ef75ce0b716c9ee12aadd5f5837e51d182"), &transcript.peek());
+    try transcript.update(&client_hello_2);
+    try expectStage("tls transcript after ClientHello2", &hexBytes("7ec9461d8bac7434b8ae63e99899d1ef75ce0b716c9ee12aadd5f5837e51d182"), transcript.peek().slice());
 }
 
 fn runTlsRecordVector(log: *ExecutionLog) !void {

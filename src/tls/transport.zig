@@ -63,6 +63,12 @@ pub fn ContractWithOptions(
         pub const Event = union(enum) {
             /// Raw TLS handshake bytes to send at `epoch`.
             handshake_bytes: struct { epoch: Epoch, data: []const u8 },
+            /// The negotiated cipher suite and its transcript hash (#564),
+            /// emitted exactly once per connection before any
+            /// `traffic_secret` event for the `handshake` epoch — the one
+            /// canonical way a record or QUIC consumer learns the suite,
+            /// never inferred from secret length.
+            negotiated_parameters: events.NegotiatedParameters,
             /// A traffic secret to install for `epoch`/`direction`.
             traffic_secret: struct { epoch: Epoch, direction: events.SecretDirection, data: []const u8 },
             /// Transport-owned peer parameters carried by the TLS handshake.
@@ -212,6 +218,15 @@ pub fn ContractWithOptions(
 
             pub fn emitOwnedCrypto(self: *EventSink, allocator: std.mem.Allocator, epoch: Epoch, data: []u8) ErrorSet!void {
                 try self.emitOwnedHandshakeBytes(allocator, epoch, data);
+            }
+
+            /// Emit the negotiated cipher-suite metadata. Callers must emit
+            /// this before the first `emitSecret` for the `handshake`
+            /// epoch, on every path (full or resumed handshake alike) —
+            /// see `Event.negotiated_parameters`.
+            pub fn emitNegotiatedParameters(self: *EventSink, params: events.NegotiatedParameters) ErrorSet!void {
+                try self.reserve(0);
+                self.pushUnchecked(.{ .negotiated_parameters = params });
             }
 
             pub fn emitSecret(self: *EventSink, epoch: Epoch, direction: events.SecretDirection, data: []const u8) ErrorSet!void {

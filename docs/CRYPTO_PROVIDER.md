@@ -93,13 +93,20 @@ data, not prose:
   which product actually selects this capability. This is authored per row,
   not derived from `pure_zig_status`/`openssl_status` — primitive support
   does not imply product selectability. AES-256-GCM and ChaCha20-Poly1305
-  both report `pure_zig_status = .supported` but neither is negotiated by the
-  native appliance, so neither claims `.native_appliance`; secp256r1 ECDH now
-  reports pure-Zig primitive support, but it still does not claim
-  `.native_appliance` because native TLS negotiation remains `.not_integrated`
-  until #335 enables the group in the live matrix.
-  See `profile.zig`'s "enabled product profiles are not a mechanical copy of
-  primitive support" test.
+  used to illustrate this asymmetry (`pure_zig_status = .supported` but not
+  negotiated by the native appliance); since #564 made the native engine's
+  handshake/transcript/key schedule cipher/hash-agile, both are negotiated
+  there too and now claim `.native_appliance`. secp256r1 is the current
+  standing example, for a different reason since #567: the pure-Zig backend
+  now implements P-256 ECDH key-share generation and shared-secret
+  derivation behind `CryptoProvider`, but the native appliance's TLS
+  handshake matrix does not yet select the group (#335), so it still does
+  not claim `.native_appliance`; `openssl_status = .provider_deferred` (no
+  in-process OpenSSL `CryptoProvider` yet) is beside the point, since the
+  real general-purpose OpenSSL product supports P-256 ECDH outside this
+  seam and so still claims `.general_purpose_openssl`. See `profile.zig`'s
+  "enabled product profiles are not a mechanical copy of primitive support"
+  test.
 
 ## Supported profile matrix
 
@@ -111,12 +118,12 @@ lists only the consumers whose live runtime calls `CryptoProvider` today
 | Capability | Pure-Zig status | Pure-Zig implementation | OpenSSL status | Consumers | Live integration | Product profiles |
 | --- | --- | --- | --- | --- | --- | --- |
 | SHA-256 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF, QUIC TLS bridge | none — unkeyed hashing has no `CryptoProvider` entry point by design | native appliance, general-purpose OpenSSL |
-| SHA-384 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF | none — unkeyed hashing has no `CryptoProvider` entry point by design | general-purpose OpenSSL only (the native appliance's engine negotiates TLS_AES_128_GCM_SHA256 only, so SHA-384 is never selected there) |
+| SHA-384 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF | none — unkeyed hashing has no `CryptoProvider` entry point by design | native appliance, general-purpose OpenSSL (the native engine's transcript/key schedule are cipher/hash-agile, #564; SHA-384 is live whenever TLS_AES_256_GCM_SHA384 is negotiated) |
 | HKDF-SHA256 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule, QUIC packet protection | live — QUIC packet protection, the QUIC/TLS secret bridge, and the TLS 1.3 key schedule (`src/tls/key_schedule.zig`) all call `CryptoProvider.hkdfExtract`/`.hkdfExpandLabel` | native appliance, general-purpose OpenSSL |
-| HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule | not integrated — `src/tls/key_schedule.zig`'s generic resumption helpers correctly route `.sha384` through `CryptoProvider` when called with it, but no live native TLS path ever calls them that way: the native engine negotiates TLS_AES_128_GCM_SHA256 only, so its resumption/ticket flow always derives SHA-256 secrets | general-purpose OpenSSL only (the native appliance's engine negotiates TLS_AES_128_GCM_SHA256 only, so HKDF-SHA384 is never selected there) |
+| HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule | live — `src/tls/key_schedule.zig` is hash-agile (#564): `KeySchedule` and every resumption/ticket helper derive their hash from the negotiated suite (`algorithms.transcriptHash`) and route it through `CryptoProvider`, so a native handshake negotiating TLS_AES_256_GCM_SHA384 really does derive under SHA-384 | native appliance, general-purpose OpenSSL |
 | AES-128-GCM | supported | `std.crypto` | provider deferred | TLS records, QUIC packet protection | both — TLS record protection and QUIC packet protection seal/open through `CryptoProvider` | native appliance, general-purpose OpenSSL |
-| AES-256-GCM | supported | `std.crypto` | provider deferred | TLS records; QUIC integration deferred | none — TLS_AES_256_GCM_SHA384 is not negotiated by the native appliance's engine | general-purpose OpenSSL only (negotiated there outside this seam) |
-| ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | protocol integration deferred | none | general-purpose OpenSSL only |
+| AES-256-GCM | supported | `std.crypto` | provider deferred | TLS records | live — the native engine now negotiates TLS_AES_256_GCM_SHA384 (#564) through the existing generic `record_protection.TrafficKeys.derive` path, the same CryptoProvider-routed seal/open every suite uses | native appliance, general-purpose OpenSSL |
+| ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | TLS records | live — the native engine now negotiates TLS_CHACHA20_POLY1305_SHA256 (#564) through the same generic record-protection path | native appliance, general-purpose OpenSSL |
 | QUIC AES-128 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection | live — every send/receive path in `src/quic/tls_adapter.zig` applies/removes header protection through `CryptoProvider` | native appliance only (QUIC-specific; the general-purpose backend is TLS-over-TCP) |
 | X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge | live — `src/tls/tls13_backend.zig` generates its ephemeral key share and derives the shared secret through `CryptoProvider.generateKeyShare`/`.deriveSharedSecret` | native appliance, general-purpose OpenSSL |
 | secp256r1 / P-256 | supported | `std.crypto` | provider deferred | TLS key share, PKI | not integrated — provider ECDH key-share generation and shared-secret derivation are available, but live native TLS negotiation does not select the group until #335 | general-purpose OpenSSL only |

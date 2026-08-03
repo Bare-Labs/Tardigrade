@@ -85,6 +85,14 @@ pub const Bridge = struct {
     pub fn applyEvent(self: *Bridge, event: events.Event, out: []u8) Error!?[]const u8 {
         switch (event) {
             .handshake_bytes => |bytes| return try self.sealHandshake(bytes.epoch, bytes.data, out),
+            // #564: the negotiated suite arrives before any handshake-epoch
+            // traffic secret (the contract `EventSink.emitNegotiatedParameters`
+            // documents), so updating `cipher_suite` here — rather than only
+            // ever accepting the constructor's fixed value — is what lets
+            // `installTrafficSecret` derive the right `TrafficKeys` for
+            // whichever suite this connection actually negotiated.
+            .negotiated_parameters => |params| self.cipher_suite = algorithms.fromInt(algorithms.CipherSuite, params.cipher_suite) orelse
+                return error.UnsupportedRecordEpoch,
             .traffic_secret => |traffic_secret| try self.installTrafficSecret(traffic_secret.epoch, traffic_secret.direction, traffic_secret.data),
             .discard_epoch => |epoch| try self.discardEpoch(epoch),
             .handshake_complete => try self.markHandshakeComplete(),
@@ -968,6 +976,10 @@ test "record epoch bridge shuttles protocol-neutral driver events through record
                         var scratch: [1]u8 = undefined;
                         _ = try sender_bridge.applyEvent(.handshake_complete, &scratch);
                         sender_driver.complete();
+                    },
+                    .negotiated_parameters => |params| {
+                        var scratch: [1]u8 = undefined;
+                        _ = try sender_bridge.applyEvent(.{ .negotiated_parameters = params }, &scratch);
                     },
                     .peer_transport_parameters,
                     .alpn,

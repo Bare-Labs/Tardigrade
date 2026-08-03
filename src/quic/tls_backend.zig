@@ -589,6 +589,7 @@ fn translate(allocator: ?std.mem.Allocator, source: *RecordSink, destination: *E
                     try destination.emitOwnedHandshakeBytesCopy(explicit_allocator, toLevel(item.epoch), item.data);
                 }
             },
+            .negotiated_parameters => |params| try destination.emitNegotiatedParameters(params),
             .traffic_secret => |item| try destination.emitSecret(toLevel(item.epoch), item.direction, item.data),
             .peer_transport_parameters => {},
             .alpn => |protocol| try destination.emitAlpn(protocol),
