@@ -791,7 +791,8 @@ fn expectRsaPssRejects(allocator: std.mem.Allocator, cp: provider.CryptoProvider
 fn runRsaPssSignPositive(allocator: std.mem.Allocator) !void {
     const rsa = crypto_pkg.rsa;
     const cp = cryptoProvider();
-    var native_key = try pure_zig.SoftwareRsaSigningKey.fromDer(rsa.testdata.private_key_pkcs1_der);
+    var import_entropy = pure_zig.DeterministicEntropy.init(0x5090);
+    var native_key = try pure_zig.SoftwareRsaSigningKey.fromDer(rsa.testdata.private_key_pkcs1_der, import_entropy.entropy());
     defer native_key.deinit();
     const signer = native_key.signingKey();
     try testing.expectEqual(provider.SignatureScheme.rsa_pss_rsae_sha256, signer.scheme());

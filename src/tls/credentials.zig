@@ -528,7 +528,26 @@ pub const Identity = struct {
 
     pub const InitError = error{InvalidPrivateKey};
 
+    /// Load an Ed25519 or ECDSA-P256 PKCS#8 private key. Returns
+    /// `error.InvalidPrivateKey` for an RSA key — RSA's `p`/`q` primality
+    /// check needs an injected entropy source for its random Miller-Rabin
+    /// witnesses (a fixed/public witness set is not sound against an
+    /// adversarially chosen key; see `rsa.isProbablePrime`'s doc comment),
+    /// which this entry point has none of. Use `initPkcs8WithEntropy` for
+    /// RSA support.
     pub fn initPkcs8(certificate_der: []const u8, pkcs8_key_der: []const u8) InitError!Identity {
+        return initPkcs8Impl(certificate_der, pkcs8_key_der, null);
+    }
+
+    /// Load an Ed25519, ECDSA-P256, or RSA PKCS#8 private key. `entropy` is
+    /// required only for RSA — Ed25519/ECDSA-P256 parsing never touches it —
+    /// but every caller must supply one since the key type isn't known until
+    /// parsing is underway.
+    pub fn initPkcs8WithEntropy(certificate_der: []const u8, pkcs8_key_der: []const u8, entropy: crypto_provider_pkg.Entropy) InitError!Identity {
+        return initPkcs8Impl(certificate_der, pkcs8_key_der, entropy);
+    }
+
+    fn initPkcs8Impl(certificate_der: []const u8, pkcs8_key_der: []const u8, entropy: ?crypto_provider_pkg.Entropy) InitError!Identity {
         if (ed25519SeedFromPkcs8(pkcs8_key_der)) |seed| {
             const software_key = pure_zig.SoftwareSigningKey.fromSeed(seed) catch return error.InvalidPrivateKey;
             return .{ .certificate_der = certificate_der, .key = .{ .ed25519 = software_key } };
@@ -542,7 +561,8 @@ pub const Identity = struct {
             return .{ .certificate_der = certificate_der, .key = .{ .ecdsa_p256 = software_key } };
         } else |_| {}
         const rsa_key_der = try rsaKeyDerFromPkcs8(pkcs8_key_der);
-        var software_key = pure_zig.SoftwareRsaSigningKey.fromDer(rsa_key_der) catch return error.InvalidPrivateKey;
+        const rsa_entropy = entropy orelse return error.InvalidPrivateKey;
+        var software_key = pure_zig.SoftwareRsaSigningKey.fromDer(rsa_key_der, rsa_entropy) catch return error.InvalidPrivateKey;
         errdefer software_key.deinit();
 
         // A structurally valid RSA private key is not necessarily *this*
@@ -900,7 +920,8 @@ pub const testdata = struct {
     }
 
     pub fn rsaIdentity() Identity {
-        return Identity.initPkcs8(rsa_certificate_der, rsa_private_key_pkcs8_der) catch unreachable;
+        var det = pure_zig.DeterministicEntropy.init(0x8511);
+        return Identity.initPkcs8WithEntropy(rsa_certificate_der, rsa_private_key_pkcs8_der, det.entropy()) catch unreachable;
     }
 
     const ignored_entropy_context: u8 = 0;
@@ -1594,12 +1615,22 @@ test "identity parser loads and rejects malformed PKCS#8" {
 }
 
 test "identity parser loads a PKCS#8 RSA key and rejects a truncated one" {
-    const identity = try Identity.initPkcs8(testdata.rsa_certificate_der, testdata.rsa_private_key_pkcs8_der);
+    var det = pure_zig.DeterministicEntropy.init(0x8512);
+    const identity = try Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, testdata.rsa_private_key_pkcs8_der, det.entropy());
     try testing.expectEqual(SignatureScheme.rsa_pss_rsae_sha256, identity.signatureScheme());
     try testing.expectEqual(@as(usize, 256), identity.key.rsa.key.modulusLen());
     try testing.expectError(
         error.InvalidPrivateKey,
-        Identity.initPkcs8(testdata.rsa_certificate_der, testdata.rsa_private_key_pkcs8_der[0 .. testdata.rsa_private_key_pkcs8_der.len - 1]),
+        Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, testdata.rsa_private_key_pkcs8_der[0 .. testdata.rsa_private_key_pkcs8_der.len - 1], det.entropy()),
+    );
+}
+
+test "identity parser without an entropy source rejects an RSA key" {
+    // `initPkcs8` (no entropy) must fail closed for RSA rather than silently
+    // skip the primality check `initPkcs8WithEntropy` performs.
+    try testing.expectError(
+        error.InvalidPrivateKey,
+        Identity.initPkcs8(testdata.rsa_certificate_der, testdata.rsa_private_key_pkcs8_der),
     );
 }
 
@@ -1608,13 +1639,15 @@ test "identity parser rejects an RSA certificate paired with an unrelated RSA pr
     // private keys; only their pairing with `rsa_certificate_der` is wrong.
     // The mismatch must be caught here, at construction, not discovered only
     // when a peer rejects the resulting CertificateVerify signature.
+    var det = pure_zig.DeterministicEntropy.init(0x8513);
     try testing.expectError(
         error.InvalidPrivateKey,
-        Identity.initPkcs8(testdata.rsa_certificate_der, testdata.other_rsa_private_key_pkcs8_der),
+        Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, testdata.other_rsa_private_key_pkcs8_der, det.entropy()),
     );
 }
 
 test "RSA PKCS#8 wrapper rejects missing NULL parameters, extra fields, and trailing bytes" {
+    var det = pure_zig.DeterministicEntropy.init(0x8514);
     const valid = testdata.rsa_private_key_pkcs8_der;
 
     // Corrupt the two-byte NULL (0x05 0x00) immediately following the OID:
@@ -1623,14 +1656,14 @@ test "RSA PKCS#8 wrapper rejects missing NULL parameters, extra fields, and trai
     var missing_null = try testing.allocator.dupe(u8, valid);
     defer testing.allocator.free(missing_null);
     missing_null[null_offset] = 0x04; // NULL tag (0x05) replaced with OCTET STRING tag
-    try testing.expectError(error.InvalidPrivateKey, Identity.initPkcs8(testdata.rsa_certificate_der, missing_null));
+    try testing.expectError(error.InvalidPrivateKey, Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, missing_null, det.entropy()));
 
     // Trailing bytes after the top-level SEQUENCE.
     var with_trailer = try testing.allocator.alloc(u8, valid.len + 1);
     defer testing.allocator.free(with_trailer);
     @memcpy(with_trailer[0..valid.len], valid);
     with_trailer[valid.len] = 0x00;
-    try testing.expectError(error.InvalidPrivateKey, Identity.initPkcs8(testdata.rsa_certificate_der, with_trailer));
+    try testing.expectError(error.InvalidPrivateKey, Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, with_trailer, det.entropy()));
 
     // Extra bytes appended inside the AlgorithmIdentifier SEQUENCE, after its
     // NULL parameters but still inside the SEQUENCE's declared length —
@@ -1650,5 +1683,5 @@ test "RSA PKCS#8 wrapper rejects missing NULL parameters, extra fields, and trai
     // long-form u16.
     const outer_len_before = std.mem.readInt(u16, extra_alg_field[2..4], .big);
     std.mem.writeInt(u16, extra_alg_field[2..4], outer_len_before + 2, .big);
-    try testing.expectError(error.InvalidPrivateKey, Identity.initPkcs8(testdata.rsa_certificate_der, extra_alg_field));
+    try testing.expectError(error.InvalidPrivateKey, Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, extra_alg_field, det.entropy()));
 }

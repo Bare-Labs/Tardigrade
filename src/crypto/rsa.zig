@@ -4,6 +4,7 @@ const std = @import("std");
 const crypto = std.crypto;
 const ff = crypto.ff;
 const secrets = @import("crypto_secrets");
+const provider = @import("provider.zig");
 
 const Sha256 = crypto.hash.sha2.Sha256;
 pub const max_modulus_bits = 4096;
@@ -15,7 +16,12 @@ const test_modulus_bytes = 256;
 /// enforce).
 pub const pss_salt_len = Sha256.digest_length;
 
-pub const Error = error{InvalidInput};
+/// `EntropyFailure` covers both the injected `provider.Entropy` source
+/// itself failing and `isProbablePrime`'s bounded rejection-sampling loop
+/// exhausting its attempts (astronomically unlikely for a real entropy
+/// source; see `drawWitness`) — both mean private-key import could not
+/// complete a sound primality check, not that the key is structurally bad.
+pub const Error = error{ InvalidInput, EntropyFailure };
 
 /// Deterministic RSA-2048 fixture (self-signed `CN=tardigrade.test`,
 /// generated with openssl — matches `credentials.testdata`'s certificate).
@@ -282,6 +288,7 @@ fn validateComponentRelationships(
     dp: []const u8,
     dq: []const u8,
     qinv: []const u8,
+    entropy: provider.Entropy,
 ) Error!void {
     const big = std.math.big.int;
     var scratch: [131072]u8 = undefined;
@@ -296,8 +303,8 @@ fn validateComponentRelationships(
     // a weak (trivially factorable) modulus that either fails at signing or,
     // worse, signs successfully with much weaker security than the modulus
     // size advertises. See `isProbablePrime`'s doc comment for what this
-    // check does and does not guarantee.
-    if (!isProbablePrime(p) or !isProbablePrime(q)) return error.InvalidInput;
+    // check does and does not guarantee, and why it needs `entropy`.
+    if (!try isProbablePrime(p, entropy) or !try isProbablePrime(q, entropy)) return error.InvalidInput;
 
     const big_n = bigFromBytes(allocator, n) catch return error.InvalidInput;
     const big_e = bigFromBytes(allocator, e) catch return error.InvalidInput;
@@ -401,46 +408,65 @@ fn shiftRightOneBigEndian(buf: []u8) void {
     }
 }
 
-/// Small-prime witness bases for `isProbablePrime`'s Miller-Rabin rounds (the
-/// first 40 odd primes).
-const miller_rabin_witnesses = [_]u8{
-    2,   3,   5,   7,   11,  13,  17,  19,  23,  29,
-    31,  37,  41,  43,  47,  53,  59,  61,  67,  71,
-    73,  79,  83,  89,  97,  101, 103, 107, 109, 113,
-    127, 131, 137, 139, 149, 151, 157, 163, 167, 173,
-};
+/// Number of Miller-Rabin rounds `isProbablePrime` runs, each with an
+/// independently drawn random witness. Error probability for a composite is
+/// bounded by `4^-miller_rabin_rounds` for *random* bases (Monier-Rabin) —
+/// astronomically below any relevant threshold at 64 rounds — unlike a fixed
+/// witness set, which a prior review round correctly pointed out is not
+/// sound against an adversarially chosen candidate (published composites are
+/// known to be strong pseudoprimes to every small fixed prime base).
+const miller_rabin_rounds = 64;
 
-/// Miller-Rabin primality test with a *fixed* set of small-prime witnesses
-/// (not random bases), run entirely over `std.crypto.ff.Modulus` — the same
+fn isAllZero(buf: []const u8) bool {
+    for (buf) |byte| if (byte != 0) return false;
+    return true;
+}
+
+fn isOneBigEndian(buf: []const u8) bool {
+    for (buf[0 .. buf.len - 1]) |byte| if (byte != 0) return false;
+    return buf[buf.len - 1] == 1;
+}
+
+/// Draw a witness base uniformly at random from `[2, n-2]` (i.e. strictly
+/// less than `n_minus_one` and not `0`/`1`) via rejection sampling: fill
+/// `out` (same byte length as the candidate) from `entropy` and retry until
+/// it lands in range. Bounded to a generous attempt count — for a real
+/// entropy source the expected number of attempts is small (at worst
+/// slightly under 256, when the candidate's leading byte is `0x01`), so
+/// exhausting the bound means the entropy source itself is failing, not bad
+/// luck.
+fn drawWitness(n_minus_one: []const u8, entropy: provider.Entropy, out: []u8) Error!void {
+    var attempts: usize = 0;
+    while (attempts < 4096) : (attempts += 1) {
+        entropy.fill(out) catch return error.EntropyFailure;
+        if (!isAllZero(out) and !isOneBigEndian(out) and lessThanUnsigned(out, n_minus_one)) return;
+    }
+    return error.EntropyFailure;
+}
+
+/// Miller-Rabin primality test with `miller_rabin_rounds` independently
+/// drawn random witnesses (not a fixed set — see that constant's doc
+/// comment for why), run entirely over `std.crypto.ff.Modulus` — the same
 /// primitive `signPssSha256`/`verifyPssSha256` use, so no new modexp
 /// implementation is introduced. `candidate` must be minimal big-endian
 /// bytes (no leading zero byte) and nonzero, matching every call site here
-/// (`p`/`q` after `stripLeadingZero`).
-///
-/// This is a strong heuristic, not a formal primality proof: fixed witnesses
-/// are not a proven-correct deterministic test at RSA prime sizes (unlike
-/// small bounded ranges where specific fixed witness sets are proven
-/// sufficient). A composite specifically engineered to be a strong
-/// pseudoprime to all 40 witnesses here is not known to be constructible in
-/// practice, and this closes the gap a purely algebraic relationship check
-/// leaves open (see `validateComponentRelationships`'s caller) — but it is
-/// weaker than trial with random bases would give, which this function
-/// avoids only to keep RSA private-key parsing free of an entropy-source
-/// dependency. Recorded here per the project's practice of documenting
-/// toolchain/scope limitations honestly rather than leaving them implicit;
-/// see `docs/CRYPTO_SECURITY_AUDIT.md`.
-fn isProbablePrime(candidate: []const u8) bool {
+/// (`p`/`q` after `stripLeadingZero`). `n_minus_one`/`d`/each drawn witness
+/// are wiped before return: all three are derived from (or, for `d`,
+/// directly determine information about) the secret prime `candidate`.
+fn isProbablePrime(candidate: []const u8, entropy: provider.Entropy) Error!bool {
     if (candidate.len == 0) return false;
     if (candidate.len == 1) return candidate[0] == 2 or candidate[0] == 3;
     if (candidate[candidate.len - 1] & 1 == 0) return false; // even, and > 1 byte so > 3: composite
 
     var n_minus_one_buf: [max_modulus_bytes]u8 = undefined;
     const n_minus_one = n_minus_one_buf[0..candidate.len];
+    defer secrets.secureZero(n_minus_one);
     @memcpy(n_minus_one, candidate);
     decrementBigEndian(n_minus_one);
 
     var d_buf: [max_modulus_bytes]u8 = undefined;
     const d = d_buf[0..candidate.len];
+    defer secrets.secureZero(d);
     @memcpy(d, n_minus_one);
     var s: u32 = 0;
     while (!isOddBigEndian(d)) {
@@ -453,20 +479,28 @@ fn isProbablePrime(candidate: []const u8) bool {
     const n_minus_one_fe = Fp.Fe.fromBytes(modulus_fe, n_minus_one, .big) catch return false;
     const one_fe = modulus_fe.one();
 
-    witness_loop: for (miller_rabin_witnesses) |witness| {
-        var base_buf: [max_modulus_bytes]u8 = [_]u8{0} ** max_modulus_bytes;
-        base_buf[candidate.len - 1] = witness;
-        const base_fe = Fp.Fe.fromBytes(modulus_fe, base_buf[0..candidate.len], .big) catch return false;
+    var base_buf: [max_modulus_bytes]u8 = undefined;
+    const base = base_buf[0..candidate.len];
+    defer secrets.secureZero(base);
+
+    var round: u32 = 0;
+    while (round < miller_rabin_rounds) : (round += 1) {
+        try drawWitness(n_minus_one, entropy, base);
+        const base_fe = Fp.Fe.fromBytes(modulus_fe, base, .big) catch return false;
 
         var x = modulus_fe.powWithEncodedExponent(base_fe, d, .big) catch return false;
-        if (x.eql(one_fe) or x.eql(n_minus_one_fe)) continue :witness_loop;
+        if (x.eql(one_fe) or x.eql(n_minus_one_fe)) continue;
 
-        var round: u32 = 1;
-        while (round < s) : (round += 1) {
+        var composite_for_this_witness = true;
+        var inner: u32 = 1;
+        while (inner < s) : (inner += 1) {
             x = modulus_fe.sq(x);
-            if (x.eql(n_minus_one_fe)) continue :witness_loop;
+            if (x.eql(n_minus_one_fe)) {
+                composite_for_this_witness = false;
+                break;
+            }
         }
-        return false;
+        if (composite_for_this_witness) return false;
     }
     return true;
 }
@@ -478,8 +512,11 @@ fn isProbablePrime(candidate: []const u8) bool {
 /// rejected, matching the narrower signing subset this profile enforces.
 /// Beyond per-field structural/range checks, every component relationship
 /// RFC 8017 requires is validated (see `validateComponentRelationships`)
-/// before any private bytes are copied into the returned owner.
-pub fn parsePrivateKeyDer(der: []const u8) Error!PrivateKey {
+/// before any private bytes are copied into the returned owner. `entropy`
+/// draws the random Miller-Rabin witnesses `isProbablePrime` uses to verify
+/// `p` and `q` are actually prime — a one-time, key-import-only draw, never
+/// on the per-signature hot path.
+pub fn parsePrivateKeyDer(der: []const u8, entropy: provider.Entropy) Error!PrivateKey {
     if (der.len < 2 or der[0] != 0x30) return error.InvalidInput;
     var offset: usize = 1;
     const sequence_len = try readLength(der, &offset);
@@ -526,7 +563,7 @@ pub fn parsePrivateKeyDer(der: []const u8) Error!PrivateKey {
         if (!lessThanUnsigned(component, modulus)) return error.InvalidInput;
     }
 
-    try validateComponentRelationships(modulus, exponent, private_exponent, prime1, prime2, exponent1, exponent2, coefficient);
+    try validateComponentRelationships(modulus, exponent, private_exponent, prime1, prime2, exponent1, exponent2, coefficient, entropy);
 
     var key = PrivateKey{ .bits = bits };
     key.n_len = modulus.len;
@@ -763,8 +800,35 @@ test "RSA-PSS rejects short, long, and out-of-range signatures" {
 const test_private_key_pkcs1_der: []const u8 = testdata.private_key_pkcs1_der;
 const test_public_key_der: []const u8 = testdata.public_key_der;
 
+/// A small deterministic splitmix64-based byte source for exercising
+/// `isProbablePrime`'s entropy-drawn witnesses in tests without depending on
+/// `pure_zig.zig` (which itself depends on this file) or the OS CSPRNG.
+/// Never used outside this file's own tests — production entropy always
+/// comes from the caller-injected `provider.Entropy`.
+const TestEntropy = struct {
+    state: u64,
+
+    fn fillImpl(context: *anyopaque, buffer: []u8) provider.EntropyError!void {
+        const self: *TestEntropy = @ptrCast(@alignCast(context));
+        for (buffer) |*byte| {
+            self.state +%= 0x9E3779B97F4A7C15;
+            var z = self.state;
+            z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+            z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+            z = z ^ (z >> 31);
+            byte.* = @truncate(z);
+        }
+    }
+};
+
+var test_entropy_state = TestEntropy{ .state = 0x5A5A5A5A5A5A5A5A };
+
+fn testEntropy() provider.Entropy {
+    return .{ .context = &test_entropy_state, .fillFn = TestEntropy.fillImpl };
+}
+
 fn testKey() PrivateKey {
-    return parsePrivateKeyDer(test_private_key_pkcs1_der) catch unreachable;
+    return parsePrivateKeyDer(test_private_key_pkcs1_der, testEntropy()) catch unreachable;
 }
 
 test "RSA-2048 private key signs a message the native verifier accepts" {
@@ -829,20 +893,20 @@ test "RSA private-key DER rejects a wrong version, malformed integers, and out-o
             buf[6] = 1; // the version INTEGER's content byte
         }
     }.mutate);
-    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&multi_prime));
+    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&multi_prime, testEntropy()));
 
     // Truncated DER.
-    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(test_private_key_pkcs1_der[0 .. test_private_key_pkcs1_der.len - 1]));
+    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(test_private_key_pkcs1_der[0 .. test_private_key_pkcs1_der.len - 1], testEntropy()));
 
     // Trailing garbage after the SEQUENCE's declared content is rejected by
     // the exact-length check on the outer TLV.
     var with_trailer: [test_private_key_pkcs1_der.len + 1]u8 = undefined;
     @memcpy(with_trailer[0..test_private_key_pkcs1_der.len], test_private_key_pkcs1_der);
     with_trailer[test_private_key_pkcs1_der.len] = 0;
-    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&with_trailer));
+    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&with_trailer, testEntropy()));
 
-    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&[_]u8{}));
-    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&[_]u8{0x30}));
+    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&[_]u8{}, testEntropy()));
+    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&[_]u8{0x30}, testEntropy()));
 }
 
 test "RSA private-key DER rejects every component mutation that breaks a required relationship" {
@@ -863,7 +927,7 @@ test "RSA private-key DER rejects every component mutation that breaks a require
     for (mutations) |case| {
         var buf = testdata.private_key_pkcs1_bytes;
         buf[case.offset] ^= 0x01;
-        var key = parsePrivateKeyDer(&buf) catch continue;
+        var key = parsePrivateKeyDer(&buf, testEntropy()) catch continue;
         key.deinit();
         std.debug.print("mutation accepted but should have been rejected: {s}\n", .{case.name});
         return error.TestUnexpectedResult;
@@ -878,7 +942,7 @@ test "RSA private-key DER rejects p == q" {
     const q_start = 668;
     const prime_len = 129;
     @memcpy(buf[q_start .. q_start + prime_len], buf[p_start .. p_start + prime_len]);
-    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&buf));
+    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&buf, testEntropy()));
 }
 
 test "RSA private-key DER rejects a full 2048-bit key whose p and q are composite but satisfy every algebraic relation" {
@@ -893,7 +957,7 @@ test "RSA private-key DER rejects a full 2048-bit key whose p and q are composit
     const composite_factor_key = hexBytesForTest(
         "308204a4020100028201010093222272dc2c77020f867d8c26052df8a60128f72bf15f2bf91338e29568e68e1814cadd95667791722bf2010140fb310020206674655e0fbfdfeb058f96652480adb0812a267f43f7453d1760bc55933b4855347d21a25963d0ba248413300f487198b0538cf062888a739cf733fa8062147ce160b700d6054bcab50a3152f4fd2d597d4318868e9065018413489f87c9da923e9752b026edbccd232cfba1aa6373414080dce61a3dccba2e2ed33de6f6f4f05646adb72159e63d6712458b0518e03a2cbaab303a57e1b45b1be9077f3f869d08ad1915d20dcf70f312fefc28ebd8b25af0067346a0182a82c79c93b94811918c4a6bb9ba6d4be374f972b4eb02030100010282010013028887e5999b20b987cb65d5adbaa45332782c0351f2d5781f7b2c8f5857dd890ffaac09770d40ce0b0e8001bcf7177c282a7782576c81456db56c690269fbfee23219662c462a2e631443167d0ee37077e6865b1a82e2e0ca219ac133c7745a0c4f498ce9fb4f07cc37a6d2abb5146c57b050e05194ba92419a25acf4f57e3ea234a53e87121d439a8b68d68a066d22476ae4b05078e623c1cca8a1c4965c42d5709eda30f0ff96e926d5260803d6f61747b9b30a8fc3eb1239757961b59b34132bd4ebef1966cf8d4b16163db2f5da1e21d074bf7fea88ba051a51d5e48027b917cc5fcf4232cdf7161db72c74a0cf43fc5a19129a3a6561f077dc51fe8102818100bcbdf596aea32769feca7cfd476344e76738a538ac8c2b8d13db925f93a019f0edab8b457c26488d2ca88145af9cf0b95f724816b19edd164ca33c1309521f8e52b9a398b363eb110c0755b3e9bf186c3a195d3e326b95ff559fb7316f65dda4beb138fbe1b2e70c3e8f263a90c4a43548c62059a19613149a4107f3c44e226b02818100c790695fdaf7cf06a578fd15cd1fdf1a911597d2970267511330527fcd9fcaff7d513689e04dbb070bb513d9285cb77a99171f84e6269b1542adf8311af2ff338b808512047750d5857973f0e12ce7e0931d86b349d656e6c2826b2f5f5af311d7b5219eccabbce6d3940ca5c7016beeb94bb9d0cbf9837c8d7b0eb9d36357810281810096f513f525ce869aa757caea44eba7d3b0e2447b74be53a2ed8c03a18010604f2bb8b596a8ba71f2c01231facb7fa9a58a2a7c6ff2368ebbe425f6c97efdf9113b27112af3e7e9bde3b20620f4c68bc11c22e749f4c7c9dbc3df0f857184b6e6aa4252c25afd5d009514a74dd63600e441457de0527616e2b69166cbd86969eb02818100b1da52ff199ff6827ee077f5810d218184c1d0bfded3468eabe249f41aa6897cef0b7ce69ddfc889fbf6124d5bba5dcec637246105d86c282377f6149566f0e7d830dee772d17f59fc0d84b5ad889ed2b769fe0d3505f006d25cf6f78e2cf929f2ab3bde519bd0cb8ace8c03067b8edc7f892c7e17fb3422c1d86504598f54810281802a90983d83db5eb1c0b853ab58873e075160ffdd1ee52638e6a8b75cbc9ae2f4d5900e8228c885057594f7ea63c01914a6e4af8449711587a4bebeac946f18794e48fd760d7d568e37ff0abf93e80d2f88ee2c36b36da93b73bb43774b65efac68f22c43f4439f4222c463d03b57a11b18f516547796d91776b10fa28ca4763b",
     );
-    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&composite_factor_key));
+    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&composite_factor_key, testEntropy()));
 }
 
 test "isProbablePrime rejects well-known composites, including Fermat/Carmichael pseudoprimes, and accepts real primes" {
@@ -914,7 +978,7 @@ test "isProbablePrime rejects well-known composites, including Fermat/Carmichael
         &[_]u8{25},
     };
     for (composites) |composite| {
-        try std.testing.expect(!isProbablePrime(composite));
+        try std.testing.expect(!try isProbablePrime(composite, testEntropy()));
     }
 
     const primes = [_][]const u8{
@@ -925,7 +989,7 @@ test "isProbablePrime rejects well-known composites, including Fermat/Carmichael
         &[_]u8{ 0x01, 0x99, 0x19 }, // 104729
     };
     for (primes) |prime| {
-        try std.testing.expect(isProbablePrime(prime));
+        try std.testing.expect(try isProbablePrime(prime, testEntropy()));
     }
 
     // Real RSA-2048/3072/4096 prime factors from the module's own fixtures.
@@ -943,7 +1007,7 @@ test "isProbablePrime rejects well-known composites, including Fermat/Carmichael
         0x24, 0x63, 0xd8, 0x9a, 0xb8, 0x42, 0xe4, 0x4f, 0x02, 0x88, 0xf8, 0xe3, 0x18, 0xd9, 0xc1, 0x25,
         0x0b, 0x9a, 0x57, 0xaa, 0x95, 0xdb, 0x61, 0x13, 0x4d, 0xe7, 0xf1, 0x29, 0xa4, 0x4e, 0x9e, 0xdd,
     };
-    try std.testing.expect(isProbablePrime(fixture_p));
+    try std.testing.expect(try isProbablePrime(fixture_p, testEntropy()));
 }
 
 test "matchesPublicKeyDer requires exact modulus and exponent equality" {
@@ -977,7 +1041,7 @@ test "RSA-3072 and RSA-4096 private keys sign messages the native verifier accep
     inline for (fixtures) |fixture| {
         const private_bytes = comptime hexBytesForTest(fixture.private_der_hex);
         const public_bytes = comptime hexBytesForTest(fixture.public_der_hex);
-        var key = try parsePrivateKeyDer(&private_bytes);
+        var key = try parsePrivateKeyDer(&private_bytes, testEntropy());
         defer key.deinit();
         try std.testing.expectEqual(fixture.expected_len, key.modulusLen());
         try std.testing.expect(key.matchesPublicKeyDer(&public_bytes));
@@ -1001,5 +1065,5 @@ test "RSA private-key DER deterministically rejects an unsupported 1024-bit modu
     const key_bytes = hexBytesForTest(
         "3082025d02010002818100d400a728e179458c0ce88301df9f5c99fc684a02986ece5c255c1b72b36b0d0135bf1c2aadf7153c196d182b7abea4b91d03d33b8e3653ff7b58b31b0d621d58044f7c87e56c5e916cd05a248d00c91507bcd9471149d4b4783b25a9ac09fc6430f8ef8553b1e402e22c749e8bd059f027d644336f8a97dd883e6fb504a8feed02030100010281803c64373a0908cfcbf67d619c6e046a8f9efc6260dce56bb98a16f3e6b7bf7e03e3389ea075d015e779e2bee8dbdd64f52a93c55f88c26729370cec707f5e7cb6ea31e91a6f7a3111b3cfcaa9c392d6b2903158d03d7a1fe4115ff77aafb07717acb8aed4b6e355b59caa3589142ffa25cda68264a88ac1ac94388d61668e5e21024100f00b331979b10224079675cc5090d70010942bc694b20eebf46ada5dfe4258f1caa59f86ae1300284daf249f6d9e3e6ff36c6d58da39c2c8c64c08e94317a8e9024100e2184773b4b71dca2d228bf2210803ab6bdaa73324d04df24b201a7146c1556ba0d5031a56245525d7dca0360de788ab6a734ce3acf3564a40750f76112fa365024100d437d2916f38c2bfbfc591977492d8c1c1e67d5d2f10cc8866aa212c8021802924139119acc4379b6a32b19a117b998fb811e00a71c4272501cb2f05aabf3c2102402612a895976cee9b4916743285d56fa8c234c3cb1cfbe6e4523a49b9a18c94f1d6d787fa3b5f4ae7607e4a8c4fb31994a40c5e7a487981a267504f1636b6aaf1024100b87667561caec2d3486ce54e23602c9d56bc089230b66cc49bd816b66405bfbdd6cb37ecd27cfee18386840467eb65629df3469bada4182df16cf43a70f7cde5",
     );
-    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&key_bytes));
+    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&key_bytes, testEntropy()));
 }

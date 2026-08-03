@@ -800,9 +800,15 @@ pub const SoftwareEcdsaP256SigningKey = struct {
 pub const SoftwareRsaSigningKey = struct {
     key: rsa.PrivateKey,
 
-    /// Parse and validate a PKCS#1 `RSAPrivateKey` DER encoding.
-    pub fn fromDer(der: []const u8) provider.SignError!SoftwareRsaSigningKey {
-        const key = rsa.parsePrivateKeyDer(der) catch return error.InvalidInput;
+    /// Parse and validate a PKCS#1 `RSAPrivateKey` DER encoding. `entropy`
+    /// draws the random Miller-Rabin witnesses used to verify `p`/`q` are
+    /// actually prime (see `rsa.parsePrivateKeyDer`) — a one-time draw at
+    /// key import, not on the per-signature path.
+    pub fn fromDer(der: []const u8, entropy: provider.Entropy) provider.SignError!SoftwareRsaSigningKey {
+        const key = rsa.parsePrivateKeyDer(der, entropy) catch |err| return switch (err) {
+            error.InvalidInput => error.InvalidInput,
+            error.EntropyFailure => error.EntropyFailure,
+        };
         return .{ .key = key };
     }
 
@@ -1595,7 +1601,7 @@ test "SoftwareRsaSigningKey signs then verifies, with tamper and wrong-key/messa
     var p = Provider.init(det.entropy());
     const cp = p.cryptoProvider();
 
-    var software_key = try SoftwareRsaSigningKey.fromDer(rsa.testdata.private_key_pkcs1_der);
+    var software_key = try SoftwareRsaSigningKey.fromDer(rsa.testdata.private_key_pkcs1_der, det.entropy());
     defer software_key.deinit();
     const signer = software_key.signingKey();
     try testing.expectEqual(provider.SignatureScheme.rsa_pss_rsae_sha256, signer.scheme());
@@ -1635,7 +1641,8 @@ test "SoftwareRsaSigningKey draws the PSS salt from injected entropy" {
         }
     };
 
-    var key = try SoftwareRsaSigningKey.fromDer(rsa.testdata.private_key_pkcs1_der);
+    var import_entropy = DeterministicEntropy.init(0x51a1);
+    var key = try SoftwareRsaSigningKey.fromDer(rsa.testdata.private_key_pkcs1_der, import_entropy.entropy());
     defer key.deinit();
     const signer = key.signingKey();
 
@@ -1682,7 +1689,8 @@ test "SoftwareRsaSigningKey rejects small output before entropy and leaves outpu
         }
     };
 
-    var key = try SoftwareRsaSigningKey.fromDer(rsa.testdata.private_key_pkcs1_der);
+    var import_entropy = DeterministicEntropy.init(0x51a2);
+    var key = try SoftwareRsaSigningKey.fromDer(rsa.testdata.private_key_pkcs1_der, import_entropy.entropy());
     defer key.deinit();
     const signer = key.signingKey();
 
@@ -1700,9 +1708,10 @@ test "SoftwareRsaSigningKey rejects small output before entropy and leaves outpu
 }
 
 test "SoftwareRsaSigningKey format is banned and fromDer rejects malformed DER" {
+    var det = DeterministicEntropy.init(0x51a3);
     try testing.expect(@hasDecl(SoftwareRsaSigningKey, "format"));
-    try testing.expectError(error.InvalidInput, SoftwareRsaSigningKey.fromDer(&[_]u8{0x30}));
-    try testing.expectError(error.InvalidInput, SoftwareRsaSigningKey.fromDer(&[_]u8{}));
+    try testing.expectError(error.InvalidInput, SoftwareRsaSigningKey.fromDer(&[_]u8{0x30}, det.entropy()));
+    try testing.expectError(error.InvalidInput, SoftwareRsaSigningKey.fromDer(&[_]u8{}, det.entropy()));
 }
 
 test "fromSeedSecret clears the caller's typed secret immediately and derives the same key as fromSeed" {
