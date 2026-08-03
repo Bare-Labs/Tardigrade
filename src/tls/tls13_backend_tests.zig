@@ -588,6 +588,183 @@ test "direct shared driver preserves derivation, sequence, discard, and teardown
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&harness.server_backend.identity), 0));
 }
 
+// #565: an RSA-2048 server credential, negotiated exclusively (the shared
+// policy on both sides names only `.rsa_pss_rsae_sha256`, so a successful
+// handshake is only reachable through the native RSA-PSS signing, provider
+// verification, and credential-selection path added by this change — there
+// is no other scheme to fall back to).
+test "native RSA-PSS server credential completes a record-mode handshake" {
+    var harness: DirectHarness = undefined;
+    const client_crypto_provider = harness.client_provider_storage.init(client_provider_seed);
+    const server_crypto_provider = harness.server_provider_storage.init(server_provider_seed);
+    const client_bridge_crypto_provider = harness.client_bridge_provider_storage.init(client_provider_seed);
+    const server_bridge_crypto_provider = harness.server_bridge_provider_storage.init(server_provider_seed);
+    const alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.h2};
+    const rsa_capabilities = tls_core.policy.Capabilities{ .signature_schemes = &.{.rsa_pss_rsae_sha256} };
+    const policy = tls_core.policy.Policy.fromCapabilities(.record, rsa_capabilities, &alpns);
+    harness = .{
+        .client_provider_storage = harness.client_provider_storage,
+        .server_provider_storage = harness.server_provider_storage,
+        .client_bridge_provider_storage = harness.client_bridge_provider_storage,
+        .server_bridge_provider_storage = harness.server_bridge_provider_storage,
+        .client_backend = tls_backend.Tls13Backend.initClientConfigured(
+            clientEntropy(),
+            client_crypto_provider,
+            .{ .pinned_certificate = tls_backend.testdata.rsa_certificate_der },
+            tls_backend.recordConfig(policy),
+            .{},
+        ),
+        .server_backend = tls_backend.Tls13Backend.initServerConfigured(
+            serverEntropy(),
+            server_crypto_provider,
+            tls_backend.testdata.rsaIdentity(),
+            tls_backend.recordConfig(policy),
+        ),
+        .client_bridge = Bridge.init(client_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+        .server_bridge = Bridge.init(server_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+    };
+    // Capture the scheme the fixed identity will sign with before running
+    // the handshake: the engine wipes `server_backend.identity` (including
+    // its tag) once it has been used to sign, as part of the same
+    // defense-in-depth secret-lifetime discipline every other identity path
+    // gets, so it is not observable after `run()` returns.
+    const identity_scheme = harness.server_backend.identity.signatureScheme();
+    try std.testing.expectEqual(credentials.SignatureScheme.rsa_pss_rsae_sha256, identity_scheme);
+
+    defer harness.deinit();
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+    // The client's policy above names only `.rsa_pss_rsae_sha256` — RFC
+    // 8446's `signature_algorithms` extension makes any other scheme
+    // unacceptable to it, so this handshake's success (not merely the
+    // pre-run identity check above) is itself proof the negotiated
+    // CertificateVerify scheme really was `identity_scheme`, not an
+    // assumption inferred from policy alone.
+    try std.testing.expect(!harness.server_backend.identity_present);
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try harness.client_bridge.sealApplicationData("client application over RSA-PSS", &protected);
+    const opened_request = try harness.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext);
+    try std.testing.expectEqualStrings("client application over RSA-PSS", opened_request.inner.content);
+}
+
+/// Build a `DirectHarness` whose client and server negotiation policies each
+/// name exactly the given signature-scheme sets (independently — unlike
+/// `directHarnessWithClientCipherSuitesAndServerProvider`'s cipher-suite
+/// analogue, both sides can differ here), with an RSA-pinned client trust and
+/// a caller-supplied server `CredentialProvider` (a `MockCredentialProvider`
+/// wrapping an RSA identity, in every current caller, so `sign_count`/
+/// `release_count`/`flip_signature` are directly observable).
+fn initAsymmetricSignatureSchemeHarness(
+    harness: *DirectHarness,
+    server_provider: credentials.CredentialProvider,
+    client_signature_schemes: []const tls_core.policy.SignatureScheme,
+    server_signature_schemes: []const tls_core.policy.SignatureScheme,
+) void {
+    const client_crypto_provider = harness.client_provider_storage.init(client_provider_seed);
+    const server_crypto_provider = harness.server_provider_storage.init(server_provider_seed);
+    const client_bridge_crypto_provider = harness.client_bridge_provider_storage.init(client_provider_seed);
+    const server_bridge_crypto_provider = harness.server_bridge_provider_storage.init(server_provider_seed);
+    const alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.h2};
+    const client_policy = tls_core.policy.Policy.fromCapabilities(.record, .{ .signature_schemes = client_signature_schemes }, &alpns);
+    const server_policy = tls_core.policy.Policy.fromCapabilities(.record, .{ .signature_schemes = server_signature_schemes }, &alpns);
+    harness.* = .{
+        .client_provider_storage = harness.client_provider_storage,
+        .server_provider_storage = harness.server_provider_storage,
+        .client_bridge_provider_storage = harness.client_bridge_provider_storage,
+        .server_bridge_provider_storage = harness.server_bridge_provider_storage,
+        .client_backend = tls_backend.Tls13Backend.initClientConfigured(
+            clientEntropy(),
+            client_crypto_provider,
+            .{ .pinned_certificate = tls_backend.testdata.rsa_certificate_der },
+            tls_backend.recordConfig(client_policy),
+            .{},
+        ),
+        .server_backend = tls_backend.Tls13Backend.initServerWithProviderConfigured(
+            serverEntropy(),
+            server_crypto_provider,
+            server_provider,
+            tls_backend.recordConfig(server_policy),
+        ),
+        .client_bridge = Bridge.init(client_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+        .server_bridge = Bridge.init(server_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+    };
+}
+
+test "RSA-PSS: no signature-algorithm overlap fails before the signer is invoked" {
+    var harness: DirectHarness = undefined;
+    var mock = credentials.MockCredentialProvider.init(tls_backend.testdata.rsaIdentity());
+    // Client accepts only Ed25519/ECDSA; the server's only credential is
+    // RSA. Selection must fail on the peer-offer check inside
+    // `MockCredentialProvider.select`, before `credentialSign` is ever
+    // reached.
+    initAsymmetricSignatureSchemeHarness(&harness, mock.provider(), &.{ .ed25519, .ecdsa_secp256r1_sha256 }, &.{.rsa_pss_rsae_sha256});
+    defer harness.deinit();
+
+    try std.testing.expectError(error.NoApplicableCredential, harness.run());
+    try std.testing.expectEqual(tls_backend.CredentialFailure.no_compatible_signature_algorithm, harness.server_backend.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 0), mock.sign_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.release_count);
+}
+
+test "RSA-PSS: tampered CertificateVerify signature fails proof of possession at the client" {
+    var harness: DirectHarness = undefined;
+    var mock = credentials.MockCredentialProvider.init(tls_backend.testdata.rsaIdentity());
+    mock.flip_signature = true;
+    initAsymmetricSignatureSchemeHarness(&harness, mock.provider(), &.{.rsa_pss_rsae_sha256}, &.{.rsa_pss_rsae_sha256});
+    defer harness.deinit();
+
+    // A CertificateVerify proof-of-possession failure is a decrypt_error
+    // (RFC 8446 §4.4.3), the same mapping the Ed25519/ECDSA paths already
+    // use — this proves the RSA arm of `checkProofOfPossession` reaches it
+    // too, not a scheme-specific outcome.
+    try std.testing.expectError(error.DecryptError, harness.run());
+    try std.testing.expectEqual(tls_backend.CredentialFailure.certificate_verify_invalid, harness.client_backend.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), mock.sign_count);
+}
+
+test "RSA-PSS: server rejects a provider-selected non-RSA scheme for an RSA leaf before flight" {
+    var server_provider_storage: ProviderStorage = .{};
+    var mock = credentials.MockCredentialProvider.init(tls_backend.testdata.rsaIdentity());
+    mock.scheme_override = .ed25519;
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), server_provider_storage.init(server_provider_seed), mock.provider(), .record);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    // Default offers include Ed25519, so selection itself succeeds (the
+    // mock reports the overridden scheme); the RSA leaf/Ed25519-scheme
+    // mismatch must be caught by `leafSupportsSignatureScheme` before any
+    // flight is emitted.
+    const hello = try buildClientHello(&buf, .{});
+    try std.testing.expectError(error.CredentialProviderFailed, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.invalid_callback_behavior, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&sink, .initial));
+}
+
+test "RSA-PSS: server rejects a provider-selected RSA scheme for a non-RSA leaf before flight" {
+    var server_provider_storage: ProviderStorage = .{};
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity()); // Ed25519 leaf
+    mock.scheme_override = .rsa_pss_rsae_sha256;
+    var server = tls_backend.Tls13Backend.initServerWithProvider(serverEntropy(), server_provider_storage.init(server_provider_seed), mock.provider(), .record);
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .sig_schemes = &.{ 0x0807, 0x0403, 0x0804 } });
+    try std.testing.expectError(error.CredentialProviderFailed, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expectEqual(tls_backend.CredentialFailure.invalid_callback_behavior, server.credentialFailure().?);
+    try std.testing.expectEqual(@as(usize, 1), mock.release_count);
+    try std.testing.expectEqual(@as(usize, 0), countCryptoEvents(&sink, .initial));
+}
+
 test "direct record handshake delivers large post-handshake ticket once" {
     const Capture = struct {
         count: usize = 0,

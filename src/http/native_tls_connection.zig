@@ -75,10 +75,16 @@ pub const NativeCredentialStore = struct {
             for (loaded[0..loaded_len]) |*bundle| bundle.deinit();
         }
 
-        try loaded[loaded_len].initDefault(self.allocator, default_cert_path, default_key_path);
+        // One entropy view, used both for private-key import (RSA's
+        // primality check) below and for signing via `config()` further
+        // down — `OsEntropy.entropy()` is a stateless wrapper over the OS
+        // CSPRNG, so reusing/re-deriving it across calls is the established
+        // pattern (see its doc comment), not a per-call resource.
+        const load_entropy = self.entropy_source.entropy();
+        try loaded[loaded_len].initDefault(self.allocator, default_cert_path, default_key_path, load_entropy);
         loaded_len += 1;
         for (sni_certs) |spec| {
-            try loaded[loaded_len].initNamed(self.allocator, spec);
+            try loaded[loaded_len].initNamed(self.allocator, spec, load_entropy);
             loaded_len += 1;
         }
 
@@ -116,12 +122,13 @@ const LoadedBundle = struct {
         allocator: std.mem.Allocator,
         cert_path: []const u8,
         key_path: []const u8,
+        entropy: @import("crypto").provider.Entropy,
     ) !void {
-        try self.init(allocator, cert_path, key_path, "default.invalid", true);
+        try self.init(allocator, cert_path, key_path, "default.invalid", true, entropy);
     }
 
-    fn initNamed(self: *LoadedBundle, allocator: std.mem.Allocator, spec: SniCertSpec) !void {
-        try self.init(allocator, spec.cert_path, spec.key_path, spec.server_name, false);
+    fn initNamed(self: *LoadedBundle, allocator: std.mem.Allocator, spec: SniCertSpec, entropy: @import("crypto").provider.Entropy) !void {
+        try self.init(allocator, spec.cert_path, spec.key_path, spec.server_name, false, entropy);
     }
 
     fn init(
@@ -131,9 +138,10 @@ const LoadedBundle = struct {
         key_path: []const u8,
         pattern: []const u8,
         is_default: bool,
+        entropy: @import("crypto").provider.Entropy,
     ) !void {
         self.* = .{};
-        self.loaded = try tls.identity_loader.loadIdentity(allocator, cert_path, key_path);
+        self.loaded = try tls.identity_loader.loadIdentity(allocator, cert_path, key_path, entropy);
         self.chain = self.loaded.cert_chain;
         self.patterns = .{pattern};
         self.supported_schemes = .{self.loaded.identity.signatureScheme()};
@@ -161,6 +169,7 @@ fn keyKindForScheme(scheme: credentials.SignatureScheme) sni_provider.KeyKind {
     return switch (scheme) {
         .ed25519 => .ed25519,
         .ecdsa_secp256r1_sha256 => .ecdsa_p256,
+        .rsa_pss_rsae_sha256 => .rsa,
         else => unreachable,
     };
 }
@@ -627,6 +636,71 @@ test "prepared native credential reload does not publish same-path cert changes 
     try expectSelectedLeaf(store.provider(), chain_a[0]);
     try store.commitPreparedReload(&prepared);
     try expectSelectedLeaf(store.provider(), chain_b[0]);
+}
+
+// #565 review: the production file-loading composition
+// (`NativeCredentialStore.reloadFromFiles` -> `LoadedBundle.init` ->
+// `identity_loader.loadIdentity`) could not construct an RSA identity at
+// all — `loadIdentity` called the no-entropy `Identity.initPkcs8`, which
+// this PR deliberately makes reject RSA, and `keyKindForScheme` had no RSA
+// arm (would have hit its `unreachable` the first time a real RSA
+// credential reached selection). This exercises the exact reload-from-files
+// path a real deployment uses, not a lower-level direct-construction
+// shortcut, so both gaps are covered together.
+test "native credential store loads an RSA identity through the real reload-from-files path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_abs);
+    const cert_path = try std.fmt.allocPrint(allocator, "{s}/server.crt", .{tmp_abs});
+    defer allocator.free(cert_path);
+    const key_path = try std.fmt.allocPrint(allocator, "{s}/server.key", .{tmp_abs});
+    defer allocator.free(key_path);
+
+    const cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.crt", 256 * 1024);
+    defer allocator.free(cert);
+    const key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_rsa.key", 256 * 1024);
+    defer allocator.free(key);
+    const chain = try tls.identity_loader.certChainFromPemOrDer(allocator, cert);
+    defer freeTestCertChain(allocator, chain);
+
+    try compat.cwd().writeFile(.{ .sub_path = cert_path, .data = cert });
+    try compat.cwd().writeFile(.{ .sub_path = key_path, .data = key });
+
+    var store = NativeCredentialStore.init(allocator);
+    defer store.deinit();
+    try store.reloadFromFiles(cert_path, key_path, &.{});
+
+    const selection = credentials.SelectionContext{
+        .role = .server,
+        .server_name = null,
+        .peer_signature_schemes = &.{0x0804}, // rsa_pss_rsae_sha256 only
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    };
+    const progress = try store.provider().selectCredential(&selection);
+    const credential = switch (progress) {
+        .complete => |c| c,
+        .pending => return error.TestUnexpectedPending,
+    };
+    defer credential.release();
+    try std.testing.expectEqual(credentials.SignatureScheme.rsa_pss_rsae_sha256, credential.scheme);
+    const selected_chain = credential.certificateChain();
+    try std.testing.expectEqual(@as(usize, 1), selected_chain.count());
+    try std.testing.expectEqualSlices(u8, chain[0], selected_chain.leaf().?);
+
+    // Prove the selected credential can actually sign, not merely that
+    // selection returned an RSA-tagged handle.
+    var signature: [512]u8 = undefined;
+    const progress2 = try credential.sign("reload-from-files RSA smoke signature", &signature);
+    const written = switch (progress2) {
+        .complete => |len| len,
+        .pending => return error.TestUnexpectedPending,
+    };
+    try std.testing.expectEqual(@as(usize, 256), written);
 }
 
 test "native TLS owner heap-stabilizes backend record and owns fd close" {

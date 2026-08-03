@@ -17,10 +17,13 @@
 //!   * Ed25519 signing (via `SoftwareSigningKey`) and verification
 //!   * ECDSA-P256/SHA-256 signing (via
 //!     `SoftwareEcdsaP256SigningKey`) and verification
+//!   * RSA-PSS-RSAE/SHA-256 signing (via `SoftwareRsaSigningKey`) and
+//!     verification
 //!   * injected-entropy random bytes, constant-time compare, secure zero
 //!
-//! RSA-PSS-RSAE/SHA-256 verification is implemented in `rsa.zig` with strict
-//! DER, 2048/3072/4096-bit RSA key-size, and EMSA-PSS validation.
+//! RSA-PSS-RSAE/SHA-256 verification and the private-key owner/signing path
+//! are implemented in `rsa.zig` with strict DER, 2048/3072/4096-bit RSA
+//! key-size, and EMSA-PSS validation.
 //!
 //! The provider never draws ambient randomness: it fills key-share scalars and
 //! any per-signature noise from the `provider.Entropy` handed in at
@@ -788,6 +791,82 @@ pub const SoftwareEcdsaP256SigningKey = struct {
     }
 };
 
+/// A software RSA-PSS-RSAE-SHA256 signing key. Produces a `provider.SigningKey`
+/// whose private state is `rsa.PrivateKey`: only the modulus and private
+/// exponent are retained (see that type's doc comment for why the CRT
+/// components are validated but not kept). Same lifetime contract as
+/// `SoftwareEcdsaP256SigningKey`: keep it alive for as long as the handle is
+/// used and call `deinit` explicitly.
+pub const SoftwareRsaSigningKey = struct {
+    key: rsa.PrivateKey,
+
+    /// Parse and validate a PKCS#1 `RSAPrivateKey` DER encoding. `entropy`
+    /// draws the random Miller-Rabin witnesses used to verify `p`/`q` are
+    /// actually prime (see `rsa.parsePrivateKeyDer`) — a one-time draw at
+    /// key import, not on the per-signature path.
+    pub fn fromDer(der: []const u8, entropy: provider.Entropy) provider.SignError!SoftwareRsaSigningKey {
+        const key = rsa.parsePrivateKeyDer(der, entropy) catch |err| return switch (err) {
+            error.InvalidInput => error.InvalidInput,
+            error.EntropyFailure => error.EntropyFailure,
+        };
+        return .{ .key = key };
+    }
+
+    /// Securely erase the private key material. Callers must invoke this when
+    /// the key is no longer needed; letting the value go out of scope does not
+    /// scrub its bytes.
+    pub fn deinit(self: *SoftwareRsaSigningKey) void {
+        self.key.deinit();
+    }
+
+    /// Whether `public_key_der` (a DER `RSAPublicKey`) is the exact public
+    /// counterpart of this private key — see `rsa.PrivateKey.
+    /// matchesPublicKeyDer`.
+    pub fn matchesPublicKeyDer(self: *const SoftwareRsaSigningKey, public_key_der: []const u8) bool {
+        return self.key.matchesPublicKeyDer(public_key_der);
+    }
+
+    pub fn format(
+        _: SoftwareRsaSigningKey,
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        _: anytype,
+    ) !void {
+        @compileError("signing keys must not be formatted or logged");
+    }
+
+    /// Erase to the opaque signing-key interface. Borrows `self`.
+    pub fn signingKey(self: *SoftwareRsaSigningKey) provider.SigningKey {
+        return .{ .context = self, .vtable = &signing_vtable };
+    }
+
+    const signing_vtable = provider.SigningKey.VTable{
+        .scheme = signingSchemeImpl,
+        .sign = signingSignImpl,
+    };
+
+    fn signingSchemeImpl(context: *anyopaque) provider.SignatureScheme {
+        _ = context;
+        return .rsa_pss_rsae_sha256;
+    }
+
+    fn signingSignImpl(
+        context: *anyopaque,
+        message: []const u8,
+        entropy: provider.Entropy,
+        out: []u8,
+    ) provider.SignError!usize {
+        const self: *SoftwareRsaSigningKey = @ptrCast(@alignCast(context));
+        if (out.len < self.key.modulusLen()) return error.InvalidInput;
+
+        var salt: [rsa.pss_salt_len]u8 = undefined;
+        defer crypto.secureZero(u8, &salt);
+        entropy.fill(&salt) catch return error.EntropyFailure;
+
+        return rsa.signPssSha256(&self.key, message, salt, out) catch return error.InvalidInput;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Deterministic entropy (tests and reproducible flows)
 // ---------------------------------------------------------------------------
@@ -1515,6 +1594,124 @@ test "SoftwareEcdsaP256SigningKey rejects invalid scalar inputs and clears typed
     try testing.expectError(error.InvalidInput, SoftwareEcdsaP256SigningKey.fromSeedSecret(&short_seed_secret));
     try testing.expectEqual(@as(usize, 0), short_seed_secret.len);
     for (short_seed_secret.bytes) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "SoftwareRsaSigningKey signs then verifies, with tamper and wrong-key/message rejection" {
+    var det = DeterministicEntropy.init(11);
+    var p = Provider.init(det.entropy());
+    const cp = p.cryptoProvider();
+
+    var software_key = try SoftwareRsaSigningKey.fromDer(rsa.testdata.private_key_pkcs1_der, det.entropy());
+    defer software_key.deinit();
+    const signer = software_key.signingKey();
+    try testing.expectEqual(provider.SignatureScheme.rsa_pss_rsae_sha256, signer.scheme());
+
+    const message = "certificate verify transcript";
+    var signature: [rsa.max_modulus_bytes]u8 = undefined;
+    const sig_len = try signer.sign(message, cp.entropy, &signature);
+    try testing.expectEqual(@as(usize, 256), sig_len);
+
+    try cp.verify(.rsa_pss_rsae_sha256, rsa.testdata.public_key_der, message, signature[0..sig_len]);
+
+    // Flip a signature byte: authentication must fail.
+    var bad_sig = signature;
+    bad_sig[sig_len - 1] ^= 0x01;
+    try testing.expectError(error.AuthenticationFailed, cp.verify(.rsa_pss_rsae_sha256, rsa.testdata.public_key_der, message, bad_sig[0..sig_len]));
+
+    // A different message under the same key must fail.
+    try testing.expectError(error.AuthenticationFailed, cp.verify(.rsa_pss_rsae_sha256, rsa.testdata.public_key_der, "wrong message", signature[0..sig_len]));
+
+    // An output buffer too small for the modulus-sized signature reports
+    // InvalidInput rather than silently truncating.
+    var tiny: [4]u8 = undefined;
+    try testing.expectError(error.InvalidInput, signer.sign(message, cp.entropy, &tiny));
+}
+
+test "SoftwareRsaSigningKey draws the PSS salt from injected entropy" {
+    const FixedEntropy = struct {
+        byte: u8,
+
+        fn fill(context: *anyopaque, buffer: []u8) provider.EntropyError!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            @memset(buffer, self.byte);
+        }
+
+        fn entropy(self: *@This()) provider.Entropy {
+            return .{ .context = self, .fillFn = fill };
+        }
+    };
+
+    var import_entropy = DeterministicEntropy.init(0x51a1);
+    var key = try SoftwareRsaSigningKey.fromDer(rsa.testdata.private_key_pkcs1_der, import_entropy.entropy());
+    defer key.deinit();
+    const signer = key.signingKey();
+
+    var entropy_a = FixedEntropy{ .byte = 0x11 };
+    var entropy_b = FixedEntropy{ .byte = 0x22 };
+    var sig_a: [rsa.max_modulus_bytes]u8 = undefined;
+    var sig_b: [rsa.max_modulus_bytes]u8 = undefined;
+    const len_a = try signer.sign("same message", entropy_a.entropy(), &sig_a);
+    const len_b = try signer.sign("same message", entropy_b.entropy(), &sig_b);
+
+    // Different injected "randomness" (the PSS salt) must produce different
+    // signatures over the same message and key.
+    try testing.expect(!std.mem.eql(u8, sig_a[0..len_a], sig_b[0..len_b]));
+    try rsa.verifyPssSha256(rsa.testdata.public_key_der, "same message", sig_a[0..len_a]);
+    try rsa.verifyPssSha256(rsa.testdata.public_key_der, "same message", sig_b[0..len_b]);
+}
+
+test "SoftwareRsaSigningKey rejects small output before entropy and leaves output unchanged on entropy failure" {
+    const CountingEntropy = struct {
+        calls: usize = 0,
+
+        fn fill(context: *anyopaque, buffer: []u8) provider.EntropyError!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            @memset(buffer, 0xa5);
+        }
+
+        fn entropy(self: *@This()) provider.Entropy {
+            return .{ .context = self, .fillFn = fill };
+        }
+    };
+    const FailingEntropy = struct {
+        calls: usize = 0,
+
+        fn fill(context: *anyopaque, buffer: []u8) provider.EntropyError!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            if (buffer.len > 0) buffer[0] = 0x5a;
+            return error.EntropyFailure;
+        }
+
+        fn entropy(self: *@This()) provider.Entropy {
+            return .{ .context = self, .fillFn = fill };
+        }
+    };
+
+    var import_entropy = DeterministicEntropy.init(0x51a2);
+    var key = try SoftwareRsaSigningKey.fromDer(rsa.testdata.private_key_pkcs1_der, import_entropy.entropy());
+    defer key.deinit();
+    const signer = key.signingKey();
+
+    var counting = CountingEntropy{};
+    var small = [_]u8{0xcc} ** 255; // one byte short of the 256-byte RSA-2048 signature
+    try testing.expectError(error.InvalidInput, signer.sign("msg", counting.entropy(), &small));
+    try testing.expectEqual(@as(usize, 0), counting.calls);
+    for (small) |byte| try testing.expectEqual(@as(u8, 0xcc), byte);
+
+    var failing = FailingEntropy{};
+    var out = [_]u8{0xcc} ** rsa.max_modulus_bytes;
+    try testing.expectError(error.EntropyFailure, signer.sign("msg", failing.entropy(), &out));
+    try testing.expectEqual(@as(usize, 1), failing.calls);
+    for (out) |byte| try testing.expectEqual(@as(u8, 0xcc), byte);
+}
+
+test "SoftwareRsaSigningKey format is banned and fromDer rejects malformed DER" {
+    var det = DeterministicEntropy.init(0x51a3);
+    try testing.expect(@hasDecl(SoftwareRsaSigningKey, "format"));
+    try testing.expectError(error.InvalidInput, SoftwareRsaSigningKey.fromDer(&[_]u8{0x30}, det.entropy()));
+    try testing.expectError(error.InvalidInput, SoftwareRsaSigningKey.fromDer(&[_]u8{}, det.entropy()));
 }
 
 test "fromSeedSecret clears the caller's typed secret immediately and derives the same key as fromSeed" {

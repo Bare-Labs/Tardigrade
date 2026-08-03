@@ -80,6 +80,7 @@ pub const Role = tls_state.Role;
 pub const SignatureScheme = enum(u16) {
     ed25519 = 0x0807,
     ecdsa_secp256r1_sha256 = 0x0403,
+    rsa_pss_rsae_sha256 = 0x0804,
     _,
 
     pub fn code(self: SignatureScheme) u16 {
@@ -522,21 +523,84 @@ pub const Identity = struct {
     pub const Key = union(enum) {
         ed25519: pure_zig.SoftwareSigningKey,
         ecdsa_p256: pure_zig.SoftwareEcdsaP256SigningKey,
+        rsa: pure_zig.SoftwareRsaSigningKey,
     };
 
+    /// Pre-existing public error type for `initPkcs8`, unchanged by RSA
+    /// support: callers that reference `Identity.InitError` directly stay
+    /// source-compatible. `initPkcs8` never returns `EntropyFailure` (see
+    /// its body), so it does not belong in this set — that case lives only
+    /// on `InitWithEntropyError`, the wider type `initPkcs8WithEntropy`
+    /// actually needs.
     pub const InitError = error{InvalidPrivateKey};
 
+    /// Error type for `initPkcs8WithEntropy`. `EntropyFailure` is distinct
+    /// from `InvalidPrivateKey`: it means the key itself may well be fine
+    /// but the injected entropy source failed mid-RSA-import (drawing
+    /// Miller-Rabin witnesses), a transient/local provider fault, not
+    /// malformed credential data — callers that log or alert on these should
+    /// not conflate "bad key on disk" with "entropy source is unhealthy."
+    pub const InitWithEntropyError = error{ InvalidPrivateKey, EntropyFailure };
+
+    /// Load an Ed25519 or ECDSA-P256 PKCS#8 private key. Returns
+    /// `error.InvalidPrivateKey` for an RSA key — RSA's `p`/`q` primality
+    /// check needs an injected entropy source for its random Miller-Rabin
+    /// witnesses (a fixed/public witness set is not sound against an
+    /// adversarially chosen key; see `rsa.isProbablePrime`'s doc comment),
+    /// which this entry point has none of. Use `initPkcs8WithEntropy` for
+    /// RSA support.
     pub fn initPkcs8(certificate_der: []const u8, pkcs8_key_der: []const u8) InitError!Identity {
+        return initPkcs8Impl(certificate_der, pkcs8_key_der, null) catch |err| switch (err) {
+            error.InvalidPrivateKey => error.InvalidPrivateKey,
+            // Unreachable: with `entropy = null`, `initPkcs8Impl`'s RSA
+            // branch takes `entropy orelse return error.InvalidPrivateKey`
+            // immediately, never reaching `SoftwareRsaSigningKey.fromDer`
+            // (the only source of `EntropyFailure`).
+            error.EntropyFailure => unreachable,
+        };
+    }
+
+    /// Load an Ed25519, ECDSA-P256, or RSA PKCS#8 private key. `entropy` is
+    /// required only for RSA — Ed25519/ECDSA-P256 parsing never touches it —
+    /// but every caller must supply one since the key type isn't known until
+    /// parsing is underway.
+    pub fn initPkcs8WithEntropy(certificate_der: []const u8, pkcs8_key_der: []const u8, entropy: crypto_provider_pkg.Entropy) InitWithEntropyError!Identity {
+        return initPkcs8Impl(certificate_der, pkcs8_key_der, entropy);
+    }
+
+    fn initPkcs8Impl(certificate_der: []const u8, pkcs8_key_der: []const u8, entropy: ?crypto_provider_pkg.Entropy) InitWithEntropyError!Identity {
         if (ed25519SeedFromPkcs8(pkcs8_key_der)) |seed| {
             const software_key = pure_zig.SoftwareSigningKey.fromSeed(seed) catch return error.InvalidPrivateKey;
             return .{ .certificate_der = certificate_der, .key = .{ .ed25519 = software_key } };
         } else |_| {}
-        var scalar = try ecdsaP256KeyFromPkcs8(pkcs8_key_der);
-        defer crypto.secureZero(u8, &scalar);
-        var scalar_secret = crypto_pkg.secrets.FixedSecret(32).init(&scalar) catch return error.InvalidPrivateKey;
-        defer scalar_secret.deinit();
-        const software_key = pure_zig.SoftwareEcdsaP256SigningKey.fromScalarSecret(&scalar_secret) catch return error.InvalidPrivateKey;
-        return .{ .certificate_der = certificate_der, .key = .{ .ecdsa_p256 = software_key } };
+        if (ecdsaP256KeyFromPkcs8(pkcs8_key_der)) |scalar_local| {
+            var scalar = scalar_local;
+            defer crypto.secureZero(u8, &scalar);
+            var scalar_secret = crypto_pkg.secrets.FixedSecret(32).init(&scalar) catch return error.InvalidPrivateKey;
+            defer scalar_secret.deinit();
+            const software_key = pure_zig.SoftwareEcdsaP256SigningKey.fromScalarSecret(&scalar_secret) catch return error.InvalidPrivateKey;
+            return .{ .certificate_der = certificate_der, .key = .{ .ecdsa_p256 = software_key } };
+        } else |_| {}
+        const rsa_key_der = try rsaKeyDerFromPkcs8(pkcs8_key_der);
+        const rsa_entropy = entropy orelse return error.InvalidPrivateKey;
+        var software_key = pure_zig.SoftwareRsaSigningKey.fromDer(rsa_key_der, rsa_entropy) catch |err| return switch (err) {
+            error.EntropyFailure => error.EntropyFailure,
+            error.InvalidInput, error.UnsupportedCapability, error.ProviderFailure => error.InvalidPrivateKey,
+        };
+        errdefer software_key.deinit();
+
+        // A structurally valid RSA private key is not necessarily *this*
+        // certificate's key — advertise a credential only when the leaf's
+        // own RSAPublicKey (modulus and exponent) matches what the private
+        // key can actually sign for. Without this check, an unrelated RSA
+        // certificate/key pairing would be selected and only fail once the
+        // peer rejects the CertificateVerify signature.
+        const leaf = (crypto.Certificate{ .buffer = certificate_der, .index = 0 }).parse() catch
+            return error.InvalidPrivateKey;
+        if (leaf.pub_key_algo != .rsaEncryption or !software_key.matchesPublicKeyDer(leaf.pubKey()))
+            return error.InvalidPrivateKey;
+
+        return .{ .certificate_der = certificate_der, .key = .{ .rsa = software_key } };
     }
 
     /// The TLS SignatureScheme this identity signs CertificateVerify with.
@@ -544,6 +608,7 @@ pub const Identity = struct {
         return switch (self.key) {
             .ed25519 => .ed25519,
             .ecdsa_p256 => .ecdsa_secp256r1_sha256,
+            .rsa => .rsa_pss_rsae_sha256,
         };
     }
 
@@ -575,6 +640,7 @@ pub const Identity = struct {
         const signer: crypto_provider_pkg.SigningKey = switch (self.key) {
             .ed25519 => |*key| @constCast(key).signingKey(),
             .ecdsa_p256 => |*key| @constCast(key).signingKey(),
+            .rsa => |*key| @constCast(key).signingKey(),
         };
         return signer.sign(input, entropy, out) catch |err| switch (err) {
             error.InvalidInput => error.SignatureOutputOverflow,
@@ -615,6 +681,31 @@ pub const Identity = struct {
         const scalar = try ec_key.octetString();
         if (scalar.len != 32) return error.InvalidPrivateKey;
         return scalar[0..32].*;
+    }
+
+    /// Unwrap a PKCS#8 `PrivateKeyInfo` for `rsaEncryption` (RFC 8017 §A.1.1
+    /// inside RFC 5958): SEQUENCE { INTEGER 0, SEQUENCE { OID
+    /// 1.2.840.113549.1.1.1, NULL }, OCTET STRING { RSAPrivateKey } }, and
+    /// return the borrowed `RSAPrivateKey` DER `pure_zig.SoftwareRsaSigningKey
+    /// .fromDer` parses directly. Every structural expectation is enforced,
+    /// not just the leading OID: the mandatory NULL parameters, that the
+    /// AlgorithmIdentifier and outer SEQUENCE each stop exactly where their
+    /// known fields end (no unparsed RFC 5958 attributes silently ignored),
+    /// and that the top-level input carries no trailing bytes.
+    fn rsaKeyDerFromPkcs8(der: []const u8) InitError![]const u8 {
+        const oid_rsa_encryption = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
+        const null_params = [_]u8{ 0x05, 0x00 };
+        var walker = DerWalker{ .bytes = der };
+        var outer = try walker.sequence();
+        try outer.expectInteger(0);
+        var alg = try outer.sequence();
+        try alg.expectBytes(&oid_rsa_encryption);
+        try alg.expectBytes(&null_params);
+        if (alg.pos != alg.bytes.len) return error.InvalidPrivateKey;
+        const key_der = try outer.octetString();
+        if (outer.pos != outer.bytes.len) return error.InvalidPrivateKey;
+        if (walker.pos != walker.bytes.len) return error.InvalidPrivateKey;
+        return key_der;
     }
 
     const DerWalker = struct {
@@ -819,12 +910,42 @@ pub const testdata = struct {
     pub const p256_certificate_der: []const u8 = &p256_certificate_bytes;
     pub const p256_private_key_pkcs8_der: []const u8 = &p256_private_key_bytes;
 
+    // Self-signed RSA-2048 fixture, CN=tardigrade.test, generated with
+    // openssl (`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`
+    // + `openssl req -new -x509`). `rsa_private_key_bytes` is the PKCS#8
+    // `PrivateKeyInfo` wrapping form `Identity.initPkcs8` unwraps via
+    // `rsaKeyDerFromPkcs8` — matches `rsa.zig`'s own `testdata`, which holds
+    // the same key's bare PKCS#1 `RSAPrivateKey`/`RSAPublicKey` DER for
+    // lower-level provider tests.
+    const rsa_certificate_bytes = hexBytes(
+        "30820315308201fda00302010202145b36622ef1cd21d37cd907d98f391f900653d212300d06092a864886f70d01010b0500301a3118301606035504030c0f746172646967726164652e74657374301e170d3236303830333032313833375a170d3336303733313032313833375a301a3118301606035504030c0f746172646967726164652e7465737430820122300d06092a864886f70d01010105000382010f003082010a028201010092af7ce98c5ada061925562b8ad51c91242589053bc4d81283fb8b7f32ad27b1c0bbeff24e7126ec5d9956fd36c6621459cf5d99f8a6b7790d77a0a7480cb490db649a1882d89876c4eacf39aeef0dab58174dba46abcc948e4755b3f41aa045be5ce6382fefe7c7e0e6ad1c5f59d2c76ed2cbf5daff65d567609eb4daec1058c20ffa7c45db67146c95d36632ce793687b577003589ecafb8ab176d47781ac11d4434d56889d52b86bf3f87bc5893dbebde97dbdf58e57242a4cf4fbec148c0ede4faed1ebad450da2272bab56c48a7eacff3bd62e8685a00de2db458ed2b91f2453139c90dd3724ed82aa825f4dd4885f85ec0e09e1c72682db6fdd1b921e90203010001a3533051301d0603551d0e04160414afadb2110af59c4b5c8e27f14436afab0e22e25f301f0603551d23041830168014afadb2110af59c4b5c8e27f14436afab0e22e25f300f0603551d130101ff040530030101ff300d06092a864886f70d01010b05000382010100925514498cccec0fec872db5b8e1472080cce1d5e197d7c359f644b732a682ec2ca8d6318c61914d099e490bae8bf104f6d114770865398144554acfddf2d8538ec6930b2ce1dacc432d0098d5fcd366fe63555e2ef59df65fc801ae475b4565983cc012c3a160042f7b4b47ab743f255f6da3e2ee3ed572e608e4312e615a915c3a92eb6c95a2e3391e9ec3b9dbb50fb4150b0f9224c0b4142e9371c7704e5c92415f7a46960499e04ae7cbd43f7f83ac683aa50f0d4ff78aaf6460c8881d37416e1009433c00b131181beb2dbd1062d2d03d7e79f32d33a935b8bdc7146b648661e4b2b042fd73df221e512e227b4e587160c032988ba27296f07987d66b47",
+    );
+    const rsa_private_key_bytes = hexBytes(
+        "308204be020100300d06092a864886f70d0101010500048204a8308204a4020100028201010092af7ce98c5ada061925562b8ad51c91242589053bc4d81283fb8b7f32ad27b1c0bbeff24e7126ec5d9956fd36c6621459cf5d99f8a6b7790d77a0a7480cb490db649a1882d89876c4eacf39aeef0dab58174dba46abcc948e4755b3f41aa045be5ce6382fefe7c7e0e6ad1c5f59d2c76ed2cbf5daff65d567609eb4daec1058c20ffa7c45db67146c95d36632ce793687b577003589ecafb8ab176d47781ac11d4434d56889d52b86bf3f87bc5893dbebde97dbdf58e57242a4cf4fbec148c0ede4faed1ebad450da2272bab56c48a7eacff3bd62e8685a00de2db458ed2b91f2453139c90dd3724ed82aa825f4dd4885f85ec0e09e1c72682db6fdd1b921e9020301000102820100225b8d680cd288e7cdc3038c7e5fcd69a7ac4d0c574413923eacd02f5278e167ceab9697cc4ccf9fa48ad2a7cbc92ad6f6744e49cec68a0a06200396bb1712c22d494298c42924890935b0a523b6e59e412b702ed5f7ce9aeb3a8535f9d2b4c0b146843c1bea570167c9d039699219ff51937967944ca71715b839644634eddce9700cde13717d98963cb2a4a2808c3b4add40a44df95f576500f3d82de9d25fe5e69ee08a0dc1599bbc7ae7681061126dc172427bbe22111c9faf2d0ca74728cdc3502b6aef8ecb26dccf0768055cece8079e516f15819c9d5ad056c6e8302d17d781392102dc09fbf8f813964a54646631e8fe3c27405f344c99505d539fa902818100cb8d33ac351529071f695efd67c9d3a5f3cfa76e42cee65a29b8a32f6b79b07679ecf138f82c3dfdb58cbf4609751b5b17478a60888503b4ebe61b3d459d00c933836d4271a7c8feff058c3667ce33f2236344e69c30b64cfdfcf59fdaabca6f2463d89ab842e44f0288f8e318d9c1250b9a57aa95db61134de7f129a44e9edd02818100b87b400d63d31ba7864de2bf3e7c8ce2af6c1c46620138a2c8a2a3fc52a687f2a991c549e3971c6e29f3605498268d35fecf5653f91e25c71112689474d9abe2eee2f7c74ac172c156c3d8e139fbf4de85888b5dbc810005a3fd2a9ca3d446f931e1d427633e702530d393521fbe6a8cc88915a2a49ff39faa2a320bde2ad07d02818100a95f00d41607597037cef1df61712acf37a45de8fd66337e6aa0dc082521c8978cb47fb3abad04980b6ce5eb5d0b388bff3ee401971737126007c43aa3a61475568bd16a2c3034ab1980803ef4f93b780bc21a1ed9701f00c986a6cb30a52978798b2b3cf27d9683b7d449648dd50345d3f5c56487f5573d3ce1f66573f687710281810089dba07be1130ae15f5da88a1d59d9b6343ce7cc38c48cdc286e5178e7128718f15a7b41c20f543186abd65aa0f07e29d166832e7144f41a1449db58c5113c7f72e0ad24825a99349d6ff10c2dd678a028cd66c7ff6baee6882b51c28832c36ec8b5e7621fa9b30837ba83a6a50e1875680df8daf78687f9d2a1819098cf09c902818043160afb78cc14e9b0b9ac88f83d72fbf75f9594c77d1dd0ecd98b4af5255d362bb74c0e7f0f9ed7fbc65aae99606326653afa099f7d4bbe039d45e5ceaacbab4bf4c21354e616aae47ad1032261a9abe0600c6f2687ff0235893b91513366867e99d21a80d3b16fffab975e99fd18645698bc104bfe206e0b11e45cbf729f11",
+    );
+
+    pub const rsa_certificate_der: []const u8 = &rsa_certificate_bytes;
+    pub const rsa_private_key_pkcs8_der: []const u8 = &rsa_private_key_bytes;
+
+    // A second, unrelated RSA-2048 key (different modulus/exponents), used
+    // only to prove `rsa_certificate_der` paired with the *wrong* private
+    // key is rejected rather than silently accepted as a usable credential.
+    const other_rsa_private_key_bytes = hexBytes(
+        "308204be020100300d06092a864886f70d0101010500048204a8308204a40201000282010100f15415a9a76266a3fa82a83f6dd5e12645ab9a716f8a53589428c630ff9cbe7a0c797f140657ccda65d113102274b13cea73ec8e8a19d490312745dec15f42cd8c04ecec80ae32afaa4c0d1f91408a33a9a74c1c1543d070a5a469e3fb0c8d91406526d40e1a38d5262aeeed2c64e5e908996cf0a6674a033037751c0b798e43c0704ae2a50e2c77302179c2e910bcb484c15f59c2a0e3bde01061fe4b36d56ab60cb84592526e53f2d616f0e13afc94b9319572b12c12db3a9f3682c181be40ef6adf4549b79ebf17b7d3ffa61a243e2c891df46122f7d3f24a7d2cfa416af411a798908fb1284dad1b2e8e90cf62970d367a0653de2388c3b1a740c05ae5090203010001028201000b6fb66a188c557c6260043ca3461e3a1bd59ec74ee7a17d02626f47fda90e2ec6fe0ffb61349278ec17cd1d37e0cb506d74ea6a33d9b704d14b80e866460f2aa1fecec283739de3ccc07763be54ae67f5db7f841a2ee14721566a0d3b85b404c4e6364198dc7dc27e214d3ad09e8475b76a5beb089bbefa6933cb993563008e9656463bb6568facc694f8dec58df7706e3c992fdd2b35c37ec89268f42e0031332ecc3b72a282b722606bbf4b4c5447869fbc93db8da3375858720c485a182fd1f03456ba48f70b867b9a4724f121a7e3bebe22e2f3caaeda1b1a40e6f09388b286933dbd1f86e5c5f08a2ceae4b41d2cbbe740572b97404a4ba836d086331d02818100fa434d920e8ba5cafd03616d47029311cfec89055ca4d537e093845977b53d5c150a60fc81c50fa3390b6134484813ab4a0bdcf58a69d7807ebe0b879ef62ceade43cba98ab00fe6818147c20ac9281f851d4243f99cc84950b469c821d7f61bd5f752931ee23fedaead680bc5963bf684b3a889bed61ce3ecf14cde9943d87d02818100f6dc5948e0034c3965da1de0d6cf5fb23033e74046fc54876537fb40ffb0f59353cb8dda5ac2e0ba917ae8dd8b51487faff483e9ad67a463b15dde87f34db91d58ad63f0986ab64495df70ff9f9efea1ce01d8619de42466e5435f001a4b4a3f87e423c1b114799bc9bb4f52eb1253a9cc5cfc34913ece40a4e30de9d469f07d02818061e902e82998a8fc8990510597ca820f6df1748a0c7cd08e53e662d93de442654c360b4bbed9820cb1bcaa02f264808d7b22b907b76741509c456ded595ba6a71cde1947f3627e560844b3f64e91f488a0639a114e0ef0acfe4e17349d4908984b55bf909f7c94d64088c73413d17b142f46baa169700b4d80ddc6dd2fc9436102818100b2c9ca1c7ea9c4c5f95f6cae4fc5a7705d7ae9ec62bd13d76fd688b17dbe434dedad8a526fd39e8161261c8b800061baa0cc3dd1bb5649f82e1867381d5dd84949d562817952282a2a45c7084c2a120f4c2d87f2c330ddb06c314c17bdf37395e9acb0bcf2ac7a9afb131f1355cf532ab229523c1c49d985762640086f603edd02818100d52656918165d006ef10fe005b9f309efee2daca8fbaee0098590e23aa869e694773e3e0fac39988254ed54789a9dd5b4f73a3d473d98059d3583f08b4c7899609afe32235d2d421063da1200dd154fe0781cf9d3dc63de90c51a99f01a0ca1af02bd68a01a86e2e13c8d2b7ca777e1db5d6579020552954ac47ec1bdc780dcd",
+    );
+    pub const other_rsa_private_key_pkcs8_der: []const u8 = &other_rsa_private_key_bytes;
+
     pub fn identity() Identity {
         return Identity.initPkcs8(certificate_der, private_key_pkcs8_der) catch unreachable;
     }
 
     pub fn p256Identity() Identity {
         return Identity.initPkcs8(p256_certificate_der, p256_private_key_pkcs8_der) catch unreachable;
+    }
+
+    pub fn rsaIdentity() Identity {
+        var det = pure_zig.DeterministicEntropy.init(0x8511);
+        return Identity.initPkcs8WithEntropy(rsa_certificate_der, rsa_private_key_pkcs8_der, det.entropy()) catch unreachable;
     }
 
     const ignored_entropy_context: u8 = 0;
@@ -1278,6 +1399,33 @@ test "fixed provider selects and signs ECDSA only for compatible offers" {
     try cp.verify(.ecdsa_secp256r1_sha256, parsed.pubKey(), message, sig_buf[0..written]);
 }
 
+test "fixed provider selects and signs RSA-PSS only for compatible offers" {
+    var det = pure_zig.DeterministicEntropy.init(0x5926);
+    var fixed = FixedCredentialProvider.init(testdata.rsaIdentity(), det.entropy());
+    defer fixed.deinit();
+    const provider_view = fixed.provider();
+
+    const incompatible = testSelection(&.{0x0807});
+    try testing.expectError(error.NoCompatibleSignatureAlgorithm, provider_view.selectCredential(&incompatible));
+
+    const selection = testSelection(&.{0x0804});
+    const credential = try syncSelect(provider_view, &selection);
+    defer credential.release();
+    try testing.expectEqual(SignatureScheme.rsa_pss_rsae_sha256, credential.scheme);
+
+    const message = "RSA-PSS CertificateVerify credential path";
+    var sig_buf: [512]u8 = undefined;
+    const written = try syncSign(credential, message, &sig_buf);
+    try testing.expectEqual(@as(usize, 256), written);
+
+    var verify_entropy = pure_zig.DeterministicEntropy.init(0x5927);
+    var verify_provider = pure_zig.Provider.init(verify_entropy.entropy());
+    const cp = verify_provider.cryptoProvider();
+    const parsed = try (crypto.Certificate{ .buffer = testdata.rsa_certificate_der, .index = 0 }).parse();
+    try testing.expect(parsed.pub_key_algo == .rsaEncryption);
+    try cp.verify(.rsa_pss_rsae_sha256, parsed.pubKey(), message, sig_buf[0..written]);
+}
+
 test "fixed provider rejects an output buffer too small for the signature" {
     var fixed = FixedCredentialProvider.init(testdata.identity(), testdata.ignoredEntropy());
     defer fixed.deinit();
@@ -1488,4 +1636,94 @@ test "identity parser loads and rejects malformed PKCS#8" {
         error.InvalidPrivateKey,
         Identity.initPkcs8(testdata.certificate_der, testdata.private_key_pkcs8_der[0 .. testdata.private_key_pkcs8_der.len - 1]),
     );
+}
+
+test "identity parser loads a PKCS#8 RSA key and rejects a truncated one" {
+    var det = pure_zig.DeterministicEntropy.init(0x8512);
+    const identity = try Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, testdata.rsa_private_key_pkcs8_der, det.entropy());
+    try testing.expectEqual(SignatureScheme.rsa_pss_rsae_sha256, identity.signatureScheme());
+    try testing.expectEqual(@as(usize, 256), identity.key.rsa.key.modulusLen());
+    try testing.expectError(
+        error.InvalidPrivateKey,
+        Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, testdata.rsa_private_key_pkcs8_der[0 .. testdata.rsa_private_key_pkcs8_der.len - 1], det.entropy()),
+    );
+}
+
+test "identity parser without an entropy source rejects an RSA key" {
+    // `initPkcs8` (no entropy) must fail closed for RSA rather than silently
+    // skip the primality check `initPkcs8WithEntropy` performs.
+    try testing.expectError(
+        error.InvalidPrivateKey,
+        Identity.initPkcs8(testdata.rsa_certificate_der, testdata.rsa_private_key_pkcs8_der),
+    );
+}
+
+test "identity parser preserves EntropyFailure distinctly from InvalidPrivateKey for RSA" {
+    // A failing entropy source is a local/transient provider fault, not
+    // malformed credential data — initPkcs8WithEntropy must not collapse it
+    // into the same error a caller would otherwise read as "bad key on
+    // disk."
+    const FailingEntropy = struct {
+        fn fill(_: *anyopaque, _: []u8) crypto_provider_pkg.EntropyError!void {
+            return error.EntropyFailure;
+        }
+    };
+    var context: u8 = 0;
+    const failing_entropy = crypto_provider_pkg.Entropy{ .context = &context, .fillFn = FailingEntropy.fill };
+    try testing.expectError(
+        error.EntropyFailure,
+        Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, testdata.rsa_private_key_pkcs8_der, failing_entropy),
+    );
+}
+
+test "identity parser rejects an RSA certificate paired with an unrelated RSA private key" {
+    // Both keys are individually well-formed, mathematically valid RSA-2048
+    // private keys; only their pairing with `rsa_certificate_der` is wrong.
+    // The mismatch must be caught here, at construction, not discovered only
+    // when a peer rejects the resulting CertificateVerify signature.
+    var det = pure_zig.DeterministicEntropy.init(0x8513);
+    try testing.expectError(
+        error.InvalidPrivateKey,
+        Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, testdata.other_rsa_private_key_pkcs8_der, det.entropy()),
+    );
+}
+
+test "RSA PKCS#8 wrapper rejects missing NULL parameters, extra fields, and trailing bytes" {
+    var det = pure_zig.DeterministicEntropy.init(0x8514);
+    const valid = testdata.rsa_private_key_pkcs8_der;
+
+    // Corrupt the two-byte NULL (0x05 0x00) immediately following the OID:
+    // flipping its tag byte to something else breaks `expectBytes`.
+    const null_offset = std.mem.indexOf(u8, valid, &[_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00 }).? + 11;
+    var missing_null = try testing.allocator.dupe(u8, valid);
+    defer testing.allocator.free(missing_null);
+    missing_null[null_offset] = 0x04; // NULL tag (0x05) replaced with OCTET STRING tag
+    try testing.expectError(error.InvalidPrivateKey, Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, missing_null, det.entropy()));
+
+    // Trailing bytes after the top-level SEQUENCE.
+    var with_trailer = try testing.allocator.alloc(u8, valid.len + 1);
+    defer testing.allocator.free(with_trailer);
+    @memcpy(with_trailer[0..valid.len], valid);
+    with_trailer[valid.len] = 0x00;
+    try testing.expectError(error.InvalidPrivateKey, Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, with_trailer, det.entropy()));
+
+    // Extra bytes appended inside the AlgorithmIdentifier SEQUENCE, after its
+    // NULL parameters but still inside the SEQUENCE's declared length —
+    // exercises the `alg.pos != alg.bytes.len` exhaustion check specifically
+    // (distinct from the top-level trailing-bytes case above).
+    const alg_seq_start = std.mem.indexOf(u8, valid, &[_]u8{ 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00 }).?;
+    var extra_alg_field = try testing.allocator.alloc(u8, valid.len + 2);
+    defer testing.allocator.free(extra_alg_field);
+    @memcpy(extra_alg_field[0 .. alg_seq_start + 15], valid[0 .. alg_seq_start + 15]);
+    extra_alg_field[alg_seq_start + 1] = 0x0f; // grow the AlgorithmIdentifier SEQUENCE length by 2
+    extra_alg_field[alg_seq_start + 15] = 0x05; // an extra (bogus) NULL element
+    extra_alg_field[alg_seq_start + 16] = 0x00;
+    @memcpy(extra_alg_field[alg_seq_start + 17 ..], valid[alg_seq_start + 15 ..]);
+    // Growing the AlgorithmIdentifier SEQUENCE's own length also grows the
+    // outer PrivateKeyInfo SEQUENCE's declared length by the same 2 bytes,
+    // and the outer length is encoded 2 bytes into the buffer as a 0x82
+    // long-form u16.
+    const outer_len_before = std.mem.readInt(u16, extra_alg_field[2..4], .big);
+    std.mem.writeInt(u16, extra_alg_field[2..4], outer_len_before + 2, .big);
+    try testing.expectError(error.InvalidPrivateKey, Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, extra_alg_field, det.entropy()));
 }

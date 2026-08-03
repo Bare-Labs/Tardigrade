@@ -35,6 +35,7 @@ pub const SnapshotOptions = struct {
 pub const KeyKind = enum {
     ed25519,
     ecdsa_p256,
+    rsa,
 };
 
 pub const HostPattern = union(enum) {
@@ -600,6 +601,7 @@ fn leafKeyKind(der: []const u8) error{ InvalidLeafKey, UnsupportedKeyType }!KeyK
     return switch (parsed.pub_key_algo) {
         .curveEd25519 => .ed25519,
         .X9_62_id_ecPublicKey => |curve| if (curve == .X9_62_prime256v1) .ecdsa_p256 else error.UnsupportedKeyType,
+        .rsaEncryption => .rsa,
         else => error.UnsupportedKeyType,
     };
 }
@@ -707,6 +709,7 @@ fn schemeFromWire(wire: u16) ?credentials.SignatureScheme {
     return switch (wire) {
         0x0807 => .ed25519,
         0x0403 => .ecdsa_secp256r1_sha256,
+        0x0804 => .rsa_pss_rsae_sha256,
         else => null,
     };
 }
@@ -715,6 +718,7 @@ fn schemeLegalForKeyKind(kind: KeyKind, scheme: credentials.SignatureScheme) boo
     return switch (kind) {
         .ed25519 => scheme == .ed25519,
         .ecdsa_p256 => scheme == .ecdsa_secp256r1_sha256,
+        .rsa => scheme == .rsa_pss_rsae_sha256,
     };
 }
 
@@ -722,7 +726,7 @@ fn providerToTlsScheme(scheme: crypto_provider.SignatureScheme) ?credentials.Sig
     return switch (scheme) {
         .ed25519 => .ed25519,
         .ecdsa_secp256r1_sha256 => .ecdsa_secp256r1_sha256,
-        else => null,
+        .rsa_pss_rsae_sha256 => .rsa_pss_rsae_sha256,
     };
 }
 
@@ -730,6 +734,7 @@ fn tlsToProviderScheme(scheme: credentials.SignatureScheme) ?crypto_provider.Sig
     return switch (scheme) {
         .ed25519 => .ed25519,
         .ecdsa_secp256r1_sha256 => .ecdsa_secp256r1_sha256,
+        .rsa_pss_rsae_sha256 => .rsa_pss_rsae_sha256,
         else => null,
     };
 }

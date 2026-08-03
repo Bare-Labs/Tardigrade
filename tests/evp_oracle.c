@@ -2,6 +2,7 @@
 #include <openssl/ec.h>
 #include <openssl/bn.h>
 #include <openssl/obj_mac.h>
+#include <openssl/rsa.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -309,6 +310,45 @@ static int cmd_ecdsa_p256_verify(int argc, char **argv) {
     return status("malformed");
 }
 
+/// Independently verify an `rsa_pss_rsae_sha256` signature this project's
+/// native provider produced, against the strict profile it claims to
+/// implement: SHA-256 digest and MGF1, a 32-byte salt, RSASSA-PSS padding.
+/// `pub_key_hex` is a DER `RSAPublicKey` (PKCS#1), matching what
+/// `src/crypto/rsa.zig` both emits (as test fixtures) and consumes.
+static int cmd_rsa_pss_verify(int argc, char **argv) {
+    if (argc != 5) return status("malformed");
+    Blob pub, message, sig;
+    if (!parse_hex(argv[2], &pub) || !parse_hex(argv[3], &message) || !parse_hex(argv[4], &sig) || pub.len == 0 || sig.len == 0) {
+        return status("malformed");
+    }
+    const unsigned char *pub_ptr = pub.bytes;
+    RSA *rsa = d2i_RSAPublicKey(NULL, &pub_ptr, (long)pub.len);
+    if (rsa == NULL) return status("malformed");
+    EVP_PKEY *key = EVP_PKEY_new();
+    if (key == NULL || EVP_PKEY_assign_RSA(key, rsa) != 1) {
+        EVP_PKEY_free(key);
+        RSA_free(rsa);
+        return status("oracle_error");
+    }
+    rsa = NULL;
+
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_PKEY_CTX *pctx = NULL;
+    int result = -1;
+    int ok = ctx != NULL &&
+        EVP_DigestVerifyInit(ctx, &pctx, EVP_sha256(), NULL, key) == 1 &&
+        EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) == 1 &&
+        EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, 32) == 1 &&
+        EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, EVP_sha256()) == 1;
+    if (ok) result = EVP_DigestVerify(ctx, sig.bytes, sig.len, message.bytes, message.len);
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(key);
+    if (!ok) return status("oracle_error");
+    if (result == 1) return status("ok");
+    if (result == 0) return status("auth_fail");
+    return status("malformed");
+}
+
 static int cmd_p256_ecdh(int argc, char **argv) {
     if (argc != 4) return status("malformed");
     Blob scalar, peer;
@@ -375,6 +415,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "ed25519-verify") == 0) return cmd_ed25519_verify(argc, argv);
     if (strcmp(argv[1], "ecdsa-p256-sign") == 0) return cmd_ecdsa_p256_sign(argc, argv);
     if (strcmp(argv[1], "ecdsa-p256-verify") == 0) return cmd_ecdsa_p256_verify(argc, argv);
+    if (strcmp(argv[1], "rsa-pss-verify") == 0) return cmd_rsa_pss_verify(argc, argv);
     if (strcmp(argv[1], "p256-ecdh") == 0) return cmd_p256_ecdh(argc, argv);
     return status("malformed");
 }

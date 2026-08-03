@@ -17,9 +17,17 @@ const quic_cipher_suites = [_]CipherSuite{
     .tls_chacha20_poly1305_sha256,
 };
 const default_named_groups = [_]NamedGroup{.x25519};
+// #565: RSA-PSS is deliberately left out of `default_signature_schemes`. Many
+// tests pin transcript-derived secrets against the exact default ClientHello
+// wire bytes (see `tls13_backend_tests.zig`'s golden-secret tests); widening
+// the default `signature_algorithms` offer would silently reflow every one
+// of those goldens. Callers that want RSA-PSS reachable — an RSA identity via
+// `fromIdentity`, or the engine's full native capability set via
+// `tls13_backend.native_capabilities` — opt in explicitly instead.
 const default_signature_schemes = [_]SignatureScheme{ .ed25519, .ecdsa_secp256r1_sha256 };
 const ed25519_signature_schemes = [_]SignatureScheme{.ed25519};
 const ecdsa_p256_signature_schemes = [_]SignatureScheme{.ecdsa_secp256r1_sha256};
+const rsa_signature_schemes = [_]SignatureScheme{.rsa_pss_rsae_sha256};
 const quic_alpns = [_]ProtocolName{algorithms.alpn.h3};
 const record_h2_alpns = [_]ProtocolName{algorithms.alpn.h2};
 const record_http1_alpns = [_]ProtocolName{algorithms.alpn.http_1_1};
@@ -30,6 +38,7 @@ pub const Error = error{UnsupportedIdentitySignature};
 pub const IdentityKey = enum {
     ed25519,
     ecdsa_secp256r1,
+    rsa,
 };
 
 pub const Capabilities = struct {
@@ -152,6 +161,7 @@ pub fn signatureSchemesForIdentity(identity_key: IdentityKey) []const SignatureS
     return switch (identity_key) {
         .ed25519 => &ed25519_signature_schemes,
         .ecdsa_secp256r1 => &ecdsa_p256_signature_schemes,
+        .rsa => &rsa_signature_schemes,
     };
 }
 
@@ -196,4 +206,11 @@ test "identity policies constrain usable signature schemes" {
 
     const ed25519_only = Capabilities{ .signature_schemes = &ed25519_signature_schemes };
     try std.testing.expectError(error.UnsupportedIdentitySignature, Policy.fromIdentity(.quic, ed25519_only, &alpns, .ecdsa_secp256r1));
+
+    const rsa_capable = Capabilities{ .signature_schemes = &.{ .ed25519, .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha256 } };
+    const rsa = try Policy.fromIdentity(.quic, rsa_capable, &alpns, .rsa);
+    try std.testing.expectEqual(@as(usize, 1), rsa.signature_schemes.len);
+    try std.testing.expectEqual(SignatureScheme.rsa_pss_rsae_sha256, rsa.signature_schemes[0]);
+    try std.testing.expectError(error.UnsupportedIdentitySignature, Policy.fromIdentity(.quic, ed25519_only, &alpns, .rsa));
+    try std.testing.expectError(error.UnsupportedIdentitySignature, Policy.fromIdentity(.quic, .{}, &alpns, .rsa));
 }
