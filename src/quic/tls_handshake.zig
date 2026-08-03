@@ -362,14 +362,10 @@ pub const Handshake = struct {
                     error.InvalidCryptoLevel => error.UnexpectedCryptoLevel,
                     error.CryptoBufferTooLarge => error.HandshakeBufferOverflow,
                 }),
-                // #564 scopes QUIC negotiated-suite packet/header protection
-                // as a separate child issue; this backend's own QUIC adapter
-                // still only negotiates TLS_AES_128_GCM_SHA256 (#335), so
-                // there is nothing for QUIC to do with this event yet.
-                .negotiated_parameters => {},
+                .negotiated_parameters => |params| self.adapter.installNegotiatedParameters(params) catch return self.fail(error.SecretExportFailed),
+                .early_data_parameters => |params| self.adapter.installEarlyDataParameters(params) catch return self.fail(error.SecretExportFailed),
                 .traffic_secret => |s| {
                     const secret = Secret.init(s.epoch, s.direction, s.data) catch return self.fail(error.SecretExportFailed);
-                    if (s.data.len != traffic_secret_len) return self.fail(error.SecretExportFailed);
                     self.adapter.installSecret(secret);
                 },
                 .peer_transport_parameters => |params| self.adapter.setPeerTransportParameters(params),
@@ -561,6 +557,10 @@ pub const TestTlsBackend = struct {
     fn emitHandshakeSecrets(self: *TestTlsBackend, sink: *EventSink) HandshakeError!void {
         const c2s = self.deriveSecret("quic-test hs c2s");
         const s2c = self.deriveSecret("quic-test hs s2c");
+        try sink.emitNegotiatedParameters(.{
+            .cipher_suite = @intFromEnum(tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256),
+            .transcript_hash = .sha256,
+        });
         switch (self.role) {
             .client => {
                 try sink.emitSecret(.handshake, .write, &c2s);
@@ -761,8 +761,10 @@ const Harness = struct {
         // Initial secrets come from the client DCID (installed by the connection
         // layer, not TLS). They let us prove Initial-key discard through the driver.
         const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
-        _ = try self.client_adapter.installInitialSecrets(.client, &dcid);
-        _ = try self.server_adapter.installInitialSecrets(.server, &dcid);
+        var client_initial = try self.client_adapter.installInitialSecrets(.client, &dcid);
+        defer client_initial.deinit();
+        var server_initial = try self.server_adapter.installInitialSecrets(.server, &dcid);
+        defer server_initial.deinit();
         self.client = Handshake.initClient(&self.client_adapter, self.client_backend.backend());
         self.server = Handshake.initServer(&self.server_adapter, self.server_backend.backend());
         // Arm the responder: the server's start() emits nothing but primes its
@@ -795,9 +797,11 @@ const Harness = struct {
 
 fn expectSecretsMatch(a: *const QuicTlsAdapter, b: *const QuicTlsAdapter, level: EncryptionLevel) !void {
     // What one side writes, the other must read (RFC 9001 secrets are shared).
-    const a_write = (try a.protectionKeys(level, .write)) orelse return error.TestUnexpectedResult;
-    const b_read = (try b.protectionKeys(level, .read)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualSlices(u8, &a_write.key, &b_read.key);
+    var a_write = (try a.protectionKeys(level, .write)) orelse return error.TestUnexpectedResult;
+    defer a_write.deinit();
+    var b_read = (try b.protectionKeys(level, .read)) orelse return error.TestUnexpectedResult;
+    defer b_read.deinit();
+    try testing.expectEqualSlices(u8, a_write.key.slice(), b_read.key.slice());
 }
 
 test "in-memory client<->server handshake completes and installs matching 1-RTT secrets" {
@@ -818,7 +822,7 @@ test "in-memory client<->server handshake completes and installs matching 1-RTT 
     // 1-RTT keys remain.
     try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), h.client_adapter.protectionKeys(.initial, .write) catch unreachable);
     try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), h.server_adapter.protectionKeys(.handshake, .read) catch unreachable);
-    try testing.expect((h.client_adapter.protectionKeys(.application, .write) catch unreachable) != null);
+    try testing.expect(h.client_adapter.hasProtectionKeys(.application, .write) catch unreachable);
 
     // ALPN negotiated h3; server certificate reported valid to the client.
     try testing.expect(h.client_adapter.negotiatedH3());
@@ -938,12 +942,12 @@ test "initial write keys survive until the queued ServerHello is drained" {
     var buf: [2048]u8 = undefined;
     const ch = (try h.client.pollOutput(.initial, &buf)).?;
     try h.server.onCrypto(.initial, ch.offset, ch.bytes);
-    try testing.expect((h.server_adapter.protectionKeys(.initial, .write) catch unreachable) != null);
+    try testing.expect(h.server_adapter.hasProtectionKeys(.initial, .write) catch unreachable);
 
     // Draining hands out the final chunk with keys still live; the discard
     // lands on the next poll.
     while (try h.server.pollOutput(.initial, &buf)) |_| {
-        try testing.expect((h.server_adapter.protectionKeys(.initial, .write) catch unreachable) != null);
+        try testing.expect(h.server_adapter.hasProtectionKeys(.initial, .write) catch unreachable);
     }
     try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), h.server_adapter.protectionKeys(.initial, .write));
 }

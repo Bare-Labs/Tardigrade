@@ -103,13 +103,15 @@ pub const HandshakeError = error{
 /// signal either way).
 pub const TranscriptHash = enum { sha256, sha384 };
 
-/// Negotiated cipher-suite metadata (#564), emitted exactly once per
-/// connection — for a full or a resumed handshake alike — before any
-/// `traffic_secret` event for the `handshake` epoch. `cipher_suite` is the
-/// wire code point (`algorithms.CipherSuite`'s backing `u16`); consumers
-/// that need the enum value convert it with `algorithms.fromInt`. This is
-/// the one canonical negotiated-parameters signal — transports must not
-/// infer the suite from secret length or any other side channel.
+/// Cipher-suite metadata (#564/#566). For the `negotiated_parameters` event,
+/// this is emitted exactly once per connection — for a full or a resumed
+/// handshake alike — before any `traffic_secret` event for the `handshake`
+/// epoch. For the `early_data_parameters` event, this names the resumed
+/// ticket/session suite that 0-RTT uses and must be emitted before any
+/// `.zero_rtt` `traffic_secret`. `cipher_suite` is the wire code point
+/// (`algorithms.CipherSuite`'s backing `u16`); consumers that need the enum
+/// value convert it with `algorithms.fromInt`. Transports must not infer the
+/// suite from secret length or any other side channel.
 pub const NegotiatedParameters = struct {
     cipher_suite: u16,
     transcript_hash: TranscriptHash,
@@ -118,6 +120,7 @@ pub const NegotiatedParameters = struct {
 pub const Event = union(enum) {
     handshake_bytes: struct { epoch: EncryptionEpoch, data: []const u8 },
     negotiated_parameters: NegotiatedParameters,
+    early_data_parameters: NegotiatedParameters,
     traffic_secret: struct { epoch: EncryptionEpoch, direction: SecretDirection, data: []const u8 },
     alpn: []const u8,
     certificate: CertificateState,

@@ -5,8 +5,9 @@
 //! carried. QUIC owns the contents of that extension; record mode carries no
 //! transport extension at all. This module imports neither QUIC nor OpenSSL.
 //!
-//! Deliberately narrow first profile, one interoperable code path per choice:
-//!   - cipher suite: TLS_AES_128_GCM_SHA256 (the adapter's suite)
+//! Deliberately narrow profile, one interoperable code path per choice:
+//!   - cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384,
+//!     TLS_CHACHA20_POLY1305_SHA256
 //!   - key exchange: X25519
 //!   - signature: Ed25519 (server CertificateVerify)
 //!   - server-only authentication; client certificates are not offered
@@ -2459,6 +2460,7 @@ pub const Tls13Backend = struct {
         var psk_secrets: [pre_shared_key.max_offered_identities][max_digest_len]u8 = undefined;
         defer crypto.secureZero(u8, std.mem.asBytes(&psk_secrets));
         var psk_hashes: [pre_shared_key.max_offered_identities]crypto_provider_pkg.Hash = undefined;
+        var psk_cipher_suites: [pre_shared_key.max_offered_identities]tls_algorithms.CipherSuite = undefined;
         var psk_count: usize = 0;
         var psk_offer_write: ?pre_shared_key.ClientOfferWrite = null;
         const active_offers = self.constClientPskOffers();
@@ -2470,6 +2472,7 @@ pub const Tls13Backend = struct {
                 const psk_slice = ticket.common.resumption_psk.slice();
                 @memcpy(psk_secrets[psk_count][0..psk_slice.len], psk_slice);
                 psk_hashes[psk_count] = ticket_hash;
+                psk_cipher_suites[psk_count] = ticket.common.cipher_suite;
                 psk_items[psk_count] = .{
                     .identity = ticket.ticket.slice(),
                     .obfuscated_ticket_age = pre_shared_key.obfuscateTicketAge(ticket.ageMillis(now_ms), ticket.ticket_age_add),
@@ -2544,6 +2547,13 @@ pub const Tls13Backend = struct {
             KeySchedule.clientEarlyTrafficSecret(self.crypto_provider, psk_hashes[0], psk_secrets[0][0..n0], client_hello_hash[0..n0], early[0..n0]) catch
                 return error.SecretExportFailed;
 
+            try sink.emitEarlyDataParameters(.{
+                .cipher_suite = @intFromEnum(psk_cipher_suites[0]),
+                .transcript_hash = switch (psk_hashes[0]) {
+                    .sha256 => .sha256,
+                    .sha384 => .sha384,
+                },
+            });
             try self.emitSecret(sink, .zero_rtt, .write, early[0..n0]);
         }
 
@@ -4468,19 +4478,28 @@ pub const Tls13Backend = struct {
             else
                 0;
             if (early_decision == .accepted) {
+                const early_cipher_suite = hit.state.common.cipher_suite;
+                const early_hash = tls_algorithms.transcriptHash(early_cipher_suite);
                 var client_hello_hash: [max_digest_len]u8 = undefined;
-                switch (self.negotiatedHash()) {
+                switch (early_hash) {
                     .sha256 => Sha256.hash(capture.message[0..capture.message_len], client_hello_hash[0..Sha256.digest_length], .{}),
                     .sha384 => Sha384.hash(capture.message[0..capture.message_len], client_hello_hash[0..Sha384.digest_length], .{}),
                 }
 
                 var early: [max_digest_len]u8 = undefined;
                 defer crypto.secureZero(u8, &early);
-                KeySchedule.clientEarlyTrafficSecret(self.crypto_provider, self.negotiatedHash(), psk_buf[0..n], client_hello_hash[0..n], early[0..n]) catch
+                KeySchedule.clientEarlyTrafficSecret(self.crypto_provider, early_hash, psk_buf[0..n], client_hello_hash[0..n], early[0..n]) catch
                     return error.SecretExportFailed;
 
                 // The server never emits a 0-RTT *write* key; server
                 // responses always use 1-RTT keys.
+                try sink.emitEarlyDataParameters(.{
+                    .cipher_suite = @intFromEnum(early_cipher_suite),
+                    .transcript_hash = switch (early_hash) {
+                        .sha256 => .sha256,
+                        .sha384 => .sha384,
+                    },
+                });
                 try self.emitSecret(sink, .zero_rtt, .read, early[0..n]);
             }
 

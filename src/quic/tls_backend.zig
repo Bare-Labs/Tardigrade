@@ -590,6 +590,7 @@ fn translate(allocator: ?std.mem.Allocator, source: *RecordSink, destination: *E
                 }
             },
             .negotiated_parameters => |params| try destination.emitNegotiatedParameters(params),
+            .early_data_parameters => |params| try destination.emitEarlyDataParameters(params),
             .traffic_secret => |item| try destination.emitSecret(toLevel(item.epoch), item.direction, item.data),
             .peer_transport_parameters => {},
             .alpn => |protocol| try destination.emitAlpn(protocol),

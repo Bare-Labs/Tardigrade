@@ -91,7 +91,7 @@ pub const Bridge = struct {
             // ever accepting the constructor's fixed value — is what lets
             // `installTrafficSecret` derive the right `TrafficKeys` for
             // whichever suite this connection actually negotiated.
-            .negotiated_parameters => |params| self.cipher_suite = algorithms.fromInt(algorithms.CipherSuite, params.cipher_suite) orelse
+            .negotiated_parameters, .early_data_parameters => |params| self.cipher_suite = algorithms.fromInt(algorithms.CipherSuite, params.cipher_suite) orelse
                 return error.UnsupportedRecordEpoch,
             .traffic_secret => |traffic_secret| try self.installTrafficSecret(traffic_secret.epoch, traffic_secret.direction, traffic_secret.data),
             .discard_epoch => |epoch| try self.discardEpoch(epoch),
@@ -980,6 +980,10 @@ test "record epoch bridge shuttles protocol-neutral driver events through record
                     .negotiated_parameters => |params| {
                         var scratch: [1]u8 = undefined;
                         _ = try sender_bridge.applyEvent(.{ .negotiated_parameters = params }, &scratch);
+                    },
+                    .early_data_parameters => |params| {
+                        var scratch: [1]u8 = undefined;
+                        _ = try sender_bridge.applyEvent(.{ .early_data_parameters = params }, &scratch);
                     },
                     .peer_transport_parameters,
                     .alpn,

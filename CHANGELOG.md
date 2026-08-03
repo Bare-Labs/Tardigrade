@@ -5,6 +5,14 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Features
+- **QUIC negotiated TLS suite packet protection (#566)** — Handshake, 0-RTT,
+  and 1-RTT packet protection now follows the TLS 1.3 cipher suite negotiated
+  by the native QUIC handshake (`TLS_AES_128_GCM_SHA256`,
+  `TLS_AES_256_GCM_SHA384`, or `TLS_CHACHA20_POLY1305_SHA256`). Initial
+  packets remain on RFC 9001's fixed AES-128-GCM/SHA-256 profile, while
+  provider-backed key derivation, AEAD seal/open, header protection, key
+  updates, capability checks, and live loopback coverage now exercise all
+  three non-Initial profiles end to end.
 - **HTTP/3 RFC 9218 priority hints (#254)** — the pure-Zig HTTP/3 path now
   parses and validates `priority` request headers, applies request
   `PRIORITY_UPDATE` frames on the peer control stream, exposes the effective
@@ -36,7 +44,7 @@ All notable user-facing changes to Tardigrade are documented here.
   WINDOW_UPDATE instead of being rewritten as gateway errors. The interop test
   checks upstream execution count and Tardigrade's typed resumption metric. The
   same slice closes the external TLS 1.3 cipher-mismatch row as unreachable
-  under the current single-cipher production native TLS profile, while
+  under the current single-cipher production native TCP TLS profile, while
   preserving deterministic in-repo `ResumeMismatch.cipher_suite_mismatch`
   coverage.
 - **Native TLS/QUIC 0-RTT anti-replay store: configuration, metrics, and
