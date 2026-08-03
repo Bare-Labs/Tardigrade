@@ -268,7 +268,11 @@ fn stripLeadingZero(value: []const u8) []const u8 {
 /// `q`/`dp`/`dq`/`qInv`), so an allocator-backed `std.math.big.int.Managed`
 /// over a bounded `FixedBufferAllocator` is an acceptable, contained
 /// exception to this module's otherwise allocation-free design; nothing here
-/// is on a path an attacker can invoke repeatedly per handshake.
+/// is on a path an attacker can invoke repeatedly per handshake. The scratch
+/// buffer holds working copies of every private component (`d`, `p`, `q`,
+/// `dp`, `dq`, `qInv`) and every intermediate the checks below compute, so it
+/// is wiped on every exit — success or any early return — by the `defer`
+/// immediately below, not just at the end of the happy path.
 fn validateComponentRelationships(
     n: []const u8,
     e: []const u8,
@@ -281,8 +285,19 @@ fn validateComponentRelationships(
 ) Error!void {
     const big = std.math.big.int;
     var scratch: [131072]u8 = undefined;
+    defer secrets.secureZero(&scratch);
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     const allocator = fba.allocator();
+
+    // `p` and `q` must actually be prime: the equations below (n = p*q, the
+    // CRT congruences) are satisfied by any correct factorization of `n`,
+    // prime or not, so without this check a composite-factor structure could
+    // pass every algebraic test yet still not be a valid two-prime RSA key —
+    // a weak (trivially factorable) modulus that either fails at signing or,
+    // worse, signs successfully with much weaker security than the modulus
+    // size advertises. See `isProbablePrime`'s doc comment for what this
+    // check does and does not guarantee.
+    if (!isProbablePrime(p) or !isProbablePrime(q)) return error.InvalidInput;
 
     const big_n = bigFromBytes(allocator, n) catch return error.InvalidInput;
     const big_e = bigFromBytes(allocator, e) catch return error.InvalidInput;
@@ -356,6 +371,104 @@ fn bigFromBytes(allocator: std.mem.Allocator, bytes: []const u8) !std.math.big.i
     var mutable = big.Mutable{ .limbs = limbs, .len = 1, .positive = true };
     mutable.readTwosComplement(bytes, bit_count, .big, .unsigned);
     return mutable.toManaged(allocator);
+}
+
+/// Decrement an unsigned big-endian integer in place. Requires `buf` to
+/// represent a nonzero value (holds for every caller here: `p`/`q` are
+/// already known to be `> 3`, see `isProbablePrime`).
+fn decrementBigEndian(buf: []u8) void {
+    var i = buf.len;
+    while (i > 0) {
+        i -= 1;
+        if (buf[i] != 0) {
+            buf[i] -= 1;
+            return;
+        }
+        buf[i] = 0xff;
+    }
+}
+
+fn isOddBigEndian(buf: []const u8) bool {
+    return buf[buf.len - 1] & 1 == 1;
+}
+
+fn shiftRightOneBigEndian(buf: []u8) void {
+    var carry: u8 = 0;
+    for (buf) |*byte| {
+        const next_carry: u8 = byte.* & 1;
+        byte.* = (byte.* >> 1) | (carry << 7);
+        carry = next_carry;
+    }
+}
+
+/// Small-prime witness bases for `isProbablePrime`'s Miller-Rabin rounds (the
+/// first 40 odd primes).
+const miller_rabin_witnesses = [_]u8{
+    2,   3,   5,   7,   11,  13,  17,  19,  23,  29,
+    31,  37,  41,  43,  47,  53,  59,  61,  67,  71,
+    73,  79,  83,  89,  97,  101, 103, 107, 109, 113,
+    127, 131, 137, 139, 149, 151, 157, 163, 167, 173,
+};
+
+/// Miller-Rabin primality test with a *fixed* set of small-prime witnesses
+/// (not random bases), run entirely over `std.crypto.ff.Modulus` — the same
+/// primitive `signPssSha256`/`verifyPssSha256` use, so no new modexp
+/// implementation is introduced. `candidate` must be minimal big-endian
+/// bytes (no leading zero byte) and nonzero, matching every call site here
+/// (`p`/`q` after `stripLeadingZero`).
+///
+/// This is a strong heuristic, not a formal primality proof: fixed witnesses
+/// are not a proven-correct deterministic test at RSA prime sizes (unlike
+/// small bounded ranges where specific fixed witness sets are proven
+/// sufficient). A composite specifically engineered to be a strong
+/// pseudoprime to all 40 witnesses here is not known to be constructible in
+/// practice, and this closes the gap a purely algebraic relationship check
+/// leaves open (see `validateComponentRelationships`'s caller) — but it is
+/// weaker than trial with random bases would give, which this function
+/// avoids only to keep RSA private-key parsing free of an entropy-source
+/// dependency. Recorded here per the project's practice of documenting
+/// toolchain/scope limitations honestly rather than leaving them implicit;
+/// see `docs/CRYPTO_SECURITY_AUDIT.md`.
+fn isProbablePrime(candidate: []const u8) bool {
+    if (candidate.len == 0) return false;
+    if (candidate.len == 1) return candidate[0] == 2 or candidate[0] == 3;
+    if (candidate[candidate.len - 1] & 1 == 0) return false; // even, and > 1 byte so > 3: composite
+
+    var n_minus_one_buf: [max_modulus_bytes]u8 = undefined;
+    const n_minus_one = n_minus_one_buf[0..candidate.len];
+    @memcpy(n_minus_one, candidate);
+    decrementBigEndian(n_minus_one);
+
+    var d_buf: [max_modulus_bytes]u8 = undefined;
+    const d = d_buf[0..candidate.len];
+    @memcpy(d, n_minus_one);
+    var s: u32 = 0;
+    while (!isOddBigEndian(d)) {
+        shiftRightOneBigEndian(d);
+        s += 1;
+    }
+
+    const Fp = ff.Modulus(max_modulus_bits);
+    const modulus_fe = Fp.fromBytes(candidate, .big) catch return false;
+    const n_minus_one_fe = Fp.Fe.fromBytes(modulus_fe, n_minus_one, .big) catch return false;
+    const one_fe = modulus_fe.one();
+
+    witness_loop: for (miller_rabin_witnesses) |witness| {
+        var base_buf: [max_modulus_bytes]u8 = [_]u8{0} ** max_modulus_bytes;
+        base_buf[candidate.len - 1] = witness;
+        const base_fe = Fp.Fe.fromBytes(modulus_fe, base_buf[0..candidate.len], .big) catch return false;
+
+        var x = modulus_fe.powWithEncodedExponent(base_fe, d, .big) catch return false;
+        if (x.eql(one_fe) or x.eql(n_minus_one_fe)) continue :witness_loop;
+
+        var round: u32 = 1;
+        while (round < s) : (round += 1) {
+            x = modulus_fe.sq(x);
+            if (x.eql(n_minus_one_fe)) continue :witness_loop;
+        }
+        return false;
+    }
+    return true;
 }
 
 /// Parse and validate a PKCS#1 `RSAPrivateKey` DER encoding (the structure a
@@ -766,6 +879,71 @@ test "RSA private-key DER rejects p == q" {
     const prime_len = 129;
     @memcpy(buf[q_start .. q_start + prime_len], buf[p_start .. p_start + prime_len]);
     try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&buf));
+}
+
+test "RSA private-key DER rejects a full 2048-bit key whose p and q are composite but satisfy every algebraic relation" {
+    // Built offline: p and q are each the product of two ~512-bit primes
+    // (so individually composite, not prime), with n = p*q landing at
+    // exactly 2048 bits and d/dP/dQ/qInv computed correctly for that (p, q)
+    // — i.e. every check `validateComponentRelationships` performs before
+    // the primality gate (n = p*q, p != q, dP/dQ, qInv*q = 1 mod p,
+    // e*d = 1 mod lcm(p-1,q-1)) holds exactly. Only `isProbablePrime`
+    // catches this: the exact "composite-factor structure satisfies every
+    // equation" case #565's review flagged.
+    const composite_factor_key = hexBytesForTest(
+        "308204a4020100028201010093222272dc2c77020f867d8c26052df8a60128f72bf15f2bf91338e29568e68e1814cadd95667791722bf2010140fb310020206674655e0fbfdfeb058f96652480adb0812a267f43f7453d1760bc55933b4855347d21a25963d0ba248413300f487198b0538cf062888a739cf733fa8062147ce160b700d6054bcab50a3152f4fd2d597d4318868e9065018413489f87c9da923e9752b026edbccd232cfba1aa6373414080dce61a3dccba2e2ed33de6f6f4f05646adb72159e63d6712458b0518e03a2cbaab303a57e1b45b1be9077f3f869d08ad1915d20dcf70f312fefc28ebd8b25af0067346a0182a82c79c93b94811918c4a6bb9ba6d4be374f972b4eb02030100010282010013028887e5999b20b987cb65d5adbaa45332782c0351f2d5781f7b2c8f5857dd890ffaac09770d40ce0b0e8001bcf7177c282a7782576c81456db56c690269fbfee23219662c462a2e631443167d0ee37077e6865b1a82e2e0ca219ac133c7745a0c4f498ce9fb4f07cc37a6d2abb5146c57b050e05194ba92419a25acf4f57e3ea234a53e87121d439a8b68d68a066d22476ae4b05078e623c1cca8a1c4965c42d5709eda30f0ff96e926d5260803d6f61747b9b30a8fc3eb1239757961b59b34132bd4ebef1966cf8d4b16163db2f5da1e21d074bf7fea88ba051a51d5e48027b917cc5fcf4232cdf7161db72c74a0cf43fc5a19129a3a6561f077dc51fe8102818100bcbdf596aea32769feca7cfd476344e76738a538ac8c2b8d13db925f93a019f0edab8b457c26488d2ca88145af9cf0b95f724816b19edd164ca33c1309521f8e52b9a398b363eb110c0755b3e9bf186c3a195d3e326b95ff559fb7316f65dda4beb138fbe1b2e70c3e8f263a90c4a43548c62059a19613149a4107f3c44e226b02818100c790695fdaf7cf06a578fd15cd1fdf1a911597d2970267511330527fcd9fcaff7d513689e04dbb070bb513d9285cb77a99171f84e6269b1542adf8311af2ff338b808512047750d5857973f0e12ce7e0931d86b349d656e6c2826b2f5f5af311d7b5219eccabbce6d3940ca5c7016beeb94bb9d0cbf9837c8d7b0eb9d36357810281810096f513f525ce869aa757caea44eba7d3b0e2447b74be53a2ed8c03a18010604f2bb8b596a8ba71f2c01231facb7fa9a58a2a7c6ff2368ebbe425f6c97efdf9113b27112af3e7e9bde3b20620f4c68bc11c22e749f4c7c9dbc3df0f857184b6e6aa4252c25afd5d009514a74dd63600e441457de0527616e2b69166cbd86969eb02818100b1da52ff199ff6827ee077f5810d218184c1d0bfded3468eabe249f41aa6897cef0b7ce69ddfc889fbf6124d5bba5dcec637246105d86c282377f6149566f0e7d830dee772d17f59fc0d84b5ad889ed2b769fe0d3505f006d25cf6f78e2cf929f2ab3bde519bd0cb8ace8c03067b8edc7f892c7e17fb3422c1d86504598f54810281802a90983d83db5eb1c0b853ab58873e075160ffdd1ee52638e6a8b75cbc9ae2f4d5900e8228c885057594f7ea63c01914a6e4af8449711587a4bebeac946f18794e48fd760d7d568e37ff0abf93e80d2f88ee2c36b36da93b73bb43774b65efac68f22c43f4439f4222c463d03b57a11b18f516547796d91776b10fa28ca4763b",
+    );
+    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&composite_factor_key));
+}
+
+test "isProbablePrime rejects well-known composites, including Fermat/Carmichael pseudoprimes, and accepts real primes" {
+    // 341 = 11*31 (the smallest Fermat pseudoprime to base 2); 561, 1105,
+    // 1729, and 8911 are Carmichael numbers (composite but pass a Fermat
+    // test for every base coprime to them) — exactly the class of composite
+    // that a weaker, single-base or purely-algebraic check could miss.
+    const composites = [_][]const u8{
+        &[_]u8{ 0x01, 0x55 }, // 341
+        &[_]u8{ 0x02, 0x31 }, // 561
+        &[_]u8{ 0x02, 0x85 }, // 645
+        &[_]u8{ 0x04, 0x51 }, // 1105
+        &[_]u8{ 0x06, 0xc1 }, // 1729
+        &[_]u8{ 0x22, 0xcf }, // 8911 = 7*19*67
+        &[_]u8{4},
+        &[_]u8{9},
+        &[_]u8{15},
+        &[_]u8{25},
+    };
+    for (composites) |composite| {
+        try std.testing.expect(!isProbablePrime(composite));
+    }
+
+    const primes = [_][]const u8{
+        &[_]u8{2}, &[_]u8{3},
+        &[_]u8{ 0x03, 0xe5 }, // 997
+        &[_]u8{ 0x1e, 0xef }, // 7919
+        &[_]u8{ 0x01, 0x00, 0x01 }, // 65537
+        &[_]u8{ 0x01, 0x99, 0x19 }, // 104729
+    };
+    for (primes) |prime| {
+        try std.testing.expect(isProbablePrime(prime));
+    }
+
+    // Real RSA-2048/3072/4096 prime factors from the module's own fixtures.
+    var key = testKey();
+    defer key.deinit();
+    // p and q are not retained on `PrivateKey`, so re-derive them from the
+    // same fixture DER `parsePrivateKeyDer` itself parses.
+    const fixture_p = &[_]u8{
+        0xcb, 0x8d, 0x33, 0xac, 0x35, 0x15, 0x29, 0x07, 0x1f, 0x69, 0x5e, 0xfd, 0x67, 0xc9, 0xd3, 0xa5,
+        0xf3, 0xcf, 0xa7, 0x6e, 0x42, 0xce, 0xe6, 0x5a, 0x29, 0xb8, 0xa3, 0x2f, 0x6b, 0x79, 0xb0, 0x76,
+        0x79, 0xec, 0xf1, 0x38, 0xf8, 0x2c, 0x3d, 0xfd, 0xb5, 0x8c, 0xbf, 0x46, 0x09, 0x75, 0x1b, 0x5b,
+        0x17, 0x47, 0x8a, 0x60, 0x88, 0x85, 0x03, 0xb4, 0xeb, 0xe6, 0x1b, 0x3d, 0x45, 0x9d, 0x00, 0xc9,
+        0x33, 0x83, 0x6d, 0x42, 0x71, 0xa7, 0xc8, 0xfe, 0xff, 0x05, 0x8c, 0x36, 0x67, 0xce, 0x33, 0xf2,
+        0x23, 0x63, 0x44, 0xe6, 0x9c, 0x30, 0xb6, 0x4c, 0xfd, 0xfc, 0xf5, 0x9f, 0xda, 0xab, 0xca, 0x6f,
+        0x24, 0x63, 0xd8, 0x9a, 0xb8, 0x42, 0xe4, 0x4f, 0x02, 0x88, 0xf8, 0xe3, 0x18, 0xd9, 0xc1, 0x25,
+        0x0b, 0x9a, 0x57, 0xaa, 0x95, 0xdb, 0x61, 0x13, 0x4d, 0xe7, 0xf1, 0x29, 0xa4, 0x4e, 0x9e, 0xdd,
+    };
+    try std.testing.expect(isProbablePrime(fixture_p));
 }
 
 test "matchesPublicKeyDer requires exact modulus and exponent equality" {
