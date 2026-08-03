@@ -399,8 +399,10 @@ fn runQuicInitialVector(log: *ExecutionLog) !void {
     _ = try log.execute("quic-header-protection-chacha20-fixed");
     const cp = cryptoProvider();
     const dcid = hexBytes("8394c8f03e515708");
-    const secrets = try quic.tls_adapter.deriveInitialSecretsV1(&dcid);
-    const provider_secrets = try quic.tls_adapter.deriveInitialSecretsV1WithProvider(cp, &dcid);
+    var secrets = try quic.tls_adapter.deriveInitialSecretsV1(&dcid);
+    defer secrets.deinit();
+    var provider_secrets = try quic.tls_adapter.deriveInitialSecretsV1WithProvider(cp, &dcid);
+    defer provider_secrets.deinit();
 
     try expectStage("quic initial secret / RFC 9001 A.1", &hexBytes("7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44"), &secrets.initial_secret);
     try expectStage("quic client initial secret / RFC 9001 A.1", &hexBytes("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"), secrets.client.secret.slice());

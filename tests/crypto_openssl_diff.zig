@@ -1868,7 +1868,8 @@ test "OpenSSL HKDF oracle matches provider and TLS record derivations" {
 
 fn runQuicInitial(allocator: std.mem.Allocator) !void {
     const dcid = hexBytes("8394c8f03e515708");
-    const zig_initial = try quic.tls_adapter.deriveInitialSecretsV1(&dcid);
+    var zig_initial = try quic.tls_adapter.deriveInitialSecretsV1(&dcid);
+    defer zig_initial.deinit();
     const rfc9001_initial_salt = hexBytes("38762cf7f55934b34d179ae6a4c80cadccbb7f0a");
     const quic_secret_len = 32;
     const quic_key_len = 16;

@@ -380,6 +380,10 @@ fn pumpDirect(
             var scratch: [1]u8 = undefined;
             _ = try sender_bridge.applyEvent(.{ .negotiated_parameters = params }, &scratch);
         },
+        .early_data_parameters => |params| {
+            var scratch: [1]u8 = undefined;
+            _ = try sender_bridge.applyEvent(.{ .early_data_parameters = params }, &scratch);
+        },
         .peer_transport_parameters => {},
         .alpn => |protocol| observed.noteAlpn(protocol),
         .certificate => |state| observed.certificate_state = state,

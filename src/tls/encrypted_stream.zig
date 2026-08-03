@@ -1017,7 +1017,7 @@ pub const PureZigRecordStream = struct {
                 // contract guarantees the backend emits it first — so
                 // `self.bridge.installTrafficSecret` derives `TrafficKeys`
                 // for the suite this connection actually negotiated.
-                .negotiated_parameters => |params| {
+                .negotiated_parameters, .early_data_parameters => |params| {
                     self.bridge.cipher_suite = algorithms.fromInt(algorithms.CipherSuite, params.cipher_suite) orelse
                         return self.fail(error.MalformedHandshake);
                 },

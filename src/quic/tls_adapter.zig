@@ -508,6 +508,12 @@ pub const InitialSecrets = struct {
     initial_secret: [traffic_secret_len]u8,
     client: PacketProtectionKeys,
     server: PacketProtectionKeys,
+
+    pub fn deinit(self: *InitialSecrets) void {
+        crypto_provider.secureZero(&self.initial_secret);
+        self.client.deinit();
+        self.server.deinit();
+    }
 };
 
 pub fn deriveInitialSecretsV1(client_initial_dcid: []const u8) error{InvalidConnectionId}!InitialSecrets {
@@ -515,10 +521,13 @@ pub fn deriveInitialSecretsV1(client_initial_dcid: []const u8) error{InvalidConn
         return error.InvalidConnectionId;
     }
 
-    const initial_secret = HkdfSha256.extract(&initial_salt_v1, client_initial_dcid);
-    const client_secret = tls.hkdfExpandLabel(HkdfSha256, initial_secret, "client in", "", traffic_secret_len);
-    const server_secret = tls.hkdfExpandLabel(HkdfSha256, initial_secret, "server in", "", traffic_secret_len);
-    return .{
+    var initial_secret = HkdfSha256.extract(&initial_salt_v1, client_initial_dcid);
+    defer crypto_provider.secureZero(&initial_secret);
+    var client_secret = tls.hkdfExpandLabel(HkdfSha256, initial_secret, "client in", "", traffic_secret_len);
+    defer crypto_provider.secureZero(&client_secret);
+    var server_secret = tls.hkdfExpandLabel(HkdfSha256, initial_secret, "server in", "", traffic_secret_len);
+    defer crypto_provider.secureZero(&server_secret);
+    return InitialSecrets{
         .initial_secret = initial_secret,
         .client = deriveAes128GcmKeys(client_secret),
         .server = deriveAes128GcmKeys(server_secret),
@@ -531,12 +540,15 @@ pub fn deriveInitialSecretsV1WithProvider(provider: crypto_provider.CryptoProvid
     }
 
     var initial_secret: [traffic_secret_len]u8 = undefined;
+    defer crypto_provider.secureZero(&initial_secret);
     provider.hkdfExtract(.sha256, &initial_salt_v1, client_initial_dcid, &initial_secret) catch return error.ProviderUnsupported;
     var client_secret: [traffic_secret_len]u8 = undefined;
+    defer crypto_provider.secureZero(&client_secret);
     var server_secret: [traffic_secret_len]u8 = undefined;
+    defer crypto_provider.secureZero(&server_secret);
     provider.hkdfExpandLabel(.sha256, &initial_secret, "client in", "", &client_secret) catch return error.ProviderUnsupported;
     provider.hkdfExpandLabel(.sha256, &initial_secret, "server in", "", &server_secret) catch return error.ProviderUnsupported;
-    return .{
+    return InitialSecrets{
         .initial_secret = initial_secret,
         .client = try deriveAes128GcmKeysWithProvider(provider, client_secret),
         .server = try deriveAes128GcmKeysWithProvider(provider, server_secret),
@@ -550,9 +562,12 @@ pub fn deriveInitialSecretsV1WithProvider(provider: crypto_provider.CryptoProvid
 pub fn deriveAes128GcmKeys(secret: [traffic_secret_len]u8) PacketProtectionKeys {
     var keys = PacketProtectionKeys{ .profile = PacketProtectionProfile.forInitial() };
     keys.secret.replace(&secret) catch unreachable;
-    const key = tls.hkdfExpandLabel(HkdfSha256, secret, "quic key", "", aead_key_len);
-    const iv = tls.hkdfExpandLabel(HkdfSha256, secret, "quic iv", "", aead_iv_len);
-    const hp = tls.hkdfExpandLabel(HkdfSha256, secret, "quic hp", "", header_protection_key_len);
+    var key = tls.hkdfExpandLabel(HkdfSha256, secret, "quic key", "", aead_key_len);
+    defer crypto_provider.secureZero(&key);
+    var iv = tls.hkdfExpandLabel(HkdfSha256, secret, "quic iv", "", aead_iv_len);
+    defer crypto_provider.secureZero(&iv);
+    var hp = tls.hkdfExpandLabel(HkdfSha256, secret, "quic hp", "", header_protection_key_len);
+    defer crypto_provider.secureZero(&hp);
     keys.key.replace(&key) catch unreachable;
     keys.iv.replace(&iv) catch unreachable;
     keys.hp.replace(&hp) catch unreachable;
@@ -867,6 +882,8 @@ pub const QuicTlsAdapter = struct {
     metrics: Metrics = .{},
     negotiated_cipher_suite: ?tls_algorithms.CipherSuite = null,
     negotiated_profile: ?PacketProtectionProfile = null,
+    zero_rtt_cipher_suite: ?tls_algorithms.CipherSuite = null,
+    zero_rtt_profile: ?PacketProtectionProfile = null,
     /// Provider-owned crypto for HKDF, AEAD, and QUIC header-protection
     /// operations (#490). No default: `src/quic/` must not choose a concrete
     /// backend (that decision belongs to the native HTTP/QUIC composition
@@ -979,6 +996,18 @@ pub const QuicTlsAdapter = struct {
     }
 
     pub fn installNegotiatedParameters(self: *QuicTlsAdapter, params: tls_core.events.NegotiatedParameters) error{ InvalidCipherSuite, ProviderUnsupported }!void {
+        const selected = try self.packetProtectionProfileFromParameters(params);
+        self.negotiated_cipher_suite = selected.suite;
+        self.negotiated_profile = selected.profile;
+    }
+
+    pub fn installEarlyDataParameters(self: *QuicTlsAdapter, params: tls_core.events.NegotiatedParameters) error{ InvalidCipherSuite, ProviderUnsupported }!void {
+        const selected = try self.packetProtectionProfileFromParameters(params);
+        self.zero_rtt_cipher_suite = selected.suite;
+        self.zero_rtt_profile = selected.profile;
+    }
+
+    fn packetProtectionProfileFromParameters(self: *const QuicTlsAdapter, params: tls_core.events.NegotiatedParameters) error{ InvalidCipherSuite, ProviderUnsupported }!struct { suite: tls_algorithms.CipherSuite, profile: PacketProtectionProfile } {
         const suite = tls_algorithms.fromInt(tls_algorithms.CipherSuite, params.cipher_suite) orelse return error.InvalidCipherSuite;
         const profile = PacketProtectionProfile.forCipherSuite(suite);
         if (profile.hash != switch (params.transcript_hash) {
@@ -986,12 +1015,15 @@ pub const QuicTlsAdapter = struct {
             .sha384 => crypto_provider.Hash.sha384,
         }) return error.InvalidCipherSuite;
         try profile.validateProvider(self.provider);
-        self.negotiated_cipher_suite = suite;
-        self.negotiated_profile = profile;
+        return .{ .suite = suite, .profile = profile };
     }
 
     pub fn negotiatedCipherSuite(self: *const QuicTlsAdapter) ?tls_algorithms.CipherSuite {
         return self.negotiated_cipher_suite;
+    }
+
+    pub fn zeroRttCipherSuite(self: *const QuicTlsAdapter) ?tls_algorithms.CipherSuite {
+        return self.zero_rtt_cipher_suite;
     }
 
     pub fn secret(self: *const QuicTlsAdapter, level: EncryptionLevel, direction: Direction) ?*const Secret {
@@ -999,7 +1031,8 @@ pub const QuicTlsAdapter = struct {
     }
 
     pub fn installInitialSecrets(self: *QuicTlsAdapter, perspective: Perspective, client_initial_dcid: []const u8) error{ InvalidConnectionId, SecretTooLarge, ProviderUnsupported }!InitialSecrets {
-        const secrets = try deriveInitialSecretsV1WithProvider(self.provider, client_initial_dcid);
+        var secrets = try deriveInitialSecretsV1WithProvider(self.provider, client_initial_dcid);
+        errdefer secrets.deinit();
         switch (perspective) {
             .client => {
                 self.installSecret(try Secret.init(.initial, .write, secrets.client.secret.slice()));
@@ -1038,6 +1071,12 @@ pub const QuicTlsAdapter = struct {
         };
     }
 
+    pub fn hasProtectionKeys(self: *const QuicTlsAdapter, level: EncryptionLevel, direction: Direction) error{ProviderUnsupported}!bool {
+        var keys = (try self.protectionKeys(level, direction)) orelse return false;
+        defer keys.deinit();
+        return true;
+    }
+
     /// Seal `plaintext` for `level`/`direction` into `out`, tracking a protected
     /// packet count. Returns error.KeysUnavailable when no usable secret is
     /// installed for the level.
@@ -1050,7 +1089,8 @@ pub const QuicTlsAdapter = struct {
         plaintext: []const u8,
         out: []u8,
     ) error{ KeysUnavailable, InvalidPacketNumber, OutputTooSmall, ProviderUnsupported }![]u8 {
-        const keys = (try self.protectionKeys(level, direction)) orelse return error.KeysUnavailable;
+        var keys = (try self.protectionKeys(level, direction)) orelse return error.KeysUnavailable;
+        defer keys.deinit();
         const sealed = try keys.sealPayloadWithProvider(self.provider, packet_number, header, plaintext, out);
         self.metrics.packets_protected += 1;
         return sealed;
@@ -1068,7 +1108,8 @@ pub const QuicTlsAdapter = struct {
         protected_payload: []const u8,
         out: []u8,
     ) error{ KeysUnavailable, InvalidPacketNumber, ProtectedPayloadTooShort, OutputTooSmall, AuthenticationFailed, ProviderUnsupported }![]u8 {
-        const keys = (try self.protectionKeys(level, direction)) orelse return error.KeysUnavailable;
+        var keys = (try self.protectionKeys(level, direction)) orelse return error.KeysUnavailable;
+        defer keys.deinit();
         const plaintext = keys.openPayloadWithProvider(self.provider, packet_number, header, protected_payload, out) catch |err| {
             if (err == error.AuthenticationFailed) self.metrics.deprotection_failures += 1;
             return err;
@@ -1153,7 +1194,8 @@ pub const QuicTlsAdapter = struct {
     fn profileForLevel(self: *const QuicTlsAdapter, level: EncryptionLevel) ?PacketProtectionProfile {
         return switch (level) {
             .initial => PacketProtectionProfile.forInitial(),
-            .zero_rtt, .handshake, .application => self.negotiated_profile,
+            .zero_rtt => self.zero_rtt_profile,
+            .handshake, .application => self.negotiated_profile,
         };
     }
 
@@ -1218,7 +1260,8 @@ test "QUIC v1 Initial secrets match RFC 9001 sample vector" {
     var dcid: [8]u8 = undefined;
     _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
 
-    const secrets = try deriveInitialSecretsV1(&dcid);
+    var secrets = try deriveInitialSecretsV1(&dcid);
+    defer secrets.deinit();
     try expectHex("7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44", &secrets.initial_secret);
     try expectHex("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea", secrets.client.secret.slice());
     try expectHex("1f369613dd76d5467730efcbe3b1a22d", secrets.client.key.slice());
@@ -1233,7 +1276,8 @@ test "QUIC v1 Initial secrets match RFC 9001 sample vector" {
 test "Initial packet protection derives nonce and header protection mask" {
     var dcid: [8]u8 = undefined;
     _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
-    const secrets = try deriveInitialSecretsV1(&dcid);
+    var secrets = try deriveInitialSecretsV1(&dcid);
+    defer secrets.deinit();
 
     try expectHex("fa044b2f42a3fd3b46fb255e", &secrets.client.nonce(2));
 
@@ -1245,7 +1289,8 @@ test "Initial packet protection derives nonce and header protection mask" {
 test "Initial packet protection seals RFC 9001 client Initial payload sample" {
     var dcid: [8]u8 = undefined;
     _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
-    const secrets = try deriveInitialSecretsV1(&dcid);
+    var secrets = try deriveInitialSecretsV1(&dcid);
+    defer secrets.deinit();
 
     var header: [22]u8 = undefined;
     _ = try std.fmt.hexToBytes(&header, "c300000001088394c8f03e5157080000449e00000002");
@@ -1323,7 +1368,8 @@ test "Initial packet protection seals RFC 9001 client Initial payload sample" {
 test "Initial packet protection rejects invalid inputs" {
     var dcid: [8]u8 = undefined;
     _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
-    const secrets = try deriveInitialSecretsV1(&dcid);
+    var secrets = try deriveInitialSecretsV1(&dcid);
+    defer secrets.deinit();
     const header = "test header";
     const plaintext = "ping";
 
@@ -1354,7 +1400,8 @@ test "Initial secrets reject invalid destination connection IDs" {
     try testing.expectError(error.InvalidConnectionId, deriveInitialSecretsV1(&too_short));
 
     const min_len = [_]u8{0xbb} ** min_initial_dcid_len;
-    _ = try deriveInitialSecretsV1(&min_len);
+    var min_secrets = try deriveInitialSecretsV1(&min_len);
+    min_secrets.deinit();
 
     const too_long = [_]u8{0xaa} ** (max_connection_id_len + 1);
     try testing.expectError(error.InvalidConnectionId, deriveInitialSecretsV1(&too_long));
@@ -1365,17 +1412,21 @@ test "adapter installs Initial secrets by endpoint perspective" {
     _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
 
     var client = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
-    const client_secrets = try client.installInitialSecrets(.client, &dcid);
+    var client_secrets = try client.installInitialSecrets(.client, &dcid);
+    defer client_secrets.deinit();
     try testing.expectEqualSlices(u8, client_secrets.client.secret.slice(), client.secret(.initial, .write).?.slice());
     try testing.expectEqualSlices(u8, client_secrets.server.secret.slice(), client.secret(.initial, .read).?.slice());
-    const client_write_keys = (try client.protectionKeys(.initial, .write)).?;
+    var client_write_keys = (try client.protectionKeys(.initial, .write)).?;
+    defer client_write_keys.deinit();
     try testing.expectEqualSlices(u8, client_secrets.client.key.slice(), client_write_keys.key.slice());
 
     var server = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
-    const server_secrets = try server.installInitialSecrets(.server, &dcid);
+    var server_secrets = try server.installInitialSecrets(.server, &dcid);
+    defer server_secrets.deinit();
     try testing.expectEqualSlices(u8, server_secrets.client.secret.slice(), server.secret(.initial, .read).?.slice());
     try testing.expectEqualSlices(u8, server_secrets.server.secret.slice(), server.secret(.initial, .write).?.slice());
-    const server_write_keys = (server.protectionKeys(.initial, .write) catch unreachable).?;
+    var server_write_keys = (server.protectionKeys(.initial, .write) catch unreachable).?;
+    defer server_write_keys.deinit();
     try testing.expectEqualSlices(u8, server_secrets.server.hp.slice(), server_write_keys.hp.slice());
 }
 
@@ -1396,14 +1447,19 @@ test "adapter derives Handshake and 1-RTT protection keys from installed traffic
     adapter.installSecret(try Secret.init(.application, .read, &app_secret));
 
     // The adapter path matches the standalone derivation for the same suite.
-    const hs_keys = (try adapter.protectionKeys(.handshake, .write)).?;
-    const expected_hs = deriveAes128GcmKeys(hs_secret);
+    var hs_keys = (try adapter.protectionKeys(.handshake, .write)).?;
+    defer hs_keys.deinit();
+    var expected_hs = deriveAes128GcmKeys(hs_secret);
+    defer expected_hs.deinit();
     try testing.expectEqualSlices(u8, expected_hs.key.slice(), hs_keys.key.slice());
     try testing.expectEqualSlices(u8, expected_hs.iv.slice(), hs_keys.iv.slice());
     try testing.expectEqualSlices(u8, expected_hs.hp.slice(), hs_keys.hp.slice());
 
-    const app_keys = (adapter.protectionKeys(.application, .read) catch unreachable).?;
-    try testing.expectEqualSlices(u8, deriveAes128GcmKeys(app_secret).key.slice(), app_keys.key.slice());
+    var app_keys = (adapter.protectionKeys(.application, .read) catch unreachable).?;
+    defer app_keys.deinit();
+    var expected_app = deriveAes128GcmKeys(app_secret);
+    defer expected_app.deinit();
+    try testing.expectEqualSlices(u8, expected_app.key.slice(), app_keys.key.slice());
 
     // Direction is honored: the untouched direction stays empty.
     try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.protectionKeys(.handshake, .read));
@@ -1431,7 +1487,8 @@ test "negotiated QUIC packet protection follows all supported TLS suites" {
         adapter.installSecret(try Secret.init(.application, .write, secret[0..profile.traffic_secret_len]));
         adapter.installSecret(try Secret.init(.application, .read, secret[0..profile.traffic_secret_len]));
 
-        const hs_keys = (try adapter.protectionKeys(.handshake, .write)).?;
+        var hs_keys = (try adapter.protectionKeys(.handshake, .write)).?;
+        defer hs_keys.deinit();
         try testing.expectEqual(profile.aead, hs_keys.profile.aead);
         try testing.expectEqual(profile.header_protection, hs_keys.profile.header_protection);
         try testing.expectEqual(profile.key_len, hs_keys.key.slice().len);
@@ -1460,17 +1517,62 @@ test "negotiated QUIC packet protection follows all supported TLS suites" {
         try testing.expectEqual(@as(u8, 0xaa), sampled_pn[0]);
         try testing.expectEqual(@as(u8, 0xbb), sampled_pn[1]);
 
-        const write_before = (try adapter.protectionKeys(.application, .write)).?;
+        var write_before = (try adapter.protectionKeys(.application, .write)).?;
+        defer write_before.deinit();
         try adapter.updateApplicationWriteKeys();
-        const write_after = (try adapter.protectionKeys(.application, .write)).?;
+        var write_after = (try adapter.protectionKeys(.application, .write)).?;
+        defer write_after.deinit();
         try testing.expectEqual(profile.key_len, write_after.key.slice().len);
         try testing.expect(!std.mem.eql(u8, write_before.key.slice(), write_after.key.slice()));
 
-        const trial_read = (try adapter.nextApplicationReadKeys()).?;
+        var trial_read = (try adapter.nextApplicationReadKeys()).?;
+        defer trial_read.deinit();
         try testing.expectEqual(profile.key_len, trial_read.key.slice().len);
         try adapter.commitApplicationReadKeyUpdate();
-        const read_after = (try adapter.protectionKeys(.application, .read)).?;
+        var read_after = (try adapter.protectionKeys(.application, .read)).?;
+        defer read_after.deinit();
         try testing.expectEqualSlices(u8, trial_read.key.slice(), read_after.key.slice());
+    }
+}
+
+test "0-RTT packet protection uses resumed suite before negotiated parameters" {
+    inline for (.{
+        tls_algorithms.CipherSuite.tls_aes_128_gcm_sha256,
+        tls_algorithms.CipherSuite.tls_aes_256_gcm_sha384,
+        tls_algorithms.CipherSuite.tls_chacha20_poly1305_sha256,
+    }) |suite| {
+        const profile = PacketProtectionProfile.forCipherSuite(suite);
+        var client = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
+        var server = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
+        const params: tls_core.events.NegotiatedParameters = .{
+            .cipher_suite = @intFromEnum(suite),
+            .transcript_hash = transcriptHashEvent(profile.hash),
+        };
+        try client.installEarlyDataParameters(params);
+        try server.installEarlyDataParameters(params);
+        client.setZeroRttEnabled(true);
+        server.setZeroRttEnabled(true);
+        try testing.expectEqual(@as(?tls_algorithms.CipherSuite, null), client.negotiatedCipherSuite());
+        try testing.expectEqual(suite, client.zeroRttCipherSuite().?);
+
+        var secret = testSecret(@intCast((@intFromEnum(suite) >> 8) & 0xff));
+        defer crypto_provider.secureZero(&secret);
+        client.installSecret(try Secret.init(.zero_rtt, .write, secret[0..profile.traffic_secret_len]));
+        server.installSecret(try Secret.init(.zero_rtt, .read, secret[0..profile.traffic_secret_len]));
+
+        var client_keys = (try client.protectionKeys(.zero_rtt, .write)).?;
+        defer client_keys.deinit();
+        try testing.expectEqual(profile.aead, client_keys.profile.aead);
+        try testing.expectEqual(profile.header_protection, client_keys.profile.header_protection);
+        try testing.expectEqual(@as(?PacketProtectionKeys, null), client.protectionKeys(.handshake, .write));
+
+        const header = "\xd0\x00\x00\x00\x01\x00";
+        const plaintext = "real zero-rtt payload before server hello";
+        var sealed: [128]u8 = undefined;
+        const protected = try client.sealPacketPayload(.zero_rtt, .write, 1, header, plaintext, &sealed);
+        var opened: [128]u8 = undefined;
+        const recovered = try server.openPacketPayload(.zero_rtt, .read, 1, header, protected, &opened);
+        try testing.expectEqualSlices(u8, plaintext, recovered);
     }
 }
 
@@ -1485,7 +1587,8 @@ test "packet protection round-trips at Handshake and 1-RTT levels" {
     const plaintext = "handshake and 1-rtt payloads use the same AEAD path";
 
     for ([_]EncryptionLevel{ .handshake, .application }) |level| {
-        const keys = (try adapter.protectionKeys(level, .write)).?;
+        var keys = (try adapter.protectionKeys(level, .write)).?;
+        defer keys.deinit();
 
         var sealed: [128]u8 = undefined;
         const protected = try keys.sealPayload(7, header, plaintext, &sealed);
@@ -1510,7 +1613,8 @@ test "protection keys reject a traffic secret of the wrong length" {
 test "header protection matches the RFC 9001 client Initial sample" {
     var dcid: [8]u8 = undefined;
     _ = try std.fmt.hexToBytes(&dcid, "8394c8f03e515708");
-    const secrets = try deriveInitialSecretsV1(&dcid);
+    var secrets = try deriveInitialSecretsV1(&dcid);
+    defer secrets.deinit();
     const sample = hexBytes("d1b1c98dd7689fb8ec11d242b123dc9b");
 
     // Apply: unprotected long header 0xc3 + 4-byte packet number 2 protect to
@@ -1537,7 +1641,8 @@ test "header protection matches the RFC 9001 client Initial sample" {
 
 test "header protection round-trips for short headers" {
     const secret = hexBytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
-    const keys = deriveAes128GcmKeys(secret);
+    var keys = deriveAes128GcmKeys(secret);
+    defer keys.deinit();
     const sample = hexBytes("101112131415161718191a1b1c1d1e1f");
 
     // Short header (high bit clear), 1-byte packet number, key phase bit set.
@@ -1574,17 +1679,23 @@ test "local key update rolls only write keys and outgoing phase" {
 
     try testing.expectEqual(@as(u1, 0), adapter.applicationWriteKeyPhase());
     try testing.expectEqual(@as(u1, 0), adapter.applicationReadKeyPhase());
-    const read_before = (try adapter.protectionKeys(.application, .read)).?;
+    var read_before = (try adapter.protectionKeys(.application, .read)).?;
+    defer read_before.deinit();
 
     try adapter.updateApplicationWriteKeys();
 
     // Only the write side advanced: outgoing phase flipped, read side untouched.
     try testing.expectEqual(@as(u1, 1), adapter.applicationWriteKeyPhase());
     try testing.expectEqual(@as(u1, 0), adapter.applicationReadKeyPhase());
-    const expected_write = deriveAes128GcmKeys(deriveNextGenerationSecret(write_secret));
-    try testing.expectEqualSlices(u8, expected_write.key.slice(), (adapter.protectionKeys(.application, .write) catch unreachable).?.key.slice());
+    var expected_write = deriveAes128GcmKeys(deriveNextGenerationSecret(write_secret));
+    defer expected_write.deinit();
+    var actual_write = (adapter.protectionKeys(.application, .write) catch unreachable).?;
+    defer actual_write.deinit();
+    try testing.expectEqualSlices(u8, expected_write.key.slice(), actual_write.key.slice());
     // Read keys still decrypt the peer's current (old) key phase.
-    try testing.expectEqualSlices(u8, read_before.key.slice(), (adapter.protectionKeys(.application, .read) catch unreachable).?.key.slice());
+    var read_after_write_update = (adapter.protectionKeys(.application, .read) catch unreachable).?;
+    defer read_after_write_update.deinit();
+    try testing.expectEqualSlices(u8, read_before.key.slice(), read_after_write_update.key.slice());
 }
 
 test "peer key update advances only read keys and incoming phase" {
@@ -1595,27 +1706,41 @@ test "peer key update advances only read keys and incoming phase" {
     adapter.installSecret(try Secret.init(.application, .read, &read_secret));
     adapter.installSecret(try Secret.init(.application, .write, &write_secret));
 
-    const write_before = (try adapter.protectionKeys(.application, .write)).?;
+    var write_before = (try adapter.protectionKeys(.application, .write)).?;
+    defer write_before.deinit();
 
     // Trial-decrypt keys for the next peer phase are derived without committing.
-    const next_read = (adapter.nextApplicationReadKeys() catch unreachable).?;
-    const expected_next_read = deriveAes128GcmKeys(deriveNextGenerationSecret(read_secret));
+    var next_read = (adapter.nextApplicationReadKeys() catch unreachable).?;
+    defer next_read.deinit();
+    var expected_next_read = deriveAes128GcmKeys(deriveNextGenerationSecret(read_secret));
+    defer expected_next_read.deinit();
     try testing.expectEqualSlices(u8, expected_next_read.key.slice(), next_read.key.slice());
     // Not yet committed: current read keys and phases are unchanged.
     try testing.expectEqual(@as(u1, 0), adapter.applicationReadKeyPhase());
-    try testing.expectEqualSlices(u8, deriveAes128GcmKeys(read_secret).key.slice(), (adapter.protectionKeys(.application, .read) catch unreachable).?.key.slice());
+    var expected_current_read = deriveAes128GcmKeys(read_secret);
+    defer expected_current_read.deinit();
+    var current_read = (adapter.protectionKeys(.application, .read) catch unreachable).?;
+    defer current_read.deinit();
+    try testing.expectEqualSlices(u8, expected_current_read.key.slice(), current_read.key.slice());
 
     // After the peer packet authenticates, commit the read key update.
     try adapter.commitApplicationReadKeyUpdate();
     try testing.expectEqual(@as(u1, 1), adapter.applicationReadKeyPhase());
     try testing.expectEqual(@as(u1, 0), adapter.applicationWriteKeyPhase());
-    try testing.expectEqualSlices(u8, expected_next_read.key.slice(), (adapter.protectionKeys(.application, .read) catch unreachable).?.key.slice());
+    var committed_read = (adapter.protectionKeys(.application, .read) catch unreachable).?;
+    defer committed_read.deinit();
+    try testing.expectEqualSlices(u8, expected_next_read.key.slice(), committed_read.key.slice());
     // Write keys and outgoing phase were not disturbed.
-    try testing.expectEqualSlices(u8, write_before.key.slice(), (adapter.protectionKeys(.application, .write) catch unreachable).?.key.slice());
+    var write_after_read_update = (adapter.protectionKeys(.application, .write) catch unreachable).?;
+    defer write_after_read_update.deinit();
+    try testing.expectEqualSlices(u8, write_before.key.slice(), write_after_read_update.key.slice());
 
     // Read updates chain from the now-current read secret.
-    const expected_second = deriveAes128GcmKeys(deriveNextGenerationSecret(deriveNextGenerationSecret(read_secret)));
-    try testing.expectEqualSlices(u8, expected_second.key.slice(), (adapter.nextApplicationReadKeys() catch unreachable).?.key.slice());
+    var expected_second = deriveAes128GcmKeys(deriveNextGenerationSecret(deriveNextGenerationSecret(read_secret)));
+    defer expected_second.deinit();
+    var second_trial = (adapter.nextApplicationReadKeys() catch unreachable).?;
+    defer second_trial.deinit();
+    try testing.expectEqualSlices(u8, expected_second.key.slice(), second_trial.key.slice());
 }
 
 test "key update helpers require the corresponding application secret" {
@@ -1627,7 +1752,7 @@ test "key update helpers require the corresponding application secret" {
 
 test "adapter guards 0-RTT keys behind explicit config" {
     var adapter = QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
-    try adapter.installNegotiatedParameters(.{ .cipher_suite = @intFromEnum(tls_algorithms.CipherSuite.tls_aes_128_gcm_sha256), .transcript_hash = .sha256 });
+    try adapter.installEarlyDataParameters(.{ .cipher_suite = @intFromEnum(tls_algorithms.CipherSuite.tls_aes_128_gcm_sha256), .transcript_hash = .sha256 });
     const secret = hexBytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
     adapter.installSecret(try Secret.init(.zero_rtt, .write, &secret));
 
@@ -1635,7 +1760,7 @@ test "adapter guards 0-RTT keys behind explicit config" {
     try testing.expectEqual(@as(?PacketProtectionKeys, null), adapter.protectionKeys(.zero_rtt, .write));
 
     adapter.setZeroRttEnabled(true);
-    try testing.expect((try adapter.protectionKeys(.zero_rtt, .write)) != null);
+    try testing.expect(try adapter.hasProtectionKeys(.zero_rtt, .write));
 }
 
 test "peer transport parameters require handshake authentication" {

@@ -69,6 +69,9 @@ pub fn ContractWithOptions(
             /// canonical way a record or QUIC consumer learns the suite,
             /// never inferred from secret length.
             negotiated_parameters: events.NegotiatedParameters,
+            /// The resumed ticket/session cipher suite and transcript hash
+            /// used by 0-RTT, emitted before any `.zero_rtt` traffic secret.
+            early_data_parameters: events.NegotiatedParameters,
             /// A traffic secret to install for `epoch`/`direction`.
             traffic_secret: struct { epoch: Epoch, direction: events.SecretDirection, data: []const u8 },
             /// Transport-owned peer parameters carried by the TLS handshake.
@@ -227,6 +230,14 @@ pub fn ContractWithOptions(
             pub fn emitNegotiatedParameters(self: *EventSink, params: events.NegotiatedParameters) ErrorSet!void {
                 try self.reserve(0);
                 self.pushUnchecked(.{ .negotiated_parameters = params });
+            }
+
+            /// Emit the resumed ticket/session cipher-suite metadata used by
+            /// 0-RTT. Callers must emit this before the `.zero_rtt`
+            /// `emitSecret` it describes.
+            pub fn emitEarlyDataParameters(self: *EventSink, params: events.NegotiatedParameters) ErrorSet!void {
+                try self.reserve(0);
+                self.pushUnchecked(.{ .early_data_parameters = params });
             }
 
             pub fn emitSecret(self: *EventSink, epoch: Epoch, direction: events.SecretDirection, data: []const u8) ErrorSet!void {

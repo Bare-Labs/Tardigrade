@@ -339,11 +339,13 @@ fn quicHeaderProtectionMaskImpl(
             var block: [provider.quic_header_protection_sample_len]u8 = undefined;
             switch (hp) {
                 .aes_128 => {
-                    const aes = Aes128.initEnc(k[0..16].*);
+                    var aes = Aes128.initEnc(k[0..16].*);
+                    defer crypto.secureZero(u8, std.mem.asBytes(&aes));
                     aes.encrypt(&block, &s);
                 },
                 .aes_256 => {
-                    const aes = Aes256.initEnc(k[0..32].*);
+                    var aes = Aes256.initEnc(k[0..32].*);
+                    defer crypto.secureZero(u8, std.mem.asBytes(&aes));
                     aes.encrypt(&block, &s);
                 },
                 .chacha20 => unreachable,

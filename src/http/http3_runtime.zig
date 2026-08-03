@@ -2839,9 +2839,9 @@ test "issueSessionTicket (#523): the production issuer advertises QUIC 0-RTT cap
 
 /// #523 test-only: seal a 0-RTT wire packet exactly the way a real client
 /// sender would, mirroring `quic.connection`'s private `sealTestZeroRttPacket`
-/// (not reachable from this file). Key derivation depends only on the
-/// secret bytes, so a receiver with the same bytes installed at
-/// `.zero_rtt read` genuinely decrypts this.
+/// (not reachable from this file). The helper uses the resumed ticket's
+/// early-data profile, so a receiver with the same profile and bytes installed
+/// at `.zero_rtt read` genuinely decrypts this.
 fn sealZeroRttPacketForTest(
     dcid: []const u8,
     scid: []const u8,
@@ -2851,7 +2851,7 @@ fn sealZeroRttPacketForTest(
     out: []u8,
 ) []u8 {
     var sender = quic.tls_adapter.QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
-    sender.installNegotiatedParameters(.{
+    sender.installEarlyDataParameters(.{
         .cipher_suite = @intFromEnum(tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256),
         .transcript_hash = .sha256,
     }) catch unreachable;
@@ -2878,7 +2878,8 @@ fn sealZeroRttPacketForTest(
     @memcpy(out[pn_offset..][0..pn_len], pn_bytes[4 - @as(usize, pn_len) ..][0..pn_len]);
 
     const header = out[0 .. pn_offset + pn_len];
-    const keys = (sender.protectionKeys(.zero_rtt, .write) catch unreachable).?;
+    var keys = (sender.protectionKeys(.zero_rtt, .write) catch unreachable).?;
+    defer keys.deinit();
     _ = sender.sealPacketPayload(.zero_rtt, .write, pn, header, padded[0..padded_len], out[pn_offset + pn_len ..]) catch unreachable;
 
     var sample: [quic.tls_adapter.header_protection_sample_len]u8 = undefined;
@@ -3267,7 +3268,7 @@ test "http3 (#523): a replay-safe early request reaches the local handler exactl
         }
     }
     try testing.expect(!entry2.conn.isEstablished());
-    try testing.expect((entry2.conn.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) != null);
+    try testing.expect(entry2.conn.adapter.hasProtectionKeys(.zero_rtt, .read) catch unreachable);
 
     const real_secret = entry2.conn.adapter.secret(.zero_rtt, .read).?.slice()[0..quic.tls_adapter.traffic_secret_len].*;
 
@@ -3785,7 +3786,7 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
             try entry2.conn.ingestOnPath(t.bytes, server_path, no_challenge, 2_000_000);
         }
     }
-    try testing.expect((entry2.conn.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) == null);
+    try testing.expect(!(entry2.conn.adapter.hasProtectionKeys(.zero_rtt, .read) catch unreachable));
     try testing.expectEqual(@as(usize, 1), decision_capture.count);
     try testing.expectEqual(scenario.expect_decision, decision_capture.last.?);
 

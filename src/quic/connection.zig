@@ -997,13 +997,14 @@ pub const Connection = struct {
             const initial_peer = quic_cid.ConnectionId.init(conn.peer_cid.slice()) catch null;
             if (initial_peer) |cid_value| conn.peer_cids.registerInitial(cid_value) catch {};
         }
-        _ = try conn.adapter.installInitialSecrets(
+        var initial_secrets = try conn.adapter.installInitialSecrets(
             switch (options.role) {
                 .client => .client,
                 .server => .server,
             },
             options.initial_secret_dcid,
         );
+        initial_secrets.deinit();
         conn.handshake.manual_key_discard = true;
         conn.handshake.allow_unverified_certificate = options.allow_unverified_certificate;
         if (options.role == .client) {
@@ -1302,6 +1303,7 @@ pub const Connection = struct {
             self.emitZeroRttOutcome(level, .keys_unavailable, bytes.len);
             return;
         };
+        defer keys.deinit();
         var sample: [sample_len]u8 = undefined;
         @memcpy(&sample, work[parsed.pn_offset + 4 ..][0..sample_len]);
         var sampled_pn: [4]u8 = work[parsed.pn_offset..][0..4].*;
@@ -1325,6 +1327,7 @@ pub const Connection = struct {
         if (level == .application) {
             const wire_phase: u1 = @intCast((work[0] >> 2) & 1);
             if (wire_phase != self.adapter.applicationReadKeyPhase()) {
+                keys.deinit();
                 keys = (self.adapter.nextApplicationReadKeys() catch unreachable) orelse {
                     self.dropPacket(.undecryptable, bytes.len);
                     return;
@@ -2006,7 +2009,8 @@ pub const Connection = struct {
         // New DCID -> new Initial keys (RFC 9001 §5.2), and the whole Initial
         // flight goes again with the token attached.
         self.peer_cid = self.retry_scid.?;
-        _ = self.adapter.installInitialSecrets(.client, self.peer_cid.slice()) catch return;
+        var retry_initial = self.adapter.installInitialSecrets(.client, self.peer_cid.slice()) catch return;
+        retry_initial.deinit();
         _ = self.recovery.onKeysDiscarded(.initial);
         var index: usize = 0;
         while (index < self.sent_records.items.len) {
@@ -2321,8 +2325,8 @@ pub const Connection = struct {
     /// recovery accounting (RFC 9002 §6.4).
     fn discardKeys(self: *Connection, space: PacketNumberSpace) void {
         const level = levelForSpace(space);
-        if ((self.adapter.protectionKeys(level, .write) catch unreachable) == null and
-            (self.adapter.protectionKeys(level, .read) catch unreachable) == null) return;
+        if (!(self.adapter.hasProtectionKeys(level, .write) catch unreachable) and
+            !(self.adapter.hasProtectionKeys(level, .read) catch unreachable)) return;
         self.adapter.discardSecrets(level);
         _ = self.recovery.onKeysDiscarded(space);
         const tx: ?*CryptoTx = switch (space) {
@@ -2489,7 +2493,7 @@ pub const Connection = struct {
         if (!fired and !any_in_flight and !self.handshake_confirmed and self.role == .client) {
             if (now_us >= self.last_activity_us + self.recovery.rtt.ptoDuration(.handshake) * backoff) {
                 // Anti-deadlock probe: resend the lowest-level flight we can.
-                if ((self.adapter.protectionKeys(.handshake, .write) catch unreachable) != null) {
+                if (self.adapter.hasProtectionKeys(.handshake, .write) catch unreachable) {
                     self.firePto(.handshake);
                 } else {
                     self.firePto(.initial);
@@ -2751,13 +2755,13 @@ pub const Connection = struct {
 
         const levels = [_]EncryptionLevel{ .initial, .handshake, .application };
         for (levels, 0..) |level, i| {
-            if ((self.adapter.protectionKeys(level, .write) catch unreachable) == null) continue;
+            if (!(self.adapter.hasProtectionKeys(level, .write) catch unreachable)) continue;
             const space = spaceForLevel(level);
             // Is this the last level that could contribute? Needed for the
             // Initial padding rule.
             var last_level = true;
             for (levels[i + 1 ..]) |later| {
-                if ((self.adapter.protectionKeys(later, .write) catch unreachable) != null) last_level = false;
+                if (self.adapter.hasProtectionKeys(later, .write) catch unreachable) last_level = false;
             }
             const written = self.buildPacket(level, space, out[datagram_len..budget], now_us, .{
                 .datagram_has_initial = has_initial or level == .initial,
@@ -2832,7 +2836,8 @@ pub const Connection = struct {
     /// content — that stays exclusively on the active path until promotion.
     fn buildCandidatePacket(self: *Connection, path: quic_path.PathKey, out: []u8, now_us: u64) ?Transmit {
         if (out.len < max_datagram_size) return null;
-        const keys = (self.adapter.protectionKeys(.application, .write) catch unreachable) orelse return null;
+        var keys = (self.adapter.protectionKeys(.application, .write) catch unreachable) orelse return null;
+        defer keys.deinit();
 
         const remaining = self.paths.remainingOnPath(path);
         if (remaining == 0) return null;
@@ -3139,7 +3144,8 @@ pub const Connection = struct {
         @memcpy(out[pn_offset..][0..pn_len], pn_bytes[4 - @as(usize, pn_len) ..][0..pn_len]);
 
         const header = out[0 .. pn_offset + pn_len];
-        const keys = (self.adapter.protectionKeys(level, .write) catch unreachable) orelse return null;
+        var keys = (self.adapter.protectionKeys(level, .write) catch unreachable) orelse return null;
+        defer keys.deinit();
         const sealed = self.adapter.sealPacketPayload(level, .write, pn, header, plain[0..plain_len], out[pn_offset + pn_len ..]) catch return null;
 
         var sample: [sample_len]u8 = undefined;
@@ -3434,11 +3440,11 @@ pub const Connection = struct {
         // application closes at lower levels are converted to transport
         // closes to avoid leaking application state pre-handshake).
         var level: EncryptionLevel = .application;
-        if ((self.adapter.protectionKeys(.application, .write) catch unreachable) == null) {
+        if (!(self.adapter.hasProtectionKeys(.application, .write) catch unreachable)) {
             level = .handshake;
-            if ((self.adapter.protectionKeys(.handshake, .write) catch unreachable) == null) level = .initial;
+            if (!(self.adapter.hasProtectionKeys(.handshake, .write) catch unreachable)) level = .initial;
         }
-        if ((self.adapter.protectionKeys(level, .write) catch unreachable) == null) return null;
+        if (!(self.adapter.hasProtectionKeys(level, .write) catch unreachable)) return null;
 
         const space = spaceForLevel(level);
         const space_idx = spaceIndex(space);
@@ -3483,7 +3489,8 @@ pub const Connection = struct {
         std.mem.writeInt(u32, &pn_bytes, truncated, .big);
         @memcpy(out[pn_offset..][0..pn_len], pn_bytes[4 - @as(usize, pn_len) ..][0..pn_len]);
         const header = out[0 .. pn_offset + pn_len];
-        const keys = (self.adapter.protectionKeys(level, .write) catch unreachable) orelse return null;
+        var keys = (self.adapter.protectionKeys(level, .write) catch unreachable) orelse return null;
+        defer keys.deinit();
         const sealed = self.adapter.sealPacketPayload(level, .write, pn, header, plain[0..plain_len], out[pn_offset + pn_len ..]) catch return null;
         var sample: [sample_len]u8 = undefined;
         @memcpy(&sample, out[pn_offset + 4 ..][0..sample_len]);
@@ -4098,8 +4105,8 @@ test "driver: client and server complete the handshake over protected packets" {
 
     // Initial and Handshake keys discarded on both sides after confirmation.
     inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |level| {
-        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.client.adapter.protectionKeys(level, .write) catch unreachable);
-        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.server.adapter.protectionKeys(level, .write) catch unreachable);
+        try testing.expect(!(pair.client.adapter.hasProtectionKeys(level, .write) catch unreachable));
+        try testing.expect(!(pair.server.adapter.hasProtectionKeys(level, .write) catch unreachable));
     }
 }
 
@@ -4122,8 +4129,10 @@ test "driver: negotiated TLS suites protect QUIC packets end to end" {
         try testing.expectEqual(suite, pair.client.adapter.negotiatedCipherSuite().?);
         try testing.expectEqual(suite, pair.server.adapter.negotiatedCipherSuite().?);
 
-        const client_write = (try pair.client.adapter.protectionKeys(.application, .write)).?;
-        const server_read = (try pair.server.adapter.protectionKeys(.application, .read)).?;
+        var client_write = (try pair.client.adapter.protectionKeys(.application, .write)).?;
+        defer client_write.deinit();
+        var server_read = (try pair.server.adapter.protectionKeys(.application, .read)).?;
+        defer server_read.deinit();
         const expected_profile = tls_adapter.PacketProtectionProfile.forCipherSuite(suite);
         try testing.expectEqual(expected_profile.aead, client_write.profile.aead);
         try testing.expectEqual(expected_profile.header_protection, client_write.profile.header_protection);
@@ -4264,8 +4273,8 @@ test "driver: HelloRetryRequest completes through real QUIC Initial CRYPTO data"
     try testing.expect(server_capture.discardedInitialKeys());
 
     inline for (.{ EncryptionLevel.initial, EncryptionLevel.handshake }) |level| {
-        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.client.adapter.protectionKeys(level, .write) catch unreachable);
-        try testing.expectEqual(@as(?tls_adapter.PacketProtectionKeys, null), pair.server.adapter.protectionKeys(level, .write) catch unreachable);
+        try testing.expect(!(pair.client.adapter.hasProtectionKeys(level, .write) catch unreachable));
+        try testing.expect(!(pair.server.adapter.hasProtectionKeys(level, .write) catch unreachable));
     }
 }
 
@@ -4634,27 +4643,24 @@ test "driver: explicit zero-rtt stream provenance mark stays sticky after one-rt
 
 /// Test-only helper (#523): seal a 0-RTT wire packet exactly the way a real
 /// client sender would, via an independent throwaway adapter installed with
-/// `secret` at the `.zero_rtt write` slot. Key derivation
-/// (`deriveAes128GcmKeys`) depends only on the secret bytes, not on which
-/// side calls it "read" vs "write", so a receiver with the same bytes
-/// installed at `.zero_rtt read` genuinely decrypts this — it exercises the
-/// real AEAD-seal/header-protection codepath `buildPacket` uses for every
-/// other level, not a synthetic shortcut.
+/// `secret` and the resumed ticket's `cipher_suite` at the `.zero_rtt write`
+/// slot. A receiver with the same resumed-suite metadata and bytes installed
+/// at `.zero_rtt read` genuinely decrypts this — it exercises the real
+/// AEAD-seal/header-protection codepath `buildPacket` uses for every other
+/// level, not a synthetic shortcut.
 fn sealTestZeroRttPacket(
+    cipher_suite: tls_core.algorithms.CipherSuite,
     dcid: []const u8,
     scid: []const u8,
-    secret: [tls_adapter.traffic_secret_len]u8,
+    secret: []const u8,
     pn: u64,
     plaintext: []const u8,
     out: []u8,
 ) []u8 {
     var sender = tls_adapter.QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
-    sender.installNegotiatedParameters(.{
-        .cipher_suite = @intFromEnum(tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256),
-        .transcript_hash = .sha256,
-    }) catch unreachable;
+    sender.installEarlyDataParameters(paramsForSuite(cipher_suite)) catch unreachable;
     sender.setZeroRttEnabled(true);
-    sender.installSecret(tls_adapter.Secret.init(.zero_rtt, .write, &secret) catch unreachable);
+    sender.installSecret(tls_adapter.Secret.init(.zero_rtt, .write, secret) catch unreachable);
 
     const pn_len: u3 = packet.packetNumberLength(pn, null);
     const written = packet.writeLongHeader(.zero_rtt, packet.quic_v1, dcid, scid, "", pn_len, out) catch unreachable;
@@ -4680,7 +4686,8 @@ fn sealTestZeroRttPacket(
     @memcpy(out[pn_offset..][0..pn_len], pn_bytes[4 - @as(usize, pn_len) ..][0..pn_len]);
 
     const header = out[0 .. pn_offset + pn_len];
-    const keys = (sender.protectionKeys(.zero_rtt, .write) catch unreachable).?;
+    var keys = (sender.protectionKeys(.zero_rtt, .write) catch unreachable).?;
+    defer keys.deinit();
     _ = sender.sealPacketPayload(.zero_rtt, .write, pn, header, padded[0..padded_len], out[pn_offset + pn_len ..]) catch unreachable;
 
     var sample: [sample_len]u8 = undefined;
@@ -4690,11 +4697,22 @@ fn sealTestZeroRttPacket(
     return out[0 .. pn_offset + pn_len + padded_len + aead_tag_len];
 }
 
+fn paramsForSuite(cipher_suite: tls_core.algorithms.CipherSuite) tls_core.events.NegotiatedParameters {
+    return .{
+        .cipher_suite = @intFromEnum(cipher_suite),
+        .transcript_hash = switch (tls_core.algorithms.transcriptHash(cipher_suite)) {
+            .sha256 => .sha256,
+            .sha384 => .sha384,
+        },
+    };
+}
+
 fn installTestAes128Negotiated(adapter: *tls_adapter.QuicTlsAdapter) void {
-    adapter.installNegotiatedParameters(.{
-        .cipher_suite = @intFromEnum(tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256),
-        .transcript_hash = .sha256,
-    }) catch unreachable;
+    adapter.installNegotiatedParameters(paramsForSuite(.tls_aes_128_gcm_sha256)) catch unreachable;
+}
+
+fn installTestAes128EarlyData(adapter: *tls_adapter.QuicTlsAdapter) void {
+    adapter.installEarlyDataParameters(paramsForSuite(.tls_aes_128_gcm_sha256)) catch unreachable;
 }
 
 test "driver: accepted 0-RTT packet with installed read keys decrypts and delivers stream data" {
@@ -4703,7 +4721,7 @@ test "driver: accepted 0-RTT packet with installed read keys decrypts and delive
     defer pair.deinit(allocator);
 
     const secret = [_]u8{0x42} ** tls_adapter.traffic_secret_len;
-    installTestAes128Negotiated(&pair.server.adapter);
+    installTestAes128EarlyData(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
 
@@ -4711,7 +4729,7 @@ test "driver: accepted 0-RTT packet with installed read keys decrypts and delive
     const frame_len = try frame.encodeStream(0, 0, "hello 0-rtt", true, &frame_buf);
 
     var wire: [256]u8 = undefined;
-    const datagram = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 0, frame_buf[0..frame_len], &wire);
+    const datagram = sealTestZeroRttPacket(.tls_aes_128_gcm_sha256, &TestPair.odcid, &TestPair.client_cid, &secret, 0, frame_buf[0..frame_len], &wire);
 
     const before_received = pair.server.metrics.packets_received;
     try pair.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, pair.now_us);
@@ -4739,7 +4757,7 @@ test "driver: 0-RTT packet without an installed read key is dropped, not deliver
     var frame_buf: [32]u8 = undefined;
     const frame_len = try frame.encodeStream(0, 0, "should not land", true, &frame_buf);
     var wire: [256]u8 = undefined;
-    const datagram = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 0, frame_buf[0..frame_len], &wire);
+    const datagram = sealTestZeroRttPacket(.tls_aes_128_gcm_sha256, &TestPair.odcid, &TestPair.client_cid, &secret, 0, frame_buf[0..frame_len], &wire);
 
     const before_received = pair.server.metrics.packets_received;
     const before_dropped = pair.server.metrics.packets_dropped;
@@ -4763,14 +4781,14 @@ test "driver: tampered 0-RTT packet is dropped and not delivered" {
     defer pair.deinit(allocator);
 
     const secret = [_]u8{0x99} ** tls_adapter.traffic_secret_len;
-    installTestAes128Negotiated(&pair.server.adapter);
+    installTestAes128EarlyData(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
 
     var frame_buf: [32]u8 = undefined;
     const frame_len = try frame.encodeStream(0, 0, "tampered", true, &frame_buf);
     var wire: [256]u8 = undefined;
-    const datagram = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 0, frame_buf[0..frame_len], &wire);
+    const datagram = sealTestZeroRttPacket(.tls_aes_128_gcm_sha256, &TestPair.odcid, &TestPair.client_cid, &secret, 0, frame_buf[0..frame_len], &wire);
     // Flip a bit well past the header so header protection removal still
     // succeeds but AEAD authentication fails.
     datagram[datagram.len - 1] ^= 0x01;
@@ -4791,19 +4809,19 @@ test "driver: 0-RTT stream provenance survives reassembly, duplicate delivery, a
     defer pair.deinit(allocator);
 
     const secret = [_]u8{0x5a} ** tls_adapter.traffic_secret_len;
-    installTestAes128Negotiated(&pair.server.adapter);
+    installTestAes128EarlyData(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
 
     var frame_buf_1: [32]u8 = undefined;
     const frame_len_1 = try frame.encodeStream(0, 0, "hel", false, &frame_buf_1);
     var wire_1: [256]u8 = undefined;
-    const datagram_1 = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 0, frame_buf_1[0..frame_len_1], &wire_1);
+    const datagram_1 = sealTestZeroRttPacket(.tls_aes_128_gcm_sha256, &TestPair.odcid, &TestPair.client_cid, &secret, 0, frame_buf_1[0..frame_len_1], &wire_1);
 
     var frame_buf_2: [32]u8 = undefined;
     const frame_len_2 = try frame.encodeStream(0, 3, "lo", false, &frame_buf_2);
     var wire_2: [256]u8 = undefined;
-    const datagram_2 = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 1, frame_buf_2[0..frame_len_2], &wire_2);
+    const datagram_2 = sealTestZeroRttPacket(.tls_aes_128_gcm_sha256, &TestPair.odcid, &TestPair.client_cid, &secret, 1, frame_buf_2[0..frame_len_2], &wire_2);
 
     // Reassembly across two 0-RTT packets.
     try pair.server.ingestOnPath(datagram_1, TestPair.server_path, TestPair.test_challenge_entropy, pair.now_us);
@@ -4845,7 +4863,7 @@ test "driver: authenticated duplicate 0-RTT packet does not re-apply a state-mut
     defer pair.deinit(allocator);
 
     const secret = [_]u8{0x63} ** tls_adapter.traffic_secret_len;
-    installTestAes128Negotiated(&pair.server.adapter);
+    installTestAes128EarlyData(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
 
@@ -4853,7 +4871,7 @@ test "driver: authenticated duplicate 0-RTT packet does not re-apply a state-mut
     const challenge_data = [_]u8{0xab} ** frame.path_data_len;
     const frame_len = try frame.encodePathChallenge(challenge_data, &frame_buf);
     var wire: [256]u8 = undefined;
-    const datagram = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 0, frame_buf[0..frame_len], &wire);
+    const datagram = sealTestZeroRttPacket(.tls_aes_128_gcm_sha256, &TestPair.odcid, &TestPair.client_cid, &secret, 0, frame_buf[0..frame_len], &wire);
 
     try pair.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, pair.now_us);
     try testing.expectEqual(@as(usize, 1), pair.server.pending_path_responses.items.len);
@@ -4869,14 +4887,14 @@ test "driver: the idle timer does not refresh on a duplicate or an undecryptable
     defer pair.deinit(allocator);
 
     const secret = [_]u8{0x29} ** tls_adapter.traffic_secret_len;
-    installTestAes128Negotiated(&pair.server.adapter);
+    installTestAes128EarlyData(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
 
     var frame_buf: [16]u8 = undefined;
     const frame_len = try frame.encodeStream(0, 0, "hi", true, &frame_buf);
     var wire: [256]u8 = undefined;
-    const datagram = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 0, frame_buf[0..frame_len], &wire);
+    const datagram = sealTestZeroRttPacket(.tls_aes_128_gcm_sha256, &TestPair.odcid, &TestPair.client_cid, &secret, 0, frame_buf[0..frame_len], &wire);
 
     try pair.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, pair.now_us);
     const deadline_after_fresh = pair.server.idle_deadline_us;
@@ -4900,7 +4918,7 @@ test "driver: the idle timer does not refresh on a duplicate or an undecryptable
     var frame_buf_2: [16]u8 = undefined;
     const frame_len_2 = try frame.encodeStream(4, 0, "bye", true, &frame_buf_2);
     var wire_2: [256]u8 = undefined;
-    const datagram_2 = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 1, frame_buf_2[0..frame_len_2], &wire_2);
+    const datagram_2 = sealTestZeroRttPacket(.tls_aes_128_gcm_sha256, &TestPair.odcid, &TestPair.client_cid, &secret, 1, frame_buf_2[0..frame_len_2], &wire_2);
     try pair.server.ingestOnPath(datagram_2, TestPair.server_path, TestPair.test_challenge_entropy, later);
     try testing.expect(pair.server.idle_deadline_us.? > deadline_after_fresh.?);
 }
@@ -4946,14 +4964,14 @@ test "driver: replayed duplicate packet from a different source address does not
     defer pair.deinit(allocator);
 
     const secret = [_]u8{0x37} ** tls_adapter.traffic_secret_len;
-    installTestAes128Negotiated(&pair.server.adapter);
+    installTestAes128EarlyData(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
 
     var frame_buf: [16]u8 = undefined;
     const frame_len = try frame.encodeStream(0, 0, "hi", true, &frame_buf);
     var wire: [256]u8 = undefined;
-    const datagram = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, secret, 0, frame_buf[0..frame_len], &wire);
+    const datagram = sealTestZeroRttPacket(.tls_aes_128_gcm_sha256, &TestPair.odcid, &TestPair.client_cid, &secret, 0, frame_buf[0..frame_len], &wire);
 
     // First delivery: authenticates and is processed on the server's actual
     // (handshake) active path, as usual.
@@ -5048,10 +5066,10 @@ test "driver: server retires its 0-RTT read secret once it authenticates a 1-RTT
     try pair.pump();
 
     const secret = [_]u8{0x11} ** tls_adapter.traffic_secret_len;
-    installTestAes128Negotiated(&pair.server.adapter);
+    installTestAes128EarlyData(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
-    try testing.expect((pair.server.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) != null);
+    try testing.expect(pair.server.adapter.hasProtectionKeys(.zero_rtt, .read) catch unreachable);
 
     // Force a genuine ack-eliciting `.application` exchange the server must
     // authenticate — a delayed/unforced ACK alone might never actually
@@ -5062,7 +5080,7 @@ test "driver: server retires its 0-RTT read secret once it authenticates a 1-RTT
 
     // The server has now authenticated a real 1-RTT packet; its 0-RTT read
     // secret must be retired.
-    try testing.expect((pair.server.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) == null);
+    try testing.expect(!(pair.server.adapter.hasProtectionKeys(.zero_rtt, .read) catch unreachable));
 
     // Retirement wipes only the `.zero_rtt` secret-store slot — the
     // application packet-number/recovery state 0-RTT and 1-RTT share is
@@ -5576,7 +5594,7 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
     // ...and that acceptance already installed a usable QUIC 0-RTT read key
     // through the ordinary secret-event pipeline (#523 requirement 1) — with
     // `zero_rtt_enabled` honored via `Connection.init`'s `setZeroRttEnabled`.
-    try testing.expect((resumed.server.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) != null);
+    try testing.expect(resumed.server.adapter.hasProtectionKeys(.zero_rtt, .read) catch unreachable);
 
     // That real, TLS-derived key genuinely decrypts a 0-RTT wire packet
     // through the ordinary driver path *during the early-data window*, with
@@ -5587,7 +5605,7 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
     var frame_buf: [32]u8 = undefined;
     const frame_len = try frame.encodeStream(4, 0, "real early data", true, &frame_buf);
     var wire: [256]u8 = undefined;
-    const datagram = sealTestZeroRttPacket(&TestPair.odcid, &TestPair.client_cid, real_secret, 0, frame_buf[0..frame_len], &wire);
+    const datagram = sealTestZeroRttPacket(.tls_aes_128_gcm_sha256, &TestPair.odcid, &TestPair.client_cid, &real_secret, 0, frame_buf[0..frame_len], &wire);
     try resumed.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, resumed.now_us);
 
     try testing.expect(resumed.server.streamTransportEarly(4));
@@ -5980,7 +5998,7 @@ fn expectRejectedEarlyDataFallsBackOnSameConnection(scenario: RejectedEarlyDataF
     try testing.expect(resumed.server.isEstablished());
     try testing.expect(resumed.client_backend.engine.core.psk_authenticated);
     try testing.expect(resumed.server_backend.engine.core.psk_authenticated);
-    try testing.expect((resumed.server.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) == null);
+    try testing.expect(!(resumed.server.adapter.hasProtectionKeys(.zero_rtt, .read) catch unreachable));
     try testing.expectEqual(@as(usize, 1), event_capture.count);
     try testing.expectEqual(scenario.expect_decision, event_capture.decision.?);
 
