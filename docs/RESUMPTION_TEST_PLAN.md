@@ -47,7 +47,7 @@ close.
 
 ## Intentional limitations / unreachable external cases
 
-- **Cipher-suite resumption mismatch.** The appliance native TLS profile
+- **Cipher-suite resumption mismatch.** The appliance native TCP TLS profile
   advertises exactly `TLS_AES_128_GCM_SHA256`. An external reconnect either
   offers that suite (nothing to mismatch) or excludes it (ordinary cipher
   negotiation fails before `session.evaluateCompatibility` is ever reached).
@@ -463,8 +463,8 @@ passed before it.
   fingerprint next to the flipped byte never appears in the server's log
   or the client's own stdout/stderr.
 - **`interop.openssl.cipher_mismatch` deliberately not shipped.** #521
-  closes this row as externally unreachable under the production native TLS
-  profile today. The listener advertises only `TLS_AES_128_GCM_SHA256` and
+  closes this row as externally unreachable under the production native TCP
+  TLS profile today. The listener advertises only `TLS_AES_128_GCM_SHA256` and
   negotiates the connection cipher before PSK/session compatibility is
   evaluated. If an OpenSSL reconnect still offers that suite, there is no
   resumption-specific cipher mismatch; if it excludes that suite, ordinary

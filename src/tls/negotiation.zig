@@ -699,7 +699,9 @@ test "negotiation reports no-overlap failures without logging offer contents" {
     try offers.appendSignatureScheme(.ed25519);
     try offers.appendAlpn(algorithms.alpn.h3);
 
-    try testing.expectError(error.NoMutualCipherSuite, negotiateServer(policy_mod.Policy.quicDefault(), &offers));
+    var policy = policy_mod.Policy.quicDefault();
+    policy.cipher_suites = &.{};
+    try testing.expectError(error.NoMutualCipherSuite, negotiateServer(policy, &offers));
 }
 
 test "client validates server selection against configured policy" {

@@ -2938,10 +2938,10 @@ test "record and extension profiles preserve independent traffic-secret goldens"
         secretGolden("6626393f198c2779e2244c3b7e2dac51b44b1b1011055af9e7d93be1774ccb76"),
     };
     const extension_goldens = [_][tls_backend.hash_len]u8{
-        secretGolden("7143c3fd6a93747e1acc930821888b56221c34a1e0b4bf76c69aa1fe8dc0f2da"),
-        secretGolden("5be8814fea2326293020cf2db66b3f458221ba4f98c34df16b4d8cfb38e28f16"),
-        secretGolden("f6133d49e7c110d73945dedf7ab95aee8db6d0433660a73a15f8e0516f010b5b"),
-        secretGolden("262f66c237c5ff9cf867b242fa37ba707b2dcd06d0188ce3b3c60a069f05588b"),
+        secretGolden("77072190f185201fe873979e7041bad67727e1194d2baf8adfdd4ebf99ab10c1"),
+        secretGolden("a9e4c2a45510720ac70302594e138dd07d599b7ca473db7e5b8d5fed9f47e022"),
+        secretGolden("18bee27e9bf23a392bfba4ac122528f47aeabfeb924ca615ce3c2d01ce608e12"),
+        secretGolden("61fe811bb5d5a02a8fa1c9b27dbc68185e66b3ca3f697a70d0644d482966ac55"),
     };
     const record_actual = [_][tls_backend.hash_len]u8{
         record.observed.handshake_write_secret[0].?.bytes[0..tls_backend.hash_len].*,

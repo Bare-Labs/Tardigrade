@@ -2851,6 +2851,10 @@ fn sealZeroRttPacketForTest(
     out: []u8,
 ) []u8 {
     var sender = quic.tls_adapter.QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
+    sender.installNegotiatedParameters(.{
+        .cipher_suite = @intFromEnum(tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256),
+        .transcript_hash = .sha256,
+    }) catch unreachable;
     sender.setZeroRttEnabled(true);
     sender.installSecret(quic.tls_adapter.Secret.init(.zero_rtt, .write, &secret) catch unreachable);
 

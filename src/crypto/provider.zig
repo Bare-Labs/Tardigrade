@@ -188,10 +188,13 @@ pub const Aead = enum {
 /// deliberately narrower than a generic block-cipher API.
 pub const QuicHeaderProtection = enum {
     aes_128,
+    aes_256,
+    chacha20,
 
     pub fn keyLength(self: QuicHeaderProtection) usize {
         return switch (self) {
             .aes_128 => 16,
+            .aes_256, .chacha20 => 32,
         };
     }
 
@@ -589,8 +592,12 @@ test "algorithm metadata is self-consistent" {
         try testing.expectEqual(aead_tag_len, aead.tagLength());
     }
     try testing.expectEqual(@as(usize, 16), QuicHeaderProtection.aes_128.keyLength());
-    try testing.expectEqual(quic_header_protection_sample_len, QuicHeaderProtection.aes_128.sampleLength());
-    try testing.expectEqual(quic_header_protection_mask_len, QuicHeaderProtection.aes_128.maskLength());
+    try testing.expectEqual(@as(usize, 32), QuicHeaderProtection.aes_256.keyLength());
+    try testing.expectEqual(@as(usize, 32), QuicHeaderProtection.chacha20.keyLength());
+    inline for (.{ QuicHeaderProtection.aes_128, QuicHeaderProtection.aes_256, QuicHeaderProtection.chacha20 }) |hp| {
+        try testing.expectEqual(quic_header_protection_sample_len, hp.sampleLength());
+        try testing.expectEqual(quic_header_protection_mask_len, hp.maskLength());
+    }
 
     try testing.expect(Group.secp256r1.publicKeyLength() <= max_public_key_len);
     try testing.expect(Group.x25519.sharedSecretLength() <= max_shared_secret_len);

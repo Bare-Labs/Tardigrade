@@ -362,14 +362,9 @@ pub const Handshake = struct {
                     error.InvalidCryptoLevel => error.UnexpectedCryptoLevel,
                     error.CryptoBufferTooLarge => error.HandshakeBufferOverflow,
                 }),
-                // #564 scopes QUIC negotiated-suite packet/header protection
-                // as a separate child issue; this backend's own QUIC adapter
-                // still only negotiates TLS_AES_128_GCM_SHA256 (#335), so
-                // there is nothing for QUIC to do with this event yet.
-                .negotiated_parameters => {},
+                .negotiated_parameters => |params| self.adapter.installNegotiatedParameters(params) catch return self.fail(error.SecretExportFailed),
                 .traffic_secret => |s| {
                     const secret = Secret.init(s.epoch, s.direction, s.data) catch return self.fail(error.SecretExportFailed);
-                    if (s.data.len != traffic_secret_len) return self.fail(error.SecretExportFailed);
                     self.adapter.installSecret(secret);
                 },
                 .peer_transport_parameters => |params| self.adapter.setPeerTransportParameters(params),
@@ -561,6 +556,10 @@ pub const TestTlsBackend = struct {
     fn emitHandshakeSecrets(self: *TestTlsBackend, sink: *EventSink) HandshakeError!void {
         const c2s = self.deriveSecret("quic-test hs c2s");
         const s2c = self.deriveSecret("quic-test hs s2c");
+        try sink.emitNegotiatedParameters(.{
+            .cipher_suite = @intFromEnum(tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256),
+            .transcript_hash = .sha256,
+        });
         switch (self.role) {
             .client => {
                 try sink.emitSecret(.handshake, .write, &c2s);
@@ -797,7 +796,7 @@ fn expectSecretsMatch(a: *const QuicTlsAdapter, b: *const QuicTlsAdapter, level:
     // What one side writes, the other must read (RFC 9001 secrets are shared).
     const a_write = (try a.protectionKeys(level, .write)) orelse return error.TestUnexpectedResult;
     const b_read = (try b.protectionKeys(level, .read)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualSlices(u8, &a_write.key, &b_read.key);
+    try testing.expectEqualSlices(u8, a_write.key.slice(), b_read.key.slice());
 }
 
 test "in-memory client<->server handshake completes and installs matching 1-RTT secrets" {

@@ -4103,6 +4103,44 @@ test "driver: client and server complete the handshake over protected packets" {
     }
 }
 
+test "driver: negotiated TLS suites protect QUIC packets end to end" {
+    const allocator = testing.allocator;
+    inline for (.{
+        tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256,
+        tls_core.algorithms.CipherSuite.tls_aes_256_gcm_sha384,
+        tls_core.algorithms.CipherSuite.tls_chacha20_poly1305_sha256,
+    }) |suite| {
+        const suites = [_]tls_core.algorithms.CipherSuite{suite};
+        var pair = try TestPair.init(allocator);
+        defer pair.deinit(allocator);
+        pair.client_backend.engine.policy.cipher_suites = &suites;
+        pair.server_backend.engine.policy.cipher_suites = &suites;
+
+        try pair.pump();
+        try testing.expectEqual(State.established, pair.client.state());
+        try testing.expectEqual(State.established, pair.server.state());
+        try testing.expectEqual(suite, pair.client.adapter.negotiatedCipherSuite().?);
+        try testing.expectEqual(suite, pair.server.adapter.negotiatedCipherSuite().?);
+
+        const client_write = (try pair.client.adapter.protectionKeys(.application, .write)).?;
+        const server_read = (try pair.server.adapter.protectionKeys(.application, .read)).?;
+        const expected_profile = tls_adapter.PacketProtectionProfile.forCipherSuite(suite);
+        try testing.expectEqual(expected_profile.aead, client_write.profile.aead);
+        try testing.expectEqual(expected_profile.header_protection, client_write.profile.header_protection);
+        try testing.expectEqual(expected_profile.key_len, client_write.key.slice().len);
+        try testing.expectEqualSlices(u8, client_write.key.slice(), server_read.key.slice());
+
+        const id = try pair.client.openStream(.bidi);
+        _ = try pair.client.writeStream(id, "suite-protected h3", true);
+        try pair.pump();
+        try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
+        var buf: [64]u8 = undefined;
+        const got = try pair.server.readStream(id, &buf);
+        try testing.expectEqualStrings("suite-protected h3", buf[0..got.len]);
+        try testing.expect(got.fin);
+    }
+}
+
 // #484: a genuine two-`Connection` loopback (real QUIC packets, real
 // Initial-space CRYPTO reassembly, real key install/discard) proving the
 // shared TLS engine's HelloRetryRequest support works through the QUIC
@@ -4611,6 +4649,10 @@ fn sealTestZeroRttPacket(
     out: []u8,
 ) []u8 {
     var sender = tls_adapter.QuicTlsAdapter{ .provider = test_quic_crypto.testDefaultProvider() };
+    sender.installNegotiatedParameters(.{
+        .cipher_suite = @intFromEnum(tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256),
+        .transcript_hash = .sha256,
+    }) catch unreachable;
     sender.setZeroRttEnabled(true);
     sender.installSecret(tls_adapter.Secret.init(.zero_rtt, .write, &secret) catch unreachable);
 
@@ -4648,12 +4690,20 @@ fn sealTestZeroRttPacket(
     return out[0 .. pn_offset + pn_len + padded_len + aead_tag_len];
 }
 
+fn installTestAes128Negotiated(adapter: *tls_adapter.QuicTlsAdapter) void {
+    adapter.installNegotiatedParameters(.{
+        .cipher_suite = @intFromEnum(tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256),
+        .transcript_hash = .sha256,
+    }) catch unreachable;
+}
+
 test "driver: accepted 0-RTT packet with installed read keys decrypts and delivers stream data" {
     const allocator = testing.allocator;
     var pair = try TestPair.init(allocator);
     defer pair.deinit(allocator);
 
     const secret = [_]u8{0x42} ** tls_adapter.traffic_secret_len;
+    installTestAes128Negotiated(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
 
@@ -4713,6 +4763,7 @@ test "driver: tampered 0-RTT packet is dropped and not delivered" {
     defer pair.deinit(allocator);
 
     const secret = [_]u8{0x99} ** tls_adapter.traffic_secret_len;
+    installTestAes128Negotiated(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
 
@@ -4740,6 +4791,7 @@ test "driver: 0-RTT stream provenance survives reassembly, duplicate delivery, a
     defer pair.deinit(allocator);
 
     const secret = [_]u8{0x5a} ** tls_adapter.traffic_secret_len;
+    installTestAes128Negotiated(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
 
@@ -4793,6 +4845,7 @@ test "driver: authenticated duplicate 0-RTT packet does not re-apply a state-mut
     defer pair.deinit(allocator);
 
     const secret = [_]u8{0x63} ** tls_adapter.traffic_secret_len;
+    installTestAes128Negotiated(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
 
@@ -4816,6 +4869,7 @@ test "driver: the idle timer does not refresh on a duplicate or an undecryptable
     defer pair.deinit(allocator);
 
     const secret = [_]u8{0x29} ** tls_adapter.traffic_secret_len;
+    installTestAes128Negotiated(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
 
@@ -4892,6 +4946,7 @@ test "driver: replayed duplicate packet from a different source address does not
     defer pair.deinit(allocator);
 
     const secret = [_]u8{0x37} ** tls_adapter.traffic_secret_len;
+    installTestAes128Negotiated(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
 
@@ -4993,6 +5048,7 @@ test "driver: server retires its 0-RTT read secret once it authenticates a 1-RTT
     try pair.pump();
 
     const secret = [_]u8{0x11} ** tls_adapter.traffic_secret_len;
+    installTestAes128Negotiated(&pair.server.adapter);
     pair.server.adapter.setZeroRttEnabled(true);
     pair.server.adapter.installSecret(try tls_adapter.Secret.init(.zero_rtt, .read, &secret));
     try testing.expect((pair.server.adapter.protectionKeys(.zero_rtt, .read) catch unreachable) != null);

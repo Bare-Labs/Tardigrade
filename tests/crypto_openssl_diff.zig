@@ -1881,35 +1881,35 @@ fn runQuicInitial(allocator: std.mem.Allocator) !void {
 
     const openssl_client_secret = try opensslHkdfExpandLabel(allocator, "quic client initial secret", .sha256, openssl_initial, "client in", "", quic_secret_len);
     defer allocator.free(openssl_client_secret);
-    try expectStage("quic client initial secret", &zig_initial.client.secret, openssl_client_secret);
+    try expectStage("quic client initial secret", zig_initial.client.secret.slice(), openssl_client_secret);
 
     const openssl_server_secret = try opensslHkdfExpandLabel(allocator, "quic server initial secret", .sha256, openssl_initial, "server in", "", quic_secret_len);
     defer allocator.free(openssl_server_secret);
-    try expectStage("quic server initial secret", &zig_initial.server.secret, openssl_server_secret);
+    try expectStage("quic server initial secret", zig_initial.server.secret.slice(), openssl_server_secret);
 
     const openssl_client_key = try opensslHkdfExpandLabel(allocator, "quic client initial key", .sha256, openssl_client_secret, "quic key", "", quic_key_len);
     defer allocator.free(openssl_client_key);
-    try expectStage("quic client initial key", &zig_initial.client.key, openssl_client_key);
+    try expectStage("quic client initial key", zig_initial.client.key.slice(), openssl_client_key);
 
     const openssl_client_iv = try opensslHkdfExpandLabel(allocator, "quic client initial iv", .sha256, openssl_client_secret, "quic iv", "", quic_iv_len);
     defer allocator.free(openssl_client_iv);
-    try expectStage("quic client initial iv", &zig_initial.client.iv, openssl_client_iv);
+    try expectStage("quic client initial iv", zig_initial.client.iv.slice(), openssl_client_iv);
 
     const openssl_client_hp = try opensslHkdfExpandLabel(allocator, "quic client initial hp", .sha256, openssl_client_secret, "quic hp", "", quic_hp_len);
     defer allocator.free(openssl_client_hp);
-    try expectStage("quic client initial hp", &zig_initial.client.hp, openssl_client_hp);
+    try expectStage("quic client initial hp", zig_initial.client.hp.slice(), openssl_client_hp);
 
     const openssl_server_key = try opensslHkdfExpandLabel(allocator, "quic server initial key", .sha256, openssl_server_secret, "quic key", "", quic_key_len);
     defer allocator.free(openssl_server_key);
-    try expectStage("quic server initial key", &zig_initial.server.key, openssl_server_key);
+    try expectStage("quic server initial key", zig_initial.server.key.slice(), openssl_server_key);
 
     const openssl_server_iv = try opensslHkdfExpandLabel(allocator, "quic server initial iv", .sha256, openssl_server_secret, "quic iv", "", quic_iv_len);
     defer allocator.free(openssl_server_iv);
-    try expectStage("quic server initial iv", &zig_initial.server.iv, openssl_server_iv);
+    try expectStage("quic server initial iv", zig_initial.server.iv.slice(), openssl_server_iv);
 
     const openssl_server_hp = try opensslHkdfExpandLabel(allocator, "quic server initial hp", .sha256, openssl_server_secret, "quic hp", "", quic_hp_len);
     defer allocator.free(openssl_server_hp);
-    try expectStage("quic server initial hp", &zig_initial.server.hp, openssl_server_hp);
+    try expectStage("quic server initial hp", zig_initial.server.hp.slice(), openssl_server_hp);
 }
 
 test "OpenSSL HKDF oracle matches QUIC production initial derivation" {

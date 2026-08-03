@@ -71,6 +71,8 @@ const case_registry = [_]CaseMeta{
     .{ .id = "quic-v1-initial-rfc9001", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .positive, .source = "RFC 9001 Appendix A.1/A.3", .license = "IETF Trust", .reproduction = "fixed RFC literals plus tests/vectors/generate_crypto_vectors.js small packet" },
     .{ .id = "quic-v1-initial-auth-failure", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "quic-header-protection-aes128-rfc9001", .algorithm = .{ .quic_header_protection = .aes_128 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 9001 Appendix A.3", .license = "IETF Trust", .reproduction = "fixed RFC sample" },
+    .{ .id = "quic-header-protection-aes256-fixed", .algorithm = .{ .quic_header_protection = .aes_256 }, .providers = pure_zig_only, .class = .positive, .source = "provider contract cross-check", .license = "project fixture", .reproduction = "AES-256 encrypt of fixed 16-byte sample, mask is first five bytes" },
+    .{ .id = "quic-header-protection-chacha20-fixed", .algorithm = .{ .quic_header_protection = .chacha20 }, .providers = pure_zig_only, .class = .positive, .source = "RFC 9001 Section 5.4.4 construction", .license = "project fixture", .reproduction = "ChaCha20 block from fixed key/sample, mask is first five bytes" },
     .{ .id = "aes-128-gcm-nist-zero-block", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .positive, .source = "NIST SP 800-38D / CAVP GCM zero-block vector", .license = "public domain", .reproduction = "published NIST vector" },
     .{ .id = "aes-128-gcm-tag-rejection", .algorithm = .{ .aead = .aes_128_gcm }, .providers = pure_zig_only, .class = .negative, .source = "provider contract", .license = "project fixture", .reproduction = "zig build test-crypto-vectors" },
     .{ .id = "aes-256-gcm-nist-zero-block", .algorithm = .{ .aead = .aes_256_gcm }, .providers = pure_zig_only, .class = .positive, .source = "NIST SP 800-38D / CAVP GCM zero-block vector", .license = "public domain", .reproduction = "published NIST vector" },
@@ -393,20 +395,22 @@ fn runQuicInitialVector(log: *ExecutionLog) !void {
     _ = try log.execute("quic-v1-initial-rfc9001");
     _ = try log.execute("quic-v1-initial-auth-failure");
     _ = try log.execute("quic-header-protection-aes128-rfc9001");
+    _ = try log.execute("quic-header-protection-aes256-fixed");
+    _ = try log.execute("quic-header-protection-chacha20-fixed");
     const cp = cryptoProvider();
     const dcid = hexBytes("8394c8f03e515708");
     const secrets = try quic.tls_adapter.deriveInitialSecretsV1(&dcid);
     const provider_secrets = try quic.tls_adapter.deriveInitialSecretsV1WithProvider(cp, &dcid);
 
     try expectStage("quic initial secret / RFC 9001 A.1", &hexBytes("7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44"), &secrets.initial_secret);
-    try expectStage("quic client initial secret / RFC 9001 A.1", &hexBytes("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"), &secrets.client.secret);
-    try expectStage("quic client initial key / RFC 9001 A.1", &hexBytes("1f369613dd76d5467730efcbe3b1a22d"), &secrets.client.key);
-    try expectStage("quic client initial iv / RFC 9001 A.1", &hexBytes("fa044b2f42a3fd3b46fb255c"), &secrets.client.iv);
-    try expectStage("quic client initial hp / RFC 9001 A.1", &hexBytes("9f50449e04a0e810283a1e9933adedd2"), &secrets.client.hp);
-    try expectStage("quic server initial secret / RFC 9001 A.1", &hexBytes("3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b"), &secrets.server.secret);
-    try expectStage("quic server initial key / RFC 9001 A.1", &hexBytes("cf3a5331653c364c88f0f379b6067e37"), &secrets.server.key);
-    try expectStage("quic server initial iv / RFC 9001 A.1", &hexBytes("0ac1493ca1905853b0bba03e"), &secrets.server.iv);
-    try expectStage("quic server initial hp / RFC 9001 A.1", &hexBytes("c206b8d9b9f0f37644430b490eeaa314"), &secrets.server.hp);
+    try expectStage("quic client initial secret / RFC 9001 A.1", &hexBytes("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"), secrets.client.secret.slice());
+    try expectStage("quic client initial key / RFC 9001 A.1", &hexBytes("1f369613dd76d5467730efcbe3b1a22d"), secrets.client.key.slice());
+    try expectStage("quic client initial iv / RFC 9001 A.1", &hexBytes("fa044b2f42a3fd3b46fb255c"), secrets.client.iv.slice());
+    try expectStage("quic client initial hp / RFC 9001 A.1", &hexBytes("9f50449e04a0e810283a1e9933adedd2"), secrets.client.hp.slice());
+    try expectStage("quic server initial secret / RFC 9001 A.1", &hexBytes("3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b"), secrets.server.secret.slice());
+    try expectStage("quic server initial key / RFC 9001 A.1", &hexBytes("cf3a5331653c364c88f0f379b6067e37"), secrets.server.key.slice());
+    try expectStage("quic server initial iv / RFC 9001 A.1", &hexBytes("0ac1493ca1905853b0bba03e"), secrets.server.iv.slice());
+    try expectStage("quic server initial hp / RFC 9001 A.1", &hexBytes("c206b8d9b9f0f37644430b490eeaa314"), secrets.server.hp.slice());
 
     try expectStage("quic packet nonce / RFC 9001 A.2", &hexBytes("fa044b2f42a3fd3b46fb255e"), &secrets.client.nonce(2));
 
@@ -414,6 +418,18 @@ fn runQuicInitialVector(log: *ExecutionLog) !void {
     try expectStage("quic header-protection mask / RFC 9001 A.3", &hexBytes("437b9aec36"), &secrets.client.headerProtectionMask(sample));
     const provider_mask = try provider_secrets.client.headerProtectionMaskWithProvider(cp, sample);
     try expectStage("quic provider header-protection mask / RFC 9001 A.3", &hexBytes("437b9aec36"), &provider_mask);
+
+    const aes256_hp_key = [_]u8{0x33} ** 32;
+    const aes256_hp_sample = [_]u8{0x44} ** quic.tls_adapter.header_protection_sample_len;
+    var aes256_hp_mask: [provider.quic_header_protection_mask_len]u8 = undefined;
+    try cp.quicHeaderProtectionMask(.aes_256, &aes256_hp_key, &aes256_hp_sample, &aes256_hp_mask);
+    try expectStage("quic aes-256 header-protection mask / fixed vector", &hexBytes("412bf041bb"), &aes256_hp_mask);
+
+    const chacha_hp_key = [_]u8{0x55} ** 32;
+    const chacha_hp_sample = hexBytes("01000000aabbccddeeff001122334455");
+    var chacha_hp_mask: [provider.quic_header_protection_mask_len]u8 = undefined;
+    try cp.quicHeaderProtectionMask(.chacha20, &chacha_hp_key, &chacha_hp_sample, &chacha_hp_mask);
+    try expectStage("quic chacha20 header-protection mask / fixed vector", &hexBytes("13d22a43a3"), &chacha_hp_mask);
 
     var header = hexBytes("c300000001088394c8f03e5157080000403400000002");
     var plaintext = [_]u8{0} ** 32;

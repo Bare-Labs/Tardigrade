@@ -2,16 +2,17 @@
 //!
 //! Satisfies the `provider.CryptoProvider` boundary using only `std.crypto`
 //! primitives — no external TLS/crypto library. This is the experimental
-//! backend the epic grows alongside OpenSSL; it implements the narrow first
-//! profile the TLS/QUIC engines target and advertises exactly that profile
-//! through capability discovery, so anything outside it is a typed
-//! `error.UnsupportedCapability` rather than a silent gap.
+//! backend the epic grows alongside OpenSSL; it implements the native TLS/QUIC
+//! profile and advertises exactly those provider capabilities, so anything
+//! outside it is a typed `error.UnsupportedCapability` rather than a silent
+//! gap.
 //!
 //! Implemented here (the overlap where a pure-Zig and an OpenSSL provider must
 //! agree):
 //!
 //!   * HKDF-Extract / Expand-Label over SHA-256 and SHA-384
 //!   * AEAD seal/open for AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305
+//!   * QUIC header protection for AES-128, AES-256, and ChaCha20
 //!   * X25519 and secp256r1 key-share generation and shared-secret derivation
 //!   * Ed25519 signing (via `SoftwareSigningKey`) and verification
 //!   * ECDSA-P256/SHA-256 signing (via
@@ -38,6 +39,8 @@ const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
 const Aes256Gcm = crypto.aead.aes_gcm.Aes256Gcm;
 const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
 const Aes128 = crypto.core.aes.Aes128;
+const Aes256 = crypto.core.aes.Aes256;
+const ChaCha20IETF = crypto.stream.chacha.ChaCha20IETF;
 const X25519 = crypto.dh.X25519;
 const Ed25519 = crypto.sign.Ed25519;
 const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
@@ -72,6 +75,8 @@ pub const Provider = struct {
         caps.aeads.insert(.aes_256_gcm);
         caps.aeads.insert(.chacha20_poly1305);
         caps.quic_header_protection.insert(.aes_128);
+        caps.quic_header_protection.insert(.aes_256);
+        caps.quic_header_protection.insert(.chacha20);
         caps.groups.insert(.x25519);
         caps.groups.insert(.secp256r1);
         caps.signatures.insert(.ed25519);
@@ -319,21 +324,50 @@ fn quicHeaderProtectionMaskImpl(
 ) provider.QuicHeaderProtectionError!void {
     _ = context;
     switch (hp) {
-        .aes_128 => {
-            if (key.len != provider.QuicHeaderProtection.aes_128.keyLength()) return error.InvalidInput;
+        .aes_128, .aes_256 => {
+            if (key.len != hp.keyLength()) return error.InvalidInput;
             if (sample.len != provider.quic_header_protection_sample_len) return error.InvalidInput;
             if (mask.len != provider.quic_header_protection_mask_len) return error.InvalidInput;
 
-            var k: [16]u8 = undefined;
+            var k: [provider.max_aead_key_len]u8 = undefined;
             var s: [provider.quic_header_protection_sample_len]u8 = undefined;
-            @memcpy(&k, key);
+            @memcpy(k[0..key.len], key);
             @memcpy(&s, sample);
             defer crypto.secureZero(u8, &k);
+            defer crypto.secureZero(u8, &s);
 
-            const aes = Aes128.initEnc(k);
             var block: [provider.quic_header_protection_sample_len]u8 = undefined;
-            aes.encrypt(&block, &s);
+            switch (hp) {
+                .aes_128 => {
+                    const aes = Aes128.initEnc(k[0..16].*);
+                    aes.encrypt(&block, &s);
+                },
+                .aes_256 => {
+                    const aes = Aes256.initEnc(k[0..32].*);
+                    aes.encrypt(&block, &s);
+                },
+                .chacha20 => unreachable,
+            }
             @memcpy(mask, block[0..provider.quic_header_protection_mask_len]);
+            crypto.secureZero(u8, &block);
+        },
+        .chacha20 => {
+            if (key.len != provider.QuicHeaderProtection.chacha20.keyLength()) return error.InvalidInput;
+            if (sample.len != provider.quic_header_protection_sample_len) return error.InvalidInput;
+            if (mask.len != provider.quic_header_protection_mask_len) return error.InvalidInput;
+
+            var k: [ChaCha20IETF.key_length]u8 = undefined;
+            var nonce: [ChaCha20IETF.nonce_length]u8 = undefined;
+            @memcpy(&k, key);
+            @memcpy(&nonce, sample[4..16]);
+            const counter = std.mem.readInt(u32, sample[0..4], .little);
+            defer crypto.secureZero(u8, &k);
+            defer crypto.secureZero(u8, &nonce);
+
+            var block: [ChaCha20IETF.block_length]u8 = undefined;
+            ChaCha20IETF.stream(&block, counter, k, nonce);
+            @memcpy(mask, block[0..provider.quic_header_protection_mask_len]);
+            crypto.secureZero(u8, &block);
         },
     }
 }
@@ -810,6 +844,8 @@ test "capabilities advertise exactly the implemented profile" {
     try testing.expect(caps.supportsAead(.aes_256_gcm));
     try testing.expect(caps.supportsAead(.chacha20_poly1305));
     try testing.expect(caps.supportsQuicHeaderProtection(.aes_128));
+    try testing.expect(caps.supportsQuicHeaderProtection(.aes_256));
+    try testing.expect(caps.supportsQuicHeaderProtection(.chacha20));
     try testing.expect(caps.supportsGroup(.x25519));
     try testing.expect(caps.supportsGroup(.secp256r1));
     try testing.expect(caps.supportsSignature(.ed25519));
@@ -833,6 +869,35 @@ test "QUIC AES header protection mask matches std.crypto directly" {
     try cp.quicHeaderProtectionMask(.aes_128, &key, &sample, &mask);
     try testing.expectEqualSlices(u8, block[0..provider.quic_header_protection_mask_len], &mask);
     try testing.expectError(error.InvalidInput, cp.quicHeaderProtectionMask(.aes_128, key[0..15], &sample, &mask));
+}
+
+test "QUIC AES-256 and ChaCha20 header protection masks match std.crypto directly" {
+    var det = DeterministicEntropy.init(10);
+    var p = Provider.init(det.entropy());
+    const cp = p.cryptoProvider();
+
+    const aes_key = [_]u8{0x33} ** 32;
+    const aes_sample = [_]u8{0x44} ** provider.quic_header_protection_sample_len;
+    const aes = Aes256.initEnc(aes_key);
+    var aes_block: [provider.quic_header_protection_sample_len]u8 = undefined;
+    aes.encrypt(&aes_block, &aes_sample);
+
+    var aes_mask: [provider.quic_header_protection_mask_len]u8 = undefined;
+    try cp.quicHeaderProtectionMask(.aes_256, &aes_key, &aes_sample, &aes_mask);
+    try testing.expectEqualSlices(u8, aes_block[0..provider.quic_header_protection_mask_len], &aes_mask);
+    try testing.expectError(error.InvalidInput, cp.quicHeaderProtectionMask(.aes_256, aes_key[0..31], &aes_sample, &aes_mask));
+
+    const chacha_key = [_]u8{0x55} ** 32;
+    const chacha_sample = hexBytes("01000000aabbccddeeff001122334455");
+    const counter = std.mem.readInt(u32, chacha_sample[0..4], .little);
+    const nonce = chacha_sample[4..16].*;
+    var stream_block: [ChaCha20IETF.block_length]u8 = undefined;
+    ChaCha20IETF.stream(&stream_block, counter, chacha_key, nonce);
+
+    var chacha_mask: [provider.quic_header_protection_mask_len]u8 = undefined;
+    try cp.quicHeaderProtectionMask(.chacha20, &chacha_key, &chacha_sample, &chacha_mask);
+    try testing.expectEqualSlices(u8, stream_block[0..provider.quic_header_protection_mask_len], &chacha_mask);
+    try testing.expectError(error.InvalidInput, cp.quicHeaderProtectionMask(.chacha20, &chacha_key, chacha_sample[0..15], &chacha_mask));
 }
 
 test "unsupported algorithms return UnsupportedCapability, not undefined behaviour" {

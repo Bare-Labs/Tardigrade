@@ -5,8 +5,9 @@
 //! carried. QUIC owns the contents of that extension; record mode carries no
 //! transport extension at all. This module imports neither QUIC nor OpenSSL.
 //!
-//! Deliberately narrow first profile, one interoperable code path per choice:
-//!   - cipher suite: TLS_AES_128_GCM_SHA256 (the adapter's suite)
+//! Deliberately narrow profile, one interoperable code path per choice:
+//!   - cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384,
+//!     TLS_CHACHA20_POLY1305_SHA256
 //!   - key exchange: X25519
 //!   - signature: Ed25519 (server CertificateVerify)
 //!   - server-only authentication; client certificates are not offered

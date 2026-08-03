@@ -12,7 +12,8 @@ The appliance profile is deliberately narrow:
 - **Ed25519 only** (RFC 8410);
 - one **leaf-first** ordered certificate chain, cryptographically coherent
   end to end;
-- **TLS 1.3 only**, key exchange **X25519**, cipher `TLS_AES_128_GCM_SHA256`;
+- **TLS 1.3 only**, key exchange **X25519**, cipher `TLS_AES_128_GCM_SHA256`
+  for native TCP;
 - ALPN `h2` and `http/1.1` over native TCP;
 - the **same credential provider instance** authenticates native HTTP/3
   (QUIC);

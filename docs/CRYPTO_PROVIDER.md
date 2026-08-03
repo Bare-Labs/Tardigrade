@@ -39,7 +39,8 @@ boundary is what keeps the two from coupling to each other.
   shared secure-zero and constant-time comparison helpers, and the non-formatting
   convention for secret-bearing values.
 - `src/crypto/pure_zig.zig` — the first concrete backend, built entirely on
-  `std.crypto`. Implements the narrow first profile and advertises exactly that.
+  `std.crypto`. Implements the native TLS/QUIC profile and advertises exactly
+  those provider capabilities.
 - `src/crypto/root.zig` — the package aggregator.
 - `docs/CRYPTO_PROVIDER_AUDIT.md` — the current native TLS/QUIC/PKI/resumption
   direct-crypto ownership audit and exception list.
@@ -53,8 +54,9 @@ changes when it lands.
 
 - **HKDF** extract and expand-label over SHA-256 and SHA-384.
 - **AEAD** seal/open for AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305.
-- **QUIC header protection** for the AES-128 profile, exposed as a narrow
-  packet-protection mask operation rather than as a reusable AES block API.
+- **QUIC header protection** for AES-128, AES-256, and ChaCha20, exposed as a
+  narrow packet-protection mask operation rather than as reusable block/stream
+  cipher APIs.
 - **Key exchange** — ephemeral key-share generation and shared-secret derivation
   for X25519 and secp256r1.
 - **Signatures** — verification for Ed25519, ECDSA-P256, and RSA-PSS, plus
@@ -65,12 +67,12 @@ changes when it lands.
 - **Opaque private-key handles** and **capability discovery**.
 
 The pure-Zig backend implements the overlap the TLS/QUIC engines need today:
-HKDF (SHA-256/384), all three AEAD primitives, AES-128 QUIC header protection,
-X25519, secp256r1 ECDH, Ed25519, ECDSA-P256 signing/verification, and RSA-PSS
-verification. The remaining algorithms are named by the interface so protocol
-and negotiation code is written once; capability discovery reports them absent
-and every entry point returns `error.UnsupportedCapability` until a backend
-provides them.
+HKDF (SHA-256/384), all three AEAD primitives, AES-128/AES-256/ChaCha20 QUIC
+header protection, X25519, secp256r1 ECDH, Ed25519, ECDSA-P256
+signing/verification, and RSA-PSS verification. The remaining algorithms are
+named by the interface so protocol and negotiation code is written once;
+capability discovery reports them absent and every entry point returns
+`error.UnsupportedCapability` until a backend provides them.
 
 Primitive support, protocol integration, and product enablement are three
 separate dimensions, and `src/crypto/profile.zig` records all three as typed
@@ -120,11 +122,13 @@ lists only the consumers whose live runtime calls `CryptoProvider` today
 | SHA-256 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF, QUIC TLS bridge | none — unkeyed hashing has no `CryptoProvider` entry point by design | native appliance, general-purpose OpenSSL |
 | SHA-384 | supported | `std.crypto` | provider deferred | TLS transcript, HKDF | none — unkeyed hashing has no `CryptoProvider` entry point by design | native appliance, general-purpose OpenSSL (the native engine's transcript/key schedule are cipher/hash-agile, #564; SHA-384 is live whenever TLS_AES_256_GCM_SHA384 is negotiated) |
 | HKDF-SHA256 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule, QUIC packet protection | live — QUIC packet protection, the QUIC/TLS secret bridge, and the TLS 1.3 key schedule (`src/tls/key_schedule.zig`) all call `CryptoProvider.hkdfExtract`/`.hkdfExpandLabel` | native appliance, general-purpose OpenSSL |
-| HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule | live — `src/tls/key_schedule.zig` is hash-agile (#564): `KeySchedule` and every resumption/ticket helper derive their hash from the negotiated suite (`algorithms.transcriptHash`) and route it through `CryptoProvider`, so a native handshake negotiating TLS_AES_256_GCM_SHA384 really does derive under SHA-384 | native appliance, general-purpose OpenSSL |
+| HKDF-SHA384 | supported | `std.crypto` HMAC/TLS label code | provider deferred | TLS 1.3 key schedule, QUIC packet protection | live — `src/tls/key_schedule.zig` is hash-agile (#564): `KeySchedule` and every resumption/ticket helper derive their hash from the negotiated suite (`algorithms.transcriptHash`) and route it through `CryptoProvider`, so a native handshake negotiating TLS_AES_256_GCM_SHA384 really does derive under SHA-384; QUIC packet protection also derives Handshake/0-RTT/1-RTT keys under SHA-384 when that suite is negotiated (#566) | native appliance, general-purpose OpenSSL |
 | AES-128-GCM | supported | `std.crypto` | provider deferred | TLS records, QUIC packet protection | both — TLS record protection and QUIC packet protection seal/open through `CryptoProvider` | native appliance, general-purpose OpenSSL |
-| AES-256-GCM | supported | `std.crypto` | provider deferred | TLS records | live — the native engine now negotiates TLS_AES_256_GCM_SHA384 (#564) through the existing generic `record_protection.TrafficKeys.derive` path, the same CryptoProvider-routed seal/open every suite uses | native appliance, general-purpose OpenSSL |
-| ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | TLS records | live — the native engine now negotiates TLS_CHACHA20_POLY1305_SHA256 (#564) through the same generic record-protection path | native appliance, general-purpose OpenSSL |
+| AES-256-GCM | supported | `std.crypto` | provider deferred | TLS records, QUIC packet protection | live — the native engine now negotiates TLS_AES_256_GCM_SHA384 (#564) through the existing generic `record_protection.TrafficKeys.derive` path, the same CryptoProvider-routed seal/open every suite uses; QUIC Handshake/0-RTT/1-RTT packet protection uses AES-256-GCM when that suite is negotiated (#566) | native appliance, general-purpose OpenSSL |
+| ChaCha20-Poly1305 | supported | `std.crypto` | provider deferred | TLS records, QUIC packet protection | live — the native engine now negotiates TLS_CHACHA20_POLY1305_SHA256 (#564) through the same generic record-protection path; QUIC Handshake/0-RTT/1-RTT packet protection uses ChaCha20-Poly1305 when that suite is negotiated (#566) | native appliance, general-purpose OpenSSL |
 | QUIC AES-128 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection | live — every send/receive path in `src/quic/tls_adapter.zig` applies/removes header protection through `CryptoProvider` | native appliance only (QUIC-specific; the general-purpose backend is TLS-over-TCP) |
+| QUIC AES-256 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection | live — every non-Initial send/receive path in `src/quic/tls_adapter.zig` selects this through `CryptoProvider` when TLS_AES_256_GCM_SHA384 is negotiated (#566) | native appliance only (QUIC-specific; the general-purpose backend is TLS-over-TCP) |
+| QUIC ChaCha20 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection | live — every non-Initial send/receive path in `src/quic/tls_adapter.zig` selects this through `CryptoProvider` when TLS_CHACHA20_POLY1305_SHA256 is negotiated (#566) | native appliance only (QUIC-specific; the general-purpose backend is TLS-over-TCP) |
 | X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge | live — `src/tls/tls13_backend.zig` generates its ephemeral key share and derives the shared secret through `CryptoProvider.generateKeyShare`/`.deriveSharedSecret` | native appliance, general-purpose OpenSSL |
 | secp256r1 / P-256 | supported | `std.crypto` | provider deferred | TLS key share, PKI | not integrated — provider ECDH key-share generation and shared-secret derivation are available, but live native TLS negotiation does not select the group until #335 | general-purpose OpenSSL only |
 | Ed25519 | supported | `std.crypto` | provider deferred | CertificateVerify, PKI | live for both — PKI chain-signature verification and the handshake's own CertificateVerify proof-of-possession (`src/tls/tls13_backend.zig`) call `CryptoProvider.verify`; local CertificateVerify signing (`src/tls/credentials.zig`'s `Identity.sign`) signs through the opaque `provider.SigningKey` handle rather than a concrete `std.crypto.sign.Ed25519.KeyPair` | native appliance, general-purpose OpenSSL |
@@ -146,9 +150,9 @@ backend), then pass the returned `asPolicyCapabilities()` slice set to
 `tls.Policy`. There is no product-agnostic shortcut: which cipher suites,
 named groups, and signature schemes a product actually negotiates is a
 product decision, not something a provider's raw capability set can answer on
-its own — a pure-Zig provider reports AES-256-GCM/ChaCha20-Poly1305/RSA-PSS
-support, but `fromProfile` still withholds them for `.native_appliance`
-because that product's engine doesn't negotiate them, while
+its own — a pure-Zig provider reports secp256r1 ECDH and RSA-PSS verification
+support, but `fromProfile` still withholds unsupported combinations for
+`.native_appliance` until that product's engine negotiates them, while
 `.general_purpose_openssl` advertises the full set. Each cipher suite is
 gated on every profile dimension it binds together (AEAD, transcript hash,
 HKDF hash), not only its AEAD row. When a call site must accept hand-written

@@ -52,12 +52,16 @@ CRYPTO-frame transport and packet-key installation.**
    QUIC/shared epoch conversion, and QUIC error mapping. It configures the
    shared engine with opaque extension type 57 and ALPN `h3`; no TLS message,
    certificate, Finished, transcript, or key-schedule logic is duplicated in
-   QUIC. The shared engine's first profile remains deliberately narrow:
-   TLS_AES_128_GCM_SHA256 (the adapter's suite), X25519 key exchange, Ed25519
-   server certificates (parsed/verified via `std.crypto.Certificate`), and
-   pinned-certificate or explicit-insecure trust. The shared key schedule is
-   validated against the RFC 8448 trace. Entropy is caller-supplied, like the
-   rest of `src/quic/`.
+   QUIC. The shared engine's profile remains deliberately narrow: the three
+   RFC 9001 packet-protection suites
+   (`TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,
+   `TLS_CHACHA20_POLY1305_SHA256`), X25519 key exchange, Ed25519 server
+   certificates (parsed/verified via `std.crypto.Certificate`), and
+   pinned-certificate or explicit-insecure trust. Initial packet protection
+   remains the RFC-fixed AES-128-GCM/SHA-256 profile; Handshake, 0-RTT, and
+   1-RTT packet protection follow the negotiated TLS suite metadata installed
+   on the QUIC adapter. The shared key schedule is validated against the RFC
+   8448 trace. Entropy is caller-supplied, like the rest of `src/quic/`.
 
 4. A deterministic in-memory `TestTlsBackend` in `tls_handshake.zig` exercises
    the driver end to end. It is a fixture, not a TLS implementation, and it is
@@ -160,8 +164,8 @@ illegal-value failure.
   `TlsBackend.setCidBinding` before the first flight and validates the peer's
   binding at handshake completion (RFC 9000 §7.3).
 - Session resumption / 0-RTT (product decision), HelloRetryRequest, additional
-  cipher suites and signature algorithms, and web-PKI certificate-chain
-  validation in the pure-Zig backend.
+  signature algorithms, and web-PKI certificate-chain validation in the
+  pure-Zig backend.
 - Fuzz and benchmark coverage (#247); external interop against ngtcp2/nghttp3, quiche, and aioquic runs out of process via `scripts/interop/run-interop.sh`.
 - TLS key logging for local decryption (#255): `installSecret` is the single
   choke point where every traffic secret is installed, so the debug-only keylog

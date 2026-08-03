@@ -11,6 +11,11 @@ pub const ProtocolName = algorithms.ProtocolName;
 
 const default_protocol_versions = [_]ProtocolVersion{.tls13};
 const default_cipher_suites = [_]CipherSuite{.tls_aes_128_gcm_sha256};
+const quic_cipher_suites = [_]CipherSuite{
+    .tls_aes_128_gcm_sha256,
+    .tls_aes_256_gcm_sha384,
+    .tls_chacha20_poly1305_sha256,
+};
 const default_named_groups = [_]NamedGroup{.x25519};
 const default_signature_schemes = [_]SignatureScheme{ .ed25519, .ecdsa_secp256r1_sha256 };
 const ed25519_signature_schemes = [_]SignatureScheme{.ed25519};
@@ -48,7 +53,7 @@ pub const Policy = struct {
         return .{
             .transport_mode = .quic,
             .protocol_versions = &default_protocol_versions,
-            .cipher_suites = &default_cipher_suites,
+            .cipher_suites = &quic_cipher_suites,
             .named_groups = &default_named_groups,
             .signature_schemes = &default_signature_schemes,
             .alpn_protocols = &quic_alpns,
