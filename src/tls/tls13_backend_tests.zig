@@ -588,6 +588,55 @@ test "direct shared driver preserves derivation, sequence, discard, and teardown
     try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&harness.server_backend.identity), 0));
 }
 
+// #565: an RSA-2048 server credential, negotiated exclusively (the shared
+// policy on both sides names only `.rsa_pss_rsae_sha256`, so a successful
+// handshake is only reachable through the native RSA-PSS signing, provider
+// verification, and credential-selection path added by this change — there
+// is no other scheme to fall back to).
+test "native RSA-PSS server credential completes a record-mode handshake" {
+    var harness: DirectHarness = undefined;
+    const client_crypto_provider = harness.client_provider_storage.init(client_provider_seed);
+    const server_crypto_provider = harness.server_provider_storage.init(server_provider_seed);
+    const client_bridge_crypto_provider = harness.client_bridge_provider_storage.init(client_provider_seed);
+    const server_bridge_crypto_provider = harness.server_bridge_provider_storage.init(server_provider_seed);
+    const alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.h2};
+    const rsa_capabilities = tls_core.policy.Capabilities{ .signature_schemes = &.{.rsa_pss_rsae_sha256} };
+    const policy = tls_core.policy.Policy.fromCapabilities(.record, rsa_capabilities, &alpns);
+    harness = .{
+        .client_provider_storage = harness.client_provider_storage,
+        .server_provider_storage = harness.server_provider_storage,
+        .client_bridge_provider_storage = harness.client_bridge_provider_storage,
+        .server_bridge_provider_storage = harness.server_bridge_provider_storage,
+        .client_backend = tls_backend.Tls13Backend.initClientConfigured(
+            clientEntropy(),
+            client_crypto_provider,
+            .{ .pinned_certificate = tls_backend.testdata.rsa_certificate_der },
+            tls_backend.recordConfig(policy),
+            .{},
+        ),
+        .server_backend = tls_backend.Tls13Backend.initServerConfigured(
+            serverEntropy(),
+            server_crypto_provider,
+            tls_backend.testdata.rsaIdentity(),
+            tls_backend.recordConfig(policy),
+        ),
+        .client_bridge = Bridge.init(client_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+        .server_bridge = Bridge.init(server_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+    };
+    defer harness.deinit();
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try harness.client_bridge.sealApplicationData("client application over RSA-PSS", &protected);
+    const opened_request = try harness.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext);
+    try std.testing.expectEqualStrings("client application over RSA-PSS", opened_request.inner.content);
+}
+
 test "direct record handshake delivers large post-handshake ticket once" {
     const Capture = struct {
         count: usize = 0,

@@ -120,6 +120,7 @@ const differential_cases = [_]DifferentialCase{
     .{ .kind = .key_exchange, .algorithm = .{ .group = .secp256r1 }, .class = .negative, .rationale = "provider P-256 ECDH malformed scalar and peer handling compared to EVP oracle status", .run = runP256EcdhNegative },
     .{ .kind = .signature_sign, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .rationale = "provider raw Ed25519 signing compared to EVP oracle", .run = runEd25519SignPositive },
     .{ .kind = .signature_sign, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .positive, .rationale = "pure-Zig ECDSA-P256 signatures cross-verify with the OpenSSL EVP oracle", .run = runEcdsaP256SignPositive },
+    .{ .kind = .signature_sign, .algorithm = .{ .signature = .rsa_pss_rsae_sha256 }, .class = .positive, .rationale = "pure-Zig RSA-PSS-RSAE-SHA256 private-key signatures cross-verify with an independent OpenSSL EVP verifier (#565)", .run = runRsaPssSignPositive },
     .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .positive, .rationale = "provider raw Ed25519 verification compared to EVP oracle", .run = runEd25519VerifyPositive },
     .{ .kind = .signature_verify, .algorithm = .{ .signature = .ed25519 }, .class = .negative, .rationale = "provider raw Ed25519 invalid signature/message/key handling compared to EVP oracle", .run = runEd25519VerifyNegative },
     .{ .kind = .signature_verify, .algorithm = .{ .signature = .ecdsa_secp256r1_sha256 }, .class = .positive, .rationale = "provider SEC1 ECDSA-P256-SHA256 verification compared to EVP oracle", .run = runEcdsaP256VerifyPositive },
@@ -751,6 +752,76 @@ fn runEcdsaP256SignPositive(allocator: std.mem.Allocator) !void {
 
     const malformed_key = [_]u8{0x04};
     try expectEcdsaP256Rejects(allocator, cp, &malformed_key, message, native_der, error.InvalidInput, .malformed);
+}
+
+fn runEvpRsaPssVerify(allocator: std.mem.Allocator, public_key: []const u8, message: []const u8, signature: []const u8) !EvpOracleResult {
+    const public_hex = try hexAlloc(allocator, public_key);
+    defer allocator.free(public_hex);
+    const message_hex = try hexAlloc(allocator, message);
+    defer allocator.free(message_hex);
+    const signature_hex = try hexAlloc(allocator, signature);
+    defer allocator.free(signature_hex);
+    return runEvpOracle(allocator, &.{ "rsa-pss-verify", public_hex, message_hex, signature_hex });
+}
+
+fn expectRsaPssAcceptsBoth(allocator: std.mem.Allocator, cp: provider.CryptoProvider, public_key: []const u8, message: []const u8, signature: []const u8) !void {
+    try cp.verify(.rsa_pss_rsae_sha256, public_key, message, signature);
+    var oracle = try runEvpRsaPssVerify(allocator, public_key, message, signature);
+    defer oracle.deinit(allocator);
+    try expectEvpStatus(&oracle, .ok);
+}
+
+fn expectRsaPssRejects(allocator: std.mem.Allocator, cp: provider.CryptoProvider, public_key: []const u8, message: []const u8, signature: []const u8, expected_native: anyerror, expected_oracle: EvpStatus) !void {
+    try testing.expectError(expected_native, cp.verify(.rsa_pss_rsae_sha256, public_key, message, signature));
+    var oracle = try runEvpRsaPssVerify(allocator, public_key, message, signature);
+    defer oracle.deinit(allocator);
+    try expectEvpStatus(&oracle, expected_oracle);
+}
+
+/// #565: cross-verifies native RSA-PSS-RSAE-SHA256 *signing* against an
+/// independent OpenSSL verifier — the counterpart to `.rsa_pss_verify`'s
+/// waivers above, which cover verification only. `rsa-pss-verify` (added to
+/// `tests/evp_oracle.c` for this) checks the strict profile both this
+/// project's decoder and RFC 8017 require: SHA-256 digest/MGF1, a 32-byte
+/// salt, RSASSA-PSS padding. The oracle never signs here — signing stays
+/// entirely inside the pure-Zig private-key owner (`rsa.zig`'s
+/// `signPssSha256`, behind `provider.SigningKey`), so this test proves that
+/// exact code path against an independent EVP verifier rather than merely
+/// against its own decoder.
+fn runRsaPssSignPositive(allocator: std.mem.Allocator) !void {
+    const rsa = crypto_pkg.rsa;
+    const cp = cryptoProvider();
+    var native_key = try pure_zig.SoftwareRsaSigningKey.fromDer(rsa.testdata.private_key_pkcs1_der);
+    defer native_key.deinit();
+    const signer = native_key.signingKey();
+    try testing.expectEqual(provider.SignatureScheme.rsa_pss_rsae_sha256, signer.scheme());
+
+    const message = "rsa-pss signing differential fixture";
+    var native_entropy = pure_zig.DeterministicEntropy.init(0x5091);
+    var native_signature: [rsa.max_modulus_bytes]u8 = undefined;
+    const native_len = try signer.sign(message, native_entropy.entropy(), &native_signature);
+    try testing.expectEqual(@as(usize, 256), native_len);
+    const native_sig = native_signature[0..native_len];
+    const public_key = rsa.testdata.public_key_der;
+
+    try expectRsaPssAcceptsBoth(allocator, cp, public_key, message, native_sig);
+
+    try expectRsaPssRejects(allocator, cp, public_key, "mutated message", native_sig, error.AuthenticationFailed, .auth_fail);
+
+    var modified_sig = try allocator.dupe(u8, native_sig);
+    defer allocator.free(modified_sig);
+    modified_sig[modified_sig.len - 1] ^= 0x01;
+    try expectRsaPssRejects(allocator, cp, public_key, message, modified_sig, error.AuthenticationFailed, .auth_fail);
+
+    const malformed_key = [_]u8{0x30};
+    try expectRsaPssRejects(allocator, cp, &malformed_key, message, native_sig, error.InvalidInput, .malformed);
+
+    // Flip a byte deep in the modulus to model an unrelated key: still a
+    // structurally valid RSAPublicKey shape, wrong value.
+    var wrong_public: [rsa.testdata.public_key_der.len]u8 = undefined;
+    @memcpy(&wrong_public, rsa.testdata.public_key_der);
+    wrong_public[20] ^= 0xff;
+    try expectRsaPssRejects(allocator, cp, &wrong_public, message, native_sig, error.AuthenticationFailed, .auth_fail);
 }
 
 fn runEcdsaP256VerifyPositive(allocator: std.mem.Allocator) !void {
@@ -2120,6 +2191,7 @@ test "OpenSSL differential coverage registry has explicit coverage or waivers" {
     try expectCoverageOrWaiver(.key_exchange, .{ .group = .secp256r1 }, .negative);
     try expectCoverageOrWaiver(.signature_sign, .{ .signature = .ed25519 }, .positive);
     try expectCoverageOrWaiver(.signature_sign, .{ .signature = .ecdsa_secp256r1_sha256 }, .positive);
+    try expectCoverageOrWaiver(.signature_sign, .{ .signature = .rsa_pss_rsae_sha256 }, .positive);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ed25519 }, .positive);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ed25519 }, .negative);
     try expectCoverageOrWaiver(.signature_verify, .{ .signature = .ecdsa_secp256r1_sha256 }, .positive);

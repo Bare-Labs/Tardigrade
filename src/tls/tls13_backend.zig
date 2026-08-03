@@ -225,6 +225,7 @@ const cipher_tls_aes_128_gcm_sha256: u16 = @intFromEnum(tls_algorithms.CipherSui
 const group_x25519: u16 = @intFromEnum(tls_algorithms.NamedGroup.x25519);
 const sigalg_ed25519: u16 = @intFromEnum(tls_algorithms.SignatureScheme.ed25519);
 const sigalg_ecdsa_secp256r1_sha256: u16 = @intFromEnum(tls_algorithms.SignatureScheme.ecdsa_secp256r1_sha256);
+const sigalg_rsa_pss_rsae_sha256: u16 = @intFromEnum(tls_algorithms.SignatureScheme.rsa_pss_rsae_sha256);
 
 const ext_server_name: u16 = @intFromEnum(tls_algorithms.ExtensionType.server_name);
 const ext_supported_groups: u16 = @intFromEnum(tls_algorithms.ExtensionType.supported_groups);
@@ -250,7 +251,13 @@ const native_cipher_suites = [_]tls_algorithms.CipherSuite{
     .tls_chacha20_poly1305_sha256,
 };
 const native_named_groups = [_]tls_algorithms.NamedGroup{.x25519};
-const native_signature_schemes = [_]tls_algorithms.SignatureScheme{ .ed25519, .ecdsa_secp256r1_sha256 };
+/// #565: RSA-PSS-RSAE-SHA256 joins Ed25519/ECDSA-P256 as an engine-level
+/// capability now that native signing, verification, and scheme-aware
+/// credential selection are all wired through the opaque provider/credential
+/// seams. This is engine *capability*, not product *enablement* — see
+/// `crypto_profile.zig`'s `enabled_product_profiles`, which the appliance
+/// product deliberately keeps this scheme out of pending #391.
+const native_signature_schemes = [_]tls_algorithms.SignatureScheme{ .ed25519, .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha256 };
 
 pub const native_capabilities = tls_policy.Capabilities{
     .protocol_versions = &native_protocol_versions,
@@ -1918,7 +1925,7 @@ pub const Tls13Backend = struct {
         }
         for (self.policy.signature_schemes, 0..) |scheme, i| {
             switch (scheme) {
-                .ed25519, .ecdsa_secp256r1_sha256 => {},
+                .ed25519, .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha256 => {},
                 else => return error.InvalidTransportProfile,
             }
             if (containsEnum(tls_algorithms.SignatureScheme, self.policy.signature_schemes[0..i], scheme)) return error.InvalidTransportProfile;
@@ -3633,6 +3640,15 @@ pub const Tls13Backend = struct {
                 }
                 break :blk .ecdsa_secp256r1_sha256;
             },
+            sigalg_rsa_pss_rsae_sha256 => blk: {
+                if (parsed.pub_key_algo != .rsaEncryption) {
+                    return switch (parsed.pub_key_algo) {
+                        .X9_62_id_ecPublicKey, .curveEd25519 => .invalid_signature,
+                        else => .unsupported_certificate,
+                    };
+                }
+                break :blk .rsa_pss_rsae_sha256;
+            },
             else => unreachable,
         };
         // A provider missing a scheme this side's own negotiated policy
@@ -5226,6 +5242,7 @@ pub const Tls13Backend = struct {
                 .X9_62_id_ecPublicKey => |curve| curve == .X9_62_prime256v1,
                 else => false,
             },
+            .rsa_pss_rsae_sha256 => parsed.pub_key_algo == .rsaEncryption,
             else => false,
         };
     }
