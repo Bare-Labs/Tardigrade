@@ -1,0 +1,239 @@
+# Shared crypto fuzzing contract and provider targets (#376, epic #327-G)
+
+This is the shared fuzzing contract for the native TLS program's crypto
+surfaces. It defines the rules every fuzz target under epic #327-G must
+follow, and owns the standalone targets for the `CryptoProvider` boundary
+itself (AEAD, key exchange, signature verification, signing keys, and the
+shared secret containers). Protocol-specific fuzzing is owned by the epics
+that own those protocol surfaces and must consume this contract rather than
+inventing incompatible rules:
+
+- #491 — shared TLS handshake / negotiation / transcript / reassembly (#323)
+- #492 — DER / PEM / X.509 / path validation (#324)
+- #493 — TLS record / protection / encrypted-stream (#325)
+- #494 — session / PSK / ticket / resumption state (#326)
+- #247 — QUIC/H3 packet/frame/transport/QPACK/H3 validation
+
+This story does not re-implement those targets. Its own targets stop at the
+provider seam (`src/crypto/provider.zig`, `src/crypto/pure_zig.zig`,
+`src/crypto/rsa.zig`, `src/crypto/secrets.zig`): malformed input that can
+reach `CryptoProvider` directly, without needing a protocol state machine.
+
+## Existing fuzzing pattern in this repo
+
+There is no separate `fuzz/` tree. Fuzzing is inline `test "fuzz: ..."`
+blocks using Zig 0.16's built-in `std.testing.fuzz`/`std.testing.Smith`,
+next to the code they exercise or in a focused `tests/*.zig` file, each with
+a checked-in seed corpus passed as `.corpus = &.{...}`. Under a normal
+`zig build test` this deterministically replays only the seed corpus; under
+`zig build <step> -Doptimize=ReleaseFast --fuzz=<N>` it becomes real
+coverage-guided mutation. This mirrors `docs/QUIC_H3_FUZZ_MATRIX.md`'s
+program for QUIC/H3 (#247/#537); this document is the equivalent for the
+shared crypto surfaces.
+
+## Commands
+
+```bash
+# Deterministic smoke coverage (seed corpus replay only) — part of the
+# default `zig build test` and CI.
+zig build test-crypto --summary all --error-style verbose
+
+# The standalone provider-boundary targets owned by this story:
+zig build test-crypto-provider-fuzz --summary all --error-style verbose
+
+# Longer local/scheduled coverage-guided runs:
+zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
+zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: AEAD open" --fuzz=10M --summary all --error-style verbose
+zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: deriveSharedSecret" --fuzz=10M --summary all --error-style verbose
+zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: verify" --fuzz=10M --summary all --error-style verbose
+zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: generateKeyShare" --fuzz=10M --summary all --error-style verbose
+zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: FixedSecret" --fuzz=10M --summary all --error-style verbose
+zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: BoundedSecret" --fuzz=10M --summary all --error-style verbose
+```
+
+`-Dcrypto-test-filter` (added alongside the existing `-Dquic-test-filter`)
+gives explicit target selection for the `test-crypto-provider-fuzz` step; the
+`--fuzz=<runs>` limit keeps scheduled runs bounded (`K`/`M`/`G` suffixes
+scale it). #491–#494 should add their own protocol-scoped test steps and
+`-D<area>-test-filter` options following the same pattern rather than
+growing this one.
+
+## The shared contract
+
+Every target under epic #327-G — this story's provider targets and
+#491–#494's protocol targets alike — must satisfy the following.
+
+### Deterministic reproduction
+
+Every failure must identify:
+
+- the target name (the `test "fuzz: ..."` name Zig's runner already prints);
+- a deterministic seed/case ID (the minimized input Zig's fuzz runner
+  reports, or the checked-in corpus entry index);
+- input length;
+- a typed stage/failure class (which operation and which error variant, not
+  a bare panic message);
+- the exact local reproduction command (the commands above, optionally with
+  `-Dcrypto-test-filter` narrowed to the failing test name).
+
+Identical input/configuration must produce identical target behavior unless
+the target explicitly injects a deterministic clock/entropy stream. Every
+target in this file drives `pure_zig.Provider` through the injected
+`provider.Entropy` seam only (`pure_zig.DeterministicEntropy` in tests) —
+never ambient randomness — so this holds by construction.
+
+### Bounded work
+
+Every target defines explicit limits for the dimensions it can amplify. For
+the provider targets in this file that means: input bytes are read from
+`std.testing.Smith` into fixed-capacity stack buffers (never an unbounded
+`ArrayList`), so a target cannot be driven into an unbounded allocation by
+attacker-controlled length fields. There is no nesting/recursion, no graph
+exploration, and no allocation inside the hot path of AEAD/KEX/verify calls
+— the provider's own contract keeps those operations O(input length). The
+`BoundedSecret` property targets are the one place with real allocation, and
+they bound capacity to a small fixed maximum (see the test file) and always
+`deinit` before the next iteration.
+
+### Arithmetic safety
+
+Provider inputs are lengths and byte buffers, not wire-encoded variable-width
+integers, so most of the classic overflow-adjacent boundaries reduce to
+buffer-length boundaries. Targets and their deterministic regressions cover:
+
+- zero-length keys/nonces/tags/AD/plaintext/ciphertext and zero-length
+  signatures/public keys;
+- exact, one-under, and one-over the algorithm's required length for every
+  fixed-size field (AEAD key/nonce/tag, key-exchange public value/private
+  scalar/shared secret, fixed-length signature encodings);
+- a harness-chosen bounded "maximum" plaintext/message length, since AEAD and
+  signing have no wire-defined upper bound the way a DER length or QUIC
+  varint does.
+
+Checked add/subtract/multiply around offsets, padding, and record/ticket/DER
+lengths belongs to #491–#494 and #492 (those are the modules that actually
+compute such offsets); this file's targets never perform that arithmetic —
+`CryptoProvider` calls take already-sliced buffers.
+
+### Lifetime / borrowed-slice safety
+
+The provider boundary is explicit about this in its own doc comment
+(`src/crypto/provider.zig`, "Secrets are borrowed, never retained"): every
+slice a caller hands in is valid only for the call's duration, and the sole
+provider-owned secret is the opaque `SigningKey` handle. This file's targets
+exercise that contract:
+
+- `deinit`/destruction after both success and failure leaves no usable
+  private key: `SoftwareSigningKey`/`SoftwareEcdsaP256SigningKey` wipe
+  `key_pair.secret_key` in place (stack-resident, directly inspectable after
+  `deinit`); `SoftwareRsaSigningKey`/`rsa.PrivateKey` route through
+  `secrets.secureZeroAndFree` (heap-resident, inspected via a
+  `FixedBufferAllocator` the same way `src/crypto/secrets.zig`'s own
+  `BoundedSecret` tests do);
+- owned results (a returned shared secret, a returned signature) remain
+  stable in the caller's buffer after the call returns — nothing the
+  provider does later can invalidate them, because the provider retains no
+  pointer into caller-owned output;
+- borrowed results are never used outside their owner's lifetime — this is
+  structurally enforced here because every provider operation is a single
+  synchronous call with no retained borrow, not a stateful handle;
+  `SigningKey` is the one exception and it is the type these `deinit` tests
+  target;
+- allocation-failure and early-return cleanup: the `BoundedSecret` property
+  target injects allocator failure at random points via
+  `std.testing.FailingAllocator` and asserts no leak (`std.testing.allocator`
+  wraps every non-injecting path) and no partially-initialized secret escapes
+  a failed `init`;
+- partial outputs are not retained after a failed transactional operation:
+  AEAD `open` never leaves usable plaintext after `error.AuthenticationFailed`
+  (see below), and every `SigningKey.sign` implementation checks the output
+  buffer length *before* drawing entropy or computing anything, so a rejected
+  call never partially fills `out`.
+
+### Read/write/reentrancy separation
+
+Not applicable to this story's own targets: every `CryptoProvider` operation
+is a single synchronous, non-reentrant call with no network I/O, no output
+event carrier, and no partial-progress state to resume. State machines with
+this shape (TLS transcript, QUIC CRYPTO reassembly, H3 request state) are
+owned by #491/#493/#494/#247, which must apply this rule themselves.
+
+### Secret-safe diagnostics
+
+No target in this file ever formats or logs a `SigningKey`, `FixedSecret`,
+`BoundedSecret`, private scalar, or shared secret — `format` is a compile
+error on every secret-bearing type already (`@compileError("secret values
+must not be formatted or logged")` in `secrets.zig` and each
+`Software*SigningKey`), so a target that tried would fail to compile, not
+just fail to review-catch. Failure output uses case IDs, public lengths,
+algorithm/scheme names, and typed error variants, matching #375's audit
+posture (`docs/CRYPTO_SECURITY_AUDIT.md`).
+
+### Regression minimization
+
+Every deterministic crash, panic, invariant violation, lifetime failure, or
+semantic bug this story's targets find is checked in as a permanent
+deterministic `test` block next to the fuzz target in
+`tests/crypto_provider_fuzz.zig` (inline regression, the same pattern
+`docs/QUIC_H3_FUZZ_MATRIX.md` uses — there is no generic top-level
+`regression/` directory in this repo; PKI's `tests/vectors/pki/reduced/`
+manifest pattern is the one exception, reserved for #492's semantic
+certificate corpus). Do not fix a reproducible deterministic failure by
+adding a skip; fix the defect or the test's understanding of the contract.
+
+## Provider targets owned here
+
+`tests/crypto_provider_fuzz.zig` drives the real `pure_zig.Provider` (never a
+mock) through `provider.CryptoProvider`, following the same three-tier shape
+`tests/security/request_parser_corpus.zig` established: deterministic
+regression tests for named edge cases, plus a `std.testing.Smith`-driven
+generative `fuzz:` target with a seed corpus for each surface below. It
+complements rather than duplicates the deep existing deterministic coverage
+already in `src/crypto/pure_zig.zig`, `src/crypto/rsa.zig`, and
+`src/crypto/secrets.zig` (key-share buffer sizing, ECDSA/RSA entropy-failure
+and malformed-scalar rejection, `BoundedSecret` allocator-observable
+zeroization, etc.) — this file adds the pieces that were missing: the
+generative fuzz harnesses themselves, plus a small number of genuine
+deterministic gaps identified while wiring them up.
+
+| Area | Target | Properties covered | Open follow-up |
+| --- | --- | --- | --- |
+| AEAD seal/open | `tests/crypto_provider_fuzz.zig` `fuzz: AEAD open never leaves unauthenticated plaintext on arbitrary key/nonce/tag/ciphertext/AD`; deterministic wrong-length, tamper-zeroization, and zero/max-length regressions | Wrong key/nonce/tag length, ciphertext/plaintext length mismatch, truncated/mutated ciphertext/tag/AD rejected as `AuthenticationFailed` with the plaintext buffer fully zeroed, zero-length and harness-bounded maximum-length plaintext round-trip, for all three supported AEADs. | Overlap/alias behavior between `ciphertext` and `plaintext` buffers is not part of the documented provider contract today (`provider.zig`'s `aeadSeal`/`aeadOpen` doc comments are silent on aliasing); add coverage once that contract is decided rather than asserting undocumented behavior. |
+| Key exchange | `tests/crypto_provider_fuzz.zig` `fuzz: deriveSharedSecret never panics on arbitrary scalar and peer-public bytes`; `fuzz: generateKeyShare never panics on arbitrary output-buffer lengths`; deterministic wrong-length and output-buffer-bound regressions | Wrong-length private scalars, peer public keys, and output buffers rejected as `InvalidInput` for X25519 and secp256r1; output-buffer-length fuzzing for key-share generation. Complements the existing low-order/all-zero-point and malformed-scalar coverage already in `pure_zig.zig`. | Positive round-trip and deterministic/failing-entropy-during-keygen coverage already exists in `pure_zig.zig` (`"X25519 key shares agree..."`, `"secp256r1 key-share generation rejects bad buffers before entropy and handles entropy failure"`); not duplicated here. |
+| Signature verification | `tests/crypto_provider_fuzz.zig` `fuzz: verify never panics on arbitrary public key, message, and signature bytes`; deterministic malformed-key, malformed-signature, tampered-signature, and wrong-message/key regressions | Malformed public-key and signature encodings, structurally-valid single-bit-modified signatures, wrong message, and wrong key rejected without panic for Ed25519, ECDSA-P256/SHA-256, and RSA-PSS-RSAE/SHA-256, using `rsa.testdata`'s fixed RSA-2048 fixture as seed/provenance material rather than re-deriving key material. | None for the current provider `verify` surface. |
+| Signing-key boundary | `tests/crypto_provider_fuzz.zig` deterministic undersized-output-buffer and deinit-wipe regressions for all three software signing-key types | Undersized output buffers rejected before any entropy draw or computation, output buffer left untouched, for Ed25519 (new — the ECDSA/RSA equivalents already existed in `pure_zig.zig`); `deinit` wipes the retained private key bytes for `SoftwareSigningKey` and `SoftwareEcdsaP256SigningKey` (RSA's equivalent already exists as `rsa.zig`'s `"PrivateKey.deinit wipes the retained private exponent"`). | Malformed constructor/import input and entropy-failure coverage already exists per-type in `pure_zig.zig`/`rsa.zig`; not duplicated here. |
+| Shared secret helpers | `tests/crypto_provider_fuzz.zig` `fuzz: FixedSecret replace/eql/deinit preserve invariants under arbitrary overlapping and non-overlapping input`; `fuzz: BoundedSecret replace/eql/deinit preserve invariants under arbitrary capacity and allocator-failure injection` | `FixedSecret`/`BoundedSecret` `replace`/`copy`/`eql`/`deinit` across randomized capacities, content, and self-overlapping slices; `BoundedSecret` allocation-failure injection via `std.testing.FailingAllocator` with no leak under `std.testing.allocator` and no partially-initialized secret escaping a failed `init`. | `constantTimeEqual`'s functional behavior (equal/unequal/length-mismatch) and the `format`-is-a-compile-error guard are already covered deterministically in `secrets.zig` and `provider.zig`; not duplicated here. |
+
+## Ownership boundaries
+
+Same boundaries as the parent issue, restated for anyone landing on this
+document directly:
+
+- **#491** owns handshake message/extensions, canonical negotiation/policy,
+  transcript/HRR/ClientHello2 state, and shared TLS reassembly.
+- **#492** owns DER/PEM/X.509 semantic parsing, path building/validation,
+  graph/resource bounds, and hostile certificate seed reuse.
+- **#493** owns record codec/protection, epoch lifecycle, encrypted-stream
+  buffering/progression, partial I/O, and authentication-failure record
+  behavior.
+- **#494** owns `NewSessionTicket`, PSK/binder handling, session
+  codecs/cache, protected ticket envelopes/keyrings, resolver/runtime
+  selection, and resumption state lifetime.
+- **#247** owns QUIC packet/frame/transport-parameter/token/CRYPTO/ACK/
+  stream/QPACK/H3 transport fuzzing and related interop/benchmark harnesses.
+
+Do not pull those concerns back into this story merely because their
+implementation consumes cryptography, and do not have this story re-fuzz a
+protocol module's own state machine — call `CryptoProvider` directly instead.
+
+## CI model
+
+`zig build test` (and therefore every CI job that runs it, per
+`.github/workflows/ci.yml`) already includes `test-crypto-provider-fuzz`'s
+deterministic seed-corpus replay — no separate CI job was added. Longer
+coverage-guided runs use the `-Doptimize=ReleaseFast --fuzz=<N>` commands
+above as scheduled or manual local runs, the same model
+`docs/QUIC_H3_FUZZ_MATRIX.md` uses; they are not wired into required PR CI
+because they are unbounded by design. Coordinate future OSS-Fuzz/OpenSSF
+onboarding with #121 rather than making external service integration a
+blocker here.
