@@ -1,6 +1,7 @@
 const std = @import("std");
 const credentials = @import("credentials.zig");
 const secrets = @import("crypto_secrets");
+const crypto_provider_pkg = @import("crypto").provider;
 
 pub const LoadedIdentity = struct {
     allocator: std.mem.Allocator,
@@ -19,10 +20,17 @@ pub const LoadedIdentity = struct {
     }
 };
 
+/// `entropy` is required for RSA private keys: `credentials.Identity
+/// .initPkcs8WithEntropy` draws its `p`/`q` primality-check Miller-Rabin
+/// witnesses from it (see that function's doc comment). Ed25519/ECDSA-P256
+/// keys never touch it, but the key type isn't known until parsing is
+/// underway, so every caller must supply one — production callers pass the
+/// real OS entropy source (`production_crypto.OsEntropy`).
 pub fn loadIdentity(
     allocator: std.mem.Allocator,
     cert_path: []const u8,
     key_path: []const u8,
+    entropy: crypto_provider_pkg.Entropy,
 ) !LoadedIdentity {
     const cert_raw = try readSmallFile(allocator, cert_path);
     defer secrets.secureZeroAndFree(allocator, cert_raw);
@@ -35,7 +43,7 @@ pub fn loadIdentity(
     errdefer secrets.secureZeroAndFree(allocator, key_der);
 
     if (cert_chain.len == 0) return error.PemBlockNotFound;
-    const identity = try credentials.Identity.initPkcs8(cert_chain[0], key_der);
+    const identity = try credentials.Identity.initPkcs8WithEntropy(cert_chain[0], key_der, entropy);
     return .{
         .allocator = allocator,
         .cert_chain = cert_chain,
