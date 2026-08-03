@@ -8,8 +8,8 @@
 //! Deliberately narrow profile, one interoperable code path per choice:
 //!   - cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384,
 //!     TLS_CHACHA20_POLY1305_SHA256
-//!   - key exchange: X25519
-//!   - signature: Ed25519 (server CertificateVerify)
+//!   - key exchange: X25519, secp256r1 / P-256
+//!   - signature: Ed25519, ECDSA-P256, RSA-PSS-RSAE-SHA256
 //!   - server-only authentication; client certificates are not offered
 //!   - trust: an explicitly pinned certificate (deterministic fixture /
 //!     deployment pin) or an explicit insecure mode reporting `not_checked`
@@ -42,20 +42,9 @@ const Sha256 = crypto.hash.sha2.Sha256;
 const Sha384 = crypto.hash.sha2.Sha384;
 const crypto_provider_pkg = crypto_pkg.provider;
 
-/// The one key-exchange group this profile negotiates. Key-share generation
-/// and shared-secret derivation both go through `CryptoProvider` (#490), so
-/// this file names only the provider's `Group` enum value and the wire
-/// lengths derived from it — never a concrete `std` X25519 Diffie-Hellman
-/// type.
-const key_share_group = crypto_provider_pkg.Group.x25519;
-const key_share_public_len = key_share_group.publicKeyLength();
-const key_share_shared_len = key_share_group.sharedSecretLength();
-/// X25519 private scalar length (RFC 7748). The provider boundary does not
-/// separately name a "private scalar length" per group (only the public key
-/// and shared-secret lengths, which happen to coincide with it for this
-/// curve); this local constant exists so `EphemeralKeyShare` below can size
-/// its private-key buffer without importing a concrete crypto type.
-const key_share_private_len = 32;
+const key_share_public_len = crypto_provider_pkg.max_public_key_len;
+const key_share_private_len = crypto_provider_pkg.max_private_scalar_len;
+const key_share_shared_len = crypto_provider_pkg.max_shared_secret_len;
 
 /// This backend's own ephemeral key-share storage: raw public/private bytes
 /// produced by `CryptoProvider.generateKeyShare`/consumed by
@@ -64,8 +53,29 @@ const key_share_private_len = 32;
 /// caller-owned buffers the provider boundary's borrowed-secret contract
 /// requires.
 const EphemeralKeyShare = struct {
+    group: tls_algorithms.NamedGroup = .x25519,
     public_key: [key_share_public_len]u8 = undefined,
+    public_key_len: usize = 0,
     private_key: [key_share_private_len]u8 = undefined,
+    private_key_len: usize = 0,
+
+    fn publicSlice(self: *const EphemeralKeyShare) []const u8 {
+        return self.public_key[0..self.public_key_len];
+    }
+
+    fn privateSlice(self: *const EphemeralKeyShare) []const u8 {
+        return self.private_key[0..self.private_key_len];
+    }
+};
+
+const PeerKeyShare = struct {
+    group: tls_algorithms.NamedGroup = .x25519,
+    public_key: [key_share_public_len]u8 = undefined,
+    public_key_len: usize = 0,
+
+    fn slice(self: *const PeerKeyShare) []const u8 {
+        return self.public_key[0..self.public_key_len];
+    }
 };
 
 const EncryptionLevel = events.EncryptionEpoch;
@@ -185,8 +195,8 @@ pub const certificate_entry_overhead = 3 + 2;
 /// Caller-owned bound on a CertificateVerify signature. The engine hands the
 /// signing provider a buffer this size; a provider whose signature would not
 /// fit reports overflow rather than exceeding the bound (#334). Comfortably
-/// above Ed25519 (64) and DER-encoded ECDSA P-256 (~72).
-pub const max_signature_len = 256;
+/// above Ed25519 (64), DER-encoded ECDSA P-256 (~72), and RSA-4096 PSS (512).
+pub const max_signature_len = crypto_provider_pkg.max_signature_len;
 
 /// Worst-case size of everything the server flight buffer carries *besides*
 /// the Certificate message, so a caller can preflight how much of
@@ -222,7 +232,6 @@ fn checkedAdd(a: usize, b: usize) HandshakeError!usize {
 const tls13_version: u16 = @intFromEnum(tls_algorithms.ProtocolVersion.tls13);
 const legacy_version: u16 = tls_algorithms.legacy_version;
 const cipher_tls_aes_128_gcm_sha256: u16 = @intFromEnum(tls_algorithms.CipherSuite.tls_aes_128_gcm_sha256);
-const group_x25519: u16 = @intFromEnum(tls_algorithms.NamedGroup.x25519);
 const sigalg_ed25519: u16 = @intFromEnum(tls_algorithms.SignatureScheme.ed25519);
 const sigalg_ecdsa_secp256r1_sha256: u16 = @intFromEnum(tls_algorithms.SignatureScheme.ecdsa_secp256r1_sha256);
 const sigalg_rsa_pss_rsae_sha256: u16 = @intFromEnum(tls_algorithms.SignatureScheme.rsa_pss_rsae_sha256);
@@ -250,7 +259,7 @@ const native_cipher_suites = [_]tls_algorithms.CipherSuite{
     .tls_aes_256_gcm_sha384,
     .tls_chacha20_poly1305_sha256,
 };
-const native_named_groups = [_]tls_algorithms.NamedGroup{.x25519};
+const native_named_groups = [_]tls_algorithms.NamedGroup{ .x25519, .secp256r1 };
 /// #565: RSA-PSS-RSAE-SHA256 joins Ed25519/ECDSA-P256 as an engine-level
 /// capability now that native signing, verification, and scheme-aware
 /// credential selection are all wired through the opaque provider/credential
@@ -684,7 +693,7 @@ pub const Tls13Backend = struct {
     pending_signature: [max_signature_len]u8 = undefined,
     pending_client_session_id: [32]u8 = undefined,
     pending_client_session_id_len: usize = 0,
-    pending_client_share: [key_share_public_len]u8 = undefined,
+    pending_client_share: PeerKeyShare = .{},
     pending_client_hello_ready: bool = false,
     /// Client (#362): resumption tickets this backend may offer, owned until
     /// moved out at ClientHello emission or wiped after ServerHello selects
@@ -1603,6 +1612,58 @@ pub const Tls13Backend = struct {
         if (!tls_crypto_profile.supportsCipherSuite(caps, self.negotiated_cipher_suite)) return error.SecretExportFailed;
     }
 
+    fn providerGroup(group: tls_algorithms.NamedGroup) ?crypto_provider_pkg.Group {
+        return switch (group) {
+            .x25519 => .x25519,
+            .secp256r1 => .secp256r1,
+            .secp384r1 => null,
+        };
+    }
+
+    fn providerGroupOrIllegal(group: tls_algorithms.NamedGroup) HandshakeError!crypto_provider_pkg.Group {
+        return providerGroup(group) orelse error.IllegalParameter;
+    }
+
+    fn groupPublicLen(group: tls_algorithms.NamedGroup) HandshakeError!usize {
+        return (try providerGroupOrIllegal(group)).publicKeyLength();
+    }
+
+    fn groupPrivateLen(group: tls_algorithms.NamedGroup) HandshakeError!usize {
+        _ = try providerGroupOrIllegal(group);
+        return crypto_provider_pkg.max_private_scalar_len;
+    }
+
+    fn groupSharedLen(group: tls_algorithms.NamedGroup) HandshakeError!usize {
+        return (try providerGroupOrIllegal(group)).sharedSecretLength();
+    }
+
+    fn keyShareFromSlice(group: tls_algorithms.NamedGroup, bytes: []const u8) HandshakeError!PeerKeyShare {
+        const n = try groupPublicLen(group);
+        if (bytes.len != n) return error.IllegalParameter;
+        var out = PeerKeyShare{ .group = group, .public_key_len = n };
+        @memcpy(out.public_key[0..n], bytes);
+        return out;
+    }
+
+    fn generateEphemeral(self: *Tls13Backend, group: tls_algorithms.NamedGroup, out: *EphemeralKeyShare) HandshakeError!void {
+        const provider_group = try providerGroupOrIllegal(group);
+        const public_len = provider_group.publicKeyLength();
+        const private_len = try groupPrivateLen(group);
+        out.* = .{
+            .group = group,
+            .public_key_len = public_len,
+            .private_key_len = private_len,
+        };
+        errdefer crypto_provider_pkg.secureZero(&out.private_key);
+        self.crypto_provider.generateKeyShare(provider_group, out.public_key[0..public_len], out.private_key[0..private_len]) catch
+            return error.SecretExportFailed;
+    }
+
+    fn validateNegotiatedGroupCapability(self: *const Tls13Backend, group: tls_algorithms.NamedGroup) HandshakeError!void {
+        const caps = self.crypto_provider.capabilities();
+        if (!tls_crypto_profile.supportsNamedGroup(caps, group)) return error.SecretExportFailed;
+    }
+
     /// #564 review: `self.policy.cipher_suites` in preference order,
     /// intersected with what the live `CryptoProvider` can actually
     /// perform (AEAD + transcript hash + HKDF, via
@@ -1630,13 +1691,47 @@ pub const Tls13Backend = struct {
         return out[0..len];
     }
 
-    /// `self.policy` with `cipher_suites` replaced by `effectiveCipherSuites`
+    fn effectiveNamedGroups(self: *const Tls13Backend, out: *[native_named_groups.len]tls_algorithms.NamedGroup) []const tls_algorithms.NamedGroup {
+        const caps = self.crypto_provider.capabilities();
+        var len: usize = 0;
+        for (self.policy.named_groups) |group| {
+            if (tls_crypto_profile.supportsNamedGroup(caps, group)) {
+                out[len] = group;
+                len += 1;
+            }
+        }
+        return out[0..len];
+    }
+
+    fn writeSupportedGroups(groups: []const tls_algorithms.NamedGroup, w: *Writer) HandshakeError!void {
+        try w.u16_(ext_supported_groups);
+        try w.u16_(@intCast(2 + 2 * groups.len));
+        try w.u16_(@intCast(2 * groups.len));
+        for (groups) |group| {
+            try w.u16_(@intFromEnum(group));
+        }
+    }
+
+    fn sameGroups(a: []const tls_algorithms.NamedGroup, b: []const tls_algorithms.NamedGroup) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |left, right| {
+            if (left != right) return false;
+        }
+        return true;
+    }
+
+    /// `self.policy` with capability-filtered cipher suites and named groups
     /// — for callers (`tls_negotiation.negotiateServerHello`,
     /// `hello_retry` validation) that take a whole `Policy` rather than a
     /// bare suite list. `suites_storage` must outlive the returned value.
-    fn effectivePolicy(self: *const Tls13Backend, suites_storage: *[native_cipher_suites.len]tls_algorithms.CipherSuite) tls_policy.Policy {
+    fn effectivePolicy(
+        self: *const Tls13Backend,
+        suites_storage: *[native_cipher_suites.len]tls_algorithms.CipherSuite,
+        groups_storage: *[native_named_groups.len]tls_algorithms.NamedGroup,
+    ) tls_policy.Policy {
         var policy = self.policy;
         policy.cipher_suites = self.effectiveCipherSuites(suites_storage);
+        policy.named_groups = self.effectiveNamedGroups(groups_storage);
         return policy;
     }
 
@@ -1687,7 +1782,7 @@ pub const Tls13Backend = struct {
         crypto.secureZero(u8, &self.pending_signature);
         crypto.secureZero(u8, &self.pending_client_session_id);
         self.pending_client_session_id_len = 0;
-        crypto.secureZero(u8, &self.pending_client_share);
+        crypto.secureZero(u8, std.mem.asBytes(&self.pending_client_share));
         self.pending_client_hello_ready = false;
         if (self.schedule) |*schedule| schedule.wipe();
         self.schedule = null;
@@ -1875,6 +1970,8 @@ pub const Tls13Backend = struct {
             // this call's state is touched at all.
             var suites_storage: [native_cipher_suites.len]tls_algorithms.CipherSuite = undefined;
             if (self.effectiveCipherSuites(&suites_storage).len == 0) return error.IllegalParameter;
+            var groups_storage: [native_named_groups.len]tls_algorithms.NamedGroup = undefined;
+            if (self.effectiveNamedGroups(&groups_storage).len == 0) return error.IllegalParameter;
             const base_len = try self.clientHelloEncodedLen();
             if (base_len > max_message_len) return error.InvalidTransportProfile;
             // #362: decide which offered tickets fit — and in what wire
@@ -1920,7 +2017,7 @@ pub const Tls13Backend = struct {
             if (containsEnum(tls_algorithms.CipherSuite, self.policy.cipher_suites[0..i], cipher)) return error.InvalidTransportProfile;
         }
         for (self.policy.named_groups, 0..) |group, i| {
-            if (group != .x25519) return error.InvalidTransportProfile;
+            if (!containsEnum(tls_algorithms.NamedGroup, &native_named_groups, group)) return error.InvalidTransportProfile;
             if (containsEnum(tls_algorithms.NamedGroup, self.policy.named_groups[0..i], group)) return error.InvalidTransportProfile;
         }
         for (self.policy.signature_schemes, 0..) |scheme, i| {
@@ -2369,12 +2466,10 @@ pub const Tls13Backend = struct {
             try w.u16_(@intFromEnum(version));
         }
 
-        try w.u16_(ext_supported_groups);
-        try w.u16_(@intCast(2 + 2 * self.policy.named_groups.len));
-        try w.u16_(@intCast(2 * self.policy.named_groups.len));
-        for (self.policy.named_groups) |group| {
-            try w.u16_(@intFromEnum(group));
-        }
+        var groups_storage: [native_named_groups.len]tls_algorithms.NamedGroup = undefined;
+        const offered_groups = self.effectiveNamedGroups(&groups_storage);
+        if (offered_groups.len == 0) return error.IllegalParameter;
+        try writeSupportedGroups(offered_groups, &w);
 
         try w.u16_(ext_signature_algorithms);
         try w.u16_(@intCast(2 + 2 * self.policy.signature_schemes.len));
@@ -2386,22 +2481,18 @@ pub const Tls13Backend = struct {
         try w.u16_(ext_key_share);
         switch (self.initial_key_share_mode) {
             .normal => {
+                const group = offered_groups[0];
                 var share: EphemeralKeyShare = .{};
-                // Armed before the fallible call (#490 review): the provider
-                // interface does not promise `share.private_key` stays
-                // untouched on failure, so a conforming provider that writes
-                // a partial scalar and then fails must still have it wiped.
+                try self.generateEphemeral(group, &share);
                 defer crypto_provider_pkg.secureZero(&share.private_key);
-                self.crypto_provider.generateKeyShare(key_share_group, &share.public_key, &share.private_key) catch
-                    return error.SecretExportFailed;
                 self.key_pair = share;
                 self.key_pair_present = true;
 
-                try w.u16_(2 + 2 + 2 + key_share_public_len);
-                try w.u16_(2 + 2 + key_share_public_len); // client_shares
-                try w.u16_(group_x25519);
-                try w.u16_(key_share_public_len);
-                try w.bytes(&share.public_key);
+                try w.u16_(@intCast(2 + 2 + 2 + share.public_key_len));
+                try w.u16_(@intCast(2 + 2 + share.public_key_len)); // client_shares
+                try w.u16_(@intFromEnum(group));
+                try w.u16_(@intCast(share.public_key_len));
+                try w.bytes(share.publicSlice());
             },
             // #484: advertise the group in `supported_groups` above but send
             // a legal empty `client_shares` vector, so a native server
@@ -2751,13 +2842,21 @@ pub const Tls13Backend = struct {
         len = try checkedAdd(len, 2); // legacy_version
         len = try checkedAdd(len, 32); // random
         len = try checkedAdd(len, 1); // legacy_session_id
-        len = try checkedAdd(len, 2 + 2 * self.policy.cipher_suites.len); // cipher_suites vector
+        var suites_storage: [native_cipher_suites.len]tls_algorithms.CipherSuite = undefined;
+        const offered_suites = self.effectiveCipherSuites(&suites_storage);
+        var groups_storage: [native_named_groups.len]tls_algorithms.NamedGroup = undefined;
+        const offered_groups = self.effectiveNamedGroups(&groups_storage);
+        len = try checkedAdd(len, 2 + 2 * offered_suites.len); // cipher_suites vector
         len = try checkedAdd(len, 1 + 1); // compression_methods vector + null
         len = try checkedAdd(len, 2); // extensions vector length
         len = try checkedAdd(len, 2 + 2 + 1 + 2 * self.policy.protocol_versions.len); // supported_versions
-        len = try checkedAdd(len, 2 + 2 + 2 + 2 * self.policy.named_groups.len); // supported_groups
+        len = try checkedAdd(len, 2 + 2 + 2 + 2 * offered_groups.len); // supported_groups
         len = try checkedAdd(len, 2 + 2 + 2 + 2 * self.policy.signature_schemes.len); // signature_algorithms
-        len = try checkedAdd(len, 2 + 2 + 2 + 2 + 2 + key_share_public_len); // key_share
+        const key_share_len = switch (self.initial_key_share_mode) {
+            .normal => 2 + 2 + 2 + 2 + 2 + try groupPublicLen(offered_groups[0]),
+            .empty => 2 + 2 + 2,
+        };
+        len = try checkedAdd(len, key_share_len); // key_share
         len = try checkedAdd(len, try self.policyAlpnOfferEncodedLen());
         if (self.serverNameSlice()) |name| {
             len = try checkedAdd(len, 2 + 2 + 2 + 1 + 2 + name.len);
@@ -2826,7 +2925,7 @@ pub const Tls13Backend = struct {
 
         var selected_version: ?tls_algorithms.ProtocolVersion = null;
         var selected_group: ?tls_algorithms.NamedGroup = null;
-        var peer_share: ?[key_share_public_len]u8 = null;
+        var peer_share: ?PeerKeyShare = null;
         var selected_identity: ?u16 = null;
         var guard = ExtensionGuard{};
         var extensions = Reader{ .bytes = try r.slice(try r.u16_()) };
@@ -2842,8 +2941,8 @@ pub const Tls13Backend = struct {
                 },
                 ext_key_share => {
                     const group = tls_algorithms.fromInt(tls_algorithms.NamedGroup, try ext.u16_()) orelse return error.IllegalParameter;
-                    if (try ext.u16_() != key_share_public_len) return error.IllegalParameter;
-                    peer_share = (try ext.slice(key_share_public_len))[0..key_share_public_len].*;
+                    const share_len = try ext.u16_();
+                    peer_share = try keyShareFromSlice(group, try ext.slice(share_len));
                     selected_group = group;
                     try ext.expectEnd();
                 },
@@ -2862,7 +2961,7 @@ pub const Tls13Backend = struct {
             .named_group = named_group,
             .alpn = null,
         }) catch |err| return mapNegotiationError(err);
-        if (named_group != .x25519 or protocol_version != .tls13) return error.IllegalParameter;
+        if (protocol_version != .tls13) return error.IllegalParameter;
         // #484: the final ServerHello must remain consistent with what this
         // connection's HelloRetryRequest actually selected — a check on top
         // of (not a substitute for) the ordinary policy-tuple check above,
@@ -2882,18 +2981,23 @@ pub const Tls13Backend = struct {
         // consistent with it above); the one-and-only selection point for a
         // connection that never retried.
         try self.validateNegotiatedSuiteCapability();
+        try self.validateNegotiatedGroupCapability(named_group);
         self.core.transcript.selectFamily(self.negotiatedHash());
         const share = peer_share orelse return error.MalformedHandshake;
+        if (share.group != named_group) return error.IllegalParameter;
 
         // A low-order/identity peer share is a well-formed 32-byte field with an
         // illegal value (predictable all-zero shared secret), not malformed wire
         // data.
         if (!self.key_pair_present) return error.InvalidHandshakeState;
+        if (self.key_pair.group != named_group) return error.IllegalParameter;
+        const provider_group = try providerGroupOrIllegal(named_group);
+        const shared_len = try groupSharedLen(named_group);
         var shared: [key_share_shared_len]u8 = undefined;
         // Armed before the fallible call (#490 review): a conforming
         // provider may write a partial shared secret and then fail.
         defer crypto_provider_pkg.secureZero(&shared);
-        self.crypto_provider.deriveSharedSecret(key_share_group, &self.key_pair.private_key, &share, &shared) catch |err| return switch (err) {
+        self.crypto_provider.deriveSharedSecret(provider_group, self.key_pair.privateSlice(), share.slice(), shared[0..shared_len]) catch |err| return switch (err) {
             error.InvalidInput => error.IllegalParameter,
             error.UnsupportedCapability => error.SecretExportFailed,
         };
@@ -2956,10 +3060,10 @@ pub const Tls13Backend = struct {
             // equivalently authenticated without a fresh Certificate flight.
             try sink.emitCertificate(.valid);
             const n = self.negotiatedDigestLen();
-            try self.installScheduleWithPsk(psk[0..n], &shared, self.core.transcriptHash().slice());
+            try self.installScheduleWithPsk(psk[0..n], shared[0..shared_len], self.core.transcriptHash().slice());
             crypto.secureZero(u8, psk);
         } else {
-            try self.installSchedule(&shared, self.core.transcriptHash().slice());
+            try self.installSchedule(shared[0..shared_len], self.core.transcriptHash().slice());
         }
         try self.emitHandshakeSecrets(sink);
         try sink.emitDiscardKeys(.initial);
@@ -3048,12 +3152,10 @@ pub const Tls13Backend = struct {
             try w.u16_(@intFromEnum(version));
         }
 
-        try w.u16_(ext_supported_groups);
-        try w.u16_(@intCast(2 + 2 * self.policy.named_groups.len));
-        try w.u16_(@intCast(2 * self.policy.named_groups.len));
-        for (self.policy.named_groups) |group| {
-            try w.u16_(@intFromEnum(group));
-        }
+        var groups_storage: [native_named_groups.len]tls_algorithms.NamedGroup = undefined;
+        const offered_groups = self.effectiveNamedGroups(&groups_storage);
+        if (!sameGroups(offered_groups, parsed.offers.supported_groups[0..parsed.offers.supported_groups_len])) return error.IllegalParameter;
+        try writeSupportedGroups(offered_groups, &w);
 
         try w.u16_(ext_signature_algorithms);
         try w.u16_(@intCast(2 + 2 * self.policy.signature_schemes.len));
@@ -3064,25 +3166,22 @@ pub const Tls13Backend = struct {
 
         try w.u16_(ext_key_share);
         if (request.selected_group) |group| {
-            if (group != .x25519) return error.IllegalParameter;
+            try self.validateNegotiatedGroupCapability(group);
             // #484: destroy ClientHello1's ephemeral key before generating
             // the fresh share ClientHello2 requires — never hold two live
             // private keys, and never reuse the superseded one.
             self.wipeEphemeral();
             var share: EphemeralKeyShare = .{};
-            // Armed before the fallible call (#490 review) — see the
-            // matching comment in `sendClientHello`.
+            try self.generateEphemeral(group, &share);
             defer crypto_provider_pkg.secureZero(&share.private_key);
-            self.crypto_provider.generateKeyShare(key_share_group, &share.public_key, &share.private_key) catch
-                return error.SecretExportFailed;
             self.key_pair = share;
             self.key_pair_present = true;
 
-            try w.u16_(2 + 2 + 2 + key_share_public_len);
-            try w.u16_(2 + 2 + key_share_public_len); // client_shares
-            try w.u16_(group_x25519);
-            try w.u16_(key_share_public_len);
-            try w.bytes(&share.public_key);
+            try w.u16_(@intCast(2 + 2 + 2 + share.public_key_len));
+            try w.u16_(@intCast(2 + 2 + share.public_key_len)); // client_shares
+            try w.u16_(@intFromEnum(group));
+            try w.u16_(@intCast(share.public_key_len));
+            try w.bytes(share.publicSlice());
         } else {
             // Cookie-only retry: ClientHello2's `key_share` extension must be
             // byte-identical to ClientHello1's. Rebuilding it from the
@@ -3999,8 +4098,9 @@ pub const Tls13Backend = struct {
         // afterward with `SecretExportFailed` instead of negotiating the
         // fallback.
         var suites_storage: [native_cipher_suites.len]tls_algorithms.CipherSuite = undefined;
-        const hello_selection = tls_negotiation.negotiateServerHello(self.effectivePolicy(&suites_storage), &offers) catch |err| return mapNegotiationError(err);
-        if (hello_selection.version != .tls13 or hello_selection.named_group != .x25519) return error.IllegalParameter;
+        var groups_storage: [native_named_groups.len]tls_algorithms.NamedGroup = undefined;
+        const hello_selection = tls_negotiation.negotiateServerHello(self.effectivePolicy(&suites_storage, &groups_storage), &offers) catch |err| return mapNegotiationError(err);
+        if (hello_selection.version != .tls13) return error.IllegalParameter;
         // #564: commit the negotiated suite — and select the transcript's
         // hash family accordingly — as soon as it is known, before any
         // possible HelloRetryRequest: `Core.acceptReceived` has already fed
@@ -4014,6 +4114,7 @@ pub const Tls13Backend = struct {
         self.negotiated_cipher_suite = hello_selection.cipher_suite;
         self.negotiated_named_group = hello_selection.named_group;
         try self.validateNegotiatedSuiteCapability();
+        try self.validateNegotiatedGroupCapability(hello_selection.named_group);
         self.core.transcript.selectFamily(self.negotiatedHash());
         if (observer.psk_ext != null and !observer.psk_modes_seen) return error.MissingExtension;
         // #366: early_data without an accompanying PSK offer is malformed —
@@ -4053,8 +4154,7 @@ pub const Tls13Backend = struct {
                 return self.emitHelloRetryRequest(raw, group, cookie, hello_selection, parsed.legacy_session_id, sink);
             },
         };
-        if (selected_key_share.len != key_share_public_len) return error.MalformedHandshake;
-        const client_share = selected_key_share[0..key_share_public_len].*;
+        const client_share = try keyShareFromSlice(hello_selection.named_group, selected_key_share);
 
         if (hello_selection.alpn) |protocol| {
             self.setSelectedAlpn(protocol.bytes);
@@ -4201,7 +4301,7 @@ pub const Tls13Backend = struct {
     fn beginServerSelection(
         self: *Tls13Backend,
         session_id: []const u8,
-        client_share: [key_share_public_len]u8,
+        client_share: PeerKeyShare,
         sink: *EventSink,
     ) HandshakeError!void {
         if (session_id.len > self.pending_client_session_id.len) return error.IllegalParameter;
@@ -4239,7 +4339,7 @@ pub const Tls13Backend = struct {
     fn emitServerHelloAndAuthFlight(
         self: *Tls13Backend,
         session_id: []const u8,
-        client_share: [key_share_public_len]u8,
+        client_share: PeerKeyShare,
         credential: credentials.SelectedCredential,
         sink: *EventSink,
     ) HandshakeError!void {
@@ -4249,17 +4349,17 @@ pub const Tls13Backend = struct {
         // Validate the peer share before emitting anything: deriveSharedSecret
         // rejects low-order/identity public keys (all-zero shared secret)
         // rather than deriving a predictable secret.
+        if (client_share.group != self.negotiated_named_group) return error.IllegalParameter;
+        const provider_group = try providerGroupOrIllegal(self.negotiated_named_group);
+        const shared_len = try groupSharedLen(self.negotiated_named_group);
         var share: EphemeralKeyShare = .{};
-        // Armed before the fallible call (#490 review) — see the matching
-        // comment in `sendClientHello`.
+        try self.generateEphemeral(self.negotiated_named_group, &share);
         defer crypto_provider_pkg.secureZero(&share.private_key);
-        self.crypto_provider.generateKeyShare(key_share_group, &share.public_key, &share.private_key) catch
-            return error.SecretExportFailed;
         self.key_pair = share;
         self.key_pair_present = true;
         var shared: [key_share_shared_len]u8 = undefined;
         defer crypto_provider_pkg.secureZero(&shared);
-        self.crypto_provider.deriveSharedSecret(key_share_group, &share.private_key, &client_share, &shared) catch |err| return switch (err) {
+        self.crypto_provider.deriveSharedSecret(provider_group, share.privateSlice(), client_share.slice(), shared[0..shared_len]) catch |err| return switch (err) {
             error.InvalidInput => error.IllegalParameter,
             error.UnsupportedCapability => error.SecretExportFailed,
         };
@@ -4302,10 +4402,10 @@ pub const Tls13Backend = struct {
         try hello.u16_(2);
         try hello.u16_(self.negotiatedVersionCode());
         try hello.u16_(ext_key_share);
-        try hello.u16_(2 + 2 + key_share_public_len);
+        try hello.u16_(@intCast(2 + 2 + share.public_key_len));
         try hello.u16_(self.negotiatedGroupCode());
-        try hello.u16_(key_share_public_len);
-        try hello.bytes(&share.public_key);
+        try hello.u16_(@intCast(share.public_key_len));
+        try hello.bytes(share.publicSlice());
         if (psk_selected) |sel| {
             try hello.u16_(pre_shared_key.ext_pre_shared_key);
             try hello.u16_(2);
@@ -4320,9 +4420,9 @@ pub const Tls13Backend = struct {
 
         if (psk_selected) |*sel| {
             const n = self.negotiatedDigestLen();
-            try self.installScheduleWithPsk(sel.psk[0..n], &shared, self.core.transcriptHash().slice());
+            try self.installScheduleWithPsk(sel.psk[0..n], shared[0..shared_len], self.core.transcriptHash().slice());
         } else {
-            try self.installSchedule(&shared, self.core.transcriptHash().slice());
+            try self.installSchedule(shared[0..shared_len], self.core.transcriptHash().slice());
         }
         try self.emitHandshakeSecrets(sink);
         try sink.emitDiscardKeys(.initial);
@@ -5757,6 +5857,68 @@ const TestProviderStorage = struct {
     }
 };
 
+const TestFailingKeyShareProvider = struct {
+    backing: crypto_provider_pkg.CryptoProvider,
+
+    fn init(backing: crypto_provider_pkg.CryptoProvider) TestFailingKeyShareProvider {
+        return .{ .backing = backing };
+    }
+
+    fn provider(self: *TestFailingKeyShareProvider) crypto_provider_pkg.CryptoProvider {
+        return .{ .context = self, .vtable = &vtable, .entropy = self.backing.entropy };
+    }
+
+    const vtable = crypto_provider_pkg.CryptoProvider.VTable{
+        .capabilities = capFn,
+        .hkdfExtract = extractFn,
+        .hkdfExpandLabel = expandFn,
+        .aeadSeal = sealFn,
+        .aeadOpen = openFn,
+        .quicHeaderProtectionMask = hpFn,
+        .generateKeyShare = genFn,
+        .deriveSharedSecret = deriveFn,
+        .verify = verifyFn,
+    };
+
+    fn capFn(ctx: *anyopaque) crypto_provider_pkg.Capabilities {
+        const self: *TestFailingKeyShareProvider = @ptrCast(@alignCast(ctx));
+        return self.backing.capabilities();
+    }
+
+    fn extractFn(_: *anyopaque, _: crypto_provider_pkg.Hash, _: []const u8, _: []const u8, _: []u8) crypto_provider_pkg.HkdfError!void {
+        unreachable;
+    }
+
+    fn expandFn(_: *anyopaque, _: crypto_provider_pkg.Hash, _: []const u8, _: []const u8, _: []const u8, _: []u8) crypto_provider_pkg.HkdfError!void {
+        unreachable;
+    }
+
+    fn sealFn(_: *anyopaque, _: crypto_provider_pkg.Aead, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: []u8, _: []u8) crypto_provider_pkg.SealError!void {
+        unreachable;
+    }
+
+    fn openFn(_: *anyopaque, _: crypto_provider_pkg.Aead, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: []u8) crypto_provider_pkg.OpenError!void {
+        unreachable;
+    }
+
+    fn hpFn(_: *anyopaque, _: crypto_provider_pkg.QuicHeaderProtection, _: []const u8, _: []const u8, _: []u8) crypto_provider_pkg.QuicHeaderProtectionError!void {
+        unreachable;
+    }
+
+    fn genFn(_: *anyopaque, _: crypto_provider_pkg.Group, _: []u8, private_out: []u8) crypto_provider_pkg.KeyShareError!void {
+        @memset(private_out, 0x5a);
+        return error.ProviderFailure;
+    }
+
+    fn deriveFn(_: *anyopaque, _: crypto_provider_pkg.Group, _: []const u8, _: []const u8, _: []u8) crypto_provider_pkg.DeriveError!void {
+        unreachable;
+    }
+
+    fn verifyFn(_: *anyopaque, _: crypto_provider_pkg.SignatureScheme, _: []const u8, _: []const u8, _: []const u8) crypto_provider_pkg.VerifyError!void {
+        unreachable;
+    }
+};
+
 const test_crypto_provider_seed: u64 = 0x71357_490;
 
 test "TLS-owned backend does not embed maximum ticket storage" {
@@ -5794,6 +5956,44 @@ test "TLS-owned backend teardown clears transcript-adjacent and peer scratch" {
     try std.testing.expectEqual(@as(usize, 0), backend.peer_chain_count);
     try std.testing.expectEqual(@as(usize, 0), backend.peer_chain_len);
     try std.testing.expectEqual(tls_handshake_codec.HandshakeLifecycle.failed, backend.core.handshake_lifecycle);
+}
+
+test "client key-share preflight length matches emitted ClientHello encodings" {
+    inline for (.{ Tls13Backend.InitialKeyShareMode.normal, Tls13Backend.InitialKeyShareMode.empty }) |mode| {
+        var test_provider_storage: TestProviderStorage = .{};
+        var backend = Tls13Backend.initClientWithOptions(
+            .{ .hello_random = [_]u8{0x41} ** 32 },
+            test_provider_storage.init(test_crypto_provider_seed),
+            .{ .pinned_certificate = testdata.certificate_der },
+            .record,
+            .{ .initial_key_share_mode = mode },
+        );
+        defer backend.deinit();
+
+        const expected = try backend.clientHelloEncodedLen();
+        var sink = EventSink{};
+        defer sink.deinit();
+        try backend.backend().start(.client, {}, &sink);
+        try std.testing.expectEqual(@as(usize, 1), sink.len);
+        try std.testing.expectEqual(expected, sink.items[0].handshake_bytes.data.len);
+    }
+}
+
+test "provider key-share failure wipes caller-owned output private scalar" {
+    var backing_storage: TestProviderStorage = .{};
+    var failing = TestFailingKeyShareProvider.init(backing_storage.init(test_crypto_provider_seed));
+    var backend = Tls13Backend.initClient(
+        .{ .hello_random = [_]u8{0x41} ** 32 },
+        failing.provider(),
+        .{ .pinned_certificate = testdata.certificate_der },
+        .record,
+    );
+    defer backend.deinit();
+
+    var share: EphemeralKeyShare = .{};
+    try std.testing.expectError(error.SecretExportFailed, backend.generateEphemeral(.x25519, &share));
+    try std.testing.expectEqual(@as(usize, crypto_provider_pkg.max_private_scalar_len), share.private_key_len);
+    try std.testing.expect(std.mem.allEqual(u8, &share.private_key, 0));
 }
 
 test "transport profile validation fails before lifecycle or transcript advance" {

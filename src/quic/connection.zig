@@ -3907,6 +3907,66 @@ const TestPair = struct {
         return pair;
     }
 
+    fn initWithSuiteAndGroup(
+        allocator: std.mem.Allocator,
+        comptime suite: tls_core.algorithms.CipherSuite,
+        comptime group: tls_core.algorithms.NamedGroup,
+    ) !*TestPair {
+        const pair = try allocator.create(TestPair);
+        const client_crypto_provider = pair.client_provider_storage.init(0x442_c);
+        const server_crypto_provider = pair.server_provider_storage.init(0x442_5);
+        const PolicyStorage = struct {
+            const suites = [_]tls_core.algorithms.CipherSuite{suite};
+            const groups = [_]tls_core.algorithms.NamedGroup{group};
+        };
+        pair.* = .{
+            .client_provider_storage = pair.client_provider_storage,
+            .server_provider_storage = pair.server_provider_storage,
+            .client_backend = tls_backend_mod.Tls13Backend.initClient(
+                .{ .hello_random = [_]u8{0xc1} ** 32 },
+                client_crypto_provider,
+                .{ .pinned_certificate = tls_backend_mod.testdata.certificate_der },
+            ),
+            .server_backend = tls_backend_mod.Tls13Backend.initServer(
+                .{ .hello_random = [_]u8{0x51} ** 32 },
+                server_crypto_provider,
+                try tls_backend_mod.Identity.initPkcs8(
+                    tls_backend_mod.testdata.certificate_der,
+                    tls_backend_mod.testdata.private_key_pkcs8_der,
+                ),
+            ),
+        };
+        pair.client_backend.engine.policy.cipher_suites = &PolicyStorage.suites;
+        pair.server_backend.engine.policy.cipher_suites = &PolicyStorage.suites;
+        pair.client_backend.engine.policy.named_groups = &PolicyStorage.groups;
+        pair.server_backend.engine.policy.named_groups = &PolicyStorage.groups;
+        errdefer allocator.destroy(pair);
+        pair.client = try Connection.init(allocator, .{
+            .role = .client,
+            .local_cid = &client_cid,
+            .original_destination_cid = &odcid,
+            .initial_secret_dcid = &odcid,
+            .peer_cid = &odcid,
+            .tls = pair.client_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
+            .now_us = pair.now_us,
+            .initial_path = client_path,
+        });
+        errdefer pair.client.deinit();
+        pair.server = try Connection.init(allocator, .{
+            .role = .server,
+            .local_cid = &odcid,
+            .original_destination_cid = &odcid,
+            .initial_secret_dcid = &odcid,
+            .peer_cid = &client_cid,
+            .tls = pair.server_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
+            .now_us = pair.now_us,
+            .initial_path = server_path,
+        });
+        return pair;
+    }
+
     fn initWithTicketConsumer(
         allocator: std.mem.Allocator,
         limits: tls_core.session.Limits,
@@ -4037,6 +4097,27 @@ const TestPair = struct {
         allocator.destroy(self);
     }
 
+    fn deliverOneClientDatagram(self: *TestPair) !void {
+        var buf: [2048]u8 = undefined;
+        const t = self.client.pollTransmitOnPath(&buf, self.now_us) orelse return error.TestUnexpectedResult;
+        const ingress = quic_path.PathKey{ .local = t.path.remote, .remote = t.path.local };
+        try self.server.ingestOnPath(t.bytes, ingress, test_challenge_entropy, self.now_us);
+        self.now_us += 500;
+    }
+
+    fn deliverServerUntilClientHandshakeKeys(self: *TestPair) !void {
+        var deliveries: usize = 0;
+        while (deliveries < 8) : (deliveries += 1) {
+            var buf: [2048]u8 = undefined;
+            const t = self.server.pollTransmitOnPath(&buf, self.now_us) orelse break;
+            const ingress = quic_path.PathKey{ .local = t.path.remote, .remote = t.path.local };
+            try self.client.ingestOnPath(t.bytes, ingress, test_challenge_entropy, self.now_us);
+            self.now_us += 500;
+            if (self.client.adapter.hasProtectionKeys(.handshake, .write) catch unreachable) return;
+        }
+        return error.TestUnexpectedResult;
+    }
+
     /// Move all pending datagrams both ways until neither side has output.
     /// Delivers every transmit on the exact path it was addressed to, so a
     /// scenario that migrates the client still routes correctly.
@@ -4062,6 +4143,22 @@ const TestPair = struct {
         return error.PumpStalled;
     }
 };
+
+fn expectProtectionProfile(
+    adapter: *const tls_adapter.QuicTlsAdapter,
+    level: EncryptionLevel,
+    direction: tls_adapter.Direction,
+    expected: tls_adapter.PacketProtectionProfile,
+) !void {
+    var keys = (try adapter.protectionKeys(level, direction)) orelse return error.TestUnexpectedResult;
+    defer keys.deinit();
+    try testing.expectEqual(expected.hash, keys.profile.hash);
+    try testing.expectEqual(expected.aead, keys.profile.aead);
+    try testing.expectEqual(expected.header_protection, keys.profile.header_protection);
+    try testing.expectEqual(expected.key_len, keys.key.slice().len);
+    try testing.expectEqual(expected.iv_len, keys.iv.slice().len);
+    try testing.expectEqual(expected.hp_key_len, keys.hp.slice().len);
+}
 
 test "Connection.init failure before the handshake is assigned does not deinit undefined storage" {
     const allocator = testing.allocator;
@@ -4110,43 +4207,63 @@ test "driver: client and server complete the handshake over protected packets" {
     }
 }
 
-test "driver: negotiated TLS suites protect QUIC packets end to end" {
+test "driver: negotiated TLS suites and groups protect QUIC packets end to end" {
     const allocator = testing.allocator;
     inline for (.{
         tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256,
         tls_core.algorithms.CipherSuite.tls_aes_256_gcm_sha384,
         tls_core.algorithms.CipherSuite.tls_chacha20_poly1305_sha256,
     }) |suite| {
-        const suites = [_]tls_core.algorithms.CipherSuite{suite};
-        var pair = try TestPair.init(allocator);
-        defer pair.deinit(allocator);
-        pair.client_backend.engine.policy.cipher_suites = &suites;
-        pair.server_backend.engine.policy.cipher_suites = &suites;
+        inline for (.{
+            tls_core.algorithms.NamedGroup.x25519,
+            tls_core.algorithms.NamedGroup.secp256r1,
+        }) |group| {
+            var pair = try TestPair.initWithSuiteAndGroup(allocator, suite, group);
+            defer pair.deinit(allocator);
 
-        try pair.pump();
-        try testing.expectEqual(State.established, pair.client.state());
-        try testing.expectEqual(State.established, pair.server.state());
-        try testing.expectEqual(suite, pair.client.adapter.negotiatedCipherSuite().?);
-        try testing.expectEqual(suite, pair.server.adapter.negotiatedCipherSuite().?);
+            const initial_profile = tls_adapter.PacketProtectionProfile.forInitial();
+            try expectProtectionProfile(&pair.client.adapter, .initial, .write, initial_profile);
+            try expectProtectionProfile(&pair.server.adapter, .initial, .write, initial_profile);
 
-        var client_write = (try pair.client.adapter.protectionKeys(.application, .write)).?;
-        defer client_write.deinit();
-        var server_read = (try pair.server.adapter.protectionKeys(.application, .read)).?;
-        defer server_read.deinit();
-        const expected_profile = tls_adapter.PacketProtectionProfile.forCipherSuite(suite);
-        try testing.expectEqual(expected_profile.aead, client_write.profile.aead);
-        try testing.expectEqual(expected_profile.header_protection, client_write.profile.header_protection);
-        try testing.expectEqual(expected_profile.key_len, client_write.key.slice().len);
-        try testing.expectEqualSlices(u8, client_write.key.slice(), server_read.key.slice());
+            try pair.deliverOneClientDatagram();
+            const expected_profile = tls_adapter.PacketProtectionProfile.forCipherSuite(suite);
+            try testing.expectEqual(suite, pair.server.adapter.negotiatedCipherSuite().?);
+            try testing.expectEqual(group, pair.server_backend.engine.negotiated_named_group);
+            try expectProtectionProfile(&pair.server.adapter, .handshake, .write, expected_profile);
+            try expectProtectionProfile(&pair.server.adapter, .handshake, .read, expected_profile);
 
-        const id = try pair.client.openStream(.bidi);
-        _ = try pair.client.writeStream(id, "suite-protected h3", true);
-        try pair.pump();
-        try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
-        var buf: [64]u8 = undefined;
-        const got = try pair.server.readStream(id, &buf);
-        try testing.expectEqualStrings("suite-protected h3", buf[0..got.len]);
-        try testing.expect(got.fin);
+            try pair.deliverServerUntilClientHandshakeKeys();
+            try testing.expectEqual(suite, pair.client.adapter.negotiatedCipherSuite().?);
+            try testing.expectEqual(group, pair.client_backend.engine.negotiated_named_group);
+            try expectProtectionProfile(&pair.client.adapter, .handshake, .write, expected_profile);
+            try expectProtectionProfile(&pair.client.adapter, .handshake, .read, expected_profile);
+
+            try pair.pump();
+            try testing.expectEqual(State.established, pair.client.state());
+            try testing.expectEqual(State.established, pair.server.state());
+            try testing.expectEqual(suite, pair.client.adapter.negotiatedCipherSuite().?);
+            try testing.expectEqual(suite, pair.server.adapter.negotiatedCipherSuite().?);
+            try testing.expectEqual(group, pair.client_backend.engine.negotiated_named_group);
+            try testing.expectEqual(group, pair.server_backend.engine.negotiated_named_group);
+
+            var client_write = (try pair.client.adapter.protectionKeys(.application, .write)).?;
+            defer client_write.deinit();
+            var server_read = (try pair.server.adapter.protectionKeys(.application, .read)).?;
+            defer server_read.deinit();
+            try testing.expectEqual(expected_profile.aead, client_write.profile.aead);
+            try testing.expectEqual(expected_profile.header_protection, client_write.profile.header_protection);
+            try testing.expectEqual(expected_profile.key_len, client_write.key.slice().len);
+            try testing.expectEqualSlices(u8, client_write.key.slice(), server_read.key.slice());
+
+            const id = try pair.client.openStream(.bidi);
+            _ = try pair.client.writeStream(id, "suite-protected h3", true);
+            try pair.pump();
+            try testing.expectEqual(@as(?StreamId, id), pair.server.acceptStream());
+            var buf: [64]u8 = undefined;
+            const got = try pair.server.readStream(id, &buf);
+            try testing.expectEqualStrings("suite-protected h3", buf[0..got.len]);
+            try testing.expect(got.fin);
+        }
     }
 }
 

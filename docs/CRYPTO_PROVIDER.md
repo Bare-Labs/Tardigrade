@@ -60,7 +60,8 @@ changes when it lands.
 - **Key exchange** — ephemeral key-share generation and shared-secret derivation
   for X25519 and secp256r1.
 - **Signatures** — verification for Ed25519, ECDSA-P256, and RSA-PSS, plus
-  signing through the opaque `SigningKey` handle for Ed25519 and ECDSA-P256.
+  signing through the opaque `SigningKey` handle for Ed25519, ECDSA-P256, and
+  RSA-PSS.
 - **Random bytes**, **constant-time comparison**, and **secure zeroing**.
 - **Secret containers** for fixed-size stack material and bounded heap material,
   with explicit replacement and deinitialization rules.
@@ -69,7 +70,7 @@ changes when it lands.
 The pure-Zig backend implements the overlap the TLS/QUIC engines need today:
 HKDF (SHA-256/384), all three AEAD primitives, AES-128/AES-256/ChaCha20 QUIC
 header protection, X25519, secp256r1 ECDH, Ed25519, ECDSA-P256
-signing/verification, and RSA-PSS verification. The remaining algorithms are
+signing/verification, and RSA-PSS signing/verification. The remaining algorithms are
 named by the interface so protocol and negotiation code is written once;
 capability discovery reports them absent and every entry point returns
 `error.UnsupportedCapability` until a backend provides them.
@@ -83,10 +84,7 @@ data, not prose:
 - **Protocol integration** — `Row.integrations`, a `(Consumer,
   IntegrationStatus)` list: whether each consumer's *live* runtime actually
   calls the provider for it today. This is per consumer because it commonly
-  differs within one row — e.g. RSA-PSS-RSAE-SHA256 is `.live` for PKI
-  chain-signature verification but `.not_integrated` for the TLS 1.3
-  handshake engine, which negotiates only Ed25519/ECDSA-P256 CertificateVerify
-  and does not claim RSA support it cannot execute (#490). `IntegrationStatus.
+  differs within one row. `IntegrationStatus.
   live` means the live runtime calls `CryptoProvider` today, not that it could
   if wired up — see `profile.zig`'s integration-status tests, which pin the
   rows this holds for.
@@ -99,11 +97,11 @@ data, not prose:
   negotiated by the native appliance); since #564 made the native engine's
   handshake/transcript/key schedule cipher/hash-agile, both are negotiated
   there too and now claim `.native_appliance`. secp256r1 is the current
-  standing example, for a different reason since #567: the pure-Zig backend
-  now implements P-256 ECDH key-share generation and shared-secret
-  derivation behind `CryptoProvider`, but the native appliance's TLS
-  handshake matrix does not yet select the group (#335), so it still does
-  not claim `.native_appliance`; `openssl_status = .provider_deferred` (no
+  standing example: the pure-Zig backend and shared TLS engine now implement
+  P-256 ECDH key-share generation, selection, and shared-secret derivation
+  behind `CryptoProvider`, but the native appliance product profile still
+  deliberately does not offer the group pending #391, so it does not claim
+  `.native_appliance`; `openssl_status = .provider_deferred` (no
   in-process OpenSSL `CryptoProvider` yet) is beside the point, since the
   real general-purpose OpenSSL product supports P-256 ECDH outside this
   seam and so still claims `.general_purpose_openssl`. See `profile.zig`'s
@@ -130,10 +128,10 @@ lists only the consumers whose live runtime calls `CryptoProvider` today
 | QUIC AES-256 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection | live — every non-Initial send/receive path in `src/quic/tls_adapter.zig` selects this through `CryptoProvider` when TLS_AES_256_GCM_SHA384 is negotiated (#566) | native appliance only (QUIC-specific; the general-purpose backend is TLS-over-TCP) |
 | QUIC ChaCha20 header protection | supported | `std.crypto` behind provider mask API | provider deferred | QUIC packet protection | live — every non-Initial send/receive path in `src/quic/tls_adapter.zig` selects this through `CryptoProvider` when TLS_CHACHA20_POLY1305_SHA256 is negotiated (#566) | native appliance only (QUIC-specific; the general-purpose backend is TLS-over-TCP) |
 | X25519 | supported | `std.crypto` | provider deferred | TLS key share, QUIC TLS bridge | live — `src/tls/tls13_backend.zig` generates its ephemeral key share and derives the shared secret through `CryptoProvider.generateKeyShare`/`.deriveSharedSecret` | native appliance, general-purpose OpenSSL |
-| secp256r1 / P-256 | supported | `std.crypto` | provider deferred | TLS key share, PKI | not integrated — provider ECDH key-share generation and shared-secret derivation are available, but live native TLS negotiation does not select the group until #335 | general-purpose OpenSSL only |
+| secp256r1 / P-256 | supported | `std.crypto` | provider deferred | TLS key share, PKI | live for TLS key exchange — the shared backend advertises/selects the group, handles HRR retry, and derives through `CryptoProvider.generateKeyShare`/`.deriveSharedSecret` (#335); PKI does not use ECDH | general-purpose OpenSSL only |
 | Ed25519 | supported | `std.crypto` | provider deferred | CertificateVerify, PKI | live for both — PKI chain-signature verification and the handshake's own CertificateVerify proof-of-possession (`src/tls/tls13_backend.zig`) call `CryptoProvider.verify`; local CertificateVerify signing (`src/tls/credentials.zig`'s `Identity.sign`) signs through the opaque `provider.SigningKey` handle rather than a concrete `std.crypto.sign.Ed25519.KeyPair` | native appliance, general-purpose OpenSSL |
 | ECDSA-P256-SHA256 | supported | `std.crypto` signing/verification | provider deferred | CertificateVerify, PKI | live for both, same split as Ed25519 — chain verification and CertificateVerify both call `CryptoProvider.verify`, and local signing goes through `provider.SigningKey` with per-signature noise from injected provider entropy. Signatures are canonical DER, but are **not** low-S normalized; valid in-range high-S and low-S forms verify without rewriting | native appliance, general-purpose OpenSSL |
-| RSA-PSS-RSAE-SHA256 | supported | project verifier | provider deferred | CertificateVerify, PKI | PKI chain-signature verification only, same split as Ed25519 | general-purpose OpenSSL only (the native appliance negotiates Ed25519/ECDSA only) |
+| RSA-PSS-RSAE-SHA256 | supported | project code | provider deferred | CertificateVerify, PKI | live for both — PKI chain-signature verification and TLS CertificateVerify verification call `CryptoProvider.verify`; local CertificateVerify signing uses the opaque `provider.SigningKey` path and is covered through RSA-2048/3072/4096 TLS handshakes | general-purpose OpenSSL only (the native appliance negotiates Ed25519/ECDSA only) |
 | DER parser | provider deferred | project code | provider deferred | PKI | none — parsing has no `CryptoProvider` entry point | native appliance, general-purpose OpenSSL (shared protocol-local code) |
 | chain builder, WebPKI validation | provider deferred | unavailable | provider deferred | PKI | none | neither — not implemented yet |
 | injected random bytes, secure zero, constant-time compare | supported | project code | provider deferred / project code | all secret-bearing paths | live for X25519 and secp256r1 ephemeral key-share generation — `CryptoProvider.generateKeyShare` draws randomness from the provider's own injected `Entropy` (#490/#563); TLS ClientHello/ServerHello random and QUIC/resumption nonces still inject through their own longer-standing `Entropy` parameters instead of `CryptoProvider.entropy`, since that randomness is not itself a provider operation; secure-zero/constant-time-compare are shared helpers, not vtable dispatch targets | native appliance, general-purpose OpenSSL |
@@ -150,9 +148,9 @@ backend), then pass the returned `asPolicyCapabilities()` slice set to
 `tls.Policy`. There is no product-agnostic shortcut: which cipher suites,
 named groups, and signature schemes a product actually negotiates is a
 product decision, not something a provider's raw capability set can answer on
-its own — a pure-Zig provider reports secp256r1 ECDH and RSA-PSS verification
-support, but `fromProfile` still withholds unsupported combinations for
-`.native_appliance` until that product's engine negotiates them, while
+its own — a pure-Zig provider reports secp256r1 ECDH and RSA-PSS signing/verification
+support, but `fromProfile` still withholds product-disabled combinations for
+`.native_appliance` until that product profile enables them, while
 `.general_purpose_openssl` advertises the full set. Each cipher suite is
 gated on every profile dimension it binds together (AEAD, transcript hash,
 HKDF hash), not only its AEAD row. When a call site must accept hand-written
@@ -165,8 +163,8 @@ TLS available only through the existing non-native backend. QUIC packet
 protection — AEAD seal/open and header protection on every send/receive path
 in `src/quic/tls_adapter.zig` — runs through `CryptoProvider`, and so does the
 TLS 1.3 handshake engine underneath it: the key schedule (HKDF-Extract,
-HKDF-Expand-Label, and Finished `verify_data`), X25519 key-share generation
-and shared-secret derivation, and CertificateVerify authentication all cross
+HKDF-Expand-Label, and Finished `verify_data`), X25519/secp256r1 key-share
+generation and shared-secret derivation, and CertificateVerify authentication all cross
 `CryptoProvider` (#490). Local CertificateVerify signing keeps using the
 existing opaque `CredentialProvider`/`SelectedCredential` contract
 (`src/tls/credentials.zig`), whose concrete fixed/native implementation signs
@@ -247,7 +245,7 @@ randomness — ephemeral scalars, nonces, per-signature noise — from the
 the OS CSPRNG in production; tests and reproducible fixtures use
 `pure_zig.DeterministicEntropy` (a seedable splitmix64 source that is explicitly
 *not* a CSPRNG). Entropy failure surfaces as `ProviderError.EntropyFailure`.
-The native TLS 1.3 engine's ephemeral X25519 scalar is one concrete instance
+The native TLS 1.3 engine's ephemeral X25519/P-256 scalar is one concrete instance
 of this (#490): `Tls13Backend` no longer carries its own key-share seed —
 `CryptoProvider.generateKeyShare` draws that randomness from the same
 injected `Entropy` every other provider operation uses, and a production
