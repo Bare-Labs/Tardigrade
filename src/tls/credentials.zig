@@ -526,7 +526,13 @@ pub const Identity = struct {
         rsa: pure_zig.SoftwareRsaSigningKey,
     };
 
-    pub const InitError = error{InvalidPrivateKey};
+    /// `EntropyFailure` is distinct from `InvalidPrivateKey`: it means the
+    /// key itself may well be fine but `initPkcs8WithEntropy`'s injected
+    /// entropy source failed mid-RSA-import (drawing Miller-Rabin
+    /// witnesses), a transient/local provider fault, not malformed
+    /// credential data — callers that log or alert on these should not
+    /// conflate "bad key on disk" with "entropy source is unhealthy."
+    pub const InitError = error{ InvalidPrivateKey, EntropyFailure };
 
     /// Load an Ed25519 or ECDSA-P256 PKCS#8 private key. Returns
     /// `error.InvalidPrivateKey` for an RSA key — RSA's `p`/`q` primality
@@ -562,7 +568,10 @@ pub const Identity = struct {
         } else |_| {}
         const rsa_key_der = try rsaKeyDerFromPkcs8(pkcs8_key_der);
         const rsa_entropy = entropy orelse return error.InvalidPrivateKey;
-        var software_key = pure_zig.SoftwareRsaSigningKey.fromDer(rsa_key_der, rsa_entropy) catch return error.InvalidPrivateKey;
+        var software_key = pure_zig.SoftwareRsaSigningKey.fromDer(rsa_key_der, rsa_entropy) catch |err| return switch (err) {
+            error.EntropyFailure => error.EntropyFailure,
+            error.InvalidInput, error.UnsupportedCapability, error.ProviderFailure => error.InvalidPrivateKey,
+        };
         errdefer software_key.deinit();
 
         // A structurally valid RSA private key is not necessarily *this*
@@ -1631,6 +1640,24 @@ test "identity parser without an entropy source rejects an RSA key" {
     try testing.expectError(
         error.InvalidPrivateKey,
         Identity.initPkcs8(testdata.rsa_certificate_der, testdata.rsa_private_key_pkcs8_der),
+    );
+}
+
+test "identity parser preserves EntropyFailure distinctly from InvalidPrivateKey for RSA" {
+    // A failing entropy source is a local/transient provider fault, not
+    // malformed credential data — initPkcs8WithEntropy must not collapse it
+    // into the same error a caller would otherwise read as "bad key on
+    // disk."
+    const FailingEntropy = struct {
+        fn fill(_: *anyopaque, _: []u8) crypto_provider_pkg.EntropyError!void {
+            return error.EntropyFailure;
+        }
+    };
+    var context: u8 = 0;
+    const failing_entropy = crypto_provider_pkg.Entropy{ .context = &context, .fillFn = FailingEntropy.fill };
+    try testing.expectError(
+        error.EntropyFailure,
+        Identity.initPkcs8WithEntropy(testdata.rsa_certificate_der, testdata.rsa_private_key_pkcs8_der, failing_entropy),
     );
 }
 

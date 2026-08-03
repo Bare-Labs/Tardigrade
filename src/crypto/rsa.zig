@@ -450,9 +450,17 @@ fn drawWitness(n_minus_one: []const u8, entropy: provider.Entropy, out: []u8) Er
 /// primitive `signPssSha256`/`verifyPssSha256` use, so no new modexp
 /// implementation is introduced. `candidate` must be minimal big-endian
 /// bytes (no leading zero byte) and nonzero, matching every call site here
-/// (`p`/`q` after `stripLeadingZero`). `n_minus_one`/`d`/each drawn witness
-/// are wiped before return: all three are derived from (or, for `d`,
-/// directly determine information about) the secret prime `candidate`.
+/// (`p`/`q` after `stripLeadingZero`).
+///
+/// Every stack value that holds the secret modulus (`candidate`, i.e. `p` or
+/// `q`) or a value derived from it — the raw byte buffers *and* every
+/// `ff.Modulus`/`Fe` value (`modulus_fe` literally embeds `candidate`;
+/// `n_minus_one_fe`, each round's `base_fe`, and the evolving `x` residue
+/// are all computed from it) — is wiped via `defer secrets.secureZero(...)`
+/// immediately after its declaration, so it is scrubbed on every exit path:
+/// normal completion, a composite verdict, or an entropy failure. `base_fe`
+/// and `x` are declared inside the round loop, so their `defer`s fire once
+/// per round (before the next witness is drawn), not only once at the end.
 fn isProbablePrime(candidate: []const u8, entropy: provider.Entropy) Error!bool {
     if (candidate.len == 0) return false;
     if (candidate.len == 1) return candidate[0] == 2 or candidate[0] == 3;
@@ -475,9 +483,12 @@ fn isProbablePrime(candidate: []const u8, entropy: provider.Entropy) Error!bool 
     }
 
     const Fp = ff.Modulus(max_modulus_bits);
-    const modulus_fe = Fp.fromBytes(candidate, .big) catch return false;
-    const n_minus_one_fe = Fp.Fe.fromBytes(modulus_fe, n_minus_one, .big) catch return false;
-    const one_fe = modulus_fe.one();
+    var modulus_fe = Fp.fromBytes(candidate, .big) catch return false;
+    defer secrets.secureZero(std.mem.asBytes(&modulus_fe));
+    var n_minus_one_fe = Fp.Fe.fromBytes(modulus_fe, n_minus_one, .big) catch return false;
+    defer secrets.secureZero(std.mem.asBytes(&n_minus_one_fe));
+    var one_fe = modulus_fe.one();
+    defer secrets.secureZero(std.mem.asBytes(&one_fe));
 
     var base_buf: [max_modulus_bytes]u8 = undefined;
     const base = base_buf[0..candidate.len];
@@ -486,9 +497,11 @@ fn isProbablePrime(candidate: []const u8, entropy: provider.Entropy) Error!bool 
     var round: u32 = 0;
     while (round < miller_rabin_rounds) : (round += 1) {
         try drawWitness(n_minus_one, entropy, base);
-        const base_fe = Fp.Fe.fromBytes(modulus_fe, base, .big) catch return false;
+        var base_fe = Fp.Fe.fromBytes(modulus_fe, base, .big) catch return false;
+        defer secrets.secureZero(std.mem.asBytes(&base_fe));
 
         var x = modulus_fe.powWithEncodedExponent(base_fe, d, .big) catch return false;
+        defer secrets.secureZero(std.mem.asBytes(&x));
         if (x.eql(one_fe) or x.eql(n_minus_one_fe)) continue;
 
         var composite_for_this_witness = true;
