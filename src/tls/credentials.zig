@@ -542,7 +542,20 @@ pub const Identity = struct {
             return .{ .certificate_der = certificate_der, .key = .{ .ecdsa_p256 = software_key } };
         } else |_| {}
         const rsa_key_der = try rsaKeyDerFromPkcs8(pkcs8_key_der);
-        const software_key = pure_zig.SoftwareRsaSigningKey.fromDer(rsa_key_der) catch return error.InvalidPrivateKey;
+        var software_key = pure_zig.SoftwareRsaSigningKey.fromDer(rsa_key_der) catch return error.InvalidPrivateKey;
+        errdefer software_key.deinit();
+
+        // A structurally valid RSA private key is not necessarily *this*
+        // certificate's key — advertise a credential only when the leaf's
+        // own RSAPublicKey (modulus and exponent) matches what the private
+        // key can actually sign for. Without this check, an unrelated RSA
+        // certificate/key pairing would be selected and only fail once the
+        // peer rejects the CertificateVerify signature.
+        const leaf = (crypto.Certificate{ .buffer = certificate_der, .index = 0 }).parse() catch
+            return error.InvalidPrivateKey;
+        if (leaf.pub_key_algo != .rsaEncryption or !software_key.matchesPublicKeyDer(leaf.pubKey()))
+            return error.InvalidPrivateKey;
+
         return .{ .certificate_der = certificate_der, .key = .{ .rsa = software_key } };
     }
 
@@ -630,15 +643,25 @@ pub const Identity = struct {
     /// inside RFC 5958): SEQUENCE { INTEGER 0, SEQUENCE { OID
     /// 1.2.840.113549.1.1.1, NULL }, OCTET STRING { RSAPrivateKey } }, and
     /// return the borrowed `RSAPrivateKey` DER `pure_zig.SoftwareRsaSigningKey
-    /// .fromDer` parses directly.
+    /// .fromDer` parses directly. Every structural expectation is enforced,
+    /// not just the leading OID: the mandatory NULL parameters, that the
+    /// AlgorithmIdentifier and outer SEQUENCE each stop exactly where their
+    /// known fields end (no unparsed RFC 5958 attributes silently ignored),
+    /// and that the top-level input carries no trailing bytes.
     fn rsaKeyDerFromPkcs8(der: []const u8) InitError![]const u8 {
         const oid_rsa_encryption = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
+        const null_params = [_]u8{ 0x05, 0x00 };
         var walker = DerWalker{ .bytes = der };
         var outer = try walker.sequence();
         try outer.expectInteger(0);
         var alg = try outer.sequence();
         try alg.expectBytes(&oid_rsa_encryption);
-        return outer.octetString();
+        try alg.expectBytes(&null_params);
+        if (alg.pos != alg.bytes.len) return error.InvalidPrivateKey;
+        const key_der = try outer.octetString();
+        if (outer.pos != outer.bytes.len) return error.InvalidPrivateKey;
+        if (walker.pos != walker.bytes.len) return error.InvalidPrivateKey;
+        return key_der;
     }
 
     const DerWalker = struct {
@@ -859,6 +882,14 @@ pub const testdata = struct {
 
     pub const rsa_certificate_der: []const u8 = &rsa_certificate_bytes;
     pub const rsa_private_key_pkcs8_der: []const u8 = &rsa_private_key_bytes;
+
+    // A second, unrelated RSA-2048 key (different modulus/exponents), used
+    // only to prove `rsa_certificate_der` paired with the *wrong* private
+    // key is rejected rather than silently accepted as a usable credential.
+    const other_rsa_private_key_bytes = hexBytes(
+        "308204be020100300d06092a864886f70d0101010500048204a8308204a40201000282010100f15415a9a76266a3fa82a83f6dd5e12645ab9a716f8a53589428c630ff9cbe7a0c797f140657ccda65d113102274b13cea73ec8e8a19d490312745dec15f42cd8c04ecec80ae32afaa4c0d1f91408a33a9a74c1c1543d070a5a469e3fb0c8d91406526d40e1a38d5262aeeed2c64e5e908996cf0a6674a033037751c0b798e43c0704ae2a50e2c77302179c2e910bcb484c15f59c2a0e3bde01061fe4b36d56ab60cb84592526e53f2d616f0e13afc94b9319572b12c12db3a9f3682c181be40ef6adf4549b79ebf17b7d3ffa61a243e2c891df46122f7d3f24a7d2cfa416af411a798908fb1284dad1b2e8e90cf62970d367a0653de2388c3b1a740c05ae5090203010001028201000b6fb66a188c557c6260043ca3461e3a1bd59ec74ee7a17d02626f47fda90e2ec6fe0ffb61349278ec17cd1d37e0cb506d74ea6a33d9b704d14b80e866460f2aa1fecec283739de3ccc07763be54ae67f5db7f841a2ee14721566a0d3b85b404c4e6364198dc7dc27e214d3ad09e8475b76a5beb089bbefa6933cb993563008e9656463bb6568facc694f8dec58df7706e3c992fdd2b35c37ec89268f42e0031332ecc3b72a282b722606bbf4b4c5447869fbc93db8da3375858720c485a182fd1f03456ba48f70b867b9a4724f121a7e3bebe22e2f3caaeda1b1a40e6f09388b286933dbd1f86e5c5f08a2ceae4b41d2cbbe740572b97404a4ba836d086331d02818100fa434d920e8ba5cafd03616d47029311cfec89055ca4d537e093845977b53d5c150a60fc81c50fa3390b6134484813ab4a0bdcf58a69d7807ebe0b879ef62ceade43cba98ab00fe6818147c20ac9281f851d4243f99cc84950b469c821d7f61bd5f752931ee23fedaead680bc5963bf684b3a889bed61ce3ecf14cde9943d87d02818100f6dc5948e0034c3965da1de0d6cf5fb23033e74046fc54876537fb40ffb0f59353cb8dda5ac2e0ba917ae8dd8b51487faff483e9ad67a463b15dde87f34db91d58ad63f0986ab64495df70ff9f9efea1ce01d8619de42466e5435f001a4b4a3f87e423c1b114799bc9bb4f52eb1253a9cc5cfc34913ece40a4e30de9d469f07d02818061e902e82998a8fc8990510597ca820f6df1748a0c7cd08e53e662d93de442654c360b4bbed9820cb1bcaa02f264808d7b22b907b76741509c456ded595ba6a71cde1947f3627e560844b3f64e91f488a0639a114e0ef0acfe4e17349d4908984b55bf909f7c94d64088c73413d17b142f46baa169700b4d80ddc6dd2fc9436102818100b2c9ca1c7ea9c4c5f95f6cae4fc5a7705d7ae9ec62bd13d76fd688b17dbe434dedad8a526fd39e8161261c8b800061baa0cc3dd1bb5649f82e1867381d5dd84949d562817952282a2a45c7084c2a120f4c2d87f2c330ddb06c314c17bdf37395e9acb0bcf2ac7a9afb131f1355cf532ab229523c1c49d985762640086f603edd02818100d52656918165d006ef10fe005b9f309efee2daca8fbaee0098590e23aa869e694773e3e0fac39988254ed54789a9dd5b4f73a3d473d98059d3583f08b4c7899609afe32235d2d421063da1200dd154fe0781cf9d3dc63de90c51a99f01a0ca1af02bd68a01a86e2e13c8d2b7ca777e1db5d6579020552954ac47ec1bdc780dcd",
+    );
+    pub const other_rsa_private_key_pkcs8_der: []const u8 = &other_rsa_private_key_bytes;
 
     pub fn identity() Identity {
         return Identity.initPkcs8(certificate_der, private_key_pkcs8_der) catch unreachable;
@@ -1570,4 +1601,54 @@ test "identity parser loads a PKCS#8 RSA key and rejects a truncated one" {
         error.InvalidPrivateKey,
         Identity.initPkcs8(testdata.rsa_certificate_der, testdata.rsa_private_key_pkcs8_der[0 .. testdata.rsa_private_key_pkcs8_der.len - 1]),
     );
+}
+
+test "identity parser rejects an RSA certificate paired with an unrelated RSA private key" {
+    // Both keys are individually well-formed, mathematically valid RSA-2048
+    // private keys; only their pairing with `rsa_certificate_der` is wrong.
+    // The mismatch must be caught here, at construction, not discovered only
+    // when a peer rejects the resulting CertificateVerify signature.
+    try testing.expectError(
+        error.InvalidPrivateKey,
+        Identity.initPkcs8(testdata.rsa_certificate_der, testdata.other_rsa_private_key_pkcs8_der),
+    );
+}
+
+test "RSA PKCS#8 wrapper rejects missing NULL parameters, extra fields, and trailing bytes" {
+    const valid = testdata.rsa_private_key_pkcs8_der;
+
+    // Corrupt the two-byte NULL (0x05 0x00) immediately following the OID:
+    // flipping its tag byte to something else breaks `expectBytes`.
+    const null_offset = std.mem.indexOf(u8, valid, &[_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00 }).? + 11;
+    var missing_null = try testing.allocator.dupe(u8, valid);
+    defer testing.allocator.free(missing_null);
+    missing_null[null_offset] = 0x04; // NULL tag (0x05) replaced with OCTET STRING tag
+    try testing.expectError(error.InvalidPrivateKey, Identity.initPkcs8(testdata.rsa_certificate_der, missing_null));
+
+    // Trailing bytes after the top-level SEQUENCE.
+    var with_trailer = try testing.allocator.alloc(u8, valid.len + 1);
+    defer testing.allocator.free(with_trailer);
+    @memcpy(with_trailer[0..valid.len], valid);
+    with_trailer[valid.len] = 0x00;
+    try testing.expectError(error.InvalidPrivateKey, Identity.initPkcs8(testdata.rsa_certificate_der, with_trailer));
+
+    // Extra bytes appended inside the AlgorithmIdentifier SEQUENCE, after its
+    // NULL parameters but still inside the SEQUENCE's declared length —
+    // exercises the `alg.pos != alg.bytes.len` exhaustion check specifically
+    // (distinct from the top-level trailing-bytes case above).
+    const alg_seq_start = std.mem.indexOf(u8, valid, &[_]u8{ 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00 }).?;
+    var extra_alg_field = try testing.allocator.alloc(u8, valid.len + 2);
+    defer testing.allocator.free(extra_alg_field);
+    @memcpy(extra_alg_field[0 .. alg_seq_start + 15], valid[0 .. alg_seq_start + 15]);
+    extra_alg_field[alg_seq_start + 1] = 0x0f; // grow the AlgorithmIdentifier SEQUENCE length by 2
+    extra_alg_field[alg_seq_start + 15] = 0x05; // an extra (bogus) NULL element
+    extra_alg_field[alg_seq_start + 16] = 0x00;
+    @memcpy(extra_alg_field[alg_seq_start + 17 ..], valid[alg_seq_start + 15 ..]);
+    // Growing the AlgorithmIdentifier SEQUENCE's own length also grows the
+    // outer PrivateKeyInfo SEQUENCE's declared length by the same 2 bytes,
+    // and the outer length is encoded 2 bytes into the buffer as a 0x82
+    // long-form u16.
+    const outer_len_before = std.mem.readInt(u16, extra_alg_field[2..4], .big);
+    std.mem.writeInt(u16, extra_alg_field[2..4], outer_len_before + 2, .big);
+    try testing.expectError(error.InvalidPrivateKey, Identity.initPkcs8(testdata.rsa_certificate_der, extra_alg_field));
 }

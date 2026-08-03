@@ -195,20 +195,21 @@ pub fn verifyPssSha256(public_key_der: []const u8, message: []const u8, signatur
 // ---------------------------------------------------------------------------
 
 /// An owned RSA private key, parsed and validated from a PKCS#1
-/// `RSAPrivateKey` DER encoding. Only the modulus `n` and private exponent
-/// `d` are retained: the signing path below performs a direct constant-time
+/// `RSAPrivateKey` DER encoding. `parsePrivateKeyDer` requires `n = p·q`,
+/// `p ≠ q`, `dP = d mod (p−1)`, `dQ = d mod (q−1)`, `qInv·q ≡ 1 (mod p)`, and
+/// `e·d ≡ 1 (mod lcm(p−1, q−1))` before returning a key at all — see
+/// `validateComponentRelationships`. Only `n`, `e`, and `d` are retained
+/// after that check: the signing path below performs a direct constant-time
 /// `d`-exponent modular exponentiation (`std.crypto.ff.Modulus.
-/// powWithEncodedExponent`), not CRT, so `p`, `q`, `dp`, `dq`, and `qInv` are
-/// structurally validated and range-checked during `fromDer` but are not
-/// consumed by any cryptographic operation and are not retained here — a key
-/// whose CRT components are inconsistent with `(n, d)` still signs exactly as
-/// `(n, d)` dictate (the modpow never touches them), and a transcription
-/// error in `n` or `d` itself is self-detecting: the resulting signature
-/// fails verification. See `docs/CRYPTO_SECURITY_AUDIT.md` for the full
-/// rationale.
+/// powWithEncodedExponent`), not CRT, so `p`, `q`, `dp`, `dq`, and `qInv`
+/// serve import-time validation only and are discarded once it passes — a
+/// deliberate choice recorded in `docs/CRYPTO_SECURITY_AUDIT.md` (no CRT
+/// side-channel/fault-injection surface, at the cost of CRT's speedup).
 pub const PrivateKey = struct {
     n: [max_modulus_bytes]u8 = undefined,
     n_len: usize = 0,
+    e: [max_modulus_bytes]u8 = undefined,
+    e_len: usize = 0,
     d: [max_modulus_bytes]u8 = undefined,
     d_len: usize = 0,
     bits: usize = 0,
@@ -236,8 +237,22 @@ pub const PrivateKey = struct {
         return self.n[0..self.n_len];
     }
 
+    fn publicExponent(self: *const PrivateKey) []const u8 {
+        return self.e[0..self.e_len];
+    }
+
     fn privateExponent(self: *const PrivateKey) []const u8 {
         return self.d[0..self.d_len];
+    }
+
+    /// Whether `public_key_der` (a DER `RSAPublicKey`, as a certificate leaf
+    /// exposes it) names the exact same modulus and public exponent as this
+    /// private key — i.e. whether this key is actually usable to sign for
+    /// that certificate. Strictly parses `public_key_der` first, so a
+    /// malformed candidate never spuriously matches.
+    pub fn matchesPublicKeyDer(self: *const PrivateKey, public_key_der: []const u8) bool {
+        const parsed = parsePublicKey(public_key_der) catch return false;
+        return std.mem.eql(u8, parsed.modulus, self.modulus()) and std.mem.eql(u8, parsed.exponent, self.publicExponent());
     }
 };
 
@@ -245,11 +260,112 @@ fn stripLeadingZero(value: []const u8) []const u8 {
     return if (value.len > 1 and value[0] == 0) value[1..] else value;
 }
 
+/// Non-allocating (fixed stack scratch) arbitrary-precision validation of the
+/// full RSA private-key component relationship set — not merely the
+/// structural/range checks `parsePrivateKeyDer` performs on each field in
+/// isolation. This is a one-time cost at key import, never on the
+/// per-signature hot path (`signPssSha256` never calls this or touches `p`/
+/// `q`/`dp`/`dq`/`qInv`), so an allocator-backed `std.math.big.int.Managed`
+/// over a bounded `FixedBufferAllocator` is an acceptable, contained
+/// exception to this module's otherwise allocation-free design; nothing here
+/// is on a path an attacker can invoke repeatedly per handshake.
+fn validateComponentRelationships(
+    n: []const u8,
+    e: []const u8,
+    d: []const u8,
+    p: []const u8,
+    q: []const u8,
+    dp: []const u8,
+    dq: []const u8,
+    qinv: []const u8,
+) Error!void {
+    const big = std.math.big.int;
+    var scratch: [131072]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const allocator = fba.allocator();
+
+    const big_n = bigFromBytes(allocator, n) catch return error.InvalidInput;
+    const big_e = bigFromBytes(allocator, e) catch return error.InvalidInput;
+    const big_d = bigFromBytes(allocator, d) catch return error.InvalidInput;
+    const big_p = bigFromBytes(allocator, p) catch return error.InvalidInput;
+    const big_q = bigFromBytes(allocator, q) catch return error.InvalidInput;
+    const big_dp = bigFromBytes(allocator, dp) catch return error.InvalidInput;
+    const big_dq = bigFromBytes(allocator, dq) catch return error.InvalidInput;
+    const big_qinv = bigFromBytes(allocator, qinv) catch return error.InvalidInput;
+
+    if (big_p.eql(big_q)) return error.InvalidInput;
+
+    // n == p * q
+    var product = big.Managed.init(allocator) catch return error.InvalidInput;
+    product.mul(&big_p, &big_q) catch return error.InvalidInput;
+    if (!product.eql(big_n)) return error.InvalidInput;
+
+    const one = big.Managed.initSet(allocator, 1) catch return error.InvalidInput;
+
+    var p_minus_one = big.Managed.init(allocator) catch return error.InvalidInput;
+    p_minus_one.sub(&big_p, &one) catch return error.InvalidInput;
+    var q_minus_one = big.Managed.init(allocator) catch return error.InvalidInput;
+    q_minus_one.sub(&big_q, &one) catch return error.InvalidInput;
+
+    // dP == d mod (p - 1)
+    var div_scratch = big.Managed.init(allocator) catch return error.InvalidInput;
+    var d_mod_p1 = big.Managed.init(allocator) catch return error.InvalidInput;
+    big.Managed.divTrunc(&div_scratch, &d_mod_p1, &big_d, &p_minus_one) catch return error.InvalidInput;
+    if (!d_mod_p1.eql(big_dp)) return error.InvalidInput;
+
+    // dQ == d mod (q - 1)
+    var div_scratch2 = big.Managed.init(allocator) catch return error.InvalidInput;
+    var d_mod_q1 = big.Managed.init(allocator) catch return error.InvalidInput;
+    big.Managed.divTrunc(&div_scratch2, &d_mod_q1, &big_d, &q_minus_one) catch return error.InvalidInput;
+    if (!d_mod_q1.eql(big_dq)) return error.InvalidInput;
+
+    // qInv * q == 1 (mod p)
+    var qinv_q = big.Managed.init(allocator) catch return error.InvalidInput;
+    qinv_q.mul(&big_qinv, &big_q) catch return error.InvalidInput;
+    var qinv_q_div = big.Managed.init(allocator) catch return error.InvalidInput;
+    var qinv_q_mod_p = big.Managed.init(allocator) catch return error.InvalidInput;
+    big.Managed.divTrunc(&qinv_q_div, &qinv_q_mod_p, &qinv_q, &big_p) catch return error.InvalidInput;
+    if (!qinv_q_mod_p.eql(one)) return error.InvalidInput;
+
+    // e * d == 1 (mod lcm(p - 1, q - 1)); lcm(a, b) = a*b / gcd(a, b).
+    var gcd = big.Managed.init(allocator) catch return error.InvalidInput;
+    big.Managed.gcd(&gcd, &p_minus_one, &q_minus_one) catch return error.InvalidInput;
+    var totient_product = big.Managed.init(allocator) catch return error.InvalidInput;
+    totient_product.mul(&p_minus_one, &q_minus_one) catch return error.InvalidInput;
+    var lcm = big.Managed.init(allocator) catch return error.InvalidInput;
+    var lcm_rem = big.Managed.init(allocator) catch return error.InvalidInput;
+    big.Managed.divTrunc(&lcm, &lcm_rem, &totient_product, &gcd) catch return error.InvalidInput;
+
+    var ed = big.Managed.init(allocator) catch return error.InvalidInput;
+    ed.mul(&big_e, &big_d) catch return error.InvalidInput;
+    var ed_div = big.Managed.init(allocator) catch return error.InvalidInput;
+    var ed_mod_lcm = big.Managed.init(allocator) catch return error.InvalidInput;
+    big.Managed.divTrunc(&ed_div, &ed_mod_lcm, &ed, &lcm) catch return error.InvalidInput;
+    if (!ed_mod_lcm.eql(one)) return error.InvalidInput;
+}
+
+/// Load an unsigned big-endian byte string into a `std.math.big.int.Managed`
+/// backed by `allocator` (expected to be a bounded `FixedBufferAllocator` —
+/// see `validateComponentRelationships`).
+fn bigFromBytes(allocator: std.mem.Allocator, bytes: []const u8) !std.math.big.int.Managed {
+    const big = std.math.big.int;
+    if (bytes.len == 0) return big.Managed.initSet(allocator, 0);
+    const bit_count = bytes.len * 8;
+    const limb_count = big.calcTwosCompLimbCount(bit_count) + 1;
+    const limbs = try allocator.alloc(std.math.big.Limb, limb_count);
+    var mutable = big.Mutable{ .limbs = limbs, .len = 1, .positive = true };
+    mutable.readTwosComplement(bytes, bit_count, .big, .unsigned);
+    return mutable.toManaged(allocator);
+}
+
 /// Parse and validate a PKCS#1 `RSAPrivateKey` DER encoding (the structure a
 /// PKCS#8 `privateKey` OCTET STRING wraps for `rsaEncryption`). Only
 /// two-prime keys (`version == 0`) with a 2048/3072/4096-bit modulus are
 /// supported — multi-prime keys (`version == 1`, `otherPrimeInfos`) are
 /// rejected, matching the narrower signing subset this profile enforces.
+/// Beyond per-field structural/range checks, every component relationship
+/// RFC 8017 requires is validated (see `validateComponentRelationships`)
+/// before any private bytes are copied into the returned owner.
 pub fn parsePrivateKeyDer(der: []const u8) Error!PrivateKey {
     if (der.len < 2 or der[0] != 0x30) return error.InvalidInput;
     var offset: usize = 1;
@@ -286,16 +402,24 @@ pub fn parsePrivateKeyDer(der: []const u8) Error!PrivateKey {
     if (private_exponent.len == 1 and private_exponent[0] == 0) return error.InvalidInput;
     if (!lessThanUnsigned(private_exponent, modulus)) return error.InvalidInput;
 
-    inline for (.{ prime1_encoded, prime2_encoded, exponent1_encoded, exponent2_encoded, coefficient_encoded }) |encoded| {
-        const component = stripLeadingZero(encoded);
+    const prime1 = stripLeadingZero(prime1_encoded);
+    const prime2 = stripLeadingZero(prime2_encoded);
+    const exponent1 = stripLeadingZero(exponent1_encoded);
+    const exponent2 = stripLeadingZero(exponent2_encoded);
+    const coefficient = stripLeadingZero(coefficient_encoded);
+    inline for (.{ prime1, prime2, exponent1, exponent2, coefficient }) |component| {
         if (component.len == 0) return error.InvalidInput;
         if (component.len == 1 and component[0] == 0) return error.InvalidInput;
         if (!lessThanUnsigned(component, modulus)) return error.InvalidInput;
     }
 
+    try validateComponentRelationships(modulus, exponent, private_exponent, prime1, prime2, exponent1, exponent2, coefficient);
+
     var key = PrivateKey{ .bits = bits };
     key.n_len = modulus.len;
     @memcpy(key.n[0..modulus.len], modulus);
+    key.e_len = exponent.len;
+    @memcpy(key.e[0..exponent.len], exponent);
     key.d_len = private_exponent.len;
     @memcpy(key.d[0..private_exponent.len], private_exponent);
     return key;
@@ -606,4 +730,98 @@ test "RSA private-key DER rejects a wrong version, malformed integers, and out-o
 
     try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&[_]u8{}));
     try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&[_]u8{0x30}));
+}
+
+test "RSA private-key DER rejects every component mutation that breaks a required relationship" {
+    // Each offset is the last (least-significant) byte of the named field in
+    // the fixture's PKCS#1 encoding — flipping it keeps the field the same
+    // length, still nonzero, and still less than the modulus (all range
+    // checks parsePrivateKeyDer already enforces stay satisfied), so only
+    // `validateComponentRelationships`'s mathematical checks can catch it.
+    const mutations = [_]struct { name: []const u8, offset: usize }{
+        .{ .name = "n (breaks n = p*q)", .offset = 267 },
+        .{ .name = "d (breaks dP/dQ/e*d relations)", .offset = 532 },
+        .{ .name = "p (breaks n = p*q)", .offset = 664 },
+        .{ .name = "q (breaks n = p*q)", .offset = 796 },
+        .{ .name = "dp (breaks dP = d mod (p-1))", .offset = 928 },
+        .{ .name = "dq (breaks dQ = d mod (q-1))", .offset = 1060 },
+        .{ .name = "qinv (breaks qInv*q = 1 mod p)", .offset = 1191 },
+    };
+    for (mutations) |case| {
+        var buf = testdata.private_key_pkcs1_bytes;
+        buf[case.offset] ^= 0x01;
+        var key = parsePrivateKeyDer(&buf) catch continue;
+        key.deinit();
+        std.debug.print("mutation accepted but should have been rejected: {s}\n", .{case.name});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "RSA private-key DER rejects p == q" {
+    var buf = testdata.private_key_pkcs1_bytes;
+    // Overwrite q's content bytes with p's (same length at these offsets in
+    // the fixture: both primes are 129 bytes), keeping DER framing intact.
+    const p_start = 536;
+    const q_start = 668;
+    const prime_len = 129;
+    @memcpy(buf[q_start .. q_start + prime_len], buf[p_start .. p_start + prime_len]);
+    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&buf));
+}
+
+test "matchesPublicKeyDer requires exact modulus and exponent equality" {
+    var key = testKey();
+    defer key.deinit();
+    try std.testing.expect(key.matchesPublicKeyDer(test_public_key_der));
+
+    var tampered_pub: [test_public_key_der.len]u8 = undefined;
+    @memcpy(&tampered_pub, test_public_key_der);
+    tampered_pub[20] ^= 0xff;
+    try std.testing.expect(!key.matchesPublicKeyDer(&tampered_pub));
+
+    try std.testing.expect(!key.matchesPublicKeyDer(&[_]u8{0x30}));
+    try std.testing.expect(!key.matchesPublicKeyDer(&[_]u8{}));
+}
+
+test "RSA-3072 and RSA-4096 private keys sign messages the native verifier accepts" {
+    const fixtures = [_]struct { private_der_hex: []const u8, public_der_hex: []const u8, expected_len: usize }{
+        .{
+            .private_der_hex = "308206e20201000282018100e800096b8f3f7bd7a554864555caef671fa090451f2ff3a42f47886f9f03a68656d035adce2a5703ca04bbdd9f23944763333f2bdffb15148f9e5e91fe05e8f7981fa5f2f04ad5cf3f7b158d436c38811d16b3dac45dce27dff3a853d5534d5ec849b8333def6974045262768009fde8edcc85c4b844edbaeb519608dc6b92108085a135d8028effabe702eb2911187ab592eddbe15dedb5429796bb4f5105a27914c9f33a63cf96d1cc4a2c615272d90d937997bee6a441b132c03f8fa3a095f7c4f841776af158420b4f5a9cb7c8aff2cd2f4f33e1316e7354f0946cfcb670f0df1bca6c08c593be0ca7d361fc897bd86ea078e548bdb5ecdeba9eee6dca991aa265e83bc59172b7a06d820fabc6615eacef576bb6ccdb382ea59f55da1b7abe678047eed12f6b6f9f1927826a5261ebd6199c1015d07de3bd4cacee005737d85fac51c0d5ba7c4c88e192837300a6b50a047774d13967e941c5eda5d3f44061092ba6bf612661b455e175964a17399c2cf20dd5c6d978baeb9e34bedbdf990203010001028201806bbcdca30d0e73b204ceb85e0985e8e070710d9e73e9be51003dcd6fdc9e02debf0108f49259da37e1c08a07d4e7de6bba77297e7410f34cad97639e93a365f959355548f8eb1fd89347d30ddb822dc953db5fa197f06214e56d0f3e0342a09b04132c0debd4bb198c0a403c7ca067401cf28e2a7952553e291aa5bcaeb3ebcc6b0ae37f1035bbf7a27a70c2093badad0a96558c775fb9cca3c4a6d48c747953e6bbcf3efb5e2fa08004496bcbb450ae589e2468e257d46ec75de4a67fcb827e500a0f36a3bfb9a78acdd956ca2b38c19bfbfdb896a4415a9c28460103899560c4a73d3105fdfb5d4c4238f56e118233c2df1e73315907b39dd49de39a8de2d0593f640618e03e32aca1686b2e98cddddfc3f08c0dc050ad7c7b1dacbf7087be7cce07964b09281a8587015b605903f44aea1ea6d307923362f099a5ab6f6a829bbb2b671e6f373377825edd4ba51e8444b6e8796196118522974069b4e6834576690743914f2684e927ca4cefe9c514e684cbf7ac06596712e98b86f035767b0281c100f601496b66e1da895c2eda926458b03af7881b04de294f8b69fefc75427ffa234e778382a10db44d3d3eaa35a42a22352b25411a388f7fcf68b682e5a37e2d3cae26301505db5c67be4d0472f9b6c831ab88324565698d86b6977421c12a15169f22ab304f0f1a4346943fdab9c7e3cb83bf8817d29a09dace65f851d5c14852f152a76c6c8d9997b449f320f378aaa4198224e4129bdce6002e958eca324f5505d6190e29fdec4ff273b54e0c0137f170fc60a310bd214c7b33f64ea4632b530281c100f16d15990f7a0efcc987253de26e567b0a3cbde1eb7500a50900121d60cfe8c48a0842982bf4fa8fde0552eecc7abd99e20608118149f61b65187c7e928d38e2343d5949be00747baf737981c27c4be83af50f3beb796f0218ebd0e3c683d89fbad913e3cee24f669e6dce95ad1675301e9c34a76c89d126db5a3161fa951995c09ff0052e46979d998e207726db14e7f4283866176375b096d404bc778a82d948585e27e1a0aec85fb831fa3e0ecebf66a624e9c109c204e7d765adecd817e30281c003273111b757ddbd34f944c3eb95576cea0f4c895b6f9c1d65566755f96c3a808958eece95d1df25be4b375348af6190dce4b558e8b0ae2ab264e4789d07d8fc961ed72eedcc49faea6d824916fa48c69a343cb0b7040b5456b2ca42447f8d95a4a4851d31663827f497a1d9e3d7b40bbfbc8cba017107ff4df5f0a0dbe48650c9d70d5e4e65e23a178d7b1849069ae94f8a637ea8de668e6c222cb88fcee54569b5bccc79ad4f8216d174d9733df0c19f791ca3fa6af22a50c9f1b6405525110281c04a299c4cdc783e4a610de6decfc3dd4506ac0a1870600cc6a5b123df6a71f3ab0c4be5492197abb0ae1f2c8eb6b9adacabc5f68c8a0ed24f300b09934829a1a3bb306d513dd09df7b0b9e4457c1cfaa468180789fc97dd05e3e9eccd4b9a0cdd646472bbb43dc8ee59149a35586a61ad5a79d9a2e4b0a1533266ce6caeb1469ebe016395f3d53395f229bac75f644553cba8df4a5d3cec5646bef28582a345f6c1468405f4458beb799bf79e4b99f8e0cb0396ab47e55b786e4fb8a868ed28c90281c02af5ab8888006123dfba060cb2d761039569a87a50a75fe7bf979692e30af428fab0edd939c3ec5339ce22bbcbee01d3c717afd9f5e3e415c4e107a9f0f12b09ae1be9a5839361673c975f33419932935dcc1347ef61c853e55e6d9d5960d9f44acf3cce8009b1be39fb3664d8637c558784baeeac708b1bd7b90b9639281ce82ac72f5d5dc8caaa286aa5cfd1e2e15dcf15bdf406b76cb564ea2c678ca7c9d62c4cc4a86930c461144b1bbeb63be75c1dbd99fac0aa0def20197f4b3397a9d3",
+            .public_der_hex = "3082018a0282018100e800096b8f3f7bd7a554864555caef671fa090451f2ff3a42f47886f9f03a68656d035adce2a5703ca04bbdd9f23944763333f2bdffb15148f9e5e91fe05e8f7981fa5f2f04ad5cf3f7b158d436c38811d16b3dac45dce27dff3a853d5534d5ec849b8333def6974045262768009fde8edcc85c4b844edbaeb519608dc6b92108085a135d8028effabe702eb2911187ab592eddbe15dedb5429796bb4f5105a27914c9f33a63cf96d1cc4a2c615272d90d937997bee6a441b132c03f8fa3a095f7c4f841776af158420b4f5a9cb7c8aff2cd2f4f33e1316e7354f0946cfcb670f0df1bca6c08c593be0ca7d361fc897bd86ea078e548bdb5ecdeba9eee6dca991aa265e83bc59172b7a06d820fabc6615eacef576bb6ccdb382ea59f55da1b7abe678047eed12f6b6f9f1927826a5261ebd6199c1015d07de3bd4cacee005737d85fac51c0d5ba7c4c88e192837300a6b50a047774d13967e941c5eda5d3f44061092ba6bf612661b455e175964a17399c2cf20dd5c6d978baeb9e34bedbdf990203010001",
+            .expected_len = 384,
+        },
+        .{
+            .private_der_hex = "3082092a0201000282020100c2ef91e889e9c4b94fb8a70abecb6fd6c70778308f17c4e6bbf59920e5fcdd09daef7a6427a779bc8cc53b4b447f89698d224ef9ab73fded5abcb036cec7d4ad575917843bfcdb3c02d38456ad7cf64d8ce73572291ca8118eefb62d9228daceb94a04a496a9cce53caa8c067ca403a1c3b7d278fd2ab9b93d5eb3c80eea4af0f674c794a62215b4a41d60a2139d8176537c1b431f870d6fcd6ff4f08ca5a69519765f7d98c218d3384d566fdb2ecddfdaa0d2df184bf07d5c8c0f2f0728bb2ee5393bc1ac6ec49bc9795b278b9043bb8c64cf07dcbcaae914b18b07e80d155cfd89c1b4552c01e7c786b13927934e8ffaa5910c5ba677e55330fa6b3c7d4268d755bd685147794b24572a9b887e95da2fd85cbb3ac797d3e6b5d6f859a0db78731e5e9c153ba9f4ddaf420f321139ed1a5a42a1c38b5008955c3a54349f084a60b713dbf28bfabc61e43bd1448788d3d6ebf06d472b1c8bbca8abef50871484b112a7d82bc77a3db55700c1acadf308d1d63b2ebd073a0691486da19f0e0183af511c9f78867499a0c76a5eace805346e65db4c533537beb849a4710e3aa8a134dcf8a0c377016ccf4774874ed565055702207734ab78a2fb2687333c78b434b7b503709e0c21aa028e829320de35cf40e680b413caf5964d052b706c0e514e1aaed70cb35dbe114d7deaa75bf127d12c9d4ecddc6876f0ad7b25ba662bbb810203010001028202004f9de77b1170f00f3bd7502a5c58dcb9dd1a58e5845c11e8a7561d0fc9bf684c1126845789b6a64af337cf0ae3d42f3c740f523038edac05986cbe8ff40ebbf77c587ff95b42e00bf79f8a4a989b1442024da08f9ae9006003803669106c2d4a07758ac5ea5f39b75afad12c0916380186dd7a523e1c8834773349bc69131a3ea67a75d569b13c2a466955417d3f7453eeaf1eb76096194fd3996972220fba24e57c6a6df2c93bb871236d2d4c59266eca6dab12c16aaab398ebff7b96b1f519a737a4076b34e68a3654a17d5a4c36cdcffe906c46a4ac2d7c6d333aac754387726a243a521b2240174714f5220bd1278f18b65054d27ddfa505b911b967f38a05d73f33003811d3d1ecae65fabdd889ee46d6afbef93190ba141f6c765a2ebffd8c158cbedd05f73a682897fb98c6d4f8a964867e218b959bd3e3c154e8054da404d84e494443510559d85f7d62249b3caa683c472986fe0e315d4616b41103d521e5a499042da315cd3596b6afb3b3ac68448b69e2febd0d3ccc9a8a41b2b908d6c0c2862b57cc69082cd05a24c27e2dcb45a0138bba71cc5cf484d8ad81d33c6e997670c8734e3ad8f0e406a17b453e679d2c9e588a872d1d2b43a277b8563c6a852cf3f5e95ade32cfe83a16a28504462c814218c8143373cb7ffdeb394639897c5e74756ab626e4f339cd2fcd0622e78c8bcfa37c636bb3b10b763d4a3d0282010100e9a1c11ec85ae80811ff6e8a9aa59bcce3625ecf71ccf3bffbc329293b2aec8de07c5236cb8e20ee1015e7a5bd9e58c24548e8c954c37a79bd058aa2f03e0c98e06919bcd6694a486b4a0761fa39ab6e988dce05fd3e53065d1d4e5a86e769e4b148965f933e9e49db23c0bf67e39bc7c7a9094227692373c07a0a00b3c3352552ce1e700760304dd432352333615bbdcac60554075b3184cc9c0b4ee855fc796175dd4717e88e249a7b5f4964683c58234c575e1e0894b2ab2469649ff82688c715795f2124beb12f2e4ebe4e9ccc1c894b2ed981fe9f1d9632c98d7985f6a0e4d69fc6c348c1be354216ae9ce4ab0bfe0988975ce14dcb5df2a5f30b97834f0282010100d5996338ed7fa47541a43bee421940fb172e9658c2be709ae3786863496f68dd8b3377e595ca5f55aa17fd83eaabfde3f54df9b7f75845cf328836776875e35b2ed085d26436d83a1d1e30dd38abefc3aaa2c1d43cfc9853e321b518e05d8d9bd66135e54b4c3a058d17a01bdc00c8f9e6ccc07f7bcce374114c3be7eeea2775767117c9191fa131986a445915d6d730883cff4d604ab528185a9f355c39194b0264708204b4242979c08aadc0991db592d83faba202db5f3fbc903442a02ef81c308b13dbc5473f7d28c4b75ac87d3da07f8c46b6b21f028e22f3392c2c42ad1b5fc9670094c4d1b4f54fb698fce07c3a72fe7bee5f3ff4f1d07884a6d3602f0282010100943ee85cd10325f2610134b24c58c358a9fbf46f2b25c291527e4eb2f3f153b2defbe3eb1314b77e77c47e7da3a94366da31de4c4a35d39445c5ab67a28bacd0a0acf000ec0859734468eff052a79f49091209e5b100880c24af80d55e7e9ea9d77858ba82a31c2b7f1adba658948b77a41075687dbb701c75c8ba6a21a6bf2554baa783ac9a736c1f3650936a79df8db98a173d6f8185156003b0053cd5bae3865d14b094d222c7c5227d9f035044e2245bbfa05fec4ff6633432900015a4d5eb858bc33a33a7b0a4607ce4b2db3984edf53fe012656faf856bea8a93ced664d76ffc6851e7ebcff6d95dad24aed07e468ee4162f80632da50a6014ad89516f0282010100bda403ae255eb05ad2bec7decf9cb04ebdd444f3e5634382a0f6e4675269b1c710b1cf7f6cb05258323e3e7d02bb551d314bdbac73d45196961ccd8ed295e817aac6c42979842011e88c478201b0d59cf940abaa8dc30e535c532f003923967887aba33842d418a7990f22bdd964710b3ed90707a898ce50dc92bc953d4f735d1c9d682ac93d85d60ca63cac83714d78ef5c88a6e0193421b70dae50a7e2a20c30c1900a3fb6d86c62868a199de7d3b2c3ff6ef8294d340bab00f55f10d03b235993d7c6f7d67d5d66f7ed3f85407fc1596024e11b8fa56c95597e6c824581a543aa959bf7ae1dd8ba3b1a5cda139a1371a96b3c08f554495af066301015974d0282010100a7efc741dc4a8dbce9edbaa5d0eb91394cf8733577d2ee2cc439140c84f3f4c49c6c3420c5a10ca38651268cbfbf502703734b4a08d8f958698e1d0c144a4c5193105fd138eb1a90eeaf41010979ba6b1db4382ef8845e7a6b7259e18a912a5ac9882c27e9f21fd6899dd1df4a12a83b582b883f36c8781c9147fe632efaecb0d70972769f0ae263fec93a1f89cf12ecaec0656cbcb5a969ff5845f989f5ae199c1e6c9614b0e662eec2104fa950b38b2bd9358739cd0ae95ca60db2d37dd51dc54ce2d7e1bc4f6bea7a98523bc9d4f047a3ccc2c614b3897b7e16860ff4a23d071a49e593f5bbb1166dd42a0bb5a3fab6d9f07fc8f2a5a9f31f6708595ffbb8",
+            .public_der_hex = "3082020a0282020100c2ef91e889e9c4b94fb8a70abecb6fd6c70778308f17c4e6bbf59920e5fcdd09daef7a6427a779bc8cc53b4b447f89698d224ef9ab73fded5abcb036cec7d4ad575917843bfcdb3c02d38456ad7cf64d8ce73572291ca8118eefb62d9228daceb94a04a496a9cce53caa8c067ca403a1c3b7d278fd2ab9b93d5eb3c80eea4af0f674c794a62215b4a41d60a2139d8176537c1b431f870d6fcd6ff4f08ca5a69519765f7d98c218d3384d566fdb2ecddfdaa0d2df184bf07d5c8c0f2f0728bb2ee5393bc1ac6ec49bc9795b278b9043bb8c64cf07dcbcaae914b18b07e80d155cfd89c1b4552c01e7c786b13927934e8ffaa5910c5ba677e55330fa6b3c7d4268d755bd685147794b24572a9b887e95da2fd85cbb3ac797d3e6b5d6f859a0db78731e5e9c153ba9f4ddaf420f321139ed1a5a42a1c38b5008955c3a54349f084a60b713dbf28bfabc61e43bd1448788d3d6ebf06d472b1c8bbca8abef50871484b112a7d82bc77a3db55700c1acadf308d1d63b2ebd073a0691486da19f0e0183af511c9f78867499a0c76a5eace805346e65db4c533537beb849a4710e3aa8a134dcf8a0c377016ccf4774874ed565055702207734ab78a2fb2687333c78b434b7b503709e0c21aa028e829320de35cf40e680b413caf5964d052b706c0e514e1aaed70cb35dbe114d7deaa75bf127d12c9d4ecddc6876f0ad7b25ba662bbb810203010001",
+            .expected_len = 512,
+        },
+    };
+
+    inline for (fixtures) |fixture| {
+        const private_bytes = comptime hexBytesForTest(fixture.private_der_hex);
+        const public_bytes = comptime hexBytesForTest(fixture.public_der_hex);
+        var key = try parsePrivateKeyDer(&private_bytes);
+        defer key.deinit();
+        try std.testing.expectEqual(fixture.expected_len, key.modulusLen());
+        try std.testing.expect(key.matchesPublicKeyDer(&public_bytes));
+
+        var out: [max_modulus_bytes]u8 = undefined;
+        const salt = [_]u8{0x5c} ** Sha256.digest_length;
+        const len = try signPssSha256(&key, "multi-size RSA-PSS fixture", salt, &out);
+        try std.testing.expectEqual(fixture.expected_len, len);
+        try verifyPssSha256(&public_bytes, "multi-size RSA-PSS fixture", out[0..len]);
+    }
+}
+
+fn hexBytesForTest(comptime hex: []const u8) [hex.len / 2]u8 {
+    @setEvalBranchQuota(16384);
+    var bytes: [hex.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
+    return bytes;
+}
+
+test "RSA private-key DER deterministically rejects an unsupported 1024-bit modulus" {
+    const key_bytes = hexBytesForTest(
+        "3082025d02010002818100d400a728e179458c0ce88301df9f5c99fc684a02986ece5c255c1b72b36b0d0135bf1c2aadf7153c196d182b7abea4b91d03d33b8e3653ff7b58b31b0d621d58044f7c87e56c5e916cd05a248d00c91507bcd9471149d4b4783b25a9ac09fc6430f8ef8553b1e402e22c749e8bd059f027d644336f8a97dd883e6fb504a8feed02030100010281803c64373a0908cfcbf67d619c6e046a8f9efc6260dce56bb98a16f3e6b7bf7e03e3389ea075d015e779e2bee8dbdd64f52a93c55f88c26729370cec707f5e7cb6ea31e91a6f7a3111b3cfcaa9c392d6b2903158d03d7a1fe4115ff77aafb07717acb8aed4b6e355b59caa3589142ffa25cda68264a88ac1ac94388d61668e5e21024100f00b331979b10224079675cc5090d70010942bc694b20eebf46ada5dfe4258f1caa59f86ae1300284daf249f6d9e3e6ff36c6d58da39c2c8c64c08e94317a8e9024100e2184773b4b71dca2d228bf2210803ab6bdaa73324d04df24b201a7146c1556ba0d5031a56245525d7dca0360de788ab6a734ce3acf3564a40750f76112fa365024100d437d2916f38c2bfbfc591977492d8c1c1e67d5d2f10cc8866aa212c8021802924139119acc4379b6a32b19a117b998fb811e00a71c4272501cb2f05aabf3c2102402612a895976cee9b4916743285d56fa8c234c3cb1cfbe6e4523a49b9a18c94f1d6d787fa3b5f4ae7607e4a8c4fb31994a40c5e7a487981a267504f1636b6aaf1024100b87667561caec2d3486ce54e23602c9d56bc089230b66cc49bd816b66405bfbdd6cb37ecd27cfee18386840467eb65629df3469bada4182df16cf43a70f7cde5",
+    );
+    try std.testing.expectError(error.InvalidInput, parsePrivateKeyDer(&key_bytes));
 }

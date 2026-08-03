@@ -813,6 +813,13 @@ pub const SoftwareRsaSigningKey = struct {
         self.key.deinit();
     }
 
+    /// Whether `public_key_der` (a DER `RSAPublicKey`) is the exact public
+    /// counterpart of this private key — see `rsa.PrivateKey.
+    /// matchesPublicKeyDer`.
+    pub fn matchesPublicKeyDer(self: *const SoftwareRsaSigningKey, public_key_der: []const u8) bool {
+        return self.key.matchesPublicKeyDer(public_key_der);
+    }
+
     pub fn format(
         _: SoftwareRsaSigningKey,
         comptime _: []const u8,
