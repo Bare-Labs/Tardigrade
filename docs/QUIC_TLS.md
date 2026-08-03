@@ -55,9 +55,10 @@ CRYPTO-frame transport and packet-key installation.**
    QUIC. The shared engine's profile remains deliberately narrow: the three
    RFC 9001 packet-protection suites
    (`TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,
-   `TLS_CHACHA20_POLY1305_SHA256`), X25519 key exchange, Ed25519 server
-   certificates (parsed/verified via `std.crypto.Certificate`), and
-   pinned-certificate or explicit-insecure trust. Initial packet protection
+   `TLS_CHACHA20_POLY1305_SHA256`), X25519 and secp256r1 key exchange,
+   Ed25519/ECDSA-P256/RSA-PSS server CertificateVerify through the shared
+   credential/provider seams, and pinned-certificate or explicit-insecure trust.
+   Initial packet protection
    remains the RFC-fixed AES-128-GCM/SHA-256 profile; Handshake, 0-RTT, and
    1-RTT packet protection follow the negotiated TLS suite metadata installed
    on the QUIC adapter. The shared key schedule is validated against the RFC

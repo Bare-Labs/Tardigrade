@@ -70,6 +70,9 @@ pub const max_public_key_len = 65;
 pub const max_private_scalar_len = 32;
 /// Largest shared secret an ECDH group in the supported profile derives.
 pub const max_shared_secret_len = 32;
+/// Largest signature a supported TLS CertificateVerify signer can produce
+/// (RSA-4096 PSS = 512 bytes).
+pub const max_signature_len = 512;
 /// QUIC AES header protection samples one AES block and consumes the first
 /// five mask bytes (RFC 9001 section 5.4.1).
 pub const quic_header_protection_sample_len = 16;

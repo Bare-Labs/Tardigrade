@@ -38,6 +38,11 @@ fn fixtureIdentity() tls_backend.Identity {
     ) catch unreachable;
 }
 
+const rsa3072_certificate_der = @embedFile("testdata/rsa3072-cert.der");
+const rsa3072_private_key_pkcs8_der = @embedFile("testdata/rsa3072-key.pkcs8.der");
+const rsa4096_certificate_der = @embedFile("testdata/rsa4096-cert.der");
+const rsa4096_private_key_pkcs8_der = @embedFile("testdata/rsa4096-key.pkcs8.der");
+
 /// Per-instance deterministic `CryptoProvider` storage (#490 review):
 /// deliberately *not* a shared/global helper backed by one process-wide
 /// mutable entropy stream (the previous `clientProvider()`/`serverProvider()`
@@ -95,6 +100,12 @@ const CapabilityOverrideProvider = struct {
     fn initWithoutAes128Gcm(backing: crypto.provider.CryptoProvider) CapabilityOverrideProvider {
         var caps = backing.capabilities();
         caps.aeads.remove(.aes_128_gcm);
+        return .{ .backing = backing, .caps = caps };
+    }
+
+    fn initWithoutP256(backing: crypto.provider.CryptoProvider) CapabilityOverrideProvider {
+        var caps = backing.capabilities();
+        caps.groups.remove(.secp256r1);
         return .{ .backing = backing, .caps = caps };
     }
 
@@ -650,6 +661,56 @@ test "native RSA-PSS server credential completes a record-mode handshake" {
     const request = try harness.client_bridge.sealApplicationData("client application over RSA-PSS", &protected);
     const opened_request = try harness.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext);
     try std.testing.expectEqualStrings("client application over RSA-PSS", opened_request.inner.content);
+}
+
+fn expectRsaCertificateVerifyHandshake(cert_der: []const u8, key_der: []const u8, expected_signature_len: usize) !void {
+    var harness: DirectHarness = undefined;
+    const client_crypto_provider = harness.client_provider_storage.init(client_provider_seed);
+    const server_crypto_provider = harness.server_provider_storage.init(server_provider_seed);
+    const client_bridge_crypto_provider = harness.client_bridge_provider_storage.init(client_provider_seed);
+    const server_bridge_crypto_provider = harness.server_bridge_provider_storage.init(server_provider_seed);
+    const alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.h2};
+    const rsa_capabilities = tls_core.policy.Capabilities{ .signature_schemes = &.{.rsa_pss_rsae_sha256} };
+    const policy = tls_core.policy.Policy.fromCapabilities(.record, rsa_capabilities, &alpns);
+    const identity = try tls_backend.Identity.initPkcs8WithEntropy(cert_der, key_der, server_crypto_provider.entropy);
+    harness = .{
+        .client_provider_storage = harness.client_provider_storage,
+        .server_provider_storage = harness.server_provider_storage,
+        .client_bridge_provider_storage = harness.client_bridge_provider_storage,
+        .server_bridge_provider_storage = harness.server_bridge_provider_storage,
+        .client_backend = tls_backend.Tls13Backend.initClientConfigured(
+            clientEntropy(),
+            client_crypto_provider,
+            .{ .pinned_certificate = cert_der },
+            tls_backend.recordConfig(policy),
+            .{},
+        ),
+        .server_backend = tls_backend.Tls13Backend.initServerConfigured(
+            serverEntropy(),
+            server_crypto_provider,
+            identity,
+            tls_backend.recordConfig(policy),
+        ),
+        .client_bridge = Bridge.init(client_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+        .server_bridge = Bridge.init(server_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+    };
+    defer harness.deinit();
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(events.CertificateState.valid, harness.observed.certificate_state.?);
+    try std.testing.expect(expected_signature_len <= tls_backend.max_signature_len);
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try harness.client_bridge.sealApplicationData("rsa large signature", &protected);
+    const opened = try harness.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext);
+    try std.testing.expectEqualStrings("rsa large signature", opened.inner.content);
+}
+
+test "#335 RSA-3072 and RSA-4096 CertificateVerify signatures fit the TLS engine buffer" {
+    try expectRsaCertificateVerifyHandshake(rsa3072_certificate_der, rsa3072_private_key_pkcs8_der, 384);
+    try expectRsaCertificateVerifyHandshake(rsa4096_certificate_der, rsa4096_private_key_pkcs8_der, 512);
 }
 
 /// Build a `DirectHarness` whose client and server negotiation policies each
@@ -3277,6 +3338,94 @@ fn directHarnessWithCipherSuiteAndP256Identity(self: *DirectHarness, comptime ci
     };
 }
 
+fn directHarnessWithMatrixTuple(
+    self: *DirectHarness,
+    comptime cipher_suite: tls_core.algorithms.CipherSuite,
+    comptime group: tls_core.algorithms.NamedGroup,
+    comptime signature_scheme: tls_core.algorithms.SignatureScheme,
+) void {
+    const client_crypto_provider = self.client_provider_storage.init(client_provider_seed);
+    const server_crypto_provider = self.server_provider_storage.init(server_provider_seed);
+    const client_bridge_crypto_provider = self.client_bridge_provider_storage.init(client_provider_seed);
+    const server_bridge_crypto_provider = self.server_bridge_provider_storage.init(server_provider_seed);
+    const suites = [_]tls_core.algorithms.CipherSuite{cipher_suite};
+    const groups = [_]tls_core.algorithms.NamedGroup{group};
+    const signatures = [_]tls_core.algorithms.SignatureScheme{signature_scheme};
+    const alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.h2};
+    const policy = tls_core.policy.Policy.fromCapabilities(.record, .{
+        .cipher_suites = &suites,
+        .named_groups = &groups,
+        .signature_schemes = &signatures,
+    }, &alpns);
+    const identity = switch (signature_scheme) {
+        .ed25519 => fixtureIdentity(),
+        .ecdsa_secp256r1_sha256 => tls_backend.testdata.p256Identity(),
+        .rsa_pss_rsae_sha256 => tls_backend.testdata.rsaIdentity(),
+        else => unreachable,
+    };
+    const trust: tls_backend.Trust = switch (signature_scheme) {
+        .ed25519 => .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .ecdsa_secp256r1_sha256 => .{ .pinned_certificate = tls_backend.testdata.p256_certificate_der },
+        .rsa_pss_rsae_sha256 => .{ .pinned_certificate = tls_backend.testdata.rsa_certificate_der },
+        else => unreachable,
+    };
+    self.* = .{
+        .client_provider_storage = self.client_provider_storage,
+        .server_provider_storage = self.server_provider_storage,
+        .client_bridge_provider_storage = self.client_bridge_provider_storage,
+        .server_bridge_provider_storage = self.server_bridge_provider_storage,
+        .client_backend = tls_backend.Tls13Backend.initClientConfigured(
+            clientEntropy(),
+            client_crypto_provider,
+            trust,
+            tls_backend.recordConfig(policy),
+            .{},
+        ),
+        .server_backend = tls_backend.Tls13Backend.initServerConfigured(
+            serverEntropy(),
+            server_crypto_provider,
+            identity,
+            tls_backend.recordConfig(policy),
+        ),
+        .client_bridge = Bridge.init(client_bridge_crypto_provider, cipher_suite),
+        .server_bridge = Bridge.init(server_bridge_crypto_provider, cipher_suite),
+    };
+}
+
+fn expectMatrixTuple(
+    comptime cipher_suite: tls_core.algorithms.CipherSuite,
+    comptime group: tls_core.algorithms.NamedGroup,
+    comptime signature_scheme: tls_core.algorithms.SignatureScheme,
+) !void {
+    var harness: DirectHarness = undefined;
+    directHarnessWithMatrixTuple(&harness, cipher_suite, group, signature_scheme);
+    defer harness.deinit();
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(cipher_suite, harness.client_backend.negotiated_cipher_suite);
+    try std.testing.expectEqual(cipher_suite, harness.server_backend.negotiated_cipher_suite);
+    try std.testing.expectEqual(group, harness.client_backend.negotiated_named_group);
+    try std.testing.expectEqual(group, harness.server_backend.negotiated_named_group);
+    try std.testing.expectEqual(tls_core.algorithms.transcriptHash(cipher_suite).digestLength(), harness.client_backend.core.transcriptHash().len);
+    try std.testing.expectEqual(harness.client_backend.core.transcriptHash().len, harness.observed.handshake_write_secret[@intFromEnum(DirectSide.client)].?.len);
+    try std.testing.expectEqual(harness.client_backend.core.transcriptHash().len, harness.observed.application_write_secret[@intFromEnum(DirectSide.server)].?.len);
+
+    const expected_key_len: usize = switch (cipher_suite) {
+        .tls_aes_128_gcm_sha256 => 16,
+        .tls_aes_256_gcm_sha384, .tls_chacha20_poly1305_sha256 => 32,
+    };
+    try std.testing.expectEqual(expected_key_len, harness.observed.application_write[@intFromEnum(DirectSide.client)].?.key_len);
+    try std.testing.expectEqual(@as(usize, crypto.provider.aead_nonce_len), harness.observed.application_write[@intFromEnum(DirectSide.server)].?.iv.len);
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const request = try harness.client_bridge.sealApplicationData("matrix application", &protected);
+    const opened = try harness.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, request), &plaintext);
+    try std.testing.expectEqualStrings("matrix application", opened.inner.content);
+}
+
 /// #564: `directHarnessWithCipherSuite`, plus an empty initial client key
 /// share — combines suite restriction with #484's HRR trigger so the
 /// non-baseline suites get their own HelloRetryRequest coverage, not only
@@ -3341,6 +3490,41 @@ fn directHarnessWithClientCipherSuitesAndServerProvider(
     const server_bridge_crypto_provider = self.server_bridge_provider_storage.init(server_provider_seed);
     const alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.h2};
     const client_policy = tls_core.policy.Policy.fromCapabilities(.record, .{ .cipher_suites = client_suites }, &alpns);
+    const server_policy = tls_core.policy.Policy.fromCapabilities(.record, tls_backend.native_capabilities, &alpns);
+    self.* = .{
+        .client_provider_storage = self.client_provider_storage,
+        .server_provider_storage = self.server_provider_storage,
+        .client_bridge_provider_storage = self.client_bridge_provider_storage,
+        .server_bridge_provider_storage = self.server_bridge_provider_storage,
+        .client_backend = tls_backend.Tls13Backend.initClientConfigured(
+            clientEntropy(),
+            client_crypto_provider,
+            .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+            tls_backend.recordConfig(client_policy),
+            .{},
+        ),
+        .server_backend = tls_backend.Tls13Backend.initServerConfigured(
+            serverEntropy(),
+            server_crypto_provider,
+            fixtureIdentity(),
+            tls_backend.recordConfig(server_policy),
+        ),
+        .client_bridge = Bridge.init(client_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+        .server_bridge = Bridge.init(server_bridge_crypto_provider, .tls_aes_128_gcm_sha256),
+    };
+}
+
+fn directHarnessWithClientGroupsAndServerProvider(
+    self: *DirectHarness,
+    client_groups: []const tls_core.algorithms.NamedGroup,
+    server_crypto_provider: crypto.provider.CryptoProvider,
+) void {
+    const client_crypto_provider = self.client_provider_storage.init(client_provider_seed);
+    _ = self.server_provider_storage.init(server_provider_seed);
+    const client_bridge_crypto_provider = self.client_bridge_provider_storage.init(client_provider_seed);
+    const server_bridge_crypto_provider = self.server_bridge_provider_storage.init(server_provider_seed);
+    const alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.h2};
+    const client_policy = tls_core.policy.Policy.fromCapabilities(.record, .{ .named_groups = client_groups }, &alpns);
     const server_policy = tls_core.policy.Policy.fromCapabilities(.record, tls_backend.native_capabilities, &alpns);
     self.* = .{
         .client_provider_storage = self.client_provider_storage,
@@ -3456,6 +3640,27 @@ test "#564 native record-mode loopback still negotiates the AES-128-GCM/SHA-256 
     try expectNativeSuiteLoopback(.tls_aes_128_gcm_sha256, 32);
 }
 
+test "#335 record-mode loopback covers the complete native suite/group/signature matrix" {
+    inline for (.{
+        tls_core.algorithms.CipherSuite.tls_aes_128_gcm_sha256,
+        tls_core.algorithms.CipherSuite.tls_aes_256_gcm_sha384,
+        tls_core.algorithms.CipherSuite.tls_chacha20_poly1305_sha256,
+    }) |cipher_suite| {
+        inline for (.{
+            tls_core.algorithms.NamedGroup.x25519,
+            tls_core.algorithms.NamedGroup.secp256r1,
+        }) |group| {
+            inline for (.{
+                tls_core.algorithms.SignatureScheme.ed25519,
+                tls_core.algorithms.SignatureScheme.ecdsa_secp256r1_sha256,
+                tls_core.algorithms.SignatureScheme.rsa_pss_rsae_sha256,
+            }) |signature_scheme| {
+                try expectMatrixTuple(cipher_suite, group, signature_scheme);
+            }
+        }
+    }
+}
+
 test "#568 native record-mode loopback negotiates AES-256-GCM/SHA-384 with an ECDSA-P256 CertificateVerify, not only Ed25519" {
     // #568 second-pass review: every other SHA-384 test in this file
     // authenticates with the fixture Ed25519 identity, so the ECDSA-P256
@@ -3537,6 +3742,70 @@ test "#568 a server whose provider lacks SHA-384/AES-256-GCM fails the ordinary 
     defer harness.deinit();
     try std.testing.expectError(error.IllegalParameter, harness.run());
     try std.testing.expect(harness.server_backend.schedule == null);
+}
+
+test "#335 a server whose provider lacks P-256 falls back to X25519 before selecting a group" {
+    var harness: DirectHarness = undefined;
+    var server_provider_storage: ProviderStorage = .{};
+    var server_capability_override = CapabilityOverrideProvider.initWithoutP256(server_provider_storage.init(server_provider_seed));
+    const client_groups = [_]tls_core.algorithms.NamedGroup{ .secp256r1, .x25519 };
+    directHarnessWithClientGroupsAndServerProvider(&harness, &client_groups, server_capability_override.provider());
+    defer harness.deinit();
+    try harness.run();
+
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+    try std.testing.expectEqual(tls_core.algorithms.NamedGroup.x25519, harness.client_backend.negotiated_named_group);
+    try std.testing.expectEqual(tls_core.algorithms.NamedGroup.x25519, harness.server_backend.negotiated_named_group);
+}
+
+test "#335 a server whose provider lacks P-256 fails no-mutual-group when P-256 is the only peer group" {
+    var harness: DirectHarness = undefined;
+    var server_provider_storage: ProviderStorage = .{};
+    var server_capability_override = CapabilityOverrideProvider.initWithoutP256(server_provider_storage.init(server_provider_seed));
+    const client_groups = [_]tls_core.algorithms.NamedGroup{.secp256r1};
+    directHarnessWithClientGroupsAndServerProvider(&harness, &client_groups, server_capability_override.provider());
+    defer harness.deinit();
+    try std.testing.expectError(error.IllegalParameter, harness.run());
+    try std.testing.expect(harness.server_backend.schedule == null);
+}
+
+fn expectMalformedP256ClientShareFails(share: []const u8) !void {
+    var server_provider_storage: ProviderStorage = .{};
+    const alpns = [_]tls_core.algorithms.ProtocolName{tls_core.algorithms.alpn.h2};
+    const groups = [_]tls_core.algorithms.NamedGroup{.secp256r1};
+    const policy = tls_core.policy.Policy.fromCapabilities(.record, .{ .named_groups = &groups }, &alpns);
+    var server = tls_backend.Tls13Backend.initServerConfigured(
+        serverEntropy(),
+        server_provider_storage.init(server_provider_seed),
+        fixtureIdentity(),
+        tls_backend.recordConfig(policy),
+    );
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [1024]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{
+        .supported_groups = &.{0x0017},
+        .key_share_group = 0x0017,
+        .key_share_bytes = share,
+    });
+    try std.testing.expectError(error.IllegalParameter, server.backend().receive(.initial, hello, &sink));
+    try std.testing.expect(server.schedule == null);
+}
+
+test "#335 malformed P-256 key shares fail before secret installation" {
+    var wrong_prefix = [_]u8{0x04} ++ ([_]u8{0x11} ** 64);
+    wrong_prefix[0] = 0x03;
+    try expectMalformedP256ClientShareFails(&wrong_prefix);
+
+    const wrong_len = [_]u8{0x04} ++ ([_]u8{0x22} ** 63);
+    try expectMalformedP256ClientShareFails(&wrong_len);
+
+    const off_curve = [_]u8{0x04} ++ ([_]u8{0xff} ** 64);
+    try expectMalformedP256ClientShareFails(&off_curve);
 }
 
 test "#568 a client whose provider lacks SHA-384 drops a SHA-384 ticket from its PSK offer and falls back to a full handshake" {
@@ -4863,9 +5132,103 @@ test "#484 client emits exactly one fresh X25519 share, drawn from the injected 
     // so this is unambiguously the fresh HRR-triggered share, not a reused
     // one).
     try std.testing.expect(client.key_pair_present);
-    try std.testing.expectEqualSlices(u8, &client.key_pair.public_key, ch2_offers.key_shares[0].key_exchange);
+    try std.testing.expectEqualSlices(u8, client.key_pair.public_key[0..client.key_pair.public_key_len], ch2_offers.key_shares[0].key_exchange);
 
     try expectHrrRetryStateCleared(&client);
+}
+
+test "#335 P-256 HelloRetryRequest emits a fresh ClientHello2 share and completes" {
+    var harness: DirectHarness = undefined;
+    directHarnessWithClientKeyShareMode(&harness, .record, .record, .empty);
+    defer harness.deinit();
+    const client_groups = [_]tls_core.algorithms.NamedGroup{ .x25519, .secp256r1 };
+    const server_groups = [_]tls_core.algorithms.NamedGroup{.secp256r1};
+    harness.client_backend.policy.named_groups = &client_groups;
+    harness.server_backend.policy.named_groups = &server_groups;
+
+    var client_sink = DirectSink{};
+    defer client_sink.deinit();
+    var server_sink = DirectSink{};
+    defer server_sink.deinit();
+
+    try harness.client_backend.backend().start(.client, {}, &client_sink);
+    const ch1_body = (try tls_core.messages.decode(nthInitialCryptoBytes(&client_sink, 0))).body;
+    const ch1_offers = try tls_core.negotiation.parseClientHello(ch1_body);
+    try std.testing.expectEqual(@as(usize, 0), ch1_offers.key_shares_len);
+    try std.testing.expectEqual(@as(usize, 2), ch1_offers.supported_groups_len);
+
+    try harness.server_backend.backend().start(.server, {}, &server_sink);
+    try harness.server_backend.backend().receive(.initial, nthInitialCryptoBytes(&client_sink, 0), &server_sink);
+    const hrr_raw = nthInitialCryptoBytes(&server_sink, 0);
+    const hrr = try tls_core.hello_retry.decode((try tls_core.messages.decode(hrr_raw)).body, "", &ch1_offers);
+    try std.testing.expectEqual(@as(?tls_core.algorithms.NamedGroup, .secp256r1), hrr.selected_group);
+
+    try harness.client_backend.backend().receive(.initial, hrr_raw, &client_sink);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, harness.client_backend.core.retry_state);
+    try std.testing.expect(harness.client_backend.key_pair_present);
+    try std.testing.expectEqual(tls_core.algorithms.NamedGroup.secp256r1, harness.client_backend.key_pair.group);
+    try std.testing.expectEqual(@as(usize, 65), harness.client_backend.key_pair.public_key_len);
+    const ch2_body = (try tls_core.messages.decode(nthInitialCryptoBytes(&client_sink, 1))).body;
+    const ch2_offers = try tls_core.negotiation.parseClientHello(ch2_body);
+    try std.testing.expectEqual(@as(usize, 1), ch2_offers.key_shares_len);
+    try std.testing.expectEqual(tls_core.algorithms.NamedGroup.secp256r1, ch2_offers.key_shares[0].group);
+    try std.testing.expectEqual(@as(usize, 65), ch2_offers.key_shares[0].key_exchange.len);
+    try std.testing.expectEqualSlices(u8, harness.client_backend.key_pair.public_key[0..harness.client_backend.key_pair.public_key_len], ch2_offers.key_shares[0].key_exchange);
+
+    try harness.server_backend.backend().receive(.initial, nthInitialCryptoBytes(&client_sink, 1), &server_sink);
+    const server_hello_raw = nthInitialCryptoBytes(&server_sink, 1);
+    var server_flight_buf: [4096]u8 = undefined;
+    const server_flight = collectHandshakeCrypto(&server_sink, &server_flight_buf);
+    try harness.client_backend.backend().receive(.initial, server_hello_raw, &client_sink);
+    try harness.client_backend.backend().receive(.handshake, server_flight, &client_sink);
+    var client_flight_buf: [512]u8 = undefined;
+    const client_flight = collectHandshakeCrypto(&client_sink, &client_flight_buf);
+    try harness.server_backend.backend().receive(.handshake, client_flight, &server_sink);
+
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.complete, harness.client_backend.core.handshake_lifecycle);
+    try std.testing.expectEqual(tls_core.handshake.HandshakeLifecycle.complete, harness.server_backend.core.handshake_lifecycle);
+    try std.testing.expectEqual(tls_core.algorithms.NamedGroup.secp256r1, harness.client_backend.negotiated_named_group);
+    try std.testing.expectEqual(tls_core.algorithms.NamedGroup.secp256r1, harness.server_backend.negotiated_named_group);
+    try std.testing.expect(!harness.client_backend.key_pair_present);
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&harness.client_backend.key_pair), 0));
+    try expectHrrRetryStateCleared(&harness.client_backend);
+    try expectHrrRetryStateCleared(&harness.server_backend);
+}
+
+test "#335 client fails closed if P-256 capability disappears before HelloRetryRequest retry" {
+    var backing_storage: ProviderStorage = .{};
+    const backing = backing_storage.init(client_provider_seed);
+    var client_capability_override = CapabilityOverrideProvider{ .backing = backing, .caps = backing.capabilities() };
+    var client = tls_backend.Tls13Backend.initClientWithOptions(
+        clientEntropy(),
+        client_capability_override.provider(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        .record,
+        .{ .initial_key_share_mode = .empty },
+    );
+    defer client.deinit();
+    const client_groups = [_]tls_core.algorithms.NamedGroup{ .x25519, .secp256r1 };
+    client.policy.named_groups = &client_groups;
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try client.backend().start(.client, {}, &sink);
+
+    const ch1_body = (try tls_core.messages.decode(nthInitialCryptoBytes(&sink, 0))).body;
+    const ch1_offers = try tls_core.negotiation.parseClientHello(ch1_body);
+    try std.testing.expectEqual(@as(usize, 0), ch1_offers.key_shares_len);
+    try std.testing.expectEqual(@as(usize, 2), ch1_offers.supported_groups_len);
+
+    client_capability_override.caps.groups.remove(.secp256r1);
+    var hrr_buf: [256]u8 = undefined;
+    const hrr = try tls_core.hello_retry.encode(.{
+        .legacy_session_id_echo = "",
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .secp256r1,
+    }, &hrr_buf);
+    try std.testing.expectError(error.IllegalParameter, client.backend().receive(.initial, hrr, &sink));
+    try std.testing.expectEqual(@as(usize, 1), countCryptoEvents(&sink, .initial));
+    try std.testing.expect(!client.key_pair_present);
+    try std.testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&client.key_pair), 0));
 }
 
 test "#484 client rejects an ordinary or HelloRetryRequest-shaped ServerHello before ClientHello1 has been sent" {
@@ -6958,6 +7321,9 @@ const ClientHelloOptions = struct {
     /// #484: omit the `key_share` extension entirely (distinct from
     /// `empty_key_share`, which sends it present-but-empty).
     omit_key_share: bool = false,
+    supported_groups: []const u16 = &.{0x001d},
+    key_share_group: u16 = 0x001d,
+    key_share_bytes: ?[]const u8 = null,
     /// The opaque transport extension (e.g. QUIC transport parameters) to
     /// offer, for driving an extension-profile (#392 HTTP/3) server through
     /// selection the same way a real QUIC client would.
@@ -7022,9 +7388,9 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
     }
     // supported_groups
     try w.u16_(10);
-    try w.u16_(4);
-    try w.u16_(2);
-    try w.u16_(0x001d);
+    try w.u16_(@intCast(2 + 2 * opts.supported_groups.len));
+    try w.u16_(@intCast(2 * opts.supported_groups.len));
+    for (opts.supported_groups) |group| try w.u16_(group);
     // signature_algorithms
     if (opts.include_signature_algorithms) {
         try w.u16_(13);
@@ -7043,11 +7409,12 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
             try w.u16_(2);
             try w.u16_(0);
         } else {
-            try w.u16_(2 + 2 + 2 + X25519.public_length);
-            try w.u16_(2 + 2 + X25519.public_length);
-            try w.u16_(0x001d);
-            try w.u16_(X25519.public_length);
-            try w.bytes(&key_pair.public_key);
+            const share = opts.key_share_bytes orelse &key_pair.public_key;
+            try w.u16_(@intCast(2 + 2 + 2 + share.len));
+            try w.u16_(@intCast(2 + 2 + share.len));
+            try w.u16_(opts.key_share_group);
+            try w.u16_(@intCast(share.len));
+            try w.bytes(share);
         }
     }
     // alpn
