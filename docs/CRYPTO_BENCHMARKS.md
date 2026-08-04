@@ -69,9 +69,15 @@ parse+open+decode cost end to end instead.
 Every measurement in the JSON report carries `suite`, `name`, `algorithm`,
 `input_bytes`, `iterations`, `ns_total`/`ns_per_op`/`ops_per_sec`, and (where
 relevant) `allocations_per_op`/`bytes_allocated_per_op`. The report's
-`_meta` object carries the Tardigrade version, Zig version, OS/architecture,
-build mode, and provider kind — the environment facts issue #378's
-benchmark contract requires for comparability. No production secrets, keys,
+`_meta` object carries the exact Tardigrade source commit (`git rev-parse
+HEAD` at build time, overridable with `-Dcommit`, or `"unknown"` for a
+non-git source tree — see `gitCommitSha` in `build.zig`) plus the
+Tardigrade version, Zig version, OS/architecture, build mode, and provider
+kind — the environment facts issue #378's benchmark contract requires for
+comparability. The commit is tracked separately from the version because a
+version string is not unique per commit; without it, two artifacts built
+from different commits of the same release would be indistinguishable. No
+production secrets, keys,
 nonces, or ticket identities are logged; every workload uses fixed
 non-secret fixture material generated in-process.
 

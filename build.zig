@@ -10,6 +10,20 @@ const std = @import("std");
 /// `tardi version`. See docs/TLS_DEPENDENCY_POLICY.md.
 const TlsProfile = enum { general, appliance };
 
+/// Resolves the source revision embedded in benchmark/diagnostic metadata
+/// (e.g. `crypto_bench`'s `_meta.tardigrade_commit`, #378's benchmark
+/// contract). Runs `git rev-parse HEAD` at configure time and falls back to
+/// `"unknown"` rather than failing the build when there is no `.git`
+/// directory to inspect (a source archive, a shallow export, etc.) or `git`
+/// itself is unavailable.
+fn gitCommitSha(b: *std.Build) []const u8 {
+    var code: u8 = undefined;
+    const output = b.runAllowFail(&.{ "git", "rev-parse", "HEAD" }, &code, .ignore) catch return "unknown";
+    const trimmed = std.mem.trim(u8, output, " \t\r\n");
+    if (trimmed.len == 0) return "unknown";
+    return trimmed;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -17,6 +31,7 @@ pub fn build(b: *std.Build) void {
     const require_static_system_libs = b.option(bool, "require-static-system-libs", "Require static linking for system libraries") orelse false;
     const static_executable = b.option(bool, "static-executable", "Build the tardi executable as a static binary") orelse false;
     const app_version = b.option([]const u8, "version", "Version string embedded in the tardi binary") orelse "dev";
+    const commit_sha = b.option([]const u8, "commit", "Source commit SHA embedded in benchmark/diagnostic metadata (default: `git rev-parse HEAD`, or \"unknown\")") orelse gitCommitSha(b);
     const go_bin = b.option([]const u8, "go-bin", "Go command used to build the PKI crypto/x509 oracle") orelse "go";
     const quic_test_filter = b.option([]const u8, "quic-test-filter", "Filter tests run by the test-quic step");
     const quic_test_filters: []const []const u8 = if (quic_test_filter) |filter| &.{filter} else &.{};
@@ -31,6 +46,7 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", app_version);
+    build_options.addOption([]const u8, "commit", commit_sha);
     build_options.addOption([]const u8, "tls_profile", @tagName(tls_profile));
     build_options.addOption(bool, "tls_openssl_adapter", link_openssl_adapter);
     const compat_mod = b.createModule(.{

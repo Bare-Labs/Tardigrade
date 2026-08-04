@@ -133,12 +133,20 @@ pub fn timeLoop(
 }
 
 /// Environment metadata every benchmark result must be comparable against
-/// (issue #378's "benchmark contract"): Tardigrade version, Zig version,
-/// OS/architecture, build mode, and provider kind. Deliberately excludes
-/// anything from the workloads themselves (keys, nonces, ticket identities)
-/// — only static build/environment facts belong here.
+/// (issue #378's "benchmark contract"): Tardigrade commit and version, Zig
+/// version, OS/architecture, build mode, and provider kind. Deliberately
+/// excludes anything from the workloads themselves (keys, nonces, ticket
+/// identities) — only static build/environment facts belong here.
+///
+/// `tardigrade_commit` is the exact source revision (`build.zig`'s
+/// `gitCommitSha`, embedded via `-Dcommit` / `git rev-parse HEAD`, or
+/// `"unknown"` for a non-git source tree) — distinct from
+/// `tardigrade_version`, which names a release and is not unique per
+/// commit, so two builds sharing a version string still produce
+/// distinguishable, attributable benchmark artifacts.
 pub const Metadata = struct {
     tardigrade_version: []const u8,
+    tardigrade_commit: []const u8,
     zig_version: []const u8,
     os: []const u8,
     arch: []const u8,
@@ -148,6 +156,7 @@ pub const Metadata = struct {
     pub fn current() Metadata {
         return .{
             .tardigrade_version = build_options.version,
+            .tardigrade_commit = build_options.commit,
             .zig_version = builtin.zig_version_string,
             .os = @tagName(builtin.os.tag),
             .arch = @tagName(builtin.cpu.arch),
@@ -180,9 +189,10 @@ pub const Reporter = struct {
 
 pub fn writeJsonReport(writer: anytype, metadata: Metadata, measurements: []const Measurement) !void {
     try writer.print(
-        "{{\n  \"_meta\": {{\"benchmark\":\"crypto-provider\",\"tardigrade_version\":\"{s}\",\"zig_version\":\"{s}\",\"os\":\"{s}\",\"arch\":\"{s}\",\"optimize_mode\":\"{s}\",\"provider_kind\":\"{s}\"}},\n  \"measurements\": [\n",
+        "{{\n  \"_meta\": {{\"benchmark\":\"crypto-provider\",\"tardigrade_version\":\"{s}\",\"tardigrade_commit\":\"{s}\",\"zig_version\":\"{s}\",\"os\":\"{s}\",\"arch\":\"{s}\",\"optimize_mode\":\"{s}\",\"provider_kind\":\"{s}\"}},\n  \"measurements\": [\n",
         .{
             metadata.tardigrade_version,
+            metadata.tardigrade_commit,
             metadata.zig_version,
             metadata.os,
             metadata.arch,

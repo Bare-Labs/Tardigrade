@@ -615,29 +615,52 @@ fn runNonceReservationContended(out: *harness.Reporter, scale: Scale) !void {
     defer state.deinit();
     var protector = ticket_protection.Protector{ .provider = cp, .keyring = &keyring, .limits = session.Limits.default };
 
+    // A worker that hits a `Protector.seal` error (nonce-lease exhaustion,
+    // an unexpected keyring rejection, ...) must not be able to make this
+    // workload silently report success on partial work: nonce uniqueness is
+    // a security invariant issue #378 says benchmarks must not weaken, so a
+    // seal failure here has to fail the benchmark, not just end one thread
+    // early while the parent reports the full requested iteration count
+    // regardless.
+    const Shared = struct {
+        completed: std.atomic.Value(usize) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+    };
+
     const Worker = struct {
-        fn run(protector_ptr: *ticket_protection.Protector, state_ptr: *const session.ServerRecoverableState, iterations: usize) void {
+        fn run(shared: *Shared, protector_ptr: *ticket_protection.Protector, state_ptr: *const session.ServerRecoverableState, iterations: usize) void {
             var out_buf: [4096]u8 = undefined;
             var i: usize = 0;
             while (i < iterations) : (i += 1) {
-                _ = protector_ptr.seal(std.heap.page_allocator, state_ptr, 1500, &out_buf) catch return;
+                _ = protector_ptr.seal(std.heap.page_allocator, state_ptr, 1500, &out_buf) catch {
+                    shared.failed.store(true, .release);
+                    return;
+                };
+                _ = shared.completed.fetchAdd(1, .monotonic);
             }
         }
     };
 
+    var shared = Shared{};
     var threads: [thread_count]std.Thread = undefined;
     const start = harness.monotonicNs();
     for (&threads) |*t| {
-        t.* = try std.Thread.spawn(.{}, Worker.run, .{ &protector, &state, per_thread_iterations });
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{ &shared, &protector, &state, per_thread_iterations });
     }
     for (&threads) |*t| t.join();
     const ns: u64 = @intCast(harness.monotonicNs() - start);
+
+    const expected = thread_count * per_thread_iterations;
+    const completed = shared.completed.load(.acquire);
+    if (shared.failed.load(.acquire) or completed != expected) {
+        return error.NonceReservationWorkerFailed;
+    }
 
     try out.append(.{
         .suite = "ticket",
         .name = "nonce_reservation_contended",
         .algorithm = "aes_128_gcm",
-        .iterations = thread_count * per_thread_iterations,
+        .iterations = completed,
         .ns_total = ns,
         .note = "4 threads sharing one nonce lease, each doing end-to-end Protector.seal",
     });
