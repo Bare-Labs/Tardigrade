@@ -3399,71 +3399,159 @@ fn fuzzParseEnvelopeMutationInput(_: void, smith: *std.testing.Smith) !void {
     try fuzzParseEnvelopeMutation(smith);
 }
 
-/// #494-B: authenticated `Protector.resolve` under key-state and envelope
-/// mutation. Complements `fuzzTicketIdentity` above (which only proves miss
-/// paths never panic or mutate output against arbitrary bytes) by driving
-/// the accept path, every typed rejection reason, and an allocator-failure
-/// sweep against a *structurally valid* envelope, so mutation has a
-/// meaningful chance of landing on the authenticated-open boundary rather
-/// than being rejected by `parseEnvelope` before any key/AEAD work happens.
-/// Every scenario runs through `ZeroCheckingAllocator` to prove the
-/// temporary plaintext buffer is wiped before free on every path (accept,
-/// reject, and allocation failure alike), not just the miss path the
-/// existing deterministic "...zeroize plaintext before free" test names.
+/// Like `buildAuthenticatedEnvelope`, but takes an explicit provider
+/// instead of the shared static `testProvider()`, so `fuzzProtectorResolve`
+/// can forge authenticated envelopes under the same per-case
+/// `DeterministicEntropy`-backed provider it uses for `Protector.seal`/
+/// `resolve`, rather than mixing two separate provider instances within one
+/// fuzz case.
+fn sealPlaintextWithProvider(
+    provider_in: provider.CryptoProvider,
+    out: []u8,
+    aead: provider.Aead,
+    key_id: KeyId,
+    key: []const u8,
+    nonce: [provider.aead_nonce_len]u8,
+    plaintext: []const u8,
+) ![]const u8 {
+    const protected_len = envelope_overhead + plaintext.len;
+    if (out.len < protected_len) return error.BufferTooSmall;
+    writeHeader(out[0..fixed_header_len], aead, &key_id, &nonce);
+    var aad: [aad_prefix.len + fixed_header_len]u8 = undefined;
+    buildAad(out[0..fixed_header_len], &aad);
+    const ciphertext = out[fixed_header_len .. fixed_header_len + plaintext.len];
+    const tag = out[fixed_header_len + plaintext.len .. protected_len];
+    try provider_in.aeadSeal(aead, key, &nonce, &aad, plaintext, ciphertext, tag);
+    return out[0..protected_len];
+}
+
+/// A `ServerRecoverableState` with caller-controlled `issued_at`/`lifetime`,
+/// for forging authenticated tickets that land on `Protector.resolveInner`'s
+/// `isNotYetValid`/`isExpired` checks (which run after authenticated decode,
+/// not at the envelope/key layer, so they need a real encoded+resealed
+/// plaintext rather than a raw byte mutation).
+fn buildTimedServerState(allocator: std.mem.Allocator, issued_at_unix_ms: i64, lifetime_seconds: u32) !session.ServerRecoverableState {
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .resumption_psk = &([_]u8{0x77} ** 32),
+        .server_name = "timed.example.test",
+        .application_protocol = "h3",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer("timed-leaf"),
+        .issued_at_unix_ms = issued_at_unix_ms,
+        .lifetime_seconds = lifetime_seconds,
+        .early_data = .resume_only,
+    });
+    var state: session.ServerRecoverableState = .{};
+    state.init(&common, 0xdeadbeef);
+    return state;
+}
+
+/// #494-B: authenticated `Protector.resolve` under key-state, envelope, and
+/// authenticated-plaintext mutation. Complements `fuzzTicketIdentity` above
+/// (which only proves miss paths never panic or mutate output against
+/// arbitrary bytes) by driving the accept path, every typed rejection
+/// reason -- including the ones that require successfully authenticating
+/// first (`invalid_plaintext`, `not_yet_valid`, `expired`) -- and a full
+/// allocation-failure sweep, against structurally valid envelopes for all
+/// three required AEADs, each fuzz case using its own freshly constructed
+/// `pure_zig.DeterministicEntropy`-backed provider rather than the shared
+/// static `testProvider()`. Every scenario runs through
+/// `ZeroCheckingAllocator` to prove the temporary plaintext buffer is wiped
+/// before free on every path (accept, reject, and allocation failure
+/// alike), not just the miss path the existing deterministic "...zeroize
+/// plaintext before free" test names.
 fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith) !void {
+    const aead_choices = [_]provider.Aead{ .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305 };
+    const selected_aead = aead_choices[smith.index(aead_choices.len)];
+    const cross_aead: provider.Aead = switch (selected_aead) {
+        .aes_128_gcm => .aes_256_gcm,
+        .aes_256_gcm => .chacha20_poly1305,
+        .chacha20_poly1305 => .aes_128_gcm,
+    };
+
+    // A fresh provider per case, per the #494-B contract: nothing in this
+    // target's actual code path draws entropy (AEAD seal/open are pure
+    // functions of key/nonce/aad/plaintext, and nonces come from the
+    // keyring's counter-based lease, not the provider), but constructing
+    // fresh state here rather than reaching for the shared static
+    // `testProvider()` keeps every target in this file honoring the same
+    // case-isolation discipline regardless of whether a given target
+    // happens to touch entropy today.
+    var entropy = crypto.pure_zig.DeterministicEntropy.init(0x494b2094);
+    var provider_state = crypto.pure_zig.Provider.init(entropy.entropy());
+    const fresh_provider = provider_state.cryptoProvider();
+
     const active_id = keyId(0xa1);
     const future_id = keyId(0xa2);
     const retired_id = keyId(0xa3);
     const other_aead_id = keyId(0xa4);
     const unknown_id = keyId(0xff);
 
+    var key_storage: [4][provider.max_aead_key_len]u8 = undefined;
+    for (&key_storage, [_]u8{ 0x11, 0x13, 0x10, 0x22 }) |*buf, tag| @memset(buf, tag);
+    const active_key = key_storage[0][0..selected_aead.keyLength()];
+
     var keyring = ReloadableKeyRing.init(allocator);
     defer keyring.deinit();
     const configs = [_]KeyConfig{
         // The only key with a nonce lease, so `seal` picks it unambiguously.
-        sampleKeyConfigWithByte(active_id, .aes_128_gcm, .{ .prefix = .{ 0xa1, 0, 0, 0 }, .start = 0, .end_exclusive = 8 }, 0x11),
+        // `decrypt_until_unix_ms` is generous (well beyond `resolve_now`
+        // below) so the forged not_yet_valid/expired tickets, whose
+        // `lifetime_seconds` pushes their nominal expiry far past the
+        // window `sampleKeyConfigWithByte`'s fixed windows would allow,
+        // stay inside the *key's* decrypt window -- only the *ticket's*
+        // own timestamps should trigger those two rejections.
+        .{
+            .id = active_id,
+            .aead = selected_aead,
+            .key_bytes = active_key,
+            .not_before_unix_ms = 0,
+            .encrypt_until_unix_ms = 5_000,
+            .decrypt_until_unix_ms = 5_000_000,
+            .nonce_lease = .{ .prefix = .{ 0xa1, 0, 0, 0 }, .start = 0, .end_exclusive = 64 },
+        },
         .{
             .id = future_id,
-            .aead = .aes_128_gcm,
-            .key_bytes = testKeyBytes(.aes_128_gcm, 0x13),
-            .not_before_unix_ms = 15_000,
-            .encrypt_until_unix_ms = 20_000,
-            .decrypt_until_unix_ms = 30_000,
+            .aead = selected_aead,
+            .key_bytes = key_storage[1][0..selected_aead.keyLength()],
+            .not_before_unix_ms = 50_000,
+            .encrypt_until_unix_ms = 60_000,
+            .decrypt_until_unix_ms = 5_000_000,
         },
         .{
             .id = retired_id,
-            .aead = .aes_128_gcm,
-            .key_bytes = testKeyBytes(.aes_128_gcm, 0x10),
+            .aead = selected_aead,
+            .key_bytes = key_storage[2][0..selected_aead.keyLength()],
             .not_before_unix_ms = 0,
             .encrypt_until_unix_ms = 500,
             .decrypt_until_unix_ms = 1_000,
         },
         .{
             .id = other_aead_id,
-            .aead = .aes_256_gcm,
-            .key_bytes = testKeyBytes(.aes_256_gcm, 0x22),
+            .aead = cross_aead,
+            .key_bytes = key_storage[3][0..cross_aead.keyLength()],
             .not_before_unix_ms = 0,
-            .encrypt_until_unix_ms = 20_000,
-            .decrypt_until_unix_ms = 30_000,
+            .encrypt_until_unix_ms = 5_000,
+            .decrypt_until_unix_ms = 5_000_000,
         },
     };
     try keyring.install(try keyring.buildSnapshot(&configs, testCapabilities()));
 
-    var state = try sampleServerState(allocator);
+    var state = try sentinelServerState(allocator);
     defer state.deinit();
-    var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
-    var seal_buf: [1024]u8 = undefined;
-    // `active_id`'s window is `sampleKeyConfigWithByte`'s fixed
-    // `[1_000, 5_000)` encrypt / `[1_000, 20_000)` decrypt range, so sealing
-    // and resolving must use different instants: seal while the lease can
-    // still mint nonces, resolve later during the decrypt-only grace
-    // window (still `retained`, not `retired`) so the accept/round-trip
-    // scenario exercises the same grace-window path
+    var protector = Protector{ .provider = fresh_provider, .keyring = &keyring, .limits = session.Limits.default };
+    var seal_buf: [2048]u8 = undefined;
+    // `active_id`'s window is `[0, 5_000)` encrypt / `[0, 5_000_000)`
+    // decrypt, so sealing and resolving use different instants: seal
+    // while the lease can still mint nonces, resolve later during the
+    // decrypt-only grace window (still `retained`, not `retired`) so the
+    // accept/round-trip scenario exercises the same grace-window path
     // `"rotation: a resolve against a decrypt-only grace-window key..."`
-    // covers deterministically, but under Smith-driven envelope/key-state
-    // mutation instead of a single hand-picked case.
+    // covers deterministically, but under Smith-driven mutation across
+    // all three AEADs instead of a single hand-picked AES-128-GCM case.
     const seal_now_unix_ms: i64 = 2_000;
-    const now_unix_ms: i64 = 10_000;
+    const resolve_now_unix_ms: i64 = 10_000;
     const valid_envelope = try protector.seal(allocator, &state, seal_now_unix_ms, &seal_buf);
 
     var observer = TestObserver{};
@@ -3471,13 +3559,13 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
     protector.observer = observer.observer();
 
     var zero_alloc = ZeroCheckingAllocator.init(allocator);
-    switch (smith.index(6)) {
+    switch (smith.index(9)) {
         0 => {
-            try expectRoundTrip(&protector, zero_alloc.allocator(), &state, valid_envelope, now_unix_ms);
+            try expectRoundTrip(&protector, zero_alloc.allocator(), &state, valid_envelope, resolve_now_unix_ms);
             try observer.expectOnly(.resolve_succeeded);
         },
         1, 2, 3, 4 => |case| {
-            var tampered_buf: [1024]u8 = undefined;
+            var tampered_buf: [2048]u8 = undefined;
             const tampered = tampered_buf[0..valid_envelope.len];
             @memcpy(tampered, valid_envelope);
             const substituted = switch (case) {
@@ -3487,7 +3575,7 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
                 else => other_aead_id,
             };
             @memcpy(tampered[8..24], &substituted);
-            try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), tampered, now_unix_ms);
+            try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), tampered, resolve_now_unix_ms);
             const expected_reason: ResolveRejectReason = switch (case) {
                 1 => .unknown_key,
                 2 => .future_key,
@@ -3496,8 +3584,8 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
             };
             try observer.expectOnly(.{ .resolve_rejected = expected_reason });
         },
-        else => {
-            var tampered_buf: [1024]u8 = undefined;
+        5 => {
+            var tampered_buf: [2048]u8 = undefined;
             const tampered = tampered_buf[0..valid_envelope.len];
             @memcpy(tampered, valid_envelope);
             const region = smith.index(3);
@@ -3507,38 +3595,134 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
                 else => tampered.len - tag_len + smith.index(tag_len), // tag
             };
             tampered[offset] ^= 0xff;
-            try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), tampered, now_unix_ms);
+            try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), tampered, resolve_now_unix_ms);
             try observer.expectOnly(.{ .resolve_rejected = .authentication_failed });
+        },
+        6 => {
+            // Authenticate a structurally corrupted `TRS1` record: encode a
+            // valid state, mutate its shared record header (magic/version/
+            // record-type/field-section-length), and re-seal the mutated
+            // bytes with the real key so AEAD authentication succeeds and
+            // `resolveInner` reaches `session.decode`, which must reject it
+            // deterministically as `invalid_plaintext`.
+            var plaintext_buf: [2048]u8 = undefined;
+            const plaintext = try session.encodeServer(&state, session.Limits.default, &plaintext_buf);
+            var mutated_buf: [2048]u8 = undefined;
+            const mutated = mutated_buf[0..plaintext.len];
+            @memcpy(mutated, plaintext);
+            switch (smith.index(4)) {
+                0 => mutated[smith.index(4)] ^= 0xff, // magic
+                1 => mutated[4] +%= 1, // format_version
+                2 => mutated[5] = 0xff, // record_type: not a valid client(1)/server(2) tag
+                else => { // field_section_len off by one from the true remaining length
+                    var section_len = std.mem.readInt(u32, mutated[6..10], .big);
+                    section_len +%= 1;
+                    std.mem.writeInt(u32, mutated[6..10], section_len, .big);
+                },
+            }
+            var envelope_buf: [2048]u8 = undefined;
+            const nonce = [_]u8{0xab} ** provider.aead_nonce_len;
+            const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, mutated);
+            try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), envelope, resolve_now_unix_ms);
+            try observer.expectOnly(.{ .resolve_rejected = .invalid_plaintext });
+        },
+        7 => {
+            // `issued_at_unix_ms` strictly after `resolve_now_unix_ms`.
+            var timed_state = try buildTimedServerState(allocator, resolve_now_unix_ms + 5_000, 10);
+            defer timed_state.deinit();
+            var plaintext_buf: [2048]u8 = undefined;
+            const plaintext = try session.encodeServer(&timed_state, session.Limits.default, &plaintext_buf);
+            var envelope_buf: [2048]u8 = undefined;
+            const nonce = [_]u8{0xcd} ** provider.aead_nonce_len;
+            const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, plaintext);
+            try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), envelope, resolve_now_unix_ms);
+            try observer.expectOnly(.{ .resolve_rejected = .not_yet_valid });
+        },
+        else => {
+            // `issued_at_unix_ms + lifetime_seconds` strictly before
+            // `resolve_now_unix_ms`.
+            var timed_state = try buildTimedServerState(allocator, 1, 1);
+            defer timed_state.deinit();
+            var plaintext_buf: [2048]u8 = undefined;
+            const plaintext = try session.encodeServer(&timed_state, session.Limits.default, &plaintext_buf);
+            var envelope_buf: [2048]u8 = undefined;
+            const nonce = [_]u8{0xef} ** provider.aead_nonce_len;
+            const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, plaintext);
+            try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), envelope, resolve_now_unix_ms);
+            try observer.expectOnly(.{ .resolve_rejected = .expired });
         },
     }
 
-    // Bounded allocation-failure sweep against the unmodified valid
-    // envelope: every reachable allocation point must leave `out` either
-    // fully owned (fail_index landed after the last allocation `resolve`
-    // needed) or byte-identical to its pristine sentinel (fail_index landed
-    // on or before one), never a partially-populated state either way.
-    var sweep_zero = ZeroCheckingAllocator.init(allocator);
-    var failing = testing.FailingAllocator.init(sweep_zero.allocator(), .{ .fail_index = smith.index(6) });
-    var out: session.ServerRecoverableState = .{};
-    defer out.deinit();
-    if (protector.resolve(failing.allocator(), valid_envelope, now_unix_ms, &out)) |found| {
-        if (found) {
-            try expectServerStateEqual(&state, &out);
-        } else {
-            try testing.expectEqual(@as(usize, 0), out.common.resumption_psk.len);
+    // Vary `protector.limits` around the exact envelope-length boundary.
+    // The raw `parseEnvelope` boundary is already exhaustively fuzzed at
+    // the parse layer by `fuzzParseEnvelopeMutation` (#494-A); this proves
+    // the same boundary integrates correctly through the full `resolve`
+    // path (`self.limits.validate()` then `parseEnvelope(identity,
+    // self.limits)`).
+    {
+        var limits_probe = session.Limits.default;
+        switch (smith.index(3)) {
+            0 => {},
+            1 => limits_probe.max_ticket_len = valid_envelope.len,
+            else => limits_probe.max_ticket_len = valid_envelope.len - 1,
         }
-    } else |err| {
-        try testing.expectEqual(error.OutOfMemory, err);
-        try testing.expectEqual(@as(usize, 0), out.common.resumption_psk.len);
+        var probe_protector = Protector{ .provider = fresh_provider, .keyring = &keyring, .limits = limits_probe };
+        if (limits_probe.max_ticket_len < valid_envelope.len) {
+            try expectResolveFalseUnchanged(&probe_protector, zero_alloc.allocator(), valid_envelope, resolve_now_unix_ms);
+        } else {
+            try expectRoundTrip(&probe_protector, zero_alloc.allocator(), &state, valid_envelope, resolve_now_unix_ms);
+        }
     }
+
+    // A real transactional allocation-failure sweep: every reachable
+    // allocation point in `resolveInner` (measured at 5 for a fully
+    // populated `ServerRecoverableState` via a one-off local probe; 8
+    // leaves headroom for future fields) must leave `out` either fully
+    // owned (fail_index landed after the last allocation `resolve`
+    // needed) or byte-identical to a *non-empty* sentinel it started
+    // from -- proving no field (not just `resumption_psk`) was partially
+    // populated -- on every miss/error. A `deinit_count` probe on the
+    // keyring's live current snapshot proves the `acquireCurrent`/
+    // `release` pair inside `resolveInner` stays balanced under every
+    // injected failure: it must never reach zero here, since the keyring
+    // itself still holds its own reference throughout.
+    const max_resolve_fail_index: usize = 8;
+    var current_deinit_count = std.atomic.Value(usize).init(0);
+    if (keyring.acquireCurrent()) |snap| {
+        snap.deinit_count = &current_deinit_count;
+        snap.release();
+    }
+    for (0..max_resolve_fail_index + 1) |fail_index| {
+        var out = try sentinelServerState(allocator);
+        defer out.deinit();
+        var expected: session.ServerRecoverableState = .{};
+        try out.cloneInto(allocator, &expected);
+        defer expected.deinit();
+
+        var sweep_zero = ZeroCheckingAllocator.init(allocator);
+        var failing = testing.FailingAllocator.init(sweep_zero.allocator(), .{ .fail_index = fail_index });
+        if (protector.resolve(failing.allocator(), valid_envelope, resolve_now_unix_ms, &out)) |found| {
+            if (found) {
+                try expectServerStateEqual(&state, &out);
+            } else {
+                try expectServerStateEqual(&expected, &out);
+            }
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try expectServerStateEqual(&expected, &out);
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), current_deinit_count.load(.monotonic));
 }
 
 test "fuzz: TLS resumption: Protector.resolve authenticates, rejects, and never leaks plaintext under key-state and envelope mutation" {
     try testing.fuzz({}, fuzzProtectorResolveInput, .{ .corpus = &.{
         "",
         &[_]u8{0},
-        &[_]u8{ 0, 1, 2, 3, 4, 5 },
-        &([_]u8{0xff} ** 6),
+        &[_]u8{1},
+        &[_]u8{2},
+        &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8 },
+        &([_]u8{0xff} ** 9),
     } });
 }
 
@@ -3548,38 +3732,83 @@ fn fuzzProtectorResolveInput(_: void, smith: *testing.Smith) !void {
 
 /// #494-B: bounded operation-sequence target over `Snapshot.build`,
 /// `ReloadableKeyRing.install`/`validateInstallCandidate`/`acquireCurrent`,
-/// and `Snapshot.retain`/`release`. `fuzzSnapshotConfig` above already
-/// exhaustively fuzzes the *static* properties of a single build/install
-/// call (every rejection reason, boundary window, and key count); this
-/// target instead fuzzes a short *program* of such calls interleaved with
-/// acquire/retain/release, asserting after every step that generation is
-/// monotonic, the ledger never shrinks, and a retained old snapshot stays
-/// fully intact (unwiped, unfreed) for as long as it is held, even across
-/// installs that replace it as `keyring.current` -- the temporal invariant
-/// the single-call target cannot exercise.
+/// `Snapshot.retain`/`release`, and `Protector.seal`. `fuzzSnapshotConfig`
+/// above already exhaustively fuzzes the *static* properties of a single
+/// build/install call (every rejection reason, boundary window, and key
+/// count); this target instead fuzzes a short *program* of such calls
+/// interleaved with acquire/retain/release and nonce-reserving seals,
+/// asserting after every step that generation is monotonic, the ledger
+/// never shrinks, nonces are never reused or reissued, a retained old
+/// snapshot's key/lease state stays byte-identical and unfreed for as long
+/// as it is held (even across installs that replace it as
+/// `keyring.current`), and it is wiped exactly once when the last
+/// reference -- acquired or explicitly retained -- is finally released.
 fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Smith) !void {
-    var keyring = ReloadableKeyRing.init(allocator);
+    // #494-B also requires OOM during `Snapshot.build`/ledger allocation/
+    // `validateInstallCandidate`/`install` to exercise copied-key/
+    // fingerprint cleanup and publication rollback. `ReloadableKeyRing`'s
+    // allocator is fixed at construction and reused for every internal
+    // allocation over the ring's whole lifetime -- there is no per-call
+    // override -- so the only way to inject a failure at an arbitrary
+    // point across a *sequence* of build/install/validate calls is to back
+    // the ring itself with a `FailingAllocator` whose `fail_index` Smith
+    // chooses once, up front: every allocation up to that point across the
+    // whole bounded program succeeds, and (per `FailingAllocator`'s "fails
+    // after N allocations" contract) every one from that point on fails
+    // deterministically, so the rest of the program keeps exercising the
+    // rejection/rollback path repeatedly rather than needing a separate
+    // one-shot opcode. `Protector.seal`'s own plaintext-buffer allocation
+    // uses the unwrapped `allocator` parameter directly (see the `seal`
+    // opcode below), so its allocation budget is independent of the
+    // keyring's.
+    var failing_keyring_alloc = testing.FailingAllocator.init(allocator, .{ .fail_index = smith.index(24) });
+    var keyring = ReloadableKeyRing.init(failing_keyring_alloc.allocator());
     defer keyring.deinit();
 
+    // A passive zeroization safety net for the whole sequence:
+    // `KeyDeinitProbe.record` (already used by `expectPartialBuildWipesCopiedKey`
+    // above) panics if any retained key byte is nonzero when a `KeyRecord`
+    // is wiped, whether that wipe comes from an ordinary replacement or
+    // from `Snapshot.build`'s partial-construction cleanup after an
+    // injected allocation failure.
+    var key_probe = KeyDeinitProbe{};
+    TestKeyDeinitProbeStorage.probe = &key_probe;
+    defer TestKeyDeinitProbeStorage.probe = null;
+
     var held: ?*Snapshot = null;
+    var held_refs: usize = 0;
     var held_deinit_count = std.atomic.Value(usize).init(0);
-    var held_generation: u64 = 0;
+    var held_fixture: KeyState = undefined;
+    var held_outlived_current = false;
     defer if (held) |snap| snap.release();
 
     var last_generation: u64 = 0;
     var last_ledger_len: usize = 0;
-    var next_id_byte: u8 = 0xb0;
+    var next_lease_start: u64 = 0;
+    const lease_chunk: u64 = 3;
+
+    var state = try sampleServerState(allocator);
+    defer state.deinit();
+    var seen_nonces: [16][provider.aead_nonce_len]u8 = undefined;
+    var seen_nonce_count: usize = 0;
+    const seal_now_unix_ms: i64 = 500;
 
     const op_count = 1 + smith.index(8);
     for (0..op_count) |_| {
-        switch (smith.index(5)) {
-            0 => { // install a fresh key, occasionally reusing a prior id
-                const aead = fuzzAead(@intCast(smith.index(3)));
-                const reuse_prior = next_id_byte > 0xb0 and smith.index(3) == 0;
-                const id_byte = if (reuse_prior) next_id_byte -% 1 else next_id_byte;
-                if (!reuse_prior) next_id_byte +%= 1;
-                const key_byte: u8 = if (aead == .aes_128_gcm) 0x11 else 0x22;
-                const config = sampleKeyConfigWithByte(keyId(id_byte), aead, .{ .prefix = .{ id_byte, 0, 0, 0 }, .start = 0, .end_exclusive = 4 }, key_byte);
+        switch (smith.index(6)) {
+            0 => { // (re)install the active key with an advanced, non-overlapping lease window
+                const start = next_lease_start;
+                const end = start + lease_chunk;
+                next_lease_start = end;
+                const config = KeyConfig{
+                    .id = keyId(0xc1),
+                    .aead = .aes_128_gcm,
+                    .key_bytes = testKeyBytes(.aes_128_gcm, 0x11),
+                    .not_before_unix_ms = 0,
+                    .encrypt_until_unix_ms = 1_000_000,
+                    .decrypt_until_unix_ms = 2_000_000,
+                    .nonce_lease = .{ .prefix = .{ 0xc1, 0, 0, 0 }, .start = start, .end_exclusive = end },
+                };
                 const before = captureKeyringState(&keyring);
                 const snapshot = keyring.buildSnapshot(&.{config}, testCapabilities()) catch continue;
                 keyring.install(snapshot) catch {
@@ -3590,63 +3819,115 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                 last_generation = keyring.current.?.generation;
             },
             1 => { // dry-run validate must never mutate published state
-                const config = sampleKeyConfigWithByte(keyId(next_id_byte), .aes_256_gcm, null, 0x22);
+                const config = sampleKeyConfigWithByte(keyId(0xc2), .aes_256_gcm, null, 0x22);
                 const before = captureKeyringState(&keyring);
                 const candidate = keyring.buildSnapshot(&.{config}, testCapabilities()) catch continue;
                 defer candidate.release();
                 keyring.validateInstallCandidate(candidate) catch {};
                 try expectKeyringStateEqual(before, &keyring);
             },
-            2 => { // acquire + retain current, hold across subsequent ops
+            2 => { // acquire current, hold across subsequent ops
                 if (held == null) {
                     if (keyring.acquireCurrent()) |snap| {
                         held_deinit_count = std.atomic.Value(usize).init(0);
                         snap.deinit_count = &held_deinit_count;
-                        held_generation = snap.generation;
                         held = snap;
+                        held_refs = 1;
+                        held_outlived_current = false;
+                        held_fixture = .{
+                            .id = snap.keys[0].id,
+                            .aead = snap.keys[0].aead,
+                            .not_before_unix_ms = snap.keys[0].not_before_unix_ms,
+                            .encrypt_until_unix_ms = snap.keys[0].encrypt_until_unix_ms,
+                            .decrypt_until_unix_ms = snap.keys[0].decrypt_until_unix_ms,
+                            .lease = leaseStateFromKey(&snap.keys[0]),
+                        };
                     }
                 }
             },
-            3 => { // release the held snapshot
+            3 => { // explicit Snapshot.retain(), a second modeled owner
                 if (held) |snap| {
-                    try testing.expectEqual(@as(usize, 0), held_deinit_count.load(.monotonic));
-                    snap.release();
-                    held = null;
+                    snap.retain();
+                    held_refs += 1;
                 }
             },
-            else => { // explicit generation control: exercise stale/overflow rejection
-                const config = sampleKeyConfigWithByte(keyId(next_id_byte), .aes_128_gcm, null, 0x33);
-                const generation: u64 = switch (smith.index(3)) {
-                    0 => 0,
-                    1 => if (last_generation > 0) last_generation else 1,
-                    else => std.math.maxInt(u64),
-                };
+            4 => { // release one modeled reference
+                if (held) |snap| {
+                    snap.release();
+                    held_refs -= 1;
+                    if (held_refs == 0) {
+                        try testing.expectEqual(
+                            @as(usize, if (held_outlived_current) 1 else 0),
+                            held_deinit_count.load(.monotonic),
+                        );
+                        held = null;
+                    }
+                }
+            },
+            else => { // reserve a nonce; expect deterministic exhaustion once the lease window is spent
+                var ticket_buf: [512]u8 = undefined;
                 const before = captureKeyringState(&keyring);
-                const candidate = Snapshot.build(allocator, &.{config}, generation, testCapabilities()) catch continue;
-                keyring.install(candidate) catch {
+                const ticket = keyring.current != null and keyring.current.?.keys[0].nonce_lease != null;
+                if (!ticket) continue;
+                var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+                if (protector.seal(allocator, &state, seal_now_unix_ms, &ticket_buf)) |sealed| {
+                    var nonce: [provider.aead_nonce_len]u8 = undefined;
+                    @memcpy(&nonce, sealed[24..36]);
+                    for (seen_nonces[0..seen_nonce_count]) |prior| {
+                        try testing.expect(!std.mem.eql(u8, &prior, &nonce));
+                    }
+                    if (seen_nonce_count < seen_nonces.len) {
+                        seen_nonces[seen_nonce_count] = nonce;
+                        seen_nonce_count += 1;
+                    }
+                } else |err| {
+                    try testing.expect(err == error.NonceLeaseExhausted or err == error.NoActiveEncryptionKey or err == error.AmbiguousActiveEncryptionKey);
                     try expectKeyringStateEqual(before, &keyring);
-                    continue;
-                };
-                try testing.expect(keyring.current.?.generation > last_generation);
-                last_generation = keyring.current.?.generation;
+                }
             },
         }
 
         try testing.expect(keyring.ledger.items.len >= last_ledger_len);
         last_ledger_len = keyring.ledger.items.len;
         if (held) |snap| {
-            try testing.expectEqual(held_generation, snap.generation);
+            if (keyring.current != snap) held_outlived_current = true;
             try testing.expectEqual(@as(usize, 0), held_deinit_count.load(.monotonic));
+            // Every field of the held key record is frozen -- it belongs to
+            // a published, immutable `Snapshot` that is never mutated in
+            // place -- *except* its nonce lease's `next_counter`, which is
+            // a live atomic that legitimately keeps advancing via `seal`
+            // for as long as this snapshot is still `keyring.current`
+            // (`seal` always reserves against `acquireCurrent()`, not
+            // `held`); it stops moving on its own once a replacing install
+            // takes `keyring.current` elsewhere, since no later `seal` can
+            // reach it, but there is no single "value at the moment of
+            // transition" to freeze to here -- the fixture was captured once
+            // at acquire time, so the only invariant that holds for every
+            // observation in between is monotonic non-decrease against that
+            // original value (never a reset/decrease), not exact equality.
+            const key = &snap.keys[0];
+            try testing.expectEqualSlices(u8, &held_fixture.id, &key.id);
+            try testing.expectEqual(held_fixture.aead, key.aead);
+            try testing.expectEqual(held_fixture.not_before_unix_ms, key.not_before_unix_ms);
+            try testing.expectEqual(held_fixture.encrypt_until_unix_ms, key.encrypt_until_unix_ms);
+            try testing.expectEqual(held_fixture.decrypt_until_unix_ms, key.decrypt_until_unix_ms);
+            try testing.expectEqual(held_fixture.lease.has_lease, key.nonce_lease != null);
+            if (key.nonce_lease) |*lease| {
+                try testing.expectEqualSlices(u8, &held_fixture.lease.prefix, &lease.prefix);
+                try testing.expectEqual(held_fixture.lease.end_exclusive, lease.currentEnd());
+                try testing.expect(lease.next_counter.load(.acquire) >= held_fixture.lease.next_counter);
+            }
         }
     }
 }
 
-test "fuzz: TLS resumption: ticket keyring install/validate/acquire/retain/release sequence preserves generation, ledger, and reference invariants" {
+test "fuzz: TLS resumption: ticket keyring install/validate/acquire/retain/release/seal sequence preserves generation, ledger, nonce, and reference invariants" {
     try testing.fuzz({}, fuzzKeyringOperationSequenceInput, .{ .corpus = &.{
         "",
         &([_]u8{0} ** 8),
         &([_]u8{0xff} ** 8),
-        &[_]u8{ 0, 2, 3, 0, 2, 0, 3, 1 },
+        &[_]u8{ 0, 2, 3, 5, 0, 4, 5, 4 },
+        &[_]u8{ 0, 0, 0, 5, 5, 5, 5 },
     } });
 }
 

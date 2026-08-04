@@ -386,7 +386,7 @@ zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-
 zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: parseEnvelope is allocation-free" --fuzz=10M --summary all --error-style verbose
 zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: parseEnvelope single-field mutation" --fuzz=10M --summary all --error-style verbose
 zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: Protector.resolve authenticates" --fuzz=10M --summary all --error-style verbose
-zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: ticket keyring install/validate/acquire/retain/release sequence" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: ticket keyring install/validate/acquire/retain/release/seal sequence" --fuzz=10M --summary all --error-style verbose
 
 # Named deterministic regressions (not fuzz-tagged, so outside the
 # default "fuzz: TLS resumption:" namespace — filter on their own name):
@@ -404,14 +404,22 @@ or the unrelated pre-existing `sni_provider.zig`/`ticket_key_snapshot.zig`/
 `NewSessionTicket` wire/owned-state construction, the session client/server
 codec, PSK modes/`OfferedPsks`/binder primitives, and allocation-free
 ticket-envelope parsing (`parseEnvelope`). #494-B adds authenticated
-`Protector.resolve` (accept, every typed rejection reason, and a bounded
-allocation-failure sweep, all under `ZeroCheckingAllocator` to prove the
-temporary plaintext is wiped before free on every path) and an in-memory
-`Snapshot`/`ReloadableKeyRing` publication target: a bounded *sequence* of
-build/install/dry-run-validate/acquire/retain/release operations (rather
-than the single-call property fuzzing `fuzzSnapshotConfig` already covered)
-asserting generation monotonicity, ledger growth, and that a retained old
-snapshot stays intact for as long as it is held across replacement. The
+`Protector.resolve` -- accept, every typed rejection reason (including the
+ones that require successfully authenticating first: `invalid_plaintext`,
+`not_yet_valid`, `expired`), and a full allocation-failure sweep over every
+reachable allocation point, all under `ZeroCheckingAllocator` to prove the
+temporary plaintext is wiped before free on every path -- exercised across
+all three required AEADs, each fuzz case constructing its own fresh
+`pure_zig.DeterministicEntropy`-backed provider rather than sharing static
+state. It also adds an in-memory `Snapshot`/`ReloadableKeyRing` publication
+target: a bounded *sequence* of build/install/dry-run-validate/acquire/
+explicit-retain/release/`seal` operations (rather than the single-call
+property fuzzing `fuzzSnapshotConfig` already covered) asserting generation
+monotonicity, ledger growth, nonce uniqueness/exhaustion, that a retained
+old snapshot's key/lease state stays byte-identical and unfreed for as long
+as it is held across replacement, that it wipes exactly once when the last
+reference is released, and that injected allocation failure during
+build/install leaves publication state unchanged. The
 existing `ticket_key_snapshot.zig` persistent-JSON-snapshot fuzz target is
 unrelated (on-disk snapshot file parsing, not the in-memory keyring) and is
 preserved as-is, per the issue's "existing coverage to preserve, not
