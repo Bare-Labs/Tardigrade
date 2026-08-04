@@ -1587,6 +1587,28 @@ pub fn fuzzPskBinderAndAge(smith: *std.testing.Smith) !void {
         try std.testing.expect(!wrong_length_matches);
     }
 
+    // #494-A also requires one-bit *identity* mutations not to verify.
+    // `deriveBinder`/`verifyBinder` compute the transcript hash over a
+    // full truncated-ClientHello-shaped prefix themselves (matching real
+    // usage), rather than taking a precomputed digest the way
+    // `*FromTranscriptHash` above does; flipping a bit inside a distinct
+    // identity sub-region of that prefix proves the identity bytes are
+    // actually included in the transcript at the correct boundary --
+    // otherwise indistinguishable from the binder/PSK/digest mutations
+    // already covered above.
+    var prefix: [128]u8 = undefined;
+    smith.bytes(&prefix);
+    const identity_len = 1 + smith.index(prefix.len - 1);
+    const identity_offset = smith.index(prefix.len - identity_len + 1);
+    const identity = prefix[identity_offset .. identity_offset + identity_len];
+
+    var identity_binder: [provider.max_digest_len]u8 = undefined;
+    try deriveBinder(hash, psk_buf[0..digest_len], &prefix, identity_binder[0..digest_len]);
+    try std.testing.expect(try verifyBinder(hash, psk_buf[0..digest_len], &prefix, identity_binder[0..digest_len]));
+
+    identity[smith.index(identity.len)] ^= @as(u8, 1) << @intCast(smith.index(8));
+    try std.testing.expect(!try verifyBinder(hash, psk_buf[0..digest_len], &prefix, identity_binder[0..digest_len]));
+
     var age_bytes: [8]u8 = undefined;
     smith.bytes(&age_bytes);
     const age_ms = std.mem.readInt(u64, &age_bytes, .big);

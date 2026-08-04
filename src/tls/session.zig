@@ -3584,7 +3584,7 @@ test "a failed CompatSnapshot.init replacement leaves the live destination compl
 /// them, to prove `decode` rejects an invalid caller `Limits` with
 /// `error.InvalidLimits`.
 fn fuzzSessionLimits(control: u8) Limits {
-    return switch (control % 19) {
+    return switch (control % 27) {
         0 => .default,
         1 => .{ .max_fields = 0 }, // invalid: zero
         2 => .{ .max_fields = 1 }, // exact minimum
@@ -3601,8 +3601,18 @@ fn fuzzSessionLimits(control: u8) Limits {
         13 => .{ .max_serialized_len = hard_max_serialized_len - 1 }, // one-under maximum
         14 => .{ .max_serialized_len = hard_max_serialized_len }, // exact maximum
         15 => .{ .max_serialized_len = hard_max_serialized_len + 1 }, // invalid: one-over maximum
-        16 => .{ .max_transport_compat_len = hard_max_compat_len + 1 }, // invalid: one-over maximum
-        17 => .{ .max_application_compat_len = hard_max_compat_len + 1 }, // invalid: one-over maximum
+        // Zero is *valid* for both compat-length fields (it means "no
+        // compat snapshot accepted"), so it must reach `decode` as a
+        // meaningful tight limit, not only exercise invalid-limit
+        // rejection.
+        16 => .{ .max_transport_compat_len = 0 }, // valid: zero
+        17 => .{ .max_transport_compat_len = hard_max_compat_len - 1 }, // one-under maximum
+        18 => .{ .max_transport_compat_len = hard_max_compat_len }, // exact maximum
+        19 => .{ .max_transport_compat_len = hard_max_compat_len + 1 }, // invalid: one-over maximum
+        20 => .{ .max_application_compat_len = 0 }, // valid: zero
+        21 => .{ .max_application_compat_len = hard_max_compat_len - 1 }, // one-under maximum
+        22 => .{ .max_application_compat_len = hard_max_compat_len }, // exact maximum
+        23 => .{ .max_application_compat_len = hard_max_compat_len + 1 }, // invalid: one-over maximum
         else => .{
             .max_fields = 1 + @as(usize, control) % (hard_max_fields + 2),
             .max_ticket_len = 1 + (@as(usize, control) * 37) % (absolute_ticket_wire_max + 2),
@@ -3703,9 +3713,15 @@ fn earlyDataCapableFromRaw(raw: u32) u32 {
     return (raw % std.math.maxInt(u32)) + 1;
 }
 
-test "fuzz: TLS resumption: earlyDataCapableFromRaw never overflows at the u32 boundary" {
-    // Regression for a fix to fuzzSessionCommon's early-data generation:
-    // `1 + raw` previously trapped when `raw == 0xffffffff`.
+test "earlyDataCapableFromRaw never overflows at the u32 boundary" {
+    // Named deterministic regression, not a fuzz target (no
+    // `std.testing.fuzz` call, no corpus): kept outside the
+    // "fuzz: TLS resumption:" namespace per #376's target/regression
+    // convention, and selected by its own name --
+    // `-Dtls-resumption-test-filter="earlyDataCapableFromRaw never
+    // overflows at the u32 boundary"`. Regression for a fix to
+    // fuzzSessionCommon's early-data generation: `1 + raw` previously
+    // trapped when `raw == 0xffffffff`.
     try testing.expectEqual(@as(u32, 1), earlyDataCapableFromRaw(std.math.maxInt(u32)));
     try testing.expectEqual(@as(u32, std.math.maxInt(u32)), earlyDataCapableFromRaw(std.math.maxInt(u32) - 1));
     try testing.expectEqual(@as(u32, 1), earlyDataCapableFromRaw(0));

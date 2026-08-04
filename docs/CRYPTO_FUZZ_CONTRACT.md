@@ -389,6 +389,7 @@ zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-
 # Named deterministic regressions (not fuzz-tagged, so outside the
 # default "fuzz: TLS resumption:" namespace — filter on their own name):
 zig build test-tls-resumption-fuzz -Dtls-resumption-test-filter="parseEnvelope rejects every truncated prefix of a valid envelope below the minimum length" --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Dtls-resumption-test-filter="earlyDataCapableFromRaw never overflows at the u32 boundary" --summary all --error-style verbose
 ```
 
 `-Dtls-resumption-test-filter` defaults to `"fuzz: TLS resumption:"` (every
