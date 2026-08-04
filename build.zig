@@ -560,6 +560,39 @@ pub fn build(b: *std.Build) void {
     crypto_step.dependOn(&run_crypto_provider_fuzz_tests.step);
     test_step.dependOn(&run_crypto_provider_fuzz_tests.step);
 
+    // CryptoProvider/record/ticket-protection benchmark suite (#378, epic
+    // #327-I): reports latency, throughput, and allocation measurements for
+    // the shared crypto seam as JSON. `test-crypto-bench` runs every
+    // workload at a tiny iteration count purely as a correctness smoke check
+    // (crash/API-drift detection, not a timing signal), so it is safe to
+    // include in the default `zig build test`; `bench-crypto` runs the same
+    // suites at full iteration counts and prints the report.
+    const crypto_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/crypto_bench/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    crypto_bench_mod.addImport("build_options", build_options.createModule());
+    crypto_bench_mod.addImport("zig_compat", compat_mod);
+    crypto_bench_mod.addImport("crypto", crypto_mod);
+    crypto_bench_mod.addImport("tls_core", tls_core_mod);
+
+    const crypto_bench_tests = b.addTest(.{ .root_module = crypto_bench_mod });
+    const run_crypto_bench_tests = b.addRunArtifact(crypto_bench_tests);
+    const crypto_bench_test_step = b.step("test-crypto-bench", "Run the CryptoProvider/record/ticket-protection benchmark suite as a correctness smoke check (#378)");
+    crypto_bench_test_step.dependOn(&run_crypto_bench_tests.step);
+    crypto_step.dependOn(&run_crypto_bench_tests.step);
+    test_step.dependOn(&run_crypto_bench_tests.step);
+
+    const crypto_bench_exe = b.addExecutable(.{
+        .name = "crypto_bench",
+        .root_module = crypto_bench_mod,
+    });
+    const run_crypto_bench = b.addRunArtifact(crypto_bench_exe);
+    const crypto_bench_step = b.step("bench-crypto", "Report CryptoProvider/record/ticket-protection benchmark measurements as JSON (#378)");
+    crypto_bench_step.dependOn(&run_crypto_bench.step);
+
     // A direct TLS-owned backend handshake through the record stack. This is a
     // standalone module because it uses socket-pair carriers and the concrete
     // pure-Zig crypto provider in addition to the reusable tls_core module.
