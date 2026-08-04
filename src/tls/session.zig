@@ -3195,6 +3195,15 @@ pub fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16
             std.mem.writeInt(u16, out[pos + 2 ..][0..2], new_length, .big);
             const copy_len = @min(new_length, tlv.value.len);
             @memcpy(out[pos + 4 ..][0..copy_len], tlv.value[0..copy_len]);
+            // `out` is caller-provided and may be `undefined`-backed
+            // scratch space (as every #494-B fuzz caller uses): a
+            // one-over `new_length` leaves `copy_len` short of the
+            // declared length, so the excess must be zero-filled here
+            // rather than left as whatever was already in `out`, or a
+            // "one-over" mutation would authenticate and encrypt
+            // uninitialized bytes into the ciphertext, breaking
+            // deterministic reproduction.
+            @memset(out[pos + 4 + copy_len ..][0 .. new_length - copy_len], 0);
             pos += 4 + @as(usize, new_length);
         } else {
             writeTlv(out, &pos, tlv.field_id, tlv.value);

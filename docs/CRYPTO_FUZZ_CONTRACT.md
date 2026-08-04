@@ -411,32 +411,50 @@ free on every path -- exercised across all three required AEADs, each fuzz
 case constructing its own fresh `pure_zig.DeterministicEntropy`-backed
 provider rather than sharing static state. The rejection matrix includes
 several classes that require successfully authenticating first:
-`not_yet_valid`/`expired` (forged timestamps), and `invalid_plaintext` via
-an authenticated-but-malformed `TRS1` record covering both the shared
-header (magic/version/record-type/section-length) and field-level TLV
-boundaries (duplicate field, missing mandatory field, exact-width field
-length above/below its true size) -- the latter reusing
+`not_yet_valid`/`expired` (forged timestamps); an authenticated state
+extended with an unknown *optional* field, which must still accept and
+round-trip (proving forward compatibility, not just rejection); and
+`invalid_plaintext` via an authenticated-but-malformed `TRS1` record
+covering the shared header (magic/version/record-type/section-length),
+field-level TLV boundaries (duplicate field, missing mandatory field,
+exact-width field length one-under/zero/one-over, an unknown *critical*
+field, PSK length across zero/one/one-over/the largest supported digest
+length, and a field whose declared length vastly exceeds the bytes the
+section actually has left -- a declaration-only truncation, not a 64 KiB
+allocation). The known-field mutations reuse
 `session.fixtureWithFieldRemoved`/`fixtureWithFieldDuplicated`/
 `withTlvLengthOverride`/`originalTlvLen`, promoted `pub` from session.zig's
-own codec fuzz/test suite rather than re-derived here. `protector.limits`
-is varied around both the envelope-length boundary (`max_ticket_len`) and
-the decoded-state boundary (`max_serialized_len`). It also adds an
+own codec fuzz/test suite rather than re-derived here (that promotion also
+fixed `withTlvLengthOverride` to zero-fill a one-over declared length's
+excess bytes instead of leaving them as whatever was in the caller's
+scratch buffer, so every caller's mutation is deterministic by
+construction). `protector.limits` is varied around both the envelope-length
+boundary (`max_ticket_len`) and the decoded-state boundary
+(`max_serialized_len`). It also adds an
 in-memory `Snapshot`/`ReloadableKeyRing` publication target: a bounded
 *sequence* of build/install/dry-run-validate/acquire/explicit-retain/
 release/`seal` operations (rather than the single-call property fuzzing
-`fuzzSnapshotConfig` already covered) asserting generation monotonicity,
-ledger growth, nonce uniqueness and deterministic exhaustion (including
-right at the `maxInt(u64)` boundary via an occasional near-wrap lease
-window), that a failed seal still consumes its reserved nonce (via a
-per-case fault-injecting provider that always fails `aeadSeal` after
-`NonceLease.reserve()` has already committed), that a retained old
-snapshot's key material and lease state stay exactly frozen once it stops
-being `keyring.current` (compared via the same constant-time key
-fingerprint the keyring's own ledger uses) for as long as it is held, that
-every modeled reference -- acquired or explicitly retained, including any
-left outstanding when a bounded program ends -- wipes the snapshot exactly
-once when the last one is released, and that injected allocation failure
-during build/install leaves publication state unchanged. The existing
+`fuzzSnapshotConfig` already covered), driving its own fresh per-case
+`pure_zig.DeterministicEntropy`-backed provider (not the shared static
+`testProvider()` every ordinary deterministic test in this file uses) for
+both the normal seal path and the fault-injecting wrapper below, and
+asserting generation monotonicity, ledger growth, nonce uniqueness and
+deterministic exhaustion (including right at the `maxInt(u64)` boundary via
+an occasional near-wrap lease window), that a failed seal still consumes
+its reserved nonce (via a per-case `FaultingSealProvider` that always fails
+`aeadSeal` after `NonceLease.reserve()` has already committed), that a
+retained old snapshot's key material and lease state stay exactly frozen
+once it stops being `keyring.current` (compared via the same constant-time
+key fingerprint the keyring's own ledger uses) for as long as it is held,
+and that injected allocation failure during build/install leaves
+publication state unchanged. Every modeled reference -- acquired or
+explicitly retained -- wipes the snapshot exactly once when the last one is
+released, and this holds even for a bounded program that ends mid-sequence
+with references still outstanding: end-of-case cleanup drains them, tears
+the keyring down, and only then asserts the snapshot deinitialized exactly
+once and wipes the stored fingerprint, with the zeroization probe kept
+installed through both steps (not disabled first) so it can observe
+whichever one performs the true final release. The existing
 `ticket_key_snapshot.zig` persistent-JSON-snapshot fuzz target is unrelated
 (on-disk snapshot file parsing, not the in-memory keyring) and is preserved
 as-is, per the issue's "existing coverage to preserve, not recreate" list.

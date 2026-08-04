@@ -3447,6 +3447,40 @@ fn buildTimedServerState(allocator: std.mem.Allocator, issued_at_unix_ms: i64, l
     return state;
 }
 
+/// Appends one real TLV (`field_id`/`value`) to `fixture` and patches the
+/// section length to match, for authenticating a state extended with an
+/// unknown field. `out` must have at least `fixture.len + 4 + value.len`
+/// bytes of room.
+fn appendTlv(fixture: []const u8, field_id: u16, value: []const u8, out: []u8) usize {
+    @memcpy(out[0..fixture.len], fixture);
+    var pos: usize = fixture.len;
+    std.mem.writeInt(u16, out[pos..][0..2], field_id, .big);
+    std.mem.writeInt(u16, out[pos + 2 ..][0..2], @intCast(value.len), .big);
+    @memcpy(out[pos + 4 ..][0..value.len], value);
+    pos += 4 + value.len;
+    std.mem.writeInt(u32, out[6..10], @intCast(pos - session.header_len), .big);
+    return pos;
+}
+
+/// Appends only a TLV *header* (`field_id` plus a `declared_length` that is
+/// never backed by that many real bytes) to `fixture` and patches the
+/// section length to the true, short byte count -- a "declaration-only"
+/// truncation that proves `session.decode`'s per-field length check
+/// rejects a field claiming far more bytes than the section actually has
+/// left, without needing an output buffer sized to `declared_length`
+/// itself (unlike `session.withTlvLengthOverride`, which always backs the
+/// declared length with real bytes). `out` must have at least
+/// `fixture.len + 4` bytes of room.
+fn appendTruncatedTlvHeader(fixture: []const u8, field_id: u16, declared_length: u16, out: []u8) usize {
+    @memcpy(out[0..fixture.len], fixture);
+    var pos: usize = fixture.len;
+    std.mem.writeInt(u16, out[pos..][0..2], field_id, .big);
+    std.mem.writeInt(u16, out[pos + 2 ..][0..2], declared_length, .big);
+    pos += 4;
+    std.mem.writeInt(u32, out[6..10], @intCast(pos - session.header_len), .big);
+    return pos;
+}
+
 /// #494-B: authenticated `Protector.resolve` under key-state, envelope, and
 /// authenticated-plaintext mutation. Complements `fuzzTicketIdentity` above
 /// (which only proves miss paths never panic or mutate output against
@@ -3559,7 +3593,7 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
     protector.observer = observer.observer();
 
     var zero_alloc = ZeroCheckingAllocator.init(allocator);
-    switch (smith.index(9)) {
+    switch (smith.index(10)) {
         0 => {
             try expectRoundTrip(&protector, zero_alloc.allocator(), &state, valid_envelope, resolve_now_unix_ms);
             try observer.expectOnly(.resolve_succeeded);
@@ -3631,7 +3665,7 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
 
             var mutated_buf: [2048 + 256]u8 = undefined;
             var mutated: []u8 = undefined;
-            switch (smith.index(7)) {
+            switch (smith.index(9)) {
                 0 => {
                     mutated = mutated_buf[0..plaintext.len];
                     @memcpy(mutated, plaintext);
@@ -3662,11 +3696,34 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
                     const field_id = duplicate_or_missing_ids[smith.index(duplicate_or_missing_ids.len)];
                     mutated = mutated_buf[0..session.fixtureWithFieldRemoved(plaintext, field_id, &mutated_buf)];
                 },
-                else => { // suite/PSK/lifetime/etc. exact-width field: 0 or one-over its true length
+                6 => { // suite/lifetime/etc. exact-width field: one-under, zero, or one-over its true length
                     const field_id = exact_width_ids[smith.index(exact_width_ids.len)];
                     const original_len = session.originalTlvLen(plaintext, field_id).?;
-                    const new_length: u16 = if (smith.index(2) == 0) 0 else original_len + 1;
+                    const new_length: u16 = switch (smith.index(3)) {
+                        0 => original_len - 1,
+                        1 => 0,
+                        else => original_len + 1,
+                    };
                     mutated = mutated_buf[0..session.withTlvLengthOverride(plaintext, field_id, new_length, &mutated_buf)];
+                },
+                7 => { // unknown *critical* field (high bit clear) -- always `error.UnknownCriticalField`
+                    mutated = mutated_buf[0..appendTlv(plaintext, 0x00ff, "unrecognized-critical-data", &mutated_buf)];
+                },
+                8 => { // PSK length boundary: zero, one, one-over, or the largest supported digest length
+                    const original_len = session.originalTlvLen(plaintext, session.field_resumption_psk).?;
+                    const new_length: u16 = switch (smith.index(4)) {
+                        0 => 0,
+                        1 => 1,
+                        2 => original_len + 1,
+                        else => provider.max_digest_len,
+                    };
+                    mutated = mutated_buf[0..session.withTlvLengthOverride(plaintext, session.field_resumption_psk, new_length, &mutated_buf)];
+                },
+                else => { // declared length far exceeds the bytes actually provided -- a truncation, not a 64 KiB allocation
+                    const field_id = duplicate_or_missing_ids[smith.index(duplicate_or_missing_ids.len)];
+                    var without_field_buf: [2048 + 256]u8 = undefined;
+                    const without_field_len = session.fixtureWithFieldRemoved(plaintext, field_id, &without_field_buf);
+                    mutated = mutated_buf[0..appendTruncatedTlvHeader(without_field_buf[0..without_field_len], field_id, 0xffff, &mutated_buf)];
                 },
             }
 
@@ -3677,6 +3734,25 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
             try observer.expectOnly(.{ .resolve_rejected = .invalid_plaintext });
         },
         7 => {
+            // An unknown *optional* field (high bit 0x8000 set) must be
+            // silently skipped by `session.decode`, not rejected -- the
+            // resolver should still accept and round-trip to the same
+            // state, proving the accept path is forward-compatible with a
+            // future optional extension the same way session.zig's own
+            // deterministic "unknown optional fields are skipped, unknown
+            // critical fields are rejected" test already proves for the
+            // raw codec (same field id, `0x9abc`, reused here).
+            var plaintext_buf: [2048]u8 = undefined;
+            const plaintext = try session.encodeServer(&state, session.Limits.default, &plaintext_buf);
+            var extended_buf: [2048 + 64]u8 = undefined;
+            const extended = extended_buf[0..appendTlv(plaintext, 0x9abc, "future-extension-data", &extended_buf)];
+            var envelope_buf: [2048 + 64]u8 = undefined;
+            const nonce = [_]u8{0x91} ** provider.aead_nonce_len;
+            const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, extended);
+            try expectRoundTrip(&protector, zero_alloc.allocator(), &state, envelope, resolve_now_unix_ms);
+            try observer.expectOnly(.resolve_succeeded);
+        },
+        8 => {
             // `issued_at_unix_ms` strictly after `resolve_now_unix_ms`.
             var timed_state = try buildTimedServerState(allocator, resolve_now_unix_ms + 5_000, 10);
             defer timed_state.deinit();
@@ -3902,7 +3978,6 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     // keyring's.
     var failing_keyring_alloc = testing.FailingAllocator.init(allocator, .{ .fail_index = smith.index(24) });
     var keyring = ReloadableKeyRing.init(failing_keyring_alloc.allocator());
-    defer keyring.deinit();
 
     // A passive zeroization safety net for the whole sequence:
     // `KeyDeinitProbe.record` (already used by `expectPartialBuildWipesCopiedKey`
@@ -3912,7 +3987,6 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     // injected allocation failure.
     var key_probe = KeyDeinitProbe{};
     TestKeyDeinitProbeStorage.probe = &key_probe;
-    defer TestKeyDeinitProbeStorage.probe = null;
 
     var held: ?*Snapshot = null;
     var held_refs: usize = 0;
@@ -3920,20 +3994,42 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     var held_fixture: KeyState = undefined;
     var held_key_fingerprint: KeyFingerprint = undefined;
     var held_outlived_current = false;
-    // A bounded program can terminate with more than one modeled owner
+    // A bounded program can terminate mid-sequence with modeled owners
     // still outstanding (e.g. install -> acquire -> retain -> end, leaving
-    // `held_refs == 2`): drain every one of them here, not just a single
-    // reference, so the "every reference is released exactly once"
-    // invariant holds even for an unfinished opcode stream. This runs
-    // before the `TestKeyDeinitProbeStorage.probe = null` defer above
-    // (Zig defers unwind LIFO), so the zeroization probe is still active
-    // to observe these final releases too.
-    defer if (held) |snap| {
-        while (held_refs != 0) {
-            held_refs -= 1;
-            snap.release();
+    // `held_refs == 2`) or with the held snapshot still `keyring.current`
+    // (never replaced), so this end-of-case cleanup has to prove the final
+    // wipe, not just avoid a leak:
+    //
+    // 1. Drain every modeled reference (`held_refs` down to 0).
+    // 2. *Then* tear the keyring down, releasing its own reference if the
+    //    held snapshot is still `keyring.current` -- whichever of these two
+    //    steps holds the true last reference performs the actual free.
+    // 3. Only once both have run, assert the snapshot deinitialized
+    //    exactly once (never zero -- a leak -- and never more than one --
+    //    a double free) and unconditionally wipe the stored fingerprint,
+    //    matching `secureZero`'s use everywhere else in this file rather
+    //    than relying on opcode 4 happening to run again.
+    // 4. Disable the zeroization probe last, so it stays installed through
+    //    both step 1 and step 2 -- with the original per-defer ordering
+    //    (probe disabled before `keyring.deinit()`) the probe missed
+    //    exactly the case where the held snapshot was still current at
+    //    teardown, since that path's true final release happens inside
+    //    `keyring.deinit()`.
+    defer {
+        const was_held = held != null;
+        if (held) |snap| {
+            while (held_refs != 0) {
+                held_refs -= 1;
+                snap.release();
+            }
         }
-    };
+        keyring.deinit();
+        if (was_held) {
+            std.debug.assert(held_deinit_count.load(.monotonic) == 1);
+            secrets.secureZero(&held_key_fingerprint);
+        }
+        TestKeyDeinitProbeStorage.probe = null;
+    }
 
     var last_generation: u64 = 0;
     var last_ledger_len: usize = 0;
@@ -3945,6 +4041,17 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     var seen_nonces: [16][provider.aead_nonce_len]u8 = undefined;
     var seen_nonce_count: usize = 0;
     const seal_now_unix_ms: i64 = 500;
+
+    // A fresh per-case provider, per #376/#494's case-isolation contract:
+    // the shared static `testProvider()` is process-global state shared
+    // across every ordinary deterministic test in this file, and this
+    // target must not fold its result into that stream (even though these
+    // particular AEAD calls never draw entropy today, a future provider
+    // change should not be able to silently make this fuzz result order-
+    // dependent on whatever else happened to run first).
+    var seal_entropy = crypto.pure_zig.DeterministicEntropy.init(0x4b657972696e67);
+    var seal_provider_state = crypto.pure_zig.Provider.init(seal_entropy.entropy());
+    const seal_provider = seal_provider_state.cryptoProvider();
 
     const op_count = 1 + smith.index(8);
     for (0..op_count) |_| {
@@ -4063,7 +4170,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                     // (`seal` never writes to the ledger on any path). A
                     // fresh per-case fault-injecting provider, not the
                     // shared static `testProvider()`, drives this.
-                    var faulting = FaultingSealProvider{ .inner = testProvider() };
+                    var faulting = FaultingSealProvider{ .inner = seal_provider };
                     var faulting_protector = Protector{ .provider = faulting.cryptoProvider(), .keyring = &keyring, .limits = session.Limits.default };
                     var ticket_buf: [512]u8 = undefined;
                     try testing.expectError(error.InvalidInternalState, faulting_protector.seal(allocator, &state, seal_now_unix_ms, &ticket_buf));
@@ -4075,7 +4182,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                 }
 
                 var ticket_buf: [512]u8 = undefined;
-                var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
+                var protector = Protector{ .provider = seal_provider, .keyring = &keyring, .limits = session.Limits.default };
                 if (protector.seal(allocator, &state, seal_now_unix_ms, &ticket_buf)) |sealed| {
                     var nonce: [provider.aead_nonce_len]u8 = undefined;
                     @memcpy(&nonce, sealed[24..36]);
