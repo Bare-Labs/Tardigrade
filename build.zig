@@ -10,6 +10,20 @@ const std = @import("std");
 /// `tardi version`. See docs/TLS_DEPENDENCY_POLICY.md.
 const TlsProfile = enum { general, appliance };
 
+/// Resolves the source revision embedded in benchmark/diagnostic metadata
+/// (e.g. `crypto_bench`'s `_meta.tardigrade_commit`, #378's benchmark
+/// contract). Runs `git rev-parse HEAD` at configure time and falls back to
+/// `"unknown"` rather than failing the build when there is no `.git`
+/// directory to inspect (a source archive, a shallow export, etc.) or `git`
+/// itself is unavailable.
+fn gitCommitSha(b: *std.Build) []const u8 {
+    var code: u8 = undefined;
+    const output = b.runAllowFail(&.{ "git", "rev-parse", "HEAD" }, &code, .ignore) catch return "unknown";
+    const trimmed = std.mem.trim(u8, output, " \t\r\n");
+    if (trimmed.len == 0) return "unknown";
+    return trimmed;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -17,6 +31,7 @@ pub fn build(b: *std.Build) void {
     const require_static_system_libs = b.option(bool, "require-static-system-libs", "Require static linking for system libraries") orelse false;
     const static_executable = b.option(bool, "static-executable", "Build the tardi executable as a static binary") orelse false;
     const app_version = b.option([]const u8, "version", "Version string embedded in the tardi binary") orelse "dev";
+    const commit_sha = b.option([]const u8, "commit", "Source commit SHA embedded in benchmark/diagnostic metadata (default: `git rev-parse HEAD`, or \"unknown\")") orelse gitCommitSha(b);
     const go_bin = b.option([]const u8, "go-bin", "Go command used to build the PKI crypto/x509 oracle") orelse "go";
     const quic_test_filter = b.option([]const u8, "quic-test-filter", "Filter tests run by the test-quic step");
     const quic_test_filters: []const []const u8 = if (quic_test_filter) |filter| &.{filter} else &.{};
@@ -31,6 +46,7 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", app_version);
+    build_options.addOption([]const u8, "commit", commit_sha);
     build_options.addOption([]const u8, "tls_profile", @tagName(tls_profile));
     build_options.addOption(bool, "tls_openssl_adapter", link_openssl_adapter);
     const compat_mod = b.createModule(.{
@@ -559,6 +575,39 @@ pub fn build(b: *std.Build) void {
     crypto_provider_fuzz_step.dependOn(&run_crypto_provider_fuzz_tests.step);
     crypto_step.dependOn(&run_crypto_provider_fuzz_tests.step);
     test_step.dependOn(&run_crypto_provider_fuzz_tests.step);
+
+    // CryptoProvider/record/ticket-protection benchmark suite (#378, epic
+    // #327-I): reports latency, throughput, and allocation measurements for
+    // the shared crypto seam as JSON. `test-crypto-bench` runs every
+    // workload at a tiny iteration count purely as a correctness smoke check
+    // (crash/API-drift detection, not a timing signal), so it is safe to
+    // include in the default `zig build test`; `bench-crypto` runs the same
+    // suites at full iteration counts and prints the report.
+    const crypto_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/crypto_bench/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    crypto_bench_mod.addImport("build_options", build_options.createModule());
+    crypto_bench_mod.addImport("zig_compat", compat_mod);
+    crypto_bench_mod.addImport("crypto", crypto_mod);
+    crypto_bench_mod.addImport("tls_core", tls_core_mod);
+
+    const crypto_bench_tests = b.addTest(.{ .root_module = crypto_bench_mod });
+    const run_crypto_bench_tests = b.addRunArtifact(crypto_bench_tests);
+    const crypto_bench_test_step = b.step("test-crypto-bench", "Run the CryptoProvider/record/ticket-protection benchmark suite as a correctness smoke check (#378)");
+    crypto_bench_test_step.dependOn(&run_crypto_bench_tests.step);
+    crypto_step.dependOn(&run_crypto_bench_tests.step);
+    test_step.dependOn(&run_crypto_bench_tests.step);
+
+    const crypto_bench_exe = b.addExecutable(.{
+        .name = "crypto_bench",
+        .root_module = crypto_bench_mod,
+    });
+    const run_crypto_bench = b.addRunArtifact(crypto_bench_exe);
+    const crypto_bench_step = b.step("bench-crypto", "Report CryptoProvider/record/ticket-protection benchmark measurements as JSON (#378)");
+    crypto_bench_step.dependOn(&run_crypto_bench.step);
 
     // A direct TLS-owned backend handshake through the record stack. This is a
     // standalone module because it uses socket-pair carriers and the concrete
