@@ -949,3 +949,183 @@ fn appendExtension(list: *std.ArrayList(u8), ext_type: u16, payload: []const u8)
     try list.appendSlice(allocator, &encoded);
     try list.appendSlice(allocator, payload);
 }
+
+// -----------------------------------------------------------------------
+// Fuzz target (#494): NewSessionTicket wire codec and owned-state
+// construction.
+//
+// This complements the deterministic truncation/extension/limit coverage
+// above (not duplicated here) with continuous mutation of the raw wire
+// body plus control-derived owned-state construction through the real
+// `buildClientTicketState`/`buildServerRecoverableStateNoIdentity` APIs.
+// `std.testing.checkAllAllocationFailures` in
+// "ticket owned state builders and clone are allocation-failure clean"
+// above already sweeps `FailingAllocator` over a fixed representative
+// shape; this target drives fuzzer-chosen shapes through the same APIs at
+// `std.testing.allocator` rather than re-adding a second sweep.
+// -----------------------------------------------------------------------
+
+const fuzz_cipher_suites = [_]algorithms.CipherSuite{
+    .tls_aes_128_gcm_sha256,
+    .tls_aes_256_gcm_sha384,
+    .tls_chacha20_poly1305_sha256,
+};
+
+/// True when `inner` is empty or is wholly contained within `outer`'s
+/// backing bytes (pointer-range containment, not content equality) — the
+/// #494 borrowed-slice-safety property for `decode`'s `ticket_nonce`/
+/// `ticket` fields.
+fn withinBounds(outer: []const u8, inner: []const u8) bool {
+    if (inner.len == 0) return true;
+    const outer_start = @intFromPtr(outer.ptr);
+    const outer_end = outer_start + outer.len;
+    const inner_start = @intFromPtr(inner.ptr);
+    const inner_end = inner_start + inner.len;
+    return inner_start >= outer_start and inner_end <= outer_end and inner_end >= inner_start;
+}
+
+fn fuzzLimits(control: u8) session.Limits {
+    return switch (control % 4) {
+        0 => .default,
+        1 => .{ .max_ticket_len = 1 },
+        2 => .{ .max_ticket_len = absolute_ticket_wire_max },
+        else => .{ .max_ticket_len = @as(usize, control) + 1 },
+    };
+}
+
+pub fn fuzzNewSessionTicket(allocator: std.mem.Allocator, smith: *std.testing.Smith) !void {
+    // 1. Raw wire decode: bounded stack buffer, no allocator, matching the
+    // real allocation-free `decode` contract.
+    var wire_buf: [4096]u8 = undefined;
+    const wire_len = smith.slice(&wire_buf);
+    const wire = wire_buf[0..wire_len];
+
+    if (decode(wire)) |parsed| {
+        try std.testing.expect(withinBounds(wire, parsed.ticket_nonce));
+        try std.testing.expect(withinBounds(wire, parsed.ticket));
+    } else |_| {}
+
+    // 2. Control-derived valid `EmitParams`, driving encode -> decode
+    // structural round trips and owned-state construction. Fields are
+    // bounded by construction (buffer sizes / modulo) rather than
+    // allowing arbitrary unbounded values, per the #376 contract.
+    const direction = smith.index(2);
+    const suite = fuzz_cipher_suites[smith.index(fuzz_cipher_suites.len)];
+
+    var nonce_buf: [max_ticket_nonce_len]u8 = undefined;
+    const nonce_len = smith.index(nonce_buf.len + 1);
+    smith.bytes(nonce_buf[0..nonce_len]);
+
+    var ticket_buf: [1024]u8 = undefined;
+    const ticket_len = 1 + smith.index(ticket_buf.len);
+    smith.bytes(ticket_buf[0..ticket_len]);
+
+    const has_early_data = smith.index(2) == 1;
+    var early_data_bytes: [4]u8 = undefined;
+    smith.bytes(&early_data_bytes);
+    const max_early_data_size: ?u32 = if (has_early_data) std.mem.readInt(u32, &early_data_bytes, .big) else null;
+
+    var lifetime_bytes: [4]u8 = undefined;
+    smith.bytes(&lifetime_bytes);
+    const ticket_lifetime = std.mem.readInt(u32, &lifetime_bytes, .big) % (max_lifetime_seconds + 1);
+
+    var age_add_bytes: [4]u8 = undefined;
+    smith.bytes(&age_add_bytes);
+    const ticket_age_add = std.mem.readInt(u32, &age_add_bytes, .big);
+
+    const params = EmitParams{
+        .ticket_lifetime = ticket_lifetime,
+        .ticket_age_add = ticket_age_add,
+        .ticket_nonce = nonce_buf[0..nonce_len],
+        .ticket = ticket_buf[0..ticket_len],
+        .max_early_data_size = max_early_data_size,
+    };
+
+    var encode_buf: [2048]u8 = undefined;
+    const encode_cap = smith.index(encode_buf.len + 1);
+    const scratch = encode_buf[0..encode_cap];
+    @memset(scratch, 0xa5);
+    var before_buf: [2048]u8 = undefined;
+    @memcpy(before_buf[0..encode_cap], scratch);
+
+    const encoded = encode(params, scratch) catch {
+        // `OutputTooSmall`/`IllegalParameter`/`LengthOverflow` must never
+        // partially write the destination buffer.
+        try std.testing.expectEqualSlices(u8, before_buf[0..encode_cap], scratch);
+        return;
+    };
+    const round = try decode(encoded);
+    try std.testing.expectEqual(params.ticket_lifetime, round.ticket_lifetime);
+    try std.testing.expectEqual(params.ticket_age_add, round.ticket_age_add);
+    try std.testing.expectEqualSlices(u8, params.ticket_nonce, round.ticket_nonce);
+    try std.testing.expectEqualSlices(u8, params.ticket, round.ticket);
+    try std.testing.expectEqual(params.max_early_data_size, round.max_early_data_size);
+
+    // 3. Owned-state construction from the round-tripped `Parsed` value,
+    // exercising both client and server construction directions.
+    var rms: [session.max_psk_len]u8 = undefined;
+    smith.bytes(&rms);
+    var limits_control: [1]u8 = undefined;
+    smith.bytes(&limits_control);
+    const limits = fuzzLimits(limits_control[0]);
+
+    const context = ConnectionResumptionContext{
+        .cipher_suite = suite,
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer("fuzz-leaf"),
+    };
+
+    var received_at_bytes: [8]u8 = undefined;
+    smith.bytes(&received_at_bytes);
+    const received_at_unix_ms: i64 = @bitCast(std.mem.readInt(u64, &received_at_bytes, .big));
+
+    if (direction == 0) {
+        var maybe_state = buildClientTicketState(
+            allocator,
+            testCryptoProvider(),
+            round,
+            context,
+            &rms,
+            received_at_unix_ms,
+            limits,
+        ) catch return;
+        if (maybe_state) |*state| {
+            defer state.deinit();
+            try std.testing.expectEqual(round.ticket.len, state.ticket.slice().len);
+        }
+    } else {
+        var state = buildServerRecoverableStateNoIdentity(
+            allocator,
+            testCryptoProvider(),
+            .{
+                .ticket_lifetime = round.ticket_lifetime,
+                .ticket_age_add = round.ticket_age_add,
+                .ticket_nonce = round.ticket_nonce,
+                .max_early_data_size = round.max_early_data_size,
+            },
+            context,
+            &rms,
+            received_at_unix_ms,
+            limits,
+        ) catch return;
+        defer state.deinit();
+    }
+}
+
+test "fuzz: NewSessionTicket wire decode and owned-state construction never panic or corrupt output" {
+    try std.testing.fuzz({}, fuzzNewSessionTicketInput, .{ .corpus = &.{
+        "",
+        &[_]u8{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 'x', 0, 0 },
+        &[_]u8{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 'x', 0, 8, 0, 42, 0, 4, 0, 0, 0, 0x20 },
+        &[_]u8{ 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 1, 'x', 0, 4, 0x12, 0x34, 0, 0 },
+        &[_]u8{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 'x', 0, 8, 0x12, 0x34, 0, 0, 0x12, 0x34, 0, 0 },
+        &[_]u8{ 0, 0, 0, 1, 0, 0, 0, 0 },
+        &([_]u8{ 0, 0, 0, 1, 0, 0, 0, 0, 255 } ++ ([_]u8{1} ** 255) ++ [_]u8{ 0, 1, 'x', 0, 0 }),
+        &[_]u8{ 0x00, 0x09, 0x3a, 0x80, 0, 0, 0, 0, 0, 0, 1, 'x', 0, 0 },
+        &[_]u8{ 0x00, 0x09, 0x3a, 0x81, 0, 0, 0, 0, 0, 0, 1, 'x', 0, 0 },
+        &([_]u8{0xff} ** 128),
+    } });
+}
+
+fn fuzzNewSessionTicketInput(_: void, smith: *std.testing.Smith) !void {
+    try fuzzNewSessionTicket(std.testing.allocator, smith);
+}

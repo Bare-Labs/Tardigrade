@@ -343,3 +343,53 @@ above as scheduled or manual local runs, the same model
 because they are unbounded by design. Coordinate future OSS-Fuzz/OpenSSF
 onboarding with #121 rather than making external service integration a
 blocker here.
+
+## Protocol-scoped fuzz steps built on this contract
+
+Per the "Commands" section above, #491–#494 do not grow this file's own
+`test-crypto-provider-fuzz` step; each adds its own protocol-scoped step
+and `-D<area>-test-filter` option instead. This section records the
+stable step/filter names as those stories land, so a reader here does not
+have to go hunting through `build.zig`.
+
+### #494 — session / PSK / ticket / resumption state (epic #326-K)
+
+Unlike this file's own targets, #494's targets are inline `test "fuzz:
+..."` blocks inside the production modules themselves
+(`src/tls/new_session_ticket.zig`, `src/tls/session.zig`,
+`src/tls/pre_shared_key.zig`, `src/tls/ticket_protection.zig`) — not a
+separate `tests/*.zig` root — so they already replay their deterministic
+seed corpus under plain `zig build test-tls` / `zig build test`. The
+`test-tls-resumption-fuzz` step exists to give them a stable,
+individually filterable/long-runnable name, the same shape as
+`-Dcrypto-test-filter` above:
+
+```bash
+# Deterministic smoke coverage for every #494 fuzz target (seed corpus
+# replay only, "fuzz: " test-name prefix) — also covered by plain
+# `zig build test-tls` / `zig build test` since tls_core's test binary
+# already includes these files.
+zig build test-tls-resumption-fuzz --summary all --error-style verbose
+
+# Longer local/scheduled coverage-guided runs, one target at a time:
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: NewSessionTicket wire decode and owned-state construction never panic or corrupt output" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: session codec raw decode never panics and owns its decoded state" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: session codec generated client/server records round-trip and reject cross-kind decode" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: PSK wire codec" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: PSK binder derivation" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: parseEnvelope is allocation-free" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: parseEnvelope single-field mutation" --fuzz=10M --summary all --error-style verbose
+```
+
+`-Dtls-resumption-test-filter` defaults to `"fuzz: "` (every #494 target,
+none of the much larger surrounding deterministic TLS suite); pass an
+exact `test "fuzz: ..."` name to scope a long `--fuzz=<N>` run to one
+target, matching the reproduction-command shape "Seed-corpus and
+regression update procedure" above requires. #494-A (this pass) covers
+`NewSessionTicket` wire/owned-state construction, the session client/
+server codec, PSK modes/`OfferedPsks`/binder primitives, and allocation-
+free ticket-envelope parsing (`parseEnvelope`); authenticated ticket open,
+key-snapshot/keyring publication, session-cache/lease state machines, and
+backend/runtime composition follow in #494-B/C/D per the issue's PR
+decomposition.
