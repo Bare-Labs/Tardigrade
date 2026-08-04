@@ -404,24 +404,41 @@ or the unrelated pre-existing `sni_provider.zig`/`ticket_key_snapshot.zig`/
 `NewSessionTicket` wire/owned-state construction, the session client/server
 codec, PSK modes/`OfferedPsks`/binder primitives, and allocation-free
 ticket-envelope parsing (`parseEnvelope`). #494-B adds authenticated
-`Protector.resolve` -- accept, every typed rejection reason (including the
-ones that require successfully authenticating first: `invalid_plaintext`,
-`not_yet_valid`, `expired`), and a full allocation-failure sweep over every
-reachable allocation point, all under `ZeroCheckingAllocator` to prove the
-temporary plaintext is wiped before free on every path -- exercised across
-all three required AEADs, each fuzz case constructing its own fresh
-`pure_zig.DeterministicEntropy`-backed provider rather than sharing static
-state. It also adds an in-memory `Snapshot`/`ReloadableKeyRing` publication
-target: a bounded *sequence* of build/install/dry-run-validate/acquire/
-explicit-retain/release/`seal` operations (rather than the single-call
-property fuzzing `fuzzSnapshotConfig` already covered) asserting generation
-monotonicity, ledger growth, nonce uniqueness/exhaustion, that a retained
-old snapshot's key/lease state stays byte-identical and unfreed for as long
-as it is held across replacement, that it wipes exactly once when the last
-reference is released, and that injected allocation failure during
-build/install leaves publication state unchanged. The
-existing `ticket_key_snapshot.zig` persistent-JSON-snapshot fuzz target is
-unrelated (on-disk snapshot file parsing, not the in-memory keyring) and is
-preserved as-is, per the issue's "existing coverage to preserve, not
-recreate" list. Session-cache/lease state machines and backend/runtime
-composition follow in #494-C/D per the issue's PR decomposition.
+`Protector.resolve` -- accept, every typed rejection reason, and a full
+allocation-failure sweep over every reachable allocation point, all under
+`ZeroCheckingAllocator` to prove the temporary plaintext is wiped before
+free on every path -- exercised across all three required AEADs, each fuzz
+case constructing its own fresh `pure_zig.DeterministicEntropy`-backed
+provider rather than sharing static state. The rejection matrix includes
+several classes that require successfully authenticating first:
+`not_yet_valid`/`expired` (forged timestamps), and `invalid_plaintext` via
+an authenticated-but-malformed `TRS1` record covering both the shared
+header (magic/version/record-type/section-length) and field-level TLV
+boundaries (duplicate field, missing mandatory field, exact-width field
+length above/below its true size) -- the latter reusing
+`session.fixtureWithFieldRemoved`/`fixtureWithFieldDuplicated`/
+`withTlvLengthOverride`/`originalTlvLen`, promoted `pub` from session.zig's
+own codec fuzz/test suite rather than re-derived here. `protector.limits`
+is varied around both the envelope-length boundary (`max_ticket_len`) and
+the decoded-state boundary (`max_serialized_len`). It also adds an
+in-memory `Snapshot`/`ReloadableKeyRing` publication target: a bounded
+*sequence* of build/install/dry-run-validate/acquire/explicit-retain/
+release/`seal` operations (rather than the single-call property fuzzing
+`fuzzSnapshotConfig` already covered) asserting generation monotonicity,
+ledger growth, nonce uniqueness and deterministic exhaustion (including
+right at the `maxInt(u64)` boundary via an occasional near-wrap lease
+window), that a failed seal still consumes its reserved nonce (via a
+per-case fault-injecting provider that always fails `aeadSeal` after
+`NonceLease.reserve()` has already committed), that a retained old
+snapshot's key material and lease state stay exactly frozen once it stops
+being `keyring.current` (compared via the same constant-time key
+fingerprint the keyring's own ledger uses) for as long as it is held, that
+every modeled reference -- acquired or explicitly retained, including any
+left outstanding when a bounded program ends -- wipes the snapshot exactly
+once when the last one is released, and that injected allocation failure
+during build/install leaves publication state unchanged. The existing
+`ticket_key_snapshot.zig` persistent-JSON-snapshot fuzz target is unrelated
+(on-disk snapshot file parsing, not the in-memory keyring) and is preserved
+as-is, per the issue's "existing coverage to preserve, not recreate" list.
+Session-cache/lease state machines and backend/runtime composition follow
+in #494-C/D per the issue's PR decomposition.

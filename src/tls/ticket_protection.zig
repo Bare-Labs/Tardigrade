@@ -3600,27 +3600,77 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
         },
         6 => {
             // Authenticate a structurally corrupted `TRS1` record: encode a
-            // valid state, mutate its shared record header (magic/version/
-            // record-type/field-section-length), and re-seal the mutated
-            // bytes with the real key so AEAD authentication succeeds and
+            // valid state, mutate it, and re-seal the mutated bytes with
+            // the real key so AEAD authentication succeeds and
             // `resolveInner` reaches `session.decode`, which must reject it
-            // deterministically as `invalid_plaintext`.
+            // deterministically as `invalid_plaintext`. Covers the shared
+            // record header (magic/version/record-type/field-section-
+            // length) plus field-level TLV boundaries (duplicate/missing
+            // field, exact-width length under/over) via the promoted
+            // session-codec fixture-mutation helpers -- the same ones
+            // `session.zig`'s own deterministic suite already proves
+            // deterministically reject for every field in these sets, so
+            // reusing them here (rather than re-deriving the TLV shape)
+            // keeps this target's own job scoped to proving the
+            // *integration* boundary: that an authenticated malformed
+            // record of any of these classes reaches the resolver's public
+            // `invalid_plaintext` contract, not to re-litigating which
+            // classes are malformed.
             var plaintext_buf: [2048]u8 = undefined;
             const plaintext = try session.encodeServer(&state, session.Limits.default, &plaintext_buf);
-            var mutated_buf: [2048]u8 = undefined;
-            const mutated = mutated_buf[0..plaintext.len];
-            @memcpy(mutated, plaintext);
-            switch (smith.index(4)) {
-                0 => mutated[smith.index(4)] ^= 0xff, // magic
-                1 => mutated[4] +%= 1, // format_version
-                2 => mutated[5] = 0xff, // record_type: not a valid client(1)/server(2) tag
-                else => { // field_section_len off by one from the true remaining length
-                    var section_len = std.mem.readInt(u32, mutated[6..10], .big);
+
+            const duplicate_or_missing_ids = [_]u16{
+                session.field_cipher_suite,   session.field_resumption_psk,   session.field_auth_binding,
+                session.field_issued_at,      session.field_lifetime_seconds, session.field_early_data,
+                session.field_ticket_age_add,
+            };
+            const exact_width_ids = [_]u16{
+                session.field_cipher_suite,     session.field_auth_binding, session.field_issued_at,
+                session.field_lifetime_seconds, session.field_early_data,   session.field_ticket_age_add,
+            };
+
+            var mutated_buf: [2048 + 256]u8 = undefined;
+            var mutated: []u8 = undefined;
+            switch (smith.index(7)) {
+                0 => {
+                    mutated = mutated_buf[0..plaintext.len];
+                    @memcpy(mutated, plaintext);
+                    mutated[smith.index(4)] ^= 0xff; // magic
+                },
+                1 => {
+                    mutated = mutated_buf[0..plaintext.len];
+                    @memcpy(mutated, plaintext);
+                    mutated[4] +%= 1; // format_version
+                },
+                2 => {
+                    mutated = mutated_buf[0..plaintext.len];
+                    @memcpy(mutated, plaintext);
+                    mutated[5] = 0xff; // record_type: not a valid client(1)/server(2) tag
+                },
+                3 => {
+                    mutated = mutated_buf[0..plaintext.len];
+                    @memcpy(mutated, plaintext);
+                    var section_len = std.mem.readInt(u32, mutated[6..10], .big); // field_section_len off by one
                     section_len +%= 1;
                     std.mem.writeInt(u32, mutated[6..10], section_len, .big);
                 },
+                4 => { // duplicate a known field -- always `error.DuplicateField`
+                    const field_id = duplicate_or_missing_ids[smith.index(duplicate_or_missing_ids.len)];
+                    mutated = mutated_buf[0..session.fixtureWithFieldDuplicated(plaintext, field_id, &mutated_buf)];
+                },
+                5 => { // remove a mandatory field -- always `error.MissingField`
+                    const field_id = duplicate_or_missing_ids[smith.index(duplicate_or_missing_ids.len)];
+                    mutated = mutated_buf[0..session.fixtureWithFieldRemoved(plaintext, field_id, &mutated_buf)];
+                },
+                else => { // suite/PSK/lifetime/etc. exact-width field: 0 or one-over its true length
+                    const field_id = exact_width_ids[smith.index(exact_width_ids.len)];
+                    const original_len = session.originalTlvLen(plaintext, field_id).?;
+                    const new_length: u16 = if (smith.index(2) == 0) 0 else original_len + 1;
+                    mutated = mutated_buf[0..session.withTlvLengthOverride(plaintext, field_id, new_length, &mutated_buf)];
+                },
             }
-            var envelope_buf: [2048]u8 = undefined;
+
+            var envelope_buf: [2048 + 256]u8 = undefined;
             const nonce = [_]u8{0xab} ** provider.aead_nonce_len;
             const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, mutated);
             try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), envelope, resolve_now_unix_ms);
@@ -3653,21 +3703,37 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
         },
     }
 
-    // Vary `protector.limits` around the exact envelope-length boundary.
-    // The raw `parseEnvelope` boundary is already exhaustively fuzzed at
-    // the parse layer by `fuzzParseEnvelopeMutation` (#494-A); this proves
-    // the same boundary integrates correctly through the full `resolve`
-    // path (`self.limits.validate()` then `parseEnvelope(identity,
-    // self.limits)`).
+    // Vary `protector.limits` around the exact envelope-length boundary
+    // (`parseEnvelope`, checked before authentication) and the exact
+    // decoded-state boundary (`session.decode`'s own `max_serialized_len`
+    // check, reached only *after* authentication succeeds). Both raw
+    // boundaries are already exhaustively fuzzed at their own parse/codec
+    // layers by `fuzzParseEnvelopeMutation` (#494-A) and session.zig's own
+    // codec target; this proves both integrate correctly through the full
+    // `resolve` path (`self.limits.validate()`, then `parseEnvelope`, then
+    // `session.decode(allocator, self.limits, plaintext)`).
     {
         var limits_probe = session.Limits.default;
-        switch (smith.index(3)) {
+        // `valid_envelope.len - envelope_overhead` is the exact plaintext
+        // length `state` encodes to, derived from the already-sealed
+        // envelope rather than re-deriving it.
+        const plaintext_len = valid_envelope.len - envelope_overhead;
+        var expect_rejected = false;
+        switch (smith.index(5)) {
             0 => {},
             1 => limits_probe.max_ticket_len = valid_envelope.len,
-            else => limits_probe.max_ticket_len = valid_envelope.len - 1,
+            2 => {
+                limits_probe.max_ticket_len = valid_envelope.len - 1;
+                expect_rejected = true;
+            },
+            3 => limits_probe.max_serialized_len = plaintext_len,
+            else => {
+                limits_probe.max_serialized_len = plaintext_len - 1;
+                expect_rejected = true;
+            },
         }
         var probe_protector = Protector{ .provider = fresh_provider, .keyring = &keyring, .limits = limits_probe };
-        if (limits_probe.max_ticket_len < valid_envelope.len) {
+        if (expect_rejected) {
             try expectResolveFalseUnchanged(&probe_protector, zero_alloc.allocator(), valid_envelope, resolve_now_unix_ms);
         } else {
             try expectRoundTrip(&probe_protector, zero_alloc.allocator(), &state, valid_envelope, resolve_now_unix_ms);
@@ -3730,6 +3796,79 @@ fn fuzzProtectorResolveInput(_: void, smith: *testing.Smith) !void {
     try fuzzProtectorResolve(testing.allocator, smith);
 }
 
+/// Wraps a real `CryptoProvider` but always fails `aeadSeal`, so
+/// `fuzzKeyringOperationSequence`'s "seal" opcode can drive the
+/// post-nonce-reservation failure contract: `NonceLease.reserve()` commits
+/// the nonce *before* `Protector.sealInner` calls `aeadSeal`, so a local
+/// provider fault after that point must still leave the nonce consumed
+/// (never reused or rolled back), even though the ticket itself is never
+/// produced. Every other operation delegates unchanged to the wrapped
+/// provider so this stays a true "one operation faults" injection rather
+/// than a stub.
+const FaultingSealProvider = struct {
+    inner: provider.CryptoProvider,
+
+    fn capabilities(ctx: *anyopaque) provider.Capabilities {
+        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        return self.inner.capabilities();
+    }
+    fn hkdfExtract(ctx: *anyopaque, hash: provider.Hash, salt: []const u8, ikm: []const u8, out: []u8) provider.HkdfError!void {
+        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.hkdfExtract(self.inner.context, hash, salt, ikm, out);
+    }
+    fn hkdfExpandLabel(ctx: *anyopaque, hash: provider.Hash, secret: []const u8, label: []const u8, hash_context: []const u8, out: []u8) provider.HkdfError!void {
+        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.hkdfExpandLabel(self.inner.context, hash, secret, label, hash_context, out);
+    }
+    fn aeadSeal(ctx: *anyopaque, aead: provider.Aead, key: []const u8, nonce: []const u8, associated_data: []const u8, plaintext: []const u8, ciphertext: []u8, tag: []u8) provider.SealError!void {
+        _ = ctx;
+        _ = aead;
+        _ = key;
+        _ = nonce;
+        _ = associated_data;
+        _ = plaintext;
+        _ = ciphertext;
+        _ = tag;
+        return error.InvalidInput;
+    }
+    fn aeadOpen(ctx: *anyopaque, aead: provider.Aead, key: []const u8, nonce: []const u8, associated_data: []const u8, ciphertext: []const u8, tag: []const u8, plaintext: []u8) provider.OpenError!void {
+        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.aeadOpen(self.inner.context, aead, key, nonce, associated_data, ciphertext, tag, plaintext);
+    }
+    fn quicHeaderProtectionMask(ctx: *anyopaque, hp: provider.QuicHeaderProtection, key: []const u8, sample: []const u8, mask: []u8) provider.QuicHeaderProtectionError!void {
+        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.quicHeaderProtectionMask(self.inner.context, hp, key, sample, mask);
+    }
+    fn generateKeyShare(ctx: *anyopaque, group: provider.Group, public_out: []u8, private_out: []u8) provider.KeyShareError!void {
+        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.generateKeyShare(self.inner.context, group, public_out, private_out);
+    }
+    fn deriveSharedSecret(ctx: *anyopaque, group: provider.Group, private_scalar: []const u8, peer_public: []const u8, out: []u8) provider.DeriveError!void {
+        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.deriveSharedSecret(self.inner.context, group, private_scalar, peer_public, out);
+    }
+    fn verify(ctx: *anyopaque, scheme: provider.SignatureScheme, public_key: []const u8, message: []const u8, signature: []const u8) provider.VerifyError!void {
+        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        return self.inner.vtable.verify(self.inner.context, scheme, public_key, message, signature);
+    }
+
+    const vtable = provider.CryptoProvider.VTable{
+        .capabilities = capabilities,
+        .hkdfExtract = hkdfExtract,
+        .hkdfExpandLabel = hkdfExpandLabel,
+        .aeadSeal = aeadSeal,
+        .aeadOpen = aeadOpen,
+        .quicHeaderProtectionMask = quicHeaderProtectionMask,
+        .generateKeyShare = generateKeyShare,
+        .deriveSharedSecret = deriveSharedSecret,
+        .verify = verify,
+    };
+
+    fn cryptoProvider(self: *FaultingSealProvider) provider.CryptoProvider {
+        return .{ .context = self, .vtable = &vtable, .entropy = self.inner.entropy };
+    }
+};
+
 /// #494-B: bounded operation-sequence target over `Snapshot.build`,
 /// `ReloadableKeyRing.install`/`validateInstallCandidate`/`acquireCurrent`,
 /// `Snapshot.retain`/`release`, and `Protector.seal`. `fuzzSnapshotConfig`
@@ -3779,8 +3918,22 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     var held_refs: usize = 0;
     var held_deinit_count = std.atomic.Value(usize).init(0);
     var held_fixture: KeyState = undefined;
+    var held_key_fingerprint: KeyFingerprint = undefined;
     var held_outlived_current = false;
-    defer if (held) |snap| snap.release();
+    // A bounded program can terminate with more than one modeled owner
+    // still outstanding (e.g. install -> acquire -> retain -> end, leaving
+    // `held_refs == 2`): drain every one of them here, not just a single
+    // reference, so the "every reference is released exactly once"
+    // invariant holds even for an unfinished opcode stream. This runs
+    // before the `TestKeyDeinitProbeStorage.probe = null` defer above
+    // (Zig defers unwind LIFO), so the zeroization probe is still active
+    // to observe these final releases too.
+    defer if (held) |snap| {
+        while (held_refs != 0) {
+            held_refs -= 1;
+            snap.release();
+        }
+    };
 
     var last_generation: u64 = 0;
     var last_ledger_len: usize = 0;
@@ -3797,9 +3950,23 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     for (0..op_count) |_| {
         switch (smith.index(6)) {
             0 => { // (re)install the active key with an advanced, non-overlapping lease window
-                const start = next_lease_start;
-                const end = start + lease_chunk;
-                next_lease_start = end;
+                // Occasionally install a lease window pinned at the very
+                // top of the `u64` counter space instead of the normal
+                // small advancing range, so the "seal" opcode below gets a
+                // chance to exercise the exact boundary `reserve()` guards
+                // against wraparound at (`current == maxInt(u64)`, and the
+                // one-nonce-then-exhausted transition it produces, not just
+                // the small-integer exhaustion the advancing range already
+                // covers. This permanently high-waters this id's ledger
+                // entry to `maxInt(u64)`, so any later ordinary-range
+                // install of the same id deterministically (and correctly)
+                // rejects as `OverlappingNonceLease` for the rest of this
+                // bounded program -- already handled by the same
+                // catch/continue every other install rejection uses below.
+                const near_wrap = smith.index(8) == 0;
+                const start: u64 = if (near_wrap) std.math.maxInt(u64) - 1 else next_lease_start;
+                const end: u64 = if (near_wrap) std.math.maxInt(u64) else start + lease_chunk;
+                if (!near_wrap) next_lease_start = end;
                 const config = KeyConfig{
                     .id = keyId(0xc1),
                     .aead = .aes_128_gcm,
@@ -3842,6 +4009,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                             .decrypt_until_unix_ms = snap.keys[0].decrypt_until_unix_ms,
                             .lease = leaseStateFromKey(&snap.keys[0]),
                         };
+                        held_key_fingerprint = fingerprintKey(snap.keys[0].aead, snap.keys[0].key.slice());
                     }
                 }
             },
@@ -3853,6 +4021,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
             },
             4 => { // release one modeled reference
                 if (held) |snap| {
+                    const key_wipes_before = key_probe.observed;
                     snap.release();
                     held_refs -= 1;
                     if (held_refs == 0) {
@@ -3860,15 +4029,52 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                             @as(usize, if (held_outlived_current) 1 else 0),
                             held_deinit_count.load(.monotonic),
                         );
+                        // Only the *final* modeled reference actually frees
+                        // the snapshot (and, since this fixture is always a
+                        // single-key snapshot, wipes exactly one key
+                        // record): if this was the last owner, the
+                        // zeroization probe must have fired exactly once
+                        // for this release, never zero (a leaked/never-wiped
+                        // key) and never more than one (a double free/wipe).
+                        if (held_outlived_current) {
+                            try testing.expectEqual(@as(usize, 1), key_probe.observed - key_wipes_before);
+                        } else {
+                            try testing.expectEqual(key_wipes_before, key_probe.observed);
+                        }
                         held = null;
+                        secrets.secureZero(&held_key_fingerprint);
                     }
                 }
             },
-            else => { // reserve a nonce; expect deterministic exhaustion once the lease window is spent
-                var ticket_buf: [512]u8 = undefined;
+            else => { // reserve a nonce: uniqueness, deterministic exhaustion (including near-wrap), and the post-reservation provider-fault contract
                 const before = captureKeyringState(&keyring);
                 const ticket = keyring.current != null and keyring.current.?.keys[0].nonce_lease != null;
                 if (!ticket) continue;
+                const counter_before = keyring.current.?.keys[0].nonce_lease.?.next_counter.load(.acquire);
+                const has_room = counter_before < keyring.current.?.keys[0].nonce_lease.?.currentEnd();
+
+                if (has_room and smith.index(5) == 0) {
+                    // `NonceLease.reserve()` commits the nonce *before*
+                    // `Protector.sealInner` ever calls `aeadSeal`, so a
+                    // local provider fault at that point must still leave
+                    // the counter advanced by exactly one -- the documented
+                    // "never reuse a nonce, even on local failure" contract
+                    // -- and must not touch any other publication state
+                    // (`seal` never writes to the ledger on any path). A
+                    // fresh per-case fault-injecting provider, not the
+                    // shared static `testProvider()`, drives this.
+                    var faulting = FaultingSealProvider{ .inner = testProvider() };
+                    var faulting_protector = Protector{ .provider = faulting.cryptoProvider(), .keyring = &keyring, .limits = session.Limits.default };
+                    var ticket_buf: [512]u8 = undefined;
+                    try testing.expectError(error.InvalidInternalState, faulting_protector.seal(allocator, &state, seal_now_unix_ms, &ticket_buf));
+                    const counter_after = keyring.current.?.keys[0].nonce_lease.?.next_counter.load(.acquire);
+                    try testing.expectEqual(counter_before + 1, counter_after);
+                    try testing.expectEqual(before.current, keyring.current);
+                    try testing.expectEqual(before.ledger_len, keyring.ledger.items.len);
+                    continue;
+                }
+
+                var ticket_buf: [512]u8 = undefined;
                 var protector = Protector{ .provider = testProvider(), .keyring = &keyring, .limits = session.Limits.default };
                 if (protector.seal(allocator, &state, seal_now_unix_ms, &ticket_buf)) |sealed| {
                     var nonce: [provider.aead_nonce_len]u8 = undefined;
@@ -3881,7 +4087,15 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                         seen_nonce_count += 1;
                     }
                 } else |err| {
-                    try testing.expect(err == error.NonceLeaseExhausted or err == error.NoActiveEncryptionKey or err == error.AmbiguousActiveEncryptionKey);
+                    // With this fixture (a single key whose time window
+                    // always covers `seal_now_unix_ms`, guarded above by
+                    // `ticket`), the only normal terminal failure is lease
+                    // exhaustion, including right at the `maxInt(u64)`
+                    // boundary the near-wrap install above sometimes
+                    // produces -- accepting the other two errors here would
+                    // silently mask an unexpected active-key-selection
+                    // regression instead of failing loudly.
+                    try testing.expectEqual(error.NonceLeaseExhausted, err);
                     try expectKeyringStateEqual(before, &keyring);
                 }
             },
@@ -3890,32 +4104,48 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
         try testing.expect(keyring.ledger.items.len >= last_ledger_len);
         last_ledger_len = keyring.ledger.items.len;
         if (held) |snap| {
-            if (keyring.current != snap) held_outlived_current = true;
+            // The moment `keyring.current` first moves away from `snap`,
+            // this is still a single-threaded sequence and no later
+            // `Protector.seal` can legally reach `snap`'s lease anymore
+            // (`seal` always reserves against `acquireCurrent()`, which now
+            // returns a different snapshot) -- so the lease's `next_counter`
+            // stops moving on its own from this exact point on. Capture
+            // that stopping value right here, once, rather than comparing
+            // against the original acquire-time value: `seal` calls issued
+            // *before* this transition legitimately advanced the counter
+            // while `snap` was still current, so only the value at the
+            // transition itself is the correct freeze point.
+            const key = &snap.keys[0];
+            if (keyring.current != snap and !held_outlived_current) {
+                held_outlived_current = true;
+                if (key.nonce_lease) |*lease| held_fixture.lease.next_counter = lease.next_counter.load(.acquire);
+            }
             try testing.expectEqual(@as(usize, 0), held_deinit_count.load(.monotonic));
             // Every field of the held key record is frozen -- it belongs to
             // a published, immutable `Snapshot` that is never mutated in
-            // place -- *except* its nonce lease's `next_counter`, which is
-            // a live atomic that legitimately keeps advancing via `seal`
-            // for as long as this snapshot is still `keyring.current`
-            // (`seal` always reserves against `acquireCurrent()`, not
-            // `held`); it stops moving on its own once a replacing install
-            // takes `keyring.current` elsewhere, since no later `seal` can
-            // reach it, but there is no single "value at the moment of
-            // transition" to freeze to here -- the fixture was captured once
-            // at acquire time, so the only invariant that holds for every
-            // observation in between is monotonic non-decrease against that
-            // original value (never a reset/decrease), not exact equality.
-            const key = &snap.keys[0];
+            // place -- including the secret key material itself, compared
+            // here via the same constant-time fingerprint the keyring's own
+            // ledger uses, so a premature wipe or corruption while retained
+            // is caught immediately rather than only at final release
+            // (`KeyDeinitProbe` only proves bytes are zero *at* deinit, not
+            // that they were still live a moment before it).
             try testing.expectEqualSlices(u8, &held_fixture.id, &key.id);
             try testing.expectEqual(held_fixture.aead, key.aead);
             try testing.expectEqual(held_fixture.not_before_unix_ms, key.not_before_unix_ms);
             try testing.expectEqual(held_fixture.encrypt_until_unix_ms, key.encrypt_until_unix_ms);
             try testing.expectEqual(held_fixture.decrypt_until_unix_ms, key.decrypt_until_unix_ms);
+            var current_fingerprint = fingerprintKey(key.aead, key.key.slice());
+            defer secrets.secureZero(&current_fingerprint);
+            try testing.expect(secrets.constantTimeEqual(&held_key_fingerprint, &current_fingerprint));
             try testing.expectEqual(held_fixture.lease.has_lease, key.nonce_lease != null);
             if (key.nonce_lease) |*lease| {
                 try testing.expectEqualSlices(u8, &held_fixture.lease.prefix, &lease.prefix);
                 try testing.expectEqual(held_fixture.lease.end_exclusive, lease.currentEnd());
-                try testing.expect(lease.next_counter.load(.acquire) >= held_fixture.lease.next_counter);
+                if (held_outlived_current) {
+                    try testing.expectEqual(held_fixture.lease.next_counter, lease.next_counter.load(.acquire));
+                } else {
+                    try testing.expect(lease.next_counter.load(.acquire) >= held_fixture.lease.next_counter);
+                }
             }
         }
     }

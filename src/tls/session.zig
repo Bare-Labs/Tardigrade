@@ -848,25 +848,32 @@ pub const format_version: u8 = 1;
 pub const magic: [4]u8 = .{ 'T', 'R', 'S', '1' };
 
 /// `magic(4) | major(1) | kind(1) | field_section_len(4)`.
-const header_len: usize = magic.len + 1 + 1 + 4;
+/// #494-B's `Protector.resolve` fuzz target (`src/tls/ticket_protection.zig`)
+/// reuses this alongside the fixture-mutation helpers below rather than
+/// re-deriving the wire header shape, so an authenticated malformed-plaintext
+/// mutation always lands on a real TLV boundary.
+pub const header_len: usize = magic.len + 1 + 1 + 4;
 
 const optional_field_mask: u16 = 0x8000;
 
-const field_cipher_suite: u16 = 0x0001;
-const field_resumption_psk: u16 = 0x0002;
+/// Exposed for #494-B's authenticated-plaintext mutation matrix (see
+/// `header_len`'s doc comment); the rest stay module-private since only
+/// these are driven from outside this file today.
+pub const field_cipher_suite: u16 = 0x0001;
+pub const field_resumption_psk: u16 = 0x0002;
 const field_server_name: u16 = 0x0003;
 const field_application_protocol: u16 = 0x0004;
-const field_auth_binding: u16 = 0x0005;
-const field_issued_at: u16 = 0x0006;
-const field_lifetime_seconds: u16 = 0x0007;
-const field_early_data: u16 = 0x0008;
+pub const field_auth_binding: u16 = 0x0005;
+pub const field_issued_at: u16 = 0x0006;
+pub const field_lifetime_seconds: u16 = 0x0007;
+pub const field_early_data: u16 = 0x0008;
 const field_transport_compat: u16 = 0x8001;
 const field_application_compat: u16 = 0x8002;
 const field_early_data_transport_compat: u16 = 0x8003;
 const field_early_data_application_compat: u16 = 0x8004;
 
 const field_ticket: u16 = 0x0010;
-const field_ticket_age_add: u16 = 0x0011;
+pub const field_ticket_age_add: u16 = 0x0011;
 const field_ticket_nonce: u16 = 0x0012;
 const field_received_at: u16 = 0x0013;
 
@@ -3000,8 +3007,9 @@ test "current encoder output exactly equals the checked-in fixtures" {
 }
 
 /// Rebuilds `fixture` with every TLV whose field id is `field_id_to_remove`
-/// dropped, patching the section length to match.
-fn fixtureWithFieldRemoved(fixture: []const u8, field_id_to_remove: u16, out: []u8) usize {
+/// dropped, patching the section length to match. Exposed for #494-B's
+/// authenticated-plaintext mutation matrix; see `header_len`'s doc comment.
+pub fn fixtureWithFieldRemoved(fixture: []const u8, field_id_to_remove: u16, out: []u8) usize {
     @memcpy(out[0..header_len], fixture[0..header_len]);
     var pos: usize = header_len;
     var offset: usize = header_len;
@@ -3015,8 +3023,9 @@ fn fixtureWithFieldRemoved(fixture: []const u8, field_id_to_remove: u16, out: []
 
 /// Rebuilds `fixture` with an extra copy of the first TLV whose field id is
 /// `field_id_to_duplicate` appended at the end, patching the section length
-/// to match.
-fn fixtureWithFieldDuplicated(fixture: []const u8, field_id_to_duplicate: u16, out: []u8) usize {
+/// to match. Exposed for #494-B's authenticated-plaintext mutation matrix;
+/// see `header_len`'s doc comment.
+pub fn fixtureWithFieldDuplicated(fixture: []const u8, field_id_to_duplicate: u16, out: []u8) usize {
     @memcpy(out[0..fixture.len], fixture);
     var pos: usize = fixture.len;
     var offset: usize = header_len;
@@ -3174,7 +3183,9 @@ test "decode rejects both literal fixtures truncated at every byte boundary" {
 /// declared length (`new_length`), copying as much of its original value as
 /// fits and leaving any excess unspecified. Every other TLV is copied
 /// unchanged. `out` must have at least `fixture.len + 8` bytes of room.
-fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16, out: []u8) usize {
+/// Exposed for #494-B's authenticated-plaintext mutation matrix; see
+/// `header_len`'s doc comment.
+pub fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16, out: []u8) usize {
     @memcpy(out[0..header_len], fixture[0..header_len]);
     var pos: usize = header_len;
     var offset: usize = header_len;
@@ -3193,7 +3204,9 @@ fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16, ou
     return pos;
 }
 
-fn originalTlvLen(fixture: []const u8, field_id: u16) ?u16 {
+/// Exposed for #494-B's authenticated-plaintext mutation matrix; see
+/// `header_len`'s doc comment.
+pub fn originalTlvLen(fixture: []const u8, field_id: u16) ?u16 {
     var offset: usize = header_len;
     while ((nextTlv(fixture, &offset) catch unreachable)) |tlv| {
         if (tlv.field_id == field_id) return @intCast(tlv.value.len);
