@@ -25,13 +25,29 @@ const secrets = crypto_pkg.secrets;
 const Ed25519 = std.crypto.sign.Ed25519;
 const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
-fn cryptoProvider() provider.CryptoProvider {
-    const Holder = struct {
-        var entropy = pure_zig.DeterministicEntropy.init(0x376);
-        var provider_instance = pure_zig.Provider.init(entropy.entropy());
-    };
-    return Holder.provider_instance.cryptoProvider();
-}
+/// Every test/fuzz case constructs its own `TestProvider` value on its own
+/// stack frame rather than sharing one process-global instance: a shared
+/// `DeterministicEntropy` stream would advance differently depending on how
+/// many earlier cases already ran in the same process, so a minimized case
+/// replayed alone (e.g. via `-Dcrypto-test-filter`) would not see the same
+/// entropy a full run gave it, breaking case-isolated deterministic
+/// reproduction. `init` must be called on an already-addressed `self` (never
+/// have a helper build one and return it by value) because `Provider.entropy`
+/// stores a raw pointer to `self.entropy`; a by-value return would leave that
+/// pointer aimed at a temporary.
+const TestProvider = struct {
+    entropy: pure_zig.DeterministicEntropy,
+    instance: pure_zig.Provider,
+
+    fn init(self: *TestProvider, seed: u64) void {
+        self.entropy = pure_zig.DeterministicEntropy.init(seed);
+        self.instance = pure_zig.Provider.init(self.entropy.entropy());
+    }
+
+    fn cryptoProvider(self: *const TestProvider) provider.CryptoProvider {
+        return self.instance.cryptoProvider();
+    }
+};
 
 fn ed25519SigningKey(seed_byte: u8) !pure_zig.SoftwareSigningKey {
     var seed: [Ed25519.KeyPair.seed_length]u8 = undefined;
@@ -50,7 +66,9 @@ fn ecdsaSigningKey(seed_byte: u8) !pure_zig.SoftwareEcdsaP256SigningKey {
 // ---------------------------------------------------------------------------
 
 test "AEAD seal/open reject wrong-length key, nonce, tag, and mismatched ciphertext/plaintext lengths for every supported AEAD" {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const aeads = [_]provider.Aead{ .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305 };
     for (aeads) |aead| {
         const key_len = aead.keyLength();
@@ -83,7 +101,9 @@ test "AEAD seal/open reject wrong-length key, nonce, tag, and mismatched ciphert
 }
 
 test "AEAD open zeroes the plaintext buffer on authentication failure from ciphertext, tag, or associated-data mutation" {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const aeads = [_]provider.Aead{ .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305 };
     for (aeads) |aead| {
         const key = [_]u8{0xAB} ** provider.max_aead_key_len;
@@ -117,7 +137,9 @@ test "AEAD open zeroes the plaintext buffer on authentication failure from ciphe
 }
 
 test "AEAD seal/open round-trip zero-length and a harness-bounded maximum-length plaintext" {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const aeads = [_]provider.Aead{ .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305 };
     // Harness-chosen bound: AEAD itself has no wire-defined maximum plaintext
     // length the way a DER or QUIC varint length does (see the fuzz
@@ -149,7 +171,9 @@ test "AEAD seal/open round-trip zero-length and a harness-bounded maximum-length
 }
 
 fn fuzzAeadOpen(_: void, smith: *std.testing.Smith) anyerror!void {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const aeads = [_]provider.Aead{ .aes_128_gcm, .aes_256_gcm, .chacha20_poly1305 };
     const aead = aeads[smith.index(aeads.len)];
 
@@ -180,18 +204,22 @@ fn fuzzAeadOpen(_: void, smith: *std.testing.Smith) anyerror!void {
         ct_buf[0..ct_len],
         tag_buf[0..tag_len],
         pt_buf[0..ct_len],
-    ) catch |err| {
-        // AuthenticationFailed carries the security-relevant contract this
-        // target exists to check: no unauthenticated plaintext survives.
-        // Any other rejection (InvalidInput for a wrong-length field) means
-        // the provider never wrote to `pt_buf` at all, so the sentinel is
-        // still there -- also fine, just not the interesting case.
-        if (err == error.AuthenticationFailed) {
+    ) catch |err| switch (err) {
+        // A wrong-length field is an expected, benign rejection: the
+        // provider never wrote to `pt_buf`, so nothing to check.
+        error.InvalidInput => return,
+        // The security-relevant contract this target exists to check: no
+        // unauthenticated plaintext survives a failed authentication.
+        error.AuthenticationFailed => {
             for (pt_buf[0..ct_len]) |b| {
                 if (b != 0) return error.TestUnexpectedResult;
             }
-        }
-        return;
+            return;
+        },
+        // `aead` is always one of the three variants this provider
+        // advertises support for; seeing this means the provider-contract
+        // itself regressed, not that the fuzz input was malformed.
+        error.UnsupportedCapability => return err,
     };
 }
 
@@ -209,7 +237,9 @@ test "fuzz: AEAD open never leaves unauthenticated plaintext on arbitrary key/no
 // ---------------------------------------------------------------------------
 
 test "deriveSharedSecret rejects wrong-length private scalars, peer public keys, and output buffers for every supported group" {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const Case = struct { group: provider.Group, scalar_len: usize, peer_len: usize, out_len: usize };
     const cases = [_]Case{
         .{ .group = .x25519, .scalar_len = 32, .peer_len = 32, .out_len = 32 },
@@ -228,7 +258,9 @@ test "deriveSharedSecret rejects wrong-length private scalars, peer public keys,
 }
 
 fn fuzzDeriveSharedSecret(_: void, smith: *std.testing.Smith) anyerror!void {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const groups = [_]provider.Group{ .x25519, .secp256r1 };
     const group = groups[smith.index(groups.len)];
 
@@ -242,7 +274,11 @@ fn fuzzDeriveSharedSecret(_: void, smith: *std.testing.Smith) anyerror!void {
     smith.bytes(peer_buf[0..peer_len]);
     const out_len = smith.index(out_buf.len + 1);
 
-    cp.deriveSharedSecret(group, scalar_buf[0..scalar_len], peer_buf[0..peer_len], out_buf[0..out_len]) catch return;
+    cp.deriveSharedSecret(group, scalar_buf[0..scalar_len], peer_buf[0..peer_len], out_buf[0..out_len]) catch |err| switch (err) {
+        error.InvalidInput => return,
+        // `group` is always one of the two variants this provider supports.
+        error.UnsupportedCapability => return err,
+    };
 }
 
 test "fuzz: deriveSharedSecret never panics on arbitrary scalar and peer-public bytes" {
@@ -254,7 +290,9 @@ test "fuzz: deriveSharedSecret never panics on arbitrary scalar and peer-public 
 }
 
 fn fuzzGenerateKeyShare(_: void, smith: *std.testing.Smith) anyerror!void {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const groups = [_]provider.Group{ .x25519, .secp256r1 };
     const group = groups[smith.index(groups.len)];
 
@@ -264,7 +302,13 @@ fn fuzzGenerateKeyShare(_: void, smith: *std.testing.Smith) anyerror!void {
     const public_len = smith.index(public_buf.len + 1);
     const private_len = smith.index(private_buf.len + 1);
 
-    cp.generateKeyShare(group, public_buf[0..public_len], private_buf[0..private_len]) catch return;
+    cp.generateKeyShare(group, public_buf[0..public_len], private_buf[0..private_len]) catch |err| switch (err) {
+        error.InvalidInput => return,
+        // `group` is always supported and `tp`'s `DeterministicEntropy`
+        // never fails, so an entropy/provider/capability failure here means
+        // a real regression, not a benign fuzz outcome.
+        error.UnsupportedCapability, error.EntropyFailure, error.ProviderFailure => return err,
+    };
 }
 
 test "fuzz: generateKeyShare never panics on arbitrary output-buffer lengths" {
@@ -281,7 +325,9 @@ test "fuzz: generateKeyShare never panics on arbitrary output-buffer lengths" {
 // ---------------------------------------------------------------------------
 
 test "verify rejects malformed public key encodings for every supported scheme" {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const message = "certificate verify transcript";
 
     {
@@ -324,7 +370,9 @@ test "verify rejects malformed public key encodings for every supported scheme" 
 }
 
 test "verify treats a malformed signature encoding as AuthenticationFailed for every supported scheme" {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const message = "certificate verify transcript";
 
     {
@@ -355,7 +403,9 @@ test "verify treats a malformed signature encoding as AuthenticationFailed for e
 }
 
 test "verify rejects a structurally valid but single-bit-modified signature for every supported scheme" {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const message = "certificate verify transcript";
 
     {
@@ -392,7 +442,9 @@ test "verify rejects a structurally valid but single-bit-modified signature for 
 }
 
 test "verify rejects the correct signature under the wrong message for every supported scheme" {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const message = "certificate verify transcript";
     const wrong_message = "a completely different transcript";
 
@@ -430,7 +482,9 @@ test "verify rejects the correct signature under the wrong message for every sup
 }
 
 test "verify rejects the correct signature under an unrelated key for Ed25519 and ECDSA-P256" {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const message = "certificate verify transcript";
 
     {
@@ -459,7 +513,9 @@ test "verify rejects the correct signature under an unrelated key for Ed25519 an
 }
 
 fn fuzzVerify(_: void, smith: *std.testing.Smith) anyerror!void {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     const schemes = [_]provider.SignatureScheme{ .ed25519, .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha256 };
     const scheme = schemes[smith.index(schemes.len)];
 
@@ -474,7 +530,12 @@ fn fuzzVerify(_: void, smith: *std.testing.Smith) anyerror!void {
     const sig_len = smith.index(sig_buf.len + 1);
     smith.bytes(sig_buf[0..sig_len]);
 
-    cp.verify(scheme, pk_buf[0..pk_len], msg_buf[0..msg_len], sig_buf[0..sig_len]) catch return;
+    cp.verify(scheme, pk_buf[0..pk_len], msg_buf[0..msg_len], sig_buf[0..sig_len]) catch |err| switch (err) {
+        error.InvalidInput, error.AuthenticationFailed => return,
+        // `scheme` is always one of the three variants this provider
+        // supports.
+        error.UnsupportedCapability => return err,
+    };
 }
 
 test "fuzz: verify never panics on arbitrary public key, message, and signature bytes" {
@@ -491,7 +552,9 @@ test "fuzz: verify never panics on arbitrary public key, message, and signature 
 // ---------------------------------------------------------------------------
 
 test "SigningKey.sign rejects an undersized output buffer without writing to it, for Ed25519" {
-    const cp = cryptoProvider();
+    var tp: TestProvider = undefined;
+    tp.init(0x376);
+    const cp = tp.cryptoProvider();
     var key = try ed25519SigningKey(13);
     defer key.deinit();
     const signer = key.signingKey();
@@ -530,11 +593,15 @@ fn fuzzFixedSecret(_: void, smith: *std.testing.Smith) anyerror!void {
         if (use_self_overlap) {
             const start = smith.index(secret.len);
             const take = smith.index(secret.len - start + 1);
-            secret.replace(secret.slice()[start..][0..take]) catch continue;
+            secret.replace(secret.slice()[start..][0..take]) catch |err| switch (err) {
+                error.SecretTooLarge => unreachable, // a self-slice cannot exceed capacity
+            };
         } else {
             const len = smith.index(scratch.len + 1);
             smith.bytes(scratch[0..len]);
-            secret.replace(scratch[0..len]) catch continue;
+            secret.replace(scratch[0..len]) catch |err| switch (err) {
+                error.SecretTooLarge => continue, // len may exceed the 32-byte capacity
+            };
         }
 
         if (secret.len > secret.bytes.len) return error.TestUnexpectedResult;
@@ -556,33 +623,124 @@ test "fuzz: FixedSecret replace/eql/deinit preserve invariants under arbitrary o
 }
 
 fn fuzzBoundedSecret(_: void, smith: *std.testing.Smith) anyerror!void {
+    const capacity = smith.index(64) + 1;
+    var scratch: [64]u8 = undefined;
+    const first_len = smith.index(capacity + 1);
+    smith.bytes(scratch[0..first_len]);
+
+    // Allocation-failure and leak-freedom path: `std.testing.allocator`'s
+    // own leak checker, wrapped so we can inject an occasional failure on
+    // `BoundedSecret`'s single capacity allocation and confirm no
+    // partially-initialized secret escapes it or leaks. Biased toward
+    // succeeding so most cases still reach the richer property loop below.
+    {
+        const should_fail = smith.boolWeighted(4, 1);
+        const fail_index: usize = if (should_fail) 0 else 1;
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var leak_secret = secrets.BoundedSecret{};
+        leak_secret.init(failing.allocator(), capacity, scratch[0..first_len]) catch |err| switch (err) {
+            error.OutOfMemory => {
+                leak_secret.deinit(); // must stay a safe no-op: nothing was allocated.
+                return;
+            },
+            error.SecretTooLarge => unreachable, // first_len <= capacity by construction
+        };
+        leak_secret.deinit(); // std.testing.allocator's own leak checker asserts this ran.
+    }
+
+    // Byte-inspection path: replace/self-overlap/oversized/eql/deinit
+    // properties against a `FixedBufferAllocator` so zeroization is directly
+    // observable in backing memory, mirroring `src/crypto/secrets.zig`'s own
+    // deterministic `BoundedSecret` tests. Every allocation below is freed
+    // in strict LIFO order (nested `defer`s inside each sub-block, `secret`
+    // itself only at the very end), so this backing buffer's bump pointer
+    // never grows past 3 concurrent `capacity`-sized allocations regardless
+    // of iteration count.
     var backing: [512]u8 align(8) = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&backing);
-
-    const capacity = smith.index(96) + 1;
-    var scratch: [96]u8 = undefined;
-    const value_len = smith.index(capacity + 1);
-    smith.bytes(scratch[0..value_len]);
-
-    // fail_index in {0, 1}: 0 injects failure on BoundedSecret's single
-    // capacity allocation; 1 lets it succeed, exercising the ordinary path.
-    const fail_index = smith.index(2);
-    var failing = std.testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = fail_index });
-
     var secret = secrets.BoundedSecret{};
-    secret.init(failing.allocator(), capacity, scratch[0..value_len]) catch |err| switch (err) {
-        error.OutOfMemory => return, // injected failure: nothing further to verify
-        error.SecretTooLarge => unreachable, // value_len <= capacity by construction
-    };
-    defer secret.deinit();
+    try secret.init(fba.allocator(), capacity, scratch[0..first_len]);
 
-    if (secret.len != value_len) return error.TestUnexpectedResult;
-    if (!std.mem.eql(u8, secret.slice(), scratch[0..value_len])) return error.TestUnexpectedResult;
+    var oversized_buf: [96]u8 = undefined;
+    var iterations: usize = 0;
+    while (iterations < 8 and !smith.eos()) : (iterations += 1) {
+        const before_len = secret.len;
+        var before_value: [64]u8 = undefined;
+        @memcpy(before_value[0..before_len], secret.slice());
 
-    var mirror = secrets.BoundedSecret{};
-    try mirror.init(fba.allocator(), capacity, secret.slice());
-    defer mirror.deinit();
-    if (!secret.eql(&mirror)) return error.TestUnexpectedResult;
+        const use_self_overlap = secret.len > 0 and smith.boolWeighted(1, 3);
+        if (use_self_overlap) {
+            const start = smith.index(secret.len);
+            const take = smith.index(secret.len - start + 1);
+            secret.replace(secret.slice()[start..][0..take]) catch |err| switch (err) {
+                error.SecretTooLarge => unreachable, // a self-slice cannot exceed capacity
+            };
+        } else if (smith.boolWeighted(3, 1)) {
+            // Oversized replacement: must always be rejected and must leave
+            // the prior value completely untouched.
+            const len = capacity + 1 + smith.index(oversized_buf.len - capacity);
+            smith.bytes(oversized_buf[0..len]);
+            secret.replace(oversized_buf[0..len]) catch |err| switch (err) {
+                error.SecretTooLarge => {
+                    if (secret.len != before_len) return error.TestUnexpectedResult;
+                    if (!std.mem.eql(u8, secret.slice(), before_value[0..before_len])) return error.TestUnexpectedResult;
+                    continue;
+                },
+            };
+            return error.TestUnexpectedResult; // an oversized replace must never succeed
+        } else {
+            const len = smith.index(capacity + 1);
+            smith.bytes(scratch[0..len]);
+            secret.replace(scratch[0..len]) catch |err| switch (err) {
+                error.SecretTooLarge => unreachable, // len <= capacity by construction
+            };
+        }
+
+        // Replacement-tail clearing: every byte beyond the new length, up to
+        // the full allocated capacity, must be zero in backing storage.
+        if (secret.len > capacity) return error.TestUnexpectedResult;
+        for (secret.bytes[secret.len..]) |b| {
+            if (b != 0) return error.TestUnexpectedResult;
+        }
+
+        // Equal comparison.
+        var mirror = secrets.BoundedSecret{};
+        try mirror.init(fba.allocator(), capacity, secret.slice());
+        defer mirror.deinit();
+        if (!secret.eql(&mirror)) return error.TestUnexpectedResult;
+
+        // Unequal (same-length, differing content) comparison.
+        if (secret.len > 0) {
+            var unequal = secrets.BoundedSecret{};
+            var tweaked: [64]u8 = undefined;
+            @memcpy(tweaked[0..secret.len], secret.slice());
+            tweaked[0] +%= 1;
+            try unequal.init(fba.allocator(), capacity, tweaked[0..secret.len]);
+            defer unequal.deinit();
+            if (secret.eql(&unequal)) return error.TestUnexpectedResult;
+        }
+
+        // Length-mismatched comparison.
+        if (secret.len < capacity) {
+            var longer = secrets.BoundedSecret{};
+            var longer_buf: [64]u8 = undefined;
+            @memcpy(longer_buf[0..secret.len], secret.slice());
+            longer_buf[secret.len] = 0;
+            try longer.init(fba.allocator(), capacity, longer_buf[0 .. secret.len + 1]);
+            defer longer.deinit();
+            if (secret.eql(&longer)) return error.TestUnexpectedResult;
+        }
+    }
+
+    secret.deinit();
+    if (secret.len != 0) return error.TestUnexpectedResult;
+    // `deinit` hands the allocator genuinely zeroed bytes, not
+    // `Allocator.free`'s undefined-poison -- inspect the FBA-backed bytes
+    // directly (they are `secret`'s original, first-from-this-arena
+    // allocation, so they sit at `backing[0..capacity]`).
+    for (backing[0..capacity]) |b| {
+        if (b != 0) return error.TestUnexpectedResult;
+    }
 }
 
 test "fuzz: BoundedSecret replace/eql/deinit preserve invariants under arbitrary capacity and allocator-failure injection" {

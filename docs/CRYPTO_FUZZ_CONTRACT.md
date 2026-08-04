@@ -58,6 +58,57 @@ scale it). #491–#494 should add their own protocol-scoped test steps and
 `-D<area>-test-filter` options following the same pattern rather than
 growing this one.
 
+## Seed-corpus and regression update procedure
+
+This is the concrete workflow #491–#494 should follow too, rather than each
+inventing their own.
+
+1. **Reproduce and identify the case.** A `--fuzz=<N>` run that finds a
+   failure fails the `zig build` step and prints the panic/error and Zig's
+   own `test "fuzz: <name>"` name plus its run count in the `FUZZING
+   REPORT` block — that name is the target's deterministic case ID
+   (`Deterministic reproduction` above). Re-run the exact same command
+   (same target, same `-Dcrypto-test-filter`, same `-Doptimize`) to confirm
+   the failure reproduces; Zig's fuzz engine is deterministic given the same
+   binary and inputs.
+2. **Choose the minimization form.**
+   - **Prefer a named deterministic `test` block** next to the fuzz target
+     when the failure has clear structure (a specific field's wrong length,
+     a specific tamper, a specific boundary value) — this is what every
+     deterministic regression in `tests/crypto_provider_fuzz.zig` already
+     is, and it stays reviewable years later the way a raw byte blob does
+     not.
+   - **Add a raw entry to the target's `.corpus = &.{...}` array** only when
+     the failure is genuinely opaque (no clean semantic story) and the exact
+     bytes matter. To capture those bytes: temporarily add a
+     `std.debug.print` of the sampled lengths/enum choice/raw slices
+     immediately before the failing `CryptoProvider` (or `secrets`) call
+     inside the target, re-run the same failing case to trigger the print,
+     copy the reported values, then remove the temporary print. Encode the
+     captured bytes as a Zig string literal using `\xNN` escapes for any
+     non-printable byte (see the existing corpus entries in this file for
+     the style) and add it to `.corpus`.
+3. **Never store real secret material.** Every target in this file
+   synthesizes or derives its own key material per case from injected
+   deterministic entropy — callers never hand it a real production secret —
+   so captured bytes are inherently synthetic/malformed wire-shaped input,
+   never a real private key, certificate, or traffic capture. Corpus entries
+   and regression fixtures must stay that way: hand-crafted or fuzzer-found
+   malformed input only, never copied from a real deployment.
+4. **Record provenance.** Add a one-line comment directly above the new
+   corpus entry or regression test noting when it was found and which
+   command found it (e.g. `-Doptimize=ReleaseFast --fuzz=10M`), so a future
+   reader can tell a hand-written edge case from a fuzzer-discovered one.
+5. **Verify before committing.** Both must pass:
+   ```bash
+   zig build test-crypto-provider-fuzz -Dcrypto-test-filter="fuzz: <exact target name>" --summary all --error-style verbose
+   zig build test --summary all --error-style verbose
+   ```
+   The first confirms the new corpus entry or regression reproduces
+   deterministically under plain (non-`--fuzz`) replay; the second confirms
+   no other target regressed. Run `zig fmt --check build.zig src/ tests/`
+   too, matching every other change in this repo.
+
 ## The shared contract
 
 Every target under epic #327-G — this story's provider targets and
@@ -80,7 +131,17 @@ Identical input/configuration must produce identical target behavior unless
 the target explicitly injects a deterministic clock/entropy stream. Every
 target in this file drives `pure_zig.Provider` through the injected
 `provider.Entropy` seam only (`pure_zig.DeterministicEntropy` in tests) —
-never ambient randomness — so this holds by construction.
+never ambient randomness. Case isolation matters as much as determinism
+here: each test and each fuzz callback constructs its own
+`DeterministicEntropy`/`Provider` pair on its own stack frame (the
+`TestProvider` helper in `tests/crypto_provider_fuzz.zig`) rather than
+sharing one process-global instance. A shared stream would advance
+differently depending on how many earlier cases already ran in the same
+process, so a case minimized during a full run and later replayed alone
+(e.g. via `-Dcrypto-test-filter`) would see a different entropy position
+than it had during discovery — reproducible in aggregate, but not
+per-case. Constructing fresh state per case removes that dependency
+entirely.
 
 ### Bounded work
 
