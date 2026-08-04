@@ -20,6 +20,8 @@ pub fn build(b: *std.Build) void {
     const go_bin = b.option([]const u8, "go-bin", "Go command used to build the PKI crypto/x509 oracle") orelse "go";
     const quic_test_filter = b.option([]const u8, "quic-test-filter", "Filter tests run by the test-quic step");
     const quic_test_filters: []const []const u8 = if (quic_test_filter) |filter| &.{filter} else &.{};
+    const crypto_test_filter = b.option([]const u8, "crypto-test-filter", "Filter tests run by the test-crypto-provider-fuzz step");
+    const crypto_test_filters: []const []const u8 = if (crypto_test_filter) |filter| &.{filter} else &.{};
     const tls_profile = b.option(
         TlsProfile,
         "tls-profile",
@@ -538,6 +540,25 @@ pub fn build(b: *std.Build) void {
     crypto_corpus_step.dependOn(&run_crypto_corpus_tests.step);
     crypto_step.dependOn(&run_crypto_corpus_tests.step);
     test_step.dependOn(&run_crypto_corpus_tests.step);
+
+    // Standalone CryptoProvider fuzz targets (#376, epic #327-G): AEAD,
+    // key exchange, signature verification, signing-key boundary, and
+    // shared secret container properties, following the shared fuzz
+    // contract in docs/CRYPTO_FUZZ_CONTRACT.md. Deterministic seed-corpus
+    // replay runs by default; `-Doptimize=ReleaseFast --fuzz=<N>` drives
+    // real coverage-guided exploration, matching docs/QUIC_H3_FUZZ_MATRIX.md.
+    const crypto_provider_fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("tests/crypto_provider_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crypto_provider_fuzz_mod.addImport("crypto", crypto_mod);
+    const crypto_provider_fuzz_tests = b.addTest(.{ .root_module = crypto_provider_fuzz_mod, .filters = crypto_test_filters });
+    const run_crypto_provider_fuzz_tests = b.addRunArtifact(crypto_provider_fuzz_tests);
+    const crypto_provider_fuzz_step = b.step("test-crypto-provider-fuzz", "Run standalone CryptoProvider AEAD/KEX/verify/signing-key/secret-helper fuzz targets (#376)");
+    crypto_provider_fuzz_step.dependOn(&run_crypto_provider_fuzz_tests.step);
+    crypto_step.dependOn(&run_crypto_provider_fuzz_tests.step);
+    test_step.dependOn(&run_crypto_provider_fuzz_tests.step);
 
     // A direct TLS-owned backend handshake through the record stack. This is a
     // standalone module because it uses socket-pair carriers and the concrete

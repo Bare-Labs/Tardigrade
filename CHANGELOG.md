@@ -4,6 +4,26 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Testing
+- **Shared crypto fuzzing contract and CryptoProvider fuzz targets (#376,
+  epic #327-G)** — adds `docs/CRYPTO_FUZZ_CONTRACT.md`, the shared
+  deterministic-reproduction/bounded-work/arithmetic-safety/lifetime/secret-
+  diagnostics/regression-minimization contract that #491–#494's future
+  protocol-level fuzzing stories consume, plus standalone `std.testing.Smith`
+  fuzz targets and deterministic regressions in
+  `tests/crypto_provider_fuzz.zig` for the `CryptoProvider` boundary itself:
+  AEAD seal/open (wrong-length fields, tamper/zeroization-on-auth-failure,
+  zero/bounded-max plaintext), key exchange (`generateKeyShare`/
+  `deriveSharedSecret` wrong-length and output-buffer fuzzing for X25519 and
+  secp256r1), signature verification (malformed key/signature encodings,
+  tampered signatures, wrong message/key for Ed25519, ECDSA-P256/SHA-256, and
+  RSA-PSS-RSAE/SHA-256), the software signing-key boundary (undersized output
+  buffers, `deinit` zeroization), and the shared `FixedSecret`/`BoundedSecret`
+  containers (including allocator-failure injection via
+  `std.testing.FailingAllocator`). Wired into `zig build test` via the new
+  `test-crypto-provider-fuzz` step and a `-Dcrypto-test-filter` build option
+  for targeted longer coverage-guided runs.
+
 ### Features
 - **QUIC negotiated TLS suite packet protection (#566)** — Handshake, 0-RTT,
   and 1-RTT packet protection now follows the TLS 1.3 cipher suite negotiated
