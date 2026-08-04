@@ -63,45 +63,82 @@ growing this one.
 This is the concrete workflow #491–#494 should follow too, rather than each
 inventing their own.
 
-1. **Reproduce and identify the case.** A `--fuzz=<N>` run that finds a
-   failure fails the `zig build` step and prints the panic/error and Zig's
-   own `test "fuzz: <name>"` name plus its run count in the `FUZZING
-   REPORT` block — that name is the target's deterministic case ID
-   (`Deterministic reproduction` above). Re-run the exact same command
-   (same target, same `-Dcrypto-test-filter`, same `-Doptimize`) to confirm
-   the failure reproduces; Zig's fuzz engine is deterministic given the same
-   binary and inputs.
-2. **Choose the minimization form.**
-   - **Prefer a named deterministic `test` block** next to the fuzz target
-     when the failure has clear structure (a specific field's wrong length,
-     a specific tamper, a specific boundary value) — this is what every
-     deterministic regression in `tests/crypto_provider_fuzz.zig` already
-     is, and it stays reviewable years later the way a raw byte blob does
-     not.
-   - **Add a raw entry to the target's `.corpus = &.{...}` array** only when
-     the failure is genuinely opaque (no clean semantic story) and the exact
-     bytes matter. To capture those bytes: temporarily add a
-     `std.debug.print` of the sampled lengths/enum choice/raw slices
-     immediately before the failing `CryptoProvider` (or `secrets`) call
-     inside the target, re-run the same failing case to trigger the print,
-     copy the reported values, then remove the temporary print. Encode the
-     captured bytes as a Zig string literal using `\xNN` escapes for any
-     non-printable byte (see the existing corpus entries in this file for
-     the style) and add it to `.corpus`.
-3. **Never store real secret material.** Every target in this file
+1. **Capture the exact crash input, not a description of it.** A `--fuzz=<N>`
+   run that finds a failure persists the exact failing `Smith` byte input
+   through Zig's own fuzz engine (the memory-mapped/corpus-backed input the
+   coverage-guided runner uses to recover crashing values, per the [Zig
+   0.16 release notes' fuzzer
+   section](https://ziglang.org/download/0.16.0/release-notes.html#Fuzzer)).
+   The `test "fuzz: <name>"` name Zig prints identifies the *target*, and a
+   `FUZZING REPORT` run count is not a stable case ID — re-running the same
+   coverage-guided command is exploration, not an exact replay. Do not
+   substitute a `std.debug.print` of the *values sampled from* the Smith
+   stream (lengths, enum choices, etc.): those are derived data, not the
+   input itself, and cannot be fed back into `.corpus` to reproduce the
+   same run deterministically. Copy the crash input file Zig's fuzzer
+   reports into a stable checked-in fixture instead:
+   `tests/vectors/fuzz/crypto/<target-slug>/<sha256-of-the-file>.bin`, where
+   `<target-slug>` is a short slug for the target (e.g. `aead-open`,
+   `derive-shared-secret`, `verify`, `fixed-secret`, `bounded-secret`). The
+   SHA-256 digest is both the filename and the deterministic case ID/
+   provenance record — identical bytes always hash to the same fixture name,
+   so a duplicate find is a no-op rather than a second copy.
+2. **Wire it back in with `@embedFile`, always.** Every checked-in crash
+   fixture is added to its target's `.corpus` as `@embedFile`, never
+   hand-transcribed as a string literal (transcription is exactly the kind
+   of lossy transcription step 1 rules out):
+   ```zig
+   try std.testing.fuzz({}, fuzzAeadOpen, .{ .corpus = &.{
+       "",
+       // Found 2026-08-04, zig build test-crypto-provider-fuzz
+       // -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: AEAD open ..." --fuzz=50M
+       @embedFile("vectors/fuzz/crypto/aead-open/1f3c9a7e...bin"),
+   } });
+   ```
+   Replay it immediately with the *same* target's filtered non-`--fuzz`
+   command (below) to confirm it reproduces deterministically before doing
+   anything else with it.
+3. **Minimize, then decide what to keep.** Reduce the fixture by repeatedly
+   trimming/simplifying its bytes and re-running the same filtered replay
+   command until it stops reproducing the failure, keeping the last input
+   that still did (manual delta-debugging; Zig 0.16 does not ship an
+   automatic minimizer for this workflow). Once the minimal failing input is
+   understood:
+   - If it has a clean semantic story (a specific field's wrong length, a
+     specific tamper, a specific boundary value), translate it into a named
+     deterministic `test` block next to the target — this is what every
+     regression in `tests/crypto_provider_fuzz.zig` already is, and it
+     stays reviewable in a way a byte blob does not. Only remove the raw
+     `.corpus`/`@embedFile` fixture once that named regression has been
+     confirmed to fail against the pre-fix code and pass against the fix
+     (i.e. it exercises the same defect, not a superficially similar one).
+   - If it has no clean semantic story (the exact bytes matter and cannot be
+     reduced to a short description), keep the minimized fixture itself as
+     the permanent regression via `@embedFile`, re-hashing and renaming the
+     file to match its minimized content.
+4. **Never store real secret material.** Every target in this file
    synthesizes or derives its own key material per case from injected
    deterministic entropy — callers never hand it a real production secret —
-   so captured bytes are inherently synthetic/malformed wire-shaped input,
-   never a real private key, certificate, or traffic capture. Corpus entries
-   and regression fixtures must stay that way: hand-crafted or fuzzer-found
-   malformed input only, never copied from a real deployment.
-4. **Record provenance.** Add a one-line comment directly above the new
-   corpus entry or regression test noting when it was found and which
-   command found it (e.g. `-Doptimize=ReleaseFast --fuzz=10M`), so a future
-   reader can tell a hand-written edge case from a fuzzer-discovered one.
-5. **Verify before committing.** Both must pass:
+   so a captured fixture is inherently synthetic/malformed wire-shaped
+   input, never a real private key, certificate, or traffic capture. Corpus
+   fixtures and regression tests must stay that way: hand-crafted or
+   fuzzer-found malformed input only, never copied from a real deployment.
+5. **Record provenance.** Add a one-line comment directly above the new
+   `.corpus`/`@embedFile` entry or regression test (see the example in step
+   2) noting when it was found and which command found it, so a future
+   reader can tell a hand-written edge case from a fuzzer-discovered one;
+   the SHA-256 filename itself is the immutable half of that record.
+6. **Verify before committing, and pick the right command for the artifact.**
+   A raw `.corpus`/`@embedFile` fixture is replayed by the *fuzz test's own*
+   filter; a named deterministic regression is a separate `test` and needs
+   its *own* name filtered instead (or the whole step, unfiltered) — the
+   fuzz-target filter will not run it:
    ```bash
+   # Corpus/@embedFile fixture: filter on the fuzz target that owns it.
    zig build test-crypto-provider-fuzz -Dcrypto-test-filter="fuzz: <exact target name>" --summary all --error-style verbose
+   # Named deterministic regression: filter on the regression's own name.
+   zig build test-crypto-provider-fuzz -Dcrypto-test-filter="<exact regression test name>" --summary all --error-style verbose
+   # Always, regardless of artifact type:
    zig build test --summary all --error-style verbose
    ```
    The first confirms the new corpus entry or regression reproduces
@@ -119,13 +156,15 @@ Every target under epic #327-G — this story's provider targets and
 Every failure must identify:
 
 - the target name (the `test "fuzz: ..."` name Zig's runner already prints);
-- a deterministic seed/case ID (the minimized input Zig's fuzz runner
-  reports, or the checked-in corpus entry index);
+- a deterministic case ID — the SHA-256 digest of the checked-in
+  `@embedFile` fixture, or the named regression `test`'s own name; a
+  `FUZZING REPORT` run count is not one (see "Seed-corpus and regression
+  update procedure" above);
 - input length;
 - a typed stage/failure class (which operation and which error variant, not
   a bare panic message);
-- the exact local reproduction command (the commands above, optionally with
-  `-Dcrypto-test-filter` narrowed to the failing test name).
+- the exact local reproduction command (the filtered commands in "Seed-corpus
+  and regression update procedure" above, chosen by artifact type).
 
 Identical input/configuration must produce identical target behavior unless
 the target explicitly injects a deterministic clock/entropy stream. Every
@@ -234,13 +273,19 @@ posture (`docs/CRYPTO_SECURITY_AUDIT.md`).
 
 Every deterministic crash, panic, invariant violation, lifetime failure, or
 semantic bug this story's targets find is checked in as a permanent
-deterministic `test` block next to the fuzz target in
-`tests/crypto_provider_fuzz.zig` (inline regression, the same pattern
-`docs/QUIC_H3_FUZZ_MATRIX.md` uses — there is no generic top-level
-`regression/` directory in this repo; PKI's `tests/vectors/pki/reduced/`
-manifest pattern is the one exception, reserved for #492's semantic
-certificate corpus). Do not fix a reproducible deterministic failure by
-adding a skip; fix the defect or the test's understanding of the contract.
+regression, in the form the "Seed-corpus and regression update procedure"
+above prefers for it: normally an inline deterministic `test` block next to
+the fuzz target in `tests/crypto_provider_fuzz.zig` (the same pattern
+`docs/QUIC_H3_FUZZ_MATRIX.md` uses), or — only when the failure has no clean
+semantic story and the exact bytes matter — a checked-in
+`tests/vectors/fuzz/crypto/<target-slug>/<sha256>.bin` fixture wired back in
+through `@embedFile`. There is no generic top-level `regression/` directory
+in this repo; `tests/vectors/fuzz/crypto/` and PKI's
+`tests/vectors/pki/reduced/` manifest pattern (reserved for #492's semantic
+certificate corpus) are the two directory-backed exceptions to the
+inline-`test`-block default. Do not fix a reproducible deterministic failure
+by adding a skip; fix the defect or the test's understanding of the
+contract.
 
 ## Provider targets owned here
 
