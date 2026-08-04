@@ -37,6 +37,20 @@ pub fn build(b: *std.Build) void {
     const quic_test_filters: []const []const u8 = if (quic_test_filter) |filter| &.{filter} else &.{};
     const crypto_test_filter = b.option([]const u8, "crypto-test-filter", "Filter tests run by the test-crypto-provider-fuzz step");
     const crypto_test_filters: []const []const u8 = if (crypto_test_filter) |filter| &.{filter} else &.{};
+    // #494: unlike the crypto/QUIC provider-fuzz steps, this step's root
+    // module (tls_core_mod) is the *entire* pure-Zig TLS suite -- also run
+    // unfiltered by `test-tls`/`test` -- not a dedicated fuzz-only root
+    // file, so an unfiltered default here would just re-run the whole
+    // suite under a second name. `tls_core_mod` also already contains
+    // unrelated pre-existing "fuzz: ..." tests (sni_provider.zig,
+    // ticket_key_snapshot.zig, ticket_protection.zig's own combined
+    // identity/resolve target), so a bare "fuzz: " prefix would silently
+    // pull those in too. Every #494-A target below is therefore named
+    // "fuzz: TLS resumption: ..." and this defaults to that exact
+    // namespace, scoping the step to only those targets; pass an explicit
+    // filter to select one target for a longer local run.
+    const tls_resumption_test_filter = b.option([]const u8, "tls-resumption-test-filter", "Filter tests run by the test-tls-resumption-fuzz step (default: \"fuzz: TLS resumption:\", i.e. only the #494 session/PSK/ticket/resumption fuzz targets)") orelse "fuzz: TLS resumption:";
+    const tls_resumption_test_filters: []const []const u8 = &.{tls_resumption_test_filter};
     const tls_profile = b.option(
         TlsProfile,
         "tls-profile",
@@ -217,6 +231,20 @@ pub fn build(b: *std.Build) void {
     const tls_step = b.step("test-tls", "Run pure-Zig TLS core unit tests");
     tls_step.dependOn(&run_tls_core_tests.step);
     test_step.dependOn(&run_tls_core_tests.step);
+
+    // Session/PSK/ticket/resumption fuzz targets (#494, epic #326-K),
+    // following the shared contract in docs/CRYPTO_FUZZ_CONTRACT.md and
+    // #376's test-crypto-provider-fuzz naming pattern. The targets
+    // themselves are inline `test "fuzz: ..."` blocks next to the code
+    // they exercise (new_session_ticket.zig, session.zig,
+    // pre_shared_key.zig, ticket_protection.zig) and already replay their
+    // deterministic seed corpus under plain `test-tls`/`test`; this step
+    // exists to give them a stable, individually filterable/long-runnable
+    // name, matching #376's `-Dcrypto-test-filter` shape.
+    const tls_resumption_fuzz_tests = b.addTest(.{ .root_module = tls_core_mod, .filters = tls_resumption_test_filters });
+    const run_tls_resumption_fuzz_tests = b.addRunArtifact(tls_resumption_fuzz_tests);
+    const tls_resumption_fuzz_step = b.step("test-tls-resumption-fuzz", "Run TLS session/PSK/ticket/resumption fuzz targets (#494)");
+    tls_resumption_fuzz_step.dependOn(&run_tls_resumption_fuzz_tests.step);
 
     const allocation_regression_mod = b.createModule(.{
         .root_source_file = b.path("src/allocation_regression.zig"),
