@@ -366,30 +366,41 @@ individually filterable/long-runnable name, the same shape as
 
 ```bash
 # Deterministic smoke coverage for every #494 fuzz target (seed corpus
-# replay only, "fuzz: " test-name prefix) — also covered by plain
-# `zig build test-tls` / `zig build test` since tls_core's test binary
-# already includes these files.
+# replay only, "fuzz: TLS resumption:" test-name namespace) — also
+# covered by plain `zig build test-tls` / `zig build test` since
+# tls_core's test binary already includes these files. The namespace is
+# deliberately more specific than a bare "fuzz: " prefix: `tls_core_mod`
+# also contains unrelated pre-existing "fuzz: ..." tests
+# (sni_provider.zig, ticket_key_snapshot.zig, and ticket_protection.zig's
+# own combined identity/resolve target), which a bare prefix would pull
+# into this step too.
 zig build test-tls-resumption-fuzz --summary all --error-style verbose
 
 # Longer local/scheduled coverage-guided runs, one target at a time:
 zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
-zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: NewSessionTicket wire decode and owned-state construction never panic or corrupt output" --fuzz=10M --summary all --error-style verbose
-zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: session codec raw decode never panics and owns its decoded state" --fuzz=10M --summary all --error-style verbose
-zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: session codec generated client/server records round-trip and reject cross-kind decode" --fuzz=10M --summary all --error-style verbose
-zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: PSK wire codec" --fuzz=10M --summary all --error-style verbose
-zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: PSK binder derivation" --fuzz=10M --summary all --error-style verbose
-zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: parseEnvelope is allocation-free" --fuzz=10M --summary all --error-style verbose
-zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: parseEnvelope single-field mutation" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: NewSessionTicket wire decode and owned-state construction never panic or corrupt output" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: session codec raw decode never panics and owns its decoded state" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: session codec generated client/server records round-trip and reject cross-kind decode" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: PSK wire codec" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: PSK binder derivation" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: parseEnvelope is allocation-free" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: parseEnvelope single-field mutation" --fuzz=10M --summary all --error-style verbose
+
+# Named deterministic regressions (not fuzz-tagged, so outside the
+# default "fuzz: TLS resumption:" namespace — filter on their own name):
+zig build test-tls-resumption-fuzz -Dtls-resumption-test-filter="parseEnvelope rejects every truncated prefix of a valid envelope below the minimum length" --summary all --error-style verbose
 ```
 
-`-Dtls-resumption-test-filter` defaults to `"fuzz: "` (every #494 target,
-none of the much larger surrounding deterministic TLS suite); pass an
-exact `test "fuzz: ..."` name to scope a long `--fuzz=<N>` run to one
-target, matching the reproduction-command shape "Seed-corpus and
-regression update procedure" above requires. #494-A (this pass) covers
-`NewSessionTicket` wire/owned-state construction, the session client/
-server codec, PSK modes/`OfferedPsks`/binder primitives, and allocation-
-free ticket-envelope parsing (`parseEnvelope`); authenticated ticket open,
-key-snapshot/keyring publication, session-cache/lease state machines, and
-backend/runtime composition follow in #494-B/C/D per the issue's PR
-decomposition.
+`-Dtls-resumption-test-filter` defaults to `"fuzz: TLS resumption:"` (every
+#494 target, none of the much larger surrounding deterministic TLS suite
+or the unrelated pre-existing `sni_provider.zig`/`ticket_key_snapshot.zig`/
+`ticket_protection.zig` fuzz targets that also happen to start with
+`"fuzz: "`); pass an exact `test "fuzz: ..."` name to scope a long
+`--fuzz=<N>` run to one target, matching the reproduction-command shape
+"Seed-corpus and regression update procedure" above requires. #494-A (this
+pass) covers `NewSessionTicket` wire/owned-state construction, the session
+client/server codec, PSK modes/`OfferedPsks`/binder primitives, and
+allocation-free ticket-envelope parsing (`parseEnvelope`); authenticated
+ticket open, key-snapshot/keyring publication, session-cache/lease state
+machines, and backend/runtime composition follow in #494-B/C/D per the
+issue's PR decomposition.

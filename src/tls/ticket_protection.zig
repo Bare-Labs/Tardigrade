@@ -3198,6 +3198,29 @@ fn envelopeWithinBounds(outer: []const u8, inner: []const u8) bool {
     return inner_start >= outer_start and inner_end <= outer_end and inner_end >= inner_start;
 }
 
+test "parseEnvelope rejects every truncated prefix of a valid envelope below the minimum length" {
+    var identity: [fixed_header_len + 32 + tag_len]u8 = undefined;
+    writeHeader(identity[0..fixed_header_len], .aes_128_gcm, &keyId(9), &([_]u8{0x77} ** provider.aead_nonce_len));
+    const ciphertext_len = 32;
+    @memset(identity[fixed_header_len..][0..ciphertext_len], 0x22);
+    @memset(identity[fixed_header_len + ciphertext_len ..][0..tag_len], 0x33);
+    const full = identity[0 .. fixed_header_len + ciphertext_len + tag_len];
+
+    // Below the minimum (`fixed_header_len + 1 + tag_len`), `parseEnvelope`
+    // rejects on length alone before ever inspecting magic/version/AEAD
+    // content, so every one of these prefixes fails identically.
+    const minimum = fixed_header_len + 1 + tag_len;
+    var cut: usize = 0;
+    while (cut < minimum) : (cut += 1) {
+        try testing.expectError(error.MalformedEnvelope, parseEnvelope(full[0..cut], session.Limits.default));
+    }
+    // At and above the minimum, the full fixed header is always intact
+    // (`minimum > fixed_header_len`), so every remaining prefix parses.
+    while (cut <= full.len) : (cut += 1) {
+        _ = try parseEnvelope(full[0..cut], session.Limits.default);
+    }
+}
+
 fn fuzzEnvelopeLimits(control: u8) session.Limits {
     return switch (control % 6) {
         0 => .default,
@@ -3234,15 +3257,21 @@ pub fn fuzzParseEnvelope(smith: *std.testing.Smith) !void {
         try testing.expectEqual(@intFromPtr(parsed.header.ptr) + parsed.header.len, @intFromPtr(parsed.ciphertext.ptr));
         try testing.expectEqual(@intFromPtr(parsed.ciphertext.ptr) + parsed.ciphertext.len, @intFromPtr(parsed.tag.ptr));
         try testing.expectEqual(@intFromPtr(parsed.tag.ptr) + parsed.tag.len, @intFromPtr(identity.ptr) + identity.len);
+        // Every field of the two parses must agree, not just a subset:
+        // identical bytes/limits must produce a byte-for-byte identical
+        // `ParsedEnvelope`.
         try testing.expectEqual(parsed.aead, parsed2.aead);
         try testing.expectEqualSlices(u8, &parsed.key_id, &parsed2.key_id);
         try testing.expectEqualSlices(u8, &parsed.nonce, &parsed2.nonce);
+        try testing.expectEqualSlices(u8, parsed.header, parsed2.header);
+        try testing.expectEqualSlices(u8, parsed.ciphertext, parsed2.ciphertext);
+        try testing.expectEqualSlices(u8, parsed.tag, parsed2.tag);
     } else |err| {
         try testing.expectError(err, second);
     }
 }
 
-test "fuzz: parseEnvelope is allocation-free, deterministic, and returns an ordered non-overlapping view" {
+test "fuzz: TLS resumption: parseEnvelope is allocation-free, deterministic, and returns an ordered non-overlapping view" {
     try testing.fuzz({}, fuzzParseEnvelopeInput, .{ .corpus = &.{
         "",
         "TDTK",
@@ -3256,14 +3285,31 @@ fn fuzzParseEnvelopeInput(_: void, smith: *std.testing.Smith) !void {
     try fuzzParseEnvelope(smith);
 }
 
+fn expectEnvelopeGeometry(identity: []const u8, parsed: ParsedEnvelope) !void {
+    try testing.expect(envelopeWithinBounds(identity, parsed.header));
+    try testing.expect(envelopeWithinBounds(identity, parsed.ciphertext));
+    try testing.expect(envelopeWithinBounds(identity, parsed.tag));
+}
+
 /// Builds a control-derived *valid* envelope via `writeHeader`, confirms
 /// the baseline parses, then applies one Smith-selected single-field
-/// mutation (magic, version, AEAD id, reserved flags, key id, nonce,
-/// ciphertext, or tag) and a synthetic `Limits` sweep. Any post-mutation
-/// success must still satisfy the ordered/non-overlapping/within-bounds
-/// view contract; this never asserts a specific rejection, since some
-/// mutations (e.g. a still-valid AEAD id byte) do not actually break
-/// structural validity.
+/// mutation and asserts the exact typed outcome for that field class:
+///
+/// - magic/reserved-flags: the fixture always starts at the required
+///   value (`magic`/zero), so XOR-by-`0xff` on one byte deterministically
+///   breaks it -- always `error.MalformedEnvelope`.
+/// - version: the fixture always starts at `format_version`; `+%= 1`
+///   always produces a different, unsupported value -- always
+///   `error.UnsupportedVersion`.
+/// - AEAD id: guarantees an actual mutation first (a same-value
+///   reassignment would silently skip this branch), then asserts by
+///   class -- a still-valid stable id parses to a *different* AEAD than
+///   the baseline, an invalid one is `error.UnsupportedAeadId`.
+/// - key id/nonce/ciphertext/tag: opaque until authenticated open, so
+///   *any* mutation must still parse successfully with the ordered/
+///   non-overlapping/within-bounds view contract intact -- a future
+///   regression that starts rejecting or interpreting these bytes must
+///   fail this target, not silently pass via a blanket `catch {}`.
 pub fn fuzzParseEnvelopeMutation(smith: *std.testing.Smith) !void {
     var ciphertext_buf: [64]u8 = undefined;
     const ciphertext_len = 1 + smith.index(ciphertext_buf.len);
@@ -3289,21 +3335,51 @@ pub fn fuzzParseEnvelopeMutation(smith: *std.testing.Smith) !void {
     try testing.expectEqual(aead, baseline.aead);
 
     switch (smith.index(8)) {
-        0 => identity[smith.index(4)] ^= 0xff, // magic
-        1 => identity[4] +%= 1, // version
-        2 => identity[5] = @intCast(smith.index(256)), // AEAD id
-        3 => identity[6 + smith.index(2)] ^= 0xff, // reserved flags
-        4 => identity[8 + smith.index(key_id_len)] ^= 0xff, // key id
-        5 => identity[24 + smith.index(provider.aead_nonce_len)] ^= 0xff, // nonce
-        6 => identity[fixed_header_len + smith.index(ciphertext_len)] ^= 0xff, // ciphertext
-        else => identity[identity.len - 1 - smith.index(tag_len)] ^= 0xff, // tag
+        0 => {
+            identity[smith.index(4)] ^= 0xff; // magic
+            try testing.expectError(error.MalformedEnvelope, parseEnvelope(identity, session.Limits.default));
+        },
+        1 => {
+            identity[4] +%= 1; // version
+            try testing.expectError(error.UnsupportedVersion, parseEnvelope(identity, session.Limits.default));
+        },
+        2 => {
+            const original = identity[5];
+            var new_id = smith.index(256);
+            if (new_id == original) new_id = (new_id + 1) % 256;
+            identity[5] = @intCast(new_id); // AEAD id, guaranteed changed
+            if (decodeAeadId(@intCast(new_id))) |_| {
+                const mutated = try parseEnvelope(identity, session.Limits.default);
+                try testing.expect(mutated.aead != baseline.aead);
+            } else |_| {
+                try testing.expectError(error.UnsupportedAeadId, parseEnvelope(identity, session.Limits.default));
+            }
+        },
+        3 => {
+            identity[6 + smith.index(2)] ^= 0xff; // reserved flags
+            try testing.expectError(error.MalformedEnvelope, parseEnvelope(identity, session.Limits.default));
+        },
+        4 => {
+            identity[8 + smith.index(key_id_len)] ^= 0xff; // key id
+            const mutated = try parseEnvelope(identity, session.Limits.default);
+            try expectEnvelopeGeometry(identity, mutated);
+        },
+        5 => {
+            identity[24 + smith.index(provider.aead_nonce_len)] ^= 0xff; // nonce
+            const mutated = try parseEnvelope(identity, session.Limits.default);
+            try expectEnvelopeGeometry(identity, mutated);
+        },
+        6 => {
+            identity[fixed_header_len + smith.index(ciphertext_len)] ^= 0xff; // ciphertext
+            const mutated = try parseEnvelope(identity, session.Limits.default);
+            try expectEnvelopeGeometry(identity, mutated);
+        },
+        else => {
+            identity[identity.len - 1 - smith.index(tag_len)] ^= 0xff; // tag
+            const mutated = try parseEnvelope(identity, session.Limits.default);
+            try expectEnvelopeGeometry(identity, mutated);
+        },
     }
-
-    if (parseEnvelope(identity, session.Limits.default)) |mutated| {
-        try testing.expect(envelopeWithinBounds(identity, mutated.header));
-        try testing.expect(envelopeWithinBounds(identity, mutated.ciphertext));
-        try testing.expect(envelopeWithinBounds(identity, mutated.tag));
-    } else |_| {}
 
     var limits_control: [1]u8 = undefined;
     smith.bytes(&limits_control);
@@ -3311,7 +3387,7 @@ pub fn fuzzParseEnvelopeMutation(smith: *std.testing.Smith) !void {
     _ = parseEnvelope(identity, limits) catch {};
 }
 
-test "fuzz: parseEnvelope single-field mutation and Limits boundaries never panic" {
+test "fuzz: TLS resumption: parseEnvelope single-field mutation and Limits boundaries never panic" {
     try testing.fuzz({}, fuzzParseEnvelopeMutationInput, .{ .corpus = &.{
         "",
         &([_]u8{0} ** 16),

@@ -41,10 +41,15 @@ pub fn build(b: *std.Build) void {
     // module (tls_core_mod) is the *entire* pure-Zig TLS suite -- also run
     // unfiltered by `test-tls`/`test` -- not a dedicated fuzz-only root
     // file, so an unfiltered default here would just re-run the whole
-    // suite under a second name. Default to the "fuzz: " test-name prefix
-    // every #494 target above uses, scoping the step to just those targets;
-    // pass an explicit filter to select one target for a longer local run.
-    const tls_resumption_test_filter = b.option([]const u8, "tls-resumption-test-filter", "Filter tests run by the test-tls-resumption-fuzz step (default: \"fuzz: \", i.e. only the #494 session/PSK/ticket/resumption fuzz targets)") orelse "fuzz: ";
+    // suite under a second name. `tls_core_mod` also already contains
+    // unrelated pre-existing "fuzz: ..." tests (sni_provider.zig,
+    // ticket_key_snapshot.zig, ticket_protection.zig's own combined
+    // identity/resolve target), so a bare "fuzz: " prefix would silently
+    // pull those in too. Every #494-A target below is therefore named
+    // "fuzz: TLS resumption: ..." and this defaults to that exact
+    // namespace, scoping the step to only those targets; pass an explicit
+    // filter to select one target for a longer local run.
+    const tls_resumption_test_filter = b.option([]const u8, "tls-resumption-test-filter", "Filter tests run by the test-tls-resumption-fuzz step (default: \"fuzz: TLS resumption:\", i.e. only the #494 session/PSK/ticket/resumption fuzz targets)") orelse "fuzz: TLS resumption:";
     const tls_resumption_test_filters: []const []const u8 = &.{tls_resumption_test_filter};
     const tls_profile = b.option(
         TlsProfile,

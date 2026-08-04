@@ -1443,6 +1443,28 @@ pub fn fuzzPskWireAndOffer(smith: *std.testing.Smith) !void {
         }
     } else |_| {}
 
+    // `writeModes`: structurally valid (1..255 modes) and invalid (0 or
+    // 256+ modes) generated lists, with the same len+bytes transactional
+    // property as `writeOffer` below.
+    const mode_choices = [_]PskKeyExchangeMode{ .psk_ke, .psk_dhe_ke };
+    const requested_mode_count = smith.index(258);
+    var modes_buf: [257]PskKeyExchangeMode = undefined;
+    for (modes_buf[0..@min(requested_mode_count, modes_buf.len)]) |*m| {
+        m.* = mode_choices[smith.index(mode_choices.len)];
+    }
+    const modes = modes_buf[0..@min(requested_mode_count, modes_buf.len)];
+
+    var modes_write_buf: [1024]u8 = undefined;
+    @memset(&modes_write_buf, 0xa5);
+    const modes_before = modes_write_buf;
+    var modes_w = messages.Writer{ .buf = &modes_write_buf };
+    if (writeModes(&modes_w, modes)) |_| {
+        try std.testing.expect(modes.len >= 1 and modes.len <= 255);
+    } else |_| {
+        try std.testing.expectEqual(@as(usize, 0), modes_w.len);
+        try std.testing.expectEqualSlices(u8, &modes_before, &modes_write_buf);
+    }
+
     const item_count = smith.index(max_offered_identities + 2);
     var items_buf: [max_offered_identities + 1]OfferItem = undefined;
     var identity_storage: [max_offered_identities + 1][64]u8 = undefined;
@@ -1461,9 +1483,15 @@ pub fn fuzzPskWireAndOffer(smith: *std.testing.Smith) !void {
     const items = items_buf[0..item_count];
 
     var write_buf: [8192]u8 = undefined;
+    @memset(&write_buf, 0xa5);
+    const before = write_buf;
     var w = messages.Writer{ .buf = &write_buf };
     const offer = writeOffer(&w, items) catch {
+        // Rejection must be fully transactional: not just `w.len`
+        // unchanged, but every byte of the destination buffer too — a
+        // regression could write bytes and then reset the logical length.
         try std.testing.expectEqual(@as(usize, 0), w.len);
+        try std.testing.expectEqualSlices(u8, &before, &write_buf);
         return;
     };
     try std.testing.expectEqual(items.len, offer.count);
@@ -1481,7 +1509,7 @@ pub fn fuzzPskWireAndOffer(smith: *std.testing.Smith) !void {
     try std.testing.expectEqual(@as(?OfferedPsks.PairIterator.Pair, null), try offer_it.next());
 }
 
-test "fuzz: PSK wire codec — modes, OfferedPsks parse, and writeOffer round trip never panic or escape bounds" {
+test "fuzz: TLS resumption: PSK wire codec — modes, OfferedPsks parse, and writeOffer round trip never panic or escape bounds" {
     try testing.fuzz({}, fuzzPskWireAndOfferInput, .{ .corpus = &.{
         "",
         &[_]u8{0},
@@ -1497,6 +1525,22 @@ fn fuzzPskWireAndOfferInput(_: void, smith: *std.testing.Smith) !void {
     try fuzzPskWireAndOffer(smith);
 }
 
+/// One of `{base-1 (saturating), base, base+1}`, used to independently vary
+/// the PSK/transcript-hash/output/candidate lengths passed to
+/// `deriveBinderFromTranscriptHash`/`verifyBinderFromTranscriptHash` around
+/// the selected hash's digest length. `base+1` is always representable in
+/// the caller's `provider.max_digest_len + 1`-sized buffers, so this
+/// actually produces a one-over case for SHA-384 too (`digest_len ==
+/// provider.max_digest_len`, where `@min(base + 1, provider.max_digest_len)`
+/// would silently collapse back to a valid length).
+fn chooseLenAround(base: usize, smith: *std.testing.Smith) usize {
+    return switch (smith.index(3)) {
+        0 => base -| 1,
+        1 => base,
+        else => base + 1,
+    };
+}
+
 /// Drives `deriveBinderFromTranscriptHash`/`verifyBinderFromTranscriptHash`
 /// across both supported hashes with Smith-controlled lengths and one-bit
 /// mutations, plus `obfuscateTicketAge`/`deobfuscateTicketAge`/
@@ -1505,30 +1549,23 @@ pub fn fuzzPskBinderAndAge(smith: *std.testing.Smith) !void {
     const hash: provider.Hash = if (smith.index(2) == 0) .sha256 else .sha384;
     const digest_len = hash.digestLength();
 
-    var psk_buf: [provider.max_digest_len]u8 = undefined;
+    var psk_buf: [provider.max_digest_len + 1]u8 = undefined;
     smith.bytes(&psk_buf);
-    var transcript_buf: [provider.max_digest_len]u8 = undefined;
+    var transcript_buf: [provider.max_digest_len + 1]u8 = undefined;
     smith.bytes(&transcript_buf);
+    var out_buf: [provider.max_digest_len + 1]u8 = undefined;
 
-    const psk_len = switch (smith.index(3)) {
-        0 => digest_len,
-        1 => digest_len -| 1,
-        else => @min(digest_len + 1, psk_buf.len),
-    };
-    var out_buf: [provider.max_digest_len]u8 = undefined;
-    const out_len = switch (smith.index(3)) {
-        0 => digest_len,
-        1 => digest_len -| 1,
-        else => @min(digest_len + 1, out_buf.len),
-    };
+    const psk_len = chooseLenAround(digest_len, smith);
+    const transcript_len = chooseLenAround(digest_len, smith);
+    const out_len = chooseLenAround(digest_len, smith);
 
-    const derive_result = deriveBinderFromTranscriptHash(hash, psk_buf[0..psk_len], transcript_buf[0..digest_len], out_buf[0..out_len]);
-    if (psk_len != digest_len or out_len != digest_len) {
+    const derive_result = deriveBinderFromTranscriptHash(hash, psk_buf[0..psk_len], transcript_buf[0..transcript_len], out_buf[0..out_len]);
+    if (psk_len != digest_len or transcript_len != digest_len or out_len != digest_len) {
         try std.testing.expectError(error.InvalidSecretLength, derive_result);
     } else {
         try derive_result;
 
-        var out2: [provider.max_digest_len]u8 = undefined;
+        var out2: [provider.max_digest_len + 1]u8 = undefined;
         try deriveBinderFromTranscriptHash(hash, psk_buf[0..digest_len], transcript_buf[0..digest_len], out2[0..digest_len]);
         try std.testing.expectEqualSlices(u8, out_buf[0..digest_len], out2[0..digest_len]);
 
@@ -1569,7 +1606,7 @@ pub fn fuzzPskBinderAndAge(smith: *std.testing.Smith) !void {
     try std.testing.expectEqual(actual_age_ms, skew.actual_age_ms);
 }
 
-test "fuzz: PSK binder derivation/verification and ticket-age arithmetic are deterministic and bounded" {
+test "fuzz: TLS resumption: PSK binder derivation/verification and ticket-age arithmetic are deterministic and bounded" {
     try testing.fuzz({}, fuzzPskBinderAndAgeInput, .{ .corpus = &.{
         "",
         &([_]u8{0} ** 32),

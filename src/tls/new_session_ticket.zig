@@ -1009,14 +1009,20 @@ pub fn fuzzNewSessionTicket(allocator: std.mem.Allocator, smith: *std.testing.Sm
     // structural round trips and owned-state construction. Fields are
     // bounded by construction (buffer sizes / modulo) rather than
     // allowing arbitrary unbounded values, per the #376 contract.
+    // `ticket_buf` reaches exactly `session.Limits.default.max_ticket_len`
+    // so generated cases exercise the configured default boundary, not
+    // only small tickets; the absolute wire maximum
+    // (`absolute_ticket_wire_max`) is already deterministically covered
+    // by "server recoverable state honors caller ticket limits" above.
     const direction = smith.index(2);
     const suite = fuzz_cipher_suites[smith.index(fuzz_cipher_suites.len)];
+    const digest_len = algorithms.transcriptHash(suite).digestLength();
 
     var nonce_buf: [max_ticket_nonce_len]u8 = undefined;
     const nonce_len = smith.index(nonce_buf.len + 1);
     smith.bytes(nonce_buf[0..nonce_len]);
 
-    var ticket_buf: [1024]u8 = undefined;
+    var ticket_buf: [session.Limits.default.max_ticket_len]u8 = undefined;
     const ticket_len = 1 + smith.index(ticket_buf.len);
     smith.bytes(ticket_buf[0..ticket_len]);
 
@@ -1041,11 +1047,15 @@ pub fn fuzzNewSessionTicket(allocator: std.mem.Allocator, smith: *std.testing.Sm
         .max_early_data_size = max_early_data_size,
     };
 
-    var encode_buf: [2048]u8 = undefined;
+    // Comfortably above the worst-case encoded length for the generated
+    // shapes above (up to 4096-byte ticket + 255-byte nonce + extension +
+    // fixed fields), so a non-trivial `encode_cap` routinely succeeds
+    // instead of `OutputTooSmall` dominating every large-ticket case.
+    var encode_buf: [8192]u8 = undefined;
     const encode_cap = smith.index(encode_buf.len + 1);
     const scratch = encode_buf[0..encode_cap];
     @memset(scratch, 0xa5);
-    var before_buf: [2048]u8 = undefined;
+    var before_buf: [8192]u8 = undefined;
     @memcpy(before_buf[0..encode_cap], scratch);
 
     const encoded = encode(params, scratch) catch {
@@ -1054,6 +1064,7 @@ pub fn fuzzNewSessionTicket(allocator: std.mem.Allocator, smith: *std.testing.Sm
         try std.testing.expectEqualSlices(u8, before_buf[0..encode_cap], scratch);
         return;
     };
+    try std.testing.expectEqual(try encodedLen(params), encoded.len);
     const round = try decode(encoded);
     try std.testing.expectEqual(params.ticket_lifetime, round.ticket_lifetime);
     try std.testing.expectEqual(params.ticket_age_add, round.ticket_age_add);
@@ -1062,9 +1073,14 @@ pub fn fuzzNewSessionTicket(allocator: std.mem.Allocator, smith: *std.testing.Sm
     try std.testing.expectEqual(params.max_early_data_size, round.max_early_data_size);
 
     // 3. Owned-state construction from the round-tripped `Parsed` value,
-    // exercising both client and server construction directions.
+    // exercising both client and server construction directions. `rms` is
+    // sized to exactly the selected suite's transcript-hash digest length
+    // (`KeySchedule.resumptionPsk` requires an exact match); a fixed
+    // 48-byte slice would make both SHA-256 suites always fail with
+    // `InvalidSecretLength`, silently skipping owned-state construction
+    // for two of the three suites.
     var rms: [session.max_psk_len]u8 = undefined;
-    smith.bytes(&rms);
+    smith.bytes(rms[0..digest_len]);
     var limits_control: [1]u8 = undefined;
     smith.bytes(&limits_control);
     const limits = fuzzLimits(limits_control[0]);
@@ -1078,24 +1094,48 @@ pub fn fuzzNewSessionTicket(allocator: std.mem.Allocator, smith: *std.testing.Sm
     smith.bytes(&received_at_bytes);
     const received_at_unix_ms: i64 = @bitCast(std.mem.readInt(u64, &received_at_bytes, .big));
 
+    // Fresh per-case deterministic entropy/provider pair, on this call's
+    // own stack frame: the #376 contract forbids sharing one
+    // process-global entropy stream across cases (unlike
+    // `testCryptoProvider()` above, which this file's *deterministic*
+    // tests intentionally share).
+    const pure_zig = @import("crypto").pure_zig;
+    var fuzz_entropy = pure_zig.DeterministicEntropy.init(0x1cec_5);
+    var fuzz_provider = pure_zig.Provider.init(fuzz_entropy.entropy());
+    const crypto_provider = fuzz_provider.cryptoProvider();
+
     if (direction == 0) {
-        var maybe_state = buildClientTicketState(
+        const build_result = buildClientTicketState(
             allocator,
-            testCryptoProvider(),
+            crypto_provider,
             round,
             context,
-            &rms,
+            rms[0..digest_len],
             received_at_unix_ms,
             limits,
-        ) catch return;
-        if (maybe_state) |*state| {
-            defer state.deinit();
-            try std.testing.expectEqual(round.ticket.len, state.ticket.slice().len);
+        );
+        if (round.ticket_lifetime == 0) {
+            // `buildClientTicketState` returns `null` (not an error) for a
+            // zero lifetime, before the ticket-size check below ever runs.
+            try std.testing.expectEqual(@as(?session.ClientTicketState, null), try build_result);
+            return;
         }
+        if (round.ticket.len > limits.max_ticket_len) {
+            try std.testing.expectError(error.TicketTooLarge, build_result);
+            return;
+        }
+        var state = (try build_result).?;
+        defer state.deinit();
+        // The state must own its ticket/nonce bytes, not borrow `round`'s
+        // view into `scratch`: poison `scratch` after construction and
+        // confirm the state's content survives.
+        @memset(scratch, 0xee);
+        try std.testing.expectEqualSlices(u8, params.ticket, state.ticket.slice());
+        try std.testing.expectEqualSlices(u8, params.ticket_nonce, state.ticket_nonce.slice());
     } else {
-        var state = buildServerRecoverableStateNoIdentity(
+        const build_result = buildServerRecoverableStateNoIdentity(
             allocator,
-            testCryptoProvider(),
+            crypto_provider,
             .{
                 .ticket_lifetime = round.ticket_lifetime,
                 .ticket_age_add = round.ticket_age_add,
@@ -1103,15 +1143,24 @@ pub fn fuzzNewSessionTicket(allocator: std.mem.Allocator, smith: *std.testing.Sm
                 .max_early_data_size = round.max_early_data_size,
             },
             context,
-            &rms,
+            rms[0..digest_len],
             received_at_unix_ms,
             limits,
-        ) catch return;
+        );
+        if (round.ticket_lifetime == 0) {
+            // Unlike the client path, a zero lifetime is a hard error here
+            // (no opaque bearer identity yet to fall back to `null` for).
+            try std.testing.expectError(error.InvalidLifetime, build_result);
+            return;
+        }
+        var state = try build_result;
         defer state.deinit();
+        @memset(scratch, 0xee);
+        try std.testing.expectEqual(round.ticket_age_add, state.ticket_age_add);
     }
 }
 
-test "fuzz: NewSessionTicket wire decode and owned-state construction never panic or corrupt output" {
+test "fuzz: TLS resumption: NewSessionTicket wire decode and owned-state construction never panic or corrupt output" {
     try std.testing.fuzz({}, fuzzNewSessionTicketInput, .{ .corpus = &.{
         "",
         &[_]u8{ 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 'x', 0, 0 },

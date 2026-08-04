@@ -3577,19 +3577,38 @@ test "a failed CompatSnapshot.init replacement leaves the live destination compl
 // re-walk the deterministic matrix above.
 // -----------------------------------------------------------------------
 
+/// Explicit zero/one-under/exact/one-over/`0xffff` boundary matrix for
+/// every `Limits` field, including deliberately *invalid* values (zero
+/// `max_fields`/`max_ticket_len`/`max_serialized_len`, one-over every hard
+/// cap): `fuzzSessionRawDecode` below must see these, not silently drop
+/// them, to prove `decode` rejects an invalid caller `Limits` with
+/// `error.InvalidLimits`.
 fn fuzzSessionLimits(control: u8) Limits {
-    return switch (control % 6) {
+    return switch (control % 19) {
         0 => .default,
-        1 => .{ .max_fields = 1 },
-        2 => .{ .max_fields = hard_max_fields },
-        3 => .{ .max_serialized_len = header_len },
-        4 => .{ .max_serialized_len = hard_max_serialized_len },
+        1 => .{ .max_fields = 0 }, // invalid: zero
+        2 => .{ .max_fields = 1 }, // exact minimum
+        3 => .{ .max_fields = hard_max_fields - 1 }, // one-under maximum
+        4 => .{ .max_fields = hard_max_fields }, // exact maximum
+        5 => .{ .max_fields = hard_max_fields + 1 }, // invalid: one-over maximum
+        6 => .{ .max_ticket_len = 0 }, // invalid: zero
+        7 => .{ .max_ticket_len = 1 }, // exact minimum
+        8 => .{ .max_ticket_len = 0xfffe }, // one-under the 0xffff/absolute maximum
+        9 => .{ .max_ticket_len = 0xffff }, // exact maximum (absolute_ticket_wire_max == 0xffff)
+        10 => .{ .max_ticket_len = absolute_ticket_wire_max + 1 }, // invalid: one-over maximum
+        11 => .{ .max_serialized_len = 0 }, // invalid: zero
+        12 => .{ .max_serialized_len = header_len }, // near-minimum, still valid
+        13 => .{ .max_serialized_len = hard_max_serialized_len - 1 }, // one-under maximum
+        14 => .{ .max_serialized_len = hard_max_serialized_len }, // exact maximum
+        15 => .{ .max_serialized_len = hard_max_serialized_len + 1 }, // invalid: one-over maximum
+        16 => .{ .max_transport_compat_len = hard_max_compat_len + 1 }, // invalid: one-over maximum
+        17 => .{ .max_application_compat_len = hard_max_compat_len + 1 }, // invalid: one-over maximum
         else => .{
-            .max_fields = 1 + @as(usize, control) % hard_max_fields,
-            .max_ticket_len = 1 + (@as(usize, control) * 37) % absolute_ticket_wire_max,
-            .max_transport_compat_len = (@as(usize, control) * 13) % (hard_max_compat_len + 1),
-            .max_application_compat_len = (@as(usize, control) * 41) % (hard_max_compat_len + 1),
-            .max_serialized_len = 64 + (@as(usize, control) * 91) % hard_max_serialized_len,
+            .max_fields = 1 + @as(usize, control) % (hard_max_fields + 2),
+            .max_ticket_len = 1 + (@as(usize, control) * 37) % (absolute_ticket_wire_max + 2),
+            .max_transport_compat_len = (@as(usize, control) * 13) % (hard_max_compat_len + 2),
+            .max_application_compat_len = (@as(usize, control) * 41) % (hard_max_compat_len + 2),
+            .max_serialized_len = 1 + (@as(usize, control) * 91) % (hard_max_serialized_len + 2),
         },
     };
 }
@@ -3633,18 +3652,27 @@ pub fn fuzzSessionRawDecode(allocator: std.mem.Allocator, smith: *std.testing.Sm
     var limits_control: [1]u8 = undefined;
     smith.bytes(&limits_control);
     const limits = fuzzSessionLimits(limits_control[0]);
-    limits.validate() catch return;
 
     var raw_buf: [8192]u8 = undefined;
     const raw_len = smith.slice(&raw_buf);
     const raw = raw_buf[0..raw_len];
 
-    var decoded = decode(allocator, limits, raw) catch return;
-    defer decoded.deinit();
-    try expectDecodedOwnership(raw, &decoded);
+    // `limits` may itself be invalid (see `fuzzSessionLimits`): `decode`
+    // must see it, not have it filtered out beforehand, so this proves
+    // the #494 requirement that an invalid caller `Limits` fails
+    // deterministically with `error.InvalidLimits` rather than becoming a
+    // silent no-op fuzz input.
+    const result = decode(allocator, limits, raw);
+    if (limits.validate()) |_| {
+        var decoded = result catch return;
+        defer decoded.deinit();
+        try expectDecodedOwnership(raw, &decoded);
+    } else |_| {
+        try testing.expectError(error.InvalidLimits, result);
+    }
 }
 
-test "fuzz: session codec raw decode never panics and owns its decoded state" {
+test "fuzz: TLS resumption: session codec raw decode never panics and owns its decoded state" {
     try testing.fuzz({}, fuzzSessionRawDecodeInput, .{ .corpus = &.{
         "",
         &magic,
@@ -3665,6 +3693,24 @@ const fuzz_session_cipher_suites = [_]algorithms.CipherSuite{
     .tls_aes_256_gcm_sha384,
     .tls_chacha20_poly1305_sha256,
 };
+
+/// Maps an arbitrary `u32` into the non-zero `u32` domain
+/// `EarlyDataPolicy.early_data_capable` requires, without `1 +
+/// std.math.maxInt(u32)` overflowing/trapping when `raw ==
+/// 0xffffffff` (safety-build panic; the fuzz harness itself would then
+/// violate the target's own no-panic property).
+fn earlyDataCapableFromRaw(raw: u32) u32 {
+    return (raw % std.math.maxInt(u32)) + 1;
+}
+
+test "fuzz: TLS resumption: earlyDataCapableFromRaw never overflows at the u32 boundary" {
+    // Regression for a fix to fuzzSessionCommon's early-data generation:
+    // `1 + raw` previously trapped when `raw == 0xffffffff`.
+    try testing.expectEqual(@as(u32, 1), earlyDataCapableFromRaw(std.math.maxInt(u32)));
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), earlyDataCapableFromRaw(std.math.maxInt(u32) - 1));
+    try testing.expectEqual(@as(u32, 1), earlyDataCapableFromRaw(0));
+    try testing.expectEqual(@as(u32, 2), earlyDataCapableFromRaw(1));
+}
 
 /// Builds a control-derived valid `ResumableSessionCommon`: presence/
 /// content of optional fields is fuzzed, but `server_name` is a fixed
@@ -3693,7 +3739,7 @@ fn fuzzSessionCommon(allocator: std.mem.Allocator, smith: *std.testing.Smith, su
     var early_max_bytes: [4]u8 = undefined;
     smith.bytes(&early_max_bytes);
     const early_data: EarlyDataPolicy = if (smith.index(2) == 1)
-        .{ .early_data_capable = 1 + std.mem.readInt(u32, &early_max_bytes, .big) }
+        .{ .early_data_capable = earlyDataCapableFromRaw(std.mem.readInt(u32, &early_max_bytes, .big)) }
     else
         .resume_only;
 
@@ -3720,14 +3766,38 @@ fn fuzzSessionCommon(allocator: std.mem.Allocator, smith: *std.testing.Smith, su
     return common;
 }
 
+/// Asserts `evaluateCompatibility` reports the record itself as eligible
+/// when the candidate context exactly matches every field `common` holds:
+/// proves `evaluateCompatibility` is actually driven by this target
+/// (#494-A acceptance gap) rather than only being available at compile
+/// time.
+fn expectSelfCompatible(common: *const ResumableSessionCommon) !void {
+    const candidate: CandidateContext = .{
+        .cipher_suite = common.cipher_suite,
+        .server_name = if (common.server_name) |*s| s.slice() else null,
+        .application_protocol = if (common.application_protocol) |*a| a.slice() else null,
+        .auth_binding = common.auth_binding,
+        .transport_compat = if (common.transport_compat) |*snap| .{ .format_id = snap.format_id, .format_version = snap.format_version, .bytes = snap.slice() } else null,
+        .application_compat = if (common.application_compat) |*snap| .{ .format_id = snap.format_id, .format_version = snap.format_version, .bytes = snap.slice() } else null,
+    };
+    const decision = evaluateCompatibility(common, candidate, common.issued_at_unix_ms);
+    try testing.expect(decision.resumption == .eligible);
+}
+
 /// Builds a generated, control-derived valid client or server record,
-/// encodes it, decodes the encoding, and asserts the round trip is
-/// canonical and preserves record kind; also flips the header's record-
-/// kind byte on the valid encoding and asserts decode never accepts a
-/// client-shaped record as a server record or vice versa (a client record
-/// always carries the client-only mandatory `ticket` field, which the
-/// server decoder treats as an unknown *critical* field, and a server
-/// record is always missing the client-only mandatory fields).
+/// encodes it, decodes the encoding, and asserts the round trip is fully
+/// canonical: `clientEncodedLenWithLimits`/`serverEncodedLenWithLimits`
+/// matches the actual encoded length, and re-encoding the *decoded*
+/// record reproduces the original encoding byte-for-byte — proving every
+/// field (PSK, SNI, ALPN, auth binding, timestamps, early-data policy,
+/// every compatibility snapshot), not just the handful spot-checked
+/// individually, survives the round trip. Also drives
+/// `evaluateCompatibility` against a matching candidate, and flips the
+/// header's record-kind byte on the valid encoding to assert decode never
+/// accepts a client-shaped record as a server record or vice versa (a
+/// client record always carries the client-only mandatory `ticket` field,
+/// which the server decoder treats as an unknown *critical* field, and a
+/// server record is always missing the client-only mandatory fields).
 pub fn fuzzSessionRoundTrip(allocator: std.mem.Allocator, smith: *std.testing.Smith) !void {
     const suite = fuzz_session_cipher_suites[smith.index(fuzz_session_cipher_suites.len)];
     const as_client = smith.index(2) == 0;
@@ -3764,13 +3834,17 @@ pub fn fuzzSessionRoundTrip(allocator: std.mem.Allocator, smith: *std.testing.Sm
         defer state.deinit();
 
         const encoded = encodeClient(&state, Limits.default, encode_buf[0..encode_cap]) catch return;
+        const needed = try clientEncodedLenWithLimits(&state, Limits.default);
+        try testing.expectEqual(needed, encoded.len);
+
         var decoded = try decode(allocator, Limits.default, encoded);
         defer decoded.deinit();
         try testing.expect(decoded == .client);
-        try testing.expectEqualSlices(u8, state.ticket.slice(), decoded.client.ticket.slice());
-        try testing.expectEqualSlices(u8, state.ticket_nonce.slice(), decoded.client.ticket_nonce.slice());
-        try testing.expectEqual(state.common.cipher_suite, decoded.client.common.cipher_suite);
-        try testing.expectEqual(state.common.lifetime_seconds, decoded.client.common.lifetime_seconds);
+
+        var canonical_buf: [4096]u8 = undefined;
+        const canonical = try encodeClient(&decoded.client, Limits.default, &canonical_buf);
+        try testing.expectEqualSlices(u8, encoded, canonical);
+        try expectSelfCompatible(&decoded.client.common);
 
         try expectCrossKindRejected(allocator, encoded);
     } else {
@@ -3782,11 +3856,17 @@ pub fn fuzzSessionRoundTrip(allocator: std.mem.Allocator, smith: *std.testing.Sm
         defer state.deinit();
 
         const encoded = encodeServer(&state, Limits.default, encode_buf[0..encode_cap]) catch return;
+        const needed = try serverEncodedLenWithLimits(&state, Limits.default);
+        try testing.expectEqual(needed, encoded.len);
+
         var decoded = try decode(allocator, Limits.default, encoded);
         defer decoded.deinit();
         try testing.expect(decoded == .server);
-        try testing.expectEqual(state.common.cipher_suite, decoded.server.common.cipher_suite);
-        try testing.expectEqual(state.ticket_age_add, decoded.server.ticket_age_add);
+
+        var canonical_buf: [4096]u8 = undefined;
+        const canonical = try encodeServer(&decoded.server, Limits.default, &canonical_buf);
+        try testing.expectEqualSlices(u8, encoded, canonical);
+        try expectSelfCompatible(&decoded.server.common);
 
         try expectCrossKindRejected(allocator, encoded);
     }
@@ -3806,7 +3886,7 @@ fn expectCrossKindRejected(allocator: std.mem.Allocator, encoded: []const u8) !v
     } else |_| {}
 }
 
-test "fuzz: session codec generated client/server records round-trip and reject cross-kind decode" {
+test "fuzz: TLS resumption: session codec generated client/server records round-trip and reject cross-kind decode" {
     try testing.fuzz({}, fuzzSessionRoundTripInput, .{ .corpus = &.{
         "",
         &([_]u8{0} ** 64),
