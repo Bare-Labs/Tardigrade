@@ -4374,8 +4374,161 @@ fn fuzzServerState(allocator: std.mem.Allocator, id: u64) !session.ServerRecover
     return makeServer(allocator, sni);
 }
 
+fn fuzzServerStateWithCompat(allocator: std.mem.Allocator, id: u64) !session.ServerRecoverableState {
+    var sni_buf: [32]u8 = undefined;
+    const sni = try std.fmt.bufPrint(&sni_buf, "sc{d}.example.test", .{id % fuzz_cache_limits.max_origins});
+    var params = commonParams(&([_]u8{0xcd} ** 32), sni);
+    params.transport_compat = .{ .format_id = 7, .format_version = 1, .bytes = "clone-alloc-compat" };
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(allocator, session.Limits.default, params);
+    var state: session.ServerRecoverableState = .{};
+    state.init(&common, 7);
+    return state;
+}
+
+const ClientLeaseTransition = struct {
+    len: usize = 0,
+    present: [pre_shared_key.max_offered_identities]bool = [_]bool{false} ** pre_shared_key.max_offered_identities,
+    entry_ids: [pre_shared_key.max_offered_identities]u64 = [_]u64{0} ** pre_shared_key.max_offered_identities,
+    single_use: [pre_shared_key.max_offered_identities]bool = [_]bool{false} ** pre_shared_key.max_offered_identities,
+    fingerprints: [pre_shared_key.max_offered_identities][32]u8 = undefined,
+};
+
+fn captureClientLeaseTransition(cache: *ClientSessionCache, lease: *pre_shared_key.ClientOfferLease) !ClientLeaseTransition {
+    var out: ClientLeaseTransition = .{ .len = lease.offers.len };
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+    for (0..lease.offers.len) |i| {
+        const token = lease.tokens[i];
+        out.entry_ids[i] = token.entry_id;
+        out.single_use[i] = token.single_use;
+        const idx = cache.findIndexByEntryId(token.entry_id) orelse {
+            try testing.expect(!token.single_use);
+            continue;
+        };
+        const entry = cache.entries.items[idx];
+        out.present[i] = true;
+        if (token.single_use) {
+            try testing.expectEqual(token.lease_epoch, entry.active_lease_epoch.?);
+        }
+        out.fingerprints[i] = try fingerprintClientTicket(&entry.ticket);
+    }
+    return out;
+}
+
+fn expectClientEntryState(cache: *ClientSessionCache, entry_id: u64, expected_fp: [32]u8, should_exist: bool, should_be_pinned: bool) !void {
+    const idx = cache.findIndexByEntryId(entry_id);
+    if (!should_exist) {
+        try testing.expect(idx == null);
+        return;
+    }
+    const entry = cache.entries.items[idx orelse return error.ClientLeaseTransitionEntryMissing];
+    try testing.expectEqualDeep(expected_fp, try fingerprintClientTicket(&entry.ticket));
+    try testing.expectEqual(should_be_pinned, entry.active_lease_epoch != null);
+}
+
+fn expectClientLeaseTransition(cache: *ClientSessionCache, before: ClientLeaseTransition, outcome: pre_shared_key.ClientOfferOutcome) !void {
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+    const selected_index: ?usize = switch (outcome) {
+        .selected => |idx| if (idx < before.len) idx else null,
+        .not_selected, .aborted => null,
+    };
+    for (0..before.len) |i| {
+        if (!before.present[i]) {
+            try testing.expect(cache.findIndexByEntryId(before.entry_ids[i]) == null);
+            continue;
+        }
+        const consumed = selected_index != null and selected_index.? == i and before.single_use[i];
+        try expectClientEntryState(cache, before.entry_ids[i], before.fingerprints[i], !consumed, false);
+    }
+}
+
+fn expectClientDropOfferTransition(cache: *ClientSessionCache, before: ClientLeaseTransition, dropped_index: usize) !void {
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+    for (0..before.len) |i| {
+        if (!before.present[i]) {
+            try testing.expect(cache.findIndexByEntryId(before.entry_ids[i]) == null);
+            continue;
+        }
+        try expectClientEntryState(cache, before.entry_ids[i], before.fingerprints[i], true, before.single_use[i] and i != dropped_index);
+    }
+}
+
+const ServerLeaseTransition = struct {
+    present: bool,
+    entry_id: u64,
+    single_use: bool,
+    lru_sequence: u64,
+    state_fingerprint: [32]u8,
+};
+
+fn captureServerLeaseTransition(cache: *StatefulServerCache, lease: *const ServerLease) !ServerLeaseTransition {
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+    const entry = cache.entries.get(lease.entry_id) orelse {
+        try testing.expect(!lease.single_use);
+        return .{
+            .present = false,
+            .entry_id = lease.entry_id,
+            .single_use = lease.single_use,
+            .lru_sequence = 0,
+            .state_fingerprint = [_]u8{0} ** 32,
+        };
+    };
+    try testing.expectEqual(lease.single_use, entry.usage == .single_use);
+    if (lease.single_use) try testing.expectEqual(lease.lease_epoch, entry.active_lease_epoch.?);
+    return .{
+        .present = true,
+        .entry_id = lease.entry_id,
+        .single_use = lease.single_use,
+        .lru_sequence = entry.lru_sequence,
+        .state_fingerprint = try fingerprintServerState(&entry.state),
+    };
+}
+
+fn captureServerHandleTransition(cache: *StatefulServerCache, handle: *const [stateful_identity_len]u8) !ServerLeaseTransition {
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+    const entry_id = cache.handle_index.get(digestHandle(handle)) orelse return error.ServerHandleTransitionMissingEntry;
+    const entry = cache.entries.get(entry_id) orelse return error.ServerHandleTransitionMissingEntry;
+    return .{
+        .present = true,
+        .entry_id = entry_id,
+        .single_use = entry.usage == .single_use,
+        .lru_sequence = entry.lru_sequence,
+        .state_fingerprint = try fingerprintServerState(&entry.state),
+    };
+}
+
+fn expectServerLeaseTransition(cache: *StatefulServerCache, before: ServerLeaseTransition, action: enum { commit, release }) !void {
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+    if (!before.present) {
+        try testing.expect(cache.entries.get(before.entry_id) == null);
+        return;
+    }
+    const entry = cache.entries.get(before.entry_id);
+    if (action == .commit and before.single_use) {
+        try testing.expect(entry == null);
+        return;
+    }
+    const live = entry orelse return error.ServerLeaseTransitionEntryMissing;
+    try testing.expectEqualDeep(before.state_fingerprint, try fingerprintServerState(&live.state));
+    try testing.expectEqual(@as(?u64, null), live.active_lease_epoch);
+    if (action == .commit and !before.single_use) {
+        try testing.expect(live.lru_sequence != before.lru_sequence);
+    } else {
+        try testing.expectEqual(before.lru_sequence, live.lru_sequence);
+    }
+}
+
 fn finishAllClientLeases(leases: *[fuzz_max_live_client_leases]ClientLookupResult) void {
-    for (leases) |*lease| lease.deinit();
+    for (leases) |*lease| {
+        lease.deinit();
+        lease.* = .miss;
+    }
 }
 
 fn firstClientLeaseSlot(leases: *[fuzz_max_live_client_leases]ClientLookupResult) ?usize {
@@ -4413,13 +4566,13 @@ fn clientStoreOomSweep() !void {
             defer after.deinit();
             try before.expectEqual(&after);
         } else {
-            try testing.expect(result == .stored or result == .replaced);
+            try testing.expectEqual(StoreResult.stored, result);
             saw_success = true;
             break;
         }
     }
-    std.mem.doNotOptimizeAway(saw_success);
-    std.mem.doNotOptimizeAway(saw_failure);
+    try testing.expect(saw_failure);
+    try testing.expect(saw_success);
 }
 
 fn clientLookupOomSweep() !void {
@@ -4450,13 +4603,13 @@ fn clientLookupOomSweep() !void {
             defer after.deinit();
             try before.expectEqual(&after);
         } else {
-            try testing.expect(result == .hit or result == .miss);
+            try testing.expect(result == .hit);
             saw_success = true;
             break;
         }
     }
-    std.mem.doNotOptimizeAway(saw_success);
-    std.mem.doNotOptimizeAway(saw_failure);
+    try testing.expect(saw_failure);
+    try testing.expect(saw_success);
 }
 
 fn clientPersistenceOomSweep() !void {
@@ -4495,8 +4648,8 @@ fn clientPersistenceOomSweep() !void {
             try before.expectEqual(&after);
         }
     }
-    std.mem.doNotOptimizeAway(saw_success);
-    std.mem.doNotOptimizeAway(saw_failure);
+    try testing.expect(saw_failure);
+    try testing.expect(saw_success);
 }
 
 fn runClientFuzzCase(smith: *std.testing.Smith) !void {
@@ -4547,27 +4700,40 @@ fn runClientFuzzCase(smith: *std.testing.Smith) !void {
             .finish_selected => for (&leases) |*lease| {
                 if (lease.* == .hit) {
                     const selected = if (lease.hit.offers.len == 0) 0 else smith.index(lease.hit.offers.len + 1);
-                    lease.hit.finish(.{ .selected = selected });
+                    const outcome: pre_shared_key.ClientOfferOutcome = .{ .selected = selected };
+                    const before = try captureClientLeaseTransition(&cache, &lease.hit);
+                    lease.hit.finish(outcome);
                     lease.deinit();
+                    lease.* = .miss;
+                    try expectClientLeaseTransition(&cache, before, outcome);
                     break;
                 }
             },
             .drop_offer => for (&leases) |*lease| {
                 if (lease.* == .hit and lease.hit.offers.len > 0) {
-                    lease.hit.dropOffer(smith.index(lease.hit.offers.len));
+                    const dropped = smith.index(lease.hit.offers.len);
+                    const before = try captureClientLeaseTransition(&cache, &lease.hit);
+                    lease.hit.dropOffer(dropped);
+                    try expectClientDropOfferTransition(&cache, before, dropped);
                     break;
                 }
             },
             .finish_not_selected => for (&leases) |*lease| {
                 if (lease.* == .hit) {
+                    const before = try captureClientLeaseTransition(&cache, &lease.hit);
                     lease.hit.finish(.not_selected);
                     lease.deinit();
+                    lease.* = .miss;
+                    try expectClientLeaseTransition(&cache, before, .not_selected);
                     break;
                 }
             },
             .abort_or_deinit => for (&leases) |*lease| {
                 if (lease.* == .hit) {
+                    const before = try captureClientLeaseTransition(&cache, &lease.hit);
                     lease.deinit();
+                    lease.* = .miss;
+                    try expectClientLeaseTransition(&cache, before, .aborted);
                     break;
                 }
             },
@@ -4656,7 +4822,10 @@ fn serverHandleWithByte(byte: u8) [stateful_identity_len]u8 {
 }
 
 fn finishAllServerLeases(leases: *[fuzz_max_live_server_leases]ResolveLeaseResult) void {
-    for (leases) |*lease| lease.deinit();
+    for (leases) |*lease| {
+        lease.deinit();
+        lease.* = .miss;
+    }
 }
 
 fn firstServerLeaseSlot(leases: *[fuzz_max_live_server_leases]ResolveLeaseResult) ?usize {
@@ -4695,16 +4864,17 @@ fn serverInsertOomSweep() !void {
             defer after.deinit();
             try before.expectEqual(&after);
         } else {
-            try testing.expect(result == .stored or result == .rejected_capacity);
+            try testing.expectEqual(StoreResult.stored, result);
             saw_success = true;
             break;
         }
     }
-    std.mem.doNotOptimizeAway(saw_success);
-    std.mem.doNotOptimizeAway(saw_failure);
+    try testing.expect(saw_failure);
+    try testing.expect(saw_success);
 }
 
 fn serverResolveOomSweep() !void {
+    var saw_failure = false;
     var saw_success = false;
     for (0..fuzz_max_oom_fail_index + 1) |fail_index| {
         var backing: [1 << 18]u8 = undefined;
@@ -4712,7 +4882,7 @@ fn serverResolveOomSweep() !void {
         var fixed = FixedRandom{ .pattern_for_call = &.{ 9, 10, 11 } };
         var cache = try StatefulServerCache.init(fba.allocator(), fuzz_cache_limits, fixed.source());
         defer cache.deinit();
-        var state = try fuzzServerState(fba.allocator(), 0);
+        var state = try fuzzServerStateWithCompat(fba.allocator(), 0);
         var handle: [stateful_identity_len]u8 = undefined;
         try testing.expectEqual(StoreResult.stored, cache.insertMove(&state, 0, .single_use, &handle));
         var before = try ServerCacheState.capture(&cache);
@@ -4725,6 +4895,7 @@ fn serverResolveOomSweep() !void {
         defer result.deinit();
 
         if (result == .storage_failed) {
+            saw_failure = true;
             var after = try ServerCacheState.capture(&cache);
             defer after.deinit();
             try before.expectEqual(&after);
@@ -4734,7 +4905,8 @@ fn serverResolveOomSweep() !void {
             break;
         }
     }
-    std.mem.doNotOptimizeAway(saw_success);
+    try testing.expect(saw_failure);
+    try testing.expect(saw_success);
 }
 
 fn serverPersistenceOomSweep() !void {
@@ -4776,8 +4948,8 @@ fn serverPersistenceOomSweep() !void {
             error.DuplicateHandle => return error.TestUnexpectedResult,
         }
     }
-    std.mem.doNotOptimizeAway(saw_success);
-    std.mem.doNotOptimizeAway(saw_failure);
+    try testing.expect(saw_failure);
+    try testing.expect(saw_success);
 }
 
 fn publicLeaseBoxOomReleasesPin() !void {
@@ -4794,6 +4966,36 @@ fn publicLeaseBoxOomReleasesPin() !void {
     var retry = try resolveStatefulServerPsk(&cache, testing.allocator, &handle, 1);
     defer retry.deinit();
     try testing.expect(retry == .hit);
+}
+
+fn controlledServerCollisionProgram(expect_retry_success: bool) !void {
+    var random = FixedRandom{ .pattern_for_call = if (expect_retry_success) &.{ 0x44, 0x44, 0x45 } else &.{ 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44 } };
+    var cache = try StatefulServerCache.init(testing.allocator, fuzz_cache_limits, random.source());
+    defer cache.deinit();
+
+    var a = try fuzzServerState(testing.allocator, 44);
+    var ha: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&a, 0, .reusable, &ha));
+
+    var b = try fuzzServerState(testing.allocator, 45);
+    defer b.deinit();
+    const b_fingerprint = try fingerprintServerState(&b);
+    var hb: [stateful_identity_len]u8 = [_]u8{0xEE} ** stateful_identity_len;
+    var before = try ServerCacheState.capture(&cache);
+    defer before.deinit();
+
+    const result = cache.insertMove(&b, 1, .reusable, &hb);
+    if (expect_retry_success) {
+        try testing.expectEqual(StoreResult.stored, result);
+        try testing.expect(!std.mem.eql(u8, &ha, &hb));
+    } else {
+        try testing.expectEqual(StoreResult.rejected_handle_generation_failed, result);
+        try testing.expectEqualSlices(u8, &([_]u8{0xEE} ** stateful_identity_len), &hb);
+        var after = try ServerCacheState.capture(&cache);
+        defer after.deinit();
+        try before.expectEqual(&after);
+        try testing.expectEqualDeep(b_fingerprint, try fingerprintServerState(&b));
+    }
 }
 
 fn runServerFuzzCase(smith: *std.testing.Smith) !void {
@@ -4860,36 +5062,72 @@ fn runServerFuzzCase(smith: *std.testing.Smith) !void {
                 defer result.deinit();
             },
             .resolve_through_public_adapter => if (handle_count > 0) {
-                var result = try resolveStatefulServerPsk(&cache, testing.allocator, &handles[smith.index(handle_count)], now_ms);
+                const handle = &handles[smith.index(handle_count)];
+                var result = try resolveStatefulServerPsk(&cache, testing.allocator, handle, now_ms);
                 if (result == .hit) {
-                    if (result.hit.on_selected) |hook| hook.complete();
+                    const before = try captureServerHandleTransition(&cache, handle);
+                    const box_before = test_public_server_lease_box_destroy_count;
+                    switch (smith.index(3)) {
+                        0 => {
+                            if (result.hit.on_selected) |hook| hook.complete();
+                            result.hit.lease.commit();
+                            result.deinit();
+                            try expectServerLeaseTransition(&cache, before, .commit);
+                        },
+                        1 => {
+                            result.hit.lease.release();
+                            result.deinit();
+                            try expectServerLeaseTransition(&cache, before, .release);
+                        },
+                        else => {
+                            result.deinit();
+                            try expectServerLeaseTransition(&cache, before, .release);
+                        },
+                    }
+                    const expected_box_delta: u64 = if (before.single_use) 1 else 0;
+                    try testing.expectEqual(box_before + expected_box_delta, test_public_server_lease_box_destroy_count);
+                } else {
+                    result.deinit();
                 }
-                result.deinit();
             },
             .commit_lease => for (&leases) |*lease| {
                 if (lease.* == .hit) {
+                    const before = try captureServerLeaseTransition(&cache, &lease.hit.lease);
                     lease.hit.lease.commit();
                     lease.deinit();
+                    lease.* = .miss;
+                    try expectServerLeaseTransition(&cache, before, .commit);
                     break;
                 }
             },
             .release_lease => for (&leases) |*lease| {
                 if (lease.* == .hit) {
+                    const before = try captureServerLeaseTransition(&cache, &lease.hit.lease);
                     lease.hit.lease.release();
                     lease.deinit();
+                    lease.* = .miss;
+                    try expectServerLeaseTransition(&cache, before, .release);
                     break;
                 }
             },
             .deinit_lease => for (&leases) |*lease| {
                 if (lease.* == .hit) {
+                    const before = try captureServerLeaseTransition(&cache, &lease.hit.lease);
                     lease.deinit();
+                    lease.* = .miss;
+                    try expectServerLeaseTransition(&cache, before, .release);
                     break;
                 }
             },
             .complete_reusable_selection_hook => if (handle_count > 0) {
-                var result = try resolveStatefulServerPsk(&cache, testing.allocator, &handles[smith.index(handle_count)], now_ms);
+                const handle = &handles[smith.index(handle_count)];
+                var result = try resolveStatefulServerPsk(&cache, testing.allocator, handle, now_ms);
                 if (result == .hit) {
-                    if (result.hit.on_selected) |hook| hook.complete();
+                    if (result.hit.on_selected) |hook| {
+                        const before = try captureServerHandleTransition(&cache, handle);
+                        hook.complete();
+                        try expectServerLeaseTransition(&cache, before, .commit);
+                    }
                 }
                 result.deinit();
             },
@@ -4953,24 +5191,7 @@ fn runServerFuzzCase(smith: *std.testing.Smith) !void {
                 cache.random = old;
             },
             .handle_collision_then_success, .handle_collision_exhaustion => {
-                var collision_random = FixedRandom{ .pattern_for_call = if (op == .handle_collision_then_success) &.{ 0x44, 0x44, 0x45 } else &.{ 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44 } };
-                cache.random = collision_random.source();
-                var a = try fuzzServerState(testing.allocator, 44);
-                var ha: [stateful_identity_len]u8 = undefined;
-                _ = cache.insertMove(&a, now_ms, .reusable, &ha);
-                a.deinit();
-                var b = try fuzzServerState(testing.allocator, 45);
-                defer b.deinit();
-                var hb: [stateful_identity_len]u8 = [_]u8{0xEE} ** stateful_identity_len;
-                const result = cache.insertMove(&b, now_ms, .reusable, &hb);
-                if (op == .handle_collision_then_success) {
-                    if (!(result == .stored or result == .rejected_handle_generation_failed or result == .rejected_capacity or result == .storage_failed))
-                        return error.ServerFuzzUnexpectedCollisionRetryResult;
-                } else {
-                    if (!(result == .stored or result == .rejected_handle_generation_failed or result == .rejected_capacity or result == .storage_failed))
-                        return error.ServerFuzzUnexpectedCollisionExhaustionResult;
-                }
-                cache.random = fixed.source();
+                try controlledServerCollisionProgram(op == .handle_collision_then_success);
             },
             .force_lru_renumber => {
                 cache.mutex.lock();

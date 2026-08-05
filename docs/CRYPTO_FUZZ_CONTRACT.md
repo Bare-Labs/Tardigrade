@@ -415,15 +415,8 @@ free on every path -- exercised across all three required AEADs, each fuzz
 case constructing its own fresh `pure_zig.DeterministicEntropy`-backed
 provider rather than sharing static state. The rejection matrix includes
 public envelope-field mutation, authenticated plaintext mutation, key state,
-and lifetime edges. #494-C adds two independent bounded operation-sequence
-targets in `session_cache.zig`: client cache store/lookup/lease/persistence
-state and stateful-server insert/resolve/public-adapter/persistence state.
-Both targets use tiny fixed cache limits, at most 16 opcodes per case,
-deterministic logical clocks, explicit Smith corpus programs, full
-fingerprint snapshots for transactional comparisons, per-op invariant
-checks, bounded operation-scoped `FailingAllocator` sweeps, and test-only
-zeroization/destruction probes for entries and public lease boxes.
-several classes that require successfully authenticating first:
+and lifetime edges, plus several classes that require successfully
+authenticating first:
 `not_yet_valid`/`expired` (forged timestamps); an authenticated state
 extended with an unknown *optional* field, which must still accept and
 round-trip (proving forward compatibility, not just rejection); a
@@ -487,5 +480,14 @@ in the opcode loop, without a redundant assertion. The existing
 `ticket_key_snapshot.zig` persistent-JSON-snapshot fuzz target is unrelated
 (on-disk snapshot file parsing, not the in-memory keyring) and is preserved
 as-is, per the issue's "existing coverage to preserve, not recreate" list.
-Session-cache/lease state machines and backend/runtime composition follow
-in #494-C/D per the issue's PR decomposition.
+#494-C adds two independent bounded operation-sequence targets in
+`session_cache.zig`: client cache store/lookup/lease/persistence state and
+stateful-server insert/resolve/public-adapter/persistence state. Both
+targets use tiny fixed cache limits, at most 16 opcodes per case,
+deterministic logical clocks, explicit Smith corpus programs, full
+fingerprint snapshots for transactional comparisons, transition-specific
+lease oracles, per-op invariant checks, bounded operation-scoped
+`FailingAllocator` sweeps, controlled collision programs, and test-only
+zeroization/destruction probes for entries and public lease boxes.
+Backend/runtime composition follows in #494-D per the issue's PR
+decomposition.
