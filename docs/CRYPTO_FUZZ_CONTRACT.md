@@ -357,9 +357,10 @@ have to go hunting through `build.zig`.
 Unlike this file's own targets, #494's targets are inline `test "fuzz:
 ..."` blocks inside the production modules themselves
 (`src/tls/new_session_ticket.zig`, `src/tls/session.zig`,
-`src/tls/pre_shared_key.zig`, `src/tls/ticket_protection.zig`) — not a
-separate `tests/*.zig` root — so they already replay their deterministic
-seed corpus under plain `zig build test-tls` / `zig build test`. The
+`src/tls/pre_shared_key.zig`, `src/tls/ticket_protection.zig`,
+`src/tls/session_cache.zig`) — not a separate `tests/*.zig` root — so they
+already replay their deterministic seed corpus under plain
+`zig build test-tls` / `zig build test`. The
 `test-tls-resumption-fuzz` step exists to give them a stable,
 individually filterable/long-runnable name, the same shape as
 `-Dcrypto-test-filter` above:
@@ -387,11 +388,14 @@ zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-
 zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: parseEnvelope single-field mutation" --fuzz=10M --summary all --error-style verbose
 zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: Protector.resolve authenticates" --fuzz=10M --summary all --error-style verbose
 zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: ticket keyring install/validate/acquire/retain/release/seal sequence" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: client session cache operation sequence preserves transactional state, ownership, eviction, and lease semantics" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Doptimize=ReleaseFast -Dtls-resumption-test-filter="fuzz: TLS resumption: stateful server cache operation sequence preserves transactional indexes, ownership, handle, and lease semantics" --fuzz=10M --summary all --error-style verbose
 
 # Named deterministic regressions (not fuzz-tagged, so outside the
 # default "fuzz: TLS resumption:" namespace — filter on their own name):
 zig build test-tls-resumption-fuzz -Dtls-resumption-test-filter="parseEnvelope rejects every truncated prefix of a valid envelope below the minimum length" --summary all --error-style verbose
 zig build test-tls-resumption-fuzz -Dtls-resumption-test-filter="earlyDataCapableFromRaw never overflows at the u32 boundary" --summary all --error-style verbose
+zig build test-tls-resumption-fuzz -Dtls-resumption-test-filter="resolveStatefulServerPsk lease-box OOM releases an acquired single-use pin and permits retry" --summary all --error-style verbose
 ```
 
 `-Dtls-resumption-test-filter` defaults to `"fuzz: TLS resumption:"` (every
@@ -410,7 +414,9 @@ allocation-failure sweep over every reachable allocation point, all under
 free on every path -- exercised across all three required AEADs, each fuzz
 case constructing its own fresh `pure_zig.DeterministicEntropy`-backed
 provider rather than sharing static state. The rejection matrix includes
-several classes that require successfully authenticating first:
+public envelope-field mutation, authenticated plaintext mutation, key state,
+and lifetime edges, plus several classes that require successfully
+authenticating first:
 `not_yet_valid`/`expired` (forged timestamps); an authenticated state
 extended with an unknown *optional* field, which must still accept and
 round-trip (proving forward compatibility, not just rejection); a
@@ -474,5 +480,14 @@ in the opcode loop, without a redundant assertion. The existing
 `ticket_key_snapshot.zig` persistent-JSON-snapshot fuzz target is unrelated
 (on-disk snapshot file parsing, not the in-memory keyring) and is preserved
 as-is, per the issue's "existing coverage to preserve, not recreate" list.
-Session-cache/lease state machines and backend/runtime composition follow
-in #494-C/D per the issue's PR decomposition.
+#494-C adds two independent bounded operation-sequence targets in
+`session_cache.zig`: client cache store/lookup/lease/persistence state and
+stateful-server insert/resolve/public-adapter/persistence state. Both
+targets use tiny fixed cache limits, at most 16 opcodes per case,
+deterministic logical clocks, explicit Smith corpus programs, full
+fingerprint snapshots for transactional comparisons, transition-specific
+lease oracles, per-op invariant checks, bounded operation-scoped
+`FailingAllocator` sweeps, controlled collision programs, and test-only
+zeroization/destruction probes for entries and public lease boxes.
+Backend/runtime composition follows in #494-D per the issue's PR
+decomposition.
