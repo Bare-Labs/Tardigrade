@@ -3779,7 +3779,7 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
     protector.observer = observer.observer();
 
     var zero_alloc = ZeroCheckingAllocator.init(allocator);
-    switch (smith.index(11)) {
+    switch (smith.index(13)) {
         0 => {
             try expectRoundTrip(&protector, zero_alloc.allocator(), &state, valid_envelope, resolve_now_unix_ms);
             try observer.expectOnly(.resolve_succeeded);
@@ -3995,7 +3995,7 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
                 try observer.expectOnly(.{ .resolve_rejected = .not_yet_valid });
             }
         },
-        else => switch (smith.index(5)) {
+        10 => switch (smith.index(5)) {
             0 => {
                 // Exact `isExpired` boundary for `lifetime_seconds = 1`
                 // (1000ms): `age == 999` must accept.
@@ -4073,6 +4073,54 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
                 try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), envelope, resolve_now_unix_ms);
                 try observer.expectOnly(.{ .resolve_rejected = .invalid_plaintext });
             },
+        },
+        11 => {
+            // A local provider fault distinct from a peer-controlled
+            // authentication failure: `aeadOpen` itself reports the active
+            // key's AEAD as unsupported. This must escape `resolve()`
+            // as-is (not normalize to a miss) and be attributed as
+            // `.unsupported_capability`, proving the resolver's
+            // peer-vs-local error split covers `aeadOpen`, not just
+            // allocation and `Limits`.
+            var faulting = FaultingAeadProvider{ .inner = fresh_provider, .fault = .open_unsupported_capability };
+            var faulting_protector = protector;
+            faulting_protector.provider = faulting.cryptoProvider();
+
+            var out = try sentinelServerState(allocator);
+            defer out.deinit();
+            var expected: session.ServerRecoverableState = .{};
+            try out.cloneInto(allocator, &expected);
+            defer expected.deinit();
+
+            try testing.expectError(
+                error.UnsupportedCapability,
+                faulting_protector.resolve(zero_alloc.allocator(), valid_envelope, resolve_now_unix_ms, &out),
+            );
+            try expectServerStateEqual(&expected, &out);
+            try observer.expectOnly(.{ .resolve_rejected = .unsupported_capability });
+        },
+        else => {
+            // The companion local-fault case: `aeadOpen` reports a
+            // configuration/input error, which must normalize to
+            // `error.InvalidInternalState` (not silently become a peer
+            // miss), leave `out` untouched, and attribute
+            // `.invalid_internal_state`.
+            var faulting = FaultingAeadProvider{ .inner = fresh_provider, .fault = .open_invalid_input };
+            var faulting_protector = protector;
+            faulting_protector.provider = faulting.cryptoProvider();
+
+            var out = try sentinelServerState(allocator);
+            defer out.deinit();
+            var expected: session.ServerRecoverableState = .{};
+            try out.cloneInto(allocator, &expected);
+            defer expected.deinit();
+
+            try testing.expectError(
+                error.InvalidInternalState,
+                faulting_protector.resolve(zero_alloc.allocator(), valid_envelope, resolve_now_unix_ms, &out),
+            );
+            try expectServerStateEqual(&expected, &out);
+            try observer.expectOnly(.{ .resolve_rejected = .invalid_internal_state });
         },
     }
 
@@ -4175,7 +4223,7 @@ fn smithCorpusWords(comptime words: []const u64) [words.len * 8]u8 {
 
 // Word[0] selects the AEAD (0/1/2 = AES-128-GCM/AES-256-GCM/ChaCha20-
 // Poly1305); word[1] selects the top-level scenario (`switch
-// (smith.index(11))` in `fuzzProtectorResolve`); the trailing word on every
+// (smith.index(13))` in `fuzzProtectorResolve`); the trailing word on every
 // entry is always the post-switch `protector.limits` probe selector
 // (`switch (smith.index(5))`, kept at its default/no-change value here so
 // each seed forces exactly the scenario it names). Words in between are
@@ -4197,13 +4245,19 @@ const resolve_sha384_pair = smithCorpusWords(&.{ 0, 8, 0 });
 // `at_boundary == true` (issued_at == now) / `false` (== now + 1).
 const resolve_issued_exact = smithCorpusWords(&.{ 0, 9, 0, 0 });
 const resolve_issued_plus_one = smithCorpusWords(&.{ 0, 9, 1, 0 });
-// The lifetime/expiry matrix (`else` branch, i.e. any value >= 10 in range)
-// selects among its own five cases via one more word.
+// The lifetime/expiry matrix (case 10) selects among its own five cases via
+// one more word.
 const resolve_expiry_999 = smithCorpusWords(&.{ 0, 10, 0, 0 });
 const resolve_expiry_1000 = smithCorpusWords(&.{ 0, 10, 1, 0 });
 const resolve_lifetime_max = smithCorpusWords(&.{ 0, 10, 2, 0 });
 const resolve_lifetime_zero = smithCorpusWords(&.{ 0, 10, 3, 0 });
 const resolve_lifetime_over = smithCorpusWords(&.{ 0, 10, 4, 0 });
+
+// Local provider faults (cases 11/12), distinct from every peer-controlled
+// rejection above: `aeadOpen` itself reports `UnsupportedCapability` /
+// `InvalidInput`, which must escape `resolve()` untranslated into a miss.
+const resolve_provider_unsupported = smithCorpusWords(&.{ 0, 11, 0 });
+const resolve_provider_invalid_input = smithCorpusWords(&.{ 0, 12, 0 });
 
 // Envelope authentication regions (scenario 5's own `region` selection:
 // 0 = nonce, already covered by `resolve_tampered_nonce` above; 1 =
@@ -4279,6 +4333,8 @@ test "fuzz: TLS resumption: Protector.resolve authenticates, rejects, and never 
             &resolve_psk_max_digest,
             &resolve_unknown_suite,
             &resolve_suite_psk_mismatch,
+            &resolve_provider_unsupported,
+            &resolve_provider_invalid_input,
             &resolve_ticket_limit_exact,
             &resolve_ticket_limit_one_under,
             &resolve_state_limit_exact,
@@ -4291,59 +4347,75 @@ fn fuzzProtectorResolveInput(_: void, smith: *testing.Smith) !void {
     try fuzzProtectorResolve(testing.allocator, smith);
 }
 
-/// Wraps a real `CryptoProvider` but always fails `aeadSeal`, so
-/// `fuzzKeyringOperationSequence`'s "seal" opcode can drive the
-/// post-nonce-reservation failure contract: `NonceLease.reserve()` commits
-/// the nonce *before* `Protector.sealInner` calls `aeadSeal`, so a local
-/// provider fault after that point must still leave the nonce consumed
-/// (never reused or rolled back), even though the ticket itself is never
-/// produced. Every other operation delegates unchanged to the wrapped
-/// provider so this stays a true "one operation faults" injection rather
-/// than a stub.
-const FaultingSealProvider = struct {
+/// Which single AEAD operation `FaultingAeadProvider` injects a fault into,
+/// and how: `seal_invalid_input` drives `fuzzKeyringOperationSequence`'s
+/// "seal" opcode's post-nonce-reservation failure contract (see below), and
+/// the two `open_*` variants drive `fuzzProtectorResolve`'s local-fault
+/// scenarios (#494-B requires proving `error.UnsupportedCapability` and
+/// `error.InvalidInput` from `aeadOpen` are distinct, non-normalized-to-miss
+/// operational errors, not folded into the peer-controlled
+/// `authentication_failed` path every tampered-ciphertext case above already
+/// covers).
+const AeadFault = enum {
+    seal_invalid_input,
+    open_unsupported_capability,
+    open_invalid_input,
+};
+
+/// Wraps a real `CryptoProvider` but injects exactly one `AeadFault` into
+/// the corresponding AEAD operation; every other operation (including the
+/// *other* AEAD direction -- `aeadSeal` under an `open_*` fault, `aeadOpen`
+/// under `seal_invalid_input`) delegates unchanged to the wrapped provider,
+/// so this stays a true "one operation faults" injection rather than a stub.
+/// `seal_invalid_input` in particular backs `fuzzKeyringOperationSequence`'s
+/// "seal" opcode's post-nonce-reservation failure contract:
+/// `NonceLease.reserve()` commits the nonce *before* `Protector.sealInner`
+/// calls `aeadSeal`, so a local provider fault after that point must still
+/// leave the nonce consumed (never reused or rolled back), even though the
+/// ticket itself is never produced.
+const FaultingAeadProvider = struct {
     inner: provider.CryptoProvider,
+    fault: AeadFault,
 
     fn capabilities(ctx: *anyopaque) provider.Capabilities {
-        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        const self: *FaultingAeadProvider = @ptrCast(@alignCast(ctx));
         return self.inner.capabilities();
     }
     fn hkdfExtract(ctx: *anyopaque, hash: provider.Hash, salt: []const u8, ikm: []const u8, out: []u8) provider.HkdfError!void {
-        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        const self: *FaultingAeadProvider = @ptrCast(@alignCast(ctx));
         return self.inner.vtable.hkdfExtract(self.inner.context, hash, salt, ikm, out);
     }
     fn hkdfExpandLabel(ctx: *anyopaque, hash: provider.Hash, secret: []const u8, label: []const u8, hash_context: []const u8, out: []u8) provider.HkdfError!void {
-        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        const self: *FaultingAeadProvider = @ptrCast(@alignCast(ctx));
         return self.inner.vtable.hkdfExpandLabel(self.inner.context, hash, secret, label, hash_context, out);
     }
     fn aeadSeal(ctx: *anyopaque, aead: provider.Aead, key: []const u8, nonce: []const u8, associated_data: []const u8, plaintext: []const u8, ciphertext: []u8, tag: []u8) provider.SealError!void {
-        _ = ctx;
-        _ = aead;
-        _ = key;
-        _ = nonce;
-        _ = associated_data;
-        _ = plaintext;
-        _ = ciphertext;
-        _ = tag;
-        return error.InvalidInput;
+        const self: *FaultingAeadProvider = @ptrCast(@alignCast(ctx));
+        if (self.fault == .seal_invalid_input) return error.InvalidInput;
+        return self.inner.vtable.aeadSeal(self.inner.context, aead, key, nonce, associated_data, plaintext, ciphertext, tag);
     }
     fn aeadOpen(ctx: *anyopaque, aead: provider.Aead, key: []const u8, nonce: []const u8, associated_data: []const u8, ciphertext: []const u8, tag: []const u8, plaintext: []u8) provider.OpenError!void {
-        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
-        return self.inner.vtable.aeadOpen(self.inner.context, aead, key, nonce, associated_data, ciphertext, tag, plaintext);
+        const self: *FaultingAeadProvider = @ptrCast(@alignCast(ctx));
+        return switch (self.fault) {
+            .seal_invalid_input => self.inner.vtable.aeadOpen(self.inner.context, aead, key, nonce, associated_data, ciphertext, tag, plaintext),
+            .open_unsupported_capability => error.UnsupportedCapability,
+            .open_invalid_input => error.InvalidInput,
+        };
     }
     fn quicHeaderProtectionMask(ctx: *anyopaque, hp: provider.QuicHeaderProtection, key: []const u8, sample: []const u8, mask: []u8) provider.QuicHeaderProtectionError!void {
-        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        const self: *FaultingAeadProvider = @ptrCast(@alignCast(ctx));
         return self.inner.vtable.quicHeaderProtectionMask(self.inner.context, hp, key, sample, mask);
     }
     fn generateKeyShare(ctx: *anyopaque, group: provider.Group, public_out: []u8, private_out: []u8) provider.KeyShareError!void {
-        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        const self: *FaultingAeadProvider = @ptrCast(@alignCast(ctx));
         return self.inner.vtable.generateKeyShare(self.inner.context, group, public_out, private_out);
     }
     fn deriveSharedSecret(ctx: *anyopaque, group: provider.Group, private_scalar: []const u8, peer_public: []const u8, out: []u8) provider.DeriveError!void {
-        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        const self: *FaultingAeadProvider = @ptrCast(@alignCast(ctx));
         return self.inner.vtable.deriveSharedSecret(self.inner.context, group, private_scalar, peer_public, out);
     }
     fn verify(ctx: *anyopaque, scheme: provider.SignatureScheme, public_key: []const u8, message: []const u8, signature: []const u8) provider.VerifyError!void {
-        const self: *FaultingSealProvider = @ptrCast(@alignCast(ctx));
+        const self: *FaultingAeadProvider = @ptrCast(@alignCast(ctx));
         return self.inner.vtable.verify(self.inner.context, scheme, public_key, message, signature);
     }
 
@@ -4359,7 +4431,7 @@ const FaultingSealProvider = struct {
         .verify = verify,
     };
 
-    fn cryptoProvider(self: *FaultingSealProvider) provider.CryptoProvider {
+    fn cryptoProvider(self: *FaultingAeadProvider) provider.CryptoProvider {
         return .{ .context = self, .vtable = &vtable, .entropy = self.inner.entropy };
     }
 };
@@ -4657,7 +4729,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                     // (`seal` never writes to the ledger on any path). A
                     // fresh per-case fault-injecting provider, not the
                     // shared static `testProvider()`, drives this.
-                    var faulting = FaultingSealProvider{ .inner = seal_provider };
+                    var faulting = FaultingAeadProvider{ .inner = seal_provider, .fault = .seal_invalid_input };
                     var faulting_protector = Protector{ .provider = faulting.cryptoProvider(), .keyring = &keyring, .limits = session.Limits.default };
                     var ticket_buf: [512]u8 = undefined;
                     try testing.expectError(error.InvalidInternalState, faulting_protector.seal(allocator, &state, seal_now_unix_ms, &ticket_buf));
