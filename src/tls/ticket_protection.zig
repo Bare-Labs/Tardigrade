@@ -3708,7 +3708,21 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
 
             var mutated_buf: [2048 + 256]u8 = undefined;
             var mutated: []u8 = undefined;
-            switch (smith.index(11)) {
+            // The declaration-only-truncation case is deliberately gated by
+            // its own small, independent choice rather than folded in as
+            // one value of a large N-way switch: a low-cardinality gate is
+            // both easier for a coverage-guided fuzzer to reach quickly and
+            // easier to force with a short, checked-in deterministic
+            // corpus entry (see the seed list below) than hoping a single
+            // wide `smith.index` call happens to land on one specific high
+            // value among many.
+            if (smith.index(4) == 0) {
+                // declared length far exceeds the bytes actually provided -- a truncation, not a 64 KiB allocation
+                const field_id = duplicate_or_missing_ids[smith.index(duplicate_or_missing_ids.len)];
+                var without_field_buf: [2048 + 256]u8 = undefined;
+                const without_field_len = session.fixtureWithFieldRemoved(plaintext, field_id, &without_field_buf);
+                mutated = mutated_buf[0..appendTruncatedTlvHeader(without_field_buf[0..without_field_len], field_id, 0xffff, &mutated_buf)];
+            } else switch (smith.index(11)) {
                 0 => {
                     mutated = mutated_buf[0..plaintext.len];
                     @memcpy(mutated, plaintext);
@@ -3747,7 +3761,7 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
                         1 => 0,
                         else => original_len + 1,
                     };
-                    mutated = mutated_buf[0..session.withTlvLengthOverride(plaintext, field_id, new_length, &mutated_buf)];
+                    mutated = mutated_buf[0..try session.withTlvLengthOverride(plaintext, field_id, new_length, &mutated_buf)];
                 },
                 7 => { // unknown *critical* field (high bit clear) -- always `error.UnknownCriticalField`
                     mutated = mutated_buf[0..appendTlv(plaintext, 0x00ff, "unrecognized-critical-data", &mutated_buf)];
@@ -3760,24 +3774,18 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
                         2 => original_len + 1,
                         else => provider.max_digest_len,
                     };
-                    mutated = mutated_buf[0..session.withTlvLengthOverride(plaintext, session.field_resumption_psk, new_length, &mutated_buf)];
+                    mutated = mutated_buf[0..try session.withTlvLengthOverride(plaintext, session.field_resumption_psk, new_length, &mutated_buf)];
                 },
                 9 => { // unknown (unassigned) cipher-suite wire value -- always `error.InvalidCipherSuite`
                     mutated = mutated_buf[0..withCipherSuiteValue(plaintext, 0x9999, &mutated_buf)];
                 },
-                10 => { // a *supported* suite id whose transcript-hash length disagrees with the
+                else => { // a *supported* suite id whose transcript-hash length disagrees with the
                     // unchanged, authenticated PSK bytes that follow it -- `state`'s own SHA-256
                     // suite paired with the SHA-384 suite id -- always `error.InvalidPskLength`.
                     // The reverse pairing (SHA-256 suite against a wrong-length PSK) is exercised
                     // by the PSK length boundary case above; scenario 8 in the outer switch proves
                     // the *accepted* SHA-384-suite/48-byte-PSK pairing this contrasts against.
                     mutated = mutated_buf[0..withCipherSuiteValue(plaintext, 0x1302, &mutated_buf)];
-                },
-                else => { // declared length far exceeds the bytes actually provided -- a truncation, not a 64 KiB allocation
-                    const field_id = duplicate_or_missing_ids[smith.index(duplicate_or_missing_ids.len)];
-                    var without_field_buf: [2048 + 256]u8 = undefined;
-                    const without_field_len = session.fixtureWithFieldRemoved(plaintext, field_id, &without_field_buf);
-                    mutated = mutated_buf[0..appendTruncatedTlvHeader(without_field_buf[0..without_field_len], field_id, 0xffff, &mutated_buf)];
                 },
             }
 
@@ -3927,14 +3935,35 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
 }
 
 test "fuzz: TLS resumption: Protector.resolve authenticates, rejects, and never leaks plaintext under key-state and envelope mutation" {
-    try testing.fuzz({}, fuzzProtectorResolveInput, .{ .corpus = &.{
-        "",
-        &[_]u8{0},
-        &[_]u8{1},
-        &[_]u8{2},
-        &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8 },
-        &([_]u8{0xff} ** 9),
-    } });
+    try testing.fuzz({}, fuzzProtectorResolveInput, .{
+        .corpus = &.{
+            "",
+            &[_]u8{0},
+            &[_]u8{1},
+            &[_]u8{2},
+            &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8 },
+            &([_]u8{0xff} ** 9),
+            // Deterministically forces the declaration-only-truncation arm of
+            // case 6's mutation matrix (`if (smith.index(4) == 0)`), rather
+            // than relying on a coverage-guided run to stumble onto it. Hand-
+            // derived from `std.testing.Smith`'s corpus-replay contract
+            // (`valueWeightedWithHashInner` in Zig 0.16's `Smith.zig`): each
+            // `index(n)` call under replay reads the *next* 8 bytes of the
+            // corpus entry as a little-endian `u64` and uses it verbatim if it
+            // already falls in `[0, n)` (defaulting to 0 once the bytes run
+            // out or fall outside that range), so this is four consecutive
+            // 8-byte little-endian words -- `1` (any valid AEAD index), `6`
+            // (the case-6 scenario, i.e. `invalid_plaintext`'s authenticated
+            // mutation matrix), `0` (the truncation gate), `0` (any valid
+            // field-id index) -- not an opaque fuzzer-minimized blob.
+            &[_]u8{
+                1, 0, 0, 0, 0, 0, 0, 0,
+                6, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0,
+            },
+        },
+    });
 }
 
 fn fuzzProtectorResolveInput(_: void, smith: *testing.Smith) !void {
@@ -4062,6 +4091,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     var held_deinit_count = std.atomic.Value(usize).init(0);
     var held_fixture: KeyState = undefined;
     var held_key_fingerprint: KeyFingerprint = undefined;
+    var tracked_generation: u64 = undefined;
     var held_outlived_current = false;
     // Set once, on the *first* successful acquire, and never reset --
     // unlike `held`, which opcode 4 sets back to `null` the moment the
@@ -4071,8 +4101,20 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     // assertion below on `held != null` at teardown would miss exactly
     // that case; this flag means "a snapshot was instrumented and its
     // eventual wipe still needs proving," independent of whether a modeled
-    // owner happens to still be outstanding right now.
+    // owner happens to still be outstanding right now. Also makes opcode 2
+    // a one-shot acquire (see below), so `held_deinit_count`/
+    // `held_key_fingerprint` are only ever wired to a single snapshot for
+    // the whole program -- never repointed at a second one mid-run, which
+    // would silently erase whatever the first snapshot's final release had
+    // or had not yet proven.
     var tracked_snapshot = false;
+    // Set at the exact operation that observes the tracked snapshot's true
+    // final reference drop (opcode 4 releasing while already outlived, or
+    // the install-replacement bracket below), so the teardown code neither
+    // re-checks an already-verified release nor mis-attributes a *later*,
+    // untracked snapshot's key-wipe delta to the one this program
+    // instrumented.
+    var tracked_finalized = false;
     // A bounded program can terminate mid-sequence with modeled owners
     // still outstanding (e.g. install -> acquire -> retain -> end) or with
     // the held snapshot still `keyring.current` (never replaced), so
@@ -4155,6 +4197,17 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                     .nonce_lease = .{ .prefix = .{ 0xc1, 0, 0, 0 }, .start = start, .end_exclusive = end },
                 };
                 const before = captureKeyringState(&keyring);
+                // If the tracked snapshot is currently unheld (no modeled
+                // owner) and still `keyring.current`, this install -- if it
+                // succeeds -- performs its true final release (a fresh
+                // `Snapshot.build` always produces a new pointer/generation,
+                // so a successful install always replaces `before.current`).
+                // Bracket the key-wipe delta around exactly that operation
+                // rather than leaving it for teardown to (mis)attribute
+                // later, once other installs may have moved on further.
+                const watching = tracked_snapshot and !tracked_finalized and held == null and
+                    before.current != null and before.current_generation == tracked_generation;
+                const wipes_before = if (watching) key_probe.observed else 0;
                 const snapshot = keyring.buildSnapshot(&.{config}, testCapabilities()) catch continue;
                 keyring.install(snapshot) catch {
                     try expectKeyringStateEqual(before, &keyring);
@@ -4162,6 +4215,11 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                 };
                 try testing.expect(keyring.current.?.generation > last_generation);
                 last_generation = keyring.current.?.generation;
+                if (watching) {
+                    try testing.expectEqual(@as(usize, 1), held_deinit_count.load(.monotonic));
+                    try testing.expectEqual(@as(usize, 1), key_probe.observed - wipes_before);
+                    tracked_finalized = true;
+                }
             },
             1 => { // dry-run validate must never mutate published state
                 const config = sampleKeyConfigWithByte(keyId(0xc2), .aes_256_gcm, null, 0x22);
@@ -4171,8 +4229,14 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                 keyring.validateInstallCandidate(candidate) catch {};
                 try expectKeyringStateEqual(before, &keyring);
             },
-            2 => { // acquire current, hold across subsequent ops
-                if (held == null) {
+            2 => { // acquire current, hold across subsequent ops -- at most once per program
+                // Instrumenting a *second* snapshot would repoint
+                // `snap.deinit_count`/re-seed `held_key_fingerprint` at the
+                // new one, silently erasing whatever the first snapshot's
+                // final release had (or had not yet) proven; `!tracked_snapshot`
+                // (never reset, unlike `held`) makes this a one-shot
+                // acquire per program instead.
+                if (!tracked_snapshot) {
                     if (keyring.acquireCurrent()) |snap| {
                         held_deinit_count = std.atomic.Value(usize).init(0);
                         snap.deinit_count = &held_deinit_count;
@@ -4189,6 +4253,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                             .lease = leaseStateFromKey(&snap.keys[0]),
                         };
                         held_key_fingerprint = fingerprintKey(snap.keys[0].aead, snap.keys[0].key.slice());
+                        tracked_generation = snap.generation;
                     }
                 }
             },
@@ -4217,6 +4282,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                         // key) and never more than one (a double free/wipe).
                         if (held_outlived_current) {
                             try testing.expectEqual(@as(usize, 1), key_probe.observed - key_wipes_before);
+                            tracked_finalized = true;
                         } else {
                             try testing.expectEqual(key_wipes_before, key_probe.observed);
                         }
@@ -4338,24 +4404,32 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     // failure via `testing.expectEqual` rather than a `std.debug.assert`
     // (which lowers through `unreachable` and so is not a reliable runtime
     // check under `-Doptimize=ReleaseFast`), that it deinitialized exactly
-    // once: never zero (a leak) and never more than one (a double free).
-    // `tracked_snapshot` -- true from the first successful acquire, never
-    // reset -- covers this even when opcode 4 already dropped the last
-    // modeled reference earlier in the loop while the snapshot was still
-    // `keyring.current` (that inline release correctly observed
-    // `deinit_count == 0` and set `held = null`, since the snapshot was
-    // not actually freed yet; its true final release happens right here,
-    // inside `keyring.deinit()`, so gating this assertion on `held != null`
-    // at this point would silently skip verifying it).
+    // once (`Snapshot.deinit` fired) *and* wiped its key exactly once (the
+    // `key_probe` delta): never zero (a leak) and never more than one (a
+    // double free/wipe). `tracked_snapshot and !tracked_finalized` -- the
+    // latter set at whichever single operation (opcode 4's inline release,
+    // or the install-replacement bracket above) already observed and
+    // verified the tracked snapshot's true final reference drop -- covers
+    // the remaining case: it is still `keyring.current` with no further
+    // install ever having replaced it, so this `keyring.deinit()` call is
+    // the one that finally performs (and here verifies) that release. When
+    // `tracked_finalized` is already true, the earlier bracket already
+    // proved the wipe, so this deliberately does not re-check: a *later*,
+    // untracked snapshot may be whatever `keyring.deinit()` frees here, and
+    // attributing its key-wipe delta to the original tracked snapshot would
+    // be a false attribution, not a real verification.
     if (held) |snap| {
         while (held_refs != 0) {
             held_refs -= 1;
             snap.release();
         }
     }
+    const watching = tracked_snapshot and !tracked_finalized;
+    const wipes_before = if (watching) key_probe.observed else 0;
     keyring.deinit();
-    if (tracked_snapshot) {
+    if (watching) {
         try testing.expectEqual(@as(usize, 1), held_deinit_count.load(.monotonic));
+        try testing.expectEqual(@as(usize, 1), key_probe.observed - wipes_before);
     }
     secrets.secureZero(&held_key_fingerprint);
     TestKeyDeinitProbeStorage.probe = null;

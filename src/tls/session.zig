@@ -3181,11 +3181,18 @@ test "decode rejects both literal fixtures truncated at every byte boundary" {
 
 /// Rebuilds `fixture` with the TLV whose field id is `field_id` given a new
 /// declared length (`new_length`), copying as much of its original value as
-/// fits and leaving any excess unspecified. Every other TLV is copied
-/// unchanged. `out` must have at least `fixture.len + 8` bytes of room.
-/// Exposed for #494-B's authenticated-plaintext mutation matrix; see
-/// `header_len`'s doc comment.
-pub fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16, out: []u8) usize {
+/// fits and zero-filling any excess (for deterministic reproduction; see
+/// the comment on the zero-fill below). Every other TLV is copied
+/// unchanged. `out` must have at least `fixture.len - old_len + new_length`
+/// bytes of room, where `old_len` is the field's original length (checked
+/// against `out.len` below, rather than merely documented, since this is a
+/// `pub` helper a caller can rely on without inspecting the
+/// implementation). Exposed for #494-B's authenticated-plaintext mutation
+/// matrix; see `header_len`'s doc comment.
+pub fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16, out: []u8) error{ FieldNotFound, BufferTooSmall }!usize {
+    const old_len = originalTlvLen(fixture, field_id) orelse return error.FieldNotFound;
+    const required = fixture.len - old_len + new_length;
+    if (out.len < required) return error.BufferTooSmall;
     @memcpy(out[0..header_len], fixture[0..header_len]);
     var pos: usize = header_len;
     var offset: usize = header_len;
@@ -3235,16 +3242,16 @@ test "decode rejects zero-length and one-over-length mutations for exact-width f
         const original = originalTlvLen(&client_fixture, field_id).?;
 
         var zero_buf: [client_fixture.len + 8]u8 = undefined;
-        const zero_len = withTlvLengthOverride(&client_fixture, field_id, 0, &zero_buf);
+        const zero_len = try withTlvLengthOverride(&client_fixture, field_id, 0, &zero_buf);
         try expectDecodeFailsWithoutLeaking(zero_buf[0..zero_len]);
 
         var over_buf: [client_fixture.len + 8]u8 = undefined;
-        const over_len = withTlvLengthOverride(&client_fixture, field_id, original + 1, &over_buf);
+        const over_len = try withTlvLengthOverride(&client_fixture, field_id, original + 1, &over_buf);
         try expectDecodeFailsWithoutLeaking(over_buf[0..over_len]);
 
         if (original > 0) {
             var under_buf: [client_fixture.len + 8]u8 = undefined;
-            const under_len = withTlvLengthOverride(&client_fixture, field_id, original - 1, &under_buf);
+            const under_len = try withTlvLengthOverride(&client_fixture, field_id, original - 1, &under_buf);
             try expectDecodeFailsWithoutLeaking(under_buf[0..under_len]);
         }
     }
@@ -3257,7 +3264,7 @@ test "decode rejects zero-length mutations for fields required to be non-empty" 
     };
     for (must_be_nonempty_ids) |field_id| {
         var zero_buf: [client_fixture.len + 8]u8 = undefined;
-        const zero_len = withTlvLengthOverride(&client_fixture, field_id, 0, &zero_buf);
+        const zero_len = try withTlvLengthOverride(&client_fixture, field_id, 0, &zero_buf);
         try expectDecodeFailsWithoutLeaking(zero_buf[0..zero_len]);
 
         // Widening by one byte has no upper semantic constraint here
@@ -3265,7 +3272,7 @@ test "decode rejects zero-length mutations for fields required to be non-empty" 
         // leak, without asserting a specific success/failure outcome.
         const original = originalTlvLen(&client_fixture, field_id).?;
         var over_buf: [client_fixture.len + 8]u8 = undefined;
-        const over_len = withTlvLengthOverride(&client_fixture, field_id, original + 1, &over_buf);
+        const over_len = try withTlvLengthOverride(&client_fixture, field_id, original + 1, &over_buf);
         try expectDecodeDoesNotPanicOrLeak(over_buf[0..over_len]);
     }
 }
@@ -3277,11 +3284,11 @@ test "decode never panics or leaks on any length mutation of ticket_nonce" {
     const original = originalTlvLen(&client_fixture, field_ticket_nonce).?;
 
     var zero_buf: [client_fixture.len + 8]u8 = undefined;
-    const zero_len = withTlvLengthOverride(&client_fixture, field_ticket_nonce, 0, &zero_buf);
+    const zero_len = try withTlvLengthOverride(&client_fixture, field_ticket_nonce, 0, &zero_buf);
     try expectDecodeDoesNotPanicOrLeak(zero_buf[0..zero_len]);
 
     var over_buf: [client_fixture.len + 8]u8 = undefined;
-    const over_len = withTlvLengthOverride(&client_fixture, field_ticket_nonce, original + 1, &over_buf);
+    const over_len = try withTlvLengthOverride(&client_fixture, field_ticket_nonce, original + 1, &over_buf);
     try expectDecodeDoesNotPanicOrLeak(over_buf[0..over_len]);
 }
 
