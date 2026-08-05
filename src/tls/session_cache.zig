@@ -4354,6 +4354,14 @@ fn smithCorpusWords(comptime words: []const u64) [words.len * 8]u8 {
     return out;
 }
 
+fn wrongPersistenceToken(smith: *std.testing.Smith, active: ?u64) u64 {
+    var candidate = smith.value(u64);
+    if (active) |token| {
+        if (candidate == token) candidate +%= 1;
+    }
+    return candidate;
+}
+
 fn fuzzClientTicket(allocator: std.mem.Allocator, id: u64, usage_byte: u64, now_ms: i64) !session.ClientTicketState {
     var ticket_buf: [32]u8 = undefined;
     const ticket = try std.fmt.bufPrint(&ticket_buf, "ct-{d}-{d}", .{ id % 23, usage_byte % 5 });
@@ -4805,7 +4813,7 @@ fn runClientFuzzCase(smith: *std.testing.Smith) !void {
                 cache.endPersistenceOperation(token);
                 persistence_token = null;
             },
-            .end_persistence_wrong_or_stale => cache.endPersistenceOperation(smith.value(u64)),
+            .end_persistence_wrong_or_stale => cache.endPersistenceOperation(wrongPersistenceToken(smith, persistence_token)),
             .clone_for_persistence => {
                 var clones = cache.cloneLiveForPersistence(testing.allocator, now_ms) catch |err| switch (err) {
                     error.CacheBusy, error.OutOfMemory => null,
@@ -5257,7 +5265,7 @@ fn runServerFuzzCase(smith: *std.testing.Smith) !void {
                 cache.endPersistenceOperation(token);
                 persistence_token = null;
             },
-            .end_persistence_wrong_or_stale => cache.endPersistenceOperation(smith.value(u64)),
+            .end_persistence_wrong_or_stale => cache.endPersistenceOperation(wrongPersistenceToken(smith, persistence_token)),
             .clone_for_persistence => {
                 var clones = cache.cloneLiveForPersistence(testing.allocator, now_ms) catch |err| switch (err) {
                     error.CacheBusy, error.OutOfMemory => null,
@@ -5374,6 +5382,7 @@ test "fuzz: TLS resumption: client session cache operation sequence preserves tr
             &smithCorpusWords(&.{ 1, 8, 0, 3, 18, 1 }),
             &smithCorpusWords(&.{ 18, 0 }),
             &smithCorpusWords(&.{ 11, 3, 12, 3 }),
+            &smithCorpusWords(&.{ 11, 13, 1 }),
             &smithCorpusWords(&.{ 15, 1, 9, 15, 10, 3 }),
             &smithCorpusWords(&.{ 16, 0, 3 }),
             &smithCorpusWords(&.{ 0, 13, 0, 17 }),
@@ -5393,6 +5402,7 @@ test "fuzz: TLS resumption: stateful server cache operation sequence preserves t
             &smithCorpusWords(&.{ 1, 5, 2, 10, 2, 8 }),
             &smithCorpusWords(&.{ 1, 6, 2, 11, 8 }),
             &smithCorpusWords(&.{ 0, 7, 12, 2, 14, 13, 2 }),
+            &smithCorpusWords(&.{ 12, 14, 1 }),
             &smithCorpusWords(&.{18}),
             &smithCorpusWords(&.{19}),
             &smithCorpusWords(&.{ 22, 0 }),
