@@ -848,25 +848,32 @@ pub const format_version: u8 = 1;
 pub const magic: [4]u8 = .{ 'T', 'R', 'S', '1' };
 
 /// `magic(4) | major(1) | kind(1) | field_section_len(4)`.
-const header_len: usize = magic.len + 1 + 1 + 4;
+/// #494-B's `Protector.resolve` fuzz target (`src/tls/ticket_protection.zig`)
+/// reuses this alongside the fixture-mutation helpers below rather than
+/// re-deriving the wire header shape, so an authenticated malformed-plaintext
+/// mutation always lands on a real TLV boundary.
+pub const header_len: usize = magic.len + 1 + 1 + 4;
 
 const optional_field_mask: u16 = 0x8000;
 
-const field_cipher_suite: u16 = 0x0001;
-const field_resumption_psk: u16 = 0x0002;
+/// Exposed for #494-B's authenticated-plaintext mutation matrix (see
+/// `header_len`'s doc comment); the rest stay module-private since only
+/// these are driven from outside this file today.
+pub const field_cipher_suite: u16 = 0x0001;
+pub const field_resumption_psk: u16 = 0x0002;
 const field_server_name: u16 = 0x0003;
 const field_application_protocol: u16 = 0x0004;
-const field_auth_binding: u16 = 0x0005;
-const field_issued_at: u16 = 0x0006;
-const field_lifetime_seconds: u16 = 0x0007;
-const field_early_data: u16 = 0x0008;
+pub const field_auth_binding: u16 = 0x0005;
+pub const field_issued_at: u16 = 0x0006;
+pub const field_lifetime_seconds: u16 = 0x0007;
+pub const field_early_data: u16 = 0x0008;
 const field_transport_compat: u16 = 0x8001;
 const field_application_compat: u16 = 0x8002;
 const field_early_data_transport_compat: u16 = 0x8003;
 const field_early_data_application_compat: u16 = 0x8004;
 
 const field_ticket: u16 = 0x0010;
-const field_ticket_age_add: u16 = 0x0011;
+pub const field_ticket_age_add: u16 = 0x0011;
 const field_ticket_nonce: u16 = 0x0012;
 const field_received_at: u16 = 0x0013;
 
@@ -3000,8 +3007,9 @@ test "current encoder output exactly equals the checked-in fixtures" {
 }
 
 /// Rebuilds `fixture` with every TLV whose field id is `field_id_to_remove`
-/// dropped, patching the section length to match.
-fn fixtureWithFieldRemoved(fixture: []const u8, field_id_to_remove: u16, out: []u8) usize {
+/// dropped, patching the section length to match. Exposed for #494-B's
+/// authenticated-plaintext mutation matrix; see `header_len`'s doc comment.
+pub fn fixtureWithFieldRemoved(fixture: []const u8, field_id_to_remove: u16, out: []u8) usize {
     @memcpy(out[0..header_len], fixture[0..header_len]);
     var pos: usize = header_len;
     var offset: usize = header_len;
@@ -3015,8 +3023,9 @@ fn fixtureWithFieldRemoved(fixture: []const u8, field_id_to_remove: u16, out: []
 
 /// Rebuilds `fixture` with an extra copy of the first TLV whose field id is
 /// `field_id_to_duplicate` appended at the end, patching the section length
-/// to match.
-fn fixtureWithFieldDuplicated(fixture: []const u8, field_id_to_duplicate: u16, out: []u8) usize {
+/// to match. Exposed for #494-B's authenticated-plaintext mutation matrix;
+/// see `header_len`'s doc comment.
+pub fn fixtureWithFieldDuplicated(fixture: []const u8, field_id_to_duplicate: u16, out: []u8) usize {
     @memcpy(out[0..fixture.len], fixture);
     var pos: usize = fixture.len;
     var offset: usize = header_len;
@@ -3172,9 +3181,32 @@ test "decode rejects both literal fixtures truncated at every byte boundary" {
 
 /// Rebuilds `fixture` with the TLV whose field id is `field_id` given a new
 /// declared length (`new_length`), copying as much of its original value as
-/// fits and leaving any excess unspecified. Every other TLV is copied
-/// unchanged. `out` must have at least `fixture.len + 8` bytes of room.
-fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16, out: []u8) usize {
+/// fits and zero-filling any excess (for deterministic reproduction; see
+/// the comment on the zero-fill below). Every other TLV is copied
+/// unchanged. `out` must have at least `fixture.len - old_len + new_length`
+/// bytes of room, where `old_len` is the field's original length (checked
+/// against `out.len` below, rather than merely documented, since this is a
+/// `pub` helper a caller can rely on without inspecting the
+/// implementation). Exposed for #494-B's authenticated-plaintext mutation
+/// matrix; see `header_len`'s doc comment.
+pub fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16, out: []u8) error{ FieldNotFound, DuplicateField, BufferTooSmall }!usize {
+    // Every TLV whose id is `field_id` gets rewritten below (not just the
+    // first), so the required-capacity math only holds for a canonical
+    // record with exactly one occurrence -- the precondition this helper
+    // has always implicitly assumed (matching `originalTlvLen`, which only
+    // ever reports the first occurrence's length). Reject a duplicate
+    // explicitly rather than silently underestimating `required` for it.
+    var old_len: ?u16 = null;
+    {
+        var offset: usize = header_len;
+        while ((nextTlv(fixture, &offset) catch unreachable)) |tlv| {
+            if (tlv.field_id != field_id) continue;
+            if (old_len != null) return error.DuplicateField;
+            old_len = @intCast(tlv.value.len);
+        }
+    }
+    const required = fixture.len - (old_len orelse return error.FieldNotFound) + new_length;
+    if (out.len < required) return error.BufferTooSmall;
     @memcpy(out[0..header_len], fixture[0..header_len]);
     var pos: usize = header_len;
     var offset: usize = header_len;
@@ -3184,6 +3216,15 @@ fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16, ou
             std.mem.writeInt(u16, out[pos + 2 ..][0..2], new_length, .big);
             const copy_len = @min(new_length, tlv.value.len);
             @memcpy(out[pos + 4 ..][0..copy_len], tlv.value[0..copy_len]);
+            // `out` is caller-provided and may be `undefined`-backed
+            // scratch space (as every #494-B fuzz caller uses): a
+            // one-over `new_length` leaves `copy_len` short of the
+            // declared length, so the excess must be zero-filled here
+            // rather than left as whatever was already in `out`, or a
+            // "one-over" mutation would authenticate and encrypt
+            // uninitialized bytes into the ciphertext, breaking
+            // deterministic reproduction.
+            @memset(out[pos + 4 + copy_len ..][0 .. new_length - copy_len], 0);
             pos += 4 + @as(usize, new_length);
         } else {
             writeTlv(out, &pos, tlv.field_id, tlv.value);
@@ -3193,12 +3234,60 @@ fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16, ou
     return pos;
 }
 
-fn originalTlvLen(fixture: []const u8, field_id: u16) ?u16 {
+/// Exposed for #494-B's authenticated-plaintext mutation matrix; see
+/// `header_len`'s doc comment.
+pub fn originalTlvLen(fixture: []const u8, field_id: u16) ?u16 {
     var offset: usize = header_len;
     while ((nextTlv(fixture, &offset) catch unreachable)) |tlv| {
         if (tlv.field_id == field_id) return @intCast(tlv.value.len);
     }
     return null;
+}
+
+test "withTlvLengthOverride rejects a duplicate target transactionally" {
+    var duplicate_buf: [client_fixture.len + 8]u8 = undefined;
+    const duplicate_len = fixtureWithFieldDuplicated(
+        &client_fixture,
+        field_cipher_suite,
+        &duplicate_buf,
+    );
+
+    var out = [_]u8{0xa5} ** (client_fixture.len + 16);
+    const before = out;
+    try testing.expectError(
+        error.DuplicateField,
+        withTlvLengthOverride(
+            duplicate_buf[0..duplicate_len],
+            field_cipher_suite,
+            3,
+            &out,
+        ),
+    );
+    try testing.expectEqualSlices(u8, &before, &out);
+}
+
+test "withTlvLengthOverride enforces exact grown capacity" {
+    var exact: [client_fixture.len + 1]u8 = undefined;
+    const len = try withTlvLengthOverride(
+        &client_fixture,
+        field_cipher_suite,
+        3,
+        &exact,
+    );
+    try testing.expectEqual(client_fixture.len + 1, len);
+
+    var short = [_]u8{0xa5} ** client_fixture.len;
+    const before = short;
+    try testing.expectError(
+        error.BufferTooSmall,
+        withTlvLengthOverride(
+            &client_fixture,
+            field_cipher_suite,
+            3,
+            &short,
+        ),
+    );
+    try testing.expectEqualSlices(u8, &before, &short);
 }
 
 test "decode rejects zero-length and one-over-length mutations for exact-width fields" {
@@ -3213,16 +3302,16 @@ test "decode rejects zero-length and one-over-length mutations for exact-width f
         const original = originalTlvLen(&client_fixture, field_id).?;
 
         var zero_buf: [client_fixture.len + 8]u8 = undefined;
-        const zero_len = withTlvLengthOverride(&client_fixture, field_id, 0, &zero_buf);
+        const zero_len = try withTlvLengthOverride(&client_fixture, field_id, 0, &zero_buf);
         try expectDecodeFailsWithoutLeaking(zero_buf[0..zero_len]);
 
         var over_buf: [client_fixture.len + 8]u8 = undefined;
-        const over_len = withTlvLengthOverride(&client_fixture, field_id, original + 1, &over_buf);
+        const over_len = try withTlvLengthOverride(&client_fixture, field_id, original + 1, &over_buf);
         try expectDecodeFailsWithoutLeaking(over_buf[0..over_len]);
 
         if (original > 0) {
             var under_buf: [client_fixture.len + 8]u8 = undefined;
-            const under_len = withTlvLengthOverride(&client_fixture, field_id, original - 1, &under_buf);
+            const under_len = try withTlvLengthOverride(&client_fixture, field_id, original - 1, &under_buf);
             try expectDecodeFailsWithoutLeaking(under_buf[0..under_len]);
         }
     }
@@ -3235,7 +3324,7 @@ test "decode rejects zero-length mutations for fields required to be non-empty" 
     };
     for (must_be_nonempty_ids) |field_id| {
         var zero_buf: [client_fixture.len + 8]u8 = undefined;
-        const zero_len = withTlvLengthOverride(&client_fixture, field_id, 0, &zero_buf);
+        const zero_len = try withTlvLengthOverride(&client_fixture, field_id, 0, &zero_buf);
         try expectDecodeFailsWithoutLeaking(zero_buf[0..zero_len]);
 
         // Widening by one byte has no upper semantic constraint here
@@ -3243,7 +3332,7 @@ test "decode rejects zero-length mutations for fields required to be non-empty" 
         // leak, without asserting a specific success/failure outcome.
         const original = originalTlvLen(&client_fixture, field_id).?;
         var over_buf: [client_fixture.len + 8]u8 = undefined;
-        const over_len = withTlvLengthOverride(&client_fixture, field_id, original + 1, &over_buf);
+        const over_len = try withTlvLengthOverride(&client_fixture, field_id, original + 1, &over_buf);
         try expectDecodeDoesNotPanicOrLeak(over_buf[0..over_len]);
     }
 }
@@ -3255,11 +3344,11 @@ test "decode never panics or leaks on any length mutation of ticket_nonce" {
     const original = originalTlvLen(&client_fixture, field_ticket_nonce).?;
 
     var zero_buf: [client_fixture.len + 8]u8 = undefined;
-    const zero_len = withTlvLengthOverride(&client_fixture, field_ticket_nonce, 0, &zero_buf);
+    const zero_len = try withTlvLengthOverride(&client_fixture, field_ticket_nonce, 0, &zero_buf);
     try expectDecodeDoesNotPanicOrLeak(zero_buf[0..zero_len]);
 
     var over_buf: [client_fixture.len + 8]u8 = undefined;
-    const over_len = withTlvLengthOverride(&client_fixture, field_ticket_nonce, original + 1, &over_buf);
+    const over_len = try withTlvLengthOverride(&client_fixture, field_ticket_nonce, original + 1, &over_buf);
     try expectDecodeDoesNotPanicOrLeak(over_buf[0..over_len]);
 }
 
