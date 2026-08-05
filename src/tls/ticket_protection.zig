@@ -50,6 +50,26 @@ fn deinitTicketKey(key: *TicketKeySecret) void {
     }
 }
 
+/// Mirrors `KeyDeinitProbe` for `LeaseHighWater.key_fingerprint`: the
+/// ledger's fingerprint is a separate secret-derived value from the
+/// `KeyRecord` it was computed from (kept alive independently, including
+/// across a key's own retirement -- see `validateReplacementLocked`), so
+/// its wipe-on-cleanup needs its own passive observation rather than
+/// assuming `KeyDeinitProbe` already covers it.
+const FingerprintDeinitProbe = struct {
+    observed: usize = 0,
+
+    fn record(self: *FingerprintDeinitProbe, value: *const KeyFingerprint) void {
+        for (value.*) |byte| {
+            if (byte != 0) @panic("ledger fingerprint was not zeroized before cleanup observation");
+        }
+        self.observed += 1;
+    }
+};
+const TestFingerprintDeinitProbeStorage = if (builtin.is_test) struct {
+    threadlocal var probe: ?*FingerprintDeinitProbe = null;
+} else struct {};
+
 pub const ParseError = error{
     MalformedEnvelope,
     UnsupportedVersion,
@@ -446,6 +466,9 @@ const LeaseHighWater = struct {
 
     fn deinit(self: *LeaseHighWater) void {
         secrets.secureZero(&self.key_fingerprint);
+        if (builtin.is_test) {
+            if (TestFingerprintDeinitProbeStorage.probe) |probe| probe.record(&self.key_fingerprint);
+        }
         self.* = undefined;
     }
 };
@@ -1622,6 +1645,65 @@ fn expectKeyringStateEqual(expected: KeyringState, keyring: *ReloadableKeyRing) 
     }
 }
 
+/// `KeyringState`/`expectKeyringStateEqual` above capture and compare every
+/// *public* field of a keyring's publication state, but neither one
+/// touches the two secret-bearing pieces: `KeyRecord.key` (the current
+/// snapshot's actual key material) and `LeaseHighWater.key_fingerprint`
+/// (the ledger's retained fingerprints, including for keys already
+/// retired out of `current`). A "no mutation happened" assertion built
+/// only from `KeyringState` would therefore still pass if a bug corrupted
+/// or wiped either one early -- this captures and compares them
+/// separately, via the same constant-time fingerprint comparison the
+/// keyring's own duplicate-detection uses, without ever exposing a raw
+/// secret byte to a test assertion. `captureInto`/`deinit` take a pointer
+/// so the fingerprints live in exactly one place (never copied through an
+/// intermediate return value) and so `deinit` can wipe them explicitly
+/// rather than leaving that to whenever the stack frame happens to be
+/// reused.
+const KeyringSecretState = struct {
+    current_count: usize = 0,
+    current: [max_keys]KeyFingerprint = undefined,
+    ledger_count: usize = 0,
+    ledger: [max_keys + 4]KeyFingerprint = undefined,
+
+    fn captureInto(self: *KeyringSecretState, keyring: *const ReloadableKeyRing) void {
+        self.current_count = 0;
+        if (keyring.current) |snapshot| {
+            self.current_count = snapshot.keys.len;
+            for (snapshot.keys, 0..) |*key, i| {
+                self.current[i] = fingerprintKey(key.aead, key.key.slice());
+            }
+        }
+        self.ledger_count = keyring.ledger.items.len;
+        for (keyring.ledger.items, 0..) |entry, i| {
+            self.ledger[i] = entry.key_fingerprint;
+        }
+    }
+
+    fn expectEqual(self: *const KeyringSecretState, keyring: *const ReloadableKeyRing) !void {
+        const current_count = if (keyring.current) |snapshot| snapshot.keys.len else 0;
+        try testing.expectEqual(self.current_count, current_count);
+        if (keyring.current) |snapshot| {
+            for (snapshot.keys, 0..) |*key, i| {
+                var actual = fingerprintKey(key.aead, key.key.slice());
+                defer secrets.secureZero(&actual);
+                try testing.expect(secrets.constantTimeEqual(&self.current[i], &actual));
+            }
+        }
+        try testing.expectEqual(self.ledger_count, keyring.ledger.items.len);
+        for (keyring.ledger.items, 0..) |entry, i| {
+            try testing.expect(secrets.constantTimeEqual(&self.ledger[i], &entry.key_fingerprint));
+        }
+    }
+
+    fn deinit(self: *KeyringSecretState) void {
+        for (self.current[0..self.current_count]) |*fingerprint| secrets.secureZero(fingerprint);
+        for (self.ledger[0..self.ledger_count]) |*fingerprint| secrets.secureZero(fingerprint);
+        self.current_count = 0;
+        self.ledger_count = 0;
+    }
+};
+
 fn leaseStateFromKey(key: *const KeyRecord) LeaseState {
     if (key.nonce_lease) |*lease| {
         return .{
@@ -2624,6 +2706,35 @@ test "candidate validation rejection observer may reenter keyring" {
 
     try testing.expectError(error.StaleSnapshotGeneration, keyring.validateInstallCandidate(candidate));
     try testing.expectEqual(@as(usize, 1), observer.rejected_events);
+}
+
+test "candidate validation OOM wipes pending ledger fingerprints" {
+    var fingerprint_probe = FingerprintDeinitProbe{};
+    TestFingerprintDeinitProbeStorage.probe = &fingerprint_probe;
+    defer TestFingerprintDeinitProbeStorage.probe = null;
+
+    // Allocation order: baseline snapshot/create/ledger/capacity = 0..3;
+    // candidate snapshot+keys = 4..5; first pending entry = 6;
+    // second pending entry allocation fails at 7 and must clean entry 6.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 7 });
+    var keyring = ReloadableKeyRing.init(failing.allocator());
+    defer keyring.deinit();
+
+    const baseline = sampleKeyConfigWithByte(keyId(0xc1), .aes_128_gcm, .{ .prefix = .{ 0xc1, 0, 0, 0 }, .start = 0, .end_exclusive = 3 }, 0x11);
+    try keyring.install(try keyring.buildSnapshot(&.{baseline}, testCapabilities()));
+
+    const candidates = [_]KeyConfig{
+        sampleKeyConfigWithByte(keyId(0xc2), .aes_256_gcm, null, 0x22),
+        sampleKeyConfigWithByte(keyId(0xc3), .chacha20_poly1305, null, 0x33),
+    };
+    const candidate = try keyring.buildSnapshot(&candidates, testCapabilities());
+    defer candidate.release();
+
+    const before = captureKeyringState(&keyring);
+    const wipes_before = fingerprint_probe.observed;
+    try testing.expectError(error.OutOfMemory, keyring.validateInstallCandidate(candidate));
+    try expectKeyringStateEqual(before, &keyring);
+    try testing.expectEqual(@as(usize, 1), fingerprint_probe.observed - wipes_before);
 }
 
 test "ambiguous encryption windows are rejected before publication" {
@@ -3645,6 +3756,24 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
     const resolve_now_unix_ms: i64 = 10_000;
     const valid_envelope = try protector.seal(allocator, &state, seal_now_unix_ms, &seal_buf);
 
+    // #494-B requires current/active, future, retained, retired, and
+    // unknown key states. Every scenario below resolves at
+    // `resolve_now_unix_ms` (inside `active_id`'s decrypt-only grace
+    // window, i.e. `retained`), so without this the active/current state
+    // itself would never be authenticated through `Protector.resolve` at
+    // all -- prove it here, once, before the Smith-selected scenario
+    // switch (and its own observer) takes over, so this runs identically
+    // for every selected AEAD without perturbing the corpus call order.
+    {
+        var active_observer = TestObserver{};
+        defer active_observer.deinit(allocator);
+        var active_protector = protector;
+        active_protector.observer = active_observer.observer();
+        var active_zero = ZeroCheckingAllocator.init(allocator);
+        try expectRoundTrip(&active_protector, active_zero.allocator(), &state, valid_envelope, seal_now_unix_ms);
+        try active_observer.expectOnly(.resolve_succeeded);
+    }
+
     var observer = TestObserver{};
     defer observer.deinit(allocator);
     protector.observer = observer.observer();
@@ -4076,6 +4205,41 @@ const resolve_lifetime_max = smithCorpusWords(&.{ 0, 10, 2, 0 });
 const resolve_lifetime_zero = smithCorpusWords(&.{ 0, 10, 3, 0 });
 const resolve_lifetime_over = smithCorpusWords(&.{ 0, 10, 4, 0 });
 
+// Envelope authentication regions (scenario 5's own `region` selection:
+// 0 = nonce, already covered by `resolve_tampered_nonce` above; 1 =
+// ciphertext; 2 = tag).
+const resolve_tampered_ciphertext = smithCorpusWords(&.{ 0, 5, 1, 0, 0 });
+const resolve_tampered_tag = smithCorpusWords(&.{ 0, 5, 2, 0, 0 });
+
+// Authenticated malformed `TRS1` records (scenario 6): word[2] keeps the
+// truncation gate nonzero (`resolve_truncated_ffff` above already covers
+// the gate-zero arm), word[3] selects the inner mutation switch, and any
+// further words are that mutation's own nested selections in call order.
+const resolve_bad_magic = smithCorpusWords(&.{ 0, 6, 1, 0, 0, 0 });
+const resolve_bad_version = smithCorpusWords(&.{ 0, 6, 1, 1, 0 });
+const resolve_bad_record_type = smithCorpusWords(&.{ 0, 6, 1, 2, 0 });
+const resolve_bad_section_length = smithCorpusWords(&.{ 0, 6, 1, 3, 0 });
+const resolve_duplicate_required = smithCorpusWords(&.{ 0, 6, 1, 4, 0, 0 });
+const resolve_missing_required = smithCorpusWords(&.{ 0, 6, 1, 5, 0, 0 });
+const resolve_length_one_under = smithCorpusWords(&.{ 0, 6, 1, 6, 0, 0, 0 });
+const resolve_length_zero = smithCorpusWords(&.{ 0, 6, 1, 6, 0, 1, 0 });
+const resolve_length_one_over = smithCorpusWords(&.{ 0, 6, 1, 6, 0, 2, 0 });
+const resolve_unknown_critical = smithCorpusWords(&.{ 0, 6, 1, 7, 0 });
+const resolve_psk_zero = smithCorpusWords(&.{ 0, 6, 1, 8, 0, 0 });
+const resolve_psk_one = smithCorpusWords(&.{ 0, 6, 1, 8, 1, 0 });
+const resolve_psk_one_over = smithCorpusWords(&.{ 0, 6, 1, 8, 2, 0 });
+const resolve_psk_max_digest = smithCorpusWords(&.{ 0, 6, 1, 8, 3, 0 });
+const resolve_unknown_suite = smithCorpusWords(&.{ 0, 6, 1, 9, 0 });
+const resolve_suite_psk_mismatch = smithCorpusWords(&.{ 0, 6, 1, 10, 0 });
+
+// The post-scenario `protector.limits` probe (`switch (smith.index(5))`
+// after the main scenario switch), forced on top of the baseline accept
+// scenario (word[1] = 0).
+const resolve_ticket_limit_exact = smithCorpusWords(&.{ 0, 0, 1 });
+const resolve_ticket_limit_one_under = smithCorpusWords(&.{ 0, 0, 2 });
+const resolve_state_limit_exact = smithCorpusWords(&.{ 0, 0, 3 });
+const resolve_state_limit_one_under = smithCorpusWords(&.{ 0, 0, 4 });
+
 test "fuzz: TLS resumption: Protector.resolve authenticates, rejects, and never leaks plaintext under key-state and envelope mutation" {
     try testing.fuzz({}, fuzzProtectorResolveInput, .{
         .corpus = &.{
@@ -4097,6 +4261,28 @@ test "fuzz: TLS resumption: Protector.resolve authenticates, rejects, and never 
             &resolve_lifetime_max,
             &resolve_lifetime_zero,
             &resolve_lifetime_over,
+            &resolve_tampered_ciphertext,
+            &resolve_tampered_tag,
+            &resolve_bad_magic,
+            &resolve_bad_version,
+            &resolve_bad_record_type,
+            &resolve_bad_section_length,
+            &resolve_duplicate_required,
+            &resolve_missing_required,
+            &resolve_length_one_under,
+            &resolve_length_zero,
+            &resolve_length_one_over,
+            &resolve_unknown_critical,
+            &resolve_psk_zero,
+            &resolve_psk_one,
+            &resolve_psk_one_over,
+            &resolve_psk_max_digest,
+            &resolve_unknown_suite,
+            &resolve_suite_psk_mismatch,
+            &resolve_ticket_limit_exact,
+            &resolve_ticket_limit_one_under,
+            &resolve_state_limit_exact,
+            &resolve_state_limit_one_under,
         },
     });
 }
@@ -4221,6 +4407,13 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     var key_probe = KeyDeinitProbe{};
     TestKeyDeinitProbeStorage.probe = &key_probe;
 
+    // Mirrors `key_probe` above, but for `LeaseHighWater.key_fingerprint`
+    // (see `FingerprintDeinitProbe`'s doc comment): proves pending ledger
+    // fingerprints are actually zeroized before being freed, not merely
+    // that the enclosing allocation was cleaned up.
+    var fingerprint_probe = FingerprintDeinitProbe{};
+    TestFingerprintDeinitProbeStorage.probe = &fingerprint_probe;
+
     var held: ?*Snapshot = null;
     var held_refs: usize = 0;
     var held_deinit_count = std.atomic.Value(usize).init(0);
@@ -4277,6 +4470,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
         keyring.deinit();
         secrets.secureZero(&held_key_fingerprint);
         TestKeyDeinitProbeStorage.probe = null;
+        TestFingerprintDeinitProbeStorage.probe = null;
     }
 
     var last_generation: u64 = 0;
@@ -4304,7 +4498,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     const op_count = 1 + smith.index(8);
     for (0..op_count) |_| {
         switch (smith.index(6)) {
-            0 => { // (re)install the active key with an advanced, non-overlapping lease window
+            0 => install_op: { // (re)install the active key with an advanced, non-overlapping lease window
                 // Occasionally install a lease window pinned at the very
                 // top of the `u64` counter space instead of the normal
                 // small advancing range, so the "seal" opcode below gets a
@@ -4317,7 +4511,8 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                 // install of the same id deterministically (and correctly)
                 // rejects as `OverlappingNonceLease` for the rest of this
                 // bounded program -- already handled by the same
-                // catch/continue every other install rejection uses below.
+                // catch/rollback-assertion every other install rejection
+                // uses below.
                 const near_wrap = smith.index(8) == 0;
                 const start: u64 = if (near_wrap) std.math.maxInt(u64) - 1 else next_lease_start;
                 const end: u64 = if (near_wrap) std.math.maxInt(u64) else start + lease_chunk;
@@ -4332,6 +4527,9 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                     .nonce_lease = .{ .prefix = .{ 0xc1, 0, 0, 0 }, .start = start, .end_exclusive = end },
                 };
                 const before = captureKeyringState(&keyring);
+                var secret_before: KeyringSecretState = undefined;
+                secret_before.captureInto(&keyring);
+                defer secret_before.deinit();
                 // If the tracked snapshot is currently unheld (no modeled
                 // owner) and still `keyring.current`, this install -- if it
                 // succeeds -- performs its true final release (a fresh
@@ -4345,11 +4543,13 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                 const wipes_before = if (watching) key_probe.observed else 0;
                 const snapshot = keyring.buildSnapshot(&.{config}, testCapabilities()) catch {
                     try expectKeyringStateEqual(before, &keyring);
-                    continue;
+                    try secret_before.expectEqual(&keyring);
+                    break :install_op;
                 };
                 keyring.install(snapshot) catch {
                     try expectKeyringStateEqual(before, &keyring);
-                    continue;
+                    try secret_before.expectEqual(&keyring);
+                    break :install_op;
                 };
                 try testing.expect(keyring.current.?.generation > last_generation);
                 last_generation = keyring.current.?.generation;
@@ -4359,16 +4559,21 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                     tracked_finalized = true;
                 }
             },
-            1 => { // dry-run validate must never mutate published state
+            1 => validate_op: { // dry-run validate must never mutate published state
                 const config = sampleKeyConfigWithByte(keyId(0xc2), .aes_256_gcm, null, 0x22);
                 const before = captureKeyringState(&keyring);
+                var secret_before: KeyringSecretState = undefined;
+                secret_before.captureInto(&keyring);
+                defer secret_before.deinit();
                 const candidate = keyring.buildSnapshot(&.{config}, testCapabilities()) catch {
                     try expectKeyringStateEqual(before, &keyring);
-                    continue;
+                    try secret_before.expectEqual(&keyring);
+                    break :validate_op;
                 };
                 defer candidate.release();
                 keyring.validateInstallCandidate(candidate) catch {};
                 try expectKeyringStateEqual(before, &keyring);
+                try secret_before.expectEqual(&keyring);
             },
             2 => { // acquire current, hold across subsequent ops -- at most once per program
                 // Instrumenting a *second* snapshot would repoint
@@ -4432,10 +4637,13 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                     }
                 }
             },
-            else => { // reserve a nonce: uniqueness, deterministic exhaustion (including near-wrap), and the post-reservation provider-fault contract
+            else => seal_op: { // reserve a nonce: uniqueness, deterministic exhaustion (including near-wrap), and the post-reservation provider-fault contract
                 const before = captureKeyringState(&keyring);
+                var secret_before: KeyringSecretState = undefined;
+                secret_before.captureInto(&keyring);
+                defer secret_before.deinit();
                 const ticket = keyring.current != null and keyring.current.?.keys[0].nonce_lease != null;
-                if (!ticket) continue;
+                if (!ticket) break :seal_op;
                 const counter_before = keyring.current.?.keys[0].nonce_lease.?.next_counter.load(.acquire);
                 const has_room = counter_before < keyring.current.?.keys[0].nonce_lease.?.currentEnd();
 
@@ -4468,7 +4676,8 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                     var expected_after = before;
                     expected_after.current_keys[0].lease.next_counter = counter_before + 1;
                     try expectKeyringStateEqual(expected_after, &keyring);
-                    continue;
+                    try secret_before.expectEqual(&keyring);
+                    break :seal_op;
                 }
 
                 var ticket_buf: [512]u8 = undefined;
@@ -4487,6 +4696,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                     var expected_after = before;
                     expected_after.current_keys[0].lease.next_counter = counter_before + 1;
                     try expectKeyringStateEqual(expected_after, &keyring);
+                    try secret_before.expectEqual(&keyring);
 
                     var expected_nonce: [provider.aead_nonce_len]u8 = undefined;
                     @memcpy(expected_nonce[0..4], &before.current_keys[0].lease.prefix);
@@ -4511,6 +4721,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                     // regression instead of failing loudly.
                     try testing.expectEqual(error.NonceLeaseExhausted, err);
                     try expectKeyringStateEqual(before, &keyring);
+                    try secret_before.expectEqual(&keyring);
                 }
             },
         }
@@ -4607,6 +4818,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     }
     secrets.secureZero(&held_key_fingerprint);
     TestKeyDeinitProbeStorage.probe = null;
+    TestFingerprintDeinitProbeStorage.probe = null;
 }
 
 // Word[0] is the `FailingAllocator` fail index (`smith.index(24)`); word[1]
