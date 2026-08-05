@@ -3244,6 +3244,52 @@ pub fn originalTlvLen(fixture: []const u8, field_id: u16) ?u16 {
     return null;
 }
 
+test "withTlvLengthOverride rejects a duplicate target transactionally" {
+    var duplicate_buf: [client_fixture.len + 8]u8 = undefined;
+    const duplicate_len = fixtureWithFieldDuplicated(
+        &client_fixture,
+        field_cipher_suite,
+        &duplicate_buf,
+    );
+
+    var out = [_]u8{0xa5} ** (client_fixture.len + 16);
+    const before = out;
+    try testing.expectError(
+        error.DuplicateField,
+        withTlvLengthOverride(
+            duplicate_buf[0..duplicate_len],
+            field_cipher_suite,
+            3,
+            &out,
+        ),
+    );
+    try testing.expectEqualSlices(u8, &before, &out);
+}
+
+test "withTlvLengthOverride enforces exact grown capacity" {
+    var exact: [client_fixture.len + 1]u8 = undefined;
+    const len = try withTlvLengthOverride(
+        &client_fixture,
+        field_cipher_suite,
+        3,
+        &exact,
+    );
+    try testing.expectEqual(client_fixture.len + 1, len);
+
+    var short = [_]u8{0xa5} ** client_fixture.len;
+    const before = short;
+    try testing.expectError(
+        error.BufferTooSmall,
+        withTlvLengthOverride(
+            &client_fixture,
+            field_cipher_suite,
+            3,
+            &short,
+        ),
+    );
+    try testing.expectEqualSlices(u8, &before, &short);
+}
+
 test "decode rejects zero-length and one-over-length mutations for exact-width fields" {
     // These fields require an exact byte count (2/32/8/4/4/8, or the {1,5}
     // early-data set); any other declared length must always fail.

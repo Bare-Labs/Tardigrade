@@ -3866,7 +3866,7 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
                 try observer.expectOnly(.{ .resolve_rejected = .not_yet_valid });
             }
         },
-        else => switch (smith.index(4)) {
+        else => switch (smith.index(5)) {
             0 => {
                 // Exact `isExpired` boundary for `lifetime_seconds = 1`
                 // (1000ms): `age == 999` must accept.
@@ -3895,6 +3895,24 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
                 try observer.expectOnly(.{ .resolve_rejected = .expired });
             },
             2 => {
+                // Exact upper endpoint of the valid `(0,
+                // max_lifetime_seconds]` interval must round-trip:
+                // #494-B's boundary matrix requires zero / exact maximum /
+                // max-plus-one, and only this branch proves the *valid*
+                // maximum is actually accepted through the authenticated
+                // resolver rather than assuming it from
+                // `ResumableSessionCommon.init`'s own constructor tests.
+                var timed_state = try buildTimedServerState(allocator, resolve_now_unix_ms, session.max_lifetime_seconds);
+                defer timed_state.deinit();
+                var plaintext_buf: [2048]u8 = undefined;
+                const plaintext = try session.encodeServer(&timed_state, session.Limits.default, &plaintext_buf);
+                var envelope_buf: [2048]u8 = undefined;
+                const nonce = [_]u8{0xfd} ** provider.aead_nonce_len;
+                const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, plaintext);
+                try expectRoundTrip(&protector, zero_alloc.allocator(), &timed_state, envelope, resolve_now_unix_ms);
+                try observer.expectOnly(.resolve_succeeded);
+            },
+            3 => {
                 // Raw-TLV `lifetime_seconds` boundary: zero is below the
                 // valid `(0, max_lifetime_seconds]` range.
                 // `ResumableSessionCommon.init` itself already rejects
@@ -4007,34 +4025,78 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
     try testing.expectEqual(@as(usize, 0), current_deinit_count.load(.monotonic));
 }
 
+/// Builds a corpus-replay entry for `std.testing.Smith` from explicit
+/// `index()`/`indexWithHash()` selections rather than opaque bytes.
+/// `Smith`'s corpus-replay contract (`valueWeightedWithHashInner` in Zig
+/// 0.16's `Smith.zig`) reads the *next* 8 bytes of the entry as a
+/// little-endian `u64` per call and uses it verbatim when it already falls
+/// in the call's valid range (defaulting to 0 once the entry runs out or a
+/// word falls outside that range) -- so a plain one- or nine-byte seed only
+/// ever supplies its *first* `index()` call before every later one defaults
+/// to 0, silently failing to force the AEAD/scenario/opcode matrix its own
+/// name and comment claim to cover. Every word here is one `index()`
+/// selection, in the exact call order the target itself makes.
+fn smithCorpusWords(comptime words: []const u64) [words.len * 8]u8 {
+    var out = [_]u8{0} ** (words.len * 8);
+    inline for (words, 0..) |word, i| {
+        std.mem.writeInt(u64, out[i * 8 ..][0..8], word, .little);
+    }
+    return out;
+}
+
+// Word[0] selects the AEAD (0/1/2 = AES-128-GCM/AES-256-GCM/ChaCha20-
+// Poly1305); word[1] selects the top-level scenario (`switch
+// (smith.index(11))` in `fuzzProtectorResolve`); the trailing word on every
+// entry is always the post-switch `protector.limits` probe selector
+// (`switch (smith.index(5))`, kept at its default/no-change value here so
+// each seed forces exactly the scenario it names). Words in between are
+// that scenario's own nested selections, in call order.
+const resolve_aes128_accept = smithCorpusWords(&.{ 0, 0, 0 });
+const resolve_aes256_accept = smithCorpusWords(&.{ 1, 0, 0 });
+const resolve_chacha_accept = smithCorpusWords(&.{ 2, 0, 0 });
+const resolve_unknown_key = smithCorpusWords(&.{ 0, 1, 0 });
+const resolve_future_key = smithCorpusWords(&.{ 0, 2, 0 });
+const resolve_retired_key = smithCorpusWords(&.{ 0, 3, 0 });
+const resolve_cross_aead = smithCorpusWords(&.{ 0, 4, 0 });
+// Region = 0 (nonce), byte-offset selector = 0.
+const resolve_tampered_nonce = smithCorpusWords(&.{ 0, 5, 0, 0, 0 });
+// The truncation gate (`smith.index(4) == 0`) inside case 6, then a valid
+// field-id index.
+const resolve_truncated_ffff = smithCorpusWords(&.{ 0, 6, 0, 0, 0 });
+const resolve_optional_field = smithCorpusWords(&.{ 0, 7, 0 });
+const resolve_sha384_pair = smithCorpusWords(&.{ 0, 8, 0 });
+// `at_boundary == true` (issued_at == now) / `false` (== now + 1).
+const resolve_issued_exact = smithCorpusWords(&.{ 0, 9, 0, 0 });
+const resolve_issued_plus_one = smithCorpusWords(&.{ 0, 9, 1, 0 });
+// The lifetime/expiry matrix (`else` branch, i.e. any value >= 10 in range)
+// selects among its own five cases via one more word.
+const resolve_expiry_999 = smithCorpusWords(&.{ 0, 10, 0, 0 });
+const resolve_expiry_1000 = smithCorpusWords(&.{ 0, 10, 1, 0 });
+const resolve_lifetime_max = smithCorpusWords(&.{ 0, 10, 2, 0 });
+const resolve_lifetime_zero = smithCorpusWords(&.{ 0, 10, 3, 0 });
+const resolve_lifetime_over = smithCorpusWords(&.{ 0, 10, 4, 0 });
+
 test "fuzz: TLS resumption: Protector.resolve authenticates, rejects, and never leaks plaintext under key-state and envelope mutation" {
     try testing.fuzz({}, fuzzProtectorResolveInput, .{
         .corpus = &.{
-            "",
-            &[_]u8{0},
-            &[_]u8{1},
-            &[_]u8{2},
-            &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8 },
-            &([_]u8{0xff} ** 9),
-            // Deterministically forces the declaration-only-truncation arm of
-            // case 6's mutation matrix (`if (smith.index(4) == 0)`), rather
-            // than relying on a coverage-guided run to stumble onto it. Hand-
-            // derived from `std.testing.Smith`'s corpus-replay contract
-            // (`valueWeightedWithHashInner` in Zig 0.16's `Smith.zig`): each
-            // `index(n)` call under replay reads the *next* 8 bytes of the
-            // corpus entry as a little-endian `u64` and uses it verbatim if it
-            // already falls in `[0, n)` (defaulting to 0 once the bytes run
-            // out or fall outside that range), so this is four consecutive
-            // 8-byte little-endian words -- `1` (any valid AEAD index), `6`
-            // (the case-6 scenario, i.e. `invalid_plaintext`'s authenticated
-            // mutation matrix), `0` (the truncation gate), `0` (any valid
-            // field-id index) -- not an opaque fuzzer-minimized blob.
-            &[_]u8{
-                1, 0, 0, 0, 0, 0, 0, 0,
-                6, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0,
-            },
+            &resolve_aes128_accept,
+            &resolve_aes256_accept,
+            &resolve_chacha_accept,
+            &resolve_unknown_key,
+            &resolve_future_key,
+            &resolve_retired_key,
+            &resolve_cross_aead,
+            &resolve_tampered_nonce,
+            &resolve_truncated_ffff,
+            &resolve_optional_field,
+            &resolve_sha384_pair,
+            &resolve_issued_exact,
+            &resolve_issued_plus_one,
+            &resolve_expiry_999,
+            &resolve_expiry_1000,
+            &resolve_lifetime_max,
+            &resolve_lifetime_zero,
+            &resolve_lifetime_over,
         },
     });
 }
@@ -4281,7 +4343,10 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                 const watching = tracked_snapshot and !tracked_finalized and held == null and
                     before.current != null and before.current_generation == tracked_generation;
                 const wipes_before = if (watching) key_probe.observed else 0;
-                const snapshot = keyring.buildSnapshot(&.{config}, testCapabilities()) catch continue;
+                const snapshot = keyring.buildSnapshot(&.{config}, testCapabilities()) catch {
+                    try expectKeyringStateEqual(before, &keyring);
+                    continue;
+                };
                 keyring.install(snapshot) catch {
                     try expectKeyringStateEqual(before, &keyring);
                     continue;
@@ -4297,7 +4362,10 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
             1 => { // dry-run validate must never mutate published state
                 const config = sampleKeyConfigWithByte(keyId(0xc2), .aes_256_gcm, null, 0x22);
                 const before = captureKeyringState(&keyring);
-                const candidate = keyring.buildSnapshot(&.{config}, testCapabilities()) catch continue;
+                const candidate = keyring.buildSnapshot(&.{config}, testCapabilities()) catch {
+                    try expectKeyringStateEqual(before, &keyring);
+                    continue;
+                };
                 defer candidate.release();
                 keyring.validateInstallCandidate(candidate) catch {};
                 try expectKeyringStateEqual(before, &keyring);
@@ -4385,25 +4453,53 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                     var faulting_protector = Protector{ .provider = faulting.cryptoProvider(), .keyring = &keyring, .limits = session.Limits.default };
                     var ticket_buf: [512]u8 = undefined;
                     try testing.expectError(error.InvalidInternalState, faulting_protector.seal(allocator, &state, seal_now_unix_ms, &ticket_buf));
+                    // The sole allowed change from a faulted seal is the
+                    // reserved-and-consumed lease counter: everything else
+                    // in the publication snapshot -- key records,
+                    // generation/next-generation, every ledger entry, lease
+                    // prefix/end -- must be byte-identical to `before`.
+                    // `captureKeyringState`/`expectKeyringStateEqual`
+                    // already capture and compare all of that; a pointer/
+                    // ledger-length subset cannot catch a regression that
+                    // corrupts anything else this operation must leave
+                    // alone.
                     const counter_after = keyring.current.?.keys[0].nonce_lease.?.next_counter.load(.acquire);
                     try testing.expectEqual(counter_before + 1, counter_after);
-                    try testing.expectEqual(before.current, keyring.current);
-                    try testing.expectEqual(before.ledger_len, keyring.ledger.items.len);
+                    var expected_after = before;
+                    expected_after.current_keys[0].lease.next_counter = counter_before + 1;
+                    try expectKeyringStateEqual(expected_after, &keyring);
                     continue;
                 }
 
                 var ticket_buf: [512]u8 = undefined;
                 var protector = Protector{ .provider = seal_provider, .keyring = &keyring, .limits = session.Limits.default };
                 if (protector.seal(allocator, &state, seal_now_unix_ms, &ticket_buf)) |sealed| {
+                    // Same full-publication-state invariant as the faulted
+                    // path above, plus the exact emitted nonce: the
+                    // reserved counter, encoded big-endian after the
+                    // lease's 4-byte prefix, is public wire format
+                    // (`writeHeader`), not an implementation detail, so
+                    // asserting it exactly (not just its uniqueness) proves
+                    // `seal` really did consume `counter_before` and not
+                    // some other value.
+                    const counter_after = keyring.current.?.keys[0].nonce_lease.?.next_counter.load(.acquire);
+                    try testing.expectEqual(counter_before + 1, counter_after);
+                    var expected_after = before;
+                    expected_after.current_keys[0].lease.next_counter = counter_before + 1;
+                    try expectKeyringStateEqual(expected_after, &keyring);
+
+                    var expected_nonce: [provider.aead_nonce_len]u8 = undefined;
+                    @memcpy(expected_nonce[0..4], &before.current_keys[0].lease.prefix);
+                    std.mem.writeInt(u64, expected_nonce[4..12], counter_before, .big);
+                    try testing.expectEqualSlices(u8, &expected_nonce, sealed[24..36]);
+
                     var nonce: [provider.aead_nonce_len]u8 = undefined;
                     @memcpy(&nonce, sealed[24..36]);
                     for (seen_nonces[0..seen_nonce_count]) |prior| {
                         try testing.expect(!std.mem.eql(u8, &prior, &nonce));
                     }
-                    if (seen_nonce_count < seen_nonces.len) {
-                        seen_nonces[seen_nonce_count] = nonce;
-                        seen_nonce_count += 1;
-                    }
+                    seen_nonces[seen_nonce_count] = nonce;
+                    seen_nonce_count += 1;
                 } else |err| {
                     // With this fixture (a single key whose time window
                     // always covers `seal_now_unix_ms`, guarded above by
@@ -4513,13 +4609,83 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     TestKeyDeinitProbeStorage.probe = null;
 }
 
+// Word[0] is the `FailingAllocator` fail index (`smith.index(24)`); word[1]
+// is `op_count - 1` (`smith.index(8)`); every word after that is one
+// opcode selection (`smith.index(6)`: 0=install, 1=dry-run validate,
+// 2=acquire, 3=retain, 4=release, 5=seal) or that opcode's own nested
+// selection, in call order. Opcode 0 (install) is always followed by its
+// near-wrap selector (`smith.index(8)`, 0 = near-`maxInt(u64)` window,
+// anything else = the normal small advancing range). Opcode 5 (seal) is
+// followed by its fault-mode selector (`smith.index(5)`, 0 = inject a
+// provider fault after the nonce is reserved) *only when* a nonce is
+// actually available to reserve (`has_room`) -- `and` short-circuits that
+// call otherwise, so an exhaustion-producing seal consumes no extra word.
+const keyring_oom_first_allocation = smithCorpusWords(&.{ 0, 0, 0, 1 });
+// install(normal range) -> acquire -> install(replaces while still held,
+// i.e. `held_outlived_current` becomes true with `held_refs > 0`) -> end:
+// teardown must drain the retained old snapshot and verify its wipe there,
+// not via the install-replacement bracket (which only fires when the
+// tracked snapshot is unheld at the moment it is replaced).
+const keyring_replace_while_held = smithCorpusWords(&.{
+    23, 2,
+    0,  1,
+    2,  0,
+    1,
+});
+// install -> acquire -> retain (a second modeled owner) -> install
+// (replaces while held) -> release -> release (the final modeled
+// reference, with the snapshot already outlived): exercises explicit
+// `Snapshot.retain()` plus the exact-final-release assertion under it.
+const keyring_explicit_retain_release = smithCorpusWords(&.{
+    23, 5,
+    0,  1,
+    2,  3,
+    0,  1,
+    4,  4,
+});
+// install -> seal, immediately faulted after the nonce is reserved.
+const keyring_fault_after_reserve = smithCorpusWords(&.{
+    23, 1,
+    0,  1,
+    5,  0,
+});
+// install(normal range, capacity 3) -> three successful reservations ->
+// a fourth seal that finds no room left and hits exact exhaustion.
+const keyring_success_and_exhaustion = smithCorpusWords(&.{
+    23, 4,
+    0,  1,
+    5,  1,
+    5,  1,
+    5,  1,
+    5,
+});
+// install a lease pinned at `[maxInt(u64) - 1, maxInt(u64))` -> the one
+// nonce it can ever issue -> a second seal that hits exhaustion exactly at
+// the `u64` boundary, proving no wraparound.
+const keyring_near_wrap = smithCorpusWords(&.{
+    23, 2,
+    0,  0,
+    5,  1,
+    5,
+});
+// install -> dry-run validate against an already-populated keyring (not
+// the empty initial state), proving the "never mutates published state"
+// invariant holds once there is real state to protect.
+const keyring_validate_dry_run = smithCorpusWords(&.{
+    23, 1,
+    0,  1,
+    1,
+});
+
 test "fuzz: TLS resumption: ticket keyring install/validate/acquire/retain/release/seal sequence preserves generation, ledger, nonce, and reference invariants" {
     try testing.fuzz({}, fuzzKeyringOperationSequenceInput, .{ .corpus = &.{
-        "",
-        &([_]u8{0} ** 8),
-        &([_]u8{0xff} ** 8),
-        &[_]u8{ 0, 2, 3, 5, 0, 4, 5, 4 },
-        &[_]u8{ 0, 0, 0, 5, 5, 5, 5 },
+        &keyring_oom_first_allocation,
+        &keyring_replace_while_held,
+        &keyring_explicit_retain_release,
+        &keyring_fault_after_reserve,
+        &keyring_success_and_exhaustion,
+        &keyring_near_wrap,
+        &keyring_validate_dry_run,
     } });
 }
 
