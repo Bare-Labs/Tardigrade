@@ -4524,7 +4524,7 @@ fn expectServerLeaseTransition(cache: *StatefulServerCache, before: ServerLeaseT
     }
 }
 
-fn finishAllClientLeases(leases: *[fuzz_max_live_client_leases]ClientLookupResult) void {
+fn cleanupAllClientLeases(leases: *[fuzz_max_live_client_leases]ClientLookupResult) void {
     for (leases) |*lease| {
         lease.deinit();
         lease.* = .miss;
@@ -4536,6 +4536,63 @@ fn firstClientLeaseSlot(leases: *[fuzz_max_live_client_leases]ClientLookupResult
         if (lease.* != .hit) return i;
     }
     return null;
+}
+
+fn finishAllClientLeasesChecked(cache: *ClientSessionCache, leases: *[fuzz_max_live_client_leases]ClientLookupResult) !void {
+    for (leases) |*lease| {
+        if (lease.* != .hit) continue;
+        const before = try captureClientLeaseTransition(cache, &lease.hit);
+        lease.deinit();
+        lease.* = .miss;
+        try expectClientLeaseTransition(cache, before, .aborted);
+    }
+}
+
+fn expectClientLeaseModel(
+    cache: *ClientSessionCache,
+    leases: *const [fuzz_max_live_client_leases]ClientLookupResult,
+    persistence_token: ?u64,
+) !void {
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+
+    try testing.expectEqual(persistence_token orelse 0, cache.persistence_epoch);
+
+    var modeled_pins: usize = 0;
+    for (leases) |*lease| {
+        if (lease.* != .hit) continue;
+        try testing.expect(lease.hit.active);
+        try testing.expectEqual(cache.cache_generation, lease.hit.cache_generation);
+        for (0..lease.hit.offers.len) |i| {
+            const token = lease.hit.tokens[i];
+            if (!token.single_use) continue;
+            modeled_pins += 1;
+            try testing.expectEqual(@as(?u64, null), persistence_token);
+            const idx = cache.findIndexByEntryId(token.entry_id) orelse return error.ClientLeaseModelMissingPinnedEntry;
+            const entry = cache.entries.items[idx];
+            try testing.expectEqual(UsagePolicy.single_use, entry.usage);
+            try testing.expectEqual(token.lease_epoch, entry.active_lease_epoch.?);
+        }
+    }
+
+    var cache_pins: usize = 0;
+    for (cache.entries.items) |entry| {
+        const epoch = entry.active_lease_epoch orelse continue;
+        cache_pins += 1;
+        try testing.expectEqual(UsagePolicy.single_use, entry.usage);
+        try testing.expectEqual(@as(?u64, null), persistence_token);
+        var owners: usize = 0;
+        for (leases) |*lease| {
+            if (lease.* != .hit) continue;
+            try testing.expectEqual(cache.cache_generation, lease.hit.cache_generation);
+            for (0..lease.hit.offers.len) |i| {
+                const token = lease.hit.tokens[i];
+                if (token.single_use and token.entry_id == entry.entry_id and token.lease_epoch == epoch) owners += 1;
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), owners);
+    }
+    try testing.expectEqual(modeled_pins, cache_pins);
 }
 
 fn clientStoreOomSweep() !void {
@@ -4658,7 +4715,7 @@ fn runClientFuzzCase(smith: *std.testing.Smith) !void {
     var persistence_token: ?u64 = null;
     var now_ms: i64 = 0;
     errdefer {
-        finishAllClientLeases(&leases);
+        cleanupAllClientLeases(&leases);
         if (persistence_token) |token| cache.endPersistenceOperation(token);
         cache.deinit();
     }
@@ -4759,7 +4816,7 @@ fn runClientFuzzCase(smith: *std.testing.Smith) !void {
                 }
             },
             .restore_clones => {
-                finishAllClientLeases(&leases);
+                try finishAllClientLeasesChecked(&cache, &leases);
                 if (persistence_token) |token| {
                     cache.endPersistenceOperation(token);
                     persistence_token = null;
@@ -4787,7 +4844,7 @@ fn runClientFuzzCase(smith: *std.testing.Smith) !void {
                 _ = cache.storeClone(&ticket, now_ms, .reusable);
             },
             .quiescent_reset => {
-                finishAllClientLeases(&leases);
+                try finishAllClientLeasesChecked(&cache, &leases);
                 if (persistence_token) |token| {
                     cache.endPersistenceOperation(token);
                     persistence_token = null;
@@ -4802,9 +4859,10 @@ fn runClientFuzzCase(smith: *std.testing.Smith) !void {
             },
         }
         try expectClientCacheInvariants(&cache);
+        try expectClientLeaseModel(&cache, &leases, persistence_token);
     }
 
-    finishAllClientLeases(&leases);
+    try finishAllClientLeasesChecked(&cache, &leases);
     if (persistence_token) |token| cache.endPersistenceOperation(token);
     try testing.expect(!cache.hasOutstandingLease());
     const before_destroy = testResetDestroyCounters();
@@ -4821,7 +4879,7 @@ fn serverHandleWithByte(byte: u8) [stateful_identity_len]u8 {
     return handle;
 }
 
-fn finishAllServerLeases(leases: *[fuzz_max_live_server_leases]ResolveLeaseResult) void {
+fn cleanupAllServerLeases(leases: *[fuzz_max_live_server_leases]ResolveLeaseResult) void {
     for (leases) |*lease| {
         lease.deinit();
         lease.* = .miss;
@@ -4833,6 +4891,63 @@ fn firstServerLeaseSlot(leases: *[fuzz_max_live_server_leases]ResolveLeaseResult
         if (lease.* != .hit) return i;
     }
     return null;
+}
+
+fn finishAllServerLeasesChecked(cache: *StatefulServerCache, leases: *[fuzz_max_live_server_leases]ResolveLeaseResult) !void {
+    for (leases) |*lease| {
+        if (lease.* != .hit) continue;
+        const before = try captureServerLeaseTransition(cache, &lease.hit.lease);
+        lease.deinit();
+        lease.* = .miss;
+        try expectServerLeaseTransition(cache, before, .release);
+    }
+}
+
+fn expectServerLeaseModel(
+    cache: *StatefulServerCache,
+    leases: *const [fuzz_max_live_server_leases]ResolveLeaseResult,
+    persistence_token: ?u64,
+) !void {
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+
+    try testing.expectEqual(persistence_token orelse 0, cache.persistence_epoch);
+
+    var modeled_pins: usize = 0;
+    for (leases) |*result| {
+        if (result.* != .hit) continue;
+        try testing.expect(result.hit.lease.active);
+        try testing.expectEqual(cache.cache_generation, result.hit.lease.cache_generation);
+        const entry = cache.entries.get(result.hit.lease.entry_id) orelse {
+            try testing.expect(!result.hit.lease.single_use);
+            continue;
+        };
+        try testing.expectEqual(result.hit.lease.single_use, entry.usage == .single_use);
+        if (result.hit.lease.single_use) {
+            modeled_pins += 1;
+            try testing.expectEqual(@as(?u64, null), persistence_token);
+            try testing.expectEqual(result.hit.lease.lease_epoch, entry.active_lease_epoch.?);
+        }
+    }
+
+    var cache_pins: usize = 0;
+    var it = cache.entries.iterator();
+    while (it.next()) |kv| {
+        const entry = kv.value_ptr.*;
+        const epoch = entry.active_lease_epoch orelse continue;
+        cache_pins += 1;
+        try testing.expectEqual(UsagePolicy.single_use, entry.usage);
+        try testing.expectEqual(@as(?u64, null), persistence_token);
+        var owners: usize = 0;
+        for (leases) |*result| {
+            if (result.* != .hit) continue;
+            const lease = result.hit.lease;
+            try testing.expectEqual(cache.cache_generation, lease.cache_generation);
+            if (lease.single_use and lease.entry_id == kv.key_ptr.* and lease.lease_epoch == epoch) owners += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), owners);
+    }
+    try testing.expectEqual(modeled_pins, cache_pins);
 }
 
 fn serverInsertOomSweep() !void {
@@ -5007,7 +5122,7 @@ fn runServerFuzzCase(smith: *std.testing.Smith) !void {
     var persistence_token: ?u64 = null;
     var now_ms: i64 = 0;
     errdefer {
-        finishAllServerLeases(&leases);
+        cleanupAllServerLeases(&leases);
         if (persistence_token) |token| cache.endPersistenceOperation(token);
         cache.deinit();
     }
@@ -5153,7 +5268,7 @@ fn runServerFuzzCase(smith: *std.testing.Smith) !void {
                 }
             },
             .restore_entries => {
-                finishAllServerLeases(&leases);
+                try finishAllServerLeasesChecked(&cache, &leases);
                 if (persistence_token) |token| {
                     cache.endPersistenceOperation(token);
                     persistence_token = null;
@@ -5207,7 +5322,7 @@ fn runServerFuzzCase(smith: *std.testing.Smith) !void {
                 }
             },
             .quiescent_reset => {
-                finishAllServerLeases(&leases);
+                try finishAllServerLeasesChecked(&cache, &leases);
                 if (persistence_token) |token| {
                     cache.endPersistenceOperation(token);
                     persistence_token = null;
@@ -5225,9 +5340,10 @@ fn runServerFuzzCase(smith: *std.testing.Smith) !void {
             },
         }
         expectServerCacheInvariants(&cache) catch return error.ServerFuzzCacheInvariant;
+        try expectServerLeaseModel(&cache, &leases, persistence_token);
     }
 
-    finishAllServerLeases(&leases);
+    try finishAllServerLeasesChecked(&cache, &leases);
     if (persistence_token) |token| cache.endPersistenceOperation(token);
     if (cache.hasOutstandingLease()) return error.ServerFuzzOutstandingLease;
     const before_destroy = testResetDestroyCounters();
