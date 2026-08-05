@@ -351,6 +351,10 @@ const ClientEntry = struct {
 fn destroyClientEntry(allocator: std.mem.Allocator, entry: *ClientEntry) void {
     entry.ticket.deinit();
     secrets.secureZero(std.mem.asBytes(entry));
+    if (builtin.is_test) {
+        for (std.mem.asBytes(entry)) |byte| std.debug.assert(byte == 0);
+        test_client_entry_destroy_count +%= 1;
+    }
     allocator.destroy(entry);
 }
 
@@ -1427,6 +1431,10 @@ const ServerEntry = struct {
 fn destroyServerEntry(allocator: std.mem.Allocator, entry: *ServerEntry) void {
     entry.state.deinit();
     secrets.secureZero(std.mem.asBytes(entry));
+    if (builtin.is_test) {
+        for (std.mem.asBytes(entry)) |byte| std.debug.assert(byte == 0);
+        test_server_entry_destroy_count +%= 1;
+    }
     allocator.destroy(entry);
 }
 
@@ -1533,6 +1541,10 @@ const PublicServerLeaseBox = struct {
         const self: *PublicServerLeaseBox = @ptrCast(@alignCast(ctx));
         const allocator = self.allocator;
         secrets.secureZero(std.mem.asBytes(self));
+        if (builtin.is_test) {
+            for (std.mem.asBytes(self)) |byte| std.debug.assert(byte == 0);
+            test_public_server_lease_box_destroy_count +%= 1;
+        }
         allocator.destroy(self);
     }
 };
@@ -2517,6 +2529,336 @@ fn hasDuplicateServerHandle(items: []const PersistedServerEntry) bool {
 // -----------------------------------------------------------------------
 
 const testing = std.testing;
+
+var test_client_entry_destroy_count: u64 = 0;
+var test_server_entry_destroy_count: u64 = 0;
+var test_public_server_lease_box_destroy_count: u64 = 0;
+
+const fuzz_cache_limits: Limits = .{
+    .max_entries = 4,
+    .max_origins = 2,
+    .max_entries_per_origin = 2,
+    .max_entry_bytes = 2 * 1024,
+    .max_total_bytes = 4 * 1024,
+};
+const fuzz_max_operations: usize = 16;
+const fuzz_max_live_client_leases: usize = 2;
+const fuzz_max_live_server_leases: usize = 2;
+const fuzz_max_persisted_records: usize = 6;
+const fuzz_max_oom_fail_index: usize = 64;
+const fuzz_clock_steps = [_]i64{ 0, 1, 999, 1000, 10_000 };
+
+fn fingerprintBytes(domain: []const u8, bytes: []const u8) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(domain);
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, @intCast(bytes.len), .big);
+    hasher.update(&len);
+    hasher.update(bytes);
+    var out: [32]u8 = undefined;
+    hasher.final(&out);
+    return out;
+}
+
+fn fingerprintClientTicket(ticket: *const session.ClientTicketState) ![32]u8 {
+    var encoded: [4096]u8 = undefined;
+    const bytes = try session.encodeClient(ticket, session.Limits.default, &encoded);
+    return fingerprintBytes("TARDIGRADE-TEST-CLIENT-CACHE-FINGERPRINT-V1", bytes);
+}
+
+fn fingerprintServerState(state: *const session.ServerRecoverableState) ![32]u8 {
+    var encoded: [4096]u8 = undefined;
+    const bytes = try session.encodeServer(state, session.Limits.default, &encoded);
+    return fingerprintBytes("TARDIGRADE-TEST-SERVER-CACHE-FINGERPRINT-V1", bytes);
+}
+
+const ClientSnapshotEntry = struct {
+    ptr: usize,
+    entry_id: u64,
+    origin: OriginDigest,
+    usage: UsagePolicy,
+    active_lease_epoch: ?u64,
+    insertion_sequence: u64,
+    lru_sequence: u64,
+    bytes: usize,
+    fingerprint: [32]u8,
+
+    fn wipe(self: *ClientSnapshotEntry) void {
+        secrets.secureZero(std.mem.asBytes(self));
+    }
+};
+
+const ClientCacheState = struct {
+    entries_len: usize,
+    entries_ptr: usize,
+    total_bytes: usize,
+    next_insertion_sequence: u64,
+    next_lru_sequence: u64,
+    next_entry_id: u64,
+    next_lease_epoch: u64,
+    cache_generation: u64,
+    persistence_epoch: u64,
+    next_persistence_token: u64,
+    entries: [fuzz_cache_limits.max_entries]ClientSnapshotEntry = undefined,
+
+    fn capture(cache: *ClientSessionCache) !ClientCacheState {
+        cache.mutex.lock();
+        defer cache.mutex.unlock();
+        var out = ClientCacheState{
+            .entries_len = cache.entries.items.len,
+            .entries_ptr = @intFromPtr(cache.entries.items.ptr),
+            .total_bytes = cache.total_bytes,
+            .next_insertion_sequence = cache.next_insertion_sequence,
+            .next_lru_sequence = cache.next_lru_sequence,
+            .next_entry_id = cache.next_entry_id,
+            .next_lease_epoch = cache.next_lease_epoch,
+            .cache_generation = cache.cache_generation,
+            .persistence_epoch = cache.persistence_epoch,
+            .next_persistence_token = cache.next_persistence_token,
+        };
+        try testing.expect(cache.entries.items.len <= out.entries.len);
+        for (cache.entries.items, 0..) |entry, i| {
+            out.entries[i] = .{
+                .ptr = @intFromPtr(entry),
+                .entry_id = entry.entry_id,
+                .origin = entry.origin,
+                .usage = entry.usage,
+                .active_lease_epoch = entry.active_lease_epoch,
+                .insertion_sequence = entry.insertion_sequence,
+                .lru_sequence = entry.lru_sequence,
+                .bytes = entry.bytes,
+                .fingerprint = try fingerprintClientTicket(&entry.ticket),
+            };
+        }
+        return out;
+    }
+
+    fn expectEqual(self: *const ClientCacheState, other: *const ClientCacheState) !void {
+        try testing.expectEqual(self.entries_len, other.entries_len);
+        try testing.expectEqual(self.entries_ptr, other.entries_ptr);
+        try testing.expectEqual(self.total_bytes, other.total_bytes);
+        try testing.expectEqual(self.next_insertion_sequence, other.next_insertion_sequence);
+        try testing.expectEqual(self.next_lru_sequence, other.next_lru_sequence);
+        try testing.expectEqual(self.next_entry_id, other.next_entry_id);
+        try testing.expectEqual(self.next_lease_epoch, other.next_lease_epoch);
+        try testing.expectEqual(self.cache_generation, other.cache_generation);
+        try testing.expectEqual(self.persistence_epoch, other.persistence_epoch);
+        try testing.expectEqual(self.next_persistence_token, other.next_persistence_token);
+        for (0..self.entries_len) |i| try testing.expectEqualDeep(self.entries[i], other.entries[i]);
+    }
+
+    fn deinit(self: *ClientCacheState) void {
+        for (0..self.entries_len) |i| self.entries[i].wipe();
+        self.entries_len = 0;
+    }
+};
+
+const ServerSnapshotEntry = struct {
+    ptr: usize,
+    entry_id: u64,
+    origin: OriginDigest,
+    usage: UsagePolicy,
+    active_lease_epoch: ?u64,
+    lru_sequence: u64,
+    pending_lru_sequence: ?u64,
+    bytes: usize,
+    handle_fingerprint: [32]u8,
+    state_fingerprint: [32]u8,
+
+    fn wipe(self: *ServerSnapshotEntry) void {
+        secrets.secureZero(std.mem.asBytes(self));
+    }
+};
+
+const ServerCacheState = struct {
+    entries_count: usize,
+    handle_index_count: usize,
+    origin_index_count: usize,
+    total_bytes: usize,
+    next_entry_id: u64,
+    next_lru_sequence: u64,
+    next_lease_epoch: u64,
+    cache_generation: u64,
+    persistence_epoch: u64,
+    next_persistence_token: u64,
+    entries: [fuzz_cache_limits.max_entries]ServerSnapshotEntry = undefined,
+    handle_index: [fuzz_cache_limits.max_entries]struct { digest: HandleDigest, entry_id: u64 } = undefined,
+    origin_members: [fuzz_cache_limits.max_entries]struct { origin: OriginDigest, entry_id: u64 } = undefined,
+    origin_member_count: usize = 0,
+
+    fn entryLess(_: void, a: ServerSnapshotEntry, b: ServerSnapshotEntry) bool {
+        return a.entry_id < b.entry_id;
+    }
+
+    fn capture(cache: *StatefulServerCache) !ServerCacheState {
+        cache.mutex.lock();
+        defer cache.mutex.unlock();
+        var out = ServerCacheState{
+            .entries_count = cache.entries.count(),
+            .handle_index_count = cache.handle_index.count(),
+            .origin_index_count = cache.origin_index.count(),
+            .total_bytes = cache.total_bytes,
+            .next_entry_id = cache.next_entry_id,
+            .next_lru_sequence = cache.next_lru_sequence,
+            .next_lease_epoch = cache.next_lease_epoch,
+            .cache_generation = cache.cache_generation,
+            .persistence_epoch = cache.persistence_epoch,
+            .next_persistence_token = cache.next_persistence_token,
+        };
+        try testing.expect(cache.entries.count() <= out.entries.len);
+        var it = cache.entries.iterator();
+        var i: usize = 0;
+        while (it.next()) |kv| : (i += 1) {
+            const entry = kv.value_ptr.*;
+            out.entries[i] = .{
+                .ptr = @intFromPtr(entry),
+                .entry_id = kv.key_ptr.*,
+                .origin = entry.origin,
+                .usage = entry.usage,
+                .active_lease_epoch = entry.active_lease_epoch,
+                .lru_sequence = entry.lru_sequence,
+                .pending_lru_sequence = entry.pending_lru_sequence,
+                .bytes = entry.bytes,
+                .handle_fingerprint = fingerprintBytes("TARDIGRADE-TEST-SERVER-HANDLE-FINGERPRINT-V1", &entry.handle),
+                .state_fingerprint = try fingerprintServerState(&entry.state),
+            };
+        }
+        std.mem.sort(ServerSnapshotEntry, out.entries[0..out.entries_count], {}, ServerCacheState.entryLess);
+
+        var hi = cache.handle_index.iterator();
+        i = 0;
+        while (hi.next()) |kv| : (i += 1) {
+            try testing.expect(i < out.handle_index.len);
+            out.handle_index[i] = .{ .digest = kv.key_ptr.*, .entry_id = kv.value_ptr.* };
+        }
+
+        var oi = cache.origin_index.iterator();
+        while (oi.next()) |kv| {
+            for (kv.value_ptr.items) |entry_id| {
+                try testing.expect(out.origin_member_count < out.origin_members.len);
+                out.origin_members[out.origin_member_count] = .{ .origin = kv.key_ptr.*, .entry_id = entry_id };
+                out.origin_member_count += 1;
+            }
+        }
+        return out;
+    }
+
+    fn expectEqual(self: *const ServerCacheState, other: *const ServerCacheState) !void {
+        try testing.expectEqual(self.entries_count, other.entries_count);
+        try testing.expectEqual(self.handle_index_count, other.handle_index_count);
+        try testing.expectEqual(self.origin_index_count, other.origin_index_count);
+        try testing.expectEqual(self.total_bytes, other.total_bytes);
+        try testing.expectEqual(self.next_entry_id, other.next_entry_id);
+        try testing.expectEqual(self.next_lru_sequence, other.next_lru_sequence);
+        try testing.expectEqual(self.next_lease_epoch, other.next_lease_epoch);
+        try testing.expectEqual(self.cache_generation, other.cache_generation);
+        try testing.expectEqual(self.persistence_epoch, other.persistence_epoch);
+        try testing.expectEqual(self.next_persistence_token, other.next_persistence_token);
+        try testing.expectEqual(self.origin_member_count, other.origin_member_count);
+        for (0..self.entries_count) |i| try testing.expectEqualDeep(self.entries[i], other.entries[i]);
+        for (0..self.handle_index_count) |i| try testing.expectEqualDeep(self.handle_index[i], other.handle_index[i]);
+        for (0..self.origin_member_count) |i| try testing.expectEqualDeep(self.origin_members[i], other.origin_members[i]);
+    }
+
+    fn deinit(self: *ServerCacheState) void {
+        for (0..self.entries_count) |i| self.entries[i].wipe();
+        self.entries_count = 0;
+    }
+};
+
+fn expectClientCacheInvariants(cache: *ClientSessionCache) !void {
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+    try testing.expect(cache.entries.items.len <= cache.limits.max_entries);
+    var total_bytes: usize = 0;
+    var distinct_origins: usize = 0;
+    for (cache.entries.items, 0..) |entry, i| {
+        try testing.expect(entry.bytes <= cache.limits.max_entry_bytes);
+        total_bytes += entry.bytes;
+        try testing.expect(entry.active_lease_epoch == null or entry.usage == .single_use);
+        var origin_seen_before = false;
+        var per_origin: usize = 0;
+        for (cache.entries.items, 0..) |other, j| {
+            if (i != j) {
+                try testing.expect(entry.entry_id != other.entry_id);
+                try testing.expect(entry.insertion_sequence != other.insertion_sequence);
+                try testing.expect(entry.lru_sequence != other.lru_sequence);
+            }
+            if (std.mem.eql(u8, &entry.origin, &other.origin)) {
+                per_origin += 1;
+                if (j < i) origin_seen_before = true;
+                if (i != j) try testing.expect(!entry.ticket.ticket.eql(&other.ticket.ticket));
+            }
+        }
+        if (!origin_seen_before) distinct_origins += 1;
+        try testing.expect(per_origin <= cache.limits.max_entries_per_origin);
+    }
+    try testing.expectEqual(total_bytes, cache.total_bytes);
+    try testing.expect(cache.total_bytes <= cache.limits.max_total_bytes);
+    try testing.expect(distinct_origins <= cache.limits.max_origins);
+}
+
+fn expectServerCacheInvariants(cache: *StatefulServerCache) !void {
+    cache.mutex.lock();
+    defer cache.mutex.unlock();
+    try testing.expect(cache.entries.count() <= cache.limits.max_entries);
+    try testing.expectEqual(cache.entries.count(), cache.handle_index.count());
+    var total_bytes: usize = 0;
+    var origin_members: usize = 0;
+    var it = cache.entries.iterator();
+    while (it.next()) |kv| {
+        const entry_id = kv.key_ptr.*;
+        const entry = kv.value_ptr.*;
+        try testing.expect(entry.bytes <= cache.limits.max_entry_bytes);
+        try testing.expect(entry.pending_lru_sequence == null);
+        try testing.expect(entry.active_lease_epoch == null or entry.usage == .single_use);
+        total_bytes += entry.bytes;
+        try testing.expectEqual(entry_id, cache.handle_index.get(digestHandle(&entry.handle)).?);
+        const bucket = cache.origin_index.get(entry.origin).?;
+        try testing.expect(std.mem.indexOfScalar(u64, bucket.items, entry_id) != null);
+        var it2 = cache.entries.iterator();
+        while (it2.next()) |kv2| {
+            if (entry_id == kv2.key_ptr.*) continue;
+            const other = kv2.value_ptr.*;
+            try testing.expect(entry.lru_sequence != other.lru_sequence);
+            try testing.expect(!std.mem.eql(u8, &entry.handle, &other.handle));
+        }
+    }
+    try testing.expectEqual(total_bytes, cache.total_bytes);
+    try testing.expect(cache.total_bytes <= cache.limits.max_total_bytes);
+
+    var origin_it = cache.origin_index.iterator();
+    while (origin_it.next()) |kv| {
+        try testing.expect(kv.value_ptr.items.len <= cache.limits.max_entries_per_origin);
+        origin_members += kv.value_ptr.items.len;
+        for (kv.value_ptr.items) |entry_id| {
+            const entry = cache.entries.get(entry_id).?;
+            try testing.expectEqualDeep(kv.key_ptr.*, entry.origin);
+        }
+    }
+    try testing.expectEqual(cache.entries.count(), origin_members);
+    try testing.expect(cache.origin_index.count() <= cache.limits.max_origins);
+
+    var handle_it = cache.handle_index.iterator();
+    while (handle_it.next()) |kv| {
+        const entry = cache.entries.get(kv.value_ptr.*).?;
+        try testing.expectEqualDeep(kv.key_ptr.*, digestHandle(&entry.handle));
+    }
+}
+
+fn testResetDestroyCounters() struct { client: u64, server: u64, box: u64 } {
+    return .{
+        .client = test_client_entry_destroy_count,
+        .server = test_server_entry_destroy_count,
+        .box = test_public_server_lease_box_destroy_count,
+    };
+}
+
+fn expectDestroyDelta(before: anytype, client: u64, server: u64, box: u64) !void {
+    try testing.expectEqual(before.client + client, test_client_entry_destroy_count);
+    try testing.expectEqual(before.server + server, test_server_entry_destroy_count);
+    try testing.expectEqual(before.box + box, test_public_server_lease_box_destroy_count);
+}
 
 fn commonParams(psk: []const u8, sni: []const u8) session.ResumableSessionCommon.InitParams {
     return .{
@@ -3954,4 +4296,805 @@ test "a removed client entry's inline secrets are wiped from allocator backing m
 
     try testing.expect(std.mem.indexOf(u8, &backing, &target_psk) == null);
     try testing.expect(std.mem.indexOf(u8, &backing, target_nonce) == null);
+}
+
+const ClientFuzzOp = enum {
+    store_reusable,
+    store_single_use,
+    replace_existing,
+    lookup_compatible,
+    lookup_incompatible,
+    finish_selected,
+    drop_offer,
+    finish_not_selected,
+    abort_or_deinit,
+    advance_clock,
+    cleanup,
+    begin_persistence,
+    end_persistence_correct,
+    end_persistence_wrong_or_stale,
+    clone_for_persistence,
+    restore_clones,
+    force_sequence_renumber,
+    quiescent_reset,
+    client_oom_sweep,
+};
+
+const ServerFuzzOp = enum {
+    insert_reusable,
+    insert_single_use,
+    resolve_known,
+    resolve_unknown,
+    resolve_malformed_shape,
+    resolve_through_public_adapter,
+    commit_lease,
+    release_lease,
+    deinit_lease,
+    complete_reusable_selection_hook,
+    advance_clock,
+    cleanup,
+    begin_persistence,
+    end_persistence_correct,
+    end_persistence_wrong_or_stale,
+    clone_for_persistence,
+    restore_entries,
+    entropy_failure,
+    handle_collision_then_success,
+    handle_collision_exhaustion,
+    force_lru_renumber,
+    quiescent_reset,
+    server_oom_sweep,
+};
+
+fn smithCorpusWords(comptime words: []const u64) [words.len * 8]u8 {
+    var out = [_]u8{0} ** (words.len * 8);
+    inline for (words, 0..) |word, i| {
+        std.mem.writeInt(u64, out[i * 8 ..][0..8], word, .little);
+    }
+    return out;
+}
+
+fn fuzzClientTicket(allocator: std.mem.Allocator, id: u64, usage_byte: u64, now_ms: i64) !session.ClientTicketState {
+    var ticket_buf: [32]u8 = undefined;
+    const ticket = try std.fmt.bufPrint(&ticket_buf, "ct-{d}-{d}", .{ id % 23, usage_byte % 5 });
+    var sni_buf: [32]u8 = undefined;
+    const sni = try std.fmt.bufPrint(&sni_buf, "c{d}.example.test", .{id % fuzz_cache_limits.max_origins});
+    var psk = [_]u8{0x51} ** 32;
+    psk[0] = @truncate(id);
+    var nonce_buf: [16]u8 = undefined;
+    const nonce = try std.fmt.bufPrint(&nonce_buf, "n{d}", .{usage_byte % 97});
+    var state = try makeClientWithSecret(allocator, ticket, sni, &psk, nonce);
+    state.received_at_unix_ms = now_ms;
+    return state;
+}
+
+fn fuzzServerState(allocator: std.mem.Allocator, id: u64) !session.ServerRecoverableState {
+    var sni_buf: [32]u8 = undefined;
+    const sni = try std.fmt.bufPrint(&sni_buf, "s{d}.example.test", .{id % fuzz_cache_limits.max_origins});
+    return makeServer(allocator, sni);
+}
+
+fn finishAllClientLeases(leases: *[fuzz_max_live_client_leases]ClientLookupResult) void {
+    for (leases) |*lease| lease.deinit();
+}
+
+fn firstClientLeaseSlot(leases: *[fuzz_max_live_client_leases]ClientLookupResult) ?usize {
+    for (leases, 0..) |*lease, i| {
+        if (lease.* != .hit) return i;
+    }
+    return null;
+}
+
+fn clientStoreOomSweep() !void {
+    var saw_failure = false;
+    var saw_success = false;
+    for (0..fuzz_max_oom_fail_index + 1) |fail_index| {
+        var backing: [1 << 18]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&backing);
+        var cache = try ClientSessionCache.init(fba.allocator(), fuzz_cache_limits);
+        defer cache.deinit();
+
+        var existing = try fuzzClientTicket(fba.allocator(), 1, 0, 0);
+        try testing.expectEqual(StoreResult.stored, cache.storeClone(&existing, 0, .reusable));
+        existing.deinit();
+        var before = try ClientCacheState.capture(&cache);
+        defer before.deinit();
+
+        var incoming = try fuzzClientTicket(testing.allocator, 2, 0, 1);
+        defer incoming.deinit();
+        var failing = testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = fail_index });
+        cache.allocator = failing.allocator();
+        const result = cache.storeClone(&incoming, 1, .reusable);
+        cache.allocator = fba.allocator();
+
+        if (result == .storage_failed) {
+            saw_failure = true;
+            var after = try ClientCacheState.capture(&cache);
+            defer after.deinit();
+            try before.expectEqual(&after);
+        } else {
+            try testing.expect(result == .stored or result == .replaced);
+            saw_success = true;
+            break;
+        }
+    }
+    std.mem.doNotOptimizeAway(saw_success);
+    std.mem.doNotOptimizeAway(saw_failure);
+}
+
+fn clientLookupOomSweep() !void {
+    var saw_failure = false;
+    var saw_success = false;
+    for (0..fuzz_max_oom_fail_index + 1) |fail_index| {
+        var backing: [1 << 18]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&backing);
+        var cache = try ClientSessionCache.init(fba.allocator(), fuzz_cache_limits);
+        defer cache.deinit();
+        for (0..2) |i| {
+            var ticket = try fuzzClientTicket(fba.allocator(), @intCast(i), 0, @intCast(i));
+            try testing.expectEqual(StoreResult.stored, cache.storeClone(&ticket, @intCast(i), .single_use));
+            ticket.deinit();
+        }
+        var before = try ClientCacheState.capture(&cache);
+        defer before.deinit();
+
+        var failing = testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = fail_index });
+        cache.allocator = failing.allocator();
+        var result = cache.lookupOffers(testCandidate("c0.example.test"), 2);
+        cache.allocator = fba.allocator();
+        defer result.deinit();
+
+        if (result == .storage_failed) {
+            saw_failure = true;
+            var after = try ClientCacheState.capture(&cache);
+            defer after.deinit();
+            try before.expectEqual(&after);
+        } else {
+            try testing.expect(result == .hit or result == .miss);
+            saw_success = true;
+            break;
+        }
+    }
+    std.mem.doNotOptimizeAway(saw_success);
+    std.mem.doNotOptimizeAway(saw_failure);
+}
+
+fn clientPersistenceOomSweep() !void {
+    var saw_failure = false;
+    var saw_success = false;
+    for (0..fuzz_max_oom_fail_index + 1) |fail_index| {
+        var backing: [1 << 18]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&backing);
+        var cache = try ClientSessionCache.init(fba.allocator(), fuzz_cache_limits);
+        defer cache.deinit();
+        var existing = try fuzzClientTicket(fba.allocator(), 0, 0, 0);
+        try testing.expectEqual(StoreResult.stored, cache.storeClone(&existing, 0, .reusable));
+        existing.deinit();
+        var before = try ClientCacheState.capture(&cache);
+        defer before.deinit();
+
+        var p0 = PersistedClientEntry{ .ticket = try fuzzClientTicket(testing.allocator, 1, 0, 1), .usage = .reusable, .insertion_sequence = 1, .lru_sequence = 1 };
+        var p1 = PersistedClientEntry{ .ticket = try fuzzClientTicket(testing.allocator, 2, 0, 2), .usage = .single_use, .insertion_sequence = 2, .lru_sequence = 2 };
+        var items = [_]PersistedClientEntry{ p0, p1 };
+        _ = &p0;
+        _ = &p1;
+
+        var failing = testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = fail_index });
+        cache.allocator = failing.allocator();
+        const result = cache.restoreClones(&items, 3);
+        cache.allocator = fba.allocator();
+
+        if (result) |_| {
+            saw_success = true;
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            saw_failure = true;
+            var after = try ClientCacheState.capture(&cache);
+            defer after.deinit();
+            try before.expectEqual(&after);
+        }
+    }
+    std.mem.doNotOptimizeAway(saw_success);
+    std.mem.doNotOptimizeAway(saw_failure);
+}
+
+fn runClientFuzzCase(smith: *std.testing.Smith) !void {
+    var cache = try ClientSessionCache.init(testing.allocator, fuzz_cache_limits);
+    var leases = [_]ClientLookupResult{.miss} ** fuzz_max_live_client_leases;
+    var persistence_token: ?u64 = null;
+    var now_ms: i64 = 0;
+    errdefer {
+        finishAllClientLeases(&leases);
+        if (persistence_token) |token| cache.endPersistenceOperation(token);
+        cache.deinit();
+    }
+
+    for (0..fuzz_max_operations) |_| {
+        const op = @as(ClientFuzzOp, @enumFromInt(smith.index(@typeInfo(ClientFuzzOp).@"enum".fields.len)));
+        switch (op) {
+            .store_reusable, .store_single_use => {
+                const id = smith.value(u64);
+                var ticket = try fuzzClientTicket(testing.allocator, id, smith.value(u64), now_ms);
+                defer ticket.deinit();
+                const before = try fingerprintClientTicket(&ticket);
+                const result = cache.storeClone(&ticket, now_ms, if (op == .store_single_use) .single_use else .reusable);
+                try testing.expect(result == .stored or result == .replaced or result == .rejected_capacity or result == .storage_failed);
+                try testing.expectEqualDeep(before, try fingerprintClientTicket(&ticket));
+            },
+            .replace_existing => {
+                var first = try fuzzClientTicket(testing.allocator, 7, 0, now_ms);
+                defer first.deinit();
+                _ = cache.storeClone(&first, now_ms, .reusable);
+                var replacement = try fuzzClientTicket(testing.allocator, 7, 1, now_ms + 1);
+                defer replacement.deinit();
+                _ = cache.storeClone(&replacement, now_ms + 1, .single_use);
+            },
+            .lookup_compatible, .lookup_incompatible => {
+                const sni = if (op == .lookup_compatible) "c0.example.test" else "not-present.example.test";
+                var result = cache.lookupOffers(testCandidate(sni), now_ms);
+                if (result == .hit) {
+                    if (firstClientLeaseSlot(&leases)) |slot| {
+                        leases[slot].deinit();
+                        leases[slot] = result;
+                    } else {
+                        result.deinit();
+                    }
+                } else {
+                    result.deinit();
+                }
+            },
+            .finish_selected => for (&leases) |*lease| {
+                if (lease.* == .hit) {
+                    const selected = if (lease.hit.offers.len == 0) 0 else smith.index(lease.hit.offers.len + 1);
+                    lease.hit.finish(.{ .selected = selected });
+                    lease.deinit();
+                    break;
+                }
+            },
+            .drop_offer => for (&leases) |*lease| {
+                if (lease.* == .hit and lease.hit.offers.len > 0) {
+                    lease.hit.dropOffer(smith.index(lease.hit.offers.len));
+                    break;
+                }
+            },
+            .finish_not_selected => for (&leases) |*lease| {
+                if (lease.* == .hit) {
+                    lease.hit.finish(.not_selected);
+                    lease.deinit();
+                    break;
+                }
+            },
+            .abort_or_deinit => for (&leases) |*lease| {
+                if (lease.* == .hit) {
+                    lease.deinit();
+                    break;
+                }
+            },
+            .advance_clock => now_ms +|= fuzz_clock_steps[smith.index(fuzz_clock_steps.len)],
+            .cleanup => _ = cache.cleanup(now_ms),
+            .begin_persistence => if (persistence_token == null) {
+                persistence_token = cache.beginPersistenceOperation() catch null;
+            } else {
+                try testing.expectError(error.CacheBusy, cache.beginPersistenceOperation());
+            },
+            .end_persistence_correct => if (persistence_token) |token| {
+                cache.endPersistenceOperation(token);
+                persistence_token = null;
+            },
+            .end_persistence_wrong_or_stale => cache.endPersistenceOperation(smith.value(u64)),
+            .clone_for_persistence => {
+                var clones = cache.cloneLiveForPersistence(testing.allocator, now_ms) catch |err| switch (err) {
+                    error.CacheBusy, error.OutOfMemory => null,
+                };
+                if (clones) |*list| {
+                    for (list.items) |*item| item.deinit();
+                    list.deinit(testing.allocator);
+                }
+            },
+            .restore_clones => {
+                finishAllClientLeases(&leases);
+                if (persistence_token) |token| {
+                    cache.endPersistenceOperation(token);
+                    persistence_token = null;
+                }
+                var items: [fuzz_max_persisted_records]PersistedClientEntry = undefined;
+                const n = 1 + smith.index(3);
+                for (0..n) |i| {
+                    const sequence: u64 = @intCast(i + 1);
+                    items[i] = .{
+                        .ticket = try fuzzClientTicket(testing.allocator, smith.value(u64), @intCast(i), now_ms),
+                        .usage = if (smith.index(2) == 0) .reusable else .single_use,
+                        .insertion_sequence = sequence,
+                        .lru_sequence = sequence,
+                    };
+                }
+                cache.restoreClones(items[0..n], now_ms) catch |err| try testing.expectEqual(error.OutOfMemory, err);
+            },
+            .force_sequence_renumber => {
+                cache.mutex.lock();
+                cache.next_insertion_sequence = std.math.maxInt(u64);
+                cache.next_lru_sequence = std.math.maxInt(u64);
+                cache.mutex.unlock();
+                var ticket = try fuzzClientTicket(testing.allocator, 13, 0, now_ms);
+                defer ticket.deinit();
+                _ = cache.storeClone(&ticket, now_ms, .reusable);
+            },
+            .quiescent_reset => {
+                finishAllClientLeases(&leases);
+                if (persistence_token) |token| {
+                    cache.endPersistenceOperation(token);
+                    persistence_token = null;
+                }
+                cache.deinit();
+                cache = try ClientSessionCache.init(testing.allocator, fuzz_cache_limits);
+            },
+            .client_oom_sweep => switch (smith.index(3)) {
+                0 => try clientStoreOomSweep(),
+                1 => try clientLookupOomSweep(),
+                else => try clientPersistenceOomSweep(),
+            },
+        }
+        try expectClientCacheInvariants(&cache);
+    }
+
+    finishAllClientLeases(&leases);
+    if (persistence_token) |token| cache.endPersistenceOperation(token);
+    try testing.expect(!cache.hasOutstandingLease());
+    const before_destroy = testResetDestroyCounters();
+    const remaining = cache.count();
+    cache.deinit();
+    try expectDestroyDelta(before_destroy, @intCast(remaining), 0, 0);
+}
+
+fn serverHandleWithByte(byte: u8) [stateful_identity_len]u8 {
+    var handle = [_]u8{byte} ** stateful_identity_len;
+    @memcpy(handle[0..4], &stateful_magic);
+    std.mem.writeInt(u16, handle[4..6], stateful_version, .big);
+    std.mem.writeInt(u16, handle[6..8], 0, .big);
+    return handle;
+}
+
+fn finishAllServerLeases(leases: *[fuzz_max_live_server_leases]ResolveLeaseResult) void {
+    for (leases) |*lease| lease.deinit();
+}
+
+fn firstServerLeaseSlot(leases: *[fuzz_max_live_server_leases]ResolveLeaseResult) ?usize {
+    for (leases, 0..) |*lease, i| {
+        if (lease.* != .hit) return i;
+    }
+    return null;
+}
+
+fn serverInsertOomSweep() !void {
+    var saw_failure = false;
+    var saw_success = false;
+    for (0..fuzz_max_oom_fail_index + 1) |fail_index| {
+        var backing: [1 << 18]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&backing);
+        var fixed = FixedRandom{ .pattern_for_call = &.{ 1, 2, 3, 4, 5 } };
+        var cache = try StatefulServerCache.init(fba.allocator(), fuzz_cache_limits, fixed.source());
+        defer cache.deinit();
+        var existing = try fuzzServerState(fba.allocator(), 0);
+        var h0: [stateful_identity_len]u8 = undefined;
+        try testing.expectEqual(StoreResult.stored, cache.insertMove(&existing, 0, .reusable, &h0));
+        var before = try ServerCacheState.capture(&cache);
+        defer before.deinit();
+
+        var incoming = try fuzzServerState(testing.allocator, 1);
+        defer incoming.deinit();
+        var out: [stateful_identity_len]u8 = [_]u8{0xEE} ** stateful_identity_len;
+        var failing = testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = fail_index });
+        cache.allocator = failing.allocator();
+        const result = cache.insertMove(&incoming, 1, .reusable, &out);
+        cache.allocator = fba.allocator();
+        if (result == .storage_failed) {
+            saw_failure = true;
+            try testing.expectEqualSlices(u8, &([_]u8{0xEE} ** stateful_identity_len), &out);
+            var after = try ServerCacheState.capture(&cache);
+            defer after.deinit();
+            try before.expectEqual(&after);
+        } else {
+            try testing.expect(result == .stored or result == .rejected_capacity);
+            saw_success = true;
+            break;
+        }
+    }
+    std.mem.doNotOptimizeAway(saw_success);
+    std.mem.doNotOptimizeAway(saw_failure);
+}
+
+fn serverResolveOomSweep() !void {
+    var saw_success = false;
+    for (0..fuzz_max_oom_fail_index + 1) |fail_index| {
+        var backing: [1 << 18]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&backing);
+        var fixed = FixedRandom{ .pattern_for_call = &.{ 9, 10, 11 } };
+        var cache = try StatefulServerCache.init(fba.allocator(), fuzz_cache_limits, fixed.source());
+        defer cache.deinit();
+        var state = try fuzzServerState(fba.allocator(), 0);
+        var handle: [stateful_identity_len]u8 = undefined;
+        try testing.expectEqual(StoreResult.stored, cache.insertMove(&state, 0, .single_use, &handle));
+        var before = try ServerCacheState.capture(&cache);
+        defer before.deinit();
+
+        var failing = testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = fail_index });
+        cache.allocator = failing.allocator();
+        var result = cache.resolveLease(&handle, 1);
+        cache.allocator = fba.allocator();
+        defer result.deinit();
+
+        if (result == .storage_failed) {
+            var after = try ServerCacheState.capture(&cache);
+            defer after.deinit();
+            try before.expectEqual(&after);
+        } else {
+            try testing.expect(result == .hit);
+            saw_success = true;
+            break;
+        }
+    }
+    std.mem.doNotOptimizeAway(saw_success);
+}
+
+fn serverPersistenceOomSweep() !void {
+    var saw_failure = false;
+    var saw_success = false;
+    for (0..fuzz_max_oom_fail_index + 1) |fail_index| {
+        var backing: [1 << 18]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&backing);
+        var fixed = FixedRandom{ .pattern_for_call = &.{ 21, 22, 23 } };
+        var cache = try StatefulServerCache.init(fba.allocator(), fuzz_cache_limits, fixed.source());
+        defer cache.deinit();
+        var existing = try fuzzServerState(fba.allocator(), 0);
+        var h0: [stateful_identity_len]u8 = undefined;
+        try testing.expectEqual(StoreResult.stored, cache.insertMove(&existing, 0, .reusable, &h0));
+        var before = try ServerCacheState.capture(&cache);
+        defer before.deinit();
+
+        var p0 = PersistedServerEntry{ .handle = serverHandleWithByte(0xA1), .usage = .reusable, .state = try fuzzServerState(testing.allocator, 1), .lru_sequence = 1 };
+        var p1 = PersistedServerEntry{ .handle = serverHandleWithByte(0xA2), .usage = .single_use, .state = try fuzzServerState(testing.allocator, 2), .lru_sequence = 2 };
+        var items = [_]PersistedServerEntry{ p0, p1 };
+        _ = &p0;
+        _ = &p1;
+
+        var failing = testing.FailingAllocator.init(fba.allocator(), .{ .fail_index = fail_index });
+        cache.allocator = failing.allocator();
+        const result = cache.restoreEntries(&items, 3);
+        cache.allocator = fba.allocator();
+
+        if (result) |_| {
+            saw_success = true;
+            break;
+        } else |err| switch (err) {
+            error.OutOfMemory => {
+                saw_failure = true;
+                var after = try ServerCacheState.capture(&cache);
+                defer after.deinit();
+                try before.expectEqual(&after);
+            },
+            error.DuplicateHandle => return error.TestUnexpectedResult,
+        }
+    }
+    std.mem.doNotOptimizeAway(saw_success);
+    std.mem.doNotOptimizeAway(saw_failure);
+}
+
+fn publicLeaseBoxOomReleasesPin() !void {
+    var fixed = FixedRandom{ .pattern_for_call = &.{ 0x31, 0x32, 0x33 } };
+    var cache = try StatefulServerCache.init(testing.allocator, fuzz_cache_limits, fixed.source());
+    defer cache.deinit();
+    var state = try fuzzServerState(testing.allocator, 0);
+    var handle: [stateful_identity_len]u8 = undefined;
+    try testing.expectEqual(StoreResult.stored, cache.insertMove(&state, 0, .single_use, &handle));
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.ResolverFailed, resolveStatefulServerPsk(&cache, failing.allocator(), &handle, 1));
+
+    var retry = try resolveStatefulServerPsk(&cache, testing.allocator, &handle, 1);
+    defer retry.deinit();
+    try testing.expect(retry == .hit);
+}
+
+fn runServerFuzzCase(smith: *std.testing.Smith) !void {
+    var fixed = FixedRandom{ .pattern_for_call = &.{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99 } };
+    var cache = try StatefulServerCache.init(testing.allocator, fuzz_cache_limits, fixed.source());
+    var leases = [_]ResolveLeaseResult{.miss} ** fuzz_max_live_server_leases;
+    var handles = [_][stateful_identity_len]u8{([_]u8{0} ** stateful_identity_len)} ** fuzz_cache_limits.max_entries;
+    var handle_count: usize = 0;
+    var persistence_token: ?u64 = null;
+    var now_ms: i64 = 0;
+    errdefer {
+        finishAllServerLeases(&leases);
+        if (persistence_token) |token| cache.endPersistenceOperation(token);
+        cache.deinit();
+    }
+
+    for (0..fuzz_max_operations) |_| {
+        const op = @as(ServerFuzzOp, @enumFromInt(smith.index(@typeInfo(ServerFuzzOp).@"enum".fields.len)));
+        switch (op) {
+            .insert_reusable, .insert_single_use => {
+                var state = try fuzzServerState(testing.allocator, smith.value(u64));
+                defer state.deinit();
+                const before = try fingerprintServerState(&state);
+                var out: [stateful_identity_len]u8 = undefined;
+                const result = cache.insertMove(&state, now_ms, if (op == .insert_single_use) .single_use else .reusable, &out);
+                if (!(result == .stored or result == .rejected_capacity or result == .rejected_handle_generation_failed or result == .storage_failed))
+                    return error.ServerFuzzUnexpectedInsertResult;
+                if (result == .stored) {
+                    if (handle_count < handles.len) {
+                        handles[handle_count] = out;
+                        handle_count += 1;
+                    }
+                    if (!isValidStatefulHandleShape(&out)) return error.ServerFuzzInvalidInsertedHandle;
+                } else {
+                    try testing.expectEqualDeep(before, try fingerprintServerState(&state));
+                }
+            },
+            .resolve_known => if (handle_count > 0) {
+                var result = cache.resolveLease(&handles[smith.index(handle_count)], now_ms);
+                if (result == .hit) {
+                    if (firstServerLeaseSlot(&leases)) |slot| {
+                        leases[slot].deinit();
+                        leases[slot] = result;
+                    } else {
+                        result.deinit();
+                    }
+                } else result.deinit();
+            },
+            .resolve_unknown => {
+                var unknown = serverHandleWithByte(@truncate(smith.value(u64)));
+                var result = cache.resolveLease(&unknown, now_ms);
+                defer result.deinit();
+            },
+            .resolve_malformed_shape => {
+                var malformed = serverHandleWithByte(0x42);
+                switch (smith.index(4)) {
+                    0 => malformed[0] ^= 0xff,
+                    1 => std.mem.writeInt(u16, malformed[4..6], 2, .big),
+                    2 => std.mem.writeInt(u16, malformed[6..8], 1, .big),
+                    else => {},
+                }
+                const slice = if (smith.index(2) == 0) malformed[0 .. stateful_identity_len - 1] else malformed[0..];
+                var result = cache.resolveLease(slice, now_ms);
+                defer result.deinit();
+            },
+            .resolve_through_public_adapter => if (handle_count > 0) {
+                var result = try resolveStatefulServerPsk(&cache, testing.allocator, &handles[smith.index(handle_count)], now_ms);
+                if (result == .hit) {
+                    if (result.hit.on_selected) |hook| hook.complete();
+                }
+                result.deinit();
+            },
+            .commit_lease => for (&leases) |*lease| {
+                if (lease.* == .hit) {
+                    lease.hit.lease.commit();
+                    lease.deinit();
+                    break;
+                }
+            },
+            .release_lease => for (&leases) |*lease| {
+                if (lease.* == .hit) {
+                    lease.hit.lease.release();
+                    lease.deinit();
+                    break;
+                }
+            },
+            .deinit_lease => for (&leases) |*lease| {
+                if (lease.* == .hit) {
+                    lease.deinit();
+                    break;
+                }
+            },
+            .complete_reusable_selection_hook => if (handle_count > 0) {
+                var result = try resolveStatefulServerPsk(&cache, testing.allocator, &handles[smith.index(handle_count)], now_ms);
+                if (result == .hit) {
+                    if (result.hit.on_selected) |hook| hook.complete();
+                }
+                result.deinit();
+            },
+            .advance_clock => now_ms +|= fuzz_clock_steps[smith.index(fuzz_clock_steps.len)],
+            .cleanup => _ = cache.cleanup(now_ms),
+            .begin_persistence => if (persistence_token == null) {
+                persistence_token = cache.beginPersistenceOperation() catch null;
+            } else {
+                try testing.expectError(error.CacheBusy, cache.beginPersistenceOperation());
+            },
+            .end_persistence_correct => if (persistence_token) |token| {
+                cache.endPersistenceOperation(token);
+                persistence_token = null;
+            },
+            .end_persistence_wrong_or_stale => cache.endPersistenceOperation(smith.value(u64)),
+            .clone_for_persistence => {
+                var clones = cache.cloneLiveForPersistence(testing.allocator, now_ms) catch |err| switch (err) {
+                    error.CacheBusy, error.OutOfMemory => null,
+                };
+                if (clones) |*list| {
+                    for (list.items) |*item| item.deinit();
+                    list.deinit(testing.allocator);
+                }
+            },
+            .restore_entries => {
+                finishAllServerLeases(&leases);
+                if (persistence_token) |token| {
+                    cache.endPersistenceOperation(token);
+                    persistence_token = null;
+                }
+                var items: [fuzz_max_persisted_records]PersistedServerEntry = undefined;
+                const n = 1 + smith.index(3);
+                for (0..n) |i| {
+                    const sequence: u64 = @intCast(i + 1);
+                    items[i] = .{
+                        .handle = serverHandleWithByte(@truncate(0xA0 + i + smith.index(5))),
+                        .usage = if (smith.index(2) == 0) .reusable else .single_use,
+                        .state = try fuzzServerState(testing.allocator, smith.value(u64)),
+                        .lru_sequence = sequence,
+                    };
+                }
+                cache.restoreEntries(items[0..n], now_ms) catch |err| switch (err) {
+                    error.OutOfMemory, error.DuplicateHandle => {},
+                };
+            },
+            .entropy_failure => {
+                const old = cache.random;
+                cache.random = AlwaysFailRandom.source();
+                var state = try fuzzServerState(testing.allocator, smith.value(u64));
+                defer state.deinit();
+                var out: [stateful_identity_len]u8 = [_]u8{0xEE} ** stateful_identity_len;
+                var before = try ServerCacheState.capture(&cache);
+                defer before.deinit();
+                if (cache.insertMove(&state, now_ms, .reusable, &out) != .rejected_handle_generation_failed)
+                    return error.ServerFuzzEntropyFailureNotTyped;
+                if (!std.mem.eql(u8, &([_]u8{0xEE} ** stateful_identity_len), &out))
+                    return error.ServerFuzzEntropyFailureMutatedOutput;
+                var after = try ServerCacheState.capture(&cache);
+                defer after.deinit();
+                try before.expectEqual(&after);
+                cache.random = old;
+            },
+            .handle_collision_then_success, .handle_collision_exhaustion => {
+                var collision_random = FixedRandom{ .pattern_for_call = if (op == .handle_collision_then_success) &.{ 0x44, 0x44, 0x45 } else &.{ 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44 } };
+                cache.random = collision_random.source();
+                var a = try fuzzServerState(testing.allocator, 44);
+                var ha: [stateful_identity_len]u8 = undefined;
+                _ = cache.insertMove(&a, now_ms, .reusable, &ha);
+                a.deinit();
+                var b = try fuzzServerState(testing.allocator, 45);
+                defer b.deinit();
+                var hb: [stateful_identity_len]u8 = [_]u8{0xEE} ** stateful_identity_len;
+                const result = cache.insertMove(&b, now_ms, .reusable, &hb);
+                if (op == .handle_collision_then_success) {
+                    if (!(result == .stored or result == .rejected_handle_generation_failed or result == .rejected_capacity or result == .storage_failed))
+                        return error.ServerFuzzUnexpectedCollisionRetryResult;
+                } else {
+                    if (!(result == .stored or result == .rejected_handle_generation_failed or result == .rejected_capacity or result == .storage_failed))
+                        return error.ServerFuzzUnexpectedCollisionExhaustionResult;
+                }
+                cache.random = fixed.source();
+            },
+            .force_lru_renumber => {
+                cache.mutex.lock();
+                cache.next_lru_sequence = std.math.maxInt(u64);
+                cache.mutex.unlock();
+                var state = try fuzzServerState(testing.allocator, 60);
+                defer state.deinit();
+                var out: [stateful_identity_len]u8 = undefined;
+                _ = cache.insertMove(&state, now_ms, .reusable, &out);
+                if (handle_count < handles.len and isValidStatefulHandleShape(&out)) {
+                    handles[handle_count] = out;
+                    handle_count += 1;
+                }
+            },
+            .quiescent_reset => {
+                finishAllServerLeases(&leases);
+                if (persistence_token) |token| {
+                    cache.endPersistenceOperation(token);
+                    persistence_token = null;
+                }
+                cache.deinit();
+                fixed = .{ .pattern_for_call = &.{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99 } };
+                cache = try StatefulServerCache.init(testing.allocator, fuzz_cache_limits, fixed.source());
+                handle_count = 0;
+            },
+            .server_oom_sweep => switch (smith.index(4)) {
+                0 => try serverInsertOomSweep(),
+                1 => try serverResolveOomSweep(),
+                2 => try serverPersistenceOomSweep(),
+                else => try publicLeaseBoxOomReleasesPin(),
+            },
+        }
+        expectServerCacheInvariants(&cache) catch return error.ServerFuzzCacheInvariant;
+    }
+
+    finishAllServerLeases(&leases);
+    if (persistence_token) |token| cache.endPersistenceOperation(token);
+    if (cache.hasOutstandingLease()) return error.ServerFuzzOutstandingLease;
+    const before_destroy = testResetDestroyCounters();
+    const remaining = cache.count();
+    cache.deinit();
+    expectDestroyDelta(before_destroy, 0, @intCast(remaining), 0) catch return error.ServerFuzzDestroyDelta;
+}
+
+fn fuzzClientCacheSequenceInput(_: void, smith: *std.testing.Smith) !void {
+    try runClientFuzzCase(smith);
+}
+
+fn fuzzServerCacheSequenceInput(_: void, smith: *std.testing.Smith) !void {
+    try runServerFuzzCase(smith);
+}
+
+test "fuzz: TLS resumption: client session cache operation sequence preserves transactional state, ownership, eviction, and lease semantics" {
+    try testing.fuzz({}, fuzzClientCacheSequenceInput, .{
+        .corpus = &.{
+            // smith.index(ClientFuzzOp), then operation-specific ids/choices.
+            &smithCorpusWords(&.{ 0, 3, 8 }),
+            &smithCorpusWords(&.{ 1, 1, 0, 1, 2, 0, 5 }),
+            &smithCorpusWords(&.{ 1, 2, 0, 3, 7 }),
+            &smithCorpusWords(&.{ 1, 3, 0, 3, 8, 3 }),
+            &smithCorpusWords(&.{ 1, 4, 0, 3, 6, 7 }),
+            &smithCorpusWords(&.{ 1, 5, 0, 3, 17, 0, 0, 11 }),
+            &smithCorpusWords(&.{ 0, 7, 0, 2 }),
+            &smithCorpusWords(&.{ 1, 8, 0, 3, 18, 1 }),
+            &smithCorpusWords(&.{ 18, 0 }),
+            &smithCorpusWords(&.{ 11, 3, 12, 3 }),
+            &smithCorpusWords(&.{ 15, 1, 9, 15, 10, 3 }),
+            &smithCorpusWords(&.{ 16, 0, 3 }),
+            &smithCorpusWords(&.{ 0, 13, 0, 17 }),
+        },
+    });
+}
+
+test "fuzz: TLS resumption: stateful server cache operation sequence preserves transactional indexes, ownership, handle, and lease semantics" {
+    try testing.fuzz({}, fuzzServerCacheSequenceInput, .{
+        .corpus = &.{
+            // smith.index(ServerFuzzOp), then operation-specific ids/choices.
+            &smithCorpusWords(&.{ 0, 0, 2, 6 }),
+            &smithCorpusWords(&.{ 0, 1, 2, 9, 3 }),
+            &smithCorpusWords(&.{ 1, 2, 2, 6, 2 }),
+            &smithCorpusWords(&.{ 1, 3, 2, 6 }),
+            &smithCorpusWords(&.{ 1, 4, 2, 8 }),
+            &smithCorpusWords(&.{ 1, 5, 2, 10, 2, 8 }),
+            &smithCorpusWords(&.{ 1, 6, 2, 11, 8 }),
+            &smithCorpusWords(&.{ 0, 7, 12, 2, 14, 13, 2 }),
+            &smithCorpusWords(&.{18}),
+            &smithCorpusWords(&.{19}),
+            &smithCorpusWords(&.{ 22, 0 }),
+            &smithCorpusWords(&.{ 22, 1 }),
+            &smithCorpusWords(&.{ 22, 3 }),
+            &smithCorpusWords(&.{ 16, 2, 2, 1, 2, 3 }),
+            &smithCorpusWords(&.{ 0, 15, 2, 6, 16 }),
+            &smithCorpusWords(&.{ 20, 0 }),
+            &smithCorpusWords(&.{ 4, 0, 4, 1, 4, 2, 4, 3 }),
+            &smithCorpusWords(&.{ 0, 12, 0, 21 }),
+        },
+    });
+}
+
+test "resolveStatefulServerPsk lease-box OOM releases an acquired single-use pin and permits retry" {
+    try publicLeaseBoxOomReleasesPin();
+}
+
+test "session cache test-only zeroization probes count exact client/server/lease-box destruction" {
+    const before = testResetDestroyCounters();
+    {
+        var cache = try ClientSessionCache.init(testing.allocator, fuzz_cache_limits);
+        var ticket = try fuzzClientTicket(testing.allocator, 1, 0, 0);
+        defer ticket.deinit();
+        try testing.expectEqual(StoreResult.stored, cache.storeClone(&ticket, 0, .reusable));
+        cache.deinit();
+    }
+    try expectDestroyDelta(before, 1, 0, 0);
+
+    const after_client = testResetDestroyCounters();
+    {
+        var fixed = FixedRandom{ .pattern_for_call = &.{0x55} };
+        var cache = try StatefulServerCache.init(testing.allocator, fuzz_cache_limits, fixed.source());
+        var state = try fuzzServerState(testing.allocator, 1);
+        var handle: [stateful_identity_len]u8 = undefined;
+        try testing.expectEqual(StoreResult.stored, cache.insertMove(&state, 0, .single_use, &handle));
+        var resolved = try resolveStatefulServerPsk(&cache, testing.allocator, &handle, 1);
+        resolved.deinit();
+        cache.deinit();
+    }
+    try expectDestroyDelta(after_client, 0, 1, 1);
 }
