@@ -413,15 +413,21 @@ provider rather than sharing static state. The rejection matrix includes
 several classes that require successfully authenticating first:
 `not_yet_valid`/`expired` (forged timestamps); an authenticated state
 extended with an unknown *optional* field, which must still accept and
-round-trip (proving forward compatibility, not just rejection); and
+round-trip (proving forward compatibility, not just rejection); a
+supported SHA-384 suite id paired with the 48-byte PSK it requires, which
+must also accept and round-trip (contrasted against the mismatched
+pairings below, so acceptance is proven, not just assumed); and
 `invalid_plaintext` via an authenticated-but-malformed `TRS1` record
 covering the shared header (magic/version/record-type/section-length),
 field-level TLV boundaries (duplicate field, missing mandatory field,
 exact-width field length one-under/zero/one-over, an unknown *critical*
 field, PSK length across zero/one/one-over/the largest supported digest
-length, and a field whose declared length vastly exceeds the bytes the
-section actually has left -- a declaration-only truncation, not a 64 KiB
-allocation). The known-field mutations reuse
+length, a field whose declared length vastly exceeds the bytes the section
+actually has left -- a declaration-only truncation, not a 64 KiB
+allocation -- an unknown/unassigned cipher-suite wire value, and a
+*supported* suite id whose transcript-hash length disagrees with the
+unchanged, authenticated PSK bytes that follow it). The known-field
+mutations reuse
 `session.fixtureWithFieldRemoved`/`fixtureWithFieldDuplicated`/
 `withTlvLengthOverride`/`originalTlvLen`, promoted `pub` from session.zig's
 own codec fuzz/test suite rather than re-derived here (that promotion also
@@ -449,12 +455,22 @@ key fingerprint the keyring's own ledger uses) for as long as it is held,
 and that injected allocation failure during build/install leaves
 publication state unchanged. Every modeled reference -- acquired or
 explicitly retained -- wipes the snapshot exactly once when the last one is
-released, and this holds even for a bounded program that ends mid-sequence
-with references still outstanding: end-of-case cleanup drains them, tears
-the keyring down, and only then asserts the snapshot deinitialized exactly
-once and wipes the stored fingerprint, with the zeroization probe kept
-installed through both steps (not disabled first) so it can observe
-whichever one performs the true final release. The existing
+released, and this holds for every bounded program, not just ones where
+opcode 4 happens to run again before the sequence ends: a `tracked_snapshot`
+flag (set once, on the first acquire, and never reset -- unlike `held`,
+which opcode 4 nulls out the moment its own modeled reference count reaches
+zero even when the snapshot is still `keyring.current` and therefore not
+actually freed yet) drives real end-of-case cleanup code -- not a bare
+`defer`, since the final check needs `try testing.expectEqual` rather than
+`std.debug.assert` (which lowers through `unreachable` and is therefore not
+a reliable runtime check under the documented `-Doptimize=ReleaseFast
+--fuzz` configuration) -- that drains every outstanding reference, tears the
+keyring down, and only then asserts the snapshot deinitialized exactly once
+and unconditionally wipes the stored fingerprint, with the zeroization
+probe kept installed through both steps so it can observe whichever one
+performs the true final release; a separate `errdefer` covers only the
+leak-prevention side of the same cleanup for an early error return elsewhere
+in the opcode loop, without a redundant assertion. The existing
 `ticket_key_snapshot.zig` persistent-JSON-snapshot fuzz target is unrelated
 (on-disk snapshot file parsing, not the in-memory keyring) and is preserved
 as-is, per the issue's "existing coverage to preserve, not recreate" list.

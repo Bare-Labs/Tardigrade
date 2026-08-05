@@ -3447,6 +3447,29 @@ fn buildTimedServerState(allocator: std.mem.Allocator, issued_at_unix_ms: i64, l
     return state;
 }
 
+/// A valid `.tls_aes_256_gcm_sha384` state with the SHA-384-length (48
+/// byte) PSK that suite requires, proving the accepted-pairing side of
+/// #494-B's suite/PSK routing requirement: `state`/`sentinelServerState`
+/// elsewhere in this file are always the SHA-256 suite, so every
+/// mismatched-pairing rejection case needs a genuine SHA-384 acceptance to
+/// contrast against, not just another rejection.
+fn buildSha384ServerState(allocator: std.mem.Allocator) !session.ServerRecoverableState {
+    var common: session.ResumableSessionCommon = .{};
+    try common.init(allocator, session.Limits.default, .{
+        .cipher_suite = .tls_aes_256_gcm_sha384,
+        .resumption_psk = &([_]u8{0x55} ** 48),
+        .server_name = "sha384.example.test",
+        .application_protocol = "h3",
+        .auth_binding = session.AuthBinding.fromLeafCertificateDer("sha384-leaf"),
+        .issued_at_unix_ms = 1_000,
+        .lifetime_seconds = 10,
+        .early_data = .resume_only,
+    });
+    var state: session.ServerRecoverableState = .{};
+    state.init(&common, 0x53484133);
+    return state;
+}
+
 /// Appends one real TLV (`field_id`/`value`) to `fixture` and patches the
 /// section length to match, for authenticating a state extended with an
 /// unknown field. `out` must have at least `fixture.len + 4 + value.len`
@@ -3479,6 +3502,26 @@ fn appendTruncatedTlvHeader(fixture: []const u8, field_id: u16, declared_length:
     pos += 4;
     std.mem.writeInt(u32, out[6..10], @intCast(pos - session.header_len), .big);
     return pos;
+}
+
+/// Replaces `fixture`'s `field_cipher_suite` TLV with one declaring the
+/// same field id but a caller-chosen raw wire value, composed from the two
+/// promoted helpers above (`fixtureWithFieldRemoved` then `appendTlv`)
+/// rather than needing a third "overwrite this field's value in place"
+/// primitive: field order is not semantically significant to `decode`
+/// (proved by session.zig's own "fields in different order" round-trip
+/// test), so moving the field to the end of the section is equivalent to
+/// mutating it in place. Drives #494-B's suite/PSK routing requirement:
+/// an unknown suite id, or a supported suite id whose transcript-hash
+/// length disagrees with the (unchanged) authenticated PSK bytes that
+/// follow it, both through the full authenticated resolver boundary
+/// rather than only the raw codec.
+fn withCipherSuiteValue(fixture: []const u8, new_suite_wire_value: u16, out: []u8) usize {
+    var without_suite_buf: [2048 + 256]u8 = undefined;
+    const without_suite_len = session.fixtureWithFieldRemoved(fixture, session.field_cipher_suite, &without_suite_buf);
+    var value_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &value_bytes, new_suite_wire_value, .big);
+    return appendTlv(without_suite_buf[0..without_suite_len], session.field_cipher_suite, &value_bytes, out);
 }
 
 /// #494-B: authenticated `Protector.resolve` under key-state, envelope, and
@@ -3593,7 +3636,7 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
     protector.observer = observer.observer();
 
     var zero_alloc = ZeroCheckingAllocator.init(allocator);
-    switch (smith.index(10)) {
+    switch (smith.index(11)) {
         0 => {
             try expectRoundTrip(&protector, zero_alloc.allocator(), &state, valid_envelope, resolve_now_unix_ms);
             try observer.expectOnly(.resolve_succeeded);
@@ -3665,7 +3708,7 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
 
             var mutated_buf: [2048 + 256]u8 = undefined;
             var mutated: []u8 = undefined;
-            switch (smith.index(9)) {
+            switch (smith.index(11)) {
                 0 => {
                     mutated = mutated_buf[0..plaintext.len];
                     @memcpy(mutated, plaintext);
@@ -3719,6 +3762,17 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
                     };
                     mutated = mutated_buf[0..session.withTlvLengthOverride(plaintext, session.field_resumption_psk, new_length, &mutated_buf)];
                 },
+                9 => { // unknown (unassigned) cipher-suite wire value -- always `error.InvalidCipherSuite`
+                    mutated = mutated_buf[0..withCipherSuiteValue(plaintext, 0x9999, &mutated_buf)];
+                },
+                10 => { // a *supported* suite id whose transcript-hash length disagrees with the
+                    // unchanged, authenticated PSK bytes that follow it -- `state`'s own SHA-256
+                    // suite paired with the SHA-384 suite id -- always `error.InvalidPskLength`.
+                    // The reverse pairing (SHA-256 suite against a wrong-length PSK) is exercised
+                    // by the PSK length boundary case above; scenario 8 in the outer switch proves
+                    // the *accepted* SHA-384-suite/48-byte-PSK pairing this contrasts against.
+                    mutated = mutated_buf[0..withCipherSuiteValue(plaintext, 0x1302, &mutated_buf)];
+                },
                 else => { // declared length far exceeds the bytes actually provided -- a truncation, not a 64 KiB allocation
                     const field_id = duplicate_or_missing_ids[smith.index(duplicate_or_missing_ids.len)];
                     var without_field_buf: [2048 + 256]u8 = undefined;
@@ -3753,6 +3807,21 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
             try observer.expectOnly(.resolve_succeeded);
         },
         8 => {
+            // The accepted-pairing side of the suite/PSK routing matrix
+            // below: a supported SHA-384 suite id with the 48-byte PSK it
+            // requires must authenticate, decode, and round-trip
+            // end-to-end through the resolver, not just fail to reject.
+            var sha384_state = try buildSha384ServerState(allocator);
+            defer sha384_state.deinit();
+            var plaintext_buf: [2048]u8 = undefined;
+            const plaintext = try session.encodeServer(&sha384_state, session.Limits.default, &plaintext_buf);
+            var envelope_buf: [2048]u8 = undefined;
+            const nonce = [_]u8{0x84} ** provider.aead_nonce_len;
+            const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, plaintext);
+            try expectRoundTrip(&protector, zero_alloc.allocator(), &sha384_state, envelope, resolve_now_unix_ms);
+            try observer.expectOnly(.resolve_succeeded);
+        },
+        9 => {
             // `issued_at_unix_ms` strictly after `resolve_now_unix_ms`.
             var timed_state = try buildTimedServerState(allocator, resolve_now_unix_ms + 5_000, 10);
             defer timed_state.deinit();
@@ -3994,29 +4063,34 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     var held_fixture: KeyState = undefined;
     var held_key_fingerprint: KeyFingerprint = undefined;
     var held_outlived_current = false;
+    // Set once, on the *first* successful acquire, and never reset --
+    // unlike `held`, which opcode 4 sets back to `null` the moment the
+    // last modeled reference is released even when the snapshot is still
+    // `keyring.current` and therefore not actually freed yet (that free
+    // happens later, inside `keyring.deinit()`). Gating the final-release
+    // assertion below on `held != null` at teardown would miss exactly
+    // that case; this flag means "a snapshot was instrumented and its
+    // eventual wipe still needs proving," independent of whether a modeled
+    // owner happens to still be outstanding right now.
+    var tracked_snapshot = false;
     // A bounded program can terminate mid-sequence with modeled owners
-    // still outstanding (e.g. install -> acquire -> retain -> end, leaving
-    // `held_refs == 2`) or with the held snapshot still `keyring.current`
-    // (never replaced), so this end-of-case cleanup has to prove the final
-    // wipe, not just avoid a leak:
-    //
-    // 1. Drain every modeled reference (`held_refs` down to 0).
-    // 2. *Then* tear the keyring down, releasing its own reference if the
-    //    held snapshot is still `keyring.current` -- whichever of these two
-    //    steps holds the true last reference performs the actual free.
-    // 3. Only once both have run, assert the snapshot deinitialized
-    //    exactly once (never zero -- a leak -- and never more than one --
-    //    a double free) and unconditionally wipe the stored fingerprint,
-    //    matching `secureZero`'s use everywhere else in this file rather
-    //    than relying on opcode 4 happening to run again.
-    // 4. Disable the zeroization probe last, so it stays installed through
-    //    both step 1 and step 2 -- with the original per-defer ordering
-    //    (probe disabled before `keyring.deinit()`) the probe missed
-    //    exactly the case where the held snapshot was still current at
-    //    teardown, since that path's true final release happens inside
-    //    `keyring.deinit()`.
-    defer {
-        const was_held = held != null;
+    // still outstanding (e.g. install -> acquire -> retain -> end) or with
+    // the held snapshot still `keyring.current` (never replaced), so
+    // end-of-case cleanup has to prove the final wipe, not just avoid a
+    // leak -- see the plain code after the opcode loop below, which drains,
+    // tears the keyring down, and only then asserts. That assertion needs
+    // `try testing.expectEqual` (a `std.debug.assert` lowers through
+    // `unreachable` under the documented `-Doptimize=ReleaseFast --fuzz`
+    // configuration, so the optimizer may treat it as an assumption to
+    // build on rather than a runtime check to report), which cannot run
+    // inside a bare `defer` block. This `errdefer` is therefore only the
+    // leak-prevention safety net for an early error return partway through
+    // the opcode loop (e.g. an invariant assertion elsewhere already
+    // failing) -- cleanup only, no redundant assertion, since the earlier
+    // failure is already this case's primary signal, and this never runs
+    // on the normal path (where the code below already tears everything
+    // down once).
+    errdefer {
         if (held) |snap| {
             while (held_refs != 0) {
                 held_refs -= 1;
@@ -4024,10 +4098,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
             }
         }
         keyring.deinit();
-        if (was_held) {
-            std.debug.assert(held_deinit_count.load(.monotonic) == 1);
-            secrets.secureZero(&held_key_fingerprint);
-        }
+        secrets.secureZero(&held_key_fingerprint);
         TestKeyDeinitProbeStorage.probe = null;
     }
 
@@ -4108,6 +4179,7 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
                         held = snap;
                         held_refs = 1;
                         held_outlived_current = false;
+                        tracked_snapshot = true;
                         held_fixture = .{
                             .id = snap.keys[0].id,
                             .aead = snap.keys[0].aead,
@@ -4256,6 +4328,37 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
             }
         }
     }
+
+    // Normal-path end-of-case cleanup, reached only once the whole opcode
+    // program above completed without an earlier failure (the `errdefer`
+    // near the top of this function is the safety net for that other
+    // case): drain every modeled reference, tear the keyring down --
+    // releasing its own reference too, if the instrumented snapshot is
+    // still `keyring.current` -- and only *then* assert, as a real fuzz
+    // failure via `testing.expectEqual` rather than a `std.debug.assert`
+    // (which lowers through `unreachable` and so is not a reliable runtime
+    // check under `-Doptimize=ReleaseFast`), that it deinitialized exactly
+    // once: never zero (a leak) and never more than one (a double free).
+    // `tracked_snapshot` -- true from the first successful acquire, never
+    // reset -- covers this even when opcode 4 already dropped the last
+    // modeled reference earlier in the loop while the snapshot was still
+    // `keyring.current` (that inline release correctly observed
+    // `deinit_count == 0` and set `held = null`, since the snapshot was
+    // not actually freed yet; its true final release happens right here,
+    // inside `keyring.deinit()`, so gating this assertion on `held != null`
+    // at this point would silently skip verifying it).
+    if (held) |snap| {
+        while (held_refs != 0) {
+            held_refs -= 1;
+            snap.release();
+        }
+    }
+    keyring.deinit();
+    if (tracked_snapshot) {
+        try testing.expectEqual(@as(usize, 1), held_deinit_count.load(.monotonic));
+    }
+    secrets.secureZero(&held_key_fingerprint);
+    TestKeyDeinitProbeStorage.probe = null;
 }
 
 test "fuzz: TLS resumption: ticket keyring install/validate/acquire/retain/release/seal sequence preserves generation, ledger, nonce, and reference invariants" {
