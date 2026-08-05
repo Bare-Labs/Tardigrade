@@ -3189,9 +3189,23 @@ test "decode rejects both literal fixtures truncated at every byte boundary" {
 /// `pub` helper a caller can rely on without inspecting the
 /// implementation). Exposed for #494-B's authenticated-plaintext mutation
 /// matrix; see `header_len`'s doc comment.
-pub fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16, out: []u8) error{ FieldNotFound, BufferTooSmall }!usize {
-    const old_len = originalTlvLen(fixture, field_id) orelse return error.FieldNotFound;
-    const required = fixture.len - old_len + new_length;
+pub fn withTlvLengthOverride(fixture: []const u8, field_id: u16, new_length: u16, out: []u8) error{ FieldNotFound, DuplicateField, BufferTooSmall }!usize {
+    // Every TLV whose id is `field_id` gets rewritten below (not just the
+    // first), so the required-capacity math only holds for a canonical
+    // record with exactly one occurrence -- the precondition this helper
+    // has always implicitly assumed (matching `originalTlvLen`, which only
+    // ever reports the first occurrence's length). Reject a duplicate
+    // explicitly rather than silently underestimating `required` for it.
+    var old_len: ?u16 = null;
+    {
+        var offset: usize = header_len;
+        while ((nextTlv(fixture, &offset) catch unreachable)) |tlv| {
+            if (tlv.field_id != field_id) continue;
+            if (old_len != null) return error.DuplicateField;
+            old_len = @intCast(tlv.value.len);
+        }
+    }
+    const required = fixture.len - (old_len orelse return error.FieldNotFound) + new_length;
     if (out.len < required) return error.BufferTooSmall;
     @memcpy(out[0..header_len], fixture[0..header_len]);
     var pos: usize = header_len;

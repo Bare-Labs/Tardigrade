@@ -3524,6 +3524,20 @@ fn withCipherSuiteValue(fixture: []const u8, new_suite_wire_value: u16, out: []u
     return appendTlv(without_suite_buf[0..without_suite_len], session.field_cipher_suite, &value_bytes, out);
 }
 
+/// Same composition as `withCipherSuiteValue`, for `field_lifetime_seconds`
+/// (a 4-byte big-endian `u32`). Used to authenticate raw wire values
+/// `session.ResumableSessionCommon.init` itself would reject at
+/// construction time (zero, or above `session.max_lifetime_seconds`), so
+/// those boundaries can only be exercised through a post-encode mutation
+/// like this one.
+fn withLifetimeSecondsValue(fixture: []const u8, new_value: u32, out: []u8) usize {
+    var without_field_buf: [2048 + 256]u8 = undefined;
+    const without_field_len = session.fixtureWithFieldRemoved(fixture, session.field_lifetime_seconds, &without_field_buf);
+    var value_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value_bytes, new_value, .big);
+    return appendTlv(without_field_buf[0..without_field_len], session.field_lifetime_seconds, &value_bytes, out);
+}
+
 /// #494-B: authenticated `Protector.resolve` under key-state, envelope, and
 /// authenticated-plaintext mutation. Complements `fuzzTicketIdentity` above
 /// (which only proves miss paths never panic or mutate output against
@@ -3830,29 +3844,88 @@ fn fuzzProtectorResolve(allocator: std.mem.Allocator, smith: *std.testing.Smith)
             try observer.expectOnly(.resolve_succeeded);
         },
         9 => {
-            // `issued_at_unix_ms` strictly after `resolve_now_unix_ms`.
-            var timed_state = try buildTimedServerState(allocator, resolve_now_unix_ms + 5_000, 10);
+            // Exact `isNotYetValid` boundary (`now < issued_at` is the
+            // rejection condition): `issued_at == now` must accept and
+            // `issued_at == now + 1` must reject, proving the boundary is
+            // `<`, not `<=` or some other off-by-one -- a comfortably
+            // inside-the-region case like the old fixed `now + 5_000`
+            // could not catch a regression at the boundary itself.
+            const at_boundary = smith.index(2) == 0;
+            var timed_state = try buildTimedServerState(allocator, if (at_boundary) resolve_now_unix_ms else resolve_now_unix_ms + 1, 10);
             defer timed_state.deinit();
             var plaintext_buf: [2048]u8 = undefined;
             const plaintext = try session.encodeServer(&timed_state, session.Limits.default, &plaintext_buf);
             var envelope_buf: [2048]u8 = undefined;
             const nonce = [_]u8{0xcd} ** provider.aead_nonce_len;
             const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, plaintext);
-            try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), envelope, resolve_now_unix_ms);
-            try observer.expectOnly(.{ .resolve_rejected = .not_yet_valid });
+            if (at_boundary) {
+                try expectRoundTrip(&protector, zero_alloc.allocator(), &timed_state, envelope, resolve_now_unix_ms);
+                try observer.expectOnly(.resolve_succeeded);
+            } else {
+                try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), envelope, resolve_now_unix_ms);
+                try observer.expectOnly(.{ .resolve_rejected = .not_yet_valid });
+            }
         },
-        else => {
-            // `issued_at_unix_ms + lifetime_seconds` strictly before
-            // `resolve_now_unix_ms`.
-            var timed_state = try buildTimedServerState(allocator, 1, 1);
-            defer timed_state.deinit();
-            var plaintext_buf: [2048]u8 = undefined;
-            const plaintext = try session.encodeServer(&timed_state, session.Limits.default, &plaintext_buf);
-            var envelope_buf: [2048]u8 = undefined;
-            const nonce = [_]u8{0xef} ** provider.aead_nonce_len;
-            const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, plaintext);
-            try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), envelope, resolve_now_unix_ms);
-            try observer.expectOnly(.{ .resolve_rejected = .expired });
+        else => switch (smith.index(4)) {
+            0 => {
+                // Exact `isExpired` boundary for `lifetime_seconds = 1`
+                // (1000ms): `age == 999` must accept.
+                var timed_state = try buildTimedServerState(allocator, resolve_now_unix_ms - 999, 1);
+                defer timed_state.deinit();
+                var plaintext_buf: [2048]u8 = undefined;
+                const plaintext = try session.encodeServer(&timed_state, session.Limits.default, &plaintext_buf);
+                var envelope_buf: [2048]u8 = undefined;
+                const nonce = [_]u8{0xef} ** provider.aead_nonce_len;
+                const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, plaintext);
+                try expectRoundTrip(&protector, zero_alloc.allocator(), &timed_state, envelope, resolve_now_unix_ms);
+                try observer.expectOnly(.resolve_succeeded);
+            },
+            1 => {
+                // ...and `age == 1000` (the exact boundary) must reject,
+                // proving `age >= lifetime` is the real condition, not
+                // `age > lifetime` or some other off-by-one.
+                var timed_state = try buildTimedServerState(allocator, resolve_now_unix_ms - 1_000, 1);
+                defer timed_state.deinit();
+                var plaintext_buf: [2048]u8 = undefined;
+                const plaintext = try session.encodeServer(&timed_state, session.Limits.default, &plaintext_buf);
+                var envelope_buf: [2048]u8 = undefined;
+                const nonce = [_]u8{0xfa} ** provider.aead_nonce_len;
+                const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, plaintext);
+                try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), envelope, resolve_now_unix_ms);
+                try observer.expectOnly(.{ .resolve_rejected = .expired });
+            },
+            2 => {
+                // Raw-TLV `lifetime_seconds` boundary: zero is below the
+                // valid `(0, max_lifetime_seconds]` range.
+                // `ResumableSessionCommon.init` itself already rejects
+                // this at construction time, so it can only be reached
+                // through a post-encode authenticated mutation like this
+                // one -- proving `resolveInner` still normalizes it to
+                // the public `invalid_plaintext` contract with the
+                // destination unchanged, the same as every other decode
+                // failure class.
+                var plaintext_buf: [2048]u8 = undefined;
+                const plaintext = try session.encodeServer(&state, session.Limits.default, &plaintext_buf);
+                var mutated_buf: [2048 + 64]u8 = undefined;
+                const mutated = mutated_buf[0..withLifetimeSecondsValue(plaintext, 0, &mutated_buf)];
+                var envelope_buf: [2048 + 64]u8 = undefined;
+                const nonce = [_]u8{0xfb} ** provider.aead_nonce_len;
+                const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, mutated);
+                try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), envelope, resolve_now_unix_ms);
+                try observer.expectOnly(.{ .resolve_rejected = .invalid_plaintext });
+            },
+            else => {
+                // ...and one past `max_lifetime_seconds` is above it.
+                var plaintext_buf: [2048]u8 = undefined;
+                const plaintext = try session.encodeServer(&state, session.Limits.default, &plaintext_buf);
+                var mutated_buf: [2048 + 64]u8 = undefined;
+                const mutated = mutated_buf[0..withLifetimeSecondsValue(plaintext, session.max_lifetime_seconds + 1, &mutated_buf)];
+                var envelope_buf: [2048 + 64]u8 = undefined;
+                const nonce = [_]u8{0xfc} ** provider.aead_nonce_len;
+                const envelope = try sealPlaintextWithProvider(fresh_provider, &envelope_buf, selected_aead, active_id, active_key, nonce, mutated);
+                try expectResolveFalseUnchanged(&protector, zero_alloc.allocator(), envelope, resolve_now_unix_ms);
+                try observer.expectOnly(.{ .resolve_rejected = .invalid_plaintext });
+            },
         },
     }
 
@@ -4398,38 +4471,43 @@ fn fuzzKeyringOperationSequence(allocator: std.mem.Allocator, smith: *testing.Sm
     // Normal-path end-of-case cleanup, reached only once the whole opcode
     // program above completed without an earlier failure (the `errdefer`
     // near the top of this function is the safety net for that other
-    // case): drain every modeled reference, tear the keyring down --
-    // releasing its own reference too, if the instrumented snapshot is
-    // still `keyring.current` -- and only *then* assert, as a real fuzz
-    // failure via `testing.expectEqual` rather than a `std.debug.assert`
-    // (which lowers through `unreachable` and so is not a reliable runtime
-    // check under `-Doptimize=ReleaseFast`), that it deinitialized exactly
-    // once (`Snapshot.deinit` fired) *and* wiped its key exactly once (the
-    // `key_probe` delta): never zero (a leak) and never more than one (a
-    // double free/wipe). `tracked_snapshot and !tracked_finalized` -- the
-    // latter set at whichever single operation (opcode 4's inline release,
-    // or the install-replacement bracket above) already observed and
-    // verified the tracked snapshot's true final reference drop -- covers
-    // the remaining case: it is still `keyring.current` with no further
-    // install ever having replaced it, so this `keyring.deinit()` call is
-    // the one that finally performs (and here verifies) that release. When
-    // `tracked_finalized` is already true, the earlier bracket already
-    // proved the wipe, so this deliberately does not re-check: a *later*,
-    // untracked snapshot may be whatever `keyring.deinit()` frees here, and
-    // attributing its key-wipe delta to the original tracked snapshot would
-    // be a false attribution, not a real verification.
+    // case): drain every modeled reference, tear the keyring down, and
+    // assert -- as a real fuzz failure via `testing.expectEqual` rather
+    // than a `std.debug.assert` (which lowers through `unreachable` and so
+    // is not a reliable runtime check under `-Doptimize=ReleaseFast`) --
+    // that the tracked snapshot deinitialized exactly once and wiped its
+    // key exactly once. The `key_probe` delta bracket has to sit around
+    // whichever operation is the tracked snapshot's *own* true final
+    // release, not merely "whatever runs after the drain loop": if
+    // `held_outlived_current` is already true when the drain below runs,
+    // draining the last modeled reference *is* that final release (the
+    // snapshot stopped being `keyring.current` earlier in the loop, so
+    // nothing else still owns a reference to it) -- capturing the baseline
+    // only after draining would let `keyring.deinit()`'s unrelated wipe of
+    // the *current* (untracked) snapshot satisfy the delta instead,
+    // falsely "proving" the tracked one was wiped. Only when the tracked
+    // snapshot is still `keyring.current` at this point (never outlived,
+    // never finalized by opcode 4 or the install bracket above) does
+    // `keyring.deinit()` itself perform and verify the release.
     if (held) |snap| {
+        const wipes_before = key_probe.observed;
         while (held_refs != 0) {
             held_refs -= 1;
             snap.release();
         }
+        if (held_outlived_current) {
+            try testing.expectEqual(@as(usize, 1), held_deinit_count.load(.monotonic));
+            try testing.expectEqual(@as(usize, 1), key_probe.observed - wipes_before);
+            tracked_finalized = true;
+        }
     }
-    const watching = tracked_snapshot and !tracked_finalized;
-    const wipes_before = if (watching) key_probe.observed else 0;
-    keyring.deinit();
-    if (watching) {
+    if (tracked_snapshot and !tracked_finalized) {
+        const wipes_before = key_probe.observed;
+        keyring.deinit();
         try testing.expectEqual(@as(usize, 1), held_deinit_count.load(.monotonic));
         try testing.expectEqual(@as(usize, 1), key_probe.observed - wipes_before);
+    } else {
+        keyring.deinit();
     }
     secrets.secureZero(&held_key_fingerprint);
     TestKeyDeinitProbeStorage.probe = null;
