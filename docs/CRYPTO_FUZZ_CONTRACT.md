@@ -41,6 +41,9 @@ zig build test-crypto --summary all --error-style verbose
 # The standalone provider-boundary targets owned by this story:
 zig build test-crypto-provider-fuzz --summary all --error-style verbose
 
+# Shared TLS protocol-engine targets owned by #491:
+zig build test-tls-protocol-fuzz --summary all --error-style verbose
+
 # Longer local/scheduled coverage-guided runs:
 zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
 zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: AEAD open" --fuzz=10M --summary all --error-style verbose
@@ -49,6 +52,8 @@ zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter=
 zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: generateKeyShare" --fuzz=10M --summary all --error-style verbose
 zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: FixedSecret" --fuzz=10M --summary all --error-style verbose
 zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: BoundedSecret" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-protocol-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
+zig build test-tls-protocol-fuzz -Doptimize=ReleaseFast -Dtls-protocol-test-filter="fuzz: TLS protocol: ClientHello parse" --fuzz=10M --summary all --error-style verbose
 ```
 
 `-Dcrypto-test-filter` (added alongside the existing `-Dquic-test-filter`)
@@ -57,6 +62,8 @@ gives explicit target selection for the `test-crypto-provider-fuzz` step; the
 scale it). #491–#494 should add their own protocol-scoped test steps and
 `-D<area>-test-filter` options following the same pattern rather than
 growing this one.
+`test-tls-protocol-fuzz` follows that convention with
+`-Dtls-protocol-test-filter` and the default `fuzz: TLS protocol:` namespace.
 
 ## Seed-corpus and regression update procedure
 

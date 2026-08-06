@@ -1010,3 +1010,107 @@ test "ClientHello2 validator rejects malformed PSK binder vectors" {
         }));
     }
 }
+
+test "fuzz: TLS protocol: HRR decode and ClientHello2 validation reject malformed ordering deterministically" {
+    try testing.fuzz({}, fuzzHrrAndClientHello2, .{ .corpus = &.{
+        "",
+        &[_]u8{ 3, 3 } ++ random ++ [_]u8{ 0, 0x13, 0x01, 0, 0, 0 },
+        &([_]u8{0xff} ** 128),
+    } });
+}
+
+fn fuzzHrrAndClientHello2(_: void, smith: *testing.Smith) !void {
+    var offers = try baseOffers();
+    if (smith.index(2) == 0) {
+        offers.key_shares[0] = .{ .group = .x25519, .key_exchange = "share" };
+        offers.key_shares_len = 1;
+    }
+    if (smith.index(2) == 0) offers.key_share_seen = false;
+
+    var raw_body: [384]u8 = undefined;
+    const raw_len = smith.index(raw_body.len + 1);
+    smith.bytes(raw_body[0..raw_len]);
+    if (decode(raw_body[0..raw_len], "sid", &offers)) |request| {
+        try testing.expectEqual(algorithms.ProtocolVersion.tls13, request.selected_version);
+        try testing.expect(containsEnum(algorithms.CipherSuite, offers.cipher_suites[0..offers.cipher_suites_len], request.cipher_suite));
+        if (request.selected_group) |group| {
+            try testing.expect(containsEnum(algorithms.NamedGroup, offers.supported_groups[0..offers.supported_groups_len], group));
+            try testing.expect(offers.keyShareFor(group) == null);
+        }
+        if (request.cookie) |cookie| try testing.expect(cookie.len > 0);
+    } else |err| switch (err) {
+        error.MalformedHandshake,
+        error.IllegalParameter,
+        error.UnexpectedHandshakeMessage,
+        error.MissingExtension,
+        error.UnsupportedExtension,
+        error.AlpnMismatch,
+        error.UnsupportedCertificate,
+        error.CertificateInvalid,
+        error.SecretExportFailed,
+        error.InvalidHandshakeState,
+        error.TicketTooLarge,
+        error.NoApplicableCredential,
+        error.CredentialProviderFailed,
+        error.ClientCertificateRequired,
+        error.DecryptError,
+        error.HandshakeBufferOverflow,
+        error.DuplicateExtension,
+        error.TooManyExtensions,
+        error.MessageTooLarge,
+        error.IncompleteHandshake,
+        => {},
+    }
+
+    const cookie_options = [_]?[]const u8{ null, "cookie", "other" };
+    const share_options = [_]?algorithms.NamedGroup{ null, .x25519, .secp256r1 };
+    const extra_options = [_]?ExtensionView{
+        null,
+        .{ .id = @intFromEnum(algorithms.ExtensionType.padding), .data = "" },
+        .{ .id = @intFromEnum(algorithms.ExtensionType.padding), .data = &.{ 0, 0, 0 } },
+        .{ .id = @intFromEnum(algorithms.ExtensionType.padding), .data = &.{ 0, 1 } },
+        .{ .id = @intFromEnum(algorithms.ExtensionType.early_data), .data = "" },
+    };
+
+    var first_buf: [768]u8 = undefined;
+    var second_buf: [768]u8 = undefined;
+    const first_share = share_options[smith.index(share_options.len)];
+    const second_share = share_options[smith.index(share_options.len)];
+    const first = try clientHello(&first_buf, @intCast(smith.index(256)), first_share, null, extra_options[smith.index(extra_options.len)]);
+    const second = try clientHello(
+        &second_buf,
+        if (smith.index(4) == 0) 0xbb else first[4],
+        second_share,
+        cookie_options[smith.index(cookie_options.len)],
+        extra_options[smith.index(extra_options.len)],
+    );
+    const request = Request{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = share_options[smith.index(share_options.len)],
+        .cookie = cookie_options[smith.index(cookie_options.len)],
+    };
+    validateSecondClientHello(first, second, request) catch |err| switch (err) {
+        error.MalformedHandshake,
+        error.IllegalParameter,
+        error.UnexpectedHandshakeMessage,
+        error.MissingExtension,
+        error.UnsupportedExtension,
+        error.AlpnMismatch,
+        error.UnsupportedCertificate,
+        error.CertificateInvalid,
+        error.SecretExportFailed,
+        error.InvalidHandshakeState,
+        error.TicketTooLarge,
+        error.NoApplicableCredential,
+        error.CredentialProviderFailed,
+        error.ClientCertificateRequired,
+        error.DecryptError,
+        error.HandshakeBufferOverflow,
+        error.DuplicateExtension,
+        error.TooManyExtensions,
+        error.MessageTooLarge,
+        error.IncompleteHandshake,
+        => {},
+    };
+}

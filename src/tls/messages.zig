@@ -319,3 +319,70 @@ test "reader and writer enforce bounds" {
     try testing.expectEqual(@as(u8, 0), try r.u8_());
     try testing.expectError(error.MalformedHandshake, r.u8_());
 }
+
+test "fuzz: TLS protocol: handshake framing extensions and reassembly preserve bounded cursor invariants" {
+    try testing.fuzz({}, fuzzHandshakeCodecAndReassembly, .{ .corpus = &.{
+        "",
+        &[_]u8{ @intFromEnum(MessageType.client_hello), 0, 0, 0 },
+        &[_]u8{ @intFromEnum(MessageType.finished), 0, 0, 1, 0xaa },
+        &[_]u8{ 0xff, 0, 0, 0 },
+        &[_]u8{ 0, 43, 0, 2, 3, 4, 0, 43, 0, 2, 3, 4 },
+        &([_]u8{0xff} ** 128),
+    } });
+}
+
+fn fuzzHandshakeCodecAndReassembly(_: void, smith: *testing.Smith) !void {
+    var raw_buf: [256]u8 = undefined;
+    const raw_len = smith.index(raw_buf.len + 1);
+    smith.bytes(raw_buf[0..raw_len]);
+    const raw = raw_buf[0..raw_len];
+
+    if (decode(raw)) |message| {
+        try testing.expectEqual(raw.len, message.raw.len);
+        try testing.expectEqual(raw.len - 4, message.body.len);
+        try testing.expectEqual(raw.ptr, message.raw.ptr);
+        try testing.expectEqual(raw[4..].ptr, message.body.ptr);
+    } else |err| switch (err) {
+        error.MalformedHandshake, error.MessageTooLarge, error.DuplicateExtension, error.TooManyExtensions, error.HandshakeBufferOverflow, error.IncompleteHandshake => {},
+    }
+
+    var extensions = ExtensionIterator.init(raw);
+    var seen: [ExtensionGuard.max_extensions]u16 = undefined;
+    var seen_len: usize = 0;
+    while (extensions.next()) |maybe_extension| {
+        const extension = maybe_extension orelse break;
+        for (seen[0..seen_len]) |id| try testing.expect(id != extension.id);
+        try testing.expect(@intFromPtr(extension.data.ptr) >= @intFromPtr(raw.ptr));
+        try testing.expect(@intFromPtr(extension.data.ptr) + extension.data.len <= @intFromPtr(raw.ptr) + raw.len);
+        seen[seen_len] = extension.id;
+        seen_len += 1;
+    } else |err| switch (err) {
+        error.MalformedHandshake, error.DuplicateExtension, error.TooManyExtensions, error.HandshakeBufferOverflow, error.MessageTooLarge, error.IncompleteHandshake => {},
+    }
+
+    var encoded_storage: [256]u8 = undefined;
+    var body_storage: [128]u8 = undefined;
+    const body_len = smith.index(body_storage.len + 1);
+    smith.bytes(body_storage[0..body_len]);
+    const kinds = [_]MessageType{ .client_hello, .server_hello, .encrypted_extensions, .certificate, .finished, .message_hash };
+    const encoded = try encode(kinds[smith.index(kinds.len)], body_storage[0..body_len], &encoded_storage);
+    const decoded = try decode(encoded);
+    try testing.expectEqualSlices(u8, encoded, decoded.raw);
+    try testing.expectEqualSlices(u8, body_storage[0..body_len], decoded.body);
+
+    var reassembler = Reassembler(512){};
+    var cursor: usize = 0;
+    while (cursor < encoded.len) {
+        const remaining = encoded.len - cursor;
+        const chunk_len = 1 + smith.index(remaining);
+        try reassembler.append(encoded[cursor..][0..chunk_len]);
+        cursor += chunk_len;
+        if (cursor < encoded.len) {
+            try testing.expect((try reassembler.peek()) == null);
+        }
+    }
+    const reassembled = (try reassembler.peek()).?;
+    try testing.expectEqualSlices(u8, encoded, reassembled.raw);
+    try reassembler.discard(reassembled.raw.len);
+    try testing.expectEqual(@as(usize, 0), reassembler.len);
+}
