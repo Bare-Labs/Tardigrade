@@ -563,16 +563,19 @@ fn fuzzHandshakeCoreAndDriver(_: void, smith: *std.testing.Smith) !void {
     } else {
         try std.testing.expect(backend.calls > before_calls);
         const repeated = driver.receiveOutcome(.handshake, command);
-        if (repeated.terminal_error) |err| {
-            const calls_after_failure = backend.calls;
-            const sink_len_after_failure = repeated.sink.len;
-            const sink_used_after_failure = repeated.sink.used;
-            const again = driver.receiveOutcome(.handshake, command);
-            try std.testing.expectEqual(err, again.terminal_error.?);
-            try std.testing.expectEqual(calls_after_failure, backend.calls);
-            try std.testing.expectEqual(sink_len_after_failure, again.sink.len);
-            try std.testing.expectEqual(sink_used_after_failure, again.sink.used);
-        }
+        const err = repeated.terminal_error orelse return error.TestExpectedError;
+        try std.testing.expectEqual(error.UnexpectedHandshakeMessage, err);
+
+        const calls_after_failure = backend.calls;
+        const state_after_failure = backend.core.handshake_state;
+        const sink_len_after_failure = repeated.sink.len;
+        const sink_used_after_failure = repeated.sink.used;
+        const again = driver.receiveOutcome(.handshake, command);
+        try std.testing.expectEqual(err, again.terminal_error.?);
+        try std.testing.expectEqual(calls_after_failure, backend.calls);
+        try std.testing.expectEqual(sink_len_after_failure, again.sink.len);
+        try std.testing.expectEqual(sink_used_after_failure, again.sink.used);
+        try std.testing.expectEqual(state_after_failure, backend.core.handshake_state);
     }
 }
 

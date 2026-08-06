@@ -425,8 +425,10 @@ fn fuzzHandshakeCodecAndReassembly(_: void, smith: *testing.Smith) !void {
             if (maybe_message) |message| {
                 try testing.expect(message.raw.len <= raw_reassembler.len);
                 try testing.expectEqualSlices(u8, raw_reassembler.data[0..message.raw.len], message.raw);
-                const bad_discard = message.raw.len + 1 + smith.index(raw_reassembler.len - message.raw.len + 1);
+                const bad_discard = raw_reassembler.len + 1 + smith.index(8);
+                const before_bad_discard = raw_reassembler.len;
                 try testing.expectError(error.MalformedHandshake, raw_reassembler.discard(bad_discard));
+                try testing.expectEqual(before_bad_discard, raw_reassembler.len);
                 try raw_reassembler.discard(message.raw.len);
                 try testing.expectEqual(raw.len - message.raw.len, raw_reassembler.len);
             }
