@@ -847,7 +847,10 @@ fn assertNegotiationOutcomes(policy: policy_mod.Policy, parsed: *const ParsedCli
                 try testing.expect(parsed.offers.keyShareFor(group) == null);
             },
         }
-        if (selected.alpn) |alpn| try testing.expect(policy.containsAlpn(alpn.bytes));
+        if (selected.alpn) |alpn| {
+            try testing.expect(policy.containsAlpn(alpn.bytes));
+            try testing.expect(containsAlpn(parsed.offers.alpn_protocols[0..parsed.offers.alpn_protocols_len], alpn));
+        }
         try validateServerSelection(policy, .{
             .version = selected.version,
             .cipher_suite = selected.cipher_suite,
@@ -882,7 +885,11 @@ fn assertNegotiationOutcomes(policy: policy_mod.Policy, parsed: *const ParsedCli
         try testing.expect(policy.containsCipherSuite(selected.cipher_suite));
         try testing.expect(policy.containsNamedGroup(selected.named_group));
         try testing.expect(policy.containsSignatureScheme(selected.signature_scheme));
+        try testing.expect(containsEnum(algorithms.SignatureScheme, parsed.offers.signature_schemes[0..parsed.offers.signature_schemes_len], selected.signature_scheme));
         try testing.expect(policy.containsAlpn(selected.alpn.bytes));
+        try testing.expect(containsAlpn(parsed.offers.alpn_protocols[0..parsed.offers.alpn_protocols_len], selected.alpn));
+        try testing.expectEqualSlices(u8, parsed.offers.keyShareFor(selected.named_group).?, selected.key_share);
+        try testing.expectEqual(parsed.offers.server_name, selected.server_name);
     } else |err| switch (err) {
         error.UnsupportedProtocolVersion,
         error.MissingServerName,

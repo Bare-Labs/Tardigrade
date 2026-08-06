@@ -326,6 +326,10 @@ test "fuzz: TLS protocol: handshake framing extensions and reassembly preserve b
         &[_]u8{ @intFromEnum(MessageType.client_hello), 0, 0, 0 },
         &[_]u8{ @intFromEnum(MessageType.finished), 0, 0, 1, 0xaa },
         &[_]u8{ 0xff, 0, 0, 0 },
+        &[_]u8{ @intFromEnum(MessageType.client_hello), 0, 0, 0, @intFromEnum(MessageType.finished), 0, 0, 0 },
+        &[_]u8{ @intFromEnum(MessageType.finished), 0, 0xff, 0xff, 0xff },
+        &([_]u8{0xaa} ** 64),
+        &([_]u8{0xbb} ** 65),
         &[_]u8{ 0, 43, 0, 2, 3, 4, 0, 43, 0, 2, 3, 4 },
         &([_]u8{0xff} ** 128),
     } });
@@ -385,4 +389,52 @@ fn fuzzHandshakeCodecAndReassembly(_: void, smith: *testing.Smith) !void {
     try testing.expectEqualSlices(u8, encoded, reassembled.raw);
     try reassembler.discard(reassembled.raw.len);
     try testing.expectEqual(@as(usize, 0), reassembler.len);
+
+    var second_encoded_storage: [256]u8 = undefined;
+    var second_body_storage: [128]u8 = undefined;
+    const second_body_len = smith.index(second_body_storage.len + 1);
+    smith.bytes(second_body_storage[0..second_body_len]);
+    const second_encoded = try encode(kinds[smith.index(kinds.len)], second_body_storage[0..second_body_len], &second_encoded_storage);
+
+    var coalesced_storage: [512]u8 = undefined;
+    @memcpy(coalesced_storage[0..encoded.len], encoded);
+    @memcpy(coalesced_storage[encoded.len..][0..second_encoded.len], second_encoded);
+    const coalesced = coalesced_storage[0 .. encoded.len + second_encoded.len];
+    var coalesced_reassembler = Reassembler(512){};
+    var coalesced_cursor: usize = 0;
+    while (coalesced_cursor < coalesced.len) {
+        const remaining = coalesced.len - coalesced_cursor;
+        const chunk_len = 1 + smith.index(remaining);
+        try coalesced_reassembler.append(coalesced[coalesced_cursor..][0..chunk_len]);
+        coalesced_cursor += chunk_len;
+    }
+    for ([_][]const u8{ encoded, second_encoded }) |frame| {
+        const message = (try coalesced_reassembler.peek()).?;
+        try testing.expectEqualSlices(u8, frame, message.raw);
+        try coalesced_reassembler.discard(message.raw.len);
+    }
+    try testing.expectEqual(@as(usize, 0), coalesced_reassembler.len);
+
+    var raw_reassembler = Reassembler(64){};
+    const raw_before_len = raw_reassembler.len;
+    const append_result = raw_reassembler.append(raw);
+    if (append_result) |_| {
+        try testing.expectEqual(raw.len, raw_reassembler.len);
+        const peek_result = raw_reassembler.peek();
+        if (peek_result) |maybe_message| {
+            if (maybe_message) |message| {
+                try testing.expect(message.raw.len <= raw_reassembler.len);
+                try testing.expectEqualSlices(u8, raw_reassembler.data[0..message.raw.len], message.raw);
+                const bad_discard = message.raw.len + 1 + smith.index(raw_reassembler.len - message.raw.len + 1);
+                try testing.expectError(error.MalformedHandshake, raw_reassembler.discard(bad_discard));
+                try raw_reassembler.discard(message.raw.len);
+                try testing.expectEqual(raw.len - message.raw.len, raw_reassembler.len);
+            }
+        } else |err| switch (err) {
+            error.MalformedHandshake, error.MessageTooLarge, error.HandshakeBufferOverflow, error.DuplicateExtension, error.TooManyExtensions, error.IncompleteHandshake => {},
+        }
+    } else |err| switch (err) {
+        error.HandshakeBufferOverflow => try testing.expectEqual(raw_before_len, raw_reassembler.len),
+        error.MalformedHandshake, error.MessageTooLarge, error.DuplicateExtension, error.TooManyExtensions, error.IncompleteHandshake => {},
+    }
 }
