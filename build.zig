@@ -58,6 +58,16 @@ pub fn build(b: *std.Build) void {
     // protocol boundary without also driving PSK/ticket/cache state.
     const tls_protocol_test_filter = b.option([]const u8, "tls-protocol-test-filter", "Filter tests run by the test-tls-protocol-fuzz step (default: \"fuzz: TLS protocol:\", i.e. only #491 shared TLS handshake/negotiation/transcript/reassembly fuzz targets)") orelse "fuzz: TLS protocol:";
     const tls_protocol_test_filters: []const []const u8 = &.{tls_protocol_test_filter};
+    // TLS record / protection / epoch / encrypted-stream fuzz targets (#493,
+    // epic #325-K). Same shape as #491/#494 above: a dedicated namespace so
+    // local coverage-guided runs can select this boundary without also
+    // driving the shared protocol engine or resumption state.
+    const tls_record_test_filter = b.option(
+        []const u8,
+        "tls-record-test-filter",
+        "Filter tests run by the test-tls-record-fuzz step (default: \"fuzz: TLS record:\", i.e. only #493 record/protection/epoch/encrypted-stream fuzz targets)",
+    ) orelse "fuzz: TLS record:";
+    const tls_record_test_filters: []const []const u8 = &.{tls_record_test_filter};
     const tls_profile = b.option(
         TlsProfile,
         "tls-profile",
@@ -257,6 +267,18 @@ pub fn build(b: *std.Build) void {
     const run_tls_protocol_fuzz_tests = b.addRunArtifact(tls_protocol_fuzz_tests);
     const tls_protocol_fuzz_step = b.step("test-tls-protocol-fuzz", "Run shared TLS protocol-engine fuzz targets (#491)");
     tls_protocol_fuzz_step.dependOn(&run_tls_protocol_fuzz_tests.step);
+
+    // Record codec, protection, epoch/key lifecycle, and encrypted-stream
+    // fuzz targets (#493, epic #325-K). Like #494/#491 above, these are
+    // inline `test "fuzz: ..."` blocks next to the code they exercise
+    // (record_codec.zig, record_protection.zig, record_epoch_bridge.zig,
+    // encrypted_stream.zig) and already replay their deterministic seed
+    // corpus under plain `test-tls`/`test`; this step gives them a stable,
+    // individually filterable/long-runnable name.
+    const tls_record_fuzz_tests = b.addTest(.{ .root_module = tls_core_mod, .filters = tls_record_test_filters });
+    const run_tls_record_fuzz_tests = b.addRunArtifact(tls_record_fuzz_tests);
+    const tls_record_fuzz_step = b.step("test-tls-record-fuzz", "Run TLS record/protection/epoch/encrypted-stream fuzz targets (#493)");
+    tls_record_fuzz_step.dependOn(&run_tls_record_fuzz_tests.step);
 
     const allocation_regression_mod = b.createModule(.{
         .root_source_file = b.path("src/allocation_regression.zig"),
