@@ -347,3 +347,67 @@ test "an unselected transcript reports no family and a zero-length digest with a
     try testing.expectEqual(@as(usize, 0), digest.len);
     for (digest.bytes) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
+
+test "fuzz: TLS protocol: transcript update select and HRR rebind sequences are bounded and deterministic" {
+    try testing.fuzz({}, fuzzTranscriptSequences, .{ .corpus = &.{
+        "",
+        &[_]u8{ 0, 1, 2, 3, 4 },
+        &[_]u8{ 2, 0, 0, 1, 0xaa },
+        &([_]u8{0xff} ** 128),
+    } });
+}
+
+fn fuzzTranscriptSequences(_: void, smith: *testing.Smith) !void {
+    var transcript = Transcript{};
+    var mirrored = Transcript{};
+    var saw_deferred_rebind = false;
+
+    var chunk_storage: [96]u8 = undefined;
+    for (0..32) |_| {
+        switch (smith.index(5)) {
+            0 => {
+                const len = smith.index(chunk_storage.len + 1);
+                smith.bytes(chunk_storage[0..len]);
+                const before_pending_len = transcript.pending_len;
+                const update_result = transcript.update(chunk_storage[0..len]);
+                const mirror_result = mirrored.update(chunk_storage[0..len]);
+                if (update_result) |_| {
+                    try mirror_result;
+                } else |err| {
+                    try testing.expectEqual(error.TranscriptOverflow, err);
+                    try testing.expectError(error.TranscriptOverflow, mirror_result);
+                    try testing.expectEqual(before_pending_len, transcript.pending_len);
+                }
+            },
+            1 => {
+                const family: Hash = if (smith.index(2) == 0) .sha256 else .sha384;
+                transcript.selectFamily(family);
+                mirrored.selectFamily(family);
+                try testing.expectEqual(family, transcript.family().?);
+                try testing.expect(transcript.peek().eql(&mirrored.peek()));
+            },
+            2 => {
+                if (transcript.family() != null or !saw_deferred_rebind) {
+                    transcript.rebindClientHello();
+                    mirrored.rebindClientHello();
+                    if (transcript.family() == null) saw_deferred_rebind = true;
+                    try testing.expect(transcript.peek().eql(&mirrored.peek()));
+                }
+            },
+            3 => {
+                const len = smith.index(chunk_storage.len + 1);
+                smith.bytes(chunk_storage[0..len]);
+                const before = transcript.peek();
+                _ = transcript.peekWith(chunk_storage[0..len]);
+                try testing.expect(before.eql(&transcript.peek()));
+            },
+            else => {
+                if (transcript.family()) |family| {
+                    const before = transcript.peek();
+                    transcript.selectFamily(if (family == .sha256) .sha384 else .sha256);
+                    try testing.expect(before.eql(&transcript.peek()));
+                }
+            },
+        }
+    }
+}

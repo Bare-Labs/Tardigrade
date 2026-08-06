@@ -10,6 +10,7 @@ pub const state = @import("state.zig");
 pub const events = @import("events.zig");
 pub const handshake = @import("handshake.zig");
 pub const key_schedule = @import("key_schedule.zig");
+const messages = @import("messages.zig");
 pub const transcript = @import("transcript.zig");
 
 pub const EngineConfig = struct {
@@ -476,4 +477,150 @@ test "driver deinit is safe after a failed handshake" {
     try std.testing.expectError(error.TransportBufferOverflow, driver.start({}));
     driver.deinit();
     try std.testing.expectEqual(@as(usize, 0), driver.sink.used);
+}
+
+test "fuzz: TLS protocol: handshake core and driver reject malformed ordering with sticky terminal errors" {
+    try std.testing.fuzz({}, fuzzHandshakeCoreAndDriver, .{ .corpus = &.{
+        "",
+        &[_]u8{ 0, @intFromEnum(messages.MessageType.client_hello), 0, 0, 0 },
+        &[_]u8{ 1, @intFromEnum(messages.MessageType.finished), 0, 0, 0 },
+        &[_]u8{ 2, @intFromEnum(messages.MessageType.server_hello), 0, 0, 3, 'h', 'r', 'r' },
+        &([_]u8{0xff} ** 96),
+    } });
+}
+
+fn fuzzHandshakeCoreAndDriver(_: void, smith: *std.testing.Smith) !void {
+    try exerciseKnownValidHrrProgression(smith);
+
+    const DriverError = handshake.Error || error{TransportBufferOverflow};
+    const T = @import("transport.zig").Contract(void, enum { handshake }, DriverError);
+    const D = Driver(T);
+    const Backend = struct {
+        core: handshake.Core,
+        calls: usize = 0,
+
+        fn start(ptr: *anyopaque, role: state.Role, _: void, _: *T.EventSink) T.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.core = handshake.Core.init(role);
+            try self.core.start();
+            self.core.transcript.selectFamily(.sha256);
+        }
+
+        fn receive(ptr: *anyopaque, _: T.EpochType, bytes: []const u8, _: *T.EventSink) T.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (bytes.len == 0) return error.MalformedHandshake;
+            const op = bytes[0] % 6;
+            const raw = bytes[1..];
+            switch (op) {
+                0 => _ = try self.core.acceptReceived(raw),
+                1 => try self.core.recordSent(raw),
+                2 => _ = try self.core.acceptHelloRetryRequest(raw),
+                3 => try self.core.recordHelloRetryRequest(raw),
+                4 => try self.core.recordSecondClientHello(raw),
+                else => _ = try self.core.acceptSecondClientHello(raw),
+            }
+        }
+    };
+
+    var backend = Backend{ .core = handshake.Core.init(if (smith.index(2) == 0) .client else .server) };
+    var driver = D.init(if (smith.index(2) == 0) .client else .server, .{
+        .ptr = &backend,
+        .startFn = Backend.start,
+        .receiveFn = Backend.receive,
+    });
+    defer driver.deinit();
+
+    const start = driver.startOutcome({});
+    try std.testing.expectEqual(@as(?T.Error, null), start.terminal_error);
+    try std.testing.expectEqual(state.DriverState.in_progress, driver.state);
+
+    var frame_storage: [128]u8 = undefined;
+    const frame = try fuzzHandshakeFrame(smith, &frame_storage);
+    var command_storage: [129]u8 = undefined;
+    command_storage[0] = @intCast(smith.index(6));
+    @memcpy(command_storage[1..][0..frame.len], frame);
+    const command = command_storage[0 .. 1 + frame.len];
+
+    const before_calls = backend.calls;
+    const first = driver.receiveOutcome(.handshake, command);
+    if (first.terminal_error) |err| {
+        try std.testing.expectEqual(state.DriverState.failed, driver.state);
+        try std.testing.expectEqual(err, driver.failure().?);
+        const state_after_failure = backend.core.handshake_state;
+        const lifecycle_after_failure = backend.core.handshake_lifecycle;
+        const calls_after_failure = backend.calls;
+        const sink_len_after_failure = first.sink.len;
+        const sink_used_after_failure = first.sink.used;
+        const again = driver.receiveOutcome(.handshake, command);
+        try std.testing.expectEqual(err, again.terminal_error.?);
+        try std.testing.expectEqual(calls_after_failure, backend.calls);
+        try std.testing.expectEqual(sink_len_after_failure, again.sink.len);
+        try std.testing.expectEqual(sink_used_after_failure, again.sink.used);
+        try std.testing.expectEqual(state_after_failure, backend.core.handshake_state);
+        try std.testing.expectEqual(lifecycle_after_failure, backend.core.handshake_lifecycle);
+    } else {
+        try std.testing.expect(backend.calls > before_calls);
+        const repeated = driver.receiveOutcome(.handshake, command);
+        const err = repeated.terminal_error orelse return error.TestExpectedError;
+        try std.testing.expectEqual(error.UnexpectedHandshakeMessage, err);
+
+        const calls_after_failure = backend.calls;
+        const state_after_failure = backend.core.handshake_state;
+        const sink_len_after_failure = repeated.sink.len;
+        const sink_used_after_failure = repeated.sink.used;
+        const again = driver.receiveOutcome(.handshake, command);
+        try std.testing.expectEqual(err, again.terminal_error.?);
+        try std.testing.expectEqual(calls_after_failure, backend.calls);
+        try std.testing.expectEqual(sink_len_after_failure, again.sink.len);
+        try std.testing.expectEqual(sink_used_after_failure, again.sink.used);
+        try std.testing.expectEqual(state_after_failure, backend.core.handshake_state);
+    }
+}
+
+fn exerciseKnownValidHrrProgression(smith: *std.testing.Smith) !void {
+    var client = handshake.Core.init(.client);
+    var server = handshake.Core.init(.server);
+    try client.start();
+    try server.start();
+    client.transcript.selectFamily(if (smith.index(2) == 0) .sha256 else .sha384);
+    server.transcript.selectFamily(client.transcript.family().?);
+
+    var ch1_buf: [32]u8 = undefined;
+    var hrr_buf: [32]u8 = undefined;
+    var ch2_buf: [32]u8 = undefined;
+    var sh_buf: [32]u8 = undefined;
+    const ch1 = try messages.encode(.client_hello, "one", &ch1_buf);
+    try client.recordSent(ch1);
+    _ = try server.acceptReceived(ch1);
+    const hrr = try messages.encode(.server_hello, "hrr", &hrr_buf);
+    try server.recordHelloRetryRequest(hrr);
+    _ = try client.acceptHelloRetryRequest(hrr);
+    const ch2 = try messages.encode(.client_hello, "two", &ch2_buf);
+    try client.recordSecondClientHello(ch2);
+    _ = try server.acceptSecondClientHello(ch2);
+    const sh = try messages.encode(.server_hello, "ok", &sh_buf);
+    try server.recordSent(sh);
+    _ = try client.acceptReceived(sh);
+
+    try std.testing.expectEqual(handshake.RetryState.hrr_received, client.retry_state);
+    try std.testing.expectEqual(handshake.RetryState.hrr_sent, server.retry_state);
+    try std.testing.expect(client.transcriptHash().eql(&server.transcriptHash()));
+}
+
+fn fuzzHandshakeFrame(smith: *std.testing.Smith, out: []u8) ![]const u8 {
+    const kinds = [_]messages.MessageType{ .client_hello, .server_hello, .encrypted_extensions, .certificate, .certificate_verify, .finished };
+    var body: [32]u8 = undefined;
+    const body_len = smith.index(body.len + 1);
+    smith.bytes(body[0..body_len]);
+    const frame = try messages.encode(kinds[smith.index(kinds.len)], body[0..body_len], out);
+    if (smith.index(4) == 0 and frame.len > 0) {
+        out[0] = 0xff;
+    } else if (smith.index(4) == 0 and frame.len >= 4) {
+        out[1] = 0xff;
+        out[2] = 0xff;
+        out[3] = 0xff;
+    }
+    return frame;
 }

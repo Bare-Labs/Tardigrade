@@ -51,6 +51,13 @@ pub fn build(b: *std.Build) void {
     // filter to select one target for a longer local run.
     const tls_resumption_test_filter = b.option([]const u8, "tls-resumption-test-filter", "Filter tests run by the test-tls-resumption-fuzz step (default: \"fuzz: TLS resumption:\", i.e. only the #494 session/PSK/ticket/resumption fuzz targets)") orelse "fuzz: TLS resumption:";
     const tls_resumption_test_filters: []const []const u8 = &.{tls_resumption_test_filter};
+    // Shared TLS protocol-engine fuzz targets (#491, epic #323-K):
+    // handshake message/extension codecs, policy negotiation, transcript/HRR
+    // state, and TLS-owned reassembly. Keep this namespace separate from
+    // #494's resumption targets so local coverage-guided runs can select the
+    // protocol boundary without also driving PSK/ticket/cache state.
+    const tls_protocol_test_filter = b.option([]const u8, "tls-protocol-test-filter", "Filter tests run by the test-tls-protocol-fuzz step (default: \"fuzz: TLS protocol:\", i.e. only #491 shared TLS handshake/negotiation/transcript/reassembly fuzz targets)") orelse "fuzz: TLS protocol:";
+    const tls_protocol_test_filters: []const []const u8 = &.{tls_protocol_test_filter};
     const tls_profile = b.option(
         TlsProfile,
         "tls-profile",
@@ -245,6 +252,11 @@ pub fn build(b: *std.Build) void {
     const run_tls_resumption_fuzz_tests = b.addRunArtifact(tls_resumption_fuzz_tests);
     const tls_resumption_fuzz_step = b.step("test-tls-resumption-fuzz", "Run TLS session/PSK/ticket/resumption fuzz targets (#494)");
     tls_resumption_fuzz_step.dependOn(&run_tls_resumption_fuzz_tests.step);
+
+    const tls_protocol_fuzz_tests = b.addTest(.{ .root_module = tls_core_mod, .filters = tls_protocol_test_filters });
+    const run_tls_protocol_fuzz_tests = b.addRunArtifact(tls_protocol_fuzz_tests);
+    const tls_protocol_fuzz_step = b.step("test-tls-protocol-fuzz", "Run shared TLS protocol-engine fuzz targets (#491)");
+    tls_protocol_fuzz_step.dependOn(&run_tls_protocol_fuzz_tests.step);
 
     const allocation_regression_mod = b.createModule(.{
         .root_source_file = b.path("src/allocation_regression.zig"),

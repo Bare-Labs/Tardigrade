@@ -1010,3 +1010,172 @@ test "ClientHello2 validator rejects malformed PSK binder vectors" {
         }));
     }
 }
+
+test "fuzz: TLS protocol: HRR decode and ClientHello2 validation reject malformed ordering deterministically" {
+    try testing.fuzz({}, fuzzHrrAndClientHello2, .{ .corpus = &.{
+        "",
+        &[_]u8{ 3, 3 } ++ random ++ [_]u8{ 0, 0x13, 0x01, 0, 0, 0 },
+        &([_]u8{0xff} ** 128),
+    } });
+}
+
+fn fuzzHrrAndClientHello2(_: void, smith: *testing.Smith) !void {
+    var offers = try baseOffers();
+    if (smith.index(2) == 0) {
+        offers.key_shares[0] = .{ .group = .x25519, .key_exchange = "share" };
+        offers.key_shares_len = 1;
+    }
+    if (smith.index(2) == 0) offers.key_share_seen = false;
+
+    var raw_body: [384]u8 = undefined;
+    const raw_len = smith.index(raw_body.len + 1);
+    smith.bytes(raw_body[0..raw_len]);
+    if (decode(raw_body[0..raw_len], "sid", &offers)) |request| {
+        try testing.expectEqual(algorithms.ProtocolVersion.tls13, request.selected_version);
+        try testing.expect(containsEnum(algorithms.CipherSuite, offers.cipher_suites[0..offers.cipher_suites_len], request.cipher_suite));
+        if (request.selected_group) |group| {
+            try testing.expect(containsEnum(algorithms.NamedGroup, offers.supported_groups[0..offers.supported_groups_len], group));
+            try testing.expect(offers.keyShareFor(group) == null);
+        }
+        if (request.cookie) |cookie| try testing.expect(cookie.len > 0);
+    } else |err| switch (err) {
+        error.MalformedHandshake,
+        error.IllegalParameter,
+        error.UnexpectedHandshakeMessage,
+        error.MissingExtension,
+        error.UnsupportedExtension,
+        error.AlpnMismatch,
+        error.UnsupportedCertificate,
+        error.CertificateInvalid,
+        error.SecretExportFailed,
+        error.InvalidHandshakeState,
+        error.TicketTooLarge,
+        error.NoApplicableCredential,
+        error.CredentialProviderFailed,
+        error.ClientCertificateRequired,
+        error.DecryptError,
+        error.HandshakeBufferOverflow,
+        error.DuplicateExtension,
+        error.TooManyExtensions,
+        error.MessageTooLarge,
+        error.IncompleteHandshake,
+        => {},
+    }
+
+    var first_buf: [768]u8 = undefined;
+    var second_buf: [768]u8 = undefined;
+    var mutated_buf: [768]u8 = undefined;
+    var psk_first_buf: [768]u8 = undefined;
+    var psk_buf: [256]u8 = undefined;
+
+    const first_random: u8 = @intCast(smith.index(256));
+    const second_cookie = "cookie";
+    const first = try clientHello(&first_buf, first_random, null, null, null);
+    const second = try clientHello(&second_buf, first_random, .x25519, second_cookie, null);
+    const valid_request = Request{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+        .cookie = second_cookie,
+    };
+    try validateSecondClientHello(first, second, valid_request);
+
+    switch (smith.index(8)) {
+        0 => {
+            const bad_random = try clientHello(&mutated_buf, first_random ^ 0xff, .x25519, second_cookie, null);
+            try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, bad_random, valid_request));
+        },
+        1 => {
+            const missing_cookie = try clientHello(&mutated_buf, first_random, .x25519, null, null);
+            try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, missing_cookie, valid_request));
+        },
+        2 => {
+            const wrong_cookie = try clientHello(&mutated_buf, first_random, .x25519, "other", null);
+            try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, wrong_cookie, valid_request));
+        },
+        3 => {
+            const missing_share = try clientHello(&mutated_buf, first_random, null, second_cookie, null);
+            try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, missing_share, valid_request));
+        },
+        4 => {
+            const early_data = try clientHello(
+                &mutated_buf,
+                first_random,
+                .x25519,
+                second_cookie,
+                .{ .id = @intFromEnum(algorithms.ExtensionType.early_data), .data = "" },
+            );
+            try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, early_data, valid_request));
+        },
+        5 => {
+            const nonzero_padding = try clientHello(
+                &mutated_buf,
+                first_random,
+                .x25519,
+                second_cookie,
+                .{ .id = @intFromEnum(algorithms.ExtensionType.padding), .data = &.{ 0, @intCast(1 + smith.index(255)) } },
+            );
+            try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, nonzero_padding, valid_request));
+        },
+        6 => {
+            const reordered_stable = try clientHelloWithReorderedStableExtensions(&mutated_buf, first_random, .x25519);
+            try testing.expectError(error.IllegalParameter, validateSecondClientHello(first, reordered_stable, .{
+                .selected_version = .tls13,
+                .cipher_suite = .tls_aes_128_gcm_sha256,
+                .selected_group = .x25519,
+                .cookie = null,
+            }));
+        },
+        else => {
+            const psk = try pskExtension(&psk_buf, "ticket-a", @intCast(smith.index(1024)), null, 0, @intCast(smith.index(256)));
+            const psk_ext = ExtensionView{ .id = @intFromEnum(algorithms.ExtensionType.pre_shared_key), .data = psk };
+            const cookie_ext = ExtensionView{ .id = @intFromEnum(algorithms.ExtensionType.cookie), .data = &.{ 0, 6, 'c', 'o', 'o', 'k', 'i', 'e' } };
+            const first_with_psk = try clientHelloWithExtensionList(&psk_first_buf, first_random, .x25519, &.{psk_ext});
+            const invalid_psk_order = try clientHelloWithExtensionList(&mutated_buf, first_random, .x25519, &.{ psk_ext, cookie_ext });
+            try testing.expectError(error.IllegalParameter, validateSecondClientHello(first_with_psk, invalid_psk_order, .{
+                .selected_version = .tls13,
+                .cipher_suite = .tls_aes_128_gcm_sha256,
+                .selected_group = null,
+                .cookie = second_cookie,
+            }));
+        },
+    }
+
+    const second_random = if (smith.index(4) == 0) first_random ^ 0xff else first_random;
+    const sampled_second = try clientHello(
+        &second_buf,
+        second_random,
+        if (smith.index(2) == 0) .x25519 else null,
+        if (smith.index(2) == 0) second_cookie else null,
+        null,
+    );
+    const sampled_request = Request{
+        .selected_version = .tls13,
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .selected_group = .x25519,
+        .cookie = second_cookie,
+    };
+    validateSecondClientHello(first, sampled_second, sampled_request) catch |err| switch (err) {
+        error.MalformedHandshake,
+        error.IllegalParameter,
+        error.UnexpectedHandshakeMessage,
+        error.MissingExtension,
+        error.UnsupportedExtension,
+        error.AlpnMismatch,
+        error.UnsupportedCertificate,
+        error.CertificateInvalid,
+        error.SecretExportFailed,
+        error.InvalidHandshakeState,
+        error.TicketTooLarge,
+        error.NoApplicableCredential,
+        error.CredentialProviderFailed,
+        error.ClientCertificateRequired,
+        error.DecryptError,
+        error.HandshakeBufferOverflow,
+        error.DuplicateExtension,
+        error.TooManyExtensions,
+        error.MessageTooLarge,
+        error.IncompleteHandshake,
+        => {},
+    };
+}

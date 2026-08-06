@@ -319,3 +319,124 @@ test "reader and writer enforce bounds" {
     try testing.expectEqual(@as(u8, 0), try r.u8_());
     try testing.expectError(error.MalformedHandshake, r.u8_());
 }
+
+test "fuzz: TLS protocol: handshake framing extensions and reassembly preserve bounded cursor invariants" {
+    try testing.fuzz({}, fuzzHandshakeCodecAndReassembly, .{ .corpus = &.{
+        "",
+        &[_]u8{ @intFromEnum(MessageType.client_hello), 0, 0, 0 },
+        &[_]u8{ @intFromEnum(MessageType.finished), 0, 0, 1, 0xaa },
+        &[_]u8{ 0xff, 0, 0, 0 },
+        &[_]u8{ @intFromEnum(MessageType.client_hello), 0, 0, 0, @intFromEnum(MessageType.finished), 0, 0, 0 },
+        &[_]u8{ @intFromEnum(MessageType.finished), 0, 0xff, 0xff, 0xff },
+        &([_]u8{0xaa} ** 64),
+        &([_]u8{0xbb} ** 65),
+        &[_]u8{ 0, 43, 0, 2, 3, 4, 0, 43, 0, 2, 3, 4 },
+        &([_]u8{0xff} ** 128),
+    } });
+}
+
+fn fuzzHandshakeCodecAndReassembly(_: void, smith: *testing.Smith) !void {
+    var raw_buf: [256]u8 = undefined;
+    const raw_len = smith.index(raw_buf.len + 1);
+    smith.bytes(raw_buf[0..raw_len]);
+    const raw = raw_buf[0..raw_len];
+
+    if (decode(raw)) |message| {
+        try testing.expectEqual(raw.len, message.raw.len);
+        try testing.expectEqual(raw.len - 4, message.body.len);
+        try testing.expectEqual(raw.ptr, message.raw.ptr);
+        try testing.expectEqual(raw[4..].ptr, message.body.ptr);
+    } else |err| switch (err) {
+        error.MalformedHandshake, error.MessageTooLarge, error.DuplicateExtension, error.TooManyExtensions, error.HandshakeBufferOverflow, error.IncompleteHandshake => {},
+    }
+
+    var extensions = ExtensionIterator.init(raw);
+    var seen: [ExtensionGuard.max_extensions]u16 = undefined;
+    var seen_len: usize = 0;
+    while (extensions.next()) |maybe_extension| {
+        const extension = maybe_extension orelse break;
+        for (seen[0..seen_len]) |id| try testing.expect(id != extension.id);
+        try testing.expect(@intFromPtr(extension.data.ptr) >= @intFromPtr(raw.ptr));
+        try testing.expect(@intFromPtr(extension.data.ptr) + extension.data.len <= @intFromPtr(raw.ptr) + raw.len);
+        seen[seen_len] = extension.id;
+        seen_len += 1;
+    } else |err| switch (err) {
+        error.MalformedHandshake, error.DuplicateExtension, error.TooManyExtensions, error.HandshakeBufferOverflow, error.MessageTooLarge, error.IncompleteHandshake => {},
+    }
+
+    var encoded_storage: [256]u8 = undefined;
+    var body_storage: [128]u8 = undefined;
+    const body_len = smith.index(body_storage.len + 1);
+    smith.bytes(body_storage[0..body_len]);
+    const kinds = [_]MessageType{ .client_hello, .server_hello, .encrypted_extensions, .certificate, .finished, .message_hash };
+    const encoded = try encode(kinds[smith.index(kinds.len)], body_storage[0..body_len], &encoded_storage);
+    const decoded = try decode(encoded);
+    try testing.expectEqualSlices(u8, encoded, decoded.raw);
+    try testing.expectEqualSlices(u8, body_storage[0..body_len], decoded.body);
+
+    var reassembler = Reassembler(512){};
+    var cursor: usize = 0;
+    while (cursor < encoded.len) {
+        const remaining = encoded.len - cursor;
+        const chunk_len = 1 + smith.index(remaining);
+        try reassembler.append(encoded[cursor..][0..chunk_len]);
+        cursor += chunk_len;
+        if (cursor < encoded.len) {
+            try testing.expect((try reassembler.peek()) == null);
+        }
+    }
+    const reassembled = (try reassembler.peek()).?;
+    try testing.expectEqualSlices(u8, encoded, reassembled.raw);
+    try reassembler.discard(reassembled.raw.len);
+    try testing.expectEqual(@as(usize, 0), reassembler.len);
+
+    var second_encoded_storage: [256]u8 = undefined;
+    var second_body_storage: [128]u8 = undefined;
+    const second_body_len = smith.index(second_body_storage.len + 1);
+    smith.bytes(second_body_storage[0..second_body_len]);
+    const second_encoded = try encode(kinds[smith.index(kinds.len)], second_body_storage[0..second_body_len], &second_encoded_storage);
+
+    var coalesced_storage: [512]u8 = undefined;
+    @memcpy(coalesced_storage[0..encoded.len], encoded);
+    @memcpy(coalesced_storage[encoded.len..][0..second_encoded.len], second_encoded);
+    const coalesced = coalesced_storage[0 .. encoded.len + second_encoded.len];
+    var coalesced_reassembler = Reassembler(512){};
+    var coalesced_cursor: usize = 0;
+    while (coalesced_cursor < coalesced.len) {
+        const remaining = coalesced.len - coalesced_cursor;
+        const chunk_len = 1 + smith.index(remaining);
+        try coalesced_reassembler.append(coalesced[coalesced_cursor..][0..chunk_len]);
+        coalesced_cursor += chunk_len;
+    }
+    for ([_][]const u8{ encoded, second_encoded }) |frame| {
+        const message = (try coalesced_reassembler.peek()).?;
+        try testing.expectEqualSlices(u8, frame, message.raw);
+        try coalesced_reassembler.discard(message.raw.len);
+    }
+    try testing.expectEqual(@as(usize, 0), coalesced_reassembler.len);
+
+    var raw_reassembler = Reassembler(64){};
+    const raw_before_len = raw_reassembler.len;
+    const append_result = raw_reassembler.append(raw);
+    if (append_result) |_| {
+        try testing.expectEqual(raw.len, raw_reassembler.len);
+        const peek_result = raw_reassembler.peek();
+        if (peek_result) |maybe_message| {
+            if (maybe_message) |message| {
+                try testing.expect(message.raw.len <= raw_reassembler.len);
+                try testing.expectEqualSlices(u8, raw_reassembler.data[0..message.raw.len], message.raw);
+                const bad_discard = raw_reassembler.len + 1 + smith.index(8);
+                const before_bad_discard = raw_reassembler.len;
+                try testing.expectError(error.MalformedHandshake, raw_reassembler.discard(bad_discard));
+                try testing.expectEqual(before_bad_discard, raw_reassembler.len);
+                try raw_reassembler.discard(message.raw.len);
+                try testing.expectEqual(raw.len - message.raw.len, raw_reassembler.len);
+            }
+        } else |err| switch (err) {
+            error.MalformedHandshake, error.MessageTooLarge, error.HandshakeBufferOverflow, error.DuplicateExtension, error.TooManyExtensions, error.IncompleteHandshake => {},
+        }
+    } else |err| switch (err) {
+        error.HandshakeBufferOverflow => try testing.expectEqual(raw_before_len, raw_reassembler.len),
+        error.MalformedHandshake, error.MessageTooLarge, error.DuplicateExtension, error.TooManyExtensions, error.IncompleteHandshake => {},
+    }
+}

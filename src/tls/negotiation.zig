@@ -739,3 +739,177 @@ test "malformed required extensions fail deterministically" {
 
     try testing.expectError(error.MalformedHandshake, parseClientHello(w.written()));
 }
+
+test "fuzz: TLS protocol: ClientHello parse and policy negotiation stays within configured registry" {
+    try testing.fuzz({}, fuzzClientHelloAndPolicyNegotiation, .{ .corpus = &.{
+        "",
+        &[_]u8{ 3, 3 },
+        &[_]u8{ 3, 3 } ++ ([_]u8{0} ** 32) ++ [_]u8{ 0, 0, 2, 0x13, 0x01, 1, 0, 0, 0 },
+        &([_]u8{0xff} ** 128),
+    } });
+}
+
+fn fuzzClientHelloAndPolicyNegotiation(_: void, smith: *testing.Smith) !void {
+    var raw_body: [384]u8 = undefined;
+    const raw_len = smith.index(raw_body.len + 1);
+    smith.bytes(raw_body[0..raw_len]);
+    if (parseClientHelloObserved(raw_body[0..raw_len], null)) |parsed| {
+        try assertNegotiationOutcomes(policy_mod.Policy.recordDefault(), &parsed);
+        try assertNegotiationOutcomes(policy_mod.Policy.quicDefault(), &parsed);
+    } else |err| switch (err) {
+        error.MalformedHandshake,
+        error.MalformedExtension,
+        error.MissingSupportedVersions,
+        error.MissingExtension,
+        error.IllegalParameter,
+        error.UnsupportedProtocolVersion,
+        error.MissingCipherSuites,
+        error.NoMutualCipherSuite,
+        error.NoMutualNamedGroup,
+        error.MissingKeyShare,
+        error.NoMutualSignatureScheme,
+        error.NoMutualAlpn,
+        error.MissingServerName,
+        error.OfferVectorTooLarge,
+        error.DuplicateExtension,
+        error.TooManyExtensions,
+        error.HandshakeBufferOverflow,
+        error.MessageTooLarge,
+        error.IncompleteHandshake,
+        => {},
+    }
+
+    const offers = try generatedOffers(smith);
+    const generated = ParsedClientHello{ .offers = offers, .legacy_session_id = "", .offered_null_compression = true };
+    try assertNegotiationOutcomes(policy_mod.Policy.recordDefault(), &generated);
+    try assertNegotiationOutcomes(policy_mod.Policy.quicDefault(), &generated);
+
+    var require_sni_policy = policy_mod.Policy.recordDefault();
+    require_sni_policy.require_sni = smith.index(2) == 0;
+    try assertNegotiationOutcomes(require_sni_policy, &generated);
+}
+
+fn generatedOffers(smith: *testing.Smith) !ClientHelloOffers {
+    var offers = ClientHelloOffers{};
+    const versions = [_]?algorithms.ProtocolVersion{ .tls13, null };
+    const ciphers = [_]?algorithms.CipherSuite{ .tls_aes_128_gcm_sha256, .tls_aes_256_gcm_sha384, .tls_chacha20_poly1305_sha256, null };
+    const groups = [_]?algorithms.NamedGroup{ .x25519, .secp256r1, .secp384r1, null };
+    const signatures = [_]?algorithms.SignatureScheme{ .ed25519, .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha256, .rsa_pkcs1_sha256, null };
+    const alpns = [_]algorithms.ProtocolName{ algorithms.alpn.h2, algorithms.alpn.http_1_1, algorithms.alpn.h3, .{ .bytes = "unknown" } };
+
+    for (0..smith.index(12)) |_| {
+        if (versions[smith.index(versions.len)]) |version| try offers.appendVersion(version);
+    }
+    for (0..smith.index(12)) |_| {
+        if (ciphers[smith.index(ciphers.len)]) |cipher| try offers.appendCipherSuite(cipher);
+    }
+    for (0..smith.index(12)) |_| {
+        if (groups[smith.index(groups.len)]) |group| try offers.appendSupportedGroup(group);
+    }
+    for (0..smith.index(12)) |_| {
+        if (signatures[smith.index(signatures.len)]) |scheme| {
+            try offers.appendRawSignatureScheme(@intFromEnum(scheme));
+            try offers.appendSignatureScheme(scheme);
+        } else {
+            try offers.appendRawSignatureScheme(0xeeee);
+        }
+    }
+    for (0..smith.index(8)) |_| try offers.appendAlpn(alpns[smith.index(alpns.len)]);
+
+    offers.key_share_seen = smith.index(2) == 0;
+    const share_seeds = [_][]const u8{ "", "x25519 share", "p256 share", "oversized-but-bounded synthetic key share" };
+    const share_count = smith.index(share_seeds.len + 1);
+    for (0..share_count) |_| {
+        const group = groups[smith.index(groups.len)] orelse .x25519;
+        const seed = share_seeds[smith.index(share_seeds.len)];
+        try offers.appendKeyShare(.{ .group = group, .key_exchange = seed[0..smith.index(seed.len + 1)] });
+    }
+    if (smith.index(2) == 0) offers.server_name = if (smith.index(2) == 0) "example.test" else "";
+    return offers;
+}
+
+fn assertNegotiationOutcomes(policy: policy_mod.Policy, parsed: *const ParsedClientHello) !void {
+    if (negotiateServerHello(policy, &parsed.offers)) |selected| {
+        try testing.expect(policy.containsProtocolVersion(selected.version));
+        try testing.expect(parsed.offers.containsVersion(selected.version));
+        try testing.expect(policy.containsCipherSuite(selected.cipher_suite));
+        try testing.expect(containsEnum(algorithms.CipherSuite, parsed.offers.cipher_suites[0..parsed.offers.cipher_suites_len], selected.cipher_suite));
+        try testing.expect(policy.containsNamedGroup(selected.named_group));
+        try testing.expect(containsEnum(algorithms.NamedGroup, parsed.offers.supported_groups[0..parsed.offers.supported_groups_len], selected.named_group));
+        switch (selected.key_share) {
+            .use => |share| {
+                try testing.expectEqual(selected.named_group, share.group);
+                try testing.expect(parsed.offers.keyShareFor(selected.named_group) != null);
+            },
+            .retry => |group| {
+                try testing.expectEqual(selected.named_group, group);
+                try testing.expect(parsed.offers.key_share_seen);
+                try testing.expect(parsed.offers.keyShareFor(group) == null);
+            },
+        }
+        if (selected.alpn) |alpn| {
+            try testing.expect(policy.containsAlpn(alpn.bytes));
+            try testing.expect(containsAlpn(parsed.offers.alpn_protocols[0..parsed.offers.alpn_protocols_len], alpn));
+        }
+        try validateServerSelection(policy, .{
+            .version = selected.version,
+            .cipher_suite = selected.cipher_suite,
+            .named_group = selected.named_group,
+            .alpn = selected.alpn,
+        });
+    } else |err| switch (err) {
+        error.UnsupportedProtocolVersion,
+        error.MissingServerName,
+        error.NoMutualCipherSuite,
+        error.NoMutualNamedGroup,
+        error.MissingExtension,
+        error.NoMutualAlpn,
+        error.MissingKeyShare,
+        error.NoMutualSignatureScheme,
+        error.MalformedHandshake,
+        error.MalformedExtension,
+        error.MissingSupportedVersions,
+        error.IllegalParameter,
+        error.MissingCipherSuites,
+        error.OfferVectorTooLarge,
+        error.DuplicateExtension,
+        error.TooManyExtensions,
+        error.HandshakeBufferOverflow,
+        error.MessageTooLarge,
+        error.IncompleteHandshake,
+        => {},
+    }
+
+    if (negotiateServer(policy, &parsed.offers)) |selected| {
+        try testing.expect(policy.containsProtocolVersion(selected.version));
+        try testing.expect(policy.containsCipherSuite(selected.cipher_suite));
+        try testing.expect(policy.containsNamedGroup(selected.named_group));
+        try testing.expect(policy.containsSignatureScheme(selected.signature_scheme));
+        try testing.expect(containsEnum(algorithms.SignatureScheme, parsed.offers.signature_schemes[0..parsed.offers.signature_schemes_len], selected.signature_scheme));
+        try testing.expect(policy.containsAlpn(selected.alpn.bytes));
+        try testing.expect(containsAlpn(parsed.offers.alpn_protocols[0..parsed.offers.alpn_protocols_len], selected.alpn));
+        try testing.expectEqualSlices(u8, parsed.offers.keyShareFor(selected.named_group).?, selected.key_share);
+        try testing.expectEqual(parsed.offers.server_name, selected.server_name);
+    } else |err| switch (err) {
+        error.UnsupportedProtocolVersion,
+        error.MissingServerName,
+        error.NoMutualCipherSuite,
+        error.NoMutualNamedGroup,
+        error.MissingExtension,
+        error.NoMutualAlpn,
+        error.MissingKeyShare,
+        error.NoMutualSignatureScheme,
+        error.MalformedHandshake,
+        error.MalformedExtension,
+        error.MissingSupportedVersions,
+        error.IllegalParameter,
+        error.MissingCipherSuites,
+        error.OfferVectorTooLarge,
+        error.DuplicateExtension,
+        error.TooManyExtensions,
+        error.HandshakeBufferOverflow,
+        error.MessageTooLarge,
+        error.IncompleteHandshake,
+        => {},
+    }
+}
