@@ -28,13 +28,22 @@ All notable user-facing changes to Tardigrade are documented here.
   `src/tls/record_codec.zig` following the `docs/CRYPTO_FUZZ_CONTRACT.md`
   contract: `codec fragmentation, coalescing, and sink saturation preserve
   exact consumption` drives fuzzer-generated valid record streams through
-  `Parser.feedOne` against a single-record-capacity sink, asserting exact
-  per-record byte consumption, correct saturation/`drainReady`/`finish`
+  `Parser.feedOne` using fuzzer-chosen offered fragment sizes (so partial
+  headers/bodies stay buffered across call boundaries), covers the
+  legal/illegal initial-ClientHello `0x0301` compatibility window as part of
+  the generated case, drives record-size boundaries up to the exact
+  plaintext/ciphertext maxima plus a declared maximum-plus-one, and asserts
+  exact per-record byte consumption, correct saturation/`drainReady`/`finish`
   backpressure semantics, and that arbitrary malformed bytes never panic;
   `inner plaintext framing, padding, and bounds remain transactional` fuzzes
   `encodeInnerPlaintext`/`decodeInnerPlaintext` round trips and raw-byte
-  decoding against an independent oracle, asserting transactional output on
-  every rejected encode. Also converts record-length-only arithmetic
+  decoding against independent oracles over content/padding/output-capacity
+  boundary matrices, asserting the exact expected typed error (computed
+  before each call) and transactional output on every rejection. Also adds
+  named deterministic companions pinning every `encodeInnerPlaintext`
+  rejection stage and every `feedOne` header/payload split point, for the
+  arms a seed-corpus replay cannot reliably reach. Also converts
+  record-length-only arithmetic
   reachable from fuzzer-chosen scalar lengths (`record_codec.Parser`'s
   pending-bytes-needed helpers, `record_epoch_bridge.zig`'s handshake
   chunk/record-length helpers, `encrypted_stream.zig`'s

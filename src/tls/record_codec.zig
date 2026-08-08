@@ -1115,6 +1115,64 @@ test "inner plaintext encodes content type followed by zero padding" {
     try testing.expectEqual(@as(usize, 3), decoded.padding_len);
 }
 
+// Pins each of `encodeInnerPlaintext`'s four typed outcomes at its exact
+// boundary, in the documented rejection order. The fuzz target below asserts
+// the same classification against generated inputs, but its `.corpus` replay
+// (what plain `zig build test`/CI runs) is not guaranteed to reach every arm,
+// so an error-class regression -- e.g. returning `RecordTooLarge` for an
+// ordinary undersized output -- needs deterministic coverage here too. This
+// was verified by mutation: swapping the `out.len < total` error makes this
+// test fail.
+test "encodeInnerPlaintext classifies every rejection stage at its exact boundary" {
+    var out: [max_ciphertext_fragment_len]u8 = undefined;
+    const content = "finished";
+
+    // 1. change_cipher_spec has no legal inner-plaintext encoding, and is
+    // refused before any length is even considered.
+    try testing.expectError(error.InvalidRecordType, encodeInnerPlaintext(.change_cipher_spec, content, 0, &out));
+    try testing.expectError(error.InvalidRecordType, encodeInnerPlaintext(.change_cipher_spec, "", 0, out[0..0]));
+
+    // 2. content longer than the plaintext fragment maximum.
+    const oversized_content = [_]u8{0} ** (max_plaintext_fragment_len + 1);
+    try testing.expectError(error.RecordTooLarge, encodeInnerPlaintext(.handshake, &oversized_content, 0, &out));
+    // Exactly at the maximum, content alone is fine; it is the total that
+    // then exceeds the ciphertext fragment maximum only once padding pushes
+    // it over (checked in stage 3).
+    const max_content = [_]u8{0} ** max_plaintext_fragment_len;
+    const at_max = try encodeInnerPlaintext(.handshake, &max_content, 0, &out);
+    try testing.expectEqual(max_plaintext_fragment_len + 1, at_max.len);
+
+    // 3. total (content || type || padding) across the ciphertext fragment
+    // maximum: exact-minus-one and exact succeed, exact-plus-one does not.
+    const max_total = max_ciphertext_fragment_len;
+    const under = try encodeInnerPlaintext(.handshake, content, max_total - content.len - 2, &out);
+    try testing.expectEqual(max_total - 1, under.len);
+    const exact = try encodeInnerPlaintext(.handshake, content, max_total - content.len - 1, &out);
+    try testing.expectEqual(max_total, exact.len);
+    try testing.expectError(
+        error.RecordTooLarge,
+        encodeInnerPlaintext(.handshake, content, max_total - content.len, &out),
+    );
+    // And a padding length that overflows `usize` arithmetic outright.
+    try testing.expectError(error.RecordTooLarge, encodeInnerPlaintext(.handshake, content, std.math.maxInt(usize), &out));
+
+    // 4. output capacity, at exact-minus-one / exact / exact-plus-one. This
+    // is the arm that must stay `RecordBufferOverflow` and not collapse into
+    // `RecordTooLarge`.
+    const needed = content.len + 1 + 3;
+    try testing.expectError(
+        error.RecordBufferOverflow,
+        encodeInnerPlaintext(.handshake, content, 3, out[0 .. needed - 1]),
+    );
+    const exact_out = try encodeInnerPlaintext(.handshake, content, 3, out[0..needed]);
+    try testing.expectEqual(needed, exact_out.len);
+    const roomy_out = try encodeInnerPlaintext(.handshake, content, 3, out[0 .. needed + 1]);
+    try testing.expectEqual(needed, roomy_out.len);
+    // A zero-capacity destination is still the output-capacity error, not a
+    // size error, even for the smallest possible encoding.
+    try testing.expectError(error.RecordBufferOverflow, encodeInnerPlaintext(.handshake, "", 0, out[0..0]));
+}
+
 test "inner plaintext rejects all-zero, invalid type, and oversized content" {
     try testing.expectError(error.MalformedInnerPlaintext, decodeInnerPlaintext(&.{ 0, 0, 0 }));
     try testing.expectError(error.MalformedInnerPlaintext, decodeInnerPlaintext(&.{ 1, 99, 0 }));
@@ -1177,25 +1235,82 @@ fn withinBounds(outer: []const u8, inner: []const u8) bool {
 
 const fuzz_codec_max_records = 4;
 const fuzz_codec_max_payload = 48;
+/// Bounded so a whole generated ClientHello message
+/// (`handshake_header_len + body`) still fits in one `fuzz_codec_max_payload`
+/// record payload, which is what makes a single-fragment compatibility-window
+/// case representable alongside the multi-fragment ones.
+const fuzz_codec_max_compat_body = fuzz_codec_max_payload - handshake_header_len;
+
+// Every split point of a two-call `feedOne` sequence must preserve exact
+// consumption: splitting after each of the five header bytes, and at
+// representative payload boundaries, leaves the remainder buffered and
+// resumes it on the next call without losing or duplicating a byte. The
+// fuzz target below randomizes this; this pins it deterministically at every
+// header offset, which a coverage-guided run should never have to
+// rediscover.
+test "feedOne preserves exact consumption across every header and payload split point" {
+    var encoded: [header_len + 6]u8 = undefined;
+    const record = try encodePlaintextRecord(.handshake, "abcdef", &encoded);
+
+    for (1..record.len) |split_at| {
+        var parser = Parser.init(.plaintext);
+        var sink = RecordSink(1, 32){};
+
+        const first = try parser.feedOne(record[0..split_at], &sink);
+        // A prefix shorter than the whole record can never emit, and must
+        // absorb every offered byte into the pending buffer.
+        try testing.expect(!first.emitted);
+        try testing.expectEqual(split_at, first.consumed);
+        try testing.expectEqual(@as(usize, 0), sink.len);
+        try testing.expectError(error.TruncatedRecord, parser.finish());
+
+        const second = try parser.feedOne(record[split_at..], &sink);
+        try testing.expect(second.emitted);
+        try testing.expectEqual(record.len - split_at, second.consumed);
+        try testing.expectEqual(@as(usize, 1), sink.len);
+        try testing.expectEqual(ContentType.handshake, sink.items[0].content_type);
+        try testing.expectEqualStrings("abcdef", sink.items[0].payload);
+        try parser.finish();
+    }
+}
 
 test "fuzz: TLS record: codec fragmentation, coalescing, and sink saturation preserve exact consumption" {
     try std.testing.fuzz({}, fuzzCodecFragmentationInput, .{ .corpus = &.{
         "",
         &[_]u8{0},
         &[_]u8{ 0, 0 },
+        &[_]u8{ 1, 1 },
+        &[_]u8{ 0, 1, 0, 1 },
         &[_]u8{ 22, 3, 3, 0, 0 },
         &[_]u8{ 22, 3, 3, 0, 5, 1, 2, 3, 4, 5 },
+        &[_]u8{ 22, 3, 1, 0, 4, 1, 0, 0, 0 },
         &[_]u8{ 21, 3, 3, 0, 2, 1, 0 },
         &[_]u8{ 20, 3, 3, 0, 1, 1 },
         &[_]u8{ 23, 3, 3, 0, 3, 9, 9, 9 },
+        &[_]u8{ 0, 0, 1, 2, 3, 4, 0x40, 0x00 },
+        &[_]u8{ 3, 3, 1, 1, 0x40, 0x01 },
         &([_]u8{0xff} ** 64),
         &([_]u8{0x01} ** 200),
+        &([_]u8{ 0, 2, 4, 8, 16, 32, 64, 128 } ** 8),
     } });
 }
 
 fn fuzzCodecFragmentationInput(_: void, smith: *std.testing.Smith) !void {
     const mode: RecordMode = if (smith.index(2) == 0) .plaintext else .ciphertext;
-    var parser = Parser.init(mode);
+    // The initial-ClientHello `0x0301` compatibility window is part of the
+    // generated case, not a separate deterministic-only scenario: when it is
+    // selected the whole oracle stream below becomes the fragments of one
+    // real ClientHello message (all handshake-content-type, so RFC 8446
+    // SS5.1's no-interleaving rule is respected), with each fragment's
+    // declared legacy version independently chosen from {0x0303, 0x0301}.
+    // Every such fragment is inside the window and therefore legal
+    // regardless of the mix, so the exact-consumption oracle applies
+    // unchanged; the illegal placements are asserted separately below.
+    const allow_compat = mode == .plaintext and smith.index(2) == 0;
+    var parser = if (allow_compat)
+        Parser.initWithVersionPolicy(.plaintext, .allow_initial_client_hello_compat)
+    else
+        Parser.init(mode);
 
     const Expected = struct {
         content_type: ContentType,
@@ -1206,54 +1321,123 @@ fn fuzzCodecFragmentationInput(_: void, smith: *std.testing.Smith) !void {
     var expected: [fuzz_codec_max_records]Expected = undefined;
     var stream_buf: [fuzz_codec_max_records * (header_len + fuzz_codec_max_payload)]u8 = undefined;
     var stream_len: usize = 0;
-    const record_count = 1 + smith.index(fuzz_codec_max_records);
+    var record_count: usize = 0;
 
-    for (0..record_count) |i| {
-        var payload_buf: [fuzz_codec_max_payload]u8 = undefined;
-        const payload_len = smith.index(payload_buf.len + 1);
-        smith.bytes(payload_buf[0..payload_len]);
-        const content_type: ContentType = switch (mode) {
-            .plaintext => switch (smith.index(3)) {
-                0 => .handshake,
-                1 => .alert,
-                else => .change_cipher_spec,
-            },
-            .ciphertext => .application_data,
-        };
-        var record_out: [header_len + fuzz_codec_max_payload]u8 = undefined;
-        const encoded = switch (mode) {
-            .plaintext => try encodePlaintextRecord(content_type, payload_buf[0..payload_len], &record_out),
-            .ciphertext => try encodeCiphertextRecord(payload_buf[0..payload_len], &record_out),
-        };
-        @memcpy(stream_buf[stream_len..][0..encoded.len], encoded);
-        stream_len += encoded.len;
-        expected[i] = .{
-            .content_type = content_type,
-            .legacy_version = legacy_record_version,
-            .payload = payload_buf,
-            .payload_len = payload_len,
-        };
+    if (allow_compat) {
+        // One real `msg_type=1, uint24 length, body` ClientHello, split at
+        // fuzzer-chosen boundaries -- including inside its own 4-byte
+        // handshake header, which is exactly the #408 compatibility-window
+        // fragmentation class.
+        var body: [fuzz_codec_max_compat_body]u8 = undefined;
+        const body_len = smith.index(body.len + 1);
+        smith.bytes(body[0..body_len]);
+        var message_buf: [handshake_header_len + fuzz_codec_max_compat_body]u8 = undefined;
+        const message = clientHelloMessage(body[0..body_len], &message_buf);
+
+        const max_fragments = @min(fuzz_codec_max_records, message.len);
+        record_count = 1 + smith.index(max_fragments);
+        var message_offset: usize = 0;
+        for (0..record_count) |i| {
+            const fragments_left = record_count - i;
+            const take = if (fragments_left == 1)
+                message.len - message_offset
+            else
+                1 + smith.index(message.len - message_offset - (fragments_left - 1));
+            const fragment = message[message_offset..][0..take];
+            message_offset += take;
+
+            var record_out: [header_len + fuzz_codec_max_payload]u8 = undefined;
+            const encoded = try encodePlaintextRecord(.handshake, fragment, &record_out);
+            const record_start = stream_len;
+            @memcpy(stream_buf[record_start..][0..encoded.len], encoded);
+            stream_len += encoded.len;
+
+            // `encodePlaintextRecord` always writes 0x0303; rewrite the
+            // version field in place when this fragment should claim the
+            // compatibility version instead.
+            const use_compat_version = smith.index(2) == 0;
+            if (use_compat_version) {
+                std.mem.writeInt(u16, stream_buf[record_start + 1 ..][0..2], compat_client_hello_version, .big);
+            }
+
+            var payload: [fuzz_codec_max_payload]u8 = undefined;
+            @memcpy(payload[0..take], fragment);
+            expected[i] = .{
+                .content_type = .handshake,
+                .legacy_version = if (use_compat_version) compat_client_hello_version else legacy_record_version,
+                .payload = payload,
+                .payload_len = take,
+            };
+        }
+        try testing.expectEqual(message.len, message_offset);
+    } else {
+        record_count = 1 + smith.index(fuzz_codec_max_records);
+        for (0..record_count) |i| {
+            var payload_buf: [fuzz_codec_max_payload]u8 = undefined;
+            const payload_len = smith.index(payload_buf.len + 1);
+            smith.bytes(payload_buf[0..payload_len]);
+            const content_type: ContentType = switch (mode) {
+                .plaintext => switch (smith.index(3)) {
+                    0 => .handshake,
+                    1 => .alert,
+                    else => .change_cipher_spec,
+                },
+                .ciphertext => .application_data,
+            };
+            var record_out: [header_len + fuzz_codec_max_payload]u8 = undefined;
+            const encoded = switch (mode) {
+                .plaintext => try encodePlaintextRecord(content_type, payload_buf[0..payload_len], &record_out),
+                .ciphertext => try encodeCiphertextRecord(payload_buf[0..payload_len], &record_out),
+            };
+            @memcpy(stream_buf[stream_len..][0..encoded.len], encoded);
+            stream_len += encoded.len;
+            expected[i] = .{
+                .content_type = content_type,
+                .legacy_version = legacy_record_version,
+                .payload = payload_buf,
+                .payload_len = payload_len,
+            };
+        }
     }
 
     // Drive the coalesced oracle stream through `feedOne` with a
-    // single-record-capacity sink, so saturation is normal rather than
-    // exceptional: every source byte must be consumed exactly once, in
-    // order, with no record skipped or duplicated.
+    // single-record-capacity sink, offering a fuzzer-chosen *prefix* of the
+    // remaining bytes on every call. Offering less than a whole record is
+    // the point: a partial header or body then stays buffered across the
+    // invocation boundary and must resume exactly on a later call, which is
+    // the caller-visible fragmentation boundary (not merely `feedOne`'s
+    // internal byte loop). Every source byte must still be consumed exactly
+    // once, in order, with no record skipped or duplicated.
     var sink = RecordSink(1, fuzz_codec_max_payload + header_len){};
     var offset: usize = 0;
     var expected_idx: usize = 0;
+    // Progress bound: each iteration consumes at least one offered byte, so
+    // this can only be reached if the parser stops making progress.
+    var iterations: usize = 0;
+    const max_iterations = stream_len * 2 + 16;
     while (offset < stream_len) {
+        iterations += 1;
+        try testing.expect(iterations <= max_iterations);
         try testing.expectEqual(@as(usize, 0), sink.len);
-        const result = try parser.feedOne(stream_buf[offset..stream_len], &sink);
+
+        const remaining = stream_len - offset;
+        const offered_len = 1 + smith.index(remaining);
+        const result = try parser.feedOne(stream_buf[offset..][0..offered_len], &sink);
         try testing.expect(parser.len <= parser.pending.len);
-        try testing.expect(offset + result.consumed <= stream_len);
-        // The remaining slice is always one-or-more complete, well-formed
-        // records (the oracle stream), so a freshly-emptied sink must
-        // always be able to emit exactly the next one.
-        try testing.expect(result.emitted);
+        try testing.expect(result.consumed <= offered_len);
+        offset += result.consumed;
+
+        if (!result.emitted) {
+            // No record completed within the offered fragment, so the whole
+            // fragment must have been absorbed into the bounded pending
+            // buffer -- nothing dropped, nothing emitted.
+            try testing.expectEqual(@as(usize, 0), sink.len);
+            try testing.expectEqual(offered_len, result.consumed);
+            continue;
+        }
+
         try testing.expect(result.consumed > 0);
         try testing.expectEqual(@as(usize, 1), sink.len);
-
         try testing.expect(expected_idx < record_count);
         const exp = expected[expected_idx];
         try testing.expectEqual(exp.content_type, sink.items[0].content_type);
@@ -1261,13 +1445,12 @@ fn fuzzCodecFragmentationInput(_: void, smith: *std.testing.Smith) !void {
         try testing.expectEqualSlices(u8, exp.payload[0..exp.payload_len], sink.items[0].payload);
         try testing.expect(withinBounds(sink.scratch[0..], sink.items[0].payload));
 
-        offset += result.consumed;
         expected_idx += 1;
 
         // Occasionally simulate a caller that has not drained the sink yet:
-        // the next `feedOne` against the following record must consume
-        // nothing and leave parser and stale-sink state untouched, and a
-        // reset + exact retry must then succeed once.
+        // the next `feedOne` must consume nothing and leave parser and
+        // stale-sink state untouched, and a reset + exact retry must then
+        // succeed once.
         if (smith.index(2) == 0 and offset < stream_len) {
             const parser_len_before = parser.len;
             const stale = try parser.feedOne(stream_buf[offset..stream_len], &sink);
@@ -1280,6 +1463,131 @@ fn fuzzCodecFragmentationInput(_: void, smith: *std.testing.Smith) !void {
     }
     try testing.expectEqual(record_count, expected_idx);
     try parser.finish();
+
+    // The compatibility window closes for good once that initial
+    // ClientHello has been fully consumed: a further `0x0301` record on the
+    // same parser must now be refused.
+    if (allow_compat) {
+        var closed_sink = DefaultSink{};
+        try testing.expectError(
+            error.InvalidRecordVersion,
+            parser.feed(&.{ 22, 3, 1, 0, 1, 1 }, &closed_sink),
+        );
+    }
+
+    // Illegal `0x0301` placements. The exception is scoped to an initial
+    // ClientHello on a plaintext parser, so it must be refused for a
+    // non-ClientHello handshake message, a non-handshake content type, and
+    // every ciphertext-mode record -- each against a fresh parser that has
+    // the compatibility policy enabled, so only the placement differs.
+    {
+        // (a) handshake content type, compat version, but `msg_type != 1`.
+        var msg_type_byte: [1]u8 = undefined;
+        smith.bytes(&msg_type_byte);
+        const non_client_hello_type: u8 = if (msg_type_byte[0] == client_hello_msg_type)
+            client_hello_msg_type + 1
+        else
+            msg_type_byte[0];
+        var other_message: [handshake_header_len + 4]u8 = undefined;
+        other_message[0] = non_client_hello_type;
+        other_message[1] = 0;
+        other_message[2] = 0;
+        other_message[3] = 4;
+        smith.bytes(other_message[handshake_header_len..]);
+        var other_record: [header_len + handshake_header_len + 4]u8 = undefined;
+        const other_encoded = try encodePlaintextRecord(.handshake, &other_message, &other_record);
+        std.mem.writeInt(u16, other_record[1..3], compat_client_hello_version, .big);
+
+        var other_parser = Parser.initWithVersionPolicy(.plaintext, .allow_initial_client_hello_compat);
+        var other_sink = DefaultSink{};
+        try testing.expectError(
+            error.InvalidRecordVersion,
+            other_parser.feed(other_encoded, &other_sink),
+        );
+
+        // (b) compat version on a non-handshake content type.
+        const non_handshake: u8 = if (smith.index(2) == 0)
+            @intFromEnum(ContentType.alert)
+        else
+            @intFromEnum(ContentType.change_cipher_spec);
+        var non_handshake_parser = Parser.initWithVersionPolicy(.plaintext, .allow_initial_client_hello_compat);
+        var non_handshake_sink = DefaultSink{};
+        try testing.expectError(
+            error.InvalidRecordVersion,
+            non_handshake_parser.feed(&.{ non_handshake, 3, 1, 0, 1, 1 }, &non_handshake_sink),
+        );
+
+        // (c) compat version has no meaning post-encryption: a
+        // ciphertext-mode parser must refuse it even with the policy set.
+        var cipher_parser = Parser.initWithVersionPolicy(.ciphertext, .allow_initial_client_hello_compat);
+        var cipher_sink = DefaultSink{};
+        try testing.expectError(
+            error.InvalidRecordVersion,
+            cipher_parser.feed(&.{ 23, 3, 1, 0, 0 }, &cipher_sink),
+        );
+    }
+
+    // Record-size boundaries, as a bounded single-record subcase rather
+    // than by making every generated record maximum-sized: zero, one,
+    // exact-maximum-minus-one, and exact-maximum payloads must all traverse
+    // the valid encode/parse/oracle path, and a header that merely
+    // *declares* maximum-plus-one must be refused with `RecordTooLarge`
+    // without that payload ever having to exist.
+    {
+        const max_len: usize = switch (mode) {
+            .plaintext => max_plaintext_fragment_len,
+            .ciphertext => max_ciphertext_fragment_len,
+        };
+        const payload_len = switch (smith.index(5)) {
+            0 => 0,
+            1 => 1,
+            2 => max_len - 1,
+            3 => max_len,
+            else => smith.index(max_len + 1),
+        };
+
+        // Cheap deterministic fill: a fuzzer-chosen seed byte expanded over
+        // the (possibly 16 KiB) payload, rather than drawing that many
+        // bytes from Smith per case. The bytes are not the property under
+        // test here -- the length boundary is.
+        var seed: [1]u8 = undefined;
+        smith.bytes(&seed);
+        var payload_buf: [max_ciphertext_fragment_len]u8 = undefined;
+        for (payload_buf[0..payload_len], 0..) |*byte, i| {
+            byte.* = seed[0] ^ @as(u8, @truncate(i));
+        }
+
+        var record_buf: [max_ciphertext_record_len]u8 = undefined;
+        const boundary_content_type: ContentType = if (mode == .plaintext) .handshake else .application_data;
+        const encoded = switch (mode) {
+            .plaintext => try encodePlaintextRecord(.handshake, payload_buf[0..payload_len], &record_buf),
+            .ciphertext => try encodeCiphertextRecord(payload_buf[0..payload_len], &record_buf),
+        };
+        try testing.expectEqual(header_len + payload_len, encoded.len);
+
+        var boundary_parser = Parser.init(mode);
+        var boundary_sink = RecordSink(1, max_ciphertext_fragment_len){};
+        const boundary_result = try boundary_parser.feedOne(encoded, &boundary_sink);
+        try testing.expect(boundary_result.emitted);
+        try testing.expectEqual(encoded.len, boundary_result.consumed);
+        try testing.expectEqual(@as(usize, 1), boundary_sink.len);
+        try testing.expectEqual(boundary_content_type, boundary_sink.items[0].content_type);
+        try testing.expectEqualSlices(u8, payload_buf[0..payload_len], boundary_sink.items[0].payload);
+        try boundary_parser.finish();
+
+        // Declared maximum-plus-one: only the 2-byte length field changes,
+        // and `max_len + 1` still fits in a `u16` for both modes, so this
+        // needs no oversized allocation at all.
+        var oversized_header: [header_len]u8 = undefined;
+        @memcpy(&oversized_header, encoded[0..header_len]);
+        std.mem.writeInt(u16, oversized_header[3..5], @intCast(max_len + 1), .big);
+        var oversized_parser = Parser.init(mode);
+        var oversized_sink = RecordSink(1, 16){};
+        try testing.expectError(
+            error.RecordTooLarge,
+            oversized_parser.feed(&oversized_header, &oversized_sink),
+        );
+    }
 
     // `drainReady` publishes an already-complete buffered record without
     // accepting new input, and a record that overflows the sink at push
@@ -1337,16 +1645,27 @@ const fuzz_inner_plaintext_max_out = max_ciphertext_fragment_len + 16;
 const fuzz_inner_plaintext_max_padding = 512;
 
 test "fuzz: TLS record: inner plaintext framing, padding, and bounds remain transactional" {
-    try std.testing.fuzz({}, fuzzInnerPlaintextInput, .{ .corpus = &.{
-        "",
-        &[_]u8{0},
-        &[_]u8{ 0, 0, 0 },
-        &[_]u8{ 1, 99, 0 },
-        &[_]u8{ 20, 0 },
-        &[_]u8{ 'f', 'i', 'n', 22, 0, 0, 0 },
-        &([_]u8{0} ** 64 ++ [_]u8{23}),
-        &([_]u8{0xff} ** 128),
-    } });
+    try std.testing.fuzz({}, fuzzInnerPlaintextInput, .{
+        .corpus = &.{
+            "",
+            &[_]u8{0},
+            &[_]u8{ 0, 0, 0 },
+            &[_]u8{ 1, 99, 0 },
+            &[_]u8{ 20, 0 },
+            &[_]u8{ 'f', 'i', 'n', 22, 0, 0, 0 },
+            // Length/capacity-matrix selectors: small leading indices steer the
+            // content/padding/output-capacity switches toward their boundary
+            // arms (0, 1, exact-max-minus-one, exact-max, exact-max-plus-one).
+            &[_]u8{ 0, 0, 0, 0, 0, 0 },
+            &[_]u8{ 1, 1, 1, 1, 1, 1 },
+            &[_]u8{ 2, 3, 4, 5, 0, 1 },
+            &[_]u8{ 3, 4, 5, 2, 1, 0 },
+            &[_]u8{ 4, 5, 3, 0, 2, 1 },
+            &[_]u8{ 5, 2, 0, 1, 3, 4 },
+            &([_]u8{0} ** 64 ++ [_]u8{23}),
+            &([_]u8{0xff} ** 128),
+        },
+    });
 }
 
 /// Independent re-derivation of `decodeInnerPlaintext`'s documented
@@ -1375,49 +1694,162 @@ fn expectedInnerPlaintext(bytes: []const u8) InnerPlaintextOracle {
     return .malformed;
 }
 
+/// The expected outcome of one `encodeInnerPlaintext` call, computed from the
+/// generated inputs *before* the call so the fuzz target asserts an exact
+/// typed error rather than accepting any rejection. Mirrors the documented
+/// rejection order in `encodeInnerPlaintext`: illegal content type, then
+/// oversized content, then overflow/oversized total, then output capacity.
+const InnerPlaintextEncodeOracle = union(enum) {
+    invalid_type,
+    too_large,
+    output_overflow,
+    ok: usize,
+};
+
+fn expectedInnerPlaintextEncode(
+    content_type: ContentType,
+    content_len: usize,
+    padding_len: usize,
+    out_cap: usize,
+) InnerPlaintextEncodeOracle {
+    if (content_type == .change_cipher_spec) return .invalid_type;
+    if (content_len > max_plaintext_fragment_len) return .too_large;
+    const with_type = std.math.add(usize, content_len, 1) catch return .too_large;
+    const total = std.math.add(usize, with_type, padding_len) catch return .too_large;
+    if (total > max_ciphertext_fragment_len) return .too_large;
+    if (out_cap < total) return .output_overflow;
+    return .{ .ok = total };
+}
+
 fn fuzzInnerPlaintextInput(_: void, smith: *std.testing.Smith) !void {
-    // 1. Valid content/type/padding/output-capacity generation, driving
-    // encode -> decode round trips and transactional-output verification on
-    // every rejected encode.
+    // 1. Content type/content/padding/output-capacity generation, driving
+    // encode -> decode round trips, an exact expected-error classification
+    // on every rejection, and transactional-output verification.
     const valid_types = [_]ContentType{ .alert, .handshake, .application_data };
-    const content_type = valid_types[smith.index(valid_types.len)];
-
-    var content_buf: [fuzz_inner_plaintext_max_content]u8 = undefined;
-    const content_len = smith.index(content_buf.len + 1);
-    smith.bytes(content_buf[0..content_len]);
-
-    // Occasionally drive a synthetic near-`usize`-max padding length: the
-    // #493 "overflow-adjacent synthetic limits" requirement, which cannot
-    // be represented by an actual padding allocation.
-    const padding_len: usize = if (smith.index(4) == 0)
-        std.math.maxInt(usize)
+    // `change_cipher_spec` has no legal `TLSInnerPlaintext` encoding and must
+    // always be refused with `InvalidRecordType`, so generate it sometimes
+    // rather than only ever generating encodable types.
+    const content_type: ContentType = if (smith.index(8) == 0)
+        .change_cipher_spec
     else
-        smith.index(fuzz_inner_plaintext_max_padding + 1);
+        valid_types[smith.index(valid_types.len)];
 
-    var out_buf: [fuzz_inner_plaintext_max_out]u8 = undefined;
-    const out_cap = smith.index(out_buf.len + 1);
-    const out = out_buf[0..out_cap];
-    @memset(out, 0xa5);
-    var before_buf: [fuzz_inner_plaintext_max_out]u8 = undefined;
-    @memcpy(before_buf[0..out_cap], out);
-
-    encode_check: {
-        const encoded = encodeInnerPlaintext(content_type, content_buf[0..content_len], padding_len, out) catch {
-            // Every rejected encode (`RecordTooLarge`/`RecordBufferOverflow`/
-            // `InvalidRecordType`) must leave the destination untouched.
-            try testing.expectEqualSlices(u8, before_buf[0..out_cap], out);
-            break :encode_check;
-        };
-        const decoded = try decodeInnerPlaintext(encoded);
-        try testing.expectEqual(content_type, decoded.content_type);
-        try testing.expectEqualSlices(u8, content_buf[0..content_len], decoded.content);
-        try testing.expectEqual(padding_len, decoded.padding_len);
-        try testing.expect(withinBounds(encoded, decoded.content));
+    // Content length matrix around the plaintext-fragment maximum, so the
+    // `content.len > max_plaintext_fragment_len` rejection stage is a
+    // property rather than a deterministic-only test. Large contents are
+    // filled from a cheap seeded pattern instead of drawing 16 KiB from
+    // Smith per case -- the length boundary is what is under test here, not
+    // the byte values.
+    var content_buf: [max_plaintext_fragment_len + 1]u8 = undefined;
+    const content_len = switch (smith.index(7)) {
+        0 => 0,
+        1 => 1,
+        2 => max_plaintext_fragment_len - 1,
+        3 => max_plaintext_fragment_len,
+        4 => max_plaintext_fragment_len + 1,
+        else => smith.index(fuzz_inner_plaintext_max_content + 1),
+    };
+    var content_seed: [1]u8 = undefined;
+    smith.bytes(&content_seed);
+    for (content_buf[0..content_len], 0..) |*byte, i| {
+        byte.* = content_seed[0] ^ @as(u8, @truncate(i));
     }
 
-    // 2. Raw-bytes decode fuzzing against the independent oracle above.
+    // Padding matrix around the *total* inner-plaintext maximum
+    // (`content || type || padding`). Padding carries the bulk of a
+    // maximum-sized total because it is a scalar the encoder zero-fills, so
+    // exact-max and max-plus-one totals need no oversized content buffer.
+    // The `maxInt(usize)` case is the #493 overflow-adjacent synthetic
+    // limit, which no real padding allocation could represent.
+    const padding_headroom = max_ciphertext_fragment_len - @min(content_len, max_ciphertext_fragment_len);
+    const padding_len: usize = switch (smith.index(8)) {
+        0 => std.math.maxInt(usize),
+        1 => 0,
+        2 => 1,
+        // Exact-maximum total, one under, and one over, when the chosen
+        // content length leaves room to express them.
+        3 => if (padding_headroom >= 2) padding_headroom - 2 else 0,
+        4 => if (padding_headroom >= 1) padding_headroom - 1 else 0,
+        5 => padding_headroom,
+        else => smith.index(fuzz_inner_plaintext_max_padding + 1),
+    };
+
+    // Output-capacity matrix around the exact required total, so the
+    // `RecordBufferOverflow` boundary is exercised at exact-minus-one,
+    // exact, and exact-plus-one rather than only at random capacities.
+    var out_buf: [fuzz_inner_plaintext_max_out]u8 = undefined;
+    const required_total: ?usize = switch (expectedInnerPlaintextEncode(content_type, content_len, padding_len, out_buf.len)) {
+        .ok => |total| total,
+        else => null,
+    };
+    const out_cap = switch (smith.index(6)) {
+        0 => if (required_total) |total| @min(total, out_buf.len) else smith.index(out_buf.len + 1),
+        1 => if (required_total) |total| (if (total == 0) 0 else @min(total - 1, out_buf.len)) else smith.index(out_buf.len + 1),
+        2 => if (required_total) |total| @min(total + 1, out_buf.len) else smith.index(out_buf.len + 1),
+        else => smith.index(out_buf.len + 1),
+    };
+    const out = out_buf[0..out_cap];
+    const sentinel: u8 = 0xa5;
+    @memset(out, sentinel);
+
+    switch (expectedInnerPlaintextEncode(content_type, content_len, padding_len, out_cap)) {
+        .invalid_type => {
+            try testing.expectError(
+                error.InvalidRecordType,
+                encodeInnerPlaintext(content_type, content_buf[0..content_len], padding_len, out),
+            );
+            try testing.expect(std.mem.allEqual(u8, out, sentinel));
+        },
+        .too_large => {
+            try testing.expectError(
+                error.RecordTooLarge,
+                encodeInnerPlaintext(content_type, content_buf[0..content_len], padding_len, out),
+            );
+            try testing.expect(std.mem.allEqual(u8, out, sentinel));
+        },
+        .output_overflow => {
+            try testing.expectError(
+                error.RecordBufferOverflow,
+                encodeInnerPlaintext(content_type, content_buf[0..content_len], padding_len, out),
+            );
+            try testing.expect(std.mem.allEqual(u8, out, sentinel));
+        },
+        .ok => |total| {
+            const encoded = try encodeInnerPlaintext(content_type, content_buf[0..content_len], padding_len, out);
+            try testing.expectEqual(total, encoded.len);
+            try testing.expect(withinBounds(out, encoded));
+            const decoded = try decodeInnerPlaintext(encoded);
+            try testing.expectEqual(content_type, decoded.content_type);
+            try testing.expectEqualSlices(u8, content_buf[0..content_len], decoded.content);
+            try testing.expectEqual(padding_len, decoded.padding_len);
+            try testing.expect(withinBounds(encoded, decoded.content));
+            // Bytes past the encoded region must still be untouched.
+            try testing.expect(std.mem.allEqual(u8, out[total..], sentinel));
+        },
+    }
+
+    // 2. Raw-bytes decode fuzzing against the independent oracle above,
+    // with a length matrix that reaches the exact ciphertext-fragment
+    // maximum and one past it (the `RecordTooLarge` decode stage).
     var raw_buf: [fuzz_inner_plaintext_max_out]u8 = undefined;
-    const raw_len = smith.slice(&raw_buf);
+    const raw_len = switch (smith.index(8)) {
+        0 => 0,
+        1 => 1,
+        2 => max_ciphertext_fragment_len - 1,
+        3 => max_ciphertext_fragment_len,
+        4 => max_ciphertext_fragment_len + 1,
+        else => smith.index(fuzz_inner_plaintext_max_content + 1),
+    };
+    // Seeded pattern for the bulk, with the trailing window Smith-filled:
+    // the last nonzero byte is what decides the decoded type/padding split,
+    // so that is the region worth fuzzer control.
+    var raw_seed: [1]u8 = undefined;
+    smith.bytes(&raw_seed);
+    for (raw_buf[0..raw_len], 0..) |*byte, i| {
+        byte.* = raw_seed[0] ^ @as(u8, @truncate(i));
+    }
+    const tail_len = @min(raw_len, 8);
+    smith.bytes(raw_buf[raw_len - tail_len ..][0..tail_len]);
     const raw = raw_buf[0..raw_len];
 
     const oracle = expectedInnerPlaintext(raw);

@@ -532,23 +532,70 @@ three PRs to keep agent context and review scope manageable, per the
 issue's implementation-plan comment:
 
 - **#493-A** (this slice) — build wiring (`test-tls-record-fuzz`,
-  `-Dtls-record-test-filter`) and the two `record_codec.zig` targets:
+  `-Dtls-record-test-filter`) and the two `record_codec.zig` targets.
+
   `codec fragmentation, coalescing, and sink saturation preserve exact
-  consumption` drives a bounded oracle stream of generated valid records
-  through `Parser.feedOne` against a single-record-capacity `RecordSink`,
-  asserting exact per-record consumption, that an undrained/saturated sink
-  yields `consumed == 0` with parser and stale-sink state untouched, that
+  consumption` generates a bounded oracle stream of valid records and drives
+  it through `Parser.feedOne` against a single-record-capacity `RecordSink`,
+  offering a **fuzzer-chosen prefix** of the remaining bytes on each call so
+  a partial header or body stays buffered across the invocation boundary and
+  must resume exactly on a later call (caller-visible fragmentation, not just
+  `feedOne`'s internal byte loop); `emitted == false` is a normal outcome and
+  must absorb the whole offered fragment. The parser's version policy is part
+  of the generated case: when the initial-ClientHello compatibility window is
+  selected, the stream becomes the fragments of one real `clientHelloMessage`
+  (all handshake-content-type, so RFC 8446 SS5.1's no-interleaving rule
+  holds) with each fragment's declared legacy version independently drawn
+  from `{0x0303, 0x0301}` — every such fragment is inside the window and so
+  must be accepted regardless of the mix, after which a further `0x0301`
+  record on the same parser must be refused. The illegal placements are
+  asserted against fresh compat-policy parsers: a non-ClientHello
+  `msg_type`, a non-handshake content type, and ciphertext mode must each
+  yield `InvalidRecordVersion`. A bounded single-record subcase drives the
+  record-size boundaries (`0`, `1`, exact-maximum-minus-one, exact maximum,
+  for both the plaintext and ciphertext limits) through the valid
+  encode/parse/oracle path, and a header that merely *declares*
+  maximum-plus-one is refused with `RecordTooLarge` without that payload ever
+  existing. The target also asserts an undrained/saturated sink yields
+  `consumed == 0` with parser and stale-sink state untouched, that
   `drainReady` publishes an already-buffered complete record without new
-  input, that `finish()` only accepts a fully-drained parser, and that
-  arbitrary bytes into a fresh parser never panic or exceed the fixed
-  pending-buffer bound; `inner plaintext framing, padding, and bounds
-  remain transactional` drives `encodeInnerPlaintext`/`decodeInnerPlaintext`
-  round trips plus an independent last-nonzero-byte oracle for raw-byte
-  decoding, asserting transactional output on every rejected encode and
-  borrowed-slice containment on every accepted decode. Both targets also
-  exercise a synthetic near-`usize`-max length at least once per case (an
-  overflow-adjacent case an actual allocation could never represent) against
-  the checked scalar arithmetic helpers below.
+  input, that `finish()` only accepts a fully-drained parser, a per-case
+  iteration bound (no spin on repeated non-progress), and that arbitrary
+  bytes into a fresh parser never panic or exceed the fixed pending-buffer
+  bound.
+
+  `inner plaintext framing, padding, and bounds remain transactional`
+  classifies the expected outcome of every `encodeInnerPlaintext` call
+  **before** making it (`expectedInnerPlaintextEncode`, mirroring the
+  documented rejection order: illegal content type, oversized content,
+  overflow/oversized total, output capacity) and asserts that exact typed
+  error rather than accepting any rejection, with the destination sentinel
+  re-verified after each one. Content length, padding length, and output
+  capacity each come from a boundary matrix — content around
+  `max_plaintext_fragment_len`, total around `max_ciphertext_fragment_len`
+  (padding carries the bulk, so exact-max and max-plus-one totals need no
+  oversized content buffer), and capacity at exact-minus-one/exact/
+  exact-plus-one — and `change_cipher_spec` is generated periodically and
+  must always be `InvalidRecordType`. Raw-byte decoding is checked against an
+  independent last-nonzero-byte oracle over a length matrix that reaches the
+  exact ciphertext-fragment maximum and one past it, asserting borrowed-slice
+  containment on every accepted decode. Both targets also drive a synthetic
+  near-`usize`-max length (an overflow-adjacent case no real allocation could
+  represent) against the checked scalar arithmetic helpers below.
+
+  Because the deterministic `.corpus` replay that plain `zig build test`/CI
+  runs is not guaranteed to reach every arm of these classifications, the
+  error-class and split-point properties additionally have named
+  deterministic tests next to them —
+  `encodeInnerPlaintext classifies every rejection stage at its exact
+  boundary` and `feedOne preserves exact consumption across every header and
+  payload split point`. The former was validated by mutation: swapping
+  `encodeInnerPlaintext`'s `out.len < total` error to `RecordTooLarge` makes
+  it fail under plain `zig build test-tls`, whereas the corpus replay alone
+  did not catch that regression (a coverage-guided run found it in ~15
+  runs). Treat that as the standard for future #493 slices: a property worth
+  fuzzing that CI's seed replay cannot reliably reach also needs a named
+  deterministic case.
 - Per the issue's "harden synthetic length arithmetic" requirement, this
   slice also converts the record-length-only calculations reachable from
   fuzzer-chosen scalar lengths to checked arithmetic returning a typed
@@ -588,5 +635,9 @@ legal initial-ClientHello `0x0301`, explicit epoch discard, sequence
 exhaustion, key cleanup, independent record-protection vectors) are treated
 as regression seeds/properties here, not reimplemented — the extensive
 pre-existing deterministic `record_codec.zig` test suite already pins most
-of them by name, and the #493-A property targets extend that coverage with
-randomization rather than duplicating it.
+of them by name, and the #493-A property targets promote the ones in scope
+for this slice (exact parser consumption under fragmentation, sink retry
+behavior, and the legal/illegal initial-ClientHello `0x0301` window) into
+generated properties rather than leaving them as fixed examples. The epoch
+discard, sequence exhaustion, and key cleanup classes are still
+deterministic-only and become fuzz properties in #493-B.
