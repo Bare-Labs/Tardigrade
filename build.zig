@@ -68,6 +68,14 @@ pub fn build(b: *std.Build) void {
         "Filter tests run by the test-tls-record-fuzz step (default: \"fuzz: TLS record:\", i.e. only #493 record/protection/epoch/encrypted-stream fuzz targets)",
     ) orelse "fuzz: TLS record:";
     const tls_record_test_filters: []const []const u8 = &.{tls_record_test_filter};
+    // PKI parser/validator fuzz targets (#492, epic #324-K): DER decoding,
+    // PEM/chain loading, the X.509 semantic model, and path building and
+    // RFC 5280 validation. Same shape as the TLS steps above: the targets
+    // live next to the code in `pki_mod`, which `test-pki`/`test` already
+    // runs unfiltered, so this step exists to give them one stable,
+    // individually filterable name for long coverage-guided runs.
+    const pki_test_filter = b.option([]const u8, "pki-test-filter", "Filter tests run by the test-pki-fuzz step (default: \"fuzz: PKI:\", i.e. only #492 DER/PEM/X.509/path-validation fuzz targets)") orelse "fuzz: PKI:";
+    const pki_test_filters: []const []const u8 = &.{pki_test_filter};
     const tls_profile = b.option(
         TlsProfile,
         "tls-profile",
@@ -837,6 +845,15 @@ pub fn build(b: *std.Build) void {
     const pki_step = b.step("test-pki", "Run pure-Zig PKI DER unit tests");
     pki_step.dependOn(&run_pki_tests.step);
     test_step.dependOn(&run_pki_tests.step);
+
+    // DER/PEM/X.509/path-validation fuzz targets (#492, epic #324-K). The
+    // targets are inline `test "fuzz: PKI: ..."` blocks inside `pki_mod`, so
+    // their deterministic seed-corpus replay is already part of `test-pki`
+    // and `test`; this step only scopes them for `--fuzz=<N>` runs.
+    const pki_fuzz_tests = b.addTest(.{ .root_module = pki_mod, .filters = pki_test_filters });
+    const run_pki_fuzz_tests = b.addRunArtifact(pki_fuzz_tests);
+    const pki_fuzz_step = b.step("test-pki-fuzz", "Run PKI DER/PEM/X.509/path-validation fuzz targets (#492)");
+    pki_fuzz_step.dependOn(&run_pki_fuzz_tests.step);
 
     // Optional out-of-process OpenSSL differential checks for the fixed Name
     // Constraints and certificate-policy matrices. This is not part of the

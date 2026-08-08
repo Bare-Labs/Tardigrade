@@ -436,7 +436,7 @@ const reduced_corpus_seeds = blk: {
     break :blk seeds;
 };
 
-test "fuzz: DER parser never panics or leaks on arbitrary input" {
+test "fuzz: PKI: DER parser never panics or leaks on arbitrary input" {
     try testing.fuzz({}, fuzzDerParse, .{ .corpus = &([_][]const u8{
         "",
         "\x30\x00",
@@ -455,6 +455,408 @@ fn fuzzDerParse(_: void, smith: *testing.Smith) !void {
     var buf: [8192]u8 = undefined;
     const len = smith.slice(&buf);
     der.fuzzParseInput(buf[0..len]);
+}
+
+// --- #492 mutation-driven parser/state safety targets -----------------------
+//
+// These complement the `fuzzParseInput` smoke target above (and #348's
+// semantic differential corpus, which stays the owner of "does this decision
+// match OpenSSL"): they assert the structural contract `der.zig` documents —
+// borrowed views never escape the caller's buffer, the cursor only advances
+// inside its region, exact consumption is enforced, and every configured
+// bound actually stops work at the byte it claims to.
+
+/// Every `Element` view is a borrow from the caller's buffer, never a copy
+/// and never a pointer into recycled parser state.
+fn expectContained(input: []const u8, view: []const u8) !void {
+    const input_start = @intFromPtr(input.ptr);
+    const view_start = @intFromPtr(view.ptr);
+    try testing.expect(view_start >= input_start);
+    try testing.expect(view_start - input_start + view.len <= input.len);
+}
+
+/// Recursive descent bounded by `limits.max_depth`, which the reader itself
+/// enforces, so this cannot recurse deeper than the configured depth.
+fn walkElements(reader: *der.Reader, input: []const u8) !void {
+    while (reader.remaining() > 0) {
+        const before = reader.currentOffset();
+        const elem = reader.readElement() catch {
+            // Even a failed parse must leave the cursor inside its region.
+            try testing.expect(reader.currentOffset() >= before);
+            try testing.expect(reader.currentOffset() <= reader.end);
+            return;
+        };
+        const after = reader.currentOffset();
+        try testing.expect(after > before);
+        try testing.expect(after <= reader.end);
+        try expectContained(input, elem.encoded);
+        try expectContained(input, elem.content);
+        // The header is at least a tag byte and a length byte, the content
+        // ends exactly where the cursor now is, and `content_offset` is an
+        // absolute index into the root input.
+        try testing.expect(elem.encoded.len >= elem.content.len + 2);
+        try testing.expectEqual(after, elem.content_offset + elem.content.len);
+        try testing.expectEqual(input.ptr + elem.content_offset, elem.content.ptr);
+        try testing.expectEqual(input.ptr + before, elem.encoded.ptr);
+
+        if (elem.tag.constructed) {
+            var child = reader.childReader(elem.content_offset, elem.content.len) catch continue;
+            try testing.expect(child.start >= reader.start);
+            try testing.expect(child.end <= reader.end);
+            try walkElements(&child, input);
+        }
+    }
+}
+
+/// Typed decoders reached directly, so their views get the same containment
+/// treatment as `readElement`'s.
+fn walkTyped(input: []const u8, limits: der.Limits, smith: *testing.Smith) !void {
+    var reader = der.Reader.init(input, limits);
+    var steps: usize = 0;
+    while (reader.remaining() > 0 and steps < 64) : (steps += 1) {
+        const before = reader.currentOffset();
+        switch (smith.index(13)) {
+            0 => {
+                const view = reader.readInteger() catch break;
+                try expectContained(input, view.content);
+                try testing.expect(view.content.len <= limits.max_integer_bytes);
+            },
+            1 => _ = reader.readBoolean() catch break,
+            2 => _ = reader.readNull() catch break,
+            3 => try expectContained(input, reader.readOctetString() catch break),
+            4 => {
+                const view = reader.readBitString() catch break;
+                try expectContained(input, view.data);
+            },
+            5 => {
+                const value = reader.readObjectIdentifier() catch break;
+                try testing.expect(value.components().len <= limits.max_oid_components);
+            },
+            6 => _ = reader.readUtcTime() catch break,
+            7 => _ = reader.readGeneralizedTime() catch break,
+            8 => try expectContained(input, reader.readUtf8String() catch break),
+            9 => try expectContained(input, reader.readPrintableString() catch break),
+            10 => try expectContained(input, reader.readIa5String() catch break),
+            11 => {
+                const child = reader.readSequence() catch break;
+                try testing.expect(child.end <= reader.end);
+                try testing.expectEqual(child.start, child.offset);
+            },
+            else => {
+                const elem = reader.readExplicitContext(@intCast(smith.index(4))) catch break;
+                try expectContained(input, elem.encoded);
+            },
+        }
+        try testing.expect(reader.currentOffset() > before);
+        try testing.expect(reader.currentOffset() <= input.len);
+    }
+}
+
+test "fuzz: PKI: DER decoding keeps every view inside the input and the cursor inside its region" {
+    try testing.fuzz({}, fuzzDerCursorSafety, .{ .corpus = &([_][]const u8{
+        "",
+        "\x30\x00",
+        "\x30\x03\x02\x01\x01",
+        "\x30\x06\x30\x04\x30\x02\x30\x00",
+        "\x02\x02\x00\x01",
+        "\x03\x02\x07\x80",
+        "\x06\x03\x55\x04\x03",
+        "\x04\x81\x80" ++ ("\x00" ** 128),
+        "\xa0\x03\x02\x01\x2a",
+        "\x30\x02\x05\x00\xff",
+        @embedFile("pki_malformed_der"),
+    } ++ reduced_corpus_seeds) });
+}
+
+fn fuzzDerCursorSafety(_: void, smith: *testing.Smith) !void {
+    // Small enough that the quadratic truncate-at-every-byte sweep below
+    // stays a bounded amount of work per case.
+    var buf: [256]u8 = undefined;
+    const len = smith.slice(&buf);
+    const input = buf[0..len];
+
+    const limits: der.Limits = .{
+        .max_depth = 1 + smith.index(8),
+        .max_element_len = 1 + smith.index(1024),
+        .max_elements = 1 + smith.index(64),
+        .max_oid_components = 2 + smith.index(31),
+        .max_integer_bytes = 1 + smith.index(256),
+    };
+
+    var reader = der.Reader.init(input, limits);
+    try walkElements(&reader, input);
+    try walkTyped(input, limits, smith);
+
+    // Truncation at every byte: no prefix may panic, escape its buffer, or
+    // report an element that runs past the bytes actually present.
+    var prefix_len: usize = 0;
+    while (prefix_len < input.len) : (prefix_len += 1) {
+        const prefix = input[0..prefix_len];
+        var prefix_reader = der.Reader.init(prefix, limits);
+        try walkElements(&prefix_reader, prefix);
+        der.fuzzParseInput(prefix);
+    }
+
+    // `readElementDiagnostic` reports an offset inside the input (or exactly
+    // at its end, where a truncation is detected) and never invents one.
+    var diagnostic_reader = der.Reader.init(input, limits);
+    switch (diagnostic_reader.readElementDiagnostic()) {
+        .element => |elem| try expectContained(input, elem.encoded),
+        .err => |parse_error| try testing.expect(parse_error.offset <= input.len),
+    }
+
+    // Exact consumption: a reader that stopped short of its end must say so.
+    var consume_reader = der.Reader.init(input, limits);
+    if (consume_reader.readElement()) |elem| {
+        if (elem.encoded.len == input.len) {
+            try consume_reader.expectEnd();
+        } else {
+            try testing.expectError(error.TrailingData, consume_reader.expectEnd());
+        }
+    } else |_| {}
+
+    try expectChildReaderRejectsSyntheticOffsets(input, limits, smith);
+}
+
+/// `childReader` is a public entry point whose offset/length pair does *not*
+/// have to come from a successful `readElement`, so wire-derived values alone
+/// can never reach the machine-width boundaries the issue's
+/// "integer/offset overflow-adjacent cases" asks for: a DER length is capped
+/// by `max_element_len` long before it approaches `maxInt(usize)`. These
+/// offsets are therefore synthesized directly, per the shared contract's rule
+/// that a target supplies synthetic caller limits when wire input cannot
+/// reach them.
+fn expectChildReaderRejectsSyntheticOffsets(input: []const u8, limits: der.Limits, smith: *testing.Smith) !void {
+    const max = std.math.maxInt(usize);
+    const offsets = [_]usize{ 0, 1, input.len, max, max - 1, max / 2 + 1 };
+    const lengths = [_]usize{ 0, 1, 2, input.len, max, max - 1, max / 2 + 1 };
+
+    // A generous depth budget, so `NestingLimit` cannot mask the bounds check
+    // this is actually probing.
+    var reader = der.Reader.init(input, .{
+        .max_depth = 32,
+        .max_element_len = limits.max_element_len,
+        .max_elements = limits.max_elements,
+    });
+    for (offsets) |content_offset| {
+        for (lengths) |content_len| {
+            // The sum must be evaluated without wrapping — that is the whole
+            // point — so the oracle computes it in a wider type.
+            const wide_end = @as(u128, content_offset) + @as(u128, content_len);
+            const in_bounds = content_offset >= reader.start and wide_end <= input.len;
+            if (reader.childReader(content_offset, content_len)) |child| {
+                try testing.expect(in_bounds);
+                try testing.expectEqual(content_offset, child.start);
+                try testing.expectEqual(content_offset, child.offset);
+                try testing.expectEqual(content_offset + content_len, child.end);
+                // A child that claims to be inside the input really is.
+                try testing.expect(child.end <= input.len);
+                try testing.expect(child.remaining() == content_len);
+            } else |err| {
+                try testing.expect(!in_bounds);
+                try testing.expectEqual(error.LengthBeyondInput, err);
+            }
+        }
+    }
+
+    // Mutation-driven variant: arbitrary offset/length pairs, including ones
+    // straddling the wrap boundary, must never panic or produce a reader that
+    // escapes the input.
+    for (0..8) |_| {
+        const content_offset = max - smith.index(4) * (max / 3);
+        const content_len = max - smith.index(4) * (max / 3);
+        if (reader.childReader(content_offset, content_len)) |child| {
+            try testing.expect(child.end <= input.len);
+        } else |err| {
+            try testing.expectEqual(error.LengthBeyondInput, err);
+        }
+    }
+}
+
+test "childReader rejects an offset and length whose sum overflows machine width" {
+    // Found 2026-08-08 while wiring #492's synthetic overflow-adjacent DER
+    // oracle: `childReader` computed `content_offset + content_len` unchecked,
+    // which panicked in checked builds and wrapped into an apparently
+    // in-bounds bounded reader under `-Doptimize=ReleaseFast`.
+    var reader = der.Reader.init(&[_]u8{ 0x30, 0x00 }, der.default_limits);
+    const max = std.math.maxInt(usize);
+    try testing.expectError(error.LengthBeyondInput, reader.childReader(max, 2));
+    try testing.expectError(error.LengthBeyondInput, reader.childReader(2, max));
+    try testing.expectError(error.LengthBeyondInput, reader.childReader(max, max));
+    try testing.expectError(error.LengthBeyondInput, reader.childReader(max / 2 + 1, max / 2 + 1));
+    // The in-bounds neighbours of those cases still work, so the new check
+    // cannot have been implemented by rejecting everything.
+    const child = try reader.childReader(2, 0);
+    try testing.expectEqual(@as(usize, 2), child.start);
+    try testing.expectEqual(@as(usize, 2), child.end);
+}
+
+/// Innermost NULL wrapped in `depth` SEQUENCEs, written back-to-front into
+/// `out`. Every level stays in short-form length range for the depths used.
+fn buildNested(depth: usize, out: []u8) []u8 {
+    var end = out.len;
+    end -= 2;
+    out[end] = 0x05;
+    out[end + 1] = 0x00;
+    var content_len: usize = 2;
+    var level: usize = 0;
+    while (level < depth) : (level += 1) {
+        end -= 2;
+        out[end] = 0x30;
+        out[end + 1] = @intCast(content_len);
+        content_len += 2;
+    }
+    return out[end..];
+}
+
+/// Descend through every constructed element, returning the depth reached.
+fn descendNested(input: []const u8, limits: der.Limits) der.Error!usize {
+    var reader = der.Reader.init(input, limits);
+    var depth: usize = 0;
+    while (true) {
+        const elem = try reader.readElement();
+        if (!elem.tag.constructed) return depth;
+        reader = try reader.childReader(elem.content_offset, elem.content.len);
+        depth += 1;
+    }
+}
+
+test "fuzz: PKI: DER length, depth, object-size, and element-count bounds hold at every boundary" {
+    try testing.fuzz({}, fuzzDerBounds, .{ .corpus = &.{
+        "",
+        &[_]u8{ 0, 0, 0, 0 },
+        &[_]u8{ 1, 127, 8, 4 },
+        &[_]u8{ 4, 128, 32, 2 },
+        &([_]u8{0xff} ** 16),
+    } });
+}
+
+fn fuzzDerBounds(_: void, smith: *testing.Smith) !void {
+    // --- Nesting depth ------------------------------------------------------
+    const max_depth = 1 + smith.index(12);
+    const depth = smith.index(16);
+    var nested_storage: [2 + 2 * 16]u8 = undefined;
+    const nested = buildNested(depth, &nested_storage);
+    const depth_limits: der.Limits = .{ .max_depth = max_depth, .max_elements = 256 };
+    if (depth <= max_depth) {
+        try testing.expectEqual(depth, try descendNested(nested, depth_limits));
+    } else {
+        try testing.expectError(error.NestingLimit, descendNested(nested, depth_limits));
+    }
+
+    // --- Short/long-form and non-minimal lengths ----------------------------
+    const content_len = smith.index(600);
+    var element_storage: [16 + 600]u8 = undefined;
+    var length_buf: [9]u8 = undefined;
+    const length_len = try der.encodeLength(content_len, &length_buf);
+    element_storage[0] = 0x04;
+    @memcpy(element_storage[1..][0..length_len], length_buf[0..length_len]);
+    @memset(element_storage[1 + length_len ..][0..content_len], 0x5a);
+    const canonical = element_storage[0 .. 1 + length_len + content_len];
+
+    // Exactly at the configured maximum object size the element decodes;
+    // one byte over is `LengthOverflow`, never a wrap or a short read.
+    const at_max: der.Limits = .{ .max_element_len = content_len };
+    var at_max_reader = der.Reader.init(canonical, at_max);
+    const at_max_elem = try at_max_reader.readElement();
+    try testing.expectEqual(content_len, at_max_elem.content.len);
+    try at_max_reader.expectEnd();
+
+    if (content_len > 0) {
+        const under_max: der.Limits = .{ .max_element_len = content_len - 1 };
+        var under_reader = der.Reader.init(canonical, under_max);
+        try testing.expectError(error.LengthOverflow, under_reader.readElement());
+    }
+
+    // A declared length one past the bytes actually present is
+    // `LengthBeyondInput`, at every truncation point.
+    if (canonical.len > 1) {
+        var short_reader = der.Reader.init(canonical[0 .. canonical.len - 1], .{});
+        try testing.expectError(
+            if (content_len == 0) error.Truncated else error.LengthBeyondInput,
+            short_reader.readElement(),
+        );
+    }
+
+    // Long form where short form would do, and a redundant leading zero, are
+    // both non-minimal.
+    if (content_len < 128) {
+        const padded = [_]u8{ 0x04, 0x81, @intCast(content_len) };
+        var padded_reader = der.Reader.init(&padded, .{});
+        try testing.expectError(error.NonMinimalLength, padded_reader.readElement());
+    } else if (content_len <= 0xff) {
+        const padded = [_]u8{ 0x04, 0x82, 0x00, @intCast(content_len) };
+        var padded_reader = der.Reader.init(&padded, .{});
+        try testing.expectError(error.NonMinimalLength, padded_reader.readElement());
+    }
+
+    // Indefinite length, an over-wide length, and a length that would
+    // overflow a 64-bit accumulator are all rejected before any allocation
+    // or arithmetic on the declared size.
+    var indefinite_reader = der.Reader.init(&[_]u8{ 0x30, 0x80, 0x00, 0x00 }, .{});
+    try testing.expectError(error.IndefiniteLength, indefinite_reader.readElement());
+    var wide_reader = der.Reader.init(&([_]u8{ 0x04, 0x89 } ++ [_]u8{0xff} ** 9), .{});
+    try testing.expectError(error.InvalidLength, wide_reader.readElement());
+    var overflow_reader = der.Reader.init(&([_]u8{ 0x04, 0x88 } ++ [_]u8{0xff} ** 8), .{});
+    try testing.expectError(error.LengthOverflow, overflow_reader.readElement());
+
+    // --- Trailing data / exact consumption ----------------------------------
+    const trailing = smith.index(4);
+    if (canonical.len + trailing <= element_storage.len) {
+        @memset(element_storage[canonical.len..][0..trailing], 0x00);
+        var trailing_reader = der.Reader.init(element_storage[0 .. canonical.len + trailing], at_max);
+        _ = try trailing_reader.readElement();
+        if (trailing == 0) {
+            try trailing_reader.expectEnd();
+        } else {
+            try testing.expectError(error.TrailingData, trailing_reader.expectEnd());
+        }
+    }
+
+    // --- Element count ------------------------------------------------------
+    const max_elements = 1 + smith.index(16);
+    const sibling_count = smith.index(24);
+    var siblings_storage: [2 * 24]u8 = undefined;
+    var index: usize = 0;
+    while (index < sibling_count) : (index += 1) {
+        siblings_storage[index * 2] = 0x05;
+        siblings_storage[index * 2 + 1] = 0x00;
+    }
+    var count_reader = der.Reader.init(siblings_storage[0 .. sibling_count * 2], .{ .max_elements = max_elements });
+    var read: usize = 0;
+    while (count_reader.remaining() > 0) {
+        _ = count_reader.readElement() catch |err| {
+            try testing.expectEqual(error.ElementCountLimit, err);
+            break;
+        };
+        read += 1;
+    }
+    try testing.expectEqual(@min(sibling_count, max_elements), read);
+
+    // --- INTEGER and OID component boundaries -------------------------------
+    const integer_bytes = 1 + smith.index(8);
+    var integer_storage: [2 + 8]u8 = undefined;
+    integer_storage[0] = 0x02;
+    integer_storage[1] = @intCast(integer_bytes);
+    integer_storage[2] = 0x01;
+    @memset(integer_storage[3..][0 .. integer_bytes - 1], 0x00);
+    const integer_tlv = integer_storage[0 .. 2 + integer_bytes];
+    var exact_integer = der.Reader.init(integer_tlv, .{ .max_integer_bytes = integer_bytes });
+    try testing.expectEqual(integer_bytes, (try exact_integer.readInteger()).content.len);
+    var tight_integer = der.Reader.init(integer_tlv, .{ .max_integer_bytes = integer_bytes - 1 });
+    try testing.expectError(error.MalformedInteger, tight_integer.readInteger());
+
+    const oid_components = 2 + smith.index(8);
+    var oid_storage: [2 + 32]u8 = undefined;
+    oid_storage[0] = 0x06;
+    oid_storage[1] = @intCast(oid_components - 1);
+    oid_storage[2] = 0x2a; // 1.2
+    @memset(oid_storage[3..][0 .. oid_components - 2], 0x01);
+    const oid_tlv = oid_storage[0 .. 2 + oid_components - 1];
+    var exact_oid = der.Reader.init(oid_tlv, .{ .max_oid_components = oid_components });
+    try testing.expectEqual(oid_components, (try exact_oid.readObjectIdentifier()).components().len);
+    var tight_oid = der.Reader.init(oid_tlv, .{ .max_oid_components = oid_components - 1 });
+    try testing.expectError(error.OidComponentLimit, tight_oid.readObjectIdentifier());
 }
 
 test "reduced differential DER seeds keep their exact DER parse outcome" {

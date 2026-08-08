@@ -718,3 +718,184 @@ test "builder is leak-free across allocation failure points" {
         }
     }.run, .{ &certs[0], certs[1..3], certs[3..5] });
 }
+
+// --- #492 adversarial-graph search targets ----------------------------------
+//
+// Path discovery is the one PKI surface where a hostile input controls a
+// *graph* rather than a byte string, so this target's oracles are about the
+// search itself: it must terminate inside its configured budgets, emit only
+// structurally well-formed paths, and produce byte-identical results for
+// byte-identical inputs.
+
+const fuzz_names = [_][]const u8{ "A", "B", "C", "D" };
+const fuzz_key_ids = [_]?[]const u8{ null, "k1", "k2" };
+
+fn addFuzzCertificate(fx: *Fixtures, smith: *testing.Smith, serial: u8) !void {
+    try fx.add(.{
+        .subject_cn = fuzz_names[smith.index(fuzz_names.len)],
+        .issuer_cn = fuzz_names[smith.index(fuzz_names.len)],
+        // Reusing a serial makes two otherwise-equal certificates
+        // byte-identical, which is the deduplication path.
+        .serial = if (smith.index(4) == 0) 1 else serial,
+        .ski = fuzz_key_ids[smith.index(fuzz_key_ids.len)],
+        .aki = fuzz_key_ids[smith.index(fuzz_key_ids.len)],
+        .subject_cn_tag = if (smith.index(4) == 0) 0x13 else 0x0c,
+        .issuer_cn_tag = if (smith.index(4) == 0) 0x13 else 0x0c,
+    });
+}
+
+fn expectWellFormedPath(
+    path: path_builder.Path,
+    leaf: *const x509.Certificate,
+    intermediates: []const x509.Certificate,
+    anchors: []const x509.Certificate,
+    limits: path_builder.Limits,
+) !void {
+    try testing.expect(path.elements.len >= 2);
+    try testing.expect(path.elements.len <= limits.max_path_len);
+
+    const last = path.elements.len - 1;
+    try testing.expectEqual(path_builder.Source.leaf, path.elements[0].source);
+    try testing.expectEqual(@as(usize, 0), path.elements[0].input_index);
+    try testing.expectEqual(leaf, path.elements[0].certificate);
+    try testing.expectEqual(path_builder.Source.anchor, path.elements[last].source);
+
+    for (path.elements, 0..) |element, index| {
+        switch (element.source) {
+            .leaf => try testing.expectEqual(@as(usize, 0), index),
+            .intermediate => {
+                try testing.expect(index > 0 and index < last);
+                try testing.expect(element.input_index < intermediates.len);
+                try testing.expectEqual(&intermediates[element.input_index], element.certificate);
+            },
+            .anchor => {
+                try testing.expectEqual(last, index);
+                try testing.expect(element.input_index < anchors.len);
+                try testing.expectEqual(&anchors[element.input_index], element.certificate);
+            },
+        }
+        // No certificate may repeat inside one path: this is what makes a
+        // cyclic input terminate instead of looping forever.
+        for (path.elements[0..index]) |earlier| {
+            try testing.expect(earlier.certificate != element.certificate);
+            try testing.expect(!std.mem.eql(u8, earlier.certificate.raw, element.certificate.raw));
+        }
+        // Every step is a real name-chaining edge, not a guess.
+        if (index < last) {
+            try testing.expect(element.certificate.issuer.eqlForChaining(&path.elements[index + 1].certificate.subject));
+        }
+    }
+}
+
+fn expectSamePaths(first: path_builder.CandidatePaths, second: path_builder.CandidatePaths) !void {
+    try testing.expectEqual(first.truncated, second.truncated);
+    try testing.expectEqual(first.paths.len, second.paths.len);
+    for (first.paths, second.paths) |mine, other| {
+        try testing.expectEqual(mine.elements.len, other.elements.len);
+        for (mine.elements, other.elements) |a, b| {
+            try testing.expectEqual(a.certificate, b.certificate);
+            try testing.expectEqual(a.source, b.source);
+            try testing.expectEqual(a.input_index, b.input_index);
+        }
+    }
+}
+
+fn buildForAllocationSweep(
+    allocator: std.mem.Allocator,
+    leaf: *const x509.Certificate,
+    intermediates: []const x509.Certificate,
+    anchors: []const x509.Certificate,
+    limits: path_builder.Limits,
+) !void {
+    var result = path_builder.build(allocator, leaf, intermediates, anchors, limits) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    result.deinit(allocator);
+}
+
+test "fuzz: PKI: path building terminates inside its budgets and is deterministic on adversarial graphs" {
+    try testing.fuzz({}, fuzzPathBuilding, .{ .corpus = &.{
+        "",
+        &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        &[_]u8{ 3, 1, 1, 0, 0, 1, 2, 0, 1, 2 },
+        &([_]u8{1} ** 24),
+        &([_]u8{0xff} ** 32),
+    } });
+}
+
+fn fuzzPathBuilding(_: void, smith: *testing.Smith) !void {
+    const allocator = testing.allocator;
+
+    var leaf_fx = Fixtures.init(allocator);
+    defer leaf_fx.deinit();
+    var intermediate_fx = Fixtures.init(allocator);
+    defer intermediate_fx.deinit();
+    var anchor_fx = Fixtures.init(allocator);
+    defer anchor_fx.deinit();
+
+    var serial: u8 = 2;
+    try addFuzzCertificate(&leaf_fx, smith, serial);
+    for (0..smith.index(6)) |_| {
+        serial += 1;
+        try addFuzzCertificate(&intermediate_fx, smith, serial);
+    }
+    for (0..smith.index(5)) |_| {
+        serial += 1;
+        try addFuzzCertificate(&anchor_fx, smith, serial);
+    }
+    // Byte-identical duplicates across the pools, so deduplication and the
+    // "already on this path" check both get exercised.
+    if (intermediate_fx.certs.items.len != 0 and smith.index(3) == 0) {
+        try intermediate_fx.addDuplicateOf(smith.index(intermediate_fx.certs.items.len));
+    }
+    if (anchor_fx.certs.items.len != 0 and smith.index(3) == 0) {
+        try anchor_fx.addDuplicateOf(smith.index(anchor_fx.certs.items.len));
+    }
+
+    const leaf = &leaf_fx.certs.items[0];
+    const intermediates = intermediate_fx.certs.items;
+    const anchors = anchor_fx.certs.items;
+
+    const limits: path_builder.Limits = .{
+        .max_path_len = 2 + smith.index(4),
+        .max_paths = 1 + smith.index(4),
+        .max_intermediates = smith.index(8),
+        .max_anchors = smith.index(8),
+        .max_fanout = 1 + smith.index(4),
+        .max_candidate_visits = 1 + smith.index(32),
+    };
+
+    if (path_builder.build(allocator, leaf, intermediates, anchors, limits)) |built| {
+        var result = built;
+        defer result.deinit(allocator);
+
+        try testing.expect(result.paths.len >= 1);
+        try testing.expect(result.paths.len <= limits.max_paths);
+        for (result.paths) |path| {
+            try expectWellFormedPath(path, leaf, intermediates, anchors, limits);
+        }
+
+        var replay = try path_builder.build(allocator, leaf, intermediates, anchors, limits);
+        defer replay.deinit(allocator);
+        try expectSamePaths(result, replay);
+    } else |err| switch (err) {
+        // A configuration defect, distinct from a search that found nothing.
+        error.NoTrustAnchors => try testing.expectEqual(@as(usize, 0), anchors.len),
+        error.CountLimitExceeded => try testing.expect(
+            intermediates.len > limits.max_intermediates or anchors.len > limits.max_anchors,
+        ),
+        error.NoCandidatePath, error.SearchLimitExceeded => {
+            try testing.expect(anchors.len > 0);
+            // Failure is deterministic too, not a function of scan order.
+            try testing.expectError(err, path_builder.build(allocator, leaf, intermediates, anchors, limits));
+        },
+        error.OutOfMemory => return err,
+    }
+
+    try testing.checkAllAllocationFailures(
+        allocator,
+        buildForAllocationSweep,
+        .{ leaf, intermediates, anchors, limits },
+    );
+}

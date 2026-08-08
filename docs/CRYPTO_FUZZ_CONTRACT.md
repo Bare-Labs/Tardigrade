@@ -47,6 +47,9 @@ zig build test-tls-protocol-fuzz --summary all --error-style verbose
 # Record/protection/epoch/encrypted-stream targets owned by #493:
 zig build test-tls-record-fuzz --summary all --error-style verbose
 
+# PKI DER/PEM/X.509/path-validation targets owned by #492:
+zig build test-pki-fuzz --summary all --error-style verbose
+
 # Longer local/scheduled coverage-guided runs:
 zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
 zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: AEAD open" --fuzz=10M --summary all --error-style verbose
@@ -57,6 +60,7 @@ zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter=
 zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: BoundedSecret" --fuzz=10M --summary all --error-style verbose
 zig build test-tls-protocol-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
 zig build test-tls-protocol-fuzz -Doptimize=ReleaseFast -Dtls-protocol-test-filter="fuzz: TLS protocol: ClientHello parse" --fuzz=10M --summary all --error-style verbose
+zig build test-pki-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
 ```
 
 `-Dcrypto-test-filter` (added alongside the existing `-Dquic-test-filter`)
@@ -66,7 +70,9 @@ scale it). #491–#494 should add their own protocol-scoped test steps and
 `-D<area>-test-filter` options following the same pattern rather than
 growing this one.
 `test-tls-protocol-fuzz` follows that convention with
-`-Dtls-protocol-test-filter` and the default `fuzz: TLS protocol:` namespace.
+`-Dtls-protocol-test-filter` and the default `fuzz: TLS protocol:` namespace,
+`test-tls-record-fuzz` with `-Dtls-record-test-filter` and `fuzz: TLS
+record:`, and `test-pki-fuzz` with `-Dpki-test-filter` and `fuzz: PKI:`.
 
 ## Seed-corpus and regression update procedure
 
@@ -801,3 +807,89 @@ legal/illegal initial-ClientHello `0x0301` window in #493-A, and epoch
 discard/transition ordering, sequence exhaustion, and key cleanup in
 #493-B. The encrypted-stream progression and terminal-error classes remain
 deterministic-only until #493-C.
+
+### #492 — DER / PEM / X.509 / path validation (epic #324-K)
+
+Like #494's, these targets are inline `test "fuzz: PKI: ..."` blocks next to
+the code they exercise (`src/pki/der_tests.zig`, `src/pki/pem_tests.zig`,
+`src/pki/x509_tests.zig`, `src/pki/path_builder_tests.zig`,
+`src/pki/path_validator_tests.zig`) rather than a dedicated fuzz-only root,
+so their deterministic seed-corpus replay already runs under plain
+`zig build test-pki` / `zig build test`. `test-pki-fuzz` exists to give them
+one stable, individually filterable name for longer coverage-guided runs:
+
+```bash
+# Deterministic smoke coverage for every #492 target (seed corpus replay
+# only, "fuzz: PKI:" test-name namespace) — also covered by plain
+# `zig build test-pki` / `zig build test`.
+zig build test-pki-fuzz --summary all --error-style verbose
+
+# Longer local/scheduled coverage-guided runs, one target at a time:
+zig build test-pki-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
+zig build test-pki-fuzz -Doptimize=ReleaseFast -Dpki-test-filter="fuzz: PKI: DER decoding keeps every view inside the input and the cursor inside its region" --fuzz=10M --summary all --error-style verbose
+zig build test-pki-fuzz -Doptimize=ReleaseFast -Dpki-test-filter="fuzz: PKI: DER length, depth, object-size, and element-count bounds hold at every boundary" --fuzz=10M --summary all --error-style verbose
+zig build test-pki-fuzz -Doptimize=ReleaseFast -Dpki-test-filter="fuzz: PKI: PEM chain loading is bounded and its owned chain outlives a mutated, freed input" --fuzz=10M --summary all --error-style verbose
+zig build test-pki-fuzz -Doptimize=ReleaseFast -Dpki-test-filter="fuzz: PKI: X.509 semantic model borrows only from its input and honors its count bounds" --fuzz=10M --summary all --error-style verbose
+zig build test-pki-fuzz -Doptimize=ReleaseFast -Dpki-test-filter="fuzz: PKI: path building terminates inside its budgets and is deterministic on adversarial graphs" --fuzz=10M --summary all --error-style verbose
+zig build test-pki-fuzz -Doptimize=ReleaseFast -Dpki-test-filter="fuzz: PKI: path validation is deterministic, bounded, and sanitized on adversarial chains" --fuzz=10M --summary all --error-style verbose
+
+# Named deterministic regressions (outside the "fuzz: PKI:" namespace —
+# filter on their own name, or run the whole `test-pki` step):
+zig build test-pki-fuzz -Dpki-test-filter="a validation failure carries only reason and stage metadata, never borrowed memory" --summary all --error-style verbose
+zig build test-pki-fuzz -Dpki-test-filter="childReader rejects an offset and length whose sum overflows machine width" --summary all --error-style verbose
+zig build test-pki-fuzz -Dpki-test-filter="validation classifies every algorithm and signature failure class" --summary all --error-style verbose
+zig build test-pki-fuzz -Dpki-test-filter="validation pins the validity window and pathLenConstraint boundaries" --summary all --error-style verbose
+```
+
+`-Dpki-test-filter` defaults to `"fuzz: PKI:"`. That namespace is deliberately
+more specific than a bare `"fuzz: "` prefix: `pki_mod` also contains the
+pre-existing non-generative `"fuzz entrypoint tolerates ..."` regression tests
+in `pem_tests.zig`/`x509_tests.zig`, which a bare prefix would pull into the
+step even though `--fuzz` cannot drive them.
+
+#### What each target owns
+
+| Surface | Target | Properties covered |
+| --- | --- | --- |
+| DER decoding | `der_tests.zig` `fuzz: PKI: DER parser never panics or leaks on arbitrary input` (pre-existing, renamed into the namespace); `fuzz: PKI: DER decoding keeps every view inside the input and the cursor inside its region` | Every `Element`'s `encoded`/`content` view is a borrow inside the caller's buffer at the exact offset `content_offset` claims; the cursor advances strictly and never leaves `[start, end]`, including after a failed parse; typed decoders (`readInteger`/`readBitString`/`readObjectIdentifier`/time/string/`readSequence`/`readExplicitContext`) return views under the same rule; truncation at *every* byte of the input; `readElementDiagnostic` reports an in-range offset; `expectEnd` is exact. |
+| DER bounds | `der_tests.zig` `fuzz: PKI: DER length, depth, object-size, and element-count bounds hold at every boundary` | Nesting depth is `NestingLimit` at exactly `max_depth + 1`; short/long-form and canonical lengths round-trip through `encodeLength`; non-minimal long form and a redundant leading length zero are `NonMinimalLength`; `max_element_len` and `max_element_len + 1`; a declared length one past the bytes present is `LengthBeyondInput`; indefinite length, a 9-byte length, and a `2^64-1` length are rejected without wrapping; trailing data; `max_elements`, `max_integer_bytes`, and `max_oid_components` each at exact, one-under, and one-over. |
+| DER caller offsets | `der_tests.zig` `expectChildReaderRejectsSyntheticOffsets` (inside the cursor-safety target); `childReader rejects an offset and length whose sum overflows machine width` | `childReader` is a public entry point whose offset/length pair need not come from a successful `readElement`, and a wire-derived length is capped by `max_element_len` long before it nears `maxInt(usize)`. The offsets are therefore **synthesized**, per the contract's rule that a target supplies synthetic caller limits when wire input cannot reach machine-width boundaries: a cross product of `{0, 1, len, maxInt, maxInt-1, maxInt/2+1}` offsets and lengths, with the in-bounds predicate evaluated in a wider type so the oracle itself cannot wrap. This found a real defect -- `childReader` computed `content_offset + content_len` unchecked, panicking in checked builds and wrapping into an apparently in-bounds bounded reader under `-Doptimize=ReleaseFast` -- fixed in this PR with a checked add. |
+| PEM / chain loading | `pem_tests.zig` `fuzz: PKI: PEM chain loading is bounded and its owned chain outlives a mutated, freed input` | Malformed boundaries/labels/base64, empty chains, duplicate blocks, unexpected block types, mixed valid and malformed input, oversized certificates, and the exact `max_certificates`/`NoCertificates` boundary under an all-well-formed generator that gives an exact oracle; every returned certificate is an owned copy disjoint from the input, re-validates as exactly one definite-length SEQUENCE, and is byte-unchanged after the input buffer is overwritten and freed; `loadCertificatePem`/`loadCertificateDer` over the same bytes; a full `checkAllAllocationFailures` sweep proving no leak and no partially owned chain. |
+| X.509 semantic model | `x509_tests.zig` `fuzz: PKI: X.509 semantic model borrows only from its input and honors its count bounds` | Structured generation of Basic Constraints, Key Usage, EKU, SAN (DNS/IP/email/URI/directoryName/registeredID/other), Name Constraints, SKI/AKI, certificate policies, and inhibitAnyPolicy — each optionally critical, optionally replaced with arbitrary bytes — plus malformed/unsupported signature parameters, duplicate semantic extensions, and bit-flip mutation over the finished DER; on success `expectBorrowsOnlyFromInput` walks *every* borrowed slice the model exposes -- `tbs_raw`, serial, both `AlgorithmIdentifier`s including `parameters_raw`, the full SPKI (its algorithm and public-key bits), issuer/subject `Name.raw` and every RDN attribute value, both optional unique-ID bit strings, the signature value, every extension value, and each parsed payload's borrows (SAN, SKI/AKI, Name Constraints, AIA locations, CRLDP `raw`/`full_names`, policy-qualifier values) -- and proves each lies inside `raw`; `Name.chaining_key`/`rdn_chaining_keys` are deliberately excluded, being arena-owned canonical forms rather than borrows. SAN IPs are 4/16 bytes and Name Constraints IPs 8/32, no extension OID repeats, every typed accessor agrees with the extension it came from, and `hasUnhandledCriticalExtension` matches the list. Determinism uses `expectSameCertificateModel`, a full public-model comparison covering version, serial, algorithms and parameters, both names (including per-RDN attributes and chaining keys), validity, SPKI and key type, unique IDs, signature value, and every parsed extension **payload** -- not just its union tag. `max_extensions` is checked at exact and one-over with always-parsable extensions; full allocation-failure sweep. |
+| Path building | `path_builder_tests.zig` `fuzz: PKI: path building terminates inside its budgets and is deterministic on adversarial graphs` | Bounded synthetic graphs over a four-name alphabet — cycles, cross-signing, ambiguity, byte-identical duplicates across pools, missing issuers, absent anchors — under Smith-chosen `max_path_len`/`max_paths`/`max_fanout`/`max_candidate_visits`/pool caps; every returned path is leaf-first and anchor-last with `intermediate` in between, is within the depth bound, repeats no certificate, and every step is a real RFC 5280 §7.1 chaining edge to a certificate at the input index it reports; the whole enumeration (including which error it fails with) is byte-identical on replay; full allocation-failure sweep. |
+| Path validation | `path_validator_tests.zig` `fuzz: PKI: path validation is deterministic, bounded, and sanitized on adversarial chains`; `a validation failure carries only reason and stage metadata, never borrowed memory` | Ed25519-signed synthetic chains with Smith-chosen validity windows (past, future, containing, and zero-width exactly on the validation time), Key Usage, EKU, Basic Constraints, path length, Name Constraints, certificate policies, unknown critical extensions, one mutually-exclusive algorithm/signature failure case, and a two- to four-certificate shape (zero, one, or two intermediates), against Smith-chosen `expected_dns_name`/`require_server_auth_eku`/`maximum_path_length`/`enforce_anchor_validity`; an accepted path must be one of the builder's candidates, well-formed, and anchored at a configured anchor by index *and* exact DER, and is never accepted on a forged signature; a rejection's indices stay inside the path and its OIDs inside the component bound; identical bytes/policy/time give an identical verdict on replay, compared across the whole result on both branches: every field of the failure value including `extension_oid` and `policy_oid`, and for an accepted result the RFC 9618 policy output as well -- both constrained-policy OID slices by length, order, and value, plus the bounded graph's `resource_usage` accounting. The accepted arm is reached readily under `--fuzz` but essentially never during seed-corpus replay, so the named `validation pins the validity window and pathLenConstraint boundaries` test replays a known-good chain through the same comparison, and asserts a policy on every non-anchor certificate so the constrained sets are non-empty and the per-OID comparison is live under plain `zig build test` rather than only in long runs; the allocation-failure sweep runs to the first fail index past the validator's last allocation -- not to a fixed cap -- asserting at each induced failure that every allocated byte was released, so no partially owned accepted path escapes. A compile-time structural check proves `ValidationFailure` has no pointer-shaped field anywhere in its layout, so a verdict cannot carry certificate bytes or key material out of the validator. Two named deterministic tests pin the boundaries and classifications the generator reaches but cannot fix exactly. They are separate `test` blocks rather than inline sub-oracles on purpose: each builds and Ed25519-signs several chains, and rebuilding them on every fuzz iteration throttled coverage-guided exploration by roughly 44x for no extra coverage. `validation pins the validity window and pathLenConstraint boundaries` covers both. The validity window: `notBefore - 1` is `certificate_not_yet_valid`, `notBefore` and `notAfter` accept, `notAfter + 1` is `certificate_expired`. RFC 5280 path length needs a `leaf -> I1 -> I2 -> root` shape to be reachable at all -- with a single intermediate the validator counts CA certificates in an empty slice, so its `pathLenConstraint` can never be exceeded, and the anchor's own constraint is not a validation input -- so the generator emits zero, one, or two intermediates and this test pins both branches: `I2` with `pathLenConstraint=0` is `path_length_exceeded` at index 2, while the otherwise-identical `pathLenConstraint=1` accepts. |
+| Signature/algorithm classification | `path_validator_tests.zig` `validation classifies every algorithm and signature failure class`, plus the mutually-exclusive `SignatureCase` arm inside the path-validation fuzz target | The issue's **algorithm/signature failure classes**. Varying only *which key signs* reaches exactly one of `signatureFailure`'s five outcomes (`signature_invalid`), so the other four are driven by mutating an already-*parsed* `AlgorithmIdentifier`, signature `BitStringView`, or issuer SPKI just enough to hit the validator's classification seam: an unknown signature OID and an Ed25519 algorithm carrying parameters (RFC 8410 §3) give `signature_algorithm_unsupported`; an ECDSA-P256 algorithm over an Ed25519 issuer key gives `signature_key_mismatch`; a 63-byte or non-octet-aligned signature gives `signature_malformed`; a 31-byte, non-octet-aligned, or parameter-carrying issuer key gives `issuer_public_key_malformed`. This is *not* a second copy of #376's provider-primitive malformed-key/signature fuzzing — no hostile bytes reach a crypto primitive, and `raw`/`tbs_raw` are left intact so path structure still validates and only the classification is under test. The named test pins all five classes on an otherwise known-good chain and asserts via an `EnumSet` that each was actually reached, so it cannot pass vacuously; the fuzz target then explores the same seam against generated path, policy, and time state with an exact reason and index oracle. That oracle is exact because signature verification runs before validity, Basic Constraints, Key Usage, EKU, Name Constraints, policy, and identity, and the generator suppresses the only two checks that precede it (unknown critical extensions, and a `maximum_path_length` below the candidate length) whenever a classification case is active. |
+
+#### Seeds, network, and relationship to #348
+
+#348 remains the owner of semantic differential validation against OpenSSL and
+a second validator; nothing here re-opens it. Its minimized hostile fixtures
+(`tests/vectors/pki/reduced/`, wired in through the `pki_reduced_corpus`
+manifest module) are reused as seed material here: the DER and X.509 targets
+take them directly in their `.corpus`, alongside
+`tests/vectors/pki/malformed-truncated.der`. The PEM, path-building, and
+path-validation targets read their Smith stream as a *program* (which blocks
+to emit, which graph to build, which policy to apply) rather than as raw
+certificate bytes, so a DER seed is not meaningful in their corpora; the PEM
+surface instead replays every reduced seed through `loadCertificateDer` and
+`fuzzLoadChainPem` in the deterministic `reduced differential seeds load as
+raw DER exactly as their parse outcome predicts` regression, and the path
+targets build their own synthetic chains because they need certificates that
+*parse* in order to reach path logic at all. A new minimized parser/validator
+finding that turns out to be a *semantic* mismatch belongs back in #348's
+differential corpus; a structural one becomes a named deterministic `test`
+next to the target, per the "Seed-corpus and regression update procedure"
+above.
+
+None of these targets performs AIA, OCSP, or CRL fetching, and none can: the
+modules under test contain no network code. `path_builder.build` searches only
+the caller-provided pools, and `path_validator.validatePath` takes an
+already-built path plus an injected `validation_time`, never a clock.
+
+#### CI model
+
+`zig build test` already runs `test-pki`, whose test binary contains these
+targets, so their deterministic seed-corpus replay is part of every CI job
+with no new job added. The `-Doptimize=ReleaseFast --fuzz=<N>` commands above
+are scheduled or manual local runs, matching the model the rest of this
+document uses.

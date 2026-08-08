@@ -1122,3 +1122,682 @@ test "reduced differential seeds keep their recorded parse outcome" {
         x509.fuzzParseCertificate(allocator, entry.seed);
     }
 }
+
+// --- #492 mutation-driven semantic-model targets ----------------------------
+//
+// #348 owns "does this decision match OpenSSL". This target owns the model's
+// structural contract: every borrowed view stays inside the caller's DER,
+// every typed accessor agrees with the extension list it was derived from,
+// configured count bounds are the exact refusal point, and a failed parse
+// (including a failed allocation) never leaves a partially owned model.
+
+/// #348's minimized hostile certificates are high-value seeds here too.
+const x509_reduced_corpus_seeds = blk: {
+    const reduced_corpus = @import("pki_reduced_corpus");
+    var seeds: [reduced_corpus.entries.len][]const u8 = undefined;
+    for (reduced_corpus.entries, &seeds) |entry, *seed| seed.* = entry.seed;
+    break :blk seeds;
+};
+
+const fuzz_x509_limits: x509.Limits = .{
+    .der = .{ .max_depth = 12, .max_element_len = 4096, .max_elements = 256 },
+    .max_extensions = 8,
+    .max_name_rdns = 8,
+    .max_name_attributes = 4,
+    .max_general_names = 8,
+    .max_eku_purposes = 8,
+    .max_policies = 8,
+    .max_policy_qualifiers = 4,
+    .max_policy_mappings = 8,
+    .max_distribution_points = 4,
+    .max_access_descriptions = 4,
+    .max_name_constraint_subtrees = 8,
+};
+
+fn expectViewContained(raw: []const u8, view: []const u8) !void {
+    const raw_start = @intFromPtr(raw.ptr);
+    const view_start = @intFromPtr(view.ptr);
+    try testing.expect(view_start >= raw_start);
+    try testing.expect(view_start - raw_start + view.len <= raw.len);
+}
+
+/// Which GeneralName IP encoding the surrounding extension mandates: a bare
+/// address in SAN/AIA/CRLDP, address-plus-mask inside Name Constraints.
+const IpForm = enum { host, cidr };
+
+fn expectGeneralNameContained(raw: []const u8, name: x509.GeneralName, form: IpForm) !void {
+    switch (name) {
+        .rfc822_name, .dns_name, .directory_name, .uniform_resource_identifier => |value| {
+            try expectViewContained(raw, value);
+        },
+        .ip_address => |value| {
+            try expectViewContained(raw, value);
+            switch (form) {
+                .host => try testing.expect(value.len == 4 or value.len == 16),
+                .cidr => try testing.expect(value.len == 8 or value.len == 32),
+            }
+        },
+        // A decoded OID is a fixed-size value, never a borrow.
+        .registered_id => |value| try testing.expect(value.components().len <= oid.max_components),
+        .other => |value| try expectViewContained(raw, value.raw),
+    }
+}
+
+fn expectGeneralNamesContained(raw: []const u8, names: []const x509.GeneralName, form: IpForm) !void {
+    for (names) |name| try expectGeneralNameContained(raw, name, form);
+}
+
+fn expectAlgorithmContained(raw: []const u8, algorithm: x509.AlgorithmIdentifier) !void {
+    try expectViewContained(raw, algorithm.raw);
+    if (algorithm.parameters_raw) |parameters| try expectViewContained(raw, parameters);
+}
+
+fn expectNameContained(raw: []const u8, name: x509.Name) !void {
+    try expectViewContained(raw, name.raw);
+    for (name.rdns) |rdn| {
+        for (rdn.attributes) |attribute| try expectViewContained(raw, attribute.value);
+    }
+    // `chaining_key`/`rdn_chaining_keys` are deliberately *not* containment
+    // checked: they are arena-owned RFC 4518 canonical forms the parser
+    // computes, not borrows of the input, so demanding containment would
+    // assert the opposite of their documented ownership.
+    try testing.expectEqual(name.rdns.len, name.rdn_chaining_keys.len);
+}
+
+fn expectSpkiContained(raw: []const u8, spki: x509.SubjectPublicKeyInfo) !void {
+    try expectViewContained(raw, spki.raw);
+    try expectAlgorithmContained(raw, spki.algorithm);
+    try expectViewContained(raw, spki.subject_public_key.data);
+}
+
+fn expectParsedExtensionContained(raw: []const u8, parsed: x509.Extension.Parsed) !void {
+    switch (parsed) {
+        .subject_alt_name => |names| try expectGeneralNamesContained(raw, names, .host),
+        .subject_key_identifier => |value| try expectViewContained(raw, value),
+        .authority_key_identifier => |value| {
+            if (value.key_identifier) |identifier| try expectViewContained(raw, identifier);
+            if (value.authority_cert_issuer_raw) |issuer| try expectViewContained(raw, issuer);
+            if (value.authority_cert_serial) |serial| try expectViewContained(raw, serial);
+        },
+        .name_constraints => |value| {
+            for (value.permitted) |subtree| try expectGeneralNameContained(raw, subtree.base, .cidr);
+            for (value.excluded) |subtree| try expectGeneralNameContained(raw, subtree.base, .cidr);
+        },
+        .authority_info_access => |descriptions| {
+            for (descriptions) |description| try expectGeneralNameContained(raw, description.location, .host);
+        },
+        .crl_distribution_points => |points| {
+            for (points) |point| {
+                try expectViewContained(raw, point.raw);
+                try expectGeneralNamesContained(raw, point.full_names, .host);
+            }
+        },
+        .certificate_policies => |policies| {
+            for (policies) |policy| {
+                for (policy.qualifiers) |qualifier| try expectViewContained(raw, qualifier.value_raw);
+            }
+        },
+        // Value-only payloads: no borrowed slice to escape.
+        .basic_constraints,
+        .key_usage,
+        .extended_key_usage,
+        .policy_mappings,
+        .policy_constraints,
+        .inhibit_any_policy,
+        .unrecognized,
+        => {},
+    }
+}
+
+/// Walks *every* borrowed slice the parsed model exposes and proves it points
+/// into the caller's DER. A parser regression that pointed any field at
+/// temporary or recycled parser storage has to fail here, which is the #492
+/// borrowed-slice-escape criterion.
+fn expectBorrowsOnlyFromInput(certificate: *const x509.Certificate) !void {
+    const raw = certificate.raw;
+    try expectViewContained(raw, certificate.tbs_raw);
+    try expectViewContained(raw, certificate.serial_number.content);
+    try expectAlgorithmContained(raw, certificate.signature_algorithm);
+    try expectNameContained(raw, certificate.issuer);
+    try expectNameContained(raw, certificate.subject);
+    try expectSpkiContained(raw, certificate.subject_public_key_info);
+    if (certificate.issuer_unique_id) |unique_id| try expectViewContained(raw, unique_id.data);
+    if (certificate.subject_unique_id) |unique_id| try expectViewContained(raw, unique_id.data);
+    try expectViewContained(raw, certificate.signature_value.data);
+    for (certificate.extensions) |extension| {
+        try expectViewContained(raw, extension.value);
+        try expectParsedExtensionContained(raw, extension.parsed);
+    }
+}
+
+// --- Full-model equality, for the "identical bytes, identical model" oracle -
+
+fn expectSameOptionalSlice(expected: ?[]const u8, actual: ?[]const u8) !void {
+    if (expected) |lhs| {
+        const rhs = actual orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, lhs, rhs);
+    } else {
+        try testing.expect(actual == null);
+    }
+}
+
+fn expectSameOid(expected: oid.ObjectIdentifier, actual: oid.ObjectIdentifier) !void {
+    try testing.expectEqualSlices(u32, expected.components(), actual.components());
+}
+
+fn expectSameOptionalOid(expected: ?oid.ObjectIdentifier, actual: ?oid.ObjectIdentifier) !void {
+    if (expected) |lhs| {
+        const rhs = actual orelse return error.TestUnexpectedResult;
+        try expectSameOid(lhs, rhs);
+    } else {
+        try testing.expect(actual == null);
+    }
+}
+
+fn expectSameAlgorithm(expected: x509.AlgorithmIdentifier, actual: x509.AlgorithmIdentifier) !void {
+    try testing.expectEqualSlices(u8, expected.raw, actual.raw);
+    try expectSameOid(expected.oid, actual.oid);
+    try expectSameOptionalSlice(expected.parameters_raw, actual.parameters_raw);
+    try testing.expectEqual(expected.parameters_null, actual.parameters_null);
+}
+
+fn expectSameName(expected: x509.Name, actual: x509.Name) !void {
+    try testing.expectEqualSlices(u8, expected.raw, actual.raw);
+    try testing.expectEqualSlices(u8, expected.chaining_key, actual.chaining_key);
+    try testing.expectEqual(expected.rdns.len, actual.rdns.len);
+    try testing.expectEqual(expected.rdn_chaining_keys.len, actual.rdn_chaining_keys.len);
+    for (expected.rdn_chaining_keys, actual.rdn_chaining_keys) |lhs, rhs| {
+        try testing.expectEqualSlices(u8, lhs, rhs);
+    }
+    for (expected.rdns, actual.rdns) |lhs, rhs| {
+        try testing.expectEqual(lhs.attributes.len, rhs.attributes.len);
+        for (lhs.attributes, rhs.attributes) |left, right| {
+            try expectSameOid(left.type, right.type);
+            try testing.expect(left.value_tag.eql(right.value_tag));
+            try testing.expectEqualSlices(u8, left.value, right.value);
+        }
+    }
+}
+
+fn expectSameGeneralName(expected: x509.GeneralName, actual: x509.GeneralName) !void {
+    const Tag = std.meta.Tag(x509.GeneralName);
+    try testing.expectEqual(@as(Tag, expected), @as(Tag, actual));
+    switch (expected) {
+        .rfc822_name => try testing.expectEqualSlices(u8, expected.rfc822_name, actual.rfc822_name),
+        .dns_name => try testing.expectEqualSlices(u8, expected.dns_name, actual.dns_name),
+        .directory_name => try testing.expectEqualSlices(u8, expected.directory_name, actual.directory_name),
+        .uniform_resource_identifier => try testing.expectEqualSlices(
+            u8,
+            expected.uniform_resource_identifier,
+            actual.uniform_resource_identifier,
+        ),
+        .ip_address => try testing.expectEqualSlices(u8, expected.ip_address, actual.ip_address),
+        .registered_id => try expectSameOid(expected.registered_id, actual.registered_id),
+        .other => {
+            try testing.expectEqual(expected.other.tag_number, actual.other.tag_number);
+            try testing.expectEqualSlices(u8, expected.other.raw, actual.other.raw);
+        },
+    }
+}
+
+fn expectSameGeneralNames(expected: []const x509.GeneralName, actual: []const x509.GeneralName) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |lhs, rhs| try expectSameGeneralName(lhs, rhs);
+}
+
+fn expectSameParsedExtension(expected: x509.Extension.Parsed, actual: x509.Extension.Parsed) !void {
+    const Tag = std.meta.Tag(x509.Extension.Parsed);
+    try testing.expectEqual(@as(Tag, expected), @as(Tag, actual));
+    switch (expected) {
+        .basic_constraints => try testing.expectEqual(expected.basic_constraints, actual.basic_constraints),
+        .key_usage => try testing.expectEqual(expected.key_usage, actual.key_usage),
+        .subject_alt_name => try expectSameGeneralNames(expected.subject_alt_name, actual.subject_alt_name),
+        .extended_key_usage => {
+            try testing.expectEqual(expected.extended_key_usage.purposes.len, actual.extended_key_usage.purposes.len);
+            for (expected.extended_key_usage.purposes, actual.extended_key_usage.purposes) |lhs, rhs| {
+                try expectSameOid(lhs, rhs);
+            }
+        },
+        .subject_key_identifier => try testing.expectEqualSlices(
+            u8,
+            expected.subject_key_identifier,
+            actual.subject_key_identifier,
+        ),
+        .authority_key_identifier => {
+            try expectSameOptionalSlice(
+                expected.authority_key_identifier.key_identifier,
+                actual.authority_key_identifier.key_identifier,
+            );
+            try expectSameOptionalSlice(
+                expected.authority_key_identifier.authority_cert_issuer_raw,
+                actual.authority_key_identifier.authority_cert_issuer_raw,
+            );
+            try expectSameOptionalSlice(
+                expected.authority_key_identifier.authority_cert_serial,
+                actual.authority_key_identifier.authority_cert_serial,
+            );
+        },
+        .name_constraints => {
+            try testing.expectEqual(expected.name_constraints.permitted.len, actual.name_constraints.permitted.len);
+            try testing.expectEqual(expected.name_constraints.excluded.len, actual.name_constraints.excluded.len);
+            for (expected.name_constraints.permitted, actual.name_constraints.permitted) |lhs, rhs| {
+                try expectSameGeneralName(lhs.base, rhs.base);
+            }
+            for (expected.name_constraints.excluded, actual.name_constraints.excluded) |lhs, rhs| {
+                try expectSameGeneralName(lhs.base, rhs.base);
+            }
+        },
+        .authority_info_access => {
+            try testing.expectEqual(expected.authority_info_access.len, actual.authority_info_access.len);
+            for (expected.authority_info_access, actual.authority_info_access) |lhs, rhs| {
+                try expectSameOid(lhs.method, rhs.method);
+                try expectSameGeneralName(lhs.location, rhs.location);
+            }
+        },
+        .crl_distribution_points => {
+            try testing.expectEqual(expected.crl_distribution_points.len, actual.crl_distribution_points.len);
+            for (expected.crl_distribution_points, actual.crl_distribution_points) |lhs, rhs| {
+                try testing.expectEqualSlices(u8, lhs.raw, rhs.raw);
+                try expectSameGeneralNames(lhs.full_names, rhs.full_names);
+            }
+        },
+        .certificate_policies => {
+            try testing.expectEqual(expected.certificate_policies.len, actual.certificate_policies.len);
+            for (expected.certificate_policies, actual.certificate_policies) |lhs, rhs| {
+                try expectSameOid(lhs.policy, rhs.policy);
+                try testing.expectEqual(lhs.qualifiers.len, rhs.qualifiers.len);
+                for (lhs.qualifiers, rhs.qualifiers) |left, right| {
+                    try expectSameOid(left.oid, right.oid);
+                    try testing.expectEqualSlices(u8, left.value_raw, right.value_raw);
+                    try testing.expectEqual(left.kind, right.kind);
+                }
+            }
+        },
+        .policy_mappings => {
+            try testing.expectEqual(expected.policy_mappings.len, actual.policy_mappings.len);
+            for (expected.policy_mappings, actual.policy_mappings) |lhs, rhs| {
+                try expectSameOid(lhs.issuer_domain_policy, rhs.issuer_domain_policy);
+                try expectSameOid(lhs.subject_domain_policy, rhs.subject_domain_policy);
+            }
+        },
+        .policy_constraints => try testing.expectEqual(expected.policy_constraints, actual.policy_constraints),
+        .inhibit_any_policy => try testing.expectEqual(expected.inhibit_any_policy, actual.inhibit_any_policy),
+        .unrecognized => {},
+    }
+}
+
+fn expectSameBitString(expected: der.BitStringView, actual: der.BitStringView) !void {
+    try testing.expectEqual(expected.unused_bits, actual.unused_bits);
+    try testing.expectEqualSlices(u8, expected.data, actual.data);
+}
+
+fn expectSameOptionalBitString(expected: ?der.BitStringView, actual: ?der.BitStringView) !void {
+    if (expected) |lhs| {
+        const rhs = actual orelse return error.TestUnexpectedResult;
+        try expectSameBitString(lhs, rhs);
+    } else {
+        try testing.expect(actual == null);
+    }
+}
+
+/// Compares the complete public semantic model, not just its structural tags,
+/// so two parses of the same bytes cannot disagree on any decoded field or
+/// parsed extension payload while still passing the determinism oracle.
+fn expectSameCertificateModel(expected: *const x509.Certificate, actual: *const x509.Certificate) !void {
+    try testing.expectEqualSlices(u8, expected.raw, actual.raw);
+    try testing.expectEqualSlices(u8, expected.tbs_raw, actual.tbs_raw);
+    try testing.expectEqual(expected.version, actual.version);
+    try testing.expectEqualSlices(u8, expected.serial_number.content, actual.serial_number.content);
+    try expectSameAlgorithm(expected.signature_algorithm, actual.signature_algorithm);
+    try testing.expectEqual(expected.signatureAlgorithm(), actual.signatureAlgorithm());
+    try expectSameName(expected.issuer, actual.issuer);
+    try expectSameName(expected.subject, actual.subject);
+    try testing.expectEqual(expected.validity, actual.validity);
+    try testing.expectEqualSlices(u8, expected.subject_public_key_info.raw, actual.subject_public_key_info.raw);
+    try expectSameAlgorithm(expected.subject_public_key_info.algorithm, actual.subject_public_key_info.algorithm);
+    try expectSameBitString(
+        expected.subject_public_key_info.subject_public_key,
+        actual.subject_public_key_info.subject_public_key,
+    );
+    try testing.expectEqual(expected.subject_public_key_info.key_type, actual.subject_public_key_info.key_type);
+    try expectSameOptionalOid(
+        expected.subject_public_key_info.named_curve,
+        actual.subject_public_key_info.named_curve,
+    );
+    try expectSameOptionalBitString(expected.issuer_unique_id, actual.issuer_unique_id);
+    try expectSameOptionalBitString(expected.subject_unique_id, actual.subject_unique_id);
+    try expectSameBitString(expected.signature_value, actual.signature_value);
+    try testing.expectEqual(expected.isSelfIssued(), actual.isSelfIssued());
+    try testing.expectEqual(expected.hasUnhandledCriticalExtension(), actual.hasUnhandledCriticalExtension());
+
+    try testing.expectEqual(expected.extensions.len, actual.extensions.len);
+    for (expected.extensions, actual.extensions) |lhs, rhs| {
+        try expectSameOid(lhs.oid, rhs.oid);
+        try testing.expectEqual(lhs.critical, rhs.critical);
+        try testing.expectEqualSlices(u8, lhs.value, rhs.value);
+        try expectSameParsedExtension(lhs.parsed, rhs.parsed);
+    }
+}
+
+/// Build one Smith-chosen extension value; `null` means "skip this slot".
+fn fuzzExtension(arena: std.mem.Allocator, smith: *testing.Smith, slot: usize) !?[]const u8 {
+    // Most slots are absent in any given case. Emitting all ten every time
+    // would exceed `max_extensions` unconditionally, so every case would
+    // stop at `CountLimitExceeded` and the model's own invariants would
+    // never be reached.
+    if (smith.index(3) != 0) return null;
+    const critical = smith.index(2) == 0;
+    // Occasionally replace the extension's value with arbitrary bytes, so the
+    // extension parsers see hostile content under a well-formed wrapper.
+    const corrupt = smith.index(4) == 0;
+    var corrupt_storage: [48]u8 = undefined;
+    const corrupt_len = smith.index(corrupt_storage.len + 1);
+    smith.bytes(corrupt_storage[0..corrupt_len]);
+    const corrupt_value = corrupt_storage[0..corrupt_len];
+
+    const dns_names = [_][]const u8{ "a.test", "*.b.test", "", "xn--fa-hia.test", "..", "A.TEST" };
+    const eku_choices = [_][]const u32{
+        &oid.well_known.server_auth,
+        &oid.well_known.client_auth,
+        &oid.well_known.any_ext_key_usage,
+        &oid.well_known.code_signing,
+        &[_]u32{ 1, 3, 6, 1, 4, 1, 4242, 1 },
+    };
+
+    switch (slot) {
+        0 => {
+            var parts: std.ArrayList([]const u8) = .empty;
+            defer parts.deinit(arena);
+            if (smith.index(2) == 0) try parts.append(arena, try tlv(arena, 0x01, &.{&[_]u8{if (smith.index(2) == 0) 0xff else 0x00}}));
+            if (smith.index(2) == 0) try parts.append(arena, try tlv(arena, 0x02, &.{&[_]u8{@intCast(smith.index(128))}}));
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x30, parts.items);
+            return try extensionTlv(arena, &oid.well_known.basic_constraints, critical, value);
+        },
+        1 => {
+            const unused: u8 = @intCast(smith.index(9)); // 8 is out of range.
+            const bits: u8 = @intCast(smith.index(256));
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x03, &.{&[_]u8{ unused, bits }});
+            return try extensionTlv(arena, &oid.well_known.key_usage, critical, value);
+        },
+        2 => {
+            var purposes: std.ArrayList([]const u8) = .empty;
+            defer purposes.deinit(arena);
+            for (0..smith.index(6)) |_| {
+                try purposes.append(arena, try oidTlv(arena, eku_choices[smith.index(eku_choices.len)]));
+            }
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x30, purposes.items);
+            return try extensionTlv(arena, &oid.well_known.ext_key_usage, critical, value);
+        },
+        3 => {
+            var names: std.ArrayList([]const u8) = .empty;
+            defer names.deinit(arena);
+            for (0..smith.index(10)) |_| {
+                const name = switch (smith.index(7)) {
+                    0 => try tlv(arena, 0x82, &.{dns_names[smith.index(dns_names.len)]}),
+                    1 => blk: {
+                        var address: [17]u8 = undefined;
+                        const length = smith.index(address.len + 1);
+                        smith.bytes(address[0..length]);
+                        break :blk try tlv(arena, 0x87, &.{address[0..length]});
+                    },
+                    2 => try tlv(arena, 0x81, &.{"user@example.test"}),
+                    3 => try tlv(arena, 0x86, &.{"https://a.test/x"}),
+                    4 => try tlv(arena, 0xa4, &.{try nameWithCn(arena, "Directory")}),
+                    5 => try tlv(arena, 0x88, &.{&[_]u8{ 0x2a, 0x03 }}),
+                    else => try tlv(arena, 0xa0, &.{&[_]u8{ 0x05, 0x00 }}),
+                };
+                try names.append(arena, name);
+            }
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x30, names.items);
+            return try extensionTlv(arena, &oid.well_known.subject_alt_name, critical, value);
+        },
+        4 => {
+            var permitted: std.ArrayList([]const u8) = .empty;
+            defer permitted.deinit(arena);
+            var excluded: std.ArrayList([]const u8) = .empty;
+            defer excluded.deinit(arena);
+            for (0..smith.index(4)) |_| {
+                try permitted.append(arena, try tlv(arena, 0x30, &.{try tlv(arena, 0x82, &.{dns_names[smith.index(dns_names.len)]})}));
+            }
+            for (0..smith.index(4)) |_| {
+                var address: [33]u8 = undefined;
+                const length = smith.index(address.len + 1);
+                smith.bytes(address[0..length]);
+                try excluded.append(arena, try tlv(arena, 0x30, &.{try tlv(arena, 0x87, &.{address[0..length]})}));
+            }
+            var parts: std.ArrayList([]const u8) = .empty;
+            defer parts.deinit(arena);
+            if (permitted.items.len != 0) try parts.append(arena, try tlv(arena, 0xa0, permitted.items));
+            if (excluded.items.len != 0) try parts.append(arena, try tlv(arena, 0xa1, excluded.items));
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x30, parts.items);
+            return try extensionTlv(arena, &oid.well_known.name_constraints, critical, value);
+        },
+        5 => {
+            var identifier: [24]u8 = undefined;
+            const length = smith.index(identifier.len + 1);
+            smith.bytes(identifier[0..length]);
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x04, &.{identifier[0..length]});
+            return try extensionTlv(arena, &oid.well_known.subject_key_identifier, critical, value);
+        },
+        6 => {
+            var identifier: [24]u8 = undefined;
+            const length = smith.index(identifier.len + 1);
+            smith.bytes(identifier[0..length]);
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x30, &.{try tlv(arena, 0x80, &.{identifier[0..length]})});
+            return try extensionTlv(arena, &oid.well_known.authority_key_identifier, critical, value);
+        },
+        7 => {
+            var policies: std.ArrayList([]const u8) = .empty;
+            defer policies.deinit(arena);
+            for (0..smith.index(4)) |index| {
+                const policy_oid = [_]u32{ 2, 5, 29, 32, @intCast(index) };
+                try policies.append(arena, try tlv(arena, 0x30, &.{try oidTlv(arena, &policy_oid)}));
+            }
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x30, policies.items);
+            return try extensionTlv(arena, &oid.well_known.certificate_policies, critical, value);
+        },
+        8 => {
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x02, &.{&[_]u8{@intCast(smith.index(128))}});
+            return try extensionTlv(arena, &oid.well_known.inhibit_any_policy, critical, value);
+        },
+        else => return try extensionTlv(arena, &unknown_ext_oid, critical, if (corrupt) corrupt_value else &[_]u8{ 0x05, 0x00 }),
+    }
+}
+
+fn parseForAllocationSweep(allocator: std.mem.Allocator, input: []const u8) !void {
+    var certificate = x509.Certificate.parse(allocator, input, fuzz_x509_limits) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    certificate.deinit(allocator);
+}
+
+test "fuzz: PKI: X.509 semantic model borrows only from its input and honors its count bounds" {
+    try testing.fuzz({}, fuzzX509Semantics, .{ .corpus = &([_][]const u8{
+        "",
+        &[_]u8{0},
+        &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 },
+        &([_]u8{0x55} ** 40),
+        &([_]u8{0xff} ** 64),
+        @embedFile("pki_malformed_der"),
+    } ++ x509_reduced_corpus_seeds) });
+}
+
+fn fuzzX509Semantics(_: void, smith: *testing.Smith) !void {
+    const allocator = testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var extensions: std.ArrayList([]const u8) = .empty;
+    defer extensions.deinit(arena);
+    for (0..10) |slot| {
+        if (try fuzzExtension(arena, smith, slot)) |extension| try extensions.append(arena, extension);
+    }
+    // Duplicate a generated extension: RFC 5280 forbids a repeated OID, and
+    // the parser must say so rather than silently keeping one of them.
+    const duplicated = extensions.items.len != 0 and smith.index(3) == 0;
+    if (duplicated) try extensions.append(arena, extensions.items[smith.index(extensions.items.len)]);
+
+    // A malformed/unsupported inner signature AlgorithmIdentifier, which must
+    // be rejected on its own terms rather than by the outer structure.
+    const inner_algorithm: ?[]const u8 = switch (smith.index(4)) {
+        0 => try tlv(arena, 0x30, &.{ try oidTlv(arena, &ecdsa_sha256_components), try tlv(arena, 0x05, &.{}) }),
+        1 => try tlv(arena, 0x30, &.{}),
+        2 => try tlv(arena, 0x30, &.{try oidTlv(arena, &[_]u32{ 1, 2, 3, 4, 5 })}),
+        else => null,
+    };
+
+    const bytes = try buildCertificate(arena, .{
+        .version = if (smith.index(8) == 0) null else try versionTlv(arena, @intCast(smith.index(4))),
+        .inner_algorithm = inner_algorithm,
+        .extensions_wrapper = if (extensions.items.len == 0) null else try extensionsWrapper(arena, extensions.items),
+    });
+
+    // Bit-flip mutation on top of the structured builder: the mutation-driven
+    // half of this target, reaching states the builder alone cannot express.
+    const mutation_count = smith.index(4);
+    for (0..mutation_count) |_| {
+        if (bytes.len == 0) break;
+        bytes[smith.index(bytes.len)] ^= @intCast(1 + smith.index(255));
+    }
+
+    // Parse from a heap copy so the copy can be freed while the parsed model
+    // is gone, proving the model never outlives (or retains) its input.
+    const input = try allocator.dupe(u8, bytes);
+    defer allocator.free(input);
+
+    if (x509.Certificate.parse(allocator, input, fuzz_x509_limits)) |parsed| {
+        var certificate = parsed;
+        defer certificate.deinit(allocator);
+
+        try testing.expectEqual(input.ptr, certificate.raw.ptr);
+        try testing.expectEqual(input.len, certificate.raw.len);
+        // Every borrowed slice anywhere in the model, not a hand-picked
+        // subset, must point into the caller's DER.
+        try expectBorrowsOnlyFromInput(&certificate);
+        try der.validateInteger(certificate.serial_number.content, fuzz_x509_limits.der.max_integer_bytes);
+        try testing.expect(certificate.issuer.rdns.len <= fuzz_x509_limits.max_name_rdns);
+        try testing.expect(certificate.subject.rdns.len <= fuzz_x509_limits.max_name_rdns);
+        for (certificate.issuer.rdns) |rdn| {
+            try testing.expect(rdn.attributes.len <= fuzz_x509_limits.max_name_attributes);
+        }
+        for (certificate.subject.rdns) |rdn| {
+            try testing.expect(rdn.attributes.len <= fuzz_x509_limits.max_name_attributes);
+        }
+        try testing.expect(certificate.isSelfIssued() == certificate.issuer.eqlForChaining(&certificate.subject));
+
+        try testing.expect(certificate.extensions.len <= fuzz_x509_limits.max_extensions);
+        var unhandled_critical = false;
+        for (certificate.extensions, 0..) |extension, index| {
+            // A duplicate OID must have been rejected, never merged.
+            for (certificate.extensions[0..index]) |earlier| {
+                try testing.expect(!earlier.oid.eql(&extension.oid));
+            }
+            if (extension.critical and extension.parsed == .unrecognized) unhandled_critical = true;
+            // Every typed accessor must agree with the extension list it was
+            // derived from — no accessor may synthesize or drop an extension.
+            switch (extension.parsed) {
+                .basic_constraints => |value| {
+                    try testing.expectEqual(value, certificate.basicConstraints().?);
+                },
+                .key_usage => |value| try testing.expectEqual(value, certificate.keyUsage().?),
+                .subject_alt_name => |names| {
+                    try testing.expect(names.len <= fuzz_x509_limits.max_general_names);
+                    try expectSameGeneralNames(names, certificate.subjectAltName().?);
+                },
+                .extended_key_usage => |value| {
+                    try testing.expect(value.purposes.len <= fuzz_x509_limits.max_eku_purposes);
+                    try testing.expectEqual(value.purposes.len, certificate.extendedKeyUsage().?.purposes.len);
+                },
+                .subject_key_identifier => |value| {
+                    try testing.expectEqualSlices(u8, value, certificate.subjectKeyIdentifier().?);
+                },
+                .authority_key_identifier => |value| {
+                    try expectSameOptionalSlice(value.key_identifier, certificate.authorityKeyIdentifier().?.key_identifier);
+                },
+                .name_constraints => |value| {
+                    try testing.expect(value.permitted.len <= fuzz_x509_limits.max_name_constraint_subtrees);
+                    try testing.expect(value.excluded.len <= fuzz_x509_limits.max_name_constraint_subtrees);
+                    try testing.expectEqual(value.permitted.len, certificate.nameConstraints().?.permitted.len);
+                    try testing.expectEqual(value.excluded.len, certificate.nameConstraints().?.excluded.len);
+                },
+                .certificate_policies => |value| {
+                    try testing.expect(value.len <= fuzz_x509_limits.max_policies);
+                    try testing.expectEqual(value.len, certificate.certificatePolicies().?.len);
+                    for (value) |policy| {
+                        try testing.expect(policy.qualifiers.len <= fuzz_x509_limits.max_policy_qualifiers);
+                    }
+                },
+                .policy_mappings => |value| {
+                    try testing.expect(value.len <= fuzz_x509_limits.max_policy_mappings);
+                    try testing.expectEqual(value.len, certificate.policyMappings().?.len);
+                },
+                .policy_constraints => |value| try testing.expectEqual(value, certificate.policyConstraints().?),
+                .authority_info_access => |value| try testing.expect(value.len <= fuzz_x509_limits.max_access_descriptions),
+                .crl_distribution_points => |value| try testing.expect(value.len <= fuzz_x509_limits.max_distribution_points),
+                .inhibit_any_policy => |value| try testing.expectEqual(value, certificate.inhibitAnyPolicy().?),
+                .unrecognized => {},
+            }
+        }
+        try testing.expectEqual(unhandled_critical, certificate.hasUnhandledCriticalExtension());
+        // An unmutated duplicate must have been rejected outright; a bit-flip
+        // can legitimately make the two OIDs differ again, so only the
+        // unmutated case has an oracle here.
+        try testing.expect(!duplicated or mutation_count > 0);
+
+        // Identical bytes must produce an identical model — compared across
+        // the whole public model, including every parsed extension payload,
+        // not just its structural tags.
+        var replay = try x509.Certificate.parse(allocator, input, fuzz_x509_limits);
+        defer replay.deinit(allocator);
+        try expectSameCertificateModel(&certificate, &replay);
+    } else |err| switch (err) {
+        error.MalformedCertificate,
+        error.UnsupportedVersion,
+        error.MalformedSerialNumber,
+        error.MalformedAlgorithm,
+        error.SignatureAlgorithmMismatch,
+        error.MalformedName,
+        error.MalformedValidity,
+        error.MalformedPublicKeyInfo,
+        error.MalformedUniqueId,
+        error.MalformedSignature,
+        error.MalformedExtension,
+        error.DuplicateExtension,
+        error.NamePreparationFailed,
+        error.CountLimitExceeded,
+        error.OutOfMemory,
+        => {},
+    }
+
+    // The extension-count bound is the exact refusal point, using extensions
+    // that always parse (unknown, non-critical) so nothing else can reject
+    // first.
+    {
+        var many: std.ArrayList([]const u8) = .empty;
+        defer many.deinit(arena);
+        const count = fuzz_x509_limits.max_extensions + smith.index(2);
+        for (0..count) |index| {
+            const ext_oid = [_]u32{ 1, 3, 6, 1, 4, 1, 99999, @intCast(index) };
+            try many.append(arena, try extensionTlv(arena, &ext_oid, false, &[_]u8{ 0x05, 0x00 }));
+        }
+        const bounded = try buildCertificate(arena, .{
+            .version = try versionTlv(arena, 2),
+            .extensions_wrapper = try extensionsWrapper(arena, many.items),
+        });
+        if (count > fuzz_x509_limits.max_extensions) {
+            try testing.expectError(error.CountLimitExceeded, x509.Certificate.parse(allocator, bounded, fuzz_x509_limits));
+        } else {
+            var certificate = try x509.Certificate.parse(allocator, bounded, fuzz_x509_limits);
+            defer certificate.deinit(allocator);
+            try testing.expectEqual(count, certificate.extensions.len);
+        }
+    }
+
+    // Allocation failure at every reachable point: no leak, and no partially
+    // owned model escapes a failed parse.
+    try testing.checkAllAllocationFailures(allocator, parseForAllocationSweep, .{input});
+
+    x509.fuzzParseCertificate(allocator, input);
+}
