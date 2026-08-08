@@ -59,6 +59,15 @@ pub const Bridge = struct {
     handshake_discarded: bool = false,
     application_discarded: bool = false,
     handshake_complete: bool = false,
+    /// Set by `deinit` and never cleared. Teardown is terminal: a torn-down
+    /// bridge must not be able to acquire key material again, and the
+    /// per-epoch discard flags alone cannot express that. `deinit` resets
+    /// `handshake_complete` to false, which is the *only* gate the 0-RTT
+    /// install path had, so without this flag a torn-down bridge could
+    /// reinstall both 0-RTT directions and resume sealing and opening
+    /// records on that epoch (#493-B review). Starting a new session is
+    /// `Bridge.init`, which yields a fresh value with this cleared.
+    torn_down: bool = false,
 
     pub fn init(crypto_provider: provider.CryptoProvider, cipher_suite: algorithms.CipherSuite) Bridge {
         return .{ .crypto_provider = crypto_provider, .cipher_suite = cipher_suite };
@@ -80,6 +89,7 @@ pub const Bridge = struct {
         self.handshake_discarded = true;
         self.application_discarded = true;
         self.handshake_complete = false;
+        self.torn_down = true;
     }
 
     pub fn applyEvent(self: *Bridge, event: events.Event, out: []u8) Error!?[]const u8 {
@@ -109,6 +119,9 @@ pub const Bridge = struct {
         direction: events.SecretDirection,
         traffic_secret: []const u8,
     ) Error!void {
+        // Teardown is terminal for every epoch, including the ones whose
+        // ordinary gates `deinit` happens to leave open.
+        if (self.torn_down) return error.InvalidEpochTransition;
         switch (epoch) {
             .handshake => switch (direction) {
                 .read => {
@@ -1160,6 +1173,7 @@ const BridgeSnapshot = struct {
     handshake_discarded: bool,
     application_discarded: bool,
     handshake_complete: bool,
+    torn_down: bool,
 };
 
 fn bridgeSnapshot(bridge: *const Bridge) !BridgeSnapshot {
@@ -1177,6 +1191,7 @@ fn bridgeSnapshot(bridge: *const Bridge) !BridgeSnapshot {
         .handshake_discarded = bridge.handshake_discarded,
         .application_discarded = bridge.application_discarded,
         .handshake_complete = bridge.handshake_complete,
+        .torn_down = bridge.torn_down,
     };
     // The public key-presence predicates must agree with the private slots
     // they report on, at every point in the program.
@@ -1206,6 +1221,7 @@ fn expectSnapshotEqual(expected: BridgeSnapshot, actual: BridgeSnapshot) !void {
     try testing.expectEqual(expected.handshake_discarded, actual.handshake_discarded);
     try testing.expectEqual(expected.application_discarded, actual.application_discarded);
     try testing.expectEqual(expected.handshake_complete, actual.handshake_complete);
+    try testing.expectEqual(expected.torn_down, actual.torn_down);
 }
 
 /// A compact reference model of the epoch lifecycle, written directly from
@@ -1227,6 +1243,13 @@ const EpochModel = struct {
     handshake_discarded: bool = false,
     application_discarded: bool = false,
     handshake_complete: bool = false,
+    /// Stated here as an independent rule of the lifecycle -- "teardown is
+    /// terminal" -- rather than being re-derived from whichever gates the
+    /// `Bridge` happens to implement. Deriving it from the per-epoch discard
+    /// and completion flags is exactly how this model previously came to
+    /// bless the 0-RTT resurrection path that `deinit` left open (#493-B
+    /// review): the model agreed with the bug instead of detecting it.
+    torn_down: bool = false,
 
     fn snapshot(self: *const EpochModel) BridgeSnapshot {
         return .{
@@ -1243,6 +1266,7 @@ const EpochModel = struct {
             .handshake_discarded = self.handshake_discarded,
             .application_discarded = self.application_discarded,
             .handshake_complete = self.handshake_complete,
+            .torn_down = self.torn_down,
         };
     }
 
@@ -1271,6 +1295,10 @@ const EpochModel = struct {
         direction: events.SecretDirection,
         secret_len: usize,
     ) ?Error {
+        // Terminal teardown outranks every per-epoch rule below. Stated
+        // independently, so a bridge that reopens *any* epoch after `deinit`
+        // is a disagreement rather than a match.
+        if (self.torn_down) return error.InvalidEpochTransition;
         switch (epoch) {
             // The initial epoch is plaintext-only; it has no traffic secret.
             .initial => return error.UnsupportedRecordEpoch,
@@ -1391,6 +1419,7 @@ const EpochModel = struct {
         self.handshake_discarded = true;
         self.application_discarded = true;
         self.handshake_complete = false;
+        self.torn_down = true;
         // `deinit` deliberately does not rewind the direction phases: it is
         // teardown, not a transition back to a usable earlier state.
     }
@@ -1763,7 +1792,86 @@ test "the epoch lifecycle model agrees with a scripted full progression through 
     try expectSnapshotEqual(model.snapshot(), try bridgeSnapshot(&bridge));
 
     // Post-teardown operations stay terminal: nothing can revive the bridge.
+    // 0-RTT is checked in *both* directions specifically because it is the
+    // epoch whose ordinary gate (`handshake_complete`) `deinit` reopens, so
+    // it is the one that could actually come back (#493-B review). Keeping
+    // it here means mutation validation covers the oracle too: a model that
+    // regressed to mirroring the implementation's gates would stop
+    // predicting these rejections.
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .zero_rtt, .read, hash_len);
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .zero_rtt, .write, hash_len);
     try Step.install(&bridge, &model, &secret_buf, &scratch, .handshake, .read, hash_len);
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .application, .write, hash_len);
     try Step.discard(&bridge, &model, &scratch, .handshake);
     try Step.complete(&bridge, &model, &scratch);
+}
+
+test "record epoch bridge cannot reinstall zero-rtt keys after teardown" {
+    const cp = testProvider();
+    var bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    const early = secret(0x91);
+
+    // Teardown from a fresh bridge is the worst case for the 0-RTT gate:
+    // `deinit` clears `handshake_complete`, which was the only condition
+    // `installTrafficSecret(.zero_rtt, ...)` checked, so before the
+    // `torn_down` guard both directions could be reinstalled here and the
+    // epoch used to seal and open records again.
+    bridge.deinit();
+
+    try testing.expectError(
+        error.InvalidEpochTransition,
+        bridge.installTrafficSecret(.zero_rtt, .read, &early),
+    );
+    try testing.expectError(
+        error.InvalidEpochTransition,
+        bridge.installTrafficSecret(.zero_rtt, .write, &early),
+    );
+    try testing.expect(!bridge.hasReadKeys(.zero_rtt));
+    try testing.expect(!bridge.hasWriteKeys(.zero_rtt));
+
+    // With no key material obtainable, the epoch stays unusable rather than
+    // merely un-keyed.
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    try testing.expectError(
+        error.MissingWriteKeys,
+        bridge.sealProtected(.zero_rtt, .application_data, "resurrected", &protected),
+    );
+    try testing.expectError(error.MissingReadKeys, bridge.openProtected(.zero_rtt, .{
+        .content_type = .application_data,
+        .legacy_version = record_codec.legacy_record_version,
+        .payload = &[_]u8{0} ** 32,
+    }, &plaintext));
+
+    // The same guard covers every other epoch, at every stage of teardown.
+    const hs = secret(0x92);
+    try testing.expectError(
+        error.InvalidEpochTransition,
+        bridge.installTrafficSecret(.handshake, .read, &hs),
+    );
+    try testing.expectError(
+        error.InvalidEpochTransition,
+        bridge.installTrafficSecret(.application, .write, &hs),
+    );
+    // Teardown after a *completed* session is the other reachable shape.
+    var completed = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    const app = secret(0x93);
+    try completed.installTrafficSecret(.handshake, .read, &hs);
+    try completed.installTrafficSecret(.handshake, .write, &hs);
+    try completed.installTrafficSecret(.application, .read, &app);
+    try completed.installTrafficSecret(.application, .write, &app);
+    try completed.discardEpoch(.initial);
+    try completed.discardEpoch(.handshake);
+    try completed.markHandshakeComplete();
+    completed.deinit();
+    try testing.expectError(
+        error.InvalidEpochTransition,
+        completed.installTrafficSecret(.zero_rtt, .write, &early),
+    );
+
+    // `Bridge.init` is the way to start a new session, and it is unaffected.
+    var fresh = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer fresh.deinit();
+    try fresh.installTrafficSecret(.zero_rtt, .write, &early);
+    try testing.expect(fresh.hasWriteKeys(.zero_rtt));
 }

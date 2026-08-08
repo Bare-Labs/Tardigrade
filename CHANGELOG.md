@@ -83,8 +83,12 @@ All notable user-facing changes to Tardigrade are documented here.
   retained key after discard or teardown, or a read sequence consumed by a
   failed open all fail the property. Adds named deterministic companions
   pinning every seal/open rejection stage per suite, record-protection
-  teardown zeroization, and a scripted full epoch progression through
-  teardown.
+  teardown zeroization, a scripted full epoch progression through teardown,
+  and a post-teardown 0-RTT reinstall regression for the terminal-teardown
+  defect recorded under Fixed below. The model states "teardown is terminal"
+  as its own rule rather than re-deriving it from the bridge's per-epoch
+  flags, which is what turns that defect into a detected disagreement
+  instead of a match.
 
 ### Features
 - **QUIC negotiated TLS suite packet protection (#566)** — Handshake, 0-RTT,
@@ -748,6 +752,19 @@ All notable user-facing changes to Tardigrade are documented here.
   number space so Initial, Handshake, and Application ranges cannot merge.
 
 ### Fixed
+- **TLS record epoch bridge teardown is now terminal (#493-B)** — found by
+  review of the #493-B fuzz oracle. `Bridge.deinit()` wipes every key slot
+  and sets the initial/handshake/application discard flags, but it also
+  resets `handshake_complete` to false — and that flag was the *only*
+  condition `installTrafficSecret(.zero_rtt, ...)` checked. A torn-down
+  bridge could therefore have fresh 0-RTT read and write keys installed and
+  resume sealing and opening records on that epoch, so teardown was not
+  actually terminal for the one epoch whose gate `deinit` reopened. `Bridge`
+  now carries a `torn_down` flag that `deinit` sets and nothing clears, and
+  `installTrafficSecret` rejects every epoch and direction once it is set;
+  starting a new session remains `Bridge.init`, which yields a fresh value
+  with the flag clear. No production caller reused a bridge after `deinit`,
+  so this only closes the resurrection path.
 - **Checked-in side-channel, secret-lifetime, and observability audit for
   native TLS/QUIC/PKI (#375)** — adds `docs/CRYPTO_SECURITY_AUDIT.md` (the
   audit matrix) and `docs/SECURITY_REVIEW_CHECKLIST.md` (the reusable

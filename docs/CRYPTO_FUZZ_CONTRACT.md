@@ -717,18 +717,40 @@ issue's implementation-plan comment:
   opened a record under the wrong epoch's keys, or that consumed a read
   sequence number on a failed open, fails here.
 
+  Terminal teardown is stated in the model as its own rule (`torn_down`)
+  rather than being re-derived from the per-epoch discard and completion
+  flags. That distinction is load-bearing: review of this slice found the
+  model had reproduced a real `Bridge` defect instead of detecting it.
+  `deinit` resets `handshake_complete` to false, which was the *only* gate
+  `installTrafficSecret(.zero_rtt, ...)` checked, so a torn-down bridge could
+  reinstall both 0-RTT directions and resume sealing and opening records on
+  that epoch — and because the model derived the same rule from the same
+  flags, model and implementation compared equal all the way through the
+  resurrection. `Bridge` now carries a `torn_down` flag that `deinit` sets
+  and nothing clears (starting a new session is `Bridge.init`), the model
+  states the rule independently, and the snapshot compares the flag. The
+  general lesson for #493-C and later slices: a reference model that
+  paraphrases the implementation's own gate expressions can only find
+  inconsistencies, not policy violations — rules the contract requires
+  should be written from the contract.
+
   Following #493-A's standard, both targets have named deterministic
   companions for the classifications CI's seed replay cannot reliably reach:
   `seal classifies every rejection stage at its exact boundary for every
   suite`, `open classifies every rejection stage at its exact boundary and
   never advances read state`, `record protection teardown zeroizes keys,
   resets sequence, and marks state exhausted`, and `the epoch lifecycle
-  model agrees with a scripted full progression through teardown`. All four
-  were validated by mutation: dropping `discardEpoch(.application)`'s
-  `handshake_complete = false` and swapping `seal`'s `RecordBufferOverflow`
-  for `RecordTooLarge` each fail under plain `zig build test-tls`, while the
-  corpus replay alone caught neither (a coverage-guided run found the epoch
-  one in 16 runs).
+  model agrees with a scripted full progression through teardown`, plus
+  `record epoch bridge cannot reinstall zero-rtt keys after teardown` for
+  the defect above. All were validated by mutation: dropping
+  `discardEpoch(.application)`'s `handshake_complete = false`, swapping
+  `seal`'s `RecordBufferOverflow` for `RecordTooLarge`, and removing
+  `installTrafficSecret`'s `torn_down` guard each fail under plain
+  `zig build test-tls`, while the corpus replay alone caught none of them
+  (coverage-guided runs found the first in 16 runs and the teardown one in
+  17). Removing the *model's* independent `torn_down` rule while leaving the
+  production guard in place also fails the scripted companion, so the
+  oracle cannot silently regress back to mirroring the implementation.
 - **#493-C** (scripted in-memory carrier, encrypted-stream progression, docs
   closeout) is tracked as a follow-on slice of the same issue and will
   extend this section and the `-Dtls-record-test-filter` namespace when it
