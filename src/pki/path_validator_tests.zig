@@ -3141,6 +3141,14 @@ fn expectSameOptionalOid(expected: ?oid.ObjectIdentifier, actual: ?oid.ObjectIde
     }
 }
 
+fn expectSameOidSlice(expected: []const oid.ObjectIdentifier, actual: []const oid.ObjectIdentifier) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    // Both slices are documented as unique and lexicographically ordered, so
+    // position-wise comparison is the right equality here: a run that emitted
+    // the same set in a different order is still non-deterministic output.
+    for (expected, actual) |lhs, rhs| try testing.expect(lhs.eql(&rhs));
+}
+
 fn expectSameVerdict(first: validator.ValidationResult, second: validator.ValidationResult) !void {
     switch (first) {
         .accepted => |mine| switch (second) {
@@ -3151,6 +3159,14 @@ fn expectSameVerdict(first: validator.ValidationResult, second: validator.Valida
                     try testing.expectEqual(a.source, b.source);
                     try testing.expectEqual(a.input_index, b.input_index);
                 }
+                // The accepted *result* is the path plus its RFC 9618 policy
+                // output, so determinism has to cover the policy output too:
+                // two runs agreeing on the path but disagreeing on the
+                // constrained policy sets, or on the bounded graph accounting,
+                // would still be a non-deterministic result.
+                try expectSameOidSlice(mine.policies.authority_constrained, other.policies.authority_constrained);
+                try expectSameOidSlice(mine.policies.user_constrained, other.policies.user_constrained);
+                try testing.expectEqual(mine.policies.resource_usage, other.policies.resource_usage);
             },
             .rejected => return error.TestUnexpectedResult,
         },
@@ -3229,6 +3245,13 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
     for ([_]u8{ 0, 1 }) |path_len| {
         var fx = Fixtures.init(allocator);
         defer fx.deinit();
+        // Every non-anchor certificate asserts the same policy, so the
+        // accepted result carries a non-empty RFC 9618 constrained set. That
+        // is what makes the per-OID half of the replay comparison live under
+        // plain `zig build test`: against a chain with no policies extension
+        // both constrained slices are empty and only their lengths get
+        // compared.
+        const chain_policies: []const PolicySpec = &.{.{ .policy = &[_]u32{ 1, 3, 6, 1, 4, 1, 4242, 7 } }};
         try fx.add(.{
             .subject = "leaf",
             .issuer = "Intermediate 1",
@@ -3237,6 +3260,7 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
             .ca = false,
             .key_usage = 0x80,
             .eku = .server,
+            .certificate_policies = chain_policies,
         });
         try fx.add(.{
             .subject = "Intermediate 1",
@@ -3245,6 +3269,7 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
             .issuer_key = 4,
             .ca = true,
             .key_usage = 0x04,
+            .certificate_policies = chain_policies,
         });
         try fx.add(.{
             .subject = "Intermediate 2",
@@ -3254,6 +3279,7 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
             .ca = true,
             .path_len = path_len,
             .key_usage = 0x04,
+            .certificate_policies = chain_policies,
         });
         try fx.add(.{
             .subject = "Root",
@@ -3278,6 +3304,24 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
         } else {
             try expectAccepted(&result, 4);
         }
+
+        // Replaying a *known-good* chain here, rather than only the
+        // randomized one below, is what gives `expectSameVerdict`'s accepted
+        // branch — including the RFC 9618 policy output — deterministic
+        // coverage under plain `zig build test`. The randomized chain reaches
+        // an accepted verdict readily under `--fuzz`, but essentially never
+        // during seed-corpus replay, so without this the accepted arm would
+        // be exercised only in long coverage-guided runs.
+        var replay = try validateBuilt(
+            allocator,
+            &fx.certs.items[0],
+            fx.certs.items[1..3],
+            anchors,
+            policy(anchors),
+            cp,
+        );
+        defer replay.deinit(allocator);
+        try expectSameVerdict(result, replay);
     }
 
     // --- Randomized chain ---------------------------------------------------
@@ -3295,6 +3339,19 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
     // build an unparsable fixture rather than reach validation at all.
     const key_usages = [_]?u8{ null, 0x80, 0x20, 0x04, 0xa0, 0xff };
     const ekus = [_]Eku{ .absent, .server, .client, .any };
+    // Certificate policies drive the RFC 9618 graph, so varying them is what
+    // makes the accepted result's policy output (and the
+    // `certificate_policy_*` rejection reasons) non-trivial rather than an
+    // always-empty set.
+    const policy_sets = [_]?[]const PolicySpec{
+        null,
+        &.{.{ .policy = &[_]u32{ 2, 5, 29, 32, 0 } }},
+        &.{.{ .policy = &[_]u32{ 1, 3, 6, 1, 4, 1, 4242, 1 } }},
+        &.{
+            .{ .policy = &[_]u32{ 1, 3, 6, 1, 4, 1, 4242, 1 } },
+            .{ .policy = &[_]u32{ 1, 3, 6, 1, 4, 1, 4242, 2 } },
+        },
+    };
 
     // Zero, one, or *two* intermediates. Two is not decoration: with a single
     // intermediate at leaf-first index 1, `validatePath` counts CA
@@ -3335,6 +3392,7 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
         .key_usage = key_usages[smith.index(key_usages.len)],
         .eku = ekus[smith.index(ekus.len)],
         .san = if (smith.index(2) == 0) "leaf.example.com" else null,
+        .certificate_policies = policy_sets[smith.index(policy_sets.len)],
         // Both flags emit the same OID, so asking for both would build a
         // duplicate-extension fixture the parser rejects before validation
         // ever runs. Duplicate extensions are #492's X.509 target's job.
@@ -3363,6 +3421,7 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
                 .permitted = &.{.{ .dns = "example.com" }},
                 .critical = smith.index(2) == 0,
             } else null,
+            .certificate_policies = policy_sets[smith.index(policy_sets.len)],
             .unknown_critical = smith.index(8) == 0,
         });
     }
@@ -3382,6 +3441,7 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
             .path_len = if (second_ca == true and smith.index(2) == 0) @intCast(smith.index(3)) else null,
             .key_usage = key_usages[smith.index(key_usages.len)],
             .eku = ekus[smith.index(ekus.len)],
+            .certificate_policies = policy_sets[smith.index(policy_sets.len)],
         });
     }
     try fx.add(.{
