@@ -59,14 +59,23 @@ pub const Bridge = struct {
     handshake_discarded: bool = false,
     application_discarded: bool = false,
     handshake_complete: bool = false,
-    /// Set by `deinit` and never cleared. Teardown is terminal: a torn-down
-    /// bridge must not be able to acquire key material again, and the
-    /// per-epoch discard flags alone cannot express that. `deinit` resets
-    /// `handshake_complete` to false, which is the *only* gate the 0-RTT
-    /// install path had, so without this flag a torn-down bridge could
-    /// reinstall both 0-RTT directions and resume sealing and opening
-    /// records on that epoch (#493-B review). Starting a new session is
-    /// `Bridge.init`, which yields a fresh value with this cleared.
+    /// Set by every session-teardown path and never cleared. Teardown is
+    /// terminal: a torn-down bridge must not be able to acquire key material
+    /// again, and the per-epoch discard flags alone cannot express that.
+    ///
+    /// There are two teardown paths, and *both* reset `handshake_complete`
+    /// to false — which was the only gate the 0-RTT install path had. Without
+    /// this flag either one left a bridge able to reinstall both 0-RTT
+    /// directions and resume sealing and opening records on that epoch
+    /// (#493-B review):
+    ///
+    ///   * `deinit`, the unconditional wipe for an abandoned or failed
+    ///     handshake; and
+    ///   * `discardEpoch(.application)`, the *orderly* teardown of a
+    ///     completed session.
+    ///
+    /// Starting a new session is `Bridge.init`, which yields a fresh value
+    /// with this cleared.
     torn_down: bool = false,
 
     pub fn init(crypto_provider: provider.CryptoProvider, cipher_suite: algorithms.CipherSuite) Bridge {
@@ -195,6 +204,11 @@ pub const Bridge = struct {
                 self.read_phase = .initial;
                 self.write_phase = .initial;
                 self.handshake_complete = false;
+                // Orderly teardown is still teardown: clearing
+                // `handshake_complete` above would otherwise reopen the
+                // 0-RTT install gate, letting a finished session acquire
+                // fresh early-data keys and resume record traffic.
+                self.torn_down = true;
             },
             .zero_rtt => {
                 clearRead(&self.read_zero_rtt);
@@ -1243,12 +1257,15 @@ const EpochModel = struct {
     handshake_discarded: bool = false,
     application_discarded: bool = false,
     handshake_complete: bool = false,
-    /// Stated here as an independent rule of the lifecycle -- "teardown is
-    /// terminal" -- rather than being re-derived from whichever gates the
+    /// Stated here as an independent rule of the lifecycle -- "a session that
+    /// has been torn down, by either path, never acquires key material
+    /// again" -- rather than being re-derived from whichever gates the
     /// `Bridge` happens to implement. Deriving it from the per-epoch discard
-    /// and completion flags is exactly how this model previously came to
-    /// bless the 0-RTT resurrection path that `deinit` left open (#493-B
-    /// review): the model agreed with the bug instead of detecting it.
+    /// and completion flags is exactly how this model twice came to bless a
+    /// 0-RTT resurrection instead of detecting it (#493-B review): first for
+    /// `deinit`, then for orderly `discardEpoch(.application)`. Both reset
+    /// `handshake_complete`, which was the 0-RTT install path's only gate,
+    /// and a model that mirrors that expression agrees with the bug.
     torn_down: bool = false,
 
     fn snapshot(self: *const EpochModel) BridgeSnapshot {
@@ -1390,7 +1407,14 @@ const EpochModel = struct {
                 self.read_phase = .initial;
                 self.write_phase = .initial;
                 self.handshake_complete = false;
+                // Orderly session teardown, so the same terminal rule
+                // applies as for `deinit` -- stated here, not inherited from
+                // the flags this branch happens to reset.
+                self.torn_down = true;
             },
+            // 0-RTT discard is epoch-scoped, not session teardown: it is
+            // emitted whenever early data ends, including mid-handshake and
+            // when no early keys ever existed, so it must not be terminal.
             .zero_rtt => self.clearSlots(.zero_rtt),
         }
     }
@@ -1787,6 +1811,18 @@ test "the epoch lifecycle model agrees with a scripted full progression through 
     // Orderly application discard, then teardown after a completed session.
     try Step.discard(&bridge, &model, &scratch, .application);
     try Step.discard(&bridge, &model, &scratch, .application);
+
+    // The window *between* orderly application discard and `deinit`: that
+    // discard is session teardown too, and it resets `handshake_complete`,
+    // so it is the second place the 0-RTT install gate could reopen
+    // (#493-B review). Exercised here, before any `deinit`, so removing
+    // either the production or the model's terminal rule for this branch is
+    // mutation-detectable independently of the `deinit` path below.
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .zero_rtt, .read, hash_len);
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .zero_rtt, .write, hash_len);
+    try testing.expect(!bridge.hasReadKeys(.zero_rtt));
+    try testing.expect(!bridge.hasWriteKeys(.zero_rtt));
+
     bridge.deinit();
     model.applyTeardown();
     try expectSnapshotEqual(model.snapshot(), try bridgeSnapshot(&bridge));
@@ -1804,6 +1840,68 @@ test "the epoch lifecycle model agrees with a scripted full progression through 
     try Step.install(&bridge, &model, &secret_buf, &scratch, .application, .write, hash_len);
     try Step.discard(&bridge, &model, &scratch, .handshake);
     try Step.complete(&bridge, &model, &scratch);
+}
+
+test "record epoch bridge cannot reinstall zero-rtt keys after orderly application discard" {
+    const cp = testProvider();
+    var bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer bridge.deinit();
+
+    const hs = secret(0xa1);
+    const app = secret(0xa2);
+    const early = secret(0xa3);
+
+    try bridge.installTrafficSecret(.handshake, .read, &hs);
+    try bridge.installTrafficSecret(.handshake, .write, &hs);
+    try bridge.installTrafficSecret(.application, .read, &app);
+    try bridge.installTrafficSecret(.application, .write, &app);
+    try bridge.discardEpoch(.initial);
+    try bridge.discardEpoch(.handshake);
+    try bridge.markHandshakeComplete();
+
+    // Orderly teardown of a completed session -- `discardEpoch`'s own
+    // documentation calls this session teardown. It resets
+    // `handshake_complete`, which was the 0-RTT install path's only gate, so
+    // before the terminal rule covered this branch a finished session could
+    // acquire fresh early-data keys here and resume record traffic. This is
+    // the window *before* any `deinit` call.
+    try bridge.discardEpoch(.application);
+
+    try testing.expectError(
+        error.InvalidEpochTransition,
+        bridge.installTrafficSecret(.zero_rtt, .read, &early),
+    );
+    try testing.expectError(
+        error.InvalidEpochTransition,
+        bridge.installTrafficSecret(.zero_rtt, .write, &early),
+    );
+    try testing.expect(!bridge.hasReadKeys(.zero_rtt));
+    try testing.expect(!bridge.hasWriteKeys(.zero_rtt));
+
+    // No key material is obtainable, so the epoch stays unusable rather than
+    // merely un-keyed -- and so do the epochs whose own keys this discard
+    // wiped.
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    try testing.expectError(
+        error.MissingWriteKeys,
+        bridge.sealProtected(.zero_rtt, .application_data, "post-teardown", &protected),
+    );
+    try testing.expectError(
+        error.HandshakeNotComplete,
+        bridge.sealApplicationData("post-teardown", &protected),
+    );
+    try testing.expectError(
+        error.InvalidEpochTransition,
+        bridge.installTrafficSecret(.handshake, .read, &hs),
+    );
+    try testing.expectError(
+        error.InvalidEpochTransition,
+        bridge.installTrafficSecret(.application, .write, &app),
+    );
+
+    // A 0-RTT *discard* stays legal and non-terminal by contract, so it must
+    // not have been swept up by the terminal rule.
+    try bridge.discardEpoch(.zero_rtt);
 }
 
 test "record epoch bridge cannot reinstall zero-rtt keys after teardown" {

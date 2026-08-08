@@ -84,11 +84,11 @@ All notable user-facing changes to Tardigrade are documented here.
   failed open all fail the property. Adds named deterministic companions
   pinning every seal/open rejection stage per suite, record-protection
   teardown zeroization, a scripted full epoch progression through teardown,
-  and a post-teardown 0-RTT reinstall regression for the terminal-teardown
-  defect recorded under Fixed below. The model states "teardown is terminal"
-  as its own rule rather than re-deriving it from the bridge's per-epoch
-  flags, which is what turns that defect into a detected disagreement
-  instead of a match.
+  and a 0-RTT reinstall regression for each of the two teardown paths behind
+  the terminal-teardown defect recorded under Fixed below. The model states
+  "a torn-down session never acquires key material again" as its own rule
+  rather than re-deriving it from the bridge's per-epoch flags, which is
+  what turns those defects into detected disagreements instead of matches.
 
 ### Features
 - **QUIC negotiated TLS suite packet protection (#566)** — Handshake, 0-RTT,
@@ -753,18 +753,23 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ### Fixed
 - **TLS record epoch bridge teardown is now terminal (#493-B)** — found by
-  review of the #493-B fuzz oracle. `Bridge.deinit()` wipes every key slot
-  and sets the initial/handshake/application discard flags, but it also
-  resets `handshake_complete` to false — and that flag was the *only*
-  condition `installTrafficSecret(.zero_rtt, ...)` checked. A torn-down
-  bridge could therefore have fresh 0-RTT read and write keys installed and
-  resume sealing and opening records on that epoch, so teardown was not
-  actually terminal for the one epoch whose gate `deinit` reopened. `Bridge`
-  now carries a `torn_down` flag that `deinit` sets and nothing clears, and
-  `installTrafficSecret` rejects every epoch and direction once it is set;
-  starting a new session remains `Bridge.init`, which yields a fresh value
-  with the flag clear. No production caller reused a bridge after `deinit`,
-  so this only closes the resurrection path.
+  review of the #493-B fuzz oracle. The record contract has two session
+  teardown paths, and both reset `handshake_complete` to false — which was
+  the *only* condition `installTrafficSecret(.zero_rtt, ...)` checked. After
+  either one, a bridge could have fresh 0-RTT read and write keys installed
+  and resume sealing and opening records on that epoch:
+  - `Bridge.deinit()`, the unconditional wipe for an abandoned or failed
+    handshake; and
+  - `discardEpoch(.application)`, the *orderly* teardown of a completed
+    session, which that function's own documentation calls session teardown.
+
+  `Bridge` now carries a `torn_down` flag that both paths set and nothing
+  clears, and `installTrafficSecret` rejects every epoch and direction once
+  it is set; starting a new session remains `Bridge.init`, which yields a
+  fresh value with the flag clear. 0-RTT discard is deliberately unaffected:
+  it is epoch-scoped rather than session teardown, emitted whenever early
+  data ends including mid-handshake. No production caller reused a bridge
+  after either teardown path, so this only closes the resurrection paths.
 - **Checked-in side-channel, secret-lifetime, and observability audit for
   native TLS/QUIC/PKI (#375)** — adds `docs/CRYPTO_SECURITY_AUDIT.md` (the
   audit matrix) and `docs/SECURITY_REVIEW_CHECKLIST.md` (the reusable
