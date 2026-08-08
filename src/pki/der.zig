@@ -255,9 +255,15 @@ pub const Reader = struct {
         return self.childReader(elem.content_offset, elem.content.len);
     }
 
+    /// `content_offset`/`content_len` are caller-supplied, not necessarily
+    /// values this reader produced, so their sum is computed with a checked
+    /// add: a pair that overflows machine width is out of bounds by
+    /// definition and must be rejected, never wrapped into a bounded reader
+    /// that appears to be inside the input.
     pub fn childReader(self: *Reader, content_offset: usize, content_len: usize) Error!Reader {
         if (self.depth >= self.limits.max_depth) return self.fail(error.NestingLimit, content_offset);
-        const end = content_offset + content_len;
+        const end = std.math.add(usize, content_offset, content_len) catch
+            return self.fail(error.LengthBeyondInput, content_offset);
         if (content_offset < self.start or end > self.end) return self.fail(error.LengthBeyondInput, content_offset);
         const shared_count = self.shared_element_count orelse &self.element_count;
         return Reader.initBounded(self.input, content_offset, end, self.depth + 1, self.currentElementCount(), shared_count, self.limits);

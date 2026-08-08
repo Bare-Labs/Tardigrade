@@ -614,6 +614,81 @@ fn fuzzDerCursorSafety(_: void, smith: *testing.Smith) !void {
             try testing.expectError(error.TrailingData, consume_reader.expectEnd());
         }
     } else |_| {}
+
+    try expectChildReaderRejectsSyntheticOffsets(input, limits, smith);
+}
+
+/// `childReader` is a public entry point whose offset/length pair does *not*
+/// have to come from a successful `readElement`, so wire-derived values alone
+/// can never reach the machine-width boundaries the issue's
+/// "integer/offset overflow-adjacent cases" asks for: a DER length is capped
+/// by `max_element_len` long before it approaches `maxInt(usize)`. These
+/// offsets are therefore synthesized directly, per the shared contract's rule
+/// that a target supplies synthetic caller limits when wire input cannot
+/// reach them.
+fn expectChildReaderRejectsSyntheticOffsets(input: []const u8, limits: der.Limits, smith: *testing.Smith) !void {
+    const max = std.math.maxInt(usize);
+    const offsets = [_]usize{ 0, 1, input.len, max, max - 1, max / 2 + 1 };
+    const lengths = [_]usize{ 0, 1, 2, input.len, max, max - 1, max / 2 + 1 };
+
+    // A generous depth budget, so `NestingLimit` cannot mask the bounds check
+    // this is actually probing.
+    var reader = der.Reader.init(input, .{
+        .max_depth = 32,
+        .max_element_len = limits.max_element_len,
+        .max_elements = limits.max_elements,
+    });
+    for (offsets) |content_offset| {
+        for (lengths) |content_len| {
+            // The sum must be evaluated without wrapping — that is the whole
+            // point — so the oracle computes it in a wider type.
+            const wide_end = @as(u128, content_offset) + @as(u128, content_len);
+            const in_bounds = content_offset >= reader.start and wide_end <= input.len;
+            if (reader.childReader(content_offset, content_len)) |child| {
+                try testing.expect(in_bounds);
+                try testing.expectEqual(content_offset, child.start);
+                try testing.expectEqual(content_offset, child.offset);
+                try testing.expectEqual(content_offset + content_len, child.end);
+                // A child that claims to be inside the input really is.
+                try testing.expect(child.end <= input.len);
+                try testing.expect(child.remaining() == content_len);
+            } else |err| {
+                try testing.expect(!in_bounds);
+                try testing.expectEqual(error.LengthBeyondInput, err);
+            }
+        }
+    }
+
+    // Mutation-driven variant: arbitrary offset/length pairs, including ones
+    // straddling the wrap boundary, must never panic or produce a reader that
+    // escapes the input.
+    for (0..8) |_| {
+        const content_offset = max - smith.index(4) * (max / 3);
+        const content_len = max - smith.index(4) * (max / 3);
+        if (reader.childReader(content_offset, content_len)) |child| {
+            try testing.expect(child.end <= input.len);
+        } else |err| {
+            try testing.expectEqual(error.LengthBeyondInput, err);
+        }
+    }
+}
+
+test "childReader rejects an offset and length whose sum overflows machine width" {
+    // Found 2026-08-08 while wiring #492's synthetic overflow-adjacent DER
+    // oracle: `childReader` computed `content_offset + content_len` unchecked,
+    // which panicked in checked builds and wrapped into an apparently
+    // in-bounds bounded reader under `-Doptimize=ReleaseFast`.
+    var reader = der.Reader.init(&[_]u8{ 0x30, 0x00 }, der.default_limits);
+    const max = std.math.maxInt(usize);
+    try testing.expectError(error.LengthBeyondInput, reader.childReader(max, 2));
+    try testing.expectError(error.LengthBeyondInput, reader.childReader(2, max));
+    try testing.expectError(error.LengthBeyondInput, reader.childReader(max, max));
+    try testing.expectError(error.LengthBeyondInput, reader.childReader(max / 2 + 1, max / 2 + 1));
+    // The in-bounds neighbours of those cases still work, so the new check
+    // cannot have been implemented by rejecting everything.
+    const child = try reader.childReader(2, 0);
+    try testing.expectEqual(@as(usize, 2), child.start);
+    try testing.expectEqual(@as(usize, 2), child.end);
 }
 
 /// Innermost NULL wrapped in `depth` SEQUENCEs, written back-to-front into

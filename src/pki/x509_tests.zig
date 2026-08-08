@@ -1161,14 +1161,18 @@ fn expectViewContained(raw: []const u8, view: []const u8) !void {
     try testing.expect(view_start - raw_start + view.len <= raw.len);
 }
 
-fn expectGeneralNameContained(raw: []const u8, name: x509.GeneralName, mode: enum { host, cidr }) !void {
+/// Which GeneralName IP encoding the surrounding extension mandates: a bare
+/// address in SAN/AIA/CRLDP, address-plus-mask inside Name Constraints.
+const IpForm = enum { host, cidr };
+
+fn expectGeneralNameContained(raw: []const u8, name: x509.GeneralName, form: IpForm) !void {
     switch (name) {
         .rfc822_name, .dns_name, .directory_name, .uniform_resource_identifier => |value| {
             try expectViewContained(raw, value);
         },
         .ip_address => |value| {
             try expectViewContained(raw, value);
-            switch (mode) {
+            switch (form) {
                 .host => try testing.expect(value.len == 4 or value.len == 16),
                 .cidr => try testing.expect(value.len == 8 or value.len == 32),
             }
@@ -1176,6 +1180,302 @@ fn expectGeneralNameContained(raw: []const u8, name: x509.GeneralName, mode: enu
         // A decoded OID is a fixed-size value, never a borrow.
         .registered_id => |value| try testing.expect(value.components().len <= oid.max_components),
         .other => |value| try expectViewContained(raw, value.raw),
+    }
+}
+
+fn expectGeneralNamesContained(raw: []const u8, names: []const x509.GeneralName, form: IpForm) !void {
+    for (names) |name| try expectGeneralNameContained(raw, name, form);
+}
+
+fn expectAlgorithmContained(raw: []const u8, algorithm: x509.AlgorithmIdentifier) !void {
+    try expectViewContained(raw, algorithm.raw);
+    if (algorithm.parameters_raw) |parameters| try expectViewContained(raw, parameters);
+}
+
+fn expectNameContained(raw: []const u8, name: x509.Name) !void {
+    try expectViewContained(raw, name.raw);
+    for (name.rdns) |rdn| {
+        for (rdn.attributes) |attribute| try expectViewContained(raw, attribute.value);
+    }
+    // `chaining_key`/`rdn_chaining_keys` are deliberately *not* containment
+    // checked: they are arena-owned RFC 4518 canonical forms the parser
+    // computes, not borrows of the input, so demanding containment would
+    // assert the opposite of their documented ownership.
+    try testing.expectEqual(name.rdns.len, name.rdn_chaining_keys.len);
+}
+
+fn expectSpkiContained(raw: []const u8, spki: x509.SubjectPublicKeyInfo) !void {
+    try expectViewContained(raw, spki.raw);
+    try expectAlgorithmContained(raw, spki.algorithm);
+    try expectViewContained(raw, spki.subject_public_key.data);
+}
+
+fn expectParsedExtensionContained(raw: []const u8, parsed: x509.Extension.Parsed) !void {
+    switch (parsed) {
+        .subject_alt_name => |names| try expectGeneralNamesContained(raw, names, .host),
+        .subject_key_identifier => |value| try expectViewContained(raw, value),
+        .authority_key_identifier => |value| {
+            if (value.key_identifier) |identifier| try expectViewContained(raw, identifier);
+            if (value.authority_cert_issuer_raw) |issuer| try expectViewContained(raw, issuer);
+            if (value.authority_cert_serial) |serial| try expectViewContained(raw, serial);
+        },
+        .name_constraints => |value| {
+            for (value.permitted) |subtree| try expectGeneralNameContained(raw, subtree.base, .cidr);
+            for (value.excluded) |subtree| try expectGeneralNameContained(raw, subtree.base, .cidr);
+        },
+        .authority_info_access => |descriptions| {
+            for (descriptions) |description| try expectGeneralNameContained(raw, description.location, .host);
+        },
+        .crl_distribution_points => |points| {
+            for (points) |point| {
+                try expectViewContained(raw, point.raw);
+                try expectGeneralNamesContained(raw, point.full_names, .host);
+            }
+        },
+        .certificate_policies => |policies| {
+            for (policies) |policy| {
+                for (policy.qualifiers) |qualifier| try expectViewContained(raw, qualifier.value_raw);
+            }
+        },
+        // Value-only payloads: no borrowed slice to escape.
+        .basic_constraints,
+        .key_usage,
+        .extended_key_usage,
+        .policy_mappings,
+        .policy_constraints,
+        .inhibit_any_policy,
+        .unrecognized,
+        => {},
+    }
+}
+
+/// Walks *every* borrowed slice the parsed model exposes and proves it points
+/// into the caller's DER. A parser regression that pointed any field at
+/// temporary or recycled parser storage has to fail here, which is the #492
+/// borrowed-slice-escape criterion.
+fn expectBorrowsOnlyFromInput(certificate: *const x509.Certificate) !void {
+    const raw = certificate.raw;
+    try expectViewContained(raw, certificate.tbs_raw);
+    try expectViewContained(raw, certificate.serial_number.content);
+    try expectAlgorithmContained(raw, certificate.signature_algorithm);
+    try expectNameContained(raw, certificate.issuer);
+    try expectNameContained(raw, certificate.subject);
+    try expectSpkiContained(raw, certificate.subject_public_key_info);
+    if (certificate.issuer_unique_id) |unique_id| try expectViewContained(raw, unique_id.data);
+    if (certificate.subject_unique_id) |unique_id| try expectViewContained(raw, unique_id.data);
+    try expectViewContained(raw, certificate.signature_value.data);
+    for (certificate.extensions) |extension| {
+        try expectViewContained(raw, extension.value);
+        try expectParsedExtensionContained(raw, extension.parsed);
+    }
+}
+
+// --- Full-model equality, for the "identical bytes, identical model" oracle -
+
+fn expectSameOptionalSlice(expected: ?[]const u8, actual: ?[]const u8) !void {
+    if (expected) |lhs| {
+        const rhs = actual orelse return error.TestUnexpectedResult;
+        try testing.expectEqualSlices(u8, lhs, rhs);
+    } else {
+        try testing.expect(actual == null);
+    }
+}
+
+fn expectSameOid(expected: oid.ObjectIdentifier, actual: oid.ObjectIdentifier) !void {
+    try testing.expectEqualSlices(u32, expected.components(), actual.components());
+}
+
+fn expectSameOptionalOid(expected: ?oid.ObjectIdentifier, actual: ?oid.ObjectIdentifier) !void {
+    if (expected) |lhs| {
+        const rhs = actual orelse return error.TestUnexpectedResult;
+        try expectSameOid(lhs, rhs);
+    } else {
+        try testing.expect(actual == null);
+    }
+}
+
+fn expectSameAlgorithm(expected: x509.AlgorithmIdentifier, actual: x509.AlgorithmIdentifier) !void {
+    try testing.expectEqualSlices(u8, expected.raw, actual.raw);
+    try expectSameOid(expected.oid, actual.oid);
+    try expectSameOptionalSlice(expected.parameters_raw, actual.parameters_raw);
+    try testing.expectEqual(expected.parameters_null, actual.parameters_null);
+}
+
+fn expectSameName(expected: x509.Name, actual: x509.Name) !void {
+    try testing.expectEqualSlices(u8, expected.raw, actual.raw);
+    try testing.expectEqualSlices(u8, expected.chaining_key, actual.chaining_key);
+    try testing.expectEqual(expected.rdns.len, actual.rdns.len);
+    try testing.expectEqual(expected.rdn_chaining_keys.len, actual.rdn_chaining_keys.len);
+    for (expected.rdn_chaining_keys, actual.rdn_chaining_keys) |lhs, rhs| {
+        try testing.expectEqualSlices(u8, lhs, rhs);
+    }
+    for (expected.rdns, actual.rdns) |lhs, rhs| {
+        try testing.expectEqual(lhs.attributes.len, rhs.attributes.len);
+        for (lhs.attributes, rhs.attributes) |left, right| {
+            try expectSameOid(left.type, right.type);
+            try testing.expect(left.value_tag.eql(right.value_tag));
+            try testing.expectEqualSlices(u8, left.value, right.value);
+        }
+    }
+}
+
+fn expectSameGeneralName(expected: x509.GeneralName, actual: x509.GeneralName) !void {
+    const Tag = std.meta.Tag(x509.GeneralName);
+    try testing.expectEqual(@as(Tag, expected), @as(Tag, actual));
+    switch (expected) {
+        .rfc822_name => try testing.expectEqualSlices(u8, expected.rfc822_name, actual.rfc822_name),
+        .dns_name => try testing.expectEqualSlices(u8, expected.dns_name, actual.dns_name),
+        .directory_name => try testing.expectEqualSlices(u8, expected.directory_name, actual.directory_name),
+        .uniform_resource_identifier => try testing.expectEqualSlices(
+            u8,
+            expected.uniform_resource_identifier,
+            actual.uniform_resource_identifier,
+        ),
+        .ip_address => try testing.expectEqualSlices(u8, expected.ip_address, actual.ip_address),
+        .registered_id => try expectSameOid(expected.registered_id, actual.registered_id),
+        .other => {
+            try testing.expectEqual(expected.other.tag_number, actual.other.tag_number);
+            try testing.expectEqualSlices(u8, expected.other.raw, actual.other.raw);
+        },
+    }
+}
+
+fn expectSameGeneralNames(expected: []const x509.GeneralName, actual: []const x509.GeneralName) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |lhs, rhs| try expectSameGeneralName(lhs, rhs);
+}
+
+fn expectSameParsedExtension(expected: x509.Extension.Parsed, actual: x509.Extension.Parsed) !void {
+    const Tag = std.meta.Tag(x509.Extension.Parsed);
+    try testing.expectEqual(@as(Tag, expected), @as(Tag, actual));
+    switch (expected) {
+        .basic_constraints => try testing.expectEqual(expected.basic_constraints, actual.basic_constraints),
+        .key_usage => try testing.expectEqual(expected.key_usage, actual.key_usage),
+        .subject_alt_name => try expectSameGeneralNames(expected.subject_alt_name, actual.subject_alt_name),
+        .extended_key_usage => {
+            try testing.expectEqual(expected.extended_key_usage.purposes.len, actual.extended_key_usage.purposes.len);
+            for (expected.extended_key_usage.purposes, actual.extended_key_usage.purposes) |lhs, rhs| {
+                try expectSameOid(lhs, rhs);
+            }
+        },
+        .subject_key_identifier => try testing.expectEqualSlices(
+            u8,
+            expected.subject_key_identifier,
+            actual.subject_key_identifier,
+        ),
+        .authority_key_identifier => {
+            try expectSameOptionalSlice(
+                expected.authority_key_identifier.key_identifier,
+                actual.authority_key_identifier.key_identifier,
+            );
+            try expectSameOptionalSlice(
+                expected.authority_key_identifier.authority_cert_issuer_raw,
+                actual.authority_key_identifier.authority_cert_issuer_raw,
+            );
+            try expectSameOptionalSlice(
+                expected.authority_key_identifier.authority_cert_serial,
+                actual.authority_key_identifier.authority_cert_serial,
+            );
+        },
+        .name_constraints => {
+            try testing.expectEqual(expected.name_constraints.permitted.len, actual.name_constraints.permitted.len);
+            try testing.expectEqual(expected.name_constraints.excluded.len, actual.name_constraints.excluded.len);
+            for (expected.name_constraints.permitted, actual.name_constraints.permitted) |lhs, rhs| {
+                try expectSameGeneralName(lhs.base, rhs.base);
+            }
+            for (expected.name_constraints.excluded, actual.name_constraints.excluded) |lhs, rhs| {
+                try expectSameGeneralName(lhs.base, rhs.base);
+            }
+        },
+        .authority_info_access => {
+            try testing.expectEqual(expected.authority_info_access.len, actual.authority_info_access.len);
+            for (expected.authority_info_access, actual.authority_info_access) |lhs, rhs| {
+                try expectSameOid(lhs.method, rhs.method);
+                try expectSameGeneralName(lhs.location, rhs.location);
+            }
+        },
+        .crl_distribution_points => {
+            try testing.expectEqual(expected.crl_distribution_points.len, actual.crl_distribution_points.len);
+            for (expected.crl_distribution_points, actual.crl_distribution_points) |lhs, rhs| {
+                try testing.expectEqualSlices(u8, lhs.raw, rhs.raw);
+                try expectSameGeneralNames(lhs.full_names, rhs.full_names);
+            }
+        },
+        .certificate_policies => {
+            try testing.expectEqual(expected.certificate_policies.len, actual.certificate_policies.len);
+            for (expected.certificate_policies, actual.certificate_policies) |lhs, rhs| {
+                try expectSameOid(lhs.policy, rhs.policy);
+                try testing.expectEqual(lhs.qualifiers.len, rhs.qualifiers.len);
+                for (lhs.qualifiers, rhs.qualifiers) |left, right| {
+                    try expectSameOid(left.oid, right.oid);
+                    try testing.expectEqualSlices(u8, left.value_raw, right.value_raw);
+                    try testing.expectEqual(left.kind, right.kind);
+                }
+            }
+        },
+        .policy_mappings => {
+            try testing.expectEqual(expected.policy_mappings.len, actual.policy_mappings.len);
+            for (expected.policy_mappings, actual.policy_mappings) |lhs, rhs| {
+                try expectSameOid(lhs.issuer_domain_policy, rhs.issuer_domain_policy);
+                try expectSameOid(lhs.subject_domain_policy, rhs.subject_domain_policy);
+            }
+        },
+        .policy_constraints => try testing.expectEqual(expected.policy_constraints, actual.policy_constraints),
+        .inhibit_any_policy => try testing.expectEqual(expected.inhibit_any_policy, actual.inhibit_any_policy),
+        .unrecognized => {},
+    }
+}
+
+fn expectSameBitString(expected: der.BitStringView, actual: der.BitStringView) !void {
+    try testing.expectEqual(expected.unused_bits, actual.unused_bits);
+    try testing.expectEqualSlices(u8, expected.data, actual.data);
+}
+
+fn expectSameOptionalBitString(expected: ?der.BitStringView, actual: ?der.BitStringView) !void {
+    if (expected) |lhs| {
+        const rhs = actual orelse return error.TestUnexpectedResult;
+        try expectSameBitString(lhs, rhs);
+    } else {
+        try testing.expect(actual == null);
+    }
+}
+
+/// Compares the complete public semantic model, not just its structural tags,
+/// so two parses of the same bytes cannot disagree on any decoded field or
+/// parsed extension payload while still passing the determinism oracle.
+fn expectSameCertificateModel(expected: *const x509.Certificate, actual: *const x509.Certificate) !void {
+    try testing.expectEqualSlices(u8, expected.raw, actual.raw);
+    try testing.expectEqualSlices(u8, expected.tbs_raw, actual.tbs_raw);
+    try testing.expectEqual(expected.version, actual.version);
+    try testing.expectEqualSlices(u8, expected.serial_number.content, actual.serial_number.content);
+    try expectSameAlgorithm(expected.signature_algorithm, actual.signature_algorithm);
+    try testing.expectEqual(expected.signatureAlgorithm(), actual.signatureAlgorithm());
+    try expectSameName(expected.issuer, actual.issuer);
+    try expectSameName(expected.subject, actual.subject);
+    try testing.expectEqual(expected.validity, actual.validity);
+    try testing.expectEqualSlices(u8, expected.subject_public_key_info.raw, actual.subject_public_key_info.raw);
+    try expectSameAlgorithm(expected.subject_public_key_info.algorithm, actual.subject_public_key_info.algorithm);
+    try expectSameBitString(
+        expected.subject_public_key_info.subject_public_key,
+        actual.subject_public_key_info.subject_public_key,
+    );
+    try testing.expectEqual(expected.subject_public_key_info.key_type, actual.subject_public_key_info.key_type);
+    try expectSameOptionalOid(
+        expected.subject_public_key_info.named_curve,
+        actual.subject_public_key_info.named_curve,
+    );
+    try expectSameOptionalBitString(expected.issuer_unique_id, actual.issuer_unique_id);
+    try expectSameOptionalBitString(expected.subject_unique_id, actual.subject_unique_id);
+    try expectSameBitString(expected.signature_value, actual.signature_value);
+    try testing.expectEqual(expected.isSelfIssued(), actual.isSelfIssued());
+    try testing.expectEqual(expected.hasUnhandledCriticalExtension(), actual.hasUnhandledCriticalExtension());
+
+    try testing.expectEqual(expected.extensions.len, actual.extensions.len);
+    for (expected.extensions, actual.extensions) |lhs, rhs| {
+        try expectSameOid(lhs.oid, rhs.oid);
+        try testing.expectEqual(lhs.critical, rhs.critical);
+        try testing.expectEqualSlices(u8, lhs.value, rhs.value);
+        try expectSameParsedExtension(lhs.parsed, rhs.parsed);
     }
 }
 
@@ -1373,24 +1673,24 @@ fn fuzzX509Semantics(_: void, smith: *testing.Smith) !void {
 
         try testing.expectEqual(input.ptr, certificate.raw.ptr);
         try testing.expectEqual(input.len, certificate.raw.len);
-        try expectViewContained(certificate.raw, certificate.tbs_raw);
-        try expectViewContained(certificate.raw, certificate.serial_number.content);
-        try expectViewContained(certificate.raw, certificate.signature_algorithm.raw);
-        try expectViewContained(certificate.raw, certificate.subject_public_key_info.raw);
-        try expectViewContained(certificate.raw, certificate.signature_value.data);
-        try expectViewContained(certificate.raw, certificate.issuer.raw);
-        try expectViewContained(certificate.raw, certificate.subject.raw);
+        // Every borrowed slice anywhere in the model, not a hand-picked
+        // subset, must point into the caller's DER.
+        try expectBorrowsOnlyFromInput(&certificate);
         try der.validateInteger(certificate.serial_number.content, fuzz_x509_limits.der.max_integer_bytes);
         try testing.expect(certificate.issuer.rdns.len <= fuzz_x509_limits.max_name_rdns);
         try testing.expect(certificate.subject.rdns.len <= fuzz_x509_limits.max_name_rdns);
-        try testing.expectEqual(certificate.issuer.rdns.len, certificate.issuer.rdn_chaining_keys.len);
+        for (certificate.issuer.rdns) |rdn| {
+            try testing.expect(rdn.attributes.len <= fuzz_x509_limits.max_name_attributes);
+        }
+        for (certificate.subject.rdns) |rdn| {
+            try testing.expect(rdn.attributes.len <= fuzz_x509_limits.max_name_attributes);
+        }
         try testing.expect(certificate.isSelfIssued() == certificate.issuer.eqlForChaining(&certificate.subject));
 
         try testing.expect(certificate.extensions.len <= fuzz_x509_limits.max_extensions);
-        // A duplicate OID must have been rejected, never merged.
         var unhandled_critical = false;
         for (certificate.extensions, 0..) |extension, index| {
-            try expectViewContained(certificate.raw, extension.value);
+            // A duplicate OID must have been rejected, never merged.
             for (certificate.extensions[0..index]) |earlier| {
                 try testing.expect(!earlier.oid.eql(&extension.oid));
             }
@@ -1399,49 +1699,45 @@ fn fuzzX509Semantics(_: void, smith: *testing.Smith) !void {
             // derived from — no accessor may synthesize or drop an extension.
             switch (extension.parsed) {
                 .basic_constraints => |value| {
-                    try testing.expectEqual(value.is_ca, certificate.basicConstraints().?.is_ca);
-                    try testing.expectEqual(value.max_path_len, certificate.basicConstraints().?.max_path_len);
+                    try testing.expectEqual(value, certificate.basicConstraints().?);
                 },
                 .key_usage => |value| try testing.expectEqual(value, certificate.keyUsage().?),
                 .subject_alt_name => |names| {
                     try testing.expect(names.len <= fuzz_x509_limits.max_general_names);
-                    try testing.expectEqual(names.len, certificate.subjectAltName().?.len);
-                    for (names) |name| try expectGeneralNameContained(certificate.raw, name, .host);
+                    try expectSameGeneralNames(names, certificate.subjectAltName().?);
                 },
                 .extended_key_usage => |value| {
                     try testing.expect(value.purposes.len <= fuzz_x509_limits.max_eku_purposes);
                     try testing.expectEqual(value.purposes.len, certificate.extendedKeyUsage().?.purposes.len);
                 },
                 .subject_key_identifier => |value| {
-                    try expectViewContained(certificate.raw, value);
                     try testing.expectEqualSlices(u8, value, certificate.subjectKeyIdentifier().?);
                 },
                 .authority_key_identifier => |value| {
-                    if (value.key_identifier) |identifier| try expectViewContained(certificate.raw, identifier);
-                    if (value.authority_cert_issuer_raw) |issuer| try expectViewContained(certificate.raw, issuer);
-                    if (value.authority_cert_serial) |serial| try expectViewContained(certificate.raw, serial);
+                    try expectSameOptionalSlice(value.key_identifier, certificate.authorityKeyIdentifier().?.key_identifier);
                 },
                 .name_constraints => |value| {
                     try testing.expect(value.permitted.len <= fuzz_x509_limits.max_name_constraint_subtrees);
                     try testing.expect(value.excluded.len <= fuzz_x509_limits.max_name_constraint_subtrees);
-                    for (value.permitted) |subtree| try expectGeneralNameContained(certificate.raw, subtree.base, .cidr);
-                    for (value.excluded) |subtree| try expectGeneralNameContained(certificate.raw, subtree.base, .cidr);
+                    try testing.expectEqual(value.permitted.len, certificate.nameConstraints().?.permitted.len);
+                    try testing.expectEqual(value.excluded.len, certificate.nameConstraints().?.excluded.len);
                 },
                 .certificate_policies => |value| {
                     try testing.expect(value.len <= fuzz_x509_limits.max_policies);
+                    try testing.expectEqual(value.len, certificate.certificatePolicies().?.len);
                     for (value) |policy| {
                         try testing.expect(policy.qualifiers.len <= fuzz_x509_limits.max_policy_qualifiers);
-                        for (policy.qualifiers) |qualifier| try expectViewContained(certificate.raw, qualifier.value_raw);
                     }
                 },
-                .policy_mappings => |value| try testing.expect(value.len <= fuzz_x509_limits.max_policy_mappings),
-                .authority_info_access => |value| try testing.expect(value.len <= fuzz_x509_limits.max_access_descriptions),
-                .crl_distribution_points => |value| {
-                    try testing.expect(value.len <= fuzz_x509_limits.max_distribution_points);
-                    for (value) |point| try expectViewContained(certificate.raw, point.raw);
+                .policy_mappings => |value| {
+                    try testing.expect(value.len <= fuzz_x509_limits.max_policy_mappings);
+                    try testing.expectEqual(value.len, certificate.policyMappings().?.len);
                 },
+                .policy_constraints => |value| try testing.expectEqual(value, certificate.policyConstraints().?),
+                .authority_info_access => |value| try testing.expect(value.len <= fuzz_x509_limits.max_access_descriptions),
+                .crl_distribution_points => |value| try testing.expect(value.len <= fuzz_x509_limits.max_distribution_points),
                 .inhibit_any_policy => |value| try testing.expectEqual(value, certificate.inhibitAnyPolicy().?),
-                .policy_constraints, .unrecognized => {},
+                .unrecognized => {},
             }
         }
         try testing.expectEqual(unhandled_critical, certificate.hasUnhandledCriticalExtension());
@@ -1450,19 +1746,12 @@ fn fuzzX509Semantics(_: void, smith: *testing.Smith) !void {
         // unmutated case has an oracle here.
         try testing.expect(!duplicated or mutation_count > 0);
 
-        // Identical bytes must produce an identical model.
+        // Identical bytes must produce an identical model — compared across
+        // the whole public model, including every parsed extension payload,
+        // not just its structural tags.
         var replay = try x509.Certificate.parse(allocator, input, fuzz_x509_limits);
         defer replay.deinit(allocator);
-        try testing.expectEqual(certificate.version, replay.version);
-        try testing.expectEqual(certificate.extensions.len, replay.extensions.len);
-        try testing.expectEqualSlices(u8, certificate.tbs_raw, replay.tbs_raw);
-        try testing.expectEqualSlices(u8, certificate.issuer.chaining_key, replay.issuer.chaining_key);
-        try testing.expectEqualSlices(u8, certificate.subject.chaining_key, replay.subject.chaining_key);
-        for (certificate.extensions, replay.extensions) |mine, other| {
-            try testing.expect(mine.oid.eql(&other.oid));
-            try testing.expectEqual(mine.critical, other.critical);
-            try testing.expectEqual(@as(std.meta.Tag(x509.Extension.Parsed), mine.parsed), @as(std.meta.Tag(x509.Extension.Parsed), other.parsed));
-        }
+        try expectSameCertificateModel(&certificate, &replay);
     } else |err| switch (err) {
         error.MalformedCertificate,
         error.UnsupportedVersion,

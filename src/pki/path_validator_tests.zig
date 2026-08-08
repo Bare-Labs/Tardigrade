@@ -3132,6 +3132,15 @@ fn expectAcceptedPathWellFormed(
     try testing.expect(matched);
 }
 
+fn expectSameOptionalOid(expected: ?oid.ObjectIdentifier, actual: ?oid.ObjectIdentifier) !void {
+    if (expected) |lhs| {
+        const rhs = actual orelse return error.TestUnexpectedResult;
+        try testing.expect(lhs.eql(&rhs));
+    } else {
+        try testing.expect(actual == null);
+    }
+}
+
 fn expectSameVerdict(first: validator.ValidationResult, second: validator.ValidationResult) !void {
     switch (first) {
         .accepted => |mine| switch (second) {
@@ -3148,6 +3157,10 @@ fn expectSameVerdict(first: validator.ValidationResult, second: validator.Valida
         .rejected => |mine| switch (second) {
             .accepted => return error.TestUnexpectedResult,
             .rejected => |other| {
+                // Every field of the failure value participates: the #492
+                // criterion is deterministic *failure output*, so a run that
+                // agreed on the reason but disagreed on which OID it named
+                // would still be non-deterministic output.
                 try testing.expectEqual(mine.reason, other.reason);
                 try testing.expectEqual(mine.certificate_index, other.certificate_index);
                 try testing.expectEqual(mine.constraint_certificate_index, other.constraint_certificate_index);
@@ -3155,6 +3168,8 @@ fn expectSameVerdict(first: validator.ValidationResult, second: validator.Valida
                 try testing.expectEqual(mine.name_form, other.name_form);
                 try testing.expectEqual(mine.policy_stage, other.policy_stage);
                 try testing.expectEqual(mine.policy_graph_depth, other.policy_graph_depth);
+                try expectSameOptionalOid(mine.extension_oid, other.extension_oid);
+                try expectSameOptionalOid(mine.policy_oid, other.policy_oid);
             },
         },
     }
@@ -3204,6 +3219,67 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
         }
     }
 
+    // --- Deterministic pathLenConstraint oracle -----------------------------
+    // A `leaf -> I1 -> I2 -> root` chain where everything except I2's
+    // pathLenConstraint is known-good. I2 sits at leaf-first index 2, so the
+    // validator counts one non-self-issued CA below it (I1): a constraint of
+    // 0 must be exceeded, and the otherwise-identical constraint of 1 must
+    // accept. This is the shape the randomized generator above can produce
+    // but cannot pin exactly.
+    for ([_]u8{ 0, 1 }) |path_len| {
+        var fx = Fixtures.init(allocator);
+        defer fx.deinit();
+        try fx.add(.{
+            .subject = "leaf",
+            .issuer = "Intermediate 1",
+            .subject_key = 1,
+            .issuer_key = 2,
+            .ca = false,
+            .key_usage = 0x80,
+            .eku = .server,
+        });
+        try fx.add(.{
+            .subject = "Intermediate 1",
+            .issuer = "Intermediate 2",
+            .subject_key = 2,
+            .issuer_key = 4,
+            .ca = true,
+            .key_usage = 0x04,
+        });
+        try fx.add(.{
+            .subject = "Intermediate 2",
+            .issuer = "Root",
+            .subject_key = 4,
+            .issuer_key = 3,
+            .ca = true,
+            .path_len = path_len,
+            .key_usage = 0x04,
+        });
+        try fx.add(.{
+            .subject = "Root",
+            .issuer = "Root",
+            .subject_key = 3,
+            .issuer_key = 3,
+            .ca = true,
+            .key_usage = 0x04,
+        });
+        const anchors = fx.certs.items[3..4];
+        var result = try validateBuilt(
+            allocator,
+            &fx.certs.items[0],
+            fx.certs.items[1..3],
+            anchors,
+            policy(anchors),
+            cp,
+        );
+        defer result.deinit(allocator);
+        if (path_len == 0) {
+            try expectRejected(&result, .path_length_exceeded, 2);
+        } else {
+            try expectAccepted(&result, 4);
+        }
+    }
+
     // --- Randomized chain ---------------------------------------------------
     var fx = Fixtures.init(allocator);
     defer fx.deinit();
@@ -3220,7 +3296,14 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
     const key_usages = [_]?u8{ null, 0x80, 0x20, 0x04, 0xa0, 0xff };
     const ekus = [_]Eku{ .absent, .server, .client, .any };
 
-    const use_intermediate = smith.index(4) != 0;
+    // Zero, one, or *two* intermediates. Two is not decoration: with a single
+    // intermediate at leaf-first index 1, `validatePath` counts CA
+    // certificates in the empty slice `path.elements[1..1]`, so a
+    // pathLenConstraint on it can never be exceeded and RFC 5280 path-length
+    // enforcement is unreachable. The anchor's own constraint does not help
+    // either, since trust-anchor extensions are deliberately not validation
+    // inputs. Only a `leaf -> I1 -> I2 -> root` shape reaches the rule.
+    const intermediate_count = smith.index(3);
     const leaf_window = windows[smith.index(windows.len)];
     const intermediate_window = windows[smith.index(windows.len)];
     const root_window = windows[smith.index(windows.len)];
@@ -3230,11 +3313,22 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
     const leaf_unknown = smith.index(6);
     const intermediate_ca: ?bool = if (smith.index(6) == 0) null else smith.index(6) != 0;
 
+    // Subject names and signing keys per shape, leaf-first. `nearest` is the
+    // leaf's issuer; the intermediates chain up to "Root".
+    const nearest_name: []const u8 = switch (intermediate_count) {
+        0 => "Root",
+        else => "Intermediate 1",
+    };
+    const nearest_key: u8 = switch (intermediate_count) {
+        0 => 3,
+        else => 2,
+    };
+
     try fx.add(.{
         .subject = "leaf",
-        .issuer = if (use_intermediate) "Intermediate" else "Root",
+        .issuer = nearest_name,
         .subject_key = 1,
-        .issuer_key = if (forged_leaf) 9 else if (use_intermediate) 2 else 3,
+        .issuer_key = if (forged_leaf) 9 else nearest_key,
         .not_before = leaf_window[0],
         .not_after = leaf_window[1],
         .ca = if (smith.index(4) == 0) null else smith.index(4) == 0,
@@ -3247,12 +3341,14 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
         .unknown_critical = leaf_unknown == 1,
         .unknown_noncritical = leaf_unknown == 2,
     });
-    if (use_intermediate) {
+    if (intermediate_count >= 1) {
+        const issuer_name: []const u8 = if (intermediate_count == 2) "Intermediate 2" else "Root";
+        const issuer_key: u8 = if (intermediate_count == 2) 4 else 3;
         try fx.add(.{
-            .subject = "Intermediate",
-            .issuer = "Root",
+            .subject = "Intermediate 1",
+            .issuer = issuer_name,
             .subject_key = 2,
-            .issuer_key = if (forged_intermediate) 9 else 3,
+            .issuer_key = if (forged_intermediate) 9 else issuer_key,
             .not_before = intermediate_window[0],
             .not_after = intermediate_window[1],
             .ca = intermediate_ca,
@@ -3270,6 +3366,24 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
             .unknown_critical = smith.index(8) == 0,
         });
     }
+    if (intermediate_count == 2) {
+        // The certificate whose pathLenConstraint the validator can actually
+        // exceed: at leaf-first index 2 it counts the non-self-issued CAs
+        // below it, which is exactly "Intermediate 1".
+        const second_ca: ?bool = if (smith.index(8) == 0) null else smith.index(8) != 0;
+        try fx.add(.{
+            .subject = "Intermediate 2",
+            .issuer = "Root",
+            .subject_key = 4,
+            .issuer_key = 3,
+            .not_before = intermediate_window[0],
+            .not_after = intermediate_window[1],
+            .ca = second_ca,
+            .path_len = if (second_ca == true and smith.index(2) == 0) @intCast(smith.index(3)) else null,
+            .key_usage = key_usages[smith.index(key_usages.len)],
+            .eku = ekus[smith.index(ekus.len)],
+        });
+    }
     try fx.add(.{
         .subject = "Root",
         .issuer = "Root",
@@ -3284,7 +3398,7 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
 
     const certs = fx.certs.items;
     const leaf = &certs[0];
-    const intermediates = if (use_intermediate) certs[1..2] else certs[0..0];
+    const intermediates = certs[1 .. 1 + intermediate_count];
     const anchors = certs[certs.len - 1 ..];
 
     const validation_policy: validator.ValidationPolicy = .{
@@ -3312,7 +3426,7 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
             try expectAcceptedPathWellFormed(accepted.accepted_path, candidates, validation_policy);
             // A path is never accepted on a forged signature.
             try testing.expect(!forged_leaf);
-            try testing.expect(!(use_intermediate and forged_intermediate));
+            try testing.expect(!(intermediate_count >= 1 and forged_intermediate));
         },
         .rejected => |failure| {
             if (failure.certificate_index) |index| {
@@ -3339,8 +3453,13 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
     // Allocation failure at every reachable point: the verdict degrades to a
     // structured rejection and every byte allocated on the failing path is
     // released, so no partially owned accepted path escapes.
+    // Runs until the first attempt whose fail index is past the last
+    // allocation the validator makes, so the sweep provably covers *every*
+    // reachable allocation point rather than stopping at an arbitrary cap.
+    // The generated path and policy dimensions are already bounded, so this
+    // terminates.
     var fail_index: usize = 0;
-    while (fail_index < 32) : (fail_index += 1) {
+    while (true) : (fail_index += 1) {
         var failing = testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
         var attempt = validator.validateCandidates(failing.allocator(), candidates, validation_policy, cp);
         attempt.deinit(failing.allocator());
