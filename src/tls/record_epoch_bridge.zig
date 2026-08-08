@@ -209,7 +209,7 @@ pub const Bridge = struct {
         return switch (epoch) {
             .initial => blk: {
                 if (self.initial_discarded) return error.UnsupportedRecordEpoch;
-                const needed = plaintextHandshakeRecordLen(bytes.len);
+                const needed = try plaintextHandshakeRecordLen(bytes.len);
                 if (out.len < needed) return error.RecordBufferOverflow;
                 var in_pos: usize = 0;
                 var out_pos: usize = 0;
@@ -243,20 +243,20 @@ pub const Bridge = struct {
             .initial => if (self.initial_discarded)
                 error.UnsupportedRecordEpoch
             else
-                plaintextHandshakeRecordLen(bytes_len),
+                try plaintextHandshakeRecordLen(bytes_len),
             .handshake => blk: {
                 const write = self.writeHandshake() orelse return error.MissingWriteKeys;
-                break :blk protectedHandshakeRecordLen(write, bytes_len);
+                break :blk try protectedHandshakeRecordLen(write, bytes_len);
             },
             .application => blk: {
                 if (!self.handshake_complete) return error.HandshakeNotComplete;
                 const write = self.writeApplication() orelse return error.MissingWriteKeys;
-                break :blk protectedHandshakeRecordLen(write, bytes_len);
+                break :blk try protectedHandshakeRecordLen(write, bytes_len);
             },
             .zero_rtt => blk: {
                 if (self.handshake_complete) return error.UnsupportedRecordEpoch;
                 const write = self.writeZeroRtt() orelse return error.MissingWriteKeys;
-                break :blk protectedHandshakeRecordLen(write, bytes_len);
+                break :blk try protectedHandshakeRecordLen(write, bytes_len);
             },
         };
     }
@@ -424,14 +424,33 @@ fn clearWrite(slot: *?record_protection.WriteState) void {
     slot.* = null;
 }
 
-fn plaintextHandshakeRecordLen(bytes_len: usize) usize {
-    const chunks = (bytes_len + record_codec.max_plaintext_fragment_len - 1) / record_codec.max_plaintext_fragment_len;
-    return bytes_len + chunks * record_codec.header_len;
+/// Number of `max_plaintext_fragment_len`-sized chunks `bytes_len` splits
+/// into (0 for an empty input). Uses `std.math.divCeil`'s
+/// `@divFloor(numerator - 1, denominator) + 1` form rather than the
+/// `(bytes_len + chunk_size - 1) / chunk_size` idiom, so a synthetic
+/// near-`usize`-max `bytes_len` -- impossible to represent with a real
+/// allocation, but exactly the "arithmetic/offset overflow-adjacent
+/// synthetic limits" #493 requires coverage for -- never overflows this
+/// step's own `+ chunk_size - 1` addition; the `Error!` return still exists
+/// because callers (`plaintextHandshakeRecordLen`/
+/// `protectedHandshakeRecordLen`) add `bytes_len` back on top of the chunk
+/// overhead, and that addition can overflow even though this one can't.
+fn chunkCount(bytes_len: usize) Error!usize {
+    if (bytes_len == 0) return 0;
+    return std.math.divCeil(usize, bytes_len, record_codec.max_plaintext_fragment_len) catch error.RecordTooLarge;
 }
 
-fn protectedHandshakeRecordLen(write: *const record_protection.WriteState, bytes_len: usize) usize {
-    const chunks = (bytes_len + record_codec.max_plaintext_fragment_len - 1) / record_codec.max_plaintext_fragment_len;
-    return bytes_len + chunks * (record_codec.header_len + 1 + write.keys.profile.aead.tagLength());
+fn plaintextHandshakeRecordLen(bytes_len: usize) Error!usize {
+    const chunks = try chunkCount(bytes_len);
+    const overhead = std.math.mul(usize, chunks, record_codec.header_len) catch return error.RecordTooLarge;
+    return std.math.add(usize, bytes_len, overhead) catch error.RecordTooLarge;
+}
+
+fn protectedHandshakeRecordLen(write: *const record_protection.WriteState, bytes_len: usize) Error!usize {
+    const chunks = try chunkCount(bytes_len);
+    const per_chunk_overhead = record_codec.header_len + 1 + write.keys.profile.aead.tagLength();
+    const overhead = std.math.mul(usize, chunks, per_chunk_overhead) catch return error.RecordTooLarge;
+    return std.math.add(usize, bytes_len, overhead) catch error.RecordTooLarge;
 }
 
 fn sealHandshakeFragments(
@@ -440,9 +459,9 @@ fn sealHandshakeFragments(
     out: []u8,
 ) Error![]const u8 {
     if (write.exhausted) return error.SequenceExhausted;
-    const chunks = (bytes.len + record_codec.max_plaintext_fragment_len - 1) / record_codec.max_plaintext_fragment_len;
+    const chunks = try chunkCount(bytes.len);
     if (chunks > 0 and chunks - 1 > std.math.maxInt(u64) - write.sequence) return error.SequenceExhausted;
-    const needed = protectedHandshakeRecordLen(write, bytes.len);
+    const needed = try protectedHandshakeRecordLen(write, bytes.len);
     if (out.len < needed) return error.RecordBufferOverflow;
 
     var in_pos: usize = 0;
@@ -491,6 +510,34 @@ fn expectAes128TrafficKeys(traffic_secret: [32]u8, keys: record_protection.Traff
 }
 
 const testing = std.testing;
+
+test "chunkCount stays overflow-safe at a synthetic near-usize-max bytes_len" {
+    try testing.expectEqual(@as(usize, 0), try chunkCount(0));
+    try testing.expectEqual(@as(usize, 1), try chunkCount(1));
+    try testing.expectEqual(@as(usize, 1), try chunkCount(record_codec.max_plaintext_fragment_len));
+    try testing.expectEqual(@as(usize, 2), try chunkCount(record_codec.max_plaintext_fragment_len + 1));
+    // `divCeil`'s `@divFloor(numerator - 1, denominator) + 1` form (unlike
+    // the naive `(numerator + denominator - 1) / denominator` idiom this
+    // replaced) cannot itself overflow for a positive numerator/denominator,
+    // so a synthetic near-`usize`-max `bytes_len` still succeeds here with a
+    // huge-but-exact chunk count; the overflow this hardening actually
+    // guards against surfaces one step later, in
+    // `plaintextHandshakeRecordLen`/`protectedHandshakeRecordLen`'s
+    // `bytes_len + chunks * overhead` addition (see the next test).
+    try testing.expectEqual(
+        try std.math.divCeil(usize, std.math.maxInt(usize), record_codec.max_plaintext_fragment_len),
+        try chunkCount(std.math.maxInt(usize)),
+    );
+}
+
+test "plaintextHandshakeRecordLen rejects synthetic overflow-adjacent bytes_len" {
+    try testing.expectEqual(@as(usize, 0), try plaintextHandshakeRecordLen(0));
+    try testing.expectEqual(
+        record_codec.max_plaintext_fragment_len + record_codec.header_len,
+        try plaintextHandshakeRecordLen(record_codec.max_plaintext_fragment_len),
+    );
+    try testing.expectError(error.RecordTooLarge, plaintextHandshakeRecordLen(std.math.maxInt(usize)));
+}
 
 test "record epoch bridge drives event loopback across plaintext, handshake, application, and post-handshake records" {
     const cp = testProvider();
@@ -604,6 +651,33 @@ test "record epoch bridge fragments large post-handshake messages into multiple 
     }
     try testing.expectEqual(payload.len, offset);
     try testing.expectEqualSlices(u8, &payload, &reassembled);
+}
+
+test "sealedHandshakeLen rejects a synthetic overflow-adjacent bytes_len at every installed epoch" {
+    const cp = testProvider();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+
+    const hs = secret(0x73);
+    const app = secret(0x74);
+    try server.installTrafficSecret(.handshake, .write, &hs);
+    try testing.expectError(error.RecordTooLarge, server.sealedHandshakeLen(.handshake, std.math.maxInt(usize)));
+
+    try server.installTrafficSecret(.handshake, .read, &hs);
+    try server.installTrafficSecret(.application, .read, &app);
+    try server.installTrafficSecret(.application, .write, &app);
+    try server.discardEpoch(.initial);
+    try server.discardEpoch(.handshake);
+    try server.markHandshakeComplete();
+    try testing.expectError(error.RecordTooLarge, server.sealedHandshakeLen(.application, std.math.maxInt(usize)));
+
+    // A small, real length still computes correctly alongside the rejected
+    // synthetic one, proving the checked helpers didn't just start
+    // rejecting everything.
+    try testing.expectEqual(
+        @as(usize, 4 + record_codec.header_len + 1 + 16),
+        try server.sealedHandshakeLen(.application, 4),
+    );
 }
 
 test "record epoch bridge rejects early, duplicate, missing, and unsupported transitions" {

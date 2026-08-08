@@ -159,8 +159,16 @@ pub const QueueCounters = struct {
     }
 };
 
-fn handshakeRecordCount(bytes_len: usize) usize {
-    return (bytes_len + record_codec.max_plaintext_fragment_len - 1) / record_codec.max_plaintext_fragment_len;
+/// Uses `std.math.divCeil`'s `@divFloor(numerator - 1, denominator) + 1`
+/// form rather than the `(bytes_len + chunk_size - 1) / chunk_size` idiom,
+/// so a synthetic near-`usize`-max `bytes_len` -- the #493 "overflow-
+/// adjacent synthetic limits" case -- never overflows this addition, unlike
+/// the naive form; mirrors `record_epoch_bridge.zig`'s `chunkCount`. The
+/// `Error!` return exists for parity with that helper's signature, not
+/// because this one can itself overflow.
+fn handshakeRecordCount(bytes_len: usize) record_codec.Error!usize {
+    if (bytes_len == 0) return 0;
+    return std.math.divCeil(usize, bytes_len, record_codec.max_plaintext_fragment_len) catch error.RecordTooLarge;
 }
 
 pub const BufferCounters = struct {
@@ -2251,10 +2259,20 @@ test "TLS buffer defaults validate and expose bounded snapshot" {
     try testing.expectEqual(AccountingBoundary.complete_stream_owned, snapshot.accounting_boundary);
 }
 
+test "handshakeRecordCount stays overflow-safe at a synthetic near-usize-max bytes_len" {
+    try testing.expectEqual(@as(usize, 0), try handshakeRecordCount(0));
+    try testing.expectEqual(@as(usize, 1), try handshakeRecordCount(record_codec.max_plaintext_fragment_len));
+    try testing.expectEqual(@as(usize, 2), try handshakeRecordCount(record_codec.max_plaintext_fragment_len + 1));
+    try testing.expectEqual(
+        try std.math.divCeil(usize, std.math.maxInt(usize), record_codec.max_plaintext_fragment_len),
+        try handshakeRecordCount(std.math.maxInt(usize)),
+    );
+}
+
 test "record stream maximum emitted ticket fits four-record ciphertext queue" {
     try std.testing.expectEqual(4 * record_codec.max_ciphertext_record_len, PureZigRecordStream.max_ciphertext_queue);
     const bytes_len = tls13_transport.max_emitted_new_session_ticket_message_len;
-    const records = handshakeRecordCount(bytes_len);
+    const records = try handshakeRecordCount(bytes_len);
     const protected_len = bytes_len + records * (record_codec.header_len + 1 + 16);
     try std.testing.expect(protected_len <= PureZigRecordStream.max_ciphertext_queue);
 }

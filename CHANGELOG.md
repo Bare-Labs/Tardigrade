@@ -23,6 +23,35 @@ All notable user-facing changes to Tardigrade are documented here.
   `std.testing.FailingAllocator`). Wired into `zig build test` via the new
   `test-crypto-provider-fuzz` step and a `-Dcrypto-test-filter` build option
   for targeted longer coverage-guided runs.
+- **TLS record codec and inner-plaintext fuzz targets (#493-A, epic
+  #325-K)** — adds two `std.testing.Smith` fuzz targets in
+  `src/tls/record_codec.zig` following the `docs/CRYPTO_FUZZ_CONTRACT.md`
+  contract: `codec fragmentation, coalescing, and sink saturation preserve
+  exact consumption` drives fuzzer-generated valid record streams through
+  `Parser.feedOne` using fuzzer-chosen offered fragment sizes (so partial
+  headers/bodies stay buffered across call boundaries), covers the
+  legal/illegal initial-ClientHello `0x0301` compatibility window as part of
+  the generated case, drives record-size boundaries up to the exact
+  plaintext/ciphertext maxima plus a declared maximum-plus-one, and asserts
+  exact per-record byte consumption, correct saturation/`drainReady`/`finish`
+  backpressure semantics, and that arbitrary malformed bytes never panic;
+  `inner plaintext framing, padding, and bounds remain transactional` fuzzes
+  `encodeInnerPlaintext`/`decodeInnerPlaintext` round trips and raw-byte
+  decoding against independent oracles over content/padding/output-capacity
+  boundary matrices, asserting the exact expected typed error (computed
+  before each call) and transactional output on every rejection. Also adds
+  named deterministic companions pinning every `encodeInnerPlaintext`
+  rejection stage and every `feedOne` header/payload split point, for the
+  arms a seed-corpus replay cannot reliably reach. Also converts
+  record-length-only arithmetic
+  reachable from fuzzer-chosen scalar lengths (`record_codec.Parser`'s
+  pending-bytes-needed helpers, `record_epoch_bridge.zig`'s handshake
+  chunk/record-length helpers, `encrypted_stream.zig`'s
+  `handshakeRecordCount`) to checked `std.math`-based arithmetic instead of
+  idioms that could wrap on a synthetic near-`usize`-max input. Wired into
+  `zig build test`/`zig build test-tls` (already run deterministically) via
+  the new `test-tls-record-fuzz` step and `-Dtls-record-test-filter` build
+  option for targeted longer coverage-guided runs.
 
 ### Features
 - **QUIC negotiated TLS suite packet protection (#566)** — Handshake, 0-RTT,

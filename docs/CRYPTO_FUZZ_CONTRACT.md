@@ -44,6 +44,9 @@ zig build test-crypto-provider-fuzz --summary all --error-style verbose
 # Shared TLS protocol-engine targets owned by #491:
 zig build test-tls-protocol-fuzz --summary all --error-style verbose
 
+# Record/protection/epoch/encrypted-stream targets owned by #493:
+zig build test-tls-record-fuzz --summary all --error-style verbose
+
 # Longer local/scheduled coverage-guided runs:
 zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
 zig build test-crypto-provider-fuzz -Doptimize=ReleaseFast -Dcrypto-test-filter="fuzz: AEAD open" --fuzz=10M --summary all --error-style verbose
@@ -498,3 +501,143 @@ lease oracles, per-op invariant checks, bounded operation-scoped
 zeroization/destruction probes for entries and public lease boxes.
 Backend/runtime composition follows in #494-D per the issue's PR
 decomposition.
+
+### #493 — TLS record / protection / epoch / encrypted-stream state (epic #325-K)
+
+Like #494's targets, #493's are inline `test "fuzz: ..."` blocks inside the
+production modules themselves (`src/tls/record_codec.zig`,
+`src/tls/record_protection.zig`, `src/tls/record_epoch_bridge.zig`,
+`src/tls/encrypted_stream.zig`) rather than a separate `tests/*.zig` root,
+so they already replay their deterministic seed corpus under plain
+`zig build test-tls` / `zig build test`. The `test-tls-record-fuzz` step
+gives them a stable, individually filterable/long-runnable name, matching
+`-Dtls-resumption-test-filter`/`-Dtls-protocol-test-filter` above:
+
+```bash
+# Deterministic smoke coverage for every #493 fuzz target landed so far
+# (seed corpus replay only, "fuzz: TLS record:" namespace) — also covered
+# by plain `zig build test-tls` / `zig build test`.
+zig build test-tls-record-fuzz --summary all --error-style verbose
+
+# Longer local/scheduled coverage-guided runs, one target at a time:
+zig build test-tls-record-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
+zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: codec fragmentation, coalescing, and sink saturation preserve exact consumption" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: inner plaintext framing, padding, and bounds remain transactional" --fuzz=10M --summary all --error-style verbose
+```
+
+`-Dtls-record-test-filter` defaults to `"fuzz: TLS record:"` (every #493
+target; scoped narrower than a bare `"fuzz: "` prefix for the same reason
+as `-Dtls-resumption-test-filter` above). This story is being delivered in
+three PRs to keep agent context and review scope manageable, per the
+issue's implementation-plan comment:
+
+- **#493-A** (this slice) — build wiring (`test-tls-record-fuzz`,
+  `-Dtls-record-test-filter`) and the two `record_codec.zig` targets.
+
+  `codec fragmentation, coalescing, and sink saturation preserve exact
+  consumption` generates a bounded oracle stream of valid records and drives
+  it through `Parser.feedOne` against a single-record-capacity `RecordSink`,
+  offering a **fuzzer-chosen prefix** of the remaining bytes on each call so
+  a partial header or body stays buffered across the invocation boundary and
+  must resume exactly on a later call (caller-visible fragmentation, not just
+  `feedOne`'s internal byte loop); `emitted == false` is a normal outcome and
+  must absorb the whole offered fragment. The parser's version policy is part
+  of the generated case: when the initial-ClientHello compatibility window is
+  selected, the stream becomes the fragments of one real `clientHelloMessage`
+  (all handshake-content-type, so RFC 8446 SS5.1's no-interleaving rule
+  holds) with each fragment's declared legacy version independently drawn
+  from `{0x0303, 0x0301}` — every such fragment is inside the window and so
+  must be accepted regardless of the mix, after which a further `0x0301`
+  record on the same parser must be refused. The illegal placements are
+  asserted against fresh compat-policy parsers: a non-ClientHello
+  `msg_type`, a non-handshake content type, and ciphertext mode must each
+  yield `InvalidRecordVersion`. A bounded single-record subcase drives the
+  record-size boundaries (`0`, `1`, exact-maximum-minus-one, exact maximum,
+  for both the plaintext and ciphertext limits) through the valid
+  encode/parse/oracle path, and a header that merely *declares*
+  maximum-plus-one is refused with `RecordTooLarge` without that payload ever
+  existing. The target also asserts an undrained/saturated sink yields
+  `consumed == 0` with parser and stale-sink state untouched, that
+  `drainReady` publishes an already-buffered complete record without new
+  input, that `finish()` only accepts a fully-drained parser, a per-case
+  iteration bound (no spin on repeated non-progress), and that arbitrary
+  bytes into a fresh parser never panic or exceed the fixed pending-buffer
+  bound.
+
+  `inner plaintext framing, padding, and bounds remain transactional`
+  classifies the expected outcome of every `encodeInnerPlaintext` call
+  **before** making it (`expectedInnerPlaintextEncode`, mirroring the
+  documented rejection order: illegal content type, oversized content,
+  overflow/oversized total, output capacity) and asserts that exact typed
+  error rather than accepting any rejection, with the destination sentinel
+  re-verified after each one. Content length, padding length, and output
+  capacity each come from a boundary matrix — content around
+  `max_plaintext_fragment_len`, total around `max_ciphertext_fragment_len`
+  (padding carries the bulk, so exact-max and max-plus-one totals need no
+  oversized content buffer), and capacity at exact-minus-one/exact/
+  exact-plus-one — and `change_cipher_spec` is generated periodically and
+  must always be `InvalidRecordType`. Raw-byte decoding is checked against an
+  independent last-nonzero-byte oracle over a length matrix that reaches the
+  exact ciphertext-fragment maximum and one past it, asserting borrowed-slice
+  containment on every accepted decode. Both targets also drive a synthetic
+  near-`usize`-max length (an overflow-adjacent case no real allocation could
+  represent) against the checked scalar arithmetic helpers below.
+
+  Because the deterministic `.corpus` replay that plain `zig build test`/CI
+  runs is not guaranteed to reach every arm of these classifications, the
+  error-class and split-point properties additionally have named
+  deterministic tests next to them —
+  `encodeInnerPlaintext classifies every rejection stage at its exact
+  boundary` and `feedOne preserves exact consumption across every header and
+  payload split point`. The former was validated by mutation: swapping
+  `encodeInnerPlaintext`'s `out.len < total` error to `RecordTooLarge` makes
+  it fail under plain `zig build test-tls`, whereas the corpus replay alone
+  did not catch that regression (a coverage-guided run found it in ~15
+  runs). Treat that as the standard for future #493 slices: a property worth
+  fuzzing that CI's seed replay cannot reliably reach also needs a named
+  deterministic case.
+- Per the issue's "harden synthetic length arithmetic" requirement, this
+  slice also converts the record-length-only calculations reachable from
+  fuzzer-chosen scalar lengths to checked arithmetic returning a typed
+  `RecordTooLarge` rather than wrapping: `record_codec.Parser`'s
+  `checkedOwnedLen`/`checkedRecordLen` (backing
+  `pendingRecordBytesNeededWith`/`pendingRecordPayloadLenWith`),
+  `record_epoch_bridge.zig`'s `chunkCount`/`plaintextHandshakeRecordLen`/
+  `protectedHandshakeRecordLen`/`sealHandshakeFragments`/
+  `sealedHandshakeLen`, and `encrypted_stream.zig`'s `handshakeRecordCount`.
+  Each of these (following `record_codec.encodeInnerPlaintext`'s existing
+  precedent) now uses `std.math.add`/`std.math.mul`/`std.math.divCeil`
+  instead of the `a + b - 1` / `a + b` idioms that can silently wrap for a
+  synthetic scalar input near the `usize` boundary — a case fuzzing can
+  drive directly as a bare length but never as a real allocation. Each
+  helper has its own named deterministic boundary test in addition to the
+  fuzz corpus; several (`chunkCount`, `handshakeRecordCount`) turn out to be
+  overflow-safe *by construction* once expressed via `std.math.divCeil`
+  (its `@divFloor(numerator - 1, denominator) + 1` form cannot itself
+  overflow for a positive numerator/denominator), so their boundary tests
+  assert exact agreement with `std.math.divCeil` at a synthetic near-max
+  input rather than an error — the actual overflow these targets guard
+  against surfaces one step later, in the callers that add `bytes_len` back
+  on top of the chunk overhead.
+- **#493-B** (record protection and epoch/key lifecycle) and **#493-C**
+  (scripted in-memory carrier, encrypted-stream progression, docs
+  closeout) are tracked as follow-on slices of the same issue and will
+  extend this section and the `-Dtls-record-test-filter` namespace when
+  they land, rather than duplicating this contract.
+
+Ownership stays exactly as scoped above and in the issue: shared TLS
+message/negotiation/transcript fuzzing is #491; PKI fuzzing is #492;
+resumption/PSK/ticket/cache fuzzing is #494; provider primitive
+malformed-input fuzzing is this file's own #376 targets; HTTP parsing and
+external TLS-over-TCP interop are out of scope entirely. #408's
+foundation-layer fixes (exact parser consumption, sink retry behavior,
+legal initial-ClientHello `0x0301`, explicit epoch discard, sequence
+exhaustion, key cleanup, independent record-protection vectors) are treated
+as regression seeds/properties here, not reimplemented — the extensive
+pre-existing deterministic `record_codec.zig` test suite already pins most
+of them by name, and the #493-A property targets promote the ones in scope
+for this slice (exact parser consumption under fragmentation, sink retry
+behavior, and the legal/illegal initial-ClientHello `0x0301` window) into
+generated properties rather than leaving them as fixed examples. The epoch
+discard, sequence exhaustion, and key cleanup classes are still
+deterministic-only and become fuzz properties in #493-B.
