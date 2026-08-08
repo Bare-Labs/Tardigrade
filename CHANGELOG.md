@@ -52,6 +52,43 @@ All notable user-facing changes to Tardigrade are documented here.
   `zig build test`/`zig build test-tls` (already run deterministically) via
   the new `test-tls-record-fuzz` step and `-Dtls-record-test-filter` build
   option for targeted longer coverage-guided runs.
+- **TLS record protection and epoch/key-lifecycle fuzz targets (#493-B, epic
+  #325-K)** — adds two more `std.testing.Smith` targets under the same
+  `test-tls-record-fuzz` step. `protection tamper and sequence boundaries
+  preserve authentication state` (in `src/tls/record_protection.zig`)
+  classifies every `WriteState.seal` outcome before the call and asserts the
+  exact typed error with an unchanged sequence and untouched destination on
+  each rejection, over suite, traffic-secret-length, content, padding,
+  output-capacity, and sequence matrices that reach the exact
+  maximum sealed payload, one past it, a synthetic near-`usize`-max padding
+  length, and both ends of the 64-bit sequence-exhaustion boundary. Each
+  sealed record then runs a tamper battery (ciphertext and tag bit flips,
+  tag truncation, associated-data type/version mutation, wrong read
+  sequence, wrong traffic secret, wrong suite-derived keys,
+  authenticated-but-malformed inner plaintext, exact-minus-one output
+  buffer) against one shared read state, asserting that authentication
+  failure never advances the sequence and never exposes unauthenticated
+  plaintext, that preflight failures leave the caller's buffer untouched,
+  and that a legitimate open still succeeds afterwards. A test-only
+  capability-masking/fault-injecting provider wrapper makes the documented
+  `UnsupportedCapability` and `InvalidInput` provider error classes
+  reachable deterministically instead of inventing errors the record API
+  cannot return. `epoch operation sequences preserve one-way key lifecycle`
+  (in `src/tls/record_epoch_bridge.zig`) runs bounded programs of up to 48
+  install/discard/complete/suite-update/seal/open/teardown operations against
+  a `Bridge` and an independent reference model, comparing a full state
+  snapshot — both direction phases, all discard and completion flags, the
+  negotiated suite, and per-slot key presence *and* sequence — after every
+  operation, so a premature, duplicate, or partially applied transition, a
+  retained key after discard or teardown, or a read sequence consumed by a
+  failed open all fail the property. Adds named deterministic companions
+  pinning every seal/open rejection stage per suite, record-protection
+  teardown zeroization, a scripted full epoch progression through teardown,
+  and a 0-RTT reinstall regression for each of the two teardown paths behind
+  the terminal-teardown defect recorded under Fixed below. The model states
+  "a torn-down session never acquires key material again" as its own rule
+  rather than re-deriving it from the bridge's per-epoch flags, which is
+  what turns those defects into detected disagreements instead of matches.
 
 ### Features
 - **QUIC negotiated TLS suite packet protection (#566)** — Handshake, 0-RTT,
@@ -715,6 +752,24 @@ All notable user-facing changes to Tardigrade are documented here.
   number space so Initial, Handshake, and Application ranges cannot merge.
 
 ### Fixed
+- **TLS record epoch bridge teardown is now terminal (#493-B)** — found by
+  review of the #493-B fuzz oracle. The record contract has two session
+  teardown paths, and both reset `handshake_complete` to false — which was
+  the *only* condition `installTrafficSecret(.zero_rtt, ...)` checked. After
+  either one, a bridge could have fresh 0-RTT read and write keys installed
+  and resume sealing and opening records on that epoch:
+  - `Bridge.deinit()`, the unconditional wipe for an abandoned or failed
+    handshake; and
+  - `discardEpoch(.application)`, the *orderly* teardown of a completed
+    session, which that function's own documentation calls session teardown.
+
+  `Bridge` now carries a `torn_down` flag that both paths set and nothing
+  clears, and `installTrafficSecret` rejects every epoch and direction once
+  it is set; starting a new session remains `Bridge.init`, which yields a
+  fresh value with the flag clear. 0-RTT discard is deliberately unaffected:
+  it is epoch-scoped rather than session teardown, emitted whenever early
+  data ends including mid-handshake. No production caller reused a bridge
+  after either teardown path, so this only closes the resurrection paths.
 - **Checked-in side-channel, secret-lifetime, and observability audit for
   native TLS/QUIC/PKI (#375)** — adds `docs/CRYPTO_SECURITY_AUDIT.md` (the
   audit matrix) and `docs/SECURITY_REVIEW_CHECKLIST.md` (the reusable

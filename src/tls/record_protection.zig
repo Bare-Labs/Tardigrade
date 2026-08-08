@@ -531,6 +531,45 @@ test "a known-answer record only authenticates at its independently-derived sequ
     try std.testing.expectEqualStrings("GET / HTTP/1.1\r\n\r\n", inner.content);
 }
 
+test "record protection teardown zeroizes keys, resets sequence, and marks state exhausted" {
+    const cp = testProvider();
+    const secret = trafficSecret(.sha384, 0x77);
+    var keys = try TrafficKeys.derive(cp, .tls_aes_256_gcm_sha384, &secret);
+    try std.testing.expect(keys.key.len > 0);
+    try std.testing.expect(keys.iv.len > 0);
+    keys.deinit();
+    try expectSecretsCleared(&keys);
+    // Repeated teardown is safe and idempotent.
+    keys.deinit();
+    try expectSecretsCleared(&keys);
+
+    var write = WriteState.init(cp, try TrafficKeys.derive(cp, .tls_aes_256_gcm_sha384, &secret));
+    write.sequence = 1234;
+    write.deinit();
+    try expectSecretsCleared(&write.keys);
+    try std.testing.expectEqual(@as(u64, 0), write.sequence);
+    try std.testing.expect(write.exhausted);
+    write.deinit();
+    try std.testing.expect(write.exhausted);
+
+    var read = ReadState.init(cp, try TrafficKeys.derive(cp, .tls_aes_256_gcm_sha384, &secret));
+    read.sequence = 4321;
+    read.deinit();
+    try expectSecretsCleared(&read.keys);
+    try std.testing.expectEqual(@as(u64, 0), read.sequence);
+    try std.testing.expect(read.exhausted);
+
+    // An exhausted state is inert: neither direction can be revived by a
+    // caller that kept a pointer to it past teardown.
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    try std.testing.expectError(error.SequenceExhausted, write.seal(.application_data, "x", 0, &protected));
+    try std.testing.expectError(error.SequenceExhausted, read.open(.{
+        .content_type = .application_data,
+        .legacy_version = record_codec.legacy_record_version,
+        .payload = &[_]u8{0} ** (provider.aead_tag_len + 1),
+    }, &protected));
+}
+
 test "record protection allows final sequence number then reports exhaustion" {
     const cp = testProvider();
     const secret = trafficSecret(.sha256, 0x66);
@@ -557,4 +596,749 @@ test "record protection allows final sequence number then reports exhaustion" {
     try std.testing.expectEqualStrings("y", inner.content);
     try std.testing.expect(read.exhausted);
     try std.testing.expectError(error.SequenceExhausted, read.open(parsed, &plaintext));
+}
+
+// -----------------------------------------------------------------------
+// #493 fuzz targets and supporting fixtures. See
+// docs/CRYPTO_FUZZ_CONTRACT.md's "#493" section for the shared rules these
+// follow (fresh provider and state per case, fixed buffers, explicit
+// bounds, typed-error classification, sanitized diagnostics).
+// -----------------------------------------------------------------------
+
+/// Asserts a `TrafficKeys` has actually been wiped: not just that the
+/// borrowed `slice()` view is empty, but that the whole `FixedSecret`
+/// backing array is zero, so a shortened `len` cannot hide retained key or
+/// IV bytes.
+fn expectSecretsCleared(keys: *const TrafficKeys) !void {
+    try std.testing.expectEqual(@as(usize, 0), keys.key.len);
+    try std.testing.expectEqual(@as(usize, 0), keys.iv.len);
+    try std.testing.expect(std.mem.allEqual(u8, &keys.key.bytes, 0));
+    try std.testing.expect(std.mem.allEqual(u8, &keys.iv.bytes, 0));
+}
+
+/// Test-only provider wrapper that either hides one capability from the
+/// reported set or forces one documented typed provider failure.
+///
+/// `HkdfError` and `SealError` contain only `InvalidInput` and
+/// `UnsupportedCapability`; `OpenError` adds `AuthenticationFailed`. Real
+/// tampering already reaches `AuthenticationFailed`, and a capability mask
+/// reaches `UnsupportedCapability` through `TrafficKeys.derive`'s own
+/// preflight, but nothing this module can pass a conforming pure-Zig
+/// provider produces `InvalidInput` -- the lengths it hands over are all
+/// derived from the suite profile. Rather than invent a generic provider
+/// error the record API cannot return, this fixture injects exactly the
+/// documented ones at the vtable seam so their propagation and the caller's
+/// transactional state can be asserted.
+const FaultProvider = struct {
+    inner: provider.CryptoProvider,
+    masked_hash: ?provider.Hash = null,
+    masked_aead: ?provider.Aead = null,
+    hkdf_error: ?provider.HkdfError = null,
+    seal_error: ?provider.SealError = null,
+    open_error: ?provider.OpenError = null,
+
+    fn capabilities(context: *anyopaque) provider.Capabilities {
+        const self: *FaultProvider = @ptrCast(@alignCast(context));
+        var caps = self.inner.capabilities();
+        if (self.masked_hash) |hash| caps.hashes.remove(hash);
+        if (self.masked_aead) |aead| caps.aeads.remove(aead);
+        return caps;
+    }
+
+    fn hkdfExtract(context: *anyopaque, hash: provider.Hash, salt: []const u8, ikm: []const u8, out: []u8) provider.HkdfError!void {
+        const self: *FaultProvider = @ptrCast(@alignCast(context));
+        if (self.hkdf_error) |err| return err;
+        return self.inner.hkdfExtract(hash, salt, ikm, out);
+    }
+
+    fn hkdfExpandLabel(
+        context: *anyopaque,
+        hash: provider.Hash,
+        secret_bytes: []const u8,
+        label: []const u8,
+        hash_context: []const u8,
+        out: []u8,
+    ) provider.HkdfError!void {
+        const self: *FaultProvider = @ptrCast(@alignCast(context));
+        if (self.hkdf_error) |err| return err;
+        return self.inner.hkdfExpandLabel(hash, secret_bytes, label, hash_context, out);
+    }
+
+    fn aeadSeal(
+        context: *anyopaque,
+        aead: provider.Aead,
+        key: []const u8,
+        nonce: []const u8,
+        associated_data: []const u8,
+        plaintext: []const u8,
+        ciphertext: []u8,
+        tag: []u8,
+    ) provider.SealError!void {
+        const self: *FaultProvider = @ptrCast(@alignCast(context));
+        if (self.seal_error) |err| return err;
+        return self.inner.aeadSeal(aead, key, nonce, associated_data, plaintext, ciphertext, tag);
+    }
+
+    fn aeadOpen(
+        context: *anyopaque,
+        aead: provider.Aead,
+        key: []const u8,
+        nonce: []const u8,
+        associated_data: []const u8,
+        ciphertext: []const u8,
+        tag: []const u8,
+        plaintext: []u8,
+    ) provider.OpenError!void {
+        const self: *FaultProvider = @ptrCast(@alignCast(context));
+        if (self.open_error) |err| {
+            // A conforming provider never leaves unauthenticated plaintext
+            // behind on a failed open (the `aeadOpen` vtable contract), so
+            // the fixture must not either -- otherwise the "no plaintext
+            // exposure" property would be proven against a fixture that is
+            // weaker than the interface it stands in for.
+            provider.secureZero(plaintext);
+            return err;
+        }
+        return self.inner.aeadOpen(aead, key, nonce, associated_data, ciphertext, tag, plaintext);
+    }
+
+    fn quicHeaderProtectionMask(
+        context: *anyopaque,
+        hp: provider.QuicHeaderProtection,
+        key: []const u8,
+        sample: []const u8,
+        mask: []u8,
+    ) provider.QuicHeaderProtectionError!void {
+        const self: *FaultProvider = @ptrCast(@alignCast(context));
+        return self.inner.quicHeaderProtectionMask(hp, key, sample, mask);
+    }
+
+    fn generateKeyShare(context: *anyopaque, group: provider.Group, public_out: []u8, private_out: []u8) provider.KeyShareError!void {
+        const self: *FaultProvider = @ptrCast(@alignCast(context));
+        return self.inner.generateKeyShare(group, public_out, private_out);
+    }
+
+    fn deriveSharedSecret(
+        context: *anyopaque,
+        group: provider.Group,
+        private_scalar: []const u8,
+        peer_public: []const u8,
+        out: []u8,
+    ) provider.DeriveError!void {
+        const self: *FaultProvider = @ptrCast(@alignCast(context));
+        return self.inner.deriveSharedSecret(group, private_scalar, peer_public, out);
+    }
+
+    fn verify(
+        context: *anyopaque,
+        scheme: provider.SignatureScheme,
+        public_key: []const u8,
+        message: []const u8,
+        signature: []const u8,
+    ) provider.VerifyError!void {
+        const self: *FaultProvider = @ptrCast(@alignCast(context));
+        return self.inner.verify(scheme, public_key, message, signature);
+    }
+
+    fn cryptoProvider(self: *FaultProvider) provider.CryptoProvider {
+        const vtable = provider.CryptoProvider.VTable{
+            .capabilities = capabilities,
+            .hkdfExtract = hkdfExtract,
+            .hkdfExpandLabel = hkdfExpandLabel,
+            .aeadSeal = aeadSeal,
+            .aeadOpen = aeadOpen,
+            .quicHeaderProtectionMask = quicHeaderProtectionMask,
+            .generateKeyShare = generateKeyShare,
+            .deriveSharedSecret = deriveSharedSecret,
+            .verify = verify,
+        };
+        return .{ .context = self, .vtable = &vtable, .entropy = self.inner.entropy };
+    }
+};
+
+const fuzz_protection_max_content = 64;
+const fuzz_protection_max_padding = 32;
+const fuzz_protection_sentinel: u8 = 0xa5;
+
+const all_suites = [_]algorithms.CipherSuite{
+    .tls_aes_128_gcm_sha256,
+    .tls_aes_256_gcm_sha384,
+    .tls_chacha20_poly1305_sha256,
+};
+
+/// The expected outcome of one `WriteState.seal` call, computed from the
+/// generated inputs *before* the call so the fuzz target asserts an exact
+/// typed error rather than accepting any rejection. Mirrors `seal`'s
+/// documented rejection order: exhausted sequence, then
+/// `encodeInnerPlaintext`'s own stages, then the sealed payload's size, then
+/// the caller's output capacity.
+const SealOracle = union(enum) {
+    sequence_exhausted,
+    invalid_type,
+    too_large,
+    output_overflow,
+    ok: struct { record_len: usize, payload_len: usize },
+};
+
+fn expectedSeal(
+    profile: SuiteProfile,
+    exhausted: bool,
+    content_type: record_codec.ContentType,
+    content_len: usize,
+    padding_len: usize,
+    out_cap: usize,
+) SealOracle {
+    if (exhausted) return .sequence_exhausted;
+    if (content_type == .change_cipher_spec) return .invalid_type;
+    if (content_len > record_codec.max_plaintext_fragment_len) return .too_large;
+    const with_type = std.math.add(usize, content_len, 1) catch return .too_large;
+    const inner_len = std.math.add(usize, with_type, padding_len) catch return .too_large;
+    // `seal` gives `encodeInnerPlaintext` a fixed `max_ciphertext_fragment_len`
+    // scratch buffer, so the encoder's own capacity stage collapses into this
+    // same bound and can never surface as `RecordBufferOverflow` from there.
+    if (inner_len > record_codec.max_ciphertext_fragment_len) return .too_large;
+    const payload_len = inner_len + profile.aead.tagLength();
+    if (payload_len > record_codec.max_ciphertext_fragment_len) return .too_large;
+    const record_len = record_codec.header_len + payload_len;
+    if (out_cap < record_len) return .output_overflow;
+    return .{ .ok = .{ .record_len = record_len, .payload_len = payload_len } };
+}
+
+/// Asserts one rejected `open` is transactional: the exact typed error, an
+/// unchanged sequence/exhaustion snapshot, and either a fully untouched
+/// output buffer (validation and preflight failures, which never reach the
+/// AEAD) or a decrypted span that has been zeroed rather than left holding
+/// unauthenticated plaintext.
+fn expectFailedOpen(
+    read: *ReadState,
+    record: record_codec.TLSCiphertext,
+    out: []u8,
+    expected: anyerror,
+    zeroes_attempted_span: bool,
+) !void {
+    const sequence_before = read.sequence;
+    const exhausted_before = read.exhausted;
+    @memset(out, fuzz_protection_sentinel);
+
+    try std.testing.expectError(expected, read.open(record, out));
+    try std.testing.expectEqual(sequence_before, read.sequence);
+    try std.testing.expectEqual(exhausted_before, read.exhausted);
+
+    if (zeroes_attempted_span) {
+        const ciphertext_len = record.payload.len - read.keys.profile.aead.tagLength();
+        try std.testing.expect(std.mem.allEqual(u8, out[0..ciphertext_len], 0));
+        try std.testing.expect(std.mem.allEqual(u8, out[ciphertext_len..], fuzz_protection_sentinel));
+    } else {
+        try std.testing.expect(std.mem.allEqual(u8, out, fuzz_protection_sentinel));
+    }
+}
+
+test "fuzz: TLS record: protection tamper and sequence boundaries preserve authentication state" {
+    try std.testing.fuzz({}, fuzzProtectionInput, .{
+        .corpus = &.{
+            "",
+            &[_]u8{0},
+            // Leading selector bytes steer the suite / traffic-secret-length /
+            // content-type / content-length / padding / capacity / sequence
+            // matrices toward their boundary arms.
+            &[_]u8{ 0, 1, 0, 0, 1, 1, 0 },
+            &[_]u8{ 1, 1, 1, 1, 2, 1, 1 },
+            &[_]u8{ 2, 1, 2, 2, 3, 1, 2 },
+            &[_]u8{ 0, 0, 0, 3, 4, 0, 3 },
+            &[_]u8{ 1, 2, 1, 4, 5, 2, 4 },
+            &[_]u8{ 2, 3, 2, 5, 0, 1, 5 },
+            &[_]u8{ 0, 1, 3, 1, 1, 1, 4 },
+            &[_]u8{ 1, 1, 0, 0, 2, 0, 5 },
+            &([_]u8{0} ** 32),
+            &([_]u8{0xff} ** 32),
+            &([_]u8{ 1, 2, 3, 4, 5 } ** 8),
+        },
+    });
+}
+
+fn fuzzProtectionInput(_: void, smith: *std.testing.Smith) !void {
+    const pure_zig = crypto.pure_zig;
+    // Per the #493 shared rules, crypto state is constructed fresh inside the
+    // callback rather than reusing this module's process-wide `testProvider()`
+    // singleton, so no case can observe another case's provider state.
+    var entropy = pure_zig.DeterministicEntropy.init(0x493b);
+    var provider_state = pure_zig.Provider.init(entropy.entropy());
+    const cp = provider_state.cryptoProvider();
+
+    const suite = all_suites[smith.index(all_suites.len)];
+    const profile = suiteProfile(suite);
+    const digest_len = profile.hash.digestLength();
+    const tag_len = profile.aead.tagLength();
+
+    // 1. Traffic-secret length matrix at exact-minus-one/exact/exact-plus-one
+    // for whichever of SHA-256/SHA-384 this suite uses. A wrong length must
+    // be refused before any key material is derived.
+    var secret_buf: [provider.max_digest_len + 1]u8 = undefined;
+    var secret_seed: [1]u8 = undefined;
+    smith.bytes(&secret_seed);
+    for (&secret_buf, 0..) |*byte, i| byte.* = secret_seed[0] ^ @as(u8, @truncate(i));
+    const wrong_len: usize = switch (smith.index(3)) {
+        0 => digest_len - 1,
+        1 => digest_len + 1,
+        else => 0,
+    };
+    try std.testing.expectError(
+        error.InvalidTrafficSecretLength,
+        TrafficKeys.derive(cp, suite, secret_buf[0..wrong_len]),
+    );
+    const traffic_secret = secret_buf[0..digest_len];
+
+    // 2. `UnsupportedCapability` is reachable only through `derive`'s
+    // capability preflight, so drive it from a masked view of this same
+    // provider -- alternating which of the suite's two required capabilities
+    // is hidden -- and confirm the unmasked path still works.
+    {
+        var masked = FaultProvider{ .inner = cp };
+        if (smith.index(2) == 0) masked.masked_hash = profile.hash else masked.masked_aead = profile.aead;
+        try std.testing.expectError(
+            error.UnsupportedCapability,
+            TrafficKeys.derive(masked.cryptoProvider(), suite, traffic_secret),
+        );
+    }
+
+    // 3. Sequence matrix: the ordinary counters plus both ends of the
+    // 64-bit exhaustion boundary.
+    const initial_sequence: u64 = switch (smith.index(6)) {
+        0 => 0,
+        1 => 1,
+        2 => 255,
+        3 => 256,
+        4 => std.math.maxInt(u64) - 1,
+        else => std.math.maxInt(u64),
+    };
+
+    var write = WriteState.init(cp, try TrafficKeys.derive(cp, suite, traffic_secret));
+    defer write.deinit();
+    var read = ReadState.init(cp, try TrafficKeys.derive(cp, suite, traffic_secret));
+    defer read.deinit();
+    write.sequence = initial_sequence;
+    read.sequence = initial_sequence;
+
+    // 4. Content type, content, padding, and output capacity. Padding
+    // carries the size boundaries because it is a scalar the encoder
+    // zero-fills: an exact-maximum sealed payload, one past it, and a
+    // synthetic near-`usize`-max value are all expressible without an
+    // oversized content buffer.
+    const valid_types = [_]record_codec.ContentType{ .alert, .handshake, .application_data };
+    const content_type: record_codec.ContentType = if (smith.index(8) == 0)
+        .change_cipher_spec
+    else
+        valid_types[smith.index(valid_types.len)];
+
+    var content_buf: [fuzz_protection_max_content]u8 = undefined;
+    const content_len = switch (smith.index(4)) {
+        0 => 0,
+        1 => 1,
+        else => smith.index(content_buf.len + 1),
+    };
+    smith.bytes(content_buf[0..content_len]);
+
+    // The largest padding whose sealed payload still fits the ciphertext
+    // fragment limit, given this content length and tag length.
+    const max_valid_padding = record_codec.max_ciphertext_fragment_len - tag_len - 1 - content_len;
+    const padding_len: usize = switch (smith.index(6)) {
+        0 => 0,
+        1 => 1,
+        2 => max_valid_padding,
+        3 => max_valid_padding + 1,
+        4 => std.math.maxInt(usize),
+        else => smith.index(fuzz_protection_max_padding + 1),
+    };
+
+    var out_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const required_len: ?usize = switch (expectedSeal(profile, false, content_type, content_len, padding_len, out_buf.len)) {
+        .ok => |ok| ok.record_len,
+        else => null,
+    };
+    const out_cap = switch (smith.index(4)) {
+        0 => if (required_len) |len| len else smith.index(out_buf.len + 1),
+        1 => if (required_len) |len| (if (len == 0) 0 else len - 1) else smith.index(out_buf.len + 1),
+        2 => if (required_len) |len| @min(len + 1, out_buf.len) else smith.index(out_buf.len + 1),
+        else => smith.index(out_buf.len + 1),
+    };
+    const out = out_buf[0..out_cap];
+    @memset(out, fuzz_protection_sentinel);
+
+    const seal_oracle = expectedSeal(profile, write.exhausted, content_type, content_len, padding_len, out_cap);
+    var plaintext_buf: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+
+    switch (seal_oracle) {
+        .sequence_exhausted, .invalid_type, .too_large, .output_overflow => {
+            const expected: anyerror = switch (seal_oracle) {
+                .sequence_exhausted => error.SequenceExhausted,
+                .invalid_type => error.InvalidRecordType,
+                .too_large => error.RecordTooLarge,
+                .output_overflow => error.RecordBufferOverflow,
+                .ok => unreachable,
+            };
+            try std.testing.expectError(expected, write.seal(content_type, content_buf[0..content_len], padding_len, out));
+            // A rejected seal is transactional: no sequence advance and not
+            // one byte written to the caller's buffer.
+            try std.testing.expectEqual(initial_sequence, write.sequence);
+            try std.testing.expect(std.mem.allEqual(u8, out, fuzz_protection_sentinel));
+        },
+        .ok => |ok| {
+            const record = try write.seal(content_type, content_buf[0..content_len], padding_len, out);
+            try std.testing.expectEqual(ok.record_len, record.len);
+            try std.testing.expect(withinRange(out, record));
+            // Bytes past the sealed record must still be untouched.
+            try std.testing.expect(std.mem.allEqual(u8, out[record.len..], fuzz_protection_sentinel));
+
+            // The header the AEAD authenticated as associated data must be
+            // exactly the serialized record header, re-derived here rather
+            // than read back from the implementation's own writer.
+            try std.testing.expectEqual(@as(u8, @intFromEnum(record_codec.ContentType.application_data)), record[0]);
+            try std.testing.expectEqual(record_codec.legacy_record_version, std.mem.readInt(u16, record[1..3], .big));
+            try std.testing.expectEqual(ok.payload_len, std.mem.readInt(u16, record[3..5], .big));
+
+            // A write at `maxInt(u64)` is legal exactly once, after which the
+            // state is exhausted rather than wrapping to a reused nonce.
+            if (initial_sequence == std.math.maxInt(u64)) {
+                try std.testing.expectEqual(std.math.maxInt(u64), write.sequence);
+                try std.testing.expect(write.exhausted);
+                var exhausted_out: [record_codec.header_len + 64]u8 = undefined;
+                @memset(&exhausted_out, fuzz_protection_sentinel);
+                try std.testing.expectError(
+                    error.SequenceExhausted,
+                    write.seal(.application_data, "x", 0, &exhausted_out),
+                );
+                try std.testing.expect(std.mem.allEqual(u8, &exhausted_out, fuzz_protection_sentinel));
+            } else {
+                try std.testing.expectEqual(initial_sequence + 1, write.sequence);
+                try std.testing.expect(!write.exhausted);
+            }
+
+            var record_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+            @memcpy(record_buf[0..record.len], record);
+            const sealed = record_buf[0..record.len];
+            const ciphertext_len = ok.payload_len - tag_len;
+            const parsed = record_codec.TLSCiphertext{
+                .content_type = .application_data,
+                .legacy_version = record_codec.legacy_record_version,
+                .payload = sealed[record_codec.header_len..],
+            };
+
+            // 5. Tamper battery. Every mutation runs against the same read
+            // state, so each one also proves the failure left that state
+            // usable for the legitimate open at the end.
+            try fuzzProtectionTamper(smith, cp, suite, traffic_secret, &read, parsed, sealed, ciphertext_len, &plaintext_buf);
+
+            // 6. A valid open against the same read state and sequence still
+            // succeeds after every one of those failures, round-trips the
+            // content exactly, and advances the read sequence exactly once.
+            @memset(plaintext_buf[0..ciphertext_len], fuzz_protection_sentinel);
+            const inner = try read.open(parsed, &plaintext_buf);
+            try std.testing.expectEqual(content_type, inner.content_type);
+            try std.testing.expectEqualSlices(u8, content_buf[0..content_len], inner.content);
+            try std.testing.expectEqual(padding_len, inner.padding_len);
+            try std.testing.expect(withinRange(plaintext_buf[0..ciphertext_len], inner.content));
+
+            if (initial_sequence == std.math.maxInt(u64)) {
+                try std.testing.expectEqual(std.math.maxInt(u64), read.sequence);
+                try std.testing.expect(read.exhausted);
+                try expectFailedOpen(&read, parsed, plaintext_buf[0..ciphertext_len], error.SequenceExhausted, false);
+            } else {
+                try std.testing.expectEqual(initial_sequence + 1, read.sequence);
+                try std.testing.expect(!read.exhausted);
+                // The same record at the *next* sequence has a different
+                // nonce, so replaying it must fail closed.
+                try expectFailedOpen(&read, parsed, plaintext_buf[0..ciphertext_len], error.AuthenticationFailed, true);
+            }
+        },
+    }
+
+    // 7. Teardown wipes both directions unconditionally, and a repeat is
+    // safe -- the deferred `deinit`s above run again on the way out.
+    write.deinit();
+    read.deinit();
+    try expectSecretsCleared(&write.keys);
+    try expectSecretsCleared(&read.keys);
+    try std.testing.expectEqual(@as(u64, 0), write.sequence);
+    try std.testing.expectEqual(@as(u64, 0), read.sequence);
+    try std.testing.expect(write.exhausted);
+    try std.testing.expect(read.exhausted);
+}
+
+/// The independent tamper scenarios #493 requires, run against one sealed
+/// record and a read state positioned at its sequence. Each must fail with
+/// its exact typed error, leave the read sequence and exhaustion flag
+/// untouched, and never hand back a plaintext view.
+fn fuzzProtectionTamper(
+    smith: *std.testing.Smith,
+    cp: provider.CryptoProvider,
+    suite: algorithms.CipherSuite,
+    traffic_secret: []const u8,
+    read: *ReadState,
+    parsed: record_codec.TLSCiphertext,
+    sealed: []u8,
+    ciphertext_len: usize,
+    plaintext_buf: []u8,
+) !void {
+    const profile = suiteProfile(suite);
+    const tag_len = profile.aead.tagLength();
+    const out = plaintext_buf[0..ciphertext_len];
+
+    // (a) Ciphertext bit flip at a fuzzer-chosen offset.
+    if (ciphertext_len > 0) {
+        var flip_byte: [1]u8 = undefined;
+        smith.bytes(&flip_byte);
+        const offset = record_codec.header_len + smith.index(ciphertext_len);
+        const original = sealed[offset];
+        sealed[offset] ^= if (flip_byte[0] == 0) 0x01 else flip_byte[0];
+        try expectFailedOpen(read, parsed, out, error.AuthenticationFailed, true);
+        sealed[offset] = original;
+    }
+
+    // (b) Tag bit flip at a fuzzer-chosen offset within the tag.
+    {
+        const offset = record_codec.header_len + ciphertext_len + smith.index(tag_len);
+        const original = sealed[offset];
+        sealed[offset] ^= 0x80;
+        try expectFailedOpen(read, parsed, out, error.AuthenticationFailed, true);
+        sealed[offset] = original;
+    }
+
+    // (c) Tag truncation: the shortened payload changes both the tag and the
+    // length field the associated data is built from. Dropping the whole tag
+    // (and more) falls below the minimum payload and must be refused before
+    // the AEAD runs, leaving the output entirely untouched.
+    {
+        const drop = 1 + smith.index(tag_len);
+        const truncated = record_codec.TLSCiphertext{
+            .content_type = .application_data,
+            .legacy_version = record_codec.legacy_record_version,
+            .payload = parsed.payload[0 .. parsed.payload.len - drop],
+        };
+        if (truncated.payload.len < tag_len) {
+            try expectFailedOpen(read, truncated, out, error.MalformedInnerPlaintext, false);
+        } else {
+            try expectFailedOpen(read, truncated, out, error.AuthenticationFailed, true);
+        }
+    }
+
+    // (d) Associated-data content type and version mutations are refused by
+    // `open`'s own preflight, before any key is touched.
+    {
+        const wrong_types = [_]record_codec.ContentType{ .handshake, .alert, .change_cipher_spec };
+        var wrong_type = parsed;
+        wrong_type.content_type = wrong_types[smith.index(wrong_types.len)];
+        try expectFailedOpen(read, wrong_type, out, error.InvalidRecordType, false);
+
+        var wrong_version = parsed;
+        wrong_version.legacy_version = if (smith.index(2) == 0) 0x0301 else 0x0304;
+        try expectFailedOpen(read, wrong_version, out, error.InvalidRecordVersion, false);
+    }
+
+    // (e) Wrong read sequence: the nonce is the sequence XORed into the IV,
+    // so a reader positioned anywhere else fails closed even with correct
+    // key material.
+    {
+        const correct = read.sequence;
+        const delta: u64 = 1 + smith.index(255);
+        read.sequence = if (correct >= delta) correct - delta else correct + delta;
+        try expectFailedOpen(read, parsed, out, error.AuthenticationFailed, true);
+        read.sequence = correct;
+    }
+
+    // (f) Wrong traffic secret, and (g) wrong suite-derived keys from the
+    // *same* secret. Both are fresh states, so the shared read state's
+    // sequence is untouched by construction.
+    {
+        var wrong_secret_buf: [provider.max_digest_len]u8 = undefined;
+        @memcpy(wrong_secret_buf[0..traffic_secret.len], traffic_secret);
+        wrong_secret_buf[smith.index(traffic_secret.len)] ^= 0x01;
+        var wrong_secret_read = ReadState.init(cp, try TrafficKeys.derive(cp, suite, wrong_secret_buf[0..traffic_secret.len]));
+        defer wrong_secret_read.deinit();
+        wrong_secret_read.sequence = read.sequence;
+        try expectFailedOpen(&wrong_secret_read, parsed, out, error.AuthenticationFailed, true);
+
+        // Only suites whose hash agrees can consume this secret length, so
+        // pick the other same-hash suite when one exists.
+        const other_suite: ?algorithms.CipherSuite = switch (suite) {
+            .tls_aes_128_gcm_sha256 => .tls_chacha20_poly1305_sha256,
+            .tls_chacha20_poly1305_sha256 => .tls_aes_128_gcm_sha256,
+            .tls_aes_256_gcm_sha384 => null,
+        };
+        if (other_suite) |other| {
+            var wrong_suite_read = ReadState.init(cp, try TrafficKeys.derive(cp, other, traffic_secret));
+            defer wrong_suite_read.deinit();
+            wrong_suite_read.sequence = read.sequence;
+            try expectFailedOpen(&wrong_suite_read, parsed, out, error.AuthenticationFailed, true);
+        }
+    }
+
+    // (h) Authenticated but malformed inner plaintext: an all-zero inner
+    // plaintext carries no content type, so it must be rejected *after* a
+    // successful AEAD open, with the decrypted span zeroed and the sequence
+    // still not advanced.
+    {
+        const inner_len = 1 + smith.index(8);
+        var inner = [_]u8{0} ** 9;
+        const payload_len = inner_len + tag_len;
+        var forged: [9 + provider.aead_tag_len + record_codec.header_len]u8 = undefined;
+        writeCiphertextHeader(payload_len, forged[0..record_codec.header_len]);
+        var nonce = nonceFor(read.keys.iv.slice(), read.sequence);
+        defer provider.secureZero(&nonce);
+        try cp.aeadSeal(
+            profile.aead,
+            read.keys.key.slice(),
+            &nonce,
+            forged[0..record_codec.header_len],
+            inner[0..inner_len],
+            forged[record_codec.header_len..][0..inner_len],
+            forged[record_codec.header_len + inner_len ..][0..tag_len],
+        );
+        const forged_record = record_codec.TLSCiphertext{
+            .content_type = .application_data,
+            .legacy_version = record_codec.legacy_record_version,
+            .payload = forged[record_codec.header_len..][0..payload_len],
+        };
+        try expectFailedOpen(read, forged_record, plaintext_buf[0..inner_len], error.MalformedInnerPlaintext, true);
+    }
+
+    // (i) Output capacity at exact-minus-one is a preflight failure: the
+    // record is authentic, but a caller who cannot receive the whole
+    // plaintext must get nothing rather than a truncated prefix.
+    if (ciphertext_len > 0) {
+        try expectFailedOpen(read, parsed, plaintext_buf[0 .. ciphertext_len - 1], error.RecordBufferOverflow, false);
+    }
+
+    // (j) Documented provider error classes propagate exactly and leave the
+    // caller's state transactional. `AuthenticationFailed` is already covered
+    // by real tampering above; these are the two that no conforming pure-Zig
+    // provider produces from this module's own call shapes.
+    {
+        var fault = FaultProvider{ .inner = cp, .open_error = error.InvalidInput };
+        var fault_read = ReadState.init(fault.cryptoProvider(), try TrafficKeys.derive(cp, suite, traffic_secret));
+        defer fault_read.deinit();
+        fault_read.sequence = read.sequence;
+        try expectFailedOpen(&fault_read, parsed, out, error.InvalidInput, true);
+
+        fault.open_error = error.UnsupportedCapability;
+        try expectFailedOpen(&fault_read, parsed, out, error.UnsupportedCapability, true);
+
+        var seal_fault = FaultProvider{ .inner = cp, .seal_error = error.InvalidInput };
+        var fault_write = WriteState.init(seal_fault.cryptoProvider(), try TrafficKeys.derive(cp, suite, traffic_secret));
+        defer fault_write.deinit();
+        fault_write.sequence = read.sequence;
+        var fault_out: [record_codec.header_len + 32]u8 = undefined;
+        @memset(&fault_out, fuzz_protection_sentinel);
+        try std.testing.expectError(error.InvalidInput, fault_write.seal(.application_data, "x", 0, &fault_out));
+        try std.testing.expectEqual(read.sequence, fault_write.sequence);
+        try std.testing.expect(!fault_write.exhausted);
+
+        var hkdf_fault = FaultProvider{ .inner = cp, .hkdf_error = error.InvalidInput };
+        try std.testing.expectError(
+            error.InvalidInput,
+            TrafficKeys.derive(hkdf_fault.cryptoProvider(), suite, traffic_secret),
+        );
+    }
+}
+
+/// True when `inner` is empty or lies wholly inside `outer`'s backing bytes,
+/// mirroring `record_codec`'s `withinBounds` -- the #493 borrowed-view
+/// lifetime property for sealed records and decoded inner plaintext.
+fn withinRange(outer: []const u8, inner: []const u8) bool {
+    if (inner.len == 0) return true;
+    const outer_start = @intFromPtr(outer.ptr);
+    const inner_start = @intFromPtr(inner.ptr);
+    return inner_start >= outer_start and inner_start + inner.len <= outer_start + outer.len;
+}
+
+// The fuzz target's tamper battery reaches each of these arms only when the
+// generated case happens to select the matching suite/length combination, and
+// CI replays the seed corpus alone. These pin the classification stages
+// deterministically, at every suite, so a regression cannot survive a plain
+// `zig build test-tls`.
+test "seal classifies every rejection stage at its exact boundary for every suite" {
+    const cp = testProvider();
+    inline for (all_suites) |suite| {
+        const profile = comptime suiteProfile(suite);
+        const secret = trafficSecret(profile.hash, 0x5a);
+        var write = WriteState.init(cp, try TrafficKeys.derive(cp, suite, &secret));
+        defer write.deinit();
+
+        var out: [record_codec.max_ciphertext_record_len]u8 = undefined;
+        const tag_len = profile.aead.tagLength();
+        const max_valid_padding = record_codec.max_ciphertext_fragment_len - tag_len - 1;
+
+        // change_cipher_spec has no legal inner-plaintext encoding.
+        try std.testing.expectError(
+            error.InvalidRecordType,
+            write.seal(.change_cipher_spec, "", 0, &out),
+        );
+        // Exactly the largest sealable payload, then one byte past it.
+        const largest = try write.seal(.application_data, "", max_valid_padding, &out);
+        try std.testing.expectEqual(
+            record_codec.header_len + record_codec.max_ciphertext_fragment_len,
+            largest.len,
+        );
+        try std.testing.expectError(
+            error.RecordTooLarge,
+            write.seal(.application_data, "", max_valid_padding + 1, &out),
+        );
+        // A padding length no allocation could represent still fails typed
+        // rather than wrapping the inner-plaintext total.
+        try std.testing.expectError(
+            error.RecordTooLarge,
+            write.seal(.application_data, "", std.math.maxInt(usize), &out),
+        );
+        // Output capacity at exactly one byte short of the record.
+        const needed = record_codec.header_len + 1 + 1 + tag_len;
+        try std.testing.expectError(
+            error.RecordBufferOverflow,
+            write.seal(.application_data, "x", 0, out[0 .. needed - 1]),
+        );
+        const exact = try write.seal(.application_data, "x", 0, out[0..needed]);
+        try std.testing.expectEqual(needed, exact.len);
+    }
+}
+
+test "open classifies every rejection stage at its exact boundary and never advances read state" {
+    const cp = testProvider();
+    inline for (all_suites) |suite| {
+        const profile = comptime suiteProfile(suite);
+        const secret = trafficSecret(profile.hash, 0x6b);
+        var write = WriteState.init(cp, try TrafficKeys.derive(cp, suite, &secret));
+        defer write.deinit();
+        var read = ReadState.init(cp, try TrafficKeys.derive(cp, suite, &secret));
+        defer read.deinit();
+
+        var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+        const record = try write.seal(.handshake, "finished", 3, &protected);
+        const parsed = try parsedCiphertext(record);
+        const tag_len = profile.aead.tagLength();
+        const ciphertext_len = parsed.payload.len - tag_len;
+        var plaintext: [64]u8 = undefined;
+
+        var wrong_type = parsed;
+        wrong_type.content_type = .handshake;
+        try expectFailedOpen(&read, wrong_type, plaintext[0..ciphertext_len], error.InvalidRecordType, false);
+
+        var wrong_version = parsed;
+        wrong_version.legacy_version = 0x0301;
+        try expectFailedOpen(&read, wrong_version, plaintext[0..ciphertext_len], error.InvalidRecordVersion, false);
+
+        const short = record_codec.TLSCiphertext{
+            .content_type = .application_data,
+            .legacy_version = record_codec.legacy_record_version,
+            .payload = parsed.payload[0 .. tag_len - 1],
+        };
+        try expectFailedOpen(&read, short, plaintext[0..ciphertext_len], error.MalformedInnerPlaintext, false);
+
+        try expectFailedOpen(&read, parsed, plaintext[0 .. ciphertext_len - 1], error.RecordBufferOverflow, false);
+
+        // Every preceding rejection left the read state exactly where it
+        // started, so the authentic record still opens at sequence 0.
+        try std.testing.expectEqual(@as(u64, 0), read.sequence);
+        const inner = try read.open(parsed, &plaintext);
+        try std.testing.expectEqualStrings("finished", inner.content);
+        try std.testing.expectEqual(@as(usize, 3), inner.padding_len);
+        try std.testing.expectEqual(@as(u64, 1), read.sequence);
+    }
 }
