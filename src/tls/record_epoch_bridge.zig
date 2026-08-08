@@ -1102,3 +1102,668 @@ test "record epoch bridge shuttles protocol-neutral driver events through record
     try testing.expectEqual(@as(u64, 1), server_bridge.write_application.?.sequence);
     try testing.expectEqual(@as(u64, 1), client_bridge.read_application.?.sequence);
 }
+
+// -----------------------------------------------------------------------
+// #493 epoch/key-lifecycle fuzz target. See docs/CRYPTO_FUZZ_CONTRACT.md's
+// "#493" section for the shared rules this follows (fresh provider and
+// bridge per case, fixed buffers, explicit operation bounds, typed-error
+// classification, sanitized diagnostics).
+// -----------------------------------------------------------------------
+
+const fuzz_epoch_max_operations = 48;
+const fuzz_epoch_content_len = 24;
+
+const all_epochs = [_]events.EncryptionEpoch{ .initial, .zero_rtt, .handshake, .application };
+const all_suites = [_]algorithms.CipherSuite{
+    .tls_aes_128_gcm_sha256,
+    .tls_aes_256_gcm_sha384,
+    .tls_chacha20_poly1305_sha256,
+};
+
+fn epochIndex(epoch: events.EncryptionEpoch) usize {
+    return switch (epoch) {
+        .initial => 0,
+        .zero_rtt => 1,
+        .handshake => 2,
+        .application => 3,
+    };
+}
+
+/// The traffic secret this target always uses for `epoch`, so a read slot and
+/// a write slot installed for the same epoch under the same suite hold
+/// byte-identical key material. That makes "does this record authenticate?"
+/// a function of the model's tracked suite and sequence alone, rather than of
+/// key bytes the model would otherwise have to reproduce.
+fn fuzzEpochSecret(epoch: events.EncryptionEpoch, len: usize, out: []u8) []const u8 {
+    const tag: u8 = 0x40 +% @as(u8, @intCast(epochIndex(epoch)));
+    for (out[0..len], 0..) |*byte, i| byte.* = tag ^ @as(u8, @truncate(i));
+    return out[0..len];
+}
+
+/// The externally observable state of a `Bridge`: direction phases, the
+/// discard/completion flags, the negotiated suite, and -- for each of the six
+/// key slots -- whether a key is installed and, if so, its sequence counter.
+/// Folding presence and sequence into one optional means a comparison catches
+/// both a key that should have been wiped and a sequence that advanced when
+/// it should not have.
+const BridgeSnapshot = struct {
+    cipher_suite: algorithms.CipherSuite,
+    read_phase: DirectionPhase,
+    write_phase: DirectionPhase,
+    read_handshake: ?u64,
+    write_handshake: ?u64,
+    read_zero_rtt: ?u64,
+    write_zero_rtt: ?u64,
+    read_application: ?u64,
+    write_application: ?u64,
+    initial_discarded: bool,
+    handshake_discarded: bool,
+    application_discarded: bool,
+    handshake_complete: bool,
+};
+
+fn bridgeSnapshot(bridge: *const Bridge) !BridgeSnapshot {
+    const snapshot = BridgeSnapshot{
+        .cipher_suite = bridge.cipher_suite,
+        .read_phase = bridge.read_phase,
+        .write_phase = bridge.write_phase,
+        .read_handshake = if (bridge.read_handshake) |state| state.sequence else null,
+        .write_handshake = if (bridge.write_handshake) |state| state.sequence else null,
+        .read_zero_rtt = if (bridge.read_zero_rtt) |state| state.sequence else null,
+        .write_zero_rtt = if (bridge.write_zero_rtt) |state| state.sequence else null,
+        .read_application = if (bridge.read_application) |state| state.sequence else null,
+        .write_application = if (bridge.write_application) |state| state.sequence else null,
+        .initial_discarded = bridge.initial_discarded,
+        .handshake_discarded = bridge.handshake_discarded,
+        .application_discarded = bridge.application_discarded,
+        .handshake_complete = bridge.handshake_complete,
+    };
+    // The public key-presence predicates must agree with the private slots
+    // they report on, at every point in the program.
+    try testing.expectEqual(snapshot.read_handshake != null, bridge.hasReadKeys(.handshake));
+    try testing.expectEqual(snapshot.write_handshake != null, bridge.hasWriteKeys(.handshake));
+    try testing.expectEqual(snapshot.read_zero_rtt != null, bridge.hasReadKeys(.zero_rtt));
+    try testing.expectEqual(snapshot.write_zero_rtt != null, bridge.hasWriteKeys(.zero_rtt));
+    try testing.expectEqual(snapshot.read_application != null, bridge.hasReadKeys(.application));
+    try testing.expectEqual(snapshot.write_application != null, bridge.hasWriteKeys(.application));
+    // The initial epoch never has record-protection keys of its own.
+    try testing.expect(!bridge.hasReadKeys(.initial));
+    try testing.expect(!bridge.hasWriteKeys(.initial));
+    return snapshot;
+}
+
+fn expectSnapshotEqual(expected: BridgeSnapshot, actual: BridgeSnapshot) !void {
+    try testing.expectEqual(expected.cipher_suite, actual.cipher_suite);
+    try testing.expectEqual(expected.read_phase, actual.read_phase);
+    try testing.expectEqual(expected.write_phase, actual.write_phase);
+    try testing.expectEqual(expected.read_handshake, actual.read_handshake);
+    try testing.expectEqual(expected.write_handshake, actual.write_handshake);
+    try testing.expectEqual(expected.read_zero_rtt, actual.read_zero_rtt);
+    try testing.expectEqual(expected.write_zero_rtt, actual.write_zero_rtt);
+    try testing.expectEqual(expected.read_application, actual.read_application);
+    try testing.expectEqual(expected.write_application, actual.write_application);
+    try testing.expectEqual(expected.initial_discarded, actual.initial_discarded);
+    try testing.expectEqual(expected.handshake_discarded, actual.handshake_discarded);
+    try testing.expectEqual(expected.application_discarded, actual.application_discarded);
+    try testing.expectEqual(expected.handshake_complete, actual.handshake_complete);
+}
+
+/// A compact reference model of the epoch lifecycle, written directly from
+/// the documented transition rules rather than from the `Bridge` code, so a
+/// rule the implementation silently relaxes shows up as a disagreement.
+///
+/// Per slot it tracks the suite the key was installed under (which decides
+/// whether a sealed record can authenticate against it) and the sequence
+/// counter, in addition to mere presence.
+const EpochModel = struct {
+    cipher_suite: algorithms.CipherSuite,
+    read_phase: DirectionPhase = .initial,
+    write_phase: DirectionPhase = .initial,
+    read_suite: [4]?algorithms.CipherSuite = .{null} ** 4,
+    write_suite: [4]?algorithms.CipherSuite = .{null} ** 4,
+    read_sequence: [4]u64 = .{0} ** 4,
+    write_sequence: [4]u64 = .{0} ** 4,
+    initial_discarded: bool = false,
+    handshake_discarded: bool = false,
+    application_discarded: bool = false,
+    handshake_complete: bool = false,
+
+    fn snapshot(self: *const EpochModel) BridgeSnapshot {
+        return .{
+            .cipher_suite = self.cipher_suite,
+            .read_phase = self.read_phase,
+            .write_phase = self.write_phase,
+            .read_handshake = self.slotSequence(.read, .handshake),
+            .write_handshake = self.slotSequence(.write, .handshake),
+            .read_zero_rtt = self.slotSequence(.read, .zero_rtt),
+            .write_zero_rtt = self.slotSequence(.write, .zero_rtt),
+            .read_application = self.slotSequence(.read, .application),
+            .write_application = self.slotSequence(.write, .application),
+            .initial_discarded = self.initial_discarded,
+            .handshake_discarded = self.handshake_discarded,
+            .application_discarded = self.application_discarded,
+            .handshake_complete = self.handshake_complete,
+        };
+    }
+
+    fn slotSequence(self: *const EpochModel, direction: events.SecretDirection, epoch: events.EncryptionEpoch) ?u64 {
+        const idx = epochIndex(epoch);
+        const suite = if (direction == .read) self.read_suite[idx] else self.write_suite[idx];
+        if (suite == null) return null;
+        return if (direction == .read) self.read_sequence[idx] else self.write_sequence[idx];
+    }
+
+    fn clearSlots(self: *EpochModel, epoch: events.EncryptionEpoch) void {
+        const idx = epochIndex(epoch);
+        self.read_suite[idx] = null;
+        self.write_suite[idx] = null;
+        self.read_sequence[idx] = 0;
+        self.write_sequence[idx] = 0;
+    }
+
+    fn secretLen(self: *const EpochModel) usize {
+        return record_protection.suiteProfile(self.cipher_suite).hash.digestLength();
+    }
+
+    fn predictInstall(
+        self: *const EpochModel,
+        epoch: events.EncryptionEpoch,
+        direction: events.SecretDirection,
+        secret_len: usize,
+    ) ?Error {
+        switch (epoch) {
+            // The initial epoch is plaintext-only; it has no traffic secret.
+            .initial => return error.UnsupportedRecordEpoch,
+            .handshake => {
+                const phase = if (direction == .read) self.read_phase else self.write_phase;
+                if (phase != .initial or self.handshake_discarded) return error.InvalidEpochTransition;
+            },
+            .application => {
+                const phase = if (direction == .read) self.read_phase else self.write_phase;
+                if (phase != .handshake or self.handshake_discarded or self.application_discarded) {
+                    return error.InvalidEpochTransition;
+                }
+            },
+            .zero_rtt => {
+                if (self.handshake_complete) return error.InvalidEpochTransition;
+            },
+        }
+        const idx = epochIndex(epoch);
+        const slot = if (direction == .read) self.read_suite[idx] else self.write_suite[idx];
+        // Duplicate detection happens before key derivation, so a duplicate
+        // install is reported as such even when its length is also wrong.
+        if (slot != null) return error.DuplicateTrafficSecret;
+        if (secret_len != self.secretLen()) return error.InvalidTrafficSecretLength;
+        return null;
+    }
+
+    fn applyInstall(self: *EpochModel, epoch: events.EncryptionEpoch, direction: events.SecretDirection) void {
+        const idx = epochIndex(epoch);
+        if (direction == .read) {
+            self.read_suite[idx] = self.cipher_suite;
+            self.read_sequence[idx] = 0;
+        } else {
+            self.write_suite[idx] = self.cipher_suite;
+            self.write_sequence[idx] = 0;
+        }
+        switch (epoch) {
+            .handshake => if (direction == .read) {
+                self.read_phase = .handshake;
+            } else {
+                self.write_phase = .handshake;
+            },
+            .application => if (direction == .read) {
+                self.read_phase = .application;
+            } else {
+                self.write_phase = .application;
+            },
+            // 0-RTT keys live alongside the phase progression rather than
+            // advancing it.
+            .zero_rtt, .initial => {},
+        }
+    }
+
+    fn predictDiscard(self: *const EpochModel, epoch: events.EncryptionEpoch) ?Error {
+        return switch (epoch) {
+            .initial => if (self.initial_discarded)
+                error.EpochAlreadyDiscarded
+            else if (self.read_phase == .initial or self.write_phase == .initial)
+                error.EpochDiscardTooEarly
+            else
+                null,
+            .handshake => if (self.handshake_discarded)
+                error.EpochAlreadyDiscarded
+            else if (self.read_phase != .application or self.write_phase != .application)
+                error.EpochDiscardTooEarly
+            else
+                null,
+            .application => if (self.application_discarded)
+                error.EpochAlreadyDiscarded
+            else if (!self.handshake_complete or self.read_phase != .complete or self.write_phase != .complete)
+                error.EpochDiscardTooEarly
+            else
+                null,
+            // 0-RTT discard is idempotent by contract: it is emitted whenever
+            // early data ends, including when no early keys ever existed.
+            .zero_rtt => null,
+        };
+    }
+
+    fn applyDiscard(self: *EpochModel, epoch: events.EncryptionEpoch) void {
+        switch (epoch) {
+            .initial => self.initial_discarded = true,
+            .handshake => {
+                self.clearSlots(.handshake);
+                self.handshake_discarded = true;
+            },
+            .application => {
+                self.clearSlots(.application);
+                self.application_discarded = true;
+                self.read_phase = .initial;
+                self.write_phase = .initial;
+                self.handshake_complete = false;
+            },
+            .zero_rtt => self.clearSlots(.zero_rtt),
+        }
+    }
+
+    fn predictComplete(self: *const EpochModel) ?Error {
+        if (self.handshake_complete) return error.InvalidEpochTransition;
+        if (!self.initial_discarded or !self.handshake_discarded) return error.InvalidEpochTransition;
+        if (self.read_phase != .application or self.write_phase != .application) return error.InvalidEpochTransition;
+        const idx = epochIndex(.application);
+        if (self.read_suite[idx] == null or self.write_suite[idx] == null) return error.MissingApplicationKeys;
+        return null;
+    }
+
+    fn applyComplete(self: *EpochModel) void {
+        self.clearSlots(.zero_rtt);
+        self.handshake_complete = true;
+        self.read_phase = .complete;
+        self.write_phase = .complete;
+    }
+
+    fn applyTeardown(self: *EpochModel) void {
+        self.clearSlots(.zero_rtt);
+        self.clearSlots(.handshake);
+        self.clearSlots(.application);
+        self.initial_discarded = true;
+        self.handshake_discarded = true;
+        self.application_discarded = true;
+        self.handshake_complete = false;
+        // `deinit` deliberately does not rewind the direction phases: it is
+        // teardown, not a transition back to a usable earlier state.
+    }
+
+    /// The gate `sealProtected` applies before it reaches a write state, for
+    /// a `handshake` content type.
+    fn predictSealGate(self: *const EpochModel, epoch: events.EncryptionEpoch) ?Error {
+        const idx = epochIndex(epoch);
+        return switch (epoch) {
+            .initial => if (self.initial_discarded) error.UnsupportedRecordEpoch else null,
+            .handshake => if (self.write_suite[idx] == null) error.MissingWriteKeys else null,
+            .application => if (!self.handshake_complete)
+                error.HandshakeNotComplete
+            else if (self.write_suite[idx] == null)
+                error.MissingWriteKeys
+            else
+                null,
+            .zero_rtt => if (self.handshake_complete)
+                error.UnsupportedRecordEpoch
+            else if (self.write_suite[idx] == null)
+                error.MissingWriteKeys
+            else
+                null,
+        };
+    }
+
+    /// Everything `openProtected` rejects before the AEAD runs: the bridge's
+    /// own epoch gate, and then -- for a protected epoch -- `ReadState.open`'s
+    /// header preflight in its documented order. A plaintext initial-epoch
+    /// record replayed at a protected epoch is refused as `InvalidRecordType`
+    /// by that preflight, never treated as a candidate ciphertext.
+    fn predictOpenGate(self: *const EpochModel, epoch: events.EncryptionEpoch, record: record_codec.Record) ?Error {
+        const idx = epochIndex(epoch);
+        switch (epoch) {
+            .initial => {
+                if (self.initial_discarded) return error.UnsupportedRecordEpoch;
+                if (record.content_type != .handshake) return error.UnexpectedRecordContent;
+                return null;
+            },
+            .handshake => if (self.read_suite[idx] == null) return error.MissingReadKeys,
+            .application => {
+                if (!self.handshake_complete) return error.HandshakeNotComplete;
+                if (self.read_suite[idx] == null) return error.MissingReadKeys;
+            },
+            .zero_rtt => {
+                if (self.handshake_complete) return error.UnsupportedRecordEpoch;
+                if (self.read_suite[idx] == null) return error.MissingReadKeys;
+            },
+        }
+        if (record.content_type != .application_data) return error.InvalidRecordType;
+        if (record.legacy_version != record_codec.legacy_record_version) return error.InvalidRecordVersion;
+        if (record.payload.len > record_codec.max_ciphertext_fragment_len) return error.RecordTooLarge;
+        const tag_len = record_protection.suiteProfile(self.read_suite[idx].?).aead.tagLength();
+        if (record.payload.len < tag_len) return error.MalformedInnerPlaintext;
+        return null;
+    }
+};
+
+/// The most recently sealed record, and everything the model needs to decide
+/// whether re-opening it can authenticate.
+const LastRecord = struct {
+    bytes: [record_codec.max_ciphertext_record_len]u8 = undefined,
+    len: usize = 0,
+    /// `null` until this case has sealed anything: the synthetic placeholder
+    /// record can never authenticate at any epoch.
+    epoch: ?events.EncryptionEpoch = null,
+    suite: algorithms.CipherSuite = .tls_aes_128_gcm_sha256,
+    sequence: u64 = 0,
+    content: [fuzz_epoch_content_len]u8 = undefined,
+};
+
+test "fuzz: TLS record: epoch operation sequences preserve one-way key lifecycle" {
+    try testing.fuzz({}, fuzzEpochOperationsInput, .{
+        .corpus = &.{
+            "",
+            &[_]u8{0},
+            // The #408 transition classes, as operation-selector prefixes:
+            // early discard, duplicate discard, missing direction,
+            // application install before handshake, partial completion,
+            // abandoned handshake, full progression, and teardown at each
+            // boundary. The generator's own bounds keep every one of these
+            // inside `fuzz_epoch_max_operations`.
+            &[_]u8{ 1, 0, 1, 2, 1, 3 },
+            &[_]u8{ 0, 2, 0, 0, 0, 2, 1, 0 },
+            &[_]u8{ 0, 3, 0, 0, 0, 3, 1, 0, 2 },
+            &[_]u8{ 0, 2, 0, 0, 0, 2, 1, 0, 1, 2, 0, 3, 0, 0, 0, 3, 1, 0, 1, 2, 2 },
+            &[_]u8{ 6, 0, 2, 0, 0, 6, 1, 0 },
+            &[_]u8{ 4, 0, 4, 2, 4, 3, 5, 0, 5, 2, 5, 3 },
+            &[_]u8{ 3, 0, 3, 1, 3, 2, 3, 3 },
+            &([_]u8{0} ** 64),
+            &([_]u8{0xff} ** 64),
+            &([_]u8{ 0, 1, 2, 3, 4, 5, 6 } ** 8),
+        },
+    });
+}
+
+fn fuzzEpochOperationsInput(_: void, smith: *std.testing.Smith) !void {
+    const pure_zig = crypto.pure_zig;
+    // Fresh provider per case, per the #493 shared rules -- not this module's
+    // process-wide `testProvider()` singleton.
+    var entropy = pure_zig.DeterministicEntropy.init(0x493c);
+    var provider_state = pure_zig.Provider.init(entropy.entropy());
+    const cp = provider_state.cryptoProvider();
+
+    const initial_suite = all_suites[smith.index(all_suites.len)];
+    var bridge = Bridge.init(cp, initial_suite);
+    defer bridge.deinit();
+    var model = EpochModel{ .cipher_suite = initial_suite };
+    try expectSnapshotEqual(model.snapshot(), try bridgeSnapshot(&bridge));
+
+    var last = LastRecord{};
+    var out_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var opened_buf: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    var secret_buf: [provider.max_digest_len + 1]u8 = undefined;
+    var scratch: [1]u8 = undefined;
+
+    const operations = smith.index(fuzz_epoch_max_operations + 1);
+    for (0..operations) |_| {
+        switch (smith.index(7)) {
+            // Install a traffic secret. The length comes from a matrix around
+            // the current suite's digest length, so a wrong-length install is
+            // a first-class operation rather than an afterthought.
+            0 => {
+                const epoch = all_epochs[smith.index(all_epochs.len)];
+                const direction: events.SecretDirection = if (smith.index(2) == 0) .read else .write;
+                const exact = model.secretLen();
+                const secret_len = switch (smith.index(4)) {
+                    0 => exact - 1,
+                    1 => exact + 1,
+                    else => exact,
+                };
+                const traffic_secret = fuzzEpochSecret(epoch, secret_len, &secret_buf);
+
+                const predicted = model.predictInstall(epoch, direction, secret_len);
+                const result = bridge.applyEvent(.{ .traffic_secret = .{
+                    .epoch = epoch,
+                    .direction = direction,
+                    .data = traffic_secret,
+                } }, &scratch);
+                if (predicted) |expected| {
+                    try testing.expectError(expected, result);
+                } else {
+                    try testing.expectEqual(@as(?[]const u8, null), try result);
+                    model.applyInstall(epoch, direction);
+                }
+            },
+            // Discard an epoch.
+            1 => {
+                const epoch = all_epochs[smith.index(all_epochs.len)];
+                const predicted = model.predictDiscard(epoch);
+                const result = bridge.applyEvent(.{ .discard_epoch = epoch }, &scratch);
+                if (predicted) |expected| {
+                    try testing.expectError(expected, result);
+                } else {
+                    try testing.expectEqual(@as(?[]const u8, null), try result);
+                    model.applyDiscard(epoch);
+                }
+            },
+            // Mark the handshake complete.
+            2 => {
+                const predicted = model.predictComplete();
+                const result = bridge.applyEvent(.handshake_complete, &scratch);
+                if (predicted) |expected| {
+                    try testing.expectError(expected, result);
+                } else {
+                    try testing.expectEqual(@as(?[]const u8, null), try result);
+                    model.applyComplete();
+                }
+            },
+            // Update the negotiated suite, including unknown code points,
+            // which must be refused without disturbing the current suite.
+            3 => {
+                const known = smith.index(4) != 0;
+                var raw: [2]u8 = undefined;
+                smith.bytes(&raw);
+                const chosen = all_suites[smith.index(all_suites.len)];
+                var wire = std.mem.readInt(u16, &raw, .big);
+                if (known) {
+                    wire = @intFromEnum(chosen);
+                } else if (algorithms.fromInt(algorithms.CipherSuite, wire) != null) {
+                    wire = 0x1300;
+                }
+                const params = events.NegotiatedParameters{
+                    .cipher_suite = wire,
+                    .transcript_hash = if (smith.index(2) == 0) .sha256 else .sha384,
+                };
+                const event: events.Event = if (smith.index(2) == 0)
+                    .{ .negotiated_parameters = params }
+                else
+                    .{ .early_data_parameters = params };
+                const result = bridge.applyEvent(event, &scratch);
+                if (algorithms.fromInt(algorithms.CipherSuite, wire)) |suite| {
+                    try testing.expectEqual(@as(?[]const u8, null), try result);
+                    model.cipher_suite = suite;
+                } else {
+                    try testing.expectError(error.UnsupportedRecordEpoch, result);
+                }
+            },
+            // Seal a handshake record at a chosen epoch.
+            4 => {
+                const epoch = all_epochs[smith.index(all_epochs.len)];
+                var content: [fuzz_epoch_content_len]u8 = undefined;
+                smith.bytes(&content);
+                const predicted = model.predictSealGate(epoch);
+                const result = bridge.sealProtected(epoch, .handshake, &content, &out_buf);
+                if (predicted) |expected| {
+                    try testing.expectError(expected, result);
+                } else {
+                    const record = try result;
+                    const idx = epochIndex(epoch);
+                    last.len = record.len;
+                    @memcpy(last.bytes[0..record.len], record);
+                    last.epoch = epoch;
+                    last.content = content;
+                    if (epoch != .initial) {
+                        last.suite = model.write_suite[idx].?;
+                        last.sequence = model.write_sequence[idx];
+                        model.write_sequence[idx] += 1;
+                    }
+                }
+            },
+            // Open the most recently sealed record at a chosen epoch. The
+            // model predicts not just the gate but whether the record can
+            // authenticate at all, so a bridge that opened a record under the
+            // wrong epoch's keys would be caught here.
+            5 => {
+                const epoch = all_epochs[smith.index(all_epochs.len)];
+                const record = if (last.epoch) |sealed_at|
+                    try parseSingleRecord(
+                        if (sealed_at == .initial) .plaintext else .ciphertext,
+                        last.bytes[0..last.len],
+                    )
+                else
+                    record_codec.Record{
+                        .content_type = .application_data,
+                        .legacy_version = record_codec.legacy_record_version,
+                        .payload = &[_]u8{0} ** 32,
+                    };
+                const idx = epochIndex(epoch);
+                const result = bridge.openProtected(epoch, record, &opened_buf);
+                if (model.predictOpenGate(epoch, record)) |expected| {
+                    try testing.expectError(expected, result);
+                } else if (last.epoch != null and last.epoch.? == epoch and
+                    (epoch == .initial or (model.read_suite[idx].? == last.suite and
+                        model.read_sequence[idx] == last.sequence)))
+                {
+                    const opened = try result;
+                    try testing.expectEqual(epoch, opened.epoch);
+                    try testing.expectEqual(record_codec.ContentType.handshake, opened.inner.content_type);
+                    try testing.expectEqualSlices(u8, &last.content, opened.inner.content);
+                    if (epoch != .initial) model.read_sequence[idx] += 1;
+                } else {
+                    // Wrong epoch, wrong suite, or a read sequence that has
+                    // moved on: the record must fail closed, and -- asserted
+                    // by the snapshot comparison below -- must not consume a
+                    // read sequence number, or a later legitimate record
+                    // would become unopenable.
+                    try testing.expectError(error.AuthenticationFailed, result);
+                }
+            },
+            // Teardown at an arbitrary point in the program, followed by
+            // continued operation: every later step must see wiped keys and
+            // terminal discard flags.
+            else => {
+                bridge.deinit();
+                model.applyTeardown();
+            },
+        }
+
+        try expectSnapshotEqual(model.snapshot(), try bridgeSnapshot(&bridge));
+    }
+
+    // Final teardown always clears every key slot regardless of how far the
+    // program progressed, including from an abandoned handshake.
+    bridge.deinit();
+    model.applyTeardown();
+    try expectSnapshotEqual(model.snapshot(), try bridgeSnapshot(&bridge));
+}
+
+// A single scripted full progression, pinned deterministically so CI's seed
+// replay always exercises the accepting path of every transition rule the
+// fuzz target's model encodes -- the generated programs reach the deepest
+// states (completion, orderly application discard, post-teardown operation)
+// only when their random operation order happens to line up.
+test "the epoch lifecycle model agrees with a scripted full progression through teardown" {
+    const cp = testProvider();
+    var bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer bridge.deinit();
+    var model = EpochModel{ .cipher_suite = .tls_aes_128_gcm_sha256 };
+    var secret_buf: [provider.max_digest_len + 1]u8 = undefined;
+    var scratch: [1]u8 = undefined;
+
+    const Step = struct {
+        fn install(
+            b: *Bridge,
+            m: *EpochModel,
+            buf: []u8,
+            sc: []u8,
+            epoch: events.EncryptionEpoch,
+            direction: events.SecretDirection,
+            len: usize,
+        ) !void {
+            const data = fuzzEpochSecret(epoch, len, buf);
+            const predicted = m.predictInstall(epoch, direction, len);
+            const result = b.applyEvent(.{ .traffic_secret = .{ .epoch = epoch, .direction = direction, .data = data } }, sc);
+            if (predicted) |expected| {
+                try testing.expectError(expected, result);
+            } else {
+                _ = try result;
+                m.applyInstall(epoch, direction);
+            }
+            try expectSnapshotEqual(m.snapshot(), try bridgeSnapshot(b));
+        }
+
+        fn discard(b: *Bridge, m: *EpochModel, sc: []u8, epoch: events.EncryptionEpoch) !void {
+            const predicted = m.predictDiscard(epoch);
+            const result = b.applyEvent(.{ .discard_epoch = epoch }, sc);
+            if (predicted) |expected| {
+                try testing.expectError(expected, result);
+            } else {
+                _ = try result;
+                m.applyDiscard(epoch);
+            }
+            try expectSnapshotEqual(m.snapshot(), try bridgeSnapshot(b));
+        }
+
+        fn complete(b: *Bridge, m: *EpochModel, sc: []u8) !void {
+            const predicted = m.predictComplete();
+            const result = b.applyEvent(.handshake_complete, sc);
+            if (predicted) |expected| {
+                try testing.expectError(expected, result);
+            } else {
+                _ = try result;
+                m.applyComplete();
+            }
+            try expectSnapshotEqual(m.snapshot(), try bridgeSnapshot(b));
+        }
+    };
+
+    const hash_len = record_protection.suiteProfile(.tls_aes_128_gcm_sha256).hash.digestLength();
+
+    // Early/duplicate/wrong-length/missing-direction rejections.
+    try Step.discard(&bridge, &model, &scratch, .initial);
+    try Step.complete(&bridge, &model, &scratch);
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .initial, .write, hash_len);
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .application, .write, hash_len);
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .handshake, .write, hash_len - 1);
+
+    // 0-RTT keys, then the full progression.
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .zero_rtt, .write, hash_len);
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .zero_rtt, .write, hash_len);
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .handshake, .read, hash_len);
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .handshake, .write, hash_len);
+    try Step.discard(&bridge, &model, &scratch, .handshake);
+    try Step.discard(&bridge, &model, &scratch, .initial);
+    try Step.discard(&bridge, &model, &scratch, .initial);
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .application, .read, hash_len);
+    try Step.complete(&bridge, &model, &scratch);
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .application, .write, hash_len);
+    try Step.discard(&bridge, &model, &scratch, .handshake);
+    try Step.complete(&bridge, &model, &scratch);
+    // Completion wipes any surviving 0-RTT keys.
+    try testing.expect(!bridge.hasWriteKeys(.zero_rtt));
+
+    // Orderly application discard, then teardown after a completed session.
+    try Step.discard(&bridge, &model, &scratch, .application);
+    try Step.discard(&bridge, &model, &scratch, .application);
+    bridge.deinit();
+    model.applyTeardown();
+    try expectSnapshotEqual(model.snapshot(), try bridgeSnapshot(&bridge));
+
+    // Post-teardown operations stay terminal: nothing can revive the bridge.
+    try Step.install(&bridge, &model, &secret_buf, &scratch, .handshake, .read, hash_len);
+    try Step.discard(&bridge, &model, &scratch, .handshake);
+    try Step.complete(&bridge, &model, &scratch);
+}
