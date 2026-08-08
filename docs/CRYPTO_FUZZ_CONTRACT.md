@@ -529,7 +529,35 @@ zig build test-tls-record-fuzz --summary all --error-style verbose
 zig build test-tls-record-fuzz -Doptimize=ReleaseFast --fuzz=10M --summary all --error-style verbose
 zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: codec fragmentation, coalescing, and sink saturation preserve exact consumption" --fuzz=10M --summary all --error-style verbose
 zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: inner plaintext framing, padding, and bounds remain transactional" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: protection tamper and sequence boundaries preserve authentication state" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: epoch operation sequences preserve one-way key lifecycle" --fuzz=10M --summary all --error-style verbose
+
+# Replay one named deterministic regression/companion case on its own
+# (the same filter option also selects non-"fuzz:" test names):
+zig build test-tls-record-fuzz -Dtls-record-test-filter="seal classifies every rejection stage at its exact boundary for every suite" --summary all --error-style verbose
 ```
+
+No #493 target performs network I/O, draws ambient entropy, loads a real
+key or certificate, or contacts an external peer: every case builds its own
+`pure_zig.DeterministicEntropy`/`pure_zig.Provider` pair inside the callback
+and works entirely from fixed stack buffers. The explicit bounds are:
+
+| Bound | Value |
+| --- | --- |
+| Generated records per codec case | 4 (`fuzz_codec_max_records`) |
+| Generated record payload | 48 bytes (`fuzz_codec_max_payload`) |
+| Codec sink capacity | 1 record |
+| Codec parser progress bound | `2 * stream_len + 16` `feedOne` calls |
+| Inner-plaintext content / padding | 512 bytes each (boundary arms aside) |
+| Protection content / padding | 64 / 32 bytes (boundary arms aside) |
+| Protection output buffer | `max_ciphertext_record_len` (16 645 bytes) |
+| Epoch operations per program | 48 (`fuzz_epoch_max_operations`) |
+| Epoch record content | 24 bytes (`fuzz_epoch_content_len`) |
+
+Boundary arms deliberately reach the real protocol limits
+(`max_plaintext_fragment_len`, `max_ciphertext_fragment_len`, and one past
+each) plus synthetic near-`usize`-max scalar lengths, which are driven
+through length-only helpers rather than allocations.
 
 `-Dtls-record-test-filter` defaults to `"fuzz: TLS record:"` (every #493
 target; scoped narrower than a bare `"fuzz: "` prefix for the same reason
@@ -625,11 +653,142 @@ issue's implementation-plan comment:
   input rather than an error — the actual overflow these targets guard
   against surfaces one step later, in the callers that add `bytes_len` back
   on top of the chunk overhead.
-- **#493-B** (record protection and epoch/key lifecycle) and **#493-C**
-  (scripted in-memory carrier, encrypted-stream progression, docs
-  closeout) are tracked as follow-on slices of the same issue and will
-  extend this section and the `-Dtls-record-test-filter` namespace when
-  they land, rather than duplicating this contract.
+- **#493-B** (this slice) — the `record_protection.zig` and
+  `record_epoch_bridge.zig` targets.
+
+  `protection tamper and sequence boundaries preserve authentication state`
+  classifies the expected outcome of every `WriteState.seal` call **before**
+  making it (`expectedSeal`, mirroring `seal`'s documented rejection order:
+  exhausted sequence, `encodeInnerPlaintext`'s stages, sealed payload size,
+  then output capacity) and asserts that exact typed error with the
+  destination sentinel and the write sequence re-verified after each one.
+  Each case picks one of the three suites, drives the traffic-secret length
+  at exact-minus-one/exact/exact-plus-one for that suite's hash, and starts
+  both directions at a sequence drawn from `{0, 1, 255, 256, maxInt-1,
+  maxInt}`. Padding carries the size boundaries because it is a scalar the
+  encoder zero-fills: the exact-maximum sealed payload, one past it, and a
+  synthetic `maxInt(usize)` are all expressible without an oversized content
+  buffer. On the accepting path the serialized header is re-derived
+  independently and compared field by field (it is what the AEAD
+  authenticates as associated data), a write at `maxInt(u64)` is proven
+  usable exactly once before the state latches exhausted, and every returned
+  view is checked for containment in its backing buffer.
+
+  Each sealed record then runs a tamper battery against one shared read
+  state — ciphertext bit flip, tag bit flip, tag truncation at every
+  representative boundary, associated-data content-type and version
+  mutation, a wrong read sequence, a wrong traffic secret, wrong
+  suite-derived keys from the same secret, an authenticated-but-malformed
+  all-zero inner plaintext, and an exact-minus-one output buffer. Every one
+  must fail with its exact typed error and leave the sequence and exhaustion
+  flag untouched; failures that reach the AEAD must leave the attempted
+  plaintext span zeroed, while validation and preflight failures must leave
+  the caller's buffer entirely untouched. Because all of them run against the
+  *same* read state, the legitimate open that follows also proves a failed
+  open leaves the state usable — and, once it succeeds, that replaying the
+  same record at the now-advanced sequence fails closed.
+
+  Provider error classes are exercised through a test-only `FaultProvider`
+  wrapper rather than invented: `UnsupportedCapability` comes from masking
+  one of the suite's two required capabilities so `TrafficKeys.derive`'s own
+  preflight rejects it, and `InvalidInput` is injected at the
+  `aeadSeal`/`aeadOpen`/HKDF vtable seam — the record API's own call shapes
+  never produce it from a conforming pure-Zig provider, and `HkdfError`/
+  `SealError` contain nothing else. The fixture zeroes `plaintext` on a
+  forced open failure so the "no unauthenticated plaintext" property is not
+  proven against a fixture weaker than the interface it stands in for.
+  Teardown is asserted directly on the public `FixedSecret` backing arrays
+  (`expectSecretsCleared`): key and IV bytes zero, lengths zero, sequence
+  reset, state marked exhausted, and repeated teardown safe.
+
+  `epoch operation sequences preserve one-way key lifecycle` runs a bounded
+  program of at most 48 operations — traffic-secret install at every
+  epoch/direction with a length matrix, epoch discard, handshake completion,
+  negotiated-suite updates including unknown code points, seal and open at
+  each epoch, and `deinit` teardown at an arbitrary point followed by
+  continued operation — against a `Bridge` and an independent `EpochModel`
+  written from the documented transition rules rather than from the
+  implementation. After **every** operation, accepted or rejected, a
+  `BridgeSnapshot` (both direction phases, all three discard flags,
+  completion, the negotiated suite, and for each of the six key slots an
+  optional holding its sequence) must equal the model's prediction. Folding
+  key presence and sequence into one optional means the comparison catches
+  both a key that should have been wiped and a sequence that advanced when
+  it should not have; the snapshot also cross-checks `hasReadKeys`/
+  `hasWriteKeys` against the private slots at every step. The model predicts
+  not only each gate but whether a record can authenticate at all — it
+  tracks the suite each slot was installed under and both sequence counters,
+  and the target always uses one fixed secret per epoch so identical
+  suite plus identical sequence means byte-identical keys. A bridge that
+  opened a record under the wrong epoch's keys, or that consumed a read
+  sequence number on a failed open, fails here.
+
+  Terminal teardown is stated in the model as its own rule (`torn_down`)
+  rather than being re-derived from the per-epoch discard and completion
+  flags. That distinction is load-bearing: review of this slice found the
+  model had reproduced two real `Bridge` defects instead of detecting them.
+  The record contract has **two** session-teardown paths, and both reset
+  `handshake_complete` to false — which was the *only* gate
+  `installTrafficSecret(.zero_rtt, ...)` checked:
+
+  1. `deinit`, the unconditional wipe for an abandoned or failed handshake;
+  2. `discardEpoch(.application)`, the orderly teardown of a completed
+     session, which `discardEpoch`'s own documentation calls session
+     teardown.
+
+  After either one, a bridge could reinstall both 0-RTT directions and
+  resume sealing and opening records on that epoch. Because the model
+  derived its rule from the same flags the implementation reset, model and
+  implementation compared equal all the way through both resurrections.
+  `Bridge` now carries a `torn_down` flag that every teardown path sets and
+  nothing clears (starting a new session is `Bridge.init`), the model states
+  the rule independently for both paths, and the snapshot compares the flag.
+  0-RTT discard is deliberately *not* terminal: it is epoch-scoped, emitted
+  whenever early data ends including mid-handshake, so the rule is scoped to
+  session teardown rather than to "any discard".
+
+  The general lesson for #493-C and later slices: a reference model that
+  paraphrases the implementation's own gate expressions can only find
+  inconsistencies, not policy violations — rules the contract requires
+  should be written from the contract. The second defect is the sharper
+  illustration, because fixing only the first path left the model still
+  agreeing with the implementation on the second.
+
+  Following #493-A's standard, both targets have named deterministic
+  companions for the classifications CI's seed replay cannot reliably reach:
+  `seal classifies every rejection stage at its exact boundary for every
+  suite`, `open classifies every rejection stage at its exact boundary and
+  never advances read state`, `record protection teardown zeroizes keys,
+  resets sequence, and marks state exhausted`, and `the epoch lifecycle
+  model agrees with a scripted full progression through teardown`, plus one
+  per teardown path for the defects above: `record epoch bridge cannot
+  reinstall zero-rtt keys after teardown` and `record epoch bridge cannot
+  reinstall zero-rtt keys after orderly application discard`. The scripted
+  companion exercises the application-discard window *before* any `deinit`
+  call, so the two paths are mutation-detectable independently.
+
+  All were validated by mutation, and in both directions for the terminal
+  rule:
+
+  | Mutation | Caught by |
+  | --- | --- |
+  | Drop `discardEpoch(.application)`'s `handshake_complete = false` | scripted companion (fuzz target in 16 runs) |
+  | Swap `seal`'s `RecordBufferOverflow` for `RecordTooLarge` | `seal classifies every rejection stage…` |
+  | Remove `installTrafficSecret`'s `torn_down` guard | both named teardown regressions (fuzz target in 17 runs) |
+  | Remove production `torn_down` on application discard only | `…after orderly application discard` + companion (fuzz target in 38 runs) |
+  | Remove the *model's* `torn_down` rule (either path) | scripted companion |
+
+  The seed-corpus replay alone caught none of them, which is why each has a
+  named companion. The last two rows are what keep the oracle honest: the
+  model cannot silently regress back to mirroring the implementation on
+  either teardown path.
+- **#493-C** (scripted in-memory carrier, encrypted-stream progression, docs
+  closeout) is tracked as a follow-on slice of the same issue and will
+  extend this section and the `-Dtls-record-test-filter` namespace when it
+  lands, rather than duplicating this contract. TLS-over-TCP KeyUpdate and
+  key replacement remain #357: the bridge exposes no such surface today, so
+  the epoch target's operation set is the extension point for it rather
+  than a fabricated API.
 
 Ownership stays exactly as scoped above and in the issue: shared TLS
 message/negotiation/transcript fuzzing is #491; PKI fuzzing is #492;
@@ -641,12 +800,13 @@ legal initial-ClientHello `0x0301`, explicit epoch discard, sequence
 exhaustion, key cleanup, independent record-protection vectors) are treated
 as regression seeds/properties here, not reimplemented — the extensive
 pre-existing deterministic `record_codec.zig` test suite already pins most
-of them by name, and the #493-A property targets promote the ones in scope
-for this slice (exact parser consumption under fragmentation, sink retry
-behavior, and the legal/illegal initial-ClientHello `0x0301` window) into
-generated properties rather than leaving them as fixed examples. The epoch
-discard, sequence exhaustion, and key cleanup classes are still
-deterministic-only and become fuzz properties in #493-B.
+of them by name, and the #493 property targets promote them into generated
+properties rather than leaving them as fixed examples: exact parser
+consumption under fragmentation, sink retry behavior, and the
+legal/illegal initial-ClientHello `0x0301` window in #493-A, and epoch
+discard/transition ordering, sequence exhaustion, and key cleanup in
+#493-B. The encrypted-stream progression and terminal-error classes remain
+deterministic-only until #493-C.
 
 ### #492 — DER / PEM / X.509 / path validation (epic #324-K)
 
