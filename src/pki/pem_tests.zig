@@ -443,3 +443,282 @@ test "fuzz entrypoint tolerates arbitrary input" {
     defer allocator.free(text);
     pem.fuzzLoadChainPem(allocator, text);
 }
+
+// --- #492 mutation-driven loader targets ------------------------------------
+//
+// Focused on parser/state safety, bounded resources, and ownership: the
+// loader hands back copies, so a chain must survive its input buffer being
+// scribbled over and freed, and every bound it advertises must be the exact
+// point at which it refuses.
+
+/// Fixed-capacity text builder. Overflowing writes truncate rather than
+/// allocate, so a generated document can never amplify into unbounded work.
+const TextBuilder = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    fn write(self: *TextBuilder, bytes: []const u8) void {
+        const room = self.buf.len - self.len;
+        const take = @min(room, bytes.len);
+        @memcpy(self.buf[self.len..][0..take], bytes[0..take]);
+        self.len += take;
+    }
+
+    fn slice(self: *const TextBuilder) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Eight-byte `SEQUENCE { OCTET STRING }` whose content encodes `id`, so
+/// generated certificates are byte-distinct and structurally valid.
+fn syntheticCertDer(id: u32) [8]u8 {
+    var out: [8]u8 = .{ 0x30, 0x06, 0x04, 0x04, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, out[4..8], id, .big);
+    return out;
+}
+
+fn writeBase64Body(builder: *TextBuilder, der_bytes: []const u8, line_ending: []const u8) void {
+    const encoder = std.base64.standard.Encoder;
+    var encoded_storage: [512]u8 = undefined;
+    const size = encoder.calcSize(der_bytes.len);
+    if (size > encoded_storage.len) return;
+    const encoded = encoder.encode(encoded_storage[0..size], der_bytes);
+    var rest: []const u8 = encoded;
+    while (rest.len > 0) {
+        const take = @min(rest.len, 64);
+        builder.write(rest[0..take]);
+        builder.write(line_ending);
+        rest = rest[take..];
+    }
+}
+
+fn writeValidCertificateBlock(builder: *TextBuilder, id: u32, line_ending: []const u8) void {
+    const bytes = syntheticCertDer(id);
+    builder.write("-----BEGIN CERTIFICATE-----");
+    builder.write(line_ending);
+    writeBase64Body(builder, &bytes, line_ending);
+    builder.write("-----END CERTIFICATE-----");
+    builder.write(line_ending);
+}
+
+const fuzz_pem_limits: pem.Limits = .{
+    .max_input_len = 4096,
+    .max_certificate_len = 64,
+    .max_certificates = 4,
+    .der = .{ .max_depth = 4, .max_element_len = 64, .max_elements = 16 },
+};
+
+/// Chain contents must be owned copies, so nothing may point into the buffer
+/// the caller handed in.
+fn expectDisjoint(owned: []const u8, input: []const u8) !void {
+    const owned_start = @intFromPtr(owned.ptr);
+    const input_start = @intFromPtr(input.ptr);
+    try testing.expect(owned_start + owned.len <= input_start or input_start + input.len <= owned_start);
+}
+
+fn loadChainForAllocationSweep(allocator: std.mem.Allocator, text: []const u8) !void {
+    var chain = pem.loadChainPem(allocator, text, fuzz_pem_limits) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    chain.deinit(allocator);
+}
+
+test "fuzz: PKI: PEM chain loading is bounded and its owned chain outlives a mutated, freed input" {
+    try testing.fuzz({}, fuzzPemChainLoading, .{ .corpus = &.{
+        "",
+        &[_]u8{ 0, 0 },
+        &[_]u8{ 1, 4 },
+        &[_]u8{ 1, 5 },
+        &[_]u8{ 0, 3, 0, 0, 0, 0, 0, 0 },
+        &([_]u8{0xff} ** 48),
+        &([_]u8{0x11} ** 32),
+    } });
+}
+
+fn fuzzPemChainLoading(_: void, smith: *testing.Smith) !void {
+    const allocator = testing.allocator;
+    var text_storage: [4096]u8 = undefined;
+    var builder = TextBuilder{ .buf = &text_storage };
+
+    // Half the cases generate only well-formed CERTIFICATE blocks, which
+    // gives an exact oracle for the empty-chain and chain-count boundaries;
+    // the other half generate hostile documents with no oracle beyond "do
+    // not panic, do not leak, fail with a documented error".
+    const well_formed = smith.index(2) == 0;
+    const line_ending: []const u8 = if (smith.index(2) == 0) "\n" else "\r\n";
+    const block_count = smith.index(fuzz_pem_limits.max_certificates + 3);
+
+    if (well_formed) {
+        for (0..block_count) |index| writeValidCertificateBlock(&builder, @intCast(index), line_ending);
+    } else {
+        const labels = [_][]const u8{
+            "CERTIFICATE",
+            "PRIVATE KEY",
+            "X509 CRL",
+            "CERTIFICATE ",
+            " CERTIFICATE",
+            "CERT--IFICATE",
+            "",
+            "CERTIFICATE\x00",
+        };
+        for (0..block_count) |index| {
+            const begin_label = labels[smith.index(labels.len)];
+            const end_label = if (smith.index(4) == 0) labels[smith.index(labels.len)] else begin_label;
+            builder.write(if (smith.index(8) == 0) "----BEGIN " else "-----BEGIN ");
+            builder.write(begin_label);
+            builder.write("-----");
+            builder.write(line_ending);
+            switch (smith.index(6)) {
+                // A duplicate of an earlier block's payload, exercising the
+                // "same certificate twice" case explicitly.
+                0 => writeBase64Body(&builder, &syntheticCertDer(0), line_ending),
+                1 => writeBase64Body(&builder, &syntheticCertDer(@intCast(index)), line_ending),
+                // Oversized: past `max_certificate_len`, so accumulation must
+                // stop at the bound rather than growing with the input.
+                2 => {
+                    var big: [256]u8 = undefined;
+                    big[0] = 0x30;
+                    big[1] = 0x82;
+                    std.mem.writeInt(u16, big[2..4], @intCast(big.len - 4), .big);
+                    @memset(big[4..], 0x00);
+                    writeBase64Body(&builder, &big, line_ending);
+                },
+                3 => {}, // Empty body.
+                4 => {
+                    var raw: [48]u8 = undefined;
+                    smith.bytes(&raw);
+                    builder.write(&raw);
+                    builder.write(line_ending);
+                },
+                else => {
+                    builder.write("!!!not base64===");
+                    builder.write(line_ending);
+                },
+            }
+            if (smith.index(8) != 0) {
+                builder.write("-----END ");
+                builder.write(end_label);
+                builder.write("-----");
+                builder.write(line_ending);
+            }
+            if (smith.index(4) == 0) {
+                builder.write("subject=/CN=noise");
+                builder.write(line_ending);
+            }
+        }
+        var trailing: [32]u8 = undefined;
+        const trailing_len = smith.index(trailing.len + 1);
+        smith.bytes(trailing[0..trailing_len]);
+        builder.write(trailing[0..trailing_len]);
+    }
+
+    // Load from a heap copy so the input can be scribbled over and freed
+    // while the chain is still live.
+    const input = try allocator.dupe(u8, builder.slice());
+    var input_owned = true;
+    defer if (input_owned) allocator.free(input);
+
+    if (pem.loadChainPem(allocator, input, fuzz_pem_limits)) |loaded| {
+        var chain = loaded;
+        defer chain.deinit(allocator);
+        try testing.expect(chain.certificates.len >= 1);
+        try testing.expect(chain.certificates.len <= fuzz_pem_limits.max_certificates);
+
+        var digests: [fuzz_pem_limits.max_certificates]u64 = undefined;
+        for (chain.certificates, 0..) |certificate, index| {
+            try testing.expect(certificate.der.len <= fuzz_pem_limits.max_certificate_len);
+            try expectDisjoint(certificate.der, input);
+            // Exactly one definite-length SEQUENCE, spanning the whole buffer.
+            var reader = der.Reader.init(certificate.der, fuzz_pem_limits.der);
+            const element = try reader.readElement();
+            try testing.expect(element.tag.constructed);
+            try testing.expectEqual(certificate.der.len, element.encoded.len);
+            try reader.expectEnd();
+            digests[index] = std.hash.Wyhash.hash(0, certificate.der);
+        }
+
+        if (well_formed) {
+            try testing.expectEqual(block_count, chain.certificates.len);
+        }
+
+        // Mutate and free the input; the owned chain must be unchanged.
+        @memset(input, 0xff);
+        allocator.free(input);
+        input_owned = false;
+        for (chain.certificates, 0..) |certificate, index| {
+            try testing.expectEqual(digests[index], std.hash.Wyhash.hash(0, certificate.der));
+        }
+    } else |err| {
+        // The error set is closed by the compiler; these are the cases with
+        // an exact oracle.
+        if (well_formed) {
+            if (block_count == 0) {
+                try testing.expectEqual(error.NoCertificates, err);
+            } else {
+                try testing.expect(block_count > fuzz_pem_limits.max_certificates);
+                try testing.expectEqual(error.TooManyCertificates, err);
+            }
+        } else switch (err) {
+            error.InputTooLarge,
+            error.CertificateTooLarge,
+            error.TooManyCertificates,
+            error.NoCertificates,
+            error.MalformedPemBoundary,
+            error.MismatchedPemLabel,
+            error.UnterminatedPemBlock,
+            error.InvalidPemBase64,
+            error.EmptyPemBlock,
+            error.MalformedCertificateDer,
+            error.OutOfMemory,
+            => {},
+        }
+    }
+
+    const text = builder.slice();
+    // `loadCertificatePem` is the exactly-one-block wrapper over the same
+    // state machine and must never leak the chain it rejects.
+    if (pem.loadCertificatePem(allocator, text, fuzz_pem_limits)) |loaded| {
+        var certificate = loaded;
+        certificate.deinit(allocator);
+        if (well_formed) try testing.expectEqual(@as(usize, 1), block_count);
+    } else |_| {}
+
+    // Raw-DER loading over the same bytes: never a borrow of the input.
+    if (pem.loadCertificateDer(allocator, text, fuzz_pem_limits)) |loaded| {
+        var certificate = loaded;
+        defer certificate.deinit(allocator);
+        try expectDisjoint(certificate.der, text);
+        try testing.expectEqualSlices(u8, text, certificate.der);
+    } else |_| {}
+
+    pem.fuzzLoadChainPem(allocator, text);
+
+    // Allocation failure at every reachable point: `OutOfMemory` propagates,
+    // nothing leaks, and no partially-owned chain escapes.
+    try testing.checkAllAllocationFailures(allocator, loadChainForAllocationSweep, .{text});
+}
+
+test "reduced differential seeds load as raw DER exactly as their parse outcome predicts" {
+    // #348's minimized hostile certificates are the highest-value seeds for
+    // this surface too: they are exactly the DER payloads a PEM block would
+    // decode to. `loadCertificateDer` only enforces the outer "exactly one
+    // definite-length SEQUENCE" shape, so a seed whose defect is interior
+    // (a duplicate extension, a corrupt signature) still loads, while one
+    // whose defect is in the DER framing itself must not.
+    const allocator = testing.allocator;
+    const reduced_corpus = @import("pki_reduced_corpus");
+    for (reduced_corpus.entries) |entry| {
+        pem.fuzzLoadChainPem(allocator, entry.seed);
+        if (pem.loadCertificateDer(allocator, entry.seed, .{})) |loaded| {
+            var certificate = loaded;
+            defer certificate.deinit(allocator);
+            try testing.expect(entry.expected != .der_parse_error);
+            try testing.expectEqualSlices(u8, entry.seed, certificate.der);
+            try expectDisjoint(certificate.der, entry.seed);
+        } else |err| {
+            try testing.expectEqual(error.MalformedCertificateDer, err);
+            try testing.expect(entry.expected == .der_parse_error);
+        }
+    }
+}

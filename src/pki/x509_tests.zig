@@ -1122,3 +1122,393 @@ test "reduced differential seeds keep their recorded parse outcome" {
         x509.fuzzParseCertificate(allocator, entry.seed);
     }
 }
+
+// --- #492 mutation-driven semantic-model targets ----------------------------
+//
+// #348 owns "does this decision match OpenSSL". This target owns the model's
+// structural contract: every borrowed view stays inside the caller's DER,
+// every typed accessor agrees with the extension list it was derived from,
+// configured count bounds are the exact refusal point, and a failed parse
+// (including a failed allocation) never leaves a partially owned model.
+
+/// #348's minimized hostile certificates are high-value seeds here too.
+const x509_reduced_corpus_seeds = blk: {
+    const reduced_corpus = @import("pki_reduced_corpus");
+    var seeds: [reduced_corpus.entries.len][]const u8 = undefined;
+    for (reduced_corpus.entries, &seeds) |entry, *seed| seed.* = entry.seed;
+    break :blk seeds;
+};
+
+const fuzz_x509_limits: x509.Limits = .{
+    .der = .{ .max_depth = 12, .max_element_len = 4096, .max_elements = 256 },
+    .max_extensions = 8,
+    .max_name_rdns = 8,
+    .max_name_attributes = 4,
+    .max_general_names = 8,
+    .max_eku_purposes = 8,
+    .max_policies = 8,
+    .max_policy_qualifiers = 4,
+    .max_policy_mappings = 8,
+    .max_distribution_points = 4,
+    .max_access_descriptions = 4,
+    .max_name_constraint_subtrees = 8,
+};
+
+fn expectViewContained(raw: []const u8, view: []const u8) !void {
+    const raw_start = @intFromPtr(raw.ptr);
+    const view_start = @intFromPtr(view.ptr);
+    try testing.expect(view_start >= raw_start);
+    try testing.expect(view_start - raw_start + view.len <= raw.len);
+}
+
+fn expectGeneralNameContained(raw: []const u8, name: x509.GeneralName, mode: enum { host, cidr }) !void {
+    switch (name) {
+        .rfc822_name, .dns_name, .directory_name, .uniform_resource_identifier => |value| {
+            try expectViewContained(raw, value);
+        },
+        .ip_address => |value| {
+            try expectViewContained(raw, value);
+            switch (mode) {
+                .host => try testing.expect(value.len == 4 or value.len == 16),
+                .cidr => try testing.expect(value.len == 8 or value.len == 32),
+            }
+        },
+        // A decoded OID is a fixed-size value, never a borrow.
+        .registered_id => |value| try testing.expect(value.components().len <= oid.max_components),
+        .other => |value| try expectViewContained(raw, value.raw),
+    }
+}
+
+/// Build one Smith-chosen extension value; `null` means "skip this slot".
+fn fuzzExtension(arena: std.mem.Allocator, smith: *testing.Smith, slot: usize) !?[]const u8 {
+    // Most slots are absent in any given case. Emitting all ten every time
+    // would exceed `max_extensions` unconditionally, so every case would
+    // stop at `CountLimitExceeded` and the model's own invariants would
+    // never be reached.
+    if (smith.index(3) != 0) return null;
+    const critical = smith.index(2) == 0;
+    // Occasionally replace the extension's value with arbitrary bytes, so the
+    // extension parsers see hostile content under a well-formed wrapper.
+    const corrupt = smith.index(4) == 0;
+    var corrupt_storage: [48]u8 = undefined;
+    const corrupt_len = smith.index(corrupt_storage.len + 1);
+    smith.bytes(corrupt_storage[0..corrupt_len]);
+    const corrupt_value = corrupt_storage[0..corrupt_len];
+
+    const dns_names = [_][]const u8{ "a.test", "*.b.test", "", "xn--fa-hia.test", "..", "A.TEST" };
+    const eku_choices = [_][]const u32{
+        &oid.well_known.server_auth,
+        &oid.well_known.client_auth,
+        &oid.well_known.any_ext_key_usage,
+        &oid.well_known.code_signing,
+        &[_]u32{ 1, 3, 6, 1, 4, 1, 4242, 1 },
+    };
+
+    switch (slot) {
+        0 => {
+            var parts: std.ArrayList([]const u8) = .empty;
+            defer parts.deinit(arena);
+            if (smith.index(2) == 0) try parts.append(arena, try tlv(arena, 0x01, &.{&[_]u8{if (smith.index(2) == 0) 0xff else 0x00}}));
+            if (smith.index(2) == 0) try parts.append(arena, try tlv(arena, 0x02, &.{&[_]u8{@intCast(smith.index(128))}}));
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x30, parts.items);
+            return try extensionTlv(arena, &oid.well_known.basic_constraints, critical, value);
+        },
+        1 => {
+            const unused: u8 = @intCast(smith.index(9)); // 8 is out of range.
+            const bits: u8 = @intCast(smith.index(256));
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x03, &.{&[_]u8{ unused, bits }});
+            return try extensionTlv(arena, &oid.well_known.key_usage, critical, value);
+        },
+        2 => {
+            var purposes: std.ArrayList([]const u8) = .empty;
+            defer purposes.deinit(arena);
+            for (0..smith.index(6)) |_| {
+                try purposes.append(arena, try oidTlv(arena, eku_choices[smith.index(eku_choices.len)]));
+            }
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x30, purposes.items);
+            return try extensionTlv(arena, &oid.well_known.ext_key_usage, critical, value);
+        },
+        3 => {
+            var names: std.ArrayList([]const u8) = .empty;
+            defer names.deinit(arena);
+            for (0..smith.index(10)) |_| {
+                const name = switch (smith.index(7)) {
+                    0 => try tlv(arena, 0x82, &.{dns_names[smith.index(dns_names.len)]}),
+                    1 => blk: {
+                        var address: [17]u8 = undefined;
+                        const length = smith.index(address.len + 1);
+                        smith.bytes(address[0..length]);
+                        break :blk try tlv(arena, 0x87, &.{address[0..length]});
+                    },
+                    2 => try tlv(arena, 0x81, &.{"user@example.test"}),
+                    3 => try tlv(arena, 0x86, &.{"https://a.test/x"}),
+                    4 => try tlv(arena, 0xa4, &.{try nameWithCn(arena, "Directory")}),
+                    5 => try tlv(arena, 0x88, &.{&[_]u8{ 0x2a, 0x03 }}),
+                    else => try tlv(arena, 0xa0, &.{&[_]u8{ 0x05, 0x00 }}),
+                };
+                try names.append(arena, name);
+            }
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x30, names.items);
+            return try extensionTlv(arena, &oid.well_known.subject_alt_name, critical, value);
+        },
+        4 => {
+            var permitted: std.ArrayList([]const u8) = .empty;
+            defer permitted.deinit(arena);
+            var excluded: std.ArrayList([]const u8) = .empty;
+            defer excluded.deinit(arena);
+            for (0..smith.index(4)) |_| {
+                try permitted.append(arena, try tlv(arena, 0x30, &.{try tlv(arena, 0x82, &.{dns_names[smith.index(dns_names.len)]})}));
+            }
+            for (0..smith.index(4)) |_| {
+                var address: [33]u8 = undefined;
+                const length = smith.index(address.len + 1);
+                smith.bytes(address[0..length]);
+                try excluded.append(arena, try tlv(arena, 0x30, &.{try tlv(arena, 0x87, &.{address[0..length]})}));
+            }
+            var parts: std.ArrayList([]const u8) = .empty;
+            defer parts.deinit(arena);
+            if (permitted.items.len != 0) try parts.append(arena, try tlv(arena, 0xa0, permitted.items));
+            if (excluded.items.len != 0) try parts.append(arena, try tlv(arena, 0xa1, excluded.items));
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x30, parts.items);
+            return try extensionTlv(arena, &oid.well_known.name_constraints, critical, value);
+        },
+        5 => {
+            var identifier: [24]u8 = undefined;
+            const length = smith.index(identifier.len + 1);
+            smith.bytes(identifier[0..length]);
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x04, &.{identifier[0..length]});
+            return try extensionTlv(arena, &oid.well_known.subject_key_identifier, critical, value);
+        },
+        6 => {
+            var identifier: [24]u8 = undefined;
+            const length = smith.index(identifier.len + 1);
+            smith.bytes(identifier[0..length]);
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x30, &.{try tlv(arena, 0x80, &.{identifier[0..length]})});
+            return try extensionTlv(arena, &oid.well_known.authority_key_identifier, critical, value);
+        },
+        7 => {
+            var policies: std.ArrayList([]const u8) = .empty;
+            defer policies.deinit(arena);
+            for (0..smith.index(4)) |index| {
+                const policy_oid = [_]u32{ 2, 5, 29, 32, @intCast(index) };
+                try policies.append(arena, try tlv(arena, 0x30, &.{try oidTlv(arena, &policy_oid)}));
+            }
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x30, policies.items);
+            return try extensionTlv(arena, &oid.well_known.certificate_policies, critical, value);
+        },
+        8 => {
+            const value = if (corrupt) corrupt_value else try tlv(arena, 0x02, &.{&[_]u8{@intCast(smith.index(128))}});
+            return try extensionTlv(arena, &oid.well_known.inhibit_any_policy, critical, value);
+        },
+        else => return try extensionTlv(arena, &unknown_ext_oid, critical, if (corrupt) corrupt_value else &[_]u8{ 0x05, 0x00 }),
+    }
+}
+
+fn parseForAllocationSweep(allocator: std.mem.Allocator, input: []const u8) !void {
+    var certificate = x509.Certificate.parse(allocator, input, fuzz_x509_limits) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    certificate.deinit(allocator);
+}
+
+test "fuzz: PKI: X.509 semantic model borrows only from its input and honors its count bounds" {
+    try testing.fuzz({}, fuzzX509Semantics, .{ .corpus = &([_][]const u8{
+        "",
+        &[_]u8{0},
+        &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 },
+        &([_]u8{0x55} ** 40),
+        &([_]u8{0xff} ** 64),
+        @embedFile("pki_malformed_der"),
+    } ++ x509_reduced_corpus_seeds) });
+}
+
+fn fuzzX509Semantics(_: void, smith: *testing.Smith) !void {
+    const allocator = testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var extensions: std.ArrayList([]const u8) = .empty;
+    defer extensions.deinit(arena);
+    for (0..10) |slot| {
+        if (try fuzzExtension(arena, smith, slot)) |extension| try extensions.append(arena, extension);
+    }
+    // Duplicate a generated extension: RFC 5280 forbids a repeated OID, and
+    // the parser must say so rather than silently keeping one of them.
+    const duplicated = extensions.items.len != 0 and smith.index(3) == 0;
+    if (duplicated) try extensions.append(arena, extensions.items[smith.index(extensions.items.len)]);
+
+    // A malformed/unsupported inner signature AlgorithmIdentifier, which must
+    // be rejected on its own terms rather than by the outer structure.
+    const inner_algorithm: ?[]const u8 = switch (smith.index(4)) {
+        0 => try tlv(arena, 0x30, &.{ try oidTlv(arena, &ecdsa_sha256_components), try tlv(arena, 0x05, &.{}) }),
+        1 => try tlv(arena, 0x30, &.{}),
+        2 => try tlv(arena, 0x30, &.{try oidTlv(arena, &[_]u32{ 1, 2, 3, 4, 5 })}),
+        else => null,
+    };
+
+    const bytes = try buildCertificate(arena, .{
+        .version = if (smith.index(8) == 0) null else try versionTlv(arena, @intCast(smith.index(4))),
+        .inner_algorithm = inner_algorithm,
+        .extensions_wrapper = if (extensions.items.len == 0) null else try extensionsWrapper(arena, extensions.items),
+    });
+
+    // Bit-flip mutation on top of the structured builder: the mutation-driven
+    // half of this target, reaching states the builder alone cannot express.
+    const mutation_count = smith.index(4);
+    for (0..mutation_count) |_| {
+        if (bytes.len == 0) break;
+        bytes[smith.index(bytes.len)] ^= @intCast(1 + smith.index(255));
+    }
+
+    // Parse from a heap copy so the copy can be freed while the parsed model
+    // is gone, proving the model never outlives (or retains) its input.
+    const input = try allocator.dupe(u8, bytes);
+    defer allocator.free(input);
+
+    if (x509.Certificate.parse(allocator, input, fuzz_x509_limits)) |parsed| {
+        var certificate = parsed;
+        defer certificate.deinit(allocator);
+
+        try testing.expectEqual(input.ptr, certificate.raw.ptr);
+        try testing.expectEqual(input.len, certificate.raw.len);
+        try expectViewContained(certificate.raw, certificate.tbs_raw);
+        try expectViewContained(certificate.raw, certificate.serial_number.content);
+        try expectViewContained(certificate.raw, certificate.signature_algorithm.raw);
+        try expectViewContained(certificate.raw, certificate.subject_public_key_info.raw);
+        try expectViewContained(certificate.raw, certificate.signature_value.data);
+        try expectViewContained(certificate.raw, certificate.issuer.raw);
+        try expectViewContained(certificate.raw, certificate.subject.raw);
+        try der.validateInteger(certificate.serial_number.content, fuzz_x509_limits.der.max_integer_bytes);
+        try testing.expect(certificate.issuer.rdns.len <= fuzz_x509_limits.max_name_rdns);
+        try testing.expect(certificate.subject.rdns.len <= fuzz_x509_limits.max_name_rdns);
+        try testing.expectEqual(certificate.issuer.rdns.len, certificate.issuer.rdn_chaining_keys.len);
+        try testing.expect(certificate.isSelfIssued() == certificate.issuer.eqlForChaining(&certificate.subject));
+
+        try testing.expect(certificate.extensions.len <= fuzz_x509_limits.max_extensions);
+        // A duplicate OID must have been rejected, never merged.
+        var unhandled_critical = false;
+        for (certificate.extensions, 0..) |extension, index| {
+            try expectViewContained(certificate.raw, extension.value);
+            for (certificate.extensions[0..index]) |earlier| {
+                try testing.expect(!earlier.oid.eql(&extension.oid));
+            }
+            if (extension.critical and extension.parsed == .unrecognized) unhandled_critical = true;
+            // Every typed accessor must agree with the extension list it was
+            // derived from — no accessor may synthesize or drop an extension.
+            switch (extension.parsed) {
+                .basic_constraints => |value| {
+                    try testing.expectEqual(value.is_ca, certificate.basicConstraints().?.is_ca);
+                    try testing.expectEqual(value.max_path_len, certificate.basicConstraints().?.max_path_len);
+                },
+                .key_usage => |value| try testing.expectEqual(value, certificate.keyUsage().?),
+                .subject_alt_name => |names| {
+                    try testing.expect(names.len <= fuzz_x509_limits.max_general_names);
+                    try testing.expectEqual(names.len, certificate.subjectAltName().?.len);
+                    for (names) |name| try expectGeneralNameContained(certificate.raw, name, .host);
+                },
+                .extended_key_usage => |value| {
+                    try testing.expect(value.purposes.len <= fuzz_x509_limits.max_eku_purposes);
+                    try testing.expectEqual(value.purposes.len, certificate.extendedKeyUsage().?.purposes.len);
+                },
+                .subject_key_identifier => |value| {
+                    try expectViewContained(certificate.raw, value);
+                    try testing.expectEqualSlices(u8, value, certificate.subjectKeyIdentifier().?);
+                },
+                .authority_key_identifier => |value| {
+                    if (value.key_identifier) |identifier| try expectViewContained(certificate.raw, identifier);
+                    if (value.authority_cert_issuer_raw) |issuer| try expectViewContained(certificate.raw, issuer);
+                    if (value.authority_cert_serial) |serial| try expectViewContained(certificate.raw, serial);
+                },
+                .name_constraints => |value| {
+                    try testing.expect(value.permitted.len <= fuzz_x509_limits.max_name_constraint_subtrees);
+                    try testing.expect(value.excluded.len <= fuzz_x509_limits.max_name_constraint_subtrees);
+                    for (value.permitted) |subtree| try expectGeneralNameContained(certificate.raw, subtree.base, .cidr);
+                    for (value.excluded) |subtree| try expectGeneralNameContained(certificate.raw, subtree.base, .cidr);
+                },
+                .certificate_policies => |value| {
+                    try testing.expect(value.len <= fuzz_x509_limits.max_policies);
+                    for (value) |policy| {
+                        try testing.expect(policy.qualifiers.len <= fuzz_x509_limits.max_policy_qualifiers);
+                        for (policy.qualifiers) |qualifier| try expectViewContained(certificate.raw, qualifier.value_raw);
+                    }
+                },
+                .policy_mappings => |value| try testing.expect(value.len <= fuzz_x509_limits.max_policy_mappings),
+                .authority_info_access => |value| try testing.expect(value.len <= fuzz_x509_limits.max_access_descriptions),
+                .crl_distribution_points => |value| {
+                    try testing.expect(value.len <= fuzz_x509_limits.max_distribution_points);
+                    for (value) |point| try expectViewContained(certificate.raw, point.raw);
+                },
+                .inhibit_any_policy => |value| try testing.expectEqual(value, certificate.inhibitAnyPolicy().?),
+                .policy_constraints, .unrecognized => {},
+            }
+        }
+        try testing.expectEqual(unhandled_critical, certificate.hasUnhandledCriticalExtension());
+        // An unmutated duplicate must have been rejected outright; a bit-flip
+        // can legitimately make the two OIDs differ again, so only the
+        // unmutated case has an oracle here.
+        try testing.expect(!duplicated or mutation_count > 0);
+
+        // Identical bytes must produce an identical model.
+        var replay = try x509.Certificate.parse(allocator, input, fuzz_x509_limits);
+        defer replay.deinit(allocator);
+        try testing.expectEqual(certificate.version, replay.version);
+        try testing.expectEqual(certificate.extensions.len, replay.extensions.len);
+        try testing.expectEqualSlices(u8, certificate.tbs_raw, replay.tbs_raw);
+        try testing.expectEqualSlices(u8, certificate.issuer.chaining_key, replay.issuer.chaining_key);
+        try testing.expectEqualSlices(u8, certificate.subject.chaining_key, replay.subject.chaining_key);
+        for (certificate.extensions, replay.extensions) |mine, other| {
+            try testing.expect(mine.oid.eql(&other.oid));
+            try testing.expectEqual(mine.critical, other.critical);
+            try testing.expectEqual(@as(std.meta.Tag(x509.Extension.Parsed), mine.parsed), @as(std.meta.Tag(x509.Extension.Parsed), other.parsed));
+        }
+    } else |err| switch (err) {
+        error.MalformedCertificate,
+        error.UnsupportedVersion,
+        error.MalformedSerialNumber,
+        error.MalformedAlgorithm,
+        error.SignatureAlgorithmMismatch,
+        error.MalformedName,
+        error.MalformedValidity,
+        error.MalformedPublicKeyInfo,
+        error.MalformedUniqueId,
+        error.MalformedSignature,
+        error.MalformedExtension,
+        error.DuplicateExtension,
+        error.NamePreparationFailed,
+        error.CountLimitExceeded,
+        error.OutOfMemory,
+        => {},
+    }
+
+    // The extension-count bound is the exact refusal point, using extensions
+    // that always parse (unknown, non-critical) so nothing else can reject
+    // first.
+    {
+        var many: std.ArrayList([]const u8) = .empty;
+        defer many.deinit(arena);
+        const count = fuzz_x509_limits.max_extensions + smith.index(2);
+        for (0..count) |index| {
+            const ext_oid = [_]u32{ 1, 3, 6, 1, 4, 1, 99999, @intCast(index) };
+            try many.append(arena, try extensionTlv(arena, &ext_oid, false, &[_]u8{ 0x05, 0x00 }));
+        }
+        const bounded = try buildCertificate(arena, .{
+            .version = try versionTlv(arena, 2),
+            .extensions_wrapper = try extensionsWrapper(arena, many.items),
+        });
+        if (count > fuzz_x509_limits.max_extensions) {
+            try testing.expectError(error.CountLimitExceeded, x509.Certificate.parse(allocator, bounded, fuzz_x509_limits));
+        } else {
+            var certificate = try x509.Certificate.parse(allocator, bounded, fuzz_x509_limits);
+            defer certificate.deinit(allocator);
+            try testing.expectEqual(count, certificate.extensions.len);
+        }
+    }
+
+    // Allocation failure at every reachable point: no leak, and no partially
+    // owned model escapes a failed parse.
+    try testing.checkAllAllocationFailures(allocator, parseForAllocationSweep, .{input});
+
+    x509.fuzzParseCertificate(allocator, input);
+}

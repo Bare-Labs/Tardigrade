@@ -3042,3 +3042,309 @@ test "policy mappings apply through an asserted anyPolicy" {
     try testing.expectEqual(@as(usize, 1), result.accepted.policies.user_constrained.len);
     try testing.expect(result.accepted.policies.user_constrained[0].eqlComponents(&policy_a));
 }
+
+// --- #492 adversarial path-validation targets -------------------------------
+//
+// Validation is the last PKI stage and the one whose *output* is a security
+// decision, so these oracles are about determinism, boundedness, and the
+// shape of the verdict: identical inputs must produce an identical verdict,
+// an accepted path must be one of the candidates the builder actually
+// emitted, and a rejection must carry nothing but reason/stage metadata.
+// No target here performs AIA/OCSP/CRL fetching, because the modules under
+// test contain no network code at all — `validatePath` takes an already-built
+// path and an injected clock.
+
+fn containsPointer(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => true,
+        .optional => |info| containsPointer(info.child),
+        .array => |info| containsPointer(info.child),
+        .@"struct" => |info| blk: {
+            inline for (info.fields) |field| {
+                if (containsPointer(field.type)) break :blk true;
+            }
+            break :blk false;
+        },
+        .@"union" => |info| blk: {
+            inline for (info.fields) |field| {
+                if (containsPointer(field.type)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+test "a validation failure carries only reason and stage metadata, never borrowed memory" {
+    // Structural proof of the sanitized-diagnostics rule: a `ValidationFailure`
+    // has no pointer-shaped field anywhere in its transitive layout, so it
+    // cannot carry certificate bytes, key material, or any other borrowed
+    // attacker-controlled slice out of the validator.
+    try testing.expect(!containsPointer(validator.ValidationFailure));
+    try testing.expect(!containsPointer(validator.FailureReason));
+}
+
+const fuzz_builder_limits: path_builder.Limits = .{ .max_path_len = 6, .max_paths = 4 };
+
+/// 2026-01-01T00:00:00Z and 2027-01-01T00:00:00Z, the exact Unix seconds of
+/// the `260101000000Z`/`270101000000Z` window `addValidChain` uses.
+const chain_not_before_unix: i64 = 1_767_225_600;
+const chain_not_after_unix: i64 = 1_798_761_600;
+
+fn expectAcceptedPathWellFormed(
+    accepted: []const path_builder.Element,
+    candidates: path_builder.CandidatePaths,
+    validation_policy: validator.ValidationPolicy,
+) !void {
+    try testing.expect(accepted.len >= 2);
+    try testing.expect(accepted.len <= validation_policy.maximum_path_length);
+    try testing.expectEqual(path_builder.Source.leaf, accepted[0].source);
+    try testing.expectEqual(path_builder.Source.anchor, accepted[accepted.len - 1].source);
+    for (accepted[1 .. accepted.len - 1]) |element| {
+        try testing.expectEqual(path_builder.Source.intermediate, element.source);
+    }
+
+    // The anchor is the configured one, by index and by exact DER.
+    const anchor = accepted[accepted.len - 1];
+    try testing.expect(anchor.input_index < validation_policy.trust_anchors.len);
+    try testing.expectEqualSlices(
+        u8,
+        validation_policy.trust_anchors[anchor.input_index].raw,
+        anchor.certificate.raw,
+    );
+
+    // An accepted path is one of the candidates, never a synthesized one.
+    var matched = false;
+    for (candidates.paths) |candidate| {
+        if (candidate.elements.len != accepted.len) continue;
+        var same = true;
+        for (candidate.elements, accepted) |a, b| {
+            if (a.certificate != b.certificate or a.source != b.source or a.input_index != b.input_index) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            matched = true;
+            break;
+        }
+    }
+    try testing.expect(matched);
+}
+
+fn expectSameVerdict(first: validator.ValidationResult, second: validator.ValidationResult) !void {
+    switch (first) {
+        .accepted => |mine| switch (second) {
+            .accepted => |other| {
+                try testing.expectEqual(mine.accepted_path.len, other.accepted_path.len);
+                for (mine.accepted_path, other.accepted_path) |a, b| {
+                    try testing.expectEqual(a.certificate, b.certificate);
+                    try testing.expectEqual(a.source, b.source);
+                    try testing.expectEqual(a.input_index, b.input_index);
+                }
+            },
+            .rejected => return error.TestUnexpectedResult,
+        },
+        .rejected => |mine| switch (second) {
+            .accepted => return error.TestUnexpectedResult,
+            .rejected => |other| {
+                try testing.expectEqual(mine.reason, other.reason);
+                try testing.expectEqual(mine.certificate_index, other.certificate_index);
+                try testing.expectEqual(mine.constraint_certificate_index, other.constraint_certificate_index);
+                try testing.expectEqual(mine.name_constraint_kind, other.name_constraint_kind);
+                try testing.expectEqual(mine.name_form, other.name_form);
+                try testing.expectEqual(mine.policy_stage, other.policy_stage);
+                try testing.expectEqual(mine.policy_graph_depth, other.policy_graph_depth);
+            },
+        },
+    }
+}
+
+test "fuzz: PKI: path validation is deterministic, bounded, and sanitized on adversarial chains" {
+    try testing.fuzz({}, fuzzPathValidation, .{ .corpus = &.{
+        "",
+        &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        &[_]u8{ 1, 0, 2, 1, 0, 3, 1, 1 },
+        &[_]u8{ 0, 2, 0, 0, 1, 0, 0, 0, 1 },
+        &([_]u8{1} ** 24),
+        &([_]u8{0xff} ** 32),
+    } });
+}
+
+fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
+    const allocator = testing.allocator;
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+
+    // --- Deterministic validity-boundary oracle -----------------------------
+    // Everything else about this chain is known-good, so the verdict is a
+    // pure function of where `validation_time` sits relative to the window.
+    {
+        var fx = Fixtures.init(allocator);
+        defer fx.deinit();
+        try addValidChain(&fx, 1);
+        const anchors = fx.certs.items[2..3];
+        const offsets = [_]i64{
+            chain_not_before_unix - 1,
+            chain_not_before_unix,
+            chain_not_after_unix,
+            chain_not_after_unix + 1,
+        };
+        const choice = smith.index(offsets.len);
+        var boundary_policy = policy(anchors);
+        boundary_policy.validation_time = offsets[choice];
+        var result = try validateBuilt(allocator, &fx.certs.items[0], fx.certs.items[1..2], anchors, boundary_policy, cp);
+        defer result.deinit(allocator);
+        switch (choice) {
+            0 => try expectRejected(&result, .certificate_not_yet_valid, 0),
+            3 => try expectRejected(&result, .certificate_expired, 0),
+            else => try expectAccepted(&result, 3),
+        }
+    }
+
+    // --- Randomized chain ---------------------------------------------------
+    var fx = Fixtures.init(allocator);
+    defer fx.deinit();
+
+    const windows = [_][2][]const u8{
+        .{ "260101000000Z", "270101000000Z" }, // Contains the validation time.
+        .{ "200101000000Z", "210101000000Z" }, // Wholly in the past.
+        .{ "400101000000Z", "410101000000Z" }, // Wholly in the future.
+        .{ "260701000000Z", "260701000000Z" }, // Zero-width, exactly on it.
+    };
+    // 0x00 is deliberately absent: an all-zero Key Usage is rejected by the
+    // #341 parser (RFC 5280 §4.2.1.3 requires at least one bit), so it would
+    // build an unparsable fixture rather than reach validation at all.
+    const key_usages = [_]?u8{ null, 0x80, 0x20, 0x04, 0xa0, 0xff };
+    const ekus = [_]Eku{ .absent, .server, .client, .any };
+
+    const use_intermediate = smith.index(4) != 0;
+    const leaf_window = windows[smith.index(windows.len)];
+    const intermediate_window = windows[smith.index(windows.len)];
+    const root_window = windows[smith.index(windows.len)];
+    // A signature forged with a key nobody in the chain holds.
+    const forged_leaf = smith.index(6) == 0;
+    const forged_intermediate = smith.index(6) == 0;
+    const leaf_unknown = smith.index(6);
+    const intermediate_ca: ?bool = if (smith.index(6) == 0) null else smith.index(6) != 0;
+
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = if (use_intermediate) "Intermediate" else "Root",
+        .subject_key = 1,
+        .issuer_key = if (forged_leaf) 9 else if (use_intermediate) 2 else 3,
+        .not_before = leaf_window[0],
+        .not_after = leaf_window[1],
+        .ca = if (smith.index(4) == 0) null else smith.index(4) == 0,
+        .key_usage = key_usages[smith.index(key_usages.len)],
+        .eku = ekus[smith.index(ekus.len)],
+        .san = if (smith.index(2) == 0) "leaf.example.com" else null,
+        // Both flags emit the same OID, so asking for both would build a
+        // duplicate-extension fixture the parser rejects before validation
+        // ever runs. Duplicate extensions are #492's X.509 target's job.
+        .unknown_critical = leaf_unknown == 1,
+        .unknown_noncritical = leaf_unknown == 2,
+    });
+    if (use_intermediate) {
+        try fx.add(.{
+            .subject = "Intermediate",
+            .issuer = "Root",
+            .subject_key = 2,
+            .issuer_key = if (forged_intermediate) 9 else 3,
+            .not_before = intermediate_window[0],
+            .not_after = intermediate_window[1],
+            .ca = intermediate_ca,
+            // RFC 5280 §4.2.1.9 only permits pathLenConstraint alongside
+            // cA TRUE, and the #341 parser enforces that, so pairing it with
+            // a non-CA here would build an unparsable fixture instead of an
+            // interesting validation case.
+            .path_len = if (intermediate_ca == true and smith.index(3) == 0) @intCast(smith.index(3)) else null,
+            .key_usage = key_usages[smith.index(key_usages.len)],
+            .eku = ekus[smith.index(ekus.len)],
+            .name_constraints = if (smith.index(4) == 0) .{
+                .permitted = &.{.{ .dns = "example.com" }},
+                .critical = smith.index(2) == 0,
+            } else null,
+            .unknown_critical = smith.index(8) == 0,
+        });
+    }
+    try fx.add(.{
+        .subject = "Root",
+        .issuer = "Root",
+        .subject_key = 3,
+        .issuer_key = 3,
+        .not_before = root_window[0],
+        .not_after = root_window[1],
+        .ca = true,
+        .path_len = if (smith.index(3) == 0) @intCast(smith.index(3)) else null,
+        .key_usage = 0x04,
+    });
+
+    const certs = fx.certs.items;
+    const leaf = &certs[0];
+    const intermediates = if (use_intermediate) certs[1..2] else certs[0..0];
+    const anchors = certs[certs.len - 1 ..];
+
+    const validation_policy: validator.ValidationPolicy = .{
+        .validation_time = validation_time,
+        .expected_dns_name = if (smith.index(3) == 0) "leaf.example.com" else null,
+        .require_server_auth_eku = smith.index(2) == 0,
+        .maximum_path_length = 2 + smith.index(5),
+        .enforce_anchor_validity = smith.index(4) == 0,
+        .trust_anchors = anchors,
+    };
+
+    var candidates = path_builder.build(allocator, leaf, intermediates, anchors, fuzz_builder_limits) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        // Nothing to validate; the builder's own invariants are #492's
+        // path-building target.
+        else => return,
+    };
+    defer candidates.deinit(allocator);
+
+    var result = validator.validateCandidates(allocator, candidates, validation_policy, cp);
+    defer result.deinit(allocator);
+
+    switch (result) {
+        .accepted => |accepted| {
+            try expectAcceptedPathWellFormed(accepted.accepted_path, candidates, validation_policy);
+            // A path is never accepted on a forged signature.
+            try testing.expect(!forged_leaf);
+            try testing.expect(!(use_intermediate and forged_intermediate));
+        },
+        .rejected => |failure| {
+            if (failure.certificate_index) |index| {
+                try testing.expect(index < fuzz_builder_limits.max_path_len);
+            }
+            if (failure.constraint_certificate_index) |index| {
+                try testing.expect(index < fuzz_builder_limits.max_path_len);
+            }
+            if (failure.extension_oid) |extension_oid| {
+                try testing.expect(extension_oid.components().len >= 2);
+                try testing.expect(extension_oid.components().len <= oid.max_components);
+            }
+            if (failure.policy_oid) |policy_oid| {
+                try testing.expect(policy_oid.components().len <= oid.max_components);
+            }
+        },
+    }
+
+    // Identical bytes, policy, and time must produce an identical verdict.
+    var replay = validator.validateCandidates(allocator, candidates, validation_policy, cp);
+    defer replay.deinit(allocator);
+    try expectSameVerdict(result, replay);
+
+    // Allocation failure at every reachable point: the verdict degrades to a
+    // structured rejection and every byte allocated on the failing path is
+    // released, so no partially owned accepted path escapes.
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var attempt = validator.validateCandidates(failing.allocator(), candidates, validation_policy, cp);
+        attempt.deinit(failing.allocator());
+        if (!failing.has_induced_failure) break;
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
