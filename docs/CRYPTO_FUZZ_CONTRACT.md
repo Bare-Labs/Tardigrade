@@ -837,8 +837,8 @@ zig build test-pki-fuzz -Doptimize=ReleaseFast -Dpki-test-filter="fuzz: PKI: pat
 # filter on their own name, or run the whole `test-pki` step):
 zig build test-pki-fuzz -Dpki-test-filter="a validation failure carries only reason and stage metadata, never borrowed memory" --summary all --error-style verbose
 zig build test-pki-fuzz -Dpki-test-filter="childReader rejects an offset and length whose sum overflows machine width" --summary all --error-style verbose
-zig build test-pki -Dpki-test-filter="validation classifies every algorithm and signature failure class" --summary all --error-style verbose
-zig build test-pki -Dpki-test-filter="validation pins the validity window and pathLenConstraint boundaries" --summary all --error-style verbose
+zig build test-pki-fuzz -Dpki-test-filter="validation classifies every algorithm and signature failure class" --summary all --error-style verbose
+zig build test-pki-fuzz -Dpki-test-filter="validation pins the validity window and pathLenConstraint boundaries" --summary all --error-style verbose
 ```
 
 `-Dpki-test-filter` defaults to `"fuzz: PKI:"`. That namespace is deliberately
