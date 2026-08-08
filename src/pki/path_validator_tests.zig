@@ -3086,6 +3086,153 @@ test "a validation failure carries only reason and stage metadata, never borrowe
 
 const fuzz_builder_limits: path_builder.Limits = .{ .max_path_len = 6, .max_paths = 4 };
 
+// --- Algorithm / signature failure classes ----------------------------------
+//
+// #492 lists "algorithm/signature failure classes" among the cases this
+// target must exercise. `path_validator.signatureFailure` maps `verify.zig`'s
+// five outcomes onto five distinct `FailureReason`s, and varying only *which
+// key signed* reaches exactly one of them (`signature_invalid`). The rest are
+// driven by mutating the already-parsed views just enough to hit the
+// classification seam.
+//
+// This is deliberately not a re-run of #376's provider-primitive
+// malformed-key/signature fuzzing: nothing here hands hostile bytes to a
+// crypto primitive. It mutates a *parsed* `AlgorithmIdentifier`,
+// `BitStringView`, or SPKI so `verify.verifyCertificateSignature` must
+// classify the mismatch, which is the seam this story owns. `raw`/`tbs_raw`
+// are intentionally left alone, so path structure still validates and the
+// signature layer is the only thing under test.
+//
+// Signature verification runs before validity, Basic Constraints, Key Usage,
+// EKU, Name Constraints, policy, and identity, so once path structure and the
+// critical-extension scan pass, the classification is the *first* rejection —
+// which is what lets these cases carry an exact reason oracle even while the
+// surrounding chain, policy, and time state stay adversarial.
+const SignatureCase = enum {
+    valid,
+    /// Construction-time: signed by a key nobody in the chain holds.
+    forged_leaf,
+    forged_intermediate,
+    /// Ed25519 signatures are exactly 64 bytes.
+    signature_truncated,
+    /// A signature BIT STRING must be octet-aligned.
+    signature_unaligned,
+    /// An OID outside the supported matrix.
+    algorithm_unknown_oid,
+    /// RFC 8410 §3: Ed25519 signatureAlgorithm parameters MUST be absent.
+    algorithm_ed25519_with_parameters,
+    /// Supported algorithm, supported key, inconsistent pairing.
+    algorithm_key_type_mismatch,
+    /// Ed25519 public keys are exactly 32 bytes.
+    issuer_key_truncated,
+    /// A public-key BIT STRING must be octet-aligned.
+    issuer_key_unaligned,
+    /// RFC 8410 §3: Ed25519 SPKI parameters MUST be absent.
+    issuer_key_with_parameters,
+};
+
+const signature_cases = std.enums.values(SignatureCase);
+
+/// An explicit ASN.1 NULL, used where a parameters field must be absent.
+const explicit_null_parameters = [_]u8{ 0x05, 0x00 };
+
+const SignatureExpectation = struct {
+    reason: validator.FailureReason,
+    certificate_index: usize,
+};
+
+/// Applies `signature_case`'s post-parse view mutation, if it has one, and
+/// returns the exact classification the validator owes it. The two `forged_*`
+/// cases are applied at construction time instead (see `.issuer_key` in the
+/// specs), so this only reports their expectation.
+fn applySignatureCase(
+    certificates: []x509.Certificate,
+    intermediate_count: usize,
+    signature_case: SignatureCase,
+) ?SignatureExpectation {
+    const leaf = &certificates[0];
+    // The leaf's issuer is always the next element: the first intermediate
+    // when there is one, otherwise the anchor itself.
+    const issuer = &certificates[1];
+    return switch (signature_case) {
+        .valid => null,
+        .forged_leaf => .{ .reason = .signature_invalid, .certificate_index = 0 },
+        .forged_intermediate => if (intermediate_count >= 1)
+            .{ .reason = .signature_invalid, .certificate_index = 1 }
+        else
+            // Nothing was forged: there is no intermediate to forge.
+            null,
+        .signature_truncated => blk: {
+            const signature = leaf.signature_value.data;
+            leaf.signature_value.data = signature[0 .. signature.len - 1];
+            break :blk .{ .reason = .signature_malformed, .certificate_index = 0 };
+        },
+        .signature_unaligned => blk: {
+            leaf.signature_value.unused_bits = 1;
+            break :blk .{ .reason = .signature_malformed, .certificate_index = 0 };
+        },
+        .algorithm_unknown_oid => blk: {
+            leaf.signature_algorithm.oid = oid.ObjectIdentifier.fromComponents(&[_]u32{ 1, 2, 3, 4, 5 }) catch unreachable;
+            break :blk .{ .reason = .signature_algorithm_unsupported, .certificate_index = 0 };
+        },
+        .algorithm_ed25519_with_parameters => blk: {
+            leaf.signature_algorithm.parameters_raw = &explicit_null_parameters;
+            break :blk .{ .reason = .signature_algorithm_unsupported, .certificate_index = 0 };
+        },
+        .algorithm_key_type_mismatch => blk: {
+            // An ECDSA-P256 signature algorithm against an Ed25519 issuer key:
+            // both are individually supported, the pairing is not.
+            leaf.signature_algorithm.oid = oid.ObjectIdentifier.fromComponents(&oid.well_known.ecdsa_with_sha256) catch unreachable;
+            leaf.signature_algorithm.parameters_raw = null;
+            break :blk .{ .reason = .signature_key_mismatch, .certificate_index = 0 };
+        },
+        .issuer_key_truncated => blk: {
+            const key = issuer.subject_public_key_info.subject_public_key.data;
+            issuer.subject_public_key_info.subject_public_key.data = key[0 .. key.len - 1];
+            break :blk .{ .reason = .issuer_public_key_malformed, .certificate_index = 0 };
+        },
+        .issuer_key_unaligned => blk: {
+            issuer.subject_public_key_info.subject_public_key.unused_bits = 1;
+            break :blk .{ .reason = .issuer_public_key_malformed, .certificate_index = 0 };
+        },
+        .issuer_key_with_parameters => blk: {
+            issuer.subject_public_key_info.algorithm.parameters_raw = &explicit_null_parameters;
+            break :blk .{ .reason = .issuer_public_key_malformed, .certificate_index = 0 };
+        },
+    };
+}
+
+/// A `leaf -> Intermediate -> Root` chain that is known-good except for
+/// `signature_case`'s construction-time forging, so a classification oracle
+/// over it has nothing else that could reject first.
+fn addSignatureCaseChain(fx: *Fixtures, signature_case: SignatureCase) !void {
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Intermediate",
+        .subject_key = 1,
+        .issuer_key = if (signature_case == .forged_leaf) 9 else 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .eku = .server,
+    });
+    try fx.add(.{
+        .subject = "Intermediate",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = if (signature_case == .forged_intermediate) 9 else 3,
+        .ca = true,
+        .key_usage = 0x04,
+    });
+    try fx.add(.{
+        .subject = "Root",
+        .issuer = "Root",
+        .subject_key = 3,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+    });
+}
+
 /// 2026-01-01T00:00:00Z and 2027-01-01T00:00:00Z, the exact Unix seconds of
 /// the `260101000000Z`/`270101000000Z` window `addValidChain` uses.
 const chain_not_before_unix: i64 = 1_767_225_600;
@@ -3191,66 +3338,111 @@ fn expectSameVerdict(first: validator.ValidationResult, second: validator.Valida
     }
 }
 
-test "fuzz: PKI: path validation is deterministic, bounded, and sanitized on adversarial chains" {
-    try testing.fuzz({}, fuzzPathValidation, .{ .corpus = &.{
-        "",
-        &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
-        &[_]u8{ 1, 0, 2, 1, 0, 3, 1, 1 },
-        &[_]u8{ 0, 2, 0, 0, 1, 0, 0, 0, 1 },
-        &([_]u8{1} ** 24),
-        &([_]u8{0xff} ** 32),
-    } });
-}
-
-fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
+test "validation classifies every algorithm and signature failure class" {
+    // `path_validator.signatureFailure` maps `verify.zig`'s five outcomes onto
+    // five distinct `FailureReason`s. Each is pinned here on a chain that is
+    // otherwise known-good, so the classification is the only thing that can
+    // reject: this proves every class is reachable and correctly mapped, which
+    // is what makes the fuzz target's exact reason oracle meaningful. The fuzz
+    // target then explores the same seam against generated path, policy, and
+    // time state, where one Smith draw only ever samples a single class.
     const allocator = testing.allocator;
-
     var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
     var provider: crypto.pure_zig.Provider = undefined;
     const cp = cryptoProvider(&entropy, &provider);
 
-    // --- Deterministic validity-boundary oracle -----------------------------
-    // Everything else about this chain is known-good, so the verdict is a
-    // pure function of where `validation_time` sits relative to the window.
+    var seen_reasons = std.EnumSet(validator.FailureReason).initEmpty();
+    for (signature_cases) |signature_case| {
+        var fx = Fixtures.init(allocator);
+        defer fx.deinit();
+        try addSignatureCaseChain(&fx, signature_case);
+        const expectation = applySignatureCase(fx.certs.items, 1, signature_case);
+        const anchors = fx.certs.items[2..3];
+        var result = try validateBuilt(
+            allocator,
+            &fx.certs.items[0],
+            fx.certs.items[1..2],
+            anchors,
+            policy(anchors),
+            cp,
+        );
+        defer result.deinit(allocator);
+        if (expectation) |expected| {
+            try expectRejected(&result, expected.reason, expected.certificate_index);
+            seen_reasons.insert(expected.reason);
+        } else {
+            try expectAccepted(&result, 3);
+        }
+    }
+
+    // All five classes really were exercised, so a future edit that quietly
+    // stops reaching one of them fails here instead of passing vacuously.
+    for ([_]validator.FailureReason{
+        .signature_invalid,
+        .signature_malformed,
+        .signature_algorithm_unsupported,
+        .signature_key_mismatch,
+        .issuer_public_key_malformed,
+    }) |reason| {
+        try testing.expect(seen_reasons.contains(reason));
+    }
+}
+
+test "validation pins the validity window and pathLenConstraint boundaries" {
+    const allocator = testing.allocator;
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+
+    // Everything else about this chain is known-good, so the verdict is a pure
+    // function of where `validation_time` sits relative to the window.
     {
         var fx = Fixtures.init(allocator);
         defer fx.deinit();
         try addValidChain(&fx, 1);
         const anchors = fx.certs.items[2..3];
-        const offsets = [_]i64{
-            chain_not_before_unix - 1,
-            chain_not_before_unix,
-            chain_not_after_unix,
-            chain_not_after_unix + 1,
+        const cases = [_]struct { time: i64, expected: ?validator.FailureReason }{
+            .{ .time = chain_not_before_unix - 1, .expected = .certificate_not_yet_valid },
+            .{ .time = chain_not_before_unix, .expected = null },
+            .{ .time = chain_not_after_unix, .expected = null },
+            .{ .time = chain_not_after_unix + 1, .expected = .certificate_expired },
         };
-        const choice = smith.index(offsets.len);
-        var boundary_policy = policy(anchors);
-        boundary_policy.validation_time = offsets[choice];
-        var result = try validateBuilt(allocator, &fx.certs.items[0], fx.certs.items[1..2], anchors, boundary_policy, cp);
-        defer result.deinit(allocator);
-        switch (choice) {
-            0 => try expectRejected(&result, .certificate_not_yet_valid, 0),
-            3 => try expectRejected(&result, .certificate_expired, 0),
-            else => try expectAccepted(&result, 3),
+        for (cases) |case| {
+            var boundary_policy = policy(anchors);
+            boundary_policy.validation_time = case.time;
+            var result = try validateBuilt(
+                allocator,
+                &fx.certs.items[0],
+                fx.certs.items[1..2],
+                anchors,
+                boundary_policy,
+                cp,
+            );
+            defer result.deinit(allocator);
+            if (case.expected) |reason| {
+                try expectRejected(&result, reason, 0);
+            } else {
+                try expectAccepted(&result, 3);
+            }
         }
     }
 
-    // --- Deterministic pathLenConstraint oracle -----------------------------
-    // A `leaf -> I1 -> I2 -> root` chain where everything except I2's
-    // pathLenConstraint is known-good. I2 sits at leaf-first index 2, so the
-    // validator counts one non-self-issued CA below it (I1): a constraint of
-    // 0 must be exceeded, and the otherwise-identical constraint of 1 must
-    // accept. This is the shape the randomized generator above can produce
-    // but cannot pin exactly.
+    // RFC 5280 path length needs a `leaf -> I1 -> I2 -> root` shape to be
+    // reachable at all: with a single intermediate the validator counts CA
+    // certificates in the empty slice `path.elements[1..1]`, so its
+    // `pathLenConstraint` can never be exceeded, and the anchor's own
+    // constraint is not a validation input. At leaf-first index 2, `I2` counts
+    // exactly one non-self-issued CA below it, so 0 must be exceeded and 1
+    // must accept.
+    //
+    // Every non-anchor certificate also asserts the same policy, so the
+    // accepted result carries a non-empty RFC 9618 constrained set. That is
+    // what makes the per-OID half of `expectSameVerdict`'s accepted branch
+    // live: against a chain with no policies extension both constrained
+    // slices are empty and only their lengths get compared.
     for ([_]u8{ 0, 1 }) |path_len| {
         var fx = Fixtures.init(allocator);
         defer fx.deinit();
-        // Every non-anchor certificate asserts the same policy, so the
-        // accepted result carries a non-empty RFC 9618 constrained set. That
-        // is what makes the per-OID half of the replay comparison live under
-        // plain `zig build test`: against a chain with no policies extension
-        // both constrained slices are empty and only their lengths get
-        // compared.
         const chain_policies: []const PolicySpec = &.{.{ .policy = &[_]u32{ 1, 3, 6, 1, 4, 1, 4242, 7 } }};
         try fx.add(.{
             .subject = "leaf",
@@ -3305,13 +3497,11 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
             try expectAccepted(&result, 4);
         }
 
-        // Replaying a *known-good* chain here, rather than only the
-        // randomized one below, is what gives `expectSameVerdict`'s accepted
-        // branch — including the RFC 9618 policy output — deterministic
-        // coverage under plain `zig build test`. The randomized chain reaches
-        // an accepted verdict readily under `--fuzz`, but essentially never
-        // during seed-corpus replay, so without this the accepted arm would
-        // be exercised only in long coverage-guided runs.
+        // Replaying a known-good chain is what gives `expectSameVerdict`'s
+        // accepted branch -- including the RFC 9618 policy output -- coverage
+        // under plain `zig build test`. The randomized chain in the fuzz
+        // target reaches an accepted verdict readily under `--fuzz`, but
+        // essentially never during seed-corpus replay.
         var replay = try validateBuilt(
             allocator,
             &fx.certs.items[0],
@@ -3323,8 +3513,34 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
         defer replay.deinit(allocator);
         try expectSameVerdict(result, replay);
     }
+}
 
-    // --- Randomized chain ---------------------------------------------------
+test "fuzz: PKI: path validation is deterministic, bounded, and sanitized on adversarial chains" {
+    try testing.fuzz({}, fuzzPathValidation, .{ .corpus = &.{
+        "",
+        &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        &[_]u8{ 1, 0, 2, 1, 0, 3, 1, 1 },
+        &[_]u8{ 0, 2, 0, 0, 1, 0, 0, 0, 1 },
+        &([_]u8{1} ** 24),
+        &([_]u8{0xff} ** 32),
+    } });
+}
+
+fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
+    const allocator = testing.allocator;
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+
+    // Deterministic boundary and classification oracles for this surface are
+    // named tests below (`validation pins ...`, `validation classifies ...`),
+    // not inline here: each of them builds and Ed25519-signs several chains,
+    // which inside the fuzz callback would be rebuilt on every iteration and
+    // throttle coverage-guided exploration by orders of magnitude for no
+    // additional coverage. As separate `test` blocks they still run under
+    // `zig build test`.
+
     var fx = Fixtures.init(allocator);
     defer fx.deinit();
 
@@ -3365,9 +3581,16 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
     const intermediate_window = windows[smith.index(windows.len)];
     const root_window = windows[smith.index(windows.len)];
     // A signature forged with a key nobody in the chain holds.
-    const forged_leaf = smith.index(6) == 0;
-    const forged_intermediate = smith.index(6) == 0;
-    const leaf_unknown = smith.index(6);
+    // One mutually-exclusive signature/algorithm case per run, so the
+    // resulting classification is unambiguous and can carry an exact oracle.
+    const signature_case = signature_cases[smith.index(signature_cases.len)];
+    const forged_leaf = signature_case == .forged_leaf;
+    const forged_intermediate = signature_case == .forged_intermediate;
+    // An unknown *critical* extension is rejected during the extension scan,
+    // which runs before signature verification, so it would mask the
+    // classification under test. The non-critical variant is harmless and
+    // stays available in every case.
+    const leaf_unknown = if (signature_case == .valid) smith.index(6) else 2 * smith.index(2);
     const intermediate_ca: ?bool = if (smith.index(6) == 0) null else smith.index(6) != 0;
 
     // Subject names and signing keys per shape, leaf-first. `nearest` is the
@@ -3422,7 +3645,7 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
                 .critical = smith.index(2) == 0,
             } else null,
             .certificate_policies = policy_sets[smith.index(policy_sets.len)],
-            .unknown_critical = smith.index(8) == 0,
+            .unknown_critical = signature_case == .valid and smith.index(8) == 0,
         });
     }
     if (intermediate_count == 2) {
@@ -3457,6 +3680,10 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
     });
 
     const certs = fx.certs.items;
+    // Mutate the parsed views before validating. Path discovery consumes
+    // names and key identifiers only, so this cannot perturb which candidates
+    // the builder finds -- just how the validator classifies them.
+    const expected_signature = applySignatureCase(certs, intermediate_count, signature_case);
     const leaf = &certs[0];
     const intermediates = certs[1 .. 1 + intermediate_count];
     const anchors = certs[certs.len - 1 ..];
@@ -3465,7 +3692,13 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
         .validation_time = validation_time,
         .expected_dns_name = if (smith.index(3) == 0) "leaf.example.com" else null,
         .require_server_auth_eku = smith.index(2) == 0,
-        .maximum_path_length = 2 + smith.index(5),
+        // A path longer than this bound is refused by the structure check,
+        // before signature verification, so when a classification is under
+        // test the bound must admit the whole candidate.
+        .maximum_path_length = if (signature_case == .valid)
+            2 + smith.index(5)
+        else
+            fuzz_builder_limits.max_path_len,
         .enforce_anchor_validity = smith.index(4) == 0,
         .trust_anchors = anchors,
     };
@@ -3484,9 +3717,9 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
     switch (result) {
         .accepted => |accepted| {
             try expectAcceptedPathWellFormed(accepted.accepted_path, candidates, validation_policy);
-            // A path is never accepted on a forged signature.
-            try testing.expect(!forged_leaf);
-            try testing.expect(!(intermediate_count >= 1 and forged_intermediate));
+            // A signature or algorithm defect is never accepted, whatever the
+            // rest of the generated chain, policy, and time state says.
+            try testing.expect(expected_signature == null);
         },
         .rejected => |failure| {
             if (failure.certificate_index) |index| {
@@ -3501,6 +3734,24 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
             }
             if (failure.policy_oid) |policy_oid| {
                 try testing.expect(policy_oid.components().len <= oid.max_components);
+            }
+            if (expected_signature) |expected| {
+                // Signature verification precedes validity, Basic
+                // Constraints, Key Usage, EKU, Name Constraints, policy, and
+                // identity, and the generator above keeps the two checks that
+                // *do* run earlier (path structure and the critical-extension
+                // scan) from rejecting, so this classification is the first
+                // rejection and the reason is exact.
+                if (candidates.truncated) {
+                    // The one documented exception: a truncated bounded
+                    // search reports the resource limit for the whole
+                    // candidate set instead of any single path's reason.
+                    try testing.expect(failure.reason == .validation_resource_limit_exceeded or
+                        failure.reason == expected.reason);
+                } else {
+                    try testing.expectEqual(expected.reason, failure.reason);
+                    try testing.expectEqual(@as(?usize, expected.certificate_index), failure.certificate_index);
+                }
             }
         },
     }
