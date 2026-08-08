@@ -68,10 +68,13 @@ pub const IntegrationStatus = enum {
     not_provider_routed,
 };
 
-/// Product profile a row's implementation is reachable from today. Derived
-/// mechanically from `pure_zig_status` / `openssl_status`: a backend that
-/// reports `.supported` is exactly the backend the matching product profile
-/// selects, so this does not encode a separate judgment call.
+/// Product profile a row's implementation is reachable from today. This is an
+/// explicitly authored product-policy dimension, independent of the
+/// primitive/provider implementation status. A capability can be implemented by
+/// the pure-Zig provider and be live in the shared TLS engine without being
+/// enabled for `.native_appliance`, while `.general_purpose_openssl` can still
+/// enable a capability through the separate OpenSSL TLS backend even when
+/// `.openssl_status == .provider_deferred`.
 pub const ProductProfile = enum {
     /// The native, OpenSSL/libcrypto-free in-process pure-Zig QUIC/H3 path.
     native_appliance,
