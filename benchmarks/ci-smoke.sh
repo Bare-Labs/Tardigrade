@@ -96,7 +96,9 @@ python3 "${BENCH_DIR}/fixtures/upstream_server.py" --port "${UPSTREAM_PORT}" >"$
 UPSTREAM_PID="$!"
 wait_for_http "http://127.0.0.1:${UPSTREAM_PORT}/health"
 
-TARDIGRADE_RATE_LIMIT_RPS=0 "${BINARY}" run -c "${CONFIG_FILE}" >"${TMP_DIR}/tardigrade.log" 2>&1 &
+TARDIGRADE_RATE_LIMIT_RPS=0 \
+TARDIGRADE_MAX_REQUESTS_PER_CONNECTION=0 \
+"${BINARY}" run -c "${CONFIG_FILE}" >"${TMP_DIR}/tardigrade.log" 2>&1 &
 TARDIGRADE_PID="$!"
 wait_for_http "http://127.0.0.1:${LISTEN_PORT}/health"
 
