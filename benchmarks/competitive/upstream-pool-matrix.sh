@@ -364,30 +364,34 @@ worker_sweep_json() {
     done
     LOCK_METRICS=false
     jq -n --argjson rows "$result" '
-    ($rows[0] // {}) as $base |
-    ($rows | map(. + {
+    def lower_peak($rows; $idx):
+        if $idx <= 0 then null
+        else ($rows[0:$idx] | map(.rps // 0) | max)
+        end;
+    ($rows | to_entries | map(.value as $row | lower_peak($rows; .key) as $peak | $row + {
         pool_lock_wait_fraction_of_p99: (
-            if (.p99_ms // 0) > 0 and (.pool_lock_wait_ns_per_request // null) != null
-            then (.pool_lock_wait_ns_per_request / (.p99_ms * 1000000.0))
+            if ($row.p99_ms // 0) > 0 and ($row.pool_lock_wait_ns_per_request // null) != null
+            then ($row.pool_lock_wait_ns_per_request / ($row.p99_ms * 1000000.0))
             else null
             end
         ),
-        throughput_drop_from_1w: (
-            if ($base.rps // 0) > 0 and (.worker_threads // 1) > ($base.worker_threads // 1)
-            then (($base.rps - (.rps // 0)) / $base.rps)
+        lower_core_peak_rps: $peak,
+        throughput_drop_from_lower_core_peak: (
+            if ($peak // 0) > 0 and ($row.worker_threads // 1) > 1 and ($row.rps // 0) < $peak
+            then (($peak - ($row.rps // 0)) / $peak)
             else 0
             end
         )
     })) as $annotated |
     ($annotated | map(.pool_lock_wait_fraction_of_p99 // 0) | max) as $max_lock_fraction |
-    ($annotated | map(.throughput_drop_from_1w // 0) | max) as $max_throughput_drop |
+    ($annotated | map(.throughput_drop_from_lower_core_peak // 0) | max) as $max_throughput_drop |
     {
         covered: true,
-        sharding_justified: ($max_lock_fraction >= 0.05 and $max_throughput_drop >= 0.10),
-        sharding_decision_rule: "Shard only when measured pool-lock wait reaches at least 5% of p99 latency and higher-worker rows show at least 10% throughput regression from the 1-worker baseline.",
+        sharding_justified: any($annotated[]; ((.worker_threads // 1) > 1) and ((.pool_lock_wait_fraction_of_p99 // 0) >= 0.05) and ((.throughput_drop_from_lower_core_peak // 0) >= 0.10)),
+        sharding_decision_rule: "Shard only when the same higher-worker row shows pool-lock wait at least 5% of p99 latency and at least 10% throughput regression from the best lower-worker throughput.",
         max_pool_lock_wait_fraction_of_p99: $max_lock_fraction,
-        max_throughput_drop_from_1w: $max_throughput_drop,
-        reason: "Derived from opt-in shared upstream-pool mutex wait counters correlated with throughput and p99 movement across the worker sweep.",
+        max_throughput_drop_from_lower_core_peak: $max_throughput_drop,
+        reason: "Derived from opt-in shared upstream-pool mutex wait counters correlated on the same worker-count row with throughput regression from the lower-core peak.",
         measurements: $annotated
     }'
 }
@@ -500,7 +504,9 @@ origins_json="$(jq --argjson elapsed "$origins_elapsed" '
 
 start_gateway "$THREADS"
 tls_json="$(run_measured_wrk tls-origin tls-origin "$DURATION" "$CONNECTIONS" "$THREADS" true)"
-contention_json="$(worker_sweep_json)"
+contention_file="${TMP_DIR}/pool-contention.json"
+worker_sweep_json > "$contention_file"
+contention_json="$(cat "$contention_file")"
 
 jq -n \
     --argjson duration "$DURATION" \
