@@ -121,11 +121,23 @@ answers an OpenSSL client request, and the native client reads an OpenSSL
 
 The dedicated `record/server/openssl/http2_entrypoint` row pins ALPN `h2`
 against `openssl s_client` and sends the RFC 9113 client connection preface
-plus an empty SETTINGS frame after negotiation. The native server verifies the
-preface arrived as decrypted application data before it completes the row.
-This keeps the TCP harness at the TLS boundary: it proves the HTTP/2 entrypoint
-is reachable under negotiated TLS keys without linking OpenSSL into any
-Tardigrade test binary.
+plus an empty SETTINGS frame after negotiation. The native server requires the
+complete 24-byte preface and the following 9-byte SETTINGS frame to arrive as
+decrypted application data before it completes the row. This keeps the TCP
+harness at the TLS boundary: it proves the HTTP/2 entrypoint is reachable
+under negotiated TLS keys without linking OpenSSL into any Tardigrade test
+binary.
+
+### Shutdown and truncation
+
+Two OpenSSL-backed server rows make TCP shutdown behavior explicit instead of
+letting ordinary positive rows finish before the peer's terminal behavior is
+observed:
+
+| Row | Peer behavior | Expectation |
+| --- | --- | --- |
+| `record/server/openssl/close_notify` | OpenSSL closes the TLS session normally after stdin EOF | the native stream observes peer `close_notify` without a terminal error |
+| `record/server/openssl/truncation` | OpenSSL is terminated after application data without sending `close_notify` | the native stream reports `TruncatedStream` |
 
 ### Post-handshake KeyUpdate
 

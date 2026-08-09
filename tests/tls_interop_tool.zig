@@ -73,6 +73,7 @@ fn trace(comptime fmt: []const u8, args: anytype) void {
 // -- Arguments --------------------------------------------------------------
 
 const Expect = enum { ok, fail };
+const PeerCloseExpectation = enum { none, clean, truncated };
 
 const Args = struct {
     mode: enum { client, server },
@@ -90,6 +91,8 @@ const Args = struct {
     expect_alpn: []const u8 = "",
     send: []const u8 = "",
     expect_contains: []const u8 = "",
+    expect_min_bytes: usize = 0,
+    expect_peer_close: PeerCloseExpectation = .none,
     expect: Expect = .ok,
     expect_alert: []const u8 = "",
     expect_error: []const u8 = "",
@@ -158,7 +161,8 @@ const usage =
     \\expectations (these drive the exit code):
     \\  --expect ok|fail --expect-alert NAME --expect-error NAME
     \\  --expect-alpn NAME --expect-hrr
-    \\  --send STR --expect-contains STR
+    \\  --send STR --expect-contains STR --expect-min-bytes N
+    \\  --expect-peer-close clean|truncated
     \\  --key-update not-requested|requested   send one post-handshake KeyUpdate
     \\  --expect-key-updates N                 require N received KeyUpdates
     \\  --transcript PATH             secret-free transcript + failure fixture
@@ -223,6 +227,16 @@ fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !?Args {
             args.send = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
         } else if (std.mem.eql(u8, arg, "--expect-contains")) {
             args.expect_contains = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, arg, "--expect-min-bytes")) {
+            args.expect_min_bytes = try std.fmt.parseInt(usize, it.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, arg, "--expect-peer-close")) {
+            const raw = it.next() orelse return error.MissingValue;
+            args.expect_peer_close = if (std.mem.eql(u8, raw, "clean"))
+                .clean
+            else if (std.mem.eql(u8, raw, "truncated"))
+                .truncated
+            else
+                return error.UnknownPeerCloseExpectation;
         } else if (std.mem.eql(u8, arg, "--expect")) {
             const raw = it.next() orelse return error.MissingValue;
             args.expect = if (std.mem.eql(u8, raw, "ok"))
@@ -544,6 +558,9 @@ const Outcome = struct {
     /// True once the row's own `--key-update` message has been queued, so the
     /// send is attempted exactly once however many times the loop spins.
     key_update_sent: bool = false,
+    /// A peer `close_notify` observed by the record stream. Abrupt EOF without
+    /// `close_notify` is reported separately as `error.TruncatedStream`.
+    peer_closed: bool = false,
 };
 
 /// The alert that characterises this run's failure, whichever side produced
@@ -751,13 +768,17 @@ const Runner = struct {
         // connection is finishing normally, not failing -- so a close observed
         // afterwards must not overwrite the result.
         var delivered = false;
+        const expect_peer_close = self.args.expect_peer_close != .none;
 
         while (nowMs() < deadline) {
             _ = stream.drive() catch |err| {
-                if (delivered) break;
+                if (delivered and !expect_peer_close) break;
                 outcome.failure = err;
+                outcome.ok = false;
                 break;
             };
+
+            if (delivered and self.args.expect_peer_close == .clean and stream.readiness().peer_closed) break;
 
             if (stream.applicationDataOpen()) {
                 outcome.handshake_complete = true;
@@ -771,8 +792,9 @@ const Runner = struct {
                         stream.requestKeyUpdate(request) catch |err| switch (err) {
                             error.WouldBlock => {},
                             else => {
-                                if (delivered) break;
+                                if (delivered and !expect_peer_close) break;
                                 outcome.failure = err;
+                                outcome.ok = false;
                                 break;
                             },
                         };
@@ -784,8 +806,9 @@ const Runner = struct {
                 const n = stream.stream().read(&buf) catch |err| switch (err) {
                     error.WouldBlock => 0,
                     else => {
-                        if (delivered) break;
+                        if (delivered and !expect_peer_close) break;
                         outcome.failure = err;
+                        outcome.ok = false;
                         break;
                     },
                 };
@@ -802,8 +825,9 @@ const Runner = struct {
                     const wrote = stream.stream().write(self.args.send[sent_len..]) catch |err| switch (err) {
                         error.WouldBlock => 0,
                         else => {
-                            if (delivered) break;
+                            if (delivered and !expect_peer_close) break;
                             outcome.failure = err;
+                            outcome.ok = false;
                             break;
                         },
                     };
@@ -821,13 +845,14 @@ const Runner = struct {
                     // outbound queue. Breaking with bytes still buffered would
                     // close the connection before the peer ever saw them,
                     // failing the row on the peer's side instead of ours.
-                    if (stream.bufferSnapshot().current.outbound_ciphertext == 0) break;
+                    if (stream.bufferSnapshot().current.outbound_ciphertext == 0 and !expect_peer_close) break;
                 }
             }
 
             if (stream.failed) |err| {
-                if (delivered) break;
+                if (delivered and !expect_peer_close) break;
                 outcome.failure = err;
+                outcome.ok = false;
                 break;
             }
             waitForCarrier(fd, &stream, deadline);
@@ -840,6 +865,7 @@ const Runner = struct {
         outcome.hello_retry_request = backend.core.retry_state != .none;
         outcome.certificate = stream.certificateState();
         outcome.peer_alert = stream.peerAlert();
+        outcome.peer_closed = stream.readiness().peer_closed;
         if (outcome.handshake_complete) {
             outcome.cipher_suite = backend.negotiated_cipher_suite;
             outcome.named_group = backend.negotiated_named_group;
@@ -866,6 +892,7 @@ const Runner = struct {
     /// a real proof: bytes only arrive after both Finished messages verified
     /// and the traffic keys agreed.
     fn matched(self: *const Runner, received: []const u8) bool {
+        if (received.len < self.args.expect_min_bytes) return false;
         if (self.args.expect_contains.len == 0) return received.len > 0;
         return std.mem.indexOf(u8, received, self.args.expect_contains) != null;
     }
@@ -955,6 +982,7 @@ fn reportLine(buf: []u8, args: Args, outcome: Outcome) []const u8 {
             outcome.key_updates_read,
         });
     }
+    if (outcome.peer_closed) report.print(" peer_close=clean", .{});
     report.print("\n", .{});
     return report.written();
 }
@@ -985,6 +1013,7 @@ fn writeTranscript(path: []const u8, args: Args, outcome: Outcome, transcript: *
     report.print("certificate: {s}\n", .{@tagName(outcome.certificate)});
     report.print("hello_retry_request: {}\n", .{outcome.hello_retry_request});
     report.print("application_bytes_received: {d}\n", .{outcome.received_len});
+    report.print("peer_close: {s}\n", .{if (outcome.peer_closed) "clean" else "none"});
     report.print("key_updates.sent: {d}\n", .{outcome.key_updates_written});
     report.print("key_updates.received: {d}\n", .{outcome.key_updates_read});
     if (outcome.failure) |err| report.print("failure: {s}\n", .{@errorName(err)});
@@ -1087,6 +1116,31 @@ fn evaluate(args: Args, outcome: Outcome) u8 {
             outcome.key_updates_read,
         });
         failed = true;
+    }
+
+    if (outcome.received_len < args.expect_min_bytes) {
+        std.debug.print("tls-interop: expected at least {d} application byte(s) but observed {d}\n", .{
+            args.expect_min_bytes,
+            outcome.received_len,
+        });
+        failed = true;
+    }
+
+    switch (args.expect_peer_close) {
+        .none => {},
+        .clean => if (!outcome.peer_closed or outcome.failure != null) {
+            std.debug.print("tls-interop: expected clean peer close_notify but observed peer_closed={} error={?s}\n", .{
+                outcome.peer_closed,
+                if (outcome.failure) |err| @errorName(err) else null,
+            });
+            failed = true;
+        },
+        .truncated => if (outcome.failure == null or outcome.failure.? != error.TruncatedStream) {
+            std.debug.print("tls-interop: expected truncated peer close but observed error={?s}\n", .{
+                if (outcome.failure) |err| @errorName(err) else null,
+            });
+            failed = true;
+        },
     }
 
     // Which credential the *engine* selected, for rows that offer several.

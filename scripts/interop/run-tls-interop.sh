@@ -197,6 +197,8 @@ list_matrix_rows() {
   say "positive  record/server/openssl/key-update/reciprocal"
   say "positive  record/client/openssl/key-update/reciprocal"
   say "positive  record/client/openssl/key-update/one-way"
+  say "positive  record/server/openssl/close_notify"
+  say "negative  record/server/openssl/truncation"
   say "negative  record/negative/alpn_no_overlap"
   say "negative  record/negative/tls12_downgrade"
   say "negative  record/negative/cipher_no_overlap"
@@ -366,6 +368,51 @@ run_server_row() { # name peer suite group signature [extra native args...]
   local name="$1" peer="$2" suite="$3" group="$4" sig="$5"
   shift 5
   run_server_alpn_row "$name" "$peer" "$suite" "$group" "$sig" http/1.1 once "$@"
+}
+
+run_server_truncation_row() {
+  local name="record/server/openssl/truncation"
+  local suite="aes128-gcm-sha256" group="x25519" sig="ed25519"
+  local p log cert fifo peer_pid native_pid
+  next_port; p="$port"
+  log="$logs/${name//\//_}"
+  cert="$(cert_for_signature "$sig")"
+  fifo="$workdir/${name//\//_}.fifo"
+  mkfifo "$fifo"
+
+  "$tls_tool" server --port "$p" --cert "$cert-cert.pem" --key "$cert-key.pem" \
+    --cipher-suite "$suite" --group "$group" --signature "$sig" \
+    --alpn http/1.1 --expect fail --expect-error TruncatedStream \
+    --expect-peer-close truncated \
+    --transcript "$transcripts/${name//\//_}.txt" \
+    --timeout-ms 20000 > "$log.native" 2>&1 &
+  native_pid=$!
+  if ! wait_for_native_listener "$log.native"; then
+    kill "$native_pid" 2>/dev/null
+    result "$name" FAIL "native listener never came up"
+    return
+  fi
+
+  "$openssl_bin" s_client -connect "127.0.0.1:$p" \
+    -servername tardigrade.test -tls1_3 \
+    -ciphersuites "$(openssl_suite "$suite")" -groups "$(openssl_group "$group")" \
+    -sigalgs "$(openssl_sigalg "$sig")" -alpn http/1.1 \
+    -CAfile "$cert-cert.pem" < "$fifo" > "$log.peer" 2>&1 &
+  peer_pid=$!
+
+  exec 3>"$fifo"
+  printf 'GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n' >&3
+  sleep 1
+  kill -KILL "$peer_pid" 2>/dev/null
+  exec 3>&-
+  wait "$peer_pid" 2>/dev/null
+  rm -f "$fifo"
+
+  if wait "$native_pid"; then
+    result "$name" PASS "$(grep -o 'error=.*' "$log.native" | head -1)"
+  else
+    result "$name" FAIL "see $log.native"
+  fi
 }
 
 # native TLS client -> external server
@@ -578,7 +625,8 @@ say "== record transport: HTTP protocol entrypoints =="
 # frame after negotiation, and the native server verifies those bytes crossed
 # under the negotiated TLS 1.3 application keys.
 run_server_alpn_row "record/server/openssl/http2_entrypoint" openssl aes128-gcm-sha256 x25519 ed25519 \
-  h2 h2_preface --expect-contains "PRI * HTTP/2.0" --send "tardigrade-h2-interop"
+  h2 h2_preface --expect-contains $'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' \
+  --expect-min-bytes 33 --send "tardigrade-h2-interop"
 
 # ── 2. HelloRetryRequest, both roles ────────────────────────────────────────
 
@@ -620,6 +668,12 @@ run_client_row "record/client/openssl/key-update/reciprocal" openssl aes128-gcm-
 # peer must follow the transition without being prompted to make one itself.
 run_client_row "record/client/openssl/key-update/one-way" openssl aes128-gcm-sha256 x25519 ed25519 \
   --key-update not-requested
+
+# #358: shutdown semantics are asserted explicitly because ordinary positive
+# rows may complete before observing the peer's terminal close behavior.
+run_server_row "record/server/openssl/close_notify" openssl aes128-gcm-sha256 x25519 ed25519 \
+  --expect-peer-close clean
+run_server_truncation_row
 
 # ── 3. negative conformance rows ────────────────────────────────────────────
 
