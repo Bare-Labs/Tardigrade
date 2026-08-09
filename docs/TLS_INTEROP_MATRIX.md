@@ -1,7 +1,11 @@
 # Shared TLS-engine interoperability and conformance matrix
 
-Tracking issue: [#338](https://github.com/Bare-Systems/Tardigrade/issues/338)
-(research story 323-J).
+Tracking issues:
+
+- [#338](https://github.com/Bare-Systems/Tardigrade/issues/338) — shared TLS
+  engine conformance matrix.
+- [#358](https://github.com/Bare-Systems/Tardigrade/issues/358) — TLS-over-TCP
+  OpenSSL interoperability harness.
 
 This suite proves that the TLS 1.3 engine Tardigrade ships — one engine, two
 transports — interoperates with independent implementations across every
@@ -34,9 +38,11 @@ scripts/interop/run-tls-interop.sh --profile ci
 scripts/interop/run-tls-interop.sh --list --profile ci
 ```
 
-`openssl` is required. `gnutls-cli`/`gnutls-serv` are optional; without them
-the independent-implementation rows report `SKIP` rather than failing, so the
-suite still runs on a machine that only has OpenSSL.
+OpenSSL 3.x is required for the OpenSSL rows. The runner prints the exact
+`openssl version` in its summary so a failing transcript can be reproduced
+against the same peer build. `gnutls-cli`/`gnutls-serv` are optional; without
+them the independent-implementation rows report `SKIP` rather than failing, so
+the suite still runs on a machine that only has OpenSSL.
 
 | Variable | Meaning |
 | --- | --- |
@@ -105,6 +111,21 @@ negotiation tuple traverses the QUIC transport of the same engine and lands
 where it was told to. The external QUIC/H3 peer matrix (ngtcp2, quiche,
 aioquic, both directions, HRR included) already exists in
 `scripts/interop/run-interop.sh` and is not duplicated here.
+
+### HTTP protocol entrypoints
+
+The record-transport positive sweep uses ALPN `http/1.1` and sends application
+bytes after the Finished messages in both directions: the native server
+answers an OpenSSL client request, and the native client reads an OpenSSL
+`s_server -www` response.
+
+The dedicated `record/server/openssl/http2_entrypoint` row pins ALPN `h2`
+against `openssl s_client` and sends the RFC 9113 client connection preface
+plus an empty SETTINGS frame after negotiation. The native server verifies the
+preface arrived as decrypted application data before it completes the row.
+This keeps the TCP harness at the TLS boundary: it proves the HTTP/2 entrypoint
+is reachable under negotiated TLS keys without linking OpenSSL into any
+Tardigrade test binary.
 
 ### Post-handshake KeyUpdate
 
