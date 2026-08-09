@@ -171,6 +171,52 @@ check_peer_spellings() {
   fi
 }
 
+list_matrix_rows() {
+  say "profile: $profile"
+  say "engine capabilities: ${#suites[@]} suites x ${#groups[@]} groups x ${#signatures[@]} signatures"
+  for suite in "${suites[@]}"; do
+    for group in "${groups[@]}"; do
+      for sig in "${signatures[@]}"; do
+        tuple="$suite/$group/$sig"
+        say "positive  record/server/openssl/$tuple"
+        say "positive  record/client/openssl/$tuple"
+        if [ "$have_gnutls" -eq 0 ]; then
+          say "skip      record/server/gnutls/$tuple"
+          say "skip      record/client/gnutls/$tuple"
+        elif gnutls_row_in_profile "$suite" "$group" "$sig"; then
+          say "positive  record/server/gnutls/$tuple"
+          say "positive  record/client/gnutls/$tuple"
+        fi
+        say "positive  quic/loopback/$tuple"
+      done
+    done
+  done
+  say "positive  record/server/openssl/http2_entrypoint"
+  say "positive  record/server/openssl/hrr"
+  say "positive  record/client/openssl/hrr"
+  say "positive  record/server/openssl/key-update/reciprocal"
+  say "positive  record/client/openssl/key-update/reciprocal"
+  say "positive  record/client/openssl/key-update/one-way"
+  say "positive  record/server/openssl/close_notify"
+  say "negative  record/server/openssl/truncation"
+  say "negative  record/negative/alpn_no_overlap"
+  say "negative  record/negative/tls12_downgrade"
+  say "negative  record/negative/cipher_no_overlap"
+  say "negative  record/negative/group_no_overlap"
+  say "negative  record/negative/signature_no_overlap"
+  say "negative  record/negative/sni_absent"
+  say "negative  record/negative/malformed_ordering"
+  say "negative  record/negative/ccs_before_clienthello"
+  say "negative  record/negative/wrong_pinned_certificate"
+  say "selection record/selection/sni_ed25519"
+  say "selection record/selection/sni_ecdsa_p256"
+  say "selection record/selection/sni_rsa"
+  say "selection record/selection/unknown_sni_uses_default"
+  say "selection record/selection/sigalgs_ed25519"
+  say "selection record/selection/sigalgs_rsa_pss"
+  say "selection record/selection/no_applicable_credential"
+}
+
 openssl_suite() {
   case "$1" in
     aes128-gcm-sha256) echo TLS_AES_128_GCM_SHA256 ;;
@@ -263,15 +309,19 @@ peer_request_stdin() { # once|keep_writing
       printf 'GET / HTTP/1.0\r\nX-Key-Update-Probe: 1\r\n\r\n'
       sleep 2
       ;;
+    h2_preface)
+      printf 'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+      printf '\x00\x00\x00\x04\x00\x00\x00\x00\x00'
+      ;;
     *) printf 'GET / HTTP/1.0\r\n\r\n' ;;
   esac
 }
 
 # native TLS server <- external client
-run_server_row() { # name peer suite group signature [extra native args...]
-  local name="$1" peer="$2" suite="$3" group="$4" sig="$5"
-  shift 5
-  local p log cert peer_groups peer_stdin
+run_server_alpn_row() { # name peer suite group signature alpn peer_stdin [extra native args...]
+  local name="$1" peer="$2" suite="$3" group="$4" sig="$5" alpn="$6" peer_stdin="$7"
+  shift 7
+  local p log cert peer_groups
   next_port; p="$port"
   log="$logs/${name//\//_}"
   cert="$(cert_for_signature "$sig")"
@@ -279,12 +329,11 @@ run_server_row() { # name peer suite group signature [extra native args...]
   # native server does not accept; ordinary rows offer the row's own group.
   peer_groups="$(openssl_group "$group")"
   case " $* " in *" --expect-hrr "*) peer_groups="P-384:$(openssl_group "$group")" ;; esac
-  peer_stdin=once
   case " $* " in *" --key-update "*) peer_stdin=keep_writing ;; esac
 
   "$tls_tool" server --port "$p" --cert "$cert-cert.pem" --key "$cert-key.pem" \
     --cipher-suite "$suite" --group "$group" --signature "$sig" \
-    --alpn http/1.1 --transcript "$transcripts/${name//\//_}.txt" \
+    --alpn "$alpn" --transcript "$transcripts/${name//\//_}.txt" \
     --timeout-ms 20000 "$@" > "$log.native" 2>&1 &
   local native_pid=$!
   if ! wait_for_native_listener "$log.native"; then
@@ -298,18 +347,69 @@ run_server_row() { # name peer suite group signature [extra native args...]
       peer_request_stdin "$peer_stdin" | "$openssl_bin" s_client -connect "127.0.0.1:$p" \
         -servername tardigrade.test -tls1_3 \
         -ciphersuites "$(openssl_suite "$suite")" -groups "$peer_groups" \
-        -sigalgs "$(openssl_sigalg "$sig")" -alpn http/1.1 \
+        -sigalgs "$(openssl_sigalg "$sig")" -alpn "$alpn" \
         -CAfile "$cert-cert.pem" > "$log.peer" 2>&1
       ;;
     gnutls)
       peer_request_stdin "$peer_stdin" | "$gnutls_cli" --port "$p" \
-        --x509cafile "$cert-cert.pem" --alpn=http/1.1 --sni-hostname=tardigrade.test \
+        --x509cafile "$cert-cert.pem" --alpn="$alpn" --sni-hostname=tardigrade.test \
         --priority "$(gnutls_priority "$suite" "$group" "$sig")" 127.0.0.1 > "$log.peer" 2>&1
       ;;
   esac
 
   if wait "$native_pid"; then
     result "$name" PASS "$(grep -o 'suite=.*' "$log.native" | head -1)"
+  else
+    result "$name" FAIL "see $log.native"
+  fi
+}
+
+run_server_row() { # name peer suite group signature [extra native args...]
+  local name="$1" peer="$2" suite="$3" group="$4" sig="$5"
+  shift 5
+  run_server_alpn_row "$name" "$peer" "$suite" "$group" "$sig" http/1.1 once "$@"
+}
+
+run_server_truncation_row() {
+  local name="record/server/openssl/truncation"
+  local suite="aes128-gcm-sha256" group="x25519" sig="ed25519"
+  local p log cert fifo peer_pid native_pid
+  next_port; p="$port"
+  log="$logs/${name//\//_}"
+  cert="$(cert_for_signature "$sig")"
+  fifo="$workdir/${name//\//_}.fifo"
+  mkfifo "$fifo"
+
+  "$tls_tool" server --port "$p" --cert "$cert-cert.pem" --key "$cert-key.pem" \
+    --cipher-suite "$suite" --group "$group" --signature "$sig" \
+    --alpn http/1.1 --expect fail --expect-error TruncatedStream \
+    --expect-peer-close truncated --expect-min-bytes 42 \
+    --transcript "$transcripts/${name//\//_}.txt" \
+    --timeout-ms 20000 > "$log.native" 2>&1 &
+  native_pid=$!
+  if ! wait_for_native_listener "$log.native"; then
+    kill "$native_pid" 2>/dev/null
+    result "$name" FAIL "native listener never came up"
+    return
+  fi
+
+  "$openssl_bin" s_client -connect "127.0.0.1:$p" \
+    -servername tardigrade.test -tls1_3 \
+    -ciphersuites "$(openssl_suite "$suite")" -groups "$(openssl_group "$group")" \
+    -sigalgs "$(openssl_sigalg "$sig")" -alpn http/1.1 \
+    -CAfile "$cert-cert.pem" < "$fifo" > "$log.peer" 2>&1 &
+  peer_pid=$!
+
+  exec 3>"$fifo"
+  printf 'GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n' >&3
+  sleep 1
+  kill -KILL "$peer_pid" 2>/dev/null
+  exec 3>&-
+  wait "$peer_pid" 2>/dev/null
+  rm -f "$fifo"
+
+  if wait "$native_pid"; then
+    result "$name" PASS "$(grep -o 'error=.*' "$log.native" | head -1)"
   else
     result "$name" FAIL "see $log.native"
   fi
@@ -476,15 +576,7 @@ load_capabilities
 check_peer_spellings
 
 if [ "$list_only" -eq 1 ]; then
-  say "profile: $profile"
-  say "engine capabilities: ${#suites[@]} suites x ${#groups[@]} groups x ${#signatures[@]} signatures"
-  for suite in "${suites[@]}"; do
-    for group in "${groups[@]}"; do
-      for sig in "${signatures[@]}"; do
-        say "positive  $suite/$group/$sig"
-      done
-    done
-  done
+  list_matrix_rows
   exit 0
 fi
 
@@ -524,6 +616,17 @@ for suite in "${suites[@]}"; do
     done
   done
 done
+
+say ""
+say "== record transport: HTTP protocol entrypoints =="
+# #358: the positive tuple sweep proves HTTP/1.1 application bytes in both
+# roles. This row pins the HTTP/2 ALPN entrypoint against OpenSSL too: the
+# peer sends the RFC 9113 client connection preface and an empty SETTINGS
+# frame after negotiation, and the native server verifies those bytes crossed
+# under the negotiated TLS 1.3 application keys.
+run_server_alpn_row "record/server/openssl/http2_entrypoint" openssl aes128-gcm-sha256 x25519 ed25519 \
+  h2 h2_preface --expect-contains $'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' \
+  --expect-min-bytes 33 --send "tardigrade-h2-interop"
 
 # ── 2. HelloRetryRequest, both roles ────────────────────────────────────────
 
@@ -565,6 +668,12 @@ run_client_row "record/client/openssl/key-update/reciprocal" openssl aes128-gcm-
 # peer must follow the transition without being prompted to make one itself.
 run_client_row "record/client/openssl/key-update/one-way" openssl aes128-gcm-sha256 x25519 ed25519 \
   --key-update not-requested
+
+# #358: shutdown semantics are asserted explicitly because ordinary positive
+# rows may complete before observing the peer's terminal close behavior.
+run_server_row "record/server/openssl/close_notify" openssl aes128-gcm-sha256 x25519 ed25519 \
+  --expect-peer-close clean
+run_server_truncation_row
 
 # ── 3. negative conformance rows ────────────────────────────────────────────
 
