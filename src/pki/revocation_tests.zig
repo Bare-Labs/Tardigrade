@@ -1259,10 +1259,12 @@ test "a longer candidate's evidence cannot invalidate a shorter candidate" {
     try testing.expectEqual(@as(usize, 2), report.entries.len);
 }
 
-test "status_request_v2 cannot be satisfied by ordinary TLS 1.3 stapling" {
-    // RFC 8446 §4.4.2.1 obsoletes RFC 6961 and forbids a TLS 1.3 server from
-    // acting on status_request_v2, so a v1 staple cannot prove a feature-17
-    // declaration was honored.
+test "status_request_v2 alone creates no stapling obligation on TLS 1.3" {
+    // RFC 8446 §4.4.2.1 makes RFC 6961 status_request_v2 unusable in TLS 1.3,
+    // but RFC 7633 §§4.1/4.3.3 scope a certificate's demand to features present
+    // in *both* the ClientHello and the certificate. This client never offers
+    // feature 17, so a certificate advertising it — typically for TLS 1.2
+    // peers — is perfectly usable and must not be rejected over it.
     const allocator = testing.allocator;
     var fx = Fixtures.init(allocator);
     defer fx.deinit();
@@ -1273,75 +1275,71 @@ test "status_request_v2 cannot be satisfied by ordinary TLS 1.3 stapling" {
         .tls_features = &.{x509.TlsFeatures.status_request_v2},
     });
 
-    // Feature 17 alone is not must-staple, but it is also not satisfiable.
     try testing.expect(!fx.certs.items[0].mustStaple());
     try testing.expect(fx.certs.items[0].assertsStatusRequestV2());
 
-    const assertions = [_]revocation.StatusAssertion{stapledFor(&fx.certs.items[0], .good)};
-    const rejected = revocation.evaluatePath(
+    // No staple at all: still accepted, because feature 17 obliges nothing here.
+    var bare = revocation.evaluatePath(
         allocator,
         v2_path,
         .{ .mode = .soft_fail },
-        .{ .assertions = &assertions },
+        .{},
         validation_time,
     );
-    try expectRejected(rejected, .must_staple_feature_unsupported, 0);
+    var bare_report = try expectAccepted(&bare);
+    defer bare_report.deinit(allocator);
+    try testing.expectEqual(revocation.MustStapleOutcome.not_required, bare_report.must_staple);
+    try testing.expect(!bare_report.entries[0].must_staple);
 
-    // Disabled records it rather than rejecting, like every other unenforced
-    // must-staple state.
-    var disabled = revocation.evaluatePath(
+    const assertions = [_]revocation.StatusAssertion{stapledFor(&fx.certs.items[0], .good)};
+    var stapled = revocation.evaluatePath(
         allocator,
         v2_path,
-        .{},
+        .{ .mode = .strict },
         .{ .assertions = &assertions },
         validation_time,
     );
-    var disabled_report = try expectAccepted(&disabled);
-    defer disabled_report.deinit(allocator);
-    try testing.expectEqual(
-        revocation.MustStapleOutcome.unsatisfiable_status_request_v2,
-        disabled_report.must_staple,
-    );
+    var stapled_report = try expectAccepted(&stapled);
+    defer stapled_report.deinit(allocator);
+    try testing.expectEqual(revocation.MustStapleOutcome.not_required, stapled_report.must_staple);
+    try testing.expect(stapled_report.allChecked());
+}
 
-    // Declaring both 5 and 17 does not make 17 satisfiable either.
-    var both_fx = Fixtures.init(allocator);
-    defer both_fx.deinit();
-    var both_storage: [4]path_builder.Element = undefined;
-    const both_path = try twoCertPath(&both_fx, &both_storage, .{
+test "declaring both status_request and its v2 form is satisfied by feature 5" {
+    const allocator = testing.allocator;
+    var fx = Fixtures.init(allocator);
+    defer fx.deinit();
+    var storage: [4]path_builder.Element = undefined;
+    const path = try twoCertPath(&fx, &storage, .{
         .subject = "leaf",
         .issuer = "Root",
         .tls_features = &.{ x509.TlsFeatures.status_request, x509.TlsFeatures.status_request_v2 },
     });
-    const both_assertions = [_]revocation.StatusAssertion{stapledFor(&both_fx.certs.items[0], .good)};
-    const both_rejected = revocation.evaluatePath(
-        allocator,
-        both_path,
-        .{ .mode = .soft_fail },
-        .{ .assertions = &both_assertions },
-        validation_time,
-    );
-    try expectRejected(both_rejected, .must_staple_feature_unsupported, 0);
+    try testing.expect(fx.certs.items[0].mustStaple());
 
-    // Ordinary feature-5 must-staple is still satisfied by a TLS 1.3 staple.
-    var v1_fx = Fixtures.init(allocator);
-    defer v1_fx.deinit();
-    var v1_storage: [4]path_builder.Element = undefined;
-    const v1_path = try twoCertPath(&v1_fx, &v1_storage, .{
-        .subject = "leaf",
-        .issuer = "Root",
-        .tls_features = &.{x509.TlsFeatures.status_request},
-    });
-    const v1_assertions = [_]revocation.StatusAssertion{stapledFor(&v1_fx.certs.items[0], .good)};
-    var accepted = revocation.evaluatePath(
+    // The ordinary TLS 1.3 staple satisfies feature 5; the unofferable feature
+    // 17 alongside it neither adds an obligation nor blocks this one.
+    const assertions = [_]revocation.StatusAssertion{stapledFor(&fx.certs.items[0], .good)};
+    var outcome = revocation.evaluatePath(
         allocator,
-        v1_path,
+        path,
         .{ .mode = .soft_fail },
-        .{ .assertions = &v1_assertions },
+        .{ .assertions = &assertions },
         validation_time,
     );
-    var report = try expectAccepted(&accepted);
+    var report = try expectAccepted(&outcome);
     defer report.deinit(allocator);
     try testing.expectEqual(revocation.MustStapleOutcome.enforced, report.must_staple);
+
+    // Feature 5 is still enforced: drop the staple and the path is rejected.
+    const missing = revocation.evaluatePath(
+        allocator,
+        path,
+        .{ .mode = .soft_fail },
+        .{},
+        validation_time,
+    );
+    try expectRejected(missing, .must_staple_not_satisfied, 0);
 }
 
 test {

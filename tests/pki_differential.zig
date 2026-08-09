@@ -289,7 +289,6 @@ fn tardigradeFailureReason(reason: pki.path_validator.FailureReason) Reason {
         .revocation_status_malformed,
         .revocation_status_unauthenticated,
         .revocation_must_staple_not_satisfied,
-        .revocation_must_staple_feature_unsupported,
         .revocation_source_unsupported,
         => .unclassified_rejection,
     };

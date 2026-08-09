@@ -4138,17 +4138,16 @@ test "an issuer's TLS Feature set constrains what its children must assert" {
 
     // Same set and superset both satisfy the constraint, and then normal leaf
     // must-staple processing applies. The superset leaf also declares feature
-    // 17, which this TLS 1.3-only stack cannot satisfy — see the dedicated
-    // status_request_v2 test; here it only has to pass the chain constraint.
-    const expected_outcomes = [_]revocation.MustStapleOutcome{
-        .unenforced_status_disabled,
-        .unsatisfiable_status_request_v2,
-    };
-    for (expected_outcomes, 1..) |expected, index| {
+    // 17; the §4.2.2 constraint covers every advertised feature, while the
+    // end-entity obligation stays scoped to feature 5.
+    for (fx.certs.items[1..3], 1..) |_, index| {
         var accepted = try validateBuilt(testing.allocator, &fx.certs.items[index], intermediates, anchors, policy(anchors), cp);
         defer accepted.deinit(testing.allocator);
         try expectAccepted(&accepted, 3);
-        try testing.expectEqual(expected, accepted.accepted.revocation.must_staple);
+        try testing.expectEqual(
+            revocation.MustStapleOutcome.unenforced_status_disabled,
+            accepted.accepted.revocation.must_staple,
+        );
     }
 }
 

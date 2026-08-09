@@ -99,7 +99,6 @@ pub const FailureReason = enum {
     revocation_status_malformed,
     revocation_status_unauthenticated,
     revocation_must_staple_not_satisfied,
-    revocation_must_staple_feature_unsupported,
     revocation_source_unsupported,
     revocation_resource_limit_exceeded,
     identity_mismatch,
@@ -481,7 +480,6 @@ fn revocationFailure(status_failure: revocation.Failure) ValidationFailure {
         .status_malformed => .revocation_status_malformed,
         .status_unauthenticated => .revocation_status_unauthenticated,
         .must_staple_not_satisfied => .revocation_must_staple_not_satisfied,
-        .must_staple_feature_unsupported => .revocation_must_staple_feature_unsupported,
         .status_source_unsupported => .revocation_source_unsupported,
         // `checkStructure` already guarantees a well-formed candidate path, so
         // this is unreachable from `validatePath`; it stays mapped for direct

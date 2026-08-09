@@ -256,16 +256,9 @@ pub const MustStapleOutcome = enum {
     unenforced_status_disabled,
     /// Asserted, but `Configuration.enforce_must_staple` is off.
     unenforced_by_configuration,
-    /// The leaf declares RFC 6961 `status_request_v2`, which RFC 8446 §4.4.2.1
-    /// forbids a TLS 1.3 server from acting on. This stack cannot satisfy such
-    /// a declaration, so it is never reported as enforced; only `disabled` mode
-    /// reaches this state, because a consulting mode rejects instead.
-    unsatisfiable_status_request_v2,
 
     pub fn isUnenforced(self: MustStapleOutcome) bool {
-        return self == .unenforced_status_disabled or
-            self == .unenforced_by_configuration or
-            self == .unsatisfiable_status_request_v2;
+        return self == .unenforced_status_disabled or self == .unenforced_by_configuration;
     }
 };
 
@@ -305,9 +298,6 @@ pub const FailureReason = enum {
     status_malformed,
     status_unauthenticated,
     must_staple_not_satisfied,
-    /// The leaf demands a TLS feature this stack cannot negotiate, so its
-    /// assertion can never be honored (RFC 6961 `status_request_v2`).
-    must_staple_feature_unsupported,
     /// The certificate publishes no revocation mechanism at all, so a strict
     /// policy can never be satisfied for it.
     status_source_unsupported,
@@ -408,8 +398,14 @@ pub fn evaluatePath(
     // the extension is a *constraint on what the child must contain*, enforced
     // during path validation (`path_validator.checkTlsFeatureConstraints`), not
     // an assertion that propagates down as a stapling obligation of its own.
+    //
+    // Only `status_request` (5) creates that obligation. RFC 6961
+    // `status_request_v2` (17) is not offered by this TLS 1.3 profile, and
+    // RFC 7633 §§4.1/4.3.3 scope the certificate's demand to features present
+    // in *both* the ClientHello and the certificate — so a certificate that
+    // also advertises 17 for TLS 1.2 peers is perfectly usable here and must
+    // not be rejected over it.
     const must_staple_required = path.elements[0].certificate.mustStaple();
-    const unsatisfiable_feature = path.elements[0].certificate.assertsStatusRequestV2();
 
     const entries = allocator.alloc(Entry, certificate_count) catch {
         return .{ .rejected = .{ .reason = .out_of_memory, .certificate_index = null } };
@@ -430,12 +426,7 @@ pub fn evaluatePath(
         return .{ .accepted = .{
             .mode = config.mode,
             .entries = entries,
-            .must_staple = if (unsatisfiable_feature)
-                .unsatisfiable_status_request_v2
-            else if (must_staple_required)
-                .unenforced_status_disabled
-            else
-                .not_required,
+            .must_staple = if (must_staple_required) .unenforced_status_disabled else .not_required,
         } };
     }
 
@@ -475,21 +466,9 @@ pub fn evaluatePath(
     }
 
     var must_staple: MustStapleOutcome = .not_required;
-    if (must_staple_required or unsatisfiable_feature) {
+    if (must_staple_required) {
         if (!config.enforce_must_staple) {
             must_staple = .unenforced_by_configuration;
-        } else if (unsatisfiable_feature) {
-            // RFC 8446 §4.4.2.1 forbids acting on status_request_v2 in TLS 1.3,
-            // so this stack can never demonstrate that the declaration was
-            // honored. Reporting `enforced` off an ordinary staple would be
-            // exactly the "pretend we checked" outcome this policy exists to
-            // prevent, so a mode that consults status fails closed instead.
-            const failure = Failure{
-                .reason = .must_staple_feature_unsupported,
-                .certificate_index = 0,
-            };
-            allocator.free(entries);
-            return .{ .rejected = failure };
         } else {
             const leaf_entry = entries[0];
             const satisfied = leaf_entry.source == .stapled_ocsp and

@@ -371,17 +371,21 @@ pub const TlsFeatures = struct {
     /// RFC 7633 §4.2.1: asserting `status_request` obliges the server to
     /// deliver a stapled certificate-status response.
     ///
-    /// Feature 17 is deliberately *not* included. RFC 6961 `status_request_v2`
-    /// is obsoleted by RFC 8446 §4.4.2.1, which forbids a TLS 1.3 server from
-    /// acting on or sending it, so an ordinary TLS 1.3 staple cannot prove that
-    /// a feature-17 declaration was honored. This stack is TLS 1.3 only; see
-    /// `assertsStatusRequestV2`.
+    /// Feature 17 is deliberately *not* included. RFC 6961
+    /// `status_request_v2` is obsoleted for TLS 1.3 by RFC 8446 §4.4.2.1, and
+    /// RFC 7633 §§4.1/4.3.3 scope a certificate's demand to features present in
+    /// *both* the ClientHello and the certificate. A TLS 1.3 client does not
+    /// offer 17, so a certificate advertising it — typically for TLS 1.2 peers
+    /// — creates no obligation here and must not be rejected over it. See
+    /// `assertsStatusRequestV2` for the declaration itself.
     pub fn requiresStapledStatus(self: *const TlsFeatures) bool {
         return self.contains(status_request);
     }
 
-    /// True when the certificate declares RFC 6961 `status_request_v2`, a
-    /// mechanism this TLS 1.3-only stack cannot negotiate or satisfy.
+    /// True when the certificate declares RFC 6961 `status_request_v2`. Kept
+    /// separate from `requiresStapledStatus` for a future implementation that
+    /// carries the negotiated ClientHello feature set into policy and enforces
+    /// the RFC 7633 §4.3.3 intersection.
     pub fn assertsStatusRequestV2(self: *const TlsFeatures) bool {
         return self.contains(status_request_v2);
     }
@@ -603,8 +607,9 @@ pub const Certificate = struct {
         return features.requiresStapledStatus();
     }
 
-    /// The certificate declares RFC 6961 `status_request_v2`, which RFC 8446
-    /// §4.4.2.1 forbids a TLS 1.3 server from acting on.
+    /// The certificate declares RFC 6961 `status_request_v2`. This TLS 1.3
+    /// profile never offers that extension, so the declaration creates no
+    /// stapling obligation on its own (RFC 7633 §4.3.3).
     pub fn assertsStatusRequestV2(self: *const Certificate) bool {
         const features = self.tlsFeatures() orelse return false;
         return features.assertsStatusRequestV2();

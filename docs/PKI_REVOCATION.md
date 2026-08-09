@@ -77,27 +77,33 @@ propagates downward — the operational must-staple requirement is read from the
 end-entity certificate after the constraint holds. The trust anchor is excluded,
 like its other extensions: anchor restrictions are local trust configuration.
 
-### `status_request_v2` is not satisfiable here
+### `status_request_v2` creates no obligation here
 
-RFC 6961 `status_request_v2` (feature 17) is a different extension, and RFC 8446
-§4.4.2.1 obsoletes it for TLS 1.3: a TLS 1.3 server MUST NOT act on or send it.
-Tardigrade's native TLS path is TLS 1.3 only, so an ordinary `status_request`
-staple cannot demonstrate that a feature-17 declaration was honored, and
-reporting it as `enforced` would be exactly the "pretend we checked" outcome
-this policy exists to prevent.
+RFC 6961 `status_request_v2` (feature 17) is a different extension, obsoleted
+for TLS 1.3 by RFC 8446 §4.4.2.1: a TLS 1.3 server must not act on or send it.
+That does **not** make a certificate carrying feature 17 invalid. RFC 7633 §4.1
+says a client need not offer or support a feature merely because a certificate
+names it, and §4.3.3 scopes invalidity to features present in *both* the
+ClientHello and the certificate that the server then fails to satisfy.
 
-A leaf declaring feature 17 — alone or alongside feature 5 — is therefore
-rejected with `must_staple_feature_unsupported` in any mode that consults
-status, and recorded as `unsatisfiable_status_request_v2` under `disabled`.
-`x509.TlsFeatures.requiresStapledStatus` covers feature 5 only;
-`assertsStatusRequestV2` reports the declaration separately.
+Tardigrade's TLS path is TLS 1.3 only and never offers feature 17, so a
+certificate advertising it — typically to serve TLS 1.2 peers as well — is
+outside that intersection and is not rejected over it. The end-entity
+must-staple obligation is scoped to `status_request` (5) alone:
+`x509.TlsFeatures.requiresStapledStatus` covers feature 5, while
+`assertsStatusRequestV2` reports the declaration separately for a future
+implementation that carries the negotiated ClientHello feature set into policy
+and enforces the §4.3.3 intersection properly.
+
+Feature 17 does still participate in the RFC 7633 §4.2.2 issuer constraint
+above, which applies to every advertised feature.
 
 ### Reporting
 
 `Report.must_staple` records what became of the assertion — `not_required`,
 `enforced`, `unenforced_status_disabled` (the mode consults nothing),
-`unenforced_by_configuration` (`enforce_must_staple` is off), or
-`unsatisfiable_status_request_v2` — so an acceptance never reads as "honored"
+or `unenforced_by_configuration` (`enforce_must_staple` is off) — so an
+acceptance never reads as "honored"
 when it was merely not applied. Operators who deploy must-staple certificates
 behind Tardigrade should run at least `stapled_only`.
 
@@ -228,7 +234,6 @@ tightening the mode.
 | `revocation_status_malformed` | evidence the provider could not interpret |
 | `revocation_status_unauthenticated` | nobody verified the responder or CRL signature |
 | `revocation_must_staple_not_satisfied` | RFC 7633 assertion unmet |
-| `revocation_must_staple_feature_unsupported` | leaf demands `status_request_v2`, unsatisfiable on TLS 1.3 |
 | `revocation_source_unsupported` | certificate publishes no revocation mechanism |
 | `tls_feature_constraint_violation` | child does not assert its issuer's TLS Feature set (RFC 7633 §4.2.2) |
 | `revocation_resource_limit_exceeded` | evidence exceeded the configured bounds |
