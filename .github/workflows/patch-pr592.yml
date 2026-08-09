@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - claude/issue-139-implementation-480e10
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -16,11 +19,13 @@ jobs:
       - name: Apply reviewed fixes and push
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TARGET_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
         run: |
           set -euo pipefail
           git init .
           git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git fetch --depth=1 origin "${TARGET_SHA}"
           git checkout --detach FETCH_HEAD
 
           python3 - <<'PY'
@@ -104,4 +109,4 @@ jobs:
             exit 1
           fi
           git commit -m "fix(proxy): preserve completed h2 streams"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "HEAD:${TARGET_REF}"
