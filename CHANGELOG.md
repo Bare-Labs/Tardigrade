@@ -120,7 +120,10 @@ All notable user-facing changes to Tardigrade are documented here.
   The validating peer's record errors are never swallowed, every case carries a
   mandatory floor of real traffic in both directions, and a two-stage
   deterministic epilogue drains what the scripts obstructed so the end-to-end
-  byte accounting is actually reached. Adds eight named deterministic
+  byte accounting is actually reached. All four cleanup families run in every
+  case rather than one being selected, so each is covered by the deterministic
+  seed replay, and the authentication-failure family is staged so its genuine
+  prelude reaches the application before the tampered record arrives. Adds eight named deterministic
   companions for the scripted classes a seed-corpus replay cannot reliably
   reach (one-byte reads/writes, permanent no-progress carriers, carrier EOF at
   every record boundary, partial-write suffix preservation, output and inbound

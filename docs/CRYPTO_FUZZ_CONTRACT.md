@@ -895,16 +895,38 @@ issue's implementation-plan comment:
   including both parsers' pending arrays and the plaintext provenance shadow —
   and that no key material survives at any epoch in either direction.
 
-  Each family is deterministic once selected, and asserts its own outcome
-  unconditionally: the authentication-failure family constructs and delivers
-  its tampered record with `try` rather than early-returning on setup trouble,
-  and requires `AuthenticationFailed` rather than accepting "no terminal error
-  happened"; the teardown family dirties every state whose zeroization it
-  checks — both parsers simultaneously, inbound plaintext with its provenance
-  shadow, inbound handshake bytes, unparsed carrier input, queued outbound
-  ciphertext, and a pending terminal alert — and asserts each one is nonzero
-  immediately before `deinit()`. A scenario that cannot reach its own property
-  is a gap in the target, not a passing case.
+  **All four families run in every case.** A `smith.index(4)` selector looked
+  reasonable and was wrong: every checked-in corpus entry resolved to the same
+  branch, so three of the four families were never reached by the deterministic
+  seed replay and their properties were only ever checked under a
+  coverage-guided run. Each family builds its own streams and carrier and draws
+  its own Smith values, so running them in sequence keeps every case
+  deterministic. Worth remembering for future slices — a per-case family
+  selector needs proof that the corpus actually spreads across its branches,
+  not just the assumption that it will.
+
+  Each family is deterministic and asserts its own outcome unconditionally:
+
+  - the **authentication-failure** family is staged in two phases, because the
+    property it is named for is a failure landing *behind already-delivered
+    plaintext*. Queuing the genuine prelude and the tampered record together
+    lets one `drive()` open both, and `fail()` clears `inbound_plaintext`
+    before the caller can read any of it — so stage one drives the prelude all
+    the way through to the application and asserts it arrived and that the read
+    sequence advanced, and only then is the tampered next-sequence record
+    queued. After the failure the delivered count must still match exactly:
+    nothing retroactively unmade, and not one byte of the tampered record
+    delivered.
+  - the **teardown** family dirties every state whose zeroization it checks —
+    both parsers simultaneously, inbound plaintext, inbound handshake bytes,
+    unparsed carrier input, queued outbound ciphertext, and a pending terminal
+    alert — and asserts each is nonzero immediately before `deinit()`. The
+    plaintext provenance shadow is deliberately dirtied with `true`: `false` is
+    its *cleared* value, so an all-`false` shadow would make the post-teardown
+    all-`false` assertion vacuous.
+
+  A scenario that cannot reach its own property is a gap in the target, not a
+  passing case.
 
   **Production finding.** Asserting that teardown property against the
   *orderly* close path showed a completed close was not clearing its
@@ -953,6 +975,8 @@ issue's implementation-plan comment:
   | A carrier write is not reported as `made_progress` | progression target, seed replay (via the epilogue's write-only stage) |
   | `drive()` latches a carrier error instead of the preserved root error | cleanup target, seed replay |
   | `ByteQueue.clear` stops zeroing its backing storage | cleanup target, seed replay, plus two named cleanup tests |
+  | `PlaintextProvenanceQueue.clear` stops zeroing its backing storage | cleanup target, seed replay (teardown family) |
+  | Opening an application record drops its plaintext instead of queuing it | cleanup target, seed replay (authentication-failure family's staged prelude) |
   | `drive()`'s write loop consumes one byte more than the carrier accepted | `…partial carrier writes preserve the exact unwritten suffix` plus four existing tests |
 
   The corruption mutation has to be scoped to the subject's own role:

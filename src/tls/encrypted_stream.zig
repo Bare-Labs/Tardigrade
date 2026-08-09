@@ -5676,12 +5676,17 @@ fn fuzzEncryptedStreamCleanupInput(_: void, smith: *std.testing.Smith) !void {
         else => .tls_chacha20_poly1305_sha256,
     };
 
-    switch (smith.index(4)) {
-        0 => try cleanupDeferredAlertCase(smith, cp, suite),
-        1 => try cleanupAuthenticationFailureCase(smith, cp, suite),
-        2 => try cleanupEpochTransitionCase(smith, cp, suite),
-        else => try cleanupTeardownCase(smith, cp, suite),
-    }
+    // Every family runs in every case rather than one being selected per case.
+    // A `smith.index(4)` selector here looked reasonable but left three of the
+    // four families unreached by the deterministic seed-corpus replay -- every
+    // checked-in entry resolved to the same branch -- so the properties they
+    // own were only ever checked under a coverage-guided run. Each family
+    // builds its own streams and carrier and draws its own Smith values, so
+    // running them in sequence keeps every case deterministic.
+    try cleanupDeferredAlertCase(smith, cp, suite);
+    try cleanupAuthenticationFailureCase(smith, cp, suite);
+    try cleanupEpochTransitionCase(smith, cp, suite);
+    try cleanupTeardownCase(smith, cp, suite);
 }
 
 /// A terminal handshake failure whose fatal alert is flushed to a scripted
@@ -5772,13 +5777,36 @@ fn cleanupAuthenticationFailureCase(smith: *std.testing.Smith, cp: provider.Cryp
     try establishForSuite(&peer, &subject, suite);
 
     var oracle = StreamOracle{};
-    // Optionally put genuine plaintext ahead of the tampered record. Bounded so
-    // the fixed inbound queue always keeps room for the tampered record itself.
-    for (0..smith.index(3)) |_| {
+    var read_buf: [fuzz_stream_max_read_buf]u8 = undefined;
+
+    // Stage one: genuine plaintext, driven all the way *through* to the
+    // application before the tampered record is ever queued. Staging matters --
+    // queuing the prelude and the tampered record together lets a single
+    // `drive()` open both, and `fail()` clears `inbound_plaintext` before the
+    // caller can read any of it, so the case would never exercise the scenario
+    // it is named for: an authentication failure landing *behind*
+    // already-delivered plaintext.
+    for (0..1 + smith.index(2)) |_| {
         try enqueuePeerRecord(&peer, &carrier_state, &oracle, 1 + smith.index(fuzz_stream_peer_chunk));
     }
+    try testing.expect(oracle.peer_sent > 0);
 
-    // One genuine record, then one byte of its payload flipped. The AEAD
+    var prelude_rounds: usize = 0;
+    while (oracle.subject_received < oracle.peer_sent and prelude_rounds < 64) : (prelude_rounds += 1) {
+        _ = try driveChecked(&subject, &carrier_state, &oracle) orelse break;
+        try subjectReadOnce(&subject, &oracle, &read_buf);
+        try checkStreamInvariants(&subject, &carrier_state);
+    }
+    try testing.expect(prelude_rounds < 64);
+    try testing.expectEqual(@as(?anyerror, null), oracle.terminal);
+    try testing.expectEqual(oracle.peer_sent, oracle.subject_received);
+    try testing.expect(oracle.subject_received > 0);
+    // ...and the read sequence really advanced on that genuine traffic, so the
+    // failure below lands on a live, already-used read state.
+    try testing.expect(subject.bridge.read_application.?.sequence > 0);
+
+    // Stage two: the next record in sequence, with one byte of its payload
+    // flipped. The AEAD
     // authenticates the header as associated data and the payload as
     // ciphertext-plus-tag, so a payload mutation is always an authentication
     // failure rather than a framing error.
@@ -5792,7 +5820,7 @@ fn cleanupAuthenticationFailureCase(smith: *std.testing.Smith, cp: provider.Cryp
     // Every step of this construction is deterministic once the family is
     // selected: the peer is open with a drained outbound queue, one sealed
     // record is at most `header + chunk + type + tag` bytes, and the inbound
-    // queue was reserved with room to spare. Nothing here may quietly return
+    // queue is empty again after stage one. Nothing here may quietly return
     // and let the case pass without testing the property it is named for.
     const content_len = 1 + smith.index(fuzz_stream_peer_chunk);
     var content: [fuzz_stream_peer_chunk]u8 = undefined;
@@ -5806,7 +5834,6 @@ fn cleanupAuthenticationFailureCase(smith: *std.testing.Smith, cp: provider.Cryp
     record_buf[offset] ^= @as(u8, 1) << @intCast(smith.index(8));
     try testing.expect(carrier_state.pushInbound(record_buf[0..record_len]));
 
-    var read_buf: [fuzz_stream_max_read_buf]u8 = undefined;
     var drives: usize = 0;
     while (oracle.terminal == null and drives < 256) : (drives += 1) {
         const result = try driveChecked(&subject, &carrier_state, &oracle) orelse break;
@@ -5818,16 +5845,18 @@ fn cleanupAuthenticationFailureCase(smith: *std.testing.Smith, cp: provider.Cryp
     try testing.expect(drives < 256);
 
     // The tampered record always reaches the bridge -- the read script's first
-    // step is forced to transfer, and `drive_record_budget` comfortably covers
-    // the at most three records queued -- so the outcome is unconditional.
+    // step is forced to transfer and the inbound queue holds only this record --
+    // so the outcome is unconditional.
     try testing.expectEqual(@as(?anyerror, error.AuthenticationFailed), oracle.terminal);
+    // The genuine plaintext delivered in stage one stays exactly accounted for
+    // across the failure: nothing was retroactively unmade, and not one byte of
+    // the tampered record reached the application. `subjectReadOnce` checks
+    // every delivered byte against the generated stream, and this record's
+    // plaintext is the complement of it, so a leak could not pass as the stream
+    // continuing.
+    try testing.expectEqual(oracle.peer_sent, oracle.subject_received);
     try expectStableTerminal(&subject, &carrier_state, error.AuthenticationFailed);
     if (carrier_state.owns_handle) try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
-    // Whatever was delivered before the failure was genuine peer plaintext,
-    // never the tampered record's contents: `subjectReadOnce` checks every
-    // byte against the generated stream, and the tampered record's plaintext
-    // was never enqueued in that stream.
-    try testing.expect(oracle.subject_received <= oracle.peer_sent);
 }
 
 /// A `.handshake` epoch discard landing on a not-yet-complete buffered record.
@@ -5950,7 +5979,14 @@ fn cleanupTeardownCase(smith: *std.testing.Smith, cp: provider.CryptoProvider, s
     // owned storage, so dirtying it directly is the point.
     var filler: [128]u8 = undefined;
     for (&filler, 0..) |*byte, i| byte.* = @truncate(i +% 1);
-    try subject.appendInboundPlaintext(&filler, smith.index(2) == 0);
+    // The provenance shadow has to be dirtied with `true`: `false` is its
+    // *cleared* value, so an all-`false` shadow would leave the post-teardown
+    // all-`false` assertion vacuous and a broken `PlaintextProvenanceQueue`
+    // teardown invisible. A second span carries the other value so both are
+    // represented.
+    const early_len = 1 + smith.index(filler.len);
+    try subject.appendInboundPlaintext(filler[0..early_len], true);
+    if (early_len < filler.len) try subject.appendInboundPlaintext(filler[early_len..], false);
     try subject.appendInboundHandshake(&filler);
     try subject.appendInboundCarrier(&filler);
 
@@ -5962,6 +5998,13 @@ fn cleanupTeardownCase(smith: *std.testing.Smith, cp: provider.CryptoProvider, s
     try testing.expect(subject.inbound_carrier.len > 0);
     try testing.expect(subject.inbound_plaintext.len > 0);
     try testing.expect(subject.inbound_plaintext_provenance.len > 0);
+    // ...and genuinely nonzero, not merely non-empty: this is the exact
+    // negation of the post-teardown check.
+    try testing.expect(!std.mem.allEqual(
+        bool,
+        subject.inbound_plaintext_provenance.buf[0..subject.inbound_plaintext_provenance.len],
+        false,
+    ));
     try testing.expect(subject.inbound_handshake.len > 0);
     try testing.expect(subject.outbound_ciphertext.len > 0);
     try testing.expect(subject.initial_parser.len > 0);
