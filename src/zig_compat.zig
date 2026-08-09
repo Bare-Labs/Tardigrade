@@ -337,7 +337,17 @@ pub fn setSocketTimeoutsMs(fd: std.posix.fd_t, recv_timeout_ms: u32, send_timeou
 /// Connect a *blocking* Unix-domain socket via std.c, bypassing the std.Io
 /// event loop. See connectBlockingTcp for why bounded transports need a plain
 /// blocking fd. Caller closes the fd.
+///
+/// This waits in `connect()` for as long as the kernel does. Callers on a
+/// per-phase deadline must use `connectBoundedUnix` instead.
 pub fn connectBlockingUnix(path: []const u8) !std.posix.fd_t {
+    return connectBoundedUnix(path, 0);
+}
+
+/// Connect a Unix-domain socket bounded by `connect_timeout_ms`, so an AF_UNIX
+/// upstream honours the same per-phase connect deadline as a TCP one (#139).
+/// A zero timeout keeps the plain blocking connect. Caller closes the fd.
+pub fn connectBoundedUnix(path: []const u8, connect_timeout_ms: u32) !std.posix.fd_t {
     var addr = std.mem.zeroes(std.c.sockaddr.un);
     addr.family = std.posix.AF.UNIX;
     if (path.len >= addr.path.len) return error.NameTooLong;
@@ -347,7 +357,7 @@ pub fn connectBlockingUnix(path: []const u8) !std.posix.fd_t {
     const sock = std.c.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
     if (sock < 0) return error.SocketFailed;
     errdefer _ = std.c.close(sock);
-    if (std.c.connect(sock, @ptrCast(&addr), len) != 0) return error.ConnectionFailed;
+    try connectFdBounded(sock, @ptrCast(&addr), len, connect_timeout_ms);
     return sock;
 }
 
@@ -378,6 +388,13 @@ pub const NetServer = struct {
 pub fn listenTcp(host: []const u8, port: u16) !NetServer {
     const address = try std.Io.net.IpAddress.parse(host, port);
     return .{ .inner = try address.listen(io(), .{ .reuse_address = true }) };
+}
+
+/// Listen on a Unix domain socket path. The caller owns the filesystem entry
+/// and must unlink it after `deinit`; `NetServer.port` is meaningless here.
+pub fn listenUnix(path: []const u8) !NetServer {
+    const address = try std.Io.net.UnixAddress.init(path);
+    return .{ .inner = try address.listen(io(), .{}) };
 }
 
 /// Drop-in replacement for std.Thread.Mutex using the new std.Io.Mutex API.

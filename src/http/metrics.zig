@@ -28,6 +28,28 @@ pub const TicketResult = enum { success, rejected, failed };
 pub const TicketKeyReloadOutcome = enum { initial_load_success, initial_load_failure, reload_accepted, reload_rejected };
 
 pub const HttpProtocol = enum { h1, h2, h3 };
+
+/// Why a reverse-proxy request took the bounded buffered path instead of
+/// streaming (#139). This lives here, next to the counters, so it is the single
+/// source of truth: `recordProxyStreamingFallback` switches over it
+/// exhaustively, and adding a case is a compile error until that case has a
+/// counter and a Prometheus series. `gateway_proxy_runtime` re-exports it as
+/// `StreamingFallbackReason` for the eligibility checks that produce it.
+pub const ProxyStreamingFallbackReason = enum {
+    policy_disabled,
+    retries_configured,
+    missing_content_length,
+    body_too_large,
+    body_dependent_middleware,
+    unsupported_route_type,
+    early_data_retry_semantics,
+
+    /// The `reason=` label value; identical to the tag name by construction, so
+    /// a label can never drift from its enum case.
+    pub fn label(self: ProxyStreamingFallbackReason) []const u8 {
+        return @tagName(self);
+    }
+};
 pub const EarlyDataSource = enum { transport, header, both };
 pub const EarlyDataDecision = enum { accepted, too_early, deferred, forwarded };
 pub const EarlyDataUpstream425Action = enum { forwarded, retried };
@@ -139,13 +161,11 @@ pub const Metrics = struct {
     proxy_upstream_aborts: u64,
     proxy_streaming_fallback_policy_disabled: u64,
     proxy_streaming_fallback_retries_configured: u64,
-    proxy_streaming_fallback_unix_socket_target: u64,
-    proxy_streaming_fallback_upstream_mtls_target: u64,
-    proxy_streaming_fallback_chunked_request_upload: u64,
     proxy_streaming_fallback_missing_content_length: u64,
     proxy_streaming_fallback_body_too_large: u64,
     proxy_streaming_fallback_body_dependent_middleware: u64,
     proxy_streaming_fallback_unsupported_route_type: u64,
+    proxy_streaming_fallback_early_data_retry_semantics: u64,
     proxy_ttfb_ms_count: u64,
     proxy_ttfb_ms_sum: u64,
     // Upstream keep-alive connection pool (#141). Populated from the pool's own
@@ -297,13 +317,11 @@ pub const Metrics = struct {
             .proxy_upstream_aborts = 0,
             .proxy_streaming_fallback_policy_disabled = 0,
             .proxy_streaming_fallback_retries_configured = 0,
-            .proxy_streaming_fallback_unix_socket_target = 0,
-            .proxy_streaming_fallback_upstream_mtls_target = 0,
-            .proxy_streaming_fallback_chunked_request_upload = 0,
             .proxy_streaming_fallback_missing_content_length = 0,
             .proxy_streaming_fallback_body_too_large = 0,
             .proxy_streaming_fallback_body_dependent_middleware = 0,
             .proxy_streaming_fallback_unsupported_route_type = 0,
+            .proxy_streaming_fallback_early_data_retry_semantics = 0,
             .proxy_ttfb_ms_count = 0,
             .proxy_ttfb_ms_sum = 0,
             .upstream_connections_new = 0,
@@ -706,25 +724,18 @@ pub const Metrics = struct {
         self.proxy_upstream_aborts += 1;
     }
 
-    pub fn recordProxyStreamingFallback(self: *Metrics, reason: []const u8) void {
-        if (std.mem.eql(u8, reason, "policy_disabled")) {
-            self.proxy_streaming_fallback_policy_disabled += 1;
-        } else if (std.mem.eql(u8, reason, "retries_configured")) {
-            self.proxy_streaming_fallback_retries_configured += 1;
-        } else if (std.mem.eql(u8, reason, "unix_socket_target")) {
-            self.proxy_streaming_fallback_unix_socket_target += 1;
-        } else if (std.mem.eql(u8, reason, "upstream_mtls_target")) {
-            self.proxy_streaming_fallback_upstream_mtls_target += 1;
-        } else if (std.mem.eql(u8, reason, "chunked_request_upload")) {
-            self.proxy_streaming_fallback_chunked_request_upload += 1;
-        } else if (std.mem.eql(u8, reason, "missing_content_length")) {
-            self.proxy_streaming_fallback_missing_content_length += 1;
-        } else if (std.mem.eql(u8, reason, "body_too_large")) {
-            self.proxy_streaming_fallback_body_too_large += 1;
-        } else if (std.mem.eql(u8, reason, "body_dependent_middleware")) {
-            self.proxy_streaming_fallback_body_dependent_middleware += 1;
-        } else if (std.mem.eql(u8, reason, "unsupported_route_type")) {
-            self.proxy_streaming_fallback_unsupported_route_type += 1;
+    /// Exhaustive by construction: a new `ProxyStreamingFallbackReason` case
+    /// fails to compile here until it is given a counter, which is what keeps a
+    /// reason from being emitted into a metric that silently drops it.
+    pub fn recordProxyStreamingFallback(self: *Metrics, reason: ProxyStreamingFallbackReason) void {
+        switch (reason) {
+            .policy_disabled => self.proxy_streaming_fallback_policy_disabled += 1,
+            .retries_configured => self.proxy_streaming_fallback_retries_configured += 1,
+            .missing_content_length => self.proxy_streaming_fallback_missing_content_length += 1,
+            .body_too_large => self.proxy_streaming_fallback_body_too_large += 1,
+            .body_dependent_middleware => self.proxy_streaming_fallback_body_dependent_middleware += 1,
+            .unsupported_route_type => self.proxy_streaming_fallback_unsupported_route_type += 1,
+            .early_data_retry_semantics => self.proxy_streaming_fallback_early_data_retry_semantics += 1,
         }
     }
 
@@ -990,13 +1001,11 @@ pub const Metrics = struct {
             \\# TYPE tardigrade_proxy_streaming_fallback_total counter
             \\tardigrade_proxy_streaming_fallback_total{{reason="policy_disabled"}} {d}
             \\tardigrade_proxy_streaming_fallback_total{{reason="retries_configured"}} {d}
-            \\tardigrade_proxy_streaming_fallback_total{{reason="unix_socket_target"}} {d}
-            \\tardigrade_proxy_streaming_fallback_total{{reason="upstream_mtls_target"}} {d}
-            \\tardigrade_proxy_streaming_fallback_total{{reason="chunked_request_upload"}} {d}
             \\tardigrade_proxy_streaming_fallback_total{{reason="missing_content_length"}} {d}
             \\tardigrade_proxy_streaming_fallback_total{{reason="body_too_large"}} {d}
             \\tardigrade_proxy_streaming_fallback_total{{reason="body_dependent_middleware"}} {d}
             \\tardigrade_proxy_streaming_fallback_total{{reason="unsupported_route_type"}} {d}
+            \\tardigrade_proxy_streaming_fallback_total{{reason="early_data_retry_semantics"}} {d}
             \\# HELP tardigrade_proxy_ttfb_ms Proxied upstream time to first byte in milliseconds
             \\# TYPE tardigrade_proxy_ttfb_ms summary
             \\tardigrade_proxy_ttfb_ms_sum {d}
@@ -1025,13 +1034,11 @@ pub const Metrics = struct {
             self.proxy_upstream_aborts,
             self.proxy_streaming_fallback_policy_disabled,
             self.proxy_streaming_fallback_retries_configured,
-            self.proxy_streaming_fallback_unix_socket_target,
-            self.proxy_streaming_fallback_upstream_mtls_target,
-            self.proxy_streaming_fallback_chunked_request_upload,
             self.proxy_streaming_fallback_missing_content_length,
             self.proxy_streaming_fallback_body_too_large,
             self.proxy_streaming_fallback_body_dependent_middleware,
             self.proxy_streaming_fallback_unsupported_route_type,
+            self.proxy_streaming_fallback_early_data_retry_semantics,
             self.proxy_ttfb_ms_sum,
             self.proxy_ttfb_ms_count,
             self.upstream_connections_new,
@@ -2266,28 +2273,26 @@ test "#368 Slice 3: early-data replay counters appear in Prometheus output with 
 
 test "Metrics records proxy streaming fallback reasons" {
     const allocator = std.testing.allocator;
+    // Driven by the enum itself, so a new reason is covered here the moment it
+    // exists. The recorder's exhaustive switch is what makes that safe: a case
+    // without a counter does not compile, and this asserts the counter also
+    // reaches the Prometheus surface rather than incrementing into the void.
     var m = Metrics.init();
-    m.recordProxyStreamingFallback("policy_disabled");
-    m.recordProxyStreamingFallback("retries_configured");
-    m.recordProxyStreamingFallback("unix_socket_target");
-    m.recordProxyStreamingFallback("upstream_mtls_target");
-    m.recordProxyStreamingFallback("chunked_request_upload");
-    m.recordProxyStreamingFallback("missing_content_length");
-    m.recordProxyStreamingFallback("body_too_large");
-    m.recordProxyStreamingFallback("body_dependent_middleware");
-    m.recordProxyStreamingFallback("unsupported_route_type");
+    for (std.enums.values(ProxyStreamingFallbackReason)) |reason| {
+        m.recordProxyStreamingFallback(reason);
+    }
 
     const prom = try m.toPrometheus(allocator);
     defer allocator.free(prom);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_streaming_fallback_total{reason=\"policy_disabled\"} 1") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_streaming_fallback_total{reason=\"retries_configured\"} 1") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_streaming_fallback_total{reason=\"unix_socket_target\"} 1") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_streaming_fallback_total{reason=\"upstream_mtls_target\"} 1") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_streaming_fallback_total{reason=\"chunked_request_upload\"} 1") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_streaming_fallback_total{reason=\"missing_content_length\"} 1") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_streaming_fallback_total{reason=\"body_too_large\"} 1") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_streaming_fallback_total{reason=\"body_dependent_middleware\"} 1") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_streaming_fallback_total{reason=\"unsupported_route_type\"} 1") != null);
+    for (std.enums.values(ProxyStreamingFallbackReason)) |reason| {
+        var expected_buf: [128]u8 = undefined;
+        const expected = try std.fmt.bufPrint(
+            &expected_buf,
+            "tardigrade_proxy_streaming_fallback_total{{reason=\"{s}\"}} 1",
+            .{reason.label()},
+        );
+        try std.testing.expect(std.mem.find(u8, prom, expected) != null);
+    }
 }
 
 test "Metrics toJson produces valid JSON" {

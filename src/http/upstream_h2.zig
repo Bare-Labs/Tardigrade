@@ -814,13 +814,15 @@ pub fn H2Conn(comptime Transport: type) type {
                     self.state_mutex.unlock();
                     return e;
                 }
-                if (self.conn_err) |e| {
-                    self.state_mutex.unlock();
-                    return e;
-                }
+                // END_STREAM makes this response complete even if the peer
+                // closes the shared connection immediately afterward.
                 if (stream.done) {
                     self.state_mutex.unlock();
                     return 0;
+                }
+                if (self.conn_err) |e| {
+                    self.state_mutex.unlock();
+                    return e;
                 }
                 stream.wait_deadline_ms = nowMs() + self.deadline_ms;
                 stream.cond.wait(&self.state_mutex);
@@ -1289,7 +1291,9 @@ pub fn H2Conn(comptime Transport: type) type {
             if (self.conn_err == null) self.conn_err = e;
             var it = self.streams.valueIterator();
             while (it.next()) |sp| {
-                if (sp.*.err == null) sp.*.err = e;
+                // A connection failure cannot retroactively invalidate a
+                // response whose END_STREAM was already processed.
+                if (!sp.*.done and sp.*.err == null) sp.*.err = e;
                 sp.*.cond.signal(); // wake each response waiter
             }
             self.state_mutex.unlock();

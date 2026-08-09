@@ -81,12 +81,14 @@ logs are written through `src/http/logger.zig`.
   `tardigrade_proxy_upstream_aborts_total`
 - reverse-proxy streaming fallback event counter:
   `tardigrade_proxy_streaming_fallback_total{reason=...}` with fixed reasons
-  `policy_disabled`, `retries_configured`, `unix_socket_target`, and
-  `upstream_mtls_target` for response-path eligibility plus
-  `chunked_request_upload`, `missing_content_length`, `body_too_large`,
+  `policy_disabled`, `retries_configured`, and `early_data_retry_semantics` for
+  response-path eligibility plus `missing_content_length`, `body_too_large`,
   `body_dependent_middleware`, and `unsupported_route_type` for request-upload
   eligibility. Upload and response eligibility are evaluated separately, so one
-  request can contribute more than one fallback event.
+  request can contribute more than one fallback event. See
+  [PROXY_STREAMING.md](PROXY_STREAMING.md) for what each reason means and which
+  transports stream. Unix-socket and upstream-mTLS targets stream like any other
+  upstream and no longer emit a fallback reason.
 - reverse-proxy upstream TTFB summary: `tardigrade_proxy_ttfb_ms`
 - HTTP-level early-data counters (fixed labels only):
   `tardigrade_http_early_data_requests_total{protocol,source}`,
