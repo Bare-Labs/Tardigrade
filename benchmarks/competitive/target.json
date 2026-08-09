@@ -1,0 +1,6 @@
+{
+  "environment_name": "competitive-local",
+  "benchmark_suite": "competitive",
+  "comparison_note": "Representative local competitive run. Use a dedicated idle host for canonical numbers.",
+  "competitors": ["tardigrade", "nginx", "haproxy", "caddy"]
+}

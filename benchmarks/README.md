@@ -30,6 +30,10 @@ Run benchmarks on a dedicated, isolated benchmark target by default.
 # Fallback only: local/shared-runner smoke test
 # Use this only when explicitly requested or when a dedicated target is unavailable.
 ./benchmarks/ci-smoke.sh
+
+# Competitive local comparison against Tardigrade, NGINX, HAProxy, and Caddy.
+# Canonical competitor numbers still belong on a dedicated idle host.
+./benchmarks/competitive/run.sh
 ```
 
 ## Prerequisites
@@ -104,6 +108,26 @@ helper allocation counts. Use the streaming scenarios below with PID sampling
 to compare RSS, p99, throughput, buffered bytes, and CPU.
 
 ## Scenarios
+
+### Competitive suite
+
+`benchmarks/competitive/run.sh` starts representative Tardigrade, NGINX,
+HAProxy, and Caddy configs one at a time, drives the shared benchmark runner,
+and emits combined JSON, CSV, and Markdown summaries. It covers tiny static,
+large static, small proxy, large proxy, slow-client proxy download, keep-alive,
+and `Connection: close` connection-churn workloads by default, with an optional k6
+idle-keepalive/active-traffic scenario.
+
+Useful commands:
+
+```bash
+./benchmarks/competitive/run.sh --print-manual
+./benchmarks/competitive/run.sh --smoke
+./benchmarks/competitive/run.sh --allow-missing
+```
+
+See `benchmarks/competitive/README.md` for fairness rules, config templates,
+and output schema.
 
 ### Throughput scenarios (all tools)
 

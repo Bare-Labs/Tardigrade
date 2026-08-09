@@ -1,0 +1,42 @@
+worker_processes auto;
+pid __PID_FILE__;
+
+events {
+    worker_connections 4096;
+}
+
+http {
+    access_log off;
+    error_log __ERROR_LOG__ warn;
+    sendfile on;
+    keepalive_timeout 65;
+
+    upstream tardigrade_competitive_origin {
+        server 127.0.0.1:__UPSTREAM_PORT__;
+        keepalive 128;
+    }
+
+    server {
+        listen 127.0.0.1:__LISTEN_PORT__;
+        server_name _;
+        root __STATIC_ROOT__;
+
+        location = /health {
+            return 200 "ok";
+        }
+
+        location = /tiny.txt {
+            try_files /tiny.txt =404;
+        }
+
+        location = /large.bin {
+            try_files /large.bin =404;
+        }
+
+        location /proxy/ {
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_pass http://tardigrade_competitive_origin/;
+        }
+    }
+}
