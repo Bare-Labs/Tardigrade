@@ -419,6 +419,46 @@ MONITOR_PID=""
 CURRENT_CPU_PCT_AVG="null"
 CURRENT_RSS_MB_PEAK="null"
 CURRENT_OPEN_FDS_PEAK="null"
+CPU_BEFORE_SECONDS="null"
+MONITOR_START_NS="null"
+
+monotonic_ns() {
+    python3 -c 'import time; print(time.monotonic_ns())'
+}
+
+cpu_time_to_seconds() {
+    awk '
+        function part_seconds(v, n, p) {
+            n = split(v, p, ":")
+            if (n == 3) return (p[1] * 3600) + (p[2] * 60) + p[3]
+            if (n == 2) return (p[1] * 60) + p[2]
+            return v + 0
+        }
+        {
+            v = $1
+            days = 0
+            if (index(v, "-") > 0) {
+                split(v, d, "-")
+                days = d[1] + 0
+                v = d[2]
+            }
+            total += days * 86400 + part_seconds(v)
+        }
+        END { printf "%.6f", total }
+    '
+}
+
+process_tree_cpu_seconds() {
+    local pid="$1"
+    local pids
+    if $PID_TREE; then
+        pids="$(process_tree_pids "$pid" | paste -sd, -)"
+    else
+        pids="$pid"
+    fi
+    [[ -n "$pids" ]] || pids="$pid"
+    ps -p "$pids" -o time= 2>/dev/null | cpu_time_to_seconds
+}
 
 count_open_fds_for_pids() {
     local pids_csv="$1"
@@ -452,13 +492,13 @@ monitor_target_process() {
                 [[ -n "$pids" ]] || pids="$pid"
                 local fds
                 fds="$(count_open_fds_for_pids "$pids")"
-                ps -p "$pids" -o rss= -o %cpu= 2>/dev/null |
-                    awk -v fds="$fds" '{ rss += $1; cpu += $2 } END { if (rss > 0 || cpu > 0) print rss, cpu, fds }' >> "$outfile"
+                ps -p "$pids" -o rss= 2>/dev/null |
+                    awk -v fds="$fds" '{ rss += $1 } END { if (rss > 0) print rss, fds }' >> "$outfile"
             }
         else
             local fds
             fds="$(count_open_fds_for_pids "$pid")"
-            ps -p "$pid" -o rss= -o %cpu= 2>/dev/null | awk -v fds="$fds" 'NF >= 2 { print $1, $2, fds; exit }' >> "$outfile"
+            ps -p "$pid" -o rss= 2>/dev/null | awk -v fds="$fds" 'NF >= 1 { print $1, fds; exit }' >> "$outfile"
         fi
         sleep "$sample_interval_s"
     done
@@ -478,6 +518,8 @@ start_process_monitor() {
     CURRENT_CPU_PCT_AVG="null"
     CURRENT_RSS_MB_PEAK="null"
     CURRENT_OPEN_FDS_PEAK="null"
+    CPU_BEFORE_SECONDS="null"
+    MONITOR_START_NS="null"
     MONITOR_FILE=""
     MONITOR_PID=""
 
@@ -492,6 +534,8 @@ start_process_monitor() {
 
     local sample_interval_s
     sample_interval_s=$(awk -v ms="$SAMPLE_INTERVAL_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
+    CPU_BEFORE_SECONDS="$(process_tree_cpu_seconds "$pid")"
+    MONITOR_START_NS="$(monotonic_ns)"
     MONITOR_FILE=$(mktemp /tmp/tardigrade-bench-monitor-XXXXXX)
     monitor_target_process "$pid" "$sample_interval_s" "$MONITOR_FILE" &
     MONITOR_PID="$!"
@@ -504,9 +548,19 @@ stop_process_monitor() {
         MONITOR_PID=""
     fi
     if [[ -n "$MONITOR_FILE" && -f "$MONITOR_FILE" ]]; then
-        CURRENT_CPU_PCT_AVG=$(average_column_or_null "$MONITOR_FILE" 2)
+        local pid cpu_after end_ns
+        if pid=$(resolve_target_pid 2>/dev/null); then
+            cpu_after="$(process_tree_cpu_seconds "$pid")"
+            end_ns="$(monotonic_ns)"
+            CURRENT_CPU_PCT_AVG=$(awk -v before="$CPU_BEFORE_SECONDS" -v after="$cpu_after" -v start="$MONITOR_START_NS" -v end="$end_ns" '
+                BEGIN {
+                    elapsed = (end - start) / 1000000000
+                    if (before != "null" && elapsed > 0) printf "%.2f", ((after - before) / elapsed) * 100
+                    else printf "null"
+                }')
+        fi
         CURRENT_RSS_MB_PEAK=$(peak_rss_mb_or_null "$MONITOR_FILE")
-        CURRENT_OPEN_FDS_PEAK=$(awk 'NF >= 3 && $3 ~ /^[0-9]+$/ && $3 > max { max = $3 } END { if (max > 0) printf "%d", max; else printf "null" }' "$MONITOR_FILE")
+        CURRENT_OPEN_FDS_PEAK=$(awk 'NF >= 2 && $2 ~ /^[0-9]+$/ && $2 > max { max = $2 } END { if (max > 0) printf "%d", max; else printf "null" }' "$MONITOR_FILE")
         rm -f "$MONITOR_FILE"
         MONITOR_FILE=""
     fi

@@ -36,6 +36,8 @@ CURRENT_RSS_MB_PEAK="null"
 CURRENT_OPEN_FDS_PEAK="null"
 MONITOR_PID=""
 MONITOR_FILE=""
+CPU_BEFORE_SECONDS="null"
+MONITOR_START_NS="null"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -315,6 +317,39 @@ process_tree_pids() {
     done
 }
 
+monotonic_ns() {
+    python3 -c 'import time; print(time.monotonic_ns())'
+}
+
+cpu_time_to_seconds() {
+    awk '
+        function part_seconds(v, n, p) {
+            n = split(v, p, ":")
+            if (n == 3) return (p[1] * 3600) + (p[2] * 60) + p[3]
+            if (n == 2) return (p[1] * 60) + p[2]
+            return v + 0
+        }
+        {
+            v = $1
+            days = 0
+            if (index(v, "-") > 0) {
+                split(v, d, "-")
+                days = d[1] + 0
+                v = d[2]
+            }
+            total += days * 86400 + part_seconds(v)
+        }
+        END { printf "%.6f", total }
+    '
+}
+
+process_tree_cpu_seconds() {
+    local pid="$1" pids
+    pids="$(process_tree_pids "$pid" | paste -sd, -)"
+    [[ -n "$pids" ]] || pids="$pid"
+    ps -p "$pids" -o time= 2>/dev/null | cpu_time_to_seconds
+}
+
 count_open_fds_for_pids() {
     local pids_csv="$1"
     local total=0 pid count
@@ -345,8 +380,8 @@ monitor_process_tree() {
             [[ -n "$pids" ]] || pids="$pid"
             local fds
             fds="$(count_open_fds_for_pids "$pids")"
-            ps -p "$pids" -o rss= -o %cpu= 2>/dev/null |
-                awk -v fds="$fds" '{ rss += $1; cpu += $2 } END { if (rss > 0 || cpu > 0) print rss, cpu, fds }' >> "$outfile"
+            ps -p "$pids" -o rss= 2>/dev/null |
+                awk -v fds="$fds" '{ rss += $1 } END { if (rss > 0) print rss, fds }' >> "$outfile"
         }
         sleep "$sample_interval_s"
     done
@@ -366,6 +401,8 @@ start_process_monitor() {
     CURRENT_CPU_PCT_AVG="null"
     CURRENT_RSS_MB_PEAK="null"
     CURRENT_OPEN_FDS_PEAK="null"
+    CPU_BEFORE_SECONDS="$(process_tree_cpu_seconds "$EDGE_PID")"
+    MONITOR_START_NS="$(monotonic_ns)"
     MONITOR_FILE="$(mktemp /tmp/tardigrade-competitive-monitor-XXXXXX)"
     local sample_interval_s
     sample_interval_s="0.500"
@@ -380,9 +417,17 @@ stop_process_monitor() {
         MONITOR_PID=""
     fi
     if [[ -n "$MONITOR_FILE" && -f "$MONITOR_FILE" ]]; then
-        CURRENT_CPU_PCT_AVG="$(average_column_or_null "$MONITOR_FILE" 2)"
+        local cpu_after end_ns
+        cpu_after="$(process_tree_cpu_seconds "$EDGE_PID")"
+        end_ns="$(monotonic_ns)"
+        CURRENT_CPU_PCT_AVG="$(awk -v before="$CPU_BEFORE_SECONDS" -v after="$cpu_after" -v start="$MONITOR_START_NS" -v end="$end_ns" '
+            BEGIN {
+                elapsed = (end - start) / 1000000000
+                if (before != "null" && elapsed > 0) printf "%.2f", ((after - before) / elapsed) * 100
+                else printf "null"
+            }')"
         CURRENT_RSS_MB_PEAK="$(peak_rss_mb_or_null "$MONITOR_FILE")"
-        CURRENT_OPEN_FDS_PEAK="$(awk 'NF >= 3 && $3 ~ /^[0-9]+$/ && $3 > max { max = $3 } END { if (max > 0) printf "%d", max; else printf "null" }' "$MONITOR_FILE")"
+        CURRENT_OPEN_FDS_PEAK="$(awk 'NF >= 2 && $2 ~ /^[0-9]+$/ && $2 > max { max = $2 } END { if (max > 0) printf "%d", max; else printf "null" }' "$MONITOR_FILE")"
         rm -f "$MONITOR_FILE"
         MONITOR_FILE=""
     fi
@@ -700,7 +745,19 @@ write_combined_outputs() {
             (.upstream_pool_matrix.scenarios | to_entries[] |
                 ["tardigrade", ("upstream-pool/" + .key), (.value.covered // .value.supported // true), (.value.reason // .value.sharding_note // null),
                  (.value.rps // null), null, null, (.value.p99_ms // null), null, (.value.p99_ttfb_ms // null), null,
-                 (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null)])
+                 (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null)]),
+            (.upstream_pool_matrix.scenarios["uneven-route-distribution"].routes // {} | to_entries[] |
+                ["tardigrade", ("upstream-pool/uneven/" + .key), (.value.covered // true), (.value.reason // null),
+                 (.value.rps // null), null, null, (.value.p99_ms // null), null, (.value.p99_ttfb_ms // null), null,
+                 (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null)]),
+            (.upstream_pool_matrix.scenarios["many-origins-low-volume"].measurements // [] | .[] |
+                ["tardigrade", ("upstream-pool/origin/" + (.origin // "unknown")), (.covered // true), (.reason // null),
+                 (.rps // null), null, null, (.p99_ms // null), null, (.p99_ttfb_ms // null), null,
+                 (.cpu_pct_avg // null), (.cpu_ms_per_request // null), (.rss_mb_peak // null), (.open_fds_peak // null), (.errors // null)]),
+            (.upstream_pool_matrix.scenarios["pool-contention"].measurements // [] | .[] |
+                ["tardigrade", ("upstream-pool/contention/" + ((.worker_threads // 0) | tostring) + "w"), (.covered // true), (.reason // null),
+                 (.rps // null), null, null, (.p99_ms // null), null, (.p99_ttfb_ms // null), null,
+                 (.cpu_pct_avg // null), (.cpu_ms_per_request // null), (.rss_mb_peak // null), (.open_fds_peak // null), (.errors // null)])
          else empty end)
         | @csv
     ' "$combined_json" > "$csv"
@@ -731,6 +788,28 @@ write_combined_outputs() {
             jq -r '
                 .upstream_pool_matrix.scenarios | to_entries[] |
                 "| `\(.key)` | \((.value.covered // .value.supported // true)) | \(.value.rps // "-") | \(.value.p99_ms // "-") | \(.value.p99_ttfb_ms // "-") | \(.value.cpu_pct_avg // "-") | \(.value.cpu_ms_per_request // "-") | \(.value.rss_mb_peak // "-") | \(.value.new_connections_per_sec // "-") | \(.value.reuse_ratio // "-") | \(.value.sharding_justified // "-") | \(.value.errors // "-") |"
+            ' "$combined_json"
+            echo ""
+            echo "### Upstream Pool Detail Rows"
+            echo ""
+            echo "| Detail | req/s | p99 ms | p99 TTFB ms | CPU % | CPU ms/req | RSS MiB | Open FDs | New conn/s | Reuse ratio | Errors |"
+            echo "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+            jq -r '
+                def row($name; $v):
+                    "| `" + $name + "` | " +
+                    (($v.rps // "-") | tostring) + " | " +
+                    (($v.p99_ms // "-") | tostring) + " | " +
+                    (($v.p99_ttfb_ms // "-") | tostring) + " | " +
+                    (($v.cpu_pct_avg // "-") | tostring) + " | " +
+                    (($v.cpu_ms_per_request // "-") | tostring) + " | " +
+                    (($v.rss_mb_peak // "-") | tostring) + " | " +
+                    (($v.open_fds_peak // "-") | tostring) + " | " +
+                    (($v.new_connections_per_sec // "-") | tostring) + " | " +
+                    (($v.reuse_ratio // "-") | tostring) + " | " +
+                    (($v.errors // "-") | tostring) + " |";
+                (.upstream_pool_matrix.scenarios["uneven-route-distribution"].routes // {} | to_entries[] | row("uneven/" + .key; .value)),
+                (.upstream_pool_matrix.scenarios["many-origins-low-volume"].measurements // [] | .[] | row("origin/" + (.origin // "unknown"); .)),
+                (.upstream_pool_matrix.scenarios["pool-contention"].measurements // [] | .[] | row("contention/" + ((.worker_threads // 0) | tostring) + "w"; .))
             ' "$combined_json"
         fi
         echo ""
@@ -839,7 +918,7 @@ if ! $SMOKE && selected_tardigrade; then
     "${COMP_DIR}/upstream-pool-matrix.sh" \
         --binary "$BINARY" \
         --listen-port "$((LISTEN_BASE + 200))" \
-        --origin-base-port "$((UPSTREAM_PORT + 200))" \
+        --origin-base-port "$((LISTEN_BASE + 300))" \
         --duration "$DURATION" \
         --connections "$CONNECTIONS" \
         --threads "$THREADS" \

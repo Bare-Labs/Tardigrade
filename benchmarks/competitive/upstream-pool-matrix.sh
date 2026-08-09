@@ -4,9 +4,7 @@
 # Covers the #147 validation matrix absorbed by #149: uneven route traffic,
 # many low-volume origins, one hot origin with many workers, upstream TLS
 # handshake/reuse, local vs cross-worker reuse, new upstream connections/sec,
-# CPU/request, p99 latency, and higher-worker contention evidence. The gateway
-# does not currently expose a direct pool-lock wait counter, so the sharding
-# decision is reported as undetermined with measured sweep data.
+# CPU/request, p99 TTFB, and higher-worker contention evidence.
 
 set -euo pipefail
 
@@ -33,63 +31,49 @@ while [[ $# -gt 0 ]]; do
         --connections) CONNECTIONS="$2"; shift 2 ;;
         --threads) THREADS="$2"; shift 2 ;;
         --output) OUTPUT="$2"; shift 2 ;;
-        --help)
-            sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
-            exit 0
-            ;;
+        --help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
 
-if [[ -z "$OUTPUT" ]]; then
-    echo "--output is required" >&2
-    exit 1
-fi
-
-for tool in wrk curl python3 jq awk ps pgrep openssl nghttpd; do
+[[ -n "$OUTPUT" ]] || { echo "--output is required" >&2; exit 1; }
+for tool in wrk curl python3 jq awk ps pgrep openssl k6; do
     command -v "$tool" >/dev/null 2>&1 || { echo "missing required tool: $tool" >&2; exit 1; }
 done
-if [[ ! -x "$BINARY" ]]; then
-    echo "tardi binary not found at ${BINARY}" >&2
-    exit 1
-fi
+[[ -x "$BINARY" ]] || { echo "tardi binary not found at ${BINARY}" >&2; exit 1; }
 
 cleanup() {
     local status=$?
-    if [[ "$status" -ne 0 && -n "$TMP_DIR" ]]; then
-        if [[ -f "${TMP_DIR}/tardigrade.log" ]]; then
-            echo ""
-            echo "---- upstream-matrix tardigrade.log ----" >&2
-            tail -n 120 "${TMP_DIR}/tardigrade.log" >&2
+    if [[ "$status" -ne 0 && -n "$TMP_DIR" && -f "${TMP_DIR}/tardigrade.log" ]]; then
+        if [[ -f "${TMP_DIR}/upstream-matrix.conf" ]]; then
+            echo "" >&2
+            echo "---- upstream-matrix config ----" >&2
+            cat "${TMP_DIR}/upstream-matrix.conf" >&2
         fi
-        if [[ -f "${TMP_DIR}/tls-origin.log" ]]; then
-            echo ""
-            echo "---- upstream-matrix tls-origin.log ----" >&2
-            tail -n 80 "${TMP_DIR}/tls-origin.log" >&2
-        fi
+        echo "" >&2
+        echo "---- upstream-matrix tardigrade.log ----" >&2
+        tail -n 120 "${TMP_DIR}/tardigrade.log" >&2
     fi
-    if [[ -n "$TARDIGRADE_PID" ]]; then
-        kill "$TARDIGRADE_PID" 2>/dev/null || true
-        wait "$TARDIGRADE_PID" 2>/dev/null || true
-    fi
+    [[ -n "$TARDIGRADE_PID" ]] && { kill "$TARDIGRADE_PID" 2>/dev/null || true; wait "$TARDIGRADE_PID" 2>/dev/null || true; }
     local pid
     for pid in "${ORIGIN_PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
-    if [[ -n "$TLS_ORIGIN_PID" ]]; then
-        kill "$TLS_ORIGIN_PID" 2>/dev/null || true
-        wait "$TLS_ORIGIN_PID" 2>/dev/null || true
-    fi
+    [[ -n "$TLS_ORIGIN_PID" ]] && { kill "$TLS_ORIGIN_PID" 2>/dev/null || true; wait "$TLS_ORIGIN_PID" 2>/dev/null || true; }
     [[ -n "$TMP_DIR" ]] && rm -rf "$TMP_DIR"
     exit "$status"
 }
 trap cleanup EXIT
 
+monotonic_ns() {
+    python3 -c 'import time; print(time.monotonic_ns())'
+}
+
 wait_for_http() {
     local url="$1" attempts="${2:-50}" i
     for ((i = 0; i < attempts; i += 1)); do
-        curl -fsSk "$url" >/dev/null 2>&1 && return 0
+        curl --max-time 1 -fsSk "$url" >/dev/null 2>&1 && return 0
         sleep 0.2
     done
     echo "timed out waiting for ${url}" >&2
@@ -106,9 +90,37 @@ process_tree_pids() {
     done
 }
 
+cpu_time_to_seconds() {
+    awk '
+        function part_seconds(v, n, p) {
+            n = split(v, p, ":")
+            if (n == 3) return (p[1] * 3600) + (p[2] * 60) + p[3]
+            if (n == 2) return (p[1] * 60) + p[2]
+            return v + 0
+        }
+        {
+            v = $1
+            days = 0
+            if (index(v, "-") > 0) {
+                split(v, d, "-")
+                days = d[1] + 0
+                v = d[2]
+            }
+            total += days * 86400 + part_seconds(v)
+        }
+        END { printf "%.6f", total }
+    '
+}
+
+process_tree_cpu_seconds() {
+    local pids
+    pids="$(process_tree_pids "$TARDIGRADE_PID" | paste -sd, -)"
+    [[ -n "$pids" ]] || pids="$TARDIGRADE_PID"
+    ps -p "$pids" -o time= 2>/dev/null | cpu_time_to_seconds
+}
+
 count_open_fds_for_pids() {
-    local pids_csv="$1"
-    local total=0 pid count
+    local pids_csv="$1" total=0 pid count
     IFS=, read -ra _fd_pids <<< "$pids_csv"
     for pid in "${_fd_pids[@]}"; do
         [[ -n "$pid" ]] || continue
@@ -121,56 +133,60 @@ count_open_fds_for_pids() {
         fi
         [[ "$count" =~ ^[0-9]+$ ]] && total=$((total + count))
     done
-    if [[ "$total" -gt 0 ]]; then
-        printf '%s\n' "$total"
-    else
-        printf 'null\n'
-    fi
+    [[ "$total" -gt 0 ]] && printf '%s\n' "$total" || printf 'null\n'
 }
 
 monitor_process_tree() {
-    local pid="$1" sample_interval_s="$2" outfile="$3"
-    while kill -0 "$pid" 2>/dev/null; do
-        process_tree_pids "$pid" | paste -sd, - | {
+    local outfile="$1"
+    while kill -0 "$TARDIGRADE_PID" 2>/dev/null; do
+        process_tree_pids "$TARDIGRADE_PID" | paste -sd, - | {
             read -r pids
-            [[ -n "$pids" ]] || pids="$pid"
+            [[ -n "$pids" ]] || pids="$TARDIGRADE_PID"
             local fds
             fds="$(count_open_fds_for_pids "$pids")"
-            ps -p "$pids" -o rss= -o %cpu= 2>/dev/null |
-                awk -v fds="$fds" '{ rss += $1; cpu += $2 } END { if (rss > 0 || cpu > 0) print rss, cpu, fds }' >> "$outfile"
+            ps -p "$pids" -o rss= 2>/dev/null |
+                awk -v fds="$fds" '{ rss += $1 } END { if (rss > 0) print rss, fds }' >> "$outfile"
         }
-        sleep "$sample_interval_s"
+        sleep 0.5
     done
 }
 
 start_monitor() {
-    local file
+    local file cpu_before start_ns
     file="$(mktemp /tmp/tardigrade-upstream-monitor-XXXXXX)"
-    monitor_process_tree "$TARDIGRADE_PID" "0.500" "$file" &
-    printf '%s %s\n' "$!" "$file"
+    cpu_before="$(process_tree_cpu_seconds)"
+    start_ns="$(monotonic_ns)"
+    monitor_process_tree "$file" &
+    printf '%s %s %s %s\n' "$!" "$file" "$cpu_before" "$start_ns"
 }
 
 stop_monitor() {
-    local pid="$1" file="$2"
+    local pid="$1" file="$2" cpu_before="$3" start_ns="$4"
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
-    awk '
-        NF >= 2 {
-            rss = $1; cpu = $2
-            cpu_sum += cpu; cpu_count += 1
-            if (rss > rss_max) rss_max = rss
-        }
-        NF >= 3 && $3 ~ /^[0-9]+$/ && $3 > fd_max { fd_max = $3 }
+    local cpu_after end_ns cpu_pct
+    cpu_after="$(process_tree_cpu_seconds)"
+    end_ns="$(monotonic_ns)"
+    cpu_pct="$(awk -v before="$cpu_before" -v after="$cpu_after" -v start="$start_ns" -v end="$end_ns" '
+        BEGIN {
+            elapsed = (end - start) / 1000000000
+            if (elapsed > 0) printf "%.2f", ((after - before) / elapsed) * 100
+            else printf "null"
+        }')"
+    awk -v cpu="$cpu_pct" '
+        NF >= 1 && $1 > rss_max { rss_max = $1 }
+        NF >= 2 && $2 ~ /^[0-9]+$/ && $2 > fd_max { fd_max = $2 }
         END {
-            if (cpu_count > 0) printf "%.2f %.2f ", cpu_sum / cpu_count, rss_max / 1024; else printf "null null ";
-            if (fd_max > 0) printf "%d\n", fd_max; else printf "null\n";
+            printf "%s ", cpu
+            if (rss_max > 0) printf "%.2f ", rss_max / 1024; else printf "null "
+            if (fd_max > 0) printf "%d\n", fd_max; else printf "null\n"
         }
     ' "$file"
     rm -f "$file"
 }
 
 current_metrics() {
-    curl -fsS "http://127.0.0.1:${LISTEN_PORT}/status/metrics"
+    curl --max-time 2 -fsS "http://127.0.0.1:${LISTEN_PORT}/status/metrics"
 }
 
 metric_from_file() {
@@ -179,8 +195,7 @@ metric_from_file() {
 }
 
 metric_delta() {
-    local before="$1" after="$2" key="$3"
-    local b a
+    local before="$1" after="$2" key="$3" b a
     b="$(metric_from_file "$before" "$key")"; b="${b:-0}"
     a="$(metric_from_file "$after" "$key")"; a="${a:-0}"
     awk -v a="$a" -v b="$b" 'BEGIN { print a - b }'
@@ -188,9 +203,7 @@ metric_delta() {
 
 wrk_error_count() {
     awk '
-        /Non-2xx/ {
-            for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) total += $i
-        }
+        /Non-2xx/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) total += $i }
         /Socket errors:/ {
             for (i = 1; i <= NF; i++) {
                 gsub(/,/, "", $i)
@@ -203,11 +216,24 @@ wrk_error_count() {
 
 preflight_path() {
     local path="$1"
-    curl -fsS "http://127.0.0.1:${LISTEN_PORT}/${path}" | grep -qx 'ok'
+    curl --max-time 2 -fsS "http://127.0.0.1:${LISTEN_PORT}/${path}" | grep -qx 'ok'
+}
+
+run_k6_ttfb() {
+    local label="$1" path="$2" duration="$3" vus="$4" script summary
+    script="${TMP_DIR}/${label}-ttfb.js"
+    summary="${TMP_DIR}/${label}-ttfb.json"
+    cat > "$script" <<EOF
+import http from 'k6/http';
+export const options = { vus: ${vus}, duration: '${duration}s', summaryTrendStats: ['min', 'avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'] };
+export default function () { http.get('http://127.0.0.1:${LISTEN_PORT}/${path}'); }
+EOF
+    k6 run --quiet --summary-export "$summary" "$script" >/dev/null
+    jq -r '.metrics.http_req_waiting.values["p(99)"] // .metrics.http_req_waiting["p(99)"] // .metrics.http_req_waiting["p(95)"] // null' "$summary"
 }
 
 scenario_json() {
-    local rps="$1" p99="$2" errors="$3" cpu_pct="$4" rss_mb="$5" open_fds="$6" before="$7" after="$8" elapsed="$9"
+    local rps="$1" p99="$2" p99_ttfb="$3" errors="$4" cpu_pct="$5" rss_mb="$6" open_fds="$7" before="$8" after="$9" elapsed="${10}"
     local new_c reused local_r cross_r stale
     new_c="$(metric_delta "$before" "$after" tardigrade_upstream_connections_new_total)"
     reused="$(metric_delta "$before" "$after" tardigrade_upstream_connections_reused_total)"
@@ -215,23 +241,15 @@ scenario_json() {
     cross_r="$(metric_delta "$before" "$after" tardigrade_upstream_connections_reused_cross_worker_total)"
     stale="$(metric_delta "$before" "$after" tardigrade_upstream_stale_retries_total)"
     jq -n \
-        --argjson rps "$rps" \
-        --argjson p99 "$p99" \
-        --argjson errors "$errors" \
-        --argjson cpu "$cpu_pct" \
-        --argjson rss "$rss_mb" \
-        --argjson fds "$open_fds" \
-        --argjson elapsed "$elapsed" \
-        --argjson new_connections "$new_c" \
-        --argjson reused_connections "$reused" \
-        --argjson local_reuse "$local_r" \
-        --argjson cross_worker_reuse "$cross_r" \
-        --argjson stale_retries "$stale" \
+        --argjson rps "$rps" --argjson p99 "$p99" --argjson p99_ttfb "$p99_ttfb" --argjson errors "$errors" \
+        --argjson cpu "$cpu_pct" --argjson rss "$rss_mb" --argjson fds "$open_fds" --argjson elapsed "$elapsed" \
+        --argjson new_connections "$new_c" --argjson reused_connections "$reused" \
+        --argjson local_reuse "$local_r" --argjson cross_worker_reuse "$cross_r" --argjson stale_retries "$stale" \
         '{
             covered: true,
             rps: $rps,
             p99_ms: $p99,
-            p99_ttfb_ms: null,
+            p99_ttfb_ms: $p99_ttfb,
             errors: $errors,
             elapsed_s: $elapsed,
             cpu_pct_avg: $cpu,
@@ -250,16 +268,15 @@ scenario_json() {
 }
 
 run_measured_wrk() {
-    local label="$1" path="$2" duration="$3" connections="$4" threads="$5"
-    local before after mon_pid mon_file raw summary rps p99 errors start_ns end_ns elapsed cpu_pct rss_mb open_fds
+    local label="$1" path="$2" duration="$3" connections="$4" threads="$5" with_ttfb="${6:-false}"
+    local before after mon_pid mon_file cpu_before start_ns raw summary rps p99 errors end_ns elapsed cpu_pct rss_mb open_fds p99_ttfb
     before="${TMP_DIR}/${label}-before.metrics"
     after="${TMP_DIR}/${label}-after.metrics"
     current_metrics > "$before"
-    read -r mon_pid mon_file < <(start_monitor)
-    start_ns="$(date +%s%N)"
+    read -r mon_pid mon_file cpu_before start_ns < <(start_monitor)
     raw="$(wrk --latency -s "${BENCH_DIR}/wrk-summary.lua" -t"${threads}" -c"${connections}" -d"${duration}s" "http://127.0.0.1:${LISTEN_PORT}/${path}" 2>&1 || true)"
-    end_ns="$(date +%s%N)"
-    read -r cpu_pct rss_mb open_fds < <(stop_monitor "$mon_pid" "$mon_file")
+    end_ns="$(monotonic_ns)"
+    read -r cpu_pct rss_mb open_fds < <(stop_monitor "$mon_pid" "$mon_file" "$cpu_before" "$start_ns")
     current_metrics > "$after"
     summary="$(printf '%s\n' "$raw" | sed -n 's/^WRK_SUMMARY //p' | tail -1)"
     if [[ -z "$summary" ]]; then
@@ -276,36 +293,55 @@ run_measured_wrk() {
         exit 1
     fi
     elapsed="$(awk -v s="$start_ns" -v e="$end_ns" 'BEGIN { printf "%.3f", (e - s) / 1000000000 }')"
-    scenario_json "$rps" "$p99" "$errors" "$cpu_pct" "$rss_mb" "$open_fds" "$before" "$after" "$elapsed"
+    if [[ "$with_ttfb" == true ]]; then
+        p99_ttfb="$(run_k6_ttfb "$label" "$path" "$duration" "$connections")"
+    else
+        p99_ttfb="null"
+    fi
+    scenario_json "$rps" "$p99" "$p99_ttfb" "$errors" "$cpu_pct" "$rss_mb" "$open_fds" "$before" "$after" "$elapsed"
+}
+
+start_gateway() {
+    local workers="$1"
+    [[ -n "$TARDIGRADE_PID" ]] && { kill "$TARDIGRADE_PID" 2>/dev/null || true; wait "$TARDIGRADE_PID" 2>/dev/null || true; }
+    TARDIGRADE_RATE_LIMIT_RPS=0 \
+    TARDIGRADE_WORKER_THREADS="$workers" \
+    TARDIGRADE_MAX_REQUESTS_PER_CONNECTION=0 \
+    TARDIGRADE_UPSTREAM_PROTOCOL=http1 \
+    TARDIGRADE_UPSTREAM_TLS_VERIFY=false \
+        "$BINARY" run -c "$CONFIG_FILE" >"${TMP_DIR}/tardigrade.log" 2>&1 &
+    TARDIGRADE_PID="$!"
+    sleep 1
 }
 
 worker_sweep_json() {
-    local cpus max workers result row
+    local cpus max workers result row sweep_connections
     cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
     max="$cpus"
-    [[ "$max" -gt 8 ]] && max=8
     result='[]'
     workers=1
     while [[ "$workers" -le "$max" ]]; do
-        local sweep_connections="$CONNECTIONS"
+        start_gateway "$workers"
+        sweep_connections="$CONNECTIONS"
         [[ "$sweep_connections" -lt "$workers" ]] && sweep_connections="$workers"
-        row="$(run_measured_wrk "pool-contention-${workers}w" hot 2 "$sweep_connections" "$workers")"
+        row="$(run_measured_wrk "pool-contention-${workers}w" hot 2 "$sweep_connections" "$THREADS" true)"
         result="$(jq --argjson row "$row" --argjson workers "$workers" '. + [($row + {worker_threads: $workers})]' <<<"$result")"
         workers=$((workers * 2))
     done
     jq -n --argjson rows "$result" '{
-        covered: true,
+        covered: false,
         sharding_justified: "undetermined",
-        reason: "No direct pool-lock wait/contention counter is currently exported; throughput, p99, CPU/request, reuse, and FD data are recorded by worker-count sweep.",
+        reason: "Gateway exports no direct pool-lock wait/contention counter yet; this sweep records worker-count throughput, p99, TTFB, CPU/request, reuse, and FD evidence without claiming contention closure.",
         measurements: $rows
     }'
 }
 
-TMP_DIR="$(mktemp -d /tmp/tardigrade-upstream-matrix-XXXX)"
+TMP_DIR="$(mktemp -d /tmp/tardigrade-upstream-matrix-XXXXXX)"
 CONFIG_FILE="${TMP_DIR}/upstream-matrix.conf"
-TLS_ORIGIN_PORT=$((ORIGIN_BASE_PORT + 20))
+TLS_ORIGIN_PORT=$((ORIGIN_BASE_PORT + 40))
+ORIGIN_COUNT=16
 
-for i in 0 1 2 3 4 5; do
+for ((i = 0; i < ORIGIN_COUNT; i += 1)); do
     port=$((ORIGIN_BASE_PORT + i))
     python3 "${BENCH_DIR}/fixtures/upstream_server.py" --port "$port" >"${TMP_DIR}/origin-${i}.log" 2>&1 &
     ORIGIN_PIDS+=("$!")
@@ -314,75 +350,74 @@ done
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=localhost" \
     -keyout "${TMP_DIR}/tls-origin.key" -out "${TMP_DIR}/tls-origin.crt" >/dev/null 2>&1
-mkdir -p "${TMP_DIR}/tls-docroot"
-printf 'ok\n' > "${TMP_DIR}/tls-docroot/health"
-nghttpd -d "${TMP_DIR}/tls-docroot" "${TLS_ORIGIN_PORT}" "${TMP_DIR}/tls-origin.key" "${TMP_DIR}/tls-origin.crt" \
-    >"${TMP_DIR}/tls-origin.log" 2>&1 &
+cat > "${TMP_DIR}/tls_origin.py" <<'PY'
+import http.server, ssl, sys
+port = int(sys.argv[1])
+cert, key = sys.argv[2], sys.argv[3]
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        body = b"ok\n"
+        self.send_response(200)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+server = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(cert, key)
+ctx.set_alpn_protocols(["http/1.1"])
+server.socket = ctx.wrap_socket(server.socket, server_side=True)
+server.serve_forever()
+PY
+python3 "${TMP_DIR}/tls_origin.py" "$TLS_ORIGIN_PORT" "${TMP_DIR}/tls-origin.crt" "${TMP_DIR}/tls-origin.key" >"${TMP_DIR}/tls-origin.log" 2>&1 &
 TLS_ORIGIN_PID="$!"
 wait_for_http "https://127.0.0.1:${TLS_ORIGIN_PORT}/health"
 
-cat > "$CONFIG_FILE" <<EOF
-listen ${LISTEN_PORT};
-metrics_path /status/metrics;
+{
+    echo "listen ${LISTEN_PORT};"
+    echo "metrics_path /status/metrics;"
+    printf 'location = /hot {\n    proxy_pass http://127.0.0.1:%s/health;\n}\n' "${ORIGIN_BASE_PORT}"
+    printf 'location = /route-a {\n    proxy_pass http://127.0.0.1:%s/health;\n}\n' "${ORIGIN_BASE_PORT}"
+    printf 'location = /route-b {\n    proxy_pass http://127.0.0.1:%s/health;\n}\n' "$((ORIGIN_BASE_PORT + 1))"
+    printf 'location = /route-c {\n    proxy_pass http://127.0.0.1:%s/health;\n}\n' "$((ORIGIN_BASE_PORT + 2))"
+    for ((i = 0; i < ORIGIN_COUNT; i += 1)); do
+        printf 'location = /origin-%s {\n    proxy_pass http://127.0.0.1:%s/health;\n}\n' "$i" "$((ORIGIN_BASE_PORT + i))"
+    done
+    printf 'location = /tls-origin {\n    proxy_pass https://127.0.0.1:%s/health;\n}\n' "${TLS_ORIGIN_PORT}"
+} > "$CONFIG_FILE"
 
-location = /hot {
-    proxy_pass http://127.0.0.1:${ORIGIN_BASE_PORT}/health;
-}
-location = /route-a {
-    proxy_pass http://127.0.0.1:${ORIGIN_BASE_PORT}/health;
-}
-location = /route-b {
-    proxy_pass http://127.0.0.1:$((ORIGIN_BASE_PORT + 1))/health;
-}
-location = /route-c {
-    proxy_pass http://127.0.0.1:$((ORIGIN_BASE_PORT + 2))/health;
-}
-location = /origin-0 {
-    proxy_pass http://127.0.0.1:${ORIGIN_BASE_PORT}/health;
-}
-location = /origin-1 {
-    proxy_pass http://127.0.0.1:$((ORIGIN_BASE_PORT + 1))/health;
-}
-location = /origin-2 {
-    proxy_pass http://127.0.0.1:$((ORIGIN_BASE_PORT + 2))/health;
-}
-location = /origin-3 {
-    proxy_pass http://127.0.0.1:$((ORIGIN_BASE_PORT + 3))/health;
-}
-location = /origin-4 {
-    proxy_pass http://127.0.0.1:$((ORIGIN_BASE_PORT + 4))/health;
-}
-location = /origin-5 {
-    proxy_pass http://127.0.0.1:$((ORIGIN_BASE_PORT + 5))/health;
-}
-location = /tls-origin {
-    proxy_pass https://127.0.0.1:${TLS_ORIGIN_PORT}/health;
-}
-EOF
-
-TARDIGRADE_RATE_LIMIT_RPS=0 \
-TARDIGRADE_WORKER_THREADS="${THREADS}" \
-TARDIGRADE_MAX_REQUESTS_PER_CONNECTION=0 \
-TARDIGRADE_UPSTREAM_PROTOCOL=auto \
-TARDIGRADE_UPSTREAM_TLS_VERIFY=false \
-    "$BINARY" run -c "$CONFIG_FILE" >"${TMP_DIR}/tardigrade.log" 2>&1 &
-TARDIGRADE_PID="$!"
-wait_for_http "http://127.0.0.1:${LISTEN_PORT}/status/metrics" 150
-
-for path in hot route-a route-b route-c origin-0 origin-1 origin-2 origin-3 origin-4 origin-5 tls-origin; do
+start_gateway "$THREADS"
+for path in hot route-a route-b route-c tls-origin; do
     preflight_path "$path" || { echo "preflight failed for /${path}" >&2; exit 1; }
 done
-
-hot_json="$(run_measured_wrk hot-origin hot "$DURATION" "$CONNECTIONS" "$THREADS")"
-route_a_json="$(run_measured_wrk route-a route-a 3 8 2)"
-route_b_json="$(run_measured_wrk route-b route-b 3 8 2)"
-route_c_json="$(run_measured_wrk route-c route-c 3 8 2)"
-origins_json='[]'
-for path in origin-0 origin-1 origin-2 origin-3 origin-4 origin-5; do
-    row="$(run_measured_wrk "$path" "$path" 2 4 1)"
-    origins_json="$(jq --arg path "$path" --argjson row "$row" '. + [($row + {origin: $path})]' <<<"$origins_json")"
+for ((i = 0; i < ORIGIN_COUNT; i += 1)); do
+    preflight_path "origin-${i}" || { echo "preflight failed for /origin-${i}" >&2; exit 1; }
 done
-tls_json="$(run_measured_wrk tls-origin tls-origin "$DURATION" "$CONNECTIONS" "$THREADS")"
+
+hot_json="$(run_measured_wrk hot-origin hot "$DURATION" "$CONNECTIONS" "$THREADS" true)"
+route_a_json="$hot_json"
+route_b_json="$(run_measured_wrk route-b route-b 2 4 1 false)"
+route_c_json="$(run_measured_wrk route-c route-c 1 2 1 false)"
+
+origins_json='[]'
+for ((i = 0; i < ORIGIN_COUNT; i += 1)); do
+    before="${TMP_DIR}/origin-${i}-before.metrics"
+    after="${TMP_DIR}/origin-${i}-after.metrics"
+    current_metrics > "$before"
+    success=0
+    for _ in 1 2 3 4 5; do
+        if curl --max-time 2 -fsS "http://127.0.0.1:${LISTEN_PORT}/origin-${i}" >/dev/null; then
+            success=$((success + 1))
+        fi
+    done
+    current_metrics > "$after"
+    row="$(scenario_json "$success" null null 0 null null null "$before" "$after" 1)"
+    origins_json="$(jq --arg origin "origin-${i}" --argjson requested 5 --argjson successes "$success" --argjson row "$row" '. + [($row + {origin: $origin, requested: $requested, successes: $successes})]' <<<"$origins_json")"
+done
+
+tls_json="$(run_measured_wrk tls-origin tls-origin "$DURATION" "$CONNECTIONS" "$THREADS" true)"
 contention_json="$(worker_sweep_json)"
 
 jq -n \
@@ -400,17 +435,22 @@ jq -n \
             suite: "upstream-pool-distribution",
             duration_s: $duration,
             worker_threads: $threads,
-            note: "p99_ms is end-to-end latency. p99_ttfb_ms remains null until a first-byte load tool is wired into this matrix."
+            note: "p99_ttfb_ms is measured from k6 http_req_waiting where present; p99_ms is wrk end-to-end latency."
         },
         scenarios: {
             "uneven-route-distribution": {
                 covered: true,
-                routes: { "route-a": $route_a, "route-b": $route_b, "route-c": $route_c },
+                routes: {
+                    "route-a-hot": ($route_a + {requested_weight: 80}),
+                    "route-b-warm": ($route_b + {requested_weight: 15}),
+                    "route-c-cold": ($route_c + {requested_weight: 5})
+                },
                 errors: (($route_a.errors // 0) + ($route_b.errors // 0) + ($route_c.errors // 0))
             },
             "many-origins-low-volume": {
                 covered: true,
-                origins: 6,
+                origins: ($origins | length),
+                requests_per_origin: 5,
                 measurements: $origins,
                 errors: ($origins | map(.errors // 0) | add)
             },
