@@ -3726,8 +3726,8 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             .fallback, .not_applicable => {
                 if (upload_eligibility == .fallback) {
                     const reason = upload_eligibility.fallback;
-                    state.metricsRecordProxyStreamingFallback(reason.metricLabel());
-                    state.logger.debug(null, "proxy upload streaming fallback: {s}", .{reason.metricLabel()});
+                    state.metricsRecordProxyStreamingFallback(reason);
+                    state.logger.debug(null, "proxy upload streaming fallback: {s}", .{reason.label()});
                 }
                 head_parse.request.deinit();
                 // Switch SO_RCVTIMEO from header phase to body read phase.

@@ -506,6 +506,223 @@ const UpstreamServer = struct {
     }
 };
 
+/// Minimal prior-knowledge HTTP/2 cleartext (h2c) origin, enough to exercise
+/// the gateway's h2 upstream client (#139). It reads the connection preface,
+/// answers SETTINGS, decodes one request's HEADERS, accumulates DATA until
+/// END_STREAM, and replies with HEADERS + DATA. Deliberately not a general h2
+/// server: no CONTINUATION, priority, push, or multiplexing beyond one stream
+/// per connection.
+const H2cUpstreamServer = struct {
+    allocator: std.mem.Allocator,
+    server: compat.NetServer,
+    thread: ?std.Thread,
+    stop_flag: std.atomic.Value(bool),
+    mutex: compat.Mutex = .{},
+    /// Decoded request-header fields of the most recent request, `name: value`
+    /// per line, so tests can assert on absent headers too.
+    headers_raw: []u8,
+    /// Concatenated DATA payload of the most recent request.
+    body: []u8,
+    request_count: u32,
+    response_body: []const u8,
+
+    fn start(allocator: std.mem.Allocator, response_body: []const u8) !H2cUpstreamServer {
+        return .{
+            .allocator = allocator,
+            .server = try compat.listenTcp(test_host, 0),
+            .thread = null,
+            .stop_flag = std.atomic.Value(bool).init(false),
+            .headers_raw = try allocator.dupe(u8, ""),
+            .body = try allocator.dupe(u8, ""),
+            .request_count = 0,
+            .response_body = response_body,
+        };
+    }
+
+    fn port(self: *const H2cUpstreamServer) u16 {
+        return self.server.port();
+    }
+
+    fn run(self: *H2cUpstreamServer) !void {
+        self.thread = try std.Thread.spawn(.{}, h2cUpstreamThreadMain, .{self});
+    }
+
+    fn stop(self: *H2cUpstreamServer) void {
+        self.stop_flag.store(true, .seq_cst);
+        wakeListener(self.port());
+        if (self.thread) |thread| thread.join();
+        self.server.deinit();
+        self.allocator.free(self.headers_raw);
+        self.allocator.free(self.body);
+        self.* = undefined;
+    }
+
+    fn requestCount(self: *H2cUpstreamServer) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.request_count;
+    }
+
+    fn capturedBody(self: *H2cUpstreamServer, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return allocator.dupe(u8, self.body);
+    }
+
+    /// True when a `name: value` line is present in the last request's decoded
+    /// header block. Used to assert both presence and absence.
+    fn capturedHasHeader(self: *H2cUpstreamServer, name: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var lines = std.mem.splitScalar(u8, self.headers_raw, '\n');
+        while (lines.next()) |line| {
+            const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), name)) return true;
+        }
+        return false;
+    }
+};
+
+const H2Frame = struct {
+    typ: u8,
+    flags: u8,
+    stream_id: u31,
+    payload: []u8,
+
+    fn deinit(self: *H2Frame, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+        self.* = undefined;
+    }
+};
+
+fn readH2Frame(allocator: std.mem.Allocator, stream: compat.NetStream, timeout_ms: i32) !H2Frame {
+    var header: [9]u8 = undefined;
+    try readExactWithPoll(stream, &header, timeout_ms);
+    const len: usize = (@as(usize, header[0]) << 16) | (@as(usize, header[1]) << 8) | header[2];
+    const payload = try allocator.alloc(u8, len);
+    errdefer allocator.free(payload);
+    if (len > 0) try readExactWithPoll(stream, payload, timeout_ms);
+    return .{
+        .typ = header[3],
+        .flags = header[4],
+        .stream_id = @intCast(std.mem.readInt(u32, header[5..9], .big) & 0x7fff_ffff),
+        .payload = payload,
+    };
+}
+
+fn readExactWithPoll(stream: compat.NetStream, out: []u8, timeout_ms: i32) !void {
+    var filled: usize = 0;
+    while (filled < out.len) {
+        const n = try readSocketWithPoll(stream.handle, out[filled..], timeout_ms);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        filled += n;
+    }
+}
+
+fn writeH2Frame(stream: compat.NetStream, typ: u8, flags: u8, stream_id: u31, payload: []const u8) !void {
+    var header: [9]u8 = undefined;
+    header[0] = @intCast((payload.len >> 16) & 0xff);
+    header[1] = @intCast((payload.len >> 8) & 0xff);
+    header[2] = @intCast(payload.len & 0xff);
+    header[3] = typ;
+    header[4] = flags;
+    std.mem.writeInt(u32, header[5..9], @as(u32, stream_id) & 0x7fff_ffff, .big);
+    try stream.writeAll(header[0..]);
+    if (payload.len > 0) try stream.writeAll(payload);
+}
+
+fn h2cUpstreamThreadMain(server: *H2cUpstreamServer) void {
+    while (!server.stop_flag.load(.seq_cst)) {
+        const conn = server.server.accept() catch return;
+        handleH2cUpstreamConnection(server, conn) catch |err| {
+            std.debug.print("h2c upstream handler failed: {}\n", .{err});
+        };
+        conn.stream.close();
+        if (server.stop_flag.load(.seq_cst)) return;
+    }
+}
+
+fn handleH2cUpstreamConnection(server: *H2cUpstreamServer, conn: compat.NetConnection) !void {
+    const allocator = server.allocator;
+    const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    var preface_buf: [24]u8 = undefined;
+    readExactWithPoll(conn.stream, &preface_buf, 5_000) catch return; // wakeListener probe
+    if (!std.mem.eql(u8, &preface_buf, preface)) return;
+
+    try writeH2Frame(conn.stream, 0x4, 0, 0, &.{}); // server SETTINGS
+    // Widen the connection-level window so a multi-megabyte upload is bounded
+    // by the gateway's relay buffer rather than by this fixture's flow control.
+    var inc: [4]u8 = undefined;
+    std.mem.writeInt(u32, &inc, 8 * 1024 * 1024, .big);
+    try writeH2Frame(conn.stream, 0x8, 0, 0, &inc);
+
+    var body: std.array_list.Managed(u8) = std.array_list.Managed(u8).init(allocator);
+    defer body.deinit();
+    var headers_raw: std.array_list.Managed(u8) = std.array_list.Managed(u8).init(allocator);
+    defer headers_raw.deinit();
+    var request_stream_id: u31 = 0;
+
+    while (true) {
+        var frame = readH2Frame(allocator, conn.stream, 5_000) catch return;
+        defer frame.deinit(allocator);
+
+        switch (frame.typ) {
+            0x4 => { // SETTINGS
+                if ((frame.flags & 0x1) == 0) try writeH2Frame(conn.stream, 0x4, 0x1, 0, &.{});
+            },
+            0x6 => { // PING
+                if ((frame.flags & 0x1) == 0) try writeH2Frame(conn.stream, 0x6, 0x1, 0, frame.payload);
+            },
+            0x1 => { // HEADERS
+                request_stream_id = frame.stream_id;
+                var decoded = try hpack.decode(allocator, frame.payload);
+                defer hpack.deinitDecoded(allocator, &decoded);
+                for (decoded.headers) |field| {
+                    try headers_raw.appendSlice(field.name);
+                    try headers_raw.appendSlice(": ");
+                    try headers_raw.appendSlice(field.value);
+                    try headers_raw.append('\n');
+                }
+                if ((frame.flags & 0x1) != 0) break; // END_STREAM: bodiless request
+            },
+            0x0 => { // DATA
+                try body.appendSlice(frame.payload);
+                if (frame.payload.len > 0) {
+                    // Replenish both windows so the upload keeps flowing.
+                    var data_inc: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &data_inc, @intCast(frame.payload.len), .big);
+                    try writeH2Frame(conn.stream, 0x8, 0, 0, &data_inc);
+                    try writeH2Frame(conn.stream, 0x8, 0, frame.stream_id, &data_inc);
+                }
+                if ((frame.flags & 0x1) != 0) break; // END_STREAM
+            },
+            0x7 => return, // GOAWAY
+            else => {},
+        }
+    }
+
+    server.mutex.lock();
+    allocator.free(server.body);
+    server.body = try allocator.dupe(u8, body.items);
+    allocator.free(server.headers_raw);
+    server.headers_raw = try allocator.dupe(u8, headers_raw.items);
+    server.request_count += 1;
+    const response_body = server.response_body;
+    server.mutex.unlock();
+
+    var length_buf: [24]u8 = undefined;
+    const length_value = try std.fmt.bufPrint(&length_buf, "{d}", .{response_body.len});
+    const response_headers = [_]hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-type", .value = "text/plain" },
+        .{ .name = "content-length", .value = length_value },
+    };
+    const block = try hpack.encodeLiteralHeaderBlock(allocator, &response_headers);
+    defer allocator.free(block);
+    try writeH2Frame(conn.stream, 0x1, 0x4, request_stream_id, block); // END_HEADERS
+    try writeH2Frame(conn.stream, 0x0, 0x1, request_stream_id, response_body); // END_STREAM
+}
+
 const FastCgiServer = struct {
     allocator: std.mem.Allocator,
     server: compat.NetServer,
@@ -2633,6 +2850,22 @@ fn wakeUnixListener(path: []const u8) void {
     var stream = compat.connectUnixSocket(path) catch return;
     defer stream.close();
     stream.writeAll("GET /__shutdown__ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n") catch {};
+}
+
+/// Wait until something accepts on `port`, for external origins (an `openssl
+/// s_server` subprocess) that have no readiness handshake of their own.
+fn waitForTcpPort(port: u16, timeout_ms: u64) !void {
+    const deadline = compat.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (compat.milliTimestamp() < deadline) {
+        if (compat.tcpConnectToHost(std.testing.allocator, test_host, port)) |connected| {
+            var stream = connected;
+            stream.close();
+            return;
+        } else |_| {
+            compat.sleepNs(25 * std.time.ns_per_ms);
+        }
+    }
+    return error.OriginNotReady;
 }
 
 fn findFreePort() !u16 {
@@ -12253,6 +12486,95 @@ test "proxy full streaming mode relays a chunked upload without buffering it" {
     try std.testing.expect(std.mem.find(u8, metrics.body, "tardigrade_proxy_streaming_fallback_total{reason=\"missing_content_length\"} 0") != null);
 }
 
+test "proxy full streaming mode relays a chunked upload to an h2c upstream as DATA" {
+    const allocator = std.testing.allocator;
+    const payload_len = 384 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, idx| {
+        byte.* = @intCast('a' + @as(u8, @intCast(idx % 26)));
+    }
+
+    var upstream = try H2cUpstreamServer.start(allocator, "h2c chunked uploaded");
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /upload {{
+        \\    proxy_pass http://{s}:{d}/upload;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "full" },
+            // Prior-knowledge h2c: the upstream is plain HTTP, so this is the
+            // only way to reach relayStreamingUploadToHttp2 without TLS ALPN.
+            .{ .name = "TARDIGRADE_UPSTREAM_PROTOCOL", .value = "h2c" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_MAX_BODY_SIZE", .value = "1048576" },
+        },
+        // Probe a gateway-local path so readiness never reaches the origin and
+        // the request-count assertion below stays exact.
+        .ready_path = "/status/metrics",
+    });
+    defer tardigrade.stop();
+
+    var upload_stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer upload_stream.close();
+    try setStreamTimeouts(&upload_stream, 10_000);
+
+    const head = try std.fmt.allocPrint(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+        .{ test_host, tardigrade.port },
+    );
+    defer allocator.free(head);
+    try upload_stream.writeAll(head);
+
+    var offset: usize = 0;
+    const chunk_len = 16 * 1024;
+    while (offset < payload_len) {
+        const take = @min(chunk_len, payload_len - offset);
+        var size_line_buf: [64]u8 = undefined;
+        const size_line = try std.fmt.bufPrint(&size_line_buf, "{x};tag=stream\r\n", .{take});
+        try upload_stream.writeAll(size_line);
+        try upload_stream.writeAll(payload[offset .. offset + take]);
+        try upload_stream.writeAll("\r\n");
+        offset += take;
+    }
+    try upload_stream.writeAll("0\r\nX-Upload-Checksum: ignored\r\n\r\n");
+
+    var response = try readHttpResponse(allocator, upload_stream);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("h2c chunked uploaded", response.body);
+
+    try std.testing.expectEqual(@as(u32, 1), upstream.requestCount());
+    // HTTP/2 carries no transfer coding, and the gateway must not invent a
+    // Content-Length it cannot know for an unterminated chunked upload.
+    try std.testing.expect(!upstream.capturedHasHeader("content-length"));
+    try std.testing.expect(!upstream.capturedHasHeader("transfer-encoding"));
+    // END_STREAM (not a length) delimited the body, and every decoded byte
+    // arrived exactly once.
+    const captured = try upstream.capturedBody(allocator);
+    defer allocator.free(captured);
+    try std.testing.expectEqual(@as(usize, payload_len), captured.len);
+    try std.testing.expectEqualStrings(payload, captured);
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer metrics.deinit();
+    const streamed = prometheusMetricValue(metrics.body, "tardigrade_proxy_streaming_requests_total") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(streamed >= 1);
+}
+
 test "proxy full streaming mode rejects malformed and oversized chunked uploads" {
     const allocator = std.testing.allocator;
 
@@ -12531,6 +12853,115 @@ test "proxy streaming mode streams over a unix socket upstream" {
     const streamed = prometheusMetricValue(metrics.body, "tardigrade_proxy_streaming_requests_total") orelse return error.InvalidHttpResponse;
     try std.testing.expect(streamed >= 1);
     try std.testing.expect(std.mem.find(u8, metrics.body, "tardigrade_proxy_streaming_fallback_total{reason=\"unsupported_route_type\"} 0") != null);
+}
+
+test "proxy streaming mode streams from an upstream requiring a client certificate" {
+    const allocator = std.testing.allocator;
+    try requireOpenssl(allocator);
+
+    // `openssl s_server -Verify 1` refuses any peer without a certificate
+    // signed by the test CA, so a successful exchange proves the streaming
+    // relay presented the configured upstream client certificate.
+    const server_cert = try applianceFixturePath(allocator, "server.crt");
+    defer allocator.free(server_cert);
+    const server_key = try applianceFixturePath(allocator, "server.key");
+    defer allocator.free(server_key);
+    const ca_cert = try applianceFixturePath(allocator, "ca.crt");
+    defer allocator.free(ca_cert);
+    const client_cert = try applianceFixturePath(allocator, "client.crt");
+    defer allocator.free(client_cert);
+    const client_key = try applianceFixturePath(allocator, "client.key");
+    defer allocator.free(client_key);
+
+    // `-WWW` serves files from its working directory and, since it sends no
+    // Content-Length, close-delimits the body — which also exercises that
+    // framing over mTLS.
+    var origin_dir = try GenericFixtureDir.create(allocator, "mtls-stream-origin");
+    defer origin_dir.deinit();
+    const payload_len = 256 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'm');
+    try origin_dir.writeRel("large.bin", payload);
+
+    const origin_port = try findFreePort();
+    const accept_arg = try std.fmt.allocPrint(allocator, "{d}", .{origin_port});
+    defer allocator.free(accept_arg);
+
+    var argv = [_][]const u8{
+        "openssl", "s_server",
+        "-accept", accept_arg,
+        "-cert",   server_cert,
+        "-key",    server_key,
+        "-CAfile", ca_cert,
+        "-Verify", "1",
+        // The upstream TLS client requires a negotiated protocol, so the origin
+        // has to answer the ALPN offer like any real HTTPS backend.
+        "-alpn",   "http/1.1",
+        "-WWW",    "-quiet",
+    };
+    var origin = try std.process.spawn(compat.io(), .{
+        .argv = &argv,
+        .cwd = .{ .path = origin_dir.dir_abs },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer origin.kill(compat.io());
+    try waitForTcpPort(origin_port, 5_000);
+
+    const upstream_url = try std.fmt.allocPrint(allocator, "https://{s}:{d}", .{ test_host, origin_port });
+    defer allocator.free(upstream_url);
+
+    const config_text =
+        \\location /secure/ {
+        \\    proxy_pass /;
+        \\}
+    ;
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_BASE_URL", .value = upstream_url },
+            // The fixture leaf carries DNS:localhost; hostname verification
+            // matches DNS SANs, so name the origin rather than its IP.
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_SERVER_NAME", .value = "localhost" },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_CLIENT_CERT", .value = client_cert },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_CLIENT_KEY", .value = client_key },
+            .{ .name = "TARDIGRADE_UPSTREAM_TLS_CA_BUNDLE", .value = ca_cert },
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            // Well below the payload: a buffered relay would fail this request
+            // instead of streaming it.
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "32768" },
+        },
+        .ready_path = "/status/metrics",
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequestWithTimeout(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/secure/large.bin",
+        .body = null,
+        .headers = &.{},
+    }, 15_000);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqual(@as(usize, payload_len), response.body.len);
+    try std.testing.expectEqualStrings(payload, response.body);
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer metrics.deinit();
+    const streamed = prometheusMetricValue(metrics.body, "tardigrade_proxy_streaming_requests_total") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(streamed >= 1);
+    // An mTLS upstream is no longer a reason to buffer, so nothing fell back.
+    const buffered = prometheusMetricValue(metrics.body, "tardigrade_proxy_buffered_requests_total") orelse return error.InvalidHttpResponse;
+    try std.testing.expectEqual(@as(u64, 0), buffered);
 }
 
 test "proxy streaming falls back with a retries_configured reason when retries are enabled" {

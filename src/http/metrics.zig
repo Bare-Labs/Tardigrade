@@ -28,6 +28,28 @@ pub const TicketResult = enum { success, rejected, failed };
 pub const TicketKeyReloadOutcome = enum { initial_load_success, initial_load_failure, reload_accepted, reload_rejected };
 
 pub const HttpProtocol = enum { h1, h2, h3 };
+
+/// Why a reverse-proxy request took the bounded buffered path instead of
+/// streaming (#139). This lives here, next to the counters, so it is the single
+/// source of truth: `recordProxyStreamingFallback` switches over it
+/// exhaustively, and adding a case is a compile error until that case has a
+/// counter and a Prometheus series. `gateway_proxy_runtime` re-exports it as
+/// `StreamingFallbackReason` for the eligibility checks that produce it.
+pub const ProxyStreamingFallbackReason = enum {
+    policy_disabled,
+    retries_configured,
+    missing_content_length,
+    body_too_large,
+    body_dependent_middleware,
+    unsupported_route_type,
+    early_data_retry_semantics,
+
+    /// The `reason=` label value; identical to the tag name by construction, so
+    /// a label can never drift from its enum case.
+    pub fn label(self: ProxyStreamingFallbackReason) []const u8 {
+        return @tagName(self);
+    }
+};
 pub const EarlyDataSource = enum { transport, header, both };
 pub const EarlyDataDecision = enum { accepted, too_early, deferred, forwarded };
 pub const EarlyDataUpstream425Action = enum { forwarded, retried };
@@ -702,21 +724,18 @@ pub const Metrics = struct {
         self.proxy_upstream_aborts += 1;
     }
 
-    pub fn recordProxyStreamingFallback(self: *Metrics, reason: []const u8) void {
-        if (std.mem.eql(u8, reason, "policy_disabled")) {
-            self.proxy_streaming_fallback_policy_disabled += 1;
-        } else if (std.mem.eql(u8, reason, "retries_configured")) {
-            self.proxy_streaming_fallback_retries_configured += 1;
-        } else if (std.mem.eql(u8, reason, "missing_content_length")) {
-            self.proxy_streaming_fallback_missing_content_length += 1;
-        } else if (std.mem.eql(u8, reason, "body_too_large")) {
-            self.proxy_streaming_fallback_body_too_large += 1;
-        } else if (std.mem.eql(u8, reason, "body_dependent_middleware")) {
-            self.proxy_streaming_fallback_body_dependent_middleware += 1;
-        } else if (std.mem.eql(u8, reason, "unsupported_route_type")) {
-            self.proxy_streaming_fallback_unsupported_route_type += 1;
-        } else if (std.mem.eql(u8, reason, "early_data_retry_semantics")) {
-            self.proxy_streaming_fallback_early_data_retry_semantics += 1;
+    /// Exhaustive by construction: a new `ProxyStreamingFallbackReason` case
+    /// fails to compile here until it is given a counter, which is what keeps a
+    /// reason from being emitted into a metric that silently drops it.
+    pub fn recordProxyStreamingFallback(self: *Metrics, reason: ProxyStreamingFallbackReason) void {
+        switch (reason) {
+            .policy_disabled => self.proxy_streaming_fallback_policy_disabled += 1,
+            .retries_configured => self.proxy_streaming_fallback_retries_configured += 1,
+            .missing_content_length => self.proxy_streaming_fallback_missing_content_length += 1,
+            .body_too_large => self.proxy_streaming_fallback_body_too_large += 1,
+            .body_dependent_middleware => self.proxy_streaming_fallback_body_dependent_middleware += 1,
+            .unsupported_route_type => self.proxy_streaming_fallback_unsupported_route_type += 1,
+            .early_data_retry_semantics => self.proxy_streaming_fallback_early_data_retry_semantics += 1,
         }
     }
 
@@ -2254,29 +2273,23 @@ test "#368 Slice 3: early-data replay counters appear in Prometheus output with 
 
 test "Metrics records proxy streaming fallback reasons" {
     const allocator = std.testing.allocator;
-    // Must stay in sync with gateway_proxy_runtime.StreamingFallbackReason: a
-    // reason with no counter here is emitted but silently unobservable.
-    const reasons = [_][]const u8{
-        "policy_disabled",
-        "retries_configured",
-        "missing_content_length",
-        "body_too_large",
-        "body_dependent_middleware",
-        "unsupported_route_type",
-        "early_data_retry_semantics",
-    };
-
+    // Driven by the enum itself, so a new reason is covered here the moment it
+    // exists. The recorder's exhaustive switch is what makes that safe: a case
+    // without a counter does not compile, and this asserts the counter also
+    // reaches the Prometheus surface rather than incrementing into the void.
     var m = Metrics.init();
-    for (reasons) |reason| m.recordProxyStreamingFallback(reason);
+    for (std.enums.values(ProxyStreamingFallbackReason)) |reason| {
+        m.recordProxyStreamingFallback(reason);
+    }
 
     const prom = try m.toPrometheus(allocator);
     defer allocator.free(prom);
-    for (reasons) |reason| {
+    for (std.enums.values(ProxyStreamingFallbackReason)) |reason| {
         var expected_buf: [128]u8 = undefined;
         const expected = try std.fmt.bufPrint(
             &expected_buf,
             "tardigrade_proxy_streaming_fallback_total{{reason=\"{s}\"}} 1",
-            .{reason},
+            .{reason.label()},
         );
         try std.testing.expect(std.mem.find(u8, prom, expected) != null);
     }

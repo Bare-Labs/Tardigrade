@@ -54,6 +54,14 @@ All notable user-facing changes to Tardigrade are documented here.
   the shared interop matrix.
 
 ### Fixed
+- **Streaming mode could never negotiate HTTP/2 to a TLS upstream (#139)** —
+  the streaming relay built its `UpstreamTlsOptions` without an `alpn_policy`,
+  so it silently fell back to the `require_http1` default and offered an HTTPS
+  origin only `http/1.1`. `TARDIGRADE_UPSTREAM_PROTOCOL=h2` (or `auto`)
+  therefore had no effect once `proxy_streaming_mode` was on: every TLS
+  exchange took the HTTP/1.1 relay on a fresh, unpooled connection. It now
+  derives the policy from the configured protocol exactly as the buffered path
+  does. Cleartext prior-knowledge `h2c` was unaffected.
 - **A peer's `KeyUpdate` failed any connection that had not opted into session
   tickets (#357)** — post-handshake message reassembly always allocated, and
   the allocator is only installed by a client that configured a session-ticket

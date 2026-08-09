@@ -78,9 +78,14 @@ extensions and trailers sent by the client are consumed and dropped, not passed
 to the origin. The decoded payload is counted against the configured
 request-body maximum while it is relayed: an upload that outgrows the maximum is
 rejected with `413` mid-relay, and malformed chunk framing is rejected with
-`400`. Neither is attributed to the origin's health. Because the failure is only
-detectable once the offending bytes arrive, the origin has by then received a
-partial request; that upstream connection is torn down rather than pooled.
+`400`. Neither is attributed to the origin's health.
+
+Because either failure is only detectable once the offending bytes arrive, the
+origin has by then received a partial request. How that is cleaned up depends on
+the upstream protocol: an HTTP/1.1 connection carries only this request, so it is
+closed rather than returned to the pool; an HTTP/2 connection is shared, so only
+the affected stream is reset with `CANCEL` and the connection stays reusable for
+unrelated multiplexed requests unless it is independently unhealthy.
 
 A streamed upload disables downstream keep-alive for that connection.
 

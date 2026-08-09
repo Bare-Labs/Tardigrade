@@ -39,27 +39,10 @@ pub const StreamingRequestBody = gp.StreamingRequestBody;
 /// Why a request took the bounded buffered path instead of streaming (#139).
 /// Every reason is recorded as a metric label and a debug log line so operators
 /// can tell whether a given large transfer actually streamed.
-pub const StreamingFallbackReason = enum {
-    policy_disabled,
-    retries_configured,
-    missing_content_length,
-    body_too_large,
-    body_dependent_middleware,
-    unsupported_route_type,
-    early_data_retry_semantics,
-
-    pub fn metricLabel(self: StreamingFallbackReason) []const u8 {
-        return switch (self) {
-            .policy_disabled => "policy_disabled",
-            .retries_configured => "retries_configured",
-            .missing_content_length => "missing_content_length",
-            .body_too_large => "body_too_large",
-            .body_dependent_middleware => "body_dependent_middleware",
-            .unsupported_route_type => "unsupported_route_type",
-            .early_data_retry_semantics => "early_data_retry_semantics",
-        };
-    }
-};
+///
+/// The enum is owned by `http.metrics` so the counter mapping can switch over
+/// it exhaustively; a reason cannot exist here without an observable counter.
+pub const StreamingFallbackReason = http.metrics.ProxyStreamingFallbackReason;
 
 const StreamingEligibility = union(enum) {
     stream,
@@ -642,11 +625,11 @@ pub fn handleLocationProxyPass(
         },
         .fallback => |reason| reason,
     };
-    state.metricsRecordProxyStreamingFallback(fallback_reason.metricLabel());
-    state.logger.debug(correlation_id, "proxy streaming fallback: {s}", .{fallback_reason.metricLabel()});
+    state.metricsRecordProxyStreamingFallback(fallback_reason);
+    state.logger.debug(correlation_id, "proxy streaming fallback: {s}", .{fallback_reason.label()});
 
     if (streaming_request_body != null) {
-        state.logger.warn(correlation_id, "streaming upload could not use streaming proxy path after routing: {s}", .{fallback_reason.metricLabel()});
+        state.logger.warn(correlation_id, "streaming upload could not use streaming proxy path after routing: {s}", .{fallback_reason.label()});
         try sendApiError(allocator, writer, .bad_gateway, "upstream_error", "Streaming upload could not be proxied", correlation_id, false, state);
         ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.bad_gateway), 0);
         return @intFromEnum(http.Status.bad_gateway);
@@ -2176,7 +2159,7 @@ test "streaming eligibility returns typed fallback reasons" {
         .proxy_streaming_policy = .inherit,
     };
     try std.testing.expectEqual(StreamingEligibility.stream, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, 1));
-    try std.testing.expectEqualStrings("early_data_retry_semantics", StreamingFallbackReason.early_data_retry_semantics.metricLabel());
+    try std.testing.expectEqualStrings("early_data_retry_semantics", StreamingFallbackReason.early_data_retry_semantics.label());
 
     var off_block = block;
     off_block.proxy_streaming_policy = .off;

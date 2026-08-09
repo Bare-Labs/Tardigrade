@@ -1490,7 +1490,7 @@ pub const GatewayState = struct {
         self.metrics.recordProxyUpstreamAbort();
     }
 
-    pub fn metricsRecordProxyStreamingFallback(self: *GatewayState, reason: []const u8) void {
+    pub fn metricsRecordProxyStreamingFallback(self: *GatewayState, reason: http.metrics.ProxyStreamingFallbackReason) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
         self.metrics.recordProxyStreamingFallback(reason);

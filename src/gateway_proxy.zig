@@ -1994,6 +1994,11 @@ pub fn executeStreamingHttpProxyRequest(
         .sni_override = cfg.upstream_tls_server_name,
         .client_cert_path = cfg.upstream_tls_client_cert,
         .client_key_path = cfg.upstream_tls_client_key,
+        // Must match the buffered path: without this the policy defaults to
+        // `require_http1`, so a TLS origin is only ever offered `http/1.1` and
+        // `streamViaH2Pool` can never negotiate h2 no matter how
+        // `TARDIGRADE_UPSTREAM_PROTOCOL` is set.
+        .alpn_policy = upstreamAlpnPolicy(cfg.upstream_protocol),
     } else null;
 
     // Per-phase deadlines (closes the #196 streaming gap): bound the connect/
@@ -2083,7 +2088,7 @@ pub fn executeStreamingHttpProxyRequest(
         if (!reused) {
             const connect_start = http.event_loop.monotonicMs();
             const new_fd = (if (unix_socket_path) |socket_path|
-                compat.connectBlockingUnix(socket_path)
+                compat.connectBoundedUnix(socket_path, connect_timeout_ms)
             else
                 compat.connectBoundedTcp(host, port, connect_timeout_ms)) catch |err| {
                 if (active_pool) |p| p.releaseSlot(key);
