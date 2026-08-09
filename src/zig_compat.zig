@@ -475,6 +475,10 @@ pub fn nanoTimestamp() i128 {
     return @intCast(std.Io.Clock.real.now(io()).toNanoseconds());
 }
 
+pub fn monotonicNanoTimestamp() i128 {
+    return @intCast(std.Io.Clock.awake.now(io()).toNanoseconds());
+}
+
 pub fn sleepNs(ns: u64) void {
     std.Io.sleep(io(), .fromNanoseconds(ns), .awake) catch {}; // interrupt wakes are fine; caller requested a sleep, not a guarantee
 }

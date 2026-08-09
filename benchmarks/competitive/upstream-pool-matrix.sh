@@ -21,6 +21,7 @@ TMP_DIR=""
 TARDIGRADE_PID=""
 TLS_ORIGIN_PID=""
 ORIGIN_PIDS=()
+LOCK_METRICS=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -288,9 +289,9 @@ scenario_json() {
             local_reuse: $local_reuse,
             cross_worker_reuse: $cross_worker_reuse,
             stale_retries: $stale_retries,
-            pool_lock_wait_ns_total: $lock_wait_ns,
-            pool_lock_acquires_total: $lock_acquires,
-            pool_lock_wait_ns_per_request: (if $request_count > 0 then ($lock_wait_ns / $request_count) else null end),
+            pool_lock_wait_ns_total: (if $lock_acquires > 0 then $lock_wait_ns else null end),
+            pool_lock_acquires_total: (if $lock_acquires > 0 then $lock_acquires else null end),
+            pool_lock_wait_ns_per_request: (if $lock_acquires > 0 and $request_count > 0 then ($lock_wait_ns / $request_count) else null end),
             pool_lock_wait_ns_per_acquire: (if $lock_acquires > 0 then ($lock_wait_ns / $lock_acquires) else null end),
             new_connections_per_sec: (if $elapsed > 0 then ($new_connections / $elapsed) else null end),
             reuse_ratio: (if ($new_connections + $reused_connections) > 0 then ($reused_connections / ($new_connections + $reused_connections)) else null end),
@@ -338,6 +339,7 @@ start_gateway() {
     TARDIGRADE_RATE_LIMIT_RPS=0 \
     TARDIGRADE_WORKER_THREADS="$workers" \
     TARDIGRADE_MAX_REQUESTS_PER_CONNECTION=1000000 \
+    TARDIGRADE_UPSTREAM_POOL_LOCK_METRICS="$LOCK_METRICS" \
     TARDIGRADE_UPSTREAM_PROTOCOL=http1 \
     TARDIGRADE_UPSTREAM_TLS_VERIFY=false \
         "$BINARY" run -c "$CONFIG_FILE" >"${TMP_DIR}/tardigrade.log" 2>&1 &
@@ -351,6 +353,7 @@ worker_sweep_json() {
     max="$cpus"
     result='[]'
     workers=1
+    LOCK_METRICS=true
     while [[ "$workers" -le "$max" ]]; do
         start_gateway "$workers"
         sweep_connections="$CONNECTIONS"
@@ -359,12 +362,33 @@ worker_sweep_json() {
         result="$(jq --argjson row "$row" --argjson workers "$workers" '. + [($row + {worker_threads: $workers})]' <<<"$result")"
         workers=$((workers * 2))
     done
-    jq -n --argjson rows "$result" '{
+    LOCK_METRICS=false
+    jq -n --argjson rows "$result" '
+    ($rows[0] // {}) as $base |
+    ($rows | map(. + {
+        pool_lock_wait_fraction_of_p99: (
+            if (.p99_ms // 0) > 0 and (.pool_lock_wait_ns_per_request // null) != null
+            then (.pool_lock_wait_ns_per_request / (.p99_ms * 1000000.0))
+            else null
+            end
+        ),
+        throughput_drop_from_1w: (
+            if ($base.rps // 0) > 0 and (.worker_threads // 1) > ($base.worker_threads // 1)
+            then (($base.rps - (.rps // 0)) / $base.rps)
+            else 0
+            end
+        )
+    })) as $annotated |
+    ($annotated | map(.pool_lock_wait_fraction_of_p99 // 0) | max) as $max_lock_fraction |
+    ($annotated | map(.throughput_drop_from_1w // 0) | max) as $max_throughput_drop |
+    {
         covered: true,
-        sharding_justified: (($rows | map(.pool_lock_wait_ns_per_request // 0) | max) > 50000),
-        sharding_threshold_wait_ns_per_request: 50000,
-        reason: "Derived from measured shared upstream-pool mutex wait nanoseconds per request across the worker sweep; sharding is justified when the worst row exceeds the threshold.",
-        measurements: $rows
+        sharding_justified: ($max_lock_fraction >= 0.05 and $max_throughput_drop >= 0.10),
+        sharding_decision_rule: "Shard only when measured pool-lock wait reaches at least 5% of p99 latency and higher-worker rows show at least 10% throughput regression from the 1-worker baseline.",
+        max_pool_lock_wait_fraction_of_p99: $max_lock_fraction,
+        max_throughput_drop_from_1w: $max_throughput_drop,
+        reason: "Derived from opt-in shared upstream-pool mutex wait counters correlated with throughput and p99 movement across the worker sweep.",
+        measurements: $annotated
     }'
 }
 
@@ -458,13 +482,19 @@ origins_elapsed="$(awk -v s="$origins_start_ns" -v e="$origins_end_ns" 'BEGIN { 
 origins_successes="$(jq '[.[].successes] | add' <<<"$origin_counts")"
 origins_failures="$(jq '[.[].failures] | add' <<<"$origin_counts")"
 origins_rps="$(awk -v successes="$origins_successes" -v elapsed="$origins_elapsed" 'BEGIN { if (elapsed > 0) printf "%.3f", successes / elapsed; else print 0 }')"
-origins_ttfb="$(run_k6_ttfb many-origins-ttfb origin-0 1 1)"
-origins_aggregate="$(scenario_json "$origins_rps" null "$origins_ttfb" "$origins_failures" "$origins_cpu_pct" "$origins_rss_mb" "$origins_open_fds" "$origins_before" "$origins_after" "$origins_elapsed")"
-origins_json="$(jq --argjson aggregate "$origins_aggregate" --argjson elapsed "$origins_elapsed" '
-    map(. + $aggregate + {
+origins_aggregate="$(scenario_json "$origins_rps" null null "$origins_failures" "$origins_cpu_pct" "$origins_rss_mb" "$origins_open_fds" "$origins_before" "$origins_after" "$origins_elapsed")"
+origins_json="$(jq --argjson elapsed "$origins_elapsed" '
+    map({
+        origin: .origin,
+        requested: .requested,
+        successes: .successes,
+        failures: .failures,
+        covered: (.failures == 0),
         rps: (if $elapsed > 0 then (.successes / $elapsed) else 0 end),
         elapsed_s: $elapsed,
-        errors: .failures
+        errors: .failures,
+        p99_ms: null,
+        p99_ttfb_ms: null
     })
 ' <<<"$origin_counts")"
 
@@ -501,7 +531,7 @@ jq -n \
                 errors: (($route_a.errors // 0) + ($route_b.errors // 0) + ($route_c.errors // 0))
             },
             "many-origins-low-volume": ($origins_aggregate + {
-                covered: true,
+                covered: (($origins | map(.errors // 0) | add) == 0),
                 origins: ($origins | length),
                 requests_per_origin: 5,
                 measurements: $origins,
