@@ -344,9 +344,27 @@ cpu_time_to_seconds() {
 }
 
 process_tree_cpu_seconds() {
-    local pid="$1" pids
+    local pid="$1" pids clk total_ticks child
     pids="$(process_tree_pids "$pid" | paste -sd, -)"
     [[ -n "$pids" ]] || pids="$pid"
+    if [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
+        clk="$(getconf CLK_TCK 2>/dev/null || true)"
+        if [[ "$clk" =~ ^[0-9]+$ && "$clk" -gt 0 ]]; then
+            total_ticks=0
+            IFS=, read -ra _cpu_pids <<< "$pids"
+            for child in "${_cpu_pids[@]}"; do
+                [[ -r "/proc/${child}/stat" ]] || continue
+                total_ticks=$((total_ticks + $(awk '{
+                    close = match($0, /\) /)
+                    rest = substr($0, close + 2)
+                    split(rest, f, " ")
+                    print (f[12] + f[13])
+                }' "/proc/${child}/stat")))
+            done
+            awk -v ticks="$total_ticks" -v clk="$clk" 'BEGIN { printf "%.6f", ticks / clk }'
+            return
+        fi
+    fi
     ps -p "$pids" -o time= 2>/dev/null | cpu_time_to_seconds
 }
 
@@ -734,30 +752,34 @@ write_combined_outputs() {
         "${server_files[@]}" > "$combined_json"
 
     jq -r '
-        ["server","scenario","supported","reason","rps","p50_ms","p95_ms","p99_ms","p999_ms","p99_ttfb_ms","throughput_mbps","cpu_pct_avg","cpu_ms_per_request","rss_mb_peak","open_fds_peak","errors"],
+        ["server","scenario","supported","reason","rps","p50_ms","p95_ms","p99_ms","p999_ms","p99_ttfb_ms","throughput_mbps","cpu_pct_avg","cpu_ms_per_request","rss_mb_peak","open_fds_peak","errors","pool_lock_wait_ns_per_request","pool_lock_wait_ns_per_acquire"],
         (.servers | to_entries[] as $server |
             $server.value | to_entries[] |
             select(.key != "_meta") |
             [$server.key, .key, (.value.supported // true), (.value.reason // null), (.value.rps // null), (.value.p50_ms // null), (.value.p95_ms // null),
              (.value.p99_ms // null), (.value.p999_ms // null), (.value.p99_ttfb_ms // null), (.value.throughput_mbps // null),
-             (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null)]),
+             (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null), null, null]),
         (if .upstream_pool_matrix != null then
             (.upstream_pool_matrix.scenarios | to_entries[] |
                 ["tardigrade", ("upstream-pool/" + .key), (.value.covered // .value.supported // true), (.value.reason // .value.sharding_note // null),
                  (.value.rps // null), null, null, (.value.p99_ms // null), null, (.value.p99_ttfb_ms // null), null,
-                 (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null)]),
+                 (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null),
+                 (.value.pool_lock_wait_ns_per_request // null), (.value.pool_lock_wait_ns_per_acquire // null)]),
             (.upstream_pool_matrix.scenarios["uneven-route-distribution"].routes // {} | to_entries[] |
                 ["tardigrade", ("upstream-pool/uneven/" + .key), (.value.covered // true), (.value.reason // null),
                  (.value.rps // null), null, null, (.value.p99_ms // null), null, (.value.p99_ttfb_ms // null), null,
-                 (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null)]),
+                 (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null),
+                 (.value.pool_lock_wait_ns_per_request // null), (.value.pool_lock_wait_ns_per_acquire // null)]),
             (.upstream_pool_matrix.scenarios["many-origins-low-volume"].measurements // [] | .[] |
                 ["tardigrade", ("upstream-pool/origin/" + (.origin // "unknown")), (.covered // true), (.reason // null),
                  (.rps // null), null, null, (.p99_ms // null), null, (.p99_ttfb_ms // null), null,
-                 (.cpu_pct_avg // null), (.cpu_ms_per_request // null), (.rss_mb_peak // null), (.open_fds_peak // null), (.errors // null)]),
+                 (.cpu_pct_avg // null), (.cpu_ms_per_request // null), (.rss_mb_peak // null), (.open_fds_peak // null), (.errors // null),
+                 (.pool_lock_wait_ns_per_request // null), (.pool_lock_wait_ns_per_acquire // null)]),
             (.upstream_pool_matrix.scenarios["pool-contention"].measurements // [] | .[] |
                 ["tardigrade", ("upstream-pool/contention/" + ((.worker_threads // 0) | tostring) + "w"), (.covered // true), (.reason // null),
                  (.rps // null), null, null, (.p99_ms // null), null, (.p99_ttfb_ms // null), null,
-                 (.cpu_pct_avg // null), (.cpu_ms_per_request // null), (.rss_mb_peak // null), (.open_fds_peak // null), (.errors // null)])
+                 (.cpu_pct_avg // null), (.cpu_ms_per_request // null), (.rss_mb_peak // null), (.open_fds_peak // null), (.errors // null),
+                 (.pool_lock_wait_ns_per_request // null), (.pool_lock_wait_ns_per_acquire // null)])
          else empty end)
         | @csv
     ' "$combined_json" > "$csv"
@@ -783,17 +805,17 @@ write_combined_outputs() {
             echo ""
             echo "## Upstream Pool Matrix"
             echo ""
-            echo "| Scenario | Covered | req/s | p99 ms | p99 TTFB ms | CPU % | CPU ms/req | RSS MiB | New conn/s | Reuse ratio | Sharding | Errors |"
-            echo "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |"
+            echo "| Scenario | Covered | req/s | p99 ms | p99 TTFB ms | CPU % | CPU ms/req | RSS MiB | New conn/s | Reuse ratio | Lock wait ns/req | Sharding | Errors |"
+            echo "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |"
             jq -r '
                 .upstream_pool_matrix.scenarios | to_entries[] |
-                "| `\(.key)` | \((.value.covered // .value.supported // true)) | \(.value.rps // "-") | \(.value.p99_ms // "-") | \(.value.p99_ttfb_ms // "-") | \(.value.cpu_pct_avg // "-") | \(.value.cpu_ms_per_request // "-") | \(.value.rss_mb_peak // "-") | \(.value.new_connections_per_sec // "-") | \(.value.reuse_ratio // "-") | \(.value.sharding_justified // "-") | \(.value.errors // "-") |"
+                "| `\(.key)` | \((.value.covered // .value.supported // true)) | \(.value.rps // "-") | \(.value.p99_ms // "-") | \(.value.p99_ttfb_ms // "-") | \(.value.cpu_pct_avg // "-") | \(.value.cpu_ms_per_request // "-") | \(.value.rss_mb_peak // "-") | \(.value.new_connections_per_sec // "-") | \(.value.reuse_ratio // "-") | \(.value.pool_lock_wait_ns_per_request // "-") | \(.value.sharding_justified // "-") | \(.value.errors // "-") |"
             ' "$combined_json"
             echo ""
             echo "### Upstream Pool Detail Rows"
             echo ""
-            echo "| Detail | req/s | p99 ms | p99 TTFB ms | CPU % | CPU ms/req | RSS MiB | Open FDs | New conn/s | Reuse ratio | Errors |"
-            echo "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+            echo "| Detail | req/s | p99 ms | p99 TTFB ms | CPU % | CPU ms/req | RSS MiB | Open FDs | New conn/s | Reuse ratio | Lock wait ns/req | Lock wait ns/acq | Errors |"
+            echo "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
             jq -r '
                 def row($name; $v):
                     "| `" + $name + "` | " +
@@ -806,6 +828,8 @@ write_combined_outputs() {
                     (($v.open_fds_peak // "-") | tostring) + " | " +
                     (($v.new_connections_per_sec // "-") | tostring) + " | " +
                     (($v.reuse_ratio // "-") | tostring) + " | " +
+                    (($v.pool_lock_wait_ns_per_request // "-") | tostring) + " | " +
+                    (($v.pool_lock_wait_ns_per_acquire // "-") | tostring) + " | " +
                     (($v.errors // "-") | tostring) + " |";
                 (.upstream_pool_matrix.scenarios["uneven-route-distribution"].routes // {} | to_entries[] | row("uneven/" + .key; .value)),
                 (.upstream_pool_matrix.scenarios["many-origins-low-volume"].measurements // [] | .[] | row("origin/" + (.origin // "unknown"); .)),
@@ -838,7 +862,6 @@ if ! $SMOKE; then
     require_tool k6
     if [[ ",$SERVERS," == *",tardigrade,"* ]]; then
         require_tool openssl
-        require_tool nghttpd
     fi
 fi
 

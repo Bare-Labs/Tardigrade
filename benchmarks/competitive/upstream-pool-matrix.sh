@@ -113,9 +113,27 @@ cpu_time_to_seconds() {
 }
 
 process_tree_cpu_seconds() {
-    local pids
+    local pids clk total_ticks pid
     pids="$(process_tree_pids "$TARDIGRADE_PID" | paste -sd, -)"
     [[ -n "$pids" ]] || pids="$TARDIGRADE_PID"
+    if [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
+        clk="$(getconf CLK_TCK 2>/dev/null || true)"
+        if [[ "$clk" =~ ^[0-9]+$ && "$clk" -gt 0 ]]; then
+            total_ticks=0
+            IFS=, read -ra _cpu_pids <<< "$pids"
+            for pid in "${_cpu_pids[@]}"; do
+                [[ -r "/proc/${pid}/stat" ]] || continue
+                total_ticks=$((total_ticks + $(awk '{
+                    close = match($0, /\) /)
+                    rest = substr($0, close + 2)
+                    split(rest, f, " ")
+                    print (f[12] + f[13])
+                }' "/proc/${pid}/stat")))
+            done
+            awk -v ticks="$total_ticks" -v clk="$clk" 'BEGIN { printf "%.6f", ticks / clk }'
+            return
+        fi
+    fi
     ps -p "$pids" -o time= 2>/dev/null | cpu_time_to_seconds
 }
 
@@ -229,22 +247,31 @@ export const options = { vus: ${vus}, duration: '${duration}s', summaryTrendStat
 export default function () { http.get('http://127.0.0.1:${LISTEN_PORT}/${path}'); }
 EOF
     k6 run --quiet --summary-export "$summary" "$script" >/dev/null
-    jq -r '.metrics.http_req_waiting.values["p(99)"] // .metrics.http_req_waiting["p(99)"] // .metrics.http_req_waiting["p(95)"] // null' "$summary"
+    jq -e -r '
+        (.metrics.http_req_failed.values.rate // .metrics.http_req_failed.rate // .metrics.http_req_failed.value // 0) as $failed
+        | if $failed != 0 then error("k6 http_req_failed was non-zero: \($failed)") else
+            (.metrics.http_req_waiting.values["p(99)"] // .metrics.http_req_waiting["p(99)"] // error("k6 summary is missing http_req_waiting p(99)"))
+          end
+    ' "$summary"
 }
 
 scenario_json() {
     local rps="$1" p99="$2" p99_ttfb="$3" errors="$4" cpu_pct="$5" rss_mb="$6" open_fds="$7" before="$8" after="$9" elapsed="${10}"
-    local new_c reused local_r cross_r stale
+    local new_c reused local_r cross_r stale lock_wait_ns lock_acquires request_count
     new_c="$(metric_delta "$before" "$after" tardigrade_upstream_connections_new_total)"
     reused="$(metric_delta "$before" "$after" tardigrade_upstream_connections_reused_total)"
     local_r="$(metric_delta "$before" "$after" tardigrade_upstream_connections_reused_local_total)"
     cross_r="$(metric_delta "$before" "$after" tardigrade_upstream_connections_reused_cross_worker_total)"
     stale="$(metric_delta "$before" "$after" tardigrade_upstream_stale_retries_total)"
+    lock_wait_ns="$(metric_delta "$before" "$after" tardigrade_upstream_pool_lock_wait_ns_total)"
+    lock_acquires="$(metric_delta "$before" "$after" tardigrade_upstream_pool_lock_acquires_total)"
+    request_count="$(awk -v rps="$rps" -v elapsed="$elapsed" 'BEGIN { if (rps > 0 && elapsed > 0) printf "%.0f", rps * elapsed; else print 0 }')"
     jq -n \
         --argjson rps "$rps" --argjson p99 "$p99" --argjson p99_ttfb "$p99_ttfb" --argjson errors "$errors" \
         --argjson cpu "$cpu_pct" --argjson rss "$rss_mb" --argjson fds "$open_fds" --argjson elapsed "$elapsed" \
         --argjson new_connections "$new_c" --argjson reused_connections "$reused" \
         --argjson local_reuse "$local_r" --argjson cross_worker_reuse "$cross_r" --argjson stale_retries "$stale" \
+        --argjson lock_wait_ns "$lock_wait_ns" --argjson lock_acquires "$lock_acquires" --argjson request_count "$request_count" \
         '{
             covered: true,
             rps: $rps,
@@ -261,6 +288,10 @@ scenario_json() {
             local_reuse: $local_reuse,
             cross_worker_reuse: $cross_worker_reuse,
             stale_retries: $stale_retries,
+            pool_lock_wait_ns_total: $lock_wait_ns,
+            pool_lock_acquires_total: $lock_acquires,
+            pool_lock_wait_ns_per_request: (if $request_count > 0 then ($lock_wait_ns / $request_count) else null end),
+            pool_lock_wait_ns_per_acquire: (if $lock_acquires > 0 then ($lock_wait_ns / $lock_acquires) else null end),
             new_connections_per_sec: (if $elapsed > 0 then ($new_connections / $elapsed) else null end),
             reuse_ratio: (if ($new_connections + $reused_connections) > 0 then ($reused_connections / ($new_connections + $reused_connections)) else null end),
             cross_worker_reuse_ratio: (if $reused_connections > 0 then ($cross_worker_reuse / $reused_connections) else null end)
@@ -306,12 +337,12 @@ start_gateway() {
     [[ -n "$TARDIGRADE_PID" ]] && { kill "$TARDIGRADE_PID" 2>/dev/null || true; wait "$TARDIGRADE_PID" 2>/dev/null || true; }
     TARDIGRADE_RATE_LIMIT_RPS=0 \
     TARDIGRADE_WORKER_THREADS="$workers" \
-    TARDIGRADE_MAX_REQUESTS_PER_CONNECTION=0 \
+    TARDIGRADE_MAX_REQUESTS_PER_CONNECTION=1000000 \
     TARDIGRADE_UPSTREAM_PROTOCOL=http1 \
     TARDIGRADE_UPSTREAM_TLS_VERIFY=false \
         "$BINARY" run -c "$CONFIG_FILE" >"${TMP_DIR}/tardigrade.log" 2>&1 &
     TARDIGRADE_PID="$!"
-    sleep 1
+    wait_for_http "http://127.0.0.1:${LISTEN_PORT}/status/metrics" 150
 }
 
 worker_sweep_json() {
@@ -329,9 +360,10 @@ worker_sweep_json() {
         workers=$((workers * 2))
     done
     jq -n --argjson rows "$result" '{
-        covered: false,
-        sharding_justified: "undetermined",
-        reason: "Gateway exports no direct pool-lock wait/contention counter yet; this sweep records worker-count throughput, p99, TTFB, CPU/request, reuse, and FD evidence without claiming contention closure.",
+        covered: true,
+        sharding_justified: (($rows | map(.pool_lock_wait_ns_per_request // 0) | max) > 50000),
+        sharding_threshold_wait_ns_per_request: 50000,
+        reason: "Derived from measured shared upstream-pool mutex wait nanoseconds per request across the worker sweep; sharding is justified when the worst row exceeds the threshold.",
         measurements: $rows
     }'
 }
@@ -389,7 +421,7 @@ wait_for_http "https://127.0.0.1:${TLS_ORIGIN_PORT}/health"
 } > "$CONFIG_FILE"
 
 start_gateway "$THREADS"
-for path in hot route-a route-b route-c tls-origin; do
+for path in hot route-a route-b route-c; do
     preflight_path "$path" || { echo "preflight failed for /${path}" >&2; exit 1; }
 done
 for ((i = 0; i < ORIGIN_COUNT; i += 1)); do
@@ -401,22 +433,42 @@ route_a_json="$hot_json"
 route_b_json="$(run_measured_wrk route-b route-b 2 4 1 false)"
 route_c_json="$(run_measured_wrk route-c route-c 1 2 1 false)"
 
-origins_json='[]'
+origins_before="${TMP_DIR}/origins-before.metrics"
+origins_after="${TMP_DIR}/origins-after.metrics"
+current_metrics > "$origins_before"
+read -r origins_mon_pid origins_mon_file origins_cpu_before origins_start_ns < <(start_monitor)
+origin_counts='[]'
 for ((i = 0; i < ORIGIN_COUNT; i += 1)); do
-    before="${TMP_DIR}/origin-${i}-before.metrics"
-    after="${TMP_DIR}/origin-${i}-after.metrics"
-    current_metrics > "$before"
     success=0
+    failures=0
     for _ in 1 2 3 4 5; do
         if curl --max-time 2 -fsS "http://127.0.0.1:${LISTEN_PORT}/origin-${i}" >/dev/null; then
             success=$((success + 1))
+        else
+            failures=$((failures + 1))
         fi
     done
-    current_metrics > "$after"
-    row="$(scenario_json "$success" null null 0 null null null "$before" "$after" 1)"
-    origins_json="$(jq --arg origin "origin-${i}" --argjson requested 5 --argjson successes "$success" --argjson row "$row" '. + [($row + {origin: $origin, requested: $requested, successes: $successes})]' <<<"$origins_json")"
+    origin_counts="$(jq --arg origin "origin-${i}" --argjson requested 5 --argjson successes "$success" --argjson failures "$failures" \
+        '. + [{origin: $origin, requested: $requested, successes: $successes, failures: $failures}]' <<<"$origin_counts")"
 done
+origins_end_ns="$(monotonic_ns)"
+read -r origins_cpu_pct origins_rss_mb origins_open_fds < <(stop_monitor "$origins_mon_pid" "$origins_mon_file" "$origins_cpu_before" "$origins_start_ns")
+current_metrics > "$origins_after"
+origins_elapsed="$(awk -v s="$origins_start_ns" -v e="$origins_end_ns" 'BEGIN { printf "%.3f", (e - s) / 1000000000 }')"
+origins_successes="$(jq '[.[].successes] | add' <<<"$origin_counts")"
+origins_failures="$(jq '[.[].failures] | add' <<<"$origin_counts")"
+origins_rps="$(awk -v successes="$origins_successes" -v elapsed="$origins_elapsed" 'BEGIN { if (elapsed > 0) printf "%.3f", successes / elapsed; else print 0 }')"
+origins_ttfb="$(run_k6_ttfb many-origins-ttfb origin-0 1 1)"
+origins_aggregate="$(scenario_json "$origins_rps" null "$origins_ttfb" "$origins_failures" "$origins_cpu_pct" "$origins_rss_mb" "$origins_open_fds" "$origins_before" "$origins_after" "$origins_elapsed")"
+origins_json="$(jq --argjson aggregate "$origins_aggregate" --argjson elapsed "$origins_elapsed" '
+    map(. + $aggregate + {
+        rps: (if $elapsed > 0 then (.successes / $elapsed) else 0 end),
+        elapsed_s: $elapsed,
+        errors: .failures
+    })
+' <<<"$origin_counts")"
 
+start_gateway "$THREADS"
 tls_json="$(run_measured_wrk tls-origin tls-origin "$DURATION" "$CONNECTIONS" "$THREADS" true)"
 contention_json="$(worker_sweep_json)"
 
@@ -427,6 +479,7 @@ jq -n \
     --argjson route_a "$route_a_json" \
     --argjson route_b "$route_b_json" \
     --argjson route_c "$route_c_json" \
+    --argjson origins_aggregate "$origins_aggregate" \
     --argjson origins "$origins_json" \
     --argjson tls "$tls_json" \
     --argjson contention "$contention_json" \
@@ -447,13 +500,13 @@ jq -n \
                 },
                 errors: (($route_a.errors // 0) + ($route_b.errors // 0) + ($route_c.errors // 0))
             },
-            "many-origins-low-volume": {
+            "many-origins-low-volume": ($origins_aggregate + {
                 covered: true,
                 origins: ($origins | length),
                 requests_per_origin: 5,
                 measurements: $origins,
                 errors: ($origins | map(.errors // 0) | add)
-            },
+            }),
             "hot-origin-many-workers": $hot,
             "upstream-tls-handshake-reuse": $tls,
             "pool-contention": $contention

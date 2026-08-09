@@ -450,13 +450,31 @@ cpu_time_to_seconds() {
 
 process_tree_cpu_seconds() {
     local pid="$1"
-    local pids
+    local pids clk total_ticks child
     if $PID_TREE; then
         pids="$(process_tree_pids "$pid" | paste -sd, -)"
     else
         pids="$pid"
     fi
     [[ -n "$pids" ]] || pids="$pid"
+    if [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
+        clk="$(getconf CLK_TCK 2>/dev/null || true)"
+        if [[ "$clk" =~ ^[0-9]+$ && "$clk" -gt 0 ]]; then
+            total_ticks=0
+            IFS=, read -ra _cpu_pids <<< "$pids"
+            for child in "${_cpu_pids[@]}"; do
+                [[ -r "/proc/${child}/stat" ]] || continue
+                total_ticks=$((total_ticks + $(awk '{
+                    close = match($0, /\) /)
+                    rest = substr($0, close + 2)
+                    split(rest, f, " ")
+                    print (f[12] + f[13])
+                }' "/proc/${child}/stat")))
+            done
+            awk -v ticks="$total_ticks" -v clk="$clk" 'BEGIN { printf "%.6f", ticks / clk }'
+            return
+        fi
+    fi
     ps -p "$pids" -o time= 2>/dev/null | cpu_time_to_seconds
 }
 

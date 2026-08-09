@@ -44,7 +44,8 @@ Required for all runs:
 Required for full non-smoke runs:
 
 - `k6`, used for the idle keep-alive clients plus active traffic scenario
-- `openssl` and `nghttpd`, used for the upstream TLS handshake/reuse phase
+- `openssl`, used to generate the local certificate for the upstream TLS
+  handshake/reuse phase
 
 Required for the full default competitor set:
 
@@ -94,8 +95,8 @@ data in `competitive-results.json`, `competitive-results.csv`, and
 #149: uneven route traffic, many low-volume origins, one hot origin with many
 workers, upstream TLS handshake/reuse, local vs cross-worker reuse, new upstream
 connections/sec, CPU/request, p99 latency, and higher-worker contention
-evidence. `p99_ttfb_ms` remains null until a first-byte-capable load tool is
-wired into that path.
+evidence. `p99_ttfb_ms` is collected with k6 for the rows that require
+first-byte timing evidence.
 
 ## Configs
 

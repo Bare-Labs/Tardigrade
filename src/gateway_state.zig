@@ -1639,6 +1639,17 @@ pub const GatewayState = struct {
         );
         try out.print("tardigrade_upstream_h2_streaming_upload_fallback_total {d}\n", .{self.upstream_pool.h2StreamingUploadFallbacks()});
 
+        const lock_stats = self.upstream_pool.lockContentionStats();
+        try out.appendSlice(
+            \\# HELP tardigrade_upstream_pool_lock_wait_ns_total Nanoseconds spent waiting to acquire the shared upstream-pool mutex
+            \\# TYPE tardigrade_upstream_pool_lock_wait_ns_total counter
+            \\# HELP tardigrade_upstream_pool_lock_acquires_total Shared upstream-pool mutex acquisitions
+            \\# TYPE tardigrade_upstream_pool_lock_acquires_total counter
+            \\
+        );
+        try out.print("tardigrade_upstream_pool_lock_wait_ns_total {d}\n", .{lock_stats.wait_ns_total});
+        try out.print("tardigrade_upstream_pool_lock_acquires_total {d}\n", .{lock_stats.acquires_total});
+
         // Completed-exchange latency by negotiated protocol (#145 — the
         // "upstream p99 by protocol" acceptance row).
         const req_lat = self.upstream_pool.requestLatencySnapshot();
