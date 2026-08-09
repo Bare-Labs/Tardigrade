@@ -631,6 +631,13 @@ fn translate(allocator: ?std.mem.Allocator, source: *RecordSink, destination: *E
             .alpn => |protocol| try destination.emitAlpn(protocol),
             .certificate => |state| try destination.emitCertificate(state),
             .discard_epoch => |epoch| try destination.emitDiscardEpoch(toLevel(epoch)),
+            // RFC 9001 §6: TLS `KeyUpdate` is not part of TLS-over-QUIC, so
+            // this event has no QUIC translation. The shared engine rejects
+            // an inbound `KeyUpdate` outright under a QUIC transport profile
+            // and never emits this, so it is unreachable in practice — kept
+            // as an explicit failure rather than a dropped event so a future
+            // engine change cannot quietly lose a key transition here.
+            .key_update => return error.InvalidHandshakeState,
             .handshake_complete => try destination.emitHandshakeComplete(),
             .fatal_alert => |alert| try destination.emitFatalAlert(alert),
         }

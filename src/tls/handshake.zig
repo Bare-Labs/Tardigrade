@@ -156,6 +156,18 @@ pub const Core = struct {
             try self.transcript.update(message.raw);
             return message;
         }
+        // KeyUpdate (RFC 8446 §4.6.3, #357) is post-handshake and symmetric:
+        // unlike NewSessionTicket either role may send it, so the only
+        // ordering constraint is that the handshake has finished. A KeyUpdate
+        // before that is a legal message in an illegal position — the
+        // `unexpected_message` class, not a decode failure.
+        //
+        // Deliberately not hashed into the transcript; `key_update.zig`'s
+        // module comment records why.
+        if (message.kind == .key_update) {
+            if (self.handshake_lifecycle != .complete) return error.UnexpectedHandshakeMessage;
+            return message;
+        }
         // A CertificateRequest (server->client, #334) is an optional message the
         // server inserts before its Certificate. Accept it transparently while
         // the client is still expecting the server's Certificate; the client

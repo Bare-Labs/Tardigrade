@@ -110,6 +110,15 @@ const Args = struct {
     /// Server: require the engine to have selected a credential signing with
     /// exactly this scheme. Empty leaves selection unchecked.
     expect_signature: []const u8 = "",
+    /// #357: send exactly one post-handshake `KeyUpdate` once the connection
+    /// is open, before this side's application payload. `update_requested`
+    /// additionally obliges the peer to roll its own sending keys, which is
+    /// how a row exercises the *receiving* path against a real peer.
+    key_update: ?tls.key_update.Request = null,
+    /// #357: require this side to have advanced its receiving keys at least
+    /// this many times by the end of the exchange -- i.e. to have processed
+    /// that many `KeyUpdate` messages from the peer.
+    expect_key_updates: u64 = 0,
 
     const Identity = struct {
         pattern: []const u8,
@@ -150,6 +159,8 @@ const usage =
     \\  --expect ok|fail --expect-alert NAME --expect-error NAME
     \\  --expect-alpn NAME --expect-hrr
     \\  --send STR --expect-contains STR
+    \\  --key-update not-requested|requested   send one post-handshake KeyUpdate
+    \\  --expect-key-updates N                 require N received KeyUpdates
     \\  --transcript PATH             secret-free transcript + failure fixture
     \\  --verbose
     \\
@@ -245,6 +256,16 @@ fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !?Args {
             args.identity_count += 1;
         } else if (std.mem.eql(u8, arg, "--expect-signature")) {
             args.expect_signature = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, arg, "--key-update")) {
+            const raw = it.next() orelse return error.MissingValue;
+            args.key_update = if (std.mem.eql(u8, raw, "not-requested"))
+                .update_not_requested
+            else if (std.mem.eql(u8, raw, "requested"))
+                .update_requested
+            else
+                return error.UnknownKeyUpdateRequest;
+        } else if (std.mem.eql(u8, arg, "--expect-key-updates")) {
+            args.expect_key_updates = try std.fmt.parseInt(u64, it.next() orelse return error.MissingValue, 10);
         } else {
             std.debug.print("tls-interop: unknown argument {s}\n", .{arg});
             return error.UnknownArgument;
@@ -515,6 +536,14 @@ const Outcome = struct {
     /// The fatal alert the peer sent us, as observed by the record stream.
     peer_alert: ?alerts.AlertDescription = null,
     received_len: usize = 0,
+    /// #357: how many times each direction's application traffic secret
+    /// advanced. `read` counts KeyUpdates this side processed from the peer,
+    /// `write` counts the ones it sent.
+    key_updates_read: u64 = 0,
+    key_updates_written: u64 = 0,
+    /// True once the row's own `--key-update` message has been queued, so the
+    /// send is attempted exactly once however many times the loop spins.
+    key_update_sent: bool = false,
 };
 
 /// The alert that characterises this run's failure, whichever side produced
@@ -733,6 +762,24 @@ const Runner = struct {
             if (stream.applicationDataOpen()) {
                 outcome.handshake_complete = true;
 
+                // #357: roll our sending keys before the row's payload goes
+                // out, so every application byte below crosses under the new
+                // generation. `WouldBlock` here only means the outbound queue
+                // has no room for the record yet; the next spin retries.
+                if (self.args.key_update) |request| {
+                    if (!outcome.key_update_sent) {
+                        stream.requestKeyUpdate(request) catch |err| switch (err) {
+                            error.WouldBlock => {},
+                            else => {
+                                if (delivered) break;
+                                outcome.failure = err;
+                                break;
+                            },
+                        };
+                        outcome.key_update_sent = stream.keyUpdateGenerations().write > 0;
+                    }
+                }
+
                 var buf: [4096]u8 = undefined;
                 const n = stream.stream().read(&buf) catch |err| switch (err) {
                     error.WouldBlock => 0,
@@ -763,7 +810,11 @@ const Runner = struct {
                     sent_len += wrote;
                 }
 
-                delivered = sent_len == self.args.send.len and self.matched(received.items);
+                const generations = stream.keyUpdateGenerations();
+                delivered = sent_len == self.args.send.len and
+                    self.matched(received.items) and
+                    (self.args.key_update == null or generations.write > 0) and
+                    generations.read >= self.args.expect_key_updates;
                 if (delivered) {
                     outcome.ok = true;
                     // Keep driving until our reply has actually left the
@@ -783,6 +834,9 @@ const Runner = struct {
         }
 
         outcome.received_len = received.items.len;
+        const final_generations = stream.keyUpdateGenerations();
+        outcome.key_updates_read = final_generations.read;
+        outcome.key_updates_written = final_generations.write;
         outcome.hello_retry_request = backend.core.retry_state != .none;
         outcome.certificate = stream.certificateState();
         outcome.peer_alert = stream.peerAlert();
@@ -894,7 +948,14 @@ fn reportLine(buf: []u8, args: Args, outcome: Outcome) []const u8 {
             if (outcome.peer_alert != null) "peer" else "local",
         });
     }
-    report.print(" app_bytes={d}\n", .{outcome.received_len});
+    report.print(" app_bytes={d}", .{outcome.received_len});
+    if (outcome.key_updates_written > 0 or outcome.key_updates_read > 0) {
+        report.print(" key_updates_sent={d} key_updates_received={d}", .{
+            outcome.key_updates_written,
+            outcome.key_updates_read,
+        });
+    }
+    report.print("\n", .{});
     return report.written();
 }
 
@@ -924,6 +985,8 @@ fn writeTranscript(path: []const u8, args: Args, outcome: Outcome, transcript: *
     report.print("certificate: {s}\n", .{@tagName(outcome.certificate)});
     report.print("hello_retry_request: {}\n", .{outcome.hello_retry_request});
     report.print("application_bytes_received: {d}\n", .{outcome.received_len});
+    report.print("key_updates.sent: {d}\n", .{outcome.key_updates_written});
+    report.print("key_updates.received: {d}\n", .{outcome.key_updates_read});
     if (outcome.failure) |err| report.print("failure: {s}\n", .{@errorName(err)});
     if (outcome.emitted_alert) |desc| report.print("alert.local: {s}\n", .{@tagName(desc)});
     if (outcome.peer_alert) |desc| report.print("alert.peer: {s}\n", .{@tagName(desc)});
@@ -1006,6 +1069,23 @@ fn evaluate(args: Args, outcome: Outcome) u8 {
 
     if (args.expect_hrr and !outcome.hello_retry_request) {
         std.debug.print("tls-interop: expected a HelloRetryRequest but none was observed\n", .{});
+        failed = true;
+    }
+
+    // #357. Both halves are asserted, because either alone is satisfiable
+    // without the mechanism working: a KeyUpdate we sent but the peer ignored
+    // would still leave our own write generation at 1, and a row that only
+    // counted received updates could pass on a peer that rolled its keys for
+    // reasons of its own.
+    if (args.key_update != null and outcome.key_updates_written == 0) {
+        std.debug.print("tls-interop: expected to send a KeyUpdate but the sending keys never advanced\n", .{});
+        failed = true;
+    }
+    if (outcome.key_updates_read < args.expect_key_updates) {
+        std.debug.print("tls-interop: expected at least {d} KeyUpdate(s) from the peer but observed {d}\n", .{
+            args.expect_key_updates,
+            outcome.key_updates_read,
+        });
         failed = true;
     }
 

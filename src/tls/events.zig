@@ -136,11 +136,30 @@ pub const NegotiatedParameters = struct {
     transcript_hash: TranscriptHash,
 };
 
+/// Advance one direction's application traffic secret one step along RFC 8446
+/// §7.2's `"traffic upd"` chain, replacing that direction's record keys and
+/// restarting its record sequence at zero (#357).
+///
+/// Ordering carries the protocol meaning, so a consumer must apply this in
+/// event order and never reorder it against `handshake_bytes`:
+///
+///   * `.read` is emitted *after* the peer's `KeyUpdate` has been processed,
+///     so the record that carried it was still opened under the old keys and
+///     everything after it uses the new ones.
+///   * `.write` is emitted *after* the `handshake_bytes` event carrying our
+///     own `KeyUpdate`, so that message is sealed under the old keys — as RFC
+///     8446 §4.6.3 requires — and only later records use the new ones.
+///
+/// Record mode only. QUIC has no `KeyUpdate` (RFC 9001 §6) and never sees this
+/// event; its own key phase is a packet-header mechanism.
+pub const KeyUpdate = struct { direction: SecretDirection };
+
 pub const Event = union(enum) {
     handshake_bytes: struct { epoch: EncryptionEpoch, data: []const u8 },
     negotiated_parameters: NegotiatedParameters,
     early_data_parameters: NegotiatedParameters,
     traffic_secret: struct { epoch: EncryptionEpoch, direction: SecretDirection, data: []const u8 },
+    key_update: KeyUpdate,
     alpn: []const u8,
     certificate: CertificateState,
     discard_epoch: EncryptionEpoch,

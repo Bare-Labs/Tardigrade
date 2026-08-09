@@ -985,11 +985,20 @@ issue's implementation-plan comment:
   that a mutation which merely turns some test red is not the same as one that
   proves the property under test bites.
 
-  TLS-over-TCP KeyUpdate and key replacement remain #357: the bridge exposes
-  no such surface today, so the epoch target's operation set is the extension
-  point for it rather than a fabricated API. The stream targets' operation
-  sets are the corresponding extension point for any future post-handshake
-  record-layer operation.
+  TLS-over-TCP KeyUpdate and key replacement landed in #357, and the bridge
+  now does expose that surface: `Bridge.updateTrafficSecret(direction)` walks
+  RFC 8446 §7.2's `"traffic upd"` chain for one direction, replacing that
+  direction's record keys and restarting its sequence. It is the extension
+  point this note anticipated — a generated operation for the epoch target,
+  not a fabricated API — and adding it there would let the existing one-way
+  key-lifecycle property cover generation transitions too. The deterministic
+  properties it must preserve are already pinned by name in
+  `record_epoch_bridge.zig` (chain arithmetic against an independent HKDF
+  computation, sequence restart, old-generation records failing to open, no
+  retired key material anywhere in the bridge, and rejection outside a live
+  completed application epoch). The stream targets' operation sets remain the
+  corresponding extension point for the post-handshake record-layer exchange
+  itself.
 
 Ownership stays exactly as scoped above and in the issue: shared TLS
 message/negotiation/transcript fuzzing is #491; PKI fuzzing is #492;

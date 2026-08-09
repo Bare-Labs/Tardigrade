@@ -395,6 +395,10 @@ fn pumpDirect(
             var scratch: [1]u8 = undefined;
             _ = try sender_bridge.applyEvent(.{ .early_data_parameters = params }, &scratch);
         },
+        .key_update => |update| {
+            var scratch: [1]u8 = undefined;
+            _ = try sender_bridge.applyEvent(.{ .key_update = update }, &scratch);
+        },
         .peer_transport_parameters => {},
         .alpn => |protocol| observed.noteAlpn(protocol),
         .certificate => |state| observed.certificate_state = state,
@@ -12740,4 +12744,509 @@ test "#369 Slice 2 rt0.reject.cross_worker_duplicate: worker A's accepted claim 
     try std.testing.expect(worker_b.server_backend.core.psk_authenticated);
 
     try std.testing.expectEqual(@as(usize, 1), store.count());
+}
+
+// ===========================================================================
+// #357: post-handshake KeyUpdate over the record stream.
+//
+// The bridge-level chain arithmetic, sequence reset, and zeroization are
+// pinned in `record_epoch_bridge.zig`. What is proved here is the *protocol*:
+// two real engines over a real socket pair, exchanging real KeyUpdate records
+// and continuing to talk afterwards.
+// ===========================================================================
+
+const key_update = tls_core.key_update;
+
+const Generations = struct {
+    client_read: u64,
+    client_write: u64,
+    server_read: u64,
+    server_write: u64,
+};
+
+fn generations(h: *SocketHarness) Generations {
+    return .{
+        .client_read = h.client.bridge.read_key_generation,
+        .client_write = h.client.bridge.write_key_generation,
+        .server_read = h.server.bridge.read_key_generation,
+        .server_write = h.server.bridge.write_key_generation,
+    };
+}
+
+/// Both directions still carry application data end to end. Run after every
+/// transition: agreeing generation counters would still be agreeing if both
+/// sides had derived the same *wrong* keys, but a byte that survives the round
+/// trip could only have been sealed and opened under matching key material.
+fn expectTrafficBothWays(h: *SocketHarness, tag: []const u8) !void {
+    var buf: [64]u8 = undefined;
+
+    try std.testing.expectEqual(tag.len, try h.client.stream().write(tag));
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.server.readiness().can_read_plaintext;
+        }
+    }.done);
+    try std.testing.expectEqualStrings(tag, buf[0..try h.server.stream().read(&buf)]);
+
+    try std.testing.expectEqual(tag.len, try h.server.stream().write(tag));
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.client.readiness().can_read_plaintext;
+        }
+    }.done);
+    try std.testing.expectEqualStrings(tag, buf[0..try h.client.stream().read(&buf)]);
+}
+
+/// Each direction's sender and receiver hold the same secret. This is the
+/// property a mis-timed transition breaks: if one side advances a record too
+/// early or too late the counters can still match while the secrets do not.
+fn expectSecretsAgree(h: *SocketHarness) !void {
+    try std.testing.expectEqualSlices(
+        u8,
+        h.client.bridge.write_application_secret.slice(),
+        h.server.bridge.read_application_secret.slice(),
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        h.server.bridge.write_application_secret.slice(),
+        h.client.bridge.read_application_secret.slice(),
+    );
+}
+
+/// Drive the server until it latches a terminal error, so a test can pin the
+/// failure class an injected record produces without depending on how many
+/// drives the carrier needs to deliver it.
+fn driveServerUntilError(h: *SocketHarness) anyerror {
+    var rounds: usize = 0;
+    while (rounds < 256) : (rounds += 1) {
+        _ = h.driveServer() catch |err| return err;
+        _ = h.driveClient() catch {};
+    }
+    return error.NoFailureLatched;
+}
+
+fn driveUntilServerRead(h: *SocketHarness, target: u64) !void {
+    const Target = struct {
+        var want: u64 = 0;
+        fn done(hh: *SocketHarness) bool {
+            return hh.server.bridge.read_key_generation >= want;
+        }
+    };
+    Target.want = target;
+    try h.driveUntil(Target.done);
+}
+
+test "#357 a one-way KeyUpdate advances only the sending direction" {
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.driveUntil(SocketHarness.bothComplete);
+    try expectTrafficBothWays(h, "before-update");
+
+    // `update_not_requested`: refresh our own sending keys and ask nothing of
+    // the peer.
+    try h.client.requestKeyUpdate(.update_not_requested);
+    try driveUntilServerRead(h, 1);
+
+    try std.testing.expectEqual(Generations{
+        .client_read = 0,
+        .client_write = 1,
+        .server_read = 1,
+        .server_write = 0,
+    }, generations(h));
+    try expectSecretsAgree(h);
+    try expectTrafficBothWays(h, "after-update");
+}
+
+test "#357 update_requested draws exactly one reciprocal update and then stops" {
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    try h.client.requestKeyUpdate(.update_requested);
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.client.bridge.read_key_generation == 1 and hh.server.bridge.read_key_generation == 1;
+        }
+    }.done);
+
+    // Both directions advanced exactly once: the client's own update, and the
+    // server's reciprocal one.
+    try std.testing.expectEqual(Generations{
+        .client_read = 1,
+        .client_write = 1,
+        .server_read = 1,
+        .server_write = 1,
+    }, generations(h));
+    try expectSecretsAgree(h);
+    try expectTrafficBothWays(h, "reciprocal");
+
+    // And it terminates. The reciprocal update carries
+    // `update_not_requested`, so nothing obliges the client to answer it --
+    // driving both sides to a standstill must not produce a further
+    // generation on either side.
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
+        _ = try h.driveClient();
+        _ = try h.driveServer();
+    }
+    try std.testing.expectEqual(Generations{
+        .client_read = 1,
+        .client_write = 1,
+        .server_read = 1,
+        .server_write = 1,
+    }, generations(h));
+    try expectTrafficBothWays(h, "still-quiet");
+}
+
+test "#357 repeated updates from both roles keep the two chains in step" {
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    for (1..6) |round| {
+        // Client-initiated, one-way.
+        try h.client.requestKeyUpdate(.update_not_requested);
+        try driveUntilServerRead(h, round);
+
+        // Server-initiated, one-way, in the other direction.
+        try h.server.requestKeyUpdate(.update_not_requested);
+        try h.driveUntil(struct {
+            fn done(hh: *SocketHarness) bool {
+                return hh.client.bridge.read_key_generation == hh.server.bridge.write_key_generation;
+            }
+        }.done);
+
+        try std.testing.expectEqual(Generations{
+            .client_read = round,
+            .client_write = round,
+            .server_read = round,
+            .server_write = round,
+        }, generations(h));
+        try expectSecretsAgree(h);
+        try expectTrafficBothWays(h, "round");
+    }
+}
+
+test "#357 simultaneous updates crossing on the wire converge without a loop" {
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    // Both endpoints request an update before either has seen the other's:
+    // the case where each side's KeyUpdate is already in flight when the
+    // peer's arrives, which RFC 8446 §4.6.3 explicitly allows.
+    try h.client.requestKeyUpdate(.update_requested);
+    try h.server.requestKeyUpdate(.update_requested);
+
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.client.bridge.read_key_generation == 2 and hh.server.bridge.read_key_generation == 2;
+        }
+    }.done);
+
+    // Each side advanced its sending keys twice -- once for its own request,
+    // once for the reciprocal answer it owed the peer -- and its receiving
+    // keys twice to match. The exchange then stops: neither reciprocal
+    // message requests anything further.
+    try std.testing.expectEqual(Generations{
+        .client_read = 2,
+        .client_write = 2,
+        .server_read = 2,
+        .server_write = 2,
+    }, generations(h));
+    try expectSecretsAgree(h);
+    try expectTrafficBothWays(h, "crossed");
+
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
+        _ = try h.driveClient();
+        _ = try h.driveServer();
+    }
+    try std.testing.expectEqual(@as(u64, 2), h.client.bridge.write_key_generation);
+    try std.testing.expectEqual(@as(u64, 2), h.server.bridge.write_key_generation);
+}
+
+/// Seal `bytes` as an application-epoch handshake record with one endpoint's
+/// own write keys and push it straight down the socket, bypassing that
+/// stream's queue. Lets a test emit exactly the record sequence a peer would
+/// -- including ones this implementation would never itself produce.
+fn injectClientHandshakeRecord(h: *SocketHarness, bytes: []const u8) !void {
+    var record_buf: [tls_core.record_codec.max_ciphertext_record_len]u8 = undefined;
+    const record = try h.client.bridge.sealProtected(.application, .handshake, bytes, &record_buf);
+    try h.injectFromClient(record);
+}
+
+fn injectServerHandshakeRecord(h: *SocketHarness, bytes: []const u8) !void {
+    var record_buf: [tls_core.record_codec.max_ciphertext_record_len]u8 = undefined;
+    const record = try h.server.bridge.sealProtected(.application, .handshake, bytes, &record_buf);
+    var written: usize = 0;
+    while (written < record.len) {
+        written += try writeFd(h.fds[1], record[written..]);
+    }
+}
+
+/// The client counterpart of `driveServerUntilError`.
+fn driveClientUntilError(h: *SocketHarness) anyerror {
+    var rounds: usize = 0;
+    while (rounds < 256) : (rounds += 1) {
+        _ = h.driveClient() catch |err| return err;
+        _ = h.driveServer() catch {};
+    }
+    return error.NoFailureLatched;
+}
+
+test "#357 a KeyUpdate fragmented across two records is reassembled and applied once" {
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.driveUntil(SocketHarness.bothComplete);
+    try expectTrafficBothWays(h, "before-fragment");
+
+    var message_buf: [key_update.message_len]u8 = undefined;
+    const message = try key_update.encode(.update_not_requested, &message_buf);
+
+    // Split mid-header and mid-body, so the server has to hold an incomplete
+    // handshake message across a record boundary rather than getting a
+    // conveniently whole one in each record.
+    for ([_]usize{ 1, 2, 3, 4 }) |split| {
+        const before = generations(h);
+        try injectClientHandshakeRecord(h, message[0..split]);
+        try injectClientHandshakeRecord(h, message[split..]);
+        // The client sealed those two records itself, so its own sending keys
+        // advance exactly where the peer will expect them to: after the
+        // KeyUpdate, never before it.
+        try h.client.bridge.updateTrafficSecret(.write);
+
+        try driveUntilServerRead(h, before.server_read + 1);
+        try std.testing.expectEqual(before.server_read + 1, h.server.bridge.read_key_generation);
+        // A partial message must not have been mistaken for a whole one.
+        try std.testing.expectEqual(before.server_write, h.server.bridge.write_key_generation);
+        try expectSecretsAgree(h);
+        try expectTrafficBothWays(h, "after-fragment");
+    }
+}
+
+test "#357 an undefined KeyUpdate request value fails as illegal_parameter" {
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    // Well-framed KeyUpdate whose request byte is outside the two defined
+    // values. RFC 8446 §4.6.3 requires `illegal_parameter`, not a decode
+    // error -- the bytes parse fine, the value is wrong.
+    try injectClientHandshakeRecord(h, &.{ 24, 0, 0, 1, 0x05 });
+
+    try std.testing.expectEqual(@as(anyerror, error.IllegalParameter), driveServerUntilError(h));
+    try std.testing.expectEqual(
+        tls_core.alerts.AlertDescription.illegal_parameter,
+        tls_core.alerts.fromHandshakeError(error.IllegalParameter),
+    );
+    // The client sees the class the server actually put on the wire.
+    var rounds: usize = 0;
+    while (rounds < 64 and h.client.peerAlert() == null) : (rounds += 1) _ = h.driveClient() catch {};
+    try std.testing.expectEqual(tls_core.alerts.AlertDescription.illegal_parameter, h.client.peerAlert().?);
+    try std.testing.expectEqual(@as(u64, 0), h.server.bridge.read_key_generation);
+}
+
+test "#357 a wrong-length KeyUpdate body fails as a decode error, not illegal_parameter" {
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    // Two body bytes where the message is defined to carry exactly one: a
+    // framing failure, which is the `decode_error` class.
+    try injectClientHandshakeRecord(h, &.{ 24, 0, 0, 2, 0x00, 0x00 });
+
+    try std.testing.expectEqual(@as(anyerror, error.MalformedHandshake), driveServerUntilError(h));
+    try std.testing.expectEqual(@as(u64, 0), h.server.bridge.read_key_generation);
+}
+
+test "#357 an over-long KeyUpdate is a framing error with or without a post-handshake allocator" {
+    // The failure class must not depend on whether this endpoint happens to
+    // have configured a ticket allocator. A KeyUpdate declaring a body too
+    // large for the inline reassembly buffer would otherwise reach the
+    // allocator path and be reported as a missing allocator on one connection
+    // and a decode error on another.
+    //
+    // Only a client can hold a post-handshake allocator (it exists to
+    // reassemble NewSessionTicket, which travels server->client only), so the
+    // client is the receiver that can actually exercise both settings.
+    for ([_]?std.mem.Allocator{ null, std.testing.allocator }) |maybe_allocator| {
+        const h = try SocketHarness.create(.{ .client_post_handshake_allocator = maybe_allocator });
+        defer h.destroy();
+        try h.driveUntil(SocketHarness.bothComplete);
+
+        // A declared 64-byte body: well past the five bytes a KeyUpdate can
+        // ever occupy, and past the inline buffer.
+        var oversized: [4 + 64]u8 = undefined;
+        oversized[0] = 24;
+        std.mem.writeInt(u24, oversized[1..4], 64, .big);
+        @memset(oversized[4..], 0);
+        try injectServerHandshakeRecord(h, &oversized);
+
+        try std.testing.expectEqual(@as(anyerror, error.MalformedHandshake), driveClientUntilError(h));
+        try std.testing.expectEqual(@as(u64, 0), h.client.bridge.read_key_generation);
+    }
+}
+
+test "#357 a KeyUpdate before the handshake completes is rejected in both roles" {
+    // Pre-handshake rejection has two distinct causes and both must bite: the
+    // message arriving at an epoch it is never carried at, and the message
+    // arriving at the right epoch before the handshake has finished.
+    for ([_]tls_core.state.Role{ .client, .server }) |role| {
+        var storage: ProviderStorage = .{};
+        const cp = storage.init(if (role == .client) client_provider_seed else server_provider_seed);
+        var engine = if (role == .client)
+            tls_backend.Tls13Backend.initClient(clientEntropy(), cp, .{ .pinned_certificate = tls_backend.testdata.certificate_der }, .record)
+        else
+            tls_backend.Tls13Backend.initServer(serverEntropy(), cp, fixtureIdentity(), .record);
+        defer engine.deinit();
+        var sink = DirectSink{};
+        defer sink.deinit();
+        try engine.backend().start(role, {}, &sink);
+
+        var message_buf: [key_update.message_len]u8 = undefined;
+        const message = try key_update.encode(.update_not_requested, &message_buf);
+
+        // Wrong epoch: KeyUpdate is an application-epoch message only, so it
+        // is refused before it is ever decoded.
+        sink.reset();
+        try std.testing.expectError(
+            error.UnexpectedTransportEpoch,
+            engine.backend().receive(.handshake, message, &sink),
+        );
+
+        // Right epoch, wrong time: the application epoch does not exist for
+        // inbound purposes until the handshake completes, so a KeyUpdate
+        // arriving there early is refused on the same deterministic ground
+        // rather than reaching the post-handshake reassembly buffer.
+        sink.reset();
+        try std.testing.expectError(
+            error.UnexpectedTransportEpoch,
+            engine.backend().receive(.application, message, &sink),
+        );
+        try std.testing.expectEqual(@as(usize, 0), sink.len);
+    }
+}
+
+test "#357 QUIC-mode engines have no KeyUpdate and reject one that arrives" {
+    var harness: DirectHarness = undefined;
+    harness.initExtension();
+    defer harness.deinit();
+    try harness.run();
+    try std.testing.expect(harness.client_driver.isComplete());
+    try std.testing.expect(harness.server_driver.isComplete());
+
+    var message_buf: [key_update.message_len]u8 = undefined;
+    const message = try key_update.encode(.update_not_requested, &message_buf);
+
+    // RFC 9001 §6: the message does not exist over QUIC. Both roles reject a
+    // received one as `unexpected_message`, and neither exposes a way to send
+    // one -- an engine that merely refused to *send* while still accepting
+    // inbound updates would silently roll its own receiving keys on a peer's
+    // say-so.
+    for ([_]*tls_backend.Tls13Backend{ &harness.client_backend, &harness.server_backend }) |engine| {
+        var sink = DirectSink{};
+        defer sink.deinit();
+        try std.testing.expect(!engine.backend().supportsKeyUpdate());
+        try std.testing.expectError(
+            error.InvalidHandshakeState,
+            engine.requestKeyUpdate(.update_requested, &sink),
+        );
+        try std.testing.expectEqual(@as(usize, 0), sink.len);
+        try std.testing.expectError(
+            error.UnexpectedHandshakeMessage,
+            engine.backend().receive(.application, message, &sink),
+        );
+    }
+}
+
+test "#357 record-mode engines expose KeyUpdate only after the handshake completes" {
+    var harness: DirectHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+
+    // The capability is a property of the transport profile, so it is present
+    // from the start...
+    try std.testing.expect(harness.client_backend.backend().supportsKeyUpdate());
+    try std.testing.expect(harness.server_backend.backend().supportsKeyUpdate());
+
+    // ...but using it before completion is a state error, not a queued
+    // message waiting for keys that do not exist yet.
+    var early_sink = DirectSink{};
+    defer early_sink.deinit();
+    try std.testing.expectError(
+        error.InvalidHandshakeState,
+        harness.client_backend.requestKeyUpdate(.update_not_requested, &early_sink),
+    );
+    try std.testing.expectEqual(@as(usize, 0), early_sink.len);
+
+    try harness.run();
+
+    // After completion it emits the message and the write-side advance, in
+    // that order -- the message must be sealed under the keys it retires.
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try harness.client_backend.requestKeyUpdate(.update_requested, &sink);
+    try std.testing.expectEqual(@as(usize, 2), sink.len);
+    try std.testing.expectEqual(events.EncryptionEpoch.application, sink.items[0].handshake_bytes.epoch);
+    try std.testing.expectEqual(
+        key_update.Request.update_requested,
+        try key_update.decode((try tls_core.messages.decode(sink.items[0].handshake_bytes.data)).body),
+    );
+    try std.testing.expectEqual(events.SecretDirection.write, sink.items[1].key_update.direction);
+}
+
+test "#357 the stream refuses a locally initiated KeyUpdate outside an open session" {
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+
+    // Before the handshake completes there is no application epoch to seal a
+    // KeyUpdate under.
+    try std.testing.expectError(error.InvalidHandshakeState, h.client.requestKeyUpdate(.update_not_requested));
+    try std.testing.expectError(error.InvalidHandshakeState, h.server.requestKeyUpdate(.update_requested));
+
+    try h.driveUntil(SocketHarness.bothComplete);
+    try h.client.requestKeyUpdate(.update_not_requested);
+    try driveUntilServerRead(h, 1);
+
+    // A closed stream is past updating, whatever its keys were.
+    h.client.stream().close();
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.client.lifecycle == .closed;
+        }
+    }.done);
+    try std.testing.expectError(error.InvalidHandshakeState, h.client.requestKeyUpdate(.update_not_requested));
+}
+
+test "#357 usage limits report when a proactive update is due without forcing one" {
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    // Unconfigured is the default, and stays false however much traffic runs.
+    try std.testing.expect(!h.client.keyUpdateDue());
+    try expectTrafficBothWays(h, "unlimited");
+    try std.testing.expect(!h.client.keyUpdateDue());
+
+    h.client.setKeyUpdateLimits(.{ .records = 3 });
+    try std.testing.expect(!h.client.keyUpdateDue());
+    for (0..3) |_| {
+        _ = try h.client.stream().write("x");
+        _ = try h.driveClient();
+        _ = try h.driveServer();
+    }
+    try std.testing.expect(h.client.keyUpdateDue());
+
+    // Reaching the limit does not itself update anything: the hook reports,
+    // the owner decides.
+    try std.testing.expectEqual(@as(u64, 0), h.client.bridge.write_key_generation);
+    var buf: [16]u8 = undefined;
+    while (h.server.readiness().can_read_plaintext) _ = try h.server.stream().read(&buf);
+
+    try h.client.requestKeyUpdate(.update_not_requested);
+    try driveUntilServerRead(h, 1);
+    // The sequence restarted, so the limit is no longer met.
+    try std.testing.expect(!h.client.keyUpdateDue());
+    try std.testing.expectEqual(@as(u64, 1), h.client.bridge.write_key_generation);
 }

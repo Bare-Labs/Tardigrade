@@ -10,6 +10,7 @@ pub const state = @import("state.zig");
 pub const events = @import("events.zig");
 pub const handshake = @import("handshake.zig");
 pub const key_schedule = @import("key_schedule.zig");
+pub const key_update = @import("key_update.zig");
 const messages = @import("messages.zig");
 pub const transcript = @import("transcript.zig");
 
@@ -166,6 +167,27 @@ pub fn Driver(comptime Transport: type) type {
             if (self.state == .failed) return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
             self.sink.reset();
             self.backend.resumeAuth(&self.sink) catch |err| self.markFailed(err);
+            return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
+        }
+
+        /// Whether the backend's transport has post-handshake `KeyUpdate`
+        /// (#357). False for QUIC, which has no such message (RFC 9001 §6).
+        pub fn supportsKeyUpdate(self: *const Self) bool {
+            return self.backend.supportsKeyUpdate();
+        }
+
+        /// Queue a locally initiated `KeyUpdate`, returning the resulting event
+        /// batch the same way `receiveOutcome` does — the batch carries the
+        /// `KeyUpdate` bytes and the write-side advance that must be applied
+        /// after them, so it must be applied in order.
+        ///
+        /// Callers must check `supportsKeyUpdate` first: on a backend without
+        /// `KeyUpdate` this emits nothing and reports no error, which is
+        /// indistinguishable here from a successful empty batch.
+        pub fn requestKeyUpdateOutcome(self: *Self, request: key_update.Request) Outcome {
+            if (self.state == .failed) return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
+            self.sink.reset();
+            _ = self.backend.requestKeyUpdate(request, &self.sink) catch |err| self.markFailed(err);
             return .{ .sink = &self.sink, .terminal_error = self.failure_reason };
         }
 

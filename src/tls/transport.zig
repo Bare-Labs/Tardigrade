@@ -30,6 +30,7 @@ const std = @import("std");
 const crypto_secrets = @import("crypto_secrets");
 const alerts = @import("alerts.zig");
 const events = @import("events.zig");
+const key_update = @import("key_update.zig");
 const state = @import("state.zig");
 
 pub fn Contract(
@@ -74,6 +75,11 @@ pub fn ContractWithOptions(
             early_data_parameters: events.NegotiatedParameters,
             /// A traffic secret to install for `epoch`/`direction`.
             traffic_secret: struct { epoch: Epoch, direction: events.SecretDirection, data: []const u8 },
+            /// Advance one direction's application traffic secret one step
+            /// along RFC 8446 §7.2's `"traffic upd"` chain (#357). Record mode
+            /// only — see `events.KeyUpdate` for the ordering contract, which
+            /// is load-bearing: consumers must apply it in event order.
+            key_update: events.KeyUpdate,
             /// Transport-owned peer parameters carried by the TLS handshake.
             peer_transport_parameters: TransportParameters,
             /// The negotiated ALPN protocol.
@@ -246,6 +252,14 @@ pub fn ContractWithOptions(
                 self.pushUnchecked(.{ .traffic_secret = .{ .epoch = epoch, .direction = direction, .data = stored } });
             }
 
+            /// Emitted *after* whichever event establishes the boundary the
+            /// update takes effect at: the peer's processed `KeyUpdate` for
+            /// `.read`, our own emitted `KeyUpdate` bytes for `.write`.
+            pub fn emitKeyUpdate(self: *EventSink, direction: events.SecretDirection) ErrorSet!void {
+                try self.reserve(0);
+                self.pushUnchecked(.{ .key_update = .{ .direction = direction } });
+            }
+
             pub fn emitPeerTransportParameters(self: *EventSink, params: TransportParameters) ErrorSet!void {
                 try self.reserve(0);
                 self.pushUnchecked(.{ .peer_transport_parameters = params });
@@ -315,6 +329,13 @@ pub fn ContractWithOptions(
             /// derives no traffic secrets to infer that from. Backends that
             /// never emit HRR leave this null.
             helloRetryRequestSentFn: ?*const fn (ptr: *anyopaque) bool = null,
+            /// Locally initiated post-handshake `KeyUpdate` (#357). Record-mode
+            /// backends wire this; QUIC's leaves it null, because RFC 9001 §6
+            /// removes `KeyUpdate` from TLS-over-QUIC entirely. Null is
+            /// therefore a real answer ("this transport has no such message"),
+            /// not a missing feature — which is why `requestKeyUpdate` reports
+            /// it to the caller instead of quietly doing nothing.
+            requestKeyUpdateFn: ?*const fn (ptr: *anyopaque, request: key_update.Request, sink: *EventSink) ErrorSet!void = null,
 
             pub fn start(self: Backend, role: state.Role, params: TransportParameters, sink: *EventSink) ErrorSet!void {
                 return self.startFn(self.ptr, role, params, sink);
@@ -362,6 +383,24 @@ pub fn ContractWithOptions(
             pub fn helloRetryRequestSent(self: Backend) bool {
                 if (self.helloRetryRequestSentFn) |f| return f(self.ptr);
                 return false;
+            }
+
+            /// Whether this backend's transport has `KeyUpdate` at all.
+            pub fn supportsKeyUpdate(self: Backend) bool {
+                return self.requestKeyUpdateFn != null;
+            }
+
+            /// Queue a locally initiated `KeyUpdate` and the write-side key
+            /// advance behind it. Returns false — emitting nothing — when the
+            /// backend has no `KeyUpdate` (QUIC). The result is a `bool` rather
+            /// than an error because this contract is generic over `ErrorSet`
+            /// and cannot name an error of its own; callers must decide what an
+            /// unsupported transport means for them, and cannot silently ignore
+            /// it.
+            pub fn requestKeyUpdate(self: Backend, request: key_update.Request, sink: *EventSink) ErrorSet!bool {
+                const f = self.requestKeyUpdateFn orelse return false;
+                try f(self.ptr, request, sink);
+                return true;
             }
 
             pub fn deinit(self: Backend) void {
