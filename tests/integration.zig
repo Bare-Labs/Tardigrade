@@ -721,6 +721,29 @@ fn handleH2cUpstreamConnection(server: *H2cUpstreamServer, conn: compat.NetConne
     defer allocator.free(block);
     try writeH2Frame(conn.stream, 0x1, 0x4, request_stream_id, block); // END_HEADERS
     try writeH2Frame(conn.stream, 0x0, 0x1, request_stream_id, response_body); // END_STREAM
+
+    // GOAWAY tells the gateway not to reuse this connection, then the receive
+    // buffer has to be drained before closing: the gateway is still sending
+    // WINDOW_UPDATE/SETTINGS-ACK frames this fixture never consumes, and on
+    // Linux `close()` with unread data queued sends RST instead of FIN, which
+    // discards the response still sitting in the send buffer. That truncates
+    // the relayed body downstream, which is a fixture artifact rather than a
+    // gateway bug — macOS happens to tolerate it.
+    var goaway_payload: [8]u8 = undefined;
+    std.mem.writeInt(u32, goaway_payload[0..4], request_stream_id, .big);
+    std.mem.writeInt(u32, goaway_payload[4..8], 0, .big); // NO_ERROR
+    writeH2Frame(conn.stream, 0x7, 0, 0, &goaway_payload) catch {};
+    drainH2Connection(allocator, conn.stream);
+}
+
+/// Read and discard whatever the peer has queued, until it closes or goes quiet.
+/// Bounded so a peer that keeps the connection parked cannot stall the fixture.
+fn drainH2Connection(allocator: std.mem.Allocator, stream: compat.NetStream) void {
+    var frames: usize = 0;
+    while (frames < 64) : (frames += 1) {
+        var frame = readH2Frame(allocator, stream, 250) catch return;
+        frame.deinit(allocator);
+    }
 }
 
 const FastCgiServer = struct {
@@ -12857,6 +12880,11 @@ test "proxy streaming mode streams over a unix socket upstream" {
 
 test "proxy streaming mode streams from an upstream requiring a client certificate" {
     const allocator = std.testing.allocator;
+    // The appliance profile stubs the upstream TLS client out entirely
+    // (`UpstreamTlsConn.connect` returns `error.ContextInitFailed`), so *no*
+    // HTTPS upstream works there — buffered or streaming. Upstream mTLS is only
+    // reachable under the general profile.
+    try requireGeneralTlsProfile();
     try requireOpenssl(allocator);
 
     // `openssl s_server -Verify 1` refuses any peer without a certificate
