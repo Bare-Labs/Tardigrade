@@ -202,13 +202,22 @@ All notable user-facing changes to Tardigrade are documented here.
   accepted path carries a report naming, per certificate, what status evidence
   was checked and what was not, so an acceptance never implies revocation was
   verified — under the default policy the report says plainly that nothing was
-  checked. RFC 7633 must-staple is parsed (new TLS Feature extension support in
-  the X.509 model, including the CA-asserted form) and enforced in every mode
-  that consults status; under `disabled` the acceptance records
-  `must_staple_unenforced` rather than silently passing. Status evidence —
-  stapled responses, cached answers, CRL sets, with freshness bounds, defect
-  reasons, and an authentication flag — is supplied by the caller, and
-  unauthenticated evidence never counts as a completed check by default. No
+  checked, and `disabled` never rejects on evidence either, so a peer cannot
+  fail a handshake against a gateway with revocation switched off. RFC 7633
+  must-staple is parsed (new TLS Feature extension support in the X.509 model)
+  and enforced in every mode that consults status; the report distinguishes
+  `enforced` from both unenforced cases rather than silently passing. The
+  issuer form of the extension is enforced correctly as an RFC 7633 §4.2.2
+  chain constraint — every certificate a TLS-Feature-carrying CA signs must
+  assert the same feature set or a superset — rather than as a downward
+  stapling obligation. Status evidence — stapled responses, cached answers, CRL
+  sets, with freshness bounds, defect reasons, and an authentication flag — is
+  supplied by the caller and bound to a certificate by SHA-256 identity, so an
+  alternate or cross-signed candidate path can never consume evidence gathered
+  for a different certificate at the same index. Unauthenticated evidence never
+  counts as a completed check by default; the one exception is a peer-stapled
+  revocation, which can only condemn the peer itself. A stale `certificateHold`
+  does not outrank fresher evidence of its RFC 5280 §5.3.1 release. No
   validator code performs network or file I/O: a future fetch-and-cache
   provider implements `revocation.Provider`, runs before validation, and
   changes no TLS-handshake or path-validation signature. Certificate

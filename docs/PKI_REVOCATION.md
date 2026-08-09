@@ -41,6 +41,11 @@ consult only evidence the caller supplies; none reaches the network.
 | `soft_fail` | all sources | accept, recorded | accept, recorded | reject |
 | `strict` | all sources | **reject** | **reject** | reject |
 
+`disabled` never rejects, and that includes rejecting *on the evidence itself*:
+supplied assertions are not examined at all, so a peer cannot fail a handshake
+against a gateway that has revocation switched off by attaching oversized or
+misfiled status data.
+
 "Present-but-unusable" means stale, malformed, or unauthenticated evidence —
 the peer or provider offered an answer and the answer cannot be trusted.
 `stapled_only` draws the line there deliberately: a peer that staples nothing
@@ -54,21 +59,30 @@ and found nothing".
 
 ## Must-staple (RFC 7633)
 
-A certificate carrying the TLS Feature extension with `status_request` (5)
-asserts that its server always delivers a stapled status response. Tardigrade
-parses the extension (`x509.Certificate.mustStaple`) and enforces it in every
-mode that consults status: the leaf must have a *stapled*, good, usable status,
-or the path is rejected with `must_staple_not_satisfied`. A cached or CRL answer
-does not substitute — the point of the assertion is the in-band delivery.
+An **end-entity** certificate carrying the TLS Feature extension with
+`status_request` (5) asserts that its server always delivers a stapled status
+response. Tardigrade parses the extension (`x509.Certificate.mustStaple`) and
+enforces it in every mode that consults status: the leaf must have a *stapled*,
+good, usable status, or the path is rejected with `must_staple_not_satisfied`. A
+cached or CRL answer does not substitute — the point of the assertion is the
+in-band delivery.
 
-RFC 7633 §4.2.3 lets an issuing CA assert the feature on behalf of the
-certificates below it, so a must-staple assertion anywhere in the path binds the
-leaf.
+The **issuer** form is a different rule. RFC 7633 §4.2.2 makes a certificate
+carrying TLS Feature a constraint on what it signs: every certificate it issues
+must assert the same feature set or a superset of it. That is a chain
+constraint, enforced during path validation for *all* advertised features (not
+just `status_request`) and independently of the status mode; a violation is
+`tls_feature_constraint_violation`. It is not a stapling obligation that
+propagates downward — the operational must-staple requirement is read from the
+end-entity certificate after the constraint holds. The trust anchor is excluded,
+like its other extensions: anchor restrictions are local trust configuration.
 
-In `disabled` mode there is no evidence channel, so the assertion cannot be
-honored. Rather than silently ignore it, acceptance sets
-`Report.must_staple_unenforced`. Operators who deploy must-staple certificates
-behind Tardigrade should run at least `stapled_only`.
+`Report.must_staple` records what became of the assertion —
+`not_required`, `enforced`, `unenforced_status_disabled` (the mode consults
+nothing), or `unenforced_by_configuration` (`enforce_must_staple` is off) — so
+an acceptance never reads as "honored" when it was merely not applied.
+Operators who deploy must-staple certificates behind Tardigrade should run at
+least `stapled_only`.
 
 ## Evidence and the trust boundary
 
@@ -77,6 +91,12 @@ Evidence reaches validation as `revocation.StatusAssertion` values in
 `Defect` when the encoded response could not be interpreted, and
 `signature_verified`.
 
+Each assertion is bound to a certificate by `CertificateIdentity` (SHA-256 over
+its exact DER), not by position. `validateCandidates` offers one evidence set to
+every candidate, and cross-signed or alternate paths routinely carry different
+certificates at the same index; an assertion whose identity does not match the
+certificate at its index is ignored rather than applied.
+
 `signature_verified` is asserted by whoever produced the evidence. This module
 does not verify OCSP responder signatures (that needs its own delegated-responder
 path validation) or CRL signatures (that needs the CRL issuer's key). With
@@ -84,9 +104,17 @@ path validation) or CRL signatures (that needs the CRL issuer's key). With
 a completed check, so a peer cannot manufacture a "good" status by stapling
 bytes nobody authenticated. Turning it off is a deliberate downgrade.
 
-A *revoked* assertion is honored even when unverified or stale. The only party
-who can supply attacker-chosen stapled bytes is the peer being authenticated,
-and a peer revoking itself is not a threat; ignoring a stale revocation would be.
+One narrow exception: a **peer-stapled** `revoked` is honored unverified. The
+only party who can supply attacker-chosen stapled bytes is the peer being
+authenticated, and a peer revoking itself is not a threat. Evidence from a
+fetched responder or a CRL gets no such exception — trusting an unauthenticated
+`revoked` there would let an on-path attacker deny service with one forged
+response.
+
+Revocation is otherwise monotonic, so staleness does not rehabilitate it — with
+one exception in the other direction: RFC 5280 §5.3.1 allows `certificateHold`
+to be released via `removeFromCRL`, so a *stale* hold does not outrank fresher
+evidence of that release.
 
 ### Freshness
 
@@ -120,13 +148,22 @@ status evidence is supplied by the caller. A future fetch-and-cache provider
 implements `revocation.Provider` and runs *before* validation:
 
 ```zig
-var evidence = try provider.collect(allocator, .{
+var collected = try provider.collect(allocator, .{
     .path = candidate_path,
     .validation_time = now,
     .stapled = stapled_from_handshake,
 });
-policy.revocation_evidence = evidence;
+defer collected.deinit(allocator);
+policy.revocation_evidence = collected.evidence();
 ```
+
+`collect` returns a `CollectedEvidence` that **owns** its assertion array,
+allocated per call with the caller's allocator. That is deliberate: a real
+provider composes each result from stapled data plus cache and CRL lookups, and
+a single provider-owned scratch buffer would alias across concurrent handshakes
+while an unreleasable per-call array would grow without bound. Only the encoded
+`raw` blobs may borrow longer-lived cache storage, which must outlive the
+validation.
 
 That is the whole seam. Adding OCSP fetching, a response cache, or a CRL-set
 distribution channel changes no signature in the TLS handshake or in
@@ -170,6 +207,7 @@ tightening the mode.
 | `revocation_status_unauthenticated` | nobody verified the responder or CRL signature |
 | `revocation_must_staple_not_satisfied` | RFC 7633 assertion unmet |
 | `revocation_source_unsupported` | certificate publishes no revocation mechanism |
+| `tls_feature_constraint_violation` | child does not assert its issuer's TLS Feature set (RFC 7633 §4.2.2) |
 | `revocation_evidence_invalid` | evidence filed against a certificate not in the path |
 | `revocation_resource_limit_exceeded` | evidence exceeded the configured bounds |
 

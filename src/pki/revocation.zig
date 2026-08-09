@@ -12,9 +12,14 @@
 //! Online revocation fetching is not implemented yet. Rather than leave the
 //! question undefined, the policy is explicit and the default (`Mode.disabled`)
 //! says so in the result: every entry is `not_checked_policy_disabled`, and a
-//! must-staple certificate accepted under it sets `Report.must_staple_unenforced`.
-//! An operator can therefore tell a "no revocation check happened" acceptance
-//! from a "status was checked and is good" acceptance.
+//! must-staple certificate accepted under it reports
+//! `MustStapleOutcome.unenforced_status_disabled`. An operator can therefore
+//! tell a "no revocation check happened" acceptance from a "status was checked
+//! and is good" acceptance.
+//!
+//! Disabled also never *rejects*. A caller running with revocation off must not
+//! be able to fail a handshake because a peer attached oversized or misfiled
+//! status data, so evidence is not even examined in that mode.
 //!
 //! A future OCSP/CRL fetch-and-cache provider produces `StatusAssertion`
 //! values before validation runs — see `Provider`. That keeps network I/O,
@@ -30,9 +35,18 @@
 //! CRL issuer's key. With `Configuration.require_signature_verified` (the
 //! default), unverified evidence never counts as a completed check — a peer
 //! cannot manufacture a "good" status by stapling bytes nobody authenticated.
-//! A *revoked* assertion is honored even when unverified: the only party that
-//! can supply attacker-chosen stapled bytes is the peer being authenticated,
-//! and revoking itself is not an attack worth defending against.
+//!
+//! One narrow exception: a *peer-stapled* `revoked` is honored unverified,
+//! because the only party who can supply attacker-chosen stapled bytes is the
+//! peer being authenticated, and revoking itself is not an attack. Evidence
+//! from a fetched responder or a CRL gets no such exception — trusting an
+//! unauthenticated `revoked` there would let an on-path attacker deny service
+//! with one forged response.
+//!
+//! Assertions are bound to a certificate by `CertificateIdentity`, not by
+//! position, so evidence gathered for one candidate path can never be applied
+//! to a different certificate that happens to sit at the same index in an
+//! alternate or cross-signed candidate.
 
 const std = @import("std");
 const path_builder = @import("path_builder.zig");
@@ -92,12 +106,42 @@ pub const Defect = enum {
     responder_error,
 };
 
+/// Which certificate a status assertion is about, independent of where that
+/// certificate sits in any particular candidate path.
+///
+/// Position alone is not an identity: `validateCandidates` offers one evidence
+/// set to every candidate, and cross-signed or alternate paths routinely carry
+/// *different* certificates at the same index. Binding to the exact DER means
+/// evidence gathered for one candidate can never be consumed by another.
+pub const CertificateIdentity = struct {
+    /// SHA-256 over the certificate's exact DER encoding.
+    digest: [32]u8,
+
+    pub fn of(certificate: *const x509.Certificate) CertificateIdentity {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(certificate.raw, &digest, .{});
+        return .{ .digest = digest };
+    }
+
+    pub fn eql(self: CertificateIdentity, other: CertificateIdentity) bool {
+        return std.mem.eql(u8, &self.digest, &other.digest);
+    }
+
+    pub fn matches(self: CertificateIdentity, certificate: *const x509.Certificate) bool {
+        return self.eql(CertificateIdentity.of(certificate));
+    }
+};
+
 /// One certificate-status assertion supplied by the caller. Timestamps are
 /// Unix seconds on the same scale as `validation_time`; all are optional
 /// because CRL sets and cache entries do not all carry every field.
 pub const StatusAssertion = struct {
     /// Leaf-first index of the certificate this assertion covers.
     certificate_index: usize,
+    /// The certificate this assertion is about. An assertion whose identity
+    /// does not match the certificate at `certificate_index` in the path being
+    /// validated is ignored, never applied by position.
+    certificate: CertificateIdentity,
     source: Source,
     status: Status = .unknown,
     /// Set when the evidence could not be interpreted. A defective assertion
@@ -121,9 +165,12 @@ pub const Evidence = struct {
     /// Borrowed for the evaluation call.
     assertions: []const StatusAssertion = &.{},
 
-    pub fn stapledFor(self: Evidence, certificate_index: usize) ?*const StatusAssertion {
+    /// The stapled assertion bound to `certificate`, if the caller supplied
+    /// one. Identity, not position, decides the match.
+    pub fn stapledFor(self: Evidence, certificate: *const x509.Certificate) ?*const StatusAssertion {
+        const identity = CertificateIdentity.of(certificate);
         for (self.assertions) |*assertion| {
-            if (assertion.source == .stapled_ocsp and assertion.certificate_index == certificate_index) {
+            if (assertion.source == .stapled_ocsp and assertion.certificate.eql(identity)) {
                 return assertion;
             }
         }
@@ -194,14 +241,30 @@ pub const Entry = struct {
     must_staple: bool = false,
 };
 
+/// What became of an RFC 7633 must-staple assertion on this path. Both
+/// unenforced states are reported distinctly, so an acceptance never reads as
+/// "the assertion was honored" when it was merely not applied.
+pub const MustStapleOutcome = enum {
+    /// No certificate on the path asserts must-staple.
+    not_required,
+    /// Asserted, and satisfied by a stapled good status.
+    enforced,
+    /// Asserted, but the mode consults no status at all.
+    unenforced_status_disabled,
+    /// Asserted, but `Configuration.enforce_must_staple` is off.
+    unenforced_by_configuration,
+
+    pub fn isUnenforced(self: MustStapleOutcome) bool {
+        return self == .unenforced_status_disabled or self == .unenforced_by_configuration;
+    }
+};
+
 /// The status evidence that was actually consulted for an accepted path.
 pub const Report = struct {
     mode: Mode,
     /// Owned, leaf-first, one entry per non-anchor certificate.
     entries: []const Entry,
-    /// A must-staple certificate was accepted without the assertion being
-    /// enforced, because status checking is disabled.
-    must_staple_unenforced: bool,
+    must_staple: MustStapleOutcome,
 
     pub fn deinit(self: *Report, allocator: std.mem.Allocator) void {
         allocator.free(self.entries);
@@ -256,11 +319,29 @@ pub const Outcome = union(enum) {
     rejected: Failure,
 };
 
+/// One collection's evidence plus the storage that backs it.
+///
+/// The assertion array is allocated per call with the caller's allocator and
+/// released by `deinit`, so two handshakes can collect concurrently without
+/// aliasing a provider-owned scratch buffer, and a provider never has to retain
+/// per-call arrays until teardown. Only the encoded `raw` blobs may borrow
+/// longer-lived provider or cache storage; those must outlive the validation.
+pub const CollectedEvidence = struct {
+    owned_assertions: []StatusAssertion,
+
+    pub fn evidence(self: *const CollectedEvidence) Evidence {
+        return .{ .assertions = self.owned_assertions };
+    }
+
+    pub fn deinit(self: *CollectedEvidence, allocator: std.mem.Allocator) void {
+        allocator.free(self.owned_assertions);
+        self.* = undefined;
+    }
+};
+
 /// Interface for a future fetch-and-cache status provider. Implementations run
-/// *before* validation and hand back evidence; the validator itself never
-/// calls one, which is what keeps ambient network I/O out of path validation.
-/// The returned assertions borrow storage the implementation owns and must
-/// outlive the validation call.
+/// *before* validation and hand back evidence; the validator itself never calls
+/// one, which is what keeps ambient network I/O out of path validation.
 pub const Provider = struct {
     context: *const anyopaque,
     vtable: *const VTable,
@@ -279,14 +360,17 @@ pub const Provider = struct {
             context: *const anyopaque,
             allocator: std.mem.Allocator,
             request: Request,
-        ) error{OutOfMemory}!Evidence,
+        ) error{OutOfMemory}!CollectedEvidence,
     };
 
+    /// Collect status evidence for one path. The result owns its assertion
+    /// array; release it with `CollectedEvidence.deinit` and the same allocator
+    /// once validation is done with it.
     pub fn collect(
         self: Provider,
         allocator: std.mem.Allocator,
         request: Request,
-    ) error{OutOfMemory}!Evidence {
+    ) error{OutOfMemory}!CollectedEvidence {
         return self.vtable.collect(self.context, allocator, request);
     }
 };
@@ -308,32 +392,11 @@ pub fn evaluatePath(
     }
     const certificate_count = path.elements.len - 1;
 
-    if (evidence.assertions.len > config.limits.maximum_assertions) {
-        return .{ .rejected = .{ .reason = .resource_limit_exceeded, .certificate_index = null } };
-    }
-    for (evidence.assertions) |assertion| {
-        if (assertion.raw.len > config.limits.maximum_evidence_bytes) {
-            return .{ .rejected = .{
-                .reason = .resource_limit_exceeded,
-                .certificate_index = assertion.certificate_index,
-                .source = assertion.source,
-            } };
-        }
-        if (assertion.certificate_index >= certificate_count) {
-            return .{ .rejected = .{
-                .reason = .evidence_index_invalid,
-                .certificate_index = assertion.certificate_index,
-                .source = assertion.source,
-            } };
-        }
-    }
-
-    // RFC 7633 §4.2.3: a CA asserting the feature obliges the certificates it
-    // issues, so any must-staple assertion in the path binds the leaf.
-    var must_staple_required = false;
-    for (path.elements[0..certificate_count]) |element| {
-        if (element.certificate.mustStaple()) must_staple_required = true;
-    }
+    // RFC 7633 must-staple is an end-entity property. The issuer-side form of
+    // the extension is a *constraint on what the child must contain*, enforced
+    // during path validation (`path_validator.checkTlsFeatureConstraints`), not
+    // an assertion that propagates down as a stapling obligation of its own.
+    const must_staple_required = path.elements[0].certificate.mustStaple();
 
     const entries = allocator.alloc(Entry, certificate_count) catch {
         return .{ .rejected = .{ .reason = .out_of_memory, .certificate_index = null } };
@@ -347,16 +410,42 @@ pub fn evaluatePath(
         };
     }
 
+    // Disabled consults nothing, and that has to include *rejecting* on
+    // evidence: a caller running with revocation off must not be able to fail
+    // a handshake because a peer attached oversized or misfiled status data.
     if (config.mode == .disabled) {
         return .{ .accepted = .{
             .mode = config.mode,
             .entries = entries,
-            .must_staple_unenforced = must_staple_required,
+            .must_staple = if (must_staple_required) .unenforced_status_disabled else .not_required,
         } };
     }
 
+    if (evidence.assertions.len > config.limits.maximum_assertions) {
+        allocator.free(entries);
+        return .{ .rejected = .{ .reason = .resource_limit_exceeded, .certificate_index = null } };
+    }
+    for (evidence.assertions) |assertion| {
+        if (assertion.raw.len > config.limits.maximum_evidence_bytes) {
+            allocator.free(entries);
+            return .{ .rejected = .{
+                .reason = .resource_limit_exceeded,
+                .certificate_index = assertion.certificate_index,
+                .source = assertion.source,
+            } };
+        }
+        if (assertion.certificate_index >= certificate_count) {
+            allocator.free(entries);
+            return .{ .rejected = .{
+                .reason = .evidence_index_invalid,
+                .certificate_index = assertion.certificate_index,
+                .source = assertion.source,
+            } };
+        }
+    }
+
     for (path.elements[0..certificate_count], 0..) |element, certificate_index| {
-        const selection = select(evidence, certificate_index, config, validation_time);
+        const selection = select(evidence, element.certificate, certificate_index, config, validation_time);
         var entry = &entries[certificate_index];
         entry.source = selection.source;
         entry.defect = selection.defect;
@@ -371,26 +460,32 @@ pub fn evaluatePath(
         }
     }
 
-    if (must_staple_required and config.enforce_must_staple) {
-        const leaf_entry = entries[0];
-        const satisfied = leaf_entry.source == .stapled_ocsp and
-            leaf_entry.determination == .checked_good;
-        if (!satisfied) {
-            const failure = Failure{
-                .reason = .must_staple_not_satisfied,
-                .certificate_index = 0,
-                .source = leaf_entry.source,
-                .defect = leaf_entry.defect,
-            };
-            allocator.free(entries);
-            return .{ .rejected = failure };
+    var must_staple: MustStapleOutcome = .not_required;
+    if (must_staple_required) {
+        if (!config.enforce_must_staple) {
+            must_staple = .unenforced_by_configuration;
+        } else {
+            const leaf_entry = entries[0];
+            const satisfied = leaf_entry.source == .stapled_ocsp and
+                leaf_entry.determination == .checked_good;
+            if (!satisfied) {
+                const failure = Failure{
+                    .reason = .must_staple_not_satisfied,
+                    .certificate_index = 0,
+                    .source = leaf_entry.source,
+                    .defect = leaf_entry.defect,
+                };
+                allocator.free(entries);
+                return .{ .rejected = failure };
+            }
+            must_staple = .enforced;
         }
     }
 
     return .{ .accepted = .{
         .mode = config.mode,
         .entries = entries,
-        .must_staple_unenforced = false,
+        .must_staple = must_staple,
     } };
 }
 
@@ -409,12 +504,17 @@ const Selection = struct {
 
 /// Choose the assertion that decides this certificate.
 ///
-/// Revoked wins over everything, from any consulted source, so that a second
-/// source cannot launder a revocation away. Otherwise the highest-precedence
-/// source with a usable answer decides; when nothing is usable, the
-/// highest-precedence blocked assertion is reported so the operator learns why.
+/// A usable revocation wins over everything, so a second source cannot launder
+/// one away. Otherwise the highest-precedence source with a usable answer
+/// decides; when nothing is usable, the highest-precedence blocked assertion is
+/// reported so the operator learns why.
+///
+/// Assertions are matched by certificate identity, not by position: the same
+/// evidence set is offered to every candidate path, and an alternate candidate
+/// with a different certificate at this index must not inherit it.
 fn select(
     evidence: Evidence,
+    certificate: *const x509.Certificate,
     certificate_index: usize,
     config: Configuration,
     validation_time: i64,
@@ -423,9 +523,11 @@ fn select(
     var best_rank: usize = std.math.maxInt(usize);
     var blocked: Selection = .{};
     var blocked_rank: usize = std.math.maxInt(usize);
+    const identity = CertificateIdentity.of(certificate);
 
     for (evidence.assertions) |assertion| {
         if (assertion.certificate_index != certificate_index) continue;
+        if (!assertion.certificate.eql(identity)) continue;
         if (!consults(config.mode, assertion.source)) continue;
 
         const candidate = Selection{
@@ -449,22 +551,47 @@ fn select(
             continue;
         }
 
-        // Revocation is honored even from stale or unauthenticated evidence:
-        // ignoring it could only ever help a certificate its own issuer has
-        // withdrawn. See the trust-boundary note at the top of this file.
-        if (assertion.status == .revoked) {
-            var revoked = candidate;
-            revoked.status = .revoked;
-            return revoked;
-        }
-
-        if (config.require_signature_verified and !assertion.signature_verified) {
+        // Authentication comes before any status is trusted, with one narrow
+        // exception: a *peer-stapled* revocation. The only party who can supply
+        // attacker-chosen stapled bytes is the peer being authenticated, so
+        // honoring its self-revocation costs nothing. Evidence from a fetched
+        // OCSP responder or a CRL is a different matter — trusting an
+        // unauthenticated `revoked` there would hand an on-path attacker a
+        // one-packet denial of service.
+        const self_stapled_revocation =
+            assertion.source == .stapled_ocsp and assertion.status == .revoked;
+        if (config.require_signature_verified and
+            !assertion.signature_verified and
+            !self_stapled_revocation)
+        {
             const rank = sourceRank(assertion.source);
             if (rank < blocked_rank) {
                 blocked_rank = rank;
                 blocked = candidate;
                 blocked.status = null;
                 blocked.blocker = .unauthenticated;
+            }
+            continue;
+        }
+
+        if (assertion.status == .revoked) {
+            // Revocation is otherwise monotonic, so staleness does not
+            // rehabilitate it — except for certificateHold, which RFC 5280
+            // §5.3.1 explicitly allows to be released via removeFromCRL. A
+            // stale hold must not outrank fresher evidence of that release.
+            const releasable_hold = assertion.revocation_reason == .certificate_hold and
+                !isFresh(assertion, config.freshness, validation_time);
+            if (!releasable_hold) {
+                var revoked = candidate;
+                revoked.status = .revoked;
+                return revoked;
+            }
+            const rank = sourceRank(assertion.source);
+            if (rank < blocked_rank) {
+                blocked_rank = rank;
+                blocked = candidate;
+                blocked.status = null;
+                blocked.blocker = .stale;
             }
             continue;
         }
@@ -603,35 +730,41 @@ test "freshness bounds accept only evidence inside the stated window" {
     const freshness = Freshness{};
     try testing.expect(isFresh(.{
         .certificate_index = 0,
+        .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now - 60,
         .next_update = now + 3600,
     }, freshness, now));
     try testing.expect(!isFresh(.{
         .certificate_index = 0,
+        .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now - 60,
         .next_update = now - 3600,
     }, freshness, now));
     try testing.expect(!isFresh(.{
         .certificate_index = 0,
+        .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now + 3600,
         .next_update = now + 7200,
     }, freshness, now));
     try testing.expect(!isFresh(.{
         .certificate_index = 0,
+        .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now - 60,
     }, freshness, now));
     try testing.expect(!isFresh(.{
         .certificate_index = 0,
+        .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .next_update = now + 3600,
     }, freshness, now));
     // nextUpdate before thisUpdate is incoherent regardless of the window.
     try testing.expect(!isFresh(.{
         .certificate_index = 0,
+        .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now - 60,
         .next_update = now - 120,
@@ -643,6 +776,7 @@ test "clock skew is applied on both sides of the window" {
     const freshness = Freshness{ .clock_skew_seconds = 300 };
     try testing.expect(isFresh(.{
         .certificate_index = 0,
+        .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now + 200,
         .next_update = now + 3600,
@@ -650,6 +784,7 @@ test "clock skew is applied on both sides of the window" {
     // Expired by less than the skew allowance is still usable.
     try testing.expect(isFresh(.{
         .certificate_index = 0,
+        .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now - 400,
         .next_update = now - 200,

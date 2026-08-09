@@ -276,6 +276,9 @@ fn tardigradeFailureReason(reason: pki.path_validator.FailureReason) Reason {
         .revocation_resource_limit_exceeded,
         .out_of_memory,
         => .resource_limit,
+        // RFC 7633 TLS Feature chain constraints are enforced by Tardigrade
+        // and by neither oracle, so there is no comparable classification.
+        .tls_feature_constraint_violation,
         // The differential harness validates with certificate-status policy
         // disabled, so no revocation verdict is comparable against OpenSSL or
         // Go here. Reaching one would be a harness bug, and an unclassified

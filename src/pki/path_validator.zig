@@ -92,6 +92,7 @@ pub const FailureReason = enum {
     policy_constraints_invalid,
     inhibit_any_policy_invalid,
     certificate_policy_resource_limit_exceeded,
+    tls_feature_constraint_violation,
     certificate_revoked,
     revocation_status_unavailable,
     revocation_status_stale,
@@ -236,6 +237,10 @@ pub fn validatePath(
         if (!usage.digital_signature) return rejectOid(.key_usage_violation, 0, &wk.key_usage);
     }
 
+    if (checkTlsFeatureConstraints(path)) |validation_failure| {
+        return .{ .rejected = validation_failure };
+    }
+
     if (policy.require_server_auth_eku) {
         // A present EKU restricts every non-anchor certificate in the path;
         // absence is unrestricted. Trust-anchor purpose is configuration.
@@ -371,6 +376,39 @@ fn checkStructure(path: path_builder.Path, policy: ValidationPolicy) ?Validation
         }
     }
     return null;
+}
+
+/// RFC 7633 §4.2.2: a certificate-signing certificate carrying the TLS Feature
+/// extension constrains what it signs — every certificate it issues must assert
+/// the same feature set or a superset of it. This is a chain constraint on the
+/// extension's contents, not a stapling obligation that propagates downward:
+/// the operational must-staple requirement is read from the end-entity
+/// certificate, after this constraint holds (see `revocation.zig`).
+///
+/// The terminal trust anchor is excluded for the same reason its other
+/// extensions are: anchor restrictions are local trust configuration.
+fn checkTlsFeatureConstraints(path: path_builder.Path) ?ValidationFailure {
+    const anchor_index = path.elements.len - 1;
+    for (path.elements[1..anchor_index], 1..) |issuer, issuer_index| {
+        const required = issuer.certificate.tlsFeatures() orelse continue;
+        const child_index = issuer_index - 1;
+        const child = path.elements[child_index].certificate.tlsFeatures() orelse
+            return tlsFeatureFailure(child_index, issuer_index);
+        for (required.features) |feature| {
+            if (!child.contains(feature)) return tlsFeatureFailure(child_index, issuer_index);
+        }
+    }
+    return null;
+}
+
+fn tlsFeatureFailure(certificate_index: usize, issuer_index: usize) ValidationFailure {
+    return .{
+        .reason = .tls_feature_constraint_violation,
+        .certificate_index = certificate_index,
+        // Compile-time well-known OID, below the fixed component bound.
+        .extension_oid = oid.ObjectIdentifier.fromComponents(&wk.tls_feature) catch unreachable,
+        .constraint_certificate_index = issuer_index,
+    };
 }
 
 fn checkExtensions(certificate: *const x509.Certificate, certificate_index: usize) ?ValidationFailure {
