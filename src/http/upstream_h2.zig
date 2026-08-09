@@ -43,11 +43,13 @@ fn nowMs() u64 {
 }
 
 const DEFAULT_MAX_FRAME: usize = 16_384;
-/// Receive window we advertise per stream (SETTINGS_INITIAL_WINDOW_SIZE). For
-/// streaming streams this doubles as the bounded per-stream buffer: the reader
-/// stops replenishing it, so a well-behaved peer can have at most this many
-/// unconsumed bytes buffered per stream.
-const OUR_INITIAL_WINDOW: u31 = 1 << 20;
+/// Receive window we advertise per stream (SETTINGS_INITIAL_WINDOW_SIZE) when
+/// no per-stream buffer policy is configured. For streaming streams this
+/// doubles as the bounded per-stream buffer: the reader stops replenishing it,
+/// so a well-behaved peer can have at most this many unconsumed bytes buffered
+/// per stream. Production connections derive the window from
+/// `proxy_buffer_account.streamReceiveWindow` instead (#140).
+pub const DEFAULT_STREAM_RECV_WINDOW: u31 = 1 << 20;
 /// HTTP/2 default initial flow-control window for a peer that sent no SETTINGS.
 const PROTOCOL_DEFAULT_WINDOW: i64 = 65_535;
 /// Grow the connection-level receive window to this at connection start so the
@@ -85,8 +87,15 @@ pub const Request = struct {
     /// Whether `body` is the complete outbound request body or the first bytes
     /// of a request body that will continue through streaming DATA writes.
     body_mode: BodyMode = .complete,
-    proxy_buffer_limits: ?proxy_buffer_account.Limits = null,
+    /// Account this stream's queued response body against the connection's
+    /// pinned buffer policy. The policy itself is never supplied per request:
+    /// it must match the receive window the connection already advertised.
+    proxy_buffer_accounting: bool = false,
     proxy_buffer_observer: ?proxy_buffer_account.Observer = null,
+    /// Aggregate (origin/global) scopes this stream's queued response bytes are
+    /// reserved against, so many concurrent slow streams cannot multiply the
+    /// per-stream bound. Only consulted alongside `proxy_buffer_accounting`.
+    proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity = .{},
 };
 
 pub const BodyMode = enum {
@@ -183,7 +192,7 @@ pub fn exchange(
     try transport.writeAll(PREFACE);
     try frame.writeSettings(allocator, transport, &[_][2]u32{
         .{ 0x2, 0 }, // SETTINGS_ENABLE_PUSH = 0
-        .{ 0x4, @as(u32, OUR_INITIAL_WINDOW) }, // SETTINGS_INITIAL_WINDOW_SIZE
+        .{ 0x4, @as(u32, DEFAULT_STREAM_RECV_WINDOW) }, // SETTINGS_INITIAL_WINDOW_SIZE
     });
 
     // 2. Request HEADERS (pseudo-headers first), then DATA.
@@ -468,37 +477,109 @@ pub const Stream = struct {
     /// read only by the owning worker thread.
     wire_opened: bool = false,
     local_abort: bool = false,
+    /// Set once the reader has emitted RST_STREAM for a locally aborted stream,
+    /// so `finishStreaming` does not send a second one.
+    rst_sent: bool = false,
+    /// Per-stream logical queue length: the bytes a downstream consumer has not
+    /// taken yet. Drives the high/low watermark hysteresis.
     proxy_body_account: ?proxy_buffer_account.Account = null,
     proxy_buffer_observer: ?proxy_buffer_account.Observer = null,
+    /// Aggregate scopes backing this stream's queue.
+    proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity = .{},
+    /// Bytes currently reserved at the aggregate scopes. This tracks `body`'s
+    /// **retained allocation**, not its logical length: an ArrayList that has
+    /// been drained still owns its backing memory, and retained memory is what
+    /// an aggregate limit is meant to bound. The queue's storage is freed (and
+    /// this reservation returned in full) as soon as it drains empty.
+    proxy_capacity_reserved: usize = 0,
+    /// Downstream-consumed bytes not yet credited back to the peer as stream
+    /// flow control. While the queue sits above its high watermark, credit is
+    /// withheld and accumulates here; it is released as one WINDOW_UPDATE when
+    /// the queue drains below the low watermark. This is the pause/resume
+    /// hysteresis — crediting every consumed chunk would let the peer refill
+    /// immediately and the band would never do anything.
+    pending_window_credit: usize = 0,
 
     fn destroy(self: *Stream, allocator: std.mem.Allocator) void {
         self.releaseQueuedBodyAccounting();
+        self.releaseRetainedStorage();
         freeHeaderList(allocator, &self.headers);
         self.body.deinit(allocator);
         allocator.destroy(self);
     }
 
-    fn recordQueuedBody(self: *Stream, bytes: usize) !void {
-        if (self.proxy_body_account) |*account| {
-            const before = account.snapshot();
-            account.reserve(bytes) catch |err| {
-                const after = account.snapshot();
+    /// True while the queue is in the pause band: it reached the high watermark
+    /// and has not yet drained back below the low one. Streams with no
+    /// accounting policy never pause.
+    fn aboveHighWatermark(self: *const Stream) bool {
+        const account = self.proxy_body_account orelse return false;
+        return account.snapshot().above_high_watermark;
+    }
+
+    fn accountDirection(self: *const Stream) proxy_buffer_account.Direction {
+        return if (self.proxy_body_account) |account| account.direction else .upstream_to_downstream;
+    }
+
+    /// Take ownership of `payload` on this stream's queue, reserving at every
+    /// scope *before* any memory is committed. Aggregate scopes are charged for
+    /// the queue's retained allocation, so the reservation only grows when the
+    /// queue's storage does; the per-stream account tracks the logical length
+    /// that drives the watermarks. Either reservation failing leaves the stream
+    /// exactly as it was — no bytes queued, no scope charged.
+    fn enqueueBody(self: *Stream, allocator: std.mem.Allocator, payload: []const u8) !void {
+        const account = if (self.proxy_body_account) |*a| a else {
+            try self.body.appendSlice(allocator, payload);
+            return;
+        };
+        const direction = account.direction;
+
+        // Grow the aggregate reservation to cover the storage this append will
+        // retain. Allocating precisely keeps `capacity == reserved`, so the
+        // aggregates never undercount an ArrayList's amortised over-allocation.
+        const needed_capacity = std.math.add(usize, self.body.items.len, payload.len) catch return error.BufferLimitExceeded;
+        var capacity_delta: usize = 0;
+        if (needed_capacity > self.proxy_capacity_reserved) {
+            capacity_delta = needed_capacity - self.proxy_capacity_reserved;
+            self.proxy_buffer_capacity.reserve(direction, capacity_delta) catch |err| {
                 if (self.proxy_buffer_observer) |observer| {
-                    if (after.limit_exceeded_events > before.limit_exceeded_events) {
-                        observer.recordReservation(account.direction, 0, false, true);
-                    }
+                    observer.recordAggregateLimitExceeded(direction, proxy_buffer_account.aggregateFailureScope(err));
                 }
-                return err;
+                return error.BufferLimitExceeded;
             };
+        }
+        errdefer if (capacity_delta > 0) {
+            self.proxy_buffer_capacity.release(direction, capacity_delta);
+        };
+
+        const before = account.snapshot();
+        account.reserve(payload.len) catch |err| {
             const after = account.snapshot();
             if (self.proxy_buffer_observer) |observer| {
-                observer.recordReservation(
-                    account.direction,
-                    bytes,
-                    after.high_watermark_events > before.high_watermark_events,
-                    after.limit_exceeded_events > before.limit_exceeded_events,
-                );
+                if (after.limit_exceeded_events > before.limit_exceeded_events) {
+                    observer.recordReservation(direction, 0, false, true);
+                }
             }
+            return err;
+        };
+        errdefer account.release(payload.len) catch unreachable;
+
+        try self.body.ensureTotalCapacityPrecise(allocator, needed_capacity);
+        self.body.appendSliceAssumeCapacity(payload);
+        self.proxy_capacity_reserved += capacity_delta;
+
+        const after = account.snapshot();
+        const crossed_high = after.high_watermark_events > before.high_watermark_events;
+        if (self.proxy_buffer_observer) |observer| {
+            observer.recordReservation(
+                direction,
+                payload.len,
+                crossed_high,
+                after.limit_exceeded_events > before.limit_exceeded_events,
+            );
+            // Reaching the high watermark is the moment stream credit stops
+            // flowing, so the pause belongs here rather than at the drain that
+            // eventually clears it.
+            if (crossed_high) observer.recordReadPause(.upstream);
         }
     }
 
@@ -512,7 +593,18 @@ pub const Stream = struct {
         }
     }
 
-    fn compactAcknowledgedBody(self: *Stream, bytes: usize) void {
+    /// Give the queue's backing allocation back once it drains empty, and with
+    /// it the aggregate reservation that covered it. Without this the queue
+    /// would keep its peak allocation for the stream's whole life while the
+    /// aggregate counters read zero — the concurrency multiplication the
+    /// aggregate limits exist to prevent.
+    fn releaseRetainedStorage(self: *Stream) void {
+        if (self.proxy_capacity_reserved == 0) return;
+        self.proxy_buffer_capacity.release(self.accountDirection(), self.proxy_capacity_reserved);
+        self.proxy_capacity_reserved = 0;
+    }
+
+    fn compactAcknowledgedBody(self: *Stream, allocator: std.mem.Allocator, bytes: usize) void {
         if (bytes == 0) return;
         std.debug.assert(bytes <= self.body_read_off);
         std.debug.assert(bytes <= self.body.items.len);
@@ -522,7 +614,13 @@ pub const Stream = struct {
         }
         self.body.shrinkRetainingCapacity(remaining);
         self.body_read_off -= bytes;
-        if (self.body.items.len == 0) self.body_read_off = 0;
+        if (self.body.items.len == 0) {
+            self.body_read_off = 0;
+            // Drained: hand the storage back rather than sitting on the peak
+            // allocation until the stream ends.
+            self.body.clearAndFree(allocator);
+            self.releaseRetainedStorage();
+        }
     }
 
     fn releaseQueuedBodyAccounting(self: *Stream) void {
@@ -545,6 +643,15 @@ pub fn H2Conn(comptime Transport: type) type {
         transport_allocator: ?std.mem.Allocator,
         fd: std.posix.fd_t,
         deadline_ms: u32,
+        /// The per-stream buffer policy pinned at connect time, and the source
+        /// of the SETTINGS_INITIAL_WINDOW_SIZE this connection advertised.
+        /// Pinned rather than read per request because the advertised window is
+        /// a promise: a reload that lowered the hard limit under a peer already
+        /// holding credit would abort a stream that never exceeded what it was
+        /// granted. A reloaded policy therefore applies to connections opened
+        /// afterwards, and every stream here is judged by what was advertised.
+        buffer_limits: proxy_buffer_account.Limits,
+        stream_recv_window: u31,
 
         write_mutex: compat.Mutex = .{},
         state_mutex: compat.Mutex = .{},
@@ -603,16 +710,20 @@ pub fn H2Conn(comptime Transport: type) type {
             transport_allocator: ?std.mem.Allocator,
             rst_counter: ?*std.atomic.Value(u64),
             goaway_counter: ?*std.atomic.Value(u64),
+            buffer_limits: proxy_buffer_account.Limits,
         ) !*Self {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
             const now = nowMs();
+            const stream_recv_window = proxy_buffer_account.streamReceiveWindow(buffer_limits);
             self.* = .{
                 .allocator = allocator,
                 .transport = transport,
                 .transport_allocator = transport_allocator,
                 .fd = fd,
                 .deadline_ms = deadline_ms,
+                .buffer_limits = buffer_limits,
+                .stream_recv_window = stream_recv_window,
                 .decoder = hpack.Decoder.init(),
                 .streams = std.AutoHashMap(u31, *Stream).init(allocator),
                 .created_ms = now,
@@ -624,7 +735,7 @@ pub fn H2Conn(comptime Transport: type) type {
             try self.transport.writeAll(PREFACE);
             try frame.writeSettings(allocator, self.transport, &[_][2]u32{
                 .{ 0x2, 0 }, // ENABLE_PUSH = 0
-                .{ 0x4, @as(u32, OUR_INITIAL_WINDOW) },
+                .{ 0x4, @as(u32, stream_recv_window) },
             });
             // Grow the connection-level receive window once up front; the
             // reader keeps it topped up per DATA frame afterwards.
@@ -747,9 +858,12 @@ pub fn H2Conn(comptime Transport: type) type {
         pub fn openStreaming(self: *Self, req: Request) !*Stream {
             const stream = try self.beginStream(true);
             errdefer self.finishStreaming(stream);
-            if (req.proxy_buffer_limits) |limits| {
-                stream.proxy_body_account = proxy_buffer_account.Account.init(.upstream_to_downstream, .stream, limits);
+            if (req.proxy_buffer_accounting) {
+                // The connection's pinned policy, not a caller snapshot: the
+                // stream is judged by exactly the window it advertised.
+                stream.proxy_body_account = proxy_buffer_account.Account.init(.upstream_to_downstream, .stream, self.buffer_limits);
                 stream.proxy_buffer_observer = req.proxy_buffer_observer;
+                stream.proxy_buffer_capacity = req.proxy_buffer_capacity;
             }
             try self.sendRequest(stream, req);
             return stream;
@@ -767,8 +881,17 @@ pub fn H2Conn(comptime Transport: type) type {
             stream.wait_deadline_ms = 0;
             const stream_err: ?anyerror = if (stream.err != null) stream.err else self.conn_err;
             const status = stream.status;
+            // The reader can decode HEADERS and then reject DATA before this
+            // worker ever writes the head downstream. Reporting success there
+            // would commit the origin's status and force a truncation, when
+            // nothing has reached the client yet and the caller can still
+            // choose a clean pre-commitment status.
+            const aborted_locally = stream.local_abort;
             self.state_mutex.unlock();
 
+            if (aborted_locally) {
+                if (stream_err) |e| return e;
+            }
             if (status != null) return;
             if (stream_err) |e| return e;
             return error.Http2MissingStatus;
@@ -837,14 +960,36 @@ pub fn H2Conn(comptime Transport: type) type {
         pub fn acknowledgeStreamingBody(self: *Self, stream: *Stream, bytes: usize) void {
             if (bytes == 0) return;
             self.state_mutex.lock();
+            const was_above_high = stream.aboveHighWatermark();
             stream.releaseQueuedBody(bytes);
-            stream.compactAcknowledgedBody(bytes);
-            stream.recv_window += @as(i64, @intCast(bytes));
-            const replenish = !stream.done;
+            stream.compactAcknowledgedBody(self.allocator, bytes);
+            const still_above_high = stream.aboveHighWatermark();
+
+            // Hysteresis (#140): while the queue sits above its high watermark
+            // the peer gets no new credit, so it stops sending instead of
+            // refilling whatever the consumer just drained. Credit accumulates
+            // and is released as a single WINDOW_UPDATE when the queue falls
+            // below the low watermark.
+            stream.pending_window_credit += bytes;
+            var credit: usize = 0;
+            if (!still_above_high) {
+                credit = stream.pending_window_credit;
+                stream.pending_window_credit = 0;
+                stream.recv_window += @as(i64, @intCast(credit));
+            }
+            const resumed = was_above_high and !still_above_high;
+            const observer = stream.proxy_buffer_observer;
+            const replenish = !stream.done and credit > 0;
             const id = stream.id;
             self.state_mutex.unlock();
+
+            // The pause is recorded where credit stops (`enqueueBody`); this is
+            // where it starts flowing again.
+            if (resumed) {
+                if (observer) |obs| obs.recordReadResume(.upstream);
+            }
             if (replenish) {
-                const inc = windowIncrement(bytes);
+                const inc = windowIncrement(credit);
                 self.writeControl(.window_update, 0, id, &inc);
             }
         }
@@ -858,7 +1003,10 @@ pub fn H2Conn(comptime Transport: type) type {
             self.state_mutex.lock();
             const removed = self.streams.remove(stream.id);
             if (removed and self.active_streams > 0) self.active_streams -= 1;
-            const need_rst = stream.wire_opened and (stream.err == null or stream.local_abort) and !stream.done and self.conn_err == null;
+            // `rst_sent` means the reader already cancelled this stream when it
+            // hit a hard limit; a second RST would be redundant.
+            const need_rst = stream.wire_opened and !stream.rst_sent and
+                (stream.err == null or stream.local_abort) and !stream.done and self.conn_err == null;
             const id = stream.id;
             self.state_mutex.unlock();
             self.last_activity_ms.store(nowMs(), .monotonic);
@@ -886,7 +1034,7 @@ pub fn H2Conn(comptime Transport: type) type {
                 .id = id,
                 .send_window = self.peer_initial_window,
                 .streaming = streaming,
-                .recv_window = if (streaming) @as(i64, OUR_INITIAL_WINDOW) else 0,
+                .recv_window = if (streaming) @as(i64, self.stream_recv_window) else 0,
             };
             try self.streams.put(id, stream);
             self.active_streams += 1;
@@ -1199,8 +1347,15 @@ pub fn H2Conn(comptime Transport: type) type {
             const maybe_stream = self.streams.get(fr.stream_id);
             var replenish_stream = false;
             var flow_violation = false;
+            var reset_stream = false;
             if (maybe_stream) |s| {
                 var deliver = fr.payload.len > 0;
+                // A stream we already gave up on is discard-only. Without this,
+                // later DATA could reserve again once another stream drained
+                // capacity free, re-queue bytes behind an error the consumer
+                // has not observed yet, and re-count the limit event on every
+                // frame while the worker is blocked on a slow downstream write.
+                if (s.local_abort or s.err != null) deliver = false;
                 if (deliver and s.streaming) {
                     // Bounded-buffer backpressure: account the bytes against
                     // the advertised stream window; the consumer replenishes
@@ -1218,21 +1373,24 @@ pub fn H2Conn(comptime Transport: type) type {
                     replenish_stream = true;
                 }
                 if (deliver) {
-                    s.recordQueuedBody(fr.payload.len) catch |err| {
-                        if (err == error.BufferLimitExceeded) {
+                    s.enqueueBody(self.allocator, fr.payload) catch |err| switch (err) {
+                        // Local capacity is exhausted at some scope. Make the
+                        // stream terminal here and now: reset it upstream so
+                        // the origin stops sending, and leave it discard-only
+                        // for any DATA already in flight.
+                        error.BufferLimitExceeded => {
                             if (s.err == null) s.err = err;
                             s.local_abort = true;
+                            if (!s.rst_sent and s.wire_opened) {
+                                s.rst_sent = true;
+                                reset_stream = true;
+                            }
                             deliver = false;
-                        } else {
+                        },
+                        else => {
                             self.state_mutex.unlock();
                             return err;
-                        }
-                    };
-                }
-                if (deliver) {
-                    s.body.appendSlice(self.allocator, fr.payload) catch {
-                        self.state_mutex.unlock();
-                        return error.OutOfMemory;
+                        },
                     };
                 }
                 if (end_stream) s.done = true;
@@ -1244,6 +1402,10 @@ pub fn H2Conn(comptime Transport: type) type {
             self.state_mutex.unlock();
             // Send-window waiters block on the connection cond.
             if (flow_violation) self.cond.broadcast();
+            if (reset_stream) {
+                const cancel_code = [4]u8{ 0, 0, 0, 8 }; // CANCEL
+                self.writeControl(.rst_stream, 0, fr.stream_id, &cancel_code);
+            }
 
             if (fr.payload.len > 0) {
                 // Always replenish the connection window promptly — one slow
@@ -1389,6 +1551,11 @@ pub const H2PoolStats = struct {
 pub const H2OriginCounters = struct {
     stream_resets_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     goaway_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Origin-scope proxy buffer reservations (#140). Shared by every stream on
+    /// every connection to this origin, so the origin's queued response bytes
+    /// are bounded no matter how many slow streams it fans out to. Lives as
+    /// long as the entry, which outlives every reader holding a pointer to it.
+    buffer: proxy_buffer_account.Aggregate = proxy_buffer_account.Aggregate.init(.origin, 0),
 };
 
 /// A copy of one origin's identity + h2 metrics for rendering. `origin` is the
@@ -1400,6 +1567,9 @@ pub const H2OriginSnapshot = struct {
     streams_active: u64,
     stream_resets_total: u64,
     goaway_total: u64,
+    /// Response bytes this origin's streams currently hold in h2 stream queues.
+    buffered_bytes: usize,
+    buffer_limit_exceeded_total: u64,
 };
 
 pub fn freeH2OriginSnapshots(allocator: std.mem.Allocator, snaps: []H2OriginSnapshot) void {
@@ -1428,6 +1598,13 @@ pub const H2ConnPool = struct {
         idle_timeout_ms: u64 = 90_000,
         /// Hard cap on total connection age (0 = unlimited).
         max_lifetime_ms: u64 = 0,
+        /// Proxy buffer policy for connections this pool opens (#140). The
+        /// per-stream high watermark becomes each connection's advertised
+        /// SETTINGS_INITIAL_WINDOW_SIZE; the aggregate hard limits are applied
+        /// to the per-origin accounts. Update through
+        /// `H2ConnPool.setProxyBufferLimits`, never by writing this field, so
+        /// existing origins pick the change up too.
+        proxy_buffer_limits: proxy_buffer_account.Limits = proxy_buffer_account.Limits.defaults(),
     };
 
     allocator: std.mem.Allocator,
@@ -1483,10 +1660,46 @@ pub const H2ConnPool = struct {
             const counters = try self.allocator.create(H2OriginCounters);
             errdefer self.allocator.destroy(counters);
             counters.* = .{};
+            // A new origin starts under the policy in force right now, not the
+            // aggregate type's unlimited default.
+            counters.buffer.setHardLimit(self.config.proxy_buffer_limits.per_origin_hard_limit);
             gop.key_ptr.* = try self.allocator.dupe(u8, key);
             gop.value_ptr.* = counters;
         }
         return gop.value_ptr.*;
+    }
+
+    /// The origin-scope buffer aggregate for `key`. Read-only with respect to
+    /// policy: the limit comes from `config.proxy_buffer_limits`, which only
+    /// `setProxyBufferLimits` writes. A request must never push its own config
+    /// snapshot into shared state — a request that started before a reload
+    /// would otherwise land here afterwards and restore the superseded limit.
+    /// The returned pointer is stable for the pool's lifetime.
+    pub fn originBufferAccount(self: *H2ConnPool, key: []const u8) !*proxy_buffer_account.Aggregate {
+        const counters = try self.originCounters(key);
+        return &counters.buffer;
+    }
+
+    /// Apply a reloaded proxy buffer policy. Aggregate hard limits take effect
+    /// immediately for every origin, including ones already carrying
+    /// reservations; the per-stream policy (and the receive window derived from
+    /// it) applies to connections opened after this call, because
+    /// SETTINGS_INITIAL_WINDOW_SIZE is negotiated once per connection and
+    /// existing peers already hold credit under the previous advertisement.
+    pub fn currentProxyBufferLimits(self: *H2ConnPool) proxy_buffer_account.Limits {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.config.proxy_buffer_limits;
+    }
+
+    pub fn setProxyBufferLimits(self: *H2ConnPool, limits: proxy_buffer_account.Limits) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.config.proxy_buffer_limits = limits;
+        var it = self.origin_counters.valueIterator();
+        while (it.next()) |counters| {
+            counters.*.buffer.setHardLimit(limits.per_origin_hard_limit);
+        }
     }
 
     /// Get a healthy h2 connection for `key`, creating one if needed. On the h2
@@ -1580,7 +1793,10 @@ pub const H2ConnPool = struct {
             return e;
         };
 
-        const conn = PooledH2Conn.init(self.allocator, transport, fd, deadline_ms, self.allocator, &counters.stream_resets_total, &counters.goaway_total) catch |e| {
+        // Snapshot the policy under the lock: a reload can rewrite it, and this
+        // connection pins whatever it advertises for its whole life.
+        const buffer_limits = self.currentProxyBufferLimits();
+        const conn = PooledH2Conn.init(self.allocator, transport, fd, deadline_ms, self.allocator, &counters.stream_resets_total, &counters.goaway_total, buffer_limits) catch |e| {
             transport.close();
             self.allocator.destroy(transport);
             return e;
@@ -1685,6 +1901,8 @@ pub const H2ConnPool = struct {
                 .streams_active = 0,
                 .stream_resets_total = e.value_ptr.*.stream_resets_total.load(.monotonic),
                 .goaway_total = e.value_ptr.*.goaway_total.load(.monotonic),
+                .buffered_bytes = e.value_ptr.*.buffer.currentBytes(.upstream_to_downstream),
+                .buffer_limit_exceeded_total = e.value_ptr.*.buffer.limitExceededEvents(.upstream_to_downstream),
             };
             errdefer allocator.free(snap.origin);
             if (self.conns.get(e.key_ptr.*)) |conn| {
@@ -1792,13 +2010,43 @@ const testing = std.testing;
 const TestProxyBufferObserver = struct {
     current: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     limit_exceeded: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    origin_limit_exceeded: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    global_limit_exceeded: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    read_pauses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    read_resumes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     fn observer(self: *TestProxyBufferObserver) proxy_buffer_account.Observer {
         return .{
             .context = self,
             .recordReservationFn = record,
             .releaseReservationFn = release,
+            .recordAggregateLimitExceededFn = recordAggregateLimitExceeded,
+            .recordReadPauseFn = recordReadPause,
+            .recordReadResumeFn = recordReadResume,
         };
+    }
+
+    fn recordReadPause(context: *anyopaque, _: proxy_buffer_account.Side) void {
+        const self: *TestProxyBufferObserver = @ptrCast(@alignCast(context));
+        _ = self.read_pauses.fetchAdd(1, .monotonic);
+    }
+
+    fn recordReadResume(context: *anyopaque, _: proxy_buffer_account.Side) void {
+        const self: *TestProxyBufferObserver = @ptrCast(@alignCast(context));
+        _ = self.read_resumes.fetchAdd(1, .monotonic);
+    }
+
+    fn recordAggregateLimitExceeded(
+        context: *anyopaque,
+        _: proxy_buffer_account.Direction,
+        scope: proxy_buffer_account.Scope,
+    ) void {
+        const self: *TestProxyBufferObserver = @ptrCast(@alignCast(context));
+        switch (scope) {
+            .origin => _ = self.origin_limit_exceeded.fetchAdd(1, .monotonic),
+            .global => _ = self.global_limit_exceeded.fetchAdd(1, .monotonic),
+            else => {},
+        }
     }
 
     fn record(context: *anyopaque, _: proxy_buffer_account.Direction, bytes: usize, _: bool, limit_exceeded: bool) void {
@@ -1813,11 +2061,15 @@ const TestProxyBufferObserver = struct {
     }
 };
 
-fn smallProxyBufferLimits(hard: usize) proxy_buffer_account.Limits {
+/// A per-stream policy whose advertised receive window is exactly `window`,
+/// with the low watermark half way down so the pause/resume band is testable.
+/// `hard == high` because the window already caps what a compliant peer can
+/// queue: anything beyond it is a flow-control violation, not a buffer overrun.
+fn windowLimits(window: usize) proxy_buffer_account.Limits {
     return .{
-        .per_stream_low_watermark = 1,
-        .per_stream_high_watermark = @max(2, @min(hard, 8)),
-        .per_stream_hard_limit = hard,
+        .per_stream_low_watermark = @max(1, window / 2),
+        .per_stream_high_watermark = window,
+        .per_stream_hard_limit = window,
         .per_origin_hard_limit = 0,
         .global_hard_limit = 0,
     };
@@ -2004,7 +2256,7 @@ test "h2 actor multiplexes concurrent requests over one connection" {
     const server = try std.Thread.spawn(.{}, cannedMuxServer, .{ fds[1], @as(usize, N) });
 
     var transport = PlainTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000, null, null, null);
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000, null, null, null, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
 
     var ctxs: [N]MuxClientCtx = undefined;
     var threads: [N]std.Thread = undefined;
@@ -2196,6 +2448,81 @@ test "h2 pool per-origin counters persist and feed both labelled and global snap
     }
 }
 
+test "reloaded proxy buffer limits reach existing origins but not open connections" {
+    const before = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 32 * 1024,
+        .per_stream_high_watermark = 64 * 1024,
+        .per_stream_hard_limit = 64 * 1024,
+        .per_origin_hard_limit = 256 * 1024,
+        .global_hard_limit = 0,
+    };
+    const after = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 8 * 1024,
+        .per_stream_high_watermark = 16 * 1024,
+        .per_stream_hard_limit = 16 * 1024,
+        .per_origin_hard_limit = 32 * 1024,
+        .global_hard_limit = 0,
+    };
+    try before.validate();
+    try after.validate();
+
+    var pool = H2ConnPool.init(testing.allocator, .{ .proxy_buffer_limits = before });
+    defer pool.deinit();
+
+    const existing = try pool.originBufferAccount("h2:origin-a:443");
+    try testing.expectEqual(before.per_origin_hard_limit, existing.hardLimit());
+    // Reserve against the pre-reload limit so the reload lands on a scope that
+    // is already carrying bytes.
+    try existing.reserve(.upstream_to_downstream, 24 * 1024);
+
+    pool.setProxyBufferLimits(after);
+
+    // Aggregate limits change immediately, in place: the stable pointer the
+    // readers hold now enforces the reloaded cap.
+    try testing.expectEqual(after.per_origin_hard_limit, existing.hardLimit());
+    try testing.expectEqual(@as(usize, 24 * 1024), existing.currentBytes(.upstream_to_downstream));
+    try testing.expectError(
+        error.BufferLimitExceeded,
+        existing.reserve(.upstream_to_downstream, 16 * 1024),
+    );
+    existing.release(.upstream_to_downstream, 24 * 1024);
+
+    // An origin first seen after the reload starts under the new policy, not
+    // the aggregate type's unlimited default.
+    const fresh = try pool.originBufferAccount("h2:origin-b:443");
+    try testing.expectEqual(after.per_origin_hard_limit, fresh.hardLimit());
+
+    // Connections opened from here on advertise the reloaded window.
+    try testing.expectEqual(after, pool.currentProxyBufferLimits());
+}
+
+test "an open connection keeps the per-stream policy it advertised" {
+    // SETTINGS_INITIAL_WINDOW_SIZE is negotiated once, so a connection must
+    // judge its streams by what it granted them. A stream therefore takes its
+    // policy from the connection, and no caller can supply a different one.
+    const fds = try makeSocketpair();
+    const server = try std.Thread.spawn(.{}, cannedSingleDataStreamingServer, .{ fds[1], "payload", true });
+
+    const pinned = windowLimits(64 * 1024);
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, pinned);
+    try testing.expectEqual(@as(u31, 64 * 1024), conn.stream_recv_window);
+
+    const stream = try conn.requestStreaming(.{
+        .method = "GET",
+        .authority = "pinned.test",
+        .path = "/",
+        .proxy_buffer_accounting = true,
+    });
+    try testing.expectEqual(pinned, stream.proxy_body_account.?.limits);
+    try testing.expectEqual(@as(i64, 64 * 1024), stream.recv_window);
+
+    conn.finishStreaming(stream);
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+}
+
 test "evictionDecision honours active-stream, health, idle, and lifetime gates" {
     const cfg = H2ConnPool.Config{ .idle_timeout_ms = 1000, .max_lifetime_ms = 5000 };
 
@@ -2279,7 +2606,7 @@ test "reader bumps the pool RST_STREAM counter per frame received" {
     var rst = std.atomic.Value(u64).init(0);
     var goaway = std.atomic.Value(u64).init(0);
     var transport = PlainTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000, null, &rst, &goaway);
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000, null, &rst, &goaway, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
 
     const res = conn.request(.{ .method = "GET", .authority = "rst.test", .path = "/" });
     try testing.expectError(error.Http2StreamReset, res);
@@ -2315,7 +2642,7 @@ test "reader bumps the pool GOAWAY counter on a connection GOAWAY" {
     var rst = std.atomic.Value(u64).init(0);
     var goaway = std.atomic.Value(u64).init(0);
     var transport = PlainTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000, null, &rst, &goaway);
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 2000, null, &rst, &goaway, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
 
     // Wait (bounded spin, no sleep-dependent assertion) until the reader has
     // processed the GOAWAY — otherwise deinit's shutdown could win the race and
@@ -2376,7 +2703,7 @@ test "streaming request relays a multi-frame body with consumer-driven window re
     const server = try std.Thread.spawn(.{}, cannedStreamingServer, .{fds[1]});
 
     var transport = PlainTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
 
     const stream = try conn.requestStreaming(.{ .method = "GET", .authority = "stream.test", .path = "/" });
     try testing.expectEqual(@as(u16, 200), stream.status.?);
@@ -2437,13 +2764,13 @@ test "streaming body accounting releases only after consumer acknowledgement and
 
     var observer = TestProxyBufferObserver{};
     var transport = PlainTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
 
     const stream = try conn.requestStreaming(.{
         .method = "GET",
         .authority = "account.test",
         .path = "/",
-        .proxy_buffer_limits = smallProxyBufferLimits(64),
+        .proxy_buffer_accounting = true,
         .proxy_buffer_observer = observer.observer(),
     });
     var buf: [16]u8 = undefined;
@@ -2462,67 +2789,6 @@ test "streaming body accounting releases only after consumer acknowledgement and
     conn.deinit();
     server.join();
     _ = std.c.close(fds[1]);
-}
-
-fn cannedLimitExceededStreamingServer(peer_fd: std.posix.fd_t, saw_rst: *std.atomic.Value(bool)) void {
-    const a = std.heap.page_allocator;
-    var srv = PlainTransport{ .fd = peer_fd };
-    var preface: [PREFACE.len]u8 = undefined;
-    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
-    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
-
-    var req_stream: u31 = 0;
-    while (req_stream == 0) {
-        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
-        if (fr.typ == .headers) req_stream = fr.stream_id;
-        frame.deinitFrame(a, &fr);
-    }
-
-    const block = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
-        .{ .name = ":status", .value = "200" },
-    }) catch return;
-    defer a.free(block);
-    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, block) catch return;
-    frame.writeFrame(&srv, .data, 0, req_stream, "0123456789abcdef") catch return;
-
-    while (true) {
-        var fr = readFrameBounded(&srv, peer_fd, a, 5000) catch return;
-        const is_rst = fr.typ == .rst_stream and fr.stream_id == req_stream;
-        frame.deinitFrame(a, &fr);
-        if (is_rst) {
-            saw_rst.store(true, .release);
-            return;
-        }
-    }
-}
-
-test "streaming body hard-limit abort resets stream and releases accounting" {
-    const fds = try makeSocketpair();
-    var saw_rst = std.atomic.Value(bool).init(false);
-    const server = try std.Thread.spawn(.{}, cannedLimitExceededStreamingServer, .{ fds[1], &saw_rst });
-
-    var observer = TestProxyBufferObserver{};
-    var transport = PlainTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
-
-    const stream = try conn.requestStreaming(.{
-        .method = "GET",
-        .authority = "limit.test",
-        .path = "/",
-        .proxy_buffer_limits = smallProxyBufferLimits(8),
-        .proxy_buffer_observer = observer.observer(),
-    });
-    var buf: [16]u8 = undefined;
-    try testing.expectError(error.BufferLimitExceeded, conn.readStreamingBody(stream, buf[0..]));
-    conn.finishStreaming(stream);
-
-    conn.deinit();
-    server.join();
-    _ = std.c.close(fds[1]);
-
-    try testing.expect(saw_rst.load(.acquire));
-    try testing.expectEqual(@as(usize, 0), observer.current.load(.monotonic));
-    try testing.expectEqual(@as(u64, 1), observer.limit_exceeded.load(.monotonic));
 }
 
 /// Canned server: HEADERS + DATA + a trailer HEADERS block (END_STREAM). The
@@ -2559,7 +2825,7 @@ test "streaming response trailers end the stream and are discarded" {
     const server = try std.Thread.spawn(.{}, cannedTrailerServer, .{fds[1]});
 
     var transport = PlainTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
 
     const stream = try conn.requestStreaming(.{ .method = "GET", .authority = "trailer.test", .path = "/" });
     try testing.expectEqual(@as(u16, 200), stream.status.?);
@@ -2583,12 +2849,13 @@ test "streaming response trailers end the stream and are discarded" {
     _ = std.c.close(fds[1]);
 }
 
-/// Canned server that violates flow control: sends OUR_INITIAL_WINDOW bytes of
-/// DATA (filling the advertised stream window exactly) plus one more frame
-/// beyond it without waiting for replenishment, then a PING whose ACK proves
-/// the client's reader has processed every prior frame. `saw_ack` is set once
-/// the ACK arrives so the test can start consuming deterministically.
-fn cannedFlowViolationServer(peer_fd: std.posix.fd_t, saw_ack: *std.atomic.Value(bool)) void {
+/// Canned server that violates flow control: sends `window` bytes of DATA
+/// (filling the advertised stream window exactly) plus one more frame beyond it
+/// without waiting for replenishment, then a PING whose ACK proves the client's
+/// reader has processed every prior frame. `saw_ack` is set once the ACK
+/// arrives so the test can start consuming deterministically. `window` must be
+/// a multiple of `DEFAULT_MAX_FRAME`.
+fn cannedFlowViolationServer(peer_fd: std.posix.fd_t, window: usize, saw_ack: *std.atomic.Value(bool)) void {
     const a = std.heap.page_allocator;
     var srv = PlainTransport{ .fd = peer_fd };
     var preface: [PREFACE.len]u8 = undefined;
@@ -2610,7 +2877,7 @@ fn cannedFlowViolationServer(peer_fd: std.posix.fd_t, saw_ack: *std.atomic.Value
 
     const chunk = [_]u8{'x'} ** DEFAULT_MAX_FRAME;
     var sent: usize = 0;
-    while (sent < OUR_INITIAL_WINDOW) : (sent += chunk.len) {
+    while (sent < window) : (sent += chunk.len) {
         frame.writeFrame(&srv, .data, 0, req_stream, chunk[0..]) catch return;
     }
     // One frame past the advertised window: a flow-control violation.
@@ -2632,10 +2899,10 @@ fn cannedFlowViolationServer(peer_fd: std.posix.fd_t, saw_ack: *std.atomic.Value
 test "streaming stream fails when the peer overruns the advertised window" {
     const fds = try makeSocketpair();
     var saw_ack = std.atomic.Value(bool).init(false);
-    const server = try std.Thread.spawn(.{}, cannedFlowViolationServer, .{ fds[1], &saw_ack });
+    const server = try std.Thread.spawn(.{}, cannedFlowViolationServer, .{ fds[1], DEFAULT_STREAM_RECV_WINDOW, &saw_ack });
 
     var transport = PlainTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 5000, null, null, null);
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 5000, null, null, null, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
 
     const stream = try conn.requestStreaming(.{ .method = "GET", .authority = "flood.test", .path = "/" });
 
@@ -2656,8 +2923,339 @@ test "streaming stream fails when the peer overruns the advertised window" {
         total += n;
         conn.acknowledgeStreamingBody(stream, n);
     };
-    try testing.expectEqual(@as(usize, OUR_INITIAL_WINDOW), total);
+    try testing.expectEqual(@as(usize, DEFAULT_STREAM_RECV_WINDOW), total);
     try testing.expectError(error.Http2FlowControlError, @as(anyerror!void, read_err));
+
+    conn.finishStreaming(stream);
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+}
+
+test "configured per-stream window replaces the default streaming receive window" {
+    // 64 KiB high watermark: the peer may park exactly that much unconsumed
+    // response body per stream, a sixteenth of the built-in default.
+    const limits = windowLimits(4 * DEFAULT_MAX_FRAME);
+    try limits.validate();
+    const window = proxy_buffer_account.streamReceiveWindow(limits);
+    try testing.expectEqual(@as(u31, 4 * DEFAULT_MAX_FRAME), window);
+
+    const fds = try makeSocketpair();
+    var saw_ack = std.atomic.Value(bool).init(false);
+    const server = try std.Thread.spawn(.{}, cannedFlowViolationServer, .{ fds[1], @as(usize, window), &saw_ack });
+
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 5000, null, null, null, limits);
+
+    const stream = try conn.requestStreaming(.{ .method = "GET", .authority = "window.test", .path = "/" });
+
+    var spins: usize = 0;
+    while (!saw_ack.load(.acquire) and spins < 100_000_000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expect(saw_ack.load(.acquire));
+
+    var total: usize = 0;
+    var buf: [8 * 1024]u8 = undefined;
+    const read_err = while (true) {
+        const n = conn.readStreamingBody(stream, buf[0..]) catch |e| break e;
+        try testing.expect(n != 0);
+        total += n;
+        conn.acknowledgeStreamingBody(stream, n);
+    };
+    // Exactly the configured window was accepted — not the 1 MiB default.
+    try testing.expectEqual(@as(usize, window), total);
+    try testing.expectError(error.Http2FlowControlError, @as(anyerror!void, read_err));
+
+    conn.finishStreaming(stream);
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+}
+
+test "streaming response reservations clear every aggregate scope after teardown" {
+    const fds = try makeSocketpair();
+    const server = try std.Thread.spawn(.{}, cannedSingleDataStreamingServer, .{ fds[1], "payload", false });
+
+    var observer = TestProxyBufferObserver{};
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 4096);
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
+
+    const stream = try conn.requestStreaming(.{
+        .method = "GET",
+        .authority = "aggregate.test",
+        .path = "/",
+        .proxy_buffer_accounting = true,
+        .proxy_buffer_observer = observer.observer(),
+        .proxy_buffer_capacity = .{ .origin = &origin, .global = &global },
+    });
+    var buf: [16]u8 = undefined;
+    const n = try conn.readStreamingBody(stream, buf[0..]);
+    try testing.expectEqualStrings("payload", buf[0..n]);
+    // Queued bytes are held at every scope until the consumer acknowledges.
+    try testing.expectEqual(@as(usize, 7), origin.currentBytes(.upstream_to_downstream));
+    try testing.expectEqual(@as(usize, 7), global.currentBytes(.upstream_to_downstream));
+
+    conn.acknowledgeStreamingBody(stream, n);
+    try testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
+    try testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+
+    conn.finishStreaming(stream);
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+
+    try testing.expectEqual(@as(usize, 0), observer.current.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), observer.origin_limit_exceeded.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), observer.global_limit_exceeded.load(.monotonic));
+}
+
+/// Canned server for the concurrent-stream aggregate case: answers two
+/// streams, fills the first with `first_bytes` of DATA and then sends
+/// `second_bytes` on the second, and reports the id of whichever stream the
+/// client resets. Both DATA bursts stay inside each stream's own advertised
+/// window, so anything the client refuses it refuses on aggregate grounds.
+fn cannedTwoStreamServer(
+    peer_fd: std.posix.fd_t,
+    first_bytes: usize,
+    second_bytes: usize,
+    rst_stream_id: *std.atomic.Value(u32),
+) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+
+    const block = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+    }) catch return;
+    defer a.free(block);
+
+    // Answer each request as it arrives so the client can open the second
+    // stream (its `requestStreaming` blocks on the response head).
+    var ids: [2]u31 = .{ 0, 0 };
+    var seen: usize = 0;
+    while (seen < 2) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 3000) catch return;
+        const is_headers = fr.typ == .headers;
+        const id = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+        if (!is_headers) continue;
+        ids[seen] = id;
+        seen += 1;
+        frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, id, block) catch return;
+    }
+
+    const payload = [_]u8{'x'} ** 256;
+    frame.writeFrame(&srv, .data, 0, ids[0], payload[0..first_bytes]) catch return;
+    frame.writeFrame(&srv, .data, 0, ids[1], payload[0..second_bytes]) catch return;
+
+    while (true) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 5000) catch return;
+        const is_rst = fr.typ == .rst_stream;
+        const id = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+        if (is_rst) {
+            rst_stream_id.store(@intCast(id), .release);
+            return;
+        }
+    }
+}
+
+test "origin capacity bounds concurrent streams and refuses only the overflowing one" {
+    // Each stream may hold 64 bytes, and so may the origin as a whole — a
+    // valid production shape (`origin_hard >= per_stream_hard`). One slow
+    // stream holding its full window therefore leaves the origin with no room
+    // for a second, which is the concurrency multiplication the aggregate
+    // limit exists to stop.
+    const window: usize = 64;
+    const limits = windowLimits(window);
+    try limits.validate();
+
+    const fds = try makeSocketpair();
+    var rst_stream_id = std.atomic.Value(u32).init(0);
+    const server = try std.Thread.spawn(.{}, cannedTwoStreamServer, .{ fds[1], window, 16, &rst_stream_id });
+
+    var observer = TestProxyBufferObserver{};
+    var origin = proxy_buffer_account.Aggregate.init(.origin, window);
+    var global = proxy_buffer_account.Aggregate.init(.global, 1024);
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, limits);
+
+    const capacity = proxy_buffer_account.AggregateCapacity{ .origin = &origin, .global = &global };
+    const slow = try conn.requestStreaming(.{
+        .method = "GET",
+        .authority = "aggregate-origin.test",
+        .path = "/",
+        .proxy_buffer_accounting = true,
+        .proxy_buffer_observer = observer.observer(),
+        .proxy_buffer_capacity = capacity,
+    });
+    const refused = try conn.requestStreaming(.{
+        .method = "GET",
+        .authority = "aggregate-origin.test",
+        .path = "/",
+        .proxy_buffer_accounting = true,
+        .proxy_buffer_observer = observer.observer(),
+        .proxy_buffer_capacity = capacity,
+    });
+
+    // The second stream is refused; the first is untouched and still usable.
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.BufferLimitExceeded, conn.readStreamingBody(refused, buf[0..]));
+    try testing.expect(origin.currentBytes(.upstream_to_downstream) <= window);
+
+    const n = try conn.readStreamingBody(slow, buf[0..]);
+    try testing.expectEqual(window, n);
+    conn.acknowledgeStreamingBody(slow, n);
+
+    const refused_id: u32 = refused.id;
+    conn.finishStreaming(refused);
+    conn.finishStreaming(slow);
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+
+    // The refused stream — not the healthy one — was reset upstream.
+    try testing.expectEqual(refused_id, rst_stream_id.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
+    try testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+    try testing.expectEqual(@as(usize, 0), observer.current.load(.monotonic));
+    // Exactly one origin-scope refusal: a stream we gave up on is discard-only,
+    // so later DATA on it neither reserves again nor re-counts the event.
+    try testing.expectEqual(@as(u64, 1), observer.origin_limit_exceeded.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), observer.global_limit_exceeded.load(.monotonic));
+    // The global scope had room; its rolled-back reservation must not have
+    // been counted as a global refusal either.
+    try testing.expectEqual(@as(u64, 0), observer.limit_exceeded.load(.monotonic));
+}
+
+/// Canned server that fills a stream's window in one frame and then reports the
+/// increment carried by the **first** stream-level WINDOW_UPDATE the client
+/// sends back. Connection-level updates (stream 0) are ignored.
+fn cannedWindowCreditServer(
+    peer_fd: std.posix.fd_t,
+    body_bytes: usize,
+    first_credit: *std.atomic.Value(u32),
+) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+
+    var req_stream: u31 = 0;
+    while (req_stream == 0) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        if (fr.typ == .headers) req_stream = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+    }
+
+    const block = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+    }) catch return;
+    defer a.free(block);
+    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, block) catch return;
+
+    const payload = [_]u8{'x'} ** 256;
+    frame.writeFrame(&srv, .data, 0, req_stream, payload[0..body_bytes]) catch return;
+
+    while (true) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 5000) catch return;
+        const is_stream_update = fr.typ == .window_update and fr.stream_id == req_stream;
+        const increment: u32 = if (is_stream_update and fr.payload.len >= 4)
+            std.mem.readInt(u32, fr.payload[0..4], .big) & 0x7FFF_FFFF
+        else
+            0;
+        frame.deinitFrame(a, &fr);
+        if (is_stream_update) {
+            first_credit.store(increment, .release);
+            return;
+        }
+    }
+}
+
+test "stream credit is withheld between the high and low watermarks" {
+    // Window (== high) 64, low 32: draining from 64 to 48 stays inside the
+    // pause band, so the peer must get no credit until the queue reaches 32.
+    const window: usize = 64;
+    const limits = windowLimits(window);
+    try testing.expectEqual(@as(usize, 32), limits.per_stream_low_watermark);
+
+    const fds = try makeSocketpair();
+    var first_credit = std.atomic.Value(u32).init(0);
+    const server = try std.Thread.spawn(.{}, cannedWindowCreditServer, .{ fds[1], window, &first_credit });
+
+    var observer = TestProxyBufferObserver{};
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, limits);
+
+    const stream = try conn.requestStreaming(.{
+        .method = "GET",
+        .authority = "hysteresis.test",
+        .path = "/",
+        .proxy_buffer_accounting = true,
+        .proxy_buffer_observer = observer.observer(),
+    });
+
+    // Fill the queue to the high watermark, which pauses the upstream.
+    var buf: [16]u8 = undefined;
+    const first = try conn.readStreamingBody(stream, buf[0..]);
+    try testing.expectEqual(@as(usize, 16), first);
+    conn.acknowledgeStreamingBody(stream, first); // queue 48: still above low
+    try testing.expectEqual(@as(u64, 1), observer.read_pauses.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), observer.read_resumes.load(.monotonic));
+
+    const second = try conn.readStreamingBody(stream, buf[0..]);
+    try testing.expectEqual(@as(usize, 16), second);
+    conn.acknowledgeStreamingBody(stream, second); // queue 32: crosses low
+    try testing.expectEqual(@as(u64, 1), observer.read_resumes.load(.monotonic));
+
+    var spins: usize = 0;
+    while (first_credit.load(.acquire) == 0 and spins < 100_000_000) : (spins += 1) std.Thread.yield() catch {};
+    // One coalesced update for everything drained inside the band — crediting
+    // each chunk as it drained would have made this 16.
+    try testing.expectEqual(@as(u32, 32), first_credit.load(.acquire));
+
+    conn.finishStreaming(stream);
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+}
+
+test "a drained queue returns its backing allocation to the aggregate scopes" {
+    // A stream that fills and drains repeatedly must not sit on its peak
+    // allocation: the aggregate scopes bound retained memory, so a queue whose
+    // logical length is zero has to have given its storage back too.
+    const window: usize = 64;
+    const fds = try makeSocketpair();
+    const server = try std.Thread.spawn(.{}, cannedSingleDataStreamingServer, .{ fds[1], "0123456789abcdef", false });
+
+    var origin = proxy_buffer_account.Aggregate.init(.origin, window);
+    var global = proxy_buffer_account.Aggregate.init(.global, 1024);
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, windowLimits(window));
+
+    const stream = try conn.requestStreaming(.{
+        .method = "GET",
+        .authority = "retained.test",
+        .path = "/",
+        .proxy_buffer_accounting = true,
+        .proxy_buffer_capacity = .{ .origin = &origin, .global = &global },
+    });
+
+    var buf: [16]u8 = undefined;
+    const n = try conn.readStreamingBody(stream, buf[0..]);
+    try testing.expectEqual(@as(usize, 16), n);
+    try testing.expectEqual(@as(usize, 16), origin.currentBytes(.upstream_to_downstream));
+
+    conn.acknowledgeStreamingBody(stream, n);
+    // Logical length *and* retained capacity are both back to zero.
+    try testing.expectEqual(@as(usize, 0), stream.body.items.len);
+    try testing.expectEqual(@as(usize, 0), stream.body.capacity);
+    try testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
+    try testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
 
     conn.finishStreaming(stream);
     conn.deinit();
@@ -2704,7 +3302,7 @@ test "stalled streaming stream times out via the reader sweep while other frames
     var transport = PlainTransport{ .fd = fds[0] };
     // Short stream deadline; PINGs every 20ms keep the reader's frame reads
     // alive, so only the sweep can bound the body wait.
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 300, null, null, null);
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 300, null, null, null, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
 
     const stream = try conn.requestStreaming(.{ .method = "GET", .authority = "stall.test", .path = "/" });
     var buf: [64]u8 = undefined;
@@ -2755,7 +3353,7 @@ test "streaming and buffered requests multiplex together on one connection" {
     const server = try std.Thread.spawn(.{}, cannedMuxServer, .{ fds[1], @as(usize, N_BUF + N_STREAM) });
 
     var transport = PlainTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
 
     var bctxs: [N_BUF]MuxClientCtx = undefined;
     var sctxs: [N_STREAM]MuxStreamingClientCtx = undefined;
@@ -2857,7 +3455,7 @@ test "streaming request upload sends DATA incrementally and waits for flow-contr
     const server = try std.Thread.spawn(.{}, cannedStreamingUploadServer, .{ fds[1], &writer_done, &blocked_observed, upload_len });
 
     var transport = PlainTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
 
     const stream = try conn.openStreaming(.{
         .method = "POST",
@@ -2904,7 +3502,7 @@ test "streaming request upload DATA write failure poisons the h2 connection" {
     defer _ = std.c.close(fds[1]);
 
     var transport = FailingDataTransport{ .fd = fds[0] };
-    const conn = try H2Conn(*FailingDataTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null);
+    const conn = try H2Conn(*FailingDataTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
 
     const stream = try conn.openStreaming(.{
         .method = "POST",

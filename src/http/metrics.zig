@@ -148,6 +148,10 @@ pub const Metrics = struct {
     proxy_buffer_high_watermark_upstream_to_downstream_stream: u64,
     proxy_buffer_limit_exceeded_downstream_to_upstream_stream: u64,
     proxy_buffer_limit_exceeded_upstream_to_downstream_stream: u64,
+    proxy_buffer_limit_exceeded_downstream_to_upstream_origin: u64,
+    proxy_buffer_limit_exceeded_upstream_to_downstream_origin: u64,
+    proxy_buffer_limit_exceeded_downstream_to_upstream_global: u64,
+    proxy_buffer_limit_exceeded_upstream_to_downstream_global: u64,
     proxy_buffer_read_pauses_downstream: u64,
     proxy_buffer_read_pauses_upstream: u64,
     proxy_buffer_read_resumes_downstream: u64,
@@ -304,6 +308,10 @@ pub const Metrics = struct {
             .proxy_buffer_high_watermark_upstream_to_downstream_stream = 0,
             .proxy_buffer_limit_exceeded_downstream_to_upstream_stream = 0,
             .proxy_buffer_limit_exceeded_upstream_to_downstream_stream = 0,
+            .proxy_buffer_limit_exceeded_downstream_to_upstream_origin = 0,
+            .proxy_buffer_limit_exceeded_upstream_to_downstream_origin = 0,
+            .proxy_buffer_limit_exceeded_downstream_to_upstream_global = 0,
+            .proxy_buffer_limit_exceeded_upstream_to_downstream_global = 0,
             .proxy_buffer_read_pauses_downstream = 0,
             .proxy_buffer_read_pauses_upstream = 0,
             .proxy_buffer_read_resumes_downstream = 0,
@@ -632,10 +640,21 @@ pub const Metrics = struct {
     }
 
     pub fn recordProxyBufferLimitExceeded(self: *Metrics, direction: proxy_buffer_account.Direction, scope: proxy_buffer_account.Scope) void {
-        if (scope != .stream) return;
-        switch (direction) {
-            .downstream_to_upstream => self.proxy_buffer_limit_exceeded_downstream_to_upstream_stream += 1,
-            .upstream_to_downstream => self.proxy_buffer_limit_exceeded_upstream_to_downstream_stream += 1,
+        switch (scope) {
+            .stream => switch (direction) {
+                .downstream_to_upstream => self.proxy_buffer_limit_exceeded_downstream_to_upstream_stream += 1,
+                .upstream_to_downstream => self.proxy_buffer_limit_exceeded_upstream_to_downstream_stream += 1,
+            },
+            .origin => switch (direction) {
+                .downstream_to_upstream => self.proxy_buffer_limit_exceeded_downstream_to_upstream_origin += 1,
+                .upstream_to_downstream => self.proxy_buffer_limit_exceeded_upstream_to_downstream_origin += 1,
+            },
+            .global => switch (direction) {
+                .downstream_to_upstream => self.proxy_buffer_limit_exceeded_downstream_to_upstream_global += 1,
+                .upstream_to_downstream => self.proxy_buffer_limit_exceeded_upstream_to_downstream_global += 1,
+            },
+            // Downstream-connection scope has no proxy body queue of its own.
+            .connection => {},
         }
     }
 
@@ -969,6 +988,10 @@ pub const Metrics = struct {
             \\# TYPE tardigrade_buffer_limit_exceeded_total counter
             \\tardigrade_buffer_limit_exceeded_total{{direction="downstream_to_upstream",scope="stream"}} {d}
             \\tardigrade_buffer_limit_exceeded_total{{direction="upstream_to_downstream",scope="stream"}} {d}
+            \\tardigrade_buffer_limit_exceeded_total{{direction="downstream_to_upstream",scope="origin"}} {d}
+            \\tardigrade_buffer_limit_exceeded_total{{direction="upstream_to_downstream",scope="origin"}} {d}
+            \\tardigrade_buffer_limit_exceeded_total{{direction="downstream_to_upstream",scope="global"}} {d}
+            \\tardigrade_buffer_limit_exceeded_total{{direction="upstream_to_downstream",scope="global"}} {d}
             \\
         , .{
             self.proxy_buffer_downstream_to_upstream_stream_current,
@@ -983,6 +1006,10 @@ pub const Metrics = struct {
             self.proxy_buffer_read_resumes_upstream,
             self.proxy_buffer_limit_exceeded_downstream_to_upstream_stream,
             self.proxy_buffer_limit_exceeded_upstream_to_downstream_stream,
+            self.proxy_buffer_limit_exceeded_downstream_to_upstream_origin,
+            self.proxy_buffer_limit_exceeded_upstream_to_downstream_origin,
+            self.proxy_buffer_limit_exceeded_downstream_to_upstream_global,
+            self.proxy_buffer_limit_exceeded_upstream_to_downstream_global,
         });
 
         try self.appendTlsBufferPrometheus(&out);
@@ -2131,6 +2158,8 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     m.recordProxyBufferReadPause("upstream");
     m.recordProxyBufferReadResume("upstream");
     m.recordProxyBufferLimitExceeded(.upstream_to_downstream, .stream);
+    m.recordProxyBufferLimitExceeded(.upstream_to_downstream, .origin);
+    m.recordProxyBufferLimitExceeded(.downstream_to_upstream, .global);
 
     const prom = try m.toPrometheus(allocator);
     defer allocator.free(prom);
@@ -2152,6 +2181,10 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_read_pauses_total{side=\"upstream\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_read_resumes_total{side=\"upstream\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"upstream_to_downstream\",scope=\"stream\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"upstream_to_downstream\",scope=\"origin\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"downstream_to_upstream\",scope=\"global\"} 1") != null);
+    // Aggregate scopes are counted independently of the per-stream scope.
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"downstream_to_upstream\",scope=\"origin\"} 0") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_ttfb_ms_count 2") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_active_jobs") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_queued_jobs") != null);

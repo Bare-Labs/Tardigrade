@@ -121,6 +121,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE,
         .max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes,
         .proxy_buffer_limits = cfg.proxy_buffer_limits,
+        .proxy_buffer_global_account = http.proxy_buffer_account.Aggregate.init(.global, cfg.proxy_buffer_limits.global_hard_limit),
         .tls_buffer_limits = cfg.tls_buffer_limits,
         .upstream_rr_index = 0,
         .upstream_backup_rr_index = 0,
@@ -141,6 +142,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         .h2_pool = http.upstream_h2.H2ConnPool.init(state_allocator, .{
             .idle_timeout_ms = cfg.upstream_pool_idle_timeout_ms,
             .max_lifetime_ms = cfg.upstream_pool_max_lifetime_ms,
+            // The advertised per-stream receive window *is* the configured
+            // per-stream high watermark (#140), so a well-behaved origin stops
+            // sending exactly where the accounting model fills up.
+            .proxy_buffer_limits = cfg.proxy_buffer_limits,
         }),
         .fastcgi_next_request_id = std.StringHashMap(u16).init(state_allocator),
         .proxy_cache_locks = std.StringHashMap(u32).init(state_allocator),

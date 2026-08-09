@@ -467,6 +467,10 @@ pub const GatewayState = struct {
     connection_memory_estimate_bytes: usize, // cfg-derived; updated on reload [runtime_mutex]
     max_total_connection_memory_bytes: usize, // cfg snapshot; updated on reload [runtime_mutex]
     proxy_buffer_limits: http.proxy_buffer_account.Limits, // cfg snapshot; updated on reload [runtime_mutex]
+    /// Process-wide proxy buffer reservations (#140). Lock-free and shared by
+    /// every worker, so its hard limit caps aggregate proxy body memory no
+    /// matter how many origins or streams are in flight. [atomic, no mutex]
+    proxy_buffer_global_account: http.proxy_buffer_account.Aggregate = http.proxy_buffer_account.Aggregate.init(.global, 0),
     tls_buffer_limits: @import("tls_core").encrypted_stream.BufferLimits, // cfg snapshot for native TLS; updated on reload [runtime_mutex]
     upstream_rr_index: usize, // LB selection state [upstream_mutex]
     upstream_backup_rr_index: usize, // LB selection state [upstream_mutex]
@@ -1514,12 +1518,54 @@ pub const GatewayState = struct {
         self.metrics.releaseProxyBufferReservation(direction, bytes) catch unreachable;
     }
 
+    pub fn metricsRecordProxyBufferLimitExceeded(
+        self: *GatewayState,
+        direction: http.proxy_buffer_account.Direction,
+        scope: http.proxy_buffer_account.Scope,
+    ) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyBufferLimitExceeded(direction, scope);
+    }
+
+    /// The process-wide aggregate every proxy body reservation clears. Its hard
+    /// limit tracks `proxy_buffer_limits.global_hard_limit` across reloads.
+    pub fn proxyBufferGlobalAccount(self: *GatewayState) *http.proxy_buffer_account.Aggregate {
+        return &self.proxy_buffer_global_account;
+    }
+
     pub fn proxyBufferObserver(self: *GatewayState) http.proxy_buffer_account.Observer {
         return .{
             .context = self,
             .recordReservationFn = recordProxyBufferReservationObserved,
             .releaseReservationFn = releaseProxyBufferReservationObserved,
+            .recordAggregateLimitExceededFn = recordProxyBufferAggregateLimitExceededObserved,
+            .recordReadPauseFn = recordProxyBufferReadPauseObserved,
+            .recordReadResumeFn = recordProxyBufferReadResumeObserved,
         };
+    }
+
+    fn recordProxyBufferReadPauseObserved(context: *anyopaque, side: http.proxy_buffer_account.Side) void {
+        const self: *GatewayState = @ptrCast(@alignCast(context));
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyBufferReadPause(side.label());
+    }
+
+    fn recordProxyBufferReadResumeObserved(context: *anyopaque, side: http.proxy_buffer_account.Side) void {
+        const self: *GatewayState = @ptrCast(@alignCast(context));
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyBufferReadResume(side.label());
+    }
+
+    fn recordProxyBufferAggregateLimitExceededObserved(
+        context: *anyopaque,
+        direction: http.proxy_buffer_account.Direction,
+        scope: http.proxy_buffer_account.Scope,
+    ) void {
+        const self: *GatewayState = @ptrCast(@alignCast(context));
+        self.metricsRecordProxyBufferLimitExceeded(direction, scope);
     }
 
     fn recordProxyBufferReservationObserved(
@@ -1705,6 +1751,10 @@ pub const GatewayState = struct {
                 \\# TYPE tardigrade_upstream_h2_pool_stream_resets_total counter
                 \\# HELP tardigrade_upstream_h2_pool_goaway_total GOAWAY frames received per origin
                 \\# TYPE tardigrade_upstream_h2_pool_goaway_total counter
+                \\# HELP tardigrade_upstream_h2_pool_buffered_bytes Response bytes currently queued in HTTP/2 stream buffers per origin
+                \\# TYPE tardigrade_upstream_h2_pool_buffered_bytes gauge
+                \\# HELP tardigrade_upstream_h2_pool_buffer_limit_exceeded_total Origin-scope proxy buffer hard-limit refusals per origin
+                \\# TYPE tardigrade_upstream_h2_pool_buffer_limit_exceeded_total counter
                 \\
             );
             for (h2_origins) |snap| {
@@ -1712,6 +1762,8 @@ pub const GatewayState = struct {
                 try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_streams_active", snap.origin, "{d}", .{snap.streams_active});
                 try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_stream_resets_total", snap.origin, "{d}", .{snap.stream_resets_total});
                 try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_goaway_total", snap.origin, "{d}", .{snap.goaway_total});
+                try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_buffered_bytes", snap.origin, "{d}", .{snap.buffered_bytes});
+                try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_buffer_limit_exceeded_total", snap.origin, "{d}", .{snap.buffer_limit_exceeded_total});
             }
         }
     }

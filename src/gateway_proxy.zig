@@ -191,6 +191,12 @@ pub const StreamingProxyResult = struct {
     response_body_bytes: usize,
     upstream_ttfb_ms: u64,
     upstream_aborted: bool = false,
+    /// The relay was truncated because *local* proxy buffer capacity ran out,
+    /// not because the origin failed. The response head was already committed
+    /// so the status cannot change, but the origin must not be blamed for it —
+    /// counting this against upstream health would let local memory pressure
+    /// trip a healthy origin's circuit breaker.
+    local_capacity_aborted: bool = false,
 };
 
 pub fn uriComponentBytes(component: std.Uri.Component) []const u8 {
@@ -801,6 +807,7 @@ fn streamViaH2Pool(
     cancel_token: ?*const CancellationToken,
     proxy_buffer_limits: proxy_buffer_account.Limits,
     proxy_buffer_observer: proxy_buffer_account.Observer,
+    proxy_buffer_global: ?*proxy_buffer_account.Aggregate,
 ) !StreamingProxyResult {
     const deadline_ms: u32 = if (read_deadline_ms > 0)
         read_deadline_ms
@@ -833,6 +840,25 @@ fn streamViaH2Pool(
             .h2 => |conn| {
                 if (h1_pool) |p| p.recordProtocol(true);
 
+                // Aggregate capacity for this origin's queued response bytes
+                // (#140). Looked up only on the h2 path, so an ALPN-h1 origin
+                // never creates an h2 origin entry. The pointer is stable for
+                // the pool's life, surviving retries and reconnects.
+                //
+                // A failure here means the accounting itself is unavailable
+                // (allocation failure) — precisely when these limits matter
+                // most. Dropping the scope would let the request retain
+                // response bytes outside the configured per-origin bound, so
+                // this is a deterministic pre-commit rejection instead.
+                const origin_buffer_account = h2_pool.originBufferAccount(key) catch {
+                    h2_pool.release(conn);
+                    return error.ProxyBufferCapacityUnavailable;
+                };
+                const proxy_buffer_capacity = proxy_buffer_account.AggregateCapacity{
+                    .origin = origin_buffer_account,
+                    .global = proxy_buffer_global,
+                };
+
                 var authority_buf: [300]u8 = undefined;
                 const authority = if (port == default_port)
                     host
@@ -857,8 +883,9 @@ fn streamViaH2Pool(
                     .headers = extra_headers,
                     .body = buffered_body,
                     .body_mode = if (streaming_body == null) .complete else .streaming,
-                    .proxy_buffer_limits = proxy_buffer_limits,
+                    .proxy_buffer_accounting = true,
                     .proxy_buffer_observer = proxy_buffer_observer,
+                    .proxy_buffer_capacity = proxy_buffer_capacity,
                 }) catch |err| {
                     // Nothing has reached the client yet: evict the dead
                     // connection so new requests do not pick it, and retry
@@ -893,6 +920,10 @@ fn streamViaH2Pool(
                     conn.finishStreaming(stream);
                     if (!conn.healthy()) h2_pool.evict(key, conn);
                     h2_pool.release(conn);
+                    // Local capacity, not the origin: nothing has reached the
+                    // client, so this becomes a clean 503 and never counts
+                    // against the origin. Retrying would hit the same wall.
+                    if (err == error.BufferLimitExceeded) return error.ProxyBufferCapacityUnavailable;
                     if (streaming_body == null and attempt == 0 and (err == error.Http2GoAway or err == error.Http2ConnectionClosed or err == error.Http2StreamReset)) {
                         continue;
                     }
@@ -921,6 +952,7 @@ fn streamViaH2Pool(
 
                 var body_bytes: usize = 0;
                 var aborted = false;
+                var local_capacity_aborted = false;
                 if (body_allowed) {
                     while (true) {
                         if (cancelStopped(cancel_token)) {
@@ -928,12 +960,19 @@ fn streamViaH2Pool(
                             h2_pool.release(conn);
                             return error.RequestCancelled;
                         }
-                        const n = conn.readStreamingBody(stream, read_buf) catch {
-                            // Upstream failed mid-body after the head went
-                            // downstream: report an aborted relay (the client
-                            // sees the truncated chunked body); other streams
-                            // on the connection are unaffected unless the
-                            // whole connection died (handled below).
+                        const n = conn.readStreamingBody(stream, read_buf) catch |err| {
+                            // Failed mid-body after the head went downstream:
+                            // report an aborted relay (the client sees the
+                            // truncated chunked body); other streams on the
+                            // connection are unaffected unless the whole
+                            // connection died (handled below).
+                            //
+                            // The status can no longer change, but the *cause*
+                            // still matters: a local buffer-capacity abort is
+                            // this proxy running out of room, and blaming the
+                            // origin for it would let local memory pressure
+                            // trip a healthy origin's failure policy.
+                            local_capacity_aborted = err == error.BufferLimitExceeded;
                             aborted = true;
                             break;
                         };
@@ -969,6 +1008,7 @@ fn streamViaH2Pool(
                     .response_body_bytes = body_bytes,
                     .upstream_ttfb_ms = ttfb_ms,
                     .upstream_aborted = aborted,
+                    .local_capacity_aborted = local_capacity_aborted,
                 };
             },
         }
@@ -1974,6 +2014,10 @@ pub fn executeStreamingHttpProxyRequest(
     sticky_set_cookie: ?[]const u8,
     cancel_token: ?*const CancellationToken,
     proxy_buffer_observer: proxy_buffer_account.Observer,
+    /// Process-wide proxy buffer aggregate (#140). Streams reserve against it
+    /// before retaining queued body bytes, so aggregate memory stays bounded no
+    /// matter how many origins or concurrent streams are slow.
+    proxy_buffer_global: ?*proxy_buffer_account.Aggregate,
     pool: ?*http.upstream_pool.UpstreamPool,
     /// Optional per-origin HTTP/2 multiplexing pool (#145).
     h2_pool: ?*http.upstream_h2.H2ConnPool,
@@ -2046,7 +2090,7 @@ pub fn executeStreamingHttpProxyRequest(
     if (stream_h2) {
         if (h2_pool) |hp| {
             const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) tls_options.? else null;
-            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, read_buf, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer);
+            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, read_buf, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_global);
         }
         if (streaming_body != null) {
             if (pool) |p| p.recordH2StreamingUploadFallback();

@@ -152,6 +152,72 @@ size. The response buffer is `proxy_stream_buffer_size` (floored at 16 KiB); the
 upload buffer is a fixed 16 KiB. The HTTP/2 relay is bounded by the per-stream
 receive window, replenished only as the downstream relay drains.
 
-Configurable buffer accounting, aggregate caps, and pause/resume metrics are
-tracked separately in #140; the bounds described here are structural, not a
-substitute for that enforcement.
+### HTTP/2 response bounds
+
+The streaming receive window an HTTP/2 upstream connection advertises is
+`TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES` — the same value the
+accounting model treats as "this stream's queue is full" — so a well-behaved
+origin stops sending exactly there. An origin that overruns the window is
+committing a flow-control violation and fails only its own stream.
+
+Credit is then returned with hysteresis rather than chunk by chunk. While a
+stream's queue sits at or above the high watermark, downstream-consumed bytes
+are accumulated but **not** credited back to the origin; the accumulated total
+is sent as a single `WINDOW_UPDATE` once the queue drains below
+`TARDIGRADE_PROXY_BUFFER_PER_STREAM_LOW_WATERMARK_BYTES`. Crediting each chunk
+as it drained would let the origin refill the queue immediately and the
+watermark band would never actually pause anything. Each transition is visible
+as `tardigrade_buffer_read_pauses_total{side="upstream"}` and
+`tardigrade_buffer_read_resumes_total{side="upstream"}`.
+
+Per-stream bounds alone do not bound the process: N concurrent slow streams
+retain up to N windows. Two aggregate hard limits close that gap:
+
+| Limit | Scope |
+| --- | --- |
+| `TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` | every stream on every connection to one upstream origin |
+| `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` | the whole process, across all origins |
+
+Both default to `0`, which means unlimited. Reservations are taken *before* any
+memory is committed, and they track each queue's **retained allocation** rather
+than its logical length — a drained queue that still owned its peak buffer
+would otherwise be invisible to these limits. A queue's storage (and its
+reservation) is released as soon as it drains empty.
+
+#### What a refusal does
+
+The behavior depends on whether the downstream response has been committed:
+
+- **Before the response head is written** — including the case where the reader
+  rejects DATA between decoding the origin's headers and the worker relaying
+  them — the request fails with `503` and the code `proxy_buffer_saturated`.
+  This is *local* saturation, so it is never recorded against upstream health
+  or the circuit breaker, and it is not retried: a retry would meet the same
+  wall.
+- **After commitment** the status can no longer change. The stream is reset
+  upstream immediately (`RST_STREAM(CANCEL)`), the downstream response is
+  truncated, every scope's reservation is released, and the truncation is
+  logged. It is counted in `tardigrade_buffer_limit_exceeded_total` at the
+  refusing scope but, again, is **not** counted as an upstream failure — local
+  memory pressure must not trip a healthy origin's failure policy.
+
+In both cases the stream becomes discard-only: DATA still in flight for it is
+dropped without reserving again, so a single refusal cannot be re-counted or
+re-queue bytes behind an error the consumer has not seen yet. Unrelated
+streams — including others on the same connection — are untouched, and a
+refusal rolls back cleanly across scopes, so a stream the origin scope rejects
+never leaves bytes reserved at the global scope.
+
+#### Reload semantics
+
+Aggregate hard limits apply immediately, including to origins that already hold
+reservations. The per-stream policy — and the receive window derived from it —
+applies to connections opened after the reload: `SETTINGS_INITIAL_WINDOW_SIZE`
+is negotiated once per connection, and a peer already holding credit is still
+judged by what it was granted. Each connection therefore pins the complete
+low/high/hard policy it advertised, and every stream on it is measured against
+that, never against a newer snapshot.
+
+The HTTP/1 relay's fixed buffers are accounted per stream but are not reserved
+against the aggregate scopes; their size does not grow with concurrency the way
+an HTTP/2 stream queue does.
