@@ -17,7 +17,11 @@
 //!   directoryName, dNSName, rfc822Name, URI, and IP forms;
 //! - certificate policies use the bounded RFC 9618 policy graph. The default
 //!   user policy is anyPolicy with no initial inhibition, preserving ordinary
-//!   validation compatibility while returning deterministic constrained sets.
+//!   validation compatibility while returning deterministic constrained sets;
+//! - certificate-status policy (revocation, OCSP, stapling, must-staple) is
+//!   evaluated from caller-supplied evidence only. It defaults to disabled and
+//!   records that fact in the accepted result rather than implying a check
+//!   happened. See `revocation.zig` for the seam and its trust boundary.
 
 const std = @import("std");
 const certificate_policy = @import("certificate_policy.zig");
@@ -26,6 +30,7 @@ const identity = @import("identity.zig");
 const name_constraints = @import("name_constraints.zig");
 const oid = @import("oid.zig");
 const path_builder = @import("path_builder.zig");
+const revocation = @import("revocation.zig");
 const verify = @import("verify.zig");
 const x509 = @import("x509.zig");
 
@@ -43,6 +48,14 @@ pub const ValidationPolicy = struct {
     maximum_extensions_per_certificate: usize = 64,
     name_constraints: name_constraints.Limits = .{},
     certificate_policy: certificate_policy.Configuration = .{},
+    /// Certificate-status policy. Defaults to disabled: no status is consulted
+    /// and the accepted result says so.
+    revocation: revocation.Configuration = .{},
+    /// Status evidence for this validation, collected by the caller before the
+    /// call. Borrowed. The validator performs no network or file I/O of any
+    /// kind, so a future fetch/cache provider fills this in without changing
+    /// this signature.
+    revocation_evidence: revocation.Evidence = .{},
     /// Anchors passed to `path_builder.build`, in the same order. Borrowed for
     /// the call only. The terminal element's input index and DER must match.
     trust_anchors: []const x509.Certificate,
@@ -79,6 +92,15 @@ pub const FailureReason = enum {
     policy_constraints_invalid,
     inhibit_any_policy_invalid,
     certificate_policy_resource_limit_exceeded,
+    certificate_revoked,
+    revocation_status_unavailable,
+    revocation_status_stale,
+    revocation_status_malformed,
+    revocation_status_unauthenticated,
+    revocation_must_staple_not_satisfied,
+    revocation_source_unsupported,
+    revocation_evidence_invalid,
+    revocation_resource_limit_exceeded,
     identity_mismatch,
     invalid_identity_reference,
     validation_resource_limit_exceeded,
@@ -98,6 +120,9 @@ pub const ValidationFailure = struct {
     policy_oid: ?oid.ObjectIdentifier = null,
     policy_graph_depth: ?usize = null,
     policy_stage: ?certificate_policy.Stage = null,
+    revocation_source: ?revocation.Source = null,
+    revocation_defect: ?revocation.Defect = null,
+    revocation_reason: ?revocation.CrlReason = null,
 };
 
 pub const AcceptedPath = struct {
@@ -106,6 +131,10 @@ pub const AcceptedPath = struct {
     accepted_path: []const path_builder.Element,
     /// Owned RFC 9618 policy outputs. Qualifiers are intentionally omitted.
     policies: certificate_policy.PolicyResult,
+    /// Owned record of what certificate-status evidence was checked, and what
+    /// was not. Present on every acceptance, including the default disabled
+    /// policy, so callers never have to assume revocation was verified.
+    revocation: revocation.Report,
 };
 
 pub const ValidationResult = union(enum) {
@@ -118,6 +147,8 @@ pub const ValidationResult = union(enum) {
                 allocator.free(accepted_value.accepted_path);
                 var policies = accepted_value.policies;
                 policies.deinit(allocator);
+                var report = accepted_value.revocation;
+                report.deinit(allocator);
             },
             .rejected => {},
         }
@@ -226,24 +257,47 @@ pub fn validatePath(
         .failure => |policy_failure| return .{ .rejected = certificatePolicyFailure(policy_failure) },
     };
 
+    // Certificate-status policy runs on caller-supplied evidence only; it
+    // never reaches a responder, a CRL endpoint, or the filesystem.
+    var status_report = switch (revocation.evaluatePath(
+        allocator,
+        path,
+        policy.revocation,
+        policy.revocation_evidence,
+        policy.validation_time,
+    )) {
+        .accepted => |report| report,
+        .rejected => |status_failure| {
+            policies.deinit(allocator);
+            return .{ .rejected = revocationFailure(status_failure) };
+        },
+    };
+
     // Identity is intentionally last: no path is accepted based on a name
     // match before its signatures and RFC 5280 policy checks succeed.
     if (policy.expected_dns_name) |expected| {
         const verdict = identity.verifyHost(leaf, expected) catch {
             policies.deinit(allocator);
+            status_report.deinit(allocator);
             return reject(.invalid_identity_reference, 0);
         };
         if (!verdict.isMatch()) {
             policies.deinit(allocator);
+            status_report.deinit(allocator);
             return reject(.identity_mismatch, 0);
         }
     }
 
     const owned = allocator.dupe(path_builder.Element, path.elements) catch {
         policies.deinit(allocator);
+        status_report.deinit(allocator);
         return rejectWithoutCertificate(.out_of_memory);
     };
-    return .{ .accepted = .{ .accepted_path = owned, .policies = policies } };
+    return .{ .accepted = .{
+        .accepted_path = owned,
+        .policies = policies,
+        .revocation = status_report,
+    } };
 }
 
 /// Validate candidates in builder order and return the first accepted path.
@@ -354,7 +408,10 @@ fn criticalExtensionHandled(extension_oid: *const oid.ObjectIdentifier) bool {
         extension_oid.eqlComponents(&wk.policy_constraints) or
         extension_oid.eqlComponents(&wk.inhibit_any_policy) or
         extension_oid.eqlComponents(&wk.subject_key_identifier) or
-        extension_oid.eqlComponents(&wk.authority_key_identifier);
+        extension_oid.eqlComponents(&wk.authority_key_identifier) or
+        // RFC 7633 permits a critical TLS Feature extension; `revocation.zig`
+        // now processes must-staple, so it is no longer unhandled.
+        extension_oid.eqlComponents(&wk.tls_feature);
 }
 
 fn certificatePolicyFailure(policy_failure: certificate_policy.Failure) ValidationFailure {
@@ -375,6 +432,28 @@ fn certificatePolicyFailure(policy_failure: certificate_policy.Failure) Validati
         .policy_oid = policy_failure.policy_oid,
         .policy_graph_depth = policy_failure.graph_depth,
         .policy_stage = policy_failure.stage,
+    };
+}
+
+fn revocationFailure(status_failure: revocation.Failure) ValidationFailure {
+    const reason: FailureReason = switch (status_failure.reason) {
+        .certificate_revoked => .certificate_revoked,
+        .status_unavailable => .revocation_status_unavailable,
+        .status_stale => .revocation_status_stale,
+        .status_malformed => .revocation_status_malformed,
+        .status_unauthenticated => .revocation_status_unauthenticated,
+        .must_staple_not_satisfied => .revocation_must_staple_not_satisfied,
+        .status_source_unsupported => .revocation_source_unsupported,
+        .evidence_index_invalid => .revocation_evidence_invalid,
+        .resource_limit_exceeded => .revocation_resource_limit_exceeded,
+        .out_of_memory => .out_of_memory,
+    };
+    return .{
+        .reason = reason,
+        .certificate_index = status_failure.certificate_index,
+        .revocation_source = status_failure.source,
+        .revocation_defect = status_failure.defect,
+        .revocation_reason = status_failure.revocation_reason,
     };
 }
 

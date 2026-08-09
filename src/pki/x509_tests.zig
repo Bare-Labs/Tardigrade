@@ -1152,6 +1152,7 @@ const fuzz_x509_limits: x509.Limits = .{
     .max_distribution_points = 4,
     .max_access_descriptions = 4,
     .max_name_constraint_subtrees = 8,
+    .max_tls_features = 4,
 };
 
 fn expectViewContained(raw: []const u8, view: []const u8) !void {
@@ -1244,6 +1245,7 @@ fn expectParsedExtensionContained(raw: []const u8, parsed: x509.Extension.Parsed
         .policy_mappings,
         .policy_constraints,
         .inhibit_any_policy,
+        .tls_features,
         .unrecognized,
         => {},
     }
@@ -1422,6 +1424,11 @@ fn expectSameParsedExtension(expected: x509.Extension.Parsed, actual: x509.Exten
         },
         .policy_constraints => try testing.expectEqual(expected.policy_constraints, actual.policy_constraints),
         .inhibit_any_policy => try testing.expectEqual(expected.inhibit_any_policy, actual.inhibit_any_policy),
+        .tls_features => try testing.expectEqualSlices(
+            u16,
+            expected.tls_features.features,
+            actual.tls_features.features,
+        ),
         .unrecognized => {},
     }
 }
@@ -1737,6 +1744,11 @@ fn fuzzX509Semantics(_: void, smith: *testing.Smith) !void {
                 .authority_info_access => |value| try testing.expect(value.len <= fuzz_x509_limits.max_access_descriptions),
                 .crl_distribution_points => |value| try testing.expect(value.len <= fuzz_x509_limits.max_distribution_points),
                 .inhibit_any_policy => |value| try testing.expectEqual(value, certificate.inhibitAnyPolicy().?),
+                .tls_features => |value| {
+                    try testing.expect(value.features.len <= fuzz_x509_limits.max_tls_features);
+                    try testing.expectEqualSlices(u16, value.features, certificate.tlsFeatures().?.features);
+                    try testing.expectEqual(value.requiresStapledStatus(), certificate.mustStaple());
+                },
                 .unrecognized => {},
             }
         }

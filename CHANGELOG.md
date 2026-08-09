@@ -195,6 +195,27 @@ All notable user-facing changes to Tardigrade are documented here.
   orderly close).
 
 ### Features
+- **Certificate-status policy seam for revocation, OCSP, CRLs, and stapling
+  (#349)** — the pure-Zig PKI path now has an explicit, testable
+  certificate-status policy (`src/pki/revocation.zig`) with four modes:
+  `disabled` (the default), `stapled_only`, `soft_fail`, and `strict`. Every
+  accepted path carries a report naming, per certificate, what status evidence
+  was checked and what was not, so an acceptance never implies revocation was
+  verified — under the default policy the report says plainly that nothing was
+  checked. RFC 7633 must-staple is parsed (new TLS Feature extension support in
+  the X.509 model, including the CA-asserted form) and enforced in every mode
+  that consults status; under `disabled` the acceptance records
+  `must_staple_unenforced` rather than silently passing. Status evidence —
+  stapled responses, cached answers, CRL sets, with freshness bounds, defect
+  reasons, and an authentication flag — is supplied by the caller, and
+  unauthenticated evidence never counts as a completed check by default. No
+  validator code performs network or file I/O: a future fetch-and-cache
+  provider implements `revocation.Provider`, runs before validation, and
+  changes no TLS-handshake or path-validation signature. Certificate
+  Authority Information Access and CRL distribution points are now surfaced
+  through typed accessors. See
+  [docs/PKI_REVOCATION.md](docs/PKI_REVOCATION.md) for the modes, the trust
+  boundary, and the privacy/availability tradeoffs. Closes #349.
 - **QUIC negotiated TLS suite packet protection (#566)** — Handshake, 0-RTT,
   and 1-RTT packet protection now follows the TLS 1.3 cipher suite negotiated
   by the native QUIC handshake (`TLS_AES_128_GCM_SHA256`,

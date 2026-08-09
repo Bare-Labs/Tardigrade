@@ -17,6 +17,7 @@
 //! - `path_validator` — deterministic RFC 5280 candidate-path validation
 //! - `name_constraints` — bounded RFC 5280 permitted/excluded subtree state
 //! - `certificate_policy` — bounded RFC 9618 certificate-policy graph
+//! - `revocation` — certificate-status policy seam (CRL/OCSP/stapling)
 //! - `trust_store` — provider-neutral trust-anchor snapshots and bundle loader
 //!
 //! ## Policy summary
@@ -44,6 +45,7 @@ pub const verify = @import("verify.zig");
 pub const path_builder = @import("path_builder.zig");
 pub const name_constraints = @import("name_constraints.zig");
 pub const certificate_policy = @import("certificate_policy.zig");
+pub const revocation = @import("revocation.zig");
 pub const path_validator = @import("path_validator.zig");
 pub const trust_store = @import("trust_store.zig");
 
@@ -56,5 +58,6 @@ test {
     _ = @import("verify_tests.zig");
     _ = @import("path_builder_tests.zig");
     _ = @import("path_validator_tests.zig");
+    _ = @import("revocation_tests.zig");
     _ = @import("trust_store_tests.zig");
 }
