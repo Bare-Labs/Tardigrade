@@ -44,6 +44,7 @@ Required for all runs:
 Required for full non-smoke runs:
 
 - `k6`, used for the idle keep-alive clients plus active traffic scenario
+- `openssl` and `nghttpd`, used for the upstream TLS handshake/reuse phase
 
 Required for the full default competitor set:
 
@@ -87,12 +88,14 @@ representative `http-request return file` path is bounded by HAProxy response
 buffer size and is not valid for a 1 MiB static file. The suite records that row
 as unsupported instead of manufacturing a misleading number.
 
-Full Tardigrade runs also write `upstream-pool-matrix.json`, covering the #147
-matrix absorbed by #149: uneven route traffic, many low-volume origins, one hot
-origin with many workers, local vs cross-worker reuse, new upstream
-connections/sec, CPU/request, p99 TTFB, and contention notes. Upstream TLS
-handshake/reuse is marked unsupported until a TLS-capable local origin fixture
-exists.
+Full Tardigrade runs also write `upstream-pool-matrix.json` and embed the same
+data in `competitive-results.json`, `competitive-results.csv`, and
+`competitive-summary.md`. The matrix covers the #147 workloads absorbed by
+#149: uneven route traffic, many low-volume origins, one hot origin with many
+workers, upstream TLS handshake/reuse, local vs cross-worker reuse, new upstream
+connections/sec, CPU/request, p99 latency, and higher-worker contention
+evidence. `p99_ttfb_ms` remains null until a first-byte-capable load tool is
+wired into that path.
 
 ## Configs
 
@@ -126,10 +129,12 @@ The combined JSON shape is:
         "throughput_mbps": 10.1,
         "cpu_pct_avg": 50.0,
         "rss_mb_peak": 25.0,
+        "open_fds_peak": 128,
         "errors": 0
       }
     }
-  }
+  },
+  "upstream_pool_matrix": { "scenarios": {} }
 }
 ```
 

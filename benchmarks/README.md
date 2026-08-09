@@ -115,8 +115,9 @@ to compare RSS, p99, throughput, buffered bytes, and CPU.
 HAProxy, and Caddy configs one at a time, drives the shared benchmark runner,
 and emits combined JSON, CSV, and Markdown summaries. It covers tiny static,
 large static, small proxy, large proxy, slow-client proxy download, keep-alive,
-and `Connection: close` connection-churn workloads by default, with an optional k6
-idle-keepalive/active-traffic scenario.
+and `Connection: close` connection-churn workloads by default. Full non-smoke
+runs also require k6 for the idle-keepalive/active-traffic scenario and include
+the upstream-pool distribution matrix.
 
 Useful commands:
 

@@ -33,6 +33,7 @@ EDGE_PID=""
 CURRENT_SERVER=""
 CURRENT_CPU_PCT_AVG="null"
 CURRENT_RSS_MB_PEAK="null"
+CURRENT_OPEN_FDS_PEAK="null"
 MONITOR_PID=""
 MONITOR_FILE=""
 
@@ -314,14 +315,38 @@ process_tree_pids() {
     done
 }
 
+count_open_fds_for_pids() {
+    local pids_csv="$1"
+    local total=0 pid count
+    IFS=, read -ra _fd_pids <<< "$pids_csv"
+    for pid in "${_fd_pids[@]}"; do
+        [[ -n "$pid" ]] || continue
+        if [[ -d "/proc/${pid}/fd" ]]; then
+            count=$(find "/proc/${pid}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' ')
+        elif command -v lsof >/dev/null 2>&1; then
+            count=$(lsof -n -P -p "$pid" 2>/dev/null | awk 'NR > 1 { count += 1 } END { print count + 0 }')
+        else
+            count=""
+        fi
+        [[ "$count" =~ ^[0-9]+$ ]] && total=$((total + count))
+    done
+    if [[ "$total" -gt 0 ]]; then
+        printf '%s\n' "$total"
+    else
+        printf 'null\n'
+    fi
+}
+
 monitor_process_tree() {
     local pid="$1" sample_interval_s="$2" outfile="$3"
     while kill -0 "$pid" 2>/dev/null; do
         process_tree_pids "$pid" | paste -sd, - | {
             read -r pids
             [[ -n "$pids" ]] || pids="$pid"
+            local fds
+            fds="$(count_open_fds_for_pids "$pids")"
             ps -p "$pids" -o rss= -o %cpu= 2>/dev/null |
-                awk '{ rss += $1; cpu += $2 } END { if (rss > 0 || cpu > 0) print rss, cpu }' >> "$outfile"
+                awk -v fds="$fds" '{ rss += $1; cpu += $2 } END { if (rss > 0 || cpu > 0) print rss, cpu, fds }' >> "$outfile"
         }
         sleep "$sample_interval_s"
     done
@@ -340,7 +365,8 @@ peak_rss_mb_or_null() {
 start_process_monitor() {
     CURRENT_CPU_PCT_AVG="null"
     CURRENT_RSS_MB_PEAK="null"
-    MONITOR_FILE="$(mktemp /tmp/tardigrade-competitive-monitor-XXXX.txt)"
+    CURRENT_OPEN_FDS_PEAK="null"
+    MONITOR_FILE="$(mktemp /tmp/tardigrade-competitive-monitor-XXXXXX)"
     local sample_interval_s
     sample_interval_s="0.500"
     monitor_process_tree "$EDGE_PID" "$sample_interval_s" "$MONITOR_FILE" &
@@ -356,6 +382,7 @@ stop_process_monitor() {
     if [[ -n "$MONITOR_FILE" && -f "$MONITOR_FILE" ]]; then
         CURRENT_CPU_PCT_AVG="$(average_column_or_null "$MONITOR_FILE" 2)"
         CURRENT_RSS_MB_PEAK="$(peak_rss_mb_or_null "$MONITOR_FILE")"
+        CURRENT_OPEN_FDS_PEAK="$(awk 'NF >= 3 && $3 ~ /^[0-9]+$/ && $3 > max { max = $3 } END { if (max > 0) printf "%d", max; else printf "null" }' "$MONITOR_FILE")"
         rm -f "$MONITOR_FILE"
         MONITOR_FILE=""
     fi
@@ -506,6 +533,7 @@ run_connection_churn() {
         --argjson errors "$errors" \
         --argjson cpu "$CURRENT_CPU_PCT_AVG" \
         --argjson rss "$CURRENT_RSS_MB_PEAK" \
+        --argjson fds "$CURRENT_OPEN_FDS_PEAK" \
         '{
             _meta: {
                 competitive_server: $server,
@@ -521,6 +549,7 @@ run_connection_churn() {
                 throughput_mbps: $mbps,
                 cpu_pct_avg: $cpu,
                 rss_mb_peak: $rss,
+                open_fds_peak: $fds,
                 errors: $errors
             }
         }' > "$output"
@@ -607,7 +636,7 @@ combine_server_results() {
                     (if ((.value.cpu_pct_avg // null) != null and (.value.rps // 0) > 0)
                      then ((.value.cpu_pct_avg / 100.0) / .value.rps * 1000.0)
                      else null end) |
-                .value.p99_ttfb_ms = (.value.p99_ms // null) |
+                .value.p99_ttfb_ms = null |
                 .
             end
         )
@@ -630,7 +659,15 @@ write_combined_outputs() {
         exit 1
     fi
 
-    jq -s '
+    local upstream_matrix="${OUT_DIR}/upstream-pool-matrix.json"
+    local upstream_arg=()
+    if [[ -f "$upstream_matrix" ]]; then
+        upstream_arg=(--slurpfile upstream "$upstream_matrix")
+    else
+        upstream_arg=(--argjson upstream '[]')
+    fi
+
+    jq -s "${upstream_arg[@]}" '
         {
             _meta: {
                 generated_at: (now | todateiso8601),
@@ -644,20 +681,27 @@ write_combined_outputs() {
             },
             servers: (reduce .[] as $doc ({};
                 .[$doc._meta.competitive_server] = $doc
-            ))
+            )),
+            upstream_pool_matrix: (if ($upstream | length) > 0 then $upstream[0] else null end)
         }
     ' --arg tool "$TOOL" --arg duration "$DURATION" --arg connections "$CONNECTIONS" --arg threads "$THREADS" \
         --argjson host_metadata "$(host_metadata_json)" \
         "${server_files[@]}" > "$combined_json"
 
     jq -r '
-        ["server","scenario","supported","rps","p50_ms","p95_ms","p99_ms","p999_ms","throughput_mbps","cpu_pct_avg","cpu_ms_per_request","rss_mb_peak","errors"],
+        ["server","scenario","supported","reason","rps","p50_ms","p95_ms","p99_ms","p999_ms","p99_ttfb_ms","throughput_mbps","cpu_pct_avg","cpu_ms_per_request","rss_mb_peak","open_fds_peak","errors"],
         (.servers | to_entries[] as $server |
             $server.value | to_entries[] |
             select(.key != "_meta") |
-            [$server.key, .key, (.value.supported // true), (.value.rps // null), (.value.p50_ms // null), (.value.p95_ms // null),
-             (.value.p99_ms // null), (.value.p999_ms // null), (.value.throughput_mbps // null),
-             (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.errors // null)])
+            [$server.key, .key, (.value.supported // true), (.value.reason // null), (.value.rps // null), (.value.p50_ms // null), (.value.p95_ms // null),
+             (.value.p99_ms // null), (.value.p999_ms // null), (.value.p99_ttfb_ms // null), (.value.throughput_mbps // null),
+             (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null)]),
+        (if .upstream_pool_matrix != null then
+            (.upstream_pool_matrix.scenarios | to_entries[] |
+                ["tardigrade", ("upstream-pool/" + .key), (.value.covered // .value.supported // true), (.value.reason // .value.sharding_note // null),
+                 (.value.rps // null), null, null, (.value.p99_ms // null), null, (.value.p99_ttfb_ms // null), null,
+                 (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null)])
+         else empty end)
         | @csv
     ' "$combined_json" > "$csv"
 
@@ -666,14 +710,29 @@ write_combined_outputs() {
         echo ""
         echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo ""
-        echo "| Server | Scenario | req/s | p50 ms | p95 ms | p99 ms | p999 ms | MB/s | CPU % | RSS MiB | Errors |"
-        echo "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        echo "| Server | Scenario | Supported | req/s | p50 ms | p95 ms | p99 ms | p999 ms | p99 TTFB ms | MB/s | CPU % | RSS MiB | Open FDs | Errors |"
+        echo "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
         jq -r '
             .servers | to_entries[] as $server |
             $server.value | to_entries[] |
             select(.key != "_meta") |
-            "| `\($server.key)` | `\(.key)` | \((.value.rps // 0) | floor) | \(.value.p50_ms // "-") | \(.value.p95_ms // "-") | \(.value.p99_ms // "-") | \(.value.p999_ms // "-") | \(.value.throughput_mbps // "-") | \(.value.cpu_pct_avg // "-") | \(.value.rss_mb_peak // "-") | \(.value.errors // 0) |"
+            if (.value.supported? == false) then
+                "| `\($server.key)` | `\(.key)` | unsupported: \(.value.reason // "not supported") | - | - | - | - | - | - | - | - | - | - | - |"
+            else
+                "| `\($server.key)` | `\(.key)` | yes | \((.value.rps // 0) | floor) | \(.value.p50_ms // "-") | \(.value.p95_ms // "-") | \(.value.p99_ms // "-") | \(.value.p999_ms // "-") | \(.value.p99_ttfb_ms // "-") | \(.value.throughput_mbps // "-") | \(.value.cpu_pct_avg // "-") | \(.value.rss_mb_peak // "-") | \(.value.open_fds_peak // "-") | \(.value.errors // 0) |"
+            end
         ' "$combined_json"
+        if jq -e '.upstream_pool_matrix != null' "$combined_json" >/dev/null; then
+            echo ""
+            echo "## Upstream Pool Matrix"
+            echo ""
+            echo "| Scenario | Covered | req/s | p99 ms | p99 TTFB ms | CPU % | CPU ms/req | RSS MiB | New conn/s | Reuse ratio | Sharding | Errors |"
+            echo "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |"
+            jq -r '
+                .upstream_pool_matrix.scenarios | to_entries[] |
+                "| `\(.key)` | \((.value.covered // .value.supported // true)) | \(.value.rps // "-") | \(.value.p99_ms // "-") | \(.value.p99_ttfb_ms // "-") | \(.value.cpu_pct_avg // "-") | \(.value.cpu_ms_per_request // "-") | \(.value.rss_mb_peak // "-") | \(.value.new_connections_per_sec // "-") | \(.value.reuse_ratio // "-") | \(.value.sharding_justified // "-") | \(.value.errors // "-") |"
+            ' "$combined_json"
+        fi
         echo ""
         echo "> Use these numbers only for same-host relative comparisons. Dedicated idle hosts are required for canonical claims."
     } > "$md"
@@ -698,6 +757,10 @@ require_tool python3
 require_tool "$TOOL"
 if ! $SMOKE; then
     require_tool k6
+    if [[ ",$SERVERS," == *",tardigrade,"* ]]; then
+        require_tool openssl
+        require_tool nghttpd
+    fi
 fi
 
 IFS=',' read -r -a SERVER_LIST <<< "$SERVERS"
@@ -775,8 +838,8 @@ done
 if ! $SMOKE && selected_tardigrade; then
     "${COMP_DIR}/upstream-pool-matrix.sh" \
         --binary "$BINARY" \
-        --listen-port "$((LISTEN_BASE + 50))" \
-        --origin-base-port "$((UPSTREAM_PORT + 50))" \
+        --listen-port "$((LISTEN_BASE + 200))" \
+        --origin-base-port "$((UPSTREAM_PORT + 200))" \
         --duration "$DURATION" \
         --connections "$CONNECTIONS" \
         --threads "$THREADS" \
