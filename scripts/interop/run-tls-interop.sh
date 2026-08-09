@@ -383,7 +383,7 @@ run_server_truncation_row() {
   "$tls_tool" server --port "$p" --cert "$cert-cert.pem" --key "$cert-key.pem" \
     --cipher-suite "$suite" --group "$group" --signature "$sig" \
     --alpn http/1.1 --expect fail --expect-error TruncatedStream \
-    --expect-peer-close truncated \
+    --expect-peer-close truncated --expect-min-bytes 42 \
     --transcript "$transcripts/${name//\//_}.txt" \
     --timeout-ms 20000 > "$log.native" 2>&1 &
   native_pid=$!
