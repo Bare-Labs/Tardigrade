@@ -531,10 +531,13 @@ zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="
 zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: inner plaintext framing, padding, and bounds remain transactional" --fuzz=10M --summary all --error-style verbose
 zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: protection tamper and sequence boundaries preserve authentication state" --fuzz=10M --summary all --error-style verbose
 zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: epoch operation sequences preserve one-way key lifecycle" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: encrypted stream scripted carrier progression preserves bytes and terminal state" --fuzz=10M --summary all --error-style verbose
+zig build test-tls-record-fuzz -Doptimize=ReleaseFast -Dtls-record-test-filter="fuzz: TLS record: encrypted stream cleanup preserves root errors across alerts and epoch transitions" --fuzz=10M --summary all --error-style verbose
 
 # Replay one named deterministic regression/companion case on its own
 # (the same filter option also selects non-"fuzz:" test names):
 zig build test-tls-record-fuzz -Dtls-record-test-filter="seal classifies every rejection stage at its exact boundary for every suite" --summary all --error-style verbose
+zig build test-tls-record-fuzz -Dtls-record-test-filter="encrypted stream close is terminal and idempotent from every lifecycle state" --summary all --error-style verbose
 ```
 
 No #493 target performs network I/O, draws ambient entropy, loads a real
@@ -553,6 +556,21 @@ and works entirely from fixed stack buffers. The explicit bounds are:
 | Protection output buffer | `max_ciphertext_record_len` (16 645 bytes) |
 | Epoch operations per program | 48 (`fuzz_epoch_max_operations`) |
 | Epoch record content | 24 bytes (`fuzz_epoch_content_len`) |
+| Stream operations per program | 24 (`fuzz_stream_max_operations`) |
+| Scripted carrier script length | 8 actions, cyclic (`scripted_script_len`) |
+| Scripted carrier inbound queue | 4 096 bytes (`scripted_inbound_capacity`) |
+| Scripted carrier capture buffer | 4 096 bytes (`scripted_capture_capacity`) |
+| Peer plaintext chunk per record | 64 bytes (`fuzz_stream_peer_chunk`) |
+| Caller read buffer | 512 bytes (`fuzz_stream_max_read_buf`) |
+| Post-program flush rounds | 96 (`fuzz_stream_flush_rounds`) |
+| Cleanup-case drives | 4 096 (`fuzz_cleanup_max_drives`) |
+
+The stream targets additionally inherit the production per-`drive()` budgets
+and fixed queue capacities, and assert them from the outside:
+`drive_read_budget`/`drive_write_budget` (`2 * max_ciphertext_record_len`
+each), `drive_read_chunk` (4 096), `drive_record_budget` (8), and the four
+owned queues (`max_carrier_input_queue`, `max_plaintext_queue`,
+`max_ciphertext_queue`, `max_handshake_queue`).
 
 Boundary arms deliberately reach the real protocol limits
 (`max_plaintext_fragment_len`, `max_ciphertext_fragment_len`, and one past
@@ -782,13 +800,196 @@ issue's implementation-plan comment:
   named companion. The last two rows are what keep the oracle honest: the
   model cannot silently regress back to mirroring the implementation on
   either teardown path.
-- **#493-C** (scripted in-memory carrier, encrypted-stream progression, docs
-  closeout) is tracked as a follow-on slice of the same issue and will
-  extend this section and the `-Dtls-record-test-filter` namespace when it
-  lands, rather than duplicating this contract. TLS-over-TCP KeyUpdate and
-  key replacement remain #357: the bridge exposes no such surface today, so
-  the epoch target's operation set is the extension point for it rather
-  than a fabricated API.
+- **#493-C** (this slice) — the `encrypted_stream.zig` targets, the scripted
+  in-memory carrier they run on, and this closeout.
+
+  `ScriptedCarrier` is a private test-only `Carrier` implementation built
+  entirely from fixed arrays: a bounded inbound queue, a bounded capture
+  buffer for everything the stream writes, independent cyclic read and write
+  action scripts (`transfer at most N`, `WouldBlock`, zero-byte progress,
+  `EndOfStream`, one typed carrier error per direction), and read/write/close
+  call counters. It opens no descriptor, and neither stream target calls the
+  module's existing socket-pair helpers — those stay behind the deterministic
+  integration tests they already serve. A `.transfer` step with nothing to
+  move reports `WouldBlock` rather than zero, because a zero-byte carrier
+  *read* is EOF to `drive()`; zero-byte *writes* are scripted separately as
+  the no-progress case.
+
+  `encrypted stream scripted carrier progression preserves bytes and terminal
+  state` runs a bounded program of at most 24 operations — `drive`, plaintext
+  `read` with a caller-buffer matrix, plaintext `write` (up to the exact
+  `max_plaintext_fragment_len` a single call can accept, so outbound
+  saturation is reachable inside the budget), `close`, enqueueing another
+  peer record, repeated `drive`, and teardown — against a real
+  `PureZigRecordStream` pair. The peer is a full record stream too, so every
+  inbound record is genuinely sealed and every outbound record genuinely
+  opened; the oracle is checked against the record path rather than a
+  hand-rolled encoder.
+
+  Both application byte streams are *generated* (`subjectStreamByte`,
+  `peerStreamByte`) rather than buffered, so "no loss or duplication" is
+  "the `n`th delivered byte equals `f(n)`" plus a monotone
+  delivered-at-most-accepted bound — which keeps a 16 KiB fragment write
+  expressible without a 16 KiB oracle buffer.
+
+  The peer is the *validator* for everything the subject emits, so its errors
+  are never swallowed: only `WouldBlock` (its own buffer pressure, retried next
+  round) and the explicit clean-`close_notify` branch are expected outcomes.
+  Any other error from `feedCiphertext`/`readPlaintext`/`writePlaintext` means
+  the subject produced bytes the real record path could not authenticate,
+  frame, or deliver — exactly the corruption this target exists to catch — and
+  propagates out of the case.
+
+  Two structural rules keep the seed-corpus replay from being vacuous. Every
+  case carries a **mandatory traffic floor** — at least one inbound record and
+  one application write before the fuzzer's program — so there is always
+  something to account for. And after the program and its flush loop, a
+  **two-stage deterministic epilogue** lifts the scripted obstruction: stage
+  one opens the write side only (so every drive is a *write-only* drive and
+  carrier bytes are the sole thing that can justify `made_progress`), then
+  stage two opens the read side and settles the stream. Without that epilogue a
+  case whose script never let a byte through would reach the accounting
+  assertions with nothing to assert.
+
+  Around every `drive()` the target asserts:
+
+  - exact outbound byte conservation, `queued_before == queued_after +
+    bytes the carrier accepted`, so a partial write discards only the
+    written prefix and keeps the unwritten suffix intact (skipped only for
+    the two drives that legitimately change the queue by other means:
+    sealing `close_notify`, and the close/terminal transition that clears
+    every owned queue);
+  - the per-drive carrier byte budgets, and — because a successful carrier
+    read or write always moves at least one byte — `calls <= bytes + k`,
+    which is the "no spin under repeated zero-progress readiness" property
+    stated as a bound;
+  - `made_progress` is *real*: a drive claiming progress moved a carrier byte
+    or changed observable state, and a drive claiming none moved **no carrier
+    byte in either direction, changed no observable state, and left every
+    owned queue exactly as it was**;
+  - `drive`'s returned readiness equals the stream's readiness on return.
+
+  Per operation it also asserts every queue stays inside both its watermark
+  and its fixed capacity, the plaintext queue and its provenance shadow move
+  together, an owned carrier handle is released at most once ever, and — for
+  a stream that has not been torn down — that backpressure pauses and resumes
+  strictly alternate (`pauses - resumes == (paused ? 1 : 0)`, exactly, for
+  both directions). Errors from plaintext I/O are classified rather than
+  swallowed: an un-latched stream may only refuse I/O for one of the two
+  deferred terminal conditions (`pending_terminal`,
+  `pending_terminal_read_error`) and must report that condition unchanged.
+
+  `encrypted stream cleanup preserves root errors across alerts and epoch
+  transitions` covers the security-sensitive terminal paths in four scenario
+  families: a deferred fatal-alert flush against a scripted write side that
+  may progress partially, block, make no progress, or fail (the root error
+  must latch unchanged, within the bounded deadline, with `write_bytes` never
+  exceeding what was queued); a record-layer authentication failure behind
+  already-delivered genuine plaintext; a `.handshake` epoch discard landing on
+  a partially buffered record (`PartialRecordAtEpochTransition`, after which
+  neither `handshake_complete` nor a further feed can reinterpret those bytes
+  under application keys); and teardown with every owned buffer, both parsers,
+  carrier input, and a pending terminal alert populated at once. Every
+  terminal outcome runs `expectStreamStateCleared`, which checks that each
+  owned buffer is not merely empty but *zeroed* in its backing storage —
+  including both parsers' pending arrays and the plaintext provenance shadow —
+  and that no key material survives at any epoch in either direction.
+
+  **All four families run in every case.** A `smith.index(4)` selector looked
+  reasonable and was wrong: every checked-in corpus entry resolved to the same
+  branch, so three of the four families were never reached by the deterministic
+  seed replay and their properties were only ever checked under a
+  coverage-guided run. Each family builds its own streams and carrier and draws
+  its own Smith values, so running them in sequence keeps every case
+  deterministic. Worth remembering for future slices — a per-case family
+  selector needs proof that the corpus actually spreads across its branches,
+  not just the assumption that it will.
+
+  Each family is deterministic and asserts its own outcome unconditionally:
+
+  - the **authentication-failure** family is staged in two phases, because the
+    property it is named for is a failure landing *behind already-delivered
+    plaintext*. Queuing the genuine prelude and the tampered record together
+    lets one `drive()` open both, and `fail()` clears `inbound_plaintext`
+    before the caller can read any of it — so stage one drives the prelude all
+    the way through to the application and asserts it arrived and that the read
+    sequence advanced, and only then is the tampered next-sequence record
+    queued. After the failure the delivered count must still match exactly:
+    nothing retroactively unmade, and not one byte of the tampered record
+    delivered.
+  - the **teardown** family dirties every state whose zeroization it checks —
+    both parsers simultaneously, inbound plaintext, inbound handshake bytes,
+    unparsed carrier input, queued outbound ciphertext, and a pending terminal
+    alert — and asserts each is nonzero immediately before `deinit()`. The
+    plaintext provenance shadow is deliberately dirtied with `true`: `false` is
+    its *cleared* value, so an all-`false` shadow would make the post-teardown
+    all-`false` assertion vacuous.
+
+  A scenario that cannot reach its own property is a gap in the target, not a
+  passing case.
+
+  **Production finding.** Asserting that teardown property against the
+  *orderly* close path showed a completed close was not clearing its
+  secret-bearing state. `fail()` and `deinit()` each release the handshake
+  driver and wipe every bridge key, but a stream that finished a clean
+  `close_notify` exchange only called `clearOwnedQueues()` and latched
+  `.closed`. Two holders survived until the caller got around to `deinit()`:
+
+  1. the bridge's **application traffic keys**; and
+  2. the owned **handshake driver**, whose borrowed `EventSink` may still hold
+     copied traffic-secret scratch until `Driver.deinit()` — a retention the
+     transport contract documents explicitly.
+
+  Nothing could *use* either (`.closed` rejects every entry point), so this is
+  retention rather than an exploitable path, but it is retention with no
+  purpose, and the record contract's rule is that a torn-down session keeps no
+  secret-bearing state. The five orderly close-completion sites now share one
+  `finishClose()` helper that runs the same teardown order as `deinit()` and
+  `fail()`: `teardownDriver()`, then the queues, then the bridge.
+  `authStillPending()` gained the matching `driver_torn_down` guard, because
+  `drive()` can reach it later in the same call after an in-loop
+  `queueCloseNotify()` completed the close.
+
+  Following the #493-A/B standard, the scripted corpus classes the issue
+  requires that a seed-corpus replay cannot reliably reach have named
+  deterministic companions next to the targets:
+
+  | Companion | Pins |
+  | --- | --- |
+  | `…delivers every byte across one-byte reads and writes` | full bidirectional exchange through single-byte carrier transfers |
+  | `…settles without spinning under repeated would-block and zero-progress carriers` | 64 repetitions: no progress claimed, no byte moved, queue unchanged, readiness stable, constant carrier work per drive |
+  | `…carrier EOF at every record boundary preserves truncation and delivery order` | EOF before a record, mid-header, mid-payload, one byte short, and exactly after a complete record; buffered plaintext delivered first, then the preserved `TruncatedStream` |
+  | `…partial carrier writes preserve the exact unwritten suffix` | written prefix and retained suffix compared byte for byte on every drive, then reassembled and opened at the peer |
+  | `…output saturation pauses plaintext writes and resumes below the low watermark` | one pause per crossing, a rejected retry consuming nothing, one resume, no byte lost across the cycle |
+  | `…inbound plaintext saturation pauses carrier reads and resumes after draining` | the same, for the read side |
+  | `…close is terminal and idempotent from every lifecycle state` | close during handshaking, open, closing, and failed; carrier released exactly once; the `finishClose` key wipe |
+  | `…orderly close releases the handshake driver and its secret scratch` | a completed driver-owned session and a mid-handshake cancellation: driver and backend released exactly once *at close*, the sink's used secret scratch zeroed, and a later `deinit()` that does not release the backend twice |
+
+  Mutation-validated:
+
+  | Mutation | Caught by |
+  | --- | --- |
+  | Drop `bridge.deinit()` from `finishClose` | `…close is terminal and idempotent from every lifecycle state` |
+  | Drop `teardownDriver()` from `finishClose` | `…orderly close releases the handshake driver and its secret scratch` |
+  | Subject emits one corrupted ciphertext byte toward the peer | progression target, seed replay |
+  | A carrier write is not reported as `made_progress` | progression target, seed replay (via the epilogue's write-only stage) |
+  | `drive()` latches a carrier error instead of the preserved root error | cleanup target, seed replay |
+  | `ByteQueue.clear` stops zeroing its backing storage | cleanup target, seed replay, plus two named cleanup tests |
+  | `PlaintextProvenanceQueue.clear` stops zeroing its backing storage | cleanup target, seed replay (teardown family) |
+  | Opening an application record drops its plaintext instead of queuing it | cleanup target, seed replay (authentication-failure family's staged prelude) |
+  | `drive()`'s write loop consumes one byte more than the carrier accepted | `…partial carrier writes preserve the exact unwritten suffix` plus four existing tests |
+
+  The corruption mutation has to be scoped to the subject's own role:
+  corrupting *both* directions makes the case terminate early on a bad inbound
+  record and never reach the outbound accounting at all — a useful reminder
+  that a mutation which merely turns some test red is not the same as one that
+  proves the property under test bites.
+
+  TLS-over-TCP KeyUpdate and key replacement remain #357: the bridge exposes
+  no such surface today, so the epoch target's operation set is the extension
+  point for it rather than a fabricated API. The stream targets' operation
+  sets are the corresponding extension point for any future post-handshake
+  record-layer operation.
 
 Ownership stays exactly as scoped above and in the issue: shared TLS
 message/negotiation/transcript fuzzing is #491; PKI fuzzing is #492;
@@ -803,10 +1004,11 @@ pre-existing deterministic `record_codec.zig` test suite already pins most
 of them by name, and the #493 property targets promote them into generated
 properties rather than leaving them as fixed examples: exact parser
 consumption under fragmentation, sink retry behavior, and the
-legal/illegal initial-ClientHello `0x0301` window in #493-A, and epoch
+legal/illegal initial-ClientHello `0x0301` window in #493-A, epoch
 discard/transition ordering, sequence exhaustion, and key cleanup in
-#493-B. The encrypted-stream progression and terminal-error classes remain
-deterministic-only until #493-C.
+#493-B, and partial-record rejection at an epoch transition, terminal-error
+preservation across an alert flush, and byte-exact progression under
+fragmented carrier I/O in #493-C.
 
 ### #492 — DER / PEM / X.509 / path validation (epic #324-K)
 
