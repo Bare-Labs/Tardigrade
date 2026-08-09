@@ -16,19 +16,24 @@ set -eu
 out="${1:?usage: gen-certs.sh OUT_DIR}"
 mkdir -p "$out"
 
-gen() { # name algo-args...
+# Each identity also carries a per-key-type SAN (`ed25519.tardigrade.test`,
+# ...). #338's certificate-selection rows drive the engine's SNI selector by
+# connecting with those names, and a certificate that did not actually assert
+# the name it was selected for would make the row prove less than it looks.
+gen() { # name extra-san algo-args...
   name="$1"
-  shift
+  extra_san="$2"
+  shift 2
   openssl genpkey "$@" -out "$out/$name-key.pem" 2>/dev/null
   openssl req -new -x509 -key "$out/$name-key.pem" -out "$out/$name-cert.pem" -days 30 \
     -subj "/CN=tardigrade.test" \
-    -addext "subjectAltName=DNS:tardigrade.test,IP:127.0.0.1" 2>/dev/null
+    -addext "subjectAltName=DNS:tardigrade.test,DNS:$extra_san,IP:127.0.0.1" 2>/dev/null
   openssl x509 -in "$out/$name-cert.pem" -outform DER -out "$out/$name-cert.der"
   openssl pkcs8 -topk8 -nocrypt -in "$out/$name-key.pem" -outform DER -out "$out/$name-key.pkcs8.der"
 }
 
-gen ed25519 -algorithm ed25519
-gen p256 -algorithm EC -pkeyopt ec_paramgen_curve:P-256
-gen rsa2048 -algorithm RSA -pkeyopt rsa_keygen_bits:2048
+gen ed25519 ed25519.tardigrade.test -algorithm ed25519
+gen p256 p256.tardigrade.test -algorithm EC -pkeyopt ec_paramgen_curve:P-256
+gen rsa2048 rsa.tardigrade.test -algorithm RSA -pkeyopt rsa_keygen_bits:2048
 
 echo "certificates written to $out"

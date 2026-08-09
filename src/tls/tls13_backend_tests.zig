@@ -7476,6 +7476,14 @@ const ClientHelloOptions = struct {
     sig_schemes: []const u16 = &.{ 0x0807, 0x0403 },
     alpn_protocols: ?[]const []const u8 = &.{"h2"},
     duplicate_supported_versions: bool = false,
+    /// #338: omit `supported_versions` entirely, modelling a genuine pre-1.3
+    /// ClientHello. RFC 8446 Appendix D.2 makes this a *legacy* hello rather
+    /// than a malformed one, so it must be distinguishable from every other
+    /// "extension missing" case.
+    omit_supported_versions: bool = false,
+    /// #338: offer `supported_versions` naming only versions this endpoint
+    /// does not support (default TLS 1.2), the other RFC 8446 §4.2.1 case.
+    supported_versions: []const u16 = &.{0x0304},
     /// #484: send `key_share` with a legal empty `client_shares` vector
     /// instead of a real x25519 entry.
     empty_key_share: bool = false,
@@ -7537,15 +7545,17 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
 
     const extensions_len = try w.reserve(2);
     // supported_versions
-    try w.u16_(43);
-    try w.u16_(3);
-    try w.u8_(2);
-    try w.u16_(0x0304);
-    if (opts.duplicate_supported_versions) {
+    if (!opts.omit_supported_versions) {
         try w.u16_(43);
-        try w.u16_(3);
-        try w.u8_(2);
-        try w.u16_(0x0304);
+        try w.u16_(@intCast(1 + 2 * opts.supported_versions.len));
+        try w.u8_(@intCast(2 * opts.supported_versions.len));
+        for (opts.supported_versions) |version| try w.u16_(version);
+        if (opts.duplicate_supported_versions) {
+            try w.u16_(43);
+            try w.u16_(@intCast(1 + 2 * opts.supported_versions.len));
+            try w.u8_(@intCast(2 * opts.supported_versions.len));
+            for (opts.supported_versions) |version| try w.u16_(version);
+        }
     }
     // supported_groups
     try w.u16_(10);
@@ -8169,6 +8179,81 @@ fn expectServerReceiveError(server: *tls_backend.Tls13Backend, opts: ClientHello
     var buf: [2048]u8 = undefined;
     const hello = try buildClientHello(&buf, opts);
     try std.testing.expectError(want, server.backend().receive(.initial, hello, &sink));
+}
+
+test "#338 the engine reports which credential its selector actually chose" {
+    // Certificate selection is otherwise invisible from outside: the chosen
+    // credential lives in a transient `SelectedCredential` released as soon as
+    // the flight is signed. Without this, a conformance row offering several
+    // identities could only confirm that *a* handshake completed, not that the
+    // engine picked the one the row expected.
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+
+    // Nothing is selected before a ClientHello has been processed.
+    try std.testing.expectEqual(
+        @as(?tls_core.algorithms.SignatureScheme, null),
+        h.server_engine.negotiated_signature_scheme,
+    );
+
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    // The fixture identity is Ed25519, so that is what CertificateVerify was
+    // signed with -- and the client never selects a credential at all here,
+    // since the server did not request client authentication.
+    try std.testing.expectEqual(
+        tls_core.algorithms.SignatureScheme.ed25519,
+        h.server_engine.negotiated_signature_scheme.?,
+    );
+    try std.testing.expectEqual(
+        @as(?tls_core.algorithms.SignatureScheme, null),
+        h.client_engine.negotiated_signature_scheme,
+    );
+}
+
+test "#338 a legacy ClientHello without supported_versions is refused with protocol_version" {
+    // RFC 8446 Appendix D.2: absence of `supported_versions` does not make a
+    // ClientHello malformed. The server treats it as a pre-1.3 hello and
+    // negotiates `min(legacy_version, TLS 1.2)`; supporting nothing in that
+    // range, §4.2.1 requires it to abort with `protocol_version`.
+    //
+    // This previously reported `MissingExtension`/`missing_extension`, which
+    // told a perfectly conformant TLS 1.2 client that its hello was
+    // malformed -- and the #338 matrix's `tls12_downgrade` row was codifying
+    // that as expected behaviour against real OpenSSL.
+    var server_provider_storage: ProviderStorage = .{};
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var server = serverWithProvider(&server_provider_storage, &mock);
+    defer server.deinit();
+    try expectServerReceiveError(&server, .{ .omit_supported_versions = true }, error.UnsupportedProtocolVersion);
+    try std.testing.expectEqual(
+        tls_core.alerts.AlertDescription.protocol_version,
+        tls_core.alerts.fromHandshakeError(error.UnsupportedProtocolVersion),
+    );
+}
+
+test "#338 a supported_versions offering only TLS 1.2 is refused with protocol_version too" {
+    // The other RFC 8446 §4.2.1 case: the extension is present and
+    // well-formed but names no version we support. Both reach the same alert,
+    // which is what lets a peer distinguish version negotiation failing from
+    // a malformed or incomplete hello.
+    var server_provider_storage: ProviderStorage = .{};
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var server = serverWithProvider(&server_provider_storage, &mock);
+    defer server.deinit();
+    try expectServerReceiveError(&server, .{ .supported_versions = &.{0x0303} }, error.UnsupportedProtocolVersion);
+}
+
+test "#338 a genuinely absent extension is still MissingExtension, not a version failure" {
+    // Guards the distinction the fix rests on: only `supported_versions` gets
+    // the legacy-hello reading. Another required extension going missing is
+    // still an ordinary `missing_extension`, so the two failure classes stay
+    // separable for a peer.
+    var server_provider_storage: ProviderStorage = .{};
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var server = serverWithProvider(&server_provider_storage, &mock);
+    defer server.deinit();
+    try expectServerReceiveError(&server, .{ .include_signature_algorithms = false }, error.MissingExtension);
 }
 
 fn countCryptoEvents(sink: *const DirectSink, epoch: events.EncryptionEpoch) usize {

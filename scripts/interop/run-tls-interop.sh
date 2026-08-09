@@ -28,10 +28,11 @@
 #   GNUTLS_CLI/GNUTLS_SERV gnutls binaries          (default: gnutls-cli/-serv)
 #   NGTCP2_EXAMPLES_DIR   dir with gtlsclient/gtlsserver, for external QUIC
 #
-# The `ci` profile keeps both roles, both transports, every negative row, and
-# every cipher suite, but reduces the positive record matrix to one
-# representative group/signature per suite plus a full sweep on the baseline
-# suite. See docs/TLS_INTEROP_MATRIX.md for what each profile covers and why.
+# Both profiles run every supported (suite, group, signature) tuple in both
+# record roles against OpenSSL, every tuple on QUIC, and every negative and
+# certificate-selection row. `ci` reduces only the *second* implementation's
+# sweep: GnuTLS cross-checks one representative tuple per suite instead of all
+# of them. See docs/TLS_INTEROP_MATRIX.md.
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -90,8 +91,7 @@ next_port() { port=$((port + 1)); }
 # Wait for the native tool's own readiness line rather than sleeping: loading
 # an RSA identity takes over a second, and a fixed sleep would race it.
 wait_for_native_listener() { # logfile
-  local i
-  for i in $(seq 1 150); do
+  for _ in $(seq 1 150); do
     grep -q 'tls-interop: listening' "$1" 2>/dev/null && return 0
     sleep 0.1
   done
@@ -103,8 +103,7 @@ wait_for_native_listener() { # logfile
 # connection, and the probe would consume it, leaving the row's real client
 # with nothing to talk to.
 wait_for_peer_listener() { # logfile pattern
-  local i
-  for i in $(seq 1 150); do
+  for _ in $(seq 1 150); do
     grep -qi "$2" "$1" 2>/dev/null && return 0
     sleep 0.1
   done
@@ -112,12 +111,65 @@ wait_for_peer_listener() { # logfile pattern
 }
 
 # ── matrix vocabulary ───────────────────────────────────────────────────────
-# These names are the ones tests/tls_interop_matrix.zig parses; the OpenSSL and
-# GnuTLS spellings beside them are how each peer names the same identifier.
+# The dimension lists are *not* written here. They come from the engine via
+# `tls_interop_tool list-capabilities`, so this script cannot drift from
+# `native_capabilities`: a newly supported suite/group/signature becomes a new
+# row automatically, and one this script has no peer spelling for fails
+# preflight loudly instead of being silently skipped.
+#
+# Only the peer *spellings* below are script-local -- they describe OpenSSL and
+# GnuTLS, not Tardigrade, so there is nothing on the Zig side for them to drift
+# from.
 
-suites=(aes128-gcm-sha256 aes256-gcm-sha384 chacha20-poly1305-sha256)
-groups=(x25519 secp256r1)
-signatures=(ed25519 ecdsa-p256-sha256 rsa-pss-rsae-sha256)
+suites=()
+groups=()
+signatures=()
+
+load_capabilities() {
+  local kind name
+  while IFS=$'\t' read -r kind name; do
+    [ -z "$kind" ] && continue
+    case "$kind" in
+      cipher-suite) suites+=("$name") ;;
+      group) groups+=("$name") ;;
+      signature) signatures+=("$name") ;;
+      *) say "unknown capability kind from the engine: $kind"; exit 1 ;;
+    esac
+  done < <("$tls_tool" list-capabilities)
+
+  if [ ${#suites[@]} -eq 0 ] || [ ${#groups[@]} -eq 0 ] || [ ${#signatures[@]} -eq 0 ]; then
+    say "the engine reported an empty capability dimension; refusing to run a hollow matrix"
+    exit 1
+  fi
+}
+
+# Every engine capability must have a spelling for each peer, or the row would
+# silently degrade into "whatever that peer defaults to" -- which is exactly
+# the drift consuming `list-capabilities` is meant to prevent. Missing
+# spellings are a preflight failure, not a skip.
+check_peer_spellings() {
+  local value missing=0
+  for value in "${suites[@]}"; do
+    [ -z "$(openssl_suite "$value")" ] && { say "no OpenSSL spelling for cipher suite: $value"; missing=1; }
+    [ "$have_gnutls" -eq 1 ] && [ -z "$(gnutls_suite "$value")" ] && { say "no GnuTLS spelling for cipher suite: $value"; missing=1; }
+  done
+  for value in "${groups[@]}"; do
+    [ -z "$(openssl_group "$value")" ] && { say "no OpenSSL spelling for group: $value"; missing=1; }
+    [ "$have_gnutls" -eq 1 ] && [ -z "$(gnutls_group "$value")" ] && { say "no GnuTLS spelling for group: $value"; missing=1; }
+  done
+  for value in "${signatures[@]}"; do
+    [ -z "$(openssl_sigalg "$value")" ] && { say "no OpenSSL spelling for signature scheme: $value"; missing=1; }
+    [ "$have_gnutls" -eq 1 ] && [ -z "$(gnutls_sign "$value")" ] && { say "no GnuTLS spelling for signature scheme: $value"; missing=1; }
+    [ -z "$(cert_for_signature "$value")" ] && { say "no credential for signature scheme: $value"; missing=1; }
+  done
+  if [ "$missing" -ne 0 ]; then
+    say ""
+    say "The engine gained a capability this runner cannot drive yet. Add the"
+    say "peer spellings above (and a credential if the signature dimension grew)"
+    say "so the new tuple is actually covered."
+    exit 1
+  fi
+}
 
 openssl_suite() {
   case "$1" in
@@ -175,12 +227,17 @@ cert_for_signature() {
   esac
 }
 
-# The reduced CI profile: every suite and both roles survive, but the
-# group/signature sweep collapses to one representative pairing per suite. The
-# baseline suite still walks the full sweep, so a regression in any single
-# group or signature is still caught somewhere in CI.
-row_in_ci_profile() { # suite group signature
-  [ "$1" = "aes128-gcm-sha256" ] && return 0
+# The reduced CI profile reduces *peer multiplicity*, never tuple coverage.
+#
+# #338 requires CI to prove positive interop for every supported tuple in both
+# roles, so every `(suite, group, signature)` combination runs in both record
+# roles against OpenSSL, and every combination runs on QUIC, in both profiles.
+# What `ci` drops is the second implementation's sweep: GnuTLS cross-checks one
+# representative tuple per suite rather than all of them. A regression in any
+# tuple is still caught; only a regression that is simultaneously
+# tuple-specific *and* GnuTLS-specific could slip to the nightly full profile.
+gnutls_row_in_profile() { # suite group signature
+  [ "$profile" = "full" ] && return 0
   [ "$2" = "x25519" ] && [ "$3" = "ed25519" ] && return 0
   return 1
 }
@@ -277,18 +334,22 @@ run_client_row() { # name peer suite group signature [extra native args...]
   fi
 }
 
-# A negative row: the native side is expected to fail, with a named alert when
-# the standard defines one. `native_args` and `peer_cmd` are supplied per row.
-run_negative_server_row() { # name expect_alert native_args... -- peer_cmd...
+# Start the native server for a negative row and wait until it is listening.
+# Reports the port and PID through globals rather than stdout: a
+# `p="$(start_negative_server ...)"` would run the whole function in a
+# subshell, so the backgrounded server's PID (and `next_port`'s increment)
+# would be lost with that subshell and `finish_negative_row` would have
+# nothing to wait on.
+negative_native_pid=""
+negative_port=""
+start_negative_server() { # name expect_alert native_args...
   local name="$1"; shift
   local expect_alert="$1"; shift
-  local native_args=()
-  while [ "$1" != "--" ]; do native_args+=("$1"); shift; done
-  shift
-  local p log
-  next_port; p="$port"
+  local log
+  next_port; negative_port="$port"
   log="$logs/${name//\//_}"
 
+  local native_args=("$@")
   # An unset-vs-empty array expands to nothing under `set -u` on bash 3.2
   # (still the system bash on macOS), so a row with no expected alert is
   # folded into `native_args` rather than expanded as its own empty array.
@@ -296,40 +357,75 @@ run_negative_server_row() { # name expect_alert native_args... -- peer_cmd...
     native_args=(--expect-alert "$expect_alert" "${native_args[@]}")
   fi
 
-  "$tls_tool" server --port "$p" --cert "$certs/ed25519-cert.pem" --key "$certs/ed25519-key.pem" \
+  "$tls_tool" server --port "$negative_port" --cert "$certs/ed25519-cert.pem" --key "$certs/ed25519-key.pem" \
     --expect fail "${native_args[@]}" \
     --transcript "$transcripts/${name//\//_}.txt" --timeout-ms 20000 > "$log.native" 2>&1 &
-  local native_pid=$!
+  negative_native_pid=$!
   if ! wait_for_native_listener "$log.native"; then
-    kill "$native_pid" 2>/dev/null
-    result "$name" FAIL "native listener never came up"
-    return
+    kill "$negative_native_pid" 2>/dev/null
+    negative_native_pid=""
+    return 1
   fi
+  return 0
+}
 
-  # The peer command receives the port as $PORT.
-  PORT="$p" CERT="$certs/ed25519-cert.pem" bash -c "$*" > "$log.peer" 2>&1
-
-  if wait "$native_pid"; then
+finish_negative_row() { # name
+  local name="$1"
+  local log="$logs/${name//\//_}"
+  if wait "$negative_native_pid"; then
     result "$name" PASS "$(grep -o 'error=.*' "$log.native" | head -1)"
   else
     result "$name" FAIL "see $log.native"
   fi
+  negative_native_pid=""
+}
+
+# A negative row driven by an external TLS client. The peer's argv is passed as
+# real arguments with the literal token `@PORT@` standing in for this row's
+# port -- the port is only known once `start_negative_server` has run, and
+# substituting a placeholder keeps the command an argv rather than a string
+# handed to a child shell -- no `eval`, no quoting hazard, and no unexpanded
+# `$VAR` sitting inside a single-quoted string for a linter to trip over.
+run_negative_server_row() { # name expect_alert native_args... -- peer_argv...
+  local name="$1"; shift
+  local expect_alert="$1"; shift
+  local native_args=()
+  while [ "$1" != "--" ]; do native_args+=("$1"); shift; done
+  shift
+
+  if ! start_negative_server "$name" "$expect_alert" "${native_args[@]}"; then
+    result "$name" FAIL "native listener never came up"
+    return
+  fi
+
+  local peer_argv=()
+  local arg
+  for arg in "$@"; do peer_argv+=("${arg//@PORT@/$negative_port}"); done
+  printf 'x' | "${peer_argv[@]}" > "$logs/${name//\//_}.peer" 2>&1
+
+  finish_negative_row "$name"
+}
+
+# A negative row driven by raw bytes on the socket rather than by a TLS client.
+# Written from this shell (where the port is an ordinary variable) so there is
+# no child-shell indirection at all.
+run_raw_record_row() { # name expect_alert byte_string native_args...
+  local name="$1"; shift
+  local expect_alert="$1"; shift
+  local bytes="$1"; shift
+
+  if ! start_negative_server "$name" "$expect_alert" "$@"; then
+    result "$name" FAIL "native listener never came up"
+    return
+  fi
+
+  # shellcheck disable=SC2059 # `bytes` is a printf format supplying \x escapes
+  printf "$bytes" > "/dev/tcp/127.0.0.1/$negative_port"
+
+  finish_negative_row "$name"
 }
 
 # ── preflight ───────────────────────────────────────────────────────────────
-
-if [ "$list_only" -eq 1 ]; then
-  say "profile: $profile"
-  for suite in "${suites[@]}"; do
-    for group in "${groups[@]}"; do
-      for sig in "${signatures[@]}"; do
-        if [ "$profile" = "ci" ] && ! row_in_ci_profile "$suite" "$group" "$sig"; then continue; fi
-        say "positive  $suite/$group/$sig"
-      done
-    done
-  done
-  exit 0
-fi
 
 for tool in "$tls_tool" "$h3_tool"; do
   if [ ! -x "$tool" ]; then
@@ -349,6 +445,24 @@ if command -v "$gnutls_cli" >/dev/null 2>&1 && command -v "$gnutls_serv" >/dev/n
   have_gnutls=1
 fi
 
+# The dimension lists come from the engine itself; peer spellings are checked
+# against them before a single row runs.
+load_capabilities
+check_peer_spellings
+
+if [ "$list_only" -eq 1 ]; then
+  say "profile: $profile"
+  say "engine capabilities: ${#suites[@]} suites x ${#groups[@]} groups x ${#signatures[@]} signatures"
+  for suite in "${suites[@]}"; do
+    for group in "${groups[@]}"; do
+      for sig in "${signatures[@]}"; do
+        say "positive  $suite/$group/$sig"
+      done
+    done
+  done
+  exit 0
+fi
+
 say "generating interop certificates in $certs"
 "$here/gen-certs.sh" "$certs" >/dev/null || { say "certificate generation failed"; exit 1; }
 
@@ -365,20 +479,22 @@ say ""
 
 # ── 1. positive record-transport matrix, both roles, both peers ─────────────
 
+# Every supported tuple, both roles, in every profile -- #338 requires CI to
+# prove positive interop for all of them. Only the second implementation's
+# sweep is reduced under `ci`; see `gnutls_row_in_profile`.
 say "== record transport: positive tuples =="
 for suite in "${suites[@]}"; do
   for group in "${groups[@]}"; do
     for sig in "${signatures[@]}"; do
-      if [ "$profile" = "ci" ] && ! row_in_ci_profile "$suite" "$group" "$sig"; then continue; fi
       tuple="$suite/$group/$sig"
       run_server_row "record/server/openssl/$tuple" openssl "$suite" "$group" "$sig"
       run_client_row "record/client/openssl/$tuple" openssl "$suite" "$group" "$sig"
-      if [ "$have_gnutls" -eq 1 ]; then
-        run_server_row "record/server/gnutls/$tuple" gnutls "$suite" "$group" "$sig"
-        run_client_row "record/client/gnutls/$tuple" gnutls "$suite" "$group" "$sig"
-      else
+      if [ "$have_gnutls" -eq 0 ]; then
         result "record/server/gnutls/$tuple" SKIP "gnutls not installed"
         result "record/client/gnutls/$tuple" SKIP "gnutls not installed"
+      elif gnutls_row_in_profile "$suite" "$group" "$sig"; then
+        run_server_row "record/server/gnutls/$tuple" gnutls "$suite" "$group" "$sig"
+        run_client_row "record/client/gnutls/$tuple" gnutls "$suite" "$group" "$sig"
       fi
     done
   done
@@ -403,54 +519,67 @@ run_client_row "record/client/openssl/hrr" openssl aes128-gcm-sha256 x25519 ed25
 say ""
 say "== record transport: negative conformance =="
 
+# Each row hands the peer a real argv; `@PORT@` is substituted with that row's
+# port by `run_negative_server_row`.
+ca="$certs/ed25519-cert.pem"
+
 # RFC 7301 §3.2: no mutually supported protocol is fatal no_application_protocol.
 run_negative_server_row "record/negative/alpn_no_overlap" no_application_protocol \
   --alpn h2 -- \
-  'printf x | '"$openssl_bin"' s_client -connect 127.0.0.1:$PORT -servername tardigrade.test -tls1_3 -alpn http/1.1 -CAfile $CERT'
+  "$openssl_bin" s_client -connect "127.0.0.1:@PORT@" -servername tardigrade.test \
+  -tls1_3 -alpn http/1.1 -CAfile "$ca"
 
-# RFC 8446 §4.2.1: a TLS 1.2 ClientHello carries no supported_versions, so a
-# TLS-1.3-only server rejects it before any version can be negotiated.
-run_negative_server_row "record/negative/tls12_downgrade" missing_extension \
-  --alpn http/1.1 -- \
-  'printf x | '"$openssl_bin"' s_client -connect 127.0.0.1:$PORT -tls1_2 -CAfile $CERT'
+# RFC 8446 Appendix D.2: a ClientHello with no `supported_versions` is a legal
+# *legacy* hello, not a malformed one -- the server negotiates
+# `min(legacy_version, TLS 1.2)`, has nothing in that range, and per §4.2.1
+# aborts with `protocol_version`. Reporting `missing_extension` here would tell
+# a perfectly conformant TLS 1.2 client that its hello was malformed.
+run_negative_server_row "record/negative/tls12_downgrade" protocol_version \
+  --alpn http/1.1 --expect-error UnsupportedProtocolVersion -- \
+  "$openssl_bin" s_client -connect "127.0.0.1:@PORT@" -tls1_2 -CAfile "$ca"
 
 # No mutually supported cipher suite: the server has nothing to select.
 run_negative_server_row "record/negative/cipher_no_overlap" handshake_failure \
-  --cipher-suite chacha20-poly1305-sha256 --alpn http/1.1 -- \
-  'printf x | '"$openssl_bin"' s_client -connect 127.0.0.1:$PORT -servername tardigrade.test -tls1_3 -ciphersuites TLS_AES_256_GCM_SHA384 -alpn http/1.1 -CAfile $CERT'
+  --cipher-suite chacha20-poly1305-sha256 --alpn http/1.1 --expect-error NoMutualParameters -- \
+  "$openssl_bin" s_client -connect "127.0.0.1:@PORT@" -servername tardigrade.test \
+  -tls1_3 -ciphersuites TLS_AES_256_GCM_SHA384 -alpn http/1.1 -CAfile "$ca"
 
 # No mutually supported group: neither the offered share nor a retry can help.
 run_negative_server_row "record/negative/group_no_overlap" handshake_failure \
-  --group x25519 --alpn http/1.1 -- \
-  'printf x | '"$openssl_bin"' s_client -connect 127.0.0.1:$PORT -servername tardigrade.test -tls1_3 -groups P-384 -alpn http/1.1 -CAfile $CERT'
+  --group x25519 --alpn http/1.1 --expect-error NoMutualParameters -- \
+  "$openssl_bin" s_client -connect "127.0.0.1:@PORT@" -servername tardigrade.test \
+  -tls1_3 -groups P-384 -alpn http/1.1 -CAfile "$ca"
 
 # No signature scheme the server's Ed25519 credential can satisfy
 # (RFC 8446 §4.4.2.2 -> handshake_failure).
 run_negative_server_row "record/negative/signature_no_overlap" handshake_failure \
-  --signature ed25519 --alpn http/1.1 -- \
-  'printf x | '"$openssl_bin"' s_client -connect 127.0.0.1:$PORT -servername tardigrade.test -tls1_3 -sigalgs rsa_pss_rsae_sha256 -alpn http/1.1 -CAfile $CERT'
+  --signature ed25519 --alpn http/1.1 --expect-error NoApplicableCredential -- \
+  "$openssl_bin" s_client -connect "127.0.0.1:@PORT@" -servername tardigrade.test \
+  -tls1_3 -sigalgs rsa_pss_rsae_sha256 -alpn http/1.1 -CAfile "$ca"
 
-# A ClientHello with no SNI against a server that requires one.
-run_negative_server_row "record/negative/sni_absent" "" \
-  --require-sni --alpn http/1.1 -- \
-  'printf x | '"$openssl_bin"' s_client -connect 127.0.0.1:$PORT -noservername -tls1_3 -alpn http/1.1 -CAfile $CERT'
+# A ClientHello with no SNI against a server that requires one. Both the wire
+# class and the typed local error are pinned: asserting only "something failed"
+# would let a timeout or an unrelated handshake bug keep this row green while
+# the SNI policy was never exercised at all.
+run_negative_server_row "record/negative/sni_absent" missing_extension \
+  --require-sni --alpn http/1.1 --expect-error MissingExtension -- \
+  "$openssl_bin" s_client -connect "127.0.0.1:@PORT@" -noservername \
+  -tls1_3 -alpn http/1.1 -CAfile "$ca"
 
 # Malformed record ordering: an application_data record arriving before any
 # ClientHello must be rejected, not buffered until keys exist. Written straight
 # to the socket rather than through a TLS client -- piping these bytes to
 # `openssl s_client` would send them as post-handshake application data, which
 # is a different (and legal) thing entirely.
-run_negative_server_row "record/negative/malformed_ordering" "" \
-  --alpn http/1.1 --allow-absent-alpn --expect-error UnexpectedRecordContent -- \
-  'printf "\x17\x03\x03\x00\x05hello" > /dev/tcp/127.0.0.1/$PORT'
+run_raw_record_row "record/negative/malformed_ordering" "" '\x17\x03\x03\x00\x05hello' \
+  --alpn http/1.1 --allow-absent-alpn --expect-error UnexpectedRecordContent
 
 # A middlebox-compat change_cipher_spec with no ClientHello before it. RFC 8446
 # §5.1 only tolerates that record *after* a ClientHello has been accepted, so
 # the compatibility window must stay shut here -- the companion to the
 # post-HelloRetryRequest widening this change makes.
-run_negative_server_row "record/negative/ccs_before_clienthello" "" \
-  --alpn http/1.1 --allow-absent-alpn --expect-error UnexpectedRecordContent -- \
-  'printf "\x14\x03\x03\x00\x01\x01" > /dev/tcp/127.0.0.1/$PORT'
+run_raw_record_row "record/negative/ccs_before_clienthello" "" '\x14\x03\x03\x00\x01\x01' \
+  --alpn http/1.1 --allow-absent-alpn --expect-error UnexpectedRecordContent
 
 # The native client must reject a server certificate it did not pin.
 negative_client_pin() {
@@ -477,6 +606,92 @@ negative_client_pin() {
 negative_client_pin
 
 # ── 4. QUIC transport: the same tuples through the same engine ──────────────
+
+# ── 3b. server certificate selection ────────────────────────────────────────
+
+say ""
+say "== record transport: server certificate selection =="
+# The positive rows above hand the server exactly one identity, so they prove
+# the *preselected* certificate works -- they cannot prove the engine would
+# have chosen it. These rows give the server all three credentials at once
+# through the production SNI/signature-algorithm credential provider and let
+# the peer's ClientHello drive the choice, then assert which one the engine
+# actually signed with (`--expect-signature`, read back from the engine's own
+# `negotiated_signature_scheme`, not from what the harness passed in).
+
+all_identities=(
+  --identity "tardigrade.test:$certs/ed25519-cert.pem:$certs/ed25519-key.pem"
+  --identity "p256.tardigrade.test:$certs/p256-cert.pem:$certs/p256-key.pem"
+  --identity "rsa.tardigrade.test:$certs/rsa2048-cert.pem:$certs/rsa2048-key.pem"
+)
+# Two credentials under one host name: SNI cannot disambiguate these, so only
+# the peer's signature_algorithms offer can.
+ambiguous_identities=(
+  --identity "tardigrade.test:$certs/ed25519-cert.pem:$certs/ed25519-key.pem"
+  --identity "tardigrade.test:$certs/rsa2048-cert.pem:$certs/rsa2048-key.pem"
+)
+
+run_selection_row() { # name expect_signature server_args... -- peer_args...
+  local name="$1" expect_sig="$2"
+  shift 2
+  local server_args=()
+  while [ "$1" != "--" ]; do server_args+=("$1"); shift; done
+  shift
+  local p log
+  next_port; p="$port"
+  log="$logs/${name//\//_}"
+
+  local expect_args=()
+  if [ -n "$expect_sig" ]; then
+    expect_args=(--expect-signature "$expect_sig")
+  else
+    # No credential can satisfy the peer: RFC 8446 §4.4.2.2 handshake_failure.
+    expect_args=(--expect fail --expect-alert handshake_failure --expect-error NoApplicableCredential)
+  fi
+
+  "$tls_tool" server --port "$p" "${server_args[@]}" --alpn http/1.1 \
+    "${expect_args[@]}" --transcript "$transcripts/${name//\//_}.txt" \
+    --timeout-ms 20000 > "$log.native" 2>&1 &
+  local native_pid=$!
+  if ! wait_for_native_listener "$log.native"; then
+    kill "$native_pid" 2>/dev/null
+    result "$name" FAIL "native listener never came up"
+    return
+  fi
+
+  printf 'GET / HTTP/1.0\r\n\r\n' | "$openssl_bin" s_client -connect "127.0.0.1:$p" \
+    -tls1_3 -alpn http/1.1 -CAfile "$certs/ed25519-cert.pem" "$@" > "$log.peer" 2>&1
+
+  if wait "$native_pid"; then
+    result "$name" PASS "$(grep -o 'signature=[^ ]*\|error=.*' "$log.native" | head -1)"
+  else
+    result "$name" FAIL "see $log.native"
+  fi
+}
+
+# SNI picks the credential: three names, three key types, one server.
+run_selection_row "record/selection/sni_ed25519" ed25519 \
+  "${all_identities[@]}" -- -servername tardigrade.test
+run_selection_row "record/selection/sni_ecdsa_p256" ecdsa-p256-sha256 \
+  "${all_identities[@]}" -- -servername p256.tardigrade.test
+run_selection_row "record/selection/sni_rsa" rsa-pss-rsae-sha256 \
+  "${all_identities[@]}" -- -servername rsa.tardigrade.test
+
+# An SNI matching no bundle falls back to the default (first) credential
+# rather than failing, which is the configured `unknown_sni_policy`.
+run_selection_row "record/selection/unknown_sni_uses_default" ed25519 \
+  "${all_identities[@]}" -- -servername nobody.tardigrade.test
+
+# signature_algorithms picks the credential when SNI cannot: same host name,
+# two key types, and only the peer's offer distinguishes them.
+run_selection_row "record/selection/sigalgs_ed25519" ed25519 \
+  "${ambiguous_identities[@]}" -- -servername tardigrade.test -sigalgs ed25519
+run_selection_row "record/selection/sigalgs_rsa_pss" rsa-pss-rsae-sha256 \
+  "${ambiguous_identities[@]}" -- -servername tardigrade.test -sigalgs rsa_pss_rsae_sha256
+
+# No credential the peer can verify: neither identity signs with ECDSA-P256.
+run_selection_row "record/selection/no_applicable_credential" "" \
+  "${ambiguous_identities[@]}" -- -servername tardigrade.test -sigalgs ecdsa_secp256r1_sha256
 
 say ""
 say "== QUIC transport: the same tuples =="
@@ -511,10 +726,12 @@ run_quic_row() { # suite group signature
   fi
 }
 
+# Every tuple on QUIC too, in both profiles: the transport is the dimension
+# this section exists to cover, so thinning it would leave the "both transports
+# exercise the same engine" claim resting on a subset.
 for suite in "${suites[@]}"; do
   for group in "${groups[@]}"; do
     for sig in "${signatures[@]}"; do
-      if [ "$profile" = "ci" ] && ! row_in_ci_profile "$suite" "$group" "$sig"; then continue; fi
       # Ed25519 is not offered by every QUIC peer's default verifier, but the
       # loopback rows pin the leaf directly, so every signature is reachable.
       run_quic_row "$suite" "$group" "$sig"

@@ -96,6 +96,11 @@ const Args = struct {
     /// #338: the shared conformance-matrix negotiation tuple. Left empty, the
     /// tool offers QUIC's ordinary default policy exactly as before.
     config: matrix.Config = .{},
+    /// #338: require the handshake to have selected exactly this protocol.
+    /// Parity with `tls_interop_tool --expect-alpn` so a matrix row asserts
+    /// the same things on either transport. `null` leaves ALPN unchecked
+    /// (h3 is separately proven by `negotiatedH3()`).
+    expect_alpn: ?[]const u8 = null,
 };
 
 /// The engine policy for this run: QUIC transport mode, h3 as the default
@@ -124,26 +129,26 @@ fn reportNegotiated(args: Args, backend: *const tls_backend.Tls13Backend, saw_hr
     });
 }
 
-/// A row that pinned exactly one value along a dimension is asserting the
-/// peer landed on it, not merely that some handshake succeeded -- the same
-/// check `tls_interop_tool` applies on the record transport.
+/// Translate this transport's backend state into the shared `Negotiated`
+/// value and apply the *same* validator the record transport uses (#338
+/// review). Only this translation is transport-specific; the expectations
+/// themselves must not be, or an identically-named matrix cell would come to
+/// mean different things on the two carriers.
 fn matrixTupleHolds(args: Args, backend: *const tls_backend.Tls13Backend) bool {
-    var ok = true;
-    if (args.config.cipher_suites.len == 1 and backend.engine.negotiated_cipher_suite != args.config.cipher_suites.values[0]) {
-        std.debug.print("h3-interop: expected suite {s} but negotiated {s}\n", .{
-            matrix.cipherSuiteName(args.config.cipher_suites.values[0]),
-            matrix.cipherSuiteName(backend.engine.negotiated_cipher_suite),
-        });
-        ok = false;
-    }
-    if (args.config.named_groups.len == 1 and backend.engine.negotiated_named_group != args.config.named_groups.values[0]) {
-        std.debug.print("h3-interop: expected group {s} but negotiated {s}\n", .{
-            matrix.namedGroupName(args.config.named_groups.values[0]),
-            matrix.namedGroupName(backend.engine.negotiated_named_group),
-        });
-        ok = false;
-    }
-    return ok;
+    var ignored: u8 = 0;
+    return args.config.validateNegotiated(.{
+        .cipher_suite = backend.engine.negotiated_cipher_suite,
+        .named_group = backend.engine.negotiated_named_group,
+        .alpn = backend.alpn,
+    }, args.expect_alpn, &ignored, reportMismatch);
+}
+
+fn reportMismatch(_: *u8, mismatch: matrix.Mismatch) void {
+    std.debug.print("h3-interop: expected {s} {s} but negotiated {s}\n", .{
+        mismatch.dimension,
+        mismatch.expected,
+        mismatch.observed,
+    });
 }
 
 fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !Args {
@@ -192,6 +197,8 @@ fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !Args {
             try args.config.addSignatureScheme(try allocator.dupe(u8, it.next() orelse return error.MissingValue));
         } else if (std.mem.eql(u8, arg, "--alpn")) {
             try args.config.addAlpn(try allocator.dupe(u8, it.next() orelse return error.MissingValue));
+        } else if (std.mem.eql(u8, arg, "--expect-alpn")) {
+            args.expect_alpn = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
         } else {
             std.debug.print("h3-interop: unknown argument {s}\n", .{arg});
             return error.UnknownArgument;

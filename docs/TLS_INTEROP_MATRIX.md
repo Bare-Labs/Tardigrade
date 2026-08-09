@@ -55,9 +55,22 @@ exits non-zero if any row failed and lists them at the end.
 
 The tuple vocabulary lives in exactly one place,
 [`tests/tls_interop_matrix.zig`](../tests/tls_interop_matrix.zig), and is
-derived from the engine's own `native_capabilities` rather than restated. A
-suite, group, or signature scheme added to the engine therefore becomes a new
-matrix row automatically instead of being silently skipped.
+derived from the engine's own `native_capabilities` rather than restated.
+
+That derivation reaches the shell runner too: it builds its dimension lists
+from `tls_interop_tool list-capabilities` instead of keeping its own copy, so
+there is no second registry to drift. A suite, group, or signature scheme added
+to the engine therefore becomes a new matrix row automatically — and if the
+runner has no OpenSSL/GnuTLS spelling (or no credential) for it yet, preflight
+fails loudly naming exactly what is missing, rather than quietly enumerating
+the old set.
+
+Parsing is likewise scoped to `native_capabilities`, not the whole protocol
+registry. `secp384r1` and `rsa_pkcs1_sha256` have matrix names but are not
+natively negotiated, and are rejected: `Config.policy` hands its selection
+straight to `Policy.fromCapabilities`, which does not filter, so accepting them
+would let a row *widen* the engine policy and turn a green cell into evidence
+about a test-only capability.
 
 | Dimension | Values | Matrix name |
 | --- | --- | --- |
@@ -106,18 +119,42 @@ result line reports `alert_origin=local` when the engine rejected the peer and
 | `cipher_no_overlap` | `handshake_failure` | RFC 8446 §4.1.1 |
 | `group_no_overlap` | `handshake_failure` | RFC 8446 §4.1.1 |
 | `signature_no_overlap` | `handshake_failure` | RFC 8446 §4.4.2.2 |
-| `tls12_downgrade` | `missing_extension` | RFC 8446 §4.2.1 — a TLS 1.2 hello carries no `supported_versions` |
+| `tls12_downgrade` | `protocol_version` | RFC 8446 App. D.2 + §4.2.1 — an absent `supported_versions` is a legal *legacy* hello |
 | `sni_absent` | `missing_extension` | server configured with `require_sni` |
 | `wrong_pinned_certificate` | `bad_certificate` | RFC 8446 §6 |
 | `malformed_ordering` | `UnexpectedRecordContent` | application data before any ClientHello |
 | `ccs_before_clienthello` | `UnexpectedRecordContent` | RFC 8446 §5.1 — the compatibility window is not open yet |
 
-`UnsupportedProtocolVersion` → `protocol_version` (RFC 8446 §4.2.1) has no
-external row: it needs a ClientHello whose `supported_versions` is present but
-lists no version we accept, and neither OpenSSL nor GnuTLS can be persuaded to
-send one — a TLS 1.2 client omits the extension entirely, which is the
-`tls12_downgrade` row instead. The mapping is covered by unit tests in
-`src/tls/alerts.zig`.
+Every negative row pins a typed local error as well as the wire alert. A row
+that asserted only "the handshake failed" would stay green through a timeout,
+a record-ordering bug, or any unrelated failure, while the behaviour it names
+went untested.
+
+The `supported_versions`-present-but-unsatisfiable variant of §4.2.1 has no
+external row — neither OpenSSL nor GnuTLS can be persuaded to send such a
+hello, since a TLS 1.2 client omits the extension entirely (which is the
+`tls12_downgrade` row). It is covered by unit tests in
+`src/tls/tls13_backend_tests.zig` alongside the absent-extension case.
+
+### Certificate selection
+
+The positive rows hand the server exactly one identity, so they prove the
+*preselected* certificate works — they cannot prove the engine would have
+chosen it. A separate section gives the server all three credentials at once
+through the production SNI/signature-algorithm credential provider
+(`--identity PATTERN:CERT:KEY`, repeatable) and lets the peer's ClientHello
+drive the choice:
+
+| Row | Selector | Expectation |
+| --- | --- | --- |
+| `sni_ed25519` / `sni_ecdsa_p256` / `sni_rsa` | peer SNI | the matching credential |
+| `unknown_sni_uses_default` | peer SNI matching nothing | the default (first) credential |
+| `sigalgs_ed25519` / `sigalgs_rsa_pss` | peer `signature_algorithms` | two credentials share one host name, so only the offer can disambiguate |
+| `no_applicable_credential` | peer offers a scheme no credential holds | `handshake_failure` (RFC 8446 §4.4.2.2) |
+
+Each row asserts `--expect-signature`, read back from the engine's own
+`negotiated_signature_scheme` — what the engine actually signed
+CertificateVerify with — not from what the harness passed in.
 
 ### HelloRetryRequest
 
@@ -156,16 +193,16 @@ reproduces the negotiation without the peer being present.
 
 ## Profiles
 
-`full` runs every tuple: 3 suites × 2 groups × 3 signatures = 18 tuples, each
-in both roles against both peers on the record transport, plus the same 18 on
-QUIC, plus HRR and the negative rows.
+**Both profiles run every supported tuple.** 3 suites × 2 groups × 3 signatures
+= 18 tuples, each in both record roles against OpenSSL, plus all 18 on QUIC,
+plus HRR, every negative row, and every certificate-selection row. #338
+requires CI to prove positive interop for all supported tuples and both roles,
+so tuple coverage is not something a profile may reduce.
 
-`ci` keeps **both roles, both transports, every cipher suite, and every
-negative row**, and reduces only the positive group/signature sweep: the
-baseline suite (`aes128-gcm-sha256`) still walks all six group/signature
-pairings, while the other two suites run one representative pairing each. A
-regression in any single group or signature is therefore still caught, at a
-fraction of the wall-clock cost.
+What `ci` reduces is *peer multiplicity*: GnuTLS cross-checks one
+representative tuple per suite rather than all 18. Only a regression that is
+simultaneously tuple-specific **and** GnuTLS-specific could reach the nightly
+`full` profile without CI catching it.
 
 ## Adding a row
 
@@ -175,10 +212,12 @@ fraction of the wall-clock cost.
   fail until you do) and add the OpenSSL/GnuTLS spellings to
   `run-tls-interop.sh`.
 - **A new negative case**: add a `run_negative_server_row` call naming the
-  expected alert. Leave the alert empty only when no standard defines one, and
-  pin `--expect-error` instead so the row still asserts something specific — a
-  negative row that only asserts "something went wrong" will pass for the wrong
-  reason.
+  expected alert, and always pin `--expect-error` too. Leave the alert empty
+  only when no standard defines one — but never leave both empty, or the row
+  will pass for the wrong reason.
+- **A new raw-bytes case** (no TLS client involved): use `run_raw_record_row`,
+  which writes the bytes from the runner itself rather than through a child
+  shell.
 
 ## Findings
 
@@ -198,5 +237,15 @@ it:
    suite, group, or signature scheme was reported as `illegal_parameter`,
    telling the peer its ClientHello was malformed when every value in it was
    legal. RFC 8446 §4.1.1 requires `handshake_failure`. The engine now has a
-   distinct `NoMutualParameters` failure for this, and a distinct
-   `UnsupportedProtocolVersion` mapping to `protocol_version` per §4.2.1.
+   distinct `NoMutualParameters` failure for this. The mapping is role-aware:
+   a *client* rejecting a ServerHello selection it never offered keeps
+   `illegal_parameter` per §4.1.3, since that is the server violating the
+   protocol rather than the two sides sharing nothing.
+
+3. **A legacy ClientHello was rejected as malformed.** A ClientHello with no
+   `supported_versions` extension was reported as `missing_extension`. RFC 8446
+   Appendix D.2 is explicit that this is a legal pre-1.3 hello: the server
+   negotiates `min(legacy_version, TLS 1.2)`, and a TLS-1.3-only endpoint then
+   aborts with `protocol_version` per §4.2.1. The engine now has a distinct
+   `UnsupportedProtocolVersion` failure covering both that case and a
+   `supported_versions` naming nothing we support.

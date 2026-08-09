@@ -603,10 +603,10 @@ jobs:
   # both the record and QUIC transports, across every supported
   # cipher-suite/group/signature tuple, against OpenSSL and GnuTLS as
   # independent out-of-process implementations -- plus the negative rows that
-  # pin the RFC 8446 §6 failure class. Runs the reduced `ci` profile: both
-  # roles, both transports, every cipher suite and every negative row survive;
-  # only the positive group/signature sweep is thinned. See
-  # docs/TLS_INTEROP_MATRIX.md for exactly what each profile covers.
+  # pin the RFC 8446 §6 failure class and the rows that make the engine select
+  # among several credentials. The `ci` profile still runs *every* supported
+  # tuple in both roles and on both transports; it reduces only the second
+  # implementation's sweep. See docs/TLS_INTEROP_MATRIX.md.
   tls-conformance-matrix:
     name: TLS interop/conformance matrix
     runs-on: ubuntu-latest

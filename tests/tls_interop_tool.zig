@@ -33,8 +33,20 @@ const es = tls.encrypted_stream;
 const events = tls.events;
 const identity_loader = tls.identity_loader;
 const production_crypto = tls.production_crypto;
+const sni_provider = tls.sni_provider;
 const tls_backend = tls.tls13_backend;
 const posix = std.posix;
+
+/// The CertificateVerify scheme each private-key type signs with. The engine
+/// derives the same pairing internally; stating it here lets a bundle declare
+/// its `supported_schemes` without the harness guessing.
+fn schemeForKeyKind(kind: sni_provider.KeyKind) tls.credentials.SignatureScheme {
+    return switch (kind) {
+        .ed25519 => .ed25519,
+        .ecdsa_p256 => .ecdsa_secp256r1_sha256,
+        .rsa => .rsa_pss_rsae_sha256,
+    };
+}
 
 var verbose = false;
 
@@ -87,11 +99,39 @@ const Args = struct {
     timeout_ms: u64 = 15_000,
     transcript: []const u8 = "",
     config: matrix.Config = .{},
+    /// Server: additional identities offered through the production
+    /// SNI/signature-algorithm credential provider (#338). With one or more
+    /// of these, `--cert`/`--key` are not used and the *engine* picks which
+    /// credential to present -- which is the behaviour a certificate-selection
+    /// row is actually testing. Without them the server holds a single fixed
+    /// identity, as before.
+    identities: [max_identities]Identity = undefined,
+    identity_count: usize = 0,
+    /// Server: require the engine to have selected a credential signing with
+    /// exactly this scheme. Empty leaves selection unchecked.
+    expect_signature: []const u8 = "",
+
+    const Identity = struct {
+        pattern: []const u8,
+        cert_path: []const u8,
+        key_path: []const u8,
+    };
 };
+
+/// Bounded by what a conformance row plausibly needs: one identity per
+/// signature scheme the engine supports, plus room for extra host patterns.
+const max_identities = 8;
 
 const usage =
     \\usage: tls_interop_tool server --port N --cert CERT --key KEY [options]
     \\       tls_interop_tool client --host HOST --port N [--pin CERT | --insecure] [options]
+    \\       tls_interop_tool list-capabilities
+    \\
+    \\`list-capabilities` prints `kind<TAB>name` lines for every cipher suite,
+    \\group, and signature scheme the engine natively negotiates. The runner
+    \\script builds its whole matrix from that output rather than keeping its
+    \\own copy of the lists, so a new engine capability becomes a new matrix
+    \\row (or an immediate preflight failure if no peer spelling exists yet).
     \\
     \\negotiation (shared vocabulary with h3_interop_tool):
     \\
@@ -115,10 +155,15 @@ const usage =
     \\
 ;
 
-fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !Args {
+/// `null` means the `list-capabilities` sub-command was requested: it takes no
+/// flags and never opens a socket, so it is signalled here rather than as a
+/// third `Args.mode` that every role switch below would have to carry an
+/// unreachable arm for.
+fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !?Args {
     var it = init_args.iterate();
     _ = it.next(); // argv[0]
     const mode_str = it.next() orelse return error.MissingMode;
+    if (std.mem.eql(u8, mode_str, "list-capabilities")) return null;
     var args = Args{
         .mode = if (std.mem.eql(u8, mode_str, "server"))
             .server
@@ -185,6 +230,21 @@ fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !Args {
             args.timeout_ms = try std.fmt.parseInt(u64, it.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, arg, "--transcript")) {
             args.transcript = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
+        } else if (std.mem.eql(u8, arg, "--identity")) {
+            if (args.identity_count == max_identities) return error.TooManyIdentities;
+            const spec = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
+            // PATTERN:CERT:KEY -- split from the left so a pattern can never
+            // swallow a path containing a colon.
+            var parts = std.mem.splitScalar(u8, spec, ':');
+            args.identities[args.identity_count] = .{
+                .pattern = parts.next() orelse return error.MalformedIdentity,
+                .cert_path = parts.next() orelse return error.MalformedIdentity,
+                .key_path = parts.rest(),
+            };
+            if (args.identities[args.identity_count].key_path.len == 0) return error.MalformedIdentity;
+            args.identity_count += 1;
+        } else if (std.mem.eql(u8, arg, "--expect-signature")) {
+            args.expect_signature = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
         } else {
             std.debug.print("tls-interop: unknown argument {s}\n", .{arg});
             return error.UnknownArgument;
@@ -443,6 +503,11 @@ const Outcome = struct {
     alpn: []const u8 = "",
     server_name: []const u8 = "",
     certificate: events.CertificateState = .not_checked,
+    /// Server: the scheme the credential the *engine* selected signs with.
+    /// This is the observable that makes certificate selection testable --
+    /// without it a row can only confirm that the identity the harness
+    /// preselected happened to work.
+    signature_scheme: ?algorithms.SignatureScheme = null,
     hello_retry_request: bool = false,
     failure: ?anyerror = null,
     /// The fatal alert this side emitted, mapped from its own failure.
@@ -468,13 +533,94 @@ const Runner = struct {
     args: Args,
     identity: ?identity_loader.LoadedIdentity = null,
     pinned: []const u8 = "",
+    /// Server, multi-identity mode: the production SNI/signature-algorithm
+    /// credential provider, holding every `--identity` for the process's
+    /// lifetime. Present exactly when `args.identity_count > 0`.
+    sni: ?*SniIdentities = null,
+
+    /// Owns the loaded identities and the reloadable provider behind them.
+    /// Heap-allocated so the provider's vtable pointer stays stable while the
+    /// engine holds it.
+    const SniIdentities = struct {
+        allocator: std.mem.Allocator,
+        loaded: [max_identities]identity_loader.LoadedIdentity = undefined,
+        loaded_count: usize = 0,
+        chains: [max_identities][1][]const u8 = undefined,
+        patterns: [max_identities][1][]const u8 = undefined,
+        schemes: [max_identities][1]tls.credentials.SignatureScheme = undefined,
+        entropy_source: production_crypto.OsEntropy = .{},
+        provider_state: sni_provider.ReloadableProvider = undefined,
+
+        fn create(allocator: std.mem.Allocator, args: Args) !*SniIdentities {
+            const self = try allocator.create(SniIdentities);
+            errdefer allocator.destroy(self);
+            self.* = .{ .allocator = allocator };
+            self.provider_state = sni_provider.ReloadableProvider.init(allocator);
+            errdefer self.provider_state.deinit();
+
+            var configs: [max_identities]sni_provider.CredentialBundleConfig = undefined;
+            for (args.identities[0..args.identity_count], 0..) |identity, i| {
+                self.loaded[i] = try identity_loader.loadIdentity(
+                    allocator,
+                    identity.cert_path,
+                    identity.key_path,
+                    self.entropy_source.entropy(),
+                );
+                self.loaded_count = i + 1;
+                self.chains[i] = .{self.loaded[i].cert_chain[0]};
+                self.patterns[i] = .{identity.pattern};
+                const key_kind: sni_provider.KeyKind = switch (self.loaded[i].identity.key) {
+                    .ed25519 => .ed25519,
+                    .ecdsa_p256 => .ecdsa_p256,
+                    .rsa => .rsa,
+                };
+                self.schemes[i] = .{schemeForKeyKind(key_kind)};
+                configs[i] = .{
+                    .chain = self.chains[i][0..],
+                    .patterns = self.patterns[i][0..],
+                    .signer = sni_provider.SignAdapter.fromIdentity(
+                        self.loaded[i].identity,
+                        self.entropy_source.entropy(),
+                    ),
+                    .key_kind = key_kind,
+                    .supported_schemes = self.schemes[i][0..],
+                    // The first identity is the default: it answers a
+                    // ClientHello whose SNI matches no pattern, which is what
+                    // makes "unknown SNI falls back" observable rather than a
+                    // handshake failure.
+                    .is_default = i == 0,
+                };
+            }
+
+            try self.provider_state.reload(configs[0..args.identity_count], .{
+                // A row that omits SNI is exercising the default-credential
+                // path, not an error path; `--require-sni` is the policy knob
+                // for demanding one.
+                .absent_sni_policy = .use_default,
+                .unknown_sni_policy = .use_default,
+            });
+            return self;
+        }
+
+        fn destroy(self: *SniIdentities) void {
+            const allocator = self.allocator;
+            self.provider_state.deinit();
+            for (self.loaded[0..self.loaded_count]) |*loaded| loaded.deinit();
+            allocator.destroy(self);
+        }
+    };
 
     fn init(allocator: std.mem.Allocator, args: Args) !Runner {
         var self = Runner{ .allocator = allocator, .args = args };
         if (args.mode == .server) {
-            if (args.cert.len == 0 or args.key.len == 0) return error.MissingIdentity;
-            var entropy_source = production_crypto.OsEntropy{};
-            self.identity = try identity_loader.loadIdentity(allocator, args.cert, args.key, entropy_source.entropy());
+            if (args.identity_count > 0) {
+                // Multi-identity: the engine selects, not the harness.
+                self.sni = try SniIdentities.create(allocator, args);
+            } else {
+                if (args.cert.len == 0 or args.key.len == 0) return error.MissingIdentity;
+                var entropy_source = production_crypto.OsEntropy{};
+                self.identity = try identity_loader.loadIdentity(allocator, args.cert, args.key, entropy_source.entropy());
+            }
         } else {
             if (args.pin.len == 0 and !args.insecure) return error.MissingClientTrust;
             if (args.pin.len > 0) {
@@ -487,6 +633,7 @@ const Runner = struct {
 
     fn deinit(self: *Runner) void {
         if (self.identity) |*loaded| loaded.deinit();
+        if (self.sni) |sni| sni.destroy();
     }
 
     fn runOne(self: *Runner, fd: posix.fd_t, transcript: *Transcript) Outcome {
@@ -507,7 +654,16 @@ const Runner = struct {
         const policy = self.args.config.policy(.record, &default_alpns);
 
         var backend = switch (self.args.mode) {
-            .server => tls_backend.Tls13Backend.initServerConfigured(
+            // Multi-identity rows go through the same `CredentialProvider`
+            // seam the production SNI listener uses, so the engine performs
+            // the selection. A single-identity row keeps the fixed-identity
+            // constructor.
+            .server => if (self.sni) |sni| tls_backend.Tls13Backend.initServerWithProviderConfigured(
+                handshake_entropy,
+                crypto_provider,
+                sni.provider_state.provider(),
+                tls_backend.recordConfig(policy),
+            ) else tls_backend.Tls13Backend.initServerConfigured(
                 handshake_entropy,
                 crypto_provider,
                 self.identity.?.identity,
@@ -633,6 +789,7 @@ const Runner = struct {
         if (outcome.handshake_complete) {
             outcome.cipher_suite = backend.negotiated_cipher_suite;
             outcome.named_group = backend.negotiated_named_group;
+            outcome.signature_scheme = backend.negotiated_signature_scheme;
             if (stream.negotiatedAlpn()) |alpn| outcome.alpn = self.allocator.dupe(u8, alpn) catch "";
             if (backend.server_name_present) {
                 outcome.server_name = self.allocator.dupe(u8, backend.server_name[0..backend.server_name_len]) catch "";
@@ -726,6 +883,7 @@ fn reportLine(buf: []u8, args: Args, outcome: Outcome) []const u8 {
     });
     if (outcome.cipher_suite) |suite| report.print(" suite={s}", .{matrix.cipherSuiteName(suite)});
     if (outcome.named_group) |group| report.print(" group={s}", .{matrix.namedGroupName(group)});
+    if (outcome.signature_scheme) |scheme| report.print(" signature={s}", .{matrix.signatureSchemeName(scheme)});
     if (outcome.alpn.len > 0) report.print(" alpn={s}", .{outcome.alpn});
     if (outcome.server_name.len > 0) report.print(" sni={s}", .{outcome.server_name});
     report.print(" certificate={s} hrr={}", .{ @tagName(outcome.certificate), outcome.hello_retry_request });
@@ -760,6 +918,7 @@ fn writeTranscript(path: []const u8, args: Args, outcome: Outcome, transcript: *
     report.print("handshake_complete: {}\n", .{outcome.handshake_complete});
     if (outcome.cipher_suite) |suite| report.print("negotiated.cipher_suite: {s}\n", .{matrix.cipherSuiteName(suite)});
     if (outcome.named_group) |group| report.print("negotiated.group: {s}\n", .{matrix.namedGroupName(group)});
+    if (outcome.signature_scheme) |scheme| report.print("selected.signature_scheme: {s}\n", .{matrix.signatureSchemeName(scheme)});
     if (outcome.alpn.len > 0) report.print("negotiated.alpn: {s}\n", .{outcome.alpn});
     if (outcome.server_name.len > 0) report.print("negotiated.sni: {s}\n", .{outcome.server_name});
     report.print("certificate: {s}\n", .{@tagName(outcome.certificate)});
@@ -850,30 +1009,50 @@ fn evaluate(args: Args, outcome: Outcome) u8 {
         failed = true;
     }
 
-    // A row that pins exactly one value along a dimension is asserting the
-    // peer landed on it -- not merely that some handshake succeeded.
-    if (outcome.handshake_complete) {
-        if (args.config.cipher_suites.len == 1 and outcome.cipher_suite != args.config.cipher_suites.values[0]) {
-            std.debug.print("tls-interop: expected suite {s} but negotiated {?s}\n", .{
-                matrix.cipherSuiteName(args.config.cipher_suites.values[0]),
-                if (outcome.cipher_suite) |suite| matrix.cipherSuiteName(suite) else null,
+    // Which credential the *engine* selected, for rows that offer several.
+    // Checked separately from the negotiated tuple because selection is a
+    // local decision about our own identity, not something negotiated with
+    // the peer.
+    if (args.expect_signature.len > 0) {
+        const observed = if (outcome.signature_scheme) |scheme| matrix.signatureSchemeName(scheme) else null;
+        if (observed == null or !std.mem.eql(u8, observed.?, args.expect_signature)) {
+            std.debug.print("tls-interop: expected the engine to select a {s} credential but it selected {?s}\n", .{
+                args.expect_signature,
+                observed,
             });
-            failed = true;
-        }
-        if (args.config.named_groups.len == 1 and outcome.named_group != args.config.named_groups.values[0]) {
-            std.debug.print("tls-interop: expected group {s} but negotiated {?s}\n", .{
-                matrix.namedGroupName(args.config.named_groups.values[0]),
-                if (outcome.named_group) |group| matrix.namedGroupName(group) else null,
-            });
-            failed = true;
-        }
-        if (args.expect_alpn.len > 0 and !std.mem.eql(u8, outcome.alpn, args.expect_alpn)) {
-            std.debug.print("tls-interop: expected alpn {s} but negotiated {s}\n", .{ args.expect_alpn, outcome.alpn });
             failed = true;
         }
     }
 
+    // The negotiated-tuple expectations come from the shared matrix
+    // validator, not a copy local to this transport -- see
+    // `Config.validateNegotiated`.
+    if (outcome.handshake_complete) {
+        var ignored: u8 = 0;
+        const held = args.config.validateNegotiated(.{
+            .cipher_suite = outcome.cipher_suite,
+            .named_group = outcome.named_group,
+            .alpn = outcome.alpn,
+        }, if (args.expect_alpn.len > 0) args.expect_alpn else null, &ignored, reportMismatch);
+        if (!held) failed = true;
+    }
+
     return if (failed) 1 else 0;
+}
+
+/// One `kind<TAB>name` line per native capability, on stdout, for the runner
+/// script to read.
+fn writeCapabilityLine(_: *u8, kind: []const u8, name: []const u8) void {
+    var buf: [128]u8 = undefined;
+    writeStdout(std.fmt.bufPrint(&buf, "{s}\t{s}\n", .{ kind, name }) catch return);
+}
+
+fn reportMismatch(_: *u8, mismatch: matrix.Mismatch) void {
+    std.debug.print("tls-interop: expected {s} {s} but negotiated {s}\n", .{
+        mismatch.dimension,
+        mismatch.expected,
+        mismatch.observed,
+    });
 }
 
 // -- Entry point ------------------------------------------------------------
@@ -884,10 +1063,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const args = parseArgs(allocator, init.args) catch |err| {
+    const parsed = parseArgs(allocator, init.args) catch |err| {
         std.debug.print("tls-interop: bad arguments ({s})\n{s}", .{ @errorName(err), usage });
         std.process.exit(2);
     };
+    if (parsed == null) {
+        var ignored: u8 = 0;
+        matrix.listCapabilities(&ignored, writeCapabilityLine);
+        std.process.exit(0);
+    }
+    const args = parsed.?;
 
     // Bind before any other setup. Loading an RSA identity runs Miller-Rabin
     // primality checks that take well over a second, and a runner that starts

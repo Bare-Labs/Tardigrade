@@ -24,9 +24,20 @@ All notable user-facing changes to Tardigrade are documented here.
   reported as `illegal_parameter`, telling the peer its ClientHello was
   malformed when every value in it was legal. RFC 8446 §4.1.1 requires
   `handshake_failure` (or `insufficient_security`). Adds the distinct
-  `NoMutualParameters` handshake failure for that case, plus a distinct
-  `UnsupportedProtocolVersion` failure mapping to the `protocol_version` alert
-  per RFC 8446 §4.2.1 rather than being folded into `illegal_parameter`.
+  `NoMutualParameters` handshake failure for that case. The mapping is
+  role-aware: a *client* rejecting a ServerHello selection it never offered
+  keeps `illegal_parameter` per §4.1.3, since that is the server violating the
+  protocol rather than the two endpoints having nothing in common.
+- **A legacy TLS 1.2 ClientHello was rejected as malformed (#338)** — a
+  ClientHello carrying no `supported_versions` extension was reported as
+  `missing_extension`. RFC 8446 Appendix D.2 is explicit that this is a legal
+  pre-1.3 hello, not a malformed one: the server negotiates
+  `min(legacy_version, TLS 1.2)`, and a TLS-1.3-only endpoint then aborts with
+  `protocol_version` per §4.2.1. Adds the distinct
+  `UnsupportedProtocolVersion` handshake failure, covering both that case and
+  a well-formed `supported_versions` naming no version this endpoint accepts.
+  Verified against `openssl s_client -tls1_2`, which now reports the
+  RFC-mandated alert 70 rather than alert 109.
 
 ### Testing
 - **Shared TLS-engine interoperability and conformance suite (#338, research
@@ -43,12 +54,21 @@ All notable user-facing changes to Tardigrade are documented here.
   single shared vocabulary (`tests/tls_interop_matrix.zig`, derived from the
   engine's own `native_capabilities`), so a matrix row means the same engine
   configuration on either transport and a newly supported algorithm becomes a
-  new row automatically. Adds the `tls_interop_tool` record-transport driver
-  (`zig build build-tls-interop`), matrix flags and policy-configurable QUIC
-  constructors for the existing `h3_interop_tool`, secret-free transcripts and
-  reduced failure fixtures for every row, a reduced `--profile ci` that keeps
-  both roles, both transports, every cipher suite and every negative row, and a
-  CI job running it on every PR. Documented in `docs/TLS_INTEROP_MATRIX.md`.
+  new row automatically — the shell runner derives its dimension lists from
+  `tls_interop_tool list-capabilities` rather than keeping its own copy, and
+  fails preflight loudly if it has no peer spelling for a new capability.
+  Certificate *selection* is exercised separately: rows hand the server several
+  credentials at once through the production SNI/signature-algorithm provider
+  and assert which one the engine chose, read back from the new
+  `negotiated_signature_scheme`, including a no-applicable-credential negative.
+  Adds the `tls_interop_tool` record-transport driver (`zig build
+  build-tls-interop`), matrix flags and policy-configurable QUIC constructors
+  for the existing `h3_interop_tool`, one shared negotiated-tuple validator
+  used by both transports, secret-free transcripts and reduced failure fixtures
+  for every row, and a CI job running it on every PR. Both profiles cover every
+  supported tuple in both roles and on both transports; `--profile ci` reduces
+  only the second implementation's sweep. Documented in
+  `docs/TLS_INTEROP_MATRIX.md`.
 - **Shared crypto fuzzing contract and CryptoProvider fuzz targets (#376,
   epic #327-G)** — adds `docs/CRYPTO_FUZZ_CONTRACT.md`, the shared
   deterministic-reproduction/bounded-work/arithmetic-safety/lifetime/secret-

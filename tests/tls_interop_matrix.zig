@@ -70,22 +70,33 @@ pub fn signatureSchemeName(scheme: SignatureScheme) []const u8 {
     };
 }
 
+// Parsing is deliberately scoped to the engine's *native capability* slices
+// rather than the whole protocol registry. `Config.policy` hands its selected
+// slices straight to `Policy.fromCapabilities`, which does not filter them, so
+// accepting an identifier the engine does not natively negotiate (`secp384r1`,
+// `rsa_pkcs1_sha256`) would let a matrix row *widen* the engine policy into a
+// test-only capability -- the exact opposite of the narrow-only invariant this
+// module documents, and it would turn a passing cell into evidence about
+// something production never does. An identifier that exists in the registry
+// but not in `native_capabilities` is therefore rejected the same way a typo
+// is; it becomes selectable the moment the engine actually supports it.
+
 pub fn parseCipherSuite(name: []const u8) ParseError!CipherSuite {
-    inline for (comptime std.enums.values(CipherSuite)) |suite| {
+    for (cipher_suites) |suite| {
         if (std.mem.eql(u8, name, cipherSuiteName(suite))) return suite;
     }
     return error.UnknownCipherSuite;
 }
 
 pub fn parseNamedGroup(name: []const u8) ParseError!NamedGroup {
-    inline for (comptime std.enums.values(NamedGroup)) |group| {
+    for (named_groups) |group| {
         if (std.mem.eql(u8, name, namedGroupName(group))) return group;
     }
     return error.UnknownNamedGroup;
 }
 
 pub fn parseSignatureScheme(name: []const u8) ParseError!SignatureScheme {
-    inline for (comptime std.enums.values(SignatureScheme)) |scheme| {
+    for (signature_schemes) |scheme| {
         if (std.mem.eql(u8, name, signatureSchemeName(scheme))) return scheme;
     }
     return error.UnknownSignatureScheme;
@@ -186,15 +197,117 @@ pub const Config = struct {
         result.allow_absent_alpn = self.allow_absent_alpn;
         return result;
     }
+
+    /// Check a completed handshake against what this row pinned.
+    ///
+    /// A row that pins exactly one value along a dimension is asserting the
+    /// peer *landed* on it, not merely that some handshake succeeded --
+    /// otherwise a server quietly ignoring the requested group would still
+    /// show green.
+    ///
+    /// This lives here, not in either tool, because both transports must
+    /// apply the same expectations to the same row. When the record tool
+    /// checked ALPN and the QUIC tool did not, the two had already drifted
+    /// into asserting different things about an identically-named matrix cell
+    /// (#338 review). `report` is called once per failed expectation; the
+    /// return value is whether everything held.
+    pub fn validateNegotiated(
+        self: *const Config,
+        got: Negotiated,
+        expected_alpn: ?[]const u8,
+        ctx: anytype,
+        comptime report: fn (@TypeOf(ctx), Mismatch) void,
+    ) bool {
+        var ok = true;
+        if (self.cipher_suites.len == 1) {
+            const want = self.cipher_suites.values[0];
+            if (got.cipher_suite == null or got.cipher_suite.? != want) {
+                report(ctx, .{
+                    .dimension = "cipher-suite",
+                    .expected = cipherSuiteName(want),
+                    .observed = if (got.cipher_suite) |suite| cipherSuiteName(suite) else "(none)",
+                });
+                ok = false;
+            }
+        }
+        if (self.named_groups.len == 1) {
+            const want = self.named_groups.values[0];
+            if (got.named_group == null or got.named_group.? != want) {
+                report(ctx, .{
+                    .dimension = "group",
+                    .expected = namedGroupName(want),
+                    .observed = if (got.named_group) |group| namedGroupName(group) else "(none)",
+                });
+                ok = false;
+            }
+        }
+        if (expected_alpn) |want| {
+            if (!std.mem.eql(u8, got.alpn, want)) {
+                report(ctx, .{
+                    .dimension = "alpn",
+                    .expected = want,
+                    .observed = if (got.alpn.len > 0) got.alpn else "(none)",
+                });
+                ok = false;
+            }
+        }
+        return ok;
+    }
 };
 
 /// One-line usage fragment shared by both tools' `--help` output, so the two
 /// cannot document different spellings of the same flags.
 pub const flag_usage =
-    "  --cipher-suite NAME   repeatable: aes128-gcm-sha256 | aes256-gcm-sha384 | chacha20-poly1305-sha256\n" ++
-    "  --group NAME          repeatable: x25519 | secp256r1\n" ++
-    "  --signature NAME      repeatable: ed25519 | ecdsa-p256-sha256 | rsa-pss-rsae-sha256\n" ++
+    "  --cipher-suite NAME   repeatable, see `list-capabilities`\n" ++
+    "  --group NAME          repeatable, see `list-capabilities`\n" ++
+    "  --signature NAME      repeatable, see `list-capabilities`\n" ++
     "  --alpn NAME           repeatable application protocol name\n";
+
+// ---------------------------------------------------------------------------
+// Machine-readable capability listing
+// ---------------------------------------------------------------------------
+
+/// Emit every dimension the engine natively negotiates as `kind<TAB>name`
+/// lines, one per value, through `writeLine`.
+///
+/// This is what makes "a new engine capability becomes a new matrix row"
+/// true rather than aspirational. The runner script cannot import Zig, so
+/// without this it would need its own copy of the three lists -- a second,
+/// unchecked registry that silently keeps enumerating the old set after
+/// `native_capabilities` grows. Instead the script asks the tool, and a
+/// capability it has no peer spelling for fails preflight loudly.
+///
+/// `writeLine` takes the fully formatted line (no trailing newline) so this
+/// stays free of any I/O dependency and is directly testable.
+pub fn listCapabilities(
+    ctx: anytype,
+    comptime writeLine: fn (@TypeOf(ctx), kind: []const u8, name: []const u8) void,
+) void {
+    for (cipher_suites) |suite| writeLine(ctx, "cipher-suite", cipherSuiteName(suite));
+    for (named_groups) |group| writeLine(ctx, "group", namedGroupName(group));
+    for (signature_schemes) |scheme| writeLine(ctx, "signature", signatureSchemeName(scheme));
+}
+
+// ---------------------------------------------------------------------------
+// Shared negotiated-tuple expectations
+// ---------------------------------------------------------------------------
+
+/// What a completed handshake actually negotiated, in transport-neutral terms.
+/// Each tool translates its own backend state into this; everything downstream
+/// of that translation is shared.
+pub const Negotiated = struct {
+    cipher_suite: ?CipherSuite = null,
+    named_group: ?NamedGroup = null,
+    alpn: []const u8 = "",
+};
+
+/// A single expectation that did not hold, with both sides of the comparison
+/// already resolved to matrix names so a caller only has to print it.
+pub const Mismatch = struct {
+    dimension: []const u8,
+    expected: []const u8,
+    observed: []const u8,
+};
 
 test "every engine-supported identifier has a matrix name that round-trips" {
     for (cipher_suites) |suite| {
@@ -228,6 +341,166 @@ test "unknown identifiers are rejected rather than silently defaulted" {
     try std.testing.expectError(error.UnknownCipherSuite, parseCipherSuite("aes128-gcm"));
     try std.testing.expectError(error.UnknownNamedGroup, parseNamedGroup("X25519"));
     try std.testing.expectError(error.UnknownSignatureScheme, parseSignatureScheme("ed448"));
+}
+
+test "a registry identifier the engine does not natively negotiate cannot be selected" {
+    // `secp384r1` and `rsa_pkcs1_sha256` exist in the protocol registry and
+    // have matrix names, but are absent from `native_capabilities`. Accepting
+    // them would let a row *widen* the engine policy — `Config.policy` passes
+    // its selection straight to `Policy.fromCapabilities`, which does not
+    // filter — so a green cell would be evidence about a test-only capability
+    // rather than about production.
+    try std.testing.expect(!containsGroup(named_groups, .secp384r1));
+    try std.testing.expectError(error.UnknownNamedGroup, parseNamedGroup("secp384r1"));
+
+    try std.testing.expect(!containsSignature(signature_schemes, .rsa_pkcs1_sha256));
+    try std.testing.expectError(error.UnknownSignatureScheme, parseSignatureScheme("rsa-pkcs1-sha256"));
+
+    // ...and rejected through the `Config` entry points the tools actually use.
+    var config = Config{};
+    try std.testing.expectError(error.UnknownNamedGroup, config.addNamedGroup("secp384r1"));
+    try std.testing.expectError(error.UnknownSignatureScheme, config.addSignatureScheme("rsa-pkcs1-sha256"));
+    try std.testing.expectEqual(@as(usize, 0), config.named_groups.len);
+    try std.testing.expectEqual(@as(usize, 0), config.signature_schemes.len);
+}
+
+fn containsGroup(haystack: []const NamedGroup, needle: NamedGroup) bool {
+    for (haystack) |value| {
+        if (value == needle) return true;
+    }
+    return false;
+}
+
+fn containsSignature(haystack: []const SignatureScheme, needle: SignatureScheme) bool {
+    for (haystack) |value| {
+        if (value == needle) return true;
+    }
+    return false;
+}
+
+const CapabilityCapture = struct {
+    buf: [64][]const u8 = undefined,
+    len: usize = 0,
+
+    fn line(self: *CapabilityCapture, kind: []const u8, name: []const u8) void {
+        _ = kind;
+        self.buf[self.len] = name;
+        self.len += 1;
+    }
+};
+
+test "listCapabilities emits exactly the engine's native capability set" {
+    // The runner script builds its whole matrix from this output, so it must
+    // enumerate every native value and nothing else. If it under-reports, a
+    // supported tuple silently stops being tested; if it over-reports, the
+    // script builds rows the tool would then reject at parse time.
+    var capture = CapabilityCapture{};
+    listCapabilities(&capture, CapabilityCapture.line);
+
+    try std.testing.expectEqual(
+        cipher_suites.len + named_groups.len + signature_schemes.len,
+        capture.len,
+    );
+
+    var index: usize = 0;
+    for (cipher_suites) |suite| {
+        try std.testing.expectEqualStrings(cipherSuiteName(suite), capture.buf[index]);
+        index += 1;
+    }
+    for (named_groups) |group| {
+        try std.testing.expectEqualStrings(namedGroupName(group), capture.buf[index]);
+        index += 1;
+    }
+    for (signature_schemes) |scheme| {
+        try std.testing.expectEqualStrings(signatureSchemeName(scheme), capture.buf[index]);
+        index += 1;
+    }
+}
+
+test "every listed capability parses back, so the runner can never build an unusable row" {
+    const Roundtrip = struct {
+        fn line(_: *u8, kind: []const u8, name: []const u8) void {
+            if (std.mem.eql(u8, kind, "cipher-suite")) {
+                _ = parseCipherSuite(name) catch unreachable;
+            } else if (std.mem.eql(u8, kind, "group")) {
+                _ = parseNamedGroup(name) catch unreachable;
+            } else if (std.mem.eql(u8, kind, "signature")) {
+                _ = parseSignatureScheme(name) catch unreachable;
+            } else {
+                unreachable; // an unrecognised kind would break the script's parser
+            }
+        }
+    };
+    var ignored: u8 = 0;
+    listCapabilities(&ignored, Roundtrip.line);
+}
+
+const MismatchCapture = struct {
+    items: [4]Mismatch = undefined,
+    len: usize = 0,
+
+    fn report(self: *MismatchCapture, mismatch: Mismatch) void {
+        self.items[self.len] = mismatch;
+        self.len += 1;
+    }
+};
+
+test "validateNegotiated accepts a handshake that landed on the pinned tuple" {
+    var config = Config{};
+    try config.addCipherSuite("aes256-gcm-sha384");
+    try config.addNamedGroup("secp256r1");
+
+    var capture = MismatchCapture{};
+    try std.testing.expect(config.validateNegotiated(.{
+        .cipher_suite = .tls_aes_256_gcm_sha384,
+        .named_group = .secp256r1,
+        .alpn = "h2",
+    }, "h2", &capture, MismatchCapture.report));
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
+}
+
+test "validateNegotiated rejects a peer that ignored the pinned tuple" {
+    // The point of the check: a peer that quietly negotiates something else
+    // must not show green just because *a* handshake completed.
+    var config = Config{};
+    try config.addCipherSuite("aes256-gcm-sha384");
+    try config.addNamedGroup("secp256r1");
+
+    var capture = MismatchCapture{};
+    try std.testing.expect(!config.validateNegotiated(.{
+        .cipher_suite = .tls_aes_128_gcm_sha256,
+        .named_group = .x25519,
+        .alpn = "http/1.1",
+    }, "h2", &capture, MismatchCapture.report));
+    try std.testing.expectEqual(@as(usize, 3), capture.len);
+    try std.testing.expectEqualStrings("cipher-suite", capture.items[0].dimension);
+    try std.testing.expectEqualStrings("aes256-gcm-sha384", capture.items[0].expected);
+    try std.testing.expectEqualStrings("aes128-gcm-sha256", capture.items[0].observed);
+    try std.testing.expectEqualStrings("group", capture.items[1].dimension);
+    try std.testing.expectEqualStrings("alpn", capture.items[2].dimension);
+}
+
+test "validateNegotiated leaves unpinned dimensions alone" {
+    // A row that offers everything along a dimension is not asserting which
+    // value wins, so any native choice must pass.
+    var config = Config{};
+    var capture = MismatchCapture{};
+    try std.testing.expect(config.validateNegotiated(.{
+        .cipher_suite = .tls_chacha20_poly1305_sha256,
+        .named_group = .x25519,
+    }, null, &capture, MismatchCapture.report));
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
+}
+
+test "validateNegotiated treats a missing negotiated value as a mismatch, not a pass" {
+    // A handshake that never completed reports `null` here. Silently accepting
+    // that would make every failed row look like it satisfied its tuple.
+    var config = Config{};
+    try config.addCipherSuite("aes128-gcm-sha256");
+    var capture = MismatchCapture{};
+    try std.testing.expect(!config.validateNegotiated(.{}, null, &capture, MismatchCapture.report));
+    try std.testing.expectEqual(@as(usize, 1), capture.len);
+    try std.testing.expectEqualStrings("(none)", capture.items[0].observed);
 }
 
 test "an unpinned dimension offers the engine's full native capability list" {
