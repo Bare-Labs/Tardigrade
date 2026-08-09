@@ -15,6 +15,7 @@
 #   --config-label STR  Config/profile label recorded in metadata
 #   --pid PID           Target Tardigrade process ID for CPU/RSS sampling
 #   --pid-file FILE     File containing the target Tardigrade PID for CPU/RSS sampling
+#   --pid-tree          Include child processes when sampling CPU/RSS
 #   --tls               Use HTTPS (default: plain HTTP)
 #   --insecure          Skip TLS certificate verification (for self-signed certs)
 #   --duration SECS     Benchmark duration per scenario (default: 30)
@@ -82,6 +83,7 @@ WORKER_COUNT=""
 CONFIG_LABEL=""
 TARGET_PID=""
 PID_FILE=""
+PID_TREE=false
 USE_TLS=false
 INSECURE=false
 DURATION=30
@@ -121,6 +123,7 @@ while [[ $# -gt 0 ]]; do
         --config-label)CONFIG_LABEL="$2";      shift 2 ;;
         --pid)        TARGET_PID="$2";         shift 2 ;;
         --pid-file)   PID_FILE="$2";           shift 2 ;;
+        --pid-tree)   PID_TREE=true;           shift ;;
         --tls)        USE_TLS=true;            shift ;;
         --insecure)   INSECURE=true;           shift ;;
         --duration)   DURATION="$2";           shift 2 ;;
@@ -394,6 +397,23 @@ peak_rss_mb_or_null() {
     ' "$file"
 }
 
+wrk_error_count() {
+    awk '
+        /Non-2xx/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^[0-9]+$/) total += $i
+            }
+        }
+        /Socket errors:/ {
+            for (i = 1; i <= NF; i++) {
+                gsub(/,/, "", $i)
+                if ($i ~ /^[0-9]+$/) total += $i
+            }
+        }
+        END { print total + 0 }
+    '
+}
+
 MONITOR_FILE=""
 MONITOR_PID=""
 CURRENT_CPU_PCT_AVG="null"
@@ -402,8 +422,27 @@ CURRENT_RSS_MB_PEAK="null"
 monitor_target_process() {
     local pid="$1" sample_interval_s="$2" outfile="$3"
     while kill -0 "$pid" 2>/dev/null; do
-        ps -p "$pid" -o rss= -o %cpu= 2>/dev/null | awk 'NF >= 2 { print $1, $2; exit }' >> "$outfile"
+        if $PID_TREE; then
+            process_tree_pids "$pid" | paste -sd, - | {
+                read -r pids
+                [[ -n "$pids" ]] || pids="$pid"
+                ps -p "$pids" -o rss= -o %cpu= 2>/dev/null |
+                    awk '{ rss += $1; cpu += $2 } END { if (rss > 0 || cpu > 0) print rss, cpu }' >> "$outfile"
+            }
+        else
+            ps -p "$pid" -o rss= -o %cpu= 2>/dev/null | awk 'NF >= 2 { print $1, $2; exit }' >> "$outfile"
+        fi
         sleep "$sample_interval_s"
+    done
+}
+
+process_tree_pids() {
+    local root="$1"
+    printf '%s\n' "$root"
+    local children child
+    children=$(pgrep -P "$root" 2>/dev/null || true)
+    for child in $children; do
+        process_tree_pids "$child"
     done
 }
 
@@ -576,7 +615,7 @@ run_wrk() {
     p95=$(echo "$summary_json" | jq -r '.p95_ms // null')
     p99=$(echo "$summary_json" | jq -r '.p99_ms // null')
     p999=$(echo "$summary_json" | jq -r '.p999_ms // null')
-    errors=$(echo "$raw" | grep -E "Non-2xx|Socket errors" | grep -oE '[0-9]+' | head -1 || echo 0)
+    errors=$(printf '%s\n' "$raw" | wrk_error_count)
     rps=${rps:-0}; errors=${errors:-0}
     local tput_mbps
     tput_mbps=$(echo "$summary_json" | jq -r '.throughput_mbps // null')
@@ -1108,6 +1147,7 @@ RESULTS_JSON=$(jq \
     --arg keepalive_path "$KEEPALIVE_PATH" \
     --arg h2_path "$H2_PATH" --arg h3_path "$H3_PATH" \
     --arg tool "$TOOL" \
+    --argjson pid_tree "$($PID_TREE && echo true || echo false)" \
     --arg zig_version "$ZIG_VERSION" \
     --arg os_name "$OS_NAME" \
     --arg kernel_release "$KERNEL_RELEASE" \
@@ -1125,6 +1165,7 @@ RESULTS_JSON=$(jq \
           process_metrics: {
             enabled: ($pid_source != "none"),
             pid_source: $pid_source,
+            pid_tree: $pid_tree,
             sample_interval_ms: $sample_interval_ms
           },
           zig_version: $zig_version,

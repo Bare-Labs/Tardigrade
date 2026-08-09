@@ -127,7 +127,7 @@ Useful commands:
 ```
 
 See `benchmarks/competitive/README.md` for fairness rules, config templates,
-and output schema.
+upstream-pool matrix coverage, and output schema.
 
 ### Throughput scenarios (all tools)
 

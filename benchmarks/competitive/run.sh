@@ -12,6 +12,9 @@ BENCH_DIR="${REPO_ROOT}/benchmarks"
 COMP_DIR="${BENCH_DIR}/competitive"
 CONFIG_DIR="${COMP_DIR}/configs"
 BINARY="${REPO_ROOT}/zig-out/bin/tardi"
+BINARY_EXPLICIT=false
+TARDIGRADE_BUILD_FLAGS="-Doptimize=ReleaseFast"
+TARDIGRADE_BUILT=false
 SERVERS="tardigrade,nginx,haproxy,caddy"
 TOOL="wrk"
 DURATION="15"
@@ -28,10 +31,14 @@ TMP_DIR=""
 ORIGIN_PID=""
 EDGE_PID=""
 CURRENT_SERVER=""
+CURRENT_CPU_PCT_AVG="null"
+CURRENT_RSS_MB_PEAK="null"
+MONITOR_PID=""
+MONITOR_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --binary) BINARY="$2"; shift 2 ;;
+        --binary) BINARY="$2"; BINARY_EXPLICIT=true; shift 2 ;;
         --servers) SERVERS="$2"; shift 2 ;;
         --tool) TOOL="$2"; shift 2 ;;
         --duration) DURATION="$2"; shift 2 ;;
@@ -44,9 +51,9 @@ while [[ $# -gt 0 ]]; do
         --allow-missing) ALLOW_MISSING=true; shift ;;
         --smoke)
             SMOKE=true
-            DURATION="5"
-            CONNECTIONS="8"
-            THREADS="2"
+            DURATION="2"
+            CONNECTIONS="1"
+            THREADS="1"
             SERVERS="tardigrade"
             shift
             ;;
@@ -68,7 +75,7 @@ Competitive benchmark manual flow:
 3. Start the shared origin fixture:
    python3 benchmarks/fixtures/upstream_server.py --port ${UPSTREAM_PORT}
 4. For each server in ${SERVERS}, render its template from benchmarks/competitive/configs
-   with LISTEN_PORT, UPSTREAM_PORT, STATIC_ROOT, PID_FILE, ERROR_LOG, and THREADS.
+   with LISTEN_PORT, UPSTREAM_PORT, STATIC_ROOT, PID_FILE, and ERROR_LOG.
 5. Start one server at a time, wait for http://127.0.0.1:<port>/health, then run:
    benchmarks/run.sh --tool ${TOOL} --host 127.0.0.1 --port <port> \\
      --duration ${DURATION} --connections ${CONNECTIONS} --threads ${THREADS} \\
@@ -164,11 +171,19 @@ render_template() {
 }
 
 ensure_tardigrade_binary() {
-    if [[ -x "$BINARY" ]]; then
+    if $BINARY_EXPLICIT; then
+        if [[ ! -x "$BINARY" ]]; then
+            echo "Explicit Tardigrade binary is not executable: ${BINARY}" >&2
+            exit 1
+        fi
         return
     fi
-    echo "Building Tardigrade release binary..."
-    (cd "$REPO_ROOT" && zig build -Doptimize=ReleaseFast)
+    if $TARDIGRADE_BUILT; then
+        return
+    fi
+    echo "Building Tardigrade release binary (${TARDIGRADE_BUILD_FLAGS})..."
+    (cd "$REPO_ROOT" && zig build ${TARDIGRADE_BUILD_FLAGS})
+    TARDIGRADE_BUILT=true
 }
 
 start_tardigrade() {
@@ -243,6 +258,153 @@ server_version() {
     esac
 }
 
+tool_version() {
+    case "$1" in
+        wrk) { wrk --version 2>&1 || true; } | head -1 ;;
+        h2load) { h2load --version 2>&1 || true; } | head -1 ;;
+        fortio) { fortio version 2>&1 || true; } | head -1 ;;
+        k6) { k6 version 2>&1 || true; } | head -1 ;;
+        *) { "$1" --version 2>&1 || true; } | head -1 ;;
+    esac
+}
+
+loopback_info() {
+    if command -v ip >/dev/null 2>&1; then
+        ip -o addr show lo 2>/dev/null | tr '\n' ';' || echo "unknown"
+    elif command -v ifconfig >/dev/null 2>&1; then
+        ifconfig lo0 2>/dev/null | awk '{$1=$1; printf "%s; ", $0}' || echo "unknown"
+    else
+        echo "unknown"
+    fi
+}
+
+host_metadata_json() {
+    jq -n \
+        --arg load_tool "$TOOL" \
+        --arg load_tool_version "$(tool_version "$TOOL")" \
+        --arg ulimit_n "$(ulimit -n 2>/dev/null || echo unknown)" \
+        --arg ulimit_u "$(ulimit -u 2>/dev/null || echo unknown)" \
+        --arg loopback "$(loopback_info)" \
+        --arg tardigrade_build_flags "$TARDIGRADE_BUILD_FLAGS" \
+        --argjson tardigrade_binary_explicit "$($BINARY_EXPLICIT && echo true || echo false)" \
+        '{
+            load_tool: $load_tool,
+            load_tool_version: $load_tool_version,
+            ulimit: {
+                open_files: $ulimit_n,
+                max_user_processes: $ulimit_u
+            },
+            network: {
+                loopback: $loopback
+            },
+            tardigrade: {
+                build_flags: $tardigrade_build_flags,
+                binary_explicit: $tardigrade_binary_explicit
+            }
+        }'
+}
+
+process_tree_pids() {
+    local root="$1"
+    printf '%s\n' "$root"
+    local children child
+    children=$(pgrep -P "$root" 2>/dev/null || true)
+    for child in $children; do
+        process_tree_pids "$child"
+    done
+}
+
+monitor_process_tree() {
+    local pid="$1" sample_interval_s="$2" outfile="$3"
+    while kill -0 "$pid" 2>/dev/null; do
+        process_tree_pids "$pid" | paste -sd, - | {
+            read -r pids
+            [[ -n "$pids" ]] || pids="$pid"
+            ps -p "$pids" -o rss= -o %cpu= 2>/dev/null |
+                awk '{ rss += $1; cpu += $2 } END { if (rss > 0 || cpu > 0) print rss, cpu }' >> "$outfile"
+        }
+        sleep "$sample_interval_s"
+    done
+}
+
+average_column_or_null() {
+    local file="$1" column="$2"
+    awk -v col="$column" 'NF >= col { sum += $col; count += 1 } END { if (count > 0) printf "%.2f", sum / count; else printf "null" }' "$file"
+}
+
+peak_rss_mb_or_null() {
+    local file="$1"
+    awk 'NF >= 1 && $1 > max { max = $1 } END { if (max > 0) printf "%.2f", max / 1024; else printf "null" }' "$file"
+}
+
+start_process_monitor() {
+    CURRENT_CPU_PCT_AVG="null"
+    CURRENT_RSS_MB_PEAK="null"
+    MONITOR_FILE="$(mktemp /tmp/tardigrade-competitive-monitor-XXXX.txt)"
+    local sample_interval_s
+    sample_interval_s="0.500"
+    monitor_process_tree "$EDGE_PID" "$sample_interval_s" "$MONITOR_FILE" &
+    MONITOR_PID="$!"
+}
+
+stop_process_monitor() {
+    if [[ -n "$MONITOR_PID" ]]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
+        MONITOR_PID=""
+    fi
+    if [[ -n "$MONITOR_FILE" && -f "$MONITOR_FILE" ]]; then
+        CURRENT_CPU_PCT_AVG="$(average_column_or_null "$MONITOR_FILE" 2)"
+        CURRENT_RSS_MB_PEAK="$(peak_rss_mb_or_null "$MONITOR_FILE")"
+        rm -f "$MONITOR_FILE"
+        MONITOR_FILE=""
+    fi
+}
+
+wrk_error_count() {
+    awk '
+        /Non-2xx/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^[0-9]+$/) total += $i
+            }
+        }
+        /Socket errors:/ {
+            for (i = 1; i <= NF; i++) {
+                gsub(/,/, "", $i)
+                if ($i ~ /^[0-9]+$/) total += $i
+            }
+        }
+        END { print total + 0 }
+    '
+}
+
+assert_payload_size() {
+    local url="$1"
+    local expected_bytes="$2"
+    local tmp actual_bytes
+    tmp="$(mktemp /tmp/tardigrade-competitive-payload-XXXX)"
+    curl -fsS "$url" -o "$tmp"
+    actual_bytes="$(wc -c < "$tmp" | tr -d '[:space:]')"
+    rm -f "$tmp"
+    if [[ "$actual_bytes" != "$expected_bytes" ]]; then
+        echo "Preflight failed for ${url}: expected ${expected_bytes} bytes, got ${actual_bytes}" >&2
+        exit 1
+    fi
+}
+
+preflight_server() {
+    local server="$1"
+    local port="$2"
+    local base="http://127.0.0.1:${port}"
+    assert_payload_size "${base}/tiny.txt" 3
+    if [[ "$server" != "haproxy" ]]; then
+        assert_payload_size "${base}/large.bin" 1048576
+    fi
+    assert_payload_size "${base}/proxy/health" 2
+    assert_payload_size "${base}/proxy/payload-1m.bin" 1048576
+    assert_payload_size "${base}/proxy/payload-16m.bin" 16777216
+}
+
 rename_pass_json() {
     local input="$1"
     local output="$2"
@@ -274,16 +436,18 @@ run_benchmark_pass() {
     local scenarios="$4"
     local static_path="$5"
     local proxy_path="$6"
+    local pass_tool="${7:-$TOOL}"
     local raw="${OUT_DIR}/${server}-${pass}.raw.json"
     local renamed="${OUT_DIR}/${server}-${pass}.json"
 
     "${BENCH_DIR}/run.sh" \
-        --tool "$TOOL" \
+        --tool "$pass_tool" \
         --host 127.0.0.1 \
         --port "$port" \
         --driver "competitive-loopback" \
         --config-label "${server}" \
         --pid "$EDGE_PID" \
+        --pid-tree \
         --meta-file "$META_FILE" \
         --duration "$DURATION" \
         --connections "$CONNECTIONS" \
@@ -309,10 +473,12 @@ run_connection_churn() {
 
     echo "==> connection-churn-http1: tiny static file with Connection: close"
     local raw summary_json rps p50 p95 p99 p999 errors tput_mbps
+    start_process_monitor
     raw=$(wrk --latency -s "${BENCH_DIR}/wrk-summary.lua" \
         -t"${THREADS}" -c"${CONNECTIONS}" -d"${DURATION}s" \
         -H "Connection: close" \
         "http://127.0.0.1:${port}/tiny.txt" 2>&1) || true
+    stop_process_monitor
     summary_json=$(printf '%s\n' "$raw" | sed -n 's/^WRK_SUMMARY //p' | tail -1)
     if [[ -z "$summary_json" ]]; then
         echo "wrk summary hook did not emit percentile JSON for connection churn" >&2
@@ -325,7 +491,7 @@ run_connection_churn() {
     p99=$(echo "$summary_json" | jq -r '.p99_ms // null')
     p999=$(echo "$summary_json" | jq -r '.p999_ms // null')
     tput_mbps=$(echo "$summary_json" | jq -r '.throughput_mbps // null')
-    errors=$(echo "$raw" | grep -E "Non-2xx|Socket errors" | grep -oE '[0-9]+' | head -1 || echo 0)
+    errors=$(printf '%s\n' "$raw" | wrk_error_count)
     rps=${rps:-0}
     errors=${errors:-0}
     echo "  connection-churn-http1 — ${rps} req/s  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms  p999=${p999}ms  errors=${errors}"
@@ -338,6 +504,8 @@ run_connection_churn() {
         --argjson p999 "$p999" \
         --argjson mbps "$tput_mbps" \
         --argjson errors "$errors" \
+        --argjson cpu "$CURRENT_CPU_PCT_AVG" \
+        --argjson rss "$CURRENT_RSS_MB_PEAK" \
         '{
             _meta: {
                 competitive_server: $server,
@@ -351,11 +519,47 @@ run_connection_churn() {
                 p99_ms: $p99,
                 p999_ms: $p999,
                 throughput_mbps: $mbps,
-                cpu_pct_avg: null,
-                rss_mb_peak: null,
+                cpu_pct_avg: $cpu,
+                rss_mb_peak: $rss,
                 errors: $errors
             }
         }' > "$output"
+}
+
+write_unsupported_result() {
+    local server="$1"
+    local scenario="$2"
+    local reason="$3"
+    local output="$4"
+    jq -n --arg server "$server" --arg scenario "$scenario" --arg reason "$reason" '{
+        _meta: {
+            competitive_server: $server,
+            competitive_pass: $scenario
+        },
+        ($scenario): {
+            supported: false,
+            reason: $reason,
+            rps: null,
+            p50_ms: null,
+            p95_ms: null,
+            p99_ms: null,
+            p999_ms: null,
+            throughput_mbps: null,
+            cpu_pct_avg: null,
+            rss_mb_peak: null,
+            errors: null
+        }
+    }' > "$output"
+}
+
+run_idle_keepalive_aux() {
+    local server="$1"
+    local port="$2"
+    if ! command -v k6 >/dev/null 2>&1; then
+        echo "Skipping idle keepalive plus active traffic scenario; k6 is not installed."
+        return 0
+    fi
+    run_benchmark_pass "$server" "$port" "idle-keepalive" "keepalive-starvation" "/tiny.txt" "/proxy/health" "k6"
 }
 
 combine_server_results() {
@@ -395,6 +599,18 @@ combine_server_results() {
             ._meta.server_version = $version |
             . + ($doc | del(._meta))
         )
+        | with_entries(
+            if .key == "_meta" or (.value.supported? == false) then
+                .
+            else
+                .value.cpu_ms_per_request =
+                    (if ((.value.cpu_pct_avg // null) != null and (.value.rps // 0) > 0)
+                     then ((.value.cpu_pct_avg / 100.0) / .value.rps * 1000.0)
+                     else null end) |
+                .value.p99_ttfb_ms = (.value.p99_ms // null) |
+                .
+            end
+        )
     ' "${inputs[@]}" > "$combined"
 }
 
@@ -423,6 +639,7 @@ write_combined_outputs() {
                 duration_s: ($duration | tonumber),
                 connections: ($connections | tonumber),
                 threads: ($threads | tonumber),
+                host: $host_metadata,
                 note: "Compare only same-host, same-tool, same-duration results. Laptop and shared-runner output is non-canonical."
             },
             servers: (reduce .[] as $doc ({};
@@ -430,16 +647,17 @@ write_combined_outputs() {
             ))
         }
     ' --arg tool "$TOOL" --arg duration "$DURATION" --arg connections "$CONNECTIONS" --arg threads "$THREADS" \
+        --argjson host_metadata "$(host_metadata_json)" \
         "${server_files[@]}" > "$combined_json"
 
     jq -r '
-        ["server","scenario","rps","p50_ms","p95_ms","p99_ms","p999_ms","throughput_mbps","cpu_pct_avg","rss_mb_peak","errors"],
+        ["server","scenario","supported","rps","p50_ms","p95_ms","p99_ms","p999_ms","throughput_mbps","cpu_pct_avg","cpu_ms_per_request","rss_mb_peak","errors"],
         (.servers | to_entries[] as $server |
             $server.value | to_entries[] |
             select(.key != "_meta") |
-            [$server.key, .key, (.value.rps // null), (.value.p50_ms // null), (.value.p95_ms // null),
+            [$server.key, .key, (.value.supported // true), (.value.rps // null), (.value.p50_ms // null), (.value.p95_ms // null),
              (.value.p99_ms // null), (.value.p999_ms // null), (.value.throughput_mbps // null),
-             (.value.cpu_pct_avg // null), (.value.rss_mb_peak // null), (.value.errors // null)])
+             (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.errors // null)])
         | @csv
     ' "$combined_json" > "$csv"
 
@@ -466,10 +684,21 @@ write_combined_outputs() {
     echo "  ${md}"
 }
 
+selected_tardigrade() {
+    local server
+    for server in "${SERVER_LIST[@]}"; do
+        [[ "$server" == "tardigrade" ]] && return 0
+    done
+    return 1
+}
+
 require_tool jq
 require_tool curl
 require_tool python3
 require_tool "$TOOL"
+if ! $SMOKE; then
+    require_tool k6
+fi
 
 IFS=',' read -r -a SERVER_LIST <<< "$SERVERS"
 for server in "${SERVER_LIST[@]}"; do
@@ -511,28 +740,47 @@ for index in "${!SERVER_LIST[@]}"; do
     port=$((LISTEN_BASE + index))
     echo ""
     echo "== ${server} (${port}) =="
+    if [[ "$server" == "tardigrade" ]]; then
+        ensure_tardigrade_binary
+    fi
     echo "version: $(server_version "$server")"
     start_server "$server" "$port"
+    preflight_server "$server" "$port"
 
     if $SMOKE; then
         run_benchmark_pass "$server" "$port" "tiny-static" "static-http1" "/tiny.txt" "/proxy/health"
     else
         run_benchmark_pass "$server" "$port" "tiny-proxy" "static-http1,proxy-http1,keepalive" "/tiny.txt" "/proxy/health"
-        run_benchmark_pass "$server" "$port" "large-static" "static-http1" "/large.bin" "/proxy/health"
+        if [[ "$server" == "haproxy" ]]; then
+            write_unsupported_result "$server" "static-large-http1" \
+                "HAProxy http-request return file responses must fit a response buffer; the 1 MiB static-file scenario is intentionally unsupported for this representative config." \
+                "${OUT_DIR}/${server}-large-static.json"
+        else
+            run_benchmark_pass "$server" "$port" "large-static" "static-http1" "/large.bin" "/proxy/health"
+        fi
         run_benchmark_pass "$server" "$port" "large-proxy" "proxy-http1" "/tiny.txt" "/proxy/payload-1m.bin"
         run_benchmark_pass "$server" "$port" "slow-client" "proxy-slow-client-download" "/tiny.txt" "/proxy/payload-16m.bin"
         run_connection_churn "$server" "$port"
     fi
     if $SMOKE; then
         :
-    elif [[ "$TOOL" == "k6" ]]; then
-        run_benchmark_pass "$server" "$port" "idle-keepalive" "keepalive-starvation" "/tiny.txt" "/proxy/health"
     else
-        echo "Skipping idle keepalive plus active traffic scenario; it requires --tool k6."
+        run_idle_keepalive_aux "$server" "$port"
     fi
 
     combine_server_results "$server"
     cleanup_edge
 done
+
+if ! $SMOKE && selected_tardigrade; then
+    "${COMP_DIR}/upstream-pool-matrix.sh" \
+        --binary "$BINARY" \
+        --listen-port "$((LISTEN_BASE + 50))" \
+        --origin-base-port "$((UPSTREAM_PORT + 50))" \
+        --duration "$DURATION" \
+        --connections "$CONNECTIONS" \
+        --threads "$THREADS" \
+        --output "${OUT_DIR}/upstream-pool-matrix.json"
+fi
 
 write_combined_outputs

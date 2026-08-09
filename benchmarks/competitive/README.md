@@ -41,6 +41,10 @@ Required for all runs:
 - one load tool, `wrk` by default
 - Zig 0.16.0 when the Tardigrade binary must be built
 
+Required for full non-smoke runs:
+
+- `k6`, used for the idle keep-alive clients plus active traffic scenario
+
 Required for the full default competitor set:
 
 - `nginx`
@@ -64,7 +68,8 @@ The automated suite records these HTTP/1.1 scenarios for each selected server:
 | `proxy-slow-client-download` | Reverse proxy download through rate-limited clients. |
 | `connection-churn-http1` | Tiny static file throughput with `Connection: close`. |
 
-When run with `--tool k6`, the full suite also includes:
+The full suite also runs this auxiliary k6 scenario independent of the primary
+throughput tool:
 
 | Scenario | Purpose |
 | --- | --- |
@@ -76,6 +81,18 @@ that scenario and print the manual workflow.
 `--smoke` intentionally runs a single Tardigrade-only static pass so CI can
 validate process startup, measurement, normalization, and output generation
 without requiring competitor binaries.
+
+HAProxy does not emit a comparable `static-large-http1` row because the
+representative `http-request return file` path is bounded by HAProxy response
+buffer size and is not valid for a 1 MiB static file. The suite records that row
+as unsupported instead of manufacturing a misleading number.
+
+Full Tardigrade runs also write `upstream-pool-matrix.json`, covering the #147
+matrix absorbed by #149: uneven route traffic, many low-volume origins, one hot
+origin with many workers, local vs cross-worker reuse, new upstream
+connections/sec, CPU/request, p99 TTFB, and contention notes. Upstream TLS
+handshake/reuse is marked unsupported until a TLS-capable local origin fixture
+exists.
 
 ## Configs
 
@@ -117,5 +134,5 @@ The combined JSON shape is:
 ```
 
 Only compare rows from the same output directory. Cross-run comparisons are
-valid only when host load, tool versions, server versions, and run parameters
-match.
+valid only when host load, tool versions, server versions, ulimits, loopback
+metadata, build flags, and run parameters match.
