@@ -57,6 +57,9 @@ const UpstreamResponseSpec = struct {
     chunked: bool = false,
     omit_body: bool = false,
     truncate_body_after: ?usize = null,
+    /// Emit neither `Content-Length` nor `Transfer-Encoding`, so the body is
+    /// delimited by the connection close (HTTP/1.0-style framing).
+    close_delimited: bool = false,
 };
 
 const FastCgiResponseSpec = struct {
@@ -400,6 +403,9 @@ const UpstreamServer = struct {
     capture: RequestCapture,
     responses: []const UpstreamResponseSpec,
     next_response_index: usize,
+    /// Set when the fixture listens on AF_UNIX instead of TCP. The path is
+    /// borrowed from the caller and unlinked on `stop`.
+    socket_path: ?[]const u8 = null,
 
     fn start(allocator: std.mem.Allocator, responses: []const UpstreamResponseSpec) !UpstreamServer {
         return startOnPort(allocator, 0, responses);
@@ -418,6 +424,21 @@ const UpstreamServer = struct {
         };
     }
 
+    fn startOnUnixSocket(allocator: std.mem.Allocator, socket_path: []const u8, responses: []const UpstreamResponseSpec) !UpstreamServer {
+        compat.cwd().deleteFile(socket_path) catch {};
+        const server = try compat.listenUnix(socket_path);
+        return .{
+            .allocator = allocator,
+            .server = server,
+            .thread = null,
+            .stop_flag = std.atomic.Value(bool).init(false),
+            .capture = try RequestCapture.init(allocator),
+            .responses = responses,
+            .next_response_index = 0,
+            .socket_path = socket_path,
+        };
+    }
+
     fn port(self: *const UpstreamServer) u16 {
         return self.server.port();
     }
@@ -433,9 +454,10 @@ const UpstreamServer = struct {
             _ = std.c.shutdown(fd, std.posix.SHUT.RDWR);
         }
         self.mutex.unlock();
-        wakeListener(self.port());
+        if (self.socket_path) |path| wakeUnixListener(path) else wakeListener(self.port());
         if (self.thread) |thread| thread.join();
         self.server.deinit();
+        if (self.socket_path) |path| compat.cwd().deleteFile(path) catch {};
         self.capture.deinit();
         self.* = undefined;
     }
@@ -1542,7 +1564,9 @@ fn handleUpstreamConnection(server: *UpstreamServer, conn: compat.NetConnection)
             200 => "OK",
             201 => "Created",
             202 => "Accepted",
+            204 => "No Content",
             302 => "Found",
+            304 => "Not Modified",
             400 => "Bad Request",
             401 => "Unauthorized",
             429 => "Too Many Requests",
@@ -1559,7 +1583,7 @@ fn handleUpstreamConnection(server: *UpstreamServer, conn: compat.NetConnection)
         });
         if (response_spec.chunked) {
             try conn.stream.writer().writeAll("Transfer-Encoding: chunked\r\n");
-        } else {
+        } else if (!response_spec.close_delimited) {
             try conn.stream.writer().print("Content-Length: {d}\r\n", .{if (response_spec.omit_body) 0 else response_spec.body.len});
         }
         try conn.stream.writer().print("Connection: {s}\r\n", .{
@@ -1707,6 +1731,7 @@ fn readHttpMessage(allocator: std.mem.Allocator, stream: compat.NetStream, max_b
     var tmp: [4096]u8 = undefined;
     var header_end: ?usize = null;
     var content_length: usize = 0;
+    var chunked = false;
     while (true) {
         const read_n = try readSocketWithPoll(stream.handle, &tmp, 5_000);
         if (read_n == 0) break;
@@ -1717,22 +1742,41 @@ fn readHttpMessage(allocator: std.mem.Allocator, stream: compat.NetStream, max_b
             if (std.mem.find(u8, buf.items, "\r\n\r\n")) |idx| {
                 header_end = idx + 4;
                 content_length = parseContentLength(buf.items[0..idx]);
+                if (headerValue(buf.items[0 .. idx + 2], "Transfer-Encoding")) |te| {
+                    chunked = std.ascii.eqlIgnoreCase(std.mem.trim(u8, te, " \t\r\n"), "chunked");
+                }
             }
         }
         if (header_end) |headers_len| {
-            if (buf.items.len >= headers_len + content_length) break;
+            // A chunked upload has no declared length: read until the terminal
+            // chunk so the captured body is the whole decoded payload.
+            if (chunked) {
+                if (std.mem.find(u8, buf.items[headers_len..], "\r\n0\r\n\r\n") != null or
+                    std.mem.startsWith(u8, buf.items[headers_len..], "0\r\n\r\n")) break;
+            } else if (buf.items.len >= headers_len + content_length) break;
         }
     }
 
-    const raw = try buf.toOwnedSlice();
+    var raw = try buf.toOwnedSlice();
+    errdefer allocator.free(raw);
     const split_idx = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.InvalidHttpMessage;
-    const request_line_end = std.mem.find(u8, raw, "\r\n") orelse return error.InvalidHttpMessage;
-    const headers_raw = raw[0 .. split_idx + 2];
     const body_start = split_idx + 4;
+    if (chunked) {
+        // Replace the raw chunk framing with the decoded payload so assertions
+        // can compare against what the client actually uploaded.
+        const decoded = try decodeChunkedHttpBody(allocator, raw[body_start..]);
+        defer allocator.free(decoded);
+        const rewritten = try allocator.alloc(u8, body_start + decoded.len);
+        @memcpy(rewritten[0..body_start], raw[0..body_start]);
+        @memcpy(rewritten[body_start..], decoded);
+        allocator.free(raw);
+        raw = rewritten;
+    }
+    const request_line_end = std.mem.find(u8, raw, "\r\n") orelse return error.InvalidHttpMessage;
     return .{
         .raw = raw,
         .request_line = raw[0..request_line_end],
-        .headers_raw = headers_raw,
+        .headers_raw = raw[0 .. split_idx + 2],
         .body = raw[body_start..],
     };
 }
@@ -2583,6 +2627,12 @@ fn wakeListener(port: u16) void {
     var stream = compat.tcpConnectToHost(std.testing.allocator, test_host, port) catch return;
     defer stream.close();
     stream.writeAll("GET /__shutdown__ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") catch {};
+}
+
+fn wakeUnixListener(path: []const u8) void {
+    var stream = compat.connectUnixSocket(path) catch return;
+    defer stream.close();
+    stream.writeAll("GET /__shutdown__ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n") catch {};
 }
 
 fn findFreePort() !u16 {
@@ -12115,6 +12165,427 @@ test "proxy full streaming upload works for server block route override" {
     defer allocator.free(captured);
     try std.testing.expectEqual(@as(usize, payload_len), captured.len);
     try std.testing.expectEqualStrings(payload, captured);
+}
+
+test "proxy full streaming mode relays a chunked upload without buffering it" {
+    const allocator = std.testing.allocator;
+    const payload_len = 512 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, idx| {
+        byte.* = @intCast('a' + @as(u8, @intCast(idx % 26)));
+    }
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "chunked uploaded",
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /upload {{
+        \\    proxy_pass http://{s}:{d}/upload;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "full" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_MAX_BODY_SIZE", .value = "1048576" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var upload_stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer upload_stream.close();
+    try setStreamTimeouts(&upload_stream, 5_000);
+
+    const head = try std.fmt.allocPrint(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+        .{ test_host, tardigrade.port },
+    );
+    defer allocator.free(head);
+    try upload_stream.writeAll(head);
+
+    // Send the body as many small chunks with an extension and a trailer, all
+    // of which the relay must consume and re-frame rather than forward.
+    var offset: usize = 0;
+    const chunk_len = 16 * 1024;
+    while (offset < payload_len) {
+        const take = @min(chunk_len, payload_len - offset);
+        var size_line_buf: [64]u8 = undefined;
+        const size_line = try std.fmt.bufPrint(&size_line_buf, "{x};tag=stream\r\n", .{take});
+        try upload_stream.writeAll(size_line);
+        try upload_stream.writeAll(payload[offset .. offset + take]);
+        try upload_stream.writeAll("\r\n");
+        offset += take;
+    }
+    try upload_stream.writeAll("0\r\nX-Upload-Checksum: ignored\r\n\r\n");
+
+    var response = try readHttpResponse(allocator, upload_stream);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("chunked uploaded", response.body);
+
+    // The upstream saw chunked framing (so the gateway re-framed rather than
+    // buffering to compute a Content-Length) and the exact decoded payload.
+    try std.testing.expectEqualStrings("chunked", upstream.capturedHeader("Transfer-Encoding").?);
+    try std.testing.expect(upstream.capturedHeader("Content-Length") == null);
+    const captured = try upstream.capturedBody(allocator);
+    defer allocator.free(captured);
+    try std.testing.expectEqual(@as(usize, payload_len), captured.len);
+    try std.testing.expectEqualStrings(payload, captured);
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer metrics.deinit();
+    const streamed = prometheusMetricValue(metrics.body, "tardigrade_proxy_streaming_requests_total") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(streamed >= 1);
+    try std.testing.expect(std.mem.find(u8, metrics.body, "tardigrade_proxy_streaming_fallback_total{reason=\"missing_content_length\"} 0") != null);
+}
+
+test "proxy full streaming mode rejects malformed and oversized chunked uploads" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "unreachable",
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /upload {{
+        \\    proxy_pass http://{s}:{d}/upload;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "full" },
+            .{ .name = "TARDIGRADE_MAX_BODY_SIZE", .value = "4096" },
+        },
+    });
+    defer tardigrade.stop();
+
+    // Chunk payload not followed by CRLF: client framing fault, not an origin
+    // failure, so it must surface as 400 rather than 502.
+    {
+        var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+        defer stream.close();
+        try setStreamTimeouts(&stream, 5_000);
+        const request = try std.fmt.allocPrint(
+            allocator,
+            "POST /upload HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloBROKEN\r\n0\r\n\r\n",
+            .{ test_host, tardigrade.port },
+        );
+        defer allocator.free(request);
+        try stream.writeAll(request);
+        var response = try readHttpResponse(allocator, stream);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status_code);
+    }
+
+    // Decoded payload past TARDIGRADE_MAX_BODY_SIZE must be rejected mid-relay.
+    {
+        var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+        defer stream.close();
+        try setStreamTimeouts(&stream, 5_000);
+        const head = try std.fmt.allocPrint(
+            allocator,
+            "POST /upload HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n",
+            .{ test_host, tardigrade.port },
+        );
+        defer allocator.free(head);
+        try stream.writeAll(head);
+        const chunk = "800\r\n" ++ ("z" ** 2048) ++ "\r\n";
+        // Two 2 KiB chunks fit the 4 KiB budget; the third must be refused.
+        stream.writeAll(chunk) catch {};
+        stream.writeAll(chunk) catch {};
+        stream.writeAll(chunk) catch {};
+        stream.writeAll("0\r\n\r\n") catch {};
+        var response = try readHttpResponse(allocator, stream);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 413), response.status_code);
+    }
+}
+
+test "proxy streaming mode relays a close-delimited upstream response" {
+    const allocator = std.testing.allocator;
+    const payload_len = 256 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'c');
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = payload,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+        .close_delimited = true,
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "65536" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/close-delimited.bin",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    // Relayed downstream with chunked framing, so the client still gets an
+    // explicit end-of-message rather than depending on the connection close.
+    try std.testing.expectEqualStrings("chunked", response.header("Transfer-Encoding").?);
+    try std.testing.expectEqual(@as(usize, payload_len), response.body.len);
+    try std.testing.expectEqualStrings(payload, response.body);
+}
+
+test "proxy streaming mode records a client abort during a large response" {
+    const allocator = std.testing.allocator;
+    const payload_len = 4 * 1024 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'q');
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = payload,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+        },
+    });
+    defer tardigrade.stop();
+
+    {
+        var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+        defer stream.close();
+        try setStreamTimeouts(&stream, 5_000);
+        const request = try std.fmt.allocPrint(
+            allocator,
+            "GET /proxy/huge.bin HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n",
+            .{ test_host, tardigrade.port },
+        );
+        defer allocator.free(request);
+        try stream.writeAll(request);
+        // Read only the head plus a little body, then close mid-transfer.
+        var scratch: [4096]u8 = undefined;
+        _ = stream.read(&scratch) catch {};
+    }
+
+    try waitForMetricAtLeast(allocator, tardigrade.port, "tardigrade_proxy_client_aborts_total", 1, 5_000);
+}
+
+test "proxy full streaming mode records a client abort during an upload" {
+    const allocator = std.testing.allocator;
+    const payload_len = 512 * 1024;
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = "never completed",
+        .headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /upload {{
+        \\    proxy_pass http://{s}:{d}/upload;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "full" },
+            .{ .name = "TARDIGRADE_MAX_BODY_SIZE", .value = "1048576" },
+        },
+    });
+    defer tardigrade.stop();
+
+    {
+        var stream = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+        defer stream.close();
+        try setStreamTimeouts(&stream, 5_000);
+        const head = try std.fmt.allocPrint(
+            allocator,
+            "POST /upload HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\nContent-Length: {d}\r\n\r\n",
+            .{ test_host, tardigrade.port, payload_len },
+        );
+        defer allocator.free(head);
+        try stream.writeAll(head);
+        // Promise 512 KiB, deliver 1 KiB, then hang up.
+        const partial = try allocator.alloc(u8, 1024);
+        defer allocator.free(partial);
+        @memset(partial, 'p');
+        try stream.writeAll(partial);
+    }
+
+    try waitForMetricAtLeast(allocator, tardigrade.port, "tardigrade_proxy_client_aborts_total", 1, 5_000);
+}
+
+test "proxy streaming mode streams over a unix socket upstream" {
+    const allocator = std.testing.allocator;
+    const payload_len = 256 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, idx| {
+        byte.* = @intCast('A' + @as(u8, @intCast(idx % 26)));
+    }
+
+    // AF_UNIX paths are capped near 104 bytes and the config loader requires an
+    // absolute one, so the repo-relative .zig-cache scratch dir is not usable.
+    const socket_path = try std.fmt.allocPrint(allocator, "/tmp/tg-stream-{d}.sock", .{compat.milliTimestamp()});
+    defer allocator.free(socket_path);
+
+    var upstream = try UpstreamServer.startOnUnixSocket(allocator, socket_path, &.{.{
+        .body = payload,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    // A Unix-socket upstream is selected by the base URL; the location keeps a
+    // relative proxy_pass so the socket path resolves for the route.
+    const upstream_base_url = try std.fmt.allocPrint(allocator, "unix:{s}", .{socket_path});
+    defer allocator.free(upstream_base_url);
+
+    const config_text =
+        \\location /proxy/ {
+        \\    proxy_pass /upstream/;
+        \\}
+    ;
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_UPSTREAM_BASE_URL", .value = upstream_base_url },
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "65536" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/large.bin",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqual(@as(usize, payload_len), response.body.len);
+    try std.testing.expectEqualStrings(payload, response.body);
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer metrics.deinit();
+    // A Unix-socket target is no longer a reason to buffer: the response
+    // streamed past the buffered cap with no fallback event.
+    const streamed = prometheusMetricValue(metrics.body, "tardigrade_proxy_streaming_requests_total") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(streamed >= 1);
+    try std.testing.expect(std.mem.find(u8, metrics.body, "tardigrade_proxy_streaming_fallback_total{reason=\"unsupported_route_type\"} 0") != null);
+}
+
+test "proxy streaming falls back with a retries_configured reason when retries are enabled" {
+    const allocator = std.testing.allocator;
+    const payload_len = 128 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'r');
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{
+        .body = payload,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+    }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /proxy/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "response" },
+            .{ .name = "TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS", .value = "2" },
+            .{ .name = "TARDIGRADE_UPSTREAM_RETRY_IDEMPOTENT_ONLY", .value = "false" },
+            .{ .name = "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", .value = "1048576" },
+        },
+    });
+    defer tardigrade.stop();
+
+    var response = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/proxy/retryable.bin",
+        .body = null,
+        .headers = &.{},
+    });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqual(@as(usize, payload_len), response.body.len);
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer metrics.deinit();
+    const fallbacks = prometheusMetricValue(metrics.body, "tardigrade_proxy_streaming_fallback_total{reason=\"retries_configured\"}") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(fallbacks >= 1);
+    const buffered = prometheusMetricValue(metrics.body, "tardigrade_proxy_buffered_requests_total") orelse return error.InvalidHttpResponse;
+    try std.testing.expect(buffered >= 1);
 }
 
 test "proxy buffered response limit returns stable 502 when upstream body exceeds cap" {

@@ -184,15 +184,20 @@ global setting. `executeStreamingHttpProxyRequest` routes HTTPS targets through
 origins fall back to the h1 streaming relay on that (fresh, unpooled)
 connection.
 
+A Unix-socket upstream is streamed by the h1 relay directly over the AF_UNIX
+socket, pooled under a `unix:<path>` key; it never uses the h2 pool, which has
+no origin to key or ALPN-negotiate.
+
 Streaming eligibility is deterministic and observable. An eligibility check that
 falls back to the bounded buffered path increments
 `tardigrade_proxy_streaming_fallback_total{reason=...}` with one of:
-`policy_disabled`, `retries_configured`, `unix_socket_target`, or
-`upstream_mtls_target`. Full-mode upload eligibility uses the same metric for
-upload-specific fallbacks: `chunked_request_upload`, `missing_content_length`,
-`body_too_large`, `body_dependent_middleware`, and `unsupported_route_type`.
-The metric counts fallback events, not unique requests, because upload and
-response eligibility are evaluated at different phases.
+`policy_disabled`, `retries_configured`, or `early_data_retry_semantics`.
+Full-mode upload eligibility uses the same metric for upload-specific
+fallbacks: `missing_content_length`, `body_too_large`,
+`body_dependent_middleware`, and `unsupported_route_type`. The metric counts
+fallback events, not unique requests, because upload and response eligibility
+are evaluated at different phases. See
+[PROXY_STREAMING.md](PROXY_STREAMING.md) for the full supported matrix.
 
 Proxy buffer accounting is exposed separately from upstream pool reuse metrics.
 `tardigrade_buffered_bytes_current{direction,scope}` reports application-owned

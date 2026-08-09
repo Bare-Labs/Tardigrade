@@ -380,6 +380,13 @@ pub fn listenTcp(host: []const u8, port: u16) !NetServer {
     return .{ .inner = try address.listen(io(), .{ .reuse_address = true }) };
 }
 
+/// Listen on a Unix domain socket path. The caller owns the filesystem entry
+/// and must unlink it after `deinit`; `NetServer.port` is meaningless here.
+pub fn listenUnix(path: []const u8) !NetServer {
+    const address = try std.Io.net.UnixAddress.init(path);
+    return .{ .inner = try address.listen(io(), .{}) };
+}
+
 /// Drop-in replacement for std.Thread.Mutex using the new std.Io.Mutex API.
 /// lock/unlock have no io or error parameter to match the old interface.
 pub const Mutex = struct {

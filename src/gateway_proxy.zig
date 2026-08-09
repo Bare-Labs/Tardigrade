@@ -114,9 +114,26 @@ pub const BufferedUpstreamResponse = struct {
     }
 };
 
+/// A client upload that is relayed to the upstream incrementally instead of
+/// being materialized first (#139).
 pub const StreamingRequestBody = struct {
-    content_length: usize,
+    /// Downstream body framing.
+    framing: Framing,
+    /// Body bytes that arrived in the same read as the request head. They are
+    /// relayed before the downstream connection is read again.
     initial_bytes: []const u8 = &.{},
+    /// Decoded-payload budget enforced while relaying `.chunked` uploads. A
+    /// `.length` upload is bounded by its own Content-Length, which routing
+    /// already checked against the same maximum.
+    max_body_bytes: usize = 0,
+
+    pub const Framing = union(enum) {
+        /// Client sent a `Content-Length`; the exact byte count is known up front.
+        length: usize,
+        /// Client sent `Transfer-Encoding: chunked`; the total size is unknown
+        /// until the terminal chunk arrives.
+        chunked,
+    };
 };
 
 const ProxyBufferReservation = struct {
@@ -686,6 +703,75 @@ fn executeBufferedViaH2Pool(
 /// on connection-level errors (matching the buffered h2 path). Once the
 /// response head has been written downstream, an upstream failure is reported
 /// as an aborted relay (truncated chunked body) rather than an error. When the
+/// Relay a streamed client upload to an HTTP/2 upstream as incremental DATA.
+/// The caller owns connection teardown on error. `read_buf` is the single relay
+/// buffer, so upload memory stays bounded; per-stream flow control supplies the
+/// backpressure.
+fn relayStreamingUploadToHttp2(
+    conn: anytype,
+    stream: anytype,
+    sb: StreamingRequestBody,
+    read_buf: []u8,
+    downstream_conn: anytype,
+    cancel_token: ?*const CancellationToken,
+    proxy_buffer_limits: proxy_buffer_account.Limits,
+    proxy_buffer_observer: proxy_buffer_account.Observer,
+) !void {
+    switch (sb.framing) {
+        .length => |content_length| {
+            var sent: usize = @min(sb.initial_bytes.len, content_length);
+            if (sent > 0) {
+                var initial_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
+                try initial_reservation.reserve(sent);
+                defer initial_reservation.releaseAll();
+                try conn.writeStreamingRequestBody(stream, sb.initial_bytes[0..sent], sent == content_length);
+            }
+            while (sent < content_length) {
+                if (cancelStopped(cancel_token)) return error.RequestCancelled;
+                const want = @min(read_buf.len, content_length - sent);
+                const n = downstream_conn.read(read_buf[0..want]) catch return error.ClientAborted;
+                if (n == 0) return error.ClientAborted;
+                var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
+                try upload_reservation.reserve(n);
+                defer upload_reservation.releaseAll();
+                try conn.writeStreamingRequestBody(stream, read_buf[0..n], sent + n == content_length);
+                sent += n;
+            }
+            // A zero-length streamed body still needs an END_STREAM DATA frame.
+            if (content_length == 0) try conn.writeStreamingRequestBody(stream, "", true);
+        },
+        .chunked => {
+            // HTTP/2 has no chunked transfer coding: the decoded payload goes
+            // out as DATA frames and END_STREAM replaces the terminal chunk, so
+            // the upstream never sees a Content-Length it cannot know.
+            var reader = http.chunked_upload.Reader(@TypeOf(downstream_conn))
+                .init(downstream_conn, sb.initial_bytes, sb.max_body_bytes);
+            while (true) {
+                if (cancelStopped(cancel_token)) return error.RequestCancelled;
+                const n = try reader.next(read_buf);
+                if (n == 0) break;
+                var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
+                try upload_reservation.reserve(n);
+                defer upload_reservation.releaseAll();
+                try conn.writeStreamingRequestBody(stream, read_buf[0..n], false);
+            }
+            try conn.writeStreamingRequestBody(stream, "", true);
+        },
+    }
+}
+
+/// Streaming reverse-proxy exchange over the per-origin HTTP/2 pool (#145,
+/// Phase 4b PR 4). Issues the request as one stream on the shared origin
+/// connection and relays DATA frames downstream as they arrive, with bounded
+/// per-stream buffering: the actor replenishes the stream-level flow-control
+/// window only as this relay drains, so a slow downstream client
+/// backpressures its own stream without stalling other streams on the shared
+/// connection (whose connection-level window the reader replenishes promptly).
+///
+/// A failure before any downstream byte evicts the connection and retries once
+/// on connection-level errors (matching the buffered h2 path). Once the
+/// response head has been written downstream, an upstream failure is reported
+/// as an aborted relay (truncated chunked body) rather than an error. When the
 /// origin negotiates HTTP/1.1 via ALPN, the request runs on the h1 streaming
 /// relay over that fresh (unpooled) connection instead.
 ///
@@ -786,64 +872,21 @@ fn streamViaH2Pool(
                 };
 
                 if (streaming_body) |sb| {
-                    var sent: usize = @min(sb.initial_bytes.len, sb.content_length);
-                    if (sent > 0) {
-                        var initial_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
-                        initial_reservation.reserve(sent) catch |err| {
-                            conn.finishStreaming(stream);
-                            h2_pool.release(conn);
-                            return err;
-                        };
-                        conn.writeStreamingRequestBody(stream, sb.initial_bytes[0..sent], sent == sb.content_length) catch |err| {
-                            initial_reservation.releaseAll();
-                            conn.finishStreaming(stream);
-                            if (!conn.healthy()) h2_pool.evict(key, conn);
-                            h2_pool.release(conn);
-                            return err;
-                        };
-                        initial_reservation.releaseAll();
-                    }
-                    while (sent < sb.content_length) {
-                        if (cancelStopped(cancel_token)) {
-                            conn.finishStreaming(stream);
-                            h2_pool.release(conn);
-                            return error.RequestCancelled;
-                        }
-                        const want = @min(read_buf.len, sb.content_length - sent);
-                        const n = downstream_conn.read(read_buf[0..want]) catch {
-                            conn.finishStreaming(stream);
-                            h2_pool.release(conn);
-                            return error.ClientAborted;
-                        };
-                        if (n == 0) {
-                            conn.finishStreaming(stream);
-                            h2_pool.release(conn);
-                            return error.ClientAborted;
-                        }
-                        var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
-                        upload_reservation.reserve(n) catch |err| {
-                            conn.finishStreaming(stream);
-                            h2_pool.release(conn);
-                            return err;
-                        };
-                        conn.writeStreamingRequestBody(stream, read_buf[0..n], sent + n == sb.content_length) catch |err| {
-                            upload_reservation.releaseAll();
-                            conn.finishStreaming(stream);
-                            if (!conn.healthy()) h2_pool.evict(key, conn);
-                            h2_pool.release(conn);
-                            return err;
-                        };
-                        upload_reservation.releaseAll();
-                        sent += n;
-                    }
-                    if (sb.content_length == 0) {
-                        conn.writeStreamingRequestBody(stream, "", true) catch |err| {
-                            conn.finishStreaming(stream);
-                            if (!conn.healthy()) h2_pool.evict(key, conn);
-                            h2_pool.release(conn);
-                            return err;
-                        };
-                    }
+                    relayStreamingUploadToHttp2(
+                        conn,
+                        stream,
+                        sb,
+                        read_buf,
+                        downstream_conn,
+                        cancel_token,
+                        proxy_buffer_limits,
+                        proxy_buffer_observer,
+                    ) catch |err| {
+                        conn.finishStreaming(stream);
+                        if (!conn.healthy()) h2_pool.evict(key, conn);
+                        h2_pool.release(conn);
+                        return err;
+                    };
                 }
 
                 conn.waitStreamingResponseHead(stream) catch |err| {
@@ -1714,7 +1757,12 @@ fn sendStreamingProxyRequest(
     }
     for (extra_headers) |header| try w.print("{s}: {s}\r\n", .{ header.name, header.value });
     if (streaming_body) |sb| {
-        try w.print("Content-Length: {d}\r\n", .{sb.content_length});
+        switch (sb.framing) {
+            // A chunked client upload is re-framed rather than buffered, so the
+            // upstream request stays chunked and no length is declared.
+            .length => |content_length| try w.print("Content-Length: {d}\r\n", .{content_length}),
+            .chunked => try w.writeAll("Transfer-Encoding: chunked\r\n"),
+        }
     } else if (buffered_body.len > 0) {
         try w.print("Content-Length: {d}\r\n", .{buffered_body.len});
     }
@@ -1722,29 +1770,74 @@ fn sendStreamingProxyRequest(
     try transport.writeAll(req_aw.written());
 
     if (streaming_body) |sb| {
-        var relay: [16 * 1024]u8 = undefined;
-        var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
-        var sent: usize = @min(sb.initial_bytes.len, sb.content_length);
-        try upload_reservation.reserve(relay.len);
-        defer upload_reservation.releaseAll();
-        if (sent > 0) {
-            try upload_reservation.reserve(sent);
-            transport.writeAll(sb.initial_bytes[0..sent]) catch |err| {
-                upload_reservation.release(sent);
-                return err;
-            };
-            upload_reservation.release(sent);
-        }
-        while (sent < sb.content_length) {
-            if (cancelStopped(cancel_token)) return error.RequestCancelled;
-            const want = @min(relay.len, sb.content_length - sent);
-            const n = downstream_conn.read(relay[0..want]) catch return error.ClientAborted;
-            if (n == 0) return error.ClientAborted;
-            try transport.writeAll(relay[0..n]);
-            sent += n;
-        }
+        try relayStreamingUploadToHttp1(
+            transport,
+            sb,
+            downstream_conn,
+            cancel_token,
+            proxy_buffer_limits,
+            proxy_buffer_observer,
+        );
     } else if (buffered_body.len > 0) {
         try transport.writeAll(buffered_body);
+    }
+}
+
+/// Relay a streamed client upload to an HTTP/1.1 upstream. Both framings copy
+/// through one fixed relay buffer, so peak user-space upload memory is bounded
+/// regardless of the body size.
+fn relayStreamingUploadToHttp1(
+    transport: anytype,
+    sb: StreamingRequestBody,
+    downstream_conn: anytype,
+    cancel_token: ?*const CancellationToken,
+    proxy_buffer_limits: proxy_buffer_account.Limits,
+    proxy_buffer_observer: proxy_buffer_account.Observer,
+) !void {
+    var relay: [16 * 1024]u8 = undefined;
+    var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
+    try upload_reservation.reserve(relay.len);
+    defer upload_reservation.releaseAll();
+
+    switch (sb.framing) {
+        .length => |content_length| {
+            var sent: usize = @min(sb.initial_bytes.len, content_length);
+            if (sent > 0) {
+                try upload_reservation.reserve(sent);
+                transport.writeAll(sb.initial_bytes[0..sent]) catch |err| {
+                    upload_reservation.release(sent);
+                    return err;
+                };
+                upload_reservation.release(sent);
+            }
+            while (sent < content_length) {
+                if (cancelStopped(cancel_token)) return error.RequestCancelled;
+                const want = @min(relay.len, content_length - sent);
+                const n = downstream_conn.read(relay[0..want]) catch return error.ClientAborted;
+                if (n == 0) return error.ClientAborted;
+                try transport.writeAll(relay[0..n]);
+                sent += n;
+            }
+        },
+        .chunked => {
+            // Decode the client's framing and re-chunk downstream-to-upstream.
+            // Re-framing (rather than forwarding the raw octets) keeps the
+            // upstream request well formed even when the client uses chunk
+            // extensions or trailers, which this hop does not forward.
+            var reader = http.chunked_upload.Reader(@TypeOf(downstream_conn))
+                .init(downstream_conn, sb.initial_bytes, sb.max_body_bytes);
+            while (true) {
+                if (cancelStopped(cancel_token)) return error.RequestCancelled;
+                const n = try reader.next(&relay);
+                if (n == 0) break;
+                var size_buf: [24]u8 = undefined;
+                const size_line = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{n}) catch unreachable;
+                try transport.writeAll(size_line);
+                try transport.writeAll(relay[0..n]);
+                try transport.writeAll("\r\n");
+            }
+            try transport.writeAll("0\r\n\r\n");
+        },
     }
 }
 
@@ -1859,6 +1952,9 @@ pub fn executeStreamingHttpProxyRequest(
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
     url: []const u8,
+    /// When set, the exchange runs over this AF_UNIX socket instead of a TCP
+    /// connection to `url`'s authority; `url` still supplies the request target.
+    unix_socket_path: ?[]const u8,
     method: []const u8,
     request_headers: *const http.Headers,
     buffered_body: []const u8,
@@ -1886,7 +1982,10 @@ pub fn executeStreamingHttpProxyRequest(
 
     const proxy_extra_header_slack = 10;
     const uri = try std.Uri.parse(url);
-    const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    // A Unix-socket upstream is always plain HTTP/1.1 over the socket: the
+    // resolved URL is a synthetic http://localhost target that only carries the
+    // request line and Host header.
+    const is_https = unix_socket_path == null and std.ascii.eqlIgnoreCase(uri.scheme, "https");
     const host = if (uri.host) |h| uriComponentBytes(h) else return error.UpstreamProtocolError;
     const port: u16 = uri.port orelse (if (is_https) @as(u16, 443) else 80);
     const tls_options: ?http.tls_termination.UpstreamTlsOptions = if (is_https) .{
@@ -1935,8 +2034,10 @@ pub fn executeStreamingHttpProxyRequest(
     // shared per-origin h2 connection when configured — via ALPN for HTTPS (h1
     // origins fall back inside) or prior-knowledge h2c for plain HTTP when
     // explicitly opted in (#237).
+    // A Unix-socket upstream has no origin the h2 pool can key or ALPN-negotiate,
+    // so it always uses the HTTP/1.1 relay below.
     const h2_requested_for_streaming = if (is_https) cfg.upstream_protocol.offersH2() else cfg.upstream_protocol.h2cPriorKnowledge();
-    const stream_h2 = h2_requested_for_streaming;
+    const stream_h2 = unix_socket_path == null and h2_requested_for_streaming;
     if (stream_h2) {
         if (h2_pool) |hp| {
             const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) tls_options.? else null;
@@ -1950,8 +2051,11 @@ pub fn executeStreamingHttpProxyRequest(
     if (pool) |p| p.recordProtocol(false);
 
     const active_pool: ?*http.upstream_pool.UpstreamPool = if (pool) |p| (if (p.config.enabled) p else null) else null;
-    var key_buf: [268]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_https) "https" else "http", host, port }) catch host;
+    var key_buf: [512]u8 = undefined;
+    const key = if (unix_socket_path) |socket_path|
+        std.fmt.bufPrint(&key_buf, "unix:{s}", .{socket_path}) catch socket_path
+    else
+        std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_https) "https" else "http", host, port }) catch host;
 
     // A dead reused connection can only be retried before any response byte
     // reaches the client, and only when the request body is re-sendable (a
@@ -1978,7 +2082,10 @@ pub fn executeStreamingHttpProxyRequest(
         }
         if (!reused) {
             const connect_start = http.event_loop.monotonicMs();
-            const new_fd = compat.connectBoundedTcp(host, port, connect_timeout_ms) catch |err| {
+            const new_fd = (if (unix_socket_path) |socket_path|
+                compat.connectBlockingUnix(socket_path)
+            else
+                compat.connectBoundedTcp(host, port, connect_timeout_ms)) catch |err| {
                 if (active_pool) |p| p.releaseSlot(key);
                 return err;
             };

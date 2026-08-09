@@ -5,6 +5,26 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- **Streaming reverse proxy completes its request-upload and transport scope
+  (#139)** — `proxy_streaming_mode full` (and the per-route `proxy_streaming
+  full` override) now relays `Transfer-Encoding: chunked` client uploads
+  incrementally instead of falling back to buffering. The client's framing is
+  decoded a slice at a time and re-framed: chunked to an HTTP/1.1 upstream, and
+  flow-controlled DATA frames terminated by `END_STREAM` — with no synthesized
+  `Content-Length` — to an HTTP/2 upstream. Chunk extensions and trailers are
+  consumed and dropped rather than forwarded. The decoded payload is counted
+  against `TARDIGRADE_MAX_BODY_SIZE` while it is relayed, so an upload that
+  outgrows the maximum is rejected with `413` and malformed chunk framing with
+  `400`; neither counts against the origin's health.
+
+  Unix-socket and upstream-mTLS targets stream as well. The streaming relay now
+  owns AF_UNIX connect and keep-alive pooling directly, and it already used the
+  same client certificate and key as the buffered path, so neither is a reason
+  to buffer any more. A Unix-socket upstream always uses HTTP/1.1.
+
+  New `docs/PROXY_STREAMING.md` documents the policy, the supported matrix, the
+  fallback reasons, and the retry / body-dependent-middleware contract.
+
 - **TLS-over-TCP post-handshake `KeyUpdate` (#357, research story 325-H)** —
   record-mode TLS 1.3 now sends and receives RFC 8446 §4.6.3 `KeyUpdate`,
   advancing one direction's application traffic secret at a time along §7.2's
@@ -1024,6 +1044,14 @@ All notable user-facing changes to Tardigrade are documented here.
   before falling back to `autoindex`, so an existing `index.html` takes
   priority over a directory listing. Set `index "";` to opt out of the
   default and rely solely on `try_files`/`autoindex`.
+
+### Removed
+- **Three reverse-proxy streaming fallback reasons that can no longer occur
+  (#139)** — `tardigrade_proxy_streaming_fallback_total` no longer exports the
+  `unix_socket_target`, `upstream_mtls_target`, or `chunked_request_upload`
+  label series, because all three combinations now stream. The
+  `early_data_retry_semantics` reason, which was emitted but had no counter,
+  gains one. Dashboards or alerts referencing the removed series need updating.
 
 ## [0.5.0] - 2026-07-08
 

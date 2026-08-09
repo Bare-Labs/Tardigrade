@@ -3335,40 +3335,19 @@ fn parseRequestErrorStatus(err: http.ParseError) http.Status {
     };
 }
 
-fn isHttpUrl(raw: []const u8) bool {
-    return std.mem.startsWith(u8, raw, "http://") or std.mem.startsWith(u8, raw, "https://");
-}
-
-fn targetSupportsStdHttpStreaming(cfg: *const edge_config.EdgeConfig, target: []const u8) bool {
-    const trimmed = std.mem.trim(u8, target, " \t\r\n");
-    if (trimmed.len == 0) return false;
-    if (gp.unixSocketPathFromEndpoint(trimmed) != null) return false;
-    if (isHttpUrl(trimmed)) {
-        return !(cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, trimmed, "https://"));
-    }
-    if (gp.unixSocketPathFromEndpoint(cfg.upstream_base_url) != null) return false;
-    return !(cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, cfg.upstream_base_url, "https://"));
-}
-
 const RequestUploadStreamingEligibility = union(enum) {
     stream,
     fallback: gproxy_runtime.StreamingFallbackReason,
     not_applicable,
 };
 
+/// Unix-socket and upstream-mTLS targets stream like any other upstream (#139),
+/// so only a route that names no target at all is unsupported here.
 fn targetStreamingFallbackReason(
-    cfg: *const edge_config.EdgeConfig,
     target: []const u8,
 ) ?gproxy_runtime.StreamingFallbackReason {
     const trimmed = std.mem.trim(u8, target, " \t\r\n");
     if (trimmed.len == 0) return .unsupported_route_type;
-    if (gp.unixSocketPathFromEndpoint(trimmed) != null) return .unix_socket_target;
-    if (isHttpUrl(trimmed)) {
-        if (cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, trimmed, "https://")) return .upstream_mtls_target;
-        return null;
-    }
-    if (gp.unixSocketPathFromEndpoint(cfg.upstream_base_url) != null) return .unix_socket_target;
-    if (cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, cfg.upstream_base_url, "https://")) return .upstream_mtls_target;
     return null;
 }
 
@@ -3392,13 +3371,18 @@ fn streamingUploadEligibilityBeforeBodyRead(
         if (request.method.isIdempotent()) return .{ .fallback = .retries_configured };
     }
 
-    if (request.hasTransferEncoding()) return .{ .fallback = .chunked_request_upload };
-    const content_length = request.contentLength() orelse return .{ .fallback = .missing_content_length };
-    if (content_length == 0) return .not_applicable;
-    if (content_length > cfg.request_limits.effectiveMaxBodySize()) return .{ .fallback = .body_too_large };
+    // `parseHead` has already rejected any transfer coding other than chunked,
+    // so a Transfer-Encoding here means a chunked upload of unknown length. It
+    // is relayed incrementally and bounded by the request-body maximum while it
+    // is decoded, rather than being buffered to learn its size.
+    if (!request.hasTransferEncoding()) {
+        const content_length = request.contentLength() orelse return .{ .fallback = .missing_content_length };
+        if (content_length == 0) return .not_applicable;
+        if (content_length > cfg.request_limits.effectiveMaxBodySize()) return .{ .fallback = .body_too_large };
+    }
 
     return switch (matched.block.action) {
-        .proxy_pass => |target| if (targetStreamingFallbackReason(cfg, target)) |reason| .{ .fallback = reason } else .stream,
+        .proxy_pass => |target| if (targetStreamingFallbackReason(target)) |reason| .{ .fallback = reason } else .stream,
         else => .{ .fallback = .unsupported_route_type },
     };
 }
@@ -3611,18 +3595,32 @@ fn mayNeedStreamingRequestBodyPreRead(cfg: *const edge_config.EdgeConfig) bool {
 }
 
 fn streamingRequestBodyFromHead(
+    cfg: *const edge_config.EdgeConfig,
     request: *const http.Request,
     pending_buf: []const u8,
     header_read: gconn.HttpRequestHeadRead,
     bytes_consumed: usize,
 ) ?gproxy_runtime.StreamingRequestBody {
-    const content_length = request.contentLength() orelse return null;
     if (bytes_consumed > header_read.total_read) return null;
     const available = header_read.total_read - bytes_consumed;
+    const max_body_bytes = cfg.request_limits.effectiveMaxBodySize();
+
+    // A chunked upload's initial bytes are still raw chunk framing; the relay
+    // decodes them before anything reaches the upstream.
+    if (request.hasTransferEncoding()) {
+        return .{
+            .framing = .chunked,
+            .initial_bytes = pending_buf[bytes_consumed .. bytes_consumed + available],
+            .max_body_bytes = max_body_bytes,
+        };
+    }
+
+    const content_length = request.contentLength() orelse return null;
     const initial_len = @min(available, content_length);
     return .{
-        .content_length = content_length,
+        .framing = .{ .length = content_length },
         .initial_bytes = pending_buf[bytes_consumed .. bytes_consumed + initial_len],
+        .max_body_bytes = max_body_bytes,
     };
 }
 
@@ -3717,7 +3715,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
         const upload_eligibility = streamingUploadEligibilityBeforeBodyRead(pre_effective_cfg, &head_parse.request);
         switch (upload_eligibility) {
             .stream => {
-                streaming_request_body = streamingRequestBodyFromHead(&head_parse.request, pending_buf, head_read, head_parse.bytes_consumed);
+                streaming_request_body = streamingRequestBodyFromHead(pre_effective_cfg, &head_parse.request, pending_buf, head_read, head_parse.bytes_consumed);
                 const request_transport_early = h1ConsumeRequestEarlyProvenance(session, old_pending_len, head_read.total_read, head_parse.bytes_consumed, h2LastReadEarlyPrefixLenBounded(conn, head_read.total_read));
                 request = head_parse.request;
                 request_initialized = true;
@@ -4937,7 +4935,8 @@ test "streaming upload eligibility reports typed fallback reasons" {
         MAX_REQUEST_SIZE,
     );
     defer chunked_head.request.deinit();
-    try std.testing.expectEqual(RequestUploadStreamingEligibility{ .fallback = .chunked_request_upload }, streamingUploadEligibilityBeforeBodyRead(&cfg, &chunked_head.request));
+    // A chunked upload is re-framed incrementally rather than buffered (#139).
+    try std.testing.expectEqual(RequestUploadStreamingEligibility.stream, streamingUploadEligibilityBeforeBodyRead(&cfg, &chunked_head.request));
 
     var compat_head = try http.Request.parseHead(
         allocator,

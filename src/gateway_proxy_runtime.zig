@@ -36,12 +36,12 @@ const writeBufferedUpstreamResponse = gp.writeBufferedUpstreamResponse;
 
 pub const StreamingRequestBody = gp.StreamingRequestBody;
 
+/// Why a request took the bounded buffered path instead of streaming (#139).
+/// Every reason is recorded as a metric label and a debug log line so operators
+/// can tell whether a given large transfer actually streamed.
 pub const StreamingFallbackReason = enum {
     policy_disabled,
     retries_configured,
-    unix_socket_target,
-    upstream_mtls_target,
-    chunked_request_upload,
     missing_content_length,
     body_too_large,
     body_dependent_middleware,
@@ -52,9 +52,6 @@ pub const StreamingFallbackReason = enum {
         return switch (self) {
             .policy_disabled => "policy_disabled",
             .retries_configured => "retries_configured",
-            .unix_socket_target => "unix_socket_target",
-            .upstream_mtls_target => "upstream_mtls_target",
-            .chunked_request_upload => "chunked_request_upload",
             .missing_content_length => "missing_content_length",
             .body_too_large => "body_too_large",
             .body_dependent_middleware => "body_dependent_middleware",
@@ -193,17 +190,17 @@ fn routeResponseStreamingEnabled(
     return block.proxy_streaming_policy.responseStreamingEnabled(cfg.proxy_streaming_mode.responseStreamingEnabled());
 }
 
+/// Unix-socket and upstream-mTLS targets are streamed like any other upstream
+/// (#139): the streaming relay owns AF_UNIX connect/pooling and the same
+/// `UpstreamTlsOptions` — including the client certificate — as the buffered
+/// path, so neither is a reason to buffer.
 fn streamingEligibilityForDataPlaneProxyRequest(
     cfg: *const edge_config.EdgeConfig,
     block: *const edge_config.EdgeConfig.LocationBlock,
-    resolved: *const gp.ResolvedProxyTarget,
-    url: []const u8,
     max_attempts: usize,
 ) StreamingEligibility {
     if (!routeResponseStreamingEnabled(cfg, block)) return .{ .fallback = .policy_disabled };
     if (max_attempts != 1) return .{ .fallback = .retries_configured };
-    if (resolved.unix_socket_path != null) return .{ .fallback = .unix_socket_target };
-    if (cfg.upstream_tls_client_cert.len > 0 and std.mem.startsWith(u8, url, "https://")) return .{ .fallback = .upstream_mtls_target };
     return .stream;
 }
 
@@ -536,7 +533,7 @@ pub fn handleLocationProxyPass(
 
     const fallback_reason: StreamingFallbackReason = if (needs_early_425_orchestration)
         .early_data_retry_semantics
-    else switch (streamingEligibilityForDataPlaneProxyRequest(cfg, matched_block, &resolved, upstream_url.value, max_attempts)) {
+    else switch (streamingEligibilityForDataPlaneProxyRequest(cfg, matched_block, max_attempts)) {
         .stream => {
             state.recordUpstreamAttemptStart(selection.base_url);
             const proxy_buffer_observer = state.proxyBufferObserver();
@@ -544,6 +541,7 @@ pub fn handleLocationProxyPass(
                 allocator,
                 cfg,
                 upstream_url.value,
+                resolved.unix_socket_path,
                 method_str,
                 &request.headers,
                 body,
@@ -578,6 +576,18 @@ pub fn handleLocationProxyPass(
                     try sendApiError(allocator, writer, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id, false, state);
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
                     return @intFromEnum(http.Status.service_unavailable);
+                }
+                // The client's own chunked framing was bad or its upload
+                // outgrew the request-body maximum (#139). Both are client
+                // faults raised before any response byte is committed, so the
+                // origin is not blamed for them.
+                if (err == error.InvalidChunkedUpload or err == error.ChunkedUploadTooLarge) {
+                    const upload_status: http.Status = if (err == error.ChunkedUploadTooLarge) .payload_too_large else .bad_request;
+                    const upload_code = if (err == error.ChunkedUploadTooLarge) "payload_too_large" else "invalid_request";
+                    const upload_msg = if (err == error.ChunkedUploadTooLarge) "Request body too large" else "Malformed chunked request body";
+                    try sendApiError(allocator, writer, upload_status, upload_code, upload_msg, correlation_id, false, state);
+                    ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(upload_status), 0);
+                    return @intFromEnum(upload_status);
                 }
                 state.recordUpstreamFailure(cfg, selection.base_url);
                 if (err == error.RequestCancelled) {
@@ -2165,26 +2175,18 @@ test "streaming eligibility returns typed fallback reasons" {
         .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
         .proxy_streaming_policy = .inherit,
     };
-    const url: []const u8 = "http://127.0.0.1:9001/";
-    const resolved = gp.ResolvedProxyTarget{
-        .url = @constCast(url),
-        .upstream_host = "127.0.0.1:9001",
-    };
-
-    try std.testing.expectEqual(StreamingEligibility.stream, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, &resolved, url, 1));
+    try std.testing.expectEqual(StreamingEligibility.stream, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, 1));
     try std.testing.expectEqualStrings("early_data_retry_semantics", StreamingFallbackReason.early_data_retry_semantics.metricLabel());
 
     var off_block = block;
     off_block.proxy_streaming_policy = .off;
-    try std.testing.expectEqual(StreamingEligibility{ .fallback = .policy_disabled }, streamingEligibilityForDataPlaneProxyRequest(&cfg, &off_block, &resolved, url, 1));
-    try std.testing.expectEqual(StreamingEligibility{ .fallback = .retries_configured }, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, &resolved, url, 2));
+    try std.testing.expectEqual(StreamingEligibility{ .fallback = .policy_disabled }, streamingEligibilityForDataPlaneProxyRequest(&cfg, &off_block, 1));
+    try std.testing.expectEqual(StreamingEligibility{ .fallback = .retries_configured }, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, 2));
 
-    var unix_resolved = resolved;
-    unix_resolved.unix_socket_path = "/tmp/upstream.sock";
-    try std.testing.expectEqual(StreamingEligibility{ .fallback = .unix_socket_target }, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, &unix_resolved, url, 1));
-
+    // Unix-socket and upstream-mTLS targets stream like any other upstream
+    // (#139) — neither forces the buffered path any more.
     cfg.upstream_tls_client_cert = "/cert.pem";
-    try std.testing.expectEqual(StreamingEligibility{ .fallback = .upstream_mtls_target }, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, &resolved, "https://127.0.0.1:9001/", 1));
+    try std.testing.expectEqual(StreamingEligibility.stream, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, 1));
 }
 
 test "route streaming policy can override global mode" {
@@ -2199,13 +2201,8 @@ test "route streaming policy can override global mode" {
         .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
         .proxy_streaming_policy = .response,
     };
-    const url: []const u8 = "http://127.0.0.1:9001/";
-    const resolved = gp.ResolvedProxyTarget{
-        .url = @constCast(url),
-        .upstream_host = "127.0.0.1:9001",
-    };
 
-    try std.testing.expectEqual(StreamingEligibility.stream, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, &resolved, url, 1));
+    try std.testing.expectEqual(StreamingEligibility.stream, streamingEligibilityForDataPlaneProxyRequest(&cfg, &block, 1));
 }
 
 test "proxySuffixPathForLocation uses mount prefix for split upstream exact route" {
