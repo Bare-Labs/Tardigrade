@@ -124,8 +124,8 @@ process_tree_cpu_seconds() {
             for pid in "${_cpu_pids[@]}"; do
                 [[ -r "/proc/${pid}/stat" ]] || continue
                 total_ticks=$((total_ticks + $(awk '{
-                    close = match($0, /\) /)
-                    rest = substr($0, close + 2)
+                    paren_idx = match($0, /\) /)
+                    rest = substr($0, paren_idx + 2)
                     split(rest, f, " ")
                     print (f[12] + f[13])
                 }' "/proc/${pid}/stat")))
