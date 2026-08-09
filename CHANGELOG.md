@@ -212,9 +212,11 @@ All notable user-facing changes to Tardigrade are documented here.
   assert the same feature set or a superset — rather than as a downward
   stapling obligation. Status evidence — stapled responses, cached answers, CRL
   sets, with freshness bounds, defect reasons, and an authentication flag — is
-  supplied by the caller and bound to a certificate by SHA-256 identity, so an
-  alternate or cross-signed candidate path can never consume evidence gathered
-  for a different certificate at the same index. Unauthenticated evidence never
+  supplied by the caller and keyed solely by SHA-256 certificate identity — never
+  by path position — so one evidence set is safely shared across candidate paths
+  of different shape and depth. RFC 6961 `status_request_v2` is reported as
+  unsatisfiable rather than enforced, because RFC 8446 §4.4.2.1 forbids a TLS
+  1.3 server from acting on it. Unauthenticated evidence never
   counts as a completed check by default; the one exception is a peer-stapled
   revocation, which can only condemn the peer itself. A stale `certificateHold`
   does not outrank fresher evidence of its RFC 5280 §5.3.1 release. No

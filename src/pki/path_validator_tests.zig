@@ -3814,13 +3814,11 @@ fn fuzzPathValidation(_: void, smith: *testing.Smith) !void {
 const revocation = @import("revocation.zig");
 
 fn statusAssertion(
-    certificate_index: usize,
     certificate: *const x509.Certificate,
     source: revocation.Source,
     status: revocation.Status,
 ) revocation.StatusAssertion {
     return .{
-        .certificate_index = certificate_index,
         .certificate = revocation.CertificateIdentity.of(certificate),
         .source = source,
         .status = status,
@@ -3859,8 +3857,8 @@ test "stapled status evidence is carried onto the accepted path" {
     try addValidChain(&fx, 1);
 
     const assertions = [_]revocation.StatusAssertion{
-        statusAssertion(0, &fx.certs.items[0], .stapled_ocsp, .good),
-        statusAssertion(1, &fx.certs.items[1], .cached_ocsp, .good),
+        statusAssertion(&fx.certs.items[0], .stapled_ocsp, .good),
+        statusAssertion(&fx.certs.items[1], .cached_ocsp, .good),
     };
     var validation_policy = policy(fx.certs.items[2..3]);
     validation_policy.revocation = .{ .mode = .strict };
@@ -3884,7 +3882,7 @@ test "a revoked certificate is rejected with its CRL reason" {
     defer fx.deinit();
     try addValidChain(&fx, 1);
 
-    var revoked = statusAssertion(0, &fx.certs.items[0], .stapled_ocsp, .revoked);
+    var revoked = statusAssertion(&fx.certs.items[0], .stapled_ocsp, .revoked);
     revoked.revocation_reason = .key_compromise;
     const assertions = [_]revocation.StatusAssertion{revoked};
     var validation_policy = policy(fx.certs.items[2..3]);
@@ -3932,7 +3930,7 @@ test "a must-staple leaf is rejected without a stapled good status" {
     defer missing.deinit(testing.allocator);
     try expectRejected(&missing, .revocation_must_staple_not_satisfied, 0);
 
-    const assertions = [_]revocation.StatusAssertion{statusAssertion(0, &fx.certs.items[0], .stapled_ocsp, .good)};
+    const assertions = [_]revocation.StatusAssertion{statusAssertion(&fx.certs.items[0], .stapled_ocsp, .good)};
     validation_policy.revocation_evidence = .{ .assertions = &assertions };
     var stapled = try validateBuilt(testing.allocator, &fx.certs.items[0], &.{}, fx.certs.items[1..2], validation_policy, cp);
     defer stapled.deinit(testing.allocator);
@@ -4004,7 +4002,7 @@ test "status evidence cannot rescue a path that fails RFC 5280 validation" {
         .key_usage = 0x04,
     });
 
-    const assertions = [_]revocation.StatusAssertion{statusAssertion(0, &fx.certs.items[0], .stapled_ocsp, .good)};
+    const assertions = [_]revocation.StatusAssertion{statusAssertion(&fx.certs.items[0], .stapled_ocsp, .good)};
     var validation_policy = policy(fx.certs.items[1..2]);
     validation_policy.revocation = .{ .mode = .strict };
     validation_policy.revocation_evidence = .{ .assertions = &assertions };
@@ -4023,8 +4021,8 @@ test "status policy allocation failures stay structured and leak-free" {
     try addValidChain(&fx, 1);
 
     const assertions = [_]revocation.StatusAssertion{
-        statusAssertion(0, &fx.certs.items[0], .stapled_ocsp, .good),
-        statusAssertion(1, &fx.certs.items[1], .cached_ocsp, .good),
+        statusAssertion(&fx.certs.items[0], .stapled_ocsp, .good),
+        statusAssertion(&fx.certs.items[1], .cached_ocsp, .good),
     };
     var validation_policy = policy(fx.certs.items[2..3]);
     validation_policy.revocation = .{ .mode = .strict };
@@ -4122,7 +4120,7 @@ test "an issuer's TLS Feature set constrains what its children must assert" {
     // A staple cannot rescue a chain that breaks the issuer's constraint: the
     // constraint is checked during path validation, before any status policy.
     const assertions = [_]revocation.StatusAssertion{
-        statusAssertion(0, &fx.certs.items[0], .stapled_ocsp, .good),
+        statusAssertion(&fx.certs.items[0], .stapled_ocsp, .good),
     };
     var validation_policy = policy(anchors);
     validation_policy.revocation = .{ .mode = .stapled_only };
@@ -4138,16 +4136,19 @@ test "an issuer's TLS Feature set constrains what its children must assert" {
     defer disjoint.deinit(testing.allocator);
     try expectRejected(&disjoint, .tls_feature_constraint_violation, 0);
 
-    // Same set and superset both satisfy it, and then normal leaf must-staple
-    // processing applies.
-    for (fx.certs.items[1..3], 1..) |_, index| {
+    // Same set and superset both satisfy the constraint, and then normal leaf
+    // must-staple processing applies. The superset leaf also declares feature
+    // 17, which this TLS 1.3-only stack cannot satisfy — see the dedicated
+    // status_request_v2 test; here it only has to pass the chain constraint.
+    const expected_outcomes = [_]revocation.MustStapleOutcome{
+        .unenforced_status_disabled,
+        .unsatisfiable_status_request_v2,
+    };
+    for (expected_outcomes, 1..) |expected, index| {
         var accepted = try validateBuilt(testing.allocator, &fx.certs.items[index], intermediates, anchors, policy(anchors), cp);
         defer accepted.deinit(testing.allocator);
         try expectAccepted(&accepted, 3);
-        try testing.expectEqual(
-            revocation.MustStapleOutcome.unenforced_status_disabled,
-            accepted.accepted.revocation.must_staple,
-        );
+        try testing.expectEqual(expected, accepted.accepted.revocation.must_staple);
     }
 }
 
@@ -4203,8 +4204,8 @@ test "an alternate candidate cannot inherit another candidate's status evidence"
 
     // Evidence covers the leaf and the *expired* intermediate only.
     const assertions = [_]revocation.StatusAssertion{
-        statusAssertion(0, &fx.certs.items[0], .stapled_ocsp, .good),
-        statusAssertion(1, &fx.certs.items[1], .cached_ocsp, .good),
+        statusAssertion(&fx.certs.items[0], .stapled_ocsp, .good),
+        statusAssertion(&fx.certs.items[1], .cached_ocsp, .good),
     };
     var validation_policy = policy(anchors);
     validation_policy.revocation = .{ .mode = .strict };
@@ -4238,12 +4239,92 @@ test "an alternate candidate cannot inherit another candidate's status evidence"
     // accepts, which proves the rejection above was the identity check and not
     // an unrelated failure.
     const bound = [_]revocation.StatusAssertion{
-        statusAssertion(0, &fx.certs.items[0], .stapled_ocsp, .good),
-        statusAssertion(1, &fx.certs.items[2], .cached_ocsp, .good),
+        statusAssertion(&fx.certs.items[0], .stapled_ocsp, .good),
+        statusAssertion(&fx.certs.items[2], .cached_ocsp, .good),
     };
     validation_policy.revocation_evidence = .{ .assertions = &bound };
     var accepted = try validateBuilt(testing.allocator, &fx.certs.items[0], intermediates, anchors, validation_policy, cp);
     defer accepted.deinit(testing.allocator);
     try expectAccepted(&accepted, 3);
     try testing.expect(accepted.accepted.revocation.allChecked());
+}
+
+test "a longer candidate's evidence cannot reject a shorter candidate end to end" {
+    // The union evidence set covers both candidates. Candidate A is one
+    // certificate longer and fails an unrelated rule; candidate B has complete
+    // evidence of its own and must be accepted, with A's extra assertions
+    // neither applied to B nor treated as an error against it.
+    var fx = Fixtures.init(testing.allocator);
+    defer fx.deinit();
+    // 0: leaf, issued by "Intermediate".
+    try fx.add(.{
+        .subject = "leaf",
+        .issuer = "Intermediate",
+        .subject_key = 1,
+        .issuer_key = 2,
+        .ca = false,
+        .key_usage = 0x80,
+        .san = "leaf.example.com",
+    });
+    // 1: candidate A's intermediate, under an expired sub-root.
+    try fx.add(.{
+        .subject = "Intermediate",
+        .issuer = "SubRoot",
+        .subject_key = 2,
+        .issuer_key = 4,
+        .ca = true,
+        .key_usage = 0x04,
+    });
+    // 2: the expired sub-root, which makes candidate A fail on validity.
+    try fx.add(.{
+        .subject = "SubRoot",
+        .issuer = "Root",
+        .subject_key = 4,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+        .not_before = "200101000000Z",
+        .not_after = "210101000000Z",
+    });
+    // 3: candidate B's intermediate, chaining straight to the anchor.
+    try fx.add(.{
+        .subject = "Intermediate",
+        .issuer = "Root",
+        .subject_key = 2,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+    });
+    try fx.add(.{
+        .subject = "Root",
+        .issuer = "Root",
+        .subject_key = 3,
+        .issuer_key = 3,
+        .ca = true,
+        .key_usage = 0x04,
+    });
+
+    var entropy: crypto.pure_zig.DeterministicEntropy = undefined;
+    var provider: crypto.pure_zig.Provider = undefined;
+    const cp = cryptoProvider(&entropy, &provider);
+    const intermediates = fx.certs.items[1..4];
+    const anchors = fx.certs.items[4..5];
+
+    const union_evidence = [_]revocation.StatusAssertion{
+        statusAssertion(&fx.certs.items[0], .stapled_ocsp, .good),
+        statusAssertion(&fx.certs.items[1], .cached_ocsp, .good),
+        // Only candidate A has a certificate at this depth.
+        statusAssertion(&fx.certs.items[2], .cached_ocsp, .good),
+        statusAssertion(&fx.certs.items[3], .cached_ocsp, .good),
+    };
+    var validation_policy = policy(anchors);
+    validation_policy.revocation = .{ .mode = .strict };
+    validation_policy.revocation_evidence = .{ .assertions = &union_evidence };
+
+    var result = try validateBuilt(testing.allocator, &fx.certs.items[0], intermediates, anchors, validation_policy, cp);
+    defer result.deinit(testing.allocator);
+    try expectAccepted(&result, 3);
+    const report = result.accepted.revocation;
+    try testing.expect(report.allChecked());
+    try testing.expectEqual(@as(usize, 2), report.entries.len);
 }

@@ -43,10 +43,13 @@
 //! unauthenticated `revoked` there would let an on-path attacker deny service
 //! with one forged response.
 //!
-//! Assertions are bound to a certificate by `CertificateIdentity`, not by
-//! position, so evidence gathered for one candidate path can never be applied
-//! to a different certificate that happens to sit at the same index in an
-//! alternate or cross-signed candidate.
+//! Assertions are bound to a certificate by `CertificateIdentity` alone, never
+//! by position. One evidence set is shared by every candidate path, and
+//! candidates differ in shape and depth, so a position-derived key would both
+//! misdirect evidence onto the wrong certificate and let a longer candidate's
+//! assertions invalidate a shorter one. Evidence for a certificate that is not
+//! on the path being evaluated is simply not consulted — it belongs to a
+//! sibling candidate, which is expected in a shared set.
 
 const std = @import("std");
 const path_builder = @import("path_builder.zig");
@@ -136,11 +139,11 @@ pub const CertificateIdentity = struct {
 /// Unix seconds on the same scale as `validation_time`; all are optional
 /// because CRL sets and cache entries do not all carry every field.
 pub const StatusAssertion = struct {
-    /// Leaf-first index of the certificate this assertion covers.
-    certificate_index: usize,
-    /// The certificate this assertion is about. An assertion whose identity
-    /// does not match the certificate at `certificate_index` in the path being
-    /// validated is ignored, never applied by position.
+    /// The certificate this assertion is about — the only thing that decides
+    /// which certificate it applies to. There is deliberately no path index
+    /// here: one evidence set is shared by every candidate, and candidates
+    /// differ in both shape and depth, so any position-derived key would let a
+    /// longer candidate's evidence invalidate or misdirect a shorter one's.
     certificate: CertificateIdentity,
     source: Source,
     status: Status = .unknown,
@@ -237,7 +240,7 @@ pub const Entry = struct {
     revocation_reason: ?CrlReason = null,
     this_update: ?i64 = null,
     next_update: ?i64 = null,
-    /// This certificate asserts RFC 7633 must-staple.
+    /// This certificate asserts RFC 7633 must-staple (`status_request`).
     must_staple: bool = false,
 };
 
@@ -253,9 +256,16 @@ pub const MustStapleOutcome = enum {
     unenforced_status_disabled,
     /// Asserted, but `Configuration.enforce_must_staple` is off.
     unenforced_by_configuration,
+    /// The leaf declares RFC 6961 `status_request_v2`, which RFC 8446 §4.4.2.1
+    /// forbids a TLS 1.3 server from acting on. This stack cannot satisfy such
+    /// a declaration, so it is never reported as enforced; only `disabled` mode
+    /// reaches this state, because a consulting mode rejects instead.
+    unsatisfiable_status_request_v2,
 
     pub fn isUnenforced(self: MustStapleOutcome) bool {
-        return self == .unenforced_status_disabled or self == .unenforced_by_configuration;
+        return self == .unenforced_status_disabled or
+            self == .unenforced_by_configuration or
+            self == .unsatisfiable_status_request_v2;
     }
 };
 
@@ -295,12 +305,14 @@ pub const FailureReason = enum {
     status_malformed,
     status_unauthenticated,
     must_staple_not_satisfied,
+    /// The leaf demands a TLS feature this stack cannot negotiate, so its
+    /// assertion can never be honored (RFC 6961 `status_request_v2`).
+    must_staple_feature_unsupported,
     /// The certificate publishes no revocation mechanism at all, so a strict
     /// policy can never be satisfied for it.
     status_source_unsupported,
-    /// The caller filed evidence against a certificate index the path does not
-    /// contain, or against the trust anchor.
-    evidence_index_invalid,
+    /// `evaluatePath` was handed something that is not a candidate path.
+    malformed_path,
     resource_limit_exceeded,
     out_of_memory,
 };
@@ -388,7 +400,7 @@ pub fn evaluatePath(
     validation_time: i64,
 ) Outcome {
     if (path.elements.len < 2) {
-        return .{ .rejected = .{ .reason = .evidence_index_invalid, .certificate_index = null } };
+        return .{ .rejected = .{ .reason = .malformed_path, .certificate_index = null } };
     }
     const certificate_count = path.elements.len - 1;
 
@@ -397,6 +409,7 @@ pub fn evaluatePath(
     // during path validation (`path_validator.checkTlsFeatureConstraints`), not
     // an assertion that propagates down as a stapling obligation of its own.
     const must_staple_required = path.elements[0].certificate.mustStaple();
+    const unsatisfiable_feature = path.elements[0].certificate.assertsStatusRequestV2();
 
     const entries = allocator.alloc(Entry, certificate_count) catch {
         return .{ .rejected = .{ .reason = .out_of_memory, .certificate_index = null } };
@@ -417,7 +430,12 @@ pub fn evaluatePath(
         return .{ .accepted = .{
             .mode = config.mode,
             .entries = entries,
-            .must_staple = if (must_staple_required) .unenforced_status_disabled else .not_required,
+            .must_staple = if (unsatisfiable_feature)
+                .unsatisfiable_status_request_v2
+            else if (must_staple_required)
+                .unenforced_status_disabled
+            else
+                .not_required,
         } };
     }
 
@@ -425,27 +443,23 @@ pub fn evaluatePath(
         allocator.free(entries);
         return .{ .rejected = .{ .reason = .resource_limit_exceeded, .certificate_index = null } };
     }
+    // Only the global bounds are checked here. Applicability is decided per
+    // certificate by identity: an assertion for a certificate this candidate
+    // does not contain belongs to a sibling candidate and is simply skipped,
+    // never a reason to reject this one.
     for (evidence.assertions) |assertion| {
         if (assertion.raw.len > config.limits.maximum_evidence_bytes) {
             allocator.free(entries);
             return .{ .rejected = .{
                 .reason = .resource_limit_exceeded,
-                .certificate_index = assertion.certificate_index,
-                .source = assertion.source,
-            } };
-        }
-        if (assertion.certificate_index >= certificate_count) {
-            allocator.free(entries);
-            return .{ .rejected = .{
-                .reason = .evidence_index_invalid,
-                .certificate_index = assertion.certificate_index,
+                .certificate_index = null,
                 .source = assertion.source,
             } };
         }
     }
 
     for (path.elements[0..certificate_count], 0..) |element, certificate_index| {
-        const selection = select(evidence, element.certificate, certificate_index, config, validation_time);
+        const selection = select(evidence, element.certificate, config, validation_time);
         var entry = &entries[certificate_index];
         entry.source = selection.source;
         entry.defect = selection.defect;
@@ -461,9 +475,21 @@ pub fn evaluatePath(
     }
 
     var must_staple: MustStapleOutcome = .not_required;
-    if (must_staple_required) {
+    if (must_staple_required or unsatisfiable_feature) {
         if (!config.enforce_must_staple) {
             must_staple = .unenforced_by_configuration;
+        } else if (unsatisfiable_feature) {
+            // RFC 8446 §4.4.2.1 forbids acting on status_request_v2 in TLS 1.3,
+            // so this stack can never demonstrate that the declaration was
+            // honored. Reporting `enforced` off an ordinary staple would be
+            // exactly the "pretend we checked" outcome this policy exists to
+            // prevent, so a mode that consults status fails closed instead.
+            const failure = Failure{
+                .reason = .must_staple_feature_unsupported,
+                .certificate_index = 0,
+            };
+            allocator.free(entries);
+            return .{ .rejected = failure };
         } else {
             const leaf_entry = entries[0];
             const satisfied = leaf_entry.source == .stapled_ocsp and
@@ -509,13 +535,13 @@ const Selection = struct {
 /// decides; when nothing is usable, the highest-precedence blocked assertion is
 /// reported so the operator learns why.
 ///
-/// Assertions are matched by certificate identity, not by position: the same
-/// evidence set is offered to every candidate path, and an alternate candidate
-/// with a different certificate at this index must not inherit it.
+/// Assertions are matched by certificate identity alone: the same evidence set
+/// is offered to every candidate path, so neither an alternate candidate with a
+/// different certificate at this index may inherit evidence, nor may the same
+/// certificate lose its own evidence by appearing at a different depth.
 fn select(
     evidence: Evidence,
     certificate: *const x509.Certificate,
-    certificate_index: usize,
     config: Configuration,
     validation_time: i64,
 ) Selection {
@@ -526,7 +552,6 @@ fn select(
     const identity = CertificateIdentity.of(certificate);
 
     for (evidence.assertions) |assertion| {
-        if (assertion.certificate_index != certificate_index) continue;
         if (!assertion.certificate.eql(identity)) continue;
         if (!consults(config.mode, assertion.source)) continue;
 
@@ -729,41 +754,35 @@ test "freshness bounds accept only evidence inside the stated window" {
     const now: i64 = 1_000_000;
     const freshness = Freshness{};
     try testing.expect(isFresh(.{
-        .certificate_index = 0,
         .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now - 60,
         .next_update = now + 3600,
     }, freshness, now));
     try testing.expect(!isFresh(.{
-        .certificate_index = 0,
         .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now - 60,
         .next_update = now - 3600,
     }, freshness, now));
     try testing.expect(!isFresh(.{
-        .certificate_index = 0,
         .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now + 3600,
         .next_update = now + 7200,
     }, freshness, now));
     try testing.expect(!isFresh(.{
-        .certificate_index = 0,
         .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now - 60,
     }, freshness, now));
     try testing.expect(!isFresh(.{
-        .certificate_index = 0,
         .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .next_update = now + 3600,
     }, freshness, now));
     // nextUpdate before thisUpdate is incoherent regardless of the window.
     try testing.expect(!isFresh(.{
-        .certificate_index = 0,
         .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now - 60,
@@ -775,7 +794,6 @@ test "clock skew is applied on both sides of the window" {
     const now: i64 = 1_000_000;
     const freshness = Freshness{ .clock_skew_seconds = 300 };
     try testing.expect(isFresh(.{
-        .certificate_index = 0,
         .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now + 200,
@@ -783,7 +801,6 @@ test "clock skew is applied on both sides of the window" {
     }, freshness, now));
     // Expired by less than the skew allowance is still usable.
     try testing.expect(isFresh(.{
-        .certificate_index = 0,
         .certificate = .{ .digest = @splat(0) },
         .source = .stapled_ocsp,
         .this_update = now - 400,

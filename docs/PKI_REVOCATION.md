@@ -77,12 +77,29 @@ propagates downward — the operational must-staple requirement is read from the
 end-entity certificate after the constraint holds. The trust anchor is excluded,
 like its other extensions: anchor restrictions are local trust configuration.
 
-`Report.must_staple` records what became of the assertion —
-`not_required`, `enforced`, `unenforced_status_disabled` (the mode consults
-nothing), or `unenforced_by_configuration` (`enforce_must_staple` is off) — so
-an acceptance never reads as "honored" when it was merely not applied.
-Operators who deploy must-staple certificates behind Tardigrade should run at
-least `stapled_only`.
+### `status_request_v2` is not satisfiable here
+
+RFC 6961 `status_request_v2` (feature 17) is a different extension, and RFC 8446
+§4.4.2.1 obsoletes it for TLS 1.3: a TLS 1.3 server MUST NOT act on or send it.
+Tardigrade's native TLS path is TLS 1.3 only, so an ordinary `status_request`
+staple cannot demonstrate that a feature-17 declaration was honored, and
+reporting it as `enforced` would be exactly the "pretend we checked" outcome
+this policy exists to prevent.
+
+A leaf declaring feature 17 — alone or alongside feature 5 — is therefore
+rejected with `must_staple_feature_unsupported` in any mode that consults
+status, and recorded as `unsatisfiable_status_request_v2` under `disabled`.
+`x509.TlsFeatures.requiresStapledStatus` covers feature 5 only;
+`assertsStatusRequestV2` reports the declaration separately.
+
+### Reporting
+
+`Report.must_staple` records what became of the assertion — `not_required`,
+`enforced`, `unenforced_status_disabled` (the mode consults nothing),
+`unenforced_by_configuration` (`enforce_must_staple` is off), or
+`unsatisfiable_status_request_v2` — so an acceptance never reads as "honored"
+when it was merely not applied. Operators who deploy must-staple certificates
+behind Tardigrade should run at least `stapled_only`.
 
 ## Evidence and the trust boundary
 
@@ -92,10 +109,15 @@ Evidence reaches validation as `revocation.StatusAssertion` values in
 `signature_verified`.
 
 Each assertion is bound to a certificate by `CertificateIdentity` (SHA-256 over
-its exact DER), not by position. `validateCandidates` offers one evidence set to
-every candidate, and cross-signed or alternate paths routinely carry different
-certificates at the same index; an assertion whose identity does not match the
-certificate at its index is ignored rather than applied.
+its exact DER) and by nothing else — there is deliberately no path index on a
+`StatusAssertion`. `validateCandidates` offers one evidence set to every
+candidate, and candidates differ in both shape and depth: a position-derived key
+would misdirect evidence onto the wrong certificate *and* let a longer
+candidate's assertions invalidate a shorter one. Evidence for a certificate that
+is not on the path being evaluated — including the trust anchor — is simply not
+consulted; it belongs to a sibling candidate, which is expected in a shared set.
+The report's per-certificate index is derived from the path actually being
+evaluated.
 
 `signature_verified` is asserted by whoever produced the evidence. This module
 does not verify OCSP responder signatures (that needs its own delegated-responder
@@ -206,9 +228,9 @@ tightening the mode.
 | `revocation_status_malformed` | evidence the provider could not interpret |
 | `revocation_status_unauthenticated` | nobody verified the responder or CRL signature |
 | `revocation_must_staple_not_satisfied` | RFC 7633 assertion unmet |
+| `revocation_must_staple_feature_unsupported` | leaf demands `status_request_v2`, unsatisfiable on TLS 1.3 |
 | `revocation_source_unsupported` | certificate publishes no revocation mechanism |
 | `tls_feature_constraint_violation` | child does not assert its issuer's TLS Feature set (RFC 7633 §4.2.2) |
-| `revocation_evidence_invalid` | evidence filed against a certificate not in the path |
 | `revocation_resource_limit_exceeded` | evidence exceeded the configured bounds |
 
 Failure values carry only enums and indices — never borrowed certificate bytes.

@@ -245,7 +245,6 @@ fn expectRejected(
 /// A fresh, authenticated stapled assertion bound to `certificate`.
 fn stapledFor(certificate: *const x509.Certificate, status: revocation.Status) revocation.StatusAssertion {
     return .{
-        .certificate_index = 0,
         .certificate = revocation.CertificateIdentity.of(certificate),
         .source = .stapled_ocsp,
         .status = status,
@@ -775,7 +774,6 @@ test "strict mode requires status for intermediates as well as the leaf" {
     try expectRejected(outcome, .status_unavailable, 1);
 
     var intermediate = stapledFor(&fx.certs.items[1], .good);
-    intermediate.certificate_index = 1;
     intermediate.source = .cached_ocsp;
     const both = [_]revocation.StatusAssertion{ stapledFor(&fx.certs.items[0], .good), intermediate };
     var accepted = revocation.evaluatePath(
@@ -792,24 +790,29 @@ test "strict mode requires status for intermediates as well as the leaf" {
     try testing.expect(report.entryFor(1).?.determination == .checked_good);
 }
 
-test "evidence filed against the anchor or beyond the path is rejected" {
+test "evidence for the trust anchor is ignored, not an error" {
+    // The anchor's status is trust configuration, so evidence about it has no
+    // certificate on the prospective path to apply to. It is skipped like any
+    // other non-matching identity — a shared evidence set legitimately carries
+    // assertions this candidate has no use for.
     const allocator = testing.allocator;
     var fx = Fixtures.init(allocator);
     defer fx.deinit();
     var storage: [4]path_builder.Element = undefined;
     const path = try twoCertPath(&fx, &storage, .{ .subject = "leaf", .issuer = "Root" });
 
-    var anchor_evidence = stapledFor(&fx.certs.items[1], .good);
-    anchor_evidence.certificate_index = 1; // the trust anchor
-    const assertions = [_]revocation.StatusAssertion{anchor_evidence};
-    const outcome = revocation.evaluatePath(
+    const assertions = [_]revocation.StatusAssertion{stapledFor(&fx.certs.items[1], .good)};
+    var outcome = revocation.evaluatePath(
         allocator,
         path,
         .{ .mode = .soft_fail },
         .{ .assertions = &assertions },
         validation_time,
     );
-    try expectRejected(outcome, .evidence_index_invalid, 1);
+    var report = try expectAccepted(&outcome);
+    defer report.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), report.entries.len);
+    try testing.expectEqual(revocation.Determination.not_checked_no_evidence, report.entries[0].determination);
 }
 
 test "evidence volume and size are bounded" {
@@ -840,7 +843,8 @@ test "evidence volume and size are bounded" {
         .{ .assertions = &oversized_assertions },
         validation_time,
     );
-    try expectRejected(too_large, .resource_limit_exceeded, 0);
+    // A global bound has no per-path certificate to blame.
+    try expectRejected(too_large, .resource_limit_exceeded, null);
 }
 
 test "evidence lookup helper matches by certificate identity" {
@@ -914,13 +918,11 @@ test "disabled mode never rejects on evidence, however malformed" {
     var storage: [4]path_builder.Element = undefined;
     const path = try twoCertPath(&fx, &storage, .{ .subject = "leaf", .issuer = "Root" });
 
-    var out_of_range = stapledFor(&fx.certs.items[0], .revoked);
-    out_of_range.certificate_index = 99;
     var oversized = stapledFor(&fx.certs.items[0], .good);
     oversized.raw = &[_]u8{0} ** 64;
     var foreign = stapledFor(&fx.certs.items[1], .revoked);
     foreign.defect = .malformed_encoding;
-    const assertions = [_]revocation.StatusAssertion{ out_of_range, oversized, foreign };
+    const assertions = [_]revocation.StatusAssertion{ oversized, foreign };
 
     var outcome = revocation.evaluatePath(
         allocator,
@@ -942,10 +944,8 @@ test "evidence bound to another certificate is never applied by position" {
     var storage: [4]path_builder.Element = undefined;
     const path = try twoCertPath(&fx, &storage, .{ .subject = "leaf", .issuer = "Root" });
 
-    // A good status for a *different* certificate, filed at the leaf's index.
-    var foreign = stapledFor(&fx.certs.items[1], .good);
-    foreign.certificate_index = 0;
-    const good_assertions = [_]revocation.StatusAssertion{foreign};
+    // A good status for a *different* certificate cannot stand in for the leaf.
+    const good_assertions = [_]revocation.StatusAssertion{stapledFor(&fx.certs.items[1], .good)};
     const unusable = revocation.evaluatePath(
         allocator,
         path,
@@ -956,9 +956,7 @@ test "evidence bound to another certificate is never applied by position" {
     try expectRejected(unusable, .status_unavailable, 0);
 
     // The inverse: a foreign revocation cannot condemn this certificate.
-    var foreign_revoked = stapledFor(&fx.certs.items[1], .revoked);
-    foreign_revoked.certificate_index = 0;
-    const revoked_assertions = [_]revocation.StatusAssertion{foreign_revoked};
+    const revoked_assertions = [_]revocation.StatusAssertion{stapledFor(&fx.certs.items[1], .revoked)};
     var outcome = revocation.evaluatePath(
         allocator,
         path,
@@ -1104,7 +1102,6 @@ const StubProvider = struct {
         const assertions = try allocator.alloc(revocation.StatusAssertion, count);
         for (request.path.elements[0..count], 0..) |element, index| {
             assertions[index] = .{
-                .certificate_index = index,
                 .certificate = revocation.CertificateIdentity.of(element.certificate),
                 .source = .cached_ocsp,
                 .status = self.status,
@@ -1156,6 +1153,195 @@ test "collected evidence owns its assertions and survives concurrent collections
 
     // The first result is untouched by the second collection.
     try testing.expectEqual(revocation.Status.good, first.owned_assertions[0].status);
+}
+
+test "the same certificate consumes its own evidence at any depth" {
+    // Cross-signed and rollover chains put the same certificate at different
+    // depths in different candidates. Identity is the only key, so evidence
+    // for it applies wherever it appears.
+    const allocator = testing.allocator;
+    var fx = Fixtures.init(allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "leaf", .issuer = "Intermediate" });
+    try fx.add(.{ .subject = "Intermediate", .issuer = "Root", .ca = true });
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .ca = true, .status_source = .none });
+
+    const leaf = &fx.certs.items[0];
+    const intermediate = &fx.certs.items[1];
+    const root = &fx.certs.items[2];
+
+    var intermediate_evidence = stapledFor(intermediate, .good);
+    intermediate_evidence.source = .cached_ocsp;
+    const assertions = [_]revocation.StatusAssertion{
+        stapledFor(leaf, .good),
+        intermediate_evidence,
+    };
+
+    // Depth 1: leaf -> intermediate -> root.
+    const deep = [_]path_builder.Element{
+        .{ .certificate = leaf, .source = .leaf, .input_index = 0 },
+        .{ .certificate = intermediate, .source = .intermediate, .input_index = 0 },
+        .{ .certificate = root, .source = .anchor, .input_index = 0 },
+    };
+    var deep_outcome = revocation.evaluatePath(
+        allocator,
+        .{ .elements = &deep },
+        .{ .mode = .strict },
+        .{ .assertions = &assertions },
+        validation_time,
+    );
+    var deep_report = try expectAccepted(&deep_outcome);
+    defer deep_report.deinit(allocator);
+    try testing.expect(deep_report.allChecked());
+
+    // Depth 0: the same intermediate certificate now sits at the leaf index.
+    // Its evidence must still apply.
+    const shallow = [_]path_builder.Element{
+        .{ .certificate = intermediate, .source = .leaf, .input_index = 0 },
+        .{ .certificate = root, .source = .anchor, .input_index = 0 },
+    };
+    var shallow_outcome = revocation.evaluatePath(
+        allocator,
+        .{ .elements = &shallow },
+        .{ .mode = .strict },
+        .{ .assertions = &assertions },
+        validation_time,
+    );
+    var shallow_report = try expectAccepted(&shallow_outcome);
+    defer shallow_report.deinit(allocator);
+    try testing.expectEqual(revocation.Determination.checked_good, shallow_report.entries[0].determination);
+    try testing.expectEqual(revocation.Source.cached_ocsp, shallow_report.entries[0].source.?);
+}
+
+test "a longer candidate's evidence cannot invalidate a shorter candidate" {
+    // A shared evidence set legitimately covers certificates that are not on
+    // this candidate. Those extra assertions must be skipped, never treated as
+    // a reason to reject the candidate that does have complete evidence.
+    const allocator = testing.allocator;
+    var fx = Fixtures.init(allocator);
+    defer fx.deinit();
+    try fx.add(.{ .subject = "leaf", .issuer = "Intermediate" });
+    try fx.add(.{ .subject = "A1", .issuer = "A2", .ca = true });
+    try fx.add(.{ .subject = "A2", .issuer = "Root", .ca = true });
+    try fx.add(.{ .subject = "B1", .issuer = "Root", .ca = true });
+    try fx.add(.{ .subject = "Root", .issuer = "Root", .ca = true, .status_source = .none });
+
+    var a1 = stapledFor(&fx.certs.items[1], .good);
+    a1.source = .cached_ocsp;
+    var a2 = stapledFor(&fx.certs.items[2], .good);
+    a2.source = .cached_ocsp;
+    var b1 = stapledFor(&fx.certs.items[3], .good);
+    b1.source = .cached_ocsp;
+    const union_evidence = [_]revocation.StatusAssertion{
+        stapledFor(&fx.certs.items[0], .good),
+        a1,
+        a2,
+        b1,
+    };
+
+    // Candidate B is two certificates shorter; A2's assertion has no place in
+    // it and must simply be ignored.
+    const candidate_b = [_]path_builder.Element{
+        .{ .certificate = &fx.certs.items[0], .source = .leaf, .input_index = 0 },
+        .{ .certificate = &fx.certs.items[3], .source = .intermediate, .input_index = 1 },
+        .{ .certificate = &fx.certs.items[4], .source = .anchor, .input_index = 0 },
+    };
+    var outcome = revocation.evaluatePath(
+        allocator,
+        .{ .elements = &candidate_b },
+        .{ .mode = .strict },
+        .{ .assertions = &union_evidence },
+        validation_time,
+    );
+    var report = try expectAccepted(&outcome);
+    defer report.deinit(allocator);
+    try testing.expect(report.allChecked());
+    try testing.expectEqual(@as(usize, 2), report.entries.len);
+}
+
+test "status_request_v2 cannot be satisfied by ordinary TLS 1.3 stapling" {
+    // RFC 8446 §4.4.2.1 obsoletes RFC 6961 and forbids a TLS 1.3 server from
+    // acting on status_request_v2, so a v1 staple cannot prove a feature-17
+    // declaration was honored.
+    const allocator = testing.allocator;
+    var fx = Fixtures.init(allocator);
+    defer fx.deinit();
+    var v2_storage: [4]path_builder.Element = undefined;
+    const v2_path = try twoCertPath(&fx, &v2_storage, .{
+        .subject = "leaf",
+        .issuer = "Root",
+        .tls_features = &.{x509.TlsFeatures.status_request_v2},
+    });
+
+    // Feature 17 alone is not must-staple, but it is also not satisfiable.
+    try testing.expect(!fx.certs.items[0].mustStaple());
+    try testing.expect(fx.certs.items[0].assertsStatusRequestV2());
+
+    const assertions = [_]revocation.StatusAssertion{stapledFor(&fx.certs.items[0], .good)};
+    const rejected = revocation.evaluatePath(
+        allocator,
+        v2_path,
+        .{ .mode = .soft_fail },
+        .{ .assertions = &assertions },
+        validation_time,
+    );
+    try expectRejected(rejected, .must_staple_feature_unsupported, 0);
+
+    // Disabled records it rather than rejecting, like every other unenforced
+    // must-staple state.
+    var disabled = revocation.evaluatePath(
+        allocator,
+        v2_path,
+        .{},
+        .{ .assertions = &assertions },
+        validation_time,
+    );
+    var disabled_report = try expectAccepted(&disabled);
+    defer disabled_report.deinit(allocator);
+    try testing.expectEqual(
+        revocation.MustStapleOutcome.unsatisfiable_status_request_v2,
+        disabled_report.must_staple,
+    );
+
+    // Declaring both 5 and 17 does not make 17 satisfiable either.
+    var both_fx = Fixtures.init(allocator);
+    defer both_fx.deinit();
+    var both_storage: [4]path_builder.Element = undefined;
+    const both_path = try twoCertPath(&both_fx, &both_storage, .{
+        .subject = "leaf",
+        .issuer = "Root",
+        .tls_features = &.{ x509.TlsFeatures.status_request, x509.TlsFeatures.status_request_v2 },
+    });
+    const both_assertions = [_]revocation.StatusAssertion{stapledFor(&both_fx.certs.items[0], .good)};
+    const both_rejected = revocation.evaluatePath(
+        allocator,
+        both_path,
+        .{ .mode = .soft_fail },
+        .{ .assertions = &both_assertions },
+        validation_time,
+    );
+    try expectRejected(both_rejected, .must_staple_feature_unsupported, 0);
+
+    // Ordinary feature-5 must-staple is still satisfied by a TLS 1.3 staple.
+    var v1_fx = Fixtures.init(allocator);
+    defer v1_fx.deinit();
+    var v1_storage: [4]path_builder.Element = undefined;
+    const v1_path = try twoCertPath(&v1_fx, &v1_storage, .{
+        .subject = "leaf",
+        .issuer = "Root",
+        .tls_features = &.{x509.TlsFeatures.status_request},
+    });
+    const v1_assertions = [_]revocation.StatusAssertion{stapledFor(&v1_fx.certs.items[0], .good)};
+    var accepted = revocation.evaluatePath(
+        allocator,
+        v1_path,
+        .{ .mode = .soft_fail },
+        .{ .assertions = &v1_assertions },
+        validation_time,
+    );
+    var report = try expectAccepted(&accepted);
+    defer report.deinit(allocator);
+    try testing.expectEqual(revocation.MustStapleOutcome.enforced, report.must_staple);
 }
 
 test {
