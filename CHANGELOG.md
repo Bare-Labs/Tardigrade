@@ -20,7 +20,12 @@ All notable user-facing changes to Tardigrade are documented here.
   `setKeyUpdateLimits`/`keyUpdateDue` expose a records-sealed threshold for
   proactive updates. The threshold reports only — nothing fires an update on
   its own, and it is disabled by default, so an existing connection's wire
-  behaviour is unchanged until a caller opts in.
+  behaviour is unchanged until a caller opts in. `records` is a cap on the
+  whole generation, counting the `KeyUpdate` that retires it: the predicate
+  becomes due one record early, since that message is itself sealed under the
+  keys it is retiring. A caller can therefore pass RFC 8446 §5.5's AES-GCM
+  record limit directly and get that bound, rather than exceeding it by the
+  one control record.
 
   `KeyUpdate` is record-mode only. RFC 9001 §6 removes it from TLS-over-QUIC,
   which carries its own key phase in the packet header, so a QUIC-profile
@@ -37,9 +42,12 @@ All notable user-facing changes to Tardigrade are documented here.
   moment a conforming peer rotated its keys. Messages that fit inline (today,
   exactly `KeyUpdate`) now reassemble without an allocator. A `KeyUpdate`
   declaring a body of any other length is rejected as a framing error before a
-  buffer is chosen, so the failure class no longer depends on whether tickets
-  were configured, and an attacker-chosen length is never buffered for a
-  five-byte message.
+  buffer is chosen — at *every* declared length, including one past the generic
+  post-handshake size cap, which would otherwise have been classified as a
+  buffer overflow and terminated the connection locally without the RFC's
+  `decode_error` alert. The failure class therefore no longer depends on the
+  declared length or on whether tickets were configured, and an attacker-chosen
+  length is never buffered for a five-byte message.
 - **HelloRetryRequest handshakes failed against compatibility-mode TLS clients
   (#338)** — RFC 8446 §5.1 has a client send `change_cipher_spec` immediately
   after receiving a HelloRetryRequest, before ClientHello2. An HRR flight

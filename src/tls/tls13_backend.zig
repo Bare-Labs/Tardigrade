@@ -175,18 +175,26 @@ const PostHandshakeInput = struct {
                 }
                 const body_len: usize = @intCast(std.mem.readInt(u24, self.header[1..4], .big));
                 const frame_len = handshake_header_len + body_len;
-                if (frame_len > max_new_session_ticket_message_len) return error.HandshakeBufferOverflow;
                 // `KeyUpdate` has exactly one legal framed length (RFC 8446
-                // §4.6.3, #357). Rejecting a wrong declared length here —
-                // before a buffer is chosen — does two things: it keeps the
-                // failure a framing error whether or not this endpoint
-                // configured a post-handshake allocator (otherwise an
-                // over-long body would fall to the allocator path and be
-                // reported as a missing allocator instead), and it declines to
-                // buffer an attacker-chosen length for a five-byte message.
+                // §4.6.3, #357), so its own length check runs *before* the
+                // generic post-handshake size cap below — the message type is
+                // already known from the header, and type-specific framing is
+                // the more precise classification.
+                //
+                // Order matters for two reasons beyond tidiness. The cap
+                // raises `HandshakeBufferOverflow`, which `mappedFatalAlert`
+                // does not map, so a `KeyUpdate` declaring a body past the cap
+                // would terminate locally with no `decode_error` alert on the
+                // wire. And checking here — before a buffer is chosen — is
+                // what makes the failure class independent of whether this
+                // endpoint configured a post-handshake allocator, rather than
+                // an over-long body falling to the allocator path and
+                // surfacing as a missing allocator instead. Every non-1-byte
+                // body is a framing error, at every declared length.
                 if (self.header[0] == @intFromEnum(MessageType.key_update) and frame_len != key_update.message_len) {
                     return error.MalformedHandshake;
                 }
+                if (frame_len > max_new_session_ticket_message_len) return error.HandshakeBufferOverflow;
                 if (frame_len <= inline_capacity) {
                     self.inline_len = frame_len;
                 } else {

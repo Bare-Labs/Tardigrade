@@ -13088,6 +13088,49 @@ test "#357 an over-long KeyUpdate is a framing error with or without a post-hand
     }
 }
 
+test "#357 a KeyUpdate header declaring a body past the ticket cap is still a framing error" {
+    // Review finding on #591: the generic post-handshake size cap used to run
+    // *before* the KeyUpdate-specific length check, so a KeyUpdate declaring a
+    // body large enough to exceed it was classified `HandshakeBufferOverflow`
+    // rather than `MalformedHandshake`. `mappedFatalAlert` has no arm for
+    // `HandshakeBufferOverflow`, so that path terminated locally and put no
+    // `decode_error` on the wire at all -- and it made the failure class
+    // depend on how large the declared body was, which is exactly the
+    // invariant the inline-reassembly change set out to establish.
+    //
+    // Only the four-byte header is ever sent. Nothing behind it needs to
+    // arrive, and nothing should be buffered waiting for it: the declared
+    // length alone is enough to know the message cannot be a KeyUpdate.
+    const declared_body_len: u24 = std.math.maxInt(u24);
+    try std.testing.expect(
+        @as(usize, declared_body_len) + 4 > tls_backend.max_new_session_ticket_message_len,
+    );
+
+    for ([_]?std.mem.Allocator{ null, std.testing.allocator }) |maybe_allocator| {
+        const h = try SocketHarness.create(.{ .client_post_handshake_allocator = maybe_allocator });
+        defer h.destroy();
+        try h.driveUntil(SocketHarness.bothComplete);
+
+        var header: [4]u8 = undefined;
+        header[0] = 24;
+        std.mem.writeInt(u24, header[1..4], declared_body_len, .big);
+        try injectServerHandshakeRecord(h, &header);
+
+        try std.testing.expectEqual(@as(anyerror, error.MalformedHandshake), driveClientUntilError(h));
+        try std.testing.expectEqual(@as(u64, 0), h.client.bridge.read_key_generation);
+
+        // The RFC-mandated alert reaches the peer, rather than the connection
+        // dying quietly on an unmapped error.
+        try std.testing.expectEqual(
+            tls_core.alerts.AlertDescription.decode_error,
+            tls_core.alerts.fromHandshakeError(error.MalformedHandshake),
+        );
+        var rounds: usize = 0;
+        while (rounds < 64 and h.server.peerAlert() == null) : (rounds += 1) _ = h.driveServer() catch {};
+        try std.testing.expectEqual(tls_core.alerts.AlertDescription.decode_error, h.server.peerAlert().?);
+    }
+}
+
 test "#357 a KeyUpdate before the handshake completes is rejected in both roles" {
     // Pre-handshake rejection has two distinct causes and both must bite: the
     // message arriving at an epoch it is never carried at, and the message
@@ -13229,24 +13272,44 @@ test "#357 usage limits report when a proactive update is due without forcing on
     try expectTrafficBothWays(h, "unlimited");
     try std.testing.expect(!h.client.keyUpdateDue());
 
-    h.client.setKeyUpdateLimits(.{ .records = 3 });
+    // A cap of 4 records on the generation. It becomes due one record early,
+    // because acting on it seals the KeyUpdate under these same keys -- so
+    // that message is the 4th record the generation protects, not a 5th
+    // (review finding on #591).
+    const cap: u64 = 4;
+    h.client.setKeyUpdateLimits(.{ .records = cap });
     try std.testing.expect(!h.client.keyUpdateDue());
-    for (0..3) |_| {
+
+    var buf: [16]u8 = undefined;
+    // Seal one record at a time, checking the boundary against the write
+    // sequence itself rather than against the loop counter: a short write or
+    // an unrelated queued record would otherwise make the count drift.
+    while (h.client.bridge.applicationRecordsSealed() < cap - 1) {
+        try std.testing.expect(!h.client.keyUpdateDue());
         _ = try h.client.stream().write("x");
         _ = try h.driveClient();
         _ = try h.driveServer();
+        while (h.server.readiness().can_read_plaintext) _ = try h.server.stream().read(&buf);
     }
+    try std.testing.expectEqual(cap - 1, h.client.bridge.applicationRecordsSealed());
     try std.testing.expect(h.client.keyUpdateDue());
 
     // Reaching the limit does not itself update anything: the hook reports,
     // the owner decides.
     try std.testing.expectEqual(@as(u64, 0), h.client.bridge.write_key_generation);
-    var buf: [16]u8 = undefined;
-    while (h.server.readiness().can_read_plaintext) _ = try h.server.stream().read(&buf);
 
+    // Becoming due at exactly `cap - 1` is what makes the KeyUpdate the
+    // cap-th record under the retiring generation -- the last one permitted,
+    // not the first one beyond it. The count itself is not observable *after*
+    // the call: `requestKeyUpdate` seals the message and applies the write-side
+    // advance in one event batch, so the sequence has already restarted by the
+    // time it returns. The assertion above, taken before it, is the one that
+    // pins the boundary.
     try h.client.requestKeyUpdate(.update_not_requested);
     try driveUntilServerRead(h, 1);
-    // The sequence restarted, so the limit is no longer met.
+    // The sequence restarted with the new generation, so the limit is no
+    // longer met.
     try std.testing.expect(!h.client.keyUpdateDue());
+    try std.testing.expectEqual(@as(u64, 0), h.client.bridge.applicationRecordsSealed());
     try std.testing.expectEqual(@as(u64, 1), h.client.bridge.write_key_generation);
 }

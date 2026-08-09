@@ -80,22 +80,44 @@ pub fn encode(request: Request, out: []u8) EncodeError![]const u8 {
 /// owner of the write state calls; whether to act on it is that owner's
 /// policy, which keeps this module free of any transport concern.
 pub const UsageLimits = struct {
-    /// Advance sending keys once this many records have been sealed under the
-    /// current generation. `null` disables proactive updates entirely, which
-    /// is the default: an endpoint is always free to never send a `KeyUpdate`,
-    /// and turning it on by default would change the wire behavior of every
-    /// existing connection.
+    /// The most records one generation of sending keys may protect, *counting
+    /// the `KeyUpdate` that retires it*. `null` disables proactive updates
+    /// entirely, which is the default: an endpoint is always free to never
+    /// send a `KeyUpdate`, and turning it on by default would change the wire
+    /// behavior of every existing connection.
+    ///
+    /// This is a cap on the generation, not a count at which to start
+    /// thinking about one — see `reached`, which fires a record early so that
+    /// the `KeyUpdate` fits underneath the cap rather than exceeding it.
     records: ?u64 = null,
 
     /// RFC 8446 §5.5's AES-GCM record limit (2^24.5, rounded down to a whole
     /// number of records). Callers opting into proactive updates should pick a
     /// value at or below this; it is offered as a named constant rather than a
     /// default so the choice stays explicit at the call site.
+    ///
+    /// Safe to pass straight to `records`: `reached` reserves the control
+    /// record, so a caller writing the RFC's own number gets the RFC's own
+    /// guarantee without having to subtract anything themselves.
     pub const aes_gcm_record_limit: u64 = 23_726_566;
 
+    /// Whether `records_sealed` records under the current generation is enough
+    /// to act on.
+    ///
+    /// Fires one record *before* the configured cap, because acting on it is
+    /// not free: `requestKeyUpdate` must seal the `KeyUpdate` itself under the
+    /// keys it is retiring (RFC 8446 §4.6.3 — the message announcing a
+    /// transition is protected by the generation it ends), so that message is
+    /// one more record against the old keys. Firing at the cap itself would
+    /// let the retiring generation protect `records + 1` records, which is
+    /// precisely the bound the caller asked not to cross.
+    ///
+    /// Saturating rather than wrapping: a nonsensical `records = 0` is due
+    /// immediately instead of underflowing into a limit of `2^64 - 1`, which
+    /// would silently disable the policy it was meant to enforce.
     pub fn reached(self: UsageLimits, records_sealed: u64) bool {
         const limit = self.records orelse return false;
-        return records_sealed >= limit;
+        return records_sealed >= limit -| 1;
     }
 };
 
@@ -136,8 +158,42 @@ test "usage limits stay inert until configured" {
     try std.testing.expect(!off.reached(0));
     try std.testing.expect(!off.reached(std.math.maxInt(u64)));
 
+    // A cap of 4 becomes due at 3 sealed records: the KeyUpdate is then the
+    // 4th and final record the retiring generation protects.
     const on: UsageLimits = .{ .records = 4 };
-    try std.testing.expect(!on.reached(3));
+    try std.testing.expect(!on.reached(2));
+    try std.testing.expect(on.reached(3));
     try std.testing.expect(on.reached(4));
-    try std.testing.expect(on.reached(5));
+}
+
+test "the AES-GCM cap leaves room for the KeyUpdate that retires the generation" {
+    // The property the constant exists for: a caller who configures RFC 8446
+    // §5.5's own number must never let the retiring keys protect more records
+    // than it names. Since `requestKeyUpdate` seals the KeyUpdate under those
+    // same old keys, becoming due at the cap itself would make that message
+    // the (limit + 1)-th record -- one past the bound.
+    const policy: UsageLimits = .{ .records = UsageLimits.aes_gcm_record_limit };
+    try std.testing.expect(!policy.reached(UsageLimits.aes_gcm_record_limit - 2));
+    try std.testing.expect(policy.reached(UsageLimits.aes_gcm_record_limit - 1));
+    // Acting the moment it is due seals the KeyUpdate as record number
+    // `aes_gcm_record_limit`, the last one permitted -- not the first one
+    // beyond it.
+    try std.testing.expectEqual(
+        UsageLimits.aes_gcm_record_limit,
+        (UsageLimits.aes_gcm_record_limit - 1) + 1,
+    );
+}
+
+test "a degenerate zero cap is due immediately rather than underflowing" {
+    // `0 -| 1` saturates to 0, so this reports due at once. Wrapping would
+    // have produced a limit of 2^64 - 1 and silently disabled the policy.
+    const zero: UsageLimits = .{ .records = 0 };
+    try std.testing.expect(zero.reached(0));
+
+    const one: UsageLimits = .{ .records = 1 };
+    try std.testing.expect(one.reached(0));
+
+    const huge: UsageLimits = .{ .records = std.math.maxInt(u64) };
+    try std.testing.expect(!huge.reached(std.math.maxInt(u64) - 2));
+    try std.testing.expect(huge.reached(std.math.maxInt(u64) - 1));
 }
