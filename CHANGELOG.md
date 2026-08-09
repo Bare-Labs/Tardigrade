@@ -238,6 +238,41 @@ All notable user-facing changes to Tardigrade are documented here.
   orderly close).
 
 ### Features
+- **Certificate-status policy seam for revocation, OCSP, CRLs, and stapling
+  (#349)** — the pure-Zig PKI path now has an explicit, testable
+  certificate-status policy (`src/pki/revocation.zig`) with four modes:
+  `disabled` (the default), `stapled_only`, `soft_fail`, and `strict`. Every
+  accepted path carries a report naming, per certificate, what status evidence
+  was checked and what was not, so an acceptance never implies revocation was
+  verified — under the default policy the report says plainly that nothing was
+  checked, and `disabled` never rejects on evidence either, so a peer cannot
+  fail a handshake against a gateway with revocation switched off. RFC 7633
+  must-staple is parsed (new TLS Feature extension support in the X.509 model)
+  and enforced in every mode that consults status; the report distinguishes
+  `enforced` from both unenforced cases rather than silently passing. The
+  issuer form of the extension is enforced correctly as an RFC 7633 §4.2.2
+  chain constraint — every certificate a TLS-Feature-carrying CA signs must
+  assert the same feature set or a superset — rather than as a downward
+  stapling obligation. Status evidence — stapled responses, cached answers, CRL
+  sets, with freshness bounds, defect reasons, and an authentication flag — is
+  supplied by the caller and keyed solely by SHA-256 certificate identity — never
+  by path position — so one evidence set is safely shared across candidate paths
+  of different shape and depth. The end-entity must-staple obligation is scoped
+  by RFC 7633 §§4.1/4.3.3 to features the ClientHello actually offered: RFC 6961
+  `status_request_v2` is unusable in TLS 1.3, and `status_request` itself is not
+  yet sent by this stack, so such certificates are accepted and reported as
+  `not_offered_by_client` rather than rejected. Wiring the extension is a matter
+  of setting `offered_status_request` from the hello actually emitted. Unauthenticated evidence never
+  counts as a completed check by default; the one exception is a peer-stapled
+  revocation, which can only condemn the peer itself. A stale `certificateHold`
+  does not outrank fresher evidence of its RFC 5280 §5.3.1 release. No
+  validator code performs network or file I/O: a future fetch-and-cache
+  provider implements `revocation.Provider`, runs before validation, and
+  changes no TLS-handshake or path-validation signature. Certificate
+  Authority Information Access and CRL distribution points are now surfaced
+  through typed accessors. See
+  [docs/PKI_REVOCATION.md](docs/PKI_REVOCATION.md) for the modes, the trust
+  boundary, and the privacy/availability tradeoffs. Closes #349.
 - **QUIC negotiated TLS suite packet protection (#566)** — Handshake, 0-RTT,
   and 1-RTT packet protection now follows the TLS 1.3 cipher suite negotiated
   by the native QUIC handshake (`TLS_AES_128_GCM_SHA256`,

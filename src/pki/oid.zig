@@ -167,6 +167,11 @@ pub const well_known = struct {
     pub const ext_key_usage = [_]u32{ 2, 5, 29, 37 };
     pub const inhibit_any_policy = [_]u32{ 2, 5, 29, 54 };
     pub const authority_info_access = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 1, 1 };
+    /// RFC 7633 TLS Feature extension; carries the must-staple assertion.
+    pub const tls_feature = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 1, 24 };
+    /// RFC 6960 §4.2.2.2.1: a responder certificate that need not itself be
+    /// revocation-checked.
+    pub const ocsp_no_check = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 48, 1, 5 };
 
     // Certificate-policy qualifiers.
     pub const policy_qualifier_cps = [_]u32{ 1, 3, 6, 1, 5, 5, 7, 2, 1 };

@@ -53,6 +53,7 @@ pub const Limits = struct {
     max_policy_mappings: usize = 64,
     max_distribution_points: usize = 16,
     max_access_descriptions: usize = 16,
+    max_tls_features: usize = 16,
     max_name_constraint_subtrees: usize = 64,
 };
 
@@ -352,6 +353,44 @@ pub const DistributionPoint = struct {
     full_names: []const GeneralName,
 };
 
+/// RFC 7633 TLS Feature extension. Values are TLS ExtensionType numbers the
+/// certificate asserts the server will negotiate; `status_request` (5) is the
+/// must-staple assertion.
+pub const TlsFeatures = struct {
+    /// TLS ExtensionType registry value for `status_request` (RFC 6066 §8).
+    pub const status_request: u16 = 5;
+    /// TLS ExtensionType registry value for `status_request_v2` (RFC 6961).
+    pub const status_request_v2: u16 = 17;
+
+    features: []const u16,
+
+    pub fn contains(self: *const TlsFeatures, feature: u16) bool {
+        return std.mem.indexOfScalar(u16, self.features, feature) != null;
+    }
+
+    /// RFC 7633 §4.2.1: asserting `status_request` obliges the server to
+    /// deliver a stapled certificate-status response.
+    ///
+    /// Feature 17 is deliberately *not* included. RFC 6961
+    /// `status_request_v2` is obsoleted for TLS 1.3 by RFC 8446 §4.4.2.1, and
+    /// RFC 7633 §§4.1/4.3.3 scope a certificate's demand to features present in
+    /// *both* the ClientHello and the certificate. A TLS 1.3 client does not
+    /// offer 17, so a certificate advertising it — typically for TLS 1.2 peers
+    /// — creates no obligation here and must not be rejected over it. See
+    /// `assertsStatusRequestV2` for the declaration itself.
+    pub fn requiresStapledStatus(self: *const TlsFeatures) bool {
+        return self.contains(status_request);
+    }
+
+    /// True when the certificate declares RFC 6961 `status_request_v2`. Kept
+    /// separate from `requiresStapledStatus` for a future implementation that
+    /// carries the negotiated ClientHello feature set into policy and enforces
+    /// the RFC 7633 §4.3.3 intersection.
+    pub fn assertsStatusRequestV2(self: *const TlsFeatures) bool {
+        return self.contains(status_request_v2);
+    }
+};
+
 pub const PolicyQualifier = struct {
     pub const Kind = enum { cps_pointer, user_notice, unsupported };
 
@@ -400,6 +439,7 @@ pub const Extension = struct {
         policy_mappings: []const PolicyMapping,
         policy_constraints: PolicyConstraints,
         inhibit_any_policy: usize,
+        tls_features: TlsFeatures,
         unrecognized: void,
     };
 };
@@ -530,6 +570,49 @@ pub const Certificate = struct {
     pub fn inhibitAnyPolicy(self: *const Certificate) ?usize {
         const extension = self.findExtension(&wk.inhibit_any_policy) orelse return null;
         return extension.parsed.inhibit_any_policy;
+    }
+
+    /// Certificate-status evidence sources published by the certificate. These
+    /// are surfaced for revocation policy and future fetch providers; nothing
+    /// in this package dereferences a location.
+    pub fn authorityInfoAccess(self: *const Certificate) ?[]const AccessDescription {
+        const extension = self.findExtension(&wk.authority_info_access) orelse return null;
+        return extension.parsed.authority_info_access;
+    }
+
+    pub fn crlDistributionPoints(self: *const Certificate) ?[]const DistributionPoint {
+        const extension = self.findExtension(&wk.crl_distribution_points) orelse return null;
+        return extension.parsed.crl_distribution_points;
+    }
+
+    /// True when the certificate names at least one OCSP responder in its
+    /// Authority Information Access extension.
+    pub fn hasOcspResponder(self: *const Certificate) bool {
+        const descriptions = self.authorityInfoAccess() orelse return false;
+        for (descriptions) |description| {
+            if (description.method.eqlComponents(&wk.aia_ocsp)) return true;
+        }
+        return false;
+    }
+
+    pub fn tlsFeatures(self: *const Certificate) ?TlsFeatures {
+        const extension = self.findExtension(&wk.tls_feature) orelse return null;
+        return extension.parsed.tls_features;
+    }
+
+    /// RFC 7633 must-staple: the certificate asserts that its server always
+    /// delivers a stapled certificate-status response (`status_request`).
+    pub fn mustStaple(self: *const Certificate) bool {
+        const features = self.tlsFeatures() orelse return false;
+        return features.requiresStapledStatus();
+    }
+
+    /// The certificate declares RFC 6961 `status_request_v2`. This TLS 1.3
+    /// profile never offers that extension, so the declaration creates no
+    /// stapling obligation on its own (RFC 7633 §4.3.3).
+    pub fn assertsStatusRequestV2(self: *const Certificate) bool {
+        const features = self.tlsFeatures() orelse return false;
+        return features.assertsStatusRequestV2();
     }
 };
 
@@ -899,6 +982,8 @@ const Parser = struct {
             return .{ .policy_constraints = try self.parsePolicyConstraints(value) };
         } else if (ext_oid.eqlComponents(&wk.inhibit_any_policy)) {
             return .{ .inhibit_any_policy = try self.parseInhibitAnyPolicy(value) };
+        } else if (ext_oid.eqlComponents(&wk.tls_feature)) {
+            return .{ .tls_features = try self.parseTlsFeatures(value) };
         }
         return .unrecognized;
     }
@@ -1359,6 +1444,27 @@ const Parser = struct {
         }
         inner.expectEnd() catch return error.MalformedExtension;
         return constraints;
+    }
+
+    /// RFC 7633 §6: `Features ::= SEQUENCE OF INTEGER`, each a TLS
+    /// ExtensionType value. Values outside the 16-bit registry cannot name a
+    /// TLS extension and are a structural encoding error.
+    fn parseTlsFeatures(self: *Parser, value: []const u8) Error!TlsFeatures {
+        var reader = der.Reader.init(value, self.limits.der);
+        var inner = reader.readSequence() catch return error.MalformedExtension;
+        reader.expectEnd() catch return error.MalformedExtension;
+
+        var features: std.ArrayList(u16) = .empty;
+        while (inner.remaining() > 0) {
+            if (features.items.len >= self.limits.max_tls_features) return error.CountLimitExceeded;
+            const integer = inner.readInteger() catch return error.MalformedExtension;
+            if (integer.isNegative()) return error.MalformedExtension;
+            const feature = integerToU32(integer) orelse return error.MalformedExtension;
+            if (feature > std.math.maxInt(u16)) return error.MalformedExtension;
+            try features.append(self.arena, @intCast(feature));
+        }
+        if (features.items.len == 0) return error.MalformedExtension;
+        return .{ .features = features.items };
     }
 
     fn parseInhibitAnyPolicy(self: *Parser, value: []const u8) Error!usize {
