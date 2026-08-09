@@ -43,6 +43,12 @@
 //! unauthenticated `revoked` there would let an on-path attacker deny service
 //! with one forged response.
 //!
+//! RFC 7633 feature demands are likewise scoped by what the handshake actually
+//! offered: `Configuration.offered_status_request` must reflect the ClientHello
+//! this connection emitted. A certificate cannot hold a client to a feature the
+//! client never requested (§4.3.3), and the validator has no way to observe the
+//! hello on its own, so the fact is carried in rather than assumed.
+//!
 //! Assertions are bound to a certificate by `CertificateIdentity` alone, never
 //! by position. One evidence set is shared by every candidate path, and
 //! candidates differ in shape and depth, so a position-derived key would both
@@ -205,8 +211,18 @@ pub const Configuration = struct {
     /// a "good" status assertable by whoever supplies the bytes.
     require_signature_verified: bool = true,
     /// Honor RFC 7633 must-staple. Has no effect in `.disabled` mode, which
-    /// records `Report.must_staple_unenforced` instead.
+    /// records the assertion as unenforced instead.
     enforce_must_staple: bool = true,
+    /// Whether this connection's ClientHello actually offered the TLS
+    /// `status_request` extension.
+    ///
+    /// RFC 7633 §§4.1/4.3.3 scope a certificate's feature demand to features
+    /// present in *both* the ClientHello and the certificate: a client that
+    /// never asked for stapling cannot hold the server to having provided it.
+    /// The default is false because Tardigrade's TLS 1.3 ClientHello does not
+    /// currently send `status_request`; a caller that wires the extension must
+    /// set this from the hello it actually emitted, not from a constant.
+    offered_status_request: bool = false,
     limits: Limits = .{},
 };
 
@@ -256,9 +272,15 @@ pub const MustStapleOutcome = enum {
     unenforced_status_disabled,
     /// Asserted, but `Configuration.enforce_must_staple` is off.
     unenforced_by_configuration,
+    /// Asserted, but this connection never offered `status_request`, so RFC
+    /// 7633 §4.3.3 puts the feature outside the ClientHello intersection and
+    /// the certificate makes no demand of this handshake.
+    not_offered_by_client,
 
     pub fn isUnenforced(self: MustStapleOutcome) bool {
-        return self == .unenforced_status_disabled or self == .unenforced_by_configuration;
+        return self == .unenforced_status_disabled or
+            self == .unenforced_by_configuration or
+            self == .not_offered_by_client;
     }
 };
 
@@ -399,13 +421,15 @@ pub fn evaluatePath(
     // during path validation (`path_validator.checkTlsFeatureConstraints`), not
     // an assertion that propagates down as a stapling obligation of its own.
     //
-    // Only `status_request` (5) creates that obligation. RFC 6961
-    // `status_request_v2` (17) is not offered by this TLS 1.3 profile, and
-    // RFC 7633 §§4.1/4.3.3 scope the certificate's demand to features present
-    // in *both* the ClientHello and the certificate — so a certificate that
-    // also advertises 17 for TLS 1.2 peers is perfectly usable here and must
-    // not be rejected over it.
-    const must_staple_required = path.elements[0].certificate.mustStaple();
+    // Only `status_request` (5) creates that obligation, and only when this
+    // connection actually offered it. RFC 7633 §§4.1/4.3.3 scope a
+    // certificate's demand to features present in *both* the ClientHello and
+    // the certificate, so neither a certificate advertising RFC 6961
+    // `status_request_v2` (17, never offered by this TLS 1.3 profile) nor one
+    // advertising feature 5 to a client that did not ask for stapling may be
+    // rejected over it.
+    const must_staple_asserted = path.elements[0].certificate.mustStaple();
+    const must_staple_required = must_staple_asserted and config.offered_status_request;
 
     const entries = allocator.alloc(Entry, certificate_count) catch {
         return .{ .rejected = .{ .reason = .out_of_memory, .certificate_index = null } };
@@ -426,7 +450,12 @@ pub fn evaluatePath(
         return .{ .accepted = .{
             .mode = config.mode,
             .entries = entries,
-            .must_staple = if (must_staple_required) .unenforced_status_disabled else .not_required,
+            .must_staple = if (!must_staple_asserted)
+                .not_required
+            else if (!config.offered_status_request)
+                .not_offered_by_client
+            else
+                .unenforced_status_disabled,
         } };
     }
 
@@ -465,7 +494,11 @@ pub fn evaluatePath(
         }
     }
 
-    var must_staple: MustStapleOutcome = .not_required;
+    var must_staple: MustStapleOutcome =
+        if (must_staple_asserted and !config.offered_status_request)
+            .not_offered_by_client
+        else
+            .not_required;
     if (must_staple_required) {
         if (!config.enforce_must_staple) {
             must_staple = .unenforced_by_configuration;

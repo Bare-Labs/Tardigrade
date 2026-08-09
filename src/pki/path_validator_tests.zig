@@ -3925,7 +3925,9 @@ test "a must-staple leaf is rejected without a stapled good status" {
     const cp = cryptoProvider(&entropy, &provider);
 
     var validation_policy = policy(fx.certs.items[1..2]);
-    validation_policy.revocation = .{ .mode = .soft_fail };
+    // The certificate's demand only binds because this connection offered
+    // `status_request` (RFC 7633 §4.3.3).
+    validation_policy.revocation = .{ .mode = .soft_fail, .offered_status_request = true };
     var missing = try validateBuilt(testing.allocator, &fx.certs.items[0], &.{}, fx.certs.items[1..2], validation_policy, cp);
     defer missing.deinit(testing.allocator);
     try expectRejected(&missing, .revocation_must_staple_not_satisfied, 0);
@@ -3939,12 +3941,24 @@ test "a must-staple leaf is rejected without a stapled good status" {
 
     // With status checking off, the assertion is unenforceable — and the
     // result says so instead of implying it was honored.
-    var disabled = try validateBuilt(testing.allocator, &fx.certs.items[0], &.{}, fx.certs.items[1..2], policy(fx.certs.items[1..2]), cp);
+    var disabled_policy = policy(fx.certs.items[1..2]);
+    disabled_policy.revocation = .{ .offered_status_request = true };
+    var disabled = try validateBuilt(testing.allocator, &fx.certs.items[0], &.{}, fx.certs.items[1..2], disabled_policy, cp);
     defer disabled.deinit(testing.allocator);
     try expectAccepted(&disabled, 2);
     try testing.expectEqual(
         revocation.MustStapleOutcome.unenforced_status_disabled,
         disabled.accepted.revocation.must_staple,
+    );
+
+    // And with the extension never offered, the certificate makes no demand of
+    // this handshake at all.
+    var not_offered = try validateBuilt(testing.allocator, &fx.certs.items[0], &.{}, fx.certs.items[1..2], policy(fx.certs.items[1..2]), cp);
+    defer not_offered.deinit(testing.allocator);
+    try expectAccepted(&not_offered, 2);
+    try testing.expectEqual(
+        revocation.MustStapleOutcome.not_offered_by_client,
+        not_offered.accepted.revocation.must_staple,
     );
 }
 
@@ -4123,7 +4137,7 @@ test "an issuer's TLS Feature set constrains what its children must assert" {
         statusAssertion(&fx.certs.items[0], .stapled_ocsp, .good),
     };
     var validation_policy = policy(anchors);
-    validation_policy.revocation = .{ .mode = .stapled_only };
+    validation_policy.revocation = .{ .mode = .stapled_only, .offered_status_request = true };
     validation_policy.revocation_evidence = .{ .assertions = &assertions };
     var missing = try validateBuilt(testing.allocator, &fx.certs.items[0], intermediates, anchors, validation_policy, cp);
     defer missing.deinit(testing.allocator);
@@ -4139,13 +4153,14 @@ test "an issuer's TLS Feature set constrains what its children must assert" {
     // Same set and superset both satisfy the constraint, and then normal leaf
     // must-staple processing applies. The superset leaf also declares feature
     // 17; the §4.2.2 constraint covers every advertised feature, while the
-    // end-entity obligation stays scoped to feature 5.
+    // end-entity obligation stays scoped to feature 5 — and here to a hello
+    // that never offered `status_request`.
     for (fx.certs.items[1..3], 1..) |_, index| {
         var accepted = try validateBuilt(testing.allocator, &fx.certs.items[index], intermediates, anchors, policy(anchors), cp);
         defer accepted.deinit(testing.allocator);
         try expectAccepted(&accepted, 3);
         try testing.expectEqual(
-            revocation.MustStapleOutcome.unenforced_status_disabled,
+            revocation.MustStapleOutcome.not_offered_by_client,
             accepted.accepted.revocation.must_staple,
         );
     }

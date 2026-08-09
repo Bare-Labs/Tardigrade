@@ -497,6 +497,10 @@ test "unauthenticated evidence never counts as a completed check" {
     try testing.expectEqual(revocation.Determination.checked_good, report.entries[0].determination);
 }
 
+/// Must-staple only binds when the ClientHello offered `status_request`, so
+/// every enforcement fixture has to say so explicitly.
+const offered = revocation.Configuration{ .mode = .soft_fail, .offered_status_request = true };
+
 test "must-staple requires stapled good status once a mode consults status" {
     const allocator = testing.allocator;
     var fx = Fixtures.init(allocator);
@@ -513,7 +517,7 @@ test "must-staple requires stapled good status once a mode consults status" {
     const missing = revocation.evaluatePath(
         allocator,
         path,
-        .{ .mode = .soft_fail },
+        offered,
         .{},
         validation_time,
     );
@@ -526,7 +530,7 @@ test "must-staple requires stapled good status once a mode consults status" {
     const wrong_source = revocation.evaluatePath(
         allocator,
         path,
-        .{ .mode = .soft_fail },
+        offered,
         .{ .assertions = &cached_assertions },
         validation_time,
     );
@@ -537,7 +541,7 @@ test "must-staple requires stapled good status once a mode consults status" {
     var outcome = revocation.evaluatePath(
         allocator,
         path,
-        .{ .mode = .soft_fail },
+        offered,
         .{ .assertions = &good_assertions },
         validation_time,
     );
@@ -558,7 +562,13 @@ test "must-staple is explicitly unenforced, not silently satisfied, when disable
         .tls_features = &.{x509.TlsFeatures.status_request},
     });
 
-    var outcome = revocation.evaluatePath(allocator, path, .{}, .{}, validation_time);
+    var outcome = revocation.evaluatePath(
+        allocator,
+        path,
+        .{ .offered_status_request = true },
+        .{},
+        validation_time,
+    );
     var report = try expectAccepted(&outcome);
     defer report.deinit(allocator);
     try testing.expectEqual(revocation.MustStapleOutcome.unenforced_status_disabled, report.must_staple);
@@ -579,7 +589,7 @@ test "must-staple enforcement can be disabled explicitly" {
     var outcome = revocation.evaluatePath(
         allocator,
         path,
-        .{ .mode = .soft_fail, .enforce_must_staple = false },
+        .{ .mode = .soft_fail, .enforce_must_staple = false, .offered_status_request = true },
         .{},
         validation_time,
     );
@@ -1323,7 +1333,7 @@ test "declaring both status_request and its v2 form is satisfied by feature 5" {
     var outcome = revocation.evaluatePath(
         allocator,
         path,
-        .{ .mode = .soft_fail },
+        offered,
         .{ .assertions = &assertions },
         validation_time,
     );
@@ -1332,14 +1342,100 @@ test "declaring both status_request and its v2 form is satisfied by feature 5" {
     try testing.expectEqual(revocation.MustStapleOutcome.enforced, report.must_staple);
 
     // Feature 5 is still enforced: drop the staple and the path is rejected.
-    const missing = revocation.evaluatePath(
+    const missing = revocation.evaluatePath(allocator, path, offered, .{}, validation_time);
+    try expectRejected(missing, .must_staple_not_satisfied, 0);
+}
+
+test "must-staple binds only when the client offered status_request" {
+    // RFC 7633 §4.3.3: a certificate's feature demand is scoped to features in
+    // both the ClientHello and the certificate. Tardigrade's TLS 1.3 hello does
+    // not currently send `status_request`, so a must-staple certificate makes
+    // no demand of such a connection — and the report says exactly that rather
+    // than reporting `not_required`, which would hide the assertion.
+    const allocator = testing.allocator;
+    var fx = Fixtures.init(allocator);
+    defer fx.deinit();
+    var storage: [4]path_builder.Element = undefined;
+    const path = try twoCertPath(&fx, &storage, .{
+        .subject = "leaf",
+        .issuer = "Root",
+        .tls_features = &.{x509.TlsFeatures.status_request},
+    });
+    try testing.expect(fx.certs.items[0].mustStaple());
+
+    // Not offered: no staple, and no rejection, in every consulting mode.
+    for ([_]revocation.Mode{ .stapled_only, .soft_fail, .strict }) |mode| {
+        var outcome = revocation.evaluatePath(
+            allocator,
+            path,
+            .{ .mode = mode, .offered_status_request = false },
+            .{},
+            validation_time,
+        );
+        // Strict still wants status evidence for its own reasons; supply it so
+        // the only thing under test is the must-staple obligation.
+        if (mode == .strict) {
+            switch (outcome) {
+                .rejected => |failure| try testing.expectEqual(
+                    revocation.FailureReason.status_unavailable,
+                    failure.reason,
+                ),
+                .accepted => return error.TestUnexpectedResult,
+            }
+            continue;
+        }
+        var report = try expectAccepted(&outcome);
+        defer report.deinit(allocator);
+        try testing.expectEqual(revocation.MustStapleOutcome.not_offered_by_client, report.must_staple);
+        try testing.expect(report.entries[0].must_staple);
+    }
+
+    // Offered: the same certificate and the same absent staple now reject.
+    const rejected = revocation.evaluatePath(
         allocator,
         path,
-        .{ .mode = .soft_fail },
+        .{ .mode = .soft_fail, .offered_status_request = true },
         .{},
         validation_time,
     );
-    try expectRejected(missing, .must_staple_not_satisfied, 0);
+    try expectRejected(rejected, .must_staple_not_satisfied, 0);
+
+    // Offered and satisfied.
+    const assertions = [_]revocation.StatusAssertion{stapledFor(&fx.certs.items[0], .good)};
+    var accepted = revocation.evaluatePath(
+        allocator,
+        path,
+        .{ .mode = .soft_fail, .offered_status_request = true },
+        .{ .assertions = &assertions },
+        validation_time,
+    );
+    var report = try expectAccepted(&accepted);
+    defer report.deinit(allocator);
+    try testing.expectEqual(revocation.MustStapleOutcome.enforced, report.must_staple);
+}
+
+test "a certificate without must-staple reports not_required either way" {
+    // `not_offered_by_client` must describe a real assertion, never stand in
+    // for "this certificate never asked for stapling".
+    const allocator = testing.allocator;
+    var fx = Fixtures.init(allocator);
+    defer fx.deinit();
+    var storage: [4]path_builder.Element = undefined;
+    const path = try twoCertPath(&fx, &storage, .{ .subject = "leaf", .issuer = "Root" });
+
+    for ([_]bool{ false, true }) |client_offered| {
+        var outcome = revocation.evaluatePath(
+            allocator,
+            path,
+            .{ .mode = .soft_fail, .offered_status_request = client_offered },
+            .{},
+            validation_time,
+        );
+        var report = try expectAccepted(&outcome);
+        defer report.deinit(allocator);
+        try testing.expectEqual(revocation.MustStapleOutcome.not_required, report.must_staple);
+        try testing.expect(!report.entries[0].must_staple);
+    }
 }
 
 test {

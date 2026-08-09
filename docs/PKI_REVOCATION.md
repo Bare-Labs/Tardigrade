@@ -62,10 +62,26 @@ and found nothing".
 An **end-entity** certificate carrying the TLS Feature extension with
 `status_request` (5) asserts that its server always delivers a stapled status
 response. Tardigrade parses the extension (`x509.Certificate.mustStaple`) and
-enforces it in every mode that consults status: the leaf must have a *stapled*,
-good, usable status, or the path is rejected with `must_staple_not_satisfied`. A
-cached or CRL answer does not substitute — the point of the assertion is the
-in-band delivery.
+enforces it in every mode that consults status — provided the connection asked
+for stapling: the leaf must have a *stapled*, good, usable status, or the path
+is rejected with `must_staple_not_satisfied`. A cached or CRL answer does not
+substitute; the point of the assertion is the in-band delivery.
+
+### The demand is scoped to what the ClientHello offered
+
+RFC 7633 §4.1 says a client need not offer or support a feature merely because a
+certificate names it, and §4.3.3 makes the certificate invalid only for features
+present in **both** the ClientHello and the certificate that the server then
+fails to satisfy. A client that never requested stapling cannot hold a server to
+having provided it.
+
+`Configuration.offered_status_request` carries that handshake fact into policy.
+It defaults to **false**, because Tardigrade's TLS 1.3 ClientHello does not
+currently send `status_request` — so today a must-staple certificate is accepted
+and reported as `not_offered_by_client` rather than rejected. A caller that
+wires the extension must set the flag from the hello it actually emitted, never
+from a constant. The validator cannot observe the handshake itself, so making
+this an input keeps the seam truthful instead of encoding an assumption.
 
 The **issuer** form is a different rule. RFC 7633 §4.2.2 makes a certificate
 carrying TLS Feature a constraint on what it signs: every certificate it issues
@@ -101,8 +117,9 @@ above, which applies to every advertised feature.
 ### Reporting
 
 `Report.must_staple` records what became of the assertion — `not_required`,
-`enforced`, `unenforced_status_disabled` (the mode consults nothing),
-or `unenforced_by_configuration` (`enforce_must_staple` is off) — so an
+`enforced`, `not_offered_by_client` (outside the §4.3.3 intersection),
+`unenforced_status_disabled` (the mode consults nothing), or
+`unenforced_by_configuration` (`enforce_must_staple` is off) — so an
 acceptance never reads as "honored"
 when it was merely not applied. Operators who deploy must-staple certificates
 behind Tardigrade should run at least `stapled_only`.
