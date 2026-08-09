@@ -28,77 +28,9 @@ jobs:
           git fetch --depth=1 origin "${TARGET_SHA}"
           git checkout --detach FETCH_HEAD
 
-          python3 - <<'PY'
-          from pathlib import Path
-
-          h2_path = Path("src/http/upstream_h2.zig")
-          h2 = h2_path.read_text()
-
-          old_read = '''                if (stream.err) |e| {
-                    self.state_mutex.unlock();
-                    return e;
-                }
-                if (self.conn_err) |e| {
-                    self.state_mutex.unlock();
-                    return e;
-                }
-                if (stream.done) {
-                    self.state_mutex.unlock();
-                    return 0;
-                }
-'''
-          new_read = '''                if (stream.err) |e| {
-                    self.state_mutex.unlock();
-                    return e;
-                }
-                // END_STREAM makes this response complete even if the peer
-                // closes the shared connection immediately afterward.
-                if (stream.done) {
-                    self.state_mutex.unlock();
-                    return 0;
-                }
-                if (self.conn_err) |e| {
-                    self.state_mutex.unlock();
-                    return e;
-                }
-'''
-          if h2.count(old_read) != 1:
-              raise SystemExit(f"expected one readStreamingBody block, found {h2.count(old_read)}")
-          h2 = h2.replace(old_read, new_read, 1)
-
-          old_fail = '''            while (it.next()) |sp| {
-                if (sp.*.err == null) sp.*.err = e;
-                sp.*.cond.signal(); // wake each response waiter
-            }
-'''
-          new_fail = '''            while (it.next()) |sp| {
-                // A connection failure cannot retroactively invalidate a
-                // response whose END_STREAM was already processed.
-                if (!sp.*.done and sp.*.err == null) sp.*.err = e;
-                sp.*.cond.signal(); // wake each response waiter
-            }
-'''
-          if h2.count(old_fail) != 1:
-              raise SystemExit(f"expected one failConnection block, found {h2.count(old_fail)}")
-          h2 = h2.replace(old_fail, new_fail, 1)
-          h2_path.write_text(h2)
-
-          integration_path = Path("tests/integration.zig")
-          integration = integration_path.read_text()
-          old_mtls = '''test "proxy streaming mode streams from an upstream requiring a client certificate" {
-    const allocator = std.testing.allocator;
-    try requireOpenssl(allocator);
-'''
-          new_mtls = '''test "proxy streaming mode streams from an upstream requiring a client certificate" {
-    const allocator = std.testing.allocator;
-    try requireGeneralTlsProfile();
-    try requireOpenssl(allocator);
-'''
-          if integration.count(old_mtls) != 1:
-              raise SystemExit(f"expected one mTLS streaming test preamble, found {integration.count(old_mtls)}")
-          integration = integration.replace(old_mtls, new_mtls, 1)
-          integration_path.write_text(integration)
-          PY
+          python3 -c 'from pathlib import Path; p=Path("src/http/upstream_h2.zig"); s=p.read_text(); old="                if (stream.err) |e| {\n                    self.state_mutex.unlock();\n                    return e;\n                }\n                if (self.conn_err) |e| {\n                    self.state_mutex.unlock();\n                    return e;\n                }\n                if (stream.done) {\n                    self.state_mutex.unlock();\n                    return 0;\n                }\n"; new="                if (stream.err) |e| {\n                    self.state_mutex.unlock();\n                    return e;\n                }\n                // END_STREAM makes this response complete even if the peer\n                // closes the shared connection immediately afterward.\n                if (stream.done) {\n                    self.state_mutex.unlock();\n                    return 0;\n                }\n                if (self.conn_err) |e| {\n                    self.state_mutex.unlock();\n                    return e;\n                }\n"; assert s.count(old)==1, s.count(old); p.write_text(s.replace(old,new,1))'
+          python3 -c 'from pathlib import Path; p=Path("src/http/upstream_h2.zig"); s=p.read_text(); old="            while (it.next()) |sp| {\n                if (sp.*.err == null) sp.*.err = e;\n                sp.*.cond.signal(); // wake each response waiter\n            }\n"; new="            while (it.next()) |sp| {\n                // A connection failure cannot retroactively invalidate a\n                // response whose END_STREAM was already processed.\n                if (!sp.*.done and sp.*.err == null) sp.*.err = e;\n                sp.*.cond.signal(); // wake each response waiter\n            }\n"; assert s.count(old)==1, s.count(old); p.write_text(s.replace(old,new,1))'
+          python3 -c 'from pathlib import Path; p=Path("tests/integration.zig"); s=p.read_text(); old="test \\"proxy streaming mode streams from an upstream requiring a client certificate\\" {\n    const allocator = std.testing.allocator;\n    try requireOpenssl(allocator);\n"; new="test \\"proxy streaming mode streams from an upstream requiring a client certificate\\" {\n    const allocator = std.testing.allocator;\n    try requireGeneralTlsProfile();\n    try requireOpenssl(allocator);\n"; assert s.count(old)==1, s.count(old); p.write_text(s.replace(old,new,1))'
 
           git diff --check
           git config user.name "github-actions[bot]"
