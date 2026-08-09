@@ -1,0 +1,107 @@
+name: Patch PR 592
+
+on:
+  push:
+    branches:
+      - claude/issue-139-implementation-480e10
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply reviewed fixes and push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach FETCH_HEAD
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          h2_path = Path("src/http/upstream_h2.zig")
+          h2 = h2_path.read_text()
+
+          old_read = '''                if (stream.err) |e| {
+                    self.state_mutex.unlock();
+                    return e;
+                }
+                if (self.conn_err) |e| {
+                    self.state_mutex.unlock();
+                    return e;
+                }
+                if (stream.done) {
+                    self.state_mutex.unlock();
+                    return 0;
+                }
+'''
+          new_read = '''                if (stream.err) |e| {
+                    self.state_mutex.unlock();
+                    return e;
+                }
+                // END_STREAM makes this response complete even if the peer
+                // closes the shared connection immediately afterward.
+                if (stream.done) {
+                    self.state_mutex.unlock();
+                    return 0;
+                }
+                if (self.conn_err) |e| {
+                    self.state_mutex.unlock();
+                    return e;
+                }
+'''
+          if h2.count(old_read) != 1:
+              raise SystemExit(f"expected one readStreamingBody block, found {h2.count(old_read)}")
+          h2 = h2.replace(old_read, new_read, 1)
+
+          old_fail = '''            while (it.next()) |sp| {
+                if (sp.*.err == null) sp.*.err = e;
+                sp.*.cond.signal(); // wake each response waiter
+            }
+'''
+          new_fail = '''            while (it.next()) |sp| {
+                // A connection failure cannot retroactively invalidate a
+                // response whose END_STREAM was already processed.
+                if (!sp.*.done and sp.*.err == null) sp.*.err = e;
+                sp.*.cond.signal(); // wake each response waiter
+            }
+'''
+          if h2.count(old_fail) != 1:
+              raise SystemExit(f"expected one failConnection block, found {h2.count(old_fail)}")
+          h2 = h2.replace(old_fail, new_fail, 1)
+          h2_path.write_text(h2)
+
+          integration_path = Path("tests/integration.zig")
+          integration = integration_path.read_text()
+          old_mtls = '''test "proxy streaming mode streams from an upstream requiring a client certificate" {
+    const allocator = std.testing.allocator;
+    try requireOpenssl(allocator);
+'''
+          new_mtls = '''test "proxy streaming mode streams from an upstream requiring a client certificate" {
+    const allocator = std.testing.allocator;
+    try requireGeneralTlsProfile();
+    try requireOpenssl(allocator);
+'''
+          if integration.count(old_mtls) != 1:
+              raise SystemExit(f"expected one mTLS streaming test preamble, found {integration.count(old_mtls)}")
+          integration = integration.replace(old_mtls, new_mtls, 1)
+          integration_path.write_text(integration)
+          PY
+
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/http/upstream_h2.zig tests/integration.zig
+          if git diff --cached --quiet; then
+            echo "No changes produced" >&2
+            exit 1
+          fi
+          git commit -m "fix(proxy): preserve completed h2 streams"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
