@@ -34,6 +34,8 @@ pub const Config = struct {
     /// worker model, blocking here would let one slow origin absorb the whole
     /// worker pool — queueing/watermark semantics are #140's scope.
     max_active_per_host: usize = 0,
+    /// Opt-in benchmark instrumentation for shared-pool mutex wait time.
+    lock_contention_metrics_enabled: bool = false,
 };
 
 /// Identifier of the worker thread that last released a connection. Used purely
@@ -83,6 +85,11 @@ pub const Stats = struct {
     at_capacity_total: u64 = 0,
     idle: u64 = 0,
     active: u64 = 0,
+};
+
+pub const LockContentionStats = struct {
+    wait_ns_total: u64 = 0,
+    acquires_total: u64 = 0,
 };
 
 /// A copy of one origin's identity + counters for rendering. `host` is owned by
@@ -160,6 +167,8 @@ pub const UpstreamPool = struct {
     /// Count streaming uploads that requested h2/h2c but still had to use h1
     /// because the h2 pool was unavailable for the exchange.
     h2_streaming_upload_fallbacks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    lock_wait_ns_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    lock_acquires_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) UpstreamPool {
         return .{
@@ -196,6 +205,33 @@ pub const UpstreamPool = struct {
         conn.stream.close();
     }
 
+    fn lock(self: *UpstreamPool) u64 {
+        if (!self.config.lock_contention_metrics_enabled) {
+            self.mutex.lock();
+            return 0;
+        }
+        const start = compat.monotonicNanoTimestamp();
+        self.mutex.lock();
+        const end = compat.monotonicNanoTimestamp();
+        return if (end > start) @intCast(end - start) else 0;
+    }
+
+    fn unlock(self: *UpstreamPool, waited_ns: u64) void {
+        self.mutex.unlock();
+        if (self.config.lock_contention_metrics_enabled) {
+            _ = self.lock_wait_ns_total.fetchAdd(waited_ns, .monotonic);
+            _ = self.lock_acquires_total.fetchAdd(1, .monotonic);
+        }
+    }
+
+    fn lockForSnapshot(self: *UpstreamPool) void {
+        self.mutex.lock();
+    }
+
+    fn unlockForSnapshot(self: *UpstreamPool) void {
+        self.mutex.unlock();
+    }
+
     /// Get or create the per-host entry for `key`, duping the key on insert.
     /// Returns null only on allocation failure. Caller holds the mutex.
     fn hostEntry(self: *UpstreamPool, key: []const u8) ?*HostEntry {
@@ -226,8 +262,8 @@ pub const UpstreamPool = struct {
     /// queueing; see `Config.max_active_per_host` for the rationale.
     pub fn checkout(self: *UpstreamPool, key: []const u8, now_ms: u64) error{UpstreamAtCapacity}!?PooledConn {
         if (!self.config.enabled) return null;
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const lock_wait_ns = self.lock();
+        defer self.unlock(lock_wait_ns);
         const entry = self.hostEntry(key) orelse return null; // OOM: proceed untracked
         if (self.config.max_active_per_host > 0 and entry.stats.active >= self.config.max_active_per_host) {
             entry.stats.at_capacity_total += 1;
@@ -259,8 +295,8 @@ pub const UpstreamPool = struct {
     /// `releaseSlot`.
     pub fn reserveSlot(self: *UpstreamPool, key: []const u8) error{UpstreamAtCapacity}!void {
         if (!self.config.enabled) return;
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const lock_wait_ns = self.lock();
+        defer self.unlock(lock_wait_ns);
         const entry = self.hostEntry(key) orelse return;
         if (self.config.max_active_per_host > 0 and entry.stats.active >= self.config.max_active_per_host) {
             entry.stats.at_capacity_total += 1;
@@ -272,8 +308,8 @@ pub const UpstreamPool = struct {
     /// Undo a `checkout`/`reserveSlot` reservation after a fresh connect
     /// failed. No-op for untracked (disabled/OOM) checkouts.
     pub fn releaseSlot(self: *UpstreamPool, key: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const lock_wait_ns = self.lock();
+        defer self.unlock(lock_wait_ns);
         const entry = self.hosts.getPtr(key) orelse return;
         if (entry.stats.active > 0) entry.stats.active -= 1;
     }
@@ -281,8 +317,8 @@ pub const UpstreamPool = struct {
     /// Record that the caller opened a fresh connection for `key`. The active
     /// slot was already reserved by `checkout`/`reserveSlot`; this only counts.
     pub fn noteNewConnection(self: *UpstreamPool, key: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const lock_wait_ns = self.lock();
+        defer self.unlock(lock_wait_ns);
         const entry = self.hostEntry(key) orelse return;
         entry.stats.new_total += 1;
     }
@@ -291,8 +327,8 @@ pub const UpstreamPool = struct {
     /// `reusable` and there is room and it has not aged out; otherwise it is
     /// closed. Either way the origin's `active` gauge is decremented.
     pub fn release(self: *UpstreamPool, key: []const u8, conn: PooledConn, reusable: bool, now_ms: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const lock_wait_ns = self.lock();
+        defer self.unlock(lock_wait_ns);
         const entry = self.hostEntry(key) orelse {
             self.closeConn(conn);
             return;
@@ -316,15 +352,15 @@ pub const UpstreamPool = struct {
     }
 
     pub fn recordStaleRetry(self: *UpstreamPool, key: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const lock_wait_ns = self.lock();
+        defer self.unlock(lock_wait_ns);
         const entry = self.hostEntry(key) orelse return;
         entry.stats.stale_retries_total += 1;
     }
 
     pub fn recordConnectLatency(self: *UpstreamPool, latency_ms: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const lock_wait_ns = self.lock();
+        defer self.unlock(lock_wait_ns);
         self.connect_latency_count += 1;
         self.connect_latency_sum_ms += latency_ms;
         for (connect_latency_bounds_ms, 0..) |bound, i| {
@@ -339,8 +375,8 @@ pub const UpstreamPool = struct {
     /// Close and drop every idle connection that has aged out, refreshing each
     /// origin's idle gauge. Intended to run from the gateway maintenance tick.
     pub fn reapIdle(self: *UpstreamPool, now_ms: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const lock_wait_ns = self.lock();
+        defer self.unlock(lock_wait_ns);
         var it = self.hosts.iterator();
         while (it.next()) |entry| {
             const list = &entry.value_ptr.idle;
@@ -358,8 +394,8 @@ pub const UpstreamPool = struct {
 
     /// Aggregate counters across all origins.
     pub fn aggregateStats(self: *UpstreamPool) Stats {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.lockForSnapshot();
+        defer self.unlockForSnapshot();
         var agg = Stats{};
         var it = self.hosts.iterator();
         while (it.next()) |entry| {
@@ -379,8 +415,8 @@ pub const UpstreamPool = struct {
     /// Snapshot per-origin counters for rendering. Caller frees with
     /// `freeHostSnapshots`.
     pub fn snapshotHosts(self: *UpstreamPool, allocator: std.mem.Allocator) ![]HostSnapshot {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.lockForSnapshot();
+        defer self.unlockForSnapshot();
         var out = std.array_list.Managed(HostSnapshot).init(allocator);
         errdefer {
             for (out.items) |snap| allocator.free(snap.host);
@@ -421,9 +457,16 @@ pub const UpstreamPool = struct {
         return self.h2_streaming_upload_fallbacks.load(.monotonic);
     }
 
+    pub fn lockContentionStats(self: *const UpstreamPool) LockContentionStats {
+        return .{
+            .wait_ns_total = self.lock_wait_ns_total.load(.monotonic),
+            .acquires_total = self.lock_acquires_total.load(.monotonic),
+        };
+    }
+
     pub fn connectLatencySnapshot(self: *UpstreamPool) ConnectLatencySnapshot {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.lockForSnapshot();
+        defer self.unlockForSnapshot();
         return .{
             .buckets = self.connect_latency_buckets,
             .count = self.connect_latency_count,
@@ -434,8 +477,8 @@ pub const UpstreamPool = struct {
     /// Record one completed upstream exchange for the per-protocol latency
     /// histogram (#145 — "upstream p99 by protocol").
     pub fn recordRequestLatency(self: *UpstreamPool, is_h2: bool, latency_ms: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const lock_wait_ns = self.lock();
+        defer self.unlock(lock_wait_ns);
         if (is_h2) {
             self.request_latency_h2.record(latency_ms);
         } else {
@@ -444,8 +487,8 @@ pub const UpstreamPool = struct {
     }
 
     pub fn requestLatencySnapshot(self: *UpstreamPool) RequestLatencySnapshot {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.lockForSnapshot();
+        defer self.unlockForSnapshot();
         return .{ .h1 = self.request_latency_h1, .h2 = self.request_latency_h2 };
     }
 };

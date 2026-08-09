@@ -1,0 +1,25 @@
+global
+    master-worker
+    pidfile __PID_FILE__
+    maxconn 4096
+    log stdout format raw local0 warning
+
+defaults
+    mode http
+    option httplog
+    option http-keep-alive
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+
+frontend tardigrade_competitive
+    bind 127.0.0.1:__LISTEN_PORT__
+    http-request return status 200 content-type text/plain string ok if { path -i /health }
+    http-request return status 200 content-type text/plain file __STATIC_ROOT__/tiny.txt if { path -i /tiny.txt }
+    use_backend origin if { path_beg /proxy/ }
+    http-request return status 404 content-type text/plain string not-found
+
+backend origin
+    http-reuse always
+    http-request replace-path ^/proxy/(.*)$ /\1
+    server origin1 127.0.0.1:__UPSTREAM_PORT__ check

@@ -136,6 +136,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .idle_timeout_ms = cfg.upstream_pool_idle_timeout_ms,
             .max_lifetime_ms = cfg.upstream_pool_max_lifetime_ms,
             .max_active_per_host = cfg.upstream_pool_max_active_per_host,
+            .lock_contention_metrics_enabled = cfg.upstream_pool_lock_metrics,
         }),
         .h2_pool = http.upstream_h2.H2ConnPool.init(state_allocator, .{
             .idle_timeout_ms = cfg.upstream_pool_idle_timeout_ms,

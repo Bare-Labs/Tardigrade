@@ -163,6 +163,10 @@ fn sawFiveInvalidTokens(snapshot: http3_runtime.Snapshot) bool {
     return snapshot.invalid_tokens >= 5 and snapshot.tracked_connections == 0;
 }
 
+fn sentFourRetries(snapshot: http3_runtime.Snapshot) bool {
+    return snapshot.retry_packets_sent >= 4;
+}
+
 fn hasPathValidationFailure(snapshot: http3_runtime.Snapshot) bool {
     return snapshot.path_validations_failed > 0 and snapshot.tracked_connections > 0;
 }
@@ -502,7 +506,7 @@ test "udp smoke: HTTP/3 runtime Retry sends tokenless Initials without tracked s
     }
     try testing.expectEqual(@as(usize, attempts), retries);
 
-    const snapshot = runtime.snapshot();
+    const snapshot = try waitRuntimeSnapshot(&runtime, sentFourRetries);
     try testing.expectEqual(@as(usize, attempts), snapshot.retry_packets_sent);
     try testing.expectEqual(@as(usize, 0), snapshot.retry_tokens_accepted);
     try testing.expectEqual(@as(usize, 0), snapshot.invalid_tokens);

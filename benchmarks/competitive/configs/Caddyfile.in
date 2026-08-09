@@ -1,0 +1,17 @@
+{
+    admin off
+}
+
+:__LISTEN_PORT__ {
+    root * __STATIC_ROOT__
+
+    handle /health {
+        respond "ok" 200
+    }
+
+    handle_path /proxy/* {
+        reverse_proxy 127.0.0.1:__UPSTREAM_PORT__
+    }
+
+    file_server
+}

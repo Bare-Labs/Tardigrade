@@ -15,6 +15,7 @@
 #   --config-label STR  Config/profile label recorded in metadata
 #   --pid PID           Target Tardigrade process ID for CPU/RSS sampling
 #   --pid-file FILE     File containing the target Tardigrade PID for CPU/RSS sampling
+#   --pid-tree          Include child processes when sampling CPU/RSS/open FDs
 #   --tls               Use HTTPS (default: plain HTTP)
 #   --insecure          Skip TLS certificate verification (for self-signed certs)
 #   --duration SECS     Benchmark duration per scenario (default: 30)
@@ -82,6 +83,7 @@ WORKER_COUNT=""
 CONFIG_LABEL=""
 TARGET_PID=""
 PID_FILE=""
+PID_TREE=false
 USE_TLS=false
 INSECURE=false
 DURATION=30
@@ -121,6 +123,7 @@ while [[ $# -gt 0 ]]; do
         --config-label)CONFIG_LABEL="$2";      shift 2 ;;
         --pid)        TARGET_PID="$2";         shift 2 ;;
         --pid-file)   PID_FILE="$2";           shift 2 ;;
+        --pid-tree)   PID_TREE=true;           shift ;;
         --tls)        USE_TLS=true;            shift ;;
         --insecure)   INSECURE=true;           shift ;;
         --duration)   DURATION="$2";           shift 2 ;;
@@ -394,22 +397,147 @@ peak_rss_mb_or_null() {
     ' "$file"
 }
 
+wrk_error_count() {
+    awk '
+        /Non-2xx/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^[0-9]+$/) total += $i
+            }
+        }
+        /Socket errors:/ {
+            for (i = 1; i <= NF; i++) {
+                gsub(/,/, "", $i)
+                if ($i ~ /^[0-9]+$/) total += $i
+            }
+        }
+        END { print total + 0 }
+    '
+}
+
 MONITOR_FILE=""
 MONITOR_PID=""
 CURRENT_CPU_PCT_AVG="null"
 CURRENT_RSS_MB_PEAK="null"
+CURRENT_OPEN_FDS_PEAK="null"
+CPU_BEFORE_SECONDS="null"
+MONITOR_START_NS="null"
+
+monotonic_ns() {
+    python3 -c 'import time; print(time.monotonic_ns())'
+}
+
+cpu_time_to_seconds() {
+    awk '
+        function part_seconds(v, n, p) {
+            n = split(v, p, ":")
+            if (n == 3) return (p[1] * 3600) + (p[2] * 60) + p[3]
+            if (n == 2) return (p[1] * 60) + p[2]
+            return v + 0
+        }
+        {
+            v = $1
+            days = 0
+            if (index(v, "-") > 0) {
+                split(v, d, "-")
+                days = d[1] + 0
+                v = d[2]
+            }
+            total += days * 86400 + part_seconds(v)
+        }
+        END { printf "%.6f", total }
+    '
+}
+
+process_tree_cpu_seconds() {
+    local pid="$1"
+    local pids clk total_ticks child
+    if $PID_TREE; then
+        pids="$(process_tree_pids "$pid" | paste -sd, -)"
+    else
+        pids="$pid"
+    fi
+    [[ -n "$pids" ]] || pids="$pid"
+    if [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
+        clk="$(getconf CLK_TCK 2>/dev/null || true)"
+        if [[ "$clk" =~ ^[0-9]+$ && "$clk" -gt 0 ]]; then
+            total_ticks=0
+            IFS=, read -ra _cpu_pids <<< "$pids"
+            for child in "${_cpu_pids[@]}"; do
+                [[ -r "/proc/${child}/stat" ]] || continue
+                total_ticks=$((total_ticks + $(awk '{
+                    paren_idx = match($0, /\) /)
+                    rest = substr($0, paren_idx + 2)
+                    split(rest, f, " ")
+                    print (f[12] + f[13])
+                }' "/proc/${child}/stat")))
+            done
+            awk -v ticks="$total_ticks" -v clk="$clk" 'BEGIN { printf "%.6f", ticks / clk }'
+            return
+        fi
+    fi
+    ps -p "$pids" -o time= 2>/dev/null | cpu_time_to_seconds
+}
+
+count_open_fds_for_pids() {
+    local pids_csv="$1"
+    local total=0 pid count
+    IFS=, read -ra _fd_pids <<< "$pids_csv"
+    for pid in "${_fd_pids[@]}"; do
+        [[ -n "$pid" ]] || continue
+        if [[ -d "/proc/${pid}/fd" ]]; then
+            count=$(find "/proc/${pid}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' ')
+        elif command -v lsof >/dev/null 2>&1; then
+            count=$(lsof -n -P -p "$pid" 2>/dev/null | awk 'NR > 1 { count += 1 } END { print count + 0 }')
+        else
+            count=""
+        fi
+        [[ "$count" =~ ^[0-9]+$ ]] && total=$((total + count))
+    done
+    if [[ "$total" -gt 0 ]]; then
+        printf '%s\n' "$total"
+    else
+        printf 'null\n'
+    fi
+}
 
 monitor_target_process() {
     local pid="$1" sample_interval_s="$2" outfile="$3"
     while kill -0 "$pid" 2>/dev/null; do
-        ps -p "$pid" -o rss= -o %cpu= 2>/dev/null | awk 'NF >= 2 { print $1, $2; exit }' >> "$outfile"
+        local pids
+        if $PID_TREE; then
+            process_tree_pids "$pid" | paste -sd, - | {
+                read -r pids
+                [[ -n "$pids" ]] || pids="$pid"
+                local fds
+                fds="$(count_open_fds_for_pids "$pids")"
+                ps -p "$pids" -o rss= 2>/dev/null |
+                    awk -v fds="$fds" '{ rss += $1 } END { if (rss > 0) print rss, fds }' >> "$outfile"
+            }
+        else
+            local fds
+            fds="$(count_open_fds_for_pids "$pid")"
+            ps -p "$pid" -o rss= 2>/dev/null | awk -v fds="$fds" 'NF >= 1 { print $1, fds; exit }' >> "$outfile"
+        fi
         sleep "$sample_interval_s"
+    done
+}
+
+process_tree_pids() {
+    local root="$1"
+    printf '%s\n' "$root"
+    local children child
+    children=$(pgrep -P "$root" 2>/dev/null || true)
+    for child in $children; do
+        process_tree_pids "$child"
     done
 }
 
 start_process_monitor() {
     CURRENT_CPU_PCT_AVG="null"
     CURRENT_RSS_MB_PEAK="null"
+    CURRENT_OPEN_FDS_PEAK="null"
+    CPU_BEFORE_SECONDS="null"
+    MONITOR_START_NS="null"
     MONITOR_FILE=""
     MONITOR_PID=""
 
@@ -424,7 +552,9 @@ start_process_monitor() {
 
     local sample_interval_s
     sample_interval_s=$(awk -v ms="$SAMPLE_INTERVAL_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
-    MONITOR_FILE=$(mktemp /tmp/tardigrade-bench-monitor-XXXX.txt)
+    CPU_BEFORE_SECONDS="$(process_tree_cpu_seconds "$pid")"
+    MONITOR_START_NS="$(monotonic_ns)"
+    MONITOR_FILE=$(mktemp /tmp/tardigrade-bench-monitor-XXXXXX)
     monitor_target_process "$pid" "$sample_interval_s" "$MONITOR_FILE" &
     MONITOR_PID="$!"
 }
@@ -436,8 +566,19 @@ stop_process_monitor() {
         MONITOR_PID=""
     fi
     if [[ -n "$MONITOR_FILE" && -f "$MONITOR_FILE" ]]; then
-        CURRENT_CPU_PCT_AVG=$(average_column_or_null "$MONITOR_FILE" 2)
+        local pid cpu_after end_ns
+        if pid=$(resolve_target_pid 2>/dev/null); then
+            cpu_after="$(process_tree_cpu_seconds "$pid")"
+            end_ns="$(monotonic_ns)"
+            CURRENT_CPU_PCT_AVG=$(awk -v before="$CPU_BEFORE_SECONDS" -v after="$cpu_after" -v start="$MONITOR_START_NS" -v end="$end_ns" '
+                BEGIN {
+                    elapsed = (end - start) / 1000000000
+                    if (before != "null" && elapsed > 0) printf "%.2f", ((after - before) / elapsed) * 100
+                    else printf "null"
+                }')
+        fi
         CURRENT_RSS_MB_PEAK=$(peak_rss_mb_or_null "$MONITOR_FILE")
+        CURRENT_OPEN_FDS_PEAK=$(awk 'NF >= 2 && $2 ~ /^[0-9]+$/ && $2 > max { max = $2 } END { if (max > 0) printf "%d", max; else printf "null" }' "$MONITOR_FILE")
         rm -f "$MONITOR_FILE"
         MONITOR_FILE=""
     fi
@@ -464,7 +605,7 @@ declare -A _run_p99_list=()
 declare -A _run_errors_list=()
 
 add_result() {
-    local scenario="$1" rps="$2" p50_ms="$3" p95_ms="$4" p99_ms="$5" p999_ms="$6" errors="$7" mbps="${8:-null}" cpu_pct_avg="${9:-null}" rss_mb_peak="${10:-null}"
+    local scenario="$1" rps="$2" p50_ms="$3" p95_ms="$4" p99_ms="$5" p999_ms="$6" errors="$7" mbps="${8:-null}" cpu_pct_avg="${9:-null}" rss_mb_peak="${10:-null}" open_fds_peak="${11:-$CURRENT_OPEN_FDS_PEAK}"
 
     if [[ "$RUNS" -gt 1 ]]; then
         # Accumulate for this run; flush_multirun_result builds the final entry.
@@ -477,7 +618,7 @@ add_result() {
     RESULTS_JSON=$(jq --arg s "$scenario" \
         --argjson rps "$rps" \
         --argjson p50 "$p50_ms" --argjson p95 "$p95_ms" --argjson p99 "$p99_ms" --argjson p999 "$p999_ms" \
-        --argjson err "$errors" --argjson mbps "$mbps" --argjson cpu "$cpu_pct_avg" --argjson rss "$rss_mb_peak" \
+        --argjson err "$errors" --argjson mbps "$mbps" --argjson cpu "$cpu_pct_avg" --argjson rss "$rss_mb_peak" --argjson fds "$open_fds_peak" \
         '.[$s] = {
             rps: $rps,
             p50_ms: $p50,
@@ -487,7 +628,8 @@ add_result() {
             errors: $err,
             throughput_mbps: $mbps,
             cpu_pct_avg: $cpu,
-            rss_mb_peak: $rss
+            rss_mb_peak: $rss,
+            open_fds_peak: $fds
         }' \
         <<<"$RESULTS_JSON")
 }
@@ -576,7 +718,7 @@ run_wrk() {
     p95=$(echo "$summary_json" | jq -r '.p95_ms // null')
     p99=$(echo "$summary_json" | jq -r '.p99_ms // null')
     p999=$(echo "$summary_json" | jq -r '.p999_ms // null')
-    errors=$(echo "$raw" | grep -E "Non-2xx|Socket errors" | grep -oE '[0-9]+' | head -1 || echo 0)
+    errors=$(printf '%s\n' "$raw" | wrk_error_count)
     rps=${rps:-0}; errors=${errors:-0}
     local tput_mbps
     tput_mbps=$(echo "$summary_json" | jq -r '.throughput_mbps // null')
@@ -728,7 +870,7 @@ _k6_parse_summary() {
 # ── k6 throughput runner ──────────────────────────────────────────────────────
 run_k6() {
     local url="$1" label="$2"
-    local tmpfile; tmpfile=$(mktemp /tmp/k6-summary-XXXX.json)
+    local tmpfile; tmpfile=$(mktemp /tmp/k6-summary-XXXXXX)
     local extra_flags=()
     $INSECURE && extra_flags+=(--insecure-skip-tls-verify)
 
@@ -758,7 +900,7 @@ run_k6() {
 run_k6_scenario() {
     local script="$1" label="$2"
     shift 2
-    local tmpfile; tmpfile=$(mktemp /tmp/k6-summary-XXXX.json)
+    local tmpfile; tmpfile=$(mktemp /tmp/k6-summary-XXXXXX)
     local extra_flags=()
     $INSECURE && extra_flags+=(--insecure-skip-tls-verify)
 
@@ -1108,6 +1250,7 @@ RESULTS_JSON=$(jq \
     --arg keepalive_path "$KEEPALIVE_PATH" \
     --arg h2_path "$H2_PATH" --arg h3_path "$H3_PATH" \
     --arg tool "$TOOL" \
+    --argjson pid_tree "$($PID_TREE && echo true || echo false)" \
     --arg zig_version "$ZIG_VERSION" \
     --arg os_name "$OS_NAME" \
     --arg kernel_release "$KERNEL_RELEASE" \
@@ -1125,6 +1268,7 @@ RESULTS_JSON=$(jq \
           process_metrics: {
             enabled: ($pid_source != "none"),
             pid_source: $pid_source,
+            pid_tree: $pid_tree,
             sample_interval_ms: $sample_interval_ms
           },
           zig_version: $zig_version,
