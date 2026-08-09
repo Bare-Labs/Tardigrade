@@ -106,6 +106,38 @@ where it was told to. The external QUIC/H3 peer matrix (ngtcp2, quiche,
 aioquic, both directions, HRR included) already exists in
 `scripts/interop/run-interop.sh` and is not duplicated here.
 
+### Post-handshake KeyUpdate
+
+Three rows (#357) exercise RFC 8446 §4.6.3 against OpenSSL in both roles. The
+native side sends exactly one `KeyUpdate` as soon as the connection opens and
+**before** its application payload, so every application byte in the row
+crosses under the new generation — a peer that did not follow the transition
+could not read the exchange at all, and the row fails rather than passing on a
+`KeyUpdate` the peer quietly ignored.
+
+| Row | Native sends | Also requires |
+| --- | --- | --- |
+| `record/server/openssl/key-update/reciprocal` | `update_requested` | the peer's answering `KeyUpdate`, applied |
+| `record/client/openssl/key-update/reciprocal` | `update_requested` | the peer's answering `KeyUpdate`, applied |
+| `record/client/openssl/key-update/one-way` | `update_not_requested` | nothing back — the peer follows unprompted |
+
+`--expect-key-updates N` asserts the *receiving* half: it requires the engine
+to have advanced its own read secret N times, which only happens by processing
+a real `KeyUpdate` from the peer. Both halves are asserted together, since
+either alone is satisfiable without the mechanism working.
+
+The server-role row feeds its external client a second, delayed request. RFC
+8446 §4.6.3 obliges a peer receiving `update_requested` to answer "prior to
+sending its next Application Data record", so a client that has already
+stopped writing owes no reply and the row would otherwise wait for something
+the standard never required. That second request also lands *after* the
+transition, so the peer must have followed the update to send it at all.
+
+One tuple per role suffices: `KeyUpdate` advances a traffic secret through the
+negotiated suite's own HKDF, which the positive matrix already sweeps for
+every suite. What is peer-specific here is the message exchange, not the
+arithmetic.
+
 ### Negative conformance
 
 Each of these asserts the failure **class**, using the RFC 8446 §6 alert where

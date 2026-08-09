@@ -244,11 +244,34 @@ gnutls_row_in_profile() { # suite group signature
 
 # ── row runners ─────────────────────────────────────────────────────────────
 
+# What an external client feeds the native server on stdin.
+#
+# `once` is the ordinary case: one request, then EOF.
+#
+# `keep_writing` exists for the KeyUpdate rows (#357). RFC 8446 §4.6.3 obliges
+# a peer that receives `update_requested` to answer "prior to sending its next
+# Application Data record" -- so a peer that has already stopped writing owes
+# us nothing, and the row would time out waiting for a reply the standard never
+# required. The delayed second request *is* that next record, and it also
+# lands after the transition, so the peer has to have followed the update to
+# send it at all.
+peer_request_stdin() { # once|keep_writing
+  case "$1" in
+    keep_writing)
+      printf 'GET / HTTP/1.0\r\n\r\n'
+      sleep 2
+      printf 'GET / HTTP/1.0\r\nX-Key-Update-Probe: 1\r\n\r\n'
+      sleep 2
+      ;;
+    *) printf 'GET / HTTP/1.0\r\n\r\n' ;;
+  esac
+}
+
 # native TLS server <- external client
 run_server_row() { # name peer suite group signature [extra native args...]
   local name="$1" peer="$2" suite="$3" group="$4" sig="$5"
   shift 5
-  local p log cert peer_groups
+  local p log cert peer_groups peer_stdin
   next_port; p="$port"
   log="$logs/${name//\//_}"
   cert="$(cert_for_signature "$sig")"
@@ -256,6 +279,8 @@ run_server_row() { # name peer suite group signature [extra native args...]
   # native server does not accept; ordinary rows offer the row's own group.
   peer_groups="$(openssl_group "$group")"
   case " $* " in *" --expect-hrr "*) peer_groups="P-384:$(openssl_group "$group")" ;; esac
+  peer_stdin=once
+  case " $* " in *" --key-update "*) peer_stdin=keep_writing ;; esac
 
   "$tls_tool" server --port "$p" --cert "$cert-cert.pem" --key "$cert-key.pem" \
     --cipher-suite "$suite" --group "$group" --signature "$sig" \
@@ -270,14 +295,14 @@ run_server_row() { # name peer suite group signature [extra native args...]
 
   case "$peer" in
     openssl)
-      printf 'GET / HTTP/1.0\r\n\r\n' | "$openssl_bin" s_client -connect "127.0.0.1:$p" \
+      peer_request_stdin "$peer_stdin" | "$openssl_bin" s_client -connect "127.0.0.1:$p" \
         -servername tardigrade.test -tls1_3 \
         -ciphersuites "$(openssl_suite "$suite")" -groups "$peer_groups" \
         -sigalgs "$(openssl_sigalg "$sig")" -alpn http/1.1 \
         -CAfile "$cert-cert.pem" > "$log.peer" 2>&1
       ;;
     gnutls)
-      printf 'GET / HTTP/1.0\r\n\r\n' | "$gnutls_cli" --port "$p" \
+      peer_request_stdin "$peer_stdin" | "$gnutls_cli" --port "$p" \
         --x509cafile "$cert-cert.pem" --alpn=http/1.1 --sni-hostname=tardigrade.test \
         --priority "$(gnutls_priority "$suite" "$group" "$sig")" 127.0.0.1 > "$log.peer" 2>&1
       ;;
@@ -513,6 +538,33 @@ run_server_row "record/server/openssl/hrr" openssl aes128-gcm-sha256 x25519 ed25
 # The native client omits its initial key share, forcing the peer to retry.
 run_client_row "record/client/openssl/hrr" openssl aes128-gcm-sha256 x25519 ed25519 \
   --empty-initial-key-share --expect-hrr
+
+# ── 2b. post-handshake KeyUpdate, both roles ────────────────────────────────
+
+say ""
+say "== record transport: post-handshake KeyUpdate =="
+# #357. Each row makes the native side send one KeyUpdate once the connection
+# is open and *before* its application payload, so every application byte in
+# the row crosses under the new generation -- a peer that failed to follow the
+# transition could not read the exchange at all, and the row fails.
+#
+# `--key-update requested` also obliges the peer to roll its own sending keys
+# and answer with `update_not_requested`. `--expect-key-updates 1` requires
+# that answer to have arrived and been applied, which is what exercises the
+# *receiving* half against a real implementation rather than against ourselves.
+#
+# One tuple per role is enough: KeyUpdate advances a traffic secret through the
+# negotiated suite's own HKDF, which the positive matrix above already sweeps
+# for every suite. What is peer-specific here is the message exchange, not the
+# arithmetic.
+run_server_row "record/server/openssl/key-update/reciprocal" openssl aes128-gcm-sha256 x25519 ed25519 \
+  --key-update requested --expect-key-updates 1
+run_client_row "record/client/openssl/key-update/reciprocal" openssl aes128-gcm-sha256 x25519 ed25519 \
+  --key-update requested --expect-key-updates 1
+# The one-way form: we refresh our sending keys and ask nothing back, so the
+# peer must follow the transition without being prompted to make one itself.
+run_client_row "record/client/openssl/key-update/one-way" openssl aes128-gcm-sha256 x25519 ed25519 \
+  --key-update not-requested
 
 # ── 3. negative conformance rows ────────────────────────────────────────────
 

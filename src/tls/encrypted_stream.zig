@@ -13,6 +13,7 @@ const algorithms = @import("algorithms.zig");
 const alerts = @import("alerts.zig");
 const engine = @import("engine.zig");
 const events = @import("events.zig");
+const key_update = @import("key_update.zig");
 const record_codec = @import("record_codec.zig");
 const record_epoch_bridge = @import("record_epoch_bridge.zig");
 const tls_state = @import("state.zig");
@@ -429,6 +430,10 @@ pub const PureZigRecordStream = struct {
     inbound_plaintext_provenance: PlaintextProvenanceQueue(max_plaintext_queue) = .{},
     outbound_ciphertext: ByteQueue(max_ciphertext_queue, error.CiphertextBufferFull) = .{},
     inbound_handshake: ByteQueue(max_handshake_queue, error.PlaintextBufferFull) = .{},
+    /// Proactive `KeyUpdate` policy (#357), disabled by default. See
+    /// `keyUpdateDue` — this stream reports the threshold but never acts on it
+    /// by itself.
+    key_update_limits: key_update.UsageLimits = .{},
     buffer_limits: BufferLimits = BufferLimits.defaults(),
     buffer_peaks: QueueBytes = .{},
     peak_total_owned: usize = 0,
@@ -1065,6 +1070,16 @@ pub const PureZigRecordStream = struct {
                     self.bridge.installTrafficSecret(ts.epoch, ts.direction, ts.data) catch |err| return self.fail(err);
                     self.advanceEpochOnSecret(ts.epoch, ts.direction);
                 },
+                // #357. Position in the batch is the protocol: the write-side
+                // update follows the `handshake_bytes` arm that already sealed
+                // our own `KeyUpdate` under the outgoing generation, and the
+                // read-side update follows the record the peer's `KeyUpdate`
+                // arrived in. Applying events in order is therefore what puts
+                // each direction's boundary in the right place -- this arm
+                // must not be hoisted or deferred.
+                .key_update => |update| {
+                    self.bridge.updateTrafficSecret(update.direction) catch |err| return self.fail(err);
+                },
                 .alpn => |protocol| {
                     try self.captureAlpn(protocol);
                     if (self.alpnPolicyError(protocol)) |err| {
@@ -1368,6 +1383,60 @@ pub const PureZigRecordStream = struct {
             }
         }
         return consumed;
+    }
+
+    /// Queues a locally initiated post-handshake `KeyUpdate` (#357).
+    ///
+    /// The emitted batch is applied in order by `applyDriverOutcome`: the
+    /// `KeyUpdate` record is sealed under the outgoing keys first, then the
+    /// write-side advance replaces them, so the message the peer needs in
+    /// order to follow the transition is itself readable under the generation
+    /// it is announcing the end of.
+    ///
+    /// `.update_requested` additionally obliges the peer to advance *its*
+    /// sending keys. That is the only way to refresh the keys this endpoint
+    /// *reads* under, since a direction's chain can only ever be advanced by
+    /// its sender — so a caller that wants both directions refreshed must use
+    /// this form rather than calling twice.
+    ///
+    /// Fails with `error.InvalidHandshakeState` before the handshake completes
+    /// or on a backend whose transport has no `KeyUpdate`, and `error.WouldBlock`
+    /// when the outbound queue has no room to serialize the batch atomically —
+    /// the same admission rule every other emitted handshake batch follows.
+    pub fn requestKeyUpdate(self: *PureZigRecordStream, request: key_update.Request) Error!void {
+        if (self.failed) |err| return err;
+        if (self.pending_terminal) |err| return err;
+        if (self.pending_terminal_read_error) |err| return err;
+        if (self.lifecycle != .open or !self.bridge.handshake_complete) return error.InvalidHandshakeState;
+        const driver = if (self.driverPresent()) &self.handshake_driver.? else return error.InvalidHandshakeState;
+        if (!driver.supportsKeyUpdate()) return error.InvalidHandshakeState;
+        if (!self.canReserveHandshakeOutputBatch()) return error.WouldBlock;
+        const outcome = driver.requestKeyUpdateOutcome(request);
+        try self.applyDriverOutcome(outcome);
+        try self.raisePendingTerminalError();
+    }
+
+    /// Proactive-update policy (#357). Defaults to disabled, so configuring
+    /// nothing keeps a connection's wire behavior exactly as it was.
+    pub fn setKeyUpdateLimits(self: *PureZigRecordStream, limits: key_update.UsageLimits) void {
+        self.key_update_limits = limits;
+    }
+
+    /// Whether the configured usage limit has been reached for the *sending*
+    /// direction. This is the hook, not the trigger: nothing in `drive()`
+    /// consults it, so acting on it stays an explicit `requestKeyUpdate` call
+    /// by the owner, who is the only layer that knows whether stalling the
+    /// stream to emit one is acceptable right now.
+    pub fn keyUpdateDue(self: *const PureZigRecordStream) bool {
+        return self.key_update_limits.reached(self.bridge.applicationRecordsSealed());
+    }
+
+    /// How many times each direction has advanced its application traffic
+    /// secret. Exposed for observability and tests: it distinguishes "the keys
+    /// rolled" from "the same keys are still in place", which no amount of
+    /// looking at ciphertext can.
+    pub fn keyUpdateGenerations(self: *const PureZigRecordStream) struct { read: u64, write: u64 } {
+        return .{ .read = self.bridge.read_key_generation, .write = self.bridge.write_key_generation };
     }
 
     pub fn markPeerEof(self: *PureZigRecordStream) Error!void {

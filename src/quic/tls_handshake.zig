@@ -378,6 +378,14 @@ pub const Handshake = struct {
                     if (cert_state == .invalid) return self.fail(error.CertificateInvalid);
                 },
                 .discard_epoch => |level| self.discardOrDefer(level),
+                // RFC 9001 SS6: TLS `KeyUpdate` does not exist over QUIC --
+                // QUIC carries its own key phase in the packet header
+                // (`commitApplicationReadKeyUpdate`), a separate mechanism.
+                // The engine already refuses to produce this event under a
+                // QUIC transport profile, so reaching here is an internal
+                // inconsistency, not peer input; fail closed rather than
+                // silently ignoring a key transition.
+                .key_update => return self.fail(error.InvalidHandshakeState),
                 .handshake_complete => try self.complete(),
                 // QUIC never emits this: RFC 9001 SS4.8 has the connection
                 // derive its own CRYPTO_ERROR close from the returned

@@ -342,6 +342,34 @@ pub const KeySchedule = struct {
         try crypto_provider.hkdfExpandLabel(hash, early_secret[0..n], "c e traffic", client_hello_hash, out);
     }
 
+    /// RFC 8446 §7.2: `application_traffic_secret_N+1 =
+    /// HKDF-Expand-Label(application_traffic_secret_N, "traffic upd", "",
+    /// Hash.length)` — the one-way step a post-handshake `KeyUpdate` (#357)
+    /// takes to replace one direction's application traffic secret.
+    ///
+    /// Independent of `KeySchedule` because it is: the chain is seeded by the
+    /// application traffic secret and never touches the master secret again,
+    /// so a record layer holding only the current secret can advance without
+    /// retaining the handshake's key schedule. It is also direction-agnostic
+    /// — each direction advances its own secret on its own schedule.
+    ///
+    /// `traffic_secret` and `out` must both be exactly `hash.digestLength()`
+    /// bytes and must not alias: `traffic_secret` is the HKDF PRK, re-read for
+    /// every output block, so writing the new secret over it in place would
+    /// feed later blocks a mutated key. Callers advancing a secret in place
+    /// derive into a scratch buffer and then replace.
+    pub fn nextTrafficSecret(
+        crypto_provider: provider.CryptoProvider,
+        hash: provider.Hash,
+        traffic_secret: []const u8,
+        out: []u8,
+    ) Error!void {
+        const n = hash.digestLength();
+        if (traffic_secret.len != n or out.len != n) return error.InvalidSecretLength;
+        errdefer provider.secureZero(out);
+        try crypto_provider.hkdfExpandLabel(hash, traffic_secret, "traffic upd", "", out);
+    }
+
     pub fn finishedKey(crypto_provider: provider.CryptoProvider, hash: provider.Hash, traffic_secret: []const u8, out: []u8) Error!void {
         const n = hash.digestLength();
         if (traffic_secret.len != n or out.len != n) return error.InvalidSecretLength;

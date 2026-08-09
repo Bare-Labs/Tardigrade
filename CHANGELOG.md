@@ -4,7 +4,50 @@ All notable user-facing changes to Tardigrade are documented here.
 
 ## [Unreleased]
 
+### Added
+- **TLS-over-TCP post-handshake `KeyUpdate` (#357, research story 325-H)** —
+  record-mode TLS 1.3 now sends and receives RFC 8446 §4.6.3 `KeyUpdate`,
+  advancing one direction's application traffic secret at a time along §7.2's
+  `"traffic upd"` chain. Receiving keys advance immediately after a valid
+  update is processed; sending keys advance only *after* the outgoing
+  `KeyUpdate` has been sealed, so the message that announces a transition is
+  still readable under the generation it retires. `update_requested` draws
+  exactly one reciprocal update, which always carries `update_not_requested`
+  and therefore cannot start a loop. Each transition restarts that direction's
+  record sequence at zero and zeroizes the keys and secret it replaced.
+
+  `PureZigRecordStream.requestKeyUpdate` initiates one locally;
+  `setKeyUpdateLimits`/`keyUpdateDue` expose a records-sealed threshold for
+  proactive updates. The threshold reports only — nothing fires an update on
+  its own, and it is disabled by default, so an existing connection's wire
+  behaviour is unchanged until a caller opts in. `records` is a cap on the
+  whole generation, counting the `KeyUpdate` that retires it: the predicate
+  becomes due one record early, since that message is itself sealed under the
+  keys it is retiring. A caller can therefore pass RFC 8446 §5.5's AES-GCM
+  record limit directly and get that bound, rather than exceeding it by the
+  one control record.
+
+  `KeyUpdate` is record-mode only. RFC 9001 §6 removes it from TLS-over-QUIC,
+  which carries its own key phase in the packet header, so a QUIC-profile
+  engine neither offers a way to send one nor accepts one that arrives.
+  Verified against OpenSSL in both client and server roles by three new rows in
+  the shared interop matrix.
+
 ### Fixed
+- **A peer's `KeyUpdate` failed any connection that had not opted into session
+  tickets (#357)** — post-handshake message reassembly always allocated, and
+  the allocator is only installed by a client that configured a session-ticket
+  consumer. Since any peer may send a `KeyUpdate` on any completed connection,
+  an endpoint that simply did not use tickets would fail the connection the
+  moment a conforming peer rotated its keys. Messages that fit inline (today,
+  exactly `KeyUpdate`) now reassemble without an allocator. A `KeyUpdate`
+  declaring a body of any other length is rejected as a framing error before a
+  buffer is chosen — at *every* declared length, including one past the generic
+  post-handshake size cap, which would otherwise have been classified as a
+  buffer overflow and terminated the connection locally without the RFC's
+  `decode_error` alert. The failure class therefore no longer depends on the
+  declared length or on whether tickets were configured, and an attacker-chosen
+  length is never buffered for a five-byte message.
 - **HelloRetryRequest handshakes failed against compatibility-mode TLS clients
   (#338)** — RFC 8446 §5.1 has a client send `change_cipher_spec` immediately
   after receiving a HelloRetryRequest, before ClientHello2. An HRR flight

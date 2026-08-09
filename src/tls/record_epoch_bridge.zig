@@ -12,14 +12,16 @@ const crypto = @import("crypto");
 const algorithms = @import("algorithms.zig");
 const engine = @import("engine.zig");
 const events = @import("events.zig");
+const key_schedule = @import("key_schedule.zig");
 const record_codec = @import("record_codec.zig");
 const record_protection = @import("record_protection.zig");
 const tls_state = @import("state.zig");
 const transport = @import("transport.zig");
 
 const provider = crypto.provider;
+const secrets = crypto.secrets;
 
-pub const Error = record_codec.Error || record_protection.Error || error{
+pub const Error = record_codec.Error || record_protection.Error || key_schedule.Error || error{
     UnsupportedRecordEpoch,
     DuplicateTrafficSecret,
     MissingReadKeys,
@@ -30,7 +32,20 @@ pub const Error = record_codec.Error || record_protection.Error || error{
     UnexpectedRecordContent,
     EpochAlreadyDiscarded,
     EpochDiscardTooEarly,
+    /// A `KeyUpdate` arrived for a direction whose application traffic secret
+    /// is not (or no longer) retained, so the `"traffic upd"` chain cannot be
+    /// advanced. Distinct from `MissingApplicationKeys`: the derived record
+    /// keys may well still exist — it is the *secret* they came from that is
+    /// gone, which is exactly the state an orderly discard leaves behind.
+    MissingTrafficSecret,
 };
+
+/// One direction's retained application traffic secret, kept alongside the
+/// derived record keys purely so `KeyUpdate` can walk RFC 8446 §7.2's
+/// `"traffic upd"` chain (#357). Handshake- and 0-RTT-epoch secrets are never
+/// retained: neither epoch can be updated, so keeping their secrets past key
+/// derivation would extend their lifetime for no protocol reason.
+const TrafficSecret = secrets.FixedSecret(provider.max_digest_len);
 
 pub const OpenedRecord = struct {
     epoch: events.EncryptionEpoch,
@@ -53,6 +68,17 @@ pub const Bridge = struct {
     write_zero_rtt: ?record_protection.WriteState = null,
     read_application: ?record_protection.ReadState = null,
     write_application: ?record_protection.WriteState = null,
+    /// Retained application traffic secrets, the input to the next `KeyUpdate`
+    /// (#357). Kept per direction because each direction advances its own
+    /// chain independently and at its own time.
+    read_application_secret: TrafficSecret = .{},
+    write_application_secret: TrafficSecret = .{},
+    /// How many times each direction has advanced past the handshake's
+    /// original application traffic secret (0 = `application_traffic_secret_0`).
+    /// Observable state, not a limit: it lets a caller — and this module's
+    /// tests — tell "the keys changed" from "the same keys were reinstalled".
+    read_key_generation: u64 = 0,
+    write_key_generation: u64 = 0,
     read_phase: DirectionPhase = .initial,
     write_phase: DirectionPhase = .initial,
     initial_discarded: bool = false,
@@ -94,6 +120,8 @@ pub const Bridge = struct {
         clearWrite(&self.write_zero_rtt);
         clearRead(&self.read_application);
         clearWrite(&self.write_application);
+        self.read_application_secret.deinit();
+        self.write_application_secret.deinit();
         self.initial_discarded = true;
         self.handshake_discarded = true;
         self.application_discarded = true;
@@ -113,6 +141,12 @@ pub const Bridge = struct {
             .negotiated_parameters, .early_data_parameters => |params| self.cipher_suite = algorithms.fromInt(algorithms.CipherSuite, params.cipher_suite) orelse
                 return error.UnsupportedRecordEpoch,
             .traffic_secret => |traffic_secret| try self.installTrafficSecret(traffic_secret.epoch, traffic_secret.direction, traffic_secret.data),
+            // Ordering is the protocol here (`events.KeyUpdate`): this arrives
+            // after the peer's `KeyUpdate` was opened (`.read`) or after our
+            // own was sealed by the `handshake_bytes` arm above (`.write`), so
+            // applying it in event order is what puts the boundary in the
+            // right place.
+            .key_update => |update| try self.updateTrafficSecret(update.direction),
             .discard_epoch => |epoch| try self.discardEpoch(epoch),
             .handshake_complete => try self.markHandshakeComplete(),
             .alpn,
@@ -148,11 +182,16 @@ pub const Bridge = struct {
                 .read => {
                     if (self.read_phase != .handshake or self.handshake_discarded or self.application_discarded) return error.InvalidEpochTransition;
                     try self.installRead(&self.read_application, traffic_secret);
+                    // Retained only after the keys derived successfully, so a
+                    // failed install never leaves a secret behind that a later
+                    // `KeyUpdate` could advance off of.
+                    self.read_application_secret.replace(traffic_secret) catch return error.InvalidTrafficSecretLength;
                     self.read_phase = .application;
                 },
                 .write => {
                     if (self.write_phase != .handshake or self.handshake_discarded or self.application_discarded) return error.InvalidEpochTransition;
                     try self.installWrite(&self.write_application, traffic_secret);
+                    self.write_application_secret.replace(traffic_secret) catch return error.InvalidTrafficSecretLength;
                     self.write_phase = .application;
                 },
             },
@@ -200,6 +239,8 @@ pub const Bridge = struct {
                 }
                 clearRead(&self.read_application);
                 clearWrite(&self.write_application);
+                self.read_application_secret.deinit();
+                self.write_application_secret.deinit();
                 self.application_discarded = true;
                 self.read_phase = .initial;
                 self.write_phase = .initial;
@@ -227,6 +268,75 @@ pub const Bridge = struct {
         self.handshake_complete = true;
         self.read_phase = .complete;
         self.write_phase = .complete;
+    }
+
+    /// Advances `direction`'s application traffic secret one step along RFC
+    /// 8446 §7.2's chain and rebuilds that direction's record keys from it
+    /// (#357).
+    ///
+    /// The transition is all-or-nothing. The new secret and the new keys are
+    /// both derived into scratch *before* anything installed is touched, so a
+    /// provider failure anywhere leaves the direction still protecting traffic
+    /// under the generation it had — a half-updated direction would be
+    /// undecryptable in both generations at once.
+    ///
+    /// On success the previous keys are zeroized (`WriteState.deinit`/
+    /// `ReadState.deinit` wipe their `TrafficKeys`), the previous secret is
+    /// overwritten in place by `FixedSecret.replace`, and the record sequence
+    /// restarts at zero — RFC 8446 §5.3's requirement, since the nonce is the
+    /// static IV XOR the sequence and a fresh key must not reuse a nonce that
+    /// key never used, but also must start counting again rather than carry
+    /// the old count forward.
+    ///
+    /// Only the application epoch can be updated, and only on a live,
+    /// completed, not-torn-down session: `KeyUpdate` is defined solely as a
+    /// post-handshake message, so a pre-handshake or post-teardown call is a
+    /// state error rather than a no-op.
+    pub fn updateTrafficSecret(self: *Bridge, direction: events.SecretDirection) Error!void {
+        if (self.torn_down or self.application_discarded) return error.InvalidEpochTransition;
+        if (!self.handshake_complete) return error.HandshakeNotComplete;
+
+        const hash = record_protection.suiteProfile(self.cipher_suite).hash;
+        var next: [provider.max_digest_len]u8 = undefined;
+        defer provider.secureZero(&next);
+        const digest_len = hash.digestLength();
+
+        switch (direction) {
+            .read => {
+                const state = self.readApplication() orelse return error.MissingReadKeys;
+                const current = self.read_application_secret.slice();
+                if (current.len == 0) return error.MissingTrafficSecret;
+                try key_schedule.KeySchedule.nextTrafficSecret(self.crypto_provider, hash, current, next[0..digest_len]);
+                var keys = try record_protection.TrafficKeys.derive(self.crypto_provider, self.cipher_suite, next[0..digest_len]);
+                errdefer keys.deinit();
+                self.read_application_secret.replace(next[0..digest_len]) catch return error.InvalidTrafficSecretLength;
+                state.deinit();
+                state.* = record_protection.ReadState.init(self.crypto_provider, keys);
+                self.read_key_generation += 1;
+            },
+            .write => {
+                const state = self.writeApplication() orelse return error.MissingWriteKeys;
+                const current = self.write_application_secret.slice();
+                if (current.len == 0) return error.MissingTrafficSecret;
+                try key_schedule.KeySchedule.nextTrafficSecret(self.crypto_provider, hash, current, next[0..digest_len]);
+                var keys = try record_protection.TrafficKeys.derive(self.crypto_provider, self.cipher_suite, next[0..digest_len]);
+                errdefer keys.deinit();
+                self.write_application_secret.replace(next[0..digest_len]) catch return error.InvalidTrafficSecretLength;
+                state.deinit();
+                state.* = record_protection.WriteState.init(self.crypto_provider, keys);
+                self.write_key_generation += 1;
+            },
+        }
+    }
+
+    /// Records sealed under the current write generation — i.e. the write
+    /// state's next sequence number, which a `KeyUpdate` reset to zero. This
+    /// is the input `key_update.UsageLimits.reached` is written against, kept
+    /// as an accessor rather than a mirrored counter so proactive-update
+    /// policy can never disagree with the sequence feeding the record nonce.
+    pub fn applicationRecordsSealed(self: *const Bridge) u64 {
+        const state = self.write_application orelse return 0;
+        return state.sequence;
     }
 
     pub fn sealHandshake(self: *Bridge, epoch: events.EncryptionEpoch, bytes: []const u8, out: []u8) Error![]const u8 {
@@ -1085,6 +1195,10 @@ test "record epoch bridge shuttles protocol-neutral driver events through record
                     .early_data_parameters => |params| {
                         var scratch: [1]u8 = undefined;
                         _ = try sender_bridge.applyEvent(.{ .early_data_parameters = params }, &scratch);
+                    },
+                    .key_update => |update| {
+                        var scratch: [1]u8 = undefined;
+                        _ = try sender_bridge.applyEvent(.{ .key_update = update }, &scratch);
                     },
                     .peer_transport_parameters,
                     .alpn,
@@ -1972,4 +2086,298 @@ test "record epoch bridge cannot reinstall zero-rtt keys after teardown" {
     defer fresh.deinit();
     try fresh.installTrafficSecret(.zero_rtt, .write, &early);
     try testing.expect(fresh.hasWriteKeys(.zero_rtt));
+}
+
+// ── KeyUpdate: application traffic secret advancement (#357) ────────────────
+
+/// A bridge pair carried to a completed handshake with the given application
+/// secrets, so a `KeyUpdate` test starts from the only state `KeyUpdate` is
+/// ever legal in. `a`'s write secret is `b`'s read secret and vice versa,
+/// which is what makes an update on one side observable on the other.
+fn establishedPair(
+    a: *Bridge,
+    b: *Bridge,
+    a_to_b: []const u8,
+    b_to_a: []const u8,
+) !void {
+    const hs_a_to_b = secret(0x01);
+    const hs_b_to_a = secret(0x02);
+    for ([_]struct { bridge: *Bridge, write: []const u8, read: []const u8 }{
+        .{ .bridge = a, .write = &hs_a_to_b, .read = &hs_b_to_a },
+        .{ .bridge = b, .write = &hs_b_to_a, .read = &hs_a_to_b },
+    }) |side| {
+        try side.bridge.installTrafficSecret(.handshake, .write, side.write);
+        try side.bridge.installTrafficSecret(.handshake, .read, side.read);
+    }
+    try a.installTrafficSecret(.application, .write, a_to_b);
+    try a.installTrafficSecret(.application, .read, b_to_a);
+    try b.installTrafficSecret(.application, .write, b_to_a);
+    try b.installTrafficSecret(.application, .read, a_to_b);
+    for ([_]*Bridge{ a, b }) |bridge| {
+        try bridge.discardEpoch(.initial);
+        try bridge.discardEpoch(.handshake);
+        try bridge.markHandshakeComplete();
+    }
+}
+
+/// RFC 8446 §7.2's `"traffic upd"` step, computed independently of the module
+/// under test so a test cannot pass by agreeing with a wrong implementation.
+fn expectedNextSecret(current: [32]u8) [32]u8 {
+    const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
+    return std.crypto.tls.hkdfExpandLabel(HkdfSha256, current, "traffic upd", "", 32);
+}
+
+fn sealOne(bridge: *Bridge, plaintext: []const u8, out: []u8) ![]const u8 {
+    return bridge.sealApplicationData(plaintext, out);
+}
+
+test "key update advances one direction along the RFC 8446 traffic-upd chain" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    const c2s = secret(0x33);
+    const s2c = secret(0x44);
+    try establishedPair(&client, &server, &c2s, &s2c);
+
+    // The client updates its *sending* keys; the server updates the matching
+    // *receiving* keys. Every other direction is untouched -- a one-way
+    // update must not disturb the reverse direction's chain.
+    try client.updateTrafficSecret(.write);
+    try server.updateTrafficSecret(.read);
+
+    const expected = expectedNextSecret(c2s);
+    try testing.expectEqualSlices(u8, &expected, client.write_application_secret.slice());
+    try testing.expectEqualSlices(u8, &expected, server.read_application_secret.slice());
+    try expectAes128TrafficKeys(expected, client.write_application.?.keys);
+    try expectAes128TrafficKeys(expected, server.read_application.?.keys);
+
+    // The reverse direction stayed on generation 0.
+    try testing.expectEqualSlices(u8, &s2c, server.write_application_secret.slice());
+    try testing.expectEqualSlices(u8, &s2c, client.read_application_secret.slice());
+    try testing.expectEqual(@as(u64, 1), client.write_key_generation);
+    try testing.expectEqual(@as(u64, 1), server.read_key_generation);
+    try testing.expectEqual(@as(u64, 0), client.read_key_generation);
+    try testing.expectEqual(@as(u64, 0), server.write_key_generation);
+
+    // Traffic still flows, under the new keys, in both directions.
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const forward = try parseSingleRecord(.ciphertext, try sealOne(&client, "after update", &protected));
+    try testing.expectEqualStrings("after update", (try server.openApplicationData(forward, &plaintext)).inner.content);
+    const back = try parseSingleRecord(.ciphertext, try sealOne(&server, "still fine", &protected));
+    try testing.expectEqualStrings("still fine", (try client.openApplicationData(back, &plaintext)).inner.content);
+}
+
+test "key update restarts the record sequence and retires the previous keys" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    const c2s = secret(0x51);
+    const s2c = secret(0x52);
+    try establishedPair(&client, &server, &c2s, &s2c);
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+
+    // Move both sides off sequence zero so the reset is observable as a
+    // change rather than as a value that happened to already hold.
+    for (0..3) |_| {
+        const record = try parseSingleRecord(.ciphertext, try sealOne(&client, "pre", &protected));
+        _ = try server.openApplicationData(record, &plaintext);
+    }
+    try testing.expectEqual(@as(u64, 3), client.write_application.?.sequence);
+    try testing.expectEqual(@as(u64, 3), server.read_application.?.sequence);
+
+    // A record sealed under the old keys, captured *before* the transition.
+    var stale_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const stale_bytes = try sealOne(&client, "old generation", &stale_buf);
+    var stale_copy: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    @memcpy(stale_copy[0..stale_bytes.len], stale_bytes);
+    const stale = try parseSingleRecord(.ciphertext, stale_copy[0..stale_bytes.len]);
+
+    try client.updateTrafficSecret(.write);
+    try server.updateTrafficSecret(.read);
+
+    // RFC 8446 §5.3: the new key starts counting from zero again.
+    try testing.expectEqual(@as(u64, 0), client.write_application.?.sequence);
+    try testing.expectEqual(@as(u64, 0), server.read_application.?.sequence);
+
+    // The old keys are gone on the receiving side: a record sealed under the
+    // previous generation no longer authenticates.
+    try testing.expectError(error.AuthenticationFailed, server.openApplicationData(stale, &plaintext));
+
+    // ...and sequence semantics resume normally from the new zero.
+    const fresh = try parseSingleRecord(.ciphertext, try sealOne(&client, "new generation", &protected));
+    try testing.expectEqualStrings("new generation", (try server.openApplicationData(fresh, &plaintext)).inner.content);
+    try testing.expectEqual(@as(u64, 1), client.write_application.?.sequence);
+    try testing.expectEqual(@as(u64, 1), server.read_application.?.sequence);
+}
+
+test "repeated key updates keep both directions walking the same chain" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    const c2s = secret(0x61);
+    const s2c = secret(0x62);
+    try establishedPair(&client, &server, &c2s, &s2c);
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    var expected_c2s = c2s;
+    var expected_s2c = s2c;
+
+    // Simultaneous updates: each round advances both directions, which is the
+    // state two endpoints reach when their updates cross on the wire.
+    for (1..9) |round| {
+        try client.updateTrafficSecret(.write);
+        try server.updateTrafficSecret(.read);
+        try server.updateTrafficSecret(.write);
+        try client.updateTrafficSecret(.read);
+        expected_c2s = expectedNextSecret(expected_c2s);
+        expected_s2c = expectedNextSecret(expected_s2c);
+
+        try testing.expectEqualSlices(u8, &expected_c2s, client.write_application_secret.slice());
+        try testing.expectEqualSlices(u8, &expected_c2s, server.read_application_secret.slice());
+        try testing.expectEqualSlices(u8, &expected_s2c, server.write_application_secret.slice());
+        try testing.expectEqualSlices(u8, &expected_s2c, client.read_application_secret.slice());
+        try testing.expectEqual(round, client.write_key_generation);
+        try testing.expectEqual(round, client.read_key_generation);
+
+        const forward = try parseSingleRecord(.ciphertext, try sealOne(&client, "c2s", &protected));
+        try testing.expectEqualStrings("c2s", (try server.openApplicationData(forward, &plaintext)).inner.content);
+        const back = try parseSingleRecord(.ciphertext, try sealOne(&server, "s2c", &protected));
+        try testing.expectEqualStrings("s2c", (try client.openApplicationData(back, &plaintext)).inner.content);
+    }
+}
+
+test "a direction that skipped an update cannot read the peer's next generation" {
+    // The chain is one-way and per-direction: falling one step behind is not
+    // recoverable by the record layer, which is exactly why the transition
+    // point has to be exact rather than approximately right.
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    const c2s = secret(0x71);
+    const s2c = secret(0x72);
+    try establishedPair(&client, &server, &c2s, &s2c);
+
+    try client.updateTrafficSecret(.write);
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const record = try parseSingleRecord(.ciphertext, try sealOne(&client, "generation 1", &protected));
+    try testing.expectError(error.AuthenticationFailed, server.openApplicationData(record, &plaintext));
+}
+
+test "key update replaces key material without leaving the previous generation in the bridge" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    const c2s = secret(0x81);
+    const s2c = secret(0x82);
+    try establishedPair(&client, &server, &c2s, &s2c);
+
+    var old_secret: [32]u8 = undefined;
+    @memcpy(&old_secret, client.write_application_secret.slice());
+    var old_key: [16]u8 = undefined;
+    @memcpy(&old_key, client.write_application.?.keys.key.slice());
+    var old_iv: [provider.aead_nonce_len]u8 = undefined;
+    @memcpy(&old_iv, client.write_application.?.keys.iv.slice());
+
+    try client.updateTrafficSecret(.write);
+
+    // Every byte string the previous generation consisted of must be absent
+    // from the bridge's entire footprint -- not merely absent from the slot it
+    // used to occupy, which a "keep the old keys for late records" change
+    // would still satisfy while leaving retired material live.
+    const footprint = std.mem.asBytes(&client);
+    try testing.expect(std.mem.indexOf(u8, footprint, &old_secret) == null);
+    try testing.expect(std.mem.indexOf(u8, footprint, &old_key) == null);
+    try testing.expect(std.mem.indexOf(u8, footprint, &old_iv) == null);
+    // The new generation is present, so the search above is a real search.
+    try testing.expect(std.mem.indexOf(u8, footprint, &expectedNextSecret(c2s)) != null);
+
+    // Teardown after an update still wipes whatever generation is current.
+    var current_secret: [32]u8 = undefined;
+    @memcpy(&current_secret, client.write_application_secret.slice());
+    client.deinit();
+    try testing.expect(std.mem.indexOf(u8, footprint, &current_secret) == null);
+    try testing.expect(client.write_application == null);
+    try testing.expectEqual(@as(usize, 0), client.write_application_secret.slice().len);
+}
+
+test "key update is rejected outside a live, completed application epoch" {
+    const cp = testProvider();
+
+    // Before the handshake completes there is no application epoch to update.
+    var early = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer early.deinit();
+    try testing.expectError(error.HandshakeNotComplete, early.updateTrafficSecret(.write));
+    try testing.expectError(error.HandshakeNotComplete, early.updateTrafficSecret(.read));
+    const hs = secret(0x91);
+    try early.installTrafficSecret(.handshake, .write, &hs);
+    try early.installTrafficSecret(.handshake, .read, &hs);
+    try testing.expectError(error.HandshakeNotComplete, early.updateTrafficSecret(.write));
+    const app = secret(0x92);
+    try early.installTrafficSecret(.application, .write, &app);
+    try early.installTrafficSecret(.application, .read, &app);
+    // Application keys exist, but `handshake_complete` has not been marked --
+    // `KeyUpdate` is post-handshake by definition, so key presence alone is
+    // not enough.
+    try testing.expectError(error.HandshakeNotComplete, early.updateTrafficSecret(.write));
+
+    // After teardown the session is over in both directions.
+    var torn = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    var peer = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer peer.deinit();
+    const c2s = secret(0x93);
+    const s2c = secret(0x94);
+    try establishedPair(&torn, &peer, &c2s, &s2c);
+    try torn.updateTrafficSecret(.write);
+    torn.deinit();
+    try testing.expectError(error.InvalidEpochTransition, torn.updateTrafficSecret(.write));
+    try testing.expectError(error.InvalidEpochTransition, torn.updateTrafficSecret(.read));
+
+    // Orderly application-epoch discard is teardown too, and drops the
+    // retained secrets along with the keys.
+    var closed = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer closed.deinit();
+    var closed_peer = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer closed_peer.deinit();
+    try establishedPair(&closed, &closed_peer, &c2s, &s2c);
+    try closed.discardEpoch(.application);
+    try testing.expectEqual(@as(usize, 0), closed.write_application_secret.slice().len);
+    try testing.expectError(error.InvalidEpochTransition, closed.updateTrafficSecret(.write));
+}
+
+test "applicationRecordsSealed tracks the current generation's sequence for usage limits" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    const c2s = secret(0xa1);
+    const s2c = secret(0xa2);
+
+    // No application keys yet: nothing has been sealed.
+    try testing.expectEqual(@as(u64, 0), client.applicationRecordsSealed());
+    try establishedPair(&client, &server, &c2s, &s2c);
+    try testing.expectEqual(@as(u64, 0), client.applicationRecordsSealed());
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    for (0..5) |_| _ = try sealOne(&client, "x", &protected);
+    try testing.expectEqual(@as(u64, 5), client.applicationRecordsSealed());
+    // The counter is the write sequence itself, so an update resets it with
+    // the sequence rather than tracking a lifetime total.
+    try client.updateTrafficSecret(.write);
+    try testing.expectEqual(@as(u64, 0), client.applicationRecordsSealed());
 }

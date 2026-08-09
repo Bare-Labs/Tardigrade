@@ -29,6 +29,7 @@ const crypto_pkg = @import("crypto");
 const tls_handshake_codec = @import("handshake.zig");
 const hello_retry = @import("hello_retry.zig");
 const tls_key_schedule = @import("key_schedule.zig");
+const key_update = @import("key_update.zig");
 const new_session_ticket = @import("new_session_ticket.zig");
 const pre_shared_key = @import("pre_shared_key.zig");
 const session = @import("session.zig");
@@ -116,8 +117,36 @@ const PostHandshakeInput = struct {
     buf_allocator: ?std.mem.Allocator = null,
     header: [handshake_header_len]u8 = undefined,
     header_len: usize = 0,
+    /// Heap storage, used only for a message too large to reassemble inline.
     buf: []u8 = &.{},
+    /// Frame length when the message fits `inline_buf`, 0 otherwise. Held as
+    /// a length rather than a slice so this struct never contains a pointer
+    /// into itself: `Tls13Backend` values are built in place and assigned by
+    /// value, and a self-referential slice would not survive that.
+    inline_len: usize = 0,
+    inline_buf: [inline_capacity]u8 = undefined,
     len: usize = 0,
+
+    /// Largest post-handshake message reassembled without an allocator.
+    ///
+    /// `KeyUpdate` (#357) is five bytes, and *any* peer may send one on *any*
+    /// completed connection at any time — unlike `NewSessionTicket`, which
+    /// only arrives because this endpoint asked for tickets and therefore
+    /// configured `setPostHandshakeAllocator`. Routing it through the
+    /// allocator too would fail every connection whose owner simply does not
+    /// use tickets, the moment a conforming peer rotates its keys.
+    const inline_capacity = key_update.message_len;
+
+    /// The reassembly frame currently in use, empty when no message has been
+    /// framed yet.
+    fn frame(self: *const PostHandshakeInput) []const u8 {
+        if (self.inline_len > 0) return self.inline_buf[0..self.inline_len];
+        return self.buf;
+    }
+
+    fn capacity(self: *const PostHandshakeInput) usize {
+        return self.frame().len;
+    }
 
     fn setAllocator(self: *PostHandshakeInput, allocator: std.mem.Allocator) HandshakeError!void {
         if (self.buf.len > 0 and !sameAllocator(self.buf_allocator.?, allocator)) return error.InvalidHandshakeState;
@@ -126,16 +155,17 @@ const PostHandshakeInput = struct {
 
     fn deinit(self: *PostHandshakeInput) void {
         if (self.buf.len > 0) crypto_pkg.secrets.secureZeroAndFree(self.buf_allocator.?, self.buf);
+        if (self.inline_len > 0) crypto.secureZero(u8, self.inline_buf[0..self.inline_len]);
         if (self.header_len > 0) crypto.secureZero(u8, self.header[0..self.header_len]);
         self.* = .{};
     }
 
     fn append(self: *PostHandshakeInput, bytes: []const u8) HandshakeError!usize {
-        if (self.buf.len > 0 and self.len == self.buf.len) return 0;
+        if (self.capacity() > 0 and self.len == self.capacity()) return 0;
         var rest = bytes;
         const original_len = bytes.len;
         while (rest.len > 0) {
-            if (self.buf.len == 0) {
+            if (self.capacity() == 0) {
                 if (self.header_len < handshake_header_len) {
                     const take = @min(handshake_header_len - self.header_len, rest.len);
                     @memcpy(self.header[self.header_len..][0..take], rest[0..take]);
@@ -145,34 +175,69 @@ const PostHandshakeInput = struct {
                 }
                 const body_len: usize = @intCast(std.mem.readInt(u24, self.header[1..4], .big));
                 const frame_len = handshake_header_len + body_len;
+                // `KeyUpdate` has exactly one legal framed length (RFC 8446
+                // §4.6.3, #357), so its own length check runs *before* the
+                // generic post-handshake size cap below — the message type is
+                // already known from the header, and type-specific framing is
+                // the more precise classification.
+                //
+                // Order matters for two reasons beyond tidiness. The cap
+                // raises `HandshakeBufferOverflow`, which `mappedFatalAlert`
+                // does not map, so a `KeyUpdate` declaring a body past the cap
+                // would terminate locally with no `decode_error` alert on the
+                // wire. And checking here — before a buffer is chosen — is
+                // what makes the failure class independent of whether this
+                // endpoint configured a post-handshake allocator, rather than
+                // an over-long body falling to the allocator path and
+                // surfacing as a missing allocator instead. Every non-1-byte
+                // body is a framing error, at every declared length.
+                if (self.header[0] == @intFromEnum(MessageType.key_update) and frame_len != key_update.message_len) {
+                    return error.MalformedHandshake;
+                }
                 if (frame_len > max_new_session_ticket_message_len) return error.HandshakeBufferOverflow;
-                const allocator = self.allocator orelse return error.InvalidHandshakeState;
-                self.buf = allocator.alloc(u8, frame_len) catch return error.CredentialProviderFailed;
-                self.buf_allocator = allocator;
-                @memcpy(self.buf[0..handshake_header_len], &self.header);
+                if (frame_len <= inline_capacity) {
+                    self.inline_len = frame_len;
+                } else {
+                    const allocator = self.allocator orelse return error.InvalidHandshakeState;
+                    self.buf = allocator.alloc(u8, frame_len) catch return error.CredentialProviderFailed;
+                    self.buf_allocator = allocator;
+                }
+                @memcpy(self.writable()[0..handshake_header_len], &self.header);
                 self.len = handshake_header_len;
                 crypto.secureZero(u8, &self.header);
                 self.header_len = 0;
             }
-            const take = @min(self.buf.len - self.len, rest.len);
-            @memcpy(self.buf[self.len..][0..take], rest[0..take]);
+            const take = @min(self.capacity() - self.len, rest.len);
+            @memcpy(self.writable()[self.len..][0..take], rest[0..take]);
             self.len += take;
             rest = rest[take..];
-            if (self.len == self.buf.len) break;
+            if (self.len == self.capacity()) break;
         }
         return original_len - rest.len;
     }
 
+    fn writable(self: *PostHandshakeInput) []u8 {
+        if (self.inline_len > 0) return self.inline_buf[0..self.inline_len];
+        return self.buf;
+    }
+
     fn peek(self: *PostHandshakeInput) tls_handshake_codec.Error!?tls_handshake_codec.Message {
-        if (self.buf.len == 0 or self.len < self.buf.len) return null;
-        return try tls_handshake_codec.decode(self.buf[0..self.len]);
+        const cap = self.capacity();
+        if (cap == 0 or self.len < cap) return null;
+        return try tls_handshake_codec.decode(self.frame()[0..self.len]);
     }
 
     fn discard(self: *PostHandshakeInput, len: usize) tls_handshake_codec.Error!void {
-        if (self.buf.len == 0 or len != self.buf.len) return error.MalformedHandshake;
-        crypto_pkg.secrets.secureZeroAndFree(self.buf_allocator.?, self.buf);
-        self.buf_allocator = null;
-        self.buf = &.{};
+        const cap = self.capacity();
+        if (cap == 0 or len != cap) return error.MalformedHandshake;
+        if (self.inline_len > 0) {
+            crypto.secureZero(u8, self.inline_buf[0..self.inline_len]);
+            self.inline_len = 0;
+        } else {
+            crypto_pkg.secrets.secureZeroAndFree(self.buf_allocator.?, self.buf);
+            self.buf_allocator = null;
+            self.buf = &.{};
+        }
         self.len = 0;
     }
 };
@@ -1537,7 +1602,21 @@ pub const Tls13Backend = struct {
             .earlyDataMaxBytesFn = earlyDataMaxBytesImpl,
             .earlyDataDiscardLimitFn = earlyDataDiscardLimitImpl,
             .helloRetryRequestSentFn = helloRetryRequestSentImpl,
+            // Wired only under the record profile, so `supportsKeyUpdate` is
+            // an honest answer rather than a slot that always exists and then
+            // refuses: RFC 9001 §6 gives TLS-over-QUIC no `KeyUpdate` at all
+            // (#357). `requestKeyUpdate` re-checks the profile anyway, since
+            // it is also reachable directly.
+            .requestKeyUpdateFn = switch (self.profile) {
+                .record => requestKeyUpdateImpl,
+                .extension => null,
+            },
         };
+    }
+
+    fn requestKeyUpdateImpl(ptr: *anyopaque, request: key_update.Request, sink: *EventSink) HandshakeError!void {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.requestKeyUpdate(request, sink);
     }
 
     /// #338: a server has sent a HelloRetryRequest, which it only does after
@@ -2287,7 +2366,7 @@ pub const Tls13Backend = struct {
             .certificate_verify,
             .finished,
             => .handshake,
-            .new_session_ticket => .application,
+            .new_session_ticket, .key_update => .application,
             else => error.UnexpectedHandshakeMessage,
         };
     }
@@ -2428,6 +2507,11 @@ pub const Tls13Backend = struct {
             return;
         }
 
+        if (kind == .key_update) {
+            try self.onKeyUpdate(body, sink);
+            return;
+        }
+
         // Message ordering has already been enforced by `core.acceptReceived`.
         // Dispatch the shared TLS semantics; transport extension contents stay
         // opaque and are consumed by the owning adapter.
@@ -2448,6 +2532,69 @@ pub const Tls13Backend = struct {
             },
             else => return error.UnexpectedHandshakeMessage,
         }
+    }
+
+    /// Post-handshake `KeyUpdate` (RFC 8446 §4.6.3, #357).
+    ///
+    /// Emits `key_update{.read}` so the transport advances its *receiving*
+    /// keys for everything after the record this message arrived in, and — if
+    /// the peer asked — an answering `KeyUpdate` plus `key_update{.write}` for
+    /// its *sending* keys. The answer always carries `update_not_requested`,
+    /// which is what makes the exchange terminate: a reciprocal update cannot
+    /// itself request another, so two endpoints can never trade updates
+    /// indefinitely off a single request.
+    fn onKeyUpdate(self: *Tls13Backend, body: []const u8, sink: *EventSink) HandshakeError!void {
+        // RFC 9001 §6 removes `KeyUpdate` from TLS-over-QUIC: QUIC updates
+        // keys with the packet-header key phase instead, and a QUIC endpoint
+        // receiving this message "MUST terminate the connection with error
+        // code 0x010a" — the `unexpected_message` alert's QUIC equivalent.
+        // Checked before decoding: in QUIC mode the message is illegal
+        // whatever it says, so a malformed body must not turn this into a
+        // decode failure and mask which rule was actually broken.
+        switch (self.profile) {
+            .record => {},
+            .extension => return error.UnexpectedHandshakeMessage,
+        }
+        const request = try key_update.decode(body);
+        try sink.emitKeyUpdate(.read);
+        if (request == .update_requested) {
+            try self.emitKeyUpdateMessage(.update_not_requested, sink);
+        }
+    }
+
+    /// Starts a locally initiated key update: queues a `KeyUpdate` at the
+    /// application epoch and the `key_update{.write}` that advances our
+    /// sending keys behind it.
+    ///
+    /// `request` is the caller's policy. `.update_not_requested` refreshes
+    /// only this endpoint's sending keys; `.update_requested` also obliges the
+    /// peer to refresh its own (RFC 8446 §4.6.3), which is the form a caller
+    /// acting on `key_update.UsageLimits` for the *receiving* direction wants,
+    /// since only the peer can advance the keys we read under.
+    ///
+    /// Record mode only, and only once the handshake is complete — `KeyUpdate`
+    /// has no meaning before then, and the application epoch it must be sealed
+    /// under does not exist yet.
+    pub fn requestKeyUpdate(self: *Tls13Backend, request: key_update.Request, sink: *EventSink) HandshakeError!void {
+        switch (self.profile) {
+            .record => {},
+            .extension => return error.InvalidHandshakeState,
+        }
+        if (self.core.handshake_lifecycle != .complete) return error.InvalidHandshakeState;
+        return self.emitKeyUpdateMessage(request, sink);
+    }
+
+    /// Emits the message and then the write-side advance, in that order. The
+    /// order is the RFC requirement, not a convenience: §4.6.3 has the sender
+    /// protect the `KeyUpdate` itself with the *old* keys and only subsequent
+    /// records with the new ones, so the transport must seal these bytes
+    /// before it applies the advance that follows them.
+    fn emitKeyUpdateMessage(self: *Tls13Backend, request: key_update.Request, sink: *EventSink) HandshakeError!void {
+        _ = self;
+        var buf: [key_update.message_len]u8 = undefined;
+        const message = key_update.encode(request, &buf) catch return error.TransportBufferOverflow;
+        try sink.emitHandshakeBytes(.application, message);
+        try sink.emitKeyUpdate(.write);
     }
 
     fn onNewSessionTicket(self: *Tls13Backend, body: []const u8) HandshakeError!void {
