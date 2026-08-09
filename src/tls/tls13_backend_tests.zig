@@ -3740,7 +3740,11 @@ test "#568 a server whose provider lacks SHA-384/AES-256-GCM fails the ordinary 
     const client_suites = [_]tls_core.algorithms.CipherSuite{.tls_aes_256_gcm_sha384};
     directHarnessWithClientCipherSuitesAndServerProvider(&harness, &client_suites, server_capability_override.provider());
     defer harness.deinit();
-    try std.testing.expectError(error.IllegalParameter, harness.run());
+    // #338: this is the server's no-overlap path, which RFC 8446 §4.1.1 makes
+    // `handshake_failure` (`NoMutualParameters`) rather than the
+    // `IllegalParameter`/`illegal_parameter` this previously asserted — every
+    // suite the client offered was legal, the two sides simply share none.
+    try std.testing.expectError(error.NoMutualParameters, harness.run());
     try std.testing.expect(harness.server_backend.schedule == null);
 }
 
@@ -3766,7 +3770,9 @@ test "#335 a server whose provider lacks P-256 fails no-mutual-group when P-256 
     const client_groups = [_]tls_core.algorithms.NamedGroup{.secp256r1};
     directHarnessWithClientGroupsAndServerProvider(&harness, &client_groups, server_capability_override.provider());
     defer harness.deinit();
-    try std.testing.expectError(error.IllegalParameter, harness.run());
+    // #338: as above -- a server with no mutually supported group aborts with
+    // `handshake_failure` per RFC 8446 §4.1.1, not `illegal_parameter`.
+    try std.testing.expectError(error.NoMutualParameters, harness.run());
     try std.testing.expect(harness.server_backend.schedule == null);
 }
 
@@ -5941,7 +5947,11 @@ const SocketHarness = struct {
         self.client_engine = if (opts.client_verifier) |verifier|
             tls_backend.Tls13Backend.initClientWithVerifierConfigured(clientEntropy(), client_crypto_provider, verifier, client_config, opts.client_options)
         else
-            tls_backend.Tls13Backend.initClientConfigured(clientEntropy(), client_crypto_provider, opts.client_trust, client_config, .{});
+            // #338: `client_options` applies on the fixed-trust path too --
+            // it was previously dropped here, so a harness case could not ask
+            // a pinned-certificate client for an empty initial key share (the
+            // only way to make the server emit a HelloRetryRequest).
+            tls_backend.Tls13Backend.initClientConfigured(clientEntropy(), client_crypto_provider, opts.client_trust, client_config, opts.client_options);
         self.server_engine = if (opts.server_provider) |provider|
             tls_backend.Tls13Backend.initServerWithProviderConfigured(serverEntropy(), server_crypto_provider, provider, server_config)
         else
@@ -6001,7 +6011,63 @@ const SocketHarness = struct {
     fn bothComplete(self: *SocketHarness) bool {
         return self.client.bridge.handshake_complete and self.server.bridge.handshake_complete;
     }
+
+    /// Write raw bytes straight into the client's end of the socket pair, so
+    /// the server sees them inline in its inbound record stream. Used to
+    /// splice in records this implementation's own client never sends (the
+    /// middlebox-compatibility `change_cipher_spec` an interop peer does).
+    fn injectFromClient(self: *SocketHarness, bytes: []const u8) !void {
+        var written: usize = 0;
+        while (written < bytes.len) {
+            written += try writeFd(self.fds[0], bytes[written..]);
+        }
+    }
 };
+
+test "#338 middlebox-compat change_cipher_spec after a HelloRetryRequest is accepted, not rejected" {
+    // RFC 8446 §5.1 / Appendix D.4: a compatibility-mode client sends
+    // `change_cipher_spec` as soon as it has received a HelloRetryRequest,
+    // before ClientHello2 -- so the wire order is CH1, CCS, CH2.
+    //
+    // An HRR flight derives no traffic secrets, so both record epochs are
+    // still `.initial` at that point. A server that inferred "a ClientHello
+    // has been accepted" from epoch movement alone therefore rejected the
+    // legal CCS with `UnexpectedRecordContent`, making HRR handshakes fail
+    // against essentially every real client. Found by the #338 external
+    // conformance matrix (`openssl s_client -groups P-256:X25519`).
+    const h = try SocketHarness.create(.{
+        .client_options = .{ .initial_key_share_mode = .empty },
+    });
+    defer h.destroy();
+
+    // ClientHello1 (no key share) goes out; the server answers with an HRR.
+    _ = try h.driveClient();
+    _ = try h.driveServer();
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_sent, h.server_engine.core.retry_state);
+
+    // The compatibility record a real peer emits here, spliced in ahead of
+    // ClientHello2 exactly as it would arrive on the wire.
+    try h.injectFromClient(&.{ 20, 3, 3, 0, 1, 1 });
+
+    try h.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expect(h.server.bridge.handshake_complete);
+    try std.testing.expect(h.client.bridge.handshake_complete);
+    try std.testing.expectEqual(tls_core.handshake.RetryState.hrr_received, h.client_engine.core.retry_state);
+}
+
+test "#338 a change_cipher_spec still cannot open the window before any ClientHello is accepted" {
+    // The companion property: widening the window for HRR must not let a CCS
+    // arriving *before* a complete ClientHello through. The server here has
+    // sent nothing and accepted nothing, so the record is still illegal.
+    const h = try SocketHarness.create(.{
+        .client_options = .{ .initial_key_share_mode = .empty },
+    });
+    defer h.destroy();
+
+    try h.injectFromClient(&.{ 20, 3, 3, 0, 1, 1 });
+    try std.testing.expectError(error.UnexpectedRecordContent, h.driveServer());
+    try std.testing.expectEqual(tls_core.handshake.RetryState.none, h.server_engine.core.retry_state);
+}
 
 test "#510 record stream carries real accepted 0-RTT provenance before 1-RTT completion" {
     const TicketCapture = struct {
@@ -7277,6 +7343,101 @@ test "record stream handshake fails closed with AlpnMismatch when the server sel
     try std.testing.expectError(error.AlpnMismatch, h.server.stream().drive());
 }
 
+test "#338 a server with no mutually supported cipher suite fails with handshake_failure, not illegal_parameter" {
+    // RFC 8446 §4.1.1: no overlap between the client's and server's parameters
+    // terminates with `handshake_failure`. Every value the client sent was
+    // individually legal, so `illegal_parameter` would tell the peer its
+    // ClientHello was malformed when it was not.
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    // The server enables only ChaCha20; the harness client offers only the
+    // AES-128 baseline, so the two share no suite at all.
+    var server_only: [1]tls_core.algorithms.CipherSuite = .{.tls_chacha20_poly1305_sha256};
+    h.server_engine.policy.cipher_suites = &server_only;
+
+    const failures = driveUntilBothErrors(h);
+    try std.testing.expectEqual(@as(?anyerror, error.NoMutualParameters), failures.server);
+    try std.testing.expectEqual(
+        tls_core.alerts.AlertDescription.handshake_failure,
+        tls_core.alerts.fromHandshakeError(error.NoMutualParameters),
+    );
+    // The client sees the class the server actually put on the wire.
+    try std.testing.expectEqual(tls_core.alerts.AlertDescription.handshake_failure, h.client.peerAlert().?);
+}
+
+// #338: the *client* direction of the same negotiation failure keeps
+// `illegal_parameter`, and is already pinned by "a PSK-selected ServerHello
+// with inconsistent suite/version/key-share is rejected and fully cleans up"
+// further down this file — its `cipher_suite = 0x1302` and
+// `selected_version = 0x0303` cases both expect `error.IllegalParameter`.
+// That asymmetry is deliberate: a ServerHello naming something the client
+// never offered is the server violating RFC 8446 §4.1.3, not the two
+// endpoints having nothing in common, so `mapPeerHelloNegotiationError`
+// applies only where a server reads a peer's ClientHello.
+
+test "#338 a rejected side records which fatal alert class the peer chose, not just that it was rejected" {
+    // `error.PeerFatalAlert` is one error for every RFC 8446 §6 failure class,
+    // so on its own it cannot tell an ALPN rejection from a certificate one.
+    // The external conformance suite has to agree with peers on the failure
+    // *class*, so the received description is retained beside the error.
+    const h = try SocketHarness.create(.{
+        .client_chunk = 1,
+        .server_chunk = 1,
+        .server_alpn = "http/1.1",
+        .one_write_per_drive = true,
+    });
+    defer h.destroy();
+
+    const failures = driveUntilBothErrors(h);
+    try std.testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), failures.client);
+    // RFC 7301 §3.2: no mutually supported protocol is fatal
+    // `no_application_protocol`, and that is what the rejecting server put on
+    // the wire (`alerts.fromHandshakeError(error.AlpnMismatch)`).
+    try std.testing.expectEqual(tls_core.alerts.AlertDescription.no_application_protocol, h.client.peerAlert().?);
+    // The side that did the rejecting received no alert of its own -- its
+    // outgoing alert is derived from its typed failure instead.
+    try std.testing.expectEqual(@as(?tls_core.alerts.AlertDescription, null), h.server.peerAlert());
+}
+
+test "#338 a different rejection class is reported as a different peer alert" {
+    // The companion to the test above: a certificate rejection must be
+    // distinguishable from an ALPN one at the peer that was rejected.
+    var wrong_pin: [tls_backend.testdata.certificate_der.len]u8 = undefined;
+    @memcpy(&wrong_pin, tls_backend.testdata.certificate_der);
+    wrong_pin[wrong_pin.len / 2] ^= 0xff;
+
+    const h = try SocketHarness.create(.{
+        .client_chunk = 1,
+        .server_chunk = 1,
+        .client_trust = .{ .pinned_certificate = &wrong_pin },
+        .one_write_per_drive = true,
+    });
+    defer h.destroy();
+
+    const failures = driveUntilBothErrors(h);
+    try std.testing.expectEqual(@as(?anyerror, error.PeerFatalAlert), failures.server);
+    try std.testing.expectEqual(tls_core.alerts.AlertDescription.bad_certificate, h.server.peerAlert().?);
+    try std.testing.expectEqual(@as(?tls_core.alerts.AlertDescription, null), h.client.peerAlert());
+}
+
+test "#338 a clean close_notify is not mistaken for a fatal alert class" {
+    // `close_notify` and `user_canceled` are warnings that leave the stream
+    // usable/closing rather than failed; recording either as the connection's
+    // fatal class would make a healthy shutdown look like a conformance
+    // failure in the interop matrix.
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    h.client.stream().close();
+    _ = h.client.stream().drive() catch {};
+    _ = h.server.stream().drive() catch {};
+
+    try std.testing.expect(h.server.peer_closed);
+    try std.testing.expectEqual(@as(?tls_core.alerts.AlertDescription, null), h.server.peerAlert());
+    try std.testing.expectEqual(@as(?tls_core.alerts.AlertDescription, null), h.client.peerAlert());
+}
+
 test "record stream requires explicit opt-in for an unverified client certificate policy" {
     const strict = try SocketHarness.create(.{ .client_trust = .insecure_no_verification });
     defer strict.destroy();
@@ -7315,6 +7476,14 @@ const ClientHelloOptions = struct {
     sig_schemes: []const u16 = &.{ 0x0807, 0x0403 },
     alpn_protocols: ?[]const []const u8 = &.{"h2"},
     duplicate_supported_versions: bool = false,
+    /// #338: omit `supported_versions` entirely, modelling a genuine pre-1.3
+    /// ClientHello. RFC 8446 Appendix D.2 makes this a *legacy* hello rather
+    /// than a malformed one, so it must be distinguishable from every other
+    /// "extension missing" case.
+    omit_supported_versions: bool = false,
+    /// #338: offer `supported_versions` naming only versions this endpoint
+    /// does not support (default TLS 1.2), the other RFC 8446 §4.2.1 case.
+    supported_versions: []const u16 = &.{0x0304},
     /// #484: send `key_share` with a legal empty `client_shares` vector
     /// instead of a real x25519 entry.
     empty_key_share: bool = false,
@@ -7376,15 +7545,17 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
 
     const extensions_len = try w.reserve(2);
     // supported_versions
-    try w.u16_(43);
-    try w.u16_(3);
-    try w.u8_(2);
-    try w.u16_(0x0304);
-    if (opts.duplicate_supported_versions) {
+    if (!opts.omit_supported_versions) {
         try w.u16_(43);
-        try w.u16_(3);
-        try w.u8_(2);
-        try w.u16_(0x0304);
+        try w.u16_(@intCast(1 + 2 * opts.supported_versions.len));
+        try w.u8_(@intCast(2 * opts.supported_versions.len));
+        for (opts.supported_versions) |version| try w.u16_(version);
+        if (opts.duplicate_supported_versions) {
+            try w.u16_(43);
+            try w.u16_(@intCast(1 + 2 * opts.supported_versions.len));
+            try w.u8_(@intCast(2 * opts.supported_versions.len));
+            for (opts.supported_versions) |version| try w.u16_(version);
+        }
     }
     // supported_groups
     try w.u16_(10);
@@ -8008,6 +8179,81 @@ fn expectServerReceiveError(server: *tls_backend.Tls13Backend, opts: ClientHello
     var buf: [2048]u8 = undefined;
     const hello = try buildClientHello(&buf, opts);
     try std.testing.expectError(want, server.backend().receive(.initial, hello, &sink));
+}
+
+test "#338 the engine reports which credential its selector actually chose" {
+    // Certificate selection is otherwise invisible from outside: the chosen
+    // credential lives in a transient `SelectedCredential` released as soon as
+    // the flight is signed. Without this, a conformance row offering several
+    // identities could only confirm that *a* handshake completed, not that the
+    // engine picked the one the row expected.
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+
+    // Nothing is selected before a ClientHello has been processed.
+    try std.testing.expectEqual(
+        @as(?tls_core.algorithms.SignatureScheme, null),
+        h.server_engine.negotiated_signature_scheme,
+    );
+
+    try h.driveUntil(SocketHarness.bothComplete);
+
+    // The fixture identity is Ed25519, so that is what CertificateVerify was
+    // signed with -- and the client never selects a credential at all here,
+    // since the server did not request client authentication.
+    try std.testing.expectEqual(
+        tls_core.algorithms.SignatureScheme.ed25519,
+        h.server_engine.negotiated_signature_scheme.?,
+    );
+    try std.testing.expectEqual(
+        @as(?tls_core.algorithms.SignatureScheme, null),
+        h.client_engine.negotiated_signature_scheme,
+    );
+}
+
+test "#338 a legacy ClientHello without supported_versions is refused with protocol_version" {
+    // RFC 8446 Appendix D.2: absence of `supported_versions` does not make a
+    // ClientHello malformed. The server treats it as a pre-1.3 hello and
+    // negotiates `min(legacy_version, TLS 1.2)`; supporting nothing in that
+    // range, §4.2.1 requires it to abort with `protocol_version`.
+    //
+    // This previously reported `MissingExtension`/`missing_extension`, which
+    // told a perfectly conformant TLS 1.2 client that its hello was
+    // malformed -- and the #338 matrix's `tls12_downgrade` row was codifying
+    // that as expected behaviour against real OpenSSL.
+    var server_provider_storage: ProviderStorage = .{};
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var server = serverWithProvider(&server_provider_storage, &mock);
+    defer server.deinit();
+    try expectServerReceiveError(&server, .{ .omit_supported_versions = true }, error.UnsupportedProtocolVersion);
+    try std.testing.expectEqual(
+        tls_core.alerts.AlertDescription.protocol_version,
+        tls_core.alerts.fromHandshakeError(error.UnsupportedProtocolVersion),
+    );
+}
+
+test "#338 a supported_versions offering only TLS 1.2 is refused with protocol_version too" {
+    // The other RFC 8446 §4.2.1 case: the extension is present and
+    // well-formed but names no version we support. Both reach the same alert,
+    // which is what lets a peer distinguish version negotiation failing from
+    // a malformed or incomplete hello.
+    var server_provider_storage: ProviderStorage = .{};
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var server = serverWithProvider(&server_provider_storage, &mock);
+    defer server.deinit();
+    try expectServerReceiveError(&server, .{ .supported_versions = &.{0x0303} }, error.UnsupportedProtocolVersion);
+}
+
+test "#338 a genuinely absent extension is still MissingExtension, not a version failure" {
+    // Guards the distinction the fix rests on: only `supported_versions` gets
+    // the legacy-hello reading. Another required extension going missing is
+    // still an ordinary `missing_extension`, so the two failure classes stay
+    // separable for a peer.
+    var server_provider_storage: ProviderStorage = .{};
+    var mock = credentials.MockCredentialProvider.init(fixtureIdentity());
+    var server = serverWithProvider(&server_provider_storage, &mock);
+    defer server.deinit();
+    try expectServerReceiveError(&server, .{ .include_signature_algorithms = false }, error.MissingExtension);
 }
 
 fn countCryptoEvents(sink: *const DirectSink, epoch: events.EncryptionEpoch) usize {

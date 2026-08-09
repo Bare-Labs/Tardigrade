@@ -637,6 +637,14 @@ pub const Tls13Backend = struct {
     negotiated_version: tls_algorithms.ProtocolVersion = .tls13,
     negotiated_cipher_suite: tls_algorithms.CipherSuite = .tls_aes_128_gcm_sha256,
     negotiated_named_group: tls_algorithms.NamedGroup = .x25519,
+    /// The signature scheme the locally selected credential signs
+    /// CertificateVerify with (#338). `null` until a credential has been
+    /// selected *and* fully validated — see `inspectSelectedCredential` — and
+    /// therefore also `null` for a resumed handshake, which authenticates via
+    /// the PSK and selects no credential at all. Diagnostic: this is the only
+    /// outside view of which identity an SNI/signature-algorithm selector
+    /// actually chose.
+    negotiated_signature_scheme: ?tls_algorithms.SignatureScheme = null,
     peer_transport_extension: [max_transport_extension_len]u8 = undefined,
     peer_transport_extension_len: usize = 0,
     peer_transport_extension_pending: bool = false,
@@ -1528,7 +1536,15 @@ pub const Tls13Backend = struct {
             .earlyDataAttemptedFn = earlyDataAttemptedImpl,
             .earlyDataMaxBytesFn = earlyDataMaxBytesImpl,
             .earlyDataDiscardLimitFn = earlyDataDiscardLimitImpl,
+            .helloRetryRequestSentFn = helloRetryRequestSentImpl,
         };
+    }
+
+    /// #338: a server has sent a HelloRetryRequest, which it only does after
+    /// accepting a complete first ClientHello. See `helloRetryRequestSentFn`.
+    fn helloRetryRequestSentImpl(ptr: *anyopaque) bool {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return self.core.retry_state == .hrr_sent;
     }
 
     fn earlyDataAttemptedImpl(ptr: *anyopaque) bool {
@@ -2312,6 +2328,49 @@ pub const Tls13Backend = struct {
             error.CredentialProviderFailed => error.CredentialProviderFailed,
             error.ClientCertificateRequired => error.ClientCertificateRequired,
             error.DecryptError => error.DecryptError,
+            // #338: raised by policy negotiation (`mapNegotiationError`), not
+            // the codec core, but likewise part of the shared error set.
+            error.NoMutualParameters => error.NoMutualParameters,
+            error.UnsupportedProtocolVersion => error.UnsupportedProtocolVersion,
+        };
+    }
+
+    /// #338: the same negotiation failure carries a *different* RFC-mandated
+    /// alert depending on which side observed it, so the two directions map
+    /// separately.
+    ///
+    /// This is the server reading a peer's ClientHello. "No mutually supported
+    /// cipher suite/group/signature scheme" here means the two endpoints share
+    /// nothing — every value the client sent was individually legal — and
+    /// RFC 8446 §4.1.1 requires `handshake_failure` rather than a
+    /// parameter-validity complaint. Likewise §4.2.1 gives version negotiation
+    /// its own `protocol_version` alert.
+    ///
+    /// `mapNegotiationError` stays as-is for the client direction: a
+    /// ServerHello naming a suite, group, or version the client never offered
+    /// is the *server* violating the protocol, which RFC 8446 §4.1.3/§4.2.1
+    /// say the client rejects with `illegal_parameter`.
+    fn mapPeerHelloNegotiationError(err: tls_negotiation.Error) HandshakeError {
+        return switch (err) {
+            error.NoMutualCipherSuite,
+            error.NoMutualNamedGroup,
+            error.NoMutualSignatureScheme,
+            => error.NoMutualParameters,
+            // `supported_versions` present but naming nothing we support.
+            error.UnsupportedProtocolVersion,
+            // `supported_versions` absent entirely. RFC 8446 Appendix D.2 is
+            // explicit that this is *not* a malformed hello: the server treats
+            // it as a pre-1.3 ClientHello and negotiates
+            // `min(legacy_version, TLS 1.2)`. Since a TLS-1.3-only endpoint
+            // supports nothing in that range, §4.2.1's `protocol_version`
+            // abort is the required outcome — the same failure class as an
+            // explicit version list we cannot satisfy, which is why both
+            // arrive here. Reporting `missing_extension` instead told a
+            // perfectly conformant TLS 1.2 client that its hello was
+            // malformed (#338).
+            error.MissingSupportedVersions,
+            => error.UnsupportedProtocolVersion,
+            else => mapNegotiationError(err),
         };
     }
 
@@ -4075,7 +4134,7 @@ pub const Tls13Backend = struct {
         const parsed = tls_negotiation.parseClientHelloObserved(body, .{
             .ctx = &observer,
             .observeFn = ClientHelloObserver.observe,
-        }) catch |err| return mapNegotiationError(err);
+        }) catch |err| return mapPeerHelloNegotiationError(err);
         const offers = parsed.offers;
         // #484: `drainInput`'s preflight (`validateSecondClientHelloAgainstRetained`)
         // already validated this ClientHello2 against the retained
@@ -4099,7 +4158,7 @@ pub const Tls13Backend = struct {
         // fallback.
         var suites_storage: [native_cipher_suites.len]tls_algorithms.CipherSuite = undefined;
         var groups_storage: [native_named_groups.len]tls_algorithms.NamedGroup = undefined;
-        const hello_selection = tls_negotiation.negotiateServerHello(self.effectivePolicy(&suites_storage, &groups_storage), &offers) catch |err| return mapNegotiationError(err);
+        const hello_selection = tls_negotiation.negotiateServerHello(self.effectivePolicy(&suites_storage, &groups_storage), &offers) catch |err| return mapPeerHelloNegotiationError(err);
         if (hello_selection.version != .tls13) return error.IllegalParameter;
         // #564: commit the negotiated suite — and select the transcript's
         // hash family accordingly — as soon as it is known, before any
@@ -5381,6 +5440,22 @@ pub const Tls13Backend = struct {
             if (certificate_message_len > max_message_len)
                 return self.failCredential(.malformed_credential_chain);
         }
+
+        // #338: the scheme this connection will actually sign
+        // CertificateVerify with, recorded once it has passed every check
+        // above (policy, peer offer, provider capability, and leaf-key
+        // compatibility) -- so it always names a credential the engine
+        // genuinely committed to, never a candidate it went on to reject.
+        //
+        // Selection is otherwise unobservable from outside: the chosen
+        // credential lives in a transient `SelectedCredential` that is
+        // released as soon as the flight is signed. Without this, "which
+        // identity did the SNI/signature-algorithm selector pick?" can only
+        // be answered by inspecting what the peer received, which the
+        // conformance suite needs to assert (#338) and operators need to
+        // diagnose. Completes the `negotiated_*` trio beside
+        // `negotiated_cipher_suite` and `negotiated_named_group`.
+        self.negotiated_signature_scheme = selected;
 
         return .{ .certificate_message_len = certificate_message_len };
     }

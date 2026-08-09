@@ -21,6 +21,7 @@
 const std = @import("std");
 const quic = @import("quic");
 const http3 = @import("http3");
+const matrix = @import("tls_interop_matrix");
 
 const connection = quic.connection;
 const tls_backend = quic.tls_backend;
@@ -92,7 +93,63 @@ const Args = struct {
     timeout_ms: u64 = 15_000,
     empty_initial_key_share: bool = false,
     expect_hrr: bool = false,
+    /// #338: the shared conformance-matrix negotiation tuple. Left empty, the
+    /// tool offers QUIC's ordinary default policy exactly as before.
+    config: matrix.Config = .{},
+    /// #338: require the handshake to have selected exactly this protocol.
+    /// Parity with `tls_interop_tool --expect-alpn` so a matrix row asserts
+    /// the same things on either transport. `null` leaves ALPN unchecked
+    /// (h3 is separately proven by `negotiatedH3()`).
+    expect_alpn: ?[]const u8 = null,
 };
+
+/// The engine policy for this run: QUIC transport mode, h3 as the default
+/// ALPN, and whatever the matrix row pinned. Built through the same
+/// `matrix.Config` the record-transport tool uses, so "aes256-gcm-sha384 +
+/// secp256r1 + ecdsa-p256-sha256" is one engine configuration regardless of
+/// which transport is carrying it.
+/// `args` is taken by pointer, not by value: the returned policy's
+/// suite/group/signature slices point into `args.config`'s inline storage, so
+/// a by-value parameter would hand back slices into a copy that dies with this
+/// call.
+fn quicPolicy(args: *const Args) quic.tls_core.policy.Policy {
+    const default_alpns = [_]quic.tls_core.algorithms.ProtocolName{quic.tls_core.algorithms.alpn.h3};
+    return args.config.policy(.quic, &default_alpns);
+}
+
+/// Emit the negotiated tuple in the shared matrix vocabulary, so a QUIC row
+/// and a record row read identically in a CI log (#338).
+fn reportNegotiated(args: Args, backend: *const tls_backend.Tls13Backend, saw_hrr: bool) void {
+    std.debug.print("tls-interop: outcome=ok transport=quic role={s} suite={s} group={s} alpn={s} hrr={}\n", .{
+        @tagName(args.mode),
+        matrix.cipherSuiteName(backend.engine.negotiated_cipher_suite),
+        matrix.namedGroupName(backend.engine.negotiated_named_group),
+        backend.alpn,
+        saw_hrr,
+    });
+}
+
+/// Translate this transport's backend state into the shared `Negotiated`
+/// value and apply the *same* validator the record transport uses (#338
+/// review). Only this translation is transport-specific; the expectations
+/// themselves must not be, or an identically-named matrix cell would come to
+/// mean different things on the two carriers.
+fn matrixTupleHolds(args: Args, backend: *const tls_backend.Tls13Backend) bool {
+    var ignored: u8 = 0;
+    return args.config.validateNegotiated(.{
+        .cipher_suite = backend.engine.negotiated_cipher_suite,
+        .named_group = backend.engine.negotiated_named_group,
+        .alpn = backend.alpn,
+    }, args.expect_alpn, &ignored, reportMismatch);
+}
+
+fn reportMismatch(_: *u8, mismatch: matrix.Mismatch) void {
+    std.debug.print("h3-interop: expected {s} {s} but negotiated {s}\n", .{
+        mismatch.dimension,
+        mismatch.expected,
+        mismatch.observed,
+    });
+}
 
 fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !Args {
     var it = init_args.iterate();
@@ -132,6 +189,16 @@ fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !Args {
             args.requests = try std.fmt.parseInt(usize, it.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, arg, "--timeout-ms")) {
             args.timeout_ms = try std.fmt.parseInt(u64, it.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, arg, "--cipher-suite")) {
+            try args.config.addCipherSuite(try allocator.dupe(u8, it.next() orelse return error.MissingValue));
+        } else if (std.mem.eql(u8, arg, "--group")) {
+            try args.config.addNamedGroup(try allocator.dupe(u8, it.next() orelse return error.MissingValue));
+        } else if (std.mem.eql(u8, arg, "--signature")) {
+            try args.config.addSignatureScheme(try allocator.dupe(u8, it.next() orelse return error.MissingValue));
+        } else if (std.mem.eql(u8, arg, "--alpn")) {
+            try args.config.addAlpn(try allocator.dupe(u8, it.next() orelse return error.MissingValue));
+        } else if (std.mem.eql(u8, arg, "--expect-alpn")) {
+            args.expect_alpn = try allocator.dupe(u8, it.next() orelse return error.MissingValue);
         } else {
             std.debug.print("h3-interop: unknown argument {s}\n", .{arg});
             return error.UnknownArgument;
@@ -261,8 +328,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const args = parseArgs(allocator, init.args) catch |err| {
         std.debug.print(
             "h3-interop: bad arguments ({s})\n" ++
-                "usage: h3_interop_tool server --port N --cert cert.der --key key.pkcs8.der [--requests N] [--expect-hrr]\n" ++
-                "       h3_interop_tool client --host IP --port N --authority NAME --path /p [--empty-initial-key-share] [--expect-hrr] [--insecure|--pin cert.der]\n",
+                "usage: h3_interop_tool server --port N --cert cert.pem --key key.pem [--requests N] [--expect-hrr]\n" ++
+                "       h3_interop_tool client --host IP --port N --authority NAME --path /p [--empty-initial-key-share] [--expect-hrr] [--insecure|--pin cert.der]\n" ++
+                "\nnegotiation (#338, shared vocabulary with tls_interop_tool):\n" ++
+                matrix.flag_usage,
             .{@errorName(err)},
         );
         std.process.exit(2);
@@ -307,7 +376,7 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     var crypto_provider_entropy = production_crypto.OsEntropy{};
     var crypto_provider_state = production_crypto.Provider.init(crypto_provider_entropy.entropy());
     const crypto_provider = crypto_provider_state.cryptoProvider();
-    var backend = tls_backend.Tls13Backend.initClientWithOptions(randomEntropy(), crypto_provider, trust, client_options);
+    var backend = tls_backend.Tls13Backend.initClientWithPolicyAndOptions(randomEntropy(), crypto_provider, trust, quicPolicy(&args), client_options);
     const client = try Connection.init(allocator, .{
         .role = .client,
         .local_cid = &local_cid,
@@ -383,10 +452,12 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     }
     const saw_hrr = backend.engine.core.retry_state == .hrr_received;
     std.debug.print("h3-interop: tls retry_state={s}\n", .{@tagName(backend.engine.core.retry_state)});
+    reportNegotiated(args, &backend, saw_hrr);
     if (args.expect_hrr and !saw_hrr) {
         std.debug.print("h3-interop: expected HelloRetryRequest but none was observed\n", .{});
         std.process.exit(1);
     }
+    if (!matrixTupleHolds(args, &backend)) std.process.exit(1);
     // Orderly close.
     client.close(0, "done", nowUs());
     var out: [2048]u8 = undefined;
@@ -398,14 +469,18 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
 
 fn runServer(allocator: std.mem.Allocator, args: Args) !void {
     if (args.cert.len == 0 or args.key.len == 0) {
-        std.debug.print("h3-interop: server needs --cert and --key (DER)\n", .{});
+        std.debug.print("h3-interop: server needs --cert and --key (PEM or DER)\n", .{});
         std.process.exit(2);
     }
-    const cert_der = try readFileAlloc(allocator, args.cert, 64 * 1024);
-    defer allocator.free(cert_der);
-    const key_der = try readFileAlloc(allocator, args.key, 4 * 1024);
-    defer allocator.free(key_der);
-    const identity = try tls_backend.Identity.initPkcs8(cert_der, key_der);
+    // #338: loaded through the production identity loader rather than
+    // `Identity.initPkcs8` directly, so a matrix row can hand this tool the
+    // same PEM files it hands `tls_interop_tool` -- and so RSA identities
+    // (whose import needs an entropy source for its primality witnesses)
+    // work here at all.
+    var identity_entropy = production_crypto.OsEntropy{};
+    var loaded = try quic.tls_core.identity_loader.loadIdentity(allocator, args.cert, args.key, identity_entropy.entropy());
+    defer loaded.deinit();
+    const identity = loaded.identity;
 
     var socket = try UdpSocket.open(args.port);
     defer socket.close();
@@ -438,7 +513,7 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         var crypto_provider_entropy = production_crypto.OsEntropy{};
         var crypto_provider_state = production_crypto.Provider.init(crypto_provider_entropy.entropy());
         const crypto_provider = crypto_provider_state.cryptoProvider();
-        var backend = tls_backend.Tls13Backend.initServer(randomEntropy(), crypto_provider, identity);
+        var backend = tls_backend.Tls13Backend.initServerWithPolicy(randomEntropy(), crypto_provider, identity, quicPolicy(&args));
         const server = try Connection.init(allocator, .{
             .role = .server,
             .local_cid = parsed.dcid,
@@ -495,6 +570,8 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
             if (server.isEstablished()) {
                 if (!h3_started) {
                     std.debug.print("h3-interop: established, alpn_h3={}\n", .{server.negotiatedH3()});
+                    reportNegotiated(args, &backend, backend.engine.core.retry_state == .hrr_sent);
+                    if (!matrixTupleHolds(args, &backend)) std.process.exit(1);
                     try h3.start(server);
                     h3_started = true;
                 }
