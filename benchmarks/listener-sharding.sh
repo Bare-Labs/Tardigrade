@@ -94,6 +94,12 @@ if [[ -z "$START_COMMAND" ]]; then
     exit 1
 fi
 
+if ! [[ "$SHARDS" =~ ^[0-9]+$ ]] || (( SHARDS < 2 || SHARDS > 64 )); then
+    echo "--shards must be an integer in the range 2..64; got '${SHARDS}'." >&2
+    echo "The listener-sharding suite compares the default 1-shard profile against a meaningful N-shard profile." >&2
+    exit 1
+fi
+
 for tool in curl jq wrk; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "Required tool not found: $tool" >&2
@@ -362,6 +368,45 @@ metrics_json() {
     ' < "$metrics_file"
 }
 
+accept_delta_json() {
+    local before_file="$1" after_file="$2"
+    jq -n \
+        --slurpfile before <(metrics_json "$before_file") \
+        --slurpfile after <(metrics_json "$after_file") \
+        '
+        def keyed_accepts($items):
+            reduce ($items // [])[] as $item ({}; .[($item.shard | tostring)] = $item.value);
+        def keyed_errors($items):
+            reduce ($items // [])[] as $item ({}; .[($item.shard | tostring) + ":" + $item.reason] = $item.value);
+        def accept_delta($before; $after):
+            (keyed_accepts($before.accepts_total)) as $b |
+            (keyed_accepts($after.accepts_total)) as $a |
+            [($a | keys_unsorted[]) as $key | {
+                shard: ($key | tonumber),
+                value: (($a[$key] // 0) - ($b[$key] // 0))
+            }] | sort_by(.shard);
+        def error_delta($before; $after):
+            (keyed_errors($before.accept_errors_total)) as $b |
+            (keyed_errors($after.accept_errors_total)) as $a |
+            [($a | keys_unsorted[]) as $key |
+                ($key | split(":")) as $parts |
+                {
+                    shard: ($parts[0] | tonumber),
+                    reason: $parts[1],
+                    value: (($a[$key] // 0) - ($b[$key] // 0))
+                }
+            ] | sort_by(.shard, .reason);
+
+        ($before[0]) as $b |
+        ($after[0]) as $a |
+        {
+            listener_shards: $a.listener_shards,
+            accepts_total_delta: accept_delta($b; $a),
+            accept_errors_total_delta: error_delta($b; $a)
+        }
+        '
+}
+
 run_wrk_workload() {
     local label="$1"
     local output="$2"
@@ -400,13 +445,16 @@ run_wrk_workload() {
 
     local queue_json
     queue_json="$(queue_summary_json "$queue_samples" "$before_metrics" "$after_metrics")"
+    local accept_json
+    accept_json="$(accept_delta_json "$before_metrics" "$after_metrics")"
 
     echo "  ${label}: $(jq -r '.rps' <<<"$summary_json") req/s, p99=$(jq -r '.p99_ms' <<<"$summary_json")ms, errors=$(jq -r '.errors' <<<"$summary_json")" >&2
     jq -n \
         --argjson summary "$summary_json" \
         --argjson resources "$resource_json" \
         --argjson queue "$queue_json" \
-        '$summary + $resources + $queue'
+        --argjson accepts "$accept_json" \
+        '$summary + $resources + $queue + {accept_metrics: $accepts}'
 }
 
 run_profile() {
