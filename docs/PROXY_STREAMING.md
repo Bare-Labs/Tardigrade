@@ -271,6 +271,17 @@ An upload therefore reserves a bounded amount that does not grow with the body,
 and the reservation is released on every exit: completion, client abort,
 cancellation, timeout, malformed chunk framing, and upstream failure alike.
 
+**The claim ends when the upload does, not when the exchange does.** On HTTP/2
+the same relay buffer goes on to serve the response, so the request-direction
+reservation is released explicitly at the upload/response boundary; carrying it
+through the response would occupy upload capacity for as long as the response
+took, which is long enough for one slow response to make an unrelated upload
+fail with a `503` it should never have seen. (HTTP/1 has no equivalent window —
+the request-sending function returns, releasing its reservation, before the
+response is read.) That buffer's ownership during the HTTP/2 response phase is
+not itself accounted; that gap predates this work and belongs with the rest of
+the response-side aggregate coverage.
+
 Every upload reservation clears
 `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES`, and an HTTP/2 upload also
 clears its origin's limit. Per-origin accounting for HTTP/1 origins is the

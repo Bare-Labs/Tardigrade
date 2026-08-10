@@ -1047,6 +1047,21 @@ fn streamViaH2Pool(
                         if (capacity_abort) return error.ProxyBufferCapacityUnavailable;
                         return err;
                     };
+                    // The upload is done: `read_buf` holds no client bytes any
+                    // more, so the request-direction claim ends here rather
+                    // than at the end of the exchange. Carrying it through
+                    // `waitStreamingResponseHead` and the response relay would
+                    // occupy upload capacity for as long as the response takes
+                    // — long enough for one slow response to make unrelated
+                    // uploads fail with a 503 they should never have seen, and
+                    // long enough for the direction gauges to keep reporting an
+                    // upload that finished. (The HTTP/1 path has no equivalent
+                    // window: `sendStreamingProxyRequest` returns, releasing
+                    // its reservation, before the response is read.)
+                    if (upload_reservation) |*reservation| {
+                        reservation.releaseAll();
+                        upload_reservation = null;
+                    }
                 }
 
                 conn.waitStreamingResponseHead(stream) catch |err| {
@@ -3613,6 +3628,236 @@ fn h2PrefaceOnlyOrigin(probe: *H2CapacityProbe) void {
         if (n <= 0) return;
         probe.len += @intCast(n);
     }
+}
+
+fn readExactlyFromFd(fd: std.posix.fd_t, out: []u8) bool {
+    var got: usize = 0;
+    while (got < out.len) {
+        const n = std.c.read(fd, out[got..].ptr, out.len - got);
+        if (n <= 0) return false;
+        got += @intCast(n);
+    }
+    return true;
+}
+
+fn sleepMs(ms: u32) void {
+    var no_fds: [0]std.posix.pollfd = .{};
+    _ = std.posix.poll(&no_fds, @intCast(ms)) catch {};
+}
+
+/// Bind a loopback listener on an ephemeral port and report it.
+fn listenLoopbackEphemeral() !struct { fd: std.posix.fd_t, port: u16 } {
+    const listen_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    if (listen_fd < 0) return error.SocketFailed;
+    errdefer _ = std.c.close(listen_fd);
+    _ = std.c.setsockopt(listen_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int));
+    const sin: std.c.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 0),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        .zero = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    if (std.c.bind(listen_fd, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) != 0) return error.BindFailed;
+    if (std.c.listen(listen_fd, 4) != 0) return error.ListenFailed;
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getsockname(listen_fd, @ptrCast(&bound), &bound_len) != 0) return error.SockNameFailed;
+    return .{ .fd = listen_fd, .port = std.mem.bigToNative(u16, bound.port) };
+}
+
+/// An h2c origin that consumes a whole upload, answers with response headers,
+/// and then holds the body back until told to release it. That gap is the
+/// window where the upload has finished but the exchange has not, which is
+/// exactly where a request-direction reservation must no longer be held.
+const H2SlowResponseOrigin = struct {
+    listen_fd: std.posix.fd_t,
+    head_sent: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release_body: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn h2SlowResponseServe(origin: *H2SlowResponseOrigin) void {
+    const conn = std.c.accept(origin.listen_fd, null, null);
+    if (conn < 0) return;
+    defer _ = std.c.close(conn);
+
+    var preface: [24]u8 = undefined;
+    if (!readExactlyFromFd(conn, &preface)) return;
+    const settings = [_]u8{ 0, 0, 0, 0x04, 0, 0, 0, 0, 0 };
+    _ = std.c.write(conn, &settings, settings.len);
+
+    // Drain frames until the request stream ends, remembering its id.
+    var stream_id: u32 = 0;
+    while (true) {
+        var hdr: [9]u8 = undefined;
+        if (!readExactlyFromFd(conn, &hdr)) return;
+        const payload_len = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | @as(usize, hdr[2]);
+        const typ = hdr[3];
+        const flags = hdr[4];
+        const sid = std.mem.readInt(u32, hdr[5..9], .big) & 0x7fff_ffff;
+        var scratch: [4096]u8 = undefined;
+        var remaining = payload_len;
+        while (remaining > 0) {
+            const take = @min(remaining, scratch.len);
+            if (!readExactlyFromFd(conn, scratch[0..take])) return;
+            remaining -= take;
+        }
+        if (typ == 0x01) stream_id = sid; // HEADERS
+        if (typ == 0x00 and (flags & 0x01) != 0) break; // DATA with END_STREAM
+    }
+    if (stream_id == 0) return;
+
+    // HEADERS, END_HEADERS, one byte of HPACK: `:status: 200` is static-table
+    // index 8, so an indexed header field encodes the whole block.
+    var head_frame = [_]u8{ 0, 0, 1, 0x01, 0x04, 0, 0, 0, 0, 0x88 };
+    std.mem.writeInt(u32, head_frame[5..9], stream_id, .big);
+    _ = std.c.write(conn, &head_frame, head_frame.len);
+    origin.head_sent.store(true, .release);
+
+    while (!origin.release_body.load(.acquire)) sleepMs(5);
+
+    var body_frame = [_]u8{ 0, 0, 2, 0x00, 0x01, 0, 0, 0, 0, 'o', 'k' };
+    std.mem.writeInt(u32, body_frame[5..9], stream_id, .big);
+    _ = std.c.write(conn, &body_frame, body_frame.len);
+
+    var drain: [256]u8 = undefined;
+    while (true) {
+        const got = std.c.read(conn, &drain, drain.len);
+        if (got <= 0) break;
+    }
+}
+
+/// Runs one `streamViaH2Pool` exchange on its own thread so the test can
+/// observe accounting while the exchange is mid-flight.
+const H2ExchangeCtx = struct {
+    pool: *http.upstream_h2.H2ConnPool,
+    port: u16,
+    uri: std.Uri,
+    read_buf: []u8,
+    source: *FakeUploadSource,
+    captured: *std.array_list.Managed(u8),
+    security: *const http.security_headers.SecurityHeaders,
+    limits: proxy_buffer_account.Limits,
+    observer: proxy_buffer_account.Observer,
+    global: *proxy_buffer_account.Aggregate,
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    failed: bool = false,
+    status: u16 = 0,
+};
+
+fn runH2ExchangeThread(ctx: *H2ExchangeCtx) void {
+    defer ctx.finished.store(true, .release);
+    const result = streamViaH2Pool(
+        std.testing.allocator,
+        ctx.pool,
+        null,
+        "127.0.0.1",
+        ctx.port,
+        null, // prior-knowledge h2c
+        ctx.uri,
+        "POST",
+        &.{},
+        "",
+        .{ .framing = .{ .length = 8 } },
+        ctx.read_buf,
+        ctx.source,
+        CaptureWriter{ .list = ctx.captured },
+        ctx.security,
+        null,
+        null,
+        "lifetime-test",
+        2000,
+        5000,
+        null,
+        ctx.limits,
+        ctx.observer,
+        ctx.global,
+    ) catch {
+        ctx.failed = true;
+        return;
+    };
+    ctx.status = result.status_code;
+}
+
+test "an http2 upload releases request-direction capacity before its response completes" {
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    var origin = H2SlowResponseOrigin{ .listen_fd = listener.fd };
+    const origin_thread = try std.Thread.spawn(.{}, h2SlowResponseServe, .{&origin});
+
+    var read_buf: [16 * 1024]u8 = undefined;
+    const limits = uploadTestLimits(1024 * 1024);
+    // Exactly one relay buffer fits per direction. The upload's claim is
+    // therefore the only thing that can keep a second upload out.
+    var global = proxy_buffer_account.Aggregate.init(.global, read_buf.len);
+
+    var counters = UploadBufferObserver{};
+    var source = FakeUploadSource{ .data = "upload!!" };
+    var captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer captured.deinit();
+    var security = http.security_headers.SecurityHeaders{};
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/upload", .{listener.port}));
+
+    var pool = http.upstream_h2.H2ConnPool.init(std.testing.allocator, .{});
+    var ctx = H2ExchangeCtx{
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf = &read_buf,
+        .source = &source,
+        .captured = &captured,
+        .security = &security,
+        .limits = limits,
+        .observer = counters.observer(),
+        .global = &global,
+    };
+    const exchange = try std.Thread.spawn(.{}, runH2ExchangeThread, .{&ctx});
+
+    // The origin has taken the whole upload and answered with headers; the
+    // response body is still being withheld, so the exchange is mid-flight.
+    var waited: u32 = 0;
+    while (!origin.head_sent.load(.acquire) and waited < 5000) : (waited += 5) sleepMs(5);
+    try std.testing.expect(origin.head_sent.load(.acquire));
+
+    // The upload finished, so its capacity must be back — even though the
+    // exchange has not. Bounded wait, because the release happens on the
+    // exchange thread just after the relay returns; the budget is well inside
+    // the exchange's own read deadline so a regression fails here on the
+    // reservation rather than later on a timeout.
+    waited = 0;
+    while (global.currentBytes(.downstream_to_upstream) != 0 and waited < 1000) : (waited += 5) sleepMs(5);
+    // Checked first: it is what makes the next assertion meaningful — the
+    // capacity came back while the exchange was still running, not because it
+    // ended.
+    try std.testing.expect(!ctx.finished.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+
+    // And the capacity is genuinely usable: a second upload can take it. With
+    // the claim held for the whole exchange this reservation was refused, which
+    // is the false `503 proxy_buffer_saturated` an unrelated client would see.
+    var other = UploadBufferObserver{};
+    var second_upload = ProxyBufferReservation.init(
+        .downstream_to_upstream,
+        limits,
+        other.observer(),
+        .{ .global = &global },
+    );
+    try second_upload.reserve(read_buf.len);
+    second_upload.releaseAll();
+
+    origin.release_body.store(true, .release);
+    exchange.join();
+    try std.testing.expect(!ctx.failed);
+    try std.testing.expectEqual(@as(u16, 200), ctx.status);
+
+    pool.deinit();
+    origin_thread.join();
+
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
 }
 
 /// Walk an HTTP/2 frame stream looking for one frame type. Frames are

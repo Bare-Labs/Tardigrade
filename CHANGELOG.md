@@ -70,7 +70,10 @@ All notable user-facing changes to Tardigrade are documented here.
   chunked upload reserves the whole raw remainder the decoder borrows — framing
   octets included — releasing it as the decoder consumes it. Reservations are
   released on every exit — completion, client abort, cancellation, timeout,
-  malformed chunk framing, upstream failure — so the gauges return to zero.
+  malformed chunk framing, upstream failure — so the gauges return to zero, and
+  on HTTP/2 the request-direction claim ends at the upload/response boundary
+  rather than lasting the whole exchange, so a slow response cannot occupy
+  upload capacity that nothing is uploading into.
 
   The reservation is taken **before anything is sent upstream**: before the
   HTTP/1 request head is written and before HTTP/2 `HEADERS` go out. Reserving
