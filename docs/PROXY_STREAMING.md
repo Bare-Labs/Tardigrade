@@ -305,9 +305,9 @@ judged by what it was granted. Each connection therefore pins the complete
 low/high/hard policy it advertised, and every stream on it is measured against
 that, never against a newer snapshot.
 
-That is *every* per-stream decision, not just the queue: the shared per-stream
-budget and the response relay buffer are sized from the connection's pinned
-policy too. Taking any of them from the current config would put one stream
+That is *every* per-stream decision, not just the queue: the headroom held back
+for the relay buffer, and the relay buffer itself, are sized from the
+connection's pinned policy too. Taking any of them from the current config would put one stream
 under two generations of policy at once — its queue judged by what the
 connection advertised and the rest by whatever the config says now — which on a
 raise lets a stream own more than the hard limit it is documented to be

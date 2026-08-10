@@ -32,8 +32,7 @@ All notable user-facing changes to Tardigrade are documented here.
   configured origin. A reloaded limit applies immediately, including to origins
   already holding reservations.
 
-  The HTTP/2 response relay buffer is now charged too, closing the last gap in
-  "every application-owned proxy body buffer is accounted". The relay copies
+  The HTTP/2 response relay buffer is now charged too. The relay copies
   queued DATA out of the stream into a per-request buffer, and the queue's own
   reservation is not released until *after* the downstream write — so while a
   slow client blocks in that write, the same bytes are owned twice, and
@@ -56,18 +55,22 @@ All notable user-facing changes to Tardigrade are documented here.
   its logical length, since that is what drives the watermarks and
   `WINDOW_UPDATE` hysteresis.
 
-  Relay memory is also no longer allocated before a reservation admits it.
-  Matching the reservation's *size* was not enough: requests waiting on a slow
-  origin each took a buffer before charging any scope, so concurrent traffic
-  reached the very memory peak the aggregate limits exist to prevent and was
-  refused only afterwards. A bodiless response now allocates no relay buffer at
-  all, and an upload's buffer is released at the upload/response boundary
-  instead of being held empty through the response.
+  Relay memory is also no longer allocated before a reservation admits it, on
+  either protocol. Matching the reservation's *size* was not enough: requests
+  waiting on a slow origin each took a buffer before charging any scope, so
+  concurrent traffic reached the very memory peak the aggregate limits exist to
+  prevent and was refused only afterwards. On HTTP/1 the same buffer is what
+  `readUpstreamHead` reads into — past the blank line, so response body bytes
+  could already be sitting in it — which is why that path reserves before the
+  buffer exists and has no bodiless exemption: the buffer is what discovers
+  whether a body exists. On HTTP/2 a bodiless response allocates no relay
+  buffer at all, and an upload's buffer is released at the upload/response
+  boundary instead of being held empty through the response.
 
   Every per-stream decision for an HTTP/2 stream is now sourced from the policy
   its connection pinned when it was opened, not from the request's config
   snapshot. A pooled connection outlives reloads and its queue was already
-  judged by the advertised policy, so sizing the shared budget or the relay
+  judged by the advertised policy, so sizing the relay headroom or the relay
   buffer from the current config put one stream under two generations at
   once — on a raise letting it own more than the hard limit it is documented to
   be measured against, on a shrink refusing a stream still operating inside the
