@@ -572,6 +572,16 @@ pub fn handleLocationProxyPass(
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
                     return @intFromEnum(http.Status.service_unavailable);
                 }
+                // The upload's in-flight bytes outgrew the per-stream buffer
+                // hard limit (#140). Unlike the aggregate refusal above this is
+                // about *this* request rather than proxy-wide saturation, so it
+                // is the client's 413 and not a 503 — and, being a client fault
+                // raised before commitment, it is not charged to the origin.
+                if (err == error.RequestBufferLimitExceeded) {
+                    try sendApiError(allocator, writer, .payload_too_large, "payload_too_large", "Request body too large", correlation_id, false, state);
+                    ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.payload_too_large), 0);
+                    return @intFromEnum(http.Status.payload_too_large);
+                }
                 // The client's own chunked framing was bad or its upload
                 // outgrew the request-body maximum (#139). Both are client
                 // faults raised before any response byte is committed, so the

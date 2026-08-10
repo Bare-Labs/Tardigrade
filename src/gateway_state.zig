@@ -110,6 +110,32 @@ fn appendUpstreamLabelMetric(
     try out.appendSlice("\n");
 }
 
+/// Per-origin series that also carry the buffer `direction`. Cardinality stays
+/// bounded: two fixed directions per configured origin, and the direction label
+/// takes the same values as the process-wide buffer family.
+fn appendUpstreamDirectionLabelMetric(
+    out: *std.array_list.Managed(u8),
+    name: []const u8,
+    upstream: []const u8,
+    direction: http.proxy_buffer_account.Direction,
+    comptime value_fmt: []const u8,
+    value_args: anytype,
+) !void {
+    try out.appendSlice(name);
+    try out.appendSlice("{upstream=\"");
+    for (upstream) |c| switch (c) {
+        '\\' => try out.appendSlice("\\\\"),
+        '"' => try out.appendSlice("\\\""),
+        '\n' => try out.appendSlice("\\n"),
+        else => try out.append(c),
+    };
+    try out.appendSlice("\",direction=\"");
+    try out.appendSlice(direction.label());
+    try out.appendSlice("\"} ");
+    try out.print(value_fmt, value_args);
+    try out.appendSlice("\n");
+}
+
 pub const UpstreamPoolView = struct {
     fallback_url: []const u8,
     primary_urls: []const []const u8,
@@ -1773,9 +1799,9 @@ pub const GatewayState = struct {
                 \\# TYPE tardigrade_upstream_h2_pool_stream_resets_total counter
                 \\# HELP tardigrade_upstream_h2_pool_goaway_total GOAWAY frames received per origin
                 \\# TYPE tardigrade_upstream_h2_pool_goaway_total counter
-                \\# HELP tardigrade_upstream_h2_pool_buffered_bytes Response bytes currently queued in HTTP/2 stream buffers per origin
+                \\# HELP tardigrade_upstream_h2_pool_buffered_bytes Bytes currently held against this origin's proxy buffer account, by direction
                 \\# TYPE tardigrade_upstream_h2_pool_buffered_bytes gauge
-                \\# HELP tardigrade_upstream_h2_pool_buffer_limit_exceeded_total Origin-scope proxy buffer hard-limit refusals per origin
+                \\# HELP tardigrade_upstream_h2_pool_buffer_limit_exceeded_total Origin-scope proxy buffer hard-limit refusals per origin, by direction
                 \\# TYPE tardigrade_upstream_h2_pool_buffer_limit_exceeded_total counter
                 \\
             );
@@ -1784,8 +1810,13 @@ pub const GatewayState = struct {
                 try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_streams_active", snap.origin, "{d}", .{snap.streams_active});
                 try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_stream_resets_total", snap.origin, "{d}", .{snap.stream_resets_total});
                 try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_goaway_total", snap.origin, "{d}", .{snap.goaway_total});
-                try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_buffered_bytes", snap.origin, "{d}", .{snap.buffered_bytes});
-                try appendUpstreamLabelMetric(out, "tardigrade_upstream_h2_pool_buffer_limit_exceeded_total", snap.origin, "{d}", .{snap.buffer_limit_exceeded_total});
+                inline for (.{
+                    http.proxy_buffer_account.Direction.downstream_to_upstream,
+                    http.proxy_buffer_account.Direction.upstream_to_downstream,
+                }) |direction| {
+                    try appendUpstreamDirectionLabelMetric(out, "tardigrade_upstream_h2_pool_buffered_bytes", snap.origin, direction, "{d}", .{snap.bufferedBytes(direction)});
+                    try appendUpstreamDirectionLabelMetric(out, "tardigrade_upstream_h2_pool_buffer_limit_exceeded_total", snap.origin, direction, "{d}", .{snap.bufferLimitExceeded(direction)});
+                }
             }
         }
     }
@@ -1884,7 +1915,7 @@ pub const GatewayState = struct {
     /// an operator can put next to the configured limit.
     fn appendProxyBufferAggregatePrometheus(self: *GatewayState, out: *std.array_list.Managed(u8)) !void {
         try out.appendSlice(
-            \\# HELP tardigrade_proxy_buffer_aggregate_bytes_current Bytes reserved at the aggregate scope the configured hard limit is enforced against (HTTP/2 streaming response queues)
+            \\# HELP tardigrade_proxy_buffer_aggregate_bytes_current Bytes reserved at the aggregate scope the configured hard limit is enforced against (HTTP/2 stream queues, HTTP/1 relay buffers, and request-direction upload buffers)
             \\# TYPE tardigrade_proxy_buffer_aggregate_bytes_current gauge
             \\
         );

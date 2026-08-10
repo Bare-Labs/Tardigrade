@@ -55,8 +55,58 @@ All notable user-facing changes to Tardigrade are documented here.
   `tardigrade_proxy_buffer_aggregate_bytes_current{direction,scope="global"}`,
   read from the enforcing account. This is the series to compare with the
   configured limit: `tardigrade_buffered_bytes_current{scope="global"}` is a
-  roll-up across every proxy-owned buffer, while the limit currently governs
-  HTTP/2 streaming response queues only.
+  roll-up across every proxy-owned buffer, including the bounded buffered
+  compatibility path, which the limit does not govern.
+
+- **Client uploads are accounted and bounded the same way, and a slow origin is
+  now visible (#140)** — request-direction relay buffers on both HTTP/1 and
+  HTTP/2 now clear `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` (and, on
+  HTTP/2, the per-origin limit) before they are used, so concurrent uploads can
+  no longer multiply upload memory past the configured ceiling. An HTTP/2 upload
+  reserves its relay buffer once for the whole upload instead of reserving and
+  releasing per DATA frame, which was a flicker no concurrent stream could ever
+  have been bounded by. Bytes still held from the request head are accounted
+  too: a `Content-Length` upload reserves the body bytes it will forward, and a
+  chunked upload reserves the whole raw remainder the decoder borrows — framing
+  octets included — releasing it as the decoder consumes it. Reservations are
+  released on every exit — completion, client abort, cancellation, timeout,
+  malformed chunk framing, upstream failure — so the gauges return to zero, and
+  on HTTP/2 the request-direction claim ends at the upload/response boundary
+  rather than lasting the whole exchange, so a slow response cannot occupy
+  upload capacity that nothing is uploading into.
+
+  The reservation is taken **before anything is sent upstream**: before the
+  HTTP/1 request head is written and before HTTP/2 `HEADERS` go out. Reserving
+  inside the relay meant a local refusal could only be raised once the origin
+  had already received a real, possibly side-effecting request whose body then
+  never arrived.
+
+  Capacity refusals during an upload are now distinguished by what ran out,
+  because the two mean different things to the client. This upload's in-flight
+  bytes exceeding `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES` is a
+  `413 payload_too_large`; the proxy being out of room for anybody is a
+  `503 proxy_buffer_saturated`. Both are raised before the response head is
+  committed, and neither is charged to upstream health. Previously an HTTP/1
+  upload refusal surfaced as a `502` blamed on a healthy origin.
+
+  `tardigrade_buffer_read_pauses_total{side="downstream"}` and its resume
+  counterpart, which previously only ever read zero, now record the HTTP/1
+  upload relay finding the origin's send buffer full. That path deliberately has
+  no queue whose depth could cross a watermark — it reads the client again only
+  once the upstream write goes through — so a blocked upstream write *is* its
+  backpressure. Only a genuinely full send buffer counts: `poll` also reports a
+  descriptor ready for `POLLERR`/`POLLHUP`/`POLLNVAL`, and treating that as a
+  stall would make a dead origin look like a slow one. Only transitions are
+  counted, and a relay torn down mid-stall still reports its resume, so the
+  difference between the two counters reads as "how many uploads are stalled
+  right now".
+
+  `tardigrade_upstream_h2_pool_buffered_bytes` and
+  `tardigrade_upstream_h2_pool_buffer_limit_exceeded_total` now carry a
+  `direction` label. Uploads consume and refuse the same per-origin account as
+  response queues, so reporting only responses let these read zero while the
+  per-origin limit was actively bounding a request. Cardinality stays bounded at
+  two fixed directions per configured origin.
 
   A high watermark that could not be advertised as an HTTP/2 window is rejected
   at startup and reload. On reload, aggregate hard limits apply immediately,
