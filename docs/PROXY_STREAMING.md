@@ -292,6 +292,24 @@ judged by what it was granted. Each connection therefore pins the complete
 low/high/hard policy it advertised, and every stream on it is measured against
 that, never against a newer snapshot.
 
+That is *every* per-stream decision, not just the queue: the shared per-stream
+budget and the response relay buffer are sized from the connection's pinned
+policy too. Taking any of them from the current config would put one stream
+under two generations of policy at once — its queue judged by what the
+connection advertised and the rest by whatever the config says now — which on a
+raise lets a stream own more than the hard limit it is documented to be
+measured against, and on a shrink refuses a stream still operating inside the
+window that connection granted it. Either way the outcome would depend on
+whether a request happened to land on a pre-reload pooled connection.
+
+The relay buffer is a case of this worth naming. It is allocated at the size
+the *current* `proxy_stream_buffer_size` asks for, so a reload that grew it can
+hand an older connection a buffer its pinned policy was never validated to
+cover. The HTTP/2 relay therefore uses only as much of that buffer as the
+pinned policy can account for — at least 16 KiB, since that is the smallest
+relay any validated policy was checked against — and the remainder simply goes
+unused until the connection is replaced.
+
 ### HTTP/1 aggregate bounds
 
 An HTTP/1 relay has no queue, so the per-stream watermarks have nothing to

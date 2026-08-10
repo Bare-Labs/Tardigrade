@@ -53,6 +53,19 @@ All notable user-facing changes to Tardigrade are documented here.
   length, since that is what drives the watermarks and `WINDOW_UPDATE`
   hysteresis.
 
+  Every per-stream decision for an HTTP/2 stream is now sourced from the policy
+  its connection pinned when it was opened, not from the request's config
+  snapshot. A pooled connection outlives reloads and its queue was already
+  judged by the advertised policy, so sizing the shared budget or the relay
+  buffer from the current config put one stream under two generations at
+  once — on a raise letting it own more than the hard limit it is documented to
+  be measured against, on a shrink refusing a stream still operating inside the
+  window that connection granted it, with the outcome depending on whether the
+  request happened to reuse a pre-reload connection. Relatedly, the relay
+  buffer is allocated at the *current* `proxy_stream_buffer_size`, so the
+  HTTP/2 relay now uses only as much of it as the pinned policy can account
+  for (never less than 16 KiB) rather than assuming a reload-grown buffer fits.
+
   **Configuration change:** `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES`
   must now be at least
   `per_stream_high_watermark + max(proxy_stream_buffer_size, 16 KiB)`, and

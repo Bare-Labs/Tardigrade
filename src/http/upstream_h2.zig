@@ -889,6 +889,21 @@ pub fn H2Conn(comptime Transport: type) type {
             return stream;
         }
 
+        /// The proxy buffer policy this connection pinned when it was opened.
+        ///
+        /// Every per-stream decision for a stream on this connection must come
+        /// from here rather than from the caller's config snapshot. A pooled
+        /// connection outlives reloads, so a caller snapshot would judge one
+        /// stream by two generations of policy at once: the queue by what the
+        /// connection advertised, and anything the caller sized by whatever the
+        /// config says now. On a raise that lets a stream own more than the
+        /// hard limit it is documented to be measured against; on a shrink it
+        /// refuses a stream that is still operating inside the window this
+        /// connection granted it.
+        pub fn proxyBufferLimits(self: *const Self) proxy_buffer_account.Limits {
+            return self.buffer_limits;
+        }
+
         /// Start a streaming request and return immediately after the request
         /// HEADERS and any initial `req.body` DATA have reached the wire. This
         /// is the entry point for streaming uploads: the caller can then send
