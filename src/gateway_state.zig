@@ -1494,6 +1494,12 @@ pub const GatewayState = struct {
         self.metrics.recordProxyUpstreamAbort();
     }
 
+    pub fn metricsRecordProxyLocalCapacityAbort(self: *GatewayState) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyLocalCapacityAbort();
+    }
+
     pub fn metricsRecordProxyStreamingFallback(self: *GatewayState, reason: http.metrics.ProxyStreamingFallbackReason) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();
@@ -1841,6 +1847,7 @@ pub const GatewayState = struct {
         const http3_advertisement_state = self.http3_advertisement_state;
         self.runtime_mutex.unlock();
         try appendProxyBufferConfigPrometheus(&combined, proxy_buffer_limits);
+        try self.appendProxyBufferAggregatePrometheus(&combined);
         try appendTlsBufferConfigPrometheus(&combined, tls_buffer_limits);
         try combined.appendSlice(
             \\# HELP tardigrade_http3_effective_state HTTP/3 effective listener and advertisement state
@@ -1862,6 +1869,34 @@ pub const GatewayState = struct {
         }
         try self.appendUpstreamPoolPrometheus(&combined);
         return combined.toOwnedSlice();
+    }
+
+    /// The bytes the global hard limit is actually checked against, read
+    /// straight from the account that does the checking.
+    ///
+    /// This is deliberately a separate series from
+    /// `tardigrade_buffered_bytes_current{scope="global"}`: that gauge is a
+    /// roll-up of every proxy-owned buffer (bounded buffered responses, HTTP/1
+    /// relay buffers, request-side buffers, HTTP/2 queues), whereas
+    /// `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` is currently enforced
+    /// only against HTTP/2 streaming response queues. Comparing the roll-up
+    /// with the limit would mislead under mixed traffic; this series is the one
+    /// an operator can put next to the configured limit.
+    fn appendProxyBufferAggregatePrometheus(self: *GatewayState, out: *std.array_list.Managed(u8)) !void {
+        try out.appendSlice(
+            \\# HELP tardigrade_proxy_buffer_aggregate_bytes_current Bytes reserved at the aggregate scope the configured hard limit is enforced against (HTTP/2 streaming response queues)
+            \\# TYPE tardigrade_proxy_buffer_aggregate_bytes_current gauge
+            \\
+        );
+        inline for (.{
+            .{ "downstream_to_upstream", http.proxy_buffer_account.Direction.downstream_to_upstream },
+            .{ "upstream_to_downstream", http.proxy_buffer_account.Direction.upstream_to_downstream },
+        }) |entry| {
+            try out.print(
+                "tardigrade_proxy_buffer_aggregate_bytes_current{{direction=\"{s}\",scope=\"global\"}} {d}\n",
+                .{ entry[0], self.proxy_buffer_global_account.currentBytes(entry[1]) },
+            );
+        }
     }
 
     fn appendProxyBufferConfigPrometheus(out: *std.array_list.Managed(u8), limits: http.proxy_buffer_account.Limits) !void {
@@ -3611,13 +3646,14 @@ fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) voi
     gs.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
     gs.h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
     gs.http3_advertisement_state = .disabled;
-    gs.proxy_buffer_limits = .{
-        .per_stream_low_watermark = 256 * 1024,
-        .per_stream_high_watermark = 768 * 1024,
-        .per_stream_hard_limit = 1024 * 1024,
-        .per_origin_hard_limit = 0,
-        .global_hard_limit = 0,
-    };
+    gs.proxy_buffer_limits = http.proxy_buffer_account.Limits.defaults();
+    // The state starts as `undefined`, so every field the metrics path reads
+    // has to be set here — the aggregate account is rendered as a gauge, and
+    // leaving it uninitialized would put garbage in the served metrics.
+    gs.proxy_buffer_global_account = http.proxy_buffer_account.Aggregate.init(
+        .global,
+        gs.proxy_buffer_limits.global_hard_limit,
+    );
     gs.tls_buffer_limits = @import("tls_core").encrypted_stream.BufferLimits.defaults();
 }
 
@@ -3675,6 +3711,36 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 786432\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_config_limit_bytes{queue=\"outbound_ciphertext\",limit=\"hard\"}") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_effective_state{state=\"disabled\"} 1\n") != null);
+}
+
+test "served Prometheus metrics expose the aggregate bytes the global limit is enforced against" {
+    var gs: GatewayState = undefined;
+    initMetricsJsonTestState(&gs, std.testing.allocator);
+    defer gs.h2_pool.deinit();
+    defer gs.upstream_pool.deinit();
+    defer gs.mux_subscriptions_by_device.deinit();
+
+    gs.proxy_buffer_global_account.setHardLimit(4096);
+    try gs.proxy_buffer_global_account.reserve(.upstream_to_downstream, 1500);
+
+    // A buffered response also moves the generic roll-up gauge. The two series
+    // are intentionally different quantities: the roll-up covers every
+    // proxy-owned buffer, while the aggregate gauge is exactly what the
+    // configured global hard limit is checked against.
+    gs.metrics.recordProxyBufferedRequest(64, 5);
+
+    const prom = try gs.metricsToPrometheus(std.testing.allocator);
+    defer std.testing.allocator.free(prom);
+
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_buffer_aggregate_bytes_current{direction=\"upstream_to_downstream\",scope=\"global\"} 1500\n") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_buffer_aggregate_bytes_current{direction=\"downstream_to_upstream\",scope=\"global\"} 0\n") != null);
+    // The roll-up reports the buffered response, not the enforced reservation.
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffered_bytes_current{direction=\"upstream_to_downstream\",scope=\"global\"} 64\n") != null);
+
+    gs.proxy_buffer_global_account.release(.upstream_to_downstream, 1500);
+    const drained = try gs.metricsToPrometheus(std.testing.allocator);
+    defer std.testing.allocator.free(drained);
+    try std.testing.expect(std.mem.find(u8, drained, "tardigrade_proxy_buffer_aggregate_bytes_current{direction=\"upstream_to_downstream\",scope=\"global\"} 0\n") != null);
 }
 
 test "served Prometheus metrics reflect updated proxy buffer limit snapshot" {

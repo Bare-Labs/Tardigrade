@@ -186,12 +186,26 @@ than its logical length — a drained queue that still owned its peak buffer
 would otherwise be invisible to these limits. A queue's storage (and its
 reservation) is released as soon as it drains empty.
 
-This is also why the two current-byte gauges move on different schedules:
+This is also why the current-byte gauges move on different schedules:
 `tardigrade_buffered_bytes_current{scope="stream"}` reports logical queue
-occupancy, while `scope="global"` reports retained allocation — the same
-quantity `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` is enforced against,
-so the gauge and its limit are directly comparable. A partially drained queue
-shows a lower stream value than global value; that is the buffer it still owns.
+occupancy, while `scope="global"` reports retained allocation. A partially
+drained queue shows a lower stream value than global value; that is the buffer
+it still owns.
+
+**Do not compare `tardigrade_buffered_bytes_current{scope="global"}` with
+`TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES`.** That gauge is a roll-up of
+every proxy-owned buffer — bounded buffered responses, HTTP/1 relay buffers,
+request-side buffers, and HTTP/2 stream queues — whereas the hard limit is
+currently enforced only against HTTP/2 streaming response queues. Under mixed
+traffic the roll-up is larger than the quantity being checked, so reading it as
+"how close am I to the limit" overstates pressure.
+
+The series to put next to the limit is
+`tardigrade_proxy_buffer_aggregate_bytes_current{direction,scope="global"}`,
+which is read directly from the account that performs the enforcement. Bringing
+the remaining paths under the same aggregate is request-direction work (the
+issue's PR 3); until then these two gauges answer different questions, and the
+narrower one is the one the limit governs.
 
 #### What a refusal does
 

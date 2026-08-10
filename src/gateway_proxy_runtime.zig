@@ -632,7 +632,15 @@ pub fn handleLocationProxyPass(
                     state.recordUpstreamSuccess(cfg, selection.base_url);
                 }
             }
-            if (streamed.upstream_aborted) state.metricsRecordProxyUpstreamAbort();
+            // `tardigrade_proxy_upstream_aborts_total` means "aborted by the
+            // origin". A truncation this proxy caused by running out of buffer
+            // capacity is not that, and counting it there would misattribute
+            // local pressure to the origin in dashboards and alerts.
+            if (streamed.local_capacity_aborted) {
+                state.metricsRecordProxyLocalCapacityAbort();
+            } else if (streamed.upstream_aborted) {
+                state.metricsRecordProxyUpstreamAbort();
+            }
             state.metricsRecordProxyStreamingRequest(streamed.upstream_ttfb_ms);
             ctx.setUpstreamResult(resolved.upstream_host, streamed.status_code, streamed.response_body_bytes);
             state.metricsRecord(streamed.status_code);

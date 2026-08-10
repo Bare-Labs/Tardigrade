@@ -54,10 +54,17 @@ logs are written through `src/http/logger.zig`.
   URLs, request IDs, or stream IDs. Current byte gauges cover bounded buffered
   responses, HTTP/1 streaming relay buffers, and HTTP/2 streaming response
   queues. `scope="stream"` reports logical queue occupancy; `scope="global"`
-  reports retained allocation, which is the quantity the global hard limit is
-  enforced against, so that gauge is directly comparable to
-  `tardigrade_buffer_config_limit_bytes{scope="global"}`. The two differ while a
-  queue is partially drained but still owns its buffer.
+  reports retained allocation, and the two differ while a queue is partially
+  drained but still owns its buffer. The `scope="global"` series is a roll-up
+  across *all* proxy paths and is **not** the quantity the configured global
+  hard limit is checked against — see the next entry.
+- the aggregate bytes the global hard limit is enforced against:
+  `tardigrade_proxy_buffer_aggregate_bytes_current{direction,scope="global"}`,
+  read directly from the account that performs the enforcement. Today that
+  covers HTTP/2 streaming response queues only, so this is the series to compare
+  with `tardigrade_buffer_config_limit_bytes{scope="global",limit="hard"}`;
+  comparing the broader `tardigrade_buffered_bytes_current{scope="global"}`
+  roll-up with that limit overstates pressure under mixed traffic.
   `tardigrade_buffer_limit_exceeded_total` carries `scope="origin"` and
   `scope="global"` alongside `scope="stream"`: an aggregate refusal means the
   upstream origin (or the process) had no room for bytes the stream itself could
@@ -94,8 +101,14 @@ logs are written through `src/http/logger.zig`.
   handshake low/high/hard watermarks. These are not described as enforced by
   OpenSSL.
 - reverse-proxy abort counters:
-  `tardigrade_proxy_client_aborts_total` and
-  `tardigrade_proxy_upstream_aborts_total`
+  `tardigrade_proxy_client_aborts_total`,
+  `tardigrade_proxy_upstream_aborts_total`, and
+  `tardigrade_proxy_local_capacity_aborts_total`. The three are mutually
+  exclusive causes for one truncated transfer: the client went away, the origin
+  went away, or this proxy ran out of buffer capacity after the response head
+  was committed. The last is local pressure and is deliberately kept out of the
+  upstream series, and out of upstream health and circuit-breaker state, so it
+  cannot be mistaken for an origin fault.
 - reverse-proxy streaming fallback event counter:
   `tardigrade_proxy_streaming_fallback_total{reason=...}` with fixed reasons
   `policy_disabled`, `retries_configured`, and `early_data_retry_semantics` for

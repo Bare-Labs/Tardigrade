@@ -163,6 +163,7 @@ pub const Metrics = struct {
     tls_buffer_stalled_drives: [tls_backend_count]u64,
     proxy_client_aborts: u64,
     proxy_upstream_aborts: u64,
+    proxy_local_capacity_aborts: u64,
     proxy_streaming_fallback_policy_disabled: u64,
     proxy_streaming_fallback_retries_configured: u64,
     proxy_streaming_fallback_missing_content_length: u64,
@@ -323,6 +324,7 @@ pub const Metrics = struct {
             .tls_buffer_stalled_drives = .{0} ** tls_backend_count,
             .proxy_client_aborts = 0,
             .proxy_upstream_aborts = 0,
+            .proxy_local_capacity_aborts = 0,
             .proxy_streaming_fallback_policy_disabled = 0,
             .proxy_streaming_fallback_retries_configured = 0,
             .proxy_streaming_fallback_missing_content_length = 0,
@@ -743,6 +745,13 @@ pub const Metrics = struct {
         self.proxy_upstream_aborts += 1;
     }
 
+    /// A relay truncated because *this proxy* ran out of buffer capacity after
+    /// the response head was committed. Deliberately separate from
+    /// `proxy_upstream_aborts`, which means the origin aborted.
+    pub fn recordProxyLocalCapacityAbort(self: *Metrics) void {
+        self.proxy_local_capacity_aborts += 1;
+    }
+
     /// Exhaustive by construction: a new `ProxyStreamingFallbackReason` case
     /// fails to compile here until it is given a counter, which is what keeps a
     /// reason from being emitted into a metric that silently drops it.
@@ -1024,6 +1033,9 @@ pub const Metrics = struct {
             \\# HELP tardigrade_proxy_upstream_aborts_total Total proxied transfers aborted by upstream origins
             \\# TYPE tardigrade_proxy_upstream_aborts_total counter
             \\tardigrade_proxy_upstream_aborts_total {d}
+            \\# HELP tardigrade_proxy_local_capacity_aborts_total Total proxied responses truncated after commitment because local proxy buffer capacity was exhausted
+            \\# TYPE tardigrade_proxy_local_capacity_aborts_total counter
+            \\tardigrade_proxy_local_capacity_aborts_total {d}
             \\# HELP tardigrade_proxy_streaming_fallback_total Total streaming eligibility fallback events by reason
             \\# TYPE tardigrade_proxy_streaming_fallback_total counter
             \\tardigrade_proxy_streaming_fallback_total{{reason="policy_disabled"}} {d}
@@ -1059,6 +1071,7 @@ pub const Metrics = struct {
         , .{
             self.proxy_client_aborts,
             self.proxy_upstream_aborts,
+            self.proxy_local_capacity_aborts,
             self.proxy_streaming_fallback_policy_disabled,
             self.proxy_streaming_fallback_retries_configured,
             self.proxy_streaming_fallback_missing_content_length,
@@ -1997,6 +2010,12 @@ test "Metrics tracks active connections and rejections" {
     try std.testing.expectEqual(@as(u64, 128), m.proxy_buffered_bytes_total);
     try std.testing.expectEqual(@as(u64, 1), m.proxy_client_aborts);
     try std.testing.expectEqual(@as(u64, 1), m.proxy_upstream_aborts);
+    // Local-capacity truncations are counted separately from origin aborts:
+    // `tardigrade_proxy_upstream_aborts_total` means the *origin* gave up.
+    try std.testing.expectEqual(@as(u64, 0), m.proxy_local_capacity_aborts);
+    m.recordProxyLocalCapacityAbort();
+    try std.testing.expectEqual(@as(u64, 1), m.proxy_local_capacity_aborts);
+    try std.testing.expectEqual(@as(u64, 1), m.proxy_upstream_aborts);
     try std.testing.expectEqual(@as(u64, 2), m.proxy_ttfb_ms_count);
     try std.testing.expectEqual(@as(u64, 20), m.proxy_ttfb_ms_sum);
     m.setUpstreamUnhealthyBackends(3);
@@ -2182,6 +2201,8 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_read_resumes_total{side=\"upstream\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"upstream_to_downstream\",scope=\"stream\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"upstream_to_downstream\",scope=\"origin\"} 1") != null);
+    // A local-capacity truncation must not land in the upstream-abort series.
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_local_capacity_aborts_total 0") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"downstream_to_upstream\",scope=\"global\"} 1") != null);
     // Aggregate scopes are counted independently of the per-stream scope.
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"downstream_to_upstream\",scope=\"origin\"} 0") != null);

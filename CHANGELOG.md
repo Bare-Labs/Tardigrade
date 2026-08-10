@@ -45,8 +45,18 @@ All notable user-facing changes to Tardigrade are documented here.
   `RST_STREAM(FLOW_CONTROL_ERROR)` instead of being left to keep sending on a
   stream the proxy had already failed.
   `tardigrade_buffer_limit_exceeded_total` now carries `scope="origin"` and
-  `scope="global"` alongside `scope="stream"`, and per-origin queued bytes are
-  visible as `tardigrade_upstream_h2_pool_buffered_bytes{upstream}`.
+  `scope="global"` alongside `scope="stream"`; per-origin queued bytes are
+  visible as `tardigrade_upstream_h2_pool_buffered_bytes{upstream}`; and a
+  post-commitment truncation is counted as
+  `tardigrade_proxy_local_capacity_aborts_total` rather than
+  `tardigrade_proxy_upstream_aborts_total`, which means the *origin* aborted.
+
+  The bytes the global hard limit is actually checked against are exported as
+  `tardigrade_proxy_buffer_aggregate_bytes_current{direction,scope="global"}`,
+  read from the enforcing account. This is the series to compare with the
+  configured limit: `tardigrade_buffered_bytes_current{scope="global"}` is a
+  roll-up across every proxy-owned buffer, while the limit currently governs
+  HTTP/2 streaming response queues only.
 
   A high watermark that could not be advertised as an HTTP/2 window is rejected
   at startup and reload. On reload, aggregate hard limits apply immediately,
