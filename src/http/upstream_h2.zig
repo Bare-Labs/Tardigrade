@@ -64,6 +64,16 @@ const CONN_RECV_WINDOW: i64 = 8 << 20;
 const WAIT_SWEEP_INTERVAL_MS: u64 = 1_000;
 const STREAM_ID: u31 = 1;
 
+/// RST_STREAM error codes we emit (RFC 9113 §7).
+const RST_FLOW_CONTROL_ERROR: u32 = 0x3;
+const RST_CANCEL: u32 = 0x8;
+
+fn rstStreamPayload(code: u32) [4]u8 {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, code, .big);
+    return buf;
+}
+
 pub const H2Error = error{
     Http2Timeout,
     Http2GoAway,
@@ -101,6 +111,24 @@ pub const Request = struct {
 pub const BodyMode = enum {
     complete,
     streaming,
+};
+
+/// Why a stream was aborted. `local_capacity` means *this proxy* ran out of
+/// buffer room, which is never evidence about the origin — the distinction has
+/// to survive all the way out to status selection and upstream health.
+pub const AbortCause = enum {
+    none,
+    upstream,
+    local_capacity,
+};
+
+/// How far the downstream response has got. The transition to `committing` is
+/// the linearization point for the commitment boundary: taken under
+/// `state_mutex`, it makes "did the reader reject DATA before or after we
+/// started writing the head?" a decided question rather than a race.
+pub const DownstreamCommitState = enum {
+    precommit,
+    committing,
 };
 
 pub const Response = struct {
@@ -471,15 +499,18 @@ pub const Stream = struct {
     /// reader extends it on progress). Bounds every wait even when the shared
     /// connection stays busy with other streams (#196 guarantee).
     wait_deadline_ms: u64 = 0,
-    /// True once the stream's HEADERS frame reached the wire. Guards
-    /// `finishStreaming`'s RST_STREAM: resetting a stream the peer never saw
-    /// (idle state) would be a connection-level PROTOCOL_ERROR. Written and
-    /// read only by the owning worker thread.
+    /// True once the stream's HEADERS frame is being put on the wire. Guards
+    /// every RST_STREAM: resetting a stream the peer never saw (idle state)
+    /// would be a connection-level PROTOCOL_ERROR. Set by the owning worker and
+    /// read by the reader thread, so it lives under `state_mutex` like the rest
+    /// of the stream state machine.
     wire_opened: bool = false,
     local_abort: bool = false,
-    /// Set once the reader has emitted RST_STREAM for a locally aborted stream,
-    /// so `finishStreaming` does not send a second one.
+    /// Set once the reader has emitted RST_STREAM for this stream, so
+    /// `finishStreaming` does not send a second one.
     rst_sent: bool = false,
+    abort_cause: AbortCause = .none,
+    downstream_state: DownstreamCommitState = .precommit,
     /// Per-stream logical queue length: the bytes a downstream consumer has not
     /// taken yet. Drives the high/low watermark hysteresis.
     proxy_body_account: ?proxy_buffer_account.Account = null,
@@ -566,6 +597,9 @@ pub const Stream = struct {
         try self.body.ensureTotalCapacityPrecise(allocator, needed_capacity);
         self.body.appendSliceAssumeCapacity(payload);
         self.proxy_capacity_reserved += capacity_delta;
+        if (self.proxy_buffer_observer) |observer| {
+            observer.recordRetainedBytes(direction, capacity_delta);
+        }
 
         const after = account.snapshot();
         const crossed_high = after.high_watermark_events > before.high_watermark_events;
@@ -600,7 +634,11 @@ pub const Stream = struct {
     /// aggregate limits exist to prevent.
     fn releaseRetainedStorage(self: *Stream) void {
         if (self.proxy_capacity_reserved == 0) return;
-        self.proxy_buffer_capacity.release(self.accountDirection(), self.proxy_capacity_reserved);
+        const direction = self.accountDirection();
+        self.proxy_buffer_capacity.release(direction, self.proxy_capacity_reserved);
+        if (self.proxy_buffer_observer) |observer| {
+            observer.releaseRetainedBytes(direction, self.proxy_capacity_reserved);
+        }
         self.proxy_capacity_reserved = 0;
     }
 
@@ -917,6 +955,28 @@ pub fn H2Conn(comptime Transport: type) type {
             if (write_result) |_| {} else |err| return self.markWriteFailure(err);
         }
 
+        /// Claim the commitment boundary for this stream's downstream response.
+        /// Call immediately before writing the response head; it fails when the
+        /// stream was already aborted for local buffer capacity, so a refusal
+        /// that physically happened before the head reached the client is
+        /// reported as one instead of becoming a truncated origin status.
+        ///
+        /// Once this returns, the reader knows the head is going out and later
+        /// capacity failures are handled as post-commitment truncations.
+        pub fn beginDownstreamCommit(self: *Self, stream: *Stream) error{BufferLimitExceeded}!void {
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+            if (stream.abort_cause == .local_capacity) return error.BufferLimitExceeded;
+            stream.downstream_state = .committing;
+        }
+
+        /// Why this stream aborted, if it did.
+        pub fn abortCause(self: *Self, stream: *Stream) AbortCause {
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+            return stream.abort_cause;
+        }
+
         /// Copy the next chunk of a streaming response body into `out`,
         /// blocking (deadline-bounded) until data, end-of-stream, or an error.
         /// Returns 0 at end of stream. The caller must acknowledge each
@@ -1084,11 +1144,24 @@ pub fn H2Conn(comptime Transport: type) type {
             // per frame — and, crucially, never holds it while waiting on
             // state_mutex for flow-control window (the reader needs write_mutex
             // for PING/SETTINGS acks; holding both would deadlock it).
+            //
+            // Publish `wire_opened` under `state_mutex` *before* the write: a
+            // fast origin can respond the instant the HEADERS syscall lands, so
+            // the reader may need to reset this stream while this thread is
+            // still inside the write. Setting it afterwards left the reader
+            // racing a plain store and potentially skipping a reset for a
+            // stream the peer had already seen. A failed write poisons
+            // `conn_err`, which keeps `finishStreaming` from emitting a reset
+            // for a request that never reached the peer.
+            {
+                self.state_mutex.lock();
+                stream.wire_opened = true;
+                self.state_mutex.unlock();
+            }
             self.write_mutex.lock();
             const write_result = self.writeHeaderBlockLocked(stream.id, block, end_stream);
             self.write_mutex.unlock();
             if (write_result) |_| {} else |err| return self.markWriteFailure(err);
-            stream.wire_opened = true;
             if (req.body.len > 0) try self.sendBody(stream, req.body, request_body_complete);
         }
 
@@ -1347,7 +1420,9 @@ pub fn H2Conn(comptime Transport: type) type {
             const maybe_stream = self.streams.get(fr.stream_id);
             var replenish_stream = false;
             var flow_violation = false;
-            var reset_stream = false;
+            // RST_STREAM error code to emit for this stream once the lock is
+            // dropped, if any (RFC 9113 §7).
+            var reset_code: ?u32 = null;
             if (maybe_stream) |s| {
                 var deliver = fr.payload.len > 0;
                 // A stream we already gave up on is discard-only. Without this,
@@ -1366,6 +1441,17 @@ pub fn H2Conn(comptime Transport: type) type {
                     s.recv_window -= @as(i64, @intCast(fr.payload.len));
                     if (s.recv_window < 0) {
                         if (s.err == null) s.err = error.Http2FlowControlError;
+                        // Tell the peer to stop. Without this the origin keeps
+                        // sending on a stream we have already failed — the
+                        // connection window is replenished per frame, so
+                        // nothing else would slow it down — until the worker
+                        // eventually finishes the stream. `finishStreaming`
+                        // will not cover this either: its predicate skips
+                        // streams carrying a non-local error.
+                        if (!s.rst_sent and s.wire_opened) {
+                            s.rst_sent = true;
+                            reset_code = RST_FLOW_CONTROL_ERROR;
+                        }
                         flow_violation = true;
                         deliver = false;
                     }
@@ -1381,9 +1467,10 @@ pub fn H2Conn(comptime Transport: type) type {
                         error.BufferLimitExceeded => {
                             if (s.err == null) s.err = err;
                             s.local_abort = true;
+                            s.abort_cause = .local_capacity;
                             if (!s.rst_sent and s.wire_opened) {
                                 s.rst_sent = true;
-                                reset_stream = true;
+                                reset_code = RST_CANCEL;
                             }
                             deliver = false;
                         },
@@ -1402,9 +1489,9 @@ pub fn H2Conn(comptime Transport: type) type {
             self.state_mutex.unlock();
             // Send-window waiters block on the connection cond.
             if (flow_violation) self.cond.broadcast();
-            if (reset_stream) {
-                const cancel_code = [4]u8{ 0, 0, 0, 8 }; // CANCEL
-                self.writeControl(.rst_stream, 0, fr.stream_id, &cancel_code);
+            if (reset_code) |code| {
+                const payload = rstStreamPayload(code);
+                self.writeControl(.rst_stream, 0, fr.stream_id, &payload);
             }
 
             if (fr.payload.len > 0) {
@@ -2014,6 +2101,9 @@ const TestProxyBufferObserver = struct {
     global_limit_exceeded: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     read_pauses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     read_resumes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Mirrors what the `scope="global"` gauge would report: retained
+    /// allocation, which moves on a different schedule from `current`.
+    retained: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     fn observer(self: *TestProxyBufferObserver) proxy_buffer_account.Observer {
         return .{
@@ -2023,7 +2113,19 @@ const TestProxyBufferObserver = struct {
             .recordAggregateLimitExceededFn = recordAggregateLimitExceeded,
             .recordReadPauseFn = recordReadPause,
             .recordReadResumeFn = recordReadResume,
+            .recordRetainedBytesFn = recordRetained,
+            .releaseRetainedBytesFn = releaseRetained,
         };
+    }
+
+    fn recordRetained(context: *anyopaque, _: proxy_buffer_account.Direction, bytes: usize) void {
+        const self: *TestProxyBufferObserver = @ptrCast(@alignCast(context));
+        _ = self.retained.fetchAdd(bytes, .monotonic);
+    }
+
+    fn releaseRetained(context: *anyopaque, _: proxy_buffer_account.Direction, bytes: usize) void {
+        const self: *TestProxyBufferObserver = @ptrCast(@alignCast(context));
+        _ = self.retained.fetchSub(bytes, .monotonic);
     }
 
     fn recordReadPause(context: *anyopaque, _: proxy_buffer_account.Side) void {
@@ -2849,13 +2951,22 @@ test "streaming response trailers end the stream and are discarded" {
     _ = std.c.close(fds[1]);
 }
 
+/// What the flow-violation server observed coming back from the client.
+const FlowViolationObservation = struct {
+    /// Set once the client's PING ACK arrives, proving its reader has processed
+    /// every frame the server sent — including the over-window one.
+    saw_ack: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    rst_stream_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    rst_code: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+};
+
 /// Canned server that violates flow control: sends `window` bytes of DATA
 /// (filling the advertised stream window exactly) plus one more frame beyond it
 /// without waiting for replenishment, then a PING whose ACK proves the client's
-/// reader has processed every prior frame. `saw_ack` is set once the ACK
-/// arrives so the test can start consuming deterministically. `window` must be
-/// a multiple of `DEFAULT_MAX_FRAME`.
-fn cannedFlowViolationServer(peer_fd: std.posix.fd_t, window: usize, saw_ack: *std.atomic.Value(bool)) void {
+/// reader has processed every prior frame. `window` must be a multiple of
+/// `DEFAULT_MAX_FRAME`. Any RST_STREAM the client sends before that ACK is
+/// recorded, which is how the overrun reset is asserted.
+fn cannedFlowViolationServer(peer_fd: std.posix.fd_t, window: usize, obs: *FlowViolationObservation) void {
     const a = std.heap.page_allocator;
     var srv = PlainTransport{ .fd = peer_fd };
     var preface: [PREFACE.len]u8 = undefined;
@@ -2888,9 +2999,13 @@ fn cannedFlowViolationServer(peer_fd: std.posix.fd_t, window: usize, saw_ack: *s
     while (true) {
         var fr = readFrameBounded(&srv, peer_fd, a, 5000) catch return;
         const is_ack = fr.typ == .ping and (fr.flags & frame.Flags.ACK) != 0;
+        if (fr.typ == .rst_stream and fr.payload.len >= 4) {
+            obs.rst_code.store(std.mem.readInt(u32, fr.payload[0..4], .big), .release);
+            obs.rst_stream_id.store(@intCast(fr.stream_id), .release);
+        }
         frame.deinitFrame(a, &fr);
         if (is_ack) {
-            saw_ack.store(true, .release);
+            obs.saw_ack.store(true, .release);
             return;
         }
     }
@@ -2898,8 +3013,8 @@ fn cannedFlowViolationServer(peer_fd: std.posix.fd_t, window: usize, saw_ack: *s
 
 test "streaming stream fails when the peer overruns the advertised window" {
     const fds = try makeSocketpair();
-    var saw_ack = std.atomic.Value(bool).init(false);
-    const server = try std.Thread.spawn(.{}, cannedFlowViolationServer, .{ fds[1], DEFAULT_STREAM_RECV_WINDOW, &saw_ack });
+    var obs = FlowViolationObservation{};
+    const server = try std.Thread.spawn(.{}, cannedFlowViolationServer, .{ fds[1], DEFAULT_STREAM_RECV_WINDOW, &obs });
 
     var transport = PlainTransport{ .fd = fds[0] };
     const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 5000, null, null, null, windowLimits(DEFAULT_STREAM_RECV_WINDOW));
@@ -2910,8 +3025,8 @@ test "streaming stream fails when the peer overruns the advertised window" {
     // server sent — including the over-window one — so the violation is
     // recorded before we start draining (draining replenishes the window).
     var spins: usize = 0;
-    while (!saw_ack.load(.acquire) and spins < 100_000_000) : (spins += 1) std.Thread.yield() catch {};
-    try testing.expect(saw_ack.load(.acquire));
+    while (!obs.saw_ack.load(.acquire) and spins < 100_000_000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expect(obs.saw_ack.load(.acquire));
 
     // The in-window megabyte drains fine; the overrun then surfaces as a
     // flow-control error rather than unbounded buffering.
@@ -2925,6 +3040,12 @@ test "streaming stream fails when the peer overruns the advertised window" {
     };
     try testing.expectEqual(@as(usize, DEFAULT_STREAM_RECV_WINDOW), total);
     try testing.expectError(error.Http2FlowControlError, @as(anyerror!void, read_err));
+
+    // The peer is actually told to stop. Without a reset it could keep sending
+    // on a stream we have already failed — the connection window is replenished
+    // per frame, so nothing else would slow it down.
+    try testing.expectEqual(@as(u32, stream.id), obs.rst_stream_id.load(.acquire));
+    try testing.expectEqual(RST_FLOW_CONTROL_ERROR, obs.rst_code.load(.acquire));
 
     conn.finishStreaming(stream);
     conn.deinit();
@@ -2941,8 +3062,8 @@ test "configured per-stream window replaces the default streaming receive window
     try testing.expectEqual(@as(u31, 4 * DEFAULT_MAX_FRAME), window);
 
     const fds = try makeSocketpair();
-    var saw_ack = std.atomic.Value(bool).init(false);
-    const server = try std.Thread.spawn(.{}, cannedFlowViolationServer, .{ fds[1], @as(usize, window), &saw_ack });
+    var obs = FlowViolationObservation{};
+    const server = try std.Thread.spawn(.{}, cannedFlowViolationServer, .{ fds[1], @as(usize, window), &obs });
 
     var transport = PlainTransport{ .fd = fds[0] };
     const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 5000, null, null, null, limits);
@@ -2950,8 +3071,8 @@ test "configured per-stream window replaces the default streaming receive window
     const stream = try conn.requestStreaming(.{ .method = "GET", .authority = "window.test", .path = "/" });
 
     var spins: usize = 0;
-    while (!saw_ack.load(.acquire) and spins < 100_000_000) : (spins += 1) std.Thread.yield() catch {};
-    try testing.expect(saw_ack.load(.acquire));
+    while (!obs.saw_ack.load(.acquire) and spins < 100_000_000) : (spins += 1) std.Thread.yield() catch {};
+    try testing.expect(obs.saw_ack.load(.acquire));
 
     var total: usize = 0;
     var buf: [8 * 1024]u8 = undefined;
@@ -3011,10 +3132,16 @@ test "streaming response reservations clear every aggregate scope after teardown
 }
 
 /// Canned server for the concurrent-stream aggregate case: answers two
-/// streams, fills the first with `first_bytes` of DATA and then sends
-/// `second_bytes` on the second, and reports the id of whichever stream the
-/// client resets. Both DATA bursts stay inside each stream's own advertised
-/// window, so anything the client refuses it refuses on aggregate grounds.
+/// streams, completes the first with `first_bytes` of DATA carrying
+/// END_STREAM, then sends `second_bytes` on the second. Both bursts stay
+/// inside each stream's own advertised window, so anything the client refuses
+/// it refuses on aggregate grounds.
+///
+/// The first stream is completed rather than left open on purpose: a
+/// wire-open stream is legitimately reset by `finishStreaming`, and an earlier
+/// revision of this test recorded that unrelated CANCEL as "the" reset and
+/// failed on CI. The server records *every* reset id so the assertion can be
+/// about which stream was reset for the capacity event, not about ordering.
 fn cannedTwoStreamServer(
     peer_fd: std.posix.fd_t,
     first_bytes: usize,
@@ -3048,7 +3175,9 @@ fn cannedTwoStreamServer(
     }
 
     const payload = [_]u8{'x'} ** 256;
-    frame.writeFrame(&srv, .data, 0, ids[0], payload[0..first_bytes]) catch return;
+    // END_STREAM: the healthy stream completes, so nothing later has cause to
+    // reset it and any reset the client sends is the capacity one.
+    frame.writeFrame(&srv, .data, frame.Flags.END_STREAM, ids[0], payload[0..first_bytes]) catch return;
     frame.writeFrame(&srv, .data, 0, ids[1], payload[0..second_bytes]) catch return;
 
     while (true) {
@@ -3104,11 +3233,22 @@ test "origin capacity bounds concurrent streams and refuses only the overflowing
     // The second stream is refused; the first is untouched and still usable.
     var buf: [128]u8 = undefined;
     try testing.expectError(error.BufferLimitExceeded, conn.readStreamingBody(refused, buf[0..]));
+    try testing.expectEqual(AbortCause.local_capacity, conn.abortCause(refused));
+    // The refusal landed before any head relay, so claiming the commitment
+    // boundary must fail — this is what turns the race into a pre-commit 503
+    // instead of a committed origin status followed by a truncation.
+    try testing.expectError(error.BufferLimitExceeded, conn.beginDownstreamCommit(refused));
+    // The healthy stream can still commit.
+    try conn.beginDownstreamCommit(slow);
     try testing.expect(origin.currentBytes(.upstream_to_downstream) <= window);
 
     const n = try conn.readStreamingBody(slow, buf[0..]);
     try testing.expectEqual(window, n);
     conn.acknowledgeStreamingBody(slow, n);
+    // The healthy stream reaches a clean end of stream rather than being
+    // collateral damage of the other stream's capacity abort.
+    try testing.expectEqual(@as(usize, 0), try conn.readStreamingBody(slow, buf[0..]));
+    try testing.expectEqual(AbortCause.none, conn.abortCause(slow));
 
     const refused_id: u32 = refused.id;
     conn.finishStreaming(refused);
@@ -3129,6 +3269,95 @@ test "origin capacity bounds concurrent streams and refuses only the overflowing
     // The global scope had room; its rolled-back reservation must not have
     // been counted as a global refusal either.
     try testing.expectEqual(@as(u64, 0), observer.limit_exceeded.load(.monotonic));
+}
+
+/// Canned server that answers before the client has finished uploading: it
+/// replies with HEADERS and a DATA burst as soon as the request head arrives,
+/// while the client is still writing request body frames.
+fn cannedEarlyResponseServer(peer_fd: std.posix.fd_t, body_bytes: usize, saw_rst: *std.atomic.Value(bool)) void {
+    const a = std.heap.page_allocator;
+    var srv = PlainTransport{ .fd = peer_fd };
+    var preface: [PREFACE.len]u8 = undefined;
+    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+
+    var req_stream: u31 = 0;
+    while (req_stream == 0) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        if (fr.typ == .headers) req_stream = fr.stream_id;
+        frame.deinitFrame(a, &fr);
+    }
+
+    const block = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+    }) catch return;
+    defer a.free(block);
+    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, block) catch return;
+    const payload = [_]u8{'x'} ** 256;
+    frame.writeFrame(&srv, .data, 0, req_stream, payload[0..body_bytes]) catch return;
+
+    while (true) {
+        var fr = readFrameBounded(&srv, peer_fd, a, 5000) catch return;
+        const is_rst = fr.typ == .rst_stream and fr.stream_id == req_stream;
+        frame.deinitFrame(a, &fr);
+        if (is_rst) {
+            saw_rst.store(true, .release);
+            return;
+        }
+    }
+}
+
+test "response capacity exhausted during an upload surfaces before commitment" {
+    // The response can outrun the request: the origin answers while the client
+    // is still writing body frames. If that response exhausts local capacity,
+    // the failure reaches the worker through its *next upload write* — and
+    // since nothing is committed downstream yet, the cause has to survive as
+    // local capacity rather than looking like an upstream write failure.
+    const fds = try makeSocketpair();
+    var saw_rst = std.atomic.Value(bool).init(false);
+    const server = try std.Thread.spawn(.{}, cannedEarlyResponseServer, .{ fds[1], 16, &saw_rst });
+
+    var observer = TestProxyBufferObserver{};
+    // No room at the origin at all: the early response is refused on arrival.
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 8);
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, windowLimits(64));
+
+    const stream = try conn.openStreaming(.{
+        .method = "POST",
+        .authority = "early.test",
+        .path = "/",
+        .body_mode = .streaming,
+        .proxy_buffer_accounting = true,
+        .proxy_buffer_observer = observer.observer(),
+        .proxy_buffer_capacity = .{ .origin = &origin },
+    });
+
+    // Wait for the reader to refuse the early response, then prove the refusal
+    // reaches the uploading worker through its next body write. Waiting on the
+    // cause first keeps this independent of how fast the reader thread runs;
+    // racing it with a write loop would make the test timing-dependent.
+    var spins: usize = 0;
+    while (conn.abortCause(stream) != .local_capacity and spins < 100_000_000) : (spins += 1) {
+        std.Thread.yield() catch {};
+    }
+    try testing.expectEqual(AbortCause.local_capacity, conn.abortCause(stream));
+
+    const chunk = [_]u8{'u'} ** 64;
+    const upload_err = conn.writeStreamingRequestBody(stream, chunk[0..], false);
+    try testing.expectError(error.BufferLimitExceeded, upload_err);
+    try testing.expectEqual(AbortCause.local_capacity, conn.abortCause(stream));
+    // Still pre-commitment, so the caller can choose a clean status.
+    try testing.expectError(error.BufferLimitExceeded, conn.beginDownstreamCommit(stream));
+
+    conn.finishStreaming(stream);
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+
+    try testing.expect(saw_rst.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
+    try testing.expectEqual(@as(usize, 0), observer.retained.load(.monotonic));
 }
 
 /// Canned server that fills a stream's window in one frame and then reports the
@@ -3217,6 +3446,54 @@ test "stream credit is withheld between the high and low watermarks" {
     // One coalesced update for everything drained inside the band — crediting
     // each chunk as it drained would have made this 16.
     try testing.expectEqual(@as(u32, 32), first_credit.load(.acquire));
+
+    conn.finishStreaming(stream);
+    conn.deinit();
+    server.join();
+    _ = std.c.close(fds[1]);
+}
+
+test "a partial drain keeps the aggregate gauge at the retained allocation" {
+    // The distinction the aggregate gauge has to preserve: a queue drained from
+    // 16 bytes to 8 still *owns* 16, and the global hard limit is enforced
+    // against that 16. Reporting 8 would leave operators unable to compare the
+    // gauge with the limit it is measured by.
+    const fds = try makeSocketpair();
+    const server = try std.Thread.spawn(.{}, cannedSingleDataStreamingServer, .{ fds[1], "0123456789abcdef", false });
+
+    var observer = TestProxyBufferObserver{};
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64);
+    var transport = PlainTransport{ .fd = fds[0] };
+    const conn = try H2Conn(*PlainTransport).init(testing.allocator, &transport, fds[0], 3000, null, null, null, windowLimits(64));
+
+    const stream = try conn.requestStreaming(.{
+        .method = "GET",
+        .authority = "partial.test",
+        .path = "/",
+        .proxy_buffer_accounting = true,
+        .proxy_buffer_observer = observer.observer(),
+        .proxy_buffer_capacity = .{ .origin = &origin },
+    });
+
+    var buf: [8]u8 = undefined;
+    const first = try conn.readStreamingBody(stream, buf[0..]);
+    try testing.expectEqual(@as(usize, 8), first);
+    try testing.expectEqual(@as(usize, 16), observer.retained.load(.monotonic));
+
+    conn.acknowledgeStreamingBody(stream, first);
+    // Logical occupancy halves; retained allocation — and the origin scope
+    // enforcing it — does not, because the buffer is still 16 bytes long.
+    try testing.expectEqual(@as(usize, 8), observer.current.load(.monotonic));
+    try testing.expectEqual(@as(usize, 16), observer.retained.load(.monotonic));
+    try testing.expectEqual(@as(usize, 16), origin.currentBytes(.upstream_to_downstream));
+    try testing.expectEqual(@as(usize, 16), stream.body.capacity);
+
+    const second = try conn.readStreamingBody(stream, buf[0..]);
+    conn.acknowledgeStreamingBody(stream, second);
+    // Now the storage is actually handed back, and both views agree again.
+    try testing.expectEqual(@as(usize, 0), observer.current.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), observer.retained.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
 
     conn.finishStreaming(stream);
     conn.deinit();

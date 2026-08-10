@@ -31,13 +31,19 @@ All notable user-facing changes to Tardigrade are documented here.
   existing deployments are unchanged until they opt in.
 
   Refusals are deterministic on both sides of the downstream commitment
-  boundary. Before the response head is written the request fails with `503`
-  and the code `proxy_buffer_saturated`; after commitment the stream is reset
-  upstream, the response is truncated, and the event is logged. Either way this
-  is *local* saturation and is never recorded against upstream health, so proxy
-  memory pressure cannot trip a healthy origin's failure policy, and a refused
-  stream becomes discard-only so one refusal cannot be re-counted. Unrelated
-  streams, including others on the same connection, are untouched.
+  boundary, which is claimed under the connection's state lock rather than
+  raced. Before the response head is written the request fails with `503` and
+  the code `proxy_buffer_saturated` — including when an origin answers while a
+  streaming upload is still being written, so the refusal surfaces through the
+  next upload write; after commitment the stream is reset upstream, the
+  response is truncated, and the event is logged. Either way this is *local*
+  saturation and is never recorded against upstream health, so proxy memory
+  pressure cannot trip a healthy origin's failure policy, and a refused stream
+  becomes discard-only so one refusal cannot be re-counted. Unrelated streams,
+  including others on the same connection, are untouched. An origin that
+  overruns its advertised window is now also reset with
+  `RST_STREAM(FLOW_CONTROL_ERROR)` instead of being left to keep sending on a
+  stream the proxy had already failed.
   `tardigrade_buffer_limit_exceeded_total` now carries `scope="origin"` and
   `scope="global"` alongside `scope="stream"`, and per-origin queued bytes are
   visible as `tardigrade_upstream_h2_pool_buffered_bytes{upstream}`.

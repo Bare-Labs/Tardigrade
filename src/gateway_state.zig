@@ -1542,7 +1542,23 @@ pub const GatewayState = struct {
             .recordAggregateLimitExceededFn = recordProxyBufferAggregateLimitExceededObserved,
             .recordReadPauseFn = recordProxyBufferReadPauseObserved,
             .recordReadResumeFn = recordProxyBufferReadResumeObserved,
+            .recordRetainedBytesFn = recordProxyBufferRetainedObserved,
+            .releaseRetainedBytesFn = releaseProxyBufferRetainedObserved,
         };
+    }
+
+    fn recordProxyBufferRetainedObserved(context: *anyopaque, direction: http.proxy_buffer_account.Direction, bytes: usize) void {
+        const self: *GatewayState = @ptrCast(@alignCast(context));
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordProxyBufferRetained(direction, bytes);
+    }
+
+    fn releaseProxyBufferRetainedObserved(context: *anyopaque, direction: http.proxy_buffer_account.Direction, bytes: usize) void {
+        const self: *GatewayState = @ptrCast(@alignCast(context));
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.releaseProxyBufferRetained(direction, bytes) catch unreachable;
     }
 
     fn recordProxyBufferReadPauseObserved(context: *anyopaque, side: http.proxy_buffer_account.Side) void {

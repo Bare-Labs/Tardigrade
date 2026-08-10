@@ -120,6 +120,13 @@ pub const Observer = struct {
     /// its high watermark, and resumed once it drained back below low.
     recordReadPauseFn: ?*const fn (*anyopaque, Side) void = null,
     recordReadResumeFn: ?*const fn (*anyopaque, Side) void = null,
+    /// Optional: bytes entering or leaving the *aggregate* scopes. These track
+    /// retained allocation, which is what the aggregate hard limits enforce and
+    /// therefore what the aggregate current-byte gauge must report — it moves
+    /// on a different schedule from the per-stream logical queue length, which
+    /// drains ahead of the storage backing it.
+    recordRetainedBytesFn: ?*const fn (*anyopaque, Direction, usize) void = null,
+    releaseRetainedBytesFn: ?*const fn (*anyopaque, Direction, usize) void = null,
 
     pub fn recordReservation(self: Observer, direction: Direction, bytes: usize, high_watermark: bool, limit_exceeded: bool) void {
         self.recordReservationFn(self.context, direction, bytes, high_watermark, limit_exceeded);
@@ -139,6 +146,16 @@ pub const Observer = struct {
 
     pub fn recordReadResume(self: Observer, side: Side) void {
         if (self.recordReadResumeFn) |f| f(self.context, side);
+    }
+
+    pub fn recordRetainedBytes(self: Observer, direction: Direction, bytes: usize) void {
+        if (bytes == 0) return;
+        if (self.recordRetainedBytesFn) |f| f(self.context, direction, bytes);
+    }
+
+    pub fn releaseRetainedBytes(self: Observer, direction: Direction, bytes: usize) void {
+        if (bytes == 0) return;
+        if (self.releaseRetainedBytesFn) |f| f(self.context, direction, bytes);
     }
 };
 

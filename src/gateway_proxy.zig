@@ -168,6 +168,10 @@ const ProxyBufferReservation = struct {
             after.high_watermark_events > before.high_watermark_events,
             after.limit_exceeded_events > before.limit_exceeded_events,
         );
+        // The HTTP/1 relay's buffer is allocated for as long as it is reserved,
+        // so its logical and retained byte counts move together — unlike an
+        // HTTP/2 stream queue, which drains ahead of its backing storage.
+        self.observer.recordRetainedBytes(self.account.direction, bytes);
         self.active = true;
     }
 
@@ -175,6 +179,7 @@ const ProxyBufferReservation = struct {
         if (!self.active) return;
         self.account.release(bytes) catch unreachable;
         self.observer.releaseReservation(self.account.direction, bytes);
+        self.observer.releaseRetainedBytes(self.account.direction, bytes);
         self.active = self.account.snapshot().current != 0;
     }
 
@@ -909,9 +914,18 @@ fn streamViaH2Pool(
                         proxy_buffer_limits,
                         proxy_buffer_observer,
                     ) catch |err| {
+                        const capacity_abort = err == error.BufferLimitExceeded or
+                            conn.abortCause(stream) == .local_capacity;
                         conn.finishStreaming(stream);
                         if (!conn.healthy()) h2_pool.evict(key, conn);
                         h2_pool.release(conn);
+                        // An early response can exhaust local buffer capacity
+                        // while the upload is still being written, and the
+                        // reader reports that through the *next* body write.
+                        // Nothing is committed downstream yet, so it is a 503 —
+                        // returning the raw error here made it a 502 charged to
+                        // a healthy origin.
+                        if (capacity_abort) return error.ProxyBufferCapacityUnavailable;
                         return err;
                     };
                 }
@@ -934,6 +948,18 @@ fn streamViaH2Pool(
 
                 const reason = gpres.upstreamReasonPhrase(@enumFromInt(status));
                 const body_allowed = gpres.responseBodyAllowed(method, status);
+                // Linearize the commitment boundary: the reader can reject DATA
+                // in the gap between the head arriving and this write starting.
+                // Claiming the transition under the connection's state lock
+                // makes that a decided question — a refusal that lands first is
+                // still a pre-commit 503 rather than a committed origin status
+                // that we then have to truncate.
+                conn.beginDownstreamCommit(stream) catch {
+                    conn.finishStreaming(stream);
+                    if (!conn.healthy()) h2_pool.evict(key, conn);
+                    h2_pool.release(conn);
+                    return error.ProxyBufferCapacityUnavailable;
+                };
                 gpres.writeStreamedUpstreamResponseHeadFromHeaders(
                     downstream_writer,
                     status,

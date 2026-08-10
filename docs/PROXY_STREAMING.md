@@ -158,7 +158,9 @@ The streaming receive window an HTTP/2 upstream connection advertises is
 `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES` — the same value the
 accounting model treats as "this stream's queue is full" — so a well-behaved
 origin stops sending exactly there. An origin that overruns the window is
-committing a flow-control violation and fails only its own stream.
+committing a flow-control violation: that stream is failed, reset upstream with
+`RST_STREAM(FLOW_CONTROL_ERROR)` so the origin actually stops sending on it, and
+left discard-only. Other streams on the connection are unaffected.
 
 Credit is then returned with hysteresis rather than chunk by chunk. While a
 stream's queue sits at or above the high watermark, downstream-consumed bytes
@@ -184,16 +186,28 @@ than its logical length — a drained queue that still owned its peak buffer
 would otherwise be invisible to these limits. A queue's storage (and its
 reservation) is released as soon as it drains empty.
 
+This is also why the two current-byte gauges move on different schedules:
+`tardigrade_buffered_bytes_current{scope="stream"}` reports logical queue
+occupancy, while `scope="global"` reports retained allocation — the same
+quantity `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` is enforced against,
+so the gauge and its limit are directly comparable. A partially drained queue
+shows a lower stream value than global value; that is the buffer it still owns.
+
 #### What a refusal does
 
-The behavior depends on whether the downstream response has been committed:
+The behavior depends on whether the downstream response has been committed.
+That question is decided, not raced: the worker claims the commitment boundary
+under the connection's state lock immediately before writing the head, so a
+refusal that physically happened first is always treated as pre-commitment.
 
-- **Before the response head is written** — including the case where the reader
-  rejects DATA between decoding the origin's headers and the worker relaying
-  them — the request fails with `503` and the code `proxy_buffer_saturated`.
-  This is *local* saturation, so it is never recorded against upstream health
-  or the circuit breaker, and it is not retried: a retry would meet the same
-  wall.
+- **Before the response head is written** the request fails with `503` and the
+  code `proxy_buffer_saturated`. This covers the reader rejecting DATA between
+  decoding the origin's headers and the worker relaying them, and it also
+  covers a streaming upload: an origin can answer while the request body is
+  still being written, so a capacity refusal can surface through the *next
+  upload write* rather than through the response path. All of these are *local*
+  saturation, so none is recorded against upstream health or the circuit
+  breaker, and none is retried — a retry would meet the same wall.
 - **After commitment** the status can no longer change. The stream is reset
   upstream immediately (`RST_STREAM(CANCEL)`), the downstream response is
   truncated, every scope's reservation is released, and the truncation is

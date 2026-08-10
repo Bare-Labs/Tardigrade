@@ -562,9 +562,16 @@ pub const Metrics = struct {
         const bytes: u64 = @intCast(buffered_bytes);
         if (bytes > self.proxy_buffered_bytes_current) return error.BufferAccountingUnderflow;
         self.proxy_buffered_bytes_current -= bytes;
+        // A fully buffered response holds one allocation for exactly as long as
+        // it holds the bytes, so both scopes move together here.
         try self.releaseProxyBufferReservation(.upstream_to_downstream, buffered_bytes);
+        try self.releaseProxyBufferRetained(.upstream_to_downstream, buffered_bytes);
     }
 
+    /// Per-stream logical queue occupancy. Deliberately does **not** touch the
+    /// aggregate gauge: the `scope="global"` series reports retained allocation
+    /// (what the global hard limit enforces), which a partially drained queue
+    /// still owns. Callers pair this with `recordProxyBufferRetained`.
     pub fn recordProxyBufferReservation(
         self: *Metrics,
         direction: proxy_buffer_account.Direction,
@@ -573,28 +580,21 @@ pub const Metrics = struct {
         limit_exceeded: bool,
     ) void {
         self.recordProxyBufferBytes(direction, .stream, bytes);
-        self.recordProxyBufferBytes(direction, .global, bytes);
         if (high_watermark) self.recordProxyBufferHighWatermark(direction, .stream);
         if (limit_exceeded) self.recordProxyBufferLimitExceeded(direction, .stream);
     }
 
     pub fn releaseProxyBufferReservation(self: *Metrics, direction: proxy_buffer_account.Direction, bytes: usize) !void {
-        const value: u64 = @intCast(bytes);
-        var stream_slot: *u64 = undefined;
-        var global_slot: *u64 = undefined;
-        switch (direction) {
-            .downstream_to_upstream => {
-                stream_slot = &self.proxy_buffer_downstream_to_upstream_stream_current;
-                global_slot = &self.proxy_buffer_downstream_to_upstream_global_current;
-            },
-            .upstream_to_downstream => {
-                stream_slot = &self.proxy_buffer_upstream_to_downstream_stream_current;
-                global_slot = &self.proxy_buffer_upstream_to_downstream_global_current;
-            },
-        }
-        if (value > stream_slot.* or value > global_slot.*) return error.BufferAccountingUnderflow;
-        stream_slot.* -= value;
-        global_slot.* -= value;
+        try self.releaseProxyBufferBytes(direction, .stream, bytes);
+    }
+
+    /// Bytes entering the aggregate scopes, i.e. allocation an owner retains.
+    pub fn recordProxyBufferRetained(self: *Metrics, direction: proxy_buffer_account.Direction, bytes: usize) void {
+        self.recordProxyBufferBytes(direction, .global, bytes);
+    }
+
+    pub fn releaseProxyBufferRetained(self: *Metrics, direction: proxy_buffer_account.Direction, bytes: usize) !void {
+        try self.releaseProxyBufferBytes(direction, .global, bytes);
     }
 
     pub fn recordProxyBufferBytes(self: *Metrics, direction: proxy_buffer_account.Direction, scope: proxy_buffer_account.Scope, bytes: usize) void {
@@ -976,11 +976,11 @@ pub const Metrics = struct {
             \\# TYPE tardigrade_buffer_high_watermark_events_total counter
             \\tardigrade_buffer_high_watermark_events_total{{direction="downstream_to_upstream",scope="stream"}} {d}
             \\tardigrade_buffer_high_watermark_events_total{{direction="upstream_to_downstream",scope="stream"}} {d}
-            \\# HELP tardigrade_buffer_read_pauses_total Reserved for future proxy reads paused by stalled buffer pressure side
+            \\# HELP tardigrade_buffer_read_pauses_total Proxy reads paused by buffer pressure, by peer side
             \\# TYPE tardigrade_buffer_read_pauses_total counter
             \\tardigrade_buffer_read_pauses_total{{side="downstream"}} {d}
             \\tardigrade_buffer_read_pauses_total{{side="upstream"}} {d}
-            \\# HELP tardigrade_buffer_read_resumes_total Reserved for future proxy reads resumed after buffer pressure drops
+            \\# HELP tardigrade_buffer_read_resumes_total Proxy reads resumed after buffer pressure dropped below the low watermark, by peer side
             \\# TYPE tardigrade_buffer_read_resumes_total counter
             \\tardigrade_buffer_read_resumes_total{{side="downstream"}} {d}
             \\tardigrade_buffer_read_resumes_total{{side="upstream"}} {d}

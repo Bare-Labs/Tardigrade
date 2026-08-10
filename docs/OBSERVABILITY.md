@@ -52,7 +52,12 @@ logs are written through `src/http/logger.zig`.
   `tardigrade_buffer_limit_exceeded_total{direction,scope}`. Labels are fixed
   to protocol-independent directions, scopes, and sides; they never include
   URLs, request IDs, or stream IDs. Current byte gauges cover bounded buffered
-  responses, HTTP/1 streaming relay buffers, and HTTP/2 streaming response queues.
+  responses, HTTP/1 streaming relay buffers, and HTTP/2 streaming response
+  queues. `scope="stream"` reports logical queue occupancy; `scope="global"`
+  reports retained allocation, which is the quantity the global hard limit is
+  enforced against, so that gauge is directly comparable to
+  `tardigrade_buffer_config_limit_bytes{scope="global"}`. The two differ while a
+  queue is partially drained but still owns its buffer.
   `tardigrade_buffer_limit_exceeded_total` carries `scope="origin"` and
   `scope="global"` alongside `scope="stream"`: an aggregate refusal means the
   upstream origin (or the process) had no room for bytes the stream itself could
