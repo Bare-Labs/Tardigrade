@@ -228,6 +228,12 @@ fn reserveUploadBytes(reservation: *ProxyBufferReservation, bytes: usize) !void 
 /// function from the array it describes.
 const http1_upload_relay_bytes: usize = 16 * 1024;
 
+/// The smallest relay buffer any path will use. Config validation already
+/// floors `proxy_stream_buffer_size` here and checks every policy against it,
+/// so this is a backstop for the one place a buffer size is derived rather than
+/// configured: the HTTP/2 relay sizing itself to a connection's pinned policy.
+const min_proxy_relay_bytes: usize = 16 * 1024;
+
 /// Bytes a relay retains from the request head, on top of its fixed relay
 /// buffer. The two framings retain different amounts of the same slice: a
 /// `.length` upload forwards only the body bytes it is owed, while a `.chunked`
@@ -1032,11 +1038,21 @@ fn streamViaH2Pool(
                 // and what is accounted are deliberately the same number.
                 //
                 // Never restrictive in practice: the pinned policy was
-                // validated against a relay of at least 16 KiB, so this is
-                // always at least that.
-                const pinned_relay_bytes = @min(
-                    requested_relay_bytes,
-                    pinned_limits.per_stream_hard_limit - pinned_limits.per_stream_high_watermark,
+                // validated against a relay of at least 16 KiB, so the headroom
+                // below is always at least that.
+                //
+                // Floored all the same, because the failure mode if it were
+                // ever zero is silent: a zero-length relay buffer makes
+                // `readStreamingBody` return 0, which this loop reads as end of
+                // body and truncates the response without a word. A policy that
+                // leaves no headroom is only reachable by constructing `Limits`
+                // directly rather than through config validation, and flooring
+                // turns that into an ordinary over-budget refusal — a clean
+                // pre-commit 503 — instead.
+                const pinned_relay_headroom = pinned_limits.per_stream_hard_limit -| pinned_limits.per_stream_high_watermark;
+                const pinned_relay_bytes = @max(
+                    @min(requested_relay_bytes, pinned_relay_headroom),
+                    min_proxy_relay_bytes,
                 );
                 const relay_buf = try allocator.alloc(u8, pinned_relay_bytes);
                 defer allocator.free(relay_buf);
@@ -5504,4 +5520,42 @@ test "an http2 relay buffer allocates exactly what it accounts across a buffer-s
     try std.testing.expectEqual(@as(usize, 0), counters.reserved);
     try std.testing.expectEqual(@as(usize, 0), counters.retained);
     try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+}
+
+test "a pinned policy with no relay headroom refuses rather than truncating silently" {
+    // Config validation makes this policy unreachable, but `Limits` can be
+    // built directly. The sizing arithmetic must not be able to produce a
+    // zero-length relay buffer: `readStreamingBody` would return 0, the relay
+    // would read that as end of body, and the response would be truncated with
+    // nothing logged and no metric moved. Flooring turns it into an ordinary
+    // over-budget refusal instead.
+    const airless = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 8 * 1024,
+        .per_stream_high_watermark = 16 * 1024,
+        .per_stream_hard_limit = 16 * 1024, // high == hard: no headroom at all
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    const headroom = airless.per_stream_hard_limit -| airless.per_stream_high_watermark;
+    try std.testing.expectEqual(@as(usize, 0), headroom);
+    const sized = @max(@min(@as(usize, 64 * 1024), headroom), min_proxy_relay_bytes);
+    try std.testing.expectEqual(min_proxy_relay_bytes, sized);
+
+    // And that floored buffer is then refused by the stream budget once the
+    // queue holds anything, which is a pre-commit 503 rather than a silent
+    // truncation.
+    var counters = UploadBufferObserver{};
+    var stream_budget = proxy_buffer_account.Aggregate.init(.stream, airless.per_stream_hard_limit);
+    try stream_budget.reserve(.upstream_to_downstream, 8 * 1024);
+    var relay = ProxyBufferReservation.init(
+        .upstream_to_downstream,
+        airless,
+        counters.observer(),
+        .{ .stream = &stream_budget },
+    );
+    try std.testing.expectError(error.ProxyBufferCapacityUnavailable, relay.reserve(sized));
+    try std.testing.expectEqual(proxy_buffer_account.Scope.stream, counters.last_aggregate_scope.?);
+
+    stream_budget.release(.upstream_to_downstream, 8 * 1024);
+    try std.testing.expectEqual(@as(usize, 0), stream_budget.currentBytes(.upstream_to_downstream));
 }
