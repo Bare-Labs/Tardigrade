@@ -237,6 +237,12 @@ fn writeBufferedUpstreamResponseMeasured(
             try writer.writeAll(head.bytes);
             return .{ .mode = .single_write };
         }
+        const total_len = head.bytes.len + upstream_response.body.len;
+        if (head.allocator == null and total_len <= scratch.len) {
+            @memcpy(scratch[head.bytes.len..total_len], upstream_response.body);
+            try writer.writeAll(scratch[0..total_len]);
+            return .{ .mode = .single_write };
+        }
         const fragments = [_][]const u8{ head.bytes, upstream_response.body };
         return .{
             .mode = .writev,
@@ -601,7 +607,7 @@ test "writeBufferedUpstreamResponse serializes a single forwarded response head"
     try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\npong"));
 }
 
-test "writeBufferedUpstreamResponseWithMetrics uses gathered write for data-plane body" {
+test "writeBufferedUpstreamResponseWithMetrics keeps small data-plane body on single-write fast path" {
     const allocator = std.testing.allocator;
     const body = try allocator.dupe(u8, "pong");
     var upstream_headers = [_]TestUpstreamHeader{
@@ -633,11 +639,53 @@ test "writeBufferedUpstreamResponseWithMetrics uses gathered write for data-plan
         &metrics_mutex,
     );
 
+    try std.testing.expectEqual(@as(usize, 0), writer.writev_calls);
+    try std.testing.expectEqual(@as(usize, 0), writer.writev_iovecs);
+    try std.testing.expectEqual(@as(usize, 1), writer.write_all_calls);
+    try std.testing.expect(std.mem.startsWith(u8, writer.output.items, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, writer.output.items, "pong"));
+    try std.testing.expectEqual(@as(u64, 1), metrics.response_write_mode_total[1]);
+    try std.testing.expectEqual(@as(u64, 0), metrics.response_writev_iovecs_total);
+}
+
+test "writeBufferedUpstreamResponseWithMetrics uses gathered write when body does not fit scratch" {
+    const allocator = std.testing.allocator;
+    const body = try allocator.alloc(u8, 10 * 1024);
+    @memset(body, 'x');
+    var upstream_headers = [_]TestUpstreamHeader{
+        .{ .name = "Content-Type", .value = "text/plain" },
+    };
+    var response = TestBufferedUpstreamResponse{
+        .metadata_arena = std.heap.ArenaAllocator.init(allocator),
+        .status_code = 200,
+        .reason = "OK",
+        .headers = upstream_headers[0..],
+        .body = body,
+    };
+    defer response.deinit(allocator);
+
+    var writer = TestGatheredProxyWriter.init(allocator);
+    defer writer.deinit();
+    var metrics = http.metrics.Metrics.init();
+    var metrics_mutex = compat.Mutex{};
+
+    try writeBufferedUpstreamResponseWithMetrics(
+        &writer,
+        &response,
+        true,
+        "req-gathered-large",
+        &http.security_headers.SecurityHeaders.api,
+        null,
+        null,
+        &metrics,
+        &metrics_mutex,
+    );
+
     try std.testing.expectEqual(@as(usize, 1), writer.writev_calls);
     try std.testing.expectEqual(@as(usize, 2), writer.writev_iovecs);
     try std.testing.expectEqual(@as(usize, 0), writer.write_all_calls);
     try std.testing.expect(std.mem.startsWith(u8, writer.output.items, "HTTP/1.1 200 OK\r\n"));
-    try std.testing.expect(std.mem.endsWith(u8, writer.output.items, "pong"));
+    try std.testing.expect(std.mem.endsWith(u8, writer.output.items, body));
     try std.testing.expectEqual(@as(u64, 1), metrics.response_write_mode_total[0]);
     try std.testing.expectEqual(@as(u64, 2), metrics.response_writev_iovecs_total);
 }
