@@ -20,7 +20,7 @@ TARDIGRADE_CONFIG_PATH=examples/rate-limiting/tardigrade.conf \
 TARDIGRADE_UPSTREAM_BASE_URL=http://127.0.0.1:8081 \
 TARDIGRADE_RATE_LIMIT_RPS=60 \
 TARDIGRADE_RATE_LIMIT_BURST=20 \
-./zig-out/bin/tardi
+./zig-out/bin/tardi &
 
 # Trigger the rate limit
 for i in $(seq 1 100); do curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/; done

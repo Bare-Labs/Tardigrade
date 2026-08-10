@@ -19,7 +19,7 @@ python3 -m http.server 9002 &
 # Build and run Tardigrade
 zig build
 TARDIGRADE_CONFIG_PATH=examples/virtual-hosts/tardigrade.conf \
-./zig-out/bin/tardi
+./zig-out/bin/tardi &
 
 # Smoke-test each virtual host
 curl -H 'Host: api.example.com' http://localhost:8080/health

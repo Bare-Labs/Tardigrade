@@ -33,7 +33,7 @@ TARDIGRADE_TLS_CERT_PATH=/tmp/server.crt \
 TARDIGRADE_TLS_KEY_PATH=/tmp/server.key \
 TARDIGRADE_UPSTREAM_BASE_URL=http://127.0.0.1:8080 \
 TARDIGRADE_CONFIG_PATH=examples/tls-termination/tardigrade.conf \
-./zig-out/bin/tardi
+./zig-out/bin/tardi &
 ```
 
 Smoke-test:

@@ -17,7 +17,7 @@ echo '<h1>Hello from Tardigrade</h1>' > ./public/index.html
 
 # Build and run
 zig build
-TARDIGRADE_CONFIG_PATH=examples/static-file-server/tardigrade.conf ./zig-out/bin/tardi
+TARDIGRADE_CONFIG_PATH=examples/static-file-server/tardigrade.conf ./zig-out/bin/tardi &
 
 # Smoke-test
 curl http://localhost:8080/

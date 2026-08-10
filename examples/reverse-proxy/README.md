@@ -19,7 +19,7 @@ python3 -m http.server 3000 &
 zig build
 TARDIGRADE_CONFIG_PATH=examples/reverse-proxy/tardigrade.conf \
 TARDIGRADE_UPSTREAM_BASE_URL=http://127.0.0.1:3000 \
-./zig-out/bin/tardi
+./zig-out/bin/tardi &
 
 # Smoke-test
 curl http://localhost:8080/health   # → 200 ok (served from edge)

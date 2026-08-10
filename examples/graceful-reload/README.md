@@ -25,10 +25,10 @@ TARDIGRADE_PID_FILE=/tmp/tardigrade.pid \
 curl http://localhost:8080/health
 
 # Edit this config file, then hot-reload — no downtime
-./zig-out/bin/tardi reload -c examples/graceful-reload/tardigrade.conf
+./zig-out/bin/tardi reload --pid-file /tmp/tardigrade.pid
 
 # Graceful stop — waits for in-flight requests to finish
-./zig-out/bin/tardi stop -c examples/graceful-reload/tardigrade.conf
+./zig-out/bin/tardi stop --pid-file /tmp/tardigrade.pid
 ```
 
 ## Key environment variables
@@ -44,9 +44,9 @@ See `tardigrade.env.example` for the full list with comments.
 
 | Action | Command | Behavior |
 |--------|---------|---------|
-| Hot reload | `tardi reload -c <config>` | Applies config changes; in-flight requests finish on the old config. Zero downtime. |
-| Graceful stop | `tardi stop -c <config>` | Stops accepting new connections; drains in-flight requests up to the drain timeout. |
-| Status check | `tardi status -c <config>` | Prints the current process state (config path, uptime, worker count). |
+| Hot reload | `tardi reload --pid-file <path>` | Applies config changes; in-flight requests finish on the old config. Zero downtime. |
+| Graceful stop | `tardi stop --pid-file <path>` | Stops accepting new connections; drains in-flight requests up to the drain timeout. |
+| Status check | `tardi status --pid-file <path>` | Prints running/stopped state, PID or PID-file information, and the effective config summary. |
 
 ## systemd integration
 
@@ -55,6 +55,7 @@ The included drain timeout works with `TimeoutStopSec=` in a systemd unit file. 
 ```ini
 [Service]
 TimeoutStopSec=35
-ExecStop=/usr/local/bin/tardi stop -c /etc/tardigrade/tardigrade.conf
+ExecStop=/usr/local/bin/tardi stop --pid-file /run/tardigrade/tardigrade.pid
 Environment=TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS=30000
+Environment=TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid
 ```
