@@ -103,6 +103,15 @@ Do not start an `io_uring` or async-runtime rewrite from this boundary. Any new
 backend must be benchmark-justified and fit behind the same socket/protocol
 ownership rules.
 
+That rule still stands, and the opt-in `io_uring` backend added under #148 does
+not relax it. That backend is a readiness-only replacement for `epoll_wait`
+behind the existing `EventLoop` seam — it is not a rewrite, it leaves
+`accept()` and all per-request I/O as blocking calls on worker threads, and it
+is off unless `TARDIGRADE_EVENT_LOOP_BACKEND=io_uring` is set. It is
+explicitly **not** benchmark-justified yet, which is why it is opt-in and why
+`epoll`/`kqueue` remains the default. See
+[`docs/EVENT_LOOP_BACKENDS.md`](EVENT_LOOP_BACKENDS.md).
+
 ## Pure Zig QUIC / H3 Embedding Target
 
 Pure Zig QUIC/H3 work starts upstream-first. Tardigrade should validate QUIC

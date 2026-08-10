@@ -1,9 +1,20 @@
 # Event-loop backend evaluation (#148)
 
-Status: **Phase 0 — design doc only.** No runtime behavior changes. This
-document satisfies the design-doc acceptance criteria from #148 and from the
-consolidated architecture-evaluation scope folded in from #213. It does not
-implement, prototype, or benchmark an `io_uring` (or other) backend.
+Status: **Phase 1 — readiness-only `io_uring` prototype landed, unbenchmarked.**
+Phase 0's comparison (below) is unchanged and still records why `epoll`/`kqueue`
+remains the default. What has changed is that the narrowly scoped, Linux-only,
+feature-flagged prototype this document specified now exists in
+`src/http/event_loop.zig`, behind `TARDIGRADE_EVENT_LOOP_BACKEND=io_uring`.
+
+**Default behavior is unchanged on every platform.** The prototype is off
+unless an operator explicitly names it, and it is deliberately shipped without
+performance claims: no benchmark evidence has been gathered for it, so the
+"Recommendation" section's bar for adopting `io_uring` as a default is **not**
+met. See "Phase 1 prototype" below for exactly what was and was not validated.
+
+This document satisfies the design-doc acceptance criteria from #148 and from
+the consolidated architecture-evaluation scope folded in from #213. It does not
+benchmark an `io_uring` (or other) backend.
 
 ## Why
 
@@ -46,8 +57,11 @@ detail in [`docs/CONCURRENCY.md`](CONCURRENCY.md):
 - `src/http/event_loop.zig` (`EventLoop`) wraps `epoll` on Linux and `kqueue`
   on BSD/macOS behind a small `add`/`modify`/`remove`/`wait` interface keyed
   on raw fds, with `Interest{ read, write }` and a fixed-capacity `Event`
-  output array. `EventLoop.init()` picks the backend from `builtin.os.tag` at
-  compile/runtime; there is no runtime backend override today.
+  output array. `EventLoop.init()` picks the backend from `builtin.os.tag`,
+  and that remains what runs unless an operator sets
+  `TARDIGRADE_EVENT_LOOP_BACKEND` to name one explicitly (Phase 1; see
+  "Phase 1 prototype" below). This section describes the default path, which
+  the prototype does not alter.
 - The single shared `EventLoop` instance in `edge_gateway.zig`'s main loop
   currently has **three** roles, not one:
   1. **Unsharded listener accept readiness** — only when listener sharding
@@ -328,8 +342,9 @@ at all unless a separate future change first migrates them onto the shared
   using that to actually simplify the reaper would require the wider
   operation/completion abstraction this doc explicitly defers (see "Backend
   abstraction boundary"), not the readiness-only prototype scoped here.
-- **Prototype needed to resolve the decision?** Not yet — see
-  "Recommendation."
+- **Prototype needed to resolve the decision?** Built (Phase 1, opt-in and
+  unbenchmarked) — see "Phase 1 prototype" and "Recommendation." Its existence
+  does not resolve the decision; the profiling/benchmark evidence still does.
 
 ## Comparison matrix
 
@@ -341,14 +356,16 @@ at all unless a separate future change first migrates them onto the shared
 | TLS integration | Done for both OpenSSL (park) and native (active registry) paths, out of event loop's path | Unaffected | Would need rework if handler goes non-blocking | Unaffected until viable | Unaffected (TLS stays in worker) |
 | Proxy streaming/backpressure (#139/#140) | Built on blocking relay, already integrated | Unaffected | Would require redesign | Already broke FastCGI in production (Phase 2) | No interaction as currently designed |
 | Timers/cancellation/parking/drain | Implemented, no known bottleneck | Unaffected | Would move into libxev's model | Unaffected until viable | Unchanged at readiness-only boundary — reaper/drain untouched |
-| Prototype required to decide? | N/A (shipped) | No | Only if handler model changes | No — blocked on toolchain, not on prototyping | Not yet (see recommendation) |
+| Prototype required to decide? | N/A (shipped) | No | Only if handler model changes | No — blocked on toolchain, not on prototyping | Built, opt-in, unbenchmarked (Phase 1) |
 
 ## Recommendation
 
 ### Short-term (now)
 
-- **No backend change.** Keep the existing `epoll`/`kqueue` `EventLoop` as
-  the only backend, exactly as `docs/CONCURRENCY.md` already directs.
+- **No change to the default backend.** `epoll`/`kqueue` remains the backend
+  selected on every platform when `TARDIGRADE_EVENT_LOOP_BACKEND` is unset or
+  `default`, exactly as `docs/CONCURRENCY.md` already directs. The Phase 1
+  `io_uring` prototype is opt-in only and carries no performance claim.
 - **Ordering precondition cleared; evidence precondition is not.** #140
   (watermark-based backpressure) merged via PR #600, closing out the last of
   #148's named prerequisites (#137, #138, #139, #140, #141 are all now
@@ -363,14 +380,15 @@ at all unless a separate future change first migrates them onto the shared
   bar or supplies that evidence — #600 bounds HTTP/1 relay memory per
   origin, which is orthogonal to whether the accept/park/native-TLS
   readiness loop is a bottleneck.
-- **Still no `io_uring`, `libxev`, or `std.Io` proactor prototype in this
-  PR.** With the ordering precondition cleared, the next concrete step is
-  gathering that profiling evidence (or determining it's not worth
-  gathering yet against other roadmap priorities) — not writing prototype
-  code speculatively. This sandboxed session also has no Zig toolchain and
-  no representative benchmarking hardware, so it could not produce that
-  evidence even if it attempted to; see "Long-term" for what a prototype
-  attempt needs before it starts.
+- **The `io_uring` prototype now exists; `libxev` and `std.Io` proactor still
+  do not, and should not.** The prototype was built ahead of the profiling
+  evidence rather than after it, as a deliberate call to make the option
+  concrete and measurable. That ordering does not retire the evidence
+  precondition — it only means the thing to be measured now exists. Nothing
+  about the prototype's existence argues for changing the default; see
+  "Phase 1 prototype" for what is still missing. `libxev` and `std.Io`
+  proactor mode remain rejected for the reasons in sections C and D, which
+  the prototype does not affect.
 - **Small independent follow-up (optional, not gated on the rest of this
   doc):** attach a `backend` label to the existing
   `tardigrade_event_loop_iterations_total` counter (the backend name is
@@ -402,34 +420,157 @@ at all unless a separate future change first migrates them onto the shared
   needs on the pinned Zig 0.16 toolchain (demonstrated in production by the
   Phase 2 FastCGI stall). Re-evaluate `std.Io` specifically on each Zig
   toolchain bump.
-- If a future profiling pass does justify pursuing `io_uring`, the correct
-  next step is a narrowly scoped, Linux-only, feature-flagged prototype
-  limited to the shared `EventLoop`'s existing readiness/idle-wait roles
-  (not a rewrite of worker I/O or of the native-TLS path's own local
-  `poll()`-based per-request wait), matching #148's original "Prototype
-  Linux `io_uring` support behind a feature flag" proposal, with its own
-  follow-up issue and its own benchmark evidence gathered on real hardware
-  (per the project's standing practice — see `docs/UPSTREAM_POOLING.md` and
-  `CONCURRENCY.md`, both of which note that benchmark numbers must be
-  captured on real hardware, not in a sandboxed dev/CI environment). See
-  "Failure modes and fallback policy" below for the minimum policy such a
-  prototype must define before it lands.
+- The narrowly scoped, Linux-only, feature-flagged prototype described here —
+  limited to the shared `EventLoop`'s existing readiness/idle-wait roles, and
+  not a rewrite of worker I/O or of the native-TLS path's own local
+  `poll()`-based per-request wait — is what Phase 1 built, matching #148's
+  original "Prototype Linux `io_uring` support behind a feature flag"
+  proposal. What it still owes is benchmark evidence gathered on real
+  hardware (per the project's standing practice — see
+  `docs/UPSTREAM_POOLING.md` and `CONCURRENCY.md`, both of which note that
+  benchmark numbers must be captured on real hardware, not in a sandboxed
+  dev/CI environment). Until that exists, the prototype stays opt-in and the
+  default is unchanged. See "Failure modes and fallback policy" below for the
+  policy it implements.
 
-## Failure modes and fallback policy for a future `io_uring` backend
+## Phase 1 prototype (implemented)
+
+The readiness-only prototype specified by this document is implemented in
+`src/http/event_loop.zig` as `Backend.io_uring`. It sits behind the existing
+`add`/`modify`/`remove`/`wait` seam with no change to that seam's shape, and
+implements the policy in "Failure modes and fallback policy" below.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TARDIGRADE_EVENT_LOOP_BACKEND` | `default` | `default` keeps the platform backend (`epoll`/`kqueue`). `io_uring` selects the prototype. `epoll`/`kqueue` may be named explicitly and fail closed if they are not this platform's backend. `auto` is rejected — the auto-detect-with-fallback mode sketched below is deliberately not implemented. |
+| `TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES` | `256` | Submission-queue depth; ignored by the other backends. Bounded to 64–4096. |
+
+The 256-entry default is chosen so the ring's mmap'd SQ/CQ memory (~24 KiB)
+fits inside the 64 KiB `RLIMIT_MEMLOCK` soft limit common on stock hosts;
+kernels before 5.12 charge ring memory against that limit, so a much deeper
+default would fail `io_uring_setup` with `ENOMEM` on exactly the 5.4-era
+kernels this prototype targets.
+
+### What it uses, and what it deliberately does not
+
+Only `IORING_OP_POLL_ADD`, `IORING_OP_POLL_REMOVE`, and `IORING_OP_TIMEOUT`
+(the last solely to implement `wait(timeout_ms)`'s bounded block). No
+`IORING_OP_ACCEPT`, no registered buffers or files, no multishot variants —
+adopting those requires the wider operation/completion abstraction that the
+"Backend abstraction boundary" section rules out of scope. Accordingly:
+
+- `accept()` and all per-request reads/writes stay outside the ring, as
+  blocking calls on worker threads, byte for byte as before.
+- The sharded per-shard accept `poll()` loops in `gateway_accept.zig` are
+  untouched and stay on `std.posix.poll()`.
+- `keepalive_park.zig`'s `ParkedRegistry` reaper, its maintenance-tick logic,
+  and `gateway_shutdown.zig`'s drain are untouched. As this document argued
+  after review, a readiness-only boundary exposes no per-connection
+  timer/cancellation operation, so there is nothing here that could simplify
+  them.
+
+The backend serves all three of the shared `EventLoop`'s roles identically to
+`epoll`: unsharded listener accept readiness, parked HTTP/1 keepalive
+readiness, and native-TLS `ActiveRegistry`/`ManagedConnection` handshake and
+idle readiness.
+
+### Behavioural differences from `epoll` that the adapter has to absorb
+
+These are the three places where the ring is not a drop-in for level-triggered
+`epoll`, and they are the parts most worth reviewing:
+
+1. **`POLL_ADD` is one-shot.** `epoll` in level-triggered mode keeps reporting
+   a fd until it is drained or removed, and callers depend on that — the
+   listener fd is registered once and never re-added. Every delivered
+   completion is therefore re-armed inside `wait` before it returns.
+2. **A completion carries the mask from when the poll fired**, not the fd's
+   readiness at `wait` time. A fd registered for read and write can be
+   reported writable on one iteration and readable on the next, where `epoll`
+   would have coalesced both. No readiness is lost — the fd is re-armed
+   immediately — but a caller may need one extra loop iteration. Closing this
+   gap needs `IORING_POLL_ADD_LEVEL`, which is Linux 5.13+ and therefore above
+   this prototype's 5.4 floor.
+3. **Closing a fd does not unregister it.** `epoll` drops a fd from every set
+   when it is closed, and this codebase relies on that:
+   `parkedConnectionCloseHook` and `activeConnectionCloseHook` only release
+   accounting slots, so the keepalive idle reaper and the active-connection
+   reaper close registered fds without unregistering them. The ring has no
+   equivalent implicit cleanup, so `add` treats a surviving table entry for a
+   fd it is asked to register as a stale registration for a recycled fd
+   number: it cancels the stale poll and takes the fd over, rather than
+   reporting the `EEXIST` that `EPOLL_CTL_ADD` would.
+
+A fourth difference is internal rather than behavioural: `epoll_ctl` is
+kernel-synchronized and safe to call from any thread while another sits in
+`epoll_wait`, which `removeReadFd` documents worker threads doing. The io_uring
+submission queue is plain shared memory, so every userspace ring mutation is
+taken under a mutex, and submitting threads call `io_uring_enter` themselves
+with `min_complete = 0` so a poll armed from a worker takes effect even while
+the loop thread is blocked in its own `io_uring_enter`. Registrations carry a
+monotonic token in the high half of `user_data` so that a completion racing
+with a `POLL_REMOVE` is discarded rather than reported against a fd the caller
+has already removed and possibly closed.
+
+### Capability probing
+
+`IoUring.init` succeeding only proves the 5.1 ring baseline, so the three
+opcodes are established explicitly at startup rather than inferred from a
+compile-time Linux check. `IORING_REGISTER_PROBE` is used where available and
+checks all three opcodes directly — but that register opcode is itself only
+present from 5.6, so kernels in the 5.1–5.5 window instead get a functional
+probe that submits an already-expired `IORING_OP_TIMEOUT` and requires the
+kernel to complete it with `-ETIME` rather than reject it. That functional
+probe is what actually enforces this prototype's 5.4 floor.
+
+### Validation status — read this before citing the prototype
+
+- **Unit tests:** the `epoll`/`kqueue` behaviour tests in `event_loop.zig` are
+  mirrored for the `io_uring` backend (write readiness, `modify` replacing
+  interest, re-arm persistence, removal, recycled-fd re-registration), plus
+  fail-closed tests for an unavailable backend and an unusable ring size. The
+  behaviour tests skip themselves when `io_uring_setup` is unavailable —
+  container seccomp profiles, Docker's default among them, block it outright —
+  since that is an environment property, not a defect in the backend.
+- **Not executed by the author.** The development host for this change was
+  macOS/arm64, where the io_uring path is compiled out entirely. It was
+  validated there by cross-compiling for `x86_64-linux-gnu` (both the gateway
+  binary and the test binaries build clean) and by review, **not** by running
+  it. The Linux CI jobs are the first place these tests actually execute.
+- **No benchmark evidence of any kind.** No profiling pass has shown the
+  shared `EventLoop`'s readiness/idle-wait role to be a bottleneck, and no
+  throughput or latency comparison against `epoll` has been run. Per
+  `docs/CONCURRENCY.md` and `docs/UPSTREAM_POOLING.md`, such numbers must come
+  from real hardware, not a sandboxed dev or CI environment. Nothing in this
+  change should be cited as evidence that `io_uring` is faster, slower, or
+  equivalent for this workload.
+- **Not recommended for production use.** It is a prototype whose purpose is
+  to make the option measurable.
+
+### What would close #148
+
+Running the `benchmarks/` harness (#136) on representative hardware against
+both backends under high-churn and many-idle-keepalive workloads, plus the
+`perf record -g` pass described under "Long-term". If that evidence shows no
+measurable win, the honest outcome is to remove this prototype rather than
+carry it, and this document should say so.
+
+## Failure modes and fallback policy for the `io_uring` backend
 
 #148 requires failure modes, kernel/toolchain requirements, and fallback
 behavior to be documented as part of the design, not deferred to whenever a
-prototype is written. This section states that policy now so a future
-feature-flagged prototype has a contract to implement against, even though
-no prototype exists yet:
+prototype is written. This section stated that policy before any prototype
+existed; the Phase 1 prototype implements it, and the policy below is now the
+contract that backend is held to:
 
 - **Default unchanged.** `epoll`/`kqueue` remains the only backend selected
   by default on every platform, in every mode (including when listener
   sharding is enabled, where the shards' own `poll()` loops are separate
   from `EventLoop` entirely — see "Current architecture" above).
 - **Explicit opt-in fails closed, not open.** If an operator explicitly
-  requests an `io_uring` backend (e.g. a future
-  `TARDIGRADE_EVENT_LOOP_BACKEND=io_uring`-style flag) and required kernel
+  requests an `io_uring` backend (`TARDIGRADE_EVENT_LOOP_BACKEND=io_uring`)
+  and required kernel
   capabilities cannot be established at startup — unsupported kernel version,
   missing opcodes, seccomp/container restrictions blocking `io_uring_setup`,
   or resource exhaustion (`RLIMIT_MEMLOCK`, ring allocation failure) — the

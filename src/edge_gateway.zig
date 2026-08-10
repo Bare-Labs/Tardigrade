@@ -286,7 +286,22 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state.logger.warn(null, "privilege drop configuration failed: {}", .{err});
     };
 
-    var event_loop = try http.event_loop.EventLoop.init();
+    // #148: an explicitly requested backend fails startup when it is
+    // unavailable rather than silently downgrading, so an operator who asked
+    // for io_uring learns their deployment target cannot provide it here and
+    // not during a later incident. `null` keeps the platform default.
+    var event_loop = if (cfg.event_loop_backend) |requested|
+        http.event_loop.EventLoop.initBackend(state_allocator, requested, .{
+            .io_uring_entries = cfg.event_loop_io_uring_entries,
+        }) catch |err| {
+            state.logger.err(null, "event loop backend '{s}' requested but unavailable: {} (refusing to fall back)", .{
+                @tagName(requested),
+                err,
+            });
+            return err;
+        }
+    else
+        try http.event_loop.EventLoop.init();
     defer event_loop.deinit();
     if (!sharding_enabled) {
         try event_loop.addReadFd(listen_fd);
