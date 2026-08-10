@@ -1090,6 +1090,43 @@ fn streamViaH2Pool(
 
                 const reason = gpres.upstreamReasonPhrase(@enumFromInt(status));
                 const body_allowed = gpres.responseBodyAllowed(method, status);
+
+                // The response relay copies queued DATA out of the stream into
+                // `read_buf`, and the queue's own reservation is not released
+                // until `acknowledgeStreamingBody` — which runs *after* the
+                // downstream write. While a slow client blocks in that write
+                // the same bytes therefore exist twice in application-owned
+                // memory, and charging only the queue let N concurrent slow
+                // responses exceed every configured ceiling by roughly
+                // N * read_buf.len with nothing in the accounting to show it
+                // (#140).
+                //
+                // Taken before the commitment boundary below, so a refusal is
+                // still a clean pre-commit 503 rather than a committed status
+                // that has to be truncated, and released on every exit from
+                // this block — including the retry `continue` paths. A
+                // bodiless response never touches the buffer and is not
+                // charged for it, which is the line HTTP/1 draws too.
+                var response_reservation: ?ProxyBufferReservation = null;
+                defer if (response_reservation) |*reservation| reservation.releaseAll();
+                if (body_allowed) {
+                    var reservation = ProxyBufferReservation.init(
+                        .upstream_to_downstream,
+                        proxy_buffer_limits,
+                        proxy_buffer_observer,
+                        proxy_buffer_capacity,
+                    );
+                    // `reserve` rolls itself back completely at either scope,
+                    // so a refusal leaves nothing to clean up here.
+                    reservation.reserve(read_buf.len) catch {
+                        conn.finishStreaming(stream);
+                        if (!conn.healthy()) h2_pool.evict(key, conn);
+                        h2_pool.release(conn);
+                        return error.ProxyBufferCapacityUnavailable;
+                    };
+                    response_reservation = reservation;
+                }
+
                 // Linearize the commitment boundary: the reader can reject DATA
                 // in the gap between the head arriving and this write starting.
                 // Claiming the transition under the connection's state lock
@@ -4646,4 +4683,264 @@ test "a cancelled http1 upload releases its origin reservation" {
     try std.testing.expectEqual(@as(usize, 0), counters.retained);
     try std.testing.expectEqual(@as(usize, 0), origin.currentBytes(.downstream_to_upstream));
     try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2 response relay buffer accounting (#140).
+// ---------------------------------------------------------------------------
+
+/// An h2c origin that answers with a head plus one DATA frame and then holds
+/// `END_STREAM` back. That leaves a stream whose queue is non-empty while the
+/// relay is working, which is the state where the queue and the relay buffer
+/// are two application-owned copies of the same bytes.
+const H2GatedBodyOrigin = struct {
+    listen_fd: std.posix.fd_t,
+    release_end: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn h2GatedBodyServe(origin: *H2GatedBodyOrigin) void {
+    const conn = std.c.accept(origin.listen_fd, null, null);
+    if (conn < 0) return;
+    defer _ = std.c.close(conn);
+
+    var preface: [24]u8 = undefined;
+    if (!readExactlyFromFd(conn, &preface)) return;
+    const settings = [_]u8{ 0, 0, 0, 0x04, 0, 0, 0, 0, 0 };
+    _ = std.c.write(conn, &settings, settings.len);
+
+    var stream_id: u32 = 0;
+    while (stream_id == 0) {
+        var hdr: [9]u8 = undefined;
+        if (!readExactlyFromFd(conn, &hdr)) return;
+        const payload_len = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | @as(usize, hdr[2]);
+        const typ = hdr[3];
+        const sid = std.mem.readInt(u32, hdr[5..9], .big) & 0x7fff_ffff;
+        var scratch: [4096]u8 = undefined;
+        var remaining = payload_len;
+        while (remaining > 0) {
+            const take = @min(remaining, scratch.len);
+            if (!readExactlyFromFd(conn, scratch[0..take])) return;
+            remaining -= take;
+        }
+        if (typ == 0x01) stream_id = sid; // HEADERS
+    }
+
+    var head_frame = [_]u8{ 0, 0, 1, 0x01, 0x04, 0, 0, 0, 0, 0x88 };
+    std.mem.writeInt(u32, head_frame[5..9], stream_id, .big);
+    _ = std.c.write(conn, &head_frame, head_frame.len);
+
+    // DATA without END_STREAM: the relay has bytes to move but the message is
+    // not over, so the stream stays alive while the downstream write blocks.
+    var body_frame = [_]u8{ 0, 0, 2, 0x00, 0x00, 0, 0, 0, 0, 'h', 'i' };
+    std.mem.writeInt(u32, body_frame[5..9], stream_id, .big);
+    _ = std.c.write(conn, &body_frame, body_frame.len);
+
+    while (!origin.release_end.load(.acquire)) sleepMs(5);
+
+    var end_frame = [_]u8{ 0, 0, 0, 0x00, 0x01, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, end_frame[5..9], stream_id, .big);
+    _ = std.c.write(conn, &end_frame, end_frame.len);
+
+    var drain: [256]u8 = undefined;
+    while (true) {
+        const got = std.c.read(conn, &drain, drain.len);
+        if (got <= 0) break;
+    }
+}
+
+/// A downstream client that stops reading once the response head has arrived,
+/// standing in for a slow consumer. It parks the relay inside the body write —
+/// after the bytes have been copied into the relay buffer and before
+/// `acknowledgeStreamingBody` releases the queue's reservation, which is
+/// exactly the window where both copies are owned at once.
+const GatedChunkWriter = struct {
+    captured: *std.array_list.Managed(u8),
+    head_done: *std.atomic.Value(bool),
+    blocked: *std.atomic.Value(bool),
+    release: *std.atomic.Value(bool),
+
+    fn gate(self: GatedChunkWriter) void {
+        if (!self.head_done.load(.acquire)) return;
+        self.blocked.store(true, .release);
+        while (!self.release.load(.acquire)) sleepMs(2);
+    }
+
+    fn noteHeadEnd(self: GatedChunkWriter) void {
+        if (std.mem.endsWith(u8, self.captured.items, "\r\n\r\n")) self.head_done.store(true, .release);
+    }
+
+    pub fn writeAll(self: GatedChunkWriter, bytes: []const u8) !void {
+        self.gate();
+        try self.captured.appendSlice(bytes);
+        self.noteHeadEnd();
+    }
+
+    pub fn print(self: GatedChunkWriter, comptime fmt: []const u8, args: anytype) !void {
+        self.gate();
+        var buf: [64]u8 = undefined;
+        try self.captured.appendSlice(try std.fmt.bufPrint(&buf, fmt, args));
+        self.noteHeadEnd();
+    }
+};
+
+const H2GatedExchangeCtx = struct {
+    pool: *http.upstream_h2.H2ConnPool,
+    port: u16,
+    uri: std.Uri,
+    read_buf: []u8,
+    captured: *std.array_list.Managed(u8),
+    security: *const http.security_headers.SecurityHeaders,
+    limits: proxy_buffer_account.Limits,
+    observer: proxy_buffer_account.Observer,
+    global: *proxy_buffer_account.Aggregate,
+    head_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    blocked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    failed: bool = false,
+    status: u16 = 0,
+};
+
+fn runH2GatedExchangeThread(ctx: *H2GatedExchangeCtx) void {
+    defer ctx.finished.store(true, .release);
+    var source = FakeUploadSource{ .data = "" };
+    const result = streamViaH2Pool(
+        std.testing.allocator,
+        ctx.pool,
+        null,
+        "127.0.0.1",
+        ctx.port,
+        null, // prior-knowledge h2c
+        ctx.uri,
+        "GET",
+        &.{},
+        "",
+        null, // no upload: this is about the response relay buffer
+        ctx.read_buf,
+        &source,
+        GatedChunkWriter{
+            .captured = ctx.captured,
+            .head_done = &ctx.head_done,
+            .blocked = &ctx.blocked,
+            .release = &ctx.release,
+        },
+        ctx.security,
+        null,
+        null,
+        "h2-response-buffer-test",
+        2000,
+        10_000,
+        null,
+        ctx.limits,
+        ctx.observer,
+        ctx.global,
+    ) catch {
+        ctx.failed = true;
+        return;
+    };
+    ctx.status = result.status_code;
+}
+
+test "an http2 response relay buffer is charged to the aggregate scopes while it relays" {
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    var origin_server = H2GatedBodyOrigin{ .listen_fd = listener.fd };
+    const origin_thread = try std.Thread.spawn(.{}, h2GatedBodyServe, .{&origin_server});
+
+    // Large enough that the stream queue's own retained allocation for two
+    // body bytes cannot be mistaken for it.
+    var read_buf: [64 * 1024]u8 = undefined;
+    const limits = uploadTestLimits(1024 * 1024);
+    // Room for two relay buffers. One is what the exchange takes; the second
+    // is what a concurrent response would need, and must no longer be
+    // available while this one is relaying.
+    var global = proxy_buffer_account.Aggregate.init(.global, 2 * read_buf.len);
+
+    var counters = UploadBufferObserver{};
+    var captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer captured.deinit();
+    var security = http.security_headers.SecurityHeaders{};
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/download", .{listener.port}));
+
+    var pool = http.upstream_h2.H2ConnPool.init(std.testing.allocator, .{
+        .proxy_buffer_limits = blk: {
+            var origin_limits = limits;
+            origin_limits.per_origin_hard_limit = 2 * read_buf.len;
+            break :blk origin_limits;
+        },
+    });
+    // The same account the exchange will reserve against: the pool hands out a
+    // pointer that is stable for its lifetime, so reading it here observes the
+    // origin scope the relay is actually charged to rather than a stand-in.
+    var origin_key_buf: [64]u8 = undefined;
+    const origin_key = try std.fmt.bufPrint(&origin_key_buf, "h2c:127.0.0.1:{d}", .{listener.port});
+    const origin = try pool.originBufferAccount(origin_key);
+
+    var ctx = H2GatedExchangeCtx{
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf = &read_buf,
+        .captured = &captured,
+        .security = &security,
+        .limits = limits,
+        .observer = counters.observer(),
+        .global = &global,
+    };
+    const exchange = try std.Thread.spawn(.{}, runH2GatedExchangeThread, .{&ctx});
+
+    // The client has the head and has stopped reading; the relay is parked
+    // inside the body write, holding the relay buffer, with the queue's
+    // reservation not yet acknowledged.
+    var waited: u32 = 0;
+    while (!ctx.blocked.load(.acquire) and waited < 10_000) : (waited += 5) sleepMs(5);
+    try std.testing.expect(ctx.blocked.load(.acquire));
+
+    // The relay buffer is represented in the process aggregate. Before it was
+    // charged, this read only the stream queue's retained bytes for a two-byte
+    // body, which is nowhere near a relay buffer.
+    try std.testing.expect(global.currentBytes(.upstream_to_downstream) >= read_buf.len);
+    // The origin scope carries it too, so one slow origin's relay buffers are
+    // contained by its own limit and not only by the process ceiling.
+    try std.testing.expect(origin.currentBytes(.upstream_to_downstream) >= read_buf.len);
+
+    // And the ceiling actually accounts for it: a concurrent response needing
+    // its own relay buffer no longer fits, which is the whole point — N slow
+    // responses used to be able to hold N relay buffers beyond the configured
+    // limit with nothing in the accounting to show for it.
+    var other = UploadBufferObserver{};
+    var concurrent = ProxyBufferReservation.init(
+        .upstream_to_downstream,
+        limits,
+        other.observer(),
+        .{ .global = &global },
+    );
+    try std.testing.expectError(
+        error.ProxyBufferCapacityUnavailable,
+        concurrent.reserve(read_buf.len),
+    );
+    try std.testing.expectEqual(@as(u64, 1), other.aggregate_limit_exceeded);
+
+    // Let the client drain and the origin finish the message.
+    ctx.release.store(true, .release);
+    origin_server.release_end.store(true, .release);
+    exchange.join();
+    try std.testing.expect(!ctx.failed);
+    try std.testing.expectEqual(@as(u16, 200), ctx.status);
+
+    // Every scope returns to zero once the exchange ends. Read before
+    // `pool.deinit()`, which frees the origin accounts.
+    try std.testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), origin.currentBytes(.downstream_to_upstream));
+    pool.deinit();
+    origin_thread.join();
+
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+    // The body really did reach the client, so this measured a working relay.
+    try std.testing.expect(std.mem.find(u8, captured.items, "hi") != null);
 }

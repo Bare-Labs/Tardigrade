@@ -32,11 +32,36 @@ All notable user-facing changes to Tardigrade are documented here.
   configured origin. A reloaded limit applies immediately, including to origins
   already holding reservations.
 
+  The HTTP/2 response relay buffer is now charged too, closing the last gap in
+  "every application-owned proxy body buffer is accounted". The relay copies
+  queued DATA out of the stream into a per-request buffer, and the queue's own
+  reservation is not released until *after* the downstream write — so while a
+  slow client blocks in that write, the same bytes are owned twice, and
+  charging only the queue let N concurrent slow responses hold roughly
+  `N × buffer` beyond every configured ceiling with nothing in the accounting
+  to show it. The reservation is taken before the response head is committed,
+  so a refusal is still a clean pre-commit `503`, and it is released on every
+  exit including the retry paths. Bodiless responses never touch the buffer and
+  are not charged for it, matching HTTP/1.
+
+  Reloading an aggregate hard limit is now linearizable against reservations,
+  which makes the documented "applies immediately" guarantee exact. Previously
+  `Aggregate.reserve` read the limit once before its compare-and-swap loop, so
+  a reservation could read the old larger limit, be overtaken by a reload
+  storing a smaller one, and still commit under a policy that no longer
+  existed — and several concurrent reservers could do it at once, leaving a
+  scope above the limit the reload had just promised to enforce. The limit is
+  now re-read on every attempt and the commit is revalidated against the limit
+  in force, rolling back if a shrink beat it there. The fast path stays
+  lock-free.
+
   `docs/PROXY_STREAMING.md` gains practical tuning guidance for the per-stream
   low/high/hard watermarks and the per-origin and global hard limits, including
-  how to read each metric family against the limit it belongs to and which
-  gauge *not* to compare with the global limit. Benchmark scenarios (#149) and
-  CI regression thresholds (#150) remain owned by those issues.
+  protocol-aware sizing (HTTP/1's cost per request is a fixed relay buffer,
+  HTTP/2's is a window plus a relay buffer), how to read each metric family
+  against the limit it belongs to, and which gauge *not* to compare with the
+  global limit. Benchmark scenarios (#149) and CI regression thresholds (#150)
+  remain owned by those issues.
 
 - **HTTP/2 proxy response buffering is bounded per stream *and* in aggregate
   (#140)** — the streaming receive window an HTTP/2 upstream connection
