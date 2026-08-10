@@ -46,10 +46,49 @@ detail in [`docs/CONCURRENCY.md`](CONCURRENCY.md):
   on raw fds, with `Interest{ read, write }` and a fixed-capacity `Event`
   output array. `EventLoop.init()` picks the backend from `builtin.os.tag` at
   compile/runtime; there is no runtime backend override today.
-- The event loop's job is narrow: watch the listener fd(s) for `accept`
-  readiness and watch **parked idle keepalive connections**
-  (`src/http/keepalive_park.zig`, #138) for the next request byte. It is not
-  a general async-I/O runtime — active request handling never touches it.
+- The single shared `EventLoop` instance in `edge_gateway.zig`'s main loop
+  currently has **three** roles, not one:
+  1. **Unsharded listener accept readiness** — only when listener sharding
+     (#137) is off. The main loop's `event_loop.wait()` result checks
+     `ev.fd == listen_fd and !sharding_enabled` before calling
+     `gaccept.acceptReadyConnections`.
+  2. **Parked HTTP/1 keepalive readiness** for the legacy blocking
+     OpenSSL/plaintext path (`src/http/keepalive_park.zig`'s
+     `ParkedRegistry`, #138) — the idle gap between requests on a
+     keep-alive connection served by a worker.
+  3. **Active managed/native downstream readiness and drive scheduling**
+     for the optional pure-Zig (`native_tls_provider`) TLS path
+     (`src/http/downstream_connection.zig`'s `ActiveRegistry` /
+     `ManagedConnection`): the main loop checks `active.contains(ev.fd)`
+     before the listener/park checks and dispatches
+     `worker_pool.submitActiveSocketReady`. A native connection is
+     registered here while waiting for TLS handshake bytes
+     (`native_handshake` phase) and again for the idle gap between
+     requests once negotiated (`native_http1`/`native_http2` phases,
+     `rearmActiveConnection`); `active.reapExpired` and
+     `active.dueDrivePollFds`, driven from the same periodic maintenance
+     tick as `keepalive_park`'s reaper, handle handshake-deadline expiry
+     and scheduled re-drives. **Actual per-request I/O for a checked-out
+     native connection still blocks** — `advanceNativeHttp1`/
+     `advanceNativeHttp2` call `serveOneRequest` through a
+     `WaitingEncryptedHttpConnection` adapter whose `waitFor` does its own
+     local, per-call `std.posix.poll()` rather than looping back through
+     the shared `EventLoop`. So the shared loop's role for this path,
+     like for parked keepalive, is bounding idle/handshake wait time off
+     a worker thread — not driving the request hot path.
+  Request processing on the default OpenSSL/plaintext path is unaffected by
+  any of this: it never touches `EventLoop` and blocks on the worker thread
+  for its full lifecycle.
+- When listener sharding (#137) is enabled
+  (`TARDIGRADE_LISTENER_SHARDS > 1` on a platform with
+  `SO_REUSEPORT`/`SO_REUSEPORT_LB`), accept readiness for **all** shards is
+  handled entirely outside the shared `EventLoop`: each shard thread runs
+  its own independent blocking `poll()` loop
+  (`gaccept.runShardAcceptLoop`/`acceptReadyConnectionsShard` in
+  `src/gateway_accept.zig`) against its own listener fd, and the shared
+  `EventLoop` registers no listener fd at all in that mode — it still
+  handles roles 2 and 3 above. Accepted fds from every shard still enter
+  the same bounded worker pool.
 - Accepted connections are dispatched to a bounded `WorkerPool`
   (`src/http/worker_pool.zig`) of OS threads. Each worker owns one
   connection's full synchronous lifecycle — TLS handshake, HTTP parse,
@@ -60,10 +99,6 @@ detail in [`docs/CONCURRENCY.md`](CONCURRENCY.md):
   Tardigrade needs direct control over thread count, work-stealing, CPU
   affinity, and drain-before-shutdown semantics for a production reverse
   proxy.
-- Listener sharding (#137) runs one independent blocking `poll()`-based
-  accept loop per shard thread (`src/gateway_accept.zig`) when
-  `TARDIGRADE_LISTENER_SHARDS > 1` and `SO_REUSEPORT`/`SO_REUSEPORT_LB` is
-  available; accepted fds still enter the same bounded worker pool.
 - `docs/CONCURRENCY.md` already states the project's standing position on
   this exact question: *"Do not start an `io_uring` or async-runtime rewrite
   from this boundary. Any new backend must be benchmark-justified and fit
@@ -101,12 +136,14 @@ framing, and proxy streaming.
 ### A. Current model — direct `epoll`/`kqueue`, thread-per-request workers
 
 - **Linux fast path:** Mature, well-understood, level-triggered epoll used
-  only for accept + parked-keepalive readiness (a small fraction of total
-  I/O — active request I/O is synchronous blocking calls on worker threads).
-  No known syscall-count problem has been measured in this narrow role;
-  #148's own research basis frames `io_uring`'s syscall-reduction pitch as
-  most valuable for I/O-heavy async runtimes, which this narrow accept/park
-  loop is not.
+  for unsharded listener accept, parked-keepalive readiness, and native-TLS
+  active-connection handshake/idle readiness (see "Current architecture"
+  above for all three roles) — in every case bounding idle wait time off a
+  worker thread, not driving per-request I/O, which stays synchronous
+  blocking calls on worker threads. No known syscall-count problem has been
+  measured in this role; #148's own research basis frames `io_uring`'s
+  syscall-reduction pitch as most valuable for I/O-heavy async runtimes,
+  which this readiness-only loop is not.
 - **macOS/kernel requirements:** `kqueue` is available on every supported
   BSD/macOS target with no minimum-version gymnastics. No portability
   fallback logic needed — it already covers both `SUPPORT_MATRIX.md`
@@ -114,10 +151,14 @@ framing, and proxy streaming.
 - **Complexity / maintenance:** Already implemented, tested, and in
   production use (398 lines, unit-tested for both backends via CI matrix).
   Zero incremental maintenance cost to keep it.
-- **TLS/encrypted-stream integration:** Already fully integrated —
-  `keepalive_park.zig` moves `TlsConnection` state off the worker stack
-  across the idle gap and the event loop only tracks fd readiness, never TLS
-  record state.
+- **TLS/encrypted-stream integration:** Already fully integrated for both
+  TLS paths — `keepalive_park.zig` moves the legacy blocking `TlsConnection`
+  (OpenSSL) state off the worker stack across the idle gap, and
+  `downstream_connection.ActiveRegistry`/`ManagedConnection` does the
+  analogous thing for the optional pure-Zig native TLS path (handshake wait
+  and idle-between-requests wait). In both cases the event loop only tracks
+  fd readiness; it never touches TLS record state or drives handshake/record
+  processing itself.
 - **Proxy streaming / backpressure:** Already integrated with #139's
   streaming relay and #140's (in-progress) watermark work, which are both
   built on synchronous blocking reads/writes, not on event-loop readiness
@@ -146,9 +187,12 @@ framing, and proxy streaming.
 
 - Not vendored or referenced anywhere in this repository today (`libxev`
   search returns no hits).
-- Would require adopting `libxev`'s completion-based (io_uring-on-Linux,
-  kqueue-on-BSD/macOS, IOCP-on-Windows) async model, which is fundamentally
-  callback/completion-oriented — a different concurrency shape than
+- Would require adopting `libxev`'s completion-based async model
+  (`io_uring` or epoll on Linux, `kqueue` on macOS, and WASM, per upstream
+  `mitchellh/libxev` docs; Windows/IOCP is documented upstream as
+  planned/upcoming rather than a currently shipped backend), which is
+  fundamentally callback/completion-oriented — a different concurrency shape
+  than
   Tardigrade's blocking-thread-per-request handler. Adopting it for real gain
   would mean rewriting the request handler to be non-blocking end-to-end
   (TLS, HTTP parsing, proxy relay, FastCGI/SCGI/uWSGI transports), which
@@ -193,8 +237,15 @@ framing, and proxy streaming.
   through one submission/completion queue), which is exactly the shape
   Tardigrade's worker pool does *not* have — each worker already does one
   blocking `read`/`write` at a time on its own thread. The event loop's
-  actual `io_uring`-addressable surface today is narrow: listener accept and
-  parked-keepalive readiness, not the request hot path. Useful `io_uring`
+  actual `io_uring`-addressable surface today spans three readiness roles
+  (unsharded listener accept, legacy-TLS/plaintext parked keepalive, and
+  native-TLS active-connection handshake/idle readiness — see "Current
+  architecture" above), plus the sharded per-shard accept `poll()` loops if
+  those were also moved onto it, but in every case it is readiness/idle-wait
+  scheduling, not the request hot path itself: per-request reads/writes stay
+  synchronous blocking calls on worker threads (including within the
+  native-TLS path's own `WaitingEncryptedHttpConnection.waitFor`, which polls
+  locally rather than through the shared loop). Useful `io_uring`
   features (e.g. `IORING_OP_ACCEPT`, fixed buffers, registered fds) require
   reasonably recent kernels (5.5+ minimum, several features need 5.11+ or
   5.19+), which is a real portability constraint the current epoll fallback
@@ -206,12 +257,14 @@ framing, and proxy streaming.
   new submission/completion-queue lifecycle code, a second set of
   cancellation/timeout semantics, and (per Envoy's and Monoio's own
   documented experience, cited in #148's research basis) materially more
-  operational surface than epoll for a comparatively narrow accept/park role
-  in this codebase's current architecture.
+  operational surface than epoll for a readiness/idle-wait role — even
+  spanning all three current `EventLoop` responsibilities — that never
+  drives per-request I/O in this codebase's current architecture.
 - **TLS/encrypted-stream integration:** Would not change — TLS record
-  handling happens inside the blocking worker, not in the event loop, so
-  `io_uring` adoption at the accept/park boundary would not touch TLS state
-  machines either way.
+  handling (both the legacy OpenSSL path and the native pure-Zig path)
+  happens inside the blocking worker once a connection is checked out, not
+  in the event loop, so `io_uring` adoption at the readiness/idle-wait
+  boundary described above would not touch TLS state machines either way.
 - **Proxy streaming and backpressure:** No expected interaction with #139
   (streaming relay) or #140 (watermark backpressure) as currently designed,
   since both operate on synchronous blocking reads/writes inside worker
@@ -228,10 +281,10 @@ framing, and proxy streaming.
 
 | Dimension | A. Current (epoll/kqueue) | B. Cleaner direct abstraction | C. `libxev` | D. `std.Io` proactor | E. Direct `io_uring` |
 |---|---|---|---|---|---|
-| Linux fast path today | Proven, narrow role | Same as A | Needs non-blocking rewrite to pay off | Not production-ready on 0.16 for socket path | Real upside only for non-blocking, high-fan-out I/O Tardigrade doesn't have yet |
+| Linux fast path today | Proven, readiness-only role (accept/park/native-active) | Same as A | Needs non-blocking rewrite to pay off | Not production-ready on 0.16 for socket path | Real upside only for non-blocking, high-fan-out I/O Tardigrade doesn't have yet |
 | macOS support | Native (`kqueue`) | Native | Native (kqueue backend) | Blocked on 0.16 maturity | None — Linux-only, needs feature-flag gate |
 | Complexity / maintenance | Already paid for | Refactor cost, no new capability | New dependency + handler rewrite | Blocked, not a maintenance question yet | High — new SQ/CQ lifecycle, cancellation model |
-| TLS integration | Done, out of event loop's path | Unaffected | Would need rework if handler goes non-blocking | Unaffected until viable | Unaffected (TLS stays in worker) |
+| TLS integration | Done for both OpenSSL (park) and native (active registry) paths, out of event loop's path | Unaffected | Would need rework if handler goes non-blocking | Unaffected until viable | Unaffected (TLS stays in worker) |
 | Proxy streaming/backpressure (#139/#140) | Built on blocking relay, already integrated | Unaffected | Would require redesign | Already broke FastCGI in production (Phase 2) | No interaction as currently designed |
 | Timers/cancellation/parking/drain | Implemented, no known bottleneck | Unaffected | Would move into libxev's model | Unaffected until viable | Could simplify parking reaper, unproven need |
 | Prototype required to decide? | N/A (shipped) | No | Only if handler model changes | No — blocked on toolchain, not on prototyping | Not yet (see recommendation) |
@@ -254,20 +307,24 @@ framing, and proxy streaming.
   `tardigrade_event_loop_iterations_total` counter (the backend name is
   already computed via `EventLoop.backendName()` and already logged once at
   startup), so operators can see the active backend in
-  `/status/metrics` without parsing startup logs. This is a few-line,
-  low-risk metrics change independent of the architecture question and can
-  land whenever convenient; it is not required to close #148.
+  `/status/metrics` without parsing startup logs. This can land
+  independently of the architecture prototype work; this Phase 0 PR does not
+  implement it, and it remains follow-up work under #148 before closure,
+  per #148's "Metrics to add or verify" section (event-loop backend
+  identifier in logs/metrics, `tardigrade_event_loop_iterations_total{backend=...}`).
 
 ### Long-term
 
 - **`io_uring` is a "later, and only if measured" candidate, not a "now" or
   "never."** The condition for revisiting it: #140 lands, and a profiling
   pass (`perf record -g` per `CONCURRENCY.md`'s "How to measure" section)
-  against the `benchmarks/` harness (#136) shows the accept/park event-loop
-  path — not worker-thread blocking I/O — is a measurable bottleneck under
-  realistic high-churn or many-idle-keepalive workloads. Given the event
-  loop's current narrow role, that evidence does not exist yet and this doc
-  does not manufacture it.
+  against the `benchmarks/` harness (#136) shows the shared `EventLoop`'s
+  readiness/idle-wait role (unsharded accept, parked keepalive, and/or
+  native-TLS active-connection scheduling — see "Current architecture"
+  above) — not worker-thread blocking I/O — is a measurable bottleneck under
+  realistic high-churn or many-idle-keepalive workloads. Given that role is
+  readiness/idle-wait scheduling rather than the request hot path, that
+  evidence does not exist yet and this doc does not manufacture it.
 - **`libxev` and `std.Io` proactor mode are "not now" for a different
   reason each:** `libxev` requires a handler-model rewrite this project has
   explicitly deferred (`worker_pool.zig`); `std.Io`'s proactor facilities are
@@ -277,13 +334,64 @@ framing, and proxy streaming.
   toolchain bump.
 - If a future profiling pass does justify pursuing `io_uring`, the correct
   next step is a narrowly scoped, Linux-only, feature-flagged prototype
-  limited to the accept/park boundary (not a rewrite of worker I/O), matching
-  #148's original "Prototype Linux `io_uring` support behind a feature flag"
-  proposal, with its own follow-up issue and its own benchmark evidence
-  gathered on real hardware (per the project's standing practice — see
-  `docs/UPSTREAM_POOLING.md` and `CONCURRENCY.md`, both of which note that
-  benchmark numbers must be captured on real hardware, not in a sandboxed
-  dev/CI environment).
+  limited to the shared `EventLoop`'s existing readiness/idle-wait roles
+  (not a rewrite of worker I/O or of the native-TLS path's own local
+  `poll()`-based per-request wait), matching #148's original "Prototype
+  Linux `io_uring` support behind a feature flag" proposal, with its own
+  follow-up issue and its own benchmark evidence gathered on real hardware
+  (per the project's standing practice — see `docs/UPSTREAM_POOLING.md` and
+  `CONCURRENCY.md`, both of which note that benchmark numbers must be
+  captured on real hardware, not in a sandboxed dev/CI environment). See
+  "Failure modes and fallback policy" below for the minimum policy such a
+  prototype must define before it lands.
+
+## Failure modes and fallback policy for a future `io_uring` backend
+
+#148 requires failure modes, kernel/toolchain requirements, and fallback
+behavior to be documented as part of the design, not deferred to whenever a
+prototype is written. This section states that policy now so a future
+feature-flagged prototype has a contract to implement against, even though
+no prototype exists yet:
+
+- **Default unchanged.** `epoll`/`kqueue` remains the only backend selected
+  by default on every platform, in every mode (including when listener
+  sharding is enabled, where the shards' own `poll()` loops are separate
+  from `EventLoop` entirely — see "Current architecture" above).
+- **Explicit opt-in fails closed, not open.** If an operator explicitly
+  requests an `io_uring` backend (e.g. a future
+  `TARDIGRADE_EVENT_LOOP_BACKEND=io_uring`-style flag) and required kernel
+  capabilities cannot be established at startup — unsupported kernel version,
+  missing opcodes, seccomp/container restrictions blocking `io_uring_setup`,
+  or resource exhaustion (`RLIMIT_MEMLOCK`, ring allocation failure) — the
+  process must fail startup with a clear error, not silently fall back to
+  epoll. An operator who explicitly asked for `io_uring` needs to know their
+  deployment target doesn't support it, not discover a silent downgrade
+  later during an incident.
+- **A future `auto` mode, if ever added, fails safe before accepting
+  traffic.** If a later revision adds an auto-detect mode, capability
+  probing must happen during startup, before the listener(s) start
+  accepting connections; a failed probe logs/increments a metric with the
+  failure reason and falls back to `epoll`, never mid-flight.
+- **No runtime hot-switching.** Once a backend is selected at startup, the
+  process does not switch backends while running. Runtime SQ/CQ errors
+  (e.g. a ring entering a bad state after `io_uring_enter` failures) are not
+  a live-migration trigger back to epoll; they surface through the same
+  error/drain semantics `gateway_shutdown.zig` already uses for other fatal
+  runtime conditions (log, drain, exit), consistent with how the current
+  `EventLoop.wait()` error path already just logs and continues rather than
+  trying to self-heal by rebuilding the poller.
+- **Kernel/toolchain requirements, if pursued:** modern `io_uring` opcodes
+  useful here (`IORING_OP_ACCEPT`, fixed buffers/files, multishot variants)
+  need meaningfully newer kernels than the epoll baseline requires — commonly
+  cited minimums range from 5.5 (basic ring support) through 5.11/5.19 for
+  specific opcodes/features relevant to a listener-readiness use case. A
+  prototype must pin and document the exact minimum kernel version it
+  targets and probe for it explicitly rather than assuming availability from
+  a compile-time Linux check.
+
+This policy applies to whichever `EventLoop` role(s) a future prototype
+targets (unsharded accept, parked keepalive, and/or native-TLS active
+readiness); it does not change based on which of those roles is chosen.
 
 ## Metrics
 
