@@ -3884,7 +3884,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 .setBody(key_auth)
                 .setHeader("Content-Type", "application/octet-stream")
                 .setConnection(keep_alive);
-            try acme_response.write(writer);
+            try acme_response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
             // ACME HTTP-01 challenges are ordinary requests; keep them visible in
             // access logs and status metrics like every other terminal (#201).
             state.metricsRecord(200);
@@ -3962,7 +3962,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
                 defer response.deinit();
                 _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
                 gp.applyResponseHeaders(state, &response);
-                try response.write(writer);
+                try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
                 state.metricsRecord(r.status);
                 ghandlers.logAccessForRequest(state, &ctx, &request, r.status);
                 return;
@@ -4005,7 +4005,7 @@ fn handleConnection(conn: anytype, session: *ConnectionSession, cfg: *const edge
             defer response.deinit();
             _ = response.setConnection(keep_alive).setHeader(http.correlation.HEADER_NAME, correlation_id);
             gp.applyResponseHeaders(state, &response);
-            try response.write(writer);
+            try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
             state.metricsRecord(r.status);
             ghandlers.logAccessForRequest(state, &ctx, &request, r.status);
             return;

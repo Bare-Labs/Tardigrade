@@ -32,7 +32,7 @@ const mapControlPlaneProxyExecutionError = gp.mapControlPlaneProxyExecutionError
 const sendApiError = gp.sendApiError;
 const setRequestIdHeaders = gp.setRequestIdHeaders;
 const applyResponseHeaders = gp.applyResponseHeaders;
-const writeBufferedUpstreamResponse = gp.writeBufferedUpstreamResponse;
+const writeBufferedUpstreamResponseWithMetrics = gp.writeBufferedUpstreamResponseWithMetrics;
 
 pub const StreamingRequestBody = gp.StreamingRequestBody;
 
@@ -97,10 +97,12 @@ pub const DataPlaneProxyResponse = union(enum) {
         security: *const http.security_headers.SecurityHeaders,
         alt_svc: ?[]const u8,
         sticky_set_cookie: ?[]const u8,
+        metrics: *http.metrics.Metrics,
+        metrics_mutex: *compat.Mutex,
     ) !void {
         switch (self.*) {
             .bounded_buffered => |*response| {
-                try writeBufferedUpstreamResponse(writer, response, keep_alive, correlation_id, security, alt_svc, sticky_set_cookie);
+                try writeBufferedUpstreamResponseWithMetrics(writer, response, keep_alive, correlation_id, security, alt_svc, sticky_set_cookie, metrics, metrics_mutex);
             },
         }
     }
@@ -436,7 +438,7 @@ fn executeVersionedApiProxyRoute(
                 _ = response.setHeader("Set-Cookie", cookie);
             }
             applyResponseHeaders(state, &response);
-            try response.write(writer);
+            try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
             ctx.setUpstreamResult(resp.upstream_addr, resp.status, resp.body.len);
             state.metricsRecord(resp.status);
             return resp.status;
@@ -758,7 +760,7 @@ pub fn handleLocationProxyPass(
         }
     }
     ctx.setUpstreamResult(resolved.upstream_host, upstream_response.statusCode(), upstream_response.bodyLen());
-    try upstream_response.writeHttp1(writer, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, sticky_set_cookie);
+    try upstream_response.writeHttp1(writer, keep_alive, correlation_id, &state.security_headers, state.http3_alt_svc, sticky_set_cookie, &state.metrics, &state.metrics_mutex);
     const status_code = upstream_response.statusCode();
     state.metricsRecord(status_code);
     return status_code;

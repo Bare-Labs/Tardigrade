@@ -6,10 +6,12 @@ const Status = @import("status.zig").Status;
 const Headers = @import("headers.zig").Headers;
 const Version = @import("version.zig").Version;
 const correlation = @import("correlation_id.zig");
+const metrics_mod = @import("metrics.zig");
 
 /// Server name and version for Server header
 pub const SERVER_NAME = "tardigrade";
 pub const SERVER_VERSION = build_options.version;
+const gathered_header_scratch_len = 8 * 1024;
 
 // Try to load a custom error page from `public/errors/<code>.html`.
 fn loadCustomErrorPage(allocator: Allocator, status: Status) ?[]const u8 {
@@ -125,44 +127,20 @@ pub const Response = struct {
 
     /// Write the response to a writer
     pub fn write(self: *Response, writer: anytype) !void {
-        // Status line
-        try writer.print("{s} {d} {s}\r\n", .{
-            self.version.toString(),
-            self.status.code(),
-            self.status.phrase(),
-        });
+        _ = try self.writeMeasured(writer);
+    }
 
-        // Auto-generate Date header
-        try self.writeDate(writer);
-
-        // Server header
-        try writer.print("Server: {s}\r\n", .{SERVER_NAME});
-
-        // Content-Length
-        if (self.headers.get("content-length")) |content_length| {
-            try writer.print("Content-Length: {s}\r\n", .{content_length});
-        } else {
-            const body_len = if (self.body) |b| b.len else 0;
-            try writer.print("Content-Length: {d}\r\n", .{body_len});
-        }
-
-        try self.writeRequestIdHeaders(writer);
-
-        // User-defined headers
-        for (self.headers.iterator()) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
-            if (std.ascii.eqlIgnoreCase(header.name, correlation.HEADER_NAME) or
-                std.ascii.eqlIgnoreCase(header.name, correlation.REQUEST_HEADER_NAME)) continue;
-            try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
-        }
-
-        // End of headers
-        try writer.writeAll("\r\n");
-
-        // Body
-        if (self.body) |b| {
-            try writer.writeAll(b);
-        }
+    pub fn writeWithMetrics(
+        self: *Response,
+        writer: anytype,
+        metrics: *metrics_mod.Metrics,
+        metrics_mutex: *compat.Mutex,
+    ) !void {
+        const result = self.writeMeasured(writer) catch |err| {
+            recordResponseWriteMetric(metrics, metrics_mutex, attemptedWriterMode(@TypeOf(writer), self.body == null or self.body.?.len == 0), 0, true);
+            return err;
+        };
+        recordResponseWriteMetric(metrics, metrics_mutex, result.mode, result.iovecs, false);
     }
 
     pub fn buildHeaderBytes(self: *Response, allocator: Allocator) ![]u8 {
@@ -196,38 +174,100 @@ pub const Response = struct {
 
     /// Write the response without body (for HEAD requests)
     pub fn writeHead(self: *Response, writer: anytype) !void {
-        // Status line
+        _ = try self.writeHeadMeasured(writer);
+    }
+
+    pub fn writeHeadWithMetrics(
+        self: *Response,
+        writer: anytype,
+        metrics: *metrics_mod.Metrics,
+        metrics_mutex: *compat.Mutex,
+    ) !void {
+        const result = self.writeHeadMeasured(writer) catch |err| {
+            recordResponseWriteMetric(metrics, metrics_mutex, attemptedWriterMode(@TypeOf(writer), true), 0, true);
+            return err;
+        };
+        recordResponseWriteMetric(metrics, metrics_mutex, result.mode, result.iovecs, false);
+    }
+
+    const WriteMeasurement = struct {
+        mode: metrics_mod.ResponseWriteMode,
+        iovecs: usize = 0,
+    };
+
+    fn writeMeasured(self: *Response, writer: anytype) !WriteMeasurement {
+        const body_bytes = self.body orelse "";
+        const Writer = @TypeOf(writer);
+        if (comptime writerSupportsGatheredWrite(Writer)) {
+            var scratch: [gathered_header_scratch_len]u8 = undefined;
+            const header = try self.buildHeaderBytesBounded(&scratch);
+            defer header.deinit(self.allocator);
+            if (body_bytes.len == 0) {
+                try writer.writeAll(header.bytes);
+                return .{ .mode = .single_write };
+            }
+            const fragments = [_][]const u8{ header.bytes, body_bytes };
+            const iovecs = try writer.writeGatheredAll(&fragments);
+            return .{ .mode = .writev, .iovecs = iovecs };
+        }
+
+        try self.writeHeaders(writer);
+        if (body_bytes.len > 0) try writer.writeAll(body_bytes);
+        return .{ .mode = classifyWriterMode(Writer, body_bytes.len == 0) };
+    }
+
+    fn writeHeadMeasured(self: *Response, writer: anytype) !WriteMeasurement {
+        const Writer = @TypeOf(writer);
+        if (comptime writerSupportsGatheredWrite(Writer)) {
+            var scratch: [gathered_header_scratch_len]u8 = undefined;
+            const header = try self.buildHeaderBytesBounded(&scratch);
+            defer header.deinit(self.allocator);
+            try writer.writeAll(header.bytes);
+            return .{ .mode = .single_write };
+        }
+
+        try self.writeHeaders(writer);
+        return .{ .mode = classifyWriterMode(Writer, true) };
+    }
+
+    const HeaderBytes = struct {
+        bytes: []u8,
+        owned: bool = false,
+
+        fn deinit(self: HeaderBytes, allocator: Allocator) void {
+            if (self.owned) allocator.free(self.bytes);
+        }
+    };
+
+    fn buildHeaderBytesBounded(self: *Response, scratch: []u8) !HeaderBytes {
+        var stream = compat.fixedBufferStream(scratch);
+        self.writeHeaders(stream.writer()) catch {
+            return .{ .bytes = try self.buildHeaderBytes(self.allocator), .owned = true };
+        };
+        return .{ .bytes = stream.getWritten() };
+    }
+
+    fn writeHeaders(self: *Response, writer: anytype) !void {
         try writer.print("{s} {d} {s}\r\n", .{
             self.version.toString(),
             self.status.code(),
             self.status.phrase(),
         });
-
-        // Auto-generate Date header
         try self.writeDate(writer);
-
-        // Server header
         try writer.print("Server: {s}\r\n", .{SERVER_NAME});
-
-        // Content-Length (still include even for HEAD)
         if (self.headers.get("content-length")) |content_length| {
             try writer.print("Content-Length: {s}\r\n", .{content_length});
         } else {
             const body_len = if (self.body) |b| b.len else 0;
             try writer.print("Content-Length: {d}\r\n", .{body_len});
         }
-
         try self.writeRequestIdHeaders(writer);
-
-        // User-defined headers
         for (self.headers.iterator()) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
             if (std.ascii.eqlIgnoreCase(header.name, correlation.HEADER_NAME) or
                 std.ascii.eqlIgnoreCase(header.name, correlation.REQUEST_HEADER_NAME)) continue;
             try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
         }
-
-        // End of headers
         try writer.writeAll("\r\n");
     }
 
@@ -477,6 +517,46 @@ pub const Response = struct {
     }
 };
 
+fn classifyWriterMode(comptime Writer: type, header_only: bool) metrics_mod.ResponseWriteMode {
+    _ = header_only;
+    const name = @typeName(Writer);
+    if (std.mem.indexOf(u8, name, "tls_termination.TlsConnection.Writer") != null or
+        std.mem.indexOf(u8, name, "encrypted_stream_connection.EncryptedStreamHttpConnection.Writer") != null)
+    {
+        return .tls_buffered;
+    }
+    return .fallback;
+}
+
+fn attemptedWriterMode(comptime Writer: type, header_only: bool) metrics_mod.ResponseWriteMode {
+    if (comptime writerSupportsGatheredWrite(Writer)) return if (header_only) .single_write else .writev;
+    return classifyWriterMode(Writer, false);
+}
+
+fn writerSupportsGatheredWrite(comptime Writer: type) bool {
+    return switch (@typeInfo(Writer)) {
+        .pointer => |ptr| @hasDecl(ptr.child, "writeGatheredAll"),
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(Writer, "writeGatheredAll"),
+        else => false,
+    };
+}
+
+fn recordResponseWriteMetric(
+    metrics: *metrics_mod.Metrics,
+    metrics_mutex: *compat.Mutex,
+    mode: metrics_mod.ResponseWriteMode,
+    iovecs: usize,
+    failed: bool,
+) void {
+    metrics_mutex.lock();
+    defer metrics_mutex.unlock();
+    if (failed) {
+        metrics.recordResponseWriteError(mode);
+    } else {
+        metrics.recordResponseWriteMode(mode, iovecs);
+    }
+}
+
 pub const ResponseWriteOutcome = enum {
     done,
     wait_write,
@@ -563,6 +643,35 @@ const TestPartialWriter = struct {
         const n = @min(self.max_chunk, bytes.len);
         try self.output.appendSlice(self.allocator, bytes[0..n]);
         return n;
+    }
+};
+
+const TestVectoredWriter = struct {
+    allocator: Allocator,
+    output: std.ArrayList(u8) = .empty,
+    writev_calls: usize = 0,
+    writev_iovecs: usize = 0,
+    write_all_calls: usize = 0,
+
+    fn init(allocator: Allocator) TestVectoredWriter {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TestVectoredWriter) void {
+        self.output.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn writeAll(self: *TestVectoredWriter, bytes: []const u8) !void {
+        self.write_all_calls += 1;
+        try self.output.appendSlice(self.allocator, bytes);
+    }
+
+    pub fn writeGatheredAll(self: *TestVectoredWriter, fragments: []const []const u8) !usize {
+        self.writev_calls += 1;
+        self.writev_iovecs += fragments.len;
+        for (fragments) |fragment| try self.output.appendSlice(self.allocator, fragment);
+        return fragments.len;
     }
 };
 
@@ -765,6 +874,68 @@ test "response write is transport-agnostic: in-memory buffer" {
     try testing.expect(std.mem.endsWith(u8, out, "ok"));
 }
 
+test "response write uses vectored writer for small body" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok).setBody("ok").setContentType("text/plain");
+
+    var writer = TestVectoredWriter.init(allocator);
+    defer writer.deinit();
+
+    try response.write(&writer);
+
+    try testing.expectEqual(@as(usize, 1), writer.writev_calls);
+    try testing.expectEqual(@as(usize, 2), writer.writev_iovecs);
+    try testing.expectEqual(@as(usize, 0), writer.write_all_calls);
+    try testing.expect(std.mem.startsWith(u8, writer.output.items, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.endsWith(u8, writer.output.items, "ok"));
+}
+
+test "response write uses vectored writer for large body" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const body = try allocator.alloc(u8, 128 * 1024);
+    defer allocator.free(body);
+    @memset(body, 'x');
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok).setBody(body).setContentType("application/octet-stream");
+
+    var writer = TestVectoredWriter.init(allocator);
+    defer writer.deinit();
+
+    try response.write(&writer);
+
+    try testing.expectEqual(@as(usize, 1), writer.writev_calls);
+    try testing.expectEqual(@as(usize, 2), writer.writev_iovecs);
+    const header_end = std.mem.indexOf(u8, writer.output.items, "\r\n\r\n") orelse return error.TestExpectedHeaders;
+    try testing.expectEqualSlices(u8, body, writer.output.items[header_end + 4 ..]);
+}
+
+test "response write empty body stays single write" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.no_content);
+
+    var writer = TestVectoredWriter.init(allocator);
+    defer writer.deinit();
+
+    try response.write(&writer);
+
+    try testing.expectEqual(@as(usize, 0), writer.writev_calls);
+    try testing.expectEqual(@as(usize, 1), writer.write_all_calls);
+    try testing.expect(std.mem.startsWith(u8, writer.output.items, "HTTP/1.1 204 No Content\r\n"));
+    try testing.expect(std.mem.endsWith(u8, writer.output.items, "\r\n\r\n"));
+}
+
 test "response writeHead emits only headers to in-memory buffer" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -781,6 +952,44 @@ test "response writeHead emits only headers to in-memory buffer" {
     try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 204 No Content\r\n"));
     // writeHead should not emit a body
     try testing.expect(std.mem.endsWith(u8, out, "\r\n"));
+}
+
+test "response writeHead uses one write on gathered writer" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    _ = response.setStatus(.ok).setBody("not sent").setContentType("text/plain");
+
+    var writer = TestVectoredWriter.init(allocator);
+    defer writer.deinit();
+
+    try response.writeHead(&writer);
+
+    try testing.expectEqual(@as(usize, 0), writer.writev_calls);
+    try testing.expectEqual(@as(usize, 1), writer.write_all_calls);
+    try testing.expect(std.mem.startsWith(u8, writer.output.items, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.find(u8, writer.output.items, "Content-Length: 8\r\n") != null);
+    try testing.expect(std.mem.find(u8, writer.output.items, "not sent") == null);
+}
+
+test "response writeWithMetrics records writev and error response modes" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var metrics = metrics_mod.Metrics.init();
+    var metrics_mutex = compat.Mutex{};
+
+    var response = Response.internalServerError(allocator);
+    defer response.deinit();
+
+    var writer = TestVectoredWriter.init(allocator);
+    defer writer.deinit();
+
+    try response.writeWithMetrics(&writer, &metrics, &metrics_mutex);
+    try testing.expectEqual(@as(u64, 1), metrics.response_write_mode_total[0]);
+    try testing.expectEqual(@as(u64, 2), metrics.response_writev_iovecs_total);
 }
 
 test "response write state resumes partial body writes after WouldBlock" {

@@ -120,6 +120,16 @@ logs are written through `src/http/logger.zig`.
   transports stream. Unix-socket and upstream-mTLS targets stream like any other
   upstream and no longer emit a fallback reason.
 - reverse-proxy upstream TTFB summary: `tardigrade_proxy_ttfb_ms`
+- HTTP/1 response writer counters:
+  `tardigrade_response_write_mode_total{mode=...}`,
+  `tardigrade_response_writev_iovecs_total`, and
+  `tardigrade_response_write_errors_total{mode=...}`. Plaintext socket writers
+  use `mode="writev"` when status/headers and body are emitted as gathered
+  fragments. Header-only or empty-body responses on gathered-capable writers
+  serialize the head once and use `mode="single_write"`. TLS writers stay on the
+  TLS library's buffered write path and are reported as `mode="tls_buffered"`
+  when callers use the tracked response-write API; generic in-memory or
+  compatibility writers use `mode="fallback"`.
 - HTTP-level early-data counters (fixed labels only):
   `tardigrade_http_early_data_requests_total{protocol,source}`,
   `tardigrade_http_early_data_decisions_total{protocol,decision}`,

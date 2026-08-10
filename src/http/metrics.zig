@@ -28,6 +28,7 @@ pub const TicketResult = enum { success, rejected, failed };
 pub const TicketKeyReloadOutcome = enum { initial_load_success, initial_load_failure, reload_accepted, reload_rejected };
 
 pub const HttpProtocol = enum { h1, h2, h3 };
+pub const ResponseWriteMode = enum { writev, single_write, tls_buffered, fallback };
 
 /// Why a reverse-proxy request took the bounded buffered path instead of
 /// streaming (#139). This lives here, next to the counters, so it is the single
@@ -102,6 +103,7 @@ const resumption_mode_count = 3;
 const ticket_result_count = 3;
 const ticket_key_reload_outcome_count = 4;
 const http_protocol_count = 3;
+const response_write_mode_count = 4;
 const early_data_source_count = 3;
 const early_data_decision_count = 4;
 const early_data_upstream_425_action_count = 2;
@@ -258,6 +260,9 @@ pub const Metrics = struct {
     tls_ticket_key_reload_total: [ticket_key_reload_outcome_count]u64,
     /// HTTP early-data replay-exposed requests by protocol and source.
     http_early_data_requests_total: [http_protocol_count][early_data_source_count]u64,
+    response_write_mode_total: [response_write_mode_count]u64,
+    response_writev_iovecs_total: u64,
+    response_write_errors_total: [response_write_mode_count]u64,
     /// HTTP early-data decisions by protocol.
     http_early_data_decisions_total: [http_protocol_count][early_data_decision_count]u64,
     /// Upstream 425 handling actions (bounded RFC 8470 semantics only).
@@ -391,6 +396,9 @@ pub const Metrics = struct {
             .tls_ticket_resolve_total = .{.{0} ** ticket_result_count} ** resumption_mode_count,
             .tls_ticket_key_reload_total = .{0} ** ticket_key_reload_outcome_count,
             .http_early_data_requests_total = .{.{0} ** early_data_source_count} ** http_protocol_count,
+            .response_write_mode_total = .{0} ** response_write_mode_count,
+            .response_writev_iovecs_total = 0,
+            .response_write_errors_total = .{0} ** response_write_mode_count,
             .http_early_data_decisions_total = .{.{0} ** early_data_decision_count} ** http_protocol_count,
             .http_early_data_upstream_425_total = .{0} ** early_data_upstream_425_action_count,
             .http_early_data_retry_total = .{0} ** early_data_retry_result_count,
@@ -483,6 +491,15 @@ pub const Metrics = struct {
 
     pub fn recordHttpEarlyDataRequest(self: *Metrics, protocol: HttpProtocol, source: EarlyDataSource) void {
         self.http_early_data_requests_total[httpProtocolIndex(protocol)][earlyDataSourceIndex(source)] += 1;
+    }
+
+    pub fn recordResponseWriteMode(self: *Metrics, mode: ResponseWriteMode, iovecs: usize) void {
+        self.response_write_mode_total[responseWriteModeIndex(mode)] += 1;
+        if (mode == .writev) self.response_writev_iovecs_total += @intCast(iovecs);
+    }
+
+    pub fn recordResponseWriteError(self: *Metrics, mode: ResponseWriteMode) void {
+        self.response_write_errors_total[responseWriteModeIndex(mode)] += 1;
     }
 
     pub fn recordHttpEarlyDataDecision(self: *Metrics, protocol: HttpProtocol, decision: EarlyDataDecision) void {
@@ -1022,6 +1039,7 @@ pub const Metrics = struct {
         });
 
         try self.appendTlsBufferPrometheus(&out);
+        try self.appendResponseWritePrometheus(&out);
         try self.appendResumptionPrometheus(&out);
         try self.appendHttpEarlyDataPrometheus(&out);
         try self.appendEarlyDataReplayPrometheus(&out);
@@ -1323,6 +1341,34 @@ pub const Metrics = struct {
             try out.print("tardigrade_tls_buffer_stalled_drives_total{{backend=\"{s}\"}} {d}\n", .{
                 tlsBackendLabel(backend),
                 self.tls_buffer_stalled_drives[tlsBackendIndex(backend)],
+            });
+        }
+    }
+
+    fn appendResponseWritePrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
+        try out.appendSlice(
+            \\# HELP tardigrade_response_write_mode_total HTTP/1 response write attempts by transport mode
+            \\# TYPE tardigrade_response_write_mode_total counter
+            \\
+        );
+        inline for (.{ ResponseWriteMode.writev, ResponseWriteMode.single_write, ResponseWriteMode.tls_buffered, ResponseWriteMode.fallback }) |mode| {
+            try out.print("tardigrade_response_write_mode_total{{mode=\"{s}\"}} {d}\n", .{
+                responseWriteModeLabel(mode),
+                self.response_write_mode_total[responseWriteModeIndex(mode)],
+            });
+        }
+        try out.print(
+            \\# HELP tardigrade_response_writev_iovecs_total Total iovecs submitted by HTTP/1 response writev attempts
+            \\# TYPE tardigrade_response_writev_iovecs_total counter
+            \\tardigrade_response_writev_iovecs_total {d}
+            \\# HELP tardigrade_response_write_errors_total HTTP/1 response write errors by transport mode
+            \\# TYPE tardigrade_response_write_errors_total counter
+            \\
+        , .{self.response_writev_iovecs_total});
+        inline for (.{ ResponseWriteMode.writev, ResponseWriteMode.single_write, ResponseWriteMode.tls_buffered, ResponseWriteMode.fallback }) |mode| {
+            try out.print("tardigrade_response_write_errors_total{{mode=\"{s}\"}} {d}\n", .{
+                responseWriteModeLabel(mode),
+                self.response_write_errors_total[responseWriteModeIndex(mode)],
             });
         }
     }
@@ -1747,6 +1793,15 @@ fn httpProtocolIndex(protocol: HttpProtocol) usize {
     };
 }
 
+fn responseWriteModeIndex(mode: ResponseWriteMode) usize {
+    return switch (mode) {
+        .writev => 0,
+        .single_write => 1,
+        .tls_buffered => 2,
+        .fallback => 3,
+    };
+}
+
 fn earlyDataSourceIndex(source: EarlyDataSource) usize {
     return switch (source) {
         .transport => 0,
@@ -1838,6 +1893,15 @@ fn httpProtocolLabel(protocol: HttpProtocol) []const u8 {
         .h1 => "h1",
         .h2 => "h2",
         .h3 => "h3",
+    };
+}
+
+fn responseWriteModeLabel(mode: ResponseWriteMode) []const u8 {
+    return switch (mode) {
+        .writev => "writev",
+        .single_write => "single_write",
+        .tls_buffered => "tls_buffered",
+        .fallback => "fallback",
     };
 }
 

@@ -111,9 +111,9 @@ pub fn handleStaticLocation(
                     .setHeader(http.correlation.HEADER_NAME, correlation_id);
                 gp.applyResponseHeaders(state, &response);
                 if (request.method == .HEAD) {
-                    try response.writeHead(writer);
+                    try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
                 } else {
-                    try response.write(writer);
+                    try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
                 }
                 state.metricsRecord(302);
                 return 302;
@@ -139,9 +139,9 @@ pub fn handleStaticLocation(
                         .setHeader(http.correlation.HEADER_NAME, correlation_id);
                     gp.applyResponseHeaders(state, &response);
                     if (request.method == .HEAD) {
-                        try response.writeHead(writer);
+                        try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
                     } else {
-                        try response.write(writer);
+                        try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
                     }
                     state.metricsRecord(302);
                     return 302;
@@ -251,7 +251,19 @@ pub fn writeStaticServedResponse(
     }
 
     gp.applyResponseHeaders(state, &response);
-    try response.writeHead(writer);
+    if (!head_only and served.file_path == null) {
+        try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
+        if (compress_result.compressed) {
+            state.logger.debug(correlation_id, "served static file via buffered path (compressed: {s})", .{
+                if (compress_result.encoding) |enc| enc.headerValue() else "?",
+            });
+        } else {
+            state.logger.debug(correlation_id, "served static file via buffered path", .{});
+        }
+        return @intFromEnum(served.status_code);
+    }
+
+    try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
 
     if (head_only) {
         if (served.file_path) |file_path| {
@@ -274,15 +286,6 @@ pub fn writeStaticServedResponse(
             state.logger.debug(correlation_id, "served static file via file-backed path: {s}", .{file_path});
         } else {
             return error.InvalidStaticTransferState;
-        }
-    } else if (out_body) |body| {
-        try writer.writeAll(body);
-        if (compress_result.compressed) {
-            state.logger.debug(correlation_id, "served static file via buffered path (compressed: {s})", .{
-                if (compress_result.encoding) |enc| enc.headerValue() else "?",
-            });
-        } else {
-            state.logger.debug(correlation_id, "served static file via buffered path", .{});
         }
     }
 
