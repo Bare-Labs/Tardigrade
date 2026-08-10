@@ -533,11 +533,23 @@ probe is what actually enforces this prototype's 5.4 floor.
   behaviour tests skip themselves when `io_uring_setup` is unavailable —
   container seccomp profiles, Docker's default among them, block it outright —
   since that is an environment property, not a defect in the backend.
-- **Not executed by the author.** The development host for this change was
-  macOS/arm64, where the io_uring path is compiled out entirely. It was
-  validated there by cross-compiling for `x86_64-linux-gnu` (both the gateway
-  binary and the test binaries build clean) and by review, **not** by running
-  it. The Linux CI jobs are the first place these tests actually execute.
+- **Executed on Linux by CI, not by the author.** The development host for
+  this change was macOS/arm64, where the io_uring path compiles out entirely;
+  it was validated there only by cross-compiling for `x86_64-linux-gnu` and by
+  review. The Linux CI jobs were the first actual execution, and all six
+  io_uring tests ran and passed there on both `ubuntu-latest` (x86_64) and
+  `ubuntu-24.04-arm` (aarch64) — confirmed by skip-count differential: the
+  macOS job skips 7 tests where the Linux jobs skip 1, and the difference of 6
+  is exactly this backend's tests. So `io_uring_setup` is not blocked on those
+  runners, the capability probe succeeds, and the readiness, `modify`,
+  re-arm, removal, and recycled-fd paths all behave as intended on a live
+  kernel.
+- **The 5.1–5.5 probe fallback is still unexercised.** CI runners are on
+  modern kernels where `IORING_REGISTER_PROBE` is available, so probing always
+  takes the register path. The functional `-ETIME` fallback — the branch that
+  actually enforces the documented 5.4 floor — has never run. Anyone
+  validating this prototype against a 5.4-era kernel should treat that path as
+  unverified.
 - **No benchmark evidence of any kind.** No profiling pass has shown the
   shared `EventLoop`'s readiness/idle-wait role to be a bottleneck, and no
   throughput or latency comparison against `epoll` has been run. Per
