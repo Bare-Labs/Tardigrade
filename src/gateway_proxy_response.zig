@@ -180,6 +180,130 @@ pub fn writeBufferedUpstreamResponse(
     try writer.writeAll(response_stream.getWritten());
 }
 
+pub fn writeBufferedUpstreamResponseWithMetrics(
+    writer: anytype,
+    upstream_response: anytype,
+    keep_alive: bool,
+    correlation_id: []const u8,
+    security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
+    sticky_set_cookie: ?[]const u8,
+    metrics: *http.metrics.Metrics,
+    metrics_mutex: *compat.Mutex,
+) !void {
+    const result = writeBufferedUpstreamResponseMeasured(
+        writer,
+        upstream_response,
+        keep_alive,
+        correlation_id,
+        security,
+        alt_svc,
+        sticky_set_cookie,
+    ) catch |err| {
+        recordResponseWriteMetric(metrics, metrics_mutex, attemptedWriterMode(@TypeOf(writer), upstream_response.body.len == 0), 0, true);
+        return err;
+    };
+    recordResponseWriteMetric(metrics, metrics_mutex, result.mode, result.iovecs, false);
+}
+
+const BufferedWriteMeasurement = struct {
+    mode: http.metrics.ResponseWriteMode,
+    iovecs: usize = 0,
+};
+
+fn writeBufferedUpstreamResponseMeasured(
+    writer: anytype,
+    upstream_response: anytype,
+    keep_alive: bool,
+    correlation_id: []const u8,
+    security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
+    sticky_set_cookie: ?[]const u8,
+) !BufferedWriteMeasurement {
+    const Writer = @TypeOf(writer);
+    if (comptime writerSupportsGatheredWrite(Writer)) {
+        var scratch: [8192]u8 = undefined;
+        const head = try buildBufferedUpstreamResponseHeadBounded(
+            &scratch,
+            upstream_response,
+            keep_alive,
+            correlation_id,
+            security,
+            alt_svc,
+            sticky_set_cookie,
+        );
+        defer head.deinit();
+        if (upstream_response.body.len == 0) {
+            try writer.writeAll(head.bytes);
+            return .{ .mode = .single_write };
+        }
+        const fragments = [_][]const u8{ head.bytes, upstream_response.body };
+        return .{
+            .mode = .writev,
+            .iovecs = try writer.writeGatheredAll(&fragments),
+        };
+    }
+
+    try writeBufferedUpstreamResponse(
+        writer,
+        upstream_response,
+        keep_alive,
+        correlation_id,
+        security,
+        alt_svc,
+        sticky_set_cookie,
+    );
+    return .{ .mode = classifyWriterMode(Writer, upstream_response.body.len == 0) };
+}
+
+const HeaderBytes = struct {
+    allocator: ?std.mem.Allocator = null,
+    bytes: []u8,
+
+    fn deinit(self: HeaderBytes) void {
+        if (self.allocator) |allocator| allocator.free(self.bytes);
+    }
+};
+
+fn buildBufferedUpstreamResponseHeadBounded(
+    scratch: []u8,
+    upstream_response: anytype,
+    keep_alive: bool,
+    correlation_id: []const u8,
+    security: *const http.security_headers.SecurityHeaders,
+    alt_svc: ?[]const u8,
+    sticky_set_cookie: ?[]const u8,
+) !HeaderBytes {
+    var stream = compat.fixedBufferStream(scratch);
+    writeBufferedUpstreamResponseHead(
+        stream.writer(),
+        upstream_response,
+        keep_alive,
+        correlation_id,
+        security,
+        alt_svc,
+        sticky_set_cookie,
+    ) catch {
+        const fallback_allocator = std.heap.page_allocator;
+        var allocating: std.Io.Writer.Allocating = .init(fallback_allocator);
+        errdefer allocating.deinit();
+        try writeBufferedUpstreamResponseHead(
+            &allocating.writer,
+            upstream_response,
+            keep_alive,
+            correlation_id,
+            security,
+            alt_svc,
+            sticky_set_cookie,
+        );
+        return .{
+            .allocator = fallback_allocator,
+            .bytes = try allocating.toOwnedSlice(),
+        };
+    };
+    return .{ .bytes = stream.getWritten() };
+}
+
 pub fn writeBufferedUpstreamResponseHead(
     writer: anytype,
     upstream_response: anytype,
@@ -214,6 +338,46 @@ pub fn writeBufferedUpstreamResponseHead(
     try writeSecurityHeadersFiltered(writer, security, upstream_response.headers);
     if (alt_svc) |value| try writer.print("Alt-Svc: {s}\r\n", .{value});
     try writer.writeAll("\r\n");
+}
+
+fn classifyWriterMode(comptime Writer: type, body_empty: bool) http.metrics.ResponseWriteMode {
+    _ = body_empty;
+    const name = @typeName(Writer);
+    if (std.mem.indexOf(u8, name, "tls_termination.TlsConnection.Writer") != null or
+        std.mem.indexOf(u8, name, "encrypted_stream_connection.EncryptedStreamHttpConnection.Writer") != null)
+    {
+        return .tls_buffered;
+    }
+    return .fallback;
+}
+
+fn attemptedWriterMode(comptime Writer: type, body_empty: bool) http.metrics.ResponseWriteMode {
+    if (comptime writerSupportsGatheredWrite(Writer)) return if (body_empty) .single_write else .writev;
+    return classifyWriterMode(Writer, body_empty);
+}
+
+fn writerSupportsGatheredWrite(comptime Writer: type) bool {
+    return switch (@typeInfo(Writer)) {
+        .pointer => |ptr| @hasDecl(ptr.child, "writeGatheredAll"),
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(Writer, "writeGatheredAll"),
+        else => false,
+    };
+}
+
+fn recordResponseWriteMetric(
+    metrics: *http.metrics.Metrics,
+    metrics_mutex: *compat.Mutex,
+    mode: http.metrics.ResponseWriteMode,
+    iovecs: usize,
+    failed: bool,
+) void {
+    metrics_mutex.lock();
+    defer metrics_mutex.unlock();
+    if (failed) {
+        metrics.recordResponseWriteError(mode);
+    } else {
+        metrics.recordResponseWriteMode(mode, iovecs);
+    }
 }
 
 pub fn computeHstsValue(allocator: std.mem.Allocator, cfg: *const edge_config.EdgeConfig) ![]u8 {
@@ -322,6 +486,35 @@ const TestBufferedUpstreamResponse = struct {
     }
 };
 
+const TestGatheredProxyWriter = struct {
+    allocator: std.mem.Allocator,
+    output: std.ArrayList(u8) = .empty,
+    writev_calls: usize = 0,
+    writev_iovecs: usize = 0,
+    write_all_calls: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) TestGatheredProxyWriter {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TestGatheredProxyWriter) void {
+        self.output.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn writeAll(self: *TestGatheredProxyWriter, bytes: []const u8) !void {
+        self.write_all_calls += 1;
+        try self.output.appendSlice(self.allocator, bytes);
+    }
+
+    pub fn writeGatheredAll(self: *TestGatheredProxyWriter, fragments: []const []const u8) !usize {
+        self.writev_calls += 1;
+        self.writev_iovecs += fragments.len;
+        for (fragments) |fragment| try self.output.appendSlice(self.allocator, fragment);
+        return fragments.len;
+    }
+};
+
 test "writeBufferedUpstreamResponse preserves oversized body bytes exactly" {
     const allocator = std.testing.allocator;
     const prefix = "/*! tailwindcss v4.1.4 | MIT License | synthetic */\n";
@@ -406,6 +599,47 @@ test "writeBufferedUpstreamResponse serializes a single forwarded response head"
     try std.testing.expect(std.mem.find(u8, output, "X-Correlation-ID: tg-1778460305668-bfebecb410803023\r\n") != null);
     try std.testing.expect(std.mem.find(u8, output, "Server: python\r\n") == null);
     try std.testing.expect(std.mem.endsWith(u8, output, "\r\n\r\npong"));
+}
+
+test "writeBufferedUpstreamResponseWithMetrics uses gathered write for data-plane body" {
+    const allocator = std.testing.allocator;
+    const body = try allocator.dupe(u8, "pong");
+    var upstream_headers = [_]TestUpstreamHeader{
+        .{ .name = "Content-Type", .value = "text/plain" },
+    };
+    var response = TestBufferedUpstreamResponse{
+        .metadata_arena = std.heap.ArenaAllocator.init(allocator),
+        .status_code = 200,
+        .reason = "OK",
+        .headers = upstream_headers[0..],
+        .body = body,
+    };
+    defer response.deinit(allocator);
+
+    var writer = TestGatheredProxyWriter.init(allocator);
+    defer writer.deinit();
+    var metrics = http.metrics.Metrics.init();
+    var metrics_mutex = compat.Mutex{};
+
+    try writeBufferedUpstreamResponseWithMetrics(
+        &writer,
+        &response,
+        true,
+        "req-gathered",
+        &http.security_headers.SecurityHeaders.api,
+        null,
+        null,
+        &metrics,
+        &metrics_mutex,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), writer.writev_calls);
+    try std.testing.expectEqual(@as(usize, 2), writer.writev_iovecs);
+    try std.testing.expectEqual(@as(usize, 0), writer.write_all_calls);
+    try std.testing.expect(std.mem.startsWith(u8, writer.output.items, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, writer.output.items, "pong"));
+    try std.testing.expectEqual(@as(u64, 1), metrics.response_write_mode_total[0]);
+    try std.testing.expectEqual(@as(u64, 2), metrics.response_writev_iovecs_total);
 }
 
 test "writeBufferedUpstreamResponse strips upstream Alt-Svc and emits effective policy once" {

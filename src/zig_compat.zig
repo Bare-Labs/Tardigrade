@@ -135,12 +135,12 @@ pub const NetStream = struct {
             try self.stream.writeAll(data);
         }
 
-        pub fn writeGatheredAll(self: Writer, data: []const []const u8) WriteError!void {
+        pub fn writeGatheredAll(self: Writer, data: []const []const u8) WriteError!usize {
             if (self.stream.inner != null) {
                 for (data) |fragment| try self.writeAll(fragment);
-                return;
+                return data.len;
             }
-            try writevAllFd(self.stream.handle, data);
+            return writevAllFd(self.stream.handle, data);
         }
 
         pub fn writeByte(self: Writer, byte: u8) WriteError!void {
@@ -192,15 +192,30 @@ pub const NetStream = struct {
     }
 };
 
-fn writevAllFd(fd: std.posix.fd_t, data: []const []const u8) !void {
+fn writevAllFd(fd: std.posix.fd_t, data: []const []const u8) !usize {
+    const Syscall = struct {
+        fn call(ctx: std.posix.fd_t, iovecs: []const std.posix.iovec_const) !usize {
+            return writevFd(ctx, iovecs);
+        }
+    };
+    return writevAllWith(std.posix.fd_t, fd, data, Syscall.call);
+}
+
+fn writevAllWith(
+    comptime Context: type,
+    context: Context,
+    data: []const []const u8,
+    writev_fn: *const fn (Context, []const std.posix.iovec_const) anyerror!usize,
+) !usize {
     var index: usize = 0;
     var offset: usize = 0;
+    var submitted_iovecs: usize = 0;
     while (index < data.len) {
         while (index < data.len and offset == data[index].len) {
             index += 1;
             offset = 0;
         }
-        if (index >= data.len) return;
+        if (index >= data.len) return submitted_iovecs;
 
         var iovecs: [16]std.posix.iovec_const = undefined;
         var iov_len: usize = 0;
@@ -219,7 +234,11 @@ fn writevAllFd(fd: std.posix.fd_t, data: []const []const u8) !void {
             first_offset = 0;
         }
 
-        const written = try writevFd(fd, iovecs[0..iov_len]);
+        submitted_iovecs += iov_len;
+        const written = writev_fn(context, iovecs[0..iov_len]) catch |err| switch (err) {
+            error.Interrupted => continue,
+            else => return err,
+        };
         if (written == 0) return error.WriteFailed;
 
         var remaining = written;
@@ -235,6 +254,7 @@ fn writevAllFd(fd: std.posix.fd_t, data: []const []const u8) !void {
             }
         }
     }
+    return submitted_iovecs;
 }
 
 fn writevFd(fd: std.posix.fd_t, iovecs: []const std.posix.iovec_const) !usize {
@@ -242,7 +262,7 @@ fn writevFd(fd: std.posix.fd_t, iovecs: []const std.posix.iovec_const) !usize {
         const rc = std.c.writev(fd, iovecs.ptr, @intCast(iovecs.len));
         switch (std.c.errno(rc)) {
             .SUCCESS => return @intCast(rc),
-            .INTR => continue,
+            .INTR => return error.Interrupted,
             .AGAIN => return error.WouldBlock,
             .PIPE => return error.BrokenPipe,
             else => return error.WriteFailed,
@@ -919,6 +939,110 @@ test "fixedBufferStream write and read back" {
     var fbs = fixedBufferStream(&buf);
     try fbs.writer().writeAll("hello");
     try std.testing.expectEqualStrings("hello", fbs.getWritten());
+}
+
+const ScriptedWritev = struct {
+    const Step = union(enum) {
+        write: usize,
+        interrupt,
+        zero,
+        fail,
+    };
+
+    allocator: std.mem.Allocator,
+    steps: []const Step,
+    step_index: usize = 0,
+    output: std.ArrayList(u8) = .empty,
+    submitted_iovecs: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, steps: []const Step) ScriptedWritev {
+        return .{ .allocator = allocator, .steps = steps };
+    }
+
+    fn deinit(self: *ScriptedWritev) void {
+        self.output.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn call(self: *ScriptedWritev, iovecs: []const std.posix.iovec_const) !usize {
+        self.submitted_iovecs += iovecs.len;
+        if (self.step_index >= self.steps.len) return error.TestUnexpectedWritevCall;
+        const step = self.steps[self.step_index];
+        self.step_index += 1;
+        switch (step) {
+            .interrupt => return error.Interrupted,
+            .zero => return 0,
+            .fail => return error.WouldBlock,
+            .write => |n| {
+                var remaining = n;
+                for (iovecs) |iov| {
+                    if (remaining == 0) break;
+                    const take = @min(remaining, iov.len);
+                    try self.output.appendSlice(self.allocator, iov.base[0..take]);
+                    remaining -= take;
+                }
+                return n;
+            },
+        }
+    }
+};
+
+test "writevAllWith resumes after short write inside first iovec" {
+    const parts = [_][]const u8{ "header", "body" };
+    const steps = [_]ScriptedWritev.Step{ .{ .write = 3 }, .{ .write = 7 } };
+    var scripted = ScriptedWritev.init(std.testing.allocator, &steps);
+    defer scripted.deinit();
+
+    const submitted = try writevAllWith(*ScriptedWritev, &scripted, &parts, ScriptedWritev.call);
+
+    try std.testing.expectEqualStrings("headerbody", scripted.output.items);
+    try std.testing.expectEqual(@as(usize, 4), submitted);
+    try std.testing.expectEqual(submitted, scripted.submitted_iovecs);
+}
+
+test "writevAllWith resumes exactly at iovec boundary" {
+    const parts = [_][]const u8{ "header", "body" };
+    const steps = [_]ScriptedWritev.Step{ .{ .write = 6 }, .{ .write = 4 } };
+    var scripted = ScriptedWritev.init(std.testing.allocator, &steps);
+    defer scripted.deinit();
+
+    const submitted = try writevAllWith(*ScriptedWritev, &scripted, &parts, ScriptedWritev.call);
+
+    try std.testing.expectEqualStrings("headerbody", scripted.output.items);
+    try std.testing.expectEqual(@as(usize, 3), submitted);
+    try std.testing.expectEqual(submitted, scripted.submitted_iovecs);
+}
+
+test "writevAllWith resumes after short write inside body iovec" {
+    const parts = [_][]const u8{ "header", "body" };
+    const steps = [_]ScriptedWritev.Step{ .{ .write = 8 }, .{ .write = 2 } };
+    var scripted = ScriptedWritev.init(std.testing.allocator, &steps);
+    defer scripted.deinit();
+
+    const submitted = try writevAllWith(*ScriptedWritev, &scripted, &parts, ScriptedWritev.call);
+
+    try std.testing.expectEqualStrings("headerbody", scripted.output.items);
+    try std.testing.expectEqual(@as(usize, 4), submitted);
+    try std.testing.expectEqual(submitted, scripted.submitted_iovecs);
+}
+
+test "writevAllWith retries interrupt and reports zero and error" {
+    const parts = [_][]const u8{ "he", "llo" };
+    const retry_steps = [_]ScriptedWritev.Step{ .interrupt, .{ .write = 5 } };
+    var retry = ScriptedWritev.init(std.testing.allocator, &retry_steps);
+    defer retry.deinit();
+    try std.testing.expectEqual(@as(usize, 4), try writevAllWith(*ScriptedWritev, &retry, &parts, ScriptedWritev.call));
+    try std.testing.expectEqualStrings("hello", retry.output.items);
+
+    const zero_steps = [_]ScriptedWritev.Step{.zero};
+    var zero = ScriptedWritev.init(std.testing.allocator, &zero_steps);
+    defer zero.deinit();
+    try std.testing.expectError(error.WriteFailed, writevAllWith(*ScriptedWritev, &zero, &parts, ScriptedWritev.call));
+
+    const fail_steps = [_]ScriptedWritev.Step{.fail};
+    var fail = ScriptedWritev.init(std.testing.allocator, &fail_steps);
+    defer fail.deinit();
+    try std.testing.expectError(error.WouldBlock, writevAllWith(*ScriptedWritev, &fail, &parts, ScriptedWritev.call));
 }
 
 test "trimRight removes trailing characters" {

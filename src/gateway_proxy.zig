@@ -43,6 +43,7 @@ pub const applyResponseHeaders = gpres.applyResponseHeaders;
 pub const writeStreamedUpstreamResponse = gpres.writeStreamedUpstreamResponse;
 pub const writeStreamedUpstreamResponseHeadFromHeaders = gpres.writeStreamedUpstreamResponseHeadFromHeaders;
 pub const writeBufferedUpstreamResponse = gpres.writeBufferedUpstreamResponse;
+pub const writeBufferedUpstreamResponseWithMetrics = gpres.writeBufferedUpstreamResponseWithMetrics;
 pub const computeHstsValue = gpres.computeHstsValue;
 pub const writeSecurityHeaders = gpres.writeSecurityHeaders;
 pub const writeChunk = gpres.writeChunk;
