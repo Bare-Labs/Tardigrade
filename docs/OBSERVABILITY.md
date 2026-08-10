@@ -83,10 +83,14 @@ logs are written through `src/http/logger.zig`.
   difference between pauses and resumes reads as "how many relays are stalled
   right now".
 - per-origin HTTP/2 buffer accounting:
-  `tardigrade_upstream_h2_pool_buffered_bytes{upstream}` and
-  `tardigrade_upstream_h2_pool_buffer_limit_exceeded_total{upstream}`. Label
-  cardinality is bounded by the number of distinct configured origins, matching
-  the other `tardigrade_upstream_h2_pool_*` series.
+  `tardigrade_upstream_h2_pool_buffered_bytes{upstream,direction}` and
+  `tardigrade_upstream_h2_pool_buffer_limit_exceeded_total{upstream,direction}`.
+  Response queues and request-direction upload relay buffers are enforced
+  against the *same* per-origin account, so both directions are reported: a
+  request-only pressure would otherwise read as zero while the limit was
+  actively bounding it. Label cardinality stays bounded — two fixed directions
+  per distinct configured origin — and `direction` takes the same values as the
+  process-wide buffer family.
 - configured proxy buffer limits:
   `tardigrade_buffer_config_limit_bytes{direction,scope,limit}` for the
   per-stream low/high/hard watermarks plus per-origin/global hard-limit

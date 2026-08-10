@@ -1664,9 +1664,21 @@ pub const H2OriginSnapshot = struct {
     streams_active: u64,
     stream_resets_total: u64,
     goaway_total: u64,
-    /// Response bytes this origin's streams currently hold in h2 stream queues.
-    buffered_bytes: usize,
-    buffer_limit_exceeded_total: u64,
+    /// Bytes this origin's streams currently hold, by direction. Response
+    /// queues and request-direction upload relay buffers are enforced against
+    /// the *same* per-origin limit (#140), so reporting only responses would
+    /// let the gauge read zero while the limit was being enforced against
+    /// uploads.
+    buffered_bytes: [2]usize,
+    buffer_limit_exceeded_total: [2]u64,
+
+    pub fn bufferedBytes(self: *const H2OriginSnapshot, direction: proxy_buffer_account.Direction) usize {
+        return self.buffered_bytes[@intFromEnum(direction)];
+    }
+
+    pub fn bufferLimitExceeded(self: *const H2OriginSnapshot, direction: proxy_buffer_account.Direction) u64 {
+        return self.buffer_limit_exceeded_total[@intFromEnum(direction)];
+    }
 };
 
 pub fn freeH2OriginSnapshots(allocator: std.mem.Allocator, snaps: []H2OriginSnapshot) void {
@@ -1998,8 +2010,14 @@ pub const H2ConnPool = struct {
                 .streams_active = 0,
                 .stream_resets_total = e.value_ptr.*.stream_resets_total.load(.monotonic),
                 .goaway_total = e.value_ptr.*.goaway_total.load(.monotonic),
-                .buffered_bytes = e.value_ptr.*.buffer.currentBytes(.upstream_to_downstream),
-                .buffer_limit_exceeded_total = e.value_ptr.*.buffer.limitExceededEvents(.upstream_to_downstream),
+                .buffered_bytes = .{
+                    e.value_ptr.*.buffer.currentBytes(.downstream_to_upstream),
+                    e.value_ptr.*.buffer.currentBytes(.upstream_to_downstream),
+                },
+                .buffer_limit_exceeded_total = .{
+                    e.value_ptr.*.buffer.limitExceededEvents(.downstream_to_upstream),
+                    e.value_ptr.*.buffer.limitExceededEvents(.upstream_to_downstream),
+                },
             };
             errdefer allocator.free(snap.origin);
             if (self.conns.get(e.key_ptr.*)) |conn| {
@@ -2522,6 +2540,36 @@ test "h2c pool acquires a prior-knowledge cleartext connection and round-trips" 
     try testing.expectEqual(@as(usize, 1), snaps.len);
     try testing.expectEqualStrings(key, snaps[0].origin);
     try testing.expectEqual(@as(u64, 1), snaps[0].connections_active);
+}
+
+test "per-origin buffer snapshot reports the request direction, not only responses" {
+    var pool = H2ConnPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    const key = "h2:origin-uploads:443";
+    const account = try pool.originBufferAccount(key);
+    account.setHardLimit(4096);
+
+    // An upload relay holding this origin's buffer capacity, with no response
+    // queue anywhere. Reporting only `upstream_to_downstream` made this read as
+    // zero while the same limit was actively bounding the upload (#140).
+    try account.reserve(.downstream_to_upstream, 3072);
+    try testing.expectError(
+        error.BufferLimitExceeded,
+        account.reserve(.downstream_to_upstream, 2048),
+    );
+
+    const snaps = try pool.snapshotOrigins(testing.allocator);
+    defer freeH2OriginSnapshots(testing.allocator, snaps);
+    try testing.expectEqual(@as(usize, 1), snaps.len);
+    try testing.expectEqualStrings(key, snaps[0].origin);
+    try testing.expectEqual(@as(usize, 3072), snaps[0].bufferedBytes(.downstream_to_upstream));
+    try testing.expectEqual(@as(u64, 1), snaps[0].bufferLimitExceeded(.downstream_to_upstream));
+    // The response direction is accounted separately and stays untouched.
+    try testing.expectEqual(@as(usize, 0), snaps[0].bufferedBytes(.upstream_to_downstream));
+    try testing.expectEqual(@as(u64, 0), snaps[0].bufferLimitExceeded(.upstream_to_downstream));
+
+    account.release(.downstream_to_upstream, 3072);
 }
 
 test "h2 pool per-origin counters persist and feed both labelled and global snapshots" {

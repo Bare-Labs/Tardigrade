@@ -222,10 +222,56 @@ fn reserveUploadBytes(reservation: *ProxyBufferReservation, bytes: usize) !void 
     };
 }
 
+/// The HTTP/1 upload relay's fixed copy buffer. Named because the reservation
+/// covering it is taken before the request head is written, in a different
+/// function from the array it describes.
+const http1_upload_relay_bytes: usize = 16 * 1024;
+
+/// Bytes a relay retains from the request head, on top of its fixed relay
+/// buffer. The two framings retain different amounts of the same slice: a
+/// `.length` upload forwards only the body bytes it is owed, while a `.chunked`
+/// upload hands the whole raw remainder to the decoder, which reads framing
+/// octets out of it too — so the retained slice there is its raw length.
+fn uploadInitialBytesFootprint(sb: StreamingRequestBody) usize {
+    return switch (sb.framing) {
+        .length => |content_length| @min(sb.initial_bytes.len, content_length),
+        .chunked => sb.initial_bytes.len,
+    };
+}
+
+/// Claim an upload's whole known buffer footprint *before* anything is sent
+/// upstream.
+///
+/// #140 requires capacity decisions to be deterministic before request
+/// forwarding, and that is not just bookkeeping: reserving inside the relay
+/// means the request head (HTTP/1) or HEADERS (HTTP/2) has already reached the
+/// origin, so a local 413/503 would leave a real, possibly side-effecting
+/// request half-delivered. Reserving first makes a refusal something the origin
+/// never sees.
+///
+/// The returned reservation is live and owned by the caller, which must
+/// `releaseAll` it on every exit; the relay releases the initial-bytes portion
+/// as those bytes drain.
+fn preflightUploadReservation(
+    limits: proxy_buffer_account.Limits,
+    observer: proxy_buffer_account.Observer,
+    capacity: proxy_buffer_account.AggregateCapacity,
+    relay_bytes: usize,
+    initial_bytes: usize,
+) !ProxyBufferReservation {
+    var reservation = ProxyBufferReservation.init(.downstream_to_upstream, limits, observer, capacity);
+    errdefer reservation.releaseAll();
+
+    try reserveUploadBytes(&reservation, relay_bytes);
+    if (initial_bytes != 0) try reserveUploadBytes(&reservation, initial_bytes);
+    return reservation;
+}
+
 /// Note a write that cannot make progress right now as a downstream read pause.
 /// The check never waits (zero timeout), so a relay whose origin keeps draining
-/// costs one non-blocking `poll` per chunk and never touches the counters. A
-/// poll failure is not evidence of a stall, so it records nothing.
+/// costs one non-blocking `poll` per chunk and never touches the counters.
+/// Only a genuinely full send buffer counts: a socket that is erroring or hung
+/// up records nothing, so a broken upstream never looks like a slow one.
 ///
 /// This reports a stall that is *already* in effect, so a single write that
 /// happens to block briefly after the check passes is not counted. That is the
@@ -233,8 +279,7 @@ fn reserveUploadBytes(reservation: *ProxyBufferReservation, bytes: usize) !void 
 /// send buffer full across relay iterations and is caught, while a momentary
 /// block is not a backpressure event worth a counter.
 fn noteUpstreamWriteStall(fd: std.posix.fd_t, stall: *proxy_buffer_account.ReadStall) void {
-    const writable = pollFdWritable(fd) catch return;
-    if (!writable) stall.pause();
+    if (pollUpstreamWritability(fd) == .blocked) stall.pause();
 }
 
 pub const StreamingProxyResult = struct {
@@ -765,6 +810,11 @@ fn executeBufferedViaH2Pool(
 /// The caller owns connection teardown on error. `read_buf` is the single relay
 /// buffer, so upload memory stays bounded; per-stream flow control supplies the
 /// backpressure.
+///
+/// `reservation` is preflighted by the caller — before HEADERS are sent, so a
+/// capacity refusal is something the origin never sees — and already covers
+/// `read_buf` plus `uploadInitialBytesFootprint(sb)`. The caller releases the
+/// rest; this function gives back only the initial-bytes portion as it drains.
 fn relayStreamingUploadToHttp2(
     conn: anytype,
     stream: anytype,
@@ -772,29 +822,18 @@ fn relayStreamingUploadToHttp2(
     read_buf: []u8,
     downstream_conn: anytype,
     cancel_token: ?*const CancellationToken,
-    proxy_buffer_limits: proxy_buffer_account.Limits,
-    proxy_buffer_observer: proxy_buffer_account.Observer,
-    proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity,
+    reservation: *ProxyBufferReservation,
 ) !void {
-    // The relay owns `read_buf` for the whole upload, so reserve it once rather
-    // than per chunk: the reservation then tracks memory actually retained, and
-    // the aggregate scopes see one stable claim instead of a reserve/release
-    // flicker per DATA frame that no concurrent stream could ever be bounded by.
-    var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity);
-    try reserveUploadBytes(&upload_reservation, read_buf.len);
-    defer upload_reservation.releaseAll();
-
     switch (sb.framing) {
         .length => |content_length| {
             var sent: usize = @min(sb.initial_bytes.len, content_length);
             if (sent > 0) {
-                // Bytes that arrived with the request head are a second buffer.
-                try reserveUploadBytes(&upload_reservation, sent);
                 conn.writeStreamingRequestBody(stream, sb.initial_bytes[0..sent], sent == content_length) catch |err| {
-                    upload_reservation.release(sent);
+                    reservation.release(sent);
                     return err;
                 };
-                upload_reservation.release(sent);
+                // Forwarded: the request head's body bytes are no longer held.
+                reservation.release(sent);
             }
             while (sent < content_length) {
                 if (cancelStopped(cancel_token)) return error.RequestCancelled;
@@ -813,9 +852,15 @@ fn relayStreamingUploadToHttp2(
             // the upstream never sees a Content-Length it cannot know.
             var reader = http.chunked_upload.Reader(@TypeOf(downstream_conn))
                 .init(downstream_conn, sb.initial_bytes, sb.max_body_bytes);
+            // The decoder borrows the whole raw request-head remainder, framing
+            // octets included — see `uploadInitialBytesFootprint`.
+            var head_bytes_held = sb.initial_bytes.len;
             while (true) {
                 if (cancelStopped(cancel_token)) return error.RequestCancelled;
                 const n = try reader.next(read_buf);
+                // Before acting on `n`: the terminal call consumes borrowed
+                // trailer bytes too.
+                releaseDrainedHeadBytes(reservation, &head_bytes_held, reader.pendingBytes());
                 if (n == 0) break;
                 try conn.writeStreamingRequestBody(stream, read_buf[0..n], false);
             }
@@ -935,6 +980,25 @@ fn streamViaH2Pool(
                     try path_buf.writer.writeAll(uriComponentBytes(q));
                 }
 
+                // Claim the upload's buffer footprint before `openStreaming`,
+                // which sends HEADERS (#140). Reserving after it would let a
+                // local 413/503 be raised only once the origin had already
+                // received a request it will never see the body of.
+                var upload_reservation: ?ProxyBufferReservation = null;
+                defer if (upload_reservation) |*reservation| reservation.releaseAll();
+                if (streaming_body) |sb| {
+                    upload_reservation = preflightUploadReservation(
+                        proxy_buffer_limits,
+                        proxy_buffer_observer,
+                        proxy_buffer_capacity,
+                        read_buf.len,
+                        uploadInitialBytesFootprint(sb),
+                    ) catch |err| {
+                        h2_pool.release(conn);
+                        return err;
+                    };
+                }
+
                 const start_ms = http.event_loop.monotonicMs();
                 const stream = conn.openStreaming(.{
                     .method = method,
@@ -967,9 +1031,7 @@ fn streamViaH2Pool(
                         read_buf,
                         downstream_conn,
                         cancel_token,
-                        proxy_buffer_limits,
-                        proxy_buffer_observer,
-                        proxy_buffer_capacity,
+                        &upload_reservation.?,
                     ) catch |err| {
                         const capacity_abort = err == error.BufferLimitExceeded or
                             conn.abortCause(stream) == .local_capacity;
@@ -1420,18 +1482,41 @@ fn pollFdReadable(fd: std.posix.fd_t, timeout_ms: u32) !bool {
     return ready != 0;
 }
 
-/// Can `fd` accept bytes right now without blocking? A `false` means the send
-/// buffer is full because the peer has stopped draining — which for the
-/// synchronous HTTP/1 relay is the whole of its backpressure, since it has no
-/// queue whose depth could cross a watermark instead. Never waits.
-fn pollFdWritable(fd: std.posix.fd_t) !bool {
+/// What a zero-timeout writability check found on the upstream socket.
+const UpstreamWritability = enum {
+    /// The socket can take bytes right now.
+    writable,
+    /// The send buffer is full because the peer has stopped draining, so the
+    /// next write blocks until it resumes. This — and only this — is
+    /// backpressure, and for the synchronous HTTP/1 relay it is the whole of
+    /// it, since that relay has no queue whose depth could cross a watermark.
+    blocked,
+    /// The socket is in error or hung up, or the check itself failed. A broken
+    /// connection is not a slow one: the write is about to fail, and calling
+    /// that a pause would report an upstream *failure* as a stalled origin.
+    failed,
+};
+
+/// Ask whether `fd` can take bytes right now. Never waits.
+///
+/// `poll` reports a descriptor as ready for `POLLERR`, `POLLHUP`, or
+/// `POLLNVAL` even when `POLLOUT` is absent, so readiness alone does not mean
+/// writable and its absence does not mean full — the three outcomes have to be
+/// separated or a dead upstream shows up in the backpressure counters.
+fn pollUpstreamWritability(fd: std.posix.fd_t) UpstreamWritability {
     var pfds = [_]std.posix.pollfd{.{
         .fd = fd,
         .events = std.posix.POLL.OUT,
         .revents = 0,
     }};
-    const ready = try std.posix.poll(&pfds, 0);
-    return ready != 0 and (pfds[0].revents & std.posix.POLL.OUT) != 0;
+    const ready = std.posix.poll(&pfds, 0) catch return .failed;
+    if (ready == 0) return .blocked;
+    const revents = pfds[0].revents;
+    // Error bits win even when POLLOUT is also set: the write is not going to
+    // succeed, so this is not a stall to wait out.
+    if ((revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL)) != 0) return .failed;
+    if ((revents & std.posix.POLL.OUT) != 0) return .writable;
+    return .failed;
 }
 
 test "parseBufferedUpstreamResponse keeps metadata in an arena and preserves forwarded headers" {
@@ -1874,6 +1959,22 @@ fn sendStreamingProxyRequest(
     proxy_buffer_observer: proxy_buffer_account.Observer,
     proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity,
 ) !void {
+    // Claim the upload's buffer footprint before a single byte of the request
+    // reaches the origin (#140). Reserving inside the relay meant a local
+    // 413/503 could only be raised after the origin had already received a
+    // half-delivered, possibly side-effecting request.
+    var upload_reservation: ?ProxyBufferReservation = null;
+    defer if (upload_reservation) |*reservation| reservation.releaseAll();
+    if (streaming_body) |sb| {
+        upload_reservation = try preflightUploadReservation(
+            proxy_buffer_limits,
+            proxy_buffer_observer,
+            proxy_buffer_capacity,
+            http1_upload_relay_bytes,
+            uploadInitialBytesFootprint(sb),
+        );
+    }
+
     var req_aw: std.Io.Writer.Allocating = .init(allocator);
     defer req_aw.deinit();
     const w = &req_aw.writer;
@@ -1915,9 +2016,8 @@ fn sendStreamingProxyRequest(
             sb,
             downstream_conn,
             cancel_token,
-            proxy_buffer_limits,
+            &upload_reservation.?,
             proxy_buffer_observer,
-            proxy_buffer_capacity,
         );
     } else if (buffered_body.len > 0) {
         try transport.writeAll(buffered_body);
@@ -1933,41 +2033,41 @@ fn sendStreamingProxyRequest(
 /// again only after the upstream write completes, so a full upstream send buffer
 /// *is* a pause of downstream reads, and that transition is the only place a
 /// slow origin becomes visible on a path that deliberately has no queue (#140).
+///
+/// `reservation` is preflighted by the caller and already covers this relay
+/// buffer plus `uploadInitialBytesFootprint(sb)`; the caller releases the rest.
+/// This function only gives back the initial-bytes portion as those bytes
+/// actually drain, so a long upload does not hold the request head's peak for
+/// its whole life.
 fn relayStreamingUploadToHttp1(
     transport: anytype,
     fd: std.posix.fd_t,
     sb: StreamingRequestBody,
     downstream_conn: anytype,
     cancel_token: ?*const CancellationToken,
-    proxy_buffer_limits: proxy_buffer_account.Limits,
-    proxy_buffer_observer: proxy_buffer_account.Observer,
-    proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity,
+    reservation: *ProxyBufferReservation,
+    observer: proxy_buffer_account.Observer,
 ) !void {
-    var relay: [16 * 1024]u8 = undefined;
-    var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity);
-    try reserveUploadBytes(&upload_reservation, relay.len);
-    defer upload_reservation.releaseAll();
+    var relay: [http1_upload_relay_bytes]u8 = undefined;
 
     // Balanced on every exit — success, client abort, cancellation, upstream
     // failure — so the pause/resume difference reads as "relays stalled right
     // now" instead of drifting by one per aborted upload.
-    var stall = proxy_buffer_account.ReadStall.init(.downstream, proxy_buffer_observer);
+    var stall = proxy_buffer_account.ReadStall.init(.downstream, observer);
     defer stall.unpause();
 
     switch (sb.framing) {
         .length => |content_length| {
             var sent: usize = @min(sb.initial_bytes.len, content_length);
             if (sent > 0) {
-                // The bytes that arrived with the request head live in their own
-                // buffer, so they are reserved on top of the relay buffer.
-                try reserveUploadBytes(&upload_reservation, sent);
                 noteUpstreamWriteStall(fd, &stall);
                 transport.writeAll(sb.initial_bytes[0..sent]) catch |err| {
-                    upload_reservation.release(sent);
+                    reservation.release(sent);
                     return err;
                 };
                 stall.unpause();
-                upload_reservation.release(sent);
+                // Forwarded: the request head's body bytes are no longer held.
+                reservation.release(sent);
             }
             while (sent < content_length) {
                 if (cancelStopped(cancel_token)) return error.RequestCancelled;
@@ -1987,9 +2087,16 @@ fn relayStreamingUploadToHttp1(
             // extensions or trailers, which this hop does not forward.
             var reader = http.chunked_upload.Reader(@TypeOf(downstream_conn))
                 .init(downstream_conn, sb.initial_bytes, sb.max_body_bytes);
+            // The decoder borrows the whole raw request-head remainder —
+            // framing octets included, which is why the reservation covers the
+            // raw length rather than the decoded payload.
+            var head_bytes_held = sb.initial_bytes.len;
             while (true) {
                 if (cancelStopped(cancel_token)) return error.RequestCancelled;
                 const n = try reader.next(&relay);
+                // Give back what the decoder has finished with, before acting on
+                // `n`: the terminal call consumes borrowed trailer bytes too.
+                releaseDrainedHeadBytes(reservation, &head_bytes_held, reader.pendingBytes());
                 if (n == 0) break;
                 var size_buf: [24]u8 = undefined;
                 const size_line = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{n}) catch unreachable;
@@ -2004,6 +2111,19 @@ fn relayStreamingUploadToHttp1(
             try transport.writeAll("0\r\n\r\n");
         },
     }
+}
+
+/// Release the request-head bytes a chunked decoder has consumed since the last
+/// check. `still_held` is what it still borrows; anything below the previous
+/// mark has been copied out and is no longer retained.
+fn releaseDrainedHeadBytes(
+    reservation: *ProxyBufferReservation,
+    head_bytes_held: *usize,
+    still_held: usize,
+) void {
+    if (still_held >= head_bytes_held.*) return;
+    reservation.release(head_bytes_held.* - still_held);
+    head_bytes_held.* = still_held;
 }
 
 /// Run one streaming proxy attempt over an already-connected `transport`: send
@@ -3000,6 +3120,50 @@ fn uploadTestLimits(hard: usize) proxy_buffer_account.Limits {
     };
 }
 
+/// Preflight then relay, in the order `sendStreamingProxyRequest` does, so
+/// tests exercise the same reservation lifetime production uses.
+fn runHttp1Upload(
+    transport: anytype,
+    fd: std.posix.fd_t,
+    sb: StreamingRequestBody,
+    downstream_conn: anytype,
+    limits: proxy_buffer_account.Limits,
+    observer: proxy_buffer_account.Observer,
+    capacity: proxy_buffer_account.AggregateCapacity,
+) !void {
+    var reservation = try preflightUploadReservation(
+        limits,
+        observer,
+        capacity,
+        http1_upload_relay_bytes,
+        uploadInitialBytesFootprint(sb),
+    );
+    defer reservation.releaseAll();
+    try relayStreamingUploadToHttp1(transport, fd, sb, downstream_conn, null, &reservation, observer);
+}
+
+/// The HTTP/2 mirror of `runHttp1Upload`.
+fn runHttp2Upload(
+    conn: anytype,
+    stream: anytype,
+    sb: StreamingRequestBody,
+    read_buf: []u8,
+    downstream_conn: anytype,
+    limits: proxy_buffer_account.Limits,
+    observer: proxy_buffer_account.Observer,
+    capacity: proxy_buffer_account.AggregateCapacity,
+) !void {
+    var reservation = try preflightUploadReservation(
+        limits,
+        observer,
+        capacity,
+        read_buf.len,
+        uploadInitialBytesFootprint(sb),
+    );
+    defer reservation.releaseAll();
+    try relayStreamingUploadToHttp2(conn, stream, sb, read_buf, downstream_conn, null, &reservation);
+}
+
 /// Drain `total` bytes from `fd` after `delay_ms`. The delay is what lets the
 /// relay observe an origin that has stopped consuming.
 fn slowUploadDrain(fd: std.posix.fd_t, delay_ms: u64, total: usize) void {
@@ -3061,23 +3225,21 @@ test "http1 upload relay reports a slow origin as a downstream read pause" {
 
     // Leave the origin's window already full, so the relay's first look at the
     // socket is guaranteed to find a stall rather than racing the drainer for
-    // one. `pollFdWritable` must agree, or the check below is not testing
-    // anything.
+    // one. The probe must agree, or the check below is not testing anything.
     const prefilled = try fillSocketSendBuffer(client_fd);
     try std.testing.expect(prefilled > 0);
-    try std.testing.expect(!try pollFdWritable(client_fd));
+    try std.testing.expectEqual(UpstreamWritability.blocked, pollUpstreamWritability(client_fd));
 
     const drainer = try std.Thread.spawn(.{}, slowUploadDrain, .{ peer_fd, @as(u64, 20), prefilled + payload.len });
     defer drainer.join();
 
     var counters = UploadBufferObserver{};
     var source = FakeUploadSource{ .data = payload };
-    try relayStreamingUploadToHttp1(
+    try runHttp1Upload(
         compat.netStreamFromFd(client_fd),
         client_fd,
         .{ .framing = .{ .length = payload.len } },
         &source,
-        null,
         uploadTestLimits(1024 * 1024),
         counters.observer(),
         .{},
@@ -3104,12 +3266,11 @@ test "http1 upload relay leaves nothing reserved when the client aborts mid-uplo
     var global = proxy_buffer_account.Aggregate.init(.global, 0);
     // Promises 8 KiB, delivers 4 KiB, then the client goes away.
     var source = FakeUploadSource{ .data = &[_]u8{'x'} ** 4096, .abort_after = 4096 };
-    try std.testing.expectError(error.ClientAborted, relayStreamingUploadToHttp1(
+    try std.testing.expectError(error.ClientAborted, runHttp1Upload(
         compat.netStreamFromFd(client_fd),
         client_fd,
         .{ .framing = .{ .length = 8192 } },
         &source,
-        null,
         uploadTestLimits(1024 * 1024),
         counters.observer(),
         .{ .global = &global },
@@ -3134,12 +3295,11 @@ test "http1 upload relay rejects an over-limit in-flight upload as a client faul
     var source = FakeUploadSource{ .data = "" };
     // The relay buffer alone consumes the whole per-stream budget, so the bytes
     // that arrived with the request head have nowhere to go.
-    try std.testing.expectError(error.RequestBufferLimitExceeded, relayStreamingUploadToHttp1(
+    try std.testing.expectError(error.RequestBufferLimitExceeded, runHttp1Upload(
         compat.netStreamFromFd(client_fd),
         client_fd,
         .{ .framing = .{ .length = 32 }, .initial_bytes = "inline-body-bytes" },
         &source,
-        null,
         uploadTestLimits(16 * 1024),
         counters.observer(),
         .{},
@@ -3170,12 +3330,11 @@ test "http1 upload relay refuses when a concurrent relay has taken the aggregate
     try in_flight.reserve(16 * 1024);
 
     var source = FakeUploadSource{ .data = "" };
-    try std.testing.expectError(error.ProxyBufferCapacityUnavailable, relayStreamingUploadToHttp1(
+    try std.testing.expectError(error.ProxyBufferCapacityUnavailable, runHttp1Upload(
         compat.netStreamFromFd(client_fd),
         client_fd,
         .{ .framing = .{ .length = 0 } },
         &source,
-        null,
         limits,
         counters.observer(),
         capacity,
@@ -3190,6 +3349,367 @@ test "http1 upload relay refuses when a concurrent relay has taken the aggregate
     try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
     try std.testing.expectEqual(@as(usize, 0), counters.reserved);
     try std.testing.expectEqual(@as(usize, 0), counters.retained);
+}
+
+/// Has anything arrived on `fd` yet? Zero timeout — used to assert an origin
+/// was left untouched, so it must not wait for something that will never come.
+fn peerHasBytes(fd: std.posix.fd_t) !bool {
+    var pfds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = try std.posix.poll(&pfds, 0);
+    return ready != 0 and (pfds[0].revents & std.posix.POLL.IN) != 0;
+}
+
+test "http1 chunked upload accounts the raw request-head remainder and releases it as it drains" {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    var counters = UploadBufferObserver{};
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    const limits = uploadTestLimits(1024 * 1024);
+    const capacity = proxy_buffer_account.AggregateCapacity{ .global = &global };
+
+    // The whole chunked body arrived with the request head. The decoder borrows
+    // that raw slice — framing octets included — so all 14 bytes are retained
+    // alongside the relay buffer even though only 5 are payload.
+    const head_remainder = "5\r\nhello\r\n0\r\n\r\n";
+    const sb = StreamingRequestBody{
+        .framing = .chunked,
+        .initial_bytes = head_remainder,
+        .max_body_bytes = 1024,
+    };
+    try std.testing.expectEqual(@as(usize, head_remainder.len), uploadInitialBytesFootprint(sb));
+
+    var source = FakeUploadSource{ .data = "" };
+    var reservation = try preflightUploadReservation(
+        limits,
+        counters.observer(),
+        capacity,
+        http1_upload_relay_bytes,
+        uploadInitialBytesFootprint(sb),
+    );
+    defer reservation.releaseAll();
+    try std.testing.expectEqual(
+        http1_upload_relay_bytes + head_remainder.len,
+        counters.peak_reserved,
+    );
+
+    try relayStreamingUploadToHttp1(
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        sb,
+        &source,
+        null,
+        &reservation,
+        counters.observer(),
+    );
+
+    // The relay gave the head remainder back as the decoder drained it, rather
+    // than holding the peak until teardown — only the relay buffer is left.
+    try std.testing.expectEqual(http1_upload_relay_bytes, reservation.account.snapshot().current);
+    try std.testing.expectEqual(http1_upload_relay_bytes, global.currentBytes(.downstream_to_upstream));
+
+    reservation.releaseAll();
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+
+    // The re-chunked body did reach the origin.
+    var seen: [64]u8 = undefined;
+    const got = std.c.read(peer_fd, &seen, seen.len);
+    try std.testing.expect(got > 0);
+    try std.testing.expectEqualStrings("5\r\nhello\r\n0\r\n\r\n", seen[0..@intCast(got)]);
+}
+
+test "chunked request-head remainder counts against the aggregate scope" {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    const limits = uploadTestLimits(64 * 1024);
+    var counters = UploadBufferObserver{};
+    var global = proxy_buffer_account.Aggregate.init(.global, 64 * 1024);
+    const capacity = proxy_buffer_account.AggregateCapacity{ .global = &global };
+
+    // Concurrent work already holds 40 KiB. The relay buffer still fits; the
+    // request-head remainder is what tips the scope over — which it could only
+    // do if that remainder is accounted at all.
+    var in_flight = ProxyBufferReservation.init(.downstream_to_upstream, limits, counters.observer(), capacity);
+    try in_flight.reserve(40 * 1024);
+
+    const head_remainder = [_]u8{'z'} ** (12 * 1024);
+    var source = FakeUploadSource{ .data = "" };
+    try std.testing.expectError(error.ProxyBufferCapacityUnavailable, runHttp1Upload(
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        .{ .framing = .chunked, .initial_bytes = &head_remainder, .max_body_bytes = 1 << 20 },
+        &source,
+        limits,
+        counters.observer(),
+        capacity,
+    ));
+
+    try std.testing.expectEqual(@as(u64, 1), counters.aggregate_limit_exceeded);
+    try std.testing.expectEqual(proxy_buffer_account.Scope.global, counters.last_aggregate_scope.?);
+    // The refused upload rolled back completely; the concurrent holder is intact.
+    try std.testing.expectEqual(@as(usize, 40 * 1024), global.currentBytes(.downstream_to_upstream));
+
+    in_flight.releaseAll();
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+}
+
+test "malformed chunked framing cannot leak the request-head reservation" {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    var counters = UploadBufferObserver{};
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    var source = FakeUploadSource{ .data = "" };
+    try std.testing.expectError(error.InvalidChunkedUpload, runHttp1Upload(
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        // Not a chunk-size line.
+        .{ .framing = .chunked, .initial_bytes = "not-hex\r\n", .max_body_bytes = 1024 },
+        &source,
+        uploadTestLimits(1024 * 1024),
+        counters.observer(),
+        .{ .global = &global },
+    ));
+
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+}
+
+test "a client that vanishes mid-chunk releases the request-head reservation" {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    var counters = UploadBufferObserver{};
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    // Announces a 16-byte chunk, supplies none of it, then goes away.
+    var source = FakeUploadSource{ .data = "", .abort_after = 0 };
+    try std.testing.expectError(error.ClientAborted, runHttp1Upload(
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        .{ .framing = .chunked, .initial_bytes = "10\r\n", .max_body_bytes = 1024 },
+        &source,
+        uploadTestLimits(1024 * 1024),
+        counters.observer(),
+        .{ .global = &global },
+    ));
+
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+}
+
+test "a broken upstream socket is not counted as backpressure" {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+
+    // The origin is gone, not slow. `poll` still reports the descriptor ready
+    // — for POLLERR/POLLHUP — so a naive readiness test would call this a full
+    // send buffer and record a pause the write is about to invalidate.
+    _ = std.c.close(peer_fd);
+
+    var counters = UploadBufferObserver{};
+    var stall = proxy_buffer_account.ReadStall.init(.downstream, counters.observer());
+    try std.testing.expect(pollUpstreamWritability(client_fd) != .blocked);
+    noteUpstreamWriteStall(client_fd, &stall);
+
+    try std.testing.expectEqual(@as(u64, 0), counters.pauses);
+    try std.testing.expectEqual(@as(u64, 0), counters.resumes);
+    try std.testing.expect(!stall.paused);
+}
+
+test "http1 upload capacity is refused before the request head reaches the origin" {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    const limits = uploadTestLimits(16 * 1024);
+    var counters = UploadBufferObserver{};
+    var global = proxy_buffer_account.Aggregate.init(.global, 16 * 1024);
+    const capacity = proxy_buffer_account.AggregateCapacity{ .global = &global };
+
+    // The process account is already spoken for, so this upload cannot be
+    // admitted at all.
+    var in_flight = ProxyBufferReservation.init(.downstream_to_upstream, limits, counters.observer(), capacity);
+    try in_flight.reserve(16 * 1024);
+    defer in_flight.releaseAll();
+
+    var source = FakeUploadSource{ .data = "" };
+    const uri = try std.Uri.parse("http://origin.test/upload");
+    try std.testing.expectError(error.ProxyBufferCapacityUnavailable, sendStreamingProxyRequest(
+        std.testing.allocator,
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        uri,
+        "POST",
+        &.{},
+        "",
+        .{ .framing = .{ .length = 4096 } },
+        &source,
+        null,
+        limits,
+        counters.observer(),
+        capacity,
+    ));
+
+    // The whole point: the origin never saw a request it would have had to
+    // decide what to do with. A refusal after the head went out would leave a
+    // real, possibly side-effecting request half-delivered.
+    try std.testing.expect(!try peerHasBytes(peer_fd));
+}
+
+/// A prior-knowledge h2c origin that completes just enough handshake for the
+/// pool to hand back a connection, then records everything else the client
+/// sends. Used to prove a request the proxy refused locally never reached it.
+const H2CapacityProbe = struct {
+    listen_fd: std.posix.fd_t,
+    recorded: [4096]u8 = undefined,
+    len: usize = 0,
+};
+
+fn h2PrefaceOnlyOrigin(probe: *H2CapacityProbe) void {
+    const conn = std.c.accept(probe.listen_fd, null, null);
+    if (conn < 0) return;
+    defer _ = std.c.close(conn);
+
+    var preface: [24]u8 = undefined;
+    var got: usize = 0;
+    while (got < preface.len) {
+        const n = std.c.read(conn, preface[got..].ptr, preface.len - got);
+        if (n <= 0) return;
+        got += @intCast(n);
+    }
+    // An empty SETTINGS frame is all `acquire` needs to consider the
+    // connection usable.
+    const settings = [_]u8{ 0, 0, 0, 0x04, 0, 0, 0, 0, 0 };
+    _ = std.c.write(conn, &settings, settings.len);
+
+    while (probe.len < probe.recorded.len) {
+        var pfd = [_]std.posix.pollfd{.{ .fd = conn, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&pfd, 500) catch return;
+        if (ready == 0) return;
+        const n = std.c.read(conn, probe.recorded[probe.len..].ptr, probe.recorded.len - probe.len);
+        if (n <= 0) return;
+        probe.len += @intCast(n);
+    }
+}
+
+/// Walk an HTTP/2 frame stream looking for one frame type. Frames are
+/// length-prefixed, so this needs no protocol state.
+fn h2StreamContainsFrameType(bytes: []const u8, wanted: u8) bool {
+    var i: usize = 0;
+    while (i + 9 <= bytes.len) {
+        const payload_len = (@as(usize, bytes[i]) << 16) | (@as(usize, bytes[i + 1]) << 8) | @as(usize, bytes[i + 2]);
+        if (bytes[i + 3] == wanted) return true;
+        i += 9 + payload_len;
+    }
+    return false;
+}
+
+test "http2 upload capacity is refused before HEADERS reach the origin" {
+    const listen_fd = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    try std.testing.expect(listen_fd >= 0);
+    defer _ = std.c.close(listen_fd);
+    _ = std.c.setsockopt(listen_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int));
+    const sin: std.c.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 0),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+        .zero = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    try std.testing.expect(std.c.bind(listen_fd, @ptrCast(&sin), @sizeOf(std.c.sockaddr.in)) == 0);
+    try std.testing.expect(std.c.listen(listen_fd, 4) == 0);
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.posix.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try std.testing.expect(std.c.getsockname(listen_fd, @ptrCast(&bound), &bound_len) == 0);
+    const port = std.mem.bigToNative(u16, bound.port);
+
+    var probe = H2CapacityProbe{ .listen_fd = listen_fd };
+    const origin = try std.Thread.spawn(.{}, h2PrefaceOnlyOrigin, .{&probe});
+
+    const limits = uploadTestLimits(1024 * 1024);
+    var counters = UploadBufferObserver{};
+    // The process account is full before the request starts.
+    var global = proxy_buffer_account.Aggregate.init(.global, 16 * 1024);
+    var in_flight = ProxyBufferReservation.init(
+        .downstream_to_upstream,
+        limits,
+        counters.observer(),
+        .{ .global = &global },
+    );
+    try in_flight.reserve(16 * 1024);
+    defer in_flight.releaseAll();
+
+    var read_buf: [16 * 1024]u8 = undefined;
+    var source = FakeUploadSource{ .data = "" };
+    var captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer captured.deinit();
+    var security = http.security_headers.SecurityHeaders{};
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/upload", .{port}));
+
+    {
+        var pool = http.upstream_h2.H2ConnPool.init(std.testing.allocator, .{});
+        defer pool.deinit();
+
+        try std.testing.expectError(error.ProxyBufferCapacityUnavailable, streamViaH2Pool(
+            std.testing.allocator,
+            &pool,
+            null,
+            "127.0.0.1",
+            port,
+            null, // prior-knowledge h2c
+            uri,
+            "POST",
+            &.{},
+            "",
+            .{ .framing = .{ .length = 4096 } },
+            &read_buf,
+            &source,
+            CaptureWriter{ .list = &captured },
+            &security,
+            null,
+            null,
+            "test-correlation-id",
+            2000,
+            2000,
+            null,
+            limits,
+            counters.observer(),
+            &global,
+        ));
+    }
+    origin.join();
+
+    // The origin completed a connection but was never asked to do any work:
+    // refusing after HEADERS would have left it holding a request whose body
+    // never arrives, and any side effects that came with it.
+    try std.testing.expect(!h2StreamContainsFrameType(probe.recorded[0..probe.len], 0x01));
+    // Nothing beyond the deliberately-held reservation is outstanding: the
+    // refused request rolled back everything it touched.
+    try std.testing.expectEqual(@as(usize, 16 * 1024), counters.retained);
+    try std.testing.expectEqual(@as(usize, 16 * 1024), global.currentBytes(.downstream_to_upstream));
 }
 
 const FakeH2UploadStream = struct { id: u32 = 1 };
@@ -3221,13 +3741,12 @@ test "http2 upload relay reserves the relay buffer once, not once per DATA frame
     var read_buf: [16 * 1024]u8 = undefined;
     var source = FakeUploadSource{ .data = payload };
 
-    try relayStreamingUploadToHttp2(
+    try runHttp2Upload(
         &conn,
         &stream,
         .{ .framing = .{ .length = payload.len } },
         &read_buf,
         &source,
-        null,
         uploadTestLimits(1024 * 1024),
         counters.observer(),
         .{ .global = &global },
@@ -3242,6 +3761,47 @@ test "http2 upload relay reserves the relay buffer once, not once per DATA frame
     try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
 }
 
+test "http2 chunked upload accounts and releases the raw request-head remainder" {
+    var conn = FakeH2UploadConn{};
+    var stream = FakeH2UploadStream{};
+    var counters = UploadBufferObserver{};
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    const limits = uploadTestLimits(1024 * 1024);
+    const capacity = proxy_buffer_account.AggregateCapacity{ .global = &global };
+    var read_buf: [16 * 1024]u8 = undefined;
+
+    const head_remainder = "5\r\nhello\r\n0\r\n\r\n";
+    const sb = StreamingRequestBody{
+        .framing = .chunked,
+        .initial_bytes = head_remainder,
+        .max_body_bytes = 1024,
+    };
+    var source = FakeUploadSource{ .data = "" };
+
+    var reservation = try preflightUploadReservation(
+        limits,
+        counters.observer(),
+        capacity,
+        read_buf.len,
+        uploadInitialBytesFootprint(sb),
+    );
+    defer reservation.releaseAll();
+    try std.testing.expectEqual(read_buf.len + head_remainder.len, counters.peak_reserved);
+
+    try relayStreamingUploadToHttp2(&conn, &stream, sb, &read_buf, &source, null, &reservation);
+
+    // Decoded payload went out as DATA; the raw framing octets were accounted
+    // and then handed back as the decoder consumed them.
+    try std.testing.expectEqual(@as(usize, 5), conn.written);
+    try std.testing.expect(conn.end_stream);
+    try std.testing.expectEqual(read_buf.len, reservation.account.snapshot().current);
+
+    reservation.releaseAll();
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+}
+
 test "http2 upload relay releases the aggregate when the client aborts" {
     var conn = FakeH2UploadConn{};
     var stream = FakeH2UploadStream{};
@@ -3250,13 +3810,12 @@ test "http2 upload relay releases the aggregate when the client aborts" {
     var read_buf: [16 * 1024]u8 = undefined;
     var source = FakeUploadSource{ .data = &[_]u8{'y'} ** 1024, .abort_after = 1024 };
 
-    try std.testing.expectError(error.ClientAborted, relayStreamingUploadToHttp2(
+    try std.testing.expectError(error.ClientAborted, runHttp2Upload(
         &conn,
         &stream,
         .{ .framing = .{ .length = 64 * 1024 } },
         &read_buf,
         &source,
-        null,
         uploadTestLimits(1024 * 1024),
         counters.observer(),
         .{ .global = &global },

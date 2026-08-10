@@ -250,12 +250,26 @@ that, never against a newer snapshot.
 
 Uploads are accounted the same way, under
 `direction="downstream_to_upstream"`. Both relays copy through one fixed buffer
-for the life of the upload, so what is reserved is that buffer — reserved once
-when the relay starts, not once per chunk — plus any body bytes that arrived in
-the same read as the request head, which live in a second buffer of their own.
+for the life of the upload, so what is reserved is that buffer — reserved once,
+not once per chunk — plus whatever the relay still holds from the request head.
+
+That second amount differs by framing, because the two retain different parts of
+the same slice. A `Content-Length` upload keeps only the body bytes it will
+forward, and gives them back as soon as they are written. A chunked upload hands
+the whole raw remainder to the decoder, framing octets included, so the raw
+length is what is reserved; the relay releases it incrementally as the decoder
+consumes it, rather than holding the request head's peak for the whole upload.
+
+**The reservation is taken before anything is sent upstream** — before the
+HTTP/1 request head is written, and before HTTP/2 `HEADERS` go out. This is not
+just bookkeeping: reserving inside the relay would mean a local `413`/`503`
+could only be raised once the origin had already received a real, possibly
+side-effecting request whose body then never arrives. Reserving first makes a
+refusal something the origin never sees.
+
 An upload therefore reserves a bounded amount that does not grow with the body,
 and the reservation is released on every exit: completion, client abort,
-cancellation, timeout, and upstream failure alike.
+cancellation, timeout, malformed chunk framing, and upstream failure alike.
 
 Every upload reservation clears
 `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES`, and an HTTP/2 upload also
@@ -284,6 +298,12 @@ zero-timeout `poll`, so a healthy origin pays nothing and moves no counters)
 whether the origin can take more bytes. When it cannot, the transition is
 recorded as `tardigrade_buffer_read_pauses_total{side="downstream"}`, and the
 matching resume once the write goes through.
+
+Only a genuinely full send buffer counts. `poll` also reports a descriptor
+ready for `POLLERR`/`POLLHUP`/`POLLNVAL`, so readiness alone does not mean
+writable and its absence does not mean full; the three outcomes are separated
+deliberately, because a broken origin recorded as a stall would show up as
+backpressure on a connection that is simply dead.
 
 Only transitions are counted: a relay stalled across many chunks reports one
 pause and one resume, not one per write, and a relay torn down mid-stall still

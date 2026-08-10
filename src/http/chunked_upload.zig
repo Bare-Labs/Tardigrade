@@ -67,6 +67,14 @@ pub fn Reader(comptime Conn: type) type {
             return self.decoded_bytes;
         }
 
+        /// Raw request-head bytes still borrowed from the caller. The streaming
+        /// relay reserves these as retained memory (#140) — framing octets
+        /// included, since the decoder reads those out of the same slice — and
+        /// releases the reservation as this drains to zero.
+        pub fn pendingBytes(self: *const Self) usize {
+            return self.pending.len;
+        }
+
         /// Copy the next slice of decoded payload into `out`. Returns 0 once
         /// the terminal chunk and trailer section have been consumed; after
         /// that the connection is positioned at the next request.
