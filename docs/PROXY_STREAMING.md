@@ -302,13 +302,21 @@ measured against, and on a shrink refuses a stream still operating inside the
 window that connection granted it. Either way the outcome would depend on
 whether a request happened to land on a pre-reload pooled connection.
 
-The relay buffer is a case of this worth naming. It is allocated at the size
-the *current* `proxy_stream_buffer_size` asks for, so a reload that grew it can
-hand an older connection a buffer its pinned policy was never validated to
-cover. The HTTP/2 relay therefore uses only as much of that buffer as the
-pinned policy can account for — at least 16 KiB, since that is the smallest
-relay any validated policy was checked against — and the remainder simply goes
-unused until the connection is replaced.
+The relay buffer is a case of this worth naming. `proxy_stream_buffer_size` can
+be raised by a reload, which would ask a request on an older connection for a
+buffer that connection's pinned policy was never validated to cover. The HTTP/2
+relay therefore **allocates** it only once the connection is acquired, at the
+size that policy can account for — at least 16 KiB, since that is the smallest
+relay any validated policy was checked against.
+
+Allocating the larger size and using only part of it would not do. These limits
+bound *retained allocation*, not bytes currently populated, so an untouched
+remainder is still real per-request memory that no scope is charged for: N
+concurrent streams on such a connection would hold N times the difference
+beyond every configured ceiling. What is allocated and what is accounted are
+deliberately the same number. (The HTTP/1 path keeps allocating and charging at
+the current config's size — an HTTP/1 connection pins no policy of its own, so
+there is no older generation for its buffer to have to fit inside.)
 
 ### HTTP/1 aggregate bounds
 

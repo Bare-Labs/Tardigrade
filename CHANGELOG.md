@@ -61,10 +61,16 @@ All notable user-facing changes to Tardigrade are documented here.
   once — on a raise letting it own more than the hard limit it is documented to
   be measured against, on a shrink refusing a stream still operating inside the
   window that connection granted it, with the outcome depending on whether the
-  request happened to reuse a pre-reload connection. Relatedly, the relay
-  buffer is allocated at the *current* `proxy_stream_buffer_size`, so the
-  HTTP/2 relay now uses only as much of it as the pinned policy can account
-  for (never less than 16 KiB) rather than assuming a reload-grown buffer fits.
+  request happened to reuse a pre-reload connection. Relatedly, the HTTP/2
+  relay buffer is now *allocated* once the connection is acquired, at the size
+  that connection's pinned policy can account for (never less than 16 KiB),
+  rather than being allocated up front at the current
+  `proxy_stream_buffer_size`. These limits bound retained allocation rather
+  than populated bytes, so allocating the larger size and using only part of it
+  would leave the remainder as real per-request memory charged to no scope —
+  N concurrent streams times the difference, beyond every configured ceiling.
+  The HTTP/1 path still allocates and charges at the current config's size,
+  since an HTTP/1 connection pins no policy of its own.
 
   **Configuration change:** `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES`
   must now be at least
