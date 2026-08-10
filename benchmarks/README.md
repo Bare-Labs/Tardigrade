@@ -193,12 +193,15 @@ The suite runs:
 - mixed short static/proxy traffic with a `wrk` Lua request alternator and
   `Connection: close`
 
-For each profile it saves the standard benchmark JSON/log, raw `wrk` output for
-the churn and mixed workloads, a full `/status/metrics` scrape, and a combined
-`summary.json` containing req/s, latency percentiles, CPU/RSS when PID sampling
-is available, accept errors, worker queue metrics, and every per-shard accept
-counter. Use the existing dedicated benchmark-target policy for publishable
-numbers; laptop-local runs are fallback data only.
+For each profile it first verifies that `/status/metrics` reports the requested
+`tardigrade_listener_shards` value; unsupported-platform fallback or shard-count
+capping aborts the run instead of being recorded as an N-shard benchmark. It then
+saves the standard benchmark JSON/log, raw `wrk` output for the churn and mixed
+workloads, per-workload worker-queue samples, startup/final `/status/metrics`
+scrapes, and a combined `summary.json` containing req/s, latency percentiles,
+CPU/RSS/open-FD peaks, accept errors, worker queue pressure, and every per-shard
+accept counter. Use the existing dedicated benchmark-target policy for
+publishable numbers; laptop-local runs are fallback data only.
 
 ## k6 scenario environment variables
 

@@ -58,9 +58,12 @@ Options:
 Saved artifacts:
   summary.json                        Combined 1-vs-N summary
   <profile>-run.json                  benchmarks/run.sh output
+  <profile>-startup-metrics.prom      Metrics scrape used to verify shard topology
   <profile>-metrics.prom              Full Prometheus scrape after workloads
   <profile>-connection-churn.wrk.txt  Raw Connection: close wrk output
+  <profile>-connection-churn-queue.samples  Worker queue samples during churn
   <profile>-mixed-static-proxy.wrk.txt Raw mixed static/proxy wrk output
+  <profile>-mixed-static-proxy-queue.samples Worker queue samples during mixed load
 EOF
 }
 
@@ -111,8 +114,27 @@ fi
 
 gateway_pid=""
 profile_tmp=""
+resource_monitor_pid=""
+resource_monitor_file=""
+resource_cpu_before="null"
+resource_monitor_start_ns="null"
+queue_monitor_pid=""
 
 cleanup_gateway() {
+    if [[ -n "${queue_monitor_pid}" ]]; then
+        kill "$queue_monitor_pid" >/dev/null 2>&1 || true
+        wait "$queue_monitor_pid" >/dev/null 2>&1 || true
+        queue_monitor_pid=""
+    fi
+    if [[ -n "${resource_monitor_pid}" ]]; then
+        kill "$resource_monitor_pid" >/dev/null 2>&1 || true
+        wait "$resource_monitor_pid" >/dev/null 2>&1 || true
+        resource_monitor_pid=""
+    fi
+    if [[ -n "${resource_monitor_file}" && -f "${resource_monitor_file}" ]]; then
+        rm -f "$resource_monitor_file"
+        resource_monitor_file=""
+    fi
     if [[ -n "${gateway_pid}" ]] && kill -0 "$gateway_pid" >/dev/null 2>&1; then
         kill "$gateway_pid" >/dev/null 2>&1 || true
         wait "$gateway_pid" >/dev/null 2>&1 || true
@@ -136,51 +158,172 @@ wait_for_ready() {
     done
 }
 
-wrk_error_count() {
+monotonic_ns() {
+    python3 -c 'import time; print(time.monotonic_ns())'
+}
+
+cpu_time_to_seconds() {
     awk '
-        /Socket errors:/ {
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ /[0-9]+/) {
-                    gsub(/[^0-9]/, "", $i);
-                    total += $i;
-                }
+        function part_seconds(v, n, p) {
+            n = split(v, p, ":")
+            if (n == 3) return (p[1] * 3600) + (p[2] * 60) + p[3]
+            if (n == 2) return (p[1] * 60) + p[2]
+            return v + 0
+        }
+        {
+            v = $1
+            days = 0
+            if (index(v, "-") > 0) {
+                split(v, d, "-")
+                days = d[1] + 0
+                v = d[2]
             }
+            total += days * 86400 + part_seconds(v)
         }
-        /Non-2xx or 3xx responses:/ { total += $NF }
-        END { print total + 0 }
+        END { printf "%.6f", total }
     '
 }
 
-wrk_latency_ms() {
-    local percentile="$1"
-    awk -v pct="$percentile" '
-        $1 == pct {
-            v = $2
-            if (v ~ /us$/) { sub(/us$/, "", v); printf "%.3f\n", v / 1000; exit }
-            if (v ~ /ms$/) { sub(/ms$/, "", v); printf "%.3f\n", v; exit }
-            if (v ~ /s$/) { sub(/s$/, "", v); printf "%.3f\n", v * 1000; exit }
-            printf "%.3f\n", v; exit
-        }
-    '
+process_cpu_seconds() {
+    ps -p "$1" -o time= 2>/dev/null | cpu_time_to_seconds
 }
 
-wrk_result_json() {
-    local raw_file="$1"
-    local rps p50 p95 p99 p999 errors
-    rps="$(awk '/Requests\/sec:/ { gsub(/,/, "", $2); print $2; exit }' "$raw_file")"
-    p50="$(wrk_latency_ms "50%" < "$raw_file")"
-    p95="$(wrk_latency_ms "95%" < "$raw_file")"
-    p99="$(wrk_latency_ms "99%" < "$raw_file")"
-    p999="$(wrk_latency_ms "99.9%" < "$raw_file")"
-    errors="$(wrk_error_count < "$raw_file")"
+count_open_fds() {
+    local pid="$1"
+    if [[ -d "/proc/${pid}/fd" ]]; then
+        find "/proc/${pid}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' '
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -n -P -p "$pid" 2>/dev/null | awk 'NR > 1 { count += 1 } END { print count + 0 }'
+    else
+        printf 'null\n'
+    fi
+}
+
+resource_sample_loop() {
+    local pid="$1" outfile="$2" interval_s="$3"
+    while kill -0 "$pid" >/dev/null 2>&1; do
+        local rss_kb open_fds
+        rss_kb="$(ps -p "$pid" -o rss= 2>/dev/null | awk 'NF >= 1 { print $1; exit }')"
+        open_fds="$(count_open_fds "$pid")"
+        if [[ -n "$rss_kb" ]]; then
+            printf '%s %s\n' "$rss_kb" "$open_fds" >> "$outfile"
+        fi
+        sleep "$interval_s"
+    done
+}
+
+start_resource_monitor() {
+    resource_monitor_file="$(mktemp /tmp/tardigrade-listener-sharding-resource-XXXXXX)"
+    resource_cpu_before="$(process_cpu_seconds "$gateway_pid")"
+    resource_monitor_start_ns="$(monotonic_ns)"
+    local interval_s
+    interval_s="$(awk -v ms="$SAMPLE_INTERVAL_MS" 'BEGIN { printf "%.3f", ms / 1000 }')"
+    resource_sample_loop "$gateway_pid" "$resource_monitor_file" "$interval_s" &
+    resource_monitor_pid="$!"
+}
+
+stop_resource_monitor_json() {
+    if [[ -n "$resource_monitor_pid" ]]; then
+        kill "$resource_monitor_pid" >/dev/null 2>&1 || true
+        wait "$resource_monitor_pid" >/dev/null 2>&1 || true
+        resource_monitor_pid=""
+    fi
+
+    local cpu_after end_ns cpu_pct rss_mb open_fds
+    cpu_after="$(process_cpu_seconds "$gateway_pid")"
+    end_ns="$(monotonic_ns)"
+    cpu_pct="$(awk -v before="$resource_cpu_before" -v after="$cpu_after" -v start="$resource_monitor_start_ns" -v end="$end_ns" '
+        BEGIN {
+            elapsed = (end - start) / 1000000000
+            if (before != "null" && elapsed > 0) printf "%.2f", ((after - before) / elapsed) * 100
+            else printf "null"
+        }')"
+    rss_mb="$(awk 'NF >= 1 && $1 > max { max = $1 } END { if (max > 0) printf "%.2f", max / 1024; else printf "null" }' "$resource_monitor_file")"
+    open_fds="$(awk 'NF >= 2 && $2 ~ /^[0-9]+$/ && $2 > max { max = $2 } END { if (max > 0) printf "%d", max; else printf "null" }' "$resource_monitor_file")"
+    rm -f "$resource_monitor_file"
+    resource_monitor_file=""
+
     jq -n \
-        --argjson rps "${rps:-0}" \
-        --argjson p50 "${p50:-0}" \
-        --argjson p95 "${p95:-0}" \
-        --argjson p99 "${p99:-0}" \
-        --argjson p999 "${p999:-0}" \
-        --argjson errors "${errors:-0}" \
-        '{rps: $rps, p50_ms: $p50, p95_ms: $p95, p99_ms: $p99, p999_ms: $p999, errors: $errors}'
+        --argjson cpu "$cpu_pct" \
+        --argjson rss "$rss_mb" \
+        --argjson fds "$open_fds" \
+        '{cpu_pct_avg: $cpu, rss_mb_peak: $rss, open_fds_peak: $fds}'
+}
+
+metric_value_from_file() {
+    local file="$1" metric="$2"
+    awk -v metric="$metric" '$1 == metric { print $2; found = 1; exit } END { if (!found) print "null" }' "$file"
+}
+
+scrape_metrics() {
+    curl -fsS "${HEADER_ARGS[@]}" "${BASE_URL}/status/metrics"
+}
+
+verify_listener_shards() {
+    local expected="$1" metrics_file="$2"
+    scrape_metrics > "$metrics_file"
+    local actual
+    actual="$(metric_value_from_file "$metrics_file" "tardigrade_listener_shards")"
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Requested TARDIGRADE_LISTENER_SHARDS=${expected}, but gateway reports tardigrade_listener_shards=${actual}." >&2
+        echo "Refusing to record this as a ${expected}-shard benchmark run." >&2
+        return 1
+    fi
+}
+
+queue_sample_loop() {
+    local outfile="$1" interval_s="$2"
+    while true; do
+        local metrics queued count sum
+        metrics="$(scrape_metrics 2>/dev/null || true)"
+        if [[ -n "$metrics" ]]; then
+            queued="$(printf '%s\n' "$metrics" | awk '$1 == "tardigrade_worker_queued_jobs" { print $2; found = 1; exit } END { if (!found) print "null" }')"
+            count="$(printf '%s\n' "$metrics" | awk '$1 == "tardigrade_worker_queue_wait_us_count" { print $2; found = 1; exit } END { if (!found) print "null" }')"
+            sum="$(printf '%s\n' "$metrics" | awk '$1 == "tardigrade_worker_queue_wait_us_sum" { print $2; found = 1; exit } END { if (!found) print "null" }')"
+            printf '%s %s %s %s\n' "$(date -u +%s)" "$queued" "$count" "$sum" >> "$outfile"
+        fi
+        sleep "$interval_s"
+    done
+}
+
+start_queue_monitor() {
+    local outfile="$1"
+    local interval_s
+    interval_s="$(awk -v ms="$SAMPLE_INTERVAL_MS" 'BEGIN { printf "%.3f", ms / 1000 }')"
+    queue_sample_loop "$outfile" "$interval_s" &
+    queue_monitor_pid="$!"
+}
+
+stop_queue_monitor() {
+    if [[ -n "$queue_monitor_pid" ]]; then
+        kill "$queue_monitor_pid" >/dev/null 2>&1 || true
+        wait "$queue_monitor_pid" >/dev/null 2>&1 || true
+        queue_monitor_pid=""
+    fi
+}
+
+queue_summary_json() {
+    local samples_file="$1" before_file="$2" after_file="$3"
+    local before_count before_sum after_count after_sum
+    before_count="$(metric_value_from_file "$before_file" "tardigrade_worker_queue_wait_us_count")"
+    before_sum="$(metric_value_from_file "$before_file" "tardigrade_worker_queue_wait_us_sum")"
+    after_count="$(metric_value_from_file "$after_file" "tardigrade_worker_queue_wait_us_count")"
+    after_sum="$(metric_value_from_file "$after_file" "tardigrade_worker_queue_wait_us_sum")"
+
+    local peak
+    peak="$(awk 'NF >= 2 && $2 ~ /^[0-9]+$/ && $2 > max { max = $2 } END { if (max > 0) printf "%d", max; else printf "0" }' "$samples_file")"
+
+    jq -n \
+        --argjson peak "$peak" \
+        --argjson before_count "$before_count" \
+        --argjson after_count "$after_count" \
+        --argjson before_sum "$before_sum" \
+        --argjson after_sum "$after_sum" \
+        '{
+            worker_queued_jobs_peak: $peak,
+            worker_queue_wait_us_count_delta: ($after_count - $before_count),
+            worker_queue_wait_us_sum_delta: ($after_sum - $before_sum)
+        }'
 }
 
 metrics_json() {
@@ -222,9 +365,48 @@ metrics_json() {
 run_wrk_workload() {
     local label="$1"
     local output="$2"
-    shift 2
-    wrk --latency -t"${THREADS}" -c"${CONNECTIONS}" -d"${DURATION}s" "$@" >"$output" 2>&1 || true
-    echo "  ${label}: $(awk '/Requests\/sec:/ {print $2; exit}' "$output") req/s, p99=$(wrk_latency_ms "99%" < "$output")ms, errors=$(wrk_error_count < "$output")" >&2
+    local script="$3"
+    local queue_samples="$4"
+    shift 4
+    local before_metrics="${output%.wrk.txt}-before.prom"
+    local after_metrics="${output%.wrk.txt}-after.prom"
+
+    scrape_metrics > "$before_metrics"
+    start_resource_monitor
+    start_queue_monitor "$queue_samples"
+    if ! wrk --latency -s "$script" -t"${THREADS}" -c"${CONNECTIONS}" -d"${DURATION}s" "$@" >"$output" 2>&1; then
+        stop_queue_monitor
+        local resource_json
+        resource_json="$(stop_resource_monitor_json)"
+        echo "wrk failed for ${label}; raw output saved to ${output}" >&2
+        jq -n --arg label "$label" --arg output "$output" --argjson resources "$resource_json" '{label: $label, raw_output: $output, resources: $resources}' >&2
+        return 1
+    fi
+    stop_queue_monitor
+    local resource_json
+    resource_json="$(stop_resource_monitor_json)"
+    scrape_metrics > "$after_metrics"
+
+    local summary_json
+    summary_json="$(sed -n 's/^WRK_SUMMARY //p' "$output" | tail -1)"
+    if [[ -z "$summary_json" ]]; then
+        echo "wrk summary hook did not emit percentile JSON for ${label}; raw output saved to ${output}" >&2
+        return 1
+    fi
+    if ! jq -e '.rps and .p50_ms and .p95_ms and .p99_ms and .p999_ms and .errors and .throughput_mbps' >/dev/null <<<"$summary_json"; then
+        echo "wrk summary JSON is missing required fields for ${label}; raw output saved to ${output}" >&2
+        return 1
+    fi
+
+    local queue_json
+    queue_json="$(queue_summary_json "$queue_samples" "$before_metrics" "$after_metrics")"
+
+    echo "  ${label}: $(jq -r '.rps' <<<"$summary_json") req/s, p99=$(jq -r '.p99_ms' <<<"$summary_json")ms, errors=$(jq -r '.errors' <<<"$summary_json")" >&2
+    jq -n \
+        --argjson summary "$summary_json" \
+        --argjson resources "$resource_json" \
+        --argjson queue "$queue_json" \
+        '$summary + $resources + $queue'
 }
 
 run_profile() {
@@ -233,9 +415,12 @@ run_profile() {
     local pid_file="${SAVE_DIR}/${label}.pid"
     local run_json="${SAVE_DIR}/${label}-run.json"
     local run_log="${SAVE_DIR}/${label}-run.log"
+    local startup_metrics_file="${SAVE_DIR}/${label}-startup-metrics.prom"
     local metrics_file="${SAVE_DIR}/${label}-metrics.prom"
     local churn_raw="${SAVE_DIR}/${label}-connection-churn.wrk.txt"
+    local churn_queue_samples="${SAVE_DIR}/${label}-connection-churn-queue.samples"
     local mixed_raw="${SAVE_DIR}/${label}-mixed-static-proxy.wrk.txt"
+    local mixed_queue_samples="${SAVE_DIR}/${label}-mixed-static-proxy-queue.samples"
     local mixed_lua="${SAVE_DIR}/${label}-mixed-static-proxy.lua"
 
     cleanup_gateway
@@ -252,6 +437,7 @@ run_profile() {
     gateway_pid="$!"
     echo "$gateway_pid" > "$pid_file"
     wait_for_ready
+    verify_listener_shards "$shard_count" "$startup_metrics_file"
 
     echo "==> ${label}: standard scenarios (${SCENARIOS})" >&2
     local -a run_args=(
@@ -278,7 +464,8 @@ run_profile() {
     "${BENCH_DIR}/run.sh" "${run_args[@]}" >"$run_log" 2>&1
 
     echo "==> ${label}: high connection churn (${STATIC_PATH}, Connection: close)" >&2
-    run_wrk_workload "connection-churn-http1" "$churn_raw" "${HEADER_ARGS[@]}" -H "Connection: close" "${BASE_URL}${STATIC_PATH}"
+    local churn_json
+    churn_json="$(run_wrk_workload "connection-churn-http1" "$churn_raw" "${BENCH_DIR}/wrk-summary.lua" "$churn_queue_samples" "${HEADER_ARGS[@]}" -H "Connection: close" "${BASE_URL}${STATIC_PATH}")"
 
     cat > "$mixed_lua" <<EOF
 local static_path = "${STATIC_PATH}"
@@ -291,17 +478,47 @@ request = function()
   end
   return wrk.format("GET", proxy_path)
 end
+
+done = function(summary, latency, requests)
+  local duration_s = summary.duration / 1000000
+  local rps = 0.0
+  local throughput_mbps = 0.0
+  local error_total = 0
+
+  if duration_s > 0 then
+    rps = summary.requests / duration_s
+    throughput_mbps = (summary.bytes / duration_s) / (1024 * 1024)
+  end
+
+  if summary.errors then
+    error_total = (summary.errors.connect or 0)
+      + (summary.errors.read or 0)
+      + (summary.errors.write or 0)
+      + (summary.errors.status or 0)
+      + (summary.errors.timeout or 0)
+  end
+
+  io.write(string.format(
+    "\\nWRK_SUMMARY {\\"rps\\":%.2f,\\"p50_ms\\":%.3f,\\"p95_ms\\":%.3f,\\"p99_ms\\":%.3f,\\"p999_ms\\":%.3f,\\"errors\\":%d,\\"throughput_mbps\\":%.2f}\\n",
+    rps,
+    latency:percentile(50.0) / 1000,
+    latency:percentile(95.0) / 1000,
+    latency:percentile(99.0) / 1000,
+    latency:percentile(99.9) / 1000,
+    error_total,
+    throughput_mbps
+  ))
+end
 EOF
 
     echo "==> ${label}: mixed short static/proxy (${STATIC_PATH} + ${PROXY_PATH}, Connection: close)" >&2
-    run_wrk_workload "mixed-short-static-proxy" "$mixed_raw" -s "$mixed_lua" "${HEADER_ARGS[@]}" -H "Connection: close" "${BASE_URL}${STATIC_PATH}"
+    local mixed_json
+    mixed_json="$(run_wrk_workload "mixed-short-static-proxy" "$mixed_raw" "$mixed_lua" "$mixed_queue_samples" "${HEADER_ARGS[@]}" -H "Connection: close" "${BASE_URL}${STATIC_PATH}")"
 
-    curl -fsS "${HEADER_ARGS[@]}" "${BASE_URL}/status/metrics" > "$metrics_file"
+    scrape_metrics > "$metrics_file"
 
-    local standard_json churn_json mixed_json metric_json
+    local standard_json metric_json
     standard_json="$(cat "$run_json")"
-    churn_json="$(wrk_result_json "$churn_raw")"
-    mixed_json="$(wrk_result_json "$mixed_raw")"
     metric_json="$(metrics_json "$metrics_file")"
 
     jq -n \
@@ -309,14 +526,17 @@ EOF
         --argjson shards "$shard_count" \
         --arg run_json "$run_json" \
         --arg run_log "$run_log" \
+        --arg startup_metrics_file "$startup_metrics_file" \
         --arg metrics_file "$metrics_file" \
         --arg churn_raw "$churn_raw" \
+        --arg churn_queue_samples "$churn_queue_samples" \
         --arg mixed_raw "$mixed_raw" \
+        --arg mixed_queue_samples "$mixed_queue_samples" \
         --argjson standard "$standard_json" \
         --argjson churn "$churn_json" \
         --argjson mixed "$mixed_json" \
         --argjson metrics "$metric_json" \
-        '{label: $label, shards: $shards, artifacts: {standard_json: $run_json, standard_log: $run_log, metrics_prom: $metrics_file, connection_churn_wrk: $churn_raw, mixed_static_proxy_wrk: $mixed_raw}, standard: $standard, "connection-churn-http1": $churn, "mixed-short-static-proxy": $mixed, metrics: $metrics}'
+        '{label: $label, requested_shards: $shards, actual_shards: $metrics.listener_shards, artifacts: {standard_json: $run_json, standard_log: $run_log, startup_metrics_prom: $startup_metrics_file, metrics_prom: $metrics_file, connection_churn_wrk: $churn_raw, connection_churn_queue_samples: $churn_queue_samples, mixed_static_proxy_wrk: $mixed_raw, mixed_static_proxy_queue_samples: $mixed_queue_samples}, standard: $standard, "connection-churn-http1": $churn, "mixed-short-static-proxy": $mixed, metrics: $metrics}'
 
     cleanup_gateway
 }
