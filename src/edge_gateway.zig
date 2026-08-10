@@ -242,19 +242,53 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         state.logger.info(null, "appliance TLS identity loaded and validated", .{});
     }
 
-    const address = try std.Io.net.IpAddress.parse(cfg.listen_host, cfg.listen_port);
-    var server = try address.listen(compat.io(), .{ .reuse_address = true });
-    defer server.deinit(compat.io());
-    const listen_fd = server.socket.handle;
+    const sharding_enabled = cfg.listener_shards > 1 and gaccept.isReusePortSupported();
+    const effective_shards: u16 = if (sharding_enabled)
+        @min(cfg.listener_shards, @as(u16, http.metrics.max_listener_shards))
+    else
+        1;
 
-    try gconn.setNonBlocking(listen_fd, true);
+    const max_shards = http.metrics.max_listener_shards;
+    var shard_fds: [max_shards]std.posix.fd_t = undefined;
+    var shard_fd_count: u16 = 0;
+    var shard_threads: [max_shards]std.Thread = undefined;
+    var shard_thread_count: usize = 0;
+    errdefer {
+        var ji: u16 = 0;
+        while (ji < shard_fd_count) : (ji += 1) _ = std.c.close(shard_fds[ji]);
+    }
+
+    var server: ?std.Io.net.Server = null;
+    defer if (server) |*s| s.deinit(compat.io());
+    const listen_fd: std.posix.fd_t = if (sharding_enabled) blk: {
+        var si: u16 = 0;
+        while (si < effective_shards) : (si += 1) {
+            const sfd = gaccept.createReusePortListenerFd(cfg.listen_host, cfg.listen_port) catch |err| {
+                state.logger.err(null, "failed to create listener shard {}: {}", .{ si, err });
+                return err;
+            };
+            gconn.setNonBlocking(sfd, true) catch {};
+            shard_fds[shard_fd_count] = sfd;
+            shard_fd_count += 1;
+        }
+        break :blk -1;
+    } else blk: {
+        const address = try std.Io.net.IpAddress.parse(cfg.listen_host, cfg.listen_port);
+        server = try address.listen(compat.io(), .{ .reuse_address = true });
+        const fd = server.?.socket.handle;
+        try gconn.setNonBlocking(fd, true);
+        break :blk fd;
+    };
+
     applyRuntimeIdentity(cfg, &state.logger) catch |err| {
         state.logger.warn(null, "privilege drop configuration failed: {}", .{err});
     };
 
     var event_loop = try http.event_loop.EventLoop.init();
     defer event_loop.deinit();
-    try event_loop.addReadFd(listen_fd);
+    if (!sharding_enabled) {
+        try event_loop.addReadFd(listen_fd);
+    }
     var timer = http.event_loop.TimerManager.init(250);
     var config_store = try ReloadableConfigStore.initBorrowed(state_allocator, cfg);
     defer config_store.deinit();
@@ -749,11 +783,43 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.max_total_connection_memory_bytes > 0) {
         state.logger.info(null, "Global connection memory estimate limit enabled: {d} bytes", .{cfg.max_total_connection_memory_bytes});
     }
-    state.logger.info(null, "Connection model: non-blocking accept loop on the main thread with blocking per-connection work on a bounded worker pool", .{});
+    if (sharding_enabled) {
+        state.logger.info(null, "Connection model: {d} load-balanced listener shard accept loops with blocking per-connection work on a bounded worker pool", .{effective_shards});
+    } else {
+        state.logger.info(null, "Connection model: non-blocking accept loop on the main thread with blocking per-connection work on a bounded worker pool", .{});
+    }
 
     // Install signal handlers for graceful shutdown
     http.shutdown.installSignalHandlers();
     state.logger.info(null, "Signal handlers installed (SIGTERM/SIGINT shutdown, SIGHUP reload, SIGUSR1 reopen logs, SIGUSR2 upgrade)", .{});
+
+    state.metricsSetListenerShards(effective_shards);
+
+    if (sharding_enabled) {
+        state.logger.info(null, "Listener sharding enabled: {} shards on {s}:{}", .{
+            effective_shards, cfg.listen_host, cfg.listen_port,
+        });
+        errdefer {
+            if (shard_thread_count > 0) {
+                http.shutdown.requestShutdown();
+                for (shard_threads[0..shard_thread_count]) |t| t.join();
+            }
+        }
+        var ti: u16 = 0;
+        while (ti < shard_fd_count) : (ti += 1) {
+            const ctx = gaccept.ShardAcceptContext{
+                .listen_fd = shard_fds[ti],
+                .shard_id = ti,
+                .worker_pool = &worker_pool,
+                .state = &state,
+            };
+            shard_threads[shard_thread_count] = std.Thread.spawn(.{}, gaccept.runShardAcceptLoop, .{ctx}) catch |err| {
+                state.logger.err(null, "failed to spawn shard {} accept thread: {}", .{ ti, err });
+                return err;
+            };
+            shard_thread_count += 1;
+        }
+    }
 
     var ready_events: [64]http.event_loop.Event = undefined;
     while (!http.shutdown.isShutdownRequested()) {
@@ -780,7 +846,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
                 continue;
             }
             if (!ev.readable) continue;
-            if (ev.fd == listen_fd) {
+            if (ev.fd == listen_fd and !sharding_enabled) {
                 gaccept.acceptReadyConnections(listen_fd, &worker_pool, &state);
             } else if (parked.resumeReady(ev.fd)) {
                 // A parked keepalive connection has a new request (or closed).
@@ -848,6 +914,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             state.metrics_mutex.unlock();
         }
     }
+
+    // Join shard accept threads (they exit when shutdown is requested) and
+    // close the shard listener fds before draining the worker pool.
+    for (shard_threads[0..shard_thread_count]) |t| t.join();
+    for (shard_fds[0..shard_fd_count]) |sfd| _ = std.c.close(sfd);
 
     const active_at_drain_start = blk: {
         state.connection_mutex.lock();

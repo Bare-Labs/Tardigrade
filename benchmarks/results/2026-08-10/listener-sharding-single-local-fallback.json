@@ -1,0 +1,72 @@
+{
+  "static-http1": {
+    "rps": 28589.49,
+    "p50_ms": 0.654,
+    "p95_ms": 1.086,
+    "p99_ms": 1.300,
+    "p999_ms": 1.512,
+    "errors": 1160,
+    "throughput_mbps": 19.22,
+    "cpu_pct_avg": 394.95,
+    "rss_mb_peak": 4.81,
+    "open_fds_peak": 32
+  },
+  "proxy-http1": {
+    "rps": 27406.89,
+    "p50_ms": 0.708,
+    "p95_ms": 0.978,
+    "p99_ms": 1.270,
+    "p999_ms": 3.076,
+    "errors": 1119,
+    "throughput_mbps": 14.82,
+    "cpu_pct_avg": 53.45,
+    "rss_mb_peak": 5.02,
+    "open_fds_peak": 34
+  },
+  "keepalive": {
+    "rps": 27888.97,
+    "p50_ms": 0.666,
+    "p95_ms": 1.119,
+    "p99_ms": 1.418,
+    "p999_ms": 5.467,
+    "errors": 1136,
+    "throughput_mbps": 18.75,
+    "cpu_pct_avg": 392.35,
+    "rss_mb_peak": 5.02,
+    "open_fds_peak": 36
+  },
+  "_meta": {
+    "tag": "v0.5.0-181-g8adb3fef",
+    "timestamp": "2026-08-10T04:30:05Z",
+    "host": "127.0.0.1",
+    "port": "54039",
+    "tool": "wrk",
+    "duration_s": 4,
+    "connections": 20,
+    "runs": 1,
+    "host_header": "",
+    "driver": "local-fallback",
+    "worker_count": 4,
+    "config_label": "single-listener",
+    "process_metrics": {
+      "enabled": true,
+      "pid_source": "pid-file",
+      "pid_tree": false,
+      "sample_interval_ms": 500
+    },
+    "zig_version": "0.16.0",
+    "environment": {
+      "os": "Darwin",
+      "kernel": "25.3.0",
+      "arch": "arm64",
+      "cpu_model": "Apple M4",
+      "cpu_threads": "10",
+      "memory_mb": "16384"
+    },
+    "static_path": "/index.html",
+    "proxy_path": "/proxy/health",
+    "keepalive_path": "/index.html",
+    "h2_path": "/index.html",
+    "h3_path": "/index.html"
+  }
+}

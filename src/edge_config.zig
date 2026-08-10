@@ -409,6 +409,12 @@ pub const EdgeConfig = struct {
     cb_timeout_ms: u64,
     /// Number of worker threads for connection handling (0 = auto CPU count).
     worker_threads: u32,
+    /// Number of listener shards (parallel accept loops) to start.
+    /// When > 1 on a load-balanced reuse-port platform, binds N sockets and
+    /// starts one accept loop per shard. 0 or 1 keeps the default
+    /// single-listener behavior.
+    /// Set via TARDIGRADE_LISTENER_SHARDS.
+    listener_shards: u16,
     /// Enable master process supervision mode.
     master_process_enabled: bool,
     /// Number of worker processes when master mode is enabled.
@@ -1204,6 +1210,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const worker_threads_str = envOrDefault(allocator, "TARDIGRADE_WORKER_THREADS", "0") catch unreachable;
     defer allocator.free(worker_threads_str);
     const worker_threads = std.fmt.parseInt(u32, worker_threads_str, 10) catch 0;
+    const listener_shards = parseIntEnv(u16, allocator, "TARDIGRADE_LISTENER_SHARDS", 0);
     const master_process_enabled = parseBoolEnv(allocator, "TARDIGRADE_MASTER_PROCESS", false);
     const worker_processes = parseIntEnv(u32, allocator, "TARDIGRADE_WORKER_PROCESSES", 1);
     const binary_upgrade_enabled = parseBoolEnv(allocator, "TARDIGRADE_BINARY_UPGRADE", true);
@@ -1660,6 +1667,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .cb_threshold = cb_threshold,
         .cb_timeout_ms = cb_timeout_ms,
         .worker_threads = worker_threads,
+        .listener_shards = listener_shards,
         .master_process_enabled = master_process_enabled,
         .worker_processes = worker_processes,
         .binary_upgrade_enabled = binary_upgrade_enabled,

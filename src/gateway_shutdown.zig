@@ -83,6 +83,23 @@ pub fn hotReloadConfig(
     };
 
     {
+        var current_lease = worker_ctx.config_store.acquire();
+        const listener_shards_changed = listenerShardConfigChanged(current_lease.cfg, cfg_ptr);
+        current_lease.release();
+        if (listener_shards_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "listener shard topology changed; restart required", .{}) catch "listener shard topology changed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected: TARDIGRADE_LISTENER_SHARDS changed; restart the process to change listener shard topology", .{});
+            return;
+        }
+    }
+    {
         // #368 Slice 3: the process-owned early-data replay store/gate are
         // constructed once in `edge_gateway.run()` from the startup config
         // and shared for the process lifetime — there is no in-place
@@ -331,6 +348,13 @@ pub fn http3ListenerConfigChanged(
         current.http3_max_datagram_size != proposed.http3_max_datagram_size;
 }
 
+pub fn listenerShardConfigChanged(
+    current: *const edge_config.EdgeConfig,
+    proposed: *const edge_config.EdgeConfig,
+) bool {
+    return current.listener_shards != proposed.listener_shards;
+}
+
 test "earlyDataReplayConfigChanged detects mode and capacity changes independently" {
     const allocator = std.testing.allocator;
     var base = try edge_config.loadFromEnv(allocator);
@@ -378,6 +402,21 @@ test "http3ListenerConfigChanged permits advertisement-only reloads" {
 
     proposed.http3_retry_policy = .address_validation;
     try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
+}
+
+test "listenerShardConfigChanged requires restart for listener topology changes" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    base.listener_shards = 1;
+    proposed.listener_shards = 1;
+    try std.testing.expect(!listenerShardConfigChanged(&base, &proposed));
+
+    proposed.listener_shards = 4;
+    try std.testing.expect(listenerShardConfigChanged(&base, &proposed));
 }
 
 test "computeReloadedHttp3Advertisement withdraws active auto advertisement when reloaded off" {

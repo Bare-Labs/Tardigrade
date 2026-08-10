@@ -1,6 +1,12 @@
 //! Listener accept-loop helpers. This module owns accepting ready sockets,
 //! applying listener fd limits, and rejecting overloaded clients before they
 //! enter the worker pool.
+//!
+//! Listener sharding: when `TARDIGRADE_LISTENER_SHARDS` > 1, the gateway
+//! creates N sockets bound to the same address with the platform's
+//! load-balanced reuse-port option and runs one independent accept loop per
+//! shard, each on its own thread. This reduces accept-path contention and
+//! improves CPU locality for high-connection-churn workloads.
 
 const builtin = @import("builtin");
 const compat = @import("zig_compat");
@@ -11,7 +17,48 @@ const gs = @import("gateway_state.zig");
 
 const GatewayState = gs.GatewayState;
 
-pub fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_pool.WorkerPool, state: *GatewayState) void {
+/// Context passed to each per-shard accept thread.
+pub const ShardAcceptContext = struct {
+    listen_fd: std.posix.fd_t,
+    shard_id: u16,
+    worker_pool: *http.worker_pool.WorkerPool,
+    state: *GatewayState,
+};
+
+/// Entry point for a per-shard accept thread.  Runs until shutdown is
+/// requested, then returns.  The caller is responsible for joining the thread
+/// and closing `ctx.listen_fd`.
+pub fn runShardAcceptLoop(ctx: ShardAcceptContext) void {
+    var pfd = [_]std.posix.pollfd{.{
+        .fd = ctx.listen_fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    while (!http.shutdown.isShutdownRequested()) {
+        // Poll with a 250 ms timeout so we check the shutdown flag periodically
+        // instead of blocking indefinitely in accept().
+        const ready = std.posix.poll(&pfd, 250) catch |err| switch (err) {
+            error.SystemResources => {
+                ctx.state.metricsRecordAcceptError(ctx.shard_id, .poll);
+                continue;
+            },
+            else => {
+                ctx.state.metricsRecordAcceptError(ctx.shard_id, .poll);
+                ctx.state.logger.err(null, "poll error (shard {}): {}", .{ ctx.shard_id, err });
+                return;
+            },
+        };
+        if (ready == 0) continue; // timeout — loop and recheck shutdown flag
+        if ((pfd[0].revents & std.posix.POLL.IN) != 0) {
+            acceptReadyConnectionsShard(ctx.listen_fd, ctx.shard_id, ctx.worker_pool, ctx.state);
+        }
+    }
+}
+
+/// Accept all connections that are ready on `listen_fd`, recording metrics
+/// under the given `shard_id`.  Returns after draining all ready connections
+/// (EAGAIN) or when shutdown is requested.
+pub fn acceptReadyConnectionsShard(listen_fd: std.posix.fd_t, shard_id: u16, worker_pool: *http.worker_pool.WorkerPool, state: *GatewayState) void {
     while (!http.shutdown.isShutdownRequested()) {
         var accepted_addr: std.c.sockaddr.storage = undefined;
         var addr_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
@@ -29,9 +76,12 @@ pub fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.work
             const e = std.posix.errno(client_fd);
             if (e == .AGAIN) return;
             if (e == .CONNABORTED) continue;
-            state.logger.err(null, "accept error: {}", .{e});
+            state.metricsRecordAcceptError(shard_id, .accept);
+            state.logger.err(null, "accept error (shard {}): {}", .{ shard_id, e });
             return;
         }
+
+        state.metricsRecordAccept(shard_id);
 
         const owned_ip_key = gc.clientIpKeyFromAddress(state.allocator, &accepted_addr) catch null;
         defer if (owned_ip_key) |key| state.allocator.free(key);
@@ -73,6 +123,72 @@ pub fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.work
             continue;
         };
     }
+}
+
+/// Backward-compatible wrapper: accept ready connections on shard 0 (the
+/// default single-listener path).
+pub fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_pool.WorkerPool, state: *GatewayState) void {
+    acceptReadyConnectionsShard(listen_fd, 0, worker_pool, state);
+}
+
+/// Create a TCP listener socket bound to `host`:`port` with `SO_REUSEADDR`
+/// and the platform's load-balanced reuse-port option.
+///
+/// Multiple sockets created with a load-balanced reuse-port option for the same
+/// address allow the kernel to distribute incoming connections across
+/// independent accept loops (listener sharding) without per-fd contention.
+/// Callers should only use this path when `isReusePortSupported()` is true.
+///
+/// Returns a bound, listening file descriptor.  The caller owns the fd and
+/// must close it when done.
+pub fn createReusePortListenerFd(host: []const u8, port: u16) !std.posix.fd_t {
+    const sock_addr = try compat.parseIpAddress(host, port);
+    // Derive the address family from the first field of the generic sockaddr.
+    const sa: *const std.c.sockaddr = @ptrCast(&sock_addr.storage);
+    const family: u32 = @intCast(sa.family);
+
+    const fd = std.c.socket(family, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    if (fd < 0) return error.SocketCreationFailed;
+    errdefer _ = std.c.close(fd);
+
+    _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, 1)); // FD_CLOEXEC
+
+    // SO_REUSEADDR: allow fast server restart without waiting out TIME_WAIT.
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1)));
+
+    try enableReusePortSharding(fd);
+
+    const rc_bind = std.c.bind(fd, @ptrCast(&sock_addr.storage), sock_addr.len);
+    if (rc_bind != 0) return error.BindFailed;
+
+    const rc_listen = std.c.listen(fd, 128);
+    if (rc_listen != 0) return error.ListenFailed;
+
+    return fd;
+}
+
+/// Set the platform option that provides load-balanced duplicate listener
+/// binding. Plain duplicate-bind options are intentionally not enough here:
+/// sharding must distribute fresh TCP connections across the listener fds.
+fn enableReusePortSharding(fd: std.posix.fd_t) !void {
+    const option = reusePortShardingOption() orelse return error.ReusePortShardingUnsupported;
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, option, std.mem.asBytes(&@as(c_int, 1)));
+}
+
+fn reusePortShardingOption() ?u32 {
+    return switch (builtin.os.tag) {
+        .linux => std.posix.SO.REUSEPORT,
+        .freebsd => 0x00010000, // SO_REUSEPORT_LB
+        else => null,
+    };
+}
+
+/// Returns true on platforms with verified load-balanced reuse-port semantics.
+pub fn isReusePortSupported() bool {
+    return switch (builtin.os.tag) {
+        .linux, .freebsd => true,
+        else => false,
+    };
 }
 
 /// Deterministic overload response sent to clients rejected at accept time
@@ -148,4 +264,50 @@ pub fn applyFdSoftLimit(desired: u64) !?u64 {
     limits.cur = @intCast(target);
     try std.posix.setrlimit(std.posix.rlimit_resource.NOFILE, limits);
     return target;
+}
+
+test "isReusePortSupported returns true only on load-balanced platforms" {
+    switch (builtin.os.tag) {
+        .linux,
+        .freebsd,
+        => try std.testing.expect(isReusePortSupported()),
+        else => try std.testing.expect(!isReusePortSupported()),
+    }
+}
+
+test "createReusePortListenerFd binds and listens on a free port" {
+    if (!isReusePortSupported()) return; // skip on unsupported platforms
+
+    // Bind to port 0 to let the kernel assign a free port.
+    const fd = try createReusePortListenerFd("127.0.0.1", 0);
+    defer _ = std.c.close(fd);
+
+    // The fd must be a valid, listening socket — verify by getting the bound address.
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.getsockname(fd, @ptrCast(&bound), &bound_len));
+    // Port 0 gets a non-zero OS-assigned port.
+    try std.testing.expect(std.mem.bigToNative(u16, bound.port) > 0);
+}
+
+test "createReusePortListenerFd allows two sockets on the same port with SO_REUSEPORT" {
+    if (!isReusePortSupported()) return; // skip on unsupported platforms
+
+    // Bind the first socket to port 0 to get a kernel-assigned port.
+    const fd1 = try createReusePortListenerFd("127.0.0.1", 0);
+    defer _ = std.c.close(fd1);
+
+    // Read the assigned port.
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.getsockname(fd1, @ptrCast(&bound), &bound_len));
+    const port = std.mem.bigToNative(u16, bound.port);
+    try std.testing.expect(port > 0);
+
+    // A second socket on the exact same port must succeed (SO_REUSEPORT).
+    const fd2 = try createReusePortListenerFd("127.0.0.1", port);
+    defer _ = std.c.close(fd2);
+
+    // Both fds are valid and distinct.
+    try std.testing.expect(fd1 != fd2);
 }
