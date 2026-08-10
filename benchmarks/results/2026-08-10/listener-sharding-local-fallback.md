@@ -87,6 +87,15 @@ Raw metric scrapes:
 - `benchmarks/results/2026-08-10/listener-sharding-single-metrics.prom`
 - `benchmarks/results/2026-08-10/listener-sharding-4shards-metrics.prom`
 
+## Reusable Suite
+
+The reusable #137 benchmark path is now `benchmarks/listener-sharding.sh`. It
+starts the same foreground gateway command with `TARDIGRADE_LISTENER_SHARDS=1`
+and `=N`, delegates the standard static/proxy/keepalive scenarios to
+`benchmarks/run.sh`, adds explicit `Connection: close` churn and mixed
+static/proxy workloads, scrapes `/status/metrics`, and saves per-profile raw
+outputs plus a combined `summary.json`.
+
 ## Interpretation
 
 - The sharded startup path ran and exported the required `listener_shards`, per-shard accepts, and `{shard,reason}` accept-error labels.

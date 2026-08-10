@@ -34,6 +34,16 @@ Run benchmarks on a dedicated, isolated benchmark target by default.
 # Competitive local comparison against Tardigrade, NGINX, HAProxy, and Caddy.
 # Canonical competitor numbers still belong on a dedicated idle host.
 ./benchmarks/competitive/run.sh
+
+# Listener-sharding suite: starts the same gateway command twice, with
+# TARDIGRADE_LISTENER_SHARDS=1 and =N, then saves comparable workload results
+# and per-shard accept metrics. Canonical numbers still belong on a dedicated
+# benchmark target.
+./benchmarks/listener-sharding.sh \
+  --start-command './zig-out/bin/tardigrade -c ./edge.conf' \
+  --shards 4 \
+  --duration 30 \
+  --connections 50
 ```
 
 ## Prerequisites
@@ -169,6 +179,26 @@ These verify correctness under load, not just raw throughput. They require `--to
 Run a subset: `--scenarios static-http1,keepalive`
 
 Run only k6 behavioral tests: `--tool k6 --scenarios auth-enforcement,rate-limit,spike`
+
+### Listener-sharding suite
+
+`benchmarks/listener-sharding.sh` is the reusable #137 benchmark path. It
+restarts the supplied foreground gateway command for two profiles:
+`TARDIGRADE_LISTENER_SHARDS=1` and `TARDIGRADE_LISTENER_SHARDS=N`.
+
+The suite runs:
+
+- `static-http1`, `proxy-http1`, and `keepalive` through `benchmarks/run.sh`
+- high connection churn with `wrk -H "Connection: close"`
+- mixed short static/proxy traffic with a `wrk` Lua request alternator and
+  `Connection: close`
+
+For each profile it saves the standard benchmark JSON/log, raw `wrk` output for
+the churn and mixed workloads, a full `/status/metrics` scrape, and a combined
+`summary.json` containing req/s, latency percentiles, CPU/RSS when PID sampling
+is available, accept errors, worker queue metrics, and every per-shard accept
+counter. Use the existing dedicated benchmark-target policy for publishable
+numbers; laptop-local runs are fallback data only.
 
 ## k6 scenario environment variables
 
