@@ -150,7 +150,7 @@ framing, and proxy streaming.
 **This constrains what a future `io_uring` backend may be, and this doc picks
 the narrower of the two honest options:** a future `io_uring` backend
 targeting this boundary is a **readiness-only poller replacement** —
-`IORING_OP_POLL_ADD`/`IORING_OP_POLL_REMOVE` (plus a ring-native timeout for
+`IORING_OP_POLL_ADD`/`IORING_OP_POLL_REMOVE` plus `IORING_OP_TIMEOUT` (for
 `wait`'s bounded-block behavior) standing in for `epoll_wait`/`kqueue`, with
 `accept()` and all request I/O staying exactly where they are today: outside
 the ring, as blocking calls on worker threads. It is **not** a wider
@@ -283,14 +283,17 @@ at all unless a separate future change first migrates them onto the shared
   native-TLS path's own `WaitingEncryptedHttpConnection.waitFor`, which polls
   locally rather than through the shared loop). Per the "Backend abstraction
   boundary" section above, a backend targeting this boundary is
-  **readiness-only** (`IORING_OP_POLL_ADD`/`IORING_OP_POLL_REMOVE` plus a
-  ring-native timeout) — it does not use `IORING_OP_ACCEPT`, registered
+  **readiness-only** (`IORING_OP_POLL_ADD`/`IORING_OP_POLL_REMOVE` plus
+  `IORING_OP_TIMEOUT`) — it does not use `IORING_OP_ACCEPT`, registered
   buffers/files, or multishot variants, since those require widening the
   boundary to an operation/completion abstraction, which is explicitly out
-  of scope for Phase 0. The readiness-only operation set is available from
-  the original `io_uring` interface (Linux 5.1); see "Failure modes and
-  fallback policy" below for how kernel-requirement documentation should be
-  structured if a wider abstraction is ever proposed instead.
+  of scope for Phase 0. `POLL_ADD`/`POLL_REMOVE` exist from the original
+  `io_uring` interface (Linux 5.1), but this readiness-only prototype's
+  actual minimum is **Linux 5.4**, because `EventLoop.wait(timeout_ms)`'s
+  bounded-block behavior is implemented with `IORING_OP_TIMEOUT`, which is
+  not present in 5.1; see "Failure modes and fallback policy" below for how
+  kernel-requirement documentation should be structured if a wider
+  abstraction is ever proposed instead.
 - **macOS support:** None — `io_uring` is Linux-only, so this would always
   need to stay behind a compile-time/feature-flag gate with `epoll`/`kqueue`
   as the portable default, exactly as #148 already proposes.
@@ -310,11 +313,18 @@ at all unless a separate future change first migrates them onto the shared
   (streaming relay) or #140 (watermark backpressure) as currently designed,
   since both operate on synchronous blocking reads/writes inside worker
   threads, not on event-loop-driven readiness.
-- **Timers, cancellation, keepalive parking, graceful drain:** `io_uring`
-  can express timeouts and cancellation natively, which could simplify
-  `keepalive_park.zig`'s reaper in principle, but the current reaper (a
-  periodic scan under one mutex) is not a known bottleneck — no profiling
-  evidence in this repo suggests it needs replacing.
+- **Timers, cancellation, keepalive parking, graceful drain:** Unchanged at
+  the readiness-only boundary chosen above. The retained API is still just
+  `add`/`modify`/`remove` plus one bounded `wait(timeout_ms)` — it has no
+  per-connection timer-submission or cancellation operation.
+  `IORING_OP_TIMEOUT` is used only to implement that single bounded
+  `wait()`, not a per-connection deadline; `keepalive_park.zig`'s
+  `ParkedRegistry` maintenance-tick reaper and `gateway_shutdown.zig`'s
+  drain behavior are unaffected and unchanged either way. `io_uring` *can*
+  express native per-operation timeouts and cancellation in general, but
+  using that to actually simplify the reaper would require the wider
+  operation/completion abstraction this doc explicitly defers (see "Backend
+  abstraction boundary"), not the readiness-only prototype scoped here.
 - **Prototype needed to resolve the decision?** Not yet — see
   "Recommendation."
 
@@ -327,7 +337,7 @@ at all unless a separate future change first migrates them onto the shared
 | Complexity / maintenance | Already paid for | Refactor cost, no new capability | New dependency + handler rewrite | Blocked, not a maintenance question yet | High — new SQ/CQ lifecycle, cancellation model |
 | TLS integration | Done for both OpenSSL (park) and native (active registry) paths, out of event loop's path | Unaffected | Would need rework if handler goes non-blocking | Unaffected until viable | Unaffected (TLS stays in worker) |
 | Proxy streaming/backpressure (#139/#140) | Built on blocking relay, already integrated | Unaffected | Would require redesign | Already broke FastCGI in production (Phase 2) | No interaction as currently designed |
-| Timers/cancellation/parking/drain | Implemented, no known bottleneck | Unaffected | Would move into libxev's model | Unaffected until viable | Could simplify parking reaper, unproven need |
+| Timers/cancellation/parking/drain | Implemented, no known bottleneck | Unaffected | Would move into libxev's model | Unaffected until viable | Unchanged at readiness-only boundary — reaper/drain untouched |
 | Prototype required to decide? | N/A (shipped) | No | Only if handler model changes | No — blocked on toolchain, not on prototyping | Not yet (see recommendation) |
 
 ## Recommendation
@@ -421,20 +431,25 @@ no prototype exists yet:
   runtime conditions (log, drain, exit), consistent with how the current
   `EventLoop.wait()` error path already just logs and continues rather than
   trying to self-heal by rebuilding the poller.
-- **Kernel/toolchain requirements, if pursued:** separate the **ring
-  baseline** from the **prototype's exact operation set**, rather than citing
-  one number for "basic support." `io_uring` itself — the
+- **Kernel/toolchain requirements, if pursued:** separate the **historical
+  ring/poll baseline** from **this prototype's actual minimum**, rather than
+  citing one number for "basic support." `io_uring` itself — the
   `io_uring_setup`/`io_uring_enter`/`io_uring_register` syscalls, and with
-  them `IORING_OP_POLL_ADD`/`IORING_OP_POLL_REMOVE` (the readiness-only
-  operation set this doc scopes a prototype to, per "Backend abstraction
-  boundary" above) — landed in Linux **5.1**. Individual capabilities this
-  doc explicitly excludes from a readiness-only prototype have their own,
-  later floors if a future wider abstraction ever adopts them:
-  `IORING_OP_ACCEPT` (5.5), multishot poll (5.13), and multishot accept
-  (5.19, per upstream `liburing` docs) are commonly cited examples, not an
-  exhaustive list. A prototype must pin and document the exact minimum
-  kernel version it targets **for the specific opcodes/features it actually
-  uses**, and probe for those capabilities explicitly at startup rather than
+  them `IORING_OP_POLL_ADD`/`IORING_OP_POLL_REMOVE` — landed in Linux
+  **5.1**. But the readiness-only prototype this doc actually scopes to (see
+  "Backend abstraction boundary") also relies on `IORING_OP_TIMEOUT` to
+  implement `EventLoop.wait(timeout_ms)`'s bounded-block behavior, and that
+  opcode is not present in 5.1 — it landed in Linux **5.4**. So **this
+  prototype's real minimum is Linux 5.4**, not 5.1, unless a future revision
+  explicitly chooses a different, non-`IORING_OP_TIMEOUT` bounded-wait
+  mechanism instead. Individual capabilities this doc explicitly excludes
+  from the readiness-only prototype have their own, later floors if a future
+  wider abstraction ever adopts them: `IORING_OP_ACCEPT` (5.5), multishot
+  poll (5.13), and multishot accept (5.19, per upstream `liburing` docs) are
+  commonly cited examples, not an exhaustive list. A prototype must pin and
+  document the exact minimum kernel version it targets **for the specific
+  opcodes/features it actually uses** — 5.4 for the operation set chosen
+  here — and probe for those capabilities explicitly at startup rather than
   assuming availability from a compile-time Linux check or from the 5.1 ring
   baseline alone.
 
