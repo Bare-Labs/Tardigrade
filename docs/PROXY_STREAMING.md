@@ -194,18 +194,18 @@ it still owns.
 
 **Do not compare `tardigrade_buffered_bytes_current{scope="global"}` with
 `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES`.** That gauge is a roll-up of
-every proxy-owned buffer — bounded buffered responses, HTTP/1 relay buffers,
-request-side buffers, and HTTP/2 stream queues — whereas the hard limit is
-currently enforced only against HTTP/2 streaming response queues. Under mixed
-traffic the roll-up is larger than the quantity being checked, so reading it as
-"how close am I to the limit" overstates pressure.
+every proxy-owned buffer, including paths the limit does not govern — most
+notably the bounded buffered compatibility path, which has its own hard cap in
+`TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES`. Under mixed traffic the
+roll-up is larger than the quantity being checked, so reading it as "how close
+am I to the limit" overstates pressure.
 
 The series to put next to the limit is
 `tardigrade_proxy_buffer_aggregate_bytes_current{direction,scope="global"}`,
-which is read directly from the account that performs the enforcement. Bringing
-the remaining paths under the same aggregate is request-direction work (the
-issue's PR 3); until then these two gauges answer different questions, and the
-narrower one is the one the limit governs.
+which is read directly from the account that performs the enforcement. It now
+covers HTTP/2 stream queues, HTTP/1 relay buffers in both directions, and
+request-direction upload buffers on both protocols; the remaining gap is
+per-origin accounting for HTTP/1 origins (the issue's PR 4).
 
 #### What a refusal does
 
@@ -246,6 +246,50 @@ judged by what it was granted. Each connection therefore pins the complete
 low/high/hard policy it advertised, and every stream on it is measured against
 that, never against a newer snapshot.
 
-The HTTP/1 relay's fixed buffers are accounted per stream but are not reserved
-against the aggregate scopes; their size does not grow with concurrency the way
-an HTTP/2 stream queue does.
+### Request-direction bounds
+
+Uploads are accounted the same way, under
+`direction="downstream_to_upstream"`. Both relays copy through one fixed buffer
+for the life of the upload, so what is reserved is that buffer — reserved once
+when the relay starts, not once per chunk — plus any body bytes that arrived in
+the same read as the request head, which live in a second buffer of their own.
+An upload therefore reserves a bounded amount that does not grow with the body,
+and the reservation is released on every exit: completion, client abort,
+cancellation, timeout, and upstream failure alike.
+
+Every upload reservation clears
+`TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES`, and an HTTP/2 upload also
+clears its origin's limit. Per-origin accounting for HTTP/1 origins is the
+issue's PR 4: an HTTP/1 origin's relay memory is already bounded per request by
+these fixed buffers, so the scope concurrency can multiply is the process.
+
+Refusals split by what ran out, because the two mean different things to the
+client:
+
+| Refused at | Status | Meaning |
+| --- | --- | --- |
+| per-stream hard limit | `413` `payload_too_large` | *this* upload's in-flight bytes exceed the bound it is allowed |
+| per-origin or global hard limit | `503` `proxy_buffer_saturated` | the proxy is out of room for anybody |
+
+Both are raised before the response head is committed, and neither is recorded
+against upstream health — a healthy origin must not be blamed for this proxy's
+memory pressure.
+
+### Seeing a slow origin on HTTP/1
+
+The HTTP/1 relay has no queue whose depth could cross a watermark: it reads the
+client only after the upstream write completes, so a full upstream send buffer
+*is* a pause of downstream reads. Before each chunk the relay asks (with a
+zero-timeout `poll`, so a healthy origin pays nothing and moves no counters)
+whether the origin can take more bytes. When it cannot, the transition is
+recorded as `tardigrade_buffer_read_pauses_total{side="downstream"}`, and the
+matching resume once the write goes through.
+
+Only transitions are counted: a relay stalled across many chunks reports one
+pause and one resume, not one per write, and a relay torn down mid-stall still
+reports its resume — so the difference between the two counters reads as "how
+many uploads are stalled right now" rather than drifting by one per abort. A
+write that begins to block only *after* the check passes is deliberately not
+counted; an origin that has genuinely stopped consuming keeps the buffer full
+across iterations and is caught, while a momentary block is not a backpressure
+event.

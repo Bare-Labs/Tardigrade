@@ -55,8 +55,36 @@ All notable user-facing changes to Tardigrade are documented here.
   `tardigrade_proxy_buffer_aggregate_bytes_current{direction,scope="global"}`,
   read from the enforcing account. This is the series to compare with the
   configured limit: `tardigrade_buffered_bytes_current{scope="global"}` is a
-  roll-up across every proxy-owned buffer, while the limit currently governs
-  HTTP/2 streaming response queues only.
+  roll-up across every proxy-owned buffer, including the bounded buffered
+  compatibility path, which the limit does not govern.
+
+- **Client uploads are accounted and bounded the same way, and a slow origin is
+  now visible (#140)** — request-direction relay buffers on both HTTP/1 and
+  HTTP/2 now clear `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` (and, on
+  HTTP/2, the per-origin limit) before they are used, so concurrent uploads can
+  no longer multiply upload memory past the configured ceiling. An HTTP/2 upload
+  reserves its relay buffer once for the whole upload instead of reserving and
+  releasing per DATA frame, which was a flicker no concurrent stream could ever
+  have been bounded by. Reservations are released on every exit — completion,
+  client abort, cancellation, timeout, upstream failure — so the gauges return
+  to zero.
+
+  Capacity refusals during an upload are now distinguished by what ran out,
+  because the two mean different things to the client. This upload's in-flight
+  bytes exceeding `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES` is a
+  `413 payload_too_large`; the proxy being out of room for anybody is a
+  `503 proxy_buffer_saturated`. Both are raised before the response head is
+  committed, and neither is charged to upstream health. Previously an HTTP/1
+  upload refusal surfaced as a `502` blamed on a healthy origin.
+
+  `tardigrade_buffer_read_pauses_total{side="downstream"}` and its resume
+  counterpart, which previously only ever read zero, now record the HTTP/1
+  upload relay finding the origin's send buffer full. That path deliberately has
+  no queue whose depth could cross a watermark — it reads the client again only
+  once the upstream write goes through — so a blocked upstream write *is* its
+  backpressure. Only transitions are counted, and a relay torn down mid-stall
+  still reports its resume, so the difference between the two counters reads as
+  "how many uploads are stalled right now".
 
   A high watermark that could not be advertised as an HTTP/2 window is rejected
   at startup and reload. On reload, aggregate hard limits apply immediately,

@@ -139,16 +139,22 @@ pub const StreamingRequestBody = struct {
 const ProxyBufferReservation = struct {
     account: proxy_buffer_account.Account,
     observer: proxy_buffer_account.Observer,
+    /// Aggregate scopes this relay's bytes must clear on top of the per-stream
+    /// bound. An empty capacity (a path with no origin identity and no process
+    /// account, or a test harness) leaves those scopes unlimited.
+    capacity: proxy_buffer_account.AggregateCapacity,
     active: bool = false,
 
     fn init(
         direction: proxy_buffer_account.Direction,
         limits: proxy_buffer_account.Limits,
         observer: proxy_buffer_account.Observer,
+        capacity: proxy_buffer_account.AggregateCapacity,
     ) ProxyBufferReservation {
         return .{
             .account = proxy_buffer_account.Account.init(direction, .stream, limits),
             .observer = observer,
+            .capacity = capacity,
         };
     }
 
@@ -160,6 +166,17 @@ const ProxyBufferReservation = struct {
                 self.observer.recordReservation(self.account.direction, 0, false, true);
             }
             return err;
+        };
+        // Charge the aggregate scopes only once the per-stream bound has
+        // admitted the bytes, and roll the per-stream reservation back if they
+        // refuse: no scope may be left holding bytes this relay never took.
+        self.capacity.reserve(self.account.direction, bytes) catch |err| {
+            self.account.release(bytes) catch unreachable;
+            self.observer.recordAggregateLimitExceeded(
+                self.account.direction,
+                proxy_buffer_account.aggregateFailureScope(err),
+            );
+            return error.ProxyBufferCapacityUnavailable;
         };
         const after = self.account.snapshot();
         self.observer.recordReservation(
@@ -178,6 +195,7 @@ const ProxyBufferReservation = struct {
     fn release(self: *ProxyBufferReservation, bytes: usize) void {
         if (!self.active) return;
         self.account.release(bytes) catch unreachable;
+        self.capacity.release(self.account.direction, bytes);
         self.observer.releaseReservation(self.account.direction, bytes);
         self.observer.releaseRetainedBytes(self.account.direction, bytes);
         self.active = self.account.snapshot().current != 0;
@@ -189,6 +207,35 @@ const ProxyBufferReservation = struct {
         self.release(current);
     }
 };
+
+/// Reserve request-direction relay bytes with the failure semantics #140 defines
+/// for the pre-commitment side of the boundary. The two refusals mean different
+/// things and must not collapse into one status: a per-stream refusal is this
+/// client's in-flight upload outgrowing the bound it is allowed (`413`), while
+/// an aggregate refusal is the proxy being out of room for anybody (`503`,
+/// already the error's own meaning). Both are raised before any response byte
+/// is committed, and neither is charged to the origin.
+fn reserveUploadBytes(reservation: *ProxyBufferReservation, bytes: usize) !void {
+    reservation.reserve(bytes) catch |err| return switch (err) {
+        error.BufferLimitExceeded => error.RequestBufferLimitExceeded,
+        else => err,
+    };
+}
+
+/// Note a write that cannot make progress right now as a downstream read pause.
+/// The check never waits (zero timeout), so a relay whose origin keeps draining
+/// costs one non-blocking `poll` per chunk and never touches the counters. A
+/// poll failure is not evidence of a stall, so it records nothing.
+///
+/// This reports a stall that is *already* in effect, so a single write that
+/// happens to block briefly after the check passes is not counted. That is the
+/// intended reading: an origin that has genuinely stopped consuming leaves the
+/// send buffer full across relay iterations and is caught, while a momentary
+/// block is not a backpressure event worth a counter.
+fn noteUpstreamWriteStall(fd: std.posix.fd_t, stall: *proxy_buffer_account.ReadStall) void {
+    const writable = pollFdWritable(fd) catch return;
+    if (!writable) stall.pause();
+}
 
 pub const StreamingProxyResult = struct {
     status_code: u16,
@@ -727,24 +774,33 @@ fn relayStreamingUploadToHttp2(
     cancel_token: ?*const CancellationToken,
     proxy_buffer_limits: proxy_buffer_account.Limits,
     proxy_buffer_observer: proxy_buffer_account.Observer,
+    proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity,
 ) !void {
+    // The relay owns `read_buf` for the whole upload, so reserve it once rather
+    // than per chunk: the reservation then tracks memory actually retained, and
+    // the aggregate scopes see one stable claim instead of a reserve/release
+    // flicker per DATA frame that no concurrent stream could ever be bounded by.
+    var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity);
+    try reserveUploadBytes(&upload_reservation, read_buf.len);
+    defer upload_reservation.releaseAll();
+
     switch (sb.framing) {
         .length => |content_length| {
             var sent: usize = @min(sb.initial_bytes.len, content_length);
             if (sent > 0) {
-                var initial_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
-                try initial_reservation.reserve(sent);
-                defer initial_reservation.releaseAll();
-                try conn.writeStreamingRequestBody(stream, sb.initial_bytes[0..sent], sent == content_length);
+                // Bytes that arrived with the request head are a second buffer.
+                try reserveUploadBytes(&upload_reservation, sent);
+                conn.writeStreamingRequestBody(stream, sb.initial_bytes[0..sent], sent == content_length) catch |err| {
+                    upload_reservation.release(sent);
+                    return err;
+                };
+                upload_reservation.release(sent);
             }
             while (sent < content_length) {
                 if (cancelStopped(cancel_token)) return error.RequestCancelled;
                 const want = @min(read_buf.len, content_length - sent);
                 const n = downstream_conn.read(read_buf[0..want]) catch return error.ClientAborted;
                 if (n == 0) return error.ClientAborted;
-                var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
-                try upload_reservation.reserve(n);
-                defer upload_reservation.releaseAll();
                 try conn.writeStreamingRequestBody(stream, read_buf[0..n], sent + n == content_length);
                 sent += n;
             }
@@ -761,9 +817,6 @@ fn relayStreamingUploadToHttp2(
                 if (cancelStopped(cancel_token)) return error.RequestCancelled;
                 const n = try reader.next(read_buf);
                 if (n == 0) break;
-                var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
-                try upload_reservation.reserve(n);
-                defer upload_reservation.releaseAll();
                 try conn.writeStreamingRequestBody(stream, read_buf[0..n], false);
             }
             try conn.writeStreamingRequestBody(stream, "", true);
@@ -838,7 +891,10 @@ fn streamViaH2Pool(
                 if (h1_pool) |p| p.recordProtocol(false);
                 const start_ms = http.event_loop.monotonicMs();
                 var wrote_downstream = false;
-                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, read_buf, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer);
+                // An ALPN-h1 origin never creates an h2 origin entry, so this
+                // connection clears the process account only (per-origin
+                // accounting for h1 origins is the issue's PR 4).
+                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, read_buf, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, .{ .global = proxy_buffer_global });
                 if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
                 return res.result;
             },
@@ -913,6 +969,7 @@ fn streamViaH2Pool(
                         cancel_token,
                         proxy_buffer_limits,
                         proxy_buffer_observer,
+                        proxy_buffer_capacity,
                     ) catch |err| {
                         const capacity_abort = err == error.BufferLimitExceeded or
                             conn.abortCause(stream) == .local_capacity;
@@ -1363,6 +1420,20 @@ fn pollFdReadable(fd: std.posix.fd_t, timeout_ms: u32) !bool {
     return ready != 0;
 }
 
+/// Can `fd` accept bytes right now without blocking? A `false` means the send
+/// buffer is full because the peer has stopped draining — which for the
+/// synchronous HTTP/1 relay is the whole of its backpressure, since it has no
+/// queue whose depth could cross a watermark instead. Never waits.
+fn pollFdWritable(fd: std.posix.fd_t) !bool {
+    var pfds = [_]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.OUT,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&pfds, 0);
+    return ready != 0 and (pfds[0].revents & std.posix.POLL.OUT) != 0;
+}
+
 test "parseBufferedUpstreamResponse keeps metadata in an arena and preserves forwarded headers" {
     var parsed = try parseBufferedUpstreamResponse(
         std.testing.allocator,
@@ -1791,6 +1862,7 @@ fn relayUpstreamBody(
 fn sendStreamingProxyRequest(
     allocator: std.mem.Allocator,
     transport: anytype,
+    fd: std.posix.fd_t,
     uri: std.Uri,
     method: []const u8,
     extra_headers: []const std.http.Header,
@@ -1800,6 +1872,7 @@ fn sendStreamingProxyRequest(
     cancel_token: ?*const CancellationToken,
     proxy_buffer_limits: proxy_buffer_account.Limits,
     proxy_buffer_observer: proxy_buffer_account.Observer,
+    proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity,
 ) !void {
     var req_aw: std.Io.Writer.Allocating = .init(allocator);
     defer req_aw.deinit();
@@ -1838,11 +1911,13 @@ fn sendStreamingProxyRequest(
     if (streaming_body) |sb| {
         try relayStreamingUploadToHttp1(
             transport,
+            fd,
             sb,
             downstream_conn,
             cancel_token,
             proxy_buffer_limits,
             proxy_buffer_observer,
+            proxy_buffer_capacity,
         );
     } else if (buffered_body.len > 0) {
         try transport.writeAll(buffered_body);
@@ -1852,28 +1927,46 @@ fn sendStreamingProxyRequest(
 /// Relay a streamed client upload to an HTTP/1.1 upstream. Both framings copy
 /// through one fixed relay buffer, so peak user-space upload memory is bounded
 /// regardless of the body size.
+///
+/// `fd` is the upstream socket (the TLS carrier when the transport is TLS). It
+/// is used only to notice a write that would block: this relay reads the client
+/// again only after the upstream write completes, so a full upstream send buffer
+/// *is* a pause of downstream reads, and that transition is the only place a
+/// slow origin becomes visible on a path that deliberately has no queue (#140).
 fn relayStreamingUploadToHttp1(
     transport: anytype,
+    fd: std.posix.fd_t,
     sb: StreamingRequestBody,
     downstream_conn: anytype,
     cancel_token: ?*const CancellationToken,
     proxy_buffer_limits: proxy_buffer_account.Limits,
     proxy_buffer_observer: proxy_buffer_account.Observer,
+    proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity,
 ) !void {
     var relay: [16 * 1024]u8 = undefined;
-    var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer);
-    try upload_reservation.reserve(relay.len);
+    var upload_reservation = ProxyBufferReservation.init(.downstream_to_upstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity);
+    try reserveUploadBytes(&upload_reservation, relay.len);
     defer upload_reservation.releaseAll();
+
+    // Balanced on every exit — success, client abort, cancellation, upstream
+    // failure — so the pause/resume difference reads as "relays stalled right
+    // now" instead of drifting by one per aborted upload.
+    var stall = proxy_buffer_account.ReadStall.init(.downstream, proxy_buffer_observer);
+    defer stall.unpause();
 
     switch (sb.framing) {
         .length => |content_length| {
             var sent: usize = @min(sb.initial_bytes.len, content_length);
             if (sent > 0) {
-                try upload_reservation.reserve(sent);
+                // The bytes that arrived with the request head live in their own
+                // buffer, so they are reserved on top of the relay buffer.
+                try reserveUploadBytes(&upload_reservation, sent);
+                noteUpstreamWriteStall(fd, &stall);
                 transport.writeAll(sb.initial_bytes[0..sent]) catch |err| {
                     upload_reservation.release(sent);
                     return err;
                 };
+                stall.unpause();
                 upload_reservation.release(sent);
             }
             while (sent < content_length) {
@@ -1881,7 +1974,9 @@ fn relayStreamingUploadToHttp1(
                 const want = @min(relay.len, content_length - sent);
                 const n = downstream_conn.read(relay[0..want]) catch return error.ClientAborted;
                 if (n == 0) return error.ClientAborted;
+                noteUpstreamWriteStall(fd, &stall);
                 try transport.writeAll(relay[0..n]);
+                stall.unpause();
                 sent += n;
             }
         },
@@ -1898,9 +1993,13 @@ fn relayStreamingUploadToHttp1(
                 if (n == 0) break;
                 var size_buf: [24]u8 = undefined;
                 const size_line = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{n}) catch unreachable;
+                // One stall check per chunk, not per write: the three writes
+                // below are one logical chunk and stall or drain together.
+                noteUpstreamWriteStall(fd, &stall);
                 try transport.writeAll(size_line);
                 try transport.writeAll(relay[0..n]);
                 try transport.writeAll("\r\n");
+                stall.unpause();
             }
             try transport.writeAll("0\r\n\r\n");
         },
@@ -1934,11 +2033,13 @@ fn streamProxyOverTransport(
     wrote_downstream: *bool,
     proxy_buffer_limits: proxy_buffer_account.Limits,
     proxy_buffer_observer: proxy_buffer_account.Observer,
+    proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity,
 ) !struct { result: StreamingProxyResult, reusable: bool } {
     if (connect_timeout_ms > 0) setSocketTimeoutMs(fd, connect_timeout_ms, connect_timeout_ms) catch {};
     try sendStreamingProxyRequest(
         allocator,
         transport,
+        fd,
         uri,
         method,
         extra_headers,
@@ -1948,6 +2049,7 @@ fn streamProxyOverTransport(
         cancel_token,
         proxy_buffer_limits,
         proxy_buffer_observer,
+        proxy_buffer_capacity,
     );
     if (read_deadline_ms > 0) setSocketRecvTimeoutMs(fd, read_deadline_ms) catch {};
 
@@ -1962,7 +2064,7 @@ fn streamProxyOverTransport(
     const body_allowed = gpres.responseBodyAllowed(method, head.status_code);
     var response_reservation: ?ProxyBufferReservation = null;
     if (body_allowed) {
-        response_reservation = ProxyBufferReservation.init(.upstream_to_downstream, proxy_buffer_limits, proxy_buffer_observer);
+        response_reservation = ProxyBufferReservation.init(.upstream_to_downstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity);
         try response_reservation.?.reserve(read_buf.len);
     }
     defer if (response_reservation) |*reservation| reservation.releaseAll();
@@ -2125,6 +2227,13 @@ pub fn executeStreamingHttpProxyRequest(
     // Everything below runs HTTP/1.1 (counted per request, not per attempt).
     if (pool) |p| p.recordProtocol(false);
 
+    // Aggregate capacity for this connection's relay buffers, in both
+    // directions (#140). The HTTP/1 pool has no per-origin buffer account — an
+    // h1 origin's relay memory is bounded per request by the fixed relay
+    // buffers, so the scope that concurrency can actually multiply is the
+    // process; per-origin accounting for h1 origins is the issue's PR 4.
+    const h1_buffer_capacity = proxy_buffer_account.AggregateCapacity{ .global = proxy_buffer_global };
+
     const active_pool: ?*http.upstream_pool.UpstreamPool = if (pool) |p| (if (p.config.enabled) p else null) else null;
     var key_buf: [512]u8 = undefined;
     const key = if (unix_socket_path) |socket_path|
@@ -2191,9 +2300,9 @@ pub fn executeStreamingHttpProxyRequest(
         const exchange_start_ms = http.event_loop.monotonicMs();
         const fd = conn.stream.handle;
         const res = (if (conn.tls) |tls|
-            streamProxyOverTransport(allocator, tls, fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer)
+            streamProxyOverTransport(allocator, tls, fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)
         else
-            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer)) catch |err| {
+            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)) catch |err| {
             // Tear down the connection (release handles active-- and close).
             if (active_pool) |p| {
                 p.release(key, conn, false, http.event_loop.monotonicMs());
@@ -2782,6 +2891,380 @@ test "streaming relay rejects a chunk not terminated by CRLF" {
         false,
         &body,
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Request-direction buffer accounting and HTTP/1 stall observability (#140).
+// ---------------------------------------------------------------------------
+
+/// Records everything the request-direction relays report, so a test can assert
+/// both the transitions and that every gauge returns to zero at teardown.
+const UploadBufferObserver = struct {
+    reserved: usize = 0,
+    peak_reserved: usize = 0,
+    retained: usize = 0,
+    pauses: u64 = 0,
+    resumes: u64 = 0,
+    stream_limit_exceeded: u64 = 0,
+    aggregate_limit_exceeded: u64 = 0,
+    last_aggregate_scope: ?proxy_buffer_account.Scope = null,
+
+    fn observer(self: *UploadBufferObserver) proxy_buffer_account.Observer {
+        return .{
+            .context = self,
+            .recordReservationFn = recordReservation,
+            .releaseReservationFn = releaseReservation,
+            .recordAggregateLimitExceededFn = recordAggregateLimitExceeded,
+            .recordReadPauseFn = recordReadPause,
+            .recordReadResumeFn = recordReadResume,
+            .recordRetainedBytesFn = recordRetained,
+            .releaseRetainedBytesFn = releaseRetained,
+        };
+    }
+
+    fn recordReservation(
+        context: *anyopaque,
+        _: proxy_buffer_account.Direction,
+        bytes: usize,
+        _: bool,
+        limit_exceeded: bool,
+    ) void {
+        const self: *UploadBufferObserver = @ptrCast(@alignCast(context));
+        if (limit_exceeded) self.stream_limit_exceeded += 1;
+        self.reserved += bytes;
+        self.peak_reserved = @max(self.peak_reserved, self.reserved);
+    }
+
+    fn releaseReservation(context: *anyopaque, _: proxy_buffer_account.Direction, bytes: usize) void {
+        const self: *UploadBufferObserver = @ptrCast(@alignCast(context));
+        self.reserved -= bytes;
+    }
+
+    fn recordAggregateLimitExceeded(
+        context: *anyopaque,
+        _: proxy_buffer_account.Direction,
+        scope: proxy_buffer_account.Scope,
+    ) void {
+        const self: *UploadBufferObserver = @ptrCast(@alignCast(context));
+        self.aggregate_limit_exceeded += 1;
+        self.last_aggregate_scope = scope;
+    }
+
+    fn recordReadPause(context: *anyopaque, _: proxy_buffer_account.Side) void {
+        const self: *UploadBufferObserver = @ptrCast(@alignCast(context));
+        self.pauses += 1;
+    }
+
+    fn recordReadResume(context: *anyopaque, _: proxy_buffer_account.Side) void {
+        const self: *UploadBufferObserver = @ptrCast(@alignCast(context));
+        self.resumes += 1;
+    }
+
+    fn recordRetained(context: *anyopaque, _: proxy_buffer_account.Direction, bytes: usize) void {
+        const self: *UploadBufferObserver = @ptrCast(@alignCast(context));
+        self.retained += bytes;
+    }
+
+    fn releaseRetained(context: *anyopaque, _: proxy_buffer_account.Direction, bytes: usize) void {
+        const self: *UploadBufferObserver = @ptrCast(@alignCast(context));
+        self.retained -= bytes;
+    }
+};
+
+/// A client upload served from memory. `abort_after` makes the read fail once
+/// that many bytes have been handed over, standing in for a client that
+/// disappears mid-upload.
+const FakeUploadSource = struct {
+    data: []const u8,
+    pos: usize = 0,
+    abort_after: ?usize = null,
+
+    pub fn read(self: *FakeUploadSource, buf: []u8) !usize {
+        if (self.abort_after) |limit| {
+            if (self.pos >= limit) return error.ConnectionResetByPeer;
+        }
+        const take = @min(buf.len, self.data.len - self.pos);
+        @memcpy(buf[0..take], self.data[self.pos..][0..take]);
+        self.pos += take;
+        return take;
+    }
+};
+
+fn uploadTestLimits(hard: usize) proxy_buffer_account.Limits {
+    return .{
+        .per_stream_low_watermark = hard / 4,
+        .per_stream_high_watermark = hard / 2,
+        .per_stream_hard_limit = hard,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+}
+
+/// Drain `total` bytes from `fd` after `delay_ms`. The delay is what lets the
+/// relay observe an origin that has stopped consuming.
+fn slowUploadDrain(fd: std.posix.fd_t, delay_ms: u64, total: usize) void {
+    // A bare `poll` with no descriptors, not `std.Io.sleep`: this runs on a raw
+    // spawned thread with no Io context, and a sleep that silently no-ops would
+    // let the drain keep pace with the relay so the stall under test would
+    // never happen.
+    var no_fds: [0]std.posix.pollfd = .{};
+    _ = std.posix.poll(&no_fds, @intCast(delay_ms)) catch {};
+    var buf: [4096]u8 = undefined;
+    var drained: usize = 0;
+    while (drained < total) {
+        const n = std.c.read(fd, &buf, buf.len);
+        if (n <= 0) return;
+        drained += @intCast(n);
+    }
+}
+
+/// Write into `fd` until it will not take another byte, and report how much
+/// went in. Non-blocking for the duration, so a partially free send buffer
+/// cannot park the caller with nobody draining. This is what makes a stall a
+/// fact of the socket's state at the moment the relay looks at it, rather than
+/// a race against a background reader.
+fn fillSocketSendBuffer(fd: std.posix.fd_t) !usize {
+    const flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+    if (flags < 0) return error.SocketFillFailed;
+    const nonblock: c_int = @bitCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+    if (std.c.fcntl(fd, std.posix.F.SETFL, flags | nonblock) < 0) return error.SocketFillFailed;
+    defer _ = std.c.fcntl(fd, std.posix.F.SETFL, flags);
+
+    const chunk = [_]u8{'p'} ** 1024;
+    var written: usize = 0;
+    // Bounded: a platform that never reports a full buffer must fail the test,
+    // not spin here forever.
+    while (written < 8 * 1024 * 1024) {
+        const n = std.c.write(fd, &chunk, chunk.len);
+        if (n <= 0) return written;
+        written += @intCast(n);
+    }
+    return error.SocketFillFailed;
+}
+
+test "http1 upload relay reports a slow origin as a downstream read pause" {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    // Shrink both ends so the origin's window fills well before the upload is
+    // done, whatever the platform default happens to be.
+    const small: c_int = 4096;
+    std.posix.setsockopt(client_fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&small)) catch {};
+    std.posix.setsockopt(peer_fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&small)) catch {};
+
+    const payload = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'u');
+
+    // Leave the origin's window already full, so the relay's first look at the
+    // socket is guaranteed to find a stall rather than racing the drainer for
+    // one. `pollFdWritable` must agree, or the check below is not testing
+    // anything.
+    const prefilled = try fillSocketSendBuffer(client_fd);
+    try std.testing.expect(prefilled > 0);
+    try std.testing.expect(!try pollFdWritable(client_fd));
+
+    const drainer = try std.Thread.spawn(.{}, slowUploadDrain, .{ peer_fd, @as(u64, 20), prefilled + payload.len });
+    defer drainer.join();
+
+    var counters = UploadBufferObserver{};
+    var source = FakeUploadSource{ .data = payload };
+    try relayStreamingUploadToHttp1(
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        .{ .framing = .{ .length = payload.len } },
+        &source,
+        null,
+        uploadTestLimits(1024 * 1024),
+        counters.observer(),
+        .{},
+    );
+
+    // The origin stopped draining, so downstream reads really were held back.
+    try std.testing.expect(counters.pauses >= 1);
+    // And every pause was resolved, not left dangling.
+    try std.testing.expectEqual(counters.pauses, counters.resumes);
+    // Peak relay memory is the fixed buffer, not the body.
+    try std.testing.expectEqual(@as(usize, 16 * 1024), counters.peak_reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+}
+
+test "http1 upload relay leaves nothing reserved when the client aborts mid-upload" {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    var counters = UploadBufferObserver{};
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    // Promises 8 KiB, delivers 4 KiB, then the client goes away.
+    var source = FakeUploadSource{ .data = &[_]u8{'x'} ** 4096, .abort_after = 4096 };
+    try std.testing.expectError(error.ClientAborted, relayStreamingUploadToHttp1(
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        .{ .framing = .{ .length = 8192 } },
+        &source,
+        null,
+        uploadTestLimits(1024 * 1024),
+        counters.observer(),
+        .{ .global = &global },
+    ));
+
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+    // Never stalled, so the pause counters stay untouched.
+    try std.testing.expectEqual(@as(u64, 0), counters.pauses);
+    try std.testing.expectEqual(@as(u64, 0), counters.resumes);
+}
+
+test "http1 upload relay rejects an over-limit in-flight upload as a client fault" {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    var counters = UploadBufferObserver{};
+    var source = FakeUploadSource{ .data = "" };
+    // The relay buffer alone consumes the whole per-stream budget, so the bytes
+    // that arrived with the request head have nowhere to go.
+    try std.testing.expectError(error.RequestBufferLimitExceeded, relayStreamingUploadToHttp1(
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        .{ .framing = .{ .length = 32 }, .initial_bytes = "inline-body-bytes" },
+        &source,
+        null,
+        uploadTestLimits(16 * 1024),
+        counters.observer(),
+        .{},
+    ));
+
+    // Charged to the stream scope (a 413), not to an aggregate one (a 503).
+    try std.testing.expectEqual(@as(u64, 1), counters.stream_limit_exceeded);
+    try std.testing.expectEqual(@as(u64, 0), counters.aggregate_limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+}
+
+test "http1 upload relay refuses when a concurrent relay has taken the aggregate" {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    const limits = uploadTestLimits(16 * 1024);
+    var counters = UploadBufferObserver{};
+    // Room for one relay buffer and a little more — the second upload is what
+    // proves concurrency cannot multiply the per-stream bound.
+    var global = proxy_buffer_account.Aggregate.init(.global, 24 * 1024);
+    const capacity = proxy_buffer_account.AggregateCapacity{ .global = &global };
+
+    var in_flight = ProxyBufferReservation.init(.downstream_to_upstream, limits, counters.observer(), capacity);
+    try in_flight.reserve(16 * 1024);
+
+    var source = FakeUploadSource{ .data = "" };
+    try std.testing.expectError(error.ProxyBufferCapacityUnavailable, relayStreamingUploadToHttp1(
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        .{ .framing = .{ .length = 0 } },
+        &source,
+        null,
+        limits,
+        counters.observer(),
+        capacity,
+    ));
+
+    try std.testing.expectEqual(@as(u64, 1), counters.aggregate_limit_exceeded);
+    try std.testing.expectEqual(proxy_buffer_account.Scope.global, counters.last_aggregate_scope.?);
+    // The refused relay retained nothing; the reservation that did fit is intact.
+    try std.testing.expectEqual(@as(usize, 16 * 1024), global.currentBytes(.downstream_to_upstream));
+
+    in_flight.releaseAll();
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+}
+
+const FakeH2UploadStream = struct { id: u32 = 1 };
+
+const FakeH2UploadConn = struct {
+    written: usize = 0,
+    end_stream: bool = false,
+
+    fn writeStreamingRequestBody(
+        self: *FakeH2UploadConn,
+        _: *FakeH2UploadStream,
+        bytes: []const u8,
+        end_stream: bool,
+    ) !void {
+        self.written += bytes.len;
+        if (end_stream) self.end_stream = true;
+    }
+};
+
+test "http2 upload relay reserves the relay buffer once, not once per DATA frame" {
+    var conn = FakeH2UploadConn{};
+    var stream = FakeH2UploadStream{};
+    var counters = UploadBufferObserver{};
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+
+    const payload = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'd');
+    var read_buf: [16 * 1024]u8 = undefined;
+    var source = FakeUploadSource{ .data = payload };
+
+    try relayStreamingUploadToHttp2(
+        &conn,
+        &stream,
+        .{ .framing = .{ .length = payload.len } },
+        &read_buf,
+        &source,
+        null,
+        uploadTestLimits(1024 * 1024),
+        counters.observer(),
+        .{ .global = &global },
+    );
+
+    try std.testing.expectEqual(payload.len, conn.written);
+    try std.testing.expect(conn.end_stream);
+    // 16 DATA frames went out, but only one buffer was ever owned.
+    try std.testing.expectEqual(@as(usize, read_buf.len), counters.peak_reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+}
+
+test "http2 upload relay releases the aggregate when the client aborts" {
+    var conn = FakeH2UploadConn{};
+    var stream = FakeH2UploadStream{};
+    var counters = UploadBufferObserver{};
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    var read_buf: [16 * 1024]u8 = undefined;
+    var source = FakeUploadSource{ .data = &[_]u8{'y'} ** 1024, .abort_after = 1024 };
+
+    try std.testing.expectError(error.ClientAborted, relayStreamingUploadToHttp2(
+        &conn,
+        &stream,
+        .{ .framing = .{ .length = 64 * 1024 } },
+        &read_buf,
+        &source,
+        null,
+        uploadTestLimits(1024 * 1024),
+        counters.observer(),
+        .{ .global = &global },
+    ));
+
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
 }
 
 /// Raw blocking responder: accepts one connection, drains the request, writes a

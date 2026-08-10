@@ -1884,7 +1884,7 @@ pub const GatewayState = struct {
     /// an operator can put next to the configured limit.
     fn appendProxyBufferAggregatePrometheus(self: *GatewayState, out: *std.array_list.Managed(u8)) !void {
         try out.appendSlice(
-            \\# HELP tardigrade_proxy_buffer_aggregate_bytes_current Bytes reserved at the aggregate scope the configured hard limit is enforced against (HTTP/2 streaming response queues)
+            \\# HELP tardigrade_proxy_buffer_aggregate_bytes_current Bytes reserved at the aggregate scope the configured hard limit is enforced against (HTTP/2 stream queues, HTTP/1 relay buffers, and request-direction upload buffers)
             \\# TYPE tardigrade_proxy_buffer_aggregate_bytes_current gauge
             \\
         );

@@ -159,6 +159,46 @@ pub const Observer = struct {
     }
 };
 
+/// Whether reads on `side` are currently stopped because the opposite peer
+/// cannot accept more bytes.
+///
+/// The synchronous HTTP/1 relay has no queue to hang a watermark off — it
+/// simply blocks in `write` until the far side drains — so a blocked write *is*
+/// its backpressure, and this is the only place it becomes observable. Only
+/// state transitions are recorded: a relay whose peers keep draining never
+/// touches the counters, and one that stalls repeatedly inside a single stall
+/// emits one pause/resume pair rather than one per write.
+pub const ReadStall = struct {
+    side: Side,
+    observer: Observer,
+    paused: bool = false,
+    pauses: u64 = 0,
+    resumes: u64 = 0,
+
+    pub fn init(side: Side, observer: Observer) ReadStall {
+        return .{ .side = side, .observer = observer };
+    }
+
+    /// The next write cannot make progress, so reads on `side` have stopped.
+    pub fn pause(self: *ReadStall) void {
+        if (self.paused) return;
+        self.paused = true;
+        self.pauses += 1;
+        self.observer.recordReadPause(self.side);
+    }
+
+    /// The write made progress, or the relay finished. Either way reads on
+    /// `side` are no longer being held back, so a relay torn down mid-stall
+    /// must call this: the pause/resume difference is meant to read as "how
+    /// many relays are stalled right now", not to drift by one per abort.
+    pub fn unpause(self: *ReadStall) void {
+        if (!self.paused) return;
+        self.paused = false;
+        self.resumes += 1;
+        self.observer.recordReadResume(self.side);
+    }
+};
+
 /// Which aggregate scope refused a reservation. Distinct errors so the caller
 /// can label the metric without a second lookup.
 pub const AggregateError = error{
@@ -482,6 +522,75 @@ test "unconfigured aggregate capacity is a no-op" {
     const capacity = AggregateCapacity{};
     try capacity.reserve(.upstream_to_downstream, std.math.maxInt(usize));
     capacity.release(.upstream_to_downstream, std.math.maxInt(usize));
+}
+
+const CountingStallObserver = struct {
+    pauses: u64 = 0,
+    resumes: u64 = 0,
+
+    fn observer(self: *CountingStallObserver) Observer {
+        return .{
+            .context = self,
+            .recordReservationFn = ignoreReservation,
+            .releaseReservationFn = ignoreRelease,
+            .recordReadPauseFn = recordPause,
+            .recordReadResumeFn = recordResume,
+        };
+    }
+
+    fn ignoreReservation(_: *anyopaque, _: Direction, _: usize, _: bool, _: bool) void {}
+    fn ignoreRelease(_: *anyopaque, _: Direction, _: usize) void {}
+
+    fn recordPause(context: *anyopaque, _: Side) void {
+        const self: *CountingStallObserver = @ptrCast(@alignCast(context));
+        self.pauses += 1;
+    }
+
+    fn recordResume(context: *anyopaque, _: Side) void {
+        const self: *CountingStallObserver = @ptrCast(@alignCast(context));
+        self.resumes += 1;
+    }
+};
+
+test "read stall records one pause resume pair per stall, not per write" {
+    var counters = CountingStallObserver{};
+    var stall = ReadStall.init(.downstream, counters.observer());
+
+    // A relay that never stalls must leave the counters untouched.
+    stall.unpause();
+    try std.testing.expectEqual(@as(u64, 0), counters.pauses);
+    try std.testing.expectEqual(@as(u64, 0), counters.resumes);
+
+    // Repeated stalled writes inside one stall are a single transition.
+    stall.pause();
+    stall.pause();
+    stall.pause();
+    try std.testing.expectEqual(@as(u64, 1), counters.pauses);
+    try std.testing.expectEqual(@as(u64, 0), counters.resumes);
+
+    stall.unpause();
+    stall.unpause();
+    try std.testing.expectEqual(@as(u64, 1), counters.pauses);
+    try std.testing.expectEqual(@as(u64, 1), counters.resumes);
+
+    // A later stall is a new transition.
+    stall.pause();
+    stall.unpause();
+    try std.testing.expectEqual(@as(u64, 2), counters.pauses);
+    try std.testing.expectEqual(@as(u64, 2), counters.resumes);
+    try std.testing.expectEqual(counters.pauses, stall.pauses);
+    try std.testing.expectEqual(counters.resumes, stall.resumes);
+}
+
+test "read stall left paused at teardown balances when unpaused" {
+    var counters = CountingStallObserver{};
+    var stall = ReadStall.init(.downstream, counters.observer());
+    stall.pause();
+    // Teardown while stalled (client abort, cancellation): the relay is gone,
+    // so it is no longer holding reads back.
+    stall.unpause();
+    try std.testing.expectEqual(counters.pauses, counters.resumes);
+    try std.testing.expect(!stall.paused);
 }
 
 test "proxy buffer account reports over-release without changing current" {
