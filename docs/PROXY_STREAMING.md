@@ -177,7 +177,7 @@ retain up to N windows. Two aggregate hard limits close that gap:
 
 | Limit | Scope |
 | --- | --- |
-| `TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` | every stream on every connection to one upstream origin |
+| `TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` | every concurrent request to one upstream origin, on either protocol |
 | `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` | the whole process, across all origins |
 
 Both default to `0`, which means unlimited. Reservations are taken *before* any
@@ -202,10 +202,17 @@ am I to the limit" overstates pressure.
 
 The series to put next to the limit is
 `tardigrade_proxy_buffer_aggregate_bytes_current{direction,scope="global"}`,
-which is read directly from the account that performs the enforcement. It now
+which is read directly from the account that performs the enforcement. It
 covers HTTP/2 stream queues, HTTP/1 relay buffers in both directions, and
-request-direction upload buffers on both protocols; the remaining gap is
-per-origin accounting for HTTP/1 origins (the issue's PR 4).
+request-direction upload buffers on both protocols.
+
+The per-origin equivalents are
+`tardigrade_upstream_h2_pool_buffered_bytes{upstream,direction}` for HTTP/2
+origins and `tardigrade_upstream_pool_buffered_bytes{upstream,direction}` for
+HTTP/1 ones, with `…_buffer_limit_exceeded_total` counterparts. Both are read
+from the accounts that enforce
+`TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES`, so either is directly
+comparable with it.
 
 #### What a refusal does
 
@@ -246,6 +253,34 @@ judged by what it was granted. Each connection therefore pins the complete
 low/high/hard policy it advertised, and every stream on it is measured against
 that, never against a newer snapshot.
 
+### HTTP/1 aggregate bounds
+
+An HTTP/1 relay has no queue, so the per-stream watermarks have nothing to
+pause; what it has is a fixed buffer per direction, and that buffer is what the
+aggregate scopes account. The response relay reserves
+`proxy_stream_buffer_size` (floored at 16 KiB) once, immediately after the
+origin's response head is parsed and before that head is written downstream;
+the upload relay reserves its fixed 16 KiB before the request head goes out.
+
+Both clear the per-origin scope as well as the global one. That scope is the
+one that matters here: a fixed buffer bounds one request, but nothing bounds
+how many requests an origin has in flight, so without it a single slow origin
+could hold `concurrency × buffer` with every individual request looking
+perfectly well behaved. Origins are keyed the way the connection pool keys them
+(`http:host:port`, `https:host:port`, `unix:/path`), and an origin reached over
+TLS whose ALPN negotiated HTTP/1.1 is accounted under its HTTP/1 key rather
+than the HTTP/2 pool key it was acquired through — otherwise one origin's
+memory would be split across two limits.
+
+The account exists whenever an origin is proxied to, including when connection
+pooling is disabled: it bounds memory, which pooling has no bearing on.
+
+**An HTTP/1 response can never meet a capacity refusal after commitment.** Its
+whole reservation is taken up front, before the head is written, so a refusal
+is always a clean pre-commitment `503 proxy_buffer_saturated` — the
+post-commitment reset-and-truncate path described above is HTTP/2-only, because
+only HTTP/2 reserves again as more DATA arrives.
+
 ### Request-direction bounds
 
 Uploads are accounted the same way, under
@@ -282,11 +317,9 @@ response is read.) That buffer's ownership during the HTTP/2 response phase is
 not itself accounted; that gap predates this work and belongs with the rest of
 the response-side aggregate coverage.
 
-Every upload reservation clears
-`TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES`, and an HTTP/2 upload also
-clears its origin's limit. Per-origin accounting for HTTP/1 origins is the
-issue's PR 4: an HTTP/1 origin's relay memory is already bounded per request by
-these fixed buffers, so the scope concurrency can multiply is the process.
+Every upload reservation clears both
+`TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` and
+`TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES`, on either protocol.
 
 Refusals split by what ran out, because the two mean different things to the
 client:
@@ -324,3 +357,99 @@ write that begins to block only *after* the check passes is deliberately not
 counted; an origin that has genuinely stopped consuming keeps the buffer full
 across iterations and is caught, while a momentary block is not a backpressure
 event.
+
+## Tuning the buffer limits
+
+The five limits answer three different questions, and it helps to set them in
+that order rather than as one block of numbers.
+
+### 1. Per-stream: how much should one slow consumer be allowed to hold?
+
+`TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES` is the important one:
+on HTTP/2 it is advertised verbatim as the receive window, so it decides how
+far ahead of a slow client an origin may run. It is a throughput/memory trade,
+not a safety setting. Too low and a fast origin stalls waiting for credit on
+every long response; too high and each concurrent slow stream is expensive. The
+768 KiB default suits typical WAN round trips; raise it for high
+bandwidth-delay-product origins (a large intra-datacenter transfer), lower it
+when concurrency matters more than per-stream speed.
+
+`…_LOW_WATERMARK_BYTES` sets the hysteresis band. The gap between low and high
+is how much a stream drains before the origin is credited again, so a narrow
+band means frequent small `WINDOW_UPDATE`s and a wide one means the origin
+pauses for longer. Something like a third of high is a reasonable start; the
+default pair (256 KiB / 768 KiB) is that ratio.
+
+`…_PER_STREAM_HARD_LIMIT_BYTES` is a safety net, not a tuning knob. It must
+leave headroom above the high watermark for DATA already in flight when the
+window closes, and it must be at least the HTTP/1 relay buffer
+(`max(proxy_stream_buffer_size, 16 KiB)`) or startup is rejected. Roughly 1.3×
+the high watermark is enough; the defaults use 1 MiB against 768 KiB.
+
+On the request direction this limit does double duty: an upload whose in-flight
+bytes exceed it is a `413`, so it is also the answer to "how many bytes of one
+upload may this proxy hold at once".
+
+### 2. Per-origin: how much should one bad origin be allowed to cost?
+
+`TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` bounds concurrency ×
+per-stream for a single origin, on both protocols. Set it from the concurrency
+you actually want to sustain to that origin:
+
+```
+per_origin ≈ expected concurrent slow requests × per_stream_high_watermark
+```
+
+It must be at least the per-stream hard limit — one request has to fit — and
+that is also the floor at which it admits exactly one request at a time.
+Default `0` means unlimited, which is only appropriate when the global limit is
+doing all the work and no single origin can be trusted less than the others.
+
+The value to watch next to it is
+`tardigrade_upstream_pool_buffered_bytes{upstream,direction}` (HTTP/1) or
+`tardigrade_upstream_h2_pool_buffered_bytes{upstream,direction}` (HTTP/2). Both
+come from the enforcing account, so they are directly comparable with the
+limit. A non-zero
+`…_buffer_limit_exceeded_total{upstream,direction}` on one origin while others
+stay quiet is the signal this limit is designed to produce: that origin is
+absorbing memory and is being contained rather than allowed to spread.
+
+### 3. Global: what is this process's ceiling?
+
+`TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` is the process-wide backstop
+across all origins and both directions. Derive it from the memory you are
+willing to spend on proxy body buffers — not from the sum of the per-origin
+limits, which is deliberately allowed to oversubscribe it. Oversubscribing is
+the point: per-origin containment stops one origin monopolising memory, and the
+global limit stops all of them together exceeding the box.
+
+Compare it with
+`tardigrade_proxy_buffer_aggregate_bytes_current{direction,scope="global"}`,
+**not** with `tardigrade_buffered_bytes_current{scope="global"}`. The latter
+also rolls up the bounded buffered compatibility path, which is capped
+separately by `TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES`, so under mixed
+traffic it reads higher than the quantity actually being checked.
+
+### Reading the metrics together
+
+| Symptom | Series | What it means |
+| --- | --- | --- |
+| Steady `tardigrade_buffer_high_watermark_events_total{scope="stream"}` with pauses and resumes tracking each other | per-stream | Working as designed: consumers are slower than origins and flow control is doing its job. Not a problem unless throughput matters more than memory, in which case raise the high watermark |
+| `tardigrade_buffer_read_pauses_total` running well ahead of `…_resumes_total` | either side | Relays are stalled *right now*, and the count is how many. A persistent gap is a slow peer, not a leak — the counters are balanced on teardown |
+| `tardigrade_buffer_limit_exceeded_total{scope="stream"}` climbing | per-stream hard limit | Uploads are outgrowing their allowed in-flight bound (`413`s). Either clients legitimately send more than the limit allows, or the limit is set below what one request needs |
+| `tardigrade_buffer_limit_exceeded_total{scope="origin"}` climbing | per-origin hard limit | Concurrency to one origin exceeds its budget: `503 proxy_buffer_saturated`. Raise the limit, cap concurrency to that origin, or fix the origin |
+| `tardigrade_buffer_limit_exceeded_total{scope="global"}` climbing | global hard limit | The process is out of room. Check whether one origin dominates the per-origin gauges before raising the global ceiling |
+| `tardigrade_proxy_local_capacity_aborts_total` climbing | post-commitment refusals | HTTP/2 responses truncated after their head was committed. Only reachable on HTTP/2, and always local pressure — deliberately excluded from upstream health and the circuit breaker |
+| A current-byte gauge not returning to zero when traffic stops | any scope | This would be a reservation leak. Every scope returns to zero after success, client abort, cancellation, timeout, upstream failure, and teardown, and that is asserted directly by the tests |
+
+Configured values are exported as
+`tardigrade_buffer_config_limit_bytes{direction,scope,limit}`, so a dashboard
+can plot each gauge against the limit in force without the limits being
+hard-coded into it.
+
+### Benchmarks and regression thresholds
+
+This document covers what the limits do and how to read them. Representative
+memory/latency benchmark scenarios for these paths are owned by #149, and CI
+performance-regression thresholds and artifacts by #150; neither is configured
+here.

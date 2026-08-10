@@ -206,6 +206,16 @@ streaming relay buffers, and HTTP/2 streaming response queues, while
 `tardigrade_buffer_config_limit_bytes{direction,scope,limit}` exposes the
 configured low/high/hard limits operators need to interpret those gauges.
 
+The pool also owns the per-origin buffer account each HTTP/1 relay reserves
+against (#140), keyed exactly as the connection entries are, and reports it as
+`tardigrade_upstream_pool_buffered_bytes{upstream,direction}` with a
+`…_buffer_limit_exceeded_total` counterpart. It is a separate map from the
+connection entries rather than another `HostStats` field: an origin gets a
+buffer account whenever it is proxied to, including when pooling is disabled,
+so the two do not have the same membership. See
+[PROXY_STREAMING.md](PROXY_STREAMING.md) for how to tune the limit enforced
+against it.
+
 The actor gains a streaming request mode next to the fully-buffered
 `request()`:
 
@@ -525,9 +535,12 @@ queue / fail-fast / backpressure:
   early on #141. Envoy's circuit-breaker `max_connections` makes the same
   call. Failing fast keeps workers live and pushes the shed decision to the
   client/retry layer.
-- **Queueing / watermark backpressure (deferred to #140).** Real queueing
-  wants admission control and watermark accounting shared with the downstream
-  side; bolting a condvar wait onto the pool would double-book that design.
+- **Queueing / watermark backpressure (not adopted).** Real queueing wants
+  admission control and watermark accounting shared with the downstream side;
+  bolting a condvar wait onto the pool would double-book that design. #140
+  built that accounting and applied it to proxy body buffers, where the memory
+  actually is; it deliberately left connection slots fail-fast, so this cap
+  still sheds rather than queues.
 
 Enforcement is race-free by construction: `checkout`/`reserveSlot` **reserve**
 the active slot under the pool mutex *before* the caller connects (a failed

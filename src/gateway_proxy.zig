@@ -937,10 +937,17 @@ fn streamViaH2Pool(
                 if (h1_pool) |p| p.recordProtocol(false);
                 const start_ms = http.event_loop.monotonicMs();
                 var wrote_downstream = false;
-                // An ALPN-h1 origin never creates an h2 origin entry, so this
-                // connection clears the process account only (per-origin
-                // accounting for h1 origins is the issue's PR 4).
-                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, read_buf, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, .{ .global = proxy_buffer_global });
+                // An ALPN-h1 origin never creates an h2 origin entry, so its
+                // per-origin account comes from the h1 pool — under the h1 key
+                // (`https:host:port`), which is the same origin identity the
+                // h1 relay would use had h2 never been offered. Keying it under
+                // `h2:…` would split one origin's memory across two limits.
+                const h1_origin_account: ?*proxy_buffer_account.Aggregate = if (h1_pool) |p| blk: {
+                    var h1_key_buf: [300]u8 = undefined;
+                    const h1_key = std.fmt.bufPrint(&h1_key_buf, "{s}:{s}:{d}", .{ scheme, host, port }) catch host;
+                    break :blk p.originBufferAccount(h1_key) catch return error.ProxyBufferCapacityUnavailable;
+                } else null;
+                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, read_buf, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, .{ .origin = h1_origin_account, .global = proxy_buffer_global });
                 if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
                 return res.result;
             },
@@ -2363,19 +2370,32 @@ pub fn executeStreamingHttpProxyRequest(
     // Everything below runs HTTP/1.1 (counted per request, not per attempt).
     if (pool) |p| p.recordProtocol(false);
 
-    // Aggregate capacity for this connection's relay buffers, in both
-    // directions (#140). The HTTP/1 pool has no per-origin buffer account — an
-    // h1 origin's relay memory is bounded per request by the fixed relay
-    // buffers, so the scope that concurrency can actually multiply is the
-    // process; per-origin accounting for h1 origins is the issue's PR 4.
-    const h1_buffer_capacity = proxy_buffer_account.AggregateCapacity{ .global = proxy_buffer_global };
-
     const active_pool: ?*http.upstream_pool.UpstreamPool = if (pool) |p| (if (p.config.enabled) p else null) else null;
     var key_buf: [512]u8 = undefined;
     const key = if (unix_socket_path) |socket_path|
         std.fmt.bufPrint(&key_buf, "unix:{s}", .{socket_path}) catch socket_path
     else
         std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_https) "https" else "http", host, port }) catch host;
+
+    // Aggregate capacity for this connection's relay buffers, in both
+    // directions (#140). A fixed relay buffer bounds one request, but nothing
+    // bounds how many requests an origin has in flight, so the per-origin scope
+    // is what stops one slow origin from multiplying its own relay memory.
+    //
+    // Looked up on `pool` rather than `active_pool`: the account exists to
+    // bound memory, which is just as true when connection pooling is disabled.
+    // A lookup failure means the accounting itself is unavailable (allocation
+    // failure) — precisely when these limits matter most — so it is a
+    // deterministic pre-commit refusal rather than a silently unaccounted
+    // request.
+    const h1_origin_buffer_account: ?*proxy_buffer_account.Aggregate = if (pool) |p|
+        p.originBufferAccount(key) catch return error.ProxyBufferCapacityUnavailable
+    else
+        null;
+    const h1_buffer_capacity = proxy_buffer_account.AggregateCapacity{
+        .origin = h1_origin_buffer_account,
+        .global = proxy_buffer_global,
+    };
 
     // A dead reused connection can only be retried before any response byte
     // reaches the client, and only when the request body is re-sendable (a
@@ -4266,4 +4286,364 @@ test "connectBlockingUnix + exchange round-trips a Unix-socket origin" {
 
     try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     try std.testing.expectEqualStrings("hello", resp.body);
+}
+
+// ---------------------------------------------------------------------------
+// Response-direction per-origin buffer accounting for HTTP/1 origins (#140).
+// ---------------------------------------------------------------------------
+
+/// A downstream client whose socket is already gone. The response reservation
+/// is taken before the head is written, so this fails with the reservation
+/// live — the case that would leak it.
+const FailingDownstreamWriter = struct {
+    pub fn writeAll(_: FailingDownstreamWriter, _: []const u8) !void {
+        return error.BrokenPipe;
+    }
+    pub fn print(_: FailingDownstreamWriter, comptime _: []const u8, _: anytype) !void {
+        return error.BrokenPipe;
+    }
+};
+
+/// One HTTP/1 response relay driven over a socketpair standing in for the
+/// origin. `preload` is written to the origin end before the relay starts; the
+/// test writes the rest (or closes) to control when the relay finishes.
+const Http1ResponseRelay = struct {
+    client_fd: std.posix.fd_t,
+    origin_fd: std.posix.fd_t,
+    read_buf: []u8,
+    captured: std.array_list.Managed(u8),
+    counters: UploadBufferObserver = .{},
+    limits: proxy_buffer_account.Limits,
+    capacity: proxy_buffer_account.AggregateCapacity,
+    read_deadline_ms: u32 = 5000,
+    cancel_token: ?*const CancellationToken = null,
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    err: ?anyerror = null,
+    status: u16 = 0,
+    upstream_aborted: bool = false,
+
+    fn init(
+        read_buf: []u8,
+        limits: proxy_buffer_account.Limits,
+        capacity: proxy_buffer_account.AggregateCapacity,
+    ) !Http1ResponseRelay {
+        const fds = try makeBlockingSocketpair();
+        return .{
+            .client_fd = fds[0],
+            .origin_fd = fds[1],
+            .read_buf = read_buf,
+            .captured = std.array_list.Managed(u8).init(std.testing.allocator),
+            .limits = limits,
+            .capacity = capacity,
+        };
+    }
+
+    fn deinit(self: *Http1ResponseRelay) void {
+        self.captured.deinit();
+        _ = std.c.close(self.client_fd);
+        _ = std.c.close(self.origin_fd);
+    }
+
+    fn originSend(self: *Http1ResponseRelay, bytes: []const u8) void {
+        _ = std.c.write(self.origin_fd, bytes.ptr, bytes.len);
+    }
+
+    fn originClose(self: *Http1ResponseRelay) void {
+        _ = std.c.shutdown(self.origin_fd, std.posix.SHUT.WR);
+    }
+
+    fn run(self: *Http1ResponseRelay, downstream_writer: anytype) void {
+        defer self.finished.store(true, .release);
+        var security = http.security_headers.SecurityHeaders{};
+        var source = FakeUploadSource{ .data = "" };
+        var wrote_downstream = false;
+        const uri = std.Uri.parse("http://origin.test/resource") catch unreachable;
+        const res = streamProxyOverTransport(
+            std.testing.allocator,
+            compat.netStreamFromFd(self.client_fd),
+            self.client_fd,
+            self.read_buf,
+            uri,
+            "GET",
+            &.{},
+            "",
+            null, // no streaming upload: this exercises the response direction
+            &source,
+            downstream_writer,
+            &security,
+            null,
+            null,
+            "origin-buffer-test",
+            0,
+            self.read_deadline_ms,
+            self.cancel_token,
+            &wrote_downstream,
+            self.limits,
+            self.counters.observer(),
+            self.capacity,
+        ) catch |err| {
+            self.err = err;
+            return;
+        };
+        self.status = res.result.status_code;
+        self.upstream_aborted = res.result.upstream_aborted;
+    }
+
+    fn runCapturing(self: *Http1ResponseRelay) void {
+        self.run(CaptureWriter{ .list = &self.captured });
+    }
+
+    /// Every scope this relay touched is back to zero, and so is the local
+    /// accounting the metrics are derived from.
+    fn expectNothingHeld(self: *const Http1ResponseRelay) !void {
+        try std.testing.expectEqual(@as(usize, 0), self.counters.reserved);
+        try std.testing.expectEqual(@as(usize, 0), self.counters.retained);
+        if (self.capacity.origin) |origin| {
+            try std.testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
+        }
+        if (self.capacity.global) |global| {
+            try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+        }
+    }
+};
+
+const h1_response_head = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n";
+
+/// Wait (bounded) for `condition` to hold, so a regression fails the assertion
+/// that follows rather than hanging the suite.
+fn awaitCondition(context: anytype, condition: *const fn (@TypeOf(context)) bool) void {
+    var waited: u32 = 0;
+    while (!condition(context) and waited < 5000) : (waited += 5) sleepMs(5);
+}
+
+fn originHoldsTwoRelayBuffers(account: *proxy_buffer_account.Aggregate) bool {
+    return account.currentBytes(.upstream_to_downstream) >= 2 * 16 * 1024;
+}
+
+fn originHoldsOneRelayBuffer(account: *proxy_buffer_account.Aggregate) bool {
+    return account.currentBytes(.upstream_to_downstream) >= 16 * 1024;
+}
+
+fn relayFinished(relay: *Http1ResponseRelay) bool {
+    return relay.finished.load(.acquire);
+}
+
+test "http1 response relay releases its origin reservation on success" {
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    var read_buf: [16 * 1024]u8 = undefined;
+
+    var relay = try Http1ResponseRelay.init(
+        &read_buf,
+        uploadTestLimits(1024 * 1024),
+        .{ .origin = &origin, .global = &global },
+    );
+    defer relay.deinit();
+
+    relay.originSend(h1_response_head ++ "body");
+    relay.runCapturing();
+
+    try std.testing.expect(relay.err == null);
+    try std.testing.expectEqual(@as(u16, 200), relay.status);
+    // The relay buffer was charged to the origin while it ran, and only that.
+    try std.testing.expectEqual(@as(usize, read_buf.len), relay.counters.peak_reserved);
+    try relay.expectNothingHeld();
+}
+
+test "http1 response relay releases its origin reservation when the upstream aborts mid-body" {
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    var read_buf: [16 * 1024]u8 = undefined;
+
+    var relay = try Http1ResponseRelay.init(
+        &read_buf,
+        uploadTestLimits(1024 * 1024),
+        .{ .origin = &origin, .global = &global },
+    );
+    defer relay.deinit();
+
+    // Promises four body bytes, sends one, then goes away.
+    relay.originSend(h1_response_head ++ "b");
+    relay.originClose();
+    relay.runCapturing();
+
+    try std.testing.expect(relay.err == null);
+    try std.testing.expect(relay.upstream_aborted);
+    try relay.expectNothingHeld();
+}
+
+test "http1 response relay releases its origin reservation on a read timeout" {
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    var read_buf: [16 * 1024]u8 = undefined;
+
+    var relay = try Http1ResponseRelay.init(
+        &read_buf,
+        uploadTestLimits(1024 * 1024),
+        .{ .origin = &origin, .global = &global },
+    );
+    defer relay.deinit();
+    relay.read_deadline_ms = 100;
+
+    // The head arrives, the body never does: the relay is holding its
+    // reservation when the read deadline fires.
+    relay.originSend(h1_response_head);
+    relay.runCapturing();
+
+    try std.testing.expect(relay.err != null);
+    try relay.expectNothingHeld();
+}
+
+test "http1 response relay releases its origin reservation when the request is cancelled" {
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    var read_buf: [16 * 1024]u8 = undefined;
+
+    var relay = try Http1ResponseRelay.init(
+        &read_buf,
+        uploadTestLimits(1024 * 1024),
+        .{ .origin = &origin, .global = &global },
+    );
+    defer relay.deinit();
+
+    var token = CancellationToken.init(0);
+    token.cancel(.client_disconnect);
+    relay.cancel_token = &token;
+
+    relay.originSend(h1_response_head);
+    relay.runCapturing();
+
+    try std.testing.expectEqual(@as(?anyerror, error.RequestCancelled), relay.err);
+    try relay.expectNothingHeld();
+}
+
+test "http1 response relay releases its origin reservation when the client aborts" {
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    var read_buf: [16 * 1024]u8 = undefined;
+
+    var relay = try Http1ResponseRelay.init(
+        &read_buf,
+        uploadTestLimits(1024 * 1024),
+        .{ .origin = &origin, .global = &global },
+    );
+    defer relay.deinit();
+
+    relay.originSend(h1_response_head ++ "body");
+    // The reservation is taken before the head is written downstream, so the
+    // write failing means it is live at the moment the client vanishes.
+    relay.run(FailingDownstreamWriter{});
+
+    try std.testing.expectEqual(@as(?anyerror, error.ClientAborted), relay.err);
+    try relay.expectNothingHeld();
+}
+
+test "concurrent http1 responses to one origin cannot exceed its buffer cap" {
+    const relay_buffer_bytes = 16 * 1024;
+    // Room for exactly two concurrent relay buffers. A third request to the
+    // same origin is what proves concurrency cannot multiply the per-request
+    // bound: nothing about one request alone would ever refuse it.
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 2 * relay_buffer_bytes);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    const limits = uploadTestLimits(1024 * 1024);
+    const capacity = proxy_buffer_account.AggregateCapacity{ .origin = &origin, .global = &global };
+
+    var read_bufs: [3][relay_buffer_bytes]u8 = undefined;
+    var relays: [3]Http1ResponseRelay = undefined;
+    for (&relays, 0..) |*relay, i| {
+        relay.* = try Http1ResponseRelay.init(&read_bufs[i], limits, capacity);
+    }
+    defer for (&relays) |*relay| relay.deinit();
+
+    // Two relays are admitted and then park mid-response, holding their
+    // reservations: each has its head but not its body.
+    var threads: [3]std.Thread = undefined;
+    relays[0].originSend(h1_response_head);
+    threads[0] = try std.Thread.spawn(.{}, Http1ResponseRelay.runCapturing, .{&relays[0]});
+    awaitCondition(&origin, originHoldsOneRelayBuffer);
+    try std.testing.expectEqual(@as(usize, relay_buffer_bytes), origin.currentBytes(.upstream_to_downstream));
+
+    relays[1].originSend(h1_response_head);
+    threads[1] = try std.Thread.spawn(.{}, Http1ResponseRelay.runCapturing, .{&relays[1]});
+    awaitCondition(&origin, originHoldsTwoRelayBuffers);
+    try std.testing.expectEqual(@as(usize, 2 * relay_buffer_bytes), origin.currentBytes(.upstream_to_downstream));
+
+    // The third meets a full origin. It is refused before its response head is
+    // committed downstream, so the request can still become a clean 503.
+    relays[2].originSend(h1_response_head);
+    threads[2] = try std.Thread.spawn(.{}, Http1ResponseRelay.runCapturing, .{&relays[2]});
+    awaitCondition(&relays[2], relayFinished);
+    threads[2].join();
+
+    try std.testing.expectEqual(@as(?anyerror, error.ProxyBufferCapacityUnavailable), relays[2].err);
+    try std.testing.expectEqual(@as(usize, 0), relays[2].captured.items.len);
+    // Refused at the origin scope specifically — the process scope is unlimited
+    // here, so nothing but the per-origin cap could have stopped it.
+    try std.testing.expectEqual(@as(u64, 1), relays[2].counters.aggregate_limit_exceeded);
+    try std.testing.expectEqual(proxy_buffer_account.Scope.origin, relays[2].counters.last_aggregate_scope.?);
+    try std.testing.expectEqual(@as(u64, 1), origin.limitExceededEvents(.upstream_to_downstream));
+    // The cap held: the refusal never let the origin exceed it, and the two
+    // admitted relays kept everything they had reserved.
+    try std.testing.expectEqual(@as(usize, 2 * relay_buffer_bytes), origin.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 2 * relay_buffer_bytes), global.currentBytes(.upstream_to_downstream));
+
+    // Let the parked relays finish; every scope must drain back to zero.
+    for (relays[0..2]) |*relay| relay.originSend("body");
+    threads[0].join();
+    threads[1].join();
+
+    for (relays[0..2]) |*relay| {
+        try std.testing.expect(relay.err == null);
+        try std.testing.expectEqual(@as(u16, 200), relay.status);
+    }
+    for (&relays) |*relay| try relay.expectNothingHeld();
+    try std.testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+
+    // And the origin is usable again: the cap was a bound, not a latch.
+    var reclaim = ProxyBufferReservation.init(.upstream_to_downstream, limits, relays[0].counters.observer(), capacity);
+    try reclaim.reserve(relay_buffer_bytes);
+    reclaim.releaseAll();
+}
+
+test "a cancelled http1 upload releases its origin reservation" {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    var counters = UploadBufferObserver{};
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+
+    var token = CancellationToken.init(0);
+    token.cancel(.timeout);
+
+    var source = FakeUploadSource{ .data = &[_]u8{'u'} ** 4096 };
+    var reservation = try preflightUploadReservation(
+        uploadTestLimits(1024 * 1024),
+        counters.observer(),
+        .{ .origin = &origin, .global = &global },
+        http1_upload_relay_bytes,
+        0,
+    );
+    defer reservation.releaseAll();
+    try std.testing.expectEqual(@as(usize, http1_upload_relay_bytes), origin.currentBytes(.downstream_to_upstream));
+
+    try std.testing.expectError(error.RequestCancelled, relayStreamingUploadToHttp1(
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        .{ .framing = .{ .length = 4096 } },
+        &source,
+        &token,
+        &reservation,
+        counters.observer(),
+    ));
+
+    reservation.releaseAll();
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+    try std.testing.expectEqual(@as(usize, 0), origin.currentBytes(.downstream_to_upstream));
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
 }

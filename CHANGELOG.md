@@ -5,6 +5,39 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- **HTTP/1 origins are bounded per origin, not just per request and per process
+  (#140)** — `TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` now applies
+  to HTTP/1 relay buffers in both directions, closing the last aggregate gap in
+  the proxy buffer accounting model. A fixed relay buffer bounds one request,
+  but nothing bounded how many requests one origin had in flight, so a single
+  slow origin could hold `concurrency × buffer` with every individual request
+  looking perfectly well behaved; only the process-wide limit stood between
+  that and the box. The account is keyed exactly as the connection pool keys
+  origins, and an origin reached over TLS whose ALPN negotiated HTTP/1.1 is now
+  charged under its HTTP/1 key rather than the HTTP/2 pool key it was acquired
+  through — otherwise one origin's memory was split across two limits. An
+  origin gets an account whenever it is proxied to, including when connection
+  pooling is disabled, because the account bounds memory and pooling has no
+  bearing on that.
+
+  An HTTP/1 response can never meet a capacity refusal after commitment: its
+  whole reservation is taken before the response head is written, so a refusal
+  is always a clean pre-commitment `503 proxy_buffer_saturated`, never charged
+  to the origin's health. Per-origin bytes and refusals are exported as
+  `tardigrade_upstream_pool_buffered_bytes{upstream,direction}` and
+  `tardigrade_upstream_pool_buffer_limit_exceeded_total{upstream,direction}`,
+  the HTTP/1 counterparts of the existing h2 pool series and read from the
+  account that does the enforcing, so either is directly comparable with the
+  configured limit. Cardinality stays bounded at two fixed directions per
+  configured origin. A reloaded limit applies immediately, including to origins
+  already holding reservations.
+
+  `docs/PROXY_STREAMING.md` gains practical tuning guidance for the per-stream
+  low/high/hard watermarks and the per-origin and global hard limits, including
+  how to read each metric family against the limit it belongs to and which
+  gauge *not* to compare with the global limit. Benchmark scenarios (#149) and
+  CI regression thresholds (#150) remain owned by those issues.
+
 - **HTTP/2 proxy response buffering is bounded per stream *and* in aggregate
   (#140)** — the streaming receive window an HTTP/2 upstream connection
   advertises is now `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES`
