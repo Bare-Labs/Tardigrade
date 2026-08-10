@@ -436,7 +436,7 @@ fn executeVersionedApiProxyRoute(
                 _ = response.setHeader("Set-Cookie", cookie);
             }
             applyResponseHeaders(state, &response);
-            try response.write(writer);
+            try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
             ctx.setUpstreamResult(resp.upstream_addr, resp.status, resp.body.len);
             state.metricsRecord(resp.status);
             return resp.status;

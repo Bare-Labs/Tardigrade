@@ -209,7 +209,7 @@ pub fn writeTooEarlyResponse(
     setRequestIdHeaders(&response, correlation_id);
     ctx.response_bytes = payload.len;
     applyResponseHeaders(state, &response);
-    try response.write(writer);
+    try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
     state.metricsRecord(@intFromEnum(plan.status));
     state.metricsRecordErrorCode(plan.code);
     return @intFromEnum(plan.status);
@@ -390,7 +390,7 @@ pub fn writeReturnResponsePlan(
             setRequestIdHeaders(&response, correlation_id);
             ctx.response_bytes = payload.len;
             applyResponseHeaders(state, &response);
-            try response.write(writer);
+            try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
             return .{ .status = 405, .error_code = "invalid_request" };
         },
         .redirect => |r| {
@@ -400,7 +400,7 @@ pub fn writeReturnResponsePlan(
             setRequestIdHeaders(&response, correlation_id);
             ctx.response_bytes = 0;
             applyResponseHeaders(state, &response);
-            try response.write(writer);
+            try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
             return .{ .status = r.status };
         },
         .body => |b| {
@@ -413,7 +413,7 @@ pub fn writeReturnResponsePlan(
             setRequestIdHeaders(&response, correlation_id);
             ctx.response_bytes = b.body.len;
             applyResponseHeaders(state, &response);
-            try response.write(writer);
+            try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
             return .{ .status = b.status };
         },
     }
@@ -1004,7 +1004,7 @@ fn handleReloadStatusRoute(
         .setConnection(keep_alive)
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
     applyResponseHeaders(state, &response);
-    try response.write(writer);
+    try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
     return 200;
 }
 
@@ -1044,11 +1044,11 @@ fn handleMetricsRoute(
         _ = response.setContentLength(payload.len);
         ctx.response_bytes = 0;
         applyResponseHeaders(state, &response);
-        try response.writeHead(writer);
+        try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
     } else {
         ctx.response_bytes = payload.len;
         applyResponseHeaders(state, &response);
-        try response.write(writer);
+        try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
     }
     return 200;
 }
@@ -1091,9 +1091,9 @@ fn writeJsonPayload(
         .setHeader(http.correlation.HEADER_NAME, correlation_id);
     applyResponseHeaders(state, &response);
     if (head_only) {
-        try response.writeHead(writer);
+        try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
     } else {
-        try response.write(writer);
+        try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
     }
 }
 
@@ -1206,7 +1206,7 @@ pub fn runMiddlewarePipeline(
             .setHeader("Retry-After", "1")
             .setHeader(http.correlation.HEADER_NAME, correlation_id);
         applyResponseHeaders(state, &response);
-        try response.write(writer);
+        try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
         state.metricsRecord(429);
         state.metricsRecordErrorCode("rate_limited");
         logAccessForRequest(state, ctx, request, 429);

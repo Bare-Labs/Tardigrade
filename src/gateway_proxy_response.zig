@@ -298,7 +298,7 @@ pub fn sendApiError(allocator: std.mem.Allocator, writer: anytype, status: http.
         gph.setRequestIdHeaders(&response, rid);
     }
     applyResponseHeaders(state, &response);
-    try response.write(writer);
+    try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
     state.metricsRecord(@intFromEnum(status));
     state.metricsRecordErrorCode(code);
 }

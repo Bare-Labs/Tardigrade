@@ -111,9 +111,9 @@ pub fn handleStaticLocation(
                     .setHeader(http.correlation.HEADER_NAME, correlation_id);
                 gp.applyResponseHeaders(state, &response);
                 if (request.method == .HEAD) {
-                    try response.writeHead(writer);
+                    try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
                 } else {
-                    try response.write(writer);
+                    try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
                 }
                 state.metricsRecord(302);
                 return 302;
@@ -139,9 +139,9 @@ pub fn handleStaticLocation(
                         .setHeader(http.correlation.HEADER_NAME, correlation_id);
                     gp.applyResponseHeaders(state, &response);
                     if (request.method == .HEAD) {
-                        try response.writeHead(writer);
+                        try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
                     } else {
-                        try response.write(writer);
+                        try response.writeWithMetrics(writer, &state.metrics, &state.metrics_mutex);
                     }
                     state.metricsRecord(302);
                     return 302;
@@ -251,7 +251,7 @@ pub fn writeStaticServedResponse(
     }
 
     gp.applyResponseHeaders(state, &response);
-    try response.writeHead(writer);
+    try response.writeHeadWithMetrics(writer, &state.metrics, &state.metrics_mutex);
 
     if (head_only) {
         if (served.file_path) |file_path| {

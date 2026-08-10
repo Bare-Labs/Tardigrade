@@ -135,6 +135,14 @@ pub const NetStream = struct {
             try self.stream.writeAll(data);
         }
 
+        pub fn writeGatheredAll(self: Writer, data: []const []const u8) WriteError!void {
+            if (self.stream.inner != null) {
+                for (data) |fragment| try self.writeAll(fragment);
+                return;
+            }
+            try writevAllFd(self.stream.handle, data);
+        }
+
         pub fn writeByte(self: Writer, byte: u8) WriteError!void {
             try self.writeAll(&[_]u8{byte});
         }
@@ -183,6 +191,64 @@ pub const NetStream = struct {
         return .{ .stream = self };
     }
 };
+
+fn writevAllFd(fd: std.posix.fd_t, data: []const []const u8) !void {
+    var index: usize = 0;
+    var offset: usize = 0;
+    while (index < data.len) {
+        while (index < data.len and offset == data[index].len) {
+            index += 1;
+            offset = 0;
+        }
+        if (index >= data.len) return;
+
+        var iovecs: [16]std.posix.iovec_const = undefined;
+        var iov_len: usize = 0;
+        var i = index;
+        var first_offset = offset;
+        while (i < data.len and iov_len < iovecs.len) : (i += 1) {
+            if (data[i].len == first_offset) {
+                first_offset = 0;
+                continue;
+            }
+            iovecs[iov_len] = .{
+                .base = data[i].ptr + first_offset,
+                .len = data[i].len - first_offset,
+            };
+            iov_len += 1;
+            first_offset = 0;
+        }
+
+        const written = try writevFd(fd, iovecs[0..iov_len]);
+        if (written == 0) return error.WriteFailed;
+
+        var remaining = written;
+        while (remaining > 0) {
+            const available = data[index].len - offset;
+            if (remaining < available) {
+                offset += remaining;
+                remaining = 0;
+            } else {
+                remaining -= available;
+                index += 1;
+                offset = 0;
+            }
+        }
+    }
+}
+
+fn writevFd(fd: std.posix.fd_t, iovecs: []const std.posix.iovec_const) !usize {
+    while (true) {
+        const rc = std.c.writev(fd, iovecs.ptr, @intCast(iovecs.len));
+        switch (std.c.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .PIPE => return error.BrokenPipe,
+            else => return error.WriteFailed,
+        }
+    }
+}
 
 pub fn netStreamFromFd(fd: std.posix.fd_t) NetStream {
     return .{
