@@ -44,16 +44,35 @@ All notable user-facing changes to Tardigrade are documented here.
   exit including the retry paths. Bodiless responses never touch the buffer and
   are not charged for it, matching HTTP/1.
 
+  An HTTP/2 stream's queue and its relay buffer share **one** per-stream
+  budget rather than getting one each. They are live at the same time, so
+  separate budgets meant a single stream could own `per_stream_hard_limit` of
+  queue *and* a relay buffer on top with neither budget reporting an
+  exceedance — the per-stream hard limit was not, in fact, a limit on what one
+  stream owns. The queue keeps its own separate accounting of its logical
+  length, since that is what drives the watermarks and `WINDOW_UPDATE`
+  hysteresis.
+
+  **Configuration change:** `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES`
+  must now be at least
+  `per_stream_high_watermark + max(proxy_stream_buffer_size, 16 KiB)`, and
+  startup and reload reject a policy that is not. Without the headroom, an
+  origin doing exactly what the advertised window invites would push the stream
+  past its own hard limit and have its response truncated; a startup error is
+  better than that surprise. The shipped defaults satisfy it with room to spare
+  (768 KiB + 16 KiB ≤ 1 MiB), so a default deployment is unaffected, but a
+  hand-tuned policy with `high` close to `hard` will need the gap widened.
+
   Reloading an aggregate hard limit is now linearizable against reservations,
   which makes the documented "applies immediately" guarantee exact. Previously
   `Aggregate.reserve` read the limit once before its compare-and-swap loop, so
   a reservation could read the old larger limit, be overtaken by a reload
   storing a smaller one, and still commit under a policy that no longer
-  existed — and several concurrent reservers could do it at once, leaving a
-  scope above the limit the reload had just promised to enforce. The limit is
-  now re-read on every attempt and the commit is revalidated against the limit
-  in force, rolling back if a shrink beat it there. The fast path stays
-  lock-free.
+  existed. A reload now waits for in-flight reservation attempts to finish and
+  holds new ones at a gate before publishing, so each attempt's policy is
+  stable across its own check-and-commit. Reservations still do not exclude one
+  another — only a reload excludes them — and reloads happen on config reload,
+  not per request.
 
   `docs/PROXY_STREAMING.md` gains practical tuning guidance for the per-stream
   low/high/hard watermarks and the per-origin and global hard limits, including

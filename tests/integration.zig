@@ -12421,9 +12421,12 @@ test "concurrent http1 uploads to one origin are bounded by the per-origin buffe
     , .{ test_host, upstream.port() });
     defer allocator.free(config_text);
 
-    // The relay buffer floors at 16 KiB, so a per-origin cap of exactly that
-    // admits one upload to this origin at a time. Nothing about a single
-    // request would ever refuse the second — only the aggregate can.
+    // The upload relay buffer floors at 16 KiB, so a per-origin cap just over
+    // that admits one upload to this origin at a time and refuses a second.
+    // Nothing about a single request would ever refuse it — only the aggregate
+    // can. The per-stream hard limit has to leave room for a full window plus
+    // a relay buffer (2048 + 16384), and the per-origin floor is that hard
+    // limit, which is why both are 18432 rather than a bare 16384.
     var tardigrade = try TardigradeProcess.start(allocator, .{
         .config_text = config_text,
         .extra_env = &.{
@@ -12432,8 +12435,8 @@ test "concurrent http1 uploads to one origin are bounded by the per-origin buffe
             .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
             .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_LOW_WATERMARK_BYTES", .value = "1024" },
             .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES", .value = "2048" },
-            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES", .value = "16384" },
-            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES", .value = "16384" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES", .value = "18432" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES", .value = "18432" },
             .{ .name = "TARDIGRADE_MAX_BODY_SIZE", .value = "1048576" },
         },
     });

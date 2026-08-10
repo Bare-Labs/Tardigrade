@@ -968,7 +968,32 @@ fn streamViaH2Pool(
                     h2_pool.release(conn);
                     return error.ProxyBufferCapacityUnavailable;
                 };
+                // One budget for everything this stream owns at once, per
+                // direction (#140). On the response side the queue's retained
+                // storage and the relay buffer the consumer copies into are
+                // both live at the same time — the queue's reservation is not
+                // released until after the downstream write — so giving each
+                // its own per-stream limit let a single stream own two hard
+                // limits' worth while neither reported an exceedance. The
+                // queue's per-stream `Account` still tracks its logical length
+                // on its own, because that is what drives the watermarks and
+                // the `WINDOW_UPDATE` hysteresis.
+                //
+                // Block-scoped, and safe as such: every path out of this block
+                // calls `finishStreaming` first, which removes the stream from
+                // the connection's map under its state lock and destroys it, so
+                // no reader can reach this budget afterwards. A retry starts a
+                // fresh one, as it should — it is a fresh stream.
+                //
+                // The per-stream policy is connection-pinned, so this needs no
+                // reload mutation: the stream is judged by the policy its
+                // connection advertised.
+                var stream_hard_budget = proxy_buffer_account.Aggregate.init(
+                    .stream,
+                    proxy_buffer_limits.per_stream_hard_limit,
+                );
                 const proxy_buffer_capacity = proxy_buffer_account.AggregateCapacity{
+                    .stream = &stream_hard_budget,
                     .origin = origin_buffer_account,
                     .global = proxy_buffer_global,
                 };
@@ -4943,4 +4968,113 @@ test "an http2 response relay buffer is charged to the aggregate scopes while it
     try std.testing.expectEqual(@as(usize, 0), counters.retained);
     // The body really did reach the client, so this measured a working relay.
     try std.testing.expect(std.mem.find(u8, captured.items, "hi") != null);
+}
+
+test "an http2 stream cannot own more than its per-stream hard limit across queue and relay" {
+    // The queue and the relay buffer are live at the same time, so each having
+    // its own per-stream budget let one stream own two hard limits' worth with
+    // neither budget reporting an exceedance. They now share one.
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    var origin_server = H2GatedBodyOrigin{ .listen_fd = listener.fd };
+    const origin_thread = try std.Thread.spawn(.{}, h2GatedBodyServe, .{&origin_server});
+
+    var read_buf: [16 * 1024]u8 = undefined;
+    // A policy sized exactly the way config validation now requires: the hard
+    // limit covers one full window plus one relay buffer, and no more. That
+    // makes the shared budget's ceiling observable — anything above
+    // `high + relay` would have to come from double-budgeting.
+    const high = 16 * 1024;
+    const limits = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = high / 2,
+        .per_stream_high_watermark = high,
+        .per_stream_hard_limit = high + read_buf.len,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    // Generous aggregates: this test is about the per-stream budget, so
+    // nothing else may be what refuses.
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+
+    var counters = UploadBufferObserver{};
+    var captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer captured.deinit();
+    var security = http.security_headers.SecurityHeaders{};
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/download", .{listener.port}));
+
+    var pool = http.upstream_h2.H2ConnPool.init(std.testing.allocator, .{ .proxy_buffer_limits = limits });
+    var ctx = H2GatedExchangeCtx{
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf = &read_buf,
+        .captured = &captured,
+        .security = &security,
+        .limits = limits,
+        .observer = counters.observer(),
+        .global = &global,
+    };
+    const exchange = try std.Thread.spawn(.{}, runH2GatedExchangeThread, .{&ctx});
+
+    var waited: u32 = 0;
+    while (!ctx.blocked.load(.acquire) and waited < 10_000) : (waited += 5) sleepMs(5);
+    try std.testing.expect(ctx.blocked.load(.acquire));
+
+    // Parked mid-relay with both copies owned. The process gauge sees the
+    // relay buffer and the queue's retained storage together, and that total
+    // must be inside the one per-stream hard limit rather than inside two.
+    const owned = global.currentBytes(.upstream_to_downstream);
+    try std.testing.expect(owned >= read_buf.len); // the relay buffer is in there
+    try std.testing.expect(owned <= limits.per_stream_hard_limit);
+
+    ctx.release.store(true, .release);
+    origin_server.release_end.store(true, .release);
+    exchange.join();
+    try std.testing.expect(!ctx.failed);
+    try std.testing.expectEqual(@as(u16, 200), ctx.status);
+
+    pool.deinit();
+    origin_thread.join();
+
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+}
+
+test "an http2 stream budget refuses the relay buffer before the response is committed" {
+    // The other side of the shared budget: when the stream's own limit has no
+    // room for the relay buffer, the refusal has to land *before* the response
+    // head is written, so the request can still become a clean 503 rather than
+    // a committed status that gets truncated.
+    const limits = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 4 * 1024,
+        .per_stream_high_watermark = 8 * 1024,
+        .per_stream_hard_limit = 24 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    var counters = UploadBufferObserver{};
+    var stream_budget = proxy_buffer_account.Aggregate.init(.stream, limits.per_stream_hard_limit);
+    const capacity = proxy_buffer_account.AggregateCapacity{ .stream = &stream_budget };
+
+    // Stand in for a queue that has already taken most of the stream's budget.
+    try stream_budget.reserve(.upstream_to_downstream, 16 * 1024);
+
+    var relay = ProxyBufferReservation.init(.upstream_to_downstream, limits, counters.observer(), capacity);
+    try std.testing.expectError(
+        error.ProxyBufferCapacityUnavailable,
+        relay.reserve(16 * 1024),
+    );
+    // Refused at the stream scope specifically — no aggregate above it is even
+    // configured here, so nothing else could have refused it.
+    try std.testing.expectEqual(@as(u64, 1), counters.aggregate_limit_exceeded);
+    try std.testing.expectEqual(proxy_buffer_account.Scope.stream, counters.last_aggregate_scope.?);
+    // The refusal rolled back cleanly; the queue's claim is untouched.
+    try std.testing.expectEqual(@as(usize, 16 * 1024), stream_budget.currentBytes(.upstream_to_downstream));
+
+    stream_budget.release(.upstream_to_downstream, 16 * 1024);
+    try std.testing.expectEqual(@as(usize, 0), stream_budget.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
 }

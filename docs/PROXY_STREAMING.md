@@ -191,6 +191,26 @@ before the response head is committed downstream — a refusal is therefore a
 clean `503` — and released on every exit. A bodiless response never touches the
 buffer and is not charged for it.
 
+The two share **one** per-stream budget rather than getting one each. That is
+the point of the shared budget: with separate budgets a single stream could own
+`per_stream_hard_limit` of queue *and* a relay buffer on top, and neither
+budget would report an exceedance, so the per-stream hard limit would not
+actually be a limit on what one stream owns. The queue keeps its own separate
+accounting of its *logical* length, because that — not total ownership — is
+what the high/low watermarks and the `WINDOW_UPDATE` hysteresis run on.
+
+For that budget to be satisfiable, the hard limit has to have room for both at
+once, so configuration requires:
+
+```
+per_stream_hard_limit >= per_stream_high_watermark + max(proxy_stream_buffer_size, 16 KiB)
+```
+
+Without it, an origin doing exactly what the advertised window invites — filling
+it to the high watermark — would push the stream past its own hard limit and
+have its response truncated. Startup and reload reject such a policy instead.
+The shipped defaults satisfy it with room to spare (768 KiB + 16 KiB ≤ 1 MiB).
+
 Both limits default to `0`, which means unlimited. Reservations are taken
 *before* any memory is committed, and they track each queue's **retained
 allocation** rather
@@ -398,11 +418,19 @@ band means frequent small `WINDOW_UPDATE`s and a wide one means the origin
 pauses for longer. Something like a third of high is a reasonable start; the
 default pair (256 KiB / 768 KiB) is that ratio.
 
-`…_PER_STREAM_HARD_LIMIT_BYTES` is a safety net, not a tuning knob. It must
-leave headroom above the high watermark for DATA already in flight when the
-window closes, and it must be at least the HTTP/1 relay buffer
-(`max(proxy_stream_buffer_size, 16 KiB)`) or startup is rejected. Roughly 1.3×
-the high watermark is enough; the defaults use 1 MiB against 768 KiB.
+`…_PER_STREAM_HARD_LIMIT_BYTES` is a safety net, not a tuning knob. It bounds
+everything one stream owns at once, so it must cover a full window *plus* the
+relay buffer the response is copied into:
+
+```
+per_stream_hard_limit >= per_stream_high_watermark + max(proxy_stream_buffer_size, 16 KiB)
+```
+
+Startup and reload reject anything less, because an origin filling the window
+it was advertised would otherwise push the stream past its own limit and have
+its response truncated. Beyond that floor, leave headroom for DATA already in
+flight when the window closes — roughly 1.3× the high watermark is enough; the
+defaults use 1 MiB against 768 KiB.
 
 On the request direction this limit does double duty: an upload whose in-flight
 bytes exceed it is a `413`, so it is also the answer to "how many bytes of one

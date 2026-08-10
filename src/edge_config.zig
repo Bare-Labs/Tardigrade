@@ -3193,6 +3193,18 @@ fn validateProxyStreamBufferSize(size: usize) !void {
 fn validateProxyBufferLimitsCoverRelayAllocations(limits: http.proxy_buffer_account.Limits, proxy_stream_buffer_size: usize) !void {
     const effective_relay_bytes = @max(proxy_stream_buffer_size, 16 * 1024);
     if (limits.per_stream_hard_limit < effective_relay_bytes) return error.InvalidConfigValue;
+    // The per-stream hard limit bounds everything one stream owns at once, and
+    // on an HTTP/2 response that is the queue *plus* the relay buffer the
+    // consumer copies into: the queue's reservation is not released until after
+    // the downstream write, so a slow client leaves both live. A policy that
+    // fills its window to the high watermark therefore needs the relay buffer
+    // to fit on top, or a compliant origin doing exactly what the advertised
+    // window invites would push the stream over its own hard limit and get its
+    // response truncated. Rejecting that here turns a surprise into a startup
+    // error. The shipped defaults (768 KiB high + 16 KiB relay <= 1 MiB hard)
+    // satisfy it.
+    const stream_peak = std.math.add(usize, limits.per_stream_high_watermark, effective_relay_bytes) catch return error.InvalidConfigValue;
+    if (limits.per_stream_hard_limit < stream_peak) return error.InvalidConfigValue;
 }
 
 /// Emit log warnings for configurations that are valid but operationally risky.
@@ -4302,6 +4314,37 @@ test "proxy buffer limits validate low high hard ordering" {
         .per_origin_hard_limit = 512 * 1024,
         .global_hard_limit = 0,
     }).validate());
+}
+
+test "per-stream hard limit must cover a full window plus its relay buffer" {
+    const relay_bytes = 16 * 1024;
+    // A stream can own its queue and the relay buffer at the same time, so a
+    // hard limit that only covers the window is not enough: a compliant origin
+    // filling the window it was advertised would push the stream over its own
+    // limit and have its response truncated.
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyBufferLimitsCoverRelayAllocations(.{
+        .per_stream_low_watermark = 32 * 1024,
+        .per_stream_high_watermark = 64 * 1024,
+        .per_stream_hard_limit = 64 * 1024, // high == hard: no room for the relay buffer
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    }, 4096));
+
+    // Exactly enough room is enough.
+    try validateProxyBufferLimitsCoverRelayAllocations(.{
+        .per_stream_low_watermark = 32 * 1024,
+        .per_stream_high_watermark = 64 * 1024,
+        .per_stream_hard_limit = 64 * 1024 + relay_bytes,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    }, 4096);
+
+    // The shipped defaults satisfy it, so this tightening costs a default
+    // deployment nothing.
+    try validateProxyBufferLimitsCoverRelayAllocations(
+        http.proxy_buffer_account.Limits.defaults(),
+        16 * 1024,
+    );
 }
 
 test "default proxy buffer limits produce the advertised HTTP/2 stream window" {
