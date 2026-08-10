@@ -3236,7 +3236,11 @@ test "origin capacity bounds concurrent streams and refuses only the overflowing
         .proxy_buffer_observer = observer.observer(),
         .proxy_buffer_capacity = capacity,
     });
-    const refused = try conn.requestStreaming(.{
+    // `openStreaming` rather than `requestStreaming` so the handle is owned on
+    // every path: the refusal can surface from the head wait as well as from
+    // the body read, and the error path of `requestStreaming` would have
+    // finished the stream itself, leaving nothing to assert against.
+    const refused = try conn.openStreaming(.{
         .method = "GET",
         .authority = "aggregate-origin.test",
         .path = "/",
@@ -3246,9 +3250,21 @@ test "origin capacity bounds concurrent streams and refuses only the overflowing
     });
 
     // The second stream is refused; the first is untouched and still usable.
+    //
+    // Wait for the reader to actually refuse before asserting. Otherwise the
+    // test races it: the refusal legitimately surfaces from the head wait when
+    // the reader gets there first and from the body read when it does not, and
+    // an earlier revision that assumed the body-read ordering crashed on CI.
     var buf: [128]u8 = undefined;
-    try testing.expectError(error.BufferLimitExceeded, conn.readStreamingBody(refused, buf[0..]));
+    var spins: usize = 0;
+    while (conn.abortCause(refused) != .local_capacity and spins < 100_000_000) : (spins += 1) {
+        std.Thread.yield() catch {};
+    }
     try testing.expectEqual(AbortCause.local_capacity, conn.abortCause(refused));
+    // Every way the worker could learn about it reports the same thing, and
+    // reports it as still pre-commitment.
+    try testing.expectError(error.BufferLimitExceeded, conn.waitStreamingResponseHead(refused));
+    try testing.expectError(error.BufferLimitExceeded, conn.readStreamingBody(refused, buf[0..]));
     // The refusal landed before any head relay, so claiming the commitment
     // boundary must fail — this is what turns the race into a pre-commit 503
     // instead of a committed origin status followed by a truncation.
