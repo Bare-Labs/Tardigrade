@@ -68,7 +68,7 @@ check "virtual-hosts" \
 
 check "health-checks" \
     examples/health-checks/tardigrade.conf \
-    "TARDIGRADE_UPSTREAM_BASE_URL=http://127.0.0.1:8080"
+    "TARDIGRADE_UPSTREAM_BASE_URLS=http://127.0.0.1:3001,http://127.0.0.1:3002"
 
 check "rate-limiting" \
     examples/rate-limiting/tardigrade.conf \
