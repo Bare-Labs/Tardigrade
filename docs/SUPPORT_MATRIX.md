@@ -95,6 +95,9 @@ or `internal` surfaces in one place. Example docs must call that out clearly and
 must not imply that non-`stable` features are part of the Core v1 support
 promise.
 
+For copy/paste-runnable configuration files covering common stable and
+experimental deployments, see the [examples directory](../examples/README.md).
+
 ## Maintenance Rule
 
 When public behavior changes:

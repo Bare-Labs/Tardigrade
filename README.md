@@ -185,6 +185,10 @@ or connecting to upstreams. When no path is supplied, it validates
 `./tardigrade.toml`; pass the path explicitly when using the nginx-style
 `tardigrade.conf` examples.
 
+For copy/paste-runnable examples of common deployments (static file serving,
+reverse proxy, TLS termination, rate limiting, and more), see the
+[examples/](examples/README.md) directory.
+
 ## Overview
 
 Tardigrade's stable Core v1 identity is intentionally focused: a host-native
@@ -221,6 +225,7 @@ operate without guessing which config file or pid file is active.
 | Release checklist | [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) |
 | Packaging | [packaging/README.md](packaging/README.md) |
 | Benchmarks | [benchmarks/README.md](benchmarks/README.md) |
+| Examples | [examples/README.md](examples/README.md) |
 | BearClaw example | [examples/bearclaw/README.md](examples/bearclaw/README.md) |
 | Security policy | [SECURITY.md](SECURITY.md) |
 | Contributing | [CONTRIBUTING.md](CONTRIBUTING.md) |
