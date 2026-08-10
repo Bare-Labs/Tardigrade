@@ -90,10 +90,19 @@ detail in [`docs/CONCURRENCY.md`](CONCURRENCY.md):
   handles roles 2 and 3 above. Accepted fds from every shard still enter
   the same bounded worker pool.
 - Accepted connections are dispatched to a bounded `WorkerPool`
-  (`src/http/worker_pool.zig`) of OS threads. Each worker owns one
-  connection's full synchronous lifecycle — TLS handshake, HTTP parse,
-  proxy/serve, response write — using **blocking** socket calls
-  (`read`/`write`/`poll`/`SO_RCVTIMEO`/`SO_SNDTIMEO`). `worker_pool.zig`
+  (`src/http/worker_pool.zig`) of OS threads, but "one worker owns the whole
+  connection lifecycle uninterrupted" is only accurate for the legacy
+  OpenSSL/plaintext path — there a worker does own one connection's full
+  synchronous lifecycle (TLS handshake, HTTP parse, proxy/serve, response
+  write) using **blocking** socket calls
+  (`read`/`write`/`poll`/`SO_RCVTIMEO`/`SO_SNDTIMEO`) with no handoff back to
+  `EventLoop` until an idle keepalive gap. For the native-TLS path, a worker
+  instead owns *active request/handshake processing*: a connection can yield
+  out of `native_handshake` (or the idle gap after a response) back to
+  `EventLoop`/`ActiveRegistry` and be re-dispatched to a different worker
+  later, so no single worker owns that connection's end-to-end lifecycle —
+  only each checked-out slice of it, which is itself still blocking work.
+  `worker_pool.zig`
   documents why this is deliberate: `std.Io.Group` (Zig 0.16) and the removed
   `std.Thread.Pool` both assume non-blocking, async-style work items, and
   Tardigrade needs direct control over thread count, work-stealing, CPU
@@ -126,10 +135,37 @@ exactly the surface `src/http/event_loop.zig` already exposes:
 - block for a bounded time and return ready events (`wait`)
 - report a stable backend identifier for logs/metrics (`backendName`)
 
+This is a **readiness-poller** abstraction, not an operation/completion
+abstraction: it has no submission-token model, no way to submit an
+accept/read/write/timeout operation, and no way to return an operation
+result (an accepted fd, a byte count). That shape is a deliberate choice for
+Phase 0, not an oversight — see the explicit call-out at the end of this
+section.
+
 Any alternative backend considered below is evaluated against whether it can
 sit behind this same four-operation boundary without forcing a rewrite of the
 blocking, thread-per-request handler code that currently owns TLS, HTTP
 framing, and proxy streaming.
+
+**This constrains what a future `io_uring` backend may be, and this doc picks
+the narrower of the two honest options:** a future `io_uring` backend
+targeting this boundary is a **readiness-only poller replacement** —
+`IORING_OP_POLL_ADD`/`IORING_OP_POLL_REMOVE` (plus a ring-native timeout for
+`wait`'s bounded-block behavior) standing in for `epoll_wait`/`kqueue`, with
+`accept()` and all request I/O staying exactly where they are today: outside
+the ring, as blocking calls on worker threads. It is **not** a wider
+operation/completion abstraction using `IORING_OP_ACCEPT`, registered
+buffers/files, or multishot variants — adopting those would require
+widening this boundary to typed submissions/completions (e.g. `submitAccept`,
+`submitRead`, `submitWrite`, `submitTimer`, `cancel`, `waitCompletions` with
+opaque tokens) and defining how `epoll`/`kqueue` implement or adapt that
+wider contract, which is a materially larger design than Phase 0 scopes and
+is explicitly out of scope here. A later doc revision would need to make
+that adoption case explicitly, including why the readiness-only version was
+insufficient. Under the readiness-only choice, the sharded per-shard accept
+`poll()` loops (`gateway_accept.zig`) are **not** exercised by this boundary
+at all unless a separate future change first migrates them onto the shared
+`EventLoop` — they stay on `std.posix.poll()` either way.
 
 ## Alternatives compared
 
@@ -245,11 +281,16 @@ framing, and proxy streaming.
   scheduling, not the request hot path itself: per-request reads/writes stay
   synchronous blocking calls on worker threads (including within the
   native-TLS path's own `WaitingEncryptedHttpConnection.waitFor`, which polls
-  locally rather than through the shared loop). Useful `io_uring`
-  features (e.g. `IORING_OP_ACCEPT`, fixed buffers, registered fds) require
-  reasonably recent kernels (5.5+ minimum, several features need 5.11+ or
-  5.19+), which is a real portability constraint the current epoll fallback
-  does not have.
+  locally rather than through the shared loop). Per the "Backend abstraction
+  boundary" section above, a backend targeting this boundary is
+  **readiness-only** (`IORING_OP_POLL_ADD`/`IORING_OP_POLL_REMOVE` plus a
+  ring-native timeout) — it does not use `IORING_OP_ACCEPT`, registered
+  buffers/files, or multishot variants, since those require widening the
+  boundary to an operation/completion abstraction, which is explicitly out
+  of scope for Phase 0. The readiness-only operation set is available from
+  the original `io_uring` interface (Linux 5.1); see "Failure modes and
+  fallback policy" below for how kernel-requirement documentation should be
+  structured if a wider abstraction is ever proposed instead.
 - **macOS support:** None — `io_uring` is Linux-only, so this would always
   need to stay behind a compile-time/feature-flag gate with `epoll`/`kqueue`
   as the portable default, exactly as #148 already proposes.
@@ -380,14 +421,22 @@ no prototype exists yet:
   runtime conditions (log, drain, exit), consistent with how the current
   `EventLoop.wait()` error path already just logs and continues rather than
   trying to self-heal by rebuilding the poller.
-- **Kernel/toolchain requirements, if pursued:** modern `io_uring` opcodes
-  useful here (`IORING_OP_ACCEPT`, fixed buffers/files, multishot variants)
-  need meaningfully newer kernels than the epoll baseline requires — commonly
-  cited minimums range from 5.5 (basic ring support) through 5.11/5.19 for
-  specific opcodes/features relevant to a listener-readiness use case. A
-  prototype must pin and document the exact minimum kernel version it
-  targets and probe for it explicitly rather than assuming availability from
-  a compile-time Linux check.
+- **Kernel/toolchain requirements, if pursued:** separate the **ring
+  baseline** from the **prototype's exact operation set**, rather than citing
+  one number for "basic support." `io_uring` itself — the
+  `io_uring_setup`/`io_uring_enter`/`io_uring_register` syscalls, and with
+  them `IORING_OP_POLL_ADD`/`IORING_OP_POLL_REMOVE` (the readiness-only
+  operation set this doc scopes a prototype to, per "Backend abstraction
+  boundary" above) — landed in Linux **5.1**. Individual capabilities this
+  doc explicitly excludes from a readiness-only prototype have their own,
+  later floors if a future wider abstraction ever adopts them:
+  `IORING_OP_ACCEPT` (5.5), multishot poll (5.13), and multishot accept
+  (5.19, per upstream `liburing` docs) are commonly cited examples, not an
+  exhaustive list. A prototype must pin and document the exact minimum
+  kernel version it targets **for the specific opcodes/features it actually
+  uses**, and probe for those capabilities explicitly at startup rather than
+  assuming availability from a compile-time Linux check or from the 5.1 ring
+  baseline alone.
 
 This policy applies to whichever `EventLoop` role(s) a future prototype
 targets (unsharded accept, parked keepalive, and/or native-TLS active
