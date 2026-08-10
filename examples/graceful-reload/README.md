@@ -4,7 +4,7 @@ Hot-reloads configuration without dropping in-flight requests and drains connect
 
 ## What it demonstrates
 
-- Hot reload via `tardi reload` (SIGUSR1): new requests use the updated config immediately; existing in-flight requests finish on the old config.
+- Hot reload via `tardi reload` (SIGHUP): new requests use the updated config immediately; existing in-flight requests finish on the old config.
 - Graceful shutdown via `tardi stop`: waits up to `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` for in-flight requests to complete before closing connections.
 - PID file for signal-based process management with init systems.
 
@@ -25,10 +25,10 @@ TARDIGRADE_PID_FILE=/tmp/tardigrade.pid \
 curl http://localhost:8080/health
 
 # Edit this config file, then hot-reload — no downtime
-./zig-out/bin/tardi reload
+./zig-out/bin/tardi reload -c examples/graceful-reload/tardigrade.conf
 
 # Graceful stop — waits for in-flight requests to finish
-./zig-out/bin/tardi stop
+./zig-out/bin/tardi stop -c examples/graceful-reload/tardigrade.conf
 ```
 
 ## Key environment variables
@@ -44,9 +44,9 @@ See `tardigrade.env.example` for the full list with comments.
 
 | Action | Command | Behavior |
 |--------|---------|---------|
-| Hot reload | `tardi reload` | Applies config changes; in-flight requests finish on the old config. Zero downtime. |
-| Graceful stop | `tardi stop` | Stops accepting new connections; drains in-flight requests up to the drain timeout. |
-| Status check | `tardi status` | Prints the current process state (config path, uptime, worker count). |
+| Hot reload | `tardi reload -c <config>` | Applies config changes; in-flight requests finish on the old config. Zero downtime. |
+| Graceful stop | `tardi stop -c <config>` | Stops accepting new connections; drains in-flight requests up to the drain timeout. |
+| Status check | `tardi status -c <config>` | Prints the current process state (config path, uptime, worker count). |
 
 ## systemd integration
 
@@ -55,6 +55,6 @@ The included drain timeout works with `TimeoutStopSec=` in a systemd unit file. 
 ```ini
 [Service]
 TimeoutStopSec=35
-ExecStop=/usr/local/bin/tardi stop
+ExecStop=/usr/local/bin/tardi stop -c /etc/tardigrade/tardigrade.conf
 Environment=TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS=30000
 ```

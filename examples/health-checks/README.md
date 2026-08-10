@@ -21,7 +21,7 @@ python3 -m http.server 3002 &
 zig build
 TARDIGRADE_CONFIG_PATH=examples/health-checks/tardigrade.conf \
 TARDIGRADE_UPSTREAM_BASE_URLS=http://127.0.0.1:3001,http://127.0.0.1:3002 \
-TARDIGRADE_UPSTREAM_PROBE_PATH=/health \
+TARDIGRADE_UPSTREAM_PROBE_PATH=/ \
 TARDIGRADE_UPSTREAM_PROBE_INTERVAL_MS=5000 \
 ./zig-out/bin/tardi
 

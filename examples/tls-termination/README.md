@@ -4,7 +4,7 @@ Terminates HTTPS at the edge and forwards plain HTTP to an upstream application.
 
 ## What it demonstrates
 
-- HTTPS listener on port 443 using `listen 443 ssl;`.
+- HTTPS listener on port 8443 using `listen 8443 ssl;`.
 - TLS certificate and private key configured in the conf file.
 - Forwarding decrypted traffic to an upstream over plain HTTP.
 - Edge-side `/health` liveness probe (no upstream hop).
@@ -39,15 +39,15 @@ TARDIGRADE_CONFIG_PATH=examples/tls-termination/tardigrade.conf \
 Smoke-test:
 
 ```bash
-curl -k https://localhost/health   # → 200 ok
-curl -k https://localhost/         # → proxied upstream response
+curl -k https://localhost:8443/health   # → 200 ok
+curl -k https://localhost:8443/         # → proxied upstream response
 ```
 
 ## Key directives
 
 | Directive | Purpose |
 |-----------|---------|
-| `listen 443 ssl;` | Bind on port 443 with TLS enabled. |
+| `listen 8443 ssl;` | Bind on unprivileged port 8443 with TLS enabled. |
 | `tls_cert_path <path>;` | Path to the PEM certificate chain (leaf + intermediates). |
 | `tls_key_path <path>;` | Path to the PEM private key. |
 
@@ -64,6 +64,6 @@ See `tardigrade.env.example` for the full set of tunable knobs.
 
 ## Notes
 
-- For a production HTTPS deployment, obtain a certificate from a public CA (e.g. Let's Encrypt) and replace the self-signed cert.
+- For a production HTTPS deployment, obtain a certificate from a public CA (e.g. Let's Encrypt), replace the self-signed cert, and switch the listener to port 443 or set `TARDIGRADE_LISTEN_PORT=443`.
 - TLS 1.0 and 1.1 are not supported. The minimum accepted version is 1.2.
 - For multiple virtual hosts with per-host certificates, see [examples/virtual-hosts](../virtual-hosts/README.md).

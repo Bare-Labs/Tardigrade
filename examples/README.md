@@ -3,7 +3,9 @@
 Curated, copy/paste-runnable configs for common Tardigrade deployments.
 Each example includes a short explanation, the minimal setup required to run it locally, and a reference to the environment variables it uses.
 
-Prefer fewer high-quality examples over many incomplete snippets — if something is not represented here, check the [configuration reference](../docs/SUPPORT_MATRIX.md) or open an issue.
+Prefer fewer high-quality examples over many incomplete snippets. If something
+is not represented here, check the [configuration overview](../README.md#overview)
+and [Core v1 support matrix](../docs/SUPPORT_MATRIX.md), or open an issue.
 
 ## Index
 
@@ -44,7 +46,7 @@ values for your environment:
 cp examples/tls-termination/tardigrade.env.example /tmp/my.env
 # Edit /tmp/my.env ...
 set -a && source /tmp/my.env && set +a
-./zig-out/bin/tardi
+TARDIGRADE_CONFIG_PATH=examples/tls-termination/tardigrade.conf ./zig-out/bin/tardi
 ```
 
 ## CI validation

@@ -4,7 +4,7 @@ A complete edge deployment combining TLS, security headers, rate limiting, struc
 
 ## What it demonstrates
 
-- HTTPS on port 443 with TLS 1.2+ enforcement.
+- HTTPS on unprivileged port 8443 for local testing, with TLS 1.2+ enforcement.
 - HSTS (`Strict-Transport-Security`) and standard security response headers.
 - Rate limiting at 100 rps per client with a burst allowance of 30.
 - JSON access logs buffered for throughput.
@@ -28,10 +28,12 @@ Start a backend:
 python3 -m http.server 8080 &
 ```
 
-Run Tardigrade:
+Run Tardigrade with the baseline environment values:
 
 ```bash
 zig build
+cp examples/production-baseline/tardigrade.env.example /tmp/tardigrade-production.env
+set -a && source /tmp/tardigrade-production.env && set +a
 TARDIGRADE_TLS_CERT_PATH=/tmp/server.crt \
 TARDIGRADE_TLS_KEY_PATH=/tmp/server.key \
 TARDIGRADE_UPSTREAM_BASE_URL=http://127.0.0.1:8080 \
@@ -42,13 +44,14 @@ TARDIGRADE_CONFIG_PATH=examples/production-baseline/tardigrade.conf \
 Smoke-test:
 
 ```bash
-curl -k https://localhost/health          # → 200 ok
-curl -k https://localhost/status/metrics  # → Prometheus text
+curl -k https://localhost:8443/health          # → 200 ok
+curl -k https://localhost:8443/status/metrics  # → Prometheus text
 ```
 
 ## Pre-production checklist
 
 - [ ] Replace `/etc/tardigrade/tls/fullchain.pem` and `privkey.pem` with a real certificate from a public CA.
+- [ ] Change `listen 8443 ssl;` or `TARDIGRADE_LISTEN_PORT=8443` to `443` once the service has permission to bind privileged ports.
 - [ ] Set `TARDIGRADE_HSTS_ENABLED=true` after confirming TLS works.
 - [ ] Set `TARDIGRADE_RATE_LIMIT_RPS` and `TARDIGRADE_RATE_LIMIT_BURST` to match your traffic profile.
 - [ ] Restrict `/status/metrics` with a firewall rule or `TARDIGRADE_METRICS_REQUIRE_AUTH=true`.
