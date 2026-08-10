@@ -296,6 +296,43 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # ── Example config validation ─────────────────────────────────────────────────
+  # Checks that all configs in the examples/ directory parse successfully.
+  # Ensures that parser changes do not silently break the curated examples.
+  examples:
+    name: Validate example configs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: sudo apt-get install -y libssl-dev
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-examples-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-examples-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-examples-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build Tardigrade
+        run: zig build
+
+      - name: Validate example configs
+        run: ./scripts/validate-examples.sh
+
   # ── Build validation ──────────────────────────────────────────────────────────
   # Validates Debug, ReleaseSafe, and ReleaseFast builds across platforms.
   # Debug catches assertion failures; ReleaseSafe catches safety-check panics;
