@@ -1,4 +1,17 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Test-only seam fired inside `Aggregate.reserve` while the reservation is
+/// admitted and in flight — after the policy has been read and before the
+/// commit. It exists so a test can hold that window open deterministically and
+/// observe that a concurrent reload cannot publish across it; production builds
+/// never contain the branch. Set it and restore it with `defer` inside a single
+/// test.
+///
+/// A hook must not call `setHardLimit` on the same aggregate: the reload waits
+/// for in-flight attempts to finish, and this hook *is* one, so that would
+/// deadlock on a single thread. Drive the reload from another thread.
+pub var reserve_race_hook: ?*const fn () void = null;
 
 pub const Direction = enum {
     downstream_to_upstream,
@@ -233,6 +246,12 @@ pub const Aggregate = struct {
         std.atomic.Value(u64).init(0),
         std.atomic.Value(u64).init(0),
     },
+    /// A reload is publishing a new limit; reservations are held at the gate.
+    reloading: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Reservation attempts admitted and not yet finished. A reload waits for
+    /// this to reach zero before publishing, which is what keeps each attempt's
+    /// policy stable across its own check-and-commit.
+    inflight_reservers: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     pub fn init(scope: Scope, hard_limit: usize) Aggregate {
         return .{
@@ -242,18 +261,77 @@ pub const Aggregate = struct {
     }
 
     /// Apply a reloaded limit. Bytes already reserved above the new limit stay
-    /// reserved; the next reservation is refused until the scope drains.
+    /// reserved; every reservation admitted after this returns is judged by the
+    /// new limit.
+    ///
+    /// The new limit is published only once no reservation attempt is in
+    /// flight, and attempts arriving meanwhile are held at the gate in
+    /// `reserve`. That is what makes each reservation's policy stable across
+    /// its own check-and-commit — see `reserve` for why publishing first and
+    /// correcting afterwards cannot work.
+    ///
+    /// Concurrent reloads are serialised by the flag itself, so two callers
+    /// cannot interleave and let reservations through between one's wait and
+    /// the other's store.
     pub fn setHardLimit(self: *Aggregate, hard_limit: usize) void {
-        self.hard_limit.store(hard_limit, .monotonic);
+        while (self.reloading.cmpxchgWeak(false, true, .acq_rel, .acquire) != null) {
+            std.Thread.yield() catch {};
+        }
+        // Attempts admitted under the previous policy finish first; new ones
+        // are already blocked. Each in-flight attempt is a short CAS loop that
+        // waits on nothing, so this cannot stall behind a blocked reserver.
+        while (self.inflight_reservers.load(.acquire) != 0) std.Thread.yield() catch {};
+        self.hard_limit.store(hard_limit, .release);
+        self.reloading.store(false, .release);
     }
 
     pub fn hardLimit(self: *const Aggregate) usize {
-        return self.hard_limit.load(.monotonic);
+        return self.hard_limit.load(.acquire);
     }
 
+    /// Reserve `bytes`, or fail without retaining any.
+    ///
+    /// A reservation is admitted through a gate that a reload closes, so the
+    /// limit cannot change between this attempt's check and its commit. That
+    /// gate is the whole mechanism, and it replaces an earlier attempt to
+    /// commit first and correct afterwards, which was not linearizable for two
+    /// reasons:
+    ///
+    ///   - A post-commit re-read of the limit tells you the limit *now*, not
+    ///     whether the reload was ordered before or after your commit. The
+    ///     "reload then commit" case (which must fail) and the "commit then
+    ///     reload" case (which must stand, as the already-reserved case) are
+    ///     indistinguishable from there, so it rolled back both.
+    ///   - Worse, the rollback is visible too late. A tentative commit is
+    ///     published to every other reserver before this one decides whether it
+    ///     succeeded, so a second reservation could be refused for bytes that
+    ///     were about to be taken back — a refusal with no sequential history
+    ///     that explains it, surfacing as a spurious `503` during a reload.
+    ///
+    /// Holding the gate means neither can happen: no reservation is ever
+    /// published unless it was admissible under the policy in force for its
+    /// whole attempt, and nothing is ever rolled back.
+    ///
+    /// Reservations do not exclude each other — only a reload excludes them —
+    /// so the contended path is still the compare-and-swap loop, plus one
+    /// increment and decrement of the in-flight counter. Reloads are rare by
+    /// construction: they happen on config reload, not per request.
     pub fn reserve(self: *Aggregate, direction: Direction, bytes: usize) error{BufferLimitExceeded}!void {
+        self.enterReservation();
+        defer _ = self.inflight_reservers.fetchSub(1, .acq_rel);
+
+        // Stable for this whole attempt: a reload cannot publish while this
+        // reservation is counted in flight.
+        const limit = self.hard_limit.load(.acquire);
+
+        // Test seam: the window a reload must not be able to cross. Compiled
+        // out entirely off the test path, since `builtin.is_test` is
+        // comptime-known.
+        if (comptime builtin.is_test) {
+            if (reserve_race_hook) |hook| hook();
+        }
+
         const slot = &self.current[@intFromEnum(direction)];
-        const limit = self.hard_limit.load(.monotonic);
         var current = slot.load(.monotonic);
         while (true) {
             const next = std.math.add(usize, current, bytes) catch {
@@ -264,11 +342,24 @@ pub const Aggregate = struct {
                 self.noteLimitExceeded(direction);
                 return error.BufferLimitExceeded;
             }
-            if (slot.cmpxchgWeak(current, next, .monotonic, .monotonic)) |actual| {
+            if (slot.cmpxchgWeak(current, next, .acq_rel, .acquire)) |actual| {
                 current = actual;
                 continue;
             }
             return;
+        }
+    }
+
+    /// Register as in flight, waiting out a reload that is publishing. The
+    /// re-check after the increment closes the obvious race: a reload that set
+    /// the flag between this thread's check and its increment would otherwise
+    /// see a zero count and publish underneath it.
+    fn enterReservation(self: *Aggregate) void {
+        while (true) {
+            while (self.reloading.load(.acquire)) std.Thread.yield() catch {};
+            _ = self.inflight_reservers.fetchAdd(1, .acq_rel);
+            if (!self.reloading.load(.acquire)) return;
+            _ = self.inflight_reservers.fetchSub(1, .acq_rel);
         }
     }
 
@@ -295,6 +386,18 @@ pub const Aggregate = struct {
 /// The aggregate scopes one stream's queued bytes must clear. Either member may
 /// be null (a path with no origin identity, or a test harness), which makes
 /// that scope unlimited and unaccounted.
+/// The aggregate scopes one stream's owned bytes must clear. Either member may
+/// be null (a path with no origin identity, or a test harness), which makes
+/// that scope unlimited and unaccounted.
+///
+/// There is deliberately no per-stream scope here. A stream's queue and the
+/// relay buffer that copies out of it are live at the same time and must share
+/// one per-stream bound, but sharing an `Aggregate` between them would need an
+/// object outliving both a worker's relay reservation and a stream the reader
+/// thread can still be inside — and `finishStreaming` destroys streams outside
+/// the connection's state lock. That bound is enforced instead by holding the
+/// relay's size back from the queue's own hard limit
+/// (`Request.proxy_relay_reserved_bytes`), which needs no shared lifetime.
 pub const AggregateCapacity = struct {
     origin: ?*Aggregate = null,
     global: ?*Aggregate = null,
@@ -470,6 +573,215 @@ test "aggregate enforces a hard limit and releases back to zero" {
 
     aggregate.release(.upstream_to_downstream, 24);
     aggregate.release(.downstream_to_upstream, 32);
+    try std.testing.expectEqual(@as(usize, 0), aggregate.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), aggregate.currentBytes(.downstream_to_upstream));
+}
+
+/// Holds a reservation attempt open from inside the gate, so a test can prove
+/// a concurrent reload cannot publish across it.
+const HeldAttempt = struct {
+    var entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var armed: bool = false;
+
+    fn hook() void {
+        if (!armed) return;
+        armed = false; // one attempt only; later reservations run normally
+        entered.store(true, .release);
+        while (!release.load(.acquire)) std.Thread.yield() catch {};
+    }
+
+    fn arm() void {
+        entered.store(false, .release);
+        release.store(false, .release);
+        armed = true;
+        reserve_race_hook = hook;
+    }
+
+    fn disarm() void {
+        reserve_race_hook = null;
+        armed = false;
+    }
+};
+
+const ShrinkCtx = struct {
+    aggregate: *Aggregate,
+    limit: usize,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn shrinkLimitThread(ctx: *ShrinkCtx) void {
+    ctx.aggregate.setHardLimit(ctx.limit);
+    ctx.done.store(true, .release);
+}
+
+fn reserveOnThread(aggregate: *Aggregate, bytes: usize, out: *?anyerror) void {
+    aggregate.reserve(.upstream_to_downstream, bytes) catch |err| {
+        out.* = err;
+    };
+}
+
+test "a reload cannot publish while a reservation attempt is in flight" {
+    // The window the previous design tried to correct after the fact. Here it
+    // simply cannot open: the reservation is admitted, the reload is asked for
+    // while that attempt is still in flight, and the new limit must not become
+    // visible until the attempt has committed under the old one.
+    var aggregate = Aggregate.init(.origin, 100);
+
+    HeldAttempt.arm();
+    defer HeldAttempt.disarm();
+
+    var reserve_err: ?anyerror = null;
+    const reserver = try std.Thread.spawn(.{}, reserveOnThread, .{ &aggregate, @as(usize, 80), &reserve_err });
+    while (!HeldAttempt.entered.load(.acquire)) std.Thread.yield() catch {};
+
+    var shrink = ShrinkCtx{ .aggregate = &aggregate, .limit = 50 };
+    const reloader = try std.Thread.spawn(.{}, shrinkLimitThread, .{&shrink});
+
+    // The reload is blocked behind the in-flight attempt, so the policy that
+    // attempt was admitted under is still the one in force.
+    var spins: usize = 0;
+    while (spins < 10_000) : (spins += 1) {
+        try std.testing.expectEqual(@as(usize, 100), aggregate.hardLimit());
+        try std.testing.expect(!shrink.done.load(.acquire));
+        std.Thread.yield() catch {};
+    }
+
+    HeldAttempt.release.store(true, .release);
+    reserver.join();
+    reloader.join();
+
+    // The reservation committed under the limit it read, and was never rolled
+    // back: its bytes are the documented "already reserved above the new
+    // limit" case.
+    try std.testing.expectEqual(@as(?anyerror, null), reserve_err);
+    try std.testing.expectEqual(@as(usize, 80), aggregate.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 50), aggregate.hardLimit());
+    aggregate.release(.upstream_to_downstream, 80);
+}
+
+test "a refused reservation never strands a smaller one that fits" {
+    // The bad history the published-then-rolled-back design allowed: an
+    // 80-byte reservation is refused under a 50-byte limit, and a 10-byte one
+    // that plainly fits is refused too, because the 80 bytes were briefly
+    // visible to it. Every outcome here has to be explainable by some order of
+    // completed reservations.
+    var aggregate = Aggregate.init(.origin, 100);
+    aggregate.setHardLimit(50);
+
+    try std.testing.expectError(
+        error.BufferLimitExceeded,
+        aggregate.reserve(.upstream_to_downstream, 80),
+    );
+    // Nothing tentative was ever published, so the scope is untouched...
+    try std.testing.expectEqual(@as(usize, 0), aggregate.currentBytes(.upstream_to_downstream));
+    // ...and the smaller reservation is admitted, as a 50-byte limit says it
+    // must be.
+    try aggregate.reserve(.upstream_to_downstream, 10);
+    try std.testing.expectEqual(@as(usize, 10), aggregate.currentBytes(.upstream_to_downstream));
+    aggregate.release(.upstream_to_downstream, 10);
+}
+
+test "a reload that lands after the commit leaves the reservation alone" {
+    // The mirror case, and the reason revalidation cannot simply refuse
+    // whenever the limit changed: bytes committed *before* the shrink are the
+    // documented "already reserved above the new limit" case and must stay.
+    var aggregate = Aggregate.init(.origin, 1024);
+    try aggregate.reserve(.upstream_to_downstream, 1024);
+    aggregate.setHardLimit(256);
+
+    try std.testing.expectEqual(@as(usize, 1024), aggregate.currentBytes(.upstream_to_downstream));
+    try std.testing.expectError(
+        error.BufferLimitExceeded,
+        aggregate.reserve(.upstream_to_downstream, 1),
+    );
+    aggregate.release(.upstream_to_downstream, 1024);
+}
+
+const reload_race_threads = 8;
+
+const ReloadRaceCtx = struct {
+    aggregate: *Aggregate,
+    bytes: usize,
+    /// One completed reserve-then-release attempt per slot, published so the
+    /// reload side can tell when a thread can no longer be holding bytes it
+    /// was admitted for under the previous policy.
+    cycles: [reload_race_threads]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** reload_race_threads,
+    admissions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    refusals: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    start: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn reloadRaceReserver(ctx: *ReloadRaceCtx, slot: usize) void {
+    while (!ctx.start.load(.acquire)) std.Thread.yield() catch {};
+    while (!ctx.stop.load(.acquire)) {
+        if (ctx.aggregate.reserve(.upstream_to_downstream, ctx.bytes)) |_| {
+            _ = ctx.admissions.fetchAdd(1, .monotonic);
+            std.Thread.yield() catch {};
+            ctx.aggregate.release(.upstream_to_downstream, ctx.bytes);
+        } else |_| {
+            _ = ctx.refusals.fetchAdd(1, .monotonic);
+        }
+        // Published only after this thread is holding nothing.
+        _ = ctx.cycles[slot].fetchAdd(1, .release);
+        std.Thread.yield() catch {};
+    }
+}
+
+test "concurrent reservations settle under a limit reloaded beneath them" {
+    // The stress counterpart to the deterministic test above: real threads
+    // hammering the CAS loop and the rollback path while the limit is shrunk
+    // under them.
+    //
+    // The assertion has to be one an outside observer can actually make.
+    // Sampling the scope right after a reload proves nothing, because bytes
+    // admitted *before* it legitimately stay reserved for as long as their
+    // holder keeps them. So this waits until every thread has completed a full
+    // reserve/release cycle after the shrink — at which point nothing admitted
+    // under the old policy can still be outstanding — and only then requires
+    // the scope to be within the new limit. The ordering guarantee itself is
+    // pinned deterministically by the commit-window test above; what this adds
+    // is that the protocol holds up under contention without leaking,
+    // double-releasing, or livelocking.
+    const bytes = 64;
+    const high = reload_race_threads * bytes;
+    const low = bytes * 2;
+    var aggregate = Aggregate.init(.origin, high);
+    var ctx = ReloadRaceCtx{ .aggregate = &aggregate, .bytes = bytes };
+
+    var threads: [reload_race_threads]std.Thread = undefined;
+    for (&threads, 0..) |*thread, slot| {
+        thread.* = try std.Thread.spawn(.{}, reloadRaceReserver, .{ &ctx, slot });
+    }
+    ctx.start.store(true, .release);
+
+    var round: usize = 0;
+    while (round < 25) : (round += 1) {
+        aggregate.setHardLimit(low);
+
+        // Wait for every thread to cycle twice: one cycle may have been in
+        // flight across the store, the second is wholly under the new limit.
+        var baseline: [reload_race_threads]u64 = undefined;
+        for (&baseline, 0..) |*value, slot| value.* = ctx.cycles[slot].load(.acquire);
+        for (baseline, 0..) |value, slot| {
+            while (ctx.cycles[slot].load(.acquire) < value + 2) std.Thread.yield() catch {};
+        }
+
+        // Everything outstanding now was admitted under `low`.
+        try std.testing.expect(aggregate.currentBytes(.upstream_to_downstream) <= low);
+
+        aggregate.setHardLimit(high);
+        std.Thread.yield() catch {};
+    }
+    ctx.stop.store(true, .release);
+    for (threads) |thread| thread.join();
+
+    // The run has to have actually exercised both outcomes, or it proves
+    // nothing: refusals mean the shrunk limit really did bite.
+    try std.testing.expect(ctx.admissions.load(.monotonic) > 0);
+    try std.testing.expect(ctx.refusals.load(.monotonic) > 0);
+    // Nothing leaked and nothing was released twice.
     try std.testing.expectEqual(@as(usize, 0), aggregate.currentBytes(.upstream_to_downstream));
     try std.testing.expectEqual(@as(usize, 0), aggregate.currentBytes(.downstream_to_upstream));
 }
