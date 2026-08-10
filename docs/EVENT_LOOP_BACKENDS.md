@@ -19,7 +19,7 @@ buffering/backpressure, and upstream connection economics," and states it
 "should be tackled after #137, #138, #139, #140, and #141 provide stronger
 baseline wins."
 
-## Dependency status (checked 2026-08-10)
+## Dependency status (checked 2026-08-10, updated after #600 merged)
 
 | Issue | Title | Status |
 |---|---|---|
@@ -27,14 +27,16 @@ baseline wins."
 | #137 | Per-core listener sharding (`SO_REUSEPORT`) | Closed |
 | #138 | Park idle keepalive connections outside workers | Closed |
 | #139 | Streaming reverse proxy with bounded buffering | Closed |
-| #140 | Watermark-based backpressure for proxy/connection buffers | **Open** — PR #600 (HTTP/1 relay buffer bounding) in flight |
+| #140 | Watermark-based backpressure for proxy/connection buffers | Closed — PR #600 (per-origin HTTP/1 relay buffer bounding, merged after #595/#599/#418) |
 | #141 | Upstream connection pooling redesign | Closed |
 
-Four of the five prerequisite baseline-wins issues are closed; #140 is not.
-Per #148's own stated ordering, this is not yet the point at which a
-prototype or migration should start. This doc proceeds only as far as the
-design/comparison work, and defers the prototype/benchmark decision until
-#140 lands (see "Recommendation" below).
+All five prerequisite baseline-wins issues named in #148's own stated
+ordering ("should be tackled after #137, #138, #139, #140, and #141 provide
+stronger baseline wins") are now closed. That clears the *ordering*
+precondition — it does not by itself supply the profiling evidence #148's
+acceptance criteria still require before a prototype is justified (see
+"Recommendation" below); it removes the one concrete reason this doc
+previously gave for not starting that evidence-gathering yet.
 
 ## Current architecture and poller assumptions
 
@@ -196,8 +198,9 @@ at all unless a separate future change first migrates them onto the shared
   fd readiness; it never touches TLS record state or drives handshake/record
   processing itself.
 - **Proxy streaming / backpressure:** Already integrated with #139's
-  streaming relay and #140's (in-progress) watermark work, which are both
-  built on synchronous blocking reads/writes, not on event-loop readiness
+  streaming relay and #140's (now closed) watermark/buffer-accounting work,
+  which are both built on synchronous blocking reads/writes, not on
+  event-loop readiness
   callbacks.
 - **Timers, cancellation, keepalive parking, graceful drain:** Already
   implemented (`keepalive_park.zig` idle reaper on the maintenance tick,
@@ -346,13 +349,28 @@ at all unless a separate future change first migrates them onto the shared
 
 - **No backend change.** Keep the existing `epoll`/`kqueue` `EventLoop` as
   the only backend, exactly as `docs/CONCURRENCY.md` already directs.
-- **No `io_uring`, `libxev`, or `std.Io` proactor prototype in this PR or in
-  the immediate next one.** #148's own dependency ordering says this issue
-  should follow stronger baseline wins from #137–#141, and #140
-  (watermark-based backpressure) is still open with PR #600 in flight. Since
-  #140's design directly shapes how proxy buffers would interact with any
-  future async I/O model, starting an `io_uring` prototype before it lands
-  risks throwaway work.
+- **Ordering precondition cleared; evidence precondition is not.** #140
+  (watermark-based backpressure) merged via PR #600, closing out the last of
+  #148's named prerequisites (#137, #138, #139, #140, #141 are all now
+  closed). That removes the *specific* reason this doc previously gave for
+  not starting `io_uring` work yet — the risk of throwaway design work while
+  #140's buffer-accounting model was still moving. It does **not** supply
+  the separate thing #148's acceptance criteria actually require before a
+  prototype is justified: profiling evidence, gathered against the
+  `benchmarks/` harness (#136) on real hardware, showing the shared
+  `EventLoop`'s readiness/idle-wait role is a measurable bottleneck (see
+  "Long-term" below for the exact bar). Nothing in #600's scope changes that
+  bar or supplies that evidence — #600 bounds HTTP/1 relay memory per
+  origin, which is orthogonal to whether the accept/park/native-TLS
+  readiness loop is a bottleneck.
+- **Still no `io_uring`, `libxev`, or `std.Io` proactor prototype in this
+  PR.** With the ordering precondition cleared, the next concrete step is
+  gathering that profiling evidence (or determining it's not worth
+  gathering yet against other roadmap priorities) — not writing prototype
+  code speculatively. This sandboxed session also has no Zig toolchain and
+  no representative benchmarking hardware, so it could not produce that
+  evidence even if it attempted to; see "Long-term" for what a prototype
+  attempt needs before it starts.
 - **Small independent follow-up (optional, not gated on the rest of this
   doc):** attach a `backend` label to the existing
   `tardigrade_event_loop_iterations_total` counter (the backend name is
@@ -367,9 +385,10 @@ at all unless a separate future change first migrates them onto the shared
 ### Long-term
 
 - **`io_uring` is a "later, and only if measured" candidate, not a "now" or
-  "never."** The condition for revisiting it: #140 lands, and a profiling
-  pass (`perf record -g` per `CONCURRENCY.md`'s "How to measure" section)
-  against the `benchmarks/` harness (#136) shows the shared `EventLoop`'s
+  "never."** With #140 now closed, the remaining condition for revisiting it
+  is a profiling pass (`perf record -g` per `CONCURRENCY.md`'s "How to
+  measure" section) against the `benchmarks/` harness (#136) that shows the
+  shared `EventLoop`'s
   readiness/idle-wait role (unsharded accept, parked keepalive, and/or
   native-TLS active-connection scheduling — see "Current architecture"
   above) — not worker-thread blocking I/O — is a measurable bottleneck under
@@ -480,10 +499,14 @@ or prototype effort), not to a design-only doc.
 
 - Depends on / informed by: #136 (closed, benchmark harness exists), #137
   (closed, listener sharding), #138 (closed, keepalive parking), #139
-  (closed, streaming proxy), #141 (closed, upstream pooling).
-- Blocked on: #140 (open) for the buffer-accounting model any future async
-  I/O design would need to interact with.
+  (closed, streaming proxy), #140 (closed, watermark/buffer-accounting
+  model), #141 (closed, upstream pooling). All five of #148's named
+  prerequisites are now closed.
+- Not blocked on any other open issue. The remaining precondition is
+  profiling evidence, not another issue's completion — see "Recommendation"
+  above.
 - No follow-up implementation issues are opened by this doc, per #148's own
   acceptance criterion that "focused follow-up implementation issues are
   created only if a migration or additional backend is approved" — this doc
-  approves neither.
+  approves neither. #148 itself stays open to track the still-missing
+  profiling/benchmark evidence and the eventual prototype decision.
