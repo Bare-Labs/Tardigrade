@@ -1,0 +1,16 @@
+Running 10s test @ http://127.0.0.1:19169/health
+  4 threads and 30 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.33ms    7.89ms 112.44ms   98.10%
+    Req/Sec     8.90k     3.42k   12.17k    83.21%
+  Latency Distribution
+     50%  319.00us
+     75%  358.00us
+     90%  435.00us
+     99%   47.10ms
+  244612 requests in 10.10s, 134.60MB read
+  Socket errors: connect 28, read 0, write 0, timeout 0
+Requests/sec:  24214.97
+Transfer/sec:     13.32MB
+
+WRK_SUMMARY {"rps":24214.97,"p50_ms":0.319,"p95_ms":0.631,"p99_ms":47.097,"p999_ms":98.385,"errors":28,"throughput_mbps":13.32}

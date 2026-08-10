@@ -1,0 +1,87 @@
+Using tool: wrk
+Tardigrade benchmark — target: http://127.0.0.1:19169  tool: wrk
+Duration: 10s  Connections: 30  Threads: 4
+Paths: static=/health proxy=/proxy/health keepalive=/health proxy64k=/proxy/payload-64k.bin proxy256k=/proxy/payload-256k.bin proxy1m=/proxy/payload-1m.bin proxy16m=/proxy/payload-16m.bin h2=/health h3=/health
+Process sampling: CPU/RSS every 500ms
+
+==> static-http1: static file serving over HTTP/1.1 (/health)
+  static-http1 — 127052.34 req/s  p50=0.185ms  p95=0.376ms  p99=1.555ms  p999=9.377ms  errors=12817  throughput=70.52MB/s  cpu=0.00%  rss_peak=1.84MiB
+==> proxy-http1: reverse proxy route over HTTP/1.1 (/proxy/health)
+  proxy-http1 — 68326.69 req/s  p50=0.355ms  p95=15.583ms  p99=78.129ms  p999=165.559ms  errors=690718  throughput=45.29MB/s  cpu=0.00%  rss_peak=0.94MiB
+==> keepalive: keep-alive connection reuse (/health)
+  keepalive — 125069.18 req/s  p50=0.201ms  p95=0.353ms  p99=0.822ms  p999=50.756ms  errors=12621  throughput=69.42MB/s  cpu=0.00%  rss_peak=0.94MiB
+
+Results saved to: benchmarks/results/2026-08-10/accept-batching-local-fallback-final/batch-1-run.json
+
+{
+  "static-http1": {
+    "rps": 127052.34,
+    "p50_ms": 0.185,
+    "p95_ms": 0.376,
+    "p99_ms": 1.555,
+    "p999_ms": 9.377,
+    "errors": 12817,
+    "throughput_mbps": 70.52,
+    "cpu_pct_avg": 0.00,
+    "rss_mb_peak": 1.84,
+    "open_fds_peak": 6
+  },
+  "proxy-http1": {
+    "rps": 68326.69,
+    "p50_ms": 0.355,
+    "p95_ms": 15.583,
+    "p99_ms": 78.129,
+    "p999_ms": 165.559,
+    "errors": 690718,
+    "throughput_mbps": 45.29,
+    "cpu_pct_avg": 0.00,
+    "rss_mb_peak": 0.94,
+    "open_fds_peak": 6
+  },
+  "keepalive": {
+    "rps": 125069.18,
+    "p50_ms": 0.201,
+    "p95_ms": 0.353,
+    "p99_ms": 0.822,
+    "p999_ms": 50.756,
+    "errors": 12621,
+    "throughput_mbps": 69.42,
+    "cpu_pct_avg": 0.00,
+    "rss_mb_peak": 0.94,
+    "open_fds_peak": 6
+  },
+  "_meta": {
+    "tag": "v0.5.0-186-ga30f6e06",
+    "timestamp": "2026-08-10T22:01:03Z",
+    "host": "127.0.0.1",
+    "port": "19169",
+    "tool": "wrk",
+    "duration_s": 10,
+    "connections": 30,
+    "runs": 1,
+    "host_header": "",
+    "driver": "listener-accept-batch-1",
+    "worker_count": null,
+    "config_label": "listener/accept batch-1 (1 shards, batch 1, fairness 0)",
+    "process_metrics": {
+      "enabled": true,
+      "pid_source": "pid",
+      "pid_tree": false,
+      "sample_interval_ms": 500
+    },
+    "zig_version": "0.16.0",
+    "environment": {
+      "os": "Darwin",
+      "kernel": "25.3.0",
+      "arch": "arm64",
+      "cpu_model": "Apple M4",
+      "cpu_threads": "10",
+      "memory_mb": "16384"
+    },
+    "static_path": "/health",
+    "proxy_path": "/proxy/health",
+    "keepalive_path": "/health",
+    "h2_path": "/health",
+    "h3_path": "/health"
+  }
+}
