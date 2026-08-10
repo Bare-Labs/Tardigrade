@@ -215,14 +215,12 @@ pub const ReadStall = struct {
 /// Which aggregate scope refused a reservation. Distinct errors so the caller
 /// can label the metric without a second lookup.
 pub const AggregateError = error{
-    StreamBufferLimitExceeded,
     OriginBufferLimitExceeded,
     GlobalBufferLimitExceeded,
 };
 
 pub fn aggregateFailureScope(err: AggregateError) Scope {
     return switch (err) {
-        error.StreamBufferLimitExceeded => .stream,
         error.OriginBufferLimitExceeded => .origin,
         error.GlobalBufferLimitExceeded => .global,
     };
@@ -388,39 +386,32 @@ pub const Aggregate = struct {
 /// The aggregate scopes one stream's queued bytes must clear. Either member may
 /// be null (a path with no origin identity, or a test harness), which makes
 /// that scope unlimited and unaccounted.
+/// The aggregate scopes one stream's owned bytes must clear. Either member may
+/// be null (a path with no origin identity, or a test harness), which makes
+/// that scope unlimited and unaccounted.
+///
+/// There is deliberately no per-stream scope here. A stream's queue and the
+/// relay buffer that copies out of it are live at the same time and must share
+/// one per-stream bound, but sharing an `Aggregate` between them would need an
+/// object outliving both a worker's relay reservation and a stream the reader
+/// thread can still be inside — and `finishStreaming` destroys streams outside
+/// the connection's state lock. That bound is enforced instead by holding the
+/// relay's size back from the queue's own hard limit
+/// (`Request.proxy_relay_reserved_bytes`), which needs no shared lifetime.
 pub const AggregateCapacity = struct {
-    /// The total a *single* stream owns in one direction, shared by every
-    /// buffer holding that stream's bytes at the same time. On an HTTP/2
-    /// response that is the queue's retained storage and the relay buffer the
-    /// consumer copies into, which genuinely coexist: the queue's reservation
-    /// is not released until after the downstream write, so a slow client
-    /// leaves both live. Giving each its own per-stream budget let one stream
-    /// own two hard limits' worth while neither budget reported an exceedance.
-    ///
-    /// The per-stream `Account` still tracks the queue's *logical* length
-    /// separately, because that — not total ownership — is what the high/low
-    /// watermarks and the `WINDOW_UPDATE` hysteresis run on.
-    stream: ?*Aggregate = null,
     origin: ?*Aggregate = null,
     global: ?*Aggregate = null,
 
-    /// Reserve at every configured scope, or nothing at all: a refusal at any
-    /// scope rolls back the scopes already taken, so none is left holding bytes
-    /// the stream never retained.
+    /// Reserve at every configured scope, or nothing at all: a refusal at the
+    /// origin scope rolls the global reservation back, so no scope is left
+    /// holding bytes the stream never retained.
     pub fn reserve(self: AggregateCapacity, direction: Direction, bytes: usize) AggregateError!void {
-        if (self.stream) |s| {
-            s.reserve(direction, bytes) catch return error.StreamBufferLimitExceeded;
-        }
         if (self.global) |g| {
-            g.reserve(direction, bytes) catch {
-                if (self.stream) |s| s.release(direction, bytes);
-                return error.GlobalBufferLimitExceeded;
-            };
+            g.reserve(direction, bytes) catch return error.GlobalBufferLimitExceeded;
         }
         if (self.origin) |o| {
             o.reserve(direction, bytes) catch {
                 if (self.global) |g| g.release(direction, bytes);
-                if (self.stream) |s| s.release(direction, bytes);
                 return error.OriginBufferLimitExceeded;
             };
         }
@@ -429,7 +420,6 @@ pub const AggregateCapacity = struct {
     pub fn release(self: AggregateCapacity, direction: Direction, bytes: usize) void {
         if (self.origin) |o| o.release(direction, bytes);
         if (self.global) |g| g.release(direction, bytes);
-        if (self.stream) |s| s.release(direction, bytes);
     }
 };
 

@@ -191,13 +191,26 @@ before the response head is committed downstream — a refusal is therefore a
 clean `503` — and released on every exit. A bodiless response never touches the
 buffer and is not charged for it.
 
-The two share **one** per-stream budget rather than getting one each. That is
-the point of the shared budget: with separate budgets a single stream could own
-`per_stream_hard_limit` of queue *and* a relay buffer on top, and neither
-budget would report an exceedance, so the per-stream hard limit would not
-actually be a limit on what one stream owns. The queue keeps its own separate
-accounting of its *logical* length, because that — not total ownership — is
-what the high/low watermarks and the `WINDOW_UPDATE` hysteresis run on.
+The two are bounded **together** by the per-stream hard limit, not separately.
+With a limit each, a single stream could own `per_stream_hard_limit` of queue
+*and* a relay buffer on top while neither reported an exceedance — so the
+per-stream hard limit would not actually limit what one stream owns. That is
+enforced by holding the relay's size back from the queue's own hard limit when
+the stream is opened, so the two sum to the configured limit at most.
+
+Deliberately reserved headroom rather than a budget object the two share: such
+an object would have to outlive both a worker's relay reservation and a stream
+the connection's reader thread can still be inside, and streams are destroyed
+outside that connection's state lock. Headroom needs no shared lifetime, and
+bounds the sum just as well. The queue keeps its own accounting of its
+*logical* length, because that — not total ownership — is what the high/low
+watermarks and the `WINDOW_UPDATE` hysteresis run on.
+
+Nothing is allocated before it is reserved, either. The relay buffer is
+allocated only once a reservation has admitted it, so requests waiting on a
+slow origin hold no relay memory at all: allocating first and refusing
+afterwards would let concurrent requests reach the memory peak the limit exists
+to prevent, and be turned away only once it had already happened.
 
 For that budget to be satisfiable, the hard limit has to have room for both at
 once, so configuration requires:

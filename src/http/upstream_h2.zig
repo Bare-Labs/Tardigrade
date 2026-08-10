@@ -106,6 +106,23 @@ pub const Request = struct {
     /// reserved against, so many concurrent slow streams cannot multiply the
     /// per-stream bound. Only consulted alongside `proxy_buffer_accounting`.
     proxy_buffer_capacity: proxy_buffer_account.AggregateCapacity = .{},
+    /// Bytes the caller's response relay buffer will own at the same time as
+    /// this stream's queue, held back from the queue's own per-stream hard
+    /// limit so the two together cannot exceed it.
+    ///
+    /// The queue and that buffer are genuinely simultaneous — the queue's
+    /// reservation is not released until after the downstream write — so
+    /// letting each have the full hard limit meant one stream could own two
+    /// limits' worth with neither reporting an exceedance. Subtracting here
+    /// rather than sharing a budget object is deliberate: a shared object
+    /// would have to outlive both a worker's relay and a stream the reader
+    /// thread can still be inside, and `finishStreaming` destroys streams
+    /// outside the state lock. Reserved headroom needs no shared lifetime at
+    /// all.
+    ///
+    /// Config validation guarantees `hard >= high + relay`, so the queue is
+    /// still left room for a full receive window.
+    proxy_relay_reserved_bytes: usize = 0,
 };
 
 pub const BodyMode = enum {
@@ -913,8 +930,12 @@ pub fn H2Conn(comptime Transport: type) type {
             errdefer self.finishStreaming(stream);
             if (req.proxy_buffer_accounting) {
                 // The connection's pinned policy, not a caller snapshot: the
-                // stream is judged by exactly the window it advertised.
-                stream.proxy_body_account = proxy_buffer_account.Account.init(.upstream_to_downstream, .stream, self.buffer_limits);
+                // stream is judged by exactly the window it advertised, less
+                // whatever the caller's relay buffer will hold alongside the
+                // queue (see `Request.proxy_relay_reserved_bytes`).
+                var queue_limits = self.buffer_limits;
+                queue_limits.per_stream_hard_limit -|= req.proxy_relay_reserved_bytes;
+                stream.proxy_body_account = proxy_buffer_account.Account.init(.upstream_to_downstream, .stream, queue_limits);
                 stream.proxy_buffer_observer = req.proxy_buffer_observer;
                 stream.proxy_buffer_capacity = req.proxy_buffer_capacity;
             }
@@ -1973,11 +1994,20 @@ pub const H2ConnPool = struct {
     pub fn evict(self: *H2ConnPool, key: []const u8, conn: *PooledH2Conn) void {
         self.mutex.lock();
         var removed = false;
-        if (self.conns.getEntry(key)) |e| {
-            if (e.value_ptr.* == conn) {
-                self.allocator.free(e.key_ptr.*);
-                _ = self.conns.remove(key);
-                removed = true;
+        if (self.conns.get(key)) |existing| {
+            if (existing == conn) {
+                // Remove first, then free the key the map owned. Freeing it
+                // while the entry is still present left `remove` probing a
+                // dangling key: on a hash collision it compares stored key
+                // bytes, so it could read freed memory and fail to remove the
+                // entry at all — leaving a map entry whose key was already
+                // freed, which `deinit` would then free a second time and
+                // whose connection it would release after teardown. Matches
+                // the fetch-then-free order `acquire` and `reapIdle` use.
+                if (self.conns.fetchRemove(key)) |old| {
+                    self.allocator.free(old.key);
+                    removed = true;
+                }
             }
         }
         self.mutex.unlock();

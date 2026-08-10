@@ -44,14 +44,25 @@ All notable user-facing changes to Tardigrade are documented here.
   exit including the retry paths. Bodiless responses never touch the buffer and
   are not charged for it, matching HTTP/1.
 
-  An HTTP/2 stream's queue and its relay buffer share **one** per-stream
-  budget rather than getting one each. They are live at the same time, so
-  separate budgets meant a single stream could own `per_stream_hard_limit` of
-  queue *and* a relay buffer on top with neither budget reporting an
-  exceedance — the per-stream hard limit was not, in fact, a limit on what one
-  stream owns. The queue keeps its own separate accounting of its logical
-  length, since that is what drives the watermarks and `WINDOW_UPDATE`
-  hysteresis.
+  An HTTP/2 stream's queue and its relay buffer are bounded together by the
+  per-stream hard limit rather than each getting one. They are live at the same
+  time, so a limit each meant a single stream could own `per_stream_hard_limit`
+  of queue *and* a relay buffer on top with neither reporting an exceedance —
+  the per-stream hard limit was not, in fact, a limit on what one stream owns.
+  It is enforced by holding the relay's size back from the queue's own limit
+  when the stream opens, rather than by a budget object the two share: such an
+  object would have to outlive both a worker's relay reservation and a stream
+  the reader thread can still be inside. The queue keeps its own accounting of
+  its logical length, since that is what drives the watermarks and
+  `WINDOW_UPDATE` hysteresis.
+
+  Relay memory is also no longer allocated before a reservation admits it.
+  Matching the reservation's *size* was not enough: requests waiting on a slow
+  origin each took a buffer before charging any scope, so concurrent traffic
+  reached the very memory peak the aggregate limits exist to prevent and was
+  refused only afterwards. A bodiless response now allocates no relay buffer at
+  all, and an upload's buffer is released at the upload/response boundary
+  instead of being held empty through the response.
 
   Every per-stream decision for an HTTP/2 stream is now sourced from the policy
   its connection pinned when it was opened, not from the request's config
@@ -261,6 +272,16 @@ All notable user-facing changes to Tardigrade are documented here.
   the shared interop matrix.
 
 ### Fixed
+- **The HTTP/2 upstream pool could double-free an evicted origin key (#140)** —
+  `H2ConnPool.evict` freed the key the connection map owned *before* removing
+  the entry, so the removal probe compared the caller's key against bytes that
+  had already been freed. On a hash collision it could fail to remove the entry
+  at all, leaving a map entry whose key was freed — which teardown then freed a
+  second time, and whose connection it released after that connection had been
+  torn down, faulting on the refcount. `acquire` and `reapIdle` already used
+  the correct fetch-then-free order; `evict` now matches them. Found by a new
+  concurrent HTTP/2 test added in this change, which reproduced it as a
+  segfault under parallel load.
 - **Streaming mode could never negotiate HTTP/2 to a TLS upstream (#139)** —
   the streaming relay built its `UpstreamTlsOptions` without an `alpn_policy`,
   so it silently fell back to the `require_http1` default and offered an HTTPS
