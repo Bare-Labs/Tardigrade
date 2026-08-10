@@ -11,7 +11,10 @@ column whenever a lock's role changes.
 
 Tardigrade uses a **blocking I/O, thread-per-request** model:
 
-- One event-loop thread accepts connections and dispatches fds to a bounded worker pool.
+- By default, one event-loop thread accepts connections and dispatches fds to a bounded worker pool.
+- When `TARDIGRADE_LISTENER_SHARDS` is greater than 1 on a `SO_REUSEPORT` platform,
+  startup binds that many listener sockets and runs one accept thread per shard;
+  accepted fds still enter the same bounded worker pool.
 - Each worker thread owns its request for the full synchronous lifecycle (TLS handshake
   → HTTP parse → proxy/serve → response write).
 - Idle keepalive connections are removed from the worker pool and parked in an
@@ -386,6 +389,7 @@ They are not on the request hot path for standard HTTP traffic.
 | `health_probe_running` | `gateway_state.zig` | `bool` flag guarding the one-at-a-time health-probe constraint. Correct. |
 | `shutdown_requested` / `reload_requested` / `upgrade_requested` / `reopen_logs_requested` | `http/shutdown.zig` | Signal-handler-safe `seq_cst` atomics. Correct; read on every event-loop tick, not per-request. |
 | `dropped_lines` | `http/access_log.zig` | Monotonic counter for dropped log lines. Correct. |
+| `accepts_total` / `accept_errors_total` | `http/metrics.zig` | Per-listener-shard counters updated directly from accept loops with `.monotonic`, avoiding `GatewayState.metrics_mutex` on the sharded accept path. |
 
 All atomics are correctly classified as lock-free; no improvement needed.
 

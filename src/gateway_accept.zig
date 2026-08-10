@@ -38,9 +38,12 @@ pub fn runShardAcceptLoop(ctx: ShardAcceptContext) void {
         // Poll with a 250 ms timeout so we check the shutdown flag periodically
         // instead of blocking indefinitely in accept().
         const ready = std.posix.poll(&pfd, 250) catch |err| switch (err) {
-            error.SystemResources => continue,
+            error.SystemResources => {
+                ctx.state.metricsRecordAcceptError(ctx.shard_id, .poll);
+                continue;
+            },
             else => {
-                ctx.state.metricsRecordAcceptError(ctx.shard_id);
+                ctx.state.metricsRecordAcceptError(ctx.shard_id, .poll);
                 ctx.state.logger.err(null, "poll error (shard {}): {}", .{ ctx.shard_id, err });
                 return;
             },
@@ -73,7 +76,7 @@ pub fn acceptReadyConnectionsShard(listen_fd: std.posix.fd_t, shard_id: u16, wor
             const e = std.posix.errno(client_fd);
             if (e == .AGAIN) return;
             if (e == .CONNABORTED) continue;
-            state.metricsRecordAcceptError(shard_id);
+            state.metricsRecordAcceptError(shard_id, .accept);
             state.logger.err(null, "accept error (shard {}): {}", .{ shard_id, e });
             return;
         }
@@ -191,8 +194,7 @@ fn setReusePort(fd: std.posix.fd_t) void {
 /// Returns true on platforms where `SO_REUSEPORT` is available.
 pub fn isReusePortSupported() bool {
     return switch (builtin.os.tag) {
-        .linux, .macos, .ios, .tvos, .watchos, .visionos,
-        .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
+        .linux, .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
         else => false,
     };
 }
@@ -274,8 +276,17 @@ pub fn applyFdSoftLimit(desired: u64) !?u64 {
 
 test "isReusePortSupported returns true on supported platforms" {
     switch (builtin.os.tag) {
-        .linux, .macos, .ios, .tvos, .watchos, .visionos,
-        .freebsd, .netbsd, .openbsd, .dragonfly, .illumos,
+        .linux,
+        .macos,
+        .ios,
+        .tvos,
+        .watchos,
+        .visionos,
+        .freebsd,
+        .netbsd,
+        .openbsd,
+        .dragonfly,
+        .illumos,
         => try std.testing.expect(isReusePortSupported()),
         else => try std.testing.expect(!isReusePortSupported()),
     }

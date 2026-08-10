@@ -14604,6 +14604,59 @@ test "static file integration returns partial content for range request" {
     try std.testing.expectEqualStrings("abcd", response.body);
 }
 
+test "listener sharding starts real gateway with reuse-port shards and exports per-shard metrics (#137)" {
+    switch (builtin.os.tag) {
+        .linux, .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => {},
+        else => return,
+    }
+
+    const allocator = std.testing.allocator;
+    var fixture = try GenericFixtureDir.create(allocator, "listener-shards-startup");
+    defer fixture.deinit();
+    try fixture.writeRel("public/index.html", "sharded listener ok\n");
+
+    const public_abs = try fixture.joinAbs("public");
+    defer allocator.free(public_abs);
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location / {{
+        \\    root {s};
+        \\    try_files $uri /index.html;
+        \\}}
+    , .{public_abs});
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{.{ .name = "TARDIGRADE_LISTENER_SHARDS", .value = "4" }},
+    });
+    defer tardigrade.stop();
+
+    try waitForLogSubstring(allocator, tardigrade.log_path, "Listener sharding enabled: 4 shards", 5_000);
+
+    var served = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/index.html",
+        .body = null,
+        .headers = &.{},
+    });
+    defer served.deinit();
+    try std.testing.expectEqual(@as(u16, 200), served.status_code);
+    try assertContains(served.body, "sharded listener ok");
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = null,
+        .headers = &.{},
+    });
+    defer metrics.deinit();
+    try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
+    try std.testing.expectEqual(@as(u64, 4), prometheusMetricValue(metrics.body, "tardigrade_listener_shards") orelse 0);
+    try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accepts_total", &.{"shard=\"0\""}) != null);
+    try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accept_errors_total", &.{ "shard=\"0\"", "reason=\"poll\"" }) != null);
+    try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accept_errors_total", &.{ "shard=\"0\"", "reason=\"accept\"" }) != null);
+}
+
 test "static file integration returns autoindex listing when enabled" {
     const allocator = std.testing.allocator;
     var fixture = try GenericFixtureDir.create(allocator, "static-autoindex");

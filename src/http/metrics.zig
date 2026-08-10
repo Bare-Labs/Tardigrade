@@ -29,6 +29,14 @@ pub const TicketKeyReloadOutcome = enum { initial_load_success, initial_load_fai
 
 pub const HttpProtocol = enum { h1, h2, h3 };
 pub const ResponseWriteMode = enum { writev, single_write, tls_buffered, fallback };
+pub const AcceptErrorReason = enum {
+    poll,
+    accept,
+
+    pub fn label(self: AcceptErrorReason) []const u8 {
+        return @tagName(self);
+    }
+};
 
 /// Why a reverse-proxy request took the bounded buffered path instead of
 /// streaming (#139). This lives here, next to the counters, so it is the single
@@ -104,6 +112,7 @@ const ticket_result_count = 3;
 const ticket_key_reload_outcome_count = 4;
 const http_protocol_count = 3;
 const response_write_mode_count = 4;
+const accept_error_reason_count = 2;
 const early_data_source_count = 3;
 const early_data_decision_count = 4;
 const early_data_upstream_425_action_count = 2;
@@ -293,9 +302,9 @@ pub const Metrics = struct {
     /// Listener sharding: configured number of active listener shards (1 = single/default).
     listener_shards: u16,
     /// Per-shard accepted connections total. Index by shard ID (clamped to max_listener_shards-1).
-    accepts_total: [max_listener_shards]u64,
-    /// Per-shard accept errors total. Index by shard ID (clamped to max_listener_shards-1).
-    accept_errors_total: [max_listener_shards]u64,
+    accepts_total: [max_listener_shards]std.atomic.Value(u64),
+    /// Per-shard accept errors total, split by a bounded reason label.
+    accept_errors_total: [max_listener_shards][accept_error_reason_count]std.atomic.Value(u64),
     /// Server start time (nanoseconds since boot).
     started_ns: i128,
 
@@ -420,8 +429,8 @@ pub const Metrics = struct {
             .drain_timeouts_total = 0,
             .drain_forced_closes_total = 0,
             .listener_shards = 1,
-            .accepts_total = .{0} ** max_listener_shards,
-            .accept_errors_total = .{0} ** max_listener_shards,
+            .accepts_total = zeroAtomicShardCounters(),
+            .accept_errors_total = zeroAtomicShardReasonCounters(),
             .started_ns = compat.nanoTimestamp(),
         };
     }
@@ -579,13 +588,13 @@ pub const Metrics = struct {
     /// Record one accepted connection on the given shard.
     pub fn recordAccept(self: *Metrics, shard_id: u16) void {
         const idx = @min(@as(usize, shard_id), max_listener_shards - 1);
-        self.accepts_total[idx] += 1;
+        _ = self.accepts_total[idx].fetchAdd(1, .monotonic);
     }
 
     /// Record one accept-path error on the given shard.
-    pub fn recordAcceptError(self: *Metrics, shard_id: u16) void {
+    pub fn recordAcceptError(self: *Metrics, shard_id: u16, reason: AcceptErrorReason) void {
         const idx = @min(@as(usize, shard_id), max_listener_shards - 1);
-        self.accept_errors_total[idx] += 1;
+        _ = self.accept_errors_total[idx][acceptErrorReasonIndex(reason)].fetchAdd(1, .monotonic);
     }
 
     pub fn setUpstreamUnhealthyBackends(self: *Metrics, count: usize) void {
@@ -1295,10 +1304,16 @@ pub const Metrics = struct {
         {
             const n = @min(@as(usize, self.listener_shards), max_listener_shards);
             for (0..n) |i| {
-                try out.print("tardigrade_accepts_total{{shard=\"{d}\"}} {d}\n", .{ i, self.accepts_total[i] });
+                try out.print("tardigrade_accepts_total{{shard=\"{d}\"}} {d}\n", .{ i, self.accepts_total[i].load(.monotonic) });
             }
             for (0..n) |i| {
-                try out.print("tardigrade_accept_errors_total{{shard=\"{d}\"}} {d}\n", .{ i, self.accept_errors_total[i] });
+                inline for (.{ AcceptErrorReason.poll, AcceptErrorReason.accept }) |reason| {
+                    try out.print("tardigrade_accept_errors_total{{shard=\"{d}\",reason=\"{s}\"}} {d}\n", .{
+                        i,
+                        reason.label(),
+                        self.accept_errors_total[i][acceptErrorReasonIndex(reason)].load(.monotonic),
+                    });
+                }
             }
         }
 
@@ -1724,6 +1739,20 @@ fn zeroTlsDirectionMatrix() [tls_backend_count][tls_direction_count]u64 {
     return .{.{0} ** tls_direction_count} ** tls_backend_count;
 }
 
+fn zeroAtomicShardCounters() [max_listener_shards]std.atomic.Value(u64) {
+    var counters: [max_listener_shards]std.atomic.Value(u64) = undefined;
+    for (&counters) |*counter| counter.* = std.atomic.Value(u64).init(0);
+    return counters;
+}
+
+fn zeroAtomicShardReasonCounters() [max_listener_shards][accept_error_reason_count]std.atomic.Value(u64) {
+    var counters: [max_listener_shards][accept_error_reason_count]std.atomic.Value(u64) = undefined;
+    for (&counters) |*shard| {
+        for (shard) |*counter| counter.* = std.atomic.Value(u64).init(0);
+    }
+    return counters;
+}
+
 fn tlsBackendIndex(backend: encrypted_stream.BackendKind) usize {
     return switch (backend) {
         .openssl => 0,
@@ -1850,6 +1879,13 @@ fn responseWriteModeIndex(mode: ResponseWriteMode) usize {
         .single_write => 1,
         .tls_buffered => 2,
         .fallback => 3,
+    };
+}
+
+fn acceptErrorReasonIndex(reason: AcceptErrorReason) usize {
+    return switch (reason) {
+        .poll => 0,
+        .accept => 1,
     };
 }
 
@@ -2615,17 +2651,19 @@ test "listener sharding metrics record per-shard accepts and errors and emit Pro
     m.recordAccept(0);
     m.recordAccept(0);
     m.recordAccept(1);
-    m.recordAcceptError(2);
+    m.recordAcceptError(2, .accept);
+    m.recordAcceptError(2, .poll);
 
-    try std.testing.expectEqual(@as(u64, 2), m.accepts_total[0]);
-    try std.testing.expectEqual(@as(u64, 1), m.accepts_total[1]);
-    try std.testing.expectEqual(@as(u64, 0), m.accepts_total[2]);
-    try std.testing.expectEqual(@as(u64, 0), m.accept_errors_total[0]);
-    try std.testing.expectEqual(@as(u64, 1), m.accept_errors_total[2]);
+    try std.testing.expectEqual(@as(u64, 2), m.accepts_total[0].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), m.accepts_total[1].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), m.accepts_total[2].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), m.accept_errors_total[0][acceptErrorReasonIndex(.accept)].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), m.accept_errors_total[2][acceptErrorReasonIndex(.accept)].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), m.accept_errors_total[2][acceptErrorReasonIndex(.poll)].load(.monotonic));
 
     // Out-of-bounds shard IDs are clamped.
     m.recordAccept(@as(u16, max_listener_shards) + 10);
-    try std.testing.expectEqual(@as(u64, 1), m.accepts_total[max_listener_shards - 1]);
+    try std.testing.expectEqual(@as(u64, 1), m.accepts_total[max_listener_shards - 1].load(.monotonic));
 
     const prom = try m.toPrometheus(allocator);
     defer allocator.free(prom);
@@ -2633,5 +2671,6 @@ test "listener sharding metrics record per-shard accepts and errors and emit Pro
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_listener_shards 3") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accepts_total{shard=\"0\"} 2") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accepts_total{shard=\"1\"} 1") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_errors_total{shard=\"2\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_errors_total{shard=\"2\",reason=\"accept\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_errors_total{shard=\"2\",reason=\"poll\"} 1") != null);
 }

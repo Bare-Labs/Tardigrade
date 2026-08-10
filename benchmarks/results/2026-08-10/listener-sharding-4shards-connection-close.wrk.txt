@@ -1,0 +1,15 @@
+Running 4s test @ http://127.0.0.1:54040/index.html
+  4 threads and 20 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.13ms    4.58ms  91.91ms   98.55%
+    Req/Sec     3.96k   617.18     4.54k    87.80%
+  Latency Distribution
+     50%  647.00us
+     75%  752.00us
+     90%    0.88ms
+     99%    9.89ms
+  64725 requests in 4.10s, 43.21MB read
+Requests/sec:  15773.25
+Transfer/sec:     10.53MB
+
+WRK_SUMMARY {"rps":15773.25,"p50_ms":0.647,"p95_ms":1.060,"p99_ms":9.888,"p999_ms":77.962,"errors":0,"throughput_mbps":10.53}
