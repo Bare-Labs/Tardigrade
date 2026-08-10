@@ -410,8 +410,9 @@ pub const EdgeConfig = struct {
     /// Number of worker threads for connection handling (0 = auto CPU count).
     worker_threads: u32,
     /// Number of listener shards (parallel accept loops) to start.
-    /// When > 1, binds N sockets with SO_REUSEPORT and starts one accept
-    /// loop per shard. 0 or 1 keeps the default single-listener behavior.
+    /// When > 1 on a load-balanced reuse-port platform, binds N sockets and
+    /// starts one accept loop per shard. 0 or 1 keeps the default
+    /// single-listener behavior.
     /// Set via TARDIGRADE_LISTENER_SHARDS.
     listener_shards: u16,
     /// Enable master process supervision mode.

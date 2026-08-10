@@ -14606,7 +14606,7 @@ test "static file integration returns partial content for range request" {
 
 test "listener sharding starts real gateway with reuse-port shards and exports per-shard metrics (#137)" {
     switch (builtin.os.tag) {
-        .linux, .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => {},
+        .linux, .freebsd => {},
         else => return,
     }
 
@@ -14643,6 +14643,17 @@ test "listener sharding starts real gateway with reuse-port shards and exports p
     try std.testing.expectEqual(@as(u16, 200), served.status_code);
     try assertContains(served.body, "sharded listener ok");
 
+    for (0..200) |_| {
+        var churn = try sendRequest(allocator, tardigrade.port, .{
+            .method = "GET",
+            .path = "/index.html",
+            .body = null,
+            .headers = &.{},
+        });
+        try std.testing.expectEqual(@as(u16, 200), churn.status_code);
+        churn.deinit();
+    }
+
     var metrics = try sendRequest(allocator, tardigrade.port, .{
         .method = "GET",
         .path = "/status/metrics",
@@ -14652,9 +14663,18 @@ test "listener sharding starts real gateway with reuse-port shards and exports p
     defer metrics.deinit();
     try std.testing.expectEqual(@as(u16, 200), metrics.status_code);
     try std.testing.expectEqual(@as(u64, 4), prometheusMetricValue(metrics.body, "tardigrade_listener_shards") orelse 0);
-    try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accepts_total", &.{"shard=\"0\""}) != null);
-    try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accept_errors_total", &.{ "shard=\"0\"", "reason=\"poll\"" }) != null);
-    try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accept_errors_total", &.{ "shard=\"0\"", "reason=\"accept\"" }) != null);
+    var nonzero_accept_shards: usize = 0;
+    for (0..4) |shard| {
+        const shard_label = try std.fmt.allocPrint(allocator, "shard=\"{d}\"", .{shard});
+        defer allocator.free(shard_label);
+
+        const accept_count = prometheusLabeledMetricValue(metrics.body, "tardigrade_accepts_total", &.{shard_label}) orelse return error.InvalidHttpResponse;
+        if (accept_count > 0) nonzero_accept_shards += 1;
+
+        try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accept_errors_total", &.{ shard_label, "reason=\"poll\"" }) != null);
+        try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accept_errors_total", &.{ shard_label, "reason=\"accept\"" }) != null);
+    }
+    try std.testing.expect(nonzero_accept_shards > 1);
 }
 
 test "static file integration returns autoindex listing when enabled" {

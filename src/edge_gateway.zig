@@ -783,7 +783,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     if (cfg.max_total_connection_memory_bytes > 0) {
         state.logger.info(null, "Global connection memory estimate limit enabled: {d} bytes", .{cfg.max_total_connection_memory_bytes});
     }
-    state.logger.info(null, "Connection model: non-blocking accept loop on the main thread with blocking per-connection work on a bounded worker pool", .{});
+    if (sharding_enabled) {
+        state.logger.info(null, "Connection model: {d} load-balanced listener shard accept loops with blocking per-connection work on a bounded worker pool", .{effective_shards});
+    } else {
+        state.logger.info(null, "Connection model: non-blocking accept loop on the main thread with blocking per-connection work on a bounded worker pool", .{});
+    }
 
     // Install signal handlers for graceful shutdown
     http.shutdown.installSignalHandlers();

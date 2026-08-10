@@ -2,12 +2,13 @@
 
 PR #596 / issue #137 listener-sharding evidence, captured on 2026-08-10 with the repo benchmark harness.
 
-This is fallback data from a local Mac, not the dedicated benchmark target recommended by `benchmarks/README.md`. Use it to verify the benchmark procedure, metric shape, and obvious regressions; do not treat it as the canonical performance claim.
+This is fallback data from a local Mac, not the dedicated benchmark target recommended by `benchmarks/README.md`. Use it to verify the benchmark procedure, metric shape, and obvious regressions; do not treat it as the canonical performance claim. The follow-up review fix for PR #596 now treats macOS as unsupported for listener sharding because this run showed duplicate-bind behavior without load-balanced accept distribution.
 
 ## Environment
 
 - Binary: `zig build -Doptimize=ReleaseFast install`
 - Git tag metadata from harness: `v0.5.0-181-g8adb3fef`
+- Provenance note: captured from the local working tree that was committed as `947222028c8481970cc65d6f44e3c876323db253`; the harness tag output does not encode dirty-tree state.
 - Host: `127.0.0.1`, Darwin `25.3.0`, Apple M4, 10 CPU threads, 16 GiB RAM
 - Load tool: `wrk`
 - Tardigrade workers: 4
@@ -92,3 +93,4 @@ Raw metric scrapes:
 - Accept errors stayed at zero in both profiles.
 - On this macOS loopback run, all accepted connections landed on one reuse-port shard, so this local result does not demonstrate shard-distribution fairness. A canonical Linux/BSD benchmark target is still needed for publishable fairness numbers.
 - The local 4-shard profile was slightly slower than single-listener in these short runs; this is not enough evidence to enable listener sharding by default.
+- The canonical Linux/BSD performance run remains intentionally absent from this artifact. `benchmarks/remote-run.sh` expects the dedicated SSH target (`remote-runner`) and a reachable gateway target; those runner credentials were not available in the local workspace used for this follow-up.

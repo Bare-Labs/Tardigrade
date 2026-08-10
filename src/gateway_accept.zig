@@ -3,10 +3,10 @@
 //! enter the worker pool.
 //!
 //! Listener sharding: when `TARDIGRADE_LISTENER_SHARDS` > 1, the gateway
-//! creates N sockets bound to the same address with `SO_REUSEPORT` (where
-//! the platform supports it) and runs one independent accept loop per shard,
-//! each on its own thread. This reduces accept-path contention and improves
-//! CPU locality for high-connection-churn workloads.
+//! creates N sockets bound to the same address with the platform's
+//! load-balanced reuse-port option and runs one independent accept loop per
+//! shard, each on its own thread. This reduces accept-path contention and
+//! improves CPU locality for high-connection-churn workloads.
 
 const builtin = @import("builtin");
 const compat = @import("zig_compat");
@@ -132,13 +132,12 @@ pub fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.work
 }
 
 /// Create a TCP listener socket bound to `host`:`port` with `SO_REUSEADDR`
-/// and, where the platform supports it, `SO_REUSEPORT`.
+/// and the platform's load-balanced reuse-port option.
 ///
-/// Multiple sockets created with `SO_REUSEPORT` for the same address allow the
-/// kernel to distribute incoming connections across independent accept loops
-/// (listener sharding) without per-fd contention.  On platforms without
-/// `SO_REUSEPORT` the socket is created without it; callers should not start
-/// more than one shard on those platforms.
+/// Multiple sockets created with a load-balanced reuse-port option for the same
+/// address allow the kernel to distribute incoming connections across
+/// independent accept loops (listener sharding) without per-fd contention.
+/// Callers should only use this path when `isReusePortSupported()` is true.
 ///
 /// Returns a bound, listening file descriptor.  The caller owns the fd and
 /// must close it when done.
@@ -155,10 +154,9 @@ pub fn createReusePortListenerFd(host: []const u8, port: u16) !std.posix.fd_t {
     _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, 1)); // FD_CLOEXEC
 
     // SO_REUSEADDR: allow fast server restart without waiting out TIME_WAIT.
-    _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int));
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1)));
 
-    // SO_REUSEPORT: allow multiple sockets on the same port for sharding.
-    setReusePort(fd);
+    try enableReusePortSharding(fd);
 
     const rc_bind = std.c.bind(fd, @ptrCast(&sock_addr.storage), sock_addr.len);
     if (rc_bind != 0) return error.BindFailed;
@@ -169,32 +167,26 @@ pub fn createReusePortListenerFd(host: []const u8, port: u16) !std.posix.fd_t {
     return fd;
 }
 
-/// Set `SO_REUSEPORT` on `fd`.  This is a no-op on platforms that do not
-/// expose this option (the socket remains usable as a regular listener).
-fn setReusePort(fd: std.posix.fd_t) void {
-    switch (builtin.os.tag) {
-        .linux,
-        .macos,
-        .ios,
-        .tvos,
-        .watchos,
-        .visionos,
-        .freebsd,
-        .netbsd,
-        .openbsd,
-        .dragonfly,
-        .illumos,
-        => {
-            _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, std.mem.asBytes(&@as(c_int, 1)), @sizeOf(c_int));
-        },
-        else => {},
-    }
+/// Set the platform option that provides load-balanced duplicate listener
+/// binding. Plain duplicate-bind options are intentionally not enough here:
+/// sharding must distribute fresh TCP connections across the listener fds.
+fn enableReusePortSharding(fd: std.posix.fd_t) !void {
+    const option = reusePortShardingOption() orelse return error.ReusePortShardingUnsupported;
+    try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, option, std.mem.asBytes(&@as(c_int, 1)));
 }
 
-/// Returns true on platforms where `SO_REUSEPORT` is available.
+fn reusePortShardingOption() ?u32 {
+    return switch (builtin.os.tag) {
+        .linux => std.posix.SO.REUSEPORT,
+        .freebsd => 0x00010000, // SO_REUSEPORT_LB
+        else => null,
+    };
+}
+
+/// Returns true on platforms with verified load-balanced reuse-port semantics.
 pub fn isReusePortSupported() bool {
     return switch (builtin.os.tag) {
-        .linux, .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
+        .linux, .freebsd => true,
         else => false,
     };
 }
@@ -274,19 +266,10 @@ pub fn applyFdSoftLimit(desired: u64) !?u64 {
     return target;
 }
 
-test "isReusePortSupported returns true on supported platforms" {
+test "isReusePortSupported returns true only on load-balanced platforms" {
     switch (builtin.os.tag) {
         .linux,
-        .macos,
-        .ios,
-        .tvos,
-        .watchos,
-        .visionos,
         .freebsd,
-        .netbsd,
-        .openbsd,
-        .dragonfly,
-        .illumos,
         => try std.testing.expect(isReusePortSupported()),
         else => try std.testing.expect(!isReusePortSupported()),
     }

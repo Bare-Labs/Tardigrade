@@ -12,9 +12,11 @@ column whenever a lock's role changes.
 Tardigrade uses a **blocking I/O, thread-per-request** model:
 
 - By default, one event-loop thread accepts connections and dispatches fds to a bounded worker pool.
-- When `TARDIGRADE_LISTENER_SHARDS` is greater than 1 on a `SO_REUSEPORT` platform,
-  startup binds that many listener sockets and runs one accept thread per shard;
-  accepted fds still enter the same bounded worker pool.
+- When `TARDIGRADE_LISTENER_SHARDS` is greater than 1 on a platform with verified
+  load-balanced reuse-port semantics (Linux `SO_REUSEPORT` or FreeBSD
+  `SO_REUSEPORT_LB`), startup binds that many listener sockets and runs one
+  accept thread per shard; accepted fds still enter the same bounded worker
+  pool. Other platforms keep the default single-listener path.
 - Each worker thread owns its request for the full synchronous lifecycle (TLS handshake
   → HTTP parse → proxy/serve → response write).
 - Idle keepalive connections are removed from the worker pool and parked in an
