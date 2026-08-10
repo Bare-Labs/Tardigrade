@@ -340,6 +340,10 @@ metrics_json() {
             listener_shards: 0,
             accepts_total: [],
             accept_errors_total: [],
+            accept_batch_size_count: [],
+            accept_batch_size_sum: [],
+            accept_batches_total: [],
+            accept_fairness_yields_total: [],
             worker_queued_jobs: 0,
             worker_queue_wait_us_count: 0,
             worker_queue_wait_us_sum: 0
@@ -355,6 +359,26 @@ metrics_json() {
                 .accept_errors_total += [{
                     shard: ($line | capture("shard=\"(?<shard>[0-9]+)\"").shard | tonumber),
                     reason: ($line | capture("reason=\"(?<reason>[^\"]+)\"").reason),
+                    value: ($line | split(" ")[1] | num)
+                }]
+            elif ($line | test("^tardigrade_accept_batch_size_count\\{")) then
+                .accept_batch_size_count += [{
+                    shard: ($line | capture("shard=\"(?<shard>[0-9]+)\"").shard | tonumber),
+                    value: ($line | split(" ")[1] | num)
+                }]
+            elif ($line | test("^tardigrade_accept_batch_size_sum\\{")) then
+                .accept_batch_size_sum += [{
+                    shard: ($line | capture("shard=\"(?<shard>[0-9]+)\"").shard | tonumber),
+                    value: ($line | split(" ")[1] | num)
+                }]
+            elif ($line | test("^tardigrade_accept_batches_total\\{")) then
+                .accept_batches_total += [{
+                    shard: ($line | capture("shard=\"(?<shard>[0-9]+)\"").shard | tonumber),
+                    value: ($line | split(" ")[1] | num)
+                }]
+            elif ($line | test("^tardigrade_accept_fairness_yields_total\\{")) then
+                .accept_fairness_yields_total += [{
+                    shard: ($line | capture("shard=\"(?<shard>[0-9]+)\"").shard | tonumber),
                     value: ($line | split(" ")[1] | num)
                 }]
             elif ($line | test("^tardigrade_worker_queued_jobs ")) then
@@ -378,9 +402,18 @@ accept_delta_json() {
             reduce ($items // [])[] as $item ({}; .[($item.shard | tostring)] = $item.value);
         def keyed_errors($items):
             reduce ($items // [])[] as $item ({}; .[($item.shard | tostring) + ":" + $item.reason] = $item.value);
+        def keyed_values($items):
+            reduce ($items // [])[] as $item ({}; .[($item.shard | tostring)] = $item.value);
         def accept_delta($before; $after):
             (keyed_accepts($before.accepts_total)) as $b |
             (keyed_accepts($after.accepts_total)) as $a |
+            [($a | keys_unsorted[]) as $key | {
+                shard: ($key | tonumber),
+                value: (($a[$key] // 0) - ($b[$key] // 0))
+            }] | sort_by(.shard);
+        def value_delta($before; $after; $field):
+            (keyed_values($before[$field])) as $b |
+            (keyed_values($after[$field])) as $a |
             [($a | keys_unsorted[]) as $key | {
                 shard: ($key | tonumber),
                 value: (($a[$key] // 0) - ($b[$key] // 0))
@@ -402,7 +435,11 @@ accept_delta_json() {
         {
             listener_shards: $a.listener_shards,
             accepts_total_delta: accept_delta($b; $a),
-            accept_errors_total_delta: error_delta($b; $a)
+            accept_errors_total_delta: error_delta($b; $a),
+            accept_batch_size_count_delta: value_delta($b; $a; "accept_batch_size_count"),
+            accept_batch_size_sum_delta: value_delta($b; $a; "accept_batch_size_sum"),
+            accept_batches_total_delta: value_delta($b; $a; "accept_batches_total"),
+            accept_fairness_yields_total_delta: value_delta($b; $a; "accept_fairness_yields_total")
         }
         '
 }
@@ -622,7 +659,7 @@ jq -n \
             keepalive_path: $keepalive_path,
             save_dir: $save_dir,
             workloads: ["static-http1", "proxy-http1", "keepalive", "connection-churn-http1", "mixed-short-static-proxy"],
-            metrics: ["req/s", "p50_ms", "p95_ms", "p99_ms", "p999_ms", "cpu_pct_avg", "rss_mb_peak", "accept_errors_total", "worker_queued_jobs", "worker_queue_wait_us_count", "worker_queue_wait_us_sum", "per-shard accepts_total"]
+            metrics: ["req/s", "p50_ms", "p95_ms", "p99_ms", "p999_ms", "cpu_pct_avg", "rss_mb_peak", "accept_errors_total", "accept_batch_size_count", "accept_batch_size_sum", "accept_batches_total", "accept_fairness_yields_total", "worker_queued_jobs", "worker_queue_wait_us_count", "worker_queue_wait_us_sum", "per-shard accepts_total"]
         },
         single: $single,
         sharded: $sharded

@@ -1418,6 +1418,14 @@ pub const GatewayState = struct {
         self.metrics.recordAcceptError(shard_id, reason);
     }
 
+    pub fn metricsRecordAcceptBatch(self: *GatewayState, shard_id: u16, batch_size: u32) void {
+        self.metrics.recordAcceptBatch(shard_id, batch_size);
+    }
+
+    pub fn metricsRecordAcceptFairnessYield(self: *GatewayState, shard_id: u16) void {
+        self.metrics.recordAcceptFairnessYield(shard_id);
+    }
+
     pub fn metricsSetListenerShards(self: *GatewayState, count: u16) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();

@@ -17,12 +17,27 @@ const gs = @import("gateway_state.zig");
 
 const GatewayState = gs.GatewayState;
 
+pub const default_accept_batch_limit: u32 = 64;
+
+pub const AcceptBatchOptions = struct {
+    limit: u32 = default_accept_batch_limit,
+    fairness_yield_every: u32 = 0,
+
+    pub fn normalized(self: AcceptBatchOptions) AcceptBatchOptions {
+        return .{
+            .limit = @max(self.limit, 1),
+            .fairness_yield_every = self.fairness_yield_every,
+        };
+    }
+};
+
 /// Context passed to each per-shard accept thread.
 pub const ShardAcceptContext = struct {
     listen_fd: std.posix.fd_t,
     shard_id: u16,
     worker_pool: *http.worker_pool.WorkerPool,
     state: *GatewayState,
+    batch_options: AcceptBatchOptions = .{},
 };
 
 /// Entry point for a per-shard accept thread.  Runs until shutdown is
@@ -50,7 +65,7 @@ pub fn runShardAcceptLoop(ctx: ShardAcceptContext) void {
         };
         if (ready == 0) continue; // timeout — loop and recheck shutdown flag
         if ((pfd[0].revents & std.posix.POLL.IN) != 0) {
-            acceptReadyConnectionsShard(ctx.listen_fd, ctx.shard_id, ctx.worker_pool, ctx.state);
+            acceptReadyConnectionsShard(ctx.listen_fd, ctx.shard_id, ctx.worker_pool, ctx.state, ctx.batch_options);
         }
     }
 }
@@ -58,7 +73,16 @@ pub fn runShardAcceptLoop(ctx: ShardAcceptContext) void {
 /// Accept all connections that are ready on `listen_fd`, recording metrics
 /// under the given `shard_id`.  Returns after draining all ready connections
 /// (EAGAIN) or when shutdown is requested.
-pub fn acceptReadyConnectionsShard(listen_fd: std.posix.fd_t, shard_id: u16, worker_pool: *http.worker_pool.WorkerPool, state: *GatewayState) void {
+pub fn acceptReadyConnectionsShard(listen_fd: std.posix.fd_t, shard_id: u16, worker_pool: *http.worker_pool.WorkerPool, state: *GatewayState, batch_options_raw: AcceptBatchOptions) void {
+    const batch_options = batch_options_raw.normalized();
+    var accepted_this_batch: u32 = 0;
+    var recorded_batch = false;
+    defer {
+        if (!recorded_batch and accepted_this_batch > 0) {
+            state.metricsRecordAcceptBatch(shard_id, accepted_this_batch);
+        }
+    }
+
     while (!http.shutdown.isShutdownRequested()) {
         var accepted_addr: std.c.sockaddr.storage = undefined;
         var addr_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
@@ -82,6 +106,7 @@ pub fn acceptReadyConnectionsShard(listen_fd: std.posix.fd_t, shard_id: u16, wor
         }
 
         state.metricsRecordAccept(shard_id);
+        accepted_this_batch += 1;
 
         const owned_ip_key = gc.clientIpKeyFromAddress(state.allocator, &accepted_addr) catch null;
         defer if (owned_ip_key) |key| state.allocator.free(key);
@@ -98,18 +123,21 @@ pub fn acceptReadyConnectionsShard(listen_fd: std.posix.fd_t, shard_id: u16, wor
                 state.logger.warn(null, "per-IP connection limit reached for {s}", .{ip_key});
                 state.metricsRecordErrorCode("overload");
                 rejectOverloadedClient(client_fd);
+                if (acceptBatchShouldYield(state, shard_id, accepted_this_batch, batch_options, &recorded_batch)) return;
                 continue;
             },
             .over_global_limit => {
                 state.logger.warn(null, "global active connection limit reached", .{});
                 state.metricsRecordErrorCode("overload");
                 rejectOverloadedClient(client_fd);
+                if (acceptBatchShouldYield(state, shard_id, accepted_this_batch, batch_options, &recorded_batch)) return;
                 continue;
             },
             .over_global_memory_limit => {
                 state.logger.warn(null, "global connection memory estimate limit reached", .{});
                 state.metricsRecordErrorCode("overload");
                 rejectOverloadedClient(client_fd);
+                if (acceptBatchShouldYield(state, shard_id, accepted_this_batch, batch_options, &recorded_batch)) return;
                 continue;
             },
         }
@@ -120,15 +148,33 @@ pub fn acceptReadyConnectionsShard(listen_fd: std.posix.fd_t, shard_id: u16, wor
             state.metricsRecordErrorCode("overload");
             state.releaseConnectionSlot(client_fd);
             rejectOverloadedClient(client_fd);
+            if (acceptBatchShouldYield(state, shard_id, accepted_this_batch, batch_options, &recorded_batch)) return;
             continue;
         };
+
+        if (acceptBatchShouldYield(state, shard_id, accepted_this_batch, batch_options, &recorded_batch)) return;
     }
+}
+
+fn acceptBatchShouldYield(state: *GatewayState, shard_id: u16, accepted_count: u32, batch_options: AcceptBatchOptions, recorded_batch: *bool) bool {
+    if (accepted_count >= batch_options.limit) {
+        state.metricsRecordAcceptBatch(shard_id, accepted_count);
+        recorded_batch.* = true;
+        return true;
+    }
+    if (batch_options.fairness_yield_every > 0 and accepted_count >= batch_options.fairness_yield_every) {
+        state.metricsRecordAcceptBatch(shard_id, accepted_count);
+        state.metricsRecordAcceptFairnessYield(shard_id);
+        recorded_batch.* = true;
+        return true;
+    }
+    return false;
 }
 
 /// Backward-compatible wrapper: accept ready connections on shard 0 (the
 /// default single-listener path).
 pub fn acceptReadyConnections(listen_fd: std.posix.fd_t, worker_pool: *http.worker_pool.WorkerPool, state: *GatewayState) void {
-    acceptReadyConnectionsShard(listen_fd, 0, worker_pool, state);
+    acceptReadyConnectionsShard(listen_fd, 0, worker_pool, state, .{});
 }
 
 /// Create a TCP listener socket bound to `host`:`port` with `SO_REUSEADDR`

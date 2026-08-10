@@ -788,6 +788,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     } else {
         state.logger.info(null, "Connection model: non-blocking accept loop on the main thread with blocking per-connection work on a bounded worker pool", .{});
     }
+    state.logger.info(null, "Accept batching: batch_limit={d} fairness_yield_every={d}", .{ cfg.accept_batch_limit, cfg.accept_fairness_yield_every });
 
     // Install signal handlers for graceful shutdown
     http.shutdown.installSignalHandlers();
@@ -812,6 +813,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
                 .shard_id = ti,
                 .worker_pool = &worker_pool,
                 .state = &state,
+                .batch_options = .{
+                    .limit = cfg.accept_batch_limit,
+                    .fairness_yield_every = cfg.accept_fairness_yield_every,
+                },
             };
             shard_threads[shard_thread_count] = std.Thread.spawn(.{}, gaccept.runShardAcceptLoop, .{ctx}) catch |err| {
                 state.logger.err(null, "failed to spawn shard {} accept thread: {}", .{ ti, err });
@@ -847,7 +852,10 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             }
             if (!ev.readable) continue;
             if (ev.fd == listen_fd and !sharding_enabled) {
-                gaccept.acceptReadyConnections(listen_fd, &worker_pool, &state);
+                gaccept.acceptReadyConnectionsShard(listen_fd, 0, &worker_pool, &state, .{
+                    .limit = cfg.accept_batch_limit,
+                    .fairness_yield_every = cfg.accept_fairness_yield_every,
+                });
             } else if (parked.resumeReady(ev.fd)) {
                 // A parked keepalive connection has a new request (or closed).
                 // Stop watching it and hand it to a worker, which serves one
