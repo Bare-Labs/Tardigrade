@@ -228,6 +228,27 @@ fn reserveUploadBytes(reservation: *ProxyBufferReservation, bytes: usize) !void 
 /// function from the array it describes.
 const http1_upload_relay_bytes: usize = 16 * 1024;
 
+/// Build the `:path` pseudo-header value. Extracted so the HTTP/2 caller can
+/// hand the connection reference back on failure instead of returning through
+/// a bare `try` while holding it.
+fn buildRequestTarget(
+    path_buf: *std.Io.Writer.Allocating,
+    path_component: []const u8,
+    query: ?std.Uri.Component,
+) !void {
+    try path_buf.writer.writeAll(if (path_component.len > 0) path_component else "/");
+    if (query) |q| {
+        try path_buf.writer.writeByte('?');
+        try path_buf.writer.writeAll(uriComponentBytes(q));
+    }
+}
+
+/// The smallest relay buffer any path will use. Config validation already
+/// floors `proxy_stream_buffer_size` here and checks every policy against it,
+/// so this is a backstop for the one place a buffer size is derived rather than
+/// configured: the HTTP/2 relay sizing itself to a connection's pinned policy.
+const min_proxy_relay_bytes: usize = 16 * 1024;
+
 /// Bytes a relay retains from the request head, on top of its fixed relay
 /// buffer. The two framings retain different amounts of the same slice: a
 /// `.length` upload forwards only the body bytes it is owed, while a `.chunked`
@@ -899,7 +920,14 @@ fn streamViaH2Pool(
     extra_headers: []const std.http.Header,
     buffered_body: []const u8,
     streaming_body: ?StreamingRequestBody,
-    read_buf: []u8,
+    /// Relay buffer size the *current* config asks for. Deliberately a size
+    /// rather than a buffer: the h2 path allocates its own once the connection
+    /// is acquired, because only then is the policy that has to account for it
+    /// known. Allocating up front and slicing down would leave the untouched
+    /// remainder as real per-request memory that no scope is charged for —
+    /// exactly the retained-but-unaccounted allocation these limits exist to
+    /// prevent.
+    requested_relay_bytes: usize,
     downstream_conn: anytype,
     downstream_writer: anytype,
     security: *const http.security_headers.SecurityHeaders,
@@ -937,10 +965,21 @@ fn streamViaH2Pool(
                 if (h1_pool) |p| p.recordProtocol(false);
                 const start_ms = http.event_loop.monotonicMs();
                 var wrote_downstream = false;
-                // An ALPN-h1 origin never creates an h2 origin entry, so this
-                // connection clears the process account only (per-origin
-                // accounting for h1 origins is the issue's PR 4).
-                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, read_buf, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, .{ .global = proxy_buffer_global });
+                // An ALPN-h1 origin never creates an h2 origin entry, so its
+                // per-origin account comes from the h1 pool — under the h1 key
+                // (`https:host:port`), which is the same origin identity the
+                // h1 relay would use had h2 never been offered. Keying it under
+                // `h2:…` would split one origin's memory across two limits.
+                const h1_origin_account: ?*proxy_buffer_account.Aggregate = if (h1_pool) |p| blk: {
+                    var h1_key_buf: [300]u8 = undefined;
+                    const h1_key = std.fmt.bufPrint(&h1_key_buf, "{s}:{s}:{d}", .{ scheme, host, port }) catch host;
+                    break :blk p.originBufferAccount(h1_key) catch return error.ProxyBufferCapacityUnavailable;
+                } else null;
+                // A fresh, unpooled connection with no pinned policy of its
+                // own, so this is an ordinary HTTP/1 exchange: allocate and
+                // charge at the current config's size, exactly as the h1 path
+                // below does.
+                const res = try streamProxyOverTransport(allocator, tls_ptr, tls_ptr.fd, requested_relay_bytes, uri, method, extra_headers, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, proxy_buffer_limits, proxy_buffer_observer, .{ .origin = h1_origin_account, .global = proxy_buffer_global });
                 if (h1_pool) |p| p.recordRequestLatency(false, http.event_loop.monotonicMs() - start_ms);
                 return res.result;
             },
@@ -961,10 +1000,71 @@ fn streamViaH2Pool(
                     h2_pool.release(conn);
                     return error.ProxyBufferCapacityUnavailable;
                 };
+                // Every per-stream decision below comes from the connection's
+                // pinned policy, never from `proxy_buffer_limits` — which is
+                // the *current* config snapshot, and a pooled connection
+                // outlives reloads. Mixing them judged one stream by two
+                // generations at once: its queue by what the connection
+                // advertised, everything sized here by whatever the config said
+                // now. On a raise that let a stream own more than the hard
+                // limit it is documented to be measured against; on a shrink it
+                // refused a stream still operating inside the window this
+                // connection had granted it, so the outcome depended on whether
+                // the request happened to land on a pre-reload connection.
+                const pinned_limits = conn.proxyBufferLimits();
+
+                // The queue and this request's relay buffer are live at the
+                // same time, so they must share one per-stream bound (#140).
+                // That is done by holding the relay's size back from the
+                // queue's own hard limit at `openStreaming` below, rather than
+                // by pointing both at a shared budget object: such an object
+                // would have to outlive both a worker's relay reservation and a
+                // stream the reader thread can still be inside, and
+                // `finishStreaming` destroys streams outside the connection's
+                // state lock. Reserved headroom needs no shared lifetime at
+                // all, and the sum is bounded either way.
                 const proxy_buffer_capacity = proxy_buffer_account.AggregateCapacity{
                     .origin = origin_buffer_account,
                     .global = proxy_buffer_global,
                 };
+
+                // Allocate the relay buffer only now, at the size the pinned
+                // policy can account for. The config may ask for more than this
+                // connection's policy was validated against — `hard >= high +
+                // relay` held for the relay size in force when it opened, not
+                // for one a later reload grew — and allocating the larger size
+                // and slicing down would leave the remainder as real
+                // per-request memory charged to no scope at all. With N
+                // concurrent streams that is exactly the unaccounted retained
+                // allocation these limits exist to bound, so what is allocated
+                // and what is accounted are deliberately the same number.
+                //
+                // Never restrictive in practice: the pinned policy was
+                // validated against a relay of at least 16 KiB, so the headroom
+                // below is always at least that.
+                //
+                // Floored all the same, because the failure mode if it were
+                // ever zero is silent: a zero-length relay buffer makes
+                // `readStreamingBody` return 0, which this loop reads as end of
+                // body and truncates the response without a word. A policy that
+                // leaves no headroom is only reachable by constructing `Limits`
+                // directly rather than through config validation, and flooring
+                // turns that into an ordinary over-budget refusal — a clean
+                // pre-commit 503 — instead.
+                const pinned_relay_headroom = pinned_limits.per_stream_hard_limit -| pinned_limits.per_stream_high_watermark;
+                const pinned_relay_bytes = @max(
+                    @min(requested_relay_bytes, pinned_relay_headroom),
+                    min_proxy_relay_bytes,
+                );
+                // Nothing is allocated here. #140 requires the reservation to
+                // come *before* the allocation, not merely to match its size:
+                // N concurrent requests to an origin slow to answer would
+                // otherwise all allocate a relay buffer while none had charged
+                // a scope yet, and the aggregate cap could not stop the process
+                // holding N of them. They would be refused only afterwards,
+                // past the peak the limit exists to prevent. Each phase below
+                // reserves first and allocates second, and a bodiless response
+                // allocates nothing at all.
 
                 var authority_buf: [300]u8 = undefined;
                 const authority = if (port == default_port)
@@ -972,14 +1072,15 @@ fn streamViaH2Pool(
                 else
                     std.fmt.bufPrint(&authority_buf, "{s}:{d}", .{ host, port }) catch host;
 
+                // The connection is acquired, so every failure from here on has
+                // to hand its reference back before returning.
                 var path_buf: std.Io.Writer.Allocating = .init(allocator);
                 defer path_buf.deinit();
                 const path_component = uriComponentBytes(uri.path);
-                try path_buf.writer.writeAll(if (path_component.len > 0) path_component else "/");
-                if (uri.query) |q| {
-                    try path_buf.writer.writeByte('?');
-                    try path_buf.writer.writeAll(uriComponentBytes(q));
-                }
+                buildRequestTarget(&path_buf, path_component, uri.query) catch |err| {
+                    h2_pool.release(conn);
+                    return err;
+                };
 
                 // Claim the upload's buffer footprint before `openStreaming`,
                 // which sends HEADERS (#140). Reserving after it would let a
@@ -987,14 +1088,21 @@ fn streamViaH2Pool(
                 // received a request it will never see the body of.
                 var upload_reservation: ?ProxyBufferReservation = null;
                 defer if (upload_reservation) |*reservation| reservation.releaseAll();
+                var upload_buf: ?[]u8 = null;
+                defer if (upload_buf) |buf| allocator.free(buf);
                 if (streaming_body) |sb| {
                     upload_reservation = preflightUploadReservation(
-                        proxy_buffer_limits,
+                        pinned_limits,
                         proxy_buffer_observer,
                         proxy_buffer_capacity,
-                        read_buf.len,
+                        pinned_relay_bytes,
                         uploadInitialBytesFootprint(sb),
                     ) catch |err| {
+                        h2_pool.release(conn);
+                        return err;
+                    };
+                    // Admitted, so the memory may now exist.
+                    upload_buf = allocator.alloc(u8, pinned_relay_bytes) catch |err| {
                         h2_pool.release(conn);
                         return err;
                     };
@@ -1012,6 +1120,9 @@ fn streamViaH2Pool(
                     .proxy_buffer_accounting = true,
                     .proxy_buffer_observer = proxy_buffer_observer,
                     .proxy_buffer_capacity = proxy_buffer_capacity,
+                    // Only a response can own a relay buffer alongside the
+                    // queue; an upload's buffer is gone before the queue fills.
+                    .proxy_relay_reserved_bytes = pinned_relay_bytes,
                 }) catch |err| {
                     // Nothing has reached the client yet: evict the dead
                     // connection so new requests do not pick it, and retry
@@ -1029,7 +1140,7 @@ fn streamViaH2Pool(
                         conn,
                         stream,
                         sb,
-                        read_buf,
+                        upload_buf.?,
                         downstream_conn,
                         cancel_token,
                         &upload_reservation.?,
@@ -1063,6 +1174,13 @@ fn streamViaH2Pool(
                         reservation.releaseAll();
                         upload_reservation = null;
                     }
+                    // And the buffer itself: holding an empty upload buffer
+                    // through the response would be allocated-but-unaccounted
+                    // memory, which is the thing this whole section is about.
+                    if (upload_buf) |buf| {
+                        allocator.free(buf);
+                        upload_buf = null;
+                    }
                 }
 
                 conn.waitStreamingResponseHead(stream) catch |err| {
@@ -1083,6 +1201,52 @@ fn streamViaH2Pool(
 
                 const reason = gpres.upstreamReasonPhrase(@enumFromInt(status));
                 const body_allowed = gpres.responseBodyAllowed(method, status);
+
+                // The response relay copies queued DATA out of the stream into
+                // `read_buf`, and the queue's own reservation is not released
+                // until `acknowledgeStreamingBody` — which runs *after* the
+                // downstream write. While a slow client blocks in that write
+                // the same bytes therefore exist twice in application-owned
+                // memory, and charging only the queue let N concurrent slow
+                // responses exceed every configured ceiling by roughly
+                // N * read_buf_bytes with nothing in the accounting to show it
+                // (#140).
+                //
+                // Taken before the commitment boundary below, so a refusal is
+                // still a clean pre-commit 503 rather than a committed status
+                // that has to be truncated, and released on every exit from
+                // this block — including the retry `continue` paths. A
+                // bodiless response never touches the buffer and is not
+                // charged for it, which is the line HTTP/1 draws too.
+                var response_reservation: ?ProxyBufferReservation = null;
+                defer if (response_reservation) |*reservation| reservation.releaseAll();
+                var response_buf: ?[]u8 = null;
+                defer if (response_buf) |buf| allocator.free(buf);
+                if (body_allowed) {
+                    var reservation = ProxyBufferReservation.init(
+                        .upstream_to_downstream,
+                        pinned_limits,
+                        proxy_buffer_observer,
+                        proxy_buffer_capacity,
+                    );
+                    // `reserve` rolls itself back completely at either scope,
+                    // so a refusal leaves nothing to clean up here.
+                    reservation.reserve(pinned_relay_bytes) catch {
+                        conn.finishStreaming(stream);
+                        if (!conn.healthy()) h2_pool.evict(key, conn);
+                        h2_pool.release(conn);
+                        return error.ProxyBufferCapacityUnavailable;
+                    };
+                    response_reservation = reservation;
+                    // Admitted, and still before the commitment boundary below.
+                    response_buf = allocator.alloc(u8, pinned_relay_bytes) catch |err| {
+                        conn.finishStreaming(stream);
+                        if (!conn.healthy()) h2_pool.evict(key, conn);
+                        h2_pool.release(conn);
+                        return err;
+                    };
+                }
+
                 // Linearize the commitment boundary: the reader can reject DATA
                 // in the gap between the head arriving and this write starting.
                 // Claiming the transition under the connection's state lock
@@ -1121,7 +1285,7 @@ fn streamViaH2Pool(
                             h2_pool.release(conn);
                             return error.RequestCancelled;
                         }
-                        const n = conn.readStreamingBody(stream, read_buf) catch |err| {
+                        const n = conn.readStreamingBody(stream, response_buf.?) catch |err| {
                             // Failed mid-body after the head went downstream:
                             // report an aborted relay (the client sees the
                             // truncated chunked body); other streams on the
@@ -1138,7 +1302,7 @@ fn streamViaH2Pool(
                             break;
                         };
                         if (n == 0) break;
-                        gpres.writeChunk(downstream_writer, read_buf[0..n]) catch {
+                        gpres.writeChunk(downstream_writer, response_buf.?[0..n]) catch {
                             conn.finishStreaming(stream);
                             h2_pool.release(conn);
                             return error.ClientAborted;
@@ -2151,7 +2315,12 @@ fn streamProxyOverTransport(
     allocator: std.mem.Allocator,
     transport: anytype,
     fd: std.posix.fd_t,
-    read_buf: []u8,
+    /// Response relay buffer size. A size rather than a buffer because the
+    /// reservation has to come first: this buffer is application-owned the
+    /// moment it exists, and `readUpstreamHead` reads into it — past the blank
+    /// line, so response body bytes can land there — before any scope has been
+    /// charged. Allocated per attempt, once admitted.
+    relay_bytes: usize,
     uri: std.Uri,
     method: []const u8,
     extra_headers: []const std.http.Header,
@@ -2189,6 +2358,34 @@ fn streamProxyOverTransport(
     );
     if (read_deadline_ms > 0) setSocketRecvTimeoutMs(fd, read_deadline_ms) catch {};
 
+    // The upload phase has returned its reservation, so the response phase
+    // claims its own — *before* the buffer exists and before a byte of the
+    // response is read into it.
+    //
+    // Ordering this the other way round meant the cap could only refuse after
+    // the memory it bounds had already been taken: N concurrent requests to an
+    // origin slow to finish a response head would each hold a relay buffer
+    // while the enforcing aggregate still read zero. And because
+    // `readUpstreamHead` reads past the blank line, body bytes could already be
+    // sitting in that buffer by then.
+    //
+    // Unlike HTTP/2 there is no bodiless exemption: this buffer is what
+    // *discovers* whether a body exists, so it cannot be treated as unowned
+    // while that question is open.
+    var response_reservation = ProxyBufferReservation.init(
+        .upstream_to_downstream,
+        proxy_buffer_limits,
+        proxy_buffer_observer,
+        proxy_buffer_capacity,
+    );
+    defer response_reservation.releaseAll();
+    // Either refusal is local capacity before anything is committed
+    // downstream, so both are the caller's clean 503 rather than a status
+    // blamed on the origin.
+    response_reservation.reserve(relay_bytes) catch return error.ProxyBufferCapacityUnavailable;
+    const read_buf = try allocator.alloc(u8, relay_bytes);
+    defer allocator.free(read_buf);
+
     const ttfb_start_ms = http.event_loop.monotonicMs();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2198,12 +2395,6 @@ fn streamProxyOverTransport(
 
     const reason = gpres.upstreamReasonPhrase(@enumFromInt(head.status_code));
     const body_allowed = gpres.responseBodyAllowed(method, head.status_code);
-    var response_reservation: ?ProxyBufferReservation = null;
-    if (body_allowed) {
-        response_reservation = ProxyBufferReservation.init(.upstream_to_downstream, proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_capacity);
-        try response_reservation.?.reserve(read_buf.len);
-    }
-    defer if (response_reservation) |*reservation| reservation.releaseAll();
 
     gpres.writeStreamedUpstreamResponseHeadFromHeaders(
         downstream_writer,
@@ -2340,8 +2531,10 @@ pub fn executeStreamingHttpProxyRequest(
         if (tp.len > 0) try extra_headers.append(.{ .name = "traceparent", .value = tp });
     }
 
-    const read_buf = try allocator.alloc(u8, @max(cfg.proxy_stream_buffer_size, 16 * 1024));
-    defer allocator.free(read_buf);
+    // The relay buffer's size, not the buffer: the h2 path allocates its own
+    // once it knows the policy that will have to account for it, so nothing is
+    // allocated here for an exchange that never uses it.
+    const requested_relay_bytes = @max(cfg.proxy_stream_buffer_size, 16 * 1024);
 
     // HTTP/2 upstream (#145/#301): multiplex the streaming exchange over the
     // shared per-origin h2 connection when configured — via ALPN for HTTPS (h1
@@ -2354,7 +2547,7 @@ pub fn executeStreamingHttpProxyRequest(
     if (stream_h2) {
         if (h2_pool) |hp| {
             const h2_opts: ?http.tls_termination.UpstreamTlsOptions = if (is_https) tls_options.? else null;
-            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, read_buf, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_global);
+            return streamViaH2Pool(allocator, hp, pool, host, port, h2_opts, uri, method, extra_headers.items, buffered_body, streaming_body, requested_relay_bytes, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, cfg.proxy_buffer_limits, proxy_buffer_observer, proxy_buffer_global);
         }
         if (streaming_body != null) {
             if (pool) |p| p.recordH2StreamingUploadFallback();
@@ -2363,19 +2556,32 @@ pub fn executeStreamingHttpProxyRequest(
     // Everything below runs HTTP/1.1 (counted per request, not per attempt).
     if (pool) |p| p.recordProtocol(false);
 
-    // Aggregate capacity for this connection's relay buffers, in both
-    // directions (#140). The HTTP/1 pool has no per-origin buffer account — an
-    // h1 origin's relay memory is bounded per request by the fixed relay
-    // buffers, so the scope that concurrency can actually multiply is the
-    // process; per-origin accounting for h1 origins is the issue's PR 4.
-    const h1_buffer_capacity = proxy_buffer_account.AggregateCapacity{ .global = proxy_buffer_global };
-
     const active_pool: ?*http.upstream_pool.UpstreamPool = if (pool) |p| (if (p.config.enabled) p else null) else null;
     var key_buf: [512]u8 = undefined;
     const key = if (unix_socket_path) |socket_path|
         std.fmt.bufPrint(&key_buf, "unix:{s}", .{socket_path}) catch socket_path
     else
         std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_https) "https" else "http", host, port }) catch host;
+
+    // Aggregate capacity for this connection's relay buffers, in both
+    // directions (#140). A fixed relay buffer bounds one request, but nothing
+    // bounds how many requests an origin has in flight, so the per-origin scope
+    // is what stops one slow origin from multiplying its own relay memory.
+    //
+    // Looked up on `pool` rather than `active_pool`: the account exists to
+    // bound memory, which is just as true when connection pooling is disabled.
+    // A lookup failure means the accounting itself is unavailable (allocation
+    // failure) — precisely when these limits matter most — so it is a
+    // deterministic pre-commit refusal rather than a silently unaccounted
+    // request.
+    const h1_origin_buffer_account: ?*proxy_buffer_account.Aggregate = if (pool) |p|
+        p.originBufferAccount(key) catch return error.ProxyBufferCapacityUnavailable
+    else
+        null;
+    const h1_buffer_capacity = proxy_buffer_account.AggregateCapacity{
+        .origin = h1_origin_buffer_account,
+        .global = proxy_buffer_global,
+    };
 
     // A dead reused connection can only be retried before any response byte
     // reaches the client, and only when the request body is re-sendable (a
@@ -2436,9 +2642,9 @@ pub fn executeStreamingHttpProxyRequest(
         const exchange_start_ms = http.event_loop.monotonicMs();
         const fd = conn.stream.handle;
         const res = (if (conn.tls) |tls|
-            streamProxyOverTransport(allocator, tls, fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)
+            streamProxyOverTransport(allocator, tls, fd, requested_relay_bytes, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)
         else
-            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, read_buf, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)) catch |err| {
+            streamProxyOverTransport(allocator, compat.netStreamFromFd(fd), fd, requested_relay_bytes, uri, method, extra_headers.items, buffered_body, streaming_body, downstream_conn, downstream_writer, security, alt_svc, sticky_set_cookie, correlation_id, connect_timeout_ms, read_deadline_ms, cancel_token, &wrote_downstream, cfg.proxy_buffer_limits, proxy_buffer_observer, h1_buffer_capacity)) catch |err| {
             // Tear down the connection (release handles active-- and close).
             if (active_pool) |p| {
                 p.release(key, conn, false, http.event_loop.monotonicMs());
@@ -3759,7 +3965,7 @@ fn runH2ExchangeThread(ctx: *H2ExchangeCtx) void {
         &.{},
         "",
         .{ .framing = .{ .length = 8 } },
-        ctx.read_buf,
+        ctx.read_buf.len,
         ctx.source,
         CaptureWriter{ .list = ctx.captured },
         ctx.security,
@@ -3907,7 +4113,7 @@ test "http2 upload capacity is refused before HEADERS reach the origin" {
     try in_flight.reserve(16 * 1024);
     defer in_flight.releaseAll();
 
-    var read_buf: [16 * 1024]u8 = undefined;
+    const relay_bytes: usize = 16 * 1024;
     var source = FakeUploadSource{ .data = "" };
     var captured = std.array_list.Managed(u8).init(std.testing.allocator);
     defer captured.deinit();
@@ -3931,7 +4137,7 @@ test "http2 upload capacity is refused before HEADERS reach the origin" {
             &.{},
             "",
             .{ .framing = .{ .length = 4096 } },
-            &read_buf,
+            relay_bytes,
             &source,
             CaptureWriter{ .list = &captured },
             &security,
@@ -4266,4 +4472,1496 @@ test "connectBlockingUnix + exchange round-trips a Unix-socket origin" {
 
     try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     try std.testing.expectEqualStrings("hello", resp.body);
+}
+
+// ---------------------------------------------------------------------------
+// Response-direction per-origin buffer accounting for HTTP/1 origins (#140).
+// ---------------------------------------------------------------------------
+
+/// A downstream client whose socket is already gone. The response reservation
+/// is taken before the head is written, so this fails with the reservation
+/// live — the case that would leak it.
+const FailingDownstreamWriter = struct {
+    pub fn writeAll(_: FailingDownstreamWriter, _: []const u8) !void {
+        return error.BrokenPipe;
+    }
+    pub fn print(_: FailingDownstreamWriter, comptime _: []const u8, _: anytype) !void {
+        return error.BrokenPipe;
+    }
+};
+
+/// One HTTP/1 response relay driven over a socketpair standing in for the
+/// origin. `preload` is written to the origin end before the relay starts; the
+/// test writes the rest (or closes) to control when the relay finishes.
+const Http1ResponseRelay = struct {
+    client_fd: std.posix.fd_t,
+    origin_fd: std.posix.fd_t,
+    /// The relay buffer's size; the production path allocates it, so a test can
+    /// observe both the allocation and the reservation.
+    relay_bytes: usize,
+    allocator: std.mem.Allocator = std.testing.allocator,
+    captured: std.array_list.Managed(u8),
+    counters: UploadBufferObserver = .{},
+    limits: proxy_buffer_account.Limits,
+    capacity: proxy_buffer_account.AggregateCapacity,
+    read_deadline_ms: u32 = 5000,
+    cancel_token: ?*const CancellationToken = null,
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    err: ?anyerror = null,
+    status: u16 = 0,
+    upstream_aborted: bool = false,
+
+    fn init(
+        relay_bytes: usize,
+        limits: proxy_buffer_account.Limits,
+        capacity: proxy_buffer_account.AggregateCapacity,
+    ) !Http1ResponseRelay {
+        const fds = try makeBlockingSocketpair();
+        return .{
+            .client_fd = fds[0],
+            .origin_fd = fds[1],
+            .relay_bytes = relay_bytes,
+            .captured = std.array_list.Managed(u8).init(std.testing.allocator),
+            .limits = limits,
+            .capacity = capacity,
+        };
+    }
+
+    fn deinit(self: *Http1ResponseRelay) void {
+        self.captured.deinit();
+        _ = std.c.close(self.client_fd);
+        _ = std.c.close(self.origin_fd);
+    }
+
+    fn originSend(self: *Http1ResponseRelay, bytes: []const u8) void {
+        _ = std.c.write(self.origin_fd, bytes.ptr, bytes.len);
+    }
+
+    fn originClose(self: *Http1ResponseRelay) void {
+        _ = std.c.shutdown(self.origin_fd, std.posix.SHUT.WR);
+    }
+
+    fn run(self: *Http1ResponseRelay, downstream_writer: anytype) void {
+        defer self.finished.store(true, .release);
+        var security = http.security_headers.SecurityHeaders{};
+        var source = FakeUploadSource{ .data = "" };
+        var wrote_downstream = false;
+        const uri = std.Uri.parse("http://origin.test/resource") catch unreachable;
+        const res = streamProxyOverTransport(
+            self.allocator,
+            compat.netStreamFromFd(self.client_fd),
+            self.client_fd,
+            self.relay_bytes,
+            uri,
+            "GET",
+            &.{},
+            "",
+            null, // no streaming upload: this exercises the response direction
+            &source,
+            downstream_writer,
+            &security,
+            null,
+            null,
+            "origin-buffer-test",
+            0,
+            self.read_deadline_ms,
+            self.cancel_token,
+            &wrote_downstream,
+            self.limits,
+            self.counters.observer(),
+            self.capacity,
+        ) catch |err| {
+            self.err = err;
+            return;
+        };
+        self.status = res.result.status_code;
+        self.upstream_aborted = res.result.upstream_aborted;
+    }
+
+    fn runCapturing(self: *Http1ResponseRelay) void {
+        self.run(CaptureWriter{ .list = &self.captured });
+    }
+
+    /// Every scope this relay touched is back to zero, and so is the local
+    /// accounting the metrics are derived from.
+    fn expectNothingHeld(self: *const Http1ResponseRelay) !void {
+        try std.testing.expectEqual(@as(usize, 0), self.counters.reserved);
+        try std.testing.expectEqual(@as(usize, 0), self.counters.retained);
+        if (self.capacity.origin) |origin| {
+            try std.testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
+        }
+        if (self.capacity.global) |global| {
+            try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+        }
+    }
+};
+
+const h1_response_head = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n";
+
+test "http1 response relay releases its origin reservation on success" {
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    const relay_bytes: usize = 16 * 1024;
+
+    var relay = try Http1ResponseRelay.init(
+        relay_bytes,
+        uploadTestLimits(1024 * 1024),
+        .{ .origin = &origin, .global = &global },
+    );
+    defer relay.deinit();
+
+    relay.originSend(h1_response_head ++ "body");
+    relay.runCapturing();
+
+    try std.testing.expect(relay.err == null);
+    try std.testing.expectEqual(@as(u16, 200), relay.status);
+    // The relay buffer was charged to the origin while it ran, and only that.
+    try std.testing.expectEqual(relay_bytes, relay.counters.peak_reserved);
+    try relay.expectNothingHeld();
+}
+
+test "http1 response relay releases its origin reservation when the upstream aborts mid-body" {
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    const relay_bytes: usize = 16 * 1024;
+
+    var relay = try Http1ResponseRelay.init(
+        relay_bytes,
+        uploadTestLimits(1024 * 1024),
+        .{ .origin = &origin, .global = &global },
+    );
+    defer relay.deinit();
+
+    // Promises four body bytes, sends one, then goes away.
+    relay.originSend(h1_response_head ++ "b");
+    relay.originClose();
+    relay.runCapturing();
+
+    try std.testing.expect(relay.err == null);
+    try std.testing.expect(relay.upstream_aborted);
+    try relay.expectNothingHeld();
+}
+
+test "http1 response relay releases its origin reservation on a read timeout" {
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    const relay_bytes: usize = 16 * 1024;
+
+    var relay = try Http1ResponseRelay.init(
+        relay_bytes,
+        uploadTestLimits(1024 * 1024),
+        .{ .origin = &origin, .global = &global },
+    );
+    defer relay.deinit();
+    relay.read_deadline_ms = 100;
+
+    // The head arrives, the body never does: the relay is holding its
+    // reservation when the read deadline fires.
+    relay.originSend(h1_response_head);
+    relay.runCapturing();
+
+    try std.testing.expect(relay.err != null);
+    try relay.expectNothingHeld();
+}
+
+test "http1 response relay releases its origin reservation when the request is cancelled" {
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    const relay_bytes: usize = 16 * 1024;
+
+    var relay = try Http1ResponseRelay.init(
+        relay_bytes,
+        uploadTestLimits(1024 * 1024),
+        .{ .origin = &origin, .global = &global },
+    );
+    defer relay.deinit();
+
+    var token = CancellationToken.init(0);
+    token.cancel(.client_disconnect);
+    relay.cancel_token = &token;
+
+    relay.originSend(h1_response_head);
+    relay.runCapturing();
+
+    try std.testing.expectEqual(@as(?anyerror, error.RequestCancelled), relay.err);
+    try relay.expectNothingHeld();
+}
+
+test "http1 response relay releases its origin reservation when the client aborts" {
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    const relay_bytes: usize = 16 * 1024;
+
+    var relay = try Http1ResponseRelay.init(
+        relay_bytes,
+        uploadTestLimits(1024 * 1024),
+        .{ .origin = &origin, .global = &global },
+    );
+    defer relay.deinit();
+
+    relay.originSend(h1_response_head ++ "body");
+    // The reservation is taken before the head is written downstream, so the
+    // write failing means it is live at the moment the client vanishes.
+    relay.run(FailingDownstreamWriter{});
+
+    try std.testing.expectEqual(@as(?anyerror, error.ClientAborted), relay.err);
+    try relay.expectNothingHeld();
+}
+
+test "http1 response memory is not allocated until a reservation admits it" {
+    // The HTTP/1 analogue of the HTTP/2 ordering rule. The response buffer is
+    // application-owned the moment it exists, and `readUpstreamHead` reads into
+    // it — past the blank line, so body bytes can land there — so allocating
+    // before the reservation let the cap refuse only after the memory it
+    // bounds had already been taken.
+    const relay_bytes: usize = 16 * 1024;
+    // Room for exactly one response relay across the whole origin.
+    var origin = proxy_buffer_account.Aggregate.init(.origin, relay_bytes);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    const limits = uploadTestLimits(1024 * 1024);
+    const capacity = proxy_buffer_account.AggregateCapacity{ .origin = &origin, .global = &global };
+
+    // One tracker across all three, so this measures relay memory held by the
+    // process at once rather than per exchange. Safe to share: every field
+    // update is under its lock.
+    var tracker = LargestAllocationTracker{ .child = std.testing.allocator };
+
+    var relays: [3]Http1ResponseRelay = undefined;
+    for (&relays) |*relay| {
+        relay.* = try Http1ResponseRelay.init(relay_bytes, limits, capacity);
+        relay.allocator = tracker.allocator();
+    }
+    defer for (&relays) |*relay| relay.deinit();
+
+    // None of them gets a complete response head, so an admitted relay parks
+    // inside `readUpstreamHead` holding its reservation — the exact state the
+    // cap has to bound.
+    var threads: [3]std.Thread = undefined;
+    for (&relays, 0..) |*relay, i| {
+        relay.originSend("HTTP/1.1 200 OK\r\n");
+        threads[i] = try std.Thread.spawn(.{}, Http1ResponseRelay.runCapturing, .{relay});
+    }
+    // Teardown must survive an early failure: finish the heads so parked
+    // relays can complete, then join.
+    defer for (&threads) |thread| thread.join();
+    defer for (&relays) |*relay| {
+        relay.originSend("Content-Length: 4\r\n\r\nbody");
+        relay.originClose();
+    };
+
+    // Wait for the two refusals to land, then for the survivor to be holding
+    // its buffer.
+    var refused: usize = 0;
+    var waited: u32 = 0;
+    while (refused < 2 and waited < 30_000) : (waited += 5) {
+        refused = 0;
+        for (&relays) |*relay| {
+            if (relay.finished.load(.acquire) and relay.err != null) refused += 1;
+        }
+        if (refused < 2) sleepMs(5);
+    }
+    try std.testing.expectEqual(@as(usize, 2), refused);
+
+    // Exactly one relay buffer exists in the whole process. Before the
+    // reordering all three allocated one and only then discovered the cap, so
+    // this read 3 x 16 KiB.
+    try std.testing.expectEqual(relay_bytes, tracker.peakLargeLive());
+    try std.testing.expectEqual(relay_bytes, origin.currentBytes(.upstream_to_downstream));
+
+    // The refusals are local capacity, raised before any response byte was
+    // read into a buffer, let alone committed downstream.
+    for (&relays) |*relay| {
+        if (relay.err) |err| {
+            try std.testing.expectEqual(@as(anyerror, error.ProxyBufferCapacityUnavailable), err);
+            try std.testing.expectEqual(@as(usize, 0), relay.captured.items.len);
+        }
+    }
+
+    // Let the survivor finish, and prove every scope drains.
+    for (&relays) |*relay| {
+        relay.originSend("Content-Length: 4\r\n\r\nbody");
+    }
+    for (&relays) |*relay| {
+        var settle: u32 = 0;
+        while (!relay.finished.load(.acquire) and settle < 30_000) : (settle += 5) sleepMs(5);
+    }
+    try std.testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), tracker.large_live);
+}
+
+test "a cancelled http1 upload releases its origin reservation" {
+    const fds = try makeBlockingSocketpair();
+    const client_fd = fds[0];
+    const peer_fd = fds[1];
+    defer _ = std.c.close(client_fd);
+    defer _ = std.c.close(peer_fd);
+
+    var counters = UploadBufferObserver{};
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+
+    var token = CancellationToken.init(0);
+    token.cancel(.timeout);
+
+    var source = FakeUploadSource{ .data = &[_]u8{'u'} ** 4096 };
+    var reservation = try preflightUploadReservation(
+        uploadTestLimits(1024 * 1024),
+        counters.observer(),
+        .{ .origin = &origin, .global = &global },
+        http1_upload_relay_bytes,
+        0,
+    );
+    defer reservation.releaseAll();
+    try std.testing.expectEqual(@as(usize, http1_upload_relay_bytes), origin.currentBytes(.downstream_to_upstream));
+
+    try std.testing.expectError(error.RequestCancelled, relayStreamingUploadToHttp1(
+        compat.netStreamFromFd(client_fd),
+        client_fd,
+        .{ .framing = .{ .length = 4096 } },
+        &source,
+        &token,
+        &reservation,
+        counters.observer(),
+    ));
+
+    reservation.releaseAll();
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+    try std.testing.expectEqual(@as(usize, 0), origin.currentBytes(.downstream_to_upstream));
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2 response relay buffer accounting (#140).
+// ---------------------------------------------------------------------------
+
+/// An h2c origin that answers with a head plus one DATA frame and then holds
+/// `END_STREAM` back. That leaves a stream whose queue is non-empty while the
+/// relay is working, which is the state where the queue and the relay buffer
+/// are two application-owned copies of the same bytes.
+const H2GatedBodyOrigin = struct {
+    listen_fd: std.posix.fd_t,
+    release_end: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn h2GatedBodyServe(origin: *H2GatedBodyOrigin) void {
+    const conn = std.c.accept(origin.listen_fd, null, null);
+    if (conn < 0) return;
+    defer _ = std.c.close(conn);
+
+    var preface: [24]u8 = undefined;
+    if (!readExactlyFromFd(conn, &preface)) return;
+    const settings = [_]u8{ 0, 0, 0, 0x04, 0, 0, 0, 0, 0 };
+    _ = std.c.write(conn, &settings, settings.len);
+
+    var stream_id: u32 = 0;
+    while (stream_id == 0) {
+        var hdr: [9]u8 = undefined;
+        if (!readExactlyFromFd(conn, &hdr)) return;
+        const payload_len = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | @as(usize, hdr[2]);
+        const typ = hdr[3];
+        const sid = std.mem.readInt(u32, hdr[5..9], .big) & 0x7fff_ffff;
+        var scratch: [4096]u8 = undefined;
+        var remaining = payload_len;
+        while (remaining > 0) {
+            const take = @min(remaining, scratch.len);
+            if (!readExactlyFromFd(conn, scratch[0..take])) return;
+            remaining -= take;
+        }
+        if (typ == 0x01) stream_id = sid; // HEADERS
+    }
+
+    var head_frame = [_]u8{ 0, 0, 1, 0x01, 0x04, 0, 0, 0, 0, 0x88 };
+    std.mem.writeInt(u32, head_frame[5..9], stream_id, .big);
+    _ = std.c.write(conn, &head_frame, head_frame.len);
+
+    // DATA without END_STREAM: the relay has bytes to move but the message is
+    // not over, so the stream stays alive while the downstream write blocks.
+    var body_frame = [_]u8{ 0, 0, 2, 0x00, 0x00, 0, 0, 0, 0, 'h', 'i' };
+    std.mem.writeInt(u32, body_frame[5..9], stream_id, .big);
+    _ = std.c.write(conn, &body_frame, body_frame.len);
+
+    while (!origin.release_end.load(.acquire)) sleepMs(5);
+
+    var end_frame = [_]u8{ 0, 0, 0, 0x00, 0x01, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, end_frame[5..9], stream_id, .big);
+    _ = std.c.write(conn, &end_frame, end_frame.len);
+
+    var drain: [256]u8 = undefined;
+    while (true) {
+        const got = std.c.read(conn, &drain, drain.len);
+        if (got <= 0) break;
+    }
+}
+
+/// A downstream client that stops reading once the response head has arrived,
+/// standing in for a slow consumer. It parks the relay inside the body write —
+/// after the bytes have been copied into the relay buffer and before
+/// `acknowledgeStreamingBody` releases the queue's reservation, which is
+/// exactly the window where both copies are owned at once.
+const GatedChunkWriter = struct {
+    captured: *std.array_list.Managed(u8),
+    head_done: *std.atomic.Value(bool),
+    blocked: *std.atomic.Value(bool),
+    release: *std.atomic.Value(bool),
+
+    fn gate(self: GatedChunkWriter) void {
+        if (!self.head_done.load(.acquire)) return;
+        self.blocked.store(true, .release);
+        while (!self.release.load(.acquire)) sleepMs(2);
+    }
+
+    fn noteHeadEnd(self: GatedChunkWriter) void {
+        if (std.mem.endsWith(u8, self.captured.items, "\r\n\r\n")) self.head_done.store(true, .release);
+    }
+
+    pub fn writeAll(self: GatedChunkWriter, bytes: []const u8) !void {
+        self.gate();
+        try self.captured.appendSlice(bytes);
+        self.noteHeadEnd();
+    }
+
+    pub fn print(self: GatedChunkWriter, comptime fmt: []const u8, args: anytype) !void {
+        self.gate();
+        var buf: [64]u8 = undefined;
+        try self.captured.appendSlice(try std.fmt.bufPrint(&buf, fmt, args));
+        self.noteHeadEnd();
+    }
+};
+
+const H2GatedExchangeCtx = struct {
+    pool: *http.upstream_h2.H2ConnPool,
+    port: u16,
+    uri: std.Uri,
+    /// The size the exchange's config asks for; `streamViaH2Pool` allocates.
+    read_buf_bytes: usize,
+    captured: *std.array_list.Managed(u8),
+    security: *const http.security_headers.SecurityHeaders,
+    limits: proxy_buffer_account.Limits,
+    observer: proxy_buffer_account.Observer,
+    global: *proxy_buffer_account.Aggregate,
+    head_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    blocked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    failed: bool = false,
+    status: u16 = 0,
+};
+
+fn runH2GatedExchangeThread(ctx: *H2GatedExchangeCtx) void {
+    defer ctx.finished.store(true, .release);
+    var source = FakeUploadSource{ .data = "" };
+    const result = streamViaH2Pool(
+        std.testing.allocator,
+        ctx.pool,
+        null,
+        "127.0.0.1",
+        ctx.port,
+        null, // prior-knowledge h2c
+        ctx.uri,
+        "GET",
+        &.{},
+        "",
+        null, // no upload: this is about the response relay buffer
+        ctx.read_buf_bytes,
+        &source,
+        GatedChunkWriter{
+            .captured = ctx.captured,
+            .head_done = &ctx.head_done,
+            .blocked = &ctx.blocked,
+            .release = &ctx.release,
+        },
+        ctx.security,
+        null,
+        null,
+        "h2-response-buffer-test",
+        2000,
+        10_000,
+        null,
+        ctx.limits,
+        ctx.observer,
+        ctx.global,
+    ) catch {
+        ctx.failed = true;
+        return;
+    };
+    ctx.status = result.status_code;
+}
+
+/// Wait (bounded) for a gated exchange thread to finish. Used where the test
+/// wants the exchange's result before its own deferred join runs.
+fn waitForExchange(ctx: *H2GatedExchangeCtx) void {
+    var waited: u32 = 0;
+    while (!ctx.finished.load(.acquire) and waited < 30_000) : (waited += 5) sleepMs(5);
+}
+
+test "an http2 response relay buffer is charged to the aggregate scopes while it relays" {
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    var origin_server = H2GatedBodyOrigin{ .listen_fd = listener.fd };
+    const origin_thread = try std.Thread.spawn(.{}, h2GatedBodyServe, .{&origin_server});
+
+    // Large enough that the stream queue's own retained allocation for two
+    // body bytes cannot be mistaken for it.
+    const read_buf_bytes: usize = 64 * 1024;
+    const limits = uploadTestLimits(1024 * 1024);
+    // Room for two relay buffers. One is what the exchange takes; the second
+    // is what a concurrent response would need, and must no longer be
+    // available while this one is relaying.
+    var global = proxy_buffer_account.Aggregate.init(.global, 2 * read_buf_bytes);
+
+    var counters = UploadBufferObserver{};
+    var captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer captured.deinit();
+    var security = http.security_headers.SecurityHeaders{};
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/download", .{listener.port}));
+
+    var pool = http.upstream_h2.H2ConnPool.init(std.testing.allocator, .{
+        .proxy_buffer_limits = blk: {
+            var origin_limits = limits;
+            origin_limits.per_origin_hard_limit = 2 * read_buf_bytes;
+            break :blk origin_limits;
+        },
+    });
+    defer origin_thread.join();
+    defer pool.deinit();
+    // The same account the exchange will reserve against: the pool hands out a
+    // pointer that is stable for its lifetime, so reading it here observes the
+    // origin scope the relay is actually charged to rather than a stand-in.
+    var origin_key_buf: [64]u8 = undefined;
+    const origin_key = try std.fmt.bufPrint(&origin_key_buf, "h2c:127.0.0.1:{d}", .{listener.port});
+    const origin = try pool.originBufferAccount(origin_key);
+
+    var ctx = H2GatedExchangeCtx{
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf_bytes = read_buf_bytes,
+        .captured = &captured,
+        .security = &security,
+        .limits = limits,
+        .observer = counters.observer(),
+        .global = &global,
+    };
+    const exchange = try std.Thread.spawn(.{}, runH2GatedExchangeThread, .{&ctx});
+    // Teardown has to survive an early assertion failure below, or the pool is
+    // destroyed while the exchange is still using it. Declared so they run as:
+    // open the gates, join the exchange, destroy the pool, join the origin
+    // (which only exits once the pool closes the connection).
+    defer exchange.join();
+    defer {
+        ctx.release.store(true, .release);
+        origin_server.release_end.store(true, .release);
+    }
+
+    // The client has the head and has stopped reading; the relay is parked
+    // inside the body write, holding the relay buffer, with the queue's
+    // reservation not yet acknowledged.
+    var waited: u32 = 0;
+    while (!ctx.blocked.load(.acquire) and waited < 30_000) : (waited += 5) sleepMs(5);
+    try std.testing.expect(ctx.blocked.load(.acquire));
+
+    // The relay buffer is represented in the process aggregate. Before it was
+    // charged, this read only the stream queue's retained bytes for a two-byte
+    // body, which is nowhere near a relay buffer.
+    try std.testing.expect(global.currentBytes(.upstream_to_downstream) >= read_buf_bytes);
+    // The origin scope carries it too, so one slow origin's relay buffers are
+    // contained by its own limit and not only by the process ceiling.
+    try std.testing.expect(origin.currentBytes(.upstream_to_downstream) >= read_buf_bytes);
+
+    // And the ceiling actually accounts for it: a concurrent response needing
+    // its own relay buffer no longer fits, which is the whole point — N slow
+    // responses used to be able to hold N relay buffers beyond the configured
+    // limit with nothing in the accounting to show for it.
+    var other = UploadBufferObserver{};
+    var concurrent = ProxyBufferReservation.init(
+        .upstream_to_downstream,
+        limits,
+        other.observer(),
+        .{ .global = &global },
+    );
+    try std.testing.expectError(
+        error.ProxyBufferCapacityUnavailable,
+        concurrent.reserve(read_buf_bytes),
+    );
+    try std.testing.expectEqual(@as(u64, 1), other.aggregate_limit_exceeded);
+
+    // Let the client drain and the origin finish the message.
+    ctx.release.store(true, .release);
+    origin_server.release_end.store(true, .release);
+    waitForExchange(&ctx);
+    try std.testing.expect(!ctx.failed);
+    try std.testing.expectEqual(@as(u16, 200), ctx.status);
+
+    // Every scope returns to zero once the exchange ends. The origin accounts
+    // live in the pool, so they are read before the deferred `pool.deinit()`.
+    try std.testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), origin.currentBytes(.downstream_to_upstream));
+
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.downstream_to_upstream));
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+    // The body really did reach the client, so this measured a working relay.
+    try std.testing.expect(std.mem.find(u8, captured.items, "hi") != null);
+}
+
+test "an http2 stream cannot own more than its per-stream hard limit across queue and relay" {
+    // The queue and the relay buffer are live at the same time, so each having
+    // its own per-stream budget let one stream own two hard limits' worth with
+    // neither budget reporting an exceedance. They now share one.
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    var origin_server = H2GatedBodyOrigin{ .listen_fd = listener.fd };
+    const origin_thread = try std.Thread.spawn(.{}, h2GatedBodyServe, .{&origin_server});
+
+    const read_buf_bytes: usize = 16 * 1024;
+    // A policy sized exactly the way config validation now requires: the hard
+    // limit covers one full window plus one relay buffer, and no more. That
+    // makes the shared budget's ceiling observable — anything above
+    // `high + relay` would have to come from double-budgeting.
+    const high = 16 * 1024;
+    const limits = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = high / 2,
+        .per_stream_high_watermark = high,
+        .per_stream_hard_limit = high + read_buf_bytes,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    // Generous aggregates: this test is about the per-stream budget, so
+    // nothing else may be what refuses.
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+
+    var counters = UploadBufferObserver{};
+    var captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer captured.deinit();
+    var security = http.security_headers.SecurityHeaders{};
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/download", .{listener.port}));
+
+    var pool = http.upstream_h2.H2ConnPool.init(std.testing.allocator, .{ .proxy_buffer_limits = limits });
+    defer origin_thread.join();
+    defer pool.deinit();
+    var ctx = H2GatedExchangeCtx{
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf_bytes = read_buf_bytes,
+        .captured = &captured,
+        .security = &security,
+        .limits = limits,
+        .observer = counters.observer(),
+        .global = &global,
+    };
+    const exchange = try std.Thread.spawn(.{}, runH2GatedExchangeThread, .{&ctx});
+    defer exchange.join();
+    defer {
+        ctx.release.store(true, .release);
+        origin_server.release_end.store(true, .release);
+    }
+
+    var waited: u32 = 0;
+    while (!ctx.blocked.load(.acquire) and waited < 30_000) : (waited += 5) sleepMs(5);
+    try std.testing.expect(ctx.blocked.load(.acquire));
+
+    // Parked mid-relay with both copies owned. The process gauge sees the
+    // relay buffer and the queue's retained storage together, and that total
+    // must be inside the one per-stream hard limit rather than inside two.
+    const owned = global.currentBytes(.upstream_to_downstream);
+    try std.testing.expect(owned >= read_buf_bytes); // the relay buffer is in there
+    try std.testing.expect(owned <= limits.per_stream_hard_limit);
+
+    ctx.release.store(true, .release);
+    origin_server.release_end.store(true, .release);
+    waitForExchange(&ctx);
+    try std.testing.expect(!ctx.failed);
+    try std.testing.expectEqual(@as(u16, 200), ctx.status);
+
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+}
+
+test "a stream queue's hard limit is reduced by the relay buffer it coexists with" {
+    // The queue and the response relay buffer are live at the same time, so
+    // the per-stream hard limit has to cover both. That is enforced by holding
+    // the relay's size back from the queue's own limit rather than by sharing
+    // a budget object between a worker and the connection's reader thread.
+    const relay_bytes: usize = 16 * 1024;
+    const limits = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 8 * 1024,
+        .per_stream_high_watermark = 16 * 1024,
+        .per_stream_hard_limit = 16 * 1024 + relay_bytes,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+
+    var queue_limits = limits;
+    queue_limits.per_stream_hard_limit -|= relay_bytes;
+    var queue = proxy_buffer_account.Account.init(.upstream_to_downstream, .stream, queue_limits);
+
+    // The queue still has room for a full receive window, which is what config
+    // validation's `hard >= high + relay` rule guarantees.
+    try queue.reserve(limits.per_stream_high_watermark);
+    // But not for the relay buffer's share on top: together they would exceed
+    // the configured per-stream hard limit.
+    try std.testing.expectError(error.BufferLimitExceeded, queue.reserve(relay_bytes));
+    try std.testing.expectEqual(@as(u64, 1), queue.snapshot().limit_exceeded_events);
+
+    // Queue + relay is exactly the configured limit, never more.
+    try std.testing.expectEqual(
+        limits.per_stream_hard_limit,
+        queue_limits.per_stream_hard_limit + relay_bytes,
+    );
+    queue.releaseAll();
+}
+
+/// The multi-stream form of `h2GatedBodyServe`: serves `stream_count` requests
+/// on **one** connection, so a test can reuse a pooled connection across a
+/// reload. Each response is a head plus one DATA frame, with `END_STREAM` held
+/// back until released.
+const H2GatedMultiOrigin = struct {
+    listen_fd: std.posix.fd_t,
+    stream_count: usize,
+    release_end: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn h2GatedMultiServe(origin: *H2GatedMultiOrigin) void {
+    const conn = std.c.accept(origin.listen_fd, null, null);
+    if (conn < 0) return;
+    defer _ = std.c.close(conn);
+
+    var preface: [24]u8 = undefined;
+    if (!readExactlyFromFd(conn, &preface)) return;
+    const settings = [_]u8{ 0, 0, 0, 0x04, 0, 0, 0, 0, 0 };
+    _ = std.c.write(conn, &settings, settings.len);
+
+    var served: usize = 0;
+    while (served < origin.stream_count) : (served += 1) {
+        var stream_id: u32 = 0;
+        while (stream_id == 0) {
+            var hdr: [9]u8 = undefined;
+            if (!readExactlyFromFd(conn, &hdr)) return;
+            const payload_len = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | @as(usize, hdr[2]);
+            const typ = hdr[3];
+            const sid = std.mem.readInt(u32, hdr[5..9], .big) & 0x7fff_ffff;
+            var scratch: [4096]u8 = undefined;
+            var remaining = payload_len;
+            while (remaining > 0) {
+                const take = @min(remaining, scratch.len);
+                if (!readExactlyFromFd(conn, scratch[0..take])) return;
+                remaining -= take;
+            }
+            if (typ == 0x01) stream_id = sid;
+        }
+
+        var head_frame = [_]u8{ 0, 0, 1, 0x01, 0x04, 0, 0, 0, 0, 0x88 };
+        std.mem.writeInt(u32, head_frame[5..9], stream_id, .big);
+        _ = std.c.write(conn, &head_frame, head_frame.len);
+
+        var body_frame = [_]u8{ 0, 0, 2, 0x00, 0x00, 0, 0, 0, 0, 'h', 'i' };
+        std.mem.writeInt(u32, body_frame[5..9], stream_id, .big);
+        _ = std.c.write(conn, &body_frame, body_frame.len);
+
+        // The last stream is the one the test parks on; earlier ones complete
+        // straight away so the connection lands back in the pool.
+        if (served + 1 == origin.stream_count) {
+            while (!origin.release_end.load(.acquire)) sleepMs(5);
+        }
+        var end_frame = [_]u8{ 0, 0, 0, 0x00, 0x01, 0, 0, 0, 0 };
+        std.mem.writeInt(u32, end_frame[5..9], stream_id, .big);
+        _ = std.c.write(conn, &end_frame, end_frame.len);
+    }
+
+    var drain: [256]u8 = undefined;
+    while (true) {
+        const got = std.c.read(conn, &drain, drain.len);
+        if (got <= 0) break;
+    }
+}
+
+test "a stream on a pooled http2 connection is judged by the policy that connection pinned" {
+    // A pooled connection outlives a reload, and the queue is deliberately
+    // judged by the policy the connection advertised. Anything the caller
+    // sizes from its own config snapshot would put the same stream under two
+    // generations of policy at once — larger or smaller than the connection's,
+    // depending on which way the reload went — so the outcome would depend on
+    // whether the request happened to reuse a pre-reload connection.
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    var origin_server = H2GatedMultiOrigin{ .listen_fd = listener.fd, .stream_count = 2 };
+    const origin_thread = try std.Thread.spawn(.{}, h2GatedMultiServe, .{&origin_server});
+
+    // Policy A pins the connection. Its hard limit leaves exactly one 16 KiB
+    // relay buffer above the window, which is the tightest validation allows.
+    const relay_bytes = 16 * 1024;
+    const policy_a = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 8 * 1024,
+        .per_stream_high_watermark = relay_bytes,
+        .per_stream_hard_limit = relay_bytes * 2,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    // Policy B is four times larger in every dimension. If any per-stream
+    // decision came from the caller's snapshot it would be visibly bigger than
+    // what A allows.
+    const policy_b = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 32 * 1024,
+        .per_stream_high_watermark = 64 * 1024,
+        .per_stream_hard_limit = 128 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+
+    // Sized from B's larger `proxy_stream_buffer_size`, as a post-reload
+    // request would ask for.
+    const read_buf_bytes: usize = 64 * 1024;
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    var counters = UploadBufferObserver{};
+    var captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer captured.deinit();
+    var security = http.security_headers.SecurityHeaders{};
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/download", .{listener.port}));
+
+    var pool = http.upstream_h2.H2ConnPool.init(std.testing.allocator, .{ .proxy_buffer_limits = policy_a });
+    defer origin_thread.join();
+    defer pool.deinit();
+
+    // Exchange one opens the connection under A and completes, returning it to
+    // the pool.
+    var first_captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer first_captured.deinit();
+    var first = H2GatedExchangeCtx{
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf_bytes = read_buf_bytes,
+        .captured = &first_captured,
+        .security = &security,
+        .limits = policy_a,
+        .observer = counters.observer(),
+        .global = &global,
+    };
+    first.release.store(true, .release); // never park this one
+    origin_server.release_end.store(false, .release);
+    runH2GatedExchangeThread(&first);
+    try std.testing.expect(!first.failed);
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+
+    // Reload to B. The pool's *new* connections would get B; this one keeps A.
+    pool.setProxyBufferLimits(policy_b);
+    try std.testing.expectEqual(policy_b, pool.currentProxyBufferLimits());
+
+    // Exchange two runs with B as its config snapshot but reuses the
+    // A-pinned connection, and parks mid-relay so the accounting is readable.
+    var second = H2GatedExchangeCtx{
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf_bytes = read_buf_bytes,
+        .captured = &captured,
+        .security = &security,
+        .limits = policy_b,
+        .observer = counters.observer(),
+        .global = &global,
+    };
+    const exchange = try std.Thread.spawn(.{}, runH2GatedExchangeThread, .{&second});
+    // Teardown must survive an early assertion failure, or the pool is
+    // destroyed while the exchange is still using it.
+    defer exchange.join();
+    defer {
+        second.release.store(true, .release);
+        origin_server.release_end.store(true, .release);
+    }
+
+    var waited: u32 = 0;
+    while (!second.blocked.load(.acquire) and waited < 30_000) : (waited += 5) sleepMs(5);
+    try std.testing.expect(second.blocked.load(.acquire));
+
+    // Everything this stream owns is inside A's hard limit, not B's. Sourcing
+    // the budget or the relay size from the caller's snapshot would show up
+    // here as a relay buffer of B's 64 KiB rather than the 16 KiB A can cover.
+    const owned = global.currentBytes(.upstream_to_downstream);
+    try std.testing.expect(owned >= relay_bytes);
+    try std.testing.expect(owned <= policy_a.per_stream_hard_limit);
+    try std.testing.expect(owned < policy_b.per_stream_hard_limit);
+
+    second.release.store(true, .release);
+    origin_server.release_end.store(true, .release);
+    waitForExchange(&second);
+    try std.testing.expect(!second.failed);
+    try std.testing.expectEqual(@as(u16, 200), second.status);
+
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), counters.retained);
+}
+
+/// Remembers the largest single allocation made through it. The relay buffer is
+/// by far the biggest thing a streaming exchange allocates, so this observes
+/// the size actually taken from the heap rather than the size the caller meant
+/// to use — the distinction between a buffer that is *sized* to the accounted
+/// amount and one that is merely *sliced* down to it.
+const LargestAllocationTracker = struct {
+    child: std.mem.Allocator,
+    largest: usize = 0,
+    /// Relay-sized allocations currently live, and the high-water mark of that.
+    /// Tracked separately from `largest` because the question "did N concurrent
+    /// requests each allocate a relay buffer" is about *concurrent* ownership,
+    /// which a largest-single-allocation figure cannot answer. Small
+    /// allocations are ignored so header and arena churn cannot drown the
+    /// signal.
+    large_live: usize = 0,
+    peak_large_live: usize = 0,
+    /// Fail any allocation at or above the relay threshold once this is set,
+    /// so a test can drive the out-of-memory path at exactly the relay buffer.
+    fail_large: bool = false,
+    large_threshold: usize = min_proxy_relay_bytes,
+    mutex: compat.Mutex = .{},
+
+    fn allocator(self: *LargestAllocationTracker) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Every field update goes through here under the lock. `largest` is not
+    /// read concurrently by today's tests, but unsynchronized writes from
+    /// several exchange threads are a race regardless of who reads them.
+    fn noteAlloc(self: *LargestAllocationTracker, len: usize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.largest = @max(self.largest, len);
+        if (len < self.large_threshold) return;
+        self.large_live += len;
+        self.peak_large_live = @max(self.peak_large_live, self.large_live);
+    }
+
+    fn noteFree(self: *LargestAllocationTracker, len: usize) void {
+        if (len < self.large_threshold) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.large_live -= @min(self.large_live, len);
+    }
+
+    fn largestAllocation(self: *LargestAllocationTracker) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.largest;
+    }
+
+    fn peakLargeLive(self: *LargestAllocationTracker) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.peak_large_live;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *LargestAllocationTracker = @ptrCast(@alignCast(ctx));
+        if (self.fail_large and len >= self.large_threshold) return null;
+        const ptr = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.noteAlloc(len);
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *LargestAllocationTracker = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.noteFree(memory.len);
+        self.noteAlloc(new_len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *LargestAllocationTracker = @ptrCast(@alignCast(ctx));
+        const ptr = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.noteFree(memory.len);
+        self.noteAlloc(new_len);
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *LargestAllocationTracker = @ptrCast(@alignCast(ctx));
+        self.noteFree(memory.len);
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+};
+
+const H2TrackedExchangeCtx = struct {
+    allocator: std.mem.Allocator,
+    pool: *http.upstream_h2.H2ConnPool,
+    port: u16,
+    uri: std.Uri,
+    read_buf_bytes: usize,
+    captured: *std.array_list.Managed(u8),
+    security: *const http.security_headers.SecurityHeaders,
+    limits: proxy_buffer_account.Limits,
+    /// Owned per exchange rather than shared: `UploadBufferObserver` keeps
+    /// plain counters, and several of these run concurrently, where a shared
+    /// one would race its own subtraction into a wrap.
+    counters: UploadBufferObserver = .{},
+    global: *proxy_buffer_account.Aggregate,
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    failed: bool = false,
+    err: ?anyerror = null,
+    status: u16 = 0,
+};
+
+fn runH2TrackedExchange(ctx: *H2TrackedExchangeCtx) void {
+    defer ctx.finished.store(true, .release);
+    var source = FakeUploadSource{ .data = "" };
+    const result = streamViaH2Pool(
+        ctx.allocator,
+        ctx.pool,
+        null,
+        "127.0.0.1",
+        ctx.port,
+        null, // prior-knowledge h2c
+        ctx.uri,
+        "GET",
+        &.{},
+        "",
+        null,
+        ctx.read_buf_bytes,
+        &source,
+        CaptureWriter{ .list = ctx.captured },
+        ctx.security,
+        null,
+        null,
+        "h2-allocation-test",
+        2000,
+        10_000,
+        null,
+        ctx.limits,
+        ctx.counters.observer(),
+        ctx.global,
+    ) catch |err| {
+        ctx.failed = true;
+        ctx.err = err;
+        return;
+    };
+    ctx.status = result.status_code;
+}
+
+test "an http2 relay buffer allocates exactly what it accounts across a buffer-size reload" {
+    // Capping the *slice* is not enough: the allocation is what costs memory.
+    // A reload that grows `proxy_stream_buffer_size` must not let a request on
+    // an older connection allocate the larger buffer and charge only the part
+    // its pinned policy covers — with N concurrent streams that is precisely
+    // the retained-but-unaccounted allocation these limits exist to bound.
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    var origin_server = H2GatedMultiOrigin{ .listen_fd = listener.fd, .stream_count = 2 };
+    origin_server.release_end.store(true, .release); // neither stream parks
+    const origin_thread = try std.Thread.spawn(.{}, h2GatedMultiServe, .{&origin_server});
+
+    const pinned_relay_bytes: usize = 16 * 1024;
+    const policy_a = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 8 * 1024,
+        .per_stream_high_watermark = pinned_relay_bytes,
+        .per_stream_hard_limit = pinned_relay_bytes * 2,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    const policy_b = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 256 * 1024,
+        .per_stream_high_watermark = 512 * 1024,
+        .per_stream_hard_limit = 2 * 1024 * 1024,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    var captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer captured.deinit();
+    var security = http.security_headers.SecurityHeaders{};
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/download", .{listener.port}));
+
+    // Ordered so the pool tears connections down before the origin thread is
+    // joined, and so an assertion failure below still cleans up rather than
+    // reporting the connection as a leak.
+    var pool = http.upstream_h2.H2ConnPool.init(std.testing.allocator, .{ .proxy_buffer_limits = policy_a });
+    defer origin_thread.join();
+    defer pool.deinit();
+
+    // First exchange pins the connection to A, under A's own buffer size.
+    var warm_captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer warm_captured.deinit();
+    var warm = H2TrackedExchangeCtx{
+        .allocator = std.testing.allocator,
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf_bytes = pinned_relay_bytes,
+        .captured = &warm_captured,
+        .security = &security,
+        .limits = policy_a,
+        .global = &global,
+    };
+    runH2TrackedExchange(&warm);
+    try std.testing.expect(!warm.failed);
+    try std.testing.expectEqual(@as(u16, 200), warm.status);
+
+    // Reload to a policy whose buffer size is 64x larger, then reuse the
+    // A-pinned connection.
+    pool.setProxyBufferLimits(policy_b);
+    const reloaded_relay_bytes: usize = 1024 * 1024;
+
+    var tracker = LargestAllocationTracker{ .child = std.testing.allocator };
+    var tracked = H2TrackedExchangeCtx{
+        .allocator = tracker.allocator(),
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf_bytes = reloaded_relay_bytes,
+        .captured = &captured,
+        .security = &security,
+        .limits = policy_b,
+        .global = &global,
+    };
+    runH2TrackedExchange(&tracked);
+    try std.testing.expect(!tracked.failed);
+    try std.testing.expectEqual(@as(u16, 200), tracked.status);
+
+    // What was taken from the heap is what the pinned policy accounts for —
+    // not the 1 MiB the reloaded config asked for. Slicing a 1 MiB allocation
+    // down to 16 KiB would leave this reading 1 MiB.
+    try std.testing.expectEqual(pinned_relay_bytes, tracker.largestAllocation());
+    try std.testing.expect(tracker.largestAllocation() < reloaded_relay_bytes);
+    // And that allocation is what was charged. (The peak also carries the
+    // stream queue's couple of body bytes, so this is a band rather than an
+    // equality — the point is that it tracks the pinned size, not the 1 MiB
+    // the reloaded config asked for.)
+    try std.testing.expect(tracked.counters.peak_reserved >= pinned_relay_bytes);
+    try std.testing.expect(tracked.counters.peak_reserved < reloaded_relay_bytes);
+
+    try std.testing.expectEqual(@as(usize, 0), tracked.counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), tracked.counters.retained);
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+}
+
+test "a pinned policy with no relay headroom refuses rather than truncating silently" {
+    // Config validation makes this policy unreachable, but `Limits` can be
+    // built directly. The sizing arithmetic must not be able to produce a
+    // zero-length relay buffer: `readStreamingBody` would return 0, the relay
+    // would read that as end of body, and the response would be truncated with
+    // nothing logged and no metric moved. Flooring turns it into an ordinary
+    // over-budget refusal instead.
+    const airless = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 8 * 1024,
+        .per_stream_high_watermark = 16 * 1024,
+        .per_stream_hard_limit = 16 * 1024, // high == hard: no headroom at all
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    const headroom = airless.per_stream_hard_limit -| airless.per_stream_high_watermark;
+    try std.testing.expectEqual(@as(usize, 0), headroom);
+    const sized = @max(@min(@as(usize, 64 * 1024), headroom), min_proxy_relay_bytes);
+    try std.testing.expectEqual(min_proxy_relay_bytes, sized);
+
+    // And with no headroom, the queue's own limit is reduced to nothing by the
+    // relay it has to coexist with, so the very first queued byte is refused
+    // rather than the response being silently cut short.
+    var queue_limits = airless;
+    queue_limits.per_stream_hard_limit -|= sized;
+    try std.testing.expectEqual(@as(usize, 0), queue_limits.per_stream_hard_limit);
+    var queue = proxy_buffer_account.Account.init(.upstream_to_downstream, .stream, queue_limits);
+    try std.testing.expectError(error.BufferLimitExceeded, queue.reserve(1));
+    try std.testing.expectEqual(@as(u64, 1), queue.snapshot().limit_exceeded_events);
+}
+
+/// An h2c origin that accepts `stream_count` requests and answers none of them
+/// until released. That parks every exchange in the window between acquiring a
+/// connection and knowing the response head — the window where a relay buffer
+/// must not yet exist.
+const H2SilentHeadOrigin = struct {
+    listen_fd: std.posix.fd_t,
+    /// Streams answered immediately, to establish the pooled connection before
+    /// the concurrent phase. Without this the concurrent exchanges race to
+    /// create the connection and the losers sit in the listen backlog of a
+    /// fixture that only ever accepts one.
+    warm_count: usize,
+    stream_count: usize,
+    seen: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+/// Read one frame header + payload, reporting its type and stream id.
+fn h2ReadFrame(conn: std.posix.fd_t) ?struct { typ: u8, stream_id: u32 } {
+    var hdr: [9]u8 = undefined;
+    if (!readExactlyFromFd(conn, &hdr)) return null;
+    const payload_len = (@as(usize, hdr[0]) << 16) | (@as(usize, hdr[1]) << 8) | @as(usize, hdr[2]);
+    const typ = hdr[3];
+    const sid = std.mem.readInt(u32, hdr[5..9], .big) & 0x7fff_ffff;
+    var scratch: [4096]u8 = undefined;
+    var remaining = payload_len;
+    while (remaining > 0) {
+        const take = @min(remaining, scratch.len);
+        if (!readExactlyFromFd(conn, scratch[0..take])) return null;
+        remaining -= take;
+    }
+    return .{ .typ = typ, .stream_id = sid };
+}
+
+fn h2AnswerBodiless(conn: std.posix.fd_t, stream_id: u32) void {
+    var head_frame = [_]u8{ 0, 0, 1, 0x01, 0x04, 0, 0, 0, 0, 0x88 };
+    std.mem.writeInt(u32, head_frame[5..9], stream_id, .big);
+    _ = std.c.write(conn, &head_frame, head_frame.len);
+    var end_frame = [_]u8{ 0, 0, 0, 0x00, 0x01, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, end_frame[5..9], stream_id, .big);
+    _ = std.c.write(conn, &end_frame, end_frame.len);
+}
+
+fn h2SilentHeadServe(origin: *H2SilentHeadOrigin) void {
+    const conn = std.c.accept(origin.listen_fd, null, null);
+    if (conn < 0) return;
+    defer _ = std.c.close(conn);
+
+    var preface: [24]u8 = undefined;
+    if (!readExactlyFromFd(conn, &preface)) return;
+    const settings = [_]u8{ 0, 0, 0, 0x04, 0, 0, 0, 0, 0 };
+    _ = std.c.write(conn, &settings, settings.len);
+
+    // Warm-up: answer immediately so the connection lands back in the pool and
+    // the concurrent phase below is guaranteed to reuse it.
+    var warmed: usize = 0;
+    while (warmed < origin.warm_count) {
+        const frame = h2ReadFrame(conn) orelse return;
+        if (frame.typ != 0x01) continue;
+        h2AnswerBodiless(conn, frame.stream_id);
+        warmed += 1;
+    }
+
+    // Concurrent phase: collect every request and answer none of them until
+    // released, parking each exchange between acquiring the connection and
+    // learning its response head.
+    var ids: [8]u32 = undefined;
+    var count: usize = 0;
+    while (count < origin.stream_count and count < ids.len) {
+        const frame = h2ReadFrame(conn) orelse return;
+        if (frame.typ != 0x01) continue;
+        ids[count] = frame.stream_id;
+        count += 1;
+        origin.seen.store(count, .release);
+    }
+
+    while (!origin.release.load(.acquire)) sleepMs(5);
+    for (ids[0..count]) |sid| h2AnswerBodiless(conn, sid);
+
+    var drain: [256]u8 = undefined;
+    while (true) {
+        const got = std.c.read(conn, &drain, drain.len);
+        if (got <= 0) break;
+    }
+}
+
+test "http2 relay memory is not allocated until a reservation admits it" {
+    // The peak this bound exists to prevent happens *before* the refusal if
+    // allocation runs first: every concurrent request to a slow-to-answer
+    // origin would take a relay buffer while none had charged a scope yet, and
+    // the aggregate cap could not stop the process holding all of them.
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    const concurrency = 3;
+    var origin_server = H2SilentHeadOrigin{
+        .listen_fd = listener.fd,
+        .warm_count = 1,
+        .stream_count = concurrency,
+    };
+    const origin_thread = try std.Thread.spawn(.{}, h2SilentHeadServe, .{&origin_server});
+
+    const relay_bytes: usize = 32 * 1024;
+    const limits = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 8 * 1024,
+        .per_stream_high_watermark = 16 * 1024,
+        .per_stream_hard_limit = 16 * 1024 + relay_bytes,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    // Room for exactly one relay buffer across the whole process.
+    var global = proxy_buffer_account.Aggregate.init(.global, relay_bytes);
+    var security = http.security_headers.SecurityHeaders{};
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/download", .{listener.port}));
+
+    var tracker = LargestAllocationTracker{ .child = std.testing.allocator };
+    var pool = http.upstream_h2.H2ConnPool.init(std.testing.allocator, .{ .proxy_buffer_limits = limits });
+    defer origin_thread.join();
+    defer pool.deinit();
+
+    var captures: [concurrency]std.array_list.Managed(u8) = undefined;
+    for (&captures) |*c| c.* = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer for (&captures) |*c| c.deinit();
+
+    // Establish the pooled connection first, on the plain allocator so the
+    // tracker below measures only the concurrent phase.
+    var warm_captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer warm_captured.deinit();
+    var warm = H2TrackedExchangeCtx{
+        .allocator = std.testing.allocator,
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf_bytes = relay_bytes,
+        .captured = &warm_captured,
+        .security = &security,
+        .limits = limits,
+        .global = &global,
+    };
+    runH2TrackedExchange(&warm);
+    try std.testing.expect(!warm.failed);
+    try std.testing.expectEqual(@as(u16, 200), warm.status);
+    try std.testing.expectEqual(@as(usize, 0), tracker.peakLargeLive());
+
+    var ctxs: [concurrency]H2TrackedExchangeCtx = undefined;
+    var threads: [concurrency]std.Thread = undefined;
+    for (&ctxs, 0..) |*ctx, i| {
+        ctx.* = .{
+            .allocator = tracker.allocator(),
+            .pool = &pool,
+            .port = listener.port,
+            .uri = uri,
+            .read_buf_bytes = relay_bytes,
+            .captured = &captures[i],
+            .security = &security,
+            .limits = limits,
+            .global = &global,
+        };
+        threads[i] = try std.Thread.spawn(.{}, runH2TrackedExchange, .{ctx});
+    }
+    // Same teardown ordering as the gated tests: an assertion failing below
+    // must not leave three live exchanges using a pool that is about to be
+    // destroyed. Runs as: open the gate, join the exchanges, destroy the pool,
+    // join the origin.
+    defer for (threads) |thread| thread.join();
+    defer origin_server.release.store(true, .release);
+
+    // All three have reached the origin and are waiting on a response head.
+    var waited: u32 = 0;
+    while (origin_server.seen.load(.acquire) < concurrency and waited < 30_000) : (waited += 5) sleepMs(5);
+    try std.testing.expectEqual(@as(usize, concurrency), origin_server.seen.load(.acquire));
+    // Give any eager allocation a chance to have happened before measuring.
+    sleepMs(50);
+
+    // Nothing has been admitted yet, so no relay memory may exist. With
+    // allocation ahead of reservation this reads 3 x 32 KiB.
+    try std.testing.expectEqual(@as(usize, 0), tracker.peakLargeLive());
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+
+    origin_server.release.store(true, .release);
+    for (&ctxs) |*ctx| {
+        var waited_done: u32 = 0;
+        while (!ctx.finished.load(.acquire) and waited_done < 30_000) : (waited_done += 5) sleepMs(5);
+    }
+
+    // Once heads arrive each response is admitted in turn and allocates its
+    // buffer then. The cap is what bounds the process: it can never hold more
+    // relay memory than one admitted reservation's worth, however the three
+    // interleave.
+    try std.testing.expect(tracker.peakLargeLive() <= relay_bytes);
+
+    // Whatever the interleaving, every exchange either completed or was turned
+    // away for capacity — never for some other reason, and never by allocating
+    // first and discovering the limit afterwards.
+    var completed: usize = 0;
+    for (&ctxs) |*ctx| {
+        if (ctx.failed) {
+            try std.testing.expectEqual(
+                @as(?anyerror, error.ProxyBufferCapacityUnavailable),
+                ctx.err,
+            );
+        } else {
+            try std.testing.expectEqual(@as(u16, 200), ctx.status);
+            completed += 1;
+        }
+    }
+    try std.testing.expect(completed >= 1);
+
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+    for (&ctxs) |*ctx| try std.testing.expectEqual(@as(usize, 0), ctx.counters.reserved);
+}
+
+test "a failed relay allocation hands the http2 connection back" {
+    // The relay buffer is allocated after the connection is acquired, so its
+    // failure path has to release that reference. Leaking it would strand a
+    // pool connection on every out-of-memory response.
+    const listener = try listenLoopbackEphemeral();
+    defer _ = std.c.close(listener.fd);
+
+    var origin_server = H2GatedMultiOrigin{ .listen_fd = listener.fd, .stream_count = 2 };
+    origin_server.release_end.store(true, .release);
+    const origin_thread = try std.Thread.spawn(.{}, h2GatedMultiServe, .{&origin_server});
+
+    const relay_bytes: usize = 32 * 1024;
+    const limits = proxy_buffer_account.Limits{
+        .per_stream_low_watermark = 8 * 1024,
+        .per_stream_high_watermark = 16 * 1024,
+        .per_stream_hard_limit = 16 * 1024 + relay_bytes,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    };
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    var security = http.security_headers.SecurityHeaders{};
+    var url_buf: [64]u8 = undefined;
+    const uri = try std.Uri.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/download", .{listener.port}));
+
+    var pool = http.upstream_h2.H2ConnPool.init(std.testing.allocator, .{ .proxy_buffer_limits = limits });
+    defer origin_thread.join();
+    defer pool.deinit();
+
+    var failing = LargestAllocationTracker{ .child = std.testing.allocator, .fail_large = true };
+    var failed_captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer failed_captured.deinit();
+    var failed_ctx = H2TrackedExchangeCtx{
+        .allocator = failing.allocator(),
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf_bytes = relay_bytes,
+        .captured = &failed_captured,
+        .security = &security,
+        .limits = limits,
+        .global = &global,
+    };
+    runH2TrackedExchange(&failed_ctx);
+    try std.testing.expect(failed_ctx.failed);
+
+    // The pool is still usable, which it would not be if the reference were
+    // stranded — and the testing allocator's leak check covers the connection
+    // object itself at `pool.deinit()`.
+    var ok_captured = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer ok_captured.deinit();
+    var ok_ctx = H2TrackedExchangeCtx{
+        .allocator = std.testing.allocator,
+        .pool = &pool,
+        .port = listener.port,
+        .uri = uri,
+        .read_buf_bytes = relay_bytes,
+        .captured = &ok_captured,
+        .security = &security,
+        .limits = limits,
+        .global = &global,
+    };
+    runH2TrackedExchange(&ok_ctx);
+    try std.testing.expect(!ok_ctx.failed);
+    try std.testing.expectEqual(@as(u16, 200), ok_ctx.status);
+
+    try std.testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
+    try std.testing.expectEqual(@as(usize, 0), failed_ctx.counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), ok_ctx.counters.reserved);
+    try std.testing.expectEqual(@as(usize, 0), ok_ctx.counters.retained);
 }

@@ -18,6 +18,7 @@
 const std = @import("std");
 const compat = @import("zig_compat");
 const tls_termination = @import("tls_backend.zig");
+const proxy_buffer_account = @import("proxy_buffer_account.zig");
 
 pub const Config = struct {
     enabled: bool = true,
@@ -36,6 +37,17 @@ pub const Config = struct {
     max_active_per_host: usize = 0,
     /// Opt-in benchmark instrumentation for shared-pool mutex wait time.
     lock_contention_metrics_enabled: bool = false,
+    /// Proxy buffer policy for HTTP/1 origins (#140). Only
+    /// `per_origin_hard_limit` is read here — the per-stream watermarks belong
+    /// to the relay, not the pool. Update through `setProxyBufferLimits`, never
+    /// by writing this field: a request must not push its own config snapshot
+    /// into shared state, or one that started before a reload would land here
+    /// afterwards and restore the superseded limit.
+    ///
+    /// Unlike the rest of `Config`, this field is mutable at runtime and is
+    /// guarded by `origin_buffers_mutex` — the same lock as the accounts it
+    /// initializes.
+    proxy_buffer_limits: proxy_buffer_account.Limits = proxy_buffer_account.Limits.defaults(),
 };
 
 /// Identifier of the worker thread that last released a connection. Used purely
@@ -99,6 +111,36 @@ pub const HostSnapshot = struct {
     stats: HostStats,
 };
 
+/// A copy of one HTTP/1 origin's proxy buffer accounting for rendering (#140).
+/// `origin` is the pool key (`http:host:port`, `https:host:port`, or
+/// `unix:/path`), owned by the caller and freed via `freeOriginBufferSnapshots`.
+///
+/// Separate from `HostSnapshot` because the two maps do not have the same
+/// membership: an origin accrues a buffer account whenever it is proxied to,
+/// including when connection pooling is disabled and no host entry exists.
+pub const OriginBufferSnapshot = struct {
+    origin: []u8,
+    /// Bytes this origin's relays currently hold, by direction. Request and
+    /// response relay buffers clear the *same* per-origin limit, so reporting
+    /// one direction would let the gauge read zero while the limit was being
+    /// enforced against the other.
+    buffered_bytes: [2]usize,
+    buffer_limit_exceeded_total: [2]u64,
+
+    pub fn bufferedBytes(self: *const OriginBufferSnapshot, direction: proxy_buffer_account.Direction) usize {
+        return self.buffered_bytes[@intFromEnum(direction)];
+    }
+
+    pub fn bufferLimitExceeded(self: *const OriginBufferSnapshot, direction: proxy_buffer_account.Direction) u64 {
+        return self.buffer_limit_exceeded_total[@intFromEnum(direction)];
+    }
+};
+
+pub fn freeOriginBufferSnapshots(allocator: std.mem.Allocator, snaps: []OriginBufferSnapshot) void {
+    for (snaps) |snap| allocator.free(snap.origin);
+    allocator.free(snaps);
+}
+
 /// Connect-latency histogram buckets (milliseconds, cumulative `le` bounds).
 pub const connect_latency_bounds_ms = [_]u64{ 1, 5, 10, 25, 50, 100, 250, 500, 1000 };
 
@@ -153,6 +195,23 @@ pub const UpstreamPool = struct {
     mutex: compat.Mutex = .{},
     config: Config,
     hosts: std.StringHashMap(HostEntry),
+    /// Origin-scope proxy buffer aggregates (#140), one per origin ever
+    /// proxied to. Held as pointers so an entry stays put across rehashes: a
+    /// relay holds its aggregate for the life of a request, and the map may
+    /// grow under it when an unrelated worker meets a new origin. Deliberately
+    /// separate from `hosts` — an origin gets an account even when connection
+    /// pooling is off, and a buffer account is not a connection statistic.
+    ///
+    /// Entries are never removed, for the same reason `hosts` keeps its own:
+    /// the keys are configured origins, so the map is bounded by the
+    /// configuration, and a live relay holds a pointer into an entry.
+    origin_buffers: std.StringHashMap(*proxy_buffer_account.Aggregate),
+    /// Guards `origin_buffers` alone. A separate lock from `mutex` on purpose:
+    /// every streaming request looks its origin's account up, and that lookup
+    /// must not join the checkout/release traffic on the shared pool mutex —
+    /// nor be counted as pool-mutex contention by the benchmark metrics. Never
+    /// held together with `mutex`, so there is no ordering to get wrong.
+    origin_buffers_mutex: compat.Mutex = .{},
     connect_latency_buckets: [connect_latency_bounds_ms.len + 1]u64 = [_]u64{0} ** (connect_latency_bounds_ms.len + 1),
     connect_latency_count: u64 = 0,
     connect_latency_sum_ms: u64 = 0,
@@ -175,6 +234,7 @@ pub const UpstreamPool = struct {
             .allocator = allocator,
             .config = config,
             .hosts = std.StringHashMap(HostEntry).init(allocator),
+            .origin_buffers = std.StringHashMap(*proxy_buffer_account.Aggregate).init(allocator),
         };
     }
 
@@ -186,7 +246,80 @@ pub const UpstreamPool = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.hosts.deinit();
+        // Safe only because every in-flight relay has finished: a live relay
+        // holds a pointer into one of these accounts.
+        var bit = self.origin_buffers.iterator();
+        while (bit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.origin_buffers.deinit();
         self.* = undefined;
+    }
+
+    /// The origin-scope proxy buffer aggregate for `key`, created on first use.
+    /// The returned pointer is stable for the pool's lifetime, so a relay may
+    /// hold it across retries and reconnects.
+    ///
+    /// Read-only with respect to policy: the hard limit comes from
+    /// `config.proxy_buffer_limits`, which only `setProxyBufferLimits` writes.
+    pub fn originBufferAccount(self: *UpstreamPool, key: []const u8) !*proxy_buffer_account.Aggregate {
+        self.origin_buffers_mutex.lock();
+        defer self.origin_buffers_mutex.unlock();
+        const gop = try self.origin_buffers.getOrPut(key);
+        if (!gop.found_existing) {
+            errdefer _ = self.origin_buffers.remove(key);
+            const account = try self.allocator.create(proxy_buffer_account.Aggregate);
+            errdefer self.allocator.destroy(account);
+            // A new origin starts under the policy in force right now, not the
+            // aggregate type's unlimited default.
+            account.* = proxy_buffer_account.Aggregate.init(.origin, self.config.proxy_buffer_limits.per_origin_hard_limit);
+            gop.key_ptr.* = try self.allocator.dupe(u8, key);
+            gop.value_ptr.* = account;
+        }
+        return gop.value_ptr.*;
+    }
+
+    /// Apply a reloaded proxy buffer policy. The per-origin hard limit takes
+    /// effect immediately for every origin, including ones already carrying
+    /// reservations: bytes already reserved above the new limit stay reserved,
+    /// and the next reservation is refused until the origin drains.
+    pub fn setProxyBufferLimits(self: *UpstreamPool, limits: proxy_buffer_account.Limits) void {
+        self.origin_buffers_mutex.lock();
+        defer self.origin_buffers_mutex.unlock();
+        self.config.proxy_buffer_limits = limits;
+        var it = self.origin_buffers.valueIterator();
+        while (it.next()) |account| account.*.setHardLimit(limits.per_origin_hard_limit);
+    }
+
+    /// Snapshot per-origin buffer accounting for rendering. Caller frees with
+    /// `freeOriginBufferSnapshots`.
+    pub fn snapshotOriginBuffers(self: *UpstreamPool, allocator: std.mem.Allocator) ![]OriginBufferSnapshot {
+        self.origin_buffers_mutex.lock();
+        defer self.origin_buffers_mutex.unlock();
+        var out = std.array_list.Managed(OriginBufferSnapshot).init(allocator);
+        errdefer {
+            for (out.items) |snap| allocator.free(snap.origin);
+            out.deinit();
+        }
+        var it = self.origin_buffers.iterator();
+        while (it.next()) |entry| {
+            const account = entry.value_ptr.*;
+            const origin = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(origin);
+            try out.append(.{
+                .origin = origin,
+                .buffered_bytes = .{
+                    account.currentBytes(.downstream_to_upstream),
+                    account.currentBytes(.upstream_to_downstream),
+                },
+                .buffer_limit_exceeded_total = .{
+                    account.limitExceededEvents(.downstream_to_upstream),
+                    account.limitExceededEvents(.upstream_to_downstream),
+                },
+            });
+        }
+        return out.toOwnedSlice();
     }
 
     fn isExpired(self: *const UpstreamPool, conn: PooledConn, now_ms: u64) bool {
@@ -681,4 +814,101 @@ test "per-host snapshot and connect-latency histogram" {
     try testing.expectEqual(@as(u64, 3), lat.count);
     try testing.expectEqual(@as(u64, 5043), lat.sum_ms);
     try testing.expectEqual(@as(u64, 1), lat.buckets[connect_latency_bounds_ms.len]); // overflow
+}
+
+// ---------------------------------------------------------------------------
+// Per-origin proxy buffer accounting for HTTP/1 origins (#140).
+// ---------------------------------------------------------------------------
+
+fn originLimits(per_origin_hard_limit: usize) proxy_buffer_account.Limits {
+    var limits = proxy_buffer_account.Limits.defaults();
+    limits.per_origin_hard_limit = per_origin_hard_limit;
+    return limits;
+}
+
+test "origin buffer accounts are stable, per-origin, and start under the configured limit" {
+    var pool = UpstreamPool.init(testing.allocator, .{ .proxy_buffer_limits = originLimits(4096) });
+    defer pool.deinit();
+
+    const a = try pool.originBufferAccount("http:origin-a:80");
+    // The pointer a relay holds must survive the map growing under it.
+    for (0..64) |i| {
+        var key_buf: [64]u8 = undefined;
+        _ = try pool.originBufferAccount(try std.fmt.bufPrint(&key_buf, "http:filler-{d}:80", .{i}));
+    }
+    try testing.expectEqual(a, try pool.originBufferAccount("http:origin-a:80"));
+    try testing.expectEqual(@as(usize, 4096), a.hardLimit());
+
+    // One origin's saturation leaves every other origin's capacity intact.
+    try a.reserve(.upstream_to_downstream, 4096);
+    try testing.expectError(error.BufferLimitExceeded, a.reserve(.upstream_to_downstream, 1));
+    const b = try pool.originBufferAccount("http:origin-b:80");
+    try b.reserve(.upstream_to_downstream, 4096);
+
+    a.release(.upstream_to_downstream, 4096);
+    b.release(.upstream_to_downstream, 4096);
+    try testing.expectEqual(@as(usize, 0), a.currentBytes(.upstream_to_downstream));
+}
+
+test "a reloaded per-origin limit applies to origins that already exist" {
+    var pool = UpstreamPool.init(testing.allocator, .{ .proxy_buffer_limits = originLimits(4096) });
+    defer pool.deinit();
+
+    const existing = try pool.originBufferAccount("http:origin:80");
+    try existing.reserve(.upstream_to_downstream, 4096);
+
+    pool.setProxyBufferLimits(originLimits(1024));
+    // Bytes already reserved above the new limit stay reserved; the next
+    // reservation is refused until the origin drains.
+    try testing.expectEqual(@as(usize, 1024), existing.hardLimit());
+    try testing.expectEqual(@as(usize, 4096), existing.currentBytes(.upstream_to_downstream));
+    try testing.expectError(error.BufferLimitExceeded, existing.reserve(.upstream_to_downstream, 1));
+    existing.release(.upstream_to_downstream, 4096);
+    try existing.reserve(.upstream_to_downstream, 1024);
+    existing.release(.upstream_to_downstream, 1024);
+
+    // And an origin first seen after the reload starts under the new policy.
+    const fresh = try pool.originBufferAccount("http:fresh:80");
+    try testing.expectEqual(@as(usize, 1024), fresh.hardLimit());
+}
+
+test "origin buffer snapshot reports both directions and refusals" {
+    var pool = UpstreamPool.init(testing.allocator, .{ .proxy_buffer_limits = originLimits(2048) });
+    defer pool.deinit();
+
+    const account = try pool.originBufferAccount("https:origin:443");
+    try account.reserve(.downstream_to_upstream, 512);
+    try account.reserve(.upstream_to_downstream, 1024);
+    try testing.expectError(error.BufferLimitExceeded, account.reserve(.upstream_to_downstream, 2048));
+
+    const snaps = try pool.snapshotOriginBuffers(testing.allocator);
+    defer freeOriginBufferSnapshots(testing.allocator, snaps);
+    try testing.expectEqual(@as(usize, 1), snaps.len);
+    try testing.expectEqualStrings("https:origin:443", snaps[0].origin);
+    try testing.expectEqual(@as(usize, 512), snaps[0].bufferedBytes(.downstream_to_upstream));
+    try testing.expectEqual(@as(usize, 1024), snaps[0].bufferedBytes(.upstream_to_downstream));
+    try testing.expectEqual(@as(u64, 0), snaps[0].bufferLimitExceeded(.downstream_to_upstream));
+    try testing.expectEqual(@as(u64, 1), snaps[0].bufferLimitExceeded(.upstream_to_downstream));
+
+    account.release(.downstream_to_upstream, 512);
+    account.release(.upstream_to_downstream, 1024);
+}
+
+test "an origin gets a buffer account even when connection pooling is disabled" {
+    // The account bounds memory, which is just as necessary without pooling.
+    var pool = UpstreamPool.init(testing.allocator, .{ .enabled = false, .proxy_buffer_limits = originLimits(2048) });
+    defer pool.deinit();
+
+    const account = try pool.originBufferAccount("http:origin:80");
+    try testing.expectEqual(@as(usize, 2048), account.hardLimit());
+
+    // No host entry exists — checkout never ran — so the two maps genuinely
+    // differ in membership and the buffer series cannot be folded into the
+    // connection series.
+    const hosts = try pool.snapshotHosts(testing.allocator);
+    defer freeHostSnapshots(testing.allocator, hosts);
+    try testing.expectEqual(@as(usize, 0), hosts.len);
+    const buffers = try pool.snapshotOriginBuffers(testing.allocator);
+    defer freeOriginBufferSnapshots(testing.allocator, buffers);
+    try testing.expectEqual(@as(usize, 1), buffers.len);
 }

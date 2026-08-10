@@ -91,6 +91,17 @@ logs are written through `src/http/logger.zig`.
   actively bounding it. Label cardinality stays bounded — two fixed directions
   per distinct configured origin — and `direction` takes the same values as the
   process-wide buffer family.
+- per-origin HTTP/1 buffer accounting:
+  `tardigrade_upstream_pool_buffered_bytes{upstream,direction}` and
+  `tardigrade_upstream_pool_buffer_limit_exceeded_total{upstream,direction}`,
+  the HTTP/1 counterparts of the two series above and read from the account
+  that enforces the per-origin limit for HTTP/1 origins. The `upstream` label
+  is the pool key (`http:host:port`, `https:host:port`, or `unix:/path`), so
+  cardinality is again two directions per distinct configured origin. These
+  series come from their own map rather than the `tardigrade_upstream_pool_*`
+  connection series: an origin gets a buffer account whenever it is proxied to,
+  including when connection pooling is disabled, so the two memberships differ
+  and summing across families would not line up.
 - configured proxy buffer limits:
   `tardigrade_buffer_config_limit_bytes{direction,scope,limit}` for the
   per-stream low/high/hard watermarks plus per-origin/global hard-limit
@@ -354,8 +365,8 @@ Two outcome shapes exist:
 | Request body too large | `TARDIGRADE_MAX_BODY_SIZE` | 1 MiB | `request_limits.validateBodySize` | `413`-class rejection |
 | Proxy per-stream buffer low watermark | `TARDIGRADE_PROXY_BUFFER_PER_STREAM_LOW_WATERMARK_BYTES` | 256 KiB | proxy buffer accounting; HTTP/2 stream credit | Must satisfy `low < high <= hard`. An HTTP/2 stream queue that reached the high watermark is credited nothing until it drains below this, then receives one coalesced `WINDOW_UPDATE` |
 | Proxy per-stream buffer high watermark | `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES` | 768 KiB | proxy buffer accounting; HTTP/2 `SETTINGS_INITIAL_WINDOW_SIZE` | High-watermark transition is observable through `tardigrade_buffer_high_watermark_events_total`. This value is advertised verbatim as the streaming HTTP/2 receive window, so a well-behaved origin stops sending once a stream holds this many unconsumed bytes. A reload applies to connections opened afterwards (SETTINGS are per connection) |
-| Proxy per-stream buffer hard limit | `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES` | 1 MiB | proxy buffer accounting | Hard-limit exceedance is observable through `tardigrade_buffer_limit_exceeded_total`. On the request direction a refusal here is *this* upload outgrowing its allowed in-flight bound → `413 payload_too_large`, distinct from an aggregate refusal's `503` |
-| Proxy per-origin buffer hard limit | `TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` | 0 (unlimited) | HTTP/2 stream queues (responses and uploads) | When non-zero, must be at least the per-stream hard limit. Caps the retained queue memory all streams to one origin hold together. Refused before commitment → `503 proxy_buffer_saturated`; refused after → that stream is reset and truncated. Never counted against upstream health. Reload applies immediately. HTTP/1 origins have no per-origin account; their relay memory is bounded per request by fixed buffers |
+| Proxy per-stream buffer hard limit | `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES` | 1 MiB | proxy buffer accounting | Bounds everything one stream owns at once, including an HTTP/2 queue and the relay buffer together. Must be at least `per_stream_high_watermark + max(proxy_stream_buffer_size, 16 KiB)` or startup/reload is rejected — otherwise an origin filling its advertised window would push the stream over its own limit. Hard-limit exceedance is observable through `tardigrade_buffer_limit_exceeded_total`. On the request direction a refusal here is *this* upload outgrowing its allowed in-flight bound → `413 payload_too_large`, distinct from an aggregate refusal's `503` |
+| Proxy per-origin buffer hard limit | `TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` | 0 (unlimited) | HTTP/2 stream queues and HTTP/1 relay buffers, in both directions | When non-zero, must be at least the per-stream hard limit. Caps the retained buffer memory every concurrent request to one origin holds together, on both protocols. Refused before commitment → `503 proxy_buffer_saturated`; refused after → that HTTP/2 stream is reset and truncated. Never counted against upstream health. Reload applies immediately, including to origins already holding reservations |
 | Proxy global buffer hard limit | `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` | 0 (unlimited) | HTTP/2 stream queues, HTTP/1 relay buffers, upload relay buffers | When non-zero, must be at least the per-stream hard limit. Process-wide ceiling across every origin and both directions, with the same pre/post-commitment behavior; reload applies immediately |
 | Native TLS inbound ciphertext watermarks | `TARDIGRADE_TLS_INBOUND_CIPHERTEXT_LOW_WATERMARK_BYTES`, `TARDIGRADE_TLS_INBOUND_CIPHERTEXT_HIGH_WATERMARK_BYTES`, `TARDIGRADE_TLS_INBOUND_CIPHERTEXT_HARD_LIMIT_BYTES` | TLS core defaults | pure-Zig TLS record stream | Invalid ordering, capacity overflow, or reserve violations reject startup/reload |
 | Native TLS inbound plaintext watermarks | `TARDIGRADE_TLS_INBOUND_PLAINTEXT_LOW_WATERMARK_BYTES`, `TARDIGRADE_TLS_INBOUND_PLAINTEXT_HIGH_WATERMARK_BYTES`, `TARDIGRADE_TLS_INBOUND_PLAINTEXT_HARD_LIMIT_BYTES` | TLS core defaults | pure-Zig TLS record stream | High pauses carrier reads; resume occurs only after all inbound queues drain to low |

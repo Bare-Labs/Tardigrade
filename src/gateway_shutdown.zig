@@ -676,6 +676,7 @@ pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Ga
     // a peer already holding credit is still judged by what it was granted.
     state.proxy_buffer_global_account.setHardLimit(cfg.proxy_buffer_limits.global_hard_limit);
     state.h2_pool.setProxyBufferLimits(cfg.proxy_buffer_limits);
+    state.upstream_pool.setProxyBufferLimits(cfg.proxy_buffer_limits);
     state.tls_buffer_limits = cfg.tls_buffer_limits;
     state.compression_config = .{
         .enabled = cfg.compression_enabled,
