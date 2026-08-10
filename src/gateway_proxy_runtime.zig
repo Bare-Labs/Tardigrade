@@ -544,6 +544,7 @@ pub fn handleLocationProxyPass(
                 sticky_set_cookie,
                 if (ctx.lifecycle) |lc| &lc.token else null,
                 proxy_buffer_observer,
+                state.proxyBufferGlobalAccount(),
                 &state.upstream_pool,
                 &state.h2_pool,
             ) catch |err| {
@@ -551,6 +552,15 @@ pub fn handleLocationProxyPass(
                 if (err == error.ClientAborted) {
                     state.metricsRecordProxyClientAbort();
                     return err;
+                }
+                if (err == error.ProxyBufferCapacityUnavailable) {
+                    // Local proxy buffer capacity, refused before any response
+                    // byte was committed (#140). Like the active-connection cap
+                    // above this is local saturation, not an origin fault, so
+                    // it must not touch upstream health / circuit-breaker state.
+                    try sendApiError(allocator, writer, .service_unavailable, "proxy_buffer_saturated", "Proxy buffer capacity exhausted", correlation_id, false, state);
+                    ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
+                    return @intFromEnum(http.Status.service_unavailable);
                 }
                 if (err == error.UpstreamAtCapacity) {
                     // Fail-fast at the per-origin active cap (#239): a local
@@ -611,13 +621,26 @@ pub fn handleLocationProxyPass(
                 transcript_redactions,
             );
             if (!isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"))) {
-                if (streamed.status_code >= 500 or streamed.upstream_aborted) {
+                // A relay truncated by local buffer capacity is not evidence
+                // about the origin, so it is neither a failure nor a success
+                // for health purposes (#140).
+                if (streamed.local_capacity_aborted) {
+                    state.logger.warn(correlation_id, "streaming relay truncated: local proxy buffer capacity exhausted", .{});
+                } else if (streamed.status_code >= 500 or streamed.upstream_aborted) {
                     state.recordUpstreamFailure(cfg, selection.base_url);
                 } else {
                     state.recordUpstreamSuccess(cfg, selection.base_url);
                 }
             }
-            if (streamed.upstream_aborted) state.metricsRecordProxyUpstreamAbort();
+            // `tardigrade_proxy_upstream_aborts_total` means "aborted by the
+            // origin". A truncation this proxy caused by running out of buffer
+            // capacity is not that, and counting it there would misattribute
+            // local pressure to the origin in dashboards and alerts.
+            if (streamed.local_capacity_aborted) {
+                state.metricsRecordProxyLocalCapacityAbort();
+            } else if (streamed.upstream_aborted) {
+                state.metricsRecordProxyUpstreamAbort();
+            }
             state.metricsRecordProxyStreamingRequest(streamed.upstream_ttfb_ms);
             ctx.setUpstreamResult(resolved.upstream_host, streamed.status_code, streamed.response_body_bytes);
             state.metricsRecord(streamed.status_code);

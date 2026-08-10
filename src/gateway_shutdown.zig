@@ -630,6 +630,13 @@ pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *Ga
     state.max_total_connection_memory_bytes = cfg.max_total_connection_memory_bytes;
     state.connection_memory_estimate_bytes = if (cfg.max_connection_memory_bytes > 0) cfg.max_connection_memory_bytes else MAX_REQUEST_SIZE;
     state.proxy_buffer_limits = cfg.proxy_buffer_limits;
+    // Aggregate hard limits take effect immediately, at every scope and for
+    // origins that already exist. The per-stream policy — and the HTTP/2
+    // receive window derived from it — reaches connections opened after this
+    // point: SETTINGS_INITIAL_WINDOW_SIZE is negotiated once per connection, so
+    // a peer already holding credit is still judged by what it was granted.
+    state.proxy_buffer_global_account.setHardLimit(cfg.proxy_buffer_limits.global_hard_limit);
+    state.h2_pool.setProxyBufferLimits(cfg.proxy_buffer_limits);
     state.tls_buffer_limits = cfg.tls_buffer_limits;
     state.compression_config = .{
         .enabled = cfg.compression_enabled,
@@ -733,13 +740,10 @@ test "applyReloadedRuntimeConfig updates exported proxy buffer limits" {
     state.max_in_flight_requests = 0;
     state.max_total_connection_memory_bytes = 0;
     state.connection_memory_estimate_bytes = MAX_REQUEST_SIZE;
-    state.proxy_buffer_limits = .{
-        .per_stream_low_watermark = 256 * 1024,
-        .per_stream_high_watermark = 768 * 1024,
-        .per_stream_hard_limit = 1024 * 1024,
-        .per_origin_hard_limit = 0,
-        .global_hard_limit = 0,
-    };
+    state.proxy_buffer_limits = http.proxy_buffer_account.Limits.defaults();
+    // Rendered as a gauge by `metricsToPrometheus` below, and this state starts
+    // as `undefined`, so it has to be initialized rather than inherited.
+    state.proxy_buffer_global_account = http.proxy_buffer_account.Aggregate.init(.global, 0);
     state.tls_buffer_limits = @import("tls_core").encrypted_stream.BufferLimits.defaults();
     state.compression_config = .{};
     state.logger = http.logger.Logger.init(.info, "test");

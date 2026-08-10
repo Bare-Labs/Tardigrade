@@ -148,6 +148,10 @@ pub const Metrics = struct {
     proxy_buffer_high_watermark_upstream_to_downstream_stream: u64,
     proxy_buffer_limit_exceeded_downstream_to_upstream_stream: u64,
     proxy_buffer_limit_exceeded_upstream_to_downstream_stream: u64,
+    proxy_buffer_limit_exceeded_downstream_to_upstream_origin: u64,
+    proxy_buffer_limit_exceeded_upstream_to_downstream_origin: u64,
+    proxy_buffer_limit_exceeded_downstream_to_upstream_global: u64,
+    proxy_buffer_limit_exceeded_upstream_to_downstream_global: u64,
     proxy_buffer_read_pauses_downstream: u64,
     proxy_buffer_read_pauses_upstream: u64,
     proxy_buffer_read_resumes_downstream: u64,
@@ -159,6 +163,7 @@ pub const Metrics = struct {
     tls_buffer_stalled_drives: [tls_backend_count]u64,
     proxy_client_aborts: u64,
     proxy_upstream_aborts: u64,
+    proxy_local_capacity_aborts: u64,
     proxy_streaming_fallback_policy_disabled: u64,
     proxy_streaming_fallback_retries_configured: u64,
     proxy_streaming_fallback_missing_content_length: u64,
@@ -304,6 +309,10 @@ pub const Metrics = struct {
             .proxy_buffer_high_watermark_upstream_to_downstream_stream = 0,
             .proxy_buffer_limit_exceeded_downstream_to_upstream_stream = 0,
             .proxy_buffer_limit_exceeded_upstream_to_downstream_stream = 0,
+            .proxy_buffer_limit_exceeded_downstream_to_upstream_origin = 0,
+            .proxy_buffer_limit_exceeded_upstream_to_downstream_origin = 0,
+            .proxy_buffer_limit_exceeded_downstream_to_upstream_global = 0,
+            .proxy_buffer_limit_exceeded_upstream_to_downstream_global = 0,
             .proxy_buffer_read_pauses_downstream = 0,
             .proxy_buffer_read_pauses_upstream = 0,
             .proxy_buffer_read_resumes_downstream = 0,
@@ -315,6 +324,7 @@ pub const Metrics = struct {
             .tls_buffer_stalled_drives = .{0} ** tls_backend_count,
             .proxy_client_aborts = 0,
             .proxy_upstream_aborts = 0,
+            .proxy_local_capacity_aborts = 0,
             .proxy_streaming_fallback_policy_disabled = 0,
             .proxy_streaming_fallback_retries_configured = 0,
             .proxy_streaming_fallback_missing_content_length = 0,
@@ -554,9 +564,16 @@ pub const Metrics = struct {
         const bytes: u64 = @intCast(buffered_bytes);
         if (bytes > self.proxy_buffered_bytes_current) return error.BufferAccountingUnderflow;
         self.proxy_buffered_bytes_current -= bytes;
+        // A fully buffered response holds one allocation for exactly as long as
+        // it holds the bytes, so both scopes move together here.
         try self.releaseProxyBufferReservation(.upstream_to_downstream, buffered_bytes);
+        try self.releaseProxyBufferRetained(.upstream_to_downstream, buffered_bytes);
     }
 
+    /// Per-stream logical queue occupancy. Deliberately does **not** touch the
+    /// aggregate gauge: the `scope="global"` series reports retained allocation
+    /// (what the global hard limit enforces), which a partially drained queue
+    /// still owns. Callers pair this with `recordProxyBufferRetained`.
     pub fn recordProxyBufferReservation(
         self: *Metrics,
         direction: proxy_buffer_account.Direction,
@@ -565,28 +582,21 @@ pub const Metrics = struct {
         limit_exceeded: bool,
     ) void {
         self.recordProxyBufferBytes(direction, .stream, bytes);
-        self.recordProxyBufferBytes(direction, .global, bytes);
         if (high_watermark) self.recordProxyBufferHighWatermark(direction, .stream);
         if (limit_exceeded) self.recordProxyBufferLimitExceeded(direction, .stream);
     }
 
     pub fn releaseProxyBufferReservation(self: *Metrics, direction: proxy_buffer_account.Direction, bytes: usize) !void {
-        const value: u64 = @intCast(bytes);
-        var stream_slot: *u64 = undefined;
-        var global_slot: *u64 = undefined;
-        switch (direction) {
-            .downstream_to_upstream => {
-                stream_slot = &self.proxy_buffer_downstream_to_upstream_stream_current;
-                global_slot = &self.proxy_buffer_downstream_to_upstream_global_current;
-            },
-            .upstream_to_downstream => {
-                stream_slot = &self.proxy_buffer_upstream_to_downstream_stream_current;
-                global_slot = &self.proxy_buffer_upstream_to_downstream_global_current;
-            },
-        }
-        if (value > stream_slot.* or value > global_slot.*) return error.BufferAccountingUnderflow;
-        stream_slot.* -= value;
-        global_slot.* -= value;
+        try self.releaseProxyBufferBytes(direction, .stream, bytes);
+    }
+
+    /// Bytes entering the aggregate scopes, i.e. allocation an owner retains.
+    pub fn recordProxyBufferRetained(self: *Metrics, direction: proxy_buffer_account.Direction, bytes: usize) void {
+        self.recordProxyBufferBytes(direction, .global, bytes);
+    }
+
+    pub fn releaseProxyBufferRetained(self: *Metrics, direction: proxy_buffer_account.Direction, bytes: usize) !void {
+        try self.releaseProxyBufferBytes(direction, .global, bytes);
     }
 
     pub fn recordProxyBufferBytes(self: *Metrics, direction: proxy_buffer_account.Direction, scope: proxy_buffer_account.Scope, bytes: usize) void {
@@ -632,10 +642,21 @@ pub const Metrics = struct {
     }
 
     pub fn recordProxyBufferLimitExceeded(self: *Metrics, direction: proxy_buffer_account.Direction, scope: proxy_buffer_account.Scope) void {
-        if (scope != .stream) return;
-        switch (direction) {
-            .downstream_to_upstream => self.proxy_buffer_limit_exceeded_downstream_to_upstream_stream += 1,
-            .upstream_to_downstream => self.proxy_buffer_limit_exceeded_upstream_to_downstream_stream += 1,
+        switch (scope) {
+            .stream => switch (direction) {
+                .downstream_to_upstream => self.proxy_buffer_limit_exceeded_downstream_to_upstream_stream += 1,
+                .upstream_to_downstream => self.proxy_buffer_limit_exceeded_upstream_to_downstream_stream += 1,
+            },
+            .origin => switch (direction) {
+                .downstream_to_upstream => self.proxy_buffer_limit_exceeded_downstream_to_upstream_origin += 1,
+                .upstream_to_downstream => self.proxy_buffer_limit_exceeded_upstream_to_downstream_origin += 1,
+            },
+            .global => switch (direction) {
+                .downstream_to_upstream => self.proxy_buffer_limit_exceeded_downstream_to_upstream_global += 1,
+                .upstream_to_downstream => self.proxy_buffer_limit_exceeded_upstream_to_downstream_global += 1,
+            },
+            // Downstream-connection scope has no proxy body queue of its own.
+            .connection => {},
         }
     }
 
@@ -722,6 +743,13 @@ pub const Metrics = struct {
 
     pub fn recordProxyUpstreamAbort(self: *Metrics) void {
         self.proxy_upstream_aborts += 1;
+    }
+
+    /// A relay truncated because *this proxy* ran out of buffer capacity after
+    /// the response head was committed. Deliberately separate from
+    /// `proxy_upstream_aborts`, which means the origin aborted.
+    pub fn recordProxyLocalCapacityAbort(self: *Metrics) void {
+        self.proxy_local_capacity_aborts += 1;
     }
 
     /// Exhaustive by construction: a new `ProxyStreamingFallbackReason` case
@@ -957,11 +985,11 @@ pub const Metrics = struct {
             \\# TYPE tardigrade_buffer_high_watermark_events_total counter
             \\tardigrade_buffer_high_watermark_events_total{{direction="downstream_to_upstream",scope="stream"}} {d}
             \\tardigrade_buffer_high_watermark_events_total{{direction="upstream_to_downstream",scope="stream"}} {d}
-            \\# HELP tardigrade_buffer_read_pauses_total Reserved for future proxy reads paused by stalled buffer pressure side
+            \\# HELP tardigrade_buffer_read_pauses_total Proxy reads paused by buffer pressure, by peer side
             \\# TYPE tardigrade_buffer_read_pauses_total counter
             \\tardigrade_buffer_read_pauses_total{{side="downstream"}} {d}
             \\tardigrade_buffer_read_pauses_total{{side="upstream"}} {d}
-            \\# HELP tardigrade_buffer_read_resumes_total Reserved for future proxy reads resumed after buffer pressure drops
+            \\# HELP tardigrade_buffer_read_resumes_total Proxy reads resumed after buffer pressure dropped below the low watermark, by peer side
             \\# TYPE tardigrade_buffer_read_resumes_total counter
             \\tardigrade_buffer_read_resumes_total{{side="downstream"}} {d}
             \\tardigrade_buffer_read_resumes_total{{side="upstream"}} {d}
@@ -969,6 +997,10 @@ pub const Metrics = struct {
             \\# TYPE tardigrade_buffer_limit_exceeded_total counter
             \\tardigrade_buffer_limit_exceeded_total{{direction="downstream_to_upstream",scope="stream"}} {d}
             \\tardigrade_buffer_limit_exceeded_total{{direction="upstream_to_downstream",scope="stream"}} {d}
+            \\tardigrade_buffer_limit_exceeded_total{{direction="downstream_to_upstream",scope="origin"}} {d}
+            \\tardigrade_buffer_limit_exceeded_total{{direction="upstream_to_downstream",scope="origin"}} {d}
+            \\tardigrade_buffer_limit_exceeded_total{{direction="downstream_to_upstream",scope="global"}} {d}
+            \\tardigrade_buffer_limit_exceeded_total{{direction="upstream_to_downstream",scope="global"}} {d}
             \\
         , .{
             self.proxy_buffer_downstream_to_upstream_stream_current,
@@ -983,6 +1015,10 @@ pub const Metrics = struct {
             self.proxy_buffer_read_resumes_upstream,
             self.proxy_buffer_limit_exceeded_downstream_to_upstream_stream,
             self.proxy_buffer_limit_exceeded_upstream_to_downstream_stream,
+            self.proxy_buffer_limit_exceeded_downstream_to_upstream_origin,
+            self.proxy_buffer_limit_exceeded_upstream_to_downstream_origin,
+            self.proxy_buffer_limit_exceeded_downstream_to_upstream_global,
+            self.proxy_buffer_limit_exceeded_upstream_to_downstream_global,
         });
 
         try self.appendTlsBufferPrometheus(&out);
@@ -997,6 +1033,9 @@ pub const Metrics = struct {
             \\# HELP tardigrade_proxy_upstream_aborts_total Total proxied transfers aborted by upstream origins
             \\# TYPE tardigrade_proxy_upstream_aborts_total counter
             \\tardigrade_proxy_upstream_aborts_total {d}
+            \\# HELP tardigrade_proxy_local_capacity_aborts_total Total proxied responses truncated after commitment because local proxy buffer capacity was exhausted
+            \\# TYPE tardigrade_proxy_local_capacity_aborts_total counter
+            \\tardigrade_proxy_local_capacity_aborts_total {d}
             \\# HELP tardigrade_proxy_streaming_fallback_total Total streaming eligibility fallback events by reason
             \\# TYPE tardigrade_proxy_streaming_fallback_total counter
             \\tardigrade_proxy_streaming_fallback_total{{reason="policy_disabled"}} {d}
@@ -1032,6 +1071,7 @@ pub const Metrics = struct {
         , .{
             self.proxy_client_aborts,
             self.proxy_upstream_aborts,
+            self.proxy_local_capacity_aborts,
             self.proxy_streaming_fallback_policy_disabled,
             self.proxy_streaming_fallback_retries_configured,
             self.proxy_streaming_fallback_missing_content_length,
@@ -1970,6 +2010,12 @@ test "Metrics tracks active connections and rejections" {
     try std.testing.expectEqual(@as(u64, 128), m.proxy_buffered_bytes_total);
     try std.testing.expectEqual(@as(u64, 1), m.proxy_client_aborts);
     try std.testing.expectEqual(@as(u64, 1), m.proxy_upstream_aborts);
+    // Local-capacity truncations are counted separately from origin aborts:
+    // `tardigrade_proxy_upstream_aborts_total` means the *origin* gave up.
+    try std.testing.expectEqual(@as(u64, 0), m.proxy_local_capacity_aborts);
+    m.recordProxyLocalCapacityAbort();
+    try std.testing.expectEqual(@as(u64, 1), m.proxy_local_capacity_aborts);
+    try std.testing.expectEqual(@as(u64, 1), m.proxy_upstream_aborts);
     try std.testing.expectEqual(@as(u64, 2), m.proxy_ttfb_ms_count);
     try std.testing.expectEqual(@as(u64, 20), m.proxy_ttfb_ms_sum);
     m.setUpstreamUnhealthyBackends(3);
@@ -2131,6 +2177,8 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     m.recordProxyBufferReadPause("upstream");
     m.recordProxyBufferReadResume("upstream");
     m.recordProxyBufferLimitExceeded(.upstream_to_downstream, .stream);
+    m.recordProxyBufferLimitExceeded(.upstream_to_downstream, .origin);
+    m.recordProxyBufferLimitExceeded(.downstream_to_upstream, .global);
 
     const prom = try m.toPrometheus(allocator);
     defer allocator.free(prom);
@@ -2152,6 +2200,12 @@ test "Metrics toPrometheus produces valid Prometheus text" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_read_pauses_total{side=\"upstream\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_read_resumes_total{side=\"upstream\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"upstream_to_downstream\",scope=\"stream\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"upstream_to_downstream\",scope=\"origin\"} 1") != null);
+    // A local-capacity truncation must not land in the upstream-abort series.
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_local_capacity_aborts_total 0") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"downstream_to_upstream\",scope=\"global\"} 1") != null);
+    // Aggregate scopes are counted independently of the per-stream scope.
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_limit_exceeded_total{direction=\"downstream_to_upstream\",scope=\"origin\"} 0") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_proxy_ttfb_ms_count 2") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_active_jobs") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_worker_queued_jobs") != null);

@@ -1286,12 +1286,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const max_buffered_upstream_resp_str = envOrDefault(allocator, "TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES", "262144") catch unreachable;
     defer allocator.free(max_buffered_upstream_resp_str);
     const max_buffered_upstream_response_bytes = std.fmt.parseInt(usize, max_buffered_upstream_resp_str, 10) catch 256 * 1024;
+    const proxy_buffer_defaults = http.proxy_buffer_account.Limits.defaults();
     const proxy_buffer_limits = http.proxy_buffer_account.Limits{
-        .per_stream_low_watermark = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_PER_STREAM_LOW_WATERMARK_BYTES", 256 * 1024),
-        .per_stream_high_watermark = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES", 768 * 1024),
-        .per_stream_hard_limit = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES", 1024 * 1024),
-        .per_origin_hard_limit = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES", 0),
-        .global_hard_limit = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES", 0),
+        .per_stream_low_watermark = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_PER_STREAM_LOW_WATERMARK_BYTES", proxy_buffer_defaults.per_stream_low_watermark),
+        .per_stream_high_watermark = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES", proxy_buffer_defaults.per_stream_high_watermark),
+        .per_stream_hard_limit = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES", proxy_buffer_defaults.per_stream_hard_limit),
+        .per_origin_hard_limit = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES", proxy_buffer_defaults.per_origin_hard_limit),
+        .global_hard_limit = parseIntEnv(usize, allocator, "TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES", proxy_buffer_defaults.global_hard_limit),
     };
 
     const proxy_streaming_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_STREAMING_MODE", "off") catch unreachable;
@@ -4293,6 +4294,19 @@ test "proxy buffer limits validate low high hard ordering" {
         .per_origin_hard_limit = 512 * 1024,
         .global_hard_limit = 0,
     }).validate());
+}
+
+test "default proxy buffer limits produce the advertised HTTP/2 stream window" {
+    const allocator = std.testing.allocator;
+    var cfg = try loadFromEnv(allocator);
+    defer cfg.deinit(allocator);
+
+    // The window an h2 connection advertises is the configured high watermark,
+    // not the protocol-independent default.
+    try std.testing.expectEqual(
+        @as(u31, 768 * 1024),
+        http.proxy_buffer_account.streamReceiveWindow(cfg.proxy_buffer_limits),
+    );
 }
 
 test "TLS buffer limits default from TLS core" {

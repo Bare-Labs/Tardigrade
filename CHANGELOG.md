@@ -5,6 +5,67 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- **HTTP/2 proxy response buffering is bounded per stream *and* in aggregate
+  (#140)** — the streaming receive window an HTTP/2 upstream connection
+  advertises is now `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES`
+  rather than a fixed 1 MiB, so the protocol's own flow control stops a
+  well-behaved origin exactly where the buffer-accounting model says the
+  stream's queue is full. Credit is returned with hysteresis: a queue that
+  reached the high watermark is credited nothing until it drains below
+  `TARDIGRADE_PROXY_BUFFER_PER_STREAM_LOW_WATERMARK_BYTES`, then receives one
+  coalesced `WINDOW_UPDATE`. Crediting each consumed chunk would have let the
+  origin refill immediately and the watermark band would never pause anything.
+  Both transitions are now real signals on
+  `tardigrade_buffer_read_pauses_total{side="upstream"}` and its resume
+  counterpart, which previously only ever read zero.
+
+  Because per-stream bounds alone let N concurrent slow streams retain N
+  windows, `TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` and
+  `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES` are now enforced rather than
+  merely validated. Reservations are taken before any memory is committed and
+  track each queue's **retained allocation** rather than its logical length — a
+  drained queue still owning its peak buffer would otherwise be invisible to
+  these limits — and a queue's storage is released as soon as it drains empty.
+  A refusal at one scope rolls back the other, so no scope is left holding bytes
+  the stream never took. Both limits still default to `0` (unlimited), so
+  existing deployments are unchanged until they opt in.
+
+  Refusals are deterministic on both sides of the downstream commitment
+  boundary, which is claimed under the connection's state lock rather than
+  raced. Before the response head is written the request fails with `503` and
+  the code `proxy_buffer_saturated` — including when an origin answers while a
+  streaming upload is still being written, so the refusal surfaces through the
+  next upload write; after commitment the stream is reset upstream, the
+  response is truncated, and the event is logged. Either way this is *local*
+  saturation and is never recorded against upstream health, so proxy memory
+  pressure cannot trip a healthy origin's failure policy, and a refused stream
+  becomes discard-only so one refusal cannot be re-counted. Unrelated streams,
+  including others on the same connection, are untouched. An origin that
+  overruns its advertised window is now also reset with
+  `RST_STREAM(FLOW_CONTROL_ERROR)` instead of being left to keep sending on a
+  stream the proxy had already failed.
+  `tardigrade_buffer_limit_exceeded_total` now carries `scope="origin"` and
+  `scope="global"` alongside `scope="stream"`; per-origin queued bytes are
+  visible as `tardigrade_upstream_h2_pool_buffered_bytes{upstream}`; and a
+  post-commitment truncation is counted as
+  `tardigrade_proxy_local_capacity_aborts_total` rather than
+  `tardigrade_proxy_upstream_aborts_total`, which means the *origin* aborted.
+
+  The bytes the global hard limit is actually checked against are exported as
+  `tardigrade_proxy_buffer_aggregate_bytes_current{direction,scope="global"}`,
+  read from the enforcing account. This is the series to compare with the
+  configured limit: `tardigrade_buffered_bytes_current{scope="global"}` is a
+  roll-up across every proxy-owned buffer, while the limit currently governs
+  HTTP/2 streaming response queues only.
+
+  A high watermark that could not be advertised as an HTTP/2 window is rejected
+  at startup and reload. On reload, aggregate hard limits apply immediately,
+  including to origins already holding reservations; the per-stream policy
+  applies to connections opened afterwards, because
+  `SETTINGS_INITIAL_WINDOW_SIZE` is negotiated once per connection. Each
+  connection pins the whole policy it advertised, so a peer is always judged by
+  the credit it was actually granted rather than by a newer snapshot.
+
 - **Streaming reverse proxy completes its request-upload and transport scope
   (#139)** — `proxy_streaming_mode full` (and the per-route `proxy_streaming
   full` override) now relays `Transfer-Encoding: chunked` client uploads
