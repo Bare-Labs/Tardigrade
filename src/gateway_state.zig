@@ -1384,6 +1384,24 @@ pub const GatewayState = struct {
         self.metrics.recordQueueRejection();
     }
 
+    pub fn metricsRecordAccept(self: *GatewayState, shard_id: u16) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordAccept(shard_id);
+    }
+
+    pub fn metricsRecordAcceptError(self: *GatewayState, shard_id: u16) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordAcceptError(shard_id);
+    }
+
+    pub fn metricsSetListenerShards(self: *GatewayState, count: u16) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.setListenerShards(count);
+    }
+
     pub fn metricsRecordMuxFrameError(self: *GatewayState) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();

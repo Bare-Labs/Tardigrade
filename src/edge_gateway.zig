@@ -254,7 +254,12 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
 
     var event_loop = try http.event_loop.EventLoop.init();
     defer event_loop.deinit();
-    try event_loop.addReadFd(listen_fd);
+    // Compute sharding configuration once, before registering with the event
+    // loop, so we know whether the main loop or dedicated threads own the accept path.
+    const sharding_enabled = cfg.listener_shards > 1 and gaccept.isReusePortSupported();
+    if (!sharding_enabled) {
+        try event_loop.addReadFd(listen_fd);
+    }
     var timer = http.event_loop.TimerManager.init(250);
     var config_store = try ReloadableConfigStore.initBorrowed(state_allocator, cfg);
     defer config_store.deinit();
@@ -755,6 +760,54 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     http.shutdown.installSignalHandlers();
     state.logger.info(null, "Signal handlers installed (SIGTERM/SIGINT shutdown, SIGHUP reload, SIGUSR1 reopen logs, SIGUSR2 upgrade)", .{});
 
+    // Listener sharding: create N sockets with SO_REUSEPORT and start one
+    // accept thread per shard when enabled.
+    const effective_shards: u16 = if (sharding_enabled)
+        @min(cfg.listener_shards, @as(u16, http.metrics.max_listener_shards))
+    else
+        1;
+    state.metricsSetListenerShards(effective_shards);
+
+    const max_shards = http.metrics.max_listener_shards;
+    var shard_fds: [max_shards]std.posix.fd_t = undefined;
+    var shard_fd_count: u16 = 0;
+    var shard_threads: [max_shards]std.Thread = undefined;
+    var shard_thread_count: usize = 0;
+
+    if (sharding_enabled) {
+        state.logger.info(null, "Listener sharding enabled: {} shards on {s}:{}", .{
+            effective_shards, cfg.listen_host, cfg.listen_port,
+        });
+        var si: u16 = 0;
+        while (si < effective_shards) : (si += 1) {
+            const sfd = gaccept.createReusePortListenerFd(cfg.listen_host, cfg.listen_port) catch |err| {
+                state.logger.err(null, "failed to create listener shard {}: {}", .{ si, err });
+                var ji: u16 = 0;
+                while (ji < shard_fd_count) : (ji += 1) _ = std.c.close(shard_fds[ji]);
+                return err;
+            };
+            gconn.setNonBlocking(sfd, true) catch {};
+            shard_fds[shard_fd_count] = sfd;
+            shard_fd_count += 1;
+        }
+        var ti: u16 = 0;
+        while (ti < shard_fd_count) : (ti += 1) {
+            const ctx = gaccept.ShardAcceptContext{
+                .listen_fd = shard_fds[ti],
+                .shard_id = ti,
+                .worker_pool = &worker_pool,
+                .state = &state,
+            };
+            shard_threads[shard_thread_count] = std.Thread.spawn(.{}, gaccept.runShardAcceptLoop, .{ctx}) catch |err| {
+                state.logger.err(null, "failed to spawn shard {} accept thread: {}", .{ ti, err });
+                var ji: u16 = ti;
+                while (ji < shard_fd_count) : (ji += 1) _ = std.c.close(shard_fds[ji]);
+                return err;
+            };
+            shard_thread_count += 1;
+        }
+    }
+
     var ready_events: [64]http.event_loop.Event = undefined;
     while (!http.shutdown.isShutdownRequested()) {
         const now_ms = http.event_loop.monotonicMs();
@@ -780,7 +833,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
                 continue;
             }
             if (!ev.readable) continue;
-            if (ev.fd == listen_fd) {
+            if (ev.fd == listen_fd and !sharding_enabled) {
                 gaccept.acceptReadyConnections(listen_fd, &worker_pool, &state);
             } else if (parked.resumeReady(ev.fd)) {
                 // A parked keepalive connection has a new request (or closed).
@@ -848,6 +901,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             state.metrics_mutex.unlock();
         }
     }
+
+    // Join shard accept threads (they exit when shutdown is requested) and
+    // close the shard listener fds before draining the worker pool.
+    for (shard_threads[0..shard_thread_count]) |t| t.join();
+    for (shard_fds[0..shard_fd_count]) |sfd| _ = std.c.close(sfd);
 
     const active_at_drain_start = blk: {
         state.connection_mutex.lock();

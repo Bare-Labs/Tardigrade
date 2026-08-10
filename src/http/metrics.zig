@@ -113,6 +113,10 @@ const early_data_replay_outcome_count = 6;
 const quic_early_data_decision_count = 10;
 const quic_zero_rtt_packet_outcome_count = 5;
 
+/// Maximum number of listener shards tracked in per-shard metric arrays.
+/// Shard IDs >= this value are clamped to the last bucket.
+pub const max_listener_shards: usize = 64;
+
 /// Server-wide metrics counters.
 ///
 /// Tracks request counts, status code distribution, and uptime.
@@ -286,6 +290,12 @@ pub const Metrics = struct {
     drain_timeouts_total: u64,
     /// Total queued (unstarted) connections force-closed because a drain timed out.
     drain_forced_closes_total: u64,
+    /// Listener sharding: configured number of active listener shards (1 = single/default).
+    listener_shards: u16,
+    /// Per-shard accepted connections total. Index by shard ID (clamped to max_listener_shards-1).
+    accepts_total: [max_listener_shards]u64,
+    /// Per-shard accept errors total. Index by shard ID (clamped to max_listener_shards-1).
+    accept_errors_total: [max_listener_shards]u64,
     /// Server start time (nanoseconds since boot).
     started_ns: i128,
 
@@ -409,6 +419,9 @@ pub const Metrics = struct {
             .drain_total = 0,
             .drain_timeouts_total = 0,
             .drain_forced_closes_total = 0,
+            .listener_shards = 1,
+            .accepts_total = .{0} ** max_listener_shards,
+            .accept_errors_total = .{0} ** max_listener_shards,
             .started_ns = compat.nanoTimestamp(),
         };
     }
@@ -556,6 +569,23 @@ pub const Metrics = struct {
         self.drain_total += 1;
         if (timed_out) self.drain_timeouts_total += 1;
         self.drain_forced_closes_total += @intCast(forced_closes);
+    }
+
+    /// Set the number of active listener shards (call once at startup).
+    pub fn setListenerShards(self: *Metrics, count: u16) void {
+        self.listener_shards = @max(count, 1);
+    }
+
+    /// Record one accepted connection on the given shard.
+    pub fn recordAccept(self: *Metrics, shard_id: u16) void {
+        const idx = @min(@as(usize, shard_id), max_listener_shards - 1);
+        self.accepts_total[idx] += 1;
+    }
+
+    /// Record one accept-path error on the given shard.
+    pub fn recordAcceptError(self: *Metrics, shard_id: u16) void {
+        const idx = @min(@as(usize, shard_id), max_listener_shards - 1);
+        self.accept_errors_total[idx] += 1;
     }
 
     pub fn setUpstreamUnhealthyBackends(self: *Metrics, count: usize) void {
@@ -1250,6 +1280,27 @@ pub const Metrics = struct {
             self.drain_timeouts_total,
             self.drain_forced_closes_total,
         });
+
+        // Listener sharding metrics
+        try out.print(
+            \\# HELP tardigrade_listener_shards Configured number of active listener shards
+            \\# TYPE tardigrade_listener_shards gauge
+            \\tardigrade_listener_shards {d}
+            \\# HELP tardigrade_accepts_total Total accepted connections per listener shard
+            \\# TYPE tardigrade_accepts_total counter
+            \\# HELP tardigrade_accept_errors_total Total accept-path errors per listener shard
+            \\# TYPE tardigrade_accept_errors_total counter
+            \\
+        , .{self.listener_shards});
+        {
+            const n = @min(@as(usize, self.listener_shards), max_listener_shards);
+            for (0..n) |i| {
+                try out.print("tardigrade_accepts_total{{shard=\"{d}\"}} {d}\n", .{ i, self.accepts_total[i] });
+            }
+            for (0..n) |i| {
+                try out.print("tardigrade_accept_errors_total{{shard=\"{d}\"}} {d}\n", .{ i, self.accept_errors_total[i] });
+            }
+        }
 
         try out.print(
             \\# HELP tardigrade_keepalive_parked_connections Idle keepalive connections currently parked off the worker pool
@@ -2547,4 +2598,40 @@ test "early-data metrics record bounded labels and emit Prometheus series" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"too_early\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_early_data_compat_total{decision=\"compatible\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_early_data_compat_total{decision=\"missing_state\"} 1") != null);
+}
+
+test "listener sharding metrics record per-shard accepts and errors and emit Prometheus series (#137)" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+
+    // Default: single shard.
+    try std.testing.expectEqual(@as(u16, 1), m.listener_shards);
+
+    // Configure 3 shards.
+    m.setListenerShards(3);
+    try std.testing.expectEqual(@as(u16, 3), m.listener_shards);
+
+    // Record accepts and errors on different shards.
+    m.recordAccept(0);
+    m.recordAccept(0);
+    m.recordAccept(1);
+    m.recordAcceptError(2);
+
+    try std.testing.expectEqual(@as(u64, 2), m.accepts_total[0]);
+    try std.testing.expectEqual(@as(u64, 1), m.accepts_total[1]);
+    try std.testing.expectEqual(@as(u64, 0), m.accepts_total[2]);
+    try std.testing.expectEqual(@as(u64, 0), m.accept_errors_total[0]);
+    try std.testing.expectEqual(@as(u64, 1), m.accept_errors_total[2]);
+
+    // Out-of-bounds shard IDs are clamped.
+    m.recordAccept(@as(u16, max_listener_shards) + 10);
+    try std.testing.expectEqual(@as(u64, 1), m.accepts_total[max_listener_shards - 1]);
+
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_listener_shards 3") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accepts_total{shard=\"0\"} 2") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accepts_total{shard=\"1\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_errors_total{shard=\"2\"} 1") != null);
 }
