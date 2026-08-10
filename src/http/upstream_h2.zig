@@ -977,6 +977,16 @@ pub fn H2Conn(comptime Transport: type) type {
             return stream.abort_cause;
         }
 
+        /// The buffer policy this stream is being judged by — the connection's
+        /// pinned policy when accounting is on. Locked because the reader
+        /// mutates the account it lives in.
+        pub fn streamBufferLimits(self: *Self, stream: *Stream) ?proxy_buffer_account.Limits {
+            self.state_mutex.lock();
+            defer self.state_mutex.unlock();
+            const account = stream.proxy_body_account orelse return null;
+            return account.limits;
+        }
+
         /// Copy the next chunk of a streaming response body into `out`,
         /// blocking (deadline-bounded) until data, end-of-stream, or an error.
         /// Returns 0 at end of stream. The caller must acknowledge each
@@ -2616,8 +2626,13 @@ test "an open connection keeps the per-stream policy it advertised" {
         .path = "/",
         .proxy_buffer_accounting = true,
     });
-    try testing.expectEqual(pinned, stream.proxy_body_account.?.limits);
-    try testing.expectEqual(@as(i64, 64 * 1024), stream.recv_window);
+    try testing.expectEqual(pinned, conn.streamBufferLimits(stream).?);
+    // Deliberately no assertion on `stream.recv_window` here: the reader
+    // decrements it as response DATA lands, so any value read from this thread
+    // is a race with the origin. The window's actual size is pinned down
+    // deterministically by "configured per-stream window replaces the default
+    // streaming receive window", which cuts the peer off at exactly the
+    // advertised byte count.
 
     conn.finishStreaming(stream);
     conn.deinit();
