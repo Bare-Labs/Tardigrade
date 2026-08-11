@@ -96,6 +96,12 @@ pub const CloseReason = enum {
     handshake_failure,
 };
 
+pub const CloseError = union(enum) {
+    none,
+    connection_unknown: u64,
+    application_unknown: u64,
+};
+
 /// PATH_CHALLENGE / PATH_RESPONSE lifecycle phases (RFC 9000 §8.2).
 pub const PathEventKind = enum {
     challenge_sent,
@@ -207,7 +213,7 @@ pub const Event = union(enum) {
     /// quic:connection_closed
     connection_closed: struct {
         reason: CloseReason,
-        error_code: ?u64 = null,
+        close_error: CloseError = .none,
     },
     /// tardigrade:quic_handshake_progressed (progress milestone; not a
     /// standard qlog event, kept under a Tardigrade namespace for stage
@@ -390,7 +396,11 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
         ),
         .connection_closed => |d| {
             try b.add("{{\"reason\":\"{s}\"", .{@tagName(d.reason)});
-            if (d.error_code) |code| try b.add(",\"error_code\":{d}", .{code});
+            switch (d.close_error) {
+                .none => {},
+                .connection_unknown => |code| try b.add(",\"connection_error\":\"unknown\",\"error_code\":{d}", .{code}),
+                .application_unknown => |code| try b.add(",\"application_error\":\"unknown\",\"error_code\":{d}", .{code}),
+            }
             try b.add("}}", .{});
         },
         .handshake_progressed => |d| try b.add(
@@ -587,6 +597,17 @@ test "0-RTT key type serializes as a standard key_updated value" {
     try expectJson(
         .{ .time_us = 0, .event = .{ .key_updated = .{ .key_type = .server_0rtt_secret } } },
         "\"key_type\":\"server_0rtt_secret\"",
+    );
+}
+
+test "connection_closed ties error_code to an unknown error category" {
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .connection_closed = .{ .reason = .transport_error, .close_error = .{ .connection_unknown = 0x123 } } } },
+        "\"connection_error\":\"unknown\",\"error_code\":291",
+    );
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .connection_closed = .{ .reason = .application_close, .close_error = .{ .application_unknown = 0x456 } } } },
+        "\"application_error\":\"unknown\",\"error_code\":1110",
     );
 }
 
