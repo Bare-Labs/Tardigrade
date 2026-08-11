@@ -16,8 +16,8 @@
 //!
 //! ## Layering (the #255 "don't leak H3 into src/quic" decision)
 //!
-//! `src/quic` owns *only* transport-vantage events (qlog categories
-//! `connectivity`, `security`, `transport`, `recovery`). HTTP/3- and
+//! `src/quic` owns *only* transport-vantage events (the `quic:*` namespace
+//! plus documented `tardigrade:*` debug extensions). HTTP/3- and
 //! QPACK-vantage events live in `src/http3/qlog.zig` and are emitted from
 //! `src/http3`. Neither package imports the other — the same boundary the
 //! build graph already enforces (see build.zig: the smoke harness stitches the
@@ -39,15 +39,20 @@
 
 const std = @import("std");
 
-/// qlog top-level event categories this transport emits. Application (`http`,
-/// `qpack`) categories are intentionally absent: they belong to `src/http3`.
-pub const Category = enum {
-    connectivity,
-    security,
-    transport,
-    recovery,
+pub const quic_event_schema_uri = "urn:ietf:params:qlog:events:quic-13";
+pub const http3_event_schema_uri = "urn:ietf:params:qlog:events:http3-13";
+pub const tardigrade_event_schema_uri = "https://bare.systems/tardigrade/qlog/events/debug-1";
+pub const file_schema_uri = "urn:ietf:params:qlog:file:sequential";
+pub const serialization_format = "application/qlog+json-seq";
+pub const sqlog_suffix = ".sqlog";
 
-    pub fn label(self: Category) []const u8 {
+/// qlog event namespace this transport emits. Application (`http3`) events are
+/// intentionally absent: they belong to `src/http3`.
+pub const Namespace = enum {
+    quic,
+    tardigrade,
+
+    pub fn label(self: Namespace) []const u8 {
         return @tagName(self);
     }
 };
@@ -82,7 +87,7 @@ pub const HandshakeStage = enum {
     failed,
 };
 
-/// Why a connection closed (drives `connectivity:connection_closed`).
+/// Why a connection closed (drives `quic:connection_closed`).
 pub const CloseReason = enum {
     idle_timeout,
     application_close,
@@ -116,124 +121,144 @@ pub const StreamResetKind = enum {
 /// DATA_BLOCKED vs. STREAM_DATA_BLOCKED (RFC 9000 §19.12, §19.13).
 pub const BlockedScope = enum { connection, stream };
 
-/// Why an inbound packet was dropped. `payload_decrypt_error` is the qlog
+/// Why an inbound packet was dropped. `decryption_failure` is the qlog
 /// canonical trigger for AEAD deprotection failure — the #255 requirement that
 /// deprotection failures are reported deterministically.
 pub const DropTrigger = enum {
-    payload_decrypt_error,
+    decryption_failure,
     key_unavailable,
-    unknown_connection_id,
-    unexpected_packet,
-    header_parse_error,
+    connection_unknown,
+    invalid,
+    unsupported,
+    duplicate,
+    internal_error,
+    rejected,
+    general,
+};
+
+pub const RecoveryMetrics = struct {
+    latest_rtt_ms: ?u64 = null,
+    smoothed_rtt_ms: ?u64 = null,
+    rtt_variance_ms: ?u64 = null,
+    pto_count: ?u16 = null,
+    congestion_window: ?u64 = null,
+    bytes_in_flight: ?u64 = null,
 };
 
 /// The closed set of transport-vantage events. Data payloads are kept small and
 /// copy-free (scalars/enums only) so emitting is cheap and the union never
 /// borrows connection-owned buffers.
 pub const Event = union(enum) {
-    /// connectivity:connection_started
+    /// quic:connection_started
     connection_started: struct {
         odcid_len: u8 = 0,
         scid_len: u8 = 0,
         dcid_len: u8 = 0,
     },
-    /// connectivity:connection_closed
+    /// quic:connection_closed
     connection_closed: struct {
         reason: CloseReason,
         error_code: ?u64 = null,
     },
-    /// connectivity:handshake (progress milestone; not a base qlog name, kept
-    /// under connectivity as a Tardigrade extension for stage visibility)
+    /// tardigrade:quic_handshake_progressed (progress milestone; not a
+    /// standard qlog event, kept under a Tardigrade namespace for stage
+    /// visibility)
     handshake_progressed: struct {
         stage: HandshakeStage,
     },
-    /// security:key_updated (1-RTT key-phase flip, RFC 9001 §6)
+    /// quic:key_updated (1-RTT key-phase flip, RFC 9001 §6)
     key_updated: struct {
         phase: u1,
     },
-    /// transport:packet_sent
+    /// quic:packet_sent
     packet_sent: struct {
         packet_type: PacketType,
         packet_number: u64,
         length: usize,
         ack_eliciting: bool = false,
     },
-    /// transport:packet_received
+    /// quic:packet_received
     packet_received: struct {
         packet_type: PacketType,
         packet_number: u64,
         length: usize,
     },
-    /// recovery:packet_lost
+    /// quic:packet_lost
     packet_lost: struct {
         packet_type: PacketType,
         packet_number: ?u64 = null,
-        bytes_in_flight: usize = 0,
-        congestion_window: usize = 0,
     },
-    /// transport:packet_dropped (deprotection failure and other drops)
+    /// quic:recovery_metrics_updated
+    recovery_metrics_updated: RecoveryMetrics,
+    /// quic:packet_dropped (deprotection failure and other drops)
     packet_dropped: struct {
         packet_type: ?PacketType = null,
         trigger: DropTrigger,
         length: usize = 0,
     },
-    /// transport:path_validation (PATH_CHALLENGE / PATH_RESPONSE)
+    /// tardigrade:quic_path_validation (PATH_CHALLENGE / PATH_RESPONSE)
     path_validation: struct {
         kind: PathEventKind,
         path_id: u8 = 0,
     },
-    /// connectivity:connection_migrated
+    /// quic:migration_state_updated
     connection_migrated: struct {
         kind: MigrationKind,
         outcome: MigrationOutcome,
     },
-    /// transport:stream_reset (RESET_STREAM / STOP_SENDING)
+    /// tardigrade:quic_stream_reset (RESET_STREAM / STOP_SENDING)
     stream_reset: struct {
         kind: StreamResetKind,
         stream_id: u64,
         error_code: u64 = 0,
     },
-    /// transport:data_blocked (flow-control blocked)
+    /// quic:connection_data_blocked_updated /
+    /// quic:stream_data_blocked_updated (flow-control blocked)
     data_blocked: struct {
         scope: BlockedScope,
         stream_id: ?u64 = null,
         limit: u64 = 0,
     },
 
-    pub fn category(self: Event) Category {
+    pub fn namespace(self: Event) Namespace {
         return switch (self) {
             .connection_started,
             .connection_closed,
-            .handshake_progressed,
             .connection_migrated,
-            => .connectivity,
-            .key_updated => .security,
-            .packet_lost => .recovery,
+            .key_updated,
+            .packet_lost,
+            .recovery_metrics_updated,
             .packet_sent,
             .packet_received,
             .packet_dropped,
+            .data_blocked,
+            => .quic,
             .path_validation,
             .stream_reset,
-            .data_blocked,
-            => .transport,
+            .handshake_progressed,
+            => .tardigrade,
         };
     }
 
-    /// The qlog event name within the category (the part after the `:`).
+    /// The qlog event name within the namespace (the part after the `:`).
     pub fn name(self: Event) []const u8 {
         return switch (self) {
             .connection_started => "connection_started",
             .connection_closed => "connection_closed",
-            .handshake_progressed => "handshake",
+            .handshake_progressed => "quic_handshake_progressed",
             .key_updated => "key_updated",
             .packet_sent => "packet_sent",
             .packet_received => "packet_received",
             .packet_lost => "packet_lost",
+            .recovery_metrics_updated => "recovery_metrics_updated",
             .packet_dropped => "packet_dropped",
-            .path_validation => "path_validation",
-            .connection_migrated => "connection_migrated",
-            .stream_reset => "stream_reset",
-            .data_blocked => "data_blocked",
+            .path_validation => "quic_path_validation",
+            .connection_migrated => "migration_state_updated",
+            .stream_reset => "quic_stream_reset",
+            .data_blocked => |d| switch (d.scope) {
+                .connection => "connection_data_blocked_updated",
+                .stream => "stream_data_blocked_updated",
+            },
         };
     }
 };
@@ -309,33 +334,63 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
         ),
         .key_updated => |d| try b.add("{{\"key_phase\":{d}}}", .{d.phase}),
         .packet_sent => |d| try b.add(
-            "{{\"packet_type\":\"{s}\",\"packet_number\":{d},\"length\":{d},\"ack_eliciting\":{s}}}",
+            "{{\"header\":{{\"packet_type\":\"{s}\",\"packet_number\":{d}}},\"raw\":{{\"length\":{d}}},\"tardigrade_ack_eliciting\":{s}}}",
             .{ d.packet_type.label(), d.packet_number, d.length, boolText(d.ack_eliciting) },
         ),
         .packet_received => |d| try b.add(
-            "{{\"packet_type\":\"{s}\",\"packet_number\":{d},\"length\":{d}}}",
+            "{{\"header\":{{\"packet_type\":\"{s}\",\"packet_number\":{d}}},\"raw\":{{\"length\":{d}}}}}",
             .{ d.packet_type.label(), d.packet_number, d.length },
         ),
         .packet_lost => |d| {
-            try b.add("{{\"packet_type\":\"{s}\"", .{d.packet_type.label()});
+            try b.add("{{\"header\":{{\"packet_type\":\"{s}\"", .{d.packet_type.label()});
             if (d.packet_number) |pn| try b.add(",\"packet_number\":{d}", .{pn});
-            try b.add(
-                ",\"bytes_in_flight\":{d},\"congestion_window\":{d}}}",
-                .{ d.bytes_in_flight, d.congestion_window },
-            );
+            try b.add("}}}}", .{});
+        },
+        .recovery_metrics_updated => |d| {
+            try b.add("{{", .{});
+            var need_comma = false;
+            if (d.latest_rtt_ms) |v| {
+                try b.add("\"latest_rtt\":{d}", .{v});
+                need_comma = true;
+            }
+            if (d.smoothed_rtt_ms) |v| {
+                if (need_comma) try b.add(",", .{});
+                try b.add("\"smoothed_rtt\":{d}", .{v});
+                need_comma = true;
+            }
+            if (d.rtt_variance_ms) |v| {
+                if (need_comma) try b.add(",", .{});
+                try b.add("\"rtt_variance\":{d}", .{v});
+                need_comma = true;
+            }
+            if (d.pto_count) |v| {
+                if (need_comma) try b.add(",", .{});
+                try b.add("\"pto_count\":{d}", .{v});
+                need_comma = true;
+            }
+            if (d.congestion_window) |v| {
+                if (need_comma) try b.add(",", .{});
+                try b.add("\"congestion_window\":{d}", .{v});
+                need_comma = true;
+            }
+            if (d.bytes_in_flight) |v| {
+                if (need_comma) try b.add(",", .{});
+                try b.add("\"bytes_in_flight\":{d}", .{v});
+            }
+            try b.add("}}", .{});
         },
         .packet_dropped => |d| {
             try b.add("{{\"trigger\":\"{s}\"", .{@tagName(d.trigger)});
-            if (d.packet_type) |pt| try b.add(",\"packet_type\":\"{s}\"", .{pt.label()});
-            try b.add(",\"length\":{d}}}", .{d.length});
+            if (d.packet_type) |pt| try b.add(",\"header\":{{\"packet_type\":\"{s}\"}}", .{pt.label()});
+            try b.add(",\"raw\":{{\"length\":{d}}}}}", .{d.length});
         },
         .path_validation => |d| try b.add(
             "{{\"phase\":\"{s}\",\"path_id\":{d}}}",
             .{ @tagName(d.kind), d.path_id },
         ),
         .connection_migrated => |d| try b.add(
-            "{{\"kind\":\"{s}\",\"outcome\":\"{s}\"}}",
-            .{ @tagName(d.kind), @tagName(d.outcome) },
+            "{{\"state\":\"{s}\",\"trigger\":\"{s}\"}}",
+            .{ @tagName(d.outcome), @tagName(d.kind) },
         ),
         .stream_reset => |d| try b.add(
             "{{\"direction\":\"{s}\",\"stream_id\":{d},\"error_code\":{d}}}",
@@ -359,29 +414,28 @@ pub const VantagePoint = enum { client, server };
 /// (ASCII / hex); they are emitted verbatim without escaping.
 pub const TraceHeader = struct {
     vantage_point: VantagePoint,
-    reference_time_us: u64 = 0,
     group_id: []const u8 = "",
     title: []const u8 = "tardigrade-quic",
-    qlog_version: []const u8 = "0.3",
+    description: []const u8 = "Tardigrade QUIC/HTTP-3 debug trace",
 };
 
 /// Serialize the qlog file header as the first JSON-SEQ record. A composition
 /// root writes this once, then appends `writeJson` event records (from both
-/// `quic` and `http3`) to form a complete `.qlog` file qvis can consume.
+/// `quic` and `http3`) to form a complete `.sqlog` file qvis can consume.
 /// Returns the written slice; a 512-byte buffer is enough.
 pub fn writeTraceHeader(header: TraceHeader, out: []u8) error{NoSpaceLeft}![]const u8 {
     var b = Buf{ .buf = out };
     try b.add("{c}", .{record_separator});
     try b.add(
-        "{{\"qlog_version\":\"{s}\",\"qlog_format\":\"JSON-SEQ\",\"title\":\"{s}\",\"trace\":{{\"vantage_point\":{{\"type\":\"{s}\"}},\"common_fields\":{{\"reference_time\":{d}.{d:0>3},\"group_id\":\"{s}\"}}}}}}\n",
-        .{ header.qlog_version, header.title, @tagName(header.vantage_point), header.reference_time_us / 1000, header.reference_time_us % 1000, header.group_id },
+        "{{\"file_schema\":\"{s}\",\"serialization_format\":\"{s}\",\"title\":\"{s}\",\"description\":\"{s}\",\"trace\":{{\"common_fields\":{{\"group_id\":\"{s}\",\"time_format\":\"relative_to_epoch\",\"reference_time\":{{\"clock_type\":\"system\",\"epoch\":\"1970-01-01T00:00:00.000Z\"}}}},\"vantage_point\":{{\"type\":\"{s}\"}},\"event_schemas\":[\"{s}\",\"{s}\",\"{s}\"]}}}}\n",
+        .{ file_schema_uri, serialization_format, header.title, header.description, header.group_id, @tagName(header.vantage_point), quic_event_schema_uri, http3_event_schema_uri, tardigrade_event_schema_uri },
     );
     return b.slice();
 }
 
 /// Serialize one `Record` into `out` as a single qlog JSON-SEQ line:
 ///
-///     0x1E {"time":<ms>,"name":"<category>:<event>","data":{...}} \n
+///     0x1E {"time":<ms>,"name":"<namespace>:<event>","data":{...}} \n
 ///
 /// Returns the written slice. Errors only if `out` is too small; a 512-byte
 /// buffer is comfortably enough for every event above.
@@ -391,7 +445,7 @@ pub fn writeJson(record: Record, out: []u8) error{NoSpaceLeft}![]const u8 {
     // qlog default time unit is milliseconds; keep microsecond precision.
     try b.add(
         "{{\"time\":{d}.{d:0>3},\"name\":\"{s}:{s}\",\"data\":",
-        .{ record.time_us / 1000, record.time_us % 1000, record.event.category().label(), record.event.name() },
+        .{ record.time_us / 1000, record.time_us % 1000, record.event.namespace().label(), record.event.name() },
     );
     try writeData(&b, record.event);
     try b.add("}}\n", .{});
@@ -412,18 +466,19 @@ fn expectJson(record: Record, needle: []const u8) !void {
     try testing.expect(std.mem.indexOf(u8, line, needle) != null);
 }
 
-test "category and name mapping stays aligned with qlog vantage points" {
-    try testing.expectEqual(Category.transport, (Event{ .packet_sent = .{ .packet_type = .one_rtt, .packet_number = 0, .length = 0 } }).category());
-    try testing.expectEqual(Category.recovery, (Event{ .packet_lost = .{ .packet_type = .one_rtt } }).category());
-    try testing.expectEqual(Category.security, (Event{ .key_updated = .{ .phase = 1 } }).category());
-    try testing.expectEqual(Category.connectivity, (Event{ .connection_migrated = .{ .kind = .active, .outcome = .blocked } }).category());
-    try testing.expectEqualStrings("packet_dropped", (Event{ .packet_dropped = .{ .trigger = .payload_decrypt_error } }).name());
+test "namespace and name mapping stays aligned with qlog vantage points" {
+    try testing.expectEqual(Namespace.quic, (Event{ .packet_sent = .{ .packet_type = .one_rtt, .packet_number = 0, .length = 0 } }).namespace());
+    try testing.expectEqual(Namespace.quic, (Event{ .packet_lost = .{ .packet_type = .one_rtt } }).namespace());
+    try testing.expectEqual(Namespace.quic, (Event{ .key_updated = .{ .phase = 1 } }).namespace());
+    try testing.expectEqual(Namespace.quic, (Event{ .connection_migrated = .{ .kind = .active, .outcome = .blocked } }).namespace());
+    try testing.expectEqual(Namespace.tardigrade, (Event{ .stream_reset = .{ .kind = .reset_sent, .stream_id = 0 } }).namespace());
+    try testing.expectEqualStrings("packet_dropped", (Event{ .packet_dropped = .{ .trigger = .decryption_failure } }).name());
 }
 
-test "packet_sent serializes to a transport JSON-SEQ line" {
+test "packet_sent serializes to a quic JSON-SEQ line" {
     try expectJson(
         .{ .time_us = 1_234_567, .event = .{ .packet_sent = .{ .packet_type = .initial, .packet_number = 7, .length = 1200, .ack_eliciting = true } } },
-        "\"name\":\"transport:packet_sent\"",
+        "\"name\":\"quic:packet_sent\"",
     );
     try expectJson(
         .{ .time_us = 1_234_567, .event = .{ .packet_sent = .{ .packet_type = .one_rtt, .packet_number = 7, .length = 1200 } } },
@@ -431,10 +486,10 @@ test "packet_sent serializes to a transport JSON-SEQ line" {
     );
 }
 
-test "deprotection failure is a packet_dropped with payload_decrypt_error" {
+test "deprotection failure is a packet_dropped with decryption_failure" {
     try expectJson(
-        .{ .time_us = 0, .event = .{ .packet_dropped = .{ .packet_type = .one_rtt, .trigger = .payload_decrypt_error, .length = 42 } } },
-        "\"trigger\":\"payload_decrypt_error\"",
+        .{ .time_us = 0, .event = .{ .packet_dropped = .{ .packet_type = .one_rtt, .trigger = .decryption_failure, .length = 42 } } },
+        "\"trigger\":\"decryption_failure\"",
     );
 }
 
@@ -446,21 +501,34 @@ test "time is rendered in milliseconds with microsecond precision" {
 
 test "path, migration, stream reset and flow-control events serialize" {
     try expectJson(.{ .time_us = 5, .event = .{ .path_validation = .{ .kind = .response_received } } }, "\"phase\":\"response_received\"");
-    try expectJson(.{ .time_us = 5, .event = .{ .connection_migrated = .{ .kind = .nat_rebinding, .outcome = .accepted } } }, "connection_migrated");
+    try expectJson(.{ .time_us = 5, .event = .{ .connection_migrated = .{ .kind = .nat_rebinding, .outcome = .accepted } } }, "migration_state_updated");
     try expectJson(.{ .time_us = 5, .event = .{ .stream_reset = .{ .kind = .reset_received, .stream_id = 4, .error_code = 9 } } }, "\"stream_id\":4");
     try expectJson(.{ .time_us = 5, .event = .{ .data_blocked = .{ .scope = .stream, .stream_id = 8, .limit = 4096 } } }, "\"scope\":\"stream\"");
 }
 
+test "recovery metrics serialize as a quic event" {
+    try expectJson(
+        .{ .time_us = 5, .event = .{ .recovery_metrics_updated = .{ .congestion_window = 12_000, .bytes_in_flight = 1_200, .pto_count = 2 } } },
+        "\"name\":\"quic:recovery_metrics_updated\"",
+    );
+    try expectJson(
+        .{ .time_us = 5, .event = .{ .recovery_metrics_updated = .{ .congestion_window = 12_000, .bytes_in_flight = 1_200, .pto_count = 2 } } },
+        "\"bytes_in_flight\":1200",
+    );
+}
+
 test "trace header then event forms a two-record JSON-SEQ stream" {
     var buf: [1024]u8 = undefined;
-    const header = try writeTraceHeader(.{ .vantage_point = .server, .reference_time_us = 1_000, .group_id = "0011deadbeef" }, &buf);
+    const header = try writeTraceHeader(.{ .vantage_point = .server, .group_id = "0011deadbeef" }, &buf);
     const event = try writeJson(.{ .time_us = 2_500, .event = .{ .packet_sent = .{ .packet_type = .initial, .packet_number = 0, .length = 1200 } } }, buf[header.len..]);
     // Exactly two record separators, one per record.
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, buf[0 .. header.len + event.len], &[_]u8{record_separator}));
-    try testing.expect(std.mem.indexOf(u8, header, "\"qlog_format\":\"JSON-SEQ\"") != null);
+    try testing.expect(std.mem.indexOf(u8, header, "\"file_schema\":\"urn:ietf:params:qlog:file:sequential\"") != null);
+    try testing.expect(std.mem.indexOf(u8, header, "\"serialization_format\":\"application/qlog+json-seq\"") != null);
+    try testing.expect(std.mem.indexOf(u8, header, "\"event_schemas\":[\"urn:ietf:params:qlog:events:quic-13\",\"urn:ietf:params:qlog:events:http3-13\"") != null);
     try testing.expect(std.mem.indexOf(u8, header, "\"vantage_point\":{\"type\":\"server\"}") != null);
     try testing.expect(std.mem.indexOf(u8, header, "\"group_id\":\"0011deadbeef\"") != null);
-    try testing.expect(std.mem.indexOf(u8, event, "transport:packet_sent") != null);
+    try testing.expect(std.mem.indexOf(u8, event, "quic:packet_sent") != null);
 }
 
 test "default sink is a no-op and log() stamps time" {

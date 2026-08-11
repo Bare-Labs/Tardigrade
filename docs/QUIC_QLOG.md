@@ -22,7 +22,7 @@ layering, and the safety rules up front so those call-sites are mechanical.
   from a captured trace, not just from ad-hoc `std.log` lines.
 - Provide the primitives (trace-header + event-line + keylog-line writers) so
   that, once the composition root assembles them, the interop/failure harnesses
-  (#247) save `*.qlog` / `*.keys` artifacts that qvis / Wireshark consume
+  (#247) save `*.sqlog` / `*.keys` artifacts that qvis / Wireshark consume
   directly. This PR ships those writers and the merged-shape test; the root
   wiring that emits real flows is follow-up.
 - Keep everything **off by default** and cheap when off.
@@ -43,7 +43,7 @@ respects that boundary rather than punching through it.
 ```
                  composition root (gateway h3 listener / smoke harness)
                  ┌───────────────────────────────────────────────────┐
-                 │  owns the *.qlog file + *.keys file writers        │
+                 │  owns the *.sqlog file + *.keys file writers       │
                  │  installs one quic.qlog.Sink, one http3.qlog.Sink, │
                  │  one quic.keylog.Sink; interleaves all three       │
                  └───────────────▲───────────────▲───────────────▲────┘
@@ -67,7 +67,7 @@ Rules:
    `Sink{}` is a no-op, so the seam costs nothing until a root wires it.
 4. The **concrete file writers** live at the composition root, which already
    owns both packages. It timestamps and interleaves the streams into one
-   JSON-SEQ `.qlog` file, so a single trace still shows transport and H3 events
+   JSON-SEQ `.sqlog` file, so a single trace still shows transport and H3 events
    side by side without either package depending on the other.
 
 This is why there is no single shared "qlog writer" module: sharing one would
@@ -89,32 +89,53 @@ into one valid file at the root instead.
 
 ## qlog event catalogue
 
-Names below are `category:event`. Transport events (`src/quic/qlog.zig`):
+The qlog scaffold tracks the July 2026 submitted drafts:
+
+- `draft-ietf-quic-qlog-main-schema-14`
+- `draft-ietf-quic-qlog-quic-events-13`
+- `draft-ietf-quic-qlog-h3-events-13`
+
+Because these are still drafts, the sequential trace header declares
+draft-qualified event schema URIs:
+
+- `urn:ietf:params:qlog:events:quic-13`
+- `urn:ietf:params:qlog:events:http3-13`
+- `https://bare.systems/tardigrade/qlog/events/debug-1`
+
+The Tardigrade URI covers debug events that are useful for #255 but are not
+standardized qlog events. Most importantly, current HTTP/3 qlog no longer
+standardizes QPACK events, so QPACK blocked-stream visibility is either a
+Prometheus/structured diagnostic signal or the explicit
+`tardigrade:qpack_stream_state_updated` extension below.
+
+Names below are `namespace:event`. Transport events (`src/quic/qlog.zig`):
 
 | Requirement (#255)        | qlog event                          | Key data |
 |---------------------------|-------------------------------------|----------|
-| handshake                 | `connectivity:connection_started`   | odcid/scid/dcid lengths |
-|                           | `connectivity:handshake`            | `stage` (started → confirmed / failed) |
-|                           | `connectivity:connection_closed`    | `reason`, optional `error_code` |
-|                           | `security:key_updated`              | `key_phase` |
-| packet sent               | `transport:packet_sent`             | type, number, length, ack-eliciting |
-| packet received           | `transport:packet_received`         | type, number, length |
-| packet lost               | `recovery:packet_lost`              | type, number, bytes-in-flight, cwnd |
-| **deprotection failure**  | `transport:packet_dropped`          | `trigger:"payload_decrypt_error"` |
-| PATH_CHALLENGE/RESPONSE   | `transport:path_validation`         | `phase` (challenge/response sent/received, validated, failed) |
-| migration                 | `connectivity:connection_migrated`  | `kind` (nat_rebinding/active), `outcome` (accepted/blocked) |
-| stream reset              | `transport:stream_reset`            | `direction` (reset/stop-sending, sent/received), stream id, error code |
-| flow-control blocked      | `transport:data_blocked`            | `scope` (connection/stream), optional stream id, limit |
+| handshake                 | `quic:connection_started`           | odcid/scid/dcid lengths |
+|                           | `tardigrade:quic_handshake_progressed` | `stage` (started -> confirmed / failed) |
+|                           | `quic:connection_closed`            | `reason`, optional `error_code` |
+|                           | `quic:key_updated`                  | `key_phase` |
+| packet sent               | `quic:packet_sent`                  | type, number, length, ack-eliciting |
+| packet received           | `quic:packet_received`              | type, number, length |
+| packet lost               | `quic:packet_lost`                  | type, number |
+| recovery metrics          | `quic:recovery_metrics_updated`     | RTT/PTO/cwnd/bytes-in-flight updates |
+| **deprotection failure**  | `quic:packet_dropped`               | `trigger:"decryption_failure"` |
+| PATH_CHALLENGE/RESPONSE   | `tardigrade:quic_path_validation`   | `phase` (challenge/response sent/received, validated, failed) |
+| migration                 | `quic:migration_state_updated`      | `trigger` (nat_rebinding/active), `state` (accepted/blocked) |
+| stream reset              | `tardigrade:quic_stream_reset`      | `direction` (reset/stop-sending, sent/received), stream id, error code |
+| flow-control blocked      | `quic:connection_data_blocked_updated` / `quic:stream_data_blocked_updated` | optional stream id, limit |
 
 Application events (`src/http3/qlog.zig`):
 
 | Requirement (#255)        | qlog event                          | Key data |
 |---------------------------|-------------------------------------|----------|
-| SETTINGS                  | `http:parameters_set`               | max field section size, QPACK table cap, blocked streams |
-| control stream / HEADERS / DATA / GOAWAY | `http:frame_created` / `http:frame_parsed` | frame type, stream id, length |
-| **QPACK blocked**         | `qpack:stream_state_updated`        | `state` (blocked/unblocked), stream id |
+| SETTINGS                  | `http3:parameters_set`              | max field section size, QPACK table cap, blocked streams |
+| control stream            | `http3:stream_type_set`             | stream id, stream type |
+| HEADERS / DATA / GOAWAY   | `http3:frame_created` / `http3:frame_parsed` | frame type, stream id, raw length |
+| **QPACK blocked**         | `tardigrade:qpack_stream_state_updated` | `state` (blocked/unblocked), stream id |
 
-`transport:packet_dropped` with `trigger:"payload_decrypt_error"` is the
+`quic:packet_dropped` with `trigger:"decryption_failure"` is the
 canonical qlog encoding of an AEAD deprotection failure, satisfying the #255
 requirement that deprotection failures are reported deterministically. It is
 distinct from a normal drop (`unknown_connection_id`, `key_unavailable`, …).
@@ -124,7 +145,7 @@ distinct from a normal drop (`unknown_connection_id`, `key_unavailable`, …).
 Each record is one JSON-SEQ line:
 
 ```
-0x1E {"time":<ms>.<us>,"name":"transport:packet_sent","data":{ … }}\n
+0x1E {"time":<ms>.<us>,"name":"quic:packet_sent","data":{ ... }}\n
 ```
 
 - Time is milliseconds (qlog's default `time_units`) with microsecond
@@ -132,14 +153,18 @@ Each record is one JSON-SEQ line:
 - Writers are **allocation-free**: they format into a caller-owned buffer
   (`writeJson(record, buf)`), matching the bounded-buffer style already used by
   the TLS handshake wire writer. A 512-byte buffer covers every event.
-- A qlog file is a trace header followed by these event lines.
-  `qlog.writeTraceHeader(header, buf)` serializes that header (qlog version,
-  vantage point, `reference_time`, and ODCID `group_id`) as the first JSON-SEQ
+- A qlog file is a `QlogFileSeq` header followed by event lines.
+  `qlog.writeTraceHeader(header, buf)` serializes the
+  `file_schema: urn:ietf:params:qlog:file:sequential`,
+  `serialization_format: application/qlog+json-seq`, `trace`,
+  `event_schemas`, vantage point, and ODCID `group_id` as the first JSON-SEQ
   record. The header spans both packages — the `group_id` ties transport and
   H3 events to one connection — so the **composition root** fills it in and
   writes it once, then appends event records from both `quic` and `http3`. The
   `tests/quic_h3_smoke.zig` harness exercises exactly this shape (header +
   transport record + H3 record) so the merged-file contract is locked.
+- JSON-SEQ qlog artifacts use the `.sqlog` suffix. Reserve `.qlog` for the
+  normal contained JSON qlog form.
 
 ### Sink error handling
 
@@ -186,7 +211,7 @@ capture can decrypt the entire connection.
   authorized to decrypt.
 - The adapter otherwise wipes these secrets (`SecretStore.wipe`); the key log is
   the only path by which they leave the process.
-- Artifacts the harness saves (`*.qlog`, `*.keys`) inherit this: store them with
+- Artifacts the harness saves (`*.sqlog`, `*.keys`) inherit this: store them with
   the capture, scrub them from CI logs, and never attach them to public issues.
 
 ## Configuration
@@ -232,9 +257,9 @@ counters they read from already exist.
   for representative transport events, QPACK blocking, and keylog line format,
   in `src/quic/qlog.zig`, `src/http3/qlog.zig`, `src/quic/keylog.zig`.
 - **Integration** (follow-up, with the connection layer): drive a handshake and
-  assert a produced `.qlog` contains the expected event classes; snapshot
+  assert a produced `.sqlog` contains the expected event classes; snapshot
   metrics on common error paths.
-- **Manual**: load a saved `.qlog` in qvis and a capture + `.keys` in Wireshark
+- **Manual**: load a saved `.sqlog` in qvis and a capture + `.keys` in Wireshark
   once enough transport exists to produce real flows.
 
 ## References
