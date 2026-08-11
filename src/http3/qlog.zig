@@ -59,8 +59,19 @@ pub const HttpField = struct {
     value: []const u8,
 };
 
+pub const SettingName = enum {
+    settings_qpack_max_table_capacity,
+    settings_max_field_section_size,
+    settings_qpack_blocked_streams,
+    settings_enable_connect_protocol,
+    settings_h3_datagram,
+    reserved,
+    unknown,
+};
+
 pub const Setting = struct {
-    name: []const u8,
+    name: SettingName,
+    name_bytes: ?u64 = null,
     value: u64,
 };
 
@@ -195,6 +206,26 @@ const Buf = struct {
     }
 };
 
+const WriteError = error{ NoSpaceLeft, InvalidSettingName };
+
+fn writeJsonString(b: *Buf, value: []const u8) error{NoSpaceLeft}!void {
+    try b.add("\"", .{});
+    for (value) |c| {
+        switch (c) {
+            '"' => try b.add("\\\"", .{}),
+            '\\' => try b.add("\\\\", .{}),
+            0x08 => try b.add("\\b", .{}),
+            0x0c => try b.add("\\f", .{}),
+            '\n' => try b.add("\\n", .{}),
+            '\r' => try b.add("\\r", .{}),
+            '\t' => try b.add("\\t", .{}),
+            0x00...0x07, 0x0b, 0x0e...0x1f => try b.add("\\u00{x:0>2}", .{c}),
+            else => try b.add("{c}", .{c}),
+        }
+    }
+    try b.add("\"", .{});
+}
+
 fn writeRawLength(b: *Buf, length: ?usize, need_comma: *bool) error{NoSpaceLeft}!void {
     if (length) |v| {
         if (need_comma.*) try b.add(",", .{});
@@ -207,21 +238,28 @@ fn writeHeaders(b: *Buf, headers: []const HttpField) error{NoSpaceLeft}!void {
     try b.add("\"headers\":[", .{});
     for (headers, 0..) |field, i| {
         if (i != 0) try b.add(",", .{});
-        try b.add("{{\"name\":\"{s}\",\"value\":\"{s}\"}}", .{ field.name, field.value });
+        try b.add("{{\"name\":", .{});
+        try writeJsonString(b, field.name);
+        try b.add(",\"value\":", .{});
+        try writeJsonString(b, field.value);
+        try b.add("}}", .{});
     }
     try b.add("]", .{});
 }
 
-fn writeSettings(b: *Buf, settings: []const Setting) error{NoSpaceLeft}!void {
+fn writeSettings(b: *Buf, settings: []const Setting) WriteError!void {
     try b.add("\"settings\":[", .{});
     for (settings, 0..) |setting, i| {
         if (i != 0) try b.add(",", .{});
-        try b.add("{{\"name\":\"{s}\",\"value\":{d}}}", .{ setting.name, setting.value });
+        if (setting.name == .unknown and setting.name_bytes == null) return error.InvalidSettingName;
+        try b.add("{{\"name\":\"{s}\"", .{@tagName(setting.name)});
+        if (setting.name_bytes) |name_bytes| try b.add(",\"name_bytes\":{d}", .{name_bytes});
+        try b.add(",\"value\":{d}}}", .{setting.value});
     }
     try b.add("]", .{});
 }
 
-fn writeFrame(b: *Buf, frame: Frame) error{NoSpaceLeft}!void {
+fn writeFrame(b: *Buf, frame: Frame) WriteError!void {
     try b.add("{{\"frame_type\":\"{s}\"", .{frame.frameType().label()});
     var need_comma = true;
     switch (frame) {
@@ -257,7 +295,7 @@ fn writeFrame(b: *Buf, frame: Frame) error{NoSpaceLeft}!void {
     try b.add("}}", .{});
 }
 
-fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
+fn writeData(b: *Buf, event: Event) WriteError!void {
     switch (event) {
         .parameters_set => |d| {
             try b.add("{{", .{});
@@ -300,7 +338,7 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
 
 /// Serialize one `Record` into `out` as a single qlog JSON-SEQ line. Same shape
 /// as `quic.qlog.writeJson` so a merged trace is uniform.
-pub fn writeJson(record: Record, out: []u8) error{NoSpaceLeft}![]const u8 {
+pub fn writeJson(record: Record, out: []u8) WriteError![]const u8 {
     var b = Buf{ .buf = out };
     try b.add("{c}", .{record_separator});
     try b.add(
@@ -357,12 +395,12 @@ test "stream_type_set and representative frames use http3 names" {
         "\"name\":\"http3:stream_type_set\"",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = "SETTINGS_QPACK_BLOCKED_STREAMS", .value = 16 }} } } } } },
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = .settings_qpack_blocked_streams, .value = 16 }} } } } } },
         "\"frame_type\":\"settings\"",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = "SETTINGS_QPACK_BLOCKED_STREAMS", .value = 16 }} } } } } },
-        "\"settings\":[{\"name\":\"SETTINGS_QPACK_BLOCKED_STREAMS\",\"value\":16}]",
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = .settings_qpack_blocked_streams, .value = 16 }} } } } } },
+        "\"settings\":[{\"name\":\"settings_qpack_blocked_streams\",\"value\":16}]",
     );
     try expectJson(
         .{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 4, .frame = .{ .headers = .{ .headers = &.{.{ .name = ":path", .value = "/" }}, .raw_length = 32 } } } } },
@@ -371,6 +409,38 @@ test "stream_type_set and representative frames use http3 names" {
     try expectJson(
         .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .goaway = .{ .id = 4 } } } } },
         "\"id\":4",
+    );
+}
+
+test "headers escape JSON string content" {
+    var buf: [512]u8 = undefined;
+    const line = try writeJson(.{
+        .time_us = 0,
+        .event = .{ .frame = .{
+            .direction = .parsed,
+            .stream_id = 4,
+            .frame = .{ .headers = .{ .headers = &.{.{ .name = "x-debug", .value = "quoted \"value\" \\ path\nnext" }} } },
+        } },
+    }, &buf);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line[1 .. line.len - 1], .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const data = root.get("data").?.object;
+    const frame = data.get("frame").?.object;
+    const headers = frame.get("headers").?.array;
+    const first = headers.items[0].object;
+    try testing.expectEqualStrings("quoted \"value\" \\ path\nnext", first.get("value").?.string);
+}
+
+test "unknown setting requires name_bytes" {
+    var buf: [512]u8 = undefined;
+    try testing.expectError(error.InvalidSettingName, writeJson(.{
+        .time_us = 0,
+        .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = .unknown, .value = 1 }} } } } },
+    }, &buf));
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = .unknown, .name_bytes = 0x21, .value = 1 }} } } } } },
+        "\"settings\":[{\"name\":\"unknown\",\"name_bytes\":33,\"value\":1}]",
     );
 }
 

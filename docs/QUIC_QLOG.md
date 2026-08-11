@@ -124,7 +124,7 @@ Names below are `namespace:event`. Transport events (`src/quic/qlog.zig`):
 | PATH_CHALLENGE/RESPONSE   | `tardigrade:quic_path_validation`   | `phase` (challenge/response sent/received, validated, failed) |
 | migration                 | `quic:migration_state_updated`      | required `new` migration state, optional `old` |
 | stream reset              | `tardigrade:quic_stream_reset`      | `direction` (reset/stop-sending, sent/received), stream id, error code |
-| flow-control blocked      | `quic:connection_data_blocked_updated` / `quic:stream_data_blocked_updated` | required `new` blocked state, optional `old` / `reason`; stream variant requires `stream_id` |
+| flow-control blocked      | `quic:connection_data_blocked_updated` / `quic:stream_data_blocked_updated` | required `new` blocked state, optional `old` / draft `$BlockedReason`; stream variant requires `stream_id` |
 
 Application events (`src/http3/qlog.zig`):
 
@@ -132,7 +132,7 @@ Application events (`src/http3/qlog.zig`):
 |---------------------------|-------------------------------------|----------|
 | SETTINGS                  | `http3:parameters_set`              | max field section size, QPACK table cap, blocked streams |
 | control stream            | `http3:stream_type_set`             | stream id, stream type |
-| HEADERS / DATA / GOAWAY   | `http3:frame_created` / `http3:frame_parsed` | variant-specific frame payloads; HEADERS carries `headers`, SETTINGS carries `settings`, GOAWAY carries `id` |
+| HEADERS / DATA / GOAWAY   | `http3:frame_created` / `http3:frame_parsed` | variant-specific frame payloads; HEADERS carries escaped `headers`, SETTINGS carries typed lower-case qlog `settings`, GOAWAY carries `id` |
 | **QPACK blocked**         | `tardigrade:qpack_stream_state_updated` | `state` (blocked/unblocked), stream id |
 
 `quic:packet_dropped` with `trigger:"decryption_failure"` is the
@@ -167,6 +167,9 @@ Each record is one JSON-SEQ line:
   representative QUIC/H3 records) so the merged-file contract is locked.
 - JSON-SEQ qlog artifacts use the `.sqlog` suffix. Reserve `.qlog` for the
   normal contained JSON qlog form.
+- Dynamic qlog text fields, including trace `title`/`description` and HTTP
+  field names/values, are JSON-string escaped by the serializers before
+  writing into the caller-owned buffer.
 
 ### Sink error handling
 

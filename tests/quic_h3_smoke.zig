@@ -1209,10 +1209,10 @@ test "qlog composition root interleaves transport and h3 records under one heade
 
     const h3_settings = try h3qlog.writeJson(.{
         .time_us = 2_000,
-        .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = "SETTINGS_QPACK_BLOCKED_STREAMS", .value = 16 }}, .raw_length = 6 } } } },
+        .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = .settings_qpack_blocked_streams, .value = 16 }}, .raw_length = 6 } } } },
     }, file[len..]);
     len += h3_settings.len;
-    try expectQlogRecord(h3_settings, "{\"time\":2.000,\"name\":\"http3:frame_created\",\"data\":{\"stream_id\":0,\"frame\":{\"frame_type\":\"settings\",\"settings\":[{\"name\":\"SETTINGS_QPACK_BLOCKED_STREAMS\",\"value\":16}],\"raw\":{\"length\":6}}}}");
+    try expectQlogRecord(h3_settings, "{\"time\":2.000,\"name\":\"http3:frame_created\",\"data\":{\"stream_id\":0,\"frame\":{\"frame_type\":\"settings\",\"settings\":[{\"name\":\"settings_qpack_blocked_streams\",\"value\":16}],\"raw\":{\"length\":6}}}}");
 
     const h3_headers = try h3qlog.writeJson(.{
         .time_us = 2_250,

@@ -113,6 +113,8 @@ pub const KeyType = enum {
     client_initial_secret,
     server_handshake_secret,
     client_handshake_secret,
+    server_0rtt_secret,
+    client_0rtt_secret,
     server_1rtt_secret,
     client_1rtt_secret,
 };
@@ -142,9 +144,14 @@ pub const StreamResetKind = enum {
 
 pub const BlockedState = enum { blocked, unblocked };
 pub const BlockedReason = enum {
-    data_blocked_frame,
-    stream_data_blocked_frame,
-    flow_control_limit,
+    scheduling,
+    pacing,
+    amplification_protection,
+    congestion_control,
+    connection_flow_control,
+    stream_flow_control,
+    stream_id,
+    application,
 };
 
 pub const DataBlocked = union(enum) {
@@ -357,6 +364,24 @@ fn boolText(value: bool) []const u8 {
     return if (value) "true" else "false";
 }
 
+fn writeJsonString(b: *Buf, value: []const u8) error{NoSpaceLeft}!void {
+    try b.add("\"", .{});
+    for (value) |c| {
+        switch (c) {
+            '"' => try b.add("\\\"", .{}),
+            '\\' => try b.add("\\\\", .{}),
+            0x08 => try b.add("\\b", .{}),
+            0x0c => try b.add("\\f", .{}),
+            '\n' => try b.add("\\n", .{}),
+            '\r' => try b.add("\\r", .{}),
+            '\t' => try b.add("\\t", .{}),
+            0x00...0x07, 0x0b, 0x0e...0x1f => try b.add("\\u00{x:0>2}", .{c}),
+            else => try b.add("{c}", .{c}),
+        }
+    }
+    try b.add("\"", .{});
+}
+
 fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
     switch (event) {
         .connection_started => |d| try b.add(
@@ -488,10 +513,13 @@ pub const TraceHeader = struct {
 pub fn writeTraceHeader(header: TraceHeader, out: []u8) error{NoSpaceLeft}![]const u8 {
     var b = Buf{ .buf = out };
     try b.add("{c}", .{record_separator});
-    try b.add(
-        "{{\"file_schema\":\"{s}\",\"serialization_format\":\"{s}\",\"title\":\"{s}\",\"description\":\"{s}\",\"trace\":{{\"common_fields\":{{\"group_id\":\"{s}\",\"time_format\":\"relative_to_epoch\",\"reference_time\":{{\"clock_type\":\"monotonic\",\"epoch\":\"unknown\"}}}},\"vantage_point\":{{\"type\":\"{s}\"}},\"event_schemas\":[\"{s}\",\"{s}\",\"{s}\"]}}}}\n",
-        .{ file_schema_uri, serialization_format, header.title, header.description, header.group_id, @tagName(header.vantage_point), quic_event_schema_uri, http3_event_schema_uri, tardigrade_event_schema_uri },
-    );
+    try b.add("{{\"file_schema\":\"{s}\",\"serialization_format\":\"{s}\",\"title\":", .{ file_schema_uri, serialization_format });
+    try writeJsonString(&b, header.title);
+    try b.add(",\"description\":", .{});
+    try writeJsonString(&b, header.description);
+    try b.add(",\"trace\":{{\"common_fields\":{{\"group_id\":", .{});
+    try writeJsonString(&b, header.group_id);
+    try b.add(",\"time_format\":\"relative_to_epoch\",\"reference_time\":{{\"clock_type\":\"monotonic\",\"epoch\":\"unknown\"}}}},\"vantage_point\":{{\"type\":\"{s}\"}},\"event_schemas\":[\"{s}\",\"{s}\",\"{s}\"]}}}}\n", .{ @tagName(header.vantage_point), quic_event_schema_uri, http3_event_schema_uri, tardigrade_event_schema_uri });
     return b.slice();
 }
 
@@ -555,6 +583,28 @@ test "deprotection failure is a packet_dropped with decryption_failure" {
     );
 }
 
+test "0-RTT key type serializes as a standard key_updated value" {
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .key_updated = .{ .key_type = .server_0rtt_secret } } },
+        "\"key_type\":\"server_0rtt_secret\"",
+    );
+}
+
+test "trace header escapes free-form text fields" {
+    var buf: [1024]u8 = undefined;
+    const header = try writeTraceHeader(.{
+        .vantage_point = .server,
+        .group_id = "0011deadbeef",
+        .title = "test \"trace\"",
+        .description = "debug \\ trace\nnext",
+    }, &buf);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, header[1 .. header.len - 1], .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqualStrings("test \"trace\"", root.get("title").?.string);
+    try testing.expectEqualStrings("debug \\ trace\nnext", root.get("description").?.string);
+}
+
 test "time is rendered in milliseconds with microsecond precision" {
     var buf: [512]u8 = undefined;
     const line = try writeJson(.{ .time_us = 1_002_003, .event = .{ .key_updated = .{ .key_type = .server_1rtt_secret, .key_phase = 1 } } }, &buf);
@@ -565,8 +615,8 @@ test "path, migration, stream reset and flow-control events serialize" {
     try expectJson(.{ .time_us = 5, .event = .{ .path_validation = .{ .kind = .response_received } } }, "\"phase\":\"response_received\"");
     try expectJson(.{ .time_us = 5, .event = .{ .connection_migrated = .{ .old = .migration_started, .new = .migration_complete } } }, "migration_state_updated");
     try expectJson(.{ .time_us = 5, .event = .{ .stream_reset = .{ .kind = .reset_received, .stream_id = 4, .error_code = 9 } } }, "\"stream_id\":4");
-    try expectJson(.{ .time_us = 5, .event = .{ .data_blocked = .{ .stream = .{ .stream_id = 8, .new = .blocked, .reason = .stream_data_blocked_frame } } } }, "\"name\":\"quic:stream_data_blocked_updated\"");
-    try expectJson(.{ .time_us = 5, .event = .{ .data_blocked = .{ .connection = .{ .new = .blocked, .reason = .data_blocked_frame } } } }, "\"name\":\"quic:connection_data_blocked_updated\"");
+    try expectJson(.{ .time_us = 5, .event = .{ .data_blocked = .{ .stream = .{ .stream_id = 8, .new = .blocked, .reason = .stream_flow_control } } } }, "\"name\":\"quic:stream_data_blocked_updated\"");
+    try expectJson(.{ .time_us = 5, .event = .{ .data_blocked = .{ .connection = .{ .new = .blocked, .reason = .connection_flow_control } } } }, "\"name\":\"quic:connection_data_blocked_updated\"");
 }
 
 test "recovery metrics serialize as a quic event" {
