@@ -285,7 +285,7 @@ fn findOrAppendByFd(out_events: []Event, out_len: *usize, fd: std.posix.fd_t) ?*
 /// SQ/CQ memory is charged against `RLIMIT_MEMLOCK`, whose default soft limit
 /// is commonly 64 KiB. At 256 entries the rings cost roughly 24 KiB (256
 /// 64-byte SQEs plus 512 16-byte CQEs), which fits that default; much deeper
-/// rings would make `io_uring_setup` fail with `ENOMEM` on stock 5.4-era
+/// rings would make `io_uring_setup` fail with `ENOMEM` on stock 5.5-era
 /// hosts. Operators who want a deeper ring can raise `RLIMIT_MEMLOCK` and set
 /// `TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES`.
 pub const default_io_uring_entries: u16 = 256;
@@ -369,6 +369,13 @@ const IoUringPollerLinux = struct {
     mutex: compat.Mutex = .{},
     registrations: std.AutoHashMapUnmanaged(std.posix.fd_t, Registration) = .empty,
     next_token: u32 = 1,
+    /// Sticky. A ring that fails to accept submissions cannot be trusted to
+    /// deliver readiness again: the polls this backend believes are armed may
+    /// not be, and unlike a per-connection wait there is no deadline reaper
+    /// behind the listener registration to recover it. Once set, `wait`
+    /// reports `error.EventLoopUnrecoverable` so the gateway can drain and
+    /// exit rather than stay up with a wedged loop.
+    fatal: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn init(allocator: std.mem.Allocator, entries: u16) !IoUringPollerLinux {
         if (entries < min_io_uring_entries or entries > max_io_uring_entries) {
@@ -383,6 +390,20 @@ const IoUringPollerLinux = struct {
             else => return error.IoUringUnavailable,
         };
         errdefer ring.deinit();
+
+        // CQ overflow must not lose completions. This backend re-arms a
+        // one-shot `POLL_ADD` only after its completion is reaped, so a
+        // dropped CQE does not merely delay an event — it strands that
+        // registration permanently: the table still says the fd is armed, and
+        // nothing will ever re-arm it. Kernels before 5.5 discard completions
+        // on overflow (bumping `cq_overflow`); 5.5+ advertise
+        // `IORING_FEAT_NODROP` and retain them on an overflow list instead.
+        // Gate on the feature rather than on a version number, and fail closed
+        // when it is absent. This is what actually sets the prototype's floor
+        // at Linux 5.5, above the 5.4 that `IORING_OP_TIMEOUT` alone implies.
+        if ((ring.features & linux.IORING_FEAT_NODROP) == 0) {
+            return error.IoUringCqOverflowUnsafe;
+        }
 
         try probeCapabilities(&ring);
 
@@ -434,24 +455,14 @@ const IoUringPollerLinux = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Closing a fd removes it from every epoll set automatically, and this
-        // codebase relies on that: both `parkedConnectionCloseHook` and
-        // `activeConnectionCloseHook` only do accounting, so the keepalive idle
-        // reaper and the active-connection reaper close registered fds without
-        // unregistering them first. io_uring has no equivalent implicit
-        // cleanup, so an entry still present here belongs to a closed fd whose
-        // number the kernel has since recycled. Cancel that stale poll and take
-        // the fd over, which is what the caller would have observed under
-        // epoll — rather than reporting EEXIST for a connection it considers
-        // brand new and failing to register it at all.
-        if (self.registrations.getPtr(fd)) |stale| {
-            self.cancelLocked(fd, stale.token) catch {};
-            stale.interest = interest;
-            stale.token = self.takeTokenLocked();
-            try self.armLocked(fd, stale);
-            try self.submitLocked();
-            return;
-        }
+        // Mirror EPOLL_CTL_ADD's EEXIST. A live entry here is a genuine
+        // double-registration, not a recycled fd: every path that closes a
+        // registered fd unregisters it first (see `parkedConnectionCloseHook`
+        // and `reapActiveConnections`). Treating a duplicate as a stale entry
+        // to take over would be unsound anyway — it cannot fix the case where
+        // the old poll completes *before* the re-add, which is precisely why
+        // unregister-before-close has to be the invariant.
+        if (self.registrations.contains(fd)) return error.Unexpected;
 
         const token = self.takeTokenLocked();
         try self.registrations.put(self.allocator, fd, .{ .interest = interest, .token = token });
@@ -489,8 +500,14 @@ const IoUringPollerLinux = struct {
     }
 
     fn wait(self: *IoUringPollerLinux, out_events: []Event, timeout_ms: i32) !usize {
+        try self.checkFatal();
+
         var ts: linux.kernel_timespec = undefined;
-        var timer_armed = false;
+        // Set only once the timer SQE has been *accepted by the kernel*, not
+        // merely filled in. Blocking on `min_complete = 1` while believing in
+        // a timeout that was never submitted would park the loop thread
+        // indefinitely, past its own maintenance and shutdown deadlines.
+        var timer_submitted = false;
         {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -505,17 +522,17 @@ const IoUringPollerLinux = struct {
                 // completion is posted, or when `ts` elapses — the same shape
                 // as `epoll_wait(timeout)`, and self-completing either way so
                 // no dangling timer has to be cancelled afterwards.
-                if (self.ring.timeout(timeout_user_data, &ts, 1, 0)) |_| {
-                    timer_armed = true;
-                } else |_| {}
+                timer_submitted = self.armTimeoutLocked(&ts) catch |err| blk: {
+                    // A ring-level failure is fatal; pure queue pressure is
+                    // not, and degrades this call to a non-blocking poll.
+                    if (err == error.EventLoopUnrecoverable) return err;
+                    break :blk false;
+                };
             }
-            self.submitLocked() catch {};
+            try self.submitLocked();
         }
 
-        // Never block without a timer to break it: a bounded wait whose timer
-        // could not be queued degrades to a non-blocking poll rather than
-        // hanging the loop thread past its caller's deadline.
-        const may_block = if (timeout_ms > 0) timer_armed else timeout_ms < 0;
+        const may_block = if (timeout_ms > 0) timer_submitted else timeout_ms < 0;
 
         // Block outside the lock so worker threads can keep arming and
         // cancelling polls while the loop thread waits.
@@ -525,11 +542,24 @@ const IoUringPollerLinux = struct {
                 // are running; treat it as "no events", mirroring the
                 // epoll/kqueue paths.
                 error.SignalInterrupt => return 0,
-                else => return error.Unexpected,
+                else => return self.markFatal(),
             };
         }
 
         return self.reap(out_events);
+    }
+
+    /// Queue and submit the bounded-wait timer. Returns true once the kernel
+    /// has accepted it; returns `error.SubmissionQueueFull` (recoverable — the
+    /// caller degrades to a non-blocking poll) or `error.EventLoopUnrecoverable`.
+    fn armTimeoutLocked(self: *IoUringPollerLinux, ts: *const linux.kernel_timespec) !bool {
+        _ = self.ring.timeout(timeout_user_data, ts, 1, 0) catch {
+            try self.submitLocked();
+            _ = self.ring.timeout(timeout_user_data, ts, 1, 0) catch
+                return error.SubmissionQueueFull;
+        };
+        try self.submitLocked();
+        return true;
     }
 
     fn reap(self: *IoUringPollerLinux, out_events: []Event) !usize {
@@ -539,7 +569,7 @@ const IoUringPollerLinux = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const copied = self.ring.copy_cqes(cqes[0..cap], 0) catch return error.Unexpected;
+        const copied = self.ring.copy_cqes(cqes[0..cap], 0) catch return self.markFatal();
         var out_len: usize = 0;
         for (cqes[0..copied]) |cqe| {
             if (cqe.user_data == timeout_user_data or cqe.user_data == cancel_user_data) continue;
@@ -566,13 +596,13 @@ const IoUringPollerLinux = struct {
             }
 
             // Re-arm: POLL_ADD is one-shot, but callers expect epoll's
-            // level-triggered persistence. Dropping the re-arm on error is
-            // safe in the same way the epoll path's errors are: the caller
-            // sees no further readiness and the connection's own deadline
-            // reaper reclaims it.
-            self.armLocked(fd, reg) catch continue;
+            // level-triggered persistence. A failure here must not be
+            // swallowed — losing the listener's re-arm would silently stop the
+            // server accepting while leaving the process healthy-looking, and
+            // no per-connection deadline reaper covers that registration.
+            try self.armLocked(fd, reg);
         }
-        self.submitLocked() catch {};
+        try self.submitLocked();
         return out_len;
     }
 
@@ -584,14 +614,24 @@ const IoUringPollerLinux = struct {
         return token;
     }
 
+    fn markFatal(self: *IoUringPollerLinux) error{EventLoopUnrecoverable} {
+        self.fatal.store(true, .release);
+        return error.EventLoopUnrecoverable;
+    }
+
+    fn checkFatal(self: *IoUringPollerLinux) !void {
+        if (self.fatal.load(.acquire)) return error.EventLoopUnrecoverable;
+    }
+
     fn armLocked(self: *IoUringPollerLinux, fd: std.posix.fd_t, reg: *const Registration) !void {
         const user_data = encodeUserData(fd, reg.token);
         const mask = pollMaskFor(reg.interest);
         // The only failure `get_sqe` reports is a full submission queue; flush
-        // it to the kernel and retry once before giving up.
+        // it to the kernel and retry once. Still full afterwards means the ring
+        // is not draining, which this backend cannot recover from.
         _ = self.ring.poll_add(user_data, fd, mask) catch {
             try self.submitLocked();
-            _ = self.ring.poll_add(user_data, fd, mask) catch return error.Unexpected;
+            _ = self.ring.poll_add(user_data, fd, mask) catch return self.markFatal();
         };
     }
 
@@ -599,20 +639,34 @@ const IoUringPollerLinux = struct {
         const target = encodeUserData(fd, token);
         _ = self.ring.poll_remove(cancel_user_data, target) catch {
             try self.submitLocked();
-            _ = self.ring.poll_remove(cancel_user_data, target) catch return error.Unexpected;
+            _ = self.ring.poll_remove(cancel_user_data, target) catch return self.markFatal();
         };
     }
 
-    /// Push queued SQEs to the kernel without blocking. Called by whichever
+    /// Push queued SQEs to the kernel without blocking, and only return
+    /// success once the kernel has actually consumed them. Called by whichever
     /// thread queued them, so a poll armed from a worker takes effect even
     /// while the loop thread is parked in `io_uring_enter`.
+    ///
+    /// `EINTR` is explicitly *not* success: with `min_complete = 0` the call
+    /// may have submitted nothing, and reporting success would leave callers
+    /// believing in polls and timers the kernel never saw. The count is
+    /// recomputed each pass because an interrupted `enter` may have consumed
+    /// part of the queue.
     fn submitLocked(self: *IoUringPollerLinux) !void {
-        const to_submit = self.ring.flush_sq();
-        if (to_submit == 0) return;
-        _ = self.ring.enter(to_submit, 0, 0) catch |err| switch (err) {
-            error.SignalInterrupt => return,
-            else => return error.Unexpected,
-        };
+        var attempts: u8 = 0;
+        while (true) {
+            const to_submit = self.ring.flush_sq();
+            if (to_submit == 0) return;
+            if (self.ring.enter(to_submit, 0, 0)) |_| {
+                if (self.ring.sq_ready() == 0) return;
+            } else |err| switch (err) {
+                error.SignalInterrupt => {},
+                else => return self.markFatal(),
+            }
+            attempts += 1;
+            if (attempts >= 16) return self.markFatal();
+        }
     }
 
     const pollIn: u32 = std.posix.POLL.IN;
@@ -839,6 +893,7 @@ fn testIoUringLoopOrSkip() !EventLoop {
     return EventLoop.initBackend(std.testing.allocator, .io_uring, .{}) catch |err| switch (err) {
         error.IoUringUnavailable,
         error.IoUringRingAllocationFailed,
+        error.IoUringCqOverflowUnsafe,
         error.IoUringPollAddUnsupported,
         error.IoUringPollRemoveUnsupported,
         error.IoUringTimeoutUnsupported,
@@ -952,33 +1007,119 @@ test "io_uring event loop stops reporting a removed fd" {
     try std.testing.expectError(error.Unexpected, loop.remove(fds[0]));
 }
 
-test "io_uring event loop re-registers a fd whose number was recycled" {
+test "io_uring event loop rejects a duplicate registration" {
     var loop = try testIoUringLoopOrSkip();
     defer loop.deinit();
     const fds = try testSocketPair();
     defer closeFd(fds[0]);
     defer closeFd(fds[1]);
 
-    // The keepalive and active-connection reapers close registered fds without
-    // unregistering them, because epoll would have dropped the registration on
-    // close. Registering the same fd number again must therefore succeed and
-    // apply the new interest, not fail the way EPOLL_CTL_ADD's EEXIST would.
     try loop.add(fds[0], .{ .read = true });
-    try loop.add(fds[0], .{ .write = true });
     defer loop.remove(fds[0]) catch {};
+    // Mirrors EPOLL_CTL_ADD's EEXIST. A live entry is a real double-register,
+    // not a recycled fd: every path that closes a registered fd unregisters it
+    // first, so staleness is never inferred here.
+    try std.testing.expectError(error.Unexpected, loop.add(fds[0], .{ .read = true }));
+}
 
+test "io_uring event loop attributes nothing to a closed fd whose number is reused" {
+    var loop = try testIoUringLoopOrSkip();
+    defer loop.deinit();
+
+    const doomed = try testSocketPair();
+    // Make it readable first, so a completion for this registration is already
+    // in flight when the fd goes away.
+    try writeFd(doomed[1], "x");
+    try loop.add(doomed[0], .{ .read = true });
+
+    // Unregister-before-close: the invariant `parkedConnectionCloseHook` now
+    // upholds. POLL_ADD pins the file, so skipping this would leave a poll
+    // armed across the close.
+    try loop.remove(doomed[0]);
+    const reused_number = doomed[0];
+    closeFd(doomed[0]);
+    closeFd(doomed[1]);
+
+    // Linux hands out the lowest free descriptor, so this should reclaim the
+    // numbers just released.
+    const fresh = try testSocketPair();
+    defer closeFd(fresh[0]);
+    defer closeFd(fresh[1]);
+    if (fresh[0] != reused_number and fresh[1] != reused_number) return error.SkipZigTest;
+
+    // The replacement descriptor is idle. A completion left over from the
+    // closed registration must not be reported against it, nor re-arm a poll
+    // on it.
     var events: [4]Event = undefined;
-    const count = try loop.wait(&events, 50);
-    try std.testing.expect(count > 0);
-    var saw_write = false;
-    for (events[0..count]) |ev| {
-        if (ev.fd == fds[0] and ev.writable) saw_write = true;
-    }
-    try std.testing.expect(saw_write);
-
-    // The stale first registration must not survive as a second live poll.
-    try loop.remove(fds[0]);
     try std.testing.expectEqual(@as(usize, 0), try loop.wait(&events, 20));
+    try std.testing.expectEqual(@as(usize, 0), try loop.wait(&events, 20));
+
+    // And no stale table entry may block registering the new descriptor.
+    try loop.add(reused_number, .{ .read = true });
+    defer loop.remove(reused_number) catch {};
+    try std.testing.expectEqual(@as(usize, 0), try loop.wait(&events, 20));
+}
+
+test "io_uring event loop drains more ready fds than the completion queue holds" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // Smallest permitted ring: 64 SQEs, so a 128-entry CQ.
+    var loop = EventLoop.initBackend(
+        std.testing.allocator,
+        .io_uring,
+        .{ .io_uring_entries = min_io_uring_entries },
+    ) catch |err| switch (err) {
+        error.IoUringUnavailable,
+        error.IoUringRingAllocationFailed,
+        error.IoUringCqOverflowUnsafe,
+        error.IoUringPollAddUnsupported,
+        error.IoUringPollRemoveUnsupported,
+        error.IoUringTimeoutUnsupported,
+        => return error.SkipZigTest,
+        else => return err,
+    };
+    defer loop.deinit();
+
+    // More simultaneously-ready one-shot polls than the CQ can hold, so the
+    // kernel must use its overflow backlog. Without IORING_FEAT_NODROP the
+    // kernel would discard the excess and those registrations would be
+    // stranded forever, since a poll is only re-armed once its CQE is reaped.
+    const total = 150;
+    var pairs: [total][2]std.posix.fd_t = undefined;
+    var made: usize = 0;
+    defer for (pairs[0..made]) |p| {
+        closeFd(p[0]);
+        closeFd(p[1]);
+    };
+    var exhausted = false;
+    while (made < total) {
+        pairs[made] = testSocketPair() catch {
+            exhausted = true;
+            break;
+        };
+        made += 1;
+    }
+    // A constrained RLIMIT_NOFILE is an environment property, not a defect.
+    if (exhausted) return error.SkipZigTest;
+
+    for (pairs[0..made]) |p| {
+        try loop.add(p[0], .{ .read = true });
+        try writeFd(p[1], "x");
+    }
+
+    var seen = std.AutoHashMap(std.posix.fd_t, void).init(std.testing.allocator);
+    defer seen.deinit();
+
+    var iterations: usize = 0;
+    while (seen.count() < made and iterations < 200) : (iterations += 1) {
+        var events: [64]Event = undefined;
+        const count = try loop.wait(&events, 50);
+        for (events[0..count]) |ev| {
+            if (ev.readable) try seen.put(ev.fd, {});
+        }
+    }
+
+    // Every registration must surface; none may be lost to CQ overflow.
+    try std.testing.expectEqual(made, seen.count());
 }
 
 fn testSocketPair() ![2]std.posix.fd_t {

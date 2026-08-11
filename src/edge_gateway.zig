@@ -568,11 +568,13 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
 
     // Registry of idle keepalive connections parked off the worker pool (#138).
     // Its close hook releases the connection slot held since accept, so parked
-    // connections torn down by the reaper/drain are accounted correctly. The
-    // deinit (closeAll) runs before session_pool.deinit thanks to defer order.
+    // connections torn down by the reaper/drain are accounted correctly, and
+    // unregisters the fd from the event loop before it is closed. The deinit
+    // (closeAll) runs before session_pool.deinit thanks to defer order.
     var parked = http.keepalive_park.ParkedRegistry.init(state_allocator, &session_pool);
+    var parked_close_ctx = ParkedCloseCtx{ .state = &state, .event_loop = &event_loop };
     parked.close_hook = parkedConnectionCloseHook;
-    parked.close_hook_ctx = &state;
+    parked.close_hook_ctx = &parked_close_ctx;
     defer parked.deinit();
     worker_ctx.parked = &parked;
 
@@ -842,7 +844,21 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     while (!http.shutdown.isShutdownRequested()) {
         const now_ms = http.event_loop.monotonicMs();
         const timeout_ms = timer.msUntilNextTick(now_ms);
-        const event_count = event_loop.wait(ready_events[0..], timeout_ms) catch |err| {
+        const event_count = event_loop.wait(ready_events[0..], timeout_ms) catch |err| blk: {
+            if (err == error.EventLoopUnrecoverable) {
+                // #148: the ring stopped accepting submissions, so readiness
+                // this loop believes is armed may not be. Continuing would
+                // leave the process up but deaf — the listener could stop
+                // reporting accepts with no deadline reaper behind it. Take
+                // the documented fatal path (log, drain, exit) instead of
+                // self-healing or silently degrading.
+                state.logger.err(null, "event loop backend '{s}' is unrecoverable: {}; draining and shutting down", .{
+                    event_loop.backendName(),
+                    err,
+                });
+                http.shutdown.requestShutdown();
+                break :blk 0;
+            }
             state.logger.err(null, "event loop wait error: {}", .{err});
             continue;
         };
@@ -2280,9 +2296,28 @@ fn advanceNativeHttp2(ctx: *WorkerContext, managed: *http.downstream_connection.
 
 /// Registry teardown hook: release the connection slot held since accept when a
 /// parked connection is finally closed (resume-close, idle reap, or drain).
-fn parkedConnectionCloseHook(raw_state: *anyopaque, fd: std.posix.fd_t) void {
-    const state: *GatewayState = @ptrCast(@alignCast(raw_state));
-    state.releaseConnectionSlot(fd);
+const ParkedCloseCtx = struct {
+    state: *GatewayState,
+    event_loop: *http.event_loop.EventLoop,
+};
+
+/// Runs from `ParkedRegistry.freeConn` immediately before the fd is closed
+/// (reaper, drain, and `closeAll` all funnel through it), without the registry
+/// mutex held.
+///
+/// Unregistering here is an invariant, not an optimization. `epoll` drops a
+/// closed fd from its set implicitly, so this hook historically only needed to
+/// release the accounting slot. `IORING_OP_POLL_ADD` instead pins the
+/// underlying file, so a poll left armed across the close survives it; if the
+/// kernel then recycles that integer for an unrelated descriptor, the stale
+/// completion would be attributed — and re-armed — against the wrong file.
+/// The active-connection expiry reaper already removes before `deinit`; this
+/// makes the parked path match.
+fn parkedConnectionCloseHook(raw_ctx: *anyopaque, fd: std.posix.fd_t) void {
+    const ctx: *ParkedCloseCtx = @ptrCast(@alignCast(raw_ctx));
+    // A checked-out connection is not registered, so ENOENT here is normal.
+    ctx.event_loop.remove(fd) catch {};
+    ctx.state.releaseConnectionSlot(fd);
 }
 
 fn recordHttp3EarlyDataCompatFromRuntime(

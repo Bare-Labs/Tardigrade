@@ -305,12 +305,12 @@ at all unless a separate future change first migrates them onto the shared
   buffers/files, or multishot variants, since those require widening the
   boundary to an operation/completion abstraction, which is explicitly out
   of scope for Phase 0. `POLL_ADD`/`POLL_REMOVE` exist from the original
-  `io_uring` interface (Linux 5.1), but this readiness-only prototype's
-  actual minimum is **Linux 5.4**, because `EventLoop.wait(timeout_ms)`'s
-  bounded-block behavior is implemented with `IORING_OP_TIMEOUT`, which is
-  not present in 5.1; see "Failure modes and fallback policy" below for how
-  kernel-requirement documentation should be structured if a wider
-  abstraction is ever proposed instead.
+  `io_uring` interface (Linux 5.1), but this readiness-only design needs
+  `IORING_OP_TIMEOUT` for `EventLoop.wait(timeout_ms)`'s bounded block, which
+  is not present in 5.1 and lands in **5.4**. Implementation then raised the
+  floor once more, to **Linux 5.5**, because re-arming one-shot polls makes
+  dropped completions unrecoverable and `IORING_FEAT_NODROP` is 5.5 — see
+  "Phase 1 prototype" and "Failure modes and fallback policy" below.
 - **macOS support:** None — `io_uring` is Linux-only, so this would always
   need to stay behind a compile-time/feature-flag gate with `epoll`/`kqueue`
   as the portable default, exactly as #148 already proposes.
@@ -450,7 +450,7 @@ implements the policy in "Failure modes and fallback policy" below.
 The 256-entry default is chosen so the ring's mmap'd SQ/CQ memory (~24 KiB)
 fits inside the 64 KiB `RLIMIT_MEMLOCK` soft limit common on stock hosts;
 kernels before 5.12 charge ring memory against that limit, so a much deeper
-default would fail `io_uring_setup` with `ENOMEM` on exactly the 5.4-era
+default would fail `io_uring_setup` with `ENOMEM` on exactly the 5.5-era
 kernels this prototype targets.
 
 ### What it uses, and what it deliberately does not
@@ -491,18 +491,30 @@ These are the three places where the ring is not a drop-in for level-triggered
    would have coalesced both. No readiness is lost — the fd is re-armed
    immediately — but a caller may need one extra loop iteration. Closing this
    gap needs `IORING_POLL_ADD_LEVEL`, which is Linux 5.13+ and therefore above
-   this prototype's 5.4 floor.
-3. **Closing a fd does not unregister it.** `epoll` drops a fd from every set
-   when it is closed, and this codebase relies on that:
-   `parkedConnectionCloseHook` and `activeConnectionCloseHook` only release
-   accounting slots, so the keepalive idle reaper and the active-connection
-   reaper close registered fds without unregistering them. The ring has no
-   equivalent implicit cleanup, so `add` treats a surviving table entry for a
-   fd it is asked to register as a stale registration for a recycled fd
-   number: it cancels the stale poll and takes the fd over, rather than
-   reporting the `EEXIST` that `EPOLL_CTL_ADD` would.
+   this prototype's floor.
+3. **Closing a fd does not unregister it, so unregister-before-close is an
+   invariant.** `epoll` drops a fd from every set when it is closed.
+   `IORING_OP_POLL_ADD` instead pins the underlying file, so a poll left armed
+   across a close survives it — and if the kernel recycles that integer for an
+   unrelated descriptor, the stale completion is reported against, and
+   re-armed on, the wrong file. The active-connection expiry reaper already
+   removed the fd before `conn.deinit()`; the parked path did not, relying on
+   epoll's implicit cleanup. `parkedConnectionCloseHook` now removes the fd
+   from the loop before `ParkedRegistry.freeConn` closes it, which covers the
+   idle reaper, the drain, and `closeAll`. `add` therefore keeps strict
+   `EPOLL_CTL_ADD`-style `EEXIST` semantics: inferring staleness from a
+   duplicate fd number was tried first and is unsound, because it cannot cover
+   the case where the stale completion is reaped *before* the re-add.
+4. **A dropped completion strands a registration permanently.** Because a
+   one-shot poll is re-armed only after its CQE is consumed, losing that CQE
+   means the table still believes the fd is armed while nothing will ever
+   re-arm it — the fd silently disappears from readiness. Kernels before 5.5
+   discard completions when the CQ is full; 5.5+ advertise
+   `IORING_FEAT_NODROP` and retain them on an overflow list. Startup requires
+   that feature and fails closed without it, which is what sets the floor at
+   5.5 rather than the 5.4 that `IORING_OP_TIMEOUT` alone implies.
 
-A fourth difference is internal rather than behavioural: `epoll_ctl` is
+A fifth difference is internal rather than behavioural: `epoll_ctl` is
 kernel-synchronized and safe to call from any thread while another sits in
 `epoll_wait`, which `removeReadFd` documents worker threads doing. The io_uring
 submission queue is plain shared memory, so every userspace ring mutation is
@@ -513,26 +525,56 @@ monotonic token in the high half of `user_data` so that a completion racing
 with a `POLL_REMOVE` is discarded rather than reported against a fd the caller
 has already removed and possibly closed.
 
-### Capability probing
+### Capability probing and the kernel floor
 
-`IoUring.init` succeeding only proves the 5.1 ring baseline, so the three
-opcodes are established explicitly at startup rather than inferred from a
-compile-time Linux check. `IORING_REGISTER_PROBE` is used where available and
-checks all three opcodes directly — but that register opcode is itself only
-present from 5.6, so kernels in the 5.1–5.5 window instead get a functional
-probe that submits an already-expired `IORING_OP_TIMEOUT` and requires the
-kernel to complete it with `-ETIME` rather than reject it. That functional
-probe is what actually enforces this prototype's 5.4 floor.
+`IoUring.init` succeeding only proves the 5.1 ring baseline, so everything this
+backend depends on is established explicitly at startup rather than inferred
+from a compile-time Linux check or a version number:
+
+- **`IORING_FEAT_NODROP`** is required from the setup features, failing closed
+  when absent. This is the binding constraint and puts the effective floor at
+  **Linux 5.5** — see difference 4 above for why a prototype that re-arms
+  one-shot polls cannot tolerate dropped completions.
+- **The three opcodes** are checked via `IORING_REGISTER_PROBE` where
+  available. That register opcode is itself only present from 5.6, so a kernel
+  at exactly 5.5 instead gets a functional probe: submit an already-expired
+  `IORING_OP_TIMEOUT` and require the kernel to complete it with `-ETIME`
+  rather than reject it.
+
+Kernel-version numbers are used here only to explain *why* each gate exists;
+every gate is a runtime feature or opcode check, so a backported or vendor
+kernel is judged on what it actually supports.
+
+### Runtime ring failures
+
+Submission failures are not swallowed. A poll or timer counts as armed only
+once the kernel has accepted it — `EINTR` from `io_uring_enter` with
+`min_complete = 0` is explicitly not treated as success, since it may have
+submitted nothing. If the bounded-wait timer cannot be queued under submission
+pressure, `wait` degrades to a non-blocking poll rather than blocking on
+`min_complete = 1` with no timer to break it.
+
+Anything worse is unrecoverable and sticky: the polls this backend believes are
+armed may not be, and there is no deadline reaper behind the listener
+registration to notice. `wait` then reports `error.EventLoopUnrecoverable`, and
+`edge_gateway` takes the fatal path this document already specified — log,
+request shutdown, drain, exit — instead of logging and continuing with a wedged
+loop.
 
 ### Validation status — read this before citing the prototype
 
 - **Unit tests:** the `epoll`/`kqueue` behaviour tests in `event_loop.zig` are
   mirrored for the `io_uring` backend (write readiness, `modify` replacing
-  interest, re-arm persistence, removal, recycled-fd re-registration), plus
-  fail-closed tests for an unavailable backend and an unusable ring size. The
-  behaviour tests skip themselves when `io_uring_setup` is unavailable —
-  container seccomp profiles, Docker's default among them, block it outright —
-  since that is an environment property, not a defect in the backend.
+  interest, re-arm persistence, removal, duplicate-registration rejection),
+  plus fail-closed tests for an unavailable backend and an unusable ring size,
+  a close/fd-number-reuse test that verifies no completion from a closed
+  registration is reported against or re-armed on the descriptor that inherits
+  its number, and a CQ-pressure regression that makes 150 fds ready
+  simultaneously against a 128-entry completion queue and requires every one
+  to surface. The behaviour tests skip themselves when `io_uring_setup` is
+  unavailable — container seccomp profiles, Docker's default among them, block
+  it outright — since that is an environment property, not a defect in the
+  backend.
 - **Executed on Linux by CI, not by the author.** The development host for
   this change was macOS/arm64, where the io_uring path compiles out entirely;
   it was validated there only by cross-compiling for `x86_64-linux-gnu` and by
@@ -544,12 +586,14 @@ probe is what actually enforces this prototype's 5.4 floor.
   runners, the capability probe succeeds, and the readiness, `modify`,
   re-arm, removal, and recycled-fd paths all behave as intended on a live
   kernel.
-- **The 5.1–5.5 probe fallback is still unexercised.** CI runners are on
+- **The functional probe fallback is still unexercised.** CI runners are on
   modern kernels where `IORING_REGISTER_PROBE` is available, so probing always
-  takes the register path. The functional `-ETIME` fallback — the branch that
-  actually enforces the documented 5.4 floor — has never run. Anyone
-  validating this prototype against a 5.4-era kernel should treat that path as
-  unverified.
+  takes the register path. The `-ETIME` fallback — reachable only on a kernel
+  at exactly 5.5 — has never run. Likewise, the `IORING_FEAT_NODROP`
+  fail-closed branch cannot be exercised on a kernel that has the feature, so
+  the CQ-pressure test proves the overflow backlog works *with* NODROP but not
+  that the refusal path works without it. Anyone validating against a 5.4/5.5
+  kernel should treat both as unverified.
 - **No benchmark evidence of any kind.** No profiling pass has shown the
   shared `EventLoop`'s readiness/idle-wait role to be a bottleneck, and no
   throughput or latency comparison against `epoll` has been run. Per
@@ -584,7 +628,8 @@ contract that backend is held to:
   requests an `io_uring` backend (`TARDIGRADE_EVENT_LOOP_BACKEND=io_uring`)
   and required kernel
   capabilities cannot be established at startup — unsupported kernel version,
-  missing opcodes, seccomp/container restrictions blocking `io_uring_setup`,
+  missing opcodes, a missing `IORING_FEAT_NODROP` guarantee,
+  seccomp/container restrictions blocking `io_uring_setup`,
   or resource exhaustion (`RLIMIT_MEMLOCK`, ring allocation failure) — the
   process must fail startup with a clear error, not silently fall back to
   epoll. An operator who explicitly asked for `io_uring` needs to know their
@@ -600,9 +645,13 @@ contract that backend is held to:
   (e.g. a ring entering a bad state after `io_uring_enter` failures) are not
   a live-migration trigger back to epoll; they surface through the same
   error/drain semantics `gateway_shutdown.zig` already uses for other fatal
-  runtime conditions (log, drain, exit), consistent with how the current
-  `EventLoop.wait()` error path already just logs and continues rather than
-  trying to self-heal by rebuilding the poller.
+  runtime conditions (log, drain, exit), rather than self-healing by
+  rebuilding the poller. **Implemented:** an unrecoverable ring state is
+  sticky and surfaces from `wait` as `error.EventLoopUnrecoverable`, on which
+  `edge_gateway` requests shutdown and drains. Note this is deliberately
+  *stricter* than the `epoll` path's log-and-continue, because a wedged ring
+  can silently stop delivering listener readiness while the process still
+  looks healthy.
 - **Kernel/toolchain requirements, if pursued:** separate the **historical
   ring/poll baseline** from **this prototype's actual minimum**, rather than
   citing one number for "basic support." `io_uring` itself — the
@@ -611,19 +660,23 @@ contract that backend is held to:
   **5.1**. But the readiness-only prototype this doc actually scopes to (see
   "Backend abstraction boundary") also relies on `IORING_OP_TIMEOUT` to
   implement `EventLoop.wait(timeout_ms)`'s bounded-block behavior, and that
-  opcode is not present in 5.1 — it landed in Linux **5.4**. So **this
-  prototype's real minimum is Linux 5.4**, not 5.1, unless a future revision
-  explicitly chooses a different, non-`IORING_OP_TIMEOUT` bounded-wait
-  mechanism instead. Individual capabilities this doc explicitly excludes
-  from the readiness-only prototype have their own, later floors if a future
-  wider abstraction ever adopts them: `IORING_OP_ACCEPT` (5.5), multishot
-  poll (5.13), and multishot accept (5.19, per upstream `liburing` docs) are
-  commonly cited examples, not an exhaustive list. A prototype must pin and
-  document the exact minimum kernel version it targets **for the specific
-  opcodes/features it actually uses** — 5.4 for the operation set chosen
+  opcode is not present in 5.1 — it landed in Linux **5.4**. So the *operation
+  set* alone implies 5.4, not 5.1.
+
+  **The implemented prototype's real minimum is Linux 5.5**, because the
+  operation set is not the only requirement: re-arming one-shot polls makes
+  completion loss unrecoverable, so `IORING_FEAT_NODROP` — which preserves
+  completions on CQ overflow instead of discarding them, and which arrives in
+  **5.5** — is required at startup too. Individual capabilities this doc
+  excludes from the readiness-only prototype have their own, later floors if a
+  future wider abstraction ever adopts them: `IORING_OP_ACCEPT` (5.5),
+  multishot poll (5.13), and multishot accept (5.19, per upstream `liburing`
+  docs) are commonly cited examples, not an exhaustive list. A prototype must
+  pin and document the exact minimum it targets **for the specific
+  opcodes and features it actually uses** — 5.5 for the combination chosen
   here — and probe for those capabilities explicitly at startup rather than
-  assuming availability from a compile-time Linux check or from the 5.1 ring
-  baseline alone.
+  assuming availability from a compile-time Linux check, from a version
+  number, or from the 5.1 ring baseline alone.
 
 This policy applies to whichever `EventLoop` role(s) a future prototype
 targets (unsharded accept, parked keepalive, and/or native-TLS active
