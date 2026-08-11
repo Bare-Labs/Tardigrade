@@ -570,6 +570,10 @@ pub const BlockedStreams = struct {
         self.streams.deinit();
     }
 
+    pub fn currentCount(self: *const BlockedStreams) u64 {
+        return self.streams.count();
+    }
+
     pub fn waitFor(self: *BlockedStreams, stream_id: u64, required_insert_count: u64, metrics: *DynamicMetrics) !void {
         if (self.streams.get(stream_id)) |blocked| {
             if (required_insert_count > blocked.required_insert_count) {
@@ -1178,6 +1182,24 @@ test "dynamic settings initialize table capacity and blocked-stream limit" {
     try testing.expectEqual(@as(u64, 128), table.max_capacity);
     try testing.expectEqual(@as(u64, 0), table.capacity);
     try testing.expectEqual(@as(u64, 2), decoder.blocked.max_blocked);
+}
+
+test "blocked stream set exposes current gauge count" {
+    var blocked = BlockedStreams.init(testing.allocator, 4);
+    defer blocked.deinit();
+    var metrics = DynamicMetrics{};
+    var out: [2]u64 = undefined;
+
+    try testing.expectEqual(@as(u64, 0), blocked.currentCount());
+    try blocked.waitFor(0, 2, &metrics);
+    try blocked.waitFor(4, 3, &metrics);
+    try testing.expectEqual(@as(u64, 2), blocked.currentCount());
+    try testing.expectEqual(@as(u64, 2), metrics.blocked_streams);
+
+    _ = blocked.unblockAvailable(2, &out, &metrics);
+    try testing.expectEqual(@as(u64, 1), blocked.currentCount());
+    blocked.cancel(4, &metrics);
+    try testing.expectEqual(@as(u64, 0), blocked.currentCount());
 }
 
 test "dynamic table capacity is capped by negotiated SETTINGS and can be lowered to zero" {

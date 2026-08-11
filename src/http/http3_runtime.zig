@@ -103,6 +103,14 @@ pub const Config = struct {
     /// (`quic.connection.Event.zero_rtt_packet`), bridged the same way.
     quic_zero_rtt_packet_metrics_ctx: ?*anyopaque = null,
     quic_zero_rtt_packet_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicZeroRttPacketOutcome) void = null,
+    /// Optional H3 qlog sink. Defaults to no-op; concrete file ownership stays
+    /// in the composition root and sink errors must not affect protocol state.
+    h3_qlog_sink: http3.qlog.Sink = .{},
+    /// Optional per-connection H3 qlog sink factory. When set, this overrides
+    /// `h3_qlog_sink` for accepted connections and lets the composition root
+    /// route H3 events to the same connection trace as QUIC events.
+    h3_qlog_sink_factory_ctx: ?*anyopaque = null,
+    h3_qlog_sink_factory_cb: ?*const fn (?*anyopaque, u64) http3.qlog.Sink = null,
 };
 
 /// Half-open admission limits (#328 review). The native stack does not send
@@ -171,9 +179,16 @@ pub const Snapshot = struct {
 
 /// One accepted QUIC connection with its HTTP/3 session state.
 const ConnEntry = struct {
+    const H3Observer = struct {
+        runtime: *Runtime,
+        connection_handle: u64,
+        qlog_sink: http3.qlog.Sink = .{},
+    };
+
     backend: *quic.tls_backend.Tls13Backend,
     conn: *Connection,
     h3: H3,
+    h3_observer: H3Observer = undefined,
     h3_started: bool = false,
     /// Source IPv4 address of the Initial that opened the connection,
     /// immutable for the connection's lifetime. Used only for half-open
@@ -258,6 +273,9 @@ pub const Runtime = struct {
     quic_early_data_decision_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicEarlyDataDecision) void = null,
     quic_zero_rtt_packet_metrics_ctx: ?*anyopaque = null,
     quic_zero_rtt_packet_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicZeroRttPacketOutcome) void = null,
+    h3_qlog_sink: http3.qlog.Sink = .{},
+    h3_qlog_sink_factory_ctx: ?*anyopaque = null,
+    h3_qlog_sink_factory_cb: ?*const fn (?*anyopaque, u64) http3.qlog.Sink = null,
     snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
     stopping: std.atomic.Value(bool),
@@ -329,6 +347,9 @@ pub const Runtime = struct {
             .quic_early_data_decision_metrics_cb = cfg.quic_early_data_decision_metrics_cb,
             .quic_zero_rtt_packet_metrics_ctx = cfg.quic_zero_rtt_packet_metrics_ctx,
             .quic_zero_rtt_packet_metrics_cb = cfg.quic_zero_rtt_packet_metrics_cb,
+            .h3_qlog_sink = cfg.h3_qlog_sink,
+            .h3_qlog_sink_factory_ctx = cfg.h3_qlog_sink_factory_ctx,
+            .h3_qlog_sink_factory_cb = cfg.h3_qlog_sink_factory_cb,
             .snapshot_state = .{ .quic_port = cfg.quic_port },
             .stopping = std.atomic.Value(bool).init(false),
             .drain_requested = std.atomic.Value(bool).init(false),
@@ -706,17 +727,26 @@ pub const Runtime = struct {
             allocator.destroy(backend);
             return null;
         };
+        const handle = next_handle.*;
+        next_handle.* += 1;
+        const h3_sink = if (self.h3_qlog_sink_factory_cb) |factory|
+            factory(self.h3_qlog_sink_factory_ctx, handle)
+        else
+            self.h3_qlog_sink;
+        const h3 = H3.initWithSettings(allocator, .server, self.h3_settings);
         entry.* = .{
             .backend = backend,
             .conn = conn,
-            .h3 = H3.initWithSettings(allocator, .server, self.h3_settings),
+            .h3 = h3,
+            .h3_observer = .{ .runtime = self, .connection_handle = handle, .qlog_sink = h3_sink },
             .admission_source_ip = peer.addr,
             .cid_len = parsed.dcid.len,
             .accepted_at_us = now,
         };
+        if (h3EventSinkFor(&entry.h3_observer)) |event_sink| {
+            entry.h3.setEventSink(event_sink);
+        }
 
-        const handle = next_handle.*;
-        next_handle.* += 1;
         const cid = quic.cid.ConnectionId.init(parsed.dcid) catch {
             entry.deinit(allocator);
             allocator.destroy(entry);
@@ -1234,6 +1264,98 @@ pub const Runtime = struct {
         cb(cb_ctx, outcome);
     }
 
+    fn h3ConnectionEvent(ctx: ?*anyopaque, event: http3.conn.Event) void {
+        const observer: *ConnEntry.H3Observer = @ptrCast(@alignCast(ctx.?));
+        _ = observer.connection_handle;
+        observer.qlog_sink.log(nowUs(), h3EventToQlog(event) orelse return);
+    }
+
+    fn h3EventSinkFor(observer: *ConnEntry.H3Observer) ?http3.conn.EventSink {
+        if (observer.qlog_sink.emit_fn == null) return null;
+        return .{ .context = observer, .emitFn = h3ConnectionEvent };
+    }
+
+    fn h3EventToQlog(event: http3.conn.Event) ?http3.qlog.Event {
+        return switch (event) {
+            .parameters_set => |parameters| .{ .parameters_set = .{
+                .initiator = switch (parameters.initiator) {
+                    .local => .local,
+                    .remote => .remote,
+                },
+                .max_field_section_size = parameters.settings.max_field_section_size,
+                .max_table_capacity = if (parameters.settings.qpack_max_table_capacity == 0) null else parameters.settings.qpack_max_table_capacity,
+                .blocked_streams_count = if (parameters.settings.qpack_blocked_streams == 0) null else parameters.settings.qpack_blocked_streams,
+                .extended_connect = if (parameters.settings.enable_connect_protocol) 1 else null,
+                .h3_datagram = if (parameters.settings.h3_datagram) 1 else null,
+            } },
+            .stream_type_set => |stream| .{ .stream_type_set = .{
+                .stream_id = stream.stream_id,
+                .stream_type = h3StreamTypeToQlog(stream.stream_type),
+            } },
+            .frame_created => |created| .{ .frame = .{
+                .direction = .created,
+                .stream_id = created.stream_id,
+                .frame = h3FrameToQlog(created.frame),
+            } },
+            .frame_parsed => |parsed| .{ .frame = .{
+                .direction = .parsed,
+                .stream_id = parsed.stream_id,
+                .frame = h3FrameToQlog(parsed.frame),
+            } },
+            .priority_updated => |updated| .{ .priority_updated = .{
+                .stream_id = updated.stream_id,
+                .new = .{ .urgency = updated.urgency, .incremental = updated.incremental },
+            } },
+        };
+    }
+
+    fn h3FrameToQlog(event_frame: http3.conn.EventFrame) http3.qlog.Frame {
+        return switch (event_frame) {
+            .data => |d| .{ .data = .{ .raw_length = d.raw_length } },
+            .headers => |h| .{ .headers = .{ .headers = h.fields, .raw_length = h.raw_length } },
+            .settings => |s| .{ .settings = .{ .settings = @ptrCast(s.entries), .raw_length = s.raw_length } },
+            .goaway => |g| .{ .goaway = .{ .id = g.id, .raw_length = g.raw_length } },
+            .priority_update => |update| .{ .priority_update = switch (update) {
+                .request => |r| .{ .request = .{ .stream_id = r.stream_id, .priority_field_value = r.field_value, .raw_length = r.raw_length } },
+                .push => |p| .{ .push = .{ .push_id = p.push_id, .priority_field_value = p.field_value, .raw_length = p.raw_length } },
+            } },
+            .push_promise => |p| .{ .push_promise = .{ .push_id = p.push_id, .headers = p.fields, .raw_length = p.raw_length } },
+            .cancel_push => |c| .{ .cancel_push = .{ .push_id = c.push_id, .raw_length = c.raw_length } },
+            .max_push_id => |m| .{ .max_push_id = .{ .push_id = m.push_id, .raw_length = m.raw_length } },
+            .unknown => |u| .{ .unknown = .{ .frame_type_bytes = u.frame_type_value, .raw_length = u.raw_length } },
+            .malformed => |m| .{ .malformed = .{
+                .frame_type = h3FrameTypeToQlog(m.frame_type),
+                .frame_type_bytes = m.frame_type_value,
+                .raw_length = m.raw_length,
+            } },
+        };
+    }
+
+    fn h3FrameTypeToQlog(typ: http3.frame.FrameType) http3.qlog.FrameType {
+        return switch (typ) {
+            .data => .data,
+            .headers => .headers,
+            .settings => .settings,
+            .goaway => .goaway,
+            .priority_update_request, .priority_update_push => .priority_update,
+            .push_promise => .push_promise,
+            .cancel_push => .cancel_push,
+            .max_push_id => .max_push_id,
+            .unknown => .unknown,
+        };
+    }
+
+    fn h3StreamTypeToQlog(typ: http3.conn.EventStreamType) http3.qlog.StreamType {
+        return switch (typ) {
+            .request => .request,
+            .control => .control,
+            .push => .push,
+            .qpack_encoder => .qpack_encode,
+            .qpack_decoder => .qpack_decode,
+            .unknown => .unknown,
+        };
+    }
+
     /// #523: bridges `quic.connection.Event`s from every accepted
     /// connection into the composition root's metrics — without this,
     /// `accept()` would construct connections with no `EventSink` at all
@@ -1601,6 +1723,239 @@ fn openUdpSocket(sa_family: u32) std.c.fd_t {
 }
 
 const testing = std.testing;
+
+const H3QlogRecorder = struct {
+    records: std.ArrayList(http3.qlog.Record) = .empty,
+
+    fn deinit(self: *H3QlogRecorder, allocator: std.mem.Allocator) void {
+        for (self.records.items) |record| freeRecord(allocator, record);
+        self.records.deinit(allocator);
+    }
+
+    fn sink(self: *H3QlogRecorder) http3.qlog.Sink {
+        return .{ .context = self, .emit_fn = emit };
+    }
+
+    fn emit(ctx: ?*anyopaque, record: http3.qlog.Record) void {
+        const self: *H3QlogRecorder = @ptrCast(@alignCast(ctx.?));
+        self.records.append(testing.allocator, cloneRecord(testing.allocator, record) catch unreachable) catch unreachable;
+    }
+
+    fn cloneFields(allocator: std.mem.Allocator, fields: []const http3.qpack.HeaderField) ![]const http3.qpack.HeaderField {
+        const copy = try allocator.alloc(http3.qpack.HeaderField, fields.len);
+        errdefer allocator.free(copy);
+        for (fields, 0..) |field, i| {
+            const name = try allocator.dupe(u8, field.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, field.value);
+            errdefer allocator.free(value);
+            copy[i] = .{ .name = name, .value = value };
+        }
+        return copy;
+    }
+
+    fn freeFields(allocator: std.mem.Allocator, fields: []const http3.qpack.HeaderField) void {
+        for (fields) |field| {
+            allocator.free(field.name);
+            allocator.free(field.value);
+        }
+        allocator.free(fields);
+    }
+
+    fn cloneFrame(allocator: std.mem.Allocator, event_frame: http3.qlog.Frame) !http3.qlog.Frame {
+        return switch (event_frame) {
+            .headers => |h| .{ .headers = .{ .headers = try cloneFields(allocator, h.headers), .raw_length = h.raw_length } },
+            .settings => |s| .{ .settings = .{ .settings = try allocator.dupe(http3.qlog.QlogSetting, s.settings), .raw_length = s.raw_length } },
+            .priority_update => |update| .{ .priority_update = switch (update) {
+                .request => |r| .{ .request = .{
+                    .stream_id = r.stream_id,
+                    .priority_field_value = try allocator.dupe(u8, r.priority_field_value),
+                    .raw_length = r.raw_length,
+                } },
+                .push => |p| .{ .push = .{
+                    .push_id = p.push_id,
+                    .priority_field_value = try allocator.dupe(u8, p.priority_field_value),
+                    .raw_length = p.raw_length,
+                } },
+            } },
+            .push_promise => |p| .{ .push_promise = .{
+                .push_id = p.push_id,
+                .headers = try cloneFields(allocator, p.headers),
+                .raw_length = p.raw_length,
+            } },
+            else => event_frame,
+        };
+    }
+
+    fn freeFrame(allocator: std.mem.Allocator, event_frame: http3.qlog.Frame) void {
+        switch (event_frame) {
+            .headers => |h| freeFields(allocator, h.headers),
+            .settings => |s| allocator.free(s.settings),
+            .priority_update => |update| switch (update) {
+                .request => |r| allocator.free(r.priority_field_value),
+                .push => |p| allocator.free(p.priority_field_value),
+            },
+            .push_promise => |p| freeFields(allocator, p.headers),
+            else => {},
+        }
+    }
+
+    fn cloneRecord(allocator: std.mem.Allocator, record: http3.qlog.Record) !http3.qlog.Record {
+        return .{ .time_us = record.time_us, .event = switch (record.event) {
+            .frame => |f| .{ .frame = .{ .direction = f.direction, .stream_id = f.stream_id, .frame = try cloneFrame(allocator, f.frame) } },
+            else => record.event,
+        } };
+    }
+
+    fn freeRecord(allocator: std.mem.Allocator, record: http3.qlog.Record) void {
+        switch (record.event) {
+            .frame => |f| freeFrame(allocator, f.frame),
+            else => {},
+        }
+    }
+};
+
+test "http3 runtime: H3 qlog events route through connection-scoped observers" {
+    var first = H3QlogRecorder{};
+    defer first.deinit(testing.allocator);
+    var second = H3QlogRecorder{};
+    defer second.deinit(testing.allocator);
+
+    var first_observer = ConnEntry.H3Observer{
+        .runtime = undefined,
+        .connection_handle = 1,
+        .qlog_sink = first.sink(),
+    };
+    var second_observer = ConnEntry.H3Observer{
+        .runtime = undefined,
+        .connection_handle = 2,
+        .qlog_sink = second.sink(),
+    };
+
+    Runtime.h3ConnectionEvent(&first_observer, .{ .stream_type_set = .{ .stream_id = 0, .stream_type = .request } });
+    Runtime.h3ConnectionEvent(&second_observer, .{ .stream_type_set = .{ .stream_id = 0, .stream_type = .request } });
+
+    try testing.expectEqual(@as(usize, 1), first.records.items.len);
+    try testing.expectEqual(@as(usize, 1), second.records.items.len);
+    try testing.expectEqual(http3.qlog.Event{ .stream_type_set = .{ .stream_id = 0, .stream_type = .request } }, first.records.items[0].event);
+    try testing.expectEqual(http3.qlog.Event{ .stream_type_set = .{ .stream_id = 0, .stream_type = .request } }, second.records.items[0].event);
+}
+
+test "http3 runtime: no-op H3 qlog sink does not install connection event observer" {
+    var no_op_observer = ConnEntry.H3Observer{
+        .runtime = undefined,
+        .connection_handle = 1,
+        .qlog_sink = .{},
+    };
+    try testing.expect(Runtime.h3EventSinkFor(&no_op_observer) == null);
+
+    var recorder = H3QlogRecorder{};
+    defer recorder.deinit(testing.allocator);
+    var enabled_observer = ConnEntry.H3Observer{
+        .runtime = undefined,
+        .connection_handle = 2,
+        .qlog_sink = recorder.sink(),
+    };
+    try testing.expect(Runtime.h3EventSinkFor(&enabled_observer) != null);
+}
+
+test "http3 runtime: H3 qlog adapter preserves typed event payloads" {
+    var recorder = H3QlogRecorder{};
+    defer recorder.deinit(testing.allocator);
+
+    var observer = ConnEntry.H3Observer{
+        .runtime = undefined,
+        .connection_handle = 1,
+        .qlog_sink = recorder.sink(),
+    };
+
+    const settings = http3.frame.Settings{
+        .qpack_max_table_capacity = 128,
+        .max_field_section_size = 4096,
+        .qpack_blocked_streams = 7,
+    };
+    const setting_entries = [_]http3.conn.EventSetting{
+        .{ .id_value = 0x01, .value = 128 },
+        .{ .id_value = 0x06, .value = 4096 },
+        .{ .id_value = 0x07, .value = 7 },
+    };
+    const fields = [_]http3.qpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/trace" },
+    };
+
+    Runtime.h3ConnectionEvent(&observer, .{ .parameters_set = .{ .initiator = .local, .settings = settings } });
+    Runtime.h3ConnectionEvent(&observer, .{ .frame_parsed = .{ .stream_id = 0, .frame = .{ .settings = .{ .entries = &setting_entries, .raw_length = 9 } } } });
+    Runtime.h3ConnectionEvent(&observer, .{ .frame_parsed = .{ .stream_id = 4, .frame = .{ .headers = .{ .fields = &fields, .raw_length = 12 } } } });
+    Runtime.h3ConnectionEvent(&observer, .{ .frame_created = .{ .stream_id = 0, .frame = .{ .goaway = .{ .id = 12, .raw_length = 2 } } } });
+    Runtime.h3ConnectionEvent(&observer, .{ .frame_parsed = .{ .stream_id = 0, .frame = .{ .priority_update = .{ .request = .{ .stream_id = 8, .field_value = "u=2", .raw_length = 7 } } } } });
+    Runtime.h3ConnectionEvent(&observer, .{ .frame_parsed = .{ .stream_id = 4, .frame = .{ .push_promise = .{ .push_id = 3, .fields = &fields, .raw_length = 10 } } } });
+
+    try testing.expectEqual(@as(usize, 6), recorder.records.items.len);
+    switch (recorder.records.items[0].event) {
+        .parameters_set => |event| {
+            try testing.expectEqual(http3.qlog.Initiator.local, event.initiator.?);
+            try testing.expectEqual(@as(u64, 128), event.max_table_capacity.?);
+            try testing.expectEqual(@as(u64, 4096), event.max_field_section_size.?);
+            try testing.expectEqual(@as(u64, 7), event.blocked_streams_count.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (recorder.records.items[1].event) {
+        .frame => |event| switch (event.frame) {
+            .settings => |frame_event| {
+                try testing.expectEqual(@as(u64, 0x01), frame_event.settings[0].id_value);
+                try testing.expectEqual(@as(u64, 128), frame_event.settings[0].value);
+                try testing.expectEqual(@as(u64, 0x06), frame_event.settings[1].id_value);
+                try testing.expectEqual(@as(u64, 4096), frame_event.settings[1].value);
+                try testing.expectEqual(@as(usize, 9), frame_event.raw_length.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (recorder.records.items[2].event) {
+        .frame => |event| switch (event.frame) {
+            .headers => |frame_event| {
+                try testing.expectEqualStrings(":path", frame_event.headers[1].name);
+                try testing.expectEqualStrings("/trace", frame_event.headers[1].value);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (recorder.records.items[3].event) {
+        .frame => |event| switch (event.frame) {
+            .goaway => |frame_event| try testing.expectEqual(@as(u64, 12), frame_event.id),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (recorder.records.items[4].event) {
+        .frame => |event| switch (event.frame) {
+            .priority_update => |update| switch (update) {
+                .request => |frame_event| {
+                    try testing.expectEqual(@as(u64, 8), frame_event.stream_id);
+                    try testing.expectEqualStrings("u=2", frame_event.priority_field_value);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (recorder.records.items[5].event) {
+        .frame => |event| switch (event.frame) {
+            .push_promise => |frame_event| {
+                try testing.expectEqual(@as(u64, 3), frame_event.push_id);
+                try testing.expectEqualStrings(":method", frame_event.headers[0].name);
+                try testing.expectEqualStrings("GET", frame_event.headers[0].value);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
 
 const RuntimeCidHarness = struct {
     client_backend: quic.tls_backend.Tls13Backend,

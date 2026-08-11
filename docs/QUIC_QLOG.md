@@ -59,9 +59,9 @@ Rules:
 1. **Transport-vantage events** (`connectivity`, `security`, `transport`,
    `recovery` qlog categories) are defined in `src/quic/qlog.zig` and emitted
    from the transport layers. `src/quic` imports no HTTP/3 type.
-2. **Application-vantage events** (`http`, `qpack` categories) are defined in
-   `src/http3/qlog.zig` and emitted from `src/http3`. `src/http3` imports no
-   transport type.
+2. **Application-vantage events** (`http3` plus documented Tardigrade QPACK
+   diagnostics) are defined in `src/http3/qlog.zig` and emitted from
+   `src/http3`. `src/http3` imports no transport type.
 3. Both packages emit through an **injected `Sink`** — an opaque context plus a
    function pointer, exactly like the existing `recovery.EventSink`. A default
    `Sink{}` is a no-op, so the seam costs nothing until a root wires it.
@@ -114,10 +114,10 @@ Names below are `namespace:event`. Transport events (`src/quic/qlog.zig`):
 |---------------------------|-------------------------------------|----------|
 | handshake                 | `quic:connection_started`           | required `local` / `remote` endpoint objects, plus Tardigrade CID-length diagnostics |
 |                           | `tardigrade:quic_handshake_progressed` | `stage` (started -> confirmed / failed) |
-|                           | `quic:connection_closed`            | `reason`, optional unknown connection/application error category plus `error_code` |
+|                           | `quic:connection_closed`            | standard `trigger`, optional unknown connection/application error category plus `error_code` |
 |                           | `quic:key_updated`                  | required `key_type`, optional full `key_phase` and `trigger` |
-| packet sent               | `quic:packet_sent`                  | `header`, `raw`, Tardigrade ack-eliciting diagnostic |
-| packet received           | `quic:packet_received`              | `header`, `raw` |
+| packet sent               | `quic:packet_sent`                  | `header` with packet number only for numbered packet types, `raw`, Tardigrade ack-eliciting diagnostic |
+| packet received           | `quic:packet_received`              | `header` with packet number only for numbered packet types, `raw` |
 | packet lost               | `quic:packet_lost`                  | `header` |
 | recovery metrics          | `quic:recovery_metrics_updated`     | RTT/PTO/cwnd/bytes-in-flight updates |
 | **deprotection failure**  | `quic:packet_dropped`               | `trigger:"decryption_failure"` |
@@ -130,10 +130,21 @@ Application events (`src/http3/qlog.zig`):
 
 | Requirement (#255)        | qlog event                          | Key data |
 |---------------------------|-------------------------------------|----------|
-| SETTINGS                  | `http3:parameters_set`              | max field section size, QPACK table cap, blocked streams |
+| SETTINGS                  | `http3:parameters_set`              | max field section size, QPACK table cap, blocked streams, extended CONNECT, H3 datagram |
 | control stream            | `http3:stream_type_set`             | stream id, stream type |
 | HEADERS / DATA / GOAWAY   | `http3:frame_created` / `http3:frame_parsed` | variant-specific frame payloads; HEADERS carries escaped `headers`, SETTINGS carries typed lower-case qlog `settings`, GOAWAY carries `id` |
 | **QPACK blocked**         | `tardigrade:qpack_stream_state_updated` | `state` (blocked/unblocked), stream id |
+
+For HEADERS and PUSH_PROMISE, the H3 observer uses the current static/bounded
+QPACK decoder only as a best-effort diagnostic helper. If that helper rejects a
+field section, the trace retains the real `frame_type` but uses the custom
+`tardigrade_qpack_decode_failed: true` and
+`tardigrade_qpack_decode_reason: "diagnostic_decoder_rejected"` fields instead
+of asserting `tardigrade_malformed_payload`. This distinction is intentional:
+the decode failure can be caused by valid dynamic-table input or local
+diagnostic bounds, so it is not evidence that the peer sent malformed wire.
+Non-QPACK known-frame payloads that are structurally invalid continue to use
+the `tardigrade_malformed_payload` diagnostic.
 
 `quic:packet_dropped` with `trigger:"decryption_failure"` is the
 canonical qlog encoding of an AEAD deprotection failure, satisfying the #255
@@ -259,6 +270,13 @@ are the source. The gateway `/status/metrics` endpoint (see
 Labels are kept low-cardinality (e.g. `stage`, not per-client) per the issue's
 non-goals. Wiring these into the gateway registry is follow-up work; the
 counters they read from already exist.
+
+Production caveat: the current native H3 connection path still uses the static
+decoder and does not compose `DynamicDecoder.decodeOrBlock()` into request
+processing. Until that changes, dynamic-QPACK blocked/table/decode metrics and
+`tardigrade:qpack_stream_state_updated` remain zero/unemitted in production; a
+zero means "dynamic decoder not composed", not "dynamic blocking was observed
+and absent."
 
 ## Testing strategy
 

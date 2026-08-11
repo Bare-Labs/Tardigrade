@@ -13,6 +13,7 @@
 //! `qpack_state_updated` is emitted as a documented `tardigrade:*` extension.
 
 const std = @import("std");
+const qpack = @import("qpack.zig");
 
 /// qlog application-vantage namespaces owned by HTTP/3.
 pub const Namespace = enum {
@@ -30,9 +31,11 @@ pub const FrameType = enum {
     headers,
     settings,
     goaway,
+    priority_update,
     push_promise,
     cancel_push,
     max_push_id,
+    unknown,
 
     pub fn label(self: FrameType) []const u8 {
         return @tagName(self);
@@ -47,6 +50,7 @@ pub const StreamType = enum {
     qpack_decode,
     request,
     push,
+    unknown,
 };
 
 /// QPACK stream state (RFC 9204 §2.1.2): a request stream becomes `blocked`
@@ -54,10 +58,7 @@ pub const StreamType = enum {
 /// encoder stream, and `unblocked` once the required insert count arrives.
 pub const QpackState = enum { blocked, unblocked };
 
-pub const HttpField = struct {
-    name: []const u8,
-    value: []const u8,
-};
+pub const HttpField = qpack.HeaderField;
 
 pub const SettingName = enum {
     settings_qpack_max_table_capacity,
@@ -69,9 +70,13 @@ pub const SettingName = enum {
     unknown,
 };
 
-pub const Setting = struct {
-    name: SettingName,
-    name_bytes: ?u64 = null,
+pub const HttpPriority = struct {
+    urgency: u3,
+    incremental: bool,
+};
+
+pub const QlogSetting = struct {
+    id_value: u64,
     value: u64,
 };
 
@@ -84,12 +89,24 @@ pub const Frame = union(enum) {
         raw_length: ?usize = null,
     },
     settings: struct {
-        settings: []const Setting = &.{},
+        settings: []const QlogSetting = &.{},
         raw_length: ?usize = null,
     },
     goaway: struct {
         id: u64,
         raw_length: ?usize = null,
+    },
+    priority_update: union(enum) {
+        request: struct {
+            stream_id: u64,
+            priority_field_value: []const u8 = "",
+            raw_length: ?usize = null,
+        },
+        push: struct {
+            push_id: u64,
+            priority_field_value: []const u8 = "",
+            raw_length: ?usize = null,
+        },
     },
     push_promise: struct {
         push_id: u64,
@@ -104,6 +121,16 @@ pub const Frame = union(enum) {
         push_id: u64,
         raw_length: ?usize = null,
     },
+    unknown: struct {
+        frame_type_bytes: u64,
+        raw_length: ?usize = null,
+    },
+    malformed: struct {
+        frame_type: FrameType,
+        frame_type_bytes: u64,
+        raw_length: ?usize = null,
+        reason: []const u8 = "malformed_payload",
+    },
 
     pub fn frameType(self: Frame) FrameType {
         return switch (self) {
@@ -111,9 +138,12 @@ pub const Frame = union(enum) {
             .headers => .headers,
             .settings => .settings,
             .goaway => .goaway,
+            .priority_update => .priority_update,
             .push_promise => .push_promise,
             .cancel_push => .cancel_push,
             .max_push_id => .max_push_id,
+            .unknown => .unknown,
+            .malformed => |d| d.frame_type,
         };
     }
 };
@@ -125,6 +155,8 @@ pub const Event = union(enum) {
         max_field_section_size: ?u64 = null,
         max_table_capacity: ?u64 = null,
         blocked_streams_count: ?u64 = null,
+        extended_connect: ?u16 = null,
+        h3_datagram: ?u16 = null,
     },
     /// http3:stream_type_set
     stream_type_set: struct {
@@ -137,6 +169,11 @@ pub const Event = union(enum) {
         stream_id: u64,
         frame: Frame,
     },
+    /// http3:priority_updated
+    priority_updated: struct {
+        stream_id: u64,
+        new: HttpPriority,
+    },
     /// tardigrade:qpack_stream_state_updated (head-of-line blocking)
     qpack_state_updated: struct {
         state: QpackState,
@@ -145,7 +182,7 @@ pub const Event = union(enum) {
 
     pub fn namespace(self: Event) Namespace {
         return switch (self) {
-            .parameters_set, .stream_type_set, .frame => .http3,
+            .parameters_set, .stream_type_set, .frame, .priority_updated => .http3,
             .qpack_state_updated => .tardigrade,
         };
     }
@@ -158,6 +195,7 @@ pub const Event = union(enum) {
                 .created => "frame_created",
                 .parsed => "frame_parsed",
             },
+            .priority_updated => "priority_updated",
             .qpack_state_updated => "qpack_stream_state_updated",
         };
     }
@@ -175,6 +213,10 @@ pub const Record = struct {
 /// `emit_fn` returns `void`, so a concrete file sink cannot propagate write
 /// errors here. Same contract as the transport sink: retain the first error
 /// and/or count dropped records out-of-band so a truncated trace is detectable.
+///
+/// All slices inside `record` are borrowed and valid only for the synchronous
+/// callback. Implementations must serialize or deep-copy before returning and
+/// must not retain/enqueue `record` itself.
 pub const Sink = struct {
     context: ?*anyopaque = null,
     emit_fn: ?*const fn (?*anyopaque, Record) void = null,
@@ -192,6 +234,11 @@ pub const Sink = struct {
 /// side so both streams concatenate into one valid qlog JSON-SEQ file.
 pub const record_separator: u8 = 0x1e;
 
+/// Recommended per-record buffer for composition-root sinks. H3 HEADERS and
+/// PUSH_PROMISE records grow with decoded field sections and byte escaping, so
+/// small fixed buffers can legitimately return `NoSpaceLeft`.
+pub const max_serialized_record_len: usize = 64 * 1024;
+
 const Buf = struct {
     buf: []u8,
     len: usize = 0,
@@ -206,26 +253,6 @@ const Buf = struct {
     }
 };
 
-const WriteError = error{ NoSpaceLeft, InvalidSettingName };
-
-fn writeJsonString(b: *Buf, value: []const u8) error{NoSpaceLeft}!void {
-    try b.add("\"", .{});
-    for (value) |c| {
-        switch (c) {
-            '"' => try b.add("\\\"", .{}),
-            '\\' => try b.add("\\\\", .{}),
-            0x08 => try b.add("\\b", .{}),
-            0x0c => try b.add("\\f", .{}),
-            '\n' => try b.add("\\n", .{}),
-            '\r' => try b.add("\\r", .{}),
-            '\t' => try b.add("\\t", .{}),
-            0x00...0x07, 0x0b, 0x0e...0x1f => try b.add("\\u00{x:0>2}", .{c}),
-            else => try b.add("{c}", .{c}),
-        }
-    }
-    try b.add("\"", .{});
-}
-
 fn writeRawLength(b: *Buf, length: ?usize, need_comma: *bool) error{NoSpaceLeft}!void {
     if (length) |v| {
         if (need_comma.*) try b.add(",", .{});
@@ -234,36 +261,133 @@ fn writeRawLength(b: *Buf, length: ?usize, need_comma: *bool) error{NoSpaceLeft}
     }
 }
 
+fn writeHexNibble(b: *Buf, value: u8) error{NoSpaceLeft}!void {
+    const c: u8 = if (value < 10) '0' + value else 'a' + (value - 10);
+    try b.add("{c}", .{c});
+}
+
+fn writeHexBytes(b: *Buf, value: []const u8) error{NoSpaceLeft}!void {
+    try b.add("\"", .{});
+    for (value) |byte| {
+        try writeHexNibble(b, byte >> 4);
+        try writeHexNibble(b, byte & 0x0f);
+    }
+    try b.add("\"", .{});
+}
+
+fn writeJsonString(b: *Buf, value: []const u8) error{NoSpaceLeft}!void {
+    try b.add("\"", .{});
+    for (value) |byte| {
+        switch (byte) {
+            '"' => try b.add("\\\"", .{}),
+            '\\' => try b.add("\\\\", .{}),
+            0x08 => try b.add("\\b", .{}),
+            0x0c => try b.add("\\f", .{}),
+            '\n' => try b.add("\\n", .{}),
+            '\r' => try b.add("\\r", .{}),
+            '\t' => try b.add("\\t", .{}),
+            else => if (byte >= 0x20) {
+                try b.add("{c}", .{byte});
+            } else {
+                try b.add("\\u00", .{});
+                try writeHexNibble(b, byte >> 4);
+                try writeHexNibble(b, byte & 0x0f);
+            },
+        }
+    }
+    try b.add("\"", .{});
+}
+
+fn isHttpFieldNameText(value: []const u8) bool {
+    if (value.len == 0) return false;
+    const start: usize = if (value[0] == ':') 1 else 0;
+    if (start == value.len) return false;
+    for (value[start..]) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn isHttpFieldValueText(value: []const u8) bool {
+    for (value) |byte| switch (byte) {
+        '\t', 0x20...0x7e => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn isPriorityFieldValueText(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| switch (byte) {
+        0x20...0x7e => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn writeTextOrBytes(b: *Buf, text_key: []const u8, bytes_key: []const u8, value: []const u8, is_text: bool) error{NoSpaceLeft}!void {
+    if (is_text) {
+        try b.add("\"{s}\":", .{text_key});
+        try writeJsonString(b, value);
+    } else {
+        try b.add("\"{s}\":", .{bytes_key});
+        try writeHexBytes(b, value);
+    }
+}
+
 fn writeHeaders(b: *Buf, headers: []const HttpField) error{NoSpaceLeft}!void {
     try b.add("\"headers\":[", .{});
     for (headers, 0..) |field, i| {
         if (i != 0) try b.add(",", .{});
-        try b.add("{{\"name\":", .{});
-        try writeJsonString(b, field.name);
-        try b.add(",\"value\":", .{});
-        try writeJsonString(b, field.value);
+        try b.add("{{", .{});
+        try writeTextOrBytes(b, "name", "name_bytes", field.name, isHttpFieldNameText(field.name));
+        try b.add(",", .{});
+        try writeTextOrBytes(b, "value", "value_bytes", field.value, isHttpFieldValueText(field.value));
         try b.add("}}", .{});
     }
     try b.add("]", .{});
 }
 
-fn writeSettings(b: *Buf, settings: []const Setting) WriteError!void {
+fn settingNameFromId(id_value: u64) struct { name: SettingName, name_bytes: ?u64 = null } {
+    return switch (id_value) {
+        0x01 => .{ .name = .settings_qpack_max_table_capacity },
+        0x06 => .{ .name = .settings_max_field_section_size },
+        0x07 => .{ .name = .settings_qpack_blocked_streams },
+        0x08 => .{ .name = .settings_enable_connect_protocol },
+        0x33 => .{ .name = .settings_h3_datagram },
+        0x00, 0x02, 0x03, 0x04, 0x05 => .{ .name = .reserved },
+        else => .{ .name = .unknown, .name_bytes = id_value },
+    };
+}
+
+fn writeSettings(b: *Buf, settings: []const QlogSetting) error{NoSpaceLeft}!void {
     try b.add("\"settings\":[", .{});
     for (settings, 0..) |setting, i| {
         if (i != 0) try b.add(",", .{});
-        if (setting.name == .unknown) {
-            if (setting.name_bytes == null) return error.InvalidSettingName;
-        } else if (setting.name_bytes != null) {
-            return error.InvalidSettingName;
-        }
-        try b.add("{{\"name\":\"{s}\"", .{@tagName(setting.name)});
-        if (setting.name_bytes) |name_bytes| try b.add(",\"name_bytes\":{d}", .{name_bytes});
+        const mapped = settingNameFromId(setting.id_value);
+        try b.add("{{\"name\":\"{s}\"", .{@tagName(mapped.name)});
+        if (mapped.name_bytes) |name_bytes| try b.add(",\"name_bytes\":{d}", .{name_bytes});
         try b.add(",\"value\":{d}}}", .{setting.value});
     }
     try b.add("]", .{});
 }
 
-fn writeFrame(b: *Buf, frame: Frame) WriteError!void {
+fn writePriorityFieldValue(b: *Buf, value: []const u8) error{NoSpaceLeft}!void {
+    if (isPriorityFieldValueText(value)) {
+        try b.add(",\"priority_field_value\":", .{});
+        try writeJsonString(b, value);
+    } else {
+        try b.add(",\"tardigrade_priority_field_value_bytes\":", .{});
+        try writeHexBytes(b, value);
+    }
+}
+
+fn qpackPayloadFrame(frame_type: FrameType) bool {
+    return frame_type == .headers or frame_type == .push_promise;
+}
+
+fn writeFrame(b: *Buf, frame: Frame) error{NoSpaceLeft}!void {
     try b.add("{{\"frame_type\":\"{s}\"", .{frame.frameType().label()});
     var need_comma = true;
     switch (frame) {
@@ -282,6 +406,20 @@ fn writeFrame(b: *Buf, frame: Frame) WriteError!void {
             try b.add(",\"id\":{d}", .{d.id});
             try writeRawLength(b, d.raw_length, &need_comma);
         },
+        .priority_update => |d| {
+            switch (d) {
+                .request => |r| {
+                    try b.add(",\"stream_id\":{d}", .{r.stream_id});
+                    try writePriorityFieldValue(b, r.priority_field_value);
+                    try writeRawLength(b, r.raw_length, &need_comma);
+                },
+                .push => |p| {
+                    try b.add(",\"push_id\":{d}", .{p.push_id});
+                    try writePriorityFieldValue(b, p.priority_field_value);
+                    try writeRawLength(b, p.raw_length, &need_comma);
+                },
+            }
+        },
         .push_promise => |d| {
             try b.add(",\"push_id\":{d},", .{d.push_id});
             try writeHeaders(b, d.headers);
@@ -295,11 +433,30 @@ fn writeFrame(b: *Buf, frame: Frame) WriteError!void {
             try b.add(",\"push_id\":{d}", .{d.push_id});
             try writeRawLength(b, d.raw_length, &need_comma);
         },
+        .unknown => |d| {
+            try b.add(",\"frame_type_bytes\":{d}", .{d.frame_type_bytes});
+            try writeRawLength(b, d.raw_length, &need_comma);
+        },
+        .malformed => |d| {
+            if (qpackPayloadFrame(d.frame_type)) {
+                // The H3 observer uses the production static/bounded QPACK
+                // decoder as a best-effort diagnostic helper. A decode error
+                // here can mean valid dynamic-table input or local diagnostic
+                // capacity exhaustion, so do not claim the peer sent malformed
+                // wire. Preserve the parsed frame boundary with an explicitly
+                // Tardigrade-namespaced decode-failure diagnostic instead.
+                try b.add(",\"frame_type_bytes\":{d},\"tardigrade_qpack_decode_failed\":true,\"tardigrade_qpack_decode_reason\":\"diagnostic_decoder_rejected\"", .{d.frame_type_bytes});
+            } else {
+                try b.add(",\"frame_type_bytes\":{d},\"tardigrade_malformed_payload\":true,\"tardigrade_malformed_reason\":", .{d.frame_type_bytes});
+                try writeJsonString(b, d.reason);
+            }
+            try writeRawLength(b, d.raw_length, &need_comma);
+        },
     }
     try b.add("}}", .{});
 }
 
-fn writeData(b: *Buf, event: Event) WriteError!void {
+fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
     switch (event) {
         .parameters_set => |d| {
             try b.add("{{", .{});
@@ -321,6 +478,16 @@ fn writeData(b: *Buf, event: Event) WriteError!void {
             if (d.blocked_streams_count) |v| {
                 if (need_comma) try b.add(",", .{});
                 try b.add("\"blocked_streams_count\":{d}", .{v});
+                need_comma = true;
+            }
+            if (d.extended_connect) |v| {
+                if (need_comma) try b.add(",", .{});
+                try b.add("\"extended_connect\":{d}", .{v});
+                need_comma = true;
+            }
+            if (d.h3_datagram) |v| {
+                if (need_comma) try b.add(",", .{});
+                try b.add("\"h3_datagram\":{d}", .{v});
             }
             try b.add("}}", .{});
         },
@@ -333,6 +500,11 @@ fn writeData(b: *Buf, event: Event) WriteError!void {
             try writeFrame(b, d.frame);
             try b.add("}}", .{});
         },
+        .priority_updated => |d| {
+            try b.add("{{\"stream_id\":{d},\"new\":\"u={d}", .{ d.stream_id, d.new.urgency });
+            if (d.new.incremental) try b.add(", i", .{});
+            try b.add("\"}}", .{});
+        },
         .qpack_state_updated => |d| try b.add(
             "{{\"stream_id\":{d},\"state\":\"{s}\"}}",
             .{ d.stream_id, @tagName(d.state) },
@@ -340,11 +512,12 @@ fn writeData(b: *Buf, event: Event) WriteError!void {
     }
 }
 
-/// Serialize one `Record` into `out` as a single qlog JSON-SEQ line. H3
-/// HEADERS, SETTINGS, and PUSH_PROMISE records can grow with the supplied
-/// slices; callers must size `out` for their configured field-section budget or
-/// retain `NoSpaceLeft` as a dropped-record diagnostic.
-pub fn writeJson(record: Record, out: []u8) WriteError![]const u8 {
+/// Serialize one `Record` into `out` as a single qlog JSON-SEQ line. Same shape
+/// as `quic.qlog.writeJson` so a merged trace is uniform. H3 HEADERS and
+/// PUSH_PROMISE records can grow with decoded field slices; callers should use
+/// `max_serialized_record_len` or retain `NoSpaceLeft` as a dropped-record
+/// diagnostic.
+pub fn writeJson(record: Record, out: []u8) error{NoSpaceLeft}![]const u8 {
     var b = Buf{ .buf = out };
     try b.add("{c}", .{record_separator});
     try b.add(
@@ -363,11 +536,24 @@ pub fn writeJson(record: Record, out: []u8) WriteError![]const u8 {
 const testing = std.testing;
 
 fn expectJson(record: Record, needle: []const u8) !void {
-    var buf: [512]u8 = undefined;
+    var buf: [2048]u8 = undefined;
     const line = try writeJson(record, &buf);
     try testing.expect(line[0] == record_separator);
     try testing.expect(line[line.len - 1] == '\n');
     try testing.expect(std.mem.indexOf(u8, line, needle) != null);
+}
+
+fn expectNoJson(record: Record, needle: []const u8) !void {
+    var buf: [2048]u8 = undefined;
+    const line = try writeJson(record, &buf);
+    try testing.expect(std.mem.indexOf(u8, line, needle) == null);
+}
+
+fn expectValidJson(record: Record) !void {
+    var buf: [2048]u8 = undefined;
+    const line = try writeJson(record, &buf);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line[1 .. line.len - 1], .{});
+    defer parsed.deinit();
 }
 
 test "qpack blocking is a Tardigrade extension event" {
@@ -390,9 +576,20 @@ test "frame direction chooses frame_created vs frame_parsed" {
 
 test "parameters_set only emits present settings" {
     try expectJson(
-        .{ .time_us = 0, .event = .{ .parameters_set = .{ .blocked_streams_count = 16 } } },
-        "{\"blocked_streams_count\":16}",
+        .{ .time_us = 0, .event = .{ .parameters_set = .{ .initiator = .remote, .blocked_streams_count = 16 } } },
+        "{\"initiator\":\"remote\",\"blocked_streams_count\":16}",
     );
+}
+
+test "parameters_set extended settings use numeric values" {
+    const record = Record{ .time_us = 0, .event = .{ .parameters_set = .{
+        .initiator = .remote,
+        .extended_connect = 1,
+        .h3_datagram = 0,
+    } } };
+    try expectJson(record, "\"extended_connect\":1");
+    try expectJson(record, "\"h3_datagram\":0");
+    try expectValidJson(record);
 }
 
 test "stream_type_set and representative frames use http3 names" {
@@ -401,12 +598,12 @@ test "stream_type_set and representative frames use http3 names" {
         "\"name\":\"http3:stream_type_set\"",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = .settings_qpack_blocked_streams, .value = 16 }} } } } } },
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .id_value = 0x07, .value = 16 }} } } } } },
         "\"frame_type\":\"settings\"",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = .settings_qpack_blocked_streams, .value = 16 }} } } } } },
-        "\"settings\":[{\"name\":\"settings_qpack_blocked_streams\",\"value\":16}]",
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{ .{ .id_value = 0x06, .value = 4096 }, .{ .id_value = 0x07, .value = 16 } } } } } } },
+        "\"settings\":[{\"name\":\"settings_max_field_section_size\",\"value\":4096},{\"name\":\"settings_qpack_blocked_streams\",\"value\":16}]",
     );
     try expectJson(
         .{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 4, .frame = .{ .headers = .{ .headers = &.{.{ .name = ":path", .value = "/" }}, .raw_length = 32 } } } } },
@@ -418,43 +615,129 @@ test "stream_type_set and representative frames use http3 names" {
     );
 }
 
-test "headers escape JSON string content" {
-    var buf: [512]u8 = undefined;
-    const line = try writeJson(.{
-        .time_us = 0,
-        .event = .{ .frame = .{
-            .direction = .parsed,
-            .stream_id = 4,
-            .frame = .{ .headers = .{ .headers = &.{.{ .name = "x-debug", .value = "quoted \"value\" \\ path\nnext" }} } },
-        } },
-    }, &buf);
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line[1 .. line.len - 1], .{});
-    defer parsed.deinit();
-    const root = parsed.value.object;
-    const data = root.get("data").?.object;
-    const frame = data.get("frame").?.object;
-    const headers = frame.get("headers").?.array;
-    const first = headers.items[0].object;
-    try testing.expectEqualStrings("quoted \"value\" \\ path\nnext", first.get("value").?.string);
+test "frame JSON string fields are escaped and parseable" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 4, .frame = .{ .headers = .{
+        .headers = &.{.{ .name = "x-name", .value = "a\\b" }},
+        .raw_length = 12,
+    } } } } };
+    try expectJson(record, "\"name\":\"x-name\"");
+    try expectJson(record, "\"value\":\"a\\\\b\"");
+    try expectValidJson(record);
 }
 
-test "unknown setting requires name_bytes" {
-    var buf: [512]u8 = undefined;
-    try testing.expectError(error.InvalidSettingName, writeJson(.{
-        .time_us = 0,
-        .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = .unknown, .value = 1 }} } } } },
-    }, &buf));
-    try testing.expectError(error.InvalidSettingName, writeJson(.{
-        .time_us = 0,
-        .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = .settings_qpack_blocked_streams, .name_bytes = 0x21, .value = 1 }} } } } },
-    }, &buf));
+test "header fields with non UTF-8 bytes use byte-oriented qlog fields" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 4, .frame = .{ .headers = .{
+        .headers = &.{.{ .name = "x", .value = &.{ 0xff, 0x00, '"' } }},
+        .raw_length = 12,
+    } } } } };
+    try expectJson(record, "\"name\":\"x\"");
+    try expectJson(record, "\"value_bytes\":\"ff0022\"");
+    try expectValidJson(record);
+}
+
+test "HTTP-invalid field bytes use byte-oriented qlog fields" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 4, .frame = .{ .headers = .{
+        .headers = &.{.{ .name = "bad name", .value = "snowman \xe2\x98\x83" }},
+        .raw_length = 12,
+    } } } } };
+    try expectJson(record, "\"name_bytes\":\"626164206e616d65\"");
+    try expectJson(record, "\"value_bytes\":\"736e6f776d616e20e29883\"");
+    try expectValidJson(record);
+}
+
+test "settings frames preserve explicit zero reserved and unknown IDs" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 0, .frame = .{ .settings = .{
+        .settings = &.{
+            .{ .id_value = 0x07, .value = 0 },
+            .{ .id_value = 0x08, .value = 0 },
+            .{ .id_value = 0x21, .value = 99 },
+            .{ .id_value = 0x02, .value = 1 },
+        },
+        .raw_length = 12,
+    } } } } };
+    try expectJson(record, "{\"name\":\"settings_qpack_blocked_streams\",\"value\":0}");
+    try expectJson(record, "{\"name\":\"settings_enable_connect_protocol\",\"value\":0}");
+    try expectJson(record, "{\"name\":\"unknown\",\"name_bytes\":33,\"value\":99}");
+    try expectJson(record, "{\"name\":\"reserved\",\"value\":1}");
+}
+
+test "priority_update frames emit typed targets and escaped values" {
+    const request = Record{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 0, .frame = .{ .priority_update = .{ .request = .{
+        .stream_id = 8,
+        .priority_field_value = "u=1\"",
+        .raw_length = 9,
+    } } } } } };
+    try expectJson(request, "\"stream_id\":8,\"priority_field_value\":\"u=1\\\"\"");
+    try expectValidJson(request);
+
+    const push = Record{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .priority_update = .{ .push = .{
+        .push_id = 3,
+        .priority_field_value = "i",
+        .raw_length = 5,
+    } } } } } };
+    try expectJson(push, "\"push_id\":3,\"priority_field_value\":\"i\"");
+    try expectValidJson(push);
+}
+
+test "priority_update invalid bytes use byte-oriented qlog field" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 0, .frame = .{ .priority_update = .{ .request = .{
+        .stream_id = 8,
+        .priority_field_value = &.{ 0xff, '\n' },
+        .raw_length = 9,
+    } } } } } };
+    try expectJson(record, "\"tardigrade_priority_field_value_bytes\":\"ff0a\"");
+    try expectValidJson(record);
+}
+
+test "unknown frame serializes with original frame type bytes" {
     try expectJson(
-        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = .unknown, .name_bytes = 0x21, .value = 1 }} } } } } },
-        "\"settings\":[{\"name\":\"unknown\",\"name_bytes\":33,\"value\":1}]",
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 4, .frame = .{ .unknown = .{ .frame_type_bytes = 0x21, .raw_length = 2 } } } } },
+        "\"frame_type\":\"unknown\",\"frame_type_bytes\":33",
     );
 }
 
-test "large header sections require a caller-sized buffer" {
+test "malformed frame preserves real frame type and diagnostic" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{
+        .direction = .parsed,
+        .stream_id = 0,
+        .frame = .{ .malformed = .{ .frame_type = .goaway, .frame_type_bytes = 0x07, .raw_length = 2 } },
+    } } };
+    try expectJson(record, "\"frame_type\":\"goaway\"");
+    try expectJson(record, "\"frame_type_bytes\":7");
+    try expectJson(record, "\"tardigrade_malformed_payload\":true");
+    try expectValidJson(record);
+}
+
+test "QPACK decode failure does not claim malformed wire" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{
+        .direction = .parsed,
+        .stream_id = 4,
+        .frame = .{ .malformed = .{ .frame_type = .push_promise, .frame_type_bytes = 0x05, .raw_length = 8 } },
+    } } };
+    try expectJson(record, "\"frame_type\":\"push_promise\"");
+    try expectJson(record, "\"tardigrade_qpack_decode_failed\":true");
+    try expectJson(record, "\"tardigrade_qpack_decode_reason\":\"diagnostic_decoder_rejected\"");
+    try expectNoJson(record, "\"tardigrade_malformed_payload\"");
+    try expectValidJson(record);
+}
+
+test "push_promise frame serializes decoded headers" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{
+        .direction = .parsed,
+        .stream_id = 4,
+        .frame = .{ .push_promise = .{
+            .push_id = 3,
+            .headers = &.{ .{ .name = ":method", .value = "GET" }, .{ .name = ":path", .value = "/" } },
+            .raw_length = 10,
+        } },
+    } } };
+    try expectJson(record, "\"frame_type\":\"push_promise\"");
+    try expectJson(record, "\"push_id\":3");
+    try expectJson(record, "\"headers\":[{\"name\":\":method\",\"value\":\"GET\"},{\"name\":\":path\",\"value\":\"/\"}]");
+    try expectValidJson(record);
+}
+
+test "large header records require a caller-sized buffer" {
     const headers = [_]HttpField{
         .{ .name = "x-debug-0", .value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
         .{ .name = "x-debug-1", .value = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
@@ -463,27 +746,20 @@ test "large header sections require a caller-sized buffer" {
         .{ .name = "x-debug-4", .value = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
         .{ .name = "x-debug-5", .value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" },
     };
-    const record = Record{
-        .time_us = 0,
-        .event = .{ .frame = .{
-            .direction = .parsed,
-            .stream_id = 4,
-            .frame = .{ .headers = .{ .headers = &headers, .raw_length = 512 } },
-        } },
-    };
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{
+        .direction = .parsed,
+        .stream_id = 4,
+        .frame = .{ .headers = .{ .headers = &headers, .raw_length = 512 } },
+    } } };
 
     var too_small: [512]u8 = undefined;
     try testing.expectError(error.NoSpaceLeft, writeJson(record, &too_small));
 
-    var enough: [2048]u8 = undefined;
+    var enough: [max_serialized_record_len]u8 = undefined;
     const line = try writeJson(record, &enough);
     try testing.expect(line.len > 512);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line[1 .. line.len - 1], .{});
     defer parsed.deinit();
-    const root = parsed.value.object;
-    const data = root.get("data").?.object;
-    const frame = data.get("frame").?.object;
-    try testing.expectEqual(@as(usize, headers.len), frame.get("headers").?.array.items.len);
 }
 
 test "default sink is a no-op" {
