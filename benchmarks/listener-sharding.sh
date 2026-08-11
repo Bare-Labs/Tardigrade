@@ -622,6 +622,12 @@ run_mixed_keepalive_churn_workload() {
         '{keepalive: $keepalive, connection_churn: $churn, resources: $resources, queue: $queue, accept_metrics: $accepts}'
 }
 
+profile_fail() {
+    local rc="${1:-1}"
+    cleanup_gateway
+    return "$rc"
+}
+
 run_profile() {
     local label="$1"
     local shard_count="$2"
@@ -639,6 +645,7 @@ run_profile() {
     local mixed_keepalive_raw="${SAVE_DIR}/${label}-mixed-keepalive-churn-keepalive.wrk.txt"
     local mixed_churn_raw="${SAVE_DIR}/${label}-mixed-keepalive-churn-churn.wrk.txt"
     local mixed_queue_samples="${SAVE_DIR}/${label}-mixed-keepalive-churn-queue.samples"
+    local rc=0
 
     cleanup_gateway
     profile_tmp="$(mktemp -d)"
@@ -655,8 +662,8 @@ run_profile() {
     ) &
     gateway_pid="$!"
     echo "$gateway_pid" > "$pid_file"
-    wait_for_ready || return 1
-    verify_listener_shards "$shard_count" "$startup_metrics_file" || return 1
+    wait_for_ready || { rc="$?"; profile_fail "$rc"; return "$?"; }
+    verify_listener_shards "$shard_count" "$startup_metrics_file" || { rc="$?"; profile_fail "$rc"; return "$?"; }
 
     echo "==> ${label}: standard scenarios (${SCENARIOS})" >&2
     local -a run_args=(
@@ -680,25 +687,25 @@ run_profile() {
     if [[ -n "$HOST_HEADER" ]]; then
         run_args+=(--host-header "$HOST_HEADER")
     fi
-    "${BENCH_DIR}/run.sh" "${run_args[@]}" >"$run_log" 2>&1 || return 1
+    "${BENCH_DIR}/run.sh" "${run_args[@]}" >"$run_log" 2>&1 || { rc="$?"; profile_fail "$rc"; return "$?"; }
 
     echo "==> ${label}: high connection churn (${STATIC_PATH}, Connection: close)" >&2
     local churn_json
-    churn_json="$(run_wrk_workload "connection-churn-http1" "$churn_raw" "${BENCH_DIR}/wrk-summary.lua" "$churn_queue_samples" "${HEADER_ARGS[@]}" -H "Connection: close" "${BASE_URL}${STATIC_PATH}")" || return 1
+    churn_json="$(run_wrk_workload "connection-churn-http1" "$churn_raw" "${BENCH_DIR}/wrk-summary.lua" "$churn_queue_samples" "${HEADER_ARGS[@]}" -H "Connection: close" "${BASE_URL}${STATIC_PATH}")" || { rc="$?"; profile_fail "$rc"; return "$?"; }
     recover_after_close_workload "${label}: post-churn"
 
     echo "==> ${label}: high connection burst (${STATIC_PATH}, Connection: close, ${BURST_CONNECTIONS} connections)" >&2
     local burst_json
-    burst_json="$(WRK_CONNECTIONS="$BURST_CONNECTIONS" run_wrk_workload "connection-burst-http1" "$burst_raw" "${BENCH_DIR}/wrk-summary.lua" "$burst_queue_samples" "${HEADER_ARGS[@]}" -H "Connection: close" "${BASE_URL}${STATIC_PATH}")" || return 1
+    burst_json="$(WRK_CONNECTIONS="$BURST_CONNECTIONS" run_wrk_workload "connection-burst-http1" "$burst_raw" "${BENCH_DIR}/wrk-summary.lua" "$burst_queue_samples" "${HEADER_ARGS[@]}" -H "Connection: close" "${BASE_URL}${STATIC_PATH}")" || { rc="$?"; profile_fail "$rc"; return "$?"; }
     recover_after_close_workload "${label}: post-burst"
 
     echo "==> ${label}: mixed active keepalive + new connection churn (${KEEPALIVE_PATH} keepalive + ${STATIC_PATH} close)" >&2
     local mixed_json
-    mixed_json="$(run_mixed_keepalive_churn_workload "mixed-keepalive-churn" "$mixed_keepalive_raw" "$mixed_churn_raw" "$mixed_queue_samples")" || return 1
+    mixed_json="$(run_mixed_keepalive_churn_workload "mixed-keepalive-churn" "$mixed_keepalive_raw" "$mixed_churn_raw" "$mixed_queue_samples")" || { rc="$?"; profile_fail "$rc"; return "$?"; }
     recover_after_close_workload "${label}: post-mixed"
-    validate_profile_accept_batching "$label" "$batch_limit" "$fairness_yield_every" "$churn_json" "$burst_json" "$mixed_json" || return 1
+    validate_profile_accept_batching "$label" "$batch_limit" "$fairness_yield_every" "$churn_json" "$burst_json" "$mixed_json" || { rc="$?"; profile_fail "$rc"; return "$?"; }
 
-    scrape_metrics > "$metrics_file" || return 1
+    scrape_metrics > "$metrics_file" || { rc="$?"; profile_fail "$rc"; return "$?"; }
     validate_profile_artifacts \
         "$run_json" \
         "$run_log" \
@@ -710,11 +717,11 @@ run_profile() {
         "$burst_queue_samples" \
         "$mixed_keepalive_raw" \
         "$mixed_churn_raw" \
-        "$mixed_queue_samples" || return 1
+        "$mixed_queue_samples" || { rc="$?"; profile_fail "$rc"; return "$?"; }
 
     local standard_json metric_json
-    standard_json="$(cat "$run_json")" || return 1
-    metric_json="$(metrics_json "$metrics_file")" || return 1
+    standard_json="$(cat "$run_json")" || { rc="$?"; profile_fail "$rc"; return "$?"; }
+    metric_json="$(metrics_json "$metrics_file")" || { rc="$?"; profile_fail "$rc"; return "$?"; }
 
     local profile_json
     profile_json="$(jq -n \
@@ -738,7 +745,7 @@ run_profile() {
         --argjson metrics "$metric_json" \
         --argjson batch_limit "$batch_limit" \
         --argjson fairness_yield_every "$fairness_yield_every" \
-        '{label: $label, requested_shards: $shards, actual_shards: $metrics.listener_shards, accept_batch_limit: $batch_limit, accept_fairness_yield_every: $fairness_yield_every, artifacts: {standard_json: $run_json, standard_log: $run_log, startup_metrics_prom: $startup_metrics_file, metrics_prom: $metrics_file, connection_churn_wrk: $churn_raw, connection_churn_queue_samples: $churn_queue_samples, connection_burst_wrk: $burst_raw, connection_burst_queue_samples: $burst_queue_samples, mixed_keepalive_churn_keepalive_wrk: $mixed_keepalive_raw, mixed_keepalive_churn_churn_wrk: $mixed_churn_raw, mixed_keepalive_churn_queue_samples: $mixed_queue_samples}, standard: $standard, "connection-churn-http1": $churn, "connection-burst-http1": $burst, "mixed-keepalive-churn": $mixed, metrics: $metrics}')" || return 1
+        '{label: $label, requested_shards: $shards, actual_shards: $metrics.listener_shards, accept_batch_limit: $batch_limit, accept_fairness_yield_every: $fairness_yield_every, artifacts: {standard_json: $run_json, standard_log: $run_log, startup_metrics_prom: $startup_metrics_file, metrics_prom: $metrics_file, connection_churn_wrk: $churn_raw, connection_churn_queue_samples: $churn_queue_samples, connection_burst_wrk: $burst_raw, connection_burst_queue_samples: $burst_queue_samples, mixed_keepalive_churn_keepalive_wrk: $mixed_keepalive_raw, mixed_keepalive_churn_churn_wrk: $mixed_churn_raw, mixed_keepalive_churn_queue_samples: $mixed_queue_samples}, standard: $standard, "connection-churn-http1": $churn, "connection-burst-http1": $burst, "mixed-keepalive-churn": $mixed, metrics: $metrics}')" || { rc="$?"; profile_fail "$rc"; return "$?"; }
 
     cleanup_gateway
     printf '%s\n' "$profile_json"
