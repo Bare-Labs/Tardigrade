@@ -383,6 +383,10 @@ fn writePriorityFieldValue(b: *Buf, value: []const u8) error{NoSpaceLeft}!void {
     }
 }
 
+fn qpackPayloadFrame(frame_type: FrameType) bool {
+    return frame_type == .headers or frame_type == .push_promise;
+}
+
 fn writeFrame(b: *Buf, frame: Frame) error{NoSpaceLeft}!void {
     try b.add("{{\"frame_type\":\"{s}\"", .{frame.frameType().label()});
     var need_comma = true;
@@ -434,8 +438,18 @@ fn writeFrame(b: *Buf, frame: Frame) error{NoSpaceLeft}!void {
             try writeRawLength(b, d.raw_length, &need_comma);
         },
         .malformed => |d| {
-            try b.add(",\"frame_type_bytes\":{d},\"tardigrade_malformed_payload\":true,\"tardigrade_malformed_reason\":", .{d.frame_type_bytes});
-            try writeJsonString(b, d.reason);
+            if (qpackPayloadFrame(d.frame_type)) {
+                // The H3 observer uses the production static/bounded QPACK
+                // decoder as a best-effort diagnostic helper. A decode error
+                // here can mean valid dynamic-table input or local diagnostic
+                // capacity exhaustion, so do not claim the peer sent malformed
+                // wire. Preserve the parsed frame boundary with an explicitly
+                // Tardigrade-namespaced decode-failure diagnostic instead.
+                try b.add(",\"frame_type_bytes\":{d},\"tardigrade_qpack_decode_failed\":true,\"tardigrade_qpack_decode_reason\":\"diagnostic_decoder_rejected\"", .{d.frame_type_bytes});
+            } else {
+                try b.add(",\"frame_type_bytes\":{d},\"tardigrade_malformed_payload\":true,\"tardigrade_malformed_reason\":", .{d.frame_type_bytes});
+                try writeJsonString(b, d.reason);
+            }
             try writeRawLength(b, d.raw_length, &need_comma);
         },
     }
@@ -527,6 +541,12 @@ fn expectJson(record: Record, needle: []const u8) !void {
     try testing.expect(line[0] == record_separator);
     try testing.expect(line[line.len - 1] == '\n');
     try testing.expect(std.mem.indexOf(u8, line, needle) != null);
+}
+
+fn expectNoJson(record: Record, needle: []const u8) !void {
+    var buf: [2048]u8 = undefined;
+    const line = try writeJson(record, &buf);
+    try testing.expect(std.mem.indexOf(u8, line, needle) == null);
 }
 
 fn expectValidJson(record: Record) !void {
@@ -685,6 +705,19 @@ test "malformed frame preserves real frame type and diagnostic" {
     try expectJson(record, "\"frame_type\":\"goaway\"");
     try expectJson(record, "\"frame_type_bytes\":7");
     try expectJson(record, "\"tardigrade_malformed_payload\":true");
+    try expectValidJson(record);
+}
+
+test "QPACK decode failure does not claim malformed wire" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{
+        .direction = .parsed,
+        .stream_id = 4,
+        .frame = .{ .malformed = .{ .frame_type = .push_promise, .frame_type_bytes = 0x05, .raw_length = 8 } },
+    } } };
+    try expectJson(record, "\"frame_type\":\"push_promise\"");
+    try expectJson(record, "\"tardigrade_qpack_decode_failed\":true");
+    try expectJson(record, "\"tardigrade_qpack_decode_reason\":\"diagnostic_decoder_rejected\"");
+    try expectNoJson(record, "\"tardigrade_malformed_payload\"");
     try expectValidJson(record);
 }
 
