@@ -1155,7 +1155,6 @@ test "qlog composition root interleaves transport and h3 records under one heade
 
     const header = try qlog.writeTraceHeader(.{
         .vantage_point = .server,
-        .reference_time_us = 0,
         .group_id = "0011223344556677",
     }, file[len..]);
     len += header.len;
@@ -1175,9 +1174,10 @@ test "qlog composition root interleaves transport and h3 records under one heade
     const stream = file[0..len];
     // Three records: header + one transport + one h3, each JSON-SEQ delimited.
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, stream, &[_]u8{qlog.record_separator}));
-    try testing.expect(std.mem.indexOf(u8, stream, "\"qlog_format\":\"JSON-SEQ\"") != null);
-    try testing.expect(std.mem.indexOf(u8, stream, "transport:packet_received") != null);
-    try testing.expect(std.mem.indexOf(u8, stream, "qpack:stream_state_updated") != null);
+    try testing.expect(std.mem.indexOf(u8, stream, "\"file_schema\":\"urn:ietf:params:qlog:file:sequential\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stream, "\"serialization_format\":\"application/qlog+json-seq\"") != null);
+    try testing.expect(std.mem.indexOf(u8, stream, "quic:packet_received") != null);
+    try testing.expect(std.mem.indexOf(u8, stream, "tardigrade:qpack_stream_state_updated") != null);
     // Both writers frame identically, so the merged stream is uniform.
     try testing.expectEqual(qlog.record_separator, h3qlog.record_separator);
 }
