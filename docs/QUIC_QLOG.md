@@ -59,9 +59,9 @@ Rules:
 1. **Transport-vantage events** (`connectivity`, `security`, `transport`,
    `recovery` qlog categories) are defined in `src/quic/qlog.zig` and emitted
    from the transport layers. `src/quic` imports no HTTP/3 type.
-2. **Application-vantage events** (`http`, `qpack` categories) are defined in
-   `src/http3/qlog.zig` and emitted from `src/http3`. `src/http3` imports no
-   transport type.
+2. **Application-vantage events** (`http3` plus documented Tardigrade QPACK
+   diagnostics) are defined in `src/http3/qlog.zig` and emitted from
+   `src/http3`. `src/http3` imports no transport type.
 3. Both packages emit through an **injected `Sink`** — an opaque context plus a
    function pointer, exactly like the existing `recovery.EventSink`. A default
    `Sink{}` is a no-op, so the seam costs nothing until a root wires it.
@@ -130,7 +130,7 @@ Application events (`src/http3/qlog.zig`):
 
 | Requirement (#255)        | qlog event                          | Key data |
 |---------------------------|-------------------------------------|----------|
-| SETTINGS                  | `http3:parameters_set`              | max field section size, QPACK table cap, blocked streams |
+| SETTINGS                  | `http3:parameters_set`              | max field section size, QPACK table cap, blocked streams, extended CONNECT, H3 datagram |
 | control stream            | `http3:stream_type_set`             | stream id, stream type |
 | HEADERS / DATA / GOAWAY   | `http3:frame_created` / `http3:frame_parsed` | variant-specific frame payloads; HEADERS carries escaped `headers`, SETTINGS carries typed lower-case qlog `settings`, GOAWAY carries `id` |
 | **QPACK blocked**         | `tardigrade:qpack_stream_state_updated` | `state` (blocked/unblocked), stream id |
@@ -259,6 +259,13 @@ are the source. The gateway `/status/metrics` endpoint (see
 Labels are kept low-cardinality (e.g. `stage`, not per-client) per the issue's
 non-goals. Wiring these into the gateway registry is follow-up work; the
 counters they read from already exist.
+
+Production caveat: the current native H3 connection path still uses the static
+decoder and does not compose `DynamicDecoder.decodeOrBlock()` into request
+processing. Until that changes, dynamic-QPACK blocked/table/decode metrics and
+`tardigrade:qpack_stream_state_updated` remain zero/unemitted in production; a
+zero means "dynamic decoder not composed", not "dynamic blocking was observed
+and absent."
 
 ## Testing strategy
 

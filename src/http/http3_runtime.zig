@@ -1278,6 +1278,8 @@ pub const Runtime = struct {
                 .max_field_section_size = parameters.settings.max_field_section_size,
                 .max_table_capacity = if (parameters.settings.qpack_max_table_capacity == 0) null else parameters.settings.qpack_max_table_capacity,
                 .blocked_streams_count = if (parameters.settings.qpack_blocked_streams == 0) null else parameters.settings.qpack_blocked_streams,
+                .extended_connect = if (parameters.settings.enable_connect_protocol) true else null,
+                .h3_datagram = if (parameters.settings.h3_datagram) true else null,
             } },
             .stream_type_set => |stream| .{ .stream_type_set = .{
                 .stream_id = stream.stream_id,
@@ -1304,7 +1306,7 @@ pub const Runtime = struct {
         return switch (event_frame) {
             .data => |d| .{ .data = .{ .raw_length = d.raw_length } },
             .headers => |h| .{ .headers = .{ .headers = h.fields, .raw_length = h.raw_length } },
-            .settings => |s| .{ .settings = .{ .settings = s.settings, .raw_length = s.raw_length } },
+            .settings => |s| .{ .settings = .{ .settings = @ptrCast(s.entries), .raw_length = s.raw_length } },
             .goaway => |g| .{ .goaway = .{ .id = g.id, .raw_length = g.raw_length } },
             .priority_update => |update| .{ .priority_update = switch (update) {
                 .request => |r| .{ .request = .{ .stream_id = r.stream_id, .priority_field_value = r.field_value, .raw_length = r.raw_length } },
@@ -1313,6 +1315,7 @@ pub const Runtime = struct {
             .push_promise => |p| .{ .push_promise = .{ .push_id = p.push_id, .raw_length = p.raw_length } },
             .cancel_push => |c| .{ .cancel_push = .{ .push_id = c.push_id, .raw_length = c.raw_length } },
             .max_push_id => |m| .{ .max_push_id = .{ .push_id = m.push_id, .raw_length = m.raw_length } },
+            .unknown => |u| .{ .unknown = .{ .frame_type_bytes = u.frame_type_value, .raw_length = u.raw_length } },
         };
     }
 
@@ -1699,6 +1702,7 @@ const H3QlogRecorder = struct {
     records: std.ArrayList(http3.qlog.Record) = .empty,
 
     fn deinit(self: *H3QlogRecorder, allocator: std.mem.Allocator) void {
+        for (self.records.items) |record| freeRecord(allocator, record);
         self.records.deinit(allocator);
     }
 
@@ -1708,7 +1712,74 @@ const H3QlogRecorder = struct {
 
     fn emit(ctx: ?*anyopaque, record: http3.qlog.Record) void {
         const self: *H3QlogRecorder = @ptrCast(@alignCast(ctx.?));
-        self.records.append(testing.allocator, record) catch unreachable;
+        self.records.append(testing.allocator, cloneRecord(testing.allocator, record) catch unreachable) catch unreachable;
+    }
+
+    fn cloneFields(allocator: std.mem.Allocator, fields: []const http3.qpack.HeaderField) ![]const http3.qpack.HeaderField {
+        const copy = try allocator.alloc(http3.qpack.HeaderField, fields.len);
+        errdefer allocator.free(copy);
+        for (fields, 0..) |field, i| {
+            const name = try allocator.dupe(u8, field.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, field.value);
+            errdefer allocator.free(value);
+            copy[i] = .{ .name = name, .value = value };
+        }
+        return copy;
+    }
+
+    fn freeFields(allocator: std.mem.Allocator, fields: []const http3.qpack.HeaderField) void {
+        for (fields) |field| {
+            allocator.free(field.name);
+            allocator.free(field.value);
+        }
+        allocator.free(fields);
+    }
+
+    fn cloneFrame(allocator: std.mem.Allocator, event_frame: http3.qlog.Frame) !http3.qlog.Frame {
+        return switch (event_frame) {
+            .headers => |h| .{ .headers = .{ .headers = try cloneFields(allocator, h.headers), .raw_length = h.raw_length } },
+            .settings => |s| .{ .settings = .{ .settings = try allocator.dupe(http3.qlog.QlogSetting, s.settings), .raw_length = s.raw_length } },
+            .priority_update => |update| .{ .priority_update = switch (update) {
+                .request => |r| .{ .request = .{
+                    .stream_id = r.stream_id,
+                    .priority_field_value = try allocator.dupe(u8, r.priority_field_value),
+                    .raw_length = r.raw_length,
+                } },
+                .push => |p| .{ .push = .{
+                    .push_id = p.push_id,
+                    .priority_field_value = try allocator.dupe(u8, p.priority_field_value),
+                    .raw_length = p.raw_length,
+                } },
+            } },
+            else => event_frame,
+        };
+    }
+
+    fn freeFrame(allocator: std.mem.Allocator, event_frame: http3.qlog.Frame) void {
+        switch (event_frame) {
+            .headers => |h| freeFields(allocator, h.headers),
+            .settings => |s| allocator.free(s.settings),
+            .priority_update => |update| switch (update) {
+                .request => |r| allocator.free(r.priority_field_value),
+                .push => |p| allocator.free(p.priority_field_value),
+            },
+            else => {},
+        }
+    }
+
+    fn cloneRecord(allocator: std.mem.Allocator, record: http3.qlog.Record) !http3.qlog.Record {
+        return .{ .time_us = record.time_us, .event = switch (record.event) {
+            .frame => |f| .{ .frame = .{ .direction = f.direction, .stream_id = f.stream_id, .frame = try cloneFrame(allocator, f.frame) } },
+            else => record.event,
+        } };
+    }
+
+    fn freeRecord(allocator: std.mem.Allocator, record: http3.qlog.Record) void {
+        switch (record.event) {
+            .frame => |f| freeFrame(allocator, f.frame),
+            else => {},
+        }
     }
 };
 
@@ -1753,13 +1824,18 @@ test "http3 runtime: H3 qlog adapter preserves typed event payloads" {
         .max_field_section_size = 4096,
         .qpack_blocked_streams = 7,
     };
+    const setting_entries = [_]http3.conn.EventSetting{
+        .{ .id_value = 0x01, .value = 128 },
+        .{ .id_value = 0x06, .value = 4096 },
+        .{ .id_value = 0x07, .value = 7 },
+    };
     const fields = [_]http3.qpack.HeaderField{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":path", .value = "/trace" },
     };
 
     Runtime.h3ConnectionEvent(&observer, .{ .parameters_set = .{ .initiator = .local, .settings = settings } });
-    Runtime.h3ConnectionEvent(&observer, .{ .frame_parsed = .{ .stream_id = 0, .frame = .{ .settings = .{ .settings = settings, .raw_length = 9 } } } });
+    Runtime.h3ConnectionEvent(&observer, .{ .frame_parsed = .{ .stream_id = 0, .frame = .{ .settings = .{ .entries = &setting_entries, .raw_length = 9 } } } });
     Runtime.h3ConnectionEvent(&observer, .{ .frame_parsed = .{ .stream_id = 4, .frame = .{ .headers = .{ .fields = &fields, .raw_length = 12 } } } });
     Runtime.h3ConnectionEvent(&observer, .{ .frame_created = .{ .stream_id = 0, .frame = .{ .goaway = .{ .id = 12, .raw_length = 2 } } } });
     Runtime.h3ConnectionEvent(&observer, .{ .frame_parsed = .{ .stream_id = 0, .frame = .{ .priority_update = .{ .request = .{ .stream_id = 8, .field_value = "u=2", .raw_length = 7 } } } } });
@@ -1777,8 +1853,10 @@ test "http3 runtime: H3 qlog adapter preserves typed event payloads" {
     switch (recorder.records.items[1].event) {
         .frame => |event| switch (event.frame) {
             .settings => |frame_event| {
-                try testing.expectEqual(@as(u64, 128), frame_event.settings.?.qpack_max_table_capacity);
-                try testing.expectEqual(@as(u64, 4096), frame_event.settings.?.max_field_section_size.?);
+                try testing.expectEqual(@as(u64, 0x01), frame_event.settings[0].id_value);
+                try testing.expectEqual(@as(u64, 128), frame_event.settings[0].value);
+                try testing.expectEqual(@as(u64, 0x06), frame_event.settings[1].id_value);
+                try testing.expectEqual(@as(u64, 4096), frame_event.settings[1].value);
                 try testing.expectEqual(@as(usize, 9), frame_event.raw_length.?);
             },
             else => return error.TestUnexpectedResult,

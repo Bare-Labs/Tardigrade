@@ -34,6 +34,11 @@ pub const EventStreamType = enum {
 
 pub const EventInitiator = enum { local, remote };
 
+pub const EventSetting = struct {
+    id_value: u64,
+    value: u64,
+};
+
 pub const EventFrame = union(enum) {
     data: struct {
         raw_length: usize,
@@ -43,7 +48,7 @@ pub const EventFrame = union(enum) {
         raw_length: usize,
     },
     settings: struct {
-        settings: frame.Settings,
+        entries: []const EventSetting,
         raw_length: usize,
     },
     goaway: struct {
@@ -74,6 +79,10 @@ pub const EventFrame = union(enum) {
         push_id: u64,
         raw_length: usize,
     },
+    unknown: struct {
+        frame_type_value: u64,
+        raw_length: usize,
+    },
 };
 
 pub const Event = union(enum) {
@@ -102,6 +111,10 @@ pub const Event = union(enum) {
 
 /// Diagnostics hook for H3/qlog. Must not block or feed errors back into
 /// protocol state; sinks retain failures out-of-band.
+///
+/// All slices inside `event` are borrowed and valid only for the synchronous
+/// callback. Implementations must serialize or deep-copy before returning and
+/// must not retain/enqueue `event` itself.
 pub const EventSink = struct {
     context: ?*anyopaque = null,
     emitFn: ?*const fn (?*anyopaque, Event) void = null,
@@ -351,11 +364,12 @@ pub fn Conn(comptime Transport: type) type {
             len += (try frame.encodeStreamType(.control, bytes[len..])).len;
             var settings_payload: [64]u8 = undefined;
             var settings_entries: [5]frame.Setting = undefined;
-            const settings = try encodeLocalSettings(self.local_settings, &settings_entries, &settings_payload);
-            const settings_frame = try frame.encodeKnownFrame(.settings, settings, bytes[len..]);
+            var event_settings: [5]EventSetting = undefined;
+            const settings = try encodeLocalSettings(self.local_settings, &settings_entries, &event_settings, &settings_payload);
+            const settings_frame = try frame.encodeKnownFrame(.settings, settings.payload, bytes[len..]);
             len += settings_frame.len;
             self.events.emit(.{ .stream_type_set = .{ .stream_id = control, .stream_type = .control } });
-            self.events.emit(.{ .frame_created = .{ .stream_id = control, .frame = .{ .settings = .{ .settings = self.local_settings, .raw_length = settings_frame.len } } } });
+            self.events.emit(.{ .frame_created = .{ .stream_id = control, .frame = .{ .settings = .{ .entries = settings.entries, .raw_length = settings_frame.len } } } });
             _ = try transport.writeStream(control, bytes[0..len], false);
             self.control_out = control;
             self.events.emit(.{ .parameters_set = .{ .initiator = .local, .settings = self.local_settings } });
@@ -373,29 +387,35 @@ pub fn Conn(comptime Transport: type) type {
             }) catch return error.ProtocolError;
         }
 
-        fn encodeLocalSettings(settings: frame.Settings, entries: *[5]frame.Setting, out: []u8) ![]u8 {
+        fn encodeLocalSettings(settings: frame.Settings, entries: *[5]frame.Setting, event_entries: *[5]EventSetting, out: []u8) !struct { payload: []u8, entries: []const EventSetting } {
             var count: usize = 0;
             if (settings.qpack_max_table_capacity != 0) {
                 entries[count] = .{ .id = .qpack_max_table_capacity, .id_value = 0x01, .value = settings.qpack_max_table_capacity };
+                event_entries[count] = .{ .id_value = entries[count].id_value, .value = entries[count].value };
                 count += 1;
             }
             if (settings.max_field_section_size) |max| {
                 entries[count] = .{ .id = .max_field_section_size, .id_value = 0x06, .value = max };
+                event_entries[count] = .{ .id_value = entries[count].id_value, .value = entries[count].value };
                 count += 1;
             }
             if (settings.qpack_blocked_streams != 0) {
                 entries[count] = .{ .id = .qpack_blocked_streams, .id_value = 0x07, .value = settings.qpack_blocked_streams };
+                event_entries[count] = .{ .id_value = entries[count].id_value, .value = entries[count].value };
                 count += 1;
             }
             if (settings.enable_connect_protocol) {
                 entries[count] = .{ .id = .enable_connect_protocol, .id_value = 0x08, .value = 1 };
+                event_entries[count] = .{ .id_value = entries[count].id_value, .value = entries[count].value };
                 count += 1;
             }
             if (settings.h3_datagram) {
                 entries[count] = .{ .id = .h3_datagram, .id_value = 0x33, .value = 1 };
+                event_entries[count] = .{ .id_value = entries[count].id_value, .value = entries[count].value };
                 count += 1;
             }
-            return frame.encodeSettings(entries[0..count], out);
+            const payload = try frame.encodeSettings(entries[0..count], out);
+            return .{ .payload = payload, .entries = event_entries[0..count] };
         }
 
         /// Drain newly accepted and readable peer streams. Call after every
@@ -549,9 +569,8 @@ pub fn Conn(comptime Transport: type) type {
         fn ingestControlFrame(self: *Self, transport: *Transport, raw: frame.RawFrame) H3Error!void {
             const had_settings = self.peer_control_view.saw_settings;
             if (self.peer_control) |control| {
-                if (eventFrameFromRaw(raw)) |event_frame| {
-                    self.events.emit(.{ .frame_parsed = .{ .stream_id = control, .frame = event_frame } });
-                }
+                var settings_scratch: [32]EventSetting = undefined;
+                self.events.emit(.{ .frame_parsed = .{ .stream_id = control, .frame = eventFrameFromRaw(raw, &settings_scratch) } });
             }
             switch (raw.typ) {
                 .priority_update_request, .priority_update_push => {
@@ -633,7 +652,8 @@ pub fn Conn(comptime Transport: type) type {
                     } } } });
                     return;
                 }
-                self.conn.events.emit(.{ .frame_parsed = .{ .stream_id = self.stream_id, .frame = eventFrameFromRaw(raw) orelse .{ .data = .{ .raw_length = raw.len } } } });
+                var settings_scratch: [32]EventSetting = undefined;
+                self.conn.events.emit(.{ .frame_parsed = .{ .stream_id = self.stream_id, .frame = eventFrameFromRaw(raw, &settings_scratch) } });
             }
         };
 
@@ -815,10 +835,13 @@ pub fn Conn(comptime Transport: type) type {
                 const raw = frame.decodeFrameWithLimit(response.buffer.items[offset..], max_response_len) catch return error.ProtocolError;
                 switch (raw.typ) {
                     .headers => {
-                        if (status != null) return error.ProtocolError;
                         var scratch: []u8 = &response.scratch;
-                        field_count = qpack.decode(raw.payload, &response.fields, scratch[0..]) catch return error.ProtocolError;
+                        field_count = qpack.decode(raw.payload, &response.fields, scratch[0..]) catch {
+                            self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .headers = .{ .raw_length = raw.len } } } });
+                            return error.ProtocolError;
+                        };
                         self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .headers = .{ .fields = response.fields[0..field_count], .raw_length = raw.len } } } });
+                        if (status != null) return error.ProtocolError;
                         if (field_count == 0) return error.ProtocolError;
                         if (!std.mem.eql(u8, response.fields[0].name, ":status")) return error.ProtocolError;
                         status = std.fmt.parseInt(u16, response.fields[0].value, 10) catch return error.ProtocolError;
@@ -841,12 +864,14 @@ pub fn Conn(comptime Transport: type) type {
                         body_len += raw.payload.len;
                     },
                     .priority_update_request, .priority_update_push => {
-                        if (eventFrameFromRaw(raw)) |event_frame| {
-                            self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = event_frame } });
-                        }
+                        var settings_scratch: [32]EventSetting = undefined;
+                        self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = eventFrameFromRaw(raw, &settings_scratch) } });
                         return self.fail(.frame_unexpected);
                     },
-                    else => {}, // unknown frames on request streams are ignored (RFC 9114 §9)
+                    else => {
+                        var settings_scratch: [32]EventSetting = undefined;
+                        self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = eventFrameFromRaw(raw, &settings_scratch) } });
+                    },
                 }
                 offset += raw.len;
             }
@@ -1001,22 +1026,37 @@ fn containsPriorityUpdateFrame(bytes: []const u8) bool {
     return false;
 }
 
-fn eventFrameFromRaw(raw: frame.RawFrame) ?EventFrame {
+fn decodeEventSettings(payload: []const u8, scratch: []EventSetting) ?[]const EventSetting {
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (pos < payload.len) {
+        if (count >= scratch.len) return null;
+        const id = varint.decode(payload[pos..]) catch return null;
+        pos += id.len;
+        const value = varint.decode(payload[pos..]) catch return null;
+        pos += value.len;
+        scratch[count] = .{ .id_value = id.value, .value = value.value };
+        count += 1;
+    }
+    return scratch[0..count];
+}
+
+fn eventFrameFromRaw(raw: frame.RawFrame, settings_scratch: []EventSetting) EventFrame {
     return switch (raw.typ) {
         .data => .{ .data = .{ .raw_length = raw.len } },
         .headers => .{ .headers = .{ .raw_length = raw.len } },
         .settings => blk: {
-            var scratch: [8]frame.Setting = undefined;
-            const decoded = frame.decodeSettings(raw.payload, &scratch) catch return .{ .settings = .{ .settings = .{}, .raw_length = raw.len } };
-            break :blk .{ .settings = .{ .settings = decoded.parsed, .raw_length = raw.len } };
+            const entries = decodeEventSettings(raw.payload, settings_scratch) orelse return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
+            break :blk .{ .settings = .{ .entries = entries, .raw_length = raw.len } };
         },
         .goaway => blk: {
-            const decoded = varint.decode(raw.payload) catch return .{ .goaway = .{ .id = 0, .raw_length = raw.len } };
+            const decoded = varint.decode(raw.payload) catch return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
+            if (decoded.len != raw.payload.len) return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
             break :blk .{ .goaway = .{ .id = decoded.value, .raw_length = raw.len } };
         },
         .priority_update_request, .priority_update_push => blk: {
-            const decoded = priority.decodePayload(raw.payload) catch return null;
-            const kind = priority.kindFromFrameType(raw.typ) orelse return null;
+            const decoded = priority.decodePayload(raw.payload) catch return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
+            const kind = priority.kindFromFrameType(raw.typ) orelse return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
             break :blk switch (kind) {
                 .request => .{ .priority_update = .{ .request = .{
                     .stream_id = decoded.element_id,
@@ -1030,19 +1070,18 @@ fn eventFrameFromRaw(raw: frame.RawFrame) ?EventFrame {
                 } } },
             };
         },
-        .push_promise => blk: {
-            const decoded = varint.decode(raw.payload) catch return .{ .push_promise = .{ .push_id = 0, .raw_length = raw.len } };
-            break :blk .{ .push_promise = .{ .push_id = decoded.value, .raw_length = raw.len } };
-        },
+        .push_promise => .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } },
         .cancel_push => blk: {
-            const decoded = varint.decode(raw.payload) catch return .{ .cancel_push = .{ .push_id = 0, .raw_length = raw.len } };
+            const decoded = varint.decode(raw.payload) catch return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
+            if (decoded.len != raw.payload.len) return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
             break :blk .{ .cancel_push = .{ .push_id = decoded.value, .raw_length = raw.len } };
         },
         .max_push_id => blk: {
-            const decoded = varint.decode(raw.payload) catch return .{ .max_push_id = .{ .push_id = 0, .raw_length = raw.len } };
+            const decoded = varint.decode(raw.payload) catch return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
+            if (decoded.len != raw.payload.len) return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
             break :blk .{ .max_push_id = .{ .push_id = decoded.value, .raw_length = raw.len } };
         },
-        .unknown => null,
+        .unknown => .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } },
     };
 }
 
@@ -1174,6 +1213,7 @@ const EventRecorder = struct {
     events: std.ArrayList(Event) = .empty,
 
     fn deinit(self: *EventRecorder, allocator: std.mem.Allocator) void {
+        for (self.events.items) |*event| freeEvent(allocator, event.*);
         self.events.deinit(allocator);
     }
 
@@ -1183,7 +1223,79 @@ const EventRecorder = struct {
 
     fn emit(ctx: ?*anyopaque, event: Event) void {
         const self: *EventRecorder = @ptrCast(@alignCast(ctx.?));
-        self.events.append(testing.allocator, event) catch unreachable;
+        self.events.append(testing.allocator, cloneEvent(testing.allocator, event) catch unreachable) catch unreachable;
+    }
+
+    fn cloneFields(allocator: std.mem.Allocator, fields: []const qpack.HeaderField) ![]const qpack.HeaderField {
+        const copy = try allocator.alloc(qpack.HeaderField, fields.len);
+        errdefer allocator.free(copy);
+        for (fields, 0..) |field, i| {
+            const name = try allocator.dupe(u8, field.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, field.value);
+            errdefer allocator.free(value);
+            copy[i] = .{ .name = name, .value = value };
+        }
+        return copy;
+    }
+
+    fn freeFields(allocator: std.mem.Allocator, fields: []const qpack.HeaderField) void {
+        for (fields) |field| {
+            allocator.free(field.name);
+            allocator.free(field.value);
+        }
+        allocator.free(fields);
+    }
+
+    fn cloneFrame(allocator: std.mem.Allocator, event_frame: EventFrame) !EventFrame {
+        return switch (event_frame) {
+            .headers => |h| .{ .headers = .{ .fields = try cloneFields(allocator, h.fields), .raw_length = h.raw_length } },
+            .settings => |s| blk: {
+                const entries = try allocator.dupe(EventSetting, s.entries);
+                break :blk .{ .settings = .{ .entries = entries, .raw_length = s.raw_length } };
+            },
+            .priority_update => |update| .{ .priority_update = switch (update) {
+                .request => |r| .{ .request = .{
+                    .stream_id = r.stream_id,
+                    .field_value = try allocator.dupe(u8, r.field_value),
+                    .raw_length = r.raw_length,
+                } },
+                .push => |p| .{ .push = .{
+                    .push_id = p.push_id,
+                    .field_value = try allocator.dupe(u8, p.field_value),
+                    .raw_length = p.raw_length,
+                } },
+            } },
+            else => event_frame,
+        };
+    }
+
+    fn freeFrame(allocator: std.mem.Allocator, event_frame: EventFrame) void {
+        switch (event_frame) {
+            .headers => |h| freeFields(allocator, h.fields),
+            .settings => |s| allocator.free(s.entries),
+            .priority_update => |update| switch (update) {
+                .request => |r| allocator.free(r.field_value),
+                .push => |p| allocator.free(p.field_value),
+            },
+            else => {},
+        }
+    }
+
+    fn cloneEvent(allocator: std.mem.Allocator, event: Event) !Event {
+        return switch (event) {
+            .frame_created => |f| .{ .frame_created = .{ .stream_id = f.stream_id, .frame = try cloneFrame(allocator, f.frame) } },
+            .frame_parsed => |f| .{ .frame_parsed = .{ .stream_id = f.stream_id, .frame = try cloneFrame(allocator, f.frame) } },
+            else => event,
+        };
+    }
+
+    fn freeEvent(allocator: std.mem.Allocator, event: Event) void {
+        switch (event) {
+            .frame_created => |f| freeFrame(allocator, f.frame),
+            .frame_parsed => |f| freeFrame(allocator, f.frame),
+            else => {},
+        }
     }
 
     fn eventFrameType(event_frame: EventFrame) frame.FrameType {
@@ -1199,6 +1311,7 @@ const EventRecorder = struct {
             .push_promise => .push_promise,
             .cancel_push => .cancel_push,
             .max_push_id => .max_push_id,
+            .unknown => .unknown,
         };
     }
 
@@ -1215,6 +1328,7 @@ const EventRecorder = struct {
             .push_promise => |f| f.raw_length,
             .cancel_push => |f| f.raw_length,
             .max_push_id => |f| f.raw_length,
+            .unknown => |f| f.raw_length,
         };
     }
 
@@ -1256,6 +1370,55 @@ const EventRecorder = struct {
         for (self.events.items) |event| switch (event) {
             .frame_parsed => |parsed| switch (parsed.frame) {
                 .goaway => |g| if (g.id == id) return true,
+                else => {},
+            },
+            else => {},
+        };
+        return false;
+    }
+
+    fn sawSettingsEntry(self: *const EventRecorder, id_value: u64, value: u64) bool {
+        for (self.events.items) |event| switch (event) {
+            .frame_created => |parsed| switch (parsed.frame) {
+                .settings => |settings| for (settings.entries) |entry| {
+                    if (entry.id_value == id_value and entry.value == value) return true;
+                },
+                else => {},
+            },
+            .frame_parsed => |parsed| switch (parsed.frame) {
+                .settings => |settings| for (settings.entries) |entry| {
+                    if (entry.id_value == id_value and entry.value == value) return true;
+                },
+                else => {},
+            },
+            else => {},
+        };
+        return false;
+    }
+
+    fn sawSettingsEntryCountAtLeast(self: *const EventRecorder, min_count: usize) bool {
+        for (self.events.items) |event| switch (event) {
+            .frame_created => |parsed| switch (parsed.frame) {
+                .settings => |settings| if (settings.entries.len >= min_count) return true,
+                else => {},
+            },
+            .frame_parsed => |parsed| switch (parsed.frame) {
+                .settings => |settings| if (settings.entries.len >= min_count) return true,
+                else => {},
+            },
+            else => {},
+        };
+        return false;
+    }
+
+    fn sawUnknownFrame(self: *const EventRecorder, frame_type_value: u64) bool {
+        for (self.events.items) |event| switch (event) {
+            .frame_created => |parsed| switch (parsed.frame) {
+                .unknown => |unknown| if (unknown.frame_type_value == frame_type_value) return true,
+                else => {},
+            },
+            .frame_parsed => |parsed| switch (parsed.frame) {
+                .unknown => |unknown| if (unknown.frame_type_value == frame_type_value) return true,
                 else => {},
             },
             else => {},
@@ -1314,6 +1477,88 @@ test "H3 conn: SETTINGS exchange and request/response over a mock transport" {
     try testing.expectEqualStrings("pong", response.body);
     try testing.expectEqualStrings("server", response.headers[0].name);
     client.releaseResponse(id);
+}
+
+test "H3 conn: client observes response HEADERS before QPACK failure" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var client_events = EventRecorder{};
+    defer client_events.deinit(allocator);
+    client.setEventSink(client_events.sink());
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/bad-qpack" });
+    var wire: [64]u8 = undefined;
+    const headers = try frame.encodeKnownFrame(.headers, &.{ 0x00, 0x00, 0x80 }, &wire);
+    _ = try server_transport.writeStream(id, headers, true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expect(client_events.sawFrame(.parsed, .headers));
+}
+
+test "H3 conn: client observes duplicate response HEADERS before rejection" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var client_events = EventRecorder{};
+    defer client_events.deinit(allocator);
+    client.setEventSink(client_events.sink());
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/duplicate-headers" });
+    var wire: [512]u8 = undefined;
+    var len: usize = 0;
+    const first = try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..]);
+    len += first.len;
+    const second = try session.ResponseEncoder.encodeHeaders(200, &.{}, wire[len..]);
+    len += second.len;
+    _ = try server_transport.writeStream(id, wire[0..len], true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expect(client_events.sawFrame(.parsed, .headers));
+}
+
+test "H3 conn: client observes response DATA before missing-headers rejection" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var client_events = EventRecorder{};
+    defer client_events.deinit(allocator);
+    client.setEventSink(client_events.sink());
+
+    const id = try client.sendRequest(&client_transport, .{ .authority = "tardigrade.test", .path = "/data-first" });
+    var wire: [64]u8 = undefined;
+    const data = try frame.encodeKnownFrame(.data, "body", &wire);
+    _ = try server_transport.writeStream(id, data, true);
+    try client.pump(&client_transport);
+
+    try testing.expectError(error.ProtocolError, client.pollResponse(id));
+    try testing.expect(client_events.sawFrame(.parsed, .data));
 }
 
 test "H3 conn: event sink observes settings stream frames and priority updates" {
@@ -1407,6 +1652,103 @@ test "H3 conn: control frame observer reports GOAWAY before semantic rejection" 
 
     try testing.expectError(error.ProtocolError, client.pump(&client_transport));
     try testing.expect(client_events.sawGoawayParsed(1));
+}
+
+test "H3 conn: SETTINGS frame events preserve wire entries before semantic policy" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var client_events = EventRecorder{};
+    defer client_events.deinit(allocator);
+    client.setEventSink(client_events.sink());
+
+    const control = try server_transport.openStream(.uni);
+    var settings_entries: [10]frame.Setting = undefined;
+    settings_entries[0] = .{ .id = .qpack_blocked_streams, .id_value = 0x07, .value = 0 };
+    settings_entries[1] = .{ .id = .enable_connect_protocol, .id_value = 0x08, .value = 0 };
+    inline for (0..8) |i| {
+        settings_entries[i + 2] = .{ .id = .unknown, .id_value = 0x21 + i, .value = i };
+    }
+    var payload: [128]u8 = undefined;
+    const settings_payload = try frame.encodeSettings(&settings_entries, &payload);
+    var wire: [160]u8 = undefined;
+    var len: usize = 0;
+    len += (try frame.encodeStreamType(.control, wire[len..])).len;
+    len += (try frame.encodeKnownFrame(.settings, settings_payload, wire[len..])).len;
+    _ = try server_transport.writeStream(control, wire[0..len], false);
+
+    try client.pump(&client_transport);
+    try testing.expect(client_events.sawSettingsEntry(0x07, 0));
+    try testing.expect(client_events.sawSettingsEntry(0x08, 0));
+    try testing.expect(client_events.sawSettingsEntry(0x21, 0));
+    try testing.expect(client_events.sawSettingsEntryCountAtLeast(10));
+}
+
+test "H3 conn: rejected SETTINGS frame remains observable" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var client_events = EventRecorder{};
+    defer client_events.deinit(allocator);
+    client.setEventSink(client_events.sink());
+
+    const control = try server_transport.openStream(.uni);
+    var payload: [32]u8 = undefined;
+    const settings_payload = try frame.encodeSettings(&.{
+        .{ .id = .unknown, .id_value = 0x02, .value = 1 },
+        .{ .id = .qpack_blocked_streams, .id_value = 0x07, .value = 0 },
+    }, &payload);
+    var wire: [64]u8 = undefined;
+    var len: usize = 0;
+    len += (try frame.encodeStreamType(.control, wire[len..])).len;
+    len += (try frame.encodeKnownFrame(.settings, settings_payload, wire[len..])).len;
+    _ = try server_transport.writeStream(control, wire[0..len], false);
+
+    try testing.expectError(error.ProtocolError, client.pump(&client_transport));
+    try testing.expect(client_events.sawSettingsEntry(0x02, 1));
+    try testing.expect(client_events.sawSettingsEntry(0x07, 0));
+}
+
+test "H3 conn: unknown request frame is observed as unknown" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+    var server_events = EventRecorder{};
+    defer server_events.deinit(allocator);
+    server.setEventSink(server_events.sink());
+
+    const id = try client_transport.openStream(.bidi);
+    var wire: [32]u8 = undefined;
+    const unknown = try frame.encodeFrame(0x21, "", &wire);
+    _ = try client_transport.writeStream(id, unknown, false);
+
+    try server.pump(&server_transport);
+    try testing.expect(server_events.sawUnknownFrame(0x21));
+    try testing.expect(!server_events.sawFrame(.parsed, .data));
 }
 
 test "H3 conn: frame_created is emitted when encoded request write fails" {

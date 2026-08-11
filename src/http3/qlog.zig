@@ -13,7 +13,6 @@
 //! `qpack_state_updated` is emitted as a documented `tardigrade:*` extension.
 
 const std = @import("std");
-const http3_frame = @import("frame.zig");
 const qpack = @import("qpack.zig");
 
 /// qlog application-vantage namespaces owned by HTTP/3.
@@ -36,6 +35,7 @@ pub const FrameType = enum {
     push_promise,
     cancel_push,
     max_push_id,
+    unknown,
 
     pub fn label(self: FrameType) []const u8 {
         return @tagName(self);
@@ -66,11 +66,18 @@ pub const SettingName = enum {
     settings_qpack_blocked_streams,
     settings_enable_connect_protocol,
     settings_h3_datagram,
+    reserved,
+    unknown,
 };
 
 pub const HttpPriority = struct {
     urgency: u3,
     incremental: bool,
+};
+
+pub const QlogSetting = struct {
+    id_value: u64,
+    value: u64,
 };
 
 pub const Frame = union(enum) {
@@ -82,7 +89,7 @@ pub const Frame = union(enum) {
         raw_length: ?usize = null,
     },
     settings: struct {
-        settings: ?http3_frame.Settings = null,
+        settings: []const QlogSetting = &.{},
         raw_length: ?usize = null,
     },
     goaway: struct {
@@ -92,12 +99,12 @@ pub const Frame = union(enum) {
     priority_update: union(enum) {
         request: struct {
             stream_id: u64,
-            priority_field_value: []const u8,
+            priority_field_value: []const u8 = "",
             raw_length: ?usize = null,
         },
         push: struct {
             push_id: u64,
-            priority_field_value: []const u8,
+            priority_field_value: []const u8 = "",
             raw_length: ?usize = null,
         },
     },
@@ -114,6 +121,10 @@ pub const Frame = union(enum) {
         push_id: u64,
         raw_length: ?usize = null,
     },
+    unknown: struct {
+        frame_type_bytes: u64,
+        raw_length: ?usize = null,
+    },
 
     pub fn frameType(self: Frame) FrameType {
         return switch (self) {
@@ -125,6 +136,7 @@ pub const Frame = union(enum) {
             .push_promise => .push_promise,
             .cancel_push => .cancel_push,
             .max_push_id => .max_push_id,
+            .unknown => .unknown,
         };
     }
 };
@@ -136,6 +148,8 @@ pub const Event = union(enum) {
         max_field_section_size: ?u64 = null,
         max_table_capacity: ?u64 = null,
         blocked_streams_count: ?u64 = null,
+        extended_connect: ?bool = null,
+        h3_datagram: ?bool = null,
     },
     /// http3:stream_type_set
     stream_type_set: struct {
@@ -192,6 +206,10 @@ pub const Record = struct {
 /// `emit_fn` returns `void`, so a concrete file sink cannot propagate write
 /// errors here. Same contract as the transport sink: retain the first error
 /// and/or count dropped records out-of-band so a truncated trace is detectable.
+///
+/// All slices inside `record` are borrowed and valid only for the synchronous
+/// callback. Implementations must serialize or deep-copy before returning and
+/// must not retain/enqueue `record` itself.
 pub const Sink = struct {
     context: ?*anyopaque = null,
     emit_fn: ?*const fn (?*anyopaque, Record) void = null,
@@ -208,6 +226,11 @@ pub const Sink = struct {
 /// JSON-SEQ record separator (RFC 7464), identical framing to the transport
 /// side so both streams concatenate into one valid qlog JSON-SEQ file.
 pub const record_separator: u8 = 0x1e;
+
+/// Recommended per-record buffer for composition-root sinks. H3 HEADERS and
+/// PUSH_PROMISE records grow with decoded field sections and byte escaping, so
+/// small fixed buffers can legitimately return `NoSpaceLeft`.
+pub const max_serialized_record_len: usize = 64 * 1024;
 
 const Buf = struct {
     buf: []u8,
@@ -268,8 +291,36 @@ fn writeJsonString(b: *Buf, value: []const u8) error{NoSpaceLeft}!void {
     try b.add("\"", .{});
 }
 
-fn writeTextOrBytes(b: *Buf, text_key: []const u8, bytes_key: []const u8, value: []const u8) error{NoSpaceLeft}!void {
-    if (std.unicode.utf8ValidateSlice(value)) {
+fn isHttpFieldNameText(value: []const u8) bool {
+    if (value.len == 0) return false;
+    const start: usize = if (value[0] == ':') 1 else 0;
+    if (start == value.len) return false;
+    for (value[start..]) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn isHttpFieldValueText(value: []const u8) bool {
+    for (value) |byte| switch (byte) {
+        '\t', 0x20...0x7e => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn isPriorityFieldValueText(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| switch (byte) {
+        0x20...0x7e => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn writeTextOrBytes(b: *Buf, text_key: []const u8, bytes_key: []const u8, value: []const u8, is_text: bool) error{NoSpaceLeft}!void {
+    if (is_text) {
         try b.add("\"{s}\":", .{text_key});
         try writeJsonString(b, value);
     } else {
@@ -283,31 +334,46 @@ fn writeHeaders(b: *Buf, headers: []const HttpField) error{NoSpaceLeft}!void {
     for (headers, 0..) |field, i| {
         if (i != 0) try b.add(",", .{});
         try b.add("{{", .{});
-        try writeTextOrBytes(b, "name", "name_bytes", field.name);
+        try writeTextOrBytes(b, "name", "name_bytes", field.name, isHttpFieldNameText(field.name));
         try b.add(",", .{});
-        try writeTextOrBytes(b, "value", "value_bytes", field.value);
+        try writeTextOrBytes(b, "value", "value_bytes", field.value, isHttpFieldValueText(field.value));
         try b.add("}}", .{});
     }
     try b.add("]", .{});
 }
 
-fn writeSetting(b: *Buf, name: SettingName, value: u64, first: *bool) error{NoSpaceLeft}!void {
-    if (!first.*) try b.add(",", .{});
-    first.* = false;
-    try b.add("{{\"name\":\"{s}\",\"value\":{d}}}", .{ @tagName(name), value });
+fn settingNameFromId(id_value: u64) struct { name: SettingName, name_bytes: ?u64 = null } {
+    return switch (id_value) {
+        0x01 => .{ .name = .settings_qpack_max_table_capacity },
+        0x06 => .{ .name = .settings_max_field_section_size },
+        0x07 => .{ .name = .settings_qpack_blocked_streams },
+        0x08 => .{ .name = .settings_enable_connect_protocol },
+        0x33 => .{ .name = .settings_h3_datagram },
+        0x00, 0x02, 0x03, 0x04, 0x05 => .{ .name = .reserved, .name_bytes = id_value },
+        else => .{ .name = .unknown, .name_bytes = id_value },
+    };
 }
 
-fn writeSettings(b: *Buf, settings: ?http3_frame.Settings) error{NoSpaceLeft}!void {
+fn writeSettings(b: *Buf, settings: []const QlogSetting) error{NoSpaceLeft}!void {
     try b.add("\"settings\":[", .{});
-    if (settings) |s| {
-        var first = true;
-        if (s.qpack_max_table_capacity != 0) try writeSetting(b, .settings_qpack_max_table_capacity, s.qpack_max_table_capacity, &first);
-        if (s.max_field_section_size) |max| try writeSetting(b, .settings_max_field_section_size, max, &first);
-        if (s.qpack_blocked_streams != 0) try writeSetting(b, .settings_qpack_blocked_streams, s.qpack_blocked_streams, &first);
-        if (s.enable_connect_protocol) try writeSetting(b, .settings_enable_connect_protocol, 1, &first);
-        if (s.h3_datagram) try writeSetting(b, .settings_h3_datagram, 1, &first);
+    for (settings, 0..) |setting, i| {
+        if (i != 0) try b.add(",", .{});
+        const mapped = settingNameFromId(setting.id_value);
+        try b.add("{{\"name\":\"{s}\"", .{@tagName(mapped.name)});
+        if (mapped.name_bytes) |name_bytes| try b.add(",\"name_bytes\":{d}", .{name_bytes});
+        try b.add(",\"value\":{d}}}", .{setting.value});
     }
     try b.add("]", .{});
+}
+
+fn writePriorityFieldValue(b: *Buf, value: []const u8) error{NoSpaceLeft}!void {
+    if (isPriorityFieldValueText(value)) {
+        try b.add(",\"priority_field_value\":", .{});
+        try writeJsonString(b, value);
+    } else {
+        try b.add(",\"priority_field_value_bytes\":", .{});
+        try writeHexBytes(b, value);
+    }
 }
 
 fn writeFrame(b: *Buf, frame: Frame) error{NoSpaceLeft}!void {
@@ -332,13 +398,13 @@ fn writeFrame(b: *Buf, frame: Frame) error{NoSpaceLeft}!void {
         .priority_update => |d| {
             switch (d) {
                 .request => |r| {
-                    try b.add(",\"stream_id\":{d},\"priority_field_value\":", .{r.stream_id});
-                    try writeJsonString(b, r.priority_field_value);
+                    try b.add(",\"stream_id\":{d}", .{r.stream_id});
+                    try writePriorityFieldValue(b, r.priority_field_value);
                     try writeRawLength(b, r.raw_length, &need_comma);
                 },
                 .push => |p| {
-                    try b.add(",\"push_id\":{d},\"priority_field_value\":", .{p.push_id});
-                    try writeJsonString(b, p.priority_field_value);
+                    try b.add(",\"push_id\":{d}", .{p.push_id});
+                    try writePriorityFieldValue(b, p.priority_field_value);
                     try writeRawLength(b, p.raw_length, &need_comma);
                 },
             }
@@ -354,6 +420,10 @@ fn writeFrame(b: *Buf, frame: Frame) error{NoSpaceLeft}!void {
         },
         .max_push_id => |d| {
             try b.add(",\"push_id\":{d}", .{d.push_id});
+            try writeRawLength(b, d.raw_length, &need_comma);
+        },
+        .unknown => |d| {
+            try b.add(",\"frame_type_bytes\":{d}", .{d.frame_type_bytes});
             try writeRawLength(b, d.raw_length, &need_comma);
         },
     }
@@ -382,6 +452,16 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
             if (d.blocked_streams_count) |v| {
                 if (need_comma) try b.add(",", .{});
                 try b.add("\"blocked_streams_count\":{d}", .{v});
+                need_comma = true;
+            }
+            if (d.extended_connect) |v| {
+                if (need_comma) try b.add(",", .{});
+                try b.add("\"extended_connect\":{s}", .{if (v) "true" else "false"});
+                need_comma = true;
+            }
+            if (d.h3_datagram) |v| {
+                if (need_comma) try b.add(",", .{});
+                try b.add("\"h3_datagram\":{s}", .{if (v) "true" else "false"});
             }
             try b.add("}}", .{});
         },
@@ -407,7 +487,10 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
 }
 
 /// Serialize one `Record` into `out` as a single qlog JSON-SEQ line. Same shape
-/// as `quic.qlog.writeJson` so a merged trace is uniform.
+/// as `quic.qlog.writeJson` so a merged trace is uniform. H3 HEADERS and
+/// PUSH_PROMISE records can grow with decoded field slices; callers should use
+/// `max_serialized_record_len` or retain `NoSpaceLeft` as a dropped-record
+/// diagnostic.
 pub fn writeJson(record: Record, out: []u8) error{NoSpaceLeft}![]const u8 {
     var b = Buf{ .buf = out };
     try b.add("{c}", .{record_separator});
@@ -472,11 +555,11 @@ test "stream_type_set and representative frames use http3 names" {
         "\"name\":\"http3:stream_type_set\"",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = .{ .qpack_blocked_streams = 16 } } } } } },
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .id_value = 0x07, .value = 16 }} } } } } },
         "\"frame_type\":\"settings\"",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = .{ .qpack_blocked_streams = 16, .max_field_section_size = 4096 } } } } } },
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{ .{ .id_value = 0x06, .value = 4096 }, .{ .id_value = 0x07, .value = 16 } } } } } } },
         "\"settings\":[{\"name\":\"settings_max_field_section_size\",\"value\":4096},{\"name\":\"settings_qpack_blocked_streams\",\"value\":16}]",
     );
     try expectJson(
@@ -491,11 +574,11 @@ test "stream_type_set and representative frames use http3 names" {
 
 test "frame JSON string fields are escaped and parseable" {
     const record = Record{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 4, .frame = .{ .headers = .{
-        .headers = &.{.{ .name = "x\"name", .value = "a\\b\n" }},
+        .headers = &.{.{ .name = "x-name", .value = "a\\b" }},
         .raw_length = 12,
     } } } } };
-    try expectJson(record, "\"name\":\"x\\\"name\"");
-    try expectJson(record, "\"value\":\"a\\\\b\\n\"");
+    try expectJson(record, "\"name\":\"x-name\"");
+    try expectJson(record, "\"value\":\"a\\\\b\"");
     try expectValidJson(record);
 }
 
@@ -507,6 +590,32 @@ test "header fields with non UTF-8 bytes use byte-oriented qlog fields" {
     try expectJson(record, "\"name\":\"x\"");
     try expectJson(record, "\"value_bytes\":\"ff0022\"");
     try expectValidJson(record);
+}
+
+test "HTTP-invalid field bytes use byte-oriented qlog fields" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 4, .frame = .{ .headers = .{
+        .headers = &.{.{ .name = "bad name", .value = "snowman \xe2\x98\x83" }},
+        .raw_length = 12,
+    } } } } };
+    try expectJson(record, "\"name_bytes\":\"626164206e616d65\"");
+    try expectJson(record, "\"value_bytes\":\"736e6f776d616e20e29883\"");
+    try expectValidJson(record);
+}
+
+test "settings frames preserve explicit zero reserved and unknown IDs" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 0, .frame = .{ .settings = .{
+        .settings = &.{
+            .{ .id_value = 0x07, .value = 0 },
+            .{ .id_value = 0x08, .value = 0 },
+            .{ .id_value = 0x21, .value = 99 },
+            .{ .id_value = 0x02, .value = 1 },
+        },
+        .raw_length = 12,
+    } } } } };
+    try expectJson(record, "{\"name\":\"settings_qpack_blocked_streams\",\"value\":0}");
+    try expectJson(record, "{\"name\":\"settings_enable_connect_protocol\",\"value\":0}");
+    try expectJson(record, "{\"name\":\"unknown\",\"name_bytes\":33,\"value\":99}");
+    try expectJson(record, "{\"name\":\"reserved\",\"name_bytes\":2,\"value\":1}");
 }
 
 test "priority_update frames emit typed targets and escaped values" {
@@ -525,6 +634,48 @@ test "priority_update frames emit typed targets and escaped values" {
     } } } } } };
     try expectJson(push, "\"push_id\":3,\"priority_field_value\":\"i\"");
     try expectValidJson(push);
+}
+
+test "priority_update invalid bytes use byte-oriented qlog field" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 0, .frame = .{ .priority_update = .{ .request = .{
+        .stream_id = 8,
+        .priority_field_value = &.{ 0xff, '\n' },
+        .raw_length = 9,
+    } } } } } };
+    try expectJson(record, "\"priority_field_value_bytes\":\"ff0a\"");
+    try expectValidJson(record);
+}
+
+test "unknown frame serializes with original frame type bytes" {
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 4, .frame = .{ .unknown = .{ .frame_type_bytes = 0x21, .raw_length = 2 } } } } },
+        "\"frame_type\":\"unknown\",\"frame_type_bytes\":33",
+    );
+}
+
+test "large header records require a caller-sized buffer" {
+    const headers = [_]HttpField{
+        .{ .name = "x-debug-0", .value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+        .{ .name = "x-debug-1", .value = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+        .{ .name = "x-debug-2", .value = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+        .{ .name = "x-debug-3", .value = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
+        .{ .name = "x-debug-4", .value = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+        .{ .name = "x-debug-5", .value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" },
+    };
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{
+        .direction = .parsed,
+        .stream_id = 4,
+        .frame = .{ .headers = .{ .headers = &headers, .raw_length = 512 } },
+    } } };
+
+    var too_small: [512]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, writeJson(record, &too_small));
+
+    var enough: [max_serialized_record_len]u8 = undefined;
+    const line = try writeJson(record, &enough);
+    try testing.expect(line.len > 512);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line[1 .. line.len - 1], .{});
+    defer parsed.deinit();
 }
 
 test "default sink is a no-op" {
