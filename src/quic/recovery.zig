@@ -12,12 +12,10 @@ const std = @import("std");
 
 pub const max_ack_ranges = 32;
 pub const max_tracked_packets = 128;
-/// Tracker slots held back from ordinary STREAM/CRYPTO traffic for packets
-/// recovery cannot defer: PTO probes (RFC 9002 §6.2.4 requires at least one
-/// ack-eliciting probe) and packets that become in-flight only through
-/// mandatory PADDING. Ordinary traffic backpressures at
-/// `max_tracked_packets - reserved_tracked_packets` so the reserve is still
-/// there when recovery needs it (#256-A review).
+/// Fixed-array slots held back from ordinary STREAM/CRYPTO traffic so common
+/// PTO and mandatory-PADDING recovery stays allocation-free. This is a
+/// performance reserve, not a correctness bound: when the fixed tracker fills,
+/// required recovery packets spill into `PacketTracker.recovery_overflow`.
 pub const reserved_tracked_packets = 8;
 /// The sender's maximum datagram size at connection start (RFC 9000 §14's
 /// floor). RFC 9002 defines the NewReno windows in terms of the sender's
@@ -260,15 +258,57 @@ pub const LossResult = struct {
 };
 
 pub const PacketTracker = struct {
+    /// Fixed fast path. Ordinary traffic is bounded here and never consumes
+    /// allocator-backed overflow.
     packets: [max_tracked_packets]SentPacket = undefined,
     count: usize = 0,
+    /// Required recovery-only spill storage. PTO expiration is not evidence of
+    /// loss, so a full fixed tracker cannot be made available by pretending an
+    /// outstanding packet stopped being in flight. Instead, reserve overflow
+    /// before building the recovery packet and keep tracking both originals and
+    /// probes until normal ACK/loss/key-discard processing retires them.
+    recovery_overflow: std.ArrayList(SentPacket) = .empty,
     bytes_in_flight: usize = 0,
     largest_acked: [3]?u64 = .{ null, null, null },
 
+    pub fn deinit(self: *PacketTracker, allocator: std.mem.Allocator) void {
+        self.recovery_overflow.deinit(allocator);
+        self.recovery_overflow = .empty;
+    }
+
+    pub fn totalCount(self: *const PacketTracker) usize {
+        return self.count + self.recovery_overflow.items.len;
+    }
+
+    pub fn ensureRecoveryCapacity(self: *PacketTracker, allocator: std.mem.Allocator, additional: usize) !void {
+        const fixed_free = max_tracked_packets - self.count;
+        const overflow_needed = additional -| fixed_free;
+        if (overflow_needed > 0) {
+            try self.recovery_overflow.ensureUnusedCapacity(allocator, overflow_needed);
+        }
+    }
+
+    pub fn canTrackRecoveryPacket(self: *const PacketTracker) bool {
+        return self.count < max_tracked_packets or self.recovery_overflow.items.len < self.recovery_overflow.capacity;
+    }
+
+    /// Ordinary insert: fixed tracker only.
     pub fn onPacketSent(self: *PacketTracker, packet: SentPacket) error{TooManyTrackedPackets}!void {
         if (self.count == max_tracked_packets) return error.TooManyTrackedPackets;
         self.packets[self.count] = packet;
         self.count += 1;
+        if (packet.in_flight) self.bytes_in_flight += packet.size;
+    }
+
+    /// Required recovery insert after `ensureRecoveryCapacity` preflight.
+    pub fn onPacketSentAssumeRecoveryCapacity(self: *PacketTracker, packet: SentPacket) void {
+        if (self.count < max_tracked_packets) {
+            self.packets[self.count] = packet;
+            self.count += 1;
+        } else {
+            std.debug.assert(self.recovery_overflow.items.len < self.recovery_overflow.capacity);
+            self.recovery_overflow.appendAssumeCapacity(packet);
+        }
         if (packet.in_flight) self.bytes_in_flight += packet.size;
     }
 
@@ -285,76 +325,76 @@ pub const PacketTracker = struct {
                 .rtt_sample_us = if (packet.ack_eliciting) now_us - packet.time_sent_us else null,
             };
         }
+
+        var overflow_index: usize = 0;
+        while (overflow_index < self.recovery_overflow.items.len) : (overflow_index += 1) {
+            const packet = self.recovery_overflow.items[overflow_index];
+            if (packet.space != space or packet.packet_number != packet_number or packet.lost) continue;
+            if (packet.in_flight) self.bytes_in_flight -= packet.size;
+            self.noteLargestAcked(space, packet_number);
+            _ = self.recovery_overflow.orderedRemove(overflow_index);
+            return .{
+                .packet = packet,
+                .rtt_sample_us = if (packet.ack_eliciting) now_us - packet.time_sent_us else null,
+            };
+        }
         return null;
+    }
+
+    fn noteLost(result: *LossResult, packet: SentPacket, threshold_lost: bool, time_lost: bool) void {
+        if (threshold_lost) result.packet_threshold_losses += 1;
+        if (time_lost) result.time_threshold_losses += 1;
+        if (packet.in_flight) result.lost_bytes += packet.size;
+        if (result.largest_lost_time_sent_us == null or packet.time_sent_us > result.largest_lost_time_sent_us.?) {
+            result.largest_lost_time_sent_us = packet.time_sent_us;
+        }
     }
 
     pub fn detectLost(self: *PacketTracker, space: PacketNumberSpace, now_us: u64, rtt: RttEstimator) LossResult {
         const largest = self.largest_acked[spaceIndex(space)] orelse return .{};
         const time_threshold = rtt.lossDelay();
         var result = LossResult{};
+
         var index: usize = 0;
         while (index < self.count) {
-            var packet = self.packets[index];
+            const packet = self.packets[index];
             if (packet.space != space or packet.lost or packet.packet_number > largest) {
                 index += 1;
                 continue;
             }
-
             const threshold_lost = largest >= packet.packet_number + packet_threshold;
             const time_lost = now_us >= packet.time_sent_us and now_us - packet.time_sent_us >= time_threshold;
             if (!threshold_lost and !time_lost) {
                 index += 1;
                 continue;
             }
-
-            if (threshold_lost) result.packet_threshold_losses += 1;
-            if (time_lost) result.time_threshold_losses += 1;
-            if (packet.in_flight) {
-                result.lost_bytes += packet.size;
-                self.bytes_in_flight -= packet.size;
-            }
-            if (result.largest_lost_time_sent_us == null or packet.time_sent_us > result.largest_lost_time_sent_us.?) {
-                result.largest_lost_time_sent_us = packet.time_sent_us;
-            }
-            packet.lost = true;
-            self.packets[index] = packet;
+            noteLost(&result, packet, threshold_lost, time_lost);
+            if (packet.in_flight) self.bytes_in_flight -= packet.size;
             self.removeAt(index);
+        }
+
+        var overflow_index: usize = 0;
+        while (overflow_index < self.recovery_overflow.items.len) {
+            const packet = self.recovery_overflow.items[overflow_index];
+            if (packet.space != space or packet.lost or packet.packet_number > largest) {
+                overflow_index += 1;
+                continue;
+            }
+            const threshold_lost = largest >= packet.packet_number + packet_threshold;
+            const time_lost = now_us >= packet.time_sent_us and now_us - packet.time_sent_us >= time_threshold;
+            if (!threshold_lost and !time_lost) {
+                overflow_index += 1;
+                continue;
+            }
+            noteLost(&result, packet, threshold_lost, time_lost);
+            if (packet.in_flight) self.bytes_in_flight -= packet.size;
+            _ = self.recovery_overflow.orderedRemove(overflow_index);
         }
         return result;
     }
 
-    /// Retire the oldest tracked packet, preferring `space`, and return it.
-    /// Its bytes stop counting as in flight; the caller is responsible for
-    /// requeuing whatever it carried. Used only to free bookkeeping capacity
-    /// for traffic recovery cannot defer — see
-    /// `RecoveryController.retireOldestForRecovery`.
-    pub fn retireOldest(self: *PacketTracker, space: PacketNumberSpace) ?SentPacket {
-        var chosen: ?usize = null;
-        var index: usize = 0;
-        while (index < self.count) : (index += 1) {
-            const candidate = self.packets[index];
-            if (chosen) |best| {
-                const current = self.packets[best];
-                // Prefer `space`; within a space, the oldest packet number.
-                const better_space = candidate.space == space and current.space != space;
-                const same_tier = (candidate.space == space) == (current.space == space);
-                if (better_space or (same_tier and candidate.packet_number < current.packet_number)) {
-                    chosen = index;
-                }
-            } else {
-                chosen = index;
-            }
-        }
-        const idx = chosen orelse return null;
-        const packet = self.packets[idx];
-        if (packet.in_flight) self.bytes_in_flight -|= packet.size;
-        self.removeAt(idx);
-        return packet;
-    }
-
-    /// RFC 9002 §6.4: when a space's keys are discarded, its packets stop
-    /// counting toward bytes in flight and will never be acked or declared
-    /// lost. Returns the in-flight bytes removed.
+    /// RFC 9002 §6.4: discard both fixed and overflow entries for a packet
+    /// number space whose keys are gone.
     pub fn dropSpace(self: *PacketTracker, space: PacketNumberSpace) usize {
         var removed: usize = 0;
         var index: usize = 0;
@@ -370,7 +410,58 @@ pub const PacketTracker = struct {
             }
             self.removeAt(index);
         }
+
+        var overflow_index: usize = 0;
+        while (overflow_index < self.recovery_overflow.items.len) {
+            const packet = self.recovery_overflow.items[overflow_index];
+            if (packet.space != space) {
+                overflow_index += 1;
+                continue;
+            }
+            if (packet.in_flight) {
+                removed += packet.size;
+                self.bytes_in_flight -= packet.size;
+            }
+            _ = self.recovery_overflow.orderedRemove(overflow_index);
+        }
         return removed;
+    }
+
+    pub fn contains(self: *const PacketTracker, space: PacketNumberSpace, packet_number: u64) bool {
+        for (self.packets[0..self.count]) |packet| {
+            if (packet.space == space and packet.packet_number == packet_number) return true;
+        }
+        for (self.recovery_overflow.items) |packet| {
+            if (packet.space == space and packet.packet_number == packet_number) return true;
+        }
+        return false;
+    }
+
+    pub fn hasAckElicitingInFlight(self: *const PacketTracker, space: PacketNumberSpace) bool {
+        for (self.packets[0..self.count]) |packet| {
+            if (packet.space == space and packet.in_flight and packet.ack_eliciting) return true;
+        }
+        for (self.recovery_overflow.items) |packet| {
+            if (packet.space == space and packet.in_flight and packet.ack_eliciting) return true;
+        }
+        return false;
+    }
+
+    pub fn nextLossDeadline(self: *const PacketTracker, loss_delay: u64) ?u64 {
+        var deadline: ?u64 = null;
+        for (self.packets[0..self.count]) |packet| {
+            const largest = self.largest_acked[spaceIndex(packet.space)] orelse continue;
+            if (packet.lost or packet.packet_number > largest) continue;
+            const candidate = packet.time_sent_us + loss_delay;
+            deadline = if (deadline) |current| @min(current, candidate) else candidate;
+        }
+        for (self.recovery_overflow.items) |packet| {
+            const largest = self.largest_acked[spaceIndex(packet.space)] orelse continue;
+            if (packet.lost or packet.packet_number > largest) continue;
+            const candidate = packet.time_sent_us + loss_delay;
+            deadline = if (deadline) |current| @min(current, candidate) else candidate;
+        }
+        return deadline;
     }
 
     fn noteLargestAcked(self: *PacketTracker, space: PacketNumberSpace, packet_number: u64) void {
@@ -496,68 +587,27 @@ pub const RecoveryController = struct {
         return self.ack_ranges[spaceIndex(space)].toAckFrame(ack_delay_us);
     }
 
-    /// Whether the bounded tracker can take one more *ordinary* sent packet —
-    /// stopping short of the recovery reserve. Callers must preflight this
-    /// before dequeuing frames: an untracked in-flight packet escapes both
-    /// loss recovery and the congestion window, and because nothing can ever
-    /// remove its bytes again it permanently inflates `bytes_in_flight`
-    /// (#256-A review).
+    pub fn deinit(self: *RecoveryController, allocator: std.mem.Allocator) void {
+        self.tracker.deinit(allocator);
+    }
+
+    /// Ordinary traffic remains fixed/bounded and stops before the recovery
+    /// reserve. It never consumes allocator-backed recovery overflow.
     pub fn canTrackPacket(self: *const RecoveryController) bool {
-        return self.canTrackPacketWithPending(0);
+        return self.tracker.count + reserved_tracked_packets < max_tracked_packets;
     }
 
-    /// `canTrackPacket` as it will read once `pending` further packets from
-    /// the datagram currently being assembled have been tracked. Coalescing
-    /// has to plan against this, not against the current count: the earlier
-    /// packets in a datagram consume slots before the later ones are built.
-    pub fn canTrackPacketWithPending(self: *const RecoveryController, pending: usize) bool {
-        return self.tracker.count + pending + reserved_tracked_packets < max_tracked_packets;
+    pub fn ensureRecoveryPacketCapacity(self: *RecoveryController, allocator: std.mem.Allocator, additional: usize) !void {
+        try self.tracker.ensureRecoveryCapacity(allocator, additional);
     }
 
-    /// Whether the tracker can take one more packet drawn from the recovery
-    /// reserve. RFC 9002 §7.5 exempts a PTO probe from the congestion-window
-    /// admission gate but still counts it in flight, so a probe needs a slot
-    /// like anything else — when even the reserve is gone the probe waits
-    /// rather than being emitted untracked.
     pub fn canTrackRecoveryPacket(self: *const RecoveryController) bool {
-        return self.canTrackRecoveryPacketWithPending(0);
-    }
-
-    pub fn canTrackRecoveryPacketWithPending(self: *const RecoveryController, pending: usize) bool {
-        return self.tracker.count + pending < max_tracked_packets;
-    }
-
-    /// Record a sent packet whose tracker slot the caller already preflighted
-    /// with `canTrackPacket`/`canTrackRecoveryPacket`. Infallible by
-    /// construction: the send path has no safe way to handle a failure here
-    /// (the packet is already sealed and its frames already dequeued), so the
-    /// capacity check belongs before the frames are committed, and this
-    /// asserts that it happened.
-    /// Free one tracker slot so a PTO probe can be sent and tracked.
-    ///
-    /// RFC 9002 §6.2.4 requires an ack-eliciting probe on *every* PTO
-    /// expiration, and PTO expiration is not itself evidence of loss: during a
-    /// total-loss episode no ACK ever arrives, so neither ACK processing nor
-    /// threshold loss detection retires anything. A bounded tracker would then
-    /// run out — a fixed reserve only postpones that by however many probes it
-    /// holds — and probe transmission would stall until idle timeout. Retiring
-    /// the oldest outstanding packet keeps a slot available for every PTO for
-    /// the whole connection lifetime, whatever the negotiated idle timeout.
-    ///
-    /// The retired packet's bytes leave `bytes_in_flight` (leaving them would
-    /// reproduce the permanent-inflation bug this replaced), but no congestion
-    /// event is applied: running out of bookkeeping is not proof the packet was
-    /// lost. The caller must requeue whatever it carried, exactly as it would
-    /// for a detected loss, so no content is dropped.
-    pub fn retireOldestForRecovery(self: *RecoveryController, space: PacketNumberSpace) ?SentPacket {
-        const retired = self.tracker.retireOldest(space) orelse return null;
-        if (retired.in_flight) self.congestion.bytes_in_flight -|= retired.size;
-        return retired;
+        return self.tracker.canTrackRecoveryPacket();
     }
 
     pub fn onPacketSentAssumeCapacity(self: *RecoveryController, packet: SentPacket) void {
         std.debug.assert(self.canTrackRecoveryPacket());
-        self.tracker.onPacketSent(packet) catch unreachable;
+        self.tracker.onPacketSentAssumeRecoveryCapacity(packet);
         if (packet.in_flight) self.congestion.onPacketSent(packet.size);
     }
 
@@ -947,14 +997,14 @@ test "recovery: a padded non-ack-eliciting packet is charged to the window" {
     try testing.expectEqual(@as(usize, 1200), controller.congestion.bytes_in_flight);
 }
 
-test "recovery: ordinary traffic backpressures before the recovery reserve" {
+test "recovery: ordinary traffic stays bounded while required recovery spills past the fixed tracker" {
     var controller = RecoveryController{};
+    defer controller.deinit(testing.allocator);
     const ordinary_capacity = max_tracked_packets - reserved_tracked_packets;
 
     var i: usize = 0;
     while (i < ordinary_capacity) : (i += 1) {
         try testing.expect(controller.canTrackPacket());
-        try testing.expect(controller.canTrackRecoveryPacket());
         try controller.onPacketSent(.{
             .space = .application,
             .packet_number = i,
@@ -962,11 +1012,7 @@ test "recovery: ordinary traffic backpressures before the recovery reserve" {
             .size = 100,
         });
     }
-
-    // Ordinary traffic is done, but the reserve is intact for PTO probes and
-    // mandatory-padding packets.
     try testing.expect(!controller.canTrackPacket());
-    try testing.expect(controller.canTrackRecoveryPacket());
 
     while (i < max_tracked_packets) : (i += 1) {
         try testing.expect(controller.canTrackRecoveryPacket());
@@ -977,19 +1023,22 @@ test "recovery: ordinary traffic backpressures before the recovery reserve" {
             .size = 100,
         });
     }
-
-    // Fully saturated: recovery traffic must now wait rather than go
-    // untracked, which is what the send path's preflight enforces.
     try testing.expect(!controller.canTrackRecoveryPacket());
-    try testing.expectError(error.TooManyTrackedPackets, controller.onPacketSent(.{
+
+    try controller.ensureRecoveryPacketCapacity(testing.allocator, 1);
+    try testing.expect(controller.canTrackRecoveryPacket());
+    controller.onPacketSentAssumeCapacity(.{
         .space = .application,
         .packet_number = max_tracked_packets,
         .time_sent_us = 9_999,
-        .size = 100,
-    }));
+        .size = 123,
+    });
+    try testing.expectEqual(@as(usize, max_tracked_packets + 1), controller.tracker.totalCount());
+    try testing.expectEqual(@as(usize, 1), controller.tracker.recovery_overflow.items.len);
 
-    // Freeing capacity restores both tiers in the right order.
-    _ = controller.tracker.dropSpace(.application);
-    try testing.expect(controller.canTrackRecoveryPacket());
-    try testing.expect(controller.canTrackPacket());
+    const before = controller.congestion.bytes_in_flight;
+    controller.onAcked(.application, max_tracked_packets, 10_100, 0);
+    try testing.expectEqual(@as(usize, max_tracked_packets), controller.tracker.totalCount());
+    try testing.expectEqual(@as(usize, 0), controller.tracker.recovery_overflow.items.len);
+    try testing.expect(controller.congestion.bytes_in_flight < before);
 }
