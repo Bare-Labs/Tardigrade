@@ -152,7 +152,11 @@ Each record is one JSON-SEQ line:
   precision, derived from a monotonic `time_us`.
 - Writers are **allocation-free**: they format into a caller-owned buffer
   (`writeJson(record, buf)`), matching the bounded-buffer style already used by
-  the TLS handshake wire writer. A 512-byte buffer covers every event.
+  the TLS handshake wire writer. Fixed-size QUIC transport records remain
+  small, but H3 HEADERS, SETTINGS, and PUSH_PROMISE records grow with supplied
+  field/setting slices. Composition-root writers must size the record buffer
+  for the configured field-section budget, stream records directly, or retain
+  `NoSpaceLeft` as an explicit dropped-record diagnostic.
 - A qlog file is a `QlogFileSeq` header followed by event lines.
   `qlog.writeTraceHeader(header, buf)` serializes the
   `file_schema: urn:ietf:params:qlog:file:sequential`,
