@@ -3250,21 +3250,120 @@ test "streaming response reservations clear every aggregate scope after teardown
 /// revision of this test recorded that unrelated CANCEL as "the" reset and
 /// failed on CI. The server records *every* reset id so the assertion can be
 /// about which stream was reset for the capacity event, not about ordering.
+/// Why a canned server thread stopped.
+///
+/// These helpers used to `catch return` on every read timeout and write error,
+/// which made "the client never sent what we were waiting for"
+/// indistinguishable from "the socket died under us". On a loaded CI runner
+/// that turned a scheduling hiccup into a bare `expected 3, found 0` at the end
+/// of a test, with nothing pointing at the cause (#140 follow-up). Publishing
+/// the reason lets a test assert on it and fail with the real story.
+const CannedServerStatus = enum(u32) {
+    /// Still running, or stopped without reaching any labelled point — the
+    /// initial value, never stored deliberately.
+    running,
+    /// Reached the terminal state the test wanted: an RST_STREAM arrived.
+    saw_rst,
+    preface_read_failed,
+    settings_write_failed,
+    headers_read_failed,
+    response_write_failed,
+    body_write_failed,
+    /// Gave up waiting for the client's RST_STREAM. This is the one that
+    /// used to masquerade as "the client never reset the stream".
+    rst_read_failed,
+};
+
+/// A canned server's published outcome, shared with the test thread.
+///
+/// Everything here is written by the server thread and read by the test, so it
+/// is all atomic; `rst_stream_id` is published *before* the terminal status, so
+/// a test that observes `.saw_rst` is guaranteed to see the id with it.
+const CannedServerState = struct {
+    status: std.atomic.Value(u32) = std.atomic.Value(u32).init(@intFromEnum(CannedServerStatus.running)),
+    rst_stream_id: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn finish(self: *CannedServerState, status: CannedServerStatus) void {
+        self.status.store(@intFromEnum(status), .release);
+    }
+
+    fn noteRst(self: *CannedServerState, id: u32) void {
+        self.rst_stream_id.store(id, .monotonic);
+        self.finish(.saw_rst);
+    }
+
+    fn status_(self: *const CannedServerState) CannedServerStatus {
+        return @enumFromInt(self.status.load(.acquire));
+    }
+
+    /// Block until the server publishes a terminal status.
+    ///
+    /// This is the synchronisation point these tests were missing. The client's
+    /// capacity RST is written by the *reader thread*, after it has released
+    /// the state lock that publishes `abort_cause` — so a test that tears the
+    /// connection down as soon as it can see the cause races that write.
+    /// `H2Conn.deinit` shuts the socket down (`SHUT_RDWR`) before joining the
+    /// reader, and `writeControl` swallows the resulting write error, so losing
+    /// that race means the RST never reaches the peer at all.
+    ///
+    /// Bounded so a genuinely stuck test still fails rather than hanging, but
+    /// the bound is not the thing being waited on: it is generous, and the wait
+    /// returns as soon as the server publishes.
+    fn waitForTerminal(self: *const CannedServerState) CannedServerStatus {
+        const deadline = nowMs() + canned_server_wait_timeout_ms;
+        while (true) {
+            const current = self.status_();
+            if (current != .running) return current;
+            if (nowMs() >= deadline) return .running;
+            std.Thread.yield() catch {};
+        }
+    }
+
+    /// `waitForTerminal` plus the assertion, so a failure names the status the
+    /// server actually reached instead of showing up as a mismatched counter
+    /// several lines later.
+    fn expectTerminal(self: *const CannedServerState, want: CannedServerStatus) !void {
+        const got = self.waitForTerminal();
+        if (got != want) {
+            std.debug.print("canned server ended as .{s}, expected .{s}\n", .{ @tagName(got), @tagName(want) });
+            return error.TestUnexpectedResult;
+        }
+    }
+};
+
+/// Read budget for the canned server helpers below.
+///
+/// Deliberately generous: this bounds a *hung* test, not the expected latency,
+/// and the expected latency on a loaded CI runner is not something a small
+/// millisecond constant can predict — which is exactly how the previous 2–5 s
+/// deadlines turned into flakes. Tests wait on published state rather than on
+/// this clock, so a passing run never spends anywhere near it.
+const canned_server_read_timeout_ms: u64 = 30_000;
+
+/// How long a test waits for the server to publish a terminal status.
+///
+/// Deliberately *longer* than the server's own read budget: when something is
+/// genuinely stuck, the server should reach its own labelled timeout first so
+/// the test reports that cause (`.rst_read_failed`) rather than a bare "still
+/// running". A `.running` result therefore means the server thread is wedged
+/// somewhere with no label at all, which is itself the useful signal.
+const canned_server_wait_timeout_ms: u64 = canned_server_read_timeout_ms + 5_000;
+
 fn cannedTwoStreamServer(
     peer_fd: std.posix.fd_t,
     first_bytes: usize,
     second_bytes: usize,
-    rst_stream_id: *std.atomic.Value(u32),
+    state: *CannedServerState,
 ) void {
     const a = std.heap.page_allocator;
     var srv = PlainTransport{ .fd = peer_fd };
     var preface: [PREFACE.len]u8 = undefined;
-    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
-    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+    readExact(&srv, peer_fd, preface[0..], canned_server_read_timeout_ms) catch return state.finish(.preface_read_failed);
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return state.finish(.settings_write_failed);
 
     const block = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
         .{ .name = ":status", .value = "200" },
-    }) catch return;
+    }) catch return state.finish(.response_write_failed);
     defer a.free(block);
 
     // Answer each request as it arrives so the client can open the second
@@ -3272,31 +3371,28 @@ fn cannedTwoStreamServer(
     var ids: [2]u31 = .{ 0, 0 };
     var seen: usize = 0;
     while (seen < 2) {
-        var fr = readFrameBounded(&srv, peer_fd, a, 3000) catch return;
+        var fr = readFrameBounded(&srv, peer_fd, a, canned_server_read_timeout_ms) catch return state.finish(.headers_read_failed);
         const is_headers = fr.typ == .headers;
         const id = fr.stream_id;
         frame.deinitFrame(a, &fr);
         if (!is_headers) continue;
         ids[seen] = id;
         seen += 1;
-        frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, id, block) catch return;
+        frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, id, block) catch return state.finish(.response_write_failed);
     }
 
     const payload = [_]u8{'x'} ** 256;
     // END_STREAM: the healthy stream completes, so nothing later has cause to
     // reset it and any reset the client sends is the capacity one.
-    frame.writeFrame(&srv, .data, frame.Flags.END_STREAM, ids[0], payload[0..first_bytes]) catch return;
-    frame.writeFrame(&srv, .data, 0, ids[1], payload[0..second_bytes]) catch return;
+    frame.writeFrame(&srv, .data, frame.Flags.END_STREAM, ids[0], payload[0..first_bytes]) catch return state.finish(.body_write_failed);
+    frame.writeFrame(&srv, .data, 0, ids[1], payload[0..second_bytes]) catch return state.finish(.body_write_failed);
 
     while (true) {
-        var fr = readFrameBounded(&srv, peer_fd, a, 5000) catch return;
+        var fr = readFrameBounded(&srv, peer_fd, a, canned_server_read_timeout_ms) catch return state.finish(.rst_read_failed);
         const is_rst = fr.typ == .rst_stream;
         const id = fr.stream_id;
         frame.deinitFrame(a, &fr);
-        if (is_rst) {
-            rst_stream_id.store(@intCast(id), .release);
-            return;
-        }
+        if (is_rst) return state.noteRst(@intCast(id));
     }
 }
 
@@ -3311,8 +3407,8 @@ test "origin capacity bounds concurrent streams and refuses only the overflowing
     try limits.validate();
 
     const fds = try makeSocketpair();
-    var rst_stream_id = std.atomic.Value(u32).init(0);
-    const server = try std.Thread.spawn(.{}, cannedTwoStreamServer, .{ fds[1], window, 16, &rst_stream_id });
+    var server_state = CannedServerState{};
+    const server = try std.Thread.spawn(.{}, cannedTwoStreamServer, .{ fds[1], window, 16, &server_state });
 
     var observer = TestProxyBufferObserver{};
     var origin = proxy_buffer_account.Aggregate.init(.origin, window);
@@ -3375,6 +3471,14 @@ test "origin capacity bounds concurrent streams and refuses only the overflowing
     try testing.expectEqual(AbortCause.none, conn.abortCause(slow));
 
     const refused_id: u32 = refused.id;
+    // Synchronise on the server having *observed* the reset before tearing the
+    // connection down. `abort_cause` is published under the state lock, but the
+    // RST is written after that lock is released, and `conn.deinit()` shuts the
+    // socket down before joining the reader — so going straight to teardown
+    // here races the RST into `writeControl`'s swallowed write error and the
+    // server sees nothing. See `CannedServerState.waitForTerminal`.
+    try server_state.expectTerminal(.saw_rst);
+
     conn.finishStreaming(refused);
     conn.finishStreaming(slow);
     conn.deinit();
@@ -3382,7 +3486,7 @@ test "origin capacity bounds concurrent streams and refuses only the overflowing
     _ = std.c.close(fds[1]);
 
     // The refused stream — not the healthy one — was reset upstream.
-    try testing.expectEqual(refused_id, rst_stream_id.load(.acquire));
+    try testing.expectEqual(refused_id, server_state.rst_stream_id.load(.acquire));
     try testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
     try testing.expectEqual(@as(usize, 0), global.currentBytes(.upstream_to_downstream));
     try testing.expectEqual(@as(usize, 0), observer.current.load(.monotonic));
@@ -3398,36 +3502,34 @@ test "origin capacity bounds concurrent streams and refuses only the overflowing
 /// Canned server that answers before the client has finished uploading: it
 /// replies with HEADERS and a DATA burst as soon as the request head arrives,
 /// while the client is still writing request body frames.
-fn cannedEarlyResponseServer(peer_fd: std.posix.fd_t, body_bytes: usize, saw_rst: *std.atomic.Value(bool)) void {
+fn cannedEarlyResponseServer(peer_fd: std.posix.fd_t, body_bytes: usize, state: *CannedServerState) void {
     const a = std.heap.page_allocator;
     var srv = PlainTransport{ .fd = peer_fd };
     var preface: [PREFACE.len]u8 = undefined;
-    readExact(&srv, peer_fd, preface[0..], 2000) catch return;
-    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return;
+    readExact(&srv, peer_fd, preface[0..], canned_server_read_timeout_ms) catch return state.finish(.preface_read_failed);
+    frame.writeSettings(a, &srv, &[_][2]u32{}) catch return state.finish(.settings_write_failed);
 
     var req_stream: u31 = 0;
     while (req_stream == 0) {
-        var fr = readFrameBounded(&srv, peer_fd, a, 2000) catch return;
+        var fr = readFrameBounded(&srv, peer_fd, a, canned_server_read_timeout_ms) catch return state.finish(.headers_read_failed);
         if (fr.typ == .headers) req_stream = fr.stream_id;
         frame.deinitFrame(a, &fr);
     }
 
     const block = hpack.encodeLiteralHeaderBlock(a, &[_]hpack.HeaderField{
         .{ .name = ":status", .value = "200" },
-    }) catch return;
+    }) catch return state.finish(.response_write_failed);
     defer a.free(block);
-    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, block) catch return;
+    frame.writeFrame(&srv, .headers, frame.Flags.END_HEADERS, req_stream, block) catch return state.finish(.response_write_failed);
     const payload = [_]u8{'x'} ** 256;
-    frame.writeFrame(&srv, .data, 0, req_stream, payload[0..body_bytes]) catch return;
+    frame.writeFrame(&srv, .data, 0, req_stream, payload[0..body_bytes]) catch return state.finish(.body_write_failed);
 
     while (true) {
-        var fr = readFrameBounded(&srv, peer_fd, a, 5000) catch return;
+        var fr = readFrameBounded(&srv, peer_fd, a, canned_server_read_timeout_ms) catch return state.finish(.rst_read_failed);
         const is_rst = fr.typ == .rst_stream and fr.stream_id == req_stream;
+        const id = fr.stream_id;
         frame.deinitFrame(a, &fr);
-        if (is_rst) {
-            saw_rst.store(true, .release);
-            return;
-        }
+        if (is_rst) return state.noteRst(@intCast(id));
     }
 }
 
@@ -3438,8 +3540,8 @@ test "response capacity exhausted during an upload surfaces before commitment" {
     // since nothing is committed downstream yet, the cause has to survive as
     // local capacity rather than looking like an upstream write failure.
     const fds = try makeSocketpair();
-    var saw_rst = std.atomic.Value(bool).init(false);
-    const server = try std.Thread.spawn(.{}, cannedEarlyResponseServer, .{ fds[1], 16, &saw_rst });
+    var server_state = CannedServerState{};
+    const server = try std.Thread.spawn(.{}, cannedEarlyResponseServer, .{ fds[1], 16, &server_state });
 
     var observer = TestProxyBufferObserver{};
     // No room at the origin at all: the early response is refused on arrival.
@@ -3474,12 +3576,16 @@ test "response capacity exhausted during an upload surfaces before commitment" {
     // Still pre-commitment, so the caller can choose a clean status.
     try testing.expectError(error.BufferLimitExceeded, conn.beginDownstreamCommit(stream));
 
+    // Same synchronisation point as the origin-capacity test above: the RST is
+    // written by the reader after it publishes the cause, so teardown must wait
+    // for the server to have seen it rather than for the cause alone.
+    try server_state.expectTerminal(.saw_rst);
+
     conn.finishStreaming(stream);
     conn.deinit();
     server.join();
     _ = std.c.close(fds[1]);
 
-    try testing.expect(saw_rst.load(.acquire));
     try testing.expectEqual(@as(usize, 0), origin.currentBytes(.upstream_to_downstream));
     try testing.expectEqual(@as(usize, 0), observer.retained.load(.monotonic));
 }
