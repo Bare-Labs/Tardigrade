@@ -5,6 +5,40 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- **Native TLS negotiates `record_size_limit` and can pad records (#359)** —
+  the record transport now offers and honors RFC 8449's `record_size_limit`
+  extension in both roles. Each side advertises the largest inner plaintext it
+  is willing to receive; outgoing protected records — application data and
+  handshake fragments alike — are sized to whatever the peer advertised, and an
+  arriving record that exceeds our own advertisement is refused before the AEAD
+  open rather than after, so the bound actually caps the work an
+  unauthenticated peer can cause. The default advertisement is the TLS 1.3
+  protocol maximum, so the extension is offered but constrains nothing until an
+  operator lowers `record_size_limit`; peers that do not implement RFC 8449
+  (OpenSSL among them) simply omit it, which the RFC defines as the protocol
+  maximum. Out-of-range values follow RFC 8449 §4's asymmetry exactly: below 64
+  is `illegal_parameter` for both roles, while above the maximum a server
+  clamps and a client rejects. The server's EncryptedExtensions answer is sent
+  only in reply to a client that offered, per RFC 8446 §4.2's request/response
+  rule, and offering is kept distinct from negotiating: a configured limit
+  becomes an enforceable receive bound only once the round trip completes, so a
+  peer that ignores the extension still gets ordinary protocol record sizes.
+  TLS-over-QUIC has no TLS records: it never offers the extension, and a QUIC
+  server ignores a client that does. 0-RTT records are exempt from the bound:
+  RFC 8446 §4.2.10 puts early data in the client's first flight, before the
+  server's answer exists, so enforcing the value the server later settles on
+  would reject early data a conforming client could not have sized. Two GnuTLS interop rows assert the
+  negotiated behaviour against an independent implementation in both roles —
+  one proving we honour the peer's limit, one proving the peer honours ours.
+
+  Separately and locally, `PureZigRecordStream.setRecordPadding` enables
+  RFC 8446 §5.4 padding on application data, rounding each record's inner
+  plaintext up to a block boundary so its length no longer reveals the content
+  length. This is a traffic-analysis countermeasure, not a performance feature
+  — it makes records larger on purpose — and it is off by default. Padding is
+  clamped by the negotiated limit, never the reverse, so it can never push a
+  record past what the peer agreed to accept. `docs/TLS_RECORD_TRANSPORT.md`
+  documents the distinction, including why neither knob is record coalescing.
 - **HTTP/1 origins are bounded per origin, not just per request and per process
   (#140)** — `TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` now applies
   to HTTP/1 relay buffers in both directions, closing the last aggregate gap in

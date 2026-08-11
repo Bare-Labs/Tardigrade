@@ -31,6 +31,7 @@ const crypto_secrets = @import("crypto_secrets");
 const alerts = @import("alerts.zig");
 const events = @import("events.zig");
 const key_update = @import("key_update.zig");
+const record_size = @import("record_size.zig");
 const state = @import("state.zig");
 
 pub fn Contract(
@@ -336,6 +337,18 @@ pub fn ContractWithOptions(
             /// not a missing feature — which is why `requestKeyUpdate` reports
             /// it to the caller instead of quietly doing nothing.
             requestKeyUpdateFn: ?*const fn (ptr: *anyopaque, request: key_update.Request, sink: *EventSink) ErrorSet!void = null,
+            /// The connection's negotiated `record_size_limit` state (RFC 8449,
+            /// #359): what this endpoint advertised, and what the peer did.
+            ///
+            /// A *pull*, not an event, for the same reason `earlyDataMaxBytes`
+            /// is: the value is settled state a transport reads when it needs
+            /// to size a record, not a moment in the handshake it must react
+            /// to at exactly the right point in an event batch. It also keeps
+            /// the extension out of QUIC's event vocabulary entirely — RFC
+            /// 8449 is defined over TLS records, which QUIC does not use, so a
+            /// QUIC backend leaves this null and gets the protocol-maximum
+            /// default below.
+            recordSizeLimitsFn: ?*const fn (ptr: *anyopaque) record_size.Limits = null,
 
             pub fn start(self: Backend, role: state.Role, params: TransportParameters, sink: *EventSink) ErrorSet!void {
                 return self.startFn(self.ptr, role, params, sink);
@@ -401,6 +414,14 @@ pub fn ContractWithOptions(
                 const f = self.requestKeyUpdateFn orelse return false;
                 try f(self.ptr, request, sink);
                 return true;
+            }
+
+            /// See `recordSizeLimitsFn`. The default is "neither side
+            /// constrained the other", which is exactly a connection where
+            /// the extension never appeared.
+            pub fn recordSizeLimits(self: Backend) record_size.Limits {
+                if (self.recordSizeLimitsFn) |f| return f(self.ptr);
+                return .{};
             }
 
             pub fn deinit(self: Backend) void {

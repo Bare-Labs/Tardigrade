@@ -171,6 +171,46 @@ negotiated suite's own HKDF, which the positive matrix already sweeps for
 every suite. What is peer-specific here is the message exchange, not the
 arithmetic.
 
+### Record size limit (RFC 8449)
+
+Two GnuTLS rows (#359) assert *negotiated* record sizing. OpenSSL does not
+implement RFC 8449 — traced against OpenSSL 3.6.2, its ClientHello carries no
+extension 28 — but GnuTLS does, and `gnutls-cli`/`gnutls-serv` expose
+`--recordsize` to advertise a non-default value. That makes these the rows
+where the extension is exercised against an independent implementation rather
+than against ourselves.
+
+One caveat worth knowing when reading them: GnuTLS's `--recordsize N`
+advertises **N+1** on the wire, because RFC 8449 measures the complete
+`TLSInnerPlaintext` and GnuTLS adds the content-type byte itself. So
+`--recordsize 1024` negotiates a 1025-byte limit, which is what the rows pin.
+
+| Row | Peer | What it proves |
+| --- | --- | --- |
+| `record/server/gnutls/record-size-limit` | `gnutls-cli --recordsize 1024` | **we honor the peer's limit**: a 3000-byte response leaves as ≥5 protected records, none with an inner plaintext above 1025 |
+| `record/client/gnutls/record-size-limit` | `gnutls-serv --recordsize 1024` | **the peer honors ours**: we advertise 512, and GnuTLS fragments its ~780-byte response to fit while still delivering every byte |
+
+The two directions are deliberately split across the rows because neither
+stands in for the other. A row that only checked our own sending would pass
+against a peer that ignored the extension completely; a row that only checked
+what arrived would pass without our sizing logic ever running.
+
+Both assert on real record sizes rather than on a completed handshake. The
+server row pins the peer's advertised value, a per-record upper bound, and a
+minimum record count — so a build that negotiated the extension and then
+ignored it fails on fragmentation, and one that stopped sending fails on the
+record count. The client row pins the received-record bound together with a
+minimum byte count, so a peer that "honored" the limit by truncating its
+response fails too. Both bounds also refuse to pass vacuously: a row where no
+protected record was sealed (or none arrived) is a failure, not a silent
+zero-versus-limit comparison.
+
+Coverage for the parts no peer can drive — the role-asymmetric handling of an
+out-of-range advertisement, the request/response rule for the server's
+EncryptedExtensions answer, and the offer-versus-negotiated distinction — lives
+in-tree, in `src/tls/tls13_backend.zig`, `src/tls/tls13_backend_tests.zig`,
+`src/tls/record_epoch_bridge.zig`, and `src/tls/encrypted_stream.zig`.
+
 ### Negative conformance
 
 Each of these asserts the failure **class**, using the RFC 8446 §6 alert where

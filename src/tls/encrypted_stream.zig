@@ -16,6 +16,7 @@ const events = @import("events.zig");
 const key_update = @import("key_update.zig");
 const record_codec = @import("record_codec.zig");
 const record_epoch_bridge = @import("record_epoch_bridge.zig");
+const record_size = @import("record_size.zig");
 const tls_state = @import("state.zig");
 const tls13_transport = @import("tls13_transport.zig");
 
@@ -619,6 +620,41 @@ pub const PureZigRecordStream = struct {
         self.require_alpn = true;
     }
 
+    /// Install the local record-padding policy (RFC 8446 §5.4, #359).
+    ///
+    /// Padding is a privacy control, not a performance one: it hides how many
+    /// content bytes each record carried, and costs bandwidth and AEAD work
+    /// for every byte it adds. It is never negotiated, so this is a local
+    /// setting with no wire signal — and it is deliberately separate from
+    /// `record_size_limit`, which *is* negotiated and bounds what the padding
+    /// may grow into.
+    pub fn setRecordPadding(self: *PureZigRecordStream, padding: record_size.PaddingPolicy) Error!void {
+        return self.bridge.setRecordPadding(padding);
+    }
+
+    /// The connection's negotiated `record_size_limit` state (#359). Before
+    /// the handshake settles it reports this endpoint's own advertisement with
+    /// no peer value, which is the same thing an un-negotiated connection
+    /// means.
+    pub fn recordSizeLimits(self: *const PureZigRecordStream) record_size.Limits {
+        return self.bridge.record_size_limits;
+    }
+
+    /// Observable record-sizing effects: writes narrowed by the peer's limit,
+    /// padding actually emitted, and inbound records refused for exceeding
+    /// our own advertisement.
+    pub fn recordSizeCounters(self: *const PureZigRecordStream) record_size.Counters {
+        return self.bridge.record_size_counters;
+    }
+
+    /// Mirror the backend's negotiated record-size state into the bridge that
+    /// actually seals and opens records. Idempotent: re-reading a settled
+    /// negotiation installs the same values.
+    fn refreshRecordSizeLimits(self: *PureZigRecordStream) Error!void {
+        const driver = if (self.handshake_driver) |*d| d else return;
+        try self.bridge.setRecordSizeLimits(driver.backend.recordSizeLimits());
+    }
+
     /// The peer certificate validation outcome the backend reported.
     pub fn certificateState(self: *const PureZigRecordStream) events.CertificateState {
         return self.certificate_state;
@@ -843,9 +879,17 @@ pub const PureZigRecordStream = struct {
     fn emitHandshakeRecords(self: *PureZigRecordStream, epoch: events.EncryptionEpoch, bytes: []const u8) Error!void {
         if (!try self.canReserveOutboundHandshakeBytes(epoch, bytes.len)) return error.WouldBlock;
 
+        // #359: RFC 8449 §4 exempts unprotected records ("Unprotected
+        // messages are not subject to this limit"), so the initial epoch's
+        // plaintext ClientHello/ServerHello keeps the full protocol fragment
+        // even against a peer that advertised a smaller limit.
+        const chunk = if (epoch == .initial)
+            record_codec.max_plaintext_fragment_len
+        else
+            self.bridge.outboundContentMax();
         var offset: usize = 0;
         while (offset < bytes.len) {
-            const take = @min(record_codec.max_plaintext_fragment_len, bytes.len - offset);
+            const take = @min(chunk, bytes.len - offset);
             var record_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
             const record = self.bridge.sealHandshake(epoch, bytes[offset..][0..take], &record_buf) catch |err| return self.fail(err);
             self.appendOutboundCiphertext(record) catch |err| return self.fail(err);
@@ -947,8 +991,14 @@ pub const PureZigRecordStream = struct {
         if (self.outbound_ciphertext.available() < needed) return error.WouldBlock;
 
         var offset: usize = 0;
+        // #359: post-handshake messages (NewSessionTicket, KeyUpdate) travel in
+        // protected application-epoch records, so they are subject to the
+        // peer's `record_size_limit` exactly as application data is. The
+        // `sealedHandshakeLen` reservation above already sizes itself from the
+        // same bound.
+        const chunk = self.bridge.outboundContentMax();
         while (offset < event.handshake_bytes.data.len) {
-            const take = @min(record_codec.max_plaintext_fragment_len, event.handshake_bytes.data.len - offset);
+            const take = @min(chunk, event.handshake_bytes.data.len - offset);
             var record_buf: [record_codec.max_ciphertext_record_len]u8 = undefined;
             const record = try self.bridge.sealHandshake(.application, event.handshake_bytes.data[offset..][0..take], &record_buf);
             try self.appendOutboundCiphertext(record);
@@ -1043,6 +1093,21 @@ pub const PureZigRecordStream = struct {
     fn applyDriverOutcome(self: *PureZigRecordStream, outcome: RecordHandshakeDriver.Outcome) Error!void {
         var fatal_alert: ?alerts.AlertDescription = null;
         const sink = outcome.sink;
+        // #359: pull the negotiated record-size state *before* serializing
+        // this batch's `handshake_bytes`. The ordering is load-bearing on both
+        // roles: a server learns the client's limit from the ClientHello it
+        // just consumed and must already honor it in the EncryptedExtensions
+        // flight this very batch emits, and a client learns the server's limit
+        // from EncryptedExtensions and must honor it in the Finished that
+        // follows in the same batch.
+        // A retroactive `RecordSizeLimitExceeded` here means the peer answered
+        // extension 28 and then exceeded the value it had just agreed to.
+        // RFC 8446 §6 makes that a fatal `record_overflow`, so it is deferred
+        // (alert queued, then latched) rather than torn down silently.
+        self.refreshRecordSizeLimits() catch |err| {
+            self.deferHandshakeFailure(err, null);
+            return;
+        };
         // A completion batch may contain application secrets, Client Finished,
         // and handshake-key discard before `handshake_complete`. Validate the
         // batch's final authentication/ALPN state first so policy failure sends
@@ -1282,6 +1347,10 @@ pub const PureZigRecordStream = struct {
             error.NoMutualParameters,
             error.UnsupportedProtocolVersion,
             => alerts.fromHandshakeError(@errorCast(err)),
+            // #359: RFC 8446 §6 names `record_overflow` for a record longer
+            // than the receiver accepts, which is exactly what a peer that
+            // ignored our `record_size_limit` sent us.
+            error.RecordSizeLimitExceeded => .record_overflow,
             else => null,
         };
     }
@@ -1476,7 +1545,16 @@ pub const PureZigRecordStream = struct {
         if (!self.hasHardRoom(.outbound_ciphertext, self.outbound_ciphertext.len, record_codec.max_ciphertext_record_len)) return self.rejectHardLimit(.outbound_ciphertext, error.WouldBlock);
         if (self.outbound_ciphertext.available() < record_codec.max_ciphertext_record_len) return error.WouldBlock;
 
-        const n = @min(bytes.len, record_codec.max_plaintext_fragment_len);
+        // #359: one record per call, sized by whichever bound is tighter --
+        // the protocol fragment maximum or the peer's advertised
+        // `record_size_limit`. A short return is already this API's contract
+        // (callers loop), so a narrower peer limit costs more calls rather
+        // than an error.
+        const content_max = self.bridge.outboundContentMax();
+        const n = @min(bytes.len, content_max);
+        if (content_max < record_codec.max_plaintext_fragment_len and bytes.len > content_max) {
+            self.bridge.record_size_counters.peer_limited_writes +|= 1;
+        }
         if (write_epoch == .zero_rtt) {
             const max_early = if (self.handshake_driver) |*driver| driver.backend.earlyDataMaxBytes() else return error.WouldBlock;
             if (self.zero_rtt_sent >= max_early) return error.WouldBlock;
@@ -4351,6 +4429,19 @@ const ScriptedRecordBackend = struct {
     /// How many times the stream released this backend. `Driver.deinit` is not
     /// idempotent, so this must never exceed one.
     deinit_count: usize = 0,
+    /// #359: the server's handshake-epoch Finished payload. Oversizing it is
+    /// how a row makes the server put more on the wire than it agreed to.
+    server_finished: []const u8 = "SF",
+    /// #359: the negotiated `record_size_limit` state this scripted backend
+    /// reports, standing in for a real handshake's advertisements.
+    record_size_limits: record_size.Limits = .{},
+    /// #359: what to report *after* the peer's handshake-epoch flight has been
+    /// processed, standing in for a client learning the server's answer from
+    /// EncryptedExtensions. Before that, `record_size_limits` is reported —
+    /// which is the window in which the server's own flight has already been
+    /// opened against the protocol maximum.
+    record_size_limits_after_flight: ?record_size.Limits = null,
+    handshake_flight_seen: bool = false,
 
     const hs_c2s = secret(0x11);
     const hs_s2c = secret(0x22);
@@ -4358,12 +4449,28 @@ const ScriptedRecordBackend = struct {
     const app_s2c = secret(0x44);
 
     fn recordBackend(self: *ScriptedRecordBackend) RecordHandshakeBackend {
-        return .{ .ptr = self, .startFn = start, .receiveFn = receive, .authPendingFn = authPending, .resumeFn = resumeAuth, .deinitFn = backendDeinit };
+        return .{
+            .ptr = self,
+            .startFn = start,
+            .receiveFn = receive,
+            .authPendingFn = authPending,
+            .resumeFn = resumeAuth,
+            .deinitFn = backendDeinit,
+            .recordSizeLimitsFn = recordSizeLimits,
+        };
     }
 
     fn backendDeinit(ptr: *anyopaque) void {
         const self: *ScriptedRecordBackend = @ptrCast(@alignCast(ptr));
         self.deinit_count += 1;
+    }
+
+    fn recordSizeLimits(ptr: *anyopaque) record_size.Limits {
+        const self: *ScriptedRecordBackend = @ptrCast(@alignCast(ptr));
+        if (self.handshake_flight_seen) {
+            if (self.record_size_limits_after_flight) |limits| return limits;
+        }
+        return self.record_size_limits;
     }
 
     fn start(ptr: *anyopaque, role: tls_state.Role, _: void, sink: *RecordTransport.EventSink) RecordHandshakeError!void {
@@ -4382,7 +4489,7 @@ const ScriptedRecordBackend = struct {
                     try sink.emitSecret(.handshake, .read, &hs_c2s);
                     try sink.emitSecret(.handshake, .write, &hs_s2c);
                     try sink.emitDiscardEpoch(.initial);
-                    try sink.emitHandshakeBytes(.handshake, "SF");
+                    try sink.emitHandshakeBytes(.handshake, self.server_finished);
                     try sink.emitSecret(.application, .read, &app_c2s);
                     try sink.emitSecret(.application, .write, &app_s2c);
                 } else if (epoch == .handshake and std.mem.eql(u8, bytes, "CF")) {
@@ -4403,7 +4510,11 @@ const ScriptedRecordBackend = struct {
                     try sink.emitSecret(.handshake, .read, &hs_s2c);
                     try sink.emitDiscardEpoch(.initial);
                     if (self.selected_alpn) |protocol| try sink.emitAlpn(protocol);
-                } else if (epoch == .handshake and std.mem.eql(u8, bytes, "SF")) {
+                    // #359: `startsWith` rather than `eql` so a row can make the
+                    // server's Finished large enough to need one oversized
+                    // record; "SF" alone still matches.
+                } else if (epoch == .handshake and std.mem.startsWith(u8, bytes, "SF")) {
+                    self.handshake_flight_seen = true;
                     try sink.emitSecret(.application, .write, &app_c2s);
                     try sink.emitSecret(.application, .read, &app_s2c);
                     // The secure record-stream default requires a client-side
@@ -6625,4 +6736,198 @@ test "encrypted stream close is terminal and idempotent from every lifecycle sta
         try expectTeardownMetadataCleared(&pair.subject);
         try testing.expectEqual(@as(usize, 1), carrier_state.close_calls);
     }
+}
+
+// ===========================================================================
+// #359: record sizing and padding on a driver-owned stream.
+// ===========================================================================
+
+test "#359 a driver-owned stream honors the peer's record_size_limit on every protected write" {
+    const cp = testProvider();
+    var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+    // The server told the client it accepts at most 128-byte inner
+    // plaintexts; the client told the server the protocol maximum.
+    var client_backend = ScriptedRecordBackend{ .role = .client, .record_size_limits = .{ .peer = 128 } };
+    var server_backend = ScriptedRecordBackend{ .role = .server, .record_size_limits = .{ .local = 128 } };
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    defer client.deinit();
+    try client.setExpectedAlpn("h1");
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    defer server.deinit();
+
+    try driveBothUntil(&client, &server, bothComplete);
+    try testing.expectEqual(@as(?u16, 128), client.recordSizeLimits().peer);
+    try testing.expectEqual(@as(usize, 127), client.bridge.outboundContentMax());
+
+    // A single write is capped at 127 content bytes -- the peer's 128 minus
+    // the content-type byte RFC 8449 counts -- and reports the short length
+    // rather than failing.
+    const payload = [_]u8{'q'} ** 400;
+    var sent: usize = 0;
+    var writes: usize = 0;
+    while (sent < payload.len) {
+        const n = try client.stream().write(payload[sent..]);
+        try testing.expect(n <= 127);
+        sent += n;
+        writes += 1;
+        _ = try client.stream().drive();
+        _ = try server.stream().drive();
+    }
+    try testing.expectEqual(@as(usize, 4), writes);
+    try testing.expect(client.recordSizeCounters().peer_limited_writes > 0);
+
+    try driveBothUntil(&client, &server, struct {
+        fn done(_: *PureZigRecordStream, s: *PureZigRecordStream) bool {
+            return s.readiness().can_read_plaintext;
+        }
+    }.done);
+
+    // The server accepted every record: none exceeded what it advertised.
+    var received: [payload.len]u8 = undefined;
+    var total: usize = 0;
+    while (total < payload.len) {
+        const n = server.stream().read(received[total..]) catch |err| switch (err) {
+            error.WouldBlock => {
+                _ = try client.stream().drive();
+                _ = try server.stream().drive();
+                continue;
+            },
+            else => return err,
+        };
+        total += n;
+    }
+    try testing.expectEqualSlices(u8, &payload, received[0..total]);
+    try testing.expectEqual(@as(u64, 0), server.recordSizeCounters().oversize_records_rejected);
+}
+
+test "#359 a stream pads application records without ever exceeding the peer's limit" {
+    const cp = testProvider();
+    var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+    var client_backend = ScriptedRecordBackend{ .role = .client, .record_size_limits = .{ .peer = 512 } };
+    var server_backend = ScriptedRecordBackend{ .role = .server, .record_size_limits = .{ .local = 512 } };
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    defer client.deinit();
+    try client.setExpectedAlpn("h1");
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    defer server.deinit();
+    // Padding is local policy: it is set on the stream, never negotiated, and
+    // the peer learns nothing about it beyond uniform record lengths.
+    try client.setRecordPadding(.{ .block = 256 });
+
+    try driveBothUntil(&client, &server, bothComplete);
+    try testing.expectEqual(@as(usize, 4), try client.stream().write("tiny"));
+    try driveBothUntil(&client, &server, struct {
+        fn done(_: *PureZigRecordStream, s: *PureZigRecordStream) bool {
+            return s.readiness().can_read_plaintext;
+        }
+    }.done);
+
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("tiny", buf[0..try server.stream().read(&buf)]);
+    // 4 content bytes + the type byte is 5; padded to the next 256 boundary.
+    const counters = client.recordSizeCounters();
+    try testing.expectEqual(@as(u64, 1), counters.padded_records);
+    try testing.expectEqual(@as(u64, 251), counters.padding_bytes);
+    // And the server, which advertised 512, accepted it: padding stayed
+    // inside the negotiated bound.
+    try testing.expectEqual(@as(u64, 0), server.recordSizeCounters().oversize_records_rejected);
+}
+
+test "#359 padding configuration outside the honorable range is rejected at the stream" {
+    const cp = testProvider();
+    var backend = ScriptedRecordBackend{ .role = .client };
+    var stream_state = try PureZigRecordStream.initWithBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, backend.recordBackend());
+    defer stream_state.deinit();
+    try testing.expectError(error.InvalidRecordSizeLimit, stream_state.setRecordPadding(.{ .block = 0 }));
+    try testing.expectError(
+        error.InvalidRecordSizeLimit,
+        stream_state.setRecordPadding(.{ .block = record_size.PaddingPolicy.max_block + 1 }),
+    );
+    try testing.expectEqual(record_size.PaddingPolicy.none, stream_state.bridge.record_padding);
+}
+
+test "#359 an inbound record past our advertised limit fails the stream with record_overflow" {
+    // The peer ignores what we advertised: our own bridge is configured to
+    // accept only 128, while the sender still uses the protocol maximum.
+    const cp = testProvider();
+    var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+    var client_backend = ScriptedRecordBackend{ .role = .client };
+    var server_backend = ScriptedRecordBackend{ .role = .server };
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    defer client.deinit();
+    try client.setExpectedAlpn("h1");
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    defer server.deinit();
+
+    try driveBothUntil(&client, &server, bothComplete);
+    // Tighten only the receiving side, after the handshake, so the sender
+    // keeps writing full-size records into a peer that no longer accepts them.
+    try server.bridge.setRecordSizeLimits(.{ .local = 128 });
+
+    const payload = [_]u8{'w'} ** 1024;
+    _ = try client.stream().write(&payload);
+    _ = try client.stream().drive();
+    try testing.expectError(error.RecordSizeLimitExceeded, server.stream().drive());
+    try testing.expectEqual(@as(u64, 1), server.bridge.record_size_counters.oversize_records_rejected);
+    try testing.expectEqual(
+        alerts.AlertDescription.record_overflow,
+        PureZigRecordStream.mappedFatalAlert(error.RecordSizeLimitExceeded).?,
+    );
+}
+
+test "#359 a server that answers extension 28 and then oversizes its own flight gets record_overflow" {
+    // The client-side enforcement gap, end to end. The client advertises 512
+    // but cannot apply it to the server's first protected flight: until that
+    // flight is parsed it does not know whether the server answered extension
+    // 28 at all. Here the server does answer (modelled by the client backend
+    // reporting the negotiated bound once it has processed the flight) *and*
+    // sends a single 2000-byte handshake record. The record is opened against
+    // the protocol maximum, then judged the moment the bound becomes known.
+    const cp = testProvider();
+    var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+    const oversized_finished = "SF" ++ ("p" ** 2000);
+    // The server is unconstrained, so it seals that flight as one record
+    // rather than fragmenting it to the client's bound.
+    var server_backend = ScriptedRecordBackend{ .role = .server, .server_finished = oversized_finished };
+    var client_backend = ScriptedRecordBackend{
+        .role = .client,
+        .record_size_limits = .{},
+        .record_size_limits_after_flight = .{ .local = 512, .peer = record_size.max_limit },
+    };
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    defer client.deinit();
+    try client.setExpectedAlpn("h1");
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    defer server.deinit();
+
+    const errors = driveDriverPairUntilBothErrors(&client, &server);
+    try testing.expectEqual(@as(?anyerror, error.RecordSizeLimitExceeded), errors.client);
+    // The alert actually reached the peer rather than the stream tearing down
+    // silently: RFC 8446 §6 requires `record_overflow` for a record above what
+    // the receiver accepts.
+    try testing.expectEqual(alerts.AlertDescription.record_overflow, server.peerAlert().?);
+    try testing.expect(!client.bridge.handshake_complete);
+    try testing.expectEqual(@as(u64, 1), client.bridge.record_size_counters.oversize_records_rejected);
+}
+
+test "#359 the same oversized flight is accepted when the server never answers extension 28" {
+    // The other half of the same window: a server that does not implement
+    // RFC 8449 is entitled to the protocol maximum, so the identical flight
+    // must complete. Without the offer/negotiated split this would fail.
+    const cp = testProvider();
+    var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+    const oversized_finished = "SF" ++ ("p" ** 2000);
+    var server_backend = ScriptedRecordBackend{ .role = .server, .server_finished = oversized_finished };
+    // No `record_size_limits_after_flight`: the peer never answered, so the
+    // client keeps reporting the protocol maximum as its enforceable bound.
+    var client_backend = ScriptedRecordBackend{ .role = .client, .record_size_limits = .{} };
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    defer client.deinit();
+    try client.setExpectedAlpn("h1");
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    defer server.deinit();
+
+    try driveBothUntil(&client, &server, bothComplete);
+    try testing.expect(client.bridge.handshake_complete);
+    try testing.expectEqual(@as(u64, 0), client.bridge.record_size_counters.oversize_records_rejected);
 }
