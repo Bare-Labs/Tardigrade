@@ -13654,3 +13654,97 @@ test "#359 a PSK-resumed server flight follows the same request/response rule" {
         try std.testing.expectEqual(offered, server.recordSizeLimits().peer);
     }
 }
+
+test "#359 a server advertising 512 accepts oversized 0-RTT but rejects the same size at 1-RTT" {
+    // The epoch boundary, end to end through a real record-mode resumption.
+    // RFC 8446 §4.2.10 has 0-RTT ride the client's first flight, so it is
+    // created before the server's EncryptedExtensions answer exists — and the
+    // server activates its own bound when it *writes* that answer, before the
+    // handshake completes. An early record can therefore legitimately arrive at
+    // a server already enforcing 512, and must not be judged against it.
+    var issued = try issueEarlyCapableTicket(16384);
+    defer issued.deinit();
+
+    var resumed: DirectHarness = undefined;
+    resumed.init();
+    defer resumed.deinit();
+
+    // Replace the server with one whose policy advertises 512. Only
+    // `record_size_limit` differs, so the ticket stays resumption-compatible.
+    resumed.server_backend.deinit();
+    resumed.server_backend = tls_backend.Tls13Backend.initServerConfigured(
+        serverEntropy(),
+        resumed.server_provider_storage.provider.cryptoProvider(),
+        fixtureIdentity(),
+        tls_backend.recordConfig(recordSizeLimitPolicy(512)),
+    );
+
+    var offers: pre_shared_key.ClientPskOfferSet = .{};
+    try offers.push(&issued.ticket);
+    var clock_dummy: u8 = 0;
+    try resumed.client_backend.setClientPskOffers(&offers, &clock_dummy, earlyDataResumedClientClock);
+    var resolver_state = IdentityResolver{ .state = &issued.server_state };
+    try resumed.server_backend.setServerPskResolver(.{
+        .ctx = &resolver_state,
+        .nowUnixMsFn = IdentityResolver.now,
+        .resolveFn = IdentityResolver.resolve,
+    });
+    try resumed.client_backend.setClientEarlyDataIntent(.{ .enabled = true, .max_bytes = 16384 });
+    try resumed.server_backend.setServerEarlyDataPolicy(.{ .enabled = true, .age_skew_tolerance_ms = 60_000 });
+    const AllowGate = struct {
+        fn decide(_: *anyopaque, _: tls_backend.EarlyDataReplayCandidate) tls_backend.EarlyDataReplayDecision {
+            return .allow;
+        }
+    };
+    var gate_ctx: u8 = 0;
+    try resumed.server_backend.setEarlyDataReplayGate(.{ .ctx = &gate_ctx, .decideFn = AllowGate.decide });
+
+    try resumed.run();
+    try std.testing.expect(resumed.server_backend.earlyDataAccepted());
+
+    // The policy really reached the wire and the negotiation really settled on
+    // it — otherwise everything below would be checking nothing.
+    const server_limits = resumed.server_backend.recordSizeLimits();
+    try std.testing.expectEqual(@as(u16, 512), server_limits.local);
+    try std.testing.expectEqual(@as(?u16, record_size.max_limit), server_limits.peer);
+
+    // Model the server's mid-handshake state: 0-RTT read keys installed and the
+    // bound already active (it activates on writing EncryptedExtensions), but
+    // the handshake not yet complete. That is the exact window in which a
+    // buffered early record lands.
+    var early_provider_storage: ProviderStorage = .{};
+    var client_early_storage: ProviderStorage = .{};
+    var server_early = Bridge.init(early_provider_storage.init(server_provider_seed), .tls_aes_128_gcm_sha256);
+    defer server_early.deinit();
+    var client_early = Bridge.init(client_early_storage.init(client_provider_seed), .tls_aes_128_gcm_sha256);
+    defer client_early.deinit();
+
+    const early_secret = resumed.observed.zero_rtt_secret[0] orelse return error.TestExpectedEqual;
+    try client_early.installTrafficSecret(.zero_rtt, .write, early_secret.slice());
+    try server_early.installTrafficSecret(.zero_rtt, .read, early_secret.slice());
+    try server_early.setRecordSizeLimits(server_limits);
+
+    // >512 but protocol-legal early data: accepted.
+    const oversized = [_]u8{'e'} ** 2000;
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const early_record = try client_early.sealProtected(.zero_rtt, .application_data, &oversized, &protected);
+    const opened = try server_early.openProtected(.zero_rtt, try parseSingleRecord(.ciphertext, early_record), &plaintext);
+    try std.testing.expectEqualSlices(u8, &oversized, opened.inner.content);
+    try std.testing.expectEqual(@as(u64, 0), server_early.record_size_counters.oversize_records_rejected);
+
+    // The very same size at the application epoch, on the completed
+    // connection, *is* rejected — which is what makes the exemption an epoch
+    // boundary rather than a hole.
+    try resumed.server_bridge.setRecordSizeLimits(server_limits);
+    const late_record = try resumed.client_bridge.sealProtected(.application, .application_data, oversized[0..511], &protected);
+    _ = try resumed.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, late_record), &plaintext);
+    // 511 content bytes + the type byte is exactly 512 and passes; one more
+    // does not. The client bridge is unconstrained here precisely so it can
+    // produce the over-limit record a misbehaving peer would.
+    const over_record = try resumed.client_bridge.sealProtected(.application, .application_data, oversized[0..512], &protected);
+    try std.testing.expectError(
+        error.RecordSizeLimitExceeded,
+        resumed.server_bridge.openApplicationData(try parseSingleRecord(.ciphertext, over_record), &plaintext),
+    );
+}

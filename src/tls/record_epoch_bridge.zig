@@ -590,7 +590,23 @@ pub const Bridge = struct {
             .zero_rtt => blk: {
                 if (self.handshake_complete) return error.UnsupportedRecordEpoch;
                 const read = self.readZeroRtt() orelse return error.MissingReadKeys;
-                try self.checkInboundRecordSize(read, record);
+                // #359: deliberately *not* size-checked against this
+                // handshake's negotiated limit. RFC 8449 §4 renegotiates the
+                // limit on resumption and governs records by the limits of the
+                // handshake that produced their protection keys; RFC 8446
+                // §4.2.10 puts 0-RTT data in the client's first flight, so it
+                // is created — and may already be in flight — before the
+                // server's EncryptedExtensions answer exists. Enforcing the
+                // value the server settles on afterwards would reject early
+                // data a conforming client had no way to size correctly.
+                //
+                // Applying the *previous* session's bound would be the fuller
+                // answer, but `ResumableSessionCommon` persists no record-size
+                // limit today, so there is no PSK-associated value to honor.
+                // Until there is, early records keep the protocol maximum,
+                // which `record_codec` already enforces. See the epoch-boundary
+                // tests below: the same-sized record is refused once it arrives
+                // at the application epoch.
                 break :blk try read.open(record, out);
             },
         };
@@ -619,6 +635,11 @@ pub const Bridge = struct {
     /// The subtraction is safe because `ReadState.open` is the only consumer
     /// of a shorter payload and rejects it as malformed; a payload that cannot
     /// even hold a tag is left for that path to name.
+    /// Enforce our advertised bound on one arriving protected record.
+    ///
+    /// Applied to the handshake and application epochs only — never to
+    /// `.zero_rtt`, whose records predate the bound they would be judged
+    /// against. See the `.zero_rtt` arm of `openProtected`.
     fn checkInboundRecordSize(
         self: *Bridge,
         read: *const record_protection.ReadState,
@@ -2915,4 +2936,72 @@ test "#359 0-RTT records are never settled retroactively against the server's ow
     // Activation with a much smaller bound must not fail the connection.
     try server.setRecordSizeLimits(.{ .local = 512, .peer = 1024 });
     try testing.expectEqual(@as(u16, 512), server.record_size_limits.local);
+}
+
+test "#359 the negotiated bound governs handshake and application records but never 0-RTT" {
+    // The epoch boundary, stated directly. RFC 8449 §4 governs records by the
+    // limits of the handshake that produced their protection keys, and RFC 8446
+    // §4.2.10 puts 0-RTT data in the client's first flight — created before the
+    // server's answer exists. A server activates its own bound when it *writes*
+    // EncryptedExtensions, which is before the handshake completes, so an early
+    // record can legitimately arrive at a bridge that is already enforcing 512.
+    const cp = testProvider();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+
+    const early = secret(0x81);
+    const hs = secret(0x82);
+    const app = secret(0x83);
+    try client.installTrafficSecret(.zero_rtt, .write, &early);
+    try server.installTrafficSecret(.zero_rtt, .read, &early);
+    // Both directions on both sides: a bridge only leaves the initial phase
+    // once each direction has a handshake secret.
+    const hs_reverse = secret(0x84);
+    try client.installTrafficSecret(.handshake, .write, &hs);
+    try client.installTrafficSecret(.handshake, .read, &hs_reverse);
+    try server.installTrafficSecret(.handshake, .read, &hs);
+    try server.installTrafficSecret(.handshake, .write, &hs_reverse);
+
+    // The server has written its EncryptedExtensions answer: the bound is live.
+    try server.setRecordSizeLimits(.{ .local = 512, .peer = 1024 });
+
+    var out: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const oversized = [_]u8{'e'} ** 2000;
+
+    // 0-RTT: accepted. The client could not have known this bound.
+    const early_record = try client.sealProtected(.zero_rtt, .application_data, &oversized, &out);
+    const opened_early = try server.openProtected(.zero_rtt, try parseSingleRecord(.ciphertext, early_record), &plaintext);
+    try testing.expectEqualSlices(u8, &oversized, opened_early.inner.content);
+    try testing.expectEqual(@as(u64, 0), server.record_size_counters.oversize_records_rejected);
+
+    // Handshake epoch, same size: refused. This one *is* governed by the
+    // bound the server just advertised.
+    const hs_record = try client.sealProtected(.handshake, .handshake, &oversized, &out);
+    try testing.expectError(
+        error.RecordSizeLimitExceeded,
+        server.openProtected(.handshake, try parseSingleRecord(.ciphertext, hs_record), &plaintext),
+    );
+
+    // And once the connection reaches the application epoch, still refused —
+    // the exemption is scoped to the epoch, not to the connection.
+    const app_reverse = secret(0x85);
+    try client.installTrafficSecret(.application, .write, &app);
+    try client.installTrafficSecret(.application, .read, &app_reverse);
+    try server.installTrafficSecret(.application, .read, &app);
+    try server.installTrafficSecret(.application, .write, &app_reverse);
+    try client.discardEpoch(.initial);
+    try server.discardEpoch(.initial);
+    try client.discardEpoch(.handshake);
+    try server.discardEpoch(.handshake);
+    try client.markHandshakeComplete();
+    try server.markHandshakeComplete();
+    const app_record = try client.sealProtected(.application, .application_data, &oversized, &out);
+    try testing.expectError(
+        error.RecordSizeLimitExceeded,
+        server.openProtected(.application, try parseSingleRecord(.ciphertext, app_record), &plaintext),
+    );
+    try testing.expectEqual(@as(u64, 2), server.record_size_counters.oversize_records_rejected);
 }

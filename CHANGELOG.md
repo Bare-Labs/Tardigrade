@@ -24,7 +24,10 @@ All notable user-facing changes to Tardigrade are documented here.
   becomes an enforceable receive bound only once the round trip completes, so a
   peer that ignores the extension still gets ordinary protocol record sizes.
   TLS-over-QUIC has no TLS records: it never offers the extension, and a QUIC
-  server ignores a client that does. Two GnuTLS interop rows assert the
+  server ignores a client that does. 0-RTT records are exempt from the bound:
+  RFC 8446 §4.2.10 puts early data in the client's first flight, before the
+  server's answer exists, so enforcing the value the server later settles on
+  would reject early data a conforming client could not have sized. Two GnuTLS interop rows assert the
   negotiated behaviour against an independent implementation in both roles —
   one proving we honour the peer's limit, one proving the peer honours ours.
 

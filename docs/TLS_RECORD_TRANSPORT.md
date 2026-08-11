@@ -161,10 +161,22 @@ advertised limit.
   to fails with `record_overflow`. When the extension does not negotiate, the
   bound stays at the protocol maximum and the mark can never exceed it, so the
   measurement clears itself.
-* The retained mark covers handshake-epoch records only. A server activates when
-  it *writes* its answer, and 0-RTT records can already be in flight by then —
-  a client cannot honor a bound it has not received, so failing those
-  retroactively would reject legitimate early data.
+* **0-RTT is exempt from the bound entirely**, not merely from the retroactive
+  settle. RFC 8449 §4 renegotiates the limit on resumption and governs records
+  by the limits of the handshake that produced their protection keys; RFC 8446
+  §4.2.10 puts early data in the client's first flight, so it is created — and
+  may already be buffered in flight — before the server's answer exists. A
+  server activates its bound when it *writes* EncryptedExtensions, which is
+  before the handshake completes, so an early record can legitimately arrive at
+  a server already enforcing 512. Judging it against that value would reject
+  early data a conforming client had no way to size correctly.
+
+  The fuller answer would be to honor the *previous* session's bound, but
+  `ResumableSessionCommon` persists no record-size limit today, so there is no
+  PSK-associated value to apply. Until one exists, early records keep the
+  protocol maximum, which `record_codec` already enforces. The exemption is
+  scoped to the epoch, not the connection: the same record size is refused as
+  soon as it arrives at the handshake or application epoch.
 * The client offers it in ClientHello (in both ClientHello1 and ClientHello2,
   at the same position, so an HRR's "ClientHello2 is a legal mutation of
   ClientHello1" check still passes). The server answers in
