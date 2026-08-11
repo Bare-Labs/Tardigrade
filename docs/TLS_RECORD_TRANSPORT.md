@@ -149,6 +149,22 @@ advertised limit.
   limit of 512 must not make us reject a legal 8 KiB record. `Limits.local`
   therefore reports the configured value only when the extension actually
   negotiated, and the protocol maximum otherwise.
+* That split leaves one window, and it is closed retroactively. A client cannot
+  apply its bound to the server's *first* protected flight: until
+  EncryptedExtensions is parsed it does not know whether the server answered at
+  all, and pre-rejecting would break every server that did not. Those
+  handshake-epoch records are therefore opened against the protocol maximum and
+  their inner lengths retained as a high-water mark (EncryptedExtensions may
+  itself be fragmented, so it is a mark across the flight, not one record).
+  `Bridge.setRecordSizeLimits` judges them the moment the bound becomes known: a
+  server that answered extension 28 and then exceeded the value it just agreed
+  to fails with `record_overflow`. When the extension does not negotiate, the
+  bound stays at the protocol maximum and the mark can never exceed it, so the
+  measurement clears itself.
+* The retained mark covers handshake-epoch records only. A server activates when
+  it *writes* its answer, and 0-RTT records can already be in flight by then —
+  a client cannot honor a bound it has not received, so failing those
+  retroactively would reject legitimate early data.
 * The client offers it in ClientHello (in both ClientHello1 and ClientHello2,
   at the same position, so an HRR's "ClientHello2 is a legal mutation of
   ClientHello1" check still passes). The server answers in

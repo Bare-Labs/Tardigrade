@@ -1100,7 +1100,14 @@ pub const PureZigRecordStream = struct {
         // flight this very batch emits, and a client learns the server's limit
         // from EncryptedExtensions and must honor it in the Finished that
         // follows in the same batch.
-        self.refreshRecordSizeLimits() catch |err| return self.fail(err);
+        // A retroactive `RecordSizeLimitExceeded` here means the peer answered
+        // extension 28 and then exceeded the value it had just agreed to.
+        // RFC 8446 §6 makes that a fatal `record_overflow`, so it is deferred
+        // (alert queued, then latched) rather than torn down silently.
+        self.refreshRecordSizeLimits() catch |err| {
+            self.deferHandshakeFailure(err, null);
+            return;
+        };
         // A completion batch may contain application secrets, Client Finished,
         // and handshake-key discard before `handshake_complete`. Validate the
         // batch's final authentication/ALPN state first so policy failure sends
@@ -4422,9 +4429,19 @@ const ScriptedRecordBackend = struct {
     /// How many times the stream released this backend. `Driver.deinit` is not
     /// idempotent, so this must never exceed one.
     deinit_count: usize = 0,
+    /// #359: the server's handshake-epoch Finished payload. Oversizing it is
+    /// how a row makes the server put more on the wire than it agreed to.
+    server_finished: []const u8 = "SF",
     /// #359: the negotiated `record_size_limit` state this scripted backend
     /// reports, standing in for a real handshake's advertisements.
     record_size_limits: record_size.Limits = .{},
+    /// #359: what to report *after* the peer's handshake-epoch flight has been
+    /// processed, standing in for a client learning the server's answer from
+    /// EncryptedExtensions. Before that, `record_size_limits` is reported —
+    /// which is the window in which the server's own flight has already been
+    /// opened against the protocol maximum.
+    record_size_limits_after_flight: ?record_size.Limits = null,
+    handshake_flight_seen: bool = false,
 
     const hs_c2s = secret(0x11);
     const hs_s2c = secret(0x22);
@@ -4450,6 +4467,9 @@ const ScriptedRecordBackend = struct {
 
     fn recordSizeLimits(ptr: *anyopaque) record_size.Limits {
         const self: *ScriptedRecordBackend = @ptrCast(@alignCast(ptr));
+        if (self.handshake_flight_seen) {
+            if (self.record_size_limits_after_flight) |limits| return limits;
+        }
         return self.record_size_limits;
     }
 
@@ -4469,7 +4489,7 @@ const ScriptedRecordBackend = struct {
                     try sink.emitSecret(.handshake, .read, &hs_c2s);
                     try sink.emitSecret(.handshake, .write, &hs_s2c);
                     try sink.emitDiscardEpoch(.initial);
-                    try sink.emitHandshakeBytes(.handshake, "SF");
+                    try sink.emitHandshakeBytes(.handshake, self.server_finished);
                     try sink.emitSecret(.application, .read, &app_c2s);
                     try sink.emitSecret(.application, .write, &app_s2c);
                 } else if (epoch == .handshake and std.mem.eql(u8, bytes, "CF")) {
@@ -4490,7 +4510,11 @@ const ScriptedRecordBackend = struct {
                     try sink.emitSecret(.handshake, .read, &hs_s2c);
                     try sink.emitDiscardEpoch(.initial);
                     if (self.selected_alpn) |protocol| try sink.emitAlpn(protocol);
-                } else if (epoch == .handshake and std.mem.eql(u8, bytes, "SF")) {
+                    // #359: `startsWith` rather than `eql` so a row can make the
+                    // server's Finished large enough to need one oversized
+                    // record; "SF" alone still matches.
+                } else if (epoch == .handshake and std.mem.startsWith(u8, bytes, "SF")) {
+                    self.handshake_flight_seen = true;
                     try sink.emitSecret(.application, .write, &app_c2s);
                     try sink.emitSecret(.application, .read, &app_s2c);
                     // The secure record-stream default requires a client-side
@@ -6849,4 +6873,61 @@ test "#359 an inbound record past our advertised limit fails the stream with rec
         alerts.AlertDescription.record_overflow,
         PureZigRecordStream.mappedFatalAlert(error.RecordSizeLimitExceeded).?,
     );
+}
+
+test "#359 a server that answers extension 28 and then oversizes its own flight gets record_overflow" {
+    // The client-side enforcement gap, end to end. The client advertises 512
+    // but cannot apply it to the server's first protected flight: until that
+    // flight is parsed it does not know whether the server answered extension
+    // 28 at all. Here the server does answer (modelled by the client backend
+    // reporting the negotiated bound once it has processed the flight) *and*
+    // sends a single 2000-byte handshake record. The record is opened against
+    // the protocol maximum, then judged the moment the bound becomes known.
+    const cp = testProvider();
+    var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+    const oversized_finished = "SF" ++ ("p" ** 2000);
+    // The server is unconstrained, so it seals that flight as one record
+    // rather than fragmenting it to the client's bound.
+    var server_backend = ScriptedRecordBackend{ .role = .server, .server_finished = oversized_finished };
+    var client_backend = ScriptedRecordBackend{
+        .role = .client,
+        .record_size_limits = .{},
+        .record_size_limits_after_flight = .{ .local = 512, .peer = record_size.max_limit },
+    };
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    defer client.deinit();
+    try client.setExpectedAlpn("h1");
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    defer server.deinit();
+
+    const errors = driveDriverPairUntilBothErrors(&client, &server);
+    try testing.expectEqual(@as(?anyerror, error.RecordSizeLimitExceeded), errors.client);
+    // The alert actually reached the peer rather than the stream tearing down
+    // silently: RFC 8446 §6 requires `record_overflow` for a record above what
+    // the receiver accepts.
+    try testing.expectEqual(alerts.AlertDescription.record_overflow, server.peerAlert().?);
+    try testing.expect(!client.bridge.handshake_complete);
+    try testing.expectEqual(@as(u64, 1), client.bridge.record_size_counters.oversize_records_rejected);
+}
+
+test "#359 the same oversized flight is accepted when the server never answers extension 28" {
+    // The other half of the same window: a server that does not implement
+    // RFC 8449 is entitled to the protocol maximum, so the identical flight
+    // must complete. Without the offer/negotiated split this would fail.
+    const cp = testProvider();
+    var duplex = Duplex{ .max_chunk = record_codec.max_ciphertext_record_len };
+    const oversized_finished = "SF" ++ ("p" ** 2000);
+    var server_backend = ScriptedRecordBackend{ .role = .server, .server_finished = oversized_finished };
+    // No `record_size_limits_after_flight`: the peer never answered, so the
+    // client keeps reporting the protocol maximum as its enforceable bound.
+    var client_backend = ScriptedRecordBackend{ .role = .client, .record_size_limits = .{} };
+    var client = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .client, cp, .tls_aes_128_gcm_sha256, duplex.clientCarrier(), client_backend.recordBackend());
+    defer client.deinit();
+    try client.setExpectedAlpn("h1");
+    var server = try PureZigRecordStream.initWithCarrierAndBackend(std.testing.allocator, .server, cp, .tls_aes_128_gcm_sha256, duplex.serverCarrier(), server_backend.recordBackend());
+    defer server.deinit();
+
+    try driveBothUntil(&client, &server, bothComplete);
+    try testing.expect(client.bridge.handshake_complete);
+    try testing.expectEqual(@as(u64, 0), client.bridge.record_size_counters.oversize_records_rejected);
 }

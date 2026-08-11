@@ -255,7 +255,7 @@ pub const Counters = struct {
     }
 };
 
-fn saturatingU32(value: usize) u32 {
+pub fn saturatingU32(value: usize) u32 {
     return @intCast(@min(value, @as(usize, std.math.maxInt(u32))));
 }
 

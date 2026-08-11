@@ -125,6 +125,27 @@ pub const Bridge = struct {
     record_padding: record_size.PaddingPolicy = .none,
     /// Observable record-sizing effects. Counters only.
     record_size_counters: record_size.Counters = .{},
+    /// #359: the largest handshake-epoch `TLSInnerPlaintext` opened so far.
+    ///
+    /// A client cannot enforce its advertised limit on the server's *first*
+    /// protected flight. Until EncryptedExtensions is parsed it does not know
+    /// whether the server answered extension 28 at all, and pre-rejecting at
+    /// the advertised value would break every server that did not answer — so
+    /// those records are opened against the protocol maximum and only measured
+    /// here. `setRecordSizeLimits` then settles them retroactively, the moment
+    /// the negotiated bound becomes known.
+    ///
+    /// A high-water mark rather than the single record that completed the
+    /// flight: EncryptedExtensions may itself be fragmented, and any record in
+    /// that flight is equally subject to the bound.
+    ///
+    /// Handshake epoch only, deliberately. A server activates when it *writes*
+    /// its answer, and 0-RTT records can already be in flight by then — a
+    /// client cannot honor a limit it has not received yet, so failing those
+    /// retroactively would reject legitimate early data. On a server no
+    /// handshake-epoch record arrives before it writes that answer (the client's
+    /// Finished follows it), so this stays zero there and the check is inert.
+    pending_handshake_inner_max: u32 = 0,
 
     pub fn init(crypto_provider: provider.CryptoProvider, cipher_suite: algorithms.CipherSuite) Bridge {
         return .{ .crypto_provider = crypto_provider, .cipher_suite = cipher_suite };
@@ -369,6 +390,21 @@ pub const Bridge = struct {
     /// never widen the protocol bound.
     pub fn setRecordSizeLimits(self: *Bridge, limits: record_size.Limits) Error!void {
         try limits.validate();
+        // #359: settle the records that were opened before the bound was
+        // knowable. RFC 8449 §4 applies the limit to protected *handshake*
+        // records too, and RFC 8446 §6 makes an over-length record a fatal
+        // `record_overflow` — so a server that answers extension 28 and then
+        // exceeds the value it just agreed to must be rejected, even though
+        // the offending record could only be measured, not refused, at the
+        // time it arrived.
+        //
+        // Self-clearing when the extension does not negotiate: `local` then
+        // stays at the protocol maximum, which no record can exceed, so there
+        // is nothing to reset explicitly.
+        if (self.pending_handshake_inner_max > limits.local) {
+            self.record_size_counters.oversize_records_rejected +|= 1;
+            return error.RecordSizeLimitExceeded;
+        }
         self.record_size_limits = limits;
     }
 
@@ -562,7 +598,13 @@ pub const Bridge = struct {
         // opened the record: an unauthenticated length is not evidence of
         // anything the peer did.
         if (epoch != .initial) {
-            self.record_size_counters.noteOpened(inner.content.len + 1 + inner.padding_len);
+            const inner_len = inner.content.len + 1 + inner.padding_len;
+            self.record_size_counters.noteOpened(inner_len);
+            // See `pending_handshake_inner_max`: measured now, judged once the
+            // negotiated bound is known.
+            if (epoch == .handshake) {
+                self.pending_handshake_inner_max = @max(self.pending_handshake_inner_max, record_size.saturatingU32(inner_len));
+            }
         }
         return .{ .epoch = epoch, .inner = inner };
     }
@@ -2750,4 +2792,127 @@ test "an invalid padding block is rejected and leaves the policy untouched" {
         bridge.setRecordPadding(.{ .block = record_size.PaddingPolicy.max_block + 1 }),
     );
     try testing.expectEqual(record_size.PaddingPolicy.none, bridge.record_padding);
+}
+
+test "#359 a handshake record opened before the bound was knowable is settled retroactively" {
+    // The client-side gap: until EncryptedExtensions is parsed, a client that
+    // advertised 512 cannot know whether the server answered extension 28, so
+    // the server's first protected flight is opened against the protocol
+    // maximum. If the server *did* answer, that flight was still subject to
+    // the bound, and the only place left to say so is activation.
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+
+    const hs_s2c = secret(0x71);
+    const hs_c2s = secret(0x72);
+    try client.installTrafficSecret(.handshake, .read, &hs_s2c);
+    try client.installTrafficSecret(.handshake, .write, &hs_c2s);
+    try server.installTrafficSecret(.handshake, .write, &hs_s2c);
+    try server.installTrafficSecret(.handshake, .read, &hs_c2s);
+
+    // The server ignores the client's (not yet known to it) bound and sends a
+    // 2000-byte handshake record. The client accepts it — it has nothing to
+    // check against yet.
+    const flight = [_]u8{'h'} ** 2000;
+    var out: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const sealed = try server.sealHandshake(.handshake, &flight, &out);
+    const opened = try client.openHandshake(.handshake, try parseSingleRecord(.ciphertext, sealed), &plaintext);
+    try testing.expectEqual(@as(usize, 2000), opened.inner.content.len);
+    try testing.expectEqual(@as(u32, 2001), client.pending_handshake_inner_max);
+
+    // Activation settles it: 2001 > 512, so the connection fails now.
+    try testing.expectError(
+        error.RecordSizeLimitExceeded,
+        client.setRecordSizeLimits(.{ .local = 512, .peer = 1024 }),
+    );
+    try testing.expectEqual(@as(u64, 1), client.record_size_counters.oversize_records_rejected);
+    // The rejected limits were not installed.
+    try testing.expectEqual(record_size.default_limit, client.record_size_limits.local);
+}
+
+test "#359 a pre-activation handshake record within the bound activates cleanly" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+
+    const hs_s2c = secret(0x73);
+    const hs_c2s = secret(0x74);
+    try client.installTrafficSecret(.handshake, .read, &hs_s2c);
+    try client.installTrafficSecret(.handshake, .write, &hs_c2s);
+    try server.installTrafficSecret(.handshake, .write, &hs_s2c);
+    try server.installTrafficSecret(.handshake, .read, &hs_c2s);
+
+    // 511 content bytes + the content-type byte is exactly the 512 bound.
+    const flight = [_]u8{'h'} ** 511;
+    var out: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const sealed = try server.sealHandshake(.handshake, &flight, &out);
+    _ = try client.openHandshake(.handshake, try parseSingleRecord(.ciphertext, sealed), &plaintext);
+    try testing.expectEqual(@as(u32, 512), client.pending_handshake_inner_max);
+
+    try client.setRecordSizeLimits(.{ .local = 512, .peer = 1024 });
+    try testing.expectEqual(@as(u16, 512), client.record_size_limits.local);
+    try testing.expectEqual(@as(u64, 0), client.record_size_counters.oversize_records_rejected);
+}
+
+test "#359 an unanswered extension leaves pre-activation handshake records alone" {
+    // The self-clearing property: when the peer never answers, `local` stays
+    // at the protocol maximum, which no record can exceed — so a large early
+    // flight must not retroactively fail a connection that simply never
+    // negotiated the extension.
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+
+    const hs_s2c = secret(0x75);
+    const hs_c2s = secret(0x76);
+    try client.installTrafficSecret(.handshake, .read, &hs_s2c);
+    try client.installTrafficSecret(.handshake, .write, &hs_c2s);
+    try server.installTrafficSecret(.handshake, .write, &hs_s2c);
+    try server.installTrafficSecret(.handshake, .read, &hs_c2s);
+
+    const flight = [_]u8{'h'} ** record_codec.max_plaintext_fragment_len;
+    var out: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const sealed = try server.sealHandshake(.handshake, &flight, &out);
+    _ = try client.openHandshake(.handshake, try parseSingleRecord(.ciphertext, sealed), &plaintext);
+
+    // What an un-negotiated connection reports: the protocol maximum.
+    try client.setRecordSizeLimits(.{ .local = record_size.default_limit, .peer = null });
+    try testing.expectEqual(@as(u64, 0), client.record_size_counters.oversize_records_rejected);
+}
+
+test "#359 0-RTT records are never settled retroactively against the server's own bound" {
+    // A client cannot honor a limit it has not received: it sends early data
+    // before EncryptedExtensions exists. A server activates when it *writes*
+    // that answer, so failing in-flight 0-RTT records at that moment would
+    // reject legitimate early data. Only handshake-epoch records are retained.
+    const cp = testProvider();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+
+    const early = secret(0x77);
+    try client.installTrafficSecret(.zero_rtt, .write, &early);
+    try server.installTrafficSecret(.zero_rtt, .read, &early);
+
+    const payload = [_]u8{'e'} ** 2000;
+    var out: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const sealed = try client.sealProtected(.zero_rtt, .application_data, &payload, &out);
+    _ = try server.openProtected(.zero_rtt, try parseSingleRecord(.ciphertext, sealed), &plaintext);
+    try testing.expectEqual(@as(u32, 0), server.pending_handshake_inner_max);
+
+    // Activation with a much smaller bound must not fail the connection.
+    try server.setRecordSizeLimits(.{ .local = 512, .peer = 1024 });
+    try testing.expectEqual(@as(u16, 512), server.record_size_limits.local);
 }
