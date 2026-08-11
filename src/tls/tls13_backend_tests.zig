@@ -3169,6 +3169,13 @@ test "record and extension profiles preserve independent traffic-secret goldens"
     defer extension.deinit();
     try extension.run();
 
+    // #359: the *record* goldens moved again when record mode began offering
+    // `record_size_limit` in its ClientHello — the extension is transcript
+    // input, so every secret derived from it legitimately changed. The
+    // extension goldens are untouched, which is the property this test exists
+    // to hold: the QUIC profile does not offer RFC 8449 and its wire bytes
+    // must not drift when the record profile's do.
+    //
     // Golden values recomputed for #490: X25519 key-share generation now
     // draws its randomness from the injected `CryptoProvider.entropy`
     // (`DirectHarness`'s own `client_provider_storage`/
@@ -3178,10 +3185,10 @@ test "record and extension profiles preserve independent traffic-secret goldens"
     // and every secret derived from it — legitimately changed. Still fully
     // deterministic; recomputed by capturing this harness's own output.
     const record_goldens = [_][tls_backend.hash_len]u8{
-        secretGolden("562a506fe3b7e55763cb374bbeddf37d2f69d0ec5c8a8f8c00a06ac867a8cfed"),
-        secretGolden("9513b75f9bb12a4212c0888ab739d9bd2b75ad25ed406962d0804a69a1c5129f"),
-        secretGolden("dac1c91c15cdc4213b17931028b5d4174fef1344d14f9546bc20b42dcd7462c7"),
-        secretGolden("6626393f198c2779e2244c3b7e2dac51b44b1b1011055af9e7d93be1774ccb76"),
+        secretGolden("663e88bfb6fe69034d56689f1825afa53464eb9a7e25f184fd1d4dca038b9a22"),
+        secretGolden("ddd6d6d7b9dd196dd7b9b290ebb15d004efd16e17080cb66cce6e332687a8ba0"),
+        secretGolden("c2702e261bd5db283a6c35315479ac04bdb4a07c466d5160287a7f65762b03cc"),
+        secretGolden("59cc7445ab6f017d6108884c074492b094c6ab8a06cddad3354c94f11dc6f5b2"),
     };
     const extension_goldens = [_][tls_backend.hash_len]u8{
         secretGolden("77072190f185201fe873979e7041bad67727e1194d2baf8adfdd4ebf99ab10c1"),
@@ -4468,12 +4475,17 @@ fn findSecretEvent(sink: *const DirectSink, epoch: events.EncryptionEpoch, direc
 /// verified against an external, non-Zig implementation of the key
 /// schedule. The RFC 8448 vectors in `key_schedule.zig` remain the
 /// independent cross-check for the HKDF chain itself.
-const kat_rebound_transcript_hash = "5bfb51c897aea5192ab702f84c0cf2f9278b7d34a1d1ea5dcbde63aaa4287467";
-const kat_ch2_binder = "5b192fe318a338a3f71450de6668f10a8aa0329983b0112d19f7c857da1bddd2";
-const kat_client_hs_traffic = "14e4e36f393b5921b5e22e382b575d6ba46629807a99cd7492c8faab77ebf3f8";
-const kat_server_hs_traffic = "3663c763c789dc344190a0aa75ea73d22d4222e7dd654d9722298e2bec67accf";
-const kat_client_ap_traffic = "44b828262e6c63eef446a5250f47d902165596d5ad6fcbdb67a1de4252692aa7";
-const kat_server_ap_traffic = "a69e28ee0032c7e7fb5db9b08148d22e672de75169027fd35761d75d310d1719";
+///
+/// #359: repinned once more when record mode started offering RFC 8449's
+/// `record_size_limit`. Both ClientHellos carry the new extension, so the
+/// rebound binder transcript — and therefore every secret below it — changed
+/// with the wire bytes. Nothing about the key schedule itself moved.
+const kat_rebound_transcript_hash = "fb3115c0b053ab6507ece8e0ab58bbe58e2a00d19e63c4b4a17cfe9855380afb";
+const kat_ch2_binder = "9a3afd7699f66a9aaa4b683fea77c1555a64bb8527c57102dc2254d9a83194bc";
+const kat_client_hs_traffic = "b00b934b5a2a5c6ff0c8fcc91f377d9756b4bbbe91a76fc7ad0451180e42ece9";
+const kat_server_hs_traffic = "b3a6cf46713e7b25f67b539c18adf220eef3d4f2dc8ccf45b1c02d71aaaa2058";
+const kat_client_ap_traffic = "7982ae3d8d5555420ee9db003b4072133fd06780202ca4b5aff65a5f5afe716f";
+const kat_server_ap_traffic = "97500698f9c2f3f6be6e966ea363f4f280366c54f1aecac72940b059676e0a39";
 
 test "#485 KAT: PSK-resumed HRR handshake/application secrets match an independently computed RFC 8446 key schedule" {
     var client_provider_storage: ProviderStorage = .{};
@@ -7501,6 +7513,10 @@ const ClientHelloOptions = struct {
     /// offer, for driving an extension-profile (#392 HTTP/3) server through
     /// selection the same way a real QUIC client would.
     transport_extension: ?struct { extension_type: u16, payload: []const u8 } = null,
+    /// #359: the raw `record_size_limit` (RFC 8449) value to advertise,
+    /// written verbatim so a test can offer values a conforming client never
+    /// would (below 64, above the TLS 1.3 maximum).
+    record_size_limit: ?u16 = null,
     /// #362: offer one or more resumption PSKs, in order, as the
     /// (necessarily last) ClientHello extension. Each binder is computed
     /// over the exact bytes this function ends up producing, from the
@@ -7625,6 +7641,12 @@ fn buildClientHello(buf: []u8, opts: ClientHelloOptions) ![]const u8 {
         try w.u16_(transport.extension_type);
         try w.u16_(@intCast(transport.payload.len));
         try w.bytes(transport.payload);
+    }
+    // record_size_limit (#359)
+    if (opts.record_size_limit) |limit| {
+        try w.u16_(tls_core.record_size.extension_type);
+        try w.u16_(tls_core.record_size.body_len);
+        try w.bytes(&tls_core.record_size.encodeBody(limit));
     }
     // pre_shared_key (#362): must be the last extension.
     var psk_offer: ?pre_shared_key.ClientOfferWrite = null;
@@ -13312,4 +13334,154 @@ test "#357 usage limits report when a proactive update is due without forcing on
     try std.testing.expect(!h.client.keyUpdateDue());
     try std.testing.expectEqual(@as(u64, 0), h.client.bridge.applicationRecordsSealed());
     try std.testing.expectEqual(@as(u64, 1), h.client.bridge.write_key_generation);
+}
+
+// ===========================================================================
+// #359: end-to-end `record_size_limit` (RFC 8449) negotiation.
+// ===========================================================================
+
+const record_size = tls_core.record_size;
+
+fn recordSizeLimitPolicy(limit: u16) tls_core.policy.Policy {
+    var policy = tls_core.policy.Policy.recordH2Only();
+    policy.record_size_limit = limit;
+    return policy;
+}
+
+test "#359 a record handshake negotiates each side's advertised limit independently" {
+    var harness: DirectHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+    // Replace both backends with ones that advertise distinct, non-default
+    // limits, so a value leaking from one side to the other is visible.
+    harness.client_backend.deinit();
+    harness.server_backend.deinit();
+    harness.client_backend = tls_backend.Tls13Backend.initClientConfigured(
+        clientEntropy(),
+        harness.client_provider_storage.provider.cryptoProvider(),
+        .{ .pinned_certificate = tls_backend.testdata.certificate_der },
+        tls_backend.recordConfig(recordSizeLimitPolicy(4096)),
+        .{},
+    );
+    harness.server_backend = tls_backend.Tls13Backend.initServerConfigured(
+        serverEntropy(),
+        harness.server_provider_storage.provider.cryptoProvider(),
+        fixtureIdentity(),
+        tls_backend.recordConfig(recordSizeLimitPolicy(2048)),
+    );
+
+    try harness.run();
+
+    const client_limits = harness.client_backend.recordSizeLimits();
+    try std.testing.expectEqual(@as(u16, 4096), client_limits.local);
+    try std.testing.expectEqual(@as(?u16, 2048), client_limits.peer);
+    try std.testing.expectEqual(@as(usize, 2047), client_limits.outboundContentMax());
+
+    const server_limits = harness.server_backend.recordSizeLimits();
+    try std.testing.expectEqual(@as(u16, 2048), server_limits.local);
+    try std.testing.expectEqual(@as(?u16, 4096), server_limits.peer);
+    try std.testing.expectEqual(@as(usize, 4095), server_limits.outboundContentMax());
+}
+
+test "#359 the default record handshake advertises the protocol maximum and constrains nothing" {
+    var harness: DirectHarness = undefined;
+    harness.init();
+    defer harness.deinit();
+    try harness.run();
+
+    for ([_]record_size.Limits{
+        harness.client_backend.recordSizeLimits(),
+        harness.server_backend.recordSizeLimits(),
+    }) |limits| {
+        try std.testing.expectEqual(record_size.max_limit, limits.local);
+        try std.testing.expectEqual(@as(?u16, record_size.max_limit), limits.peer);
+        try std.testing.expect(!limits.peerConstrains());
+    }
+}
+
+test "#359 a server clamps an above-maximum client advertisement rather than rejecting it" {
+    var server_provider_storage: ProviderStorage = .{};
+    var server = tls_backend.Tls13Backend.initServer(
+        serverEntropy(),
+        server_provider_storage.init(server_provider_seed),
+        fixtureIdentity(),
+        .record,
+    );
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    // RFC 8449 §4: "A server MUST NOT enforce this restriction; a client might
+    // advertise a higher limit that is enabled by an extension or version the
+    // server does not understand." The handshake proceeds, clamped.
+    var buf: [2048]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .record_size_limit = 65535 });
+    try server.backend().receive(.initial, hello, &sink);
+    try std.testing.expectEqual(@as(?u16, record_size.max_limit), server.recordSizeLimits().peer);
+}
+
+test "#359 a server rejects a below-minimum client advertisement with illegal_parameter" {
+    for ([_]u16{ 0, 1, record_size.min_limit - 1 }) |limit| {
+        var server_provider_storage: ProviderStorage = .{};
+        var server = tls_backend.Tls13Backend.initServer(
+            serverEntropy(),
+            server_provider_storage.init(server_provider_seed),
+            fixtureIdentity(),
+            .record,
+        );
+        defer server.deinit();
+        var sink = DirectSink{};
+        defer sink.deinit();
+        try server.backend().start(.server, {}, &sink);
+
+        var buf: [2048]u8 = undefined;
+        const hello = try buildClientHello(&buf, .{ .record_size_limit = limit });
+        try std.testing.expectError(error.IllegalParameter, server.backend().receive(.initial, hello, &sink));
+    }
+}
+
+test "#359 a server accepts a client that never advertises, and treats it as the protocol maximum" {
+    var server_provider_storage: ProviderStorage = .{};
+    var server = tls_backend.Tls13Backend.initServer(
+        serverEntropy(),
+        server_provider_storage.init(server_provider_seed),
+        fixtureIdentity(),
+        .record,
+    );
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [2048]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try server.backend().receive(.initial, hello, &sink);
+    const limits = server.recordSizeLimits();
+    try std.testing.expectEqual(@as(?u16, null), limits.peer);
+    try std.testing.expectEqual(@as(usize, record_size.max_limit), limits.outboundInnerMax());
+}
+
+test "#359 a QUIC-profile server rejects a client that offers record_size_limit" {
+    var server_provider_storage: ProviderStorage = .{};
+    var server = tls_backend.Tls13Backend.initServer(
+        serverEntropy(),
+        server_provider_storage.init(server_provider_seed),
+        fixtureIdentity(),
+        .{ .extension = .{ .extension_type = 57, .local = "server transport parameters" } },
+    );
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    // RFC 8449 bounds TLS *records*; TLS-over-QUIC has none, so this is an
+    // extension the endpoint never offered and cannot honor.
+    var buf: [2048]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{
+        .alpn_protocols = &.{"h3"},
+        .transport_extension = .{ .extension_type = 57, .payload = "client transport parameters" },
+        .record_size_limit = 4096,
+    });
+    try std.testing.expectError(error.UnsupportedExtension, server.backend().receive(.initial, hello, &sink));
 }

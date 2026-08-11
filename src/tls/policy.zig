@@ -2,6 +2,7 @@
 
 const state = @import("state.zig");
 const algorithms = @import("algorithms.zig");
+const record_size = @import("record_size.zig");
 
 pub const CipherSuite = algorithms.CipherSuite;
 pub const NamedGroup = algorithms.NamedGroup;
@@ -57,6 +58,17 @@ pub const Policy = struct {
     alpn_protocols: []const ProtocolName,
     require_sni: bool = false,
     allow_absent_alpn: bool = false,
+    /// The `record_size_limit` this endpoint advertises (RFC 8449, #359): the
+    /// largest `TLSInnerPlaintext` it is willing to *receive*. Defaults to the
+    /// TLS 1.3 protocol maximum, so the extension is offered but constrains
+    /// nothing until an operator lowers it — an endpoint that supports every
+    /// record size interoperates most widely by saying exactly that.
+    ///
+    /// Record transport only. RFC 8449 is defined over TLS/DTLS records, which
+    /// QUIC does not use (RFC 9001 carries handshake bytes in CRYPTO frames
+    /// and bounds application data with its own flow control), so a
+    /// `.quic` policy never puts this on the wire.
+    record_size_limit: u16 = record_size.default_limit,
 
     pub fn quicDefault() Policy {
         return .{

@@ -15,13 +15,23 @@ const events = @import("events.zig");
 const key_schedule = @import("key_schedule.zig");
 const record_codec = @import("record_codec.zig");
 const record_protection = @import("record_protection.zig");
+const record_size = @import("record_size.zig");
 const tls_state = @import("state.zig");
 const transport = @import("transport.zig");
 
 const provider = crypto.provider;
 const secrets = crypto.secrets;
 
-pub const Error = record_codec.Error || record_protection.Error || key_schedule.Error || error{
+pub const Error = record_codec.Error || record_protection.Error || key_schedule.Error ||
+    record_size.ConfigError || error{
+    /// A protected record's `TLSInnerPlaintext` exceeded the `record_size_limit`
+    /// this endpoint advertised (RFC 8449 §4), so the peer sent more than it
+    /// was told we would accept. Distinct from `RecordTooLarge`, which is the
+    /// *protocol* maximum: this one is the smaller, negotiated bound, and it
+    /// carries the `record_overflow` alert for the same reason RFC 8446 §6
+    /// gives one to an over-length record at all.
+    RecordSizeLimitExceeded,
+} || error{
     UnsupportedRecordEpoch,
     DuplicateTrafficSecret,
     MissingReadKeys,
@@ -103,6 +113,18 @@ pub const Bridge = struct {
     /// Starting a new session is `Bridge.init`, which yields a fresh value
     /// with this cleared.
     torn_down: bool = false,
+    /// Negotiated `record_size_limit` state (#359). Defaults to the protocol
+    /// maximum in both directions, which is exactly the behavior of a
+    /// connection where the extension never appeared — so a bridge driven
+    /// without a handshake backend (the low-level record-plumbing paths) is
+    /// unaffected by this feature existing.
+    record_size_limits: record_size.Limits = .{},
+    /// Local, non-negotiated padding policy (RFC 8446 §5.4). Off by default;
+    /// applies only to `application_data`, never to handshake records — see
+    /// `sealProtected`.
+    record_padding: record_size.PaddingPolicy = .none,
+    /// Observable record-sizing effects. Counters only.
+    record_size_counters: record_size.Counters = .{},
 
     pub fn init(crypto_provider: provider.CryptoProvider, cipher_suite: algorithms.CipherSuite) Bridge {
         return .{ .crypto_provider = crypto_provider, .cipher_suite = cipher_suite };
@@ -339,8 +361,40 @@ pub const Bridge = struct {
         return state.sequence;
     }
 
+    /// Install the negotiated `record_size_limit` state (#359).
+    ///
+    /// Both halves are validated here rather than trusted: `local` is our own
+    /// advertisement and must be one we could legally have sent, and `peer`
+    /// is clamped by `Limits.outboundInnerMax` so an out-of-range value can
+    /// never widen the protocol bound.
+    pub fn setRecordSizeLimits(self: *Bridge, limits: record_size.Limits) Error!void {
+        try limits.validate();
+        self.record_size_limits = limits;
+    }
+
+    /// Install the local padding policy (RFC 8446 §5.4). Purely local: nothing
+    /// about it is negotiated, and a peer cannot observe it except as record
+    /// lengths that no longer reveal content lengths.
+    pub fn setRecordPadding(self: *Bridge, padding: record_size.PaddingPolicy) Error!void {
+        try padding.validate();
+        self.record_padding = padding;
+    }
+
+    /// The largest *content* one outgoing protected record may carry: the
+    /// protocol fragment maximum, narrowed by whatever the peer advertised.
+    /// This is the fragmentation unit for every protected write, which is why
+    /// it is public — `encrypted_stream` sizes its own writes from it rather
+    /// than discovering the bound by failing a seal.
+    pub fn outboundContentMax(self: *const Bridge) usize {
+        return @min(record_codec.max_plaintext_fragment_len, self.record_size_limits.outboundContentMax());
+    }
+
     pub fn sealHandshake(self: *Bridge, epoch: events.EncryptionEpoch, bytes: []const u8, out: []u8) Error![]const u8 {
-        if (bytes.len <= record_codec.max_plaintext_fragment_len) {
+        // Unprotected records are not subject to `record_size_limit`
+        // (RFC 8449 §4: "Unprotected messages are not subject to this
+        // limit"), so the initial epoch keeps the full protocol fragment.
+        const content_max = if (epoch == .initial) record_codec.max_plaintext_fragment_len else self.outboundContentMax();
+        if (bytes.len <= content_max) {
             return self.sealProtected(epoch, .handshake, bytes, out);
         }
         return switch (epoch) {
@@ -360,22 +414,23 @@ pub const Bridge = struct {
             },
             .handshake => blk: {
                 const write = self.writeHandshake() orelse return error.MissingWriteKeys;
-                break :blk try sealHandshakeFragments(write, bytes, out);
+                break :blk try sealHandshakeFragments(write, bytes, content_max, out);
             },
             .application => blk: {
                 if (!self.handshake_complete) return error.HandshakeNotComplete;
                 const write = self.writeApplication() orelse return error.MissingWriteKeys;
-                break :blk try sealHandshakeFragments(write, bytes, out);
+                break :blk try sealHandshakeFragments(write, bytes, content_max, out);
             },
             .zero_rtt => blk: {
                 if (self.handshake_complete) return error.UnsupportedRecordEpoch;
                 const write = self.writeZeroRtt() orelse return error.MissingWriteKeys;
-                break :blk try sealHandshakeFragments(write, bytes, out);
+                break :blk try sealHandshakeFragments(write, bytes, content_max, out);
             },
         };
     }
 
     pub fn sealedHandshakeLen(self: *Bridge, epoch: events.EncryptionEpoch, bytes_len: usize) Error!usize {
+        const content_max = self.outboundContentMax();
         return switch (epoch) {
             .initial => if (self.initial_discarded)
                 error.UnsupportedRecordEpoch
@@ -383,17 +438,17 @@ pub const Bridge = struct {
                 try plaintextHandshakeRecordLen(bytes_len),
             .handshake => blk: {
                 const write = self.writeHandshake() orelse return error.MissingWriteKeys;
-                break :blk try protectedHandshakeRecordLen(write, bytes_len);
+                break :blk try protectedHandshakeRecordLen(write, bytes_len, content_max);
             },
             .application => blk: {
                 if (!self.handshake_complete) return error.HandshakeNotComplete;
                 const write = self.writeApplication() orelse return error.MissingWriteKeys;
-                break :blk try protectedHandshakeRecordLen(write, bytes_len);
+                break :blk try protectedHandshakeRecordLen(write, bytes_len, content_max);
             },
             .zero_rtt => blk: {
                 if (self.handshake_complete) return error.UnsupportedRecordEpoch;
                 const write = self.writeZeroRtt() orelse return error.MissingWriteKeys;
-                break :blk try protectedHandshakeRecordLen(write, bytes_len);
+                break :blk try protectedHandshakeRecordLen(write, bytes_len, content_max);
             },
         };
     }
@@ -405,30 +460,49 @@ pub const Bridge = struct {
         bytes: []const u8,
         out: []u8,
     ) Error![]const u8 {
-        return switch (epoch) {
-            .initial => if (self.initial_discarded)
-                error.UnsupportedRecordEpoch
-            else if (content_type == .handshake)
-                record_codec.encodePlaintextRecord(.handshake, bytes, out)
-            else
-                error.UnsupportedRecordEpoch,
+        if (epoch != .initial) {
+            // Fail closed rather than silently truncating: a caller that hands
+            // this more content than the peer agreed to receive has a sizing
+            // bug, and quietly dropping the tail would corrupt the stream.
+            if (bytes.len > self.outboundContentMax()) return error.RecordSizeLimitExceeded;
+        }
+        // RFC 8446 §5.4 padding is applied only to `application_data`.
+        // Handshake records carry messages whose lengths are already fixed by
+        // the protocol and visible in the transcript, so padding them buys no
+        // privacy while inflating a latency-critical flight; alerts are two
+        // bytes and are the one record type whose size an implementation
+        // should not vary at all.
+        const padding_len = if (epoch != .initial and content_type == .application_data)
+            self.record_padding.paddingFor(bytes.len, self.record_size_limits.outboundInnerMax())
+        else
+            0;
+        const sealed = switch (epoch) {
+            .initial => blk: {
+                if (self.initial_discarded) return error.UnsupportedRecordEpoch;
+                if (content_type != .handshake) return error.UnsupportedRecordEpoch;
+                break :blk try record_codec.encodePlaintextRecord(.handshake, bytes, out);
+            },
             .handshake => blk: {
                 const write = self.writeHandshake() orelse return error.MissingWriteKeys;
-                break :blk try write.seal(content_type, bytes, 0, out);
+                break :blk try write.seal(content_type, bytes, padding_len, out);
             },
             .application => blk: {
                 if (!self.handshake_complete and content_type != .alert) return error.HandshakeNotComplete;
                 const write = self.writeApplication() orelse return error.MissingWriteKeys;
-                break :blk try write.seal(content_type, bytes, 0, out);
+                break :blk try write.seal(content_type, bytes, padding_len, out);
             },
             .zero_rtt => blk: {
                 if (self.handshake_complete or
                     !(content_type == .application_data or content_type == .handshake))
                     return error.UnsupportedRecordEpoch;
                 const write = self.writeZeroRtt() orelse return error.MissingWriteKeys;
-                break :blk try write.seal(content_type, bytes, 0, out);
+                break :blk try write.seal(content_type, bytes, padding_len, out);
             },
         };
+        // Only counted once the record actually exists: a failed seal sent
+        // nothing, so it padded nothing.
+        self.record_size_counters.notePadding(padding_len);
+        return sealed;
     }
 
     pub fn sealApplicationData(self: *Bridge, bytes: []const u8, out: []u8) Error![]const u8 {
@@ -464,20 +538,46 @@ pub const Bridge = struct {
             },
             .handshake => blk: {
                 const read = self.readHandshake() orelse return error.MissingReadKeys;
+                try self.checkInboundRecordSize(read, record);
                 break :blk try read.open(record, out);
             },
             .application => blk: {
                 if (!self.handshake_complete) return error.HandshakeNotComplete;
                 const read = self.readApplication() orelse return error.MissingReadKeys;
+                try self.checkInboundRecordSize(read, record);
                 break :blk try read.open(record, out);
             },
             .zero_rtt => blk: {
                 if (self.handshake_complete) return error.UnsupportedRecordEpoch;
                 const read = self.readZeroRtt() orelse return error.MissingReadKeys;
+                try self.checkInboundRecordSize(read, record);
                 break :blk try read.open(record, out);
             },
         };
         return .{ .epoch = epoch, .inner = inner };
+    }
+
+    /// Reject a protected record whose `TLSInnerPlaintext` would exceed the
+    /// limit we advertised (RFC 8449 §4), *before* spending an AEAD open on it.
+    ///
+    /// The inner length is recovered from the ciphertext length rather than
+    /// measured after decryption on purpose: the whole point of advertising a
+    /// limit is to bound the work an unauthenticated peer can make us do, and
+    /// a check that only fires post-decryption would already have done it.
+    /// The subtraction is safe because `ReadState.open` is the only consumer
+    /// of a shorter payload and rejects it as malformed; a payload that cannot
+    /// even hold a tag is left for that path to name.
+    fn checkInboundRecordSize(
+        self: *Bridge,
+        read: *const record_protection.ReadState,
+        record: record_codec.Record,
+    ) Error!void {
+        const tag_len = read.keys.profile.aead.tagLength();
+        if (record.payload.len < tag_len) return;
+        const inner_len = record.payload.len - tag_len;
+        if (inner_len <= self.record_size_limits.inboundInnerMax()) return;
+        self.record_size_counters.oversize_records_rejected +|= 1;
+        return error.RecordSizeLimitExceeded;
     }
 
     pub fn openApplicationData(self: *Bridge, record: record_codec.Record, out: []u8) Error!OpenedRecord {
@@ -572,19 +672,26 @@ fn clearWrite(slot: *?record_protection.WriteState) void {
 /// because callers (`plaintextHandshakeRecordLen`/
 /// `protectedHandshakeRecordLen`) add `bytes_len` back on top of the chunk
 /// overhead, and that addition can overflow even though this one can't.
-fn chunkCount(bytes_len: usize) Error!usize {
+fn chunkCount(bytes_len: usize, chunk_size: usize) Error!usize {
     if (bytes_len == 0) return 0;
-    return std.math.divCeil(usize, bytes_len, record_codec.max_plaintext_fragment_len) catch error.RecordTooLarge;
+    // `chunk_size` is `Bridge.outboundContentMax`, which is at least
+    // `record_size.min_limit - 1` (63) and never zero, so this cannot divide
+    // by zero on any reachable path.
+    return std.math.divCeil(usize, bytes_len, chunk_size) catch error.RecordTooLarge;
 }
 
 fn plaintextHandshakeRecordLen(bytes_len: usize) Error!usize {
-    const chunks = try chunkCount(bytes_len);
+    const chunks = try chunkCount(bytes_len, record_codec.max_plaintext_fragment_len);
     const overhead = std.math.mul(usize, chunks, record_codec.header_len) catch return error.RecordTooLarge;
     return std.math.add(usize, bytes_len, overhead) catch error.RecordTooLarge;
 }
 
-fn protectedHandshakeRecordLen(write: *const record_protection.WriteState, bytes_len: usize) Error!usize {
-    const chunks = try chunkCount(bytes_len);
+fn protectedHandshakeRecordLen(
+    write: *const record_protection.WriteState,
+    bytes_len: usize,
+    content_max: usize,
+) Error!usize {
+    const chunks = try chunkCount(bytes_len, content_max);
     const per_chunk_overhead = record_codec.header_len + 1 + write.keys.profile.aead.tagLength();
     const overhead = std.math.mul(usize, chunks, per_chunk_overhead) catch return error.RecordTooLarge;
     return std.math.add(usize, bytes_len, overhead) catch error.RecordTooLarge;
@@ -593,18 +700,19 @@ fn protectedHandshakeRecordLen(write: *const record_protection.WriteState, bytes
 fn sealHandshakeFragments(
     write: *record_protection.WriteState,
     bytes: []const u8,
+    content_max: usize,
     out: []u8,
 ) Error![]const u8 {
     if (write.exhausted) return error.SequenceExhausted;
-    const chunks = try chunkCount(bytes.len);
+    const chunks = try chunkCount(bytes.len, content_max);
     if (chunks > 0 and chunks - 1 > std.math.maxInt(u64) - write.sequence) return error.SequenceExhausted;
-    const needed = try protectedHandshakeRecordLen(write, bytes.len);
+    const needed = try protectedHandshakeRecordLen(write, bytes.len, content_max);
     if (out.len < needed) return error.RecordBufferOverflow;
 
     var in_pos: usize = 0;
     var out_pos: usize = 0;
     while (in_pos < bytes.len) {
-        const take = @min(record_codec.max_plaintext_fragment_len, bytes.len - in_pos);
+        const take = @min(content_max, bytes.len - in_pos);
         const record = try write.seal(.handshake, bytes[in_pos..][0..take], 0, out[out_pos..]);
         in_pos += take;
         out_pos += record.len;
@@ -649,10 +757,15 @@ fn expectAes128TrafficKeys(traffic_secret: [32]u8, keys: record_protection.Traff
 const testing = std.testing;
 
 test "chunkCount stays overflow-safe at a synthetic near-usize-max bytes_len" {
-    try testing.expectEqual(@as(usize, 0), try chunkCount(0));
-    try testing.expectEqual(@as(usize, 1), try chunkCount(1));
-    try testing.expectEqual(@as(usize, 1), try chunkCount(record_codec.max_plaintext_fragment_len));
-    try testing.expectEqual(@as(usize, 2), try chunkCount(record_codec.max_plaintext_fragment_len + 1));
+    const full = record_codec.max_plaintext_fragment_len;
+    try testing.expectEqual(@as(usize, 0), try chunkCount(0, full));
+    try testing.expectEqual(@as(usize, 1), try chunkCount(1, full));
+    try testing.expectEqual(@as(usize, 1), try chunkCount(full, full));
+    try testing.expectEqual(@as(usize, 2), try chunkCount(full + 1, full));
+    // #359: a narrower negotiated `record_size_limit` is just a smaller chunk
+    // size here -- the same arithmetic, applied to the bound the peer set.
+    try testing.expectEqual(@as(usize, 2), try chunkCount(64, 63));
+    try testing.expectEqual(@as(usize, 1), try chunkCount(63, 63));
     // `divCeil`'s `@divFloor(numerator - 1, denominator) + 1` form (unlike
     // the naive `(numerator + denominator - 1) / denominator` idiom this
     // replaced) cannot itself overflow for a positive numerator/denominator,
@@ -662,8 +775,8 @@ test "chunkCount stays overflow-safe at a synthetic near-usize-max bytes_len" {
     // `plaintextHandshakeRecordLen`/`protectedHandshakeRecordLen`'s
     // `bytes_len + chunks * overhead` addition (see the next test).
     try testing.expectEqual(
-        try std.math.divCeil(usize, std.math.maxInt(usize), record_codec.max_plaintext_fragment_len),
-        try chunkCount(std.math.maxInt(usize)),
+        try std.math.divCeil(usize, std.math.maxInt(usize), full),
+        try chunkCount(std.math.maxInt(usize), full),
     );
 }
 
@@ -2380,4 +2493,249 @@ test "applicationRecordsSealed tracks the current generation's sequence for usag
     // the sequence rather than tracking a lifetime total.
     try client.updateTrafficSecret(.write);
     try testing.expectEqual(@as(u64, 0), client.applicationRecordsSealed());
+}
+
+// ===========================================================================
+// #359: negotiated record sizing and bounded padding.
+// ===========================================================================
+
+test "an unnegotiated bridge sends and accepts the full protocol fragment" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    const c2s = secret(0x51);
+    const s2c = secret(0x52);
+    try establishedPair(&client, &server, &c2s, &s2c);
+
+    try testing.expectEqual(@as(usize, record_codec.max_plaintext_fragment_len), client.outboundContentMax());
+
+    const payload = [_]u8{'z'} ** record_codec.max_plaintext_fragment_len;
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const sealed = try client.sealApplicationData(&payload, &protected);
+    const opened = try server.openApplicationData(try parseSingleRecord(.ciphertext, sealed), &plaintext);
+    try testing.expectEqualSlices(u8, &payload, opened.inner.content);
+    try testing.expectEqual(@as(u64, 0), server.record_size_counters.oversize_records_rejected);
+}
+
+test "a negotiated peer limit reserves the content-type byte it counts" {
+    const cp = testProvider();
+    var bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer bridge.deinit();
+
+    try bridge.setRecordSizeLimits(.{ .peer = 1024 });
+    try testing.expectEqual(@as(usize, 1023), bridge.outboundContentMax());
+    // RFC 8449's floor: 64 leaves exactly 63 usable content bytes.
+    try bridge.setRecordSizeLimits(.{ .peer = record_size.min_limit });
+    try testing.expectEqual(@as(usize, 63), bridge.outboundContentMax());
+    // A peer at (or beyond) the protocol maximum never widens it.
+    try bridge.setRecordSizeLimits(.{ .peer = record_size.max_limit });
+    try testing.expectEqual(@as(usize, record_codec.max_plaintext_fragment_len), bridge.outboundContentMax());
+}
+
+test "a local advertisement outside RFC 8449's range is rejected before it can be enforced" {
+    const cp = testProvider();
+    var bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer bridge.deinit();
+    try testing.expectError(error.InvalidRecordSizeLimit, bridge.setRecordSizeLimits(.{ .local = 63 }));
+    try testing.expectError(
+        error.InvalidRecordSizeLimit,
+        bridge.setRecordSizeLimits(.{ .local = record_size.max_limit + 1 }),
+    );
+    // The rejected value never landed.
+    try testing.expectEqual(record_size.default_limit, bridge.record_size_limits.local);
+}
+
+test "sealing more content than the peer's limit fails closed instead of truncating" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    const c2s = secret(0x53);
+    const s2c = secret(0x54);
+    try establishedPair(&client, &server, &c2s, &s2c);
+    try client.setRecordSizeLimits(.{ .peer = 128 });
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    const at_limit = [_]u8{'a'} ** 127;
+    _ = try client.sealApplicationData(&at_limit, &protected);
+    // Off-by-one on the other side of the boundary: 128 content bytes plus
+    // the content-type byte is 129, one past the 128 the peer accepts.
+    const past_limit = [_]u8{'a'} ** 128;
+    try testing.expectError(error.RecordSizeLimitExceeded, client.sealApplicationData(&past_limit, &protected));
+}
+
+test "an inbound record past our advertised limit is refused before decryption" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    const c2s = secret(0x55);
+    const s2c = secret(0x56);
+    try establishedPair(&client, &server, &c2s, &s2c);
+    // The server advertised 256; the client ignores it and sends more.
+    try server.setRecordSizeLimits(.{ .local = 256 });
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+
+    // Exactly at the limit: 255 content + 1 content-type byte = 256.
+    const at_limit = [_]u8{'b'} ** 255;
+    const ok = try client.sealApplicationData(&at_limit, &protected);
+    const opened = try server.openApplicationData(try parseSingleRecord(.ciphertext, ok), &plaintext);
+    try testing.expectEqual(@as(usize, 255), opened.inner.content.len);
+    try testing.expectEqual(@as(u64, 0), server.record_size_counters.oversize_records_rejected);
+
+    // One byte more, and the record is refused. The read sequence must not
+    // advance: rejecting before the AEAD means no nonce was consumed.
+    const sequence_before = server.read_application.?.sequence;
+    const over_limit = [_]u8{'b'} ** 256;
+    const too_big = try client.sealApplicationData(&over_limit, &protected);
+    try testing.expectError(
+        error.RecordSizeLimitExceeded,
+        server.openApplicationData(try parseSingleRecord(.ciphertext, too_big), &plaintext),
+    );
+    try testing.expectEqual(sequence_before, server.read_application.?.sequence);
+    try testing.expectEqual(@as(u64, 1), server.record_size_counters.oversize_records_rejected);
+}
+
+test "a handshake flight fragments at the negotiated limit, not the protocol maximum" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+
+    const hs_c2s = secret(0x57);
+    const hs_s2c = secret(0x58);
+    try client.installTrafficSecret(.handshake, .write, &hs_c2s);
+    try client.installTrafficSecret(.handshake, .read, &hs_s2c);
+    try server.installTrafficSecret(.handshake, .read, &hs_c2s);
+    try server.installTrafficSecret(.handshake, .write, &hs_s2c);
+    try client.setRecordSizeLimits(.{ .peer = 256 });
+    try server.setRecordSizeLimits(.{ .local = 256 });
+
+    // 1000 bytes at 255 content bytes per record is four records.
+    const flight = [_]u8{'h'} ** 1000;
+    var out: [8 * record_codec.max_ciphertext_record_len]u8 = undefined;
+    const expected_len = try client.sealedHandshakeLen(.handshake, flight.len);
+    const sealed = try client.sealHandshake(.handshake, &flight, &out);
+    try testing.expectEqual(expected_len, sealed.len);
+
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    var offset: usize = 0;
+    var reassembled: usize = 0;
+    var records: usize = 0;
+    while (offset < sealed.len) {
+        const header = try record_codec.parseHeader(sealed[offset..][0..record_codec.header_len], .ciphertext, .strict);
+        const record_len = record_codec.header_len + header.payload_len;
+        const opened = try server.openHandshake(
+            .handshake,
+            try parseSingleRecord(.ciphertext, sealed[offset..][0..record_len]),
+            &plaintext,
+        );
+        // Every fragment respects the negotiated bound the server advertised.
+        try testing.expect(opened.inner.content.len + 1 <= 256);
+        reassembled += opened.inner.content.len;
+        records += 1;
+        offset += record_len;
+    }
+    try testing.expectEqual(@as(usize, 4), records);
+    try testing.expectEqual(flight.len, reassembled);
+}
+
+test "padding rounds application records without exceeding the negotiated cap" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    const c2s = secret(0x59);
+    const s2c = secret(0x5a);
+    try establishedPair(&client, &server, &c2s, &s2c);
+    try client.setRecordPadding(.{ .block = 128 });
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+
+    // 10 content bytes + the type byte is 11; the next multiple of 128 is 128.
+    const sealed = try client.sealApplicationData("0123456789", &protected);
+    const opened = try server.openApplicationData(try parseSingleRecord(.ciphertext, sealed), &plaintext);
+    try testing.expectEqualStrings("0123456789", opened.inner.content);
+    try testing.expectEqual(@as(usize, 117), opened.inner.padding_len);
+    try testing.expectEqual(@as(u64, 1), client.record_size_counters.padded_records);
+    try testing.expectEqual(@as(u64, 117), client.record_size_counters.padding_bytes);
+
+    // Handshake and alert records are never padded -- see `sealProtected`.
+    const alert = try client.sealProtected(.application, .alert, &.{ 1, 0 }, &protected);
+    const alert_opened = try server.openProtected(.application, try parseSingleRecord(.ciphertext, alert), &plaintext);
+    try testing.expectEqual(@as(usize, 0), alert_opened.inner.padding_len);
+    try testing.expectEqual(@as(u64, 1), client.record_size_counters.padded_records);
+}
+
+test "padding never pushes a record past the peer's limit, at the boundary or over it" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    const c2s = secret(0x5b);
+    const s2c = secret(0x5c);
+    try establishedPair(&client, &server, &c2s, &s2c);
+    // A block far larger than the cap: every record would round straight past
+    // it if the policy were applied without a bound.
+    try client.setRecordSizeLimits(.{ .peer = 200 });
+    try client.setRecordPadding(.{ .block = 4096 });
+    try server.setRecordSizeLimits(.{ .local = 200 });
+
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    var content_len: usize = 0;
+    const content = [_]u8{'p'} ** 199;
+    while (content_len < 199) : (content_len += 1) {
+        const sealed = try client.sealApplicationData(content[0..content_len], &protected);
+        const opened = try server.openApplicationData(try parseSingleRecord(.ciphertext, sealed), &plaintext);
+        try testing.expectEqualSlices(u8, content[0..content_len], opened.inner.content);
+        // The property: the whole inner plaintext fits under the cap the peer
+        // set, which is also why the receiver above never rejected it.
+        try testing.expect(content_len + 1 + opened.inner.padding_len <= 200);
+    }
+}
+
+test "padding survives an at-capacity record by adding nothing" {
+    const cp = testProvider();
+    var client = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer client.deinit();
+    var server = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer server.deinit();
+    const c2s = secret(0x5d);
+    const s2c = secret(0x5e);
+    try establishedPair(&client, &server, &c2s, &s2c);
+    try client.setRecordPadding(.{ .block = 512 });
+
+    // A full-size fragment already fills the protocol maximum: padding it at
+    // all would produce a record no peer could accept.
+    const payload = [_]u8{'f'} ** record_codec.max_plaintext_fragment_len;
+    var protected: [record_codec.max_ciphertext_record_len]u8 = undefined;
+    var plaintext: [record_codec.max_ciphertext_fragment_len]u8 = undefined;
+    const sealed = try client.sealApplicationData(&payload, &protected);
+    const opened = try server.openApplicationData(try parseSingleRecord(.ciphertext, sealed), &plaintext);
+    try testing.expectEqual(@as(usize, 0), opened.inner.padding_len);
+    try testing.expectEqual(@as(u64, 0), client.record_size_counters.padded_records);
+}
+
+test "an invalid padding block is rejected and leaves the policy untouched" {
+    const cp = testProvider();
+    var bridge = Bridge.init(cp, .tls_aes_128_gcm_sha256);
+    defer bridge.deinit();
+    try testing.expectError(error.InvalidRecordSizeLimit, bridge.setRecordPadding(.{ .block = 0 }));
+    try testing.expectError(
+        error.InvalidRecordSizeLimit,
+        bridge.setRecordPadding(.{ .block = record_size.PaddingPolicy.max_block + 1 }),
+    );
+    try testing.expectEqual(record_size.PaddingPolicy.none, bridge.record_padding);
 }

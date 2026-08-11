@@ -171,6 +171,28 @@ negotiated suite's own HKDF, which the positive matrix already sweeps for
 every suite. What is peer-specific here is the message exchange, not the
 arithmetic.
 
+### Record size limit (RFC 8449)
+
+There is deliberately **no** dedicated row for `record_size_limit` (#359).
+OpenSSL does not implement RFC 8449 — traced against OpenSSL 3.6.2, its
+ClientHello and EncryptedExtensions carry no extension 28 in either role — so a
+row asserting a negotiated limit would assert something no peer in this harness
+can do.
+
+What the existing positive rows do cover is the case the RFC defines for
+exactly that situation: a peer that never sends the extension means "the
+protocol maximum", not "no limit". Every OpenSSL row therefore exercises the
+native side offering the extension (its default advertisement is the protocol
+maximum) to a peer that ignores it, and completing normally — which is the
+interoperability property that matters for enabling it by default.
+
+Coverage for a genuinely negotiated limit lives in-tree, where both sides can
+be driven: wire encode/decode and the role-asymmetric out-of-range handling in
+`src/tls/tls13_backend.zig` and `src/tls/tls13_backend_tests.zig`, and the
+sealing/opening bounds in `src/tls/record_epoch_bridge.zig` and
+`src/tls/encrypted_stream.zig`. If a future peer in this matrix implements RFC
+8449, a row belongs here.
+
 ### Negative conformance
 
 Each of these asserts the failure **class**, using the RFC 8446 §6 alert where

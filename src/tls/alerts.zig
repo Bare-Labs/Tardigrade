@@ -11,6 +11,10 @@ const events = @import("events.zig");
 pub const AlertDescription = enum(u8) {
     close_notify = 0,
     unexpected_message = 10,
+    /// RFC 8446 §6: a record whose length exceeded what the receiver accepts.
+    /// Reachable both ways — a peer may send it to us, and #359's negotiated
+    /// `record_size_limit` gives us a reason to send it ourselves.
+    record_overflow = 22,
     handshake_failure = 40,
     bad_certificate = 42,
     unsupported_certificate = 43,

@@ -51,6 +51,9 @@ pub const ExtensionType = enum(u16) {
     signature_algorithms = 13,
     application_layer_protocol_negotiation = 16,
     padding = 21,
+    /// RFC 8449. Record-transport only: QUIC carries no TLS records, so a
+    /// QUIC endpoint neither offers nor honors it (#359).
+    record_size_limit = 28,
     early_data = 42,
     pre_shared_key = 41,
     supported_versions = 43,

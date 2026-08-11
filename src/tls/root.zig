@@ -23,6 +23,7 @@ pub const production_crypto = @import("production_crypto.zig");
 pub const record_codec = @import("record_codec.zig");
 pub const record_epoch_bridge = @import("record_epoch_bridge.zig");
 pub const record_protection = @import("record_protection.zig");
+pub const record_size = @import("record_size.zig");
 pub const resumption_runtime = @import("resumption_runtime.zig");
 pub const session = @import("session.zig");
 pub const session_cache = @import("session_cache.zig");

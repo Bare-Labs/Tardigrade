@@ -113,3 +113,91 @@ immediate application work; raw socket registration is derived only from
 `wants_read` and `wants_write`. A plaintext read blocked on a TLS write retry
 therefore registers only write interest, and a plaintext write blocked on a TLS
 read retry registers only read interest.
+
+## Record sizing and padding (#359)
+
+Two independent knobs sit on the record path. They are easy to confuse and do
+opposite things, so this section names them apart explicitly.
+
+### `record_size_limit` — negotiated, bounds memory
+
+RFC 8449's `record_size_limit` extension (type 28) is a *negotiated* bound.
+Each endpoint advertises the largest `TLSInnerPlaintext` it is willing to
+**receive**; the peer must not send a protected record larger than that.
+The value covers the complete inner plaintext — content, the content-type
+byte, and any padding — which is why the TLS 1.3 maximum is 2^14+1 (16385)
+rather than 2^14, and why usable content is always one byte less than the
+advertised limit.
+
+* Record transport only. TLS-over-QUIC has no TLS records, so the QUIC
+  profile neither offers the extension nor accepts one: a peer that sends it
+  gets `unsupported_extension`.
+* The client offers it in ClientHello (in both ClientHello1 and ClientHello2,
+  at the same position, so an HRR's "ClientHello2 is a legal mutation of
+  ClientHello1" check still passes). The server answers in
+  EncryptedExtensions, on the full and PSK-resumed flights alike.
+* Configured by `policy.Policy.record_size_limit`. The default is the
+  protocol maximum: the extension is offered but constrains nothing, which is
+  the most interoperable choice and avoids inflating per-record overhead for
+  connections that never needed smaller records. Lowering it is a deliberate
+  memory/latency tradeoff.
+* Values below 64 are rejected as `illegal_parameter` by both roles. Above
+  the protocol maximum the handling is asymmetric, exactly as RFC 8449 §4
+  requires: a **server clamps** (a client may be advertising a size a future
+  version enables, and a server must not enforce the restriction), while a
+  **client rejects** — by EncryptedExtensions the negotiated version is
+  already settled, so no such reading is available.
+* Enforcement is symmetric in `record_epoch_bridge`. Outbound, every
+  protected write and every protected handshake fragment is sized by
+  `Bridge.outboundContentMax()`; sealing more than that fails closed with
+  `RecordSizeLimitExceeded` rather than silently truncating. Inbound, a
+  record whose inner plaintext would exceed our own advertisement is refused
+  *before* the AEAD open — the point of the bound is to cap the work an
+  unauthenticated peer can cause — and maps to the `record_overflow` alert.
+* Unprotected records are exempt (RFC 8449 §4). The initial-epoch plaintext
+  ClientHello/ServerHello keeps the full protocol fragment.
+
+A very small advertised limit interacts with the fixed outbound queue: a large
+server flight (certificate chain plus CertificateVerify) split into 63-byte
+fragments pays per-record overhead on every fragment. The exact requirement is
+preflighted by `sealedHandshakeLen`, so the failure mode is a deterministic
+refusal to progress, never an overflow — but an operator choosing a limit near
+RFC 8449's floor should size the certificate chain accordingly.
+
+### Padding — local, buys privacy, costs bandwidth
+
+RFC 8446 §5.4 record padding is *not* negotiated and has no wire signal. It
+appends zero bytes to the inner plaintext so that an on-path observer cannot
+read the true content length out of the record length. It is a
+traffic-analysis countermeasure, and it is the only thing here that is.
+
+* Configured per stream with `PureZigRecordStream.setRecordPadding`. Off by
+  default: every padding byte costs bandwidth and AEAD work and buys nothing
+  except length uniformity.
+* The only policy is `.block = N`, which rounds each inner plaintext up to a
+  multiple of `N`. A fixed target size was rejected because it cannot pad a
+  record that is already larger and inflates a small-record stream by a
+  constant factor; rounding degrades smoothly.
+* Applied only to `application_data`. Handshake messages have protocol-fixed
+  lengths that are already visible in the transcript, so padding them inflates
+  a latency-critical flight for no privacy; alerts are two bytes and their size
+  should not vary at all.
+* Padding is bounded by the negotiated limit, never the other way around: the
+  target length is clamped to `record_size_limit` before the padding is
+  derived from it, so `content + type + padding` is within the cap for every
+  input, including a record that is already at the cap (which gets none).
+
+Neither knob is record *coalescing*. Coalescing — merging several small
+application writes into one record to amortize the 22-byte header/tag
+overhead — is a throughput optimization that changes when bytes leave, and it
+is not implemented here: `writePlaintext` seals exactly what it accepts, one
+record per call. Padding makes records *larger* on purpose and never merges
+them; a smaller `record_size_limit` makes them *more numerous*. Reading either
+as a performance feature gets the tradeoff backwards.
+
+### Observability
+
+`PureZigRecordStream.recordSizeLimits()` reports the negotiated state and
+`recordSizeCounters()` the effects: writes narrowed by the peer's limit,
+records that carried padding, total padding bytes, and inbound records refused
+for exceeding our own advertisement.
