@@ -3011,22 +3011,18 @@ pub const Connection = struct {
         self.next_pn[space_idx] = pn + 1;
 
         if (record.ack_eliciting) {
-            var tracked = true;
-            self.recovery.onPacketSent(.{
+            // Slot preflighted at the top, before the PATH_RESPONSE was
+            // dequeued or `needs_send` cleared.
+            self.recovery.onPacketSentAssumeCapacity(.{
                 .space = .application,
                 .packet_number = pn,
                 .time_sent_us = now_us,
                 .size = total,
                 .ack_eliciting = true,
                 .in_flight = true,
-            }) catch {
-                // Preflighted above; charge the window regardless so this
-                // cannot become a congestion-control bypass.
-                self.recovery.congestion.onPacketSent(total);
-                tracked = false;
-            };
+            });
             self.last_ack_eliciting_sent_us[space_idx] = now_us;
-            if (tracked) publishSentRecord(self, &record);
+            publishSentRecord(self, &record);
         }
         self.paths.recordSentOnPath(path, total);
         self.metrics.packets_sent += 1;
@@ -3062,7 +3058,18 @@ pub const Connection = struct {
         ctx: BuildContext,
     ) ?BuiltPacket {
         const space_idx = spaceIndex(space);
-        const probe = self.probes_pending[space_idx] > 0;
+        // Recovery's tracker is bounded, and an in-flight packet it cannot
+        // track escapes loss detection *and* leaves bytes in
+        // `bytes_in_flight` that nothing can ever remove. Ordinary traffic
+        // stops short of a reserve; traffic recovery cannot defer draws on it.
+        const can_track_ordinary = self.recovery.canTrackPacket();
+        const can_track_recovery = self.recovery.canTrackRecoveryPacket();
+        // RFC 9002 §7.5 exempts a PTO probe from the congestion gate but still
+        // counts it in flight, so the probe needs a slot like anything else.
+        // Without one it stays owed (`probes_pending` is untouched) and is
+        // retried once an ACK or loss frees capacity — delayed, never
+        // untracked.
+        const probe = self.probes_pending[space_idx] > 0 and can_track_recovery;
 
         // Congestion gate: in-flight bytes need window; pure ACK packets and
         // PTO probes are exempt (RFC 9002 §7, §6.2.4).
@@ -3071,8 +3078,7 @@ pub const Connection = struct {
         // would escape both loss detection and the congestion window, so
         // preflight a slot here — before any frame is dequeued — and fall back
         // to ACK-only output rather than sending something uncharged.
-        const can_track = self.recovery.canTrackPacket();
-        const can_send_data = can_track and (probe or
+        const can_send_data = can_track_ordinary and (probe or
             cwnd_room >= self.recovery.congestion.max_datagram_size / 2 or
             self.recovery.congestion.bytes_in_flight == 0);
 
@@ -3095,6 +3101,10 @@ pub const Connection = struct {
         if (!probe and initial_pad_target > cwnd_room and self.recovery.congestion.bytes_in_flight != 0) {
             return null;
         }
+        // PADDING alone makes a packet in flight (RFC 9002 §2), so a packet
+        // that will be padded needs a tracker slot even when everything it
+        // carries would otherwise be exempt — an ACK-only Initial included.
+        if (initial_pad_target > 0 and !can_track_recovery) return null;
 
         // Same rule for a PATH_RESPONSE riding on the active path: it forces
         // the datagram to 1200 (§8.2.1-2). RFC 9000 §8.2 explicitly permits
@@ -3102,9 +3112,9 @@ pub const Connection = struct {
         // padded size does not fit, the response stays queued rather than
         // being sent uncharged.
         const path_response_final: usize = min_initial_datagram -| ctx.datagram_so_far;
-        const allow_path_response = probe or
+        const allow_path_response = can_track_recovery and (probe or
             path_response_final <= cwnd_room or
-            self.recovery.congestion.bytes_in_flight == 0;
+            self.recovery.congestion.bytes_in_flight == 0);
 
         var want_ack = self.ack_needed[space_idx];
         if (space == .application and want_ack) {
@@ -3120,7 +3130,7 @@ pub const Connection = struct {
             .application => !self.crypto_tx[2].pending.isEmpty(),
         };
         const has_app = space == .application and self.hasAppContent();
-        if (!want_ack and !has_crypto and !(has_app and can_send_data) and !(probe and can_track)) return null;
+        if (!want_ack and !has_crypto and !(has_app and can_send_data) and !probe) return null;
         if ((has_crypto or has_app) and !can_send_data and !want_ack and !probe) return null;
 
         // Header sizing.
@@ -3307,24 +3317,22 @@ pub const Connection = struct {
         // exempt: the peer never acknowledges it, so tracking it would only
         // consume tracker slots.
         if (recordIsInFlight(record)) {
-            var tracked = true;
-            self.recovery.onPacketSent(.{
+            // Every path that can reach here preflighted a tracker slot before
+            // committing a frame — `can_track_ordinary` for ordinary content,
+            // `can_track_recovery` for probes and mandatory padding — so this
+            // cannot fail. Asserting beats a fallback branch: there is no safe
+            // way to handle exhaustion once the frames are dequeued and the
+            // packet is sealed.
+            self.recovery.onPacketSentAssumeCapacity(.{
                 .space = space,
                 .packet_number = pn,
                 .time_sent_us = now_us,
                 .size = total,
                 .ack_eliciting = record.ack_eliciting,
                 .in_flight = true,
-            }) catch {
-                // `can_track` preflighted a slot before any frame was
-                // dequeued, so this is unreachable in practice. Charge the
-                // bytes anyway rather than letting an in-flight packet escape
-                // the congestion window.
-                self.recovery.congestion.onPacketSent(total);
-                tracked = false;
-            };
+            });
             if (record.ack_eliciting) self.last_ack_eliciting_sent_us[space_idx] = now_us;
-            if (tracked) publishSentRecord(self, &record);
+            publishSentRecord(self, &record);
         }
         if (record.has_new_connection_id) {
             if (self.local_cids) |*registry| registry.markAdvertised(record.carried_new_connection_id.sequence) catch {};
@@ -8316,4 +8324,181 @@ test "driver: a saturated recovery tracker backpressures instead of sending untr
     try testing.expect(pair.server.recovery.tracker.count > tracked_before);
     try testing.expect(congestion.bytes_in_flight >= in_flight_before + sent.bytes.len);
     try testing.expect(pair.server.next_pn[Connection.spaceIndex(.application)] > pn_before);
+}
+
+/// Occupy tracker slots with zero-size entries in a space the caller is not
+/// otherwise using, so capacity can be exhausted without perturbing congestion
+/// accounting. Returns how many were added.
+fn fillTracker(conn: *Connection, until_recovery_reserve: bool) !usize {
+    var added: usize = 0;
+    while (if (until_recovery_reserve) conn.recovery.canTrackRecoveryPacket() else conn.recovery.canTrackPacket()) {
+        try conn.recovery.tracker.onPacketSent(.{
+            .space = .initial,
+            .packet_number = 900_000 + added,
+            .time_sent_us = 1,
+            .size = 0,
+        });
+        added += 1;
+    }
+    return added;
+}
+
+/// Drive `conn` to its next deadline until a PTO arms probes in app space.
+fn fireApplicationPto(conn: *Connection, now_us: *u64) !void {
+    var rounds: usize = 0;
+    while (rounds < 8) : (rounds += 1) {
+        const deadline = conn.nextTimeoutUs() orelse return error.TestExpectedEqual;
+        now_us.* = @max(now_us.*, deadline);
+        conn.onTimeout(now_us.*);
+        if (conn.probes_pending[Connection.spaceIndex(.application)] > 0) return;
+    }
+    return error.TestExpectedEqual;
+}
+
+test "driver: a PTO probe at the ordinary tracking limit is emitted tracked and charged" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.initWithConfigs(allocator, .{}, .{ .max_send_udp_payload_size = 1452 });
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const sid = try openServerResponseStream(pair);
+    _ = try pair.server.writeStream(sid, &[_]u8{0x63} ** 4096, false);
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |_| {
+        pair.now_us += 500;
+    }
+    const congestion = &pair.server.recovery.congestion;
+    congestion.congestion_window = 1 << 24;
+
+    // Ordinary traffic is at its backpressure threshold; the recovery reserve
+    // is untouched.
+    _ = try fillTracker(pair.server, false);
+    try testing.expect(!pair.server.recovery.canTrackPacket());
+    try testing.expect(pair.server.recovery.canTrackRecoveryPacket());
+
+    // More stream data cannot go out ...
+    _ = try pair.server.writeStream(sid, &[_]u8{0x64} ** 4096, false);
+    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |t| {
+        try testing.expect(t.bytes.len < base_datagram_size);
+        pair.now_us += 500;
+    }
+
+    // ... but a real PTO still gets its probe out, tracked and charged
+    // (RFC 9002 §6.2.4 requires the probe; §7.5 keeps it in flight).
+    try fireApplicationPto(pair.server, &pair.now_us);
+    const tracked_before = pair.server.recovery.tracker.count;
+    const in_flight_before = congestion.bytes_in_flight;
+    const probe = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    try testing.expect(pair.server.recovery.tracker.count > tracked_before);
+    try testing.expectEqual(in_flight_before + probe.bytes.len, congestion.bytes_in_flight);
+
+    // The probe's bytes are removable: the peer's ACK takes them back out,
+    // which an untracked packet could never allow.
+    const ingress = quic_path.PathKey{ .local = probe.path.remote, .remote = probe.path.local };
+    try pair.client.ingestOnPath(probe.bytes, ingress, TestPair.test_challenge_entropy, pair.now_us);
+    // Past the delayed-ACK timer so a single ack-eliciting packet is enough.
+    pair.now_us += 2 * local_max_ack_delay_us;
+    var reply: [max_datagram_size_ceiling]u8 = undefined;
+    while (pair.client.pollTransmitOnPath(&reply, pair.now_us)) |t| {
+        const back = quic_path.PathKey{ .local = t.path.remote, .remote = t.path.local };
+        try pair.server.ingestOnPath(t.bytes, back, TestPair.test_challenge_entropy, pair.now_us);
+        pair.now_us += 500;
+    }
+    try testing.expect(congestion.bytes_in_flight < in_flight_before + probe.bytes.len);
+}
+
+test "driver: repeated PTOs at capacity stay tracked, then wait rather than go untracked" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.initWithConfigs(allocator, .{}, .{ .max_send_udp_payload_size = 1452 });
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const sid = try openServerResponseStream(pair);
+    _ = try pair.server.writeStream(sid, &[_]u8{0x65} ** 4096, false);
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |_| {
+        pair.now_us += 500;
+    }
+    pair.server.recovery.congestion.congestion_window = 1 << 24;
+    _ = try fillTracker(pair.server, false);
+
+    // The reserve is not a single-probe illusion: every probe it covers is
+    // emitted with a tracker entry and charged to the window.
+    var probes: usize = 0;
+    while (probes < recovery.reserved_tracked_packets) : (probes += 1) {
+        if (!pair.server.recovery.canTrackRecoveryPacket()) break;
+        pair.server.probes_pending[Connection.spaceIndex(.application)] = 1;
+        const before = pair.server.recovery.tracker.count;
+        const in_flight_before = pair.server.recovery.congestion.bytes_in_flight;
+        const probe = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse break;
+        try testing.expectEqual(before + 1, pair.server.recovery.tracker.count);
+        try testing.expectEqual(
+            in_flight_before + probe.bytes.len,
+            pair.server.recovery.congestion.bytes_in_flight,
+        );
+        pair.now_us += 500;
+    }
+    try testing.expect(probes > 1);
+
+    // Once even the reserve is spent, the probe waits: it is still owed, and
+    // nothing untracked leaves.
+    _ = try fillTracker(pair.server, true);
+    try testing.expect(!pair.server.recovery.canTrackRecoveryPacket());
+    pair.server.probes_pending[Connection.spaceIndex(.application)] = 1;
+    const saturated_tracked = pair.server.recovery.tracker.count;
+    const saturated_in_flight = pair.server.recovery.congestion.bytes_in_flight;
+    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |t| {
+        try testing.expect(t.bytes.len < base_datagram_size);
+        pair.now_us += 500;
+    }
+    try testing.expectEqual(saturated_tracked, pair.server.recovery.tracker.count);
+    try testing.expectEqual(saturated_in_flight, pair.server.recovery.congestion.bytes_in_flight);
+    try testing.expect(pair.server.probes_pending[Connection.spaceIndex(.application)] > 0);
+
+    // Freeing capacity releases the owed probe.
+    _ = pair.server.recovery.tracker.dropSpace(.initial);
+    const freed_tracked = pair.server.recovery.tracker.count;
+    const released = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    try testing.expect(released.bytes.len > 0);
+    try testing.expect(pair.server.recovery.tracker.count > freed_tracked);
+}
+
+test "driver: a fully saturated tracker never seals a padded in-flight packet" {
+    const allocator = testing.allocator;
+    // Every Initial-bearing datagram is padded to 1200 and is therefore in
+    // flight (RFC 9002 §2) whatever it carries — including an ACK-only one.
+    // With no trackable slot at all, a whole handshake must produce no such
+    // datagram. `onPacketSentAssumeCapacity` asserts the same invariant from
+    // the other side for every packet any test in this file builds.
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+
+    _ = try fillTracker(pair.client, true);
+    _ = try fillTracker(pair.server, true);
+    try testing.expect(!pair.client.recovery.canTrackRecoveryPacket());
+    try testing.expect(!pair.server.recovery.canTrackRecoveryPacket());
+
+    const client_in_flight = pair.client.recovery.congestion.bytes_in_flight;
+    const server_in_flight = pair.server.recovery.congestion.bytes_in_flight;
+
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    var rounds: usize = 0;
+    while (rounds < 8) : (rounds += 1) {
+        while (pair.client.pollTransmitOnPath(&out, pair.now_us)) |t| {
+            try testing.expect(t.bytes.len < min_initial_datagram);
+            pair.now_us += 500;
+        }
+        while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |t| {
+            try testing.expect(t.bytes.len < min_initial_datagram);
+            pair.now_us += 500;
+        }
+    }
+    try testing.expectEqual(client_in_flight, pair.client.recovery.congestion.bytes_in_flight);
+    try testing.expectEqual(server_in_flight, pair.server.recovery.congestion.bytes_in_flight);
+
+    // With capacity back, the padded Initial flows normally.
+    _ = pair.client.recovery.tracker.dropSpace(.initial);
+    _ = pair.server.recovery.tracker.dropSpace(.initial);
+    try pair.pump();
+    try testing.expect(pair.server.isEstablished());
 }

@@ -12,6 +12,13 @@ const std = @import("std");
 
 pub const max_ack_ranges = 32;
 pub const max_tracked_packets = 128;
+/// Tracker slots held back from ordinary STREAM/CRYPTO traffic for packets
+/// recovery cannot defer: PTO probes (RFC 9002 §6.2.4 requires at least one
+/// ack-eliciting probe) and packets that become in-flight only through
+/// mandatory PADDING. Ordinary traffic backpressures at
+/// `max_tracked_packets - reserved_tracked_packets` so the reserve is still
+/// there when recovery needs it (#256-A review).
+pub const reserved_tracked_packets = 8;
 /// The sender's maximum datagram size at connection start (RFC 9000 §14's
 /// floor). RFC 9002 defines the NewReno windows in terms of the sender's
 /// *current* maximum datagram size, so this is only the starting value:
@@ -460,12 +467,35 @@ pub const RecoveryController = struct {
         return self.ack_ranges[spaceIndex(space)].toAckFrame(ack_delay_us);
     }
 
-    /// Whether the bounded tracker can still take one more sent packet.
-    /// Callers must preflight this before dequeuing frames for an in-flight
-    /// packet: an untracked in-flight packet escapes both loss recovery and
-    /// the congestion window (#256-A review).
+    /// Whether the bounded tracker can take one more *ordinary* sent packet —
+    /// stopping short of the recovery reserve. Callers must preflight this
+    /// before dequeuing frames: an untracked in-flight packet escapes both
+    /// loss recovery and the congestion window, and because nothing can ever
+    /// remove its bytes again it permanently inflates `bytes_in_flight`
+    /// (#256-A review).
     pub fn canTrackPacket(self: *const RecoveryController) bool {
+        return self.tracker.count + reserved_tracked_packets < max_tracked_packets;
+    }
+
+    /// Whether the tracker can take one more packet drawn from the recovery
+    /// reserve. RFC 9002 §7.5 exempts a PTO probe from the congestion-window
+    /// admission gate but still counts it in flight, so a probe needs a slot
+    /// like anything else — when even the reserve is gone the probe waits
+    /// rather than being emitted untracked.
+    pub fn canTrackRecoveryPacket(self: *const RecoveryController) bool {
         return self.tracker.count < max_tracked_packets;
+    }
+
+    /// Record a sent packet whose tracker slot the caller already preflighted
+    /// with `canTrackPacket`/`canTrackRecoveryPacket`. Infallible by
+    /// construction: the send path has no safe way to handle a failure here
+    /// (the packet is already sealed and its frames already dequeued), so the
+    /// capacity check belongs before the frames are committed, and this
+    /// asserts that it happened.
+    pub fn onPacketSentAssumeCapacity(self: *RecoveryController, packet: SentPacket) void {
+        std.debug.assert(self.canTrackRecoveryPacket());
+        self.tracker.onPacketSent(packet) catch unreachable;
+        if (packet.in_flight) self.congestion.onPacketSent(packet.size);
     }
 
     pub fn onPacketSent(self: *RecoveryController, packet: SentPacket) error{TooManyTrackedPackets}!void {
@@ -854,11 +884,14 @@ test "recovery: a padded non-ack-eliciting packet is charged to the window" {
     try testing.expectEqual(@as(usize, 1200), controller.congestion.bytes_in_flight);
 }
 
-test "recovery: the bounded tracker reports when it can no longer take a packet" {
+test "recovery: ordinary traffic backpressures before the recovery reserve" {
     var controller = RecoveryController{};
+    const ordinary_capacity = max_tracked_packets - reserved_tracked_packets;
+
     var i: usize = 0;
-    while (i < max_tracked_packets) : (i += 1) {
+    while (i < ordinary_capacity) : (i += 1) {
         try testing.expect(controller.canTrackPacket());
+        try testing.expect(controller.canTrackRecoveryPacket());
         try controller.onPacketSent(.{
             .space = .application,
             .packet_number = i,
@@ -866,11 +899,34 @@ test "recovery: the bounded tracker reports when it can no longer take a packet"
             .size = 100,
         });
     }
+
+    // Ordinary traffic is done, but the reserve is intact for PTO probes and
+    // mandatory-padding packets.
     try testing.expect(!controller.canTrackPacket());
+    try testing.expect(controller.canTrackRecoveryPacket());
+
+    while (i < max_tracked_packets) : (i += 1) {
+        try testing.expect(controller.canTrackRecoveryPacket());
+        controller.onPacketSentAssumeCapacity(.{
+            .space = .application,
+            .packet_number = i,
+            .time_sent_us = i,
+            .size = 100,
+        });
+    }
+
+    // Fully saturated: recovery traffic must now wait rather than go
+    // untracked, which is what the send path's preflight enforces.
+    try testing.expect(!controller.canTrackRecoveryPacket());
     try testing.expectError(error.TooManyTrackedPackets, controller.onPacketSent(.{
         .space = .application,
         .packet_number = max_tracked_packets,
         .time_sent_us = 9_999,
         .size = 100,
     }));
+
+    // Freeing capacity restores both tiers in the right order.
+    _ = controller.tracker.dropSpace(.application);
+    try testing.expect(controller.canTrackRecoveryPacket());
+    try testing.expect(controller.canTrackPacket());
 }
