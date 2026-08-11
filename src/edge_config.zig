@@ -415,6 +415,18 @@ pub const EdgeConfig = struct {
     /// single-listener behavior.
     /// Set via TARDIGRADE_LISTENER_SHARDS.
     listener_shards: u16,
+    /// Event-loop backend override (#148). `null` keeps the platform default
+    /// (`epoll` on Linux, `kqueue` elsewhere), which is the shipped behavior.
+    /// Setting this to `io_uring` opts into the Linux-only readiness-only
+    /// `io_uring` poller; if its kernel capabilities cannot be established at
+    /// startup the process fails to start rather than silently downgrading to
+    /// `epoll`. Set via TARDIGRADE_EVENT_LOOP_BACKEND.
+    /// See docs/EVENT_LOOP_BACKENDS.md.
+    event_loop_backend: ?http.event_loop.Backend,
+    /// Submission-queue depth for the `io_uring` backend. Ignored by the
+    /// `epoll`/`kqueue` backends. Set via
+    /// TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES.
+    event_loop_io_uring_entries: u16,
     /// Enable master process supervision mode.
     master_process_enabled: bool,
     /// Number of worker processes when master mode is enabled.
@@ -1211,6 +1223,24 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(worker_threads_str);
     const worker_threads = std.fmt.parseInt(u32, worker_threads_str, 10) catch 0;
     const listener_shards = parseIntEnv(u16, allocator, "TARDIGRADE_LISTENER_SHARDS", 0);
+    const event_loop_backend_str = envOrDefault(allocator, "TARDIGRADE_EVENT_LOOP_BACKEND", "default") catch unreachable;
+    defer allocator.free(event_loop_backend_str);
+    const event_loop_backend = try parseEventLoopBackendConfig(event_loop_backend_str);
+    const event_loop_io_uring_entries = parseIntEnv(
+        u16,
+        allocator,
+        "TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES",
+        http.event_loop.default_io_uring_entries,
+    );
+    if (event_loop_io_uring_entries < http.event_loop.min_io_uring_entries or
+        event_loop_io_uring_entries > http.event_loop.max_io_uring_entries)
+    {
+        logConfigDiagnostic("config validation failed: event_loop_io_uring_entries must be between {d} and {d}", .{
+            http.event_loop.min_io_uring_entries,
+            http.event_loop.max_io_uring_entries,
+        });
+        return error.InvalidConfigValue;
+    }
     const master_process_enabled = parseBoolEnv(allocator, "TARDIGRADE_MASTER_PROCESS", false);
     const worker_processes = parseIntEnv(u32, allocator, "TARDIGRADE_WORKER_PROCESSES", 1);
     const binary_upgrade_enabled = parseBoolEnv(allocator, "TARDIGRADE_BINARY_UPGRADE", true);
@@ -1668,6 +1698,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .cb_timeout_ms = cb_timeout_ms,
         .worker_threads = worker_threads,
         .listener_shards = listener_shards,
+        .event_loop_backend = event_loop_backend,
+        .event_loop_io_uring_entries = event_loop_io_uring_entries,
         .master_process_enabled = master_process_enabled,
         .worker_processes = worker_processes,
         .binary_upgrade_enabled = binary_upgrade_enabled,
@@ -2015,6 +2047,21 @@ fn parseAccessLogFormatConfig(raw: []const u8) !http.access_log.Format {
     const value = std.mem.trim(u8, raw, " \t\r\n");
     return http.access_log.Format.parse(value) orelse {
         logConfigDiagnostic("config validation failed: access_log_format must be one of json, plain, custom", .{});
+        return error.InvalidConfigValue;
+    };
+}
+
+/// `default` (the shipped behavior) leaves backend selection to the platform.
+/// Any other value names an explicit backend, which fails closed at startup if
+/// it is unavailable — see docs/EVENT_LOOP_BACKENDS.md.
+fn parseEventLoopBackendConfig(raw: []const u8) !?http.event_loop.Backend {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    // `auto` is deliberately NOT accepted: the auto-detect-with-fallback mode
+    // sketched in docs/EVENT_LOOP_BACKENDS.md is not implemented, and silently
+    // treating it as `default` would misrepresent that.
+    if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "default")) return null;
+    return http.event_loop.Backend.parse(value) orelse {
+        logConfigDiagnostic("config validation failed: event_loop_backend must be one of default, epoll, kqueue, io_uring", .{});
         return error.InvalidConfigValue;
     };
 }
@@ -3405,6 +3452,23 @@ test "parse upstream lb algorithm aliases" {
     try std.testing.expectEqual(UpstreamLbAlgorithm.generic_hash, UpstreamLbAlgorithm.parse("generic-hash").?);
     try std.testing.expectEqual(UpstreamLbAlgorithm.random_two_choices, UpstreamLbAlgorithm.parse("random_two_choices").?);
     try std.testing.expect(UpstreamLbAlgorithm.parse("unknown") == null);
+}
+
+test "parse event loop backend config" {
+    // The default keeps the shipped epoll/kqueue behavior.
+    try std.testing.expect(try parseEventLoopBackendConfig("default") == null);
+    try std.testing.expect(try parseEventLoopBackendConfig("  ") == null);
+    try std.testing.expect(try parseEventLoopBackendConfig("") == null);
+
+    try std.testing.expectEqual(http.event_loop.Backend.io_uring, (try parseEventLoopBackendConfig("io_uring")).?);
+    try std.testing.expectEqual(http.event_loop.Backend.io_uring, (try parseEventLoopBackendConfig(" IO-URING ")).?);
+    try std.testing.expectEqual(http.event_loop.Backend.epoll, (try parseEventLoopBackendConfig("epoll")).?);
+
+    // `auto` is rejected rather than aliased to `default`: the auto-detect
+    // mode with epoll fallback described in docs/EVENT_LOOP_BACKENDS.md is
+    // not implemented, and accepting the name would imply otherwise.
+    try std.testing.expectError(error.InvalidConfigValue, parseEventLoopBackendConfig("auto"));
+    try std.testing.expectError(error.InvalidConfigValue, parseEventLoopBackendConfig("uring"));
 }
 
 test "parse upstream base url weights csv" {
