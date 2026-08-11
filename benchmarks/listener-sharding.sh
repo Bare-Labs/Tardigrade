@@ -493,17 +493,22 @@ validate_profile_accept_batching() {
     local label="$1" batch_limit="$2" fairness_yield_every="$3"
     shift 3
 
-    local accepted batches yields
-    accepted="$(printf '%s\n' "$@" | jq -s '[.[].accept_metrics.accept_batch_size_sum_delta[]?.value] | add // 0')" || return 1
-    batches="$(printf '%s\n' "$@" | jq -s '[.[].accept_metrics.accept_batch_size_count_delta[]?.value] | add // 0')" || return 1
+    local yields
     yields="$(printf '%s\n' "$@" | jq -s '[.[].accept_metrics.accept_fairness_yields_total_delta[]?.value] | add // 0')" || return 1
 
-    if (( batch_limit > 1 )) && (( accepted <= batches )); then
-        echo "${label}: invalid benchmark sample; no readiness turn accepted more than one connection (accepted=${accepted}, batches=${batches})" >&2
-        return 1
-    fi
     if (( fairness_yield_every > 0 )) && (( yields <= 0 )); then
         echo "${label}: invalid benchmark sample; fairness cutoff was never exercised" >&2
+        return 1
+    fi
+}
+
+validate_workload_batching() {
+    local profile="$1" workload="$2" result="$3"
+    local accepted batches
+    accepted="$(jq '[.accept_metrics.accept_batch_size_sum_delta[]?.value] | add // 0' <<<"$result")" || return 1
+    batches="$(jq '[.accept_metrics.accept_batch_size_count_delta[]?.value] | add // 0' <<<"$result")" || return 1
+    if (( accepted <= batches )); then
+        echo "${profile}/${workload}: batching was not exercised (accepted=${accepted}, batches=${batches})" >&2
         return 1
     fi
 }
@@ -692,16 +697,25 @@ run_profile() {
     echo "==> ${label}: high connection churn (${STATIC_PATH}, Connection: close)" >&2
     local churn_json
     churn_json="$(run_wrk_workload "connection-churn-http1" "$churn_raw" "${BENCH_DIR}/wrk-summary.lua" "$churn_queue_samples" "${HEADER_ARGS[@]}" -H "Connection: close" "${BASE_URL}${STATIC_PATH}")" || { rc="$?"; profile_fail "$rc"; return "$?"; }
+    if (( batch_limit > 1 )); then
+        validate_workload_batching "$label" "connection-churn-http1" "$churn_json" || { rc="$?"; profile_fail "$rc"; return "$?"; }
+    fi
     recover_after_close_workload "${label}: post-churn"
 
     echo "==> ${label}: high connection burst (${STATIC_PATH}, Connection: close, ${BURST_CONNECTIONS} connections)" >&2
     local burst_json
     burst_json="$(WRK_CONNECTIONS="$BURST_CONNECTIONS" run_wrk_workload "connection-burst-http1" "$burst_raw" "${BENCH_DIR}/wrk-summary.lua" "$burst_queue_samples" "${HEADER_ARGS[@]}" -H "Connection: close" "${BASE_URL}${STATIC_PATH}")" || { rc="$?"; profile_fail "$rc"; return "$?"; }
+    if (( batch_limit > 1 )); then
+        validate_workload_batching "$label" "connection-burst-http1" "$burst_json" || { rc="$?"; profile_fail "$rc"; return "$?"; }
+    fi
     recover_after_close_workload "${label}: post-burst"
 
     echo "==> ${label}: mixed active keepalive + new connection churn (${KEEPALIVE_PATH} keepalive + ${STATIC_PATH} close)" >&2
     local mixed_json
     mixed_json="$(run_mixed_keepalive_churn_workload "mixed-keepalive-churn" "$mixed_keepalive_raw" "$mixed_churn_raw" "$mixed_queue_samples")" || { rc="$?"; profile_fail "$rc"; return "$?"; }
+    if (( batch_limit > 1 )); then
+        validate_workload_batching "$label" "mixed-keepalive-churn" "$mixed_json" || { rc="$?"; profile_fail "$rc"; return "$?"; }
+    fi
     recover_after_close_workload "${label}: post-mixed"
     validate_profile_accept_batching "$label" "$batch_limit" "$fairness_yield_every" "$churn_json" "$burst_json" "$mixed_json" || { rc="$?"; profile_fail "$rc"; return "$?"; }
 

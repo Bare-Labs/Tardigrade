@@ -852,7 +852,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             }
             if (!ev.readable) continue;
             if (ev.fd == listen_fd and !sharding_enabled) {
-                gaccept.acceptReadyConnectionsShard(listen_fd, 0, &worker_pool, &state, .{
+                _ = gaccept.acceptReadyConnectionsShard(listen_fd, 0, &worker_pool, &state, .{
                     .limit = cfg.accept_batch_limit,
                     .fairness_yield_every = cfg.accept_fairness_yield_every,
                 });
