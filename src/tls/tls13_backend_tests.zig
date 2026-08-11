@@ -13462,7 +13462,7 @@ test "#359 a server accepts a client that never advertises, and treats it as the
     try std.testing.expectEqual(@as(usize, record_size.max_limit), limits.outboundInnerMax());
 }
 
-test "#359 a QUIC-profile server rejects a client that offers record_size_limit" {
+test "#359 a QUIC-profile server ignores a client that offers record_size_limit" {
     var server_provider_storage: ProviderStorage = .{};
     var server = tls_backend.Tls13Backend.initServer(
         serverEntropy(),
@@ -13475,13 +13475,45 @@ test "#359 a QUIC-profile server rejects a client that offers record_size_limit"
     defer sink.deinit();
     try server.backend().start(.server, {}, &sink);
 
-    // RFC 8449 bounds TLS *records*; TLS-over-QUIC has none, so this is an
-    // extension the endpoint never offered and cannot honor.
+    // RFC 8449 bounds TLS *records*; TLS-over-QUIC has none, so this endpoint
+    // does not support the extension. RFC 8446 §4.1.2 has a server *ignore* an
+    // unsupported ClientHello extension rather than reject it — and GnuTLS-based
+    // QUIC clients (the H3 interop peer) do send it, so rejecting here failed
+    // real handshakes.
     var buf: [2048]u8 = undefined;
     const hello = try buildClientHello(&buf, .{
         .alpn_protocols = &.{"h3"},
         .transport_extension = .{ .extension_type = 57, .payload = "client transport parameters" },
         .record_size_limit = 4096,
     });
-    try std.testing.expectError(error.UnsupportedExtension, server.backend().receive(.initial, hello, &sink));
+    try server.backend().receive(.initial, hello, &sink);
+    try std.testing.expectEqual(@as(?u16, null), server.recordSizeLimits().peer);
+}
+
+test "#359 a QUIC-profile server does not even validate a record_size_limit it ignores" {
+    // Ignoring means not parsing: a value this endpoint would reject as
+    // `illegal_parameter` under the record profile must not fail a QUIC
+    // handshake, because the field is not one this profile reads at all.
+    for ([_]u16{ 0, record_size.min_limit - 1, 65535 }) |limit| {
+        var server_provider_storage: ProviderStorage = .{};
+        var server = tls_backend.Tls13Backend.initServer(
+            serverEntropy(),
+            server_provider_storage.init(server_provider_seed),
+            fixtureIdentity(),
+            .{ .extension = .{ .extension_type = 57, .local = "server transport parameters" } },
+        );
+        defer server.deinit();
+        var sink = DirectSink{};
+        defer sink.deinit();
+        try server.backend().start(.server, {}, &sink);
+
+        var buf: [2048]u8 = undefined;
+        const hello = try buildClientHello(&buf, .{
+            .alpn_protocols = &.{"h3"},
+            .transport_extension = .{ .extension_type = 57, .payload = "client transport parameters" },
+            .record_size_limit = limit,
+        });
+        try server.backend().receive(.initial, hello, &sink);
+        try std.testing.expectEqual(@as(?u16, null), server.recordSizeLimits().peer);
+    }
 }

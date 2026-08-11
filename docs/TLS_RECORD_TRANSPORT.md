@@ -129,9 +129,14 @@ byte, and any padding — which is why the TLS 1.3 maximum is 2^14+1 (16385)
 rather than 2^14, and why usable content is always one byte less than the
 advertised limit.
 
-* Record transport only. TLS-over-QUIC has no TLS records, so the QUIC
-  profile neither offers the extension nor accepts one: a peer that sends it
-  gets `unsupported_extension`.
+* Record transport only. TLS-over-QUIC has no TLS records, so the QUIC profile
+  never offers the extension and never reads one. A QUIC **server** ignores a
+  client that offers it — without even validating the value — because RFC 8446
+  §4.1.2 has a server ignore an unsupported ClientHello extension, and
+  GnuTLS-based QUIC clients do send it. A **client** still rejects one in
+  EncryptedExtensions with `unsupported_extension`, which is the opposite
+  case and the one RFC 8446 §4.2 requires aborting on: a server must not answer
+  an extension the client never requested.
 * The client offers it in ClientHello (in both ClientHello1 and ClientHello2,
   at the same position, so an HRR's "ClientHello2 is a legal mutation of
   ClientHello1" check still passes). The server answers in

@@ -4343,6 +4343,13 @@ pub const Tls13Backend = struct {
             psk_dhe_ke_offered: bool = false,
             psk_ext: ?struct { body_offset: usize, len: usize } = null,
             early_data_seen: bool = false,
+            /// #359: whether this profile has TLS records for RFC 8449 to
+            /// bound at all. False under the QUIC profile, where the
+            /// extension is not merely unused but *unsupported* — and RFC
+            /// 8446 §4.1.2 has a server ignore an unsupported ClientHello
+            /// extension, not inspect or reject it. GnuTLS-based QUIC clients
+            /// do send it, so parsing it here would fail real handshakes.
+            record_size_limit_supported: bool,
             /// #359: the client's `record_size_limit`, already validated and
             /// (per RFC 8449 §4's server rule) clamped to the protocol
             /// maximum rather than rejected when it is larger.
@@ -4377,9 +4384,12 @@ pub const Tls13Backend = struct {
                     // restriction", because a client may be advertising a size
                     // some future version or extension enables. Clamping (not
                     // rejecting) is what lets such a client still connect.
-                    ext_record_size_limit => self_obs.record_size_limit = record_size.decode(observation.data, .clamp) catch |err| switch (err) {
-                        error.MalformedHandshake => return error.MalformedExtension,
-                        error.IllegalParameter => return error.IllegalParameter,
+                    ext_record_size_limit => {
+                        if (!self_obs.record_size_limit_supported) return;
+                        self_obs.record_size_limit = record_size.decode(observation.data, .clamp) catch |err| switch (err) {
+                            error.MalformedHandshake => return error.MalformedExtension,
+                            error.IllegalParameter => return error.IllegalParameter,
+                        };
                     },
                     else => if (self_obs.transport_extension_type) |expected_type| {
                         if (expected_type == observation.id) self_obs.transport_params = observation.data;
@@ -4388,7 +4398,10 @@ pub const Tls13Backend = struct {
             }
         };
 
-        var observer = ClientHelloObserver{ .transport_extension_type = self.profile.extensionType() };
+        var observer = ClientHelloObserver{
+            .transport_extension_type = self.profile.extensionType(),
+            .record_size_limit_supported = self.offeredRecordSizeLimit() != null,
+        };
         const parsed = tls_negotiation.parseClientHelloObserved(body, .{
             .ctx = &observer,
             .observeFn = ClientHelloObserver.observe,
@@ -4438,12 +4451,11 @@ pub const Tls13Backend = struct {
         // 0-RTT is only meaningful alongside a resumption attempt.
         if (observer.early_data_seen and observer.psk_ext == null) return error.MissingExtension;
         self.client_hello_early_data_seen = observer.early_data_seen;
-        // #359: a client offering `record_size_limit` to a profile that has no
-        // TLS records (QUIC) is offering a bound neither side can apply.
-        if (observer.record_size_limit) |limit| {
-            if (self.offeredRecordSizeLimit() == null) return error.UnsupportedExtension;
-            self.peer_record_size_limit = limit;
-        }
+        // #359: null under the QUIC profile, which never inspects the
+        // extension (see `record_size_limit_supported`), and null for a record
+        // client that simply did not offer one — RFC 8449 §4 makes that mean
+        // "the protocol maximum", which is what `recordSizeLimits` reports.
+        self.peer_record_size_limit = observer.record_size_limit;
         // signature_algorithms is required whenever the server authenticates
         // with a certificate (RFC 8446 §9.2). A missing or empty list is a
         // malformed/missing required *peer* extension — attribute it to the

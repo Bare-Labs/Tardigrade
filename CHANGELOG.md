@@ -18,8 +18,8 @@ All notable user-facing changes to Tardigrade are documented here.
   (OpenSSL among them) simply omit it, which the RFC defines as the protocol
   maximum. Out-of-range values follow RFC 8449 §4's asymmetry exactly: below 64
   is `illegal_parameter` for both roles, while above the maximum a server
-  clamps and a client rejects. TLS-over-QUIC has no TLS records and neither
-  offers nor accepts the extension.
+  clamps and a client rejects. TLS-over-QUIC has no TLS records: it never
+  offers the extension, and a QUIC server ignores a client that does.
 
   Separately and locally, `PureZigRecordStream.setRecordPadding` enables
   RFC 8446 §5.4 padding on application data, rounding each record's inner
