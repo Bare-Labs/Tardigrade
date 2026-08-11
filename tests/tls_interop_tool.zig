@@ -122,6 +122,24 @@ const Args = struct {
     /// this many times by the end of the exchange -- i.e. to have processed
     /// that many `KeyUpdate` messages from the peer.
     expect_key_updates: u64 = 0,
+    /// #359: require the peer to have advertised exactly this
+    /// `record_size_limit`. Proves the extension actually round-tripped,
+    /// rather than the row passing because both sides quietly ignored it.
+    expect_peer_record_size_limit: ?u16 = null,
+    /// #359: require every protected record this side sealed to have carried a
+    /// `TLSInnerPlaintext` no larger than this. Held against the peer's
+    /// advertised bound, this is what proves records were *bounded* rather
+    /// than merely that a handshake completed.
+    expect_max_record_bytes: ?u32 = null,
+    /// #359: require this side to have sealed at least this many protected
+    /// records. With a payload larger than the peer's limit, this is what
+    /// proves the payload was actually *fragmented* across records.
+    expect_min_records_sent: u64 = 0,
+    /// #359: require every protected record the *peer* sent to have carried a
+    /// `TLSInnerPlaintext` no larger than this. Held against our own
+    /// advertisement, this proves the peer honored the limit we asked for --
+    /// the half of RFC 8449 that a send-side assertion cannot reach.
+    expect_max_received_record_bytes: ?u32 = null,
 
     const Identity = struct {
         pattern: []const u8,
@@ -165,6 +183,11 @@ const usage =
     \\  --expect-peer-close clean|truncated
     \\  --key-update not-requested|requested   send one post-handshake KeyUpdate
     \\  --expect-key-updates N                 require N received KeyUpdates
+    \\  --record-size-limit N                  advertise RFC 8449 extension 28
+    \\  --expect-peer-record-size-limit N      require the peer to advertise N
+    \\  --expect-max-record-bytes N            no sealed inner plaintext above N
+    \\  --expect-min-records-sent N            at least N protected records sealed
+    \\  --expect-max-received-record-bytes N   no record from the peer above N
     \\  --transcript PATH             secret-free transcript + failure fixture
     \\  --verbose
     \\
@@ -278,6 +301,16 @@ fn parseArgs(allocator: std.mem.Allocator, init_args: std.process.Args) !?Args {
                 .update_requested
             else
                 return error.UnknownKeyUpdateRequest;
+        } else if (std.mem.eql(u8, arg, "--record-size-limit")) {
+            args.config.record_size_limit = try std.fmt.parseInt(u16, it.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, arg, "--expect-peer-record-size-limit")) {
+            args.expect_peer_record_size_limit = try std.fmt.parseInt(u16, it.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, arg, "--expect-max-record-bytes")) {
+            args.expect_max_record_bytes = try std.fmt.parseInt(u32, it.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, arg, "--expect-min-records-sent")) {
+            args.expect_min_records_sent = try std.fmt.parseInt(u64, it.next() orelse return error.MissingValue, 10);
+        } else if (std.mem.eql(u8, arg, "--expect-max-received-record-bytes")) {
+            args.expect_max_received_record_bytes = try std.fmt.parseInt(u32, it.next() orelse return error.MissingValue, 10);
         } else if (std.mem.eql(u8, arg, "--expect-key-updates")) {
             args.expect_key_updates = try std.fmt.parseInt(u64, it.next() orelse return error.MissingValue, 10);
         } else {
@@ -561,6 +594,15 @@ const Outcome = struct {
     /// A peer `close_notify` observed by the record stream. Abrupt EOF without
     /// `close_notify` is reported separately as `error.TruncatedStream`.
     peer_closed: bool = false,
+    /// #359: the negotiated RFC 8449 state and what this side actually did
+    /// with it -- the peer's advertised bound, our own enforceable one, the
+    /// largest inner plaintext we sealed, and how many protected records we
+    /// sent.
+    peer_record_size_limit: ?u16 = null,
+    local_record_size_limit: u16 = 0,
+    max_sent_record_bytes: u32 = 0,
+    max_received_record_bytes: u32 = 0,
+    protected_records_sent: u64 = 0,
 };
 
 /// The alert that characterises this run's failure, whichever side produced
@@ -866,6 +908,13 @@ const Runner = struct {
         outcome.certificate = stream.certificateState();
         outcome.peer_alert = stream.peerAlert();
         outcome.peer_closed = stream.readiness().peer_closed;
+        const record_size_limits = stream.recordSizeLimits();
+        const record_size_counters = stream.recordSizeCounters();
+        outcome.peer_record_size_limit = record_size_limits.peer;
+        outcome.local_record_size_limit = record_size_limits.local;
+        outcome.max_sent_record_bytes = record_size_counters.max_sent_inner_len;
+        outcome.max_received_record_bytes = record_size_counters.max_recv_inner_len;
+        outcome.protected_records_sent = record_size_counters.protected_records_sent;
         if (outcome.handshake_complete) {
             outcome.cipher_suite = backend.negotiated_cipher_suite;
             outcome.named_group = backend.negotiated_named_group;
@@ -1016,6 +1065,15 @@ fn writeTranscript(path: []const u8, args: Args, outcome: Outcome, transcript: *
     report.print("peer_close: {s}\n", .{if (outcome.peer_closed) "clean" else "none"});
     report.print("key_updates.sent: {d}\n", .{outcome.key_updates_written});
     report.print("key_updates.received: {d}\n", .{outcome.key_updates_read});
+    report.print("record_size_limit.local: {d}\n", .{outcome.local_record_size_limit});
+    if (outcome.peer_record_size_limit) |limit| {
+        report.print("record_size_limit.peer: {d}\n", .{limit});
+    } else {
+        report.print("record_size_limit.peer: absent\n", .{});
+    }
+    report.print("records.sent: {d}\n", .{outcome.protected_records_sent});
+    report.print("records.max_inner_bytes: {d}\n", .{outcome.max_sent_record_bytes});
+    report.print("records.max_received_inner_bytes: {d}\n", .{outcome.max_received_record_bytes});
     if (outcome.failure) |err| report.print("failure: {s}\n", .{@errorName(err)});
     if (outcome.emitted_alert) |desc| report.print("alert.local: {s}\n", .{@tagName(desc)});
     if (outcome.peer_alert) |desc| report.print("alert.peer: {s}\n", .{@tagName(desc)});
@@ -1114,6 +1172,50 @@ fn evaluate(args: Args, outcome: Outcome) u8 {
         std.debug.print("tls-interop: expected at least {d} KeyUpdate(s) from the peer but observed {d}\n", .{
             args.expect_key_updates,
             outcome.key_updates_read,
+        });
+        failed = true;
+    }
+
+    if (args.expect_peer_record_size_limit) |expected| {
+        if (outcome.peer_record_size_limit == null or outcome.peer_record_size_limit.? != expected) {
+            std.debug.print("tls-interop: expected the peer to advertise record_size_limit={d} but observed {?d}\n", .{
+                expected,
+                outcome.peer_record_size_limit,
+            });
+            failed = true;
+        }
+    }
+    if (args.expect_max_record_bytes) |limit| {
+        if (outcome.max_sent_record_bytes > limit) {
+            std.debug.print("tls-interop: sealed a {d}-byte inner plaintext, above the {d}-byte bound\n", .{
+                outcome.max_sent_record_bytes,
+                limit,
+            });
+            failed = true;
+        }
+        // A row that pins a bound but sent nothing would pass vacuously.
+        if (outcome.max_sent_record_bytes == 0) {
+            std.debug.print("tls-interop: no protected record was sealed, so the {d}-byte bound proves nothing\n", .{limit});
+            failed = true;
+        }
+    }
+    if (args.expect_max_received_record_bytes) |limit| {
+        if (outcome.max_received_record_bytes > limit) {
+            std.debug.print("tls-interop: the peer sent a {d}-byte inner plaintext, above the {d} we advertised\n", .{
+                outcome.max_received_record_bytes,
+                limit,
+            });
+            failed = true;
+        }
+        if (outcome.max_received_record_bytes == 0) {
+            std.debug.print("tls-interop: no protected record arrived, so the {d}-byte bound proves nothing\n", .{limit});
+            failed = true;
+        }
+    }
+    if (outcome.protected_records_sent < args.expect_min_records_sent) {
+        std.debug.print("tls-interop: expected at least {d} protected record(s) but sealed {d}\n", .{
+            args.expect_min_records_sent,
+            outcome.protected_records_sent,
         });
         failed = true;
     }

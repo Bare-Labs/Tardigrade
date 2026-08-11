@@ -414,17 +414,17 @@ pub const Bridge = struct {
             },
             .handshake => blk: {
                 const write = self.writeHandshake() orelse return error.MissingWriteKeys;
-                break :blk try sealHandshakeFragments(write, bytes, content_max, out);
+                break :blk try sealHandshakeFragments(write, bytes, content_max, &self.record_size_counters, out);
             },
             .application => blk: {
                 if (!self.handshake_complete) return error.HandshakeNotComplete;
                 const write = self.writeApplication() orelse return error.MissingWriteKeys;
-                break :blk try sealHandshakeFragments(write, bytes, content_max, out);
+                break :blk try sealHandshakeFragments(write, bytes, content_max, &self.record_size_counters, out);
             },
             .zero_rtt => blk: {
                 if (self.handshake_complete) return error.UnsupportedRecordEpoch;
                 const write = self.writeZeroRtt() orelse return error.MissingWriteKeys;
-                break :blk try sealHandshakeFragments(write, bytes, content_max, out);
+                break :blk try sealHandshakeFragments(write, bytes, content_max, &self.record_size_counters, out);
             },
         };
     }
@@ -500,8 +500,12 @@ pub const Bridge = struct {
             },
         };
         // Only counted once the record actually exists: a failed seal sent
-        // nothing, so it padded nothing.
-        self.record_size_counters.notePadding(padding_len);
+        // nothing, so it padded nothing. The initial epoch is unprotected and
+        // outside RFC 8449's accounting entirely.
+        if (epoch != .initial) {
+            self.record_size_counters.notePadding(padding_len);
+            self.record_size_counters.noteSealed(bytes.len, padding_len);
+        }
         return sealed;
     }
 
@@ -554,6 +558,12 @@ pub const Bridge = struct {
                 break :blk try read.open(record, out);
             },
         };
+        // Counted only for protected epochs, and only once the AEAD actually
+        // opened the record: an unauthenticated length is not evidence of
+        // anything the peer did.
+        if (epoch != .initial) {
+            self.record_size_counters.noteOpened(inner.content.len + 1 + inner.padding_len);
+        }
         return .{ .epoch = epoch, .inner = inner };
     }
 
@@ -701,6 +711,7 @@ fn sealHandshakeFragments(
     write: *record_protection.WriteState,
     bytes: []const u8,
     content_max: usize,
+    counters: *record_size.Counters,
     out: []u8,
 ) Error![]const u8 {
     if (write.exhausted) return error.SequenceExhausted;
@@ -714,6 +725,7 @@ fn sealHandshakeFragments(
     while (in_pos < bytes.len) {
         const take = @min(content_max, bytes.len - in_pos);
         const record = try write.seal(.handshake, bytes[in_pos..][0..take], 0, out[out_pos..]);
+        counters.noteSealed(take, 0);
         in_pos += take;
         out_pos += record.len;
     }

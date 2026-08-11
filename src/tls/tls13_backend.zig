@@ -878,6 +878,24 @@ pub const Tls13Backend = struct {
     /// and on the client from EncryptedExtensions; read through
     /// `recordSizeLimits` by the record transport, which is the only consumer.
     peer_record_size_limit: ?u16 = null,
+    /// Whether extension 28 actually *completed* its round trip (#359), as
+    /// opposed to merely having been offered.
+    ///
+    /// This is what gates our own inbound bound, and the distinction is
+    /// load-bearing: an offer is a request, not an agreement. RFC 8449 §4
+    /// bounds records only "when the `record_size_limit` extension is
+    /// negotiated", so against a peer that ignores the extension entirely,
+    /// ordinary protocol record sizes remain legal and a configured
+    /// `policy.record_size_limit` of, say, 512 must not make us reject a
+    /// perfectly valid 8 KiB record.
+    ///
+    /// The activation point differs by role, and both are "the response, not
+    /// the offer": a client sets this when the server's EncryptedExtensions
+    /// answer arrives, and a server when it actually writes that answer. The
+    /// *peer* bound (`peer_record_size_limit`) is deliberately not gated this
+    /// way — a server learns it from the ClientHello and needs it immediately,
+    /// to fragment the very handshake flight that carries its response.
+    record_size_limit_active: bool = false,
     /// Server (#366): enablement/tolerance for accepting 0-RTT, configured
     /// via `setServerEarlyDataPolicy` before `start`.
     server_early_data_policy: ServerEarlyDataPolicy = .{},
@@ -1916,6 +1934,9 @@ pub const Tls13Backend = struct {
         self.client_early_data_attempted = false;
         self.selected_client_psk_index = null;
         self.client_hello_early_data_seen = false;
+        // #359: a reset connection has negotiated nothing.
+        self.peer_record_size_limit = null;
+        self.record_size_limit_active = false;
         self.server_early_data_policy = .{};
         self.early_data_replay_gate = .{};
         self.early_data_compat_gate = .{};
@@ -2032,6 +2053,10 @@ pub const Tls13Backend = struct {
         self.client_early_data_attempted = false;
         self.selected_client_psk_index = null;
         self.client_hello_early_data_seen = false;
+        // #359: a failed handshake negotiated no record-size bound either, so
+        // neither half may stay visible to a carrier.
+        self.peer_record_size_limit = null;
+        self.record_size_limit_active = false;
         self.early_data_accepted = false;
         self.early_data_decision = .not_attempted;
         self.early_data_max_bytes = 0;
@@ -3140,17 +3165,49 @@ pub const Tls13Backend = struct {
         try w.bytes(&body);
     }
 
+    /// The server's EncryptedExtensions half of the exchange.
+    ///
+    /// Conditional on the client having offered, because RFC 8449 §4 places
+    /// the server's value in EncryptedExtensions but does not exempt it from
+    /// RFC 8446 §4.2's rule that an endpoint "MUST NOT send extension
+    /// responses if the remote endpoint did not send the corresponding
+    /// extension requests" — and a client receiving such a response "MUST
+    /// abort the handshake with an `unsupported_extension` alert". Answering
+    /// unconditionally would therefore break every conforming client that
+    /// does not implement RFC 8449, which is most of them.
+    ///
+    /// Writing the response is also the server's activation point: from here
+    /// the extension is negotiated, so our own advertised bound becomes
+    /// enforceable on arriving records.
+    fn writeRecordSizeLimitResponse(self: *Tls13Backend, w: *Writer) HandshakeError!void {
+        if (self.offeredRecordSizeLimit() == null) return;
+        if (self.peer_record_size_limit == null) return;
+        try self.writeRecordSizeLimitOffer(w);
+        self.record_size_limit_active = true;
+    }
+
     fn recordSizeLimitEncodedLen(self: *const Tls13Backend) usize {
         return if (self.offeredRecordSizeLimit() == null) 0 else 2 + 2 + record_size.body_len;
     }
 
     /// The connection's negotiated record-size state (#359), for the record
-    /// transport. `local` is what we advertised — the bound we enforce on
-    /// arriving records — and `peer` is what the peer advertised, or null
-    /// until (or unless) it does.
+    /// transport.
+    ///
+    /// `local` is the bound we enforce on arriving records, and it is the
+    /// configured advertisement *only once the extension is actually
+    /// negotiated* — see `record_size_limit_active`. Reporting the configured
+    /// value from a connection where the peer ignored the extension would
+    /// have us reject records RFC 8449 §4 still permits.
+    ///
+    /// `peer` is what the peer advertised, or null until (or unless) it does;
+    /// `Limits` treats null as the protocol maximum, which is exactly what
+    /// RFC 8449 defines an absent extension to mean.
     pub fn recordSizeLimits(self: *const Tls13Backend) record_size.Limits {
         return .{
-            .local = self.offeredRecordSizeLimit() orelse record_size.default_limit,
+            .local = if (self.record_size_limit_active)
+                self.offeredRecordSizeLimit() orelse record_size.default_limit
+            else
+                record_size.default_limit,
             .peer = self.peer_record_size_limit,
         };
     }
@@ -3175,6 +3232,9 @@ pub const Tls13Backend = struct {
             error.MalformedHandshake => return error.MalformedHandshake,
             error.IllegalParameter => return error.IllegalParameter,
         };
+        // Only ever reached from `onEncryptedExtensions`, i.e. the server's
+        // answer to an offer this client made — the client's activation point.
+        self.record_size_limit_active = true;
     }
 
     fn policyAlpnOfferEncodedLen(self: *const Tls13Backend) HandshakeError!usize {
@@ -5074,10 +5134,9 @@ pub const Tls13Backend = struct {
         }
         // #359: RFC 8449 §4 — "In TLS 1.3, the server sends the
         // `record_size_limit` extension in the EncryptedExtensions message."
-        // Sent unconditionally when the profile offers it, not only in reply
-        // to a client that asked: the value bounds what the *server* accepts,
-        // and the client needs it whether or not it advertised one itself.
-        try self.writeRecordSizeLimitOffer(&w);
+        // Only in answer to a client that offered one; see
+        // `writeRecordSizeLimitResponse`.
+        try self.writeRecordSizeLimitResponse(&w);
         // #366: signal 0-RTT acceptance with an empty `early_data`
         // extension — omitted (not merely absent-with-a-flag) for a
         // PSK-resumed but early-rejected connection, so the client's
@@ -5157,8 +5216,9 @@ pub const Tls13Backend = struct {
             try w.bytes(payload);
         }
         // #359: see `emitPskFinishFlight` — RFC 8449 §4 puts the server's
-        // advertisement in EncryptedExtensions on both flights.
-        try self.writeRecordSizeLimitOffer(&w);
+        // advertisement in EncryptedExtensions on both flights, and both are
+        // equally bound by RFC 8446 §4.2's request/response rule.
+        try self.writeRecordSizeLimitResponse(&w);
         w.patch(2, ee_extensions);
         w.patch(3, ee_len);
         const encrypted_extensions = buf[0..w.len];
@@ -7073,9 +7133,82 @@ test "#359 the record-mode ClientHello carries a well-formed record_size_limit" 
         .{ .ctx = &found, .observeFn = Found.observe },
     );
     try std.testing.expectEqual(@as(?u16, 4096), found.limit);
-    // Nothing is negotiated yet: only our own advertisement is known.
-    try std.testing.expectEqual(@as(u16, 4096), backend.recordSizeLimits().local);
+    // The wire carries the configured offer, but nothing is negotiated yet —
+    // so the *enforceable* inbound bound is still the protocol maximum. An
+    // offer is a request, not an agreement (RFC 8449 §4 bounds records only
+    // once the extension "is negotiated").
+    try std.testing.expect(!backend.record_size_limit_active);
+    try std.testing.expectEqual(record_size.default_limit, backend.recordSizeLimits().local);
     try std.testing.expectEqual(@as(?u16, null), backend.recordSizeLimits().peer);
+}
+
+test "#359 a client that offers but is ignored keeps the protocol-maximum receive bound" {
+    // The regression the offer/active split exists to prevent: configured
+    // 512, peer ignores extension 28, and a legal 8 KiB record must still be
+    // acceptable. Reporting `local = 512` here would have the bridge reject
+    // records RFC 8449 §4 still permits.
+    var storage: TestProviderStorage = .{};
+    var policy = tls_policy.Policy.recordH2Only();
+    policy.record_size_limit = 512;
+    var backend = Tls13Backend.initClientConfigured(
+        Entropy{ .hello_random = [_]u8{0x66} ** 32 },
+        storage.init(test_crypto_provider_seed),
+        .{ .pinned_certificate = testdata.certificate_der },
+        recordConfig(policy),
+        .{},
+    );
+    defer backend.deinit();
+    var sink = EventSink{};
+    defer sink.deinit();
+    try backend.backend().start(.client, {}, &sink);
+
+    // EncryptedExtensions with ALPN but *no* record_size_limit: the peer
+    // simply does not implement RFC 8449.
+    var buf: [64]u8 = undefined;
+    var w = Writer{ .buf = &buf };
+    const extensions_len = try w.reserve(2);
+    try w.u16_(ext_alpn);
+    try w.u16_(2 + 1 + 2);
+    try w.u16_(1 + 2);
+    try w.u8_(2);
+    try w.bytes("h2");
+    w.patch(2, extensions_len);
+    try backend.onEncryptedExtensions(buf[0..w.len], &sink);
+
+    try std.testing.expect(!backend.record_size_limit_active);
+    const limits = backend.recordSizeLimits();
+    try std.testing.expectEqual(record_size.default_limit, limits.local);
+    try std.testing.expectEqual(@as(usize, record_size.max_limit), limits.inboundInnerMax());
+    // And nothing bounds our sends either.
+    try std.testing.expectEqual(@as(?u16, null), limits.peer);
+    try std.testing.expect(!limits.peerConstrains());
+}
+
+test "#359 a client activates its configured receive bound only once the server answers" {
+    var storage: TestProviderStorage = .{};
+    var policy = tls_policy.Policy.recordH2Only();
+    policy.record_size_limit = 512;
+    var backend = Tls13Backend.initClientConfigured(
+        Entropy{ .hello_random = [_]u8{0x67} ** 32 },
+        storage.init(test_crypto_provider_seed),
+        .{ .pinned_certificate = testdata.certificate_der },
+        recordConfig(policy),
+        .{},
+    );
+    defer backend.deinit();
+    var sink = EventSink{};
+    defer sink.deinit();
+    try backend.backend().start(.client, {}, &sink);
+    try std.testing.expectEqual(record_size.default_limit, backend.recordSizeLimits().local);
+
+    var buf: [64]u8 = undefined;
+    const ee = encryptedExtensionsWithRecordSizeLimit(&buf, 1024);
+    try backend.onEncryptedExtensions(ee, &sink);
+
+    try std.testing.expect(backend.record_size_limit_active);
+    const limits = backend.recordSizeLimits();
+    try std.testing.expectEqual(@as(u16, 512), limits.local);
+    try std.testing.expectEqual(@as(?u16, 1024), limits.peer);
 }
 
 test "#359 the QUIC (extension) profile never offers record_size_limit" {

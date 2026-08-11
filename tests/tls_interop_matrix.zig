@@ -150,6 +150,10 @@ pub const Config = struct {
     alpn_len: usize = 0,
     require_sni: bool = false,
     allow_absent_alpn: bool = false,
+    /// #359: the RFC 8449 `record_size_limit` this side advertises. Null
+    /// leaves `tls_policy.Policy`'s own default (the protocol maximum), which
+    /// is what every row that is not about record sizing wants.
+    record_size_limit: ?u16 = null,
 
     pub fn addCipherSuite(self: *Config, name: []const u8) ParseError!void {
         try self.cipher_suites.append(try parseCipherSuite(name));
@@ -195,6 +199,7 @@ pub const Config = struct {
         }, self.alpnProtocols(default_alpns));
         result.require_sni = self.require_sni;
         result.allow_absent_alpn = self.allow_absent_alpn;
+        if (self.record_size_limit) |limit| result.record_size_limit = limit;
         return result;
     }
 

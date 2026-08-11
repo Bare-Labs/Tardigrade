@@ -18,8 +18,15 @@ All notable user-facing changes to Tardigrade are documented here.
   (OpenSSL among them) simply omit it, which the RFC defines as the protocol
   maximum. Out-of-range values follow RFC 8449 §4's asymmetry exactly: below 64
   is `illegal_parameter` for both roles, while above the maximum a server
-  clamps and a client rejects. TLS-over-QUIC has no TLS records: it never
-  offers the extension, and a QUIC server ignores a client that does.
+  clamps and a client rejects. The server's EncryptedExtensions answer is sent
+  only in reply to a client that offered, per RFC 8446 §4.2's request/response
+  rule, and offering is kept distinct from negotiating: a configured limit
+  becomes an enforceable receive bound only once the round trip completes, so a
+  peer that ignores the extension still gets ordinary protocol record sizes.
+  TLS-over-QUIC has no TLS records: it never offers the extension, and a QUIC
+  server ignores a client that does. Two GnuTLS interop rows assert the
+  negotiated behaviour against an independent implementation in both roles —
+  one proving we honour the peer's limit, one proving the peer honours ours.
 
   Separately and locally, `PureZigRecordStream.setRecordPadding` enables
   RFC 8446 §5.4 padding on application data, rounding each record's inner

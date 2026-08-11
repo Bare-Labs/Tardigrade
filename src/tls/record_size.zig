@@ -219,13 +219,45 @@ pub const Counters = struct {
     padding_bytes: u64 = 0,
     /// Inbound protected records refused for exceeding `Limits.local`.
     oversize_records_rejected: u64 = 0,
+    /// Protected records sealed, across every content type.
+    protected_records_sent: u64 = 0,
+    /// The largest `TLSInnerPlaintext` actually sealed — content, its
+    /// content-type byte, and any padding. This is the quantity RFC 8449
+    /// bounds, so it is the one an interop row can hold against the peer's
+    /// advertised limit to prove records were really constrained rather than
+    /// merely that a handshake completed.
+    max_sent_inner_len: u32 = 0,
+    /// The largest `TLSInnerPlaintext` successfully opened. Held against our
+    /// *own* advertisement, this is the half of RFC 8449 a send-side counter
+    /// cannot reach: it shows the peer actually honored the limit we asked
+    /// for, rather than that we honored theirs.
+    max_recv_inner_len: u32 = 0,
 
     pub fn notePadding(self: *Counters, padding_len: usize) void {
         if (padding_len == 0) return;
         self.padded_records +|= 1;
         self.padding_bytes +|= padding_len;
     }
+
+    /// Record one sealed protected record of `content_len` content bytes plus
+    /// `padding_len` padding. The content-type byte is added here, so callers
+    /// pass what they actually sealed rather than pre-computing the framing.
+    pub fn noteSealed(self: *Counters, content_len: usize, padding_len: usize) void {
+        self.protected_records_sent +|= 1;
+        const inner = content_len +| 1 +| padding_len;
+        self.max_sent_inner_len = @max(self.max_sent_inner_len, saturatingU32(inner));
+    }
+
+    /// Record one successfully opened protected record whose complete inner
+    /// plaintext was `inner_len` bytes.
+    pub fn noteOpened(self: *Counters, inner_len: usize) void {
+        self.max_recv_inner_len = @max(self.max_recv_inner_len, saturatingU32(inner_len));
+    }
 };
+
+fn saturatingU32(value: usize) u32 {
+    return @intCast(@min(value, @as(usize, std.math.maxInt(u32))));
+}
 
 const testing = std.testing;
 
@@ -363,4 +395,37 @@ test "counters only move for records that actually carried padding" {
     counters.notePadding(5);
     try testing.expectEqual(@as(u64, 2), counters.padded_records);
     try testing.expectEqual(@as(u64, 32), counters.padding_bytes);
+}
+
+test "the sealed-record counter tracks the whole inner plaintext, padding included" {
+    var counters = Counters{};
+    counters.noteSealed(10, 0);
+    try testing.expectEqual(@as(u64, 1), counters.protected_records_sent);
+    // 10 content + the content-type byte.
+    try testing.expectEqual(@as(u32, 11), counters.max_sent_inner_len);
+
+    // Padding counts against the same bound the peer advertised, so it must
+    // count here too -- otherwise a padded record could exceed a limit this
+    // counter reported as respected.
+    counters.noteSealed(10, 100);
+    try testing.expectEqual(@as(u32, 111), counters.max_sent_inner_len);
+
+    // It is a high-water mark: a later smaller record does not lower it.
+    counters.noteSealed(1, 0);
+    try testing.expectEqual(@as(u32, 111), counters.max_sent_inner_len);
+    try testing.expectEqual(@as(u64, 3), counters.protected_records_sent);
+}
+
+test "the received-record counter is a separate high-water mark from the sent one" {
+    // The two directions answer different questions -- "did we honor the
+    // peer's limit" versus "did the peer honor ours" -- so one must never
+    // stand in for the other.
+    var counters = Counters{};
+    counters.noteSealed(4000, 0);
+    try testing.expectEqual(@as(u32, 0), counters.max_recv_inner_len);
+
+    counters.noteOpened(512);
+    counters.noteOpened(64);
+    try testing.expectEqual(@as(u32, 512), counters.max_recv_inner_len);
+    try testing.expectEqual(@as(u32, 4001), counters.max_sent_inner_len);
 }

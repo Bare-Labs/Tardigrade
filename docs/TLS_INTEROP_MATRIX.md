@@ -173,25 +173,43 @@ arithmetic.
 
 ### Record size limit (RFC 8449)
 
-There is deliberately **no** dedicated row for `record_size_limit` (#359).
-OpenSSL does not implement RFC 8449 — traced against OpenSSL 3.6.2, its
-ClientHello and EncryptedExtensions carry no extension 28 in either role — so a
-row asserting a negotiated limit would assert something no peer in this harness
-can do.
+Two GnuTLS rows (#359) assert *negotiated* record sizing. OpenSSL does not
+implement RFC 8449 — traced against OpenSSL 3.6.2, its ClientHello carries no
+extension 28 — but GnuTLS does, and `gnutls-cli`/`gnutls-serv` expose
+`--recordsize` to advertise a non-default value. That makes these the rows
+where the extension is exercised against an independent implementation rather
+than against ourselves.
 
-What the existing positive rows do cover is the case the RFC defines for
-exactly that situation: a peer that never sends the extension means "the
-protocol maximum", not "no limit". Every OpenSSL row therefore exercises the
-native side offering the extension (its default advertisement is the protocol
-maximum) to a peer that ignores it, and completing normally — which is the
-interoperability property that matters for enabling it by default.
+One caveat worth knowing when reading them: GnuTLS's `--recordsize N`
+advertises **N+1** on the wire, because RFC 8449 measures the complete
+`TLSInnerPlaintext` and GnuTLS adds the content-type byte itself. So
+`--recordsize 1024` negotiates a 1025-byte limit, which is what the rows pin.
 
-Coverage for a genuinely negotiated limit lives in-tree, where both sides can
-be driven: wire encode/decode and the role-asymmetric out-of-range handling in
-`src/tls/tls13_backend.zig` and `src/tls/tls13_backend_tests.zig`, and the
-sealing/opening bounds in `src/tls/record_epoch_bridge.zig` and
-`src/tls/encrypted_stream.zig`. If a future peer in this matrix implements RFC
-8449, a row belongs here.
+| Row | Peer | What it proves |
+| --- | --- | --- |
+| `record/server/gnutls/record-size-limit` | `gnutls-cli --recordsize 1024` | **we honor the peer's limit**: a 3000-byte response leaves as ≥5 protected records, none with an inner plaintext above 1025 |
+| `record/client/gnutls/record-size-limit` | `gnutls-serv --recordsize 1024` | **the peer honors ours**: we advertise 512, and GnuTLS fragments its ~780-byte response to fit while still delivering every byte |
+
+The two directions are deliberately split across the rows because neither
+stands in for the other. A row that only checked our own sending would pass
+against a peer that ignored the extension completely; a row that only checked
+what arrived would pass without our sizing logic ever running.
+
+Both assert on real record sizes rather than on a completed handshake. The
+server row pins the peer's advertised value, a per-record upper bound, and a
+minimum record count — so a build that negotiated the extension and then
+ignored it fails on fragmentation, and one that stopped sending fails on the
+record count. The client row pins the received-record bound together with a
+minimum byte count, so a peer that "honored" the limit by truncating its
+response fails too. Both bounds also refuse to pass vacuously: a row where no
+protected record was sealed (or none arrived) is a failure, not a silent
+zero-versus-limit comparison.
+
+Coverage for the parts no peer can drive — the role-asymmetric handling of an
+out-of-range advertisement, the request/response rule for the server's
+EncryptedExtensions answer, and the offer-versus-negotiated distinction — lives
+in-tree, in `src/tls/tls13_backend.zig`, `src/tls/tls13_backend_tests.zig`,
+`src/tls/record_epoch_bridge.zig`, and `src/tls/encrypted_stream.zig`.
 
 ### Negative conformance
 

@@ -57,6 +57,13 @@ openssl_bin="${OPENSSL_BIN:-openssl}"
 gnutls_cli="${GNUTLS_CLI:-gnutls-cli}"
 gnutls_serv="${GNUTLS_SERV:-gnutls-serv}"
 
+# #359: when non-empty, the GnuTLS peer advertises this RFC 8449
+# `record_size_limit` (its `--recordsize` is the payload size; GnuTLS adds the
+# content-type byte itself, so `--recordsize 1024` puts 1025 on the wire).
+# Scoped by the record-size rows and cleared straight after, so every other row
+# keeps the peer's default.
+gnutls_recordsize=""
+
 workdir="${TLS_INTEROP_WORKDIR:-$(mktemp -d)}"
 certs="$workdir/certs"
 logs="$workdir/logs"
@@ -194,6 +201,13 @@ list_matrix_rows() {
   say "positive  record/server/openssl/http2_entrypoint"
   say "positive  record/server/openssl/hrr"
   say "positive  record/client/openssl/hrr"
+  if [ "$have_gnutls" -eq 0 ]; then
+    say "skip      record/server/gnutls/record-size-limit"
+    say "skip      record/client/gnutls/record-size-limit"
+  else
+    say "positive  record/server/gnutls/record-size-limit"
+    say "positive  record/client/gnutls/record-size-limit"
+  fi
   say "positive  record/server/openssl/key-update/reciprocal"
   say "positive  record/client/openssl/key-update/reciprocal"
   say "positive  record/client/openssl/key-update/one-way"
@@ -351,9 +365,10 @@ run_server_alpn_row() { # name peer suite group signature alpn peer_stdin [extra
         -CAfile "$cert-cert.pem" > "$log.peer" 2>&1
       ;;
     gnutls)
-      peer_request_stdin "$peer_stdin" | "$gnutls_cli" --port "$p" \
-        --x509cafile "$cert-cert.pem" --alpn="$alpn" --sni-hostname=tardigrade.test \
-        --priority "$(gnutls_priority "$suite" "$group" "$sig")" 127.0.0.1 > "$log.peer" 2>&1
+      local cli_args=(--port "$p" --x509cafile "$cert-cert.pem" --alpn="$alpn"
+        --sni-hostname=tardigrade.test --priority "$(gnutls_priority "$suite" "$group" "$sig")")
+      [ -n "$gnutls_recordsize" ] && cli_args+=(--recordsize "$gnutls_recordsize")
+      peer_request_stdin "$peer_stdin" | "$gnutls_cli" "${cli_args[@]}" 127.0.0.1 > "$log.peer" 2>&1
       ;;
   esac
 
@@ -433,9 +448,11 @@ run_client_row() { # name peer suite group signature [extra native args...]
       wait_for_peer_listener "$log.peer" '^ACCEPT'
       ;;
     gnutls)
-      "$gnutls_serv" --port "$p" --http --x509certfile "$cert-cert.pem" \
-        --x509keyfile "$cert-key.pem" --alpn=http/1.1 \
-        --priority "$(gnutls_priority "$suite" "$group" "$sig")" > "$log.peer" 2>&1 &
+      local serv_args=(--port "$p" --http --x509certfile "$cert-cert.pem"
+        --x509keyfile "$cert-key.pem" --alpn=http/1.1
+        --priority "$(gnutls_priority "$suite" "$group" "$sig")")
+      [ -n "$gnutls_recordsize" ] && serv_args+=(--recordsize "$gnutls_recordsize")
+      "$gnutls_serv" "${serv_args[@]}" > "$log.peer" 2>&1 &
       peer_pid=$!
       wait_for_peer_listener "$log.peer" 'listening on ipv4'
       ;;
@@ -668,6 +685,54 @@ run_client_row "record/client/openssl/key-update/reciprocal" openssl aes128-gcm-
 # peer must follow the transition without being prompted to make one itself.
 run_client_row "record/client/openssl/key-update/one-way" openssl aes128-gcm-sha256 x25519 ed25519 \
   --key-update not-requested
+
+# ── 2c. RFC 8449 record_size_limit, both roles ──────────────────────────────
+
+say ""
+say "== record transport: record_size_limit (RFC 8449) =="
+# #359. OpenSSL does not implement RFC 8449, but GnuTLS does -- and its
+# `--recordsize` makes the peer advertise a non-default limit, so these rows
+# assert *negotiated* record sizing against an independent implementation
+# rather than against ourselves.
+#
+# The two rows deliberately cover opposite halves of the RFC, because one
+# direction cannot stand in for the other:
+#
+#   * the server row proves **we honor the peer's** limit -- a 3000-byte
+#     response must leave as several records, none larger than the 1025 the
+#     peer asked for; and
+#   * the client row proves **the peer honors ours** -- we advertise 512, and
+#     GnuTLS must fragment its ~780-byte response to fit while still
+#     delivering every byte of it.
+#
+# Both assert on real record sizes, not merely on a completed handshake: a
+# row where the extension was silently ignored fails on the size assertions.
+if [ "$have_gnutls" -eq 0 ]; then
+  result "record/server/gnutls/record-size-limit" SKIP "gnutls not installed"
+  result "record/client/gnutls/record-size-limit" SKIP "gnutls not installed"
+else
+  # Larger than the peer's 1025-byte limit, so it cannot be sent as one record.
+  record_size_payload="$(printf 'x%.0s' $(seq 1 3000))"
+
+  # `keep_writing` keeps GnuTLS attached while the response drains: a peer that
+  # sends its request and immediately EOFs would close mid-flush and the row
+  # would fail on the truncation rather than on record sizing.
+  gnutls_recordsize=1024
+  run_server_alpn_row "record/server/gnutls/record-size-limit" gnutls \
+    aes128-gcm-sha256 x25519 ed25519 http/1.1 keep_writing \
+    --record-size-limit 2048 --send "$record_size_payload" \
+    --expect-peer-record-size-limit 1025 \
+    --expect-max-record-bytes 1025 --expect-min-records-sent 5
+
+  # We advertise 512 while the peer advertises 1025, so both directions are
+  # pinned in one row: the peer's value must round-trip to us, and every
+  # record it sends must fit the bound we asked for.
+  run_client_row "record/client/gnutls/record-size-limit" gnutls \
+    aes128-gcm-sha256 x25519 ed25519 \
+    --record-size-limit 512 --expect-peer-record-size-limit 1025 \
+    --expect-max-received-record-bytes 512 --expect-min-bytes 700
+  gnutls_recordsize=""
+fi
 
 # #358: shutdown semantics are asserted explicitly because ordinary positive
 # rows may complete before observing the peer's terminal close behavior.

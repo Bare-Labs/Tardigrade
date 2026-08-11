@@ -137,6 +137,18 @@ advertised limit.
   EncryptedExtensions with `unsupported_extension`, which is the opposite
   case and the one RFC 8446 §4.2 requires aborting on: a server must not answer
   an extension the client never requested.
+* The server's EncryptedExtensions answer is **conditional on the client having
+  offered**, for that same reason. RFC 8449 §4 says where the server's value
+  goes; it does not exempt it from RFC 8446 §4.2's request/response rule, and a
+  conforming client that does not implement RFC 8449 aborts on an unsolicited
+  response.
+* Offering is not negotiating. Our own advertised bound becomes enforceable
+  only once the round trip completes — the client on receiving the server's
+  answer, the server on writing it. Against a peer that ignores the extension,
+  RFC 8449 §4 leaves ordinary protocol record sizes permitted, so a configured
+  limit of 512 must not make us reject a legal 8 KiB record. `Limits.local`
+  therefore reports the configured value only when the extension actually
+  negotiated, and the protocol maximum otherwise.
 * The client offers it in ClientHello (in both ClientHello1 and ClientHello2,
   at the same position, so an HRR's "ClientHello2 is a legal mutation of
   ClientHello1" check still passes). The server answers in
@@ -204,5 +216,12 @@ as a performance feature gets the tradeoff backwards.
 
 `PureZigRecordStream.recordSizeLimits()` reports the negotiated state and
 `recordSizeCounters()` the effects: writes narrowed by the peer's limit,
-records that carried padding, total padding bytes, and inbound records refused
-for exceeding our own advertisement.
+records that carried padding, total padding bytes, inbound records refused for
+exceeding our own advertisement, how many protected records were sealed, and
+the high-water inner-plaintext size in each direction.
+
+The two high-water marks answer different questions and neither substitutes for
+the other: `max_sent_inner_len` against the peer's advertised bound shows *we*
+honored *theirs*, while `max_recv_inner_len` against `Limits.local` shows the
+peer honored *ours*. The interop rows in `docs/TLS_INTEROP_MATRIX.md` assert one
+of each against GnuTLS.

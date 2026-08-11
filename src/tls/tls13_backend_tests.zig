@@ -13517,3 +13517,140 @@ test "#359 a QUIC-profile server does not even validate a record_size_limit it i
         try std.testing.expectEqual(@as(?u16, null), server.recordSizeLimits().peer);
     }
 }
+
+/// Scan an EncryptedExtensions message body for extension `id`. `body` is the
+/// message *including* its 4-byte handshake header, as it appears on the wire.
+fn encryptedExtensionsHasExtension(body: []const u8, id: u16) !bool {
+    const message = try tls_core.messages.decode(body);
+    try std.testing.expectEqual(tls_core.messages.MessageType.encrypted_extensions, message.kind);
+    var r = tls_core.messages.Reader{ .bytes = message.body };
+    var extensions = tls_core.messages.ExtensionIterator.init(try r.slice(try r.u16_()));
+    while (try extensions.next()) |extension| {
+        if (extension.id == id) return true;
+    }
+    return false;
+}
+
+/// The first EncryptedExtensions message in a handshake-epoch flight. The
+/// server concatenates EE/Certificate/CertificateVerify/Finished into one
+/// event, so this walks the framed messages rather than assuming the flight is
+/// a single message.
+fn firstEncryptedExtensions(flight: []const u8) ![]const u8 {
+    var offset: usize = 0;
+    while (offset + 4 <= flight.len) {
+        const body_len = (@as(usize, flight[offset + 1]) << 16) |
+            (@as(usize, flight[offset + 2]) << 8) | flight[offset + 3];
+        const end = offset + 4 + body_len;
+        if (end > flight.len) break;
+        if (flight[offset] == @intFromEnum(tls_core.messages.MessageType.encrypted_extensions)) {
+            return flight[offset..end];
+        }
+        offset = end;
+    }
+    return error.TestExpectedEqual;
+}
+
+test "#359 a server omits record_size_limit from EncryptedExtensions when the client did not offer" {
+    // RFC 8446 §4.2: a server "MUST NOT send extension responses if the remote
+    // endpoint did not send the corresponding extension requests", and a client
+    // receiving one "MUST abort the handshake with an unsupported_extension
+    // alert". RFC 8449 §4 places the server's value in EE but does not exempt
+    // it from that rule — so answering unconditionally would break every
+    // conforming client that does not implement RFC 8449.
+    var server_provider_storage: ProviderStorage = .{};
+    var server = tls_backend.Tls13Backend.initServer(
+        serverEntropy(),
+        server_provider_storage.init(server_provider_seed),
+        fixtureIdentity(),
+        .record,
+    );
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [2048]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{});
+    try server.backend().receive(.initial, hello, &sink);
+
+    var flight_buf: [8192]u8 = undefined;
+    const flight = collectHandshakeCrypto(&sink, &flight_buf);
+    const ee = try firstEncryptedExtensions(flight);
+    try std.testing.expect(!try encryptedExtensionsHasExtension(ee, record_size.extension_type));
+    // And with no round trip completed, the server's own advertisement is not
+    // an enforceable receive bound either.
+    try std.testing.expectEqual(record_size.default_limit, server.recordSizeLimits().local);
+}
+
+test "#359 a server answers in EncryptedExtensions exactly when the client offered" {
+    var server_provider_storage: ProviderStorage = .{};
+    var server = tls_backend.Tls13Backend.initServerConfigured(
+        serverEntropy(),
+        server_provider_storage.init(server_provider_seed),
+        fixtureIdentity(),
+        tls_backend.recordConfig(recordSizeLimitPolicy(2048)),
+    );
+    defer server.deinit();
+    var sink = DirectSink{};
+    defer sink.deinit();
+    try server.backend().start(.server, {}, &sink);
+
+    var buf: [2048]u8 = undefined;
+    const hello = try buildClientHello(&buf, .{ .record_size_limit = 1024 });
+    try server.backend().receive(.initial, hello, &sink);
+
+    var flight_buf: [8192]u8 = undefined;
+    const flight = collectHandshakeCrypto(&sink, &flight_buf);
+    const ee = try firstEncryptedExtensions(flight);
+    try std.testing.expect(try encryptedExtensionsHasExtension(ee, record_size.extension_type));
+    // Writing the answer is the server's activation point, so its configured
+    // bound is now enforceable — and the client's bound its sending bound.
+    const limits = server.recordSizeLimits();
+    try std.testing.expectEqual(@as(u16, 2048), limits.local);
+    try std.testing.expectEqual(@as(?u16, 1024), limits.peer);
+    try std.testing.expectEqual(@as(usize, 1023), limits.outboundContentMax());
+}
+
+test "#359 a PSK-resumed server flight follows the same request/response rule" {
+    // The resumed flight is a separate EncryptedExtensions builder
+    // (`emitPskFinishFlight`), so it needs its own proof — both directions.
+    for ([_]?u16{ null, 1024 }) |offered| {
+        var server_provider_storage: ProviderStorage = .{};
+        var server = tls_backend.Tls13Backend.initServer(
+            serverEntropy(),
+            server_provider_storage.init(server_provider_seed),
+            fixtureIdentity(),
+            .record,
+        );
+        defer server.deinit();
+
+        const psk = [_]u8{0x64} ** tls_backend.hash_len;
+        var stored_state = pskStoredState(&psk);
+        defer stored_state.deinit();
+        var resolver_state = CountingResolver{ .state = &stored_state, .identity = "rsl-ticket" };
+        try server.setServerPskResolver(.{
+            .ctx = &resolver_state,
+            .nowUnixMsFn = CountingResolver.now,
+            .resolveFn = CountingResolver.resolve,
+        });
+
+        var sink = DirectSink{};
+        defer sink.deinit();
+        try server.backend().start(.server, {}, &sink);
+
+        var buf: [2048]u8 = undefined;
+        const hello = try buildClientHello(&buf, .{
+            .record_size_limit = offered,
+            .psk = .{ .items = &.{.{ .identity = "rsl-ticket", .binder_psk = &psk }} },
+        });
+        try server.backend().receive(.initial, hello, &sink);
+        try std.testing.expect(server.selected_server_psk_present);
+
+        var flight_buf: [8192]u8 = undefined;
+        const flight = collectHandshakeCrypto(&sink, &flight_buf);
+        const ee = try firstEncryptedExtensions(flight);
+        const present = try encryptedExtensionsHasExtension(ee, record_size.extension_type);
+        try std.testing.expectEqual(offered != null, present);
+        try std.testing.expectEqual(offered, server.recordSizeLimits().peer);
+    }
+}
