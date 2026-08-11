@@ -83,6 +83,11 @@ pub const EventFrame = union(enum) {
         frame_type_value: u64,
         raw_length: usize,
     },
+    malformed: struct {
+        frame_type: frame.FrameType,
+        frame_type_value: u64,
+        raw_length: usize,
+    },
 };
 
 pub const Event = union(enum) {
@@ -645,7 +650,10 @@ pub fn Conn(comptime Transport: type) type {
                 if (raw.typ == .headers) {
                     var fields: [128]qpack.HeaderField = undefined;
                     var scratch: [4096]u8 = undefined;
-                    const count = qpack.decode(raw.payload, &fields, &scratch) catch 0;
+                    const count = qpack.decode(raw.payload, &fields, &scratch) catch {
+                        self.conn.events.emit(.{ .frame_parsed = .{ .stream_id = self.stream_id, .frame = .{ .malformed = .{ .frame_type = raw.typ, .frame_type_value = raw.type_value, .raw_length = raw.len } } } });
+                        return;
+                    };
                     self.conn.events.emit(.{ .frame_parsed = .{ .stream_id = self.stream_id, .frame = .{ .headers = .{
                         .fields = fields[0..count],
                         .raw_length = raw.len,
@@ -677,7 +685,8 @@ pub fn Conn(comptime Transport: type) type {
                     request.transport_early = request.transport_early or transportStreamTransportEarly(transport, id);
                     if (result.len > 0) {
                         var observer = RequestFrameObserver{ .conn = self, .stream_id = id };
-                        _ = request.stream.ingestBytesWithObserver(buf[0..result.len], &qpack_scratch, observer.observer()) catch |err| {
+                        const frame_observer = if (self.events.emitFn != null) observer.observer() else null;
+                        _ = request.stream.ingestBytesWithObserver(buf[0..result.len], &qpack_scratch, frame_observer) catch |err| {
                             if (err == error.UnexpectedFrame) return self.fail(.frame_unexpected);
                             return self.fail(.message_error);
                         };
@@ -837,7 +846,7 @@ pub fn Conn(comptime Transport: type) type {
                     .headers => {
                         var scratch: []u8 = &response.scratch;
                         field_count = qpack.decode(raw.payload, &response.fields, scratch[0..]) catch {
-                            self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .headers = .{ .raw_length = raw.len } } } });
+                            self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .malformed = .{ .frame_type = raw.typ, .frame_type_value = raw.type_value, .raw_length = raw.len } } } });
                             return error.ProtocolError;
                         };
                         self.events.emit(.{ .frame_parsed = .{ .stream_id = id, .frame = .{ .headers = .{ .fields = response.fields[0..field_count], .raw_length = raw.len } } } });
@@ -1042,21 +1051,22 @@ fn decodeEventSettings(payload: []const u8, scratch: []EventSetting) ?[]const Ev
 }
 
 fn eventFrameFromRaw(raw: frame.RawFrame, settings_scratch: []EventSetting) EventFrame {
+    const malformed = EventFrame{ .malformed = .{ .frame_type = raw.typ, .frame_type_value = raw.type_value, .raw_length = raw.len } };
     return switch (raw.typ) {
         .data => .{ .data = .{ .raw_length = raw.len } },
         .headers => .{ .headers = .{ .raw_length = raw.len } },
         .settings => blk: {
-            const entries = decodeEventSettings(raw.payload, settings_scratch) orelse return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
+            const entries = decodeEventSettings(raw.payload, settings_scratch) orelse return malformed;
             break :blk .{ .settings = .{ .entries = entries, .raw_length = raw.len } };
         },
         .goaway => blk: {
-            const decoded = varint.decode(raw.payload) catch return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
-            if (decoded.len != raw.payload.len) return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
+            const decoded = varint.decode(raw.payload) catch return malformed;
+            if (decoded.len != raw.payload.len) return malformed;
             break :blk .{ .goaway = .{ .id = decoded.value, .raw_length = raw.len } };
         },
         .priority_update_request, .priority_update_push => blk: {
-            const decoded = priority.decodePayload(raw.payload) catch return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
-            const kind = priority.kindFromFrameType(raw.typ) orelse return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
+            const decoded = priority.decodePayload(raw.payload) catch return malformed;
+            const kind = priority.kindFromFrameType(raw.typ) orelse return malformed;
             break :blk switch (kind) {
                 .request => .{ .priority_update = .{ .request = .{
                     .stream_id = decoded.element_id,
@@ -1070,15 +1080,15 @@ fn eventFrameFromRaw(raw: frame.RawFrame, settings_scratch: []EventSetting) Even
                 } } },
             };
         },
-        .push_promise => .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } },
+        .push_promise => malformed,
         .cancel_push => blk: {
-            const decoded = varint.decode(raw.payload) catch return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
-            if (decoded.len != raw.payload.len) return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
+            const decoded = varint.decode(raw.payload) catch return malformed;
+            if (decoded.len != raw.payload.len) return malformed;
             break :blk .{ .cancel_push = .{ .push_id = decoded.value, .raw_length = raw.len } };
         },
         .max_push_id => blk: {
-            const decoded = varint.decode(raw.payload) catch return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
-            if (decoded.len != raw.payload.len) return .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } };
+            const decoded = varint.decode(raw.payload) catch return malformed;
+            if (decoded.len != raw.payload.len) return malformed;
             break :blk .{ .max_push_id = .{ .push_id = decoded.value, .raw_length = raw.len } };
         },
         .unknown => .{ .unknown = .{ .frame_type_value = raw.type_value, .raw_length = raw.len } },
@@ -1312,6 +1322,7 @@ const EventRecorder = struct {
             .cancel_push => .cancel_push,
             .max_push_id => .max_push_id,
             .unknown => .unknown,
+            .malformed => |f| f.frame_type,
         };
     }
 
@@ -1329,6 +1340,7 @@ const EventRecorder = struct {
             .cancel_push => |f| f.raw_length,
             .max_push_id => |f| f.raw_length,
             .unknown => |f| f.raw_length,
+            .malformed => |f| f.raw_length,
         };
     }
 
@@ -1426,6 +1438,21 @@ const EventRecorder = struct {
         return false;
     }
 
+    fn sawMalformedFrame(self: *const EventRecorder, typ: frame.FrameType) bool {
+        for (self.events.items) |event| switch (event) {
+            .frame_created => |parsed| switch (parsed.frame) {
+                .malformed => |malformed| if (malformed.frame_type == typ) return true,
+                else => {},
+            },
+            .frame_parsed => |parsed| switch (parsed.frame) {
+                .malformed => |malformed| if (malformed.frame_type == typ) return true,
+                else => {},
+            },
+            else => {},
+        };
+        return false;
+    }
+
     fn sawPriorityUpdated(self: *const EventRecorder, stream_id: u64, urgency: u3, incremental: bool) bool {
         for (self.events.items) |event| switch (event) {
             .priority_updated => |p| if (p.stream_id == stream_id and p.urgency == urgency and p.incremental == incremental) return true,
@@ -1502,7 +1529,7 @@ test "H3 conn: client observes response HEADERS before QPACK failure" {
     try client.pump(&client_transport);
 
     try testing.expectError(error.ProtocolError, client.pollResponse(id));
-    try testing.expect(client_events.sawFrame(.parsed, .headers));
+    try testing.expect(client_events.sawMalformedFrame(.headers));
 }
 
 test "H3 conn: client observes duplicate response HEADERS before rejection" {
@@ -1749,6 +1776,65 @@ test "H3 conn: unknown request frame is observed as unknown" {
     try server.pump(&server_transport);
     try testing.expect(server_events.sawUnknownFrame(0x21));
     try testing.expect(!server_events.sawFrame(.parsed, .data));
+}
+
+test "H3 conn: malformed known frames are not observed as unknown" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var client = H3.init(allocator, .client);
+    defer client.deinit();
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+    var client_events = EventRecorder{};
+    defer client_events.deinit(allocator);
+    client.setEventSink(client_events.sink());
+
+    try client.start(&client_transport);
+    try server.start(&server_transport);
+    try client.pump(&client_transport);
+
+    var wire: [32]u8 = undefined;
+    const malformed_goaway = try frame.encodeKnownFrame(.goaway, &.{}, &wire);
+    _ = try server_transport.writeStream(server.control_out.?, malformed_goaway, false);
+
+    try testing.expectError(error.ProtocolError, client.pump(&client_transport));
+    try testing.expect(client_events.sawMalformedFrame(.goaway));
+    try testing.expect(!client_events.sawUnknownFrame(@intFromEnum(frame.FrameType.goaway)));
+}
+
+test "H3 conn: PUSH_PROMISE is preserved as malformed known frame until decoded" {
+    const allocator = testing.allocator;
+    var client_transport = MockTransport.init(allocator, true);
+    defer client_transport.deinit();
+    var server_transport = MockTransport.init(allocator, false);
+    defer server_transport.deinit();
+    client_transport.peer = &server_transport;
+    server_transport.peer = &client_transport;
+
+    const H3 = Conn(MockTransport);
+    var server = H3.init(allocator, .server);
+    defer server.deinit();
+    var server_events = EventRecorder{};
+    defer server_events.deinit(allocator);
+    server.setEventSink(server_events.sink());
+
+    const id = try client_transport.openStream(.bidi);
+    var payload: [8]u8 = undefined;
+    const payload_len = try varint.encode(1, &payload);
+    var wire: [32]u8 = undefined;
+    const push_promise = try frame.encodeKnownFrame(.push_promise, payload[0..payload_len], &wire);
+    _ = try client_transport.writeStream(id, push_promise, false);
+
+    try testing.expectError(error.ProtocolError, server.pump(&server_transport));
+    try testing.expect(server_events.sawMalformedFrame(.push_promise));
+    try testing.expect(!server_events.sawUnknownFrame(@intFromEnum(frame.FrameType.push_promise)));
 }
 
 test "H3 conn: frame_created is emitted when encoded request write fails" {

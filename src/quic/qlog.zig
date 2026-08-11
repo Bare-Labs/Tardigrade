@@ -87,13 +87,15 @@ pub const HandshakeStage = enum {
     failed,
 };
 
-/// Why a connection closed (drives `quic:connection_closed`).
-pub const CloseReason = enum {
+/// Standard qlog `quic:connection_closed` trigger.
+pub const CloseTrigger = enum {
     idle_timeout,
-    application_close,
-    transport_error,
+    application,
+    @"error",
+    version_mismatch,
     stateless_reset,
-    handshake_failure,
+    aborted,
+    unspecified,
 };
 
 pub const CloseError = union(enum) {
@@ -212,7 +214,7 @@ pub const Event = union(enum) {
     },
     /// quic:connection_closed
     connection_closed: struct {
-        reason: CloseReason,
+        trigger: CloseTrigger,
         close_error: CloseError = .none,
     },
     /// tardigrade:quic_handshake_progressed (progress milestone; not a
@@ -230,14 +232,14 @@ pub const Event = union(enum) {
     /// quic:packet_sent
     packet_sent: struct {
         packet_type: PacketType,
-        packet_number: u64,
+        packet_number: ?u64 = null,
         length: usize,
         ack_eliciting: bool = false,
     },
     /// quic:packet_received
     packet_received: struct {
         packet_type: PacketType,
-        packet_number: u64,
+        packet_number: ?u64 = null,
         length: usize,
     },
     /// quic:packet_lost
@@ -395,7 +397,7 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
             .{ d.odcid_len, d.scid_len, d.dcid_len },
         ),
         .connection_closed => |d| {
-            try b.add("{{\"reason\":\"{s}\"", .{@tagName(d.reason)});
+            try b.add("{{\"trigger\":\"{s}\"", .{@tagName(d.trigger)});
             switch (d.close_error) {
                 .none => {},
                 .connection_unknown => |code| try b.add(",\"connection_error\":\"unknown\",\"error_code\":{d}", .{code}),
@@ -413,14 +415,16 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
             if (d.trigger) |trigger| try b.add(",\"trigger\":\"{s}\"", .{@tagName(trigger)});
             try b.add("}}", .{});
         },
-        .packet_sent => |d| try b.add(
-            "{{\"header\":{{\"packet_type\":\"{s}\",\"packet_number\":{d}}},\"raw\":{{\"length\":{d}}},\"tardigrade_ack_eliciting\":{s}}}",
-            .{ d.packet_type.label(), d.packet_number, d.length, boolText(d.ack_eliciting) },
-        ),
-        .packet_received => |d| try b.add(
-            "{{\"header\":{{\"packet_type\":\"{s}\",\"packet_number\":{d}}},\"raw\":{{\"length\":{d}}}}}",
-            .{ d.packet_type.label(), d.packet_number, d.length },
-        ),
+        .packet_sent => |d| {
+            try b.add("{{\"header\":{{\"packet_type\":\"{s}\"", .{d.packet_type.label()});
+            if (d.packet_number) |pn| try b.add(",\"packet_number\":{d}", .{pn});
+            try b.add("}},\"raw\":{{\"length\":{d}}},\"tardigrade_ack_eliciting\":{s}}}", .{ d.length, boolText(d.ack_eliciting) });
+        },
+        .packet_received => |d| {
+            try b.add("{{\"header\":{{\"packet_type\":\"{s}\"", .{d.packet_type.label()});
+            if (d.packet_number) |pn| try b.add(",\"packet_number\":{d}", .{pn});
+            try b.add("}},\"raw\":{{\"length\":{d}}}}}", .{d.length});
+        },
         .packet_lost => |d| {
             try b.add("{{\"header\":{{\"packet_type\":\"{s}\"", .{d.packet_type.label()});
             if (d.packet_number) |pn| try b.add(",\"packet_number\":{d}", .{pn});
@@ -566,6 +570,16 @@ fn expectJson(record: Record, needle: []const u8) !void {
     try testing.expect(std.mem.indexOf(u8, line, needle) != null);
 }
 
+fn expectNoJson(record: Record, needle: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    const line = try writeJson(record, &buf);
+    try testing.expect(line[0] == record_separator);
+    try testing.expect(line[line.len - 1] == '\n');
+    try testing.expect(std.mem.indexOf(u8, line, needle) == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line[1 .. line.len - 1], .{});
+    defer parsed.deinit();
+}
+
 test "namespace and name mapping stays aligned with qlog vantage points" {
     try testing.expectEqual(Namespace.quic, (Event{ .packet_sent = .{ .packet_type = .one_rtt, .packet_number = 0, .length = 0 } }).namespace());
     try testing.expectEqual(Namespace.quic, (Event{ .packet_lost = .{ .packet_type = .one_rtt } }).namespace());
@@ -586,6 +600,25 @@ test "packet_sent serializes to a quic JSON-SEQ line" {
     );
 }
 
+test "non-numbered packets omit packet_number" {
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .packet_sent = .{ .packet_type = .retry, .length = 1200 } } },
+        "\"header\":{\"packet_type\":\"retry\"}",
+    );
+    try expectNoJson(
+        .{ .time_us = 0, .event = .{ .packet_sent = .{ .packet_type = .retry, .length = 1200 } } },
+        "\"packet_number\"",
+    );
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .packet_received = .{ .packet_type = .version_negotiation, .length = 37 } } },
+        "\"header\":{\"packet_type\":\"version_negotiation\"}",
+    );
+    try expectNoJson(
+        .{ .time_us = 0, .event = .{ .packet_received = .{ .packet_type = .version_negotiation, .length = 37 } } },
+        "\"packet_number\"",
+    );
+}
+
 test "deprotection failure is a packet_dropped with decryption_failure" {
     try expectJson(
         .{ .time_us = 0, .event = .{ .packet_dropped = .{ .packet_type = .one_rtt, .trigger = .decryption_failure, .length = 42 } } },
@@ -602,11 +635,15 @@ test "0-RTT key type serializes as a standard key_updated value" {
 
 test "connection_closed ties error_code to an unknown error category" {
     try expectJson(
-        .{ .time_us = 0, .event = .{ .connection_closed = .{ .reason = .transport_error, .close_error = .{ .connection_unknown = 0x123 } } } },
+        .{ .time_us = 0, .event = .{ .connection_closed = .{ .trigger = .@"error", .close_error = .{ .connection_unknown = 0x123 } } } },
+        "\"trigger\":\"error\"",
+    );
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .connection_closed = .{ .trigger = .@"error", .close_error = .{ .connection_unknown = 0x123 } } } },
         "\"connection_error\":\"unknown\",\"error_code\":291",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .connection_closed = .{ .reason = .application_close, .close_error = .{ .application_unknown = 0x456 } } } },
+        .{ .time_us = 0, .event = .{ .connection_closed = .{ .trigger = .application, .close_error = .{ .application_unknown = 0x456 } } } },
         "\"application_error\":\"unknown\",\"error_code\":1110",
     );
 }
@@ -678,7 +715,7 @@ test "default sink is a no-op and log() stamps time" {
 
     Collector.last = null;
     const sink = Sink{ .emit_fn = Collector.emit };
-    sink.log(99, .{ .connection_closed = .{ .reason = .idle_timeout } });
+    sink.log(99, .{ .connection_closed = .{ .trigger = .idle_timeout } });
     try testing.expect(Collector.last != null);
     try testing.expectEqual(@as(u64, 99), Collector.last.?.time_us);
 }

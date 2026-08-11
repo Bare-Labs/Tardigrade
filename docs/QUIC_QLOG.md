@@ -114,10 +114,10 @@ Names below are `namespace:event`. Transport events (`src/quic/qlog.zig`):
 |---------------------------|-------------------------------------|----------|
 | handshake                 | `quic:connection_started`           | required `local` / `remote` endpoint objects, plus Tardigrade CID-length diagnostics |
 |                           | `tardigrade:quic_handshake_progressed` | `stage` (started -> confirmed / failed) |
-|                           | `quic:connection_closed`            | `reason`, optional unknown connection/application error category plus `error_code` |
+|                           | `quic:connection_closed`            | standard `trigger`, optional unknown connection/application error category plus `error_code` |
 |                           | `quic:key_updated`                  | required `key_type`, optional full `key_phase` and `trigger` |
-| packet sent               | `quic:packet_sent`                  | `header`, `raw`, Tardigrade ack-eliciting diagnostic |
-| packet received           | `quic:packet_received`              | `header`, `raw` |
+| packet sent               | `quic:packet_sent`                  | `header` with packet number only for numbered packet types, `raw`, Tardigrade ack-eliciting diagnostic |
+| packet received           | `quic:packet_received`              | `header` with packet number only for numbered packet types, `raw` |
 | packet lost               | `quic:packet_lost`                  | `header` |
 | recovery metrics          | `quic:recovery_metrics_updated`     | RTT/PTO/cwnd/bytes-in-flight updates |
 | **deprotection failure**  | `quic:packet_dropped`               | `trigger:"decryption_failure"` |

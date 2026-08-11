@@ -1278,8 +1278,8 @@ pub const Runtime = struct {
                 .max_field_section_size = parameters.settings.max_field_section_size,
                 .max_table_capacity = if (parameters.settings.qpack_max_table_capacity == 0) null else parameters.settings.qpack_max_table_capacity,
                 .blocked_streams_count = if (parameters.settings.qpack_blocked_streams == 0) null else parameters.settings.qpack_blocked_streams,
-                .extended_connect = if (parameters.settings.enable_connect_protocol) true else null,
-                .h3_datagram = if (parameters.settings.h3_datagram) true else null,
+                .extended_connect = if (parameters.settings.enable_connect_protocol) 1 else null,
+                .h3_datagram = if (parameters.settings.h3_datagram) 1 else null,
             } },
             .stream_type_set => |stream| .{ .stream_type_set = .{
                 .stream_id = stream.stream_id,
@@ -1316,6 +1316,25 @@ pub const Runtime = struct {
             .cancel_push => |c| .{ .cancel_push = .{ .push_id = c.push_id, .raw_length = c.raw_length } },
             .max_push_id => |m| .{ .max_push_id = .{ .push_id = m.push_id, .raw_length = m.raw_length } },
             .unknown => |u| .{ .unknown = .{ .frame_type_bytes = u.frame_type_value, .raw_length = u.raw_length } },
+            .malformed => |m| .{ .malformed = .{
+                .frame_type = h3FrameTypeToQlog(m.frame_type),
+                .frame_type_bytes = m.frame_type_value,
+                .raw_length = m.raw_length,
+            } },
+        };
+    }
+
+    fn h3FrameTypeToQlog(typ: http3.frame.FrameType) http3.qlog.FrameType {
+        return switch (typ) {
+            .data => .data,
+            .headers => .headers,
+            .settings => .settings,
+            .goaway => .goaway,
+            .priority_update_request, .priority_update_push => .priority_update,
+            .push_promise => .push_promise,
+            .cancel_push => .cancel_push,
+            .max_push_id => .max_push_id,
+            .unknown => .unknown,
         };
     }
 

@@ -125,6 +125,12 @@ pub const Frame = union(enum) {
         frame_type_bytes: u64,
         raw_length: ?usize = null,
     },
+    malformed: struct {
+        frame_type: FrameType,
+        frame_type_bytes: u64,
+        raw_length: ?usize = null,
+        reason: []const u8 = "malformed_payload",
+    },
 
     pub fn frameType(self: Frame) FrameType {
         return switch (self) {
@@ -137,6 +143,7 @@ pub const Frame = union(enum) {
             .cancel_push => .cancel_push,
             .max_push_id => .max_push_id,
             .unknown => .unknown,
+            .malformed => |d| d.frame_type,
         };
     }
 };
@@ -148,8 +155,8 @@ pub const Event = union(enum) {
         max_field_section_size: ?u64 = null,
         max_table_capacity: ?u64 = null,
         blocked_streams_count: ?u64 = null,
-        extended_connect: ?bool = null,
-        h3_datagram: ?bool = null,
+        extended_connect: ?u16 = null,
+        h3_datagram: ?u16 = null,
     },
     /// http3:stream_type_set
     stream_type_set: struct {
@@ -349,7 +356,7 @@ fn settingNameFromId(id_value: u64) struct { name: SettingName, name_bytes: ?u64
         0x07 => .{ .name = .settings_qpack_blocked_streams },
         0x08 => .{ .name = .settings_enable_connect_protocol },
         0x33 => .{ .name = .settings_h3_datagram },
-        0x00, 0x02, 0x03, 0x04, 0x05 => .{ .name = .reserved, .name_bytes = id_value },
+        0x00, 0x02, 0x03, 0x04, 0x05 => .{ .name = .reserved },
         else => .{ .name = .unknown, .name_bytes = id_value },
     };
 }
@@ -371,7 +378,7 @@ fn writePriorityFieldValue(b: *Buf, value: []const u8) error{NoSpaceLeft}!void {
         try b.add(",\"priority_field_value\":", .{});
         try writeJsonString(b, value);
     } else {
-        try b.add(",\"priority_field_value_bytes\":", .{});
+        try b.add(",\"tardigrade_priority_field_value_bytes\":", .{});
         try writeHexBytes(b, value);
     }
 }
@@ -426,6 +433,11 @@ fn writeFrame(b: *Buf, frame: Frame) error{NoSpaceLeft}!void {
             try b.add(",\"frame_type_bytes\":{d}", .{d.frame_type_bytes});
             try writeRawLength(b, d.raw_length, &need_comma);
         },
+        .malformed => |d| {
+            try b.add(",\"frame_type_bytes\":{d},\"tardigrade_malformed_payload\":true,\"tardigrade_malformed_reason\":", .{d.frame_type_bytes});
+            try writeJsonString(b, d.reason);
+            try writeRawLength(b, d.raw_length, &need_comma);
+        },
     }
     try b.add("}}", .{});
 }
@@ -456,12 +468,12 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
             }
             if (d.extended_connect) |v| {
                 if (need_comma) try b.add(",", .{});
-                try b.add("\"extended_connect\":{s}", .{if (v) "true" else "false"});
+                try b.add("\"extended_connect\":{d}", .{v});
                 need_comma = true;
             }
             if (d.h3_datagram) |v| {
                 if (need_comma) try b.add(",", .{});
-                try b.add("\"h3_datagram\":{s}", .{if (v) "true" else "false"});
+                try b.add("\"h3_datagram\":{d}", .{v});
             }
             try b.add("}}", .{});
         },
@@ -549,6 +561,17 @@ test "parameters_set only emits present settings" {
     );
 }
 
+test "parameters_set extended settings use numeric values" {
+    const record = Record{ .time_us = 0, .event = .{ .parameters_set = .{
+        .initiator = .remote,
+        .extended_connect = 1,
+        .h3_datagram = 0,
+    } } };
+    try expectJson(record, "\"extended_connect\":1");
+    try expectJson(record, "\"h3_datagram\":0");
+    try expectValidJson(record);
+}
+
 test "stream_type_set and representative frames use http3 names" {
     try expectJson(
         .{ .time_us = 0, .event = .{ .stream_type_set = .{ .stream_id = 2, .stream_type = .control } } },
@@ -615,7 +638,7 @@ test "settings frames preserve explicit zero reserved and unknown IDs" {
     try expectJson(record, "{\"name\":\"settings_qpack_blocked_streams\",\"value\":0}");
     try expectJson(record, "{\"name\":\"settings_enable_connect_protocol\",\"value\":0}");
     try expectJson(record, "{\"name\":\"unknown\",\"name_bytes\":33,\"value\":99}");
-    try expectJson(record, "{\"name\":\"reserved\",\"name_bytes\":2,\"value\":1}");
+    try expectJson(record, "{\"name\":\"reserved\",\"value\":1}");
 }
 
 test "priority_update frames emit typed targets and escaped values" {
@@ -642,7 +665,7 @@ test "priority_update invalid bytes use byte-oriented qlog field" {
         .priority_field_value = &.{ 0xff, '\n' },
         .raw_length = 9,
     } } } } } };
-    try expectJson(record, "\"priority_field_value_bytes\":\"ff0a\"");
+    try expectJson(record, "\"tardigrade_priority_field_value_bytes\":\"ff0a\"");
     try expectValidJson(record);
 }
 
@@ -651,6 +674,18 @@ test "unknown frame serializes with original frame type bytes" {
         .{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 4, .frame = .{ .unknown = .{ .frame_type_bytes = 0x21, .raw_length = 2 } } } } },
         "\"frame_type\":\"unknown\",\"frame_type_bytes\":33",
     );
+}
+
+test "malformed frame preserves real frame type and diagnostic" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{
+        .direction = .parsed,
+        .stream_id = 0,
+        .frame = .{ .malformed = .{ .frame_type = .goaway, .frame_type_bytes = 0x07, .raw_length = 2 } },
+    } } };
+    try expectJson(record, "\"frame_type\":\"goaway\"");
+    try expectJson(record, "\"frame_type_bytes\":7");
+    try expectJson(record, "\"tardigrade_malformed_payload\":true");
+    try expectValidJson(record);
 }
 
 test "large header records require a caller-sized buffer" {
