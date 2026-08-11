@@ -114,7 +114,7 @@ Names below are `namespace:event`. Transport events (`src/quic/qlog.zig`):
 |---------------------------|-------------------------------------|----------|
 | handshake                 | `quic:connection_started`           | required `local` / `remote` endpoint objects, plus Tardigrade CID-length diagnostics |
 |                           | `tardigrade:quic_handshake_progressed` | `stage` (started -> confirmed / failed) |
-|                           | `quic:connection_closed`            | `reason`, optional `error_code` |
+|                           | `quic:connection_closed`            | `reason`, optional unknown connection/application error category plus `error_code` |
 |                           | `quic:key_updated`                  | required `key_type`, optional full `key_phase` and `trigger` |
 | packet sent               | `quic:packet_sent`                  | `header`, `raw`, Tardigrade ack-eliciting diagnostic |
 | packet received           | `quic:packet_received`              | `header`, `raw` |
@@ -124,16 +124,15 @@ Names below are `namespace:event`. Transport events (`src/quic/qlog.zig`):
 | PATH_CHALLENGE/RESPONSE   | `tardigrade:quic_path_validation`   | `phase` (challenge/response sent/received, validated, failed) |
 | migration                 | `quic:migration_state_updated`      | required `new` migration state, optional `old` |
 | stream reset              | `tardigrade:quic_stream_reset`      | `direction` (reset/stop-sending, sent/received), stream id, error code |
-| flow-control blocked      | `quic:connection_data_blocked_updated` / `quic:stream_data_blocked_updated` | required `new` blocked state, optional `old` / `reason`; stream variant requires `stream_id` |
+| flow-control blocked      | `quic:connection_data_blocked_updated` / `quic:stream_data_blocked_updated` | required `new` blocked state, optional `old` / draft `$BlockedReason`; stream variant requires `stream_id` |
 
 Application events (`src/http3/qlog.zig`):
 
 | Requirement (#255)        | qlog event                          | Key data |
 |---------------------------|-------------------------------------|----------|
 | SETTINGS                  | `http3:parameters_set`              | max field section size, QPACK table cap, blocked streams |
-| stream classification     | `http3:stream_type_set`             | stream id, request/control/QPACK/push/unknown stream type |
-| HEADERS / DATA / GOAWAY / PRIORITY_UPDATE | `http3:frame_created` / `http3:frame_parsed` | variant-specific frame payloads; HEADERS carries `headers`, SETTINGS carries `settings`, GOAWAY carries `id`, raw lengths live under `raw.length` |
-| priority changes          | `http3:priority_updated`            | stream id and `new` HTTP priority field value |
+| control stream            | `http3:stream_type_set`             | stream id, stream type |
+| HEADERS / DATA / GOAWAY   | `http3:frame_created` / `http3:frame_parsed` | variant-specific frame payloads; HEADERS carries escaped `headers`, SETTINGS carries typed lower-case qlog `settings`, GOAWAY carries `id` |
 | **QPACK blocked**         | `tardigrade:qpack_stream_state_updated` | `state` (blocked/unblocked), stream id |
 
 `quic:packet_dropped` with `trigger:"decryption_failure"` is the
@@ -153,7 +152,11 @@ Each record is one JSON-SEQ line:
   precision, derived from a monotonic `time_us`.
 - Writers are **allocation-free**: they format into a caller-owned buffer
   (`writeJson(record, buf)`), matching the bounded-buffer style already used by
-  the TLS handshake wire writer. A 512-byte buffer covers every event.
+  the TLS handshake wire writer. Fixed-size QUIC transport records remain
+  small, but H3 HEADERS, SETTINGS, and PUSH_PROMISE records grow with supplied
+  field/setting slices. Composition-root writers must size the record buffer
+  for the configured field-section budget, stream records directly, or retain
+  `NoSpaceLeft` as an explicit dropped-record diagnostic.
 - A qlog file is a `QlogFileSeq` header followed by event lines.
   `qlog.writeTraceHeader(header, buf)` serializes the
   `file_schema: urn:ietf:params:qlog:file:sequential`,
@@ -168,6 +171,9 @@ Each record is one JSON-SEQ line:
   representative QUIC/H3 records) so the merged-file contract is locked.
 - JSON-SEQ qlog artifacts use the `.sqlog` suffix. Reserve `.qlog` for the
   normal contained JSON qlog form.
+- Dynamic qlog text fields, including trace `title`/`description` and HTTP
+  field names/values, are JSON-string escaped by the serializers before
+  writing into the caller-owned buffer.
 
 ### Sink error handling
 
