@@ -35,6 +35,7 @@ START_COMMAND=""
 SAVE_DIR=""
 WAIT_SECONDS="10"
 SAMPLE_INTERVAL_MS="500"
+RECOVERY_SECONDS="5"
 
 usage() {
     sed -n '/^# Usage:/,/^$/p' "$0"
@@ -56,10 +57,11 @@ Options:
   --save-dir DIR         Artifact directory (default: benchmarks/results/<date>/listener-sharding-<timestamp>)
   --wait-seconds N       Startup wait timeout (default: 10)
   --sample-interval-ms N CPU/RSS sample interval passed to run.sh (default: 500)
+  --recovery-seconds N   Pause after close-connection workloads (default: 5)
   --help                 Show this help
 
 Saved artifacts:
-  summary.json                        Combined 1-vs-N summary
+  summary.json                        Combined accept-batching summary
   <profile>-run.json                  benchmarks/run.sh output
   <profile>-startup-metrics.prom      Metrics scrape used to verify shard topology
   <profile>-metrics.prom              Full Prometheus scrape after workloads
@@ -91,6 +93,7 @@ while [[ $# -gt 0 ]]; do
         --save-dir) SAVE_DIR="$2"; shift 2 ;;
         --wait-seconds) WAIT_SECONDS="$2"; shift 2 ;;
         --sample-interval-ms) SAMPLE_INTERVAL_MS="$2"; shift 2 ;;
+        --recovery-seconds) RECOVERY_SECONDS="$2"; shift 2 ;;
         --help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -470,6 +473,56 @@ wrk_summary_json_from_file() {
     printf '%s\n' "$summary_json"
 }
 
+validate_wrk_sample() {
+    local label="$1" summary_json="$2" output="$3"
+    if ! jq -e '.rps > 0 and .errors == 0' >/dev/null <<<"$summary_json"; then
+        echo "${label}: invalid benchmark sample (zero throughput or client/socket errors); raw output saved to ${output}" >&2
+        return 1
+    fi
+}
+
+recover_after_close_workload() {
+    local label="$1"
+    if (( RECOVERY_SECONDS > 0 )); then
+        echo "==> ${label}: waiting ${RECOVERY_SECONDS}s for close-connection recovery" >&2
+        sleep "$RECOVERY_SECONDS"
+    fi
+}
+
+validate_profile_accept_batching() {
+    local label="$1" batch_limit="$2" fairness_yield_every="$3"
+    shift 3
+
+    local accepted batches yields
+    accepted="$(printf '%s\n' "$@" | jq -s '[.[].accept_metrics.accept_batch_size_sum_delta[]?.value] | add // 0')"
+    batches="$(printf '%s\n' "$@" | jq -s '[.[].accept_metrics.accept_batch_size_count_delta[]?.value] | add // 0')"
+    yields="$(printf '%s\n' "$@" | jq -s '[.[].accept_metrics.accept_fairness_yields_total_delta[]?.value] | add // 0')"
+
+    if (( batch_limit > 1 )) && (( accepted <= batches )); then
+        echo "${label}: invalid benchmark sample; no readiness turn accepted more than one connection (accepted=${accepted}, batches=${batches})" >&2
+        return 1
+    fi
+    if (( fairness_yield_every > 0 )) && (( yields <= 0 )); then
+        echo "${label}: invalid benchmark sample; fairness cutoff was never exercised" >&2
+        return 1
+    fi
+}
+
+require_nonempty_file() {
+    local path="$1"
+    if [[ ! -s "$path" ]]; then
+        echo "Required benchmark artifact is empty or missing: ${path}" >&2
+        return 1
+    fi
+}
+
+validate_profile_artifacts() {
+    local file
+    for file in "$@"; do
+        require_nonempty_file "$file"
+    done
+}
+
 run_wrk_workload() {
     local label="$1"
     local output="$2"
@@ -498,6 +551,7 @@ run_wrk_workload() {
 
     local summary_json
     summary_json="$(wrk_summary_json_from_file "$label" "$output")"
+    validate_wrk_sample "$label" "$summary_json" "$output"
 
     local queue_json
     queue_json="$(queue_summary_json "$queue_samples" "$before_metrics" "$after_metrics")"
@@ -553,6 +607,8 @@ run_mixed_keepalive_churn_workload() {
     local keepalive_json churn_json queue_json accept_json
     keepalive_json="$(wrk_summary_json_from_file "${label}-keepalive" "$keepalive_output")"
     churn_json="$(wrk_summary_json_from_file "${label}-churn" "$churn_output")"
+    validate_wrk_sample "${label}-keepalive" "$keepalive_json" "$keepalive_output"
+    validate_wrk_sample "${label}-churn" "$churn_json" "$churn_output"
     queue_json="$(queue_summary_json "$queue_samples" "$before_metrics" "$after_metrics")"
     accept_json="$(accept_delta_json "$before_metrics" "$after_metrics")"
 
@@ -629,16 +685,32 @@ run_profile() {
     echo "==> ${label}: high connection churn (${STATIC_PATH}, Connection: close)" >&2
     local churn_json
     churn_json="$(run_wrk_workload "connection-churn-http1" "$churn_raw" "${BENCH_DIR}/wrk-summary.lua" "$churn_queue_samples" "${HEADER_ARGS[@]}" -H "Connection: close" "${BASE_URL}${STATIC_PATH}")"
+    recover_after_close_workload "${label}: post-churn"
 
     echo "==> ${label}: high connection burst (${STATIC_PATH}, Connection: close, ${BURST_CONNECTIONS} connections)" >&2
     local burst_json
     burst_json="$(WRK_CONNECTIONS="$BURST_CONNECTIONS" run_wrk_workload "connection-burst-http1" "$burst_raw" "${BENCH_DIR}/wrk-summary.lua" "$burst_queue_samples" "${HEADER_ARGS[@]}" -H "Connection: close" "${BASE_URL}${STATIC_PATH}")"
+    recover_after_close_workload "${label}: post-burst"
 
     echo "==> ${label}: mixed active keepalive + new connection churn (${KEEPALIVE_PATH} keepalive + ${STATIC_PATH} close)" >&2
     local mixed_json
     mixed_json="$(run_mixed_keepalive_churn_workload "mixed-keepalive-churn" "$mixed_keepalive_raw" "$mixed_churn_raw" "$mixed_queue_samples")"
+    recover_after_close_workload "${label}: post-mixed"
+    validate_profile_accept_batching "$label" "$batch_limit" "$fairness_yield_every" "$churn_json" "$burst_json" "$mixed_json"
 
     scrape_metrics > "$metrics_file"
+    validate_profile_artifacts \
+        "$run_json" \
+        "$run_log" \
+        "$startup_metrics_file" \
+        "$metrics_file" \
+        "$churn_raw" \
+        "$churn_queue_samples" \
+        "$burst_raw" \
+        "$burst_queue_samples" \
+        "$mixed_keepalive_raw" \
+        "$mixed_churn_raw" \
+        "$mixed_queue_samples"
 
     local standard_json metric_json
     standard_json="$(cat "$run_json")"
@@ -676,6 +748,7 @@ batch_64_fair_8_json="$(run_profile "batch-64-fair-8" 1 64 8)"
 sharded_json="$(run_profile "sharded-batch-64" "$SHARDS" 64 0)"
 
 summary_file="${SAVE_DIR}/summary.json"
+summary_tmp="${summary_file}.tmp"
 jq -n \
     --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
     --arg tag "$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)" \
@@ -685,6 +758,7 @@ jq -n \
     --argjson connections "$CONNECTIONS" \
     --argjson burst_connections "$BURST_CONNECTIONS" \
     --argjson threads "$THREADS" \
+    --argjson recovery_seconds "$RECOVERY_SECONDS" \
     --arg static_path "$STATIC_PATH" \
     --arg proxy_path "$PROXY_PATH" \
     --arg keepalive_path "$KEEPALIVE_PATH" \
@@ -704,6 +778,7 @@ jq -n \
             connections: $connections,
             burst_connections: $burst_connections,
             threads: $threads,
+            recovery_seconds: $recovery_seconds,
             static_path: $static_path,
             proxy_path: $proxy_path,
             keepalive_path: $keepalive_path,
@@ -721,7 +796,10 @@ jq -n \
         "batch-64": $batch_64,
         "batch-64-fair-8": $batch_64_fair_8,
         "sharded-batch-64": $sharded
-    }' > "$summary_file"
+    }' > "$summary_tmp"
+require_nonempty_file "$summary_tmp"
+jq empty "$summary_tmp"
+mv "$summary_tmp" "$summary_file"
 
 echo ""
 echo "Listener-sharding benchmark artifacts saved under: ${SAVE_DIR}"
