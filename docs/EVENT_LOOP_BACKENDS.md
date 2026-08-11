@@ -581,7 +581,7 @@ loop.
 - **Executed on Linux by CI, not by the author.** The development host for
   this change was macOS/arm64, where the io_uring path compiles out entirely;
   it was validated there only by cross-compiling for `x86_64-linux-gnu` and by
-  review. The Linux CI jobs were the first actual execution, and all six
+  review. The Linux CI jobs were the first actual execution, and all eight
   io_uring tests ran and passed there on both `ubuntu-latest` (x86_64) and
   `ubuntu-24.04-arm` (aarch64) — confirmed by skip-count differential: the
   macOS job skips 9 tests where the Linux jobs skip 1, and the difference of 8
