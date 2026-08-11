@@ -135,6 +135,17 @@ Application events (`src/http3/qlog.zig`):
 | HEADERS / DATA / GOAWAY   | `http3:frame_created` / `http3:frame_parsed` | variant-specific frame payloads; HEADERS carries escaped `headers`, SETTINGS carries typed lower-case qlog `settings`, GOAWAY carries `id` |
 | **QPACK blocked**         | `tardigrade:qpack_stream_state_updated` | `state` (blocked/unblocked), stream id |
 
+For HEADERS and PUSH_PROMISE, the H3 observer uses the current static/bounded
+QPACK decoder only as a best-effort diagnostic helper. If that helper rejects a
+field section, the trace retains the real `frame_type` but uses the custom
+`tardigrade_qpack_decode_failed: true` and
+`tardigrade_qpack_decode_reason: "diagnostic_decoder_rejected"` fields instead
+of asserting `tardigrade_malformed_payload`. This distinction is intentional:
+the decode failure can be caused by valid dynamic-table input or local
+diagnostic bounds, so it is not evidence that the peer sent malformed wire.
+Non-QPACK known-frame payloads that are structurally invalid continue to use
+the `tardigrade_malformed_payload` diagnostic.
+
 `quic:packet_dropped` with `trigger:"decryption_failure"` is the
 canonical qlog encoding of an AEAD deprotection failure, satisfying the #255
 requirement that deprotection failures are reported deterministically. It is
