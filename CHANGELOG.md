@@ -5,6 +5,116 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- **HTTP/1 origins are bounded per origin, not just per request and per process
+  (#140)** — `TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES` now applies
+  to HTTP/1 relay buffers in both directions, closing the last aggregate gap in
+  the proxy buffer accounting model. A fixed relay buffer bounds one request,
+  but nothing bounded how many requests one origin had in flight, so a single
+  slow origin could hold `concurrency × buffer` with every individual request
+  looking perfectly well behaved; only the process-wide limit stood between
+  that and the box. The account is keyed exactly as the connection pool keys
+  origins, and an origin reached over TLS whose ALPN negotiated HTTP/1.1 is now
+  charged under its HTTP/1 key rather than the HTTP/2 pool key it was acquired
+  through — otherwise one origin's memory was split across two limits. An
+  origin gets an account whenever it is proxied to, including when connection
+  pooling is disabled, because the account bounds memory and pooling has no
+  bearing on that.
+
+  An HTTP/1 response can never meet a capacity refusal after commitment: its
+  whole reservation is taken before the response head is written, so a refusal
+  is always a clean pre-commitment `503 proxy_buffer_saturated`, never charged
+  to the origin's health. Per-origin bytes and refusals are exported as
+  `tardigrade_upstream_pool_buffered_bytes{upstream,direction}` and
+  `tardigrade_upstream_pool_buffer_limit_exceeded_total{upstream,direction}`,
+  the HTTP/1 counterparts of the existing h2 pool series and read from the
+  account that does the enforcing, so either is directly comparable with the
+  configured limit. Cardinality stays bounded at two fixed directions per
+  configured origin. A reloaded limit applies immediately, including to origins
+  already holding reservations.
+
+  The HTTP/2 response relay buffer is now charged too. The relay copies
+  queued DATA out of the stream into a per-request buffer, and the queue's own
+  reservation is not released until *after* the downstream write — so while a
+  slow client blocks in that write, the same bytes are owned twice, and
+  charging only the queue let N concurrent slow responses hold roughly
+  `N × buffer` beyond every configured ceiling with nothing in the accounting
+  to show it. The reservation is taken before the response head is committed,
+  so a refusal is still a clean pre-commit `503`, and it is released on every
+  exit including the retry paths. Bodiless responses never touch the buffer and
+  are not charged for it, matching HTTP/1.
+
+  An HTTP/2 stream's queue and its relay buffer are bounded together by the
+  per-stream hard limit rather than each getting one. They are live at the same
+  time, so a limit each meant a single stream could own `per_stream_hard_limit`
+  of queue *and* a relay buffer on top with neither reporting an exceedance —
+  the per-stream hard limit was not, in fact, a limit on what one stream owns.
+  It is enforced by holding the relay's size back from the queue's own limit
+  when the stream opens, rather than by a budget object the two share: such an
+  object would have to outlive both a worker's relay reservation and a stream
+  the reader thread can still be inside. The queue keeps its own accounting of
+  its logical length, since that is what drives the watermarks and
+  `WINDOW_UPDATE` hysteresis.
+
+  Relay memory is also no longer allocated before a reservation admits it, on
+  either protocol. Matching the reservation's *size* was not enough: requests
+  waiting on a slow origin each took a buffer before charging any scope, so
+  concurrent traffic reached the very memory peak the aggregate limits exist to
+  prevent and was refused only afterwards. On HTTP/1 the same buffer is what
+  `readUpstreamHead` reads into — past the blank line, so response body bytes
+  could already be sitting in it — which is why that path reserves before the
+  buffer exists and has no bodiless exemption: the buffer is what discovers
+  whether a body exists. On HTTP/2 a bodiless response allocates no relay
+  buffer at all, and an upload's buffer is released at the upload/response
+  boundary instead of being held empty through the response.
+
+  Every per-stream decision for an HTTP/2 stream is now sourced from the policy
+  its connection pinned when it was opened, not from the request's config
+  snapshot. A pooled connection outlives reloads and its queue was already
+  judged by the advertised policy, so sizing the relay headroom or the relay
+  buffer from the current config put one stream under two generations at
+  once — on a raise letting it own more than the hard limit it is documented to
+  be measured against, on a shrink refusing a stream still operating inside the
+  window that connection granted it, with the outcome depending on whether the
+  request happened to reuse a pre-reload connection. Relatedly, the HTTP/2
+  relay buffer is now *allocated* once the connection is acquired, at the size
+  that connection's pinned policy can account for (never less than 16 KiB),
+  rather than being allocated up front at the current
+  `proxy_stream_buffer_size`. These limits bound retained allocation rather
+  than populated bytes, so allocating the larger size and using only part of it
+  would leave the remainder as real per-request memory charged to no scope —
+  N concurrent streams times the difference, beyond every configured ceiling.
+  The HTTP/1 path still allocates and charges at the current config's size,
+  since an HTTP/1 connection pins no policy of its own.
+
+  **Configuration change:** `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES`
+  must now be at least
+  `per_stream_high_watermark + max(proxy_stream_buffer_size, 16 KiB)`, and
+  startup and reload reject a policy that is not. Without the headroom, an
+  origin doing exactly what the advertised window invites would push the stream
+  past its own hard limit and have its response truncated; a startup error is
+  better than that surprise. The shipped defaults satisfy it with room to spare
+  (768 KiB + 16 KiB ≤ 1 MiB), so a default deployment is unaffected, but a
+  hand-tuned policy with `high` close to `hard` will need the gap widened.
+
+  Reloading an aggregate hard limit is now linearizable against reservations,
+  which makes the documented "applies immediately" guarantee exact. Previously
+  `Aggregate.reserve` read the limit once before its compare-and-swap loop, so
+  a reservation could read the old larger limit, be overtaken by a reload
+  storing a smaller one, and still commit under a policy that no longer
+  existed. A reload now waits for in-flight reservation attempts to finish and
+  holds new ones at a gate before publishing, so each attempt's policy is
+  stable across its own check-and-commit. Reservations still do not exclude one
+  another — only a reload excludes them — and reloads happen on config reload,
+  not per request.
+
+  `docs/PROXY_STREAMING.md` gains practical tuning guidance for the per-stream
+  low/high/hard watermarks and the per-origin and global hard limits, including
+  protocol-aware sizing (HTTP/1's cost per request is a fixed relay buffer,
+  HTTP/2's is a window plus a relay buffer), how to read each metric family
+  against the limit it belongs to, and which gauge *not* to compare with the
+  global limit. Benchmark scenarios (#149) and CI regression thresholds (#150)
+  remain owned by those issues.
+
 - **HTTP/2 proxy response buffering is bounded per stream *and* in aggregate
   (#140)** — the streaming receive window an HTTP/2 upstream connection
   advertises is now `TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES`
@@ -165,6 +275,16 @@ All notable user-facing changes to Tardigrade are documented here.
   the shared interop matrix.
 
 ### Fixed
+- **The HTTP/2 upstream pool could double-free an evicted origin key (#140)** —
+  `H2ConnPool.evict` freed the key the connection map owned *before* removing
+  the entry, so the removal probe compared the caller's key against bytes that
+  had already been freed. On a hash collision it could fail to remove the entry
+  at all, leaving a map entry whose key was freed — which teardown then freed a
+  second time, and whose connection it released after that connection had been
+  torn down, faulting on the refcount. `acquire` and `reapIdle` already used
+  the correct fetch-then-free order; `evict` now matches them. Found by a new
+  concurrent HTTP/2 test added in this change, which reproduced it as a
+  segfault under parallel load.
 - **Streaming mode could never negotiate HTTP/2 to a TLS upstream (#139)** —
   the streaming relay built its `UpstreamTlsOptions` without an `alpn_policy`,
   so it silently fell back to the `require_http1` default and offered an HTTPS

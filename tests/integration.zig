@@ -12345,6 +12345,28 @@ test "proxy full streaming mode relays fixed-length upload beyond request buffer
     }
     try std.testing.expect(saw_active_upload);
 
+    // The parked upload's relay buffer is charged to its HTTP/1 origin, not
+    // only to the process (#140): a fixed buffer bounds one request, but the
+    // scope concurrency to one origin can multiply is the origin. Safe to
+    // sample after the loop — the upload is blocked on bytes this test has not
+    // sent yet, so the gauge cannot move under us.
+    const origin_label = try std.fmt.allocPrint(allocator, "upstream=\"http:{s}:{d}\"", .{ test_host, upstream.port() });
+    defer allocator.free(origin_label);
+    {
+        var origin_metrics = try sendRequest(allocator, tardigrade.port, .{
+            .method = "GET",
+            .path = "/status/metrics",
+            .body = "",
+            .headers = &.{},
+        });
+        defer origin_metrics.deinit();
+        try std.testing.expectEqual(@as(?u64, 16384), prometheusLabeledMetricValue(
+            origin_metrics.body,
+            "tardigrade_upstream_pool_buffered_bytes",
+            &.{ origin_label, "direction=\"downstream_to_upstream\"" },
+        ));
+    }
+
     try upload_stream.writeAll(payload[initial_prefix_len..]);
     var response = try readHttpResponse(allocator, upload_stream);
     defer response.deinit();
@@ -12367,6 +12389,138 @@ test "proxy full streaming mode relays fixed-length upload beyond request buffer
     try std.testing.expect(std.mem.find(u8, metrics.body, "tardigrade_buffer_high_watermark_events_total{direction=\"downstream_to_upstream\",scope=\"stream\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, metrics.body, "tardigrade_buffered_bytes_current{direction=\"upstream_to_downstream\",scope=\"global\"} 0") != null);
     try std.testing.expect(std.mem.find(u8, metrics.body, "tardigrade_buffered_bytes_current{direction=\"downstream_to_upstream\",scope=\"global\"} 0") != null);
+    // The origin's account drained with the exchange, in both directions.
+    inline for (.{ "direction=\"downstream_to_upstream\"", "direction=\"upstream_to_downstream\"" }) |direction| {
+        try std.testing.expectEqual(@as(?u64, 0), prometheusLabeledMetricValue(
+            metrics.body,
+            "tardigrade_upstream_pool_buffered_bytes",
+            &.{ origin_label, direction },
+        ));
+    }
+}
+
+test "concurrent http1 uploads to one origin are bounded by the per-origin buffer cap" {
+    const allocator = std.testing.allocator;
+    const payload_len = 256 * 1024;
+    const payload = try allocator.alloc(u8, payload_len);
+    defer allocator.free(payload);
+    @memset(payload, 'c');
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .body = "first uploaded" },
+        .{ .body = "unused" },
+        .{ .body = "unused" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location /upload {{
+        \\    proxy_pass http://{s}:{d}/upload;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    // The upload relay buffer floors at 16 KiB, so a per-origin cap just over
+    // that admits one upload to this origin at a time and refuses a second.
+    // Nothing about a single request would ever refuse it — only the aggregate
+    // can. The per-stream hard limit has to leave room for a full window plus
+    // a relay buffer (2048 + 16384), and the per-origin floor is that hard
+    // limit, which is why both are 18432 rather than a bare 16384.
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_PROXY_STREAMING_MODE", .value = "full" },
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "4" },
+            .{ .name = "TARDIGRADE_PROXY_STREAM_BUFFER_SIZE", .value = "4096" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_LOW_WATERMARK_BYTES", .value = "1024" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HIGH_WATERMARK_BYTES", .value = "2048" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_STREAM_HARD_LIMIT_BYTES", .value = "18432" },
+            .{ .name = "TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES", .value = "18432" },
+            .{ .name = "TARDIGRADE_MAX_BODY_SIZE", .value = "1048576" },
+        },
+    });
+    defer tardigrade.stop();
+
+    const upload_head = try std.fmt.allocPrint(
+        allocator,
+        "POST /upload HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\n\r\n",
+        .{ test_host, tardigrade.port, payload.len },
+    );
+    defer allocator.free(upload_head);
+
+    // Head only, no body bytes yet: the relay's fixed 16 KiB buffer is then the
+    // whole of what this upload holds, which is what lets the cap be set to
+    // exactly one upload. (Body bytes arriving with the head would be reserved
+    // on top of it.) Upload one parks there until this test sends the rest.
+    var first = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer first.close();
+    try setStreamTimeouts(&first, 10_000);
+    try first.writeAll(upload_head);
+
+    const origin_label = try std.fmt.allocPrint(allocator, "upstream=\"http:{s}:{d}\"", .{ test_host, upstream.port() });
+    defer allocator.free(origin_label);
+    var origin_saturated = false;
+    var attempt: usize = 0;
+    while (attempt < 40 and !origin_saturated) : (attempt += 1) {
+        var active_metrics = try sendRequest(allocator, tardigrade.port, .{
+            .method = "GET",
+            .path = "/status/metrics",
+            .body = "",
+            .headers = &.{},
+        });
+        defer active_metrics.deinit();
+        origin_saturated = prometheusLabeledMetricValue(
+            active_metrics.body,
+            "tardigrade_upstream_pool_buffered_bytes",
+            &.{ origin_label, "direction=\"downstream_to_upstream\"" },
+        ) == @as(u64, 16384);
+        if (!origin_saturated) compat.sleepNs(25 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(origin_saturated);
+
+    // Upload two meets a full origin. The refusal is local saturation raised
+    // before the response head is committed, so it is a clean 503 rather than
+    // a status blamed on a perfectly healthy origin.
+    var second = try compat.tcpConnectToHost(allocator, test_host, tardigrade.port);
+    defer second.close();
+    try setStreamTimeouts(&second, 10_000);
+    try second.writeAll(upload_head);
+    var refused = try readHttpResponse(allocator, second);
+    defer refused.deinit();
+    try std.testing.expectEqual(@as(u16, 503), refused.status_code);
+    try std.testing.expect(std.mem.find(u8, refused.body, "proxy_buffer_saturated") != null);
+
+    // The parked upload was untouched by the refusal and still completes.
+    try first.writeAll(payload);
+    var accepted = try readHttpResponse(allocator, first);
+    defer accepted.deinit();
+    try std.testing.expectEqual(@as(u16, 200), accepted.status_code);
+
+    var metrics = try sendRequest(allocator, tardigrade.port, .{
+        .method = "GET",
+        .path = "/status/metrics",
+        .body = "",
+        .headers = &.{},
+    });
+    defer metrics.deinit();
+    // The refusal was counted at the origin scope, and every reservation came
+    // back: the cap bounded memory rather than latching it.
+    try std.testing.expect((prometheusLabeledMetricValue(
+        metrics.body,
+        "tardigrade_upstream_pool_buffer_limit_exceeded_total",
+        &.{ origin_label, "direction=\"downstream_to_upstream\"" },
+    ) orelse 0) >= 1);
+    try std.testing.expect((prometheusLabeledMetricValue(
+        metrics.body,
+        "tardigrade_buffer_limit_exceeded_total",
+        &.{ "direction=\"downstream_to_upstream\"", "scope=\"origin\"" },
+    ) orelse 0) >= 1);
+    try std.testing.expectEqual(@as(?u64, 0), prometheusLabeledMetricValue(
+        metrics.body,
+        "tardigrade_upstream_pool_buffered_bytes",
+        &.{ origin_label, "direction=\"downstream_to_upstream\"" },
+    ));
 }
 
 test "proxy full streaming upload works for server block route override" {

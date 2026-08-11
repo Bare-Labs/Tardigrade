@@ -1723,6 +1723,33 @@ pub const GatewayState = struct {
             try appendUpstreamLabelMetric(out, "tardigrade_upstream_pool_reuse_ratio", snap.host, "{d:.4}", .{ratio});
         }
 
+        // Per-origin HTTP/1 proxy buffer accounting (#140). Rendered from its
+        // own map rather than the host stats above: an origin gets a buffer
+        // account whenever it is proxied to, including with connection pooling
+        // disabled, so the two memberships differ. Cardinality is one series
+        // per configured origin per direction — the same bound as the h1
+        // connection series and the h2 pool's buffer series.
+        const origin_buffers = try self.upstream_pool.snapshotOriginBuffers(self.allocator);
+        defer http.upstream_pool.freeOriginBufferSnapshots(self.allocator, origin_buffers);
+        if (origin_buffers.len > 0) {
+            try out.appendSlice(
+                \\# HELP tardigrade_upstream_pool_buffered_bytes Bytes currently held against this HTTP/1 origin's proxy buffer account, by direction
+                \\# TYPE tardigrade_upstream_pool_buffered_bytes gauge
+                \\# HELP tardigrade_upstream_pool_buffer_limit_exceeded_total Origin-scope proxy buffer hard-limit refusals per HTTP/1 origin, by direction
+                \\# TYPE tardigrade_upstream_pool_buffer_limit_exceeded_total counter
+                \\
+            );
+            for (origin_buffers) |snap| {
+                inline for (.{
+                    http.proxy_buffer_account.Direction.downstream_to_upstream,
+                    http.proxy_buffer_account.Direction.upstream_to_downstream,
+                }) |direction| {
+                    try appendUpstreamDirectionLabelMetric(out, "tardigrade_upstream_pool_buffered_bytes", snap.origin, direction, "{d}", .{snap.bufferedBytes(direction)});
+                    try appendUpstreamDirectionLabelMetric(out, "tardigrade_upstream_pool_buffer_limit_exceeded_total", snap.origin, direction, "{d}", .{snap.bufferLimitExceeded(direction)});
+                }
+            }
+        }
+
         const lat = self.upstream_pool.connectLatencySnapshot();
         try out.appendSlice(
             \\# HELP tardigrade_upstream_connect_latency_ms Upstream TCP connect latency histogram in milliseconds

@@ -424,6 +424,18 @@ pub const EdgeConfig = struct {
     /// even if the batch cap is higher. 0 disables the extra fairness yield.
     /// Set via TARDIGRADE_ACCEPT_FAIRNESS_YIELD_EVERY.
     accept_fairness_yield_every: u32,
+    /// Event-loop backend override (#148). `null` keeps the platform default
+    /// (`epoll` on Linux, `kqueue` elsewhere), which is the shipped behavior.
+    /// Setting this to `io_uring` opts into the Linux-only readiness-only
+    /// `io_uring` poller; if its kernel capabilities cannot be established at
+    /// startup the process fails to start rather than silently downgrading to
+    /// `epoll`. Set via TARDIGRADE_EVENT_LOOP_BACKEND.
+    /// See docs/EVENT_LOOP_BACKENDS.md.
+    event_loop_backend: ?http.event_loop.Backend,
+    /// Submission-queue depth for the `io_uring` backend. Ignored by the
+    /// `epoll`/`kqueue` backends. Set via
+    /// TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES.
+    event_loop_io_uring_entries: u16,
     /// Enable master process supervision mode.
     master_process_enabled: bool,
     /// Number of worker processes when master mode is enabled.
@@ -1222,6 +1234,24 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const listener_shards = parseIntEnv(u16, allocator, "TARDIGRADE_LISTENER_SHARDS", 0);
     const accept_batch_limit = @max(parseIntEnv(u32, allocator, "TARDIGRADE_ACCEPT_BATCH_LIMIT", gaccept.default_accept_batch_limit), 1);
     const accept_fairness_yield_every = parseIntEnv(u32, allocator, "TARDIGRADE_ACCEPT_FAIRNESS_YIELD_EVERY", 0);
+    const event_loop_backend_str = envOrDefault(allocator, "TARDIGRADE_EVENT_LOOP_BACKEND", "default") catch unreachable;
+    defer allocator.free(event_loop_backend_str);
+    const event_loop_backend = try parseEventLoopBackendConfig(event_loop_backend_str);
+    const event_loop_io_uring_entries = parseIntEnv(
+        u16,
+        allocator,
+        "TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES",
+        http.event_loop.default_io_uring_entries,
+    );
+    if (event_loop_io_uring_entries < http.event_loop.min_io_uring_entries or
+        event_loop_io_uring_entries > http.event_loop.max_io_uring_entries)
+    {
+        logConfigDiagnostic("config validation failed: event_loop_io_uring_entries must be between {d} and {d}", .{
+            http.event_loop.min_io_uring_entries,
+            http.event_loop.max_io_uring_entries,
+        });
+        return error.InvalidConfigValue;
+    }
     const master_process_enabled = parseBoolEnv(allocator, "TARDIGRADE_MASTER_PROCESS", false);
     const worker_processes = parseIntEnv(u32, allocator, "TARDIGRADE_WORKER_PROCESSES", 1);
     const binary_upgrade_enabled = parseBoolEnv(allocator, "TARDIGRADE_BINARY_UPGRADE", true);
@@ -1681,6 +1711,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .listener_shards = listener_shards,
         .accept_batch_limit = accept_batch_limit,
         .accept_fairness_yield_every = accept_fairness_yield_every,
+        .event_loop_backend = event_loop_backend,
+        .event_loop_io_uring_entries = event_loop_io_uring_entries,
         .master_process_enabled = master_process_enabled,
         .worker_processes = worker_processes,
         .binary_upgrade_enabled = binary_upgrade_enabled,
@@ -2028,6 +2060,21 @@ fn parseAccessLogFormatConfig(raw: []const u8) !http.access_log.Format {
     const value = std.mem.trim(u8, raw, " \t\r\n");
     return http.access_log.Format.parse(value) orelse {
         logConfigDiagnostic("config validation failed: access_log_format must be one of json, plain, custom", .{});
+        return error.InvalidConfigValue;
+    };
+}
+
+/// `default` (the shipped behavior) leaves backend selection to the platform.
+/// Any other value names an explicit backend, which fails closed at startup if
+/// it is unavailable — see docs/EVENT_LOOP_BACKENDS.md.
+fn parseEventLoopBackendConfig(raw: []const u8) !?http.event_loop.Backend {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    // `auto` is deliberately NOT accepted: the auto-detect-with-fallback mode
+    // sketched in docs/EVENT_LOOP_BACKENDS.md is not implemented, and silently
+    // treating it as `default` would misrepresent that.
+    if (value.len == 0 or std.ascii.eqlIgnoreCase(value, "default")) return null;
+    return http.event_loop.Backend.parse(value) orelse {
+        logConfigDiagnostic("config validation failed: event_loop_backend must be one of default, epoll, kqueue, io_uring", .{});
         return error.InvalidConfigValue;
     };
 }
@@ -3206,6 +3253,18 @@ fn validateProxyStreamBufferSize(size: usize) !void {
 fn validateProxyBufferLimitsCoverRelayAllocations(limits: http.proxy_buffer_account.Limits, proxy_stream_buffer_size: usize) !void {
     const effective_relay_bytes = @max(proxy_stream_buffer_size, 16 * 1024);
     if (limits.per_stream_hard_limit < effective_relay_bytes) return error.InvalidConfigValue;
+    // The per-stream hard limit bounds everything one stream owns at once, and
+    // on an HTTP/2 response that is the queue *plus* the relay buffer the
+    // consumer copies into: the queue's reservation is not released until after
+    // the downstream write, so a slow client leaves both live. A policy that
+    // fills its window to the high watermark therefore needs the relay buffer
+    // to fit on top, or a compliant origin doing exactly what the advertised
+    // window invites would push the stream over its own hard limit and get its
+    // response truncated. Rejecting that here turns a surprise into a startup
+    // error. The shipped defaults (768 KiB high + 16 KiB relay <= 1 MiB hard)
+    // satisfy it.
+    const stream_peak = std.math.add(usize, limits.per_stream_high_watermark, effective_relay_bytes) catch return error.InvalidConfigValue;
+    if (limits.per_stream_hard_limit < stream_peak) return error.InvalidConfigValue;
 }
 
 /// Emit log warnings for configurations that are valid but operationally risky.
@@ -3406,6 +3465,23 @@ test "parse upstream lb algorithm aliases" {
     try std.testing.expectEqual(UpstreamLbAlgorithm.generic_hash, UpstreamLbAlgorithm.parse("generic-hash").?);
     try std.testing.expectEqual(UpstreamLbAlgorithm.random_two_choices, UpstreamLbAlgorithm.parse("random_two_choices").?);
     try std.testing.expect(UpstreamLbAlgorithm.parse("unknown") == null);
+}
+
+test "parse event loop backend config" {
+    // The default keeps the shipped epoll/kqueue behavior.
+    try std.testing.expect(try parseEventLoopBackendConfig("default") == null);
+    try std.testing.expect(try parseEventLoopBackendConfig("  ") == null);
+    try std.testing.expect(try parseEventLoopBackendConfig("") == null);
+
+    try std.testing.expectEqual(http.event_loop.Backend.io_uring, (try parseEventLoopBackendConfig("io_uring")).?);
+    try std.testing.expectEqual(http.event_loop.Backend.io_uring, (try parseEventLoopBackendConfig(" IO-URING ")).?);
+    try std.testing.expectEqual(http.event_loop.Backend.epoll, (try parseEventLoopBackendConfig("epoll")).?);
+
+    // `auto` is rejected rather than aliased to `default`: the auto-detect
+    // mode with epoll fallback described in docs/EVENT_LOOP_BACKENDS.md is
+    // not implemented, and accepting the name would imply otherwise.
+    try std.testing.expectError(error.InvalidConfigValue, parseEventLoopBackendConfig("auto"));
+    try std.testing.expectError(error.InvalidConfigValue, parseEventLoopBackendConfig("uring"));
 }
 
 test "parse upstream base url weights csv" {
@@ -4315,6 +4391,37 @@ test "proxy buffer limits validate low high hard ordering" {
         .per_origin_hard_limit = 512 * 1024,
         .global_hard_limit = 0,
     }).validate());
+}
+
+test "per-stream hard limit must cover a full window plus its relay buffer" {
+    const relay_bytes = 16 * 1024;
+    // A stream can own its queue and the relay buffer at the same time, so a
+    // hard limit that only covers the window is not enough: a compliant origin
+    // filling the window it was advertised would push the stream over its own
+    // limit and have its response truncated.
+    try std.testing.expectError(error.InvalidConfigValue, validateProxyBufferLimitsCoverRelayAllocations(.{
+        .per_stream_low_watermark = 32 * 1024,
+        .per_stream_high_watermark = 64 * 1024,
+        .per_stream_hard_limit = 64 * 1024, // high == hard: no room for the relay buffer
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    }, 4096));
+
+    // Exactly enough room is enough.
+    try validateProxyBufferLimitsCoverRelayAllocations(.{
+        .per_stream_low_watermark = 32 * 1024,
+        .per_stream_high_watermark = 64 * 1024,
+        .per_stream_hard_limit = 64 * 1024 + relay_bytes,
+        .per_origin_hard_limit = 0,
+        .global_hard_limit = 0,
+    }, 4096);
+
+    // The shipped defaults satisfy it, so this tightening costs a default
+    // deployment nothing.
+    try validateProxyBufferLimitsCoverRelayAllocations(
+        http.proxy_buffer_account.Limits.defaults(),
+        16 * 1024,
+    );
 }
 
 test "default proxy buffer limits produce the advertised HTTP/2 stream window" {
