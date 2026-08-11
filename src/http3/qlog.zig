@@ -688,6 +688,22 @@ test "malformed frame preserves real frame type and diagnostic" {
     try expectValidJson(record);
 }
 
+test "push_promise frame serializes decoded headers" {
+    const record = Record{ .time_us = 0, .event = .{ .frame = .{
+        .direction = .parsed,
+        .stream_id = 4,
+        .frame = .{ .push_promise = .{
+            .push_id = 3,
+            .headers = &.{ .{ .name = ":method", .value = "GET" }, .{ .name = ":path", .value = "/" } },
+            .raw_length = 10,
+        } },
+    } } };
+    try expectJson(record, "\"frame_type\":\"push_promise\"");
+    try expectJson(record, "\"push_id\":3");
+    try expectJson(record, "\"headers\":[{\"name\":\":method\",\"value\":\"GET\"},{\"name\":\":path\",\"value\":\"/\"}]");
+    try expectValidJson(record);
+}
+
 test "large header records require a caller-sized buffer" {
     const headers = [_]HttpField{
         .{ .name = "x-debug-0", .value = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },

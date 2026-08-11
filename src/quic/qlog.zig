@@ -372,6 +372,13 @@ fn boolText(value: bool) []const u8 {
     return if (value) "true" else "false";
 }
 
+fn packetTypeCarriesNumber(packet_type: PacketType) bool {
+    return switch (packet_type) {
+        .initial, .zero_rtt, .handshake, .one_rtt => true,
+        .retry, .version_negotiation => false,
+    };
+}
+
 fn writeJsonString(b: *Buf, value: []const u8) error{NoSpaceLeft}!void {
     try b.add("\"", .{});
     for (value) |c| {
@@ -417,12 +424,16 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
         },
         .packet_sent => |d| {
             try b.add("{{\"header\":{{\"packet_type\":\"{s}\"", .{d.packet_type.label()});
-            if (d.packet_number) |pn| try b.add(",\"packet_number\":{d}", .{pn});
+            if (packetTypeCarriesNumber(d.packet_type)) {
+                if (d.packet_number) |pn| try b.add(",\"packet_number\":{d}", .{pn});
+            }
             try b.add("}},\"raw\":{{\"length\":{d}}},\"tardigrade_ack_eliciting\":{s}}}", .{ d.length, boolText(d.ack_eliciting) });
         },
         .packet_received => |d| {
             try b.add("{{\"header\":{{\"packet_type\":\"{s}\"", .{d.packet_type.label()});
-            if (d.packet_number) |pn| try b.add(",\"packet_number\":{d}", .{pn});
+            if (packetTypeCarriesNumber(d.packet_type)) {
+                if (d.packet_number) |pn| try b.add(",\"packet_number\":{d}", .{pn});
+            }
             try b.add("}},\"raw\":{{\"length\":{d}}}}}", .{d.length});
         },
         .packet_lost => |d| {
@@ -602,19 +613,19 @@ test "packet_sent serializes to a quic JSON-SEQ line" {
 
 test "non-numbered packets omit packet_number" {
     try expectJson(
-        .{ .time_us = 0, .event = .{ .packet_sent = .{ .packet_type = .retry, .length = 1200 } } },
+        .{ .time_us = 0, .event = .{ .packet_sent = .{ .packet_type = .retry, .packet_number = 99, .length = 1200 } } },
         "\"header\":{\"packet_type\":\"retry\"}",
     );
     try expectNoJson(
-        .{ .time_us = 0, .event = .{ .packet_sent = .{ .packet_type = .retry, .length = 1200 } } },
+        .{ .time_us = 0, .event = .{ .packet_sent = .{ .packet_type = .retry, .packet_number = 99, .length = 1200 } } },
         "\"packet_number\"",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .packet_received = .{ .packet_type = .version_negotiation, .length = 37 } } },
+        .{ .time_us = 0, .event = .{ .packet_received = .{ .packet_type = .version_negotiation, .packet_number = 99, .length = 37 } } },
         "\"header\":{\"packet_type\":\"version_negotiation\"}",
     );
     try expectNoJson(
-        .{ .time_us = 0, .event = .{ .packet_received = .{ .packet_type = .version_negotiation, .length = 37 } } },
+        .{ .time_us = 0, .event = .{ .packet_received = .{ .packet_type = .version_negotiation, .packet_number = 99, .length = 37 } } },
         "\"packet_number\"",
     );
 }

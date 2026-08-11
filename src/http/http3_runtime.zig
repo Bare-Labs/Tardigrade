@@ -743,7 +743,9 @@ pub const Runtime = struct {
             .cid_len = parsed.dcid.len,
             .accepted_at_us = now,
         };
-        entry.h3.setEventSink(.{ .context = &entry.h3_observer, .emitFn = h3ConnectionEvent });
+        if (h3EventSinkFor(&entry.h3_observer)) |event_sink| {
+            entry.h3.setEventSink(event_sink);
+        }
 
         const cid = quic.cid.ConnectionId.init(parsed.dcid) catch {
             entry.deinit(allocator);
@@ -1268,6 +1270,11 @@ pub const Runtime = struct {
         observer.qlog_sink.log(nowUs(), h3EventToQlog(event) orelse return);
     }
 
+    fn h3EventSinkFor(observer: *ConnEntry.H3Observer) ?http3.conn.EventSink {
+        if (observer.qlog_sink.emit_fn == null) return null;
+        return .{ .context = observer, .emitFn = h3ConnectionEvent };
+    }
+
     fn h3EventToQlog(event: http3.conn.Event) ?http3.qlog.Event {
         return switch (event) {
             .parameters_set => |parameters| .{ .parameters_set = .{
@@ -1312,7 +1319,7 @@ pub const Runtime = struct {
                 .request => |r| .{ .request = .{ .stream_id = r.stream_id, .priority_field_value = r.field_value, .raw_length = r.raw_length } },
                 .push => |p| .{ .push = .{ .push_id = p.push_id, .priority_field_value = p.field_value, .raw_length = p.raw_length } },
             } },
-            .push_promise => |p| .{ .push_promise = .{ .push_id = p.push_id, .raw_length = p.raw_length } },
+            .push_promise => |p| .{ .push_promise = .{ .push_id = p.push_id, .headers = p.fields, .raw_length = p.raw_length } },
             .cancel_push => |c| .{ .cancel_push = .{ .push_id = c.push_id, .raw_length = c.raw_length } },
             .max_push_id => |m| .{ .max_push_id = .{ .push_id = m.push_id, .raw_length = m.raw_length } },
             .unknown => |u| .{ .unknown = .{ .frame_type_bytes = u.frame_type_value, .raw_length = u.raw_length } },
@@ -1771,6 +1778,11 @@ const H3QlogRecorder = struct {
                     .raw_length = p.raw_length,
                 } },
             } },
+            .push_promise => |p| .{ .push_promise = .{
+                .push_id = p.push_id,
+                .headers = try cloneFields(allocator, p.headers),
+                .raw_length = p.raw_length,
+            } },
             else => event_frame,
         };
     }
@@ -1783,6 +1795,7 @@ const H3QlogRecorder = struct {
                 .request => |r| allocator.free(r.priority_field_value),
                 .push => |p| allocator.free(p.priority_field_value),
             },
+            .push_promise => |p| freeFields(allocator, p.headers),
             else => {},
         }
     }
@@ -1828,6 +1841,24 @@ test "http3 runtime: H3 qlog events route through connection-scoped observers" {
     try testing.expectEqual(http3.qlog.Event{ .stream_type_set = .{ .stream_id = 0, .stream_type = .request } }, second.records.items[0].event);
 }
 
+test "http3 runtime: no-op H3 qlog sink does not install connection event observer" {
+    var no_op_observer = ConnEntry.H3Observer{
+        .runtime = undefined,
+        .connection_handle = 1,
+        .qlog_sink = .{},
+    };
+    try testing.expect(Runtime.h3EventSinkFor(&no_op_observer) == null);
+
+    var recorder = H3QlogRecorder{};
+    defer recorder.deinit(testing.allocator);
+    var enabled_observer = ConnEntry.H3Observer{
+        .runtime = undefined,
+        .connection_handle = 2,
+        .qlog_sink = recorder.sink(),
+    };
+    try testing.expect(Runtime.h3EventSinkFor(&enabled_observer) != null);
+}
+
 test "http3 runtime: H3 qlog adapter preserves typed event payloads" {
     var recorder = H3QlogRecorder{};
     defer recorder.deinit(testing.allocator);
@@ -1858,8 +1889,9 @@ test "http3 runtime: H3 qlog adapter preserves typed event payloads" {
     Runtime.h3ConnectionEvent(&observer, .{ .frame_parsed = .{ .stream_id = 4, .frame = .{ .headers = .{ .fields = &fields, .raw_length = 12 } } } });
     Runtime.h3ConnectionEvent(&observer, .{ .frame_created = .{ .stream_id = 0, .frame = .{ .goaway = .{ .id = 12, .raw_length = 2 } } } });
     Runtime.h3ConnectionEvent(&observer, .{ .frame_parsed = .{ .stream_id = 0, .frame = .{ .priority_update = .{ .request = .{ .stream_id = 8, .field_value = "u=2", .raw_length = 7 } } } } });
+    Runtime.h3ConnectionEvent(&observer, .{ .frame_parsed = .{ .stream_id = 4, .frame = .{ .push_promise = .{ .push_id = 3, .fields = &fields, .raw_length = 10 } } } });
 
-    try testing.expectEqual(@as(usize, 5), recorder.records.items.len);
+    try testing.expectEqual(@as(usize, 6), recorder.records.items.len);
     switch (recorder.records.items[0].event) {
         .parameters_set => |event| {
             try testing.expectEqual(http3.qlog.Initiator.local, event.initiator.?);
@@ -1907,6 +1939,17 @@ test "http3 runtime: H3 qlog adapter preserves typed event payloads" {
                     try testing.expectEqualStrings("u=2", frame_event.priority_field_value);
                 },
                 else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (recorder.records.items[5].event) {
+        .frame => |event| switch (event.frame) {
+            .push_promise => |frame_event| {
+                try testing.expectEqual(@as(u64, 3), frame_event.push_id);
+                try testing.expectEqualStrings(":method", frame_event.headers[0].name);
+                try testing.expectEqualStrings("GET", frame_event.headers[0].value);
             },
             else => return error.TestUnexpectedResult,
         },
