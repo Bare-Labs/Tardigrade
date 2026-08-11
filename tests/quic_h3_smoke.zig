@@ -1146,11 +1146,22 @@ test "smoke harness fails truncated long-header packets deterministically" {
 // interleaves transport records (src/quic) and HTTP/3 records (src/http3) into
 // a single JSON-SEQ stream. This test locks that intended file shape — the seam
 // #255 designs — without either package importing the other.
+fn expectQlogRecord(record: []const u8, expected_json: []const u8) !void {
+    try testing.expect(record.len >= 2);
+    try testing.expectEqual(quic.qlog.record_separator, record[0]);
+    try testing.expectEqual(@as(u8, '\n'), record[record.len - 1]);
+
+    const payload = record[1 .. record.len - 1];
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(expected_json, payload);
+}
+
 test "qlog composition root interleaves transport and h3 records under one header" {
     const qlog = quic.qlog;
     const h3qlog = http3.qlog;
 
-    var file: [1024]u8 = undefined;
+    var file: [8192]u8 = undefined;
     var len: usize = 0;
 
     const header = try qlog.writeTraceHeader(.{
@@ -1159,25 +1170,74 @@ test "qlog composition root interleaves transport and h3 records under one heade
     }, file[len..]);
     len += header.len;
 
-    const transport_rec = try qlog.writeJson(.{
+    try expectQlogRecord(header, "{\"file_schema\":\"urn:ietf:params:qlog:file:sequential\",\"serialization_format\":\"application/qlog+json-seq\",\"title\":\"tardigrade-quic\",\"description\":\"Tardigrade QUIC/HTTP-3 debug trace\",\"trace\":{\"common_fields\":{\"group_id\":\"0011223344556677\",\"time_format\":\"relative_to_epoch\",\"reference_time\":{\"clock_type\":\"monotonic\",\"epoch\":\"unknown\"}},\"vantage_point\":{\"type\":\"server\"},\"event_schemas\":[\"urn:ietf:params:qlog:events:quic-13\",\"urn:ietf:params:qlog:events:http3-13\",\"https://bare.systems/tardigrade/qlog/events/debug-1\"]}}");
+
+    const connection_started = try qlog.writeJson(.{
+        .time_us = 500,
+        .event = .{ .connection_started = .{ .odcid_len = 8, .scid_len = 8, .dcid_len = 8 } },
+    }, file[len..]);
+    len += connection_started.len;
+    try expectQlogRecord(connection_started, "{\"time\":0.500,\"name\":\"quic:connection_started\",\"data\":{\"local\":{},\"remote\":{},\"tardigrade_odcid_length\":8,\"tardigrade_scid_length\":8,\"tardigrade_dcid_length\":8}}");
+
+    const packet_sent = try qlog.writeJson(.{
+        .time_us = 1_000,
+        .event = .{ .packet_sent = .{ .packet_type = .initial, .packet_number = 0, .length = 1200, .ack_eliciting = true } },
+    }, file[len..]);
+    len += packet_sent.len;
+    try expectQlogRecord(packet_sent, "{\"time\":1.000,\"name\":\"quic:packet_sent\",\"data\":{\"header\":{\"packet_type\":\"initial\",\"packet_number\":0},\"raw\":{\"length\":1200},\"tardigrade_ack_eliciting\":true}}");
+
+    const packet_received = try qlog.writeJson(.{
         .time_us = 1_000,
         .event = .{ .packet_received = .{ .packet_type = .initial, .packet_number = 0, .length = 1200 } },
     }, file[len..]);
-    len += transport_rec.len;
+    len += packet_received.len;
+    try expectQlogRecord(packet_received, "{\"time\":1.000,\"name\":\"quic:packet_received\",\"data\":{\"header\":{\"packet_type\":\"initial\",\"packet_number\":0},\"raw\":{\"length\":1200}}}");
 
-    const h3_rec = try h3qlog.writeJson(.{
+    const packet_lost = try qlog.writeJson(.{
+        .time_us = 1_500,
+        .event = .{ .packet_lost = .{ .packet_type = .one_rtt, .packet_number = 7 } },
+    }, file[len..]);
+    len += packet_lost.len;
+    try expectQlogRecord(packet_lost, "{\"time\":1.500,\"name\":\"quic:packet_lost\",\"data\":{\"header\":{\"packet_type\":\"1RTT\",\"packet_number\":7}}}");
+
+    const recovery_metrics = try qlog.writeJson(.{
+        .time_us = 1_750,
+        .event = .{ .recovery_metrics_updated = .{ .latest_rtt_ms = 21, .smoothed_rtt_ms = 23, .rtt_variance_ms = 4, .pto_count = 1, .congestion_window = 12000, .bytes_in_flight = 1200 } },
+    }, file[len..]);
+    len += recovery_metrics.len;
+    try expectQlogRecord(recovery_metrics, "{\"time\":1.750,\"name\":\"quic:recovery_metrics_updated\",\"data\":{\"latest_rtt\":21,\"smoothed_rtt\":23,\"rtt_variance\":4,\"pto_count\":1,\"congestion_window\":12000,\"bytes_in_flight\":1200}}");
+
+    const h3_settings = try h3qlog.writeJson(.{
+        .time_us = 2_000,
+        .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = "SETTINGS_QPACK_BLOCKED_STREAMS", .value = 16 }}, .raw_length = 6 } } } },
+    }, file[len..]);
+    len += h3_settings.len;
+    try expectQlogRecord(h3_settings, "{\"time\":2.000,\"name\":\"http3:frame_created\",\"data\":{\"stream_id\":0,\"frame\":{\"frame_type\":\"settings\",\"settings\":[{\"name\":\"SETTINGS_QPACK_BLOCKED_STREAMS\",\"value\":16}],\"raw\":{\"length\":6}}}}");
+
+    const h3_headers = try h3qlog.writeJson(.{
+        .time_us = 2_250,
+        .event = .{ .frame = .{ .direction = .parsed, .stream_id = 4, .frame = .{ .headers = .{ .headers = &.{ .{ .name = ":method", .value = "GET" }, .{ .name = ":path", .value = "/" } }, .raw_length = 12 } } } },
+    }, file[len..]);
+    len += h3_headers.len;
+    try expectQlogRecord(h3_headers, "{\"time\":2.250,\"name\":\"http3:frame_parsed\",\"data\":{\"stream_id\":4,\"frame\":{\"frame_type\":\"headers\",\"headers\":[{\"name\":\":method\",\"value\":\"GET\"},{\"name\":\":path\",\"value\":\"/\"}],\"raw\":{\"length\":12}}}}");
+
+    const h3_goaway = try h3qlog.writeJson(.{
+        .time_us = 2_500,
+        .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .goaway = .{ .id = 4, .raw_length = 1 } } } },
+    }, file[len..]);
+    len += h3_goaway.len;
+    try expectQlogRecord(h3_goaway, "{\"time\":2.500,\"name\":\"http3:frame_created\",\"data\":{\"stream_id\":0,\"frame\":{\"frame_type\":\"goaway\",\"id\":4,\"raw\":{\"length\":1}}}}");
+
+    const qpack_extension = try h3qlog.writeJson(.{
         .time_us = 2_000,
         .event = .{ .qpack_state_updated = .{ .state = .blocked, .stream_id = 0 } },
     }, file[len..]);
-    len += h3_rec.len;
+    len += qpack_extension.len;
+    try expectQlogRecord(qpack_extension, "{\"time\":2.000,\"name\":\"tardigrade:qpack_stream_state_updated\",\"data\":{\"stream_id\":0,\"state\":\"blocked\"}}");
 
     const stream = file[0..len];
-    // Three records: header + one transport + one h3, each JSON-SEQ delimited.
-    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, stream, &[_]u8{qlog.record_separator}));
-    try testing.expect(std.mem.indexOf(u8, stream, "\"file_schema\":\"urn:ietf:params:qlog:file:sequential\"") != null);
-    try testing.expect(std.mem.indexOf(u8, stream, "\"serialization_format\":\"application/qlog+json-seq\"") != null);
-    try testing.expect(std.mem.indexOf(u8, stream, "quic:packet_received") != null);
-    try testing.expect(std.mem.indexOf(u8, stream, "tardigrade:qpack_stream_state_updated") != null);
+    // Header + representative QUIC/H3 records, each JSON-SEQ delimited.
+    try testing.expectEqual(@as(usize, 10), std.mem.count(u8, stream, &[_]u8{qlog.record_separator}));
     // Both writers frame identically, so the merged stream is uniform.
     try testing.expectEqual(qlog.record_separator, h3qlog.record_separator);
 }

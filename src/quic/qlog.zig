@@ -106,9 +106,31 @@ pub const PathEventKind = enum {
     failed,
 };
 
-/// Connection-migration classification and policy outcome (RFC 9000 §9).
-pub const MigrationKind = enum { nat_rebinding, active };
-pub const MigrationOutcome = enum { accepted, blocked };
+pub const TupleEndpointInfo = struct {};
+
+pub const KeyType = enum {
+    server_initial_secret,
+    client_initial_secret,
+    server_handshake_secret,
+    client_handshake_secret,
+    server_1rtt_secret,
+    client_1rtt_secret,
+};
+
+pub const KeyUpdateTrigger = enum {
+    tls,
+    local_update,
+    remote_update,
+};
+
+pub const MigrationState = enum {
+    probing_started,
+    probing_abandoned,
+    probing_successful,
+    migration_started,
+    migration_abandoned,
+    migration_complete,
+};
 
 /// RESET_STREAM / STOP_SENDING direction (RFC 9000 §19.4, §19.5).
 pub const StreamResetKind = enum {
@@ -118,8 +140,26 @@ pub const StreamResetKind = enum {
     stop_sending_received,
 };
 
-/// DATA_BLOCKED vs. STREAM_DATA_BLOCKED (RFC 9000 §19.12, §19.13).
-pub const BlockedScope = enum { connection, stream };
+pub const BlockedState = enum { blocked, unblocked };
+pub const BlockedReason = enum {
+    data_blocked_frame,
+    stream_data_blocked_frame,
+    flow_control_limit,
+};
+
+pub const DataBlocked = union(enum) {
+    connection: struct {
+        old: ?BlockedState = null,
+        new: BlockedState,
+        reason: ?BlockedReason = null,
+    },
+    stream: struct {
+        stream_id: u64,
+        old: ?BlockedState = null,
+        new: BlockedState,
+        reason: ?BlockedReason = null,
+    },
+};
 
 /// Why an inbound packet was dropped. `decryption_failure` is the qlog
 /// canonical trigger for AEAD deprotection failure — the #255 requirement that
@@ -151,6 +191,8 @@ pub const RecoveryMetrics = struct {
 pub const Event = union(enum) {
     /// quic:connection_started
     connection_started: struct {
+        local: TupleEndpointInfo = .{},
+        remote: TupleEndpointInfo = .{},
         odcid_len: u8 = 0,
         scid_len: u8 = 0,
         dcid_len: u8 = 0,
@@ -168,7 +210,9 @@ pub const Event = union(enum) {
     },
     /// quic:key_updated (1-RTT key-phase flip, RFC 9001 §6)
     key_updated: struct {
-        phase: u1,
+        key_type: KeyType,
+        key_phase: ?u64 = null,
+        trigger: ?KeyUpdateTrigger = null,
     },
     /// quic:packet_sent
     packet_sent: struct {
@@ -203,8 +247,8 @@ pub const Event = union(enum) {
     },
     /// quic:migration_state_updated
     connection_migrated: struct {
-        kind: MigrationKind,
-        outcome: MigrationOutcome,
+        old: ?MigrationState = null,
+        new: MigrationState,
     },
     /// tardigrade:quic_stream_reset (RESET_STREAM / STOP_SENDING)
     stream_reset: struct {
@@ -214,11 +258,7 @@ pub const Event = union(enum) {
     },
     /// quic:connection_data_blocked_updated /
     /// quic:stream_data_blocked_updated (flow-control blocked)
-    data_blocked: struct {
-        scope: BlockedScope,
-        stream_id: ?u64 = null,
-        limit: u64 = 0,
-    },
+    data_blocked: DataBlocked,
 
     pub fn namespace(self: Event) Namespace {
         return switch (self) {
@@ -255,7 +295,7 @@ pub const Event = union(enum) {
             .path_validation => "quic_path_validation",
             .connection_migrated => "migration_state_updated",
             .stream_reset => "quic_stream_reset",
-            .data_blocked => |d| switch (d.scope) {
+            .data_blocked => |d| switch (d) {
                 .connection => "connection_data_blocked_updated",
                 .stream => "stream_data_blocked_updated",
             },
@@ -320,7 +360,7 @@ fn boolText(value: bool) []const u8 {
 fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
     switch (event) {
         .connection_started => |d| try b.add(
-            "{{\"odcid_length\":{d},\"scid_length\":{d},\"dcid_length\":{d}}}",
+            "{{\"local\":{{}},\"remote\":{{}},\"tardigrade_odcid_length\":{d},\"tardigrade_scid_length\":{d},\"tardigrade_dcid_length\":{d}}}",
             .{ d.odcid_len, d.scid_len, d.dcid_len },
         ),
         .connection_closed => |d| {
@@ -332,7 +372,12 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
             "{{\"stage\":\"{s}\"}}",
             .{@tagName(d.stage)},
         ),
-        .key_updated => |d| try b.add("{{\"key_phase\":{d}}}", .{d.phase}),
+        .key_updated => |d| {
+            try b.add("{{\"key_type\":\"{s}\"", .{@tagName(d.key_type)});
+            if (d.key_phase) |phase| try b.add(",\"key_phase\":{d}", .{phase});
+            if (d.trigger) |trigger| try b.add(",\"trigger\":\"{s}\"", .{@tagName(trigger)});
+            try b.add("}}", .{});
+        },
         .packet_sent => |d| try b.add(
             "{{\"header\":{{\"packet_type\":\"{s}\",\"packet_number\":{d}}},\"raw\":{{\"length\":{d}}},\"tardigrade_ack_eliciting\":{s}}}",
             .{ d.packet_type.label(), d.packet_number, d.length, boolText(d.ack_eliciting) },
@@ -388,18 +433,35 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
             "{{\"phase\":\"{s}\",\"path_id\":{d}}}",
             .{ @tagName(d.kind), d.path_id },
         ),
-        .connection_migrated => |d| try b.add(
-            "{{\"state\":\"{s}\",\"trigger\":\"{s}\"}}",
-            .{ @tagName(d.outcome), @tagName(d.kind) },
-        ),
+        .connection_migrated => |d| {
+            try b.add("{{", .{});
+            if (d.old) |old| try b.add("\"old\":\"{s}\",", .{@tagName(old)});
+            try b.add("\"new\":\"{s}\"}}", .{@tagName(d.new)});
+        },
         .stream_reset => |d| try b.add(
             "{{\"direction\":\"{s}\",\"stream_id\":{d},\"error_code\":{d}}}",
             .{ @tagName(d.kind), d.stream_id, d.error_code },
         ),
-        .data_blocked => |d| {
-            try b.add("{{\"scope\":\"{s}\"", .{@tagName(d.scope)});
-            if (d.stream_id) |sid| try b.add(",\"stream_id\":{d}", .{sid});
-            try b.add(",\"limit\":{d}}}", .{d.limit});
+        .data_blocked => |d| switch (d) {
+            .connection => |blocked| {
+                try b.add("{{", .{});
+                var need_comma = false;
+                if (blocked.old) |old| {
+                    try b.add("\"old\":\"{s}\"", .{@tagName(old)});
+                    need_comma = true;
+                }
+                if (need_comma) try b.add(",", .{});
+                try b.add("\"new\":\"{s}\"", .{@tagName(blocked.new)});
+                if (blocked.reason) |reason| try b.add(",\"reason\":\"{s}\"", .{@tagName(reason)});
+                try b.add("}}", .{});
+            },
+            .stream => |blocked| {
+                try b.add("{{\"stream_id\":{d}", .{blocked.stream_id});
+                if (blocked.old) |old| try b.add(",\"old\":\"{s}\"", .{@tagName(old)});
+                try b.add(",\"new\":\"{s}\"", .{@tagName(blocked.new)});
+                if (blocked.reason) |reason| try b.add(",\"reason\":\"{s}\"", .{@tagName(reason)});
+                try b.add("}}", .{});
+            },
         },
     }
 }
@@ -427,7 +489,7 @@ pub fn writeTraceHeader(header: TraceHeader, out: []u8) error{NoSpaceLeft}![]con
     var b = Buf{ .buf = out };
     try b.add("{c}", .{record_separator});
     try b.add(
-        "{{\"file_schema\":\"{s}\",\"serialization_format\":\"{s}\",\"title\":\"{s}\",\"description\":\"{s}\",\"trace\":{{\"common_fields\":{{\"group_id\":\"{s}\",\"time_format\":\"relative_to_epoch\",\"reference_time\":{{\"clock_type\":\"system\",\"epoch\":\"1970-01-01T00:00:00.000Z\"}}}},\"vantage_point\":{{\"type\":\"{s}\"}},\"event_schemas\":[\"{s}\",\"{s}\",\"{s}\"]}}}}\n",
+        "{{\"file_schema\":\"{s}\",\"serialization_format\":\"{s}\",\"title\":\"{s}\",\"description\":\"{s}\",\"trace\":{{\"common_fields\":{{\"group_id\":\"{s}\",\"time_format\":\"relative_to_epoch\",\"reference_time\":{{\"clock_type\":\"monotonic\",\"epoch\":\"unknown\"}}}},\"vantage_point\":{{\"type\":\"{s}\"}},\"event_schemas\":[\"{s}\",\"{s}\",\"{s}\"]}}}}\n",
         .{ file_schema_uri, serialization_format, header.title, header.description, header.group_id, @tagName(header.vantage_point), quic_event_schema_uri, http3_event_schema_uri, tardigrade_event_schema_uri },
     );
     return b.slice();
@@ -469,8 +531,8 @@ fn expectJson(record: Record, needle: []const u8) !void {
 test "namespace and name mapping stays aligned with qlog vantage points" {
     try testing.expectEqual(Namespace.quic, (Event{ .packet_sent = .{ .packet_type = .one_rtt, .packet_number = 0, .length = 0 } }).namespace());
     try testing.expectEqual(Namespace.quic, (Event{ .packet_lost = .{ .packet_type = .one_rtt } }).namespace());
-    try testing.expectEqual(Namespace.quic, (Event{ .key_updated = .{ .phase = 1 } }).namespace());
-    try testing.expectEqual(Namespace.quic, (Event{ .connection_migrated = .{ .kind = .active, .outcome = .blocked } }).namespace());
+    try testing.expectEqual(Namespace.quic, (Event{ .key_updated = .{ .key_type = .server_1rtt_secret, .key_phase = 1 } }).namespace());
+    try testing.expectEqual(Namespace.quic, (Event{ .connection_migrated = .{ .new = .migration_complete } }).namespace());
     try testing.expectEqual(Namespace.tardigrade, (Event{ .stream_reset = .{ .kind = .reset_sent, .stream_id = 0 } }).namespace());
     try testing.expectEqualStrings("packet_dropped", (Event{ .packet_dropped = .{ .trigger = .decryption_failure } }).name());
 }
@@ -495,15 +557,16 @@ test "deprotection failure is a packet_dropped with decryption_failure" {
 
 test "time is rendered in milliseconds with microsecond precision" {
     var buf: [512]u8 = undefined;
-    const line = try writeJson(.{ .time_us = 1_002_003, .event = .{ .key_updated = .{ .phase = 1 } } }, &buf);
+    const line = try writeJson(.{ .time_us = 1_002_003, .event = .{ .key_updated = .{ .key_type = .server_1rtt_secret, .key_phase = 1 } } }, &buf);
     try testing.expect(std.mem.indexOf(u8, line, "\"time\":1002.003") != null);
 }
 
 test "path, migration, stream reset and flow-control events serialize" {
     try expectJson(.{ .time_us = 5, .event = .{ .path_validation = .{ .kind = .response_received } } }, "\"phase\":\"response_received\"");
-    try expectJson(.{ .time_us = 5, .event = .{ .connection_migrated = .{ .kind = .nat_rebinding, .outcome = .accepted } } }, "migration_state_updated");
+    try expectJson(.{ .time_us = 5, .event = .{ .connection_migrated = .{ .old = .migration_started, .new = .migration_complete } } }, "migration_state_updated");
     try expectJson(.{ .time_us = 5, .event = .{ .stream_reset = .{ .kind = .reset_received, .stream_id = 4, .error_code = 9 } } }, "\"stream_id\":4");
-    try expectJson(.{ .time_us = 5, .event = .{ .data_blocked = .{ .scope = .stream, .stream_id = 8, .limit = 4096 } } }, "\"scope\":\"stream\"");
+    try expectJson(.{ .time_us = 5, .event = .{ .data_blocked = .{ .stream = .{ .stream_id = 8, .new = .blocked, .reason = .stream_data_blocked_frame } } } }, "\"name\":\"quic:stream_data_blocked_updated\"");
+    try expectJson(.{ .time_us = 5, .event = .{ .data_blocked = .{ .connection = .{ .new = .blocked, .reason = .data_blocked_frame } } } }, "\"name\":\"quic:connection_data_blocked_updated\"");
 }
 
 test "recovery metrics serialize as a quic event" {
@@ -525,6 +588,7 @@ test "trace header then event forms a two-record JSON-SEQ stream" {
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, buf[0 .. header.len + event.len], &[_]u8{record_separator}));
     try testing.expect(std.mem.indexOf(u8, header, "\"file_schema\":\"urn:ietf:params:qlog:file:sequential\"") != null);
     try testing.expect(std.mem.indexOf(u8, header, "\"serialization_format\":\"application/qlog+json-seq\"") != null);
+    try testing.expect(std.mem.indexOf(u8, header, "\"reference_time\":{\"clock_type\":\"monotonic\",\"epoch\":\"unknown\"}") != null);
     try testing.expect(std.mem.indexOf(u8, header, "\"event_schemas\":[\"urn:ietf:params:qlog:events:quic-13\",\"urn:ietf:params:qlog:events:http3-13\"") != null);
     try testing.expect(std.mem.indexOf(u8, header, "\"vantage_point\":{\"type\":\"server\"}") != null);
     try testing.expect(std.mem.indexOf(u8, header, "\"group_id\":\"0011deadbeef\"") != null);
@@ -539,7 +603,7 @@ test "default sink is a no-op and log() stamps time" {
         }
     };
     const noop = Sink{};
-    noop.log(1, .{ .key_updated = .{ .phase = 0 } }); // must not crash
+    noop.log(1, .{ .key_updated = .{ .key_type = .client_1rtt_secret, .key_phase = 0 } }); // must not crash
 
     Collector.last = null;
     const sink = Sink{ .emit_fn = Collector.emit };
