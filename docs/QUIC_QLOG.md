@@ -112,19 +112,19 @@ Names below are `namespace:event`. Transport events (`src/quic/qlog.zig`):
 
 | Requirement (#255)        | qlog event                          | Key data |
 |---------------------------|-------------------------------------|----------|
-| handshake                 | `quic:connection_started`           | odcid/scid/dcid lengths |
+| handshake                 | `quic:connection_started`           | required `local` / `remote` endpoint objects, plus Tardigrade CID-length diagnostics |
 |                           | `tardigrade:quic_handshake_progressed` | `stage` (started -> confirmed / failed) |
 |                           | `quic:connection_closed`            | `reason`, optional `error_code` |
-|                           | `quic:key_updated`                  | `key_phase` |
-| packet sent               | `quic:packet_sent`                  | type, number, length, ack-eliciting |
-| packet received           | `quic:packet_received`              | type, number, length |
-| packet lost               | `quic:packet_lost`                  | type, number |
+|                           | `quic:key_updated`                  | required `key_type`, optional full `key_phase` and `trigger` |
+| packet sent               | `quic:packet_sent`                  | `header`, `raw`, Tardigrade ack-eliciting diagnostic |
+| packet received           | `quic:packet_received`              | `header`, `raw` |
+| packet lost               | `quic:packet_lost`                  | `header` |
 | recovery metrics          | `quic:recovery_metrics_updated`     | RTT/PTO/cwnd/bytes-in-flight updates |
 | **deprotection failure**  | `quic:packet_dropped`               | `trigger:"decryption_failure"` |
 | PATH_CHALLENGE/RESPONSE   | `tardigrade:quic_path_validation`   | `phase` (challenge/response sent/received, validated, failed) |
-| migration                 | `quic:migration_state_updated`      | `trigger` (nat_rebinding/active), `state` (accepted/blocked) |
+| migration                 | `quic:migration_state_updated`      | required `new` migration state, optional `old` |
 | stream reset              | `tardigrade:quic_stream_reset`      | `direction` (reset/stop-sending, sent/received), stream id, error code |
-| flow-control blocked      | `quic:connection_data_blocked_updated` / `quic:stream_data_blocked_updated` | optional stream id, limit |
+| flow-control blocked      | `quic:connection_data_blocked_updated` / `quic:stream_data_blocked_updated` | required `new` blocked state, optional `old` / `reason`; stream variant requires `stream_id` |
 
 Application events (`src/http3/qlog.zig`):
 
@@ -132,13 +132,13 @@ Application events (`src/http3/qlog.zig`):
 |---------------------------|-------------------------------------|----------|
 | SETTINGS                  | `http3:parameters_set`              | max field section size, QPACK table cap, blocked streams |
 | control stream            | `http3:stream_type_set`             | stream id, stream type |
-| HEADERS / DATA / GOAWAY   | `http3:frame_created` / `http3:frame_parsed` | frame type, stream id, raw length |
+| HEADERS / DATA / GOAWAY   | `http3:frame_created` / `http3:frame_parsed` | variant-specific frame payloads; HEADERS carries `headers`, SETTINGS carries `settings`, GOAWAY carries `id` |
 | **QPACK blocked**         | `tardigrade:qpack_stream_state_updated` | `state` (blocked/unblocked), stream id |
 
 `quic:packet_dropped` with `trigger:"decryption_failure"` is the
 canonical qlog encoding of an AEAD deprotection failure, satisfying the #255
 requirement that deprotection failures are reported deterministically. It is
-distinct from a normal drop (`unknown_connection_id`, `key_unavailable`, …).
+distinct from a normal drop (`connection_unknown`, `key_unavailable`, ...).
 
 ### Serialization format
 
@@ -158,11 +158,13 @@ Each record is one JSON-SEQ line:
   `file_schema: urn:ietf:params:qlog:file:sequential`,
   `serialization_format: application/qlog+json-seq`, `trace`,
   `event_schemas`, vantage point, and ODCID `group_id` as the first JSON-SEQ
-  record. The header spans both packages — the `group_id` ties transport and
+  record. The trace declares `clock_type: monotonic` and `epoch: unknown`
+  because event timestamps are monotonic process-relative values, not Unix
+  timestamps. The header spans both packages — the `group_id` ties transport and
   H3 events to one connection — so the **composition root** fills it in and
   writes it once, then appends event records from both `quic` and `http3`. The
   `tests/quic_h3_smoke.zig` harness exercises exactly this shape (header +
-  transport record + H3 record) so the merged-file contract is locked.
+  representative QUIC/H3 records) so the merged-file contract is locked.
 - JSON-SEQ qlog artifacts use the `.sqlog` suffix. Reserve `.qlog` for the
   normal contained JSON qlog form.
 

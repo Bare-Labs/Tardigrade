@@ -54,6 +54,59 @@ pub const StreamType = enum {
 /// encoder stream, and `unblocked` once the required insert count arrives.
 pub const QpackState = enum { blocked, unblocked };
 
+pub const HttpField = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const Setting = struct {
+    name: []const u8,
+    value: u64,
+};
+
+pub const Frame = union(enum) {
+    data: struct {
+        raw_length: ?usize = null,
+    },
+    headers: struct {
+        headers: []const HttpField = &.{},
+        raw_length: ?usize = null,
+    },
+    settings: struct {
+        settings: []const Setting = &.{},
+        raw_length: ?usize = null,
+    },
+    goaway: struct {
+        id: u64,
+        raw_length: ?usize = null,
+    },
+    push_promise: struct {
+        push_id: u64,
+        headers: []const HttpField = &.{},
+        raw_length: ?usize = null,
+    },
+    cancel_push: struct {
+        push_id: u64,
+        raw_length: ?usize = null,
+    },
+    max_push_id: struct {
+        push_id: u64,
+        raw_length: ?usize = null,
+    },
+
+    pub fn frameType(self: Frame) FrameType {
+        return switch (self) {
+            .data => .data,
+            .headers => .headers,
+            .settings => .settings,
+            .goaway => .goaway,
+            .push_promise => .push_promise,
+            .cancel_push => .cancel_push,
+            .max_push_id => .max_push_id,
+        };
+    }
+};
+
 pub const Event = union(enum) {
     /// http3:parameters_set (SETTINGS applied)
     parameters_set: struct {
@@ -70,9 +123,8 @@ pub const Event = union(enum) {
     /// http3:frame_created / http3:frame_parsed
     frame: struct {
         direction: Direction,
-        frame_type: FrameType,
         stream_id: u64,
-        length: usize = 0,
+        frame: Frame,
     },
     /// tardigrade:qpack_stream_state_updated (head-of-line blocking)
     qpack_state_updated: struct {
@@ -143,6 +195,68 @@ const Buf = struct {
     }
 };
 
+fn writeRawLength(b: *Buf, length: ?usize, need_comma: *bool) error{NoSpaceLeft}!void {
+    if (length) |v| {
+        if (need_comma.*) try b.add(",", .{});
+        try b.add("\"raw\":{{\"length\":{d}}}", .{v});
+        need_comma.* = true;
+    }
+}
+
+fn writeHeaders(b: *Buf, headers: []const HttpField) error{NoSpaceLeft}!void {
+    try b.add("\"headers\":[", .{});
+    for (headers, 0..) |field, i| {
+        if (i != 0) try b.add(",", .{});
+        try b.add("{{\"name\":\"{s}\",\"value\":\"{s}\"}}", .{ field.name, field.value });
+    }
+    try b.add("]", .{});
+}
+
+fn writeSettings(b: *Buf, settings: []const Setting) error{NoSpaceLeft}!void {
+    try b.add("\"settings\":[", .{});
+    for (settings, 0..) |setting, i| {
+        if (i != 0) try b.add(",", .{});
+        try b.add("{{\"name\":\"{s}\",\"value\":{d}}}", .{ setting.name, setting.value });
+    }
+    try b.add("]", .{});
+}
+
+fn writeFrame(b: *Buf, frame: Frame) error{NoSpaceLeft}!void {
+    try b.add("{{\"frame_type\":\"{s}\"", .{frame.frameType().label()});
+    var need_comma = true;
+    switch (frame) {
+        .data => |d| try writeRawLength(b, d.raw_length, &need_comma),
+        .headers => |d| {
+            try b.add(",", .{});
+            try writeHeaders(b, d.headers);
+            try writeRawLength(b, d.raw_length, &need_comma);
+        },
+        .settings => |d| {
+            try b.add(",", .{});
+            try writeSettings(b, d.settings);
+            try writeRawLength(b, d.raw_length, &need_comma);
+        },
+        .goaway => |d| {
+            try b.add(",\"id\":{d}", .{d.id});
+            try writeRawLength(b, d.raw_length, &need_comma);
+        },
+        .push_promise => |d| {
+            try b.add(",\"push_id\":{d},", .{d.push_id});
+            try writeHeaders(b, d.headers);
+            try writeRawLength(b, d.raw_length, &need_comma);
+        },
+        .cancel_push => |d| {
+            try b.add(",\"push_id\":{d}", .{d.push_id});
+            try writeRawLength(b, d.raw_length, &need_comma);
+        },
+        .max_push_id => |d| {
+            try b.add(",\"push_id\":{d}", .{d.push_id});
+            try writeRawLength(b, d.raw_length, &need_comma);
+        },
+    }
+    try b.add("}}", .{});
+}
+
 fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
     switch (event) {
         .parameters_set => |d| {
@@ -172,10 +286,11 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
             "{{\"stream_id\":{d},\"stream_type\":\"{s}\"}}",
             .{ d.stream_id, @tagName(d.stream_type) },
         ),
-        .frame => |d| try b.add(
-            "{{\"stream_id\":{d},\"frame\":{{\"frame_type\":\"{s}\",\"raw\":{{\"length\":{d}}}}}}}",
-            .{ d.stream_id, d.frame_type.label(), d.length },
-        ),
+        .frame => |d| {
+            try b.add("{{\"stream_id\":{d},\"frame\":", .{d.stream_id});
+            try writeFrame(b, d.frame);
+            try b.add("}}", .{});
+        },
         .qpack_state_updated => |d| try b.add(
             "{{\"stream_id\":{d},\"state\":\"{s}\"}}",
             .{ d.stream_id, @tagName(d.state) },
@@ -220,11 +335,11 @@ test "qpack blocking is a Tardigrade extension event" {
 
 test "frame direction chooses frame_created vs frame_parsed" {
     try expectJson(
-        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .frame_type = .headers, .stream_id = 0, .length = 20 } } },
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .headers = .{ .headers = &.{.{ .name = ":status", .value = "200" }}, .raw_length = 20 } } } } },
         "\"name\":\"http3:frame_created\"",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .frame_type = .goaway, .stream_id = 3 } } },
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 3, .frame = .{ .goaway = .{ .id = 0 } } } } },
         "\"name\":\"http3:frame_parsed\"",
     );
 }
@@ -242,16 +357,20 @@ test "stream_type_set and representative frames use http3 names" {
         "\"name\":\"http3:stream_type_set\"",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .frame_type = .settings, .stream_id = 0 } } },
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = "SETTINGS_QPACK_BLOCKED_STREAMS", .value = 16 }} } } } } },
         "\"frame_type\":\"settings\"",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .frame_type = .headers, .stream_id = 4, .length = 32 } } },
-        "\"frame_type\":\"headers\"",
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .settings = .{ .settings = &.{.{ .name = "SETTINGS_QPACK_BLOCKED_STREAMS", .value = 16 }} } } } } },
+        "\"settings\":[{\"name\":\"SETTINGS_QPACK_BLOCKED_STREAMS\",\"value\":16}]",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .frame_type = .goaway, .stream_id = 0 } } },
-        "\"frame_type\":\"goaway\"",
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .parsed, .stream_id = 4, .frame = .{ .headers = .{ .headers = &.{.{ .name = ":path", .value = "/" }}, .raw_length = 32 } } } } },
+        "\"headers\":[{\"name\":\":path\",\"value\":\"/\"}]",
+    );
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .frame = .{ .direction = .created, .stream_id = 0, .frame = .{ .goaway = .{ .id = 4 } } } } },
+        "\"id\":4",
     );
 }
 
