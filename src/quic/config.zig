@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const secrets = @import("crypto_secrets");
+const quic_datagram = @import("datagram.zig");
 
 pub const QuicVersion = enum(u32) {
     v1 = 0x00000001,
@@ -72,7 +73,12 @@ pub const Config = struct {
     versions: VersionSet = .{},
     idle_timeout_ms: u64 = 30_000,
     active_connection_id_limit: u64 = 4,
-    max_udp_payload_size: u64 = 1200,
+    /// The local bound on outbound UDP datagrams, also advertised to the peer
+    /// as the `max_udp_payload_size` transport parameter. `quic.datagram`
+    /// owns the authoritative default and the rule that combines this with the
+    /// peer's advertisement and the validated path size (#256-A); nothing
+    /// downstream should carry its own datagram-size default.
+    max_udp_payload_size: u64 = quic_datagram.base_size,
     initial_max_data: u64 = 8 * 1024 * 1024,
     initial_max_stream_data_bidi_local: u64 = 1024 * 1024,
     initial_max_stream_data_bidi_remote: u64 = 1024 * 1024,
@@ -91,7 +97,10 @@ pub const Config = struct {
         if (self.versions.preferred() == null) return error.UnsupportedQuicVersion;
         if (self.idle_timeout_ms == 0) return error.InvalidIdleTimeout;
         if (self.active_connection_id_limit < 2) return error.InvalidActiveConnectionIdLimit;
-        if (self.max_udp_payload_size < 1200 or self.max_udp_payload_size > 65_527) return error.InvalidMaxUdpPayloadSize;
+        // RFC 9000 §18.2 bounds on the advertised parameter. The emitted size
+        // is clamped further by `quic.datagram`; this only rejects values that
+        // are illegal to advertise at all.
+        if (self.max_udp_payload_size < quic_datagram.base_size or self.max_udp_payload_size > 65_527) return error.InvalidMaxUdpPayloadSize;
         if (self.initial_max_data == 0) return error.InvalidFlowControlWindow;
         if (self.initial_max_stream_data_bidi_local > self.initial_max_data) return error.InvalidFlowControlWindow;
         if (self.initial_max_stream_data_bidi_remote > self.initial_max_data) return error.InvalidFlowControlWindow;

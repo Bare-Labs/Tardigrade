@@ -24,6 +24,7 @@ const std = @import("std");
 const crypto_secrets = @import("crypto_secrets");
 const varint = @import("quic_varint");
 const config = @import("config.zig");
+const quic_datagram = @import("datagram.zig");
 const packet = @import("packet.zig");
 const frame = @import("frame.zig");
 const tls_adapter = @import("tls_adapter.zig");
@@ -56,13 +57,19 @@ pub const State = enum {
     closed,
 };
 
-/// The datagram size this driver sends. Conservative (RFC 9000 §14.1 minimum)
-/// until DPLPMTUD lands under #256.
-pub const max_datagram_size: usize = recovery.max_datagram_size;
+/// The datagram size every QUIC path must support (RFC 9000 §14), and the
+/// floor of this driver's effective send cap. What a connection actually
+/// emits is `Connection.effectiveMaxDatagramSize()`, which combines the local
+/// config, the peer's advertised maximum, and the validated path size (#256-A).
+pub const base_datagram_size: usize = quic_datagram.base_size;
+/// Hard ceiling on any datagram this driver emits, and the size of the
+/// per-packet plaintext scratch buffers below. An `out` buffer larger than
+/// this is simply not used past the effective cap.
+pub const max_datagram_size_ceiling: usize = quic_datagram.max_size;
 pub const max_application_crypto_outstanding: usize = 2 * tls_core.tls13_transport.max_emitted_new_session_ticket_message_len;
-const min_application_crypto_payload: usize = max_datagram_size / 2;
+const min_application_crypto_payload: usize = base_datagram_size / 2;
 /// RFC 9000 §14.1: datagrams carrying Initial packets are padded to 1200.
-pub const min_initial_datagram: usize = 1200;
+pub const min_initial_datagram: usize = base_datagram_size;
 
 /// Hard bound on bytes buffered per stream for transmission (unsent +
 /// unacked). `writeStream` accepts partial writes beyond it.
@@ -1086,6 +1093,32 @@ pub const Connection = struct {
 
     pub fn peerTransportParameters(self: *const Connection) ?config.TransportParameters {
         return self.adapter.peerTransportParameters();
+    }
+
+    /// The bounds that decide how large an outbound datagram may be (#256-A).
+    /// Derived on demand rather than cached so a peer's transport parameters
+    /// take effect the moment they are authenticated, with no separate
+    /// invalidation step to get wrong.
+    pub fn datagramLimits(self: *const Connection) quic_datagram.Limits {
+        return .{
+            .local_max = self.cfg.max_udp_payload_size,
+            .peer_max = if (self.adapter.peerTransportParameters()) |peer|
+                peer.max_udp_payload_size
+            else
+                null,
+            // #256-B fills this in from per-path DPLPMTUD state. Until then
+            // the locally configured maximum is the operator's path assertion,
+            // and it defaults to the RFC 9000 §14 floor.
+            .validated_path_max = null,
+        };
+    }
+
+    /// The one authoritative cap on an ordinary outbound UDP datagram: the
+    /// smallest of the locally configured maximum, the peer's advertised
+    /// `max_udp_payload_size` once authenticated, and the validated path size.
+    /// Never below `base_datagram_size`, so Initial padding always fits.
+    pub fn effectiveMaxDatagramSize(self: *const Connection) usize {
+        return self.datagramLimits().effective();
     }
 
     pub fn closeInfo(self: *const Connection) ?CloseInfo {
@@ -2719,7 +2752,7 @@ pub const Connection = struct {
     /// tried first so a probe is never starved behind ordinary traffic.
     pub fn pollTransmitOnPath(self: *Connection, out: []u8, now_us: u64) ?Transmit {
         if (self.state_ == .closed or self.state_ == .draining) return null;
-        if (out.len < max_datagram_size) return null;
+        if (out.len < base_datagram_size) return null;
 
         if (self.state_ == .closing) {
             if (!self.close_needs_send) return null;
@@ -2748,7 +2781,11 @@ pub const Connection = struct {
             self.ack_eliciting_since_ack[2] = ack_eliciting_threshold;
         }
 
-        const budget = @min(out.len, max_datagram_size);
+        // #256-A: the single cap every ordinary outbound datagram respects.
+        // Coalescing below only ever fills `out[0..budget]`, so no level can
+        // push the datagram past the local config, the peer's advertised
+        // `max_udp_payload_size`, or the validated path size.
+        const budget = @min(out.len, self.effectiveMaxDatagramSize());
         var datagram_len: usize = 0;
         var has_initial = false;
         var sent_ack_eliciting = false;
@@ -2835,21 +2872,26 @@ pub const Connection = struct {
     /// budget. Never carries ACK/STREAM/CRYPTO/flow-control/CID-management
     /// content — that stays exclusively on the active path until promotion.
     fn buildCandidatePacket(self: *Connection, path: quic_path.PathKey, out: []u8, now_us: u64) ?Transmit {
-        if (out.len < max_datagram_size) return null;
+        if (out.len < base_datagram_size) return null;
         var keys = (self.adapter.protectionKeys(.application, .write) catch unreachable) orelse return null;
         defer keys.deinit();
 
         const remaining = self.paths.remainingOnPath(path);
         if (remaining == 0) return null;
 
+        // #256-A: candidate-path probes obey the same effective cap as
+        // ordinary traffic. They are padded to `min_initial_datagram`, which
+        // the cap's floor guarantees room for.
+        const budget = @min(out.len, self.effectiveMaxDatagramSize());
+
         const space_idx = spaceIndex(.application);
         const pn = self.next_pn[space_idx];
         const pn_len: u3 = packet.packetNumberLength(pn, self.largest_peer_acked[space_idx]);
         const pn_offset = packet.writeShortHeader(self.peer_cid.slice(), self.adapter.applicationWriteKeyPhase(), pn_len, out) catch return null;
 
-        const max_packet = @min(out.len, @as(usize, @intCast(@min(@as(u64, out.len), remaining))));
+        const max_packet: usize = @intCast(@min(@as(u64, budget), remaining));
         if (max_packet <= pn_offset + pn_len + aead_tag_len + 16) return null;
-        var plain: [max_datagram_size]u8 = undefined;
+        var plain: [max_datagram_size_ceiling]u8 = undefined;
         const plain_budget = @min(plain.len, max_packet - pn_offset - pn_len - aead_tag_len);
         var plain_len: usize = 0;
         var record = SentRecord{ .space = .application, .packet_number = pn, .ack_eliciting = false };
@@ -2972,7 +3014,7 @@ pub const Connection = struct {
         // Congestion gate: in-flight (ack-eliciting) bytes need window; pure
         // ACK packets and PTO probes are exempt (RFC 9002 §7, §6.2.4).
         const cwnd_room = self.recovery.congestion.congestion_window -| self.recovery.congestion.bytes_in_flight;
-        const can_send_data = probe or cwnd_room >= max_datagram_size / 2 or
+        const can_send_data = probe or cwnd_room >= recovery.max_datagram_size / 2 or
             self.recovery.congestion.bytes_in_flight == 0;
 
         // Anti-amplification gate applies to every byte a server sends before
@@ -3022,7 +3064,7 @@ pub const Connection = struct {
         // Available plaintext room in this packet.
         const max_packet = @min(out.len, @as(usize, @intCast(@min(@as(u64, out.len), amp_room -| ctx.datagram_so_far))));
         if (max_packet <= pn_offset + pn_len + aead_tag_len + 16) return null;
-        var plain: [max_datagram_size]u8 = undefined;
+        var plain: [max_datagram_size_ceiling]u8 = undefined;
         const plain_budget = @min(plain.len, max_packet - pn_offset - pn_len - aead_tag_len);
         var plain_len: usize = 0;
         var record = SentRecord{
@@ -3860,6 +3902,14 @@ const TestPair = struct {
     const test_challenge_entropy = [_]u8{0x5a} ** quic_path.path_challenge_len;
 
     fn init(allocator: std.mem.Allocator) !*TestPair {
+        return initWithConfigs(allocator, .{}, .{});
+    }
+
+    fn initWithConfigs(
+        allocator: std.mem.Allocator,
+        client_config: config.Config,
+        server_config: config.Config,
+    ) !*TestPair {
         const pair = try allocator.create(TestPair);
         const client_crypto_provider = pair.client_provider_storage.init(0x442_c);
         const server_crypto_provider = pair.server_provider_storage.init(0x442_5);
@@ -3883,6 +3933,7 @@ const TestPair = struct {
         errdefer allocator.destroy(pair);
         pair.client = try Connection.init(allocator, .{
             .role = .client,
+            .config = client_config,
             .local_cid = &client_cid,
             .original_destination_cid = &odcid,
             .initial_secret_dcid = &odcid,
@@ -3895,6 +3946,7 @@ const TestPair = struct {
         errdefer pair.client.deinit();
         pair.server = try Connection.init(allocator, .{
             .role = .server,
+            .config = server_config,
             .local_cid = &odcid,
             .original_destination_cid = &odcid,
             .initial_secret_dcid = &odcid,
@@ -4654,7 +4706,7 @@ test "driver: stream scheduling hint sends lower urgency first" {
     _ = try pair.server.writeStream(high, "less urgent response", false);
     _ = try pair.server.writeStream(low, "more urgent response", false);
 
-    var out: [max_datagram_size]u8 = undefined;
+    var out: [max_datagram_size_ceiling]u8 = undefined;
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
     const record = lastSentRecordWithStreams(pair.server) orelse return error.TestExpectedEqual;
     try testing.expect(record.stream_count > 0);
@@ -4678,7 +4730,7 @@ test "driver: equal urgency stream scheduling gives peers progress" {
     _ = try pair.server.writeStream(first, "first response chunk", false);
     _ = try pair.server.writeStream(second, "second response chunk", false);
 
-    var out: [max_datagram_size]u8 = undefined;
+    var out: [max_datagram_size_ceiling]u8 = undefined;
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
     const record = lastSentRecordWithStreams(pair.server) orelse return error.TestExpectedEqual;
     try testing.expect(streamRecordContains(record.*, first));
@@ -4700,12 +4752,12 @@ test "driver: equal urgency mixed incremental streams both make repeated progres
     try pair.server.setStreamSchedulingHint(incremental, .{ .urgency = 2, .incremental = true });
     try pair.server.setStreamSchedulingHint(non_incremental, .{ .urgency = 2, .incremental = false });
 
-    const large_incremental = [_]u8{'i'} ** (max_datagram_size * 3);
-    const large_non_incremental = [_]u8{'n'} ** (max_datagram_size * 3);
+    const large_incremental = [_]u8{'i'} ** (base_datagram_size * 3);
+    const large_non_incremental = [_]u8{'n'} ** (base_datagram_size * 3);
     _ = try pair.server.writeStream(incremental, &large_incremental, false);
     _ = try pair.server.writeStream(non_incremental, &large_non_incremental, false);
 
-    var out: [max_datagram_size]u8 = undefined;
+    var out: [max_datagram_size_ceiling]u8 = undefined;
     var incremental_records: usize = 0;
     var non_incremental_records: usize = 0;
     var polls: usize = 0;
@@ -6258,14 +6310,14 @@ test "driver: maximum NewSessionTicket survives real loss reordering PTO and ACK
         .issued_at_unix_ms = 10,
     }, limits);
     defer server_state.deinit();
-    try testing.expect(pair.server.crypto_tx[2].data.items.len > max_datagram_size);
+    try testing.expect(pair.server.crypto_tx[2].data.items.len > base_datagram_size);
 
     var datagrams = std.ArrayList([]u8).empty;
     defer {
         for (datagrams.items) |copy| allocator.free(copy);
         datagrams.deinit(allocator);
     }
-    var buf: [max_datagram_size]u8 = undefined;
+    var buf: [max_datagram_size_ceiling]u8 = undefined;
     while (pair.server.pollTransmitOnPath(&buf, pair.now_us)) |t| {
         const copy = try allocator.dupe(u8, t.bytes);
         errdefer allocator.free(copy);
@@ -7592,7 +7644,7 @@ test "driver: 1-RTT packets are dropped before deprotection until TLS handshake 
 
     const id = try pair.client.openStream(.bidi);
     try testing.expectEqual(@as(usize, 5), try pair.client.writeStream(id, "hello", false));
-    var datagram: [max_datagram_size]u8 = undefined;
+    var datagram: [max_datagram_size_ceiling]u8 = undefined;
     const one_rtt = pair.client.pollTransmitOnPath(&datagram, pair.now_us) orelse return error.TestExpectedEqual;
 
     const received_before = pair.server.metrics.packets_received;
@@ -7717,4 +7769,157 @@ test "a real Connection closes with handshake_failure when the server has no app
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+// ---------------------------------------------------------------------------
+// #256-A: the effective outbound datagram cap.
+// ---------------------------------------------------------------------------
+
+const EmittedDatagrams = struct {
+    count: usize = 0,
+    largest: usize = 0,
+    total: usize = 0,
+};
+
+/// Drain everything `conn` will send right now, advancing `now_us` the way
+/// `TestPair.pump` does, and report what came out. The `out` buffer is
+/// deliberately the driver's ceiling rather than the effective cap, so a
+/// datagram that overran the cap would be visible here instead of being
+/// silently clipped by a too-small caller buffer.
+fn drainTransmits(conn: *Connection, now_us: *u64) EmittedDatagrams {
+    var seen = EmittedDatagrams{};
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    while (conn.pollTransmitOnPath(&out, now_us.*)) |t| {
+        seen.count += 1;
+        seen.largest = @max(seen.largest, t.bytes.len);
+        seen.total += t.bytes.len;
+        now_us.* += 500;
+    }
+    return seen;
+}
+
+/// A client-opened bidi stream, established and known to both sides, ready
+/// for the server to write a response the size of which the test controls.
+fn openServerResponseStream(pair: *TestPair) !StreamId {
+    const sid = try pair.client.openStream(.bidi);
+    _ = try pair.client.writeStream(sid, "request", false);
+    try pair.pump();
+    return sid;
+}
+
+test "driver: a raised local maximum is enforced by the datagrams actually emitted" {
+    const allocator = testing.allocator;
+    const raised = config.Config{ .max_udp_payload_size = 1452 };
+    var pair = try TestPair.initWithConfigs(allocator, raised, raised);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    try testing.expectEqual(@as(usize, 1452), pair.server.effectiveMaxDatagramSize());
+
+    const sid = try openServerResponseStream(pair);
+    const payload = [_]u8{0xab} ** (16 * 1024);
+    _ = try pair.server.writeStream(sid, &payload, false);
+
+    const seen = drainTransmits(pair.server, &pair.now_us);
+    try testing.expect(seen.count > 1);
+    // The knob is real: datagrams grew past the RFC floor ...
+    try testing.expect(seen.largest > base_datagram_size);
+    // ... but never past what was configured.
+    try testing.expect(seen.largest <= 1452);
+}
+
+test "driver: the peer's advertised maximum lowers the effective cap" {
+    const allocator = testing.allocator;
+    // Server configured high, client advertising the floor: the smaller of
+    // the two wins, so a larger local setting never overrides a smaller peer
+    // limit.
+    var pair = try TestPair.initWithConfigs(
+        allocator,
+        .{ .max_udp_payload_size = base_datagram_size },
+        .{ .max_udp_payload_size = max_datagram_size_ceiling },
+    );
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    try testing.expectEqual(base_datagram_size, pair.server.effectiveMaxDatagramSize());
+    try testing.expectEqual(
+        @as(u64, base_datagram_size),
+        pair.server.peerTransportParameters().?.max_udp_payload_size,
+    );
+
+    const sid = try openServerResponseStream(pair);
+    const payload = [_]u8{0xcd} ** (16 * 1024);
+    _ = try pair.server.writeStream(sid, &payload, false);
+
+    const seen = drainTransmits(pair.server, &pair.now_us);
+    try testing.expect(seen.count > 1);
+    try testing.expect(seen.largest <= base_datagram_size);
+}
+
+test "driver: the cap stays at the floor until the peer's transport parameters arrive" {
+    const allocator = testing.allocator;
+    const raised = config.Config{ .max_udp_payload_size = max_datagram_size_ceiling };
+    var pair = try TestPair.initWithConfigs(allocator, raised, raised);
+    defer pair.deinit(allocator);
+
+    // Nothing is authenticated yet, so the local maximum must not raise the
+    // cap, and the client's first Initial datagram is still padded to exactly
+    // the RFC 9000 §14.1 minimum rather than to the configured maximum.
+    try testing.expectEqual(base_datagram_size, pair.client.effectiveMaxDatagramSize());
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    const initial = pair.client.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(min_initial_datagram, initial.bytes.len);
+
+    // Hand that same Initial on so the handshake still completes, then the
+    // authenticated peer parameters let the configured maximum take effect.
+    const ingress = quic_path.PathKey{ .local = initial.path.remote, .remote = initial.path.local };
+    try pair.server.ingestOnPath(initial.bytes, ingress, TestPair.test_challenge_entropy, pair.now_us);
+    pair.now_us += 500;
+    try pair.pump();
+    try testing.expectEqual(max_datagram_size_ceiling, pair.client.effectiveMaxDatagramSize());
+}
+
+test "driver: a raised local maximum does not widen the anti-amplification budget" {
+    const allocator = testing.allocator;
+    const raised = config.Config{ .max_udp_payload_size = max_datagram_size_ceiling };
+    var pair = try TestPair.initWithConfigs(allocator, raised, raised);
+    defer pair.deinit(allocator);
+
+    var received: usize = 0;
+    var buf: [max_datagram_size_ceiling]u8 = undefined;
+    while (pair.client.pollTransmitOnPath(&buf, pair.now_us)) |t| {
+        const ingress = quic_path.PathKey{ .local = t.path.remote, .remote = t.path.local };
+        try pair.server.ingestOnPath(t.bytes, ingress, TestPair.test_challenge_entropy, pair.now_us);
+        received += t.bytes.len;
+        pair.now_us += 500;
+    }
+    try testing.expect(received > 0);
+
+    const seen = drainTransmits(pair.server, &pair.now_us);
+    try testing.expect(seen.count > 0);
+    try testing.expect(seen.total <= 3 * received);
+}
+
+test "driver: raising the cap leaves packet-number and congestion accounting intact" {
+    const allocator = testing.allocator;
+    const raised = config.Config{ .max_udp_payload_size = 1452 };
+    var pair = try TestPair.initWithConfigs(allocator, raised, raised);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const sid = try openServerResponseStream(pair);
+    const payload = [_]u8{0xef} ** (16 * 1024);
+    _ = try pair.server.writeStream(sid, &payload, false);
+
+    const pn_before = pair.server.next_pn[Connection.spaceIndex(.application)];
+    const seen = drainTransmits(pair.server, &pair.now_us);
+    const pn_after = pair.server.next_pn[Connection.spaceIndex(.application)];
+
+    // Only application keys remain after the handshake, so each datagram
+    // carries exactly one packet and consumes exactly one packet number.
+    try testing.expectEqual(seen.count, pn_after - pn_before);
+    // Congestion control, not the datagram size, still bounds what goes out:
+    // the last packet may straddle the window, nothing beyond it may.
+    const congestion = pair.server.recovery.congestion;
+    try testing.expect(congestion.bytes_in_flight <= congestion.congestion_window + seen.largest);
 }

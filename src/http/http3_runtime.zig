@@ -88,7 +88,13 @@ pub const Config = struct {
     h3_settings: http3.frame.Settings = .{},
     connection_migration: bool = false,
     retry_policy: quic.config.RetryPolicy = .off,
-    max_datagram_size: usize = 1350,
+    /// Operator-facing local bound on outbound UDP datagrams, clamped into
+    /// `[quic.datagram.base_size, quic.datagram.max_size]` and handed to the
+    /// transport as `max_udp_payload_size`. The default is the one
+    /// authoritative value in `quic.datagram` rather than a second knob that
+    /// can drift from it (#256-A); the transport lowers it further whenever
+    /// the peer advertises less.
+    max_datagram_size: usize = quic.datagram.base_size,
     request_handler: ?RequestHandler = null,
     request_handler_ctx: ?*anyopaque = null,
     early_data_compat_metrics_ctx: ?*anyopaque = null,
@@ -440,7 +446,7 @@ pub const Runtime = struct {
             // 1) Timers and transmission for every connection.
             var wake_us: u64 = now + 100_000;
             {
-                var out: [2048]u8 = undefined;
+                var out: [quic.datagram.max_size]u8 = undefined;
                 var reap: [16]u64 = undefined;
                 var reap_count: usize = 0;
                 var it = connections.iterator();
@@ -488,7 +494,7 @@ pub const Runtime = struct {
             _ = posix.poll(&fds, timeout_ms) catch {};
 
             // 3) Ingest every waiting datagram.
-            var buf: [2048]u8 = undefined;
+            var buf: [quic.datagram.max_size]u8 = undefined;
             var from: std.c.sockaddr.storage = undefined;
             while (true) {
                 var from_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
@@ -591,7 +597,7 @@ pub const Runtime = struct {
         }
         self.maybeIssueSessionTicket(entry);
 
-        var out: [2048]u8 = undefined;
+        var out: [quic.datagram.max_size]u8 = undefined;
         while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
             self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
         }
@@ -1439,7 +1445,7 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
 /// config.
 fn quicConfigFrom(cfg: Config) quic.config.Config {
     return .{
-        .max_udp_payload_size = std.math.clamp(cfg.max_datagram_size, 1200, 2048),
+        .max_udp_payload_size = std.math.clamp(cfg.max_datagram_size, quic.datagram.base_size, quic.datagram.max_size),
         .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
         .retry_policy = cfg.retry_policy,
         .migration_policy = if (cfg.connection_migration) .full else .nat_rebinding_only,
@@ -1773,6 +1779,17 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
         .quic_port = 443,
         .retry_policy = .address_validation,
     }).retry_policy);
+}
+
+test "quicConfigFrom: the runtime default is the transport's own authoritative default" {
+    // #256-A: the runtime must not carry a second datagram-size default that
+    // can drift from the transport's. Both come from `quic.datagram`.
+    const runtime_default = Config{ .listen_host = "::", .quic_port = 443 };
+    try testing.expectEqual(quic.datagram.base_size, runtime_default.max_datagram_size);
+    try testing.expectEqual(
+        (quic.config.Config{}).max_udp_payload_size,
+        quicConfigFrom(runtime_default).max_udp_payload_size,
+    );
 }
 
 test "http3 runtime: spare CID route is registered before NEW_CONNECTION_ID is pollable" {

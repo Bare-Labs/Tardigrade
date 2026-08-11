@@ -31,6 +31,42 @@ During drain or rollback withdrawal, eligible TCP responses emit
 upstream `Alt-Svc` response headers and emits at most one gateway-owned
 `Alt-Svc` value.
 
+## Datagram size
+
+`TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` is the **local** bound on the UDP payload
+of every datagram this process sends, and the `max_udp_payload_size` transport
+parameter it advertises to peers. It defaults to **1200** — the size RFC 9000
+§14 requires every QUIC path to carry — and is clamped into `[1200, 2048]`.
+
+It is only one of the inputs to the size actually emitted. The transport
+resolves one *effective* cap per connection as the smallest of:
+
+1. this local configured maximum;
+2. the peer's advertised `max_udp_payload_size`, once its transport parameters
+   are authenticated;
+3. the validated path size.
+
+Consequences worth knowing before tuning it:
+
+- **The cap sits at 1200 for the whole handshake.** A raised local value only
+  takes effect once the peer has authenticated and committed to accepting
+  larger datagrams. Datagrams carrying Initial packets are always padded to
+  1200 regardless.
+- **A peer always wins when it asks for less.** Raising this value can never
+  push a datagram past what the peer advertised.
+- **Raising it is an assertion about the path**, not a measurement. Tardigrade
+  does not yet run DPLPMTUD (RFC 8899), so a value above 1200 says "I know this
+  path carries this much". If it does not, those datagrams are dropped and the
+  connection stalls until the peer's PTO retransmits. Raise it only for paths
+  whose MTU you control end to end (a dedicated link, a loopback or same-rack
+  benchmark host, a known-jumbo-frame fabric). Leave it at the default on the
+  open internet.
+- The 2048 ceiling is the transport's work-buffer size, not a path property.
+
+Nothing about this setting relaxes congestion control, flow control, or the
+server's anti-amplification budget; those gates run after the size cap and
+still bound every byte sent.
+
 ## Reload
 
 Advertisement-only knobs can hot reload:
