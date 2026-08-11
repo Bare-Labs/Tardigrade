@@ -64,8 +64,10 @@ Consequences worth knowing before tuning it:
 - The 2048 ceiling is the transport's work-buffer size, not a path property.
 
 Nothing about this setting relaxes congestion control, flow control, or the
-server's anti-amplification budget; those gates run after the size cap and
-still bound every byte sent.
+server's anti-amplification budget. In particular, an ordinary packet's
+in-flight content is bounded by the *remaining congestion window*, not by this
+cap, so raising the cap cannot widen how far in-flight bytes cross the window.
+Pure ACKs (not in flight) and PTO probes keep their RFC 9002 exemptions.
 
 ## Reload
 

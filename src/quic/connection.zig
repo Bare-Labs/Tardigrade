@@ -3096,6 +3096,25 @@ pub const Connection = struct {
             }
         }
 
+        // Congestion budget for in-flight content, applied on top of the
+        // datagram cap (#256-A). `can_send_data` only decides *whether* data
+        // may go out; without this, a packet admitted on 600 bytes of window
+        // would still be filled to the full effective datagram size, so
+        // raising that size would widen how far `bytes_in_flight` overshoots
+        // `congestion_window`. Bounding the payload by the remaining window
+        // instead keeps the overshoot independent of the cap.
+        //
+        // Both RFC 9002 exemptions survive: a pure ACK never reaches here
+        // with content (§2, not in flight — the ACK above already used the
+        // full `plain_budget`), and a PTO probe may exceed the window (§7.5).
+        // `@max(plain_len, ...)` keeps the bound from cutting into bytes the
+        // exempt ACK already wrote.
+        const packet_overhead = pn_offset + pn_len + aead_tag_len;
+        const data_budget = if (probe)
+            plain_budget
+        else
+            @max(plain_len, @min(plain_budget, cwnd_room -| packet_overhead));
+
         // 2) CRYPTO retransmission/transmission
         if (has_crypto and (can_send_data or probe)) {
             const tx = switch (space) {
@@ -3103,8 +3122,8 @@ pub const Connection = struct {
                 .handshake => &self.crypto_tx[1],
                 .application => &self.crypto_tx[2],
             };
-            while (!tx.pending.isEmpty() and plain_len + frame.max_crypto_overhead + 16 < plain_budget) {
-                const room: u64 = @intCast(plain_budget - plain_len - frame.max_crypto_overhead);
+            while (!tx.pending.isEmpty() and plain_len + frame.max_crypto_overhead + 16 < data_budget) {
+                const room: u64 = @intCast(data_budget - plain_len - frame.max_crypto_overhead);
                 var range = tx.pending.takeFirst(room) orelse break;
                 range = tx.liveRange(range) orelse continue;
                 if (record.crypto) |existing| {
@@ -3118,7 +3137,7 @@ pub const Connection = struct {
                     }
                 }
                 const data = tx.slice(range);
-                const n = frame.encodeCrypto(range.start, data, plain[plain_len..plain_budget]) catch {
+                const n = frame.encodeCrypto(range.start, data, plain[plain_len..data_budget]) catch {
                     if (space == .application) {
                         tx.pending.insertAssumeCapacity(range);
                     } else {
@@ -3140,7 +3159,7 @@ pub const Connection = struct {
 
         // 3) Application-space control and stream frames
         if (space == .application and self.state_ == .established and (can_send_data or probe)) {
-            plain_len = self.buildAppFrames(&record, &plain, plain_len, plain_budget);
+            plain_len = self.buildAppFrames(&record, &plain, plain_len, data_budget);
         }
 
         // 4) Probe padding: a PTO probe with nothing else carries a PING.
@@ -3168,7 +3187,6 @@ pub const Connection = struct {
         // which §8.2.1 lets cap the expansion.
         if ((ctx.datagram_has_initial and ctx.is_last_level) or record.carried_path_response) {
             const target = min_initial_datagram -| ctx.datagram_so_far;
-            const packet_overhead = pn_offset + pn_len + aead_tag_len;
             if (packet_overhead + plain_len < target and target <= plain_budget + packet_overhead) {
                 const padded = target - packet_overhead;
                 @memset(plain[plain_len..padded], 0);
@@ -7918,8 +7936,72 @@ test "driver: raising the cap leaves packet-number and congestion accounting int
     // Only application keys remain after the handshake, so each datagram
     // carries exactly one packet and consumes exactly one packet number.
     try testing.expectEqual(seen.count, pn_after - pn_before);
-    // Congestion control, not the datagram size, still bounds what goes out:
-    // the last packet may straddle the window, nothing beyond it may.
+    // Congestion control, not the datagram size, bounds what goes out: every
+    // in-flight byte fits inside the window, with no straddle allowance.
     const congestion = pair.server.recovery.congestion;
-    try testing.expect(congestion.bytes_in_flight <= congestion.congestion_window + seen.largest);
+    try testing.expect(congestion.bytes_in_flight <= congestion.congestion_window);
+}
+
+test "driver: a raised datagram cap cannot widen the congestion overshoot" {
+    const allocator = testing.allocator;
+    const raised = config.Config{ .max_udp_payload_size = max_datagram_size_ceiling };
+    var pair = try TestPair.initWithConfigs(allocator, raised, raised);
+    defer pair.deinit(allocator);
+    try pair.pump();
+    try testing.expectEqual(max_datagram_size_ceiling, pair.server.effectiveMaxDatagramSize());
+
+    const sid = try openServerResponseStream(pair);
+    const payload = [_]u8{0x5a} ** (16 * 1024);
+    _ = try pair.server.writeStream(sid, &payload, false);
+
+    // A window that clears the send gate's half-datagram threshold but is far
+    // below the raised cap: exactly the gap where a cap-sized packet would
+    // otherwise be built on top of a nearly full window.
+    const congestion = &pair.server.recovery.congestion;
+    const room: usize = 700;
+    congestion.congestion_window = congestion.bytes_in_flight + room;
+    const window = congestion.congestion_window;
+    const in_flight_before = congestion.bytes_in_flight;
+
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    const sent = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    // The packet is sized by the remaining window, not by the datagram cap.
+    try testing.expect(sent.bytes.len <= room);
+    try testing.expect(congestion.bytes_in_flight <= window);
+    try testing.expect(congestion.bytes_in_flight > in_flight_before);
+
+    // With the window now spent, no further ordinary data packet is admitted.
+    pair.now_us += 500;
+    try testing.expectEqual(@as(?Transmit, null), pair.server.pollTransmitOnPath(&out, pair.now_us));
+}
+
+test "driver: a PTO probe keeps its congestion exemption under a raised cap" {
+    const allocator = testing.allocator;
+    const raised = config.Config{ .max_udp_payload_size = max_datagram_size_ceiling };
+    var pair = try TestPair.initWithConfigs(allocator, raised, raised);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const sid = try openServerResponseStream(pair);
+    const payload = [_]u8{0x5a} ** (16 * 1024);
+    _ = try pair.server.writeStream(sid, &payload, false);
+
+    // Window fully spent: no queued stream data may go out, and nothing that
+    // does (a pure ACK is exempt, being not in flight) adds to the window.
+    const congestion = &pair.server.recovery.congestion;
+    congestion.congestion_window = congestion.bytes_in_flight;
+    const in_flight_before = congestion.bytes_in_flight;
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |exempt| {
+        try testing.expect(exempt.bytes.len < base_datagram_size);
+        pair.now_us += 500;
+    }
+    try testing.expectEqual(in_flight_before, congestion.bytes_in_flight);
+
+    // A PTO probe keeps its exemption and may exceed the window (RFC 9002 §7.5).
+    pair.server.probes_pending[Connection.spaceIndex(.application)] = 1;
+    const probe = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    try testing.expect(probe.bytes.len > 0);
+    try testing.expect(probe.bytes.len <= max_datagram_size_ceiling);
+    try testing.expect(congestion.bytes_in_flight > congestion.congestion_window);
 }
