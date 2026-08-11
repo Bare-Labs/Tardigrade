@@ -323,6 +323,35 @@ pub const PacketTracker = struct {
         return result;
     }
 
+    /// Retire the oldest tracked packet, preferring `space`, and return it.
+    /// Its bytes stop counting as in flight; the caller is responsible for
+    /// requeuing whatever it carried. Used only to free bookkeeping capacity
+    /// for traffic recovery cannot defer — see
+    /// `RecoveryController.retireOldestForRecovery`.
+    pub fn retireOldest(self: *PacketTracker, space: PacketNumberSpace) ?SentPacket {
+        var chosen: ?usize = null;
+        var index: usize = 0;
+        while (index < self.count) : (index += 1) {
+            const candidate = self.packets[index];
+            if (chosen) |best| {
+                const current = self.packets[best];
+                // Prefer `space`; within a space, the oldest packet number.
+                const better_space = candidate.space == space and current.space != space;
+                const same_tier = (candidate.space == space) == (current.space == space);
+                if (better_space or (same_tier and candidate.packet_number < current.packet_number)) {
+                    chosen = index;
+                }
+            } else {
+                chosen = index;
+            }
+        }
+        const idx = chosen orelse return null;
+        const packet = self.packets[idx];
+        if (packet.in_flight) self.bytes_in_flight -|= packet.size;
+        self.removeAt(idx);
+        return packet;
+    }
+
     /// RFC 9002 §6.4: when a space's keys are discarded, its packets stop
     /// counting toward bytes in flight and will never be acked or declared
     /// lost. Returns the in-flight bytes removed.
@@ -474,7 +503,15 @@ pub const RecoveryController = struct {
     /// remove its bytes again it permanently inflates `bytes_in_flight`
     /// (#256-A review).
     pub fn canTrackPacket(self: *const RecoveryController) bool {
-        return self.tracker.count + reserved_tracked_packets < max_tracked_packets;
+        return self.canTrackPacketWithPending(0);
+    }
+
+    /// `canTrackPacket` as it will read once `pending` further packets from
+    /// the datagram currently being assembled have been tracked. Coalescing
+    /// has to plan against this, not against the current count: the earlier
+    /// packets in a datagram consume slots before the later ones are built.
+    pub fn canTrackPacketWithPending(self: *const RecoveryController, pending: usize) bool {
+        return self.tracker.count + pending + reserved_tracked_packets < max_tracked_packets;
     }
 
     /// Whether the tracker can take one more packet drawn from the recovery
@@ -483,7 +520,11 @@ pub const RecoveryController = struct {
     /// like anything else — when even the reserve is gone the probe waits
     /// rather than being emitted untracked.
     pub fn canTrackRecoveryPacket(self: *const RecoveryController) bool {
-        return self.tracker.count < max_tracked_packets;
+        return self.canTrackRecoveryPacketWithPending(0);
+    }
+
+    pub fn canTrackRecoveryPacketWithPending(self: *const RecoveryController, pending: usize) bool {
+        return self.tracker.count + pending < max_tracked_packets;
     }
 
     /// Record a sent packet whose tracker slot the caller already preflighted
@@ -492,6 +533,28 @@ pub const RecoveryController = struct {
     /// (the packet is already sealed and its frames already dequeued), so the
     /// capacity check belongs before the frames are committed, and this
     /// asserts that it happened.
+    /// Free one tracker slot so a PTO probe can be sent and tracked.
+    ///
+    /// RFC 9002 §6.2.4 requires an ack-eliciting probe on *every* PTO
+    /// expiration, and PTO expiration is not itself evidence of loss: during a
+    /// total-loss episode no ACK ever arrives, so neither ACK processing nor
+    /// threshold loss detection retires anything. A bounded tracker would then
+    /// run out — a fixed reserve only postpones that by however many probes it
+    /// holds — and probe transmission would stall until idle timeout. Retiring
+    /// the oldest outstanding packet keeps a slot available for every PTO for
+    /// the whole connection lifetime, whatever the negotiated idle timeout.
+    ///
+    /// The retired packet's bytes leave `bytes_in_flight` (leaving them would
+    /// reproduce the permanent-inflation bug this replaced), but no congestion
+    /// event is applied: running out of bookkeeping is not proof the packet was
+    /// lost. The caller must requeue whatever it carried, exactly as it would
+    /// for a detected loss, so no content is dropped.
+    pub fn retireOldestForRecovery(self: *RecoveryController, space: PacketNumberSpace) ?SentPacket {
+        const retired = self.tracker.retireOldest(space) orelse return null;
+        if (retired.in_flight) self.congestion.bytes_in_flight -|= retired.size;
+        return retired;
+    }
+
     pub fn onPacketSentAssumeCapacity(self: *RecoveryController, packet: SentPacket) void {
         std.debug.assert(self.canTrackRecoveryPacket());
         self.tracker.onPacketSent(packet) catch unreachable;

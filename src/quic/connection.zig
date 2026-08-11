@@ -1822,17 +1822,27 @@ pub const Connection = struct {
     fn detectAndRequeueLost(self: *Connection, space: PacketNumberSpace, now_us: u64) void {
         const loss = self.recovery.detectLost(space, now_us);
         if (loss.packet_threshold_losses + loss.time_threshold_losses == 0) return;
-        // The tracker dropped the lost packets; any record of this space no
-        // longer tracked (and not acked, i.e. still recorded) is lost.
+        const lost_count = self.requeueUntrackedRecords(space);
+        if (lost_count > 0) {
+            self.metrics.packets_lost += lost_count;
+            self.events.emit(.{ .packets_lost = .{ .space = space, .bytes = loss.lost_bytes } });
+        }
+    }
+
+    /// Requeue the content of every record in `space` the tracker no longer
+    /// holds. Shared by loss detection and by recovery-slot reclamation, which
+    /// retires a tracked packet for exactly the same reason: its content must
+    /// be resent, and its record must not outlive its tracker entry.
+    fn requeueUntrackedRecords(self: *Connection, space: PacketNumberSpace) u64 {
         var index: usize = 0;
-        var lost_count: u64 = 0;
+        var count: u64 = 0;
         while (index < self.sent_records.items.len) {
             const record = &self.sent_records.items[index];
             if (record.space != space or self.trackerContains(space, record.packet_number)) {
                 index += 1;
                 continue;
             }
-            lost_count += 1;
+            count += 1;
             // Read the live element to requeue its content (a fresh copy of
             // any carried reset token lands in `pending_new_connection_ids`
             // via `requeueRecord`) before wiping this now-redundant copy and
@@ -1842,10 +1852,18 @@ pub const Connection = struct {
             _ = self.sent_records.swapRemove(index);
             wipeSentRecordsSwapRemoveResidue(&self.sent_records);
         }
-        if (lost_count > 0) {
-            self.metrics.packets_lost += lost_count;
-            self.events.emit(.{ .packets_lost = .{ .space = space, .bytes = loss.lost_bytes } });
-        }
+        return count;
+    }
+
+    /// Make a tracker slot available for a PTO probe that RFC 9002 §6.2.4
+    /// requires be sent. Returns false only when the tracker holds nothing at
+    /// all to retire, which cannot happen while it is full.
+    fn reclaimTrackerSlotForProbe(self: *Connection, space: PacketNumberSpace) bool {
+        if (self.recovery.canTrackRecoveryPacket()) return true;
+        const retired = self.recovery.retireOldestForRecovery(space) orelse return false;
+        _ = self.requeueUntrackedRecords(retired.space);
+        self.metrics.packets_lost += 1;
+        return self.recovery.canTrackRecoveryPacket();
     }
 
     fn trackerContains(self: *const Connection, space: PacketNumberSpace, pn: u64) bool {
@@ -2822,19 +2840,32 @@ pub const Connection = struct {
         // push the datagram past the local config, the peer's advertised
         // `max_udp_payload_size`, or the validated path size.
         const budget = @min(out.len, self.effectiveMaxDatagramSize());
+        const amp_before = self.paths.activePath().anti_amplification.remaining();
         var datagram_len: usize = 0;
         var has_initial = false;
         var sent_ack_eliciting = false;
+        var packets_in_datagram: usize = 0;
 
         const levels = [_]EncryptionLevel{ .initial, .handshake, .application };
         for (levels, 0..) |level, i| {
             if (!(self.adapter.hasProtectionKeys(level, .write) catch unreachable)) continue;
             const space = spaceForLevel(level);
-            // Is this the last level that could contribute? Needed for the
-            // Initial padding rule.
+            // Who owns the RFC 9000 §14.1 expansion to 1200 bytes. Having a
+            // later write key is *not* a promise that the later level will
+            // actually contribute a packet: it may have nothing to send, be
+            // out of anti-amplification budget, or — now that the bounded
+            // tracker backpressures — have no slot left. If the Initial
+            // deferred on that basis and the later packet then declined, the
+            // datagram would go out under 1200. Ask whether the later level
+            // will really contribute, and err toward the Initial padding
+            // itself: an extra padded Initial is legal, a short one is not.
             var last_level = true;
             for (levels[i + 1 ..]) |later| {
-                if (self.adapter.hasProtectionKeys(later, .write) catch unreachable) last_level = false;
+                // `+ 1`: the packet about to be built takes a tracker slot
+                // before the later level is ever asked for one.
+                if (self.levelWillContribute(later, spaceForLevel(later), datagram_len, packets_in_datagram + 1)) {
+                    last_level = false;
+                }
             }
             const written = self.buildPacket(level, space, out[datagram_len..budget], now_us, .{
                 .datagram_has_initial = has_initial or level == .initial,
@@ -2842,6 +2873,7 @@ pub const Connection = struct {
                 .datagram_so_far = datagram_len,
             }) orelse continue;
             datagram_len += written.len;
+            packets_in_datagram += 1;
             has_initial = has_initial or level == .initial;
             sent_ack_eliciting = sent_ack_eliciting or written.ack_eliciting;
             if (level == .handshake) {
@@ -2858,6 +2890,19 @@ pub const Connection = struct {
             self.discardKeys(.handshake);
         }
         if (datagram_len == 0) return null;
+
+        // Backstop for RFC 9000 §14.1. The planning above decides who pads
+        // before any packet is sealed, and padding cannot be added afterwards
+        // — so if a datagram carrying an Initial still came out short, drop it
+        // rather than put an illegal datagram on the wire. Its packets stay
+        // tracked and their content is requeued by ordinary loss detection.
+        // Excluded: a server legitimately limited by anti-amplification (§8.1)
+        // or by a datagram cap below the minimum, where §14.1 cannot be met.
+        if (has_initial and datagram_len < min_initial_datagram and
+            budget >= min_initial_datagram and amp_before >= min_initial_datagram)
+        {
+            return null;
+        }
 
         const active_key = self.paths.activePath().key;
         self.paths.recordSentOnPath(active_key, datagram_len);
@@ -3036,6 +3081,48 @@ pub const Connection = struct {
         return .{ .bytes = out[0..total], .path = path };
     }
 
+    /// Whether `level` would produce a packet right now, evaluated against the
+    /// same gates `buildPacket` applies. Used to plan who pads an
+    /// Initial-bearing datagram (RFC 9000 §14.1) before the first packet is
+    /// committed, since that decision cannot be revisited once a packet is
+    /// sealed.
+    ///
+    /// Side-effect free, so it deliberately does *not* consider the recovery
+    /// slot reclamation a real probe build may perform. That only ever makes
+    /// the answer more pessimistic, which is the safe direction: the Initial
+    /// pads itself and the later packet coalesces on top of a datagram that
+    /// is already legal.
+    fn levelWillContribute(
+        self: *Connection,
+        level: EncryptionLevel,
+        space: PacketNumberSpace,
+        datagram_so_far: usize,
+        pending_packets: usize,
+    ) bool {
+        if (!(self.adapter.hasProtectionKeys(level, .write) catch unreachable)) return false;
+        if (self.paths.activePath().anti_amplification.remaining() <= datagram_so_far) return false;
+
+        const space_idx = spaceIndex(space);
+        const probe = self.probes_pending[space_idx] > 0 and
+            self.recovery.canTrackRecoveryPacketWithPending(pending_packets);
+        const cwnd_room = self.recovery.congestion.congestion_window -| self.recovery.congestion.bytes_in_flight;
+        const can_send_data = self.recovery.canTrackPacketWithPending(pending_packets) and (probe or
+            cwnd_room >= self.recovery.congestion.max_datagram_size / 2 or
+            self.recovery.congestion.bytes_in_flight == 0);
+
+        var want_ack = self.ack_needed[space_idx];
+        if (space == .application and want_ack) {
+            const forced = self.ack_eliciting_since_ack[space_idx] >= ack_eliciting_threshold;
+            if (!forced and !self.hasAppContent() and !probe) want_ack = false;
+        }
+        const has_crypto = !self.crypto_tx[space_idx].pending.isEmpty();
+        const has_app = space == .application and self.hasAppContent();
+
+        if (!want_ack and !has_crypto and !(has_app and can_send_data) and !probe) return false;
+        if ((has_crypto or has_app) and !can_send_data and !want_ack and !probe) return false;
+        return true;
+    }
+
     const BuildContext = struct {
         datagram_has_initial: bool,
         is_last_level: bool,
@@ -3063,13 +3150,20 @@ pub const Connection = struct {
         // `bytes_in_flight` that nothing can ever remove. Ordinary traffic
         // stops short of a reserve; traffic recovery cannot defer draws on it.
         const can_track_ordinary = self.recovery.canTrackPacket();
-        const can_track_recovery = self.recovery.canTrackRecoveryPacket();
         // RFC 9002 §7.5 exempts a PTO probe from the congestion gate but still
-        // counts it in flight, so the probe needs a slot like anything else.
-        // Without one it stays owed (`probes_pending` is untouched) and is
-        // retried once an ACK or loss frees capacity — delayed, never
-        // untracked.
-        const probe = self.probes_pending[space_idx] > 0 and can_track_recovery;
+        // counts it in flight, so the probe needs a tracker slot like anything
+        // else — and §6.2.4 requires a probe on *every* PTO expiration, which
+        // a fixed reserve cannot promise (a total-loss episode retires
+        // nothing, so the reserve drains and never refills). When capacity is
+        // gone, reclaim it by retiring the oldest outstanding packet and
+        // requeuing its content, so probe progress survives for the whole
+        // connection lifetime instead of a fixed number of probes.
+        const probe_owed = self.probes_pending[space_idx] > 0;
+        const can_track_recovery = if (probe_owed)
+            self.reclaimTrackerSlotForProbe(space)
+        else
+            self.recovery.canTrackRecoveryPacket();
+        const probe = probe_owed and can_track_recovery;
 
         // Congestion gate: in-flight bytes need window; pure ACK packets and
         // PTO probes are exempt (RFC 9002 §7, §6.2.4).
@@ -8407,7 +8501,7 @@ test "driver: a PTO probe at the ordinary tracking limit is emitted tracked and 
     try testing.expect(congestion.bytes_in_flight < in_flight_before + probe.bytes.len);
 }
 
-test "driver: repeated PTOs at capacity stay tracked, then wait rather than go untracked" {
+test "driver: every PTO in a total-loss episode still emits a tracked probe" {
     const allocator = testing.allocator;
     var pair = try TestPair.initWithConfigs(allocator, .{}, .{ .max_send_udp_payload_size = 1452 });
     defer pair.deinit(allocator);
@@ -8422,45 +8516,74 @@ test "driver: repeated PTOs at capacity stay tracked, then wait rather than go u
     pair.server.recovery.congestion.congestion_window = 1 << 24;
     _ = try fillTracker(pair.server, false);
 
-    // The reserve is not a single-probe illusion: every probe it covers is
-    // emitted with a tracker entry and charged to the window.
-    var probes: usize = 0;
-    while (probes < recovery.reserved_tracked_packets) : (probes += 1) {
-        if (!pair.server.recovery.canTrackRecoveryPacket()) break;
+    // A total blackhole: nothing is ever delivered, so no ACK arrives and
+    // threshold loss detection never retires anything. RFC 9002 §6.2.4 still
+    // requires an ack-eliciting probe on *every* PTO expiration — far more
+    // than any fixed reserve could hold.
+    const rounds = 4 * recovery.reserved_tracked_packets;
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
         pair.server.probes_pending[Connection.spaceIndex(.application)] = 1;
-        const before = pair.server.recovery.tracker.count;
-        const in_flight_before = pair.server.recovery.congestion.bytes_in_flight;
-        const probe = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse break;
-        try testing.expectEqual(before + 1, pair.server.recovery.tracker.count);
-        try testing.expectEqual(
-            in_flight_before + probe.bytes.len,
-            pair.server.recovery.congestion.bytes_in_flight,
+        const tracked_before = pair.server.recovery.tracker.count;
+        const probe = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse {
+            std.debug.print("no probe emitted on PTO round {d}\n", .{round});
+            return error.TestExpectedEqual;
+        };
+        try testing.expect(probe.bytes.len > 0);
+        // Emitted *and* recorded: the tracker never loses an entry to make
+        // room, and in-flight bytes stay bounded instead of ratcheting up
+        // behind untracked packets.
+        try testing.expect(pair.server.recovery.tracker.count >= tracked_before);
+        try testing.expect(pair.server.recovery.canTrackRecoveryPacket() or
+            pair.server.recovery.tracker.count == recovery.max_tracked_packets);
+        try testing.expect(
+            pair.server.recovery.congestion.bytes_in_flight <= recovery.max_tracked_packets * max_datagram_size_ceiling,
         );
         pair.now_us += 500;
     }
-    try testing.expect(probes > 1);
 
-    // Once even the reserve is spent, the probe waits: it is still owed, and
-    // nothing untracked leaves.
-    _ = try fillTracker(pair.server, true);
-    try testing.expect(!pair.server.recovery.canTrackRecoveryPacket());
-    pair.server.probes_pending[Connection.spaceIndex(.application)] = 1;
-    const saturated_tracked = pair.server.recovery.tracker.count;
-    const saturated_in_flight = pair.server.recovery.congestion.bytes_in_flight;
-    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |t| {
-        try testing.expect(t.bytes.len < base_datagram_size);
-        pair.now_us += 500;
+    // Every probe that ever went out is still accounted for by a tracker
+    // entry — none escaped into an untracked limbo.
+    try testing.expect(pair.server.recovery.tracker.count <= recovery.max_tracked_packets);
+}
+
+test "driver: a coalesced Initial-bearing datagram is never emitted below 1200" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+
+    // Server holds Initial + Handshake write keys with pending flights in
+    // both, so its next datagram wants to coalesce.
+    try pair.deliverOneClientDatagram();
+    try testing.expect(pair.server.adapter.hasProtectionKeys(.initial, .write) catch unreachable);
+    try testing.expect(pair.server.adapter.hasProtectionKeys(.handshake, .write) catch unreachable);
+
+    // Exactly one ordinary tracker slot left: the Initial takes it, and the
+    // Handshake packet that a later write key seemed to promise cannot be
+    // built. RFC 9000 §14.1 still requires >= 1200 bytes.
+    while (pair.server.recovery.canTrackPacketWithPending(1)) {
+        try pair.server.recovery.tracker.onPacketSent(.{
+            .space = .application,
+            .packet_number = 800_000 + pair.server.recovery.tracker.count,
+            .time_sent_us = 1,
+            .size = 0,
+        });
     }
-    try testing.expectEqual(saturated_tracked, pair.server.recovery.tracker.count);
-    try testing.expectEqual(saturated_in_flight, pair.server.recovery.congestion.bytes_in_flight);
-    try testing.expect(pair.server.probes_pending[Connection.spaceIndex(.application)] > 0);
+    try testing.expect(pair.server.recovery.canTrackPacket());
+    try testing.expect(!pair.server.recovery.canTrackPacketWithPending(1));
 
-    // Freeing capacity releases the owed probe.
-    _ = pair.server.recovery.tracker.dropSpace(.initial);
-    const freed_tracked = pair.server.recovery.tracker.count;
-    const released = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
-    try testing.expect(released.bytes.len > 0);
-    try testing.expect(pair.server.recovery.tracker.count > freed_tracked);
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    var emitted: usize = 0;
+    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |t| {
+        // Every datagram carrying an Initial is either fully expanded or not
+        // sent at all; a short one would be a §14.1 violation.
+        try testing.expect(t.bytes.len >= min_initial_datagram);
+        emitted += 1;
+        pair.now_us += 500;
+        if (emitted > 4) break;
+    }
+    try testing.expect(emitted > 0);
+    try testing.expect(pair.server.recovery.tracker.count <= recovery.max_tracked_packets);
 }
 
 test "driver: a fully saturated tracker never seals a padded in-flight packet" {
