@@ -313,19 +313,36 @@ fn initIoUring(allocator: std.mem.Allocator, entries: u16) !EventLoop {
 /// Emulates the level-triggered `add`/`modify`/`remove`/`wait` contract the
 /// rest of the gateway already programs against, using only
 /// `IORING_OP_POLL_ADD`, `IORING_OP_POLL_REMOVE` and `IORING_OP_TIMEOUT`.
-/// Two behaviours of the ring have to be papered over to match `epoll`:
+/// Requires Linux 5.5: `IORING_OP_TIMEOUT` is 5.4, but `IORING_FEAT_NODROP`
+/// (see point 3) raises the implemented floor. Several behaviours of the ring
+/// have to be reconciled with `epoll`:
 ///
 ///  1. **`POLL_ADD` is one-shot.** `epoll` in level-triggered mode keeps
 ///     reporting a fd until the caller drains or removes it, and callers rely
 ///     on that (the listener fd is registered once and never re-added). Every
 ///     delivered completion is therefore immediately re-armed inside `wait`.
-///  2. **Closing a fd does not unregister it.** `epoll` drops a fd from every
-///     set when it is closed, and the gateway's close hooks rely on that —
-///     they only release accounting slots. The ring keeps the poll armed and
-///     this poller keeps its table entry, so `add` treats a surviving entry
-///     for a fd it is asked to register as a stale one from a recycled fd
-///     number, cancels it, and takes the fd over.
-///  3. **The submission queue is not kernel-synchronized.** `epoll_ctl` is
+///  2. **Closing a fd does not unregister it, so unregister-before-close is an
+///     invariant.** `epoll` drops a fd from every set when it is closed;
+///     `POLL_ADD` instead pins the underlying file, so a poll left armed
+///     across a close survives it and can be reported against — and re-armed
+///     on — whatever unrelated descriptor inherits that number. Every path
+///     that closes a registered fd therefore unregisters first:
+///     `parkedConnectionCloseHook` removes before `ParkedRegistry.freeConn`
+///     closes (covering the idle reaper, drain and `closeAll`), and
+///     `reapActiveConnections` already removed before `deinit`. `add`
+///     consequently keeps strict `EPOLL_CTL_ADD`/`EEXIST` semantics —
+///     inferring staleness from a duplicate fd number was tried and is
+///     unsound, since it cannot cover a stale completion reaped *before* the
+///     re-add.
+///  3. **A lost or failed completion strands a registration.** Since a
+///     one-shot poll is re-armed only after its CQE is consumed, anything that
+///     consumes the poll without yielding a usable completion leaves the table
+///     claiming the fd is armed when nothing will ever re-arm it — silently
+///     fatal for the listener. Two guards follow: startup requires
+///     `IORING_FEAT_NODROP` so the kernel never discards completions on CQ
+///     overflow, and a negative `cqe.res` on a live token fails the loop
+///     rather than being skipped.
+///  4. **The submission queue is not kernel-synchronized.** `epoll_ctl` is
 ///     safe to call from any thread while another sits in `epoll_wait`, and
 ///     `removeReadFd` documents that worker threads do exactly that. The SQ
 ///     is plain shared memory, so every userspace ring mutation here is taken
@@ -349,7 +366,7 @@ fn initIoUring(allocator: std.mem.Allocator, entries: u16) !EventLoop {
 /// level-triggered, re-poll-until-drained consumers in `edge_gateway.zig`, but
 /// it does mean a caller may need one extra loop iteration. Closing the gap
 /// would require `IORING_POLL_ADD_LEVEL`, which is Linux 5.13+ and therefore
-/// above this prototype's documented 5.4 floor.
+/// above this prototype's documented 5.5 floor.
 const IoUringPollerLinux = struct {
     const linux = std.os.linux;
 
@@ -579,13 +596,19 @@ const IoUringPollerLinux = struct {
             // Stale completion for a registration that was removed or
             // re-armed under a new interest.
             if (reg.token != decodeToken(cqe.user_data)) continue;
-            // A negative result is a negated errno, not a poll mask. The
-            // common case is -ECANCELED, though a cancel normally also
-            // removes or re-tokenizes the registration and so is already
-            // filtered above. Anything else is a poll the kernel refused;
-            // like the epoll path's error handling, this reports no readiness
-            // and does not try to self-heal by re-arming.
-            if (cqe.res < 0) continue;
+            // A negative result is a negated errno, not a poll mask, and
+            // reaching here means it belongs to the *live* registration:
+            // cancellations are already filtered out above, because `remove`
+            // deletes the map entry and `modify` re-tokenizes before the old
+            // cancellation can be accepted. `POLL_ADD` is one-shot, so the
+            // request is now terminated while the table still says this fd is
+            // armed. Continuing would strand it exactly like a dropped CQE —
+            // and for the listener that means staying up while never seeing
+            // another accept. Fail fast instead.
+            if (cqe.res < 0) {
+                _ = self.registrations.remove(fd);
+                return self.markFatal();
+            }
 
             const mask: u32 = @intCast(cqe.res);
             const errored = (mask & (pollErr | pollHup)) != 0;
@@ -1058,6 +1081,33 @@ test "io_uring event loop attributes nothing to a closed fd whose number is reus
     try loop.add(reused_number, .{ .read = true });
     defer loop.remove(reused_number) catch {};
     try std.testing.expectEqual(@as(usize, 0), try loop.wait(&events, 20));
+}
+
+test "io_uring event loop fails fast when a live poll completes with an error" {
+    var loop = try testIoUringLoopOrSkip();
+    defer loop.deinit();
+
+    const fds = try testSocketPair();
+    closeFd(fds[1]);
+    const dead = fds[0];
+    closeFd(dead);
+
+    // Polling a closed descriptor: the SQE is accepted and the kernel reports
+    // the failure asynchronously as a negative `cqe.res`. That terminates the
+    // one-shot poll, so the registration can never be re-armed — the loop must
+    // surface it rather than silently going deaf on that fd.
+    loop.add(dead, .{ .read = true }) catch |err| {
+        // A kernel that rejects it at submission time instead is equally
+        // fail-closed; either way the error must not be swallowed.
+        try std.testing.expect(err == error.EventLoopUnrecoverable);
+        return;
+    };
+
+    var events: [4]Event = undefined;
+    try std.testing.expectError(error.EventLoopUnrecoverable, loop.wait(&events, 50));
+    // The unrecoverable state is sticky, so the gateway cannot accidentally
+    // keep running past it.
+    try std.testing.expectError(error.EventLoopUnrecoverable, loop.wait(&events, 0));
 }
 
 test "io_uring event loop drains more ready fds than the completion queue holds" {

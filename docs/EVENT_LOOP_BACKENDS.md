@@ -563,25 +563,28 @@ loop.
 
 ### Validation status — read this before citing the prototype
 
-- **Unit tests:** the `epoll`/`kqueue` behaviour tests in `event_loop.zig` are
-  mirrored for the `io_uring` backend (write readiness, `modify` replacing
-  interest, re-arm persistence, removal, duplicate-registration rejection),
-  plus fail-closed tests for an unavailable backend and an unusable ring size,
-  a close/fd-number-reuse test that verifies no completion from a closed
-  registration is reported against or re-armed on the descriptor that inherits
-  its number, and a CQ-pressure regression that makes 150 fds ready
-  simultaneously against a 128-entry completion queue and requires every one
-  to surface. The behaviour tests skip themselves when `io_uring_setup` is
-  unavailable — container seccomp profiles, Docker's default among them, block
-  it outright — since that is an environment property, not a defect in the
-  backend.
+- **Unit tests: eight Linux-only tests** — one ring-size fail-closed test plus
+  seven that drive a live ring. They mirror the `epoll`/`kqueue` behaviour
+  tests (write readiness, `modify` replacing interest, re-arm persistence,
+  removal, duplicate-registration rejection) and add three regressions for the
+  failure modes above: a close/fd-number-reuse test verifying no completion
+  from a closed registration is reported against or re-armed on the descriptor
+  that inherits its number; a CQ-pressure test making 150 fds ready against a
+  128-entry completion queue and requiring every one to surface; and an
+  operation-error test asserting that a negative completion on a live token
+  makes `wait` return `error.EventLoopUnrecoverable` rather than silently
+  dropping the registration. There is also a platform fail-closed test for an
+  unavailable backend. The live-ring tests skip themselves when
+  `io_uring_setup` is unavailable — container seccomp profiles, Docker's
+  default among them, block it outright — since that is an environment
+  property, not a defect in the backend.
 - **Executed on Linux by CI, not by the author.** The development host for
   this change was macOS/arm64, where the io_uring path compiles out entirely;
   it was validated there only by cross-compiling for `x86_64-linux-gnu` and by
   review. The Linux CI jobs were the first actual execution, and all six
   io_uring tests ran and passed there on both `ubuntu-latest` (x86_64) and
   `ubuntu-24.04-arm` (aarch64) — confirmed by skip-count differential: the
-  macOS job skips 7 tests where the Linux jobs skip 1, and the difference of 6
+  macOS job skips 9 tests where the Linux jobs skip 1, and the difference of 8
   is exactly this backend's tests. So `io_uring_setup` is not blocked on those
   runners, the capability probe succeeds, and the readiness, `modify`,
   re-arm, removal, and recycled-fd paths all behave as intended on a live
