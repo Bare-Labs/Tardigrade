@@ -125,6 +125,7 @@ const quic_zero_rtt_packet_outcome_count = 5;
 /// Maximum number of listener shards tracked in per-shard metric arrays.
 /// Shard IDs >= this value are clamped to the last bucket.
 pub const max_listener_shards: usize = 64;
+const accept_batch_bucket_count = 6;
 
 /// Server-wide metrics counters.
 ///
@@ -305,6 +306,12 @@ pub const Metrics = struct {
     accepts_total: [max_listener_shards]std.atomic.Value(u64),
     /// Per-shard accept errors total, split by a bounded reason label.
     accept_errors_total: [max_listener_shards][accept_error_reason_count]std.atomic.Value(u64),
+    /// Per-shard accept readiness batches by size bucket.
+    accept_batch_size_buckets: [max_listener_shards][accept_batch_bucket_count]std.atomic.Value(u64),
+    accept_batch_size_sum: [max_listener_shards]std.atomic.Value(u64),
+    accept_batch_size_count: [max_listener_shards]std.atomic.Value(u64),
+    accept_batches_total: [max_listener_shards]std.atomic.Value(u64),
+    accept_fairness_yields_total: [max_listener_shards]std.atomic.Value(u64),
     /// Server start time (nanoseconds since boot).
     started_ns: i128,
 
@@ -431,6 +438,11 @@ pub const Metrics = struct {
             .listener_shards = 1,
             .accepts_total = zeroAtomicShardCounters(),
             .accept_errors_total = zeroAtomicShardReasonCounters(),
+            .accept_batch_size_buckets = zeroAtomicShardBatchCounters(),
+            .accept_batch_size_sum = zeroAtomicShardCounters(),
+            .accept_batch_size_count = zeroAtomicShardCounters(),
+            .accept_batches_total = zeroAtomicShardCounters(),
+            .accept_fairness_yields_total = zeroAtomicShardCounters(),
             .started_ns = compat.nanoTimestamp(),
         };
     }
@@ -595,6 +607,25 @@ pub const Metrics = struct {
     pub fn recordAcceptError(self: *Metrics, shard_id: u16, reason: AcceptErrorReason) void {
         const idx = @min(@as(usize, shard_id), max_listener_shards - 1);
         _ = self.accept_errors_total[idx][acceptErrorReasonIndex(reason)].fetchAdd(1, .monotonic);
+    }
+
+    pub fn recordAcceptBatch(self: *Metrics, shard_id: u16, batch_size: u32) void {
+        const idx = @min(@as(usize, shard_id), max_listener_shards - 1);
+        const size: u64 = @intCast(batch_size);
+        _ = self.accept_batches_total[idx].fetchAdd(1, .monotonic);
+        _ = self.accept_batch_size_count[idx].fetchAdd(1, .monotonic);
+        _ = self.accept_batch_size_sum[idx].fetchAdd(size, .monotonic);
+
+        const bucket_idx = acceptBatchBucketIndex(batch_size);
+        var i: usize = bucket_idx;
+        while (i < accept_batch_bucket_count) : (i += 1) {
+            _ = self.accept_batch_size_buckets[idx][i].fetchAdd(1, .monotonic);
+        }
+    }
+
+    pub fn recordAcceptFairnessYield(self: *Metrics, shard_id: u16) void {
+        const idx = @min(@as(usize, shard_id), max_listener_shards - 1);
+        _ = self.accept_fairness_yields_total[idx].fetchAdd(1, .monotonic);
     }
 
     pub fn setUpstreamUnhealthyBackends(self: *Metrics, count: usize) void {
@@ -1299,6 +1330,12 @@ pub const Metrics = struct {
             \\# TYPE tardigrade_accepts_total counter
             \\# HELP tardigrade_accept_errors_total Total accept-path errors per listener shard
             \\# TYPE tardigrade_accept_errors_total counter
+            \\# HELP tardigrade_accept_batch_size Accepted connections drained from one listener readiness turn
+            \\# TYPE tardigrade_accept_batch_size histogram
+            \\# HELP tardigrade_accept_batches_total Total listener readiness turns that accepted at least one connection
+            \\# TYPE tardigrade_accept_batches_total counter
+            \\# HELP tardigrade_accept_fairness_yields_total Total accept batches stopped early by the fairness yield limit
+            \\# TYPE tardigrade_accept_fairness_yields_total counter
             \\
         , .{self.listener_shards});
         {
@@ -1314,6 +1351,23 @@ pub const Metrics = struct {
                         self.accept_errors_total[i][acceptErrorReasonIndex(reason)].load(.monotonic),
                     });
                 }
+            }
+            for (0..n) |i| {
+                inline for (.{ 1, 2, 4, 8, 16 }) |le| {
+                    try out.print("tardigrade_accept_batch_size_bucket{{shard=\"{d}\",le=\"{d}\"}} {d}\n", .{
+                        i,
+                        le,
+                        self.accept_batch_size_buckets[i][acceptBatchBucketIndex(le)].load(.monotonic),
+                    });
+                }
+                try out.print("tardigrade_accept_batch_size_bucket{{shard=\"{d}\",le=\"+Inf\"}} {d}\n", .{
+                    i,
+                    self.accept_batch_size_buckets[i][accept_batch_bucket_count - 1].load(.monotonic),
+                });
+                try out.print("tardigrade_accept_batch_size_sum{{shard=\"{d}\"}} {d}\n", .{ i, self.accept_batch_size_sum[i].load(.monotonic) });
+                try out.print("tardigrade_accept_batch_size_count{{shard=\"{d}\"}} {d}\n", .{ i, self.accept_batch_size_count[i].load(.monotonic) });
+                try out.print("tardigrade_accept_batches_total{{shard=\"{d}\"}} {d}\n", .{ i, self.accept_batches_total[i].load(.monotonic) });
+                try out.print("tardigrade_accept_fairness_yields_total{{shard=\"{d}\"}} {d}\n", .{ i, self.accept_fairness_yields_total[i].load(.monotonic) });
             }
         }
 
@@ -1753,6 +1807,14 @@ fn zeroAtomicShardReasonCounters() [max_listener_shards][accept_error_reason_cou
     return counters;
 }
 
+fn zeroAtomicShardBatchCounters() [max_listener_shards][accept_batch_bucket_count]std.atomic.Value(u64) {
+    var counters: [max_listener_shards][accept_batch_bucket_count]std.atomic.Value(u64) = undefined;
+    for (&counters) |*shard| {
+        for (shard) |*counter| counter.* = std.atomic.Value(u64).init(0);
+    }
+    return counters;
+}
+
 fn tlsBackendIndex(backend: encrypted_stream.BackendKind) usize {
     return switch (backend) {
         .openssl => 0,
@@ -1887,6 +1949,15 @@ fn acceptErrorReasonIndex(reason: AcceptErrorReason) usize {
         .poll => 0,
         .accept => 1,
     };
+}
+
+fn acceptBatchBucketIndex(batch_size: u32) usize {
+    if (batch_size <= 1) return 0;
+    if (batch_size <= 2) return 1;
+    if (batch_size <= 4) return 2;
+    if (batch_size <= 8) return 3;
+    if (batch_size <= 16) return 4;
+    return 5;
 }
 
 fn earlyDataSourceIndex(source: EarlyDataSource) usize {
@@ -2653,6 +2724,10 @@ test "listener sharding metrics record per-shard accepts and errors and emit Pro
     m.recordAccept(1);
     m.recordAcceptError(2, .accept);
     m.recordAcceptError(2, .poll);
+    m.recordAcceptBatch(0, 1);
+    m.recordAcceptBatch(0, 3);
+    m.recordAcceptBatch(1, 17);
+    m.recordAcceptFairnessYield(0);
 
     try std.testing.expectEqual(@as(u64, 2), m.accepts_total[0].load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), m.accepts_total[1].load(.monotonic));
@@ -2660,6 +2735,9 @@ test "listener sharding metrics record per-shard accepts and errors and emit Pro
     try std.testing.expectEqual(@as(u64, 0), m.accept_errors_total[0][acceptErrorReasonIndex(.accept)].load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), m.accept_errors_total[2][acceptErrorReasonIndex(.accept)].load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), m.accept_errors_total[2][acceptErrorReasonIndex(.poll)].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), m.accept_batches_total[0].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 4), m.accept_batch_size_sum[0].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), m.accept_fairness_yields_total[0].load(.monotonic));
 
     // Out-of-bounds shard IDs are clamped.
     m.recordAccept(@as(u16, max_listener_shards) + 10);
@@ -2673,4 +2751,11 @@ test "listener sharding metrics record per-shard accepts and errors and emit Pro
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accepts_total{shard=\"1\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_errors_total{shard=\"2\",reason=\"accept\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_errors_total{shard=\"2\",reason=\"poll\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_batch_size_bucket{shard=\"0\",le=\"1\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_batch_size_bucket{shard=\"0\",le=\"4\"} 2") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_batch_size_bucket{shard=\"1\",le=\"+Inf\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_batch_size_sum{shard=\"0\"} 4") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_batch_size_count{shard=\"0\"} 2") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_batches_total{shard=\"0\"} 2") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_accept_fairness_yields_total{shard=\"0\"} 1") != null);
 }

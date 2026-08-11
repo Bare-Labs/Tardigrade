@@ -14827,6 +14827,9 @@ test "listener sharding starts real gateway with reuse-port shards and exports p
 
         try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accept_errors_total", &.{ shard_label, "reason=\"poll\"" }) != null);
         try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accept_errors_total", &.{ shard_label, "reason=\"accept\"" }) != null);
+        try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accept_batch_size_count", &.{shard_label}) != null);
+        try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accept_batches_total", &.{shard_label}) != null);
+        try std.testing.expect(prometheusLabeledMetricValue(metrics.body, "tardigrade_accept_fairness_yields_total", &.{shard_label}) != null);
     }
     try std.testing.expect(nonzero_accept_shards > 1);
 }

@@ -353,6 +353,8 @@ Two outcome shapes exist:
 | Scenario | Config (env) | Default | Enforced in | Outcome when reached |
 |---|---|---|---|---|
 | File descriptors | `TARDIGRADE_FD_SOFT_LIMIT` | OS default | `gateway_accept.applyFdSoftLimit` | Soft `RLIMIT_NOFILE` raised toward the hard cap at startup; `accept()` errors are logged, the loop yields, and the listener keeps running |
+| Accept batch cap | `TARDIGRADE_ACCEPT_BATCH_LIMIT` | 64 | `gateway_accept.acceptReadyConnectionsShard` | Each listener readiness turn accepts at most this many connections before yielding back to the event loop |
+| Accept fairness yield | `TARDIGRADE_ACCEPT_FAIRNESS_YIELD_EVERY` | 0 (disabled) | `gateway_accept.acceptReadyConnectionsShard` | When non-zero, stops a readiness turn after this many accepts even if the batch cap is higher; increments `tardigrade_accept_fairness_yields_total` |
 | Global connection limit | `TARDIGRADE_MAX_ACTIVE_CONNECTIONS` | 0 (unlimited) | `GatewayState.tryAcquireConnectionSlot` → `.over_global_limit` | Deterministic `503`; `connection_rejections` + `error_overload` incremented |
 | Per-IP connection limit | `TARDIGRADE_MAX_CONNECTIONS_PER_IP` | 0 (unlimited) | `tryAcquireConnectionSlot` → `.over_ip_limit` | Deterministic `503`; `connection_rejections` + `error_overload`; warn log names the IP |
 | Connection memory budget | `TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES` | 0 (off) | `tryAcquireConnectionSlot` → `.over_global_memory_limit` | Projected `(active+1) × per-conn estimate` over budget → deterministic `503`; `connection_rejections` + `error_overload` |
@@ -418,6 +420,11 @@ without reading source:
   counts worker-queue saturation; `tardigrade_error_overload_total` aggregates
   both accept-time families. `active_connections`, `worker_queued_jobs`, and
   `worker_queue_capacity` show how close the gateway is to its caps.
+- **Accept batching** — `tardigrade_accept_batch_size` records how many
+  connections each listener readiness turn drained; `tardigrade_accept_batches_total`
+  counts non-empty accept turns; `tardigrade_accept_fairness_yields_total` shows
+  when `TARDIGRADE_ACCEPT_FAIRNESS_YIELD_EVERY` forced the loop to give active
+  connections, parked keepalives, timers, or sibling listener shards another turn.
 - **Logs** — each accept-time rejection emits a distinct `warn` runtime log:
   per-IP limit names the offending IP, the global and memory limits each have
   their own message, and queue-submit failures log the submit error. Request

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const compat = @import("zig_compat");
 const http = @import("http.zig");
+const gaccept = @import("gateway_accept.zig");
 const tls_core = @import("tls_core");
 
 const encrypted_stream = tls_core.encrypted_stream;
@@ -415,6 +416,14 @@ pub const EdgeConfig = struct {
     /// single-listener behavior.
     /// Set via TARDIGRADE_LISTENER_SHARDS.
     listener_shards: u16,
+    /// Maximum accepted connections to drain from a ready listener before
+    /// returning to the event loop.
+    /// Set via TARDIGRADE_ACCEPT_BATCH_LIMIT.
+    accept_batch_limit: u32,
+    /// Return to the event loop after this many accepts in one readiness turn,
+    /// even if the batch cap is higher. 0 disables the extra fairness yield.
+    /// Set via TARDIGRADE_ACCEPT_FAIRNESS_YIELD_EVERY.
+    accept_fairness_yield_every: u32,
     /// Event-loop backend override (#148). `null` keeps the platform default
     /// (`epoll` on Linux, `kqueue` elsewhere), which is the shipped behavior.
     /// Setting this to `io_uring` opts into the Linux-only readiness-only
@@ -1223,6 +1232,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     defer allocator.free(worker_threads_str);
     const worker_threads = std.fmt.parseInt(u32, worker_threads_str, 10) catch 0;
     const listener_shards = parseIntEnv(u16, allocator, "TARDIGRADE_LISTENER_SHARDS", 0);
+    const accept_batch_limit = @max(parseIntEnv(u32, allocator, "TARDIGRADE_ACCEPT_BATCH_LIMIT", gaccept.default_accept_batch_limit), 1);
+    const accept_fairness_yield_every = parseIntEnv(u32, allocator, "TARDIGRADE_ACCEPT_FAIRNESS_YIELD_EVERY", 0);
     const event_loop_backend_str = envOrDefault(allocator, "TARDIGRADE_EVENT_LOOP_BACKEND", "default") catch unreachable;
     defer allocator.free(event_loop_backend_str);
     const event_loop_backend = try parseEventLoopBackendConfig(event_loop_backend_str);
@@ -1698,6 +1709,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .cb_timeout_ms = cb_timeout_ms,
         .worker_threads = worker_threads,
         .listener_shards = listener_shards,
+        .accept_batch_limit = accept_batch_limit,
+        .accept_fairness_yield_every = accept_fairness_yield_every,
         .event_loop_backend = event_loop_backend,
         .event_loop_io_uring_entries = event_loop_io_uring_entries,
         .master_process_enabled = master_process_enabled,

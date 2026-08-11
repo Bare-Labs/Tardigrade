@@ -12,6 +12,10 @@ column whenever a lock's role changes.
 Tardigrade uses a **blocking I/O, thread-per-request** model:
 
 - By default, one event-loop thread accepts connections and dispatches fds to a bounded worker pool.
+- Each listener readiness turn accepts up to `TARDIGRADE_ACCEPT_BATCH_LIMIT`
+  connections (default `64`) and can yield earlier via
+  `TARDIGRADE_ACCEPT_FAIRNESS_YIELD_EVERY` so connection churn cannot monopolize
+  the event loop or shard thread indefinitely.
 - When `TARDIGRADE_LISTENER_SHARDS` is greater than 1 on a platform with verified
   load-balanced reuse-port semantics (Linux `SO_REUSEPORT` or FreeBSD
   `SO_REUSEPORT_LB`), startup binds that many listener sockets and runs one
@@ -400,7 +404,7 @@ They are not on the request hot path for standard HTTP traffic.
 | `health_probe_running` | `gateway_state.zig` | `bool` flag guarding the one-at-a-time health-probe constraint. Correct. |
 | `shutdown_requested` / `reload_requested` / `upgrade_requested` / `reopen_logs_requested` | `http/shutdown.zig` | Signal-handler-safe `seq_cst` atomics. Correct; read on every event-loop tick, not per-request. |
 | `dropped_lines` | `http/access_log.zig` | Monotonic counter for dropped log lines. Correct. |
-| `accepts_total` / `accept_errors_total` | `http/metrics.zig` | Per-listener-shard counters updated directly from accept loops with `.monotonic`, avoiding `GatewayState.metrics_mutex` on the sharded accept path. |
+| `accepts_total` / `accept_errors_total` / accept batch counters | `http/metrics.zig` | Per-listener-shard counters updated directly from accept loops with `.monotonic`, avoiding `GatewayState.metrics_mutex` on the sharded accept path. |
 
 All atomics are correctly classified as lock-free; no improvement needed.
 
