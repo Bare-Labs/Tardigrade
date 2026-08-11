@@ -131,8 +131,9 @@ Application events (`src/http3/qlog.zig`):
 | Requirement (#255)        | qlog event                          | Key data |
 |---------------------------|-------------------------------------|----------|
 | SETTINGS                  | `http3:parameters_set`              | max field section size, QPACK table cap, blocked streams |
-| control stream            | `http3:stream_type_set`             | stream id, stream type |
-| HEADERS / DATA / GOAWAY   | `http3:frame_created` / `http3:frame_parsed` | variant-specific frame payloads; HEADERS carries `headers`, SETTINGS carries `settings`, GOAWAY carries `id` |
+| stream classification     | `http3:stream_type_set`             | stream id, request/control/QPACK/push/unknown stream type |
+| HEADERS / DATA / GOAWAY / PRIORITY_UPDATE | `http3:frame_created` / `http3:frame_parsed` | variant-specific frame payloads; HEADERS carries `headers`, SETTINGS carries `settings`, GOAWAY carries `id`, raw lengths live under `raw.length` |
+| priority changes          | `http3:priority_updated`            | stream id and `new` HTTP priority field value |
 | **QPACK blocked**         | `tardigrade:qpack_stream_state_updated` | `state` (blocked/unblocked), stream id |
 
 `quic:packet_dropped` with `trigger:"decryption_failure"` is the

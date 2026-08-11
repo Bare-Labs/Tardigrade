@@ -85,12 +85,26 @@ pub const RequestStream = struct {
     }
 
     pub fn ingestBytes(self: *RequestStream, bytes: []const u8, qpack_scratch: []u8) SessionError!usize {
+        return self.ingestBytesWithObserver(bytes, qpack_scratch, null);
+    }
+
+    pub const FrameObserver = struct {
+        context: ?*anyopaque = null,
+        parsedFn: ?*const fn (?*anyopaque, frame.RawFrame) void = null,
+
+        fn parsed(self: FrameObserver, raw: frame.RawFrame) void {
+            if (self.parsedFn) |parsed_fn| parsed_fn(self.context, raw);
+        }
+    };
+
+    pub fn ingestBytesWithObserver(self: *RequestStream, bytes: []const u8, qpack_scratch: []u8, observer: ?FrameObserver) SessionError!usize {
         self.pending.appendSlice(self.allocator, bytes) catch return error.OutOfMemory;
         while (true) {
             const raw = frame.decodeFrameWithLimit(self.pending.items, max_frame_payload_len) catch |err| switch (err) {
                 error.BufferTooShort => return bytes.len,
                 else => return mapFrameDecodeError(err),
             };
+            if (observer) |obs| obs.parsed(raw);
             try self.ingestFrame(raw, qpack_scratch);
             discardPrefix(&self.pending, raw.len);
         }
@@ -246,6 +260,23 @@ fn mapFrameDecodeError(err: frame.DecodeError) SessionError {
 }
 
 const testing = std.testing;
+
+const ParsedFrameRecorder = struct {
+    frames: std.ArrayList(frame.RawFrame) = .empty,
+
+    fn deinit(self: *ParsedFrameRecorder, allocator: std.mem.Allocator) void {
+        self.frames.deinit(allocator);
+    }
+
+    fn observer(self: *ParsedFrameRecorder) RequestStream.FrameObserver {
+        return .{ .context = self, .parsedFn = parsed };
+    }
+
+    fn parsed(ctx: ?*anyopaque, raw: frame.RawFrame) void {
+        const self: *ParsedFrameRecorder = @ptrCast(@alignCast(ctx.?));
+        self.frames.append(testing.allocator, raw) catch unreachable;
+    }
+};
 
 test "request stream maps HEADERS and DATA onto stream_transport Exchange" {
     const allocator = testing.allocator;
@@ -440,6 +471,59 @@ test "request stream ingests split frame type length and payload incrementally" 
 
     const exchange = try req.finish();
     try testing.expectEqualStrings("GET", exchange.request.method);
+}
+
+test "request stream frame observer reports every decoded frame with exact wire length" {
+    const allocator = testing.allocator;
+    var qpack_buf: [512]u8 = undefined;
+    const block = try qpack.encode(&.{
+        .{ .name = ":method", .value = "POST" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "example.com" },
+        .{ .name = ":path", .value = "/" },
+    }, &qpack_buf);
+
+    var wire: [1024]u8 = undefined;
+    var pos: usize = 0;
+    const headers = try frame.encodeKnownFrame(.headers, block, wire[pos..]);
+    pos += headers.len;
+    const data_a = try frame.encodeKnownFrame(.data, "abc", wire[pos..]);
+    pos += data_a.len;
+    const data_b = try frame.encodeKnownFrame(.data, "defg", wire[pos..]);
+    pos += data_b.len;
+
+    var req = RequestStream.init(allocator, 0);
+    defer req.deinit();
+    var recorder = ParsedFrameRecorder{};
+    defer recorder.deinit(allocator);
+    var scratch: [512]u8 = undefined;
+
+    try testing.expectEqual(pos - 1, try req.ingestBytesWithObserver(wire[0 .. pos - 1], &scratch, recorder.observer()));
+    try testing.expectEqual(@as(usize, 2), recorder.frames.items.len);
+    try testing.expectEqual(@as(usize, 1), try req.ingestBytesWithObserver(wire[pos - 1 .. pos], &scratch, recorder.observer()));
+    try testing.expectEqual(@as(usize, 3), recorder.frames.items.len);
+    try testing.expectEqual(frame.FrameType.headers, recorder.frames.items[0].typ);
+    try testing.expectEqual(headers.len, recorder.frames.items[0].len);
+    try testing.expectEqual(frame.FrameType.data, recorder.frames.items[1].typ);
+    try testing.expectEqual(data_a.len, recorder.frames.items[1].len);
+    try testing.expectEqual(frame.FrameType.data, recorder.frames.items[2].typ);
+    try testing.expectEqual(data_b.len, recorder.frames.items[2].len);
+}
+
+test "request stream frame observer reports DATA before semantic rejection" {
+    var wire: [64]u8 = undefined;
+    const data = try frame.encodeKnownFrame(.data, "x", &wire);
+
+    var req = RequestStream.init(testing.allocator, 0);
+    defer req.deinit();
+    var recorder = ParsedFrameRecorder{};
+    defer recorder.deinit(testing.allocator);
+    var scratch: [128]u8 = undefined;
+
+    try testing.expectError(error.InvalidRequestFrame, req.ingestBytesWithObserver(data, &scratch, recorder.observer()));
+    try testing.expectEqual(@as(usize, 1), recorder.frames.items.len);
+    try testing.expectEqual(frame.FrameType.data, recorder.frames.items[0].typ);
+    try testing.expectEqual(data.len, recorder.frames.items[0].len);
 }
 
 test "request stream rejects DATA before HEADERS and trailers for the MVP" {

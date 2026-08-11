@@ -294,6 +294,14 @@ pub const Metrics = struct {
     /// #523: per-packet 0-RTT authentication/admission outcomes. See
     /// `QuicZeroRttPacketOutcome`.
     quic_zero_rtt_packet_total: [quic_zero_rtt_packet_outcome_count]u64,
+    /// #255 Slice 3: process-wide QPACK dynamic decoder observability. These
+    /// remain zero until the live H3 path composes the dynamic decoder.
+    h3_qpack_blocked_streams_current: u64,
+    h3_qpack_blocked_streams_total: u64,
+    h3_qpack_unblocked_streams_total: u64,
+    h3_qpack_cancelled_streams_total: u64,
+    h3_qpack_table_bytes: u64,
+    h3_qpack_decode_failures_total: u64,
     /// Total graceful-shutdown drains started.
     drain_total: u64,
     /// Total drains that hit the configured drain timeout before work finished.
@@ -432,6 +440,12 @@ pub const Metrics = struct {
             .tls_early_data_replay_total = .{0} ** early_data_replay_outcome_count,
             .quic_early_data_decision_total = .{0} ** quic_early_data_decision_count,
             .quic_zero_rtt_packet_total = .{0} ** quic_zero_rtt_packet_outcome_count,
+            .h3_qpack_blocked_streams_current = 0,
+            .h3_qpack_blocked_streams_total = 0,
+            .h3_qpack_unblocked_streams_total = 0,
+            .h3_qpack_cancelled_streams_total = 0,
+            .h3_qpack_table_bytes = 0,
+            .h3_qpack_decode_failures_total = 0,
             .drain_total = 0,
             .drain_timeouts_total = 0,
             .drain_forced_closes_total = 0,
@@ -566,6 +580,36 @@ pub const Metrics = struct {
     /// #523: record one 0-RTT packet's authentication/admission outcome.
     pub fn recordQuicZeroRttPacket(self: *Metrics, outcome: QuicZeroRttPacketOutcome) void {
         self.quic_zero_rtt_packet_total[quicZeroRttPacketOutcomeIndex(outcome)] += 1;
+    }
+
+    pub const H3QpackSnapshot = struct {
+        current_blocked_streams: u64 = 0,
+        blocked_streams: u64 = 0,
+        unblocked_streams: u64 = 0,
+        cancelled_streams: u64 = 0,
+        table_bytes: u64 = 0,
+        decode_failures: u64 = 0,
+    };
+
+    /// Fold one connection's cumulative QPACK metrics. Gauge values are
+    /// adjusted from previous/current state so multi-connection totals compose
+    /// and teardown can subtract the final per-connection snapshot.
+    pub fn recordH3QpackSnapshotDelta(self: *Metrics, previous: H3QpackSnapshot, current: H3QpackSnapshot) void {
+        self.h3_qpack_blocked_streams_total += current.blocked_streams -| previous.blocked_streams;
+        self.h3_qpack_unblocked_streams_total += current.unblocked_streams -| previous.unblocked_streams;
+        self.h3_qpack_cancelled_streams_total += current.cancelled_streams -| previous.cancelled_streams;
+        self.h3_qpack_decode_failures_total += current.decode_failures -| previous.decode_failures;
+        self.h3_qpack_blocked_streams_current = addGaugeDelta(
+            self.h3_qpack_blocked_streams_current,
+            previous.current_blocked_streams,
+            current.current_blocked_streams,
+        );
+        self.h3_qpack_table_bytes = addGaugeDelta(self.h3_qpack_table_bytes, previous.table_bytes, current.table_bytes);
+    }
+
+    pub fn removeH3QpackSnapshot(self: *Metrics, snapshot: H3QpackSnapshot) void {
+        self.h3_qpack_blocked_streams_current -|= snapshot.current_blocked_streams;
+        self.h3_qpack_table_bytes -|= snapshot.table_bytes;
     }
 
     /// Record the start of a config hot-reload attempt.
@@ -1689,6 +1733,35 @@ pub const Metrics = struct {
                 self.quic_zero_rtt_packet_total[quicZeroRttPacketOutcomeIndex(outcome)],
             });
         }
+
+        try out.print(
+            \\# HELP tardigrade_h3_qpack_blocked_streams Current HTTP/3 QPACK blocked streams
+            \\# TYPE tardigrade_h3_qpack_blocked_streams gauge
+            \\tardigrade_h3_qpack_blocked_streams {d}
+            \\# HELP tardigrade_h3_qpack_blocked_streams_total Total HTTP/3 QPACK streams that became blocked
+            \\# TYPE tardigrade_h3_qpack_blocked_streams_total counter
+            \\tardigrade_h3_qpack_blocked_streams_total {d}
+            \\# HELP tardigrade_h3_qpack_unblocked_streams_total Total HTTP/3 QPACK streams unblocked by encoder progress
+            \\# TYPE tardigrade_h3_qpack_unblocked_streams_total counter
+            \\tardigrade_h3_qpack_unblocked_streams_total {d}
+            \\# HELP tardigrade_h3_qpack_cancelled_streams_total Total HTTP/3 QPACK blocked streams cancelled before unblock
+            \\# TYPE tardigrade_h3_qpack_cancelled_streams_total counter
+            \\tardigrade_h3_qpack_cancelled_streams_total {d}
+            \\# HELP tardigrade_h3_qpack_table_bytes Current HTTP/3 QPACK dynamic table bytes
+            \\# TYPE tardigrade_h3_qpack_table_bytes gauge
+            \\tardigrade_h3_qpack_table_bytes {d}
+            \\# HELP tardigrade_h3_qpack_decode_failures_total Total HTTP/3 QPACK dynamic decode failures
+            \\# TYPE tardigrade_h3_qpack_decode_failures_total counter
+            \\tardigrade_h3_qpack_decode_failures_total {d}
+            \\
+        , .{
+            self.h3_qpack_blocked_streams_current,
+            self.h3_qpack_blocked_streams_total,
+            self.h3_qpack_unblocked_streams_total,
+            self.h3_qpack_cancelled_streams_total,
+            self.h3_qpack_table_bytes,
+            self.h3_qpack_decode_failures_total,
+        });
     }
 
     /// #368 Slice 3: process-local anti-replay store outcomes. Every label
@@ -1784,6 +1857,13 @@ pub const Metrics = struct {
         return out.toOwnedSlice();
     }
 };
+
+fn addGaugeDelta(current_total: u64, previous_value: u64, current_value: u64) u64 {
+    if (current_value >= previous_value) {
+        return current_total + (current_value - previous_value);
+    }
+    return current_total -| (previous_value - current_value);
+}
 
 fn zeroTlsQueueMatrix() [tls_backend_count][tls_queue_count]u64 {
     return .{.{0} ** tls_queue_count} ** tls_backend_count;
@@ -2705,6 +2785,51 @@ test "early-data metrics record bounded labels and emit Prometheus series" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"too_early\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_early_data_compat_total{decision=\"compatible\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_early_data_compat_total{decision=\"missing_state\"} 1") != null);
+}
+
+test "H3 QPACK metrics expose current blocked gauge and monotonic counters" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+
+    const empty = Metrics.H3QpackSnapshot{};
+    const conn_a = Metrics.H3QpackSnapshot{
+        .current_blocked_streams = 2,
+        .blocked_streams = 3,
+        .table_bytes = 128,
+        .decode_failures = 1,
+    };
+    const conn_b = Metrics.H3QpackSnapshot{
+        .current_blocked_streams = 1,
+        .blocked_streams = 1,
+        .table_bytes = 64,
+    };
+    const conn_a_later = Metrics.H3QpackSnapshot{
+        .current_blocked_streams = 1,
+        .blocked_streams = 3,
+        .unblocked_streams = 1,
+        .table_bytes = 96,
+        .decode_failures = 2,
+    };
+
+    m.recordH3QpackSnapshotDelta(empty, conn_a);
+    m.recordH3QpackSnapshotDelta(empty, conn_b);
+    m.recordH3QpackSnapshotDelta(conn_a, conn_a_later);
+
+    try std.testing.expectEqual(@as(u64, 2), m.h3_qpack_blocked_streams_current);
+    try std.testing.expectEqual(@as(u64, 160), m.h3_qpack_table_bytes);
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_qpack_blocked_streams 2") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_qpack_blocked_streams_total 4") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_qpack_unblocked_streams_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_qpack_table_bytes 160") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_qpack_decode_failures_total 2") != null);
+
+    m.removeH3QpackSnapshot(conn_a_later);
+    m.removeH3QpackSnapshot(conn_b);
+    try std.testing.expectEqual(@as(u64, 0), m.h3_qpack_blocked_streams_current);
+    try std.testing.expectEqual(@as(u64, 0), m.h3_qpack_table_bytes);
+    try std.testing.expectEqual(@as(u64, 4), m.h3_qpack_blocked_streams_total);
 }
 
 test "listener sharding metrics record per-shard accepts and errors and emit Prometheus series (#137)" {
