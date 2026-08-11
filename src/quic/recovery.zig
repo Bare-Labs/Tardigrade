@@ -12,8 +12,12 @@ const std = @import("std");
 
 pub const max_ack_ranges = 32;
 pub const max_tracked_packets = 128;
-pub const max_datagram_size: usize = 1200;
-pub const min_congestion_window: usize = 2 * max_datagram_size;
+/// The sender's maximum datagram size at connection start (RFC 9000 §14's
+/// floor). RFC 9002 defines the NewReno windows in terms of the sender's
+/// *current* maximum datagram size, so this is only the starting value:
+/// `CongestionController.max_datagram_size` carries the live one and
+/// `setMaxDatagramSize` tracks it as the path's send size changes (#256-A).
+pub const initial_max_datagram_size: usize = 1200;
 pub const initial_rtt_us: u64 = 333_000;
 pub const timer_granularity_us: u64 = 1_000;
 pub const packet_threshold: u64 = 3;
@@ -350,13 +354,33 @@ pub const PacketTracker = struct {
 };
 
 pub const CongestionController = struct {
-    congestion_window: usize = initialWindow(max_datagram_size),
+    congestion_window: usize = initialWindow(initial_max_datagram_size),
     bytes_in_flight: usize = 0,
     ssthresh: usize = std.math.maxInt(usize),
     recovery_start_time_us: ?u64 = null,
+    /// The sender's current maximum datagram size (RFC 9002 §B.2). Every
+    /// NewReno window below is expressed in terms of it, so it must follow the
+    /// size the packet builder actually emits rather than a compile-time
+    /// constant (#256-A).
+    max_datagram_size: usize = initial_max_datagram_size,
 
     pub fn initialWindow(max_datagram: usize) usize {
         return @min(10 * max_datagram, @max(2 * max_datagram, 14_720));
+    }
+
+    pub fn minWindow(self: CongestionController) usize {
+        return 2 * self.max_datagram_size;
+    }
+
+    /// Adopt a new sender maximum datagram size. The congestion window is not
+    /// recomputed — it reflects measured capacity, not the packet size — but
+    /// it is lifted to the new minimum so a larger datagram can never be
+    /// blocked by a floor derived from a smaller one.
+    pub fn setMaxDatagramSize(self: *CongestionController, size: usize) void {
+        if (size == 0 or size == self.max_datagram_size) return;
+        self.max_datagram_size = size;
+        const floor = self.minWindow();
+        if (self.congestion_window < floor) self.congestion_window = floor;
     }
 
     pub fn onPacketSent(self: *CongestionController, bytes: usize) void {
@@ -371,7 +395,7 @@ pub const CongestionController = struct {
         if (self.congestion_window < self.ssthresh) {
             self.congestion_window += packet.size;
         } else {
-            self.congestion_window += @max(1, max_datagram_size * packet.size / self.congestion_window);
+            self.congestion_window += @max(1, self.max_datagram_size * packet.size / self.congestion_window);
         }
     }
 
@@ -382,13 +406,13 @@ pub const CongestionController = struct {
             if (largest_lost_time_sent_us <= start) return;
         }
         self.recovery_start_time_us = now_us;
-        self.congestion_window = @max(self.congestion_window / 2, min_congestion_window);
+        self.congestion_window = @max(self.congestion_window / 2, self.minWindow());
         self.ssthresh = self.congestion_window;
     }
 
     pub fn onPersistentCongestion(self: *CongestionController) void {
-        self.congestion_window = min_congestion_window;
-        self.ssthresh = min_congestion_window;
+        self.congestion_window = self.minWindow();
+        self.ssthresh = self.congestion_window;
     }
 
     pub fn pacingHint(self: CongestionController, now_us: u64, rtt: RttEstimator) PacingHint {
@@ -434,6 +458,14 @@ pub const RecoveryController = struct {
 
     pub fn ackFrameForSpace(self: *const RecoveryController, space: PacketNumberSpace, ack_delay_us: u64) ?AckFrameModel {
         return self.ack_ranges[spaceIndex(space)].toAckFrame(ack_delay_us);
+    }
+
+    /// Whether the bounded tracker can still take one more sent packet.
+    /// Callers must preflight this before dequeuing frames for an in-flight
+    /// packet: an untracked in-flight packet escapes both loss recovery and
+    /// the congestion window (#256-A review).
+    pub fn canTrackPacket(self: *const RecoveryController) bool {
+        return self.tracker.count < max_tracked_packets;
     }
 
     pub fn onPacketSent(self: *RecoveryController, packet: SentPacket) error{TooManyTrackedPackets}!void {
@@ -487,7 +519,14 @@ pub const RecoveryController = struct {
     /// per-path controllers, which is multipath-adjacent work outside #251.
     pub fn resetForPathMigration(self: *RecoveryController) void {
         self.rtt = RttEstimator.init(self.rtt.max_ack_delay_us);
-        self.congestion = .{ .bytes_in_flight = self.congestion.bytes_in_flight };
+        // A migration resets the measured window, not the sender's datagram
+        // size: the packet builder is still emitting that size, and #256-B
+        // revalidates the new path's PMTU separately.
+        self.congestion = .{
+            .bytes_in_flight = self.congestion.bytes_in_flight,
+            .max_datagram_size = self.congestion.max_datagram_size,
+            .congestion_window = CongestionController.initialWindow(self.congestion.max_datagram_size),
+        };
     }
 
     /// RFC 9002 §6.4: drop a packet-number space's tracked packets and ACK
@@ -639,12 +678,12 @@ test "NewReno baseline halves cwnd and persistent congestion uses minimum window
 
     cc.onPacketsLost(2_000, 1_200, 50_000);
     try testing.expectEqual(@as(usize, 1_600), cc.bytes_in_flight);
-    try testing.expect(cc.congestion_window >= min_congestion_window);
+    try testing.expect(cc.congestion_window >= cc.minWindow());
     try testing.expectEqual(cc.congestion_window, cc.ssthresh);
 
     cc.onPersistentCongestion();
-    try testing.expectEqual(@as(usize, min_congestion_window), cc.congestion_window);
-    try testing.expectEqual(@as(usize, min_congestion_window), cc.ssthresh);
+    try testing.expectEqual(cc.minWindow(), cc.congestion_window);
+    try testing.expectEqual(cc.minWindow(), cc.ssthresh);
 }
 
 test "NewReno recovery period prevents repeated cwnd cuts and old ACK growth" {
@@ -722,4 +761,116 @@ test "recovery controller wires ACK RTT loss congestion and events" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+// ---------------------------------------------------------------------------
+// #256-A: the sender's current maximum datagram size drives NewReno.
+// ---------------------------------------------------------------------------
+
+test "congestion: the initial and minimum windows follow the sender's datagram size" {
+    // RFC 9002 §7.2/§7.3 express both in terms of the sender's current max
+    // datagram size, so a 1452- or 2048-byte sender gets proportionally
+    // larger windows than the 1200-byte floor.
+    // min(10*mds, max(2*mds, 14720)) per RFC 9002 §7.2.
+    try testing.expectEqual(@as(usize, 12_000), CongestionController.initialWindow(1200));
+    try testing.expectEqual(@as(usize, 14_520), CongestionController.initialWindow(1452));
+    try testing.expectEqual(@as(usize, 14_720), CongestionController.initialWindow(2048));
+
+    var cc = CongestionController{};
+    try testing.expectEqual(@as(usize, 2 * 1200), cc.minWindow());
+    cc.setMaxDatagramSize(1452);
+    try testing.expectEqual(@as(usize, 2 * 1452), cc.minWindow());
+    cc.setMaxDatagramSize(2048);
+    try testing.expectEqual(@as(usize, 2 * 2048), cc.minWindow());
+}
+
+test "congestion: adopting a larger datagram size lifts a window below the new floor" {
+    var cc = CongestionController{};
+    cc.congestion_window = 2 * initial_max_datagram_size;
+    cc.setMaxDatagramSize(2048);
+    // The window is measured capacity and is not rescaled, but it can never
+    // sit below a floor that would block a single datagram pair.
+    try testing.expectEqual(@as(usize, 2 * 2048), cc.congestion_window);
+}
+
+test "congestion: avoidance growth is proportional to the sender's datagram size" {
+    const acked = SentPacket{ .space = .application, .packet_number = 1, .time_sent_us = 0, .size = 1200 };
+
+    var small = CongestionController{ .congestion_window = 30_000, .ssthresh = 1_000, .bytes_in_flight = 1200 };
+    small.onPacketAcked(acked);
+    const small_growth = small.congestion_window - 30_000;
+
+    var large = CongestionController{ .congestion_window = 30_000, .ssthresh = 1_000, .bytes_in_flight = 1200 };
+    large.setMaxDatagramSize(2048);
+    large.onPacketAcked(acked);
+    const large_growth = large.congestion_window - 30_000;
+
+    try testing.expectEqual(@as(usize, 1200 * 1200 / 30_000), small_growth);
+    try testing.expectEqual(@as(usize, 2048 * 1200 / 30_000), large_growth);
+    try testing.expect(large_growth > small_growth);
+}
+
+test "congestion: loss and persistent congestion respect the larger floor" {
+    var cc = CongestionController{ .congestion_window = 40_000, .bytes_in_flight = 4_000 };
+    cc.setMaxDatagramSize(2048);
+    cc.onPacketsLost(10, 4_000, 100);
+    try testing.expect(cc.congestion_window >= cc.minWindow());
+
+    cc.onPersistentCongestion();
+    try testing.expectEqual(@as(usize, 2 * 2048), cc.congestion_window);
+    try testing.expectEqual(@as(usize, 2 * 2048), cc.ssthresh);
+}
+
+test "recovery: a path migration resets the window but keeps the sender's datagram size" {
+    var controller = RecoveryController{};
+    controller.congestion.setMaxDatagramSize(1452);
+    controller.congestion.congestion_window = 90_000;
+    controller.congestion.ssthresh = 40_000;
+    controller.congestion.bytes_in_flight = 3_000;
+
+    controller.resetForPathMigration();
+
+    // The measured window is discarded (RFC 9002 §7.8) but the size the packet
+    // builder is still emitting is not.
+    try testing.expectEqual(@as(usize, 1452), controller.congestion.max_datagram_size);
+    try testing.expectEqual(
+        CongestionController.initialWindow(1452),
+        controller.congestion.congestion_window,
+    );
+    try testing.expectEqual(@as(usize, std.math.maxInt(usize)), controller.congestion.ssthresh);
+    try testing.expectEqual(@as(usize, 3_000), controller.congestion.bytes_in_flight);
+}
+
+test "recovery: a padded non-ack-eliciting packet is charged to the window" {
+    var controller = RecoveryController{};
+    try controller.onPacketSent(.{
+        .space = .initial,
+        .packet_number = 0,
+        .time_sent_us = 0,
+        .size = 1200,
+        .ack_eliciting = false,
+        .in_flight = true,
+    });
+    try testing.expectEqual(@as(usize, 1200), controller.congestion.bytes_in_flight);
+}
+
+test "recovery: the bounded tracker reports when it can no longer take a packet" {
+    var controller = RecoveryController{};
+    var i: usize = 0;
+    while (i < max_tracked_packets) : (i += 1) {
+        try testing.expect(controller.canTrackPacket());
+        try controller.onPacketSent(.{
+            .space = .application,
+            .packet_number = i,
+            .time_sent_us = i,
+            .size = 100,
+        });
+    }
+    try testing.expect(!controller.canTrackPacket());
+    try testing.expectError(error.TooManyTrackedPackets, controller.onPacketSent(.{
+        .space = .application,
+        .packet_number = max_tracked_packets,
+        .time_sent_us = 9_999,
+        .size = 100,
+    }));
 }

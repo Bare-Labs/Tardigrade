@@ -25,52 +25,45 @@ pub const base_size: usize = 1200;
 /// so raising it means raising those too.
 pub const max_size: usize = 2048;
 
-/// The inputs to the effective outbound datagram cap. Every field is an upper
-/// bound in its own right; the cap is the smallest of them, clamped to
-/// `[base_size, max_size]`.
+/// The inputs to the outbound datagram limits.
+///
+/// These are *send*-side quantities. They are deliberately separate from the
+/// `max_udp_payload_size` transport parameter an endpoint advertises, which is
+/// what that endpoint is willing to *receive* (RFC 9000 §18.2) — an immutable
+/// statement of receive capacity, not mutable path state. Only the peer's
+/// advertisement appears here, as a ceiling on what we may send it.
 pub const Limits = struct {
-    /// The locally configured maximum (`quic.config.Config.max_udp_payload_size`).
-    /// This is the operator's assertion about what the local host and path
-    /// can carry.
-    local_max: u64 = base_size,
-    /// The peer's advertised `max_udp_payload_size` transport parameter, once
-    /// transport parameters have been authenticated. `null` before then, and
-    /// treated as `base_size`: during the handshake we know least about both
-    /// the peer and the path, so the cap collapses to the size RFC 9000 §14
-    /// guarantees. A raised `local_max` therefore only takes effect once the
-    /// peer has actually committed to accepting larger datagrams.
+    /// The sender's current maximum datagram size for the active path: what
+    /// this stack believes the path carries today. Starts at `base_size`, the
+    /// only size RFC 9000 §14 guarantees. An operator may assert a larger
+    /// value for a path whose MTU they control; #256-B replaces the assertion
+    /// with measured DPLPMTUD state and black-hole fallback.
+    current_path_max: u64 = base_size,
+    /// The largest datagram this endpoint will ever emit, independent of what
+    /// the path has been shown to carry. This is the ceiling a PMTU probe may
+    /// reach for, so it must have headroom above `base_size` or #256-B could
+    /// never discover anything.
+    send_ceiling: u64 = max_size,
+    /// The peer's advertised `max_udp_payload_size`: its receive capacity,
+    /// once transport parameters have been authenticated. `null` before then,
+    /// and treated as `base_size` — during the handshake we know least about
+    /// both the peer and the path, so everything collapses to the size RFC
+    /// 9000 §14 guarantees.
     peer_max: ?u64 = null,
-    /// The largest datagram size validated for the current path. `null` means
-    /// "not yet constrained by path measurement", in which case the locally
-    /// configured maximum stands in as the operator's path assertion.
-    ///
-    /// #256-B replaces that with per-path DPLPMTUD (RFC 8899) state and
-    /// black-hole fallback; until it lands, the shipped default for
-    /// `local_max` is `base_size`, so the stack does not assume any path
-    /// carries more than the RFC floor unless an operator says so.
-    validated_path_max: ?u64 = null,
 
-    /// The largest ordinary UDP datagram that may be emitted under these
-    /// limits. Never below `base_size` (Initial padding and the RFC floor
-    /// both need it) and never above `max_size`.
+    /// The largest ordinary UDP datagram that may be emitted. Never below
+    /// `base_size` (Initial padding and the RFC floor both need it) and never
+    /// above `max_size`.
     pub fn effective(self: Limits) usize {
-        var cap = self.endpointCeiling();
-        if (self.validated_path_max) |path_max| cap = @min(cap, clampToRange(path_max));
-        return cap;
+        return @min(clampToRange(self.current_path_max), self.probeCeiling());
     }
 
-    /// The bound imposed by the two endpoints alone, ignoring what the path
-    /// has been shown to carry. A PMTU probe (#256-B) is allowed to exceed
-    /// `effective()` because exceeding the validated path size is the point,
-    /// but it must never exceed this: the peer will drop anything larger than
-    /// its advertised `max_udp_payload_size`, and the local ceiling bounds our
-    /// own buffers.
+    /// The largest datagram a PMTU probe (#256-B) may attempt. A probe is
+    /// allowed to exceed `effective()` — exceeding the current path size is
+    /// the point — but never this: the peer drops anything above its
+    /// advertised receive capacity, and the local ceiling bounds our buffers.
     pub fn probeCeiling(self: Limits) usize {
-        return self.endpointCeiling();
-    }
-
-    fn endpointCeiling(self: Limits) usize {
-        return @min(clampToRange(self.local_max), clampToRange(self.peer_max orelse base_size));
+        return @min(clampToRange(self.send_ceiling), clampToRange(self.peer_max orelse base_size));
     }
 };
 
@@ -87,67 +80,75 @@ fn clampToRange(value: u64) usize {
 
 const testing = std.testing;
 
-test "datagram: defaults sit at the RFC 9000 floor" {
+test "datagram: defaults send at the RFC 9000 floor" {
     const limits = Limits{};
     try testing.expectEqual(base_size, limits.effective());
+    // Pre-authentication the probe ceiling collapses too: the peer has not
+    // yet said it can receive more.
     try testing.expectEqual(base_size, limits.probeCeiling());
 }
 
-test "datagram: a larger local maximum raises the cap up to the ceiling" {
+test "datagram: an authenticated peer leaves probe headroom above the floor" {
+    // The default send ceiling must let #256-B probe upward once the peer's
+    // receive capacity is known; ordinary sends stay at the current path size.
+    const limits = Limits{ .peer_max = max_size };
+    try testing.expectEqual(base_size, limits.effective());
+    try testing.expectEqual(max_size, limits.probeCeiling());
+    try testing.expect(limits.probeCeiling() > limits.effective());
+}
+
+test "datagram: the current path size raises ordinary sends up to the ceiling" {
     try testing.expectEqual(
         @as(usize, 1452),
-        (Limits{ .local_max = 1452, .peer_max = 65_527 }).effective(),
+        (Limits{ .current_path_max = 1452, .peer_max = 65_527 }).effective(),
     );
     try testing.expectEqual(
         max_size,
-        (Limits{ .local_max = 65_527, .peer_max = 65_527 }).effective(),
+        (Limits{ .current_path_max = 65_527, .peer_max = 65_527 }).effective(),
     );
 }
 
-test "datagram: the cap stays at the floor until the peer's parameters arrive" {
-    // Nothing an operator configures locally may raise the cap while the
-    // peer has not yet committed to accepting larger datagrams.
-    try testing.expectEqual(base_size, (Limits{ .local_max = 1500 }).effective());
-    try testing.expectEqual(base_size, (Limits{ .local_max = max_size }).probeCeiling());
+test "datagram: nothing raises the send size until the peer's parameters arrive" {
+    try testing.expectEqual(base_size, (Limits{ .current_path_max = 1500 }).effective());
+    try testing.expectEqual(base_size, (Limits{ .send_ceiling = max_size }).probeCeiling());
 }
 
-test "datagram: the peer's advertised maximum lowers the cap" {
-    const limits = Limits{ .local_max = 1500, .peer_max = 1300 };
+test "datagram: the peer's advertised receive capacity lowers the send size" {
+    const limits = Limits{ .current_path_max = 1500, .peer_max = 1300 };
     try testing.expectEqual(@as(usize, 1300), limits.effective());
+    try testing.expectEqual(@as(usize, 1300), limits.probeCeiling());
 }
 
-test "datagram: a larger local maximum never overrides a smaller peer limit" {
-    const limits = Limits{ .local_max = max_size, .peer_max = 1200 };
+test "datagram: a larger local path size never overrides a smaller peer limit" {
+    const limits = Limits{ .current_path_max = max_size, .peer_max = base_size };
     try testing.expectEqual(base_size, limits.effective());
 }
 
-test "datagram: a larger peer maximum never raises the cap past the local one" {
-    const limits = Limits{ .local_max = 1300, .peer_max = 65_527 };
+test "datagram: a larger peer capacity never raises past the local path size" {
+    const limits = Limits{ .current_path_max = 1300, .peer_max = 65_527 };
     try testing.expectEqual(@as(usize, 1300), limits.effective());
 }
 
-test "datagram: the validated path size lowers the cap but never below the floor" {
-    try testing.expectEqual(
-        @as(usize, 1350),
-        (Limits{ .local_max = 1500, .peer_max = 1500, .validated_path_max = 1350 }).effective(),
-    );
-    try testing.expectEqual(
-        base_size,
-        (Limits{ .local_max = 1500, .peer_max = 1500, .validated_path_max = 900 }).effective(),
-    );
+test "datagram: the send ceiling bounds both ordinary sends and probes" {
+    const limits = Limits{ .current_path_max = max_size, .send_ceiling = 1400, .peer_max = max_size };
+    try testing.expectEqual(@as(usize, 1400), limits.effective());
+    try testing.expectEqual(@as(usize, 1400), limits.probeCeiling());
 }
 
-test "datagram: probes may exceed the validated path size but not the endpoint bounds" {
-    const limits = Limits{ .local_max = 1500, .peer_max = 1400, .validated_path_max = base_size };
+test "datagram: probes may exceed the current path size but not the endpoint bounds" {
+    const limits = Limits{ .current_path_max = base_size, .send_ceiling = 1500, .peer_max = 1400 };
     try testing.expectEqual(base_size, limits.effective());
     try testing.expectEqual(@as(usize, 1400), limits.probeCeiling());
 }
 
 test "datagram: out-of-range bounds are clamped rather than trusted" {
-    try testing.expectEqual(base_size, (Limits{ .local_max = 0, .peer_max = 65_527 }).effective());
-    try testing.expectEqual(base_size, (Limits{ .local_max = 1500, .peer_max = 0 }).effective());
+    try testing.expectEqual(base_size, (Limits{ .current_path_max = 0, .peer_max = 65_527 }).effective());
+    try testing.expectEqual(base_size, (Limits{ .current_path_max = 1500, .peer_max = 0 }).effective());
     try testing.expectEqual(
         max_size,
-        (Limits{ .local_max = std.math.maxInt(u64), .peer_max = std.math.maxInt(u64) }).effective(),
+        (Limits{
+            .current_path_max = std.math.maxInt(u64),
+            .peer_max = std.math.maxInt(u64),
+        }).effective(),
     );
 }

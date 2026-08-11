@@ -66,6 +66,12 @@ pub const base_datagram_size: usize = quic_datagram.base_size;
 /// per-packet plaintext scratch buffers below. An `out` buffer larger than
 /// this is simply not used past the effective cap.
 pub const max_datagram_size_ceiling: usize = quic_datagram.max_size;
+/// The largest UDP payload `ingest` can deprotect, and therefore the receive
+/// capacity this endpoint may advertise as `max_udp_payload_size`. Every
+/// receive scratch buffer below derives from it, and `config.validate()`
+/// rejects an advertisement above it, so the promise and the buffers cannot
+/// drift apart.
+pub const max_receive_datagram_size: usize = quic_datagram.max_size;
 pub const max_application_crypto_outstanding: usize = 2 * tls_core.tls13_transport.max_emitted_new_session_ticket_message_len;
 const min_application_crypto_payload: usize = base_datagram_size / 2;
 /// RFC 9000 §14.1: datagrams carrying Initial packets are padded to 1200.
@@ -726,6 +732,10 @@ const SentRecord = struct {
     /// re-challenges instead), so it needs no requeue-identifying field.
     carried_path_challenge_path: ?quic_path.PathKey = null,
     carried_path_response: bool = false,
+    /// RFC 9002 §2: PADDING makes a packet count as in flight even when it
+    /// carries nothing ack-eliciting, so it must still be tracked and charged
+    /// to the congestion window.
+    carried_padding: bool = false,
     carried_ack_largest: ?u64 = null,
 
     const StreamRange = struct {
@@ -740,6 +750,15 @@ const SentRecord = struct {
 /// copies, requeues, or discards a `SentRecord` mints or drops an
 /// independent copy of it; each of those copies must be scrubbed once it is
 /// no longer needed rather than left for the allocator to reclaim unwiped.
+/// RFC 9002 §2: a packet is *in flight* when it is ack-eliciting **or**
+/// carries PADDING. The two are not synonymous — a padded ACK-only Initial is
+/// not ack-eliciting yet still consumes congestion window and must be tracked,
+/// so the send path keys recovery accounting off this rather than off
+/// `ack_eliciting` alone (#256-A review).
+fn recordIsInFlight(record: SentRecord) bool {
+    return record.ack_eliciting or record.carried_padding;
+}
+
 fn wipeSentRecordToken(record: *SentRecord) void {
     if (record.has_new_connection_id) crypto_secrets.secureZero(&record.carried_new_connection_id.stateless_reset_token);
 }
@@ -1095,30 +1114,40 @@ pub const Connection = struct {
         return self.adapter.peerTransportParameters();
     }
 
-    /// The bounds that decide how large an outbound datagram may be (#256-A).
-    /// Derived on demand rather than cached so a peer's transport parameters
-    /// take effect the moment they are authenticated, with no separate
-    /// invalidation step to get wrong.
+    /// The send-side bounds on an outbound datagram (#256-A). Derived on
+    /// demand rather than cached so a peer's transport parameters take effect
+    /// the moment they are authenticated, with no separate invalidation step
+    /// to get wrong.
+    ///
+    /// Note the asymmetry: `cfg.max_udp_payload_size` is *our* receive
+    /// capacity and never appears here, while the peer's advertisement of the
+    /// same parameter is *its* receive capacity and bounds everything we send.
     pub fn datagramLimits(self: *const Connection) quic_datagram.Limits {
         return .{
-            .local_max = self.cfg.max_udp_payload_size,
+            // #256-B replaces this operator assertion with measured per-path
+            // DPLPMTUD state; it defaults to the RFC 9000 §14 floor.
+            .current_path_max = self.cfg.max_send_udp_payload_size,
+            .send_ceiling = quic_datagram.max_size,
             .peer_max = if (self.adapter.peerTransportParameters()) |peer|
                 peer.max_udp_payload_size
             else
                 null,
-            // #256-B fills this in from per-path DPLPMTUD state. Until then
-            // the locally configured maximum is the operator's path assertion,
-            // and it defaults to the RFC 9000 §14 floor.
-            .validated_path_max = null,
         };
     }
 
     /// The one authoritative cap on an ordinary outbound UDP datagram: the
-    /// smallest of the locally configured maximum, the peer's advertised
-    /// `max_udp_payload_size` once authenticated, and the validated path size.
-    /// Never below `base_datagram_size`, so Initial padding always fits.
+    /// smallest of the current path size, this endpoint's send ceiling, and
+    /// the peer's advertised receive capacity once authenticated. Never below
+    /// `base_datagram_size`, so Initial padding always fits.
     pub fn effectiveMaxDatagramSize(self: *const Connection) usize {
         return self.datagramLimits().effective();
+    }
+
+    /// The largest datagram a PMTU probe may attempt (#256-B's upper bound).
+    /// Exposed now so the probe ceiling is part of the same authoritative
+    /// model rather than something the next slice re-derives.
+    pub fn probeMaxDatagramSize(self: *const Connection) usize {
+        return self.datagramLimits().probeCeiling();
     }
 
     pub fn closeInfo(self: *const Connection) ?CloseInfo {
@@ -1308,7 +1337,7 @@ pub const Connection = struct {
         }
 
         // Header protection removal needs a sample 4 bytes past pn_offset.
-        var work: [2048]u8 = undefined;
+        var work: [max_receive_datagram_size]u8 = undefined;
         if (bytes.len > work.len) {
             self.dropPacket(.malformed, bytes.len);
             self.emitZeroRttOutcome(level, .malformed, bytes.len);
@@ -1371,7 +1400,7 @@ pub const Connection = struct {
 
         const header = work[0 .. parsed.pn_offset + removed.packet_number_length];
         const ciphertext = work[parsed.pn_offset + removed.packet_number_length .. parsed.packet_len];
-        var plain: [2048]u8 = undefined;
+        var plain: [max_receive_datagram_size]u8 = undefined;
         const payload = keys.openPayloadWithProvider(self.adapter.provider, pn, header, ciphertext, &plain) catch {
             self.adapter.metrics.deprotection_failures += 1;
             self.dropPacket(.undecryptable, bytes.len);
@@ -2754,6 +2783,13 @@ pub const Connection = struct {
         if (self.state_ == .closed or self.state_ == .draining) return null;
         if (out.len < base_datagram_size) return null;
 
+        // RFC 9002 expresses every NewReno window in terms of the sender's
+        // *current* maximum datagram size, so recovery has to follow what the
+        // builder actually emits (#256-A). Refreshed here, before any gate
+        // reads it, rather than cached at init: the effective size changes the
+        // moment the peer's transport parameters authenticate.
+        self.recovery.congestion.setMaxDatagramSize(self.effectiveMaxDatagramSize());
+
         if (self.state_ == .closing) {
             if (!self.close_needs_send) return null;
             self.close_needs_send = false;
@@ -2868,9 +2904,10 @@ pub const Connection = struct {
 
     /// Assemble, seal, and record one control-only datagram for `path`: a
     /// queued PATH_RESPONSE and/or an outstanding PATH_CHALLENGE, padded per
-    /// RFC 9000 §8.2.1, gated strictly by that path's own anti-amplification
-    /// budget. Never carries ACK/STREAM/CRYPTO/flow-control/CID-management
-    /// content — that stays exclusively on the active path until promotion.
+    /// RFC 9000 §8.2.1, gated by that path's own anti-amplification budget and
+    /// by congestion control. Never carries ACK/STREAM/CRYPTO/flow-control/
+    /// CID-management content — that stays exclusively on the active path
+    /// until promotion.
     fn buildCandidatePacket(self: *Connection, path: quic_path.PathKey, out: []u8, now_us: u64) ?Transmit {
         if (out.len < base_datagram_size) return null;
         var keys = (self.adapter.protectionKeys(.application, .write) catch unreachable) orelse return null;
@@ -2883,6 +2920,19 @@ pub const Connection = struct {
         // ordinary traffic. They are padded to `min_initial_datagram`, which
         // the cap's floor guarantees room for.
         const budget = @min(out.len, self.effectiveMaxDatagramSize());
+
+        // A path-validation packet is ack-eliciting and padded to 1200, so it
+        // is in flight like any other — it is not an RFC 9002 PTO probe, and
+        // RFC 9000 §8.2 explicitly allows path validation to be delayed by
+        // congestion control. Gate before anything is dequeued: nothing below
+        // may remove a PATH_RESPONSE or clear `needs_send` for a packet that
+        // is not allowed out. The recovery tracker is preflighted for the same
+        // reason as on the ordinary path — an untracked in-flight packet would
+        // escape both loss detection and the window.
+        if (!self.recovery.canTrackPacket()) return null;
+        const cwnd_room = self.recovery.congestion.congestion_window -| self.recovery.congestion.bytes_in_flight;
+        const planned_total: usize = @min(min_initial_datagram, @min(budget, std.math.lossyCast(usize, remaining)));
+        if (planned_total > cwnd_room and self.recovery.congestion.bytes_in_flight != 0) return null;
 
         const space_idx = spaceIndex(.application);
         const pn = self.next_pn[space_idx];
@@ -2970,6 +3020,9 @@ pub const Connection = struct {
                 .ack_eliciting = true,
                 .in_flight = true,
             }) catch {
+                // Preflighted above; charge the window regardless so this
+                // cannot become a congestion-control bypass.
+                self.recovery.congestion.onPacketSent(total);
                 tracked = false;
             };
             self.last_ack_eliciting_sent_us[space_idx] = now_us;
@@ -3011,11 +3064,17 @@ pub const Connection = struct {
         const space_idx = spaceIndex(space);
         const probe = self.probes_pending[space_idx] > 0;
 
-        // Congestion gate: in-flight (ack-eliciting) bytes need window; pure
-        // ACK packets and PTO probes are exempt (RFC 9002 §7, §6.2.4).
+        // Congestion gate: in-flight bytes need window; pure ACK packets and
+        // PTO probes are exempt (RFC 9002 §7, §6.2.4).
         const cwnd_room = self.recovery.congestion.congestion_window -| self.recovery.congestion.bytes_in_flight;
-        const can_send_data = probe or cwnd_room >= recovery.max_datagram_size / 2 or
-            self.recovery.congestion.bytes_in_flight == 0;
+        // Recovery's tracker is bounded. An in-flight packet it cannot track
+        // would escape both loss detection and the congestion window, so
+        // preflight a slot here — before any frame is dequeued — and fall back
+        // to ACK-only output rather than sending something uncharged.
+        const can_track = self.recovery.canTrackPacket();
+        const can_send_data = can_track and (probe or
+            cwnd_room >= self.recovery.congestion.max_datagram_size / 2 or
+            self.recovery.congestion.bytes_in_flight == 0);
 
         // Anti-amplification gate applies to every byte a server sends before
         // the client's address is validated. Ordinary output always targets
@@ -3023,6 +3082,29 @@ pub const Connection = struct {
         // and gated separately by `buildCandidatePacket`).
         const amp_room = self.paths.activePath().anti_amplification.remaining();
         if (amp_room == 0) return null;
+
+        // RFC 9000 §14.1 expands an Initial-bearing datagram to 1200 whatever
+        // it carries, and recovery charges that padded size — so the padding
+        // has to be budgeted before anything is built, not discovered after
+        // the frames are already committed. The zero-in-flight escape keeps
+        // the very first flight sendable.
+        const initial_pad_target: usize = if (ctx.datagram_has_initial and ctx.is_last_level)
+            min_initial_datagram -| ctx.datagram_so_far
+        else
+            0;
+        if (!probe and initial_pad_target > cwnd_room and self.recovery.congestion.bytes_in_flight != 0) {
+            return null;
+        }
+
+        // Same rule for a PATH_RESPONSE riding on the active path: it forces
+        // the datagram to 1200 (§8.2.1-2). RFC 9000 §8.2 explicitly permits
+        // path validation to be delayed by congestion control, so when the
+        // padded size does not fit, the response stays queued rather than
+        // being sent uncharged.
+        const path_response_final: usize = min_initial_datagram -| ctx.datagram_so_far;
+        const allow_path_response = probe or
+            path_response_final <= cwnd_room or
+            self.recovery.congestion.bytes_in_flight == 0;
 
         var want_ack = self.ack_needed[space_idx];
         if (space == .application and want_ack) {
@@ -3038,7 +3120,7 @@ pub const Connection = struct {
             .application => !self.crypto_tx[2].pending.isEmpty(),
         };
         const has_app = space == .application and self.hasAppContent();
-        if (!want_ack and !has_crypto and !(has_app and can_send_data) and !probe) return null;
+        if (!want_ack and !has_crypto and !(has_app and can_send_data) and !(probe and can_track)) return null;
         if ((has_crypto or has_app) and !can_send_data and !want_ack and !probe) return null;
 
         // Header sizing.
@@ -3159,7 +3241,7 @@ pub const Connection = struct {
 
         // 3) Application-space control and stream frames
         if (space == .application and self.state_ == .established and (can_send_data or probe)) {
-            plain_len = self.buildAppFrames(&record, &plain, plain_len, data_budget);
+            plain_len = self.buildAppFrames(&record, &plain, plain_len, data_budget, allow_path_response);
         }
 
         // 4) Probe padding: a PTO probe with nothing else carries a PING.
@@ -3185,12 +3267,15 @@ pub const Connection = struct {
         // content; `buildCandidatePacket` pads candidate-path probes itself.
         // `plain_budget` already reflects the anti-amplification allowance,
         // which §8.2.1 lets cap the expansion.
-        if ((ctx.datagram_has_initial and ctx.is_last_level) or record.carried_path_response) {
-            const target = min_initial_datagram -| ctx.datagram_so_far;
+        if (initial_pad_target > 0 or record.carried_path_response) {
+            const target = @max(initial_pad_target, if (record.carried_path_response) path_response_final else 0);
             if (packet_overhead + plain_len < target and target <= plain_budget + packet_overhead) {
                 const padded = target - packet_overhead;
                 @memset(plain[plain_len..padded], 0);
                 plain_len = padded;
+                // RFC 9002 §2: a packet carrying PADDING is in flight even
+                // when nothing in it is ack-eliciting.
+                record.carried_padding = true;
             }
         }
 
@@ -3215,24 +3300,30 @@ pub const Connection = struct {
         const total = pn_offset + pn_len + sealed.len;
         self.next_pn[space_idx] = pn + 1;
 
-        // 7) Record for recovery. Non-ack-eliciting packets (pure ACKs) are
-        // never acknowledged by the peer, so tracking them would only fill
-        // the tracker; RFC 9002 excludes them from loss/congestion anyway.
-        if (record.ack_eliciting) {
+        // 7) Record for recovery. A packet is *in flight* when it is
+        // ack-eliciting or carries PADDING (RFC 9002 §2) — the two are not
+        // synonymous, and a padded non-ack-eliciting packet that skipped this
+        // would escape the congestion window entirely. A pure ACK really is
+        // exempt: the peer never acknowledges it, so tracking it would only
+        // consume tracker slots.
+        if (recordIsInFlight(record)) {
             var tracked = true;
             self.recovery.onPacketSent(.{
                 .space = space,
                 .packet_number = pn,
                 .time_sent_us = now_us,
                 .size = total,
-                .ack_eliciting = true,
+                .ack_eliciting = record.ack_eliciting,
                 .in_flight = true,
             }) catch {
-                // Tracker exhaustion: the packet is sealed and will be sent;
-                // treat it as untracked best-effort.
+                // `can_track` preflighted a slot before any frame was
+                // dequeued, so this is unreachable in practice. Charge the
+                // bytes anyway rather than letting an in-flight packet escape
+                // the congestion window.
+                self.recovery.congestion.onPacketSent(total);
                 tracked = false;
             };
-            self.last_ack_eliciting_sent_us[space_idx] = now_us;
+            if (record.ack_eliciting) self.last_ack_eliciting_sent_us[space_idx] = now_us;
             if (tracked) publishSentRecord(self, &record);
         }
         if (record.has_new_connection_id) {
@@ -3280,7 +3371,14 @@ pub const Connection = struct {
         return false;
     }
 
-    fn buildAppFrames(self: *Connection, record: *SentRecord, plain: []u8, start_len: usize, budget: usize) usize {
+    fn buildAppFrames(
+        self: *Connection,
+        record: *SentRecord,
+        plain: []u8,
+        start_len: usize,
+        budget: usize,
+        allow_path_response: bool,
+    ) usize {
         var plain_len = start_len;
 
         if (self.handshake_done_pending and self.role == .server) {
@@ -3353,7 +3451,7 @@ pub const Connection = struct {
         // ordinary content; one queued for a candidate path is sent in
         // isolation by `buildCandidatePacket` instead (candidate-path egress
         // must never carry ACK/STREAM/CRYPTO/flow-control content).
-        {
+        if (allow_path_response) {
             const active_key = self.paths.activePath().key;
             var i: usize = 0;
             while (i < self.pending_path_responses.items.len) {
@@ -7827,7 +7925,7 @@ fn openServerResponseStream(pair: *TestPair) !StreamId {
 
 test "driver: a raised local maximum is enforced by the datagrams actually emitted" {
     const allocator = testing.allocator;
-    const raised = config.Config{ .max_udp_payload_size = 1452 };
+    const raised = config.Config{ .max_send_udp_payload_size = 1452 };
     var pair = try TestPair.initWithConfigs(allocator, raised, raised);
     defer pair.deinit(allocator);
     try pair.pump();
@@ -7854,7 +7952,7 @@ test "driver: the peer's advertised maximum lowers the effective cap" {
     var pair = try TestPair.initWithConfigs(
         allocator,
         .{ .max_udp_payload_size = base_datagram_size },
-        .{ .max_udp_payload_size = max_datagram_size_ceiling },
+        .{ .max_send_udp_payload_size = max_datagram_size_ceiling },
     );
     defer pair.deinit(allocator);
     try pair.pump();
@@ -7876,7 +7974,7 @@ test "driver: the peer's advertised maximum lowers the effective cap" {
 
 test "driver: the cap stays at the floor until the peer's transport parameters arrive" {
     const allocator = testing.allocator;
-    const raised = config.Config{ .max_udp_payload_size = max_datagram_size_ceiling };
+    const raised = config.Config{ .max_send_udp_payload_size = max_datagram_size_ceiling };
     var pair = try TestPair.initWithConfigs(allocator, raised, raised);
     defer pair.deinit(allocator);
 
@@ -7899,7 +7997,7 @@ test "driver: the cap stays at the floor until the peer's transport parameters a
 
 test "driver: a raised local maximum does not widen the anti-amplification budget" {
     const allocator = testing.allocator;
-    const raised = config.Config{ .max_udp_payload_size = max_datagram_size_ceiling };
+    const raised = config.Config{ .max_send_udp_payload_size = max_datagram_size_ceiling };
     var pair = try TestPair.initWithConfigs(allocator, raised, raised);
     defer pair.deinit(allocator);
 
@@ -7920,7 +8018,7 @@ test "driver: a raised local maximum does not widen the anti-amplification budge
 
 test "driver: raising the cap leaves packet-number and congestion accounting intact" {
     const allocator = testing.allocator;
-    const raised = config.Config{ .max_udp_payload_size = 1452 };
+    const raised = config.Config{ .max_send_udp_payload_size = 1452 };
     var pair = try TestPair.initWithConfigs(allocator, raised, raised);
     defer pair.deinit(allocator);
     try pair.pump();
@@ -7944,7 +8042,7 @@ test "driver: raising the cap leaves packet-number and congestion accounting int
 
 test "driver: a raised datagram cap cannot widen the congestion overshoot" {
     const allocator = testing.allocator;
-    const raised = config.Config{ .max_udp_payload_size = max_datagram_size_ceiling };
+    const raised = config.Config{ .max_send_udp_payload_size = max_datagram_size_ceiling };
     var pair = try TestPair.initWithConfigs(allocator, raised, raised);
     defer pair.deinit(allocator);
     try pair.pump();
@@ -7977,7 +8075,7 @@ test "driver: a raised datagram cap cannot widen the congestion overshoot" {
 
 test "driver: a PTO probe keeps its congestion exemption under a raised cap" {
     const allocator = testing.allocator;
-    const raised = config.Config{ .max_udp_payload_size = max_datagram_size_ceiling };
+    const raised = config.Config{ .max_send_udp_payload_size = max_datagram_size_ceiling };
     var pair = try TestPair.initWithConfigs(allocator, raised, raised);
     defer pair.deinit(allocator);
     try pair.pump();
@@ -8004,4 +8102,218 @@ test "driver: a PTO probe keeps its congestion exemption under a raised cap" {
     try testing.expect(probe.bytes.len > 0);
     try testing.expect(probe.bytes.len <= max_datagram_size_ceiling);
     try testing.expect(congestion.bytes_in_flight > congestion.congestion_window);
+}
+
+test "driver: the advertised receive capacity is separate from the send size" {
+    const allocator = testing.allocator;
+    // A conservative sender still advertises the full capacity it can
+    // actually deprotect: receive capability is not path state.
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    try testing.expectEqual(
+        @as(u64, max_receive_datagram_size),
+        pair.server.local_params.max_udp_payload_size,
+    );
+    try testing.expectEqual(
+        @as(u64, max_receive_datagram_size),
+        pair.client.peerTransportParameters().?.max_udp_payload_size,
+    );
+    // ... while ordinary sends stay at the RFC 9000 §14 floor by default.
+    try testing.expectEqual(base_datagram_size, pair.server.effectiveMaxDatagramSize());
+    try testing.expectEqual(base_datagram_size, pair.client.effectiveMaxDatagramSize());
+}
+
+test "driver: the default probe ceiling leaves headroom above the send size" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+
+    // Before authentication nothing may exceed the floor, in either role.
+    try testing.expectEqual(base_datagram_size, pair.client.probeMaxDatagramSize());
+
+    try pair.pump();
+    // Afterwards #256-B has somewhere to probe *to* without the operator
+    // having to pre-configure a larger value.
+    try testing.expectEqual(max_datagram_size_ceiling, pair.server.probeMaxDatagramSize());
+    try testing.expect(pair.server.probeMaxDatagramSize() > pair.server.effectiveMaxDatagramSize());
+}
+
+test "driver: a padded non-ack-eliciting packet counts as in flight" {
+    // RFC 9002 §2 — the predicate the send path keys recovery accounting off.
+    try testing.expect(recordIsInFlight(.{
+        .space = .initial,
+        .packet_number = 0,
+        .ack_eliciting = false,
+        .carried_padding = true,
+    }));
+    try testing.expect(recordIsInFlight(.{
+        .space = .application,
+        .packet_number = 0,
+        .ack_eliciting = true,
+    }));
+    // A genuine pure ACK stays exempt.
+    try testing.expect(!recordIsInFlight(.{
+        .space = .application,
+        .packet_number = 0,
+        .ack_eliciting = false,
+    }));
+}
+
+/// Queue a PATH_RESPONSE for `conn`'s own active path, the way an inbound
+/// PATH_CHALLENGE on that path would.
+fn queueActivePathResponse(allocator: std.mem.Allocator, conn: *Connection) !void {
+    try conn.pending_path_responses.append(allocator, .{
+        .path = conn.paths.activePath().key,
+        .data = [_]u8{0xa7} ** quic_path.path_challenge_len,
+    });
+}
+
+test "driver: an active-path PATH_RESPONSE waits for window for its padded size" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.initWithConfigs(
+        allocator,
+        .{},
+        .{ .max_send_udp_payload_size = max_datagram_size_ceiling },
+    );
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    // Real bytes in flight first, so the window below is genuinely tight
+    // rather than zero (which every gate deliberately lets through).
+    const sid = try openServerResponseStream(pair);
+    _ = try pair.server.writeStream(sid, &[_]u8{0x22} ** 2048, false);
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |_| {
+        pair.now_us += 500;
+    }
+    const congestion = &pair.server.recovery.congestion;
+    try testing.expect(congestion.bytes_in_flight > 0);
+
+    try queueActivePathResponse(allocator, pair.server);
+
+    // Room enough to clear the send gate's half-datagram threshold, but less
+    // than the 1200 bytes RFC 9000 §8.2.1-2 forces the carrying datagram to —
+    // and recovery charges that padded size, not the frame's size. §8.2 lets
+    // validation be delayed, so the response stays queued.
+    const room: usize = max_datagram_size_ceiling / 2 + 64;
+    try testing.expect(room < min_initial_datagram);
+    congestion.congestion_window = congestion.bytes_in_flight + room;
+    const window_before = congestion.congestion_window;
+
+    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |t| {
+        try testing.expect(t.bytes.len < min_initial_datagram);
+        pair.now_us += 500;
+    }
+    try testing.expectEqual(@as(usize, 1), pair.server.pending_path_responses.items.len);
+    try testing.expect(congestion.bytes_in_flight <= window_before);
+
+    // Given room for the padded datagram it goes out, still inside the window.
+    congestion.congestion_window = congestion.bytes_in_flight + 4 * min_initial_datagram;
+    const window = congestion.congestion_window;
+    const in_flight_before = congestion.bytes_in_flight;
+    const sent = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(min_initial_datagram, sent.bytes.len);
+    try testing.expectEqual(@as(usize, 0), pair.server.pending_path_responses.items.len);
+    try testing.expect(congestion.bytes_in_flight > in_flight_before);
+    try testing.expect(congestion.bytes_in_flight <= window);
+}
+
+test "driver: candidate-path validation traffic waits for congestion window" {
+    const allocator = testing.allocator;
+    var pair = try MigrationPair.init(allocator, .full);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    // Put real bytes in flight on the active path first, so the window can be
+    // genuinely spent rather than merely zero.
+    const server_sid = try pair.server.openStream(.bidi);
+    const response = [_]u8{0x31} ** (8 * 1024);
+    _ = try pair.server.writeStream(server_sid, &response, false);
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |_| {
+        pair.now_us += 500;
+    }
+    const congestion = &pair.server.recovery.congestion;
+    try testing.expect(congestion.bytes_in_flight > 0);
+
+    // A datagram from a rebound address opens a candidate path and credits it
+    // enough anti-amplification budget for a padded PATH_CHALLENGE.
+    const sid = try pair.client.openStream(.bidi);
+    const big_payload = [_]u8{0x42} ** 900;
+    _ = try pair.client.writeStream(sid, &big_payload, false);
+    var buf: [max_datagram_size_ceiling]u8 = undefined;
+    const from_client = pair.client.pollTransmitOnPath(&buf, pair.now_us) orelse return error.TestExpectedEqual;
+    try pair.server.ingestOnPath(from_client.bytes, rebind_candidate, TestPair.test_challenge_entropy, pair.now_us);
+
+    // With the window spent, path validation is delayed (RFC 9000 §8.2) rather
+    // than sent without being charged: nothing goes to the candidate path.
+    congestion.congestion_window = congestion.bytes_in_flight;
+    const in_flight_before = congestion.bytes_in_flight;
+    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |t| {
+        try testing.expect(!t.path.eql(rebind_candidate));
+        pair.now_us += 500;
+    }
+    try testing.expectEqual(in_flight_before, congestion.bytes_in_flight);
+
+    // Once there is window for the padded probe it transmits and is charged.
+    congestion.congestion_window = congestion.bytes_in_flight + 4 * min_initial_datagram;
+    const window = congestion.congestion_window;
+    const probe = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    try testing.expect(probe.path.eql(rebind_candidate));
+    try testing.expect(congestion.bytes_in_flight > in_flight_before);
+    try testing.expect(congestion.bytes_in_flight <= window);
+}
+
+test "driver: a saturated recovery tracker backpressures instead of sending untracked" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.initWithConfigs(
+        allocator,
+        .{},
+        .{ .max_send_udp_payload_size = 1452 },
+    );
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const sid = try openServerResponseStream(pair);
+    const payload = [_]u8{0x77} ** (64 * 1024);
+    _ = try pair.server.writeStream(sid, &payload, false);
+
+    // Plenty of window, but the bounded tracker is full: an in-flight packet
+    // it cannot track would escape both loss detection and the window.
+    const congestion = &pair.server.recovery.congestion;
+    congestion.congestion_window = 1 << 24;
+    var i: u64 = 0;
+    while (pair.server.recovery.canTrackPacket()) : (i += 1) {
+        try pair.server.recovery.tracker.onPacketSent(.{
+            .space = .initial,
+            .packet_number = 100_000 + i,
+            .time_sent_us = 1,
+            .size = 0,
+        });
+    }
+    try testing.expect(!pair.server.recovery.canTrackPacket());
+
+    const in_flight_before = congestion.bytes_in_flight;
+    const pn_before = pair.server.next_pn[Connection.spaceIndex(.application)];
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |t| {
+        // Only genuinely exempt content may still leave; nothing carrying the
+        // queued stream data does.
+        try testing.expect(t.bytes.len < base_datagram_size);
+        pair.now_us += 500;
+    }
+    try testing.expectEqual(in_flight_before, congestion.bytes_in_flight);
+    try testing.expect(pair.server.hasAppContent());
+
+    // Freeing a slot lets the next packet send, tracked and charged.
+    _ = pair.server.recovery.tracker.dropSpace(.initial);
+    try testing.expect(pair.server.recovery.canTrackPacket());
+    const tracked_before = pair.server.recovery.tracker.count;
+    const sent = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    try testing.expect(sent.bytes.len > base_datagram_size / 2);
+    try testing.expect(pair.server.recovery.tracker.count > tracked_before);
+    try testing.expect(congestion.bytes_in_flight >= in_flight_before + sent.bytes.len);
+    try testing.expect(pair.server.next_pn[Connection.spaceIndex(.application)] > pn_before);
 }

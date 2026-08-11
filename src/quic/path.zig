@@ -1458,7 +1458,7 @@ test "a real migration validates and requires congestion/RTT reset" {
     controller.congestion.onPacketSent(old_path_packet.size);
     controller.resetForPathMigration();
     try testing.expect(!controller.rtt.hasSample());
-    try testing.expectEqual(recovery.CongestionController.initialWindow(recovery.max_datagram_size), controller.congestion.congestion_window);
+    try testing.expectEqual(recovery.CongestionController.initialWindow(recovery.initial_max_datagram_size), controller.congestion.congestion_window);
     // Packets in flight on the old path stay in the single send ledger...
     try testing.expectEqual(@as(usize, 999), controller.congestion.bytes_in_flight);
     // ...and drain through the normal ack path without corrupting accounting.
