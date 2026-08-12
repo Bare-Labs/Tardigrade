@@ -250,6 +250,10 @@ pub const SentPacket = struct {
     /// about queue depth. Its bytes still leave the in-flight ledger; only the
     /// window reduction is withheld.
     pmtu_probe: bool = false,
+    /// True when an RTT sample existed before this packet was sent. RFC 9002
+    /// §7.6.2 requires persistent-congestion boundary packets to have been
+    /// sent after at least one RTT sample was available.
+    rtt_sample_available_at_send: bool = false,
 };
 
 pub const AckResult = struct {
@@ -279,6 +283,17 @@ pub const LossResult = struct {
 };
 
 pub const PacketTracker = struct {
+    const PersistentCandidate = struct {
+        active: bool = false,
+        start_us: u64 = 0,
+        end_us: u64 = 0,
+        boundaries_have_prior_rtt: bool = false,
+
+        fn reset(self: *PersistentCandidate) void {
+            self.* = .{};
+        }
+    };
+
     /// Fixed fast path. Ordinary traffic is bounded here and never consumes
     /// allocator-backed overflow.
     packets: [max_tracked_packets]SentPacket = undefined,
@@ -291,6 +306,9 @@ pub const PacketTracker = struct {
     recovery_overflow: std.ArrayList(SentPacket) = .empty,
     bytes_in_flight: usize = 0,
     largest_acked: [3]?u64 = .{ null, null, null },
+    persistent_candidates: [3]PersistentCandidate = .{ .{}, .{}, .{} },
+    acked_send_times: [3][16]u64 = [_][16]u64{[_]u64{0} ** 16} ** 3,
+    acked_send_time_counts: [3]usize = .{0} ** 3,
 
     pub fn deinit(self: *PacketTracker, allocator: std.mem.Allocator) void {
         self.recovery_overflow.deinit(allocator);
@@ -339,6 +357,8 @@ pub const PacketTracker = struct {
             const packet = self.packets[index];
             if (packet.space != space or packet.packet_number != packet_number or packet.lost) continue;
             if (packet.in_flight) self.bytes_in_flight -= packet.size;
+            self.noteAckedSendTime(space, packet.time_sent_us);
+            self.breakPersistentCandidateOnAck(space, packet.time_sent_us);
             self.noteLargestAcked(space, packet_number);
             self.removeAt(index);
             return .{
@@ -352,6 +372,8 @@ pub const PacketTracker = struct {
             const packet = self.recovery_overflow.items[overflow_index];
             if (packet.space != space or packet.packet_number != packet_number or packet.lost) continue;
             if (packet.in_flight) self.bytes_in_flight -= packet.size;
+            self.noteAckedSendTime(space, packet.time_sent_us);
+            self.breakPersistentCandidateOnAck(space, packet.time_sent_us);
             self.noteLargestAcked(space, packet_number);
             _ = self.recovery_overflow.orderedRemove(overflow_index);
             return .{
@@ -388,6 +410,61 @@ pub const PacketTracker = struct {
         }
     }
 
+    fn observePersistentCandidate(self: *PacketTracker, space: PacketNumberSpace, packet: SentPacket) void {
+        if (packet.pmtu_probe or !packet.ack_eliciting or !packet.in_flight) return;
+        const idx = spaceIndex(space);
+        var candidate = &self.persistent_candidates[idx];
+        if (!candidate.active) {
+            candidate.* = .{
+                .active = true,
+                .start_us = packet.time_sent_us,
+                .end_us = packet.time_sent_us,
+                .boundaries_have_prior_rtt = packet.rtt_sample_available_at_send,
+            };
+            return;
+        }
+        if (packet.time_sent_us < candidate.start_us) {
+            candidate.start_us = packet.time_sent_us;
+            candidate.boundaries_have_prior_rtt = candidate.boundaries_have_prior_rtt and packet.rtt_sample_available_at_send;
+        } else if (packet.time_sent_us > candidate.end_us) {
+            candidate.end_us = packet.time_sent_us;
+            candidate.boundaries_have_prior_rtt = candidate.boundaries_have_prior_rtt and packet.rtt_sample_available_at_send;
+        }
+        if (self.hasAckedSendTimeInCandidate(space, candidate.*)) candidate.reset();
+    }
+
+    fn noteAckedSendTime(self: *PacketTracker, space: PacketNumberSpace, time_sent_us: u64) void {
+        const idx = spaceIndex(space);
+        if (self.acked_send_time_counts[idx] < self.acked_send_times[idx].len) {
+            self.acked_send_times[idx][self.acked_send_time_counts[idx]] = time_sent_us;
+            self.acked_send_time_counts[idx] += 1;
+            return;
+        }
+        std.mem.copyForwards(u64, self.acked_send_times[idx][0 .. self.acked_send_times[idx].len - 1], self.acked_send_times[idx][1..]);
+        self.acked_send_times[idx][self.acked_send_times[idx].len - 1] = time_sent_us;
+    }
+
+    fn hasAckedSendTimeInCandidate(self: *const PacketTracker, space: PacketNumberSpace, candidate: PersistentCandidate) bool {
+        if (!candidate.active) return false;
+        const idx = spaceIndex(space);
+        for (self.acked_send_times[idx][0..self.acked_send_time_counts[idx]]) |time_sent_us| {
+            if (time_sent_us >= candidate.start_us and time_sent_us <= candidate.end_us) return true;
+        }
+        return false;
+    }
+
+    fn breakPersistentCandidateOnAck(self: *PacketTracker, space: PacketNumberSpace, time_sent_us: u64) void {
+        var candidate = &self.persistent_candidates[spaceIndex(space)];
+        if (!candidate.active) return;
+        if (time_sent_us >= candidate.start_us and time_sent_us <= candidate.end_us) candidate.reset();
+    }
+
+    fn persistentCongestionDuration(rtt: RttEstimator) ?u64 {
+        const smoothed = rtt.smoothed_rtt_us orelse return null;
+        const variance = rtt.rttvar_us orelse return null;
+        return (smoothed + @max(4 * variance, timer_granularity_us) + rtt.max_ack_delay_us) * 3;
+    }
+
     pub fn detectLost(self: *PacketTracker, space: PacketNumberSpace, now_us: u64, rtt: RttEstimator) LossResult {
         const largest = self.largest_acked[spaceIndex(space)] orelse return .{};
         const time_threshold = rtt.lossDelay();
@@ -407,6 +484,7 @@ pub const PacketTracker = struct {
                 continue;
             }
             noteLost(&result, packet, threshold_lost, time_lost);
+            self.observePersistentCandidate(space, packet);
             if (packet.in_flight) self.bytes_in_flight -= packet.size;
             self.removeAt(index);
         }
@@ -425,13 +503,15 @@ pub const PacketTracker = struct {
                 continue;
             }
             noteLost(&result, packet, threshold_lost, time_lost);
+            self.observePersistentCandidate(space, packet);
             if (packet.in_flight) self.bytes_in_flight -= packet.size;
             _ = self.recovery_overflow.orderedRemove(overflow_index);
         }
-        if (result.time_threshold_losses > 0 and result.earliest_ordinary_lost_time_sent_us != null) {
-            const earliest = result.earliest_ordinary_lost_time_sent_us.?;
-            const latest = result.largest_ordinary_lost_time_sent_us.?;
-            result.persistent_congestion = latest >= earliest and latest - earliest >= rtt.ptoDuration(space) * 3;
+        const candidate = self.persistent_candidates[spaceIndex(space)];
+        if (candidate.active and candidate.boundaries_have_prior_rtt) {
+            if (persistentCongestionDuration(rtt)) |duration| {
+                result.persistent_congestion = candidate.end_us >= candidate.start_us and candidate.end_us - candidate.start_us >= duration;
+            }
         }
         return result;
     }
@@ -660,13 +740,17 @@ pub const RecoveryController = struct {
 
     pub fn onPacketSentAssumeCapacity(self: *RecoveryController, packet: SentPacket) void {
         std.debug.assert(self.canTrackRecoveryPacket());
-        self.tracker.onPacketSentAssumeRecoveryCapacity(packet);
-        if (packet.in_flight) self.congestion.onPacketSent(packet.size);
+        var tracked = packet;
+        tracked.rtt_sample_available_at_send = self.rtt.smoothed_rtt_us != null;
+        self.tracker.onPacketSentAssumeRecoveryCapacity(tracked);
+        if (tracked.in_flight) self.congestion.onPacketSent(tracked.size);
     }
 
     pub fn onPacketSent(self: *RecoveryController, packet: SentPacket) error{TooManyTrackedPackets}!void {
-        try self.tracker.onPacketSent(packet);
-        if (packet.in_flight) self.congestion.onPacketSent(packet.size);
+        var tracked = packet;
+        tracked.rtt_sample_available_at_send = self.rtt.smoothed_rtt_us != null;
+        try self.tracker.onPacketSent(tracked);
+        if (tracked.in_flight) self.congestion.onPacketSent(tracked.size);
     }
 
     pub fn onAcked(self: *RecoveryController, space: PacketNumberSpace, packet_number: u64, now_us: u64, ack_delay_us: u64) void {
@@ -886,16 +970,85 @@ test "loss detection reports persistent congestion only for a real duration epis
     var tracker = PacketTracker{};
     var rtt = RttEstimator.init(0);
     rtt.update(100_000, 0);
-    const duration = rtt.ptoDuration(.application) * 3;
+    const duration = PacketTracker.persistentCongestionDuration(rtt).?;
 
-    try tracker.onPacketSent(.{ .space = .application, .packet_number = 1, .time_sent_us = 0, .size = 100 });
-    try tracker.onPacketSent(.{ .space = .application, .packet_number = 2, .time_sent_us = duration, .size = 100 });
-    try tracker.onPacketSent(.{ .space = .application, .packet_number = 3, .time_sent_us = duration + 1, .size = 100 });
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 1, .time_sent_us = 0, .size = 100, .rtt_sample_available_at_send = true });
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 2, .time_sent_us = duration, .size = 100, .rtt_sample_available_at_send = true });
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 3, .time_sent_us = duration + 1, .size = 100, .rtt_sample_available_at_send = true });
     _ = tracker.onAcked(.application, 3, duration + 2);
 
     const loss = tracker.detectLost(.application, duration * 2, rtt);
     try testing.expectEqual(@as(usize, 2), loss.time_threshold_losses);
     try testing.expect(loss.persistent_congestion);
+}
+
+test "persistent congestion ignores non-ack-eliciting boundaries and no-prior-rtt packets" {
+    var rtt = RttEstimator.init(0);
+    rtt.update(100_000, 0);
+    const duration = PacketTracker.persistentCongestionDuration(rtt).?;
+
+    var padding = PacketTracker{};
+    try padding.onPacketSent(.{ .space = .application, .packet_number = 1, .time_sent_us = 0, .size = 100, .ack_eliciting = false, .rtt_sample_available_at_send = true });
+    try padding.onPacketSent(.{ .space = .application, .packet_number = 2, .time_sent_us = duration, .size = 100, .ack_eliciting = false, .rtt_sample_available_at_send = true });
+    try padding.onPacketSent(.{ .space = .application, .packet_number = 3, .time_sent_us = duration + 1, .size = 100, .rtt_sample_available_at_send = true });
+    _ = padding.onAcked(.application, 3, duration + 2);
+    try testing.expect(!padding.detectLost(.application, duration * 2, rtt).persistent_congestion);
+
+    var no_prior = PacketTracker{};
+    try no_prior.onPacketSent(.{ .space = .application, .packet_number = 1, .time_sent_us = 0, .size = 100 });
+    try no_prior.onPacketSent(.{ .space = .application, .packet_number = 2, .time_sent_us = duration, .size = 100 });
+    try no_prior.onPacketSent(.{ .space = .application, .packet_number = 3, .time_sent_us = duration + 1, .size = 100, .rtt_sample_available_at_send = true });
+    _ = no_prior.onAcked(.application, 3, duration + 2);
+    try testing.expect(!no_prior.detectLost(.application, duration * 2, rtt).persistent_congestion);
+}
+
+test "persistent congestion resets on ACK inside candidate interval" {
+    var tracker = PacketTracker{};
+    var rtt = RttEstimator.init(0);
+    rtt.update(100_000, 0);
+    const duration = PacketTracker.persistentCongestionDuration(rtt).?;
+
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 1, .time_sent_us = 0, .size = 100, .rtt_sample_available_at_send = true });
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 2, .time_sent_us = duration / 2, .size = 100, .rtt_sample_available_at_send = true });
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 3, .time_sent_us = duration, .size = 100, .rtt_sample_available_at_send = true });
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 4, .time_sent_us = duration + 1, .size = 100, .rtt_sample_available_at_send = true });
+    _ = tracker.onAcked(.application, 2, duration + 2);
+    _ = tracker.onAcked(.application, 4, duration + 3);
+    try testing.expect(!tracker.detectLost(.application, duration * 2, rtt).persistent_congestion);
+}
+
+test "persistent congestion includes max_ack_delay outside application space" {
+    var rtt = RttEstimator.init(25_000);
+    rtt.update(100_000, 0);
+    const duration = PacketTracker.persistentCongestionDuration(rtt).?;
+    try testing.expect(duration > rtt.ptoDuration(.initial) * 3);
+
+    var tracker = PacketTracker{};
+    try tracker.onPacketSent(.{ .space = .initial, .packet_number = 1, .time_sent_us = 0, .size = 100, .rtt_sample_available_at_send = true });
+    try tracker.onPacketSent(.{ .space = .initial, .packet_number = 2, .time_sent_us = rtt.ptoDuration(.initial) * 3, .size = 100, .rtt_sample_available_at_send = true });
+    try tracker.onPacketSent(.{ .space = .initial, .packet_number = 3, .time_sent_us = duration + 1, .size = 100, .rtt_sample_available_at_send = true });
+    _ = tracker.onAcked(.initial, 3, duration + 2);
+    try testing.expect(!tracker.detectLost(.initial, duration * 2, rtt).persistent_congestion);
+}
+
+test "persistent congestion can come from packet-threshold loss across calls" {
+    var tracker = PacketTracker{};
+    var rtt = RttEstimator.init(0);
+    rtt.update(100_000, 0);
+    const duration = PacketTracker.persistentCongestionDuration(rtt).?;
+
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 1, .time_sent_us = 0, .size = 100, .rtt_sample_available_at_send = true });
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 2, .time_sent_us = duration, .size = 100, .rtt_sample_available_at_send = true });
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 3, .time_sent_us = duration + 1, .size = 100, .rtt_sample_available_at_send = true });
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 4, .time_sent_us = duration + 2, .size = 100, .rtt_sample_available_at_send = true });
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 5, .time_sent_us = duration + 3, .size = 100, .rtt_sample_available_at_send = true });
+    _ = tracker.onAcked(.application, 4, duration + 4);
+
+    const first = tracker.detectLost(.application, duration + 4, rtt);
+    try testing.expect(!first.persistent_congestion);
+    _ = tracker.onAcked(.application, 5, duration + 5);
+    const second = tracker.detectLost(.application, duration + 6, rtt);
+    try testing.expect(second.persistent_congestion);
 }
 
 test "NewReno baseline halves cwnd and persistent congestion uses minimum window" {

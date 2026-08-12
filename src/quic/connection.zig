@@ -133,6 +133,9 @@ pub const IngestError = error{OutOfMemory};
 pub const FlowControlScope = enum { connection, stream };
 pub const FlowControlState = enum { blocked, unblocked };
 pub const CongestionState = enum { slow_start, congestion_avoidance, recovery, persistent_congestion };
+pub const StreamSide = enum { sending, receiving };
+pub const StreamSideState = enum { ready, closed, reset_sent, reset_received };
+pub const StreamStateTrigger = enum { local, remote };
 
 pub const Event = union(enum) {
     state: State,
@@ -143,9 +146,9 @@ pub const Event = union(enum) {
     handshake_complete,
     handshake_confirmed,
     pto_fired: struct { space: PacketNumberSpace, count: u32 },
-    packets_acked: struct { space: PacketNumberSpace, packet_type: ?packet.PacketKind, largest_acknowledged: u64, acked_count: u64 },
+    packets_acked: struct { space: PacketNumberSpace, packet_number: u64 },
     packets_lost: struct { space: PacketNumberSpace, packet_type: ?packet.PacketKind, lost_count: u64, bytes: usize },
-    stream_state_changed: struct { id: StreamId, old: ?quic_stream.StreamState = null, new: quic_stream.StreamState },
+    stream_state_changed: struct { id: StreamId, side: StreamSide, old: ?StreamSideState = null, new: StreamSideState, trigger: ?StreamStateTrigger = null },
     congestion_state_changed: struct { old: CongestionState, new: CongestionState },
     persistent_congestion,
     recovery_metrics_updated: struct {
@@ -1792,17 +1795,13 @@ pub const Connection = struct {
                 const new = if (manager.get(sf.id)) |stream| stream.state() else null;
                 if (!self.known_streams.contains(sf.id)) {
                     try self.known_streams.put(sf.id, {});
-                    self.events.emit(.{ .stream_state_changed = .{ .id = sf.id, .new = .open } });
+                    self.emitStreamStateCreated(sf.id, new);
                     if (quic_stream.streamInitiator(sf.id) != roleInitiator(self.role)) {
                         try self.accept_queue.append(self.allocator, sf.id);
                     }
                 }
-                if (new) |new_state| {
-                    if (old) |old_state| {
-                        if (new_state != old_state) self.events.emit(.{ .stream_state_changed = .{ .id = sf.id, .old = old_state, .new = new_state } });
-                    } else if (new_state != .open) {
-                        self.events.emit(.{ .stream_state_changed = .{ .id = sf.id, .old = .open, .new = new_state } });
-                    }
+                if (old) |old_state| {
+                    if (new) |new_state| self.emitStreamStateTransition(sf.id, old_state, new_state, .remote);
                 }
                 if (level == .zero_rtt) {
                     // Sticky provenance (#523): bytes delivered while this
@@ -1828,11 +1827,8 @@ pub const Connection = struct {
                 if (manager.get(rs.id)) |stream| {
                     const new = stream.state();
                     if (old) |old_state| {
-                        if (new != old_state) self.events.emit(.{ .stream_state_changed = .{ .id = rs.id, .old = old_state, .new = new } });
-                    } else {
-                        self.events.emit(.{ .stream_state_changed = .{ .id = rs.id, .new = .open } });
-                        if (new != .open) self.events.emit(.{ .stream_state_changed = .{ .id = rs.id, .old = .open, .new = new } });
-                    }
+                        if (new != old_state) self.emitStreamStateTransition(rs.id, old_state, new, .remote);
+                    } else self.emitStreamStateCreated(rs.id, new);
                 }
             },
             .stop_sending => |ss| {
@@ -1843,10 +1839,14 @@ pub const Connection = struct {
                 };
                 self.events.emit(.{ .stop_sending = .{ .id = ss.id, .error_code = ss.app_error_code, .local = false } });
                 // RFC 9000 §3.5: a STOP_SENDING peer expects RESET_STREAM.
+                const old = if (manager.get(ss.id)) |stream| stream.state() else null;
                 if (manager.sendResetStream(ss.id, ss.app_error_code)) |reset| {
                     try self.pending_resets.append(self.allocator, reset);
                     self.forgetLocalStreamFlowBlocked(ss.id);
                     self.events.emit(.{ .stream_reset = .{ .id = ss.id, .error_code = ss.app_error_code, .local = true } });
+                    if (old) |old_state| {
+                        if (manager.get(ss.id)) |stream| self.emitStreamStateTransition(ss.id, old_state, stream.state(), .remote);
+                    }
                     if (self.send_queues.get(ss.id)) |queue| queue.reset_sent = true;
                 } else |_| {}
             },
@@ -2015,8 +2015,6 @@ pub const Connection = struct {
         // Ack every tracked packet covered by the ranges. The RTT sample only
         // comes from the largest acked packet (RFC 9002 §5.1).
         var acked_count: u64 = 0;
-        var acked_packet_type: ?packet.PacketKind = null;
-        var acked_packet_types_mixed = false;
         var index: usize = 0;
         while (index < self.sent_records.items.len) {
             const record = &self.sent_records.items[index];
@@ -2026,11 +2024,7 @@ pub const Connection = struct {
             }
             if (self.recovery.tracker.onAcked(space, record.packet_number, now_us)) |acked| {
                 acked_count += 1;
-                if (acked_packet_type) |kind| {
-                    if (kind != record.packet_type) acked_packet_types_mixed = true;
-                } else {
-                    acked_packet_type = record.packet_type;
-                }
+                self.events.emit(.{ .packets_acked = .{ .space = space, .packet_number = record.packet_number } });
                 const before_congestion = self.congestionState();
                 self.recovery.congestion.onPacketAcked(acked.packet);
                 self.emitCongestionStateChange(before_congestion);
@@ -2062,14 +2056,6 @@ pub const Connection = struct {
         // A validated ACK ends the current PTO backoff episode.
         const pto_was_nonzero = self.pto_count != 0;
         self.pto_count = 0;
-        if (acked_count > 0) {
-            self.events.emit(.{ .packets_acked = .{
-                .space = space,
-                .packet_type = if (acked_packet_types_mixed) null else acked_packet_type,
-                .largest_acknowledged = ack.largest_acknowledged,
-                .acked_count = acked_count,
-            } });
-        }
         if (acked_count > 0 or pto_was_nonzero) {
             self.emitRecoveryMetrics();
         }
@@ -2190,11 +2176,52 @@ pub const Connection = struct {
         _ = self.local_stream_flow_blocked.remove(id);
     }
 
+    fn streamSideState(stream_state: quic_stream.StreamState, side: StreamSide) StreamSideState {
+        return switch (side) {
+            .sending => switch (stream_state) {
+                .open, .half_closed_remote, .reset_received => .ready,
+                .half_closed_local, .closed => .closed,
+                .reset_sent => .reset_sent,
+            },
+            .receiving => switch (stream_state) {
+                .open, .half_closed_local, .reset_sent => .ready,
+                .half_closed_remote, .closed => .closed,
+                .reset_received => .reset_received,
+            },
+        };
+    }
+
+    fn emitStreamStateCreated(self: *Connection, id: StreamId, maybe_state: ?quic_stream.StreamState) void {
+        const stream_state = maybe_state orelse .open;
+        for ([_]StreamSide{ .sending, .receiving }) |side| {
+            self.events.emit(.{ .stream_state_changed = .{
+                .id = id,
+                .side = side,
+                .new = streamSideState(stream_state, side),
+            } });
+        }
+    }
+
+    fn emitStreamStateTransition(self: *Connection, id: StreamId, old: quic_stream.StreamState, new: quic_stream.StreamState, trigger: ?StreamStateTrigger) void {
+        for ([_]StreamSide{ .sending, .receiving }) |side| {
+            const old_side = streamSideState(old, side);
+            const new_side = streamSideState(new, side);
+            if (old_side == new_side) continue;
+            self.events.emit(.{ .stream_state_changed = .{
+                .id = id,
+                .side = side,
+                .old = old_side,
+                .new = new_side,
+                .trigger = trigger,
+            } });
+        }
+    }
+
     fn emitStreamStateIfChanged(self: *Connection, id: StreamId, old: quic_stream.StreamState) void {
         var manager = self.streamManager() orelse return;
         const stream = manager.get(id) orelse return;
         const new = stream.state();
-        if (new != old) self.events.emit(.{ .stream_state_changed = .{ .id = id, .old = old, .new = new } });
+        if (new != old) self.emitStreamStateTransition(id, old, new, .local);
     }
 
     fn emitPeerFlowBlocked(self: *Connection, scope: FlowControlScope, stream_id: ?StreamId) void {
@@ -3092,7 +3119,7 @@ pub const Connection = struct {
         var manager = self.streamManager() orelse return error.NotEstablished;
         const id = try manager.openLocal(typ);
         try self.known_streams.put(id, {});
-        self.events.emit(.{ .stream_state_changed = .{ .id = id, .new = .open } });
+        self.emitStreamStateCreated(id, manager.get(id).?.state());
         return id;
     }
 
@@ -6167,6 +6194,68 @@ test "driver: duplicate valid ACK clears PTO without emitting an ack summary" {
     try testing.expect(capture.saw_zero_pto_metrics);
 }
 
+test "driver: sparse ACK emits exact newly acked packet numbers" {
+    const Capture = struct {
+        packet_numbers: [4]u64 = .{0} ** 4,
+        count: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .packets_acked => |acked| {
+                    self.packet_numbers[self.count] = acked.packet_number;
+                    self.count += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const space = PacketNumberSpace.application;
+    const path_ref = pair.server.paths.activePathRef();
+    try ensureSentRecordCapacity(pair.server, pair.server.sent_records.items.len + 2);
+    inline for (.{ @as(u64, 1), @as(u64, 5) }) |pn| {
+        pair.server.recovery.onPacketSentAssumeCapacity(.{
+            .space = space,
+            .packet_number = pn,
+            .time_sent_us = pair.now_us,
+            .size = 100,
+            .ack_eliciting = true,
+            .in_flight = true,
+        });
+        pair.server.sent_records.addOneAssumeCapacity().* = .{
+            .space = space,
+            .packet_type = .one_rtt,
+            .packet_number = pn,
+            .ack_eliciting = true,
+            .sent_path = path_ref,
+            .sent_size = 100,
+        };
+    }
+    pair.server.next_pn[Connection.spaceIndex(space)] = 6;
+
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+
+    var ranges = recovery.AckRangeSet{};
+    try ranges.insert(1);
+    try ranges.insert(5);
+    pair.server.processAck(space, .{
+        .ranges = ranges,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = 5,
+    }, pair.now_us + 1_000);
+
+    try testing.expectEqual(@as(usize, 2), capture.count);
+    try testing.expectEqual(@as(u64, 1), capture.packet_numbers[0]);
+    try testing.expectEqual(@as(u64, 5), capture.packet_numbers[1]);
+}
+
 test "driver: close retransmission does not duplicate semantic close event" {
     const Capture = struct {
         close_started_events: usize = 0,
@@ -6238,8 +6327,8 @@ test "driver: received stream frames emit actual lifecycle transitions" {
     try pair.server.applyFrame(.application, .{ .stream = .{ .id = id, .offset = 0, .data = "", .fin = true } }, TestPair.server_path, 0, pair.now_us);
 
     try testing.expectEqual(@as(usize, 2), capture.count);
-    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .new = .open } }, capture.events[0]);
-    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .old = .open, .new = .half_closed_remote } }, capture.events[1]);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .sending, .new = .ready } }, capture.events[0]);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .receiving, .new = .closed } }, capture.events[1]);
 }
 
 test "driver: received reset that creates a stream emits lifecycle transition" {
@@ -6274,8 +6363,8 @@ test "driver: received reset that creates a stream emits lifecycle transition" {
 
     try testing.expectEqual(@as(usize, 1), capture.reset_count);
     try testing.expectEqual(@as(usize, 2), capture.stream_count);
-    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .new = .open } }, capture.stream_events[0]);
-    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .old = .open, .new = .reset_received } }, capture.stream_events[1]);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .sending, .new = .ready } }, capture.stream_events[0]);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .receiving, .new = .reset_received } }, capture.stream_events[1]);
 }
 
 test "driver: terminal reset forgets local stream flow blocked state without unblocked event" {

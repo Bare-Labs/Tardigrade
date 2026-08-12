@@ -1516,9 +1516,8 @@ pub const Runtime = struct {
             .handshake_confirmed => .{ .handshake_progressed = .{ .stage = .confirmed } },
             .pto_fired => |pto| .{ .recovery_metrics_updated = .{ .pto_count = @intCast(@min(pto.count, std.math.maxInt(u16))) } },
             .packets_acked => |acked| .{ .packets_acked = .{
-                .packet_type = if (acked.packet_type) |kind| packetTypeForKind(kind) else null,
-                .largest_acknowledged = acked.largest_acknowledged,
-                .acked_count = acked.acked_count,
+                .packet_number_space = packetNumberSpaceToQlog(acked.space),
+                .packet_number = acked.packet_number,
             } },
             .packets_lost => |lost| .{ .packets_lost = .{
                 .packet_type = if (lost.packet_type) |kind| packetTypeForKind(kind) else null,
@@ -1588,8 +1587,10 @@ pub const Runtime = struct {
             } } },
             .stream_state_changed => |stream| .{ .stream_state_updated = .{
                 .stream_id = stream.id,
+                .stream_side = streamSideToQlog(stream.side),
                 .old = if (stream.old) |old| streamStateToQlog(old) else null,
                 .new = streamStateToQlog(stream.new),
+                .trigger = if (stream.trigger) |trigger| streamStateTriggerToQlog(trigger) else null,
             } },
             .congestion_state_changed => |congestion| .{ .congestion_state_updated = .{
                 .old = congestionStateToQlog(congestion.old),
@@ -1608,14 +1609,34 @@ pub const Runtime = struct {
         };
     }
 
-    fn streamStateToQlog(state: quic.stream.StreamState) quic.qlog.StreamState {
+    fn streamSideToQlog(side: quic.connection.StreamSide) quic.qlog.StreamSide {
+        return switch (side) {
+            .sending => .sending,
+            .receiving => .receiving,
+        };
+    }
+
+    fn streamStateToQlog(state: quic.connection.StreamSideState) quic.qlog.StreamState {
         return switch (state) {
-            .open => .open,
-            .half_closed_local => .half_closed_local,
-            .half_closed_remote => .half_closed_remote,
+            .ready => .ready,
             .closed => .closed,
             .reset_received => .reset_received,
             .reset_sent => .reset_sent,
+        };
+    }
+
+    fn streamStateTriggerToQlog(trigger: quic.connection.StreamStateTrigger) quic.qlog.StreamStateTrigger {
+        return switch (trigger) {
+            .local => .local,
+            .remote => .remote,
+        };
+    }
+
+    fn packetNumberSpaceToQlog(space: quic.recovery.PacketNumberSpace) quic.qlog.PacketNumberSpace {
+        return switch (space) {
+            .initial => .initial,
+            .handshake => .handshake,
+            .application => .application,
         };
     }
 
@@ -2150,8 +2171,8 @@ const QuicQlogRecorder = struct {
 
 test "http3 runtime: QUIC qlog adapter preserves normalized transport events" {
     try testing.expectEqual(
-        quic.qlog.Event{ .packets_acked = .{ .packet_type = .one_rtt, .largest_acknowledged = 11, .acked_count = 4 } },
-        Runtime.quicEventToQlog(.{ .packets_acked = .{ .space = .application, .packet_type = .one_rtt, .largest_acknowledged = 11, .acked_count = 4 } }).?,
+        quic.qlog.Event{ .packets_acked = .{ .packet_number_space = .application, .packet_number = 11 } },
+        Runtime.quicEventToQlog(.{ .packets_acked = .{ .space = .application, .packet_number = 11 } }).?,
     );
     try testing.expectEqual(
         quic.qlog.Event{ .packets_lost = .{ .packet_type = .one_rtt, .lost_count = 3, .bytes = 3600 } },
@@ -2178,8 +2199,8 @@ test "http3 runtime: QUIC qlog adapter preserves normalized transport events" {
         Runtime.quicEventToQlog(.{ .flow_control_blocked_received = .{ .scope = .stream, .stream_id = 12 } }).?,
     );
     try testing.expectEqual(
-        quic.qlog.Event{ .stream_state_updated = .{ .stream_id = 4, .old = .open, .new = .half_closed_remote } },
-        Runtime.quicEventToQlog(.{ .stream_state_changed = .{ .id = 4, .old = .open, .new = .half_closed_remote } }).?,
+        quic.qlog.Event{ .stream_state_updated = .{ .stream_id = 4, .stream_side = .receiving, .old = .ready, .new = .closed, .trigger = .remote } },
+        Runtime.quicEventToQlog(.{ .stream_state_changed = .{ .id = 4, .side = .receiving, .old = .ready, .new = .closed, .trigger = .remote } }).?,
     );
     try testing.expectEqual(
         quic.qlog.Event{ .congestion_state_updated = .{ .old = .slow_start, .new = .recovery } },

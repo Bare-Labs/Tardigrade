@@ -142,14 +142,15 @@ pub const MigrationState = enum {
     migration_complete,
 };
 
+pub const StreamSide = enum { sending, receiving };
 pub const StreamState = enum {
-    open,
-    half_closed_local,
-    half_closed_remote,
+    ready,
     closed,
     reset_received,
     reset_sent,
 };
+pub const StreamStateTrigger = enum { local, remote };
+pub const PacketNumberSpace = enum { initial, handshake, application };
 
 pub const CongestionState = enum {
     slow_start,
@@ -222,9 +223,8 @@ pub const RecoveryMetrics = struct {
 };
 
 pub const AckedPackets = struct {
-    packet_type: ?PacketType = null,
-    largest_acknowledged: u64,
-    acked_count: u64,
+    packet_number_space: PacketNumberSpace,
+    packet_number: u64,
 };
 
 pub const LostPackets = struct {
@@ -280,8 +280,7 @@ pub const Event = union(enum) {
         packet_type: PacketType,
         packet_number: ?u64 = null,
     },
-    /// tardigrade:quic_packets_acked (ACK processing summary; current qlog
-    /// drafts do not standardize a compact "packets acked" event shape)
+    /// quic:packets_acked
     packets_acked: AckedPackets,
     /// tardigrade:quic_packets_lost (loss detection summary; standard
     /// quic:packet_lost is singular and needs a concrete packet number)
@@ -313,8 +312,10 @@ pub const Event = union(enum) {
     /// quic:stream_state_updated
     stream_state_updated: struct {
         stream_id: u64,
+        stream_side: StreamSide,
         old: ?StreamState = null,
         new: StreamState,
+        trigger: ?StreamStateTrigger = null,
     },
     /// quic:congestion_state_updated
     congestion_state_updated: struct {
@@ -346,11 +347,11 @@ pub const Event = union(enum) {
             .data_blocked,
             .stream_state_updated,
             .congestion_state_updated,
+            .packets_acked,
             => .quic,
             .path_validation,
             .stream_reset,
             .handshake_progressed,
-            .packets_acked,
             .packets_lost,
             .flow_control_blocked_received,
             .persistent_congestion,
@@ -368,7 +369,7 @@ pub const Event = union(enum) {
             .packet_sent => "packet_sent",
             .packet_received => "packet_received",
             .packet_lost => "packet_lost",
-            .packets_acked => "quic_packets_acked",
+            .packets_acked => "packets_acked",
             .packets_lost => "quic_packets_lost",
             .recovery_metrics_updated => "recovery_metrics_updated",
             .packet_dropped => "packet_dropped",
@@ -515,9 +516,10 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
             try b.add("}}}}", .{});
         },
         .packets_acked => |d| {
-            try b.add("{{", .{});
-            if (d.packet_type) |packet_type| try b.add("\"packet_type\":\"{s}\",", .{packet_type.label()});
-            try b.add("\"largest_acknowledged\":{d},\"acked_count\":{d}}}", .{ d.largest_acknowledged, d.acked_count });
+            try b.add(
+                "{{\"packet_number_space\":\"{s}\",\"packet_numbers\":[{d}]}}",
+                .{ @tagName(d.packet_number_space), d.packet_number },
+            );
         },
         .packets_lost => |d| {
             try b.add("{{", .{});
@@ -576,9 +578,11 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
             .{ @tagName(d.kind), d.stream_id, d.error_code },
         ),
         .stream_state_updated => |d| {
-            try b.add("{{\"stream_id\":{d}", .{d.stream_id});
+            try b.add("{{\"stream_id\":{d},\"stream_side\":\"{s}\"", .{ d.stream_id, @tagName(d.stream_side) });
             if (d.old) |old| try b.add(",\"old\":\"{s}\"", .{@tagName(old)});
-            try b.add(",\"new\":\"{s}\"}}", .{@tagName(d.new)});
+            try b.add(",\"new\":\"{s}\"", .{@tagName(d.new)});
+            if (d.trigger) |trigger| try b.add(",\"trigger\":\"{s}\"", .{@tagName(trigger)});
+            try b.add("}}", .{});
         },
         .congestion_state_updated => |d| try b.add(
             "{{\"old\":\"{s}\",\"new\":\"{s}\"}}",
@@ -697,23 +701,23 @@ test "namespace and name mapping stays aligned with qlog vantage points" {
     try testing.expectEqual(Namespace.quic, (Event{ .packet_lost = .{ .packet_type = .one_rtt } }).namespace());
     try testing.expectEqual(Namespace.quic, (Event{ .key_updated = .{ .key_type = .server_1rtt_secret, .key_phase = 1 } }).namespace());
     try testing.expectEqual(Namespace.quic, (Event{ .connection_migrated = .{ .new = .migration_complete } }).namespace());
-    try testing.expectEqual(Namespace.quic, (Event{ .stream_state_updated = .{ .stream_id = 0, .new = .open } }).namespace());
+    try testing.expectEqual(Namespace.quic, (Event{ .stream_state_updated = .{ .stream_id = 0, .stream_side = .sending, .new = .ready } }).namespace());
     try testing.expectEqual(Namespace.quic, (Event{ .congestion_state_updated = .{ .old = .slow_start, .new = .recovery } }).namespace());
     try testing.expectEqual(Namespace.tardigrade, (Event{ .persistent_congestion = .{} }).namespace());
     try testing.expectEqual(Namespace.tardigrade, (Event{ .stream_reset = .{ .kind = .reset_sent, .stream_id = 0 } }).namespace());
     try testing.expectEqual(Namespace.tardigrade, (Event{ .packets_lost = .{ .lost_count = 2, .bytes = 2400 } }).namespace());
-    try testing.expectEqual(Namespace.tardigrade, (Event{ .packets_acked = .{ .packet_type = .one_rtt, .largest_acknowledged = 7, .acked_count = 1 } }).namespace());
+    try testing.expectEqual(Namespace.quic, (Event{ .packets_acked = .{ .packet_number_space = .application, .packet_number = 7 } }).namespace());
     try testing.expectEqualStrings("packet_dropped", (Event{ .packet_dropped = .{ .trigger = .decryption_failure } }).name());
 }
 
 test "stream and congestion transitions serialize to qlog records" {
     try expectJson(
-        .{ .time_us = 0, .event = .{ .stream_state_updated = .{ .stream_id = 8, .old = .open, .new = .half_closed_remote } } },
+        .{ .time_us = 0, .event = .{ .stream_state_updated = .{ .stream_id = 8, .stream_side = .receiving, .old = .ready, .new = .closed, .trigger = .remote } } },
         "\"name\":\"quic:stream_state_updated\"",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .stream_state_updated = .{ .stream_id = 8, .old = .open, .new = .half_closed_remote } } },
-        "\"stream_id\":8,\"old\":\"open\",\"new\":\"half_closed_remote\"",
+        .{ .time_us = 0, .event = .{ .stream_state_updated = .{ .stream_id = 8, .stream_side = .receiving, .old = .ready, .new = .closed, .trigger = .remote } } },
+        "\"stream_id\":8,\"stream_side\":\"receiving\",\"old\":\"ready\",\"new\":\"closed\",\"trigger\":\"remote\"",
     );
     try expectJson(
         .{ .time_us = 0, .event = .{ .congestion_state_updated = .{ .old = .slow_start, .new = .recovery } } },
@@ -825,14 +829,14 @@ test "recovery metrics serialize as a quic event" {
     );
 }
 
-test "acked packet summaries stay in the Tardigrade extension namespace" {
+test "acked packets serialize as standard qlog packet number arrays" {
     try expectJson(
-        .{ .time_us = 5, .event = .{ .packets_acked = .{ .packet_type = .one_rtt, .largest_acknowledged = 9, .acked_count = 3 } } },
-        "\"name\":\"tardigrade:quic_packets_acked\"",
+        .{ .time_us = 5, .event = .{ .packets_acked = .{ .packet_number_space = .application, .packet_number = 9 } } },
+        "\"name\":\"quic:packets_acked\"",
     );
     try expectJson(
-        .{ .time_us = 5, .event = .{ .packets_acked = .{ .packet_type = .one_rtt, .largest_acknowledged = 9, .acked_count = 3 } } },
-        "\"acked_count\":3",
+        .{ .time_us = 5, .event = .{ .packets_acked = .{ .packet_number_space = .application, .packet_number = 9 } } },
+        "\"packet_number_space\":\"application\",\"packet_numbers\":[9]",
     );
 }
 
