@@ -81,13 +81,16 @@ pub const Config = struct {
     /// sized from. Send-side limits live in `max_send_udp_payload_size` and
     /// `quic.datagram.Limits`.
     max_udp_payload_size: u64 = quic_datagram.max_size,
-    /// The sender's maximum datagram size for a new path: what this endpoint
-    /// assumes the path carries before anything has measured it. Defaults to
-    /// the RFC 9000 §14 floor, the only size every path must support. Raising
-    /// it asserts a path MTU rather than measuring one; #256-B replaces the
-    /// assertion with DPLPMTUD. Always additionally bounded by the peer's
+    /// The largest UDP payload this endpoint will ever put on the wire — a
+    /// ceiling, not a size. DPLPMTUD (#256-B) searches inside
+    /// `[base_size, this]` and raises the size actually emitted only when a
+    /// probe of the larger size is acknowledged, so a fresh path still starts
+    /// at the RFC 9000 §14 floor no matter how high this is set. Lowering it
+    /// bounds what discovery may find, which is the only reason to touch it:
+    /// under #256-A raising it *asserted* a path MTU, and that is what
+    /// discovery replaces. Always additionally bounded by the peer's
     /// advertised receive capacity.
-    max_send_udp_payload_size: u64 = quic_datagram.base_size,
+    max_send_udp_payload_size: u64 = quic_datagram.max_size,
     initial_max_data: u64 = 8 * 1024 * 1024,
     initial_max_stream_data_bidi_local: u64 = 1024 * 1024,
     initial_max_stream_data_bidi_remote: u64 = 1024 * 1024,
@@ -216,7 +219,10 @@ test "default QUIC config maps to conservative transport parameters" {
     // The advertised parameter is receive capacity, so it matches the receive
     // buffers the implementation allocates; the send side stays conservative.
     try std.testing.expectEqual(@as(u64, quic_datagram.max_size), params.max_udp_payload_size);
-    try std.testing.expectEqual(@as(u64, quic_datagram.base_size), cfg.max_send_udp_payload_size);
+    // The send *ceiling* defaults wide open — DPLPMTUD keeps the size actually
+    // emitted at the RFC floor until a probe of something larger is
+    // acknowledged (#256-B), so a wide ceiling is not an aggressive default.
+    try std.testing.expectEqual(@as(u64, quic_datagram.max_size), cfg.max_send_udp_payload_size);
     try std.testing.expect(params.disable_active_migration);
     try std.testing.expect(!cfg.zero_rtt_enabled);
     try std.testing.expectEqual(QpackMode.static_only, cfg.qpack.mode);

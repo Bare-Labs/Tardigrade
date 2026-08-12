@@ -243,6 +243,13 @@ pub const SentPacket = struct {
     ack_eliciting: bool = true,
     in_flight: bool = true,
     lost: bool = false,
+    /// A DPLPMTUD probe (#256-B). It is in flight and consumes congestion
+    /// window like anything else, but RFC 9000 §14.4 is explicit that losing
+    /// one is *not* a reliable congestion signal — an oversized datagram is
+    /// expected to be dropped by a path too small for it, which says nothing
+    /// about queue depth. Its bytes still leave the in-flight ledger; only the
+    /// window reduction is withheld.
+    pmtu_probe: bool = false,
 };
 
 pub const AckResult = struct {
@@ -253,8 +260,18 @@ pub const AckResult = struct {
 pub const LossResult = struct {
     packet_threshold_losses: usize = 0,
     time_threshold_losses: usize = 0,
+    /// Every in-flight byte declared lost, probes included. This is the
+    /// ledger figure — all of it must leave `bytes_in_flight`.
     lost_bytes: usize = 0,
     largest_lost_time_sent_us: ?u64 = null,
+    /// The subset of `lost_bytes` belonging to DPLPMTUD probes, which
+    /// RFC 9000 §14.4 excludes from the congestion reaction.
+    probe_lost_bytes: usize = 0,
+    /// The largest ordinary (non-probe) lost packet's size and send time: the
+    /// inputs to the congestion event and to black-hole detection, both of
+    /// which must ignore probes.
+    largest_ordinary_lost_size: usize = 0,
+    largest_ordinary_lost_time_sent_us: ?u64 = null,
 };
 
 pub const PacketTracker = struct {
@@ -347,6 +364,16 @@ pub const PacketTracker = struct {
         if (packet.in_flight) result.lost_bytes += packet.size;
         if (result.largest_lost_time_sent_us == null or packet.time_sent_us > result.largest_lost_time_sent_us.?) {
             result.largest_lost_time_sent_us = packet.time_sent_us;
+        }
+        if (packet.pmtu_probe) {
+            if (packet.in_flight) result.probe_lost_bytes += packet.size;
+            return;
+        }
+        result.largest_ordinary_lost_size = @max(result.largest_ordinary_lost_size, packet.size);
+        if (result.largest_ordinary_lost_time_sent_us == null or
+            packet.time_sent_us > result.largest_ordinary_lost_time_sent_us.?)
+        {
+            result.largest_ordinary_lost_time_sent_us = packet.time_sent_us;
         }
     }
 
@@ -537,6 +564,15 @@ pub const CongestionController = struct {
         self.ssthresh = self.congestion_window;
     }
 
+    /// Release lost DPLPMTUD probe bytes from the in-flight ledger without a
+    /// congestion event (RFC 9000 §14.4). The bytes were genuinely in flight
+    /// and must be reclaimed, but a probe deliberately sized larger than the
+    /// path is not evidence of congestion, and halving the window every time
+    /// discovery overshoots would make probing cost throughput.
+    pub fn onProbePacketsLost(self: *CongestionController, lost_bytes: usize) void {
+        self.bytes_in_flight -|= lost_bytes;
+    }
+
     pub fn onPersistentCongestion(self: *CongestionController) void {
         self.congestion_window = self.minWindow();
         self.ssthresh = self.congestion_window;
@@ -634,7 +670,14 @@ pub const RecoveryController = struct {
     pub fn detectLost(self: *RecoveryController, space: PacketNumberSpace, now_us: u64) LossResult {
         const result = self.tracker.detectLost(space, now_us, self.rtt);
         if (result.lost_bytes > 0) {
-            self.congestion.onPacketsLost(result.largest_lost_time_sent_us.?, result.lost_bytes, now_us);
+            // Probe bytes leave the ledger but drive no congestion event
+            // (RFC 9000 §14.4), and the event's timestamp comes from ordinary
+            // traffic so a probe cannot start a recovery period on its own.
+            if (result.probe_lost_bytes > 0) self.congestion.onProbePacketsLost(result.probe_lost_bytes);
+            const congestion_bytes = result.lost_bytes - result.probe_lost_bytes;
+            if (congestion_bytes > 0) {
+                self.congestion.onPacketsLost(result.largest_ordinary_lost_time_sent_us.?, congestion_bytes, now_us);
+            }
             self.events.emit(.{
                 .kind = .packet_lost,
                 .space = space,
@@ -995,6 +1038,80 @@ test "recovery: a padded non-ack-eliciting packet is charged to the window" {
         .in_flight = true,
     });
     try testing.expectEqual(@as(usize, 1200), controller.congestion.bytes_in_flight);
+}
+
+// ---------------------------------------------------------------------------
+// #256-B: a DPLPMTUD probe is in flight, but losing one is not congestion.
+// ---------------------------------------------------------------------------
+
+test "recovery: a lost PMTU probe returns its bytes without a congestion event" {
+    var controller = RecoveryController{};
+    const window_before = controller.congestion.congestion_window;
+
+    try controller.onPacketSent(.{
+        .space = .application,
+        .packet_number = 1,
+        .time_sent_us = 0,
+        .size = 1_624,
+        .pmtu_probe = true,
+    });
+    // A probe consumes window like anything else while it is outstanding.
+    try testing.expectEqual(@as(usize, 1_624), controller.congestion.bytes_in_flight);
+
+    // Later ordinary packets get through, which is what declares the probe
+    // lost by packet threshold — exactly the black-hole-free case where the
+    // path simply cannot carry the probed size.
+    var pn: u64 = 2;
+    while (pn <= 5) : (pn += 1) {
+        try controller.onPacketSent(.{ .space = .application, .packet_number = pn, .time_sent_us = pn, .size = 100 });
+    }
+    controller.onAcked(.application, 5, 1_000, 0);
+
+    const loss = controller.detectLost(.application, 1_000);
+    try testing.expectEqual(@as(usize, 1_624), loss.probe_lost_bytes);
+    try testing.expect(loss.lost_bytes > loss.probe_lost_bytes);
+    // The ordinary packets lost alongside it still count, and only their size
+    // reaches black-hole detection.
+    try testing.expectEqual(@as(usize, 100), loss.largest_ordinary_lost_size);
+    // The window was cut once, by the ordinary loss — never by the probe.
+    try testing.expect(controller.congestion.congestion_window < window_before);
+    try testing.expectEqual(controller.congestion.congestion_window, controller.congestion.ssthresh);
+    // Every lost byte, probe included, left both in-flight ledgers, leaving
+    // only the two packets that are neither acked nor yet declared lost.
+    try testing.expectEqual(@as(usize, 200), controller.tracker.bytes_in_flight);
+    try testing.expectEqual(@as(usize, 200), controller.congestion.bytes_in_flight);
+}
+
+test "recovery: a probe lost on its own leaves the congestion window untouched" {
+    var controller = RecoveryController{};
+    controller.congestion.congestion_window = 30_000;
+    controller.congestion.ssthresh = 30_000;
+
+    try controller.onPacketSent(.{
+        .space = .application,
+        .packet_number = 1,
+        .time_sent_us = 0,
+        .size = 1_624,
+        .pmtu_probe = true,
+    });
+    // Exactly `packet_threshold` newer packets, so the probe is the only thing
+    // far enough behind the acknowledged one to be declared lost.
+    try controller.onPacketSent(.{ .space = .application, .packet_number = 2, .time_sent_us = 10, .size = 200 });
+    try controller.onPacketSent(.{ .space = .application, .packet_number = 3, .time_sent_us = 20, .size = 200 });
+    try controller.onPacketSent(.{ .space = .application, .packet_number = 4, .time_sent_us = 30, .size = 200 });
+    controller.onAcked(.application, 4, 100, 0);
+    const window_before = controller.congestion.congestion_window;
+    const ssthresh_before = controller.congestion.ssthresh;
+
+    const loss = controller.detectLost(.application, 100);
+    try testing.expectEqual(@as(usize, 1_624), loss.lost_bytes);
+    try testing.expectEqual(loss.lost_bytes, loss.probe_lost_bytes);
+    try testing.expectEqual(@as(usize, 0), loss.largest_ordinary_lost_size);
+    try testing.expectEqual(@as(?u64, null), loss.largest_ordinary_lost_time_sent_us);
+    try testing.expectEqual(window_before, controller.congestion.congestion_window);
+    try testing.expectEqual(ssthresh_before, controller.congestion.ssthresh);
+    try testing.expectEqual(@as(?u64, null), controller.congestion.recovery_start_time_us);
+    try testing.expectEqual(@as(usize, 400), controller.congestion.bytes_in_flight);
 }
 
 test "recovery: ordinary traffic stays bounded while required recovery spills past the fixed tracker" {

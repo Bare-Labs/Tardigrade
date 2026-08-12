@@ -88,15 +88,18 @@ pub const Config = struct {
     h3_settings: http3.frame.Settings = .{},
     connection_migration: bool = false,
     retry_policy: quic.config.RetryPolicy = .off,
-    /// Operator-facing bound on the size of datagrams this listener **sends**,
-    /// clamped into `[quic.datagram.base_size, quic.datagram.max_size]`. It is
-    /// the assumed path MTU, not a receive limit: the `max_udp_payload_size`
-    /// this endpoint advertises is its own receive capacity and is fixed by
-    /// the transport's buffers, not by this knob (#256-A). The default is the
-    /// one authoritative value in `quic.datagram` rather than a second knob
-    /// that can drift from it; the transport lowers it further whenever the
-    /// peer advertises less receive capacity.
-    max_datagram_size: usize = quic.datagram.base_size,
+    /// Operator-facing ceiling on the size of datagrams this listener
+    /// **sends**, clamped into `[quic.datagram.base_size,
+    /// quic.datagram.max_size]`. It is not a receive limit: the
+    /// `max_udp_payload_size` this endpoint advertises is its own receive
+    /// capacity and is fixed by the transport's buffers, not by this knob
+    /// (#256-A). Nor is it the size on the wire — DPLPMTUD (#256-B) starts
+    /// every path at the RFC 9000 §14 floor and only raises it as far as a
+    /// probe is actually acknowledged, so this bounds what discovery may find.
+    /// The default is the one authoritative value in `quic.datagram` rather
+    /// than a second knob that can drift from it; the transport lowers it
+    /// further whenever the peer advertises less receive capacity.
+    max_datagram_size: usize = quic.datagram.max_size,
     request_handler: ?RequestHandler = null,
     request_handler_ctx: ?*anyopaque = null,
     early_data_compat_metrics_ctx: ?*anyopaque = null,
@@ -2142,7 +2145,7 @@ test "quicConfigFrom: the runtime default is the transport's own authoritative d
     // #256-A: the runtime must not carry a second datagram-size default that
     // can drift from the transport's. Both come from `quic.datagram`.
     const runtime_default = Config{ .listen_host = "::", .quic_port = 443 };
-    try testing.expectEqual(quic.datagram.base_size, runtime_default.max_datagram_size);
+    try testing.expectEqual(quic.datagram.max_size, runtime_default.max_datagram_size);
     const mapped = quicConfigFrom(runtime_default);
     try testing.expectEqual(
         (quic.config.Config{}).max_send_udp_payload_size,

@@ -18,6 +18,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const packet = @import("packet.zig");
+const pmtu = @import("pmtu.zig");
 const udp = @import("udp.zig");
 const secrets = @import("crypto_secrets");
 
@@ -486,6 +487,12 @@ pub const Path = struct {
     challenge: [path_challenge_len]u8 = undefined,
     challenge_deadline_us: u64 = 0,
     anti_amplification: AntiAmplification = .{},
+    /// DPLPMTUD state for *this* path (#256-B). Path-scoped rather than
+    /// connection-scoped because that is what the question means: a size
+    /// discovered on one path says nothing about another. A new or recycled
+    /// slot therefore starts from the RFC 9000 §14 floor by construction —
+    /// there is no inherit-the-old-value path to get wrong.
+    plpmtu: pmtu.Controller = .{},
 };
 
 /// The action the connection takes for a datagram from a given tuple.
@@ -569,6 +576,15 @@ pub const PathManager = struct {
 
     pub fn activePath(self: *const PathManager) *const Path {
         return &self.paths[self.active].?;
+    }
+
+    /// The active path's DPLPMTUD state, for a caller that drives probing and
+    /// consumes probe/loss feedback (#256-B). Mutable by design and reached
+    /// only through the active slot: promoting a different path swaps which
+    /// controller this returns, which is exactly the per-path reset the
+    /// discovery model requires.
+    pub fn activePlpmtu(self: *PathManager) *pmtu.Controller {
+        return &self.paths[self.active].?.plpmtu;
     }
 
     /// Lift the active path's anti-amplification limit once its address is
@@ -712,7 +728,15 @@ pub const PathManager = struct {
             // deliberately chose not to skip validation (RFC 9000 §9.3.1).
             // A path still mid-validation or awaiting promotion keeps its
             // ledger untouched — it either hasn't validated yet or just did.
-            if (path.state == .validated) path.anti_amplification = .{};
+            // Same reasoning for the path's measured MTU (#256-B): a tuple
+            // being re-validated after having been away is not demonstrably
+            // the same path it was, and an inherited size that no longer
+            // traverses it is a black hole waiting to happen. Discovery
+            // restarts from the guaranteed floor.
+            if (path.state == .validated) {
+                path.anti_amplification = .{};
+                path.plpmtu.reset();
+            }
             path.anti_amplification.recordReceived(authenticated_bytes);
             switch (path.state) {
                 .validating => return .probing,
