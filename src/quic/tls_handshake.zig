@@ -232,11 +232,23 @@ pub const Handshake = struct {
     pending_discard: [4]bool = .{ false, false, false, false },
 
     pub fn initClient(adapter: *QuicTlsAdapter, backend: TlsBackend) Handshake {
-        return .{ .adapter = adapter, .driver = CoreDriver.init(.client, backend.transport) };
+        return initClientWithKeylog(adapter, backend, .{});
+    }
+
+    pub fn initClientWithKeylog(adapter: *QuicTlsAdapter, backend: TlsBackend, keylog_context: tls_core.keylog.Context) Handshake {
+        var handshake = Handshake{ .adapter = adapter, .driver = CoreDriver.init(.client, backend.transport) };
+        handshake.driver.sink.keylog_context = keylog_context;
+        return handshake;
     }
 
     pub fn initServer(adapter: *QuicTlsAdapter, backend: TlsBackend) Handshake {
-        return .{ .adapter = adapter, .driver = CoreDriver.init(.server, backend.transport) };
+        return initServerWithKeylog(adapter, backend, .{});
+    }
+
+    pub fn initServerWithKeylog(adapter: *QuicTlsAdapter, backend: TlsBackend, keylog_context: tls_core.keylog.Context) Handshake {
+        var handshake = Handshake{ .adapter = adapter, .driver = CoreDriver.init(.server, backend.transport) };
+        handshake.driver.sink.keylog_context = keylog_context;
+        return handshake;
     }
 
     /// Securely wipe any traffic secret still copied into the driver's

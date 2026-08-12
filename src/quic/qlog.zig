@@ -200,6 +200,12 @@ pub const RecoveryMetrics = struct {
     bytes_in_flight: ?u64 = null,
 };
 
+pub const AckedPackets = struct {
+    packet_type: PacketType,
+    largest_acknowledged: u64,
+    acked_count: u64,
+};
+
 /// The closed set of transport-vantage events. Data payloads are kept small and
 /// copy-free (scalars/enums only) so emitting is cheap and the union never
 /// borrows connection-owned buffers.
@@ -247,6 +253,9 @@ pub const Event = union(enum) {
         packet_type: PacketType,
         packet_number: ?u64 = null,
     },
+    /// tardigrade:quic_packets_acked (ACK processing summary; current qlog
+    /// drafts do not standardize a compact "packets acked" event shape)
+    packets_acked: AckedPackets,
     /// quic:recovery_metrics_updated
     recovery_metrics_updated: RecoveryMetrics,
     /// quic:packet_dropped (deprotection failure and other drops)
@@ -291,6 +300,7 @@ pub const Event = union(enum) {
             .path_validation,
             .stream_reset,
             .handshake_progressed,
+            .packets_acked,
             => .tardigrade,
         };
     }
@@ -305,6 +315,7 @@ pub const Event = union(enum) {
             .packet_sent => "packet_sent",
             .packet_received => "packet_received",
             .packet_lost => "packet_lost",
+            .packets_acked => "quic_packets_acked",
             .recovery_metrics_updated => "recovery_metrics_updated",
             .packet_dropped => "packet_dropped",
             .path_validation => "quic_path_validation",
@@ -441,6 +452,10 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
             if (d.packet_number) |pn| try b.add(",\"packet_number\":{d}", .{pn});
             try b.add("}}}}", .{});
         },
+        .packets_acked => |d| try b.add(
+            "{{\"packet_type\":\"{s}\",\"largest_acknowledged\":{d},\"acked_count\":{d}}}",
+            .{ d.packet_type.label(), d.largest_acknowledged, d.acked_count },
+        ),
         .recovery_metrics_updated => |d| {
             try b.add("{{", .{});
             var need_comma = false;
@@ -597,6 +612,7 @@ test "namespace and name mapping stays aligned with qlog vantage points" {
     try testing.expectEqual(Namespace.quic, (Event{ .key_updated = .{ .key_type = .server_1rtt_secret, .key_phase = 1 } }).namespace());
     try testing.expectEqual(Namespace.quic, (Event{ .connection_migrated = .{ .new = .migration_complete } }).namespace());
     try testing.expectEqual(Namespace.tardigrade, (Event{ .stream_reset = .{ .kind = .reset_sent, .stream_id = 0 } }).namespace());
+    try testing.expectEqual(Namespace.tardigrade, (Event{ .packets_acked = .{ .packet_type = .one_rtt, .largest_acknowledged = 7, .acked_count = 1 } }).namespace());
     try testing.expectEqualStrings("packet_dropped", (Event{ .packet_dropped = .{ .trigger = .decryption_failure } }).name());
 }
 
@@ -696,6 +712,17 @@ test "recovery metrics serialize as a quic event" {
     try expectJson(
         .{ .time_us = 5, .event = .{ .recovery_metrics_updated = .{ .congestion_window = 12_000, .bytes_in_flight = 1_200, .pto_count = 2 } } },
         "\"bytes_in_flight\":1200",
+    );
+}
+
+test "acked packet summaries stay in the Tardigrade extension namespace" {
+    try expectJson(
+        .{ .time_us = 5, .event = .{ .packets_acked = .{ .packet_type = .one_rtt, .largest_acknowledged = 9, .acked_count = 3 } } },
+        "\"name\":\"tardigrade:quic_packets_acked\"",
+    );
+    try expectJson(
+        .{ .time_us = 5, .event = .{ .packets_acked = .{ .packet_type = .one_rtt, .largest_acknowledged = 9, .acked_count = 3 } } },
+        "\"acked_count\":3",
     );
 }
 

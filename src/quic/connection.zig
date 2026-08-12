@@ -40,7 +40,7 @@ const quic_udp = @import("udp.zig");
 const test_quic_crypto = @import("test_quic_crypto");
 
 const EncryptionLevel = tls_adapter.EncryptionLevel;
-const PacketNumberSpace = recovery.PacketNumberSpace;
+pub const PacketNumberSpace = recovery.PacketNumberSpace;
 const StreamId = quic_stream.StreamId;
 
 pub const Role = enum { client, server };
@@ -139,7 +139,19 @@ pub const Event = union(enum) {
     handshake_complete,
     handshake_confirmed,
     pto_fired: struct { space: PacketNumberSpace, count: u32 },
+    packets_acked: struct { space: PacketNumberSpace, largest_acknowledged: u64, acked_count: u64 },
     packets_lost: struct { space: PacketNumberSpace, bytes: usize },
+    recovery_metrics_updated: struct {
+        latest_rtt_us: ?u64 = null,
+        smoothed_rtt_us: ?u64 = null,
+        rttvar_us: ?u64 = null,
+        pto_count: u16 = 0,
+        congestion_window: usize = 0,
+        bytes_in_flight: usize = 0,
+    },
+    stream_reset: struct { id: StreamId, error_code: u64, local: bool },
+    stop_sending: struct { id: StreamId, error_code: u64, local: bool },
+    flow_control_blocked: struct { scope: enum { connection, stream }, stream_id: ?StreamId = null },
     close_sent: struct { error_code: u64 },
     close_received: struct { error_code: u64, is_application: bool },
     idle_timeout,
@@ -291,6 +303,7 @@ pub const Options = struct {
     /// and the retried Initial DCID/Retry SCID after Retry.
     initial_secret_dcid: []const u8,
     tls: tls_handshake.TlsBackend,
+    tls_keylog_context: tls_core.keylog.Context = .{},
     /// The provider-owned crypto QUIC packet protection uses (#490). Required,
     /// with no default: `src/quic/` does not choose a concrete backend —
     /// selecting one (e.g. the pure-Zig provider) is the native HTTP/QUIC
@@ -1019,8 +1032,8 @@ pub const Connection = struct {
         // constructors (no I/O, no dependency on installed secrets), so
         // this reordering is free.
         conn.handshake = switch (options.role) {
-            .client => tls_handshake.Handshake.initClient(&conn.adapter, options.tls),
-            .server => tls_handshake.Handshake.initServer(&conn.adapter, options.tls),
+            .client => tls_handshake.Handshake.initClientWithKeylog(&conn.adapter, options.tls, options.tls_keylog_context),
+            .server => tls_handshake.Handshake.initServerWithKeylog(&conn.adapter, options.tls, options.tls_keylog_context),
         };
         // A client's own initial path is validated by definition; a server
         // must not exceed 3x received bytes until Retry or the handshake
@@ -1762,6 +1775,7 @@ pub const Connection = struct {
                     self.closeOnStreamError(err, now_us);
                     return;
                 };
+                self.events.emit(.{ .stream_reset = .{ .id = rs.id, .error_code = rs.app_error_code, .local = false } });
                 if (!self.known_streams.contains(rs.id)) {
                     try self.known_streams.put(rs.id, {});
                     if (quic_stream.streamInitiator(rs.id) != roleInitiator(self.role)) {
@@ -1771,6 +1785,7 @@ pub const Connection = struct {
             },
             .stop_sending => |ss| {
                 var manager = self.streamManager() orelse return;
+                self.events.emit(.{ .stop_sending = .{ .id = ss.id, .error_code = ss.app_error_code, .local = false } });
                 manager.receiveStopSending(ss) catch |err| {
                     self.closeOnStreamError(err, now_us);
                     return;
@@ -1793,7 +1808,9 @@ pub const Connection = struct {
             .max_streams_uni => |limit| {
                 if (self.streamManager()) |manager| manager.applyMaxStreams(.uni, limit);
             },
-            .data_blocked, .stream_data_blocked, .streams_blocked_bidi, .streams_blocked_uni => {},
+            .data_blocked => self.events.emit(.{ .flow_control_blocked = .{ .scope = .connection } }),
+            .stream_data_blocked => |blocked| self.events.emit(.{ .flow_control_blocked = .{ .scope = .stream, .stream_id = blocked.id } }),
+            .streams_blocked_bidi, .streams_blocked_uni => {},
             .new_token => {
                 // Address-validation tokens for future connections; endpoint
                 // token stores are out of scope for the driver.
@@ -1929,6 +1946,7 @@ pub const Connection = struct {
 
         // Ack every tracked packet covered by the ranges. The RTT sample only
         // comes from the largest acked packet (RFC 9002 §5.1).
+        var acked_count: u64 = 0;
         var index: usize = 0;
         while (index < self.sent_records.items.len) {
             const record = &self.sent_records.items[index];
@@ -1937,6 +1955,7 @@ pub const Connection = struct {
                 continue;
             }
             if (self.recovery.tracker.onAcked(space, record.packet_number, now_us)) |acked| {
+                acked_count += 1;
                 self.recovery.congestion.onPacketAcked(acked.packet);
                 if (record.packet_number == ack.largest_acknowledged) {
                     if (acked.rtt_sample_us) |sample| self.recovery.rtt.update(sample, ack_delay_us);
@@ -1962,6 +1981,10 @@ pub const Connection = struct {
             wipeSentRecordToken(record);
             _ = self.sent_records.swapRemove(index);
             wipeSentRecordsSwapRemoveResidue(&self.sent_records);
+        }
+        if (acked_count > 0) {
+            self.events.emit(.{ .packets_acked = .{ .space = space, .largest_acknowledged = ack.largest_acknowledged, .acked_count = acked_count } });
+            self.emitRecoveryMetrics();
         }
         // A validated ACK ends the current PTO backoff episode.
         self.pto_count = 0;
@@ -2011,7 +2034,19 @@ pub const Connection = struct {
         if (lost_count > 0) {
             self.metrics.packets_lost += lost_count;
             self.events.emit(.{ .packets_lost = .{ .space = space, .bytes = loss.lost_bytes } });
+            self.emitRecoveryMetrics();
         }
+    }
+
+    fn emitRecoveryMetrics(self: *Connection) void {
+        self.events.emit(.{ .recovery_metrics_updated = .{
+            .latest_rtt_us = self.recovery.rtt.latest_rtt_us,
+            .smoothed_rtt_us = self.recovery.rtt.smoothed_rtt_us,
+            .rttvar_us = self.recovery.rtt.rttvar_us,
+            .pto_count = @intCast(@min(self.pto_count, std.math.maxInt(u16))),
+            .congestion_window = self.recovery.congestion.congestion_window,
+            .bytes_in_flight = self.recovery.congestion.bytes_in_flight,
+        } });
     }
 
     /// Requeue the content of every record in `space` the tracker no longer
@@ -2385,7 +2420,7 @@ pub const Connection = struct {
         var reservation = tx.prepareAppend(self.allocator, message_len, max_application_crypto_outstanding) catch return error.HandshakeBufferOverflow;
         defer reservation.deinit();
 
-        var sink = tls_handshake.EventSink{};
+        var sink = tls_handshake.EventSink{ .keylog_context = self.handshake.driver.sink.keylog_context };
         defer sink.deinit();
         var ticket_state = try self.tls.emitNewSessionTicket(self.allocator, &sink, params, limits);
         errdefer ticket_state.deinit();
@@ -2449,7 +2484,7 @@ pub const Connection = struct {
         var reservation = tx.prepareAppend(self.allocator, message_len, max_application_crypto_outstanding) catch return error.HandshakeBufferOverflow;
         defer reservation.deinit();
 
-        var sink = tls_handshake.EventSink{};
+        var sink = tls_handshake.EventSink{ .keylog_context = self.handshake.driver.sink.keylog_context };
         defer sink.deinit();
         try self.tls.emitPreparedNewSessionTicket(self.allocator, &sink, prepared, identity, limits);
         tx.commitReservation(&reservation);
@@ -2844,6 +2879,7 @@ pub const Connection = struct {
                 self.notePmtuEvidence(active, .stalled_pto, now_us);
             }
         }
+        self.emitRecoveryMetrics();
         // Requeue the oldest unacked retransmittable content of the space so
         // the probe carries data rather than a bare PING when possible.
         var oldest: ?usize = null;
@@ -2945,6 +2981,7 @@ pub const Connection = struct {
         var manager = self.streamManager() orelse return error.NotEstablished;
         const reset = try manager.sendResetStream(id, app_error_code);
         try self.pending_resets.append(self.allocator, reset);
+        self.events.emit(.{ .stream_reset = .{ .id = id, .error_code = app_error_code, .local = true } });
         if (self.send_queues.get(id)) |queue| {
             queue.reset_sent = true;
             queue.retransmit.items.clearRetainingCapacity();
@@ -3023,6 +3060,7 @@ pub const Connection = struct {
         var manager = self.streamManager() orelse return error.NotEstablished;
         const stop = try manager.sendStopSending(id, app_error_code);
         try self.pending_stop_sending.append(self.allocator, stop);
+        self.events.emit(.{ .stop_sending = .{ .id = id, .error_code = app_error_code, .local = true } });
     }
 
     pub fn streamState(self: *Connection, id: StreamId) ?quic_stream.StreamState {
@@ -3910,7 +3948,14 @@ pub const Connection = struct {
             const conn_window = manager.max_data_send -| manager.bytes_sent;
             const frame_room: u64 = @intCast(budget -| plain_len -| frame.max_stream_overhead);
             const n_bytes = @min(@min(unsent, @min(stream_window, conn_window)), frame_room);
-            if (n_bytes == 0 and !(want_fin and unsent == 0)) continue;
+            if (n_bytes == 0 and !(want_fin and unsent == 0)) {
+                if (conn_window == 0) {
+                    self.events.emit(.{ .flow_control_blocked = .{ .scope = .connection } });
+                } else if (stream_window == 0) {
+                    self.events.emit(.{ .flow_control_blocked = .{ .scope = .stream, .stream_id = id } });
+                }
+                continue;
+            }
             const fin_now = want_fin and n_bytes == unsent;
             const grant = manager.reserveSend(id, @intCast(n_bytes), fin_now) catch continue;
             const range = Range{ .start = grant.offset, .end = grant.offset + grant.len };
