@@ -68,6 +68,7 @@ fn logEvent(_: ?*anyopaque, event: connection.Event) void {
         .stream_reset => |s| std.fmt.bufPrint(&buf, "stream_reset id={d} code={d} local={}", .{ s.id, s.error_code, s.local }),
         .stop_sending => |s| std.fmt.bufPrint(&buf, "stop_sending id={d} code={d} local={}", .{ s.id, s.error_code, s.local }),
         .flow_control_state_changed => |f| std.fmt.bufPrint(&buf, "flow_control scope={s} stream_id={?d} local={} {s}->{s}", .{ @tagName(f.scope), f.stream_id, f.local, @tagName(f.old), @tagName(f.new) }),
+        .flow_control_blocked_received => |f| std.fmt.bufPrint(&buf, "flow_control_blocked_received scope={s} stream_id={?d}", .{ @tagName(f.scope), f.stream_id }),
         .close_sent => |c| std.fmt.bufPrint(&buf, "close sent code={d} app={}", .{ c.error_code, c.is_application }),
         .close_received => |c| std.fmt.bufPrint(&buf, "close received code={d} app={}", .{ c.error_code, c.is_application }),
         .idle_timeout => std.fmt.bufPrint(&buf, "idle timeout", .{}),

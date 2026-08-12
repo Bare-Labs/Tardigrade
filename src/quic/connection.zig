@@ -161,6 +161,10 @@ pub const Event = union(enum) {
         old: FlowControlState,
         new: FlowControlState,
     },
+    flow_control_blocked_received: struct {
+        scope: FlowControlScope,
+        stream_id: ?StreamId = null,
+    },
     close_sent: struct { error_code: u64, is_application: bool },
     close_received: struct { error_code: u64, is_application: bool },
     idle_timeout,
@@ -1816,6 +1820,7 @@ pub const Connection = struct {
                 // RFC 9000 §3.5: a STOP_SENDING peer expects RESET_STREAM.
                 if (manager.sendResetStream(ss.id, ss.app_error_code)) |reset| {
                     try self.pending_resets.append(self.allocator, reset);
+                    self.events.emit(.{ .stream_reset = .{ .id = ss.id, .error_code = ss.app_error_code, .local = true } });
                     if (self.send_queues.get(ss.id)) |queue| queue.reset_sent = true;
                 } else |_| {}
             },
@@ -2033,6 +2038,7 @@ pub const Connection = struct {
             wipeSentRecordsSwapRemoveResidue(&self.sent_records);
         }
         // A validated ACK ends the current PTO backoff episode.
+        const pto_was_nonzero = self.pto_count != 0;
         self.pto_count = 0;
         if (acked_count > 0) {
             self.events.emit(.{ .packets_acked = .{
@@ -2041,6 +2047,8 @@ pub const Connection = struct {
                 .largest_acknowledged = ack.largest_acknowledged,
                 .acked_count = acked_count,
             } });
+        }
+        if (acked_count > 0 or pto_was_nonzero) {
             self.emitRecoveryMetrics();
         }
 
@@ -2141,12 +2149,9 @@ pub const Connection = struct {
     }
 
     fn emitPeerFlowBlocked(self: *Connection, scope: FlowControlScope, stream_id: ?StreamId) void {
-        self.events.emit(.{ .flow_control_state_changed = .{
+        self.events.emit(.{ .flow_control_blocked_received = .{
             .scope = scope,
             .stream_id = stream_id,
-            .local = false,
-            .old = .unblocked,
-            .new = .blocked,
         } });
     }
 
@@ -2803,6 +2808,7 @@ pub const Connection = struct {
         self.close_reason_len = @min(reason.len, self.close_reason.len);
         @memcpy(self.close_reason[0..self.close_reason_len], reason[0..self.close_reason_len]);
         self.setState(.closing);
+        self.events.emit(.{ .close_sent = .{ .error_code = info.error_code, .is_application = info.is_application } });
         self.close_needs_send = true;
         self.close_deadline_us = now_us + 3 * self.ptoDurationNow();
     }
@@ -4213,7 +4219,6 @@ pub const Connection = struct {
         const active_key = self.paths.activePath().key;
         self.paths.recordSentOnPath(active_key, total);
         self.metrics.datagrams_sent += 1;
-        self.events.emit(.{ .close_sent = .{ .error_code = info.error_code, .is_application = use_app_frame } });
         return .{ .bytes = out[0..total], .path = active_key };
     }
 };
@@ -5938,6 +5943,45 @@ test "driver: invalid STOP_SENDING does not emit successful transition event" {
     try testing.expectEqual(@as(usize, 0), capture.stop_sending_events);
 }
 
+test "driver: valid peer STOP_SENDING emits the automatic local RESET_STREAM once" {
+    const Capture = struct {
+        remote_stop_sending: usize = 0,
+        local_reset: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .stop_sending => |stop| {
+                    if (!stop.local) self.remote_stop_sending += 1;
+                },
+                .stream_reset => |reset| {
+                    if (reset.local) self.local_reset += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id = try pair.server.openStream(.bidi);
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+
+    try pair.server.applyFrame(.application, .{ .stop_sending = .{ .id = id, .app_error_code = 7 } }, TestPair.server_path, 0, pair.now_us);
+    try testing.expectEqual(@as(usize, 1), capture.remote_stop_sending);
+    try testing.expectEqual(@as(usize, 1), capture.local_reset);
+
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us + 1_000);
+    try testing.expectEqual(@as(usize, 1), capture.remote_stop_sending);
+    try testing.expectEqual(@as(usize, 1), capture.local_reset);
+}
+
 test "driver: validated ACK reports recovery metrics after PTO backoff reset" {
     const Capture = struct {
         saw_zero_pto_metrics: bool = false,
@@ -5977,6 +6021,91 @@ test "driver: validated ACK reports recovery metrics after PTO backoff reset" {
     } }, TestPair.server_path, 0, pair.now_us + 1_000);
 
     try testing.expect(capture.saw_zero_pto_metrics);
+}
+
+test "driver: duplicate valid ACK clears PTO without emitting an ack summary" {
+    const Capture = struct {
+        ack_summaries: usize = 0,
+        saw_zero_pto_metrics: bool = false,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .packets_acked => self.ack_summaries += 1,
+                .recovery_metrics_updated => |metrics| {
+                    if (metrics.pto_count == 0) self.saw_zero_pto_metrics = true;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id = try pair.server.openStream(.bidi);
+    _ = try pair.server.writeStream(id, "pto-reset", false);
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    const sent = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
+
+    var ranges = recovery.AckRangeSet{};
+    try ranges.insert(sent.packet_number);
+    try pair.server.applyFrame(.application, .{ .ack = .{
+        .ranges = ranges,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = sent.packet_number,
+    } }, TestPair.server_path, 0, pair.now_us + 1_000);
+
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+    pair.server.pto_count = 2;
+
+    try pair.server.applyFrame(.application, .{ .ack = .{
+        .ranges = ranges,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = sent.packet_number,
+    } }, TestPair.server_path, 0, pair.now_us + 2_000);
+
+    try testing.expectEqual(@as(usize, 0), capture.ack_summaries);
+    try testing.expect(capture.saw_zero_pto_metrics);
+}
+
+test "driver: close retransmission does not duplicate semantic close event" {
+    const Capture = struct {
+        close_sent_events: usize = 0,
+        app_close: bool = false,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .close_sent => |close| {
+                    self.close_sent_events += 1;
+                    self.app_close = close.is_application;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var capture = Capture{};
+    pair.client.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+    pair.client.close(42, "app-close", pair.now_us);
+    try testing.expectEqual(@as(usize, 1), capture.close_sent_events);
+    try testing.expect(capture.app_close);
+
+    var out: [2048]u8 = undefined;
+    _ = pair.client.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    pair.client.close_needs_send = true;
+    _ = pair.client.pollTransmitOnPath(&out, pair.now_us + 1_000) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(usize, 1), capture.close_sent_events);
 }
 
 test "driver: server retires its 0-RTT read secret once it authenticates a 1-RTT packet (RFC 9001 §4.9.3)" {

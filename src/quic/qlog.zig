@@ -176,6 +176,11 @@ pub const DataBlocked = union(enum) {
     },
 };
 
+pub const FlowControlBlockedReceived = struct {
+    scope: enum { connection, stream },
+    stream_id: ?u64 = null,
+};
+
 /// Why an inbound packet was dropped. `decryption_failure` is the qlog
 /// canonical trigger for AEAD deprotection failure — the #255 requirement that
 /// deprotection failures are reported deterministically.
@@ -292,6 +297,9 @@ pub const Event = union(enum) {
     /// quic:connection_data_blocked_updated /
     /// quic:stream_data_blocked_updated (flow-control blocked)
     data_blocked: DataBlocked,
+    /// tardigrade:quic_flow_control_blocked_received (peer DATA_BLOCKED /
+    /// STREAM_DATA_BLOCKED frame observed; not this endpoint's blocked state)
+    flow_control_blocked_received: FlowControlBlockedReceived,
 
     pub fn namespace(self: Event) Namespace {
         return switch (self) {
@@ -311,6 +319,7 @@ pub const Event = union(enum) {
             .handshake_progressed,
             .packets_acked,
             .packets_lost,
+            .flow_control_blocked_received,
             => .tardigrade,
         };
     }
@@ -336,6 +345,7 @@ pub const Event = union(enum) {
                 .connection => "connection_data_blocked_updated",
                 .stream => "stream_data_blocked_updated",
             },
+            .flow_control_blocked_received => "quic_flow_control_blocked_received",
         };
     }
 };
@@ -549,6 +559,11 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
                 try b.add("}}", .{});
             },
         },
+        .flow_control_blocked_received => |d| {
+            try b.add("{{\"scope\":\"{s}\"", .{@tagName(d.scope)});
+            if (d.stream_id) |stream_id| try b.add(",\"stream_id\":{d}", .{stream_id});
+            try b.add("}}", .{});
+        },
     }
 }
 
@@ -724,6 +739,7 @@ test "path, migration, stream reset and flow-control events serialize" {
     try expectJson(.{ .time_us = 5, .event = .{ .stream_reset = .{ .kind = .reset_received, .stream_id = 4, .error_code = 9 } } }, "\"stream_id\":4");
     try expectJson(.{ .time_us = 5, .event = .{ .data_blocked = .{ .stream = .{ .stream_id = 8, .new = .blocked, .reason = .stream_flow_control } } } }, "\"name\":\"quic:stream_data_blocked_updated\"");
     try expectJson(.{ .time_us = 5, .event = .{ .data_blocked = .{ .connection = .{ .new = .blocked, .reason = .connection_flow_control } } } }, "\"name\":\"quic:connection_data_blocked_updated\"");
+    try expectJson(.{ .time_us = 5, .event = .{ .flow_control_blocked_received = .{ .scope = .stream, .stream_id = 8 } } }, "\"name\":\"tardigrade:quic_flow_control_blocked_received\"");
 }
 
 test "recovery metrics serialize as a quic event" {

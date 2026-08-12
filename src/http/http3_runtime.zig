@@ -1548,15 +1548,22 @@ pub const Runtime = struct {
                     .reason = .stream_flow_control,
                 } } },
             },
+            .flow_control_blocked_received => |blocked| .{ .flow_control_blocked_received = .{
+                .scope = switch (blocked.scope) {
+                    .connection => .connection,
+                    .stream => .stream,
+                },
+                .stream_id = blocked.stream_id,
+            } },
             .close_sent => |close| .{ .connection_closed = .{
-                .trigger = .@"error",
+                .trigger = if (close.is_application) .application else .@"error",
                 .close_error = if (close.is_application)
                     .{ .application_unknown = close.error_code }
                 else
                     .{ .connection_unknown = close.error_code },
             } },
             .close_received => |close| .{ .connection_closed = .{
-                .trigger = .@"error",
+                .trigger = if (close.is_application) .application else .@"error",
                 .close_error = if (close.is_application)
                     .{ .application_unknown = close.error_code }
                 else
@@ -2111,8 +2118,16 @@ test "http3 runtime: QUIC qlog adapter preserves normalized transport events" {
         Runtime.quicEventToQlog(.{ .flow_control_state_changed = .{ .scope = .stream, .stream_id = 12, .local = true, .old = .unblocked, .new = .blocked } }).?,
     );
     try testing.expectEqual(
+        quic.qlog.Event{ .flow_control_blocked_received = .{ .scope = .stream, .stream_id = 12 } },
+        Runtime.quicEventToQlog(.{ .flow_control_blocked_received = .{ .scope = .stream, .stream_id = 12 } }).?,
+    );
+    try testing.expectEqual(
         quic.qlog.Event{ .connection_closed = .{ .trigger = .idle_timeout } },
         Runtime.quicEventToQlog(.idle_timeout).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .connection_closed = .{ .trigger = .application, .close_error = .{ .application_unknown = 42 } } },
+        Runtime.quicEventToQlog(.{ .close_sent = .{ .error_code = 42, .is_application = true } }).?,
     );
 }
 

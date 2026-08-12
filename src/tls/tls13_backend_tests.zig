@@ -12786,6 +12786,21 @@ const Generations = struct {
     server_write: u64,
 };
 
+const KeylogCapture = struct {
+    client_generation_counts: [4]usize = .{0} ** 4,
+    server_generation_counts: [4]usize = .{0} ** 4,
+
+    fn emit(ctx: ?*anyopaque, entry: tls_core.keylog.Entry) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        if (entry.label.epoch != .application) return;
+        if (entry.label.generation >= self.client_generation_counts.len) return;
+        switch (entry.label.endpoint) {
+            .client => self.client_generation_counts[@intCast(entry.label.generation)] += 1,
+            .server => self.server_generation_counts[@intCast(entry.label.generation)] += 1,
+        }
+    }
+};
+
 fn generations(h: *SocketHarness) Generations {
     return .{
         .client_read = h.client.bridge.read_key_generation,
@@ -12877,6 +12892,40 @@ test "#357 a one-way KeyUpdate advances only the sending direction" {
     }, generations(h));
     try expectSecretsAgree(h);
     try expectTrafficBothWays(h, "after-update");
+}
+
+test "#357 real record-mode KeyUpdate emits NSS keylog generations from derived traffic secrets" {
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+
+    var capture = KeylogCapture{};
+    const context = tls_core.keylog.Context{
+        .enabled = true,
+        .sink = .{ .context = &capture, .emit_fn = KeylogCapture.emit },
+    };
+    try h.client.setKeylogContext(context);
+    try h.server.setKeylogContext(context);
+
+    try h.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expect(capture.client_generation_counts[0] > 0);
+    try std.testing.expect(capture.server_generation_counts[0] > 0);
+
+    try h.client.requestKeyUpdate(.update_not_requested);
+    try driveUntilServerRead(h, 1);
+    try std.testing.expectEqual(@as(usize, 2), capture.client_generation_counts[1]);
+
+    try h.client.requestKeyUpdate(.update_not_requested);
+    try driveUntilServerRead(h, 2);
+    try std.testing.expectEqual(@as(usize, 2), capture.client_generation_counts[2]);
+
+    try h.server.requestKeyUpdate(.update_not_requested);
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.client.bridge.read_key_generation == 1;
+        }
+    }.done);
+    try std.testing.expectEqual(@as(usize, 2), capture.server_generation_counts[1]);
+    try expectTrafficBothWays(h, "keylog-update");
 }
 
 test "#357 update_requested draws exactly one reciprocal update and then stops" {

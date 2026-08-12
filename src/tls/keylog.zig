@@ -70,8 +70,6 @@ pub const Context = struct {
     client_random: [client_random_len]u8 = [_]u8{0} ** client_random_len,
     has_client_random: bool = false,
     sink: Sink = .{},
-    read_application_generation: u64 = 0,
-    write_application_generation: u64 = 0,
 
     pub fn setClientRandom(self: *Context, random: []const u8) error{InvalidClientRandom}!void {
         if (random.len != client_random_len) return error.InvalidClientRandom;
@@ -80,21 +78,14 @@ pub const Context = struct {
     }
 
     pub fn emitSecret(self: *Context, epoch: events.EncryptionEpoch, direction: events.SecretDirection, secret: []const u8) void {
-        if (!self.enabled) return;
-        if (!self.has_client_random) return;
-        const generation = switch (direction) {
-            .read => self.read_application_generation,
-            .write => self.write_application_generation,
-        };
-        const label = labelFor(self.role, direction, epoch, generation) orelse return;
-        self.sink.emit(.{ .label = label, .client_random = &self.client_random, .secret = secret });
+        self.emitSecretAtGeneration(epoch, direction, 0, secret);
     }
 
-    pub fn noteKeyUpdate(self: *Context, direction: events.SecretDirection) void {
-        switch (direction) {
-            .read => self.read_application_generation += 1,
-            .write => self.write_application_generation += 1,
-        }
+    pub fn emitSecretAtGeneration(self: *Context, epoch: events.EncryptionEpoch, direction: events.SecretDirection, generation: u64, secret: []const u8) void {
+        if (!self.enabled) return;
+        if (!self.has_client_random) return;
+        const label = labelFor(self.role, direction, epoch, generation) orelse return;
+        self.sink.emit(.{ .label = label, .client_random = &self.client_random, .secret = secret });
     }
 };
 
@@ -207,8 +198,7 @@ test "context emits before caller resets or wipes event payloads" {
         .sink = .{ .context = &capture, .emit_fn = Capture.emit },
     };
     try ctx.setClientRandom(&random);
-    ctx.noteKeyUpdate(.write);
-    ctx.emitSecret(.application, .write, &secret);
+    ctx.emitSecretAtGeneration(.application, .write, 1, &secret);
     try testing.expectEqual(@as(usize, 1), capture.count);
     try testing.expectEqual(Label{ .endpoint = .server, .epoch = .application, .generation = 1 }, capture.label.?);
     try testing.expectEqualSlices(u8, &secret, capture.secret[0..capture.secret_len]);

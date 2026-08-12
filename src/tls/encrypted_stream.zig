@@ -13,6 +13,7 @@ const algorithms = @import("algorithms.zig");
 const alerts = @import("alerts.zig");
 const engine = @import("engine.zig");
 const events = @import("events.zig");
+const keylog = @import("keylog.zig");
 const key_update = @import("key_update.zig");
 const record_codec = @import("record_codec.zig");
 const record_epoch_bridge = @import("record_epoch_bridge.zig");
@@ -587,6 +588,14 @@ pub const PureZigRecordStream = struct {
         return stream_state;
     }
 
+    pub fn setKeylogContext(self: *PureZigRecordStream, context: keylog.Context) Error!void {
+        if (self.handshake_started) return error.InvalidHandshakeState;
+        const driver = if (self.handshake_driver) |*d| d else return error.InvalidHandshakeState;
+        var owned = context;
+        owned.role = self.role;
+        driver.sink.keylog_context = owned;
+    }
+
     /// The ALPN protocol negotiated by the handshake, or null if none was seen.
     pub fn negotiatedAlpn(self: *const PureZigRecordStream) ?[]const u8 {
         if (!self.alpn_captured) return null;
@@ -1143,7 +1152,7 @@ pub const PureZigRecordStream = struct {
                 // each direction's boundary in the right place -- this arm
                 // must not be hoisted or deferred.
                 .key_update => |update| {
-                    self.bridge.updateTrafficSecret(update.direction) catch |err| return self.fail(err);
+                    self.bridge.updateTrafficSecretWithKeylog(update.direction, &sink.keylog_context) catch |err| return self.fail(err);
                 },
                 .alpn => |protocol| {
                     try self.captureAlpn(protocol);
