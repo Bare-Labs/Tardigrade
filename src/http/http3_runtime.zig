@@ -1645,7 +1645,6 @@ pub const Runtime = struct {
             .slow_start => .slow_start,
             .congestion_avoidance => .congestion_avoidance,
             .recovery => .recovery,
-            .persistent_congestion => .persistent_congestion,
         };
     }
 

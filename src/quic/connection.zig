@@ -132,7 +132,7 @@ pub const IngestError = error{OutOfMemory};
 
 pub const FlowControlScope = enum { connection, stream };
 pub const FlowControlState = enum { blocked, unblocked };
-pub const CongestionState = enum { slow_start, congestion_avoidance, recovery, persistent_congestion };
+pub const CongestionState = enum { slow_start, congestion_avoidance, recovery };
 pub const StreamSide = enum { sending, receiving };
 pub const StreamSideState = enum { ready, closed, reset_sent, reset_received };
 pub const StreamStateTrigger = enum { local, remote };
@@ -6254,6 +6254,193 @@ test "driver: sparse ACK emits exact newly acked packet numbers" {
     try testing.expectEqual(@as(usize, 2), capture.count);
     try testing.expectEqual(@as(u64, 1), capture.packet_numbers[0]);
     try testing.expectEqual(@as(u64, 5), capture.packet_numbers[1]);
+}
+
+test "driver: ordinary loss at minimum window does not emit persistent congestion" {
+    const Capture = struct {
+        persistent_count: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .persistent_congestion => self.persistent_count += 1,
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+    pair.server.recovery.congestion.congestion_window = pair.server.recovery.congestion.minWindow();
+
+    const space = PacketNumberSpace.application;
+    const path_ref = pair.server.paths.activePathRef();
+    try ensureSentRecordCapacity(pair.server, pair.server.sent_records.items.len + 2);
+    inline for (.{ @as(u64, 1), @as(u64, 4) }) |pn| {
+        pair.server.recovery.onPacketSentAssumeCapacity(.{
+            .space = space,
+            .packet_number = pn,
+            .time_sent_us = pair.now_us,
+            .size = 100,
+            .ack_eliciting = true,
+            .in_flight = true,
+        });
+        pair.server.sent_records.addOneAssumeCapacity().* = .{
+            .space = space,
+            .packet_type = .one_rtt,
+            .packet_number = pn,
+            .ack_eliciting = true,
+            .sent_path = path_ref,
+            .sent_size = 100,
+        };
+    }
+    pair.server.next_pn[Connection.spaceIndex(space)] = 5;
+
+    var ranges = recovery.AckRangeSet{};
+    try ranges.insert(4);
+    pair.server.processAck(space, .{
+        .ranges = ranges,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = 4,
+    }, pair.now_us + 1_000);
+
+    try testing.expectEqual(pair.server.recovery.congestion.minWindow(), pair.server.recovery.congestion.congestion_window);
+    try testing.expectEqual(@as(usize, 0), capture.persistent_count);
+}
+
+test "driver: persistent congestion is emitted only from recovery loss result" {
+    const Capture = struct {
+        persistent_count: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .persistent_congestion => self.persistent_count += 1,
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    pair.server.recovery.rtt.update(100_000, 0);
+    const duration = pair.server.recovery.rtt.ptoDuration(.application) * 3;
+    const base = pair.now_us;
+    const space = PacketNumberSpace.application;
+    const path_ref = pair.server.paths.activePathRef();
+    try ensureSentRecordCapacity(pair.server, pair.server.sent_records.items.len + 3);
+    inline for (.{ @as(u64, 1), @as(u64, 2), @as(u64, 3) }) |pn| {
+        const sent_at = switch (pn) {
+            1 => base,
+            2 => base + duration,
+            else => base + duration * 2 - 1_000,
+        };
+        pair.server.recovery.onPacketSentAssumeCapacity(.{
+            .space = space,
+            .packet_number = pn,
+            .time_sent_us = sent_at,
+            .size = 100,
+            .ack_eliciting = true,
+            .in_flight = true,
+        });
+        pair.server.sent_records.addOneAssumeCapacity().* = .{
+            .space = space,
+            .packet_type = .one_rtt,
+            .packet_number = pn,
+            .ack_eliciting = true,
+            .sent_path = path_ref,
+            .sent_size = 100,
+        };
+    }
+    pair.server.next_pn[Connection.spaceIndex(space)] = 4;
+
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+    var ranges = recovery.AckRangeSet{};
+    try ranges.insert(3);
+    pair.server.processAck(space, .{
+        .ranges = ranges,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = 3,
+    }, base + duration * 2);
+
+    try testing.expectEqual(@as(usize, 1), capture.persistent_count);
+    try testing.expectEqual(pair.server.recovery.congestion.minWindow(), pair.server.recovery.congestion.congestion_window);
+}
+
+test "driver: ACK after recovery publishes congestion exit transition" {
+    const Capture = struct {
+        transitions: [4]Event = undefined,
+        count: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .congestion_state_changed => {
+                    self.transitions[self.count] = event;
+                    self.count += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const space = PacketNumberSpace.application;
+    const path_ref = pair.server.paths.activePathRef();
+    const recovery_start = pair.now_us;
+    pair.server.recovery.congestion.recovery_start_time_us = recovery_start;
+    pair.server.recovery.congestion.ssthresh = pair.server.recovery.congestion.congestion_window;
+
+    const pn: u64 = 9;
+    try ensureSentRecordCapacity(pair.server, pair.server.sent_records.items.len + 1);
+    pair.server.recovery.onPacketSentAssumeCapacity(.{
+        .space = space,
+        .packet_number = pn,
+        .time_sent_us = recovery_start + 1,
+        .size = 100,
+        .ack_eliciting = true,
+        .in_flight = true,
+    });
+    pair.server.sent_records.addOneAssumeCapacity().* = .{
+        .space = space,
+        .packet_type = .one_rtt,
+        .packet_number = pn,
+        .ack_eliciting = true,
+        .sent_path = path_ref,
+        .sent_size = 100,
+    };
+    pair.server.next_pn[Connection.spaceIndex(space)] = pn + 1;
+
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+    var ranges = recovery.AckRangeSet{};
+    try ranges.insert(pn);
+    pair.server.processAck(space, .{
+        .ranges = ranges,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = pn,
+    }, recovery_start + 2);
+
+    var saw_exit = false;
+    for (capture.transitions[0..capture.count]) |event| {
+        if (event.congestion_state_changed.old == .recovery and event.congestion_state_changed.new == .congestion_avoidance) {
+            saw_exit = true;
+        }
+    }
+    try testing.expect(saw_exit);
 }
 
 test "driver: close retransmission does not duplicate semantic close event" {
