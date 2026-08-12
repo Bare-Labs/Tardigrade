@@ -5035,24 +5035,34 @@ test "http3 runtime: socket buffer sizes are read back from the kernel, not assu
     try testing.expectEqual(grantedBufferBytes(tuned.recv.effective_bytes.?), tuned.recv.granted_bytes.?);
 }
 
-test "http3 runtime: a kernel ceiling below the request is reported as a clamp" {
-    // The failure this whole readback exists for: `setsockopt` succeeds, the
-    // kernel silently caps the size, and nothing outside the process can tell.
-    // Asking for the ABI maximum guarantees the cap on any host — no kernel
-    // grants a 1 GiB socket buffer by default — so this exercises the clamp
-    // path rather than describing it.
-    //
-    // On Linux the raw reading of that capped buffer is doubled and can exceed
-    // the request outright; the classification must still be `clamped`, which
-    // is what pins the false positive shut.
+test "http3 runtime: a real kernel's answer to the largest request is classified consistently" {
+    // The clamp *regression* is the deterministic classifier test in
+    // `quic.udp`; this checks the same policy against a real kernel, where the
+    // answer depends on the host. Asking for the maximum will be capped almost
+    // everywhere, but a deliberately tuned host can grant it — and a
+    // correctness test must not fail because someone raised their socket
+    // ceiling. So this asserts the invariants that must hold either way rather
+    // than demanding a particular verdict.
     const fd = openUdpSocket(posix.AF.INET);
     if (fd < 0) return error.SkipZigTest;
     defer _ = std.c.close(fd);
 
     const outcome = tuneSocketBuffer(fd, posix.SO.RCVBUF, quic.udp.max_buffer_bytes);
     if (outcome.status == .unsupported or outcome.status == .unverified) return error.SkipZigTest;
-    try testing.expectEqual(quic.udp.BufferTuningStatus.clamped, outcome.status);
-    try testing.expect(outcome.granted_bytes.? < quic.udp.max_buffer_bytes);
+    try testing.expectEqual(@as(?usize, quic.udp.max_buffer_bytes), outcome.requested_bytes);
+
+    // Whatever the kernel decided, the verdict follows from the
+    // request-comparable reading and nothing else. On Linux the raw reading of
+    // a capped buffer is doubled and can exceed the request outright, so a
+    // `clamped` verdict alongside an `effective_bytes` larger than the request
+    // is precisely the false positive this pins shut.
+    const granted = outcome.granted_bytes.?;
+    switch (outcome.status) {
+        .clamped => try testing.expect(granted < quic.udp.max_buffer_bytes),
+        .applied => try testing.expect(granted >= quic.udp.max_buffer_bytes),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(grantedBufferBytes(outcome.effective_bytes.?), granted);
 }
 
 test "http3 runtime: only Linux restates socket buffer readings" {
@@ -5080,10 +5090,11 @@ test "http3 runtime: an oversized buffer request never reaches the kernel as one
     try testing.expect(outcome.status != .default);
 }
 
-test "http3 runtime: an unsatisfiable buffer request still yields a working listener" {
-    // Socket buffer sizing is a performance setting. A host whose ceiling is
-    // far below the request must still get a bound, bootstrapped listener —
-    // the outcome is published for diagnosis instead of failing startup.
+test "http3 runtime: the largest possible buffer request still yields a working listener" {
+    // Socket buffer sizing is a performance setting. Whatever the host makes
+    // of a maximum-sized request — granting it, capping it, refusing it — the
+    // listener must still come up bound and bootstrapped, with the outcome
+    // published for diagnosis instead of failing startup.
     var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
     defer fixed.deinit();
     var logger = logger_mod.Logger.init(.err, "http3-test");

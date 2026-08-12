@@ -196,8 +196,12 @@ will do this under bursts even when the link is idle.
 `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES` request `SO_RCVBUF` / `SO_SNDBUF` on
 the listener socket. Both default to `0`, meaning **leave the kernel's own
 sizing alone** — the right setting unless you have measured drops. Requests are
-clamped into `[2048, 1073741824]` before reaching the kernel, since the
-`setsockopt` ABI takes a signed 32-bit size and a typo must not wrap it.
+clamped into `[2048, 1073741823]` before reaching the kernel: the `setsockopt`
+ABI takes a signed 32-bit size and a typo must not wrap it. The upper bound is
+`INT_MAX / 2` rather than a round 1 GiB because Linux stores twice what it is
+given and caps a request at that same figure first — asking for 1 GiB exactly
+would be reduced by a byte and then reported as clamped forever, blaming a
+sysctl that was never the cause.
 
 Everything here is advisory. A kernel that refuses the request, or grants less
 than was asked for, still gets a listener that serves HTTP/3 correctly — buffer

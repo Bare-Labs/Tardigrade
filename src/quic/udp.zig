@@ -87,12 +87,19 @@ pub const BufferTuning = struct {
 
 /// Bounds on a socket buffer request. The upper bound is not a policy opinion
 /// about how much buffering is useful — kernels clamp long before this — it
-/// keeps the request inside the `c_int` every `setsockopt(SO_RCVBUF)` ABI
-/// takes, so an operator typo cannot wrap into a negative size. The lower
-/// bound is below every kernel minimum this code knows of, so it only catches
-/// values that could not have been meant.
+/// keeps the request inside what the platform can actually represent, so an
+/// operator typo cannot wrap into a negative size. The lower bound is below
+/// every kernel minimum this code knows of, so it only catches values that
+/// could not have been meant.
+///
+/// The upper bound is `INT_MAX / 2` rather than a round 1 GiB because the
+/// `setsockopt` ABI takes a signed 32-bit size *and* Linux stores twice what
+/// it is given: a request has to leave room for that doubling to stay
+/// representable. Asking for 1 GiB exactly would be silently reduced by one
+/// byte on Linux and then reported as a clamp forever — pointing the operator
+/// at a `net.core.rmem_max` that was never the cause.
 pub const min_buffer_bytes: usize = 2048;
-pub const max_buffer_bytes: usize = 1 << 30;
+pub const max_buffer_bytes: usize = @as(usize, std.math.maxInt(c_int)) / 2;
 
 pub fn clampBufferBytes(requested: usize) usize {
     return std.math.clamp(requested, min_buffer_bytes, max_buffer_bytes);
@@ -444,6 +451,34 @@ test "socket buffer requests stay inside the setsockopt ABI" {
     try std.testing.expect(max_buffer_bytes <= std.math.maxInt(c_int));
     try std.testing.expectEqual(min_buffer_bytes, clampBufferBytes(1));
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), clampBufferBytes(4 * 1024 * 1024));
+
+    // The bound has to survive *doubling*, not just the ABI: Linux stores
+    // twice what it is given and caps the request at `INT_MAX / 2` first, so a
+    // maximum that leaves no room for the doubling would be reduced by the
+    // kernel and could never be granted in full.
+    try std.testing.expect(max_buffer_bytes * 2 <= std.math.maxInt(c_int));
+}
+
+test "the maximum request is grantable, not permanently clamped by its own bound" {
+    // The exact upper boundary must be able to come back `applied` on a host
+    // whose ceiling permits it. A maximum the platform cannot represent would
+    // report a one-byte clamp forever and send the operator after a sysctl
+    // that was never the cause.
+    const at_maximum = classifyBufferOutcome(max_buffer_bytes, true, .{
+        // What Linux reports for a fully granted maximum: twice the request.
+        .reported_bytes = max_buffer_bytes * 2,
+        .granted_bytes = max_buffer_bytes,
+    });
+    try std.testing.expectEqual(BufferTuningStatus.applied, at_maximum.status);
+    try std.testing.expectEqual(@as(?usize, max_buffer_bytes), at_maximum.granted_bytes);
+
+    // And a host ceiling below it is still a clamp, so making the maximum
+    // reachable did not cost the diagnostic.
+    const capped_at_maximum = classifyBufferOutcome(max_buffer_bytes, true, .{
+        .reported_bytes = 425_984,
+        .granted_bytes = 212_992,
+    });
+    try std.testing.expectEqual(BufferTuningStatus.clamped, capped_at_maximum.status);
 }
 
 test "DCID routing key owns a bounded connection ID" {
