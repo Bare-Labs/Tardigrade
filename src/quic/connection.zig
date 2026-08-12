@@ -1919,6 +1919,12 @@ pub const Connection = struct {
     }
 
     fn processAck(self: *Connection, space: PacketNumberSpace, ack: frame.Ack, now_us: u64) void {
+        const space_idx = spaceIndex(space);
+        if (ack.largest_acknowledged >= self.next_pn[space_idx]) {
+            self.startClose(.{ .error_code = error_protocol_violation, .is_application = false, .local = true }, "ACK for unsent packet", now_us);
+            return;
+        }
+
         const exponent: u6 = if (self.adapter.peerTransportParameters()) |peer|
             @intCast(@min(peer.ack_delay_exponent, 20))
         else
@@ -5772,6 +5778,29 @@ test "driver: frames illegal in 0-RTT close the connection instead of taking eff
     }
 }
 
+test "driver: ACK for unsent packet closes without poisoning packet number reference" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const space_idx = 2;
+    const before = pair.server.largest_peer_acked[space_idx];
+    const unsent = pair.server.next_pn[space_idx];
+    var ranges = recovery.AckRangeSet{};
+    try ranges.insert(unsent);
+
+    try pair.server.applyFrame(.application, .{ .ack = .{
+        .ranges = ranges,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = unsent,
+    } }, TestPair.server_path, 0, pair.now_us);
+
+    try testing.expectEqual(State.closing, pair.server.state());
+    try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
+    try testing.expectEqual(before, pair.server.largest_peer_acked[space_idx]);
+}
+
 test "driver: server retires its 0-RTT read secret once it authenticates a 1-RTT packet (RFC 9001 §4.9.3)" {
     const allocator = testing.allocator;
     var pair = try TestPair.init(allocator);
@@ -6338,7 +6367,8 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
         // the server's ACK for it looks like an ACK for a packet the client
         // never sent — a protocol violation (RFC 9000 §13.1) the client now
         // rejects — and the handshake below would close instead of completing.
-        resumed.client.next_pn[Connection.spaceIndex(.application)] = 1;
+        const app_space = Connection.spaceIndex(.application);
+        resumed.client.next_pn[app_space] = @max(resumed.client.next_pn[app_space], 1);
         try resumed.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, resumed.now_us);
 
         try testing.expect(resumed.server.streamTransportEarly(4));
