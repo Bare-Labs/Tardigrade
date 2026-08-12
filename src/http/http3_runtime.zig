@@ -1845,6 +1845,23 @@ fn socketBufferBytes(fd: std.c.fd_t, option: u32) ?usize {
     return @intCast(value);
 }
 
+/// Restate a `getsockopt` reading in the units the request was made in, which
+/// is the only basis on which "did the kernel grant this?" can be answered.
+///
+/// Linux stores `SO_RCVBUF`/`SO_SNDBUF` as twice the requested size — the
+/// extra half is `sk_buff` bookkeeping, not payload capacity — and reports the
+/// doubled figure. Comparing that figure against the request would report a
+/// grant whenever the kernel gave *more than half* of what was asked for: a
+/// 256 KiB request on a host whose `net.core.rmem_max` is 208 KiB reads back
+/// as 416 KiB and would look like a success, which is precisely the silent
+/// clamp this readback exists to expose.
+///
+/// This lives here rather than in `src/quic/udp.zig` because it is a fact
+/// about the host's socket API, not about QUIC.
+fn grantedBufferBytes(reported: usize) usize {
+    return if (builtin.os.tag == .linux) reported / 2 else reported;
+}
+
 /// Apply one direction's requested socket buffer size and report what the
 /// kernel did with it (#256-D).
 ///
@@ -1860,11 +1877,15 @@ fn tuneSocketBuffer(fd: std.c.fd_t, option: u32, requested: ?usize) quic.udp.Buf
     // that explains a benchmark run or a report of unexplained loss, and it
     // is only knowable from inside this process.
     const want = requested orelse
-        return quic.udp.classifyBufferOutcome(null, false, socketBufferBytes(fd, option));
+        return quic.udp.classifyBufferOutcome(null, false, .{ .reported_bytes = socketBufferBytes(fd, option) });
     const clamped = quic.udp.clampBufferBytes(want);
     const value: c_int = @intCast(clamped);
     const accepted = if (posix.setsockopt(fd, posix.SOL.SOCKET, option, std.mem.asBytes(&value))) |_| true else |_| false;
-    return quic.udp.classifyBufferOutcome(clamped, accepted, socketBufferBytes(fd, option));
+    const reported = socketBufferBytes(fd, option);
+    return quic.udp.classifyBufferOutcome(clamped, accepted, .{
+        .reported_bytes = reported,
+        .granted_bytes = if (reported) |bytes| grantedBufferBytes(bytes) else null,
+    });
 }
 
 fn tuneSocketBuffers(fd: std.c.fd_t, tuning: quic.udp.BufferTuning) quic.udp.EffectiveBufferTuning {
@@ -1897,14 +1918,20 @@ fn logSocketBufferOutcome(
         .default => if (outcome.effective_bytes != null) {
             logger.info(null, "http3: udp {s} buffer at kernel default effective_bytes={d}", .{ direction, effective });
         },
-        .applied => logger.info(null, "http3: udp {s} buffer applied requested_bytes={d} effective_bytes={d}", .{
+        // `granted_bytes` is the request-comparable reading and `effective_bytes`
+        // the raw one the kernel will report to anyone who inspects the socket.
+        // Both are logged: on Linux they differ by design, and an operator
+        // checking the two against each other should find them consistent.
+        .applied => logger.info(null, "http3: udp {s} buffer applied requested_bytes={d} granted_bytes={d} effective_bytes={d}", .{
             direction,
             outcome.requested_bytes orelse 0,
+            outcome.granted_bytes orelse 0,
             effective,
         }),
-        .clamped => logger.warn(null, "http3: udp {s} buffer clamped by the kernel requested_bytes={d} effective_bytes={d}; raise {s} on the host or lower the configured request", .{
+        .clamped => logger.warn(null, "http3: udp {s} buffer clamped by the kernel requested_bytes={d} granted_bytes={d} effective_bytes={d}; raise {s} on the host or lower the configured request", .{
             direction,
             outcome.requested_bytes orelse 0,
+            outcome.granted_bytes orelse 0,
             effective,
             socket_buffer_ceiling_hint,
         }),
@@ -4989,15 +5016,52 @@ test "http3 runtime: socket buffer sizes are read back from the kernel, not assu
     try testing.expect(untouched.recv.effective_bytes != null);
     try testing.expect(untouched.send.effective_bytes != null);
 
-    // A request every kernel this runs on can satisfy from its default
-    // ceiling, so the outcome is a grant rather than a clamp.
-    const requested: usize = 256 * 1024;
-    const tuned = tuneSocketBuffers(fd, .{ .recv_bytes = requested, .send_bytes = requested });
+    // A satisfiable request, *derived from this host* rather than assumed: no
+    // fixed constant is below every kernel's ceiling, and a hardcoded one that
+    // happens to pass says nothing about the grant path. Half of what the
+    // socket already has is inside any ceiling that produced that default.
+    const recv_request = quic.udp.clampBufferBytes(grantedBufferBytes(untouched.recv.effective_bytes.?) / 2);
+    const send_request = quic.udp.clampBufferBytes(grantedBufferBytes(untouched.send.effective_bytes.?) / 2);
+    const tuned = tuneSocketBuffers(fd, .{ .recv_bytes = recv_request, .send_bytes = send_request });
     try testing.expectEqual(quic.udp.BufferTuningStatus.applied, tuned.recv.status);
     try testing.expectEqual(quic.udp.BufferTuningStatus.applied, tuned.send.status);
-    try testing.expectEqual(@as(?usize, requested), tuned.recv.requested_bytes);
-    try testing.expect(tuned.recv.effective_bytes.? >= requested);
-    try testing.expect(tuned.send.effective_bytes.? >= requested);
+    try testing.expectEqual(@as(?usize, recv_request), tuned.recv.requested_bytes);
+
+    // The grant is judged in request units. On Linux the raw reading is about
+    // twice that; asserting on the raw reading instead would pass for the
+    // wrong reason there.
+    try testing.expect(tuned.recv.granted_bytes.? >= recv_request);
+    try testing.expect(tuned.send.granted_bytes.? >= send_request);
+    try testing.expectEqual(grantedBufferBytes(tuned.recv.effective_bytes.?), tuned.recv.granted_bytes.?);
+}
+
+test "http3 runtime: a kernel ceiling below the request is reported as a clamp" {
+    // The failure this whole readback exists for: `setsockopt` succeeds, the
+    // kernel silently caps the size, and nothing outside the process can tell.
+    // Asking for the ABI maximum guarantees the cap on any host — no kernel
+    // grants a 1 GiB socket buffer by default — so this exercises the clamp
+    // path rather than describing it.
+    //
+    // On Linux the raw reading of that capped buffer is doubled and can exceed
+    // the request outright; the classification must still be `clamped`, which
+    // is what pins the false positive shut.
+    const fd = openUdpSocket(posix.AF.INET);
+    if (fd < 0) return error.SkipZigTest;
+    defer _ = std.c.close(fd);
+
+    const outcome = tuneSocketBuffer(fd, posix.SO.RCVBUF, quic.udp.max_buffer_bytes);
+    if (outcome.status == .unsupported or outcome.status == .unverified) return error.SkipZigTest;
+    try testing.expectEqual(quic.udp.BufferTuningStatus.clamped, outcome.status);
+    try testing.expect(outcome.granted_bytes.? < quic.udp.max_buffer_bytes);
+}
+
+test "http3 runtime: only Linux restates socket buffer readings" {
+    // The doubling is a Linux storage detail, not a portable one: Darwin and
+    // the BSDs report what was set. Halving elsewhere would invent a clamp
+    // that never happened and warn on every correctly applied request.
+    const reported: usize = 8 * 1024 * 1024;
+    const expected: usize = if (builtin.os.tag == .linux) reported / 2 else reported;
+    try testing.expectEqual(expected, grantedBufferBytes(reported));
 }
 
 test "http3 runtime: an oversized buffer request never reaches the kernel as one" {

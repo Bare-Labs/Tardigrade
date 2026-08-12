@@ -208,7 +208,7 @@ so the size is **read back with `getsockopt`** and reported:
 | Log | Meaning |
 | --- | --- |
 | `udp receive buffer at kernel default effective_bytes=N` | Nothing requested. `N` is what the socket has. |
-| `udp receive buffer applied requested_bytes=N effective_bytes=M` | Granted. |
+| `udp receive buffer applied requested_bytes=N granted_bytes=N effective_bytes=M` | Granted. |
 | `udp receive buffer clamped by the kernel …` | The request was accepted and cut down by a host-wide ceiling. Only the host operator can raise it. |
 | `udp receive buffer … accepted but could not be read back` | The size is unknown; nothing was measured. |
 | `udp receive buffer request rejected by the kernel …` | The default buffer stands. |
@@ -220,10 +220,17 @@ numbers, and `setsockopt` reports success either way:
   `net.core.wmem_max`) — commonly 208 KiB on a stock kernel — so a listener
   asking for 16 MiB gets a fraction of it and no indication from the syscall.
   Raise the ceiling on the host (`sysctl -w net.core.rmem_max=8388608`,
-  persisted in `/etc/sysctl.d/`) before raising the request. Linux also reports
-  roughly **twice** what was set: the other half is per-datagram bookkeeping
-  overhead, not payload capacity, so a readback of 8 MiB for a 4 MiB request is
-  normal and is treated as a grant.
+  persisted in `/etc/sysctl.d/`) before raising the request.
+
+  Linux also stores and reports **twice** what was set: the other half is
+  per-datagram bookkeeping overhead, not payload capacity. Grant-versus-clamp
+  is therefore decided on the reading *restated in request units* — the half
+  that corresponds to what was asked for — and not on the raw number, which
+  would report a success whenever the kernel granted more than half the
+  request. A 256 KiB request on a host capped at 208 KiB reads back as
+  416 KiB: larger than the request, and still a clamp. Both figures are
+  logged, as `granted_bytes` and `effective_bytes`; the second is what the
+  kernel will tell anyone who inspects the socket directly.
 - **macOS and the BSDs** bound the total per-socket buffer with
   `kern.ipc.maxsockbuf` rather than per direction, and return the size set
   rather than a doubled one.

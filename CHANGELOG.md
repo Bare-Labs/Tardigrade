@@ -19,9 +19,13 @@ All notable user-facing changes to Tardigrade are documented here.
   performance setting and not worth failing startup over. It is not, however,
   allowed to fail silently. The size is read back with `getsockopt` — Linux
   caps requests at `net.core.rmem_max` while `setsockopt` still reports
-  success, and returns roughly double what was set — so the listener logs and
-  publishes what the kernel actually granted, distinguishing a grant from a
-  clamp, an outright refusal, and an accepted-but-unreadable result. Effective
+  success — so the listener logs and publishes what the kernel actually
+  granted, distinguishing a grant from a clamp, an outright refusal, and an
+  accepted-but-unreadable result. Linux stores and reports twice what was set
+  (the other half is bookkeeping, not payload capacity), so that judgement is
+  made on the reading restated in request units: a 256 KiB request capped at
+  208 KiB reads back as 416 KiB, which is larger than the request and still a
+  clamp. Effective
   values appear on the runtime status snapshot, and competitive benchmark runs
   now record the host's UDP buffer ceilings alongside their results.
 - **QUIC discovers the path MTU instead of assuming one (#256-B)** — Tardigrade

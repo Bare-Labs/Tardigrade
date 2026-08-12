@@ -124,16 +124,41 @@ pub const BufferTuningStatus = enum {
     unsupported,
 };
 
+/// One `getsockopt` readback, in both the units the kernel reports it in and
+/// the units the request was made in.
+///
+/// On most platforms these are the same number. Linux is the reason they are
+/// separate fields: it stores `SO_RCVBUF`/`SO_SNDBUF` as *twice* the requested
+/// size — the other half is per-datagram bookkeeping, not payload capacity —
+/// and reports the doubled figure. Comparing that figure to the request would
+/// call a grant of half what was asked for a success, which is exactly the
+/// case this whole readback exists to catch.
+///
+/// Translating between the two is a property of the OS, not of QUIC, so the
+/// caller that owns the socket owns the translation and this layer stays
+/// OS-neutral.
+pub const BufferReadback = struct {
+    /// Exactly what `getsockopt` returned. `null` when the readback failed.
+    /// This is the number to report: it is what the kernel will say if an
+    /// operator checks the socket themselves.
+    reported_bytes: ?usize = null,
+    /// The same measurement restated in the units the request was made in, so
+    /// it can be compared against it. `null` when nothing was requested or
+    /// the readback failed.
+    granted_bytes: ?usize = null,
+};
+
 /// One direction's tuning result. `effective_bytes` is what `getsockopt` read
 /// back, never what was asked for: kernels adjust these requests and the
-/// adjustment is the interesting part. Linux in particular returns roughly
-/// *twice* what was set — it reserves the other half for its own per-datagram
-/// bookkeeping — so a readback larger than the request is normal there and is
-/// not evidence of extra payload capacity.
+/// adjustment is the interesting part. `granted_bytes` is that same reading
+/// made comparable to `requested_bytes` (see `BufferReadback`), and is what
+/// the grant/clamp decision is made on.
 pub const BufferOutcome = struct {
     requested_bytes: ?usize = null,
     /// `null` when the readback itself failed.
     effective_bytes: ?usize = null,
+    /// `null` when nothing was requested, or when the readback failed.
+    granted_bytes: ?usize = null,
     status: BufferTuningStatus = .default,
 };
 
@@ -144,25 +169,31 @@ pub const EffectiveBufferTuning = struct {
 
 /// Classify one direction's tuning attempt from what the socket layer
 /// observed: what was asked for, whether `setsockopt` accepted it, and what
-/// `getsockopt` read back afterwards (`null` if that failed).
+/// `getsockopt` read back afterwards.
 ///
 /// Deliberately platform-neutral and syscall-free so the policy is testable
-/// without a socket — the caller owns the syscalls, this owns the meaning.
-pub fn classifyBufferOutcome(requested: ?usize, accepted: bool, effective: ?usize) BufferOutcome {
-    const want = requested orelse return .{ .effective_bytes = effective, .status = .default };
+/// without a socket — the caller owns the syscalls and the platform's readback
+/// semantics, this owns the meaning.
+pub fn classifyBufferOutcome(requested: ?usize, accepted: bool, readback: BufferReadback) BufferOutcome {
+    const want = requested orelse return .{
+        .effective_bytes = readback.reported_bytes,
+        .status = .default,
+    };
     if (!accepted) return .{
         .requested_bytes = want,
-        .effective_bytes = effective,
+        .effective_bytes = readback.reported_bytes,
         .status = .unsupported,
     };
-    const got = effective orelse return .{
+    const granted = readback.granted_bytes orelse return .{
         .requested_bytes = want,
+        .effective_bytes = readback.reported_bytes,
         .status = .unverified,
     };
     return .{
         .requested_bytes = want,
-        .effective_bytes = got,
-        .status = if (got >= want) .applied else .clamped,
+        .effective_bytes = readback.reported_bytes,
+        .granted_bytes = granted,
+        .status = if (granted >= want) .applied else .clamped,
     };
 }
 
@@ -277,8 +308,14 @@ const FakeEndpoint = struct {
         const self: *FakeEndpoint = @ptrCast(@alignCast(ctx));
         self.last_tuning = tuning;
         return .{
-            .recv = classifyBufferOutcome(tuning.recv_bytes, true, tuning.recv_bytes),
-            .send = classifyBufferOutcome(tuning.send_bytes, true, tuning.send_bytes),
+            .recv = classifyBufferOutcome(tuning.recv_bytes, true, .{
+                .reported_bytes = tuning.recv_bytes,
+                .granted_bytes = tuning.recv_bytes,
+            }),
+            .send = classifyBufferOutcome(tuning.send_bytes, true, .{
+                .reported_bytes = tuning.send_bytes,
+                .granted_bytes = tuning.send_bytes,
+            }),
         };
     }
 
@@ -332,39 +369,71 @@ test "UDP endpoint exposes send and buffer tuning hooks" {
 test "socket buffer tuning reports what the kernel did, not what was asked" {
     // Nothing requested: the kernel default stands, and reading it back is
     // still worth doing — benchmark metadata wants the number either way.
-    const untouched = classifyBufferOutcome(null, false, 212_992);
+    const untouched = classifyBufferOutcome(null, false, .{ .reported_bytes = 212_992 });
     try std.testing.expectEqual(BufferTuningStatus.default, untouched.status);
     try std.testing.expectEqual(@as(?usize, null), untouched.requested_bytes);
     try std.testing.expectEqual(@as(?usize, 212_992), untouched.effective_bytes);
 
-    // Linux hands back about twice what was set — it reserves the rest for
-    // bookkeeping — so a larger readback is a grant, not an anomaly.
-    const doubled = classifyBufferOutcome(4 * 1024 * 1024, true, 8 * 1024 * 1024);
-    try std.testing.expectEqual(BufferTuningStatus.applied, doubled.status);
-
-    // Exactly what was asked for (Darwin, BSD) is equally a grant.
-    const exact = classifyBufferOutcome(4 * 1024 * 1024, true, 4 * 1024 * 1024);
+    // Exactly what was asked for (Darwin, BSD) is a grant.
+    const exact = classifyBufferOutcome(4 * 1024 * 1024, true, .{
+        .reported_bytes = 4 * 1024 * 1024,
+        .granted_bytes = 4 * 1024 * 1024,
+    });
     try std.testing.expectEqual(BufferTuningStatus.applied, exact.status);
 
     // The interesting case: `setsockopt` succeeded and the kernel still gave
     // a fraction of the request, because a system-wide ceiling
     // (`net.core.rmem_max`) outranks it. Silent without a readback.
-    const ceiling = classifyBufferOutcome(64 * 1024 * 1024, true, 425_984);
+    const ceiling = classifyBufferOutcome(64 * 1024 * 1024, true, .{
+        .reported_bytes = 425_984,
+        .granted_bytes = 212_992,
+    });
     try std.testing.expectEqual(BufferTuningStatus.clamped, ceiling.status);
     try std.testing.expectEqual(@as(?usize, 64 * 1024 * 1024), ceiling.requested_bytes);
     try std.testing.expectEqual(@as(?usize, 425_984), ceiling.effective_bytes);
+    try std.testing.expectEqual(@as(?usize, 212_992), ceiling.granted_bytes);
 
     // Accepted but unreadable is not `applied`: nothing was measured, and
     // claiming otherwise would invent a number the process never saw.
-    const unverified = classifyBufferOutcome(4 * 1024 * 1024, true, null);
+    const unverified = classifyBufferOutcome(4 * 1024 * 1024, true, .{});
     try std.testing.expectEqual(BufferTuningStatus.unverified, unverified.status);
     try std.testing.expectEqual(@as(?usize, null), unverified.effective_bytes);
+    try std.testing.expectEqual(@as(?usize, null), unverified.granted_bytes);
 
     // Refused outright: the default buffer is what the socket has, and it is
     // reported rather than the request that failed.
-    const refused = classifyBufferOutcome(4 * 1024 * 1024, false, 212_992);
+    const refused = classifyBufferOutcome(4 * 1024 * 1024, false, .{ .reported_bytes = 212_992 });
     try std.testing.expectEqual(BufferTuningStatus.unsupported, refused.status);
     try std.testing.expectEqual(@as(?usize, 212_992), refused.effective_bytes);
+}
+
+test "a doubled Linux readback is judged in request units, not kernel units" {
+    // Linux stores twice what was set and reports the doubled figure. Judging
+    // a request against that figure would call any grant of more than half the
+    // request a success — including the ones this readback exists to catch —
+    // so the decision is made on the reading restated in request units, while
+    // the raw kernel number is still what gets reported.
+
+    // A true grant: 4 MiB set, 8 MiB reported, 4 MiB actually granted.
+    const granted = classifyBufferOutcome(4 * 1024 * 1024, true, .{
+        .reported_bytes = 8 * 1024 * 1024,
+        .granted_bytes = 4 * 1024 * 1024,
+    });
+    try std.testing.expectEqual(BufferTuningStatus.applied, granted.status);
+    try std.testing.expectEqual(@as(?usize, 8 * 1024 * 1024), granted.effective_bytes);
+    try std.testing.expectEqual(@as(?usize, 4 * 1024 * 1024), granted.granted_bytes);
+
+    // The false-positive window: a 300 KiB request on a host whose
+    // `net.core.rmem_max` is 208 KiB. The kernel caps at the ceiling and
+    // reports 416 KiB — larger than the request — while the operator got
+    // barely two thirds of what they asked for.
+    const capped = classifyBufferOutcome(307_200, true, .{
+        .reported_bytes = 425_984,
+        .granted_bytes = 212_992,
+    });
+    try std.testing.expectEqual(BufferTuningStatus.clamped, capped.status);
+    try std.testing.expect(capped.effective_bytes.? > capped.requested_bytes.?);
+    try std.testing.expect(capped.granted_bytes.? < capped.requested_bytes.?);
 }
 
 test "socket buffer requests stay inside the setsockopt ABI" {
