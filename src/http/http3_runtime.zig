@@ -1734,6 +1734,66 @@ fn cidSliceContains(cids: []const quic.cid.ConnectionId, needle: quic.cid.Connec
     return false;
 }
 
+/// The IPv4/IPv6 socket options that disable source fragmentation on this
+/// platform, or null where no such API has been verified.
+///
+/// These are *not* portable across the BSDs and must not be grouped: Apple's
+/// `<netinet/in.h>` defines IPv4 `IP_DONTFRAG` as 28, FreeBSD's defines it as
+/// 67, and OpenBSD uses option 28 for `IP_IPSEC_REMOTE_AUTH` entirely. Since
+/// this helper's return value is the gate that unlocks discovery above 1200, a
+/// wrong constant that some kernel happens to *accept* would report success
+/// without ever setting DF — the exact false-positive the gate exists to
+/// prevent. An unverified platform therefore returns null and stays on the
+/// conservative 1200-byte policy rather than guessing.
+const NoFragmentOptions = struct {
+    level_v4: u32,
+    option_v4: u32,
+    level_v6: u32,
+    option_v6: u32,
+    /// Linux's `IP_PMTUDISC_PROBE` is a mode value; the DF-only platforms set
+    /// a boolean instead.
+    value: c_int,
+};
+
+const no_fragment_options: ?NoFragmentOptions = switch (builtin.os.tag) {
+    // `IP_PMTUDISC_PROBE` sets DF *and* ignores the kernel's cached path MTU,
+    // which RFC 8899 §4.5 requires so DPLPMTUD is the thing in control.
+    .linux => .{
+        .level_v4 = posix.IPPROTO.IP,
+        .option_v4 = std.os.linux.IP.MTU_DISCOVER,
+        .level_v6 = posix.IPPROTO.IPV6,
+        .option_v6 = std.os.linux.IPV6.MTU_DISCOVER,
+        .value = std.os.linux.IP.PMTUDISC_PROBE,
+    },
+    // Darwin: IP_DONTFRAG (28) / IPV6_DONTFRAG (62) from <netinet/in.h> and
+    // <netinet6/in6.h>; not exposed by Zig's darwin bindings. DF only — there
+    // is no probe mode, so a kernel-cached PMTU can still bound a probe. That
+    // costs discovery reach, never soundness: a probe the kernel refuses to
+    // send simply fails, and a failed probe never validates a size.
+    .macos, .ios, .tvos, .watchos => .{
+        .level_v4 = posix.IPPROTO.IP,
+        .option_v4 = 28,
+        .level_v6 = posix.IPPROTO.IPV6,
+        .option_v6 = 62,
+        .value = 1,
+    },
+    // FreeBSD: IP_DONTFRAG is 67 there, *not* Darwin's 28.
+    .freebsd => .{
+        .level_v4 = posix.IPPROTO.IP,
+        .option_v4 = 67,
+        .level_v6 = posix.IPPROTO.IPV6,
+        .option_v6 = 62,
+        .value = 1,
+    },
+    // NetBSD/OpenBSD/DragonFly expose no IPv4 no-fragment option this code has
+    // verified, so they take the conservative path rather than a guess.
+    else => null,
+};
+
+/// Whether this platform has a verified no-source-fragmentation API at all.
+/// Discovery above the RFC 9000 §14 floor is gated on it.
+const no_fragment_supported = no_fragment_options != null;
+
 /// RFC 8899 §3 / RFC 9000 §14: a DPLPMTUD probe only measures a path MTU if
 /// the IP layer puts it on the wire as one *unfragmented* datagram. Where the
 /// kernel is free to source-fragment, an acknowledged 2048-byte probe proves
@@ -1742,42 +1802,18 @@ fn cidSliceContains(cids: []const quic.cid.ConnectionId, needle: quic.cid.Connec
 /// RFC 9000 §14 independently forbids fragmenting QUIC datagrams at all.
 ///
 /// So the no-fragmentation contract is a *precondition* for discovering
-/// anything above the RFC 9000 §14 floor, not a tuning detail. This returns
-/// whether the kernel accepted one; `Runtime.init` holds discovery at 1200 on
-/// platforms where it did not, which is the conservative policy #256's
-/// acceptance criteria allow as the alternative to DPLPMTUD.
-///
-/// Linux gets `IP_PMTUDISC_PROBE`, which sets DF *and* ignores the kernel's
-/// cached path MTU — RFC 8899 §4.5 requires DPLPMTUD to be in control rather
-/// than clamped by a lower layer's own discovery. macOS/BSD have no probe
-/// mode, so they get `IP_DONTFRAG`, which supplies the DF half; the kernel's
-/// cached PMTU can still bound a probe there, which costs discovery reach but
-/// never soundness — a probe the kernel refuses to send simply fails, and a
-/// failed probe is never evidence that a size works.
+/// anything above the floor, not a tuning detail. This returns whether the
+/// kernel accepted one; `Runtime.init` holds discovery at 1200 when it did
+/// not, which is the conservative policy #256's acceptance criteria allow as
+/// the alternative to DPLPMTUD.
 fn configureNoFragment(fd: std.c.fd_t, sa_family: u32) bool {
+    const options = no_fragment_options orelse return false;
     const is_v6 = sa_family == posix.AF.INET6;
-    switch (builtin.os.tag) {
-        .linux => {
-            const linux = std.os.linux;
-            const level: u32 = if (is_v6) posix.IPPROTO.IPV6 else posix.IPPROTO.IP;
-            const option: u32 = if (is_v6) linux.IPV6.MTU_DISCOVER else linux.IP.MTU_DISCOVER;
-            const mode: c_int = if (is_v6) linux.IPV6.PMTUDISC_PROBE else linux.IP.PMTUDISC_PROBE;
-            posix.setsockopt(fd, @intCast(level), @intCast(option), std.mem.asBytes(&mode)) catch return false;
-            return true;
-        },
-        .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => {
-            // Not exposed by Zig's darwin/BSD headers; the values are the
-            // stable ABI constants from <netinet/in.h> and <netinet6/in6.h>.
-            const ip_dontfrag: u32 = 28;
-            const ipv6_dontfrag: u32 = 62;
-            const level: u32 = if (is_v6) posix.IPPROTO.IPV6 else posix.IPPROTO.IP;
-            const option: u32 = if (is_v6) ipv6_dontfrag else ip_dontfrag;
-            const on: c_int = 1;
-            posix.setsockopt(fd, @intCast(level), @intCast(option), std.mem.asBytes(&on)) catch return false;
-            return true;
-        },
-        else => return false,
-    }
+    const level = if (is_v6) options.level_v6 else options.level_v4;
+    const option = if (is_v6) options.option_v6 else options.option_v4;
+    const value = options.value;
+    posix.setsockopt(fd, @intCast(level), @intCast(option), std.mem.asBytes(&value)) catch return false;
+    return true;
 }
 
 /// Create a non-blocking, close-on-exec UDP socket for `sa_family`. Returns a
@@ -2203,15 +2239,28 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
     }, true).retry_policy);
 }
 
-test "quicConfigFrom: the runtime default is the transport's own authoritative default" {
-    // #256-A: the runtime must not carry a second datagram-size default that
-    // can drift from the transport's. Both come from `quic.datagram`.
+test "quicConfigFrom: the runtime is the socket owner that opts discovery in" {
+    // #256-A: neither layer carries a second datagram-size *value* that can
+    // drift — both come from `quic.datagram`. #256-B splits the two defaults
+    // on purpose, though: the transport cannot see a socket, so it stays at
+    // the floor, and this runtime raises the ceiling only because it just
+    // established the no-fragmentation contract on the socket it owns.
     const runtime_default = Config{ .listen_host = "::", .quic_port = 443 };
     try testing.expectEqual(quic.datagram.max_size, runtime_default.max_datagram_size);
+    try testing.expectEqual(
+        @as(u64, quic.datagram.base_size),
+        (quic.config.Config{}).max_send_udp_payload_size,
+    );
     const mapped = quicConfigFrom(runtime_default, true);
     try testing.expectEqual(
-        (quic.config.Config{}).max_send_udp_payload_size,
+        @as(u64, quic.datagram.max_size),
         mapped.max_send_udp_payload_size,
+    );
+    // ... and without that contract it falls back to the transport's own
+    // conservative default rather than the operator's ceiling.
+    try testing.expectEqual(
+        (quic.config.Config{}).max_send_udp_payload_size,
+        quicConfigFrom(runtime_default, false).max_send_udp_payload_size,
     );
     // The advertised receive capacity is a property of the transport's
     // buffers, not of this operator knob, so the knob must not move it.
@@ -4805,14 +4854,28 @@ test "http3 runtime: DPLPMTUD stays at the floor without the no-fragmentation co
     );
 }
 
-test "http3 runtime: the no-fragmentation socket option is actually accepted here" {
-    // Platform-gated: asserts the option is applied where the OS supports it,
-    // rather than trusting that `setsockopt` was called.
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+test "http3 runtime: the no-fragmentation contract is established exactly where it is claimed" {
+    // Runs on every platform. Where the OS is one this code has verified, the
+    // option must actually be accepted by the kernel — not merely attempted.
+    // Where it is not, `configureNoFragment` must report failure so the
+    // ceiling collapses, rather than guessing a constant and reporting
+    // success without ever setting DF.
     for ([_]u32{ posix.AF.INET, posix.AF.INET6 }) |family| {
         const fd = openUdpSocket(family);
         if (fd < 0) continue;
         defer _ = std.c.close(fd);
-        try testing.expect(configureNoFragment(fd, family));
+        try testing.expectEqual(no_fragment_supported, configureNoFragment(fd, family));
     }
+}
+
+test "http3 runtime: only verified platforms claim no-fragmentation support" {
+    // The list here is the same one `docs/HTTP3_ROLLOUT.md` names. BSD is not
+    // one platform: Darwin's IP_DONTFRAG is 28 and FreeBSD's is 67, and
+    // OpenBSD uses 28 for something else entirely, so the families cannot be
+    // grouped and the unverified ones must stay conservative.
+    const expected = switch (builtin.os.tag) {
+        .linux, .macos, .ios, .tvos, .watchos, .freebsd => true,
+        else => false,
+    };
+    try testing.expectEqual(expected, no_fragment_supported);
 }

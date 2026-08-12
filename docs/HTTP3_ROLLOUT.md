@@ -67,6 +67,9 @@ may find**, not a size taken on trust. Consequences worth knowing:
   default needs no defensive tuning. Lower it when you know a downstream link
   is smaller than discovery would otherwise find, or to switch discovery off
   entirely by pinning it to 1200.
+- **It has no effect at all without the socket contract below.** On a platform
+  where no-IP-fragmentation cannot be established, the send size stays at 1200
+  however this is set.
 
 ## Path MTU discovery
 
@@ -115,20 +118,43 @@ A false positive costs throughput until the raise timer re-tests. Not falling
 back costs the connection: Tardigrade's own retransmissions would keep
 re-sending the same oversized datagram until the idle timeout.
 
-Discovery is **per path, never inherited.** Migrating to a new path — or
-re-validating a tuple that has been away — restarts from 1200 rather than
-carrying over a size only the old path was shown to carry.
+Discovery is **per path incarnation, never inherited.** Migrating to a new path
+restarts from 1200 rather than carrying over a size only the old path was shown
+to carry — and so does re-probing a tuple whose previous validation ended,
+whether it was promoted away or expired unanswered. Outcomes still owed by an
+earlier incarnation (a delayed acknowledgement, a late loss) are dropped rather
+than applied to the state that replaced it.
 
 ### Requirements and diagnostics
 
 Discovering anything above 1200 requires the listener socket to establish a
-**no-IP-fragmentation contract** — `IP_PMTUDISC_PROBE` on Linux (DF set, and the
-kernel's cached path MTU ignored, per RFC 8899 §4.5), `IP_DONTFRAG` on
-macOS/BSD. Without it a large probe may be fragmented, and its acknowledgement
-would prove the peer *reassembled* it rather than that the path carries it. On a
-platform or kernel that refuses the option the listener logs a warning and holds
+**no-IP-fragmentation contract**. Without it a large probe may be fragmented,
+and its acknowledgement would prove the peer *reassembled* it rather than that
+the path carries it. Supported platforms:
+
+| Platform | Mechanism | Notes |
+| --- | --- | --- |
+| Linux | `IP_PMTUDISC_PROBE` / `IPV6_PMTUDISC_PROBE` | Sets DF *and* ignores the kernel's cached path MTU, so DPLPMTUD is in control (RFC 8899 §4.5). |
+| macOS, iOS, tvOS, watchOS | `IP_DONTFRAG` (28) / `IPV6_DONTFRAG` (62) | DF only — no probe mode, so a kernel-cached PMTU can still bound a probe. Costs discovery reach, not soundness. |
+| FreeBSD | `IP_DONTFRAG` (67) / `IPV6_DONTFRAG` (62) | As above. Note the IPv4 constant differs from Darwin's. |
+| NetBSD, OpenBSD, DragonFly, others | — | No verified API; discovery stays at 1200. |
+
+These constants are deliberately **not** shared across the BSDs: Darwin's IPv4
+`IP_DONTFRAG` is 28 while FreeBSD's is 67, and OpenBSD uses option 28 for
+something else entirely. A wrong constant that a kernel happens to *accept*
+would report success without ever setting DF — the exact false positive this
+gate exists to prevent — so an unverified platform reports failure instead of
+guessing.
+
+Where the contract cannot be established the listener logs a warning and holds
 the send size at 1200 whatever `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` says — the
 conservative policy, not a silently unsound measurement.
+
+The QUIC transport's own `max_send_udp_payload_size` defaults to 1200 for the
+same reason: `src/quic/` owns no socket and cannot know whether a probe would be
+fragmented, so **discovery is opt-in by the composition root that created the
+socket**. An embedder using `quic.connection` directly gets the conservative
+policy until it establishes the contract itself and raises the ceiling.
 
 Diagnostics are currently **connection-level, not yet operator-facing**:
 `pmtu_probes_sent` and `pmtu_black_holes` on `quic.connection.Metrics`, plus a

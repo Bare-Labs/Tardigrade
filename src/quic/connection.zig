@@ -2706,9 +2706,11 @@ pub const Connection = struct {
         // Fold in any outstanding path-validation deadline so `onTimeout`
         // expires it promptly rather than only on the next unrelated timer.
         if (self.paths.nextValidationDeadlineUs()) |validation| deadline = minOpt(deadline, validation);
-        // #256-B: the DPLPMTUD raise timer, armed only after a black-hole
-        // fallback. `Controller.onTimeout` disarms it when it fires, so this
-        // cannot return a deadline already in the past and spin the caller.
+        // #256-B: the DPLPMTUD raise timer, armed whenever a search converged
+        // below the ceiling because larger sizes were ruled out — by probe
+        // failure or by a black-hole fallback. `Controller.onTimeout` disarms
+        // it when it fires, so this cannot return a deadline already in the
+        // past and spin the caller.
         if (self.paths.activePath().plpmtu.deadlineUs()) |raise| deadline = minOpt(deadline, raise);
         return deadline;
     }
@@ -7150,7 +7152,7 @@ const MigrationPair = struct {
         errdefer allocator.destroy(pair);
         pair.client = try Connection.init(allocator, .{
             .role = .client,
-            .config = .{ .migration_policy = policy },
+            .config = .{ .migration_policy = policy, .max_send_udp_payload_size = max_datagram_size_ceiling },
             .local_cid = &TestPair.client_cid,
             .original_destination_cid = &TestPair.odcid,
             .initial_secret_dcid = &TestPair.odcid,
@@ -7163,7 +7165,7 @@ const MigrationPair = struct {
         errdefer pair.client.deinit();
         pair.server = try Connection.init(allocator, .{
             .role = .server,
-            .config = .{ .migration_policy = policy },
+            .config = .{ .migration_policy = policy, .max_send_udp_payload_size = max_datagram_size_ceiling },
             .local_cid = &TestPair.odcid,
             .original_destination_cid = &TestPair.odcid,
             .initial_secret_dcid = &TestPair.odcid,
@@ -8302,6 +8304,19 @@ fn drainTransmits(conn: *Connection, now_us: *u64) EmittedDatagrams {
     return seen;
 }
 
+/// The configuration of an embedder that has established the
+/// no-IP-fragmentation contract on its socket and may therefore let discovery
+/// reach the ceiling (#256-B). The transport default is the RFC 9000 §14
+/// floor: `quic/config.zig` owns no socket and cannot know whether a probe
+/// would be fragmented, so raising this is the socket owner's call. Every
+/// discovery test opts in explicitly, exactly as `http3_runtime` does after
+/// `configureNoFragment` succeeds.
+const discovery_enabled = config.Config{ .max_send_udp_payload_size = max_datagram_size_ceiling };
+
+fn discoveryPair(allocator: std.mem.Allocator) !*TestPair {
+    return TestPair.initWithConfigs(allocator, discovery_enabled, discovery_enabled);
+}
+
 /// Run DPLPMTUD to a resolved state on both sides across a path that silently
 /// drops any datagram larger than `path_mtu` — the network behaviour #256-B
 /// exists to discover. Pass `max_datagram_size_ceiling` for a path that
@@ -8573,9 +8588,9 @@ test "driver: the advertised receive capacity is separate from the send size" {
     );
 }
 
-test "driver: the default deployment discovers a larger size rather than assuming one" {
+test "driver: an embedder that opts in discovers a larger size rather than assuming one" {
     const allocator = testing.allocator;
-    var pair = try TestPair.init(allocator);
+    var pair = try discoveryPair(allocator);
     defer pair.deinit(allocator);
 
     // Before authentication nothing may exceed the floor, in either role: the
@@ -8600,7 +8615,7 @@ test "driver: the default deployment discovers a larger size rather than assumin
 
 test "driver: a path that only carries the floor is discovered as such" {
     const allocator = testing.allocator;
-    var pair = try TestPair.init(allocator);
+    var pair = try discoveryPair(allocator);
     defer pair.deinit(allocator);
 
     // Every probe this endpoint sends is larger than the path carries, so
@@ -8631,7 +8646,7 @@ test "driver: a path that only carries the floor is discovered as such" {
 
 test "driver: a path larger than the floor is discovered, and only up to what it carries" {
     const allocator = testing.allocator;
-    var pair = try TestPair.init(allocator);
+    var pair = try discoveryPair(allocator);
     defer pair.deinit(allocator);
 
     const path_mtu: usize = 1452;
@@ -8657,7 +8672,7 @@ test "driver: a path larger than the floor is discovered, and only up to what it
 
 test "driver: a probe is its own datagram, exactly the size it validates" {
     const allocator = testing.allocator;
-    var pair = try TestPair.init(allocator);
+    var pair = try discoveryPair(allocator);
     defer pair.deinit(allocator);
     try pair.pump();
 
@@ -8683,7 +8698,7 @@ test "driver: a probe is its own datagram, exactly the size it validates" {
 
 test "driver: a path that stops carrying the discovered size falls back to the floor" {
     const allocator = testing.allocator;
-    var pair = try TestPair.init(allocator);
+    var pair = try discoveryPair(allocator);
     defer pair.deinit(allocator);
     try settleDiscovery(pair, max_datagram_size_ceiling);
     const discovered = pair.server.effectiveMaxDatagramSize();
@@ -8763,7 +8778,7 @@ test "driver: a configured ceiling bounds discovery and is never exceeded" {
 
 test "driver: a probe waits for congestion window rather than taking an exemption" {
     const allocator = testing.allocator;
-    var pair = try TestPair.init(allocator);
+    var pair = try discoveryPair(allocator);
     defer pair.deinit(allocator);
     try pair.pump();
 
@@ -9119,7 +9134,7 @@ const PmtuEventRecorder = struct {
 
 test "driver: a fallback completed by a smaller ACK still publishes the transition" {
     const allocator = testing.allocator;
-    var pair = try TestPair.init(allocator);
+    var pair = try discoveryPair(allocator);
     defer pair.deinit(allocator);
     try settleDiscovery(pair, max_datagram_size_ceiling);
 
@@ -9225,7 +9240,7 @@ test "driver: a PTO driven by old-path packets is not charged to the new path" {
 
 test "driver: a PTO with the active path's own traffic outstanding is charged normally" {
     const allocator = testing.allocator;
-    var pair = try TestPair.init(allocator);
+    var pair = try discoveryPair(allocator);
     defer pair.deinit(allocator);
     try settleDiscovery(pair, max_datagram_size_ceiling);
     try testing.expect(pair.server.effectiveMaxDatagramSize() > base_datagram_size);
@@ -9246,6 +9261,108 @@ test "driver: a PTO with the active path's own traffic outstanding is charged no
     // The gate is about attribution, not about suppressing the signal.
     try testing.expectEqual(@as(u64, 1), pair.server.metrics.pmtu_black_holes);
     try testing.expectEqual(base_datagram_size, pair.server.effectiveMaxDatagramSize());
+}
+
+test "driver: a retry after a failed validation is a new incarnation" {
+    const allocator = testing.allocator;
+    var pair = try MigrationPair.init(allocator, .full);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    // Candidate A starts validating, and its PATH_CHALLENGE goes out.
+    var buf: [2048]u8 = undefined;
+    const datagram = try clientDatagram(pair, &buf);
+    try pair.server.ingestOnPath(datagram, rebind_candidate, TestPair.test_challenge_entropy, pair.now_us);
+    const first_ref = pair.server.paths.pathRefFor(rebind_candidate) orelse return error.TestExpectedEqual;
+    var challenge_out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&challenge_out, pair.now_us) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(quic_path.PathState.validating, pair.server.paths.stateOf(rebind_candidate).?);
+
+    // Nobody answers, so the attempt expires. Its challenge record is still
+    // alive in connection-wide recovery — expiry is a path-lifecycle event,
+    // not a recovery one.
+    pair.now_us += 4 * quic_path.default_validation_timeout_us;
+    pair.server.onTimeout(pair.now_us);
+    try testing.expectEqual(quic_path.PathState.failed, pair.server.paths.stateOf(rebind_candidate).?);
+
+    // The same tuple is probed again. A *failed* attempt ended just as
+    // definitively as a promoted one, so this is a new incarnation: the old
+    // attempt's outstanding challenge must not resolve against it.
+    var retry_buf: [2048]u8 = undefined;
+    const retry = try clientDatagram(pair, &retry_buf);
+    try pair.server.ingestOnPath(retry, rebind_candidate, TestPair.test_challenge_entropy, pair.now_us);
+    const second_ref = pair.server.paths.pathRefFor(rebind_candidate) orelse return error.TestExpectedEqual;
+    try testing.expect(second_ref.generation != first_ref.generation);
+    try testing.expectEqual(@as(?*quic_pmtu.Controller, null), pair.server.paths.plpmtuFor(first_ref));
+
+    // Promote it and give it a discovered size, so stale feedback would have
+    // something to corrupt.
+    var challenge2: [2048]u8 = undefined;
+    const challenge = pair.server.pollTransmitOnPath(&challenge2, pair.now_us) orelse return error.TestExpectedEqual;
+    var challenge_bytes: [2048]u8 = undefined;
+    @memcpy(challenge_bytes[0..challenge.bytes.len], challenge.bytes);
+    try pair.client.ingestOnPath(challenge_bytes[0..challenge.bytes.len], TestPair.client_path, TestPair.test_challenge_entropy, pair.now_us);
+    var response_out: [2048]u8 = undefined;
+    const response = pair.client.pollTransmitOnPath(&response_out, pair.now_us) orelse return error.TestExpectedEqual;
+    var response_bytes: [2048]u8 = undefined;
+    @memcpy(response_bytes[0..response.bytes.len], response.bytes);
+    try pair.server.ingestOnPath(response_bytes[0..response.bytes.len], rebind_candidate, TestPair.test_challenge_entropy, pair.now_us);
+    try testing.expect(pair.server.activePathKey().eql(rebind_candidate));
+
+    const fresh = pair.server.paths.plpmtuFor(second_ref) orelse return error.TestExpectedEqual;
+    fresh.reset();
+    fresh.enable(max_datagram_size_ceiling, pair.now_us);
+    fresh.onProbeSent(1452, 5_100);
+    try testing.expect(fresh.onProbeAcked(5_100, pair.now_us));
+    try testing.expectEqual(@as(usize, 1452), fresh.sendSize());
+
+    // Now resolve the *first* attempt's record, both ways.
+    try ensureSentRecordCapacity(pair.server, pair.server.sent_records.items.len + 1);
+    pair.server.sent_records.addOneAssumeCapacity().* = .{
+        .space = .application,
+        .packet_number = 5_101,
+        .ack_eliciting = true,
+        .sent_path = first_ref,
+        .sent_size = base_datagram_size,
+    };
+    _ = pair.server.requeueUntrackedRecords(.application, pair.now_us);
+    pair.server.notePmtuEvidence(first_ref, .{ .ordinary_ack = base_datagram_size }, pair.now_us);
+
+    try testing.expectEqual(@as(usize, 1452), fresh.sendSize());
+    try testing.expectEqual(@as(u8, 0), fresh.oversized_losses);
+    try testing.expectEqual(@as(u8, 0), fresh.stalled_ptos);
+    try testing.expectEqual(@as(?u64, null), fresh.outstanding_pn);
+    try testing.expectEqual(@as(u32, 0), fresh.black_holes);
+    try testing.expectEqual(@as(u64, 0), pair.server.metrics.pmtu_black_holes);
+}
+
+test "driver: a bare embedder cannot discover above the floor" {
+    const allocator = testing.allocator;
+    // The transport default owns no socket, so it cannot know whether a probe
+    // would be fragmented — and an acknowledged fragmented probe would measure
+    // reassembly, not the path (RFC 8899 §3). Discovery is therefore off until
+    // a socket owner opts in.
+    try testing.expectEqual(
+        @as(u64, base_datagram_size),
+        (config.Config{}).max_send_udp_payload_size,
+    );
+
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try settleDiscovery(pair, max_datagram_size_ceiling);
+
+    // Even on a path that would carry anything, and with the peer advertising
+    // full receive capacity, nothing is probed and nothing is raised.
+    try testing.expectEqual(base_datagram_size, pair.server.probeMaxDatagramSize());
+    try testing.expectEqual(base_datagram_size, pair.server.effectiveMaxDatagramSize());
+    try testing.expectEqual(@as(u64, 0), pair.server.metrics.pmtu_probes_sent);
+    try testing.expectEqual(@as(?usize, null), pair.server.pathPlpmtu().nextProbeSize());
+
+    const sid = try openServerResponseStream(pair);
+    _ = try pair.server.writeStream(sid, &[_]u8{0x88} ** (16 * 1024), false);
+    const seen = drainTransmits(pair.server, &pair.now_us);
+    try testing.expect(seen.count > 1);
+    try testing.expect(seen.largest <= base_datagram_size);
 }
 
 test "driver: a padded non-ack-eliciting packet counts as in flight" {

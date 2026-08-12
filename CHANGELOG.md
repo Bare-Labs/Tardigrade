@@ -25,10 +25,14 @@ All notable user-facing changes to Tardigrade are documented here.
   than applied to the new one.
 
   Discovery above 1200 additionally requires the listener socket to establish a
-  no-IP-fragmentation contract (RFC 8899 §3: `IP_PMTUDISC_PROBE` on Linux,
-  `IP_DONTFRAG` on macOS/BSD). Without it an acknowledged large probe would be
-  measuring reassembly rather than the path, so on platforms where the kernel
-  refuses it the send size stays at 1200 regardless of configuration.
+  no-IP-fragmentation contract (RFC 8899 §3): `IP_PMTUDISC_PROBE` on Linux,
+  `IP_DONTFRAG` on Darwin and FreeBSD — whose IPv4 constants differ, so the
+  BSDs are handled per-OS rather than as a family. Without it an acknowledged
+  large probe would be measuring reassembly rather than the path, so where the
+  contract cannot be established the send size stays at 1200 regardless of
+  configuration. The QUIC transport's own default is 1200 for the same reason:
+  it owns no socket, so discovery is opt-in by whichever composition root
+  created one and can vouch for it.
 
   `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` changes meaning accordingly and now
   defaults to **2048**. It was an assertion — "this path carries this much" —

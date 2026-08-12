@@ -801,17 +801,36 @@ pub const PathManager = struct {
             // deliberately chose not to skip validation (RFC 9000 §9.3.1).
             // A path still mid-validation or awaiting promotion keeps its
             // ledger untouched — it either hasn't validated yet or just did.
-            // Same reasoning for the path's measured MTU (#256-B): a tuple
-            // being re-validated after having been away is not demonstrably
-            // the same path it was, and an inherited size that no longer
-            // traverses it is a black hole waiting to happen. Discovery
-            // restarts from the guaranteed floor.
-            if (path.state == .validated) {
-                path.anti_amplification = .{};
+            // Whether this datagram *begins a new validation attempt*, as
+            // opposed to arriving during one that is already running or
+            // already finished. Every fresh attempt is a new incarnation of
+            // the tuple, whatever ended the previous one — a promotion
+            // elsewhere (`.validated`), an expiry (`.failed`), or a policy
+            // block that never probed (`.unvalidated`). Getting this wrong for
+            // `.failed` in particular leaves a hole: the expired attempt's
+            // PATH_CHALLENGE can still be sitting in connection-wide recovery,
+            // and its delayed ACK would resolve against the new attempt's
+            // state as if the two were the same path lifetime.
+            const fresh_attempt = switch (path.state) {
+                .validating, .validated_pending_promotion => false,
+                .failed, .unvalidated, .validated => true,
+            };
+            if (fresh_attempt) {
+                // Same reasoning as the ledger below, for the path's measured
+                // MTU (#256-B): a tuple being re-probed is not demonstrably
+                // the path it was, and an inherited size that no longer
+                // traverses it is a black hole waiting to happen. Discovery
+                // restarts from the guaranteed floor, and the new generation
+                // makes outcomes owed by the previous incarnation droppable.
                 path.plpmtu.reset();
-                // A new incarnation of the same tuple: outcomes still owed by
-                // the previous one must not land on this fresh state.
                 path.generation = self.claimGeneration();
+                // The anti-amplification reset stays specific to `.validated`:
+                // only a previously-*validated* path carries a lifted limit
+                // that must not survive into an attempt this code deliberately
+                // chose not to skip (RFC 9000 §9.3.1). A `.failed` or
+                // `.unvalidated` path's ledger is already the conservative one
+                // its own received bytes earned.
+                if (path.state == .validated) path.anti_amplification = .{};
             }
             path.anti_amplification.recordReceived(authenticated_bytes);
             switch (path.state) {
