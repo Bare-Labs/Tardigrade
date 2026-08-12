@@ -119,9 +119,22 @@ Discovery is **per path, never inherited.** Migrating to a new path — or
 re-validating a tuple that has been away — restarts from 1200 rather than
 carrying over a size only the old path was shown to carry.
 
-Operator counters: `pmtu_probes_sent` and `pmtu_black_holes` on the connection's
-metrics, plus a `pmtu_updated` event carrying the path, the new effective size,
-and whether it rose or fell back.
+### Requirements and diagnostics
+
+Discovering anything above 1200 requires the listener socket to establish a
+**no-IP-fragmentation contract** — `IP_PMTUDISC_PROBE` on Linux (DF set, and the
+kernel's cached path MTU ignored, per RFC 8899 §4.5), `IP_DONTFRAG` on
+macOS/BSD. Without it a large probe may be fragmented, and its acknowledgement
+would prove the peer *reassembled* it rather than that the path carries it. On a
+platform or kernel that refuses the option the listener logs a warning and holds
+the send size at 1200 whatever `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` says — the
+conservative policy, not a silently unsound measurement.
+
+Diagnostics are currently **connection-level, not yet operator-facing**:
+`pmtu_probes_sent` and `pmtu_black_holes` on `quic.connection.Metrics`, plus a
+`pmtu_updated` event carrying the path, the new effective size, and whether it
+rose or fell back. The HTTP/3 runtime's metrics/event bridge does not surface
+them yet; #255's observability work is where they become operator-visible.
 
 Nothing about this setting relaxes congestion control, flow control, or the
 server's anti-amplification budget:

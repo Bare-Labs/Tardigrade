@@ -17,6 +17,7 @@
 //! backend. Without a provider the QUIC listener stays unbootstrapped with a
 //! logged warning while TCP continues to serve.
 
+const builtin = @import("builtin");
 const compat = @import("zig_compat");
 const std = @import("std");
 const early_data_policy = @import("early_data.zig");
@@ -318,6 +319,14 @@ pub const Runtime = struct {
         errdefer _ = std.c.close(fd);
 
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&@as(c_int, 1))) catch {}; // REUSEADDR is advisory; bind proceeds regardless
+        // DPLPMTUD's precondition (#256-B). Advisory to the *listener* — a
+        // kernel that refuses it still serves QUIC — but binding on discovery:
+        // without it a probe can be fragmented and its acknowledgement would
+        // measure reassembly instead of the path.
+        const no_fragment = configureNoFragment(fd, sa_family);
+        if (!no_fragment) {
+            logger.warn(null, "http3: no-fragmentation socket policy unavailable; path MTU discovery held at {d} bytes", .{quic.datagram.base_size});
+        }
         const bind_rc = std.c.bind(fd, @ptrCast(&address.storage), @intCast(address.len));
         if (bind_rc != 0) {
             logger.warn(null, "http3: udp bind failed: {s}", .{@tagName(posix.errno(bind_rc))});
@@ -350,7 +359,7 @@ pub const Runtime = struct {
             .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
             .retry_policy = cfg.retry_policy,
             .secrets = .{},
-            .quic_config = quicConfigFrom(cfg),
+            .quic_config = quicConfigFrom(cfg, no_fragment),
             .h3_settings = cfg.h3_settings,
             .early_data_compat_metrics_ctx = cfg.early_data_compat_metrics_ctx,
             .early_data_compat_metrics_cb = cfg.early_data_compat_metrics_cb,
@@ -1570,9 +1579,16 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
 
 /// Map the operator-facing runtime config onto the native QUIC transport
 /// config.
-fn quicConfigFrom(cfg: Config) quic.config.Config {
+/// `no_fragment` is whether the listener's socket actually established the
+/// no-IP-fragmentation contract DPLPMTUD requires (RFC 8899 §3). Without it
+/// the discovery ceiling collapses to the RFC 9000 §14 floor regardless of
+/// what the operator configured: a probe that the kernel may fragment cannot
+/// measure a path MTU, and raising the send size on that evidence would be
+/// worse than never discovering anything.
+fn quicConfigFrom(cfg: Config, no_fragment: bool) quic.config.Config {
+    const configured = std.math.clamp(cfg.max_datagram_size, quic.datagram.base_size, quic.datagram.max_size);
     return .{
-        .max_send_udp_payload_size = std.math.clamp(cfg.max_datagram_size, quic.datagram.base_size, quic.datagram.max_size),
+        .max_send_udp_payload_size = if (no_fragment) configured else quic.datagram.base_size,
         .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
         .retry_policy = cfg.retry_policy,
         .migration_policy = if (cfg.connection_migration) .full else .nat_rebinding_only,
@@ -1716,6 +1732,52 @@ fn cidSliceContains(cids: []const quic.cid.ConnectionId, needle: quic.cid.Connec
         if (std.mem.eql(u8, cid.slice(), needle.slice())) return true;
     }
     return false;
+}
+
+/// RFC 8899 §3 / RFC 9000 §14: a DPLPMTUD probe only measures a path MTU if
+/// the IP layer puts it on the wire as one *unfragmented* datagram. Where the
+/// kernel is free to source-fragment, an acknowledged 2048-byte probe proves
+/// the peer reassembled two fragments — not that the path carries 2048 bytes —
+/// and discovery would happily raise the send size on that false evidence.
+/// RFC 9000 §14 independently forbids fragmenting QUIC datagrams at all.
+///
+/// So the no-fragmentation contract is a *precondition* for discovering
+/// anything above the RFC 9000 §14 floor, not a tuning detail. This returns
+/// whether the kernel accepted one; `Runtime.init` holds discovery at 1200 on
+/// platforms where it did not, which is the conservative policy #256's
+/// acceptance criteria allow as the alternative to DPLPMTUD.
+///
+/// Linux gets `IP_PMTUDISC_PROBE`, which sets DF *and* ignores the kernel's
+/// cached path MTU — RFC 8899 §4.5 requires DPLPMTUD to be in control rather
+/// than clamped by a lower layer's own discovery. macOS/BSD have no probe
+/// mode, so they get `IP_DONTFRAG`, which supplies the DF half; the kernel's
+/// cached PMTU can still bound a probe there, which costs discovery reach but
+/// never soundness — a probe the kernel refuses to send simply fails, and a
+/// failed probe is never evidence that a size works.
+fn configureNoFragment(fd: std.c.fd_t, sa_family: u32) bool {
+    const is_v6 = sa_family == posix.AF.INET6;
+    switch (builtin.os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            const level: u32 = if (is_v6) posix.IPPROTO.IPV6 else posix.IPPROTO.IP;
+            const option: u32 = if (is_v6) linux.IPV6.MTU_DISCOVER else linux.IP.MTU_DISCOVER;
+            const mode: c_int = if (is_v6) linux.IPV6.PMTUDISC_PROBE else linux.IP.PMTUDISC_PROBE;
+            posix.setsockopt(fd, @intCast(level), @intCast(option), std.mem.asBytes(&mode)) catch return false;
+            return true;
+        },
+        .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => {
+            // Not exposed by Zig's darwin/BSD headers; the values are the
+            // stable ABI constants from <netinet/in.h> and <netinet6/in6.h>.
+            const ip_dontfrag: u32 = 28;
+            const ipv6_dontfrag: u32 = 62;
+            const level: u32 = if (is_v6) posix.IPPROTO.IPV6 else posix.IPPROTO.IP;
+            const option: u32 = if (is_v6) ipv6_dontfrag else ip_dontfrag;
+            const on: c_int = 1;
+            posix.setsockopt(fd, @intCast(level), @intCast(option), std.mem.asBytes(&on)) catch return false;
+            return true;
+        },
+        else => return false,
+    }
 }
 
 /// Create a non-blocking, close-on-exec UDP socket for `sa_family`. Returns a
@@ -2116,16 +2178,16 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
         .listen_host = "::",
         .quic_port = 443,
         .max_datagram_size = 512,
-    }).max_send_udp_payload_size);
+    }, true).max_send_udp_payload_size);
     // Above the 2048-byte work buffer snaps down.
     try testing.expectEqual(@as(u64, 2048), quicConfigFrom(.{
         .listen_host = "::",
         .quic_port = 443,
         .max_datagram_size = 9000,
-    }).max_send_udp_payload_size);
+    }, true).max_send_udp_payload_size);
     // An in-range value passes through, and default migration allows validated
     // same-IP NAT rebinding while still advertising disable_active_migration.
-    const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 });
+    const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 }, true);
     try testing.expectEqual(@as(u64, 1350), mid.max_send_udp_payload_size);
     try testing.expectEqual(quic.config.MigrationPolicy.nat_rebinding_only, mid.migration_policy);
     try testing.expectEqual(quic.config.RetryPolicy.off, mid.retry_policy);
@@ -2133,12 +2195,12 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
         .listen_host = "::",
         .quic_port = 443,
         .connection_migration = true,
-    }).migration_policy);
+    }, true).migration_policy);
     try testing.expectEqual(quic.config.RetryPolicy.address_validation, quicConfigFrom(.{
         .listen_host = "::",
         .quic_port = 443,
         .retry_policy = .address_validation,
-    }).retry_policy);
+    }, true).retry_policy);
 }
 
 test "quicConfigFrom: the runtime default is the transport's own authoritative default" {
@@ -2146,7 +2208,7 @@ test "quicConfigFrom: the runtime default is the transport's own authoritative d
     // can drift from the transport's. Both come from `quic.datagram`.
     const runtime_default = Config{ .listen_host = "::", .quic_port = 443 };
     try testing.expectEqual(quic.datagram.max_size, runtime_default.max_datagram_size);
-    const mapped = quicConfigFrom(runtime_default);
+    const mapped = quicConfigFrom(runtime_default, true);
     try testing.expectEqual(
         (quic.config.Config{}).max_send_udp_payload_size,
         mapped.max_send_udp_payload_size,
@@ -2159,7 +2221,7 @@ test "quicConfigFrom: the runtime default is the transport's own authoritative d
     );
     try testing.expectEqual(
         quic.datagram.max_size,
-        quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 }).max_udp_payload_size,
+        quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 }, true).max_udp_payload_size,
     );
 }
 
@@ -2400,28 +2462,28 @@ test "quicConfigFrom (#523): enable_0rtt alone never enables the 0-RTT carrier" 
     const gate = gate_adapter.gate();
 
     // No dependencies at all.
-    try testing.expect(!quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .enable_0rtt = true }).zero_rtt_enabled);
+    try testing.expect(!quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .enable_0rtt = true }, true).zero_rtt_enabled);
     // Only a resumption runtime.
     try testing.expect(!quicConfigFrom(.{
         .listen_host = "::",
         .quic_port = 443,
         .enable_0rtt = true,
         .resumption_runtime = &resumption,
-    }).zero_rtt_enabled);
+    }, true).zero_rtt_enabled);
     // Only a replay gate.
     try testing.expect(!quicConfigFrom(.{
         .listen_host = "::",
         .quic_port = 443,
         .enable_0rtt = true,
         .early_data_replay_gate = gate,
-    }).zero_rtt_enabled);
+    }, true).zero_rtt_enabled);
     // Both dependencies present but `enable_0rtt` false (the default): still disabled.
     try testing.expect(!quicConfigFrom(.{
         .listen_host = "::",
         .quic_port = 443,
         .resumption_runtime = &resumption,
         .early_data_replay_gate = gate,
-    }).zero_rtt_enabled);
+    }, true).zero_rtt_enabled);
     // Every dependency present: the carrier actually enables.
     try testing.expect(quicConfigFrom(.{
         .listen_host = "::",
@@ -2429,7 +2491,7 @@ test "quicConfigFrom (#523): enable_0rtt alone never enables the 0-RTT carrier" 
         .enable_0rtt = true,
         .resumption_runtime = &resumption,
         .early_data_replay_gate = gate,
-    }).zero_rtt_enabled);
+    }, true).zero_rtt_enabled);
 }
 
 fn expectInvalidH3SettingsAtRuntimeInit(settings: http3.frame.Settings) !void {
@@ -4719,4 +4781,38 @@ test "sockaddr_in <-> quic.udp.Address conversion round-trips family, octets, an
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "http3 runtime: DPLPMTUD stays at the floor without the no-fragmentation contract" {
+    // RFC 8899 §3: an acknowledged large probe only measures the path if the
+    // datagram was not fragmented. A listener that could not establish that
+    // contract must not discover above the RFC 9000 §14 floor, whatever the
+    // operator configured.
+    const raised = Config{ .listen_host = "::", .quic_port = 443, .max_datagram_size = quic.datagram.max_size };
+    try testing.expectEqual(
+        @as(u64, quic.datagram.max_size),
+        quicConfigFrom(raised, true).max_send_udp_payload_size,
+    );
+    try testing.expectEqual(
+        @as(u64, quic.datagram.base_size),
+        quicConfigFrom(raised, false).max_send_udp_payload_size,
+    );
+    // The advertised receive capacity is a property of this endpoint's
+    // buffers and is unaffected either way.
+    try testing.expectEqual(
+        quicConfigFrom(raised, true).max_udp_payload_size,
+        quicConfigFrom(raised, false).max_udp_payload_size,
+    );
+}
+
+test "http3 runtime: the no-fragmentation socket option is actually accepted here" {
+    // Platform-gated: asserts the option is applied where the OS supports it,
+    // rather than trusting that `setsockopt` was called.
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    for ([_]u32{ posix.AF.INET, posix.AF.INET6 }) |family| {
+        const fd = openUdpSocket(family);
+        if (fd < 0) continue;
+        defer _ = std.c.close(fd);
+        try testing.expect(configureNoFragment(fd, family));
+    }
 }

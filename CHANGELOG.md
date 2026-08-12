@@ -16,9 +16,19 @@ All notable user-facing changes to Tardigrade are documented here.
   oversized datagrams lost while smaller ones arrive, or consecutive PTOs with
   nothing acknowledged — the send size falls back to 1200 rather than
   retransmitting the same oversized datagram until the idle timeout, and the
-  RFC 8899 raise timer later re-searches below the size that failed. Discovery
-  is per path and never inherited: a migration or a re-validated tuple starts
-  over at 1200.
+  RFC 8899 raise timer (10 minutes) later re-enters the search, discarding the
+  previous failure bound — it described a path condition that may no longer
+  hold — so a path that regains MTU is rediscovered rather than being stuck at
+  the size that once failed. Discovery is per path *incarnation* and never
+  inherited: a migration, or a tuple that has to be re-validated, starts over
+  at 1200, and feedback still owed by a previous incarnation is dropped rather
+  than applied to the new one.
+
+  Discovery above 1200 additionally requires the listener socket to establish a
+  no-IP-fragmentation contract (RFC 8899 §3: `IP_PMTUDISC_PROBE` on Linux,
+  `IP_DONTFRAG` on macOS/BSD). Without it an acknowledged large probe would be
+  measuring reassembly rather than the path, so on platforms where the kernel
+  refuses it the send size stays at 1200 regardless of configuration.
 
   `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` changes meaning accordingly and now
   defaults to **2048**. It was an assertion — "this path carries this much" —
