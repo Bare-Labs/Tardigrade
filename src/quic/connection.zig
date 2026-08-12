@@ -130,17 +130,20 @@ const zero_send_credit_params: config.TransportParameters = .{
 
 pub const IngestError = error{OutOfMemory};
 
+pub const FlowControlScope = enum { connection, stream };
+pub const FlowControlState = enum { blocked, unblocked };
+
 pub const Event = union(enum) {
     state: State,
-    packet_received: struct { space: PacketNumberSpace, packet_number: u64, size: usize },
-    packet_sent: struct { space: PacketNumberSpace, packet_number: u64, size: usize, ack_eliciting: bool },
+    packet_received: struct { space: PacketNumberSpace, packet_type: packet.PacketKind, packet_number: u64, size: usize },
+    packet_sent: struct { space: PacketNumberSpace, packet_type: packet.PacketKind, packet_number: u64, size: usize, ack_eliciting: bool },
     packet_dropped: struct { reason: DropReason, size: usize },
     keys_discarded: PacketNumberSpace,
     handshake_complete,
     handshake_confirmed,
     pto_fired: struct { space: PacketNumberSpace, count: u32 },
-    packets_acked: struct { space: PacketNumberSpace, largest_acknowledged: u64, acked_count: u64 },
-    packets_lost: struct { space: PacketNumberSpace, bytes: usize },
+    packets_acked: struct { space: PacketNumberSpace, packet_type: ?packet.PacketKind, largest_acknowledged: u64, acked_count: u64 },
+    packets_lost: struct { space: PacketNumberSpace, packet_type: ?packet.PacketKind, lost_count: u64, bytes: usize },
     recovery_metrics_updated: struct {
         latest_rtt_us: ?u64 = null,
         smoothed_rtt_us: ?u64 = null,
@@ -151,8 +154,14 @@ pub const Event = union(enum) {
     },
     stream_reset: struct { id: StreamId, error_code: u64, local: bool },
     stop_sending: struct { id: StreamId, error_code: u64, local: bool },
-    flow_control_blocked: struct { scope: enum { connection, stream }, stream_id: ?StreamId = null },
-    close_sent: struct { error_code: u64 },
+    flow_control_state_changed: struct {
+        scope: FlowControlScope,
+        stream_id: ?StreamId = null,
+        local: bool,
+        old: FlowControlState,
+        new: FlowControlState,
+    },
+    close_sent: struct { error_code: u64, is_application: bool },
     close_received: struct { error_code: u64, is_application: bool },
     idle_timeout,
     path_validation_started: PathTransitionEvent,
@@ -735,6 +744,7 @@ fn requeueSendQueueRange(allocator: std.mem.Allocator, queue: *SendQueue, range:
 /// Parallel to the recovery controller's `SentPacket` accounting.
 const SentRecord = struct {
     space: PacketNumberSpace,
+    packet_type: packet.PacketKind,
     packet_number: u64,
     ack_eliciting: bool,
     /// The path *incarnation* this packet went out on, and the size it went
@@ -931,6 +941,8 @@ pub const Connection = struct {
     send_queues: std.AutoHashMap(StreamId, *SendQueue),
     known_streams: std.AutoHashMap(StreamId, void),
     stream_transport_early: std.AutoHashMap(StreamId, void),
+    local_connection_flow_blocked: bool = false,
+    local_stream_flow_blocked: std.AutoHashMap(StreamId, void),
     accept_queue: std.ArrayList(StreamId) = .empty,
     stream_scheduling_cursor: StreamId = 0,
 
@@ -1021,6 +1033,7 @@ pub const Connection = struct {
             .send_queues = std.AutoHashMap(StreamId, *SendQueue).init(allocator),
             .known_streams = std.AutoHashMap(StreamId, void).init(allocator),
             .stream_transport_early = std.AutoHashMap(StreamId, void).init(allocator),
+            .local_stream_flow_blocked = std.AutoHashMap(StreamId, void).init(allocator),
             .last_activity_us = options.now_us,
         };
         conn.adapter.setZeroRttEnabled(conn.cfg.zero_rtt_enabled);
@@ -1121,6 +1134,7 @@ pub const Connection = struct {
         self.send_queues.deinit();
         self.known_streams.deinit();
         self.stream_transport_early.deinit();
+        self.local_stream_flow_blocked.deinit();
         self.accept_queue.deinit(self.allocator);
         for (&self.crypto_tx) |*tx| tx.deinit(self.allocator);
         self.recovery.deinit(self.allocator);
@@ -1399,6 +1413,15 @@ pub const Connection = struct {
         };
     }
 
+    fn packetKindForLevel(level: EncryptionLevel) packet.PacketKind {
+        return switch (level) {
+            .initial => .initial,
+            .zero_rtt => .zero_rtt,
+            .handshake => .handshake,
+            .application => .one_rtt,
+        };
+    }
+
     // -- ingest ---------------------------------------------------------------
 
     /// Feed one received UDP datagram that arrived on `ingress_path`.
@@ -1584,7 +1607,7 @@ pub const Connection = struct {
 
         // Post-authentication bookkeeping.
         self.metrics.packets_received += 1;
-        self.events.emit(.{ .packet_received = .{ .space = space, .packet_number = pn, .size = bytes.len } });
+        self.events.emit(.{ .packet_received = .{ .space = space, .packet_type = parsed.kind, .packet_number = pn, .size = bytes.len } });
         if (self.largest_recv_pn[space_idx] == null or pn > self.largest_recv_pn[space_idx].?) {
             self.largest_recv_pn[space_idx] = pn;
         }
@@ -1785,11 +1808,11 @@ pub const Connection = struct {
             },
             .stop_sending => |ss| {
                 var manager = self.streamManager() orelse return;
-                self.events.emit(.{ .stop_sending = .{ .id = ss.id, .error_code = ss.app_error_code, .local = false } });
                 manager.receiveStopSending(ss) catch |err| {
                     self.closeOnStreamError(err, now_us);
                     return;
                 };
+                self.events.emit(.{ .stop_sending = .{ .id = ss.id, .error_code = ss.app_error_code, .local = false } });
                 // RFC 9000 §3.5: a STOP_SENDING peer expects RESET_STREAM.
                 if (manager.sendResetStream(ss.id, ss.app_error_code)) |reset| {
                     try self.pending_resets.append(self.allocator, reset);
@@ -1797,10 +1820,24 @@ pub const Connection = struct {
                 } else |_| {}
             },
             .max_data => |limit| {
-                if (self.streamManager()) |manager| manager.applyMaxData(limit);
+                if (self.streamManager()) |manager| {
+                    const before = manager.max_data_send;
+                    manager.applyMaxData(limit);
+                    if (manager.max_data_send > before and manager.bytes_sent < manager.max_data_send) {
+                        self.setLocalConnectionFlowBlocked(false);
+                    }
+                }
             },
             .max_stream_data => |msd| {
-                if (self.streamManager()) |manager| manager.applyMaxStreamData(msd.id, msd.limit) catch {};
+                if (self.streamManager()) |manager| {
+                    const before = if (manager.get(msd.id)) |s| s.max_send_data else 0;
+                    manager.applyMaxStreamData(msd.id, msd.limit) catch {};
+                    if (manager.get(msd.id)) |s| {
+                        if (s.max_send_data > before and s.send_offset < s.max_send_data) {
+                            self.setLocalStreamFlowBlocked(msd.id, false);
+                        }
+                    }
+                }
             },
             .max_streams_bidi => |limit| {
                 if (self.streamManager()) |manager| manager.applyMaxStreams(.bidi, limit);
@@ -1808,8 +1845,8 @@ pub const Connection = struct {
             .max_streams_uni => |limit| {
                 if (self.streamManager()) |manager| manager.applyMaxStreams(.uni, limit);
             },
-            .data_blocked => self.events.emit(.{ .flow_control_blocked = .{ .scope = .connection } }),
-            .stream_data_blocked => |blocked| self.events.emit(.{ .flow_control_blocked = .{ .scope = .stream, .stream_id = blocked.id } }),
+            .data_blocked => self.emitPeerFlowBlocked(.connection, null),
+            .stream_data_blocked => |blocked| self.emitPeerFlowBlocked(.stream, blocked.id),
             .streams_blocked_bidi, .streams_blocked_uni => {},
             .new_token => {
                 // Address-validation tokens for future connections; endpoint
@@ -1953,6 +1990,8 @@ pub const Connection = struct {
         // Ack every tracked packet covered by the ranges. The RTT sample only
         // comes from the largest acked packet (RFC 9002 §5.1).
         var acked_count: u64 = 0;
+        var acked_packet_type: ?packet.PacketKind = null;
+        var acked_packet_types_mixed = false;
         var index: usize = 0;
         while (index < self.sent_records.items.len) {
             const record = &self.sent_records.items[index];
@@ -1962,6 +2001,11 @@ pub const Connection = struct {
             }
             if (self.recovery.tracker.onAcked(space, record.packet_number, now_us)) |acked| {
                 acked_count += 1;
+                if (acked_packet_type) |kind| {
+                    if (kind != record.packet_type) acked_packet_types_mixed = true;
+                } else {
+                    acked_packet_type = record.packet_type;
+                }
                 self.recovery.congestion.onPacketAcked(acked.packet);
                 if (record.packet_number == ack.largest_acknowledged) {
                     if (acked.rtt_sample_us) |sample| self.recovery.rtt.update(sample, ack_delay_us);
@@ -1988,12 +2032,17 @@ pub const Connection = struct {
             _ = self.sent_records.swapRemove(index);
             wipeSentRecordsSwapRemoveResidue(&self.sent_records);
         }
-        if (acked_count > 0) {
-            self.events.emit(.{ .packets_acked = .{ .space = space, .largest_acknowledged = ack.largest_acknowledged, .acked_count = acked_count } });
-            self.emitRecoveryMetrics();
-        }
         // A validated ACK ends the current PTO backoff episode.
         self.pto_count = 0;
+        if (acked_count > 0) {
+            self.events.emit(.{ .packets_acked = .{
+                .space = space,
+                .packet_type = if (acked_packet_types_mixed) null else acked_packet_type,
+                .largest_acknowledged = ack.largest_acknowledged,
+                .acked_count = acked_count,
+            } });
+            self.emitRecoveryMetrics();
+        }
 
         self.detectAndRequeueLost(space, now_us);
     }
@@ -2036,10 +2085,17 @@ pub const Connection = struct {
         // still known. Deriving it from `loss` instead would collapse losses
         // from several paths into one number and then attribute it to whichever
         // path happens to be active.
-        const lost_count = self.requeueUntrackedRecords(space, now_us);
+        var lost_packet_type: ?packet.PacketKind = null;
+        var lost_packet_types_mixed = false;
+        const lost_count = self.requeueUntrackedRecords(space, now_us, &lost_packet_type, &lost_packet_types_mixed);
         if (lost_count > 0) {
             self.metrics.packets_lost += lost_count;
-            self.events.emit(.{ .packets_lost = .{ .space = space, .bytes = loss.lost_bytes } });
+            self.events.emit(.{ .packets_lost = .{
+                .space = space,
+                .packet_type = if (lost_packet_types_mixed) null else lost_packet_type,
+                .lost_count = lost_count,
+                .bytes = loss.lost_bytes,
+            } });
             self.emitRecoveryMetrics();
         }
     }
@@ -2055,11 +2111,56 @@ pub const Connection = struct {
         } });
     }
 
+    fn setLocalConnectionFlowBlocked(self: *Connection, blocked: bool) void {
+        if (self.local_connection_flow_blocked == blocked) return;
+        const old = self.local_connection_flow_blocked;
+        self.local_connection_flow_blocked = blocked;
+        self.events.emit(.{ .flow_control_state_changed = .{
+            .scope = .connection,
+            .local = true,
+            .old = if (old) .blocked else .unblocked,
+            .new = if (blocked) .blocked else .unblocked,
+        } });
+    }
+
+    fn setLocalStreamFlowBlocked(self: *Connection, id: StreamId, blocked: bool) void {
+        const was_blocked = self.local_stream_flow_blocked.contains(id);
+        if (was_blocked == blocked) return;
+        if (blocked) {
+            self.local_stream_flow_blocked.put(id, {}) catch return;
+        } else {
+            _ = self.local_stream_flow_blocked.remove(id);
+        }
+        self.events.emit(.{ .flow_control_state_changed = .{
+            .scope = .stream,
+            .stream_id = id,
+            .local = true,
+            .old = if (was_blocked) .blocked else .unblocked,
+            .new = if (blocked) .blocked else .unblocked,
+        } });
+    }
+
+    fn emitPeerFlowBlocked(self: *Connection, scope: FlowControlScope, stream_id: ?StreamId) void {
+        self.events.emit(.{ .flow_control_state_changed = .{
+            .scope = scope,
+            .stream_id = stream_id,
+            .local = false,
+            .old = .unblocked,
+            .new = .blocked,
+        } });
+    }
+
     /// Requeue the content of every record in `space` the tracker no longer
     /// holds. Shared by loss detection and by recovery-slot reclamation, which
     /// retires a tracked packet for exactly the same reason: its content must
     /// be resent, and its record must not outlive its tracker entry.
-    fn requeueUntrackedRecords(self: *Connection, space: PacketNumberSpace, now_us: u64) u64 {
+    fn requeueUntrackedRecords(
+        self: *Connection,
+        space: PacketNumberSpace,
+        now_us: u64,
+        packet_type: *?packet.PacketKind,
+        packet_types_mixed: *bool,
+    ) u64 {
         var index: usize = 0;
         var count: u64 = 0;
         while (index < self.sent_records.items.len) {
@@ -2069,6 +2170,11 @@ pub const Connection = struct {
                 continue;
             }
             count += 1;
+            if (packet_type.*) |kind| {
+                if (kind != record.packet_type) packet_types_mixed.* = true;
+            } else {
+                packet_type.* = record.packet_type;
+            }
             if (record.carried_pmtu_probe != null) {
                 // Nothing to requeue: a probe carries no user data, and the
                 // search decides for itself whether to retry this size. The
@@ -3263,7 +3369,7 @@ pub const Connection = struct {
         var plain: [max_datagram_size_ceiling]u8 = undefined;
         const plain_budget = @min(plain.len, max_packet - pn_offset - pn_len - aead_tag_len);
         var plain_len: usize = 0;
-        var record = SentRecord{ .space = .application, .packet_number = pn, .ack_eliciting = false, .sent_path = self.paths.pathRefFor(path) orelse return null };
+        var record = SentRecord{ .space = .application, .packet_type = .one_rtt, .packet_number = pn, .ack_eliciting = false, .sent_path = self.paths.pathRefFor(path) orelse return null };
 
         var i: usize = 0;
         while (i < self.pending_path_responses.items.len) {
@@ -3349,6 +3455,7 @@ pub const Connection = struct {
         self.metrics.datagrams_sent += 1;
         self.events.emit(.{ .packet_sent = .{
             .space = .application,
+            .packet_type = .one_rtt,
             .packet_number = pn,
             .size = total,
             .ack_eliciting = record.ack_eliciting,
@@ -3576,6 +3683,7 @@ pub const Connection = struct {
         var plain_len: usize = 0;
         var record = SentRecord{
             .space = space,
+            .packet_type = packetKindForLevel(level),
             .packet_number = pn,
             .ack_eliciting = false,
             // Ordinary content always targets the active path; candidate-path
@@ -3759,6 +3867,7 @@ pub const Connection = struct {
         self.metrics.packets_sent += 1;
         self.events.emit(.{ .packet_sent = .{
             .space = space,
+            .packet_type = packetKindForLevel(level),
             .packet_number = pn,
             .size = total,
             .ack_eliciting = record.ack_eliciting,
@@ -3956,12 +4065,14 @@ pub const Connection = struct {
             const n_bytes = @min(@min(unsent, @min(stream_window, conn_window)), frame_room);
             if (n_bytes == 0 and !(want_fin and unsent == 0)) {
                 if (conn_window == 0) {
-                    self.events.emit(.{ .flow_control_blocked = .{ .scope = .connection } });
+                    self.setLocalConnectionFlowBlocked(true);
                 } else if (stream_window == 0) {
-                    self.events.emit(.{ .flow_control_blocked = .{ .scope = .stream, .stream_id = id } });
+                    self.setLocalStreamFlowBlocked(id, true);
                 }
                 continue;
             }
+            if (conn_window > 0) self.setLocalConnectionFlowBlocked(false);
+            if (stream_window > 0) self.setLocalStreamFlowBlocked(id, false);
             const fin_now = want_fin and n_bytes == unsent;
             const grant = manager.reserveSend(id, @intCast(n_bytes), fin_now) catch continue;
             const range = Range{ .start = grant.offset, .end = grant.offset + grant.len };
@@ -4102,7 +4213,7 @@ pub const Connection = struct {
         const active_key = self.paths.activePath().key;
         self.paths.recordSentOnPath(active_key, total);
         self.metrics.datagrams_sent += 1;
-        self.events.emit(.{ .close_sent = .{ .error_code = info.error_code } });
+        self.events.emit(.{ .close_sent = .{ .error_code = info.error_code, .is_application = use_app_frame } });
         return .{ .bytes = out[0..total], .path = active_key };
     }
 };
@@ -5799,6 +5910,73 @@ test "driver: ACK for unsent packet closes without poisoning packet number refer
     try testing.expectEqual(State.closing, pair.server.state());
     try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
     try testing.expectEqual(before, pair.server.largest_peer_acked[space_idx]);
+}
+
+test "driver: invalid STOP_SENDING does not emit successful transition event" {
+    const Capture = struct {
+        stop_sending_events: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .stop_sending => self.stop_sending_events += 1,
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+
+    try pair.server.applyFrame(.application, .{ .stop_sending = .{ .id = 999, .app_error_code = 7 } }, TestPair.server_path, 0, pair.now_us);
+    try testing.expectEqual(State.closing, pair.server.state());
+    try testing.expectEqual(@as(usize, 0), capture.stop_sending_events);
+}
+
+test "driver: validated ACK reports recovery metrics after PTO backoff reset" {
+    const Capture = struct {
+        saw_zero_pto_metrics: bool = false,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .recovery_metrics_updated => |metrics| {
+                    if (metrics.pto_count == 0) self.saw_zero_pto_metrics = true;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+
+    const id = try pair.server.openStream(.bidi);
+    _ = try pair.server.writeStream(id, "pto-reset", false);
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    const sent = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
+    pair.server.pto_count = 3;
+
+    var ranges = recovery.AckRangeSet{};
+    try ranges.insert(sent.packet_number);
+    try pair.server.applyFrame(.application, .{ .ack = .{
+        .ranges = ranges,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = sent.packet_number,
+    } }, TestPair.server_path, 0, pair.now_us + 1_000);
+
+    try testing.expect(capture.saw_zero_pto_metrics);
 }
 
 test "driver: server retires its 0-RTT read secret once it authenticates a 1-RTT packet (RFC 9001 §4.9.3)" {
@@ -8049,8 +8227,8 @@ test "wipeSentRecordsSwapRemoveResidue zeroes the vacated slot regardless of its
     var records: std.ArrayList(SentRecord) = .empty;
     defer records.deinit(testing.allocator);
     try records.ensureTotalCapacityPrecise(testing.allocator, 4);
-    records.appendAssumeCapacity(.{ .space = .application, .packet_number = 1, .ack_eliciting = false, .sent_path = .{ .key = TestPair.client_path, .generation = 1 } });
-    records.appendAssumeCapacity(.{ .space = .application, .packet_number = 2, .ack_eliciting = false, .sent_path = .{ .key = TestPair.client_path, .generation = 1 } });
+    records.appendAssumeCapacity(.{ .space = .application, .packet_type = .one_rtt, .packet_number = 1, .ack_eliciting = false, .sent_path = .{ .key = TestPair.client_path, .generation = 1 } });
+    records.appendAssumeCapacity(.{ .space = .application, .packet_type = .one_rtt, .packet_number = 2, .ack_eliciting = false, .sent_path = .{ .key = TestPair.client_path, .generation = 1 } });
 
     _ = records.swapRemove(0);
     // Simulate whatever a safety-checked build's poison-fill (or a
@@ -8114,6 +8292,7 @@ test "connection: fixed sent-record and pending-CID capacities are preallocated"
     while (i < recovery.max_tracked_packets) : (i += 1) {
         try pair.server.sent_records.append(pair.server.allocator, .{
             .space = .application,
+            .packet_type = .one_rtt,
             .packet_number = i,
             .ack_eliciting = false,
             .sent_path = pair.server.paths.activePathRef(),
@@ -9023,12 +9202,15 @@ test "driver: PMTU loss feedback after promotion lands on the path that sent it"
     try ensureSentRecordCapacity(pair.server, pair.server.sent_records.items.len + 1);
     pair.server.sent_records.addOneAssumeCapacity().* = .{
         .space = .application,
+        .packet_type = .one_rtt,
         .packet_number = 9_999,
         .ack_eliciting = true,
         .sent_path = old_ref,
         .sent_size = discovered,
     };
-    _ = pair.server.requeueUntrackedRecords(.application, pair.now_us);
+    var lost_packet_type: ?packet.PacketKind = null;
+    var lost_packet_types_mixed = false;
+    _ = pair.server.requeueUntrackedRecords(.application, pair.now_us, &lost_packet_type, &lost_packet_types_mixed);
 
     // It counted against the path that actually sent it ...
     try testing.expectEqual(@as(u8, 1), pair.server.paths.plpmtuFor(old_ref).?.oversized_losses);
@@ -9075,6 +9257,7 @@ test "driver: a probe outcome after promotion resolves the probe's own path" {
     // raise the old path's size, not the new path's.
     pair.server.onRecordAcked(&.{
         .space = .application,
+        .packet_type = .one_rtt,
         .packet_number = 4_242,
         .ack_eliciting = true,
         .sent_path = old_ref,
@@ -9104,6 +9287,7 @@ test "driver: PMTU feedback for a recycled path slot is dropped" {
     try ensureSentRecordCapacity(pair.server, pair.server.sent_records.items.len + 1);
     pair.server.sent_records.addOneAssumeCapacity().* = .{
         .space = .application,
+        .packet_type = .one_rtt,
         .packet_number = 8_888,
         .ack_eliciting = true,
         .sent_path = .{ .key = stranger, .generation = 9_999 },
@@ -9111,7 +9295,9 @@ test "driver: PMTU feedback for a recycled path slot is dropped" {
     };
     // Dropping the feedback is the point: applying it to some other path would
     // be worse than losing it.
-    _ = pair.server.requeueUntrackedRecords(.application, pair.now_us);
+    var lost_packet_type: ?packet.PacketKind = null;
+    var lost_packet_types_mixed = false;
+    _ = pair.server.requeueUntrackedRecords(.application, pair.now_us, &lost_packet_type, &lost_packet_types_mixed);
     try testing.expectEqual(@as(u64, 0), pair.server.metrics.pmtu_black_holes);
     try testing.expectEqual(@as(u8, 0), pair.server.paths.activePlpmtu().oversized_losses);
 }
@@ -9163,12 +9349,15 @@ test "driver: a re-validated tuple does not inherit its previous incarnation's f
     try ensureSentRecordCapacity(pair.server, pair.server.sent_records.items.len + 1);
     pair.server.sent_records.addOneAssumeCapacity().* = .{
         .space = .application,
+        .packet_type = .one_rtt,
         .packet_number = 7_777,
         .ack_eliciting = true,
         .sent_path = old_ref,
         .sent_size = discovered,
     };
-    _ = pair.server.requeueUntrackedRecords(.application, pair.now_us);
+    var lost_packet_type: ?packet.PacketKind = null;
+    var lost_packet_types_mixed = false;
+    _ = pair.server.requeueUntrackedRecords(.application, pair.now_us, &lost_packet_type, &lost_packet_types_mixed);
 
     try testing.expectEqual(@as(u8, 0), fresh.oversized_losses);
     try testing.expectEqual(@as(u32, 0), fresh.black_holes);
@@ -9266,6 +9455,7 @@ test "driver: a PTO driven by old-path packets is not charged to the new path" {
     try ensureSentRecordCapacity(pair.server, pair.server.sent_records.items.len + 1);
     pair.server.sent_records.addOneAssumeCapacity().* = .{
         .space = .application,
+        .packet_type = .one_rtt,
         .packet_number = 6_000,
         .ack_eliciting = true,
         .sent_path = old_ref,
@@ -9395,12 +9585,15 @@ test "driver: a retry after a failed validation is a new incarnation" {
     try ensureSentRecordCapacity(pair.server, pair.server.sent_records.items.len + 1);
     pair.server.sent_records.addOneAssumeCapacity().* = .{
         .space = .application,
+        .packet_type = .one_rtt,
         .packet_number = 5_101,
         .ack_eliciting = true,
         .sent_path = first_ref,
         .sent_size = base_datagram_size,
     };
-    _ = pair.server.requeueUntrackedRecords(.application, pair.now_us);
+    var lost_packet_type: ?packet.PacketKind = null;
+    var lost_packet_types_mixed = false;
+    _ = pair.server.requeueUntrackedRecords(.application, pair.now_us, &lost_packet_type, &lost_packet_types_mixed);
     pair.server.notePmtuEvidence(first_ref, .{ .ordinary_ack = base_datagram_size }, pair.now_us);
 
     try testing.expectEqual(@as(usize, 1452), fresh.sendSize());
@@ -9444,6 +9637,7 @@ test "driver: a padded non-ack-eliciting packet counts as in flight" {
     // RFC 9002 §2 — the predicate the send path keys recovery accounting off.
     try testing.expect(recordIsInFlight(.{
         .space = .initial,
+        .packet_type = .initial,
         .packet_number = 0,
         .ack_eliciting = false,
         .sent_path = .{ .key = TestPair.client_path, .generation = 1 },
@@ -9451,6 +9645,7 @@ test "driver: a padded non-ack-eliciting packet counts as in flight" {
     }));
     try testing.expect(recordIsInFlight(.{
         .space = .application,
+        .packet_type = .one_rtt,
         .packet_number = 0,
         .ack_eliciting = true,
         .sent_path = .{ .key = TestPair.client_path, .generation = 1 },
@@ -9458,6 +9653,7 @@ test "driver: a padded non-ack-eliciting packet counts as in flight" {
     // A genuine pure ACK stays exempt.
     try testing.expect(!recordIsInFlight(.{
         .space = .application,
+        .packet_type = .one_rtt,
         .packet_number = 0,
         .ack_eliciting = false,
         .sent_path = .{ .key = TestPair.client_path, .generation = 1 },
@@ -9717,6 +9913,7 @@ fn fillOrdinaryTrackerWithRecords(conn: *Connection) !usize {
         std.debug.assert(conn.sent_records.items.len < conn.sent_records.capacity);
         conn.sent_records.addOneAssumeCapacity().* = .{
             .space = .initial,
+            .packet_type = .initial,
             .packet_number = pn,
             .ack_eliciting = false,
             .sent_path = conn.paths.activePathRef(),

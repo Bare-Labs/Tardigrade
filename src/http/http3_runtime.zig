@@ -791,6 +791,9 @@ pub const Runtime = struct {
             .accepted_at_us = now,
         };
         entry.conn.events = .{ .context = &entry.quic_observer, .emitFn = quicConnectionEvent };
+        if (quic_sink.isEnabled()) {
+            quic_sink.log(now, .{ .connection_started = .{ .dcid_len = @intCast(@min(parsed.dcid.len, std.math.maxInt(u8))) } });
+        }
         if (h3EventSinkFor(&entry.h3_observer)) |event_sink| {
             entry.h3.setEventSink(event_sink);
         }
@@ -1414,8 +1417,10 @@ pub const Runtime = struct {
     fn quicConnectionEvent(ctx: ?*anyopaque, event: quic.connection.Event) void {
         const observer: *ConnEntry.QuicObserver = @ptrCast(@alignCast(ctx.?));
         const self = observer.runtime;
-        if (quicEventToQlog(event)) |qlog_event| {
-            observer.qlog_sink.log(nowUs(), qlog_event);
+        if (observer.qlog_sink.isEnabled()) {
+            if (quicEventToQlog(event)) |qlog_event| {
+                observer.qlog_sink.log(nowUs(), qlog_event);
+            }
         }
         switch (event) {
             .early_data_decision => |decision| {
@@ -1482,18 +1487,15 @@ pub const Runtime = struct {
     fn quicEventToQlog(event: quic.connection.Event) ?quic.qlog.Event {
         return switch (event) {
             .state => |state| switch (state) {
-                .handshaking => .{ .handshake_progressed = .{ .stage = .started } },
-                .established => .{ .handshake_progressed = .{ .stage = .confirmed } },
-                .closing, .draining => null,
-                .closed => .{ .connection_closed = .{ .trigger = .unspecified } },
+                .handshaking, .established, .closing, .draining, .closed => null,
             },
             .packet_received => |packet_event| .{ .packet_received = .{
-                .packet_type = packetTypeForSpace(packet_event.space),
+                .packet_type = packetTypeForKind(packet_event.packet_type),
                 .packet_number = packet_event.packet_number,
                 .length = packet_event.size,
             } },
             .packet_sent => |packet_event| .{ .packet_sent = .{
-                .packet_type = packetTypeForSpace(packet_event.space),
+                .packet_type = packetTypeForKind(packet_event.packet_type),
                 .packet_number = packet_event.packet_number,
                 .length = packet_event.size,
                 .ack_eliciting = packet_event.ack_eliciting,
@@ -1506,11 +1508,15 @@ pub const Runtime = struct {
             .handshake_confirmed => .{ .handshake_progressed = .{ .stage = .confirmed } },
             .pto_fired => |pto| .{ .recovery_metrics_updated = .{ .pto_count = @intCast(@min(pto.count, std.math.maxInt(u16))) } },
             .packets_acked => |acked| .{ .packets_acked = .{
-                .packet_type = packetTypeForSpace(acked.space),
+                .packet_type = if (acked.packet_type) |kind| packetTypeForKind(kind) else null,
                 .largest_acknowledged = acked.largest_acknowledged,
                 .acked_count = acked.acked_count,
             } },
-            .packets_lost => |lost| .{ .packet_lost = .{ .packet_type = packetTypeForSpace(lost.space) } },
+            .packets_lost => |lost| .{ .packets_lost = .{
+                .packet_type = if (lost.packet_type) |kind| packetTypeForKind(kind) else null,
+                .lost_count = lost.lost_count,
+                .bytes = lost.bytes,
+            } },
             .recovery_metrics_updated => |metrics| .{ .recovery_metrics_updated = .{
                 .latest_rtt_ms = usToMs(metrics.latest_rtt_us),
                 .smoothed_rtt_ms = usToMs(metrics.smoothed_rtt_us),
@@ -1529,11 +1535,26 @@ pub const Runtime = struct {
                 .stream_id = stop.id,
                 .error_code = stop.error_code,
             } },
-            .flow_control_blocked => |blocked| switch (blocked.scope) {
-                .connection => .{ .data_blocked = .{ .connection = .{ .new = .blocked, .reason = .connection_flow_control } } },
-                .stream => .{ .data_blocked = .{ .stream = .{ .stream_id = blocked.stream_id orelse 0, .new = .blocked, .reason = .stream_flow_control } } },
+            .flow_control_state_changed => |blocked| switch (blocked.scope) {
+                .connection => .{ .data_blocked = .{ .connection = .{
+                    .old = flowControlStateToQlog(blocked.old),
+                    .new = flowControlStateToQlog(blocked.new),
+                    .reason = .connection_flow_control,
+                } } },
+                .stream => .{ .data_blocked = .{ .stream = .{
+                    .stream_id = blocked.stream_id orelse 0,
+                    .old = flowControlStateToQlog(blocked.old),
+                    .new = flowControlStateToQlog(blocked.new),
+                    .reason = .stream_flow_control,
+                } } },
             },
-            .close_sent => |close| .{ .connection_closed = .{ .trigger = .@"error", .close_error = .{ .connection_unknown = close.error_code } } },
+            .close_sent => |close| .{ .connection_closed = .{
+                .trigger = .@"error",
+                .close_error = if (close.is_application)
+                    .{ .application_unknown = close.error_code }
+                else
+                    .{ .connection_unknown = close.error_code },
+            } },
             .close_received => |close| .{ .connection_closed = .{
                 .trigger = .@"error",
                 .close_error = if (close.is_application)
@@ -1554,11 +1575,21 @@ pub const Runtime = struct {
         };
     }
 
-    fn packetTypeForSpace(space: quic.connection.PacketNumberSpace) quic.qlog.PacketType {
-        return switch (space) {
+    fn flowControlStateToQlog(state: quic.connection.FlowControlState) quic.qlog.BlockedState {
+        return switch (state) {
+            .blocked => .blocked,
+            .unblocked => .unblocked,
+        };
+    }
+
+    fn packetTypeForKind(kind: quic.packet.PacketKind) quic.qlog.PacketType {
+        return switch (kind) {
             .initial => .initial,
+            .zero_rtt => .zero_rtt,
             .handshake => .handshake,
-            .application => .one_rtt,
+            .one_rtt => .one_rtt,
+            .retry => .retry,
+            .version_negotiation => .version_negotiation,
         };
     }
 
@@ -2057,7 +2088,15 @@ const H3QlogRecorder = struct {
 test "http3 runtime: QUIC qlog adapter preserves normalized transport events" {
     try testing.expectEqual(
         quic.qlog.Event{ .packets_acked = .{ .packet_type = .one_rtt, .largest_acknowledged = 11, .acked_count = 4 } },
-        Runtime.quicEventToQlog(.{ .packets_acked = .{ .space = .application, .largest_acknowledged = 11, .acked_count = 4 } }).?,
+        Runtime.quicEventToQlog(.{ .packets_acked = .{ .space = .application, .packet_type = .one_rtt, .largest_acknowledged = 11, .acked_count = 4 } }).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .packets_lost = .{ .packet_type = .one_rtt, .lost_count = 3, .bytes = 3600 } },
+        Runtime.quicEventToQlog(.{ .packets_lost = .{ .space = .application, .packet_type = .one_rtt, .lost_count = 3, .bytes = 3600 } }).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .packet_received = .{ .packet_type = .zero_rtt, .packet_number = 7, .length = 1200 } },
+        Runtime.quicEventToQlog(.{ .packet_received = .{ .space = .application, .packet_type = .zero_rtt, .packet_number = 7, .size = 1200 } }).?,
     );
     try testing.expectEqual(
         quic.qlog.Event{ .recovery_metrics_updated = .{ .latest_rtt_ms = 12, .smoothed_rtt_ms = 10, .rtt_variance_ms = 3, .pto_count = 2, .congestion_window = 12000, .bytes_in_flight = 6000 } },
@@ -2068,8 +2107,8 @@ test "http3 runtime: QUIC qlog adapter preserves normalized transport events" {
         Runtime.quicEventToQlog(.{ .stop_sending = .{ .id = 8, .error_code = 42, .local = false } }).?,
     );
     try testing.expectEqual(
-        quic.qlog.Event{ .data_blocked = .{ .stream = .{ .stream_id = 12, .new = .blocked, .reason = .stream_flow_control } } },
-        Runtime.quicEventToQlog(.{ .flow_control_blocked = .{ .scope = .stream, .stream_id = 12 } }).?,
+        quic.qlog.Event{ .data_blocked = .{ .stream = .{ .stream_id = 12, .old = .unblocked, .new = .blocked, .reason = .stream_flow_control } } },
+        Runtime.quicEventToQlog(.{ .flow_control_state_changed = .{ .scope = .stream, .stream_id = 12, .local = true, .old = .unblocked, .new = .blocked } }).?,
     );
     try testing.expectEqual(
         quic.qlog.Event{ .connection_closed = .{ .trigger = .idle_timeout } },

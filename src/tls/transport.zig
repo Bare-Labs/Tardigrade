@@ -263,7 +263,6 @@ pub fn ContractWithOptions(
             /// `.read`, our own emitted `KeyUpdate` bytes for `.write`.
             pub fn emitKeyUpdate(self: *EventSink, direction: events.SecretDirection) ErrorSet!void {
                 try self.reserve(0);
-                self.keylog_context.noteKeyUpdate(direction);
                 self.pushUnchecked(.{ .key_update = .{ .direction = direction } });
             }
 
@@ -342,6 +341,7 @@ pub fn ContractWithOptions(
             earlyDataAttemptedFn: ?*const fn (ptr: *anyopaque) bool = null,
             earlyDataMaxBytesFn: ?*const fn (ptr: *anyopaque) u32 = null,
             earlyDataDiscardLimitFn: ?*const fn (ptr: *anyopaque) u32 = null,
+            clientRandomFn: ?*const fn (ptr: *anyopaque) ?*const [keylog.client_random_len]u8 = null,
             /// True once this side has *sent* a HelloRetryRequest (#338).
             /// Only a server ever does, and only after it has accepted a
             /// complete, well-formed first ClientHello -- which is precisely
@@ -408,6 +408,11 @@ pub fn ContractWithOptions(
             pub fn earlyDataDiscardLimit(self: Backend) u32 {
                 if (self.earlyDataDiscardLimitFn) |f| return f(self.ptr);
                 return 0;
+            }
+
+            pub fn clientRandom(self: Backend) ?*const [keylog.client_random_len]u8 {
+                if (self.clientRandomFn) |f| return f(self.ptr);
+                return null;
             }
 
             /// See `helloRetryRequestSentFn`. Defaults to false, which keeps
@@ -510,10 +515,10 @@ test "generic transport sink emits TLS-owned keylog before reset can wipe secret
         .keylog_context = .{
             .enabled = true,
             .role = .server,
-            .client_random = &random,
             .sink = .{ .context = &capture, .emit_fn = Capture.emit },
         },
     };
+    try sink.keylog_context.setClientRandom(&random);
     try sink.emitSecret(.application, .write, &secret);
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expect(std.mem.startsWith(u8, capture.line[0..capture.line_len], "SERVER_TRAFFIC_SECRET_0 "));
@@ -523,7 +528,7 @@ test "generic transport sink emits TLS-owned keylog before reset can wipe secret
     for (sink.scratch[0..secret.len]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
-test "generic transport sink keylog tracks record-mode KeyUpdate generations" {
+test "generic transport sink KeyUpdate does not pre-advance keylog generations" {
     const ErrorSet = error{TransportBufferOverflow};
     const Epoch = events.EncryptionEpoch;
     const T = Contract(void, Epoch, ErrorSet);
@@ -541,13 +546,13 @@ test "generic transport sink keylog tracks record-mode KeyUpdate generations" {
         .keylog_context = .{
             .enabled = true,
             .role = .client,
-            .client_random = &random,
             .sink = .{ .context = &capture, .emit_fn = Capture.emit },
         },
     };
+    try sink.keylog_context.setClientRandom(&random);
     try sink.emitKeyUpdate(.read);
     try sink.emitSecret(.application, .read, &[_]u8{0x55} ** 32);
-    try std.testing.expectEqual(keylog.Label{ .endpoint = .server, .epoch = .application, .generation = 1 }, capture.last.?);
+    try std.testing.expectEqual(keylog.Label{ .endpoint = .server, .epoch = .application, .generation = 0 }, capture.last.?);
 }
 
 test "generic transport sink enforces bounded payload storage" {

@@ -29,6 +29,7 @@ const crypto_pkg = @import("crypto");
 const tls_handshake_codec = @import("handshake.zig");
 const hello_retry = @import("hello_retry.zig");
 const tls_key_schedule = @import("key_schedule.zig");
+const keylog = @import("keylog.zig");
 const key_update = @import("key_update.zig");
 const new_session_ticket = @import("new_session_ticket.zig");
 const pre_shared_key = @import("pre_shared_key.zig");
@@ -719,6 +720,8 @@ pub const Tls13Backend = struct {
     peer_transport_extension: [max_transport_extension_len]u8 = undefined,
     peer_transport_extension_len: usize = 0,
     peer_transport_extension_pending: bool = false,
+    client_random: [keylog.client_random_len]u8 = [_]u8{0} ** keylog.client_random_len,
+    has_client_random: bool = false,
     key_pair: EphemeralKeyShare = .{},
     key_pair_present: bool = false,
     /// Client (#484): which key-share strategy ClientHello1 uses, configured
@@ -1631,6 +1634,7 @@ pub const Tls13Backend = struct {
             .earlyDataAttemptedFn = earlyDataAttemptedImpl,
             .earlyDataMaxBytesFn = earlyDataMaxBytesImpl,
             .earlyDataDiscardLimitFn = earlyDataDiscardLimitImpl,
+            .clientRandomFn = clientRandomImpl,
             .helloRetryRequestSentFn = helloRetryRequestSentImpl,
             // #359: always wired. Under `.extension` (QUIC) it reports the
             // protocol-maximum default, which is what an unnegotiated
@@ -1652,6 +1656,14 @@ pub const Tls13Backend = struct {
     fn requestKeyUpdateImpl(ptr: *anyopaque, request: key_update.Request, sink: *EventSink) HandshakeError!void {
         const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
         return self.requestKeyUpdate(request, sink);
+    }
+
+    fn clientRandomImpl(ptr: *anyopaque) ?*const [keylog.client_random_len]u8 {
+        const self: *Tls13Backend = @ptrCast(@alignCast(ptr));
+        return switch (self.role) {
+            .client => &self.entropy.hello_random,
+            .server => if (self.has_client_random) &self.client_random else null,
+        };
     }
 
     /// #338: a server has sent a HelloRetryRequest, which it only does after
@@ -2885,6 +2897,7 @@ pub const Tls13Backend = struct {
         }
 
         const message = buf[0..w.len];
+        sink.keylog_context.setClientRandom(&self.entropy.hello_random) catch unreachable;
 
         // #366: the client 0-RTT traffic secret is derived from the hash of
         // this *complete* ClientHello (patched lengths, real binders) —
@@ -4466,6 +4479,9 @@ pub const Tls13Backend = struct {
             .ctx = &observer,
             .observeFn = ClientHelloObserver.observe,
         }) catch |err| return mapPeerHelloNegotiationError(err);
+        sink.keylog_context.setClientRandom(body[2..][0..keylog.client_random_len]) catch unreachable;
+        @memcpy(&self.client_random, body[2..][0..keylog.client_random_len]);
+        self.has_client_random = true;
         const offers = parsed.offers;
         // #484: `drainInput`'s preflight (`validateSecondClientHelloAgainstRetained`)
         // already validated this ClientHello2 against the retained

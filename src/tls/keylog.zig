@@ -67,20 +67,27 @@ pub const Sink = struct {
 pub const Context = struct {
     enabled: bool = false,
     role: state.Role = .server,
-    client_random: ?*const [client_random_len]u8 = null,
+    client_random: [client_random_len]u8 = [_]u8{0} ** client_random_len,
+    has_client_random: bool = false,
     sink: Sink = .{},
     read_application_generation: u64 = 0,
     write_application_generation: u64 = 0,
 
+    pub fn setClientRandom(self: *Context, random: []const u8) error{InvalidClientRandom}!void {
+        if (random.len != client_random_len) return error.InvalidClientRandom;
+        @memcpy(&self.client_random, random);
+        self.has_client_random = true;
+    }
+
     pub fn emitSecret(self: *Context, epoch: events.EncryptionEpoch, direction: events.SecretDirection, secret: []const u8) void {
         if (!self.enabled) return;
-        const random = self.client_random orelse return;
+        if (!self.has_client_random) return;
         const generation = switch (direction) {
             .read => self.read_application_generation,
             .write => self.write_application_generation,
         };
         const label = labelFor(self.role, direction, epoch, generation) orelse return;
-        self.sink.emit(.{ .label = label, .client_random = random, .secret = secret });
+        self.sink.emit(.{ .label = label, .client_random = &self.client_random, .secret = secret });
     }
 
     pub fn noteKeyUpdate(self: *Context, direction: events.SecretDirection) void {
@@ -197,9 +204,9 @@ test "context emits before caller resets or wipes event payloads" {
     var ctx = Context{
         .enabled = true,
         .role = .server,
-        .client_random = &random,
         .sink = .{ .context = &capture, .emit_fn = Capture.emit },
     };
+    try ctx.setClientRandom(&random);
     ctx.noteKeyUpdate(.write);
     ctx.emitSecret(.application, .write, &secret);
     try testing.expectEqual(@as(usize, 1), capture.count);

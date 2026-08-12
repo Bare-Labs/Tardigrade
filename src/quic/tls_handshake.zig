@@ -238,6 +238,7 @@ pub const Handshake = struct {
     pub fn initClientWithKeylog(adapter: *QuicTlsAdapter, backend: TlsBackend, keylog_context: tls_core.keylog.Context) Handshake {
         var handshake = Handshake{ .adapter = adapter, .driver = CoreDriver.init(.client, backend.transport) };
         handshake.driver.sink.keylog_context = keylog_context;
+        handshake.driver.sink.keylog_context.role = .client;
         return handshake;
     }
 
@@ -248,6 +249,7 @@ pub const Handshake = struct {
     pub fn initServerWithKeylog(adapter: *QuicTlsAdapter, backend: TlsBackend, keylog_context: tls_core.keylog.Context) Handshake {
         var handshake = Handshake{ .adapter = adapter, .driver = CoreDriver.init(.server, backend.transport) };
         handshake.driver.sink.keylog_context = keylog_context;
+        handshake.driver.sink.keylog_context.role = .server;
         return handshake;
     }
 
