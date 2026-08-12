@@ -88,7 +88,15 @@ pub const Config = struct {
     h3_settings: http3.frame.Settings = .{},
     connection_migration: bool = false,
     retry_policy: quic.config.RetryPolicy = .off,
-    max_datagram_size: usize = 1350,
+    /// Operator-facing bound on the size of datagrams this listener **sends**,
+    /// clamped into `[quic.datagram.base_size, quic.datagram.max_size]`. It is
+    /// the assumed path MTU, not a receive limit: the `max_udp_payload_size`
+    /// this endpoint advertises is its own receive capacity and is fixed by
+    /// the transport's buffers, not by this knob (#256-A). The default is the
+    /// one authoritative value in `quic.datagram` rather than a second knob
+    /// that can drift from it; the transport lowers it further whenever the
+    /// peer advertises less receive capacity.
+    max_datagram_size: usize = quic.datagram.base_size,
     request_handler: ?RequestHandler = null,
     request_handler_ctx: ?*anyopaque = null,
     early_data_compat_metrics_ctx: ?*anyopaque = null,
@@ -461,7 +469,7 @@ pub const Runtime = struct {
             // 1) Timers and transmission for every connection.
             var wake_us: u64 = now + 100_000;
             {
-                var out: [2048]u8 = undefined;
+                var out: [quic.datagram.max_size]u8 = undefined;
                 var reap: [16]u64 = undefined;
                 var reap_count: usize = 0;
                 var it = connections.iterator();
@@ -509,7 +517,7 @@ pub const Runtime = struct {
             _ = posix.poll(&fds, timeout_ms) catch {};
 
             // 3) Ingest every waiting datagram.
-            var buf: [2048]u8 = undefined;
+            var buf: [quic.datagram.max_size]u8 = undefined;
             var from: std.c.sockaddr.storage = undefined;
             while (true) {
                 var from_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
@@ -612,7 +620,7 @@ pub const Runtime = struct {
         }
         self.maybeIssueSessionTicket(entry);
 
-        var out: [2048]u8 = undefined;
+        var out: [quic.datagram.max_size]u8 = undefined;
         while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
             self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
         }
@@ -1561,7 +1569,7 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
 /// config.
 fn quicConfigFrom(cfg: Config) quic.config.Config {
     return .{
-        .max_udp_payload_size = std.math.clamp(cfg.max_datagram_size, 1200, 2048),
+        .max_send_udp_payload_size = std.math.clamp(cfg.max_datagram_size, quic.datagram.base_size, quic.datagram.max_size),
         .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
         .retry_policy = cfg.retry_policy,
         .migration_policy = if (cfg.connection_migration) .full else .nat_rebinding_only,
@@ -2105,17 +2113,17 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
         .listen_host = "::",
         .quic_port = 443,
         .max_datagram_size = 512,
-    }).max_udp_payload_size);
+    }).max_send_udp_payload_size);
     // Above the 2048-byte work buffer snaps down.
     try testing.expectEqual(@as(u64, 2048), quicConfigFrom(.{
         .listen_host = "::",
         .quic_port = 443,
         .max_datagram_size = 9000,
-    }).max_udp_payload_size);
+    }).max_send_udp_payload_size);
     // An in-range value passes through, and default migration allows validated
     // same-IP NAT rebinding while still advertising disable_active_migration.
     const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 });
-    try testing.expectEqual(@as(u64, 1350), mid.max_udp_payload_size);
+    try testing.expectEqual(@as(u64, 1350), mid.max_send_udp_payload_size);
     try testing.expectEqual(quic.config.MigrationPolicy.nat_rebinding_only, mid.migration_policy);
     try testing.expectEqual(quic.config.RetryPolicy.off, mid.retry_policy);
     try testing.expectEqual(quic.config.MigrationPolicy.full, quicConfigFrom(.{
@@ -2128,6 +2136,36 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
         .quic_port = 443,
         .retry_policy = .address_validation,
     }).retry_policy);
+}
+
+test "quicConfigFrom: the runtime default is the transport's own authoritative default" {
+    // #256-A: the runtime must not carry a second datagram-size default that
+    // can drift from the transport's. Both come from `quic.datagram`.
+    const runtime_default = Config{ .listen_host = "::", .quic_port = 443 };
+    try testing.expectEqual(quic.datagram.base_size, runtime_default.max_datagram_size);
+    const mapped = quicConfigFrom(runtime_default);
+    try testing.expectEqual(
+        (quic.config.Config{}).max_send_udp_payload_size,
+        mapped.max_send_udp_payload_size,
+    );
+    // The advertised receive capacity is a property of the transport's
+    // buffers, not of this operator knob, so the knob must not move it.
+    try testing.expectEqual(
+        (quic.config.Config{}).max_udp_payload_size,
+        mapped.max_udp_payload_size,
+    );
+    try testing.expectEqual(
+        quic.datagram.max_size,
+        quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 }).max_udp_payload_size,
+    );
+}
+
+test "http3 runtime: receive buffers match the advertised receive capacity" {
+    // The `max_udp_payload_size` this endpoint promises the peer must not
+    // exceed what the listener and connection can actually deprotect.
+    const advertised = (quic.config.Config{}).max_udp_payload_size;
+    try testing.expectEqual(@as(u64, quic.datagram.max_size), advertised);
+    try testing.expectEqual(quic.datagram.max_size, quic.connection.max_receive_datagram_size);
 }
 
 test "http3 runtime: spare CID route is registered before NEW_CONNECTION_ID is pollable" {

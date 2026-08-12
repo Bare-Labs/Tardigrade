@@ -935,7 +935,12 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     const http3_retry_policy_str = envOrDefault(allocator, "TARDIGRADE_HTTP3_RETRY_POLICY", "off") catch unreachable;
     defer allocator.free(http3_retry_policy_str);
     const http3_retry_policy = try parseHttp3RetryPolicyConfig(http3_retry_policy_str);
-    const http3_max_datagram_size = parseIntEnv(usize, allocator, "TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE", 1350);
+    // #256-A: the **send** size, owned by `quic.datagram`. This is not the
+    // `max_udp_payload_size` this endpoint advertises — that is receive
+    // capacity, fixed by the transport's buffers. The transport clamps this
+    // into `[base_size, max_size]` and lowers it further whenever the peer
+    // advertises smaller receive capacity.
+    const http3_max_datagram_size = parseIntEnv(usize, allocator, "TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE", http.quic.datagram.base_size);
     const proxy_protocol_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_PROTOCOL", "off") catch unreachable;
     defer allocator.free(proxy_protocol_mode_str);
     const proxy_protocol_mode = try parseProxyProtocolModeConfig(proxy_protocol_mode_str);

@@ -2,6 +2,7 @@
 //! gateway types. HTTP/3 application mapping lives in `src/http3/`.
 
 pub const config = @import("config.zig");
+pub const datagram = @import("datagram.zig");
 pub const udp = @import("udp.zig");
 pub const varint = @import("quic_varint");
 pub const packet = @import("packet.zig");

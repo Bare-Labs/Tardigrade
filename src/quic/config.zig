@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const secrets = @import("crypto_secrets");
+const quic_datagram = @import("datagram.zig");
 
 pub const QuicVersion = enum(u32) {
     v1 = 0x00000001,
@@ -72,7 +73,21 @@ pub const Config = struct {
     versions: VersionSet = .{},
     idle_timeout_ms: u64 = 30_000,
     active_connection_id_limit: u64 = 4,
-    max_udp_payload_size: u64 = 1200,
+    /// RFC 9000 §18.2: the largest UDP payload this endpoint is willing to
+    /// **receive**, advertised to the peer. It is endpoint receive capacity,
+    /// not path state, so it must not exceed the receive buffers the
+    /// implementation actually allocates — `validate()` enforces that against
+    /// `quic.datagram.max_size`, which is the same symbol those buffers are
+    /// sized from. Send-side limits live in `max_send_udp_payload_size` and
+    /// `quic.datagram.Limits`.
+    max_udp_payload_size: u64 = quic_datagram.max_size,
+    /// The sender's maximum datagram size for a new path: what this endpoint
+    /// assumes the path carries before anything has measured it. Defaults to
+    /// the RFC 9000 §14 floor, the only size every path must support. Raising
+    /// it asserts a path MTU rather than measuring one; #256-B replaces the
+    /// assertion with DPLPMTUD. Always additionally bounded by the peer's
+    /// advertised receive capacity.
+    max_send_udp_payload_size: u64 = quic_datagram.base_size,
     initial_max_data: u64 = 8 * 1024 * 1024,
     initial_max_stream_data_bidi_local: u64 = 1024 * 1024,
     initial_max_stream_data_bidi_remote: u64 = 1024 * 1024,
@@ -91,7 +106,11 @@ pub const Config = struct {
         if (self.versions.preferred() == null) return error.UnsupportedQuicVersion;
         if (self.idle_timeout_ms == 0) return error.InvalidIdleTimeout;
         if (self.active_connection_id_limit < 2) return error.InvalidActiveConnectionIdLimit;
-        if (self.max_udp_payload_size < 1200 or self.max_udp_payload_size > 65_527) return error.InvalidMaxUdpPayloadSize;
+        // Never advertise receive capacity the implementation cannot process:
+        // the ceiling here is the same symbol the receive scratch buffers are
+        // sized from, so the two cannot drift.
+        if (self.max_udp_payload_size < quic_datagram.base_size or self.max_udp_payload_size > quic_datagram.max_size) return error.InvalidMaxUdpPayloadSize;
+        if (self.max_send_udp_payload_size < quic_datagram.base_size or self.max_send_udp_payload_size > quic_datagram.max_size) return error.InvalidMaxSendUdpPayloadSize;
         if (self.initial_max_data == 0) return error.InvalidFlowControlWindow;
         if (self.initial_max_stream_data_bidi_local > self.initial_max_data) return error.InvalidFlowControlWindow;
         if (self.initial_max_stream_data_bidi_remote > self.initial_max_data) return error.InvalidFlowControlWindow;
@@ -194,7 +213,10 @@ test "default QUIC config maps to conservative transport parameters" {
     try std.testing.expect(!cfg.versions.supports(.v2));
     try std.testing.expectEqual(@as(u64, 30_000), params.max_idle_timeout_ms);
     try std.testing.expectEqual(@as(u64, 4), params.active_connection_id_limit);
-    try std.testing.expectEqual(@as(u64, 1200), params.max_udp_payload_size);
+    // The advertised parameter is receive capacity, so it matches the receive
+    // buffers the implementation allocates; the send side stays conservative.
+    try std.testing.expectEqual(@as(u64, quic_datagram.max_size), params.max_udp_payload_size);
+    try std.testing.expectEqual(@as(u64, quic_datagram.base_size), cfg.max_send_udp_payload_size);
     try std.testing.expect(params.disable_active_migration);
     try std.testing.expect(!cfg.zero_rtt_enabled);
     try std.testing.expectEqual(QpackMode.static_only, cfg.qpack.mode);
@@ -204,6 +226,11 @@ test "QUIC config validation rejects unsafe combinations" {
     try std.testing.expectError(error.UnsupportedQuicVersion, (Config{ .versions = .{ .v1 = false, .v2 = false } }).validate());
     try std.testing.expectError(error.InvalidActiveConnectionIdLimit, (Config{ .active_connection_id_limit = 1 }).validate());
     try std.testing.expectError(error.InvalidMaxUdpPayloadSize, (Config{ .max_udp_payload_size = 1199 }).validate());
+    // Advertising more than the implementation can actually receive is
+    // rejected rather than promised to the peer.
+    try std.testing.expectError(error.InvalidMaxUdpPayloadSize, (Config{ .max_udp_payload_size = quic_datagram.max_size + 1 }).validate());
+    try std.testing.expectError(error.InvalidMaxSendUdpPayloadSize, (Config{ .max_send_udp_payload_size = 1199 }).validate());
+    try std.testing.expectError(error.InvalidMaxSendUdpPayloadSize, (Config{ .max_send_udp_payload_size = quic_datagram.max_size + 1 }).validate());
     try std.testing.expectError(error.InvalidStreamLimit, (Config{ .initial_max_streams_bidi = max_initial_streams_transport_parameter + 1 }).validate());
     try std.testing.expectError(error.InvalidStreamLimit, (Config{ .initial_max_streams_uni = max_initial_streams_transport_parameter + 1 }).validate());
     try std.testing.expectError(error.InvalidFlowControlWindow, (Config{

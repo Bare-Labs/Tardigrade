@@ -1078,7 +1078,7 @@ test "smoke harness resets recovery when validated migration changes host" {
     try smoke.completeHandshake();
 
     smoke.server.recovery.rtt.update(80_000, 0);
-    smoke.server.recovery.congestion.congestion_window = 3 * quic_recovery.max_datagram_size;
+    smoke.server.recovery.congestion.congestion_window = 3 * quic_recovery.initial_max_datagram_size;
     try testing.expect(smoke.server.recovery.rtt.hasSample());
 
     const migrated_client = quic_udp.Address.ip4(.{ 198, 51, 100, 7 }, 50_000);
@@ -1092,7 +1092,7 @@ test "smoke harness resets recovery when validated migration changes host" {
     try testing.expectEqual(@as(u64, 1), smoke.server.paths.metrics.migrations);
     try testing.expect(!smoke.server.recovery.rtt.hasSample());
     try testing.expectEqual(
-        quic_recovery.CongestionController.initialWindow(quic_recovery.max_datagram_size),
+        quic_recovery.CongestionController.initialWindow(quic_recovery.initial_max_datagram_size),
         smoke.server.recovery.congestion.congestion_window,
     );
 }
