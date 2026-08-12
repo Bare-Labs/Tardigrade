@@ -263,6 +263,8 @@ pub const LossResult = struct {
     /// Every in-flight byte declared lost, probes included. This is the
     /// ledger figure — all of it must leave `bytes_in_flight`.
     lost_bytes: usize = 0,
+    persistent_congestion: bool = false,
+    earliest_lost_time_sent_us: ?u64 = null,
     largest_lost_time_sent_us: ?u64 = null,
     /// The subset of `lost_bytes` belonging to DPLPMTUD probes, which
     /// RFC 9000 §14.4 excludes from the congestion reaction.
@@ -272,6 +274,7 @@ pub const LossResult = struct {
     /// on its own. Deliberately *not* accompanied by an aggregate lost size —
     /// DPLPMTUD evidence is per path, and a single number here would collapse
     /// losses from several paths into one (#256-B review).
+    earliest_ordinary_lost_time_sent_us: ?u64 = null,
     largest_ordinary_lost_time_sent_us: ?u64 = null,
 };
 
@@ -363,12 +366,20 @@ pub const PacketTracker = struct {
         if (threshold_lost) result.packet_threshold_losses += 1;
         if (time_lost) result.time_threshold_losses += 1;
         if (packet.in_flight) result.lost_bytes += packet.size;
+        if (result.earliest_lost_time_sent_us == null or packet.time_sent_us < result.earliest_lost_time_sent_us.?) {
+            result.earliest_lost_time_sent_us = packet.time_sent_us;
+        }
         if (result.largest_lost_time_sent_us == null or packet.time_sent_us > result.largest_lost_time_sent_us.?) {
             result.largest_lost_time_sent_us = packet.time_sent_us;
         }
         if (packet.pmtu_probe) {
             if (packet.in_flight) result.probe_lost_bytes += packet.size;
             return;
+        }
+        if (result.earliest_ordinary_lost_time_sent_us == null or
+            packet.time_sent_us < result.earliest_ordinary_lost_time_sent_us.?)
+        {
+            result.earliest_ordinary_lost_time_sent_us = packet.time_sent_us;
         }
         if (result.largest_ordinary_lost_time_sent_us == null or
             packet.time_sent_us > result.largest_ordinary_lost_time_sent_us.?)
@@ -416,6 +427,11 @@ pub const PacketTracker = struct {
             noteLost(&result, packet, threshold_lost, time_lost);
             if (packet.in_flight) self.bytes_in_flight -= packet.size;
             _ = self.recovery_overflow.orderedRemove(overflow_index);
+        }
+        if (result.time_threshold_losses > 0 and result.earliest_ordinary_lost_time_sent_us != null) {
+            const earliest = result.earliest_ordinary_lost_time_sent_us.?;
+            const latest = result.largest_ordinary_lost_time_sent_us.?;
+            result.persistent_congestion = latest >= earliest and latest - earliest >= rtt.ptoDuration(space) * 3;
         }
         return result;
     }
@@ -545,6 +561,7 @@ pub const CongestionController = struct {
         self.bytes_in_flight -|= packet.size;
         if (self.recovery_start_time_us) |start| {
             if (packet.time_sent_us <= start) return;
+            self.recovery_start_time_us = null;
         }
         if (self.congestion_window < self.ssthresh) {
             self.congestion_window += packet.size;
@@ -677,6 +694,7 @@ pub const RecoveryController = struct {
             const congestion_bytes = result.lost_bytes - result.probe_lost_bytes;
             if (congestion_bytes > 0) {
                 self.congestion.onPacketsLost(result.largest_ordinary_lost_time_sent_us.?, congestion_bytes, now_us);
+                if (result.persistent_congestion) self.congestion.onPersistentCongestion();
             }
             self.events.emit(.{
                 .kind = .packet_lost,
@@ -684,6 +702,14 @@ pub const RecoveryController = struct {
                 .bytes_in_flight = self.tracker.bytes_in_flight,
                 .congestion_window = self.congestion.congestion_window,
             });
+            if (result.persistent_congestion) {
+                self.events.emit(.{
+                    .kind = .persistent_congestion,
+                    .space = space,
+                    .bytes_in_flight = self.tracker.bytes_in_flight,
+                    .congestion_window = self.congestion.congestion_window,
+                });
+            }
         }
         return result;
     }
@@ -844,6 +870,7 @@ test "loss detection covers packet threshold and time threshold" {
     try testing.expectEqual(@as(usize, 2), threshold_loss.packet_threshold_losses);
     try testing.expectEqual(@as(usize, 200), threshold_loss.lost_bytes);
     try testing.expectEqual(@as(u64, 10), threshold_loss.largest_lost_time_sent_us.?);
+    try testing.expect(!threshold_loss.persistent_congestion);
     try testing.expectEqual(@as(usize, 200), tracker.bytes_in_flight);
 
     _ = tracker.onAcked(.application, 4, 120);
@@ -851,7 +878,24 @@ test "loss detection covers packet threshold and time threshold" {
     try testing.expectEqual(@as(usize, 1), time_loss.time_threshold_losses);
     try testing.expectEqual(@as(usize, 100), time_loss.lost_bytes);
     try testing.expectEqual(@as(u64, 20), time_loss.largest_lost_time_sent_us.?);
+    try testing.expect(!time_loss.persistent_congestion);
     try testing.expectEqual(@as(usize, 0), tracker.bytes_in_flight);
+}
+
+test "loss detection reports persistent congestion only for a real duration episode" {
+    var tracker = PacketTracker{};
+    var rtt = RttEstimator.init(0);
+    rtt.update(100_000, 0);
+    const duration = rtt.ptoDuration(.application) * 3;
+
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 1, .time_sent_us = 0, .size = 100 });
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 2, .time_sent_us = duration, .size = 100 });
+    try tracker.onPacketSent(.{ .space = .application, .packet_number = 3, .time_sent_us = duration + 1, .size = 100 });
+    _ = tracker.onAcked(.application, 3, duration + 2);
+
+    const loss = tracker.detectLost(.application, duration * 2, rtt);
+    try testing.expectEqual(@as(usize, 2), loss.time_threshold_losses);
+    try testing.expect(loss.persistent_congestion);
 }
 
 test "NewReno baseline halves cwnd and persistent congestion uses minimum window" {
@@ -892,6 +936,7 @@ test "NewReno recovery period prevents repeated cwnd cuts and old ACK growth" {
 
     cc.onPacketAcked(.{ .space = .application, .packet_number = 5, .time_sent_us = 70_000, .size = 1_200 });
     try testing.expect(cc.congestion_window > after_first_loss);
+    try testing.expect(cc.recovery_start_time_us == null);
     try testing.expectEqual(@as(usize, 1_200), cc.bytes_in_flight);
 }
 

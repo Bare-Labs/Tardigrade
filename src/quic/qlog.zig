@@ -142,6 +142,22 @@ pub const MigrationState = enum {
     migration_complete,
 };
 
+pub const StreamState = enum {
+    open,
+    half_closed_local,
+    half_closed_remote,
+    closed,
+    reset_received,
+    reset_sent,
+};
+
+pub const CongestionState = enum {
+    slow_start,
+    congestion_avoidance,
+    recovery,
+    persistent_congestion,
+};
+
 /// RESET_STREAM / STOP_SENDING direction (RFC 9000 §19.4, §19.5).
 pub const StreamResetKind = enum {
     reset_sent,
@@ -294,6 +310,21 @@ pub const Event = union(enum) {
         stream_id: u64,
         error_code: u64 = 0,
     },
+    /// quic:stream_state_updated
+    stream_state_updated: struct {
+        stream_id: u64,
+        old: ?StreamState = null,
+        new: StreamState,
+    },
+    /// quic:congestion_state_updated
+    congestion_state_updated: struct {
+        old: CongestionState,
+        new: CongestionState,
+    },
+    /// tardigrade:quic_persistent_congestion (RFC 9002 persistent congestion detected)
+    persistent_congestion: struct {
+        trigger: []const u8 = "loss_duration",
+    },
     /// quic:connection_data_blocked_updated /
     /// quic:stream_data_blocked_updated (flow-control blocked)
     data_blocked: DataBlocked,
@@ -313,6 +344,8 @@ pub const Event = union(enum) {
             .packet_received,
             .packet_dropped,
             .data_blocked,
+            .stream_state_updated,
+            .congestion_state_updated,
             => .quic,
             .path_validation,
             .stream_reset,
@@ -320,6 +353,7 @@ pub const Event = union(enum) {
             .packets_acked,
             .packets_lost,
             .flow_control_blocked_received,
+            .persistent_congestion,
             => .tardigrade,
         };
     }
@@ -341,6 +375,9 @@ pub const Event = union(enum) {
             .path_validation => "quic_path_validation",
             .connection_migrated => "migration_state_updated",
             .stream_reset => "quic_stream_reset",
+            .stream_state_updated => "stream_state_updated",
+            .congestion_state_updated => "congestion_state_updated",
+            .persistent_congestion => "quic_persistent_congestion",
             .data_blocked => |d| switch (d) {
                 .connection => "connection_data_blocked_updated",
                 .stream => "stream_data_blocked_updated",
@@ -538,6 +575,19 @@ fn writeData(b: *Buf, event: Event) error{NoSpaceLeft}!void {
             "{{\"direction\":\"{s}\",\"stream_id\":{d},\"error_code\":{d}}}",
             .{ @tagName(d.kind), d.stream_id, d.error_code },
         ),
+        .stream_state_updated => |d| {
+            try b.add("{{\"stream_id\":{d}", .{d.stream_id});
+            if (d.old) |old| try b.add(",\"old\":\"{s}\"", .{@tagName(old)});
+            try b.add(",\"new\":\"{s}\"}}", .{@tagName(d.new)});
+        },
+        .congestion_state_updated => |d| try b.add(
+            "{{\"old\":\"{s}\",\"new\":\"{s}\"}}",
+            .{ @tagName(d.old), @tagName(d.new) },
+        ),
+        .persistent_congestion => |d| try b.add(
+            "{{\"trigger\":\"{s}\"}}",
+            .{d.trigger},
+        ),
         .data_blocked => |d| switch (d) {
             .connection => |blocked| {
                 try b.add("{{", .{});
@@ -647,10 +697,32 @@ test "namespace and name mapping stays aligned with qlog vantage points" {
     try testing.expectEqual(Namespace.quic, (Event{ .packet_lost = .{ .packet_type = .one_rtt } }).namespace());
     try testing.expectEqual(Namespace.quic, (Event{ .key_updated = .{ .key_type = .server_1rtt_secret, .key_phase = 1 } }).namespace());
     try testing.expectEqual(Namespace.quic, (Event{ .connection_migrated = .{ .new = .migration_complete } }).namespace());
+    try testing.expectEqual(Namespace.quic, (Event{ .stream_state_updated = .{ .stream_id = 0, .new = .open } }).namespace());
+    try testing.expectEqual(Namespace.quic, (Event{ .congestion_state_updated = .{ .old = .slow_start, .new = .recovery } }).namespace());
+    try testing.expectEqual(Namespace.tardigrade, (Event{ .persistent_congestion = .{} }).namespace());
     try testing.expectEqual(Namespace.tardigrade, (Event{ .stream_reset = .{ .kind = .reset_sent, .stream_id = 0 } }).namespace());
     try testing.expectEqual(Namespace.tardigrade, (Event{ .packets_lost = .{ .lost_count = 2, .bytes = 2400 } }).namespace());
     try testing.expectEqual(Namespace.tardigrade, (Event{ .packets_acked = .{ .packet_type = .one_rtt, .largest_acknowledged = 7, .acked_count = 1 } }).namespace());
     try testing.expectEqualStrings("packet_dropped", (Event{ .packet_dropped = .{ .trigger = .decryption_failure } }).name());
+}
+
+test "stream and congestion transitions serialize to qlog records" {
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .stream_state_updated = .{ .stream_id = 8, .old = .open, .new = .half_closed_remote } } },
+        "\"name\":\"quic:stream_state_updated\"",
+    );
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .stream_state_updated = .{ .stream_id = 8, .old = .open, .new = .half_closed_remote } } },
+        "\"stream_id\":8,\"old\":\"open\",\"new\":\"half_closed_remote\"",
+    );
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .congestion_state_updated = .{ .old = .slow_start, .new = .recovery } } },
+        "\"name\":\"quic:congestion_state_updated\"",
+    );
+    try expectJson(
+        .{ .time_us = 0, .event = .{ .persistent_congestion = .{} } },
+        "\"name\":\"tardigrade:quic_persistent_congestion\"",
+    );
 }
 
 test "packet_sent serializes to a quic JSON-SEQ line" {

@@ -1784,16 +1784,24 @@ pub const Connection = struct {
                     self.startClose(.{ .error_code = error_protocol_violation, .is_application = false, .local = true }, "stream before handshake", now_us);
                     return;
                 };
-                const known = self.known_streams.contains(sf.id);
+                const old = if (manager.get(sf.id)) |stream| stream.state() else null;
                 _ = manager.receiveStreamFrame(sf) catch |err| {
                     self.closeOnStreamError(err, now_us);
                     return;
                 };
-                if (!known) {
+                const new = if (manager.get(sf.id)) |stream| stream.state() else null;
+                if (!self.known_streams.contains(sf.id)) {
                     try self.known_streams.put(sf.id, {});
                     self.events.emit(.{ .stream_state_changed = .{ .id = sf.id, .new = .open } });
                     if (quic_stream.streamInitiator(sf.id) != roleInitiator(self.role)) {
                         try self.accept_queue.append(self.allocator, sf.id);
+                    }
+                }
+                if (new) |new_state| {
+                    if (old) |old_state| {
+                        if (new_state != old_state) self.events.emit(.{ .stream_state_changed = .{ .id = sf.id, .old = old_state, .new = new_state } });
+                    } else if (new_state != .open) {
+                        self.events.emit(.{ .stream_state_changed = .{ .id = sf.id, .old = .open, .new = new_state } });
                     }
                 }
                 if (level == .zero_rtt) {
@@ -1805,6 +1813,7 @@ pub const Connection = struct {
             },
             .reset_stream => |rs| {
                 var manager = self.streamManager() orelse return;
+                const old = if (manager.get(rs.id)) |stream| stream.state() else null;
                 manager.receiveResetStream(rs) catch |err| {
                     self.closeOnStreamError(err, now_us);
                     return;
@@ -1814,6 +1823,15 @@ pub const Connection = struct {
                     try self.known_streams.put(rs.id, {});
                     if (quic_stream.streamInitiator(rs.id) != roleInitiator(self.role)) {
                         try self.accept_queue.append(self.allocator, rs.id);
+                    }
+                }
+                if (manager.get(rs.id)) |stream| {
+                    const new = stream.state();
+                    if (old) |old_state| {
+                        if (new != old_state) self.events.emit(.{ .stream_state_changed = .{ .id = rs.id, .old = old_state, .new = new } });
+                    } else {
+                        self.events.emit(.{ .stream_state_changed = .{ .id = rs.id, .new = .open } });
+                        if (new != .open) self.events.emit(.{ .stream_state_changed = .{ .id = rs.id, .old = .open, .new = new } });
                     }
                 }
             },
@@ -1969,12 +1987,6 @@ pub const Connection = struct {
     }
 
     fn processAck(self: *Connection, space: PacketNumberSpace, ack: frame.Ack, now_us: u64) void {
-        const space_idx = spaceIndex(space);
-        if (ack.largest_acknowledged >= self.next_pn[space_idx]) {
-            self.startClose(.{ .error_code = error_protocol_violation, .is_application = false, .local = true }, "ACK for unsent packet", now_us);
-            return;
-        }
-
         const exponent: u6 = if (self.adapter.peerTransportParameters()) |peer|
             @intCast(@min(peer.ack_delay_exponent, 20))
         else
@@ -2019,7 +2031,9 @@ pub const Connection = struct {
                 } else {
                     acked_packet_type = record.packet_type;
                 }
+                const before_congestion = self.congestionState();
                 self.recovery.congestion.onPacketAcked(acked.packet);
+                self.emitCongestionStateChange(before_congestion);
                 if (record.packet_number == ack.largest_acknowledged) {
                     if (acked.rtt_sample_us) |sample| self.recovery.rtt.update(sample, ack_delay_us);
                 }
@@ -2098,6 +2112,7 @@ pub const Connection = struct {
         const loss = self.recovery.detectLost(space, now_us);
         if (loss.packet_threshold_losses + loss.time_threshold_losses == 0) return;
         self.emitCongestionStateChange(before_congestion);
+        if (loss.persistent_congestion) self.events.emit(.persistent_congestion);
         // #256-B evidence is fed per record inside `requeueUntrackedRecords`,
         // where the path and size each lost packet actually went out on are
         // still known. Deriving it from `loss` instead would collapse losses
@@ -2131,8 +2146,7 @@ pub const Connection = struct {
 
     fn congestionState(self: *const Connection) CongestionState {
         const cc = self.recovery.congestion;
-        if (cc.congestion_window <= cc.minWindow()) return .persistent_congestion;
-        if (cc.congestion_window == cc.ssthresh and cc.ssthresh < std.math.maxInt(usize)) return .recovery;
+        if (cc.recovery_start_time_us != null) return .recovery;
         if (cc.congestion_window < cc.ssthresh) return .slow_start;
         return .congestion_avoidance;
     }
@@ -2141,7 +2155,6 @@ pub const Connection = struct {
         const new = self.congestionState();
         if (new == old) return;
         self.events.emit(.{ .congestion_state_changed = .{ .old = old, .new = new } });
-        if (new == .persistent_congestion) self.events.emit(.persistent_congestion);
     }
 
     fn setLocalConnectionFlowBlocked(self: *Connection, blocked: bool) void {
@@ -2470,7 +2483,8 @@ pub const Connection = struct {
         self.peer_cid = self.retry_scid.?;
         var retry_initial = self.adapter.installInitialSecrets(.client, self.peer_cid.slice()) catch return;
         retry_initial.deinit();
-        _ = self.recovery.onKeysDiscarded(.initial);
+        const removed = self.recovery.onKeysDiscarded(.initial);
+        if (removed > 0) self.emitRecoveryMetrics();
         var index: usize = 0;
         while (index < self.sent_records.items.len) {
             if (self.sent_records.items[index].space == .initial) {
@@ -3501,6 +3515,7 @@ pub const Connection = struct {
                 .ack_eliciting = true,
                 .in_flight = true,
             });
+            self.emitRecoveryMetrics();
             self.last_ack_eliciting_sent_us[space_idx] = now_us;
             publishSentRecord(self, &record);
         }
@@ -3588,6 +3603,7 @@ pub const Connection = struct {
         controller.onProbeSent(probe_size, pn);
         var record = SentRecord{
             .space = .application,
+            .packet_type = .one_rtt,
             .packet_number = pn,
             .ack_eliciting = true,
             .sent_path = self.paths.activePathRef(),
@@ -3613,6 +3629,7 @@ pub const Connection = struct {
         self.armIdle(now_us);
         self.events.emit(.{ .packet_sent = .{
             .space = .application,
+            .packet_type = .one_rtt,
             .packet_number = pn,
             .size = total,
             .ack_eliciting = true,
@@ -5837,9 +5854,30 @@ test "driver: a validated, successfully processed Retry still refreshes the idle
     try testing.expect(before != null);
     const later = pair.now_us + 5 * std.time.us_per_s;
 
+    var initial_buf: [max_datagram_size_ceiling]u8 = undefined;
+    _ = pair.client.pollTransmitOnPath(&initial_buf, pair.now_us) orelse return error.TestExpectedEqual;
+    try testing.expect(pair.client.recovery.tracker.bytes_in_flight > 0);
+
+    const Capture = struct {
+        saw_zero_bif: bool = false,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .recovery_metrics_updated => |metrics| {
+                    if (metrics.bytes_in_flight == 0) self.saw_zero_bif = true;
+                },
+                else => {},
+            }
+        }
+    };
+    var capture = Capture{};
+    pair.client.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+
     try pair.client.ingestOnPath(&retry, TestPair.client_path, TestPair.test_challenge_entropy, later);
 
     try testing.expect(pair.client.got_retry);
+    try testing.expect(capture.saw_zero_bif);
     try testing.expect(pair.client.idle_deadline_us.? > before.?);
     // The client handshake anti-deadlock PTO (`nextTimeoutUs`/`onTimeout`)
     // bases its deadline on `last_activity_us` whenever nothing is in
@@ -6169,6 +6207,75 @@ test "driver: close retransmission does not duplicate semantic close event" {
     pair.client.close_needs_send = true;
     _ = pair.client.pollTransmitOnPath(&out, pair.now_us + 1_000) orelse return error.TestExpectedEqual;
     try testing.expectEqual(@as(usize, 1), capture.close_sent_events);
+}
+
+test "driver: received stream frames emit actual lifecycle transitions" {
+    const Capture = struct {
+        events: [4]Event = undefined,
+        count: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .stream_state_changed => {
+                    self.events[self.count] = event;
+                    self.count += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+    const id = try quic_stream.makeStreamId(.client, .bidi, 0);
+
+    try pair.server.applyFrame(.application, .{ .stream = .{ .id = id, .offset = 0, .data = "", .fin = true } }, TestPair.server_path, 0, pair.now_us);
+
+    try testing.expectEqual(@as(usize, 2), capture.count);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .new = .open } }, capture.events[0]);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .old = .open, .new = .half_closed_remote } }, capture.events[1]);
+}
+
+test "driver: received reset that creates a stream emits lifecycle transition" {
+    const Capture = struct {
+        stream_events: [4]Event = undefined,
+        stream_count: usize = 0,
+        reset_count: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .stream_state_changed => {
+                    self.stream_events[self.stream_count] = event;
+                    self.stream_count += 1;
+                },
+                .stream_reset => self.reset_count += 1,
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+    const id = try quic_stream.makeStreamId(.client, .bidi, 0);
+
+    try pair.server.applyFrame(.application, .{ .reset_stream = .{ .id = id, .app_error_code = 77, .final_size = 0 } }, TestPair.server_path, 0, pair.now_us);
+
+    try testing.expectEqual(@as(usize, 1), capture.reset_count);
+    try testing.expectEqual(@as(usize, 2), capture.stream_count);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .new = .open } }, capture.stream_events[0]);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .old = .open, .new = .reset_received } }, capture.stream_events[1]);
 }
 
 test "driver: terminal reset forgets local stream flow blocked state without unblocked event" {
@@ -9978,12 +10085,29 @@ test "driver: candidate-path validation traffic waits for congestion window" {
     try testing.expectEqual(in_flight_before, congestion.bytes_in_flight);
 
     // Once there is window for the padded probe it transmits and is charged.
+    const Capture = struct {
+        saw_candidate_bif: bool = false,
+        baseline: u64 = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .recovery_metrics_updated => |metrics| {
+                    if (metrics.bytes_in_flight > self.baseline) self.saw_candidate_bif = true;
+                },
+                else => {},
+            }
+        }
+    };
+    var capture = Capture{ .baseline = @intCast(in_flight_before) };
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
     congestion.congestion_window = congestion.bytes_in_flight + 4 * min_initial_datagram;
     const window = congestion.congestion_window;
     const probe = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
     try testing.expect(probe.path.eql(rebind_candidate));
     try testing.expect(congestion.bytes_in_flight > in_flight_before);
     try testing.expect(congestion.bytes_in_flight <= window);
+    try testing.expect(capture.saw_candidate_bif);
 }
 
 test "driver: a saturated recovery tracker backpressures instead of sending untracked" {

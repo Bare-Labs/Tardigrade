@@ -204,6 +204,7 @@ const ConnEntry = struct {
         runtime: *Runtime,
         connection_handle: u64,
         qlog_sink: quic.qlog.Sink = .{},
+        close_logged: bool = false,
     };
 
     const H3Observer = struct {
@@ -1419,6 +1420,13 @@ pub const Runtime = struct {
         const self = observer.runtime;
         if (observer.qlog_sink.isEnabled()) {
             if (quicEventToQlog(event)) |qlog_event| {
+                switch (qlog_event) {
+                    .connection_closed => {
+                        if (observer.close_logged) return;
+                        observer.close_logged = true;
+                    },
+                    else => {},
+                }
                 observer.qlog_sink.log(nowUs(), qlog_event);
             }
         }
@@ -1578,8 +1586,18 @@ pub const Runtime = struct {
                 .nat_rebinding => .probing_successful,
                 .migration => .migration_complete,
             } } },
-            .path_migration_blocked => null,
-            .stream_state_changed, .congestion_state_changed, .persistent_congestion, .keys_discarded, .zero_rtt_packet, .early_data_decision => null,
+            .stream_state_changed => |stream| .{ .stream_state_updated = .{
+                .stream_id = stream.id,
+                .old = if (stream.old) |old| streamStateToQlog(old) else null,
+                .new = streamStateToQlog(stream.new),
+            } },
+            .congestion_state_changed => |congestion| .{ .congestion_state_updated = .{
+                .old = congestionStateToQlog(congestion.old),
+                .new = congestionStateToQlog(congestion.new),
+            } },
+            .persistent_congestion => .{ .persistent_congestion = .{} },
+            .path_migration_blocked, .pmtu_updated => null,
+            .keys_discarded, .zero_rtt_packet, .early_data_decision => null,
         };
     }
 
@@ -1587,6 +1605,26 @@ pub const Runtime = struct {
         return switch (state) {
             .blocked => .blocked,
             .unblocked => .unblocked,
+        };
+    }
+
+    fn streamStateToQlog(state: quic.stream.StreamState) quic.qlog.StreamState {
+        return switch (state) {
+            .open => .open,
+            .half_closed_local => .half_closed_local,
+            .half_closed_remote => .half_closed_remote,
+            .closed => .closed,
+            .reset_received => .reset_received,
+            .reset_sent => .reset_sent,
+        };
+    }
+
+    fn congestionStateToQlog(state: quic.connection.CongestionState) quic.qlog.CongestionState {
+        return switch (state) {
+            .slow_start => .slow_start,
+            .congestion_avoidance => .congestion_avoidance,
+            .recovery => .recovery,
+            .persistent_congestion => .persistent_congestion,
         };
     }
 
@@ -2093,6 +2131,23 @@ const H3QlogRecorder = struct {
     }
 };
 
+const QuicQlogRecorder = struct {
+    records: std.ArrayList(quic.qlog.Record) = .empty,
+
+    fn deinit(self: *QuicQlogRecorder, allocator: std.mem.Allocator) void {
+        self.records.deinit(allocator);
+    }
+
+    fn sink(self: *QuicQlogRecorder) quic.qlog.Sink {
+        return .{ .context = self, .emit_fn = emit };
+    }
+
+    fn emit(ctx: ?*anyopaque, record: quic.qlog.Record) void {
+        const self: *QuicQlogRecorder = @ptrCast(@alignCast(ctx.?));
+        self.records.append(std.testing.allocator, record) catch unreachable;
+    }
+};
+
 test "http3 runtime: QUIC qlog adapter preserves normalized transport events" {
     try testing.expectEqual(
         quic.qlog.Event{ .packets_acked = .{ .packet_type = .one_rtt, .largest_acknowledged = 11, .acked_count = 4 } },
@@ -2123,6 +2178,15 @@ test "http3 runtime: QUIC qlog adapter preserves normalized transport events" {
         Runtime.quicEventToQlog(.{ .flow_control_blocked_received = .{ .scope = .stream, .stream_id = 12 } }).?,
     );
     try testing.expectEqual(
+        quic.qlog.Event{ .stream_state_updated = .{ .stream_id = 4, .old = .open, .new = .half_closed_remote } },
+        Runtime.quicEventToQlog(.{ .stream_state_changed = .{ .id = 4, .old = .open, .new = .half_closed_remote } }).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .congestion_state_updated = .{ .old = .slow_start, .new = .recovery } },
+        Runtime.quicEventToQlog(.{ .congestion_state_changed = .{ .old = .slow_start, .new = .recovery } }).?,
+    );
+    try testing.expectEqual(quic.qlog.Event{ .persistent_congestion = .{} }, Runtime.quicEventToQlog(.persistent_congestion).?);
+    try testing.expectEqual(
         quic.qlog.Event{ .connection_closed = .{ .trigger = .idle_timeout } },
         Runtime.quicEventToQlog(.idle_timeout).?,
     );
@@ -2131,6 +2195,24 @@ test "http3 runtime: QUIC qlog adapter preserves normalized transport events" {
         Runtime.quicEventToQlog(.{ .local_close_started = .{ .error_code = 42, .is_application = true } }).?,
     );
     try testing.expect(Runtime.quicEventToQlog(.{ .close_sent = .{ .error_code = 42, .is_application = true } }) == null);
+}
+
+test "http3 runtime: QUIC qlog observer logs only first semantic close" {
+    var runtime: Runtime = undefined;
+    var recorder = QuicQlogRecorder{};
+    defer recorder.deinit(testing.allocator);
+    var observer = ConnEntry.QuicObserver{
+        .runtime = &runtime,
+        .connection_handle = 1,
+        .qlog_sink = recorder.sink(),
+    };
+
+    Runtime.quicConnectionEvent(&observer, .{ .local_close_started = .{ .error_code = 42, .is_application = true } });
+    Runtime.quicConnectionEvent(&observer, .{ .close_received = .{ .error_code = 7, .is_application = false } });
+    Runtime.quicConnectionEvent(&observer, .idle_timeout);
+
+    try testing.expectEqual(@as(usize, 1), recorder.records.items.len);
+    try testing.expectEqual(quic.qlog.Event{ .connection_closed = .{ .trigger = .application, .close_error = .{ .application_unknown = 42 } } }, recorder.records.items[0].event);
 }
 
 test "http3 runtime: H3 qlog events route through connection-scoped observers" {
