@@ -71,6 +71,7 @@ fn logEvent(_: ?*anyopaque, event: connection.Event) void {
         .path_validation_failed => |p| std.fmt.bufPrint(&buf, "path validation failed change={s} remote_port={d}", .{ @tagName(p.change), p.path.remote.port }),
         .path_migration_blocked => |p| std.fmt.bufPrint(&buf, "path blocked change={s} reason={s} remote_port={d}", .{ @tagName(p.change), @tagName(p.reason), p.path.remote.port }),
         .path_promoted => |p| std.fmt.bufPrint(&buf, "path promoted change={s} remote_port={d}", .{ @tagName(p.change), p.path.remote.port }),
+        .pmtu_updated => |p| std.fmt.bufPrint(&buf, "pmtu {s} size={d} remote_port={d}", .{ @tagName(p.reason), p.size, p.path.remote.port }),
         .zero_rtt_packet => |z| std.fmt.bufPrint(&buf, "zero_rtt_packet outcome={s} size={d}", .{ @tagName(z.outcome), z.size }),
         .early_data_decision => |d| std.fmt.bufPrint(&buf, "early_data_decision {s}", .{@tagName(d)}),
     } catch return;
