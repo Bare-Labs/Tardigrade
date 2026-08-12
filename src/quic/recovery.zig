@@ -267,10 +267,11 @@ pub const LossResult = struct {
     /// The subset of `lost_bytes` belonging to DPLPMTUD probes, which
     /// RFC 9000 §14.4 excludes from the congestion reaction.
     probe_lost_bytes: usize = 0,
-    /// The largest ordinary (non-probe) lost packet's size and send time: the
-    /// inputs to the congestion event and to black-hole detection, both of
-    /// which must ignore probes.
-    largest_ordinary_lost_size: usize = 0,
+    /// Send time of the most recent ordinary (non-probe) lost packet: the
+    /// congestion event's timestamp, so a probe cannot start a recovery period
+    /// on its own. Deliberately *not* accompanied by an aggregate lost size —
+    /// DPLPMTUD evidence is per path, and a single number here would collapse
+    /// losses from several paths into one (#256-B review).
     largest_ordinary_lost_time_sent_us: ?u64 = null,
 };
 
@@ -369,7 +370,6 @@ pub const PacketTracker = struct {
             if (packet.in_flight) result.probe_lost_bytes += packet.size;
             return;
         }
-        result.largest_ordinary_lost_size = @max(result.largest_ordinary_lost_size, packet.size);
         if (result.largest_ordinary_lost_time_sent_us == null or
             packet.time_sent_us > result.largest_ordinary_lost_time_sent_us.?)
         {
@@ -1070,9 +1070,9 @@ test "recovery: a lost PMTU probe returns its bytes without a congestion event" 
     const loss = controller.detectLost(.application, 1_000);
     try testing.expectEqual(@as(usize, 1_624), loss.probe_lost_bytes);
     try testing.expect(loss.lost_bytes > loss.probe_lost_bytes);
-    // The ordinary packets lost alongside it still count, and only their size
-    // reaches black-hole detection.
-    try testing.expectEqual(@as(usize, 100), loss.largest_ordinary_lost_size);
+    // The ordinary loss supplies the congestion event's timestamp; the probe
+    // must not, or a probe could start a recovery period on its own.
+    try testing.expectEqual(@as(?u64, 2), loss.largest_ordinary_lost_time_sent_us);
     // The window was cut once, by the ordinary loss — never by the probe.
     try testing.expect(controller.congestion.congestion_window < window_before);
     try testing.expectEqual(controller.congestion.congestion_window, controller.congestion.ssthresh);
@@ -1106,7 +1106,6 @@ test "recovery: a probe lost on its own leaves the congestion window untouched" 
     const loss = controller.detectLost(.application, 100);
     try testing.expectEqual(@as(usize, 1_624), loss.lost_bytes);
     try testing.expectEqual(loss.lost_bytes, loss.probe_lost_bytes);
-    try testing.expectEqual(@as(usize, 0), loss.largest_ordinary_lost_size);
     try testing.expectEqual(@as(?u64, null), loss.largest_ordinary_lost_time_sent_us);
     try testing.expectEqual(window_before, controller.congestion.congestion_window);
     try testing.expectEqual(ssthresh_before, controller.congestion.ssthresh);

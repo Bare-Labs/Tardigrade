@@ -587,6 +587,21 @@ pub const PathManager = struct {
         return &self.paths[self.active].?.plpmtu;
     }
 
+    /// The DPLPMTUD state of a *specific* path, or null when that tuple is no
+    /// longer tracked. This is the accessor ACK/loss feedback must use, not
+    /// `activePlpmtu`: recovery deliberately keeps old-path packets in flight
+    /// across a migration (RFC 9000 §9.4, see
+    /// `recovery.resetForPathMigration`), so a delayed acknowledgement or a
+    /// loss can land well after a different path became active. Attributing
+    /// that outcome to whatever is active *now* would teach the new path a
+    /// size only the old one was ever shown to carry — exactly the inheritance
+    /// this per-path model exists to prevent. A null return means the slot was
+    /// recycled and the feedback has nowhere legitimate to go: drop it.
+    pub fn plpmtuFor(self: *PathManager, key: PathKey) ?*pmtu.Controller {
+        const index = self.find(key) orelse return null;
+        return &self.paths[index].?.plpmtu;
+    }
+
     /// Lift the active path's anti-amplification limit once its address is
     /// validated some other way (e.g. a non-Retry server's handshake
     /// completed). Prefer this over reaching into a connection-wide ledger.

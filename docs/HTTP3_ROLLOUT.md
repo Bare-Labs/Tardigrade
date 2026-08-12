@@ -81,6 +81,12 @@ carries 1200 bytes, since every Initial-bearing datagram was padded to it.
 - **The first probe reaches straight for the ceiling** (RFC 8899's optimistic
   search), so a path that really carries the configured maximum is discovered in
   one round trip. After that the search bisects, converging to within 16 bytes.
+- **A converged search is re-run every 10 minutes** if it stopped because larger
+  sizes failed (RFC 8899's `PMTU_RAISE_TIMER`). A path can *gain* MTU on the
+  same address tuple — a tunnel goes away, a route changes — and the previous
+  failure bound describes a path condition that no longer exists, so it is
+  discarded and the sizes it ruled out become reachable again. A search that
+  converged at the ceiling has nothing above it to find and does not re-run.
 - **A probe's loss is not a congestion signal** (RFC 9000 §14.4) — being too big
   is what a probe is for — but a probe is still congestion controlled and
   anti-amplification limited like any other datagram, with none of the RFC 9002
@@ -94,15 +100,20 @@ A path that used to carry the discovered size can stop carrying it — a tunnel
 appears, a route changes, an operator lowers an MTU. Tardigrade watches for two
 signatures and pulls the send size back to 1200 when either fires three times:
 
-- oversized datagrams being lost while smaller ones are still delivered;
+- datagrams **at or above the current send size** being lost while **smaller**
+  ones are still delivered. Both halves are measured against the size actually
+  in question, not against the 1200-byte floor: with a discovered size of 1452,
+  a delivered 1300-byte datagram *corroborates* the black hole rather than
+  disproving it, while a delivered 1452-byte datagram clears the evidence
+  outright. A loss below the current size is not evidence at all — falling back
+  would not have saved it.
 - consecutive PTO expirations with nothing acknowledged in between, which is
   what the same failure looks like when *every* datagram in flight is already
   oversized and there is no smaller delivery to compare against.
 
-A false positive costs throughput until the RFC 8899 raise timer (10 minutes)
-re-opens a search below the size that failed. Not falling back costs the
-connection: Tardigrade's own retransmissions would keep re-sending the same
-oversized datagram until the idle timeout.
+A false positive costs throughput until the raise timer re-tests. Not falling
+back costs the connection: Tardigrade's own retransmissions would keep
+re-sending the same oversized datagram until the idle timeout.
 
 Discovery is **per path, never inherited.** Migrating to a new path — or
 re-validating a tuple that has been away — restarts from 1200 rather than

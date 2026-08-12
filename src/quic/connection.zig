@@ -724,6 +724,15 @@ const SentRecord = struct {
     space: PacketNumberSpace,
     packet_number: u64,
     ack_eliciting: bool,
+    /// The path this packet actually went out on, and the size it went out at
+    /// (#256-B). DPLPMTUD feedback is a statement about *that* path, and a
+    /// migration does not retroactively move a packet: recovery keeps
+    /// old-path packets in flight across a promotion (RFC 9000 §9.4), so an
+    /// ACK or a loss can arrive long after a different path became active.
+    /// Every PMTU outcome is routed back through these two fields rather than
+    /// through whatever `activePath()` happens to be at the time.
+    sent_path: quic_path.PathKey,
+    sent_size: usize = 0,
     crypto: ?Range = null,
     stream_count: u8 = 0,
     streams: [4]StreamRange = undefined,
@@ -1153,12 +1162,31 @@ pub const Connection = struct {
     /// capacity and never appears here, while the peer's advertisement of the
     /// same parameter is *its* receive capacity and bounds everything we send.
     pub fn datagramLimits(self: *const Connection) quic_datagram.Limits {
+        return self.datagramLimitsFor(self.paths.activePath().plpmtu);
+    }
+
+    /// The same bounds resolved for a specific path's controller, so a report
+    /// about a path that is no longer active (a PMTU change on a path whose
+    /// delayed ACK just arrived) describes that path rather than this one.
+    fn datagramLimitsForPath(self: *const Connection, key: quic_path.PathKey) quic_datagram.Limits {
+        const active = self.paths.activePath();
+        const plpmtu = if (active.key.eql(key)) active.plpmtu else blk: {
+            for (self.paths.paths) |slot| {
+                const path = slot orelse continue;
+                if (path.key.eql(key)) break :blk path.plpmtu;
+            }
+            break :blk active.plpmtu;
+        };
+        return self.datagramLimitsFor(plpmtu);
+    }
+
+    fn datagramLimitsFor(self: *const Connection, plpmtu: quic_pmtu.Controller) quic_datagram.Limits {
         return .{
-            // What DPLPMTUD has actually shown *this* path carries (#256-B),
-            // starting at the RFC 9000 §14 floor. Note "this path": promoting
-            // a different one swaps in that path's controller, so a migration
-            // cannot inherit a size only the old path was shown to carry.
-            .current_path_max = self.paths.activePath().plpmtu.sendSize(),
+            // What DPLPMTUD has actually shown this path carries (#256-B),
+            // starting at the RFC 9000 §14 floor. The controller is per path,
+            // so promoting a different one swaps in that path's own state and
+            // a migration cannot inherit a size only the old path carried.
+            .current_path_max = plpmtu.sendSize(),
             // `max_send_udp_payload_size` is a ceiling, not a starting point:
             // it bounds what discovery may reach for rather than asserting a
             // size outright, so raising it can only ever permit a size that
@@ -1204,23 +1232,28 @@ pub const Connection = struct {
     /// §14.1). Confirmation is also what proves the base size works — every
     /// Initial-bearing datagram was padded to 1200 — which is the BASE-state
     /// check RFC 8899 would otherwise owe before any search may start.
-    fn syncPathPmtu(self: *Connection) void {
+    fn syncPathPmtu(self: *Connection, now_us: u64) void {
         // `probeCeiling()` already folds in both bounds a probe must respect:
         // this endpoint's send ceiling (the operator's configured maximum) and
         // the peer's advertised receive capacity.
         const ceiling = self.probeMaxDatagramSize();
         const controller = self.paths.activePlpmtu();
-        controller.configure(ceiling);
+        controller.configure(ceiling, now_us);
         if (self.handshake_confirmed and self.state_ == .established) {
-            controller.enable(ceiling);
+            controller.enable(ceiling, now_us);
         }
     }
 
     /// Feed one piece of black-hole evidence to the active path's controller
     /// and report the fallback if that tipped it. Both signals funnel through
     /// here so "the send size just dropped" is observed in exactly one place.
-    fn notePmtuBlackHoleEvidence(self: *Connection, kind: union(enum) { ordinary_loss: usize, stalled_pto }, now_us: u64) void {
-        const controller = self.paths.activePlpmtu();
+    fn notePmtuBlackHoleEvidence(
+        self: *Connection,
+        path: quic_path.PathKey,
+        kind: union(enum) { ordinary_loss: usize, stalled_pto },
+        now_us: u64,
+    ) void {
+        const controller = self.paths.plpmtuFor(path) orelse return;
         const before = controller.black_holes;
         switch (kind) {
             .ordinary_loss => |size| controller.onOrdinaryLoss(size, now_us),
@@ -1229,12 +1262,15 @@ pub const Connection = struct {
         if (controller.black_holes == before) return;
         self.metrics.pmtu_black_holes += 1;
         // Recovery's NewReno windows are expressed in the sender's current
-        // datagram size (RFC 9002 §B.2), so a fallback has to reach it now
-        // rather than at the next poll.
-        self.recovery.congestion.setMaxDatagramSize(self.effectiveMaxDatagramSize());
+        // datagram size (RFC 9002 §B.2), so a fallback on the path we are
+        // actually sending on has to reach it now rather than at the next
+        // poll. A fallback on some other path changes nothing we emit today.
+        if (self.paths.activePath().key.eql(path)) {
+            self.recovery.congestion.setMaxDatagramSize(self.effectiveMaxDatagramSize());
+        }
         self.events.emit(.{ .pmtu_updated = .{
-            .path = self.paths.activePath().key,
-            .size = self.effectiveMaxDatagramSize(),
+            .path = path,
+            .size = self.datagramLimitsForPath(path).effective(),
             .reason = .black_hole,
         } });
     }
@@ -1856,6 +1892,21 @@ pub const Connection = struct {
             3;
         const ack_delay_us = ack.ackDelayUs(exponent);
         const space_idx = spaceIndex(space);
+        // RFC 9000 §13.1: an ACK covering a packet number this endpoint has
+        // never sent is a protocol violation. Reject it *before* it reaches
+        // `largest_peer_acked` — that value is the reference every subsequent
+        // packet number is encoded against, so accepting an attacker-chosen
+        // future number would keep encoding needlessly wide until `next_pn`
+        // caught up with it. `packetNumberReference` still refuses an unusable
+        // reference, but as a backstop rather than as the handling.
+        if (ack.largest_acknowledged >= self.next_pn[space_idx]) {
+            self.startClose(.{
+                .error_code = error_protocol_violation,
+                .is_application = false,
+                .local = true,
+            }, "ACK for unsent packet", now_us);
+            return;
+        }
         if (self.largest_peer_acked[space_idx] == null or ack.largest_acknowledged > self.largest_peer_acked[space_idx].?) {
             self.largest_peer_acked[space_idx] = ack.largest_acknowledged;
         }
@@ -1875,14 +1926,18 @@ pub const Connection = struct {
                     if (acked.rtt_sample_us) |sample| self.recovery.rtt.update(sample, ack_delay_us);
                 }
                 // Delivery of an ordinary datagram is DPLPMTUD's evidence that
-                // the path still carries the size it was sent at (#256-B).
-                // Probes are excluded: `onRecordAcked` resolves those against
-                // the outstanding probe instead.
+                // the path still carries the size it was sent at (#256-B) —
+                // evidence about `record.sent_path`, which after a migration
+                // is not necessarily the active one. Probes are excluded:
+                // `onRecordAcked` resolves those against the outstanding probe
+                // instead.
                 if (!acked.packet.pmtu_probe) {
-                    self.paths.activePlpmtu().onOrdinaryAck(acked.packet.size);
+                    if (self.paths.plpmtuFor(record.sent_path)) |controller| {
+                        controller.onOrdinaryAck(record.sent_size, now_us);
+                    }
                 }
             }
-            self.onRecordAcked(record);
+            self.onRecordAcked(record, now_us);
             // Delivery is confirmed: any reset token this record carried
             // has done its job (the registry keeps the durable copy for as
             // long as the CID stays active) and is now redundant. Wipe it
@@ -1900,16 +1955,17 @@ pub const Connection = struct {
         self.detectAndRequeueLost(space, now_us);
     }
 
-    fn onRecordAcked(self: *Connection, record: *const SentRecord) void {
+    fn onRecordAcked(self: *Connection, record: *const SentRecord, now_us: u64) void {
         if (record.carried_pmtu_probe != null) {
-            // The probed size traversed the path, so it becomes the path's
-            // send size. Matching on the packet number means a stale ACK for
-            // an earlier probe cannot promote a size the current search has
-            // already ruled out.
-            if (self.paths.activePlpmtu().onProbeAcked(record.packet_number)) {
+            // The probed size traversed the path the probe was sent on, so it
+            // becomes *that* path's send size. Matching on the packet number
+            // means a stale ACK for an earlier probe cannot promote a size the
+            // current search has already ruled out.
+            const controller = self.paths.plpmtuFor(record.sent_path) orelse return;
+            if (controller.onProbeAcked(record.packet_number, now_us)) {
                 self.events.emit(.{ .pmtu_updated = .{
-                    .path = self.paths.activePath().key,
-                    .size = self.effectiveMaxDatagramSize(),
+                    .path = record.sent_path,
+                    .size = self.datagramLimitsForPath(record.sent_path).effective(),
                     .reason = .raised,
                 } });
             }
@@ -1932,15 +1988,12 @@ pub const Connection = struct {
     fn detectAndRequeueLost(self: *Connection, space: PacketNumberSpace, now_us: u64) void {
         const loss = self.recovery.detectLost(space, now_us);
         if (loss.packet_threshold_losses + loss.time_threshold_losses == 0) return;
-        // #256-B: a lost *ordinary* datagram larger than the guaranteed floor
-        // is the one loss that a smaller send size could have prevented, so it
-        // is the only kind DPLPMTUD treats as evidence. Probe losses are
-        // excluded here and routed to the controller by `requeueUntrackedRecords`
-        // below — a probe is meant to be too big.
-        if (loss.largest_ordinary_lost_size > 0) {
-            self.notePmtuBlackHoleEvidence(.{ .ordinary_loss = loss.largest_ordinary_lost_size }, now_us);
-        }
-        const lost_count = self.requeueUntrackedRecords(space);
+        // #256-B evidence is fed per record inside `requeueUntrackedRecords`,
+        // where the path and size each lost packet actually went out on are
+        // still known. Deriving it from `loss` instead would collapse losses
+        // from several paths into one number and then attribute it to whichever
+        // path happens to be active.
+        const lost_count = self.requeueUntrackedRecords(space, now_us);
         if (lost_count > 0) {
             self.metrics.packets_lost += lost_count;
             self.events.emit(.{ .packets_lost = .{ .space = space, .bytes = loss.lost_bytes } });
@@ -1951,7 +2004,7 @@ pub const Connection = struct {
     /// holds. Shared by loss detection and by recovery-slot reclamation, which
     /// retires a tracked packet for exactly the same reason: its content must
     /// be resent, and its record must not outlive its tracker entry.
-    fn requeueUntrackedRecords(self: *Connection, space: PacketNumberSpace) u64 {
+    fn requeueUntrackedRecords(self: *Connection, space: PacketNumberSpace, now_us: u64) u64 {
         var index: usize = 0;
         var count: u64 = 0;
         while (index < self.sent_records.items.len) {
@@ -1963,13 +2016,24 @@ pub const Connection = struct {
             count += 1;
             if (record.carried_pmtu_probe != null) {
                 // Nothing to requeue: a probe carries no user data, and the
-                // search decides for itself whether to retry this size.
-                self.paths.activePlpmtu().onProbeLost(record.packet_number);
+                // search decides for itself whether to retry this size. The
+                // outcome belongs to the path the probe went out on.
+                if (self.paths.plpmtuFor(record.sent_path)) |controller| {
+                    controller.onProbeLost(record.packet_number, now_us);
+                }
                 wipeSentRecordToken(record);
                 _ = self.sent_records.swapRemove(index);
                 wipeSentRecordsSwapRemoveResidue(&self.sent_records);
                 continue;
             }
+            // #256-B: a lost ordinary datagram is evidence about the path it
+            // was sent on and the size it was sent at — the controller decides
+            // whether that size is large enough to mean anything.
+            self.notePmtuBlackHoleEvidence(
+                record.sent_path,
+                .{ .ordinary_loss = record.sent_size },
+                now_us,
+            );
             // Read the live element to requeue its content (a fresh copy of
             // any carried reset token lands in `pending_new_connection_ids`
             // via `requeueRecord`) before wiping this now-redundant copy and
@@ -2731,7 +2795,14 @@ pub const Connection = struct {
         // the application space counts, so one timer expiry that fires a PTO
         // in two spaces is still one piece of evidence; discovery only runs
         // after confirmation anyway, when the earlier spaces are gone.
-        if (space == .application) self.notePmtuBlackHoleEvidence(.stalled_pto, now_us);
+        //
+        // This one *is* an active-path statement, unlike the ACK/loss signals:
+        // it says what this endpoint is sending right now is not getting
+        // through, and what it is sending right now goes out on the active
+        // path at the active path's size.
+        if (space == .application) {
+            self.notePmtuBlackHoleEvidence(self.paths.activePath().key, .stalled_pto, now_us);
+        }
         // Requeue the oldest unacked retransmittable content of the space so
         // the probe carries data rather than a bare PING when possible.
         var oldest: ?usize = null;
@@ -2955,7 +3026,7 @@ pub const Connection = struct {
         // Refresh DPLPMTUD's bounds first: it is what `effectiveMaxDatagramSize`
         // reads for the current path size, so recovery below sees the same
         // value the builder is about to use.
-        self.syncPathPmtu();
+        self.syncPathPmtu(now_us);
         self.recovery.congestion.setMaxDatagramSize(self.effectiveMaxDatagramSize());
 
         if (self.state_ == .closing) {
@@ -3107,7 +3178,7 @@ pub const Connection = struct {
         var plain: [max_datagram_size_ceiling]u8 = undefined;
         const plain_budget = @min(plain.len, max_packet - pn_offset - pn_len - aead_tag_len);
         var plain_len: usize = 0;
-        var record = SentRecord{ .space = .application, .packet_number = pn, .ack_eliciting = false };
+        var record = SentRecord{ .space = .application, .packet_number = pn, .ack_eliciting = false, .sent_path = path };
 
         var i: usize = 0;
         while (i < self.pending_path_responses.items.len) {
@@ -3174,6 +3245,7 @@ pub const Connection = struct {
         self.next_pn[space_idx] = pn + 1;
 
         if (record.ack_eliciting) {
+            record.sent_size = total;
             // Slot preflighted at the top, before the PATH_RESPONSE was
             // dequeued or `needs_send` cleared.
             self.recovery.onPacketSentAssumeCapacity(.{
@@ -3272,6 +3344,8 @@ pub const Connection = struct {
             .space = .application,
             .packet_number = pn,
             .ack_eliciting = true,
+            .sent_path = active_key,
+            .sent_size = total,
             .carried_pmtu_probe = probe_size,
         };
         self.recovery.onPacketSentAssumeCapacity(.{
@@ -3419,6 +3493,9 @@ pub const Connection = struct {
             .space = space,
             .packet_number = pn,
             .ack_eliciting = false,
+            // Ordinary content always targets the active path; candidate-path
+            // content is built and recorded by `buildCandidatePacket`.
+            .sent_path = self.paths.activePath().key,
         };
         // `record` may pick up a dequeued NEW_CONNECTION_ID's reset token
         // below; `self.sent_records.append` (if reached) copies it into the
@@ -3573,6 +3650,7 @@ pub const Connection = struct {
         // exempt: the peer never acknowledges it, so tracking it would only
         // consume tracker slots.
         if (recordIsInFlight(record)) {
+            record.sent_size = total;
             // Every path that can reach here preflighted a tracker slot before
             // committing a frame — `can_track_ordinary` for ordinary content,
             // `can_track_recovery` for probes and mandatory padding — so this
@@ -6169,6 +6247,12 @@ test "#523: real TLS accept decision installs a usable QUIC 0-RTT read key end t
         const frame_len = try frame.encodeStream(4, 0, "real early data", true, &frame_buf);
         var wire: [256]u8 = undefined;
         const datagram = sealTestZeroRttPacket(suite, &TestPair.odcid, &TestPair.client_cid, real_secret, 0, frame_buf[0..frame_len], &wire);
+        // This packet is sealed outside the driver, so the client's own
+        // packet-number bookkeeping has to be told it went out. Without that,
+        // the server's ACK for it looks like an ACK for a packet the client
+        // never sent — a protocol violation (RFC 9000 §13.1) the client now
+        // rejects — and the handshake below would close instead of completing.
+        resumed.client.next_pn[Connection.spaceIndex(.application)] = 1;
         try resumed.server.ingestOnPath(datagram, TestPair.server_path, TestPair.test_challenge_entropy, resumed.now_us);
 
         try testing.expect(resumed.server.streamTransportEarly(4));
@@ -7849,8 +7933,8 @@ test "wipeSentRecordsSwapRemoveResidue zeroes the vacated slot regardless of its
     var records: std.ArrayList(SentRecord) = .empty;
     defer records.deinit(testing.allocator);
     try records.ensureTotalCapacityPrecise(testing.allocator, 4);
-    records.appendAssumeCapacity(.{ .space = .application, .packet_number = 1, .ack_eliciting = false });
-    records.appendAssumeCapacity(.{ .space = .application, .packet_number = 2, .ack_eliciting = false });
+    records.appendAssumeCapacity(.{ .space = .application, .packet_number = 1, .ack_eliciting = false, .sent_path = TestPair.client_path });
+    records.appendAssumeCapacity(.{ .space = .application, .packet_number = 2, .ack_eliciting = false, .sent_path = TestPair.client_path });
 
     _ = records.swapRemove(0);
     // Simulate whatever a safety-checked build's poison-fill (or a
@@ -7916,6 +8000,7 @@ test "connection: fixed sent-record and pending-CID capacities are preallocated"
             .space = .application,
             .packet_number = i,
             .ack_eliciting = false,
+            .sent_path = pair.server.paths.activePath().key,
         });
     }
     try testing.expectEqual(sent_records_backing, pair.server.sent_records.items.ptr);
@@ -8541,7 +8626,7 @@ test "driver: a probe is its own datagram, exactly the size it validates" {
     // datagram is the probe rather than whatever the handshake left queued.
     const probes_before = pair.server.metrics.pmtu_probes_sent;
     pair.server.paths.activePlpmtu().reset();
-    pair.server.syncPathPmtu();
+    pair.server.syncPathPmtu(pair.now_us);
     const expected = pair.server.probeMaxDatagramSize();
 
     var out: [max_datagram_size_ceiling]u8 = undefined;
@@ -8663,7 +8748,7 @@ test "driver: a probe waits for congestion window rather than taking an exemptio
     // probes to be congestion controlled).
     const probes_before = pair.server.metrics.pmtu_probes_sent;
     pair.server.paths.activePlpmtu().reset();
-    pair.server.syncPathPmtu();
+    pair.server.syncPathPmtu(pair.now_us);
     congestion.congestion_window = congestion.bytes_in_flight + base_datagram_size;
     while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |t| {
         try testing.expect(t.bytes.len <= base_datagram_size);
@@ -8717,24 +8802,211 @@ test "driver: a migrated path revalidates its own MTU instead of inheriting one"
     );
 }
 
+test "driver: an ACK for a packet that was never sent is a protocol violation" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const space_idx = Connection.spaceIndex(.application);
+    const sent_reference = pair.server.largest_peer_acked[space_idx];
+    const unsent = pair.server.next_pn[space_idx] + 5;
+
+    var ranges = recovery.AckRangeSet{};
+    try ranges.insert(unsent);
+    pair.server.processAck(.application, .{
+        .ranges = ranges,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = unsent,
+    }, pair.now_us);
+
+    // RFC 9000 §13.1. Detecting the violation exactly beats absorbing it: this
+    // must not merely avoid the `packetNumberLength` assertion.
+    try testing.expectEqual(State.closing, pair.server.state());
+    try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
+    try testing.expect(pair.server.close_info.?.local);
+    // The attacker-chosen number never reached the encoding reference, which
+    // would otherwise keep every subsequent packet number needlessly wide
+    // until `next_pn` caught up with it.
+    try testing.expectEqual(sent_reference, pair.server.largest_peer_acked[space_idx]);
+    if (pair.server.largest_peer_acked[space_idx]) |acked| {
+        try testing.expect(acked < pair.server.next_pn[space_idx]);
+    }
+}
+
+test "driver: an ACK for an unsent packet in a space that has sent nothing also closes" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+
+    // Nothing has been sent in the handshake space yet, so *any* ACK for it
+    // acknowledges something that does not exist.
+    try testing.expectEqual(@as(u64, 0), pair.server.next_pn[Connection.spaceIndex(.handshake)]);
+    var ranges = recovery.AckRangeSet{};
+    try ranges.insert(0);
+    pair.server.processAck(.handshake, .{
+        .ranges = ranges,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = 0,
+    }, pair.now_us);
+
+    try testing.expectEqual(State.closing, pair.server.state());
+    try testing.expectEqual(error_protocol_violation, pair.server.close_info.?.error_code);
+}
+
+test "driver: PMTU loss feedback after promotion lands on the path that sent it" {
+    const allocator = testing.allocator;
+    var pair = try MigrationPair.init(allocator, .full);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    // The handshake path discovered a size above the floor.
+    const old_key = pair.server.activePathKey();
+    const discovered = pair.server.effectiveMaxDatagramSize();
+    try testing.expect(discovered > base_datagram_size);
+
+    // Migrate. Recovery deliberately keeps old-path packets in flight across
+    // this (RFC 9000 §9.4), which is exactly why their eventual ACK or loss
+    // can arrive once a different path is active.
+    var buf: [2048]u8 = undefined;
+    const datagram = try clientDatagram(pair, &buf);
+    try pair.server.ingestOnPath(datagram, rebind_candidate, TestPair.test_challenge_entropy, pair.now_us);
+    var challenge_out: [2048]u8 = undefined;
+    const challenge = pair.server.pollTransmitOnPath(&challenge_out, pair.now_us) orelse return error.TestExpectedEqual;
+    var challenge_bytes: [2048]u8 = undefined;
+    @memcpy(challenge_bytes[0..challenge.bytes.len], challenge.bytes);
+    try pair.client.ingestOnPath(challenge_bytes[0..challenge.bytes.len], TestPair.client_path, TestPair.test_challenge_entropy, pair.now_us);
+    var response_out: [2048]u8 = undefined;
+    const response = pair.client.pollTransmitOnPath(&response_out, pair.now_us) orelse return error.TestExpectedEqual;
+    var response_bytes: [2048]u8 = undefined;
+    @memcpy(response_bytes[0..response.bytes.len], response.bytes);
+    try pair.server.ingestOnPath(response_bytes[0..response.bytes.len], rebind_candidate, TestPair.test_challenge_entropy, pair.now_us);
+    try testing.expect(pair.server.activePathKey().eql(rebind_candidate));
+    try testing.expect(!old_key.eql(rebind_candidate));
+
+    // The new path starts clean.
+    try testing.expectEqual(base_datagram_size, pair.server.effectiveMaxDatagramSize());
+    try testing.expectEqual(@as(u8, 0), pair.server.paths.plpmtuFor(rebind_candidate).?.oversized_losses);
+
+    // An old-path packet, sent at the old path's larger size, is now declared
+    // lost. `requeueUntrackedRecords` owns the attribution.
+    try ensureSentRecordCapacity(pair.server, pair.server.sent_records.items.len + 1);
+    pair.server.sent_records.addOneAssumeCapacity().* = .{
+        .space = .application,
+        .packet_number = 9_999,
+        .ack_eliciting = true,
+        .sent_path = old_key,
+        .sent_size = discovered,
+    };
+    _ = pair.server.requeueUntrackedRecords(.application, pair.now_us);
+
+    // It counted against the path that actually sent it ...
+    try testing.expectEqual(@as(u8, 1), pair.server.paths.plpmtuFor(old_key).?.oversized_losses);
+    // ... and left the new path's controller alone. Attributing it here would
+    // accumulate black-hole evidence against a size the new path has never
+    // even sent, and three of those would drag it to the floor for nothing.
+    const fresh = pair.server.paths.plpmtuFor(rebind_candidate).?;
+    try testing.expectEqual(@as(u8, 0), fresh.oversized_losses);
+    try testing.expectEqual(@as(u32, 0), fresh.black_holes);
+    try testing.expectEqual(base_datagram_size, fresh.sendSize());
+    try testing.expectEqual(@as(u64, 0), pair.server.metrics.pmtu_black_holes);
+}
+
+test "driver: a probe outcome after promotion resolves the probe's own path" {
+    const allocator = testing.allocator;
+    var pair = try MigrationPair.init(allocator, .full);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const old_key = pair.server.activePathKey();
+    // An outstanding probe on the handshake path.
+    const old_controller = pair.server.paths.plpmtuFor(old_key).?;
+    old_controller.reset();
+    old_controller.enable(max_datagram_size_ceiling, pair.now_us);
+    const probe_size = old_controller.nextProbeSize().?;
+    old_controller.onProbeSent(probe_size, 4_242);
+
+    var buf: [2048]u8 = undefined;
+    const datagram = try clientDatagram(pair, &buf);
+    try pair.server.ingestOnPath(datagram, rebind_candidate, TestPair.test_challenge_entropy, pair.now_us);
+    var challenge_out: [2048]u8 = undefined;
+    const challenge = pair.server.pollTransmitOnPath(&challenge_out, pair.now_us) orelse return error.TestExpectedEqual;
+    var challenge_bytes: [2048]u8 = undefined;
+    @memcpy(challenge_bytes[0..challenge.bytes.len], challenge.bytes);
+    try pair.client.ingestOnPath(challenge_bytes[0..challenge.bytes.len], TestPair.client_path, TestPair.test_challenge_entropy, pair.now_us);
+    var response_out: [2048]u8 = undefined;
+    const response = pair.client.pollTransmitOnPath(&response_out, pair.now_us) orelse return error.TestExpectedEqual;
+    var response_bytes: [2048]u8 = undefined;
+    @memcpy(response_bytes[0..response.bytes.len], response.bytes);
+    try pair.server.ingestOnPath(response_bytes[0..response.bytes.len], rebind_candidate, TestPair.test_challenge_entropy, pair.now_us);
+    try testing.expect(pair.server.activePathKey().eql(rebind_candidate));
+
+    // The probe's ACK arrives after a different path became active. It must
+    // raise the old path's size, not the new path's.
+    pair.server.onRecordAcked(&.{
+        .space = .application,
+        .packet_number = 4_242,
+        .ack_eliciting = true,
+        .sent_path = old_key,
+        .sent_size = probe_size,
+        .carried_pmtu_probe = probe_size,
+    }, pair.now_us);
+
+    try testing.expectEqual(probe_size, pair.server.paths.plpmtuFor(old_key).?.sendSize());
+    try testing.expectEqual(base_datagram_size, pair.server.paths.plpmtuFor(rebind_candidate).?.sendSize());
+    // The size on the wire follows the path we are actually sending on.
+    try testing.expectEqual(base_datagram_size, pair.server.effectiveMaxDatagramSize());
+}
+
+test "driver: PMTU feedback for a recycled path slot is dropped" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    // A tuple this connection has never tracked has no controller to teach.
+    const stranger = quic_path.PathKey{
+        .local = TestPair.server_path.local,
+        .remote = quic_udp.Address.ip4(.{ 198, 51, 100, 7 }, 4433),
+    };
+    try testing.expectEqual(@as(?*quic_pmtu.Controller, null), pair.server.paths.plpmtuFor(stranger));
+
+    try ensureSentRecordCapacity(pair.server, pair.server.sent_records.items.len + 1);
+    pair.server.sent_records.addOneAssumeCapacity().* = .{
+        .space = .application,
+        .packet_number = 8_888,
+        .ack_eliciting = true,
+        .sent_path = stranger,
+        .sent_size = max_datagram_size_ceiling,
+    };
+    // Dropping the feedback is the point: applying it to some other path would
+    // be worse than losing it.
+    _ = pair.server.requeueUntrackedRecords(.application, pair.now_us);
+    try testing.expectEqual(@as(u64, 0), pair.server.metrics.pmtu_black_holes);
+    try testing.expectEqual(@as(u8, 0), pair.server.paths.activePlpmtu().oversized_losses);
+}
+
 test "driver: a padded non-ack-eliciting packet counts as in flight" {
     // RFC 9002 §2 — the predicate the send path keys recovery accounting off.
     try testing.expect(recordIsInFlight(.{
         .space = .initial,
         .packet_number = 0,
         .ack_eliciting = false,
+        .sent_path = TestPair.client_path,
         .carried_padding = true,
     }));
     try testing.expect(recordIsInFlight(.{
         .space = .application,
         .packet_number = 0,
         .ack_eliciting = true,
+        .sent_path = TestPair.client_path,
     }));
     // A genuine pure ACK stays exempt.
     try testing.expect(!recordIsInFlight(.{
         .space = .application,
         .packet_number = 0,
         .ack_eliciting = false,
+        .sent_path = TestPair.client_path,
     }));
 }
 
@@ -8993,6 +9265,7 @@ fn fillOrdinaryTrackerWithRecords(conn: *Connection) !usize {
             .space = .initial,
             .packet_number = pn,
             .ack_eliciting = false,
+            .sent_path = conn.paths.activePath().key,
         };
     }
     return added;
