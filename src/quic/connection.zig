@@ -132,6 +132,7 @@ pub const IngestError = error{OutOfMemory};
 
 pub const FlowControlScope = enum { connection, stream };
 pub const FlowControlState = enum { blocked, unblocked };
+pub const CongestionState = enum { slow_start, congestion_avoidance, recovery, persistent_congestion };
 
 pub const Event = union(enum) {
     state: State,
@@ -144,6 +145,9 @@ pub const Event = union(enum) {
     pto_fired: struct { space: PacketNumberSpace, count: u32 },
     packets_acked: struct { space: PacketNumberSpace, packet_type: ?packet.PacketKind, largest_acknowledged: u64, acked_count: u64 },
     packets_lost: struct { space: PacketNumberSpace, packet_type: ?packet.PacketKind, lost_count: u64, bytes: usize },
+    stream_state_changed: struct { id: StreamId, old: ?quic_stream.StreamState = null, new: quic_stream.StreamState },
+    congestion_state_changed: struct { old: CongestionState, new: CongestionState },
+    persistent_congestion,
     recovery_metrics_updated: struct {
         latest_rtt_us: ?u64 = null,
         smoothed_rtt_us: ?u64 = null,
@@ -165,6 +169,7 @@ pub const Event = union(enum) {
         scope: FlowControlScope,
         stream_id: ?StreamId = null,
     },
+    local_close_started: struct { error_code: u64, is_application: bool },
     close_sent: struct { error_code: u64, is_application: bool },
     close_received: struct { error_code: u64, is_application: bool },
     idle_timeout,
@@ -1006,6 +1011,7 @@ pub const Connection = struct {
     close_deadline_us: ?u64 = null,
     close_resend_allowed_at_us: u64 = 0,
     close_needs_send: bool = false,
+    close_sent_emitted: bool = false,
     /// Terminal handshake failure (kept for the embedder's diagnostics).
     handshake_error: ?tls_handshake.HandshakeError = null,
 
@@ -1785,6 +1791,7 @@ pub const Connection = struct {
                 };
                 if (!known) {
                     try self.known_streams.put(sf.id, {});
+                    self.events.emit(.{ .stream_state_changed = .{ .id = sf.id, .new = .open } });
                     if (quic_stream.streamInitiator(sf.id) != roleInitiator(self.role)) {
                         try self.accept_queue.append(self.allocator, sf.id);
                     }
@@ -1820,6 +1827,7 @@ pub const Connection = struct {
                 // RFC 9000 §3.5: a STOP_SENDING peer expects RESET_STREAM.
                 if (manager.sendResetStream(ss.id, ss.app_error_code)) |reset| {
                     try self.pending_resets.append(self.allocator, reset);
+                    self.forgetLocalStreamFlowBlocked(ss.id);
                     self.events.emit(.{ .stream_reset = .{ .id = ss.id, .error_code = ss.app_error_code, .local = true } });
                     if (self.send_queues.get(ss.id)) |queue| queue.reset_sent = true;
                 } else |_| {}
@@ -2086,8 +2094,10 @@ pub const Connection = struct {
 
     /// Detect newly lost packets in `space` and requeue their content.
     fn detectAndRequeueLost(self: *Connection, space: PacketNumberSpace, now_us: u64) void {
+        const before_congestion = self.congestionState();
         const loss = self.recovery.detectLost(space, now_us);
         if (loss.packet_threshold_losses + loss.time_threshold_losses == 0) return;
+        self.emitCongestionStateChange(before_congestion);
         // #256-B evidence is fed per record inside `requeueUntrackedRecords`,
         // where the path and size each lost packet actually went out on are
         // still known. Deriving it from `loss` instead would collapse losses
@@ -2119,6 +2129,21 @@ pub const Connection = struct {
         } });
     }
 
+    fn congestionState(self: *const Connection) CongestionState {
+        const cc = self.recovery.congestion;
+        if (cc.congestion_window <= cc.minWindow()) return .persistent_congestion;
+        if (cc.congestion_window == cc.ssthresh and cc.ssthresh < std.math.maxInt(usize)) return .recovery;
+        if (cc.congestion_window < cc.ssthresh) return .slow_start;
+        return .congestion_avoidance;
+    }
+
+    fn emitCongestionStateChange(self: *Connection, old: CongestionState) void {
+        const new = self.congestionState();
+        if (new == old) return;
+        self.events.emit(.{ .congestion_state_changed = .{ .old = old, .new = new } });
+        if (new == .persistent_congestion) self.events.emit(.persistent_congestion);
+    }
+
     fn setLocalConnectionFlowBlocked(self: *Connection, blocked: bool) void {
         if (self.local_connection_flow_blocked == blocked) return;
         const old = self.local_connection_flow_blocked;
@@ -2146,6 +2171,17 @@ pub const Connection = struct {
             .old = if (was_blocked) .blocked else .unblocked,
             .new = if (blocked) .blocked else .unblocked,
         } });
+    }
+
+    fn forgetLocalStreamFlowBlocked(self: *Connection, id: StreamId) void {
+        _ = self.local_stream_flow_blocked.remove(id);
+    }
+
+    fn emitStreamStateIfChanged(self: *Connection, id: StreamId, old: quic_stream.StreamState) void {
+        var manager = self.streamManager() orelse return;
+        const stream = manager.get(id) orelse return;
+        const new = stream.state();
+        if (new != old) self.events.emit(.{ .stream_state_changed = .{ .id = id, .old = old, .new = new } });
     }
 
     fn emitPeerFlowBlocked(self: *Connection, scope: FlowControlScope, stream_id: ?StreamId) void {
@@ -2751,7 +2787,7 @@ pub const Connection = struct {
         if (!(self.adapter.hasProtectionKeys(level, .write) catch unreachable) and
             !(self.adapter.hasProtectionKeys(level, .read) catch unreachable)) return;
         self.adapter.discardSecrets(level);
-        _ = self.recovery.onKeysDiscarded(space);
+        const removed = self.recovery.onKeysDiscarded(space);
         const tx: ?*CryptoTx = switch (space) {
             .initial => &self.crypto_tx[0],
             .handshake => &self.crypto_tx[1],
@@ -2775,6 +2811,7 @@ pub const Connection = struct {
         self.last_ack_eliciting_sent_us[spaceIndex(space)] = null;
         self.probes_pending[spaceIndex(space)] = 0;
         self.events.emit(.{ .keys_discarded = space });
+        if (removed > 0) self.emitRecoveryMetrics();
     }
 
     /// TLS alert mapping (RFC 9001 §4.8). QUIC-only failures (not part of the
@@ -2808,7 +2845,7 @@ pub const Connection = struct {
         self.close_reason_len = @min(reason.len, self.close_reason.len);
         @memcpy(self.close_reason[0..self.close_reason_len], reason[0..self.close_reason_len]);
         self.setState(.closing);
-        self.events.emit(.{ .close_sent = .{ .error_code = info.error_code, .is_application = info.is_application } });
+        self.events.emit(.{ .local_close_started = .{ .error_code = info.error_code, .is_application = info.is_application } });
         self.close_needs_send = true;
         self.close_deadline_us = now_us + 3 * self.ptoDurationNow();
     }
@@ -3041,6 +3078,7 @@ pub const Connection = struct {
         var manager = self.streamManager() orelse return error.NotEstablished;
         const id = try manager.openLocal(typ);
         try self.known_streams.put(id, {});
+        self.events.emit(.{ .stream_state_changed = .{ .id = id, .new = .open } });
         return id;
     }
 
@@ -3071,7 +3109,9 @@ pub const Connection = struct {
 
     pub fn readStream(self: *Connection, id: StreamId, out: []u8) !quic_stream.ReadResult {
         var manager = self.streamManager() orelse return error.NotEstablished;
+        const old = if (manager.get(id)) |stream| stream.state() else return error.UnknownStream;
         const result = try manager.read(id, out);
+        self.emitStreamStateIfChanged(id, old);
         // Flow-control credit decided by the stream manager becomes MAX_DATA /
         // MAX_STREAM_DATA frames on the next transmit.
         if (result.credit.max_data != null) self.pending_max_data = result.credit.max_data;
@@ -3097,9 +3137,12 @@ pub const Connection = struct {
 
     pub fn resetStream(self: *Connection, id: StreamId, app_error_code: u64) !void {
         var manager = self.streamManager() orelse return error.NotEstablished;
+        const old = if (manager.get(id)) |stream| stream.state() else return error.UnknownStream;
         const reset = try manager.sendResetStream(id, app_error_code);
         try self.pending_resets.append(self.allocator, reset);
+        self.forgetLocalStreamFlowBlocked(id);
         self.events.emit(.{ .stream_reset = .{ .id = id, .error_code = app_error_code, .local = true } });
+        self.emitStreamStateIfChanged(id, old);
         if (self.send_queues.get(id)) |queue| {
             queue.reset_sent = true;
             queue.retransmit.items.clearRetainingCapacity();
@@ -3169,7 +3212,12 @@ pub const Connection = struct {
             self.peer_cid = config.CidValue.init(claimed.cid.slice()) catch self.peer_cid;
         }
         const outcome = self.paths.promoteValidated(candidate) orelse return;
-        if (outcome.reset_congestion) self.recovery.resetForPathMigration();
+        if (outcome.reset_congestion) {
+            const before_congestion = self.congestionState();
+            self.recovery.resetForPathMigration();
+            self.emitCongestionStateChange(before_congestion);
+            self.emitRecoveryMetrics();
+        }
         self.removeCandidateChallenge(candidate);
         self.events.emit(.{ .path_promoted = .{ .path = candidate, .change = outcome.change } });
     }
@@ -3864,6 +3912,7 @@ pub const Connection = struct {
                 .ack_eliciting = record.ack_eliciting,
                 .in_flight = true,
             });
+            self.emitRecoveryMetrics();
             if (record.ack_eliciting) self.last_ack_eliciting_sent_us[space_idx] = now_us;
             publishSentRecord(self, &record);
         }
@@ -4080,7 +4129,9 @@ pub const Connection = struct {
             if (conn_window > 0) self.setLocalConnectionFlowBlocked(false);
             if (stream_window > 0) self.setLocalStreamFlowBlocked(id, false);
             const fin_now = want_fin and n_bytes == unsent;
+            const old_state = s.state();
             const grant = manager.reserveSend(id, @intCast(n_bytes), fin_now) catch continue;
+            self.emitStreamStateIfChanged(id, old_state);
             const range = Range{ .start = grant.offset, .end = grant.offset + grant.len };
             const n = frame.encodeStream(id, range.start, queue.slice(range), grant.fin, plain[plain_len..budget]) catch continue;
             plain_len += n;
@@ -4179,8 +4230,9 @@ pub const Connection = struct {
 
         var plain: [512]u8 = undefined;
         const use_app_frame = info.is_application and level == .application;
+        const wire_error_code = if (use_app_frame or !info.is_application) info.error_code else error_internal;
         var plain_len = frame.encodeConnectionClose(.{
-            .error_code = if (use_app_frame or info.is_application == false) info.error_code else error_internal,
+            .error_code = wire_error_code,
             .reason = self.close_reason[0..self.close_reason_len],
             .is_application = use_app_frame,
         }, &plain) catch return null;
@@ -4219,6 +4271,10 @@ pub const Connection = struct {
         const active_key = self.paths.activePath().key;
         self.paths.recordSentOnPath(active_key, total);
         self.metrics.datagrams_sent += 1;
+        if (!self.close_sent_emitted) {
+            self.close_sent_emitted = true;
+            self.events.emit(.{ .close_sent = .{ .error_code = wire_error_code, .is_application = use_app_frame } });
+        }
         return .{ .bytes = out[0..total], .path = active_key };
     }
 };
@@ -6075,12 +6131,17 @@ test "driver: duplicate valid ACK clears PTO without emitting an ack summary" {
 
 test "driver: close retransmission does not duplicate semantic close event" {
     const Capture = struct {
+        close_started_events: usize = 0,
         close_sent_events: usize = 0,
         app_close: bool = false,
 
         fn onEvent(ctx: ?*anyopaque, event: Event) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             switch (event) {
+                .local_close_started => |close| {
+                    self.close_started_events += 1;
+                    self.app_close = close.is_application;
+                },
                 .close_sent => |close| {
                     self.close_sent_events += 1;
                     self.app_close = close.is_application;
@@ -6098,14 +6159,45 @@ test "driver: close retransmission does not duplicate semantic close event" {
     var capture = Capture{};
     pair.client.events = .{ .context = &capture, .emitFn = Capture.onEvent };
     pair.client.close(42, "app-close", pair.now_us);
-    try testing.expectEqual(@as(usize, 1), capture.close_sent_events);
+    try testing.expectEqual(@as(usize, 1), capture.close_started_events);
+    try testing.expectEqual(@as(usize, 0), capture.close_sent_events);
     try testing.expect(capture.app_close);
 
     var out: [2048]u8 = undefined;
     _ = pair.client.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+    try testing.expectEqual(@as(usize, 1), capture.close_sent_events);
     pair.client.close_needs_send = true;
     _ = pair.client.pollTransmitOnPath(&out, pair.now_us + 1_000) orelse return error.TestExpectedEqual;
     try testing.expectEqual(@as(usize, 1), capture.close_sent_events);
+}
+
+test "driver: terminal reset forgets local stream flow blocked state without unblocked event" {
+    const Capture = struct {
+        flow_events: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .flow_control_state_changed => self.flow_events += 1,
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id = try pair.server.openStream(.bidi);
+    try pair.server.local_stream_flow_blocked.put(id, {});
+    try pair.server.resetStream(id, 99);
+
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+    try pair.server.applyFrame(.application, .{ .max_stream_data = .{ .id = id, .limit = 1_000_000 } }, TestPair.server_path, 0, pair.now_us);
+    try testing.expectEqual(@as(usize, 0), capture.flow_events);
+    try testing.expect(!pair.server.local_stream_flow_blocked.contains(id));
 }
 
 test "driver: server retires its 0-RTT read secret once it authenticates a 1-RTT packet (RFC 9001 §4.9.3)" {

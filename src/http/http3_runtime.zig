@@ -1555,13 +1555,14 @@ pub const Runtime = struct {
                 },
                 .stream_id = blocked.stream_id,
             } },
-            .close_sent => |close| .{ .connection_closed = .{
+            .local_close_started => |close| .{ .connection_closed = .{
                 .trigger = if (close.is_application) .application else .@"error",
                 .close_error = if (close.is_application)
                     .{ .application_unknown = close.error_code }
                 else
                     .{ .connection_unknown = close.error_code },
             } },
+            .close_sent => null,
             .close_received => |close| .{ .connection_closed = .{
                 .trigger = if (close.is_application) .application else .@"error",
                 .close_error = if (close.is_application)
@@ -1578,7 +1579,7 @@ pub const Runtime = struct {
                 .migration => .migration_complete,
             } } },
             .path_migration_blocked => null,
-            .keys_discarded, .zero_rtt_packet, .early_data_decision => null,
+            .stream_state_changed, .congestion_state_changed, .persistent_congestion, .keys_discarded, .zero_rtt_packet, .early_data_decision => null,
         };
     }
 
@@ -2127,8 +2128,9 @@ test "http3 runtime: QUIC qlog adapter preserves normalized transport events" {
     );
     try testing.expectEqual(
         quic.qlog.Event{ .connection_closed = .{ .trigger = .application, .close_error = .{ .application_unknown = 42 } } },
-        Runtime.quicEventToQlog(.{ .close_sent = .{ .error_code = 42, .is_application = true } }).?,
+        Runtime.quicEventToQlog(.{ .local_close_started = .{ .error_code = 42, .is_application = true } }).?,
     );
+    try testing.expect(Runtime.quicEventToQlog(.{ .close_sent = .{ .error_code = 42, .is_application = true } }) == null);
 }
 
 test "http3 runtime: H3 qlog events route through connection-scoped observers" {

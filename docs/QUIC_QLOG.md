@@ -218,12 +218,15 @@ secrets are never logged** — for QUIC they are derivable from the client DCID
 on the wire, so logging them only widens the exposure without adding debugging
 value.
 
-Wiring point: `tls.transport.EventSink.emitSecret` is the shared TLS-engine
-choke point for QUIC and record-mode TLS traffic-secret events. When an enabled
-`tls.keylog.Context` with a 32-byte ClientHello random and injected `Sink` is
-installed, the keylog entry is emitted synchronously before the event sink later
-resets and wipes copied secret bytes. QUIC threads this context through
-`Connection.Options.tls_keylog_context`; the default context is disabled.
+Wiring points: `tls.transport.EventSink.emitSecret` emits handshake, early-data,
+and application generation-0 secrets from the shared TLS-engine event stream.
+Record-mode KeyUpdate generations are different: the next traffic secret is
+derived inside `record_epoch_bridge.Bridge.updateTrafficSecretWithKeylog()`, so
+that bridge synchronously emits the generation-N keylog entry before wiping its
+derivation scratch. Both paths require an enabled `tls.keylog.Context` with a
+32-byte ClientHello random and injected `Sink`; the default context is disabled.
+QUIC threads this context through `Connection.Options.tls_keylog_context`, while
+record-mode streams install it before handshake start with `setKeylogContext`.
 
 ### Sensitive / debug-only behaviour  ⚠️
 
