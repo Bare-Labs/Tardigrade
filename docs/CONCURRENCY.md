@@ -167,6 +167,7 @@ they need public control.
 | Max streams | `initial_max_streams_*` | 100 bidi, 16 uni | internal initially |
 | Retry policy | address validation / tokens | `off` | `TARDIGRADE_HTTP3_RETRY_POLICY=off\|address_validation`; `address_validation` sends stateless QUIC Retry before allocating connection state |
 | Migration policy | `disable_active_migration` | NAT rebinding only | `TARDIGRADE_HTTP3_CONNECTION_MIGRATION=false` permits same-IP NAT rebinding but not active migration; `true` enables full migration |
+| UDP socket buffers | `SO_RCVBUF` / `SO_SNDBUF` | kernel default | `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES` / `..._SEND_BUFFER_BYTES`; advisory, read back with `getsockopt` and published on the runtime snapshot |
 | qlog / keylog | debug artifact emission | off | local-debug toggle |
 | QPACK | SETTINGS | static-only, zero dynamic capacity | internal until dynamic QPACK lands |
 

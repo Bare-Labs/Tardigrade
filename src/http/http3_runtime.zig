@@ -101,6 +101,13 @@ pub const Config = struct {
     /// than a second knob that can drift from it; the transport lowers it
     /// further whenever the peer advertises less receive capacity.
     max_datagram_size: usize = quic.datagram.max_size,
+    /// Optional `SO_RCVBUF`/`SO_SNDBUF` targets for the listener socket
+    /// (#256-D). Advisory in both directions: a kernel that refuses or trims
+    /// a request still gets a working listener, and the default (`null`,
+    /// leave the kernel's own sizing alone) is the right answer unless
+    /// measurements say otherwise. What the kernel actually granted is read
+    /// back and published on `Snapshot.udp_buffers`.
+    udp_buffer_tuning: quic.udp.BufferTuning = .{},
     request_handler: ?RequestHandler = null,
     request_handler_ctx: ?*anyopaque = null,
     early_data_compat_metrics_ctx: ?*anyopaque = null,
@@ -179,6 +186,11 @@ pub const Snapshot = struct {
     h3_goaway_sent: usize = 0,
     h3_drain_request_rejections: usize = 0,
     active_cid_routes: usize = 0,
+    /// What the kernel actually granted for this listener's socket buffers
+    /// (#256-D) — read back at bind time, never the requested value. Fixed
+    /// for the life of the socket, so unlike every counter above it is
+    /// written once at init.
+    udp_buffers: quic.udp.EffectiveBufferTuning = .{},
 
     pub fn handshakeState(self: Snapshot) []const u8 {
         if (!self.server_bootstrapped) return "bootstrap_incomplete";
@@ -327,6 +339,11 @@ pub const Runtime = struct {
         if (!no_fragment) {
             logger.warn(null, "http3: no-fragmentation socket policy unavailable; path MTU discovery held at {d} bytes", .{quic.datagram.base_size});
         }
+        // Advisory, and applied before `bind` so the socket is never briefly
+        // reachable with a buffer the operator did not ask for (#256-D).
+        const udp_buffers = tuneSocketBuffers(fd, cfg.udp_buffer_tuning);
+        logSocketBufferOutcome(logger, "receive", udp_buffers.recv);
+        logSocketBufferOutcome(logger, "send", udp_buffers.send);
         const bind_rc = std.c.bind(fd, @ptrCast(&address.storage), @intCast(address.len));
         if (bind_rc != 0) {
             logger.warn(null, "http3: udp bind failed: {s}", .{@tagName(posix.errno(bind_rc))});
@@ -370,7 +387,7 @@ pub const Runtime = struct {
             .h3_qlog_sink = cfg.h3_qlog_sink,
             .h3_qlog_sink_factory_ctx = cfg.h3_qlog_sink_factory_ctx,
             .h3_qlog_sink_factory_cb = cfg.h3_qlog_sink_factory_cb,
-            .snapshot_state = .{ .quic_port = cfg.quic_port },
+            .snapshot_state = .{ .quic_port = cfg.quic_port, .udp_buffers = udp_buffers },
             .stopping = std.atomic.Value(bool).init(false),
             .drain_requested = std.atomic.Value(bool).init(false),
             .drain_deadline_us = std.atomic.Value(u64).init(0),
@@ -1814,6 +1831,92 @@ fn configureNoFragment(fd: std.c.fd_t, sa_family: u32) bool {
     const value = options.value;
     posix.setsockopt(fd, @intCast(level), @intCast(option), std.mem.asBytes(&value)) catch return false;
     return true;
+}
+
+/// Read one socket buffer size back with `getsockopt`. Returns null when the
+/// readback fails, which is reported as such rather than being papered over
+/// with the requested value: the whole reason to read back is that the number
+/// the kernel chose and the number that was asked for routinely differ.
+fn socketBufferBytes(fd: std.c.fd_t, option: u32) ?usize {
+    var value: c_int = 0;
+    var len: posix.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(fd, posix.SOL.SOCKET, option, &value, &len) != 0) return null;
+    if (len != @sizeOf(c_int) or value < 0) return null;
+    return @intCast(value);
+}
+
+/// Apply one direction's requested socket buffer size and report what the
+/// kernel did with it (#256-D).
+///
+/// Advisory by construction. `SO_RCVBUF`/`SO_SNDBUF` are performance knobs:
+/// every failure mode here — refused, trimmed to a system ceiling, unreadable
+/// — still leaves a listener that serves QUIC correctly, so none of them
+/// returns an error. What they must not do is fail *silently*, which is why
+/// the value is always read back: Linux caps a request at `net.core.rmem_max`
+/// while returning success from `setsockopt`, so a listener asking for 16 MiB
+/// on a stock kernel gets ~208 KiB and no indication of it.
+fn tuneSocketBuffer(fd: std.c.fd_t, option: u32, requested: ?usize) quic.udp.BufferOutcome {
+    // Nothing requested still reads back: the kernel default is the number
+    // that explains a benchmark run or a report of unexplained loss, and it
+    // is only knowable from inside this process.
+    const want = requested orelse
+        return quic.udp.classifyBufferOutcome(null, false, socketBufferBytes(fd, option));
+    const clamped = quic.udp.clampBufferBytes(want);
+    const value: c_int = @intCast(clamped);
+    const accepted = if (posix.setsockopt(fd, posix.SOL.SOCKET, option, std.mem.asBytes(&value))) |_| true else |_| false;
+    return quic.udp.classifyBufferOutcome(clamped, accepted, socketBufferBytes(fd, option));
+}
+
+fn tuneSocketBuffers(fd: std.c.fd_t, tuning: quic.udp.BufferTuning) quic.udp.EffectiveBufferTuning {
+    return .{
+        .recv = tuneSocketBuffer(fd, posix.SO.RCVBUF, tuning.recv_bytes),
+        .send = tuneSocketBuffer(fd, posix.SO.SNDBUF, tuning.send_bytes),
+    };
+}
+
+/// The host-wide ceiling an operator has to raise before a larger per-socket
+/// request can be granted. Named per platform because these are not the same
+/// knob: Linux bounds each direction separately, the BSDs bound the total.
+const socket_buffer_ceiling_hint = switch (builtin.os.tag) {
+    .linux => "net.core.rmem_max/net.core.wmem_max",
+    .macos, .ios, .tvos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => "kern.ipc.maxsockbuf",
+    else => "the host socket buffer ceiling",
+};
+
+/// Report one direction's tuning result. A granted request is `info`; every
+/// outcome where the operator did not get what they configured is `warn`,
+/// because the listener will otherwise run indefinitely with a buffer nobody
+/// chose and no way to tell from outside the process.
+fn logSocketBufferOutcome(
+    logger: *logger_mod.Logger,
+    direction: []const u8,
+    outcome: quic.udp.BufferOutcome,
+) void {
+    const effective = outcome.effective_bytes orelse 0;
+    switch (outcome.status) {
+        .default => if (outcome.effective_bytes != null) {
+            logger.info(null, "http3: udp {s} buffer at kernel default effective_bytes={d}", .{ direction, effective });
+        },
+        .applied => logger.info(null, "http3: udp {s} buffer applied requested_bytes={d} effective_bytes={d}", .{
+            direction,
+            outcome.requested_bytes orelse 0,
+            effective,
+        }),
+        .clamped => logger.warn(null, "http3: udp {s} buffer clamped by the kernel requested_bytes={d} effective_bytes={d}; raise {s} on the host or lower the configured request", .{
+            direction,
+            outcome.requested_bytes orelse 0,
+            effective,
+            socket_buffer_ceiling_hint,
+        }),
+        .unverified => logger.warn(null, "http3: udp {s} buffer requested_bytes={d} accepted but could not be read back; effective size unknown", .{
+            direction,
+            outcome.requested_bytes orelse 0,
+        }),
+        .unsupported => logger.warn(null, "http3: udp {s} buffer request rejected by the kernel requested_bytes={d}; kernel default in effect", .{
+            direction,
+            outcome.requested_bytes orelse 0,
+        }),
+    }
 }
 
 /// Create a non-blocking, close-on-exec UDP socket for `sa_family`. Returns a
@@ -4866,6 +4969,96 @@ test "http3 runtime: the no-fragmentation contract is established exactly where 
         defer _ = std.c.close(fd);
         try testing.expectEqual(no_fragment_supported, configureNoFragment(fd, family));
     }
+}
+
+test "http3 runtime: socket buffer sizes are read back from the kernel, not assumed" {
+    // #256-D: the request and the grant are different numbers on every
+    // platform — Linux returns roughly double, and caps at a sysctl the
+    // process cannot see — so what gets reported has to come from
+    // `getsockopt` on the real socket.
+    const fd = openUdpSocket(posix.AF.INET);
+    if (fd < 0) return error.SkipZigTest;
+    defer _ = std.c.close(fd);
+
+    // Nothing requested: still read back, because benchmark metadata and
+    // operator diagnostics want the number whether or not it was chosen here.
+    const untouched = tuneSocketBuffers(fd, .{});
+    try testing.expectEqual(quic.udp.BufferTuningStatus.default, untouched.recv.status);
+    try testing.expectEqual(quic.udp.BufferTuningStatus.default, untouched.send.status);
+    try testing.expectEqual(@as(?usize, null), untouched.recv.requested_bytes);
+    try testing.expect(untouched.recv.effective_bytes != null);
+    try testing.expect(untouched.send.effective_bytes != null);
+
+    // A request every kernel this runs on can satisfy from its default
+    // ceiling, so the outcome is a grant rather than a clamp.
+    const requested: usize = 256 * 1024;
+    const tuned = tuneSocketBuffers(fd, .{ .recv_bytes = requested, .send_bytes = requested });
+    try testing.expectEqual(quic.udp.BufferTuningStatus.applied, tuned.recv.status);
+    try testing.expectEqual(quic.udp.BufferTuningStatus.applied, tuned.send.status);
+    try testing.expectEqual(@as(?usize, requested), tuned.recv.requested_bytes);
+    try testing.expect(tuned.recv.effective_bytes.? >= requested);
+    try testing.expect(tuned.send.effective_bytes.? >= requested);
+}
+
+test "http3 runtime: an oversized buffer request never reaches the kernel as one" {
+    // `setsockopt(SO_RCVBUF)` takes a `c_int`. An operator typo must be
+    // clamped to something the ABI can express — handing it over unclamped
+    // would truncate to a negative size — and the clamped value is what gets
+    // reported, so the log never claims a request that was not made.
+    const fd = openUdpSocket(posix.AF.INET);
+    if (fd < 0) return error.SkipZigTest;
+    defer _ = std.c.close(fd);
+
+    const outcome = tuneSocketBuffer(fd, posix.SO.RCVBUF, std.math.maxInt(usize));
+    try testing.expectEqual(@as(?usize, quic.udp.max_buffer_bytes), outcome.requested_bytes);
+    // Whatever the kernel decided, this stays advisory: a refusal or a clamp
+    // is reported, never raised.
+    try testing.expect(outcome.status != .default);
+}
+
+test "http3 runtime: an unsatisfiable buffer request still yields a working listener" {
+    // Socket buffer sizing is a performance setting. A host whose ceiling is
+    // far below the request must still get a bound, bootstrapped listener —
+    // the outcome is published for diagnosis instead of failing startup.
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-test");
+
+    var runtime = Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .udp_buffer_tuning = .{ .recv_bytes = quic.udp.max_buffer_bytes, .send_bytes = quic.udp.max_buffer_bytes },
+    }) catch return error.SkipZigTest;
+    defer runtime.deinit();
+
+    try testing.expect(runtime.snapshot().server_bootstrapped);
+    const buffers = runtime.snapshot().udp_buffers;
+    try testing.expectEqual(@as(?usize, quic.udp.max_buffer_bytes), buffers.recv.requested_bytes);
+    try testing.expectEqual(@as(?usize, quic.udp.max_buffer_bytes), buffers.send.requested_bytes);
+    // The listener publishes what it got, so a clamp is diagnosable from
+    // outside the process rather than showing up as unexplained loss.
+    try testing.expect(buffers.recv.status != .default);
+    if (buffers.recv.effective_bytes) |effective| try testing.expect(effective > 0);
+}
+
+test "http3 runtime: an untuned listener still reports its socket buffers" {
+    // The default path: nothing configured, kernel sizing left alone, and the
+    // effective values still published so benchmark runs and support tickets
+    // record what the socket actually had.
+    var logger = logger_mod.Logger.init(.err, "http3-test");
+    var runtime = Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    }) catch return error.SkipZigTest;
+    defer runtime.deinit();
+
+    const buffers = runtime.snapshot().udp_buffers;
+    try testing.expectEqual(quic.udp.BufferTuningStatus.default, buffers.recv.status);
+    try testing.expectEqual(quic.udp.BufferTuningStatus.default, buffers.send.status);
+    try testing.expectEqual(@as(?usize, null), buffers.recv.requested_bytes);
+    try testing.expect(buffers.recv.effective_bytes != null);
+    try testing.expect(buffers.send.effective_bytes != null);
 }
 
 test "http3 runtime: only verified platforms claim no-fragmentation support" {

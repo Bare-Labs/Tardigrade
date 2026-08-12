@@ -182,6 +182,61 @@ RFC 9002's NewReno windows are defined in terms of the sender's current maximum
 datagram size, so the initial window, minimum window, and congestion-avoidance
 growth all scale with the value above rather than with a fixed 1200.
 
+## Socket buffers
+
+The UDP receive buffer is where datagrams wait between the kernel taking them
+off the wire and the listener thread reading them. When it fills, the kernel
+drops datagrams — silently, as far as QUIC is concerned. To the connection that
+looks exactly like network loss: congestion control backs off, packets are
+retransmitted, and throughput falls for a reason nothing on the path caused.
+A host whose default buffer is small relative to the bandwidth-delay product
+will do this under bursts even when the link is idle.
+
+`TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES` and
+`TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES` request `SO_RCVBUF` / `SO_SNDBUF` on
+the listener socket. Both default to `0`, meaning **leave the kernel's own
+sizing alone** — the right setting unless you have measured drops. Requests are
+clamped into `[2048, 1073741824]` before reaching the kernel, since the
+`setsockopt` ABI takes a signed 32-bit size and a typo must not wrap it.
+
+Everything here is advisory. A kernel that refuses the request, or grants less
+than was asked for, still gets a listener that serves HTTP/3 correctly — buffer
+sizing is a performance setting, and turning it into a startup failure would
+take a service down over a tuning knob. What it must not do is fail silently,
+so the size is **read back with `getsockopt`** and reported:
+
+| Log | Meaning |
+| --- | --- |
+| `udp receive buffer at kernel default effective_bytes=N` | Nothing requested. `N` is what the socket has. |
+| `udp receive buffer applied requested_bytes=N effective_bytes=M` | Granted. |
+| `udp receive buffer clamped by the kernel …` | The request was accepted and cut down by a host-wide ceiling. Only the host operator can raise it. |
+| `udp receive buffer … accepted but could not be read back` | The size is unknown; nothing was measured. |
+| `udp receive buffer request rejected by the kernel …` | The default buffer stands. |
+
+The readback matters because the request and the grant are routinely different
+numbers, and `setsockopt` reports success either way:
+
+- **Linux** caps `SO_RCVBUF` at `net.core.rmem_max` (and `SO_SNDBUF` at
+  `net.core.wmem_max`) — commonly 208 KiB on a stock kernel — so a listener
+  asking for 16 MiB gets a fraction of it and no indication from the syscall.
+  Raise the ceiling on the host (`sysctl -w net.core.rmem_max=8388608`,
+  persisted in `/etc/sysctl.d/`) before raising the request. Linux also reports
+  roughly **twice** what was set: the other half is per-datagram bookkeeping
+  overhead, not payload capacity, so a readback of 8 MiB for a 4 MiB request is
+  normal and is treated as a grant.
+- **macOS and the BSDs** bound the total per-socket buffer with
+  `kern.ipc.maxsockbuf` rather than per direction, and return the size set
+  rather than a doubled one.
+- **Other platforms** are not assumed to expose either knob; a refusal is
+  reported and the default stands.
+
+The effective values are published on the runtime's status snapshot
+(`udp_buffers`), which is what benchmark runs should record — the requested
+value and the host sysctls describe intent, not what the socket got.
+
+Both variables are restart-required: buffer sizes are socket state applied to
+the live descriptor at bind time, so changing one means a new socket.
+
 ## Reload
 
 Advertisement-only knobs can hot reload:
@@ -198,6 +253,8 @@ runtime does not atomically replace a live UDP socket and QUIC connection table:
 - `TARDIGRADE_HTTP3_RETRY_POLICY`
 - `TARDIGRADE_HTTP3_ENABLE_0RTT`
 - `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE`
+- `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES`
+- `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES`
 
 A reload that changes one of those fields is rejected before publication. The
 old config, old runtime, and old effective advertisement remain active.

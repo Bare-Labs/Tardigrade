@@ -5,6 +5,25 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- **Tunable UDP socket buffers for the HTTP/3 listener (#256-D)** —
+  `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES` and
+  `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES` request `SO_RCVBUF`/`SO_SNDBUF` on
+  the QUIC listener socket. Both default to `0`, leaving the kernel's own
+  sizing alone. A full receive buffer drops datagrams that QUIC then treats as
+  network loss — congestion control backs off for a reason nothing on the path
+  caused — so hosts that measure drops under bursts can now raise it without
+  patching.
+
+  The request is advisory in both directions: a kernel that refuses or trims it
+  still gets a listener that serves HTTP/3 correctly, since buffer sizing is a
+  performance setting and not worth failing startup over. It is not, however,
+  allowed to fail silently. The size is read back with `getsockopt` — Linux
+  caps requests at `net.core.rmem_max` while `setsockopt` still reports
+  success, and returns roughly double what was set — so the listener logs and
+  publishes what the kernel actually granted, distinguishing a grant from a
+  clamp, an outright refusal, and an accepted-but-unreadable result. Effective
+  values appear on the runtime status snapshot, and competitive benchmark runs
+  now record the host's UDP buffer ceilings alongside their results.
 - **QUIC discovers the path MTU instead of assuming one (#256-B)** — Tardigrade
   now runs DPLPMTUD (RFC 8899, RFC 9000 §14.3/§14.4) per network path. Every
   path starts at the 1200-byte size RFC 9000 §14 guarantees and rises only as
