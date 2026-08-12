@@ -18,6 +18,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const packet = @import("packet.zig");
+const pmtu = @import("pmtu.zig");
 const udp = @import("udp.zig");
 const secrets = @import("crypto_secrets");
 
@@ -449,6 +450,26 @@ pub const PathKey = struct {
     }
 };
 
+/// A path *incarnation*: the address tuple plus the generation of the slot
+/// that represented it (#256-B review).
+///
+/// The tuple alone is not an identity for anything with per-path lifecycle
+/// state. A slot can be recycled, and `onDatagram` deliberately restarts a
+/// previously-validated tuple's discovery when it has to be re-validated — so
+/// the same `(local, remote)` can name a *fresh* PMTU controller while packets
+/// sent by its previous incarnation are still outstanding in recovery. Feeding
+/// those stale outcomes to the new controller would teach it about a path
+/// condition that no longer exists. Carrying the generation makes that
+/// detectable rather than silent.
+pub const PathRef = struct {
+    key: PathKey,
+    generation: u64,
+
+    pub fn eql(self: PathRef, other: PathRef) bool {
+        return self.generation == other.generation and self.key.eql(other.key);
+    }
+};
+
 pub const PathState = enum {
     /// Traffic seen, no validation started (policy denied or not yet probed).
     unvalidated,
@@ -486,6 +507,18 @@ pub const Path = struct {
     challenge: [path_challenge_len]u8 = undefined,
     challenge_deadline_us: u64 = 0,
     anti_amplification: AntiAmplification = .{},
+    /// Which incarnation of this slot the current lifecycle state belongs to.
+    /// Bumped whenever the slot starts representing a new path — a fresh or
+    /// recycled slot, or a validated tuple whose discovery is restarted — so
+    /// outcomes stamped with an older generation can be recognised as stale
+    /// and dropped rather than applied to state they did not produce.
+    generation: u64 = 0,
+    /// DPLPMTUD state for *this* path (#256-B). Path-scoped rather than
+    /// connection-scoped because that is what the question means: a size
+    /// discovered on one path says nothing about another. A new or recycled
+    /// slot therefore starts from the RFC 9000 §14 floor by construction —
+    /// there is no inherit-the-old-value path to get wrong.
+    plpmtu: pmtu.Controller = .{},
 };
 
 /// The action the connection takes for a datagram from a given tuple.
@@ -548,6 +581,9 @@ pub const PathManager = struct {
     paths: [max_paths]?Path = [_]?Path{null} ** max_paths,
     /// Index of the active (validated, in-use) path.
     active: usize = 0,
+    /// Monotonic source of path-incarnation generations. Never reused, so a
+    /// stamped `PathRef` can always be compared for staleness.
+    next_generation: u64 = 1,
     metrics: Metrics = .{},
 
     /// Start with the handshake path as the active routing path. Its
@@ -562,13 +598,66 @@ pub const PathManager = struct {
             .key = handshake_path,
             .state = .validated,
             .change = .migration,
+            .generation = 1,
         };
+        manager.next_generation = 2;
         if (initial_address_validated) manager.paths[0].?.anti_amplification.markValidated();
         return manager;
     }
 
     pub fn activePath(self: *const PathManager) *const Path {
         return &self.paths[self.active].?;
+    }
+
+    /// The active path's DPLPMTUD state, for a caller that drives probing and
+    /// consumes probe/loss feedback (#256-B). Mutable by design and reached
+    /// only through the active slot: promoting a different path swaps which
+    /// controller this returns, which is exactly the per-path reset the
+    /// discovery model requires.
+    pub fn activePlpmtu(self: *PathManager) *pmtu.Controller {
+        return &self.paths[self.active].?.plpmtu;
+    }
+
+    /// The active path's current incarnation, for stamping onto outbound
+    /// records so their eventual outcome can be matched back to the state that
+    /// produced them.
+    pub fn activePathRef(self: *const PathManager) PathRef {
+        const path = self.activePath();
+        return .{ .key = path.key, .generation = path.generation };
+    }
+
+    /// The incarnation of a tracked tuple, or null when it is not tracked.
+    pub fn pathRefFor(self: *const PathManager, key: PathKey) ?PathRef {
+        const index = self.find(key) orelse return null;
+        const path = self.paths[index].?;
+        return .{ .key = path.key, .generation = path.generation };
+    }
+
+    /// Whether `ref` names the path that is active right now — both the tuple
+    /// and the incarnation, so a re-validated tuple does not answer for the
+    /// generation that preceded it.
+    pub fn isActive(self: *const PathManager, ref: PathRef) bool {
+        return self.activePathRef().eql(ref);
+    }
+
+    /// The DPLPMTUD state of a *specific* path, or null when that tuple is no
+    /// longer tracked. This is the accessor ACK/loss feedback must use, not
+    /// `activePlpmtu`: recovery deliberately keeps old-path packets in flight
+    /// across a migration (RFC 9000 §9.4, see
+    /// `recovery.resetForPathMigration`), so a delayed acknowledgement or a
+    /// loss can land well after a different path became active. Attributing
+    /// that outcome to whatever is active *now* would teach the new path a
+    /// size only the old one was ever shown to carry — exactly the inheritance
+    /// this per-path model exists to prevent. A null return means the slot was
+    /// recycled and the feedback has nowhere legitimate to go: drop it.
+    pub fn plpmtuFor(self: *PathManager, ref: PathRef) ?*pmtu.Controller {
+        const index = self.find(ref.key) orelse return null;
+        const path = &self.paths[index].?;
+        // Same tuple, different incarnation: the state that produced this
+        // outcome is gone, and the controller sitting here now describes a
+        // path that has not been shown to behave the same way.
+        if (path.generation != ref.generation) return null;
+        return &path.plpmtu;
     }
 
     /// Lift the active path's anti-amplification limit once its address is
@@ -697,7 +786,7 @@ pub const PathManager = struct {
                 return .{ .blocked = .{ .change = change, .first_observation = false } };
             } else {
                 const slot = self.claimSlot();
-                self.paths[slot] = .{ .key = key, .state = .unvalidated, .change = change };
+                self.paths[slot] = .{ .key = key, .state = .unvalidated, .change = change, .generation = self.claimGeneration() };
                 self.paths[slot].?.anti_amplification.recordReceived(authenticated_bytes);
                 return .{ .blocked = .{ .change = change, .first_observation = true } };
             }
@@ -712,7 +801,37 @@ pub const PathManager = struct {
             // deliberately chose not to skip validation (RFC 9000 §9.3.1).
             // A path still mid-validation or awaiting promotion keeps its
             // ledger untouched — it either hasn't validated yet or just did.
-            if (path.state == .validated) path.anti_amplification = .{};
+            // Whether this datagram *begins a new validation attempt*, as
+            // opposed to arriving during one that is already running or
+            // already finished. Every fresh attempt is a new incarnation of
+            // the tuple, whatever ended the previous one — a promotion
+            // elsewhere (`.validated`), an expiry (`.failed`), or a policy
+            // block that never probed (`.unvalidated`). Getting this wrong for
+            // `.failed` in particular leaves a hole: the expired attempt's
+            // PATH_CHALLENGE can still be sitting in connection-wide recovery,
+            // and its delayed ACK would resolve against the new attempt's
+            // state as if the two were the same path lifetime.
+            const fresh_attempt = switch (path.state) {
+                .validating, .validated_pending_promotion => false,
+                .failed, .unvalidated, .validated => true,
+            };
+            if (fresh_attempt) {
+                // Same reasoning as the ledger below, for the path's measured
+                // MTU (#256-B): a tuple being re-probed is not demonstrably
+                // the path it was, and an inherited size that no longer
+                // traverses it is a black hole waiting to happen. Discovery
+                // restarts from the guaranteed floor, and the new generation
+                // makes outcomes owed by the previous incarnation droppable.
+                path.plpmtu.reset();
+                path.generation = self.claimGeneration();
+                // The anti-amplification reset stays specific to `.validated`:
+                // only a previously-*validated* path carries a lifted limit
+                // that must not survive into an attempt this code deliberately
+                // chose not to skip (RFC 9000 §9.3.1). A `.failed` or
+                // `.unvalidated` path's ledger is already the conservative one
+                // its own received bytes earned.
+                if (path.state == .validated) path.anti_amplification = .{};
+            }
             path.anti_amplification.recordReceived(authenticated_bytes);
             switch (path.state) {
                 .validating => return .probing,
@@ -744,6 +863,7 @@ pub const PathManager = struct {
             .change = change,
             .challenge = challenge_entropy,
             .challenge_deadline_us = now_us + self.validation_timeout_us,
+            .generation = self.claimGeneration(),
         };
         self.paths[slot].?.anti_amplification.recordReceived(authenticated_bytes);
         self.metrics.path_challenges_sent += 1;
@@ -910,6 +1030,12 @@ pub const PathManager = struct {
 
     /// A free slot, or the oldest non-active failed/unvalidated slot when the
     /// table is full — probe storms recycle probes, never the active path.
+    fn claimGeneration(self: *PathManager) u64 {
+        const generation = self.next_generation;
+        self.next_generation +|= 1;
+        return generation;
+    }
+
     fn claimSlot(self: *PathManager) usize {
         for (self.paths, 0..) |slot, index| {
             if (slot == null) return index;

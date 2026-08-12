@@ -16,7 +16,8 @@ const std = @import("std");
 /// payload, and §14.1 requires a datagram carrying an Initial packet to be
 /// padded to at least that size. So it is simultaneously the floor of any
 /// effective cap and the value the stack falls back to whenever nothing
-/// larger has been established. Also the operator-facing default.
+/// larger has been established — where every path starts, and where a
+/// black-hole fallback lands (#256-B).
 pub const base_size: usize = 1200;
 
 /// Hard ceiling on any datagram this stack will emit, whatever an operator or
@@ -33,16 +34,19 @@ pub const max_size: usize = 2048;
 /// statement of receive capacity, not mutable path state. Only the peer's
 /// advertisement appears here, as a ceiling on what we may send it.
 pub const Limits = struct {
-    /// The sender's current maximum datagram size for the active path: what
-    /// this stack believes the path carries today. Starts at `base_size`, the
-    /// only size RFC 9000 §14 guarantees. An operator may assert a larger
-    /// value for a path whose MTU they control; #256-B replaces the assertion
-    /// with measured DPLPMTUD state and black-hole fallback.
+    /// The sender's current maximum datagram size for the path in question:
+    /// what DPLPMTUD has *shown* the path carries (#256-B). Starts at
+    /// `base_size`, the only size RFC 9000 §14 guarantees, and rises only when
+    /// a probe of a larger size is acknowledged. Nothing an operator or peer
+    /// says raises it directly — that is the difference from #256-A, where
+    /// this was an assertion.
     current_path_max: u64 = base_size,
     /// The largest datagram this endpoint will ever emit, independent of what
-    /// the path has been shown to carry. This is the ceiling a PMTU probe may
-    /// reach for, so it must have headroom above `base_size` or #256-B could
-    /// never discover anything.
+    /// the path has been shown to carry: the operator's configured maximum,
+    /// held down to `base_size` on a listener that could not establish the
+    /// no-IP-fragmentation contract DPLPMTUD requires. This is the ceiling a
+    /// PMTU probe may reach for, so it must have headroom above `base_size`
+    /// or #256-B could never discover anything.
     send_ceiling: u64 = max_size,
     /// The peer's advertised `max_udp_payload_size`: its receive capacity,
     /// once transport parameters have been authenticated. `null` before then,

@@ -5,6 +5,42 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- **QUIC discovers the path MTU instead of assuming one (#256-B)** — Tardigrade
+  now runs DPLPMTUD (RFC 8899, RFC 9000 §14.3/§14.4) per network path. Every
+  path starts at the 1200-byte size RFC 9000 §14 guarantees and rises only as
+  far as a padded probe datagram is actually acknowledged; the first probe
+  reaches straight for the ceiling, so a path that carries it is discovered in
+  one round trip. Probe loss is not treated as congestion (§14.4), but probes
+  are still congestion controlled and anti-amplification limited, with none of
+  the RFC 9002 PTO exemptions. When a path stops carrying the discovered size —
+  oversized datagrams lost while smaller ones arrive, or consecutive PTOs with
+  nothing acknowledged — the send size falls back to 1200 rather than
+  retransmitting the same oversized datagram until the idle timeout, and the
+  RFC 8899 raise timer (10 minutes) later re-enters the search, discarding the
+  previous failure bound — it described a path condition that may no longer
+  hold — so a path that regains MTU is rediscovered rather than being stuck at
+  the size that once failed. Discovery is per path *incarnation* and never
+  inherited: a migration, or a tuple that has to be re-validated, starts over
+  at 1200, and feedback still owed by a previous incarnation is dropped rather
+  than applied to the new one.
+
+  Discovery above 1200 additionally requires the listener socket to establish a
+  no-IP-fragmentation contract (RFC 8899 §3): `IP_PMTUDISC_PROBE` on Linux,
+  `IP_DONTFRAG` on Darwin and FreeBSD — whose IPv4 constants differ, so the
+  BSDs are handled per-OS rather than as a family. Without it an acknowledged
+  large probe would be measuring reassembly rather than the path, so where the
+  contract cannot be established the send size stays at 1200 regardless of
+  configuration. The QUIC transport's own default is 1200 for the same reason:
+  it owns no socket, so discovery is opt-in by whichever composition root
+  created one and can vouch for it.
+
+  `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` changes meaning accordingly and now
+  defaults to **2048**. It was an assertion — "this path carries this much" —
+  and is now a *ceiling on what discovery may find*. Raising it can no longer
+  put a size on the wire that nothing has measured, so the wider default is not
+  a more aggressive one: the size actually emitted still starts at 1200.
+  Lowering it is now the only reason to set it. See `docs/HTTP3_ROLLOUT.md`.
+
 - **Native TLS negotiates `record_size_limit` and can pad records (#359)** —
   the record transport now offers and honors RFC 8449's `record_size_limit`
   extension in both roles. Each side advertises the largest inner plaintext it

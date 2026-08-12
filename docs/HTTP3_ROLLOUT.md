@@ -42,34 +42,125 @@ receive buffers the implementation allocates — **2048 bytes** — not somethin
 operator tunes, and it never changes for the life of a connection. The config
 layer refuses to advertise more than the transport can actually deprotect.
 
-**Send size** is what this process puts on the wire, and that is what
-`TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` controls. It defaults to **1200** — the
-size RFC 9000 §14 requires every QUIC path to carry — and is clamped into
-`[1200, 2048]`. The transport resolves the size actually emitted as the smallest
-of:
+**Send size** is what this process puts on the wire. It is *measured*, not
+configured: every path starts at **1200** — the size RFC 9000 §14 requires every
+QUIC path to carry — and only rises as far as DPLPMTUD has proven the path
+carries (see below). The transport resolves the size actually emitted as the
+smallest of:
 
-1. the current path size (this knob, until DPLPMTUD replaces it);
-2. this endpoint's send ceiling (2048);
+1. the current path size, as discovered by DPLPMTUD;
+2. this endpoint's send ceiling — `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE`, clamped
+   into `[1200, 2048]` and defaulting to 2048;
 3. the peer's advertised receive capacity, once its transport parameters are
    authenticated.
 
-Consequences worth knowing before tuning it:
+`TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` is therefore a **ceiling on what discovery
+may find**, not a size taken on trust. Consequences worth knowing:
 
-- **The send size sits at 1200 for the whole handshake.** A raised value only
-  takes effect once the peer has authenticated and committed to accepting
-  larger datagrams. Datagrams carrying Initial packets are always padded to
-  1200 regardless.
-- **A peer always wins when it asks for less.** Raising this value can never
-  push a datagram past what the peer advertised.
-- **Raising it is an assertion about the path**, not a measurement. Tardigrade
-  does not yet run DPLPMTUD (RFC 8899), so a value above 1200 says "I know this
-  path carries this much". If it does not, those datagrams are dropped in the
-  network. Tardigrade's own loss recovery will notice and retransmit — but with
-  no PMTU black-hole fallback yet, the retransmissions are the same oversized
-  datagrams, so the connection can stall indefinitely rather than recovering at
-  a smaller size. Raise it only for paths whose MTU you control end to end (a
-  dedicated link, a loopback or same-rack benchmark host, a known-jumbo-frame
-  fabric). Leave it at the default on the open internet.
+- **The send size sits at 1200 for the whole handshake**, and stays there until
+  a probe of something larger is acknowledged. Datagrams carrying Initial
+  packets are always padded to 1200 regardless.
+- **A peer always wins when it asks for less.** Nothing here can push a
+  datagram past what the peer advertised.
+- **Lowering the ceiling is the only reason to touch it.** Raising it can never
+  make Tardigrade send a size the path has not been shown to carry, so the
+  default needs no defensive tuning. Lower it when you know a downstream link
+  is smaller than discovery would otherwise find, or to switch discovery off
+  entirely by pinning it to 1200.
+- **It has no effect at all without the socket contract below.** On a platform
+  where no-IP-fragmentation cannot be established, the send size stays at 1200
+  however this is set.
+
+## Path MTU discovery
+
+Tardigrade runs DPLPMTUD (RFC 8899, RFC 9000 §14.3/§14.4) per network path,
+starting once the handshake is confirmed — the peer's receive capacity is
+authenticated by then, and a completed handshake is itself proof the path
+carries 1200 bytes, since every Initial-bearing datagram was padded to it.
+
+- **Probes are standalone datagrams** carrying only PING and PADDING, sized to
+  exactly the size being validated. Nothing rides on one, so a probe dropped by
+  a path too small for it costs no application progress.
+- **The first probe reaches straight for the ceiling** (RFC 8899's optimistic
+  search), so a path that really carries the configured maximum is discovered in
+  one round trip. After that the search bisects, converging to within 16 bytes.
+- **A converged search is re-run every 10 minutes** if it stopped because larger
+  sizes failed (RFC 8899's `PMTU_RAISE_TIMER`). A path can *gain* MTU on the
+  same address tuple — a tunnel goes away, a route changes — and the previous
+  failure bound describes a path condition that no longer exists, so it is
+  discarded and the sizes it ruled out become reachable again. A search that
+  converged at the ceiling has nothing above it to find and does not re-run.
+- **A probe's loss is not a congestion signal** (RFC 9000 §14.4) — being too big
+  is what a probe is for — but a probe is still congestion controlled and
+  anti-amplification limited like any other datagram, with none of the RFC 9002
+  PTO exemptions. It waits for window rather than overshooting.
+- **A size is only ruled out after three consecutive probe losses**, so ordinary
+  congestion cannot narrow the search.
+
+### Black holes
+
+A path that used to carry the discovered size can stop carrying it — a tunnel
+appears, a route changes, an operator lowers an MTU. Tardigrade watches for two
+signatures and pulls the send size back to 1200 when either fires three times:
+
+- datagrams **at or above the current send size** being lost while **smaller**
+  ones are still delivered. Both halves are measured against the size actually
+  in question, not against the 1200-byte floor: with a discovered size of 1452,
+  a delivered 1300-byte datagram *corroborates* the black hole rather than
+  disproving it, while a delivered 1452-byte datagram clears the evidence
+  outright. A loss below the current size is not evidence at all — falling back
+  would not have saved it.
+- consecutive PTO expirations with nothing acknowledged in between, which is
+  what the same failure looks like when *every* datagram in flight is already
+  oversized and there is no smaller delivery to compare against.
+
+A false positive costs throughput until the raise timer re-tests. Not falling
+back costs the connection: Tardigrade's own retransmissions would keep
+re-sending the same oversized datagram until the idle timeout.
+
+Discovery is **per path incarnation, never inherited.** Migrating to a new path
+restarts from 1200 rather than carrying over a size only the old path was shown
+to carry — and so does re-probing a tuple whose previous validation ended,
+whether it was promoted away or expired unanswered. Outcomes still owed by an
+earlier incarnation (a delayed acknowledgement, a late loss) are dropped rather
+than applied to the state that replaced it.
+
+### Requirements and diagnostics
+
+Discovering anything above 1200 requires the listener socket to establish a
+**no-IP-fragmentation contract**. Without it a large probe may be fragmented,
+and its acknowledgement would prove the peer *reassembled* it rather than that
+the path carries it. Supported platforms:
+
+| Platform | Mechanism | Notes |
+| --- | --- | --- |
+| Linux | `IP_PMTUDISC_PROBE` / `IPV6_PMTUDISC_PROBE` | Sets DF *and* ignores the kernel's cached path MTU, so DPLPMTUD is in control (RFC 8899 §4.5). |
+| macOS, iOS, tvOS, watchOS | `IP_DONTFRAG` (28) / `IPV6_DONTFRAG` (62) | DF only — no probe mode, so a kernel-cached PMTU can still bound a probe. Costs discovery reach, not soundness. |
+| FreeBSD | `IP_DONTFRAG` (67) / `IPV6_DONTFRAG` (62) | As above. Note the IPv4 constant differs from Darwin's. |
+| NetBSD, OpenBSD, DragonFly, others | — | No verified API; discovery stays at 1200. |
+
+These constants are deliberately **not** shared across the BSDs: Darwin's IPv4
+`IP_DONTFRAG` is 28 while FreeBSD's is 67, and OpenBSD uses option 28 for
+something else entirely. A wrong constant that a kernel happens to *accept*
+would report success without ever setting DF — the exact false positive this
+gate exists to prevent — so an unverified platform reports failure instead of
+guessing.
+
+Where the contract cannot be established the listener logs a warning and holds
+the send size at 1200 whatever `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` says — the
+conservative policy, not a silently unsound measurement.
+
+The QUIC transport's own `max_send_udp_payload_size` defaults to 1200 for the
+same reason: `src/quic/` owns no socket and cannot know whether a probe would be
+fragmented, so **discovery is opt-in by the composition root that created the
+socket**. An embedder using `quic.connection` directly gets the conservative
+policy until it establishes the contract itself and raises the ceiling.
+
+Diagnostics are currently **connection-level, not yet operator-facing**:
+`pmtu_probes_sent` and `pmtu_black_holes` on `quic.connection.Metrics`, plus a
+`pmtu_updated` event carrying the path, the new effective size, and whether it
+rose or fell back. The HTTP/3 runtime's metrics/event bridge does not surface
+them yet; #255's observability work is where they become operator-visible.
 
 Nothing about this setting relaxes congestion control, flow control, or the
 server's anti-amplification budget:
