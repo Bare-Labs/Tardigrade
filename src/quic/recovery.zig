@@ -1234,7 +1234,7 @@ test "discarding Initial state clears persistent-congestion bookkeeping for Retr
     try controller.onPacketSent(.{ .space = .initial, .packet_number = 0, .time_sent_us = 0, .size = 100 });
     try controller.onPacketSent(.{ .space = .initial, .packet_number = 1, .time_sent_us = duration, .size = 100 });
     try controller.onPacketSent(.{ .space = .initial, .packet_number = 2, .time_sent_us = duration + 1, .size = 100 });
-    controller.onAcked(.initial, 2, duration + 2, 0);
+    controller.onAcked(.initial, 2, duration + 100_001, 0);
     try testing.expect(controller.detectLost(.initial, duration * 2).persistent_congestion);
 
     const idx = spaceIndex(.initial);
@@ -1252,7 +1252,7 @@ test "discarding Initial state clears persistent-congestion bookkeeping for Retr
     try controller.onPacketSent(.{ .space = .initial, .packet_number = 0, .time_sent_us = duration * 3, .size = 100 });
     try controller.onPacketSent(.{ .space = .initial, .packet_number = 1, .time_sent_us = duration * 4, .size = 100 });
     try controller.onPacketSent(.{ .space = .initial, .packet_number = 2, .time_sent_us = duration * 4 + 1, .size = 100 });
-    controller.onAcked(.initial, 2, duration * 4 + 2, 0);
+    controller.onAcked(.initial, 2, duration * 4 + 100_001, 0);
     try testing.expect(controller.detectLost(.initial, duration * 5).persistent_congestion);
 }
 
