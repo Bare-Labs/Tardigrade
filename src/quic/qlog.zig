@@ -144,13 +144,11 @@ pub const MigrationState = enum {
 
 pub const StreamSide = enum { sending, receiving };
 pub const StreamState = enum {
-    ready,
+    open,
     closed,
-    reset_received,
-    reset_sent,
 };
 pub const StreamStateTrigger = enum { local, remote };
-pub const PacketNumberSpace = enum { initial, handshake, application };
+pub const PacketNumberSpace = enum { initial, handshake, application_data };
 
 pub const CongestionState = enum {
     slow_start,
@@ -701,23 +699,23 @@ test "namespace and name mapping stays aligned with qlog vantage points" {
     try testing.expectEqual(Namespace.quic, (Event{ .packet_lost = .{ .packet_type = .one_rtt } }).namespace());
     try testing.expectEqual(Namespace.quic, (Event{ .key_updated = .{ .key_type = .server_1rtt_secret, .key_phase = 1 } }).namespace());
     try testing.expectEqual(Namespace.quic, (Event{ .connection_migrated = .{ .new = .migration_complete } }).namespace());
-    try testing.expectEqual(Namespace.quic, (Event{ .stream_state_updated = .{ .stream_id = 0, .stream_side = .sending, .new = .ready } }).namespace());
+    try testing.expectEqual(Namespace.quic, (Event{ .stream_state_updated = .{ .stream_id = 0, .stream_side = .sending, .new = .open } }).namespace());
     try testing.expectEqual(Namespace.quic, (Event{ .congestion_state_updated = .{ .old = .slow_start, .new = .recovery } }).namespace());
     try testing.expectEqual(Namespace.tardigrade, (Event{ .persistent_congestion = .{} }).namespace());
     try testing.expectEqual(Namespace.tardigrade, (Event{ .stream_reset = .{ .kind = .reset_sent, .stream_id = 0 } }).namespace());
     try testing.expectEqual(Namespace.tardigrade, (Event{ .packets_lost = .{ .lost_count = 2, .bytes = 2400 } }).namespace());
-    try testing.expectEqual(Namespace.quic, (Event{ .packets_acked = .{ .packet_number_space = .application, .packet_number = 7 } }).namespace());
+    try testing.expectEqual(Namespace.quic, (Event{ .packets_acked = .{ .packet_number_space = .application_data, .packet_number = 7 } }).namespace());
     try testing.expectEqualStrings("packet_dropped", (Event{ .packet_dropped = .{ .trigger = .decryption_failure } }).name());
 }
 
 test "stream and congestion transitions serialize to qlog records" {
     try expectJson(
-        .{ .time_us = 0, .event = .{ .stream_state_updated = .{ .stream_id = 8, .stream_side = .receiving, .old = .ready, .new = .closed, .trigger = .remote } } },
+        .{ .time_us = 0, .event = .{ .stream_state_updated = .{ .stream_id = 8, .stream_side = .receiving, .old = .open, .new = .closed, .trigger = .remote } } },
         "\"name\":\"quic:stream_state_updated\"",
     );
     try expectJson(
-        .{ .time_us = 0, .event = .{ .stream_state_updated = .{ .stream_id = 8, .stream_side = .receiving, .old = .ready, .new = .closed, .trigger = .remote } } },
-        "\"stream_id\":8,\"stream_side\":\"receiving\",\"old\":\"ready\",\"new\":\"closed\",\"trigger\":\"remote\"",
+        .{ .time_us = 0, .event = .{ .stream_state_updated = .{ .stream_id = 8, .stream_side = .receiving, .old = .open, .new = .closed, .trigger = .remote } } },
+        "\"stream_id\":8,\"stream_side\":\"receiving\",\"old\":\"open\",\"new\":\"closed\",\"trigger\":\"remote\"",
     );
     try expectJson(
         .{ .time_us = 0, .event = .{ .congestion_state_updated = .{ .old = .slow_start, .new = .recovery } } },
@@ -831,12 +829,12 @@ test "recovery metrics serialize as a quic event" {
 
 test "acked packets serialize as standard qlog packet number arrays" {
     try expectJson(
-        .{ .time_us = 5, .event = .{ .packets_acked = .{ .packet_number_space = .application, .packet_number = 9 } } },
+        .{ .time_us = 5, .event = .{ .packets_acked = .{ .packet_number_space = .application_data, .packet_number = 9 } } },
         "\"name\":\"quic:packets_acked\"",
     );
     try expectJson(
-        .{ .time_us = 5, .event = .{ .packets_acked = .{ .packet_number_space = .application, .packet_number = 9 } } },
-        "\"packet_number_space\":\"application\",\"packet_numbers\":[9]",
+        .{ .time_us = 5, .event = .{ .packets_acked = .{ .packet_number_space = .application_data, .packet_number = 9 } } },
+        "\"packet_number_space\":\"application_data\",\"packet_numbers\":[9]",
     );
 }
 

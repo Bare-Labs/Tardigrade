@@ -134,7 +134,7 @@ pub const FlowControlScope = enum { connection, stream };
 pub const FlowControlState = enum { blocked, unblocked };
 pub const CongestionState = enum { slow_start, congestion_avoidance, recovery };
 pub const StreamSide = enum { sending, receiving };
-pub const StreamSideState = enum { ready, closed, reset_sent, reset_received };
+pub const StreamSideState = enum { open, closed };
 pub const StreamStateTrigger = enum { local, remote };
 
 pub const Event = union(enum) {
@@ -2179,21 +2179,29 @@ pub const Connection = struct {
     fn streamSideState(stream_state: quic_stream.StreamState, side: StreamSide) StreamSideState {
         return switch (side) {
             .sending => switch (stream_state) {
-                .open, .half_closed_remote, .reset_received => .ready,
-                .half_closed_local, .closed => .closed,
-                .reset_sent => .reset_sent,
+                .open, .half_closed_remote, .reset_received => .open,
+                .half_closed_local, .closed, .reset_sent => .closed,
             },
             .receiving => switch (stream_state) {
-                .open, .half_closed_local, .reset_sent => .ready,
-                .half_closed_remote, .closed => .closed,
-                .reset_received => .reset_received,
+                .open, .half_closed_local, .reset_sent => .open,
+                .half_closed_remote, .closed, .reset_received => .closed,
             },
+        };
+    }
+
+    fn streamHasSide(self: *const Connection, id: StreamId, side: StreamSide) bool {
+        if (quic_stream.streamType(id) == .bidi) return true;
+        const locally_initiated = quic_stream.streamInitiator(id) == roleInitiator(self.role);
+        return switch (side) {
+            .sending => locally_initiated,
+            .receiving => !locally_initiated,
         };
     }
 
     fn emitStreamStateCreated(self: *Connection, id: StreamId, maybe_state: ?quic_stream.StreamState) void {
         const stream_state = maybe_state orelse .open;
         for ([_]StreamSide{ .sending, .receiving }) |side| {
+            if (!self.streamHasSide(id, side)) continue;
             self.events.emit(.{ .stream_state_changed = .{
                 .id = id,
                 .side = side,
@@ -2204,6 +2212,7 @@ pub const Connection = struct {
 
     fn emitStreamStateTransition(self: *Connection, id: StreamId, old: quic_stream.StreamState, new: quic_stream.StreamState, trigger: ?StreamStateTrigger) void {
         for ([_]StreamSide{ .sending, .receiving }) |side| {
+            if (!self.streamHasSide(id, side)) continue;
             const old_side = streamSideState(old, side);
             const new_side = streamSideState(new, side);
             if (old_side == new_side) continue;
@@ -6514,7 +6523,7 @@ test "driver: received stream frames emit actual lifecycle transitions" {
     try pair.server.applyFrame(.application, .{ .stream = .{ .id = id, .offset = 0, .data = "", .fin = true } }, TestPair.server_path, 0, pair.now_us);
 
     try testing.expectEqual(@as(usize, 2), capture.count);
-    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .sending, .new = .ready } }, capture.events[0]);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .sending, .new = .open } }, capture.events[0]);
     try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .receiving, .new = .closed } }, capture.events[1]);
 }
 
@@ -6550,8 +6559,69 @@ test "driver: received reset that creates a stream emits lifecycle transition" {
 
     try testing.expectEqual(@as(usize, 1), capture.reset_count);
     try testing.expectEqual(@as(usize, 2), capture.stream_count);
-    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .sending, .new = .ready } }, capture.stream_events[0]);
-    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .receiving, .new = .reset_received } }, capture.stream_events[1]);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .sending, .new = .open } }, capture.stream_events[0]);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .receiving, .new = .closed } }, capture.stream_events[1]);
+}
+
+test "driver: local unidirectional stream emits only sending-side lifecycle" {
+    const Capture = struct {
+        events: [4]Event = undefined,
+        count: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .stream_state_changed => {
+                    self.events[self.count] = event;
+                    self.count += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+    const id = try pair.server.openStream(.uni);
+
+    try testing.expectEqual(@as(usize, 1), capture.count);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .sending, .new = .open } }, capture.events[0]);
+}
+
+test "driver: peer unidirectional stream emits only receiving-side lifecycle" {
+    const Capture = struct {
+        events: [4]Event = undefined,
+        count: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .stream_state_changed => {
+                    self.events[self.count] = event;
+                    self.count += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+    const id: StreamId = 2;
+    try pair.server.applyFrame(.application, .{ .stream = .{ .id = id, .offset = 0, .data = "x", .fin = false } }, TestPair.server_path, 0, pair.now_us);
+
+    try testing.expectEqual(@as(usize, 1), capture.count);
+    try testing.expectEqual(Event{ .stream_state_changed = .{ .id = id, .side = .receiving, .new = .open } }, capture.events[0]);
 }
 
 test "driver: terminal reset forgets local stream flow blocked state without unblocked event" {

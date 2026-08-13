@@ -142,3 +142,13 @@ The combined JSON shape is:
 Only compare rows from the same output directory. Cross-run comparisons are
 valid only when host load, tool versions, server versions, ulimits, loopback
 metadata, build flags, and run parameters match.
+
+`host.network.udp_buffers` records the host-wide ceilings on per-socket UDP
+buffers (`net.core.rmem_max`/`wmem_max` on Linux, `kern.ipc.maxsockbuf` on
+macOS and the BSDs) alongside whatever `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES`
+/ `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES` asked for. A QUIC run whose receive
+buffer filled shows up as loss in the results, so the limit that bounded it
+belongs next to the numbers it explains — and a request the kernel clamped
+makes two runs incomparable even with identical configuration. The size the
+listener actually got is read back with `getsockopt` and logged by the runtime
+at startup; only the process can see it. See `docs/HTTP3_ROLLOUT.md`.
