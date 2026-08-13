@@ -308,9 +308,12 @@ path it has been reached on:
   ACK_ECN: generated after the acknowledgement, its counters necessarily
   include whatever the acknowledged packet contributed.
 - **An ACK that does not advance the largest acknowledged packet number is
-  ignored entirely** (RFC 9000 §13.4.2.1). Cumulative counters arrive
-  legitimately stale on a reordered ACK, and validating against them would
-  read ordinary reordering as a peer walking its counters backwards.
+  ignored for ECN counter validation** (RFC 9000 §13.4.2.1). Its cumulative
+  counters can legitimately be stale on a reordered ACK, so they cannot fail
+  the path. It can still newly acknowledge a previously missing packet,
+  though: that packet's local metadata is retired immediately, while any
+  marked contribution remains owed until a later advancing ACK_ECN
+  resynchronises the cumulative baseline.
 
 The testing window is armed by the first marked packet rather than by
 enabling, so an idle connection cannot time out a path that was never given a
@@ -341,11 +344,13 @@ checked against what this endpoint actually sent before they are believed:
 | Metadata needed to attribute the counters was dropped | `evidence_lost` |
 | The socket turned out to be unable to set the codepoint | `platform_unsupported` |
 
-Any of these turns marking off for that path and the connection continues
-normally. **CE reports are acted on only on a validated path**, so an
-unvalidated or forged report cannot shrink the congestion window on demand. The
-counters this endpoint reports back come only from packets that passed AEAD
-authentication, so an off-path spoofer cannot inflate what the peer is told.
+Path-local validation failures turn marking off for that path and the
+connection continues normally. `evidence_lost` and `platform_unsupported`
+instead turn ECN off for the whole connection, as described above. **CE
+reports are acted on only on a validated path**, so an unvalidated or forged
+report cannot shrink the congestion window on demand. The counters this
+endpoint reports back come only from packets that passed AEAD authentication,
+so an off-path spoofer cannot inflate what the peer is told.
 
 `ecn_paths_disabled` being non-zero on the open internet is expected and is not
 an error condition.
@@ -369,8 +374,10 @@ an unverified platform runs without ECN rather than guessing. The *receive* side
 gates everything: without received codepoints there is nothing to put in
 ACK_ECN, so the peer's own validation would fail and this endpoint would be
 marking into a feedback loop it cannot close. If the kernel later refuses the
-send-side control message, the listener logs it, stops asking, and each
-connection's validation discovers the marks are not arriving.
+send-side control message, the listener logs it, withdraws send-side ECN for
+future connections, and disables ECN on every live connection so transport
+state and published counters do not continue claiming marks the socket cannot
+place on the wire.
 
 There is nothing to tune on the host — no sysctl gates any of this. Whether ECN
 does anything useful depends on the routers between the endpoints, not on local
