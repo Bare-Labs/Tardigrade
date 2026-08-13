@@ -156,18 +156,21 @@ pub const Controller = struct {
 
     /// Packets sent with `send_codepoint` on this path since marking began.
     marked_sent: u64 = 0,
-    /// `marked_sent` as of the baseline ACK. Everything is judged in deltas
-    /// from there, so counters the peer accumulated for a *different* path — it
-    /// keeps them per packet number space, and a migration does not reset them
-    /// (RFC 9000 §13.4.2) — cannot be mistaken for feedback about this one.
-    marked_at_baseline: u64 = 0,
-    /// The largest counts the peer has reported, or null until the first
-    /// ACK_ECN establishes the baseline.
-    seen: ?Feedback = null,
+    /// The peer's counters as they stood when this path started marking, and
+    /// then the latest successfully validated report.
+    ///
+    /// The baseline is taken at `enable`, **before a single mark goes out**,
+    /// which is what RFC 9000 Appendix A.4 does when it snapshots the packet
+    /// number space's ECN counts as testing starts. Taking it from the first
+    /// ACK_ECN to arrive instead would silently write off every mark already
+    /// in flight: ten marked packets outstanding and a first report
+    /// acknowledging two would leave the other eight unaccounted, and the next
+    /// report that legitimately counted them would look like an over-claim.
+    seen: Feedback = .{ .ect0 = 0, .ect1 = 0, .ce = 0 },
     /// Marked arrivals the peer has reported since the baseline, as ECT(0)+CE.
     /// Compared against what was actually marked, so a peer cannot claim more
     /// marked traffic than it was sent.
-    reported_since_baseline: u64 = 0,
+    reported: u64 = 0,
 
     /// When the testing phase gives up, or null when not testing.
     testing_deadline_us: ?u64 = null,
@@ -192,14 +195,21 @@ pub const Controller = struct {
         return self.state != .disabled;
     }
 
-    /// Start marking on this path and open the testing window. Idempotent, so
-    /// the send path can call it every poll; a path that already failed
-    /// validation stays failed until `reset` (a new path incarnation) rather
-    /// than re-enabling into the same broken route every poll.
-    pub fn enable(self: *Controller, now_us: u64, testing_window_us: u64) void {
+    /// Start marking on this path, taking `baseline` as the peer's counters as
+    /// of right now (RFC 9000 Appendix A.4). Idempotent, so the send path can
+    /// call it every poll; a path that already failed validation stays failed
+    /// until `reset` (a new path incarnation) rather than re-enabling into the
+    /// same broken route every poll.
+    ///
+    /// The testing window is *not* armed here. It is armed by the first marked
+    /// packet actually leaving (`onMarkedSent`), because a connection that is
+    /// simply idle has not tested anything: arming at enable would let three
+    /// PTOs of silence record a permanent `testing_timeout` on a path that was
+    /// never given a chance.
+    pub fn enable(self: *Controller, baseline: Feedback) void {
         if (self.state != .disabled or self.failure != null) return;
         self.state = .testing;
-        self.testing_deadline_us = now_us +| testing_window_us;
+        self.seen = baseline;
     }
 
     /// Stop marking on this path. Used both by validation failures here and by
@@ -210,17 +220,31 @@ pub const Controller = struct {
         self.testing_deadline_us = null;
     }
 
-    /// One datagram went out carrying `send_codepoint` on this path.
-    pub fn onMarkedSent(self: *Controller) void {
+    /// One packet went out carrying `send_codepoint` on this path.
+    ///
+    /// The first one arms the testing window: that is the moment something is
+    /// actually under test, and dating the deadline from `enable` instead
+    /// would time out an idle connection that had not yet sent a thing.
+    pub fn onMarkedSent(self: *Controller, now_us: u64, testing_window_us: u64) void {
+        if (self.state == .testing and self.marked_sent == 0) {
+            self.testing_deadline_us = now_us +| testing_window_us;
+        }
         self.marked_sent +|= 1;
     }
 
     /// Apply one ACK's worth of peer feedback.
     ///
     /// `newly_acked_marked` is how many packets *this ACK newly acknowledged*
-    /// that went out marked — the quantity RFC 9000 §13.4.2.1 requires the
-    /// reported counts to account for. `feedback` is null when the ACK frame
-    /// was a plain ACK rather than an ACK_ECN.
+    /// that went out marked **on this path** — the quantity RFC 9000 §13.4.2.1
+    /// requires the reported counts to account for. `feedback` is null when the
+    /// ACK frame was a plain ACK rather than an ACK_ECN.
+    ///
+    /// The caller must only call this for an ACK that advanced the largest
+    /// acknowledged packet number in the space. RFC 9000 §13.4.2.1 requires
+    /// that an ACK which does not is left alone entirely: the peer's counters
+    /// are cumulative, so a delayed ACK legitimately carries *older* ones, and
+    /// judging those against what has since been reported would read ordinary
+    /// reordering as hostile feedback. `Connection.processAck` owns that gate.
     ///
     /// Every rejection path here ends in `disable`, never in an error: the
     /// worst case for a false positive is a path that runs without ECN, which
@@ -229,9 +253,7 @@ pub const Controller = struct {
         self: *Controller,
         newly_acked_marked: u64,
         feedback: ?Feedback,
-        now_us: u64,
     ) Outcome {
-        _ = now_us;
         if (self.state == .disabled) return .{};
 
         const counts = feedback orelse {
@@ -243,35 +265,28 @@ pub const Controller = struct {
             return self.fail(.missing_counts);
         };
 
-        const baseline = self.seen orelse {
-            // First report on this path: adopt it as the origin rather than
-            // validating against it. The peer's counters are per packet number
-            // space and span every path it has used, so their absolute values
-            // are not a statement about this path — only their growth is.
-            self.seen = counts;
-            self.marked_at_baseline = self.marked_sent;
-            return .{};
-        };
+        // Nothing this endpoint ever sends is ECT(1), so a non-zero report is
+        // impossible for this connection whatever the baseline was. Checked as
+        // an absolute rather than as growth: a baseline adopted from a report
+        // that already contained ECT(1) would otherwise grandfather it in and
+        // let validation succeed on counters known to be rewritten.
+        if (counts.ect1 != 0) return self.fail(.unsent_codepoint);
 
-        if (counts.ect0 < baseline.ect0 or counts.ect1 < baseline.ect1 or counts.ce < baseline.ce) {
+        const baseline = self.seen;
+        if (counts.ect0 < baseline.ect0 or counts.ce < baseline.ce) {
             return self.fail(.counts_regressed);
         }
-        // Nothing this endpoint sends is ECT(1), so any ECT(1) growth means
-        // the codepoint is being rewritten somewhere on the path.
-        if (counts.ect1 > baseline.ect1) return self.fail(.unsent_codepoint);
 
         const ect0_increase = counts.ect0 - baseline.ect0;
         const ce_increase = counts.ce - baseline.ce;
         const marked_increase = ect0_increase +| ce_increase;
 
         // A peer cannot have received more marked packets than were marked.
-        // Checked cumulatively against the marks placed since the baseline, so
-        // it holds across reordered and delayed reports rather than only
-        // within one ACK.
-        const reported = self.reported_since_baseline +| marked_increase;
-        if (reported > self.marked_sent -| self.marked_at_baseline) {
-            return self.fail(.counts_exceed_sent);
-        }
+        // Checked cumulatively against every mark this path has placed — the
+        // baseline was taken before the first of them — so it holds across
+        // reports that arrive in batches rather than only within one ACK.
+        const reported = self.reported +| marked_increase;
+        if (reported > self.marked_sent) return self.fail(.counts_exceed_sent);
 
         // RFC 9000 §13.4.2.1: packets that went out marked and are now
         // acknowledged must show up in the counts. CE counts too — a marked
@@ -281,10 +296,18 @@ pub const Controller = struct {
         }
 
         self.seen = counts;
-        self.reported_since_baseline = reported;
+        self.reported = reported;
 
         var outcome = Outcome{};
-        if (self.state == .testing and marked_increase > 0) {
+        // Promotion needs evidence attributable to *this* path: an ACK that
+        // newly acknowledged a packet this path marked, and counter growth to
+        // go with it. Growth alone is not enough — the peer's counters are
+        // per packet number space and span every path it has been reached on,
+        // so an ACK covering another path's marks would otherwise validate a
+        // route that is quietly stripping every codepoint. The connection's
+        // epoch barrier is what makes this sufficient rather than merely
+        // necessary; see `Connection.syncPathEcn`.
+        if (self.state == .testing and newly_acked_marked > 0 and marked_increase > 0) {
             self.state = .capable;
             self.testing_deadline_us = null;
             outcome.validated = true;
@@ -338,217 +361,280 @@ pub const Controller = struct {
 // where the OS half is unavailable.
 // ---------------------------------------------------------------------------
 
-const testing_alloc = std.testing;
+const testing = std.testing;
 
-fn validatedController(now_us: u64) Controller {
+const no_counts = Feedback{ .ect0 = 0, .ect1 = 0, .ce = 0 };
+
+/// A path whose markings demonstrably survive: enabled from a clean baseline,
+/// two marks sent, both acknowledged and both counted.
+fn validatedController() Controller {
     var controller = Controller{};
-    controller.enable(now_us, 3 * 100_000);
-    // Baseline: the peer's counters already hold traffic from elsewhere.
-    controller.onMarkedSent();
-    _ = controller.onAck(0, .{ .ect0 = 40, .ect1 = 0, .ce = 7 }, now_us);
-    controller.onMarkedSent();
-    controller.onMarkedSent();
-    _ = controller.onAck(2, .{ .ect0 = 42, .ect1 = 0, .ce = 7 }, now_us);
+    controller.enable(no_counts);
+    controller.onMarkedSent(0, 300_000);
+    controller.onMarkedSent(0, 300_000);
+    _ = controller.onAck(2, .{ .ect0 = 2, .ect1 = 0, .ce = 0 });
     return controller;
 }
 
 test "ecn: received codepoints accumulate per space and drive ACK_ECN" {
     var counts = Counts{};
-    try testing_alloc.expect(!counts.any());
+    try testing.expect(!counts.any());
     counts.record(.not_ect);
     counts.record(.unavailable);
     // Neither an unmarked packet nor a receive path that cannot report is a
     // counter, so an ACK for this space is still a plain ACK.
-    try testing_alloc.expect(!counts.any());
+    try testing.expect(!counts.any());
 
     counts.record(.ect0);
     counts.record(.ect0);
     counts.record(.ce);
     counts.record(.ect1);
-    try testing_alloc.expect(counts.any());
-    try testing_alloc.expectEqual(@as(u64, 2), counts.ect0);
-    try testing_alloc.expectEqual(@as(u64, 1), counts.ect1);
-    try testing_alloc.expectEqual(@as(u64, 1), counts.ce);
+    try testing.expect(counts.any());
+    try testing.expectEqual(@as(u64, 2), counts.ect0);
+    try testing.expectEqual(@as(u64, 1), counts.ect1);
+    try testing.expectEqual(@as(u64, 1), counts.ce);
 
     counts.reset();
-    try testing_alloc.expect(!counts.any());
+    try testing.expect(!counts.any());
 }
 
 test "ecn: marking is off until enabled and never marks after failure" {
     var controller = Controller{};
-    try testing_alloc.expectEqual(udp.Ecn.not_ect, controller.sendCodepoint());
-    try testing_alloc.expect(!controller.marking());
+    try testing.expectEqual(udp.Ecn.not_ect, controller.sendCodepoint());
+    try testing.expect(!controller.marking());
 
-    controller.enable(0, 300_000);
-    try testing_alloc.expectEqual(udp.Ecn.ect0, controller.sendCodepoint());
-    try testing_alloc.expectEqual(State.testing, controller.state);
+    controller.enable(no_counts);
+    try testing.expectEqual(udp.Ecn.ect0, controller.sendCodepoint());
+    try testing.expectEqual(State.testing, controller.state);
 
     controller.disable(.missing_counts);
-    try testing_alloc.expectEqual(udp.Ecn.not_ect, controller.sendCodepoint());
+    try testing.expectEqual(udp.Ecn.not_ect, controller.sendCodepoint());
     // Re-enabling into a path already known to break ECN would re-run the
     // whole testing window on every poll and mark traffic that is being
     // dropped or stripped. Only a new path incarnation gets another try.
-    controller.enable(0, 300_000);
-    try testing_alloc.expectEqual(State.disabled, controller.state);
+    controller.enable(no_counts);
+    try testing.expectEqual(State.disabled, controller.state);
     controller.reset();
-    controller.enable(0, 300_000);
-    try testing_alloc.expectEqual(State.testing, controller.state);
+    controller.enable(no_counts);
+    try testing.expectEqual(State.testing, controller.state);
 }
 
-test "ecn: the first report is a baseline, not evidence" {
+test "ecn: the baseline is taken before the first mark, not from the first report" {
+    // The peer's counters already carry traffic from another path — they are
+    // per packet number space and survive migration — so the baseline is that
+    // history, snapshotted as this path starts marking.
     var controller = Controller{};
-    controller.enable(0, 300_000);
-    controller.onMarkedSent();
+    controller.enable(.{ .ect0 = 900, .ect1 = 0, .ce = 3 });
+    try testing.expectEqual(@as(u64, 900), controller.seen.ect0);
 
-    // The peer's counters already carry traffic from another path — its
-    // counts are per packet number space and survive migration. Treating that
-    // history as feedback about this path would validate it on the strength of
-    // packets this path never carried.
-    const first = controller.onAck(1, .{ .ect0 = 900, .ect1 = 0, .ce = 3 }, 1_000);
-    try testing_alloc.expect(!first.validated);
-    try testing_alloc.expectEqual(State.testing, controller.state);
-    try testing_alloc.expectEqual(@as(u64, 1), controller.marked_at_baseline);
+    controller.onMarkedSent(0, 300_000);
+    const first = controller.onAck(1, .{ .ect0 = 901, .ect1 = 0, .ce = 3 });
+    // Growth from that origin validates immediately: there is no wasted round
+    // trip spent adopting a baseline that was already known.
+    try testing.expect(first.validated);
+    try testing.expectEqual(State.capable, controller.state);
+}
 
-    // Growth from that origin is what counts.
-    controller.onMarkedSent();
-    const second = controller.onAck(1, .{ .ect0 = 901, .ect1 = 0, .ce = 3 }, 2_000);
-    try testing_alloc.expect(second.validated);
-    try testing_alloc.expectEqual(State.capable, controller.state);
+test "ecn: marks outstanding before the first report are still accounted for" {
+    // The regression behind taking the baseline at `enable`. Ten marked
+    // packets go out; the first ACK_ECN acknowledges only two of them.
+    var controller = Controller{};
+    controller.enable(no_counts);
+    var sent: usize = 0;
+    while (sent < 10) : (sent += 1) controller.onMarkedSent(0, 300_000);
+
+    const first = controller.onAck(2, .{ .ect0 = 2, .ect1 = 0, .ce = 0 });
+    try testing.expect(first.validated);
+    try testing.expectEqual(@as(?FailureReason, null), first.failed);
+
+    // The remaining eight are acknowledged in later batches, with no further
+    // sends. A baseline adopted from that first report would have written the
+    // eight off as never sent, and this honest growth would read as an
+    // over-claim — disabling ECN on a path that is working perfectly.
+    const second = controller.onAck(3, .{ .ect0 = 5, .ect1 = 0, .ce = 0 });
+    try testing.expectEqual(@as(?FailureReason, null), second.failed);
+    const third = controller.onAck(5, .{ .ect0 = 10, .ect1 = 0, .ce = 0 });
+    try testing.expectEqual(@as(?FailureReason, null), third.failed);
+    try testing.expectEqual(State.capable, controller.state);
+    try testing.expectEqual(@as(u64, 10), controller.reported);
+}
+
+test "ecn: a first report containing ECT(1) is rejected, not adopted" {
+    // This endpoint never sends ECT(1) at all, so the check is on the absolute
+    // value rather than on growth. Adopting a non-zero ECT(1) as the baseline
+    // would grandfather in counters already known to be rewritten, and every
+    // later report could then validate the path as long as ECT(1) held still.
+    var controller = Controller{};
+    controller.enable(no_counts);
+    controller.onMarkedSent(0, 300_000);
+    const outcome = controller.onAck(1, .{ .ect0 = 1, .ect1 = 4, .ce = 0 });
+    try testing.expectEqual(@as(?FailureReason, .unsent_codepoint), outcome.failed);
+    try testing.expectEqual(State.disabled, controller.state);
 }
 
 test "ecn: an ACK without counts for marked packets disables ECN" {
     var controller = Controller{};
-    controller.enable(0, 300_000);
-    controller.onMarkedSent();
+    controller.enable(no_counts);
+    controller.onMarkedSent(0, 300_000);
 
     // An ACK that acknowledges nothing we marked is not evidence either way.
-    const unrelated = controller.onAck(0, null, 1_000);
-    try testing_alloc.expectEqual(@as(?FailureReason, null), unrelated.failed);
-    try testing_alloc.expectEqual(State.testing, controller.state);
+    const unrelated = controller.onAck(0, null);
+    try testing.expectEqual(@as(?FailureReason, null), unrelated.failed);
+    try testing.expectEqual(State.testing, controller.state);
 
-    const stripped = controller.onAck(1, null, 2_000);
-    try testing_alloc.expectEqual(@as(?FailureReason, .missing_counts), stripped.failed);
-    try testing_alloc.expectEqual(State.disabled, controller.state);
-    try testing_alloc.expectEqual(udp.Ecn.not_ect, controller.sendCodepoint());
+    const stripped = controller.onAck(1, null);
+    try testing.expectEqual(@as(?FailureReason, .missing_counts), stripped.failed);
+    try testing.expectEqual(State.disabled, controller.state);
+    try testing.expectEqual(udp.Ecn.not_ect, controller.sendCodepoint());
+}
+
+test "ecn: promotion requires an acknowledgement of this path's own mark" {
+    // Counter growth alone must not validate: the counters are per packet
+    // number space and span every path the peer has been reached on, so growth
+    // with nothing of this path's acknowledged is somebody else's evidence.
+    var controller = Controller{};
+    controller.enable(no_counts);
+    controller.onMarkedSent(0, 300_000);
+    controller.onMarkedSent(0, 300_000);
+
+    // Growth arrives, but this ACK acknowledged none of this path's marks.
+    // Whatever produced that growth, it was not evidence about this route.
+    const foreign = controller.onAck(0, .{ .ect0 = 1, .ect1 = 0, .ce = 0 });
+    try testing.expect(!foreign.validated);
+    try testing.expectEqual(State.testing, controller.state);
+    try testing.expectEqual(@as(u64, 0), foreign.ce_increase);
+
+    // Growth *and* one of this path's own marks acknowledged: evidence at
+    // last.
+    const own = controller.onAck(1, .{ .ect0 = 2, .ect1 = 0, .ce = 0 });
+    try testing.expect(own.validated);
+    try testing.expectEqual(State.capable, controller.state);
 }
 
 test "ecn: CE reports reach congestion control only once validated" {
     var controller = Controller{};
-    controller.enable(0, 300_000);
-    controller.onMarkedSent();
-    _ = controller.onAck(0, .{ .ect0 = 0, .ect1 = 0, .ce = 0 }, 1_000);
+    controller.enable(no_counts);
+    controller.onMarkedSent(0, 300_000);
 
-    // Still `.testing`: a CE report here is unvalidated, and RFC 9000 §13.4.2
-    // is explicit that unvalidated feedback is forgeable. It promotes the path
-    // (a mark demonstrably survived) but must not double as a congestion
-    // signal on the strength of its own arrival.
-    controller.onMarkedSent();
-    const promoting = controller.onAck(1, .{ .ect0 = 0, .ect1 = 0, .ce = 1 }, 2_000);
-    try testing_alloc.expect(promoting.validated);
-    try testing_alloc.expectEqual(@as(u64, 1), promoting.ce_increase);
-    try testing_alloc.expectEqual(State.capable, controller.state);
+    // The promoting ACK: a mark demonstrably survived, and it arrived CE.
+    const promoting = controller.onAck(1, .{ .ect0 = 0, .ect1 = 0, .ce = 1 });
+    try testing.expect(promoting.validated);
+    try testing.expectEqual(@as(u64, 1), promoting.ce_increase);
+    try testing.expectEqual(State.capable, controller.state);
 
-    controller.onMarkedSent();
-    const congested = controller.onAck(1, .{ .ect0 = 0, .ect1 = 0, .ce = 2 }, 3_000);
-    try testing_alloc.expectEqual(@as(u64, 1), congested.ce_increase);
-    try testing_alloc.expectEqual(@as(u64, 2), controller.ce_observed);
+    controller.onMarkedSent(0, 300_000);
+    const congested = controller.onAck(1, .{ .ect0 = 0, .ect1 = 0, .ce = 2 });
+    try testing.expectEqual(@as(u64, 1), congested.ce_increase);
+    try testing.expectEqual(@as(u64, 2), controller.ce_observed);
 }
 
 test "ecn: counts that go backwards disable ECN" {
-    var controller = validatedController(0);
-    controller.onMarkedSent();
-    const outcome = controller.onAck(1, .{ .ect0 = 41, .ect1 = 0, .ce = 7 }, 5_000);
-    try testing_alloc.expectEqual(@as(?FailureReason, .counts_regressed), outcome.failed);
-    try testing_alloc.expectEqual(@as(u64, 0), outcome.ce_increase);
+    var controller = validatedController();
+    controller.onMarkedSent(0, 300_000);
+    const outcome = controller.onAck(1, .{ .ect0 = 1, .ect1 = 0, .ce = 0 });
+    try testing.expectEqual(@as(?FailureReason, .counts_regressed), outcome.failed);
+    try testing.expectEqual(@as(u64, 0), outcome.ce_increase);
 }
 
 test "ecn: a reported ECT(1) this endpoint never sends disables ECN" {
-    var controller = validatedController(0);
-    controller.onMarkedSent();
+    var controller = validatedController();
+    controller.onMarkedSent(0, 300_000);
     // Something on the path rewrote ECT(0) to ECT(1). The counts are no longer
     // describing what was sent, so nothing derived from them can be believed.
-    const outcome = controller.onAck(1, .{ .ect0 = 43, .ect1 = 1, .ce = 7 }, 5_000);
-    try testing_alloc.expectEqual(@as(?FailureReason, .unsent_codepoint), outcome.failed);
+    const outcome = controller.onAck(1, .{ .ect0 = 3, .ect1 = 1, .ce = 0 });
+    try testing.expectEqual(@as(?FailureReason, .unsent_codepoint), outcome.failed);
 }
 
 test "ecn: a peer cannot report more marked arrivals than were marked" {
-    var controller = validatedController(0);
-    controller.onMarkedSent();
-    // Three packets have been marked since the baseline. A report of twelve
-    // marked arrivals is arithmetic that cannot describe this connection —
-    // the classic way a forged or confused ACK_ECN would try to manufacture
-    // congestion signals.
-    const outcome = controller.onAck(1, .{ .ect0 = 52, .ect1 = 0, .ce = 7 }, 5_000);
-    try testing_alloc.expectEqual(@as(?FailureReason, .counts_exceed_sent), outcome.failed);
-    try testing_alloc.expectEqual(@as(u64, 0), outcome.ce_increase);
+    var controller = validatedController();
+    controller.onMarkedSent(0, 300_000);
+    // Three marked packets in total, and a report of twelve marked arrivals:
+    // arithmetic that cannot describe this connection, and the classic way a
+    // forged or confused ACK_ECN would try to manufacture congestion signals.
+    const outcome = controller.onAck(1, .{ .ect0 = 12, .ect1 = 0, .ce = 0 });
+    try testing.expectEqual(@as(?FailureReason, .counts_exceed_sent), outcome.failed);
+    try testing.expectEqual(@as(u64, 0), outcome.ce_increase);
 }
 
 test "ecn: marks cleared in flight disable ECN" {
     var controller = Controller{};
-    controller.enable(0, 300_000);
-    controller.onMarkedSent();
-    _ = controller.onAck(0, .{ .ect0 = 0, .ect1 = 0, .ce = 0 }, 1_000);
+    controller.enable(no_counts);
 
     // Four marked packets acknowledged, and the peer saw none of them marked:
     // a middlebox is clearing the codepoint (RFC 9000 §13.4.2.1).
-    controller.onMarkedSent();
-    controller.onMarkedSent();
-    controller.onMarkedSent();
-    controller.onMarkedSent();
-    const outcome = controller.onAck(4, .{ .ect0 = 0, .ect1 = 0, .ce = 0 }, 2_000);
-    try testing_alloc.expectEqual(@as(?FailureReason, .insufficient_increase), outcome.failed);
-    try testing_alloc.expectEqual(State.disabled, controller.state);
+    var sent: usize = 0;
+    while (sent < 4) : (sent += 1) controller.onMarkedSent(0, 300_000);
+    const outcome = controller.onAck(4, no_counts);
+    try testing.expectEqual(@as(?FailureReason, .insufficient_increase), outcome.failed);
+    try testing.expectEqual(State.disabled, controller.state);
 }
 
 test "ecn: a CE-marked delivery still accounts for its packet" {
     var controller = Controller{};
-    controller.enable(0, 300_000);
-    controller.onMarkedSent();
-    _ = controller.onAck(0, .{ .ect0 = 0, .ect1 = 0, .ce = 0 }, 1_000);
+    controller.enable(no_counts);
+    controller.onMarkedSent(0, 300_000);
+    controller.onMarkedSent(0, 300_000);
 
     // Two marked packets acknowledged; one arrived ECT(0), the other met
     // congestion and arrived CE. The ECT(0) count alone is short of the two
     // acknowledged, so validation must count CE as well or every congested
     // path would look like a broken one.
-    controller.onMarkedSent();
-    controller.onMarkedSent();
-    const outcome = controller.onAck(2, .{ .ect0 = 1, .ect1 = 0, .ce = 1 }, 2_000);
-    try testing_alloc.expectEqual(@as(?FailureReason, null), outcome.failed);
-    try testing_alloc.expect(outcome.validated);
-    try testing_alloc.expectEqual(@as(u64, 1), outcome.ce_increase);
+    const outcome = controller.onAck(2, .{ .ect0 = 1, .ect1 = 0, .ce = 1 });
+    try testing.expectEqual(@as(?FailureReason, null), outcome.failed);
+    try testing.expect(outcome.validated);
+    try testing.expectEqual(@as(u64, 1), outcome.ce_increase);
+}
+
+test "ecn: the testing window is armed by the first mark, not by enabling" {
+    // A handshake-confirmed connection can sit idle. Arming at `enable` would
+    // let three PTOs of silence record a permanent `testing_timeout` on a path
+    // that was never given a chance to carry a single marked packet.
+    var controller = Controller{};
+    controller.enable(no_counts);
+    try testing.expectEqual(@as(?u64, null), controller.deadlineUs());
+    try testing.expectEqual(@as(?FailureReason, null), controller.onTimeout(10_000_000));
+    try testing.expectEqual(State.testing, controller.state);
+
+    // The first mark starts the clock, dated from when it actually went out.
+    controller.onMarkedSent(10_000_000, 300_000);
+    try testing.expectEqual(@as(?u64, 10_300_000), controller.deadlineUs());
+    // Later marks do not push the deadline out, or a busy path that strips
+    // every codepoint would never stop being tested.
+    controller.onMarkedSent(10_200_000, 300_000);
+    try testing.expectEqual(@as(?u64, 10_300_000), controller.deadlineUs());
 }
 
 test "ecn: the testing window closes on silence" {
     var controller = Controller{};
-    controller.enable(1_000, 300_000);
-    controller.onMarkedSent();
-    try testing_alloc.expectEqual(@as(?u64, 301_000), controller.deadlineUs());
+    controller.enable(no_counts);
+    controller.onMarkedSent(1_000, 300_000);
+    try testing.expectEqual(@as(?u64, 301_000), controller.deadlineUs());
 
-    try testing_alloc.expectEqual(@as(?FailureReason, null), controller.onTimeout(300_999));
-    try testing_alloc.expectEqual(State.testing, controller.state);
+    try testing.expectEqual(@as(?FailureReason, null), controller.onTimeout(300_999));
+    try testing.expectEqual(State.testing, controller.state);
 
-    try testing_alloc.expectEqual(@as(?FailureReason, .testing_timeout), controller.onTimeout(301_000));
-    try testing_alloc.expectEqual(State.disabled, controller.state);
-    try testing_alloc.expectEqual(@as(?u64, null), controller.deadlineUs());
+    try testing.expectEqual(@as(?FailureReason, .testing_timeout), controller.onTimeout(301_000));
+    try testing.expectEqual(State.disabled, controller.state);
+    try testing.expectEqual(@as(?u64, null), controller.deadlineUs());
     // Idempotent: a later timeout on a path that already gave up is silent.
-    try testing_alloc.expectEqual(@as(?FailureReason, null), controller.onTimeout(999_999));
+    try testing.expectEqual(@as(?FailureReason, null), controller.onTimeout(999_999));
 }
 
 test "ecn: validation clears the testing deadline" {
-    var controller = validatedController(0);
-    try testing_alloc.expectEqual(State.capable, controller.state);
-    try testing_alloc.expectEqual(@as(?u64, null), controller.deadlineUs());
+    var controller = validatedController();
+    try testing.expectEqual(State.capable, controller.state);
+    try testing.expectEqual(@as(?u64, null), controller.deadlineUs());
     // A validated path is never retired by the testing timer.
-    try testing_alloc.expectEqual(@as(?FailureReason, null), controller.onTimeout(std.math.maxInt(u64)));
-    try testing_alloc.expectEqual(State.capable, controller.state);
+    try testing.expectEqual(@as(?FailureReason, null), controller.onTimeout(std.math.maxInt(u64)));
+    try testing.expectEqual(State.capable, controller.state);
 }
 
 test "ecn: a disabled controller ignores feedback entirely" {
     var controller = Controller{};
     // Nothing enabled marking, so nothing was marked, so no report about this
     // path can mean anything — including one claiming congestion.
-    const outcome = controller.onAck(5, .{ .ect0 = 5, .ect1 = 0, .ce = 5 }, 1_000);
-    try testing_alloc.expectEqual(@as(u64, 0), outcome.ce_increase);
-    try testing_alloc.expectEqual(@as(?FailureReason, null), outcome.failed);
-    try testing_alloc.expectEqual(State.disabled, controller.state);
+    const outcome = controller.onAck(5, .{ .ect0 = 5, .ect1 = 0, .ce = 5 });
+    try testing.expectEqual(@as(u64, 0), outcome.ce_increase);
+    try testing.expectEqual(@as(?FailureReason, null), outcome.failed);
+    try testing.expectEqual(State.disabled, controller.state);
 }

@@ -269,6 +269,30 @@ Whether ECN survives end to end is a property of the route, so a migration
 re-validates rather than inheriting an answer measured somewhere else. A path
 that failed validation stays unmarked for the life of that path incarnation.
 
+Three details make that per-path story hold, because the peer's counters are
+*not* per path — they are cumulative per packet number space and span every
+path it has been reached on:
+
+- **The baseline is snapshotted when a path starts marking**, before its first
+  marked packet goes out (RFC 9000 Appendix A.4), so every mark it places is
+  accounted for. Adopting the first report that happens to arrive would write
+  off whatever was already in flight, and the next honest report covering
+  those packets would look like an over-claim.
+- **A migration waits for the previous path's marks to drain** before the new
+  one starts testing. Otherwise the old path's intact marks would validate a
+  new path that is stripping every codepoint, and the old path's CE reports
+  would halve the new path's window for congestion that is no longer on the
+  route. Promotion additionally requires an acknowledgement of a packet the
+  new path itself marked.
+- **An ACK that does not advance the largest acknowledged packet number is
+  ignored entirely** (RFC 9000 §13.4.2.1). Cumulative counters arrive
+  legitimately stale on a reordered ACK, and validating against them would
+  read ordinary reordering as a peer walking its counters backwards.
+
+The testing window is armed by the first marked packet rather than by
+enabling, so an idle connection cannot time out a path that was never given a
+chance to carry one.
+
 Validation is not a formality. The peer's counters are an *input to congestion
 control*, reachable by anything on the path and by the peer itself, so they are
 checked against what this endpoint actually sent before they are believed:

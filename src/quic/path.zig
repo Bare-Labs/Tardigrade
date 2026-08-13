@@ -1986,11 +1986,9 @@ test "ECN state is per path incarnation and is never inherited across migration 
     const handshake_ref = manager.activePathRef();
 
     // The handshake path validated ECN: markings survive it end to end.
-    manager.activeEcn().enable(0, 300_000);
-    manager.activeEcn().onMarkedSent();
-    _ = manager.activeEcn().onAck(0, .{ .ect0 = 0, .ect1 = 0, .ce = 0 }, 0);
-    manager.activeEcn().onMarkedSent();
-    _ = manager.activeEcn().onAck(1, .{ .ect0 = 1, .ect1 = 0, .ce = 0 }, 0);
+    manager.activeEcn().enable(.{ .ect0 = 0, .ect1 = 0, .ce = 0 });
+    manager.activeEcn().onMarkedSent(0, 300_000);
+    _ = manager.activeEcn().onAck(1, .{ .ect0 = 1, .ect1 = 0, .ce = 0 });
     try testing.expectEqual(ecn_mod.State.capable, manager.activePath().ecn.state);
 
     // Migrate to a different host. Whether ECN survives is a property of the
