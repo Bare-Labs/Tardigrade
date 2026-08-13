@@ -5,6 +5,32 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- **Explicit Congestion Notification for HTTP/3 (#256-E)** — the QUIC listener
+  now marks outbound datagrams ECT(0), counts the codepoints on received
+  packets, reports them to peers in ACK_ECN, and validates the counters peers
+  report back. A congested router can mark a packet instead of dropping it, so
+  congestion control reacts a round trip earlier and without a retransmission.
+
+  ECN is validated per network path and only after the handshake is confirmed;
+  a migration re-validates rather than inheriting an answer measured elsewhere.
+  Because the peer's counters are an input to congestion control and reachable
+  by anything on the path, they are checked against what was actually sent —
+  counters that regress, exceed what was marked, report a codepoint this
+  endpoint never sends, or fail to grow when marked packets are acknowledged
+  all turn marking off for that path. CE reports drive congestion response only
+  on a validated path, and the counters reported back come only from packets
+  that passed AEAD authentication, so an off-path spoofer cannot inflate them.
+  Every failure ends in ordinary non-ECN operation, never a connection error —
+  which is the common outcome on the open internet, where a great deal of
+  deployed gear clears or rewrites the field.
+
+  Platform support is gated on verified per-OS socket constants (Linux, Darwin,
+  FreeBSD); anywhere else the listener simply runs without ECN.
+  `TARDIGRADE_HTTP3_ECN` (default `true`) disables it outright, for hosts where
+  a middlebox drops marked traffic rather than clearing the marks — the one
+  failure mode per-path validation cannot see. The runtime status snapshot
+  publishes whether marking is actually running along with marked-sent,
+  validated-path, disabled-path, and CE counts. See `docs/HTTP3_ROLLOUT.md`.
 - **Tunable UDP socket buffers for the HTTP/3 listener (#256-D)** —
   `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES` and
   `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES` request `SO_RCVBUF`/`SO_SNDBUF` on
