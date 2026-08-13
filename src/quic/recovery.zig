@@ -303,6 +303,28 @@ pub const PacketTracker = struct {
         }
     };
 
+    const AckedSendTimeRange = struct {
+        start_us: u64 = 0,
+        end_us: u64 = 0,
+
+        fn fromSendTime(time_sent_us: u64) AckedSendTimeRange {
+            return .{ .start_us = time_sent_us, .end_us = time_sent_us };
+        }
+
+        fn canMerge(self: AckedSendTimeRange, other: AckedSendTimeRange) bool {
+            return self.start_us <= other.end_us +| 1 and other.start_us <= self.end_us +| 1;
+        }
+
+        fn merge(self: *AckedSendTimeRange, other: AckedSendTimeRange) void {
+            self.start_us = @min(self.start_us, other.start_us);
+            self.end_us = @max(self.end_us, other.end_us);
+        }
+
+        fn intersects(self: AckedSendTimeRange, candidate: PersistentCandidate) bool {
+            return self.end_us >= candidate.start_us and self.start_us <= candidate.end_us;
+        }
+    };
+
     /// Fixed fast path. Ordinary traffic is bounded here and never consumes
     /// allocator-backed overflow.
     packets: [max_tracked_packets]SentPacket = undefined,
@@ -321,15 +343,8 @@ pub const PacketTracker = struct {
     /// are pruned by relevance rather than retained for the lifetime of the
     /// connection, so `max_tracked_packets` is a storage bound, not an ACK-count
     /// lifetime limit.
-    acked_send_times: [3][max_tracked_packets]u64 = [_][max_tracked_packets]u64{[_]u64{0} ** max_tracked_packets} ** 3,
-    acked_send_time_counts: [3]usize = .{0} ** 3,
-    /// If the exact array is temporarily saturated by ACKs that are all still
-    /// relevant, retain the uncertain send-time extent instead of dropping the
-    /// evidence. Intersecting candidates are conservatively split until their
-    /// start advances beyond this extent; unlike the old permanent boolean,
-    /// this uncertainty expires as soon as it is no longer relevant.
-    acked_send_times_overflow_min_us: [3]?u64 = .{ null, null, null },
-    acked_send_times_overflow_max_us: [3]?u64 = .{ null, null, null },
+    acked_send_time_ranges: [3][max_tracked_packets]AckedSendTimeRange = [_][max_tracked_packets]AckedSendTimeRange{[_]AckedSendTimeRange{.{}} ** max_tracked_packets} ** 3,
+    acked_send_time_range_counts: [3]usize = .{0} ** 3,
 
     pub fn deinit(self: *PacketTracker, allocator: std.mem.Allocator) void {
         self.recovery_overflow.deinit(allocator);
@@ -462,18 +477,43 @@ pub const PacketTracker = struct {
     }
 
     fn noteAckedSendTime(self: *PacketTracker, space: PacketNumberSpace, time_sent_us: u64) void {
+        self.pruneAckedSendTimes(space);
+        self.insertAckedSendTimeRange(space, .fromSendTime(time_sent_us));
+        self.pruneAckedSendTimes(space);
+    }
+
+    fn insertAckedSendTimeRange(self: *PacketTracker, space: PacketNumberSpace, range: AckedSendTimeRange) void {
         const idx = spaceIndex(space);
-        self.pruneAckedSendTimes(space);
-        if (self.acked_send_time_counts[idx] < self.acked_send_times[idx].len) {
-            self.acked_send_times[idx][self.acked_send_time_counts[idx]] = time_sent_us;
-            self.acked_send_time_counts[idx] += 1;
-        } else {
-            const min = self.acked_send_times_overflow_min_us[idx];
-            const max = self.acked_send_times_overflow_max_us[idx];
-            self.acked_send_times_overflow_min_us[idx] = if (min) |value| @min(value, time_sent_us) else time_sent_us;
-            self.acked_send_times_overflow_max_us[idx] = if (max) |value| @max(value, time_sent_us) else time_sent_us;
+        var merged = range;
+        var index: usize = 0;
+        while (index < self.acked_send_time_range_counts[idx]) {
+            if (!self.acked_send_time_ranges[idx][index].canMerge(merged)) {
+                index += 1;
+                continue;
+            }
+            merged.merge(self.acked_send_time_ranges[idx][index]);
+            self.removeAckedSendTimeRangeAt(idx, index);
         }
-        self.pruneAckedSendTimes(space);
+
+        std.debug.assert(self.acked_send_time_range_counts[idx] < self.acked_send_time_ranges[idx].len);
+        index = 0;
+        while (index < self.acked_send_time_range_counts[idx] and self.acked_send_time_ranges[idx][index].start_us < merged.start_us) : (index += 1) {}
+        std.mem.copyBackwards(
+            AckedSendTimeRange,
+            self.acked_send_time_ranges[idx][index + 1 .. self.acked_send_time_range_counts[idx] + 1],
+            self.acked_send_time_ranges[idx][index..self.acked_send_time_range_counts[idx]],
+        );
+        self.acked_send_time_ranges[idx][index] = merged;
+        self.acked_send_time_range_counts[idx] += 1;
+    }
+
+    fn removeAckedSendTimeRangeAt(self: *PacketTracker, idx: usize, index: usize) void {
+        std.mem.copyForwards(
+            AckedSendTimeRange,
+            self.acked_send_time_ranges[idx][index .. self.acked_send_time_range_counts[idx] - 1],
+            self.acked_send_time_ranges[idx][index + 1 .. self.acked_send_time_range_counts[idx]],
+        );
+        self.acked_send_time_range_counts[idx] -= 1;
     }
 
     fn earliestTrackedSendTime(self: *const PacketTracker, space: PacketNumberSpace) ?u64 {
@@ -498,39 +538,27 @@ pub const PacketTracker = struct {
     fn pruneAckedSendTimes(self: *PacketTracker, space: PacketNumberSpace) void {
         const idx = spaceIndex(space);
         const floor = self.ackEvidenceFloor(space) orelse {
-            self.acked_send_time_counts[idx] = 0;
-            self.acked_send_times_overflow_min_us[idx] = null;
-            self.acked_send_times_overflow_max_us[idx] = null;
+            self.acked_send_time_range_counts[idx] = 0;
             return;
         };
 
         var write_index: usize = 0;
-        for (self.acked_send_times[idx][0..self.acked_send_time_counts[idx]]) |time_sent_us| {
-            if (time_sent_us < floor) continue;
-            self.acked_send_times[idx][write_index] = time_sent_us;
+        for (self.acked_send_time_ranges[idx][0..self.acked_send_time_range_counts[idx]]) |range| {
+            if (range.end_us < floor) continue;
+            self.acked_send_time_ranges[idx][write_index] = .{
+                .start_us = @max(range.start_us, floor),
+                .end_us = range.end_us,
+            };
             write_index += 1;
         }
-        self.acked_send_time_counts[idx] = write_index;
-
-        if (self.acked_send_times_overflow_max_us[idx]) |overflow_max| {
-            if (overflow_max < floor) {
-                self.acked_send_times_overflow_min_us[idx] = null;
-                self.acked_send_times_overflow_max_us[idx] = null;
-            } else if (self.acked_send_times_overflow_min_us[idx]) |overflow_min| {
-                if (overflow_min < floor) self.acked_send_times_overflow_min_us[idx] = floor;
-            }
-        }
+        self.acked_send_time_range_counts[idx] = write_index;
     }
 
     fn hasAckedSendTimeInCandidate(self: *const PacketTracker, space: PacketNumberSpace, candidate: PersistentCandidate) bool {
         if (!candidate.active) return false;
         const idx = spaceIndex(space);
-        for (self.acked_send_times[idx][0..self.acked_send_time_counts[idx]]) |time_sent_us| {
-            if (time_sent_us >= candidate.start_us and time_sent_us <= candidate.end_us) return true;
-        }
-        if (self.acked_send_times_overflow_min_us[idx]) |overflow_min| {
-            const overflow_max = self.acked_send_times_overflow_max_us[idx].?;
-            if (overflow_max >= candidate.start_us and overflow_min <= candidate.end_us) return true;
+        for (self.acked_send_time_ranges[idx][0..self.acked_send_time_range_counts[idx]]) |range| {
+            if (range.intersects(candidate)) return true;
         }
         return false;
     }
@@ -634,9 +662,7 @@ pub const PacketTracker = struct {
         const idx = spaceIndex(space);
         self.largest_acked[idx] = null;
         self.persistent_candidates[idx].reset();
-        self.acked_send_time_counts[idx] = 0;
-        self.acked_send_times_overflow_min_us[idx] = null;
-        self.acked_send_times_overflow_max_us[idx] = null;
+        self.acked_send_time_range_counts[idx] = 0;
         return removed;
     }
 
@@ -1212,8 +1238,7 @@ test "persistent congestion remains detectable after more than tracker-capacity 
         });
         _ = tracker.onAcked(.application, pn, pn + 1);
     }
-    try testing.expectEqual(@as(usize, 0), tracker.acked_send_time_counts[spaceIndex(.application)]);
-    try testing.expect(tracker.acked_send_times_overflow_min_us[spaceIndex(.application)] == null);
+    try testing.expectEqual(@as(usize, 0), tracker.acked_send_time_range_counts[spaceIndex(.application)]);
 
     const base: u64 = 10_000_000;
     try tracker.onPacketSent(.{ .space = .application, .packet_number = pn, .time_sent_us = base, .size = 100, .rtt_sample_available_at_send = true });
@@ -1223,6 +1248,39 @@ test "persistent congestion remains detectable after more than tracker-capacity 
 
     const loss = tracker.detectLost(.application, base + duration * 2, rtt);
     try testing.expect(loss.persistent_congestion);
+}
+
+test "persistent congestion ACK ranges preserve gaps across tracker-capacity ACKs" {
+    var tracker = PacketTracker{};
+    var rtt = RttEstimator.init(0);
+    rtt.update(100_000, 0);
+    const duration = PacketTracker.persistentCongestionDuration(rtt).?;
+    const a: u64 = 1_000;
+    const b = a + duration;
+    const c = b + duration;
+
+    tracker.observePersistentCandidate(.application, .{ .space = .application, .packet_number = 1, .time_sent_us = a, .size = 100, .rtt_sample_available_at_send = true });
+
+    var offset: u64 = 1;
+    while (offset <= 80) : (offset += 1) {
+        tracker.noteAckedSendTime(.application, a + offset);
+    }
+    offset = 1;
+    while (offset <= 80) : (offset += 1) {
+        tracker.noteAckedSendTime(.application, c + offset);
+    }
+    try testing.expectEqual(@as(usize, 2), tracker.acked_send_time_range_counts[spaceIndex(.application)]);
+
+    tracker.observePersistentCandidate(.application, .{ .space = .application, .packet_number = 2, .time_sent_us = b, .size = 100, .rtt_sample_available_at_send = true });
+    try testing.expectEqual(@as(usize, 1), tracker.acked_send_time_range_counts[spaceIndex(.application)]);
+
+    tracker.observePersistentCandidate(.application, .{ .space = .application, .packet_number = 3, .time_sent_us = c, .size = 100, .rtt_sample_available_at_send = true });
+    const candidate = tracker.persistent_candidates[spaceIndex(.application)];
+    try testing.expect(candidate.active);
+    try testing.expectEqual(b, candidate.start_us);
+    try testing.expectEqual(c, candidate.end_us);
+    try testing.expect(!tracker.hasAckedSendTimeInCandidate(.application, candidate));
+    try testing.expect(candidate.end_us - candidate.start_us >= duration);
 }
 
 test "discarding Initial state clears persistent-congestion bookkeeping for Retry" {
@@ -1242,9 +1300,7 @@ test "discarding Initial state clears persistent-congestion bookkeeping for Retr
     _ = controller.onKeysDiscarded(.initial);
     try testing.expect(controller.tracker.largest_acked[idx] == null);
     try testing.expect(!controller.tracker.persistent_candidates[idx].active);
-    try testing.expectEqual(@as(usize, 0), controller.tracker.acked_send_time_counts[idx]);
-    try testing.expect(controller.tracker.acked_send_times_overflow_min_us[idx] == null);
-    try testing.expect(controller.tracker.acked_send_times_overflow_max_us[idx] == null);
+    try testing.expectEqual(@as(usize, 0), controller.tracker.acked_send_time_range_counts[idx]);
 
     // Retry restarts the Initial packet number space. The replacement flight
     // must build a fresh loss episode rather than inheriting any old boundary
