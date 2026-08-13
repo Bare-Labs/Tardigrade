@@ -1344,9 +1344,17 @@ test "persistent congestion ACK barriers spill beyond fixed tracker capacity" {
         .rtt_sample_available_at_send = true,
     });
 
-    var index: u64 = 1;
-    while (index <= max_tracked_packets + 1) : (index += 1) {
-        tracker.noteAckedSendTime(.application, index * 10);
+    var pn: u64 = 2;
+    while (pn <= max_tracked_packets + 2) : (pn += 1) {
+        const sent_at = pn * 10;
+        try tracker.onPacketSent(.{
+            .space = .application,
+            .packet_number = pn,
+            .time_sent_us = sent_at,
+            .size = 100,
+            .rtt_sample_available_at_send = true,
+        });
+        _ = tracker.onAcked(.application, pn, sent_at + 1);
     }
 
     const space_idx = spaceIndex(.application);
@@ -1356,7 +1364,7 @@ test "persistent congestion ACK barriers spill beyond fixed tracker capacity" {
     try testing.expect(tracker.hasAckedSendTimeInCandidate(.application, .{
         .active = true,
         .start_us = candidate.start_us,
-        .end_us = (max_tracked_packets + 1) * 10,
+        .end_us = (max_tracked_packets + 2) * 10,
         .boundaries_have_prior_rtt = true,
     }));
 }
