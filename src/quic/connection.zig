@@ -1987,7 +1987,6 @@ pub const Connection = struct {
     }
 
     fn processAck(self: *Connection, space: PacketNumberSpace, ack: frame.Ack, now_us: u64) void {
-        self.recovery.tracker.setAckBarrierAllocator(self.allocator);
         const exponent: u6 = if (self.adapter.peerTransportParameters()) |peer|
             @intCast(@min(peer.ack_delay_exponent, 20))
         else
@@ -2023,7 +2022,11 @@ pub const Connection = struct {
                 index += 1;
                 continue;
             }
-            if (self.recovery.tracker.onAcked(space, record.packet_number, now_us)) |acked| {
+            const maybe_acked = self.recovery.tracker.onAcked(space, record.packet_number, now_us) catch {
+                self.startClose(.{ .error_code = error_internal, .is_application = false, .local = true }, "ack barrier capacity", now_us);
+                return;
+            };
+            if (maybe_acked) |acked| {
                 acked_count += 1;
                 self.events.emit(.{ .packets_acked = .{ .space = space, .packet_number = record.packet_number } });
                 const before_congestion = self.congestionState();
