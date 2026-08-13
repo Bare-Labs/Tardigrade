@@ -5,7 +5,7 @@ Hot-reloads configuration without dropping in-flight requests and drains connect
 ## What it demonstrates
 
 - Hot reload via `tardi reload` (SIGHUP): new requests use the updated config immediately; existing in-flight requests keep their request-scoped config lease but can observe reloaded process-shared policy.
-- Graceful shutdown via `tardi stop`: stops accepting new connections and waits up to `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` for worker jobs to drain.
+- Graceful shutdown via `tardi stop`: sends SIGTERM; the running process stops accepting new connections and drains before exit.
 - PID file for signal-based process management with init systems.
 
 ## Quick start

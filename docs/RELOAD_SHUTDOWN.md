@@ -146,7 +146,7 @@ Shutdown refuses new QUIC connections, sends H3 GOAWAY, and rejects new request
 streams past the drain boundary. Existing H3 work may complete before the
 deadline; remaining H3 connections are closed when the deadline expires.
 
-Expected shutdown logs include:
+Expected TCP worker-pool shutdown logs include:
 
 ```text
 Shutdown requested; draining active connection work (timeout=30000ms active_connections=...)
@@ -158,10 +158,10 @@ Related knobs:
 
 | Env var | Default | Effect |
 | --- | ---: | --- |
-| `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` | `30000` | TCP worker-pool drain window and native HTTP/3 drain deadline for graceful shutdown. |
-| `TARDIGRADE_WORKER_THREADS` | `0` | Worker thread count; `0` uses the runtime default. |
-| `TARDIGRADE_WORKER_QUEUE_SIZE` | `1024` | Worker queue capacity. |
-| `TARDIGRADE_WORKER_MAX_QUEUE_DEPTH` | `0` | Optional per-worker queue depth cap (`0` means unlimited beyond queue capacity behavior). |
+| `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` | `30000` | TCP worker-pool drain window and native HTTP/3 drain deadline for graceful shutdown. The final shutdown path uses the startup value; hot reload can publish a different request-scoped value, but the process drain/H3 deadline still requires restart to change coherently today. |
+| `TARDIGRADE_WORKER_THREADS` | `0` | Startup-owned worker thread count; `0` uses the runtime default. Restart required to change. |
+| `TARDIGRADE_WORKER_QUEUE_SIZE` | `1024` | Startup-owned worker queue capacity. Restart required to change. |
+| `TARDIGRADE_WORKER_MAX_QUEUE_DEPTH` | `0` | Startup-owned optional per-worker queue depth cap (`0` means unlimited beyond queue capacity behavior). Restart required to change. |
 
 Related references:
 
@@ -214,8 +214,8 @@ the configured metrics path, `/status/metrics` by default:
 | `tardigrade_reload_success_total` | Reloads successfully installed. |
 | `tardigrade_reload_failure_total` | Reloads rejected; previous config kept. |
 | `tardigrade_drain_total` | Graceful-shutdown drains started. |
-| `tardigrade_drain_timeouts_total` | Drains that reached the drain timeout. |
-| `tardigrade_drain_forced_closes_total` | Queued connections force-closed after drain timeout. |
+| `tardigrade_drain_timeouts_total` | TCP worker-pool drains that reached a positive drain deadline before worker jobs finished; does not report native H3 deadline expiry. |
+| `tardigrade_drain_forced_closes_total` | Queue-owned unstarted TCP accepted sockets closed on worker drain expiry or an immediate zero-timeout shutdown. |
 | `tardigrade_active_connections` | Currently accepted downstream connections. |
 | `tardigrade_worker_active_jobs` | Worker jobs currently running. |
 | `tardigrade_worker_queued_jobs` | Worker jobs waiting in queues. |
