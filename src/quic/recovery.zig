@@ -399,6 +399,7 @@ pub const PacketTracker = struct {
             self.noteLargestAcked(space, packet_number);
             self.removeAt(index);
             self.breakPersistentCandidateOnAck(space, packet.time_sent_us);
+            self.retirePersistentCandidateOnAckBarrier(space, packet.time_sent_us);
             try self.noteAckedSendTime(space, packet.time_sent_us);
             return .{
                 .packet = packet,
@@ -414,6 +415,7 @@ pub const PacketTracker = struct {
             self.noteLargestAcked(space, packet_number);
             _ = self.recovery_overflow.orderedRemove(overflow_index);
             self.breakPersistentCandidateOnAck(space, packet.time_sent_us);
+            self.retirePersistentCandidateOnAckBarrier(space, packet.time_sent_us);
             try self.noteAckedSendTime(space, packet.time_sent_us);
             return .{
                 .packet = packet,
@@ -449,8 +451,12 @@ pub const PacketTracker = struct {
         }
     }
 
+    fn isPersistentCandidatePacket(packet: SentPacket) bool {
+        return !packet.pmtu_probe and packet.ack_eliciting and packet.in_flight;
+    }
+
     fn observePersistentCandidate(self: *PacketTracker, space: PacketNumberSpace, packet: SentPacket) void {
-        if (packet.pmtu_probe or !packet.ack_eliciting or !packet.in_flight) return;
+        if (!isPersistentCandidatePacket(packet)) return;
         const idx = spaceIndex(space);
         var candidate = &self.persistent_candidates[idx];
         if (!candidate.active) {
@@ -547,14 +553,39 @@ pub const PacketTracker = struct {
         self.acked_send_time_range_overflow_counts[idx] -= 1;
     }
 
-    fn earliestTrackedSendTime(self: *const PacketTracker, space: PacketNumberSpace) ?u64 {
+    fn hasTrackedPersistentCandidatePacketBefore(self: *const PacketTracker, space: PacketNumberSpace, barrier_time_us: u64) bool {
+        for (self.packets[0..self.count]) |packet| {
+            if (packet.space != space or packet.lost or !isPersistentCandidatePacket(packet)) continue;
+            if (packet.time_sent_us < barrier_time_us) return true;
+        }
+        for (self.recovery_overflow.items) |packet| {
+            if (packet.space != space or packet.lost or !isPersistentCandidatePacket(packet)) continue;
+            if (packet.time_sent_us < barrier_time_us) return true;
+        }
+        return false;
+    }
+
+    /// An ACK sent after the current loss candidate is a hard barrier: no loss
+    /// sent at or after that time can join the candidate without crossing an
+    /// acknowledged packet. Once every still-outstanding packet that could
+    /// extend the candidate before that barrier has resolved, the candidate can
+    /// never grow again and its old ACK history is no longer relevant.
+    fn retirePersistentCandidateOnAckBarrier(self: *PacketTracker, space: PacketNumberSpace, time_sent_us: u64) void {
+        const idx = spaceIndex(space);
+        var candidate = &self.persistent_candidates[idx];
+        if (!candidate.active or time_sent_us <= candidate.end_us) return;
+        if (self.hasTrackedPersistentCandidatePacketBefore(space, time_sent_us)) return;
+        candidate.reset();
+    }
+
+    fn earliestTrackedPersistentCandidateSendTime(self: *const PacketTracker, space: PacketNumberSpace) ?u64 {
         var earliest: ?u64 = null;
         for (self.packets[0..self.count]) |packet| {
-            if (packet.space != space or packet.lost) continue;
+            if (packet.space != space or packet.lost or !isPersistentCandidatePacket(packet)) continue;
             earliest = if (earliest) |value| @min(value, packet.time_sent_us) else packet.time_sent_us;
         }
         for (self.recovery_overflow.items) |packet| {
-            if (packet.space != space or packet.lost) continue;
+            if (packet.space != space or packet.lost or !isPersistentCandidatePacket(packet)) continue;
             earliest = if (earliest) |value| @min(value, packet.time_sent_us) else packet.time_sent_us;
         }
         return earliest;
@@ -563,7 +594,7 @@ pub const PacketTracker = struct {
     fn ackEvidenceFloor(self: *const PacketTracker, space: PacketNumberSpace) ?u64 {
         const candidate = self.persistent_candidates[spaceIndex(space)];
         if (candidate.active) return candidate.start_us;
-        return self.earliestTrackedSendTime(space);
+        return self.earliestTrackedPersistentCandidateSendTime(space);
     }
 
     fn pruneAckedSendTimes(self: *PacketTracker, space: PacketNumberSpace) void {
@@ -1328,6 +1359,72 @@ test "persistent congestion ACK ranges preserve gaps across tracker-capacity ACK
     try testing.expect(candidate.end_us - candidate.start_us >= duration);
 }
 
+test "persistent congestion stale candidate retires behind later ACK barrier" {
+    var tracker = PacketTracker{};
+    defer tracker.deinit(testing.allocator);
+
+    tracker.observePersistentCandidate(.application, .{
+        .space = .application,
+        .packet_number = 1,
+        .time_sent_us = 0,
+        .size = 100,
+        .rtt_sample_available_at_send = true,
+    });
+
+    var pn: u64 = 2;
+    while (pn <= max_tracked_packets + max_ack_barrier_overflow_ranges + 64) : (pn += 1) {
+        const sent_at = pn * 10;
+        try tracker.onPacketSent(.{
+            .space = .application,
+            .packet_number = pn,
+            .time_sent_us = sent_at,
+            .size = 100,
+            .rtt_sample_available_at_send = true,
+        });
+        _ = try tracker.onAcked(.application, pn, sent_at + 1);
+    }
+
+    const space_idx = spaceIndex(.application);
+    try testing.expect(!tracker.persistent_candidates[space_idx].active);
+    try testing.expectEqual(@as(usize, 0), tracker.acked_send_time_range_counts[space_idx]);
+    try testing.expectEqual(@as(usize, 0), tracker.acked_send_time_range_overflow_counts[space_idx]);
+}
+
+test "persistent congestion candidate survives ACK while an earlier unresolved packet can extend it" {
+    var tracker = PacketTracker{};
+    var rtt = RttEstimator.init(0);
+    rtt.update(100_000, 0);
+    const duration = PacketTracker.persistentCongestionDuration(rtt).?;
+
+    tracker.observePersistentCandidate(.application, .{
+        .space = .application,
+        .packet_number = 1,
+        .time_sent_us = 0,
+        .size = 100,
+        .rtt_sample_available_at_send = true,
+    });
+    try tracker.onPacketSent(.{
+        .space = .application,
+        .packet_number = 2,
+        .time_sent_us = duration,
+        .size = 100,
+        .rtt_sample_available_at_send = true,
+    });
+    try tracker.onPacketSent(.{
+        .space = .application,
+        .packet_number = 5,
+        .time_sent_us = duration + 100,
+        .size = 100,
+        .rtt_sample_available_at_send = true,
+    });
+
+    _ = try tracker.onAcked(.application, 5, duration + 101);
+    try testing.expect(tracker.persistent_candidates[spaceIndex(.application)].active);
+
+    const loss = tracker.detectLost(.application, duration * 2, rtt);
+    try testing.expect(loss.persistent_congestion);
+}
+
 test "persistent congestion ACK barriers spill beyond fixed tracker capacity" {
     var tracker = PacketTracker{};
     defer tracker.deinit(testing.allocator);
@@ -1336,6 +1433,16 @@ test "persistent congestion ACK barriers spill beyond fixed tracker capacity" {
         .space = .application,
         .packet_number = 1,
         .time_sent_us = 0,
+        .size = 100,
+        .rtt_sample_available_at_send = true,
+    });
+    // Keep one candidate-eligible packet unresolved before every later ACK
+    // barrier. That makes the old candidate genuinely capable of extending,
+    // so the barriers must remain exact rather than being retired for space.
+    try tracker.onPacketSent(.{
+        .space = .application,
+        .packet_number = 10_000,
+        .time_sent_us = 1,
         .size = 100,
         .rtt_sample_available_at_send = true,
     });
@@ -1373,6 +1480,13 @@ test "persistent congestion ACK barrier budget fails connection-locally" {
         .space = .application,
         .packet_number = 1,
         .time_sent_us = 0,
+        .size = 100,
+        .rtt_sample_available_at_send = true,
+    });
+    try tracker.onPacketSent(.{
+        .space = .application,
+        .packet_number = 10_000,
+        .time_sent_us = 1,
         .size = 100,
         .rtt_sample_available_at_send = true,
     });
