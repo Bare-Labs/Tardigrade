@@ -281,6 +281,61 @@ loopback_info() {
     fi
 }
 
+# Host-wide ceilings on per-socket UDP buffers (#256-D). A QUIC run whose
+# receive buffer filled looks like packet loss in the results, so the ceiling
+# that bounded it belongs in the metadata next to the numbers it explains.
+# These are the *host* limits; the size the listener actually got is read back
+# with getsockopt and logged by the runtime itself, since only the process can
+# see it.
+udp_sysctl() {
+    local key="$1"
+    if command -v sysctl >/dev/null 2>&1; then
+        sysctl -n "$key" 2>/dev/null || echo "unknown"
+    else
+        echo "unknown"
+    fi
+}
+
+udp_buffer_metadata_json() {
+    if [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
+        jq -n \
+            --arg rmem_max "$(udp_sysctl net.core.rmem_max)" \
+            --arg wmem_max "$(udp_sysctl net.core.wmem_max)" \
+            --arg rmem_default "$(udp_sysctl net.core.rmem_default)" \
+            --arg wmem_default "$(udp_sysctl net.core.wmem_default)" \
+            --arg requested_recv "${TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES:-0}" \
+            --arg requested_send "${TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES:-0}" \
+            '{
+                host_ceiling: {
+                    "net.core.rmem_max": $rmem_max,
+                    "net.core.wmem_max": $wmem_max,
+                    "net.core.rmem_default": $rmem_default,
+                    "net.core.wmem_default": $wmem_default
+                },
+                tardigrade_requested: {
+                    recv_bytes: $requested_recv,
+                    send_bytes: $requested_send
+                }
+            }'
+    else
+        jq -n \
+            --arg maxsockbuf "$(udp_sysctl kern.ipc.maxsockbuf)" \
+            --arg recvspace "$(udp_sysctl net.inet.udp.recvspace)" \
+            --arg requested_recv "${TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES:-0}" \
+            --arg requested_send "${TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES:-0}" \
+            '{
+                host_ceiling: {
+                    "kern.ipc.maxsockbuf": $maxsockbuf,
+                    "net.inet.udp.recvspace": $recvspace
+                },
+                tardigrade_requested: {
+                    recv_bytes: $requested_recv,
+                    send_bytes: $requested_send
+                }
+            }'
+    fi
+}
+
 host_metadata_json() {
     jq -n \
         --arg load_tool "$TOOL" \
@@ -288,6 +343,7 @@ host_metadata_json() {
         --arg ulimit_n "$(ulimit -n 2>/dev/null || echo unknown)" \
         --arg ulimit_u "$(ulimit -u 2>/dev/null || echo unknown)" \
         --arg loopback "$(loopback_info)" \
+        --argjson udp_buffers "$(udp_buffer_metadata_json)" \
         --arg tardigrade_build_flags "$TARDIGRADE_BUILD_FLAGS" \
         --argjson tardigrade_binary_explicit "$($BINARY_EXPLICIT && echo true || echo false)" \
         '{
@@ -298,7 +354,8 @@ host_metadata_json() {
                 max_user_processes: $ulimit_u
             },
             network: {
-                loopback: $loopback
+                loopback: $loopback,
+                udp_buffers: $udp_buffers
             },
             tardigrade: {
                 build_flags: $tardigrade_build_flags,

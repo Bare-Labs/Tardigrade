@@ -345,7 +345,12 @@ pub fn http3ListenerConfigChanged(
         current.http3_enable_0rtt != proposed.http3_enable_0rtt or
         current.http3_connection_migration != proposed.http3_connection_migration or
         current.http3_retry_policy != proposed.http3_retry_policy or
-        current.http3_max_datagram_size != proposed.http3_max_datagram_size;
+        current.http3_max_datagram_size != proposed.http3_max_datagram_size or
+        // #256-D: buffer sizes are socket state, set once on the live fd at
+        // bind time. Changing them means a new socket, which is a listener
+        // restart like every other knob here.
+        current.http3_udp_recv_buffer_bytes != proposed.http3_udp_recv_buffer_bytes or
+        current.http3_udp_send_buffer_bytes != proposed.http3_udp_send_buffer_bytes;
 }
 
 pub fn listenerShardConfigChanged(
@@ -401,6 +406,18 @@ test "http3ListenerConfigChanged permits advertisement-only reloads" {
     proposed.quic_port = base.quic_port;
 
     proposed.http3_retry_policy = .address_validation;
+    try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
+    proposed.http3_retry_policy = base.http3_retry_policy;
+
+    // #256-D: socket buffer sizes are applied to the live descriptor at bind
+    // time. A reload cannot resize the socket the listener is already reading
+    // from, so changing either target has to go through a restart rather than
+    // being accepted and silently ignored.
+    proposed.http3_udp_recv_buffer_bytes = base.http3_udp_recv_buffer_bytes + 4096;
+    try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
+    proposed.http3_udp_recv_buffer_bytes = base.http3_udp_recv_buffer_bytes;
+
+    proposed.http3_udp_send_buffer_bytes = base.http3_udp_send_buffer_bytes + 4096;
     try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
 }
 

@@ -277,6 +277,10 @@ pub const EdgeConfig = struct {
     http3_connection_migration: bool,
     http3_retry_policy: http.quic.config.RetryPolicy,
     http3_max_datagram_size: usize,
+    /// Optional `SO_RCVBUF`/`SO_SNDBUF` targets for the QUIC listener socket
+    /// (#256-D). `0` — the default — leaves the kernel's own sizing alone.
+    http3_udp_recv_buffer_bytes: usize,
+    http3_udp_send_buffer_bytes: usize,
     proxy_protocol_mode: ProxyProtocolMode,
     /// Gateway identity used in signed upstream trust headers.
     trust_gateway_id: []const u8,
@@ -944,6 +948,13 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     // `[base_size, max_size]` and lowers it further whenever the peer
     // advertises smaller receive capacity.
     const http3_max_datagram_size = parseIntEnv(usize, allocator, "TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE", http.quic.datagram.max_size);
+    // #256-D: advisory socket buffer targets for the QUIC listener. `0` (the
+    // default) means "leave the kernel's sizing alone", which is what most
+    // deployments should do — these exist for hosts whose default receive
+    // buffer is small enough to drop datagrams in bursts. A request the
+    // kernel refuses or trims is logged and published, never fatal.
+    const http3_udp_recv_buffer_bytes = parseIntEnv(usize, allocator, "TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES", 0);
+    const http3_udp_send_buffer_bytes = parseIntEnv(usize, allocator, "TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES", 0);
     const proxy_protocol_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_PROTOCOL", "off") catch unreachable;
     defer allocator.free(proxy_protocol_mode_str);
     const proxy_protocol_mode = try parseProxyProtocolModeConfig(proxy_protocol_mode_str);
@@ -1632,6 +1643,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .http3_connection_migration = http3_connection_migration,
         .http3_retry_policy = http3_retry_policy,
         .http3_max_datagram_size = http3_max_datagram_size,
+        .http3_udp_recv_buffer_bytes = http3_udp_recv_buffer_bytes,
+        .http3_udp_send_buffer_bytes = http3_udp_send_buffer_bytes,
         .proxy_protocol_mode = proxy_protocol_mode,
         .trust_gateway_id = trust_gateway_id,
         .trust_shared_secret = trust_shared_secret,
