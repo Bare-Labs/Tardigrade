@@ -1987,6 +1987,7 @@ pub const Connection = struct {
     }
 
     fn processAck(self: *Connection, space: PacketNumberSpace, ack: frame.Ack, now_us: u64) void {
+        self.recovery.tracker.setAckBarrierAllocator(self.allocator);
         const exponent: u6 = if (self.adapter.peerTransportParameters()) |peer|
             @intCast(@min(peer.ack_delay_exponent, 20))
         else
