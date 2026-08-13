@@ -15,6 +15,7 @@ pub const recovery = @import("recovery.zig");
 pub const cid = @import("cid.zig");
 pub const path = @import("path.zig");
 pub const pmtu = @import("pmtu.zig");
+pub const ecn = @import("ecn.zig");
 pub const stream = @import("stream.zig");
 pub const qlog = @import("qlog.zig");
 pub const keylog = @import("keylog.zig");

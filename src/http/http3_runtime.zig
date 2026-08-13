@@ -108,6 +108,14 @@ pub const Config = struct {
     /// measurements say otherwise. What the kernel actually granted is read
     /// back and published on `Snapshot.udp_buffers`.
     udp_buffer_tuning: quic.udp.BufferTuning = .{},
+    /// Whether to run ECN on this listener (#256-E, RFC 9000 §13.4). On by
+    /// default because it is safe by construction: the runtime turns it on
+    /// only after the kernel agrees to report received codepoints, and the
+    /// transport turns it off again per path the moment the peer's feedback
+    /// stops adding up — a path that cannot carry markings ends up in ordinary
+    /// non-ECN operation, never in an error. Set false to keep every datagram
+    /// unmarked regardless of platform support.
+    ecn_enabled: bool = true,
     request_handler: ?RequestHandler = null,
     request_handler_ctx: ?*anyopaque = null,
     early_data_compat_metrics_ctx: ?*anyopaque = null,
@@ -191,6 +199,19 @@ pub const Snapshot = struct {
     /// for the life of the socket, so unlike every counter above it is
     /// written once at init.
     udp_buffers: quic.udp.EffectiveBufferTuning = .{},
+    /// Whether this listener is running ECN at all (#256-E): the operator
+    /// asked for it *and* the kernel agreed to report received codepoints.
+    /// Fixed for the life of the socket unless a marked send is refused, which
+    /// clears it — so a benchmark run records the state that actually applied.
+    ecn_enabled: bool = false,
+    /// Folded from every connection's transport counters, so an operator can
+    /// tell "ECN is on and working" from "ECN is on and every path turned it
+    /// off". `ecn_paths_disabled` is expected to be non-zero on the open
+    /// internet and is not an error condition.
+    ecn_marked_sent: usize = 0,
+    ecn_paths_validated: usize = 0,
+    ecn_paths_disabled: usize = 0,
+    ecn_ce_received: usize = 0,
 
     pub fn handshakeState(self: Snapshot) []const u8 {
         if (!self.server_bootstrapped) return "bootstrap_incomplete";
@@ -234,6 +255,10 @@ const ConnEntry = struct {
     highest_admitted_request_stream_id: ?u64 = null,
     drain_goaway_boundary: ?u64 = null,
     last_path_metrics: quic.path.Metrics = .{},
+    /// The connection's transport counters as of the last fold, so the
+    /// listener snapshot accumulates deltas rather than re-adding totals
+    /// (#256-E). Same pattern as `last_path_metrics`.
+    last_transport_metrics: quic.connection.Metrics = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
@@ -312,6 +337,12 @@ pub const Runtime = struct {
     /// by real OS entropy.
     crypto_provider_entropy: tls_core.production_crypto.OsEntropy = .{},
     crypto_provider_state: tls_core.production_crypto.Provider = undefined,
+    /// Whether outbound datagrams may carry an ECN control message (#256-E).
+    /// Starts as whatever the receive-side configuration established, and is
+    /// cleared for good if the kernel ever refuses the send-side control
+    /// message — the two are separate capabilities on some platforms, and one
+    /// refusal is enough to know marking will never work here.
+    ecn_send_enabled: bool = false,
 
     /// Erase `crypto_provider_state` to the boundary type for a `Connection`.
     /// Borrows `self`, so the returned value must not outlive this `Runtime`
@@ -338,6 +369,16 @@ pub const Runtime = struct {
         const no_fragment = configureNoFragment(fd, sa_family);
         if (!no_fragment) {
             logger.warn(null, "http3: no-fragmentation socket policy unavailable; path MTU discovery held at {d} bytes", .{quic.datagram.base_size});
+        }
+        // ECN's precondition (#256-E). Marking is only worth doing if the peer
+        // can be observed marking back, so the *receive* side is what gates
+        // it: without received codepoints there is nothing to put in ACK_ECN,
+        // the peer's own validation fails, and this endpoint would be marking
+        // into a feedback loop it cannot close. Advisory to the listener —
+        // refusing it costs a congestion signal, not correctness.
+        const ecn_receive = cfg.ecn_enabled and configureEcnReceive(fd, sa_family);
+        if (cfg.ecn_enabled and !ecn_receive) {
+            logger.warn(null, "http3: ECN unavailable on this platform or socket; running without explicit congestion notification", .{});
         }
         // Advisory, and applied before `bind` so the socket is never briefly
         // reachable with a buffer the operator did not ask for (#256-D).
@@ -376,7 +417,8 @@ pub const Runtime = struct {
             .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
             .retry_policy = cfg.retry_policy,
             .secrets = .{},
-            .quic_config = quicConfigFrom(cfg, no_fragment),
+            .quic_config = quicConfigFrom(cfg, no_fragment, ecn_receive),
+            .ecn_send_enabled = ecn_receive,
             .h3_settings = cfg.h3_settings,
             .early_data_compat_metrics_ctx = cfg.early_data_compat_metrics_ctx,
             .early_data_compat_metrics_cb = cfg.early_data_compat_metrics_cb,
@@ -387,7 +429,11 @@ pub const Runtime = struct {
             .h3_qlog_sink = cfg.h3_qlog_sink,
             .h3_qlog_sink_factory_ctx = cfg.h3_qlog_sink_factory_ctx,
             .h3_qlog_sink_factory_cb = cfg.h3_qlog_sink_factory_cb,
-            .snapshot_state = .{ .quic_port = cfg.quic_port, .udp_buffers = udp_buffers },
+            .snapshot_state = .{
+                .quic_port = cfg.quic_port,
+                .udp_buffers = udp_buffers,
+                .ecn_enabled = ecn_receive,
+            },
             .stopping = std.atomic.Value(bool).init(false),
             .drain_requested = std.atomic.Value(bool).init(false),
             .drain_deadline_us = std.atomic.Value(u64).init(0),
@@ -510,7 +556,7 @@ pub const Runtime = struct {
                     self.foldPathMetrics(entry);
                     if (draining and !entry.drain_goaway_sent) self.sendDrainGoaway(entry);
                     while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
-                        self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
+                        self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes, t.ecn);
                     }
                     if (drain_expired) {
                         entry.conn.close(0x0100, "h3 drain deadline", now);
@@ -518,7 +564,7 @@ pub const Runtime = struct {
                         self.pumpH3(entry, now);
                     }
                     while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
-                        self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
+                        self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes, t.ecn);
                     }
                     // Reap closed connections and half-open connections that
                     // blew the handshake deadline (spoofed/stalled Initials).
@@ -550,7 +596,8 @@ pub const Runtime = struct {
             var from: std.c.sockaddr.storage = undefined;
             while (true) {
                 var from_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
-                const n = std.c.recvfrom(self.socket_fd, &buf, buf.len, 0, @ptrCast(&from), &from_len);
+                const received = receiveDatagram(self.socket_fd, &buf, &from, &from_len);
+                const n = received.result;
                 if (n < 0) {
                     const e = posix.errno(n);
                     if (e == .AGAIN) break;
@@ -561,7 +608,7 @@ pub const Runtime = struct {
                 const datagram = buf[0..@intCast(n)];
                 if (from.family != posix.AF.INET) continue;
                 const peer: *const std.c.sockaddr.in = @ptrCast(&from);
-                self.ingest(&connections, &routes, &per_ip, &next_handle, datagram, peer.*, nowUs());
+                self.ingest(&connections, &routes, &per_ip, &next_handle, datagram, peer.*, received.ecn, nowUs());
             }
         }
     }
@@ -574,6 +621,7 @@ pub const Runtime = struct {
         next_handle: *u64,
         datagram: []const u8,
         peer: std.c.sockaddr.in,
+        ingress_ecn: quic.udp.Ecn,
         now: u64,
     ) void {
         self.noteDatagram(datagram.len);
@@ -622,7 +670,7 @@ pub const Runtime = struct {
         const ingress_path = quic.path.PathKey{ .local = self.local_address, .remote = ingress_remote };
         var challenge_entropy: [quic.path.path_challenge_len]u8 = undefined;
         compat.randomBytes(&challenge_entropy);
-        entry.conn.ingestOnPath(datagram, ingress_path, challenge_entropy, now) catch {
+        entry.conn.ingestOnPathWithEcn(datagram, ingress_path, ingress_ecn, challenge_entropy, now) catch {
             if (freshly_accepted) self.removeConnection(connections, routes, per_ip, found);
             return;
         };
@@ -651,11 +699,11 @@ pub const Runtime = struct {
 
         var out: [quic.datagram.max_size]u8 = undefined;
         while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
-            self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
+            self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes, t.ecn);
         }
         self.pumpH3(entry, now);
         while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
-            self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes);
+            self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes, t.ecn);
         }
     }
 
@@ -865,7 +913,9 @@ pub const Runtime = struct {
         const token = self.secrets.retry_tokens.issueRetry(parsed.dcid, retry_scid.slice(), parsed.version, remote, now, nonce, &token_buf) catch return;
         var retry_buf: [512]u8 = undefined;
         const retry = quic.packet.writeRetryV1(parsed.dcid, parsed.scid, retry_scid.slice(), token, &retry_buf) catch return;
-        self.sendDatagram(peer, retry);
+        // Unmarked: a Retry is sent before any connection state exists, so
+        // there is no path whose ECN validation could ever account for it.
+        self.sendDatagram(peer, retry, .not_ect);
         self.noteRetryPacketSent();
     }
 
@@ -1134,8 +1184,25 @@ pub const Runtime = struct {
         self.noteRequestCompleted();
     }
 
-    fn sendDatagram(self: *Runtime, peer: std.c.sockaddr.in, datagram: []const u8) void {
-        const sent = std.c.sendto(self.socket_fd, datagram.ptr, datagram.len, 0, @ptrCast(&peer), @sizeOf(std.c.sockaddr.in));
+    /// Send one transport-produced datagram, carrying the ECN codepoint the
+    /// transport asked for (#256-E). `mark` is `.not_ect` for every datagram
+    /// on a path that is not marking, which is the plain-`sendto` path.
+    fn sendDatagram(self: *Runtime, peer: std.c.sockaddr.in, datagram: []const u8, mark: quic.udp.Ecn) void {
+        const effective_mark = if (self.ecn_send_enabled) mark else .not_ect;
+        const outcome = sendDatagramTo(self.socket_fd, &peer, datagram, effective_mark);
+        if (outcome.ecn_rejected and self.ecn_send_enabled) {
+            // Reading the codepoint and setting it are separate kernel
+            // capabilities; this listener has just learned it only has the
+            // first. Stop asking rather than paying a failed `sendmsg` on
+            // every datagram, and let each connection's own ECN validation
+            // discover that its marks are not arriving.
+            self.ecn_send_enabled = false;
+            self.snapshot_mutex.lock();
+            self.snapshot_state.ecn_enabled = false;
+            self.snapshot_mutex.unlock();
+            self.logger.warn(null, "http3: kernel refused the ECN send option; continuing without explicit congestion notification", .{});
+        }
+        const sent = outcome.result;
         if (sent >= 0 and @as(usize, @intCast(sent)) == datagram.len) {
             self.notePacketOut(datagram.len);
         }
@@ -1528,6 +1595,17 @@ pub const Runtime = struct {
         self.snapshot_state.migrations_blocked += @intCast(current.migrations_blocked -| previous.migrations_blocked);
         self.snapshot_state.migrations_blocked_no_peer_cid += @intCast(current.migrations_blocked_no_peer_cid -| previous.migrations_blocked_no_peer_cid);
         self.snapshot_state.migration_events += @intCast(nat +| migrations);
+
+        // #256-E: ECN is transport state, but the interesting question is a
+        // listener-wide one — is marking working here at all — so the
+        // per-connection counters fold into the same snapshot.
+        const transport = entry.conn.metrics;
+        const last = entry.last_transport_metrics;
+        entry.last_transport_metrics = transport;
+        self.snapshot_state.ecn_marked_sent += @intCast(transport.ecn_marked_sent -| last.ecn_marked_sent);
+        self.snapshot_state.ecn_paths_validated += @intCast(transport.ecn_validated -| last.ecn_validated);
+        self.snapshot_state.ecn_paths_disabled += @intCast(transport.ecn_disabled -| last.ecn_disabled);
+        self.snapshot_state.ecn_ce_received += @intCast(transport.ecn_ce_received -| last.ecn_ce_received);
     }
 
     fn noteRetryPacketSent(self: *Runtime) void {
@@ -1602,10 +1680,14 @@ fn buildStreamRequest(allocator: std.mem.Allocator, exchange: stream_transport.E
 /// what the operator configured: a probe that the kernel may fragment cannot
 /// measure a path MTU, and raising the send size on that evidence would be
 /// worse than never discovering anything.
-fn quicConfigFrom(cfg: Config, no_fragment: bool) quic.config.Config {
+fn quicConfigFrom(cfg: Config, no_fragment: bool, ecn: bool) quic.config.Config {
     const configured = std.math.clamp(cfg.max_datagram_size, quic.datagram.base_size, quic.datagram.max_size);
     return .{
         .max_send_udp_payload_size = if (no_fragment) configured else quic.datagram.base_size,
+        // Only the socket owner can answer this, which is why the transport
+        // default is off: `quic/config.zig` has no way to know whether the
+        // codepoint can be set or read (#256-E).
+        .ecn_enabled = ecn,
         .zero_rtt_enabled = zeroRttCarrierEnabled(cfg),
         .retry_policy = cfg.retry_policy,
         .migration_policy = if (cfg.connection_migration) .full else .nat_rebinding_only,
@@ -1831,6 +1913,295 @@ fn configureNoFragment(fd: std.c.fd_t, sa_family: u32) bool {
     const value = options.value;
     posix.setsockopt(fd, @intCast(level), @intCast(option), std.mem.asBytes(&value)) catch return false;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// ECN socket support (#256-E).
+//
+// The transport decides *whether* to mark and what a peer's feedback means
+// (`quic/ecn.zig`); everything here is the platform half it cannot own —
+// asking the kernel to put ECT(0) in the IP header of one specific datagram,
+// and reading the field back off a received one. Both need ancillary control
+// messages, which is why they are `sendmsg`/`recvmsg` rather than socket-wide
+// options: ECN is validated per path, and a socket-wide `IP_TOS` would mark
+// every connection on the listener alike with no way to stop marking on the
+// one path whose validation failed.
+// ---------------------------------------------------------------------------
+
+/// The IP header option numbers this ECN implementation uses, per platform.
+///
+/// Named per OS rather than guessed, for the same reason `no_fragment_options`
+/// is: the numeric values differ between Linux, Darwin, and the BSDs, and a
+/// wrong constant that some kernel happens to accept would read as a working
+/// ECN path while marking nothing. An unverified platform gets `null` and the
+/// listener runs without ECN, which is a supported, tested state.
+const EcnSocketOptions = struct {
+    /// `setsockopt` that turns on delivery of the received codepoint.
+    recv_enable_v4: u32,
+    recv_enable_v6: u32,
+    /// The `cmsg_type` a received codepoint arrives under, which is not always
+    /// the same number as the option that enabled it.
+    recv_cmsg_v4: u32,
+    recv_cmsg_v6: u32,
+    /// The `cmsg_type` used to set the field on one outbound datagram.
+    send_cmsg_v4: u32,
+    send_cmsg_v6: u32,
+};
+
+const ecn_socket_options: ?EcnSocketOptions = switch (builtin.os.tag) {
+    // Linux: IP_TOS=1, IP_RECVTOS=13, IPV6_TCLASS=67, IPV6_RECVTCLASS=66
+    // (<linux/in.h>, <linux/in6.h>). Received IPv4 codepoints arrive under
+    // IP_TOS, *not* under the IP_RECVTOS that enabled them.
+    .linux => .{
+        .recv_enable_v4 = 13,
+        .recv_enable_v6 = 66,
+        .recv_cmsg_v4 = 1,
+        .recv_cmsg_v6 = 67,
+        .send_cmsg_v4 = 1,
+        .send_cmsg_v6 = 67,
+    },
+    // Darwin: IP_TOS=3, IP_RECVTOS=27 (<netinet/in.h>), IPV6_TCLASS=36,
+    // IPV6_RECVTCLASS=35 (<netinet6/in6.h>). Here the received IPv4 codepoint
+    // *does* arrive under IP_RECVTOS.
+    .macos, .ios, .tvos, .watchos => .{
+        .recv_enable_v4 = 27,
+        .recv_enable_v6 = 35,
+        .recv_cmsg_v4 = 27,
+        .recv_cmsg_v6 = 36,
+        .send_cmsg_v4 = 3,
+        .send_cmsg_v6 = 36,
+    },
+    // FreeBSD: IP_TOS=3, IP_RECVTOS=68, IPV6_TCLASS=61, IPV6_RECVTCLASS=57.
+    .freebsd => .{
+        .recv_enable_v4 = 68,
+        .recv_enable_v6 = 57,
+        .recv_cmsg_v4 = 68,
+        .recv_cmsg_v6 = 61,
+        .send_cmsg_v4 = 3,
+        .send_cmsg_v6 = 61,
+    },
+    else => null,
+};
+
+const ecn_supported = ecn_socket_options != null;
+
+/// RFC 3168 §5: the ECN field is the low two bits of the IPv4 TOS byte / IPv6
+/// traffic class. The other six are DSCP and are none of this stack's
+/// business — reading them would turn an operator's traffic-class marking into
+/// a spurious congestion signal.
+fn ecnFromTrafficClass(byte: u8) quic.udp.Ecn {
+    return switch (byte & 0x03) {
+        0b00 => .not_ect,
+        0b01 => .ect1,
+        0b10 => .ect0,
+        0b11 => .ce,
+        else => unreachable,
+    };
+}
+
+fn trafficClassFromEcn(mark: quic.udp.Ecn) ?c_int {
+    return switch (mark) {
+        .not_ect => 0b00,
+        .ect1 => 0b01,
+        .ect0 => 0b10,
+        .ce => 0b11,
+        // "The receive path could not tell" is not a codepoint to send.
+        .unavailable => null,
+    };
+}
+
+/// `CMSG_ALIGN`'s alignment, which is *not* the platform word everywhere.
+///
+/// Linux aligns to `sizeof(size_t)`; Darwin's `CMSG_DATA`/`CMSG_SPACE` use
+/// `__DARWIN_ALIGN32`, i.e. `sizeof(uint32_t)`, so on 64-bit Darwin the payload
+/// begins 12 bytes into a control message rather than 16. Assuming the word
+/// size on both is not a subtle bug: the ECN payload would be read four bytes
+/// past where the kernel wrote it, every received codepoint would come back
+/// `.unavailable`, and ECN would look like a network problem on every macOS
+/// host. The BSDs align to `register_t`, which is the word.
+const cmsg_alignment: usize = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos => @alignOf(u32),
+    else => @alignOf(usize),
+};
+
+fn cmsgAlign(len: usize) usize {
+    return (len + cmsg_alignment - 1) & ~(cmsg_alignment - 1);
+}
+
+/// `CMSG_DATA`'s offset from the header: the header size, aligned up.
+const cmsg_data_offset: usize = cmsgAlign(@sizeOf(std.c.cmsghdr));
+
+fn cmsgSpace(payload_len: usize) usize {
+    return cmsg_data_offset + cmsgAlign(payload_len);
+}
+
+fn cmsgLen(payload_len: usize) usize {
+    return cmsg_data_offset + payload_len;
+}
+
+/// Room for one control message carrying a `c_int` — the only ancillary data
+/// this listener sends or expects. A kernel with more to say sets `MSG_CTRUNC`
+/// and the extra is simply not read.
+const ecn_control_len: usize = cmsgSpace(@sizeOf(c_int));
+
+/// Ask the kernel to report the received ECN codepoint on this socket
+/// (#256-E). Advisory: a refusal leaves a listener that serves QUIC normally
+/// and simply never reports a codepoint, which the transport reads as
+/// `.unavailable` rather than as an unmarked datagram.
+fn configureEcnReceive(fd: std.c.fd_t, sa_family: u32) bool {
+    const options = ecn_socket_options orelse return false;
+    const is_v6 = sa_family == posix.AF.INET6;
+    const option = if (is_v6) options.recv_enable_v6 else options.recv_enable_v4;
+    const value: c_int = 1;
+    posix.setsockopt(fd, if (is_v6) posix.IPPROTO.IPV6 else posix.IPPROTO.IP, @intCast(option), std.mem.asBytes(&value)) catch return false;
+    return true;
+}
+
+/// One received datagram: the `recvmsg` return value verbatim (negative on
+/// error, so the caller's errno handling is unchanged) and the ECN codepoint
+/// its IP header carried.
+const ReceivedDatagram = struct {
+    result: isize,
+    ecn: quic.udp.Ecn = .unavailable,
+};
+
+/// Receive one datagram with its ancillary metadata. `recvmsg` rather than
+/// `recvfrom` because the codepoint only arrives as a control message; the
+/// source address comes back identically either way.
+fn receiveDatagram(
+    fd: std.c.fd_t,
+    buf: []u8,
+    from: *std.c.sockaddr.storage,
+    from_len: *std.c.socklen_t,
+) ReceivedDatagram {
+    var control: [ecn_control_len]u8 align(@alignOf(usize)) = undefined;
+    var iov = [_]std.c.iovec{.{ .base = buf.ptr, .len = buf.len }};
+    var msg = std.mem.zeroes(std.c.msghdr);
+    msg.name = @ptrCast(from);
+    msg.namelen = from_len.*;
+    msg.iov = &iov;
+    msg.iovlen = 1;
+    msg.control = &control;
+    msg.controllen = @intCast(control.len);
+
+    const n = std.c.recvmsg(fd, &msg, 0);
+    if (n < 0) return .{ .result = n };
+    from_len.* = msg.namelen;
+    return .{
+        .result = n,
+        .ecn = ecnFromControl(&control, @intCast(msg.controllen), from.family),
+    };
+}
+
+/// Send one datagram, asking the kernel to put `mark` in its IP header when
+/// the transport called for one (#256-E). Returns the `sendmsg`/`sendto`
+/// result and whether the ECN control message was refused, which is the
+/// listener's cue to stop attempting it.
+const SentDatagram = struct {
+    result: isize,
+    /// True when this send carried an ECN control message and the kernel
+    /// rejected the call outright. Distinguished from an ordinary send failure
+    /// because it is a statement about the *capability*, not about this packet.
+    ecn_rejected: bool = false,
+};
+
+fn sendDatagramTo(
+    fd: std.c.fd_t,
+    peer: *const std.c.sockaddr.in,
+    datagram: []const u8,
+    mark: quic.udp.Ecn,
+) SentDatagram {
+    const options = ecn_socket_options;
+    const traffic_class: ?c_int = if (options == null) null else trafficClassFromEcn(mark);
+    // `.not_ect` is the default state of the field, so an unmarked datagram
+    // needs no control message at all — which keeps the common path a plain
+    // `sendto` and means a kernel that rejects the cmsg only ever affects
+    // listeners that are actually marking.
+    if (traffic_class == null or traffic_class.? == 0) {
+        return .{ .result = std.c.sendto(fd, datagram.ptr, datagram.len, 0, @ptrCast(peer), @sizeOf(std.c.sockaddr.in)) };
+    }
+
+    var control: [ecn_control_len]u8 align(@alignOf(usize)) = std.mem.zeroes([ecn_control_len]u8);
+    const header: *align(cmsg_alignment) std.c.cmsghdr = @ptrCast(@alignCast(&control[0]));
+    header.len = @intCast(cmsgLen(@sizeOf(c_int)));
+    header.level = if (peer.family == posix.AF.INET6) posix.IPPROTO.IPV6 else posix.IPPROTO.IP;
+    header.type = @intCast(if (peer.family == posix.AF.INET6) options.?.send_cmsg_v6 else options.?.send_cmsg_v4);
+    const value: c_int = traffic_class.?;
+    @memcpy(control[cmsg_data_offset..][0..@sizeOf(c_int)], std.mem.asBytes(&value));
+
+    var iov = [_]std.c.iovec_const{.{ .base = datagram.ptr, .len = datagram.len }};
+    var msg = std.mem.zeroes(std.c.msghdr_const);
+    msg.name = @ptrCast(peer);
+    msg.namelen = @sizeOf(std.c.sockaddr.in);
+    msg.iov = &iov;
+    msg.iovlen = 1;
+    msg.control = &control;
+    msg.controllen = @intCast(cmsgSpace(@sizeOf(c_int)));
+
+    const sent = std.c.sendmsg(fd, &msg, 0);
+    if (sent >= 0) return .{ .result = sent };
+    // A kernel that will not accept the control message rejects every marked
+    // send the same way, so retrying this one unmarked both delivers the
+    // datagram and tells the caller to stop asking. Losing the mark is safe in
+    // the direction that matters: the transport counted a marked packet the
+    // peer will report as unmarked, which its own validation reads as marks
+    // being stripped and answers by turning ECN off.
+    if (isEcnControlRejection(posix.errno(sent))) {
+        return .{
+            .result = std.c.sendto(fd, datagram.ptr, datagram.len, 0, @ptrCast(peer), @sizeOf(std.c.sockaddr.in)),
+            .ecn_rejected = true,
+        };
+    }
+    return .{ .result = sent };
+}
+
+/// Whether a `sendmsg` failure is the kernel refusing the ECN control message
+/// rather than an ordinary transient send failure. Deliberately narrow:
+/// treating a full send buffer or an unreachable host as "this platform cannot
+/// mark" would disable ECN for the life of the listener on the strength of one
+/// bad moment.
+fn isEcnControlRejection(err: posix.E) bool {
+    return switch (err) {
+        .INVAL, .NOPROTOOPT, .OPNOTSUPP, .PERM, .AFNOSUPPORT => true,
+        else => false,
+    };
+}
+
+/// The ECN codepoint carried by the control messages `recvmsg` returned, or
+/// `.unavailable` when the kernel reported none — a socket without the option,
+/// a platform without the constants, or a truncated control buffer.
+fn ecnFromControl(control: []const u8, controllen: usize, sa_family: u32) quic.udp.Ecn {
+    const options = ecn_socket_options orelse return .unavailable;
+    const is_v6 = sa_family == posix.AF.INET6;
+    const want_level: c_int = if (is_v6) posix.IPPROTO.IPV6 else posix.IPPROTO.IP;
+    const want_type: c_int = @intCast(if (is_v6) options.recv_cmsg_v6 else options.recv_cmsg_v4);
+
+    const limit = @min(controllen, control.len);
+    var offset: usize = 0;
+    while (offset + cmsg_data_offset <= limit) {
+        const header: *align(cmsg_alignment) const std.c.cmsghdr = @ptrCast(@alignCast(&control[offset]));
+        const len: usize = @intCast(header.len);
+        if (len < cmsg_data_offset or offset + len > limit) break;
+        if (header.level == want_level and header.type == want_type) {
+            const payload = control[offset + cmsg_data_offset .. offset + len];
+            // Kernels are inconsistent about the width: Linux delivers the
+            // IPv4 TOS as a single byte and the IPv6 traffic class as an int,
+            // and the BSDs differ again. Only the low byte of the value ever
+            // matters, and it is the first byte on every little-endian target
+            // this runs on — but read the width the kernel actually used
+            // rather than assuming one, so a big-endian port does not silently
+            // read the wrong end of an int.
+            if (payload.len == 0) return .unavailable;
+            if (payload.len >= @sizeOf(c_int)) {
+                var value: c_int = 0;
+                @memcpy(std.mem.asBytes(&value), payload[0..@sizeOf(c_int)]);
+                return ecnFromTrafficClass(@truncate(@as(u32, @bitCast(value))));
+            }
+            return ecnFromTrafficClass(payload[0]);
+        }
+        offset += cmsgAlign(len);
+    }
+    return .unavailable;
 }
 
 /// Read one socket buffer size back with `getsockopt`. Returns null when the
@@ -2344,16 +2715,16 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
         .listen_host = "::",
         .quic_port = 443,
         .max_datagram_size = 512,
-    }, true).max_send_udp_payload_size);
+    }, true, false).max_send_udp_payload_size);
     // Above the 2048-byte work buffer snaps down.
     try testing.expectEqual(@as(u64, 2048), quicConfigFrom(.{
         .listen_host = "::",
         .quic_port = 443,
         .max_datagram_size = 9000,
-    }, true).max_send_udp_payload_size);
+    }, true, false).max_send_udp_payload_size);
     // An in-range value passes through, and default migration allows validated
     // same-IP NAT rebinding while still advertising disable_active_migration.
-    const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 }, true);
+    const mid = quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 }, true, false);
     try testing.expectEqual(@as(u64, 1350), mid.max_send_udp_payload_size);
     try testing.expectEqual(quic.config.MigrationPolicy.nat_rebinding_only, mid.migration_policy);
     try testing.expectEqual(quic.config.RetryPolicy.off, mid.retry_policy);
@@ -2361,12 +2732,12 @@ test "quicConfigFrom clamps datagram size into the work-buffer range" {
         .listen_host = "::",
         .quic_port = 443,
         .connection_migration = true,
-    }, true).migration_policy);
+    }, true, false).migration_policy);
     try testing.expectEqual(quic.config.RetryPolicy.address_validation, quicConfigFrom(.{
         .listen_host = "::",
         .quic_port = 443,
         .retry_policy = .address_validation,
-    }, true).retry_policy);
+    }, true, false).retry_policy);
 }
 
 test "quicConfigFrom: the runtime is the socket owner that opts discovery in" {
@@ -2381,7 +2752,7 @@ test "quicConfigFrom: the runtime is the socket owner that opts discovery in" {
         @as(u64, quic.datagram.base_size),
         (quic.config.Config{}).max_send_udp_payload_size,
     );
-    const mapped = quicConfigFrom(runtime_default, true);
+    const mapped = quicConfigFrom(runtime_default, true, false);
     try testing.expectEqual(
         @as(u64, quic.datagram.max_size),
         mapped.max_send_udp_payload_size,
@@ -2390,7 +2761,7 @@ test "quicConfigFrom: the runtime is the socket owner that opts discovery in" {
     // conservative default rather than the operator's ceiling.
     try testing.expectEqual(
         (quic.config.Config{}).max_send_udp_payload_size,
-        quicConfigFrom(runtime_default, false).max_send_udp_payload_size,
+        quicConfigFrom(runtime_default, false, false).max_send_udp_payload_size,
     );
     // The advertised receive capacity is a property of the transport's
     // buffers, not of this operator knob, so the knob must not move it.
@@ -2400,7 +2771,7 @@ test "quicConfigFrom: the runtime is the socket owner that opts discovery in" {
     );
     try testing.expectEqual(
         quic.datagram.max_size,
-        quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 }, true).max_udp_payload_size,
+        quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .max_datagram_size = 1350 }, true, false).max_udp_payload_size,
     );
 }
 
@@ -2641,28 +3012,28 @@ test "quicConfigFrom (#523): enable_0rtt alone never enables the 0-RTT carrier" 
     const gate = gate_adapter.gate();
 
     // No dependencies at all.
-    try testing.expect(!quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .enable_0rtt = true }, true).zero_rtt_enabled);
+    try testing.expect(!quicConfigFrom(.{ .listen_host = "::", .quic_port = 443, .enable_0rtt = true }, true, false).zero_rtt_enabled);
     // Only a resumption runtime.
     try testing.expect(!quicConfigFrom(.{
         .listen_host = "::",
         .quic_port = 443,
         .enable_0rtt = true,
         .resumption_runtime = &resumption,
-    }, true).zero_rtt_enabled);
+    }, true, false).zero_rtt_enabled);
     // Only a replay gate.
     try testing.expect(!quicConfigFrom(.{
         .listen_host = "::",
         .quic_port = 443,
         .enable_0rtt = true,
         .early_data_replay_gate = gate,
-    }, true).zero_rtt_enabled);
+    }, true, false).zero_rtt_enabled);
     // Both dependencies present but `enable_0rtt` false (the default): still disabled.
     try testing.expect(!quicConfigFrom(.{
         .listen_host = "::",
         .quic_port = 443,
         .resumption_runtime = &resumption,
         .early_data_replay_gate = gate,
-    }, true).zero_rtt_enabled);
+    }, true, false).zero_rtt_enabled);
     // Every dependency present: the carrier actually enables.
     try testing.expect(quicConfigFrom(.{
         .listen_host = "::",
@@ -2670,7 +3041,7 @@ test "quicConfigFrom (#523): enable_0rtt alone never enables the 0-RTT carrier" 
         .enable_0rtt = true,
         .resumption_runtime = &resumption,
         .early_data_replay_gate = gate,
-    }, true).zero_rtt_enabled);
+    }, true, false).zero_rtt_enabled);
 }
 
 fn expectInvalidH3SettingsAtRuntimeInit(settings: http3.frame.Settings) !void {
@@ -4970,17 +5341,17 @@ test "http3 runtime: DPLPMTUD stays at the floor without the no-fragmentation co
     const raised = Config{ .listen_host = "::", .quic_port = 443, .max_datagram_size = quic.datagram.max_size };
     try testing.expectEqual(
         @as(u64, quic.datagram.max_size),
-        quicConfigFrom(raised, true).max_send_udp_payload_size,
+        quicConfigFrom(raised, true, false).max_send_udp_payload_size,
     );
     try testing.expectEqual(
         @as(u64, quic.datagram.base_size),
-        quicConfigFrom(raised, false).max_send_udp_payload_size,
+        quicConfigFrom(raised, false, false).max_send_udp_payload_size,
     );
     // The advertised receive capacity is a property of this endpoint's
     // buffers and is unaffected either way.
     try testing.expectEqual(
-        quicConfigFrom(raised, true).max_udp_payload_size,
-        quicConfigFrom(raised, false).max_udp_payload_size,
+        quicConfigFrom(raised, true, false).max_udp_payload_size,
+        quicConfigFrom(raised, false, false).max_udp_payload_size,
     );
 }
 
@@ -5146,4 +5517,221 @@ test "http3 runtime: only verified platforms claim no-fragmentation support" {
         else => false,
     };
     try testing.expectEqual(expected, no_fragment_supported);
+}
+
+// ---------------------------------------------------------------------------
+// ECN socket support (#256-E).
+//
+// The state machine these feed is tested deterministically in `quic/ecn.zig`
+// and end to end in `quic/connection.zig`; what is left here is the part that
+// can only be checked against a real kernel, plus the pure conversions between
+// an IP traffic-class byte and the transport's codepoint model.
+// ---------------------------------------------------------------------------
+
+test "http3 runtime: only verified platforms claim ECN support" {
+    // Same rule as the no-fragmentation table: these option numbers differ
+    // per OS, and a wrong constant that a kernel happens to accept would read
+    // as a working ECN path while marking nothing. Unverified platforms run
+    // without ECN, which is a supported state.
+    const expected = switch (builtin.os.tag) {
+        .linux, .macos, .ios, .tvos, .watchos, .freebsd => true,
+        else => false,
+    };
+    try testing.expectEqual(expected, ecn_supported);
+}
+
+test "http3 runtime: the ECN field is the low two bits and nothing else" {
+    // RFC 3168 §5. The upper six bits are DSCP — an operator's traffic-class
+    // marking — and reading them as congestion would turn ordinary QoS
+    // configuration into a signal to halve the window.
+    try testing.expectEqual(quic.udp.Ecn.not_ect, ecnFromTrafficClass(0b0000_0000));
+    try testing.expectEqual(quic.udp.Ecn.ect1, ecnFromTrafficClass(0b0000_0001));
+    try testing.expectEqual(quic.udp.Ecn.ect0, ecnFromTrafficClass(0b0000_0010));
+    try testing.expectEqual(quic.udp.Ecn.ce, ecnFromTrafficClass(0b0000_0011));
+    // A DSCP-marked packet (CS5 = 0b101000_00) is still not-ECT.
+    try testing.expectEqual(quic.udp.Ecn.not_ect, ecnFromTrafficClass(0b1010_0000));
+    try testing.expectEqual(quic.udp.Ecn.ect0, ecnFromTrafficClass(0b1010_0010));
+
+    try testing.expectEqual(@as(?c_int, 0b10), trafficClassFromEcn(.ect0));
+    try testing.expectEqual(@as(?c_int, 0b11), trafficClassFromEcn(.ce));
+    try testing.expectEqual(@as(?c_int, 0), trafficClassFromEcn(.not_ect));
+    // "Could not observe one" is not a codepoint that can be sent.
+    try testing.expectEqual(@as(?c_int, null), trafficClassFromEcn(.unavailable));
+}
+
+test "http3 runtime: an absent or unrelated control message reads as unavailable" {
+    if (!ecn_supported) return error.SkipZigTest;
+    var control: [ecn_control_len]u8 align(@alignOf(usize)) = std.mem.zeroes([ecn_control_len]u8);
+
+    // No control data at all: the socket cannot report a codepoint, which is
+    // `.unavailable` and emphatically not `.not_ect` — reporting "unmarked"
+    // would make a peer's working marking look stripped.
+    try testing.expectEqual(quic.udp.Ecn.unavailable, ecnFromControl(&control, 0, posix.AF.INET));
+
+    // A well-formed control message for something else is skipped rather than
+    // misread as a traffic class.
+    const header: *align(cmsg_alignment) std.c.cmsghdr = @ptrCast(@alignCast(&control[0]));
+    header.len = @intCast(cmsgLen(@sizeOf(c_int)));
+    header.level = posix.SOL.SOCKET;
+    header.type = 0x7f;
+    try testing.expectEqual(
+        quic.udp.Ecn.unavailable,
+        ecnFromControl(&control, cmsgSpace(@sizeOf(c_int)), posix.AF.INET),
+    );
+
+    // A header claiming more data than the buffer holds is refused rather than
+    // read past — control data comes from the kernel, but the length arithmetic
+    // is this code's to get right.
+    header.level = posix.IPPROTO.IP;
+    header.type = @intCast(ecn_socket_options.?.recv_cmsg_v4);
+    header.len = @intCast(cmsgLen(@sizeOf(c_int)) + 4096);
+    try testing.expectEqual(
+        quic.udp.Ecn.unavailable,
+        ecnFromControl(&control, cmsgSpace(@sizeOf(c_int)), posix.AF.INET),
+    );
+}
+
+test "http3 runtime: a received traffic-class control message yields its codepoint" {
+    if (!ecn_supported) return error.SkipZigTest;
+    var control: [ecn_control_len]u8 align(@alignOf(usize)) = std.mem.zeroes([ecn_control_len]u8);
+    const header: *align(cmsg_alignment) std.c.cmsghdr = @ptrCast(@alignCast(&control[0]));
+    header.level = posix.IPPROTO.IP;
+    header.type = @intCast(ecn_socket_options.?.recv_cmsg_v4);
+
+    // Kernels disagree on the width they deliver this in — Linux hands back a
+    // single byte for IPv4, an int for IPv6, and the BSDs differ again — so
+    // both are read rather than one being assumed.
+    header.len = @intCast(cmsgLen(1));
+    control[cmsg_data_offset] = 0b11;
+    try testing.expectEqual(quic.udp.Ecn.ce, ecnFromControl(&control, cmsgSpace(1), posix.AF.INET));
+
+    header.len = @intCast(cmsgLen(@sizeOf(c_int)));
+    const value: c_int = 0b10;
+    @memcpy(control[cmsg_data_offset..][0..@sizeOf(c_int)], std.mem.asBytes(&value));
+    try testing.expectEqual(
+        quic.udp.Ecn.ect0,
+        ecnFromControl(&control, cmsgSpace(@sizeOf(c_int)), posix.AF.INET),
+    );
+}
+
+test "http3 runtime: a marked datagram survives a real loopback socket" {
+    // The one thing no state-machine test can establish: that this platform's
+    // option numbers, control-message layout, and alignment arithmetic are
+    // right, end to end, against the kernel that will actually carry the
+    // traffic. Everything above this line would pass with the constants wrong.
+    if (!ecn_supported) return error.SkipZigTest;
+
+    const receiver = openUdpSocket(posix.AF.INET);
+    if (receiver < 0) return error.SkipZigTest;
+    defer _ = std.c.close(receiver);
+    if (!configureEcnReceive(receiver, posix.AF.INET)) return error.SkipZigTest;
+
+    var bind_address = std.c.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
+        .zero = [_]u8{0} ** 8,
+    };
+    if (std.c.bind(receiver, @ptrCast(&bind_address), @sizeOf(std.c.sockaddr.in)) != 0) return error.SkipZigTest;
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getsockname(receiver, @ptrCast(&bound), &bound_len) != 0) return error.SkipZigTest;
+
+    const sender = openUdpSocket(posix.AF.INET);
+    if (sender < 0) return error.SkipZigTest;
+    defer _ = std.c.close(sender);
+
+    const outcome = sendDatagramTo(sender, &bound, "ecn", .ect0);
+    // A kernel that refuses the control message is a real, supported outcome:
+    // the datagram still went out, unmarked, and the listener stops asking.
+    if (outcome.ecn_rejected) return error.SkipZigTest;
+    try testing.expectEqual(@as(isize, 3), outcome.result);
+
+    var buf: [64]u8 = undefined;
+    var from: std.c.sockaddr.storage = undefined;
+    var from_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
+    var attempts: usize = 0;
+    const received = while (attempts < 200) : (attempts += 1) {
+        const attempt = receiveDatagram(receiver, &buf, &from, &from_len);
+        if (attempt.result >= 0) break attempt;
+        if (posix.errno(attempt.result) != .AGAIN) return error.SkipZigTest;
+        compat.sleepNs(1 * std.time.ns_per_ms);
+    } else return error.SkipZigTest;
+
+    try testing.expectEqualStrings("ecn", buf[0..@intCast(received.result)]);
+    try testing.expectEqual(quic.udp.Ecn.ect0, received.ecn);
+}
+
+test "http3 runtime: an unmarked datagram reports not-ECT, not unavailable" {
+    // The negative control for the test above: with the receive option on, a
+    // datagram that really was unmarked must come back as `.not_ect` so the
+    // peer's validation can distinguish "your marks were stripped" from "I
+    // cannot see marks at all".
+    if (!ecn_supported) return error.SkipZigTest;
+
+    const receiver = openUdpSocket(posix.AF.INET);
+    if (receiver < 0) return error.SkipZigTest;
+    defer _ = std.c.close(receiver);
+    if (!configureEcnReceive(receiver, posix.AF.INET)) return error.SkipZigTest;
+
+    var bind_address = std.c.sockaddr.in{
+        .family = posix.AF.INET,
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
+        .zero = [_]u8{0} ** 8,
+    };
+    if (std.c.bind(receiver, @ptrCast(&bind_address), @sizeOf(std.c.sockaddr.in)) != 0) return error.SkipZigTest;
+    var bound: std.c.sockaddr.in = undefined;
+    var bound_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getsockname(receiver, @ptrCast(&bound), &bound_len) != 0) return error.SkipZigTest;
+
+    const sender = openUdpSocket(posix.AF.INET);
+    if (sender < 0) return error.SkipZigTest;
+    defer _ = std.c.close(sender);
+    const outcome = sendDatagramTo(sender, &bound, "plain", .not_ect);
+    try testing.expectEqual(@as(isize, 5), outcome.result);
+    try testing.expect(!outcome.ecn_rejected);
+
+    var buf: [64]u8 = undefined;
+    var from: std.c.sockaddr.storage = undefined;
+    var from_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.storage);
+    var attempts: usize = 0;
+    const received = while (attempts < 200) : (attempts += 1) {
+        const attempt = receiveDatagram(receiver, &buf, &from, &from_len);
+        if (attempt.result >= 0) break attempt;
+        if (posix.errno(attempt.result) != .AGAIN) return error.SkipZigTest;
+        compat.sleepNs(1 * std.time.ns_per_ms);
+    } else return error.SkipZigTest;
+    try testing.expectEqual(quic.udp.Ecn.not_ect, received.ecn);
+}
+
+test "http3 runtime: a listener publishes whether ECN is actually running" {
+    var logger = logger_mod.Logger.init(.err, "http3-ecn-test");
+    var runtime = Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    }) catch return error.SkipZigTest;
+    defer runtime.deinit();
+
+    // On by default, but only *actually* on where the kernel agreed to report
+    // received codepoints — the snapshot reports what applied, not what was
+    // asked for, because that is what a benchmark run has to record.
+    try testing.expectEqual(ecn_supported, runtime.snapshot().ecn_enabled);
+    try testing.expectEqual(ecn_supported, runtime.quic_config.ecn_enabled);
+    try testing.expectEqual(ecn_supported, runtime.ecn_send_enabled);
+}
+
+test "http3 runtime: an operator can turn ECN off outright" {
+    var logger = logger_mod.Logger.init(.err, "http3-ecn-off-test");
+    var runtime = Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .ecn_enabled = false,
+    }) catch return error.SkipZigTest;
+    defer runtime.deinit();
+
+    try testing.expect(!runtime.snapshot().ecn_enabled);
+    try testing.expect(!runtime.quic_config.ecn_enabled);
+    try testing.expect(!runtime.ecn_send_enabled);
+    try testing.expectEqual(@as(usize, 0), runtime.snapshot().ecn_marked_sent);
 }

@@ -19,6 +19,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const packet = @import("packet.zig");
 const pmtu = @import("pmtu.zig");
+const ecn_mod = @import("ecn.zig");
 const udp = @import("udp.zig");
 const secrets = @import("crypto_secrets");
 
@@ -519,6 +520,13 @@ pub const Path = struct {
     /// slot therefore starts from the RFC 9000 §14 floor by construction —
     /// there is no inherit-the-old-value path to get wrong.
     plpmtu: pmtu.Controller = .{},
+    /// ECN state for *this* path (#256-E). Path-scoped for the same reason
+    /// `plpmtu` is: whether ECN codepoints survive end to end is a property of
+    /// the route, and a path that strips them says nothing about the next one.
+    /// RFC 9000 §13.4.2 requires exactly this — ECN is re-validated on a new
+    /// path — and a fresh or recycled slot gets a fresh controller by
+    /// construction, including one whose predecessor failed validation.
+    ecn: ecn_mod.Controller = .{},
 };
 
 /// The action the connection takes for a datagram from a given tuple.
@@ -616,6 +624,27 @@ pub const PathManager = struct {
     /// discovery model requires.
     pub fn activePlpmtu(self: *PathManager) *pmtu.Controller {
         return &self.paths[self.active].?.plpmtu;
+    }
+
+    /// The active path's ECN state (#256-E), for the send path that stamps a
+    /// codepoint onto the next datagram. Reached through the active slot for
+    /// the same reason as `activePlpmtu`: promoting a different path swaps in
+    /// that path's own validation state rather than carrying one over.
+    pub fn activeEcn(self: *PathManager) *ecn_mod.Controller {
+        return &self.paths[self.active].?.ecn;
+    }
+
+    /// The ECN state of a *specific* path incarnation, or null when that
+    /// incarnation is gone. This is the accessor ACK feedback must use, for
+    /// the reason spelled out on `plpmtuFor`: an acknowledgement can arrive
+    /// after a different path became active, and crediting its ECN counters to
+    /// whatever is active now would validate a route on the strength of marks
+    /// that traversed another one.
+    pub fn ecnFor(self: *PathManager, ref: PathRef) ?*ecn_mod.Controller {
+        const index = self.find(ref.key) orelse return null;
+        const path = &self.paths[index].?;
+        if (path.generation != ref.generation) return null;
+        return &path.ecn;
     }
 
     /// The active path's current incarnation, for stamping onto outbound
@@ -1950,4 +1979,40 @@ test "pendingPromotionCandidate finds a validated-but-unpromoted path and clears
 
     _ = manager.promoteValidated(candidate).?;
     try testing.expectEqual(@as(?PathKey, null), manager.pendingPromotionCandidate());
+}
+
+test "ECN state is per path incarnation and is never inherited across migration (#256-E)" {
+    var manager = PathManager.init(.full, testKey(50_000), true);
+    const handshake_ref = manager.activePathRef();
+
+    // The handshake path validated ECN: markings survive it end to end.
+    manager.activeEcn().enable(0, 300_000);
+    manager.activeEcn().onMarkedSent();
+    _ = manager.activeEcn().onAck(0, .{ .ect0 = 0, .ect1 = 0, .ce = 0 }, 0);
+    manager.activeEcn().onMarkedSent();
+    _ = manager.activeEcn().onAck(1, .{ .ect0 = 1, .ect1 = 0, .ce = 0 }, 0);
+    try testing.expectEqual(ecn_mod.State.capable, manager.activePath().ecn.state);
+
+    // Migrate to a different host. Whether ECN survives is a property of the
+    // route, so the new path starts from scratch — an inherited `.capable`
+    // would mark traffic into a path nothing has shown can carry a codepoint,
+    // and would accept its CE reports as congestion on that basis.
+    const candidate = testKeyOtherHost(50_000);
+    _ = manager.onDatagram(candidate, 100, test_challenge, 0);
+    _ = manager.validatePathResponse(candidate, test_challenge, 0);
+    _ = manager.promoteValidated(candidate);
+    try testing.expect(manager.activePath().key.eql(candidate));
+    try testing.expectEqual(ecn_mod.State.disabled, manager.activePath().ecn.state);
+    try testing.expectEqual(@as(?ecn_mod.FailureReason, null), manager.activePath().ecn.failure);
+    try testing.expectEqual(udp.Ecn.not_ect, manager.activePath().ecn.sendCodepoint());
+
+    // The old incarnation's state is still reachable by its own ref, so
+    // feedback for packets it sent resolves there rather than teaching the new
+    // path about a route it has never been on.
+    try testing.expectEqual(ecn_mod.State.capable, manager.ecnFor(handshake_ref).?.state);
+    // And a ref naming an incarnation that no longer exists resolves nowhere.
+    try testing.expectEqual(
+        @as(?*ecn_mod.Controller, null),
+        manager.ecnFor(.{ .key = candidate, .generation = 9_999 }),
+    );
 }

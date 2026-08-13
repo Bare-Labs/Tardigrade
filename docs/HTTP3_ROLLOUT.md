@@ -248,6 +248,92 @@ value and the host sysctls describe intent, not what the socket got.
 Both variables are restart-required: buffer sizes are socket state applied to
 the live descriptor at bind time, so changing one means a new socket.
 
+## Explicit Congestion Notification
+
+ECN (RFC 3168, RFC 9000 §13.4) lets a congested router *mark* a packet instead
+of dropping it. When it works, congestion control reacts a round trip earlier
+and without a retransmission; when it does not, nothing is lost. That asymmetry
+is why Tardigrade runs it by default and treats every failure as a fallback
+rather than an error.
+
+Tardigrade marks outbound datagrams **ECT(0)**, counts the codepoints on
+received packets, reports them to the peer in ACK_ECN, and validates the
+counters the peer sends back. ECT(1) is never sent: it belongs to L4S
+(RFC 9331), whose congestion response is not the RFC 9002 one implemented here.
+
+### Per path, and only after the handshake
+
+Marking starts once the handshake is **confirmed**, and each network path
+validates independently — the same scoping as DPLPMTUD, for the same reason.
+Whether ECN survives end to end is a property of the route, so a migration
+re-validates rather than inheriting an answer measured somewhere else. A path
+that failed validation stays unmarked for the life of that path incarnation.
+
+Validation is not a formality. The peer's counters are an *input to congestion
+control*, reachable by anything on the path and by the peer itself, so they are
+checked against what this endpoint actually sent before they are believed:
+
+| Check | Failure |
+| --- | --- |
+| Acknowledged marked packets, no ECN counts in the ACK | `missing_counts` — the marks were stripped, or the peer does not report |
+| A counter went backwards | `counts_regressed` |
+| ECT(1) reported | `unsent_codepoint` — something is rewriting the field |
+| More marked arrivals reported than were ever marked | `counts_exceed_sent` |
+| Marked packets acknowledged without matching counter growth | `insufficient_increase` |
+| No usable feedback within the testing window (3×PTO) | `testing_timeout` |
+
+Any of these turns marking off for that path and the connection continues
+normally. **CE reports are acted on only on a validated path**, so an
+unvalidated or forged report cannot shrink the congestion window on demand. The
+counters this endpoint reports back come only from packets that passed AEAD
+authentication, so an off-path spoofer cannot inflate what the peer is told.
+
+`ecn_paths_disabled` being non-zero on the open internet is expected and is not
+an error condition.
+
+### Platform support
+
+The transport decides *whether* to mark; the kernel is what actually sets and
+reads the IP header field, via `sendmsg`/`recvmsg` ancillary data. A socket-wide
+`IP_TOS` would not do — ECN is validated per path, and there would be no way to
+stop marking on the one path whose validation failed.
+
+| Platform | Receive | Send | Notes |
+| --- | --- | --- | --- |
+| Linux | `IP_RECVTOS` (13) / `IPV6_RECVTCLASS` (66) | `IP_TOS` (1) / `IPV6_TCLASS` (67) | Received IPv4 codepoints arrive under `IP_TOS`, not under the option that enabled them. |
+| macOS, iOS, tvOS, watchOS | `IP_RECVTOS` (27) / `IPV6_RECVTCLASS` (35) | `IP_TOS` (3) / `IPV6_TCLASS` (36) | Control messages align to 4 bytes (`__DARWIN_ALIGN32`), not the platform word. |
+| FreeBSD | `IP_RECVTOS` (68) / `IPV6_RECVTCLASS` (57) | `IP_TOS` (3) / `IPV6_TCLASS` (61) | Constants differ from Darwin's; not interchangeable. |
+| Other platforms | — | — | No verified API; the listener runs without ECN. |
+
+As with the no-fragmentation table, these are **not** shared across the BSDs and
+an unverified platform runs without ECN rather than guessing. The *receive* side
+gates everything: without received codepoints there is nothing to put in
+ACK_ECN, so the peer's own validation would fail and this endpoint would be
+marking into a feedback loop it cannot close. If the kernel later refuses the
+send-side control message, the listener logs it, stops asking, and each
+connection's validation discovers the marks are not arriving.
+
+There is nothing to tune on the host — no sysctl gates any of this. Whether ECN
+does anything useful depends on the routers between the endpoints, not on local
+configuration.
+
+### Operating
+
+`TARDIGRADE_HTTP3_ECN` (default `true`) turns marking off outright. The escape
+hatch exists for the one failure mode per-path validation cannot detect: a
+middlebox that *drops* ECT-marked traffic rather than clearing the marks, which
+looks like ordinary loss. Symptom: loss and PTO counts that fall when ECN is
+disabled on an otherwise unchanged path.
+
+The runtime status snapshot publishes `ecn_enabled` — whether marking is
+actually running, not merely requested — along with `ecn_marked_sent`,
+`ecn_paths_validated`, `ecn_paths_disabled`, and `ecn_ce_received`. Benchmark
+runs should record all five: a CE count is only meaningful next to the number
+of paths that validated.
+
+`TARDIGRADE_HTTP3_ECN` is restart-required, like every other listener-owned knob
+— the receive option is socket state applied at bind time.
+
 ## Reload
 
 Advertisement-only knobs can hot reload:
@@ -266,6 +352,7 @@ runtime does not atomically replace a live UDP socket and QUIC connection table:
 - `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE`
 - `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES`
 - `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES`
+- `TARDIGRADE_HTTP3_ECN`
 
 A reload that changes one of those fields is rejected before publication. The
 old config, old runtime, and old effective advertisement remain active.
