@@ -27,7 +27,7 @@ curl http://localhost:8080/health
 # Edit this config file, then hot-reload — no downtime
 ./zig-out/bin/tardi reload --pid-file /tmp/tardigrade.pid
 
-# Graceful stop — waits for worker jobs to drain
+# Graceful stop — sends SIGTERM; the running process drains before exit
 ./zig-out/bin/tardi stop --pid-file /tmp/tardigrade.pid
 ```
 
@@ -45,7 +45,7 @@ See `tardigrade.env.example` for the full list with comments.
 | Action | Command | Behavior |
 |--------|---------|---------|
 | Hot reload | `tardi reload --pid-file <path>` | Applies config changes; in-flight requests finish on the old config. Zero downtime. |
-| Graceful stop | `tardi stop --pid-file <path>` | Stops accepting new connections; drains in-flight requests up to the drain timeout. |
+| Graceful stop | `tardi stop --pid-file <path>` | Sends SIGTERM; the running process stops accepting new connections, drains worker jobs until the deadline, then force-closes queued unstarted accepted sockets while active handlers finish naturally. |
 | Status check | `tardi status --pid-file <path>` | Prints running/stopped state, PID or PID-file information, and the effective config summary. |
 
 For the full lifecycle contract, including failed reloads, upstream pools,
@@ -54,7 +54,10 @@ queued worker jobs, and hard termination, see
 
 ## systemd integration
 
-The included drain timeout works with `TimeoutStopSec=` in a systemd unit file. Set both to the same value so systemd does not kill Tardigrade before the drain completes:
+The included drain timeout works with `TimeoutStopSec=` in a systemd unit file.
+Set `TimeoutStopSec` slightly above `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` so
+Tardigrade can complete its drain and teardown before systemd escalates to a
+hard kill:
 
 ```ini
 [Service]

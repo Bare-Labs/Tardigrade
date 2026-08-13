@@ -61,9 +61,11 @@ keep a lease on the config version they started with and are allowed to finish o
 that version. Reload does not drain worker jobs, stop the listener, or close
 active client connections.
 
-If load, validation, allocation, bookkeeping, credential preparation, or another
-reload preflight fails, the active config is left in place. The failed config is
-not partially installed. Operators can inspect the last result through:
+If reload fails before config publication, the previously published config
+remains active for request routing and config leases. Reload-owned runtime
+resources are not fully transactional: a runtime update performed before a later
+failure may remain in effect even though the new config is not published.
+Operators can inspect the last result through:
 
 ```bash
 curl http://127.0.0.1:8080/tardigrade/reload/status
@@ -98,6 +100,9 @@ Tardigrade tracks accepted client connections separately from requests:
   request uses whichever config version they acquire at handler entry.
 - On graceful shutdown, new accepts stop and keep-alive is disabled for requests
   already being handled, so connections close instead of being re-parked.
+- Already-parked idle keep-alive connections are not worker jobs. They remain in
+  the parked registry during worker drain and are closed when the downstream
+  runtime is torn down; they do not extend the worker-pool drain deadline.
 
 The main related knobs are:
 
@@ -113,14 +118,16 @@ See [TIMEOUTS.md](TIMEOUTS.md) for request phase timeout semantics.
 ## Worker Jobs and Drain
 
 Graceful shutdown is the path that uses the drain timeout. Once shutdown is
-requested, the accept loop exits and the worker pool drains with
+requested, the accept loop exits and the TCP worker pool drains with
 `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` (default `30000` ms).
 
 Drain behavior:
 
 - Active, already-dispatched handlers are allowed to finish naturally.
-- During shutdown, request deadlines are capped to the drain window when a
-  request has no stricter deadline.
+- Requests whose handler/lifecycle starts after shutdown has been requested cap
+  their request deadline to the drain window when no stricter deadline exists.
+  Requests already executing when shutdown is requested keep their existing
+  lifecycle and phase deadlines.
 - Queued, not-yet-started connection jobs wait until the drain deadline.
 - If the drain deadline expires, remaining queued file descriptors owned by the
   worker queue are closed and counted as forced closes.
@@ -129,6 +136,11 @@ Drain behavior:
 The drain timeout is a soft process cap: active handlers are not killed inside
 the process. Their own phase deadlines, downstream disconnects, or the
 supervisor's external stop timeout bound the final exit.
+
+Native HTTP/3 uses the same shutdown timeout as a QUIC/H3 drain deadline.
+Shutdown refuses new QUIC connections, sends H3 GOAWAY, and rejects new request
+streams past the drain boundary. Existing H3 work may complete before the
+deadline; remaining H3 connections are closed when the deadline expires.
 
 Expected shutdown logs include:
 
@@ -155,12 +167,18 @@ downstream client connection lifecycle:
 - Hot reload keeps existing upstream idle and active pooled connections alive.
 - Requests already using an upstream connection finish under their current
   request/config lease.
-- New requests use the current config and may reuse an existing pooled
-  connection when it is still valid for the pool key.
+- New requests use the current request config, but they may still reuse an
+  existing pooled connection governed by the pool policy installed at startup.
 - Idle upstream connections are evicted by the maintenance tick when they exceed
   idle or lifetime limits.
 - Shutdown closes idle upstream pool connections during runtime teardown after
   worker drain.
+
+Hot reload does not reconfigure the process-owned upstream pool policy. Changes
+to pool enablement, capacity, idle timeout, lifetime, or active checkout limits
+require a restart today; existing pool instances and their startup policy remain
+in effect. Reloaded proxy-buffer limits are the exception and are applied through
+the pool's runtime setters.
 
 Related knobs:
 
