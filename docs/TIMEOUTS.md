@@ -61,7 +61,7 @@ Two principles, from the #196/#141 arc:
 | Class | Knob (`TARDIGRADE_…`) | Default | Enforcement | Semantics | Status |
 |---|---|---|---|---|---|
 | Shutdown drain | `SHUTDOWN_DRAIN_TIMEOUT_MS` | 30000 | worker-pool drain deadline | **soft cap**: queued work is drained/abandoned by the deadline, but active handlers finish naturally (their own phase timeouts bound them) | 🟡 semantics documented here; a hard process cap is a #169-adjacent decision |
-| Reload drain | (same machinery) | — | as above | as above | 🟡 |
+| Hot reload | — | — | config load/validation + lease-counted publication | no worker-pool drain; in-flight requests keep their original config lease, and failed reloads keep the previous config active | ✅ |
 | OCSP refresh | `TLS_OCSP_REFRESH_TIMEOUT_MS` | 10000 | bounded fetch | stale staple kept | ✅ |
 | TLS session cache lifetime | `TLS_SESSION_TIMEOUT_SECONDS` | 300 | OpenSSL session cache | session renegotiated | ✅ (cache lifetime, not an I/O deadline) |
 
