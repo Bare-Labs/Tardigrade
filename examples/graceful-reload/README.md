@@ -4,7 +4,7 @@ Hot-reloads configuration without dropping in-flight requests and drains connect
 
 ## What it demonstrates
 
-- Hot reload via `tardi reload` (SIGHUP): new requests use the updated config immediately; existing in-flight requests finish on the old config.
+- Hot reload via `tardi reload` (SIGHUP): new requests use the updated config immediately; existing in-flight requests keep their request-scoped config lease but can observe reloaded process-shared policy.
 - Graceful shutdown via `tardi stop`: stops accepting new connections and waits up to `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` for worker jobs to drain.
 - PID file for signal-based process management with init systems.
 
@@ -35,8 +35,8 @@ curl http://localhost:8080/health
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TARDIGRADE_PID_FILE` | `""` | Path to the PID file. Required for `tardi reload` and `tardi stop`. |
-| `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` | `30000` | Max time in ms to wait for worker jobs to drain on shutdown. |
+| `TARDIGRADE_PID_FILE` | `""` | Path to the PID file. Required for `tardi reload` and `tardi stop` unless `--pid` is supplied. |
+| `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` | `30000` | TCP worker-pool drain window and native HTTP/3 drain deadline on shutdown. |
 
 See `tardigrade.env.example` for the full list with comments.
 
@@ -44,7 +44,7 @@ See `tardigrade.env.example` for the full list with comments.
 
 | Action | Command | Behavior |
 |--------|---------|---------|
-| Hot reload | `tardi reload --pid-file <path>` | Applies config changes; in-flight requests finish on the old config. Zero downtime. |
+| Hot reload | `tardi reload --pid-file <path>` | Applies config changes without dropping active client connections; in-flight requests keep their request-scoped config lease but can observe reloaded process-shared policy. |
 | Graceful stop | `tardi stop --pid-file <path>` | Sends SIGTERM; the running process stops accepting new connections, drains worker jobs until the deadline, then force-closes queued unstarted accepted sockets while active handlers finish naturally. |
 | Status check | `tardi status --pid-file <path>` | Prints running/stopped state, PID or PID-file information, and the effective config summary. |
 

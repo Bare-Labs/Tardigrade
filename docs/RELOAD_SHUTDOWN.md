@@ -57,9 +57,10 @@ On `SIGHUP`, the gateway handles reload on the maintenance tick:
 5. Publish the new config through the lease-counted config store.
 
 New requests acquire the newly published config after step 5. In-flight requests
-keep a lease on the config version they started with and are allowed to finish on
-that version. Reload does not drain worker jobs, stop the listener, or close
-active client connections.
+retain their original config lease for request-scoped config reads. Reload also
+updates some process-shared runtime policy, so an in-flight request is not a
+fully isolated snapshot of the previous runtime configuration. Reload does not
+drain worker jobs, stop the listener, or close active client connections.
 
 If reload fails before config publication, the previously published config
 remains active for request routing and config leases. Reload-owned runtime
@@ -131,11 +132,14 @@ Drain behavior:
 - Queued, not-yet-started connection jobs wait until the drain deadline.
 - If the drain deadline expires, remaining queued file descriptors owned by the
   worker queue are closed and counted as forced closes.
-- A drain timeout of `0` closes queued work immediately.
+- A drain timeout of `0` skips the wait and abandons queued jobs immediately.
+  Queue-owned unstarted accepted sockets are closed, while non-owning
+  resume/poll work is discarded and cleaned up by its owning runtime state.
 
-The drain timeout is a soft process cap: active handlers are not killed inside
-the process. Their own phase deadlines, downstream disconnects, or the
-supervisor's external stop timeout bound the final exit.
+For TCP worker jobs, the drain timeout is a soft worker-drain cap: active
+handlers are not killed inside the process. Their own phase deadlines,
+downstream disconnects, or the supervisor's external stop timeout bound the
+final exit.
 
 Native HTTP/3 uses the same shutdown timeout as a QUIC/H3 drain deadline.
 Shutdown refuses new QUIC connections, sends H3 GOAWAY, and rejects new request
@@ -154,10 +158,17 @@ Related knobs:
 
 | Env var | Default | Effect |
 | --- | ---: | --- |
-| `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` | `30000` | Worker-pool drain window for graceful shutdown. |
+| `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` | `30000` | TCP worker-pool drain window and native HTTP/3 drain deadline for graceful shutdown. |
 | `TARDIGRADE_WORKER_THREADS` | `0` | Worker thread count; `0` uses the runtime default. |
 | `TARDIGRADE_WORKER_QUEUE_SIZE` | `1024` | Worker queue capacity. |
 | `TARDIGRADE_WORKER_MAX_QUEUE_DEPTH` | `0` | Optional per-worker queue depth cap (`0` means unlimited beyond queue capacity behavior). |
+
+Related references:
+
+- [TIMEOUTS.md lifecycle table](TIMEOUTS.md#lifecycle--operations) for timeout
+  semantics of `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS`.
+- [examples/graceful-reload/tardigrade.env.example](../examples/graceful-reload/tardigrade.env.example)
+  for commented PID-file and drain-timeout configuration.
 
 ## Upstream Keepalive Pools
 
