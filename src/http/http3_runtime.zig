@@ -343,10 +343,6 @@ pub const Runtime = struct {
     /// message — the two are separate capabilities on some platforms, and one
     /// refusal is enough to know marking will never work here.
     ecn_send_enabled: bool = false,
-    /// Set when `noteEcnSendRejected` has withdrawn the capability and live
-    /// connections have not been told yet. Applied on the run loop's next
-    /// pass, which is the only place that holds the connection table.
-    ecn_disable_pending: bool = false,
 
     /// Erase `crypto_provider_state` to the boundary type for a `Connection`.
     /// Borrows `self`, so the returned value must not outlive this `Runtime`
@@ -548,7 +544,6 @@ pub const Runtime = struct {
             // 1) Timers and transmission for every connection.
             var wake_us: u64 = now + 100_000;
             {
-                var out: [quic.datagram.max_size]u8 = undefined;
                 var reap: [16]u64 = undefined;
                 var reap_count: usize = 0;
                 var it = connections.iterator();
@@ -559,21 +554,20 @@ pub const Runtime = struct {
                     self.maintainLocalCidRoutes(entry, kv.key_ptr.*, &routes);
                     self.foldPathMetrics(entry);
                     if (draining and !entry.drain_goaway_sent) self.sendDrainGoaway(entry);
-                    while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
-                        self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes, t.ecn);
-                    }
+                    self.drainConnectionTransmits(entry, now);
                     if (drain_expired) {
                         entry.conn.close(0x0100, "h3 drain deadline", now);
                     } else {
                         self.pumpH3(entry, now);
                     }
-                    while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
-                        self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes, t.ecn);
-                    }
-                    // #256-E: the socket has just proven it cannot mark, so
-                    // stop every live connection from claiming marks it never
-                    // sent. Distinct from a path failing ECN validation.
-                    if (self.ecn_disable_pending) entry.conn.disableEcnUnsupported();
+                    self.drainConnectionTransmits(entry, now);
+                    // #256-E: while the socket cannot mark, every live
+                    // connection is kept told — not once on the pass that
+                    // discovered it. A one-shot flag would miss every entry
+                    // this iterator had already walked past when the rejection
+                    // happened, and those connections would go on counting
+                    // marks for datagrams that left Not-ECT. Idempotent.
+                    if (!self.ecn_send_enabled) entry.conn.disableEcnUnsupported();
                     // Reap closed connections and half-open connections that
                     // blew the handshake deadline (spoofed/stalled Initials).
                     const stalled = !entry.conn.isEstablished() and now -| entry.accepted_at_us > handshake_timeout_us;
@@ -586,7 +580,6 @@ pub const Runtime = struct {
                     }
                     if (entry.conn.nextTimeoutUs()) |deadline| wake_us = @min(wake_us, deadline);
                 }
-                self.ecn_disable_pending = false;
                 for (reap[0..reap_count]) |handle| {
                     self.removeConnection(&connections, &routes, &per_ip, handle);
                 }
@@ -706,14 +699,9 @@ pub const Runtime = struct {
         }
         self.maybeIssueSessionTicket(entry);
 
-        var out: [quic.datagram.max_size]u8 = undefined;
-        while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
-            self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes, t.ecn);
-        }
+        self.drainConnectionTransmits(entry, now);
         self.pumpH3(entry, now);
-        while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
-            self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes, t.ecn);
-        }
+        self.drainConnectionTransmits(entry, now);
     }
 
     fn accept(
@@ -1196,6 +1184,31 @@ pub const Runtime = struct {
     /// Send one transport-produced datagram, carrying the ECN codepoint the
     /// transport asked for (#256-E). `mark` is `.not_ect` for every datagram
     /// on a path that is not marking, which is the plain-`sendto` path.
+    /// Drain one connection's pending datagrams.
+    ///
+    /// Checks the send-side ECN capability after every datagram rather than
+    /// once per pass: the refusal is discovered *inside* a send, and the rest
+    /// of this drain would otherwise keep building packets the transport counts
+    /// as marked while the socket emits them Not-ECT.
+    fn drainConnectionTransmits(self: *Runtime, entry: *ConnEntry, now: u64) void {
+        var out: [quic.datagram.max_size]u8 = undefined;
+        while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
+            self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes, t.ecn);
+            if (!self.ecn_send_enabled) entry.conn.disableEcnUnsupported();
+        }
+    }
+
+    /// Tell every live connection that the socket cannot mark. Idempotent, and
+    /// safe to call on every pass.
+    fn applyEcnCapabilityLoss(
+        self: *Runtime,
+        connections: *std.AutoHashMap(u64, *ConnEntry),
+    ) void {
+        if (self.ecn_send_enabled) return;
+        var it = connections.iterator();
+        while (it.next()) |kv| kv.value_ptr.*.conn.disableEcnUnsupported();
+    }
+
     fn sendDatagram(self: *Runtime, peer: std.c.sockaddr.in, datagram: []const u8, mark: quic.udp.Ecn) void {
         const effective_mark = if (self.ecn_send_enabled) mark else .not_ect;
         const outcome = sendDatagramTo(self.socket_fd, &peer, datagram, effective_mark);
@@ -1223,7 +1236,6 @@ pub const Runtime = struct {
         if (!self.ecn_send_enabled) return;
         self.ecn_send_enabled = false;
         self.quic_config.ecn_enabled = false;
-        self.ecn_disable_pending = true;
         self.snapshot_mutex.lock();
         self.snapshot_state.ecn_enabled = false;
         self.snapshot_mutex.unlock();
@@ -5781,12 +5793,76 @@ test "http3 runtime: a socket that cannot mark withdraws ECN from the transport 
     try testing.expect(!runtime.quic_config.ecn_enabled);
     // ... the snapshot agrees ...
     try testing.expect(!runtime.snapshot().ecn_enabled);
-    // ... and live connections are queued to be told, which is a different
-    // thing from any one of their paths failing ECN validation.
-    try testing.expect(runtime.ecn_disable_pending);
+    // ... and the capability stays withdrawn, which is what
+    // `applyEcnCapabilityLoss` keys off on every subsequent pass.
+    try testing.expect(!runtime.ecn_send_enabled);
 
-    // Idempotent: a second refusal changes nothing and does not re-queue.
-    runtime.ecn_disable_pending = false;
+    // Idempotent.
     runtime.noteEcnSendRejected();
-    try testing.expect(!runtime.ecn_disable_pending);
+    try testing.expect(!runtime.ecn_send_enabled);
+    try testing.expect(!runtime.quic_config.ecn_enabled);
+}
+
+test "http3 runtime: every live connection is told the socket cannot mark (#256-E review)" {
+    // The rejection is discovered inside a send, part-way through the
+    // connection table. A one-shot "pending" flag would only reach entries the
+    // iterator had not yet walked past; the rest would keep counting marks for
+    // datagrams that left Not-ECT. So the capability loss is applied on every
+    // pass, for every connection, until the process restarts.
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(
+        tls_core.credentials.testdata.identity(),
+        tls_core.credentials.testdata.ignoredEntropy(),
+    );
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-ecn-sweep-test");
+    var runtime = Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+    }) catch return error.SkipZigTest;
+    defer runtime.deinit();
+    if (!runtime.ecn_send_enabled) return error.SkipZigTest;
+
+    var connections = std.AutoHashMap(u64, *ConnEntry).init(testing.allocator);
+    defer deinitTestConnections(&connections, testing.allocator);
+    var routes = quic.cid.CidRoutingTable.init(testing.allocator);
+    defer routes.deinit();
+    var per_ip = std.AutoHashMap(u32, u32).init(testing.allocator);
+    defer per_ip.deinit();
+    var next_handle: u64 = 1;
+
+    // Two live connections, accepted before the capability is lost.
+    var handles: [2]u64 = undefined;
+    for (&handles, 0..) |*handle, index| {
+        const dcid = [_]u8{ 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, @intCast(index) };
+        const scid = [_]u8{ 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, @intCast(index) };
+        handle.* = runtime.accept(&connections, &routes, &per_ip, &next_handle, .{
+            .kind = .initial,
+            .version = quic.packet.quic_v1,
+            .dcid = &dcid,
+            .scid = &scid,
+            .token = "",
+        }, testPeerSockaddr(@intCast(45_000 + index)), 1_000_000) orelse
+            return error.SkipZigTest;
+    }
+    try testing.expectEqual(@as(usize, 2), connections.count());
+    for (handles) |handle| {
+        try testing.expect(connections.get(handle).?.conn.cfg.ecn_enabled);
+    }
+
+    runtime.noteEcnSendRejected();
+    runtime.applyEcnCapabilityLoss(&connections);
+
+    // Both — not just whichever one the rejection happened on.
+    for (handles) |handle| {
+        const conn = connections.get(handle).?.conn;
+        try testing.expect(!conn.cfg.ecn_enabled);
+        try testing.expectEqual(quic.udp.Ecn.not_ect, conn.ecnCodepoint());
+        const marked_before = conn.metrics.ecn_marked_sent;
+        var out: [quic.datagram.max_size]u8 = undefined;
+        while (conn.pollTransmitOnPath(&out, 1_000_000)) |t| {
+            try testing.expectEqual(quic.udp.Ecn.not_ect, t.ecn);
+        }
+        try testing.expectEqual(marked_before, conn.metrics.ecn_marked_sent);
+    }
 }

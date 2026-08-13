@@ -1118,7 +1118,25 @@ pub const Connection = struct {
     /// newly acknowledge those packets — it filled a gap — but its cumulative
     /// counters are stale, so the growth they require has to be demanded of
     /// the next report that is current (#256-E review).
+    ///
+    /// Tagged with the epoch that placed them: a carried mark is evidence
+    /// about *that* path, and adding it to whatever path happens to be active
+    /// later would either validate the new one on the old one's growth or fail
+    /// a clean path for growth it never claimed.
     ecn_carried_marked: u64 = 0,
+    ecn_carried_generation: ?u64 = null,
+    /// Whether a marked packet has been acknowledged without a *current*
+    /// ACK_ECN having been adopted since (#256-E review).
+    ///
+    /// The peer counts on receipt, so an acknowledged mark may already sit in
+    /// its cumulative counters — but if the ACK that acknowledged it carried no
+    /// counts, or carried stale ones, this endpoint has not seen those counters
+    /// and its trusted baseline is behind reality by an unknown amount. Letting
+    /// a new path start from that baseline hands it the old path's growth as
+    /// its own evidence. Cleared by the next advancing ACK_ECN that is adopted:
+    /// having been generated after the acknowledgement, its counts necessarily
+    /// include whatever the acknowledged packet contributed.
+    ecn_sync_owed: bool = false,
     /// When a migration's wait for the previous epoch stops being worth it.
     /// The barrier cannot always drain — a marked packet that is never
     /// acknowledged is never settled — so it is bounded, and running out fails
@@ -1481,7 +1499,14 @@ pub const Connection = struct {
         // and starts marking.
         if (self.ecn_marking_generation) |marking| {
             if (marking != active.generation) {
-                if (self.ecn_outstanding_marked > 0) {
+                if (self.ecn_outstanding_marked > 0 or self.ecn_sync_owed) {
+                    // Two obligations, not one. A mark still outstanding may
+                    // yet be counted; a mark already acknowledged without a
+                    // current report may *already* have been counted, unseen.
+                    // Either way the trusted baseline is not known to be level
+                    // with the peer's, and a new path started from it would be
+                    // handed the old path's growth as its own evidence.
+                    //
                     // Bounded, because the wait can be unbounded: a marked
                     // packet that is never acknowledged is never settled, and
                     // no amount of waiting makes it so. Running out fails ECN
@@ -1499,6 +1524,11 @@ pub const Connection = struct {
                 }
                 self.ecn_marking_generation = null;
                 self.ecn_barrier_deadline_us = null;
+                // Carried marks belong to the epoch that placed them. The
+                // barrier has just certified that epoch as settled, so they
+                // have been accounted for and must not follow the new one.
+                self.ecn_carried_marked = 0;
+                self.ecn_carried_generation = null;
             }
         }
 
@@ -1591,6 +1621,8 @@ pub const Connection = struct {
         self.ecn_marking_generation = null;
         self.ecn_outstanding_marked = 0;
         self.ecn_carried_marked = 0;
+        self.ecn_carried_generation = null;
+        self.ecn_sync_owed = false;
         self.ecn_barrier_deadline_us = null;
         self.ecn_history.len = 0;
         for (&self.paths.paths) |*slot| {
@@ -2459,7 +2491,20 @@ pub const Connection = struct {
         const advances = self.largest_ecn_acked[space_idx] == null or
             ack.largest_acknowledged > self.largest_ecn_acked[space_idx].?;
         if (!advances) {
-            self.ecn_carried_marked +|= tally.total();
+            // The marks it retired stay tied to the epoch that placed them,
+            // and only that epoch's may be carried; anything else is another
+            // path's evidence and is handled by the barrier below.
+            if (self.ecn_marking_generation) |marking| {
+                const own = tally.countFor(marking);
+                if (own > 0) {
+                    self.ecn_carried_marked +|= own;
+                    self.ecn_carried_generation = marking;
+                }
+            }
+            // Retiring a mark is not the same as synchronising on it. These
+            // deliveries are real, but no current report has been adopted for
+            // them, so the trusted baseline is now behind by an unknown amount.
+            if (tally.total() > 0) self.ecn_sync_owed = true;
             return;
         }
         self.largest_ecn_acked[space_idx] = ack.largest_acknowledged;
@@ -2481,9 +2526,20 @@ pub const Connection = struct {
         // count honest; the epoch barrier in `syncPathEcn` is what makes it
         // sufficient, by ensuring no previous path's marks are still in flight
         // to contribute growth this path would otherwise be promoted on.
+        // An advancing ACK with no counts at all still acknowledges whatever it
+        // acknowledges. The path fails on that (`missing_counts`), but the
+        // connection also owes a synchronisation point: those marks may
+        // already be in the peer's counters, unseen from here.
+        if (feedback == null and tally.total() > 0) self.ecn_sync_owed = true;
+
         const active = self.paths.activePathRef();
-        const carried = self.ecn_carried_marked;
+        // Carried marks apply only to the epoch that placed them.
+        const carried = if (self.ecn_carried_generation == active.generation)
+            self.ecn_carried_marked
+        else
+            0;
         self.ecn_carried_marked = 0;
+        self.ecn_carried_generation = null;
         const rejected = self.applyEcnFeedback(
             active,
             tally.countFor(active.generation) +| carried,
@@ -2534,6 +2590,11 @@ pub const Connection = struct {
             return;
         }
         self.ecn_last_counts = counts;
+        // A current report has been adopted. It was generated after every
+        // acknowledgement processed so far, so its counters necessarily include
+        // whatever those acknowledged packets contributed: the trusted baseline
+        // is level with the peer's again.
+        self.ecn_sync_owed = false;
     }
 
     /// Returns the reason this path rejected the report, or null when it did
@@ -10695,6 +10756,11 @@ test "driver: old-path ECN growth cannot validate a new path that strips marks" 
     try testing.expect(pair.server.ecn_outstanding_marked > 0);
 
     try migrateServerPath(pair);
+    // The migration exchange acknowledges the highest packet number sent so
+    // far, so a report built on that would be non-advancing and — correctly —
+    // ignored for validation. One more datagram makes the report below current.
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
     const space_idx = Connection.spaceIndex(.application);
     const old_largest = pair.server.next_pn[space_idx] - 1;
     const old_marked = markedAwaitingAck(pair.server, old_largest);
@@ -10713,7 +10779,6 @@ test "driver: old-path ECN growth cannot validate a new path that strips marks" 
     }, pair.now_us);
 
     // N starts marking, and the network strips every one of its codepoints.
-    var out: [2048]u8 = undefined;
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
     try testing.expectEqual(quic_ecn.State.testing, pair.server.pathEcn().state);
     _ = try pair.server.writeStream(sid, &[_]u8{0x68} ** 4096, false);
@@ -10736,6 +10801,164 @@ test "driver: old-path ECN growth cannot validate a new path that strips marks" 
 
     try testing.expect(pair.server.pathEcn().state != .capable);
     try testing.expectEqual(validated_before, pair.server.metrics.ecn_validated);
+    try testing.expectEqual(State.established, pair.server.state());
+}
+
+test "driver: a plain ACK of a marked packet blocks the next epoch until resynchronised" {
+    const allocator = testing.allocator;
+    var pair = try MigrationPair.initWithEcn(allocator, .full, true);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const sid = try pair.server.openStream(.uni);
+    _ = try pair.server.writeStream(sid, &[_]u8{0x6e} ** 4096, false);
+    _ = drainTransmits(pair.server, &pair.now_us);
+    const space_idx = Connection.spaceIndex(.application);
+    const trusted = pair.server.ecn_last_counts;
+    const largest = pair.server.next_pn[space_idx] - 1;
+    try testing.expect(markedAwaitingAck(pair.server, largest) > 0);
+
+    // The old path's marks arrive and are counted by the peer — but the ACK
+    // carries no counts. The path rightly fails, and the connection is left
+    // with a trusted baseline that is behind the peer's by an unknown amount:
+    // those marks may already be in its cumulative counters, unseen from here.
+    var plain = recovery.AckRangeSet{};
+    try plain.insertRange(.{ .first = 0, .last = largest });
+    pair.server.processAck(.application, .{
+        .ranges = plain,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = largest,
+        .ecn = null,
+    }, pair.now_us);
+    try testing.expectEqual(
+        @as(?quic_ecn.FailureReason, .missing_counts),
+        pair.server.pathEcn().failure,
+    );
+    try testing.expect(pair.server.ecn_sync_owed);
+
+    // Simulate the epoch change a migration produces, rather than driving the
+    // exchange: that exchange carries the peer's own ACK_ECN, which would
+    // legitimately resynchronise the baseline and hide the case under test. A
+    // new path incarnation gets a fresh controller by construction.
+    pair.server.paths.activeEcn().reset();
+    pair.server.ecn_marking_generation = pair.server.paths.activePathRef().generation +| 1;
+
+    // The new epoch must not start from that baseline. Doing so would hand the
+    // new path the old path's counter growth as its own evidence the moment it
+    // finally shows up.
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
+    try testing.expectEqual(quic_ecn.State.disabled, pair.server.pathEcn().state);
+    try testing.expectEqual(quic_udp.Ecn.not_ect, pair.server.ecnCodepoint());
+
+    // The old growth arrives on a current report. That is the synchronisation
+    // point: adopting it brings the baseline level with the peer, and only
+    // then may a new epoch begin — from counters that already contain it.
+    // A fresh packet first, so the report is current rather than a duplicate
+    // of the one that already set the ordering boundary.
+    _ = try pair.server.writeStream(sid, "resync", false);
+    _ = drainTransmits(pair.server, &pair.now_us);
+    const resync_largest = pair.server.next_pn[space_idx] - 1;
+    var resync = recovery.AckRangeSet{};
+    try resync.insertRange(.{ .first = 0, .last = resync_largest });
+    pair.server.processAck(.application, .{
+        .ranges = resync,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = resync_largest,
+        .ecn = .{ .ect0 = trusted.ect0 + 1, .ect1 = 0, .ce = trusted.ce },
+    }, pair.now_us);
+    try testing.expect(!pair.server.ecn_sync_owed);
+    try testing.expectEqual(trusted.ect0 + 1, pair.server.ecn_last_counts.ect0);
+
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
+    try testing.expectEqual(quic_ecn.State.testing, pair.server.pathEcn().state);
+    // The new path starts from counters that already include the old mark, so
+    // that growth can never be re-spent as this path's evidence.
+    try testing.expectEqual(trusted.ect0 + 1, pair.server.pathEcn().seen.ect0);
+}
+
+test "driver: a gap filled by a stale ACK stays the old epoch's evidence" {
+    const allocator = testing.allocator;
+    var pair = try MigrationPair.initWithEcn(allocator, .full, true);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const sid = try pair.server.openStream(.uni);
+    _ = try pair.server.writeStream(sid, &[_]u8{0x70} ** 4096, false);
+    _ = drainTransmits(pair.server, &pair.now_us);
+    const space_idx = Connection.spaceIndex(.application);
+    const largest = pair.server.next_pn[space_idx] - 1;
+    try testing.expect(largest >= 2);
+    const trusted = pair.server.ecn_last_counts;
+    const old_generation = pair.server.ecn_marking_generation orelse
+        return error.TestExpectedEqual;
+    // An advancing report that leaves a hole at `gap`.
+    const gap = largest - 1;
+    var with_gap = recovery.AckRangeSet{};
+    try with_gap.insertRange(.{ .first = 0, .last = gap - 1 });
+    try with_gap.insertRange(.{ .first = largest, .last = largest });
+    const acked_marks = blk: {
+        var n: u64 = 0;
+        for (pair.server.ecn_history.entries[0..pair.server.ecn_history.len]) |e| {
+            if (e.marked and with_gap.contains(e.packet_number)) n += 1;
+        }
+        break :blk n;
+    };
+    pair.server.processAck(.application, .{
+        .ranges = with_gap,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = largest,
+        .ecn = .{ .ect0 = trusted.ect0 + acked_marks, .ect1 = 0, .ce = trusted.ce },
+    }, pair.now_us);
+
+    // A later *non-advancing* ACK fills the hole. The delivery is real, so the
+    // packet is retired — but its counter growth has not been reported by any
+    // current report, so it remains the old epoch's unsettled business.
+    var fills_gap = recovery.AckRangeSet{};
+    try fills_gap.insertRange(.{ .first = 0, .last = largest });
+    pair.server.processAck(.application, .{
+        .ranges = fills_gap,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = largest,
+        .ecn = .{ .ect0 = trusted.ect0 + acked_marks, .ect1 = 0, .ce = trusted.ce },
+    }, pair.now_us);
+    try testing.expect(pair.server.ecn_sync_owed);
+    try testing.expectEqual(@as(?u64, old_generation), pair.server.ecn_carried_generation);
+
+    // A new epoch must neither start from the stale baseline nor inherit the
+    // carried mark as its own newly acknowledged evidence. The epoch change is
+    // simulated rather than driven, because a real migration exchange carries
+    // the peer's own ACK_ECN and would resynchronise before the case under
+    // test could arise.
+    // Bumping the active slot's generation is what a recycled or re-validated
+    // path slot does, and it gives the fresh controller a new incarnation
+    // without driving an exchange that would resynchronise first.
+    pair.server.paths.paths[pair.server.paths.active].?.generation = old_generation +| 1;
+    pair.server.paths.activeEcn().reset();
+    try testing.expect(pair.server.paths.activePathRef().generation != old_generation);
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
+    try testing.expectEqual(quic_ecn.State.disabled, pair.server.pathEcn().state);
+
+    // A current report resynchronises, and starting the new epoch discards the
+    // old one's carried evidence rather than crediting it to the new path.
+    _ = try pair.server.writeStream(sid, "resync", false);
+    _ = drainTransmits(pair.server, &pair.now_us);
+    const resync_largest = pair.server.next_pn[space_idx] - 1;
+    var resync = recovery.AckRangeSet{};
+    try resync.insertRange(.{ .first = 0, .last = resync_largest });
+    pair.server.processAck(.application, .{
+        .ranges = resync,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = resync_largest,
+        .ecn = .{ .ect0 = trusted.ect0 + acked_marks + 1, .ect1 = 0, .ce = trusted.ce },
+    }, pair.now_us);
+    try testing.expect(!pair.server.ecn_sync_owed);
+
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
+    try testing.expectEqual(quic_ecn.State.testing, pair.server.pathEcn().state);
+    try testing.expectEqual(@as(u64, 0), pair.server.ecn_carried_marked);
+    try testing.expectEqual(@as(?u64, null), pair.server.ecn_carried_generation);
     try testing.expectEqual(State.established, pair.server.state());
 }
 

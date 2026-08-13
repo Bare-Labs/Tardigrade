@@ -298,6 +298,15 @@ path it has been reached on:
   counted while the ACK reporting it was itself lost. Since a packet that is
   never acknowledged is never settled, the wait is bounded — and running out
   turns ECN off for the connection rather than releasing on an assumption.
+
+  Acknowledgement alone is not quite enough either. If the ACK that
+  acknowledged a mark carried no counts, or carried stale ones, the peer may
+  already have counted that mark where this endpoint cannot see it — so the
+  trusted baseline is behind by an unknown amount, and a new path started from
+  it would be handed the old path's growth as its own evidence. The wait
+  therefore also covers that obligation, discharged by the next current
+  ACK_ECN: generated after the acknowledgement, its counters necessarily
+  include whatever the acknowledged packet contributed.
 - **An ACK that does not advance the largest acknowledged packet number is
   ignored entirely** (RFC 9000 §13.4.2.1). Cumulative counters arrive
   legitimately stale on a reordered ACK, and validating against them would
