@@ -284,6 +284,12 @@ path it has been reached on:
   would halve the new path's window for congestion that is no longer on the
   route. Promotion additionally requires an acknowledgement of a packet the
   new path itself marked.
+
+  Only an *acknowledgement* drains that wait. A loss declaration does not:
+  QUIC loss is an inference, and the packet may well have arrived and been
+  counted while the ACK reporting it was itself lost. Since a packet that is
+  never acknowledged is never settled, the wait is bounded — and running out
+  turns ECN off for the connection rather than releasing on an assumption.
 - **An ACK that does not advance the largest acknowledged packet number is
   ignored entirely** (RFC 9000 §13.4.2.1). Cumulative counters arrive
   legitimately stale on a reordered ACK, and validating against them would
@@ -291,7 +297,17 @@ path it has been reached on:
 
 The testing window is armed by the first marked packet rather than by
 enabling, so an idle connection cannot time out a path that was never given a
-chance to carry one.
+chance to carry one. Only packets that are *in flight* are marked at all —
+never a pure ACK, which RFC 9000 §13.2 notes can go unacknowledged for a long
+time and so would arm that window on feedback that may never come.
+
+Two of these end in ECN being off for the whole connection rather than for one
+path: `evidence_lost` (the bounded per-connection ECN metadata overflowed, or a
+migration's wait ran out) and `platform_unsupported`. Both are conservative by
+design — the peer's counters drive congestion response, so when attribution
+stops being provable the answer is to stop using them, not to keep going on
+evidence that can no longer be checked. A long-lived connection over a lossy
+path can reach `evidence_lost`; that is a deliberate trade, not a defect.
 
 Validation is not a formality. The peer's counters are an *input to congestion
 control*, reachable by anything on the path and by the peer itself, so they are
@@ -305,6 +321,8 @@ checked against what this endpoint actually sent before they are believed:
 | More marked arrivals reported than were ever marked | `counts_exceed_sent` |
 | Marked packets acknowledged without matching counter growth | `insufficient_increase` |
 | No usable feedback within the testing window (3×PTO) | `testing_timeout` |
+| Metadata needed to attribute the counters was dropped | `evidence_lost` |
+| The socket turned out to be unable to set the codepoint | `platform_unsupported` |
 
 Any of these turns marking off for that path and the connection continues
 normally. **CE reports are acted on only on a validated path**, so an

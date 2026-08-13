@@ -917,20 +917,20 @@ const EcnSentMeta = struct {
     path_generation: u64,
     sent_time_us: u64,
     marked: bool,
-    /// Whether this packet can still move the peer's cumulative counters.
-    /// Cleared once recovery declares it lost: a packet the peer never
-    /// received never incremented anything. The entry itself stays, so a late
-    /// acknowledgement is still classified correctly — only the connection's
-    /// outstanding-mark accounting stops waiting on it.
-    can_affect_counts: bool = true,
 };
 
-/// How many application-space packets keep ECN metadata. Covers a full flight
-/// with headroom (recovery tracks at most `recovery.max_tracked_packets`), so
-/// eviction is the exception rather than the rule. A fixed array costs every
-/// connection ~4 KiB whether or not ECN is on, which is the price of not
-/// allocating on the send path.
-const ecn_history_capacity: usize = 128;
+/// How many application-space packets keep ECN metadata.
+///
+/// Entries retire fast — every advancing ACK_ECN clears everything at or below
+/// its largest acknowledged packet number — so this only has to cover packets
+/// sent since the last such ACK, which is a flight. Twice
+/// `recovery.max_tracked_packets` leaves room for the untracked packets
+/// recovery never sees. Overflowing it is not a silent condition: evicting an
+/// entry whose evidence is still owed fails ECN closed (`evidence_lost`),
+/// because memory pressure says nothing about whether that packet moved the
+/// peer's counters. A fixed array costs every connection ~8 KiB whether or not
+/// ECN is on, which is the price of not allocating on the send path.
+const ecn_history_capacity: usize = 2 * recovery.max_tracked_packets;
 
 /// Bounded ECN metadata for recently sent application-space packets.
 ///
@@ -1010,6 +1010,12 @@ const EcnAckTally = struct {
             if (entry.generation == generation) return entry.count;
         }
         return 0;
+    }
+
+    fn total(self: EcnAckTally) u64 {
+        var sum: u64 = 0;
+        for (self.entries[0..self.len]) |entry| sum +|= entry.count;
+        return sum;
     }
 };
 
@@ -1107,6 +1113,17 @@ pub const Connection = struct {
     /// see `syncPathEcn`.
     ecn_marking_generation: ?u64 = null,
     ecn_outstanding_marked: u32 = 0,
+    /// Marks retired by an ACK that did *not* advance the largest acknowledged
+    /// packet number, owed to the next one that does. Such an ACK really does
+    /// newly acknowledge those packets — it filled a gap — but its cumulative
+    /// counters are stale, so the growth they require has to be demanded of
+    /// the next report that is current (#256-E review).
+    ecn_carried_marked: u64 = 0,
+    /// When a migration's wait for the previous epoch stops being worth it.
+    /// The barrier cannot always drain — a marked packet that is never
+    /// acknowledged is never settled — so it is bounded, and running out fails
+    /// ECN closed rather than releasing on an assumption (#256-E review).
+    ecn_barrier_deadline_us: ?u64 = null,
     /// Whether an ACK must be assembled for the space, and when the obligation
     /// arose (for the encoded ack_delay and the delayed-ack timer).
     ack_needed: [3]bool = .{ false, false, false },
@@ -1449,7 +1466,6 @@ pub const Connection = struct {
     /// marked, which is only a clean comparison once one packet number space
     /// is doing all the work.
     fn syncPathEcn(self: *Connection, now_us: u64) void {
-        _ = now_us;
         if (!self.cfg.ecn_enabled) return;
         if (!self.handshake_confirmed or self.state_ != .established) return;
         const active = self.paths.activePathRef();
@@ -1465,8 +1481,24 @@ pub const Connection = struct {
         // and starts marking.
         if (self.ecn_marking_generation) |marking| {
             if (marking != active.generation) {
-                if (self.ecn_outstanding_marked > 0) return;
+                if (self.ecn_outstanding_marked > 0) {
+                    // Bounded, because the wait can be unbounded: a marked
+                    // packet that is never acknowledged is never settled, and
+                    // no amount of waiting makes it so. Running out fails ECN
+                    // closed for the connection rather than releasing on the
+                    // assumption that an unacknowledged packet was never
+                    // counted — which is precisely the assumption that lets an
+                    // old path's evidence validate a new one.
+                    const deadline = self.ecn_barrier_deadline_us orelse deadline: {
+                        const at = now_us +| quic_ecn.testing_pto_multiplier *| self.ptoDurationNow();
+                        self.ecn_barrier_deadline_us = at;
+                        break :deadline at;
+                    };
+                    if (now_us >= deadline) self.failEcnClosed(.evidence_lost);
+                    return;
+                }
                 self.ecn_marking_generation = null;
+                self.ecn_barrier_deadline_us = null;
             }
         }
 
@@ -1508,11 +1540,15 @@ pub const Connection = struct {
             .sent_time_us = now_us,
             .marked = marked,
         })) |evicted| {
-            // An evicted entry can no longer be classified, so it must stop
-            // holding the barrier open. Under-counting here only ever delays
-            // nothing and releases the barrier sooner, which is why eviction
-            // is bounded by a capacity comfortably above a full flight.
-            self.releaseEcnOutstanding(evicted);
+            // Evicting an entry whose evidence is still owed loses the ability
+            // to check something that matters: whether a mark this endpoint
+            // placed came back counted. Silently dropping it would let a
+            // stripped mark go unnoticed — 129 marked packets, the oldest
+            // evicted and stripped, and an ACK covering all of them validates
+            // on 128 — and would release the migration barrier on a packet
+            // whose contribution to the peer's counters is unknown. Memory
+            // pressure is not evidence, so this fails ECN closed instead.
+            if (evicted.marked) self.failEcnClosed(.evidence_lost);
         }
         if (!marked) return;
         self.paths.activeEcn().onMarkedSent(
@@ -1523,25 +1559,56 @@ pub const Connection = struct {
         self.metrics.ecn_marked_sent += 1;
     }
 
-    /// Stop waiting on one marked packet: it was acknowledged, declared lost,
-    /// or fell out of the history.
+    /// Stop waiting on one marked packet, because the peer acknowledged it and
+    /// its contribution to the counters is therefore settled.
+    ///
+    /// Acknowledgement is the *only* thing that qualifies. It is tempting to
+    /// also retire a packet the peer has evidently moved past — one below a
+    /// later ACK's largest acknowledged number — on the grounds that its
+    /// contribution must already be in those counts. That is exactly backwards:
+    /// a QUIC receiver reports every packet number it has received in its ACK
+    /// ranges, so a packet *missing* from them had not arrived when the ACK was
+    /// generated, and its contribution is still to come.
+    ///
+    /// Notably *not* a loss declaration. QUIC loss is an inference, not proof
+    /// of non-delivery: the packet may have arrived and incremented the peer's
+    /// counter while the ACK carrying that increment was itself lost, and this
+    /// implementation deliberately supports acknowledging a packet after
+    /// declaring it lost. RFC 9000 §13.4.2 treats an ECT-marked packet deemed
+    /// lost as validation *evidence*, not as proof it was never counted.
     fn releaseEcnOutstanding(self: *Connection, meta: EcnSentMeta) void {
-        if (!meta.marked or !meta.can_affect_counts) return;
+        if (!meta.marked) return;
         self.ecn_outstanding_marked -|= 1;
     }
 
-    /// Recovery declared an application-space packet lost. The peer never
-    /// received it, so it can no longer move the peer's counters and must stop
-    /// holding the epoch barrier open — but the history entry survives, so a
-    /// late acknowledgement (a spurious loss, a reordered ACK) is still
-    /// classified rather than silently unaccounted.
-    fn noteEcnPacketLost(self: *Connection, space: PacketNumberSpace, packet_number: u64) void {
-        if (space != .application or !self.cfg.ecn_enabled) return;
-        const index = self.ecn_history.find(packet_number) orelse return;
-        const entry = &self.ecn_history.entries[index];
-        if (!entry.can_affect_counts) return;
-        entry.can_affect_counts = false;
-        if (entry.marked) self.ecn_outstanding_marked -|= 1;
+    /// Give up on ECN for this connection because something needed to attribute
+    /// the peer's counters is gone. Marking stops on every path, and no new
+    /// epoch may start: the alternative is continuing to feed congestion
+    /// control from counters nothing can check.
+    fn failEcnClosed(self: *Connection, reason: quic_ecn.FailureReason) void {
+        if (!self.cfg.ecn_enabled) return;
+        self.cfg.ecn_enabled = false;
+        self.ecn_marking_generation = null;
+        self.ecn_outstanding_marked = 0;
+        self.ecn_carried_marked = 0;
+        self.ecn_barrier_deadline_us = null;
+        self.ecn_history.len = 0;
+        for (&self.paths.paths) |*slot| {
+            const path = &(slot.* orelse continue);
+            if (!path.ecn.marking()) continue;
+            path.ecn.disable(reason);
+            self.publishEcnState(path.key, .disabled, reason);
+        }
+    }
+
+    /// The socket layer has discovered it cannot put the codepoint on the wire
+    /// after all, so every packet this connection believes it marked actually
+    /// left Not-ECT (#256-E review). Distinct from a path failing validation:
+    /// nothing was learned about any path, and continuing to count marks the
+    /// socket did not send would make both the transport counters and the
+    /// listener snapshot claim something untrue.
+    pub fn disableEcnUnsupported(self: *Connection) void {
+        self.failEcnClosed(.platform_unsupported);
     }
 
     /// Publish an ECN state transition for `path`: the operator counter and
@@ -2355,23 +2422,13 @@ pub const Connection = struct {
         if (space != .application or !self.cfg.ecn_enabled) return;
         const space_idx = spaceIndex(space);
 
-        // RFC 9000 §13.4.2.1: an ACK that does not increase the largest
-        // acknowledged packet number must not fail ECN validation. The peer's
-        // counters are cumulative, so a delayed ACK carries the values as of
-        // *its* largest — older than what has already been processed — and
-        // judging those against the current state would read ordinary
-        // reordering as a peer walking its counters backwards. Nothing here
-        // runs for such an ACK: not the tally, not the counter update, not the
-        // history reaping, all of which would corrupt the ordering boundary.
-        const advances = self.largest_ecn_acked[space_idx] == null or
-            ack.largest_acknowledged > self.largest_ecn_acked[space_idx].?;
-        if (!advances) return;
-        self.largest_ecn_acked[space_idx] = ack.largest_acknowledged;
-
-        // Newly acknowledged packets, from the ECN history rather than from
-        // `sent_records`: a packet declared lost is gone from the latter and
-        // can still be acknowledged (a spurious loss, a reordered ACK), and
-        // RFC 9000 §13.4.2.1 is about what an ACK *newly acknowledges*.
+        // Retiring metadata and validating counters are two different things,
+        // and only the second is subject to the ordering rule. An ACK that
+        // does not advance the largest acknowledged packet number can still
+        // *newly acknowledge* a packet that was a gap in an earlier one, and
+        // that delivery is irrevocable — the peer is under no obligation to
+        // repeat the range. Leaving the entry charged would hold the migration
+        // barrier open until eviction, which now fails ECN closed.
         var tally = EcnAckTally{};
         var history_largest_sent_us: ?u64 = null;
         var index: usize = 0;
@@ -2388,6 +2445,24 @@ pub const Connection = struct {
             self.releaseEcnOutstanding(entry);
             self.ecn_history.removeAt(index);
         }
+
+        // RFC 9000 §13.4.2.1: an ACK that does not increase the largest
+        // acknowledged packet number must not fail ECN validation. The peer's
+        // counters are cumulative, so a delayed ACK carries the values as of
+        // *its* largest — older than what has already been processed — and
+        // judging those against the current state would read ordinary
+        // reordering as a peer walking its counters backwards.
+        //
+        // The marks it retired are not forgotten, though: their growth is owed
+        // by the next report that is current, so they are carried forward
+        // rather than dropped.
+        const advances = self.largest_ecn_acked[space_idx] == null or
+            ack.largest_acknowledged > self.largest_ecn_acked[space_idx].?;
+        if (!advances) {
+            self.ecn_carried_marked +|= tally.total();
+            return;
+        }
+        self.largest_ecn_acked[space_idx] = ack.largest_acknowledged;
 
         const feedback: ?quic_ecn.Feedback = if (ack.ecn) |counts|
             .{ .ect0 = counts.ect0, .ect1 = counts.ect1, .ce = counts.ce }
@@ -2412,9 +2487,11 @@ pub const Connection = struct {
         // sufficient, by ensuring no previous path's marks are still in flight
         // to contribute growth this path would otherwise be promoted on.
         const active = self.paths.activePathRef();
+        const carried = self.ecn_carried_marked;
+        self.ecn_carried_marked = 0;
         self.applyEcnFeedback(
             active,
-            tally.countFor(active.generation),
+            tally.countFor(active.generation) +| carried,
             feedback,
             history_largest_sent_us orelse record_largest_sent_us,
             now_us,
@@ -2508,11 +2585,10 @@ pub const Connection = struct {
                 continue;
             }
             count += 1;
-            // #256-E: a lost packet never reached the peer, so it can no
-            // longer move the peer's ECN counters and must stop holding the
-            // migration barrier open. Its history entry survives, so a late
-            // acknowledgement is still classified.
-            self.noteEcnPacketLost(space, record.packet_number);
+            // #256-E deliberately does nothing here. A loss declaration is an
+            // inference, not proof the peer never received the packet, so it
+            // neither retires the packet's ECN metadata nor releases the
+            // migration barrier. See `releaseEcnOutstanding`.
             if (record.carried_pmtu_probe != null) {
                 // Nothing to requeue: a probe carries no user data, and the
                 // search decides for itself whether to retry this size. The
@@ -3609,6 +3685,7 @@ pub const Connection = struct {
         var datagram_len: usize = 0;
         var has_initial = false;
         var sent_ack_eliciting = false;
+        var datagram_marked = false;
 
         const levels = [_]EncryptionLevel{ .initial, .handshake, .application };
         for (levels) |level| {
@@ -3621,6 +3698,7 @@ pub const Connection = struct {
             datagram_len += written.len;
             has_initial = has_initial or level == .initial;
             sent_ack_eliciting = sent_ack_eliciting or written.ack_eliciting;
+            datagram_marked = datagram_marked or written.ecn_marked;
             if (level == .handshake) {
                 if (!self.sent_handshake_packet) {
                     self.sent_handshake_packet = true;
@@ -3638,13 +3716,16 @@ pub const Connection = struct {
         self.paths.recordSentOnPath(active_key, datagram_len);
         self.metrics.datagrams_sent += 1;
         if (sent_ack_eliciting) self.armIdle(now_us);
-        // Every packet coalesced above shares this datagram's single IP
-        // header, so the codepoint is a property of the datagram — read once,
-        // here, from the same state each `buildPacket` stamped onto its record.
+        // Every packet coalesced above shares this datagram's single IP header,
+        // so the codepoint is a property of the datagram — and it must be
+        // exactly what the packets inside it were counted as. A datagram
+        // marked on the wire but not counted would make the peer's honest
+        // report look like an over-claim, which is why this follows what
+        // `buildPacket` actually did rather than re-reading the path state.
         return .{
             .bytes = out[0..datagram_len],
             .path = active_key,
-            .ecn = self.paths.activeEcn().sendCodepoint(),
+            .ecn = if (datagram_marked) quic_ecn.send_codepoint else .not_ect,
         };
     }
 
@@ -3928,7 +4009,14 @@ pub const Connection = struct {
             .size = total,
             .ack_eliciting = true,
         } });
-        return .{ .bytes = out[0..total], .path = active_key, .ecn = self.paths.activeEcn().sendCodepoint() };
+        // A probe is ack-eliciting and in flight, so it marks like ordinary
+        // traffic — but the codepoint still follows what was counted rather
+        // than the path state, so the two can never disagree.
+        return .{
+            .bytes = out[0..total],
+            .path = active_key,
+            .ecn = if (ecn_marked) quic_ecn.send_codepoint else .not_ect,
+        };
     }
 
     const BuildContext = struct {
@@ -3939,6 +4027,10 @@ pub const Connection = struct {
     const BuiltPacket = struct {
         len: usize,
         ack_eliciting: bool,
+        /// Whether this packet was marked ECT(0) (#256-E). The datagram's IP
+        /// header carries one codepoint for everything coalesced into it, so
+        /// the caller ORs this across the packets it builds.
+        ecn_marked: bool = false,
     };
 
     /// Assemble, seal, and record one packet at `level` into `out`. Returns
@@ -3952,6 +4044,10 @@ pub const Connection = struct {
         ctx: BuildContext,
     ) ?BuiltPacket {
         const space_idx = spaceIndex(space);
+        // Read once here rather than at the end: the path's state cannot
+        // change mid-build, and validation is a statement about how the packet
+        // actually left rather than about the state it finds later.
+        const ecn_marking = self.activeEcnMarking();
         // Ordinary traffic stays on the fixed tracker. Required PTO/padding
         // traffic pre-reserves recovery overflow before any frame is dequeued.
         const can_track_ordinary = self.recovery.canTrackPacket();
@@ -4054,7 +4150,6 @@ pub const Connection = struct {
             // content is built and recorded by `buildCandidatePacket`.
             .sent_path = self.paths.activePathRef(),
         };
-        const ecn_marked = self.activeEcnMarking();
         // `record` may pick up a dequeued NEW_CONNECTION_ID's reset token
         // below; `self.sent_records.append` (if reached) copies it into the
         // owned, tracked record, but this local stays around until every
@@ -4242,11 +4337,15 @@ pub const Connection = struct {
         if (record.has_new_connection_id) {
             if (self.local_cids) |*registry| registry.markAdvertised(record.carried_new_connection_id.sequence) catch {};
         }
-        // Recorded per *packet*, matching RFC 9000 §13.4.1's per-packet receive
-        // counters — and for pure ACKs too, which are not in flight and so
-        // were never published as a record. The peer counts them all the same,
-        // and a marked packet this endpoint failed to count would make the
-        // peer's honest report look like an over-claim.
+        // #256-E: only a packet that is in flight may be marked. A pure ACK is
+        // neither ack-eliciting nor tracked by recovery, and RFC 9000 §13.2
+        // notes it can go unacknowledged for a long time — so marking one
+        // would arm the testing window on a packet that may never produce
+        // feedback, and after a migration would hold the epoch barrier open
+        // with nothing able to resolve it. Recorded either way: dating a CE
+        // report needs the largest newly acknowledged packet's send time, and
+        // that packet need not have carried a mark.
+        const ecn_marked = ecn_marking and recordIsInFlight(record);
         if (space == .application) self.noteEcnPacketSent(pn, ecn_marked, now_us);
         self.metrics.packets_sent += 1;
         self.events.emit(.{ .packet_sent = .{
@@ -4255,7 +4354,7 @@ pub const Connection = struct {
             .size = total,
             .ack_eliciting = record.ack_eliciting,
         } });
-        return .{ .len = total, .ack_eliciting = record.ack_eliciting };
+        return .{ .len = total, .ack_eliciting = record.ack_eliciting, .ecn_marked = ecn_marked };
     }
 
     /// Whether a PATH_RESPONSE is queued for the active path specifically —
@@ -10425,13 +10524,13 @@ fn migrateServerPath(pair: *MigrationPair) !void {
     try testing.expect(pair.server.activePathKey().eql(rebind_candidate));
 }
 
-test "driver: a migration waits for the old path's marks before testing the new one" {
+test "driver: a loss declaration does not release the migration barrier (#256-E review)" {
     const allocator = testing.allocator;
     var pair = try MigrationPair.initWithEcn(allocator, .full, true);
     defer pair.deinit(allocator);
     try pair.pump();
 
-    // Put marked packets on the old path and leave them outstanding.
+    // Marked packets go out on the old path and are never acknowledged.
     const sid = try pair.server.openStream(.uni);
     _ = try pair.server.writeStream(sid, &[_]u8{0x66} ** 4096, false);
     _ = drainTransmits(pair.server, &pair.now_us);
@@ -10441,27 +10540,103 @@ test "driver: a migration waits for the old path's marks before testing the new 
 
     try migrateServerPath(pair);
 
-    // The epoch barrier. The peer's counters are cumulative per packet number
-    // space, so while the old path's marks can still arrive and move them, no
-    // growth is attributable to the new path — and starting to test here would
-    // let the old path's intact marks validate a route that is stripping every
-    // codepoint. So the new path stays unmarked until the old epoch drains.
+    // The epoch barrier: the peer's counters are cumulative per packet number
+    // space, so while the old path's marks can still be counted, no growth is
+    // attributable to the new path.
     var out: [2048]u8 = undefined;
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
     try testing.expectEqual(quic_ecn.State.disabled, pair.server.pathEcn().state);
     try testing.expectEqual(quic_udp.Ecn.not_ect, pair.server.ecnCodepoint());
     try testing.expectEqual(@as(?u64, old_generation), pair.server.ecn_marking_generation);
 
-    // Once those packets are resolved — here by being declared lost, which is
-    // proof enough that they never reached the peer and so never moved a
-    // counter — the new path may start its own epoch.
+    // Declaring those packets lost must NOT release the barrier. QUIC loss is
+    // an inference, not proof of non-delivery: the packet may have arrived and
+    // incremented the peer's counter while the ACK carrying that increment was
+    // itself lost. Releasing here would let the new path start from a baseline
+    // missing that contribution, and then validate on it.
     _ = pair.server.recovery.tracker.dropSpace(.application);
     _ = pair.server.requeueUntrackedRecords(.application, pair.now_us);
+    try testing.expect(pair.server.ecn_outstanding_marked > 0);
+
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
+    try testing.expectEqual(quic_ecn.State.disabled, pair.server.pathEcn().state);
+    try testing.expectEqual(@as(?u64, old_generation), pair.server.ecn_marking_generation);
+}
+
+test "driver: an acknowledgement is what drains the migration barrier" {
+    const allocator = testing.allocator;
+    var pair = try MigrationPair.initWithEcn(allocator, .full, true);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const sid = try pair.server.openStream(.uni);
+    _ = try pair.server.writeStream(sid, &[_]u8{0x69} ** 4096, false);
+    _ = drainTransmits(pair.server, &pair.now_us);
+    try testing.expect(pair.server.ecn_outstanding_marked > 0);
+
+    try migrateServerPath(pair);
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
+    try testing.expectEqual(quic_ecn.State.disabled, pair.server.pathEcn().state);
+
+    // Captured after the migration exchange, which advances the largest
+    // acknowledged number itself: an ACK built from earlier values would be
+    // non-advancing and correctly ignored for validation.
+    const space_idx = Connection.spaceIndex(.application);
+    const largest = pair.server.next_pn[space_idx] - 1;
+    const marked = markedAwaitingAck(pair.server, largest);
+    try testing.expect(marked > 0);
+    const counts_before = pair.server.ecn_last_counts;
+
+    // The old path's marks are acknowledged, with the counter growth to match.
+    // Now their contribution is settled and folded into `ecn_last_counts`, so
+    // the new path can take a baseline that already accounts for them.
+    var ranges = recovery.AckRangeSet{};
+    try ranges.insertRange(.{ .first = 0, .last = largest });
+    pair.server.processAck(.application, .{
+        .ranges = ranges,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = largest,
+        .ecn = .{ .ect0 = counts_before.ect0 + marked, .ect1 = 0, .ce = counts_before.ce },
+    }, pair.now_us);
     try testing.expectEqual(@as(u32, 0), pair.server.ecn_outstanding_marked);
 
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
     try testing.expectEqual(quic_ecn.State.testing, pair.server.pathEcn().state);
-    try testing.expect(pair.server.ecn_marking_generation.? != old_generation);
+    // And the new path starts from the counters that already include the old
+    // path's contribution, so none of it can be mistaken for its own evidence.
+    try testing.expectEqual(
+        counts_before.ect0 + marked,
+        pair.server.pathEcn().seen.ect0,
+    );
+}
+
+test "driver: a barrier that cannot drain fails ECN closed rather than releasing" {
+    const allocator = testing.allocator;
+    var pair = try MigrationPair.initWithEcn(allocator, .full, true);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const sid = try pair.server.openStream(.uni);
+    _ = try pair.server.writeStream(sid, &[_]u8{0x6a} ** 4096, false);
+    _ = drainTransmits(pair.server, &pair.now_us);
+    try testing.expect(pair.server.ecn_outstanding_marked > 0);
+    try migrateServerPath(pair);
+
+    // The old marks are never acknowledged, so the barrier can never be shown
+    // to have drained. Waiting forever is not an option and releasing is not
+    // sound, so the bounded wait expires and ECN stops for the connection.
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
+    try testing.expect(pair.server.ecn_barrier_deadline_us != null);
+
+    pair.now_us = pair.server.ecn_barrier_deadline_us.?;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
+    try testing.expect(!pair.server.cfg.ecn_enabled);
+    try testing.expectEqual(quic_ecn.State.disabled, pair.server.pathEcn().state);
+    try testing.expectEqual(quic_udp.Ecn.not_ect, pair.server.ecnCodepoint());
+    // Falling back is not failing: the connection carries on unchanged.
+    try testing.expectEqual(State.established, pair.server.state());
 }
 
 test "driver: old-path ECN growth cannot validate a new path that strips marks" {
@@ -10470,33 +10645,54 @@ test "driver: old-path ECN growth cannot validate a new path that strips marks" 
     defer pair.deinit(allocator);
     try pair.pump();
 
-    // Leave marked packets outstanding on the old path, then migrate. Every
-    // datagram the server sends from here on has its codepoint stripped.
+    // The reviewer's sequence: path O's marked packet is received by the peer
+    // and counted, path N then starts and strips its own marks, and O's growth
+    // arrives afterwards. N must not be validated by it.
     const sid = try pair.server.openStream(.uni);
     _ = try pair.server.writeStream(sid, &[_]u8{0x67} ** 4096, false);
     _ = drainTransmits(pair.server, &pair.now_us);
-    try migrateServerPath(pair);
-    pair.network_ecn = clearsEcn;
+    try testing.expect(pair.server.ecn_outstanding_marked > 0);
 
-    // The old path's marks now arrive and are reported honestly: real ECT(0)
-    // growth in the packet number space, caused entirely by path O. Without
-    // the barrier this growth would reach path N's controller, which — having
-    // sent marks of its own — would take it as proof that N carries ECN.
+    try migrateServerPath(pair);
     const space_idx = Connection.spaceIndex(.application);
-    const largest = pair.server.next_pn[space_idx] - 1;
-    const marked = markedAwaitingAck(pair.server, largest);
-    try testing.expect(marked > 0);
-    const validated_before = pair.server.metrics.ecn_validated;
-    var ranges = recovery.AckRangeSet{};
-    try ranges.insertRange(.{ .first = 0, .last = largest });
+    const old_largest = pair.server.next_pn[space_idx] - 1;
+    const old_marked = markedAwaitingAck(pair.server, old_largest);
+    try testing.expect(old_marked > 0);
+    const counts_before = pair.server.ecn_last_counts;
+
+    // O's marks are acknowledged and counted, draining the barrier: N's
+    // baseline therefore already contains every one of them.
+    var old_ranges = recovery.AckRangeSet{};
+    try old_ranges.insertRange(.{ .first = 0, .last = old_largest });
     pair.server.processAck(.application, .{
-        .ranges = ranges,
+        .ranges = old_ranges,
         .ack_delay_raw = 0,
-        .largest_acknowledged = largest,
-        .ecn = .{ .ect0 = marked, .ect1 = 0, .ce = 0 },
+        .largest_acknowledged = old_largest,
+        .ecn = .{ .ect0 = counts_before.ect0 + old_marked, .ect1 = 0, .ce = counts_before.ce },
     }, pair.now_us);
 
-    // N was never validated on O's evidence.
+    // N starts marking, and the network strips every one of its codepoints.
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
+    try testing.expectEqual(quic_ecn.State.testing, pair.server.pathEcn().state);
+    _ = try pair.server.writeStream(sid, &[_]u8{0x68} ** 4096, false);
+    _ = drainTransmits(pair.server, &pair.now_us);
+    const new_largest = pair.server.next_pn[space_idx] - 1;
+    try testing.expect(markedAwaitingAck(pair.server, new_largest) > 0);
+
+    // N's marks come back acknowledged with no further growth at all — because
+    // they were stripped. The counters still show O's historical total, which
+    // is exactly the "old evidence" that must not validate N.
+    const validated_before = pair.server.metrics.ecn_validated;
+    var new_ranges = recovery.AckRangeSet{};
+    try new_ranges.insertRange(.{ .first = 0, .last = new_largest });
+    pair.server.processAck(.application, .{
+        .ranges = new_ranges,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = new_largest,
+        .ecn = .{ .ect0 = counts_before.ect0 + old_marked, .ect1 = 0, .ce = counts_before.ce },
+    }, pair.now_us);
+
     try testing.expect(pair.server.pathEcn().state != .capable);
     try testing.expectEqual(validated_before, pair.server.metrics.ecn_validated);
     try testing.expectEqual(State.established, pair.server.state());
@@ -10509,27 +10705,30 @@ test "driver: an old-path CE report cannot congest the new path" {
     try pair.pump();
 
     const sid = try pair.server.openStream(.uni);
-    _ = try pair.server.writeStream(sid, &[_]u8{0x68} ** 4096, false);
+    _ = try pair.server.writeStream(sid, &[_]u8{0x6b} ** 4096, false);
     _ = drainTransmits(pair.server, &pair.now_us);
-    try migrateServerPath(pair);
+    try testing.expect(pair.server.ecn_outstanding_marked > 0);
 
+    try migrateServerPath(pair);
     const space_idx = Connection.spaceIndex(.application);
     const largest = pair.server.next_pn[space_idx] - 1;
     const marked = markedAwaitingAck(pair.server, largest);
     try testing.expect(marked > 0);
+    const counts_before = pair.server.ecn_last_counts;
     pair.server.recovery.congestion.recovery_start_time_us = null;
 
     // Every one of the old path's marks met congestion. That is real
     // congestion — on the path this connection no longer uses. Halving the new
     // path's window on it would be responding to a bottleneck that is not on
-    // the route any more.
+    // the route any more, and while the barrier holds the new path is not even
+    // marking, so there is nothing of its own for the report to describe.
     var ranges = recovery.AckRangeSet{};
     try ranges.insertRange(.{ .first = 0, .last = largest });
     pair.server.processAck(.application, .{
         .ranges = ranges,
         .ack_delay_raw = 0,
         .largest_acknowledged = largest,
-        .ecn = .{ .ect0 = 0, .ect1 = 0, .ce = marked },
+        .ecn = .{ .ect0 = counts_before.ect0, .ect1 = 0, .ce = counts_before.ce + marked },
     }, pair.now_us);
 
     try testing.expectEqual(@as(u64, 0), pair.server.metrics.ecn_ce_received);
@@ -10537,6 +10736,122 @@ test "driver: an old-path CE report cannot congest the new path" {
         @as(?u64, null),
         pair.server.recovery.congestion.recovery_start_time_us,
     );
+}
+
+test "driver: evicting unresolved ECN evidence fails closed rather than forgetting it" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.initWithConfigs(allocator, ecn_enabled, ecn_enabled);
+    defer pair.deinit(allocator);
+    try pair.pump();
+    try settleEcn(pair);
+    try testing.expect(pair.server.cfg.ecn_enabled);
+
+    // Fill the history past capacity with marked packets that are never
+    // acknowledged. Discarding the oldest silently would lose the only record
+    // that a mark was owed — 129 marked packets with the evicted one stripped
+    // would then validate on 128 — and across a migration it would release the
+    // barrier on a packet whose contribution is unknown. Memory pressure is
+    // not evidence, so it fails ECN closed.
+    var packet_number = pair.server.next_pn[Connection.spaceIndex(.application)];
+    var pushed: usize = 0;
+    while (pushed < ecn_history_capacity + 1) : (pushed += 1) {
+        pair.server.noteEcnPacketSent(packet_number, true, pair.now_us);
+        packet_number += 1;
+    }
+
+    try testing.expect(!pair.server.cfg.ecn_enabled);
+    try testing.expectEqual(quic_ecn.State.disabled, pair.server.pathEcn().state);
+    try testing.expectEqual(
+        @as(?quic_ecn.FailureReason, .evidence_lost),
+        pair.server.pathEcn().failure,
+    );
+    try testing.expectEqual(quic_udp.Ecn.not_ect, pair.server.ecnCodepoint());
+    // And nothing re-enables it: the evidence is gone for good.
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
+    try testing.expectEqual(quic_ecn.State.disabled, pair.server.pathEcn().state);
+    try testing.expectEqual(State.established, pair.server.state());
+}
+
+test "driver: an ACK-only datagram is never marked (#256-E review)" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.initWithConfigs(allocator, ecn_enabled, ecn_enabled);
+    defer pair.deinit(allocator);
+    try pair.pump();
+    try settleEcn(pair);
+
+    // Make the server owe an ACK and nothing else, so its next datagram is a
+    // pure ACK: not ack-eliciting, not tracked by recovery, and — per RFC 9000
+    // §13.2 — able to go unacknowledged for a long time. Marking one would arm
+    // the testing window on a packet that may never produce feedback, and
+    // after a migration would hold the epoch barrier open with nothing able to
+    // resolve it.
+    const sid = try pair.client.openStream(.uni);
+    _ = try pair.client.writeStream(sid, "elicit an ack", false);
+    var buf: [max_datagram_size_ceiling]u8 = undefined;
+    const from_client = pair.client.pollTransmitOnPath(&buf, pair.now_us) orelse
+        return error.TestExpectedEqual;
+    const ingress = quic_path.PathKey{
+        .local = from_client.path.remote,
+        .remote = from_client.path.local,
+    };
+    try pair.server.ingestOnPathWithEcn(
+        from_client.bytes,
+        ingress,
+        from_client.ecn,
+        TestPair.test_challenge_entropy,
+        pair.now_us,
+    );
+
+    const marked_before = pair.server.metrics.ecn_marked_sent;
+    const outstanding_before = pair.server.ecn_outstanding_marked;
+    pair.now_us += local_max_ack_delay_us + 1;
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    const ack_only = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse
+        return error.TestExpectedEqual;
+
+    // A pure ACK is short and carries nothing in flight.
+    try testing.expect(ack_only.bytes.len < base_datagram_size);
+    try testing.expectEqual(quic_udp.Ecn.not_ect, ack_only.ecn);
+    try testing.expectEqual(marked_before, pair.server.metrics.ecn_marked_sent);
+    try testing.expectEqual(outstanding_before, pair.server.ecn_outstanding_marked);
+    // The path is still marking — this is about which packets qualify, not
+    // about ECN being off.
+    try testing.expect(pair.server.pathEcn().marking());
+}
+
+test "driver: a socket that cannot mark disables ECN without blaming the path" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.initWithConfigs(allocator, ecn_enabled, ecn_enabled);
+    defer pair.deinit(allocator);
+    try pair.pump();
+    try settleEcn(pair);
+    try testing.expectEqual(quic_ecn.State.capable, pair.server.pathEcn().state);
+
+    // The listener has discovered the kernel will not set the codepoint, so
+    // every packet this connection believed it marked actually left Not-ECT.
+    // That is not the path's fault and must not be recorded as such, and the
+    // transport must stop counting marks the socket never sent.
+    pair.server.disableEcnUnsupported();
+
+    try testing.expect(!pair.server.cfg.ecn_enabled);
+    try testing.expectEqual(quic_ecn.State.disabled, pair.server.pathEcn().state);
+    try testing.expectEqual(
+        @as(?quic_ecn.FailureReason, .platform_unsupported),
+        pair.server.pathEcn().failure,
+    );
+    try testing.expectEqual(quic_udp.Ecn.not_ect, pair.server.ecnCodepoint());
+
+    const marked_before = pair.server.metrics.ecn_marked_sent;
+    const sid = try pair.server.openStream(.uni);
+    _ = try pair.server.writeStream(sid, &[_]u8{0x71} ** 2048, false);
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    while (pair.server.pollTransmitOnPath(&out, pair.now_us)) |t| {
+        try testing.expectEqual(quic_udp.Ecn.not_ect, t.ecn);
+        pair.now_us += 500;
+    }
+    try testing.expectEqual(marked_before, pair.server.metrics.ecn_marked_sent);
+    try testing.expectEqual(State.established, pair.server.state());
 }
 
 test "driver: an idle connection does not burn its ECN testing window" {

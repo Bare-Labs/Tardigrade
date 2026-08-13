@@ -343,6 +343,10 @@ pub const Runtime = struct {
     /// message — the two are separate capabilities on some platforms, and one
     /// refusal is enough to know marking will never work here.
     ecn_send_enabled: bool = false,
+    /// Set when `noteEcnSendRejected` has withdrawn the capability and live
+    /// connections have not been told yet. Applied on the run loop's next
+    /// pass, which is the only place that holds the connection table.
+    ecn_disable_pending: bool = false,
 
     /// Erase `crypto_provider_state` to the boundary type for a `Connection`.
     /// Borrows `self`, so the returned value must not outlive this `Runtime`
@@ -566,6 +570,10 @@ pub const Runtime = struct {
                     while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
                         self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes, t.ecn);
                     }
+                    // #256-E: the socket has just proven it cannot mark, so
+                    // stop every live connection from claiming marks it never
+                    // sent. Distinct from a path failing ECN validation.
+                    if (self.ecn_disable_pending) entry.conn.disableEcnUnsupported();
                     // Reap closed connections and half-open connections that
                     // blew the handshake deadline (spoofed/stalled Initials).
                     const stalled = !entry.conn.isEstablished() and now -| entry.accepted_at_us > handshake_timeout_us;
@@ -578,6 +586,7 @@ pub const Runtime = struct {
                     }
                     if (entry.conn.nextTimeoutUs()) |deadline| wake_us = @min(wake_us, deadline);
                 }
+                self.ecn_disable_pending = false;
                 for (reap[0..reap_count]) |handle| {
                     self.removeConnection(&connections, &routes, &per_ip, handle);
                 }
@@ -1190,22 +1199,35 @@ pub const Runtime = struct {
     fn sendDatagram(self: *Runtime, peer: std.c.sockaddr.in, datagram: []const u8, mark: quic.udp.Ecn) void {
         const effective_mark = if (self.ecn_send_enabled) mark else .not_ect;
         const outcome = sendDatagramTo(self.socket_fd, &peer, datagram, effective_mark);
-        if (outcome.ecn_rejected and self.ecn_send_enabled) {
-            // Reading the codepoint and setting it are separate kernel
-            // capabilities; this listener has just learned it only has the
-            // first. Stop asking rather than paying a failed `sendmsg` on
-            // every datagram, and let each connection's own ECN validation
-            // discover that its marks are not arriving.
-            self.ecn_send_enabled = false;
-            self.snapshot_mutex.lock();
-            self.snapshot_state.ecn_enabled = false;
-            self.snapshot_mutex.unlock();
-            self.logger.warn(null, "http3: kernel refused the ECN send option; continuing without explicit congestion notification", .{});
-        }
+        if (outcome.ecn_rejected) self.noteEcnSendRejected();
         const sent = outcome.result;
         if (sent >= 0 and @as(usize, @intCast(sent)) == datagram.len) {
             self.notePacketOut(datagram.len);
         }
+    }
+
+    /// The kernel refused the ECN control message, so this listener can read
+    /// the codepoint but not set it (#256-E review).
+    ///
+    /// Turning off the send shim alone is not enough: `quic_config` is copied
+    /// into every accepted `Connection`, so future connections would keep
+    /// entering ECN testing, counting marks, and waiting for ACK_ECN for
+    /// datagrams that actually left Not-ECT — with the snapshot simultaneously
+    /// reporting ECN off. So the capability is withdrawn at the transport
+    /// boundary too, and live connections are told explicitly (which is a
+    /// different thing from a path failing validation).
+    ///
+    /// Separated from `sendDatagram` so it is unit-testable without a kernel
+    /// that rejects the option.
+    fn noteEcnSendRejected(self: *Runtime) void {
+        if (!self.ecn_send_enabled) return;
+        self.ecn_send_enabled = false;
+        self.quic_config.ecn_enabled = false;
+        self.ecn_disable_pending = true;
+        self.snapshot_mutex.lock();
+        self.snapshot_state.ecn_enabled = false;
+        self.snapshot_mutex.unlock();
+        self.logger.warn(null, "http3: kernel refused the ECN send option; continuing without explicit congestion notification", .{});
     }
 
     fn h3DownstreamHandshakeComplete(ctx: *anyopaque) bool {
@@ -5734,4 +5756,37 @@ test "http3 runtime: an operator can turn ECN off outright" {
     try testing.expect(!runtime.quic_config.ecn_enabled);
     try testing.expect(!runtime.ecn_send_enabled);
     try testing.expectEqual(@as(usize, 0), runtime.snapshot().ecn_marked_sent);
+}
+
+test "http3 runtime: a socket that cannot mark withdraws ECN from the transport too" {
+    // #256-E review: turning off only the send shim would leave
+    // `quic_config.ecn_enabled` true, so every connection accepted afterwards
+    // would still enter ECN testing and count marks for datagrams that
+    // actually left Not-ECT — while the snapshot reported ECN off. Separated
+    // from `sendDatagram` so this is provable without a kernel that rejects
+    // the control message.
+    var logger = logger_mod.Logger.init(.err, "http3-ecn-reject-test");
+    var runtime = Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+    }) catch return error.SkipZigTest;
+    defer runtime.deinit();
+    if (!runtime.ecn_send_enabled) return error.SkipZigTest;
+    try testing.expect(runtime.quic_config.ecn_enabled);
+
+    runtime.noteEcnSendRejected();
+
+    try testing.expect(!runtime.ecn_send_enabled);
+    // The capability is withdrawn where new connections read it ...
+    try testing.expect(!runtime.quic_config.ecn_enabled);
+    // ... the snapshot agrees ...
+    try testing.expect(!runtime.snapshot().ecn_enabled);
+    // ... and live connections are queued to be told, which is a different
+    // thing from any one of their paths failing ECN validation.
+    try testing.expect(runtime.ecn_disable_pending);
+
+    // Idempotent: a second refusal changes nothing and does not re-queue.
+    runtime.ecn_disable_pending = false;
+    runtime.noteEcnSendRejected();
+    try testing.expect(!runtime.ecn_disable_pending);
 }

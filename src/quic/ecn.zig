@@ -87,6 +87,17 @@ pub const FailureReason = enum {
     insufficient_increase,
     /// The testing window closed with no usable feedback at all.
     testing_timeout,
+    /// The metadata needed to attribute the peer's counters was dropped before
+    /// it could be used, so nothing further about this path can be *proved*.
+    /// Marking stops rather than continuing on evidence that can no longer be
+    /// checked — the conservative direction, since the counters drive both
+    /// validation and congestion response.
+    evidence_lost,
+    /// The socket cannot put the codepoint on the wire after all, so every
+    /// "marked" packet actually left Not-ECT. Distinct from the network
+    /// failures above: nothing was learned about the path, and the peer's
+    /// silence about marks is this endpoint's own doing.
+    platform_unsupported,
 };
 
 /// Received ECN codepoints for one packet number space (RFC 9000 §13.4.1).
@@ -265,17 +276,22 @@ pub const Controller = struct {
             return self.fail(.missing_counts);
         };
 
-        // Nothing this endpoint ever sends is ECT(1), so a non-zero report is
-        // impossible for this connection whatever the baseline was. Checked as
-        // an absolute rather than as growth: a baseline adopted from a report
-        // that already contained ECT(1) would otherwise grandfather it in and
-        // let validation succeed on counters known to be rewritten.
-        if (counts.ect1 != 0) return self.fail(.unsent_codepoint);
-
+        // Judged against *this path's* baseline rather than against zero.
+        // The counters are cumulative per packet number space and survive a
+        // migration, so a path that rewrote ECT(0) to ECT(1) leaves a non-zero
+        // historical value that a later, clean path legitimately starts from —
+        // and rejecting it outright would deny that path the revalidation the
+        // per-path model exists to give it. An unchanged historical count is
+        // evidence about a route that is no longer in use; only *growth* says
+        // anything about this one, and this endpoint never sends ECT(1) at all.
         const baseline = self.seen;
-        if (counts.ect0 < baseline.ect0 or counts.ce < baseline.ce) {
+        if (counts.ect0 < baseline.ect0 or
+            counts.ect1 < baseline.ect1 or
+            counts.ce < baseline.ce)
+        {
             return self.fail(.counts_regressed);
         }
+        if (counts.ect1 > baseline.ect1) return self.fail(.unsent_codepoint);
 
         const ect0_increase = counts.ect0 - baseline.ect0;
         const ce_increase = counts.ce - baseline.ce;
