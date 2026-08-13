@@ -278,6 +278,14 @@ path it has been reached on:
   accounted for. Adopting the first report that happens to arrive would write
   off whatever was already in flight, and the next honest report covering
   those packets would look like an over-claim.
+
+  The counters that baseline is taken from advance only on reports that
+  *survived* validation. A rejected report is not a synchronisation point: a
+  count that regressed to 8 would otherwise become the baseline a later path is
+  measured from, and the real cumulative 10 arriving afterwards would credit
+  that path with growth it never earned. Counters that regress or over-claim
+  fail ECN closed for the connection; a stripped or rewritten codepoint
+  condemns only the route, and leaves the counters usable for the next path.
 - **A migration waits for the previous path's marks to drain** before the new
   one starts testing. Otherwise the old path's intact marks would validate a
   new path that is stripping every codepoint, and the old path's CE reports

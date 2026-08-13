@@ -98,6 +98,29 @@ pub const FailureReason = enum {
     /// failures above: nothing was learned about the path, and the peer's
     /// silence about marks is this endpoint's own doing.
     platform_unsupported,
+
+    /// Whether this failure impugns the peer's *counters* or only this path.
+    ///
+    /// The distinction matters because the counters outlive the path: they are
+    /// cumulative per packet number space, and the next path to start marking
+    /// takes them as its baseline. A stripped or rewritten codepoint is a
+    /// statement about the route — the counters remain an honest record of what
+    /// arrived, and the next path deserves its own chance. Counters that go
+    /// backwards or claim more marked arrivals than were ever sent are not
+    /// describing this connection at all, and nothing derived from them can be
+    /// trusted again, including a future path's baseline.
+    pub fn impugnsCounters(self: FailureReason) bool {
+        return switch (self) {
+            .counts_regressed, .counts_exceed_sent => true,
+            .missing_counts,
+            .unsent_codepoint,
+            .insufficient_increase,
+            .testing_timeout,
+            .evidence_lost,
+            .platform_unsupported,
+            => false,
+        };
+    }
 };
 
 /// Received ECN codepoints for one packet number space (RFC 9000 §13.4.1).

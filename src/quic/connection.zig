@@ -2468,11 +2468,6 @@ pub const Connection = struct {
             .{ .ect0 = counts.ect0, .ect1 = counts.ect1, .ce = counts.ce }
         else
             null;
-        // What the peer has reported, kept at connection scope because that is
-        // the scope it has. This is the baseline a path takes when it starts
-        // marking, so it has to keep advancing even while no path is
-        // validating — during a migration's drain, most of all.
-        if (feedback) |counts| self.ecn_last_counts = counts;
 
         // Only the active path. Marking is only ever started on the active
         // path (`syncPathEcn`), so a path that is not active either never
@@ -2489,15 +2484,60 @@ pub const Connection = struct {
         const active = self.paths.activePathRef();
         const carried = self.ecn_carried_marked;
         self.ecn_carried_marked = 0;
-        self.applyEcnFeedback(
+        const rejected = self.applyEcnFeedback(
             active,
             tally.countFor(active.generation) +| carried,
             feedback,
             history_largest_sent_us orelse record_largest_sent_us,
             now_us,
         );
+        if (feedback) |counts| self.adoptEcnCounts(counts, rejected);
     }
 
+    /// Advance the connection's trusted view of the peer's counters — but only
+    /// once this report has survived validation (#256-E review).
+    ///
+    /// These counters are not scratch state: they are the baseline the *next*
+    /// path takes when it starts marking, which is to say the number that path
+    /// is then measured against. Committing a report that validation just
+    /// rejected would hand a future path a starting point the peer never
+    /// justified, and the arithmetic does the rest — a report that regressed to
+    /// 8 becomes the baseline, the real cumulative 10 arrives later, and a path
+    /// that preserved not one codepoint is credited with two marks of growth.
+    ///
+    /// So a report is adopted only if the path did not reject it *and* it is
+    /// monotonic against what is already trusted. The second check stands alone
+    /// when no path is validating — during a migration's drain, most of all,
+    /// which is exactly when the baseline matters most and when no controller
+    /// is watching. Anything else fails ECN closed: there is no way to
+    /// re-derive a trustworthy synchronisation point from a peer whose
+    /// cumulative counters have stopped making sense.
+    fn adoptEcnCounts(
+        self: *Connection,
+        counts: quic_ecn.Feedback,
+        rejected: ?quic_ecn.FailureReason,
+    ) void {
+        if (rejected) |reason| {
+            if (reason.impugnsCounters()) {
+                self.failEcnClosed(.evidence_lost);
+                return;
+            }
+            // A stripped or rewritten codepoint condemns the route, not the
+            // bookkeeping: the counters remain an honest record of what
+            // arrived, and the next path deserves an accurate baseline.
+        }
+        if (counts.ect0 < self.ecn_last_counts.ect0 or
+            counts.ect1 < self.ecn_last_counts.ect1 or
+            counts.ce < self.ecn_last_counts.ce)
+        {
+            self.failEcnClosed(.evidence_lost);
+            return;
+        }
+        self.ecn_last_counts = counts;
+    }
+
+    /// Returns the reason this path rejected the report, or null when it did
+    /// not — including when there was no path validating to reject it.
     fn applyEcnFeedback(
         self: *Connection,
         path: quic_path.PathRef,
@@ -2505,16 +2545,16 @@ pub const Connection = struct {
         feedback: ?quic_ecn.Feedback,
         largest_acked_sent_us: ?u64,
         now_us: u64,
-    ) void {
-        const controller = self.paths.ecnFor(path) orelse return;
-        if (controller.state == .disabled) return;
+    ) ?quic_ecn.FailureReason {
+        const controller = self.paths.ecnFor(path) orelse return null;
+        if (controller.state == .disabled) return null;
         const outcome = controller.onAck(newly_acked_marked, feedback);
         if (outcome.failed) |reason| {
             self.publishEcnState(path.key, .disabled, reason);
-            return;
+            return reason;
         }
         if (outcome.validated) self.publishEcnState(path.key, .capable, null);
-        if (outcome.ce_increase == 0) return;
+        if (outcome.ce_increase == 0) return null;
         self.metrics.ecn_ce_received +|= outcome.ce_increase;
         // RFC 9002 §7.1: a CE report on a *validated* path is congestion, and
         // it is congestion about packets that arrived — so the window halves
@@ -2524,6 +2564,7 @@ pub const Connection = struct {
         if (largest_acked_sent_us) |sent_us| {
             self.recovery.congestion.onCongestionEvent(sent_us, now_us);
         }
+        return null;
     }
 
     fn onRecordAcked(self: *Connection, record: *const SentRecord, now_us: u64) void {
@@ -10695,6 +10736,99 @@ test "driver: old-path ECN growth cannot validate a new path that strips marks" 
 
     try testing.expect(pair.server.pathEcn().state != .capable);
     try testing.expectEqual(validated_before, pair.server.metrics.ecn_validated);
+    try testing.expectEqual(State.established, pair.server.state());
+}
+
+test "driver: a rejected report never becomes a future path's baseline (#256-E review)" {
+    const allocator = testing.allocator;
+    var pair = try MigrationPair.initWithEcn(allocator, .full, true);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const sid = try pair.server.openStream(.uni);
+    _ = try pair.server.writeStream(sid, &[_]u8{0x6c} ** 4096, false);
+    _ = drainTransmits(pair.server, &pair.now_us);
+    const space_idx = Connection.spaceIndex(.application);
+
+    // Establish a trusted cumulative count on the old path.
+    const first_largest = pair.server.next_pn[space_idx] - 1;
+    const first_marked = markedAwaitingAck(pair.server, first_largest);
+    try testing.expect(first_marked > 0);
+    const trusted_ect0 = pair.server.ecn_last_counts.ect0 + first_marked;
+    var first = recovery.AckRangeSet{};
+    try first.insertRange(.{ .first = 0, .last = first_largest });
+    pair.server.processAck(.application, .{
+        .ranges = first,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = first_largest,
+        .ecn = .{ .ect0 = trusted_ect0, .ect1 = 0, .ce = 0 },
+    }, pair.now_us);
+    try testing.expectEqual(trusted_ect0, pair.server.ecn_last_counts.ect0);
+
+    // Now a report that goes backwards. The path rejects it as a regression —
+    // and the connection must not quietly keep it as the trusted baseline
+    // either, or a path that starts marking later is measured from a number
+    // the peer never justified and can be credited with growth it did not
+    // earn. Counters that regress are not describing this connection, so
+    // nothing derived from them is usable again.
+    _ = try pair.server.writeStream(sid, &[_]u8{0x6d} ** 2048, false);
+    _ = drainTransmits(pair.server, &pair.now_us);
+    const second_largest = pair.server.next_pn[space_idx] - 1;
+    var second = recovery.AckRangeSet{};
+    try second.insertRange(.{ .first = 0, .last = second_largest });
+    pair.server.processAck(.application, .{
+        .ranges = second,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = second_largest,
+        .ecn = .{ .ect0 = trusted_ect0 - 2, .ect1 = 0, .ce = 0 },
+    }, pair.now_us);
+
+    try testing.expect(pair.server.ecn_last_counts.ect0 != trusted_ect0 - 2);
+    try testing.expect(!pair.server.cfg.ecn_enabled);
+
+    // A migration cannot resurrect ECN from that rejected state: no path
+    // starts marking, so the real cumulative count returning later has nothing
+    // to validate and nothing to congest.
+    try migrateServerPath(pair);
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us);
+    try testing.expectEqual(quic_ecn.State.disabled, pair.server.pathEcn().state);
+    try testing.expectEqual(quic_udp.Ecn.not_ect, pair.server.ecnCodepoint());
+
+    const validated_before = pair.server.metrics.ecn_validated;
+    const third_largest = pair.server.next_pn[space_idx] - 1;
+    var third = recovery.AckRangeSet{};
+    try third.insertRange(.{ .first = 0, .last = third_largest });
+    pair.server.processAck(.application, .{
+        .ranges = third,
+        .ack_delay_raw = 0,
+        .largest_acknowledged = third_largest,
+        .ecn = .{ .ect0 = trusted_ect0, .ect1 = 0, .ce = 0 },
+    }, pair.now_us);
+
+    try testing.expect(pair.server.pathEcn().state != .capable);
+    try testing.expectEqual(validated_before, pair.server.metrics.ecn_validated);
+    try testing.expectEqual(State.established, pair.server.state());
+}
+
+test "driver: a stripped path still leaves the counters usable for the next one" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.initWithConfigs(allocator, ecn_enabled, ecn_enabled);
+    defer pair.deinit(allocator);
+    pair.network_ecn = clearsEcn;
+    try pair.pump();
+    try settleEcn(pair);
+
+    // The path failed because the network cleared its codepoints. That
+    // condemns the route, not the peer's bookkeeping — so unlike a regression
+    // it must not poison the connection's trusted counters, and the next path
+    // is still entitled to an accurate baseline and its own chance.
+    try testing.expectEqual(quic_ecn.State.disabled, pair.server.pathEcn().state);
+    try testing.expectEqual(
+        @as(?quic_ecn.FailureReason, .missing_counts),
+        pair.server.pathEcn().failure,
+    );
+    try testing.expect(pair.server.cfg.ecn_enabled);
     try testing.expectEqual(State.established, pair.server.state());
 }
 
