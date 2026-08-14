@@ -6,10 +6,7 @@
 .zig/
 .zig-toolchain/
 dist/
-zig-out/*
-!zig-out/bin/
-zig-out/bin/*
-!zig-out/bin/tardi
+zig-out/
 docs
 tests
 # The default `zig build` target embeds these specific fixture files into the

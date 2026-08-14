@@ -37,30 +37,40 @@ Two supported deployment paths:
 
 ## Host filesystem layout
 
-The two paths use the same *directory* layout, but they're populated
-differently: the DEB/RPM package creates every path below automatically
-(including `tardigrade.env`); the Docker image only creates the directories
-themselves (`/etc/tardigrade`, `/var/lib/tardigrade`, `/run/tardigrade`,
-`/var/log/tardigrade`) — you supply `tardigrade.conf`, `tardigrade.env`
-(if you use one), and any TLS material as bind mounts. See
-[Docker](#docker) below for the exact mount shape and the one path that
-differs: the packages install the binary at `/usr/bin/tardi`, the image
-installs it at `/usr/local/bin/tardi`.
+The two paths converge on the same *directory* layout, but different pieces
+of it come from different places and at different times — not everything
+below is created by the package install step. Three categories:
+
+- **Created by the package install** (DEB/RPM `postinst`/`%post`; the Docker
+  image creates the equivalent directories at build time): the binary,
+  `/etc/tardigrade/tardigrade.conf`, `/etc/tardigrade/tardigrade.env`,
+  `/var/lib/tardigrade`, `/var/log/tardigrade`.
+- **Created at service start, not install**: `/run/tardigrade` is created by
+  systemd's `RuntimeDirectory=` when the unit starts (see
+  [below](#the-systemd-units-pidcontrol-path-contract)), not by the package.
+  Under Docker it's a `tmpfs` mount you supply in `compose.yaml`.
+- **Operator-created, only if you use them**: neither package nor image
+  creates `/etc/tardigrade/tls/` or `/var/lib/tardigrade/public/` — you
+  create these (or bind-mount them, under Docker) only if your config
+  actually references TLS material or a static root.
 
 ```text
-/usr/bin/tardi                         binary (packages) — /usr/local/bin/tardi in the Docker image
-/etc/tardigrade/
-    tardigrade.conf                    routing/runtime configuration
-    tardigrade.env                     environment-only settings / secret references
-    tls/
-        fullchain.pem
-        privkey.pem
-/run/tardigrade/
-    tardigrade.pid                     ephemeral process PID
-/var/lib/tardigrade/                   service working/state directory
-/var/lib/tardigrade/public/            optional static root
-/var/log/tardigrade/                   optional file logs
+Package install:              /usr/bin/tardi                     binary (/usr/local/bin/tardi in the Docker image)
+                               /etc/tardigrade/tardigrade.conf    routing/runtime configuration
+                               /etc/tardigrade/tardigrade.env     environment-only settings / secret references
+                               /var/lib/tardigrade/                service working/state directory
+                               /var/log/tardigrade/                 file-log directory
+Service start (systemd RuntimeDirectory= / Docker tmpfs mount):
+                               /run/tardigrade/tardigrade.pid      ephemeral process PID
+Operator-created when used:   /etc/tardigrade/tls/fullchain.pem
+                               /etc/tardigrade/tls/privkey.pem
+                               /var/lib/tardigrade/public/          optional static root
 ```
+
+Under Docker, the image only creates the directories themselves — you
+supply `tardigrade.conf`, `tardigrade.env` (if you use one), and any TLS
+material as bind mounts. See [Docker](#docker) below for the exact mount
+shape.
 
 ### Permissions and ownership
 
@@ -92,9 +102,28 @@ owns the file — group and user *names* don't cross the container boundary,
 only the numeric IDs do. The image's `tardigrade` group is a fixed
 `10001`; if your host's `tardigrade` group (created by the DEB/RPM package
 via `useradd --system`, so its GID is whatever the distro allocated) isn't
-also `10001`, either `chgrp`/`chmod` the mounted file for the container's
-GID or mount it world-readable-within-the-container (`0644`) if that fits
-your threat model — never make it world-readable on the host.
+also `10001`, you cannot fix this with `chmod 0644` — a bind mount exposes
+the *same host inode* inside the container, so `chmod` changes the mode on
+the host file too and makes the key world-readable there, not just "within
+the container." That fails the never-world-readable requirement outright.
+
+Instead, give the container access to the correct numeric group without
+loosening the host file's mode. Create (or reuse) a host group whose GID
+owns the TLS key at `0640`, and add the container to that group with
+Compose's `group_add`:
+
+```yaml
+services:
+  tardigrade:
+    group_add:
+      - "${TARDIGRADE_TLS_GID}"   # numeric GID of the host group that owns the key
+```
+
+The key stays `root:<that-group> 0640` on the host; the container gains
+read access via the matching numeric supplementary group rather than
+through a mode change. An alternative is staging a copy of the key into a
+volume you initialize with owner/group `10001` directly, if you'd rather
+not add a supplementary group.
 
 If your config references additional roots, Unix sockets, or upstream
 sockets outside this layout, they need their own filesystem access —
@@ -327,12 +356,33 @@ Two logging surfaces, both covered in full by
   `/etc/logrotate.d/tardigrade`, which signals `SIGUSR1` after rotation;
   Tardigrade has a real SIGUSR1 log-reopen handler, so log files reopen
   cleanly on the existing rotation cadence. Don't invent a second rotation
-  mechanism. The Docker image creates the same `tardigrade`-owned
-  `/var/log/tardigrade` directory, but it isn't persistent or rotated by
-  anything inside the container — mount a host path or named volume over
-  it if you use `error_log` under Docker (`- ./logs:/var/log/tardigrade`
-  in `compose.yaml`), and handle rotation on the host side. Without that
-  mount, stdout/stderr (`docker compose logs`) is the durable log surface.
+  mechanism.
+
+  The Docker image creates the same `tardigrade`-owned `/var/log/tardigrade`
+  directory, but nothing inside the container persists or rotates it. Using
+  `error_log` under Docker needs two things, not just a mount:
+
+  1. **A pre-owned host path or named volume.** A bind mount such as
+     `- ./logs:/var/log/tardigrade` *replaces* the image's `10001:10001`
+     directory with whatever is at `./logs` on the host. A freshly created
+     (often root-owned) host directory will make `error_log` fail with
+     `EACCES`. Prepare it first:
+     ```bash
+     install -d -o 10001 -g 10001 -m 0755 ./logs
+     ```
+     or use a named volume and let the container's own directory-creation
+     step own it on first start.
+  2. **Rotation that reopens the file, not just renames it.** The DEB/RPM
+     logrotate policy sends `SIGUSR1` for exactly this reason — Tardigrade
+     keeps writing to the old (now-renamed) inode otherwise. A host-side
+     `logrotate` `postrotate` needs the equivalent signal delivered to the
+     container, e.g. `docker kill --signal=USR1 <container>` (or the
+     `docker compose` equivalent), not just a `copytruncate`/rename step.
+
+  Without a persistent mount, `docker compose logs` on stdout/stderr is the
+  default log surface — but don't treat it as inherently durable either;
+  retention depends on the configured Docker logging driver and container
+  lifecycle, the same as any other container's stdout.
 
 > **Operator note discovered while writing this guide**: the starter config
 > matches on `server_name localhost;`. A bare `curl http://<host>:8069/health`
@@ -344,8 +394,11 @@ Two logging surfaces, both covered in full by
 
 - [ ] Run as the dedicated non-root `tardigrade` user (default for both
       paths — don't override it).
-- [ ] Validate config before every start/reload (`tardi check`; the systemd
-      unit already does this via `ExecStartPre`).
+- [ ] Validate `tardigrade.conf` edits with `tardi check` before reload when
+      practical — `ExecStartPre` does not run on `systemctl reload`, only on
+      `start`/`restart`; hot reload runs its own validation and leaves the
+      previously published config active if the candidate is rejected (see
+      [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md)).
 - [ ] TLS private key permissions: never world-readable; restrict to the
       service account/group.
 - [ ] Mount static roots, config, and TLS material read-only where the

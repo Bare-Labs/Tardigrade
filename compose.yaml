@@ -18,8 +18,15 @@ services:
       # directive. Uncomment and point at a real directory if you serve
       # static files.
       # - ./public:/var/lib/tardigrade/public:ro
-      # Optional TLS material for a `listen ... ssl;` config.
+      # Optional TLS material for a `listen ... ssl;` config. A bind mount
+      # exposes the same host inode/permissions inside the container, so a
+      # host key at root:<some-group> 0640 needs the container to have that
+      # group's *numeric* GID as a supplementary group (names don't cross
+      # the container boundary) — see docs/DEPLOYMENT.md's TLS bind-mount
+      # note. Uncomment both lines and set the real host GID:
       # - ./tls:/etc/tardigrade/tls:ro
+    # group_add:
+    #   - "${TARDIGRADE_TLS_GID}"   # numeric GID of the host group that owns the key
     tmpfs:
       # uid/gid must match the image's fixed non-root `tardigrade` user
       # (10001:10001, pinned in the Dockerfile) so the runtime can write its
