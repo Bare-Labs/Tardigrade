@@ -9,6 +9,7 @@
   <a href="docs/SUPPORT_MATRIX.md">Support Matrix</a> |
   <a href="docs/CONFIGURATION.md">Configuration</a> |
   <a href="docs/OBSERVABILITY.md">Observability</a> |
+  <a href="docs/DEPLOYMENT.md">Deployment</a> |
   <a href="SECURITY.md">Security</a> |
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
@@ -95,6 +96,10 @@ Other install paths:
   [packaging/README.md](packaging/README.md) for current status and
   install/build instructions.
 - Build from source (see below).
+
+For running Tardigrade as a managed service — systemd unit, filesystem
+layout, permissions, and a locally built Docker image — see the
+[production deployment guide](docs/DEPLOYMENT.md).
 
 ## Build from source
 
@@ -220,6 +225,7 @@ operate without guessing which config file or pid file is active.
 | Event-loop backend evaluation (epoll/kqueue vs libxev/std.Io/io_uring) | [docs/EVENT_LOOP_BACKENDS.md](docs/EVENT_LOOP_BACKENDS.md) |
 | Observability | [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
 | Reload, drain, and shutdown | [docs/RELOAD_SHUTDOWN.md](docs/RELOAD_SHUTDOWN.md) |
+| Production deployment (systemd and Docker) | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
 | Proxy security | [docs/PROXY_SECURITY.md](docs/PROXY_SECURITY.md) |
 | Security test plan | [docs/SECURITY_TEST_PLAN.md](docs/SECURITY_TEST_PLAN.md) |
 | TLS interop & conformance matrix | [docs/TLS_INTEROP_MATRIX.md](docs/TLS_INTEROP_MATRIX.md) |

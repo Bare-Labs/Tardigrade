@@ -8,13 +8,28 @@ Type=simple
 User=tardigrade
 Group=tardigrade
 WorkingDirectory=/var/lib/tardigrade
+
 EnvironmentFile=-/etc/tardigrade/tardigrade.env
+Environment=TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid
+
+RuntimeDirectory=tardigrade
+RuntimeDirectoryMode=0750
+
+ExecStartPre=/usr/bin/tardi check /etc/tardigrade/tardigrade.conf
 ExecStart=/usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf
-ExecReload=/usr/bin/tardi reload -c /etc/tardigrade/tardigrade.conf
-ExecStop=/usr/bin/tardi stop -c /etc/tardigrade/tardigrade.conf
+ExecReload=/usr/bin/tardi reload --pid-file /run/tardigrade/tardigrade.pid
+ExecStop=/usr/bin/tardi stop --pid-file /run/tardigrade/tardigrade.pid
+
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=35s
 LimitNOFILE=65536
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target

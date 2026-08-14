@@ -70,6 +70,12 @@ docker run --pull=never --rm -v "${OUTPUT_DIR}:/artifacts:ro" "$DEB_TEST_IMAGE" 
     test -d /var/lib/tardigrade
     grep -F "EnvironmentFile=-/etc/tardigrade/tardigrade.env" /lib/systemd/system/tardigrade.service
     grep -F "ExecStart=/usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf" /lib/systemd/system/tardigrade.service
+    grep -F "RuntimeDirectory=tardigrade" /lib/systemd/system/tardigrade.service
+    grep -F "Environment=TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid" /lib/systemd/system/tardigrade.service
+    grep -F "ExecStartPre=/usr/bin/tardi check /etc/tardigrade/tardigrade.conf" /lib/systemd/system/tardigrade.service
+    grep -F "ExecReload=/usr/bin/tardi reload --pid-file /run/tardigrade/tardigrade.pid" /lib/systemd/system/tardigrade.service
+    grep -F "ExecStop=/usr/bin/tardi stop --pid-file /run/tardigrade/tardigrade.pid" /lib/systemd/system/tardigrade.service
+    grep -F "TimeoutStopSec=35s" /lib/systemd/system/tardigrade.service
     test "$(stat -c "%a %U %G" /etc/tardigrade/tardigrade.env)" = "640 root tardigrade"
     test "$(stat -c "%a %U %G" /etc/tardigrade/tardigrade.conf)" = "644 root root"
     test "$(stat -c "%a %U %G" /etc/logrotate.d/tardigrade)" = "644 root root"

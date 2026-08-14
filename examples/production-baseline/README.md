@@ -1,6 +1,10 @@
 # Production-Hardened Baseline
 
-A complete edge deployment combining TLS, security headers, rate limiting, structured access logging, Prometheus metrics, upstream health checks, and graceful drain.
+A hardened **configuration** example combining TLS, security headers, rate limiting, structured access logging, Prometheus metrics, upstream health checks, and graceful drain.
+
+This example covers the config file only. For the surrounding host/container
+service setup — systemd unit, filesystem layout, permissions, Docker image —
+see the [production deployment guide](../../docs/DEPLOYMENT.md).
 
 ## What it demonstrates
 

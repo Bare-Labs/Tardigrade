@@ -7,5 +7,9 @@ zig-out/bin/*
 !zig-out/bin/tardi
 docs
 tests
+# The default `zig build` target embeds tests/vectors/pki/malformed-truncated.der
+# and tests/vectors/pki/reduced/ into the production pki module (build.zig), so
+# they must stay in the Docker build context even though the rest of tests/ does not.
+!tests/vectors
 examples
 PLAN.md

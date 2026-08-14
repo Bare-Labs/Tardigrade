@@ -1,0 +1,46 @@
+# Local, build-from-source Docker deployment example. See docs/DEPLOYMENT.md
+# for the full workflow (build, validate, start, reload, stop).
+#
+# This is not a published image — `docker compose build` builds it from the
+# Dockerfile in this repository.
+
+services:
+  tardigrade:
+    build: .
+    ports:
+      - "8069:8069"
+    volumes:
+      # Starter routing/runtime config. Swap for your own; see
+      # docs/CONFIGURATION.md and examples/production-baseline/ for a
+      # hardened starting point.
+      - ./packaging/tardigrade.conf:/etc/tardigrade/tardigrade.conf:ro
+      # Optional static root referenced by the starter config's `root`
+      # directive. Uncomment and point at a real directory if you serve
+      # static files.
+      # - ./public:/var/lib/tardigrade/public:ro
+      # Optional TLS material for a `listen ... ssl;` config.
+      # - ./tls:/etc/tardigrade/tls:ro
+    tmpfs:
+      # uid/gid must match the image's non-root `tardigrade` user (999:999)
+      # so the runtime can write its PID file; a plain tmpfs mount defaults
+      # to root:root and the process cannot write into it.
+      - /run/tardigrade:uid=999,gid=999,mode=0750
+    environment:
+      TARDIGRADE_PID_FILE: /run/tardigrade/tardigrade.pid
+      TARDIGRADE_REQUIRE_UNPRIVILEGED_USER: "true"
+    restart: unless-stopped
+    # Longer than TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS (default 30000ms) so
+    # Docker's SIGTERM->SIGKILL escalation doesn't cut off a graceful drain.
+    stop_grace_period: 35s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/usr/local/bin/tardi",
+          "status",
+          "--pid-file",
+          "/run/tardigrade/tardigrade.pid"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3

@@ -113,6 +113,12 @@ docker run --pull=never --rm \
         grep -F "EnvironmentFile=-/etc/tardigrade/tardigrade.env" /usr/lib/systemd/system/tardigrade.service
         grep -F "ExecStart=/usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf" /usr/lib/systemd/system/tardigrade.service
         grep -F "WorkingDirectory=/var/lib/tardigrade" /usr/lib/systemd/system/tardigrade.service
+        grep -F "RuntimeDirectory=tardigrade" /usr/lib/systemd/system/tardigrade.service
+        grep -F "Environment=TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid" /usr/lib/systemd/system/tardigrade.service
+        grep -F "ExecStartPre=/usr/bin/tardi check /etc/tardigrade/tardigrade.conf" /usr/lib/systemd/system/tardigrade.service
+        grep -F "ExecReload=/usr/bin/tardi reload --pid-file /run/tardigrade/tardigrade.pid" /usr/lib/systemd/system/tardigrade.service
+        grep -F "ExecStop=/usr/bin/tardi stop --pid-file /run/tardigrade/tardigrade.pid" /usr/lib/systemd/system/tardigrade.service
+        grep -F "TimeoutStopSec=35s" /usr/lib/systemd/system/tardigrade.service
 
         dnf remove -y tardigrade
         test ! -e /usr/bin/tardi

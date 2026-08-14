@@ -16,7 +16,7 @@ versus what is a local-build-only tool.
 | systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and exercised end-to-end by both the DEB and RPM smoke tests. |
 | launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **Unverified template** | Ships as a template for macOS host-native installs; there is no macOS packaging pipeline or smoke test exercising it. |
 | Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present, tap not published, macOS blocked** | The `on_linux` blocks can resolve once real release checksums are filled in; the `on_macos` blocks cannot resolve until macOS archives are published (see above). No `Bare-Systems/homebrew-tap` repo exists yet. |
-| Docker / OCI image | **Not implemented** | No `Dockerfile` or container-publishing workflow exists in this repository. |
+| Docker / OCI image | **Local build supported, not published** | Root [`Dockerfile`](../Dockerfile) and [`compose.yaml`](../compose.yaml) build a runtime image locally; smoke-tested via `scripts/test-docker-image.sh` in the `packaging-smoke` CI job. No registry-published image or container-publishing workflow exists. See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the full workflow. |
 
 ## Quick install (recommended)
 
@@ -134,6 +134,24 @@ Like the DEB package, the RPM installs a starter
 systemd unit's `WorkingDirectory`) on install, so `systemctl enable --now
 tardigrade` works immediately after a fresh install.
 
+## Docker (local build)
+
+There is no published Bare Systems container image. The root
+[`Dockerfile`](../Dockerfile) and [`compose.yaml`](../compose.yaml) support
+building and running Tardigrade in a container locally:
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+The image is a multi-stage build (Zig toolchain in the build stage only, a
+minimal `tardi` + OpenSSL/CA-certificates runtime in the final stage) that
+runs as a non-root `tardigrade` user. See
+[docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the complete Docker workflow
+— build, config validation, start, reload, and graceful stop — alongside the
+equivalent systemd path.
+
 ## Upgrading
 
 For both DEB and RPM installs, validate the new config before reloading or
@@ -198,5 +216,6 @@ Pre-built service files for host-native installs:
 ## Related docs
 
 - [Main README — Install](../README.md#install)
+- [Production deployment guide](../docs/DEPLOYMENT.md)
 - [Release checklist](../docs/RELEASE_CHECKLIST.md)
 - [Support matrix](../docs/SUPPORT_MATRIX.md)
