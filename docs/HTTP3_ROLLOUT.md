@@ -532,6 +532,112 @@ operator could raise independently of the window would be a way to defeat
 congestion control rather than to tune it. A path whose measured capacity
 grows paces faster on its own.
 
+## Batching, GSO, and GRO
+
+This is a design note, not an implementation (#256-F). #256's non-goals rule
+out building this speculatively; what follows is where it would plug into the
+current contract, what it must not be allowed to break, and what evidence
+would justify picking it up.
+
+### Where the runtime stands today
+
+Every datagram crosses the syscall boundary alone. `drainConnectionTransmits`
+calls `sendDatagram` — one `sendmsg`/`sendto` — for each datagram
+`pollTransmitOnPath` releases, and the receive loop calls `receiveDatagram` —
+one `recvmsg` — repeatedly until the socket reports `EAGAIN`. At the packet
+sizes DPLPMTUD settles on (1200–2048 bytes) and the rates pacing now permits,
+a saturated loopback or datacenter link spends a growing share of its time
+crossing that boundary rather than building or parsing the datagrams that
+cross it. `sendmmsg`/`recvmmsg` (batched syscalls) and UDP GSO/GRO (kernel-side
+segmentation and coalescing via `UDP_SEGMENT` and `UDP_GRO`) are the standard
+answers to that cost, and neither is implemented.
+
+### Where it would plug in
+
+The seam is already there on both sides, and neither needs a new abstraction
+in `src/quic/udp.zig`: `SendDatagram` and `ReceivedDatagram` are already
+per-datagram values carrying their own `ecn` and address, which is what a
+batch is a list of.
+
+- **Send.** `Connection.pollTransmitOnPath` already returns one datagram at a
+  time by contract; `drainConnectionTransmits`'s `while` loop is the only
+  place that would change, assembling either a `sendmmsg` vector of
+  independent datagrams or a single GSO buffer of same-sized segments plus a
+  `UDP_SEGMENT` control message. Packet *construction* would not change —
+  pacing already keeps `pollTransmitOnPath` from blocking, and that
+  separation between "build a datagram" and "decide when it may leave" is the
+  same seam a batching send path needs, noted where pacing reaches the wire
+  above.
+- **Receive.** The `while (true) { receiveDatagram(...) }` loop in `serve`
+  already drains everything waiting before sleeping again; `recvmmsg` would
+  replace repeated `recvmsg` calls with one call returning several datagrams,
+  and `UDP_GRO` would let the kernel coalesce datagrams from one peer before
+  the syscall even happens. `ingest` already takes one datagram, one peer
+  address, and one ECN mark per call, so a batched receive path would still
+  call it once per datagram inside the batch — no change to DCID routing or
+  connection lookup.
+
+### What batching must not break
+
+A batch is a kernel-level optimization; it must stay invisible to the
+transport guarantees layered above it.
+
+- **Pacing** decides *whether* a datagram may leave, not how it is
+  transmitted once released. A GSO buffer could only ever hold datagrams the
+  pacer has already released — never a way to front-run the schedule by
+  assembling a bigger buffer than the burst ceiling allows. That existing
+  ceiling (the smaller of ten datagrams and one initial window) is also a
+  reasonable first cap on batch size: a batch larger than a paced burst would
+  have to sit somewhere between release and syscall, reintroducing the same
+  burst the leaky bucket exists to prevent.
+- **ECN** is marked and validated per path, and GSO's `UDP_SEGMENT` shares one
+  `IP_TOS`/`IPV6_TCLASS` control message across every segment in the buffer.
+  A batch could only ever contain datagrams bound for the same path carrying
+  the same mark; a path that is marking and one that is not cannot share a
+  GSO buffer.
+- **PMTU probes** are identified by their exact size, deliberately larger than
+  the path's validated size. A GSO segment size is fixed for the whole
+  buffer, so a probe cannot ride alongside ordinary traffic in the same
+  buffer — it would still need its own single-datagram send, as it does
+  today.
+- **Receive-side ECN and peer address** are per datagram, not per batch.
+  `UDP_GRO` only coalesces datagrams that already share source address and
+  destination port, so the codepoint recovered from the shared control
+  message is valid for every segment — but a batched receive path still has
+  to split the buffer back into individual `ReceivedDatagram`s before `ingest`
+  sees them, since DCID routing and AEAD are per-packet regardless of how
+  many packets arrived in one syscall.
+
+### Evidence bar before implementing
+
+Reuse the existing competitive benchmark framework (#149, `benchmarks/competitive/`)
+rather than building a second one. The case for batching/GSO/GRO is a
+syscall-count argument, so the evidence needs to show the syscall boundary is
+actually the bottleneck before paying the complexity:
+
+- CPU/request or syscalls/request at a fixed throughput, with a profile
+  showing `sendmsg`/`recvmsg` dominating at realistic throughput — not merely
+  a benchmark run existing.
+- The high-bandwidth loopback/dedicated-host scenario #256 already asks for is
+  the right one to profile first: it is the case most likely to be
+  syscall-bound rather than network-bound.
+- A regression budget: batching adds code on the hot send/receive path, so it
+  only earns its keep if it moves throughput or CPU/request outside the noise
+  of existing runs, not merely in the same direction as one.
+
+Absent that evidence, the per-datagram path stays.
+
+### Platform support
+
+`UDP_SEGMENT` (Linux 4.18) and `UDP_GRO` (Linux 5.0) are Linux-only kernel
+socket options with no macOS or BSD equivalent. `sendmmsg`/`recvmmsg` batch
+the syscall without kernel-side segmentation and are more broadly available,
+but still not on every platform this runtime already treats as unverified for
+ECN and no-fragmentation. Any future implementation would gate on the same
+per-platform tables those features already use, and fall back to today's
+per-datagram path exactly the way ECN falls back to `.unavailable` — a
+batching failure must never become a transport failure.
+
 ## Reload
 
 Advertisement-only knobs can hot reload:
