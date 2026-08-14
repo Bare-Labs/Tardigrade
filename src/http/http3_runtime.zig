@@ -601,7 +601,11 @@ pub const Runtime = struct {
             // 1) Timers and transmission for every connection.
             var wake_us: u64 = now + 100_000;
             {
-                var reap: [16]u64 = undefined;
+                const Reap = struct {
+                    handle: u64,
+                    reason: RemovalReason,
+                };
+                var reap: [16]Reap = undefined;
                 var reap_count: usize = 0;
                 var it = connections.iterator();
                 while (it.next()) |kv| {
@@ -612,9 +616,10 @@ pub const Runtime = struct {
                     self.foldPathMetrics(entry);
                     if (draining and !entry.drain_goaway_sent) self.sendDrainGoaway(entry);
                     self.drainConnectionTransmits(entry, now);
-                    if (drain_expired) {
+                    const handshake_timed_out = handshakeTimedOutForRemoval(entry, now);
+                    if (drain_expired and !handshake_timed_out) {
                         self.closeForDrainDeadline(entry, now);
-                    } else {
+                    } else if (!drain_expired) {
                         self.pumpH3(entry, now);
                     }
                     self.drainConnectionTransmits(entry, now);
@@ -627,27 +632,20 @@ pub const Runtime = struct {
                     if (!self.ecn_send_enabled) entry.conn.disableEcnUnsupported();
                     // Reap closed connections and half-open connections that
                     // blew the handshake deadline (spoofed/stalled Initials).
-                    const stalled = !entry.quic_observer.handshake_succeeded and now -| entry.accepted_at_us > handshake_timeout_us;
-                    if (entry.conn.state() == .closed or stalled) {
+                    if (entry.conn.state() == .closed or handshake_timed_out) {
                         if (reap_count < reap.len) {
-                            reap[reap_count] = kv.key_ptr.*;
+                            reap[reap_count] = .{
+                                .handle = kv.key_ptr.*,
+                                .reason = reapRemovalReason(entry, handshake_timed_out),
+                            };
                             reap_count += 1;
                         }
                         continue;
                     }
                     if (entry.conn.nextTimeoutUs()) |deadline| wake_us = @min(wake_us, deadline);
                 }
-                for (reap[0..reap_count]) |handle| {
-                    const reason: RemovalReason = if (connections.get(handle)) |entry|
-                        if (entry.quic_observer.administrative_close)
-                            .administrative
-                        else if (!entry.quic_observer.handshake_succeeded and now -| entry.accepted_at_us > handshake_timeout_us)
-                            .handshake_timeout
-                        else
-                            .protocol_failure
-                    else
-                        .protocol_failure;
-                    self.removeConnection(&connections, &routes, &per_ip, handle, reason);
+                for (reap[0..reap_count]) |r| {
+                    self.removeConnection(&connections, &routes, &per_ip, r.handle, r.reason);
                 }
             }
             if (draining and connections.count() == 0) break;
@@ -1053,6 +1051,18 @@ pub const Runtime = struct {
                 entry.conn.close(0x0100, "h3 drain deadline", now);
             },
         }
+    }
+
+    fn handshakeTimedOutForRemoval(entry: *const ConnEntry, now: u64) bool {
+        return !entry.quic_observer.administrative_close and
+            !entry.quic_observer.handshake_succeeded and
+            now -| entry.accepted_at_us > handshake_timeout_us;
+    }
+
+    fn reapRemovalReason(entry: *const ConnEntry, handshake_timed_out: bool) RemovalReason {
+        if (entry.quic_observer.administrative_close) return .administrative;
+        if (handshake_timed_out) return .handshake_timeout;
+        return .protocol_failure;
     }
 
     fn syncCidRoutes(self: *Runtime, entry: *ConnEntry, routes: *quic.cid.CidRoutingTable) void {
@@ -3400,8 +3410,37 @@ test "http3 runtime metrics: handshake failures use removal reason and observed 
     drain_race.client.deinit();
     allocator.destroy(drain_race);
 
-    try testing.expectEqual(@as(usize, 4), capture.handshake_failures);
-    try testing.expectEqual(@as(usize, 1), capture.handshake_failures_by_stage[0]);
+    var timeout_on_drain = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer timeout_on_drain.deinit(allocator);
+    timeout_on_drain.entry.conn.state_ = .handshaking;
+    timeout_on_drain.entry.accepted_at_us = 0;
+    timeout_on_drain.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 8 };
+    const drain_now = handshake_timeout_us + 1;
+    const timeout_before_drain = Runtime.handshakeTimedOutForRemoval(timeout_on_drain.entry, drain_now);
+    try testing.expect(timeout_before_drain);
+    if (!timeout_before_drain) runtime.closeForDrainDeadline(timeout_on_drain.entry, drain_now);
+    try testing.expect(!timeout_on_drain.entry.quic_observer.administrative_close);
+    var timeout_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer timeout_connections.deinit();
+    var timeout_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer timeout_routes.deinit();
+    var timeout_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer timeout_per_ip.deinit();
+    try timeout_connections.put(8, timeout_on_drain.entry);
+    try timeout_routes.insert(timeout_on_drain.entry.owned_cids[0], 8);
+    try incPerIp(&timeout_per_ip, timeout_on_drain.entry.admission_source_ip);
+    runtime.removeConnection(
+        &timeout_connections,
+        &timeout_routes,
+        &timeout_per_ip,
+        8,
+        Runtime.reapRemovalReason(timeout_on_drain.entry, timeout_before_drain),
+    );
+    timeout_on_drain.client.deinit();
+    allocator.destroy(timeout_on_drain);
+
+    try testing.expectEqual(@as(usize, 5), capture.handshake_failures);
+    try testing.expectEqual(@as(usize, 2), capture.handshake_failures_by_stage[0]);
     try testing.expectEqual(@as(usize, 3), capture.handshake_failures_by_stage[1]);
 }
 
