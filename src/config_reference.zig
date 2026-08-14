@@ -56,6 +56,7 @@ const CTX_TOP = &[_]Context{.top_level};
 const CTX_SERVER = &[_]Context{.server};
 const CTX_LOCATION = &[_]Context{.location};
 const CTX_TOP_SERVER = &[_]Context{ .top_level, .server };
+const CTX_TOP_LOCATION = &[_]Context{ .top_level, .location };
 const CTX_TOP_SERVER_LOCATION = &[_]Context{ .top_level, .server, .location };
 
 pub const entries = [_]ConfigEntry{
@@ -124,7 +125,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "$name value",
         .description = "Declares a config-parse-time variable substitutable via ${name} in later directive values.",
-        .example = "set $backend 127.0.0.1:3000;\nproxy_pass http://${backend};",
+        .example = "set $backend 127.0.0.1:3000;\nlocation /api/ {\n    proxy_pass http://${backend};\n}",
         .docs = &.{"docs/CONFIGURATION.md"},
     },
 
@@ -141,6 +142,7 @@ pub const entries = [_]ConfigEntry{
     },
     .{
         .name = "server_name",
+        .aliases = &.{"server.server_name"},
         .contexts = CTX_TOP_SERVER,
         .value_type = "hostname list",
         .default_value = "none (accepts any Host header)",
@@ -211,7 +213,7 @@ pub const entries = [_]ConfigEntry{
     // ---- Routing / location ----------------------------------------------
     .{
         .name = "location",
-        .contexts = CTX_LOCATION,
+        .contexts = CTX_TOP_SERVER,
         .value_type = "block",
         .description = "Route-matching block. Supports exactly one action directive: proxy_pass, fastcgi_pass, scgi_pass, uwsgi_pass, return, static serving (root/alias/index/autoindex/try_files), or rewrite.",
         .example =
@@ -397,8 +399,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "false",
+        .valid_values = &.{ "true", "false" },
         .description = "Requires and verifies client certificates (mTLS).",
-        .example = "tls_client_verify on;",
+        .example = "tls_client_verify true;",
         .env_vars = &.{"TARDIGRADE_TLS_CLIENT_VERIFY"},
         .docs = &.{"docs/PENTEST_PLAYBOOK.md"},
     },
@@ -417,8 +420,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "false",
+        .valid_values = &.{ "true", "false" },
         .description = "Enables OCSP stapling responses. Not supported when the binary is built with the appliance TLS profile.",
-        .example = "tls_ocsp_stapling on;",
+        .example = "tls_ocsp_stapling true;",
         .env_vars = &.{"TARDIGRADE_TLS_OCSP_STAPLING"},
         .docs = &.{"docs/PKI_REVOCATION.md"},
     },
@@ -494,8 +498,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "true",
+        .valid_values = &.{ "true", "false" },
         .description = "Verifies TLS certificates presented by HTTPS upstream backends.",
-        .example = "upstream_tls_verify off;",
+        .example = "upstream_tls_verify false;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_TLS_VERIFY"},
         .docs = &.{"docs/PROXY_SECURITY.md"},
     },
@@ -537,6 +542,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "true",
+        .valid_values = &.{ "true", "false" },
         .description = "Restricts retries to idempotent methods (GET, HEAD, PUT, DELETE, OPTIONS, TRACE). POST and PATCH are never retried when this is enabled.",
         .example = "upstream_retry_idempotent_only false;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_RETRY_IDEMPOTENT_ONLY"},
@@ -549,8 +555,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "true",
+        .valid_values = &.{ "true", "false" },
         .description = "Enables keep-alive connection pooling to plain-HTTP upstreams. When false, every request opens a fresh Connection: close connection.",
-        .example = "upstream_pool_enabled off;",
+        .example = "upstream_pool_enabled false;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_POOL_ENABLED"},
         .docs = &.{"docs/UPSTREAM_POOLING.md"},
     },
@@ -674,8 +681,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "true",
+        .valid_values = &.{ "true", "false" },
         .description = "Enables HTTP/1.1 listener support.",
-        .example = "http1_enabled off;",
+        .example = "http1_enabled false;",
         .env_vars = &.{"TARDIGRADE_HTTP1_ENABLED"},
         .docs = &.{"docs/SUPPORT_MATRIX.md"},
     },
@@ -684,8 +692,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "true",
-        .description = "Enables HTTP/2 (h2/h2c negotiation via ALPN or prior-knowledge). Also settable via the `listen ... http2;` flag.",
-        .example = "http2_enabled off;",
+        .valid_values = &.{ "true", "false" },
+        .description = "Enables downstream HTTP/2 over TLS via ALPN. Also settable via the `listen ... http2;` flag. Plaintext downstream h2c is not supported; prior-knowledge h2c is only available for upstream connections via upstream_protocol.",
+        .example = "http2_enabled false;",
         .env_vars = &.{"TARDIGRADE_HTTP2_ENABLED"},
         .docs = &.{"docs/SUPPORT_MATRIX.md"},
     },
@@ -694,8 +703,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "false",
+        .valid_values = &.{ "true", "false" },
         .description = "Enables the HTTP/3 (QUIC) listener.",
-        .example = "http3_enabled on;",
+        .example = "http3_enabled true;",
         .env_vars = &.{"TARDIGRADE_HTTP3_ENABLED"},
         .docs = &.{ "docs/HTTP3_ROLLOUT.md", "docs/SUPPORT_MATRIX.md" },
     },
@@ -704,7 +714,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "port",
         .default_value = "443",
-        .valid_values = &.{"0-65535"},
+        .valid_values = &.{"1-65535"},
         .description = "UDP port for the QUIC/HTTP3 listener.",
         .example = "quic_port 8443;",
         .env_vars = &.{"TARDIGRADE_QUIC_PORT"},
@@ -726,8 +736,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "false",
+        .valid_values = &.{ "true", "false" },
         .description = "Enables QUIC 0-RTT early data acceptance.",
-        .example = "http3_enable_0rtt on;",
+        .example = "http3_enable_0rtt true;",
         .env_vars = &.{"TARDIGRADE_HTTP3_ENABLE_0RTT"},
         .docs = &.{"docs/QUIC_TLS.md"},
     },
@@ -736,8 +747,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "false",
+        .valid_values = &.{ "true", "false" },
         .description = "Enables QUIC connection migration (path change) support.",
-        .example = "http3_connection_migration on;",
+        .example = "http3_connection_migration true;",
         .env_vars = &.{"TARDIGRADE_HTTP3_CONNECTION_MIGRATION"},
         .docs = &.{"docs/QUIC_TLS.md"},
     },
@@ -760,8 +772,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "true",
+        .valid_values = &.{ "true", "false" },
         .description = "Enables ECN marking on the QUIC listener. Self-disables per-path on unreliable feedback; this is an escape hatch to disable it outright.",
-        .example = "http3_ecn off;",
+        .example = "http3_ecn false;",
         .env_vars = &.{"TARDIGRADE_HTTP3_ECN"},
         .docs = &.{"docs/QUIC_QLOG.md"},
     },
@@ -794,8 +807,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "true",
+        .valid_values = &.{ "true", "false" },
         .description = "Adds standard security response headers to every response.",
-        .example = "security_headers off;",
+        .example = "security_headers false;",
         .env_vars = &.{"TARDIGRADE_SECURITY_HEADERS"},
         .docs = &.{"docs/CONFIGURATION.md"},
     },
@@ -804,8 +818,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "false",
+        .valid_values = &.{ "true", "false" },
         .description = "Emits a Strict-Transport-Security header on HTTPS responses. Has no effect without TLS configured.",
-        .example = "hsts_enabled on;",
+        .example = "hsts_enabled true;",
         .env_vars = &.{"TARDIGRADE_HSTS_ENABLED"},
         .docs = &.{"docs/CONFIGURATION.md"},
     },
@@ -902,8 +917,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "boolean",
         .default_value = "false",
+        .valid_values = &.{ "true", "false" },
         .description = "Requires request authentication before serving the metrics endpoint.",
-        .example = "metrics_require_auth on;",
+        .example = "metrics_require_auth true;",
         .env_vars = &.{"TARDIGRADE_METRICS_REQUIRE_AUTH"},
         .docs = &.{"docs/OBSERVABILITY.md"},
     },
@@ -1008,13 +1024,18 @@ pub const entries = [_]ConfigEntry{
     },
 
     // ---- Alternate upstream / proxy protocols -------------------------------
+    // fastcgi_pass/scgi_pass/uwsgi_pass are recognized top-level and inside
+    // location {} blocks (parseStatement / parseLocationStatement); they are
+    // NOT among the directives parseServerStatement recognizes inside a
+    // server {} block, so `server` is deliberately excluded from contexts.
     .{
         .name = "fastcgi_pass",
-        .contexts = CTX_TOP_SERVER_LOCATION,
+        .contexts = CTX_TOP_LOCATION,
         .value_type = "endpoint (host:port or unix:/path)",
         .default_value = "none",
         .description = "FastCGI upstream endpoint.",
         .example = "location ~ \\.php$ {\n    fastcgi_pass 127.0.0.1:9000;\n}",
+        .env_vars = &.{"TARDIGRADE_FASTCGI_UPSTREAM"},
     },
     .{
         .name = "fastcgi_param",
@@ -1029,26 +1050,28 @@ pub const entries = [_]ConfigEntry{
         .name = "fastcgi_index",
         .contexts = CTX_TOP,
         .value_type = "filename",
-        .default_value = "none",
+        .default_value = "index.php",
         .description = "Default index script for directory-style FastCGI requests.",
         .example = "fastcgi_index index.php;",
         .env_vars = &.{"TARDIGRADE_FASTCGI_INDEX"},
     },
     .{
         .name = "scgi_pass",
-        .contexts = CTX_TOP_SERVER_LOCATION,
+        .contexts = CTX_TOP_LOCATION,
         .value_type = "endpoint",
         .default_value = "none",
         .description = "SCGI upstream endpoint.",
         .example = "scgi_pass 127.0.0.1:4100;",
+        .env_vars = &.{"TARDIGRADE_SCGI_UPSTREAM"},
     },
     .{
         .name = "uwsgi_pass",
-        .contexts = CTX_TOP_SERVER_LOCATION,
+        .contexts = CTX_TOP_LOCATION,
         .value_type = "endpoint",
         .default_value = "none",
         .description = "uWSGI upstream endpoint.",
         .example = "uwsgi_pass 127.0.0.1:4200;",
+        .env_vars = &.{"TARDIGRADE_UWSGI_UPSTREAM"},
     },
 
     // ---- Secrets (never print the live value; see security regression tests) --
@@ -1298,6 +1321,76 @@ test "lookup resolves the current and legacy environment variable names" {
     try std.testing.expectEqualStrings("upstream_probe_interval_ms", legacy.name);
 }
 
+test "lookup resolves the qualified server.server_name alias" {
+    const entry = lookup("server.server_name") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("server_name", entry.name);
+}
+
+test "location block reports its real parser contexts (top-level and server, not nested location)" {
+    const entry = lookup("location").?;
+    try std.testing.expectEqual(@as(usize, 2), entry.contexts.len);
+    try std.testing.expectEqual(Context.top_level, entry.contexts[0]);
+    try std.testing.expectEqual(Context.server, entry.contexts[1]);
+}
+
+test "lookup resolves the alternate-upstream directives by their current environment variable names" {
+    const fastcgi = lookup("TARDIGRADE_FASTCGI_UPSTREAM") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fastcgi_pass", fastcgi.name);
+
+    const scgi = lookup("TARDIGRADE_SCGI_UPSTREAM") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("scgi_pass", scgi.name);
+
+    const uwsgi = lookup("TARDIGRADE_UWSGI_UPSTREAM") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("uwsgi_pass", uwsgi.name);
+}
+
+test "fastcgi_pass/scgi_pass/uwsgi_pass do not claim server-block support" {
+    for (&[_][]const u8{ "fastcgi_pass", "scgi_pass", "uwsgi_pass" }) |name| {
+        const entry = lookup(name).?;
+        for (entry.contexts) |ctx| try std.testing.expect(ctx != .server);
+    }
+}
+
+test "fastcgi_index reports the actual EdgeConfig default of index.php" {
+    const entry = lookup("fastcgi_index").?;
+    try std.testing.expectEqualStrings("index.php", entry.default_value.?);
+}
+
+test "quic_port rejects 0 as a valid value, matching parseConfigPort/validate" {
+    const entry = lookup("quic_port").?;
+    var found = false;
+    for (entry.valid_values) |v| {
+        try std.testing.expect(std.mem.indexOf(u8, v, "0-") == null);
+        if (std.mem.eql(u8, v, "1-65535")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "every generic boolean entry documents true/false and no example uses the invalid nginx on/off spelling" {
+    // location.autoindex has its own dedicated on/off parser (isLocationAutoindexValue-style
+    // handling in config_file.zig) and is deliberately excluded: "on"/"off" really are the
+    // accepted spellings there. Every other boolean-typed entry here goes through the generic
+    // top-level directive path, which normalizes to EdgeConfig.parseBoolEnv() -- that function
+    // only recognizes "true"/"1" as true, so a documented/example "on" would silently mean off.
+    for (&entries) |*entry| {
+        if (!std.mem.eql(u8, entry.value_type, "boolean")) continue;
+        if (std.mem.eql(u8, entry.name, "location.autoindex")) continue;
+
+        var has_true = false;
+        var has_false = false;
+        for (entry.valid_values) |v| {
+            if (std.mem.eql(u8, v, "true")) has_true = true;
+            if (std.mem.eql(u8, v, "false")) has_false = true;
+        }
+        try std.testing.expect(has_true and has_false);
+
+        if (entry.example) |example| {
+            try std.testing.expect(std.mem.indexOf(u8, example, " on;") == null);
+            try std.testing.expect(std.mem.indexOf(u8, example, " off;") == null);
+        }
+    }
+}
+
 test "lookup is case-insensitive" {
     const lower = lookup("listen") orelse return error.TestUnexpectedResult;
     const upper = lookup("LISTEN") orelse return error.TestUnexpectedResult;
@@ -1424,16 +1517,28 @@ test "writeUnknown on a wildly unrelated query still returns cleanly with no sug
     try std.testing.expect(std.mem.indexOf(u8, written, "unknown configuration") != null);
 }
 
-test "explaining a secret field never includes a live secret value even if present in the process environment" {
-    // Regression guard for #163: `explain` is a static reference lookup and
-    // must never read process environment values. jwt_secret's entry has no
-    // mechanism to read TARDIGRADE_JWT_SECRET at all, but assert the
-    // rendered output positively excludes a sentinel value to catch any
-    // future refactor that accidentally wires this through effective config.
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+test "explaining a secret field never includes a live secret value present in the process environment" {
+    // Regression guard for #163. Unlike a check that only inspects the
+    // static metadata (which would keep passing even if `explain` were
+    // later wired through effective config), this test places a sentinel
+    // value in the *real* process environment first -- mirroring how an
+    // operator actually sets TARDIGRADE_JWT_SECRET -- then proves both that
+    // the sentinel is genuinely present and that rendering the entry never
+    // surfaces it. See also the equivalent integration test in
+    // tests/integration.zig, which spawns the built `tardi explain
+    // jwt_secret` binary against a real child environment.
+    const sentinel = "do-not-print-this-sentinel";
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_JWT_SECRET", sentinel, 1));
+
+    const observed = std.c.getenv("TARDIGRADE_JWT_SECRET") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(sentinel, std.mem.span(observed));
+
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try writeExplanation(&out.writer, lookup("jwt_secret").?);
     const written = out.writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "do-not-print-this") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, sentinel) == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "TARDIGRADE_JWT_SECRET") != null);
 }

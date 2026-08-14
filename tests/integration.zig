@@ -17350,3 +17350,59 @@ test "init tls profile passes the real tardi check once real TLS fixtures are su
 test "init prod profile passes the real tardi check with TLS fixtures and a test upstream" {
     try expectInitTlsProfileGeneratesCheckableConfig(std.testing.allocator, "prod", "http://127.0.0.1:3000");
 }
+
+// #163: `tardi explain <field>`. These spawn the actual built binary against
+// a real child environment rather than exercising config_reference.zig's
+// pure functions in-process, so they prove the strongest form of the
+// secret-leak regression required by #163 -- that a sentinel genuinely
+// present in the environment `tardi explain` runs under never reaches
+// stdout or stderr, closing the gap a purely-static assertion cannot.
+fn expectExplainNeverLeaksLiveSecret(allocator: std.mem.Allocator, field: []const u8, env_name: []const u8) !void {
+    const sentinel = "super-secret-test-value";
+
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put(env_name, sentinel);
+
+    const res = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "explain", field },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    try assertContains(res.stdout, env_name);
+    try std.testing.expect(std.mem.indexOf(u8, res.stdout, sentinel) == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.stderr, sentinel) == null);
+}
+
+test "explain jwt_secret never leaks a live TARDIGRADE_JWT_SECRET value from the process environment" {
+    try expectExplainNeverLeaksLiveSecret(std.testing.allocator, "jwt_secret", "TARDIGRADE_JWT_SECRET");
+}
+
+test "explain trust_shared_secret never leaks a live TARDIGRADE_TRUST_SHARED_SECRET value from the process environment" {
+    try expectExplainNeverLeaksLiveSecret(std.testing.allocator, "trust_shared_secret", "TARDIGRADE_TRUST_SHARED_SECRET");
+}
+
+test "explain never touches a config file: an invalid TARDIGRADE_CONFIG_PATH does not affect the result" {
+    const allocator = std.testing.allocator;
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("TARDIGRADE_CONFIG_PATH", "/nonexistent/path/tardigrade.conf");
+
+    const res = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "explain", "listen" },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    try assertContains(res.stdout, "listen");
+    try std.testing.expectEqualStrings("", res.stderr);
+}
