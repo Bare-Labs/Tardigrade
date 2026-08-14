@@ -19,20 +19,28 @@ All notable user-facing changes to Tardigrade are documented here.
   datagrams, which also caps what a connection returning from idle may send at
   once. BBR and other rate estimators remain out of scope.
 
-  Only application data waits on the bucket. Acknowledgements, PTO probes, and
-  Initial/Handshake flights are charged to it but never delayed by it: an ACK
-  is not congestion-controlled traffic, a probe is how a stalled connection
-  recovers, and the handshake is already bounded by the initial window and by
-  anti-amplification. Congestion control and anti-amplification stay the hard
-  gates — pacing only ever delays a datagram, never authorises one.
+  Only application data waits on the bucket. PTO probes, Initial/Handshake
+  flights, DPLPMTUD probes, and path-validation probes are charged to it but
+  never delayed by it — a probe is how a stalled connection recovers, and the
+  handshake is already bounded by the initial window and by anti-amplification.
+  Pure ACKs are exempt outright, neither delayed nor charged, since an ACK-only
+  packet is not congestion-controlled traffic and metering it would only add
+  latency to the peer's loss recovery. Congestion control and anti-amplification
+  stay the hard gates — pacing only ever delays a datagram, never authorises one.
 
   Packet construction never sleeps: `pollTransmitOnPath` declines to build
   paced data while the bucket is short, and the listener folds the connection's
-  next release time into the same poll timeout it already computes from timers,
-  so a paced connection neither spins nor sleeps past its own deadline. There
-  is no operator knob — a pacing rate adjustable independently of the window
-  would be a way to defeat congestion control rather than to tune it. See
-  `docs/HTTP3_ROLLOUT.md`.
+  next release time into the same sleep it already computes from timers, so a
+  paced connection neither spins nor sleeps past its own deadline. Because
+  pacing intervals are routinely sub-millisecond — a 480 kB window over a 10 ms
+  RTT is one datagram every ~20 µs — the QUIC listener now waits with `ppoll`
+  on Linux and a `kqueue` timeout on the BSDs, falling back to millisecond
+  `poll` elsewhere; without that, rounding each release up to 1 ms would have
+  capped the listener at one burst per millisecond regardless of window and RTT.
+
+  There is no operator knob — a pacing rate adjustable independently of the
+  window would be a way to defeat congestion control rather than to tune it.
+  See `docs/HTTP3_ROLLOUT.md`.
 - **Explicit Congestion Notification for HTTP/3 (#256-E)** — the QUIC listener
   now marks outbound datagrams ECT(0), counts the codepoints on received
   packets, reports them to peers in ACK_ECN, and validates the counters peers

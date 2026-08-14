@@ -947,10 +947,17 @@ pub const CongestionController = struct {
     }
 
     /// The earliest time `bytes` becomes eligible — `now_us` when it already
-    /// is. When it is not, the result is strictly greater than `now_us` (at
-    /// least one timer granularity out), so an event loop that sleeps until
-    /// this deadline always makes progress instead of spinning on a deadline
-    /// that has already passed.
+    /// is. When it is not, the result is strictly greater than `now_us`, so an
+    /// event loop that sleeps until this deadline always makes progress
+    /// instead of spinning on a deadline that has already passed.
+    ///
+    /// Anti-spin needs exactly one microsecond of headroom and gets it for
+    /// free: the ceil-division below cannot return 0 while the deficit is
+    /// non-zero. Deliberately *not* floored at `timer_granularity_us` — that
+    /// constant is loss-detection timer resolution, and a fast path's pacing
+    /// interval is legitimately far below it. A 1 ms floor on a 40 Mbit-plus
+    /// path would round every release up and, against a bounded burst, cap the
+    /// sender at `burst / 1 ms` no matter how much window and RTT allowed.
     pub fn pacingReleaseUs(self: CongestionController, bytes: usize, now_us: u64, rtt: RttEstimator) u64 {
         const tokens = self.pacingTokens(now_us, rtt);
         if (tokens >= bytes) return now_us;
@@ -960,7 +967,7 @@ pub const CongestionController = struct {
         const numerator = @as(u128, deficit) * gain.denominator * srtt;
         const denominator = @as(u128, gain.numerator) * self.pacingWindow();
         const delay: u64 = @intCast(@min((numerator + denominator - 1) / denominator, @as(u128, std.math.maxInt(u32))));
-        return now_us + @max(delay, timer_granularity_us);
+        return now_us + @max(delay, 1);
     }
 
     /// Charge `bytes` to the pacing bucket at `now_us`. Called for every
@@ -1106,11 +1113,15 @@ pub const RecoveryController = struct {
     }
 
     /// Bill one in-flight packet to the congestion window and, in the same
-    /// step, to the pacing bucket (#256-C). Handshake and PTO traffic is
-    /// charged like everything else even though neither *waits* on the pacer:
-    /// those bytes are genuinely on the wire, and a bucket that ignored them
-    /// would let application data follow a handshake flight at a rate the
-    /// path was never shown to support.
+    /// step, to the pacing bucket (#256-C). Handshake, PTO, DPLPMTUD-probe and
+    /// path-validation traffic is charged like everything else even though
+    /// none of it *waits* on the pacer: those bytes are genuinely on the wire,
+    /// and a bucket that ignored them would let application data follow a
+    /// handshake flight at a rate the path was never shown to support.
+    ///
+    /// The `in_flight` test at both call sites is also what exempts a pure ACK
+    /// from the bucket entirely — not delayed by it and not charged to it,
+    /// since an ACK-only packet is not congestion-controlled traffic.
     fn chargeSend(self: *RecoveryController, packet: SentPacket) void {
         self.congestion.onPacketSent(packet.size);
         self.congestion.onPacingSent(packet.size, packet.time_sent_us, self.rtt);
@@ -1839,6 +1850,37 @@ test "pacing: the release schedule spaces datagrams at the RFC 9002 rate" {
         try testing.expect(cc.pacingTokens(now, fixture.rtt) < 1_200);
         previous = now;
     }
+}
+
+test "pacing: a fast path keeps its sub-millisecond interval" {
+    // 1.25 × 480 kB over a 10 ms RTT is 60 MB/s — one 1200-byte datagram every
+    // 20 µs. Ordinary for a datacentre or loopback path, and two orders of
+    // magnitude below `timer_granularity_us`.
+    var cc = CongestionController{ .congestion_window = 480_000, .ssthresh = 480_000 };
+    var rtt = RttEstimator.init(25_000);
+    rtt.update(10_000, 0);
+    var now: u64 = 1_000_000;
+    while (cc.pacingAllows(1_200, now, rtt)) cc.onPacingSent(1_200, now, rtt);
+
+    // `timer_granularity_us` is loss-detection resolution and has no business
+    // here: flooring the release at 1 ms would underpace this path 50×.
+    const release = cc.pacingReleaseUs(1_200, now, rtt);
+    try testing.expectEqual(now + 20, release);
+    try testing.expect(release - now < timer_granularity_us);
+
+    // The consequence a floor would have, stated as throughput: one
+    // millisecond of this schedule releases five bursts' worth. Floored at
+    // 1 ms it could never exceed one, whatever the window and RTT said.
+    const deadline = now + 1_000;
+    var released: usize = 0;
+    while (true) {
+        now = cc.pacingReleaseUs(1_200, now, rtt);
+        if (now > deadline) break;
+        cc.onPacingSent(1_200, now, rtt);
+        released += 1;
+    }
+    try testing.expectEqual(@as(usize, 50), released);
+    try testing.expect(released > default_pacer_burst_packets);
 }
 
 test "pacing: an idle sender restarts with one burst, not with everything it missed" {

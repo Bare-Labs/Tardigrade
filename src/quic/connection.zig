@@ -3645,11 +3645,18 @@ pub const Connection = struct {
     ///
     /// Null unless there is genuinely paced content held back, so it cannot
     /// keep an otherwise-idle listener awake. When it is non-null the value is
-    /// strictly in the future (`pacingReleaseUs` floors the wait at one timer
-    /// granularity), so a loop that sleeps until it always advances.
+    /// strictly in the future, so a loop that sleeps until it always advances.
     pub fn nextSendTimeUs(self: *Connection, now_us: u64) ?u64 {
         if (self.state_ != .established) return null;
-        if (!self.hasAppContent()) return null;
+        // Must name every source `buildPacket` subjects to the pacing gate,
+        // not just streams and control frames. Application-space CRYPTO is the
+        // one that is easy to miss: `emitNewSessionTicket` queues post-
+        // handshake bytes into `crypto_tx[2]`, which the builder paces like any
+        // other application-space content. A predicate that only asked
+        // `hasAppContent` would report no deadline for a connection whose only
+        // held-back content was a session ticket — the ticket would be refused
+        // at `now` and then wait for an unrelated wakeup.
+        if (!self.hasAppContent() and self.crypto_tx[2].pending.isEmpty()) return null;
         const size = self.recovery.congestion.max_datagram_size;
         // Congestion control is the harder gate and it is not a pacing
         // deadline: when the window is what is holding the sender back, the
@@ -4457,8 +4464,6 @@ pub const Connection = struct {
         // window term below and the anti-amplification check after it remain
         // the gates that refuse outright. What waits on a token is
         // application-space data, and only that:
-        //   * a pure ACK is not congestion controlled at all, so metering it
-        //     would add latency to acknowledgements for no capacity reason;
         //   * a PTO probe is recovery traffic RFC 9002 §7 already exempts from
         //     the window, and making loss recovery wait on a token is how a
         //     stalled connection stays stalled;
@@ -4466,8 +4471,16 @@ pub const Connection = struct {
         //     for a server, by anti-amplification — pacing the handshake at a
         //     rate derived from an RTT nobody has measured yet would slow every
         //     connection setup to buy nothing.
-        // The bytes all three put on the wire are still charged to the bucket
-        // (`RecoveryController.chargeSend`); they simply never wait on it.
+        // Both still put bytes on the wire and are charged for them
+        // (`RecoveryController.chargeSend`); they just never wait.
+        //
+        // A pure ACK is exempt without needing to be named here: it is not in
+        // flight, so it is neither delayed by the bucket nor charged to it —
+        // metering acknowledgements would add latency to the *peer's* loss
+        // recovery for no capacity reason. It reaches the wire through the
+        // `want_ack` terms below, which `can_send_data` does not gate.
+        // `buildPmtuProbe` and `buildCandidatePacket` are likewise unpaced;
+        // both build their own datagram without coming through here.
         const pacing_blocked = space == .application and !probe and
             !self.recovery.pacingAllows(self.recovery.congestion.max_datagram_size, now_us);
 
@@ -12919,4 +12932,54 @@ test "driver: an acknowledgement is not delayed by a spent pacing bucket" {
     pair.server.ack_eliciting_since_ack[Connection.spaceIndex(.application)] = ack_eliciting_threshold;
     const ack = pair.server.pollTransmitOnPath(&out, now) orelse return error.TestExpectedEqual;
     try testing.expect(ack.bytes.len > 0);
+}
+
+test "driver: a paced session ticket is refused now and reported as a deadline" {
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    // Post-handshake CRYPTO is application-space content, so `buildPacket`
+    // paces it like any other. Nothing else is queued here — no streams, no
+    // control frames — so a wake predicate that only asked `hasAppContent`
+    // would report no deadline and leave the ticket waiting for an unrelated
+    // wakeup.
+    pair.server.recovery.rtt = recovery.RttEstimator.init(25_000);
+    pair.server.recovery.rtt.update(100_000, 0);
+    const congestion = &pair.server.recovery.congestion;
+    congestion.congestion_window = 64 * 1024;
+    congestion.ssthresh = 64 * 1024;
+    congestion.bytes_in_flight = 0;
+    // A bucket spent down to nothing, without anything having been sent that
+    // could queue other content alongside the ticket.
+    congestion.pacer = .{ .tokens = 0, .updated_at_us = pair.now_us };
+
+    var server_state = try pair.server.emitNewSessionTicket(.{
+        .ticket_lifetime = 60,
+        .ticket_age_add = 1,
+        .ticket_nonce = "\x01",
+        .opaque_ticket = "paced-ticket",
+        .issued_at_unix_ms = 10,
+    }, tls_core.session.Limits.default);
+    defer server_state.deinit();
+
+    const now = pair.now_us;
+    try testing.expect(!pair.server.crypto_tx[Connection.spaceIndex(.application)].pending.isEmpty());
+    try testing.expect(!pair.server.hasAppContent());
+
+    // Refused at `now` — and the connection says when to come back rather than
+    // going silent.
+    try testing.expectEqual(@as(usize, 0), drainAtInstant(pair.server, now));
+    const release = pair.server.nextSendTimeUs(now) orelse return error.TestExpectedEqual;
+    try testing.expect(release > now);
+    try testing.expectEqual(@as(usize, 0), drainAtInstant(pair.server, release - 1));
+
+    // At the release the ticket goes out, as application-space CRYPTO.
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    const sent = pair.server.pollTransmitOnPath(&out, release) orelse return error.TestExpectedEqual;
+    try testing.expect(sent.bytes.len > 0);
+    const record = pair.server.sent_records.items[pair.server.sent_records.items.len - 1];
+    try testing.expectEqual(PacketNumberSpace.application, record.space);
+    try testing.expect(record.crypto != null);
 }
