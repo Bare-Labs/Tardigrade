@@ -205,8 +205,13 @@ TARDIGRADE_HTTP3_KEYLOG_PATH=/tmp/tardigrade-qlog/http3.keys
   collision-safe: `quic-0000000000000001.sqlog`, then a numeric suffix if that
   name already exists.
 - `TARDIGRADE_HTTP3_KEYLOG_PATH` opens one append-only NSS keylog file with
-  restrictive `0600` permissions when it is created. Multiple connections share
-  this file; writes are serialized in process and use OS append mode.
+  restrictive `0600` permissions; existing files are tightened to `0600` before
+  any secret is written. Multiple connections share this file.
+- Runtime callbacks serialize records into fixed buffers and enqueue them into
+  a bounded in-process queue. A dedicated writer thread owns file creation,
+  append writes, and per-connection trace close. Queue-full / enqueue-failure
+  cases drop the debug record and increment diagnostics rather than blocking
+  the QUIC/H3 event-loop thread or TLS handshake path.
 - Enabling key logging emits a startup warning because the file contains TLS
   traffic secrets. Never put this path under normal logs, Prometheus, qlog,
   crash-report directories, public CI artifacts, or shared object storage.
@@ -227,7 +232,8 @@ serialization / disk-full / permission errors back through `emit`. The
 **contract for concrete sinks** is therefore to *retain the first write error
 and/or count dropped records* and expose that out-of-band, so a truncated trace
 is detectable rather than silently lost during interop. The gateway artifact
-writer keeps qlog and keylog write-error counters out of protocol state.
+writer keeps qlog/keylog write-error and dropped-record counters out of
+protocol state and logs final nonzero counts at teardown.
 
 ## Keylog
 

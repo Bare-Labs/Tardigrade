@@ -159,6 +159,7 @@ pub const Config = struct {
     qlog_artifacts_ctx: ?*anyopaque = null,
     quic_qlog_artifact_cb: ?*const fn (*anyopaque, u64, quic.qlog.Record) void = null,
     h3_qlog_artifact_cb: ?*const fn (*anyopaque, u64, http3.qlog.Record) void = null,
+    qlog_artifact_close_cb: ?*const fn (*anyopaque, u64) void = null,
     /// Optional TLS keylog context copied into every accepted QUIC handshake.
     /// The TLS engine emits secrets to this callback only; file handling stays
     /// in the composition root.
@@ -166,14 +167,19 @@ pub const Config = struct {
 };
 
 pub const ObservabilityArtifacts = struct {
-    allocator: std.mem.Allocator,
-    qlog_dir: []const u8 = "",
-    keylog_path: []const u8 = "",
-    traces: std.AutoHashMap(u64, *Trace) = undefined,
-    keylog_fd: ?posix.fd_t = null,
-    mutex: compat.Mutex = .{},
-    qlog_write_errors: usize = 0,
-    keylog_write_errors: usize = 0,
+    state: *State,
+
+    const qlog_record_max = 4096;
+    const keylog_record_max = 256;
+    const queue_capacity = 256;
+    const ArtifactKind = enum { qlog, keylog };
+
+    pub const Diagnostics = struct {
+        qlog_write_errors: usize = 0,
+        keylog_write_errors: usize = 0,
+        qlog_dropped_records: usize = 0,
+        keylog_dropped_records: usize = 0,
+    };
 
     const Trace = struct {
         path: []u8,
@@ -186,40 +192,201 @@ pub const ObservabilityArtifacts = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator, qlog_dir: []const u8, keylog_path: []const u8) !ObservabilityArtifacts {
-        var self = ObservabilityArtifacts{
-            .allocator = allocator,
-            .qlog_dir = qlog_dir,
-            .keylog_path = keylog_path,
-            .traces = std.AutoHashMap(u64, *Trace).init(allocator),
-        };
-        errdefer self.deinit();
-        if (qlog_dir.len > 0) try compat.cwd().makePath(qlog_dir);
-        if (keylog_path.len > 0) {
-            self.keylog_fd = try openAppendOnly0600(keylog_path);
-        }
-        return self;
-    }
+    const Command = union(enum) {
+        qlog: struct {
+            handle: u64,
+            bytes: [qlog_record_max]u8,
+            len: usize,
+        },
+        keylog: struct {
+            bytes: [keylog_record_max]u8,
+            len: usize,
+        },
+        close_trace: u64,
+    };
 
-    pub fn deinit(self: *ObservabilityArtifacts) void {
-        if (self.traces.capacity() != 0) {
+    const State = struct {
+        allocator: std.mem.Allocator,
+        logger: ?*Logger,
+        qlog_dir: []const u8,
+        keylog_path: []const u8,
+        traces: std.AutoHashMap(u64, *Trace),
+        keylog_fd: ?posix.fd_t = null,
+        mutex: compat.Mutex = .{},
+        condition: compat.Condition = .{},
+        queue: [queue_capacity]Command = undefined,
+        queue_head: usize = 0,
+        queue_len: usize = 0,
+        worker_active: bool = false,
+        stopping: bool = false,
+        thread: ?std.Thread = null,
+        qlog_write_errors: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        keylog_write_errors: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        qlog_dropped_records: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        keylog_dropped_records: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+        fn init(allocator: std.mem.Allocator, logger: ?*Logger, qlog_dir: []const u8, keylog_path: []const u8) !*State {
+            const state = try allocator.create(State);
+            state.* = .{
+                .allocator = allocator,
+                .logger = logger,
+                .qlog_dir = qlog_dir,
+                .keylog_path = keylog_path,
+                .traces = std.AutoHashMap(u64, *Trace).init(allocator),
+            };
+            errdefer {
+                state.deinitStorage();
+                allocator.destroy(state);
+            }
+            if (qlog_dir.len > 0) try compat.cwd().makePath(qlog_dir);
+            if (keylog_path.len > 0) state.keylog_fd = try openAppendOnly0600(keylog_path);
+            state.thread = try std.Thread.spawn(.{}, workerMain, .{state});
+            return state;
+        }
+
+        fn deinit(self: *State) void {
+            self.mutex.lock();
+            self.stopping = true;
+            self.condition.signal();
+            self.mutex.unlock();
+            if (self.thread) |thread| thread.join();
+            self.logFinalDiagnostics();
+            self.deinitStorage();
+            self.allocator.destroy(self);
+        }
+
+        fn deinitStorage(self: *State) void {
             var it = self.traces.valueIterator();
             while (it.next()) |trace| trace.*.deinit(self.allocator);
             self.traces.deinit();
+            if (self.keylog_fd) |fd| {
+                _ = std.c.close(fd);
+                self.keylog_fd = null;
+            }
         }
-        if (self.keylog_fd) |fd| {
-            _ = std.c.close(fd);
-            self.keylog_fd = null;
+
+        fn diagnostics(self: *const State) Diagnostics {
+            return .{
+                .qlog_write_errors = self.qlog_write_errors.load(.monotonic),
+                .keylog_write_errors = self.keylog_write_errors.load(.monotonic),
+                .qlog_dropped_records = self.qlog_dropped_records.load(.monotonic),
+                .keylog_dropped_records = self.keylog_dropped_records.load(.monotonic),
+            };
         }
+
+        fn logFinalDiagnostics(self: *const State) void {
+            const d = self.diagnostics();
+            if (d.qlog_write_errors == 0 and d.keylog_write_errors == 0 and d.qlog_dropped_records == 0 and d.keylog_dropped_records == 0) return;
+            if (self.logger) |logger| {
+                logger.warn(null, "HTTP/3 observability artifacts ended with qlog_write_errors={d} keylog_write_errors={d} qlog_dropped_records={d} keylog_dropped_records={d}", .{
+                    d.qlog_write_errors,
+                    d.keylog_write_errors,
+                    d.qlog_dropped_records,
+                    d.keylog_dropped_records,
+                });
+            }
+        }
+
+        fn noteWriteError(self: *State, comptime kind: ArtifactKind, err: anyerror) void {
+            switch (kind) {
+                .qlog => _ = self.qlog_write_errors.fetchAdd(1, .monotonic),
+                .keylog => _ = self.keylog_write_errors.fetchAdd(1, .monotonic),
+            }
+            if (self.logger) |logger| {
+                logger.warn(null, "HTTP/3 observability artifact write failed kind={s} error={s}", .{ @tagName(kind), @errorName(err) });
+            }
+        }
+
+        fn noteDrop(self: *State, comptime kind: ArtifactKind) void {
+            switch (kind) {
+                .qlog => _ = self.qlog_dropped_records.fetchAdd(1, .monotonic),
+                .keylog => _ = self.keylog_dropped_records.fetchAdd(1, .monotonic),
+            }
+        }
+
+        fn tryEnqueue(self: *State, comptime kind: ArtifactKind, command: Command) void {
+            if (!self.mutex.tryLock()) {
+                self.noteDrop(kind);
+                return;
+            }
+            defer self.mutex.unlock();
+            if (self.stopping or self.queue_len == self.queue.len) {
+                self.noteDrop(kind);
+                return;
+            }
+            self.pushAssumeLocked(command);
+            self.condition.signal();
+        }
+
+        fn enqueueClose(self: *State, handle: u64) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.stopping) return;
+            if (self.queue_len == self.queue.len) self.dropOldestDataAssumeLocked();
+            self.pushAssumeLocked(.{ .close_trace = handle });
+            self.condition.signal();
+        }
+
+        fn dropOldestDataAssumeLocked(self: *State) void {
+            if (self.queue_len == 0) return;
+            const dropped = self.queue[self.queue_head];
+            self.queue_head = (self.queue_head + 1) % self.queue.len;
+            self.queue_len -= 1;
+            switch (dropped) {
+                .qlog => self.noteDrop(.qlog),
+                .keylog => self.noteDrop(.keylog),
+                .close_trace => {},
+            }
+        }
+
+        fn pushAssumeLocked(self: *State, command: Command) void {
+            const tail = (self.queue_head + self.queue_len) % self.queue.len;
+            self.queue[tail] = command;
+            self.queue_len += 1;
+        }
+
+        fn popAssumeLocked(self: *State) ?Command {
+            if (self.queue_len == 0) return null;
+            const command = self.queue[self.queue_head];
+            self.queue_head = (self.queue_head + 1) % self.queue.len;
+            self.queue_len -= 1;
+            return command;
+        }
+
+        fn waitIdle(self: *State) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (self.queue_len != 0 or self.worker_active) {
+                self.condition.wait(&self.mutex);
+            }
+        }
+
+        fn traceCount(self: *State) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.traces.count();
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator, qlog_dir: []const u8, keylog_path: []const u8) !ObservabilityArtifacts {
+        return initWithLogger(allocator, null, qlog_dir, keylog_path);
+    }
+
+    pub fn initWithLogger(allocator: std.mem.Allocator, logger: ?*Logger, qlog_dir: []const u8, keylog_path: []const u8) !ObservabilityArtifacts {
+        return .{ .state = try State.init(allocator, logger, qlog_dir, keylog_path) };
+    }
+
+    pub fn deinit(self: *ObservabilityArtifacts) void {
+        self.state.deinit();
         self.* = undefined;
     }
 
     pub fn qlogEnabled(self: *const ObservabilityArtifacts) bool {
-        return self.qlog_dir.len > 0;
+        return self.state.qlog_dir.len > 0;
     }
 
     pub fn keylogContext(self: *ObservabilityArtifacts) tls_core.keylog.Context {
-        if (self.keylog_fd == null) return .{};
+        if (self.state.keylog_fd == null) return .{};
         return .{
             .enabled = true,
             .role = .server,
@@ -230,53 +397,112 @@ pub const ObservabilityArtifacts = struct {
     pub fn writeQuicRecord(ctx: *anyopaque, handle: u64, record: quic.qlog.Record) void {
         const self: *ObservabilityArtifacts = @ptrCast(@alignCast(ctx));
         if (!self.qlogEnabled()) return;
-        self.writeQlog(handle, .{ .quic = record }) catch {
-            self.qlog_write_errors += 1;
+        var bytes: [qlog_record_max]u8 = undefined;
+        const line = quic.qlog.writeJson(record, &bytes) catch {
+            self.state.noteDrop(.qlog);
+            return;
         };
+        self.state.tryEnqueue(.qlog, .{ .qlog = .{ .handle = handle, .bytes = bytes, .len = line.len } });
     }
 
     pub fn writeH3Record(ctx: *anyopaque, handle: u64, record: http3.qlog.Record) void {
         const self: *ObservabilityArtifacts = @ptrCast(@alignCast(ctx));
         if (!self.qlogEnabled()) return;
-        self.writeQlog(handle, .{ .h3 = record }) catch {
-            self.qlog_write_errors += 1;
+        var bytes: [qlog_record_max]u8 = undefined;
+        const line = http3.qlog.writeJson(record, &bytes) catch {
+            self.state.noteDrop(.qlog);
+            return;
         };
+        self.state.tryEnqueue(.qlog, .{ .qlog = .{ .handle = handle, .bytes = bytes, .len = line.len } });
+    }
+
+    pub fn closeTrace(ctx: *anyopaque, handle: u64) void {
+        const self: *ObservabilityArtifacts = @ptrCast(@alignCast(ctx));
+        if (!self.qlogEnabled()) return;
+        self.state.enqueueClose(handle);
     }
 
     fn emitKeylog(ctx: ?*anyopaque, entry: tls_core.keylog.Entry) void {
         const self: *ObservabilityArtifacts = @ptrCast(@alignCast(ctx.?));
-        self.writeKeylog(entry) catch {
-            self.keylog_write_errors += 1;
+        var bytes: [keylog_record_max]u8 = undefined;
+        const line = tls_core.keylog.writeLine(entry, &bytes) catch {
+            self.state.noteDrop(.keylog);
+            return;
         };
+        self.state.tryEnqueue(.keylog, .{ .keylog = .{ .bytes = bytes, .len = line.len } });
     }
 
-    const QlogRecord = union(enum) {
-        quic: quic.qlog.Record,
-        h3: http3.qlog.Record,
-    };
-
-    fn writeQlog(self: *ObservabilityArtifacts, handle: u64, record: QlogRecord) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const trace = try self.traceFor(handle);
-        var buf: [4096]u8 = undefined;
-        const line = switch (record) {
-            .quic => |r| try quic.qlog.writeJson(r, &buf),
-            .h3 => |r| try http3.qlog.writeJson(r, &buf),
-        };
-        try trace.file.writeAll(line);
+    pub fn waitIdle(self: *ObservabilityArtifacts) void {
+        self.state.waitIdle();
     }
 
-    fn traceFor(self: *ObservabilityArtifacts, handle: u64) !*Trace {
-        if (self.traces.get(handle)) |trace| return trace;
+    pub fn traceCount(self: *ObservabilityArtifacts) usize {
+        return self.state.traceCount();
+    }
+
+    pub fn diagnostics(self: *const ObservabilityArtifacts) Diagnostics {
+        return self.state.diagnostics();
+    }
+
+    fn workerMain(state: *State) void {
+        while (true) {
+            state.mutex.lock();
+            while (state.queue_len == 0 and !state.stopping) {
+                state.condition.wait(&state.mutex);
+            }
+            const command = state.popAssumeLocked() orelse {
+                const done = state.stopping;
+                state.mutex.unlock();
+                if (done) break;
+                continue;
+            };
+            state.worker_active = true;
+            state.mutex.unlock();
+
+            processCommand(state, command);
+
+            state.mutex.lock();
+            state.worker_active = false;
+            if (state.queue_len == 0) state.condition.broadcast();
+            state.mutex.unlock();
+        }
+    }
+
+    fn processCommand(state: *State, command: Command) void {
+        switch (command) {
+            .qlog => |record| {
+                const trace = traceFor(state, record.handle) catch |err| {
+                    state.noteWriteError(.qlog, err);
+                    return;
+                };
+                trace.file.writeAll(record.bytes[0..record.len]) catch |err| {
+                    state.noteWriteError(.qlog, err);
+                };
+            },
+            .keylog => |record| {
+                const fd = state.keylog_fd orelse return;
+                writeAllFd(fd, record.bytes[0..record.len]) catch |err| {
+                    state.noteWriteError(.keylog, err);
+                };
+            },
+            .close_trace => |handle| closeTraceOnWriter(state, handle),
+        }
+    }
+
+    fn closeTraceOnWriter(state: *State, handle: u64) void {
+        if (state.traces.fetchRemove(handle)) |kv| kv.value.deinit(state.allocator);
+    }
+
+    fn traceFor(state: *State, handle: u64) !*Trace {
+        if (state.traces.get(handle)) |trace| return trace;
 
         var attempts: usize = 0;
         while (attempts < 1024) : (attempts += 1) {
             const path = if (attempts == 0)
-                try std.fmt.allocPrint(self.allocator, "{s}/quic-{x:0>16}.sqlog", .{ self.qlog_dir, handle })
+                try std.fmt.allocPrint(state.allocator, "{s}/quic-{x:0>16}.sqlog", .{ state.qlog_dir, handle })
             else
-                try std.fmt.allocPrint(self.allocator, "{s}/quic-{x:0>16}-{d}.sqlog", .{ self.qlog_dir, handle, attempts });
-            errdefer self.allocator.free(path);
+                try std.fmt.allocPrint(state.allocator, "{s}/quic-{x:0>16}-{d}.sqlog", .{ state.qlog_dir, handle, attempts });
+            errdefer state.allocator.free(path);
             var file = compat.cwd().createFile(path, .{
                 .read = false,
                 .truncate = false,
@@ -284,7 +510,7 @@ pub const ObservabilityArtifacts = struct {
                 .permissions = @enumFromInt(0o600),
             }) catch |err| switch (err) {
                 error.PathAlreadyExists => {
-                    self.allocator.free(path);
+                    state.allocator.free(path);
                     continue;
                 },
                 else => return err,
@@ -297,30 +523,24 @@ pub const ObservabilityArtifacts = struct {
                 .vantage_point = .server,
             }, &header_buf);
             try file.writeAll(header);
-            const trace = try self.allocator.create(Trace);
+            const trace = try state.allocator.create(Trace);
             trace.* = .{ .path = path, .file = file };
-            try self.traces.put(handle, trace);
+            try state.traces.put(handle, trace);
             return trace;
         }
         return error.QlogPathCollision;
     }
 
-    fn writeKeylog(self: *ObservabilityArtifacts, entry: tls_core.keylog.Entry) !void {
-        const fd = self.keylog_fd orelse return;
-        var buf: [256]u8 = undefined;
-        const line = try tls_core.keylog.writeLine(entry, &buf);
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try writeAllFd(fd, line);
-    }
-
     fn openAppendOnly0600(path: []const u8) !posix.fd_t {
-        return try posix.openat(posix.AT.FDCWD, path, .{
+        const fd = try posix.openat(posix.AT.FDCWD, path, .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
             .APPEND = true,
             .CLOEXEC = true,
         }, 0o600);
+        errdefer _ = std.c.close(fd);
+        if (std.c.fchmod(fd, 0o600) != 0) return error.PermissionDenied;
+        return fd;
     }
 
     fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
@@ -538,6 +758,7 @@ const ConnEntry = struct {
         qlog_sink: quic.qlog.Sink = .{},
         qlog_artifacts_ctx: ?*anyopaque = null,
         qlog_artifact_cb: ?*const fn (*anyopaque, u64, quic.qlog.Record) void = null,
+        qlog_artifact_close_cb: ?*const fn (*anyopaque, u64) void = null,
         close_logged: bool = false,
         handshake_stage: metrics_mod.QuicHandshakeFailureStage = .initial,
         handshake_succeeded: bool = false,
@@ -665,6 +886,7 @@ pub const Runtime = struct {
     qlog_artifacts_ctx: ?*anyopaque = null,
     quic_qlog_artifact_cb: ?*const fn (*anyopaque, u64, quic.qlog.Record) void = null,
     h3_qlog_artifact_cb: ?*const fn (*anyopaque, u64, http3.qlog.Record) void = null,
+    qlog_artifact_close_cb: ?*const fn (*anyopaque, u64) void = null,
     tls_keylog_context: tls_core.keylog.Context = .{},
     snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
@@ -784,6 +1006,7 @@ pub const Runtime = struct {
             .qlog_artifacts_ctx = cfg.qlog_artifacts_ctx,
             .quic_qlog_artifact_cb = cfg.quic_qlog_artifact_cb,
             .h3_qlog_artifact_cb = cfg.h3_qlog_artifact_cb,
+            .qlog_artifact_close_cb = cfg.qlog_artifact_close_cb,
             .tls_keylog_context = cfg.tls_keylog_context,
             .snapshot_state = .{
                 .quic_port = cfg.quic_port,
@@ -1188,6 +1411,7 @@ pub const Runtime = struct {
                 .qlog_sink = quic_sink,
                 .qlog_artifacts_ctx = self.qlog_artifacts_ctx,
                 .qlog_artifact_cb = self.quic_qlog_artifact_cb,
+                .qlog_artifact_close_cb = self.qlog_artifact_close_cb,
             },
             .h3_observer = .{
                 .runtime = self,
@@ -1201,9 +1425,6 @@ pub const Runtime = struct {
             .accepted_at_us = now,
         };
         entry.conn.events = .{ .context = &entry.quic_observer, .emitFn = quicConnectionEvent };
-        if (quic_sink.isEnabled()) {
-            quic_sink.log(now, .{ .connection_started = .{ .dcid_len = @intCast(@min(parsed.dcid.len, std.math.maxInt(u8))) } });
-        }
         if (h3EventSinkFor(&entry.h3_observer)) |event_sink| {
             entry.h3.setEventSink(event_sink);
         }
@@ -1237,6 +1458,7 @@ pub const Runtime = struct {
             return null;
         };
         self.noteConnectionAccepted();
+        emitQuicQlog(&entry.quic_observer, now, .{ .connection_started = .{ .dcid_len = @intCast(@min(parsed.dcid.len, std.math.maxInt(u8))) } });
         self.recordQuicConnectionsActive(connections.count());
         if (retry_context != null) self.noteRetryTokenAccepted();
         return handle;
@@ -1329,6 +1551,11 @@ pub const Runtime = struct {
             for (kv.value.owned_cids[0..kv.value.owned_cid_count]) |cid| routes.remove(cid);
             self.noteCidRouteCount(routes.count());
             decPerIp(per_ip, kv.value.admission_source_ip);
+            if (kv.value.quic_observer.qlog_artifact_close_cb) |close| {
+                if (kv.value.quic_observer.qlog_artifacts_ctx) |artifact_ctx| {
+                    close(artifact_ctx, handle);
+                }
+            }
             kv.value.deinit(self.allocator);
             self.allocator.destroy(kv.value);
             self.noteConnectionClosed();
@@ -2005,13 +2232,7 @@ pub const Runtime = struct {
                     },
                     else => {},
                 }
-                const record = quic.qlog.Record{ .time_us = nowUs(), .event = qlog_event };
-                observer.qlog_sink.emit(record);
-                if (observer.qlog_artifact_cb) |emit| {
-                    if (observer.qlog_artifacts_ctx) |artifact_ctx| {
-                        emit(artifact_ctx, observer.connection_handle, record);
-                    }
-                }
+                emitQuicQlog(observer, nowUs(), qlog_event);
             }
         }
         switch (event) {
@@ -2079,6 +2300,16 @@ pub const Runtime = struct {
                 });
             },
             else => {},
+        }
+    }
+
+    fn emitQuicQlog(observer: *ConnEntry.QuicObserver, time_us: u64, event: quic.qlog.Event) void {
+        const record = quic.qlog.Record{ .time_us = time_us, .event = event };
+        observer.qlog_sink.emit(record);
+        if (observer.qlog_artifact_cb) |emit| {
+            if (observer.qlog_artifacts_ctx) |artifact_ctx| {
+                emit(artifact_ctx, observer.connection_handle, record);
+            }
         }
     }
 
@@ -7389,7 +7620,7 @@ test "http3 runtime: the socket waiter takes a sub-millisecond path where the pl
     waiter.wait(200);
 }
 
-test "http3 runtime: observability artifacts merge QUIC and H3 qlog records into one sqlog" {
+test "http3 runtime: observability artifacts follow accepted connection lifecycle" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const tmp_root = try compat.wrapDir(tmp.dir).realpathAlloc(testing.allocator, ".");
@@ -7400,26 +7631,77 @@ test "http3 runtime: observability artifacts merge QUIC and H3 qlog records into
     var artifacts = try ObservabilityArtifacts.init(testing.allocator, qlog_dir, "");
     defer artifacts.deinit();
 
-    ObservabilityArtifacts.writeQuicRecord(&artifacts, 7, .{
-        .time_us = 1000,
-        .event = .{ .connection_started = .{ .dcid_len = 8 } },
-    });
-    ObservabilityArtifacts.writeH3Record(&artifacts, 7, .{
-        .time_us = 2000,
-        .event = .{ .stream_type_set = .{ .stream_id = 0, .stream_type = .control } },
-    });
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(
+        tls_core.credentials.testdata.identity(),
+        tls_core.credentials.testdata.ignoredEntropy(),
+    );
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-artifacts-test");
+    var runtime = Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .qlog_artifacts_ctx = &artifacts,
+        .quic_qlog_artifact_cb = ObservabilityArtifacts.writeQuicRecord,
+        .h3_qlog_artifact_cb = ObservabilityArtifacts.writeH3Record,
+        .qlog_artifact_close_cb = ObservabilityArtifacts.closeTrace,
+    }) catch return error.SkipZigTest;
+    defer runtime.deinit();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/quic-0000000000000007.sqlog", .{qlog_dir});
+    var connections = std.AutoHashMap(u64, *ConnEntry).init(testing.allocator);
+    defer connections.deinit();
+    var routes = quic.cid.CidRoutingTable.init(testing.allocator);
+    defer routes.deinit();
+    var per_ip = std.AutoHashMap(u32, u32).init(testing.allocator);
+    defer per_ip.deinit();
+    var next_handle: u64 = 1;
+
+    const dcid = [_]u8{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7 };
+    const scid = [_]u8{ 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7 };
+    const handle = runtime.accept(&connections, &routes, &per_ip, &next_handle, .{
+        .kind = .initial,
+        .version = quic.packet.quic_v1,
+        .dcid = &dcid,
+        .scid = &scid,
+        .token = "",
+    }, testPeerSockaddr(44_300), 1_000_000) orelse return error.SkipZigTest;
+    const entry = connections.get(handle).?;
+    Runtime.h3ConnectionEvent(&entry.h3_observer, .{ .stream_type_set = .{ .stream_id = 0, .stream_type = .control } });
+    artifacts.waitIdle();
+    try testing.expectEqual(@as(usize, 1), artifacts.traceCount());
+
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/quic-0000000000000001.sqlog", .{qlog_dir});
     defer testing.allocator.free(path);
     const contents = try compat.cwd().readFileAlloc(testing.allocator, path, 8192);
     defer testing.allocator.free(contents);
 
     try testing.expect(std.mem.indexOf(u8, contents, "\"file_schema\":\"urn:ietf:params:qlog:file:sequential\"") != null);
-    try testing.expect(std.mem.indexOf(u8, contents, "\"group_id\":\"0000000000000007\"") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "\"group_id\":\"0000000000000001\"") != null);
     try testing.expect(std.mem.indexOf(u8, contents, "\"name\":\"quic:connection_started\"") != null);
     try testing.expect(std.mem.indexOf(u8, contents, "\"name\":\"http3:stream_type_set\"") != null);
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, contents, &[_]u8{quic.qlog.record_separator}));
-    try testing.expectEqual(@as(usize, 0), artifacts.qlog_write_errors);
+    runtime.removeConnection(&connections, &routes, &per_ip, handle, .administrative);
+    artifacts.waitIdle();
+    try testing.expectEqual(@as(usize, 0), artifacts.traceCount());
+
+    const dcid2 = [_]u8{ 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7 };
+    const scid2 = [_]u8{ 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7 };
+    const handle2 = runtime.accept(&connections, &routes, &per_ip, &next_handle, .{
+        .kind = .initial,
+        .version = quic.packet.quic_v1,
+        .dcid = &dcid2,
+        .scid = &scid2,
+        .token = "",
+    }, testPeerSockaddr(44_301), 1_100_000) orelse return error.SkipZigTest;
+    artifacts.waitIdle();
+    try testing.expectEqual(@as(usize, 1), artifacts.traceCount());
+    runtime.removeConnection(&connections, &routes, &per_ip, handle2, .administrative);
+    artifacts.waitIdle();
+    try testing.expectEqual(@as(usize, 0), artifacts.traceCount());
+
+    const d = artifacts.diagnostics();
+    try testing.expectEqual(@as(usize, 0), d.qlog_write_errors);
+    try testing.expectEqual(@as(usize, 0), d.qlog_dropped_records);
 }
 
 test "http3 runtime: observability artifacts append TLS keylog lines through shared formatter" {
@@ -7437,10 +7719,45 @@ test "http3 runtime: observability artifacts append TLS keylog lines through sha
     const random = [_]u8{0x11} ** tls_core.keylog.client_random_len;
     try context.setClientRandom(&random);
     context.emitSecret(.handshake, .write, &[_]u8{ 0xaa, 0xbb });
+    artifacts.waitIdle();
 
     const contents = try compat.cwd().readFileAlloc(testing.allocator, keylog_path, 1024);
     defer testing.allocator.free(contents);
     try testing.expect(std.mem.startsWith(u8, contents, "SERVER_HANDSHAKE_TRAFFIC_SECRET "));
     try testing.expect(std.mem.endsWith(u8, contents, " aabb\n"));
-    try testing.expectEqual(@as(usize, 0), artifacts.keylog_write_errors);
+    const d = artifacts.diagnostics();
+    try testing.expectEqual(@as(usize, 0), d.keylog_write_errors);
+    try testing.expectEqual(@as(usize, 0), d.keylog_dropped_records);
+}
+
+test "http3 runtime: keylog initialization tightens permissive existing files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try compat.wrapDir(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(tmp_root);
+    const keylog_path = try std.fmt.allocPrint(testing.allocator, "{s}/http3.keys", .{tmp_root});
+    defer testing.allocator.free(keylog_path);
+
+    var file = try compat.cwd().createFile(keylog_path, .{
+        .read = false,
+        .truncate = true,
+        .exclusive = true,
+        .permissions = @enumFromInt(0o644),
+    });
+    file.close();
+
+    var artifacts = try ObservabilityArtifacts.init(testing.allocator, "", keylog_path);
+    defer artifacts.deinit();
+    const stat = try compat.cwd().statFile(keylog_path);
+    try testing.expectEqual(@as(u16, 0), @as(u16, @intCast(@intFromEnum(stat.permissions) & 0o077)));
+
+    var context = artifacts.keylogContext();
+    const random = [_]u8{0x33} ** tls_core.keylog.client_random_len;
+    try context.setClientRandom(&random);
+    context.emitSecret(.handshake, .write, &[_]u8{0xcc});
+    artifacts.waitIdle();
+
+    const contents = try compat.cwd().readFileAlloc(testing.allocator, keylog_path, 1024);
+    defer testing.allocator.free(contents);
+    try testing.expect(std.mem.endsWith(u8, contents, " cc\n"));
 }

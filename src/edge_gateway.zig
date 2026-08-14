@@ -503,8 +503,9 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             state.logger.warn(null, "HTTP/3 requested without TLS cert/key; QUIC bootstrap will remain incomplete", .{});
         }
         if (cfg.http3_qlog_dir.len > 0 or cfg.http3_keylog_path.len > 0) {
-            http3_observability_artifacts = http.http3_runtime.ObservabilityArtifacts.init(
+            http3_observability_artifacts = http.http3_runtime.ObservabilityArtifacts.initWithLogger(
                 state_allocator,
+                &state.logger,
                 cfg.http3_qlog_dir,
                 cfg.http3_keylog_path,
             ) catch |err| {
@@ -554,6 +555,7 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .qlog_artifacts_ctx = if (http3_observability_artifacts) |*artifacts| artifacts else null,
             .quic_qlog_artifact_cb = if (http3_observability_artifacts) |*artifacts| if (artifacts.qlogEnabled()) http.http3_runtime.ObservabilityArtifacts.writeQuicRecord else null else null,
             .h3_qlog_artifact_cb = if (http3_observability_artifacts) |*artifacts| if (artifacts.qlogEnabled()) http.http3_runtime.ObservabilityArtifacts.writeH3Record else null else null,
+            .qlog_artifact_close_cb = if (http3_observability_artifacts) |*artifacts| if (artifacts.qlogEnabled()) http.http3_runtime.ObservabilityArtifacts.closeTrace else null else null,
             .tls_keylog_context = if (http3_observability_artifacts) |*artifacts| artifacts.keylogContext() else .{},
         }) catch |err| blk: {
             state.logger.warn(null, "HTTP/3 listener failed to initialize: {s}", .{@errorName(err)});
