@@ -4,8 +4,10 @@ Curated, copy/paste-runnable configs for common Tardigrade deployments.
 Each example includes a short explanation, the minimal setup required to run it locally, and a reference to the environment variables it uses.
 
 Prefer fewer high-quality examples over many incomplete snippets. If something
-is not represented here, check the [configuration overview](../README.md#overview)
-and [Core v1 support matrix](../docs/SUPPORT_MATRIX.md), or open an issue.
+is not represented here, check the
+[configuration reference](../docs/CONFIGURATION.md),
+[configuration overview](../README.md#overview), and
+[Core v1 support matrix](../docs/SUPPORT_MATRIX.md), or open an issue.
 
 ## Index
 
