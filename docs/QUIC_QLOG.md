@@ -10,11 +10,12 @@ This document is the design of record. The scaffolding it describes lives in:
 - `src/tls/keylog.zig` — transport-neutral NSS `SSLKEYLOGFILE` label mapping
   + line writer (`src/quic/keylog.zig` is a compatibility re-export).
 - `src/quic/config.zig` — `Observability { qlog_enabled, keylog_enabled }`.
+- `src/http/http3_runtime.zig` — concrete debug artifact writer for the
+  gateway HTTP/3 listener.
 
 The event models, JSON-SEQ serializers, HTTP/3 qlog bridge, QUIC qlog bridge,
-and shared TLS keylog emission seam are implemented. Concrete qlog/keylog file
-destinations and #247 artifact retention remain opt-in composition-root follow
-ups.
+shared TLS keylog emission seam, and gateway qlog/keylog file destinations are
+implemented. #247 artifact retention remains opt-in harness work.
 
 ## Goals
 
@@ -189,6 +190,39 @@ Each record is one JSON-SEQ line:
   field names/values, are JSON-string escaped by the serializers before
   writing into the caller-owned buffer.
 
+### Gateway file destinations
+
+The gateway HTTP/3 listener owns the production file destinations. Both are
+off by default:
+
+```sh
+TARDIGRADE_HTTP3_QLOG_DIR=/tmp/tardigrade-qlog
+TARDIGRADE_HTTP3_KEYLOG_PATH=/tmp/tardigrade-qlog/http3.keys
+```
+
+- `TARDIGRADE_HTTP3_QLOG_DIR` creates the directory at startup and writes one
+  JSON-SEQ trace per accepted QUIC connection. Filenames are deterministic and
+  collision-safe: `quic-0000000000000001.sqlog`, then a numeric suffix if that
+  name already exists.
+- `TARDIGRADE_HTTP3_KEYLOG_PATH` opens one append-only NSS keylog file with
+  restrictive `0600` permissions; existing files are tightened to `0600` before
+  any secret is written. Multiple connections share this file.
+- Runtime callbacks serialize records into fixed buffers and enqueue them into
+  a bounded in-process queue. A dedicated writer thread owns file creation,
+  append writes, and per-connection trace close. Queue-full / enqueue-failure
+  cases drop the debug record and increment diagnostics rather than blocking
+  the QUIC/H3 event-loop thread or TLS handshake path.
+- Enabling key logging emits a startup warning because the file contains TLS
+  traffic secrets. Never put this path under normal logs, Prometheus, qlog,
+  crash-report directories, public CI artifacts, or shared object storage.
+- Changing either destination on hot reload is rejected; restart the HTTP/3
+  listener so the socket, open files, and trace map agree.
+
+Use `.sqlog` files with qvis. Use the `.keys` file with Wireshark only together
+with packet captures from traffic you own and are authorized to decrypt. Delete
+both artifacts after the debugging session unless your incident-retention
+policy explicitly says otherwise.
+
 ### Sink error handling
 
 `Sink.emit` returns `void` so transport/H3 emission stays infallible on the hot
@@ -197,9 +231,9 @@ path — a dropped debug record must never fail a connection, mirroring
 serialization / disk-full / permission errors back through `emit`. The
 **contract for concrete sinks** is therefore to *retain the first write error
 and/or count dropped records* and expose that out-of-band, so a truncated trace
-is detectable rather than silently lost during interop. This is a requirement on
-the composition-root sink implementation, documented here before that wiring
-lands.
+is detectable rather than silently lost during interop. The gateway artifact
+writer keeps qlog/keylog write-error and dropped-record counters out of
+protocol state and logs final nonzero counts at teardown.
 
 ## Keylog
 
@@ -256,10 +290,9 @@ keylog_enabled: bool = false, // emit TLS secrets for local decryption
 ```
 
 Both default off and are intended to be reachable only through explicit
-debug/interop configuration, never a production default. The concrete
-destinations (qlog directory, keylog path) are supplied by the composition root
-that owns the writers, not by the transport config, keeping file I/O out of the
-transport core.
+debug/interop configuration, never a production default. The gateway maps
+non-empty `TARDIGRADE_HTTP3_QLOG_DIR` / `TARDIGRADE_HTTP3_KEYLOG_PATH` into
+those opt-in sinks. File I/O stays out of the transport core.
 
 ## Metrics (Prometheus)
 
@@ -297,9 +330,8 @@ and absent."
   adapters, and TLS keylog line/emission behavior, in `src/quic/qlog.zig`,
   `src/http3/qlog.zig`, `src/http/http3_runtime.zig`, and
   `src/tls/keylog.zig` / `src/tls/transport.zig`.
-- **Integration** (follow-up, with file destinations): drive a handshake and
-  assert a produced `.sqlog` contains the expected event classes; snapshot
-  metrics on common error paths.
+- **Integration**: drive a handshake and assert a produced `.sqlog` contains
+  the expected event classes; snapshot metrics on common error paths.
 - **Manual**: load a saved `.sqlog` in qvis and a capture + `.keys` in Wireshark
   once enough transport exists to produce real flows.
 

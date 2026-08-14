@@ -370,6 +370,8 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     defer if (native_early_data_replay_store) |*store| store.deinit();
     var native_early_data_replay_gate_adapter: tls_core.early_data_replay.GateAdapter = undefined;
     var native_early_data_replay_gate: ?tls_core.tls13_backend.EarlyDataReplayGate = null;
+    var http3_observability_artifacts: ?http.http3_runtime.ObservabilityArtifacts = null;
+    defer if (http3_observability_artifacts) |*artifacts| artifacts.deinit();
     var http3_dispatch_ctx = ghandlers.Http3DispatchContext{
         .config_store = &config_store,
         .cfg = cfg,
@@ -500,6 +502,23 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
         if (!edge_config.hasTlsFiles(cfg)) {
             state.logger.warn(null, "HTTP/3 requested without TLS cert/key; QUIC bootstrap will remain incomplete", .{});
         }
+        if (cfg.http3_qlog_dir.len > 0 or cfg.http3_keylog_path.len > 0) {
+            http3_observability_artifacts = http.http3_runtime.ObservabilityArtifacts.initWithLogger(
+                state_allocator,
+                &state.logger,
+                cfg.http3_qlog_dir,
+                cfg.http3_keylog_path,
+            ) catch |err| {
+                state.logger.warn(null, "HTTP/3 observability artifact setup failed: {s}", .{@errorName(err)});
+                return err;
+            };
+            if (cfg.http3_qlog_dir.len > 0) {
+                state.logger.warn(null, "HTTP/3 qlog enabled for local/debug tracing: dir={s}", .{cfg.http3_qlog_dir});
+            }
+            if (cfg.http3_keylog_path.len > 0) {
+                state.logger.warn(null, "HTTP/3 TLS key logging enabled: {s} contains traffic secrets and permits packet decryption", .{cfg.http3_keylog_path});
+            }
+        }
         http3_runtime = http.http3_runtime.Runtime.init(state_allocator, &state.logger, .{
             .listen_host = cfg.listen_host,
             .quic_port = cfg.quic_port,
@@ -533,6 +552,11 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .quic_handshake_failure_metrics_cb = recordQuicHandshakeFailureFromRuntime,
             .h3_request_latency_metrics_ctx = &state,
             .h3_request_latency_metrics_cb = recordH3RequestLatencyFromRuntime,
+            .qlog_artifacts_ctx = if (http3_observability_artifacts) |*artifacts| artifacts else null,
+            .quic_qlog_artifact_cb = if (http3_observability_artifacts) |*artifacts| if (artifacts.qlogEnabled()) http.http3_runtime.ObservabilityArtifacts.writeQuicRecord else null else null,
+            .h3_qlog_artifact_cb = if (http3_observability_artifacts) |*artifacts| if (artifacts.qlogEnabled()) http.http3_runtime.ObservabilityArtifacts.writeH3Record else null else null,
+            .qlog_artifact_close_cb = if (http3_observability_artifacts) |*artifacts| if (artifacts.qlogEnabled()) http.http3_runtime.ObservabilityArtifacts.closeTrace else null else null,
+            .tls_keylog_context = if (http3_observability_artifacts) |*artifacts| artifacts.keylogContext() else .{},
         }) catch |err| blk: {
             state.logger.warn(null, "HTTP/3 listener failed to initialize: {s}", .{@errorName(err)});
             break :blk null;

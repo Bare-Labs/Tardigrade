@@ -143,7 +143,7 @@ pub fn hotReloadConfig(
             state.last_reload_error_len = msg.len;
             state.reload_mutex.unlock();
             state.metricsRecordReloadFailure();
-            state.logger.warn(null, "config reload rejected: HTTP/3 listener-owned configuration changed; restart the process to change http3_enabled, quic_port, migration, Retry, 0-RTT, or datagram sizing", .{});
+            state.logger.warn(null, "config reload rejected: HTTP/3 listener-owned configuration changed; restart the process to change http3_enabled, quic_port, migration, Retry, 0-RTT, datagram sizing, ECN, or observability artifact destinations", .{});
             return;
         }
     }
@@ -354,7 +354,9 @@ pub fn http3ListenerConfigChanged(
         // #256-E: same reasoning — the ECN receive option is set on the live
         // fd at bind time, and the transport's marking decision is fixed per
         // connection at creation.
-        current.http3_ecn_enabled != proposed.http3_ecn_enabled;
+        current.http3_ecn_enabled != proposed.http3_ecn_enabled or
+        !std.mem.eql(u8, current.http3_qlog_dir, proposed.http3_qlog_dir) or
+        !std.mem.eql(u8, current.http3_keylog_path, proposed.http3_keylog_path);
 }
 
 pub fn listenerShardConfigChanged(
