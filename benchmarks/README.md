@@ -166,6 +166,17 @@ detects this at runtime by checking whether `h2load --h3` is recognized; if not,
 prints a skip message and continues. HTTP/3 also requires TLS because QUIC mandates it —
 always pass `--tls` (and `--insecure` for self-signed certs) for HTTP/3 runs.
 
+When an H3 scenario completes, the runner also scrapes `--metrics-path` (default
+`/status/metrics`, requires Tardigrade metrics enabled) and attaches a `quic` sub-object to
+that scenario's result — packet/loss/PTO counts, effective PLPMTU, ECN state, and
+requested-vs-effective UDP socket buffer sizes (#256-G). It's omitted entirely (not
+null-filled) when the endpoint isn't reachable or exposes no QUIC series, and isn't attached
+at all under `--runs > 1` since averaging point-in-time cumulative counters across repeated
+runs wouldn't mean what it looks like it means. See
+[competitive/README.md](competitive/README.md#http3quic-benchmarking-256-g) for the canonical
+small/large/proxy H3 rows, the before/after UDP-buffer tuning comparison, controlled
+loss/reordering, and high-bandwidth/dedicated-host runs built on top of this.
+
 ### k6-only behavioral scenarios
 
 These verify correctness under load, not just raw throughput. They require `--tool k6`.

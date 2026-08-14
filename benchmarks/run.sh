@@ -42,6 +42,7 @@
 #   --sample-interval-ms N  CPU/RSS sample interval in milliseconds (default: 500)
 #   --runs N            Repeat each scenario N times; output mean ± stddev (default: 1)
 #   --idle-check        Abort if load average exceeds 0.7× CPU count before starting
+#   --metrics-path PATH Prometheus metrics path scraped for QUIC transport state on H3 scenarios (default: /status/metrics)
 #   --help              Show this message and exit
 #
 # Scenarios:
@@ -111,6 +112,11 @@ REGRESSION_THRESHOLD=10  # percent
 SAMPLE_INTERVAL_MS=500
 RUNS=1            # repeat each scenario N times; mean/stddev reported when N>1
 IDLE_CHECK=false  # gate on machine load average before starting
+# #256-G: Prometheus path scraped right after an H3 scenario finishes to
+# attach a `quic` transport-state block (packet/loss/PTO counts, effective
+# PLPMTU, ECN state, requested-vs-effective UDP buffers) to that result.
+# Best-effort only — never fabricated when the endpoint is unreachable.
+QUIC_METRICS_PATH="/status/metrics"
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -151,7 +157,8 @@ while [[ $# -gt 0 ]]; do
         --sample-interval-ms) SAMPLE_INTERVAL_MS="$2"; shift 2 ;;
         --runs)       RUNS="$2";               shift 2 ;;
         --idle-check) IDLE_CHECK=true;         shift ;;
-        --help)       sed -n '/^# Usage/,/^[^#]/p' "$0" | head -n -1; exit 0 ;;
+        --metrics-path) QUIC_METRICS_PATH="$2"; shift 2 ;;
+        --help)       sed -n '/^# Usage/,/^[^#]/p' "$0" | sed '$d'; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -768,6 +775,147 @@ run_h2load() {
     add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "$tput_mbps" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
 }
 
+# ── QUIC transport-state capture (#256-G) ─────────────────────────────────────
+# Best-effort scrape of the Prometheus metrics endpoint right after an H3
+# scenario finishes, so its JSON result can explain *why* the numbers came
+# out the way they did: packet/loss/PTO counts, the PLPMTU actually in
+# effect, ECN state, and requested-vs-effective UDP socket buffer sizes.
+# Requested and effective/granted are always read from separate metric
+# series (never inferred from one another) — see docs/HTTP3_ROLLOUT.md.
+# Returns the string "null" (not an error) when the endpoint is unreachable
+# or HTTP/3 metrics are absent — a benchmark result should say "this could
+# not be observed" rather than fabricate it.
+quic_metric() {
+    local body="$1" name="$2"
+    printf '%s\n' "$body" | awk -v m="$name" '$1 == m { print $2; exit }'
+}
+
+quic_metric_labeled() {
+    local body="$1" pattern="$2"
+    printf '%s\n' "$body" | awk -v m="$pattern" '$0 ~ ("^" m) { print $2; exit }'
+}
+
+quic_buffer_status_label() {
+    local body="$1" direction="$2"
+    printf '%s\n' "$body" \
+        | grep -oE "tardigrade_quic_udp_buffer_status\\{direction=\"${direction}\",status=\"[a-z]+\"\\}" \
+        | grep -oE 'status="[a-z]+"' | sed -E 's/status="([a-z]+)"/\1/' | head -1
+}
+
+capture_quic_transport_state() {
+    local url="${SCHEME}://${TARGET_HOST}:${TARGET_PORT}${QUIC_METRICS_PATH}"
+    local extra=()
+    $INSECURE && extra+=(--insecure)
+    local body
+    if ! body=$(curl -fsS "${extra[@]+"${extra[@]}"}" "$url" 2>/dev/null); then
+        echo "null"
+        return 0
+    fi
+
+    local packets_sent
+    packets_sent=$(quic_metric "$body" tardigrade_quic_packets_sent_total)
+    if [[ -z "$packets_sent" ]]; then
+        # Endpoint answered but exposes no QUIC series at all (HTTP/3 metrics
+        # disabled, or this isn't a Tardigrade /status/metrics endpoint).
+        echo "null"
+        return 0
+    fi
+
+    local packets_received packets_lost pto bytes_sent bytes_received
+    packets_received=$(quic_metric "$body" tardigrade_quic_packets_received_total)
+    packets_lost=$(quic_metric "$body" tardigrade_quic_packets_lost_total)
+    pto=$(quic_metric "$body" tardigrade_quic_pto_total)
+    bytes_sent=$(quic_metric "$body" tardigrade_quic_bytes_sent_total)
+    bytes_received=$(quic_metric "$body" tardigrade_quic_bytes_received_total)
+
+    local pmtu_probes pmtu_black_holes plpmtu_last plpmtu_min plpmtu_max
+    pmtu_probes=$(quic_metric "$body" tardigrade_quic_pmtu_probes_total)
+    pmtu_black_holes=$(quic_metric "$body" tardigrade_quic_pmtu_black_holes_total)
+    plpmtu_last=$(quic_metric "$body" tardigrade_quic_effective_plpmtu_bytes_last)
+    plpmtu_min=$(quic_metric "$body" tardigrade_quic_effective_plpmtu_bytes_min)
+    plpmtu_max=$(quic_metric "$body" tardigrade_quic_effective_plpmtu_bytes_max)
+
+    local ecn_enabled ecn_marked ecn_validated ecn_disabled ecn_ce
+    ecn_enabled=$(quic_metric "$body" tardigrade_quic_ecn_enabled)
+    ecn_marked=$(quic_metric "$body" tardigrade_quic_ecn_marked_sent_total)
+    ecn_validated=$(quic_metric "$body" tardigrade_quic_ecn_paths_validated_total)
+    ecn_disabled=$(quic_metric "$body" tardigrade_quic_ecn_paths_disabled_total)
+    ecn_ce=$(quic_metric "$body" tardigrade_quic_ecn_ce_received_total)
+
+    local recv_req recv_eff recv_grant recv_status send_req send_eff send_grant send_status
+    recv_req=$(quic_metric_labeled "$body" 'tardigrade_quic_udp_buffer_requested_bytes\{direction="recv"\}')
+    recv_eff=$(quic_metric_labeled "$body" 'tardigrade_quic_udp_buffer_effective_bytes\{direction="recv"\}')
+    recv_grant=$(quic_metric_labeled "$body" 'tardigrade_quic_udp_buffer_granted_bytes\{direction="recv"\}')
+    recv_status=$(quic_buffer_status_label "$body" recv)
+    send_req=$(quic_metric_labeled "$body" 'tardigrade_quic_udp_buffer_requested_bytes\{direction="send"\}')
+    send_eff=$(quic_metric_labeled "$body" 'tardigrade_quic_udp_buffer_effective_bytes\{direction="send"\}')
+    send_grant=$(quic_metric_labeled "$body" 'tardigrade_quic_udp_buffer_granted_bytes\{direction="send"\}')
+    send_status=$(quic_buffer_status_label "$body" send)
+
+    jq -n \
+        --argjson packets_sent "${packets_sent:-0}" \
+        --argjson packets_received "${packets_received:-0}" \
+        --argjson packets_lost "${packets_lost:-0}" \
+        --argjson pto_total "${pto:-0}" \
+        --argjson bytes_sent "${bytes_sent:-0}" \
+        --argjson bytes_received "${bytes_received:-0}" \
+        --argjson pmtu_probes "${pmtu_probes:-0}" \
+        --argjson pmtu_black_holes "${pmtu_black_holes:-0}" \
+        --argjson plpmtu_last "${plpmtu_last:-0}" \
+        --argjson plpmtu_min "${plpmtu_min:-0}" \
+        --argjson plpmtu_max "${plpmtu_max:-0}" \
+        --argjson ecn_enabled "$([[ "${ecn_enabled:-0}" == "1" ]] && echo true || echo false)" \
+        --argjson ecn_marked_sent "${ecn_marked:-0}" \
+        --argjson ecn_paths_validated "${ecn_validated:-0}" \
+        --argjson ecn_paths_disabled "${ecn_disabled:-0}" \
+        --argjson ecn_ce_received "${ecn_ce:-0}" \
+        --argjson recv_requested "${recv_req:-0}" \
+        --argjson recv_effective "${recv_eff:-0}" \
+        --argjson recv_granted "${recv_grant:-0}" \
+        --arg recv_status "${recv_status:-default}" \
+        --argjson send_requested "${send_req:-0}" \
+        --argjson send_effective "${send_eff:-0}" \
+        --argjson send_granted "${send_grant:-0}" \
+        --arg send_status "${send_status:-default}" \
+        '{
+            packets_sent: $packets_sent,
+            packets_received: $packets_received,
+            packets_lost: $packets_lost,
+            pto_total: $pto_total,
+            bytes_sent: $bytes_sent,
+            bytes_received: $bytes_received,
+            effective_plpmtu: {last_bytes: $plpmtu_last, min_bytes: $plpmtu_min, max_bytes: $plpmtu_max},
+            pmtu_probes: $pmtu_probes,
+            pmtu_black_holes: $pmtu_black_holes,
+            ecn: {
+                enabled: $ecn_enabled,
+                marked_sent: $ecn_marked_sent,
+                paths_validated: $ecn_paths_validated,
+                paths_disabled: $ecn_paths_disabled,
+                ce_received: $ecn_ce_received
+            },
+            udp_buffers: {
+                recv: {requested_bytes: $recv_requested, effective_bytes: $recv_effective, granted_bytes: $recv_granted, status: $recv_status},
+                send: {requested_bytes: $send_requested, effective_bytes: $send_effective, granted_bytes: $send_granted, status: $send_status}
+            }
+        }'
+}
+
+# Attaches the quic transport-state block captured above to a scenario's
+# result. Only meaningful for single-run scenarios: with --runs > 1 the
+# per-scenario entry doesn't exist yet at this point (flush_multirun_result
+# builds it at the end from accumulated samples), and averaging point-in-time
+# cumulative counters across repeated runs would not mean what it looks like
+# it means — so multi-run H3 scenarios intentionally have no `quic` block.
+attach_quic_transport_state() {
+    local label="$1"
+    [[ "$RUNS" -eq 1 ]] || return 0
+    local quic_json
+    quic_json=$(capture_quic_transport_state)
+    [[ "$quic_json" == "null" ]] && return 0
+    RESULTS_JSON=$(jq --arg s "$label" --argjson quic "$quic_json" '.[$s].quic = $quic' <<<"$RESULTS_JSON")
+}
+
 # ── h2load HTTP/3 runner ──────────────────────────────────────────────────────
 # Requires h2load built with QUIC/nghttp3+ngtcp2 support.
 # If --h3 is unknown to this h2load build, the scenario is silently skipped.
@@ -812,6 +960,7 @@ run_h2load_h3() {
     [[ "$CURRENT_RSS_MB_PEAK" != "null" ]] && rss_display="  rss_peak=${CURRENT_RSS_MB_PEAK}MiB"
     echo "  $label — ${rps} req/s  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms  p999=${p999}ms  errors=${errors}${tput_display}${cpu_display}${rss_display}"
     add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "$tput_mbps" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
+    attach_quic_transport_state "$label"
 }
 
 # ── fortio runner ─────────────────────────────────────────────────────────────
@@ -1238,6 +1387,16 @@ ARCH_NAME=$(detect_arch)
 CPU_MODEL=$(detect_cpu_model)
 CPU_THREADS=$(detect_cpu_threads)
 MEMORY_MB=$(detect_memory_mb)
+# #256-G: high-bandwidth/dedicated-host evidence needs to say whether the
+# installed h2load can even drive HTTP/3 — a run with h2load lacking --h3
+# silently produces zero H3 rows, and that has to be distinguishable from
+# "we tried and it was slow."
+H2LOAD_VERSION="unknown"
+H2LOAD_H3_SUPPORTED=false
+if command -v h2load &>/dev/null; then
+    H2LOAD_VERSION=$({ h2load --version 2>&1 || true; } | head -1)
+    h2load --h3 --help &>/dev/null 2>&1 && H2LOAD_H3_SUPPORTED=true
+fi
 RESULTS_JSON=$(jq \
     --arg tag "$GIT_TAG" --arg ts "$TIMESTAMP" \
     --arg host "$TARGET_HOST" --arg port "$TARGET_PORT" \
@@ -1258,10 +1417,13 @@ RESULTS_JSON=$(jq \
     --arg cpu_model "$CPU_MODEL" \
     --arg cpu_threads "$CPU_THREADS" \
     --arg memory_mb "$MEMORY_MB" \
+    --arg h2load_version "$H2LOAD_VERSION" \
+    --argjson h2load_h3_supported "$($H2LOAD_H3_SUPPORTED && echo true || echo false)" \
+    --argjson threads "$THREADS" \
     --argjson dur "$DURATION" --argjson conn "$CONNECTIONS" --argjson sample_interval_ms "$SAMPLE_INTERVAL_MS" \
     --argjson runs "$RUNS" \
     '. + {_meta: {tag: $tag, timestamp: $ts, host: $host, port: $port,
-          tool: $tool, duration_s: $dur, connections: $conn, runs: $runs,
+          tool: $tool, duration_s: $dur, connections: $conn, threads: $threads, runs: $runs,
           host_header: $host_header, driver: $driver,
           worker_count: (if $worker_count == "" then null else ($worker_count | tonumber) end),
           config_label: (if $config_label == "" then null else $config_label end),
@@ -1272,6 +1434,8 @@ RESULTS_JSON=$(jq \
             sample_interval_ms: $sample_interval_ms
           },
           zig_version: $zig_version,
+          h2load_version: $h2load_version,
+          h2load_h3_supported: $h2load_h3_supported,
           environment: {
             os: $os_name,
             kernel: $kernel_release,

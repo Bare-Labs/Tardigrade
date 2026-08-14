@@ -282,6 +282,21 @@ fn deinitMuxMetricsSnapshot(allocator: std.mem.Allocator, device_counts: []MuxDe
     allocator.free(device_counts);
 }
 
+/// #256-G: `quic.udp.BufferTuningStatus` -> `http.metrics.QuicUdpBufferStatus`.
+/// Takes `anytype` so this file does not need its own `@import("quic")` just
+/// for one enum's tag names; the two enums are kept in lockstep by the
+/// exhaustive switch below (a new `BufferTuningStatus` variant fails to
+/// compile here until it is handled).
+fn quicUdpBufferStatusFrom(status: anytype) http.metrics.QuicUdpBufferStatus {
+    return switch (status) {
+        .default => .default,
+        .applied => .applied,
+        .clamped => .clamped,
+        .unverified => .unverified,
+        .unsupported => .unsupported,
+    };
+}
+
 fn deinitMuxPendingFrames(allocator: std.mem.Allocator, pending: *std.array_list.Managed(MuxPendingFrame)) void {
     for (pending.items) |frame| allocator.free(frame.payload);
     pending.deinit();
@@ -1690,6 +1705,41 @@ pub const GatewayState = struct {
         self.metrics.recordWorkerQueueWaitNs(wait_ns);
     }
 
+    /// #256-G: copy the live H3 runtime's transport-state snapshot (packet
+    /// counts, DPLPMTUD probe/black-hole counts + effective PLPMTU, ECN
+    /// state/counters, requested-vs-effective UDP socket buffer sizes) into
+    /// a metrics snapshot just before rendering — the runtime owns these
+    /// counters, not `Metrics`, the same reason `overlayUpstreamPoolStats`
+    /// exists below. A no-op when HTTP/3 is not enabled (`http3_runtime` is
+    /// null), leaving every field at its zero default.
+    fn overlayQuicTransportSnapshot(self: *GatewayState, snapshot: *http.metrics.Metrics) void {
+        const rt = self.http3_runtime orelse return;
+        const rs = rt.snapshot();
+
+        snapshot.quic_packets_sent_total = @intCast(rs.packets_sent);
+        snapshot.quic_packets_received_total = @intCast(rs.packets_received);
+        snapshot.quic_pmtu_probes_sent_total = @intCast(rs.pmtu_probes_sent);
+        snapshot.quic_pmtu_black_holes_total = @intCast(rs.pmtu_black_holes);
+        snapshot.quic_effective_plpmtu_bytes_last = @intCast(rs.plpmtu_last_bytes);
+        snapshot.quic_effective_plpmtu_bytes_min = @intCast(rs.plpmtu_min_bytes);
+        snapshot.quic_effective_plpmtu_bytes_max = @intCast(rs.plpmtu_max_bytes);
+
+        snapshot.quic_ecn_enabled = if (rs.ecn_enabled) 1 else 0;
+        snapshot.quic_ecn_marked_sent_total = @intCast(rs.ecn_marked_sent);
+        snapshot.quic_ecn_paths_validated_total = @intCast(rs.ecn_paths_validated);
+        snapshot.quic_ecn_paths_disabled_total = @intCast(rs.ecn_paths_disabled);
+        snapshot.quic_ecn_ce_received_total = @intCast(rs.ecn_ce_received);
+
+        snapshot.quic_udp_recv_buffer_requested_bytes = @intCast(rs.udp_buffers.recv.requested_bytes orelse 0);
+        snapshot.quic_udp_recv_buffer_effective_bytes = @intCast(rs.udp_buffers.recv.effective_bytes orelse 0);
+        snapshot.quic_udp_recv_buffer_granted_bytes = @intCast(rs.udp_buffers.recv.granted_bytes orelse 0);
+        snapshot.quic_udp_recv_buffer_status = quicUdpBufferStatusFrom(rs.udp_buffers.recv.status);
+        snapshot.quic_udp_send_buffer_requested_bytes = @intCast(rs.udp_buffers.send.requested_bytes orelse 0);
+        snapshot.quic_udp_send_buffer_effective_bytes = @intCast(rs.udp_buffers.send.effective_bytes orelse 0);
+        snapshot.quic_udp_send_buffer_granted_bytes = @intCast(rs.udp_buffers.send.granted_bytes orelse 0);
+        snapshot.quic_udp_send_buffer_status = quicUdpBufferStatusFrom(rs.udp_buffers.send.status);
+    }
+
     /// Copy the live upstream keep-alive pool counters into a metrics snapshot
     /// just before rendering (the pool owns these counters, not `Metrics`).
     fn overlayUpstreamPoolStats(self: *GatewayState, snapshot: *http.metrics.Metrics) void {
@@ -1938,6 +1988,7 @@ pub const GatewayState = struct {
         var metrics_snapshot = self.metrics;
         self.metrics_mutex.unlock();
         self.overlayUpstreamPoolStats(&metrics_snapshot);
+        self.overlayQuicTransportSnapshot(&metrics_snapshot);
 
         const base = try metrics_snapshot.toPrometheus(allocator);
         defer allocator.free(base);
@@ -3750,6 +3801,9 @@ fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) voi
     gs.upstream_pool = http.upstream_pool.UpstreamPool.init(allocator, .{});
     gs.h2_pool = http.upstream_h2.H2ConnPool.init(allocator, .{});
     gs.http3_advertisement_state = .disabled;
+    // metricsToPrometheus overlays the H3 runtime's transport snapshot
+    // (#256-G) when one is attached; this fixture has none.
+    gs.http3_runtime = null;
     gs.proxy_buffer_limits = http.proxy_buffer_account.Limits.defaults();
     // The state starts as `undefined`, so every field the metrics path reads
     // has to be set here — the aggregate account is rendered as a gauge, and
@@ -3815,6 +3869,52 @@ test "served Prometheus metrics expose h2 streaming upload fallback counter" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_buffer_config_limit_bytes{direction=\"upstream_to_downstream\",scope=\"stream\",limit=\"high\"} 786432\n") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_tls_buffer_config_limit_bytes{queue=\"outbound_ciphertext\",limit=\"hard\"}") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http3_effective_state{state=\"disabled\"} 1\n") != null);
+}
+
+test "#256-G: served Prometheus metrics overlay the attached H3 runtime's transport snapshot" {
+    var gs: GatewayState = undefined;
+    initMetricsJsonTestState(&gs, std.testing.allocator);
+    defer gs.h2_pool.deinit();
+    defer gs.upstream_pool.deinit();
+    defer gs.mux_subscriptions_by_device.deinit();
+
+    // `snapshot()` only ever touches `snapshot_mutex`/`snapshot_state`, so a
+    // Runtime with just those two fields populated is a safe, minimal
+    // fixture — the rest legitimately stays `undefined` for this test.
+    var rt: http.http3_runtime.Runtime = undefined;
+    rt.snapshot_mutex = .{};
+    rt.snapshot_state = .{
+        .packets_sent = 42,
+        .packets_received = 41,
+        .pmtu_probes_sent = 3,
+        .pmtu_black_holes = 1,
+        .plpmtu_last_bytes = 1452,
+        .plpmtu_min_bytes = 1200,
+        .plpmtu_max_bytes = 1452,
+        .ecn_enabled = true,
+        .ecn_marked_sent = 10,
+        .ecn_paths_validated = 2,
+        .ecn_paths_disabled = 1,
+        .ecn_ce_received = 5,
+        .udp_buffers = .{
+            .recv = .{ .requested_bytes = 4_194_304, .effective_bytes = 2_097_152, .granted_bytes = 1_048_576, .status = .clamped },
+            .send = .{ .requested_bytes = 4_194_304, .effective_bytes = 4_194_304, .granted_bytes = 4_194_304, .status = .applied },
+        },
+    };
+    gs.http3_runtime = &rt;
+
+    const prom = try gs.metricsToPrometheus(std.testing.allocator);
+    defer std.testing.allocator.free(prom);
+
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_packets_sent_total 42") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_pmtu_probes_total 3") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_effective_plpmtu_bytes_min 1200") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_enabled 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_paths_disabled_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_requested_bytes{direction=\"recv\"} 4194304") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_effective_bytes{direction=\"recv\"} 2097152") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_status{direction=\"recv\",status=\"clamped\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_status{direction=\"send\",status=\"applied\"} 1") != null);
 }
 
 test "served Prometheus metrics expose the aggregate bytes the global limit is enforced against" {

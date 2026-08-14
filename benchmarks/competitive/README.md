@@ -102,7 +102,9 @@ first-byte timing evidence.
 
 Representative config templates live under `configs/`:
 
-- `tardigrade.conf.in`
+- `tardigrade.conf.in` — plaintext HTTP/1.1, used for the cross-server comparison.
+- `tardigrade-http3.conf.in` — TLS + HTTP/3 enabled, used only for the
+  Tardigrade-only H3 matrix (see [HTTP/3/QUIC Benchmarking](#http3quic-benchmarking-256-g)).
 - `nginx.conf.in`
 - `haproxy.cfg.in`
 - `Caddyfile.in`
@@ -152,3 +154,162 @@ belongs next to the numbers it explains — and a request the kernel clamped
 makes two runs incomparable even with identical configuration. The size the
 listener actually got is read back with `getsockopt` and logged by the runtime
 at startup; only the process can see it. See `docs/HTTP3_ROLLOUT.md`.
+
+## HTTP/3/QUIC Benchmarking (#256-G)
+
+This extends the same framework above with H3/QUIC-specific rows — it is not
+a second benchmark runner. Everything in [Quick Start](#quick-start),
+[Prerequisites](#prerequisites), and [Interpreting Results](#interpreting-results)
+still applies; this section only covers what's different for HTTP/3.
+
+Transport-level guidance (datagram sizing, DPLPMTUD, black-hole fallback,
+socket buffer tuning, ECN, pacing, and future batching/GSO/GRO plans) lives in
+[docs/HTTP3_ROLLOUT.md](../../docs/HTTP3_ROLLOUT.md) — it is not repeated here.
+
+### Requirements
+
+- An **H3-capable `h2load`** build: nghttp2 built with QUIC support against
+  ngtcp2 + nghttp3. The stock `apt`/`brew` `nghttp2` package usually is not
+  this build. Verify with:
+
+  ```bash
+  h2load --h3 --help >/dev/null && echo "h2load supports HTTP/3" || echo "h2load does NOT support HTTP/3"
+  ```
+
+  Without it, every H3 row is recorded as `"supported": false` with a
+  `"reason"` explaining why — never silently skipped, never a fabricated
+  number.
+- `openssl`, to generate a **benchmark-only local TLS identity** fresh for
+  each run via `scripts/interop/gen-certs.sh` (never a checked-in or
+  developer-machine certificate path).
+
+### What the H3 matrix does
+
+`benchmarks/competitive/run.sh` starts a **second**, dedicated Tardigrade
+listener — TLS + HTTP/3 enabled, a deterministic QUIC port
+(`LISTEN_BASE + 250` by default), a static route, a reverse-proxy route, and
+`/status/metrics` enabled — alongside whatever plaintext HTTP/1.1 comparison
+is already running. Starting the process is not treated as proof HTTP/3
+works: after the TLS/TCP side answers `/health`, the runner sends one real
+HTTP/3 request through `h2load --h3` and only records H3 results if that
+succeeds. On failure (missing H3-capable `h2load`, or a QUIC listener that
+didn't come up cleanly), every H3 row for that run is written as
+`"supported": false` with the reason, and the listener's `server.log`/
+`error.log` are dumped for diagnosis.
+
+This runs for the `tardigrade` server whenever it's selected — including
+under `--smoke`, where it's bounded to a single short `static-small-http3`
+pass (config renders, Tardigrade launches with TLS+H3, one real H3 request
+succeeds) with the large/proxy/tuned rows skipped.
+
+### Canonical H3 rows
+
+| Scenario | Purpose |
+| --- | --- |
+| `static-small-http3` | Small static object (`/tiny.txt`, 3 bytes) — request/response overhead. |
+| `static-large-http3` | Large static object (`/large.bin`, 1 MiB). |
+| `proxy-large-http3` | 1 MiB reverse-proxied response, client-facing HTTP/3, streamed through the existing proxy path to the local origin fixture (not fully buffered). |
+| `static-small-http3-tuned` | Same as `static-small-http3`, but the listener was started with explicit larger `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES`/`_SEND_BUFFER_BYTES`. Only recorded with `--tune-comparison`. |
+
+Each supported H3 row carries a `quic` sub-object (scraped from
+`/status/metrics` right after the pass finishes):
+
+```json
+{
+  "rps": 1234,
+  "p99_ms": 3.4,
+  "quic": {
+    "packets_sent": 50000,
+    "packets_received": 49998,
+    "packets_lost": 2,
+    "pto_total": 0,
+    "bytes_sent": 62914560,
+    "bytes_received": 1500,
+    "effective_plpmtu": { "last_bytes": 1452, "min_bytes": 1200, "max_bytes": 1452 },
+    "pmtu_probes": 3,
+    "pmtu_black_holes": 0,
+    "ecn": { "enabled": true, "marked_sent": 50000, "paths_validated": 8, "paths_disabled": 0, "ce_received": 0 },
+    "udp_buffers": {
+      "recv": { "requested_bytes": 0, "effective_bytes": 212992, "granted_bytes": 0, "status": "default" },
+      "send": { "requested_bytes": 0, "effective_bytes": 212992, "granted_bytes": 0, "status": "default" }
+    }
+  }
+}
+```
+
+`requested_bytes`/`effective_bytes`/`granted_bytes` are never inferred from
+each other — `effective_bytes` is the raw `getsockopt` readback,
+`granted_bytes` restates it in requested units (see
+[docs/HTTP3_ROLLOUT.md#socket-buffers](../../docs/HTTP3_ROLLOUT.md#socket-buffers)
+for why Linux needs that distinction), and `status` says whether the request
+was granted, clamped, refused, or nothing was requested at all. `0` in a
+`_bytes` field means "not requested" or "not read back," never a real socket
+buffer size. The combined `competitive-results.csv`/`.md` also carry a subset
+of these fields as columns/a dedicated "H3/QUIC Transport State" table.
+
+### Before/after transport-tuning comparison
+
+```bash
+./benchmarks/competitive/run.sh --servers tardigrade --tune-comparison
+```
+
+Adds `static-small-http3-tuned`, restarting the H3 listener with explicit
+4 MiB `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES`/`_SEND_BUFFER_BYTES` requests.
+Compare its `quic.udp_buffers.*.status` against the baseline
+`static-small-http3` row to see whether the larger request was actually
+granted (`applied`) or clamped by a host ceiling — and compare `rps`/
+`p99_ms`/`cpu_ms_per_request`/`quic.packets_lost`/`quic.pto_total` to see
+whether it mattered. "No meaningful improvement" is a valid, expected result
+on an idle loopback host with a small BDP; the comparison exists to show
+that, not to manufacture a win.
+
+### Controlled loss and reordering
+
+Linux-only, manual, and never run in default or scheduled CI —
+`benchmarks/competitive/netem-impair.sh` wraps a command with a `tc netem`
+qdisc, requires root/`CAP_NET_ADMIN` (reports the scenario as **not
+executed**, not a fabricated result, if that's missing), records the exact
+`tc` command used, and always removes the qdisc on exit — including on
+failure or Ctrl-C:
+
+```bash
+sudo benchmarks/competitive/netem-impair.sh \
+  --loss 1 --reorder 25 --delay 20 --interface lo \
+  --evidence-file benchmarks/competitive/results/netem-loss-reorder.json \
+  -- benchmarks/competitive/run.sh --servers tardigrade
+```
+
+`--reorder` requires `--delay` (netem defines reordering relative to a
+delayed stream). The evidence file records `loss_percent`, `reorder_percent`,
+`delay_ms`, `interface`, and the exact `tc` command — cross-reference it with
+the benchmark JSON's `quic.packets_lost`/`pto_total` from the same run.
+
+### High-bandwidth / dedicated-host runs
+
+For stressing the H3 syscall/packet path at high throughput — belongs on a
+dedicated, idle host (a Beelink-class box or comparable), not shared CI
+hardware:
+
+```bash
+./benchmarks/competitive/run.sh --servers tardigrade \
+  --duration 60 --connections 200 --threads 8 --tune-comparison
+```
+
+`_meta.host` in the combined JSON records what the numbers are scoped to:
+CPU model/cores, OS/kernel, loopback interface, `tardigrade.build_flags`
+(release mode), and — per-scenario — `h2load.version`/`h2load.h3_supported`,
+concurrency/duration, host UDP sysctls, and every Tardigrade transport
+setting captured in `quic`. Do not publish a throughput claim from this
+without that metadata attached; it describes one host and one configuration,
+not Tardigrade in general.
+
+### CI execution model
+
+Default PR CI (`.github/workflows/ci.yml`'s `perf-smoke` job, driven by
+`benchmarks/ci-smoke.sh`) stays HTTP/1.1-only and does not invoke any of the
+above — it has no H3-capable `h2load` installed and is not the place for
+QUIC evidence. `benchmarks/competitive/run.sh --smoke` (see above) is a
+bounded, manually-triggered H3 sanity check, not a default CI gate. Full
+throughput, loss/reordering, high-bandwidth, and tuned-comparison runs are
+scheduled/manual only — see the GitHub Actions workflow for the manual H3
+matrix job.
