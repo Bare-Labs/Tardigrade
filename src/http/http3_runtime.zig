@@ -255,6 +255,8 @@ const ConnEntry = struct {
         qlog_sink: quic.qlog.Sink = .{},
         close_logged: bool = false,
         handshake_stage: metrics_mod.QuicHandshakeFailureStage = .initial,
+        handshake_succeeded: bool = false,
+        administrative_close: bool = false,
     };
 
     const H3Observer = struct {
@@ -611,6 +613,7 @@ pub const Runtime = struct {
                     if (draining and !entry.drain_goaway_sent) self.sendDrainGoaway(entry);
                     self.drainConnectionTransmits(entry, now);
                     if (drain_expired) {
+                        entry.quic_observer.administrative_close = true;
                         entry.conn.close(0x0100, "h3 drain deadline", now);
                     } else {
                         self.pumpH3(entry, now);
@@ -625,7 +628,7 @@ pub const Runtime = struct {
                     if (!self.ecn_send_enabled) entry.conn.disableEcnUnsupported();
                     // Reap closed connections and half-open connections that
                     // blew the handshake deadline (spoofed/stalled Initials).
-                    const stalled = !entry.conn.isEstablished() and now -| entry.accepted_at_us > handshake_timeout_us;
+                    const stalled = !entry.quic_observer.handshake_succeeded and now -| entry.accepted_at_us > handshake_timeout_us;
                     if (entry.conn.state() == .closed or stalled) {
                         if (reap_count < reap.len) {
                             reap[reap_count] = kv.key_ptr.*;
@@ -637,7 +640,12 @@ pub const Runtime = struct {
                 }
                 for (reap[0..reap_count]) |handle| {
                     const reason: RemovalReason = if (connections.get(handle)) |entry|
-                        if (!entry.conn.isEstablished() and now -| entry.accepted_at_us > handshake_timeout_us) .handshake_timeout else .protocol_failure
+                        if (entry.quic_observer.administrative_close)
+                            .administrative
+                        else if (!entry.quic_observer.handshake_succeeded and now -| entry.accepted_at_us > handshake_timeout_us)
+                            .handshake_timeout
+                        else
+                            .protocol_failure
                     else
                         .protocol_failure;
                     self.removeConnection(&connections, &routes, &per_ip, handle, reason);
@@ -1011,7 +1019,7 @@ pub const Runtime = struct {
     ) void {
         if (connections.fetchRemove(handle)) |kv| {
             self.foldPathMetrics(kv.value);
-            if (reason != .administrative and !kv.value.conn.isEstablished() and !kv.value.handshake_failure_recorded) {
+            if (reason != .administrative and !kv.value.quic_observer.handshake_succeeded and !kv.value.handshake_failure_recorded) {
                 kv.value.handshake_failure_recorded = true;
                 self.recordQuicHandshakeFailure(kv.value.quic_observer.handshake_stage);
             }
@@ -1148,6 +1156,7 @@ pub const Runtime = struct {
                     entry.conn.resetStream(incoming.stream_id, 0x010b) catch {}; // H3_REQUEST_REJECTED
                     entry.h3.finishRequest(incoming.stream_id);
                     self.noteDrainRequestRejections(1);
+                    self.noteRequestCompletedWithLatency(now, nowUs());
                     continue;
                 }
             }
@@ -1644,6 +1653,9 @@ pub const Runtime = struct {
         switch (event) {
             .packet_received => |packet| {
                 if (packet.space == .handshake) observer.handshake_stage = .handshake;
+            },
+            .handshake_complete, .handshake_confirmed => {
+                observer.handshake_succeeded = true;
             },
             .early_data_decision => |decision| {
                 const mapped: metrics_mod.QuicEarlyDataDecision = switch (decision) {
@@ -3108,6 +3120,8 @@ const RuntimeCidHarness = struct {
             .backend = server_backend,
             .conn = server,
             .h3 = H3.initWithSettings(allocator, .server, .{}),
+            .quic_observer = .{ .runtime = undefined, .connection_handle = 0 },
+            .h3_observer = .{ .runtime = undefined, .connection_handle = 0 },
             .admission_source_ip = 0x0100007f,
             .cid_len = odcid.len,
             .accepted_at_us = self.now_us,
@@ -3251,6 +3265,7 @@ test "http3 runtime metrics: handshake failures use removal reason and observed 
     var initial = try RuntimeCidHarness.init(allocator, fixed.provider());
     errdefer initial.deinit(allocator);
     initial.entry.conn.state_ = .handshaking;
+    initial.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 1 };
     var initial_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
     defer initial_connections.deinit();
     var initial_routes = quic.cid.CidRoutingTable.init(allocator);
@@ -3285,6 +3300,7 @@ test "http3 runtime metrics: handshake failures use removal reason and observed 
     var administrative = try RuntimeCidHarness.init(allocator, fixed.provider());
     errdefer administrative.deinit(allocator);
     administrative.entry.conn.state_ = .handshaking;
+    administrative.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 3 };
     var admin_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
     defer admin_connections.deinit();
     var admin_routes = quic.cid.CidRoutingTable.init(allocator);
@@ -3298,7 +3314,46 @@ test "http3 runtime metrics: handshake failures use removal reason and observed 
     administrative.client.deinit();
     allocator.destroy(administrative);
 
+    var established_closed = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer established_closed.deinit(allocator);
+    established_closed.entry.conn.state_ = .closing;
+    established_closed.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 4 };
+    Runtime.quicConnectionEvent(&established_closed.entry.quic_observer, .handshake_complete);
+    var closed_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer closed_connections.deinit();
+    var closed_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer closed_routes.deinit();
+    var closed_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer closed_per_ip.deinit();
+    try closed_connections.put(4, established_closed.entry);
+    try closed_routes.insert(established_closed.entry.owned_cids[0], 4);
+    try incPerIp(&closed_per_ip, established_closed.entry.admission_source_ip);
+    runtime.removeConnection(&closed_connections, &closed_routes, &closed_per_ip, 4, .protocol_failure);
+    established_closed.client.deinit();
+    allocator.destroy(established_closed);
+
+    var established_old = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer established_old.deinit(allocator);
+    established_old.entry.conn.state_ = .closed;
+    established_old.entry.accepted_at_us = 0;
+    established_old.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 5 };
+    Runtime.quicConnectionEvent(&established_old.entry.quic_observer, .handshake_confirmed);
+    var old_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer old_connections.deinit();
+    var old_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer old_routes.deinit();
+    var old_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer old_per_ip.deinit();
+    try old_connections.put(5, established_old.entry);
+    try old_routes.insert(established_old.entry.owned_cids[0], 5);
+    try incPerIp(&old_per_ip, established_old.entry.admission_source_ip);
+    runtime.removeConnection(&old_connections, &old_routes, &old_per_ip, 5, .handshake_timeout);
+    established_old.client.deinit();
+    allocator.destroy(established_old);
+
     try testing.expectEqual(@as(usize, 2), capture.handshake_failures);
+    try testing.expectEqual(@as(usize, 1), capture.handshake_failures_by_stage[0]);
+    try testing.expectEqual(@as(usize, 1), capture.handshake_failures_by_stage[1]);
 }
 
 test "http3 runtime metrics: rendered Prometheus deltas are not double-counted across folds" {
@@ -3907,6 +3962,37 @@ test "http3 runtime (#546): a request stream rejected by Conn.pump() at local_go
     try testing.expectEqual(@as(usize, 1), runtime.snapshot().h3_drain_request_rejections);
 }
 
+test "http3 runtime (#546): drain boundary request rejection counts one terminal H3 request" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-drain-boundary-rejection-metrics-test");
+    var latency = H3LatencyCapture{};
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .h3_request_latency_metrics_ctx = &latency,
+        .h3_request_latency_metrics_cb = H3LatencyCapture.onLatency,
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
+    defer harness.deinit(testing.allocator);
+
+    var request_bytes: [128]u8 = undefined;
+    const bytes = buildH3RequestBytesForTest("GET", "/during-drain", "example.com", &request_bytes);
+    const stream_id = try harness.client.openStream(.bidi);
+    try testing.expectEqual(@as(u64, 0), stream_id);
+    _ = try harness.client.writeStream(stream_id, bytes, true);
+    try harness.pump();
+
+    runtime.drain_requested.store(true, .release);
+    runtime.pumpH3(harness.entry, harness.now_us);
+
+    try testing.expectEqual(@as(usize, 1), runtime.snapshot().h3_drain_request_rejections);
+    try testing.expectEqual(@as(usize, 1), runtime.snapshot().requests_completed);
+    try testing.expectEqual(@as(usize, 1), latency.count);
+}
+
 test "http3 runtime metrics: handler error counts one terminal H3 request" {
     const Handler = struct {
         fn fail(
@@ -4096,6 +4182,7 @@ const RuntimeMetricCapture = struct {
     last_active: usize = 0,
     delta: metrics_mod.QuicTransportDelta = .{},
     handshake_failures: usize = 0,
+    handshake_failures_by_stage: [2]usize = .{ 0, 0 },
 
     fn onActive(ctx: *anyopaque, active: usize) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
@@ -4117,9 +4204,14 @@ const RuntimeMetricCapture = struct {
         self.delta.deprotection_failures += delta.deprotection_failures;
     }
 
-    fn onHandshakeFailure(ctx: *anyopaque, _: metrics_mod.QuicHandshakeFailureStage) void {
+    fn onHandshakeFailure(ctx: *anyopaque, stage: metrics_mod.QuicHandshakeFailureStage) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         self.handshake_failures += 1;
+        const idx: usize = switch (stage) {
+            .initial => 0,
+            .handshake => 1,
+        };
+        self.handshake_failures_by_stage[idx] += 1;
     }
 };
 
