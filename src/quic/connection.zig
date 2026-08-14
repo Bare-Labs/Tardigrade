@@ -12828,7 +12828,7 @@ test "driver: pacing spaces datagrams evenly once the opening burst is spent" {
     // bucket — the interval the schedule is aiming at.
     const mds = pair.server.effectiveMaxDatagramSize();
     var empty = pair.server.recovery.congestion;
-    empty.pacer = .{ .tokens = 0, .updated_at_us = 0 };
+    empty.pacer = .{ .balance = 0, .updated_at_us = 0 };
     const interval = empty.pacingReleaseUs(mds, 0, pair.server.recovery.rtt);
 
     // Past the opening burst, each wakeup waits about one datagram-interval
@@ -12953,7 +12953,7 @@ test "driver: a paced session ticket is refused now and reported as a deadline" 
     congestion.bytes_in_flight = 0;
     // A bucket spent down to nothing, without anything having been sent that
     // could queue other content alongside the ticket.
-    congestion.pacer = .{ .tokens = 0, .updated_at_us = pair.now_us };
+    congestion.pacer = .{ .balance = 0, .updated_at_us = pair.now_us };
 
     var server_state = try pair.server.emitNewSessionTicket(.{
         .ticket_lifetime = 60,

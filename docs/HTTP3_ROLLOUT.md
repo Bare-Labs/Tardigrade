@@ -410,20 +410,32 @@ still sees queue-overflow loss. RFC 9002 §7.7 requires a sender to either pace
 or bound such bursts. Tardigrade does both.
 
 Pacing is a **leaky bucket**, not a bandwidth model: credit accrues at
-`N × congestion_window / smoothed_rtt` and is spent by packets as they leave.
-`N` is 2 while the connection is in slow start and 1.25 in congestion
-avoidance, exactly as RFC 9002 §7.7 describes. BBR and any other rate estimator
-are out of scope.
+RFC 9002 §7.7's rate `N × congestion_window / smoothed_rtt` and is spent by
+packets as they leave. BBR and any other rate estimator are out of scope.
+
+Tardigrade uses `N = 2` in slow start and `N = 1.25` in congestion avoidance.
+That split is a **local policy, not an RFC requirement**: RFC 9002 fixes the
+shape of the rate and asks only that `N` be a small value above 1, offering
+1.25 as an example. The explicit per-phase split comes from the earlier QUIC
+recovery drafts, and is kept for the reason those drafts gave — slow start
+doubles the window every round trip, so pacing it at 1.25× would hold the
+sender below growth the window is already granting.
 
 Two properties follow, and they are what the setting is for:
 
 - **Spacing.** Once the bucket is empty, datagrams leave one interval apart —
   a full window's worth of data reaches the path spread over a round trip
   rather than as a single flight.
-- **A burst ceiling.** The bucket holds at most ten maximum-size datagrams.
-  That bounds the opening flight, and it bounds the *restart* flight: a
-  connection that has been idle for a second has notionally earned megabytes
-  of credit, and gets ten packets.
+- **A burst ceiling.** The bucket holds at most a NewReno **initial window**
+  for the current datagram size. That bounds the opening flight, and it bounds
+  the *restart* flight: a connection idle for a second has notionally earned
+  megabytes of credit, and gets one initial window.
+
+  The ceiling is the smaller of ten datagrams and `initialWindow(datagram
+  size)`, which matters once DPLPMTUD raises the path size past 1472 bytes.
+  RFC 9002 §7.2 caps the initial window at 14720 bytes, so at a 2048-byte
+  datagram the bucket holds 14720 bytes (seven packets), not ten packets'
+  20480 bytes.
 
 ### What is paced, and what is not
 
@@ -464,6 +476,15 @@ The reasoning behind each exemption:
 Everything in the "charged but not delayed" rows still puts bytes on the wire,
 and the bucket accounts for them. A pacer that ignored a handshake flight would
 let application data follow it at a rate the path was never shown to support.
+
+**Exempt means "may send now", not "outside the schedule."** Those packets
+routinely leave when the bucket cannot cover them, so the balance is signed and
+goes negative — the overdraft is carried as debt, and refill pays it off before
+producing credit again. Discarding it instead would let an exempt packet
+consume path capacity for free: one interval later, ordinary application data
+would be released as though the probe had never been sent. A connection that
+emits a PTO probe on an empty bucket therefore waits two intervals for its next
+application datagram, not one.
 
 Congestion control and anti-amplification remain the hard gates. Pacing can
 only ever *delay* a datagram — it never authorises one the window or the

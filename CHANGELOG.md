@@ -12,21 +12,27 @@ All notable user-facing changes to Tardigrade are documented here.
   still hand its whole window to the first router in the path as one burst and
   take queue-overflow loss for it.
 
-  The schedule is the leaky bucket RFC 9002 §7.7 describes: credit accrues at
-  `N × congestion_window / smoothed_rtt`, with `N` of 2 in slow start and 1.25
-  in congestion avoidance. Two things follow — datagrams leave one interval
-  apart once the bucket is empty, and a burst is capped at ten maximum-size
-  datagrams, which also caps what a connection returning from idle may send at
-  once. BBR and other rate estimators remain out of scope.
+  The schedule is a leaky bucket filling at RFC 9002 §7.7's rate
+  `N × congestion_window / smoothed_rtt`. Tardigrade uses `N` of 2 in slow
+  start and 1.25 in congestion avoidance — a local policy carried over from the
+  earlier QUIC recovery drafts, not an RFC requirement; RFC 9002 fixes the rate
+  form and asks only that `N` be a small value above 1. Two things follow:
+  datagrams leave one interval apart once the bucket is empty, and a burst is
+  capped at a NewReno initial window for the current datagram size, which also
+  caps what a connection returning from idle may send at once. BBR and other
+  rate estimators remain out of scope.
 
   Only application data waits on the bucket. PTO probes, Initial/Handshake
   flights, DPLPMTUD probes, and path-validation probes are charged to it but
   never delayed by it — a probe is how a stalled connection recovers, and the
   handshake is already bounded by the initial window and by anti-amplification.
-  Pure ACKs are exempt outright, neither delayed nor charged, since an ACK-only
-  packet is not congestion-controlled traffic and metering it would only add
-  latency to the peer's loss recovery. Congestion control and anti-amplification
-  stay the hard gates — pacing only ever delays a datagram, never authorises one.
+  Being exempt does not make them free: when one leaves an empty bucket the
+  balance goes negative, and refill repays that debt before releasing ordinary
+  traffic again. Pure ACKs are exempt outright, neither delayed nor charged,
+  since an ACK-only packet is not congestion-controlled traffic and metering it
+  would only add latency to the peer's loss recovery. Congestion control and
+  anti-amplification stay the hard gates — pacing only ever delays a datagram,
+  never authorises one.
 
   Packet construction never sleeps: `pollTransmitOnPath` declines to build
   paced data while the bucket is short, and the listener folds the connection's
