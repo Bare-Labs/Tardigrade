@@ -130,8 +130,10 @@ sudo systemctl enable --now tardigrade
 ```
 
 Like the DEB package, the RPM installs a starter
-`/etc/tardigrade/tardigrade.conf` and creates `/var/lib/tardigrade` (the
-systemd unit's `WorkingDirectory`) on install, so `systemctl enable --now
+`/etc/tardigrade/tardigrade.conf`, creates `/var/lib/tardigrade` (the
+systemd unit's `WorkingDirectory`), creates a `tardigrade`-owned
+`/var/log/tardigrade`, and installs the same SIGUSR1-reopen logrotate
+policy at `/etc/logrotate.d/tardigrade`, so `systemctl enable --now
 tardigrade` works immediately after a fresh install.
 
 ## Docker (local build)

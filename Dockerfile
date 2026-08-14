@@ -24,15 +24,25 @@ RUN zig build -Doptimize=ReleaseFast
 # ── Runtime ───────────────────────────────────────────────────────────────────
 FROM debian@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime
 
+# Fixed, documented numeric identity: compose.yaml and scripts/test-docker-image.sh
+# pin their tmpfs/ownership checks to these exact values. `useradd --system`
+# without an explicit --uid lets the distro allocate whatever's next free,
+# which happens to be 999 on the currently pinned base but isn't a contract —
+# a future base image refresh could silently break tmpfs ownership.
+ARG TARDIGRADE_UID=10001
+ARG TARDIGRADE_GID=10001
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --no-create-home --shell /usr/sbin/nologin tardigrade
+    && groupadd --system --gid "$TARDIGRADE_GID" tardigrade \
+    && useradd --system --uid "$TARDIGRADE_UID" --gid "$TARDIGRADE_GID" \
+        --no-create-home --shell /usr/sbin/nologin tardigrade
 
 COPY --from=build /src/zig-out/bin/tardi /usr/local/bin/tardi
 
-RUN mkdir -p /etc/tardigrade /var/lib/tardigrade /run/tardigrade \
-    && chown -R tardigrade:tardigrade /var/lib/tardigrade /run/tardigrade
+RUN mkdir -p /etc/tardigrade /var/lib/tardigrade /run/tardigrade /var/log/tardigrade \
+    && chown -R tardigrade:tardigrade /var/lib/tardigrade /run/tardigrade /var/log/tardigrade
 
 USER tardigrade
 WORKDIR /var/lib/tardigrade

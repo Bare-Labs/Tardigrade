@@ -16,7 +16,11 @@ RuntimeDirectory=tardigrade
 RuntimeDirectoryMode=0750
 
 ExecStartPre=/usr/bin/tardi check /etc/tardigrade/tardigrade.conf
-ExecStart=/usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf
+# `EnvironmentFile=` values override unit-level `Environment=` values, so a
+# TARDIGRADE_PID_FILE set in tardigrade.env would otherwise win here and
+# desync from the ExecReload/ExecStop targets below. Force it at exec time
+# instead of trusting it survives environment-file merging.
+ExecStart=/usr/bin/env TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid /usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf
 ExecReload=/usr/bin/tardi reload --pid-file /run/tardigrade/tardigrade.pid
 ExecStop=/usr/bin/tardi stop --pid-file /run/tardigrade/tardigrade.pid
 

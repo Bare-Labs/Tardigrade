@@ -9,6 +9,7 @@ Source1:        tardigrade.service
 Source2:        tardigrade.env
 Source3:        LICENSE
 Source4:        tardigrade.conf
+Source5:        tardigrade.logrotate
 
 BuildArch:      %{build_arch}
 Requires:       openssl-libs
@@ -24,6 +25,7 @@ install -D -m 0644 %{SOURCE1} %{buildroot}%{_unitdir}/tardigrade.service
 install -D -m 0640 %{SOURCE2} %{buildroot}%{_sysconfdir}/tardigrade/tardigrade.env
 install -D -m 0644 %{SOURCE3} %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
 install -D -m 0644 %{SOURCE4} %{buildroot}%{_sysconfdir}/tardigrade/tardigrade.conf
+install -D -m 0644 %{SOURCE5} %{buildroot}%{_sysconfdir}/logrotate.d/tardigrade
 install -d %{buildroot}%{_localstatedir}/log/tardigrade
 
 %pre
@@ -35,6 +37,7 @@ exit 0
 %systemd_post tardigrade.service
 chown root:tardigrade %{_sysconfdir}/tardigrade/tardigrade.env
 install -d -o tardigrade -g tardigrade %{_localstatedir}/lib/tardigrade
+install -d -o tardigrade -g tardigrade %{_localstatedir}/log/tardigrade
 exit 0
 
 %preun
@@ -52,6 +55,7 @@ exit 0
 %{_unitdir}/tardigrade.service
 %config(noreplace) %{_sysconfdir}/tardigrade/tardigrade.env
 %config(noreplace) %{_sysconfdir}/tardigrade/tardigrade.conf
+%config(noreplace) %{_sysconfdir}/logrotate.d/tardigrade
 %dir %{_localstatedir}/log/tardigrade
 
 %changelog

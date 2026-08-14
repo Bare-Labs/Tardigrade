@@ -40,6 +40,15 @@ sudo systemctl reload tardigrade
 sudo systemctl stop tardigrade
 ```
 
+This standalone `tardi check` validates `tardigrade.conf` only — it doesn't
+load `/etc/tardigrade/tardigrade.env`, so it isn't a complete pre-flight
+check of everything the running service uses. See
+[DEPLOYMENT.md#commands](DEPLOYMENT.md#commands) for the full
+validation/reload/restart contract, including why `tardigrade.env` edits
+need a restart rather than a reload, and the current single-process-only
+scope of this control path (`master_process true;` doesn't yet get coherent
+SIGHUP/PID-file reload across workers).
+
 Set systemd `TimeoutStopSec` slightly above
 `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` so systemd does not escalate to a hard
 kill before Tardigrade's drain has finished.

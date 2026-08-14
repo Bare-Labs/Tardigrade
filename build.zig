@@ -1061,17 +1061,25 @@ fn configureSystemLibrarySearchPaths(
         if (pathExists("/usr/local/lib")) compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
         switch (target.cpu.arch) {
             .aarch64 => {
-                compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/aarch64-linux-gnu" });
-                compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
-                compile.root_module.addLibraryPath(.{ .cwd_relative = "/lib/aarch64-linux-gnu" });
+                if (pathExists("/usr/include/aarch64-linux-gnu")) compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/aarch64-linux-gnu" });
+                if (pathExists("/usr/lib/aarch64-linux-gnu")) compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/aarch64-linux-gnu" });
+                if (pathExists("/lib/aarch64-linux-gnu")) compile.root_module.addLibraryPath(.{ .cwd_relative = "/lib/aarch64-linux-gnu" });
             },
             .x86_64 => {
-                compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
-                compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
-                compile.root_module.addLibraryPath(.{ .cwd_relative = "/lib/x86_64-linux-gnu" });
+                if (pathExists("/usr/include/x86_64-linux-gnu")) compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/x86_64-linux-gnu" });
+                if (pathExists("/usr/lib/x86_64-linux-gnu")) compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+                if (pathExists("/lib/x86_64-linux-gnu")) compile.root_module.addLibraryPath(.{ .cwd_relative = "/lib/x86_64-linux-gnu" });
             },
             else => {},
         }
+        // RHEL-family distros (Rocky, Alma, Fedora, CentOS) use a flat lib64
+        // layout instead of Debian's multiarch triplet directories above —
+        // without this, `configureSystemLibrarySearchPaths` never points the
+        // linker at the real OpenSSL location on those distros at all.
+        if (pathExists("/usr/lib64")) compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib64" });
+        if (pathExists("/lib64")) compile.root_module.addLibraryPath(.{ .cwd_relative = "/lib64" });
+        if (pathExists("/usr/lib")) compile.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+        if (pathExists("/lib")) compile.root_module.addLibraryPath(.{ .cwd_relative = "/lib" });
     }
     if (!prefer_static_system_libs) return;
     compile.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });

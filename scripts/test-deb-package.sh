@@ -68,8 +68,9 @@ docker run --pull=never --rm -v "${OUTPUT_DIR}:/artifacts:ro" "$DEB_TEST_IMAGE" 
     test -f /lib/systemd/system/tardigrade.service
     test -f /etc/logrotate.d/tardigrade
     test -d /var/lib/tardigrade
+    test -d /var/log/tardigrade
     grep -F "EnvironmentFile=-/etc/tardigrade/tardigrade.env" /lib/systemd/system/tardigrade.service
-    grep -F "ExecStart=/usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf" /lib/systemd/system/tardigrade.service
+    grep -F "ExecStart=/usr/bin/env TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid /usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf" /lib/systemd/system/tardigrade.service
     grep -F "RuntimeDirectory=tardigrade" /lib/systemd/system/tardigrade.service
     grep -F "Environment=TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid" /lib/systemd/system/tardigrade.service
     grep -F "ExecStartPre=/usr/bin/tardi check /etc/tardigrade/tardigrade.conf" /lib/systemd/system/tardigrade.service
@@ -80,6 +81,8 @@ docker run --pull=never --rm -v "${OUTPUT_DIR}:/artifacts:ro" "$DEB_TEST_IMAGE" 
     test "$(stat -c "%a %U %G" /etc/tardigrade/tardigrade.conf)" = "644 root root"
     test "$(stat -c "%a %U %G" /etc/logrotate.d/tardigrade)" = "644 root root"
     test "$(stat -c "%a %U %G" /var/lib/tardigrade)" = "755 tardigrade tardigrade"
+    test "$(stat -c "%U %G" /var/log/tardigrade)" = "tardigrade tardigrade"
+    grep -F "systemctl kill --kill-who=main --signal=USR1 tardigrade.service" /etc/logrotate.d/tardigrade
     apt-get remove -y tardigrade
     test ! -e /usr/bin/tardi
 '

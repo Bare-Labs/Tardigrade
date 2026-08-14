@@ -37,13 +37,18 @@ Two supported deployment paths:
 
 ## Host filesystem layout
 
-Both deployment paths converge on the same layout. The DEB/RPM packages
-create this automatically; the Docker image creates the container-local
-equivalent under `/etc/tardigrade`, `/var/lib/tardigrade`, and
-`/run/tardigrade`.
+The two paths use the same *directory* layout, but they're populated
+differently: the DEB/RPM package creates every path below automatically
+(including `tardigrade.env`); the Docker image only creates the directories
+themselves (`/etc/tardigrade`, `/var/lib/tardigrade`, `/run/tardigrade`,
+`/var/log/tardigrade`) — you supply `tardigrade.conf`, `tardigrade.env`
+(if you use one), and any TLS material as bind mounts. See
+[Docker](#docker) below for the exact mount shape and the one path that
+differs: the packages install the binary at `/usr/bin/tardi`, the image
+installs it at `/usr/local/bin/tardi`.
 
 ```text
-/usr/bin/tardi                         binary
+/usr/bin/tardi                         binary (packages) — /usr/local/bin/tardi in the Docker image
 /etc/tardigrade/
     tardigrade.conf                    routing/runtime configuration
     tardigrade.env                     environment-only settings / secret references
@@ -60,7 +65,12 @@ equivalent under `/etc/tardigrade`, `/var/lib/tardigrade`, and
 ### Permissions and ownership
 
 The package `postinst`/`%post` scripts are the source of truth for this on a
-host-native install; the same properties apply inside the Docker image.
+host-native install. The Docker image creates the equivalent directories at
+build time, owned by a **fixed, pinned** non-root UID/GID (`10001:10001`,
+the `tardigrade` user/group — see the [`Dockerfile`](../Dockerfile)); this
+value is a documented part of the image contract, not an incidental
+distro-allocated ID, and `compose.yaml`/`scripts/test-docker-image.sh` both
+depend on it matching exactly.
 
 | Path | Owner | Mode | Notes |
 | --- | --- | --- | --- |
@@ -70,9 +80,21 @@ host-native install; the same properties apply inside the Docker image.
 | `/run/tardigrade/` | `tardigrade:tardigrade` | `0750` | Ephemeral; recreated at start by systemd's `RuntimeDirectory=` or the container's tmpfs mount. |
 | `/var/lib/tardigrade/` | `tardigrade:tardigrade` | `0755` | Writable service state directory. |
 | `/var/lib/tardigrade/public/` | read-only to the service where possible | — | Static roots and mounted config don't need write access; mount `:ro`. |
+| `/var/log/tardigrade/` | `tardigrade:tardigrade` | `0755` | Writable file-log directory; created by the package/image but not persistent in Docker unless volume-mounted (see [Logs](#logs)). |
 
 The service always runs as the dedicated non-root `tardigrade` user, both
 under systemd and in the container.
+
+**Bind-mounted TLS material and container UID/GID**: a host file owned
+`root:tardigrade 0640` is only readable inside the container if the
+container's `tardigrade` group *numerically* matches the host group that
+owns the file — group and user *names* don't cross the container boundary,
+only the numeric IDs do. The image's `tardigrade` group is a fixed
+`10001`; if your host's `tardigrade` group (created by the DEB/RPM package
+via `useradd --system`, so its GID is whatever the distro allocated) isn't
+also `10001`, either `chgrp`/`chmod` the mounted file for the container's
+GID or mount it world-readable-within-the-container (`0644`) if that fits
+your threat model — never make it world-readable on the host.
 
 If your config references additional roots, Unix sockets, or upstream
 sockets outside this layout, they need their own filesystem access —
@@ -96,12 +118,13 @@ The shared unit at
 gives every fresh install a deterministic, self-contained control path:
 
 ```ini
+EnvironmentFile=-/etc/tardigrade/tardigrade.env
 Environment=TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid
 RuntimeDirectory=tardigrade
 RuntimeDirectoryMode=0750
 
 ExecStartPre=/usr/bin/tardi check /etc/tardigrade/tardigrade.conf
-ExecStart=/usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf
+ExecStart=/usr/bin/env TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid /usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf
 ExecReload=/usr/bin/tardi reload --pid-file /run/tardigrade/tardigrade.pid
 ExecStop=/usr/bin/tardi stop --pid-file /run/tardigrade/tardigrade.pid
 
@@ -111,12 +134,24 @@ TimeoutStopSec=35s
 - `RuntimeDirectory=tardigrade` makes systemd create and own
   `/run/tardigrade` (mode `0750`, owned by the `tardigrade` service user) on
   every start — no manual directory setup needed.
-- `Environment=TARDIGRADE_PID_FILE=...` and the `--pid-file` flags on
-  `ExecReload`/`ExecStop` all point at the same path the running process
-  writes, so `systemctl reload`/`stop` can always find it.
+- The PID path is forced twice, deliberately: `Environment=TARDIGRADE_PID_FILE=...`
+  sets a default, but systemd gives `EnvironmentFile=` values **higher**
+  precedence than unit-level `Environment=` values — so a stray
+  `TARDIGRADE_PID_FILE=` line in `tardigrade.env` would otherwise silently
+  win and desync the running process's actual PID file from what
+  `ExecReload`/`ExecStop` target. `ExecStart` wraps the command in
+  `/usr/bin/env TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid ...`,
+  which sets that variable at exec time and always wins, regardless of
+  what's in `tardigrade.env`. `tardi` still runs directly (`env` execs it),
+  so systemd tracks the same process. This exact conflicting-env-file
+  scenario is covered by a regression check in
+  `scripts/test-docker-image.sh`.
 - `ExecStartPre` runs `tardi check` against the config before the listener
   binds, so a bad edit fails the start instead of taking down a working
-  process.
+  process. Because `ExecStartPre` is part of the same unit, it inherits the
+  merged `EnvironmentFile=`/`Environment=` environment — unlike the
+  standalone manual `tardi check` shown in [Commands](#commands) below,
+  it's validating what the service will actually run with.
 - `TimeoutStopSec=35s` is set above the default 30s graceful-drain window
   (`TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS`, see
   [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md)) so systemd doesn't escalate to
@@ -132,7 +167,7 @@ config validation.
 ### Commands
 
 ```bash
-# Validate a config edit before publishing it
+# Validate the config file itself before publishing an edit
 sudo -u tardigrade tardi check /etc/tardigrade/tardigrade.conf
 
 sudo systemctl start tardigrade
@@ -145,14 +180,38 @@ sudo journalctl -u tardigrade
 sudo journalctl -u tardigrade -f
 ```
 
-Reload vs. restart:
+**This standalone `tardi check` does not validate the same effective
+configuration the service runs with.** Run outside the unit, it doesn't load
+`/etc/tardigrade/tardigrade.env`, and [`CONFIGURATION.md`](CONFIGURATION.md)
+defines process environment as higher precedence than config-file values —
+so an invalid or changed value that only exists in `tardigrade.env` (a
+secret bootstrap reference, an overridden port, a TLS path override, etc.)
+can pass this check and still fail at start. The unit's own
+`ExecStartPre=/usr/bin/tardi check ...` is the check that sees the same
+merged environment as `ExecStart`, and is the real pre-flight gate on
+`start`/`restart`.
 
-- A config change that only affects request routing, TLS credentials, or
-  other reload-owned settings: validate, then `systemctl reload tardigrade`.
-- A change to listener shard topology, HTTP/3 listener-owned settings, or
-  other process-owned settings: `systemctl restart tardigrade` (reload
-  rejects these; see [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md) for the exact
-  boundary).
+Reload vs. restart — the two are not interchangeable:
+
+- **`tardigrade.conf` edits to reloadable values** (request routing, TLS
+  credentials, and other reload-owned config — see
+  [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md) for the exact boundary):
+  validate, then `systemctl reload tardigrade`.
+- **`tardigrade.conf` edits to process-owned values** (listener shard
+  topology, HTTP/3 listener-owned settings, etc.): reload rejects these;
+  use `systemctl restart tardigrade`.
+- **`tardigrade.env` edits, of any kind**: always `systemctl restart
+  tardigrade`. `SIGHUP` reloads the published config; it cannot change the
+  environment of an already-running process, so a `tardigrade.env` edit has
+  no effect until the process is restarted and re-reads it at exec time.
+
+**Master/worker mode**: the `systemctl reload`/PID-file workflow above
+assumes single-process mode (the default). Per
+[`CONFIGURATION.md`](CONFIGURATION.md#field-reference)'s `master_process`
+entry, master/worker mode does not yet provide coherent PID-file/SIGHUP
+reload control across all workers — use restart semantics
+(`systemctl restart tardigrade`) instead of `reload` if you run with
+`master_process true;`.
 
 ## Docker
 
@@ -222,9 +281,10 @@ local example: builds the image, mounts a read-only config (and optional
 static root / TLS directory), supplies `/run/tardigrade` as a `tmpfs` mount
 owned by the container's non-root user, maps the port, and sets a graceful
 `stop_grace_period` longer than the drain timeout. The `tmpfs` entry needs
-explicit `uid`/`gid` mount options matching the image's `tardigrade` user —
-a plain tmpfs mount defaults to `root:root` and the process can't write its
-PID file into it.
+explicit `uid=10001,gid=10001` mount options matching the image's fixed
+`tardigrade` user (see [Permissions and ownership](#permissions-and-ownership)
+above) — a plain tmpfs mount defaults to `root:root` and the process can't
+write its PID file into it.
 
 The bundled healthcheck runs `tardi status --pid-file ...` inside the
 container. Note its limitation: `tardi status` always exits `0` once the
@@ -262,11 +322,17 @@ Two logging surfaces, both covered in full by
   is configured.
 - **Configured file logs** — set `error_log` (or
   `TARDIGRADE_ERROR_LOG_PATH`) to write to `/var/log/tardigrade/*.log`
-  instead. The DEB/RPM packages already install a logrotate config at
-  `/etc/logrotate.d/tardigrade` that signals `SIGUSR1` after rotation;
+  instead. Both the DEB and RPM packages create a `tardigrade`-owned
+  `/var/log/tardigrade` and install the same logrotate config at
+  `/etc/logrotate.d/tardigrade`, which signals `SIGUSR1` after rotation;
   Tardigrade has a real SIGUSR1 log-reopen handler, so log files reopen
   cleanly on the existing rotation cadence. Don't invent a second rotation
-  mechanism.
+  mechanism. The Docker image creates the same `tardigrade`-owned
+  `/var/log/tardigrade` directory, but it isn't persistent or rotated by
+  anything inside the container — mount a host path or named volume over
+  it if you use `error_log` under Docker (`- ./logs:/var/log/tardigrade`
+  in `compose.yaml`), and handle rotation on the host side. Without that
+  mount, stdout/stderr (`docker compose logs`) is the durable log surface.
 
 > **Operator note discovered while writing this guide**: the starter config
 > matches on `server_name localhost;`. A bare `curl http://<host>:8069/health`
@@ -318,6 +384,10 @@ limiting values.
   item above before exposing a deployment publicly.
 - DEB/RPM remain the more deeply integrated host-native Linux install path
   (user creation, logrotate, systemd wiring all handled by the package).
+- The packaged `systemctl reload`/PID-file control workflow targets
+  single-process mode. `master_process true;` does not yet provide coherent
+  SIGHUP/PID-file reload control across all workers — restart instead of
+  reload in that mode (see [CONFIGURATION.md](CONFIGURATION.md#field-reference)).
 - Every experimental protocol/feature in the [support matrix](SUPPORT_MATRIX.md)
   stays experimental regardless of deployment method — deploying via
   Docker or systemd does not change a feature's maturity level.

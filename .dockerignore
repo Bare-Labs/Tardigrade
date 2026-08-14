@@ -1,15 +1,30 @@
 .git
 .github
 .zig-cache
+# Repo-local build/tool artifacts that shouldn't be sent as build context;
+# the image builds its own Zig toolchain and binary from source.
+.zig/
+.zig-toolchain/
+dist/
 zig-out/*
 !zig-out/bin/
 zig-out/bin/*
 !zig-out/bin/tardi
 docs
 tests
-# The default `zig build` target embeds tests/vectors/pki/malformed-truncated.der
-# and tests/vectors/pki/reduced/ into the production pki module (build.zig), so
-# they must stay in the Docker build context even though the rest of tests/ does not.
+# The default `zig build` target embeds these specific fixture files into the
+# production pki module (build.zig: pki_malformed_der, pki_reduced_corpus), so
+# they must stay in the Docker build context even though the rest of tests/
+# does not. Narrowed to exactly what's embedded, not the whole tests/vectors
+# tree, to keep the build context small.
 !tests/vectors
+tests/vectors/*
+!tests/vectors/pki
+tests/vectors/pki/*
+!tests/vectors/pki/malformed-truncated.der
+!tests/vectors/pki/reduced
+tests/vectors/pki/reduced/*
+!tests/vectors/pki/reduced/manifest.zig
+!tests/vectors/pki/reduced/*.der
 examples
 PLAN.md
