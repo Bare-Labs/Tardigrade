@@ -17138,3 +17138,215 @@ test "a post-validation runtime failure is not misreported as a configuration er
     try assertContains(run_res.stderr, "AccessDenied");
     try std.testing.expect(std.mem.indexOf(u8, run_res.stderr, "configuration validation failed") == null);
 }
+
+// #162: `tardi init <profile>` real generated-config validation. These
+// spawn the actual built binary rather than re-implementing a mini
+// validator, so they prove the exact bytes an operator gets from
+// `tardi init <profile> > tardigrade.conf` are accepted by the exact
+// production `tardi check` path -- not a stand-in for it.
+
+const init_profile_names = [_][]const u8{ "static", "proxy", "tls", "metrics", "prod" };
+const init_profile_aliases = [_][]const u8{ "static-site", "reverse-proxy", "tls-termination", "metrics-enabled", "production-baseline" };
+
+test "init emits config bytes only to stdout with empty stderr for every canonical profile and alias" {
+    const allocator = std.testing.allocator;
+    for (init_profile_names) |name| try expectInitStdoutOnly(allocator, name);
+    for (init_profile_aliases) |name| try expectInitStdoutOnly(allocator, name);
+}
+
+fn expectInitStdoutOnly(allocator: std.mem.Allocator, profile_arg: []const u8) !void {
+    const res = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "init", profile_arg },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    try std.testing.expectEqualStrings("", res.stderr);
+    try assertContains(res.stdout, "# Tardigrade profile:");
+    try std.testing.expect(std.mem.endsWith(u8, res.stdout, "\n"));
+}
+
+test "init proxy and its descriptive alias reverse-proxy are byte-identical" {
+    const allocator = std.testing.allocator;
+    const canonical = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "init", "proxy" },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(canonical.stdout);
+    defer allocator.free(canonical.stderr);
+
+    const alias = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "init", "reverse-proxy" },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(alias.stdout);
+    defer allocator.free(alias.stderr);
+
+    try std.testing.expectEqualStrings(canonical.stdout, alias.stdout);
+}
+
+test "init rejects an unknown profile by name and lists the valid ones" {
+    const allocator = std.testing.allocator;
+    const res = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "init", "kubernetes" },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(res.stdout);
+    defer allocator.free(res.stderr);
+
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    try std.testing.expectEqualStrings("", res.stdout);
+    try assertContains(res.stderr, "unknown config profile 'kubernetes'");
+    try assertContains(res.stderr, "static, proxy, tls, metrics, prod");
+}
+
+test "init rejects too many positional arguments and a missing profile" {
+    const allocator = std.testing.allocator;
+    const too_many = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "init", "proxy", "static" },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(too_many.stdout);
+    defer allocator.free(too_many.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, too_many.term);
+    try assertContains(too_many.stderr, "too many positional arguments");
+
+    const missing = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "init" },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(missing.stdout);
+    defer allocator.free(missing.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, missing.term);
+    try assertContains(missing.stderr, "missing config profile");
+}
+
+test "init -h and --help print usage without generating a config" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "-h", "--help" }) |flag| {
+        const res = try std.process.run(allocator, compat.io(), .{
+            .argv = &.{ integration_options.tardigrade_bin_path, "init", flag },
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+        });
+        defer allocator.free(res.stdout);
+        defer allocator.free(res.stderr);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+        try std.testing.expect(std.mem.indexOf(u8, res.stdout, "# Tardigrade profile:") == null);
+        try assertContains(res.stdout, "tardigrade init <profile>");
+    }
+}
+
+/// Writes `data` to a fresh `.zig-cache`-relative path so callers get an
+/// isolated real file the production `check`/`init` file-writing paths can
+/// exercise, cleaned up automatically.
+fn writeTempConfig(allocator: std.mem.Allocator, label: []const u8, data: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tardigrade-init-{s}-{d}.conf", .{ label, compat.nanoTimestamp() });
+    errdefer allocator.free(path);
+    try compat.cwd().writeFile(.{ .sub_path = path, .data = data });
+    return path;
+}
+
+fn expectInitProfileGeneratesCheckableConfig(allocator: std.mem.Allocator, profile: []const u8) !void {
+    const generated = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "init", profile },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(generated.stdout);
+    defer allocator.free(generated.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, generated.term);
+
+    const config_path = try writeTempConfig(allocator, profile, generated.stdout);
+    defer {
+        compat.cwd().deleteFile(config_path) catch {};
+        allocator.free(config_path);
+    }
+
+    const checked = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "check", config_path },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(checked.stdout);
+    defer allocator.free(checked.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, checked.term);
+    try assertContains(checked.stdout, "configuration valid");
+}
+
+test "init static, proxy, and metrics profiles pass the real tardi check with no external prerequisites" {
+    const allocator = std.testing.allocator;
+    try expectInitProfileGeneratesCheckableConfig(allocator, "static");
+    try expectInitProfileGeneratesCheckableConfig(allocator, "proxy");
+    try expectInitProfileGeneratesCheckableConfig(allocator, "metrics");
+}
+
+fn expectInitTlsProfileGeneratesCheckableConfig(allocator: std.mem.Allocator, profile: []const u8, upstream_base_url: ?[]const u8) !void {
+    const generated = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "init", profile },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(generated.stdout);
+    defer allocator.free(generated.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, generated.term);
+    try assertContains(generated.stdout, "/etc/tardigrade/tls/fullchain.pem");
+    try assertContains(generated.stdout, "/etc/tardigrade/tls/privkey.pem");
+
+    // The generated profile intentionally points at operator-owned
+    // credential paths that do not exist on this machine (#162's contract:
+    // no embedded/fake credentials). Validation of the real artifact
+    // therefore substitutes the repository's own fixture cert/key -- the
+    // same Ed25519 pair the appliance credential preflight tests already
+    // trust -- rather than weakening or skipping `tardi check`.
+    const cert_path = try applianceFixturePath(allocator, "native_ed25519.crt");
+    defer allocator.free(cert_path);
+    const key_path = try applianceFixturePath(allocator, "native_ed25519.key");
+    defer allocator.free(key_path);
+
+    const with_cert = try std.mem.replaceOwned(u8, allocator, generated.stdout, "/etc/tardigrade/tls/fullchain.pem", cert_path);
+    defer allocator.free(with_cert);
+    const substituted = try std.mem.replaceOwned(u8, allocator, with_cert, "/etc/tardigrade/tls/privkey.pem", key_path);
+    defer allocator.free(substituted);
+
+    const config_path = try writeTempConfig(allocator, profile, substituted);
+    defer {
+        compat.cwd().deleteFile(config_path) catch {};
+        allocator.free(config_path);
+    }
+
+    var env_map = try inheritedEnvMap(allocator);
+    defer env_map.deinit();
+    // The fixture's leaf identity is CN/SAN `tardigrade.test`; the
+    // appliance credential preflight matches this against the configured
+    // server name (see `verifyApplianceAcceptsCredential` above).
+    try env_map.put("TARDIGRADE_TLS_SERVER_NAME", "tardigrade.test");
+    if (upstream_base_url) |url| try env_map.put("TARDIGRADE_UPSTREAM_BASE_URL", url);
+
+    const checked = try std.process.run(allocator, compat.io(), .{
+        .argv = &.{ integration_options.tardigrade_bin_path, "check", config_path },
+        .environ_map = &env_map,
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer allocator.free(checked.stdout);
+    defer allocator.free(checked.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, checked.term);
+    try assertContains(checked.stdout, "configuration valid");
+}
+
+test "init tls profile passes the real tardi check once real TLS fixtures are supplied" {
+    try expectInitTlsProfileGeneratesCheckableConfig(std.testing.allocator, "tls", null);
+}
+
+test "init prod profile passes the real tardi check with TLS fixtures and a test upstream" {
+    try expectInitTlsProfileGeneratesCheckableConfig(std.testing.allocator, "prod", "http://127.0.0.1:3000");
+}

@@ -130,42 +130,50 @@ Useful build options are documented in [CONTRIBUTING.md](CONTRIBUTING.md#build-o
 
 ## Quick start
 
-Create a small static root:
-
-```bash
-mkdir -p public
-printf '%s\n' '<h1>Hello from Tardigrade</h1>' > public/index.html
-```
-
-Create `tardigrade.conf`:
-
-```nginx
-listen 8069;
-server_name localhost;
-
-root ./public;
-try_files $uri /index.html;
-
-location = /health {
-    return 200 ok;
-}
-
-location /api/ {
-    proxy_pass http://127.0.0.1:8080;
-}
-```
-
-Build and run:
+Build Tardigrade, then generate a starter config for your deployment shape
+with `tardi init <profile>`:
 
 ```bash
 zig build
+
+mkdir -p public
+printf '%s\n' '<h1>Hello from Tardigrade</h1>' > public/index.html
+
+./zig-out/bin/tardi init static > tardigrade.conf
+./zig-out/bin/tardi check ./tardigrade.conf
 ./zig-out/bin/tardi run -c ./tardigrade.conf
 ```
 
 Then open:
 
-- `http://localhost:8069/`
-- `http://localhost:8069/health`
+- `http://localhost:8080/`
+- `http://localhost:8080/health`
+
+`init` writes configuration bytes only to stdout, so the redirect above
+produces a clean file with no extra output mixed in. Other common shapes:
+
+```bash
+./zig-out/bin/tardi init proxy > tardigrade.conf     # reverse proxy to an upstream app
+./zig-out/bin/tardi init tls > tardigrade.conf        # TLS termination + proxy
+./zig-out/bin/tardi init metrics > tardigrade.conf    # proxy starter documenting /status/metrics
+./zig-out/bin/tardi init prod > tardigrade.conf       # production-oriented TLS/proxy scaffold
+```
+
+Each profile also has a longer descriptive alias that resolves to the same
+template, e.g. `tardi init reverse-proxy` is identical to `tardi init proxy`.
+Run `tardi init --help` for the full profile/alias list. The `tls` and `prod`
+profiles reference certificate/key paths you must provision yourself — see
+[examples/tls-termination](examples/tls-termination/README.md) and
+[examples/production-baseline](examples/production-baseline/README.md) for
+how to generate a local test certificate. The `metrics` profile documents the
+existing `/status/metrics` endpoint; protect it in production with
+`TARDIGRADE_METRICS_REQUIRE_AUTH=true` or a network-boundary restriction.
+
+`tardi config init [<path>] [--force | --stdout] [--profile <profile>]` is
+the verbose, file-writing form of the same generator: it supports the same
+profiles via `--profile`, writes to a file (creating parent directories and
+refusing to overwrite an existing file unless `--force` is given), and keeps
+today's generic starter output when no `--profile` is given.
 
 Common CLI commands:
 
@@ -177,6 +185,7 @@ Common CLI commands:
 ./zig-out/bin/tardi status -c ./tardigrade.conf
 ./zig-out/bin/tardi reload -c ./tardigrade.conf
 ./zig-out/bin/tardi stop -c ./tardigrade.conf
+./zig-out/bin/tardi init <profile>
 ./zig-out/bin/tardi config init
 ```
 

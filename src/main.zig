@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const compat = @import("zig_compat");
+const config_profiles = @import("config_profiles.zig");
 const edge_config = @import("edge_config.zig");
 const edge_gateway = @import("edge_gateway.zig");
 const http = @import("http.zig");
@@ -25,6 +26,7 @@ const CliCommand = union(enum) {
     version,
     help,
     config_init: ConfigInitOptions,
+    init: InitOptions,
 };
 
 const CommonOptions = struct {
@@ -47,6 +49,18 @@ const ConfigInitOptions = struct {
     output_path: []const u8 = "tardigrade.conf",
     force: bool = false,
     stdout: bool = false,
+    // Deferred to execution time (not resolved during parsing) so an
+    // invalid value can be reported with the same "unknown config
+    // profile" message the concise `init` command uses -- see
+    // `resolveConfigProfileOrExit`.
+    profile_name: ?[]const u8 = null,
+};
+
+// The concise `tardi init <profile>` command. Its happy path is stdout-only
+// (see #162): no output-path/overwrite API of its own -- `config init
+// --profile <name>` already owns file-writing.
+const InitOptions = struct {
+    profile_name: []const u8,
 };
 
 const ValidationMode = enum {
@@ -124,6 +138,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             try stdout.flush();
         },
         .config_init => |options| try writeStarterConfig(options),
+        .init => |options| try executeInitCommand(options),
         .status => |options| try executeStatusCommand(control_allocator, options),
         .print_config => |options| try executePrintConfigCommand(control_allocator, options),
         .routes => |options| try executeRoutesCommand(control_allocator, options),
@@ -159,6 +174,7 @@ fn parseCliCommand(args: []const []const u8) !CliCommand {
     if (std.mem.eql(u8, first, "upstreams")) return if (try parseInspectOptions(args[1..])) |o| .{ .upstreams = o } else .help;
     if (std.mem.eql(u8, first, "reload")) return try parseSignalCommand(.reload, args[1..]);
     if (std.mem.eql(u8, first, "stop")) return try parseSignalCommand(.stop, args[1..]);
+    if (std.mem.eql(u8, first, "init")) return try parseInitCommand(args[1..]);
     if (std.mem.eql(u8, first, "config")) {
         if (args.len >= 2 and std.mem.eql(u8, args[1], "init")) return try parseConfigInitCommand(args[2..]);
         if (args.len >= 2 and std.mem.eql(u8, args[1], "print")) return try parsePrintConfigCommand(args[2..]);
@@ -326,7 +342,9 @@ fn parseInspectOptions(args: []const []const u8) !?CommonOptions {
 fn parseConfigInitCommand(args: []const []const u8) !CliCommand {
     var options = ConfigInitOptions{};
     var saw_output = false;
-    for (args) |arg| {
+    var idx: usize = 0;
+    while (idx < args.len) : (idx += 1) {
+        const arg = args[idx];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
         if (std.mem.eql(u8, arg, "--force")) {
             options.force = true;
@@ -336,12 +354,34 @@ fn parseConfigInitCommand(args: []const []const u8) !CliCommand {
             options.stdout = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--profile")) {
+            if (idx + 1 >= args.len) return error.MissingOptionValue;
+            options.profile_name = args[idx + 1];
+            idx += 1;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "-")) return error.UnknownOption;
         if (saw_output) return error.TooManyArguments;
         options.output_path = arg;
         saw_output = true;
     }
     return .{ .config_init = options };
+}
+
+// The concise `tardi init <profile>` command (#162). Argument *shape*
+// (missing/extra positionals) is validated here; the profile *name* itself
+// is resolved later at execution time so an unknown name can be reported
+// with the offending value inline (`resolveConfigProfileOrExit`) instead of
+// through the generic, context-free CLI parse error path.
+fn parseInitCommand(args: []const []const u8) !CliCommand {
+    var profile_name: ?[]const u8 = null;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
+        if (std.mem.startsWith(u8, arg, "-")) return error.UnknownOption;
+        if (profile_name != null) return error.TooManyArguments;
+        profile_name = arg;
+    }
+    return .{ .init = .{ .profile_name = profile_name orelse return error.MissingConfigProfile } };
 }
 
 fn printUsage(writer: anytype) !void {
@@ -357,11 +397,26 @@ fn printUsage(writer: anytype) !void {
         \\  tardigrade reload [-c <path>] [--pid-file <path> | --pid <pid>]
         \\  tardigrade stop [-c <path>] [--pid-file <path> | --pid <pid>]
         \\  tardigrade version
-        \\  tardigrade config init [<path>] [--force | --stdout]
+        \\  tardigrade init <profile>
+        \\  tardigrade config init [<path>] [--force | --stdout] [--profile <profile>]
         \\  tardigrade config print [-c <path>]
         \\  tardigrade config validate [<config>]
         \\
+        \\Profiles (canonical name, descriptive alias -- aliases resolve to the
+        \\same template):
+        \\  static (static-site)         static files + SPA fallback + health
+        \\  proxy (reverse-proxy)        basic HTTP reverse proxy + health
+        \\  tls (tls-termination)        TLS termination + proxy + health
+        \\  metrics (metrics-enabled)    proxy starter documenting /status/metrics
+        \\  prod (production-baseline)   production-oriented TLS/proxy scaffold
+        \\
         \\Notes:
+        \\  - `init <profile>` writes the profile's config to stdout only, e.g.
+        \\    `tardi init proxy > tardigrade.conf`; nothing else is printed to
+        \\    stdout or stderr on success. `config init` is the verbose,
+        \\    file-writing form: it supports the same profiles via
+        \\    `--profile <profile>` and keeps today's generic starter output
+        \\    when no `--profile` is given.
         \\  - `check [<config>]` validates a config file without starting the server.
         \\    Accepts a positional config path or defaults to `./tardigrade.toml`.
         \\    `config validate [<config>]` is a verbose alias for the same command.
@@ -386,6 +441,7 @@ fn printCliParseError(writer: anytype, err: anyerror) !void {
         error.UnknownOption => "error: unknown option\n",
         error.MissingOptionValue => "error: missing option value\n",
         error.TooManyArguments => "error: too many positional arguments\n",
+        error.MissingConfigProfile => "error: missing config profile\n",
         else => "error: invalid command line\n",
     };
     try writer.writeAll(msg);
@@ -1019,11 +1075,46 @@ fn readPidFromFile(allocator: std.mem.Allocator, path: []const u8) !std.posix.pi
     return try parsePid(std.mem.trim(u8, raw, " \t\r\n"));
 }
 
+// Shared by `init <profile>` and `config init --profile <profile>` (#162):
+// resolves an operator-supplied profile name against `config_profiles`, or
+// reports it and exits so both call sites give the same wording for the
+// same mistake instead of drifting.
+fn writeUnknownConfigProfileError(writer: anytype, name: []const u8) !void {
+    try writer.print("error: unknown config profile '{s}'\n", .{name});
+    try writer.print("available profiles: {s}\n", .{config_profiles.canonical_names_csv});
+}
+
+fn resolveConfigProfileOrExit(name: []const u8) config_profiles.ConfigProfile {
+    return config_profiles.parse(name) orelse {
+        var stderr_buf: [512]u8 = undefined;
+        var stderr = compat.stderrWriter(&stderr_buf);
+        writeUnknownConfigProfileError(&stderr, name) catch {};
+        stderr.flush() catch {};
+        std.process.exit(EXIT_INTERNAL_ERROR);
+    };
+}
+
+// `init <profile>` (#162): concise, stdout-only. On success this must write
+// nothing but the config bytes to stdout and nothing at all to stderr, so
+// `tardi init proxy > tardigrade.conf` redirects cleanly.
+fn executeInitCommand(options: InitOptions) !void {
+    const profile = resolveConfigProfileOrExit(options.profile_name);
+    var stdout_buf: [2048]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try stdout.writeAll(config_profiles.template(profile));
+    try stdout.flush();
+}
+
 fn writeStarterConfig(options: ConfigInitOptions) !void {
+    const content: []const u8 = if (options.profile_name) |name|
+        config_profiles.template(resolveConfigProfileOrExit(name))
+    else
+        starter_config;
+
     if (options.stdout) {
         var stdout_buf: [2048]u8 = undefined;
         var stdout = compat.stdoutWriter(&stdout_buf);
-        try stdout.writeAll(starter_config);
+        try stdout.writeAll(content);
         try stdout.flush();
         return;
     }
@@ -1032,7 +1123,7 @@ fn writeStarterConfig(options: ConfigInitOptions) !void {
     try ensureParentPath(options.output_path);
     var file = try createFileAtPath(options.output_path, .{ .truncate = true, .read = false });
     defer file.close(compat.io());
-    try file.writeStreamingAll(compat.io(), starter_config);
+    try file.writeStreamingAll(compat.io(), content);
     var stdout_buf: [256]u8 = undefined;
     var stdout = compat.stdoutWriter(&stdout_buf);
     try stdout.print("wrote starter config to {s}\n", .{options.output_path});
@@ -1422,6 +1513,101 @@ test "parse config init command supports stdout" {
     }
 }
 
+test "parse init command accepts every canonical profile name" {
+    inline for (config_profiles.all) |profile| {
+        const cmd = try parseCliCommand(&.{ "init", config_profiles.canonicalName(profile) });
+        switch (cmd) {
+            .init => |options| {
+                try std.testing.expectEqualStrings(config_profiles.canonicalName(profile), options.profile_name);
+                try std.testing.expectEqual(profile, config_profiles.parse(options.profile_name).?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "parse init command accepts every descriptive alias" {
+    inline for (config_profiles.all) |profile| {
+        const cmd = try parseCliCommand(&.{ "init", config_profiles.descriptiveAlias(profile) });
+        switch (cmd) {
+            .init => |options| try std.testing.expectEqual(profile, config_profiles.parse(options.profile_name).?),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "parse init command rejects a missing profile" {
+    try std.testing.expectError(error.MissingConfigProfile, parseCliCommand(&.{"init"}));
+}
+
+test "parse init command rejects too many positional arguments" {
+    try std.testing.expectError(error.TooManyArguments, parseCliCommand(&.{ "init", "proxy", "static" }));
+}
+
+test "parse init command help does not select a profile" {
+    try std.testing.expectEqual(CliCommand.help, std.meta.activeTag(try parseCliCommand(&.{ "init", "-h" })));
+    try std.testing.expectEqual(CliCommand.help, std.meta.activeTag(try parseCliCommand(&.{ "init", "--help" })));
+}
+
+test "parse init command defers unknown profile validation to execution" {
+    // Argument *shape* is what parsing validates; the value itself is
+    // resolved later (resolveConfigProfileOrExit) so the "unknown profile"
+    // message can name the offending value. An unrecognized name therefore
+    // still parses successfully here.
+    const cmd = try parseCliCommand(&.{ "init", "kubernetes" });
+    switch (cmd) {
+        .init => |options| {
+            try std.testing.expectEqualStrings("kubernetes", options.profile_name);
+            try std.testing.expectEqual(@as(?config_profiles.ConfigProfile, null), config_profiles.parse(options.profile_name));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "unknown config profile error names the value and lists valid profiles" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeUnknownConfigProfileError(&out.writer, "kubernetes");
+    const written = out.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "unknown config profile 'kubernetes'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, config_profiles.canonical_names_csv) != null);
+}
+
+test "config init --profile parses and rejects a missing value" {
+    const cmd = try parseCliCommand(&.{ "config", "init", "--profile", "proxy", "--stdout" });
+    switch (cmd) {
+        .config_init => |options| {
+            try std.testing.expectEqualStrings("proxy", options.profile_name.?);
+            try std.testing.expect(options.stdout);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.MissingOptionValue, parseCliCommand(&.{ "config", "init", "--profile" }));
+}
+
+test "config init with no profile keeps the legacy default profile_name" {
+    const cmd = try parseCliCommand(&.{ "config", "init" });
+    switch (cmd) {
+        .config_init => |options| {
+            try std.testing.expectEqual(@as(?[]const u8, null), options.profile_name);
+            try std.testing.expectEqualStrings("tardigrade.conf", options.output_path);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "config init positional path, --force, and --profile compose" {
+    const cmd = try parseCliCommand(&.{ "config", "init", "./out/tardigrade.conf", "--profile", "prod", "--force" });
+    switch (cmd) {
+        .config_init => |options| {
+            try std.testing.expectEqualStrings("./out/tardigrade.conf", options.output_path);
+            try std.testing.expectEqualStrings("prod", options.profile_name.?);
+            try std.testing.expect(options.force);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "parsePid accepts valid positive pid" {
     try std.testing.expectEqual(@as(std.posix.pid_t, 1234), try parsePid("1234"));
     try std.testing.expectEqual(@as(std.posix.pid_t, 1), try parsePid("1"));
@@ -1435,6 +1621,68 @@ test "parsePid rejects zero and negative pids" {
 test "parsePid rejects non-numeric input" {
     try std.testing.expectError(error.InvalidCharacter, parsePid("abc"));
     try std.testing.expectError(error.InvalidCharacter, parsePid("12px"));
+}
+
+test "writeStarterConfig writes the selected profile's template to a file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try compat.wrapDir(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const out_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/tardigrade.conf", .{dir_abs});
+    defer std.testing.allocator.free(out_path);
+
+    try writeStarterConfig(.{ .output_path = out_path, .profile_name = "proxy" });
+
+    const written = try compat.wrapDir(tmp.dir).readFileAlloc(std.testing.allocator, "tardigrade.conf", 8192);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings(config_profiles.template(.proxy), written);
+}
+
+test "writeStarterConfig keeps the legacy generic starter when no profile is given" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try compat.wrapDir(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const out_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/tardigrade.conf", .{dir_abs});
+    defer std.testing.allocator.free(out_path);
+
+    try writeStarterConfig(.{ .output_path = out_path });
+
+    const written = try compat.wrapDir(tmp.dir).readFileAlloc(std.testing.allocator, "tardigrade.conf", 8192);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings(starter_config, written);
+}
+
+test "writeStarterConfig refuses to overwrite an existing file without --force" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "tardigrade.conf", .data = "existing" });
+    const dir_abs = try compat.wrapDir(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const out_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/tardigrade.conf", .{dir_abs});
+    defer std.testing.allocator.free(out_path);
+
+    try std.testing.expectError(error.PathAlreadyExists, writeStarterConfig(.{ .output_path = out_path, .profile_name = "static" }));
+    try writeStarterConfig(.{ .output_path = out_path, .profile_name = "static", .force = true });
+
+    const written = try compat.wrapDir(tmp.dir).readFileAlloc(std.testing.allocator, "tardigrade.conf", 8192);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings(config_profiles.template(.static), written);
+}
+
+test "writeStarterConfig creates parent directories for a nested profile path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_abs = try compat.wrapDir(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(dir_abs);
+    const out_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/config/tardigrade.conf", .{dir_abs});
+    defer std.testing.allocator.free(out_path);
+
+    try writeStarterConfig(.{ .output_path = out_path, .profile_name = "tls" });
+
+    const written = try compat.wrapDir(tmp.dir).readFileAlloc(std.testing.allocator, "nested/config/tardigrade.conf", 8192);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings(config_profiles.template(.tls), written);
 }
 
 test "readPidFromFile reads pid written to a temp file" {
