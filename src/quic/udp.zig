@@ -72,7 +72,17 @@ pub const SendDatagram = struct {
     local: ?Address = null,
     remote: Address,
     ecn: Ecn = .unavailable,
-    /// Future pacing hook. `null` means send as soon as the endpoint can.
+    /// Earliest instant this datagram may leave; `null` means send as soon as
+    /// the endpoint can.
+    ///
+    /// Not a second pacing API (#256-C). The transport's schedule lives in
+    /// `recovery.Pacer`, and `Connection.pollTransmitOnPath` already declines
+    /// to build a paced datagram before it is eligible — so every datagram
+    /// that reaches an endpoint is one the pacer has released, and this field
+    /// is null on the production path. It stays for endpoints that queue
+    /// ahead of the wire (batching, a test harness driving a fake clock),
+    /// which need somewhere to carry the release time that
+    /// `Connection.nextSendTimeUs` reports.
     send_at_us: ?u64 = null,
 };
 

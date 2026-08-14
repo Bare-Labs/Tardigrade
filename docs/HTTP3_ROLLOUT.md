@@ -400,6 +400,138 @@ of paths that validated.
 `TARDIGRADE_HTTP3_ECN` is restart-required, like every other listener-owned knob
 — the receive option is socket state applied at bind time.
 
+## Packet pacing
+
+A congestion window is a bound on how much data may be *outstanding*, not on
+how fast it may leave. A sender that holds a 64 kB window and simply writes
+until the window is full hands that whole window to the first router in the
+path as one burst — which is how a connection with plenty of nominal capacity
+still sees queue-overflow loss. RFC 9002 §7.7 requires a sender to either pace
+or bound such bursts. Tardigrade does both.
+
+Pacing is a **leaky bucket**, not a bandwidth model: credit accrues at
+RFC 9002 §7.7's rate `N × congestion_window / smoothed_rtt` and is spent by
+packets as they leave. BBR and any other rate estimator are out of scope.
+
+Tardigrade uses `N = 2` in slow start and `N = 1.25` in congestion avoidance.
+That split is a **local policy, not an RFC requirement**: RFC 9002 fixes the
+shape of the rate and asks only that `N` be a small value above 1, offering
+1.25 as an example. The explicit per-phase split comes from the earlier QUIC
+recovery drafts, and is kept for the reason those drafts gave — slow start
+doubles the window every round trip, so pacing it at 1.25× would hold the
+sender below growth the window is already granting.
+
+Two properties follow, and they are what the setting is for:
+
+- **Spacing.** Once the bucket is empty, datagrams leave one interval apart —
+  a full window's worth of data reaches the path spread over a round trip
+  rather than as a single flight.
+- **A burst ceiling.** The bucket holds at most a NewReno **initial window**
+  for the current datagram size. That bounds the opening flight, and it bounds
+  the *restart* flight: a connection idle for a second has notionally earned
+  megabytes of credit, and gets one initial window.
+
+  The ceiling is the smaller of ten datagrams and `initialWindow(datagram
+  size)`, which matters once DPLPMTUD raises the path size past 1472 bytes.
+  RFC 9002 §7.2 caps the initial window at 14720 bytes, so at a 2048-byte
+  datagram the bucket holds 14720 bytes (seven packets), not ten packets'
+  20480 bytes.
+
+### What is paced, and what is not
+
+Only application-space data waits on the bucket: stream data, application
+control frames, post-handshake CRYPTO (session tickets), and a PATH_RESPONSE
+riding on the active path. RFC 9000 §8.2 explicitly permits path validation to
+be delayed by congestion control, which is why the last of those is in the
+list rather than exempt.
+
+Everything else is exempt from *waiting*, but the two categories differ in
+whether the bytes are **charged** to the bucket:
+
+| Traffic | Delayed by pacing? | Charged to the bucket? |
+|---|---|---|
+| Application data, app control frames, post-handshake CRYPTO, active-path PATH_RESPONSE | yes | yes |
+| PTO probes | no | yes |
+| Initial and Handshake flights | no | yes |
+| DPLPMTUD probes | no | yes |
+| Candidate-path PATH_CHALLENGE / PATH_RESPONSE | no | yes |
+| Pure ACK packets | no | **no** |
+
+The reasoning behind each exemption:
+
+- **Acknowledgements** are not congestion-controlled traffic at all — an
+  ACK-only packet is not in flight, so it is neither delayed by the bucket nor
+  charged to it. Metering acknowledgements would add latency to the *peer's*
+  loss recovery for no capacity reason.
+- **PTO probes** are already exempt from the congestion window by RFC 9002 §7;
+  making loss recovery wait on a token is how a stalled connection stays
+  stalled.
+- **Initial and Handshake flights** are already bounded by the initial window
+  and, for a server, by anti-amplification. Pacing them at a rate derived from
+  an RTT nobody has measured yet would slow every connection setup to buy
+  nothing.
+- **DPLPMTUD and path-validation probes** each build their own datagram, and at
+  most one is outstanding per path at a time, so they cannot burst.
+
+Everything in the "charged but not delayed" rows still puts bytes on the wire,
+and the bucket accounts for them. A pacer that ignored a handshake flight would
+let application data follow it at a rate the path was never shown to support.
+
+**Exempt means "may send now", not "outside the schedule."** Those packets
+routinely leave when the bucket cannot cover them, so the balance is signed and
+goes negative — the overdraft is carried as debt, and refill pays it off before
+producing credit again. Discarding it instead would let an exempt packet
+consume path capacity for free: one interval later, ordinary application data
+would be released as though the probe had never been sent. A connection that
+emits a PTO probe on an empty bucket therefore waits two intervals for its next
+application datagram, not one.
+
+Congestion control and anti-amplification remain the hard gates. Pacing can
+only ever *delay* a datagram — it never authorises one the window or the
+amplification budget would refuse, and a connection blocked by either of those
+reports no pacing deadline at all.
+
+### How it reaches the wire
+
+Pacing is a schedule, not a sleep. `Connection.pollTransmitOnPath` never
+blocks: while the bucket is short it simply declines to build paced data, and
+`Connection.nextSendTimeUs` reports the instant the schedule next releases
+something. The listener folds that deadline into the same sleep it already
+computes from timers, so a paced connection neither spins nor sleeps past its
+own release. Packet construction and scheduling stay separable — the same seam
+a batching or GSO send path would need later.
+
+### Timer resolution
+
+Pacing intervals are routinely **sub-millisecond**. A 480 kB window over a
+10 ms RTT is one datagram every ~20 µs, which is an ordinary datacentre or
+loopback figure and exactly the case #256 exists for.
+
+That rules out `poll(2)` as the listener's only wait: its timeout is an integer
+number of milliseconds, so every one of those releases would round up to 1 ms.
+Against a ten-datagram burst ceiling that would cap the listener near 12 MB/s
+no matter how much window and RTT allowed — a 50× loss on the path above. The
+listener therefore waits with a nanosecond-resolution primitive where the
+platform has one:
+
+| Platform | Wait primitive |
+|---|---|
+| Linux | `ppoll` |
+| macOS, FreeBSD, NetBSD, OpenBSD, DragonFly | `kqueue` timeout |
+| Anything else | `poll`, rounded up to the next millisecond |
+
+The fallback is safe, not broken: a platform that lands there sends at a
+coarser cadence, never an incorrect one — the pacer still decides *whether* a
+datagram may leave. The same reasoning is why the pacing release is not floored
+at the recovery timer granularity (1 ms): that constant is loss-detection
+resolution, and imposing it on the pacer would reintroduce the cap the
+fine-grained wait exists to remove.
+
+There is no operator knob. Pacing follows congestion control, and a rate an
+operator could raise independently of the window would be a way to defeat
+congestion control rather than to tune it. A path whose measured capacity
+grows paces faster on its own.
+
 ## Reload
 
 Advertisement-only knobs can hot reload:
