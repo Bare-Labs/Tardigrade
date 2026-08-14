@@ -261,27 +261,27 @@ destinations (qlog directory, keylog path) are supplied by the composition root
 that owns the writers, not by the transport config, keeping file I/O out of the
 transport core.
 
-## Metrics (Prometheus) — planned surface
+## Metrics (Prometheus)
 
 qlog answers "what happened on this one connection"; Prometheus answers "what is
 happening across all connections". The existing per-module `Metrics` counters
 are the source. The gateway `/status/metrics` endpoint (see
-`docs/OBSERVABILITY.md`) will export, when the pure-Zig backend is active:
+`docs/OBSERVABILITY.md`) exports, when the pure-Zig backend is active:
 
 - `tardigrade_quic_connections_active` (gauge)
-- `tardigrade_quic_handshake_failures_total{stage}`
+- `tardigrade_quic_handshake_failures_total{stage}` (`initial|handshake`)
 - `tardigrade_quic_retry_total`, `tardigrade_quic_amplification_blocked_total`
 - `tardigrade_quic_pto_total`, `tardigrade_quic_packets_lost_total`
 - `tardigrade_quic_bytes_sent_total`, `tardigrade_quic_bytes_received_total`
 - `tardigrade_quic_stream_resets_total`
-- `tardigrade_quic_flow_control_blocked_total`
+- `tardigrade_quic_flow_control_blocked_total{scope}` (`connection|stream`)
 - `tardigrade_quic_deprotection_failures_total`
 - `tardigrade_h3_qpack_blocked_streams` (gauge)
 - `tardigrade_h3_requests_total` and an h3 latency histogram
 
 Labels are kept low-cardinality (e.g. `stage`, not per-client) per the issue's
-non-goals. Wiring these into the gateway registry is follow-up work; the
-counters they read from already exist.
+non-goals. QUIC byte counters are accounted at the UDP datagram payload
+boundary so coalesced packets are not double-counted.
 
 Production caveat: the current native H3 connection path still uses the static
 decoder and does not compose `DynamicDecoder.decodeOrBlock()` into request

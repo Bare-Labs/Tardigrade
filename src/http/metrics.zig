@@ -105,7 +105,7 @@ pub const QuicZeroRttPacketOutcome = enum {
     malformed,
 };
 
-pub const QuicHandshakeFailureStage = enum { initial, handshake, application };
+pub const QuicHandshakeFailureStage = enum { initial, handshake };
 pub const QuicFlowControlScope = enum { connection, stream };
 
 pub const QuicTransportDelta = struct {
@@ -137,7 +137,7 @@ const h3_early_data_compat_decision_count = 4;
 const early_data_replay_outcome_count = 6;
 const quic_early_data_decision_count = 10;
 const quic_zero_rtt_packet_outcome_count = 5;
-const quic_handshake_failure_stage_count = 3;
+const quic_handshake_failure_stage_count = 2;
 const quic_flow_control_scope_count = 2;
 
 /// Maximum number of listener shards tracked in per-shard metric arrays.
@@ -1920,7 +1920,7 @@ pub const Metrics = struct {
             \\# TYPE tardigrade_quic_handshake_failures_total counter
             \\
         );
-        inline for (.{ QuicHandshakeFailureStage.initial, QuicHandshakeFailureStage.handshake, QuicHandshakeFailureStage.application }) |stage| {
+        inline for (.{ QuicHandshakeFailureStage.initial, QuicHandshakeFailureStage.handshake }) |stage| {
             try out.print("tardigrade_quic_handshake_failures_total{{stage=\"{s}\"}} {d}\n", .{
                 quicHandshakeFailureStageLabel(stage),
                 self.quic_handshake_failures_total[quicHandshakeFailureStageIndex(stage)],
@@ -2317,7 +2317,6 @@ fn quicHandshakeFailureStageIndex(stage: QuicHandshakeFailureStage) usize {
     return switch (stage) {
         .initial => 0,
         .handshake => 1,
-        .application => 2,
     };
 }
 
@@ -2435,7 +2434,6 @@ fn quicHandshakeFailureStageLabel(stage: QuicHandshakeFailureStage) []const u8 {
     return switch (stage) {
         .initial => "initial",
         .handshake => "handshake",
-        .application => "application",
     };
 }
 
@@ -3068,7 +3066,7 @@ test "QUIC and H3 transport metrics expose bounded labels and consistent latency
 
     m.setQuicConnectionsActive(2);
     m.recordQuicHandshakeFailure(.initial);
-    m.recordQuicHandshakeFailure(.application);
+    m.recordQuicHandshakeFailure(.handshake);
     m.recordQuicTransportDelta(.{
         .retry = 1,
         .amplification_blocked = 2,
@@ -3089,8 +3087,7 @@ test "QUIC and H3 transport metrics expose bounded labels and consistent latency
 
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_connections_active 2") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_handshake_failures_total{stage=\"initial\"} 1") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_handshake_failures_total{stage=\"handshake\"} 0") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_handshake_failures_total{stage=\"application\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_handshake_failures_total{stage=\"handshake\"} 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_retry_total 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_amplification_blocked_total 2") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_pto_total 3") != null);
