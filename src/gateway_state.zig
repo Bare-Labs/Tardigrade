@@ -1488,6 +1488,30 @@ pub const GatewayState = struct {
         self.metrics.recordQuicZeroRttPacket(outcome);
     }
 
+    pub fn metricsRecordQuicTransportDelta(self: *GatewayState, delta: http.metrics.QuicTransportDelta) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordQuicTransportDelta(delta);
+    }
+
+    pub fn metricsSetQuicConnectionsActive(self: *GatewayState, active: usize) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.setQuicConnectionsActive(active);
+    }
+
+    pub fn metricsRecordQuicHandshakeFailure(self: *GatewayState, stage: http.metrics.QuicHandshakeFailureStage) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordQuicHandshakeFailure(stage);
+    }
+
+    pub fn metricsRecordH3RequestLatency(self: *GatewayState, latency_ms: u64) void {
+        self.metrics_mutex.lock();
+        defer self.metrics_mutex.unlock();
+        self.metrics.recordH3RequestLatency(latency_ms);
+    }
+
     pub fn metricsRecordReloadAttempt(self: *GatewayState) void {
         self.metrics_mutex.lock();
         defer self.metrics_mutex.unlock();

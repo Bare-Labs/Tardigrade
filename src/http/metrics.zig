@@ -105,6 +105,22 @@ pub const QuicZeroRttPacketOutcome = enum {
     malformed,
 };
 
+pub const QuicHandshakeFailureStage = enum { initial, handshake, application };
+pub const QuicFlowControlScope = enum { connection, stream };
+
+pub const QuicTransportDelta = struct {
+    retry: u64 = 0,
+    amplification_blocked: u64 = 0,
+    pto: u64 = 0,
+    packets_lost: u64 = 0,
+    bytes_sent: u64 = 0,
+    bytes_received: u64 = 0,
+    stream_resets: u64 = 0,
+    connection_flow_blocked: u64 = 0,
+    stream_flow_blocked: u64 = 0,
+    deprotection_failures: u64 = 0,
+};
+
 const resumption_transport_count = 2;
 const resumption_outcome_count = 5;
 const resumption_mode_count = 3;
@@ -121,6 +137,8 @@ const h3_early_data_compat_decision_count = 4;
 const early_data_replay_outcome_count = 6;
 const quic_early_data_decision_count = 10;
 const quic_zero_rtt_packet_outcome_count = 5;
+const quic_handshake_failure_stage_count = 3;
+const quic_flow_control_scope_count = 2;
 
 /// Maximum number of listener shards tracked in per-shard metric arrays.
 /// Shard IDs >= this value are clamped to the last bucket.
@@ -294,6 +312,32 @@ pub const Metrics = struct {
     /// #523: per-packet 0-RTT authentication/admission outcomes. See
     /// `QuicZeroRttPacketOutcome`.
     quic_zero_rtt_packet_total: [quic_zero_rtt_packet_outcome_count]u64,
+    /// #255 Slice 5: low-cardinality QUIC transport counters, folded from
+    /// per-connection cumulative transport/path/stream/TLS snapshots.
+    quic_connections_active: u64,
+    quic_handshake_failures_total: [quic_handshake_failure_stage_count]u64,
+    quic_retry_total: u64,
+    quic_amplification_blocked_total: u64,
+    quic_pto_total: u64,
+    quic_packets_lost_total: u64,
+    quic_bytes_sent_total: u64,
+    quic_bytes_received_total: u64,
+    quic_stream_resets_total: u64,
+    quic_flow_control_blocked_total: [quic_flow_control_scope_count]u64,
+    quic_deprotection_failures_total: u64,
+    h3_requests_total: u64,
+    h3_request_latency_le_1ms: u64,
+    h3_request_latency_le_5ms: u64,
+    h3_request_latency_le_10ms: u64,
+    h3_request_latency_le_25ms: u64,
+    h3_request_latency_le_50ms: u64,
+    h3_request_latency_le_100ms: u64,
+    h3_request_latency_le_250ms: u64,
+    h3_request_latency_le_500ms: u64,
+    h3_request_latency_le_1000ms: u64,
+    h3_request_latency_gt_1000ms: u64,
+    h3_request_latency_count: u64,
+    h3_request_latency_sum_ms: u64,
     /// #255 Slice 3: process-wide QPACK dynamic decoder observability. These
     /// remain zero until the live H3 path composes the dynamic decoder.
     h3_qpack_blocked_streams_current: u64,
@@ -440,6 +484,30 @@ pub const Metrics = struct {
             .tls_early_data_replay_total = .{0} ** early_data_replay_outcome_count,
             .quic_early_data_decision_total = .{0} ** quic_early_data_decision_count,
             .quic_zero_rtt_packet_total = .{0} ** quic_zero_rtt_packet_outcome_count,
+            .quic_connections_active = 0,
+            .quic_handshake_failures_total = .{0} ** quic_handshake_failure_stage_count,
+            .quic_retry_total = 0,
+            .quic_amplification_blocked_total = 0,
+            .quic_pto_total = 0,
+            .quic_packets_lost_total = 0,
+            .quic_bytes_sent_total = 0,
+            .quic_bytes_received_total = 0,
+            .quic_stream_resets_total = 0,
+            .quic_flow_control_blocked_total = .{0} ** quic_flow_control_scope_count,
+            .quic_deprotection_failures_total = 0,
+            .h3_requests_total = 0,
+            .h3_request_latency_le_1ms = 0,
+            .h3_request_latency_le_5ms = 0,
+            .h3_request_latency_le_10ms = 0,
+            .h3_request_latency_le_25ms = 0,
+            .h3_request_latency_le_50ms = 0,
+            .h3_request_latency_le_100ms = 0,
+            .h3_request_latency_le_250ms = 0,
+            .h3_request_latency_le_500ms = 0,
+            .h3_request_latency_le_1000ms = 0,
+            .h3_request_latency_gt_1000ms = 0,
+            .h3_request_latency_count = 0,
+            .h3_request_latency_sum_ms = 0,
             .h3_qpack_blocked_streams_current = 0,
             .h3_qpack_blocked_streams_total = 0,
             .h3_qpack_unblocked_streams_total = 0,
@@ -580,6 +648,42 @@ pub const Metrics = struct {
     /// #523: record one 0-RTT packet's authentication/admission outcome.
     pub fn recordQuicZeroRttPacket(self: *Metrics, outcome: QuicZeroRttPacketOutcome) void {
         self.quic_zero_rtt_packet_total[quicZeroRttPacketOutcomeIndex(outcome)] += 1;
+    }
+
+    pub fn setQuicConnectionsActive(self: *Metrics, active: usize) void {
+        self.quic_connections_active = @intCast(active);
+    }
+
+    pub fn recordQuicHandshakeFailure(self: *Metrics, stage: QuicHandshakeFailureStage) void {
+        self.quic_handshake_failures_total[quicHandshakeFailureStageIndex(stage)] += 1;
+    }
+
+    pub fn recordQuicTransportDelta(self: *Metrics, delta: QuicTransportDelta) void {
+        self.quic_retry_total += delta.retry;
+        self.quic_amplification_blocked_total += delta.amplification_blocked;
+        self.quic_pto_total += delta.pto;
+        self.quic_packets_lost_total += delta.packets_lost;
+        self.quic_bytes_sent_total += delta.bytes_sent;
+        self.quic_bytes_received_total += delta.bytes_received;
+        self.quic_stream_resets_total += delta.stream_resets;
+        self.quic_flow_control_blocked_total[quicFlowControlScopeIndex(.connection)] += delta.connection_flow_blocked;
+        self.quic_flow_control_blocked_total[quicFlowControlScopeIndex(.stream)] += delta.stream_flow_blocked;
+        self.quic_deprotection_failures_total += delta.deprotection_failures;
+    }
+
+    pub fn recordH3RequestLatency(self: *Metrics, latency_ms: u64) void {
+        self.h3_requests_total += 1;
+        self.h3_request_latency_count += 1;
+        self.h3_request_latency_sum_ms += latency_ms;
+        if (latency_ms <= 1) self.h3_request_latency_le_1ms += 1;
+        if (latency_ms <= 5) self.h3_request_latency_le_5ms += 1;
+        if (latency_ms <= 10) self.h3_request_latency_le_10ms += 1;
+        if (latency_ms <= 25) self.h3_request_latency_le_25ms += 1;
+        if (latency_ms <= 50) self.h3_request_latency_le_50ms += 1;
+        if (latency_ms <= 100) self.h3_request_latency_le_100ms += 1;
+        if (latency_ms <= 250) self.h3_request_latency_le_250ms += 1;
+        if (latency_ms <= 500) self.h3_request_latency_le_500ms += 1;
+        if (latency_ms <= 1000) self.h3_request_latency_le_1000ms += 1 else self.h3_request_latency_gt_1000ms += 1;
     }
 
     pub const H3QpackSnapshot = struct {
@@ -1155,6 +1259,7 @@ pub const Metrics = struct {
         try self.appendTlsBufferPrometheus(&out);
         try self.appendResponseWritePrometheus(&out);
         try self.appendResumptionPrometheus(&out);
+        try self.appendQuicH3Prometheus(&out);
         try self.appendHttpEarlyDataPrometheus(&out);
         try self.appendEarlyDataReplayPrometheus(&out);
 
@@ -1764,6 +1869,97 @@ pub const Metrics = struct {
         });
     }
 
+    fn appendQuicH3Prometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
+        try out.print(
+            \\# HELP tardigrade_quic_connections_active Active native QUIC connections
+            \\# TYPE tardigrade_quic_connections_active gauge
+            \\tardigrade_quic_connections_active {d}
+            \\# HELP tardigrade_quic_retry_total QUIC Retry packets sent
+            \\# TYPE tardigrade_quic_retry_total counter
+            \\tardigrade_quic_retry_total {d}
+            \\# HELP tardigrade_quic_amplification_blocked_total QUIC sends blocked by anti-amplification limits
+            \\# TYPE tardigrade_quic_amplification_blocked_total counter
+            \\tardigrade_quic_amplification_blocked_total {d}
+            \\# HELP tardigrade_quic_pto_total QUIC probe timeout events
+            \\# TYPE tardigrade_quic_pto_total counter
+            \\tardigrade_quic_pto_total {d}
+            \\# HELP tardigrade_quic_packets_lost_total QUIC packets declared lost
+            \\# TYPE tardigrade_quic_packets_lost_total counter
+            \\tardigrade_quic_packets_lost_total {d}
+            \\# HELP tardigrade_quic_bytes_sent_total QUIC UDP datagram payload bytes sent by this listener
+            \\# TYPE tardigrade_quic_bytes_sent_total counter
+            \\tardigrade_quic_bytes_sent_total {d}
+            \\# HELP tardigrade_quic_bytes_received_total QUIC UDP datagram payload bytes received by this listener
+            \\# TYPE tardigrade_quic_bytes_received_total counter
+            \\tardigrade_quic_bytes_received_total {d}
+            \\# HELP tardigrade_quic_stream_resets_total QUIC stream reset events
+            \\# TYPE tardigrade_quic_stream_resets_total counter
+            \\tardigrade_quic_stream_resets_total {d}
+            \\# HELP tardigrade_quic_deprotection_failures_total QUIC packet deprotection authentication failures
+            \\# TYPE tardigrade_quic_deprotection_failures_total counter
+            \\tardigrade_quic_deprotection_failures_total {d}
+            \\# HELP tardigrade_h3_requests_total HTTP/3 requests completed by the native runtime
+            \\# TYPE tardigrade_h3_requests_total counter
+            \\tardigrade_h3_requests_total {d}
+            \\
+        , .{
+            self.quic_connections_active,
+            self.quic_retry_total,
+            self.quic_amplification_blocked_total,
+            self.quic_pto_total,
+            self.quic_packets_lost_total,
+            self.quic_bytes_sent_total,
+            self.quic_bytes_received_total,
+            self.quic_stream_resets_total,
+            self.quic_deprotection_failures_total,
+            self.h3_requests_total,
+        });
+
+        try out.appendSlice(
+            \\# HELP tardigrade_quic_handshake_failures_total QUIC handshake failures by bounded stage
+            \\# TYPE tardigrade_quic_handshake_failures_total counter
+            \\
+        );
+        inline for (.{ QuicHandshakeFailureStage.initial, QuicHandshakeFailureStage.handshake, QuicHandshakeFailureStage.application }) |stage| {
+            try out.print("tardigrade_quic_handshake_failures_total{{stage=\"{s}\"}} {d}\n", .{
+                quicHandshakeFailureStageLabel(stage),
+                self.quic_handshake_failures_total[quicHandshakeFailureStageIndex(stage)],
+            });
+        }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_quic_flow_control_blocked_total QUIC flow-control blocked events by bounded scope
+            \\# TYPE tardigrade_quic_flow_control_blocked_total counter
+            \\
+        );
+        inline for (.{ QuicFlowControlScope.connection, QuicFlowControlScope.stream }) |scope| {
+            try out.print("tardigrade_quic_flow_control_blocked_total{{scope=\"{s}\"}} {d}\n", .{
+                quicFlowControlScopeLabel(scope),
+                self.quic_flow_control_blocked_total[quicFlowControlScopeIndex(scope)],
+            });
+        }
+
+        try out.appendSlice(
+            \\# HELP tardigrade_h3_request_latency_ms HTTP/3 request latency in milliseconds
+            \\# TYPE tardigrade_h3_request_latency_ms histogram
+        );
+        try appendHistogramBucket(out, "tardigrade_h3_request_latency_ms", "1", self.h3_request_latency_le_1ms);
+        try appendHistogramBucket(out, "tardigrade_h3_request_latency_ms", "5", self.h3_request_latency_le_5ms);
+        try appendHistogramBucket(out, "tardigrade_h3_request_latency_ms", "10", self.h3_request_latency_le_10ms);
+        try appendHistogramBucket(out, "tardigrade_h3_request_latency_ms", "25", self.h3_request_latency_le_25ms);
+        try appendHistogramBucket(out, "tardigrade_h3_request_latency_ms", "50", self.h3_request_latency_le_50ms);
+        try appendHistogramBucket(out, "tardigrade_h3_request_latency_ms", "100", self.h3_request_latency_le_100ms);
+        try appendHistogramBucket(out, "tardigrade_h3_request_latency_ms", "250", self.h3_request_latency_le_250ms);
+        try appendHistogramBucket(out, "tardigrade_h3_request_latency_ms", "500", self.h3_request_latency_le_500ms);
+        try appendHistogramBucket(out, "tardigrade_h3_request_latency_ms", "1000", self.h3_request_latency_le_1000ms);
+        try appendHistogramBucket(out, "tardigrade_h3_request_latency_ms", "+Inf", self.h3_request_latency_count);
+        try out.print(
+            \\tardigrade_h3_request_latency_ms_sum {d}
+            \\tardigrade_h3_request_latency_ms_count {d}
+            \\
+        , .{ self.h3_request_latency_sum_ms, self.h3_request_latency_count });
+    }
+
     /// #368 Slice 3: process-local anti-replay store outcomes. Every label
     /// comes from the fixed, closed `EarlyDataReplayOutcome` enum — never a
     /// ticket fingerprint, ticket identity, client address, request path,
@@ -2117,6 +2313,21 @@ fn quicZeroRttPacketOutcomeIndex(outcome: QuicZeroRttPacketOutcome) usize {
     };
 }
 
+fn quicHandshakeFailureStageIndex(stage: QuicHandshakeFailureStage) usize {
+    return switch (stage) {
+        .initial => 0,
+        .handshake => 1,
+        .application => 2,
+    };
+}
+
+fn quicFlowControlScopeIndex(scope: QuicFlowControlScope) usize {
+    return switch (scope) {
+        .connection => 0,
+        .stream => 1,
+    };
+}
+
 fn ticketKeyReloadOutcomeIndex(outcome: TicketKeyReloadOutcome) usize {
     return switch (outcome) {
         .initial_load_success => 0,
@@ -2218,6 +2429,25 @@ fn quicZeroRttPacketOutcomeLabel(outcome: QuicZeroRttPacketOutcome) []const u8 {
         .duplicate => "duplicate",
         .malformed => "malformed",
     };
+}
+
+fn quicHandshakeFailureStageLabel(stage: QuicHandshakeFailureStage) []const u8 {
+    return switch (stage) {
+        .initial => "initial",
+        .handshake => "handshake",
+        .application => "application",
+    };
+}
+
+fn quicFlowControlScopeLabel(scope: QuicFlowControlScope) []const u8 {
+    return switch (scope) {
+        .connection => "connection",
+        .stream => "stream",
+    };
+}
+
+fn appendHistogramBucket(out: *std.array_list.Managed(u8), name: []const u8, le: []const u8, value: u64) !void {
+    try out.print("{s}_bucket{{le=\"{s}\"}} {d}\n", .{ name, le, value });
 }
 
 fn ticketKeyReloadOutcomeLabel(outcome: TicketKeyReloadOutcome) []const u8 {
@@ -2830,6 +3060,52 @@ test "H3 QPACK metrics expose current blocked gauge and monotonic counters" {
     try std.testing.expectEqual(@as(u64, 0), m.h3_qpack_blocked_streams_current);
     try std.testing.expectEqual(@as(u64, 0), m.h3_qpack_table_bytes);
     try std.testing.expectEqual(@as(u64, 4), m.h3_qpack_blocked_streams_total);
+}
+
+test "QUIC and H3 transport metrics expose bounded labels and consistent latency histogram" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+
+    m.setQuicConnectionsActive(2);
+    m.recordQuicHandshakeFailure(.initial);
+    m.recordQuicHandshakeFailure(.application);
+    m.recordQuicTransportDelta(.{
+        .retry = 1,
+        .amplification_blocked = 2,
+        .pto = 3,
+        .packets_lost = 4,
+        .bytes_sent = 1200,
+        .bytes_received = 2400,
+        .stream_resets = 5,
+        .connection_flow_blocked = 6,
+        .stream_flow_blocked = 7,
+        .deprotection_failures = 8,
+    });
+    m.recordH3RequestLatency(4);
+    m.recordH3RequestLatency(1200);
+
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_connections_active 2") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_handshake_failures_total{stage=\"initial\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_handshake_failures_total{stage=\"handshake\"} 0") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_handshake_failures_total{stage=\"application\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_retry_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_amplification_blocked_total 2") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_pto_total 3") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_packets_lost_total 4") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_bytes_sent_total 1200") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_bytes_received_total 2400") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_stream_resets_total 5") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_flow_control_blocked_total{scope=\"connection\"} 6") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_flow_control_blocked_total{scope=\"stream\"} 7") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_deprotection_failures_total 8") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_requests_total 2") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_request_latency_ms_bucket{le=\"5\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_request_latency_ms_bucket{le=\"+Inf\"} 2") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_request_latency_ms_sum 1204") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_request_latency_ms_count 2") != null);
 }
 
 test "listener sharding metrics record per-shard accepts and errors and emit Prometheus series (#137)" {

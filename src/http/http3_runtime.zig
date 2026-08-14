@@ -130,6 +130,14 @@ pub const Config = struct {
     /// (`quic.connection.Event.zero_rtt_packet`), bridged the same way.
     quic_zero_rtt_packet_metrics_ctx: ?*anyopaque = null,
     quic_zero_rtt_packet_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicZeroRttPacketOutcome) void = null,
+    quic_transport_metrics_ctx: ?*anyopaque = null,
+    quic_transport_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicTransportDelta) void = null,
+    quic_connections_active_metrics_ctx: ?*anyopaque = null,
+    quic_connections_active_metrics_cb: ?*const fn (*anyopaque, usize) void = null,
+    quic_handshake_failure_metrics_ctx: ?*anyopaque = null,
+    quic_handshake_failure_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicHandshakeFailureStage) void = null,
+    h3_request_latency_metrics_ctx: ?*anyopaque = null,
+    h3_request_latency_metrics_cb: ?*const fn (*anyopaque, u64) void = null,
     /// Optional H3 qlog sink. Defaults to no-op; concrete file ownership stays
     /// in the composition root and sink errors must not affect protocol state.
     h3_qlog_sink: http3.qlog.Sink = .{},
@@ -269,6 +277,7 @@ const ConnEntry = struct {
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
     drain_goaway_sent: bool = false,
+    handshake_failure_recorded: bool = false,
     highest_admitted_request_stream_id: ?u64 = null,
     drain_goaway_boundary: ?u64 = null,
     last_path_metrics: quic.path.Metrics = .{},
@@ -276,6 +285,8 @@ const ConnEntry = struct {
     /// listener snapshot accumulates deltas rather than re-adding totals
     /// (#256-E). Same pattern as `last_path_metrics`.
     last_transport_metrics: quic.connection.Metrics = .{},
+    last_stream_metrics: quic.stream.Metrics = .{},
+    last_tls_metrics: quic.tls_adapter.Metrics = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
@@ -339,6 +350,14 @@ pub const Runtime = struct {
     quic_early_data_decision_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicEarlyDataDecision) void = null,
     quic_zero_rtt_packet_metrics_ctx: ?*anyopaque = null,
     quic_zero_rtt_packet_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicZeroRttPacketOutcome) void = null,
+    quic_transport_metrics_ctx: ?*anyopaque = null,
+    quic_transport_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicTransportDelta) void = null,
+    quic_connections_active_metrics_ctx: ?*anyopaque = null,
+    quic_connections_active_metrics_cb: ?*const fn (*anyopaque, usize) void = null,
+    quic_handshake_failure_metrics_ctx: ?*anyopaque = null,
+    quic_handshake_failure_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicHandshakeFailureStage) void = null,
+    h3_request_latency_metrics_ctx: ?*anyopaque = null,
+    h3_request_latency_metrics_cb: ?*const fn (*anyopaque, u64) void = null,
     h3_qlog_sink: http3.qlog.Sink = .{},
     quic_qlog_sink: quic.qlog.Sink = .{},
     h3_qlog_sink_factory_ctx: ?*anyopaque = null,
@@ -446,6 +465,14 @@ pub const Runtime = struct {
             .quic_early_data_decision_metrics_cb = cfg.quic_early_data_decision_metrics_cb,
             .quic_zero_rtt_packet_metrics_ctx = cfg.quic_zero_rtt_packet_metrics_ctx,
             .quic_zero_rtt_packet_metrics_cb = cfg.quic_zero_rtt_packet_metrics_cb,
+            .quic_transport_metrics_ctx = cfg.quic_transport_metrics_ctx,
+            .quic_transport_metrics_cb = cfg.quic_transport_metrics_cb,
+            .quic_connections_active_metrics_ctx = cfg.quic_connections_active_metrics_ctx,
+            .quic_connections_active_metrics_cb = cfg.quic_connections_active_metrics_cb,
+            .quic_handshake_failure_metrics_ctx = cfg.quic_handshake_failure_metrics_ctx,
+            .quic_handshake_failure_metrics_cb = cfg.quic_handshake_failure_metrics_cb,
+            .h3_request_latency_metrics_ctx = cfg.h3_request_latency_metrics_ctx,
+            .h3_request_latency_metrics_cb = cfg.h3_request_latency_metrics_cb,
             .h3_qlog_sink = cfg.h3_qlog_sink,
             .quic_qlog_sink = cfg.quic_qlog_sink,
             .h3_qlog_sink_factory_ctx = cfg.h3_qlog_sink_factory_ctx,
@@ -890,6 +917,7 @@ pub const Runtime = struct {
             return null;
         };
         self.noteConnectionAccepted();
+        self.recordQuicConnectionsActive(connections.count());
         if (retry_context != null) self.noteRetryTokenAccepted();
         return handle;
     }
@@ -971,12 +999,18 @@ pub const Runtime = struct {
         handle: u64,
     ) void {
         if (connections.fetchRemove(handle)) |kv| {
+            self.foldPathMetrics(kv.value);
+            if (!kv.value.conn.isEstablished() and !kv.value.handshake_failure_recorded) {
+                kv.value.handshake_failure_recorded = true;
+                self.recordQuicHandshakeFailure(if (kv.value.conn.handshake_error == null) .initial else .handshake);
+            }
             for (kv.value.owned_cids[0..kv.value.owned_cid_count]) |cid| routes.remove(cid);
             self.noteCidRouteCount(routes.count());
             decPerIp(per_ip, kv.value.admission_source_ip);
             kv.value.deinit(self.allocator);
             self.allocator.destroy(kv.value);
             self.noteConnectionClosed();
+            self.recordQuicConnectionsActive(connections.count());
         }
     }
 
@@ -1110,7 +1144,6 @@ pub const Runtime = struct {
     }
 
     fn serveRequest(self: *Runtime, entry: *ConnEntry, incoming: H3.IncomingRequest, now: u64) void {
-        _ = now;
         entry.highest_admitted_request_stream_id = maxOptional(entry.highest_admitted_request_stream_id, incoming.stream_id);
         entry.conn.setStreamSchedulingHint(incoming.stream_id, .{
             .urgency = incoming.priority.urgency,
@@ -1119,12 +1152,14 @@ pub const Runtime = struct {
         const allocator = self.allocator;
         const handler = self.request_handler orelse {
             entry.h3.sendResponse(entry.conn, incoming.stream_id, 404, &.{}, "") catch {};
+            self.noteRequestCompletedWithLatency(now, nowUs());
             return;
         };
 
         var request = buildStreamRequest(allocator, incoming.exchange) catch {
             entry.h3.sendResponse(entry.conn, incoming.stream_id, 500, &.{}, "") catch {};
             entry.h3.finishRequest(incoming.stream_id);
+            self.noteRequestCompletedWithLatency(now, nowUs());
             return;
         };
         defer request.deinit();
@@ -1152,7 +1187,7 @@ pub const Runtime = struct {
             return;
         };
 
-        self.sendHandlerResponse(entry, incoming.stream_id, &response);
+        self.sendHandlerResponse(entry, incoming.stream_id, &response, now);
     }
 
     fn resumeParkedH3Retries(self: *Runtime, entry: *ConnEntry) void {
@@ -1173,14 +1208,14 @@ pub const Runtime = struct {
             defer response.deinit();
             parked.continuation.run(self.allocator, &response) catch |err| {
                 self.logger.warn(null, "http3: parked request retry failed: {s}", .{@errorName(err)});
-                self.sendInternalErrorResponse(entry, parked.stream_id);
+                self.sendInternalErrorResponse(entry, parked.stream_id, nowUs());
                 continue;
             };
-            self.sendHandlerResponse(entry, parked.stream_id, &response);
+            self.sendHandlerResponse(entry, parked.stream_id, &response, nowUs());
         }
     }
 
-    fn sendHandlerResponse(self: *Runtime, entry: anytype, stream_id: u64, response: *const response_mod.Response) void {
+    fn sendHandlerResponse(self: *Runtime, entry: anytype, stream_id: u64, response: *const response_mod.Response, started_us: u64) void {
         var headers_buf: [64]stream_transport.Header = undefined;
         var header_count: usize = 0;
         for (response.headers.iterator()) |header| {
@@ -1200,17 +1235,17 @@ pub const Runtime = struct {
             entry.h3.finishRequest(stream_id);
             return;
         };
-        self.noteRequestCompleted();
+        self.noteRequestCompletedWithLatency(started_us, nowUs());
     }
 
-    fn sendInternalErrorResponse(self: *Runtime, entry: anytype, stream_id: u64) void {
+    fn sendInternalErrorResponse(self: *Runtime, entry: anytype, stream_id: u64, started_us: u64) void {
         entry.h3.sendResponse(entry.conn, stream_id, 500, &.{}, "") catch |err| {
             self.logger.warn(null, "http3: fallback response send failed: {s}", .{@errorName(err)});
             entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
             entry.h3.finishRequest(stream_id);
             return;
         };
-        self.noteRequestCompleted();
+        self.noteRequestCompletedWithLatency(started_us, nowUs());
     }
 
     /// Send one transport-produced datagram, carrying the ECN codepoint the
@@ -1432,6 +1467,30 @@ pub const Runtime = struct {
         const cb = self.quic_zero_rtt_packet_metrics_cb orelse return;
         const cb_ctx = self.quic_zero_rtt_packet_metrics_ctx orelse return;
         cb(cb_ctx, outcome);
+    }
+
+    fn recordQuicTransportDelta(self: *Runtime, delta: metrics_mod.QuicTransportDelta) void {
+        const cb = self.quic_transport_metrics_cb orelse return;
+        const cb_ctx = self.quic_transport_metrics_ctx orelse return;
+        cb(cb_ctx, delta);
+    }
+
+    fn recordQuicConnectionsActive(self: *Runtime, active: usize) void {
+        const cb = self.quic_connections_active_metrics_cb orelse return;
+        const cb_ctx = self.quic_connections_active_metrics_ctx orelse return;
+        cb(cb_ctx, active);
+    }
+
+    fn recordQuicHandshakeFailure(self: *Runtime, stage: metrics_mod.QuicHandshakeFailureStage) void {
+        const cb = self.quic_handshake_failure_metrics_cb orelse return;
+        const cb_ctx = self.quic_handshake_failure_metrics_ctx orelse return;
+        cb(cb_ctx, stage);
+    }
+
+    fn recordH3RequestCompleted(self: *Runtime, latency_ms: u64) void {
+        const cb = self.h3_request_latency_metrics_cb orelse return;
+        const cb_ctx = self.h3_request_latency_metrics_ctx orelse return;
+        cb(cb_ctx, latency_ms);
     }
 
     fn h3ConnectionEvent(ctx: ?*anyopaque, event: http3.conn.Event) void {
@@ -1830,10 +1889,11 @@ pub const Runtime = struct {
         self.snapshot_state.handshakes_completed += 1;
     }
 
-    fn noteRequestCompleted(self: *Runtime) void {
+    fn noteRequestCompletedWithLatency(self: *Runtime, started_us: u64, finished_us: u64) void {
         self.snapshot_mutex.lock();
         defer self.snapshot_mutex.unlock();
         self.snapshot_state.requests_completed += 1;
+        self.recordH3RequestCompleted((finished_us -| started_us) / std.time.us_per_ms);
     }
 
     fn foldPathMetrics(self: *Runtime, entry: *ConnEntry) void {
@@ -1865,12 +1925,30 @@ pub const Runtime = struct {
         self.snapshot_state.ecn_paths_validated += @intCast(transport.ecn_validated -| last.ecn_validated);
         self.snapshot_state.ecn_paths_disabled += @intCast(transport.ecn_disabled -| last.ecn_disabled);
         self.snapshot_state.ecn_ce_received += @intCast(transport.ecn_ce_received -| last.ecn_ce_received);
+
+        const stream_metrics = if (entry.conn.streams) |streams| streams.metrics else quic.stream.Metrics{};
+        const last_stream = entry.last_stream_metrics;
+        entry.last_stream_metrics = stream_metrics;
+        const tls_metrics = entry.conn.adapter.metrics;
+        const last_tls = entry.last_tls_metrics;
+        entry.last_tls_metrics = tls_metrics;
+        self.recordQuicTransportDelta(.{
+            .amplification_blocked = current.amplification_blocked_sends -| previous.amplification_blocked_sends,
+            .pto = transport.pto_count_total -| last.pto_count_total,
+            .packets_lost = transport.packets_lost -| last.packets_lost,
+            .stream_resets = stream_metrics.reset_streams -| last_stream.reset_streams,
+            .connection_flow_blocked = stream_metrics.data_blocked_events -| last_stream.data_blocked_events,
+            .stream_flow_blocked = (stream_metrics.stream_data_blocked_events -| last_stream.stream_data_blocked_events) +
+                (stream_metrics.streams_blocked_events -| last_stream.streams_blocked_events),
+            .deprotection_failures = tls_metrics.deprotection_failures -| last_tls.deprotection_failures,
+        });
     }
 
     fn noteRetryPacketSent(self: *Runtime) void {
         self.snapshot_mutex.lock();
         defer self.snapshot_mutex.unlock();
         self.snapshot_state.retry_packets_sent += 1;
+        self.recordQuicTransportDelta(.{ .retry = 1 });
     }
 
     fn noteRetryTokenAccepted(self: *Runtime) void {
@@ -1890,6 +1968,7 @@ pub const Runtime = struct {
         defer self.snapshot_mutex.unlock();
         self.snapshot_state.datagrams_seen += 1;
         self.snapshot_state.bytes_seen += len;
+        self.recordQuicTransportDelta(.{ .bytes_received = @intCast(len) });
     }
 
     fn noteZeroRtt(self: *Runtime) void {
@@ -1903,6 +1982,7 @@ pub const Runtime = struct {
         defer self.snapshot_mutex.unlock();
         self.snapshot_state.packets_emitted += 1;
         self.snapshot_state.bytes_emitted += len;
+        self.recordQuicTransportDelta(.{ .bytes_sent = @intCast(len) });
     }
 };
 
