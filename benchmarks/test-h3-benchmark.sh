@@ -410,27 +410,40 @@ echo ""
 echo "==> Test 7: netem-impair.sh always removes the qdisc on exit, including on a failing wrapped command"
 if [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
     STUB_BIN="$(mktemp -d /tmp/tardi-netem-stub-XXXX)"
-    cat > "${STUB_BIN}/tc" <<'EOF2'
+    # netem-impair.sh redirects the add command's stderr to a temp file it
+    # deletes on success, and the cleanup del's output to /dev/null
+    # unconditionally (by design — it only surfaces tc's own output on
+    # failure). A stub that writes to its OWN stderr is therefore invisible
+    # to a test capturing the script's stdout/stderr, even though it really
+    # ran — confirmed by `tc qdisc show dev lo` staying at the untouched
+    # default when a first version of this test relied on captured output
+    # and passed for the wrong reason (real tc, running as CI root, silently
+    # applied and removed a real qdisc instead of the stub ever being
+    # exercised). Logging to an independent file sidesteps the redirects
+    # entirely and proves the stub — not real tc — actually ran.
+    STUB_LOG="$(mktemp /tmp/tardi-netem-stub-log-XXXX)"
+    cat > "${STUB_BIN}/tc" <<EOF2
 #!/usr/bin/env bash
-echo "STUB tc $*" >&2
+echo "\$*" >> "${STUB_LOG}"
 exit 0
 EOF2
     chmod +x "${STUB_BIN}/tc"
     EVIDENCE_OK="$(mktemp /tmp/tardi-netem-evidence-ok-XXXX.json)"
     PATH="${STUB_BIN}:$PATH" "$NETEM_SH" --loss 1 --reorder 25 --delay 20 --interface lo \
         --evidence-file "$EVIDENCE_OK" -- true > /tmp/tardi-netem-ok.log 2>&1 || true
-    check "successful run: qdisc add then del both invoked" "STUB tc qdisc add" "$(cat /tmp/tardi-netem-ok.log)"
-    check "successful run: cleanup del invoked"             "STUB tc qdisc del" "$(cat /tmp/tardi-netem-ok.log)"
+    check "successful run: qdisc add invoked (via the stub, not real tc)" "qdisc add dev lo root netem" "$(cat "$STUB_LOG")"
+    check "successful run: cleanup del invoked (via the stub, not real tc)" "qdisc del dev lo root netem" "$(cat "$STUB_LOG")"
     check "successful run: exact tc command recorded"       '"tc_command": "tc qdisc add dev lo root netem delay 20ms loss 1% reorder 25%"' "$(cat "$EVIDENCE_OK")"
 
+    : > "$STUB_LOG"
     EVIDENCE_FAIL="$(mktemp /tmp/tardi-netem-evidence-fail-XXXX.json)"
     set +e
     PATH="${STUB_BIN}:$PATH" "$NETEM_SH" --loss 5 --evidence-file "$EVIDENCE_FAIL" -- false > /tmp/tardi-netem-fail.log 2>&1
     NETEM_FAIL_STATUS=$?
     set -e
-    check "failing wrapped command: cleanup del still invoked" "STUB tc qdisc del" "$(cat /tmp/tardi-netem-fail.log)"
+    check "failing wrapped command: cleanup del still invoked (via the stub, not real tc)" "qdisc del dev lo root netem" "$(cat "$STUB_LOG")"
     check "failing wrapped command: exit status propagated"    "1" "$NETEM_FAIL_STATUS"
-    rm -rf "$STUB_BIN" "$EVIDENCE_OK" "$EVIDENCE_FAIL" /tmp/tardi-netem-ok.log /tmp/tardi-netem-fail.log
+    rm -rf "$STUB_BIN" "$EVIDENCE_OK" "$EVIDENCE_FAIL" "$STUB_LOG" /tmp/tardi-netem-ok.log /tmp/tardi-netem-fail.log
 else
     echo "  SKIP: netem-impair.sh is Linux-only; this host is $(uname -s 2>/dev/null || echo unknown)."
     echo "  SKIP: verifying only that it refuses cleanly on a non-Linux host instead."
