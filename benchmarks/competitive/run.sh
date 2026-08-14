@@ -284,7 +284,12 @@ verify_h3_listener() {
     local port="$1"
     local url="https://127.0.0.1:${port}/health"
     local raw succeeded failed
-    raw=$(h2load --h3 -n 1 -c 1 --insecure "$url" 2>&1) || true
+    # #256-G review: h2load has no --insecure/verify-skip flag at all
+    # (verified against a real nghttp2 1.69.0 build) — it never validates
+    # TLS certificates in the first place, and passing an option it doesn't
+    # recognize makes it exit immediately, which this loop would otherwise
+    # misreport as "the listener didn't answer."
+    raw=$(h2load --h3 -n 1 -c 1 "$url" 2>&1) || true
     succeeded=$(printf '%s\n' "$raw" | grep -oE '[0-9]+ succeeded' | grep -oE '^[0-9]+' | head -1)
     failed=$(printf '%s\n' "$raw" | grep -oE '[0-9]+ failed' | grep -oE '^[0-9]+' | head -1)
     if [[ "${succeeded:-0}" -lt 1 || "${failed:-1}" -gt 0 ]]; then
@@ -1113,14 +1118,14 @@ write_combined_outputs() {
             echo ""
             echo "Requested vs effective/granted UDP buffer sizes are never the same number — see [docs/HTTP3_ROLLOUT.md](../../../docs/HTTP3_ROLLOUT.md#socket-buffers)."
             echo ""
-            echo "| Scenario | Packets sent | Packets received | Packets lost | PTO | Effective PLPMTU (last/min/max) | PMTU probes | Black holes | ECN enabled | ECN CE received | RCVBUF req/eff/granted (status) | SNDBUF req/eff/granted (status) |"
+            echo "| Scenario | Packets sent | Packets received | Packets lost | PTO | Effective PLPMTU (last / listener-lifetime min-max) | PMTU probes | Black holes | ECN enabled | ECN CE received | RCVBUF req/eff/granted (status) | SNDBUF req/eff/granted (status) |"
             echo "| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | ---: | --- | --- |"
             jq -r '
                 .servers | to_entries[] as $server |
                 $server.value | to_entries[] |
                 select(.value.quic != null) |
                 .value.quic as $q |
-                "| `\(.key)` | \($q.packets_sent) | \($q.packets_received) | \($q.packets_lost) | \($q.pto_total) | \($q.effective_plpmtu.last_bytes)/\($q.effective_plpmtu.min_bytes)/\($q.effective_plpmtu.max_bytes) | \($q.pmtu_probes) | \($q.pmtu_black_holes) | \($q.ecn.enabled) | \($q.ecn.ce_received) | \($q.udp_buffers.recv.requested_bytes)/\($q.udp_buffers.recv.effective_bytes)/\($q.udp_buffers.recv.granted_bytes) (\($q.udp_buffers.recv.status)) | \($q.udp_buffers.send.requested_bytes)/\($q.udp_buffers.send.effective_bytes)/\($q.udp_buffers.send.granted_bytes) (\($q.udp_buffers.send.status)) |"
+                "| `\(.key)` | \($q.packets_sent) | \($q.packets_received) | \($q.packets_lost) | \($q.pto_total) | \($q.effective_plpmtu.last_bytes) / \($q.effective_plpmtu.lifetime_min_bytes)-\($q.effective_plpmtu.lifetime_max_bytes) | \($q.pmtu_probes) | \($q.pmtu_black_holes) | \($q.ecn.enabled) | \($q.ecn.ce_received) | \($q.udp_buffers.recv.requested_bytes)/\($q.udp_buffers.recv.effective_bytes)/\($q.udp_buffers.recv.granted_bytes) (\($q.udp_buffers.recv.status)) | \($q.udp_buffers.send.requested_bytes)/\($q.udp_buffers.send.effective_bytes)/\($q.udp_buffers.send.granted_bytes) (\($q.udp_buffers.send.status)) |"
             ' "$combined_json"
         fi
         if jq -e '.upstream_pool_matrix != null' "$combined_json" >/dev/null; then

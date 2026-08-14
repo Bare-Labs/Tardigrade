@@ -357,8 +357,8 @@ pub const Metrics = struct {
     /// for exactly what these three mean — not a single listener-wide "the
     /// PLPMTU".
     quic_effective_plpmtu_bytes_last: u64,
-    quic_effective_plpmtu_bytes_min: u64,
-    quic_effective_plpmtu_bytes_max: u64,
+    quic_effective_plpmtu_bytes_lifetime_min: u64,
+    quic_effective_plpmtu_bytes_lifetime_max: u64,
     /// 0/1 gauge: whether ECN is actually running on this listener right now.
     quic_ecn_enabled: u64,
     quic_ecn_marked_sent_total: u64,
@@ -555,8 +555,8 @@ pub const Metrics = struct {
             .quic_pmtu_probes_sent_total = 0,
             .quic_pmtu_black_holes_total = 0,
             .quic_effective_plpmtu_bytes_last = 0,
-            .quic_effective_plpmtu_bytes_min = 0,
-            .quic_effective_plpmtu_bytes_max = 0,
+            .quic_effective_plpmtu_bytes_lifetime_min = 0,
+            .quic_effective_plpmtu_bytes_lifetime_max = 0,
             .quic_ecn_enabled = 0,
             .quic_ecn_marked_sent_total = 0,
             .quic_ecn_paths_validated_total = 0,
@@ -2065,12 +2065,12 @@ pub const Metrics = struct {
             \\# HELP tardigrade_quic_effective_plpmtu_bytes_last Active-path PLPMTU of the most recently folded connection. Not a listener-wide aggregate — see http3_runtime.Snapshot doc comment.
             \\# TYPE tardigrade_quic_effective_plpmtu_bytes_last gauge
             \\tardigrade_quic_effective_plpmtu_bytes_last {d}
-            \\# HELP tardigrade_quic_effective_plpmtu_bytes_min Smallest active-path PLPMTU observed since this listener started
-            \\# TYPE tardigrade_quic_effective_plpmtu_bytes_min gauge
-            \\tardigrade_quic_effective_plpmtu_bytes_min {d}
-            \\# HELP tardigrade_quic_effective_plpmtu_bytes_max Largest active-path PLPMTU observed since this listener started
-            \\# TYPE tardigrade_quic_effective_plpmtu_bytes_max gauge
-            \\tardigrade_quic_effective_plpmtu_bytes_max {d}
+            \\# HELP tardigrade_quic_effective_plpmtu_bytes_lifetime_min Smallest active-path PLPMTU observed since this listener started. Never resets and is NOT scoped to any single benchmark scenario or pass — do not read this as evidence of path convergence within one run.
+            \\# TYPE tardigrade_quic_effective_plpmtu_bytes_lifetime_min gauge
+            \\tardigrade_quic_effective_plpmtu_bytes_lifetime_min {d}
+            \\# HELP tardigrade_quic_effective_plpmtu_bytes_lifetime_max Largest active-path PLPMTU observed since this listener started. Never resets and is NOT scoped to any single benchmark scenario or pass.
+            \\# TYPE tardigrade_quic_effective_plpmtu_bytes_lifetime_max gauge
+            \\tardigrade_quic_effective_plpmtu_bytes_lifetime_max {d}
             \\# HELP tardigrade_quic_ecn_enabled Whether ECN is running on this listener (operator requested it and the kernel agreed)
             \\# TYPE tardigrade_quic_ecn_enabled gauge
             \\tardigrade_quic_ecn_enabled {d}
@@ -2093,8 +2093,8 @@ pub const Metrics = struct {
             self.quic_pmtu_probes_sent_total,
             self.quic_pmtu_black_holes_total,
             self.quic_effective_plpmtu_bytes_last,
-            self.quic_effective_plpmtu_bytes_min,
-            self.quic_effective_plpmtu_bytes_max,
+            self.quic_effective_plpmtu_bytes_lifetime_min,
+            self.quic_effective_plpmtu_bytes_lifetime_max,
             self.quic_ecn_enabled,
             self.quic_ecn_marked_sent_total,
             self.quic_ecn_paths_validated_total,
@@ -3289,8 +3289,8 @@ test "#256-G: QUIC packet/PMTU/ECN/UDP-buffer transport state renders with reque
     m.quic_pmtu_probes_sent_total = 3;
     m.quic_pmtu_black_holes_total = 1;
     m.quic_effective_plpmtu_bytes_last = 1452;
-    m.quic_effective_plpmtu_bytes_min = 1200;
-    m.quic_effective_plpmtu_bytes_max = 1452;
+    m.quic_effective_plpmtu_bytes_lifetime_min = 1200;
+    m.quic_effective_plpmtu_bytes_lifetime_max = 1452;
     m.quic_ecn_enabled = 1;
     m.quic_ecn_marked_sent_total = 10;
     m.quic_ecn_paths_validated_total = 2;
@@ -3315,8 +3315,8 @@ test "#256-G: QUIC packet/PMTU/ECN/UDP-buffer transport state renders with reque
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_pmtu_probes_total 3") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_pmtu_black_holes_total 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_effective_plpmtu_bytes_last 1452") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_effective_plpmtu_bytes_min 1200") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_effective_plpmtu_bytes_max 1452") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_effective_plpmtu_bytes_lifetime_min 1200") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_effective_plpmtu_bytes_lifetime_max 1452") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_enabled 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_marked_sent_total 10") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_paths_validated_total 2") != null);

@@ -192,10 +192,26 @@ listener — TLS + HTTP/3 enabled, a deterministic QUIC port
 is already running. Starting the process is not treated as proof HTTP/3
 works: after the TLS/TCP side answers `/health`, the runner sends one real
 HTTP/3 request through `h2load --h3` and only records H3 results if that
-succeeds. On failure (missing H3-capable `h2load`, or a QUIC listener that
-didn't come up cleanly), every H3 row for that run is written as
-`"supported": false` with the reason, and the listener's `server.log`/
-`error.log` are dumped for diagnosis.
+succeeds.
+
+Client capability and Tardigrade's own H3 health are checked, and reported,
+separately:
+
+- **`h2load` cannot speak HTTP/3 at all** (no QUIC-enabled build on this
+  host) is checked *first*, before Tardigrade's H3 listener is even
+  started. This is a legitimate environment limitation, not a Tardigrade
+  problem — every H3 row for the run is written as `"supported": false`
+  with the reason, and the run continues normally (exit 0).
+- **`h2load` supports HTTP/3, but Tardigrade's listener doesn't come up or
+  doesn't answer a real request** (TLS/TCP side never opens, or the H3
+  readiness request fails) is a product regression, not an environment
+  limitation. It is never written as a soft `"supported": false` row — the
+  listener's `server.log`/`error.log` are dumped for diagnosis and the run
+  fails outright, so a real H3 regression can't hide behind a green run.
+  The same split applies to the opt-in tuned-buffer listener: once the
+  baseline H3 pass has already proven client capability and a working
+  listener, a tuned-listener failure is also a hard failure, not a skipped
+  row.
 
 This runs for the `tardigrade` server whenever it's selected — including
 under `--smoke`, where it's bounded to a single short `static-small-http3`
@@ -225,7 +241,7 @@ Each supported H3 row carries a `quic` sub-object (scraped from
     "pto_total": 0,
     "bytes_sent": 62914560,
     "bytes_received": 1500,
-    "effective_plpmtu": { "last_bytes": 1452, "min_bytes": 1200, "max_bytes": 1452 },
+    "effective_plpmtu": { "last_bytes": 1452, "lifetime_min_bytes": 1200, "lifetime_max_bytes": 1452 },
     "pmtu_probes": 3,
     "pmtu_black_holes": 0,
     "ecn": { "enabled": true, "marked_sent": 50000, "paths_validated": 8, "paths_disabled": 0, "ce_received": 0 },
@@ -236,6 +252,16 @@ Each supported H3 row carries a `quic` sub-object (scraped from
   }
 }
 ```
+
+`effective_plpmtu.lifetime_min_bytes`/`lifetime_max_bytes` are named that way
+deliberately: they never reset and are **not** scoped to any single
+scenario or pass — the same H3 listener is reused across the small/large/
+proxy rows in one run, so `lifetime_min_bytes` reads 1200 forever after the
+first connection's startup fold regardless of what every later path
+converged to. Do not read them as evidence that paths converged (or didn't)
+within one benchmark row; `last_bytes` (the active-path PLPMTU of whichever
+connection most recently folded) is the closer proxy for "what this pass
+saw." See [docs/HTTP3_ROLLOUT.md](../../docs/HTTP3_ROLLOUT.md#path-mtu-discovery).
 
 `requested_bytes`/`effective_bytes`/`granted_bytes` are never inferred from
 each other — `effective_bytes` is the raw `getsockopt` readback,

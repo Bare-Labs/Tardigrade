@@ -103,8 +103,8 @@ tardigrade_quic_bytes_received_total 654321
 tardigrade_quic_pmtu_probes_total 3
 tardigrade_quic_pmtu_black_holes_total 0
 tardigrade_quic_effective_plpmtu_bytes_last 1452
-tardigrade_quic_effective_plpmtu_bytes_min 1200
-tardigrade_quic_effective_plpmtu_bytes_max 1452
+tardigrade_quic_effective_plpmtu_bytes_lifetime_min 1200
+tardigrade_quic_effective_plpmtu_bytes_lifetime_max 1452
 tardigrade_quic_ecn_enabled 1
 tardigrade_quic_ecn_marked_sent_total 10
 tardigrade_quic_ecn_paths_validated_total 2
@@ -156,7 +156,7 @@ snap() {
     jq -cn --argjson sent "$1" --argjson recv "$2" '{
         packets_sent: $sent, packets_received: $recv, packets_lost: 0, pto_total: 0,
         bytes_sent: ($sent * 100), bytes_received: ($recv * 100),
-        effective_plpmtu: {last_bytes: 1200, min_bytes: 1200, max_bytes: 1200},
+        effective_plpmtu: {last_bytes: 1200, lifetime_min_bytes: 1200, lifetime_max_bytes: 1200},
         pmtu_probes: 0, pmtu_black_holes: 0,
         ecn: {enabled: true, marked_sent: 0, paths_validated: 0, paths_disabled: 0, ce_received: 0},
         udp_buffers: {
@@ -358,7 +358,7 @@ cat > "$FAKE_COMBINED" <<'EOF'
         "quic": {
           "packets_sent": 50000, "packets_received": 49998, "packets_lost": 2, "pto_total": 0,
           "bytes_sent": 100, "bytes_received": 100,
-          "effective_plpmtu": {"last_bytes": 1452, "min_bytes": 1200, "max_bytes": 1452},
+          "effective_plpmtu": {"last_bytes": 1452, "lifetime_min_bytes": 1200, "lifetime_max_bytes": 1452},
           "pmtu_probes": 3, "pmtu_black_holes": 0,
           "ecn": {"enabled": true, "marked_sent": 1, "paths_validated": 1, "paths_disabled": 0, "ce_received": 0},
           "udp_buffers": {
@@ -451,6 +451,123 @@ else
     check "non-Linux host: explicit not-executed message, no silent no-op success" \
         "SCENARIO NOT EXECUTED" "$NON_LINUX_OUTPUT"
 fi
+
+echo ""
+echo "==> Test 13: parse_h2load_json_result parses a real h2load 1.69.0 --output-file document (#256-G review)"
+# This fixture is not invented — it is a real --output-file=<path> capture
+# from `h2load --h3 -H "Host: tardigrade.test" --sni=tardigrade.test
+# https://127.0.0.1:<port>/health` against a live local Tardigrade H3
+# listener, run by hand while fixing this review (the version/schema the
+# review flagged as incompatible with the old text-table parser).
+REAL_H2LOAD_JSON='{"version":"v1","metadata":{"generator":"h2load 1.69.0"},"measurements":{"duration":0.004285,"request_per_second":4667.44457,"bytes_per_second":956826,"requests":{"total":20,"started":20,"done":20,"succeeded":15,"failed":3,"errored":1,"timeout":1},"status_codes":{"2xx":15,"3xx":0,"4xx":5,"5xx":0},"traffic":{"total":4100,"headers":3260,"headers_decompressed":2960,"data":420},"performance":{"request":{"min":3.9083e-05,"max":0.000132292,"median":4.3833e-05,"p95":0.000132292,"p99":0.000132292,"mean":5.714995e-05,"sd":2.6971523e-05,"within_sd":80,"samples":[3.9083e-05]},"connect":{"min":0.002875125,"max":0.00343225,"median":0.0031536875,"p95":0.00343225,"p99":0.00343225,"mean":0.0031536875,"sd":0.000393946865,"within_sd":100,"samples":[0.002875125]},"ttfb":{"min":0.003575625,"max":0.003682917,"median":0.003629271,"p95":0.003682917,"p99":0.003682917,"mean":0.003629271,"sd":7.58669008e-05,"within_sd":100,"samples":[0.003575625]},"request_per_second":{"min":2384.07438,"max":2429.12541,"median":2406.5999,"p95":2429.12541,"p99":2429.12541,"mean":2406.5999,"sd":31.8558852,"within_sd":100,"samples":[2384.07438]}}}}'
+REAL_JSON_FILE="$(mktemp /tmp/tardi-h2load-real-json-XXXX.json)"
+printf '%s' "$REAL_H2LOAD_JSON" > "$REAL_JSON_FILE"
+eval "$(source_functions "$RUN_SH" parse_h2load_json_result)"
+(
+    rps=0; p50="null"; p95="null"; p99="null"; p999="null"; errors=0; tput_mbps="null"
+    if parse_h2load_json_result "$REAL_JSON_FILE"; then
+        echo "PARSE_OK rps=$rps p50=$p50 p95=$p95 p99=$p99 p999=$p999 errors=$errors tput_mbps=$tput_mbps"
+    else
+        echo "PARSE_FAILED_UNEXPECTEDLY"
+    fi
+) > /tmp/tardi-h2load-real-parse-result.txt
+REAL_PARSE_OUT="$(cat /tmp/tardi-h2load-real-parse-result.txt)"
+check "real h2load 1.69.0 JSON: parse succeeds" "PARSE_OK" "$REAL_PARSE_OUT"
+check "real h2load 1.69.0 JSON: rps floored from request_per_second" "rps=4667" "$REAL_PARSE_OUT"
+check "real h2load 1.69.0 JSON: p50 converted from median seconds to ms" "p50=0.044" "$REAL_PARSE_OUT"
+check "real h2load 1.69.0 JSON: errors sums failed+errored+timeout (3+1+1=5), not just failed" "errors=5" "$REAL_PARSE_OUT"
+rm -f "$REAL_JSON_FILE" /tmp/tardi-h2load-real-parse-result.txt
+
+echo ""
+echo "==> Test 14: an invalid/missing h2load --output-file is a failed pass, not a fabricated clean zero (#256-G review)"
+(
+    rps=99; p50="1"; p95="1"; p99="1"; p999="1"; errors=0; tput_mbps="1"
+    if parse_h2load_json_result /tmp/tardi-does-not-exist-XYZ.json; then
+        echo "SHOULD_HAVE_FAILED"
+    else
+        echo "CORRECTLY_FAILED rps=$rps errors=$errors p50=$p50"
+    fi
+) > /tmp/tardi-h2load-missing-result.txt
+MISSING_OUT="$(cat /tmp/tardi-h2load-missing-result.txt)"
+check "missing --output-file: reported as a failed pass" "CORRECTLY_FAILED" "$MISSING_OUT"
+check "missing --output-file: rps resets to 0, not a stale prior value" "rps=0" "$MISSING_OUT"
+check "missing --output-file: errors is a non-zero sentinel, not a fabricated clean 0" "errors=1" "$MISSING_OUT"
+rm -f /tmp/tardi-h2load-missing-result.txt
+
+echo ""
+echo "==> Test 15: the H3 load command uses h2load's real --duration timing mode, not a synthesized -n request count (#256-G review)"
+H3_INVOCATION_SRC="$(grep -n 'h2load --h3 --duration' "$RUN_SH" || true)"
+# shellcheck disable=SC2016 # single-quoted on purpose: matching the literal source text "${DURATION}s", not expanding a shell variable
+check "run_h2load_h3 invokes h2load with --duration" '--duration "${DURATION}s"' "$H3_INVOCATION_SRC"
+# shellcheck disable=SC2016 # single-quoted on purpose: matching the literal old source text, not expanding a shell variable
+check_not "run_h2load_h3 no longer synthesizes a request count from CONNECTIONS*DURATION*10" \
+    'h2load --h3 -n $((CONNECTIONS * DURATION * 10))' "$(sed -n '/^run_h2load_h3/,/^}/p' "$RUN_SH")"
+H2_INVOCATION_SRC="$(grep -n 'h2load --duration' "$RUN_SH" || true)"
+# shellcheck disable=SC2016 # single-quoted on purpose: matching the literal source text "${DURATION}s", not expanding a shell variable
+check "run_h2load (HTTP/2) also invokes h2load with --duration" '--duration "${DURATION}s"' "$H2_INVOCATION_SRC"
+
+echo ""
+echo "==> Test 16: a missing single required QUIC series is treated as unobserved, not a fabricated zero/default (#256-G review)"
+PARTIAL_METRICS='tardigrade_quic_packets_sent_total 42
+tardigrade_quic_packets_received_total 41
+tardigrade_quic_pto_total 1
+tardigrade_quic_bytes_sent_total 100
+tardigrade_quic_bytes_received_total 100
+tardigrade_quic_pmtu_probes_total 0
+tardigrade_quic_pmtu_black_holes_total 0
+tardigrade_quic_effective_plpmtu_bytes_last 1200
+tardigrade_quic_effective_plpmtu_bytes_lifetime_min 1200
+tardigrade_quic_effective_plpmtu_bytes_lifetime_max 1200
+tardigrade_quic_ecn_enabled 1
+tardigrade_quic_ecn_marked_sent_total 1
+tardigrade_quic_ecn_paths_validated_total 1
+tardigrade_quic_ecn_paths_disabled_total 0
+tardigrade_quic_ecn_ce_received_total 0
+tardigrade_quic_udp_buffer_requested_bytes{direction="recv"} 0
+tardigrade_quic_udp_buffer_effective_bytes{direction="recv"} 1
+tardigrade_quic_udp_buffer_granted_bytes{direction="recv"} 0
+tardigrade_quic_udp_buffer_status{direction="recv",status="default"} 1
+tardigrade_quic_udp_buffer_requested_bytes{direction="send"} 0
+tardigrade_quic_udp_buffer_effective_bytes{direction="send"} 1
+tardigrade_quic_udp_buffer_granted_bytes{direction="send"} 0
+tardigrade_quic_udp_buffer_status{direction="send",status="default"} 1'
+# packets_lost_total is deliberately omitted above — everything else present.
+PARTIAL_JSON="$(bash -c "
+set -euo pipefail
+SCHEME=https; TARGET_HOST=127.0.0.1; TARGET_PORT=9443; QUIC_METRICS_PATH=/status/metrics; INSECURE=true
+curl() { cat <<'EOF3'
+${PARTIAL_METRICS}
+EOF3
+}
+${QUIC_FNS}
+capture_quic_transport_state
+")"
+check "packets_sent present but packets_lost missing: whole snapshot is null, not zero-filled" "null" "$PARTIAL_JSON"
+
+echo ""
+echo "==> Test 17: multi-run scenario accounting distinguishes attempted runs from runs with data end-to-end (#256-G review)"
+(
+    # shellcheck disable=SC2034 # read by flush_multirun_result, sourced via eval below — shellcheck can't see across that
+    RUNS=2
+    RESULTS_JSON='{}'
+    declare -A _run_quic_list=()
+    declare -A _run_rps_list=()
+    declare -A _run_p99_list=()
+    declare -A _run_errors_list=()
+    eval "$(source_functions "$RUN_SH" _stats_from_space_list attach_quic_transport_state flush_multirun_result)"
+    _run_rps_list[static-http3]='100 110 '
+    _run_p99_list[static-http3]='5 6 '
+    _run_errors_list[static-http3]='0 0 '
+    VALID=$(jq -cn '{packets_sent:100,packets_received:99,packets_lost:1,pto_total:0,bytes_sent:1000,bytes_received:900,effective_plpmtu:{last_bytes:1200,lifetime_min_bytes:1200,lifetime_max_bytes:1200},pmtu_probes:0,pmtu_black_holes:0,ecn:{enabled:true,marked_sent:5,paths_validated:1,paths_disabled:0,ce_received:0},udp_buffers:{recv:{},send:{}}}')
+    attach_quic_transport_state "static-http3" "$VALID"
+    attach_quic_transport_state "static-http3" "null"
+    flush_multirun_result "static-http3"
+    echo "$RESULTS_JSON" > /tmp/tardi-h3-runstotal-test.json
+)
+RUNSTOTAL_JSON="$(jq . /tmp/tardi-h3-runstotal-test.json)"
+check "one valid + one missing scrape: runs_total reflects both attempted runs (2)" '"runs_total": 2' "$RUNSTOTAL_JSON"
+check "one valid + one missing scrape: runs_with_data reflects only the observed one (1)" '"runs_with_data": 1' "$RUNSTOTAL_JSON"
+rm -f /tmp/tardi-h3-runstotal-test.json
 
 echo ""
 echo "==> Test: existing HTTP/1 benchmark behavior does not regress (run.sh --help still documents http1 scenarios)"

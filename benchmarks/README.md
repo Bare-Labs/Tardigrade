@@ -164,15 +164,27 @@ These measure raw request throughput and run with whichever tool is auto-detecte
 HTTP/3 scenarios require `h2load` built with QUIC support (`nghttp3` + `ngtcp2`). The runner
 detects this at runtime by checking whether `h2load --h3` is recognized; if not, the scenario
 prints a skip message and continues. HTTP/3 also requires TLS because QUIC mandates it —
-always pass `--tls` (and `--insecure` for self-signed certs) for HTTP/3 runs.
+always pass `--tls` for HTTP/3 runs. `--insecure` is still accepted and still applies to
+`wrk`/`fortio`/`k6`, but h2load itself has no certificate-verification flag at all (verified
+against a real nghttp2 1.69.0 build) — it never validates TLS certificates in the first
+place, so nothing needs to be skipped for the h2load-driven scenarios (`static-http2`,
+`proxy-http2`, `static-http3`, `proxy-http3`).
 
 When an H3 scenario completes, the runner also scrapes `--metrics-path` (default
 `/status/metrics`, requires Tardigrade metrics enabled) and attaches a `quic` sub-object to
 that scenario's result — packet/loss/PTO counts, effective PLPMTU, ECN state, and
-requested-vs-effective UDP socket buffer sizes (#256-G). It's omitted entirely (not
-null-filled) when the endpoint isn't reachable or exposes no QUIC series, and isn't attached
-at all under `--runs > 1` since averaging point-in-time cumulative counters across repeated
-runs wouldn't mean what it looks like it means. See
+requested-vs-effective UDP socket buffer sizes (#256-G). The scrape itself is bracketed
+immediately before and after the load run and counter fields are delta'd, so the block
+measures only that one pass, not everything the listener has done since it started (a
+listener stays alive across an H3 readiness check and every scenario in a run).
+`quic` is omitted entirely (not null-filled) when the endpoint isn't reachable, exposes no
+QUIC series at all, or is missing any single required series — a partial scrape is treated as
+unobserved, never as a fabricated zero/default. Under `--runs > 1`, each run's scenario-local
+delta is preserved and aggregated once every run completes: counters sum across runs,
+gauges use the last run's state, and the result records `runs_total` (every attempted run,
+including ones where the scrape came back unobservable) alongside `runs_with_data` (how many
+actually had a QUIC delta) — a run whose scrape failed is never silently treated as if it had
+never happened. See
 [competitive/README.md](competitive/README.md#http3quic-benchmarking-256-g) for the canonical
 small/large/proxy H3 rows, the before/after UDP-buffer tuning comparison, controlled
 loss/reordering, and high-bandwidth/dedicated-host runs built on top of this.

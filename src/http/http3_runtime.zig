@@ -366,14 +366,24 @@ pub const Snapshot = struct {
     ///     connection was most recently folded — the right value to read for
     ///     a single-connection benchmark run, but not a listener-wide
     ///     aggregate for production traffic with many concurrent paths.
-    ///   - `plpmtu_min_bytes`/`plpmtu_max_bytes` are the smallest/largest
-    ///     active-path PLPMTU observed across every fold since this listener
-    ///     started, i.e. "did every path converge to the same discovered
-    ///     size, or did some stay smaller." They only widen over the
-    ///     listener's lifetime; they are not a live "current" spread.
+    ///   - `plpmtu_lifetime_min_bytes`/`plpmtu_lifetime_max_bytes` are the
+    ///     smallest/largest active-path PLPMTU observed across every fold
+    ///     since this listener started. They are named `lifetime_*`
+    ///     deliberately (#256-G review): they never reset, so on a listener
+    ///     that has served more than one connection or more than one
+    ///     benchmark scenario, `lifetime_min_bytes` reads 1200 forever after
+    ///     the first connection's startup fold, regardless of what every
+    ///     later path converged to. They describe "has this listener ever
+    ///     seen a path stuck below the maximum" over its whole running
+    ///     time — not a per-scenario, per-benchmark-pass, or even per-
+    ///     connection figure, and not evidence that paths in any particular
+    ///     benchmark run did or did not converge. A benchmark wanting a
+    ///     scenario-scoped PLPMTU spread would need a connection-scoped
+    ///     snapshot this runtime does not currently take; `plpmtu_last_bytes`
+    ///     is the closest available proxy for "what a benchmark pass saw."
     plpmtu_last_bytes: usize = 0,
-    plpmtu_min_bytes: usize = 0,
-    plpmtu_max_bytes: usize = 0,
+    plpmtu_lifetime_min_bytes: usize = 0,
+    plpmtu_lifetime_max_bytes: usize = 0,
 
     pub fn handshakeState(self: Snapshot) []const u8 {
         if (!self.server_bootstrapped) return "bootstrap_incomplete";
@@ -2165,11 +2175,11 @@ pub const Runtime = struct {
 
         const active_plpmtu = entry.conn.paths.activePlpmtu().sendSize();
         self.snapshot_state.plpmtu_last_bytes = active_plpmtu;
-        if (self.snapshot_state.plpmtu_min_bytes == 0 or active_plpmtu < self.snapshot_state.plpmtu_min_bytes) {
-            self.snapshot_state.plpmtu_min_bytes = active_plpmtu;
+        if (self.snapshot_state.plpmtu_lifetime_min_bytes == 0 or active_plpmtu < self.snapshot_state.plpmtu_lifetime_min_bytes) {
+            self.snapshot_state.plpmtu_lifetime_min_bytes = active_plpmtu;
         }
-        if (active_plpmtu > self.snapshot_state.plpmtu_max_bytes) {
-            self.snapshot_state.plpmtu_max_bytes = active_plpmtu;
+        if (active_plpmtu > self.snapshot_state.plpmtu_lifetime_max_bytes) {
+            self.snapshot_state.plpmtu_lifetime_max_bytes = active_plpmtu;
         }
 
         const stream_metrics = if (entry.conn.streams) |streams| streams.metrics else quic.stream.Metrics{};
@@ -3486,8 +3496,8 @@ test "#256-G: foldPathMetrics folds packet counts and PMTU probe/black-hole coun
     // The active path starts at the DPLPMTUD base size — never zero, and
     // last/min/max agree on it since only one path has folded so far.
     try testing.expect(snap.plpmtu_last_bytes > 0);
-    try testing.expectEqual(snap.plpmtu_last_bytes, snap.plpmtu_min_bytes);
-    try testing.expectEqual(snap.plpmtu_last_bytes, snap.plpmtu_max_bytes);
+    try testing.expectEqual(snap.plpmtu_last_bytes, snap.plpmtu_lifetime_min_bytes);
+    try testing.expectEqual(snap.plpmtu_last_bytes, snap.plpmtu_lifetime_max_bytes);
 
     // A second fold only adds the *delta* since the last fold, matching every
     // other counter folded here (ECN, retry, etc.) — not the raw connection

@@ -162,11 +162,24 @@ carrying the path, the new effective size, and whether it rose or fell back.
 #256-G added the smallest possible bridge from that per-connection state to a
 benchmark/status-facing snapshot — `tardigrade_quic_pmtu_probes_total`,
 `tardigrade_quic_pmtu_black_holes_total`, and
-`tardigrade_quic_effective_plpmtu_bytes_{last,min,max}` on `/status/metrics` —
-so a benchmark run can explain a throughput number without a debugger. That
-bridge is deliberately bounded (aggregate counts only, no per-connection or
-per-path detail); #255 remains the canonical owner of general QUIC/H3
-observability, and a richer per-connection view belongs there, not here.
+`tardigrade_quic_effective_plpmtu_bytes_last` and
+`tardigrade_quic_effective_plpmtu_bytes_lifetime_{min,max}` on
+`/status/metrics` — so a benchmark run can explain a throughput number
+without a debugger. That bridge is deliberately bounded (aggregate counts
+only, no per-connection or per-path detail); #255 remains the canonical
+owner of general QUIC/H3 observability, and a richer per-connection view
+belongs there, not here.
+
+The `lifetime_min`/`lifetime_max` pair is named deliberately: it never
+resets and is not scoped to any single benchmark scenario or pass — a
+listener that has served more than one connection will show
+`lifetime_min` stuck at the DPLPMTUD base size (1200) forever after the
+first connection's startup fold, regardless of what every later path
+converged to. Read it as "has this listener ever seen a path stuck below
+the maximum over its whole running time," not as evidence that paths in
+any particular benchmark run did or did not converge. `_last` — the
+active-path PLPMTU of whichever connection was most recently folded — is
+the closer (if still imperfect) proxy for "what one benchmark pass saw."
 
 Nothing about this setting relaxes congestion control, flow control, or the
 server's anti-amplification budget:

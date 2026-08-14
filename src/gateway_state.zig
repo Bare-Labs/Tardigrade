@@ -1721,8 +1721,8 @@ pub const GatewayState = struct {
         snapshot.quic_pmtu_probes_sent_total = @intCast(rs.pmtu_probes_sent);
         snapshot.quic_pmtu_black_holes_total = @intCast(rs.pmtu_black_holes);
         snapshot.quic_effective_plpmtu_bytes_last = @intCast(rs.plpmtu_last_bytes);
-        snapshot.quic_effective_plpmtu_bytes_min = @intCast(rs.plpmtu_min_bytes);
-        snapshot.quic_effective_plpmtu_bytes_max = @intCast(rs.plpmtu_max_bytes);
+        snapshot.quic_effective_plpmtu_bytes_lifetime_min = @intCast(rs.plpmtu_lifetime_min_bytes);
+        snapshot.quic_effective_plpmtu_bytes_lifetime_max = @intCast(rs.plpmtu_lifetime_max_bytes);
 
         snapshot.quic_ecn_enabled = if (rs.ecn_enabled) 1 else 0;
         snapshot.quic_ecn_marked_sent_total = @intCast(rs.ecn_marked_sent);
@@ -3889,8 +3889,8 @@ test "#256-G: served Prometheus metrics overlay the attached H3 runtime's transp
         .pmtu_probes_sent = 3,
         .pmtu_black_holes = 1,
         .plpmtu_last_bytes = 1452,
-        .plpmtu_min_bytes = 1200,
-        .plpmtu_max_bytes = 1452,
+        .plpmtu_lifetime_min_bytes = 1200,
+        .plpmtu_lifetime_max_bytes = 1452,
         .ecn_enabled = true,
         .ecn_marked_sent = 10,
         .ecn_paths_validated = 2,
@@ -3908,7 +3908,7 @@ test "#256-G: served Prometheus metrics overlay the attached H3 runtime's transp
 
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_packets_sent_total 42") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_pmtu_probes_total 3") != null);
-    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_effective_plpmtu_bytes_min 1200") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_effective_plpmtu_bytes_lifetime_min 1200") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_enabled 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_paths_disabled_total 1") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_requested_bytes{direction=\"recv\"} 4194304") != null);
