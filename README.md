@@ -7,6 +7,7 @@
 <p align="center">
   <a href="https://github.com/Bare-Systems/Tardigrade/releases">Releases</a> |
   <a href="docs/SUPPORT_MATRIX.md">Support Matrix</a> |
+  <a href="docs/CONFIGURATION.md">Configuration</a> |
   <a href="docs/OBSERVABILITY.md">Observability</a> |
   <a href="SECURITY.md">Security</a> |
   <a href="CONTRIBUTING.md">Contributing</a>
@@ -213,6 +214,7 @@ operate without guessing which config file or pid file is active.
 | Topic | Location |
 | --- | --- |
 | Core v1 support matrix | [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) |
+| Configuration reference | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | HTTP/3 rollout and lifecycle | [docs/HTTP3_ROLLOUT.md](docs/HTTP3_ROLLOUT.md) |
 | Concurrency & hot-path audit | [docs/CONCURRENCY.md](docs/CONCURRENCY.md) |
 | Event-loop backend evaluation (epoll/kqueue vs libxev/std.Io/io_uring) | [docs/EVENT_LOOP_BACKENDS.md](docs/EVENT_LOOP_BACKENDS.md) |
