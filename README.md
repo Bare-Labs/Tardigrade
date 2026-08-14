@@ -217,6 +217,7 @@ operate without guessing which config file or pid file is active.
 | Concurrency & hot-path audit | [docs/CONCURRENCY.md](docs/CONCURRENCY.md) |
 | Event-loop backend evaluation (epoll/kqueue vs libxev/std.Io/io_uring) | [docs/EVENT_LOOP_BACKENDS.md](docs/EVENT_LOOP_BACKENDS.md) |
 | Observability | [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
+| Reload, drain, and shutdown | [docs/RELOAD_SHUTDOWN.md](docs/RELOAD_SHUTDOWN.md) |
 | Proxy security | [docs/PROXY_SECURITY.md](docs/PROXY_SECURITY.md) |
 | Security test plan | [docs/SECURITY_TEST_PLAN.md](docs/SECURITY_TEST_PLAN.md) |
 | TLS interop & conformance matrix | [docs/TLS_INTEROP_MATRIX.md](docs/TLS_INTEROP_MATRIX.md) |

@@ -844,8 +844,21 @@ pub const CongestionController = struct {
     pub fn onPacketsLost(self: *CongestionController, largest_lost_time_sent_us: u64, lost_bytes: usize, now_us: u64) void {
         if (lost_bytes == 0) return;
         self.bytes_in_flight -|= lost_bytes;
+        self.onCongestionEvent(largest_lost_time_sent_us, now_us);
+    }
+
+    /// RFC 9002 §7.1/§B.5: halve the window and enter recovery, without
+    /// touching the in-flight ledger.
+    ///
+    /// Split out for the ECN-CE case (#256-E), which is congestion evidence
+    /// about a packet that *arrived*: its bytes were already released when it
+    /// was acknowledged, and reclaiming them a second time here would
+    /// under-count what is on the wire. The one-recovery-period-per-event rule
+    /// is shared with loss, so a CE report and a loss for the same round trip
+    /// halve the window once between them rather than twice.
+    pub fn onCongestionEvent(self: *CongestionController, sent_time_us: u64, now_us: u64) void {
         if (self.recovery_start_time_us) |start| {
-            if (largest_lost_time_sent_us <= start) return;
+            if (sent_time_us <= start) return;
         }
         self.recovery_start_time_us = now_us;
         self.congestion_window = @max(self.congestion_window / 2, self.minWindow());

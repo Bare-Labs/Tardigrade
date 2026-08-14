@@ -82,6 +82,14 @@ fn logEvent(_: ?*anyopaque, event: connection.Event) void {
         .path_migration_blocked => |p| std.fmt.bufPrint(&buf, "path blocked change={s} reason={s} remote_port={d}", .{ @tagName(p.change), @tagName(p.reason), p.path.remote.port }),
         .path_promoted => |p| std.fmt.bufPrint(&buf, "path promoted change={s} remote_port={d}", .{ @tagName(p.change), p.path.remote.port }),
         .pmtu_updated => |p| std.fmt.bufPrint(&buf, "pmtu {s} size={d} remote_port={d}", .{ @tagName(p.reason), p.size, p.path.remote.port }),
+        // #256-E: the reason is what makes an interop transcript useful here.
+        // "ECN turned off" is the expected outcome against a lot of real
+        // networks, and which check rejected the peer's feedback is the
+        // difference between a stripped codepoint and a peer that miscounts.
+        .ecn_state_changed => |e| if (e.reason) |reason|
+            std.fmt.bufPrint(&buf, "ecn {s} reason={s} remote_port={d}", .{ @tagName(e.state), @tagName(reason), e.path.remote.port })
+        else
+            std.fmt.bufPrint(&buf, "ecn {s} remote_port={d}", .{ @tagName(e.state), e.path.remote.port }),
         .zero_rtt_packet => |z| std.fmt.bufPrint(&buf, "zero_rtt_packet outcome={s} size={d}", .{ @tagName(z.outcome), z.size }),
         .early_data_decision => |d| std.fmt.bufPrint(&buf, "early_data_decision {s}", .{@tagName(d)}),
     } catch return;

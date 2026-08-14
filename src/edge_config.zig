@@ -281,6 +281,13 @@ pub const EdgeConfig = struct {
     /// (#256-D). `0` — the default — leaves the kernel's own sizing alone.
     http3_udp_recv_buffer_bytes: usize,
     http3_udp_send_buffer_bytes: usize,
+    /// Whether the QUIC listener runs ECN (#256-E). On by default and safe by
+    /// construction — the runtime only turns it on where the kernel can report
+    /// received codepoints, and the transport turns it off per path the moment
+    /// the peer's feedback stops adding up. The escape hatch exists for hosts
+    /// where a middlebox penalises marked traffic outright rather than merely
+    /// clearing the marks, which per-path validation cannot detect.
+    http3_ecn_enabled: bool,
     proxy_protocol_mode: ProxyProtocolMode,
     /// Gateway identity used in signed upstream trust headers.
     trust_gateway_id: []const u8,
@@ -955,6 +962,11 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     // kernel refuses or trims is logged and published, never fatal.
     const http3_udp_recv_buffer_bytes = parseIntEnv(usize, allocator, "TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES", 0);
     const http3_udp_send_buffer_bytes = parseIntEnv(usize, allocator, "TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES", 0);
+    // #256-E: ECN defaults on. Unlike the buffer knobs it costs nothing to
+    // leave enabled — an unsupported platform never marks, and a path that
+    // cannot carry markings turns itself off — so this exists to disable it,
+    // not to enable it.
+    const http3_ecn_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ECN", true);
     const proxy_protocol_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_PROTOCOL", "off") catch unreachable;
     defer allocator.free(proxy_protocol_mode_str);
     const proxy_protocol_mode = try parseProxyProtocolModeConfig(proxy_protocol_mode_str);
@@ -1645,6 +1657,7 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .http3_max_datagram_size = http3_max_datagram_size,
         .http3_udp_recv_buffer_bytes = http3_udp_recv_buffer_bytes,
         .http3_udp_send_buffer_bytes = http3_udp_send_buffer_bytes,
+        .http3_ecn_enabled = http3_ecn_enabled,
         .proxy_protocol_mode = proxy_protocol_mode,
         .trust_gateway_id = trust_gateway_id,
         .trust_shared_secret = trust_shared_secret,

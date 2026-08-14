@@ -105,6 +105,22 @@ pub const Config = struct {
     initial_max_streams_uni: u64 = 16,
     retry_policy: RetryPolicy = .off,
     migration_policy: MigrationPolicy = .disabled,
+    /// Whether outbound packets may be marked ECT(0) and the peer's ACK_ECN
+    /// counters acted on (#256-E, RFC 9000 §13.4).
+    ///
+    /// Off by default for the same reason `max_send_udp_payload_size` starts
+    /// at the floor: this layer owns no socket. Marking a packet means asking
+    /// the kernel to set an IP header field on a specific datagram, and
+    /// reading the peer's marks back means ancillary receive metadata — both
+    /// are platform capabilities only the composition root that created the
+    /// socket can establish. Enabling it without them would mark nothing,
+    /// observe nothing, and then conclude from the resulting silence that the
+    /// *path* strips ECN.
+    ///
+    /// Enabling it is never a correctness risk in the other direction: every
+    /// validation failure ends in ordinary non-ECN operation rather than a
+    /// connection error.
+    ecn_enabled: bool = false,
     /// 0-RTT is off unless an operator explicitly opts in, given its replay
     /// exposure (RFC 9001 §9.2). The TLS adapter refuses 0-RTT keys while false.
     zero_rtt_enabled: bool = false,

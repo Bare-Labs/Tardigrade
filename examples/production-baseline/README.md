@@ -56,7 +56,7 @@ curl -k https://localhost:8443/status/metrics  # → Prometheus text
 - [ ] Set `TARDIGRADE_RATE_LIMIT_RPS` and `TARDIGRADE_RATE_LIMIT_BURST` to match your traffic profile.
 - [ ] Restrict `/status/metrics` with a firewall rule or `TARDIGRADE_METRICS_REQUIRE_AUTH=true`.
 - [ ] Set `TARDIGRADE_PID_FILE` to a path your init system can write to (e.g. `/run/tardigrade/tardigrade.pid`).
-- [ ] Match `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` to `TimeoutStopSec` in your systemd unit.
+- [ ] Set `TimeoutStopSec` slightly above `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` in your systemd unit.
 
 ## Notes
 

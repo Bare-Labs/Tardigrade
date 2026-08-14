@@ -350,7 +350,11 @@ pub fn http3ListenerConfigChanged(
         // bind time. Changing them means a new socket, which is a listener
         // restart like every other knob here.
         current.http3_udp_recv_buffer_bytes != proposed.http3_udp_recv_buffer_bytes or
-        current.http3_udp_send_buffer_bytes != proposed.http3_udp_send_buffer_bytes;
+        current.http3_udp_send_buffer_bytes != proposed.http3_udp_send_buffer_bytes or
+        // #256-E: same reasoning — the ECN receive option is set on the live
+        // fd at bind time, and the transport's marking decision is fixed per
+        // connection at creation.
+        current.http3_ecn_enabled != proposed.http3_ecn_enabled;
 }
 
 pub fn listenerShardConfigChanged(
@@ -418,6 +422,12 @@ test "http3ListenerConfigChanged permits advertisement-only reloads" {
     proposed.http3_udp_recv_buffer_bytes = base.http3_udp_recv_buffer_bytes;
 
     proposed.http3_udp_send_buffer_bytes = base.http3_udp_send_buffer_bytes + 4096;
+    try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
+    proposed.http3_udp_send_buffer_bytes = base.http3_udp_send_buffer_bytes;
+
+    // #256-E: the ECN receive option is socket state too, and every live
+    // connection's marking decision was made when it was created.
+    proposed.http3_ecn_enabled = !base.http3_ecn_enabled;
     try std.testing.expect(http3ListenerConfigChanged(&base, &proposed));
 }
 

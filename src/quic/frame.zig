@@ -391,8 +391,31 @@ pub fn encodeStream(id: stream.StreamId, offset: u64, data: []const u8, fin: boo
 pub const max_stream_overhead = 1 + 8 + 8 + 8;
 
 pub fn encodeAck(model: recovery.AckFrameModel, ack_delay_exponent: u6, buf: []u8) EncodeError!usize {
+    return encodeAckFrame(model, null, ack_delay_exponent, buf);
+}
+
+/// RFC 9000 §19.3.2: the same ACK frame under type 0x03, with this endpoint's
+/// received ECN counters appended (#256-E). Required rather than optional once
+/// any marked packet has been received in the space — the peer's ECN validation
+/// is built on these counts, and an ACK that omits them after a marked arrival
+/// is exactly what tells the peer its marks are being stripped.
+pub fn encodeAckEcn(
+    model: recovery.AckFrameModel,
+    counts: Ecn,
+    ack_delay_exponent: u6,
+    buf: []u8,
+) EncodeError!usize {
+    return encodeAckFrame(model, counts, ack_delay_exponent, buf);
+}
+
+fn encodeAckFrame(
+    model: recovery.AckFrameModel,
+    counts: ?Ecn,
+    ack_delay_exponent: u6,
+    buf: []u8,
+) EncodeError!usize {
     var w = FrameWriter{ .buf = buf };
-    try w.int(frame_ack);
+    try w.int(if (counts == null) frame_ack else frame_ack_ecn);
     try w.int(model.largest_acknowledged);
     try w.int(model.ack_delay_us >> ack_delay_exponent);
     try w.int(model.range_count);
@@ -400,6 +423,11 @@ pub fn encodeAck(model: recovery.AckFrameModel, ack_delay_exponent: u6, buf: []u
     for (model.ranges[0..model.range_count]) |range| {
         try w.int(range.gap);
         try w.int(range.length);
+    }
+    if (counts) |ecn| {
+        try w.int(ecn.ect0);
+        try w.int(ecn.ect1);
+        try w.int(ecn.ce);
     }
     return w.pos;
 }
@@ -575,6 +603,33 @@ test "ACK frame with ECN counts parses" {
     try testing.expectEqual(@as(u64, 1), decoded.frame.ack.ecn.?.ect0);
     try testing.expectEqual(@as(u64, 3), decoded.frame.ack.ecn.?.ce);
     try testing.expectEqual(bytes.len, decoded.len);
+}
+
+test "ACK_ECN roundtrips the received counters alongside the ranges (#256-E)" {
+    var set = recovery.AckRangeSet{};
+    try set.insertRange(.{ .first = 1, .last = 2 });
+    try set.insertRange(.{ .first = 5, .last = 9 });
+    const model = set.toAckFrame(1_000).?;
+
+    var buf: [64]u8 = undefined;
+    const len = try encodeAckEcn(model, .{ .ect0 = 17, .ect1 = 0, .ce = 4 }, 3, &buf);
+    // The ECN counters ride on top of an otherwise identical frame, so the
+    // type byte is the only structural difference from a plain ACK.
+    try testing.expectEqual(@as(u8, frame_ack_ecn), buf[0]);
+    const decoded = try roundtripOne(buf[0..len]);
+    const ack = decoded.ack;
+    try testing.expectEqual(@as(u64, 9), ack.largest_acknowledged);
+    try testing.expect(ack.ranges.contains(1));
+    try testing.expect(ack.ranges.contains(9));
+    try testing.expectEqual(@as(u64, 17), ack.ecn.?.ect0);
+    try testing.expectEqual(@as(u64, 0), ack.ecn.?.ect1);
+    try testing.expectEqual(@as(u64, 4), ack.ecn.?.ce);
+
+    // And a plain ACK still reports no counters at all, rather than zeros —
+    // the peer's validation has to tell "nothing marked arrived" apart from
+    // "this endpoint is not reporting".
+    const plain_len = try encodeAck(model, 3, &buf);
+    try testing.expectEqual(@as(?Ecn, null), (try roundtripOne(buf[0..plain_len])).ack.ecn);
 }
 
 test "malformed ACK ranges fail deterministically" {
