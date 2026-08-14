@@ -288,6 +288,13 @@ pub const EdgeConfig = struct {
     /// where a middlebox penalises marked traffic outright rather than merely
     /// clearing the marks, which per-path validation cannot detect.
     http3_ecn_enabled: bool,
+    /// Debug-only qlog output directory for native QUIC/H3. Empty keeps qlog
+    /// disabled; non-empty creates one `*.sqlog` trace per accepted connection.
+    http3_qlog_dir: []const u8 = "",
+    /// Debug-only NSS keylog output path for native QUIC/H3. Empty keeps TLS
+    /// key logging disabled. Non-empty permits packet decryption and must be
+    /// handled as sensitive material.
+    http3_keylog_path: []const u8 = "",
     proxy_protocol_mode: ProxyProtocolMode,
     /// Gateway identity used in signed upstream trust headers.
     trust_gateway_id: []const u8,
@@ -663,6 +670,8 @@ pub const EdgeConfig = struct {
         allocator.free(self.upstream_tls_server_name);
         allocator.free(self.upstream_tls_client_cert);
         allocator.free(self.upstream_tls_client_key);
+        if (self.http3_qlog_dir.ptr != "".ptr) allocator.free(self.http3_qlog_dir);
+        if (self.http3_keylog_path.ptr != "".ptr) allocator.free(self.http3_keylog_path);
         allocator.free(self.tls_client_ca_path);
         allocator.free(self.tls_crl_path);
         allocator.free(self.tls_acme_cert_dir);
@@ -967,6 +976,10 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
     // cannot carry markings turns itself off — so this exists to disable it,
     // not to enable it.
     const http3_ecn_enabled = parseBoolEnv(allocator, "TARDIGRADE_HTTP3_ECN", true);
+    const http3_qlog_dir = envOrDefault(allocator, "TARDIGRADE_HTTP3_QLOG_DIR", "") catch unreachable;
+    errdefer allocator.free(http3_qlog_dir);
+    const http3_keylog_path = envOrDefault(allocator, "TARDIGRADE_HTTP3_KEYLOG_PATH", "") catch unreachable;
+    errdefer allocator.free(http3_keylog_path);
     const proxy_protocol_mode_str = envOrDefault(allocator, "TARDIGRADE_PROXY_PROTOCOL", "off") catch unreachable;
     defer allocator.free(proxy_protocol_mode_str);
     const proxy_protocol_mode = try parseProxyProtocolModeConfig(proxy_protocol_mode_str);
@@ -1658,6 +1671,8 @@ pub fn loadFromEnv(allocator: std.mem.Allocator) !EdgeConfig {
         .http3_udp_recv_buffer_bytes = http3_udp_recv_buffer_bytes,
         .http3_udp_send_buffer_bytes = http3_udp_send_buffer_bytes,
         .http3_ecn_enabled = http3_ecn_enabled,
+        .http3_qlog_dir = http3_qlog_dir,
+        .http3_keylog_path = http3_keylog_path,
         .proxy_protocol_mode = proxy_protocol_mode,
         .trust_gateway_id = trust_gateway_id,
         .trust_shared_secret = trust_shared_secret,

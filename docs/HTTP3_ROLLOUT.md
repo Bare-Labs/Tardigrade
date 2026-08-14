@@ -551,6 +551,8 @@ runtime does not atomically replace a live UDP socket and QUIC connection table:
 - `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES`
 - `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES`
 - `TARDIGRADE_HTTP3_ECN`
+- `TARDIGRADE_HTTP3_QLOG_DIR`
+- `TARDIGRADE_HTTP3_KEYLOG_PATH`
 
 A reload that changes one of those fields is rejected before publication. The
 old config, old runtime, and old effective advertisement remain active.
