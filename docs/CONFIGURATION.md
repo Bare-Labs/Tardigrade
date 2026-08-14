@@ -155,7 +155,7 @@ the feature or let runtime code choose a fallback. Boolean parsing accepts
 | `TARDIGRADE_HTTP1_ENABLED` | bool | `true` | Enables HTTP/1.1. At least one of HTTP/1.1 or HTTP/2 must stay enabled; plaintext listeners require HTTP/1.1 because downstream h2c is not supported. | `TARDIGRADE_HTTP1_ENABLED=true` |
 | `TARDIGRADE_HTTP2_ENABLED` | bool | `true` | Enables HTTP/2 where supported. HTTP/2-only downstream listeners require TLS. | `TARDIGRADE_HTTP2_ENABLED=true` |
 | `TARDIGRADE_TLS_HTTP1_NO_ALPN_FALLBACK` | bool | `false` | Allows HTTP/1.1 on TLS clients that omit ALPN. | `TARDIGRADE_TLS_HTTP1_NO_ALPN_FALLBACK=true` |
-| `TARDIGRADE_PROXY_PROTOCOL` | enum | `off` | `off`, `auto`, `v1`, `v2`. | `TARDIGRADE_PROXY_PROTOCOL=auto` |
+| `TARDIGRADE_PROXY_PROTOCOL` | enum | `off` | `off`, `auto`, `v1`, `v2`. Appliance TLS profile requires `off`. | `TARDIGRADE_PROXY_PROTOCOL=auto` |
 | `TARDIGRADE_PROXY_STREAMING_MODE` | enum | `off` | `off`/`buffered`, `response`/`responses`, `full`/`request_response`/`request-response`. | `TARDIGRADE_PROXY_STREAMING_MODE=response` |
 | `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE` | bytes | `16384` | 1-1048576; must fit proxy buffer hard limit. | `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE=65536` |
 | `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` | bool | `false` | Stream all upstream statuses instead of mapping non-200 responses. | `TARDIGRADE_PROXY_STREAM_ALL_STATUSES=true` |
@@ -257,11 +257,11 @@ appliance/native profile has a stricter TLS 1.3-only subset.
 | --- | --- | --- | --- | --- |
 | `TARDIGRADE_TLS_CERT_PATH` | path | `""` | Required for TLS; must be paired with key path. | `TARDIGRADE_TLS_CERT_PATH=/etc/tls/fullchain.pem` |
 | `TARDIGRADE_TLS_KEY_PATH` | path | `""` | Required for TLS; must be paired with cert path. | `TARDIGRADE_TLS_KEY_PATH=/etc/tls/privkey.pem` |
-| `TARDIGRADE_TLS_MIN_VERSION` | string | `1.2` general, `1.3` appliance | Appliance profile requires `1.3`. | `TARDIGRADE_TLS_MIN_VERSION=1.2` |
-| `TARDIGRADE_TLS_MAX_VERSION` | string | `1.3` | Appliance profile requires `1.3`. | `TARDIGRADE_TLS_MAX_VERSION=1.3` |
+| `TARDIGRADE_TLS_MIN_VERSION` | string | `1.2` general, `1.3` appliance | General/OpenSSL accepts exactly `1.2` or `1.3`; appliance requires `1.3`. | `TARDIGRADE_TLS_MIN_VERSION=1.2` |
+| `TARDIGRADE_TLS_MAX_VERSION` | string | `1.3` | General/OpenSSL accepts exactly `1.2` or `1.3`; appliance requires `1.3`. | `TARDIGRADE_TLS_MAX_VERSION=1.3` |
 | `TARDIGRADE_TLS_CIPHER_LIST` | string | `""` | OpenSSL TLS <=1.2 cipher list. Appliance profile requires empty. | `TARDIGRADE_TLS_CIPHER_LIST=ECDHE+AESGCM` |
 | `TARDIGRADE_TLS_CIPHER_SUITES` | string | `""` | TLS 1.3 cipher suites. Appliance profile requires empty. | `TARDIGRADE_TLS_CIPHER_SUITES=TLS_AES_256_GCM_SHA384` |
-| `TARDIGRADE_TLS_SERVER_NAME` | DNS name | `""` | Appliance profile requires a single non-wildcard DNS host name when TLS is enabled. | `TARDIGRADE_TLS_SERVER_NAME=edge.example.com` |
+| `TARDIGRADE_TLS_SERVER_NAME` | DNS name | `""` | Unused by the general/OpenSSL terminator. Appliance requires one non-wildcard DNS name when TLS is enabled; appliance credential/name changes require restart. | `TARDIGRADE_TLS_SERVER_NAME=edge.example.com` |
 | `TARDIGRADE_TLS_SNI_CERTS` | encoded list | `""` | Additional SNI certs as <code>name:cert:key&#124;name2:cert2:key2</code>. Appliance profile requires empty. | `TARDIGRADE_TLS_SNI_CERTS=api.example.com:/a.crt:/a.key` |
 | `TARDIGRADE_TLS_SESSION_CACHE` | bool | `true` general, `false` appliance | OpenSSL session cache. Appliance profile rejects true. | `TARDIGRADE_TLS_SESSION_CACHE=true` |
 | `TARDIGRADE_TLS_SESSION_CACHE_SIZE` | u32 | `20480` | OpenSSL session cache size. | `TARDIGRADE_TLS_SESSION_CACHE_SIZE=40960` |
@@ -340,10 +340,10 @@ TLS stream capacity. Defaults are deterministic from native stream queue capacit
 | `TARDIGRADE_QUIC_PORT` | u16 | `443` | UDP QUIC listener port, 1-65535. HTTP/3 listener topology changes require restart. | `TARDIGRADE_QUIC_PORT=8443` |
 | `TARDIGRADE_HTTP3_ALT_SVC` | enum | `off` | `off`, `auto`. | `TARDIGRADE_HTTP3_ALT_SVC=auto` |
 | `TARDIGRADE_HTTP3_ALT_SVC_MAX_AGE_SECONDS` | u32 | `300` | `Alt-Svc` `ma` value; must be `0`-`86400`. | `TARDIGRADE_HTTP3_ALT_SVC_MAX_AGE_SECONDS=86400` |
-| `TARDIGRADE_HTTP3_ENABLE_0RTT` | bool | `false` | Enables 0-RTT. Logs replay warning; appliance profile rejects true. | `TARDIGRADE_HTTP3_ENABLE_0RTT=false` |
-| `TARDIGRADE_HTTP3_CONNECTION_MIGRATION` | bool | `false` | QUIC connection migration; appliance profile rejects true. | `TARDIGRADE_HTTP3_CONNECTION_MIGRATION=true` |
-| `TARDIGRADE_HTTP3_RETRY_POLICY` | enum | `off` | `off`, `address_validation`/`address-validation`; appliance profile rejects non-off. | `TARDIGRADE_HTTP3_RETRY_POLICY=address_validation` |
-| `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` | bytes | `2048` | Bounds discovered send size; transport clamps to `[1200, 2048]` and may lower it for the peer/path. | `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE=2048` |
+| `TARDIGRADE_HTTP3_ENABLE_0RTT` | bool | `false` | Enables 0-RTT. Logs replay warning; appliance profile rejects true. HTTP/3 listener-owned changes require restart. | `TARDIGRADE_HTTP3_ENABLE_0RTT=false` |
+| `TARDIGRADE_HTTP3_CONNECTION_MIGRATION` | bool | `false` | QUIC connection migration; appliance profile rejects true. HTTP/3 listener-owned changes require restart. | `TARDIGRADE_HTTP3_CONNECTION_MIGRATION=true` |
+| `TARDIGRADE_HTTP3_RETRY_POLICY` | enum | `off` | `off`, `address_validation`/`address-validation`; appliance profile rejects non-off. HTTP/3 listener-owned changes require restart. | `TARDIGRADE_HTTP3_RETRY_POLICY=address_validation` |
+| `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` | bytes | `2048` | Bounds discovered send size; transport clamps to `[1200, 2048]` and may lower it for the peer/path. HTTP/3 listener-owned changes require restart. | `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE=2048` |
 | `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES` | bytes | `0` | Advisory socket receive buffer target. `0` leaves kernel sizing. HTTP/3 listener-owned changes require restart. | `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES=1048576` |
 | `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES` | bytes | `0` | Advisory socket send buffer target. `0` leaves kernel sizing. HTTP/3 listener-owned changes require restart. | `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES=1048576` |
 | `TARDIGRADE_HTTP3_ECN` | bool | `true` | Enables QUIC ECN where supported. HTTP/3 listener-owned changes require restart. | `TARDIGRADE_HTTP3_ECN=true` |
@@ -367,7 +367,7 @@ TLS stream capacity. Defaults are deterministic from native stream queue capacit
 | `TARDIGRADE_POLICY_APPROVAL_ROUTES` | encoded string | `""` | Raw approval-route mapping. | `TARDIGRADE_POLICY_APPROVAL_ROUTES=POST:/deploy=required` |
 | `TARDIGRADE_APPROVAL_STORE_PATH` | path | `""` | Approval store. Path changes on reload require restart. | `TARDIGRADE_APPROVAL_STORE_PATH=/var/lib/tardigrade/approvals.json` |
 | `TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK` | URL | `""` | Approval escalation webhook. Changes on reload require restart. | `TARDIGRADE_APPROVAL_ESCALATION_WEBHOOK=https://hooks.example.com/tardi` |
-| `TARDIGRADE_APPROVAL_TTL_MS` | i64 ms | `300000` | Approval token TTL. | `TARDIGRADE_APPROVAL_TTL_MS=600000` |
+| `TARDIGRADE_APPROVAL_TTL_MS` | i64 ms | `300000` | Positive values set the approval token TTL; `<= 0` uses the `300000` ms fallback. | `TARDIGRADE_APPROVAL_TTL_MS=600000` |
 | `TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY` | u32 | `0` | Pending approvals per identity; `0` disables this cap. | `TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY=10` |
 | `TARDIGRADE_TRANSCRIPT_STORE_PATH` | path | `""` | Transcript store. Path changes on reload require restart. | `TARDIGRADE_TRANSCRIPT_STORE_PATH=/var/lib/tardigrade/transcripts` |
 | `TARDIGRADE_TRUST_GATEWAY_ID` | string | `tardigrade-edge` | Gateway identity for signed upstream trust headers. | `TARDIGRADE_TRUST_GATEWAY_ID=edge-us-east-1` |
@@ -388,7 +388,7 @@ TLS stream capacity. Defaults are deterministic from native stream queue capacit
 
 | Env key | Type | Config default | Effective behavior | Example |
 | --- | --- | --- | --- | --- |
-| `TARDIGRADE_RATE_LIMIT_RPS` | f64 | `10` | Requests per second per client IP. `0` disables and logs a warning. | `TARDIGRADE_RATE_LIMIT_RPS=50` |
+| `TARDIGRADE_RATE_LIMIT_RPS` | f64 | `10` | Requests per second per client IP. `> 0` enables; `<= 0` disables; exactly `0` logs a warning. | `TARDIGRADE_RATE_LIMIT_RPS=50` |
 | `TARDIGRADE_RATE_LIMIT_BURST` | u32 | `20` | Burst capacity. | `TARDIGRADE_RATE_LIMIT_BURST=100` |
 | `TARDIGRADE_MAX_BODY_SIZE` | bytes | `0` | `0` uses parser default `1048576`. | `TARDIGRADE_MAX_BODY_SIZE=10485760` |
 | `TARDIGRADE_MAX_URI_LENGTH` | bytes | `0` | `0` uses parser default `8192`. | `TARDIGRADE_MAX_URI_LENGTH=16384` |
@@ -424,9 +424,16 @@ TLS stream capacity. Defaults are deterministic from native stream queue capacit
 | `TARDIGRADE_OTEL_ENDPOINT` | URL | `""` | OTLP/HTTP endpoint. | `TARDIGRADE_OTEL_ENDPOINT=http://jaeger:4318/v1/traces` |
 | `TARDIGRADE_OTEL_SAMPLE_RATE` | u32 percent | `100` | Must be 0-100. | `TARDIGRADE_OTEL_SAMPLE_RATE=10` |
 
-`TARDIGRADE_LOG_ROTATE_MAX_BYTES` and `TARDIGRADE_LOG_ROTATE_MAX_FILES` are
-consumed by the CLI log-rotation path, not `EdgeConfig`. Defaults are `0`
-(rotation disabled) and `5`.
+### CLI-Owned Environment Fields
+
+These public environment fields are consumed by CLI paths rather than
+`EdgeConfig`.
+
+| Env key | Type | Default | Valid values / behavior | Example |
+| --- | --- | --- | --- | --- |
+| `TARDIGRADE_LOG_ROTATE_MAX_BYTES` | usize bytes | `0` | `0` disables startup size-triggered rotation; `> 0` rotates when the existing error log size reaches the threshold. | `TARDIGRADE_LOG_ROTATE_MAX_BYTES=10485760` |
+| `TARDIGRADE_LOG_ROTATE_MAX_FILES` | usize | `5` | Number of retained rotated generations; `0` discards the current log when rotation triggers. | `TARDIGRADE_LOG_ROTATE_MAX_FILES=5` |
+| `TARDIGRADE_VALIDATE_CONFIG_ONLY` | bool-like | `false` | `1` or case-insensitive `true` makes `run` execute legacy config validation and exit; other values do not enable it. | `TARDIGRADE_VALIDATE_CONFIG_ONLY=true` |
 
 ### Compression And Cache
 
@@ -473,9 +480,6 @@ consumed by the CLI log-rotation path, not `EdgeConfig`. Defaults are `0`
 | `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES` | bytes | `2097152` | Max retained bytes per active connection; `0` unlimited. | `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES=4194304` |
 | `TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES` | bytes | `0` | Estimated total connection memory cap; `0` unlimited. | `TARDIGRADE_MAX_TOTAL_CONNECTION_MEMORY_BYTES=1073741824` |
 
-`TARDIGRADE_VALIDATE_CONFIG_ONLY` is consumed by the CLI as a compatibility
-validation switch. It is not part of `EdgeConfig`.
-
 ### Reload Behavior
 
 See [Reload, Drain, and Shutdown](RELOAD_SHUTDOWN.md) for the full lifecycle
@@ -484,11 +488,13 @@ reload-owned resources, then publish it for new requests without draining active
 connections. If loading or validation fails before publication, the previous
 config remains active.
 
-Reload rejects process-owned changes that require restart. Current restart-owned
-surfaces include listener-shard and HTTP/3 listener topology, native replay
-mode/capacity, native ticket-key source mode, worker thread and queue settings,
-coherent shutdown-drain changes, and upstream-pool policy changes. Rows above
-that mention "require restart" are not hot-reloadable in place.
+Reloaded settings fall into three operational categories:
+
+| Reload behavior | Fields / surfaces | Example |
+| --- | --- | --- |
+| Reloadable in place | Most request-routing, proxy, auth, header, logging, timeout, limit, and metrics policy fields. New requests acquire the newly published config after reload publication. | `TARDIGRADE_RATE_LIMIT_RPS=50` |
+| Reload rejected; restart required | Listener-shard topology, native early-data replay mode/capacity, HTTP/3 listener-owned fields (`HTTP3_ENABLED`, `QUIC_PORT`, `HTTP3_ENABLE_0RTT`, `HTTP3_CONNECTION_MIGRATION`, `HTTP3_RETRY_POLICY`, `HTTP3_MAX_DATAGRAM_SIZE`, UDP buffer sizes, ECN), native ticket-key source-mode changes, and appliance TLS credential configuration (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_SERVER_NAME`, `TLS_SNI_CERTS`). | `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE=1200` |
+| Config may publish, but live startup-owned state changes only after restart | Bound TCP socket host/port, event-loop backend and io_uring entries, runtime identity/chroot, master/worker-process topology, worker thread/queue/recycle/affinity settings, FD soft limit, connection-pool capacity, upstream TLS client state, circuit-breaker construction, session/approval/transcript store paths, SSE event-hub capacity, DNS-discovery construction, coherent shutdown-drain policy, and upstream-pool policy. Reload may log a restart-required warning for these. | `TARDIGRADE_WORKER_THREADS=8` |
 
 ### Proxy Buffer Limits
 
@@ -554,12 +560,8 @@ These are configurable in-tree surfaces outside the stable Core v1 baseline.
 # accepts one top-level identity only, so the server-block TLS material below
 # would be rejected there.
 
-# Master-process mode is required for worker_processes to take effect. `auto`
-# maps to 0 and lets Tardigrade choose the worker-process count.
-master_process true;
 # `worker_connections` caps total active client connections through
 # TARDIGRADE_MAX_ACTIVE_CONNECTIONS.
-worker_processes auto;
 worker_connections 4096;
 
 # Write the active process id for service managers and send info-or-higher
@@ -567,13 +569,12 @@ worker_connections 4096;
 pid /run/tardigrade.pid;
 error_log /var/log/tardigrade/error.log info;
 
-# Serve TLS on 8443 and advertise HTTP/2. Cert/key must be configured together;
-# the server name binds the native/appliance TLS identity when that profile is
-# used.
+# Serve TLS on 8443 and advertise HTTP/2. Cert/key must be configured together.
+# `tls_server_name` is intentionally omitted because this is a general/OpenSSL
+# example; that field is used by the appliance/native profile.
 listen 0.0.0.0:8443 http2;
 tls_cert_path /etc/tardigrade/tls/fullchain.pem;
 tls_key_path /etc/tardigrade/tls/privkey.pem;
-tls_server_name edge.example.com;
 
 # Default virtual host: serve static files first, then fall back to the SPA
 # entry point when a concrete file is not present.
