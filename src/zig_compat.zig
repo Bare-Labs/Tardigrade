@@ -517,6 +517,18 @@ pub const Condition = struct {
     }
 };
 
+pub const Semaphore = struct {
+    inner: std.Io.Semaphore = .{},
+
+    pub fn wait(self: *Semaphore) void {
+        self.inner.waitUncancelable(io());
+    }
+
+    pub fn post(self: *Semaphore) void {
+        self.inner.post(io());
+    }
+};
+
 pub const SockAddr = struct {
     storage: std.c.sockaddr.storage,
     len: std.posix.socklen_t,
