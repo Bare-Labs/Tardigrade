@@ -66,7 +66,7 @@ jobs:
           if h2load --h3 --help >/dev/null 2>&1; then
             echo "h2load on this runner supports HTTP/3 — H3 rows will be recorded."
           else
-            echo "h2load on this runner does NOT support HTTP/3 (no QUIC/ngtcp2+nghttp3 build available)."
+            echo "h2load on this runner does NOT support HTTP/3 (no QUIC-enabled build available)."
             echo "H3 rows will be recorded as unsupported with a reason, per benchmarks/competitive/README.md."
           fi
 
