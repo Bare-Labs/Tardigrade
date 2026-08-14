@@ -203,7 +203,7 @@ echo "==> Test 2c: --runs > 1 aggregates each run's scenario-local quic delta in
 
     echo "$RESULTS_JSON" > /tmp/tardi-h3-multirun-test.json
 )
-MULTIRUN_JSON="$(cat /tmp/tardi-h3-multirun-test.json | jq .)"
+MULTIRUN_JSON="$(jq . /tmp/tardi-h3-multirun-test.json)"
 check "repeated-run scenario still carries a quic block (not silently dropped)" \
     '"quic"' "$MULTIRUN_JSON"
 check "aggregated packets_sent sums every run's delta (100+150=250)" \
