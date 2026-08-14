@@ -525,6 +525,14 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             .quic_early_data_decision_metrics_cb = recordQuicEarlyDataDecisionFromRuntime,
             .quic_zero_rtt_packet_metrics_ctx = &state,
             .quic_zero_rtt_packet_metrics_cb = recordQuicZeroRttPacketFromRuntime,
+            .quic_transport_metrics_ctx = &state,
+            .quic_transport_metrics_cb = recordQuicTransportDeltaFromRuntime,
+            .quic_connections_active_metrics_ctx = &state,
+            .quic_connections_active_metrics_cb = setQuicConnectionsActiveFromRuntime,
+            .quic_handshake_failure_metrics_ctx = &state,
+            .quic_handshake_failure_metrics_cb = recordQuicHandshakeFailureFromRuntime,
+            .h3_request_latency_metrics_ctx = &state,
+            .h3_request_latency_metrics_cb = recordH3RequestLatencyFromRuntime,
         }) catch |err| blk: {
             state.logger.warn(null, "HTTP/3 listener failed to initialize: {s}", .{@errorName(err)});
             break :blk null;
@@ -2358,6 +2366,38 @@ fn recordQuicZeroRttPacketFromRuntime(
 ) void {
     const state: *GatewayState = @ptrCast(@alignCast(raw_state));
     state.metricsRecordQuicZeroRttPacket(outcome);
+}
+
+fn recordQuicTransportDeltaFromRuntime(
+    raw_state: *anyopaque,
+    delta: http.metrics.QuicTransportDelta,
+) void {
+    const state: *GatewayState = @ptrCast(@alignCast(raw_state));
+    state.metricsRecordQuicTransportDelta(delta);
+}
+
+fn setQuicConnectionsActiveFromRuntime(
+    raw_state: *anyopaque,
+    active: usize,
+) void {
+    const state: *GatewayState = @ptrCast(@alignCast(raw_state));
+    state.metricsSetQuicConnectionsActive(active);
+}
+
+fn recordQuicHandshakeFailureFromRuntime(
+    raw_state: *anyopaque,
+    stage: http.metrics.QuicHandshakeFailureStage,
+) void {
+    const state: *GatewayState = @ptrCast(@alignCast(raw_state));
+    state.metricsRecordQuicHandshakeFailure(stage);
+}
+
+fn recordH3RequestLatencyFromRuntime(
+    raw_state: *anyopaque,
+    latency_ms: u64,
+) void {
+    const state: *GatewayState = @ptrCast(@alignCast(raw_state));
+    state.metricsRecordH3RequestLatency(latency_ms);
 }
 
 fn h2LastReadEarlyPrefixLen(conn: anytype) usize {

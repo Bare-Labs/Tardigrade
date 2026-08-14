@@ -130,6 +130,14 @@ pub const Config = struct {
     /// (`quic.connection.Event.zero_rtt_packet`), bridged the same way.
     quic_zero_rtt_packet_metrics_ctx: ?*anyopaque = null,
     quic_zero_rtt_packet_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicZeroRttPacketOutcome) void = null,
+    quic_transport_metrics_ctx: ?*anyopaque = null,
+    quic_transport_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicTransportDelta) void = null,
+    quic_connections_active_metrics_ctx: ?*anyopaque = null,
+    quic_connections_active_metrics_cb: ?*const fn (*anyopaque, usize) void = null,
+    quic_handshake_failure_metrics_ctx: ?*anyopaque = null,
+    quic_handshake_failure_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicHandshakeFailureStage) void = null,
+    h3_request_latency_metrics_ctx: ?*anyopaque = null,
+    h3_request_latency_metrics_cb: ?*const fn (*anyopaque, u64) void = null,
     /// Optional H3 qlog sink. Defaults to no-op; concrete file ownership stays
     /// in the composition root and sink errors must not affect protocol state.
     h3_qlog_sink: http3.qlog.Sink = .{},
@@ -268,12 +276,20 @@ const SocketWaiter = struct {
 
 const ParkedH3Retry = struct {
     stream_id: u64,
+    started_us: u64,
     continuation: http3_session.StreamRequest.Early425RetryContinuation,
 
     fn deinit(self: *ParkedH3Retry, allocator: std.mem.Allocator) void {
         self.continuation.deinit(allocator);
         self.* = undefined;
     }
+};
+
+const RemovalReason = enum {
+    unauthenticated_initial,
+    handshake_timeout,
+    protocol_failure,
+    administrative,
 };
 
 pub const Snapshot = struct {
@@ -344,6 +360,9 @@ const ConnEntry = struct {
         connection_handle: u64,
         qlog_sink: quic.qlog.Sink = .{},
         close_logged: bool = false,
+        handshake_stage: metrics_mod.QuicHandshakeFailureStage = .initial,
+        handshake_succeeded: bool = false,
+        administrative_close: bool = false,
     };
 
     const H3Observer = struct {
@@ -375,6 +394,7 @@ const ConnEntry = struct {
     /// never be retried on the same connection (#488).
     ticket_issue_attempted: bool = false,
     drain_goaway_sent: bool = false,
+    handshake_failure_recorded: bool = false,
     highest_admitted_request_stream_id: ?u64 = null,
     drain_goaway_boundary: ?u64 = null,
     last_path_metrics: quic.path.Metrics = .{},
@@ -382,6 +402,8 @@ const ConnEntry = struct {
     /// listener snapshot accumulates deltas rather than re-adding totals
     /// (#256-E). Same pattern as `last_path_metrics`.
     last_transport_metrics: quic.connection.Metrics = .{},
+    last_stream_metrics: quic.stream.Metrics = .{},
+    last_tls_metrics: quic.tls_adapter.Metrics = .{},
     parked_h3_retries: std.ArrayList(ParkedH3Retry) = .empty,
 
     fn deinit(self: *ConnEntry, allocator: std.mem.Allocator) void {
@@ -445,6 +467,14 @@ pub const Runtime = struct {
     quic_early_data_decision_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicEarlyDataDecision) void = null,
     quic_zero_rtt_packet_metrics_ctx: ?*anyopaque = null,
     quic_zero_rtt_packet_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicZeroRttPacketOutcome) void = null,
+    quic_transport_metrics_ctx: ?*anyopaque = null,
+    quic_transport_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicTransportDelta) void = null,
+    quic_connections_active_metrics_ctx: ?*anyopaque = null,
+    quic_connections_active_metrics_cb: ?*const fn (*anyopaque, usize) void = null,
+    quic_handshake_failure_metrics_ctx: ?*anyopaque = null,
+    quic_handshake_failure_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicHandshakeFailureStage) void = null,
+    h3_request_latency_metrics_ctx: ?*anyopaque = null,
+    h3_request_latency_metrics_cb: ?*const fn (*anyopaque, u64) void = null,
     h3_qlog_sink: http3.qlog.Sink = .{},
     quic_qlog_sink: quic.qlog.Sink = .{},
     h3_qlog_sink_factory_ctx: ?*anyopaque = null,
@@ -552,6 +582,14 @@ pub const Runtime = struct {
             .quic_early_data_decision_metrics_cb = cfg.quic_early_data_decision_metrics_cb,
             .quic_zero_rtt_packet_metrics_ctx = cfg.quic_zero_rtt_packet_metrics_ctx,
             .quic_zero_rtt_packet_metrics_cb = cfg.quic_zero_rtt_packet_metrics_cb,
+            .quic_transport_metrics_ctx = cfg.quic_transport_metrics_ctx,
+            .quic_transport_metrics_cb = cfg.quic_transport_metrics_cb,
+            .quic_connections_active_metrics_ctx = cfg.quic_connections_active_metrics_ctx,
+            .quic_connections_active_metrics_cb = cfg.quic_connections_active_metrics_cb,
+            .quic_handshake_failure_metrics_ctx = cfg.quic_handshake_failure_metrics_ctx,
+            .quic_handshake_failure_metrics_cb = cfg.quic_handshake_failure_metrics_cb,
+            .h3_request_latency_metrics_ctx = cfg.h3_request_latency_metrics_ctx,
+            .h3_request_latency_metrics_cb = cfg.h3_request_latency_metrics_cb,
             .h3_qlog_sink = cfg.h3_qlog_sink,
             .quic_qlog_sink = cfg.quic_qlog_sink,
             .h3_qlog_sink_factory_ctx = cfg.h3_qlog_sink_factory_ctx,
@@ -656,11 +694,7 @@ pub const Runtime = struct {
         var waiter = SocketWaiter.init(self.socket_fd);
         defer {
             waiter.deinit();
-            var it = connections.valueIterator();
-            while (it.next()) |entry| {
-                entry.*.deinit(allocator);
-                allocator.destroy(entry.*);
-            }
+            self.removeAllConnections(&connections, &routes, &per_ip);
             connections.deinit();
             routes.deinit();
             per_ip.deinit();
@@ -675,7 +709,11 @@ pub const Runtime = struct {
             // 1) Timers and transmission for every connection.
             var wake_us: u64 = now + 100_000;
             {
-                var reap: [16]u64 = undefined;
+                const Reap = struct {
+                    handle: u64,
+                    reason: RemovalReason,
+                };
+                var reap: [16]Reap = undefined;
                 var reap_count: usize = 0;
                 var it = connections.iterator();
                 while (it.next()) |kv| {
@@ -686,9 +724,10 @@ pub const Runtime = struct {
                     self.foldPathMetrics(entry);
                     if (draining and !entry.drain_goaway_sent) self.sendDrainGoaway(entry);
                     self.drainConnectionTransmits(entry, now);
-                    if (drain_expired) {
-                        entry.conn.close(0x0100, "h3 drain deadline", now);
-                    } else {
+                    const handshake_timed_out = handshakeTimedOutForRemoval(entry, now);
+                    if (drain_expired and !handshake_timed_out) {
+                        self.closeForDrainDeadline(entry, now);
+                    } else if (!drain_expired) {
                         self.pumpH3(entry, now);
                     }
                     self.drainConnectionTransmits(entry, now);
@@ -701,18 +740,20 @@ pub const Runtime = struct {
                     if (!self.ecn_send_enabled) entry.conn.disableEcnUnsupported();
                     // Reap closed connections and half-open connections that
                     // blew the handshake deadline (spoofed/stalled Initials).
-                    const stalled = !entry.conn.isEstablished() and now -| entry.accepted_at_us > handshake_timeout_us;
-                    if (entry.conn.state() == .closed or stalled) {
+                    if (entry.conn.state() == .closed or handshake_timed_out) {
                         if (reap_count < reap.len) {
-                            reap[reap_count] = kv.key_ptr.*;
+                            reap[reap_count] = .{
+                                .handle = kv.key_ptr.*,
+                                .reason = reapRemovalReason(entry, handshake_timed_out),
+                            };
                             reap_count += 1;
                         }
                         continue;
                     }
                     wake_us = connectionWakeUs(entry, now, wake_us);
                 }
-                for (reap[0..reap_count]) |handle| {
-                    self.removeConnection(&connections, &routes, &per_ip, handle);
+                for (reap[0..reap_count]) |r| {
+                    self.removeConnection(&connections, &routes, &per_ip, r.handle, r.reason);
                 }
             }
             if (draining and connections.count() == 0) break;
@@ -800,7 +841,7 @@ pub const Runtime = struct {
         var challenge_entropy: [quic.path.path_challenge_len]u8 = undefined;
         compat.randomBytes(&challenge_entropy);
         entry.conn.ingestOnPathWithEcn(datagram, ingress_path, ingress_ecn, challenge_entropy, now) catch {
-            if (freshly_accepted) self.removeConnection(connections, routes, per_ip, found);
+            if (freshly_accepted) self.removeConnection(connections, routes, per_ip, found, .protocol_failure);
             return;
         };
         self.syncCidRoutes(entry, routes);
@@ -812,7 +853,7 @@ pub const Runtime = struct {
             // nothing is an unsolicited or spoofed Initial: drop the half-open
             // state now instead of holding it until the handshake deadline.
             .drop_unauthenticated => {
-                self.removeConnection(connections, routes, per_ip, found);
+                self.removeConnection(connections, routes, per_ip, found, .unauthenticated_initial);
                 return;
             },
             // `Connection` owns migration validation; runtime counters fold
@@ -994,6 +1035,7 @@ pub const Runtime = struct {
             return null;
         };
         self.noteConnectionAccepted();
+        self.recordQuicConnectionsActive(connections.count());
         if (retry_context != null) self.noteRetryTokenAccepted();
         return handle;
     }
@@ -1048,8 +1090,9 @@ pub const Runtime = struct {
         const retry = quic.packet.writeRetryV1(parsed.dcid, parsed.scid, retry_scid.slice(), token, &retry_buf) catch return;
         // Unmarked: a Retry is sent before any connection state exists, so
         // there is no path whose ECN validation could ever account for it.
-        self.sendDatagram(peer, retry, .not_ect);
-        self.noteRetryPacketSent();
+        if (self.sendDatagram(peer, retry, .not_ect)) {
+            self.noteRetryPacketSent();
+        }
     }
 
     fn generateRetryScid(self: *Runtime, routes: *quic.cid.CidRoutingTable, cid_len: usize, original_dcid: []const u8) ?quic.cid.ConnectionId {
@@ -1073,15 +1116,57 @@ pub const Runtime = struct {
         routes: *quic.cid.CidRoutingTable,
         per_ip: *std.AutoHashMap(u32, u32),
         handle: u64,
+        reason: RemovalReason,
     ) void {
         if (connections.fetchRemove(handle)) |kv| {
+            self.foldPathMetrics(kv.value);
+            if (reason != .administrative and !kv.value.quic_observer.handshake_succeeded and !kv.value.handshake_failure_recorded) {
+                kv.value.handshake_failure_recorded = true;
+                self.recordQuicHandshakeFailure(kv.value.quic_observer.handshake_stage);
+            }
             for (kv.value.owned_cids[0..kv.value.owned_cid_count]) |cid| routes.remove(cid);
             self.noteCidRouteCount(routes.count());
             decPerIp(per_ip, kv.value.admission_source_ip);
             kv.value.deinit(self.allocator);
             self.allocator.destroy(kv.value);
             self.noteConnectionClosed();
+            self.recordQuicConnectionsActive(connections.count());
         }
+    }
+
+    fn removeAllConnections(
+        self: *Runtime,
+        connections: *std.AutoHashMap(u64, *ConnEntry),
+        routes: *quic.cid.CidRoutingTable,
+        per_ip: *std.AutoHashMap(u32, u32),
+    ) void {
+        while (connections.count() != 0) {
+            var it = connections.keyIterator();
+            const handle = it.next().?.*;
+            self.removeConnection(connections, routes, per_ip, handle, .administrative);
+        }
+    }
+
+    fn closeForDrainDeadline(_: *Runtime, entry: *ConnEntry, now: u64) void {
+        switch (entry.conn.state()) {
+            .closing, .draining, .closed => {},
+            else => {
+                entry.quic_observer.administrative_close = true;
+                entry.conn.close(0x0100, "h3 drain deadline", now);
+            },
+        }
+    }
+
+    fn handshakeTimedOutForRemoval(entry: *const ConnEntry, now: u64) bool {
+        return !entry.quic_observer.administrative_close and
+            !entry.quic_observer.handshake_succeeded and
+            now -| entry.accepted_at_us > handshake_timeout_us;
+    }
+
+    fn reapRemovalReason(entry: *const ConnEntry, handshake_timed_out: bool) RemovalReason {
+        if (entry.quic_observer.administrative_close) return .administrative;
+        if (handshake_timed_out) return .handshake_timeout;
+        return .protocol_failure;
     }
 
     fn syncCidRoutes(self: *Runtime, entry: *ConnEntry, routes: *quic.cid.CidRoutingTable) void {
@@ -1194,6 +1279,7 @@ pub const Runtime = struct {
                     entry.conn.resetStream(incoming.stream_id, 0x010b) catch {}; // H3_REQUEST_REJECTED
                     entry.h3.finishRequest(incoming.stream_id);
                     self.noteDrainRequestRejections(1);
+                    self.noteRequestCompletedWithLatency(now, nowUs());
                     continue;
                 }
             }
@@ -1214,7 +1300,6 @@ pub const Runtime = struct {
     }
 
     fn serveRequest(self: *Runtime, entry: *ConnEntry, incoming: H3.IncomingRequest, now: u64) void {
-        _ = now;
         entry.highest_admitted_request_stream_id = maxOptional(entry.highest_admitted_request_stream_id, incoming.stream_id);
         entry.conn.setStreamSchedulingHint(incoming.stream_id, .{
             .urgency = incoming.priority.urgency,
@@ -1222,13 +1307,12 @@ pub const Runtime = struct {
         }) catch {};
         const allocator = self.allocator;
         const handler = self.request_handler orelse {
-            entry.h3.sendResponse(entry.conn, incoming.stream_id, 404, &.{}, "") catch {};
+            self.sendStatusResponse(entry, incoming.stream_id, 404, now);
             return;
         };
 
         var request = buildStreamRequest(allocator, incoming.exchange) catch {
-            entry.h3.sendResponse(entry.conn, incoming.stream_id, 500, &.{}, "") catch {};
-            entry.h3.finishRequest(incoming.stream_id);
+            self.sendInternalErrorResponse(entry, incoming.stream_id, now);
             return;
         };
         defer request.deinit();
@@ -1240,7 +1324,7 @@ pub const Runtime = struct {
             .is_complete_fn = h3DownstreamHandshakeComplete,
             .wait_or_drive_fn = h3DownstreamWaitOrDriveHandshake,
         };
-        var park_ctx = H3ParkContext{ .runtime = self, .entry = entry, .stream_id = incoming.stream_id };
+        var park_ctx = H3ParkContext{ .runtime = self, .entry = entry, .stream_id = incoming.stream_id, .started_us = now };
         request.park_early_425_retry = .{
             .ctx = &park_ctx,
             .park_fn = parkH3Early425Retry,
@@ -1251,12 +1335,11 @@ pub const Runtime = struct {
         handler(allocator, &request, &response, self.request_handler_ctx) catch |err| {
             if (err == error.Http3RequestParked) return;
             self.logger.warn(null, "http3: request handler failed: {s}", .{@errorName(err)});
-            entry.h3.sendResponse(entry.conn, incoming.stream_id, 500, &.{}, "") catch {};
-            entry.h3.finishRequest(incoming.stream_id);
+            self.sendInternalErrorResponse(entry, incoming.stream_id, now);
             return;
         };
 
-        self.sendHandlerResponse(entry, incoming.stream_id, &response);
+        self.sendHandlerResponse(entry, incoming.stream_id, &response, now);
     }
 
     fn resumeParkedH3Retries(self: *Runtime, entry: *ConnEntry) void {
@@ -1277,14 +1360,25 @@ pub const Runtime = struct {
             defer response.deinit();
             parked.continuation.run(self.allocator, &response) catch |err| {
                 self.logger.warn(null, "http3: parked request retry failed: {s}", .{@errorName(err)});
-                self.sendInternalErrorResponse(entry, parked.stream_id);
+                self.sendInternalErrorResponse(entry, parked.stream_id, parked.started_us);
                 continue;
             };
-            self.sendHandlerResponse(entry, parked.stream_id, &response);
+            self.sendHandlerResponse(entry, parked.stream_id, &response, parked.started_us);
         }
     }
 
-    fn sendHandlerResponse(self: *Runtime, entry: anytype, stream_id: u64, response: *const response_mod.Response) void {
+    fn sendStatusResponse(self: *Runtime, entry: anytype, stream_id: u64, status: u16, started_us: u64) void {
+        defer self.noteRequestCompletedWithLatency(started_us, nowUs());
+        entry.h3.sendResponse(entry.conn, stream_id, status, &.{}, "") catch |err| {
+            self.logger.warn(null, "http3: terminal response send failed: {s}", .{@errorName(err)});
+            entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
+            entry.h3.finishRequest(stream_id);
+            return;
+        };
+    }
+
+    fn sendHandlerResponse(self: *Runtime, entry: anytype, stream_id: u64, response: *const response_mod.Response, started_us: u64) void {
+        defer self.noteRequestCompletedWithLatency(started_us, nowUs());
         var headers_buf: [64]stream_transport.Header = undefined;
         var header_count: usize = 0;
         for (response.headers.iterator()) |header| {
@@ -1304,17 +1398,16 @@ pub const Runtime = struct {
             entry.h3.finishRequest(stream_id);
             return;
         };
-        self.noteRequestCompleted();
     }
 
-    fn sendInternalErrorResponse(self: *Runtime, entry: anytype, stream_id: u64) void {
+    fn sendInternalErrorResponse(self: *Runtime, entry: anytype, stream_id: u64, started_us: u64) void {
+        defer self.noteRequestCompletedWithLatency(started_us, nowUs());
         entry.h3.sendResponse(entry.conn, stream_id, 500, &.{}, "") catch |err| {
             self.logger.warn(null, "http3: fallback response send failed: {s}", .{@errorName(err)});
             entry.conn.resetStream(stream_id, 0x0102) catch {}; // H3_INTERNAL_ERROR
             entry.h3.finishRequest(stream_id);
             return;
         };
-        self.noteRequestCompleted();
     }
 
     /// Fold one connection's deadlines into the loop's sleep deadline.
@@ -1356,7 +1449,7 @@ pub const Runtime = struct {
     fn drainConnectionTransmits(self: *Runtime, entry: *ConnEntry, now: u64) void {
         var out: [quic.datagram.max_size]u8 = undefined;
         while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
-            self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes, t.ecn);
+            _ = self.sendDatagram(sockaddrInFromAddress(t.path.remote), t.bytes, t.ecn);
             if (!self.ecn_send_enabled) entry.conn.disableEcnUnsupported();
         }
     }
@@ -1372,14 +1465,16 @@ pub const Runtime = struct {
         while (it.next()) |kv| kv.value_ptr.*.conn.disableEcnUnsupported();
     }
 
-    fn sendDatagram(self: *Runtime, peer: std.c.sockaddr.in, datagram: []const u8, mark: quic.udp.Ecn) void {
+    fn sendDatagram(self: *Runtime, peer: std.c.sockaddr.in, datagram: []const u8, mark: quic.udp.Ecn) bool {
         const effective_mark = if (self.ecn_send_enabled) mark else .not_ect;
         const outcome = sendDatagramTo(self.socket_fd, &peer, datagram, effective_mark);
         if (outcome.ecn_rejected) self.noteEcnSendRejected();
         const sent = outcome.result;
-        if (sent >= 0 and @as(usize, @intCast(sent)) == datagram.len) {
+        const ok = sent >= 0 and @as(usize, @intCast(sent)) == datagram.len;
+        if (ok) {
             self.notePacketOut(datagram.len);
         }
+        return ok;
     }
 
     /// The kernel refused the ECN control message, so this listener can read
@@ -1419,12 +1514,14 @@ pub const Runtime = struct {
         runtime: *Runtime,
         entry: *ConnEntry,
         stream_id: u64,
+        started_us: u64,
     };
 
     fn parkH3Early425Retry(ctx: *anyopaque, continuation: http3_session.StreamRequest.Early425RetryContinuation) anyerror!void {
         const park_ctx: *H3ParkContext = @ptrCast(@alignCast(ctx));
         try park_ctx.entry.parked_h3_retries.append(park_ctx.runtime.allocator, .{
             .stream_id = park_ctx.stream_id,
+            .started_us = park_ctx.started_us,
             .continuation = continuation,
         });
     }
@@ -1565,6 +1662,30 @@ pub const Runtime = struct {
         cb(cb_ctx, outcome);
     }
 
+    fn recordQuicTransportDelta(self: *Runtime, delta: metrics_mod.QuicTransportDelta) void {
+        const cb = self.quic_transport_metrics_cb orelse return;
+        const cb_ctx = self.quic_transport_metrics_ctx orelse return;
+        cb(cb_ctx, delta);
+    }
+
+    fn recordQuicConnectionsActive(self: *Runtime, active: usize) void {
+        const cb = self.quic_connections_active_metrics_cb orelse return;
+        const cb_ctx = self.quic_connections_active_metrics_ctx orelse return;
+        cb(cb_ctx, active);
+    }
+
+    fn recordQuicHandshakeFailure(self: *Runtime, stage: metrics_mod.QuicHandshakeFailureStage) void {
+        const cb = self.quic_handshake_failure_metrics_cb orelse return;
+        const cb_ctx = self.quic_handshake_failure_metrics_ctx orelse return;
+        cb(cb_ctx, stage);
+    }
+
+    fn recordH3RequestCompleted(self: *Runtime, latency_ms: u64) void {
+        const cb = self.h3_request_latency_metrics_cb orelse return;
+        const cb_ctx = self.h3_request_latency_metrics_ctx orelse return;
+        cb(cb_ctx, latency_ms);
+    }
+
     fn h3ConnectionEvent(ctx: ?*anyopaque, event: http3.conn.Event) void {
         const observer: *ConnEntry.H3Observer = @ptrCast(@alignCast(ctx.?));
         _ = observer.connection_handle;
@@ -1680,6 +1801,12 @@ pub const Runtime = struct {
             }
         }
         switch (event) {
+            .state => |state| {
+                if (state == .established) observer.handshake_succeeded = true;
+            },
+            .packet_received => |packet| {
+                if (packet.space == .handshake) observer.handshake_stage = .handshake;
+            },
             .early_data_decision => |decision| {
                 const mapped: metrics_mod.QuicEarlyDataDecision = switch (decision) {
                     .not_attempted => return,
@@ -1961,10 +2088,11 @@ pub const Runtime = struct {
         self.snapshot_state.handshakes_completed += 1;
     }
 
-    fn noteRequestCompleted(self: *Runtime) void {
+    fn noteRequestCompletedWithLatency(self: *Runtime, started_us: u64, finished_us: u64) void {
         self.snapshot_mutex.lock();
         defer self.snapshot_mutex.unlock();
         self.snapshot_state.requests_completed += 1;
+        self.recordH3RequestCompleted((finished_us -| started_us) / std.time.us_per_ms);
     }
 
     fn foldPathMetrics(self: *Runtime, entry: *ConnEntry) void {
@@ -1996,12 +2124,29 @@ pub const Runtime = struct {
         self.snapshot_state.ecn_paths_validated += @intCast(transport.ecn_validated -| last.ecn_validated);
         self.snapshot_state.ecn_paths_disabled += @intCast(transport.ecn_disabled -| last.ecn_disabled);
         self.snapshot_state.ecn_ce_received += @intCast(transport.ecn_ce_received -| last.ecn_ce_received);
+
+        const stream_metrics = if (entry.conn.streams) |streams| streams.metrics else quic.stream.Metrics{};
+        const last_stream = entry.last_stream_metrics;
+        entry.last_stream_metrics = stream_metrics;
+        const tls_metrics = entry.conn.adapter.metrics;
+        const last_tls = entry.last_tls_metrics;
+        entry.last_tls_metrics = tls_metrics;
+        self.recordQuicTransportDelta(.{
+            .amplification_blocked = current.amplification_blocked_sends -| previous.amplification_blocked_sends,
+            .pto = transport.pto_count_total -| last.pto_count_total,
+            .packets_lost = transport.packets_lost -| last.packets_lost,
+            .stream_resets = stream_metrics.reset_streams -| last_stream.reset_streams,
+            .connection_flow_blocked = stream_metrics.data_blocked_events -| last_stream.data_blocked_events,
+            .stream_flow_blocked = stream_metrics.stream_data_blocked_events -| last_stream.stream_data_blocked_events,
+            .deprotection_failures = tls_metrics.deprotection_failures -| last_tls.deprotection_failures,
+        });
     }
 
     fn noteRetryPacketSent(self: *Runtime) void {
         self.snapshot_mutex.lock();
         defer self.snapshot_mutex.unlock();
         self.snapshot_state.retry_packets_sent += 1;
+        self.recordQuicTransportDelta(.{ .retry = 1 });
     }
 
     fn noteRetryTokenAccepted(self: *Runtime) void {
@@ -2021,6 +2166,7 @@ pub const Runtime = struct {
         defer self.snapshot_mutex.unlock();
         self.snapshot_state.datagrams_seen += 1;
         self.snapshot_state.bytes_seen += len;
+        self.recordQuicTransportDelta(.{ .bytes_received = @intCast(len) });
     }
 
     fn noteZeroRtt(self: *Runtime) void {
@@ -2034,6 +2180,7 @@ pub const Runtime = struct {
         defer self.snapshot_mutex.unlock();
         self.snapshot_state.packets_emitted += 1;
         self.snapshot_state.bytes_emitted += len;
+        self.recordQuicTransportDelta(.{ .bytes_sent = @intCast(len) });
     }
 };
 
@@ -3123,6 +3270,8 @@ const RuntimeCidHarness = struct {
             .backend = server_backend,
             .conn = server,
             .h3 = H3.initWithSettings(allocator, .server, .{}),
+            .quic_observer = .{ .runtime = undefined, .connection_handle = 0 },
+            .h3_observer = .{ .runtime = undefined, .connection_handle = 0 },
             .admission_source_ip = 0x0100007f,
             .cid_len = odcid.len,
             .accepted_at_us = self.now_us,
@@ -3161,6 +3310,388 @@ const RuntimeCidHarness = struct {
         try testing.expect(self.entry.conn.isEstablished());
     }
 };
+
+test "http3 runtime metrics: bulk cleanup flushes final transport deltas and clears active gauge" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-runtime-metrics-cleanup-test");
+    var capture = RuntimeMetricCapture{};
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .quic_transport_metrics_ctx = &capture,
+        .quic_transport_metrics_cb = RuntimeMetricCapture.onDelta,
+        .quic_connections_active_metrics_ctx = &capture,
+        .quic_connections_active_metrics_cb = RuntimeMetricCapture.onActive,
+        .quic_handshake_failure_metrics_ctx = &capture,
+        .quic_handshake_failure_metrics_cb = RuntimeMetricCapture.onHandshakeFailure,
+    });
+    defer runtime.deinit();
+
+    var harness = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer harness.deinit(allocator);
+    harness.entry.conn.metrics.pto_count_total += 2;
+    harness.entry.conn.metrics.packets_lost += 3;
+    harness.entry.conn.adapter.metrics.deprotection_failures += 4;
+
+    var connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer connections.deinit();
+    var routes = quic.cid.CidRoutingTable.init(allocator);
+    defer routes.deinit();
+    var per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer per_ip.deinit();
+    try connections.put(7, harness.entry);
+    try routes.insert(harness.entry.owned_cids[0], 7);
+    try incPerIp(&per_ip, harness.entry.admission_source_ip);
+    runtime.recordQuicConnectionsActive(connections.count());
+
+    runtime.removeAllConnections(&connections, &routes, &per_ip);
+
+    try testing.expectEqual(@as(usize, 0), connections.count());
+    try testing.expectEqual(@as(usize, 0), routes.count());
+    try testing.expectEqual(@as(usize, 0), per_ip.count());
+    try testing.expectEqual(@as(usize, 0), capture.last_active);
+    try testing.expect(capture.active_calls >= 2);
+    try testing.expectEqual(@as(u64, 2), capture.delta.pto);
+    try testing.expectEqual(@as(u64, 3), capture.delta.packets_lost);
+    try testing.expectEqual(@as(u64, 4), capture.delta.deprotection_failures);
+    try testing.expectEqual(@as(usize, 0), capture.handshake_failures);
+
+    harness.client.deinit();
+    allocator.destroy(harness);
+}
+
+test "http3 runtime metrics: MAX_STREAMS pressure is not stream byte flow-control pressure" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-runtime-stream-limit-metrics-test");
+    var capture = RuntimeMetricCapture{};
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .quic_transport_metrics_ctx = &capture,
+        .quic_transport_metrics_cb = RuntimeMetricCapture.onDelta,
+    });
+    defer runtime.deinit();
+
+    var harness = try RuntimeCidHarness.init(allocator, fixed.provider());
+    defer harness.deinit(allocator);
+    if (harness.entry.conn.streams == null) {
+        harness.entry.conn.streams = quic.stream.StreamManager.init(
+            allocator,
+            .server,
+            harness.entry.conn.local_params,
+            harness.entry.conn.peerTransportParameters().?,
+        );
+    }
+    harness.entry.conn.streams.?.metrics.streams_blocked_events += 5;
+    runtime.foldPathMetrics(harness.entry);
+    try testing.expectEqual(@as(u64, 0), capture.delta.stream_flow_blocked);
+
+    harness.entry.conn.streams.?.metrics.stream_data_blocked_events += 2;
+    runtime.foldPathMetrics(harness.entry);
+    try testing.expectEqual(@as(u64, 2), capture.delta.stream_flow_blocked);
+}
+
+test "http3 runtime metrics: handshake failures use removal reason and observed stage" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-runtime-handshake-stage-metrics-test");
+    var capture = RuntimeMetricCapture{};
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .quic_handshake_failure_metrics_ctx = &capture,
+        .quic_handshake_failure_metrics_cb = RuntimeMetricCapture.onHandshakeFailure,
+    });
+    defer runtime.deinit();
+
+    var initial = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer initial.deinit(allocator);
+    initial.entry.conn.state_ = .handshaking;
+    initial.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 1 };
+    var initial_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer initial_connections.deinit();
+    var initial_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer initial_routes.deinit();
+    var initial_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer initial_per_ip.deinit();
+    try initial_connections.put(1, initial.entry);
+    try initial_routes.insert(initial.entry.owned_cids[0], 1);
+    try incPerIp(&initial_per_ip, initial.entry.admission_source_ip);
+    runtime.removeConnection(&initial_connections, &initial_routes, &initial_per_ip, 1, .unauthenticated_initial);
+    initial.client.deinit();
+    allocator.destroy(initial);
+
+    var handshake = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer handshake.deinit(allocator);
+    handshake.entry.conn.state_ = .handshaking;
+    handshake.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 2 };
+    Runtime.quicConnectionEvent(&handshake.entry.quic_observer, .{ .packet_received = .{ .space = .handshake, .packet_type = .handshake, .packet_number = 1, .size = 64 } });
+    var hs_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer hs_connections.deinit();
+    var hs_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer hs_routes.deinit();
+    var hs_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer hs_per_ip.deinit();
+    try hs_connections.put(2, handshake.entry);
+    try hs_routes.insert(handshake.entry.owned_cids[0], 2);
+    try incPerIp(&hs_per_ip, handshake.entry.admission_source_ip);
+    runtime.removeConnection(&hs_connections, &hs_routes, &hs_per_ip, 2, .handshake_timeout);
+    handshake.client.deinit();
+    allocator.destroy(handshake);
+
+    var administrative = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer administrative.deinit(allocator);
+    administrative.entry.conn.state_ = .handshaking;
+    administrative.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 3 };
+    var admin_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer admin_connections.deinit();
+    var admin_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer admin_routes.deinit();
+    var admin_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer admin_per_ip.deinit();
+    try admin_connections.put(3, administrative.entry);
+    try admin_routes.insert(administrative.entry.owned_cids[0], 3);
+    try incPerIp(&admin_per_ip, administrative.entry.admission_source_ip);
+    runtime.removeAllConnections(&admin_connections, &admin_routes, &admin_per_ip);
+    administrative.client.deinit();
+    allocator.destroy(administrative);
+
+    var established_closed = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer established_closed.deinit(allocator);
+    established_closed.entry.conn.state_ = .closing;
+    established_closed.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 4 };
+    Runtime.quicConnectionEvent(&established_closed.entry.quic_observer, .{ .state = .established });
+    var closed_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer closed_connections.deinit();
+    var closed_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer closed_routes.deinit();
+    var closed_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer closed_per_ip.deinit();
+    try closed_connections.put(4, established_closed.entry);
+    try closed_routes.insert(established_closed.entry.owned_cids[0], 4);
+    try incPerIp(&closed_per_ip, established_closed.entry.admission_source_ip);
+    runtime.removeConnection(&closed_connections, &closed_routes, &closed_per_ip, 4, .protocol_failure);
+    established_closed.client.deinit();
+    allocator.destroy(established_closed);
+
+    var established_old = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer established_old.deinit(allocator);
+    established_old.entry.conn.state_ = .closed;
+    established_old.entry.accepted_at_us = 0;
+    established_old.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 5 };
+    Runtime.quicConnectionEvent(&established_old.entry.quic_observer, .{ .state = .established });
+    var old_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer old_connections.deinit();
+    var old_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer old_routes.deinit();
+    var old_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer old_per_ip.deinit();
+    try old_connections.put(5, established_old.entry);
+    try old_routes.insert(established_old.entry.owned_cids[0], 5);
+    try incPerIp(&old_per_ip, established_old.entry.admission_source_ip);
+    runtime.removeConnection(&old_connections, &old_routes, &old_per_ip, 5, .handshake_timeout);
+    established_old.client.deinit();
+    allocator.destroy(established_old);
+
+    var tls_complete_failed = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer tls_complete_failed.deinit(allocator);
+    tls_complete_failed.entry.conn.state_ = .closing;
+    tls_complete_failed.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 6 };
+    Runtime.quicConnectionEvent(&tls_complete_failed.entry.quic_observer, .{ .packet_received = .{ .space = .handshake, .packet_type = .handshake, .packet_number = 2, .size = 80 } });
+    Runtime.quicConnectionEvent(&tls_complete_failed.entry.quic_observer, .handshake_complete);
+    var tls_failed_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer tls_failed_connections.deinit();
+    var tls_failed_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer tls_failed_routes.deinit();
+    var tls_failed_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer tls_failed_per_ip.deinit();
+    try tls_failed_connections.put(6, tls_complete_failed.entry);
+    try tls_failed_routes.insert(tls_complete_failed.entry.owned_cids[0], 6);
+    try incPerIp(&tls_failed_per_ip, tls_complete_failed.entry.admission_source_ip);
+    runtime.removeConnection(&tls_failed_connections, &tls_failed_routes, &tls_failed_per_ip, 6, .protocol_failure);
+    tls_complete_failed.client.deinit();
+    allocator.destroy(tls_complete_failed);
+
+    var drain_race = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer drain_race.deinit(allocator);
+    drain_race.entry.conn.state_ = .closing;
+    drain_race.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 7 };
+    Runtime.quicConnectionEvent(&drain_race.entry.quic_observer, .{ .packet_received = .{ .space = .handshake, .packet_type = .handshake, .packet_number = 3, .size = 96 } });
+    runtime.closeForDrainDeadline(drain_race.entry, drain_race.now_us);
+    try testing.expect(!drain_race.entry.quic_observer.administrative_close);
+    var drain_race_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer drain_race_connections.deinit();
+    var drain_race_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer drain_race_routes.deinit();
+    var drain_race_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer drain_race_per_ip.deinit();
+    try drain_race_connections.put(7, drain_race.entry);
+    try drain_race_routes.insert(drain_race.entry.owned_cids[0], 7);
+    try incPerIp(&drain_race_per_ip, drain_race.entry.admission_source_ip);
+    const drain_race_reason: RemovalReason = if (drain_race.entry.quic_observer.administrative_close) .administrative else .protocol_failure;
+    runtime.removeConnection(&drain_race_connections, &drain_race_routes, &drain_race_per_ip, 7, drain_race_reason);
+    drain_race.client.deinit();
+    allocator.destroy(drain_race);
+
+    var timeout_on_drain = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer timeout_on_drain.deinit(allocator);
+    timeout_on_drain.entry.conn.state_ = .handshaking;
+    timeout_on_drain.entry.accepted_at_us = 0;
+    timeout_on_drain.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 8 };
+    const drain_now = handshake_timeout_us + 1;
+    const timeout_before_drain = Runtime.handshakeTimedOutForRemoval(timeout_on_drain.entry, drain_now);
+    try testing.expect(timeout_before_drain);
+    if (!timeout_before_drain) runtime.closeForDrainDeadline(timeout_on_drain.entry, drain_now);
+    try testing.expect(!timeout_on_drain.entry.quic_observer.administrative_close);
+    var timeout_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer timeout_connections.deinit();
+    var timeout_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer timeout_routes.deinit();
+    var timeout_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer timeout_per_ip.deinit();
+    try timeout_connections.put(8, timeout_on_drain.entry);
+    try timeout_routes.insert(timeout_on_drain.entry.owned_cids[0], 8);
+    try incPerIp(&timeout_per_ip, timeout_on_drain.entry.admission_source_ip);
+    runtime.removeConnection(
+        &timeout_connections,
+        &timeout_routes,
+        &timeout_per_ip,
+        8,
+        Runtime.reapRemovalReason(timeout_on_drain.entry, timeout_before_drain),
+    );
+    timeout_on_drain.client.deinit();
+    allocator.destroy(timeout_on_drain);
+
+    try testing.expectEqual(@as(usize, 5), capture.handshake_failures);
+    try testing.expectEqual(@as(usize, 2), capture.handshake_failures_by_stage[0]);
+    try testing.expectEqual(@as(usize, 3), capture.handshake_failures_by_stage[1]);
+}
+
+test "http3 runtime metrics: rendered Prometheus deltas are not double-counted across folds" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-runtime-served-metrics-delta-test");
+    var bridge = MetricsBridgeCapture{ .metrics = metrics_mod.Metrics.init() };
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .quic_transport_metrics_ctx = &bridge,
+        .quic_transport_metrics_cb = MetricsBridgeCapture.onDelta,
+    });
+    defer runtime.deinit();
+
+    var harness = try RuntimeCidHarness.init(allocator, fixed.provider());
+    defer harness.deinit(allocator);
+    if (harness.entry.conn.streams == null) {
+        harness.entry.conn.streams = quic.stream.StreamManager.init(
+            allocator,
+            .server,
+            harness.entry.conn.local_params,
+            harness.entry.conn.peerTransportParameters().?,
+        );
+    }
+
+    runtime.noteRetryPacketSent();
+    harness.entry.conn.paths.metrics.amplification_blocked_sends += 2;
+    harness.entry.conn.metrics.pto_count_total += 3;
+    harness.entry.conn.metrics.packets_lost += 4;
+    harness.entry.conn.streams.?.metrics.reset_streams += 5;
+    harness.entry.conn.streams.?.metrics.data_blocked_events += 6;
+    harness.entry.conn.streams.?.metrics.stream_data_blocked_events += 7;
+    harness.entry.conn.adapter.metrics.deprotection_failures += 8;
+    runtime.foldPathMetrics(harness.entry);
+    {
+        const prom = try bridge.metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_retry_total 1\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_amplification_blocked_total 2\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_pto_total 3\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_packets_lost_total 4\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_stream_resets_total 5\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_flow_control_blocked_total{scope=\"connection\"} 6\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_flow_control_blocked_total{scope=\"stream\"} 7\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_deprotection_failures_total 8\n") != null);
+    }
+
+    runtime.foldPathMetrics(harness.entry);
+    {
+        const prom = try bridge.metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_amplification_blocked_total 2\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_pto_total 3\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_packets_lost_total 4\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_stream_resets_total 5\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_flow_control_blocked_total{scope=\"connection\"} 6\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_flow_control_blocked_total{scope=\"stream\"} 7\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_deprotection_failures_total 8\n") != null);
+    }
+
+    harness.entry.conn.paths.metrics.amplification_blocked_sends += 1;
+    harness.entry.conn.metrics.pto_count_total += 1;
+    harness.entry.conn.metrics.packets_lost += 1;
+    harness.entry.conn.streams.?.metrics.reset_streams += 1;
+    harness.entry.conn.streams.?.metrics.data_blocked_events += 1;
+    harness.entry.conn.streams.?.metrics.stream_data_blocked_events += 1;
+    harness.entry.conn.adapter.metrics.deprotection_failures += 1;
+    runtime.foldPathMetrics(harness.entry);
+    {
+        const prom = try bridge.metrics.toPrometheus(allocator);
+        defer allocator.free(prom);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_amplification_blocked_total 3\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_pto_total 4\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_packets_lost_total 5\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_stream_resets_total 6\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_flow_control_blocked_total{scope=\"connection\"} 7\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_flow_control_blocked_total{scope=\"stream\"} 8\n") != null);
+        try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_deprotection_failures_total 9\n") != null);
+    }
+}
+
+test "http3 runtime metrics: failed Retry UDP send does not increment sent counters" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-runtime-retry-send-failure-test");
+    var bridge = MetricsBridgeCapture{ .metrics = metrics_mod.Metrics.init() };
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .retry_policy = .address_validation,
+        .quic_transport_metrics_ctx = &bridge,
+        .quic_transport_metrics_cb = MetricsBridgeCapture.onDelta,
+    });
+    _ = std.c.close(runtime.socket_fd);
+    runtime.socket_fd = -1;
+    defer {
+        runtime.socket_fd = -1;
+        runtime.deinit();
+    }
+
+    var routes = quic.cid.CidRoutingTable.init(allocator);
+    defer routes.deinit();
+    const dcid = [_]u8{0x44} ** 8;
+    const scid = [_]u8{0x55} ** 8;
+    runtime.issueRetry(
+        &routes,
+        .{ .kind = .initial, .version = quic.packet.quic_v1, .dcid = &dcid, .scid = &scid },
+        sockaddrInFromAddress(quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 4444)),
+        quic.udp.Address.ip4(.{ 127, 0, 0, 1 }, 4444),
+        1_000_000,
+    );
+
+    const prom = try bridge.metrics.toPrometheus(allocator);
+    defer allocator.free(prom);
+    try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_retry_total 0\n") != null);
+    try testing.expect(std.mem.find(u8, prom, "tardigrade_quic_bytes_sent_total 0\n") != null);
+}
 
 test "stream request bridge maps exchange fields and Host" {
     const allocator = testing.allocator;
@@ -3436,7 +3967,7 @@ test "http3 runtime: retired CIDs stop routing, replenish, and teardown removes 
     const admission_ip = harness.entry.admission_source_ip;
     try connections.put(handle, harness.entry);
     try incPerIp(&per_ip, admission_ip);
-    runtime.removeConnection(&connections, &routes, &per_ip, handle);
+    runtime.removeConnection(&connections, &routes, &per_ip, handle, .administrative);
     try testing.expectEqual(@as(usize, 0), connections.count());
     try testing.expectEqual(@as(usize, 0), routes.count());
     try testing.expectEqual(@as(?u32, null), per_ip.get(admission_ip));
@@ -3724,6 +4255,83 @@ test "http3 runtime (#546): a request stream rejected by Conn.pump() at local_go
     try testing.expectEqual(@as(usize, 1), runtime.snapshot().h3_drain_request_rejections);
 }
 
+test "http3 runtime (#546): drain boundary request rejection counts one terminal H3 request" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-drain-boundary-rejection-metrics-test");
+    var latency = H3LatencyCapture{};
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .h3_request_latency_metrics_ctx = &latency,
+        .h3_request_latency_metrics_cb = H3LatencyCapture.onLatency,
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
+    defer harness.deinit(testing.allocator);
+
+    var request_bytes: [128]u8 = undefined;
+    const bytes = buildH3RequestBytesForTest("GET", "/during-drain", "example.com", &request_bytes);
+    const stream_id = try harness.client.openStream(.bidi);
+    try testing.expectEqual(@as(u64, 0), stream_id);
+    _ = try harness.client.writeStream(stream_id, bytes, true);
+    try harness.pump();
+
+    runtime.drain_requested.store(true, .release);
+    runtime.pumpH3(harness.entry, harness.now_us);
+
+    try testing.expectEqual(@as(usize, 1), runtime.snapshot().h3_drain_request_rejections);
+    try testing.expectEqual(@as(usize, 1), runtime.snapshot().requests_completed);
+    try testing.expectEqual(@as(usize, 1), latency.count);
+}
+
+test "http3 runtime metrics: handler error counts one terminal H3 request" {
+    const Handler = struct {
+        fn fail(
+            _: std.mem.Allocator,
+            _: *const http3_session.StreamRequest,
+            _: *response_mod.Response,
+            _: ?*anyopaque,
+        ) anyerror!void {
+            return error.IntentionalHandlerFailure;
+        }
+    };
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-handler-error-metrics-test");
+    var latency = H3LatencyCapture{};
+    var runtime = try Runtime.init(testing.allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .request_handler = Handler.fail,
+        .h3_request_latency_metrics_ctx = &latency,
+        .h3_request_latency_metrics_cb = H3LatencyCapture.onLatency,
+    });
+    defer runtime.deinit();
+    var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
+    defer harness.deinit(testing.allocator);
+
+    runtime.serveRequest(harness.entry, .{
+        .stream_id = 0,
+        .exchange = .{
+            .request = .{
+                .method = "GET",
+                .scheme = "https",
+                .authority = "example.com",
+                .path = "/handler-error",
+            },
+            .body = .none,
+        },
+        .transport_early = false,
+        .priority = .{},
+    }, harness.now_us);
+
+    try testing.expectEqual(@as(usize, 1), latency.count);
+    try testing.expectEqual(@as(usize, 1), runtime.snapshot().requests_completed);
+}
+
 test "classifyIngest routes spoofed Initials, migration, and normal traffic" {
     // Freshly accepted + first datagram authenticates nothing -> spoofed
     // Initial, torn down. The source-changed flag never overrides this: a
@@ -3851,12 +4459,88 @@ const TestH3ResumeEntry = struct {
     }
 };
 
+const H3LatencyCapture = struct {
+    count: usize = 0,
+    last_ms: u64 = 0,
+
+    fn onLatency(ctx: *anyopaque, latency_ms: u64) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        self.last_ms = latency_ms;
+    }
+};
+
+const RuntimeMetricCapture = struct {
+    active_calls: usize = 0,
+    last_active: usize = 0,
+    delta: metrics_mod.QuicTransportDelta = .{},
+    handshake_failures: usize = 0,
+    handshake_failures_by_stage: [2]usize = .{ 0, 0 },
+
+    fn onActive(ctx: *anyopaque, active: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.active_calls += 1;
+        self.last_active = active;
+    }
+
+    fn onDelta(ctx: *anyopaque, delta: metrics_mod.QuicTransportDelta) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.delta.retry += delta.retry;
+        self.delta.amplification_blocked += delta.amplification_blocked;
+        self.delta.pto += delta.pto;
+        self.delta.packets_lost += delta.packets_lost;
+        self.delta.bytes_sent += delta.bytes_sent;
+        self.delta.bytes_received += delta.bytes_received;
+        self.delta.stream_resets += delta.stream_resets;
+        self.delta.connection_flow_blocked += delta.connection_flow_blocked;
+        self.delta.stream_flow_blocked += delta.stream_flow_blocked;
+        self.delta.deprotection_failures += delta.deprotection_failures;
+    }
+
+    fn onHandshakeFailure(ctx: *anyopaque, stage: metrics_mod.QuicHandshakeFailureStage) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.handshake_failures += 1;
+        const idx: usize = switch (stage) {
+            .initial => 0,
+            .handshake => 1,
+        };
+        self.handshake_failures_by_stage[idx] += 1;
+    }
+};
+
+const MetricsBridgeCapture = struct {
+    metrics: metrics_mod.Metrics,
+
+    fn onActive(ctx: *anyopaque, active: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.metrics.setQuicConnectionsActive(active);
+    }
+
+    fn onDelta(ctx: *anyopaque, delta: metrics_mod.QuicTransportDelta) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.metrics.recordQuicTransportDelta(delta);
+    }
+
+    fn onHandshakeFailure(ctx: *anyopaque, stage: metrics_mod.QuicHandshakeFailureStage) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.metrics.recordQuicHandshakeFailure(stage);
+    }
+
+    fn onLatency(ctx: *anyopaque, latency_ms: u64) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.metrics.recordH3RequestLatency(latency_ms);
+    }
+};
+
 test "parked H3 retry resumes only after connection establishment" {
     const allocator = testing.allocator;
     var logger = logger_mod.Logger.init(.err, "http3-parked-resume-test");
+    var latency = H3LatencyCapture{};
     var runtime = try Runtime.init(allocator, &logger, .{
         .listen_host = "127.0.0.1",
         .quic_port = 0,
+        .h3_request_latency_metrics_ctx = &latency,
+        .h3_request_latency_metrics_cb = H3LatencyCapture.onLatency,
     });
     defer runtime.deinit();
 
@@ -3866,6 +4550,7 @@ test "parked H3 retry resumes only after connection establishment" {
     var continuation = TestParkedContinuationState{};
     try entry.parked_h3_retries.append(allocator, .{
         .stream_id = 11,
+        .started_us = 1,
         .continuation = continuation.continuation(),
     });
 
@@ -3882,6 +4567,8 @@ test "parked H3 retry resumes only after connection establishment" {
     try testing.expectEqual(@as(usize, 1), entry.h3.send_calls);
     try testing.expectEqual(@as(u16, 200), entry.h3.last_status);
     try testing.expectEqual(@as(u64, 11), entry.h3.last_stream_id);
+    try testing.expectEqual(@as(usize, 1), latency.count);
+    try testing.expect(latency.last_ms > 0);
 }
 
 test "parked H3 retry fallback send failure resets and finishes stream once" {
@@ -3902,6 +4589,7 @@ test "parked H3 retry fallback send failure resets and finishes stream once" {
     var continuation = TestParkedContinuationState{ .fail_run = true };
     try entry.parked_h3_retries.append(allocator, .{
         .stream_id = 13,
+        .started_us = 1,
         .continuation = continuation.continuation(),
     });
 
@@ -3915,6 +4603,41 @@ test "parked H3 retry fallback send failure resets and finishes stream once" {
     try testing.expectEqual(@as(usize, 1), entry.h3.finish_calls);
     try testing.expectEqual(@as(u64, 13), conn.last_reset_stream_id);
     try testing.expectEqual(@as(u64, 13), entry.h3.last_stream_id);
+}
+
+test "H3 terminal response send failures are counted exactly once" {
+    const allocator = testing.allocator;
+    var logger = logger_mod.Logger.init(.err, "http3-terminal-send-failure-metrics-test");
+    var latency = H3LatencyCapture{};
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .h3_request_latency_metrics_ctx = &latency,
+        .h3_request_latency_metrics_cb = H3LatencyCapture.onLatency,
+    });
+    defer runtime.deinit();
+
+    var conn = TestH3ResumeConn{ .established = true };
+    var entry = TestH3ResumeEntry{
+        .conn = &conn,
+        .h3 = .{ .send_fail = true },
+    };
+    defer entry.deinit(allocator);
+    var response = response_mod.Response.init(allocator);
+    defer response.deinit();
+    response.status = .ok;
+
+    runtime.sendHandlerResponse(&entry, 41, &response, 1);
+    try testing.expectEqual(@as(usize, 1), latency.count);
+    try testing.expectEqual(@as(usize, 1), entry.h3.send_calls);
+    try testing.expectEqual(@as(usize, 1), conn.reset_calls);
+    try testing.expectEqual(@as(usize, 1), entry.h3.finish_calls);
+
+    runtime.sendInternalErrorResponse(&entry, 43, 1);
+    try testing.expectEqual(@as(usize, 2), latency.count);
+    try testing.expectEqual(@as(usize, 2), entry.h3.send_calls);
+    try testing.expectEqual(@as(usize, 2), conn.reset_calls);
+    try testing.expectEqual(@as(usize, 2), entry.h3.finish_calls);
 }
 
 test "failed parked H3 retry does not stop later parked retry" {
@@ -3933,10 +4656,12 @@ test "failed parked H3 retry does not stop later parked retry" {
     var resumed = TestParkedContinuationState{};
     try entry.parked_h3_retries.append(allocator, .{
         .stream_id = 21,
+        .started_us = 1,
         .continuation = failed.continuation(),
     });
     try entry.parked_h3_retries.append(allocator, .{
         .stream_id = 23,
+        .started_us = 1,
         .continuation = resumed.continuation(),
     });
 
@@ -3973,10 +4698,12 @@ test "failed parked H3 retry reset path does not stop later parked retry" {
     var resumed = TestParkedContinuationState{};
     try entry.parked_h3_retries.append(allocator, .{
         .stream_id = 31,
+        .started_us = 1,
         .continuation = failed.continuation(),
     });
     try entry.parked_h3_retries.append(allocator, .{
         .stream_id = 33,
+        .started_us = 1,
         .continuation = resumed.continuation(),
     });
 
