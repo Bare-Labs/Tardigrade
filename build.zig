@@ -848,6 +848,9 @@ pub fn build(b: *std.Build) void {
     const h3_interop_install = b.addInstallArtifact(h3_interop_tool, .{});
     const h3_interop_step = b.step("build-h3-interop", "Build the native HTTP/3 interop client/server tool");
     h3_interop_step.dependOn(&h3_interop_install.step);
+    const h3_interop_tests = b.addTest(.{ .root_module = h3_interop_mod });
+    const run_h3_interop_tests = b.addRunArtifact(h3_interop_tests);
+    test_step.dependOn(&run_h3_interop_tests.step);
 
     // Out-of-process record-transport TLS conformance driver (#338). Runs
     // the shared engine as client or server against external peers

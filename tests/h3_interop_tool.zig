@@ -43,7 +43,7 @@ var verbose = false;
 
 const ArtifactSink = struct {
     qlog_file: ?compat.FileCompat = null,
-    keylog_file: ?compat.FileCompat = null,
+    keylog_fd: ?posix.fd_t = null,
     qlog_dropped_records: usize = 0,
     keylog_dropped_records: usize = 0,
     close_logged: bool = false,
@@ -64,6 +64,7 @@ const ArtifactSink = struct {
         if (qlog_dir.len > 0) {
             try compat.cwd().makePath(qlog_dir);
             const path = try std.fmt.allocPrint(allocator, "{s}/{s}-{s}.sqlog", .{ qlog_dir, @tagName(mode), group_id });
+            defer allocator.free(path);
             var file = try compat.cwd().createFile(path, .{ .read = false });
             errdefer file.close();
             var header_buf: [1024]u8 = undefined;
@@ -81,10 +82,7 @@ const ArtifactSink = struct {
         }
 
         if (keylog_path.len > 0) {
-            var file = try compat.cwd().createFile(keylog_path, .{ .read = false });
-            errdefer file.close();
-            if (std.c.fchmod(file.file.handle, 0o600) != 0) return error.PermissionDenied;
-            sink.keylog_file = file;
+            sink.keylog_fd = try openAppendOnly0600(keylog_path);
         }
 
         return sink;
@@ -92,7 +90,7 @@ const ArtifactSink = struct {
 
     fn deinit(self: *ArtifactSink) void {
         if (self.qlog_file) |*file| file.close();
-        if (self.keylog_file) |*file| file.close();
+        if (self.keylog_fd) |fd| _ = std.c.close(fd);
         self.* = undefined;
     }
 
@@ -107,7 +105,7 @@ const ArtifactSink = struct {
     }
 
     fn keylogContext(self: *ArtifactSink, role: quic.tls_core.state.Role) quic.tls_core.keylog.Context {
-        if (self.keylog_file == null) return .{};
+        if (self.keylog_fd == null) return .{};
         return .{
             .enabled = true,
             .role = role,
@@ -115,8 +113,24 @@ const ArtifactSink = struct {
         };
     }
 
-    fn diagnostics(self: *const ArtifactSink) bool {
-        return self.qlog_dropped_records != 0 or self.keylog_dropped_records != 0;
+    fn emitQuicQlog(self: *ArtifactSink, event: quic.qlog.Event) void {
+        if (self.qlog_file == null) return;
+        var bytes: [qlog_record_max]u8 = undefined;
+        const line = quic.qlog.writeJson(.{ .time_us = nowUs(), .event = event }, &bytes) catch {
+            self.qlog_dropped_records += 1;
+            return;
+        };
+        if (self.qlog_file) |*file| file.writeAll(line) catch {
+            self.qlog_dropped_records += 1;
+        };
+    }
+
+    fn reportDiagnostics(self: *const ArtifactSink) void {
+        if (self.qlog_dropped_records == 0 and self.keylog_dropped_records == 0) return;
+        std.debug.print("h3-interop: artifact diagnostics qlog_dropped_records={d} keylog_dropped_records={d}\n", .{
+            self.qlog_dropped_records,
+            self.keylog_dropped_records,
+        });
     }
 
     fn emitQuicEvent(ctx: ?*anyopaque, event: connection.Event) void {
@@ -130,14 +144,7 @@ const ArtifactSink = struct {
             },
             else => {},
         }
-        var bytes: [qlog_record_max]u8 = undefined;
-        const line = quic.qlog.writeJson(.{ .time_us = nowUs(), .event = qlog_event }, &bytes) catch {
-            self.qlog_dropped_records += 1;
-            return;
-        };
-        if (self.qlog_file) |*file| file.writeAll(line) catch {
-            self.qlog_dropped_records += 1;
-        };
+        self.emitQuicQlog(qlog_event);
     }
 
     fn emitH3Event(ctx: ?*anyopaque, event: http3.conn.Event) void {
@@ -160,9 +167,31 @@ const ArtifactSink = struct {
             self.keylog_dropped_records += 1;
             return;
         };
-        if (self.keylog_file) |*file| file.writeAll(line) catch {
+        if (self.keylog_fd) |fd| writeAllFd(fd, line) catch {
             self.keylog_dropped_records += 1;
         };
+    }
+
+    fn openAppendOnly0600(path: []const u8) !posix.fd_t {
+        const fd = try posix.openat(posix.AT.FDCWD, path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .APPEND = true,
+            .CLOEXEC = true,
+        }, 0o600);
+        errdefer _ = std.c.close(fd);
+        if (std.c.fchmod(fd, 0o600) != 0) return error.PermissionDenied;
+        return fd;
+    }
+
+    fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const n = std.c.write(fd, bytes[written..].ptr, bytes.len - written);
+            if (n < 0) return error.WriteFailed;
+            if (n == 0) return error.WriteFailed;
+            written += @intCast(n);
+        }
     }
 };
 
@@ -746,7 +775,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const args = parseArgs(allocator, init.args) catch |err| {
         std.debug.print(
-                "h3-interop: bad arguments ({s})\n" ++
+            "h3-interop: bad arguments ({s})\n" ++
                 "usage: h3_interop_tool server --port N --cert cert.pem --key key.pem [--requests N] [--expect-hrr] [--qlog-dir DIR] [--keylog-path FILE]\n" ++
                 "       h3_interop_tool client --host IP --port N --authority NAME --path /p [--empty-initial-key-share] [--expect-hrr] [--insecure|--pin cert.der] [--qlog-dir DIR] [--keylog-path FILE]\n" ++
                 "\nnegotiation (#338, shared vocabulary with tls_interop_tool):\n" ++
@@ -774,9 +803,15 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     var group_id_buf: [16]u8 = undefined;
     var artifacts = try ArtifactSink.init(allocator, args.qlog_dir, args.keylog_path, .client, cidHex(&odcid, &group_id_buf));
     defer artifacts.deinit();
+    defer artifacts.reportDiagnostics();
     if (args.keylog_path.len > 0) {
         std.debug.print("h3-interop: WARNING keylog enabled; {s} permits decrypting captured traffic\n", .{args.keylog_path});
     }
+    artifacts.emitQuicQlog(.{ .connection_started = .{
+        .odcid_len = @intCast(odcid.len),
+        .scid_len = @intCast(local_cid.len),
+        .dcid_len = @intCast(odcid.len),
+    } });
 
     const trust: tls_backend.Trust = if (args.pin.len > 0) blk: {
         const pinned = try readFileAlloc(allocator, args.pin, 64 * 1024);
@@ -784,6 +819,7 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     } else .insecure_no_verification;
     if (args.pin.len == 0 and !args.insecure) {
         std.debug.print("h3-interop: client needs --pin cert.der or --insecure\n", .{});
+        artifacts.reportDiagnostics();
         std.process.exit(2);
     }
 
@@ -876,6 +912,7 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
             @tagName(client.state()),
             client.handshakeFailure(),
         });
+        artifacts.reportDiagnostics();
         std.process.exit(1);
     }
     const saw_hrr = backend.engine.core.retry_state == .hrr_received;
@@ -883,20 +920,18 @@ fn runClient(allocator: std.mem.Allocator, args: Args) !void {
     reportNegotiated(args, &backend, saw_hrr);
     if (args.expect_hrr and !saw_hrr) {
         std.debug.print("h3-interop: expected HelloRetryRequest but none was observed\n", .{});
+        artifacts.reportDiagnostics();
         std.process.exit(1);
     }
-    if (!matrixTupleHolds(args, &backend)) std.process.exit(1);
+    if (!matrixTupleHolds(args, &backend)) {
+        artifacts.reportDiagnostics();
+        std.process.exit(1);
+    }
     // Orderly close.
     client.close(0, "done", nowUs());
     var out: [2048]u8 = undefined;
     while (client.pollTransmitOnPath(&out, nowUs())) |t| {
         try socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
-    }
-    if (artifacts.diagnostics()) {
-        std.debug.print("h3-interop: artifact diagnostics qlog_dropped_records={d} keylog_dropped_records={d}\n", .{
-            artifacts.qlog_dropped_records,
-            artifacts.keylog_dropped_records,
-        });
     }
     std.debug.print("h3-interop: client ok\n", .{});
 }
@@ -951,9 +986,15 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         var group_id_buf: [16]u8 = undefined;
         var artifacts = try ArtifactSink.init(allocator, args.qlog_dir, args.keylog_path, .server, cidHex(parsed.dcid, &group_id_buf));
         defer artifacts.deinit();
+        defer artifacts.reportDiagnostics();
         if (args.keylog_path.len > 0) {
             std.debug.print("h3-interop: WARNING keylog enabled; {s} permits decrypting captured traffic\n", .{args.keylog_path});
         }
+        artifacts.emitQuicQlog(.{ .connection_started = .{
+            .odcid_len = @intCast(parsed.dcid.len),
+            .scid_len = @intCast(parsed.scid.len),
+            .dcid_len = @intCast(parsed.dcid.len),
+        } });
         const keylog_context = artifacts.keylogContext(.server);
         const server = try Connection.init(allocator, .{
             .role = .server,
@@ -1014,7 +1055,10 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
                 if (!h3_started) {
                     std.debug.print("h3-interop: established, alpn_h3={}\n", .{server.negotiatedH3()});
                     reportNegotiated(args, &backend, backend.engine.core.retry_state == .hrr_sent);
-                    if (!matrixTupleHolds(args, &backend)) std.process.exit(1);
+                    if (!matrixTupleHolds(args, &backend)) {
+                        artifacts.reportDiagnostics();
+                        std.process.exit(1);
+                    }
                     try h3.start(server);
                     h3_started = true;
                 }
@@ -1054,4 +1098,78 @@ fn runServer(allocator: std.mem.Allocator, args: Args) !void {
         std.process.exit(1);
     }
     std.debug.print("h3-interop: server ok, served={d}\n", .{served});
+}
+
+const testing = std.testing;
+
+test "artifact sink appends keylog lines across repeated connection sinks" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = testing.allocator;
+    const root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const keylog_path = try std.fmt.allocPrint(allocator, "{s}/native-server.keys", .{root});
+    defer allocator.free(keylog_path);
+
+    const random_a = [_]u8{0x11} ** quic.tls_core.keylog.client_random_len;
+    const random_b = [_]u8{0x22} ** quic.tls_core.keylog.client_random_len;
+    const secret_a = [_]u8{0xaa} ** 32;
+    const secret_b = [_]u8{0xbb} ** 32;
+
+    var first = try ArtifactSink.init(allocator, "", keylog_path, .server, "first");
+    var first_context = first.keylogContext(.server);
+    try first_context.setClientRandom(&random_a);
+    first_context.emitSecret(.handshake, .write, &secret_a);
+    first.deinit();
+
+    var second = try ArtifactSink.init(allocator, "", keylog_path, .server, "second");
+    var second_context = second.keylogContext(.server);
+    try second_context.setClientRandom(&random_b);
+    second_context.emitSecret(.handshake, .write, &secret_b);
+    second.deinit();
+
+    const contents = try compat.cwd().readFileAlloc(allocator, keylog_path, 4096);
+    defer allocator.free(contents);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, contents, "SERVER_HANDSHAKE_TRAFFIC_SECRET"));
+    try testing.expect(std.mem.indexOf(u8, contents, "1111111111111111111111111111111111111111111111111111111111111111") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "2222222222222222222222222222222222222222222222222222222222222222") != null);
+    const stat = try compat.cwd().statFile(keylog_path);
+    try testing.expectEqual(@as(u32, 0o600), @intFromEnum(stat.permissions) & 0o777);
+}
+
+test "artifact sink writes qlog header connection start and representative events" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = testing.allocator;
+    const root = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const qlog_dir = try std.fmt.allocPrint(allocator, "{s}/qlog", .{root});
+    defer allocator.free(qlog_dir);
+
+    var sink = try ArtifactSink.init(allocator, qlog_dir, "", .server, "0011223344556677");
+    sink.emitQuicQlog(.{ .connection_started = .{
+        .odcid_len = 8,
+        .scid_len = 8,
+        .dcid_len = 8,
+    } });
+    sink.emitQuicQlog(.{ .packet_sent = .{
+        .packet_type = .initial,
+        .packet_number = 1,
+        .length = 1200,
+        .ack_eliciting = true,
+    } });
+    sink.h3Sink().emit(.{ .frame_created = .{
+        .stream_id = 0,
+        .frame = .{ .data = .{ .raw_length = 5 } },
+    } });
+    sink.deinit();
+
+    const qlog_path = try std.fmt.allocPrint(allocator, "{s}/server-0011223344556677.sqlog", .{qlog_dir});
+    defer allocator.free(qlog_path);
+    const contents = try compat.cwd().readFileAlloc(allocator, qlog_path, 4096);
+    defer allocator.free(contents);
+    try testing.expect(std.mem.indexOf(u8, contents, "\"file_schema\":\"urn:ietf:params:qlog:file:sequential\"") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "\"name\":\"quic:connection_started\"") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "\"name\":\"quic:packet_sent\"") != null);
+    try testing.expect(std.mem.indexOf(u8, contents, "\"name\":\"http3:frame_created\"") != null);
 }
