@@ -7665,6 +7665,9 @@ test "http3 runtime: observability artifacts follow accepted connection lifecycl
         .scid = &scid,
         .token = "",
     }, testPeerSockaddr(44_300), 1_000_000) orelse return error.SkipZigTest;
+    defer runtime.removeConnection(&connections, &routes, &per_ip, handle, .administrative);
+    artifacts.waitIdle();
+
     const entry = connections.get(handle).?;
     Runtime.h3ConnectionEvent(&entry.h3_observer, .{ .stream_type_set = .{ .stream_id = 0, .stream_type = .control } });
     artifacts.waitIdle();
@@ -7693,6 +7696,7 @@ test "http3 runtime: observability artifacts follow accepted connection lifecycl
         .scid = &scid2,
         .token = "",
     }, testPeerSockaddr(44_301), 1_100_000) orelse return error.SkipZigTest;
+    defer runtime.removeConnection(&connections, &routes, &per_ip, handle2, .administrative);
     artifacts.waitIdle();
     try testing.expectEqual(@as(usize, 1), artifacts.traceCount());
     runtime.removeConnection(&connections, &routes, &per_ip, handle2, .administrative);
