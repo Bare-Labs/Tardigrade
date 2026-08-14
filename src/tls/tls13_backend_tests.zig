@@ -182,6 +182,17 @@ fn recordPolicyForNames(names: []const []const u8, allow_absent_alpn: bool) tls_
     return policy;
 }
 
+fn recordPolicyForNamesAndCipherSuite(
+    names: []const []const u8,
+    allow_absent_alpn: bool,
+    comptime cipher_suite: tls_core.algorithms.CipherSuite,
+) tls_core.policy.Policy {
+    var policy = recordPolicyForNames(names, allow_absent_alpn);
+    const suites = [_]tls_core.algorithms.CipherSuite{cipher_suite};
+    policy.cipher_suites = &suites;
+    return policy;
+}
+
 // ==========================================================================
 // Direct transport-neutral driver coverage. This keeps key derivation,
 // record sequencing, epoch discard, and teardown assertions at the engine
@@ -435,6 +446,7 @@ const DirectHarness = struct {
     // addresses are captured into the backends by `configureClientAuth`.
     client_credential: ?credentials.FixedCredentialProvider = null,
     server_client_verifier: ?credentials.FixedVerifier = null,
+    keylog_context: tls_core.keylog.Context = .{},
 
     /// Wire up handshake-time client authentication before `run`. `mode` is the
     /// server's request policy; `client_cert` decides whether the client offers
@@ -508,6 +520,14 @@ const DirectHarness = struct {
     fn run(self: *DirectHarness) DirectError!void {
         self.client_driver = DirectDriver.init(.client, self.client_backend.backend());
         self.server_driver = DirectDriver.init(.server, self.server_backend.backend());
+        if (self.keylog_context.enabled) {
+            var client_context = self.keylog_context;
+            client_context.role = .client;
+            self.client_driver.sink.keylog_context = client_context;
+            var server_context = self.keylog_context;
+            server_context.role = .server;
+            self.server_driver.sink.keylog_context = server_context;
+        }
         self.drivers_ready = true;
         _ = try self.server_driver.start({});
         const initial = try self.client_driver.start({});
@@ -521,6 +541,10 @@ const DirectHarness = struct {
             initial,
             &self.observed,
         );
+    }
+
+    fn setKeylogContext(self: *DirectHarness, context: tls_core.keylog.Context) void {
+        self.keylog_context = context;
     }
 
     fn deinit(self: *DirectHarness) void {
@@ -1501,6 +1525,12 @@ test "#564 0-RTT round trip is accepted end to end under AES-256-GCM/SHA-384, no
     var replay_ctx: u8 = 0;
     try resumed.server_backend.setEarlyDataReplayGate(.{ .ctx = &replay_ctx, .decideFn = AllowReplayGate.decide });
 
+    var keylog_capture = KeylogCapture{};
+    resumed.setKeylogContext(.{
+        .enabled = true,
+        .sink = .{ .context = &keylog_capture, .emit_fn = KeylogCapture.emit },
+    });
+
     try resumed.run();
 
     try std.testing.expect(resumed.client_driver.isComplete());
@@ -1522,6 +1552,9 @@ test "#564 0-RTT round trip is accepted end to end under AES-256-GCM/SHA-384, no
     // secret path (`KeySchedule.clientEarlyTrafficSecret`), not just the
     // 32-byte SHA-256 one the baseline test above exercises.
     try std.testing.expectEqual(@as(usize, 48), resumed.observed.zero_rtt_secret[0].?.slice().len);
+    try std.testing.expectEqual(@as(usize, 2), keylog_capture.client_early_count);
+    try std.testing.expectEqual(@as(usize, 48), keylog_capture.client_early_len);
+    try std.testing.expectEqualSlices(u8, &clientEntropy().hello_random, &keylog_capture.client_early_random);
     try std.testing.expectEqualSlices(
         u8,
         resumed.observed.zero_rtt_secret[0].?.slice(),
@@ -5941,10 +5974,22 @@ const SocketHarness = struct {
     };
 
     fn create(opts: Options) !*SocketHarness {
-        return createWithAllocator(std.testing.allocator, opts);
+        return createWithAllocatorAndCipherSuite(std.testing.allocator, suite, opts);
     }
 
     fn createWithAllocator(allocator: std.mem.Allocator, opts: Options) !*SocketHarness {
+        return createWithAllocatorAndCipherSuite(allocator, suite, opts);
+    }
+
+    fn createSha384(opts: Options) !*SocketHarness {
+        return createWithAllocatorAndCipherSuite(std.testing.allocator, .tls_aes_256_gcm_sha384, opts);
+    }
+
+    fn createWithAllocatorAndCipherSuite(
+        allocator: std.mem.Allocator,
+        comptime cipher_suite: tls_core.algorithms.CipherSuite,
+        opts: Options,
+    ) !*SocketHarness {
         const self = try allocator.create(SocketHarness);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
@@ -5953,8 +5998,8 @@ const SocketHarness = struct {
 
         self.client_alpn_protocols = .{opts.client_alpn};
         self.server_alpn_protocols = .{opts.server_alpn};
-        const client_config = tls_backend.recordConfig(recordPolicyForNames(&self.client_alpn_protocols, false));
-        const server_config = tls_backend.recordConfig(recordPolicyForNames(&self.server_alpn_protocols, false));
+        const client_config = tls_backend.recordConfig(recordPolicyForNamesAndCipherSuite(&self.client_alpn_protocols, false, cipher_suite));
+        const server_config = tls_backend.recordConfig(recordPolicyForNamesAndCipherSuite(&self.server_alpn_protocols, false, cipher_suite));
         // `self` is already at its final heap address (allocated above), so
         // seeding these in place and reusing the result for both the
         // backend and the record stream is safe (#490 review).
@@ -5978,8 +6023,8 @@ const SocketHarness = struct {
         self.client_carrier = .{ .fd = self.fds[0], .max_chunk = opts.client_chunk, .one_write_per_drive = opts.one_write_per_drive };
         self.server_carrier = .{ .fd = self.fds[1], .max_chunk = opts.server_chunk, .one_write_per_drive = opts.one_write_per_drive };
 
-        self.client = try es.PureZigRecordStream.initWithCarrierAndBackend(allocator, .client, client_crypto_provider, suite, self.client_carrier.carrier(), self.client_engine.backend());
-        self.server = try es.PureZigRecordStream.initWithCarrierAndBackend(allocator, .server, server_crypto_provider, suite, self.server_carrier.carrier(), self.server_engine.backend());
+        self.client = try es.PureZigRecordStream.initWithCarrierAndBackend(allocator, .client, client_crypto_provider, cipher_suite, self.client_carrier.carrier(), self.client_engine.backend());
+        self.server = try es.PureZigRecordStream.initWithCarrierAndBackend(allocator, .server, server_crypto_provider, cipher_suite, self.server_carrier.carrier(), self.server_engine.backend());
         self.client.setExpectedAlpn(opts.client_alpn) catch unreachable;
         return self;
     }
@@ -12786,6 +12831,43 @@ const Generations = struct {
     server_write: u64,
 };
 
+const KeylogCapture = struct {
+    client_generation_counts: [4]usize = .{0} ** 4,
+    server_generation_counts: [4]usize = .{0} ** 4,
+    client_generation_lens: [4]usize = .{0} ** 4,
+    server_generation_lens: [4]usize = .{0} ** 4,
+    client_early_count: usize = 0,
+    client_early_len: usize = 0,
+    client_early_random: [tls_core.keylog.client_random_len]u8 = [_]u8{0} ** tls_core.keylog.client_random_len,
+
+    fn emit(ctx: ?*anyopaque, entry: tls_core.keylog.Entry) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        switch (entry.label.epoch) {
+            .early => {
+                if (entry.label.endpoint != .client) return;
+                self.client_early_count += 1;
+                self.client_early_len = entry.secret.len;
+                @memcpy(&self.client_early_random, entry.client_random);
+            },
+            .application => {
+                if (entry.label.generation >= self.client_generation_counts.len) return;
+                const index: usize = @intCast(entry.label.generation);
+                switch (entry.label.endpoint) {
+                    .client => {
+                        self.client_generation_counts[index] += 1;
+                        self.client_generation_lens[index] = entry.secret.len;
+                    },
+                    .server => {
+                        self.server_generation_counts[index] += 1;
+                        self.server_generation_lens[index] = entry.secret.len;
+                    },
+                }
+            },
+            .handshake => return,
+        }
+    }
+};
+
 fn generations(h: *SocketHarness) Generations {
     return .{
         .client_read = h.client.bridge.read_key_generation,
@@ -12877,6 +12959,60 @@ test "#357 a one-way KeyUpdate advances only the sending direction" {
     }, generations(h));
     try expectSecretsAgree(h);
     try expectTrafficBothWays(h, "after-update");
+}
+
+test "#357 real record-mode KeyUpdate emits NSS keylog generations from derived traffic secrets" {
+    const h = try SocketHarness.create(.{});
+    defer h.destroy();
+
+    var capture = KeylogCapture{};
+    const context = tls_core.keylog.Context{
+        .enabled = true,
+        .sink = .{ .context = &capture, .emit_fn = KeylogCapture.emit },
+    };
+    try h.client.setKeylogContext(context);
+    try h.server.setKeylogContext(context);
+
+    try h.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expect(capture.client_generation_counts[0] > 0);
+    try std.testing.expect(capture.server_generation_counts[0] > 0);
+
+    try h.client.requestKeyUpdate(.update_not_requested);
+    try driveUntilServerRead(h, 1);
+    try std.testing.expectEqual(@as(usize, 2), capture.client_generation_counts[1]);
+
+    try h.client.requestKeyUpdate(.update_not_requested);
+    try driveUntilServerRead(h, 2);
+    try std.testing.expectEqual(@as(usize, 2), capture.client_generation_counts[2]);
+
+    try h.server.requestKeyUpdate(.update_not_requested);
+    try h.driveUntil(struct {
+        fn done(hh: *SocketHarness) bool {
+            return hh.client.bridge.read_key_generation == 1;
+        }
+    }.done);
+    try std.testing.expectEqual(@as(usize, 2), capture.server_generation_counts[1]);
+    try expectTrafficBothWays(h, "keylog-update");
+
+    const h384 = try SocketHarness.createSha384(.{});
+    defer h384.destroy();
+
+    var capture384 = KeylogCapture{};
+    const context384 = tls_core.keylog.Context{
+        .enabled = true,
+        .sink = .{ .context = &capture384, .emit_fn = KeylogCapture.emit },
+    };
+    try h384.client.setKeylogContext(context384);
+    try h384.server.setKeylogContext(context384);
+
+    try h384.driveUntil(SocketHarness.bothComplete);
+    try std.testing.expectEqual(@as(usize, 48), capture384.client_generation_lens[0]);
+    try std.testing.expectEqual(@as(usize, 48), capture384.server_generation_lens[0]);
+
+    try h384.client.requestKeyUpdate(.update_not_requested);
+    try driveUntilServerRead(h384, 1);
+    try std.testing.expectEqual(@as(usize, 2), capture384.client_generation_counts[1]);
+    try std.testing.expectEqual(@as(usize, 48), capture384.client_generation_lens[1]);
 }
 
 test "#357 update_requested draws exactly one reciprocal update and then stops" {

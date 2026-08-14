@@ -12,6 +12,7 @@ const crypto = @import("crypto");
 const algorithms = @import("algorithms.zig");
 const engine = @import("engine.zig");
 const events = @import("events.zig");
+const keylog = @import("keylog.zig");
 const key_schedule = @import("key_schedule.zig");
 const record_codec = @import("record_codec.zig");
 const record_protection = @import("record_protection.zig");
@@ -336,6 +337,10 @@ pub const Bridge = struct {
     /// post-handshake message, so a pre-handshake or post-teardown call is a
     /// state error rather than a no-op.
     pub fn updateTrafficSecret(self: *Bridge, direction: events.SecretDirection) Error!void {
+        try self.updateTrafficSecretWithKeylog(direction, null);
+    }
+
+    pub fn updateTrafficSecretWithKeylog(self: *Bridge, direction: events.SecretDirection, keylog_context: ?*keylog.Context) Error!void {
         if (self.torn_down or self.application_discarded) return error.InvalidEpochTransition;
         if (!self.handshake_complete) return error.HandshakeNotComplete;
 
@@ -356,6 +361,7 @@ pub const Bridge = struct {
                 state.deinit();
                 state.* = record_protection.ReadState.init(self.crypto_provider, keys);
                 self.read_key_generation += 1;
+                if (keylog_context) |ctx| ctx.emitSecretAtGeneration(.application, direction, self.read_key_generation, next[0..digest_len]);
             },
             .write => {
                 const state = self.writeApplication() orelse return error.MissingWriteKeys;
@@ -368,6 +374,7 @@ pub const Bridge = struct {
                 state.deinit();
                 state.* = record_protection.WriteState.init(self.crypto_provider, keys);
                 self.write_key_generation += 1;
+                if (keylog_context) |ctx| ctx.emitSecretAtGeneration(.application, direction, self.write_key_generation, next[0..digest_len]);
             },
         }
     }

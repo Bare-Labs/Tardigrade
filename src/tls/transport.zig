@@ -30,6 +30,7 @@ const std = @import("std");
 const crypto_secrets = @import("crypto_secrets");
 const alerts = @import("alerts.zig");
 const events = @import("events.zig");
+const keylog = @import("keylog.zig");
 const key_update = @import("key_update.zig");
 const record_size = @import("record_size.zig");
 const state = @import("state.zig");
@@ -112,6 +113,7 @@ pub fn ContractWithOptions(
             len: usize = 0,
             scratch: [max_bytes]u8 = undefined,
             used: usize = 0,
+            keylog_context: keylog.Context = .{},
 
             /// Clear all events and securely wipe the scratch range copied
             /// traffic secrets (and other emitted bytes) occupied, so they do
@@ -249,6 +251,9 @@ pub fn ContractWithOptions(
 
             pub fn emitSecret(self: *EventSink, epoch: Epoch, direction: events.SecretDirection, data: []const u8) ErrorSet!void {
                 try self.reserve(data.len);
+                if (epochForKeylog(epoch)) |keylog_epoch| {
+                    self.keylog_context.emitSecret(keylog_epoch, direction, data);
+                }
                 const stored = self.storeUnchecked(data);
                 self.pushUnchecked(.{ .traffic_secret = .{ .epoch = epoch, .direction = direction, .data = stored } });
             }
@@ -305,6 +310,20 @@ pub fn ContractWithOptions(
             }
         };
 
+        fn epochForKeylog(epoch: Epoch) ?events.EncryptionEpoch {
+            return switch (@typeInfo(Epoch)) {
+                .@"enum" => blk: {
+                    const name = @tagName(epoch);
+                    if (std.mem.eql(u8, name, "initial")) break :blk .initial;
+                    if (std.mem.eql(u8, name, "zero_rtt")) break :blk .zero_rtt;
+                    if (std.mem.eql(u8, name, "handshake")) break :blk .handshake;
+                    if (std.mem.eql(u8, name, "application")) break :blk .application;
+                    break :blk null;
+                },
+                else => null,
+            };
+        }
+
         pub const Backend = struct {
             ptr: *anyopaque,
             startFn: *const fn (ptr: *anyopaque, role: state.Role, params: TransportParameters, sink: *EventSink) ErrorSet!void,
@@ -322,6 +341,7 @@ pub fn ContractWithOptions(
             earlyDataAttemptedFn: ?*const fn (ptr: *anyopaque) bool = null,
             earlyDataMaxBytesFn: ?*const fn (ptr: *anyopaque) u32 = null,
             earlyDataDiscardLimitFn: ?*const fn (ptr: *anyopaque) u32 = null,
+            clientRandomFn: ?*const fn (ptr: *anyopaque) ?*const [keylog.client_random_len]u8 = null,
             /// True once this side has *sent* a HelloRetryRequest (#338).
             /// Only a server ever does, and only after it has accepted a
             /// complete, well-formed first ClientHello -- which is precisely
@@ -390,6 +410,11 @@ pub fn ContractWithOptions(
                 return 0;
             }
 
+            pub fn clientRandom(self: Backend) ?*const [keylog.client_random_len]u8 {
+                if (self.clientRandomFn) |f| return f(self.ptr);
+                return null;
+            }
+
             /// See `helloRetryRequestSentFn`. Defaults to false, which keeps
             /// the middlebox-compatibility window closed for any backend that
             /// does not report HRR -- the conservative direction.
@@ -446,6 +471,88 @@ test "generic transport sink stores copied event payloads" {
     try std.testing.expectEqualStrings("hello", sink.items[0].handshake_bytes.data);
     try std.testing.expectEqual(events.SecretDirection.write, sink.items[1].traffic_secret.direction);
     try std.testing.expect(!sink.items[2].peer_transport_parameters.enabled);
+}
+
+test "generic transport sink keylog is disabled by default" {
+    const ErrorSet = error{TransportBufferOverflow};
+    const Epoch = events.EncryptionEpoch;
+    const T = Contract(void, Epoch, ErrorSet);
+
+    const Capture = struct {
+        count: usize = 0,
+        fn emit(ctx: ?*anyopaque, _: keylog.Entry) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.count += 1;
+        }
+    };
+    var capture = Capture{};
+    var sink = T.EventSink{};
+    sink.keylog_context.sink = .{ .context = &capture, .emit_fn = Capture.emit };
+    try sink.emitSecret(.handshake, .write, &[_]u8{0x11} ** 32);
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+}
+
+test "generic transport sink emits TLS-owned keylog before reset can wipe secrets" {
+    const ErrorSet = error{TransportBufferOverflow};
+    const Epoch = events.EncryptionEpoch;
+    const T = Contract(void, Epoch, ErrorSet);
+
+    const Capture = struct {
+        count: usize = 0,
+        line: [256]u8 = undefined,
+        line_len: usize = 0,
+        fn emit(ctx: ?*anyopaque, entry: keylog.Entry) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.count += 1;
+            const line = keylog.writeLine(entry, &self.line) catch unreachable;
+            self.line_len = line.len;
+        }
+    };
+    const random = [_]u8{0x22} ** keylog.client_random_len;
+    const secret = [_]u8{0x33} ** 48;
+    var capture = Capture{};
+    var sink = T.EventSink{
+        .keylog_context = .{
+            .enabled = true,
+            .role = .server,
+            .sink = .{ .context = &capture, .emit_fn = Capture.emit },
+        },
+    };
+    try sink.keylog_context.setClientRandom(&random);
+    try sink.emitSecret(.application, .write, &secret);
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expect(std.mem.startsWith(u8, capture.line[0..capture.line_len], "SERVER_TRAFFIC_SECRET_0 "));
+
+    sink.reset();
+    try std.testing.expect(std.mem.indexOf(u8, capture.line[0..capture.line_len], "333333") != null);
+    for (sink.scratch[0..secret.len]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "generic transport sink KeyUpdate does not pre-advance keylog generations" {
+    const ErrorSet = error{TransportBufferOverflow};
+    const Epoch = events.EncryptionEpoch;
+    const T = Contract(void, Epoch, ErrorSet);
+
+    const Capture = struct {
+        last: ?keylog.Label = null,
+        fn emit(ctx: ?*anyopaque, entry: keylog.Entry) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.last = entry.label;
+        }
+    };
+    const random = [_]u8{0x44} ** keylog.client_random_len;
+    var capture = Capture{};
+    var sink = T.EventSink{
+        .keylog_context = .{
+            .enabled = true,
+            .role = .client,
+            .sink = .{ .context = &capture, .emit_fn = Capture.emit },
+        },
+    };
+    try sink.keylog_context.setClientRandom(&random);
+    try sink.emitKeyUpdate(.read);
+    try sink.emitSecret(.application, .read, &[_]u8{0x55} ** 32);
+    try std.testing.expectEqual(keylog.Label{ .endpoint = .server, .epoch = .application, .generation = 0 }, capture.last.?);
 }
 
 test "generic transport sink enforces bounded payload storage" {

@@ -133,11 +133,20 @@ pub const Config = struct {
     /// Optional H3 qlog sink. Defaults to no-op; concrete file ownership stays
     /// in the composition root and sink errors must not affect protocol state.
     h3_qlog_sink: http3.qlog.Sink = .{},
+    /// Optional QUIC qlog sink. Defaults to no-op; concrete file ownership
+    /// stays in the composition root and sink errors must not affect protocol
+    /// state.
+    quic_qlog_sink: quic.qlog.Sink = .{},
     /// Optional per-connection H3 qlog sink factory. When set, this overrides
     /// `h3_qlog_sink` for accepted connections and lets the composition root
     /// route H3 events to the same connection trace as QUIC events.
     h3_qlog_sink_factory_ctx: ?*anyopaque = null,
     h3_qlog_sink_factory_cb: ?*const fn (?*anyopaque, u64) http3.qlog.Sink = null,
+    /// Optional per-connection QUIC qlog sink factory. Use the same handle as
+    /// `h3_qlog_sink_factory_cb` so a composition root can interleave both
+    /// namespaces into one `.sqlog`.
+    quic_qlog_sink_factory_ctx: ?*anyopaque = null,
+    quic_qlog_sink_factory_cb: ?*const fn (?*anyopaque, u64) quic.qlog.Sink = null,
 };
 
 /// Half-open admission limits (#328 review). The native stack does not send
@@ -224,6 +233,13 @@ pub const Snapshot = struct {
 
 /// One accepted QUIC connection with its HTTP/3 session state.
 const ConnEntry = struct {
+    const QuicObserver = struct {
+        runtime: *Runtime,
+        connection_handle: u64,
+        qlog_sink: quic.qlog.Sink = .{},
+        close_logged: bool = false,
+    };
+
     const H3Observer = struct {
         runtime: *Runtime,
         connection_handle: u64,
@@ -233,6 +249,7 @@ const ConnEntry = struct {
     backend: *quic.tls_backend.Tls13Backend,
     conn: *Connection,
     h3: H3,
+    quic_observer: QuicObserver = undefined,
     h3_observer: H3Observer = undefined,
     h3_started: bool = false,
     /// Source IPv4 address of the Initial that opened the connection,
@@ -323,8 +340,11 @@ pub const Runtime = struct {
     quic_zero_rtt_packet_metrics_ctx: ?*anyopaque = null,
     quic_zero_rtt_packet_metrics_cb: ?*const fn (*anyopaque, metrics_mod.QuicZeroRttPacketOutcome) void = null,
     h3_qlog_sink: http3.qlog.Sink = .{},
+    quic_qlog_sink: quic.qlog.Sink = .{},
     h3_qlog_sink_factory_ctx: ?*anyopaque = null,
     h3_qlog_sink_factory_cb: ?*const fn (?*anyopaque, u64) http3.qlog.Sink = null,
+    quic_qlog_sink_factory_ctx: ?*anyopaque = null,
+    quic_qlog_sink_factory_cb: ?*const fn (?*anyopaque, u64) quic.qlog.Sink = null,
     snapshot_mutex: compat.Mutex = .{},
     snapshot_state: Snapshot,
     stopping: std.atomic.Value(bool),
@@ -427,8 +447,11 @@ pub const Runtime = struct {
             .quic_zero_rtt_packet_metrics_ctx = cfg.quic_zero_rtt_packet_metrics_ctx,
             .quic_zero_rtt_packet_metrics_cb = cfg.quic_zero_rtt_packet_metrics_cb,
             .h3_qlog_sink = cfg.h3_qlog_sink,
+            .quic_qlog_sink = cfg.quic_qlog_sink,
             .h3_qlog_sink_factory_ctx = cfg.h3_qlog_sink_factory_ctx,
             .h3_qlog_sink_factory_cb = cfg.h3_qlog_sink_factory_cb,
+            .quic_qlog_sink_factory_ctx = cfg.quic_qlog_sink_factory_ctx,
+            .quic_qlog_sink_factory_cb = cfg.quic_qlog_sink_factory_cb,
             .snapshot_state = .{
                 .quic_port = cfg.quic_port,
                 .udp_buffers = udp_buffers,
@@ -798,7 +821,7 @@ pub const Runtime = struct {
             .initial_path = .{ .local = self.local_address, .remote = addressFromSockaddrIn(peer) },
             .initial_address_validated = retry_context != null,
             .stateless_reset_key = &self.secrets.stateless_reset_key,
-            .events = .{ .context = self, .emitFn = quicConnectionEvent },
+            .events = .{},
         }) catch {
             allocator.destroy(backend);
             return null;
@@ -815,16 +838,25 @@ pub const Runtime = struct {
             factory(self.h3_qlog_sink_factory_ctx, handle)
         else
             self.h3_qlog_sink;
+        const quic_sink = if (self.quic_qlog_sink_factory_cb) |factory|
+            factory(self.quic_qlog_sink_factory_ctx, handle)
+        else
+            self.quic_qlog_sink;
         const h3 = H3.initWithSettings(allocator, .server, self.h3_settings);
         entry.* = .{
             .backend = backend,
             .conn = conn,
             .h3 = h3,
+            .quic_observer = .{ .runtime = self, .connection_handle = handle, .qlog_sink = quic_sink },
             .h3_observer = .{ .runtime = self, .connection_handle = handle, .qlog_sink = h3_sink },
             .admission_source_ip = peer.addr,
             .cid_len = parsed.dcid.len,
             .accepted_at_us = now,
         };
+        entry.conn.events = .{ .context = &entry.quic_observer, .emitFn = quicConnectionEvent };
+        if (quic_sink.isEnabled()) {
+            quic_sink.log(now, .{ .connection_started = .{ .dcid_len = @intCast(@min(parsed.dcid.len, std.math.maxInt(u8))) } });
+        }
         if (h3EventSinkFor(&entry.h3_observer)) |event_sink| {
             entry.h3.setEventSink(event_sink);
         }
@@ -1502,7 +1534,20 @@ pub const Runtime = struct {
     /// enum/family context only; no connection IDs, tokens, packet payloads,
     /// or IP addresses are emitted.
     fn quicConnectionEvent(ctx: ?*anyopaque, event: quic.connection.Event) void {
-        const self: *Runtime = @ptrCast(@alignCast(ctx.?));
+        const observer: *ConnEntry.QuicObserver = @ptrCast(@alignCast(ctx.?));
+        const self = observer.runtime;
+        if (observer.qlog_sink.isEnabled()) {
+            if (quicEventToQlog(event)) |qlog_event| {
+                switch (qlog_event) {
+                    .connection_closed => {
+                        if (observer.close_logged) return;
+                        observer.close_logged = true;
+                    },
+                    else => {},
+                }
+                observer.qlog_sink.log(nowUs(), qlog_event);
+            }
+        }
         switch (event) {
             .early_data_decision => |decision| {
                 const mapped: metrics_mod.QuicEarlyDataDecision = switch (decision) {
@@ -1563,6 +1608,186 @@ pub const Runtime = struct {
             },
             else => {},
         }
+    }
+
+    fn quicEventToQlog(event: quic.connection.Event) ?quic.qlog.Event {
+        return switch (event) {
+            .state => |state| switch (state) {
+                .handshaking, .established, .closing, .draining, .closed => null,
+            },
+            .packet_received => |packet_event| .{ .packet_received = .{
+                .packet_type = packetTypeForKind(packet_event.packet_type),
+                .packet_number = packet_event.packet_number,
+                .length = packet_event.size,
+            } },
+            .packet_sent => |packet_event| .{ .packet_sent = .{
+                .packet_type = packetTypeForKind(packet_event.packet_type),
+                .packet_number = packet_event.packet_number,
+                .length = packet_event.size,
+                .ack_eliciting = packet_event.ack_eliciting,
+            } },
+            .packet_dropped => |drop| .{ .packet_dropped = .{
+                .trigger = dropReasonToQlog(drop.reason),
+                .length = drop.size,
+            } },
+            .handshake_complete => .{ .handshake_progressed = .{ .stage = .application_keys_installed } },
+            .handshake_confirmed => .{ .handshake_progressed = .{ .stage = .confirmed } },
+            .pto_fired => |pto| .{ .recovery_metrics_updated = .{ .pto_count = @intCast(@min(pto.count, std.math.maxInt(u16))) } },
+            .packets_acked => |acked| .{ .packets_acked = .{
+                .packet_number_space = packetNumberSpaceToQlog(acked.space),
+                .packet_number = acked.packet_number,
+            } },
+            .packets_lost => |lost| .{ .packets_lost = .{
+                .packet_type = if (lost.packet_type) |kind| packetTypeForKind(kind) else null,
+                .lost_count = lost.lost_count,
+                .bytes = lost.bytes,
+            } },
+            .recovery_metrics_updated => |metrics| .{ .recovery_metrics_updated = .{
+                .latest_rtt_ms = usToMs(metrics.latest_rtt_us),
+                .smoothed_rtt_ms = usToMs(metrics.smoothed_rtt_us),
+                .rtt_variance_ms = usToMs(metrics.rttvar_us),
+                .pto_count = metrics.pto_count,
+                .congestion_window = metrics.congestion_window,
+                .bytes_in_flight = metrics.bytes_in_flight,
+            } },
+            .stream_reset => |reset| .{ .stream_reset = .{
+                .kind = if (reset.local) .reset_sent else .reset_received,
+                .stream_id = reset.id,
+                .error_code = reset.error_code,
+            } },
+            .stop_sending => |stop| .{ .stream_reset = .{
+                .kind = if (stop.local) .stop_sending_sent else .stop_sending_received,
+                .stream_id = stop.id,
+                .error_code = stop.error_code,
+            } },
+            .flow_control_state_changed => |blocked| switch (blocked.scope) {
+                .connection => .{ .data_blocked = .{ .connection = .{
+                    .old = flowControlStateToQlog(blocked.old),
+                    .new = flowControlStateToQlog(blocked.new),
+                    .reason = .connection_flow_control,
+                } } },
+                .stream => .{ .data_blocked = .{ .stream = .{
+                    .stream_id = blocked.stream_id orelse 0,
+                    .old = flowControlStateToQlog(blocked.old),
+                    .new = flowControlStateToQlog(blocked.new),
+                    .reason = .stream_flow_control,
+                } } },
+            },
+            .flow_control_blocked_received => |blocked| .{ .flow_control_blocked_received = .{
+                .scope = switch (blocked.scope) {
+                    .connection => .connection,
+                    .stream => .stream,
+                },
+                .stream_id = blocked.stream_id,
+            } },
+            .local_close_started => |close| .{ .connection_closed = .{
+                .trigger = if (close.is_application) .application else .@"error",
+                .close_error = if (close.is_application)
+                    .{ .application_unknown = close.error_code }
+                else
+                    .{ .connection_unknown = close.error_code },
+            } },
+            .close_sent => null,
+            .close_received => |close| .{ .connection_closed = .{
+                .trigger = if (close.is_application) .application else .@"error",
+                .close_error = if (close.is_application)
+                    .{ .application_unknown = close.error_code }
+                else
+                    .{ .connection_unknown = close.error_code },
+            } },
+            .idle_timeout => .{ .connection_closed = .{ .trigger = .idle_timeout } },
+            .path_validation_started => .{ .path_validation = .{ .kind = .challenge_sent } },
+            .path_validation_succeeded => .{ .path_validation = .{ .kind = .validated } },
+            .path_validation_failed => .{ .path_validation = .{ .kind = .failed } },
+            .path_promoted => |path| .{ .connection_migrated = .{ .new = switch (path.change) {
+                .nat_rebinding => .probing_successful,
+                .migration => .migration_complete,
+            } } },
+            .stream_state_changed => |stream| .{ .stream_state_updated = .{
+                .stream_id = stream.id,
+                .stream_side = streamSideToQlog(stream.side),
+                .old = if (stream.old) |old| streamStateToQlog(old) else null,
+                .new = streamStateToQlog(stream.new),
+                .trigger = if (stream.trigger) |trigger| streamStateTriggerToQlog(trigger) else null,
+            } },
+            .congestion_state_changed => |congestion| .{ .congestion_state_updated = .{
+                .old = congestionStateToQlog(congestion.old),
+                .new = congestionStateToQlog(congestion.new),
+            } },
+            .persistent_congestion => .{ .persistent_congestion = .{} },
+            .path_migration_blocked, .pmtu_updated => null,
+            .keys_discarded, .zero_rtt_packet, .early_data_decision, .ecn_state_changed => null,
+        };
+    }
+
+    fn flowControlStateToQlog(state: quic.connection.FlowControlState) quic.qlog.BlockedState {
+        return switch (state) {
+            .blocked => .blocked,
+            .unblocked => .unblocked,
+        };
+    }
+
+    fn streamSideToQlog(side: quic.connection.StreamSide) quic.qlog.StreamSide {
+        return switch (side) {
+            .sending => .sending,
+            .receiving => .receiving,
+        };
+    }
+
+    fn streamStateToQlog(state: quic.connection.StreamSideState) quic.qlog.StreamState {
+        return switch (state) {
+            .open => .open,
+            .closed => .closed,
+        };
+    }
+
+    fn streamStateTriggerToQlog(trigger: quic.connection.StreamStateTrigger) quic.qlog.StreamStateTrigger {
+        return switch (trigger) {
+            .local => .local,
+            .remote => .remote,
+        };
+    }
+
+    fn packetNumberSpaceToQlog(space: quic.recovery.PacketNumberSpace) quic.qlog.PacketNumberSpace {
+        return switch (space) {
+            .initial => .initial,
+            .handshake => .handshake,
+            .application => .application_data,
+        };
+    }
+
+    fn congestionStateToQlog(state: quic.connection.CongestionState) quic.qlog.CongestionState {
+        return switch (state) {
+            .slow_start => .slow_start,
+            .congestion_avoidance => .congestion_avoidance,
+            .recovery => .recovery,
+        };
+    }
+
+    fn packetTypeForKind(kind: quic.packet.PacketKind) quic.qlog.PacketType {
+        return switch (kind) {
+            .initial => .initial,
+            .zero_rtt => .zero_rtt,
+            .handshake => .handshake,
+            .one_rtt => .one_rtt,
+            .retry => .retry,
+            .version_negotiation => .version_negotiation,
+        };
+    }
+
+    fn dropReasonToQlog(reason: quic.connection.DropReason) quic.qlog.DropTrigger {
+        return switch (reason) {
+            .unknown_cid => .connection_unknown,
+            .keys_unavailable => .key_unavailable,
+            .undecryptable => .decryption_failure,
+            .malformed => .invalid,
+            .unsupported_version => .unsupported,
+            .unexpected_type => .invalid,
+        };
+    }
+
+    fn usToMs(value: ?u64) ?u64 {
+        return if (value) |v| v / 1000 else null;
     }
 
     fn noteConnectionAccepted(self: *Runtime) void {
@@ -2458,6 +2683,90 @@ const H3QlogRecorder = struct {
         }
     }
 };
+
+const QuicQlogRecorder = struct {
+    records: std.ArrayList(quic.qlog.Record) = .empty,
+
+    fn deinit(self: *QuicQlogRecorder, allocator: std.mem.Allocator) void {
+        self.records.deinit(allocator);
+    }
+
+    fn sink(self: *QuicQlogRecorder) quic.qlog.Sink {
+        return .{ .context = self, .emit_fn = emit };
+    }
+
+    fn emit(ctx: ?*anyopaque, record: quic.qlog.Record) void {
+        const self: *QuicQlogRecorder = @ptrCast(@alignCast(ctx.?));
+        self.records.append(std.testing.allocator, record) catch unreachable;
+    }
+};
+
+test "http3 runtime: QUIC qlog adapter preserves normalized transport events" {
+    try testing.expectEqual(
+        quic.qlog.Event{ .packets_acked = .{ .packet_number_space = .application_data, .packet_number = 11 } },
+        Runtime.quicEventToQlog(.{ .packets_acked = .{ .space = .application, .packet_number = 11 } }).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .packets_lost = .{ .packet_type = .one_rtt, .lost_count = 3, .bytes = 3600 } },
+        Runtime.quicEventToQlog(.{ .packets_lost = .{ .space = .application, .packet_type = .one_rtt, .lost_count = 3, .bytes = 3600 } }).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .packet_received = .{ .packet_type = .zero_rtt, .packet_number = 7, .length = 1200 } },
+        Runtime.quicEventToQlog(.{ .packet_received = .{ .space = .application, .packet_type = .zero_rtt, .packet_number = 7, .size = 1200 } }).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .recovery_metrics_updated = .{ .latest_rtt_ms = 12, .smoothed_rtt_ms = 10, .rtt_variance_ms = 3, .pto_count = 2, .congestion_window = 12000, .bytes_in_flight = 6000 } },
+        Runtime.quicEventToQlog(.{ .recovery_metrics_updated = .{ .latest_rtt_us = 12_900, .smoothed_rtt_us = 10_100, .rttvar_us = 3_999, .pto_count = 2, .congestion_window = 12000, .bytes_in_flight = 6000 } }).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .stream_reset = .{ .kind = .stop_sending_received, .stream_id = 8, .error_code = 42 } },
+        Runtime.quicEventToQlog(.{ .stop_sending = .{ .id = 8, .error_code = 42, .local = false } }).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .data_blocked = .{ .stream = .{ .stream_id = 12, .old = .unblocked, .new = .blocked, .reason = .stream_flow_control } } },
+        Runtime.quicEventToQlog(.{ .flow_control_state_changed = .{ .scope = .stream, .stream_id = 12, .local = true, .old = .unblocked, .new = .blocked } }).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .flow_control_blocked_received = .{ .scope = .stream, .stream_id = 12 } },
+        Runtime.quicEventToQlog(.{ .flow_control_blocked_received = .{ .scope = .stream, .stream_id = 12 } }).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .stream_state_updated = .{ .stream_id = 4, .stream_side = .receiving, .old = .open, .new = .closed, .trigger = .remote } },
+        Runtime.quicEventToQlog(.{ .stream_state_changed = .{ .id = 4, .side = .receiving, .old = .open, .new = .closed, .trigger = .remote } }).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .congestion_state_updated = .{ .old = .slow_start, .new = .recovery } },
+        Runtime.quicEventToQlog(.{ .congestion_state_changed = .{ .old = .slow_start, .new = .recovery } }).?,
+    );
+    try testing.expectEqual(quic.qlog.Event{ .persistent_congestion = .{} }, Runtime.quicEventToQlog(.persistent_congestion).?);
+    try testing.expectEqual(
+        quic.qlog.Event{ .connection_closed = .{ .trigger = .idle_timeout } },
+        Runtime.quicEventToQlog(.idle_timeout).?,
+    );
+    try testing.expectEqual(
+        quic.qlog.Event{ .connection_closed = .{ .trigger = .application, .close_error = .{ .application_unknown = 42 } } },
+        Runtime.quicEventToQlog(.{ .local_close_started = .{ .error_code = 42, .is_application = true } }).?,
+    );
+    try testing.expect(Runtime.quicEventToQlog(.{ .close_sent = .{ .error_code = 42, .is_application = true } }) == null);
+}
+
+test "http3 runtime: QUIC qlog observer logs only first semantic close" {
+    var runtime: Runtime = undefined;
+    var recorder = QuicQlogRecorder{};
+    defer recorder.deinit(testing.allocator);
+    var observer = ConnEntry.QuicObserver{
+        .runtime = &runtime,
+        .connection_handle = 1,
+        .qlog_sink = recorder.sink(),
+    };
+
+    Runtime.quicConnectionEvent(&observer, .{ .local_close_started = .{ .error_code = 42, .is_application = true } });
+    Runtime.quicConnectionEvent(&observer, .{ .close_received = .{ .error_code = 7, .is_application = false } });
+    Runtime.quicConnectionEvent(&observer, .idle_timeout);
+
+    try testing.expectEqual(@as(usize, 1), recorder.records.items.len);
+    try testing.expectEqual(quic.qlog.Event{ .connection_closed = .{ .trigger = .application, .close_error = .{ .application_unknown = 42 } } }, recorder.records.items[0].event);
+}
 
 test "http3 runtime: H3 qlog events route through connection-scoped observers" {
     var first = H3QlogRecorder{};
@@ -4789,6 +5098,10 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .initial_path = client_path,
     });
     defer client2.deinit();
+    var quic_observer2 = ConnEntry.QuicObserver{
+        .runtime = &runtime,
+        .connection_handle = 2,
+    };
     const server_conn2 = try Connection.init(allocator, .{
         .role = .server,
         .config = runtime.quic_config,
@@ -4800,12 +5113,13 @@ fn expectH3EarlyDataRejectionFallsBackToRealRequest(scenario: H3EarlyDataRejecti
         .crypto_provider = test_quic_crypto.testDefaultProvider(),
         .now_us = 2_000_000,
         .initial_path = server_path,
-        .events = .{ .context = &runtime, .emitFn = Runtime.quicConnectionEvent },
+        .events = .{ .context = &quic_observer2, .emitFn = Runtime.quicConnectionEvent },
     });
 
     var entry2 = ConnEntry{
         .backend = backend2,
         .conn = server_conn2,
+        .quic_observer = quic_observer2,
         // Mirrors `accept()`'s `self.h3_settings` (line ~585) — for the
         // application-incompatible scenario, `scenario.mutate` just changed
         // this live value, so phase 2's actual H3 session must run under

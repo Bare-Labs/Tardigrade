@@ -168,8 +168,9 @@ illegal-value failure.
   signature algorithms, and web-PKI certificate-chain validation in the
   pure-Zig backend.
 - Fuzz and benchmark coverage (#247); external interop against ngtcp2/nghttp3, quiche, and aioquic runs out of process via `scripts/interop/run-interop.sh`.
-- TLS key logging for local decryption (#255): `installSecret` is the single
-  choke point where every traffic secret is installed, so the debug-only keylog
-  `Sink` (`src/quic/keylog.zig`) is invoked there when `keylog_enabled`. Initial
+- TLS key logging for local decryption (#255): the shared TLS transport
+  `EventSink.emitSecret` path is the choke point where QUIC and record-mode TLS
+  traffic secrets pass through, so the debug-only keylog `Sink`
+  (`src/tls/keylog.zig`) is invoked there only when explicitly enabled. Initial
   secrets are intentionally never logged. See `docs/QUIC_QLOG.md` for the
   sensitive/debug-only handling rules.

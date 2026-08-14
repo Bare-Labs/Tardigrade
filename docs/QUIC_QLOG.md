@@ -1,19 +1,20 @@
 # QUIC/HTTP-3 Observability: qlog, keylog, metrics
 
-Design for the minimal qlog / keylog / metrics seam the pure-Zig QUIC and
-HTTP/3 stack (#240) needs **before** external interop and fuzzing (#247, #255).
+Design for the qlog / keylog / metrics seam the pure-Zig QUIC and HTTP/3 stack
+(#240) uses for external interop and failure debugging (#247, #255).
 
 This document is the design of record. The scaffolding it describes lives in:
 
 - `src/quic/qlog.zig` — transport-vantage event model + JSON-SEQ serializer.
 - `src/http3/qlog.zig` — HTTP/3- and QPACK-vantage event model + serializer.
-- `src/quic/keylog.zig` — NSS `SSLKEYLOGFILE` label mapping + line writer.
+- `src/tls/keylog.zig` — transport-neutral NSS `SSLKEYLOGFILE` label mapping
+  + line writer (`src/quic/keylog.zig` is a compatibility re-export).
 - `src/quic/config.zig` — `Observability { qlog_enabled, keylog_enabled }`.
 
-The intent is **design + small scaffold**, not a full observability
-implementation. Emission call-sites in the connection/packet/stream/path layers
-are added as those layers land; this seam fixes the event vocabulary, the
-layering, and the safety rules up front so those call-sites are mechanical.
+The event models, JSON-SEQ serializers, HTTP/3 qlog bridge, QUIC qlog bridge,
+and shared TLS keylog emission seam are implemented. Concrete qlog/keylog file
+destinations and #247 artifact retention remain opt-in composition-root follow
+ups.
 
 ## Goals
 
@@ -21,10 +22,8 @@ layering, and the safety rules up front so those call-sites are mechanical.
   flow-control blocking, and QPACK head-of-line blocking **distinguishable**
   from a captured trace, not just from ad-hoc `std.log` lines.
 - Provide the primitives (trace-header + event-line + keylog-line writers) so
-  that, once the composition root assembles them, the interop/failure harnesses
-  (#247) save `*.sqlog` / `*.keys` artifacts that qvis / Wireshark consume
-  directly. This PR ships those writers and the merged-shape test; the root
-  wiring that emits real flows is follow-up.
+  that composition roots and interop/failure harnesses (#247) can save
+  `*.sqlog` / `*.keys` artifacts that qvis / Wireshark consume directly.
 - Keep everything **off by default** and cheap when off.
 - Keep HTTP/3 out of `src/quic` (the #255 layering constraint).
 
@@ -45,13 +44,13 @@ respects that boundary rather than punching through it.
                  ┌───────────────────────────────────────────────────┐
                  │  owns the *.sqlog file + *.keys file writers       │
                  │  installs one quic.qlog.Sink, one http3.qlog.Sink, │
-                 │  one quic.keylog.Sink; interleaves all three       │
+                 │  one tls.keylog.Sink; interleaves all qlog events  │
                  └───────────────▲───────────────▲───────────────▲────┘
                                  │ Record        │ Record        │ Entry
         transport events ────────┘        H3/QPACK events ┘   TLS secrets ┘
         emitted by src/quic               emitted by src/http3   emitted by
-        (connection, packet,              (session, frame,       src/quic
-         recovery, path, stream)           qpack)                (tls_adapter)
+        (connection, packet,              (session, frame,       src/tls
+         recovery, path, stream)           qpack)                (transport)
 ```
 
 Rules:
@@ -63,8 +62,8 @@ Rules:
    diagnostics) are defined in `src/http3/qlog.zig` and emitted from
    `src/http3`. `src/http3` imports no transport type.
 3. Both packages emit through an **injected `Sink`** — an opaque context plus a
-   function pointer, exactly like the existing `recovery.EventSink`. A default
-   `Sink{}` is a no-op, so the seam costs nothing until a root wires it.
+   function pointer. A default `Sink{}` is a no-op, so the seam costs nothing
+   until a root wires it.
 4. The **concrete file writers** live at the composition root, which already
    owns both packages. It timestamps and interleaves the streams into one
    JSON-SEQ `.sqlog` file, so a single trace still shows transport and H3 events
@@ -78,8 +77,12 @@ into one valid file at the root instead.
 ### Relationship to existing hooks and metrics
 
 - `recovery.EventSink` / `recovery.Event` already exist for ACK/loss/PTO. The
-  connection layer bridges those into `qlog.Event.packet_lost` etc. rather than
-  duplicating loss logic — `recovery` stays qlog-agnostic.
+  connection layer now emits normalized ACK summaries and recovery metrics from
+  the ACK/loss/PTO paths, then the HTTP/3 runtime maps them to `quic.qlog.Event`
+  records when a qlog sink is installed.
+- Stream reset / STOP_SENDING and connection/stream flow-control-blocked
+  transitions are reported as typed transport events and mapped to qlog by the
+  runtime. `stream.zig` stays qlog-agnostic.
 - Per-module counters already exist and remain the source for Prometheus:
   `tls_adapter.Metrics` (protect/deprotect/deprotection-failure),
   `path.Metrics` (challenges, migrations, amplification-blocked),
@@ -200,21 +203,30 @@ lands.
 
 ## Keylog
 
-`src/quic/keylog.zig` maps a `(perspective, direction, level)` triple from the
-TLS adapter to an NSS `SSLKEYLOGFILE` label and formats the line:
+`src/tls/keylog.zig` maps a `(role, direction, epoch, generation)` tuple from
+the shared TLS transport event stream to an NSS `SSLKEYLOGFILE` label and
+formats the line:
 
 ```
 <LABEL> <client_random_hex> <secret_hex>\n
 ```
 
-Labels: `CLIENT_EARLY_TRAFFIC_SECRET`, `{CLIENT,SERVER}_HANDSHAKE_TRAFFIC_SECRET`,
-`{CLIENT,SERVER}_TRAFFIC_SECRET_0`. **Initial secrets are never logged** — they
-are derivable from the client DCID on the wire, so logging them only widens the
-exposure without adding debugging value.
+Labels: `CLIENT_EARLY_TRAFFIC_SECRET`,
+`{CLIENT,SERVER}_HANDSHAKE_TRAFFIC_SECRET`, and
+`{CLIENT,SERVER}_TRAFFIC_SECRET_N` for application generations. **Initial
+secrets are never logged** — for QUIC they are derivable from the client DCID
+on the wire, so logging them only widens the exposure without adding debugging
+value.
 
-Wiring point: `QuicTlsAdapter.installSecret` is the single choke point where
-every traffic secret is installed, so a keylog `Sink` is invoked there (guarded
-by `keylog_enabled`) before the secret is later wiped.
+Wiring points: `tls.transport.EventSink.emitSecret` emits handshake, early-data,
+and application generation-0 secrets from the shared TLS-engine event stream.
+Record-mode KeyUpdate generations are different: the next traffic secret is
+derived inside `record_epoch_bridge.Bridge.updateTrafficSecretWithKeylog()`, so
+that bridge synchronously emits the generation-N keylog entry before wiping its
+derivation scratch. Both paths require an enabled `tls.keylog.Context` with a
+32-byte ClientHello random and injected `Sink`; the default context is disabled.
+QUIC threads this context through `Connection.Options.tls_keylog_context`, while
+record-mode streams install it before handshake start with `setKeylogContext`.
 
 ### Sensitive / debug-only behaviour  ⚠️
 
@@ -281,9 +293,11 @@ and absent."
 ## Testing strategy
 
 - **Unit** (in place): event category/name mapping and JSON-SEQ serialization
-  for representative transport events, QPACK blocking, and keylog line format,
-  in `src/quic/qlog.zig`, `src/http3/qlog.zig`, `src/quic/keylog.zig`.
-- **Integration** (follow-up, with the connection layer): drive a handshake and
+  for representative transport events, QPACK blocking, runtime QUIC/H3 qlog
+  adapters, and TLS keylog line/emission behavior, in `src/quic/qlog.zig`,
+  `src/http3/qlog.zig`, `src/http/http3_runtime.zig`, and
+  `src/tls/keylog.zig` / `src/tls/transport.zig`.
+- **Integration** (follow-up, with file destinations): drive a handshake and
   assert a produced `.sqlog` contains the expected event classes; snapshot
   metrics on common error paths.
 - **Manual**: load a saved `.sqlog` in qvis and a capture + `.keys` in Wireshark
