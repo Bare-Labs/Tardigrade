@@ -63,7 +63,7 @@ replacing `-` with `_`, and prefixing `TARDIGRADE_`. For example,
 | `listen` | `TARDIGRADE_LISTEN_HOST`, `TARDIGRADE_LISTEN_PORT`, `TARDIGRADE_HTTP2_ENABLED` | host/port | `0.0.0.0:8069` | Accepts `host:port`, `port`, or `host`; `http2` flag enables HTTP/2. Ports must be 1-65535. | `listen 0.0.0.0:8443 http2;` |
 | `worker_processes` | `TARDIGRADE_WORKER_PROCESSES` | u32 | `1` | `auto` maps to `0`; used with master-process mode. | `worker_processes auto;` |
 | `worker_connections` | `TARDIGRADE_MAX_ACTIVE_CONNECTIONS` | u32 | `0` | `0` means unlimited active client connections. | `worker_connections 4096;` |
-| `master_process` | `TARDIGRADE_MASTER_PROCESS` | bool | `false` | Enables master-process supervision mode; required for `worker_processes` to take effect. | `master_process true;` |
+| `master_process` | `TARDIGRADE_MASTER_PROCESS` | bool | `false` | Enables master-process supervision mode; required for `worker_processes` to take effect. Current limitation: master/worker mode does not provide coherent PID-file/SIGHUP reload control across all workers; use single-process mode when relying on `tardi reload` and the configured PID file. `TARDIGRADE_BINARY_UPGRADE` is effective through the master loop. | `master_process true;` |
 | `pid` | `TARDIGRADE_PID_FILE` | path | `""` | Empty disables pid-file writing. | `pid /run/tardigrade.pid;` |
 | `user` | `TARDIGRADE_RUN_USER`, `TARDIGRADE_RUN_GROUP` | names | `""` | First token is user; optional second token is group. | `user tardigrade tardigrade;` |
 | `error_log` | `TARDIGRADE_ERROR_LOG_PATH`, `TARDIGRADE_LOG_LEVEL` | path + enum | `""`, `info` | Levels: `debug`, `info`, `warn`, `error`. | `error_log /var/log/tardigrade/error.log warn;` |
@@ -82,8 +82,12 @@ parsed too late to activate the secret store. Use environment variables instead.
 
 ## Server Blocks
 
-Top-level `server_name`, `root`, and `try_files` configure the default virtual
-host. `server {}` blocks add per-host overrides. See the
+When no `server {}` blocks exist, top-level `server_name`, `root`, `try_files`,
+and locations define the only virtual host. Once any `server {}` block exists,
+host selection is based on server blocks only: the first matching named block
+wins, then an unnamed/default block, then the first block as fallback. A selected
+named fallback that does not match the request Host is rejected. Server blocks
+start from the top-level config and overlay non-empty per-block values. See the
 [virtual-hosts example](../examples/virtual-hosts/README.md).
 
 | Directive | Type | Default | Notes | Example |
@@ -96,7 +100,7 @@ host. `server {}` blocks add per-host overrides. See the
 | `upstream_base_url` | URL | `""` | Per-server default reverse-proxy upstream. | `upstream_base_url http://127.0.0.1:8081;` |
 | `proxy_pass_chat` | URL | `""` | BearClaw/chat route upstream. | `proxy_pass_chat http://127.0.0.1:9001;` |
 | `proxy_pass_commands_prefix` | URL/path | `""` | BearClaw commands prefix upstream. | `proxy_pass_commands_prefix http://127.0.0.1:9002;` |
-| nested `location` | block | `[]` | Locations scoped to this server block. | `location /api/ { proxy_pass http://127.0.0.1:8080; }` |
+| nested `location` | block | `[]` | Locations scoped to this server block. The parser requires the block opener on a line ending with `{` and a closing line containing only `}`. | See matcher examples below. |
 
 ## Location Blocks
 
@@ -107,11 +111,11 @@ return, rewrite, or static.
 
 | Directive | Type | Default | Notes | Example |
 | --- | --- | --- | --- | --- |
-| `location = /path` | matcher | n/a | Exact match. | `location = /health { return 200 ok; }` |
-| `location ^~ /path/` | matcher | n/a | Prefix priority. | `location ^~ /assets/ { root /srv/www; }` |
-| `location ~ pattern` | matcher | n/a | Case-sensitive regex. | `location ~ \.php$ { fastcgi_pass unix:/run/php.sock; }` |
-| `location ~* pattern` | matcher | n/a | Case-insensitive regex. | <code>location ~* \.(png&#124;jpg)$ { root /srv/www; }</code> |
-| `location /path/` | matcher | n/a | Plain prefix. | `location /api/ { proxy_pass http://127.0.0.1:8080; }` |
+| `location = /path` | matcher | n/a | Exact match. | See exact example below. |
+| `location ^~ /path/` | matcher | n/a | Prefix priority. | See priority-prefix example below. |
+| `location ~ pattern` | matcher | n/a | Case-sensitive regex. | See regex example below. |
+| `location ~* pattern` | matcher | n/a | Case-insensitive regex. | See case-insensitive regex example below. |
+| `location /path/` | matcher | n/a | Plain prefix. | See plain-prefix example below. |
 | `proxy_pass` | URL/path | n/a | Proxies matching requests. | `proxy_pass http://127.0.0.1:8080;` |
 | `fastcgi_pass` | endpoint | n/a | FastCGI upstream. | `fastcgi_pass unix:/run/php.sock;` |
 | `scgi_pass` | endpoint | n/a | SCGI upstream. | `scgi_pass 127.0.0.1:4100;` |
@@ -128,6 +132,30 @@ return, rewrite, or static.
 | `proxy_streaming` / `proxy_streaming_mode` | enum | `inherit` | `inherit`, `off`/`buffered`, `response`/`responses`, `full`/`request_response`/`request-response`. | `proxy_streaming response;` |
 | `early_data` | enum | `off` | `off`, `replay_safe`/`replay-safe`. | `early_data replay_safe;` |
 | `proxy_early_data` | enum | `off` | `off`, `rfc8470`/`rfc-8470`; valid only with `proxy_pass`. | `proxy_early_data rfc8470;` |
+
+Parser-valid matcher examples:
+
+```nginx
+location = /health {
+    return 200 ok;
+}
+
+location ^~ /assets/ {
+    root /srv/www;
+}
+
+location ~ \.php$ {
+    fastcgi_pass unix:/run/php.sock;
+}
+
+location ~* \.(png|jpg)$ {
+    root /srv/www;
+}
+
+location /api/ {
+    proxy_pass http://127.0.0.1:8080;
+}
+```
 
 ## Top-Level Routing Directives
 
@@ -371,9 +399,9 @@ TLS stream capacity. Defaults are deterministic from native stream queue capacit
 | `TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY` | u32 | `0` | Pending approvals per identity; `0` disables this cap. | `TARDIGRADE_APPROVAL_MAX_PENDING_PER_IDENTITY=10` |
 | `TARDIGRADE_TRANSCRIPT_STORE_PATH` | path | `""` | Transcript store. Path changes on reload require restart. | `TARDIGRADE_TRANSCRIPT_STORE_PATH=/var/lib/tardigrade/transcripts` |
 | `TARDIGRADE_TRUST_GATEWAY_ID` | string | `tardigrade-edge` | Gateway identity for signed upstream trust headers. | `TARDIGRADE_TRUST_GATEWAY_ID=edge-us-east-1` |
-| `TARDIGRADE_TRUST_SHARED_SECRET` | secret | `""` | Shared secret for upstream trust headers. Empty disables signing/verification. | `TARDIGRADE_TRUST_SHARED_SECRET=change-me` |
-| `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` | CSV strings | `[]` | Accepted upstream identities when verification is enabled. | `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES=app-a,app-b` |
-| `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY` | bool | `false` | Require signed upstream identity headers on responses. | `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true` |
+| `TARDIGRADE_TRUST_SHARED_SECRET` | secret | `""` | Signs outbound `X-Tardigrade-Gateway-Id`, timestamp, and signature headers sent to upstreams. Empty disables outbound trust-header signing. | `TARDIGRADE_TRUST_SHARED_SECRET=change-me` |
+| `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES` | CSV strings | `[]` | Allowed upstream host/authority identities used by control-plane proxy trust enforcement. | `TARDIGRADE_TRUSTED_UPSTREAM_IDENTITIES=app-a,app-b` |
+| `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY` | bool | `false` | When true, trusted control-plane proxying requires a shared secret and an allowed upstream target; it does not currently verify signed response headers. | `TARDIGRADE_TRUST_REQUIRE_UPSTREAM_IDENTITY=true` |
 | `TARDIGRADE_SECURITY_HEADERS` | bool | `true` | Adds default security headers. | `TARDIGRADE_SECURITY_HEADERS=true` |
 | `TARDIGRADE_HSTS_ENABLED` | bool | `false` | Emits HSTS on HTTPS responses. | `TARDIGRADE_HSTS_ENABLED=true` |
 | `TARDIGRADE_HSTS_MAX_AGE` | u32 seconds | `31536000` | HSTS max-age. | `TARDIGRADE_HSTS_MAX_AGE=63072000` |
@@ -420,9 +448,12 @@ TLS stream capacity. Defaults are deterministic from native stream queue capacit
 | `TARDIGRADE_REDACT_HEADERS` | CSV header names | built-in list | Empty uses built-in redaction list. | `TARDIGRADE_REDACT_HEADERS=authorization,cookie` |
 | `TARDIGRADE_METRICS_PATH` | path | `/status/metrics` | Empty disables Prometheus endpoint. | `TARDIGRADE_METRICS_PATH=/metrics` |
 | `TARDIGRADE_METRICS_REQUIRE_AUTH` | bool | `false` | Requires request auth before serving metrics. | `TARDIGRADE_METRICS_REQUIRE_AUTH=true` |
-| `TARDIGRADE_OTEL_ENABLED` | bool | `false` | Enables W3C Trace Context propagation and OTLP export. | `TARDIGRADE_OTEL_ENABLED=true` |
-| `TARDIGRADE_OTEL_ENDPOINT` | URL | `""` | OTLP/HTTP endpoint. | `TARDIGRADE_OTEL_ENDPOINT=http://jaeger:4318/v1/traces` |
-| `TARDIGRADE_OTEL_SAMPLE_RATE` | u32 percent | `100` | Must be 0-100. | `TARDIGRADE_OTEL_SAMPLE_RATE=10` |
+| `TARDIGRADE_OTEL_ENABLED` | bool | `false` | Parsed operator setting reserved for telemetry; no OTLP exporter is currently wired to this flag. | `TARDIGRADE_OTEL_ENABLED=true` |
+| `TARDIGRADE_OTEL_ENDPOINT` | URL | `""` | Parsed endpoint reserved for OTLP export; currently not consumed by a runtime exporter. | `TARDIGRADE_OTEL_ENDPOINT=http://jaeger:4318/v1/traces` |
+| `TARDIGRADE_OTEL_SAMPLE_RATE` | u32 percent | `100` | Parsed and validated 0-100; currently not applied to runtime span export. | `TARDIGRADE_OTEL_SAMPLE_RATE=10` |
+
+W3C `traceparent` propagation/origination is active on proxy requests even when
+`TARDIGRADE_OTEL_ENABLED=false`.
 
 ### CLI-Owned Environment Fields
 
@@ -467,9 +498,9 @@ These public environment fields are consumed by CLI paths rather than
 | `TARDIGRADE_ACCEPT_FAIRNESS_YIELD_EVERY` | u32 | `0` | Yield after this many accepts; `0` disables. | `TARDIGRADE_ACCEPT_FAIRNESS_YIELD_EVERY=32` |
 | `TARDIGRADE_EVENT_LOOP_BACKEND` | enum | `default` | `default`, `epoll`, `kqueue`, `io_uring`/`io-uring`; explicit unavailable backends fail startup. | `TARDIGRADE_EVENT_LOOP_BACKEND=io_uring` |
 | `TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES` | u16 | `256` | 64-4096. Ignored by epoll/kqueue. | `TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=512` |
-| `TARDIGRADE_MASTER_PROCESS` | bool | `false` | Enables master process supervision mode. | `TARDIGRADE_MASTER_PROCESS=true` |
+| `TARDIGRADE_MASTER_PROCESS` | bool | `false` | Enables master process supervision mode. Current limitation: master/worker mode does not provide coherent PID-file/SIGHUP reload control across all workers; use single-process mode when relying on `tardi reload` and the configured PID file. | `TARDIGRADE_MASTER_PROCESS=true` |
 | `TARDIGRADE_WORKER_PROCESSES` | u32 | `1` | Worker processes in master mode. | `TARDIGRADE_WORKER_PROCESSES=4` |
-| `TARDIGRADE_BINARY_UPGRADE` | bool | `true` | Enables SIGUSR2 binary upgrade path. | `TARDIGRADE_BINARY_UPGRADE=true` |
+| `TARDIGRADE_BINARY_UPGRADE` | bool | `true` | Enables SIGUSR2 binary upgrade path; effective through the master loop. | `TARDIGRADE_BINARY_UPGRADE=true` |
 | `TARDIGRADE_WORKER_RECYCLE_SECONDS` | u32 seconds | `0` | Worker recycle interval; `0` disables. | `TARDIGRADE_WORKER_RECYCLE_SECONDS=3600` |
 | `TARDIGRADE_WORKER_CPU_AFFINITY` | string | `""` | CPU list for worker role pinning. | `TARDIGRADE_WORKER_CPU_AFFINITY=0,1,2,3` |
 | `TARDIGRADE_WORKER_QUEUE_SIZE` | usize | `1024` | Max queued accepted connections waiting for workers. Changes require restart. | `TARDIGRADE_WORKER_QUEUE_SIZE=4096` |
@@ -492,9 +523,9 @@ Reloaded settings fall into three operational categories:
 
 | Reload behavior | Fields / surfaces | Example |
 | --- | --- | --- |
-| Reloadable in place | Most request-routing, proxy, auth, header, logging, timeout, limit, and metrics policy fields. New requests acquire the newly published config after reload publication. | `TARDIGRADE_RATE_LIMIT_RPS=50` |
+| Reloadable or rebuilt in place | Request routing and per-request config fields carried by the published `EdgeConfig`; rate limiter; proxy cache store/path/TTL; response and security headers; H3 `Alt-Svc` advertisement; connection caps; proxy and TLS buffer limits; compression config; logger level; access logging after publication. New requests acquire the newly published config after reload publication. | `TARDIGRADE_RATE_LIMIT_RPS=50` |
 | Reload rejected; restart required | Listener-shard topology, native early-data replay mode/capacity, HTTP/3 listener-owned fields (`HTTP3_ENABLED`, `QUIC_PORT`, `HTTP3_ENABLE_0RTT`, `HTTP3_CONNECTION_MIGRATION`, `HTTP3_RETRY_POLICY`, `HTTP3_MAX_DATAGRAM_SIZE`, UDP buffer sizes, ECN), native ticket-key source-mode changes, and appliance TLS credential configuration (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_SERVER_NAME`, `TLS_SNI_CERTS`). | `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE=1200` |
-| Config may publish, but live startup-owned state changes only after restart | Bound TCP socket host/port, event-loop backend and io_uring entries, runtime identity/chroot, master/worker-process topology, worker thread/queue/recycle/affinity settings, FD soft limit, connection-pool capacity, upstream TLS client state, circuit-breaker construction, session/approval/transcript store paths, SSE event-hub capacity, DNS-discovery construction, coherent shutdown-drain policy, and upstream-pool policy. Reload may log a restart-required warning for these. | `TARDIGRADE_WORKER_THREADS=8` |
+| Config may publish, but live startup-owned state changes only after restart | Bound TCP socket host/port; event-loop backend and io_uring entries; runtime identity/chroot; PID file; master/worker-process topology; worker thread/queue/recycle/affinity settings; FD soft limit; connection-pool capacity; upstream TLS client state; circuit-breaker construction; idempotency TTL; session TTL/max/store path; access-control object; approval TTL/max-pending/store/escalation state; transcript store path; native resumption mode/ticket lifetime/ticket usage; general/OpenSSL TLS context inputs including min/max version, ciphers, session cache/tickets, client verification/CA/CRL, OCSP/ACME/watcher settings, and configured SNI identity; SSE event-hub capacity; DNS-discovery construction; coherent shutdown-drain policy; upstream-pool policy. Reload may log a restart-required warning for some of these. | `TARDIGRADE_WORKER_THREADS=8` |
 
 ### Proxy Buffer Limits
 
@@ -514,19 +545,19 @@ depending on them in production.
 
 | Env key / directive | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
-| `fastcgi_pass` / `TARDIGRADE_FASTCGI_UPSTREAM` | endpoint | `""` | Top-level or location FastCGI upstream. | `TARDIGRADE_FASTCGI_UPSTREAM=unix:/run/php.sock` |
-| `fastcgi_index` / `TARDIGRADE_FASTCGI_INDEX` | filename | `index.php` | Default FastCGI directory index. | `TARDIGRADE_FASTCGI_INDEX=index.php` |
-| `fastcgi_param` / `TARDIGRADE_FASTCGI_PARAMS` | key/value list | `[]` | Directive appends `NAME value`; env format is <code>NAME=value&#124;NAME2=value2</code>. | `TARDIGRADE_FASTCGI_PARAMS=APP_ENV=prod` |
-| `scgi_pass` / `TARDIGRADE_SCGI_UPSTREAM` | endpoint | `""` | SCGI upstream. | `TARDIGRADE_SCGI_UPSTREAM=127.0.0.1:4100` |
-| `uwsgi_pass` / `TARDIGRADE_UWSGI_UPSTREAM` | endpoint | `""` | uWSGI upstream. | `TARDIGRADE_UWSGI_UPSTREAM=127.0.0.1:4200` |
-| `smtp_pass` / `TARDIGRADE_SMTP_UPSTREAM` | endpoint | `""` | SMTP upstream. | `TARDIGRADE_SMTP_UPSTREAM=127.0.0.1:2525` |
-| `imap_pass` / `TARDIGRADE_IMAP_UPSTREAM` | endpoint | `""` | IMAP upstream. | `TARDIGRADE_IMAP_UPSTREAM=127.0.0.1:1143` |
-| `pop3_pass` / `TARDIGRADE_POP3_UPSTREAM` | endpoint | `""` | POP3 upstream. | `TARDIGRADE_POP3_UPSTREAM=127.0.0.1:1110` |
-| `TARDIGRADE_GRPC_UPSTREAM` | URL | `""` | gRPC upstream base URL. | `TARDIGRADE_GRPC_UPSTREAM=http://127.0.0.1:50051` |
-| `TARDIGRADE_MEMCACHED_UPSTREAM` | endpoint | `""` | Memcached endpoint. | `TARDIGRADE_MEMCACHED_UPSTREAM=127.0.0.1:11211` |
-| `TARDIGRADE_TCP_PROXY_UPSTREAM` | endpoint | `""` | Generic TCP proxy upstream. | `TARDIGRADE_TCP_PROXY_UPSTREAM=127.0.0.1:9000` |
-| `TARDIGRADE_UDP_PROXY_UPSTREAM` | endpoint | `""` | Generic UDP proxy upstream. | `TARDIGRADE_UDP_PROXY_UPSTREAM=127.0.0.1:9001` |
-| `TARDIGRADE_STREAM_SSL_TERMINATION` | bool | `false` | Enable stream-module SSL termination mode. | `TARDIGRADE_STREAM_SSL_TERMINATION=true` |
+| `fastcgi_pass` / `TARDIGRADE_FASTCGI_UPSTREAM` | endpoint | `""` | Location `fastcgi_pass` is wired to request dispatch. Top-level / env `TARDIGRADE_FASTCGI_UPSTREAM` is parsed and logged, but does not install a route by itself. | `fastcgi_pass unix:/run/php.sock;` |
+| `fastcgi_index` / `TARDIGRADE_FASTCGI_INDEX` | filename | `index.php` | Default FastCGI directory index used by dispatched FastCGI location routes. | `TARDIGRADE_FASTCGI_INDEX=index.php` |
+| `fastcgi_param` / `TARDIGRADE_FASTCGI_PARAMS` | key/value list | `[]` | Directive appends `NAME value`; env format is <code>NAME=value&#124;NAME2=value2</code>; used by dispatched FastCGI location routes. | `TARDIGRADE_FASTCGI_PARAMS=APP_ENV=prod` |
+| `scgi_pass` / `TARDIGRADE_SCGI_UPSTREAM` | endpoint | `""` | Parsed. Current config-file lowering maps location `scgi_pass` to a `scgi:` proxy target, but the gateway does not install a live SCGI route from this setting. | `TARDIGRADE_SCGI_UPSTREAM=127.0.0.1:4100` |
+| `uwsgi_pass` / `TARDIGRADE_UWSGI_UPSTREAM` | endpoint | `""` | Parsed. Current config-file lowering maps location `uwsgi_pass` to a `uwsgi:` proxy target, but the gateway does not install a live uWSGI route from this setting. | `TARDIGRADE_UWSGI_UPSTREAM=127.0.0.1:4200` |
+| `smtp_pass` / `TARDIGRADE_SMTP_UPSTREAM` | endpoint | `""` | Parsed and included in startup diagnostics; does not install a live mail route in the current gateway. | `TARDIGRADE_SMTP_UPSTREAM=127.0.0.1:2525` |
+| `imap_pass` / `TARDIGRADE_IMAP_UPSTREAM` | endpoint | `""` | Parsed and included in startup diagnostics; does not install a live mail route in the current gateway. | `TARDIGRADE_IMAP_UPSTREAM=127.0.0.1:1143` |
+| `pop3_pass` / `TARDIGRADE_POP3_UPSTREAM` | endpoint | `""` | Parsed and included in startup diagnostics; does not install a live mail route in the current gateway. | `TARDIGRADE_POP3_UPSTREAM=127.0.0.1:1110` |
+| `TARDIGRADE_GRPC_UPSTREAM` | URL | `""` | Parsed and included in startup diagnostics; does not install a live gRPC route in the current gateway. | `TARDIGRADE_GRPC_UPSTREAM=http://127.0.0.1:50051` |
+| `TARDIGRADE_MEMCACHED_UPSTREAM` | endpoint | `""` | Parsed and included in startup diagnostics; does not install a live Memcached route in the current gateway. | `TARDIGRADE_MEMCACHED_UPSTREAM=127.0.0.1:11211` |
+| `TARDIGRADE_TCP_PROXY_UPSTREAM` | endpoint | `""` | Parsed and included in startup diagnostics; does not install a live TCP proxy route in the current gateway. | `TARDIGRADE_TCP_PROXY_UPSTREAM=127.0.0.1:9000` |
+| `TARDIGRADE_UDP_PROXY_UPSTREAM` | endpoint | `""` | Parsed and included in startup diagnostics; does not install a live UDP proxy route in the current gateway. | `TARDIGRADE_UDP_PROXY_UPSTREAM=127.0.0.1:9001` |
+| `TARDIGRADE_STREAM_SSL_TERMINATION` | bool | `false` | Parsed and included in stream-proxy startup diagnostics; no live stream route is installed by this flag alone. | `TARDIGRADE_STREAM_SSL_TERMINATION=true` |
 
 ### WebSocket And SSE
 
@@ -576,36 +607,40 @@ listen 0.0.0.0:8443 http2;
 tls_cert_path /etc/tardigrade/tls/fullchain.pem;
 tls_key_path /etc/tardigrade/tls/privkey.pem;
 
-# Default virtual host: serve static files first, then fall back to the SPA
-# entry point when a concrete file is not present.
-server_name example.com www.example.com;
-root /srv/www/example;
-try_files $uri /index.html;
-
-# Exact match routes are evaluated before prefixes and regexes, making this a
-# cheap health endpoint that never touches disk or upstreams.
-location = /health {
-    return 200 ok;
-}
-
-# `^~` gives the assets prefix priority over regex locations. `index ""` opts
-# out of the default `index.html` directory fallback for this static subtree.
-location ^~ /assets/ {
+# Because this config uses server blocks, host selection is based on those
+# blocks rather than a top-level `server_name`. Represent every served host with
+# a block. Top-level TLS settings are inherited by each selected block.
+server {
+    server_name example.com www.example.com;
     root /srv/www/example;
-    index "";
-    autoindex off;
+    try_files $uri /index.html;
+
+    # Exact match routes are evaluated before prefixes and regexes, making this
+    # a cheap health endpoint that never touches disk or upstreams.
+    location = /health {
+        return 200 ok;
+    }
+
+    # `^~` gives the assets prefix priority over regex locations. `index ""`
+    # opts out of the default `index.html` directory fallback for this static
+    # subtree.
+    location ^~ /assets/ {
+        root /srv/www/example;
+        index "";
+        autoindex off;
+    }
+
+    # Prefix route: proxy application traffic and stream upstream responses
+    # instead of fully buffering large downloads. Request bodies remain buffered
+    # because the mode is `response`, not `full`.
+    location /api/ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_streaming response;
+    }
 }
 
-# Prefix route: proxy application traffic and stream upstream responses instead
-# of fully buffering large downloads. Request bodies remain buffered because the
-# mode is `response`, not `full`.
-location /api/ {
-    proxy_pass http://127.0.0.1:8080;
-    proxy_streaming response;
-}
-
-# Additional server block: host-specific TLS material is merged into SNI config,
-# and locations inside the block only apply when Host matches api.example.com.
+# API virtual host: host-specific TLS material is merged into SNI config, and
+# locations inside the block only apply when Host matches api.example.com.
 server {
     server_name api.example.com;
     tls_cert_path /etc/tardigrade/tls/api.crt;
@@ -647,7 +682,8 @@ export TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS=30000
 - `TARDIGRADE_TLS_CLIENT_VERIFY=true` requires `TARDIGRADE_TLS_CLIENT_CA_PATH`.
 - `TARDIGRADE_COMPRESSION_BROTLI_QUALITY` must be 0-11.
 - `TARDIGRADE_OTEL_SAMPLE_RATE` must be 0-100.
-- `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` must be at least 1.
+- `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` has a minimum effective value of 1; `0`
+  is clamped and malformed values fall back to 1.
 - `TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES` must be at least 1.
 - `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE` must be 1-1048576 bytes.
 - Many integer fields use permissive parsing and fall back to defaults on
