@@ -840,6 +840,7 @@ pub fn build(b: *std.Build) void {
     h3_interop_mod.addImport("http3", http3_mod);
     h3_interop_mod.addImport("stream_transport", stream_transport_mod);
     h3_interop_mod.addImport("tls_interop_matrix", tls_interop_matrix_mod);
+    h3_interop_mod.addImport("zig_compat", compat_mod);
     const h3_interop_tool = b.addExecutable(.{
         .name = "h3_interop_tool",
         .root_module = h3_interop_mod,

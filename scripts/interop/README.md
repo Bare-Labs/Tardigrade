@@ -118,6 +118,31 @@ The matrix logs stdout/stderr for each side under the printed `logs:` path.
 They contain request/response status and the explicit HRR assertion lines
 above, but no keylog output or secret material.
 
+## Optional qlog/keylog failure artifacts
+
+Default matrix runs produce only the normal text logs. Local debugging can
+opt in to qlog traces and, separately, TLS keylog files:
+
+```sh
+INTEROP_QLOG=1 \
+INTEROP_ARTIFACT_DIR=/tmp/tardigrade-h3-artifacts \
+NGTCP2_EXAMPLES_DIR=/tmp/tardigrade-h3-peer/client/build/examples \
+scripts/interop/run-interop.sh
+```
+
+`INTEROP_QLOG=1` passes `--qlog-dir` to each native `h3_interop_tool`
+invocation and retains per-case/per-role `.sqlog` files. `INTEROP_KEYLOG=1`
+also passes `--keylog-path`, writes per-role `.keys` files, and places a
+`SENSITIVE-KEYLOG.txt` marker beside them. Keylogs permit decrypting packet
+captures and must not be uploaded to public CI artifacts, logs, or issues.
+
+When any row fails and artifacts were enabled, the script prints the artifact
+root once after the summary so the directory can be collected:
+
+```text
+interop failure artifacts: /tmp/tardigrade-h3-artifacts
+```
+
 ## #522: production resumption/0-RTT interop
 
 The matrix above proves baseline wire interoperability against the direct
