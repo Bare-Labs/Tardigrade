@@ -355,7 +355,10 @@ fn parseConfigInitCommand(args: []const []const u8) !CliCommand {
             continue;
         }
         if (std.mem.eql(u8, arg, "--profile")) {
-            if (idx + 1 >= args.len) return error.MissingOptionValue;
+            // A following token that itself looks like an option (e.g.
+            // `--profile --stdout`) is a missing value, not a profile
+            // named "--stdout" -- no profile name starts with `-`.
+            if (idx + 1 >= args.len or std.mem.startsWith(u8, args[idx + 1], "-")) return error.MissingOptionValue;
             options.profile_name = args[idx + 1];
             idx += 1;
             continue;
@@ -1583,6 +1586,15 @@ test "config init --profile parses and rejects a missing value" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expectError(error.MissingOptionValue, parseCliCommand(&.{ "config", "init", "--profile" }));
+}
+
+test "config init --profile rejects an option token as its value instead of consuming it" {
+    // `--profile --stdout` etc. must report a missing value, not treat
+    // "--stdout" as a (nonexistent) profile named "--stdout".
+    try std.testing.expectError(error.MissingOptionValue, parseCliCommand(&.{ "config", "init", "--profile", "--stdout" }));
+    try std.testing.expectError(error.MissingOptionValue, parseCliCommand(&.{ "config", "init", "--profile", "--force" }));
+    try std.testing.expectError(error.MissingOptionValue, parseCliCommand(&.{ "config", "init", "--profile", "--help" }));
+    try std.testing.expectError(error.MissingOptionValue, parseCliCommand(&.{ "config", "init", "--profile", "-h" }));
 }
 
 test "config init with no profile keeps the legacy default profile_name" {

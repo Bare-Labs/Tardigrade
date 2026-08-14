@@ -5,6 +5,20 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- **Profile-aware `tardi init <profile>` first-run config generator (#162)** —
+  `tardi init static|proxy|tls|metrics|prod` writes a ready-to-check
+  nginx-style `tardigrade.conf` starter to stdout only (no banner or status
+  text, so `tardi init proxy > tardigrade.conf` produces a clean file), with
+  descriptive aliases (`static-site`, `reverse-proxy`, `tls-termination`,
+  `metrics-enabled`, `production-baseline`) resolving to byte-identical
+  output. The existing `tardi config init` gains the same profiles via
+  `--profile <profile>`; its file-writing behavior (positional output path,
+  `--stdout`, `--force`, overwrite refusal, parent-directory creation) and
+  the no-profile generic starter are unchanged. `tls`/`prod` profiles point
+  at operator-owned certificate paths rather than embedding credentials, and
+  `metrics` documents the existing `/status/metrics` endpoint instead of
+  introducing new config syntax.
+
 - **RFC 9002 packet pacing for HTTP/3 (#256-C)** — QUIC now spreads outbound
   application data across the round trip instead of writing until the
   congestion window is full. A window bounds how much data may be outstanding,
