@@ -167,6 +167,112 @@ const max_connections: usize = 1024;
 const max_connections_per_source: u32 = 32;
 const handshake_timeout_us: u64 = 10 * std.time.us_per_s;
 const cid_generation_retries: usize = 16;
+/// The listener never sleeps longer than this in one pass, so a connection
+/// whose state changed without arming a deadline is still revisited promptly.
+const max_loop_wait_us: u64 = 100 * std.time.us_per_ms;
+
+/// Wait for the QUIC socket to become readable, or for a deadline — with
+/// finer resolution than `poll(2)` can express (#256-C).
+///
+/// `poll` takes an integer number of milliseconds. That was fine when every
+/// deadline this loop computed came from a timer measured in milliseconds, and
+/// it stopped being fine when pacing started producing them: on a fast path
+/// the interval between two datagrams is tens of microseconds, and rounding
+/// each release up to 1 ms caps the listener at one burst per millisecond no
+/// matter what the congestion window and RTT actually permit. So the wait uses
+/// whatever nanosecond-resolution primitive the platform has.
+///
+/// `poll` remains the fallback, and it is a safe one rather than a broken one:
+/// a platform that lands there sleeps at millisecond granularity exactly as
+/// this loop always did. It sends at a coarser cadence, not an incorrect one —
+/// the pacer is still what decides *whether* a datagram may leave.
+const SocketWaiter = struct {
+    fd: posix.fd_t,
+    /// BSD `kqueue` descriptor, or `-1` on platforms that do not use one —
+    /// including a BSD where `kqueue` failed, which simply falls back.
+    kq: i32 = -1,
+
+    const uses_kqueue = switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+        else => false,
+    };
+
+    /// A valid pointer for the list `kevent` is told to read zero entries
+    /// from. The kernel never dereferences it, but handing a syscall an
+    /// `undefined` pointer is undefined behaviour on this side of the call
+    /// regardless of what the other side does with it.
+    const no_events: [0]std.c.Kevent = .{};
+
+    /// Every reference to `std.c.Kevent`/`EVFILT`/`EV` sits inside a branch on
+    /// this comptime-known flag, so it is never *analysed* off the BSDs — on
+    /// Linux `std.c.Kevent` resolves to `void` and naming its fields would not
+    /// merely be dead code, it would fail to compile.
+    fn init(fd: posix.fd_t) SocketWaiter {
+        var self = SocketWaiter{ .fd = fd };
+        if (uses_kqueue) {
+            if (fd < 0) return self;
+            const kq = std.c.kqueue();
+            if (kq < 0) return self;
+            // Registered once, level-triggered: every later `kevent` call is a
+            // pure wait with no changelist, which is what keeps the hot path
+            // to a single syscall.
+            const change = [_]std.c.Kevent{.{
+                .ident = @intCast(fd),
+                .filter = std.c.EVFILT.READ,
+                .flags = std.c.EV.ADD,
+                .fflags = 0,
+                .data = 0,
+                .udata = 0,
+            }};
+            if (std.c.kevent(kq, &change, 1, @constCast(&no_events), 0, null) < 0) {
+                _ = std.c.close(kq);
+                return self;
+            }
+            self.kq = kq;
+        }
+        return self;
+    }
+
+    fn deinit(self: *SocketWaiter) void {
+        if (self.kq >= 0) _ = std.c.close(self.kq);
+        self.kq = -1;
+    }
+
+    /// Sleep until the socket is readable or `timeout_us` elapses. Errors are
+    /// swallowed deliberately: every one of them means "stopped waiting early",
+    /// and the loop's next pass re-derives what to do from connection state
+    /// rather than from what this call returned.
+    fn wait(self: *SocketWaiter, timeout_us: u64) void {
+        const ts = std.posix.timespec{
+            .sec = @intCast(timeout_us / std.time.us_per_s),
+            .nsec = @intCast((timeout_us % std.time.us_per_s) * std.time.ns_per_us),
+        };
+        if (uses_kqueue) {
+            if (self.kq >= 0) {
+                var event: [1]std.c.Kevent = undefined;
+                _ = std.c.kevent(self.kq, &no_events, 0, &event, 1, &ts);
+                return;
+            }
+        }
+        var fds = [_]posix.pollfd{
+            .{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+        if (builtin.os.tag == .linux) {
+            _ = posix.ppoll(&fds, &ts, null) catch {};
+            return;
+        }
+        _ = posix.poll(&fds, pollTimeoutMs(timeout_us)) catch {};
+    }
+
+    /// `poll`'s millisecond timeout for a microsecond deadline. Rounds *up* so
+    /// the loop never wakes before the deadline it computed and re-runs a pass
+    /// that can do nothing; a sub-millisecond deadline therefore becomes 1 ms,
+    /// which is the resolution limit this fallback exists to acknowledge.
+    fn pollTimeoutMs(timeout_us: u64) i32 {
+        const ms = (timeout_us + std.time.us_per_ms - 1) / std.time.us_per_ms;
+        return @intCast(@min(@max(ms, 1), max_loop_wait_us / std.time.us_per_ms));
+    }
+};
 
 const ParkedH3Retry = struct {
     stream_id: u64,
@@ -585,7 +691,9 @@ pub const Runtime = struct {
         // Half-open admission accounting, keyed on the source IPv4 address.
         var per_ip = std.AutoHashMap(u32, u32).init(allocator);
         var next_handle: u64 = 1;
+        var waiter = SocketWaiter.init(self.socket_fd);
         defer {
+            waiter.deinit();
             self.removeAllConnections(&connections, &routes, &per_ip);
             connections.deinit();
             routes.deinit();
@@ -642,7 +750,7 @@ pub const Runtime = struct {
                         }
                         continue;
                     }
-                    if (entry.conn.nextTimeoutUs()) |deadline| wake_us = @min(wake_us, deadline);
+                    wake_us = connectionWakeUs(entry, now, wake_us);
                 }
                 for (reap[0..reap_count]) |r| {
                     self.removeConnection(&connections, &routes, &per_ip, r.handle, r.reason);
@@ -651,11 +759,7 @@ pub const Runtime = struct {
             if (draining and connections.count() == 0) break;
 
             // 2) Sleep until the earliest deadline or socket readability.
-            const timeout_ms: i32 = @intCast(@min((wake_us -| nowUs()) / 1_000 + 1, 100));
-            var fds = [_]posix.pollfd{
-                .{ .fd = self.socket_fd, .events = posix.POLL.IN, .revents = 0 },
-            };
-            _ = posix.poll(&fds, timeout_ms) catch {};
+            waiter.wait(@min(wake_us -| nowUs(), max_loop_wait_us));
 
             // 3) Ingest every waiting datagram.
             var buf: [quic.datagram.max_size]u8 = undefined;
@@ -1306,6 +1410,28 @@ pub const Runtime = struct {
         };
     }
 
+    /// Fold one connection's deadlines into the loop's sleep deadline.
+    ///
+    /// Two independent sources, and the pacing one is the reason this exists
+    /// (#256-C). A connection the pacer is holding data back for has no timer
+    /// to fire — `drainConnectionTransmits` has already stopped producing
+    /// datagrams for it, and none of `nextTimeoutUs`'s deadlines knows the
+    /// send path is waiting — so without `nextSendTimeUs` here the data would
+    /// sit until the next unrelated wakeup or the 100 ms loop floor.
+    ///
+    /// The converse matters as much: `nextSendTimeUs` is null unless something
+    /// is genuinely paced out and is always strictly in the future, so this
+    /// neither wakes an idle listener nor lets a busy one spin on a deadline
+    /// that has already passed.
+    ///
+    /// Split out of `serve` so the selection is testable without a socket.
+    fn connectionWakeUs(entry: *ConnEntry, now: u64, current: u64) u64 {
+        var wake = current;
+        if (entry.conn.nextTimeoutUs()) |deadline| wake = @min(wake, deadline);
+        if (entry.conn.nextSendTimeUs(now)) |release| wake = @min(wake, release);
+        return wake;
+    }
+
     /// Send one transport-produced datagram, carrying the ECN codepoint the
     /// transport asked for (#256-E). `mark` is `.not_ect` for every datagram
     /// on a path that is not marking, which is the plain-`sendto` path.
@@ -1315,6 +1441,11 @@ pub const Runtime = struct {
     /// once per pass: the refusal is discovered *inside* a send, and the rest
     /// of this drain would otherwise keep building packets the transport counts
     /// as marked while the socket emits them Not-ECT.
+    ///
+    /// Stops when the transport declines — including when the pacer is what
+    /// declines (#256-C). The bounded burst is what keeps this drain from
+    /// flushing a whole congestion window in one pass, and the deadline
+    /// `connectionWakeUs` folds in is what brings the loop back for the rest.
     fn drainConnectionTransmits(self: *Runtime, entry: *ConnEntry, now: u64) void {
         var out: [quic.datagram.max_size]u8 = undefined;
         while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
@@ -3712,6 +3843,80 @@ test "http3 runtime: CID route collision rolls back without stealing an existing
     try testing.expectEqual(before_owned, harness.entry.owned_cid_count);
     try testing.expectEqual(before_pending, harness.entry.conn.pending_new_connection_ids.items.len);
     try testing.expectEqual(@as(?u64, collision_owner), routes.lookup(candidate.slice()));
+}
+
+/// Queue a response far larger than one burst on the harness's server
+/// connection and pin the window and RTT, so what holds the send path back is
+/// the pacer rather than the sub-millisecond RTT the in-process handshake
+/// leaves behind (see the matching fixture in `quic/connection.zig`). Returns
+/// with the opening burst already spent at `harness.now_us`.
+fn spendPacingBurst(harness: *RuntimeCidHarness, cwnd: usize, srtt_us: u64) !void {
+    const sid = try harness.client.openStream(.bidi);
+    _ = try harness.client.writeStream(sid, "request", false);
+    try harness.pump();
+    _ = try harness.entry.conn.writeStream(sid, &[_]u8{0xab} ** (64 * 1024), false);
+
+    harness.entry.conn.recovery.rtt = quic.recovery.RttEstimator.init(25_000);
+    harness.entry.conn.recovery.rtt.update(srtt_us, 0);
+    const congestion = &harness.entry.conn.recovery.congestion;
+    congestion.congestion_window = cwnd;
+    congestion.ssthresh = cwnd;
+    congestion.bytes_in_flight = 0;
+    congestion.pacer = .{};
+
+    var out: [quic.datagram.max_size]u8 = undefined;
+    var emitted: usize = 0;
+    while (harness.entry.conn.pollTransmitOnPath(&out, harness.now_us)) |_| emitted += 1;
+    try testing.expect(emitted > 0);
+    try testing.expect(emitted <= quic.recovery.default_pacer_burst_packets);
+}
+
+test "http3 runtime: the loop's sleep deadline follows the pacing release" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
+    defer harness.deinit(testing.allocator);
+
+    // The loop's own idle ceiling, which every other deadline competes with.
+    const floor = harness.now_us + 100_000;
+    const quiet = Runtime.connectionWakeUs(harness.entry, harness.now_us, floor);
+    try testing.expectEqual(@as(?u64, null), harness.entry.conn.nextSendTimeUs(harness.now_us));
+
+    try spendPacingBurst(harness, 64 * 1024, 100_000);
+    const now = harness.now_us;
+
+    // Held back by the pacer and by nothing else, and the release beats every
+    // timer deadline — so a loop that folded in only `nextTimeoutUs` would
+    // sleep straight past the moment this data became eligible.
+    const release = harness.entry.conn.nextSendTimeUs(now) orelse return error.TestExpectedEqual;
+    try testing.expect(release > now);
+    try testing.expect(release < quiet);
+    try testing.expectEqual(release, Runtime.connectionWakeUs(harness.entry, now, floor));
+
+    // And sleeping until it is productive: the send path yields again there.
+    var out: [quic.datagram.max_size]u8 = undefined;
+    try testing.expect(harness.entry.conn.pollTransmitOnPath(&out, release) != null);
+}
+
+test "http3 runtime: a connection with nothing paced contributes no wakeup of its own" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
+    defer harness.deinit(testing.allocator);
+
+    try spendPacingBurst(harness, 64 * 1024, 100_000);
+    const now = harness.now_us;
+
+    // Congestion control is the harder gate, and when it is what a connection
+    // is waiting on there is no pacing wakeup to schedule: the loss and PTO
+    // timers already in `nextTimeoutUs` are what should bring the loop back.
+    const congestion = &harness.entry.conn.recovery.congestion;
+    congestion.bytes_in_flight = congestion.congestion_window;
+    try testing.expectEqual(@as(?u64, null), harness.entry.conn.nextSendTimeUs(now));
+
+    const floor = now + 100_000;
+    const timers = harness.entry.conn.nextTimeoutUs() orelse floor;
+    try testing.expectEqual(@min(floor, timers), Runtime.connectionWakeUs(harness.entry, now, floor));
 }
 
 test "http3 runtime: retired CIDs stop routing, replenish, and teardown removes every route" {
@@ -6906,4 +7111,66 @@ test "http3 runtime: every live connection is told the socket cannot mark (#256-
         }
         try testing.expectEqual(marked_before, conn.metrics.ecn_marked_sent);
     }
+}
+
+test "http3 runtime: a low-RTT connection hands the loop a sub-millisecond deadline" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
+    defer harness.deinit(testing.allocator);
+
+    // 1.25 × 480 kB over a 10 ms RTT — a datacentre or loopback path, and the
+    // case #256 exists for. One datagram every ~20 µs.
+    try spendPacingBurst(harness, 480 * 1024, 10_000);
+    const now = harness.now_us;
+
+    const release = harness.entry.conn.nextSendTimeUs(now) orelse return error.TestExpectedEqual;
+    try testing.expect(release > now);
+    try testing.expect(release - now < std.time.us_per_ms);
+    try testing.expectEqual(release, Runtime.connectionWakeUs(harness.entry, now, now + max_loop_wait_us));
+
+    // The deadline reaches the wait primitive in microseconds. Rounding it to
+    // an integer-millisecond `poll` timeout — what this loop did before
+    // #256-C — would sleep ~50 pacing intervals past it, and with a bounded
+    // burst that caps the listener at one burst per millisecond however much
+    // window and RTT allow.
+    try testing.expect(SocketWaiter.pollTimeoutMs(release - now) == 1);
+    try testing.expect(release - now < SocketWaiter.pollTimeoutMs(release - now) * std.time.us_per_ms);
+}
+
+test "http3 runtime: the socket waiter rounds its fallback up and clamps to the loop ceiling" {
+    // Never round *down*: a wait that returns before its deadline costs the
+    // loop a whole pass that can produce nothing.
+    try testing.expectEqual(@as(i32, 1), SocketWaiter.pollTimeoutMs(1));
+    try testing.expectEqual(@as(i32, 1), SocketWaiter.pollTimeoutMs(999));
+    try testing.expectEqual(@as(i32, 1), SocketWaiter.pollTimeoutMs(1_000));
+    try testing.expectEqual(@as(i32, 2), SocketWaiter.pollTimeoutMs(1_001));
+
+    // A zero deadline still blocks for a tick rather than spinning the loop.
+    try testing.expectEqual(@as(i32, 1), SocketWaiter.pollTimeoutMs(0));
+
+    // And never past the loop's own ceiling.
+    try testing.expectEqual(@as(i32, 100), SocketWaiter.pollTimeoutMs(max_loop_wait_us));
+    try testing.expectEqual(@as(i32, 100), SocketWaiter.pollTimeoutMs(10 * max_loop_wait_us));
+}
+
+test "http3 runtime: the socket waiter takes a sub-millisecond path where the platform has one" {
+    const fd = std.c.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
+    if (fd < 0) return error.SkipZigTest;
+    defer _ = std.c.close(fd);
+
+    var waiter = SocketWaiter.init(fd);
+    defer waiter.deinit();
+
+    // Linux waits with `ppoll` and needs no descriptor; the BSDs need a
+    // `kqueue` and this asserts one was actually obtained, so a silent
+    // fallback to millisecond `poll` on a platform that has better cannot pass
+    // unnoticed.
+    if (SocketWaiter.uses_kqueue) try testing.expect(waiter.kq >= 0);
+
+    // A sub-millisecond wait on a socket with nothing to read must return, not
+    // hang or fail. Deliberately no assertion on elapsed time: this is a real
+    // syscall against a shared scheduler, and the deadline is a floor on how
+    // long it sleeps, never a ceiling.
+    waiter.wait(200);
 }

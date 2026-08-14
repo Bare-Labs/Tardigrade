@@ -128,7 +128,8 @@ The target module seams are:
 
 | Seam | Responsibility |
 |---|---|
-| `src/quic/udp.zig` | HTTP-independent UDP endpoint: send/receive datagrams, local/remote address metadata, ECN, socket buffer tuning, deterministic clock hook, and future batching/GSO/pacing extension points |
+| `src/quic/udp.zig` | HTTP-independent UDP endpoint: send/receive datagrams, local/remote address metadata, ECN, socket buffer tuning, deterministic clock hook, and future batching/GSO extension points |
+| `src/quic/recovery.zig` | Loss detection, RTT, NewReno congestion control, and the RFC 9002 §7.7 pacer whose release times gate `pollTransmitOnPath` and feed the listener's sleep deadline |
 | `src/quic/config.zig` | Internal config defaults, validation, and QUIC transport-parameter mapping |
 | `src/quic/packet.*` / `connection.*` / `stream.*` | QUIC packet codec, connection state, packet number spaces, DCID routing, timers, loss recovery, stream flow control, close/drain |
 | `src/quic/tls_adapter.*` | QUIC TLS 1.3 handshake bytes, transport parameters, traffic secrets, AEAD/header protection, ALPN, certificate state, and key updates |
