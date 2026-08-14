@@ -534,15 +534,22 @@ grows paces faster on its own.
 
 ## Batching, GSO, and GRO
 
-This is a design note, not an implementation (#256-F). #256's non-goals rule
-out building this speculatively; what follows is where it would plug into the
-current contract, what it must not be allowed to break, and what evidence
-would justify picking it up.
+This is a design note, not an implementation (#256-F). The issue scopes
+batching/GSO/GRO as future design work, and the latest #256 reconciliation
+says implementation should be split into a focused follow-up only if
+benchmark evidence justifies it — this note exists so that follow-up has a
+contract to build against rather than a blank page.
 
 ### Where the runtime stands today
 
-Every datagram crosses the syscall boundary alone. `drainConnectionTransmits`
-calls `sendDatagram` — one `sendmsg`/`sendto` — for each datagram
+Every datagram crosses the syscall boundary alone, and not through
+`quic.udp.Endpoint`: the production H3 listener bypasses that contract
+entirely and calls its own `receiveDatagram`/`sendDatagramTo` helpers in
+`src/http/http3_runtime.zig` directly, using `recvmsg`/`sendmsg` for the
+ancillary ECN metadata (#256-E). `Endpoint` itself is scalar today —
+`recvFn`/`sendFn` each move exactly one datagram — and nothing in the
+production path currently calls it. `drainConnectionTransmits` calls
+`sendDatagram` — one `sendmsg`/`sendto` — for each datagram
 `pollTransmitOnPath` releases, and the receive loop calls `receiveDatagram` —
 one `recvmsg` — repeatedly until the socket reports `EAGAIN`. At the packet
 sizes DPLPMTUD settles on (1200–2048 bytes) and the rates pacing now permits,
@@ -554,28 +561,55 @@ answers to that cost, and neither is implemented.
 
 ### Where it would plug in
 
-The seam is already there on both sides, and neither needs a new abstraction
-in `src/quic/udp.zig`: `SendDatagram` and `ReceivedDatagram` are already
-per-datagram values carrying their own `ecn` and address, which is what a
-batch is a list of.
+Unlike the scalar `SendDatagram`/`ReceivedDatagram` values in
+`src/quic/udp.zig`, the runtime's own transmit path is not batch-ready as it
+stands, so a future implementation has to pick one of two shapes rather than
+assume the seam is free:
 
-- **Send.** `Connection.pollTransmitOnPath` already returns one datagram at a
-  time by contract; `drainConnectionTransmits`'s `while` loop is the only
-  place that would change, assembling either a `sendmmsg` vector of
-  independent datagrams or a single GSO buffer of same-sized segments plus a
-  `UDP_SEGMENT` control message. Packet *construction* would not change —
-  pacing already keeps `pollTransmitOnPath` from blocking, and that
-  separation between "build a datagram" and "decide when it may leave" is the
-  same seam a batching send path needs, noted where pacing reaches the wire
-  above.
-- **Receive.** The `while (true) { receiveDatagram(...) }` loop in `serve`
-  already drains everything waiting before sleeping again; `recvmmsg` would
-  replace repeated `recvmsg` calls with one call returning several datagrams,
-  and `UDP_GRO` would let the kernel coalesce datagrams from one peer before
-  the syscall even happens. `ingest` already takes one datagram, one peer
-  address, and one ECN mark per call, so a batched receive path would still
-  call it once per datagram inside the batch — no change to DCID routing or
-  connection lookup.
+- **Runtime-local batching** (the smaller change): keep `quic.udp.Endpoint`
+  scalar — nothing outside the H3 listener needs batch semantics today — and
+  do the batching entirely inside `http3_runtime.zig`. This is the shape the
+  rest of this section assumes.
+- **A batch-capable `Endpoint` contract**: add explicit `sendBatch`/
+  `receiveBatch` methods with their own lifetime rules, for callers other
+  than the H3 listener that might want batching later. Nothing in the current
+  tree needs this; it is only worth doing if a second caller shows up.
+
+Either way, `drainConnectionTransmits`'s `while` loop is not literally the
+only code that would change, because of how it currently produces datagrams:
+it has one `out: [quic.datagram.max_size]u8` scratch buffer and repeatedly
+calls `pollTransmitOnPath(&out, now)`, and the returned `Transmit.bytes`
+slice points *into that same caller-owned buffer*. A batch cannot be
+collected by polling repeatedly and holding on to each `Transmit` — the next
+poll overwrites the storage the previous one pointed at. A batching send path
+needs its own shape:
+
+1. Poll only datagrams the pacer has released (`pollTransmitOnPath` already
+   declines to produce more).
+2. Copy each result into stable, batch-owned backing storage together with
+   its path and ECN metadata, before the next poll reuses the scratch buffer.
+3. Submit the vector (`sendmmsg`) or GSO super-buffer.
+4. Handle **partial sends** explicitly: `sendmmsg` can send only a prefix of
+   the vector, and by that point the transport has already produced the
+   remaining datagrams with real packet numbers and recovery accounting.
+   Those exact bytes have to be retained and retried — not discarded in favor
+   of re-polling, which would fabricate new packets for data already counted
+   as sent. The same applies if a GSO attempt is rejected: fall back to
+   per-datagram sends of the already-produced bytes rather than losing them.
+
+Packet *construction* itself would not change — pacing already keeps
+`pollTransmitOnPath` from blocking (see above) — but "produced" and "sent"
+are no longer the same instant once a batch sits between them, and the design
+has to own that gap explicitly.
+
+On the receive side the seam is closer to free: the `while (true) {
+receiveDatagram(...) }` loop in `serve` already drains everything waiting
+before sleeping again; `recvmmsg` would replace repeated `recvmsg` calls with
+one call returning several datagrams, and `UDP_GRO` would let the kernel
+coalesce datagrams from one peer before the syscall even happens. `ingest`
+already takes one datagram, one peer address, and one ECN mark per call, so a
+batched receive path would still call it once per datagram inside the batch —
+no change to DCID routing or connection lookup.
 
 ### What batching must not break
 
@@ -583,30 +617,57 @@ A batch is a kernel-level optimization; it must stay invisible to the
 transport guarantees layered above it.
 
 - **Pacing** decides *whether* a datagram may leave, not how it is
-  transmitted once released. A GSO buffer could only ever hold datagrams the
-  pacer has already released — never a way to front-run the schedule by
-  assembling a bigger buffer than the burst ceiling allows. That existing
-  ceiling (the smaller of ten datagrams and one initial window) is also a
-  reasonable first cap on batch size: a batch larger than a paced burst would
-  have to sit somewhere between release and syscall, reintroducing the same
-  burst the leaky bucket exists to prevent.
-- **ECN** is marked and validated per path, and GSO's `UDP_SEGMENT` shares one
-  `IP_TOS`/`IPV6_TCLASS` control message across every segment in the buffer.
-  A batch could only ever contain datagrams bound for the same path carrying
-  the same mark; a path that is marking and one that is not cannot share a
-  GSO buffer.
-- **PMTU probes** are identified by their exact size, deliberately larger than
-  the path's validated size. A GSO segment size is fixed for the whole
-  buffer, so a probe cannot ride alongside ordinary traffic in the same
-  buffer — it would still need its own single-datagram send, as it does
-  today.
-- **Receive-side ECN and peer address** are per datagram, not per batch.
-  `UDP_GRO` only coalesces datagrams that already share source address and
-  destination port, so the codepoint recovered from the shared control
-  message is valid for every segment — but a batched receive path still has
-  to split the buffer back into individual `ReceivedDatagram`s before `ingest`
-  sees them, since DCID routing and AEAD are per-packet regardless of how
-  many packets arrived in one syscall.
+  transmitted once released. A batch could only ever hold datagrams the pacer
+  has already released — never a way to front-run the schedule by assembling
+  a bigger batch than the burst ceiling allows. That existing ceiling (the
+  smaller of ten datagrams and one initial window) is also a reasonable first
+  cap on batch size: a batch larger than a paced burst would have to sit
+  somewhere between release and syscall, reintroducing the same burst the
+  leaky bucket exists to prevent.
+- **`sendmmsg` batching and GSO restrict different things.** `sendmmsg` takes
+  an array of `mmsghdr`, and every element carries its own destination and
+  ancillary data — so a `sendmmsg` vector may freely contain independent
+  datagrams for independent paths and independent ECN marks. A single GSO
+  `UDP_SEGMENT` buffer is the stricter case: all segments in that one
+  super-buffer share one destination, one segment size, and one
+  `IP_TOS`/`IPV6_TCLASS` control message. The same-path/same-ECN constraint
+  therefore belongs to a GSO super-buffer specifically, not to batching in
+  general — split the batch into separate GSO buffers whenever path or ECN
+  mark differs, but a `sendmmsg` vector needs no such split.
+- **PMTU probes** target a datagram size deliberately above the path's
+  currently validated PLPMTU, but a probe is identified by its **packet
+  number** (`pmtu.Controller.outstanding_pn`), not by its size, precisely
+  because the same target size can be retried and a stale ACK or loss report
+  for an earlier attempt must not resolve the current probe
+  (`recovery.SentPacket.pmtu_probe` marks these packets so recovery treats
+  them apart from ordinary congestion traffic). That identity has to survive
+  batching: a GSO buffer uses one segment size for the whole buffer, and
+  ordinary traffic is bounded by the validated PLPMTU rather than the probe's
+  target size, so the simplest correct implementation keeps an outstanding
+  PMTU probe out of an ordinary GSO super-buffer and sends it individually. A
+  `sendmmsg` vector has no such restriction — a probe can ride in the same
+  vector as ordinary datagrams, since each element is independent — but its
+  identity is still carried by packet number, not by which slot it occupied
+  in the vector.
+- **Receive-side ECN is not implied by the peer tuple alone.** Two UDP
+  datagrams from the same source address and port can legitimately carry
+  different ECN codepoints, so a batched receive path may not assume a shared
+  mark just because the datagrams share a peer. What actually makes Linux's
+  `UDP_GRO` safe here is a **platform guarantee**, not an inference from the
+  tuple: GRO's IP-layer aggregation checks refuse to coalesce packets whose
+  IPv4 TOS or IPv6 Traffic Class differ — and those fields carry the ECN
+  bits — so a GRO aggregate's one reported TOS/TCLASS cmsg is guaranteed to
+  apply to every segment the kernel coalesced into it. A batched receive path
+  may expand that single cmsg into per-datagram ECN metadata only because of
+  that kernel-enforced compatibility check, and enabling GRO on another
+  platform would require verifying the equivalent guarantee there first, not
+  assuming it. Getting this wrong would feed a datagram the wrong ECN mark
+  into ACK_ECN counting and validation, which #256-E deliberately keeps
+  scoped per path and per datagram.
+- Splitting a batch back into individual datagrams — on receive, into
+  `ReceivedDatagram`s before `ingest` sees them — is required regardless of
+  the guarantee above, since DCID routing and AEAD are per-packet regardless
+  of how many packets arrived in one syscall.
 
 ### Evidence bar before implementing
 
