@@ -234,7 +234,7 @@ check "endpoint with no QUIC series yields null, not zeros" "null" "$NO_QUIC_SER
 
 echo ""
 echo "==> Test 6: an h2load without HTTP/3 support is reported as unsupported, never treated as a pass"
-H3_RUNNER="$(source_functions "$RUN_SH" run_h2load_h3)"
+H3_RUNNER="$(source_functions "$RUN_SH" h2load_h3_supported run_h2load_h3)"
 # Stub h2load so '--h3 --help' fails exactly the way a non-QUIC nghttp2 build does.
 H3_SKIP_OUTPUT="$(bash -c "
 set -euo pipefail
@@ -621,6 +621,66 @@ check "no --output-file build: errors parsed from legacy 'failed: N' token" \
     "errors=5" "$FALLBACK_OUTPUT"
 check "no --output-file build: throughput parsed from legacy 'finished' line" \
     "tput=1.20" "$FALLBACK_OUTPUT"
+
+echo ""
+echo "==> Test 19: h2load_h3_supported requires real QUIC linkage, not just flag recognition (#256-G review — the exact false positive hit investigating #256's ALPN blocker)"
+H3_SUPPORT_FNS="$(source_functions "$RUN_SH" h2load_h3_supported)"
+
+# Case A: h2load recognizes --h3 syntactically but there is no real on-disk
+# binary for otool/ldd to inspect — this reproduces the "flag yes, QUIC
+# library linkage no" shape of the stock Homebrew nghttp2 package, which is
+# exactly what silently negotiated a degraded TCP connection offering ALPN
+# "h3" against a live local Tardigrade H3 listener during #256-G review, and
+# was misread as a Tardigrade regression before that was root-caused.
+CASE_A_OUT="$(bash -c "
+set -euo pipefail
+h2load() { [[ \"\$1\" == --h3 ]] && return 0; return 1; }
+${H3_SUPPORT_FNS}
+h2load_h3_supported && echo SUPPORTED || echo UNSUPPORTED
+")"
+check "flag-only h2load (no real binary to link-check): reported unsupported, not the false positive that caused #256-G's ALPN investigation" \
+    "UNSUPPORTED" "$CASE_A_OUT"
+
+# Case B: a real on-disk h2load that recognizes --h3 AND is actually linked
+# against libngtcp2/libnghttp3 (faked via stub otool/ldd placed first on
+# PATH, so this runs identically on macOS and Linux CI regardless of which
+# linker-inspection tool the host actually has).
+CASE_B_DIR="$(mktemp -d /tmp/tardi-h2load-linked-test-XXXX)"
+cat > "${CASE_B_DIR}/h2load" <<'H2LOAD_STUB'
+#!/usr/bin/env bash
+[[ "$1" == "--h3" ]] && exit 0
+exit 1
+H2LOAD_STUB
+cat > "${CASE_B_DIR}/otool" <<'OTOOL_STUB'
+#!/usr/bin/env bash
+echo "	/usr/lib/libngtcp2.dylib (compatibility version 1.0.0, current version 1.0.0)"
+OTOOL_STUB
+cat > "${CASE_B_DIR}/ldd" <<'LDD_STUB'
+#!/usr/bin/env bash
+echo "	libngtcp2.so.16 => /usr/lib/x86_64-linux-gnu/libngtcp2.so.16"
+LDD_STUB
+chmod +x "${CASE_B_DIR}/h2load" "${CASE_B_DIR}/otool" "${CASE_B_DIR}/ldd"
+CASE_B_OUT="$(bash -c "
+set -euo pipefail
+export PATH=\"${CASE_B_DIR}:\$PATH\"
+${H3_SUPPORT_FNS}
+h2load_h3_supported && echo SUPPORTED || echo UNSUPPORTED
+")"
+check "real QUIC-linked h2load (flag + linkage both present): still reported supported" \
+    "SUPPORTED" "$CASE_B_OUT"
+rm -rf "$CASE_B_DIR"
+
+echo ""
+echo "==> Test 20: competitive/run.sh's h2load_h3_supported (what run_tardigrade_http3_matrix actually gates on) gets the same linkage check (#256-G review)"
+COMPETITIVE_H3_SUPPORT_FNS="$(source_functions "$COMPETITIVE_RUN_SH" h2load_h3_supported)"
+COMPETITIVE_CASE_A_OUT="$(bash -c "
+set -euo pipefail
+h2load() { [[ \"\$1\" == --h3 ]] && return 0; return 1; }
+${COMPETITIVE_H3_SUPPORT_FNS}
+h2load_h3_supported && echo SUPPORTED || echo UNSUPPORTED
+")"
+check "competitive/run.sh: flag-only h2load is also reported unsupported, not a false positive" \
+    "UNSUPPORTED" "$COMPETITIVE_CASE_A_OUT"
 
 echo ""
 echo "==> Test: existing HTTP/1 benchmark behavior does not regress (run.sh --help still documents http1 scenarios)"

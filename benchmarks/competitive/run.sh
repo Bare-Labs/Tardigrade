@@ -436,8 +436,29 @@ udp_buffer_metadata_json() {
     fi
 }
 
+# #256-G review: `h2load --h3 --help` only proves the binary recognizes the
+# flag syntactically. A build with no QUIC library linked at all — e.g. the
+# stock Homebrew/apt nghttp2 package, which has no ngtcp2/nghttp3 build
+# option — still passes that check, then silently negotiates a degraded TCP
+# connection offering ALPN "h3" (only ever valid over QUIC/UDP), which a
+# correct H3 server must reject. That reject looks identical to a real
+# Tardigrade H3 regression unless this check can tell the two apart, so also
+# confirm the binary is actually linked against a QUIC library — best
+# effort: a statically-linked QUIC build won't show up here and is treated
+# as unsupported, so this can produce false negatives but not the false
+# positive that motivated it.
 h2load_h3_supported() {
-    command -v h2load >/dev/null 2>&1 && h2load --h3 --help >/dev/null 2>&1
+    command -v h2load >/dev/null 2>&1 || return 1
+    h2load --h3 --help >/dev/null 2>&1 || return 1
+    local h2load_path
+    h2load_path="$(command -v h2load)"
+    if command -v otool >/dev/null 2>&1; then
+        otool -L "$h2load_path" 2>/dev/null | grep -qiE 'libngtcp2|libnghttp3'
+    elif command -v ldd >/dev/null 2>&1; then
+        ldd "$h2load_path" 2>/dev/null | grep -qiE 'libngtcp2|libnghttp3'
+    else
+        return 0
+    fi
 }
 
 host_metadata_json() {

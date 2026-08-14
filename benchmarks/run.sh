@@ -1144,12 +1144,37 @@ attach_quic_transport_state() {
     _run_quic_list["$label"]=$(jq -cn --argjson acc "$prev" --argjson item "$quic_delta" '$acc + [$item]')
 }
 
+# #256-G review: `h2load --h3 --help` only proves the binary recognizes the
+# flag syntactically. A build with no QUIC library linked at all — e.g. the
+# stock Homebrew/apt nghttp2 package, which has no ngtcp2/nghttp3 build
+# option — still passes that check, then silently negotiates a degraded TCP
+# connection offering ALPN "h3" (only ever valid over QUIC/UDP), which a
+# correct H3 server must reject. That reject looks identical to a real
+# Tardigrade H3 regression unless this check can tell the two apart, so also
+# confirm the binary is actually linked against a QUIC library — best
+# effort: a statically-linked QUIC build won't show up here and is treated
+# as unsupported, so this can produce false negatives but not the false
+# positive that motivated it.
+h2load_h3_supported() {
+    command -v h2load >/dev/null 2>&1 || return 1
+    h2load --h3 --help &>/dev/null 2>&1 || return 1
+    local h2load_path
+    h2load_path="$(command -v h2load)"
+    if command -v otool >/dev/null 2>&1; then
+        otool -L "$h2load_path" 2>/dev/null | grep -qiE 'libngtcp2|libnghttp3'
+    elif command -v ldd >/dev/null 2>&1; then
+        ldd "$h2load_path" 2>/dev/null | grep -qiE 'libngtcp2|libnghttp3'
+    else
+        return 0
+    fi
+}
+
 # ── h2load HTTP/3 runner ──────────────────────────────────────────────────────
 # Requires h2load built with QUIC/nghttp3+ngtcp2 support.
 # If --h3 is unknown to this h2load build, the scenario is silently skipped.
 run_h2load_h3() {
     local url="$1" label="$2"
-    if ! h2load --h3 --help &>/dev/null 2>&1; then
+    if ! h2load_h3_supported; then
         echo "  Skipping $label — h2load on this system does not support --h3 (HTTP/3)"
         return
     fi
@@ -1633,7 +1658,7 @@ H2LOAD_H3_SUPPORTED=false
 H2LOAD_OUTPUT_FILE_SUPPORTED=false
 if command -v h2load &>/dev/null; then
     H2LOAD_VERSION=$({ h2load --version 2>&1 || true; } | head -1)
-    h2load --h3 --help &>/dev/null 2>&1 && H2LOAD_H3_SUPPORTED=true
+    h2load_h3_supported && H2LOAD_H3_SUPPORTED=true
     # #256-G review: run_h2load falls back to text-table parsing on a build
     # without --output-file — record which path actually ran so a result
     # produced by the legacy fallback isn't silently indistinguishable from
