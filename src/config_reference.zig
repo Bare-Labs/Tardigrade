@@ -270,20 +270,20 @@ pub const entries = [_]ConfigEntry{
     .{
         .name = "location.return",
         .aliases = &.{"return"},
-        .contexts = CTX_LOCATION,
+        .contexts = CTX_TOP_LOCATION,
         .value_type = "status [body]",
         .default_value = "none",
-        .description = "Immediately returns a fixed status code and optional body for matching requests.",
+        .description = "Immediately returns a fixed status code and optional body. At top level it applies globally; inside a location it applies only to the matched route.",
         .example = "location = /health {\n    return 200 ok;\n}",
         .docs = &.{"docs/CONFIGURATION.md"},
     },
     .{
         .name = "location.rewrite",
         .aliases = &.{"rewrite"},
-        .contexts = CTX_LOCATION,
+        .contexts = CTX_TOP_LOCATION,
         .value_type = "pattern replacement [flag]",
         .default_value = "flag: last",
-        .description = "Rewrites the request URI according to pattern/replacement before continuing dispatch.",
+        .description = "Rewrites the request URI according to pattern/replacement before continuing dispatch. Valid both at top level and inside a location.",
         .example = "location /old/ {\n    rewrite ^/old/(.*)$ /new/$1 last;\n}",
     },
     .{
@@ -306,8 +306,25 @@ pub const entries = [_]ConfigEntry{
         .example = "location /admin/ {\n    auth required;\n}",
     },
     .{
+        .name = "proxy_streaming_mode",
+        .contexts = CTX_TOP,
+        .value_type = "enum",
+        .default_value = "off",
+        .valid_values = &.{ "off", "response", "full" },
+        .value_aliases = &.{
+            .{ .alias = "buffered", .canonical = "off" },
+            .{ .alias = "responses", .canonical = "response" },
+            .{ .alias = "request_response", .canonical = "full" },
+            .{ .alias = "request-response", .canonical = "full" },
+        },
+        .description = "Global proxy streaming policy (off = fully buffered, response = stream response only, full = stream both directions). Overridable per-location via proxy_streaming.",
+        .example = "proxy_streaming_mode response;",
+        .env_vars = &.{"TARDIGRADE_PROXY_STREAMING_MODE"},
+        .docs = &.{"docs/PROXY_STREAMING.md"},
+    },
+    .{
         .name = "location.proxy_streaming",
-        .aliases = &.{ "proxy_streaming", "proxy_streaming_mode", "location.proxy_streaming_mode" },
+        .aliases = &.{ "proxy_streaming", "location.proxy_streaming_mode" },
         .contexts = CTX_LOCATION,
         .value_type = "enum",
         .default_value = "inherit (uses the global proxy_streaming_mode)",
@@ -318,7 +335,7 @@ pub const entries = [_]ConfigEntry{
             .{ .alias = "request_response", .canonical = "full" },
             .{ .alias = "request-response", .canonical = "full" },
         },
-        .description = "Per-location override of the global proxy streaming policy (off = fully buffered, response = stream response only, full = stream both directions).",
+        .description = "Per-location override of the global proxy_streaming_mode policy (off = fully buffered, response = stream response only, full = stream both directions).",
         .example = "location /upload/ {\n    proxy_pass http://up;\n    proxy_streaming full;\n}",
         .docs = &.{"docs/PROXY_STREAMING.md"},
     },
@@ -1326,6 +1343,41 @@ test "lookup resolves the qualified server.server_name alias" {
     try std.testing.expectEqualStrings("server_name", entry.name);
 }
 
+fn hasContext(contexts: []const Context, target: Context) bool {
+    for (contexts) |ctx| if (ctx == target) return true;
+    return false;
+}
+
+test "return and rewrite report both their top-level and location contexts" {
+    const ret = lookup("return").?;
+    try std.testing.expect(hasContext(ret.contexts, .top_level));
+    try std.testing.expect(hasContext(ret.contexts, .location));
+
+    const rewrite = lookup("rewrite").?;
+    try std.testing.expect(hasContext(rewrite.contexts, .top_level));
+    try std.testing.expect(hasContext(rewrite.contexts, .location));
+}
+
+test "proxy_streaming_mode (global) and location.proxy_streaming report distinct defaults, contexts, and env vars" {
+    const global = lookup("proxy_streaming_mode").?;
+    try std.testing.expectEqualStrings("proxy_streaming_mode", global.name);
+    try std.testing.expectEqualStrings("off", global.default_value.?);
+    try std.testing.expectEqual(@as(usize, 1), global.contexts.len);
+    try std.testing.expectEqual(Context.top_level, global.contexts[0]);
+    try std.testing.expectEqualStrings("TARDIGRADE_PROXY_STREAMING_MODE", global.env_vars[0]);
+
+    const location_override = lookup("proxy_streaming").?;
+    try std.testing.expectEqualStrings("location.proxy_streaming", location_override.name);
+    try std.testing.expectEqualStrings("inherit (uses the global proxy_streaming_mode)", location_override.default_value.?);
+    try std.testing.expectEqual(@as(usize, 1), location_override.contexts.len);
+    try std.testing.expectEqual(Context.location, location_override.contexts[0]);
+    try std.testing.expectEqual(@as(usize, 0), location_override.env_vars.len);
+
+    // The qualified long-form spelling still reaches the location entry,
+    // not the global one.
+    try std.testing.expectEqualStrings("location.proxy_streaming", lookup("location.proxy_streaming_mode").?.name);
+}
+
 test "location block reports its real parser contexts (top-level and server, not nested location)" {
     const entry = lookup("location").?;
     try std.testing.expectEqual(@as(usize, 2), entry.contexts.len);
@@ -1518,6 +1570,7 @@ test "writeUnknown on a wildly unrelated query still returns cleanly with no sug
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 test "explaining a secret field never includes a live secret value present in the process environment" {
     // Regression guard for #163. Unlike a check that only inspects the
@@ -1529,10 +1582,30 @@ test "explaining a secret field never includes a live secret value present in th
     // surfaces it. See also the equivalent integration test in
     // tests/integration.zig, which spawns the built `tardi explain
     // jwt_secret` binary against a real child environment.
-    const sentinel = "do-not-print-this-sentinel";
-    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_JWT_SECRET", sentinel, 1));
+    //
+    // Zig unit tests share one process, so this test must not leave
+    // TARDIGRADE_JWT_SECRET mutated for whatever ran before or after it:
+    // capture the prior value (if any) and restore/unset it on the way out.
+    const env_name = "TARDIGRADE_JWT_SECRET";
+    var prev_buf: [4096]u8 = undefined;
+    var prev_len: ?usize = null;
+    if (std.c.getenv(env_name)) |existing| {
+        const existing_slice = std.mem.span(existing);
+        const len = @min(existing_slice.len, prev_buf.len - 1);
+        @memcpy(prev_buf[0..len], existing_slice[0..len]);
+        prev_buf[len] = 0;
+        prev_len = len;
+    }
+    defer if (prev_len) |len| {
+        _ = setenv(env_name, prev_buf[0..len :0], 1);
+    } else {
+        _ = unsetenv(env_name);
+    };
 
-    const observed = std.c.getenv("TARDIGRADE_JWT_SECRET") orelse return error.TestUnexpectedResult;
+    const sentinel = "do-not-print-this-sentinel";
+    try std.testing.expectEqual(@as(c_int, 0), setenv(env_name, sentinel, 1));
+
+    const observed = std.c.getenv(env_name) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(sentinel, std.mem.span(observed));
 
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -1540,5 +1613,5 @@ test "explaining a secret field never includes a live secret value present in th
     try writeExplanation(&out.writer, lookup("jwt_secret").?);
     const written = out.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, sentinel) == null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "TARDIGRADE_JWT_SECRET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, env_name) != null);
 }

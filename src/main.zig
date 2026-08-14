@@ -428,11 +428,11 @@ fn printUsage(writer: anytype) !void {
         \\  tardigrade stop [-c <path>] [--pid-file <path> | --pid <pid>]
         \\  tardigrade version
         \\  tardigrade init <profile>
-        \\  tardigrade explain <field>
+        \\  tardi explain <field>
         \\  tardigrade config init [<path>] [--force | --stdout] [--profile <profile>]
         \\  tardigrade config print [-c <path>]
         \\  tardigrade config validate [<config>]
-        \\  tardigrade config explain <field>
+        \\  tardi config explain <field>
         \\
         \\Profiles (canonical name, descriptive alias -- aliases resolve to the
         \\same template):
@@ -1982,4 +1982,20 @@ test "missing explain field error message names the field" {
     defer out.deinit();
     try printCliParseError(&out.writer, error.MissingExplainField);
     try std.testing.expectEqualStrings("error: missing configuration field or directive\n", out.writer.buffered());
+}
+
+test "built-in usage documents the concise tardi explain form before the verbose config explain alias" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try printUsage(&out.writer);
+    const written = out.writer.buffered();
+
+    const concise_idx = std.mem.indexOf(u8, written, "tardi explain <field>") orelse return error.TestUnexpectedResult;
+    const verbose_idx = std.mem.indexOf(u8, written, "tardi config explain <field>") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(concise_idx < verbose_idx);
+
+    // #163 requires the built-in help to name the canonical `tardi` binary
+    // for these two commands, not the legacy `tardigrade` spelling.
+    try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade explain <field>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade config explain <field>") == null);
 }
