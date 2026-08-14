@@ -613,8 +613,7 @@ pub const Runtime = struct {
                     if (draining and !entry.drain_goaway_sent) self.sendDrainGoaway(entry);
                     self.drainConnectionTransmits(entry, now);
                     if (drain_expired) {
-                        entry.quic_observer.administrative_close = true;
-                        entry.conn.close(0x0100, "h3 drain deadline", now);
+                        self.closeForDrainDeadline(entry, now);
                     } else {
                         self.pumpH3(entry, now);
                     }
@@ -1043,6 +1042,16 @@ pub const Runtime = struct {
             var it = connections.keyIterator();
             const handle = it.next().?.*;
             self.removeConnection(connections, routes, per_ip, handle, .administrative);
+        }
+    }
+
+    fn closeForDrainDeadline(_: *Runtime, entry: *ConnEntry, now: u64) void {
+        switch (entry.conn.state()) {
+            .closing, .draining, .closed => {},
+            else => {
+                entry.quic_observer.administrative_close = true;
+                entry.conn.close(0x0100, "h3 drain deadline", now);
+            },
         }
     }
 
@@ -1651,11 +1660,11 @@ pub const Runtime = struct {
             }
         }
         switch (event) {
+            .state => |state| {
+                if (state == .established) observer.handshake_succeeded = true;
+            },
             .packet_received => |packet| {
                 if (packet.space == .handshake) observer.handshake_stage = .handshake;
-            },
-            .handshake_complete, .handshake_confirmed => {
-                observer.handshake_succeeded = true;
             },
             .early_data_decision => |decision| {
                 const mapped: metrics_mod.QuicEarlyDataDecision = switch (decision) {
@@ -3318,7 +3327,7 @@ test "http3 runtime metrics: handshake failures use removal reason and observed 
     errdefer established_closed.deinit(allocator);
     established_closed.entry.conn.state_ = .closing;
     established_closed.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 4 };
-    Runtime.quicConnectionEvent(&established_closed.entry.quic_observer, .handshake_complete);
+    Runtime.quicConnectionEvent(&established_closed.entry.quic_observer, .{ .state = .established });
     var closed_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
     defer closed_connections.deinit();
     var closed_routes = quic.cid.CidRoutingTable.init(allocator);
@@ -3337,7 +3346,7 @@ test "http3 runtime metrics: handshake failures use removal reason and observed 
     established_old.entry.conn.state_ = .closed;
     established_old.entry.accepted_at_us = 0;
     established_old.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 5 };
-    Runtime.quicConnectionEvent(&established_old.entry.quic_observer, .handshake_confirmed);
+    Runtime.quicConnectionEvent(&established_old.entry.quic_observer, .{ .state = .established });
     var old_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
     defer old_connections.deinit();
     var old_routes = quic.cid.CidRoutingTable.init(allocator);
@@ -3351,9 +3360,49 @@ test "http3 runtime metrics: handshake failures use removal reason and observed 
     established_old.client.deinit();
     allocator.destroy(established_old);
 
-    try testing.expectEqual(@as(usize, 2), capture.handshake_failures);
+    var tls_complete_failed = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer tls_complete_failed.deinit(allocator);
+    tls_complete_failed.entry.conn.state_ = .closing;
+    tls_complete_failed.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 6 };
+    Runtime.quicConnectionEvent(&tls_complete_failed.entry.quic_observer, .{ .packet_received = .{ .space = .handshake, .packet_type = .handshake, .packet_number = 2, .size = 80 } });
+    Runtime.quicConnectionEvent(&tls_complete_failed.entry.quic_observer, .handshake_complete);
+    var tls_failed_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer tls_failed_connections.deinit();
+    var tls_failed_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer tls_failed_routes.deinit();
+    var tls_failed_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer tls_failed_per_ip.deinit();
+    try tls_failed_connections.put(6, tls_complete_failed.entry);
+    try tls_failed_routes.insert(tls_complete_failed.entry.owned_cids[0], 6);
+    try incPerIp(&tls_failed_per_ip, tls_complete_failed.entry.admission_source_ip);
+    runtime.removeConnection(&tls_failed_connections, &tls_failed_routes, &tls_failed_per_ip, 6, .protocol_failure);
+    tls_complete_failed.client.deinit();
+    allocator.destroy(tls_complete_failed);
+
+    var drain_race = try RuntimeCidHarness.init(allocator, fixed.provider());
+    errdefer drain_race.deinit(allocator);
+    drain_race.entry.conn.state_ = .closing;
+    drain_race.entry.quic_observer = .{ .runtime = &runtime, .connection_handle = 7 };
+    Runtime.quicConnectionEvent(&drain_race.entry.quic_observer, .{ .packet_received = .{ .space = .handshake, .packet_type = .handshake, .packet_number = 3, .size = 96 } });
+    runtime.closeForDrainDeadline(drain_race.entry, drain_race.now_us);
+    try testing.expect(!drain_race.entry.quic_observer.administrative_close);
+    var drain_race_connections = std.AutoHashMap(u64, *ConnEntry).init(allocator);
+    defer drain_race_connections.deinit();
+    var drain_race_routes = quic.cid.CidRoutingTable.init(allocator);
+    defer drain_race_routes.deinit();
+    var drain_race_per_ip = std.AutoHashMap(u32, u32).init(allocator);
+    defer drain_race_per_ip.deinit();
+    try drain_race_connections.put(7, drain_race.entry);
+    try drain_race_routes.insert(drain_race.entry.owned_cids[0], 7);
+    try incPerIp(&drain_race_per_ip, drain_race.entry.admission_source_ip);
+    const drain_race_reason: RemovalReason = if (drain_race.entry.quic_observer.administrative_close) .administrative else .protocol_failure;
+    runtime.removeConnection(&drain_race_connections, &drain_race_routes, &drain_race_per_ip, 7, drain_race_reason);
+    drain_race.client.deinit();
+    allocator.destroy(drain_race);
+
+    try testing.expectEqual(@as(usize, 4), capture.handshake_failures);
     try testing.expectEqual(@as(usize, 1), capture.handshake_failures_by_stage[0]);
-    try testing.expectEqual(@as(usize, 1), capture.handshake_failures_by_stage[1]);
+    try testing.expectEqual(@as(usize, 3), capture.handshake_failures_by_stage[1]);
 }
 
 test "http3 runtime metrics: rendered Prometheus deltas are not double-counted across folds" {
