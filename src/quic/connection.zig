@@ -3631,6 +3631,37 @@ pub const Connection = struct {
         return deadline;
     }
 
+    /// #256-C: the instant this connection's *pacing* schedule next releases a
+    /// datagram, or null when nothing is waiting on it.
+    ///
+    /// This is the scheduling half of `pollTransmitOnPath`. That function
+    /// declines to build application data while the token bucket is short
+    /// rather than sleeping inside packet construction, so an event loop that
+    /// watched only `nextTimeoutUs` would have nothing telling it when the
+    /// data became eligible — it would either sleep past the release or come
+    /// back immediately and be refused again. Deliberately separate from
+    /// `nextTimeoutUs`: this deadline arms no timer and needs no `onTimeout`
+    /// work, it only says when to try transmitting again.
+    ///
+    /// Null unless there is genuinely paced content held back, so it cannot
+    /// keep an otherwise-idle listener awake. When it is non-null the value is
+    /// strictly in the future (`pacingReleaseUs` floors the wait at one timer
+    /// granularity), so a loop that sleeps until it always advances.
+    pub fn nextSendTimeUs(self: *Connection, now_us: u64) ?u64 {
+        if (self.state_ != .established) return null;
+        if (!self.hasAppContent()) return null;
+        const size = self.recovery.congestion.max_datagram_size;
+        // Congestion control is the harder gate and it is not a pacing
+        // deadline: when the window is what is holding the sender back, the
+        // PTO and loss timers `nextTimeoutUs` already reports are what should
+        // wake the loop. Mirrors `buildPacket`'s window check so this never
+        // promises a wakeup that would produce nothing.
+        const cwnd_room = self.recovery.congestion.congestion_window -| self.recovery.congestion.bytes_in_flight;
+        if (cwnd_room < size / 2 and self.recovery.congestion.bytes_in_flight != 0) return null;
+        if (self.recovery.pacingAllows(size, now_us)) return null;
+        return self.recovery.pacingReleaseUs(size, now_us);
+    }
+
     /// The peer's largest acknowledged packet number in a space, as the
     /// reference `packet.packetNumberLength` encodes against — or null when
     /// there isn't a usable one.
@@ -4421,11 +4452,30 @@ pub const Connection = struct {
         // Congestion gate: in-flight bytes need window; pure ACK packets and
         // PTO probes are exempt (RFC 9002 §7, §6.2.4).
         const cwnd_room = self.recovery.congestion.congestion_window -| self.recovery.congestion.bytes_in_flight;
+
+        // #256-C: the RFC 9002 §7.7 pacing gate. It only ever *delays* — the
+        // window term below and the anti-amplification check after it remain
+        // the gates that refuse outright. What waits on a token is
+        // application-space data, and only that:
+        //   * a pure ACK is not congestion controlled at all, so metering it
+        //     would add latency to acknowledgements for no capacity reason;
+        //   * a PTO probe is recovery traffic RFC 9002 §7 already exempts from
+        //     the window, and making loss recovery wait on a token is how a
+        //     stalled connection stays stalled;
+        //   * Initial/Handshake flights are bounded by the initial window and,
+        //     for a server, by anti-amplification — pacing the handshake at a
+        //     rate derived from an RTT nobody has measured yet would slow every
+        //     connection setup to buy nothing.
+        // The bytes all three put on the wire are still charged to the bucket
+        // (`RecoveryController.chargeSend`); they simply never wait on it.
+        const pacing_blocked = space == .application and !probe and
+            !self.recovery.pacingAllows(self.recovery.congestion.max_datagram_size, now_us);
+
         // Recovery's tracker is bounded. An in-flight packet it cannot track
         // would escape both loss detection and the congestion window, so
         // preflight a slot here — before any frame is dequeued — and fall back
         // to ACK-only output rather than sending something uncharged.
-        const can_send_data = can_track_ordinary and (probe or
+        const can_send_data = can_track_ordinary and !pacing_blocked and (probe or
             cwnd_room >= self.recovery.congestion.max_datagram_size / 2 or
             self.recovery.congestion.bytes_in_flight == 0);
 
@@ -12658,4 +12708,215 @@ test "driver: a fully saturated tracker never seals a padded in-flight packet" {
     _ = pair.server.recovery.tracker.dropSpace(.initial);
     try pair.pump();
     try testing.expect(pair.server.isEstablished());
+}
+
+// -- #256-C: pacing ----------------------------------------------------------
+
+/// A connection parked where pacing, and only pacing, is what bounds egress:
+/// established, a large stream queued, and a fresh token bucket. Every other
+/// gate — the window, flow control, the recovery tracker, anti-amplification —
+/// is deliberately left with slack, so a test that observes backpressure here
+/// is observing the pacer.
+///
+/// The window and RTT are pinned rather than inherited from the handshake,
+/// which leaves a sub-millisecond RTT that would put the pacing rate in the
+/// hundreds of MB/s — a rate at which the schedule correctly stops mattering
+/// and there would be nothing to observe. A 64 kB window over a 100 ms RTT
+/// paces one 1200-byte datagram every 1.5 ms, and holds ~53 datagrams, so the
+/// ten-datagram burst ceiling is the binding constraint and not the window.
+fn pacedServerPair(allocator: std.mem.Allocator) !*TestPair {
+    const pair = try TestPair.init(allocator);
+    errdefer pair.deinit(allocator);
+    try pair.pump();
+
+    const sid = try openServerResponseStream(pair);
+    _ = try pair.server.writeStream(sid, &[_]u8{0xab} ** (64 * 1024), false);
+
+    pair.server.recovery.rtt = recovery.RttEstimator.init(25_000);
+    pair.server.recovery.rtt.update(100_000, 0);
+    const congestion = &pair.server.recovery.congestion;
+    congestion.congestion_window = 64 * 1024;
+    congestion.ssthresh = 64 * 1024;
+    congestion.bytes_in_flight = 0;
+    congestion.pacer = .{};
+    return pair;
+}
+
+/// Drain every datagram the connection will produce at one frozen instant.
+/// Distinct from `drainTransmits`, which advances the clock between datagrams
+/// and so lets the bucket refill mid-drain — exactly what a burst-bound test
+/// must not do.
+fn drainAtInstant(conn: *Connection, now_us: u64) usize {
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    var count: usize = 0;
+    while (conn.pollTransmitOnPath(&out, now_us)) |_| count += 1;
+    return count;
+}
+
+test "driver: pacing bounds one instant's egress and declines rather than sleeping" {
+    const allocator = testing.allocator;
+    var pair = try pacedServerPair(allocator);
+    defer pair.deinit(allocator);
+
+    const now = pair.now_us;
+    const congestion = &pair.server.recovery.congestion;
+    const mds = pair.server.effectiveMaxDatagramSize();
+
+    // The event loop asks for datagrams until it is told no. With the clock
+    // frozen, what stops it is the burst ceiling — not a sleep inside packet
+    // construction, and not the 512 kB window, which is wide enough for far
+    // more than this.
+    const burst = drainAtInstant(pair.server, now);
+    try testing.expect(burst > 0);
+    try testing.expect(burst <= recovery.default_pacer_burst_packets);
+    try testing.expect(congestion.bytes_in_flight < congestion.congestion_window);
+    try testing.expect(!pair.server.recovery.pacingAllows(mds, now));
+
+    // Asking again at the same instant produces nothing at all: the listener
+    // stops, it does not spin.
+    try testing.expectEqual(@as(usize, 0), drainAtInstant(pair.server, now));
+}
+
+test "driver: a paced connection reports the wakeup deadline its send path is waiting on" {
+    const allocator = testing.allocator;
+    var pair = try pacedServerPair(allocator);
+    defer pair.deinit(allocator);
+
+    const now = pair.now_us;
+    _ = drainAtInstant(pair.server, now);
+
+    // Nothing in `nextTimeoutUs` knows about the pacer, so without this the
+    // event loop would have no deadline for the data it is holding back.
+    const release = pair.server.nextSendTimeUs(now) orelse return error.TestExpectedEqual;
+    try testing.expect(release > now);
+
+    // Strictly in the future, so sleeping until it always advances — and
+    // nothing more comes out before it does.
+    try testing.expectEqual(@as(usize, 0), drainAtInstant(pair.server, release - 1));
+
+    // At the deadline the send path produces again, and having produced, it is
+    // once more waiting on a later deadline.
+    const in_flight_before = pair.server.recovery.congestion.bytes_in_flight;
+    try testing.expect(drainAtInstant(pair.server, release) > 0);
+    try testing.expect(pair.server.recovery.congestion.bytes_in_flight > in_flight_before);
+    const next = pair.server.nextSendTimeUs(release) orelse return error.TestExpectedEqual;
+    try testing.expect(next > release);
+}
+
+test "driver: pacing spaces datagrams evenly once the opening burst is spent" {
+    const allocator = testing.allocator;
+    var pair = try pacedServerPair(allocator);
+    defer pair.deinit(allocator);
+
+    var now = pair.now_us;
+    _ = drainAtInstant(pair.server, now);
+
+    // What one maximum-size datagram costs at this pacing rate, from an empty
+    // bucket — the interval the schedule is aiming at.
+    const mds = pair.server.effectiveMaxDatagramSize();
+    var empty = pair.server.recovery.congestion;
+    empty.pacer = .{ .tokens = 0, .updated_at_us = 0 };
+    const interval = empty.pacingReleaseUs(mds, 0, pair.server.recovery.rtt);
+
+    // Past the opening burst, each wakeup waits about one datagram-interval
+    // and releases a datagram or two — never the ceiling again. That is the
+    // whole point of the bucket: a window's worth of data reaches the path
+    // spread across a round trip instead of as one flight.
+    //
+    // Not exactly `interval` each time, because a datagram that comes out
+    // slightly under the maximum size leaves that much credit behind and
+    // shortens the next wait. Bounded above by construction (the deficit can
+    // never exceed a full datagram) and, for a stream this large, never far
+    // below it.
+    var step: usize = 0;
+    while (step < 5) : (step += 1) {
+        const release = pair.server.nextSendTimeUs(now) orelse return error.TestExpectedEqual;
+        const gap = release - now;
+        try testing.expect(gap > 0);
+        try testing.expect(gap <= interval);
+        try testing.expect(gap >= interval / 2);
+
+        const emitted = drainAtInstant(pair.server, release);
+        try testing.expect(emitted > 0);
+        try testing.expect(emitted < recovery.default_pacer_burst_packets);
+        now = release;
+    }
+}
+
+test "driver: an idle paced connection restarts with a burst rather than a backlog" {
+    const allocator = testing.allocator;
+    var pair = try pacedServerPair(allocator);
+    defer pair.deinit(allocator);
+
+    const now = pair.now_us;
+    const burst = drainAtInstant(pair.server, now);
+    try testing.expect(burst > 0);
+
+    // A second's silence is worth many times the burst in accrued credit. The
+    // restart is bounded by the same ceiling as the opening flight, so a
+    // connection coming back from idle cannot hand the path a datagram storm.
+    const after_idle = now + 1_000_000;
+    const restart = drainAtInstant(pair.server, after_idle);
+    try testing.expect(restart > 0);
+    try testing.expect(restart <= recovery.default_pacer_burst_packets);
+    try testing.expectEqual(@as(usize, 0), drainAtInstant(pair.server, after_idle));
+}
+
+test "driver: congestion control outranks pacing, and reports no pacing deadline" {
+    const allocator = testing.allocator;
+    var pair = try pacedServerPair(allocator);
+    defer pair.deinit(allocator);
+
+    const now = pair.now_us;
+    const congestion = &pair.server.recovery.congestion;
+
+    // A full bucket over a closed window puts nothing new on the wire. Pacing
+    // releases traffic; it never authorises it past the window. Measured on
+    // the in-flight ledger rather than on the datagram count, because a pure
+    // ACK is entitled to leave here and is not charged to the window.
+    congestion.bytes_in_flight = congestion.congestion_window;
+    const closed = congestion.bytes_in_flight;
+    try testing.expect(pair.server.recovery.pacingAllows(pair.server.effectiveMaxDatagramSize(), now));
+    _ = drainAtInstant(pair.server, now);
+    try testing.expectEqual(closed, congestion.bytes_in_flight);
+
+    // And no pacing deadline is reported for it: the pacer is not what this
+    // connection is waiting on, so the loss and PTO timers `nextTimeoutUs`
+    // already publishes are what should wake the loop.
+    try testing.expectEqual(@as(?u64, null), pair.server.nextSendTimeUs(now));
+
+    // Reopening the window releases the data without any wait — the credit
+    // was there the whole time.
+    congestion.bytes_in_flight = 0;
+    try testing.expect(drainAtInstant(pair.server, now) > 0);
+}
+
+test "driver: an acknowledgement is not delayed by a spent pacing bucket" {
+    const allocator = testing.allocator;
+    var pair = try pacedServerPair(allocator);
+    defer pair.deinit(allocator);
+
+    const now = pair.now_us;
+    _ = drainAtInstant(pair.server, now);
+    try testing.expect(!pair.server.recovery.pacingAllows(pair.server.effectiveMaxDatagramSize(), now));
+
+    // The client sends something ack-eliciting into a server whose bucket is
+    // empty. An ACK is not congestion-controlled traffic, so metering it would
+    // add pure latency to the peer's recovery for no capacity reason.
+    const sid = try pair.client.openStream(.uni);
+    _ = try pair.client.writeStream(sid, "ping", false);
+    var out: [max_datagram_size_ceiling]u8 = undefined;
+    var delivered: usize = 0;
+    while (pair.client.pollTransmitOnPath(&out, now)) |t| {
+        const ingress = quic_path.PathKey{ .local = t.path.remote, .remote = t.path.local };
+        try pair.server.ingestOnPath(t.bytes, ingress, TestPair.test_challenge_entropy, now);
+        delivered += 1;
+    }
+    try testing.expect(delivered > 0);
+
+    // Forced past the delayed-ACK timer so this is about pacing and not about
+    // the ACK still legitimately waiting.
+    pair.server.ack_eliciting_since_ack[Connection.spaceIndex(.application)] = ack_eliciting_threshold;
+    const ack = pair.server.pollTransmitOnPath(&out, now) orelse return error.TestExpectedEqual;
+    try testing.expect(ack.bytes.len > 0);
 }

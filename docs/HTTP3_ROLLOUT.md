@@ -400,6 +400,67 @@ of paths that validated.
 `TARDIGRADE_HTTP3_ECN` is restart-required, like every other listener-owned knob
 — the receive option is socket state applied at bind time.
 
+## Packet pacing
+
+A congestion window is a bound on how much data may be *outstanding*, not on
+how fast it may leave. A sender that holds a 64 kB window and simply writes
+until the window is full hands that whole window to the first router in the
+path as one burst — which is how a connection with plenty of nominal capacity
+still sees queue-overflow loss. RFC 9002 §7.7 requires a sender to either pace
+or bound such bursts. Tardigrade does both.
+
+Pacing is a **leaky bucket**, not a bandwidth model: credit accrues at
+`N × congestion_window / smoothed_rtt` and is spent by packets as they leave.
+`N` is 2 while the connection is in slow start and 1.25 in congestion
+avoidance, exactly as RFC 9002 §7.7 describes. BBR and any other rate estimator
+are out of scope.
+
+Two properties follow, and they are what the setting is for:
+
+- **Spacing.** Once the bucket is empty, datagrams leave one interval apart —
+  a full window's worth of data reaches the path spread over a round trip
+  rather than as a single flight.
+- **A burst ceiling.** The bucket holds at most ten maximum-size datagrams.
+  That bounds the opening flight, and it bounds the *restart* flight: a
+  connection that has been idle for a second has notionally earned megabytes
+  of credit, and gets ten packets.
+
+### What is paced, and what is not
+
+Only application-space data waits on the bucket. Three kinds of traffic are
+charged to it — the bytes are genuinely on the wire — but never delayed by it:
+
+- **Acknowledgements.** A pure ACK is not congestion-controlled traffic at all.
+  Metering it would add latency to the *peer's* loss recovery for no capacity
+  reason.
+- **PTO probes.** RFC 9002 §7 already exempts probes from the congestion
+  window; making loss recovery wait on a token is how a stalled connection
+  stays stalled.
+- **Initial and Handshake flights.** These are already bounded by the initial
+  window and, for a server, by anti-amplification. Pacing them at a rate
+  derived from an RTT nobody has measured yet would slow every connection
+  setup to buy nothing.
+
+Congestion control and anti-amplification remain the hard gates. Pacing can
+only ever *delay* a datagram — it never authorises one the window or the
+amplification budget would refuse, and a connection blocked by either of those
+reports no pacing deadline at all.
+
+### How it reaches the wire
+
+Pacing is a schedule, not a sleep. `Connection.pollTransmitOnPath` never
+blocks: while the bucket is short it simply declines to build paced data, and
+`Connection.nextSendTimeUs` reports the instant the schedule next releases
+something. The listener folds that deadline into the same `poll` timeout it
+already computes from timers, so a paced connection neither spins nor sleeps
+past its own release. Packet construction and scheduling stay separable — the
+same seam a batching or GSO send path would need later.
+
+There is no operator knob. Pacing follows congestion control, and a rate an
+operator could raise independently of the window would be a way to defeat
+congestion control rather than to tune it. A path whose measured capacity
+grows paces faster on its own.
+
 ## Reload
 
 Advertisement-only knobs can hot reload:

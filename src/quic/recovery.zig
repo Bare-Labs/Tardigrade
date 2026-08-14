@@ -29,8 +29,21 @@ pub const timer_granularity_us: u64 = 1_000;
 pub const packet_threshold: u64 = 3;
 pub const default_max_ack_delay_us: u64 = 25_000;
 
+/// How many maximum-size datagrams the pacer will let leave back to back
+/// (#256-C). RFC 9002 §7.7 requires a sender to either pace or bound its
+/// bursts; this bounds them at the initial window, so a connection whose
+/// congestion window has grown to many times that still cannot hand the
+/// network a window-sized burst in a single event-loop pass.
+pub const default_pacer_burst_packets: usize = 10;
+
 const time_threshold_numerator: u64 = 9;
 const time_threshold_denominator: u64 = 8;
+/// RFC 9002 §7.7's pacing gain `N`: 2 while in slow start, 1.25 in congestion
+/// avoidance.
+const pacing_gain_slow_start_numerator: u64 = 2;
+const pacing_gain_slow_start_denominator: u64 = 1;
+const pacing_gain_avoidance_numerator: u64 = 5;
+const pacing_gain_avoidance_denominator: u64 = 4;
 
 pub const PacketNumberSpace = enum {
     initial,
@@ -804,6 +817,11 @@ pub const CongestionController = struct {
     /// size the packet builder actually emits rather than a compile-time
     /// constant (#256-A).
     max_datagram_size: usize = initial_max_datagram_size,
+    /// RFC 9002 §7.7 pacing state (#256-C). Lives here because the pacing
+    /// rate is a function of this controller's window: a reset that discards
+    /// the window (path migration) must discard the schedule derived from it
+    /// in the same step.
+    pacer: Pacer = .{},
 
     pub fn initialWindow(max_datagram: usize) usize {
         return @min(10 * max_datagram, @max(2 * max_datagram, 14_720));
@@ -879,19 +897,149 @@ pub const CongestionController = struct {
         self.ssthresh = self.congestion_window;
     }
 
+    /// RFC 9002 §7.7's pacing gain `N`, as an exact fraction so the schedule
+    /// stays integer arithmetic. Slow start doubles the window every round
+    /// trip, so pacing it at 1.25× would hold the sender below the growth the
+    /// window is already granting; congestion avoidance wants the smaller
+    /// gain, which is what keeps a full window from leaving as one burst.
+    fn pacingGain(self: CongestionController) PacingGain {
+        if (self.congestion_window < self.ssthresh) {
+            return .{ .numerator = pacing_gain_slow_start_numerator, .denominator = pacing_gain_slow_start_denominator };
+        }
+        return .{ .numerator = pacing_gain_avoidance_numerator, .denominator = pacing_gain_avoidance_denominator };
+    }
+
+    /// The window the pacing rate is derived from. Floored at the minimum
+    /// window so a controller driven to its floor still paces at a rate that
+    /// makes forward progress rather than dividing by a collapsed number.
+    fn pacingWindow(self: CongestionController) u64 {
+        return @max(self.congestion_window, self.minWindow());
+    }
+
+    /// Bytes the pacing bucket holds at `now_us` (#256-C).
+    ///
+    /// Pure by design: asking "may I send?" must not itself move the
+    /// schedule, so the bucket is only ever advanced by `onPacingSent`, and
+    /// two queries at the same instant give the same answer. The refill is
+    /// computed from the last charge rather than accumulated tick by tick,
+    /// which is what makes the schedule independent of how often the event
+    /// loop happens to wake.
+    pub fn pacingTokens(self: CongestionController, now_us: u64, rtt: RttEstimator) usize {
+        const burst = self.pacer.burstBytes(self.max_datagram_size);
+        // A pacer that has never sent starts full: the first flight of a
+        // connection (and the first after an idle period, once
+        // `onPacingSent`'s stamp has aged past a full burst's worth of
+        // refill) is allowed the whole burst rather than being metered out
+        // from an empty bucket.
+        const since = self.pacer.updated_at_us orelse return burst;
+        const elapsed = now_us -| since;
+        const srtt = @max(rtt.smoothed_rtt_us orelse initial_rtt_us, 1);
+        const gain = self.pacingGain();
+        const gained = (@as(u128, elapsed) * gain.numerator * self.pacingWindow()) /
+            (@as(u128, gain.denominator) * srtt);
+        return @intCast(@min(@as(u128, self.pacer.tokens) + gained, @as(u128, burst)));
+    }
+
+    /// Whether a `bytes`-sized congestion-controlled datagram is eligible to
+    /// leave at `now_us` under the pacing schedule.
+    pub fn pacingAllows(self: CongestionController, bytes: usize, now_us: u64, rtt: RttEstimator) bool {
+        return self.pacingTokens(now_us, rtt) >= bytes;
+    }
+
+    /// The earliest time `bytes` becomes eligible — `now_us` when it already
+    /// is. When it is not, the result is strictly greater than `now_us` (at
+    /// least one timer granularity out), so an event loop that sleeps until
+    /// this deadline always makes progress instead of spinning on a deadline
+    /// that has already passed.
+    pub fn pacingReleaseUs(self: CongestionController, bytes: usize, now_us: u64, rtt: RttEstimator) u64 {
+        const tokens = self.pacingTokens(now_us, rtt);
+        if (tokens >= bytes) return now_us;
+        const deficit = bytes - tokens;
+        const srtt = @max(rtt.smoothed_rtt_us orelse initial_rtt_us, 1);
+        const gain = self.pacingGain();
+        const numerator = @as(u128, deficit) * gain.denominator * srtt;
+        const denominator = @as(u128, gain.numerator) * self.pacingWindow();
+        const delay: u64 = @intCast(@min((numerator + denominator - 1) / denominator, @as(u128, std.math.maxInt(u32))));
+        return now_us + @max(delay, timer_granularity_us);
+    }
+
+    /// Charge `bytes` to the pacing bucket at `now_us`. Called for every
+    /// congestion-controlled packet that actually left, and only for those:
+    /// a pure ACK is not in flight and is not metered here, which is what
+    /// keeps acknowledgement latency independent of the send schedule.
+    pub fn onPacingSent(self: *CongestionController, bytes: usize, now_us: u64, rtt: RttEstimator) void {
+        self.pacer.tokens = self.pacingTokens(now_us, rtt) -| bytes;
+        // Never move the stamp backwards: a coalesced datagram's packets are
+        // charged one after another with the same timestamp, and a caller
+        // replaying an older `now_us` must not hand the bucket a second refill
+        // for time it has already been credited.
+        self.pacer.updated_at_us = @max(now_us, self.pacer.updated_at_us orelse now_us);
+    }
+
     pub fn pacingHint(self: CongestionController, now_us: u64, rtt: RttEstimator) PacingHint {
         const allowance = self.congestion_window -| self.bytes_in_flight;
-        if (allowance > 0) return .{ .bytes_available = allowance, .next_send_time_us = now_us };
-        return .{ .bytes_available = 0, .next_send_time_us = now_us + rtt.ptoDuration(.application) };
+        const tokens = self.pacingTokens(now_us, rtt);
+        if (allowance == 0) {
+            return .{
+                .bytes_available = 0,
+                .pacing_tokens = tokens,
+                .next_send_time_us = now_us + rtt.ptoDuration(.application),
+            };
+        }
+        return .{
+            .bytes_available = allowance,
+            .pacing_tokens = tokens,
+            .next_send_time_us = self.pacingReleaseUs(@min(self.max_datagram_size, allowance), now_us, rtt),
+        };
+    }
+};
+
+const PacingGain = struct { numerator: u64, denominator: u64 };
+
+/// RFC 9002 §7.7 leaky-bucket pacer (#256-C). Credit accrues at the pacing
+/// rate `N * congestion_window / smoothed_rtt` and is spent by packets that
+/// leave; the bucket's ceiling is what bounds a burst, so a sender whose
+/// window has grown large still cannot empty it onto the wire in one pass.
+///
+/// Deliberately a token bucket rather than a rate estimator: BBR and any
+/// other bandwidth model are out of scope here (#240 non-goals). This one only
+/// ever *delays* traffic — congestion control and anti-amplification stay the
+/// gates that can refuse it outright.
+pub const Pacer = struct {
+    /// Credit remaining as of `updated_at_us`, in bytes.
+    tokens: usize = 0,
+    /// When `tokens` was last charged. Null until the first paced packet: an
+    /// unused pacer is treated as full, not empty.
+    updated_at_us: ?u64 = null,
+    /// The burst ceiling, in maximum-size datagrams. Expressed in packets
+    /// because that is the unit the bound is meaningful in — the byte ceiling
+    /// follows the sender's current datagram size (#256-A/B) rather than
+    /// being frozen at whatever it was when the connection started.
+    burst_packets: usize = default_pacer_burst_packets,
+
+    pub fn burstBytes(self: Pacer, max_datagram_size: usize) usize {
+        return self.burst_packets * max_datagram_size;
     }
 };
 
 pub const PacingHint = struct {
+    /// Bytes the congestion window still permits in flight.
     bytes_available: usize,
+    /// Bytes the pacing bucket has credited at the queried instant.
+    pacing_tokens: usize,
+    /// The earliest instant a maximum-size datagram may leave: the queried
+    /// time when the sender is eligible now, the pacing release time when the
+    /// bucket is short, and a PTO out when the window itself is full.
     next_send_time_us: u64,
 
     pub fn canSend(self: PacingHint) bool {
         return self.bytes_available > 0;
+    }
+
+    /// Whether a `bytes`-sized congestion-controlled datagram may leave right
+    /// now: it needs both window and pacing credit.
+    pub fn canSendNow(self: PacingHint, bytes: usize) bool {
+        return self.bytes_available >= bytes and self.pacing_tokens >= bytes;
     }
 };
 
@@ -947,14 +1095,37 @@ pub const RecoveryController = struct {
         var tracked = packet;
         tracked.rtt_sample_available_at_send = self.rtt.smoothed_rtt_us != null;
         self.tracker.onPacketSentAssumeRecoveryCapacity(tracked);
-        if (tracked.in_flight) self.congestion.onPacketSent(tracked.size);
+        if (tracked.in_flight) self.chargeSend(tracked);
     }
 
     pub fn onPacketSent(self: *RecoveryController, packet: SentPacket) error{TooManyTrackedPackets}!void {
         var tracked = packet;
         tracked.rtt_sample_available_at_send = self.rtt.smoothed_rtt_us != null;
         try self.tracker.onPacketSent(tracked);
-        if (tracked.in_flight) self.congestion.onPacketSent(tracked.size);
+        if (tracked.in_flight) self.chargeSend(tracked);
+    }
+
+    /// Bill one in-flight packet to the congestion window and, in the same
+    /// step, to the pacing bucket (#256-C). Handshake and PTO traffic is
+    /// charged like everything else even though neither *waits* on the pacer:
+    /// those bytes are genuinely on the wire, and a bucket that ignored them
+    /// would let application data follow a handshake flight at a rate the
+    /// path was never shown to support.
+    fn chargeSend(self: *RecoveryController, packet: SentPacket) void {
+        self.congestion.onPacketSent(packet.size);
+        self.congestion.onPacingSent(packet.size, packet.time_sent_us, self.rtt);
+    }
+
+    /// Whether a `bytes`-sized congestion-controlled datagram may leave at
+    /// `now_us` under the pacing schedule (#256-C).
+    pub fn pacingAllows(self: *const RecoveryController, bytes: usize, now_us: u64) bool {
+        return self.congestion.pacingAllows(bytes, now_us, self.rtt);
+    }
+
+    /// The earliest instant a `bytes`-sized congestion-controlled datagram
+    /// becomes eligible; `now_us` when it already is.
+    pub fn pacingReleaseUs(self: *const RecoveryController, bytes: usize, now_us: u64) u64 {
+        return self.congestion.pacingReleaseUs(bytes, now_us, self.rtt);
     }
 
     pub fn onAcked(self: *RecoveryController, space: PacketNumberSpace, packet_number: u64, now_us: u64, ack_delay_us: u64) error{OutOfMemory}!void {
@@ -1021,7 +1192,10 @@ pub const RecoveryController = struct {
         self.rtt = RttEstimator.init(self.rtt.max_ack_delay_us);
         // A migration resets the measured window, not the sender's datagram
         // size: the packet builder is still emitting that size, and #256-B
-        // revalidates the new path's PMTU separately.
+        // revalidates the new path's PMTU separately. The pacer goes back to
+        // its default with it (#256-C) — its rate is derived from the window
+        // that was just discarded, and credit earned against the old path's
+        // capacity says nothing about the new one.
         self.congestion = .{
             .bytes_in_flight = self.congestion.bytes_in_flight,
             .max_datagram_size = self.congestion.max_datagram_size,
@@ -1602,6 +1776,192 @@ test "NewReno recovery period prevents repeated cwnd cuts and old ACK growth" {
     try testing.expect(cc.congestion_window > after_first_loss);
     try testing.expect(cc.recovery_start_time_us == null);
     try testing.expectEqual(@as(usize, 1_200), cc.bytes_in_flight);
+}
+
+/// A controller parked in congestion avoidance with a 12 kB window and a
+/// 100 ms smoothed RTT, so every pacing number below is exact:
+/// `1.25 * 12_000 B / 0.1 s` is 150 kB/s, one 1200-byte datagram every 8 ms,
+/// and the burst ceiling is `10 * 1200 = 12_000` bytes — ten datagrams.
+fn pacingFixture() struct { cc: CongestionController, rtt: RttEstimator } {
+    var rtt = RttEstimator.init(25_000);
+    rtt.update(100_000, 0);
+    return .{
+        .cc = .{ .congestion_window = 12_000, .ssthresh = 12_000 },
+        .rtt = rtt,
+    };
+}
+
+test "pacing: a bounded burst leaves back to back, then the bucket is empty" {
+    var fixture = pacingFixture();
+    const cc = &fixture.cc;
+    const now: u64 = 1_000_000;
+
+    try testing.expectEqual(@as(usize, 12_000), cc.pacingTokens(now, fixture.rtt));
+
+    // The whole burst leaves at one instant of the fake clock: nothing here
+    // advances time, so the only thing that can stop the tenth datagram is the
+    // bucket's ceiling.
+    var sent: usize = 0;
+    while (cc.pacingAllows(1_200, now, fixture.rtt)) : (sent += 1) {
+        cc.onPacingSent(1_200, now, fixture.rtt);
+        if (sent > default_pacer_burst_packets) break;
+    }
+    try testing.expectEqual(default_pacer_burst_packets, sent);
+    try testing.expectEqual(@as(usize, 0), cc.pacingTokens(now, fixture.rtt));
+    try testing.expect(!cc.pacingAllows(1_200, now, fixture.rtt));
+}
+
+test "pacing: the release schedule spaces datagrams at the RFC 9002 rate" {
+    var fixture = pacingFixture();
+    const cc = &fixture.cc;
+    var now: u64 = 1_000_000;
+
+    while (cc.pacingAllows(1_200, now, fixture.rtt)) cc.onPacingSent(1_200, now, fixture.rtt);
+
+    // 1200 bytes at 150 kB/s is 8 ms, and the deadline is exact rather than
+    // approximate: a datagram is refused at 7999 µs and released at 8000.
+    const release = cc.pacingReleaseUs(1_200, now, fixture.rtt);
+    try testing.expectEqual(now + 8_000, release);
+    try testing.expect(!cc.pacingAllows(1_200, release - 1, fixture.rtt));
+    try testing.expect(cc.pacingAllows(1_200, release, fixture.rtt));
+
+    // And the spacing is a steady interval, not a one-off: each send moves the
+    // next release exactly one interval on.
+    var previous = now;
+    var step: usize = 0;
+    while (step < 4) : (step += 1) {
+        now = cc.pacingReleaseUs(1_200, now, fixture.rtt);
+        try testing.expectEqual(previous + 8_000, now);
+        try testing.expect(cc.pacingAllows(1_200, now, fixture.rtt));
+        cc.onPacingSent(1_200, now, fixture.rtt);
+        // One datagram's worth of credit was earned and one was spent, so the
+        // sender never banks a second burst while it is transmitting.
+        try testing.expect(cc.pacingTokens(now, fixture.rtt) < 1_200);
+        previous = now;
+    }
+}
+
+test "pacing: an idle sender restarts with one burst, not with everything it missed" {
+    var fixture = pacingFixture();
+    const cc = &fixture.cc;
+    const now: u64 = 1_000_000;
+
+    while (cc.pacingAllows(1_200, now, fixture.rtt)) cc.onPacingSent(1_200, now, fixture.rtt);
+
+    // Ten seconds idle is 1.5 MB of credit at this rate. The bucket keeps a
+    // burst and discards the rest: without the ceiling, a connection that went
+    // quiet would come back entitled to dump its whole idle period onto the
+    // path in one pass.
+    const after_idle = now + 10_000_000;
+    try testing.expectEqual(@as(usize, 12_000), cc.pacingTokens(after_idle, fixture.rtt));
+
+    var sent: usize = 0;
+    while (cc.pacingAllows(1_200, after_idle, fixture.rtt)) : (sent += 1) {
+        cc.onPacingSent(1_200, after_idle, fixture.rtt);
+        if (sent > default_pacer_burst_packets) break;
+    }
+    try testing.expectEqual(default_pacer_burst_packets, sent);
+}
+
+test "pacing: the congestion window stays the harder gate" {
+    var fixture = pacingFixture();
+    const cc = &fixture.cc;
+    const now: u64 = 1_000_000;
+
+    // A full bucket over a full window sends nothing: pacing may delay
+    // traffic, never authorise it.
+    cc.bytes_in_flight = cc.congestion_window;
+    const blocked = cc.pacingHint(now, fixture.rtt);
+    try testing.expectEqual(@as(usize, 12_000), blocked.pacing_tokens);
+    try testing.expect(cc.pacingAllows(1_200, now, fixture.rtt));
+    try testing.expect(!blocked.canSend());
+    try testing.expect(!blocked.canSendNow(1_200));
+    try testing.expectEqual(now + fixture.rtt.ptoDuration(.application), blocked.next_send_time_us);
+
+    // Window room alone is not enough either — an empty bucket over an open
+    // window reports the pacing release, not `now`.
+    cc.bytes_in_flight = 0;
+    while (cc.pacingAllows(1_200, now, fixture.rtt)) cc.onPacingSent(1_200, now, fixture.rtt);
+    const paced = cc.pacingHint(now, fixture.rtt);
+    try testing.expect(paced.canSend());
+    try testing.expect(!paced.canSendNow(1_200));
+    try testing.expectEqual(now + 8_000, paced.next_send_time_us);
+
+    // Both open: send now.
+    const ready = cc.pacingHint(now + 8_000, fixture.rtt);
+    try testing.expect(ready.canSendNow(1_200));
+    try testing.expectEqual(now + 8_000, ready.next_send_time_us);
+}
+
+test "pacing: slow start paces at 2x and congestion avoidance at 1.25x" {
+    var fixture = pacingFixture();
+    const cc = &fixture.cc;
+    const now: u64 = 1_000_000;
+    while (cc.pacingAllows(1_200, now, fixture.rtt)) cc.onPacingSent(1_200, now, fixture.rtt);
+
+    // Congestion avoidance (cwnd == ssthresh): N = 1.25, 8 ms apart.
+    try testing.expectEqual(now + 8_000, cc.pacingReleaseUs(1_200, now, fixture.rtt));
+
+    // Slow start doubles the window every round trip, so pacing it at the
+    // avoidance gain would hold the sender below the growth the window is
+    // already granting: N = 2, 5 ms apart.
+    cc.ssthresh = std.math.maxInt(usize);
+    try testing.expectEqual(now + 5_000, cc.pacingReleaseUs(1_200, now, fixture.rtt));
+}
+
+test "pacing: only in-flight packets are metered, and a shrinking window slows the rate" {
+    var controller = RecoveryController{};
+    controller.rtt.update(100_000, 0);
+    controller.congestion.congestion_window = 12_000;
+    controller.congestion.ssthresh = 12_000;
+    const now: u64 = 1_000_000;
+
+    // A pure ACK is not congestion controlled, so it spends no credit —
+    // acknowledgement latency must not depend on the send schedule.
+    const before = controller.congestion.pacingTokens(now, controller.rtt);
+    try controller.onPacketSent(.{
+        .space = .application,
+        .packet_number = 0,
+        .time_sent_us = now,
+        .size = 1_200,
+        .ack_eliciting = false,
+        .in_flight = false,
+    });
+    try testing.expectEqual(before, controller.congestion.pacingTokens(now, controller.rtt));
+
+    // An in-flight packet is.
+    try controller.onPacketSent(.{
+        .space = .application,
+        .packet_number = 1,
+        .time_sent_us = now,
+        .size = 1_200,
+    });
+    try testing.expectEqual(before - 1_200, controller.congestion.pacingTokens(now, controller.rtt));
+
+    // Halving the window halves the pacing rate: the schedule is derived from
+    // congestion control rather than running alongside it.
+    const wide = controller.pacingReleaseUs(12_000, now);
+    controller.congestion.congestion_window = 6_000;
+    controller.congestion.ssthresh = 6_000;
+    const narrow = controller.pacingReleaseUs(12_000, now);
+    try testing.expectEqual(2 * (wide - now), narrow - now);
+}
+
+test "pacing: a path migration discards the schedule with the window it came from" {
+    var controller = RecoveryController{};
+    controller.rtt.update(100_000, 0);
+    const now: u64 = 1_000_000;
+    while (controller.pacingAllows(1_200, now)) {
+        controller.congestion.onPacingSent(1_200, now, controller.rtt);
+    }
+    try testing.expect(!controller.pacingAllows(1_200, now));
+
+    controller.resetForPathMigration();
+    try testing.expect(controller.pacingAllows(1_200, now));
+    try testing.expectEqual(
+        @as(?u64, null),
+        controller.congestion.pacer.updated_at_us,
+    );
 }
 
 test "pacing hint exposes send allowance and blocked wake time" {

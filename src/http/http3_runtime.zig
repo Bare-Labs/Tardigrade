@@ -601,7 +601,7 @@ pub const Runtime = struct {
                         }
                         continue;
                     }
-                    if (entry.conn.nextTimeoutUs()) |deadline| wake_us = @min(wake_us, deadline);
+                    wake_us = connectionWakeUs(entry, now, wake_us);
                 }
                 for (reap[0..reap_count]) |handle| {
                     self.removeConnection(&connections, &routes, &per_ip, handle);
@@ -1213,6 +1213,28 @@ pub const Runtime = struct {
         self.noteRequestCompleted();
     }
 
+    /// Fold one connection's deadlines into the loop's sleep deadline.
+    ///
+    /// Two independent sources, and the pacing one is the reason this exists
+    /// (#256-C). A connection the pacer is holding data back for has no timer
+    /// to fire — `drainConnectionTransmits` has already stopped producing
+    /// datagrams for it, and none of `nextTimeoutUs`'s deadlines knows the
+    /// send path is waiting — so without `nextSendTimeUs` here the data would
+    /// sit until the next unrelated wakeup or the 100 ms loop floor.
+    ///
+    /// The converse matters as much: `nextSendTimeUs` is null unless something
+    /// is genuinely paced out and is always strictly in the future, so this
+    /// neither wakes an idle listener nor lets a busy one spin on a deadline
+    /// that has already passed.
+    ///
+    /// Split out of `serve` so the selection is testable without a socket.
+    fn connectionWakeUs(entry: *ConnEntry, now: u64, current: u64) u64 {
+        var wake = current;
+        if (entry.conn.nextTimeoutUs()) |deadline| wake = @min(wake, deadline);
+        if (entry.conn.nextSendTimeUs(now)) |release| wake = @min(wake, release);
+        return wake;
+    }
+
     /// Send one transport-produced datagram, carrying the ECN codepoint the
     /// transport asked for (#256-E). `mark` is `.not_ect` for every datagram
     /// on a path that is not marking, which is the plain-`sendto` path.
@@ -1222,6 +1244,11 @@ pub const Runtime = struct {
     /// once per pass: the refusal is discovered *inside* a send, and the rest
     /// of this drain would otherwise keep building packets the transport counts
     /// as marked while the socket emits them Not-ECT.
+    ///
+    /// Stops when the transport declines — including when the pacer is what
+    /// declines (#256-C). The bounded burst is what keeps this drain from
+    /// flushing a whole congestion window in one pass, and the deadline
+    /// `connectionWakeUs` folds in is what brings the loop back for the rest.
     fn drainConnectionTransmits(self: *Runtime, entry: *ConnEntry, now: u64) void {
         var out: [quic.datagram.max_size]u8 = undefined;
         while (entry.conn.pollTransmitOnPath(&out, now)) |t| {
@@ -3181,6 +3208,80 @@ test "http3 runtime: CID route collision rolls back without stealing an existing
     try testing.expectEqual(before_owned, harness.entry.owned_cid_count);
     try testing.expectEqual(before_pending, harness.entry.conn.pending_new_connection_ids.items.len);
     try testing.expectEqual(@as(?u64, collision_owner), routes.lookup(candidate.slice()));
+}
+
+/// Queue a response far larger than one burst on the harness's server
+/// connection and pin the window and RTT, so what holds the send path back is
+/// the pacer rather than a sub-millisecond handshake RTT (see the matching
+/// fixture in `quic/connection.zig`). Returns with the opening burst already
+/// spent at `harness.now_us`.
+fn spendPacingBurst(harness: *RuntimeCidHarness) !void {
+    const sid = try harness.client.openStream(.bidi);
+    _ = try harness.client.writeStream(sid, "request", false);
+    try harness.pump();
+    _ = try harness.entry.conn.writeStream(sid, &[_]u8{0xab} ** (64 * 1024), false);
+
+    harness.entry.conn.recovery.rtt = quic.recovery.RttEstimator.init(25_000);
+    harness.entry.conn.recovery.rtt.update(100_000, 0);
+    const congestion = &harness.entry.conn.recovery.congestion;
+    congestion.congestion_window = 64 * 1024;
+    congestion.ssthresh = 64 * 1024;
+    congestion.bytes_in_flight = 0;
+    congestion.pacer = .{};
+
+    var out: [quic.datagram.max_size]u8 = undefined;
+    var emitted: usize = 0;
+    while (harness.entry.conn.pollTransmitOnPath(&out, harness.now_us)) |_| emitted += 1;
+    try testing.expect(emitted > 0);
+    try testing.expect(emitted <= quic.recovery.default_pacer_burst_packets);
+}
+
+test "http3 runtime: the loop's sleep deadline follows the pacing release" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
+    defer harness.deinit(testing.allocator);
+
+    // The loop's own idle ceiling, which every other deadline competes with.
+    const floor = harness.now_us + 100_000;
+    const quiet = Runtime.connectionWakeUs(harness.entry, harness.now_us, floor);
+    try testing.expectEqual(@as(?u64, null), harness.entry.conn.nextSendTimeUs(harness.now_us));
+
+    try spendPacingBurst(harness);
+    const now = harness.now_us;
+
+    // Held back by the pacer and by nothing else, and the release beats every
+    // timer deadline — so a loop that folded in only `nextTimeoutUs` would
+    // sleep straight past the moment this data became eligible.
+    const release = harness.entry.conn.nextSendTimeUs(now) orelse return error.TestExpectedEqual;
+    try testing.expect(release > now);
+    try testing.expect(release < quiet);
+    try testing.expectEqual(release, Runtime.connectionWakeUs(harness.entry, now, floor));
+
+    // And sleeping until it is productive: the send path yields again there.
+    var out: [quic.datagram.max_size]u8 = undefined;
+    try testing.expect(harness.entry.conn.pollTransmitOnPath(&out, release) != null);
+}
+
+test "http3 runtime: a connection with nothing paced contributes no wakeup of its own" {
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var harness = try RuntimeCidHarness.init(testing.allocator, fixed.provider());
+    defer harness.deinit(testing.allocator);
+
+    try spendPacingBurst(harness);
+    const now = harness.now_us;
+
+    // Congestion control is the harder gate, and when it is what a connection
+    // is waiting on there is no pacing wakeup to schedule: the loss and PTO
+    // timers already in `nextTimeoutUs` are what should bring the loop back.
+    const congestion = &harness.entry.conn.recovery.congestion;
+    congestion.bytes_in_flight = congestion.congestion_window;
+    try testing.expectEqual(@as(?u64, null), harness.entry.conn.nextSendTimeUs(now));
+
+    const floor = now + 100_000;
+    const timers = harness.entry.conn.nextTimeoutUs() orelse floor;
+    try testing.expectEqual(@min(floor, timers), Runtime.connectionWakeUs(harness.entry, now, floor));
 }
 
 test "http3 runtime: retired CIDs stop routing, replenish, and teardown removes every route" {

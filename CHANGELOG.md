@@ -5,6 +5,34 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- **RFC 9002 packet pacing for HTTP/3 (#256-C)** — QUIC now spreads outbound
+  application data across the round trip instead of writing until the
+  congestion window is full. A window bounds how much data may be outstanding,
+  not how fast it may leave, so a sender with plenty of nominal capacity could
+  still hand its whole window to the first router in the path as one burst and
+  take queue-overflow loss for it.
+
+  The schedule is the leaky bucket RFC 9002 §7.7 describes: credit accrues at
+  `N × congestion_window / smoothed_rtt`, with `N` of 2 in slow start and 1.25
+  in congestion avoidance. Two things follow — datagrams leave one interval
+  apart once the bucket is empty, and a burst is capped at ten maximum-size
+  datagrams, which also caps what a connection returning from idle may send at
+  once. BBR and other rate estimators remain out of scope.
+
+  Only application data waits on the bucket. Acknowledgements, PTO probes, and
+  Initial/Handshake flights are charged to it but never delayed by it: an ACK
+  is not congestion-controlled traffic, a probe is how a stalled connection
+  recovers, and the handshake is already bounded by the initial window and by
+  anti-amplification. Congestion control and anti-amplification stay the hard
+  gates — pacing only ever delays a datagram, never authorises one.
+
+  Packet construction never sleeps: `pollTransmitOnPath` declines to build
+  paced data while the bucket is short, and the listener folds the connection's
+  next release time into the same poll timeout it already computes from timers,
+  so a paced connection neither spins nor sleeps past its own deadline. There
+  is no operator knob — a pacing rate adjustable independently of the window
+  would be a way to defeat congestion control rather than to tune it. See
+  `docs/HTTP3_ROLLOUT.md`.
 - **Explicit Congestion Notification for HTTP/3 (#256-E)** — the QUIC listener
   now marks outbound datagrams ECT(0), counts the codepoints on received
   packets, reports them to peers in ACK_ECN, and validates the counters peers
