@@ -172,6 +172,7 @@ pub const ObservabilityArtifacts = struct {
     const qlog_record_max = 4096;
     const keylog_record_max = 256;
     const queue_capacity = 256;
+    const close_queue_capacity = 1024;
     const ArtifactKind = enum { qlog, keylog };
 
     pub const Diagnostics = struct {
@@ -217,6 +218,9 @@ pub const ObservabilityArtifacts = struct {
         queue: [queue_capacity]Command = undefined,
         queue_head: usize = 0,
         queue_len: usize = 0,
+        close_queue: [close_queue_capacity]u64 = undefined,
+        close_queue_head: usize = 0,
+        close_queue_len: usize = 0,
         worker_active: bool = false,
         stopping: bool = false,
         thread: ?std.Thread = null,
@@ -224,6 +228,11 @@ pub const ObservabilityArtifacts = struct {
         keylog_write_errors: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         qlog_dropped_records: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         keylog_dropped_records: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        qlog_write_error_reported: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        keylog_write_error_reported: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        qlog_drop_reported: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        keylog_drop_reported: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        drop_diagnostic_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         fn init(allocator: std.mem.Allocator, logger: ?*Logger, qlog_dir: []const u8, keylog_path: []const u8) !*State {
             const state = try allocator.create(State);
@@ -288,13 +297,17 @@ pub const ObservabilityArtifacts = struct {
         }
 
         fn noteWriteError(self: *State, comptime kind: ArtifactKind, err: anyerror) void {
+            const first = switch (kind) {
+                .qlog => self.qlog_write_error_reported.cmpxchgStrong(false, true, .acq_rel, .acquire) == null,
+                .keylog => self.keylog_write_error_reported.cmpxchgStrong(false, true, .acq_rel, .acquire) == null,
+            };
             switch (kind) {
                 .qlog => _ = self.qlog_write_errors.fetchAdd(1, .monotonic),
                 .keylog => _ = self.keylog_write_errors.fetchAdd(1, .monotonic),
             }
-            if (self.logger) |logger| {
+            if (first) if (self.logger) |logger| {
                 logger.warn(null, "HTTP/3 observability artifact write failed kind={s} error={s}", .{ @tagName(kind), @errorName(err) });
-            }
+            };
         }
 
         fn noteDrop(self: *State, comptime kind: ArtifactKind) void {
@@ -302,13 +315,12 @@ pub const ObservabilityArtifacts = struct {
                 .qlog => _ = self.qlog_dropped_records.fetchAdd(1, .monotonic),
                 .keylog => _ = self.keylog_dropped_records.fetchAdd(1, .monotonic),
             }
+            self.drop_diagnostic_pending.store(true, .release);
+            self.condition.signal();
         }
 
         fn tryEnqueue(self: *State, comptime kind: ArtifactKind, command: Command) void {
-            if (!self.mutex.tryLock()) {
-                self.noteDrop(kind);
-                return;
-            }
+            self.mutex.lock();
             defer self.mutex.unlock();
             if (self.stopping or self.queue_len == self.queue.len) {
                 self.noteDrop(kind);
@@ -322,20 +334,25 @@ pub const ObservabilityArtifacts = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.stopping) return;
-            if (self.queue_len == self.queue.len) self.dropOldestDataAssumeLocked();
-            self.pushAssumeLocked(.{ .close_trace = handle });
+            if (self.close_queue_len == self.close_queue.len) {
+                self.dropAllDataAssumeLocked();
+                if (self.close_queue_len == self.close_queue.len) {
+                    self.closeTraceOnWriter(handle);
+                    return;
+                }
+            }
+            self.pushCloseAssumeLocked(handle);
             self.condition.signal();
         }
 
-        fn dropOldestDataAssumeLocked(self: *State) void {
-            if (self.queue_len == 0) return;
-            const dropped = self.queue[self.queue_head];
-            self.queue_head = (self.queue_head + 1) % self.queue.len;
-            self.queue_len -= 1;
-            switch (dropped) {
-                .qlog => self.noteDrop(.qlog),
-                .keylog => self.noteDrop(.keylog),
-                .close_trace => {},
+        fn dropAllDataAssumeLocked(self: *State) void {
+            while (self.queue_len != 0) {
+                const dropped = self.popAssumeLocked().?;
+                switch (dropped) {
+                    .qlog => self.noteDrop(.qlog),
+                    .keylog => self.noteDrop(.keylog),
+                    .close_trace => unreachable,
+                }
             }
         }
 
@@ -353,10 +370,24 @@ pub const ObservabilityArtifacts = struct {
             return command;
         }
 
+        fn pushCloseAssumeLocked(self: *State, handle: u64) void {
+            const tail = (self.close_queue_head + self.close_queue_len) % self.close_queue.len;
+            self.close_queue[tail] = handle;
+            self.close_queue_len += 1;
+        }
+
+        fn popCloseAssumeLocked(self: *State) ?u64 {
+            if (self.close_queue_len == 0) return null;
+            const handle = self.close_queue[self.close_queue_head];
+            self.close_queue_head = (self.close_queue_head + 1) % self.close_queue.len;
+            self.close_queue_len -= 1;
+            return handle;
+        }
+
         fn waitIdle(self: *State) void {
             self.mutex.lock();
             defer self.mutex.unlock();
-            while (self.queue_len != 0 or self.worker_active) {
+            while (self.queue_len != 0 or self.close_queue_len != 0 or self.worker_active) {
                 self.condition.wait(&self.mutex);
             }
         }
@@ -365,6 +396,10 @@ pub const ObservabilityArtifacts = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             return self.traces.count();
+        }
+
+        fn closeTraceOnWriter(self: *State, handle: u64) void {
+            if (self.traces.fetchRemove(handle)) |kv| kv.value.deinit(self.allocator);
         }
     };
 
@@ -447,24 +482,43 @@ pub const ObservabilityArtifacts = struct {
     fn workerMain(state: *State) void {
         while (true) {
             state.mutex.lock();
-            while (state.queue_len == 0 and !state.stopping) {
+            while (state.queue_len == 0 and state.close_queue_len == 0 and !state.stopping and !state.drop_diagnostic_pending.load(.acquire)) {
                 state.condition.wait(&state.mutex);
             }
-            const command = state.popAssumeLocked() orelse {
+            const command: ?Command = state.popAssumeLocked() orelse if (state.close_queue_len != 0)
+                .{ .close_trace = state.popCloseAssumeLocked().? }
+            else
+                null;
+            if (command == null) {
                 const done = state.stopping;
                 state.mutex.unlock();
+                logPendingDrops(state);
                 if (done) break;
                 continue;
-            };
+            }
             state.worker_active = true;
             state.mutex.unlock();
 
-            processCommand(state, command);
+            processCommand(state, command.?);
+            logPendingDrops(state);
 
             state.mutex.lock();
             state.worker_active = false;
-            if (state.queue_len == 0) state.condition.broadcast();
+            if (state.queue_len == 0 and state.close_queue_len == 0) state.condition.broadcast();
             state.mutex.unlock();
+        }
+    }
+
+    fn logPendingDrops(state: *State) void {
+        if (!state.drop_diagnostic_pending.swap(false, .acq_rel)) return;
+        const d = state.diagnostics();
+        if (state.logger) |logger| {
+            if (d.qlog_dropped_records != 0 and state.qlog_drop_reported.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+                logger.warn(null, "HTTP/3 observability artifact records dropped kind=qlog count={d}", .{d.qlog_dropped_records});
+            }
+            if (d.keylog_dropped_records != 0 and state.keylog_drop_reported.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+                logger.warn(null, "HTTP/3 observability artifact records dropped kind=keylog count={d}", .{d.keylog_dropped_records});
+            }
         }
     }
 
@@ -485,12 +539,8 @@ pub const ObservabilityArtifacts = struct {
                     state.noteWriteError(.keylog, err);
                 };
             },
-            .close_trace => |handle| closeTraceOnWriter(state, handle),
+            .close_trace => |handle| state.closeTraceOnWriter(handle),
         }
-    }
-
-    fn closeTraceOnWriter(state: *State, handle: u64) void {
-        if (state.traces.fetchRemove(handle)) |kv| kv.value.deinit(state.allocator);
     }
 
     fn traceFor(state: *State, handle: u64) !*Trace {
@@ -7706,6 +7756,84 @@ test "http3 runtime: observability artifacts follow accepted connection lifecycl
     const d = artifacts.diagnostics();
     try testing.expectEqual(@as(usize, 0), d.qlog_write_errors);
     try testing.expectEqual(@as(usize, 0), d.qlog_dropped_records);
+}
+
+test "http3 runtime: observability artifacts keep adjacent low-volume records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try compat.wrapDir(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(tmp_root);
+    const qlog_dir = try std.fmt.allocPrint(testing.allocator, "{s}/qlogs", .{tmp_root});
+    defer testing.allocator.free(qlog_dir);
+
+    var artifacts = try ObservabilityArtifacts.init(testing.allocator, qlog_dir, "");
+    defer artifacts.deinit();
+
+    const handle: u64 = 1;
+    for (0..64) |i| {
+        ObservabilityArtifacts.writeQuicRecord(&artifacts, handle, .{
+            .time_us = @intCast(i),
+            .event = .{ .connection_started = .{ .dcid_len = 8 } },
+        });
+        ObservabilityArtifacts.writeH3Record(&artifacts, handle, .{
+            .time_us = @intCast(i),
+            .event = .{ .stream_type_set = .{ .stream_id = @intCast(i), .stream_type = .control } },
+        });
+        artifacts.waitIdle();
+    }
+
+    const d = artifacts.diagnostics();
+    try testing.expectEqual(@as(usize, 0), d.qlog_dropped_records);
+    try testing.expectEqual(@as(usize, 1), artifacts.traceCount());
+    ObservabilityArtifacts.closeTrace(&artifacts, handle);
+    artifacts.waitIdle();
+    try testing.expectEqual(@as(usize, 0), artifacts.traceCount());
+}
+
+test "http3 runtime: observability artifact close commands survive saturated data queue" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try compat.wrapDir(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(tmp_root);
+
+    var state = ObservabilityArtifacts.State{
+        .allocator = testing.allocator,
+        .logger = null,
+        .qlog_dir = "",
+        .keylog_path = "",
+        .traces = std.AutoHashMap(u64, *ObservabilityArtifacts.Trace).init(testing.allocator),
+    };
+    defer state.deinitStorage();
+
+    const empty_record: [ObservabilityArtifacts.qlog_record_max]u8 = undefined;
+    for (0..ObservabilityArtifacts.queue_capacity) |_| {
+        state.pushAssumeLocked(.{ .qlog = .{ .handle = 999, .bytes = empty_record, .len = 0 } });
+    }
+
+    const close_count = 16;
+    for (0..close_count) |i| {
+        const handle: u64 = @intCast(i + 1);
+        const path = try std.fmt.allocPrint(testing.allocator, "{s}/trace-{d}.sqlog", .{ tmp_root, handle });
+        errdefer testing.allocator.free(path);
+        var file = try compat.cwd().createFile(path, .{ .read = false, .truncate = true });
+        errdefer file.close();
+        const trace = try testing.allocator.create(ObservabilityArtifacts.Trace);
+        trace.* = .{ .path = path, .file = file };
+        try state.traces.put(handle, trace);
+        state.enqueueClose(handle);
+    }
+
+    try testing.expectEqual(@as(usize, ObservabilityArtifacts.queue_capacity), state.queue_len);
+    try testing.expectEqual(@as(usize, close_count), state.close_queue_len);
+    try testing.expectEqual(@as(usize, close_count), state.traces.count());
+
+    while (state.popAssumeLocked() != null) {}
+    while (state.popCloseAssumeLocked()) |handle| state.closeTraceOnWriter(handle);
+    try testing.expectEqual(@as(usize, 0), state.traces.count());
+
+    const d = state.diagnostics();
+    try testing.expectEqual(@as(usize, 0), d.qlog_dropped_records);
+    try testing.expectEqual(@as(usize, 0), d.keylog_dropped_records);
 }
 
 test "http3 runtime: observability artifacts append TLS keylog lines through shared formatter" {
