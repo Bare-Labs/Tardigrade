@@ -271,16 +271,18 @@ wait_for_https() {
 }
 
 # #256-G: "the process started" is not proof HTTP/3 is operational — the TLS
-# port can come up while the QUIC/UDP side is misconfigured or the installed
-# h2load cannot speak QUIC at all. Send one real HTTP/3 request over the
-# actual load tool before any H3 result is recorded.
+# port can come up while the QUIC/UDP side is misconfigured. Send one real
+# HTTP/3 request over the actual load tool before any H3 result is recorded.
+#
+# Review note: this used to also check `h2load --h3 --help` itself and treat
+# that failure the same as a failed request — conflating "this environment
+# has no HTTP/3-capable load generator" (a legitimate `supported: false`)
+# with "Tardigrade's QUIC listener didn't answer" (a product regression).
+# Callers now check `h2load_h3_supported` *before* calling this, so a
+# failure here always means the second case.
 verify_h3_listener() {
     local port="$1"
     local url="https://127.0.0.1:${port}/health"
-    if ! h2load --h3 --help >/dev/null 2>&1; then
-        echo "  h2load on this host does not support --h3 (HTTP/3/QUIC) — H3 rows will be marked unsupported."
-        return 1
-    fi
     local raw succeeded failed
     raw=$(h2load --h3 -n 1 -c 1 --insecure "$url" 2>&1) || true
     succeeded=$(printf '%s\n' "$raw" | grep -oE '[0-9]+ succeeded' | grep -oE '^[0-9]+' | head -1)
@@ -753,6 +755,13 @@ run_benchmark_pass_h3() {
     rename_pass_json "$raw" "$renamed" "$server" "$pass"
 }
 
+# #256-G review: dumps the H3 listener's logs to stderr for diagnosis. Split
+# out because both the readiness and the (post-capability) hard-failure
+# paths in run_tardigrade_http3_matrix need it.
+dump_h3_logs() {
+    find "${TMP_DIR}/tardigrade-http3" -maxdepth 1 -name '*.log' -print -exec tail -60 {} \; >&2 || true
+}
+
 # #256-G: canonical H3 rows for the `tardigrade` server — small/large static
 # object, large streaming reverse proxy, and (opt-in) a before/after UDP
 # socket buffer tuning comparison. Runs its own dedicated TLS+H3 listener
@@ -761,33 +770,45 @@ run_benchmark_pass_h3() {
 # plaintext config does not have. Writes `${OUT_DIR}/tardigrade-<pass>.json`
 # files and re-runs `combine_server_results tardigrade` so they land in the
 # same combined `tardigrade.json` the HTTP/1.1 passes already wrote.
+#
+# Review note: this used to treat "h2load can't speak HTTP/3" and "Tardigrade's
+# QUIC listener didn't come up/answer" identically — both wrote unsupported
+# rows and returned 0, so a real Tardigrade H3 regression could go unnoticed
+# behind a green run. Client capability is now checked *first* and is the
+# only case that is a soft `supported: false`; every failure after that is a
+# product-side failure and aborts the run (`return 1` under this script's
+# `set -e`, which the trap on EXIT still cleans up after).
 run_tardigrade_http3_matrix() {
     local port=$((LISTEN_BASE + H3_LISTEN_OFFSET))
     echo ""
     echo "== tardigrade-http3 (${port}) =="
 
-    start_tardigrade_http3 "$port"
-    if ! wait_for_https "https://127.0.0.1:${port}/health"; then
-        echo "  tardigrade did not come up with HTTP/3 enabled — H3 rows will be marked unsupported." >&2
-        find "${TMP_DIR}/tardigrade-http3" -maxdepth 1 -name '*.log' -print -exec tail -40 {} \; >&2 || true
-        write_unsupported_result "tardigrade" "static-small-http3" "Tardigrade did not come up with TLS/HTTP3 enabled; see server.log." "${OUT_DIR}/tardigrade-static-small-h3.json"
-        write_unsupported_result "tardigrade" "static-large-http3" "Tardigrade did not come up with TLS/HTTP3 enabled; see server.log." "${OUT_DIR}/tardigrade-static-large-h3.json"
-        write_unsupported_result "tardigrade" "proxy-large-http3" "Tardigrade did not come up with TLS/HTTP3 enabled; see server.log." "${OUT_DIR}/tardigrade-proxy-large-h3.json"
-        cleanup_edge
+    if ! h2load_h3_supported; then
+        echo "  h2load on this host does not support --h3 (HTTP/3/QUIC) — H3 rows will be marked unsupported." >&2
+        write_unsupported_result "tardigrade" "static-small-http3" "h2load on this host does not support HTTP/3 (no QUIC-enabled build)." "${OUT_DIR}/tardigrade-static-small-h3.json"
+        write_unsupported_result "tardigrade" "static-large-http3" "h2load on this host does not support HTTP/3 (no QUIC-enabled build)." "${OUT_DIR}/tardigrade-static-large-h3.json"
+        write_unsupported_result "tardigrade" "proxy-large-http3" "h2load on this host does not support HTTP/3 (no QUIC-enabled build)." "${OUT_DIR}/tardigrade-proxy-large-h3.json"
         combine_server_results "tardigrade"
         return 0
+    fi
+    echo "h2load supports HTTP/3 on this host — any Tardigrade H3 failure from here is a product regression, not an environment limitation, and fails this run."
+
+    start_tardigrade_http3 "$port"
+    if ! wait_for_https "https://127.0.0.1:${port}/health"; then
+        echo "  tardigrade did not come up with HTTP/3 enabled." >&2
+        dump_h3_logs
+        cleanup_edge
+        return 1
     fi
     assert_payload_size "https://127.0.0.1:${port}/tiny.txt" 3
     assert_payload_size "https://127.0.0.1:${port}/large.bin" 1048576
     assert_payload_size "https://127.0.0.1:${port}/proxy/payload-1m.bin" 1048576
 
     if ! verify_h3_listener "$port"; then
-        write_unsupported_result "tardigrade" "static-small-http3" "h2load on this host cannot speak HTTP/3, or the QUIC listener did not answer a real request." "${OUT_DIR}/tardigrade-static-small-h3.json"
-        write_unsupported_result "tardigrade" "static-large-http3" "h2load on this host cannot speak HTTP/3, or the QUIC listener did not answer a real request." "${OUT_DIR}/tardigrade-static-large-h3.json"
-        write_unsupported_result "tardigrade" "proxy-large-http3" "h2load on this host cannot speak HTTP/3, or the QUIC listener did not answer a real request." "${OUT_DIR}/tardigrade-proxy-large-h3.json"
+        echo "  H3/QUIC listener did not answer a real HTTP/3 request." >&2
+        dump_h3_logs
         cleanup_edge
-        combine_server_results "tardigrade"
-        return 0
+        return 1
     fi
 
     echo "H3/QUIC listener verified — recording H3 results."
@@ -804,12 +825,17 @@ run_tardigrade_http3_matrix() {
         start_tardigrade_http3 "$port" \
             "TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES=${H3_TUNED_UDP_BUFFER_BYTES}" \
             "TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES=${H3_TUNED_UDP_BUFFER_BYTES}"
-        if wait_for_https "https://127.0.0.1:${port}/health" && verify_h3_listener "$port"; then
-            run_benchmark_pass_h3 "tardigrade" "$port" "static-small-h3-tuned" "static-http3" "/tiny.txt" "/proxy/health"
-        else
-            echo "  Tuned listener did not come up cleanly — skipping the tuned comparison row." >&2
-            write_unsupported_result "tardigrade" "static-small-http3-tuned" "Tuned-buffer listener did not come up; see server.log." "${OUT_DIR}/tardigrade-static-small-h3-tuned.json"
+        if ! wait_for_https "https://127.0.0.1:${port}/health" || ! verify_h3_listener "$port"; then
+            # Baseline H3 already proved the client is capable and the
+            # untuned listener works — a tuned-listener failure here is the
+            # same kind of product regression as the baseline checks above,
+            # not a reason to quietly drop the comparison row.
+            echo "  Tuned-buffer listener did not come up cleanly (baseline H3 already verified — this is a real failure)." >&2
+            dump_h3_logs
+            cleanup_edge
+            return 1
         fi
+        run_benchmark_pass_h3 "tardigrade" "$port" "static-small-h3-tuned" "static-http3" "/tiny.txt" "/proxy/health"
         cleanup_edge
     fi
 

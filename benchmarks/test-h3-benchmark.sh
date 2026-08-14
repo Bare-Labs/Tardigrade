@@ -145,6 +145,74 @@ check "send requested == send effective == send granted (fully granted, not a co
     "true"
 
 echo ""
+echo "==> Test 2b: quic_transport_delta isolates each pass's traffic on a listener kept alive across passes (#256-G review)"
+# The competitive harness keeps one H3 listener alive across the readiness
+# probe and every pass, so the underlying Prometheus counters are cumulative
+# for the listener's whole lifetime, not per-pass. Two synthetic snapshots
+# with increasing cumulative values prove the delta between them — not the
+# raw post-pass reading — is what a pass's `quic` block gets.
+eval "$(source_functions "$RUN_SH" quic_transport_delta)"
+snap() {
+    jq -cn --argjson sent "$1" --argjson recv "$2" '{
+        packets_sent: $sent, packets_received: $recv, packets_lost: 0, pto_total: 0,
+        bytes_sent: ($sent * 100), bytes_received: ($recv * 100),
+        effective_plpmtu: {last_bytes: 1200, min_bytes: 1200, max_bytes: 1200},
+        pmtu_probes: 0, pmtu_black_holes: 0,
+        ecn: {enabled: true, marked_sent: 0, paths_validated: 0, paths_disabled: 0, ce_received: 0},
+        udp_buffers: {
+            recv: {requested_bytes: 0, effective_bytes: 1, granted_bytes: 0, status: "default"},
+            send: {requested_bytes: 0, effective_bytes: 1, granted_bytes: 0, status: "default"}
+        }
+    }'
+}
+SNAP_AFTER_READINESS="$(snap 5 5)"      # the H3 readiness probe request
+SNAP_AFTER_PASS1="$(snap 105 104)"      # +100 packets during pass 1
+SNAP_AFTER_PASS2="$(snap 355 353)"      # +250 packets during pass 2 (cumulative 355, not 250)
+
+DELTA1="$(quic_transport_delta "$SNAP_AFTER_READINESS" "$SNAP_AFTER_PASS1")"
+DELTA2="$(quic_transport_delta "$SNAP_AFTER_PASS1" "$SNAP_AFTER_PASS2")"
+
+check "pass 1's delta is its own 100 packets, not the readiness probe's 5" \
+    '"packets_sent": 100' "$(echo "$DELTA1" | jq .)"
+check "pass 2's delta is its own 250 packets" \
+    '"packets_sent": 250' "$(echo "$DELTA2" | jq .)"
+check_not "pass 2's delta is NOT the listener-lifetime cumulative total (355) a naive single post-pass scrape would have attributed to it" \
+    '"packets_sent": 355' "$(echo "$DELTA2" | jq .)"
+
+echo ""
+echo "==> Test 2c: --runs > 1 aggregates each run's scenario-local quic delta instead of dropping it (#256-G review)"
+(
+    # shellcheck disable=SC2034 # read by flush_multirun_result, sourced via eval below — shellcheck can't see across that
+    RUNS=2
+    RESULTS_JSON='{}'
+    declare -A _run_quic_list=()
+    declare -A _run_rps_list=()
+    declare -A _run_p99_list=()
+    declare -A _run_errors_list=()
+    eval "$(source_functions "$RUN_SH" _stats_from_space_list attach_quic_transport_state flush_multirun_result)"
+
+    _run_rps_list[static-http3]='100 110 '
+    _run_p99_list[static-http3]='5 6 '
+    _run_errors_list[static-http3]='0 0 '
+
+    RUN1_DELTA="$(snap 100 99)"
+    RUN2_DELTA="$(snap 150 148)"
+    attach_quic_transport_state "static-http3" "$RUN1_DELTA"
+    attach_quic_transport_state "static-http3" "$RUN2_DELTA"
+    flush_multirun_result "static-http3"
+
+    echo "$RESULTS_JSON" > /tmp/tardi-h3-multirun-test.json
+)
+MULTIRUN_JSON="$(cat /tmp/tardi-h3-multirun-test.json | jq .)"
+check "repeated-run scenario still carries a quic block (not silently dropped)" \
+    '"quic"' "$MULTIRUN_JSON"
+check "aggregated packets_sent sums every run's delta (100+150=250)" \
+    '"packets_sent": 250' "$MULTIRUN_JSON"
+check "aggregate records how many runs actually had observable quic data" \
+    '"runs_with_data": 2' "$MULTIRUN_JSON"
+rm -f /tmp/tardi-h3-multirun-test.json
+
+echo ""
 echo "==> Test 4: QUIC metric collection handles an unreachable/metrics-disabled endpoint explicitly (not fabricated)"
 UNREACHABLE_JSON="$(bash -c "
 set -euo pipefail
@@ -182,6 +250,71 @@ run_h2load_h3 'https://127.0.0.1:9443/health' 'static-http3'
 ")"
 check "h2load without --h3 support prints an explicit skip, not a fabricated result" \
     "does not support --h3" "$H3_SKIP_OUTPUT"
+
+echo ""
+echo "==> Test 12: the competitive harness separates an unsupported h2load from a broken Tardigrade H3 listener (#256-G review)"
+MATRIX_FNS="$(source_functions "$COMPETITIVE_RUN_SH" run_tardigrade_http3_matrix dump_h3_logs)"
+
+# Case A: h2load lacks HTTP/3 support entirely — a legitimate environment
+# limitation. Must write unsupported rows, must NEVER start Tardigrade, and
+# must return success (this is not a failure of anything Tardigrade does).
+CASE_A_OUT="$(bash -c "
+set -euo pipefail
+LISTEN_BASE=19080; H3_LISTEN_OFFSET=250; OUT_DIR=/tmp; SMOKE=false; TUNE_COMPARISON=false; TMP_DIR=/tmp
+h2load_h3_supported() { return 1; }
+start_tardigrade_http3() { echo 'START SHOULD NOT HAVE BEEN CALLED' >&2; exit 1; }
+write_unsupported_result() { echo \"UNSUPPORTED: \$2\"; }
+combine_server_results() { :; }
+${MATRIX_FNS}
+run_tardigrade_http3_matrix
+echo \"EXIT_CODE=\$?\"
+" 2>&1)"
+check "case A (no HTTP/3-capable h2load): writes unsupported rows" \
+    "UNSUPPORTED: static-small-http3" "$CASE_A_OUT"
+check "case A: returns success — this is an environment limitation, not a failure" \
+    "EXIT_CODE=0" "$CASE_A_OUT"
+CASE_A_STARTED="$(printf '%s' "$CASE_A_OUT" | grep -c 'SHOULD NOT HAVE BEEN CALLED' || true)"
+if [[ "$CASE_A_STARTED" -eq 0 ]]; then
+    echo "  PASS: case A never starts Tardigrade at all (capability is checked before any process launch)"
+    pass=$((pass + 1))
+else
+    echo "  FAIL: case A started Tardigrade despite h2load lacking HTTP/3 support"
+    fail=$((fail + 1))
+fi
+
+# Case B: h2load DOES support HTTP/3, but Tardigrade's TLS/H3 listener never
+# comes up. Once capability is established, this is a product regression —
+# must NOT write a soft unsupported row, and must fail the run (nonzero
+# exit under this script's `set -e`), not go quietly green.
+set +e
+CASE_B_OUT="$(bash -c "
+set -euo pipefail
+LISTEN_BASE=19080; H3_LISTEN_OFFSET=250; OUT_DIR=/tmp; SMOKE=false; TUNE_COMPARISON=false; TMP_DIR=/tmp
+h2load_h3_supported() { return 0; }
+start_tardigrade_http3() { :; }
+wait_for_https() { return 1; }
+write_unsupported_result() { echo 'UNSUPPORTED SHOULD NOT HAVE BEEN CALLED FOR A REAL FAILURE' >&2; }
+cleanup_edge() { :; }
+${MATRIX_FNS}
+run_tardigrade_http3_matrix
+" 2>&1)"
+CASE_B_STATUS=$?
+set -e
+CASE_B_WROTE_UNSUPPORTED="$(printf '%s' "$CASE_B_OUT" | grep -c 'SHOULD NOT HAVE BEEN CALLED FOR A REAL FAILURE' || true)"
+if [[ "$CASE_B_STATUS" -ne 0 ]]; then
+    echo "  PASS: case B (h2load supports HTTP/3, Tardigrade's listener doesn't come up) fails the run, exit=${CASE_B_STATUS}"
+    pass=$((pass + 1))
+else
+    echo "  FAIL: case B should have failed the run but exited 0"
+    fail=$((fail + 1))
+fi
+if [[ "$CASE_B_WROTE_UNSUPPORTED" -eq 0 ]]; then
+    echo "  PASS: case B does not paper over a real Tardigrade H3 failure with a soft unsupported row"
+    pass=$((pass + 1))
+else
+    echo "  FAIL: case B wrote an unsupported row for what should be a hard product-regression failure"
+    fail=$((fail + 1))
+fi
 
 echo ""
 echo "==> Test 3 & 9: H3 pass renaming produces the canonical scenario keys, and JSON stays valid"
@@ -254,6 +387,7 @@ rm -f "$FAKE_COMBINED"
 
 echo ""
 echo "==> Test 8: --smoke keeps the H3 matrix bounded (large/proxy/tuned rows are skipped)"
+# shellcheck disable=SC2016 # single-quoted on purpose: grepping for the literal text "$port"/"$SMOKE" in the source file, not expanding them
 SMOKE_GATE_SRC="$(grep -n 'run_benchmark_pass_h3 "tardigrade" "\$port" "static-large-h3"\|run_benchmark_pass_h3 "tardigrade" "\$port" "proxy-large-h3"\|if ! \$SMOKE; then' "$COMPETITIVE_RUN_SH" | head -5)"
 check "large/proxy H3 passes stay inside an '! \$SMOKE' guard" \
     "if ! \$SMOKE; then" "$SMOKE_GATE_SRC"

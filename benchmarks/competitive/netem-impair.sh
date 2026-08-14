@@ -106,6 +106,7 @@ netem_args=()
 TC_ADD_CMD=(tc qdisc add dev "$INTERFACE" root netem "${netem_args[@]}")
 TC_COMMAND="${TC_ADD_CMD[*]}"
 
+# shellcheck disable=SC2329 # invoked indirectly via `trap cleanup EXIT INT TERM` below
 cleanup() {
     local status=$?
     if $APPLIED; then

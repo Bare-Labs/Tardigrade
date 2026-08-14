@@ -48,6 +48,18 @@ jobs:
       - name: Run shellcheck
         run: find scripts/ packaging/ tests/vectors/pki -name "*.sh" -exec shellcheck {} +
 
+      # #256-G review: the rest of benchmarks/ is not swept here yet (several
+      # pre-existing scripts have their own unrelated shellcheck findings);
+      # this scans exactly the H3 benchmark harness this PR added/changed, so
+      # regressions in it get PR-level signal instead of none.
+      - name: Run shellcheck on the H3 benchmark harness (#256-G)
+        run: >-
+          shellcheck
+          benchmarks/run.sh
+          benchmarks/competitive/run.sh
+          benchmarks/competitive/netem-impair.sh
+          benchmarks/test-h3-benchmark.sh
+
   # ── TLS dependency audit ──────────────────────────────────────────────────────
   # Enforces the external-library policy (#379): forbidden TLS/crypto/QUIC/H3
   # dependency names must not be configured, OpenSSL must stay behind the
@@ -455,6 +467,14 @@ jobs:
 
       - name: Run performance smoke benchmark
         run: ./benchmarks/ci-smoke.sh --save benchmarks/results/ci-smoke.json
+
+      # #256-G review: this stubs h2load/tc/tardigrade throughout — no real
+      # server, no real network — so it's cheap and appropriate for bounded
+      # PR CI, giving the H3 benchmark harness itself (as opposed to a live
+      # H3 run, which stays manual/scheduled) real PR-level regression
+      # coverage.
+      - name: Run H3 benchmark harness tests (#256-G)
+        run: ./benchmarks/test-h3-benchmark.sh
 
       - name: Stage perf smoke artifact
         if: always()

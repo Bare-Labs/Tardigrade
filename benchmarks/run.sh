@@ -610,6 +610,11 @@ TOOL_HEADERS=()
 declare -A _run_rps_list=()
 declare -A _run_p99_list=()
 declare -A _run_errors_list=()
+# #256-G review: per-run scenario-local QUIC transport deltas (JSON array,
+# one element per completed run), so `--runs > 1` doesn't silently drop the
+# transport evidence every H3 result is supposed to carry. Aggregated into
+# `.[$s].quic` by flush_multirun_result.
+declare -A _run_quic_list=()
 
 add_result() {
     local scenario="$1" rps="$2" p50_ms="$3" p95_ms="$4" p99_ms="$5" p999_ms="$6" errors="$7" mbps="${8:-null}" cpu_pct_avg="${9:-null}" rss_mb_peak="${10:-null}" open_fds_peak="${11:-$CURRENT_OPEN_FDS_PEAK}"
@@ -685,6 +690,46 @@ flush_multirun_result() {
             runs: $runs
         }' \
         <<<"$RESULTS_JSON")
+
+    # #256-G review: aggregate the per-run scenario-local QUIC deltas
+    # accumulated by attach_quic_transport_state, so a repeated H3 scenario
+    # still carries transport evidence instead of silently omitting it.
+    # Counters sum across runs; effective_plpmtu/udp_buffers/ecn.enabled use
+    # the last run's post-pass state (they're gauges, not counters — summing
+    # them would be meaningless). Runs where metrics could not be observed
+    # are dropped from the aggregate, not treated as a zero contribution.
+    local quic_runs="${_run_quic_list[$scenario]:-}"
+    if [[ -n "$quic_runs" ]]; then
+        local quic_agg
+        quic_agg=$(jq -c '
+            (map(select(. != null))) as $valid |
+            if ($valid | length) == 0 then null else {
+                packets_sent: ($valid | map(.packets_sent) | add),
+                packets_received: ($valid | map(.packets_received) | add),
+                packets_lost: ($valid | map(.packets_lost) | add),
+                pto_total: ($valid | map(.pto_total) | add),
+                bytes_sent: ($valid | map(.bytes_sent) | add),
+                bytes_received: ($valid | map(.bytes_received) | add),
+                effective_plpmtu: ($valid[-1].effective_plpmtu),
+                pmtu_probes: ($valid | map(.pmtu_probes) | add),
+                pmtu_black_holes: ($valid | map(.pmtu_black_holes) | add),
+                ecn: {
+                    enabled: ($valid[-1].ecn.enabled),
+                    marked_sent: ($valid | map(.ecn.marked_sent) | add),
+                    paths_validated: ($valid | map(.ecn.paths_validated) | add),
+                    paths_disabled: ($valid | map(.ecn.paths_disabled) | add),
+                    ce_received: ($valid | map(.ecn.ce_received) | add)
+                },
+                udp_buffers: ($valid[-1].udp_buffers),
+                runs_with_data: ($valid | length),
+                runs_total: (. | length)
+            } end
+        ' <<<"$quic_runs")
+        if [[ "$quic_agg" != "null" ]]; then
+            RESULTS_JSON=$(jq --arg s "$scenario" --argjson quic "$quic_agg" '.[$s].quic = $quic' <<<"$RESULTS_JSON")
+        fi
+        unset "_run_quic_list[$scenario]"
+    fi
 
     unset "_run_rps_list[$scenario]"
     unset "_run_p99_list[$scenario]"
@@ -901,19 +946,58 @@ capture_quic_transport_state() {
         }'
 }
 
-# Attaches the quic transport-state block captured above to a scenario's
-# result. Only meaningful for single-run scenarios: with --runs > 1 the
-# per-scenario entry doesn't exist yet at this point (flush_multirun_result
-# builds it at the end from accumulated samples), and averaging point-in-time
-# cumulative counters across repeated runs would not mean what it looks like
-# it means — so multi-run H3 scenarios intentionally have no `quic` block.
+# #256-G review: the H3 listener started by the competitive harness stays up
+# across the readiness check and every pass (small/large/proxy), so a single
+# post-pass scrape of these listener-lifetime cumulative counters would
+# attribute earlier passes' traffic to a later row. `capture_quic_transport_state`
+# is a point-in-time snapshot; this turns two snapshots (taken immediately
+# before and after one load run) into a scenario-local measurement by
+# subtracting counter fields. Gauges/status (effective PLPMTU, ECN enabled,
+# UDP buffer requested/effective/granted/status) are not counters and are not
+# subtracted — they describe *current* state, so the post-run reading is used
+# as-is. `null` in, `null` out: if either snapshot could not be observed, the
+# delta is "unknown", never a fabricated zero.
+quic_transport_delta() {
+    local before="$1" after="$2"
+    if [[ "$before" == "null" || "$after" == "null" ]]; then
+        echo "null"
+        return 0
+    fi
+    jq -cn --argjson b "$before" --argjson a "$after" '{
+        packets_sent: ($a.packets_sent - $b.packets_sent),
+        packets_received: ($a.packets_received - $b.packets_received),
+        packets_lost: ($a.packets_lost - $b.packets_lost),
+        pto_total: ($a.pto_total - $b.pto_total),
+        bytes_sent: ($a.bytes_sent - $b.bytes_sent),
+        bytes_received: ($a.bytes_received - $b.bytes_received),
+        effective_plpmtu: $a.effective_plpmtu,
+        pmtu_probes: ($a.pmtu_probes - $b.pmtu_probes),
+        pmtu_black_holes: ($a.pmtu_black_holes - $b.pmtu_black_holes),
+        ecn: {
+            enabled: $a.ecn.enabled,
+            marked_sent: ($a.ecn.marked_sent - $b.ecn.marked_sent),
+            paths_validated: ($a.ecn.paths_validated - $b.ecn.paths_validated),
+            paths_disabled: ($a.ecn.paths_disabled - $b.ecn.paths_disabled),
+            ce_received: ($a.ecn.ce_received - $b.ecn.ce_received)
+        },
+        udp_buffers: $a.udp_buffers
+    }'
+}
+
+# Attaches an already-computed scenario-local quic delta (see
+# quic_transport_delta) to a scenario's result. Single-run scenarios get it
+# directly; multi-run scenarios accumulate it into `_run_quic_list` for
+# flush_multirun_result to aggregate once every run has completed (#256-G
+# review: repeated H3 runs must not silently drop transport evidence).
 attach_quic_transport_state() {
-    local label="$1"
-    [[ "$RUNS" -eq 1 ]] || return 0
-    local quic_json
-    quic_json=$(capture_quic_transport_state)
-    [[ "$quic_json" == "null" ]] && return 0
-    RESULTS_JSON=$(jq --arg s "$label" --argjson quic "$quic_json" '.[$s].quic = $quic' <<<"$RESULTS_JSON")
+    local label="$1" quic_delta="$2"
+    [[ "$quic_delta" == "null" ]] && return 0
+    if [[ "$RUNS" -eq 1 ]]; then
+        RESULTS_JSON=$(jq --arg s "$label" --argjson quic "$quic_delta" '.[$s].quic = $quic' <<<"$RESULTS_JSON")
+        return 0
+    fi
+    local prev="${_run_quic_list[$label]:-[]}"
+    _run_quic_list["$label"]=$(jq -cn --argjson acc "$prev" --argjson item "$quic_delta" '$acc + [$item]')
 }
 
 # ── h2load HTTP/3 runner ──────────────────────────────────────────────────────
@@ -933,11 +1017,18 @@ run_h2load_h3() {
     $INSECURE && extra+=(--insecure)
     build_tool_headers -H
     [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
+    # #256-G review: bracket the load run with metrics snapshots so the
+    # attached `quic` block measures only this pass, not everything the
+    # listener has done since it started.
+    local quic_before
+    quic_before=$(capture_quic_transport_state)
     local raw
     start_process_monitor
     raw=$(h2load --h3 -n $((CONNECTIONS * DURATION * 10)) \
         -c "$CONNECTIONS" -t "$THREADS" ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
     stop_process_monitor
+    local quic_after
+    quic_after=$(capture_quic_transport_state)
     local rps p50 p95 p99 p999 errors
     rps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+ req/s' | grep -oE '[0-9.]+' || echo 0)
     p50=$(extract_h2load_percentile_ms "$raw" "50")
@@ -960,7 +1051,7 @@ run_h2load_h3() {
     [[ "$CURRENT_RSS_MB_PEAK" != "null" ]] && rss_display="  rss_peak=${CURRENT_RSS_MB_PEAK}MiB"
     echo "  $label — ${rps} req/s  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms  p999=${p999}ms  errors=${errors}${tput_display}${cpu_display}${rss_display}"
     add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "$tput_mbps" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
-    attach_quic_transport_state "$label"
+    attach_quic_transport_state "$label" "$(quic_transport_delta "$quic_before" "$quic_after")"
 }
 
 # ── fortio runner ─────────────────────────────────────────────────────────────
@@ -1496,6 +1587,7 @@ if [[ -n "$BASELINE_FILE" && -f "$BASELINE_FILE" ]]; then
         esac
         echo "  ${scenario}.${metric}: baseline=${baseline_value} current=${current_value} delta=${delta}% [${status}]"
     }
+    # shellcheck disable=SC2016 # single-quoted on purpose: $s is a jq --arg binding inside compare_metric's own jq program, not a shell variable
     while IFS= read -r scenario; do
         [[ "$scenario" == _meta ]] && continue
         compare_metric "$scenario" "rps" '.[$s].rps' higher

@@ -307,9 +307,20 @@ not Tardigrade in general.
 
 Default PR CI (`.github/workflows/ci.yml`'s `perf-smoke` job, driven by
 `benchmarks/ci-smoke.sh`) stays HTTP/1.1-only and does not invoke any of the
-above — it has no H3-capable `h2load` installed and is not the place for
-QUIC evidence. `benchmarks/competitive/run.sh --smoke` (see above) is a
-bounded, manually-triggered H3 sanity check, not a default CI gate. Full
-throughput, loss/reordering, high-bandwidth, and tuned-comparison runs are
-scheduled/manual only — see the GitHub Actions workflow for the manual H3
-matrix job.
+above against a live server — it has no H3-capable `h2load` installed and is
+not the place for QUIC evidence. `benchmarks/competitive/run.sh --smoke` (see
+above) is a bounded, manually-triggered H3 sanity check against a real
+process, not a default CI gate. Full throughput, loss/reordering,
+high-bandwidth, and tuned-comparison runs are scheduled/manual only — see the
+GitHub Actions workflow for the manual H3 matrix job.
+
+The `perf-smoke` job does run `benchmarks/test-h3-benchmark.sh` on every PR,
+though: it stubs `h2load`/`tc`/Tardigrade throughout, so it never starts a
+real server or touches the network, and instead proves the harness's own
+logic stays correct — H3 config rendering, scenario-local QUIC delta
+computation (not listener-lifetime cumulative totals), `--runs > 1`
+aggregation, the unsupported-h2load-vs-broken-listener distinction, pass
+renaming, and CSV/Markdown output. The Lint job's shellcheck step also covers
+`benchmarks/run.sh`, `benchmarks/competitive/run.sh`,
+`benchmarks/competitive/netem-impair.sh`, and `benchmarks/test-h3-benchmark.sh`
+(the rest of `benchmarks/` is not swept yet).
