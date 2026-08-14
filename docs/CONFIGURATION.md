@@ -63,6 +63,7 @@ replacing `-` with `_`, and prefixing `TARDIGRADE_`. For example,
 | `listen` | `TARDIGRADE_LISTEN_HOST`, `TARDIGRADE_LISTEN_PORT`, `TARDIGRADE_HTTP2_ENABLED` | host/port | `0.0.0.0:8069` | Accepts `host:port`, `port`, or `host`; `http2` flag enables HTTP/2. Ports must be 1-65535. | `listen 0.0.0.0:8443 http2;` |
 | `worker_processes` | `TARDIGRADE_WORKER_PROCESSES` | u32 | `1` | `auto` maps to `0`; used with master-process mode. | `worker_processes auto;` |
 | `worker_connections` | `TARDIGRADE_MAX_ACTIVE_CONNECTIONS` | u32 | `0` | `0` means unlimited active client connections. | `worker_connections 4096;` |
+| `master_process` | `TARDIGRADE_MASTER_PROCESS` | bool | `false` | Enables master-process supervision mode; required for `worker_processes` to take effect. | `master_process true;` |
 | `pid` | `TARDIGRADE_PID_FILE` | path | `""` | Empty disables pid-file writing. | `pid /run/tardigrade.pid;` |
 | `user` | `TARDIGRADE_RUN_USER`, `TARDIGRADE_RUN_GROUP` | names | `""` | First token is user; optional second token is group. | `user tardigrade tardigrade;` |
 | `error_log` | `TARDIGRADE_ERROR_LOG_PATH`, `TARDIGRADE_LOG_LEVEL` | path + enum | `""`, `info` | Levels: `debug`, `info`, `warn`, `error`. | `error_log /var/log/tardigrade/error.log warn;` |
@@ -90,8 +91,8 @@ host. `server {}` blocks add per-host overrides. See the
 | `server_name` | list | `[]` | Hostnames for this block. A block with no names is the default block. | `server_name api.example.com;` |
 | `root` | path | `""` | Per-server static root. | `root /srv/site;` |
 | `try_files` | string/list | `""` | Per-server static fallback. | `try_files $uri /index.html;` |
-| `tls_cert_path` | path | `""` | Per-server TLS cert. With `tls_key_path`, also adds SNI certs for block names. | `tls_cert_path /etc/tls/api.crt;` |
-| `tls_key_path` | path | `""` | Per-server TLS key. Must be paired with cert path. | `tls_key_path /etc/tls/api.key;` |
+| `tls_cert_path` | path | `""` | Per-server TLS cert. With `tls_key_path`, also adds SNI certs for block names. Appliance profile rejects server-block TLS material. | `tls_cert_path /etc/tls/api.crt;` |
+| `tls_key_path` | path | `""` | Per-server TLS key. Must be paired with cert path. Appliance profile rejects server-block TLS material. | `tls_key_path /etc/tls/api.key;` |
 | `upstream_base_url` | URL | `""` | Per-server default reverse-proxy upstream. | `upstream_base_url http://127.0.0.1:8081;` |
 | `proxy_pass_chat` | URL | `""` | BearClaw/chat route upstream. | `proxy_pass_chat http://127.0.0.1:9001;` |
 | `proxy_pass_commands_prefix` | URL/path | `""` | BearClaw commands prefix upstream. | `proxy_pass_commands_prefix http://127.0.0.1:9002;` |
@@ -121,12 +122,23 @@ return, rewrite, or static.
 | `autoindex` | bool | `off` | `on`, `off`, `true`, `false`. | `autoindex off;` |
 | `try_files` | string/list | `""` | Location-level candidate list. | `try_files $uri /index.html;` |
 | `return` | status/body | n/a | Status u16 and optional response body. | `return 200 ok;` |
-| `rewrite` | pattern/replacement/flag | n/a | Default flag is `last`. | `rewrite ^/old/(.*)$ /new/$1 last;` |
+| `rewrite` | pattern/replacement/flag | n/a | Default flag is `last`; accepted flags are `last`, `break`, `redirect`, `permanent`. | `rewrite ^/old/(.*)$ /new/$1 last;` |
 | `error_page` | statuses/target | `[]` | Status codes followed by path or HTTP(S) URL target. | `error_page 502 503 /50x.html;` |
 | `auth` | enum | `off` | `off`, `required`. | `auth required;` |
-| `proxy_streaming` / `proxy_streaming_mode` | enum | `inherit` | `inherit`, `off`/`buffered`, `response`, `full`/`request-response`. | `proxy_streaming response;` |
+| `proxy_streaming` / `proxy_streaming_mode` | enum | `inherit` | `inherit`, `off`/`buffered`, `response`/`responses`, `full`/`request_response`/`request-response`. | `proxy_streaming response;` |
 | `early_data` | enum | `off` | `off`, `replay_safe`/`replay-safe`. | `early_data replay_safe;` |
 | `proxy_early_data` | enum | `off` | `off`, `rfc8470`/`rfc-8470`; valid only with `proxy_pass`. | `proxy_early_data rfc8470;` |
+
+## Top-Level Routing Directives
+
+These directives are accepted at top level and apply to all methods through the
+encoded routing fields listed below.
+
+| Directive | Env key | Syntax / behavior | Example |
+| --- | --- | --- | --- |
+| `rewrite` | `TARDIGRADE_REWRITE_RULES` | `rewrite <pattern> <replacement> [flag];`; default flag is `last`; accepted flags are `last`, `break`, `redirect`, `permanent`. | `rewrite ^/old/(.*)$ /new/$1 permanent;` |
+| `return` | `TARDIGRADE_RETURN_RULES` | `return <status> [body];`; maps to a catch-all return rule. | `return 200 ok;` |
+| `if` | `TARDIGRADE_CONDITIONAL_RULES` | <code>if ($&lt;variable&gt; ~ or ~* &lt;pattern&gt;) return-or-rewrite ...;</code>; variables are `request_uri`, `http_host`, `args`; `~` is case-sensitive and `~*` is case-insensitive. | `if ($request_uri ~* ^/admin) return 403 blocked;` |
 
 ## Field Reference
 
@@ -140,11 +152,11 @@ the feature or let runtime code choose a fallback. Boolean parsing accepts
 | --- | --- | --- | --- | --- |
 | `TARDIGRADE_LISTEN_HOST` | string | `0.0.0.0` | Bind address. | `TARDIGRADE_LISTEN_HOST=127.0.0.1` |
 | `TARDIGRADE_LISTEN_PORT` | u16 | `8069` | 1-65535. | `TARDIGRADE_LISTEN_PORT=8443` |
-| `TARDIGRADE_HTTP1_ENABLED` | bool | `true` | Enables HTTP/1.1. | `TARDIGRADE_HTTP1_ENABLED=true` |
-| `TARDIGRADE_HTTP2_ENABLED` | bool | `true` | Enables HTTP/2 where supported. | `TARDIGRADE_HTTP2_ENABLED=true` |
+| `TARDIGRADE_HTTP1_ENABLED` | bool | `true` | Enables HTTP/1.1. At least one of HTTP/1.1 or HTTP/2 must stay enabled; plaintext listeners require HTTP/1.1 because downstream h2c is not supported. | `TARDIGRADE_HTTP1_ENABLED=true` |
+| `TARDIGRADE_HTTP2_ENABLED` | bool | `true` | Enables HTTP/2 where supported. HTTP/2-only downstream listeners require TLS. | `TARDIGRADE_HTTP2_ENABLED=true` |
 | `TARDIGRADE_TLS_HTTP1_NO_ALPN_FALLBACK` | bool | `false` | Allows HTTP/1.1 on TLS clients that omit ALPN. | `TARDIGRADE_TLS_HTTP1_NO_ALPN_FALLBACK=true` |
 | `TARDIGRADE_PROXY_PROTOCOL` | enum | `off` | `off`, `auto`, `v1`, `v2`. | `TARDIGRADE_PROXY_PROTOCOL=auto` |
-| `TARDIGRADE_PROXY_STREAMING_MODE` | enum | `off` | `off`/`buffered`, `response`, `full`/`request-response`. | `TARDIGRADE_PROXY_STREAMING_MODE=response` |
+| `TARDIGRADE_PROXY_STREAMING_MODE` | enum | `off` | `off`/`buffered`, `response`/`responses`, `full`/`request_response`/`request-response`. | `TARDIGRADE_PROXY_STREAMING_MODE=response` |
 | `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE` | bytes | `16384` | 1-1048576; must fit proxy buffer hard limit. | `TARDIGRADE_PROXY_STREAM_BUFFER_SIZE=65536` |
 | `TARDIGRADE_PROXY_STREAM_ALL_STATUSES` | bool | `false` | Stream all upstream statuses instead of mapping non-200 responses. | `TARDIGRADE_PROXY_STREAM_ALL_STATUSES=true` |
 
@@ -155,7 +167,7 @@ the feature or let runtime code choose a fallback. Boolean parsing accepts
 | `TARDIGRADE_SERVER_NAMES` | list | `[]` | Comma or whitespace separated host patterns. Empty matches any host. | `TARDIGRADE_SERVER_NAMES=example.com,www.example.com` |
 | `TARDIGRADE_DOC_ROOT` | path | `""` | Enables static fallback when set. | `TARDIGRADE_DOC_ROOT=/srv/www` |
 | `TARDIGRADE_TRY_FILES` | string/list | `""` | Candidate list; supports `$uri`. | `TARDIGRADE_TRY_FILES=$uri /index.html` |
-| `TARDIGRADE_SERVER_BLOCKS` | encoded list | `""` | Internal representation generated by `server {}` blocks. Prefer config-file blocks. | `TARDIGRADE_SERVER_BLOCKS=example.com\x1f/srv/www\x1f$uri /index.html\x1f\x1f\x1fhttp://127.0.0.1:8080\x1f\x1f\x1f` |
+| `TARDIGRADE_SERVER_BLOCKS` | encoded list | `""` | Internal representation generated by `server {}` blocks. Records use byte `0x1e`; fields use byte `0x1f`. Prefer config-file blocks. | <code>export TARDIGRADE_SERVER_BLOCKS=$'example.com\x1f/srv/www\x1f$uri /index.html\x1f\x1f\x1fhttp://127.0.0.1:8080\x1f\x1f\x1f'</code> |
 | `TARDIGRADE_LOCATION_BLOCKS` | encoded list | `""` | Internal representation generated by `location {}` blocks. Prefer config-file blocks. | <code>TARDIGRADE_LOCATION_BLOCKS=prefix&#124;/api/&#124;proxy_pass&#124;http://127.0.0.1:8080</code> |
 | `TARDIGRADE_LOCATION_ERROR_PAGES` | encoded list | `""` | Internal error-page representation. Prefer `error_page` in locations. | <code>TARDIGRADE_LOCATION_ERROR_PAGES=prefix&#124;/api/&#124;502,503&#124;/50x.html</code> |
 | `TARDIGRADE_INTERNAL_REDIRECT_RULES` | encoded list | `""` | <code>method&#124;pattern&#124;target;...</code>; target can be a path or named location. | <code>TARDIGRADE_INTERNAL_REDIRECT_RULES=GET&#124;^/old$&#124;/new</code> |
@@ -163,7 +175,7 @@ the feature or let runtime code choose a fallback. Boolean parsing accepts
 | `TARDIGRADE_MIRROR_RULES` | encoded list | `""` | <code>method&#124;pattern&#124;target_url;...</code>; best-effort async copies. | <code>TARDIGRADE_MIRROR_RULES=POST&#124;^/api/&#124;http://127.0.0.1:9000</code> |
 | `TARDIGRADE_REWRITE_RULES` | encoded list | `""` | <code>method&#124;pattern&#124;replacement&#124;flag;...</code>; config-file `rewrite` is preferred. | <code>TARDIGRADE_REWRITE_RULES=*&#124;^/old/(.*)$&#124;/new/$1&#124;last</code> |
 | `TARDIGRADE_RETURN_RULES` | encoded list | `""` | <code>method&#124;pattern&#124;status&#124;body;...</code>; config-file `return` is preferred. | <code>TARDIGRADE_RETURN_RULES=*&#124;^/health$&#124;200&#124;ok</code> |
-| `TARDIGRADE_CONDITIONAL_RULES` | encoded list | `""` | Encoded inline <code>if (...) return&#124;rewrite</code> rules. | <code>TARDIGRADE_CONDITIONAL_RULES=http_user_agent&#124;ci&#124;bot&#124;return&#124;403&#124;blocked</code> |
+| `TARDIGRADE_CONDITIONAL_RULES` | encoded list | `""` | Encoded inline <code>if (...) return&#124;rewrite</code> rules. Variables are `request_uri`, `http_host`, `args`; sensitivity is `cs` or `ci`. | <code>TARDIGRADE_CONDITIONAL_RULES=request_uri&#124;ci&#124;^/admin&#124;return&#124;403&#124;blocked</code> |
 
 ### Proxy And Upstreams
 
@@ -187,11 +199,11 @@ the feature or let runtime code choose a fallback. Boolean parsing accepts
 | `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS` | u64 ms | `0` | Total budget across attempts; `0` disables. | `TARDIGRADE_UPSTREAM_TIMEOUT_BUDGET_MS=12000` |
 | `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS` | u32 | `1` | Minimum effective value is `1`. | `TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS=3` |
 | `TARDIGRADE_UPSTREAM_RETRY_IDEMPOTENT_ONLY` | bool | `true` | Restricts retries to idempotent methods. | `TARDIGRADE_UPSTREAM_RETRY_IDEMPOTENT_ONLY=true` |
-| `TARDIGRADE_UPSTREAM_POOL_ENABLED` | bool | `true` | Reuse plain-HTTP upstream connections. | `TARDIGRADE_UPSTREAM_POOL_ENABLED=true` |
-| `TARDIGRADE_UPSTREAM_POOL_MAX_IDLE_PER_HOST` | usize | `32` | Idle pooled connections per origin. | `TARDIGRADE_UPSTREAM_POOL_MAX_IDLE_PER_HOST=64` |
-| `TARDIGRADE_UPSTREAM_POOL_IDLE_TIMEOUT_MS` | u64 ms | `90000` | Idle pool eviction age. | `TARDIGRADE_UPSTREAM_POOL_IDLE_TIMEOUT_MS=30000` |
-| `TARDIGRADE_UPSTREAM_POOL_MAX_LIFETIME_MS` | u64 ms | `0` | Hard pooled-connection lifetime; `0` disables. | `TARDIGRADE_UPSTREAM_POOL_MAX_LIFETIME_MS=600000` |
-| `TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST` | usize | `0` | Concurrent checked-out upstream connections per origin; `0` unlimited. | `TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST=128` |
+| `TARDIGRADE_UPSTREAM_POOL_ENABLED` | bool | `true` | Reuse plain-HTTP upstream connections. Upstream-pool policy changes require restart. | `TARDIGRADE_UPSTREAM_POOL_ENABLED=true` |
+| `TARDIGRADE_UPSTREAM_POOL_MAX_IDLE_PER_HOST` | usize | `32` | Idle pooled connections per origin. Upstream-pool policy changes require restart. | `TARDIGRADE_UPSTREAM_POOL_MAX_IDLE_PER_HOST=64` |
+| `TARDIGRADE_UPSTREAM_POOL_IDLE_TIMEOUT_MS` | u64 ms | `90000` | Idle pool eviction age. Upstream-pool policy changes require restart. | `TARDIGRADE_UPSTREAM_POOL_IDLE_TIMEOUT_MS=30000` |
+| `TARDIGRADE_UPSTREAM_POOL_MAX_LIFETIME_MS` | u64 ms | `0` | Hard pooled-connection lifetime; `0` disables. Upstream-pool policy changes require restart. | `TARDIGRADE_UPSTREAM_POOL_MAX_LIFETIME_MS=600000` |
+| `TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST` | usize | `0` | Concurrent checked-out upstream connections per origin; `0` unlimited. Upstream-pool policy changes require restart. | `TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST=128` |
 | `TARDIGRADE_UPSTREAM_POOL_LOCK_METRICS` | bool | `false` | Benchmark-only lock wait counters. | `TARDIGRADE_UPSTREAM_POOL_LOCK_METRICS=false` |
 | `TARDIGRADE_UPSTREAM_GUNZIP_ENABLED` | bool | `true` | Request gzip from upstream and gunzip in gateway. | `TARDIGRADE_UPSTREAM_GUNZIP_ENABLED=true` |
 | `TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES` | bytes | `262144` | Must be at least 1. | `TARDIGRADE_MAX_BUFFERED_UPSTREAM_RESPONSE_BYTES=1048576` |
@@ -210,25 +222,30 @@ the feature or let runtime code choose a fallback. Boolean parsing accepts
 
 ### Health Checks And Circuit Breaking
 
+For active-probe aliases, `TARDIGRADE_UPSTREAM_PROBE_*` names are preferred only
+when set in the process environment. With the current loader, config-file and
+secret overrides must use the `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_*` names because
+the primary `PROBE_*` names bypass file/secret lookup.
+
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
 | `TARDIGRADE_CB_THRESHOLD` | u32 | `0` | Circuit breaker failure threshold; `0` disables. | `TARDIGRADE_CB_THRESHOLD=5` |
 | `TARDIGRADE_CB_TIMEOUT_MS` | u64 ms | `30000` | Open timeout before half-open probe. | `TARDIGRADE_CB_TIMEOUT_MS=10000` |
 | `TARDIGRADE_UPSTREAM_MAX_FAILS` | u32 | `0` | Passive health failure threshold; `0` disables. | `TARDIGRADE_UPSTREAM_MAX_FAILS=3` |
 | `TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS` | u64 ms | `10000` | Passive failure retry timeout. | `TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS=30000` |
-| `TARDIGRADE_UPSTREAM_PROBE_INTERVAL_MS` | u64 ms | `0` | Primary active-probe interval; `0` disables. | `TARDIGRADE_UPSTREAM_PROBE_INTERVAL_MS=5000` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_INTERVAL_MS` | u64 ms | `0` | Fallback alias for probe interval. | `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_INTERVAL_MS=5000` |
-| `TARDIGRADE_UPSTREAM_PROBE_PATH` | path | `/` | Primary active-probe path. | `TARDIGRADE_UPSTREAM_PROBE_PATH=/health` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_PATH` | path | `/` | Fallback alias for probe path. | `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_PATH=/healthz` |
-| `TARDIGRADE_UPSTREAM_PROBE_TIMEOUT_MS` | u32 ms | `2000` | Primary active-probe timeout. | `TARDIGRADE_UPSTREAM_PROBE_TIMEOUT_MS=1000` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS` | u32 ms | `2000` | Fallback alias for probe timeout. | `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS=1000` |
-| `TARDIGRADE_UPSTREAM_PROBE_FAIL_THRESHOLD` | u32 | `1` | Primary active-probe failure threshold; minimum effective value is 1. | `TARDIGRADE_UPSTREAM_PROBE_FAIL_THRESHOLD=2` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_FAIL_THRESHOLD` | u32 | `1` | Fallback alias for fail threshold. | `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_FAIL_THRESHOLD=2` |
+| `TARDIGRADE_UPSTREAM_PROBE_INTERVAL_MS` | u64 ms | `0` | Preferred process-env name for active-probe interval; `0` disables. | `TARDIGRADE_UPSTREAM_PROBE_INTERVAL_MS=5000` |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_INTERVAL_MS` | u64 ms | `0` | Config-file/secret-compatible active-probe interval name. | `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_INTERVAL_MS=5000` |
+| `TARDIGRADE_UPSTREAM_PROBE_PATH` | path | `/` | Preferred process-env name for active-probe path. | `TARDIGRADE_UPSTREAM_PROBE_PATH=/health` |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_PATH` | path | `/` | Config-file/secret-compatible active-probe path name. | `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_PATH=/healthz` |
+| `TARDIGRADE_UPSTREAM_PROBE_TIMEOUT_MS` | u32 ms | `2000` | Preferred process-env name for active-probe timeout. | `TARDIGRADE_UPSTREAM_PROBE_TIMEOUT_MS=1000` |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS` | u32 ms | `2000` | Config-file/secret-compatible active-probe timeout name. | `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS=1000` |
+| `TARDIGRADE_UPSTREAM_PROBE_FAIL_THRESHOLD` | u32 | `1` | Preferred process-env name for active-probe failure threshold; minimum effective value is 1. | `TARDIGRADE_UPSTREAM_PROBE_FAIL_THRESHOLD=2` |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_FAIL_THRESHOLD` | u32 | `1` | Config-file/secret-compatible fail threshold name. | `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_FAIL_THRESHOLD=2` |
 | `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_THRESHOLD` | u32 | `1` | Consecutive successes before clearing unhealthy; minimum effective value is 1. | `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_THRESHOLD=2` |
-| `TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS` | status/range | `200-299` | Single u16 status or inclusive `min-max`. | `TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS=200-399` |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS` | status/range | `200-299` | Fallback alias for success range. | `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS=204` |
-| `TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS_OVERRIDES` | encoded list | `""` | <code>upstream_url&#124;status-or-range;...</code>. | <code>TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS_OVERRIDES=http://127.0.0.1:8080&#124;200-399</code> |
-| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS_OVERRIDES` | encoded list | `""` | Fallback alias for success overrides. | <code>TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS_OVERRIDES=http://a&#124;204</code> |
+| `TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS` | status/range | `200-299` | Preferred process-env name; accepts a single u16 status or inclusive `min-max`. | `TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS=200-399` |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS` | status/range | `200-299` | Config-file/secret-compatible success range name. | `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS=204` |
+| `TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS_OVERRIDES` | encoded list | `""` | Preferred process-env name; format is <code>upstream_url&#124;status-or-range;...</code>. | <code>TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS_OVERRIDES=http://127.0.0.1:8080&#124;200-399</code> |
+| `TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS_OVERRIDES` | encoded list | `""` | Config-file/secret-compatible success override name. | <code>TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS_OVERRIDES=http://a&#124;204</code> |
 | `TARDIGRADE_UPSTREAM_SLOW_START_MS` | u64 ms | `0` | Slow-start window for recovered upstreams; `0` disables. | `TARDIGRADE_UPSTREAM_SLOW_START_MS=30000` |
 
 ### TLS Termination
@@ -245,7 +262,7 @@ appliance/native profile has a stricter TLS 1.3-only subset.
 | `TARDIGRADE_TLS_CIPHER_LIST` | string | `""` | OpenSSL TLS <=1.2 cipher list. Appliance profile requires empty. | `TARDIGRADE_TLS_CIPHER_LIST=ECDHE+AESGCM` |
 | `TARDIGRADE_TLS_CIPHER_SUITES` | string | `""` | TLS 1.3 cipher suites. Appliance profile requires empty. | `TARDIGRADE_TLS_CIPHER_SUITES=TLS_AES_256_GCM_SHA384` |
 | `TARDIGRADE_TLS_SERVER_NAME` | DNS name | `""` | Appliance profile requires a single non-wildcard DNS host name when TLS is enabled. | `TARDIGRADE_TLS_SERVER_NAME=edge.example.com` |
-| `TARDIGRADE_TLS_SNI_CERTS` | encoded list | `""` | Additional SNI certs as <code>name&#124;cert&#124;key;...</code>. Appliance profile requires empty. | <code>TARDIGRADE_TLS_SNI_CERTS=api.example.com&#124;/a.crt&#124;/a.key</code> |
+| `TARDIGRADE_TLS_SNI_CERTS` | encoded list | `""` | Additional SNI certs as <code>name:cert:key&#124;name2:cert2:key2</code>. Appliance profile requires empty. | `TARDIGRADE_TLS_SNI_CERTS=api.example.com:/a.crt:/a.key` |
 | `TARDIGRADE_TLS_SESSION_CACHE` | bool | `true` general, `false` appliance | OpenSSL session cache. Appliance profile rejects true. | `TARDIGRADE_TLS_SESSION_CACHE=true` |
 | `TARDIGRADE_TLS_SESSION_CACHE_SIZE` | u32 | `20480` | OpenSSL session cache size. | `TARDIGRADE_TLS_SESSION_CACHE_SIZE=40960` |
 | `TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS` | u32 | `300` | OpenSSL session timeout. | `TARDIGRADE_TLS_SESSION_TIMEOUT_SECONDS=600` |
@@ -271,11 +288,11 @@ OpenSSL `TARDIGRADE_TLS_SESSION_*` behavior.
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
 | `TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE` | enum | `disabled` | `disabled`, `stateful`, `stateless`, `hybrid`. | `TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE=stateless` |
-| `TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_LIFETIME_SECONDS` | u32 seconds | `86400` | Must be nonzero and within native session policy when enabled. | `TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_LIFETIME_SECONDS=3600` |
+| `TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_LIFETIME_SECONDS` | u32 seconds | `86400` | When resumption mode is enabled, must be `1`-`604800` seconds. | `TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_LIFETIME_SECONDS=3600` |
 | `TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_USAGE` | enum | `reusable` | `reusable`, `single_use`. | `TARDIGRADE_TLS_NATIVE_RESUMPTION_TICKET_USAGE=single_use` |
-| `TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH` | path | `""` | Requires `stateless` or `hybrid`. Reload mode changes may require restart. | `TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH=/var/lib/tardigrade/tickets.json` |
-| `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE` | enum | `disabled` | `disabled`, `process_local`. Replay-store topology changes require restart. | `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE=process_local` |
-| `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES` | usize | `65536` | Strictly parsed. Must be 1-1048576. | `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES=131072` |
+| `TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH` | path | `""` | Requires `stateless` or `hybrid`. Ticket-key source mode changes require restart. | `TARDIGRADE_TLS_NATIVE_TICKET_KEYS_PATH=/var/lib/tardigrade/tickets.json` |
+| `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE` | enum | `disabled` | `disabled`, `process_local`/`process-local`. Replay-store topology changes require restart. | `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MODE=process_local` |
+| `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES` | usize | `65536` | Strictly parsed. Must be 1-1048576. Replay capacity changes require restart. | `TARDIGRADE_TLS_NATIVE_EARLY_DATA_REPLAY_MAX_ENTRIES=131072` |
 
 ### TLS Buffer Limits
 
@@ -319,17 +336,17 @@ TLS stream capacity. Defaults are deterministic from native stream queue capacit
 
 | Env key | Type | Default | Valid values / behavior | Example |
 | --- | --- | --- | --- | --- |
-| `TARDIGRADE_HTTP3_ENABLED` | bool | `false` | Enables native QUIC/H3. Requires TLS identity in native paths. | `TARDIGRADE_HTTP3_ENABLED=true` |
-| `TARDIGRADE_QUIC_PORT` | u16 | `443` | UDP QUIC listener port, 1-65535. | `TARDIGRADE_QUIC_PORT=8443` |
+| `TARDIGRADE_HTTP3_ENABLED` | bool | `false` | Enables native QUIC/H3. Requires TLS identity in native paths. HTTP/3 listener topology changes require restart. | `TARDIGRADE_HTTP3_ENABLED=true` |
+| `TARDIGRADE_QUIC_PORT` | u16 | `443` | UDP QUIC listener port, 1-65535. HTTP/3 listener topology changes require restart. | `TARDIGRADE_QUIC_PORT=8443` |
 | `TARDIGRADE_HTTP3_ALT_SVC` | enum | `off` | `off`, `auto`. | `TARDIGRADE_HTTP3_ALT_SVC=auto` |
-| `TARDIGRADE_HTTP3_ALT_SVC_MAX_AGE_SECONDS` | u32 | `300` | `Alt-Svc` `ma` value. | `TARDIGRADE_HTTP3_ALT_SVC_MAX_AGE_SECONDS=86400` |
+| `TARDIGRADE_HTTP3_ALT_SVC_MAX_AGE_SECONDS` | u32 | `300` | `Alt-Svc` `ma` value; must be `0`-`86400`. | `TARDIGRADE_HTTP3_ALT_SVC_MAX_AGE_SECONDS=86400` |
 | `TARDIGRADE_HTTP3_ENABLE_0RTT` | bool | `false` | Enables 0-RTT. Logs replay warning; appliance profile rejects true. | `TARDIGRADE_HTTP3_ENABLE_0RTT=false` |
 | `TARDIGRADE_HTTP3_CONNECTION_MIGRATION` | bool | `false` | QUIC connection migration; appliance profile rejects true. | `TARDIGRADE_HTTP3_CONNECTION_MIGRATION=true` |
 | `TARDIGRADE_HTTP3_RETRY_POLICY` | enum | `off` | `off`, `address_validation`/`address-validation`; appliance profile rejects non-off. | `TARDIGRADE_HTTP3_RETRY_POLICY=address_validation` |
 | `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE` | bytes | `2048` | Bounds discovered send size; transport clamps to `[1200, 2048]` and may lower it for the peer/path. | `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE=2048` |
-| `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES` | bytes | `0` | Advisory socket receive buffer target. `0` leaves kernel sizing. | `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES=1048576` |
-| `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES` | bytes | `0` | Advisory socket send buffer target. `0` leaves kernel sizing. | `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES=1048576` |
-| `TARDIGRADE_HTTP3_ECN` | bool | `true` | Enables QUIC ECN where supported. | `TARDIGRADE_HTTP3_ECN=true` |
+| `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES` | bytes | `0` | Advisory socket receive buffer target. `0` leaves kernel sizing. HTTP/3 listener-owned changes require restart. | `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES=1048576` |
+| `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES` | bytes | `0` | Advisory socket send buffer target. `0` leaves kernel sizing. HTTP/3 listener-owned changes require restart. | `TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES=1048576` |
+| `TARDIGRADE_HTTP3_ECN` | bool | `true` | Enables QUIC ECN where supported. HTTP/3 listener-owned changes require restart. | `TARDIGRADE_HTTP3_ECN=true` |
 
 ### Security, Auth, And Policy
 
@@ -437,20 +454,20 @@ consumed by the CLI log-rotation path, not `EdgeConfig`. Defaults are `0`
 | `TARDIGRADE_RUN_GROUP` | string | `""` | Group for post-bind privilege drop. | `TARDIGRADE_RUN_GROUP=tardigrade` |
 | `TARDIGRADE_CHROOT_DIR` | path | `""` | Chroot after bind. | `TARDIGRADE_CHROOT_DIR=/var/empty` |
 | `TARDIGRADE_REQUIRE_UNPRIVILEGED_USER` | bool | `false` | Require runtime to be unprivileged after startup. | `TARDIGRADE_REQUIRE_UNPRIVILEGED_USER=true` |
-| `TARDIGRADE_WORKER_THREADS` | u32 | `0` | Connection-handling worker threads; `0` means auto CPU count. | `TARDIGRADE_WORKER_THREADS=8` |
+| `TARDIGRADE_WORKER_THREADS` | u32 | `0` | Connection-handling worker threads; `0` means auto CPU count. Changes require restart. | `TARDIGRADE_WORKER_THREADS=8` |
 | `TARDIGRADE_LISTENER_SHARDS` | u16 | `0` | `0`/`1` single listener; `>1` starts parallel accept loops where supported. Topology changes require restart. | `TARDIGRADE_LISTENER_SHARDS=4` |
 | `TARDIGRADE_ACCEPT_BATCH_LIMIT` | u32 | `64` | Minimum effective value is 1. | `TARDIGRADE_ACCEPT_BATCH_LIMIT=128` |
 | `TARDIGRADE_ACCEPT_FAIRNESS_YIELD_EVERY` | u32 | `0` | Yield after this many accepts; `0` disables. | `TARDIGRADE_ACCEPT_FAIRNESS_YIELD_EVERY=32` |
-| `TARDIGRADE_EVENT_LOOP_BACKEND` | enum | `default` | `default`, `epoll`, `kqueue`, `io_uring`; explicit unavailable backends fail startup. | `TARDIGRADE_EVENT_LOOP_BACKEND=io_uring` |
+| `TARDIGRADE_EVENT_LOOP_BACKEND` | enum | `default` | `default`, `epoll`, `kqueue`, `io_uring`/`io-uring`; explicit unavailable backends fail startup. | `TARDIGRADE_EVENT_LOOP_BACKEND=io_uring` |
 | `TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES` | u16 | `256` | 64-4096. Ignored by epoll/kqueue. | `TARDIGRADE_EVENT_LOOP_IO_URING_ENTRIES=512` |
 | `TARDIGRADE_MASTER_PROCESS` | bool | `false` | Enables master process supervision mode. | `TARDIGRADE_MASTER_PROCESS=true` |
 | `TARDIGRADE_WORKER_PROCESSES` | u32 | `1` | Worker processes in master mode. | `TARDIGRADE_WORKER_PROCESSES=4` |
 | `TARDIGRADE_BINARY_UPGRADE` | bool | `true` | Enables SIGUSR2 binary upgrade path. | `TARDIGRADE_BINARY_UPGRADE=true` |
 | `TARDIGRADE_WORKER_RECYCLE_SECONDS` | u32 seconds | `0` | Worker recycle interval; `0` disables. | `TARDIGRADE_WORKER_RECYCLE_SECONDS=3600` |
 | `TARDIGRADE_WORKER_CPU_AFFINITY` | string | `""` | CPU list for worker role pinning. | `TARDIGRADE_WORKER_CPU_AFFINITY=0,1,2,3` |
-| `TARDIGRADE_WORKER_QUEUE_SIZE` | usize | `1024` | Max queued accepted connections waiting for workers. | `TARDIGRADE_WORKER_QUEUE_SIZE=4096` |
-| `TARDIGRADE_WORKER_MAX_QUEUE_DEPTH` | usize | `0` | Per-worker queue depth; `0` no per-worker limit. | `TARDIGRADE_WORKER_MAX_QUEUE_DEPTH=256` |
-| `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` | u64 ms | `30000` | Graceful drain timeout. `0` force-closes immediately. | `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS=60000` |
+| `TARDIGRADE_WORKER_QUEUE_SIZE` | usize | `1024` | Max queued accepted connections waiting for workers. Changes require restart. | `TARDIGRADE_WORKER_QUEUE_SIZE=4096` |
+| `TARDIGRADE_WORKER_MAX_QUEUE_DEPTH` | usize | `0` | Per-worker queue depth; `0` no per-worker limit. Changes require restart. | `TARDIGRADE_WORKER_MAX_QUEUE_DEPTH=256` |
+| `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS` | u64 ms | `30000` | Graceful drain timeout. `0` force-closes immediately. Coherent drain-policy changes require restart. | `TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS=60000` |
 | `TARDIGRADE_FD_SOFT_LIMIT` | u64 | `0` | Desired `RLIMIT_NOFILE` soft limit; `0` leaves OS default. | `TARDIGRADE_FD_SOFT_LIMIT=65535` |
 | `TARDIGRADE_CONNECTION_POOL_SIZE` | usize | `256` | Maximum idle connection sessions cached for reuse. | `TARDIGRADE_CONNECTION_POOL_SIZE=512` |
 | `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES` | bytes | `2097152` | Max retained bytes per active connection; `0` unlimited. | `TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES=4194304` |
@@ -458,6 +475,20 @@ consumed by the CLI log-rotation path, not `EdgeConfig`. Defaults are `0`
 
 `TARDIGRADE_VALIDATE_CONFIG_ONLY` is consumed by the CLI as a compatibility
 validation switch. It is not part of `EdgeConfig`.
+
+### Reload Behavior
+
+See [Reload, Drain, and Shutdown](RELOAD_SHUTDOWN.md) for the full lifecycle
+contract. `tardi reload` and `SIGHUP` load and validate a new config, prepare
+reload-owned resources, then publish it for new requests without draining active
+connections. If loading or validation fails before publication, the previous
+config remains active.
+
+Reload rejects process-owned changes that require restart. Current restart-owned
+surfaces include listener-shard and HTTP/3 listener topology, native replay
+mode/capacity, native ticket-key source mode, worker thread and queue settings,
+coherent shutdown-drain changes, and upstream-pool policy changes. Rows above
+that mention "require restart" are not hot-reloadable in place.
 
 ### Proxy Buffer Limits
 
@@ -519,13 +550,19 @@ These are configurable in-tree surfaces outside the stable Core v1 baseline.
 ## Full Annotated Example
 
 ```nginx
-# `auto` maps to 0 and lets Tardigrade choose the worker-process count.
+# This complete example targets the general/OpenSSL TLS profile. Appliance TLS
+# accepts one top-level identity only, so the server-block TLS material below
+# would be rejected there.
+
+# Master-process mode is required for worker_processes to take effect. `auto`
+# maps to 0 and lets Tardigrade choose the worker-process count.
+master_process true;
 # `worker_connections` caps total active client connections through
 # TARDIGRADE_MAX_ACTIVE_CONNECTIONS.
 worker_processes auto;
 worker_connections 4096;
 
-# Write the active process id for service managers and send warning-or-higher
+# Write the active process id for service managers and send info-or-higher
 # startup/runtime diagnostics to an explicit file instead of stderr.
 pid /run/tardigrade.pid;
 error_log /var/log/tardigrade/error.log info;
