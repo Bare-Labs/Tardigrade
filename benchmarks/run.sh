@@ -358,30 +358,52 @@ wrk_percentile_ms() {
     latency_value_to_ms "$value"
 }
 
-# #256-G review: the adjacency-based text parsing this used to do
-# (grep for a percentile label, take the nearest number+unit) cannot work
-# against current h2load output at all, for two independent reasons
-# verified against a real nghttp2 1.69.0 build (the version --h3 requires):
-# the label spelling changed ("50th"/"95th"/"99th" -> "median"/"p95"/"p99"),
-# and — the part no amount of label-matching could fix — the labels and
-# values now live in different table rows/columns (a header row naming the
-# columns, then one data row per metric), not adjacent to each other on the
-# same line. h2load's structured `--output-file=<path>` JSON export is the
-# only interface here that is actually stable to parse; see
-# parse_h2load_json_result below, which replaced every caller of this
-# function. There is also no 99.9th-percentile figure anywhere in that JSON
-# — h2load does not compute one — so p999 is always reported as `null`.
-#
+# #256-G review: adjacency-based text parsing (grep for a percentile label,
+# take the nearest number+unit) cannot work against h2load's *current*
+# text-table output at all, for two independent reasons verified against a
+# real nghttp2 1.69.0 build (the version --h3 requires): the label spelling
+# changed ("50th"/"95th"/"99th" -> "median"/"p95"/"p99"), and — the part no
+# amount of label-matching could fix — the labels and values now live in
+# different table rows/columns (a header row naming the columns, then one
+# data row per metric), not adjacent to each other on the same line.
+# h2load's structured `--output-file=<path>` JSON export (see
+# parse_h2load_json_result below) is the only interface that is stable to
+# parse on a build that has it. But `--output-file` itself is a 1.69+
+# addition — it does not exist on the older h2load still shipped by stock
+# apt/brew packages, and unlike an unrecognized flag causing a clean exit,
+# there is no reason to make plain HTTP/2 benchmarking (run_h2load, which
+# never needs --h3 or QUIC) hard-require a feature only present in the same
+# build that added QUIC support. `extract_h2load_percentile_ms` is that
+# older build's text-table format — "50th"/"95th"/"99th" labels immediately
+# adjacent to their number+unit on the same line — kept alive as a fallback
+# for exactly that case, gated on H2LOAD_OUTPUT_FILE_SUPPORTED (see below).
+# It is never used against a build that has --output-file, so it never has
+# to cope with the new table layout above.
+extract_h2load_percentile_ms() {
+    local raw="$1" percentile="$2"
+    local pattern
+    case "$percentile" in
+        50) pattern='50th' ;;
+        95) pattern='95th' ;;
+        99) pattern='99th' ;;
+        99.9) pattern='99.9th' ;;
+        *) echo "null"; return 0 ;;
+    esac
+    local value
+    value=$(printf '%s\n' "$raw" | grep -E "$pattern" | grep -oE '[0-9.]+ (us|ms|s)' | head -1 | tr -d ' ')
+    latency_value_to_ms "$value"
+}
+
 # Parses one h2load `--output-file=<path>` JSON document (schema verified
 # against a real nghttp2 1.69.0 build) into this script's usual
 # rps/p50/p95/p99/p999/errors/tput_mbps shape. Sets those variables directly
 # in the caller's scope — they must already be `local` there — rather than
 # returning a value, since every caller needs all seven at once anyway.
 #
-# `errors` is the sum of h2load's failed + errored + timeout counts: a
-# request that errored or timed out is exactly as much "not a clean
-# success" as one the server rejected, and folding them keeps this script's
-# existing single errors column meaningful.
+# `errors` is `requests.failed` alone (#256-G review: `.failed`/.errored`/
+# `.timeout` are not disjoint counters — h2load already folds
+# connection/transport errors and timeouts into `.failed`, so summing all
+# three double- or triple-counts the same bad request).
 #
 # A missing, empty, or invalid JSON document — h2load crashed, was killed,
 # or wrote nothing — is treated as a failed pass (rps=0, an explicit
@@ -397,11 +419,12 @@ parse_h2load_json_result() {
         return 1
     fi
     rps=$(jq -r '(.measurements.request_per_second // 0) | floor' "$json_file")
-    errors=$(jq -r '
-        (.measurements.requests.failed // 0)
-        + (.measurements.requests.errored // 0)
-        + (.measurements.requests.timeout // 0)
-    ' "$json_file")
+    # #256-G review: requests.failed/.errored/.timeout are not disjoint —
+    # h2load already folds connection/transport errors and timeouts into
+    # requests.failed, so summing all three double- or triple-counts the
+    # same bad request. requests.failed alone is the authoritative "not a
+    # clean success" count for this script's single errors column.
+    errors=$(jq -r '.measurements.requests.failed // 0' "$json_file")
     p50=$(jq -r '.measurements.performance.request.median as $v | if $v == null then null else (($v * 1000000 | round) / 1000) end' "$json_file")
     p95=$(jq -r '.measurements.performance.request.p95 as $v | if $v == null then null else (($v * 1000000 | round) / 1000) end' "$json_file")
     p99=$(jq -r '.measurements.performance.request.p99 as $v | if $v == null then null else (($v * 1000000 | round) / 1000) end' "$json_file")
@@ -834,6 +857,20 @@ run_wrk() {
     add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "$tput_mbps" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
 }
 
+# #256-G review: `--output-file` (the structured JSON export parsed by
+# parse_h2load_json_result) is a 1.69+ addition — the same build that added
+# --h3/QUIC. run_h2load benchmarks plain HTTP/2 and never needs --h3, so it
+# has no real reason to require that build; the older h2load still shipped
+# by stock apt/brew packages fully supports HTTP/2 but doesn't recognize
+# --output-file at all, and (like the --insecure case above) an unrecognized
+# flag makes h2load exit immediately instead of running the benchmark. This
+# checks for the flag directly rather than sniffing a version number, since
+# that's the thing that actually matters and avoids parsing yet another
+# version-string format.
+h2load_output_file_supported() {
+    h2load --help 2>&1 | grep -q -- '--output-file'
+}
+
 # ── h2load runner ─────────────────────────────────────────────────────────────
 run_h2load() {
     local url="$1" label="$2"
@@ -845,24 +882,47 @@ run_h2load() {
     # $INSECURE is intentionally not forwarded here.
     build_tool_headers -H
     [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
-    local out_json; out_json=$(mktemp /tmp/tardigrade-bench-h2load-XXXXXX.json)
-    local raw
-    start_process_monitor
-    # #256-G review: --duration is h2load's real timing-based mode (verified
-    # wall-clock-accurate against a real build); the previous -n synthesis
-    # only ever approximated the requested duration and could finish in a
-    # fraction of it on a fast target while _meta.duration_s still claimed
-    # the requested value.
-    raw=$(h2load --duration "${DURATION}s" \
-        -c "$CONNECTIONS" -t "$THREADS" --output-file="$out_json" \
-        ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
-    stop_process_monitor
     local rps p50 p95 p99 p999 errors tput_mbps
-    if ! parse_h2load_json_result "$out_json"; then
-        echo "  $label — h2load produced no usable --output-file JSON; recording as a failed pass. Raw output:" >&2
-        printf '%s\n' "$raw" | tail -20 >&2
+    local raw
+    if h2load_output_file_supported; then
+        local out_json; out_json=$(mktemp /tmp/tardigrade-bench-h2load-XXXXXX.json)
+        start_process_monitor
+        # #256-G review: --duration is h2load's real timing-based mode (verified
+        # wall-clock-accurate against a real build); the previous -n synthesis
+        # only ever approximated the requested duration and could finish in a
+        # fraction of it on a fast target while _meta.duration_s still claimed
+        # the requested value.
+        raw=$(h2load --duration "${DURATION}s" \
+            -c "$CONNECTIONS" -t "$THREADS" --output-file="$out_json" \
+            ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
+        stop_process_monitor
+        if ! parse_h2load_json_result "$out_json"; then
+            echo "  $label — h2load produced no usable --output-file JSON; recording as a failed pass. Raw output:" >&2
+            printf '%s\n' "$raw" | tail -20 >&2
+        fi
+        rm -f "$out_json"
+    else
+        echo "  $label — h2load has no --output-file support (pre-1.69 build); falling back to text-table parsing"
+        start_process_monitor
+        raw=$(h2load --duration "${DURATION}s" \
+            -c "$CONNECTIONS" -t "$THREADS" \
+            ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
+        stop_process_monitor
+        rps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+ req/s' | grep -oE '[0-9.]+' || echo 0)
+        p50=$(extract_h2load_percentile_ms "$raw" "50")
+        p95=$(extract_h2load_percentile_ms "$raw" "95")
+        p99=$(extract_h2load_percentile_ms "$raw" "99")
+        p999=$(extract_h2load_percentile_ms "$raw" "99.9")
+        errors=$(echo "$raw" | grep -oE 'failed: [0-9]+' | grep -oE '[0-9]+' | head -1 || echo 0)
+        rps=${rps:-0}; errors=${errors:-0}
+        tput_mbps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+[KMG]B/s' | awk '{
+            v=$1
+            if (v ~ /GB\/s$/) { sub(/GB\/s$/, "", v); printf "%.2f", v*1024; exit }
+            if (v ~ /MB\/s$/) { sub(/MB\/s$/, "", v); printf "%.2f", v; exit }
+            if (v ~ /KB\/s$/) { sub(/KB\/s$/, "", v); printf "%.2f", v/1024; exit }
+        }')
+        tput_mbps="${tput_mbps:-null}"
     fi
-    rm -f "$out_json"
     local tput_display="" cpu_display="" rss_display=""
     [[ "$tput_mbps" != "null" ]] && tput_display="  throughput=${tput_mbps}MB/s"
     [[ "$CURRENT_CPU_PCT_AVG" != "null" ]] && cpu_display="  cpu=${CURRENT_CPU_PCT_AVG}%"
@@ -1570,9 +1630,15 @@ MEMORY_MB=$(detect_memory_mb)
 # "we tried and it was slow."
 H2LOAD_VERSION="unknown"
 H2LOAD_H3_SUPPORTED=false
+H2LOAD_OUTPUT_FILE_SUPPORTED=false
 if command -v h2load &>/dev/null; then
     H2LOAD_VERSION=$({ h2load --version 2>&1 || true; } | head -1)
     h2load --h3 --help &>/dev/null 2>&1 && H2LOAD_H3_SUPPORTED=true
+    # #256-G review: run_h2load falls back to text-table parsing on a build
+    # without --output-file — record which path actually ran so a result
+    # produced by the legacy fallback isn't silently indistinguishable from
+    # one backed by the structured JSON export.
+    h2load_output_file_supported && H2LOAD_OUTPUT_FILE_SUPPORTED=true
 fi
 RESULTS_JSON=$(jq \
     --arg tag "$GIT_TAG" --arg ts "$TIMESTAMP" \
@@ -1596,6 +1662,7 @@ RESULTS_JSON=$(jq \
     --arg memory_mb "$MEMORY_MB" \
     --arg h2load_version "$H2LOAD_VERSION" \
     --argjson h2load_h3_supported "$($H2LOAD_H3_SUPPORTED && echo true || echo false)" \
+    --argjson h2load_output_file_supported "$($H2LOAD_OUTPUT_FILE_SUPPORTED && echo true || echo false)" \
     --argjson threads "$THREADS" \
     --argjson dur "$DURATION" --argjson conn "$CONNECTIONS" --argjson sample_interval_ms "$SAMPLE_INTERVAL_MS" \
     --argjson runs "$RUNS" \
@@ -1613,6 +1680,7 @@ RESULTS_JSON=$(jq \
           zig_version: $zig_version,
           h2load_version: $h2load_version,
           h2load_h3_supported: $h2load_h3_supported,
+          h2load_output_file_supported: $h2load_output_file_supported,
           environment: {
             os: $os_name,
             kernel: $kernel_release,

@@ -170,6 +170,14 @@ against a real nghttp2 1.69.0 build) — it never validates TLS certificates in 
 place, so nothing needs to be skipped for the h2load-driven scenarios (`static-http2`,
 `proxy-http2`, `static-http3`, `proxy-http3`).
 
+`static-http2` and `proxy-http2` parse h2load's structured `--output-file=<path>` JSON
+export when it's available (nghttp2 1.69+, the same build that added `--h3`), and fall back
+to h2load's older text-table output when it isn't — plain HTTP/2 benchmarking never needs
+--h3/QUIC, so the runner doesn't require the build that added them. The active h2load
+version and both capability flags (`h2load_h3_supported`, `h2load_output_file_supported`) are
+recorded in each result's `_meta`, so a result produced by the text-table fallback path is
+never silently indistinguishable from one backed by the JSON export.
+
 When an H3 scenario completes, the runner also scrapes `--metrics-path` (default
 `/status/metrics`, requires Tardigrade metrics enabled) and attaches a `quic` sub-object to
 that scenario's result — packet/loss/PTO counts, effective PLPMTU, ECN state, and

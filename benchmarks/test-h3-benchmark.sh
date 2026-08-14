@@ -459,7 +459,12 @@ echo "==> Test 13: parse_h2load_json_result parses a real h2load 1.69.0 --output
 # https://127.0.0.1:<port>/health` against a live local Tardigrade H3
 # listener, run by hand while fixing this review (the version/schema the
 # review flagged as incompatible with the old text-table parser).
-REAL_H2LOAD_JSON='{"version":"v1","metadata":{"generator":"h2load 1.69.0"},"measurements":{"duration":0.004285,"request_per_second":4667.44457,"bytes_per_second":956826,"requests":{"total":20,"started":20,"done":20,"succeeded":15,"failed":3,"errored":1,"timeout":1},"status_codes":{"2xx":15,"3xx":0,"4xx":5,"5xx":0},"traffic":{"total":4100,"headers":3260,"headers_decompressed":2960,"data":420},"performance":{"request":{"min":3.9083e-05,"max":0.000132292,"median":4.3833e-05,"p95":0.000132292,"p99":0.000132292,"mean":5.714995e-05,"sd":2.6971523e-05,"within_sd":80,"samples":[3.9083e-05]},"connect":{"min":0.002875125,"max":0.00343225,"median":0.0031536875,"p95":0.00343225,"p99":0.00343225,"mean":0.0031536875,"sd":0.000393946865,"within_sd":100,"samples":[0.002875125]},"ttfb":{"min":0.003575625,"max":0.003682917,"median":0.003629271,"p95":0.003682917,"p99":0.003682917,"mean":0.003629271,"sd":7.58669008e-05,"within_sd":100,"samples":[0.003575625]},"request_per_second":{"min":2384.07438,"max":2429.12541,"median":2406.5999,"p95":2429.12541,"p99":2429.12541,"mean":2406.5999,"sd":31.8558852,"within_sd":100,"samples":[2384.07438]}}}}'
+# #256-G review: requests.failed/.errored/.timeout are not disjoint in real
+# h2load — .errored/.timeout requests are already folded into .failed — so
+# this fixture keeps failed >= errored + timeout (5 >= 1 + 1) instead of
+# baking in the double-counting bug the review caught (the original fixture
+# here asserted failed+errored+timeout==5 as if they were additive).
+REAL_H2LOAD_JSON='{"version":"v1","metadata":{"generator":"h2load 1.69.0"},"measurements":{"duration":0.004285,"request_per_second":4667.44457,"bytes_per_second":956826,"requests":{"total":20,"started":20,"done":20,"succeeded":15,"failed":5,"errored":1,"timeout":1},"status_codes":{"2xx":15,"3xx":0,"4xx":3,"5xx":0},"traffic":{"total":4100,"headers":3260,"headers_decompressed":2960,"data":420},"performance":{"request":{"min":3.9083e-05,"max":0.000132292,"median":4.3833e-05,"p95":0.000132292,"p99":0.000132292,"mean":5.714995e-05,"sd":2.6971523e-05,"within_sd":80,"samples":[3.9083e-05]},"connect":{"min":0.002875125,"max":0.00343225,"median":0.0031536875,"p95":0.00343225,"p99":0.00343225,"mean":0.0031536875,"sd":0.000393946865,"within_sd":100,"samples":[0.002875125]},"ttfb":{"min":0.003575625,"max":0.003682917,"median":0.003629271,"p95":0.003682917,"p99":0.003682917,"mean":0.003629271,"sd":7.58669008e-05,"within_sd":100,"samples":[0.003575625]},"request_per_second":{"min":2384.07438,"max":2429.12541,"median":2406.5999,"p95":2429.12541,"p99":2429.12541,"mean":2406.5999,"sd":31.8558852,"within_sd":100,"samples":[2384.07438]}}}}'
 REAL_JSON_FILE="$(mktemp /tmp/tardi-h2load-real-json-XXXX.json)"
 printf '%s' "$REAL_H2LOAD_JSON" > "$REAL_JSON_FILE"
 eval "$(source_functions "$RUN_SH" parse_h2load_json_result)"
@@ -475,7 +480,7 @@ REAL_PARSE_OUT="$(cat /tmp/tardi-h2load-real-parse-result.txt)"
 check "real h2load 1.69.0 JSON: parse succeeds" "PARSE_OK" "$REAL_PARSE_OUT"
 check "real h2load 1.69.0 JSON: rps floored from request_per_second" "rps=4667" "$REAL_PARSE_OUT"
 check "real h2load 1.69.0 JSON: p50 converted from median seconds to ms" "p50=0.044" "$REAL_PARSE_OUT"
-check "real h2load 1.69.0 JSON: errors sums failed+errored+timeout (3+1+1=5), not just failed" "errors=5" "$REAL_PARSE_OUT"
+check "real h2load 1.69.0 JSON: errors uses requests.failed alone (5), not failed+errored+timeout" "errors=5" "$REAL_PARSE_OUT"
 rm -f "$REAL_JSON_FILE" /tmp/tardi-h2load-real-parse-result.txt
 
 echo ""
@@ -568,6 +573,54 @@ RUNSTOTAL_JSON="$(jq . /tmp/tardi-h3-runstotal-test.json)"
 check "one valid + one missing scrape: runs_total reflects both attempted runs (2)" '"runs_total": 2' "$RUNSTOTAL_JSON"
 check "one valid + one missing scrape: runs_with_data reflects only the observed one (1)" '"runs_with_data": 1' "$RUNSTOTAL_JSON"
 rm -f /tmp/tardi-h3-runstotal-test.json
+
+echo ""
+echo "==> Test 18: run_h2load falls back to text-table parsing when h2load lacks --output-file (pre-1.69 build) (#256-G review)"
+H2LOAD_RUNNER="$(source_functions "$RUN_SH" h2load_output_file_supported run_h2load extract_h2load_percentile_ms latency_value_to_ms)"
+# Synthetic pre-1.69 h2load text output: real historical baselines were
+# produced against this label/token layout (see commit 124c1d8e's
+# "failed: N" fix), not captured fresh from an installed old build — this
+# test is only exercising the capability-gating branch added here, not
+# re-verifying that decade-old parsing regex.
+FALLBACK_OUTPUT="$(bash -c "
+set -euo pipefail
+FAKE_LEGACY_H2LOAD_OUTPUT='finished in 3.00s, 1234.56 req/s, 1.20MB/s
+requests: 5000 total, 5000 started, 5000 done, 4995 succeeded, failed: 5, errored: 2, timeout: 1
+status codes: 4995 2xx, 0 3xx, 5 4xx, 0 5xx
+  50th percentile: 12.34 ms
+  95th percentile: 45.67 ms
+  99th percentile: 78.90 ms
+  99.9th percentile: 120.00 ms'
+h2load() {
+    if [[ \"\$1\" == \"--help\" ]]; then
+        echo 'usage: h2load [OPTIONS]... <URI>'
+        echo '  -c, --clients=N     ...'
+        return 0
+    fi
+    printf '%s\n' \"\$FAKE_LEGACY_H2LOAD_OUTPUT\"
+    return 0
+}
+USE_TLS=true; INSECURE=false; TOOL_HEADERS=(); CONNECTIONS=1; DURATION=1; THREADS=1
+CURRENT_CPU_PCT_AVG=null; CURRENT_RSS_MB_PEAK=null
+add_result() { echo \"add_result rps=\$2 p50=\$3 p95=\$4 p99=\$5 p999=\$6 errors=\$7 tput=\$8\"; }
+build_tool_headers() { :; }
+start_process_monitor() { :; }
+stop_process_monitor() { :; }
+${H2LOAD_RUNNER}
+run_h2load 'https://127.0.0.1:9443/health' 'static-http2'
+")"
+check "no --output-file build: prints an explicit fallback notice, not a silent switch" \
+    "falling back to text-table parsing" "$FALLBACK_OUTPUT"
+check "no --output-file build: rps parsed from legacy 'finished' line" \
+    "rps=1234.56" "$FALLBACK_OUTPUT"
+check "no --output-file build: p50 parsed from legacy '50th percentile' line" \
+    "p50=12.340" "$FALLBACK_OUTPUT"
+check "no --output-file build: p999 parsed from legacy '99.9th percentile' line" \
+    "p999=120.000" "$FALLBACK_OUTPUT"
+check "no --output-file build: errors parsed from legacy 'failed: N' token" \
+    "errors=5" "$FALLBACK_OUTPUT"
+check "no --output-file build: throughput parsed from legacy 'finished' line" \
+    "tput=1.20" "$FALLBACK_OUTPUT"
 
 echo ""
 echo "==> Test: existing HTTP/1 benchmark behavior does not regress (run.sh --help still documents http1 scenarios)"
