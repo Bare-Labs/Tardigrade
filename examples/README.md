@@ -25,6 +25,29 @@ is not represented here, check the
 | [production-baseline](production-baseline/README.md) | Full hardened deployment combining TLS, security headers, rate limiting, metrics, health checks, and drain. |
 | [bearclaw](bearclaw/README.md) | BearClaw-specific edge shape (product-specific; see support matrix). |
 
+## Generating a starter config
+
+`tardi init <profile>` (or the verbose `tardi config init --profile <profile>`)
+generates a minimal starter config for one of five common shapes, without
+hand-copying an example:
+
+| `tardi init` profile | Descriptive alias | Corresponding example |
+|---|---|---|
+| `static` | `static-site` | [static-file-server](static-file-server/README.md) |
+| `proxy` | `reverse-proxy` | [reverse-proxy](reverse-proxy/README.md) |
+| `tls` | `tls-termination` | [tls-termination](tls-termination/README.md) |
+| `metrics` | `metrics-enabled` | [prometheus-metrics](prometheus-metrics/README.md) |
+| `prod` | `production-baseline` | [production-baseline](production-baseline/README.md) |
+
+```bash
+./zig-out/bin/tardi init static > tardigrade.conf
+./zig-out/bin/tardi check ./tardigrade.conf
+```
+
+The generated starters are intentionally minimal; once a profile fits your
+deployment, use the corresponding example above (and its `README.md`) for the
+complete, copy/paste-runnable version with every relevant knob explained.
+
 ## How to run an example
 
 All examples follow the same pattern:

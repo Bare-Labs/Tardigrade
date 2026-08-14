@@ -147,6 +147,16 @@ jobs:
       - name: Run unit tests
         run: zig build test --summary all --error-style verbose
 
+      # #162: `tardi init <profile>` / `config init --profile` real
+      # generated-config validation, on the default/general (OpenSSL-adapter)
+      # profile this job otherwise never runs `check` against -- the
+      # appliance-profile job below covers the native-profile equivalent.
+      # One Linux leg of the matrix is enough; no need to multiply this
+      # across every OS the `test` job builds for.
+      - name: Run tardi init <profile> real generated-config validation (general profile)
+        if: matrix.os == 'ubuntu-latest'
+        run: zig build test-integration-init --summary all --error-style verbose
+
   # ── Appliance profile tests ──────────────────────────────────────────────────
   # The default `test` job above only exercises the general (OpenSSL-adapter)
   # profile: `requireNativeTlsProfile()` skips every native-listener/appliance
