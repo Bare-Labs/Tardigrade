@@ -1,0 +1,87 @@
+name: HTTP/3 competitive benchmark (heavy, manual/scheduled)
+
+# #256-G: full H3/QUIC benchmark matrix — small/large static, large streaming
+# reverse proxy, and the before/after UDP-buffer tuning comparison. This is
+# deliberately NOT part of default PR/push CI: shared runners are noisy and
+# not idle, so throughput numbers from here are evidence for a dedicated-host
+# run, not a pass/fail gate. See benchmarks/competitive/README.md's
+# "HTTP/3/QUIC Benchmarking" section for what each row means and how to
+# reproduce a run outside CI.
+#
+# The GitHub Actions runner image does not ship an H3-capable (QUIC-enabled)
+# h2load build. When one isn't available, the harness still runs cleanly and
+# records every H3 row as `"supported": false` with a reason — this workflow
+# exists to produce that evidence file on a schedule and keep the harness
+# itself exercised, not to guarantee HTTP/3 numbers land on every run. See
+# the competitive README for how to verify/build an H3-capable h2load
+# locally or on a dedicated host.
+#
+# Controlled loss/reordering (benchmarks/competitive/netem-impair.sh) is
+# intentionally NOT run here: it requires root/CAP_NET_ADMIN and is scoped to
+# manual/dedicated-host use, not shared CI runners.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "20 6 * * 1" # weekly, Monday 06:20 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: h3-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  h3-matrix:
+    name: H3/QUIC benchmark matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: sudo apt-get install -y libssl-dev wrk nghttp2-client jq
+
+      - name: Install Zig
+        run: sh ./scripts/install-zig.sh 0.16.0
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-h3-benchmark-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-${{ github.sha }}
+          restore-keys: |
+            zig-h3-benchmark-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
+            zig-h3-benchmark-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run the H3/QUIC competitive benchmark matrix
+        run: |
+          ./benchmarks/competitive/run.sh \
+            --servers tardigrade \
+            --duration 30 \
+            --connections 50 \
+            --threads 4 \
+            --tune-comparison \
+            --out-dir benchmarks/competitive/results/h3-ci-run
+
+      - name: Stage benchmark artifacts
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/h3-benchmark-artifacts"
+          cp -r benchmarks/competitive/results/h3-ci-run/. "$RUNNER_TEMP/h3-benchmark-artifacts/" 2>/dev/null || true
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: h3-benchmark-results
+          path: ${{ runner.temp }}/h3-benchmark-artifacts
+          if-no-files-found: error
+          retention-days: 30

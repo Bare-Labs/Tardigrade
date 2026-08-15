@@ -162,9 +162,44 @@ These measure raw request throughput and run with whichever tool is auto-detecte
 | `reload-under-load` | SIGHUP sent mid-run; measures degradation during reload | Requires `wrk` and a PID file |
 
 HTTP/3 scenarios require `h2load` built with QUIC support (`nghttp3` + `ngtcp2`). The runner
-detects this at runtime by checking whether `h2load --h3` is recognized; if not, the scenario
-prints a skip message and continues. HTTP/3 also requires TLS because QUIC mandates it —
-always pass `--tls` (and `--insecure` for self-signed certs) for HTTP/3 runs.
+detects this at runtime via `h2load_h3_supported()`, which checks both that `--h3` is
+recognized *and* that the binary is actually linked against `libngtcp2`/`libnghttp3`
+(`otool -L`/`ldd`) — flag recognition alone isn't reliable: the stock `apt`/`brew` `nghttp2`
+package accepts `--h3` syntactically but has no QUIC library linked, and silently falls back
+to a plain TCP connection instead of erroring. If either check fails, the scenario prints a
+skip message and continues. HTTP/3 also requires TLS because QUIC mandates it —
+always pass `--tls` for HTTP/3 runs. `--insecure` is still accepted and still applies to
+`wrk`/`fortio`/`k6`, but h2load itself has no certificate-verification flag at all (verified
+against a real nghttp2 1.69.0 build) — it never validates TLS certificates in the first
+place, so nothing needs to be skipped for the h2load-driven scenarios (`static-http2`,
+`proxy-http2`, `static-http3`, `proxy-http3`).
+
+`static-http2` and `proxy-http2` parse h2load's structured `--output-file=<path>` JSON
+export when it's available (nghttp2 1.69+, the same build that added `--h3`), and fall back
+to h2load's older text-table output when it isn't — plain HTTP/2 benchmarking never needs
+--h3/QUIC, so the runner doesn't require the build that added them. The active h2load
+version and both capability flags (`h2load_h3_supported`, `h2load_output_file_supported`) are
+recorded in each result's `_meta`, so a result produced by the text-table fallback path is
+never silently indistinguishable from one backed by the JSON export.
+
+When an H3 scenario completes, the runner also scrapes `--metrics-path` (default
+`/status/metrics`, requires Tardigrade metrics enabled) and attaches a `quic` sub-object to
+that scenario's result — packet/loss/PTO counts, effective PLPMTU, ECN state, and
+requested-vs-effective UDP socket buffer sizes (#256-G). The scrape itself is bracketed
+immediately before and after the load run and counter fields are delta'd, so the block
+measures only that one pass, not everything the listener has done since it started (a
+listener stays alive across an H3 readiness check and every scenario in a run).
+`quic` is omitted entirely (not null-filled) when the endpoint isn't reachable, exposes no
+QUIC series at all, or is missing any single required series — a partial scrape is treated as
+unobserved, never as a fabricated zero/default. Under `--runs > 1`, each run's scenario-local
+delta is preserved and aggregated once every run completes: counters sum across runs,
+gauges use the last run's state, and the result records `runs_total` (every attempted run,
+including ones where the scrape came back unobservable) alongside `runs_with_data` (how many
+actually had a QUIC delta) — a run whose scrape failed is never silently treated as if it had
+never happened. See
+[competitive/README.md](competitive/README.md#http3quic-benchmarking-256-g) for the canonical
+small/large/proxy H3 rows, the before/after UDP-buffer tuning comparison, controlled
+loss/reordering, and high-bandwidth/dedicated-host runs built on top of this.
 
 ### k6-only behavioral scenarios
 

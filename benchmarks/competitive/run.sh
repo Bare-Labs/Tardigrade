@@ -27,6 +27,13 @@ META_FILE="${COMP_DIR}/target.json"
 ALLOW_MISSING=false
 PRINT_MANUAL=false
 SMOKE=false
+# #256-G: the H3 benchmark-only listener. A dedicated port outside the
+# per-competitor block (LISTEN_BASE+0..3) and the upstream-pool-matrix range
+# (LISTEN_BASE+200.. / +300..) so it never collides with either.
+H3_LISTEN_OFFSET="250"
+H3_TLS_SERVER_NAME="tardigrade.test"
+TUNE_COMPARISON=false
+H3_TUNED_UDP_BUFFER_BYTES="4194304"
 TMP_DIR=""
 ORIGIN_PID=""
 EDGE_PID=""
@@ -60,6 +67,7 @@ while [[ $# -gt 0 ]]; do
             SERVERS="tardigrade"
             shift
             ;;
+        --tune-comparison) TUNE_COMPARISON=true; shift ;;
         --print-manual) PRINT_MANUAL=true; shift ;;
         --help)
             sed -n '2,80p' "$0" | sed 's/^# \{0,1\}//'
@@ -200,6 +208,106 @@ start_tardigrade() {
     EDGE_PID="$!"
 }
 
+# #256-G: benchmark-only local TLS identity for the H3 listener, generated
+# fresh per run with the repository's existing interop cert tooling — never a
+# checked-in or developer-machine path. `scripts/interop/gen-certs.sh` writes
+# three identities; only the Ed25519 one is used here (the native stack's
+# default profile).
+generate_h3_certs() {
+    local dir="$1"
+    "${REPO_ROOT}/scripts/interop/gen-certs.sh" "${dir}/certs" >/dev/null
+}
+
+# #256-G: a second, TLS+HTTP/3-enabled Tardigrade listener alongside the
+# plaintext HTTP/1.1 config the rest of this harness uses. Extra positional
+# args after `port` are passed through as additional environment assignments
+# (`env NAME=VALUE ...`) — used by the tuned-vs-baseline UDP buffer
+# comparison to override `TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES` /
+# `_SEND_BUFFER_BYTES` without a second config template.
+start_tardigrade_http3() {
+    ensure_tardigrade_binary
+    local port="$1"
+    shift
+    local extra_env=("$@")
+    local dir="${TMP_DIR}/tardigrade-http3"
+    mkdir -p "$dir"
+    generate_h3_certs "$dir"
+    local cert="${dir}/certs/ed25519-cert.pem"
+    local key="${dir}/certs/ed25519-key.pem"
+    sed \
+        -e "s|__LISTEN_PORT__|${port}|g" \
+        -e "s|__UPSTREAM_PORT__|${UPSTREAM_PORT}|g" \
+        -e "s|__STATIC_ROOT__|${TMP_DIR}/public|g" \
+        -e "s|__PID_FILE__|${dir}/tardigrade.pid|g" \
+        -e "s|__TLS_SERVER_NAME__|${H3_TLS_SERVER_NAME}|g" \
+        -e "s|__TLS_CERT_PATH__|${cert}|g" \
+        -e "s|__TLS_KEY_PATH__|${key}|g" \
+        "${CONFIG_DIR}/tardigrade-http3.conf.in" > "${dir}/tardigrade.conf"
+    env \
+        TARDIGRADE_RATE_LIMIT_RPS=0 \
+        TARDIGRADE_PROXY_STREAMING_MODE=response \
+        TARDIGRADE_HTTP3_ENABLED=true \
+        TARDIGRADE_QUIC_PORT="$port" \
+        TARDIGRADE_TLS_SERVER_NAME="$H3_TLS_SERVER_NAME" \
+        TARDIGRADE_HTTP3_ALT_SVC=auto \
+        ${extra_env[@]+"${extra_env[@]}"} \
+        "$BINARY" run -c "${dir}/tardigrade.conf" >"${dir}/server.log" 2>&1 &
+    EDGE_PID="$!"
+}
+
+wait_for_https() {
+    local url="$1"
+    local attempts="${2:-60}"
+    local delay="${3:-0.2}"
+    local host_header="${4:-}"
+    local extra=()
+    [[ -n "$host_header" ]] && extra+=(-H "Host: ${host_header}")
+    local i
+    for ((i = 0; i < attempts; i += 1)); do
+        if curl -k -fsS "${extra[@]+"${extra[@]}"}" "$url" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep "$delay"
+    done
+    echo "Timed out waiting for ${url}" >&2
+    return 1
+}
+
+# #256-G: "the process started" is not proof HTTP/3 is operational — the TLS
+# port can come up while the QUIC/UDP side is misconfigured. Send one real
+# HTTP/3 request over the actual load tool before any H3 result is recorded.
+#
+# Review note: this used to also check `h2load --h3 --help` itself and treat
+# that failure the same as a failed request — conflating "this environment
+# has no HTTP/3-capable load generator" (a legitimate `supported: false`)
+# with "Tardigrade's QUIC listener didn't answer" (a product regression).
+# Callers now check `h2load_h3_supported` *before* calling this, so a
+# failure here always means the second case.
+verify_h3_listener() {
+    local port="$1"
+    local url="https://127.0.0.1:${port}/health"
+    local raw succeeded failed
+    # #256-G review: h2load has no --insecure/verify-skip flag at all
+    # (verified against a real nghttp2 1.69.0 build) — it never validates
+    # TLS certificates in the first place, and passing an option it doesn't
+    # recognize makes it exit immediately, which this loop would otherwise
+    # misreport as "the listener didn't answer."
+    # #256-G review: the benchmark config's `server_name` is
+    # $H3_TLS_SERVER_NAME, not the 127.0.0.1 literal in $url — H3 dispatch
+    # resolves routes off :authority, so without this header every request
+    # here 404s before reaching /health regardless of whether QUIC itself
+    # negotiated correctly.
+    raw=$(h2load --h3 -n 1 -c 1 -H "Host: ${H3_TLS_SERVER_NAME}" "$url" 2>&1) || true
+    succeeded=$(printf '%s\n' "$raw" | grep -oE '[0-9]+ succeeded' | grep -oE '^[0-9]+' | head -1)
+    failed=$(printf '%s\n' "$raw" | grep -oE '[0-9]+ failed' | grep -oE '^[0-9]+' | head -1)
+    if [[ "${succeeded:-0}" -lt 1 || "${failed:-1}" -gt 0 ]]; then
+        echo "  H3/QUIC listener at ${url} did not answer a real HTTP/3 request; client capability was already verified, so the benchmark run will fail." >&2
+        printf '%s\n' "$raw" | tail -20 >&2
+        return 1
+    fi
+    return 0
+}
+
 start_nginx() {
     local port="$1"
     local dir="${TMP_DIR}/nginx"
@@ -336,6 +444,31 @@ udp_buffer_metadata_json() {
     fi
 }
 
+# #256-G review: `h2load --h3 --help` only proves the binary recognizes the
+# flag syntactically. A build with no QUIC library linked at all — e.g. the
+# stock Homebrew/apt nghttp2 package, which has no ngtcp2/nghttp3 build
+# option — still passes that check, then silently negotiates a degraded TCP
+# connection offering ALPN "h3" (only ever valid over QUIC/UDP), which a
+# correct H3 server must reject. That reject looks identical to a real
+# Tardigrade H3 regression unless this check can tell the two apart, so also
+# confirm the binary is actually linked against a QUIC library — best
+# effort: a statically-linked QUIC build won't show up here and is treated
+# as unsupported, so this can produce false negatives but not the false
+# positive that motivated it.
+h2load_h3_supported() {
+    command -v h2load >/dev/null 2>&1 || return 1
+    h2load --h3 --help >/dev/null 2>&1 || return 1
+    local h2load_path
+    h2load_path="$(command -v h2load)"
+    if command -v otool >/dev/null 2>&1; then
+        otool -L "$h2load_path" 2>/dev/null | grep -qiE 'libngtcp2|libnghttp3'
+    elif command -v ldd >/dev/null 2>&1; then
+        ldd "$h2load_path" 2>/dev/null | grep -qiE 'libngtcp2|libnghttp3'
+    else
+        return 0
+    fi
+}
+
 host_metadata_json() {
     jq -n \
         --arg load_tool "$TOOL" \
@@ -346,6 +479,8 @@ host_metadata_json() {
         --argjson udp_buffers "$(udp_buffer_metadata_json)" \
         --arg tardigrade_build_flags "$TARDIGRADE_BUILD_FLAGS" \
         --argjson tardigrade_binary_explicit "$($BINARY_EXPLICIT && echo true || echo false)" \
+        --arg h2load_version "$(tool_version h2load)" \
+        --argjson h2load_h3_supported "$(h2load_h3_supported && echo true || echo false)" \
         '{
             load_tool: $load_tool,
             load_tool_version: $load_tool_version,
@@ -360,6 +495,10 @@ host_metadata_json() {
             tardigrade: {
                 build_flags: $tardigrade_build_flags,
                 binary_explicit: $tardigrade_binary_explicit
+            },
+            h2load: {
+                version: $h2load_version,
+                h3_supported: $h2load_h3_supported
             }
         }'
 }
@@ -528,9 +667,14 @@ wrk_error_count() {
 assert_payload_size() {
     local url="$1"
     local expected_bytes="$2"
+    local host_header="${3:-}"
     local tmp actual_bytes
     tmp="$(mktemp /tmp/tardigrade-competitive-payload-XXXX)"
-    curl -fsS "$url" -o "$tmp"
+    local extra=()
+    [[ -n "$host_header" ]] && extra+=(-H "Host: ${host_header}")
+    # -k is a no-op for plain http:// URLs; needed for the benchmark-only
+    # self-signed H3 listener's https:// URLs (#256-G).
+    curl -k -fsS "${extra[@]+"${extra[@]}"}" "$url" -o "$tmp"
     actual_bytes="$(wc -c < "$tmp" | tr -d '[:space:]')"
     rm -f "$tmp"
     if [[ "$actual_bytes" != "$expected_bytes" ]]; then
@@ -571,6 +715,10 @@ rename_pass_json() {
             elif $pass == "large-proxy" and .key == "proxy-http1" then .key = "proxy-large-http1" | .
             elif $pass == "slow-client" and .key == "proxy-slow-client-download" then .key = "proxy-slow-client-download" | .
             elif $pass == "idle-keepalive" and .key == "keepalive-starvation" then .key = "idle-keepalive-active-traffic" | .
+            elif $pass == "static-small-h3" and .key == "static-http3" then .key = "static-small-http3" | .
+            elif $pass == "static-large-h3" and .key == "static-http3" then .key = "static-large-http3" | .
+            elif $pass == "proxy-large-h3" and .key == "proxy-http3" then .key = "proxy-large-http3" | .
+            elif $pass == "static-small-h3-tuned" and .key == "static-http3" then .key = "static-small-http3-tuned" | .
             else .
             end
         )' "$input" > "$output"
@@ -607,6 +755,129 @@ run_benchmark_pass() {
         --scenarios "$scenarios" \
         --save "$raw"
     rename_pass_json "$raw" "$renamed" "$server" "$pass"
+}
+
+# #256-G: H3-specific pass runner — forces --tool h2load (the only driver
+# benchmarks/run.sh can speak HTTP/3 with) and --tls --insecure (the
+# benchmark-only cert is self-signed for this host). Otherwise mirrors
+# run_benchmark_pass, including the raw/renamed/rename_pass_json flow.
+run_benchmark_pass_h3() {
+    local server="$1"
+    local port="$2"
+    local pass="$3"
+    local scenarios="$4"
+    local h3_path="$5"
+    local proxy_path="$6"
+    local raw="${OUT_DIR}/${server}-${pass}.raw.json"
+    local renamed="${OUT_DIR}/${server}-${pass}.json"
+
+    "${BENCH_DIR}/run.sh" \
+        --tool h2load \
+        --host 127.0.0.1 \
+        --port "$port" \
+        --host-header "$H3_TLS_SERVER_NAME" \
+        --tls \
+        --insecure \
+        --driver "competitive-loopback" \
+        --config-label "${server}" \
+        --pid "$EDGE_PID" \
+        --pid-tree \
+        --meta-file "$META_FILE" \
+        --duration "$DURATION" \
+        --connections "$CONNECTIONS" \
+        --threads "$THREADS" \
+        --h3-path "$h3_path" \
+        --proxy-path "$proxy_path" \
+        --scenarios "$scenarios" \
+        --save "$raw"
+    rename_pass_json "$raw" "$renamed" "$server" "$pass"
+}
+
+# #256-G review: dumps the H3 listener's logs to stderr for diagnosis. Split
+# out because both the readiness and the (post-capability) hard-failure
+# paths in run_tardigrade_http3_matrix need it.
+dump_h3_logs() {
+    find "${TMP_DIR}/tardigrade-http3" -maxdepth 1 -name '*.log' -print -exec tail -60 {} \; >&2 || true
+}
+
+# #256-G: canonical H3 rows for the `tardigrade` server — small/large static
+# object, large streaming reverse proxy, and (opt-in) a before/after UDP
+# socket buffer tuning comparison. Runs its own dedicated TLS+H3 listener
+# rather than reusing the plaintext HTTP/1.1 instance the rest of this
+# harness drives, since HTTP/3 needs TLS credentials and a QUIC port the
+# plaintext config does not have. Writes `${OUT_DIR}/tardigrade-<pass>.json`
+# files and re-runs `combine_server_results tardigrade` so they land in the
+# same combined `tardigrade.json` the HTTP/1.1 passes already wrote.
+#
+# Review note: this used to treat "h2load can't speak HTTP/3" and "Tardigrade's
+# QUIC listener didn't come up/answer" identically — both wrote unsupported
+# rows and returned 0, so a real Tardigrade H3 regression could go unnoticed
+# behind a green run. Client capability is now checked *first* and is the
+# only case that is a soft `supported: false`; every failure after that is a
+# product-side failure and aborts the run (`return 1` under this script's
+# `set -e`, which the trap on EXIT still cleans up after).
+run_tardigrade_http3_matrix() {
+    local port=$((LISTEN_BASE + H3_LISTEN_OFFSET))
+    echo ""
+    echo "== tardigrade-http3 (${port}) =="
+
+    if ! h2load_h3_supported; then
+        echo "  h2load on this host does not support --h3 (HTTP/3/QUIC) — H3 rows will be marked unsupported." >&2
+        write_unsupported_result "tardigrade" "static-small-http3" "h2load on this host does not support HTTP/3 (no QUIC-enabled build)." "${OUT_DIR}/tardigrade-static-small-h3.json"
+        write_unsupported_result "tardigrade" "static-large-http3" "h2load on this host does not support HTTP/3 (no QUIC-enabled build)." "${OUT_DIR}/tardigrade-static-large-h3.json"
+        write_unsupported_result "tardigrade" "proxy-large-http3" "h2load on this host does not support HTTP/3 (no QUIC-enabled build)." "${OUT_DIR}/tardigrade-proxy-large-h3.json"
+        combine_server_results "tardigrade"
+        return 0
+    fi
+    echo "h2load supports HTTP/3 on this host — any Tardigrade H3 failure from here is a product regression, not an environment limitation, and fails this run."
+
+    start_tardigrade_http3 "$port"
+    if ! wait_for_https "https://127.0.0.1:${port}/health" 60 0.2 "$H3_TLS_SERVER_NAME"; then
+        echo "  tardigrade did not come up with HTTP/3 enabled." >&2
+        dump_h3_logs
+        cleanup_edge
+        return 1
+    fi
+    assert_payload_size "https://127.0.0.1:${port}/tiny.txt" 3 "$H3_TLS_SERVER_NAME"
+    assert_payload_size "https://127.0.0.1:${port}/large.bin" 1048576 "$H3_TLS_SERVER_NAME"
+    assert_payload_size "https://127.0.0.1:${port}/proxy/payload-1m.bin" 1048576 "$H3_TLS_SERVER_NAME"
+
+    if ! verify_h3_listener "$port"; then
+        echo "  H3/QUIC listener did not answer a real HTTP/3 request." >&2
+        dump_h3_logs
+        cleanup_edge
+        return 1
+    fi
+
+    echo "H3/QUIC listener verified — recording H3 results."
+    run_benchmark_pass_h3 "tardigrade" "$port" "static-small-h3" "static-http3" "/tiny.txt" "/proxy/health"
+    if ! $SMOKE; then
+        run_benchmark_pass_h3 "tardigrade" "$port" "static-large-h3" "static-http3" "/large.bin" "/proxy/health"
+        run_benchmark_pass_h3 "tardigrade" "$port" "proxy-large-h3" "proxy-http3" "/tiny.txt" "/proxy/payload-1m.bin"
+    fi
+    cleanup_edge
+
+    if $TUNE_COMPARISON && ! $SMOKE; then
+        echo ""
+        echo "== tardigrade-http3 tuned UDP buffers (${port}) =="
+        start_tardigrade_http3 "$port" \
+            "TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES=${H3_TUNED_UDP_BUFFER_BYTES}" \
+            "TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES=${H3_TUNED_UDP_BUFFER_BYTES}"
+        if ! wait_for_https "https://127.0.0.1:${port}/health" 60 0.2 "$H3_TLS_SERVER_NAME" || ! verify_h3_listener "$port"; then
+            # Baseline H3 already proved the client is capable and the
+            # untuned listener works — a tuned-listener failure here is the
+            # same kind of product regression as the baseline checks above,
+            # not a reason to quietly drop the comparison row.
+            echo "  Tuned-buffer listener did not come up cleanly (baseline H3 already verified — this is a real failure)." >&2
+            dump_h3_logs
+            cleanup_edge
+            return 1
+        fi
+        run_benchmark_pass_h3 "tardigrade" "$port" "static-small-h3-tuned" "static-http3" "/tiny.txt" "/proxy/health"
+        cleanup_edge
+    fi
+
+    combine_server_results "tardigrade"
 }
 
 run_connection_churn() {
@@ -736,6 +1007,15 @@ combine_server_results() {
     if [[ -f "${OUT_DIR}/${server}-connection-churn.json" ]]; then
         inputs+=("${OUT_DIR}/${server}-connection-churn.json")
     fi
+    # #256-G: H3 rows, present only for `tardigrade` and only when the H3
+    # matrix actually ran (verified listener) or explicitly recorded as
+    # unsupported — never silently absent.
+    local h3_pass
+    for h3_pass in static-small-h3 static-large-h3 proxy-large-h3 static-small-h3-tuned; do
+        if [[ -f "${OUT_DIR}/${server}-${h3_pass}.json" ]]; then
+            inputs+=("${OUT_DIR}/${server}-${h3_pass}.json")
+        fi
+    done
     if [[ ${#inputs[@]} -eq 0 ]]; then
         echo "No normalized pass results found for ${server}" >&2
         exit 1
@@ -809,34 +1089,41 @@ write_combined_outputs() {
         "${server_files[@]}" > "$combined_json"
 
     jq -r '
-        ["server","scenario","supported","reason","rps","p50_ms","p95_ms","p99_ms","p999_ms","p99_ttfb_ms","throughput_mbps","cpu_pct_avg","cpu_ms_per_request","rss_mb_peak","open_fds_peak","errors","pool_lock_wait_ns_per_request","pool_lock_wait_ns_per_acquire"],
+        ["server","scenario","supported","reason","rps","p50_ms","p95_ms","p99_ms","p999_ms","p99_ttfb_ms","throughput_mbps","cpu_pct_avg","cpu_ms_per_request","rss_mb_peak","open_fds_peak","errors","pool_lock_wait_ns_per_request","pool_lock_wait_ns_per_acquire","quic_packets_sent","quic_packets_lost","quic_pto_total","quic_effective_plpmtu_last_bytes","quic_ecn_enabled","quic_udp_recv_buffer_status","quic_udp_send_buffer_status"],
         (.servers | to_entries[] as $server |
             $server.value | to_entries[] |
             select(.key != "_meta") |
             [$server.key, .key, (.value.supported // true), (.value.reason // null), (.value.rps // null), (.value.p50_ms // null), (.value.p95_ms // null),
              (.value.p99_ms // null), (.value.p999_ms // null), (.value.p99_ttfb_ms // null), (.value.throughput_mbps // null),
-             (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null), null, null]),
+             (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null), null, null,
+             (.value.quic.packets_sent // null), (.value.quic.packets_lost // null), (.value.quic.pto_total // null),
+             (.value.quic.effective_plpmtu.last_bytes // null), (.value.quic.ecn.enabled // null),
+             (.value.quic.udp_buffers.recv.status // null), (.value.quic.udp_buffers.send.status // null)]),
         (if .upstream_pool_matrix != null then
             (.upstream_pool_matrix.scenarios | to_entries[] |
                 ["tardigrade", ("upstream-pool/" + .key), (.value.covered // .value.supported // true), (.value.reason // .value.sharding_note // null),
                  (.value.rps // null), null, null, (.value.p99_ms // null), null, (.value.p99_ttfb_ms // null), null,
                  (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null),
-                 (.value.pool_lock_wait_ns_per_request // null), (.value.pool_lock_wait_ns_per_acquire // null)]),
+                 (.value.pool_lock_wait_ns_per_request // null), (.value.pool_lock_wait_ns_per_acquire // null),
+                 null, null, null, null, null, null, null]),
             (.upstream_pool_matrix.scenarios["uneven-route-distribution"].routes // {} | to_entries[] |
                 ["tardigrade", ("upstream-pool/uneven/" + .key), (.value.covered // true), (.value.reason // null),
                  (.value.rps // null), null, null, (.value.p99_ms // null), null, (.value.p99_ttfb_ms // null), null,
                  (.value.cpu_pct_avg // null), (.value.cpu_ms_per_request // null), (.value.rss_mb_peak // null), (.value.open_fds_peak // null), (.value.errors // null),
-                 (.value.pool_lock_wait_ns_per_request // null), (.value.pool_lock_wait_ns_per_acquire // null)]),
+                 (.value.pool_lock_wait_ns_per_request // null), (.value.pool_lock_wait_ns_per_acquire // null),
+                 null, null, null, null, null, null, null]),
             (.upstream_pool_matrix.scenarios["many-origins-low-volume"].measurements // [] | .[] |
                 ["tardigrade", ("upstream-pool/origin/" + (.origin // "unknown")), (.covered // true), (.reason // null),
                  (.rps // null), null, null, (.p99_ms // null), null, (.p99_ttfb_ms // null), null,
                  (.cpu_pct_avg // null), (.cpu_ms_per_request // null), (.rss_mb_peak // null), (.open_fds_peak // null), (.errors // null),
-                 (.pool_lock_wait_ns_per_request // null), (.pool_lock_wait_ns_per_acquire // null)]),
+                 (.pool_lock_wait_ns_per_request // null), (.pool_lock_wait_ns_per_acquire // null),
+                 null, null, null, null, null, null, null]),
             (.upstream_pool_matrix.scenarios["pool-contention"].measurements // [] | .[] |
                 ["tardigrade", ("upstream-pool/contention/" + ((.worker_threads // 0) | tostring) + "w"), (.covered // true), (.reason // null),
                  (.rps // null), null, null, (.p99_ms // null), null, (.p99_ttfb_ms // null), null,
                  (.cpu_pct_avg // null), (.cpu_ms_per_request // null), (.rss_mb_peak // null), (.open_fds_peak // null), (.errors // null),
-                 (.pool_lock_wait_ns_per_request // null), (.pool_lock_wait_ns_per_acquire // null)])
+                 (.pool_lock_wait_ns_per_request // null), (.pool_lock_wait_ns_per_acquire // null),
+                 null, null, null, null, null, null, null])
          else empty end)
         | @csv
     ' "$combined_json" > "$csv"
@@ -858,6 +1145,22 @@ write_combined_outputs() {
                 "| `\($server.key)` | `\(.key)` | yes | \((.value.rps // 0) | floor) | \(.value.p50_ms // "-") | \(.value.p95_ms // "-") | \(.value.p99_ms // "-") | \(.value.p999_ms // "-") | \(.value.p99_ttfb_ms // "-") | \(.value.throughput_mbps // "-") | \(.value.cpu_pct_avg // "-") | \(.value.rss_mb_peak // "-") | \(.value.open_fds_peak // "-") | \(.value.errors // 0) |"
             end
         ' "$combined_json"
+        if jq -e '[.servers[] | to_entries[] | select(.value.quic != null)] | length > 0' "$combined_json" >/dev/null; then
+            echo ""
+            echo "## H3/QUIC Transport State (#256-G)"
+            echo ""
+            echo "Requested vs effective/granted UDP buffer sizes are never the same number — see [docs/HTTP3_ROLLOUT.md](../../../docs/HTTP3_ROLLOUT.md#socket-buffers)."
+            echo ""
+            echo "| Scenario | Packets sent | Packets received | Packets lost | PTO | Effective PLPMTU (last / listener-lifetime min-max) | PMTU probes | Black holes | ECN enabled | ECN CE received | RCVBUF req/eff/granted (status) | SNDBUF req/eff/granted (status) |"
+            echo "| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | ---: | --- | --- |"
+            jq -r '
+                .servers | to_entries[] as $server |
+                $server.value | to_entries[] |
+                select(.value.quic != null) |
+                .value.quic as $q |
+                "| `\(.key)` | \($q.packets_sent) | \($q.packets_received) | \($q.packets_lost) | \($q.pto_total) | \($q.effective_plpmtu.last_bytes) / \($q.effective_plpmtu.lifetime_min_bytes)-\($q.effective_plpmtu.lifetime_max_bytes) | \($q.pmtu_probes) | \($q.pmtu_black_holes) | \($q.ecn.enabled) | \($q.ecn.ce_received) | \($q.udp_buffers.recv.requested_bytes)/\($q.udp_buffers.recv.effective_bytes)/\($q.udp_buffers.recv.granted_bytes) (\($q.udp_buffers.recv.status)) | \($q.udp_buffers.send.requested_bytes)/\($q.udp_buffers.send.effective_bytes)/\($q.udp_buffers.send.granted_bytes) (\($q.udp_buffers.send.status)) |"
+            ' "$combined_json"
+        fi
         if jq -e '.upstream_pool_matrix != null' "$combined_json" >/dev/null; then
             echo ""
             echo "## Upstream Pool Matrix"
@@ -915,11 +1218,14 @@ require_tool jq
 require_tool curl
 require_tool python3
 require_tool "$TOOL"
+if [[ ",$SERVERS," == *",tardigrade,"* ]]; then
+    # #256-G: the H3 matrix (run_tardigrade_http3_matrix) needs openssl to
+    # generate a benchmark-only local TLS identity, and runs even under
+    # --smoke (bounded there), so this is no longer smoke-conditional.
+    require_tool openssl
+fi
 if ! $SMOKE; then
     require_tool k6
-    if [[ ",$SERVERS," == *",tardigrade,"* ]]; then
-        require_tool openssl
-    fi
 fi
 
 IFS=',' read -r -a SERVER_LIST <<< "$SERVERS"
@@ -993,6 +1299,14 @@ for index in "${!SERVER_LIST[@]}"; do
     combine_server_results "$server"
     cleanup_edge
 done
+
+if selected_tardigrade; then
+    # #256-G: runs even under --smoke — bounded there because $DURATION/
+    # $CONNECTIONS/$THREADS are already reduced to 2s/1/1 and the
+    # large/proxy/tuned rows are skipped, leaving only "config renders,
+    # Tardigrade launches with TLS+H3, one real H3 request succeeds."
+    run_tardigrade_http3_matrix
+fi
 
 if ! $SMOKE && selected_tardigrade; then
     "${COMP_DIR}/upstream-pool-matrix.sh" \

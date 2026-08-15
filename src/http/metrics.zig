@@ -108,6 +108,24 @@ pub const QuicZeroRttPacketOutcome = enum {
 pub const QuicHandshakeFailureStage = enum { initial, handshake };
 pub const QuicFlowControlScope = enum { connection, stream };
 
+/// #256-D/#256-G: mirrors `quic.udp.BufferTuningStatus` without this module
+/// depending on the `quic` package — `GatewayState.overlayQuicTransportSnapshot`
+/// translates between the two. See that struct's doc comment for what each
+/// value means; the short version is "no request" / "kernel gave you at
+/// least what you asked" / "kernel gave you less" / "accepted but couldn't
+/// read back" / "kernel refused outright".
+pub const QuicUdpBufferStatus = enum { default, applied, clamped, unverified, unsupported };
+
+fn quicUdpBufferStatusLabel(status: QuicUdpBufferStatus) []const u8 {
+    return switch (status) {
+        .default => "default",
+        .applied => "applied",
+        .clamped => "clamped",
+        .unverified => "unverified",
+        .unsupported => "unsupported",
+    };
+}
+
 pub const QuicTransportDelta = struct {
     retry: u64 = 0,
     amplification_blocked: u64 = 0,
@@ -325,6 +343,43 @@ pub const Metrics = struct {
     quic_stream_resets_total: u64,
     quic_flow_control_blocked_total: [quic_flow_control_scope_count]u64,
     quic_deprotection_failures_total: u64,
+    /// #256-G: populated at render time from `http3_runtime.Snapshot` by
+    /// `GatewayState.overlayQuicTransportSnapshot` (mirrors how
+    /// `overlayUpstreamPoolStats` overlays the upstream pool's own live
+    /// stats), not accumulated via `recordQuicTransportDelta` — the runtime
+    /// snapshot is already the authoritative accumulator for these fields,
+    /// so there is no second counter to keep in sync.
+    quic_packets_sent_total: u64,
+    quic_packets_received_total: u64,
+    quic_pmtu_probes_sent_total: u64,
+    quic_pmtu_black_holes_total: u64,
+    /// See `http3_runtime.Snapshot.plpmtu_last_bytes` / `_min_bytes` / `_max_bytes`
+    /// for exactly what these three mean — not a single listener-wide "the
+    /// PLPMTU".
+    quic_effective_plpmtu_bytes_last: u64,
+    quic_effective_plpmtu_bytes_lifetime_min: u64,
+    quic_effective_plpmtu_bytes_lifetime_max: u64,
+    /// 0/1 gauge: whether ECN is actually running on this listener right now.
+    quic_ecn_enabled: u64,
+    quic_ecn_marked_sent_total: u64,
+    quic_ecn_paths_validated_total: u64,
+    quic_ecn_paths_disabled_total: u64,
+    quic_ecn_ce_received_total: u64,
+    /// #256-D/#256-G: requested vs kernel-effective/granted UDP socket
+    /// buffer sizes, read back via `getsockopt` at bind time. 0 means
+    /// "nothing was explicitly requested" (kernel default in effect) for the
+    /// `_requested_bytes` fields, or "not read back" for `_effective_bytes`/
+    /// `_granted_bytes` — never a real socket buffer size on any platform
+    /// this transport runs on. Do not infer one from the other: `status`
+    /// says whether the request was granted, clamped, or refused.
+    quic_udp_recv_buffer_requested_bytes: u64,
+    quic_udp_recv_buffer_effective_bytes: u64,
+    quic_udp_recv_buffer_granted_bytes: u64,
+    quic_udp_recv_buffer_status: QuicUdpBufferStatus,
+    quic_udp_send_buffer_requested_bytes: u64,
+    quic_udp_send_buffer_effective_bytes: u64,
+    quic_udp_send_buffer_granted_bytes: u64,
+    quic_udp_send_buffer_status: QuicUdpBufferStatus,
     h3_requests_total: u64,
     h3_request_latency_le_1ms: u64,
     h3_request_latency_le_5ms: u64,
@@ -495,6 +550,26 @@ pub const Metrics = struct {
             .quic_stream_resets_total = 0,
             .quic_flow_control_blocked_total = .{0} ** quic_flow_control_scope_count,
             .quic_deprotection_failures_total = 0,
+            .quic_packets_sent_total = 0,
+            .quic_packets_received_total = 0,
+            .quic_pmtu_probes_sent_total = 0,
+            .quic_pmtu_black_holes_total = 0,
+            .quic_effective_plpmtu_bytes_last = 0,
+            .quic_effective_plpmtu_bytes_lifetime_min = 0,
+            .quic_effective_plpmtu_bytes_lifetime_max = 0,
+            .quic_ecn_enabled = 0,
+            .quic_ecn_marked_sent_total = 0,
+            .quic_ecn_paths_validated_total = 0,
+            .quic_ecn_paths_disabled_total = 0,
+            .quic_ecn_ce_received_total = 0,
+            .quic_udp_recv_buffer_requested_bytes = 0,
+            .quic_udp_recv_buffer_effective_bytes = 0,
+            .quic_udp_recv_buffer_granted_bytes = 0,
+            .quic_udp_recv_buffer_status = .default,
+            .quic_udp_send_buffer_requested_bytes = 0,
+            .quic_udp_send_buffer_effective_bytes = 0,
+            .quic_udp_send_buffer_granted_bytes = 0,
+            .quic_udp_send_buffer_status = .default,
             .h3_requests_total = 0,
             .h3_request_latency_le_1ms = 0,
             .h3_request_latency_le_5ms = 0,
@@ -1939,6 +2014,8 @@ pub const Metrics = struct {
             });
         }
 
+        try self.appendQuicPmtuEcnBufferPrometheus(out);
+
         try out.appendSlice(
             \\# HELP tardigrade_h3_request_latency_ms HTTP/3 request latency in milliseconds
             \\# TYPE tardigrade_h3_request_latency_ms histogram
@@ -1958,6 +2035,101 @@ pub const Metrics = struct {
             \\tardigrade_h3_request_latency_ms_count {d}
             \\
         , .{ self.h3_request_latency_sum_ms, self.h3_request_latency_count });
+    }
+
+    /// #256-G: benchmark/status-facing bridge for state that #256-A..E
+    /// already compute per-connection or per-listener but never exported to
+    /// Prometheus — packet counts, DPLPMTUD probe/black-hole counts and the
+    /// effective PLPMTU, ECN state/counters, and requested-vs-effective UDP
+    /// socket buffer sizes. All values are populated at render time from
+    /// `http3_runtime.Snapshot` by `GatewayState.overlayQuicTransportSnapshot`;
+    /// no peer address, connection ID, or other high-cardinality label is
+    /// ever attached to any of these series. #255 remains the canonical
+    /// owner of QUIC/H3 observability generally — this is the smallest
+    /// bridge needed to make existing #256 transport state benchmark-visible,
+    /// not a competing metrics subsystem.
+    fn appendQuicPmtuEcnBufferPrometheus(self: *const Metrics, out: *std.array_list.Managed(u8)) !void {
+        try out.print(
+            \\# HELP tardigrade_quic_packets_sent_total QUIC packets sent by this listener
+            \\# TYPE tardigrade_quic_packets_sent_total counter
+            \\tardigrade_quic_packets_sent_total {d}
+            \\# HELP tardigrade_quic_packets_received_total QUIC packets received by this listener
+            \\# TYPE tardigrade_quic_packets_received_total counter
+            \\tardigrade_quic_packets_received_total {d}
+            \\# HELP tardigrade_quic_pmtu_probes_total DPLPMTUD probe packets sent (#256-B)
+            \\# TYPE tardigrade_quic_pmtu_probes_total counter
+            \\tardigrade_quic_pmtu_probes_total {d}
+            \\# HELP tardigrade_quic_pmtu_black_holes_total DPLPMTUD black-hole fallbacks triggered (#256-B)
+            \\# TYPE tardigrade_quic_pmtu_black_holes_total counter
+            \\tardigrade_quic_pmtu_black_holes_total {d}
+            \\# HELP tardigrade_quic_effective_plpmtu_bytes_last Active-path PLPMTU of the most recently folded connection. Not a listener-wide aggregate — see http3_runtime.Snapshot doc comment.
+            \\# TYPE tardigrade_quic_effective_plpmtu_bytes_last gauge
+            \\tardigrade_quic_effective_plpmtu_bytes_last {d}
+            \\# HELP tardigrade_quic_effective_plpmtu_bytes_lifetime_min Smallest active-path PLPMTU observed since this listener started. Never resets and is NOT scoped to any single benchmark scenario or pass — do not read this as evidence of path convergence within one run.
+            \\# TYPE tardigrade_quic_effective_plpmtu_bytes_lifetime_min gauge
+            \\tardigrade_quic_effective_plpmtu_bytes_lifetime_min {d}
+            \\# HELP tardigrade_quic_effective_plpmtu_bytes_lifetime_max Largest active-path PLPMTU observed since this listener started. Never resets and is NOT scoped to any single benchmark scenario or pass.
+            \\# TYPE tardigrade_quic_effective_plpmtu_bytes_lifetime_max gauge
+            \\tardigrade_quic_effective_plpmtu_bytes_lifetime_max {d}
+            \\# HELP tardigrade_quic_ecn_enabled Whether ECN is running on this listener (operator requested it and the kernel agreed)
+            \\# TYPE tardigrade_quic_ecn_enabled gauge
+            \\tardigrade_quic_ecn_enabled {d}
+            \\# HELP tardigrade_quic_ecn_marked_sent_total ECT-marked packets sent (#256-E)
+            \\# TYPE tardigrade_quic_ecn_marked_sent_total counter
+            \\tardigrade_quic_ecn_marked_sent_total {d}
+            \\# HELP tardigrade_quic_ecn_paths_validated_total Paths that validated peer ECN feedback (#256-E)
+            \\# TYPE tardigrade_quic_ecn_paths_validated_total counter
+            \\tardigrade_quic_ecn_paths_validated_total {d}
+            \\# HELP tardigrade_quic_ecn_paths_disabled_total Paths that disabled ECN after failed validation (#256-E); non-zero is expected on the open internet
+            \\# TYPE tardigrade_quic_ecn_paths_disabled_total counter
+            \\tardigrade_quic_ecn_paths_disabled_total {d}
+            \\# HELP tardigrade_quic_ecn_ce_received_total CE-marked packets received (#256-E)
+            \\# TYPE tardigrade_quic_ecn_ce_received_total counter
+            \\tardigrade_quic_ecn_ce_received_total {d}
+            \\
+        , .{
+            self.quic_packets_sent_total,
+            self.quic_packets_received_total,
+            self.quic_pmtu_probes_sent_total,
+            self.quic_pmtu_black_holes_total,
+            self.quic_effective_plpmtu_bytes_last,
+            self.quic_effective_plpmtu_bytes_lifetime_min,
+            self.quic_effective_plpmtu_bytes_lifetime_max,
+            self.quic_ecn_enabled,
+            self.quic_ecn_marked_sent_total,
+            self.quic_ecn_paths_validated_total,
+            self.quic_ecn_paths_disabled_total,
+            self.quic_ecn_ce_received_total,
+        });
+
+        try out.print(
+            \\# HELP tardigrade_quic_udp_buffer_requested_bytes Requested SO_RCVBUF/SO_SNDBUF size by direction (#256-D). 0 means nothing was explicitly requested (kernel default in effect) — never a real socket buffer size.
+            \\# TYPE tardigrade_quic_udp_buffer_requested_bytes gauge
+            \\tardigrade_quic_udp_buffer_requested_bytes{{direction="recv"}} {d}
+            \\tardigrade_quic_udp_buffer_requested_bytes{{direction="send"}} {d}
+            \\# HELP tardigrade_quic_udp_buffer_effective_bytes getsockopt(SO_RCVBUF/SO_SNDBUF) readback by direction (#256-D). 0 means the readback was not taken/failed — never a real socket buffer size.
+            \\# TYPE tardigrade_quic_udp_buffer_effective_bytes gauge
+            \\tardigrade_quic_udp_buffer_effective_bytes{{direction="recv"}} {d}
+            \\tardigrade_quic_udp_buffer_effective_bytes{{direction="send"}} {d}
+            \\# HELP tardigrade_quic_udp_buffer_granted_bytes Readback restated in requested units, comparable to _requested_bytes (#256-D). 0 means nothing was requested or the readback failed.
+            \\# TYPE tardigrade_quic_udp_buffer_granted_bytes gauge
+            \\tardigrade_quic_udp_buffer_granted_bytes{{direction="recv"}} {d}
+            \\tardigrade_quic_udp_buffer_granted_bytes{{direction="send"}} {d}
+            \\# HELP tardigrade_quic_udp_buffer_status Current buffer-tuning outcome by direction: default, applied, clamped, unverified, or unsupported (#256-D)
+            \\# TYPE tardigrade_quic_udp_buffer_status gauge
+            \\tardigrade_quic_udp_buffer_status{{direction="recv",status="{s}"}} 1
+            \\tardigrade_quic_udp_buffer_status{{direction="send",status="{s}"}} 1
+            \\
+        , .{
+            self.quic_udp_recv_buffer_requested_bytes,
+            self.quic_udp_send_buffer_requested_bytes,
+            self.quic_udp_recv_buffer_effective_bytes,
+            self.quic_udp_send_buffer_effective_bytes,
+            self.quic_udp_recv_buffer_granted_bytes,
+            self.quic_udp_send_buffer_granted_bytes,
+            quicUdpBufferStatusLabel(self.quic_udp_recv_buffer_status),
+            quicUdpBufferStatusLabel(self.quic_udp_send_buffer_status),
+        });
     }
 
     /// #368 Slice 3: process-local anti-replay store outcomes. Every label
@@ -3103,6 +3275,75 @@ test "QUIC and H3 transport metrics expose bounded labels and consistent latency
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_request_latency_ms_bucket{le=\"+Inf\"} 2") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_request_latency_ms_sum 1204") != null);
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_h3_request_latency_ms_count 2") != null);
+}
+
+test "#256-G: QUIC packet/PMTU/ECN/UDP-buffer transport state renders with requested-vs-effective distinction" {
+    const allocator = std.testing.allocator;
+    var m = Metrics.init();
+
+    // These fields are populated by GatewayState.overlayQuicTransportSnapshot
+    // at render time, not by a Metrics setter — set them directly here the
+    // way the overlay would.
+    m.quic_packets_sent_total = 42;
+    m.quic_packets_received_total = 41;
+    m.quic_pmtu_probes_sent_total = 3;
+    m.quic_pmtu_black_holes_total = 1;
+    m.quic_effective_plpmtu_bytes_last = 1452;
+    m.quic_effective_plpmtu_bytes_lifetime_min = 1200;
+    m.quic_effective_plpmtu_bytes_lifetime_max = 1452;
+    m.quic_ecn_enabled = 1;
+    m.quic_ecn_marked_sent_total = 10;
+    m.quic_ecn_paths_validated_total = 2;
+    m.quic_ecn_paths_disabled_total = 1;
+    m.quic_ecn_ce_received_total = 5;
+    // Distinct requested/effective/granted values so a test that mixed them
+    // up would fail — this is exactly the confusion #256-G forbids.
+    m.quic_udp_recv_buffer_requested_bytes = 4_194_304;
+    m.quic_udp_recv_buffer_effective_bytes = 2_097_152;
+    m.quic_udp_recv_buffer_granted_bytes = 1_048_576;
+    m.quic_udp_recv_buffer_status = .clamped;
+    m.quic_udp_send_buffer_requested_bytes = 4_194_304;
+    m.quic_udp_send_buffer_effective_bytes = 8_388_608;
+    m.quic_udp_send_buffer_granted_bytes = 4_194_304;
+    m.quic_udp_send_buffer_status = .applied;
+
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_packets_sent_total 42") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_packets_received_total 41") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_pmtu_probes_total 3") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_pmtu_black_holes_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_effective_plpmtu_bytes_last 1452") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_effective_plpmtu_bytes_lifetime_min 1200") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_effective_plpmtu_bytes_lifetime_max 1452") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_enabled 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_marked_sent_total 10") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_paths_validated_total 2") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_paths_disabled_total 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_ce_received_total 5") != null);
+
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_requested_bytes{direction=\"recv\"} 4194304") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_effective_bytes{direction=\"recv\"} 2097152") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_granted_bytes{direction=\"recv\"} 1048576") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_status{direction=\"recv\",status=\"clamped\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_requested_bytes{direction=\"send\"} 4194304") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_effective_bytes{direction=\"send\"} 8388608") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_granted_bytes{direction=\"send\"} 4194304") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_status{direction=\"send\",status=\"applied\"} 1") != null);
+}
+
+test "#256-G: QUIC transport state defaults to zero/default when no H3 runtime is attached" {
+    const allocator = std.testing.allocator;
+    const m = Metrics.init();
+
+    const prom = try m.toPrometheus(allocator);
+    defer allocator.free(prom);
+
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_packets_sent_total 0") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_ecn_enabled 0") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_status{direction=\"recv\",status=\"default\"} 1") != null);
+    try std.testing.expect(std.mem.find(u8, prom, "tardigrade_quic_udp_buffer_status{direction=\"send\",status=\"default\"} 1") != null);
 }
 
 test "listener sharding metrics record per-shard accepts and errors and emit Prometheus series (#137)" {

@@ -156,11 +156,30 @@ fragmented, so **discovery is opt-in by the composition root that created the
 socket**. An embedder using `quic.connection` directly gets the conservative
 policy until it establishes the contract itself and raises the ceiling.
 
-Diagnostics are currently **connection-level, not yet operator-facing**:
-`pmtu_probes_sent` and `pmtu_black_holes` on `quic.connection.Metrics`, plus a
-`pmtu_updated` event carrying the path, the new effective size, and whether it
-rose or fell back. The HTTP/3 runtime's metrics/event bridge does not surface
-them yet; #255's observability work is where they become operator-visible.
+Diagnostics originate **connection-level**: `pmtu_probes_sent` and
+`pmtu_black_holes` on `quic.connection.Metrics`, plus a `pmtu_updated` event
+carrying the path, the new effective size, and whether it rose or fell back.
+#256-G added the smallest possible bridge from that per-connection state to a
+benchmark/status-facing snapshot — `tardigrade_quic_pmtu_probes_total`,
+`tardigrade_quic_pmtu_black_holes_total`, and
+`tardigrade_quic_effective_plpmtu_bytes_last` and
+`tardigrade_quic_effective_plpmtu_bytes_lifetime_{min,max}` on
+`/status/metrics` — so a benchmark run can explain a throughput number
+without a debugger. That bridge is deliberately bounded (aggregate counts
+only, no per-connection or per-path detail); #255 remains the canonical
+owner of general QUIC/H3 observability, and a richer per-connection view
+belongs there, not here.
+
+The `lifetime_min`/`lifetime_max` pair is named deliberately: it never
+resets and is not scoped to any single benchmark scenario or pass — a
+listener that has served more than one connection will show
+`lifetime_min` stuck at the DPLPMTUD base size (1200) forever after the
+first connection's startup fold, regardless of what every later path
+converged to. Read it as "has this listener ever seen a path stuck below
+the maximum over its whole running time," not as evidence that paths in
+any particular benchmark run did or did not converge. `_last` — the
+active-path PLPMTU of whichever connection was most recently folded — is
+the closer (if still imperfect) proxy for "what one benchmark pass saw."
 
 Nothing about this setting relaxes congestion control, flow control, or the
 server's anti-amplification budget:
@@ -243,7 +262,13 @@ numbers, and `setsockopt` reports success either way:
 
 The effective values are published on the runtime's status snapshot
 (`udp_buffers`), which is what benchmark runs should record — the requested
-value and the host sysctls describe intent, not what the socket got.
+value and the host sysctls describe intent, not what the socket got. #256-G
+mirrors that snapshot onto `/status/metrics` as
+`tardigrade_quic_udp_buffer_{requested,effective,granted}_bytes{direction=...}`
+and `tardigrade_quic_udp_buffer_status{direction=...,status=...}`, so a
+benchmark script can scrape requested-vs-effective over HTTP instead of
+parsing startup logs. See [benchmarks/competitive/README.md](../benchmarks/competitive/README.md#http3quic-benchmarking-256-g)
+for the benchmark rows that record it.
 
 Both variables are restart-required: buffer sizes are socket state applied to
 the live descriptor at bind time, so changing one means a new socket.
@@ -395,7 +420,9 @@ The runtime status snapshot publishes `ecn_enabled` — whether marking is
 actually running, not merely requested — along with `ecn_marked_sent`,
 `ecn_paths_validated`, `ecn_paths_disabled`, and `ecn_ce_received`. Benchmark
 runs should record all five: a CE count is only meaningful next to the number
-of paths that validated.
+of paths that validated. #256-G exposes the same five on `/status/metrics`
+(`tardigrade_quic_ecn_enabled` and the four `tardigrade_quic_ecn_*_total`
+counters) for exactly that purpose.
 
 `TARDIGRADE_HTTP3_ECN` is restart-required, like every other listener-owned knob
 — the receive option is socket state applied at bind time.
@@ -698,6 +725,43 @@ ECN and no-fragmentation. Any future implementation would gate on the same
 per-platform tables those features already use, and fall back to today's
 per-datagram path exactly the way ECN falls back to `.unavailable` — a
 batching failure must never become a transport failure.
+
+## Benchmark and operator evidence
+
+#256-G extended the existing benchmark framework (#149) with H3/QUIC rows
+rather than building a second one. Full instructions, scenario definitions,
+and result-schema details live in
+[benchmarks/competitive/README.md](../benchmarks/competitive/README.md#http3quic-benchmarking-256-g);
+this section only points at where to look, not at duplicate content.
+
+- **Small/large/proxy H3 rows**: `benchmarks/competitive/run.sh` (also see
+  `benchmarks/run.sh --scenarios static-http3,proxy-http3`).
+- **Requested vs. effective UDP buffers, PLPMTU, ECN state**: covered above
+  under [Socket buffers](#socket-buffers) and
+  [Explicit Congestion Notification](#explicit-congestion-notification) —
+  every H3 benchmark row carries this as a `quic` sub-object.
+- **Controlled loss/reordering**: `benchmarks/competitive/netem-impair.sh`
+  (Linux-only, manual, requires root/`CAP_NET_ADMIN`; never runs in ordinary
+  PR CI).
+- **High-bandwidth loopback/dedicated-host runs**: the same harness with a
+  higher `--connections`/`--duration`, run by hand on an idle dedicated host
+  — see the competitive README's "High-bandwidth / dedicated-host runs"
+  section for the exact command and the metadata (CPU model, kernel, h2load
+  version/QUIC support, UDP sysctls, Tardigrade transport settings) every
+  result records alongside the numbers.
+
+A required H3-capable `h2load` build (nghttp2 built against ngtcp2 +
+nghttp3) is not installed in default CI; on any host without one, H3 rows are
+recorded as `supported: false` with a reason rather than silently skipped.
+`h2load --h3 --help` succeeding is not sufficient to verify this locally —
+the stock `apt`/`brew` build recognizes the flag but has no QUIC library
+linked, and silently degrades to plain TCP instead of erroring; see the
+competitive README's "Requirements" section for the actual check (flag
+recognition plus `otool -L`/`ldd` linkage verification).
+
+Performance claims from any of this must stay scoped to the recorded
+hardware and configuration — see the competitive README's repeated warning
+about laptop-local and shared-runner results.
 
 ## Reload
 

@@ -42,6 +42,7 @@
 #   --sample-interval-ms N  CPU/RSS sample interval in milliseconds (default: 500)
 #   --runs N            Repeat each scenario N times; output mean ± stddev (default: 1)
 #   --idle-check        Abort if load average exceeds 0.7× CPU count before starting
+#   --metrics-path PATH Prometheus metrics path scraped for QUIC transport state on H3 scenarios (default: /status/metrics)
 #   --help              Show this message and exit
 #
 # Scenarios:
@@ -111,6 +112,11 @@ REGRESSION_THRESHOLD=10  # percent
 SAMPLE_INTERVAL_MS=500
 RUNS=1            # repeat each scenario N times; mean/stddev reported when N>1
 IDLE_CHECK=false  # gate on machine load average before starting
+# #256-G: Prometheus path scraped right after an H3 scenario finishes to
+# attach a `quic` transport-state block (packet/loss/PTO counts, effective
+# PLPMTU, ECN state, requested-vs-effective UDP buffers) to that result.
+# Best-effort only — never fabricated when the endpoint is unreachable.
+QUIC_METRICS_PATH="/status/metrics"
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -151,7 +157,8 @@ while [[ $# -gt 0 ]]; do
         --sample-interval-ms) SAMPLE_INTERVAL_MS="$2"; shift 2 ;;
         --runs)       RUNS="$2";               shift 2 ;;
         --idle-check) IDLE_CHECK=true;         shift ;;
-        --help)       sed -n '/^# Usage/,/^[^#]/p' "$0" | head -n -1; exit 0 ;;
+        --metrics-path) QUIC_METRICS_PATH="$2"; shift 2 ;;
+        --help)       sed -n '/^# Usage/,/^[^#]/p' "$0" | sed '$d'; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -351,6 +358,27 @@ wrk_percentile_ms() {
     latency_value_to_ms "$value"
 }
 
+# #256-G review: adjacency-based text parsing (grep for a percentile label,
+# take the nearest number+unit) cannot work against h2load's *current*
+# text-table output at all, for two independent reasons verified against a
+# real nghttp2 1.69.0 build (the version --h3 requires): the label spelling
+# changed ("50th"/"95th"/"99th" -> "median"/"p95"/"p99"), and — the part no
+# amount of label-matching could fix — the labels and values now live in
+# different table rows/columns (a header row naming the columns, then one
+# data row per metric), not adjacent to each other on the same line.
+# h2load's structured `--output-file=<path>` JSON export (see
+# parse_h2load_json_result below) is the only interface that is stable to
+# parse on a build that has it. But `--output-file` itself is a 1.69+
+# addition — it does not exist on the older h2load still shipped by stock
+# apt/brew packages, and unlike an unrecognized flag causing a clean exit,
+# there is no reason to make plain HTTP/2 benchmarking (run_h2load, which
+# never needs --h3 or QUIC) hard-require a feature only present in the same
+# build that added QUIC support. `extract_h2load_percentile_ms` is that
+# older build's text-table format — "50th"/"95th"/"99th" labels immediately
+# adjacent to their number+unit on the same line — kept alive as a fallback
+# for exactly that case, gated on H2LOAD_OUTPUT_FILE_SUPPORTED (see below).
+# It is never used against a build that has --output-file, so it never has
+# to cope with the new table layout above.
 extract_h2load_percentile_ms() {
     local raw="$1" percentile="$2"
     local pattern
@@ -362,8 +390,53 @@ extract_h2load_percentile_ms() {
         *) echo "null"; return 0 ;;
     esac
     local value
-    value=$(printf '%s\n' "$raw" | grep -E "$pattern" | grep -oE '[0-9.]+ (us|ms|s)' | head -1 | tr -d ' ')
+    # `|| true`: a percentile label this h2load build doesn't print (this
+    # script's own doc comment above notes 99.9th isn't always present) is a
+    # legitimate "no value" outcome, not a script-ending error — under
+    # set -euo pipefail, an unmatched grep here would otherwise abort the
+    # whole run instead of falling through to latency_value_to_ms's existing
+    # empty-value -> "null" handling.
+    value=$(printf '%s\n' "$raw" | grep -E "$pattern" | grep -oE '[0-9.]+ (us|ms|s)' | head -1 | tr -d ' ' || true)
     latency_value_to_ms "$value"
+}
+
+# Parses one h2load `--output-file=<path>` JSON document (schema verified
+# against a real nghttp2 1.69.0 build) into this script's usual
+# rps/p50/p95/p99/p999/errors/tput_mbps shape. Sets those variables directly
+# in the caller's scope — they must already be `local` there — rather than
+# returning a value, since every caller needs all seven at once anyway.
+#
+# `errors` is `requests.failed` alone (#256-G review: `.failed`/.errored`/
+# `.timeout` are not disjoint counters — h2load already folds
+# connection/transport errors and timeouts into `.failed`, so summing all
+# three double- or triple-counts the same bad request).
+#
+# A missing, empty, or invalid JSON document — h2load crashed, was killed,
+# or wrote nothing — is treated as a failed pass (rps=0, an explicit
+# non-zero errors sentinel, every latency null), never as a fabricated
+# clean zero-error result silently indistinguishable from an idle server.
+parse_h2load_json_result() {
+    local json_file="$1"
+    if [[ ! -s "$json_file" ]] || ! jq -e '.measurements' "$json_file" >/dev/null 2>&1; then
+        rps=0
+        p50="null"; p95="null"; p99="null"; p999="null"
+        errors=1
+        tput_mbps="null"
+        return 1
+    fi
+    rps=$(jq -r '(.measurements.request_per_second // 0) | floor' "$json_file")
+    # #256-G review: requests.failed/.errored/.timeout are not disjoint —
+    # h2load already folds connection/transport errors and timeouts into
+    # requests.failed, so summing all three double- or triple-counts the
+    # same bad request. requests.failed alone is the authoritative "not a
+    # clean success" count for this script's single errors column.
+    errors=$(jq -r '.measurements.requests.failed // 0' "$json_file")
+    p50=$(jq -r '.measurements.performance.request.median as $v | if $v == null then null else (($v * 1000000 | round) / 1000) end' "$json_file")
+    p95=$(jq -r '.measurements.performance.request.p95 as $v | if $v == null then null else (($v * 1000000 | round) / 1000) end' "$json_file")
+    p99=$(jq -r '.measurements.performance.request.p99 as $v | if $v == null then null else (($v * 1000000 | round) / 1000) end' "$json_file")
+    p999="null"
+    tput_mbps=$(jq -r '.measurements.bytes_per_second as $v | if $v == null then null else (($v / 1048576 * 100 | round) / 100) end' "$json_file")
+    return 0
 }
 
 average_column_or_null() {
@@ -603,6 +676,11 @@ TOOL_HEADERS=()
 declare -A _run_rps_list=()
 declare -A _run_p99_list=()
 declare -A _run_errors_list=()
+# #256-G review: per-run scenario-local QUIC transport deltas (JSON array,
+# one element per completed run), so `--runs > 1` doesn't silently drop the
+# transport evidence every H3 result is supposed to carry. Aggregated into
+# `.[$s].quic` by flush_multirun_result.
+declare -A _run_quic_list=()
 
 add_result() {
     local scenario="$1" rps="$2" p50_ms="$3" p95_ms="$4" p99_ms="$5" p999_ms="$6" errors="$7" mbps="${8:-null}" cpu_pct_avg="${9:-null}" rss_mb_peak="${10:-null}" open_fds_peak="${11:-$CURRENT_OPEN_FDS_PEAK}"
@@ -679,6 +757,59 @@ flush_multirun_result() {
         }' \
         <<<"$RESULTS_JSON")
 
+    # #256-G review: aggregate the per-run scenario-local QUIC deltas
+    # accumulated by attach_quic_transport_state, so a repeated H3 scenario
+    # still carries transport evidence instead of silently omitting it.
+    # Counters sum across runs; effective_plpmtu/udp_buffers/ecn.enabled use
+    # the last run's post-pass state (they're gauges, not counters — summing
+    # them would be meaningless).
+    #
+    # `runs_total` is the full accumulated array length — including runs
+    # where the scrape came back null — since attach_quic_transport_state
+    # now appends nulls too instead of skipping them (see its own comment):
+    # a two-run scenario with one missing scrape must report
+    # `runs_total: 2, runs_with_data: 1`, not silently collapse to
+    # `runs_total: 1` as if only one run had ever happened. If every run's
+    # scrape came back null, this still emits a `quic` block — with
+    # `runs_with_data: 0` and every counter/gauge explicitly null — rather
+    # than omitting the field entirely, which would be indistinguishable
+    # from a scenario that never attempted QUIC evidence collection at all.
+    local quic_runs="${_run_quic_list[$scenario]:-}"
+    if [[ -n "$quic_runs" ]]; then
+        local quic_agg
+        quic_agg=$(jq -c '
+            (map(select(. != null))) as $valid |
+            {
+                runs_total: (. | length),
+                runs_with_data: ($valid | length)
+            } + (if ($valid | length) == 0 then {
+                packets_sent: null, packets_received: null, packets_lost: null, pto_total: null,
+                bytes_sent: null, bytes_received: null, effective_plpmtu: null,
+                pmtu_probes: null, pmtu_black_holes: null, ecn: null, udp_buffers: null
+            } else {
+                packets_sent: ($valid | map(.packets_sent) | add),
+                packets_received: ($valid | map(.packets_received) | add),
+                packets_lost: ($valid | map(.packets_lost) | add),
+                pto_total: ($valid | map(.pto_total) | add),
+                bytes_sent: ($valid | map(.bytes_sent) | add),
+                bytes_received: ($valid | map(.bytes_received) | add),
+                effective_plpmtu: ($valid[-1].effective_plpmtu),
+                pmtu_probes: ($valid | map(.pmtu_probes) | add),
+                pmtu_black_holes: ($valid | map(.pmtu_black_holes) | add),
+                ecn: {
+                    enabled: ($valid[-1].ecn.enabled),
+                    marked_sent: ($valid | map(.ecn.marked_sent) | add),
+                    paths_validated: ($valid | map(.ecn.paths_validated) | add),
+                    paths_disabled: ($valid | map(.ecn.paths_disabled) | add),
+                    ce_received: ($valid | map(.ecn.ce_received) | add)
+                },
+                udp_buffers: ($valid[-1].udp_buffers)
+            } end)
+        ' <<<"$quic_runs")
+        RESULTS_JSON=$(jq --arg s "$scenario" --argjson quic "$quic_agg" '.[$s].quic = $quic' <<<"$RESULTS_JSON")
+        unset "_run_quic_list[$scenario]"
+    fi
+
     unset "_run_rps_list[$scenario]"
     unset "_run_p99_list[$scenario]"
     unset "_run_errors_list[$scenario]"
@@ -732,34 +863,72 @@ run_wrk() {
     add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "$tput_mbps" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
 }
 
+# #256-G review: `--output-file` (the structured JSON export parsed by
+# parse_h2load_json_result) is a 1.69+ addition — the same build that added
+# --h3/QUIC. run_h2load benchmarks plain HTTP/2 and never needs --h3, so it
+# has no real reason to require that build; the older h2load still shipped
+# by stock apt/brew packages fully supports HTTP/2 but doesn't recognize
+# --output-file at all, and (like the --insecure case above) an unrecognized
+# flag makes h2load exit immediately instead of running the benchmark. This
+# checks for the flag directly rather than sniffing a version number, since
+# that's the thing that actually matters and avoids parsing yet another
+# version-string format.
+h2load_output_file_supported() {
+    h2load --help 2>&1 | grep -q -- '--output-file'
+}
+
 # ── h2load runner ─────────────────────────────────────────────────────────────
 run_h2load() {
     local url="$1" label="$2"
     local extra=()
-    $INSECURE && extra+=(--insecure)
+    # #256-G review: h2load has no --insecure/verify-skip flag at all
+    # (verified against a real nghttp2 1.69.0 build) — it never validates
+    # TLS certificates in the first place, so there's nothing to skip, and
+    # passing an option it doesn't recognize makes it exit immediately.
+    # $INSECURE is intentionally not forwarded here.
     build_tool_headers -H
     [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
+    local rps p50 p95 p99 p999 errors tput_mbps
     local raw
-    start_process_monitor
-    raw=$(h2load -n $((CONNECTIONS * DURATION * 10)) \
-        -c "$CONNECTIONS" -t "$THREADS" ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
-    stop_process_monitor
-    local rps p50 p95 p99 p999 errors
-    rps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+ req/s' | grep -oE '[0-9.]+' || echo 0)
-    p50=$(extract_h2load_percentile_ms "$raw" "50")
-    p95=$(extract_h2load_percentile_ms "$raw" "95")
-    p99=$(extract_h2load_percentile_ms "$raw" "99")
-    p999=$(extract_h2load_percentile_ms "$raw" "99.9")
-    errors=$(echo "$raw" | grep -oE 'failed: [0-9]+' | grep -oE '[0-9]+' | head -1 || echo 0)
-    rps=${rps:-0}; errors=${errors:-0}
-    local tput_mbps
-    tput_mbps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+[KMG]B/s' | awk '{
-        v=$1
-        if (v ~ /GB\/s$/) { sub(/GB\/s$/, "", v); printf "%.2f", v*1024; exit }
-        if (v ~ /MB\/s$/) { sub(/MB\/s$/, "", v); printf "%.2f", v; exit }
-        if (v ~ /KB\/s$/) { sub(/KB\/s$/, "", v); printf "%.2f", v/1024; exit }
-    }')
-    tput_mbps="${tput_mbps:-null}"
+    if h2load_output_file_supported; then
+        local out_json; out_json=$(mktemp /tmp/tardigrade-bench-h2load-XXXXXX.json)
+        start_process_monitor
+        # #256-G review: --duration is h2load's real timing-based mode (verified
+        # wall-clock-accurate against a real build); the previous -n synthesis
+        # only ever approximated the requested duration and could finish in a
+        # fraction of it on a fast target while _meta.duration_s still claimed
+        # the requested value.
+        raw=$(h2load --duration "${DURATION}s" \
+            -c "$CONNECTIONS" -t "$THREADS" --output-file="$out_json" \
+            ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
+        stop_process_monitor
+        if ! parse_h2load_json_result "$out_json"; then
+            echo "  $label — h2load produced no usable --output-file JSON; recording as a failed pass. Raw output:" >&2
+            printf '%s\n' "$raw" | tail -20 >&2
+        fi
+        rm -f "$out_json"
+    else
+        echo "  $label — h2load has no --output-file support (pre-1.69 build); falling back to text-table parsing"
+        start_process_monitor
+        raw=$(h2load --duration "${DURATION}s" \
+            -c "$CONNECTIONS" -t "$THREADS" \
+            ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
+        stop_process_monitor
+        rps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+ req/s' | grep -oE '[0-9.]+' || echo 0)
+        p50=$(extract_h2load_percentile_ms "$raw" "50")
+        p95=$(extract_h2load_percentile_ms "$raw" "95")
+        p99=$(extract_h2load_percentile_ms "$raw" "99")
+        p999=$(extract_h2load_percentile_ms "$raw" "99.9")
+        errors=$(echo "$raw" | grep -oE 'failed: [0-9]+' | grep -oE '[0-9]+' | head -1 || echo 0)
+        rps=${rps:-0}; errors=${errors:-0}
+        tput_mbps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+[KMG]B/s' | awk '{
+            v=$1
+            if (v ~ /GB\/s$/) { sub(/GB\/s$/, "", v); printf "%.2f", v*1024; exit }
+            if (v ~ /MB\/s$/) { sub(/MB\/s$/, "", v); printf "%.2f", v; exit }
+            if (v ~ /KB\/s$/) { sub(/KB\/s$/, "", v); printf "%.2f", v/1024; exit }
+        }')
+        tput_mbps="${tput_mbps:-null}"
+    fi
     local tput_display="" cpu_display="" rss_display=""
     [[ "$tput_mbps" != "null" ]] && tput_display="  throughput=${tput_mbps}MB/s"
     [[ "$CURRENT_CPU_PCT_AVG" != "null" ]] && cpu_display="  cpu=${CURRENT_CPU_PCT_AVG}%"
@@ -768,12 +937,262 @@ run_h2load() {
     add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "$tput_mbps" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
 }
 
+# ── QUIC transport-state capture (#256-G) ─────────────────────────────────────
+# Best-effort scrape of the Prometheus metrics endpoint right after an H3
+# scenario finishes, so its JSON result can explain *why* the numbers came
+# out the way they did: packet/loss/PTO counts, the PLPMTU actually in
+# effect, ECN state, and requested-vs-effective UDP socket buffer sizes.
+# Requested and effective/granted are always read from separate metric
+# series (never inferred from one another) — see docs/HTTP3_ROLLOUT.md.
+# Returns the string "null" (not an error) when the endpoint is unreachable
+# or HTTP/3 metrics are absent — a benchmark result should say "this could
+# not be observed" rather than fabricate it.
+quic_metric() {
+    local body="$1" name="$2"
+    printf '%s\n' "$body" | awk -v m="$name" '$1 == m { print $2; exit }'
+}
+
+quic_metric_labeled() {
+    local body="$1" pattern="$2"
+    printf '%s\n' "$body" | awk -v m="$pattern" '$0 ~ ("^" m) { print $2; exit }'
+}
+
+quic_buffer_status_label() {
+    local body="$1" direction="$2"
+    # `|| true`: under this script's `set -euo pipefail`, the first grep
+    # returning no match (a legitimate "this series is absent" outcome the
+    # caller's required-fields check below is designed to handle) would
+    # otherwise abort the whole script instead of yielding the empty string
+    # this function is supposed to return in that case.
+    printf '%s\n' "$body" \
+        | grep -oE "tardigrade_quic_udp_buffer_status\\{direction=\"${direction}\",status=\"[a-z]+\"\\}" \
+        | grep -oE 'status="[a-z]+"' | sed -E 's/status="([a-z]+)"/\1/' | head -1 || true
+}
+
+capture_quic_transport_state() {
+    local url="${SCHEME}://${TARGET_HOST}:${TARGET_PORT}${QUIC_METRICS_PATH}"
+    local extra=()
+    $INSECURE && extra+=(--insecure)
+    # #256-G review: a listener with a non-empty server_name (e.g. the H3
+    # benchmark config's `tardigrade.test`) 404s a request whose Host
+    # doesn't match it, same as any other route — without this, the load
+    # pass can succeed (it already sends $HOST_HEADER via run_h2load_h3)
+    # while this separate metrics scrape 404s and the required `quic`
+    # evidence silently becomes unobservable.
+    [[ -n "${HOST_HEADER:-}" ]] && extra+=(-H "Host: $HOST_HEADER")
+    local body
+    if ! body=$(curl -fsS "${extra[@]+"${extra[@]}"}" "$url" 2>/dev/null); then
+        echo "null"
+        return 0
+    fi
+
+    local packets_sent
+    packets_sent=$(quic_metric "$body" tardigrade_quic_packets_sent_total)
+    if [[ -z "$packets_sent" ]]; then
+        # Endpoint answered but exposes no QUIC series at all (HTTP/3 metrics
+        # disabled, or this isn't a Tardigrade /status/metrics endpoint).
+        echo "null"
+        return 0
+    fi
+
+    local packets_received packets_lost pto bytes_sent bytes_received
+    packets_received=$(quic_metric "$body" tardigrade_quic_packets_received_total)
+    packets_lost=$(quic_metric "$body" tardigrade_quic_packets_lost_total)
+    pto=$(quic_metric "$body" tardigrade_quic_pto_total)
+    bytes_sent=$(quic_metric "$body" tardigrade_quic_bytes_sent_total)
+    bytes_received=$(quic_metric "$body" tardigrade_quic_bytes_received_total)
+
+    # #256-G review: _lifetime_min/_lifetime_max never reset and are not
+    # scoped to any single benchmark scenario or pass — see the matching
+    # rename/doc comment on http3_runtime.Snapshot. Do not treat them as
+    # evidence of path convergence within one run.
+    local pmtu_probes pmtu_black_holes plpmtu_last plpmtu_lifetime_min plpmtu_lifetime_max
+    pmtu_probes=$(quic_metric "$body" tardigrade_quic_pmtu_probes_total)
+    pmtu_black_holes=$(quic_metric "$body" tardigrade_quic_pmtu_black_holes_total)
+    plpmtu_last=$(quic_metric "$body" tardigrade_quic_effective_plpmtu_bytes_last)
+    plpmtu_lifetime_min=$(quic_metric "$body" tardigrade_quic_effective_plpmtu_bytes_lifetime_min)
+    plpmtu_lifetime_max=$(quic_metric "$body" tardigrade_quic_effective_plpmtu_bytes_lifetime_max)
+
+    local ecn_enabled ecn_marked ecn_validated ecn_disabled ecn_ce
+    ecn_enabled=$(quic_metric "$body" tardigrade_quic_ecn_enabled)
+    ecn_marked=$(quic_metric "$body" tardigrade_quic_ecn_marked_sent_total)
+    ecn_validated=$(quic_metric "$body" tardigrade_quic_ecn_paths_validated_total)
+    ecn_disabled=$(quic_metric "$body" tardigrade_quic_ecn_paths_disabled_total)
+    ecn_ce=$(quic_metric "$body" tardigrade_quic_ecn_ce_received_total)
+
+    local recv_req recv_eff recv_grant recv_status send_req send_eff send_grant send_status
+    recv_req=$(quic_metric_labeled "$body" 'tardigrade_quic_udp_buffer_requested_bytes\{direction="recv"\}')
+    recv_eff=$(quic_metric_labeled "$body" 'tardigrade_quic_udp_buffer_effective_bytes\{direction="recv"\}')
+    recv_grant=$(quic_metric_labeled "$body" 'tardigrade_quic_udp_buffer_granted_bytes\{direction="recv"\}')
+    recv_status=$(quic_buffer_status_label "$body" recv)
+    send_req=$(quic_metric_labeled "$body" 'tardigrade_quic_udp_buffer_requested_bytes\{direction="send"\}')
+    send_eff=$(quic_metric_labeled "$body" 'tardigrade_quic_udp_buffer_effective_bytes\{direction="send"\}')
+    send_grant=$(quic_metric_labeled "$body" 'tardigrade_quic_udp_buffer_granted_bytes\{direction="send"\}')
+    send_status=$(quic_buffer_status_label "$body" send)
+
+    # #256-G review: a missing series must stay missing, not become a
+    # fabricated observed zero/default via `${var:-0}` — a result claiming
+    # zero loss or default buffers is only meaningful if that was actually
+    # scraped, not assumed because the field happened to be absent. Every
+    # series checked here is normally emitted unconditionally by the same
+    # runtime code path that emits packets_sent (see
+    # appendQuicPmtuEcnBufferPrometheus in src/http/metrics.zig), so this
+    # should only ever trip on a truncated scrape, a metrics-format
+    # mismatch, or a version skew between this script and the binary being
+    # benchmarked — cases where "unknown" is the honest answer, not a guess.
+    local required
+    for required in \
+        "$packets_received" "$packets_lost" "$pto" "$bytes_sent" "$bytes_received" \
+        "$pmtu_probes" "$pmtu_black_holes" "$plpmtu_last" "$plpmtu_lifetime_min" "$plpmtu_lifetime_max" \
+        "$ecn_enabled" "$ecn_marked" "$ecn_validated" "$ecn_disabled" "$ecn_ce" \
+        "$recv_req" "$recv_eff" "$recv_grant" "$recv_status" \
+        "$send_req" "$send_eff" "$send_grant" "$send_status"
+    do
+        if [[ -z "$required" ]]; then
+            echo "null"
+            return 0
+        fi
+    done
+
+    jq -n \
+        --argjson packets_sent "$packets_sent" \
+        --argjson packets_received "$packets_received" \
+        --argjson packets_lost "$packets_lost" \
+        --argjson pto_total "$pto" \
+        --argjson bytes_sent "$bytes_sent" \
+        --argjson bytes_received "$bytes_received" \
+        --argjson pmtu_probes "$pmtu_probes" \
+        --argjson pmtu_black_holes "$pmtu_black_holes" \
+        --argjson plpmtu_last "$plpmtu_last" \
+        --argjson plpmtu_lifetime_min "$plpmtu_lifetime_min" \
+        --argjson plpmtu_lifetime_max "$plpmtu_lifetime_max" \
+        --argjson ecn_enabled "$([[ "$ecn_enabled" == "1" ]] && echo true || echo false)" \
+        --argjson ecn_marked_sent "$ecn_marked" \
+        --argjson ecn_paths_validated "$ecn_validated" \
+        --argjson ecn_paths_disabled "$ecn_disabled" \
+        --argjson ecn_ce_received "$ecn_ce" \
+        --argjson recv_requested "$recv_req" \
+        --argjson recv_effective "$recv_eff" \
+        --argjson recv_granted "$recv_grant" \
+        --arg recv_status "$recv_status" \
+        --argjson send_requested "$send_req" \
+        --argjson send_effective "$send_eff" \
+        --argjson send_granted "$send_grant" \
+        --arg send_status "$send_status" \
+        '{
+            packets_sent: $packets_sent,
+            packets_received: $packets_received,
+            packets_lost: $packets_lost,
+            pto_total: $pto_total,
+            bytes_sent: $bytes_sent,
+            bytes_received: $bytes_received,
+            effective_plpmtu: {last_bytes: $plpmtu_last, lifetime_min_bytes: $plpmtu_lifetime_min, lifetime_max_bytes: $plpmtu_lifetime_max},
+            pmtu_probes: $pmtu_probes,
+            pmtu_black_holes: $pmtu_black_holes,
+            ecn: {
+                enabled: $ecn_enabled,
+                marked_sent: $ecn_marked_sent,
+                paths_validated: $ecn_paths_validated,
+                paths_disabled: $ecn_paths_disabled,
+                ce_received: $ecn_ce_received
+            },
+            udp_buffers: {
+                recv: {requested_bytes: $recv_requested, effective_bytes: $recv_effective, granted_bytes: $recv_granted, status: $recv_status},
+                send: {requested_bytes: $send_requested, effective_bytes: $send_effective, granted_bytes: $send_granted, status: $send_status}
+            }
+        }'
+}
+
+# #256-G review: the H3 listener started by the competitive harness stays up
+# across the readiness check and every pass (small/large/proxy), so a single
+# post-pass scrape of these listener-lifetime cumulative counters would
+# attribute earlier passes' traffic to a later row. `capture_quic_transport_state`
+# is a point-in-time snapshot; this turns two snapshots (taken immediately
+# before and after one load run) into a scenario-local measurement by
+# subtracting counter fields. Gauges/status (effective PLPMTU, ECN enabled,
+# UDP buffer requested/effective/granted/status) are not counters and are not
+# subtracted — they describe *current* state, so the post-run reading is used
+# as-is. `null` in, `null` out: if either snapshot could not be observed, the
+# delta is "unknown", never a fabricated zero.
+quic_transport_delta() {
+    local before="$1" after="$2"
+    if [[ "$before" == "null" || "$after" == "null" ]]; then
+        echo "null"
+        return 0
+    fi
+    jq -cn --argjson b "$before" --argjson a "$after" '{
+        packets_sent: ($a.packets_sent - $b.packets_sent),
+        packets_received: ($a.packets_received - $b.packets_received),
+        packets_lost: ($a.packets_lost - $b.packets_lost),
+        pto_total: ($a.pto_total - $b.pto_total),
+        bytes_sent: ($a.bytes_sent - $b.bytes_sent),
+        bytes_received: ($a.bytes_received - $b.bytes_received),
+        effective_plpmtu: $a.effective_plpmtu,
+        pmtu_probes: ($a.pmtu_probes - $b.pmtu_probes),
+        pmtu_black_holes: ($a.pmtu_black_holes - $b.pmtu_black_holes),
+        ecn: {
+            enabled: $a.ecn.enabled,
+            marked_sent: ($a.ecn.marked_sent - $b.ecn.marked_sent),
+            paths_validated: ($a.ecn.paths_validated - $b.ecn.paths_validated),
+            paths_disabled: ($a.ecn.paths_disabled - $b.ecn.paths_disabled),
+            ce_received: ($a.ecn.ce_received - $b.ecn.ce_received)
+        },
+        udp_buffers: $a.udp_buffers
+    }'
+}
+
+# Attaches an already-computed scenario-local quic delta (see
+# quic_transport_delta) to a scenario's result. Single-run scenarios get it
+# directly; multi-run scenarios accumulate it into `_run_quic_list` for
+# flush_multirun_result to aggregate once every run has completed (#256-G
+# review: repeated H3 runs must not silently drop transport evidence).
+attach_quic_transport_state() {
+    local label="$1" quic_delta="$2"
+    if [[ "$RUNS" -eq 1 ]]; then
+        [[ "$quic_delta" == "null" ]] && return 0
+        RESULTS_JSON=$(jq --arg s "$label" --argjson quic "$quic_delta" '.[$s].quic = $quic' <<<"$RESULTS_JSON")
+        return 0
+    fi
+    # #256-G review: a null delta is appended too (not skipped) — otherwise
+    # a scenario with one successful scrape and one missing one would end up
+    # with a one-element array, and flush_multirun_result's `runs_total`
+    # (the array length) would silently equal `runs_with_data`, hiding that
+    # a run's transport evidence was never observed at all.
+    local prev="${_run_quic_list[$label]:-[]}"
+    _run_quic_list["$label"]=$(jq -cn --argjson acc "$prev" --argjson item "$quic_delta" '$acc + [$item]')
+}
+
+# #256-G review: `h2load --h3 --help` only proves the binary recognizes the
+# flag syntactically. A build with no QUIC library linked at all — e.g. the
+# stock Homebrew/apt nghttp2 package, which has no ngtcp2/nghttp3 build
+# option — still passes that check, then silently negotiates a degraded TCP
+# connection offering ALPN "h3" (only ever valid over QUIC/UDP), which a
+# correct H3 server must reject. That reject looks identical to a real
+# Tardigrade H3 regression unless this check can tell the two apart, so also
+# confirm the binary is actually linked against a QUIC library — best
+# effort: a statically-linked QUIC build won't show up here and is treated
+# as unsupported, so this can produce false negatives but not the false
+# positive that motivated it.
+h2load_h3_supported() {
+    command -v h2load >/dev/null 2>&1 || return 1
+    h2load --h3 --help &>/dev/null 2>&1 || return 1
+    local h2load_path
+    h2load_path="$(command -v h2load)"
+    if command -v otool >/dev/null 2>&1; then
+        otool -L "$h2load_path" 2>/dev/null | grep -qiE 'libngtcp2|libnghttp3'
+    elif command -v ldd >/dev/null 2>&1; then
+        ldd "$h2load_path" 2>/dev/null | grep -qiE 'libngtcp2|libnghttp3'
+    else
+        return 0
+    fi
+}
+
 # ── h2load HTTP/3 runner ──────────────────────────────────────────────────────
 # Requires h2load built with QUIC/nghttp3+ngtcp2 support.
 # If --h3 is unknown to this h2load build, the scenario is silently skipped.
 run_h2load_h3() {
     local url="$1" label="$2"
-    if ! h2load --h3 --help &>/dev/null 2>&1; then
+    if ! h2load_h3_supported; then
         echo "  Skipping $label — h2load on this system does not support --h3 (HTTP/3)"
         return
     fi
@@ -782,36 +1201,46 @@ run_h2load_h3() {
         return
     fi
     local extra=()
-    $INSECURE && extra+=(--insecure)
+    # #256-G review: h2load has no --insecure/verify-skip flag at all
+    # (verified against a real nghttp2 1.69.0 build) — it never validates
+    # TLS certificates in the first place. $INSECURE is intentionally not
+    # forwarded here.
     build_tool_headers -H
     [[ ${#TOOL_HEADERS[@]} -gt 0 ]] && extra+=("${TOOL_HEADERS[@]}")
+    # #256-G review: bracket the load run with metrics snapshots so the
+    # attached `quic` block measures only this pass, not everything the
+    # listener has done since it started.
+    local quic_before
+    quic_before=$(capture_quic_transport_state)
+    local out_json; out_json=$(mktemp /tmp/tardigrade-bench-h2load-h3-XXXXXX.json)
     local raw
     start_process_monitor
-    raw=$(h2load --h3 -n $((CONNECTIONS * DURATION * 10)) \
-        -c "$CONNECTIONS" -t "$THREADS" ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
+    # #256-G review: --duration is h2load's real timing-based mode (verified
+    # wall-clock-accurate against a real build); the previous -n synthesis
+    # only ever approximated the requested duration. --output-file writes
+    # structured JSON this parses instead of the plain-text table, whose
+    # labels ("median"/"p95"/"p99") and values live in different table
+    # rows/columns that adjacency-based text parsing cannot recover at all
+    # on the h2load versions that actually support --h3.
+    raw=$(h2load --h3 --duration "${DURATION}s" \
+        -c "$CONNECTIONS" -t "$THREADS" --output-file="$out_json" \
+        ${extra[@]+"${extra[@]}"} "$url" 2>&1) || true
     stop_process_monitor
-    local rps p50 p95 p99 p999 errors
-    rps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+ req/s' | grep -oE '[0-9.]+' || echo 0)
-    p50=$(extract_h2load_percentile_ms "$raw" "50")
-    p95=$(extract_h2load_percentile_ms "$raw" "95")
-    p99=$(extract_h2load_percentile_ms "$raw" "99")
-    p999=$(extract_h2load_percentile_ms "$raw" "99.9")
-    errors=$(echo "$raw" | grep -oE 'failed: [0-9]+' | grep -oE '[0-9]+' | head -1 || echo 0)
-    rps=${rps:-0}; errors=${errors:-0}
-    local tput_mbps
-    tput_mbps=$(echo "$raw" | grep -E "^finished" | grep -oE '[0-9.]+[KMG]B/s' | awk '{
-        v=$1
-        if (v ~ /GB\/s$/) { sub(/GB\/s$/, "", v); printf "%.2f", v*1024; exit }
-        if (v ~ /MB\/s$/) { sub(/MB\/s$/, "", v); printf "%.2f", v; exit }
-        if (v ~ /KB\/s$/) { sub(/KB\/s$/, "", v); printf "%.2f", v/1024; exit }
-    }')
-    tput_mbps="${tput_mbps:-null}"
+    local quic_after
+    quic_after=$(capture_quic_transport_state)
+    local rps p50 p95 p99 p999 errors tput_mbps
+    if ! parse_h2load_json_result "$out_json"; then
+        echo "  $label — h2load produced no usable --output-file JSON; recording as a failed pass. Raw output:" >&2
+        printf '%s\n' "$raw" | tail -20 >&2
+    fi
+    rm -f "$out_json"
     local tput_display="" cpu_display="" rss_display=""
     [[ "$tput_mbps" != "null" ]] && tput_display="  throughput=${tput_mbps}MB/s"
     [[ "$CURRENT_CPU_PCT_AVG" != "null" ]] && cpu_display="  cpu=${CURRENT_CPU_PCT_AVG}%"
     [[ "$CURRENT_RSS_MB_PEAK" != "null" ]] && rss_display="  rss_peak=${CURRENT_RSS_MB_PEAK}MiB"
     echo "  $label — ${rps} req/s  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms  p999=${p999}ms  errors=${errors}${tput_display}${cpu_display}${rss_display}"
     add_result "$label" "$rps" "$p50" "$p95" "$p99" "$p999" "$errors" "$tput_mbps" "$CURRENT_CPU_PCT_AVG" "$CURRENT_RSS_MB_PEAK"
+    attach_quic_transport_state "$label" "$(quic_transport_delta "$quic_before" "$quic_after")"
 }
 
 # ── fortio runner ─────────────────────────────────────────────────────────────
@@ -1238,6 +1667,22 @@ ARCH_NAME=$(detect_arch)
 CPU_MODEL=$(detect_cpu_model)
 CPU_THREADS=$(detect_cpu_threads)
 MEMORY_MB=$(detect_memory_mb)
+# #256-G: high-bandwidth/dedicated-host evidence needs to say whether the
+# installed h2load can even drive HTTP/3 — a run with h2load lacking --h3
+# silently produces zero H3 rows, and that has to be distinguishable from
+# "we tried and it was slow."
+H2LOAD_VERSION="unknown"
+H2LOAD_H3_SUPPORTED=false
+H2LOAD_OUTPUT_FILE_SUPPORTED=false
+if command -v h2load &>/dev/null; then
+    H2LOAD_VERSION=$({ h2load --version 2>&1 || true; } | head -1)
+    h2load_h3_supported && H2LOAD_H3_SUPPORTED=true
+    # #256-G review: run_h2load falls back to text-table parsing on a build
+    # without --output-file — record which path actually ran so a result
+    # produced by the legacy fallback isn't silently indistinguishable from
+    # one backed by the structured JSON export.
+    h2load_output_file_supported && H2LOAD_OUTPUT_FILE_SUPPORTED=true
+fi
 RESULTS_JSON=$(jq \
     --arg tag "$GIT_TAG" --arg ts "$TIMESTAMP" \
     --arg host "$TARGET_HOST" --arg port "$TARGET_PORT" \
@@ -1258,10 +1703,14 @@ RESULTS_JSON=$(jq \
     --arg cpu_model "$CPU_MODEL" \
     --arg cpu_threads "$CPU_THREADS" \
     --arg memory_mb "$MEMORY_MB" \
+    --arg h2load_version "$H2LOAD_VERSION" \
+    --argjson h2load_h3_supported "$($H2LOAD_H3_SUPPORTED && echo true || echo false)" \
+    --argjson h2load_output_file_supported "$($H2LOAD_OUTPUT_FILE_SUPPORTED && echo true || echo false)" \
+    --argjson threads "$THREADS" \
     --argjson dur "$DURATION" --argjson conn "$CONNECTIONS" --argjson sample_interval_ms "$SAMPLE_INTERVAL_MS" \
     --argjson runs "$RUNS" \
     '. + {_meta: {tag: $tag, timestamp: $ts, host: $host, port: $port,
-          tool: $tool, duration_s: $dur, connections: $conn, runs: $runs,
+          tool: $tool, duration_s: $dur, connections: $conn, threads: $threads, runs: $runs,
           host_header: $host_header, driver: $driver,
           worker_count: (if $worker_count == "" then null else ($worker_count | tonumber) end),
           config_label: (if $config_label == "" then null else $config_label end),
@@ -1272,6 +1721,9 @@ RESULTS_JSON=$(jq \
             sample_interval_ms: $sample_interval_ms
           },
           zig_version: $zig_version,
+          h2load_version: $h2load_version,
+          h2load_h3_supported: $h2load_h3_supported,
+          h2load_output_file_supported: $h2load_output_file_supported,
           environment: {
             os: $os_name,
             kernel: $kernel_release,
@@ -1332,6 +1784,7 @@ if [[ -n "$BASELINE_FILE" && -f "$BASELINE_FILE" ]]; then
         esac
         echo "  ${scenario}.${metric}: baseline=${baseline_value} current=${current_value} delta=${delta}% [${status}]"
     }
+    # shellcheck disable=SC2016 # single-quoted on purpose: $s is a jq --arg binding inside compare_metric's own jq program, not a shell variable
     while IFS= read -r scenario; do
         [[ "$scenario" == _meta ]] && continue
         compare_metric "$scenario" "rps" '.[$s].rps' higher

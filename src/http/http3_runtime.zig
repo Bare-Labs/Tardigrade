@@ -884,6 +884,47 @@ pub const Snapshot = struct {
     ecn_paths_validated: usize = 0,
     ecn_paths_disabled: usize = 0,
     ecn_ce_received: usize = 0,
+    /// #256-G: QUIC packet counters folded from every connection's transport
+    /// metrics, the same way `ecn_marked_sent` etc. are folded above. These
+    /// are UDP-datagram-level packet counts (one QUIC packet per datagram in
+    /// this transport, no coalescing), not HTTP/3 request counts.
+    packets_sent: usize = 0,
+    packets_received: usize = 0,
+    /// #256-G: DPLPMTUD probe/black-hole counters folded from `quic.connection.Metrics`
+    /// (`pmtu_probes_sent`/`pmtu_black_holes`, populated by #256-B). Previously
+    /// only readable from inside a connection; this is the smallest bridge
+    /// needed to make them benchmark/status-visible per #256-G, not a new
+    /// observability subsystem (#255 remains the canonical owner of that).
+    pmtu_probes_sent: usize = 0,
+    pmtu_black_holes: usize = 0,
+    /// #256-G: effective PLPMTU (path MTU the transport actually sends at,
+    /// see `quic.pmtu.Controller.sendSize()`) observed across folded
+    /// connections' *active* path. A single listener can have many
+    /// concurrent connections/paths with different discovered values, so a
+    /// lone "the PLPMTU" gauge would be misleading for anything but a
+    /// benchmark that guarantees exactly one connection. Instead:
+    ///   - `plpmtu_last_bytes` is the active-path PLPMTU of whichever
+    ///     connection was most recently folded — the right value to read for
+    ///     a single-connection benchmark run, but not a listener-wide
+    ///     aggregate for production traffic with many concurrent paths.
+    ///   - `plpmtu_lifetime_min_bytes`/`plpmtu_lifetime_max_bytes` are the
+    ///     smallest/largest active-path PLPMTU observed across every fold
+    ///     since this listener started. They are named `lifetime_*`
+    ///     deliberately (#256-G review): they never reset, so on a listener
+    ///     that has served more than one connection or more than one
+    ///     benchmark scenario, `lifetime_min_bytes` reads 1200 forever after
+    ///     the first connection's startup fold, regardless of what every
+    ///     later path converged to. They describe "has this listener ever
+    ///     seen a path stuck below the maximum" over its whole running
+    ///     time — not a per-scenario, per-benchmark-pass, or even per-
+    ///     connection figure, and not evidence that paths in any particular
+    ///     benchmark run did or did not converge. A benchmark wanting a
+    ///     scenario-scoped PLPMTU spread would need a connection-scoped
+    ///     snapshot this runtime does not currently take; `plpmtu_last_bytes`
+    ///     is the closest available proxy for "what a benchmark pass saw."
+    plpmtu_last_bytes: usize = 0,
+    plpmtu_lifetime_min_bytes: usize = 0,
+    plpmtu_lifetime_max_bytes: usize = 0,
 
     pub fn handshakeState(self: Snapshot) []const u8 {
         if (!self.server_bootstrapped) return "bootstrap_incomplete";
@@ -2714,6 +2755,22 @@ pub const Runtime = struct {
         self.snapshot_state.ecn_paths_disabled += @intCast(transport.ecn_disabled -| last.ecn_disabled);
         self.snapshot_state.ecn_ce_received += @intCast(transport.ecn_ce_received -| last.ecn_ce_received);
 
+        // #256-G: packet counts and DPLPMTUD probe/black-hole counts, folded
+        // the same way as the ECN counters above.
+        self.snapshot_state.packets_sent += @intCast(transport.packets_sent -| last.packets_sent);
+        self.snapshot_state.packets_received += @intCast(transport.packets_received -| last.packets_received);
+        self.snapshot_state.pmtu_probes_sent += @intCast(transport.pmtu_probes_sent -| last.pmtu_probes_sent);
+        self.snapshot_state.pmtu_black_holes += @intCast(transport.pmtu_black_holes -| last.pmtu_black_holes);
+
+        const active_plpmtu = entry.conn.paths.activePlpmtu().sendSize();
+        self.snapshot_state.plpmtu_last_bytes = active_plpmtu;
+        if (self.snapshot_state.plpmtu_lifetime_min_bytes == 0 or active_plpmtu < self.snapshot_state.plpmtu_lifetime_min_bytes) {
+            self.snapshot_state.plpmtu_lifetime_min_bytes = active_plpmtu;
+        }
+        if (active_plpmtu > self.snapshot_state.plpmtu_lifetime_max_bytes) {
+            self.snapshot_state.plpmtu_lifetime_max_bytes = active_plpmtu;
+        }
+
         const stream_metrics = if (entry.conn.streams) |streams| streams.metrics else quic.stream.Metrics{};
         const last_stream = entry.last_stream_metrics;
         entry.last_stream_metrics = stream_metrics;
@@ -3984,6 +4041,63 @@ test "http3 runtime metrics: MAX_STREAMS pressure is not stream byte flow-contro
     harness.entry.conn.streams.?.metrics.stream_data_blocked_events += 2;
     runtime.foldPathMetrics(harness.entry);
     try testing.expectEqual(@as(u64, 2), capture.delta.stream_flow_blocked);
+}
+
+test "#256-G: foldPathMetrics folds packet counts and PMTU probe/black-hole counts into the snapshot" {
+    const allocator = testing.allocator;
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(tls_core.credentials.testdata.identity(), tls_core.credentials.testdata.ignoredEntropy());
+    defer fixed.deinit();
+    var logger = logger_mod.Logger.init(.err, "http3-runtime-pmtu-packet-snapshot-test");
+    var runtime = try Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+    });
+    defer runtime.deinit();
+
+    var harness = try RuntimeCidHarness.init(allocator, fixed.provider());
+    defer harness.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 0), runtime.snapshot().packets_sent);
+    try testing.expectEqual(@as(usize, 0), runtime.snapshot().packets_received);
+    try testing.expectEqual(@as(usize, 0), runtime.snapshot().pmtu_probes_sent);
+    try testing.expectEqual(@as(usize, 0), runtime.snapshot().pmtu_black_holes);
+
+    // The harness's own setup (CID registration/handshake bookkeeping) may
+    // already have sent/received a handful of packets on `harness.entry.conn`
+    // before this test ever touches it, so measure everything from here as a
+    // delta against a first fold rather than assuming a zero baseline —
+    // exactly the relative-delta semantics `foldPathMetrics` itself applies
+    // to every other counter.
+    runtime.foldPathMetrics(harness.entry);
+    const base = runtime.snapshot();
+
+    harness.entry.conn.metrics.packets_sent += 10;
+    harness.entry.conn.metrics.packets_received += 8;
+    harness.entry.conn.metrics.pmtu_probes_sent += 2;
+    runtime.foldPathMetrics(harness.entry);
+
+    var snap = runtime.snapshot();
+    try testing.expectEqual(@as(usize, 10), snap.packets_sent - base.packets_sent);
+    try testing.expectEqual(@as(usize, 8), snap.packets_received - base.packets_received);
+    try testing.expectEqual(@as(usize, 2), snap.pmtu_probes_sent - base.pmtu_probes_sent);
+    try testing.expectEqual(base.pmtu_black_holes, snap.pmtu_black_holes);
+    // The active path starts at the DPLPMTUD base size — never zero, and
+    // last/min/max agree on it since only one path has folded so far.
+    try testing.expect(snap.plpmtu_last_bytes > 0);
+    try testing.expectEqual(snap.plpmtu_last_bytes, snap.plpmtu_lifetime_min_bytes);
+    try testing.expectEqual(snap.plpmtu_last_bytes, snap.plpmtu_lifetime_max_bytes);
+
+    // A second fold only adds the *delta* since the last fold, matching every
+    // other counter folded here (ECN, retry, etc.) — not the raw connection
+    // total re-added on top.
+    const after_first = snap.packets_sent;
+    harness.entry.conn.metrics.packets_sent += 5;
+    harness.entry.conn.metrics.pmtu_black_holes += 1;
+    runtime.foldPathMetrics(harness.entry);
+    snap = runtime.snapshot();
+    try testing.expectEqual(@as(usize, 5), snap.packets_sent - after_first);
+    try testing.expectEqual(@as(usize, 1), snap.pmtu_black_holes - base.pmtu_black_holes);
 }
 
 test "http3 runtime metrics: handshake failures use removal reason and observed stage" {
