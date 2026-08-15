@@ -41,8 +41,12 @@ given, which is almost never what you want against an nginx-style
 
 ## 1. Five-minute triage
 
-Run this pass before anything more specific. It separates "config problem",
-"process problem", and "network/routing problem" in a handful of commands.
+### Symptoms
+
+Something about Tardigrade is wrong and you haven't yet isolated whether
+it's a config problem, a process problem, or a network/routing problem.
+
+### First checks
 
 ```bash
 tardi version
@@ -68,43 +72,80 @@ Then probe the listener you're actually diagnosing. Only do this if the
 config you're checking actually defines a `/health` route — it isn't a
 built-in path, it's a convention used throughout `examples/` (a
 `location = /health { return 200 ok; }` block); `tardi routes` above tells
-you whether yours has one.
+you whether yours has one. Send a `Host` header that matches your config's
+`server_name`:
 
 ```bash
 curl -v -H 'Host: localhost' http://127.0.0.1:8069/health
 ```
 
-For TLS:
+For TLS, make the **TLS identity (SNI) and the HTTP `Host` agree** — `-H
+'Host: ...'` only rewrites the HTTP request line/header *after* the
+handshake, it does not set the `ClientHello` SNI. Sending a request to a
+raw IP with `-H 'Host: localhost'` can select the wrong certificate (or the
+wrong SNI-routed path) while the HTTP layer routes as `localhost`. Use
+`--resolve` so both the transport name and the HTTP host are `localhost`:
 
 ```bash
-curl -vk -H 'Host: localhost' https://127.0.0.1:8443/health
+curl -v --resolve localhost:8443:127.0.0.1 https://localhost:8443/health
 ```
 
+`-k`/`--insecure` here would skip certificate trust validation entirely,
+which is fine for a first-pass reachability check but not for confirming
+the certificate itself is correct — see [§7](#7-tls-certificatekey-errors)
+for a validating check once you know the listener responds at all.
+
 > The starter config and every example match on a specific `server_name`
-> (`localhost` by default). A bare `curl` against a raw IP without a matching
-> `Host` header returns `404`, not `200` — that's expected virtual-host
-> behavior, not a bug. Match your config's `server_name` with `-H 'Host:
-> ...'`, or configure an unnamed/default `server {}` block (a block with no
-> `server_name` names) if you need one to catch non-matching hosts — see
-> [CONFIGURATION.md's Server Blocks section](CONFIGURATION.md#server-blocks).
+> (`localhost` by default). A request whose `Host` (and, for TLS, SNI)
+> doesn't match any configured `server_name` returns `404`, not `200` —
+> that's expected virtual-host behavior, not a bug. Match your config's
+> `server_name`, or configure an unnamed/default `server {}` block (a block
+> with no `server_name` names) if you need one to catch non-matching hosts —
+> see [CONFIGURATION.md's Server Blocks section](CONFIGURATION.md#server-blocks).
 
-### Critical inspection-command warning
+**Critical inspection-command warning: `print-config`, `routes`, and
+`upstreams` inspect the config file loaded by that CLI invocation. They do
+not talk to a running Tardigrade process, and they do not prove that a
+previous `tardi reload`/`SIGHUP` was applied successfully.** Running any of
+the three against an edited config file only tells you the *file* parses
+and would produce the routes/upstreams you expect — not that the live
+process is actually serving them. For live reload state, use the runtime
+status/log/metric surfaces in [§11](#11-reload-did-not-apply-expected-changes),
+primarily `GET /tardigrade/reload/status`.
 
-**`print-config`, `routes`, and `upstreams` inspect the config file loaded by
-that CLI invocation. They do not talk to a running Tardigrade process, and
-they do not prove that a previous `tardi reload`/`SIGHUP` was applied
-successfully.** Running any of the three against an edited config file only
-tells you the *file* parses and would produce the routes/upstreams you
-expect — not that the live process is actually serving them. For live reload
-state, use the runtime status/log/metric surfaces in
-[§11](#11-reload-did-not-apply-expected-changes), primarily
-`GET /tardigrade/reload/status`.
+### Likely causes
 
-Effective-value precedence (process environment, then config file, then
-decrypted secrets, then built-in defaults) is fully documented in
-[CONFIGURATION.md](CONFIGURATION.md#configuration-reference) — check there
-before assuming a config-file edit is what's actually in effect; a
-`TARDIGRADE_*` environment variable set on the process always wins.
+This pass doesn't diagnose a specific cause by itself — it tells you which
+section below to jump to:
+
+- `tardi check`/`print-config` fails → [§2](#2-config-does-not-parse-or-validate)
+- the process won't start, or `status`/`systemctl status` shows it isn't
+  running → [§3](#3-listener-fails-to-bind--service-is-unreachable)
+- the process is up and `tardi routes`/`upstreams` look right, but a live
+  request behaves unexpectedly → whichever of
+  [§4](#4-route-does-not-match)–[§9](#9-metrics-endpoint-unavailable)
+  matches the symptom (routing, static files, upstream status code, TLS,
+  health, or metrics)
+- a config edit doesn't seem to be taking effect → [§11](#11-reload-did-not-apply-expected-changes)
+
+### Concrete fixes
+
+None at this stage — apply the fix in whichever section your triage pointed
+you to.
+
+### Verify the fix
+
+None at this stage — each section below has its own verification step.
+
+### Related documentation
+
+- [CONFIGURATION.md](CONFIGURATION.md#configuration-reference) — full
+  effective-value precedence (process environment, then config file, then
+  decrypted secrets, then built-in defaults); check there before assuming
+  a config-file edit is what's actually in effect, since a `TARDIGRADE_*`
+  environment variable set on the process always wins.
+- [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md) — the live reload contract
+  referenced above.
 
 ## 2. Config does not parse or validate
 
@@ -415,9 +456,12 @@ tardi routes -c /etc/tardigrade/tardigrade.conf
 sudo -u tardigrade test -r /var/lib/tardigrade/public/index.html
 ```
 
-The `test -r` run as the service account catches "the file exists but
-Tardigrade's user can't read it" — which surfaces as `404`, not a permission
-error, from the client's perspective.
+Run the readability check as the service account because a file can exist
+and resolve correctly while the worker still cannot open it — an
+`AccessDenied` from the actual `openFile` call is propagated as its own
+error rather than converted to `404`, so don't assume this case is an
+ordinary 404. Check the runtime log and the actual client response, and fix
+ownership/permissions for the service account.
 
 #### Likely causes
 
@@ -485,9 +529,18 @@ directory so the request never needs to leave it.
 curl -v -H 'Host: <server_name>' http://127.0.0.1:8069/<legitimate-path>
 ```
 
-Confirm you get `200` for the legitimate path while a traversal attempt
-(`curl http://127.0.0.1:8069/../../etc/passwd`) still correctly returns
-`403`.
+Confirm you get `200` for the legitimate path. To confirm traversal is
+still correctly rejected, send the raw `..` sequence with `--path-as-is` —
+without it, curl normalizes dot-segments client-side before the request
+ever leaves the machine, so the server may never see the traversal attempt
+at all and the test would silently pass or fail for the wrong reason:
+
+```bash
+curl --path-as-is -v -H 'Host: <server_name>' \
+  'http://127.0.0.1:8069/../../etc/passwd'
+```
+
+This should return `403`.
 
 ### Related documentation
 
@@ -616,42 +669,60 @@ failure — don't fold it into the 502/504 explanations above:
 - the per-origin connection-pool limit
   (`TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST`) is exhausted, failing the
   checkout fast instead of queuing without bound
-- every backend for the route is currently marked unhealthy by passive
-  failure tracking (`TARDIGRADE_UPSTREAM_MAX_FAILS`/
-  `TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS`) or active probing — see
-  [§8](#8-health-checks-mark-an-upstream-down)
-- an open circuit breaker fast-failing a backend after repeated failures —
-  see the [circuit-breaker row of OBSERVABILITY.md's overload
-  troubleshooting table](OBSERVABILITY.md#operator-troubleshooting) for the
-  exact recovery condition
 - Tardigrade's own accept-time capacity limits were hit — this is **not**
   an upstream problem at all; see the [overload-response table in
   OBSERVABILITY.md](OBSERVABILITY.md#configured-limits) for the connection/
   queue/memory caps that produce the same deterministic `503`
 
+Marking backends unhealthy (passive failure tracking or active probing —
+see [§8](#8-health-checks-mark-an-upstream-down)) changes backend
+*selection*, not the status code by itself: a healthy backup is preferred
+over an unhealthy primary, but with no healthy backup available Tardigrade
+still probes a primary in round-robin order rather than short-circuiting to
+`503`. So "every backend looks unhealthy" alone can still produce a `502`
+or `504` (from whatever that probed primary actually does), not
+necessarily a `503` — check the access log's `upstream_status`/
+`error_category` for the specific request rather than assuming `503` from
+health state alone.
+
+> `GatewayState`'s circuit-breaker fields
+> (`circuitTryAcquire`/`circuitRecordFailure`/`circuitRecordSuccess`) exist
+> and are unit-tested in isolation, but as of this writing they are not
+> called from the live proxy request path (`gateway_proxy.zig`,
+> `gateway_proxy_runtime.zig`, `gateway_control_plane_proxy.zig`,
+> `gateway_handlers.zig`) — only referenced in comments. Despite
+> `OBSERVABILITY.md`'s troubleshooting table describing a circuit-breaker-
+> open symptom, this guide does not document it as a live `503` cause
+> until that wiring is confirmed or added; treat any breaker-shaped
+> symptom you observe as one of the causes above instead, and flag the gap
+> to a maintainer if you need breaker behavior for production traffic
+> shedding.
+
 #### Concrete fixes
 
-Point 503s at capacity/health metrics rather than guessing:
+Point 503s at capacity metrics rather than guessing:
 
 ```bash
 curl -s http://127.0.0.1:8069/status/metrics | grep -E \
-  'tardigrade_upstream_unhealthy_backends|tardigrade_connection_rejections_total|tardigrade_queue_rejections_total'
+  'tardigrade_connection_rejections_total|tardigrade_queue_rejections_total'
 ```
 
-Scale or repair the unhealthy backend(s), or raise the relevant capacity
-limit only after confirming Tardigrade has headroom (CPU/memory/fds) to
-honor it. If a circuit breaker is involved, let it recover on its own
-schedule rather than editing config to force it closed — it will re-trip on
-the next real failure anyway.
+Raise the relevant capacity limit only after confirming Tardigrade has
+headroom (CPU/memory/fds) to honor it. If backend health looks like the
+underlying issue, fix the origin(s) and use [§8](#8-health-checks-mark-an-upstream-down)
+to confirm they're marked healthy again — that resolves the `502`/`504`s
+the unhealthy state was actually producing.
 
 #### Verify the fix
 
 ```bash
-curl -s http://127.0.0.1:8069/status/metrics | grep tardigrade_upstream_unhealthy_backends
+curl -s http://127.0.0.1:8069/status/metrics | grep -E \
+  'tardigrade_connection_rejections_total|tardigrade_queue_rejections_total'
 curl -v http://127.0.0.1:8069/<proxied-path>
 ```
 
-Confirm the unhealthy-backend count drops and the proxied request succeeds.
+Confirm the rejection counters aren't climbing and the proxied request
+succeeds with the status you expect.
 
 ### Related documentation
 
@@ -670,21 +741,40 @@ can't complete a TLS handshake).
 
 ### Startup validation failures
 
+`tardi check` validates two different things depending on how the binary
+was built, and conflating them leads to false confidence. **`tardi check`
+only performs the full credential-material preflight (PEM parse,
+certificate-chain shape, leaf/key match, validity-window checks) when the
+binary was built with the appliance TLS profile
+(`-Dtls-profile=appliance`).** The published/default build uses the
+`general` (OpenSSL) profile, for which `tardi check` validates config
+*shape* only — it does not parse or cross-check the certificate/key files
+themselves. Confirm which profile you're running with `tardi version`
+(it prints `tls-profile=...`) before trusting `configuration valid` as
+proof the certificate material itself is sound.
+
 #### Symptoms
 
 `tardi check`/`tardi run`/`systemctl start tardigrade` fails with a
-certificate/key-related validation error instead of `configuration valid`.
+certificate/key-related validation error instead of `configuration valid`
+(appliance profile), or the process starts but a real handshake later
+fails despite `configuration valid` (general profile — see [Runtime
+handshake failures](#runtime-handshake-failures) below).
 
 #### First checks
 
+Config-shape validation (both profiles):
+
 ```bash
+tardi version   # confirm tls-profile
 tardi check /etc/tardigrade/tardigrade.conf
 tardi print-config -c /etc/tardigrade/tardigrade.conf
 sudo -u tardigrade test -r /etc/tardigrade/tls/fullchain.pem
 sudo -u tardigrade test -r /etc/tardigrade/tls/privkey.pem
 ```
 
-Certificate metadata:
+Certificate metadata (either profile — this is plain `openssl`, not a
+Tardigrade check):
 
 ```bash
 openssl x509 \
@@ -692,20 +782,44 @@ openssl x509 \
   -noout -subject -issuer -dates
 ```
 
+A profile-independent cert/key match check (compares public-key digests
+rather than relying on a Tardigrade-side match check that only runs on
+appliance builds):
+
+```bash
+openssl x509 -in /etc/tardigrade/tls/fullchain.pem -pubkey -noout \
+  | openssl pkey -pubin -outform DER | sha256sum
+openssl pkey -in /etc/tardigrade/tls/privkey.pem -pubout -outform DER \
+  | sha256sum
+```
+
+The two digests must match.
+
 #### Likely causes
+
+Config-shape (rejected by `tardi check` on **either** profile):
 
 - only `tls_cert_path` or only `tls_key_path` configured — Tardigrade
   requires both or neither, and rejects a cert-only/key-only configuration
   at validation time rather than silently falling back to plaintext
-- the service account can't read the private key (see permissions fix
-  below)
-- malformed PEM, or an ambiguous/ill-formed certificate chain
-- the certificate and key don't match
-- an expired or not-yet-valid certificate (`openssl x509 … -dates` above)
 - for the appliance TLS profile specifically: more than one certificate
   identity configured (server-block TLS material or `TARDIGRADE_TLS_SNI_CERTS`)
   — the appliance profile supports exactly one identity; see
   [BARE_APPLIANCE_TLS.md](BARE_APPLIANCE_TLS.md)
+
+Credential material (rejected by `tardi check` **only on appliance
+builds**; on general/default builds these surface later, at a real TLS
+handshake, not at `check`/startup time):
+
+- the service account can't read the private key (see permissions fix
+  below — this one *does* fail startup on any profile, since the process
+  can't open the file at all)
+- malformed PEM, or an ambiguous/ill-formed certificate chain
+- the certificate and key don't match (`sha256sum` check above)
+- an expired or not-yet-valid certificate (`openssl x509 … -dates` above)
+  — on the general/OpenSSL profile this is normally a *client-side*
+  validation failure at handshake time, not something that blocks
+  Tardigrade from starting
 
 #### Concrete fixes
 
@@ -731,7 +845,10 @@ section](DEPLOYMENT.md#permissions-and-ownership).
 sudo -u tardigrade tardi check /etc/tardigrade/tardigrade.conf
 ```
 
-Should print `configuration valid` with `tls: enabled` in the summary.
+Should print `configuration valid` with `tls: enabled` in the summary. On
+the general/default profile, treat this as config-shape confirmation only
+— follow up with the [runtime handshake check](#runtime-handshake-failures)
+below to actually prove the certificate/key work.
 
 ### Runtime handshake failures
 
@@ -778,10 +895,16 @@ actual mismatch instead.
 
 ```bash
 openssl s_client -connect 127.0.0.1:8443 -servername api.example.com </dev/null
-curl -vk -H 'Host: api.example.com' https://127.0.0.1:8443/health
+curl -v --resolve api.example.com:8443:127.0.0.1 https://api.example.com:8443/health
 ```
 
-Confirm the handshake completes and the response comes back as expected.
+The `curl` here sends `api.example.com` as both SNI and HTTP `Host` — as in
+the triage section, `-H 'Host: ...'` alone against a raw IP would not do
+that. Add `--cacert <path>` if the certificate chains to a private/
+self-signed CA you want validated, or `-k` only if you're deliberately
+separating reachability/routing from trust validation (see the note in
+[§1](#1-five-minute-triage)). Confirm the handshake completes and the
+response comes back as expected.
 
 ### Related documentation
 
@@ -887,16 +1010,17 @@ curl -v http://127.0.0.1:8069/status/metrics
 | Symptom | Meaning |
 | --- | --- |
 | `404 Not Found` | Wrong path, metrics disabled (`TARDIGRADE_METRICS_PATH=""`), or you're hitting the wrong listener/server block. Check `tardi print-config -c <path>` for the `metrics:` line. |
-| `401 Unauthorized` | `TARDIGRADE_METRICS_REQUIRE_AUTH=true` and the request isn't authenticated. This is expected hardening, not a bug — see [DEPLOYMENT.md's hardening checklist](DEPLOYMENT.md#production-hardening-checklist). |
+| `401 Unauthorized` | `TARDIGRADE_METRICS_REQUIRE_AUTH=true` and the request didn't authenticate. This uses the same request-auth mechanism as any other protected route — Basic auth (`TARDIGRADE_BASIC_AUTH_HASHES`), a static bearer-token hash (`TARDIGRADE_AUTH_TOKEN_HASHES`), or JWT bearer auth (`TARDIGRADE_JWT_SECRET`), whichever your config enables — not specifically a bearer token. This is expected hardening, not a bug — see [DEPLOYMENT.md's hardening checklist](DEPLOYMENT.md#production-hardening-checklist). |
 | Connection refused | The listener itself is down or unreachable — this is [§3](#3-listener-fails-to-bind--service-is-unreachable), not a metrics-specific problem. |
 | TLS handshake failure | Wrong scheme (`http://` vs `https://`) or a certificate problem — see [§7](#7-tls-certificatekey-errors). |
-| Curl from the host succeeds, Prometheus scrape fails | The failure is on the scraper's side of the network path — a firewall rule, wrong scrape target, wrong scheme/TLS config in the scrape job, or `TARDIGRADE_METRICS_REQUIRE_AUTH` without a bearer token configured in the scrape job. Not a Tardigrade-side problem once local `curl` works. |
+| Curl from the host succeeds, Prometheus scrape fails | The failure is on the scraper's side of the network path — a firewall rule, wrong scrape target, wrong scheme/TLS config in the scrape job, or `TARDIGRADE_METRICS_REQUIRE_AUTH` without credentials matching whichever auth mechanism your config requires. Not a Tardigrade-side problem once local `curl` works. |
 
 ### Concrete fixes
 
-Correct `TARDIGRADE_METRICS_PATH`/re-enable metrics, supply the auth
-credential your scraper needs if `TARDIGRADE_METRICS_REQUIRE_AUTH=true`, or
-fix the scraper's target/scheme/network path. Don't disable
+Correct `TARDIGRADE_METRICS_PATH`/re-enable metrics, configure the scraper
+for whichever request-auth mechanism your config actually requires (Basic
+auth, static bearer token, or JWT) if `TARDIGRADE_METRICS_REQUIRE_AUTH=true`,
+or fix the scraper's target/scheme/network path. Don't disable
 `TARDIGRADE_METRICS_REQUIRE_AUTH` in production just to unblock a scrape —
 fix the scrape job's auth instead.
 
@@ -947,10 +1071,17 @@ sudo tail -f /var/log/tardigrade/error.log
 
 ### Likely causes
 
-- **expecting a file while output is actually going to
-  journald/stdout/stderr**: without `error_log`/`TARDIGRADE_ERROR_LOG_PATH`
-  configured, runtime and access logs go to stdout, which is what
-  `journalctl`/`docker compose logs` capture
+- **expecting a file while output is actually going to journald/stderr**:
+  both runtime logs and access logs write to **stderr** by default (not
+  stdout) — that's what `journalctl`/`docker compose logs` capture. There
+  is no separate access-log file unless you set `error_log` (see below).
+- **expecting a separate access-log file**: without `error_log`/
+  `TARDIGRADE_ERROR_LOG_PATH` configured, both log types stay on stderr.
+  With it configured, Tardigrade `dup2`s that file onto its own stderr
+  file descriptor at startup, so runtime *and* access logs both end up
+  interleaved in that **one** file — there is no independent
+  `access.log`/`error.log` split; the file just takes whatever name you
+  gave `error_log`.
 - **`error_log` is configured but the target directory/file isn't writable
   by the service account** — check ownership of `/var/log/tardigrade/`
 - **log level filtering**: `error_log … warn;` (or
@@ -958,9 +1089,12 @@ sudo tail -f /var/log/tardigrade/error.log
   might be expecting
 - **access-log minimum status**: `TARDIGRADE_ACCESS_LOG_MIN_STATUS` set
   above `0` hides successful requests from the access log by design
-- **buffering delay**: `TARDIGRADE_ACCESS_LOG_BUFFER_SIZE` set above `0`
-  batches access-log writes until the buffer threshold — a request you just
-  made may not appear until the buffer flushes
+- **buffering**: `TARDIGRADE_ACCESS_LOG_BUFFER_SIZE` set above `0` batches
+  access-log writes until the buffered bytes cross that threshold — a
+  request you just made may not appear yet. There is no time-based flush;
+  entries flush only when the buffer fills, on an explicit flush, or at
+  process teardown, so waiting alone will not surface a line that hasn't
+  reached the threshold.
 - **a misconfigured syslog target** (`TARDIGRADE_ACCESS_LOG_SYSLOG_UDP`)
   silently drops entries the sink refuses (access logging is best-effort and
   never blocks the request path — see
@@ -982,16 +1116,21 @@ one supported rotation path.
 
 ### Concrete fixes
 
-Point your monitoring at the actual active surface (journald vs. file),
-raise the log level or lower `TARDIGRADE_ACCESS_LOG_MIN_STATUS` if you're
-missing entries, fix `/var/log/tardigrade/` ownership, or wait out
-(or disable) the access-log buffer if you need near-real-time entries.
+Point your monitoring at the actual active surface (journald vs. the one
+`error_log` file), raise the log level or lower
+`TARDIGRADE_ACCESS_LOG_MIN_STATUS` if you're missing entries, fix
+`/var/log/tardigrade/` ownership, or — if you need near-real-time
+visibility — generate enough log volume to cross the configured buffer
+threshold, or set `TARDIGRADE_ACCESS_LOG_BUFFER_SIZE=0` to disable
+buffering entirely rather than waiting for it to flush on its own.
 
 ### Verify the fix
 
 ```bash
 curl -v http://127.0.0.1:8069/health
-sudo journalctl -u tardigrade -n 5 --no-pager   # or: tail -5 /var/log/tardigrade/access.log
+sudo journalctl -u tardigrade -n 5 --no-pager
+# or, when error_log is configured (runtime and access logs are interleaved):
+sudo tail -5 /var/log/tardigrade/error.log
 ```
 
 Confirm the request you just made shows up where you expect it.
