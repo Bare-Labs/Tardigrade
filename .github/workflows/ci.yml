@@ -388,12 +388,13 @@ jobs:
         run: zig build "-Doptimize=$OPTIMIZE"
 
   # ── Packaging smoke ─────────────────────────────────────────────────────────
-  # Verifies the release archive layout, install script behavior, and host-native
-  # DEB package layout against a disposable Ubuntu container.
+  # Verifies the release archive layout, install script behavior, host-native
+  # DEB/RPM package layout, and the local-build Docker image, each against a
+  # disposable container.
   packaging-smoke:
     name: Packaging smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -427,6 +428,9 @@ jobs:
 
       - name: Smoke test RPM package
         run: ./scripts/test-rpm-package.sh
+
+      - name: Smoke test Docker image
+        run: ./scripts/test-docker-image.sh
 
   # ── Performance smoke ────────────────────────────────────────────────────────
   # Shared-runner loopback benchmark with conservative floors and a 30s default

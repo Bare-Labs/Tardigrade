@@ -82,14 +82,32 @@ docker run --pull=never --rm \
         export PATH="/opt/zig:${PATH}"
 
         # Build from source inside this container so the binary links against
-        # Rocky Linux 9'"'"'s glibc (2.34) rather than the CI runner'"'"'s.
+        # Rocky Linux 9'"'"'s glibc (2.34) rather than the CI runner'"'"'s. Discard
+        # any zig-out/.zig-cache copied in from the host/CI runner first: without
+        # this, a build failure inside this container (wrong glibc, missing libs,
+        # etc.) can go unnoticed because a stale host-built binary still satisfies
+        # the path below, and the smoke test would package that binary instead of
+        # actually proving the Rocky build works.
         cp -a /repo /tmp/tardigrade
         cd /tmp/tardigrade
-        zig build -Doptimize=ReleaseFast
+        rm -rf zig-out .zig-cache
+
+        # glibc 2.34 (Rocky/RHEL 9'"'"'s version) merged libpthread into libc and
+        # re-versioned pthread_create/pthread_join/etc. under a new GLIBC_2.34
+        # symbol version. Zig'"'"'s default native-target glibc floor predates that,
+        # so it doesn'"'"'t know those symbol versions exist and dynamic linking
+        # against the real /usr/lib64/libssl.so fails with "undefined reference"
+        # even though the symbols are genuinely present at runtime. Passing an
+        # explicit glibc-version floor (not a ceiling -- linking is still against
+        # the real system libc.so.6 dynamically) fixes it; bare "native"/"native-native-gnu"
+        # does not, and was confirmed to reproduce the same failure.
+        zig_arch="$(uname -m)"
+        zig build -Doptimize=ReleaseFast -Dtarget="${zig_arch}-linux-gnu.2.34"
+        test -x zig-out/bin/tardi
 
         /repo/packaging/rpm/build.sh \
             --version 0.0.0 \
-            --arch x86_64 \
+            --arch "$zig_arch" \
             --binary /tmp/tardigrade/zig-out/bin/tardi \
             --output /output
 
@@ -105,14 +123,24 @@ docker run --pull=never --rm \
         test -f /etc/tardigrade/tardigrade.conf
         test -f /usr/lib/systemd/system/tardigrade.service
         test -f /usr/share/licenses/tardigrade/LICENSE
+        test -f /etc/logrotate.d/tardigrade
         test -d /var/log/tardigrade
         test -d /var/lib/tardigrade
         test "$(stat -c "%a %U %G" /etc/tardigrade/tardigrade.env)" = "640 root tardigrade"
         test "$(stat -c "%a %U %G" /etc/tardigrade/tardigrade.conf)" = "644 root root"
+        test "$(stat -c "%a %U %G" /etc/logrotate.d/tardigrade)" = "644 root root"
         test "$(stat -c "%a %U %G" /var/lib/tardigrade)" = "755 tardigrade tardigrade"
+        test "$(stat -c "%U %G" /var/log/tardigrade)" = "tardigrade tardigrade"
+        grep -F "systemctl kill --kill-who=main --signal=USR1 tardigrade.service" /etc/logrotate.d/tardigrade
         grep -F "EnvironmentFile=-/etc/tardigrade/tardigrade.env" /usr/lib/systemd/system/tardigrade.service
-        grep -F "ExecStart=/usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf" /usr/lib/systemd/system/tardigrade.service
+        grep -F "ExecStart=/usr/bin/env TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid /usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf" /usr/lib/systemd/system/tardigrade.service
         grep -F "WorkingDirectory=/var/lib/tardigrade" /usr/lib/systemd/system/tardigrade.service
+        grep -F "RuntimeDirectory=tardigrade" /usr/lib/systemd/system/tardigrade.service
+        grep -F "Environment=TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid" /usr/lib/systemd/system/tardigrade.service
+        grep -F "ExecStartPre=/usr/bin/env TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid /usr/bin/tardi check /etc/tardigrade/tardigrade.conf" /usr/lib/systemd/system/tardigrade.service
+        grep -F "ExecReload=/usr/bin/tardi reload --pid-file /run/tardigrade/tardigrade.pid" /usr/lib/systemd/system/tardigrade.service
+        grep -F "ExecStop=/usr/bin/tardi stop --pid-file /run/tardigrade/tardigrade.pid" /usr/lib/systemd/system/tardigrade.service
+        grep -F "TimeoutStopSec=35s" /usr/lib/systemd/system/tardigrade.service
 
         dnf remove -y tardigrade
         test ! -e /usr/bin/tardi

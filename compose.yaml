@@ -1,0 +1,65 @@
+# Local, build-from-source Docker deployment example. See docs/DEPLOYMENT.md
+# for the full workflow (build, validate, start, reload, stop).
+#
+# This is not a published image — `docker compose build` builds it from the
+# Dockerfile in this repository.
+
+services:
+  tardigrade:
+    build: .
+    ports:
+      - "8069:8069"
+    volumes:
+      # Starter routing/runtime config. Swap for your own; see
+      # docs/CONFIGURATION.md and examples/production-baseline/ for a
+      # hardened starting point.
+      - ./packaging/tardigrade.conf:/etc/tardigrade/tardigrade.conf:ro
+      # Optional static root referenced by the starter config's `root`
+      # directive. Uncomment and point at a real directory if you serve
+      # static files.
+      # - ./public:/var/lib/tardigrade/public:ro
+      # Optional TLS material for a `listen ... ssl;` config. A bind mount
+      # exposes the same host inode/permissions inside the container, so a
+      # host key at root:<some-group> 0640 needs the container to have that
+      # group's *numeric* GID as a supplementary group (names don't cross
+      # the container boundary) — see docs/DEPLOYMENT.md's TLS bind-mount
+      # note. Uncomment both lines and set the real host GID:
+      # - ./tls:/etc/tardigrade/tls:ro
+    # group_add:
+    #   - "${TARDIGRADE_TLS_GID}"   # numeric GID of the host group that owns the key
+    tmpfs:
+      # uid/gid must match the image's fixed non-root `tardigrade` user
+      # (10001:10001, pinned in the Dockerfile) so the runtime can write its
+      # PID file; a plain tmpfs mount defaults to root:root and the process
+      # cannot write into it.
+      - /run/tardigrade:uid=10001,gid=10001,mode=0750
+    # Optional operator environment values (secrets, upstream URLs, etc.).
+    # `tardi` reads TARDIGRADE_* from the process environment only — it does
+    # NOT parse this path as a file the way systemd's EnvironmentFile= does,
+    # so don't bind-mount an env file into the container expecting tardi to
+    # read it. env_file: injects the host file's contents as real container
+    # environment variables instead.
+    # env_file:
+    #   - ./deploy/tardigrade.env
+    environment:
+      # Keep these explicit: Compose `environment:` overrides `env_file:`,
+      # so even a baseline env file setting a conflicting PID path cannot
+      # desync the runtime from the reload/stop commands in docs/DEPLOYMENT.md.
+      TARDIGRADE_PID_FILE: /run/tardigrade/tardigrade.pid
+      TARDIGRADE_REQUIRE_UNPRIVILEGED_USER: "true"
+    restart: unless-stopped
+    # Longer than TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS (default 30000ms) so
+    # Docker's SIGTERM->SIGKILL escalation doesn't cut off a graceful drain.
+    stop_grace_period: 35s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/usr/local/bin/tardi",
+          "status",
+          "--pid-file",
+          "/run/tardigrade/tardigrade.pid"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3

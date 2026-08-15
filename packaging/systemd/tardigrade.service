@@ -8,13 +8,34 @@ Type=simple
 User=tardigrade
 Group=tardigrade
 WorkingDirectory=/var/lib/tardigrade
+
 EnvironmentFile=-/etc/tardigrade/tardigrade.env
-ExecStart=/usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf
-ExecReload=/usr/bin/tardi reload -c /etc/tardigrade/tardigrade.conf
-ExecStop=/usr/bin/tardi stop -c /etc/tardigrade/tardigrade.conf
+Environment=TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid
+
+RuntimeDirectory=tardigrade
+RuntimeDirectoryMode=0750
+
+# `EnvironmentFile=` values override unit-level `Environment=` values, so a
+# TARDIGRADE_PID_FILE set in tardigrade.env would otherwise win here and
+# desync from the ExecReload/ExecStop targets below. Force it at exec time
+# on both commands, not just ExecStart -- ExecStartPre exists to validate
+# the configuration the service is actually about to run with, so it needs
+# to see the same forced value.
+ExecStartPre=/usr/bin/env TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid /usr/bin/tardi check /etc/tardigrade/tardigrade.conf
+ExecStart=/usr/bin/env TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid /usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf
+ExecReload=/usr/bin/tardi reload --pid-file /run/tardigrade/tardigrade.pid
+ExecStop=/usr/bin/tardi stop --pid-file /run/tardigrade/tardigrade.pid
+
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=35s
 LimitNOFILE=65536
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target

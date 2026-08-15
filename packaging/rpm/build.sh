@@ -60,6 +60,22 @@ TARDIGRADE_REQUIRE_UNPRIVILEGED_USER=true
 # TARDIGRADE_UPSTREAM_BASE_URL=http://127.0.0.1:8080
 ENVEOF
 
+# Same SIGUSR1-reopen logrotate policy as the DEB package (packaging/deb/build.sh).
+cat > "${WORK_DIR}/SOURCES/tardigrade.logrotate" <<'LREOF'
+/var/log/tardigrade/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    sharedscripts
+    postrotate
+        systemctl kill --kill-who=main --signal=USR1 tardigrade.service 2>/dev/null || true
+    endscript
+}
+LREOF
+
 rpmbuild --define "_topdir ${WORK_DIR}" \
          --define "version ${VERSION}" \
          --define "build_arch ${RPM_ARCH}" \

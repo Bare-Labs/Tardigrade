@@ -13,10 +13,10 @@ versus what is a local-build-only tool.
 | macOS release archives (`.tar.gz`, darwin x86_64/arm64) | **Planned, not published** | CI builds and tests Tardigrade on `macos-14`, but the release workflow's build matrix only packages Linux. `install.sh` and the Homebrew formula already expect `tardigrade-darwin-*.tar.gz` assets that do not yet exist. |
 | DEB (`packaging/deb/build.sh`) | **Supported, published** | Built for `amd64`/`arm64` from the same release binaries as the `.tar.gz` archives and attached to every GitHub release; also usable as a local builder (`packaging/deb/build.sh`). Smoke-tested on every PR/push via the `packaging-smoke` CI job (`scripts/test-deb-package.sh`). |
 | RPM (`packaging/rpm/build.sh`) | **Supported, published** | Same treatment as DEB, for `x86_64`/`aarch64`. Smoke-tested via `scripts/test-rpm-package.sh`. Built from the same Ubuntu-runner binary as the archives — see the glibc compatibility note below if targeting an older RHEL-family release. |
-| systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and exercised end-to-end by both the DEB and RPM smoke tests. |
+| systemd unit (`packaging/systemd/tardigrade.service`) | **Supported** | Installed and structurally validated (unit file text/layout, permissions) by both the DEB and RPM smoke tests. Neither test boots systemd or exercises a real start/status/reload/stop lifecycle — see [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md#the-systemd-units-pidcontrol-path-contract) for the unit contract these assertions check. |
 | launchd plist (`packaging/launchd/io.baresystems.tardigrade.plist`) | **Unverified template** | Ships as a template for macOS host-native installs; there is no macOS packaging pipeline or smoke test exercising it. |
 | Homebrew (`packaging/homebrew/tardigrade.rb`) | **Formula present, tap not published, macOS blocked** | The `on_linux` blocks can resolve once real release checksums are filled in; the `on_macos` blocks cannot resolve until macOS archives are published (see above). No `Bare-Systems/homebrew-tap` repo exists yet. |
-| Docker / OCI image | **Not implemented** | No `Dockerfile` or container-publishing workflow exists in this repository. |
+| Docker / OCI image | **Local build supported, not published** | Root [`Dockerfile`](../Dockerfile) and [`compose.yaml`](../compose.yaml) build a runtime image locally; smoke-tested via `scripts/test-docker-image.sh` in the `packaging-smoke` CI job. No registry-published image or container-publishing workflow exists. See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the full workflow. |
 
 ## Quick install (recommended)
 
@@ -130,20 +130,52 @@ sudo systemctl enable --now tardigrade
 ```
 
 Like the DEB package, the RPM installs a starter
-`/etc/tardigrade/tardigrade.conf` and creates `/var/lib/tardigrade` (the
-systemd unit's `WorkingDirectory`) on install, so `systemctl enable --now
+`/etc/tardigrade/tardigrade.conf`, creates `/var/lib/tardigrade` (the
+systemd unit's `WorkingDirectory`), creates a `tardigrade`-owned
+`/var/log/tardigrade`, and installs the same SIGUSR1-reopen logrotate
+policy at `/etc/logrotate.d/tardigrade`, so `systemctl enable --now
 tardigrade` works immediately after a fresh install.
+
+## Docker (local build)
+
+There is no published Bare Systems container image. The root
+[`Dockerfile`](../Dockerfile) and [`compose.yaml`](../compose.yaml) support
+building and running Tardigrade in a container locally:
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+The image is a multi-stage build (Zig toolchain in the build stage only, a
+minimal `tardi` + OpenSSL/CA-certificates runtime in the final stage) that
+runs as a non-root `tardigrade` user. See
+[docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) for the complete Docker workflow
+— build, config validation, start, reload, and graceful stop — alongside the
+equivalent systemd path.
 
 ## Upgrading
 
-For both DEB and RPM installs, validate the new config before reloading or
-restarting the service, so a bad edit surfaces before the running process is
-affected:
+After a package (or standalone binary) upgrade, use `systemctl restart`, not
+`systemctl reload`:
 
 ```bash
-sudo -u tardigrade tardi check /etc/tardigrade/tardigrade.conf
-sudo systemctl reload tardigrade   # or: restart, if reload is insufficient
+sudo apt install ./new-package.deb   # or: dnf upgrade / rpm -U for RPM
+sudo systemctl restart tardigrade
 ```
+
+`systemctl reload` sends `SIGHUP`, which republishes the *existing running
+process's* config — it does not exec the newly installed `tardi` binary, so
+a package/binary upgrade needs a restart to actually take effect. Reserve
+`reload` for edits to reloadable values in `tardigrade.conf` where neither
+the binary nor `/etc/tardigrade/tardigrade.env` changed; env-file edits also
+always require a restart (`SIGHUP` cannot change an already-running
+process's environment). See
+[docs/DEPLOYMENT.md#commands](../docs/DEPLOYMENT.md#commands) and
+[docs/RELOAD_SHUTDOWN.md](../docs/RELOAD_SHUTDOWN.md) for the exact
+reload/restart boundary, and why the standalone `tardi check` shown there
+isn't a complete pre-flight check on its own (it doesn't load
+`tardigrade.env`).
 
 - DEB upgrades (`sudo apt install ./new-package.deb`) preserve
   `/etc/tardigrade/tardigrade.conf` and `/etc/tardigrade/tardigrade.env` as
@@ -198,5 +230,6 @@ Pre-built service files for host-native installs:
 ## Related docs
 
 - [Main README — Install](../README.md#install)
+- [Production deployment guide](../docs/DEPLOYMENT.md)
 - [Release checklist](../docs/RELEASE_CHECKLIST.md)
 - [Support matrix](../docs/SUPPORT_MATRIX.md)
