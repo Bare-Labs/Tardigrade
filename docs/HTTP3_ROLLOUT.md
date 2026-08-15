@@ -753,7 +753,11 @@ this section only points at where to look, not at duplicate content.
 A required H3-capable `h2load` build (nghttp2 built against ngtcp2 +
 nghttp3) is not installed in default CI; on any host without one, H3 rows are
 recorded as `supported: false` with a reason rather than silently skipped.
-Verify a local build with `h2load --h3 --help`.
+`h2load --h3 --help` succeeding is not sufficient to verify this locally —
+the stock `apt`/`brew` build recognizes the flag but has no QUIC library
+linked, and silently degrades to plain TCP instead of erroring; see the
+competitive README's "Requirements" section for the actual check (flag
+recognition plus `otool -L`/`ldd` linkage verification).
 
 Performance claims from any of this must stay scoped to the recorded
 hardware and configuration — see the competitive README's repeated warning

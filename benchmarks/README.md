@@ -162,8 +162,12 @@ These measure raw request throughput and run with whichever tool is auto-detecte
 | `reload-under-load` | SIGHUP sent mid-run; measures degradation during reload | Requires `wrk` and a PID file |
 
 HTTP/3 scenarios require `h2load` built with QUIC support (`nghttp3` + `ngtcp2`). The runner
-detects this at runtime by checking whether `h2load --h3` is recognized; if not, the scenario
-prints a skip message and continues. HTTP/3 also requires TLS because QUIC mandates it —
+detects this at runtime via `h2load_h3_supported()`, which checks both that `--h3` is
+recognized *and* that the binary is actually linked against `libngtcp2`/`libnghttp3`
+(`otool -L`/`ldd`) — flag recognition alone isn't reliable: the stock `apt`/`brew` `nghttp2`
+package accepts `--h3` syntactically but has no QUIC library linked, and silently falls back
+to a plain TCP connection instead of erroring. If either check fails, the scenario prints a
+skip message and continues. HTTP/3 also requires TLS because QUIC mandates it —
 always pass `--tls` for HTTP/3 runs. `--insecure` is still accepted and still applies to
 `wrk`/`fortio`/`k6`, but h2load itself has no certificate-verification flag at all (verified
 against a real nghttp2 1.69.0 build) — it never validates TLS certificates in the first

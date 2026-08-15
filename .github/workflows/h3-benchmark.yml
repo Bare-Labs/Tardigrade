@@ -61,15 +61,6 @@ jobs:
             zig-h3-benchmark-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig') }}-
             zig-h3-benchmark-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Report h2load HTTP/3 support on this runner
-        run: |
-          if h2load --h3 --help >/dev/null 2>&1; then
-            echo "h2load on this runner supports HTTP/3 — H3 rows will be recorded."
-          else
-            echo "h2load on this runner does NOT support HTTP/3 (no QUIC-enabled build available)."
-            echo "H3 rows will be recorded as unsupported with a reason, per benchmarks/competitive/README.md."
-          fi
-
       - name: Run the H3/QUIC competitive benchmark matrix
         run: |
           ./benchmarks/competitive/run.sh \

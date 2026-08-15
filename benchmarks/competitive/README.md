@@ -170,15 +170,32 @@ socket buffer tuning, ECN, pacing, and future batching/GSO/GRO plans) lives in
 
 - An **H3-capable `h2load`** build: nghttp2 built with QUIC support against
   ngtcp2 + nghttp3. The stock `apt`/`brew` `nghttp2` package usually is not
-  this build. Verify with:
+  this build — it recognizes `--h3` as a valid flag but has no QUIC library
+  linked in at all, so it silently falls back to a plain TCP connection
+  offering ALPN `h3` (only ever valid over QUIC/UDP), which any correct H3
+  server must reject. `h2load --h3 --help` succeeding is therefore **not**
+  proof of real HTTP/3 support by itself — this exact false positive is what
+  the harness's own capability check exists to catch. Verify the same way
+  the harness does, by also confirming the binary is actually linked against
+  a QUIC library:
 
   ```bash
-  h2load --h3 --help >/dev/null && echo "h2load supports HTTP/3" || echo "h2load does NOT support HTTP/3"
+  h2load --h3 --help >/dev/null 2>&1 && echo "h2load recognizes --h3 (necessary, not sufficient)"
+  otool -L "$(command -v h2load)" | grep -Ei 'libngtcp2|libnghttp3'   # macOS
+  ldd "$(command -v h2load)" | grep -Ei 'libngtcp2|libnghttp3'        # Linux
   ```
 
-  Without it, every H3 row is recorded as `"supported": false` with a
-  `"reason"` explaining why — never silently skipped, never a fabricated
-  number.
+  Both need to succeed. Note this is a best-effort, dynamic-linkage check: a
+  statically-linked QUIC build won't show up in `otool -L`/`ldd` output and
+  will be conservatively reported as unsupported (a false negative, never
+  the false positive above). The authoritative result is whatever
+  `h2load_h3_supported()` in `benchmarks/run.sh` / `benchmarks/competitive/run.sh`
+  reports at run time — the commands above are for a human to sanity-check
+  in advance, not a separate rule the harness has to agree with.
+
+  Without real support, every H3 row is recorded as `"supported": false`
+  with a `"reason"` explaining why — never silently skipped, never a
+  fabricated number.
 - `openssl`, to generate a **benchmark-only local TLS identity** fresh for
   each run via `scripts/interop/gen-certs.sh` (never a checked-in or
   developer-machine certificate path).

@@ -390,7 +390,13 @@ extract_h2load_percentile_ms() {
         *) echo "null"; return 0 ;;
     esac
     local value
-    value=$(printf '%s\n' "$raw" | grep -E "$pattern" | grep -oE '[0-9.]+ (us|ms|s)' | head -1 | tr -d ' ')
+    # `|| true`: a percentile label this h2load build doesn't print (this
+    # script's own doc comment above notes 99.9th isn't always present) is a
+    # legitimate "no value" outcome, not a script-ending error — under
+    # set -euo pipefail, an unmatched grep here would otherwise abort the
+    # whole run instead of falling through to latency_value_to_ms's existing
+    # empty-value -> "null" handling.
+    value=$(printf '%s\n' "$raw" | grep -E "$pattern" | grep -oE '[0-9.]+ (us|ms|s)' | head -1 | tr -d ' ' || true)
     latency_value_to_ms "$value"
 }
 
@@ -953,15 +959,27 @@ quic_metric_labeled() {
 
 quic_buffer_status_label() {
     local body="$1" direction="$2"
+    # `|| true`: under this script's `set -euo pipefail`, the first grep
+    # returning no match (a legitimate "this series is absent" outcome the
+    # caller's required-fields check below is designed to handle) would
+    # otherwise abort the whole script instead of yielding the empty string
+    # this function is supposed to return in that case.
     printf '%s\n' "$body" \
         | grep -oE "tardigrade_quic_udp_buffer_status\\{direction=\"${direction}\",status=\"[a-z]+\"\\}" \
-        | grep -oE 'status="[a-z]+"' | sed -E 's/status="([a-z]+)"/\1/' | head -1
+        | grep -oE 'status="[a-z]+"' | sed -E 's/status="([a-z]+)"/\1/' | head -1 || true
 }
 
 capture_quic_transport_state() {
     local url="${SCHEME}://${TARGET_HOST}:${TARGET_PORT}${QUIC_METRICS_PATH}"
     local extra=()
     $INSECURE && extra+=(--insecure)
+    # #256-G review: a listener with a non-empty server_name (e.g. the H3
+    # benchmark config's `tardigrade.test`) 404s a request whose Host
+    # doesn't match it, same as any other route — without this, the load
+    # pass can succeed (it already sends $HOST_HEADER via run_h2load_h3)
+    # while this separate metrics scrape 404s and the required `quic`
+    # evidence silently becomes unobservable.
+    [[ -n "${HOST_HEADER:-}" ]] && extra+=(-H "Host: $HOST_HEADER")
     local body
     if ! body=$(curl -fsS "${extra[@]+"${extra[@]}"}" "$url" 2>/dev/null); then
         echo "null"

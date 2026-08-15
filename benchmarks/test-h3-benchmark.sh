@@ -454,11 +454,17 @@ fi
 
 echo ""
 echo "==> Test 13: parse_h2load_json_result parses a real h2load 1.69.0 --output-file document (#256-G review)"
-# This fixture is not invented — it is a real --output-file=<path> capture
-# from `h2load --h3 -H "Host: tardigrade.test" --sni=tardigrade.test
-# https://127.0.0.1:<port>/health` against a live local Tardigrade H3
-# listener, run by hand while fixing this review (the version/schema the
-# review flagged as incompatible with the old text-table parser).
+# Provenance, corrected per review: this is a real --output-file=<path>
+# capture's *schema* from a local nghttp2 1.69.0 h2load run against a real
+# local Tardigrade listener — but it is an HTTP/2 capture, not HTTP/3/QUIC
+# evidence. The commit that root-caused #256-G's ALPN failure (cff15570)
+# established that this same local h2load recognizes `--h3` syntactically
+# but has no QUIC library linked, so it degrades to a plain TCP connection;
+# pointed at Tardigrade's HTTP/2 (TCP) listener instead of the HTTP/3 one,
+# that degraded connection completes normally and produced this JSON. The
+# --output-file schema itself (field names, nesting, units) is real and
+# verified, which is all this parser test needs — it is not, and must not be
+# read as, the real H3 benchmark evidence #256 still requires.
 # #256-G review: requests.failed/.errored/.timeout are not disjoint in real
 # h2load — .errored/.timeout requests are already folded into .failed — so
 # this fixture keeps failed >= errored + timeout (5 >= 1 + 1) instead of
@@ -681,6 +687,41 @@ h2load_h3_supported && echo SUPPORTED || echo UNSUPPORTED
 ")"
 check "competitive/run.sh: flag-only h2load is also reported unsupported, not a false positive" \
     "UNSUPPORTED" "$COMPETITIVE_CASE_A_OUT"
+
+echo ""
+echo "==> Test 21: capture_quic_transport_state sends the configured Host header to the metrics scrape, not just the load pass (#256-G review)"
+# capture_quic_transport_state's own curl call redirects stderr to
+# /dev/null (so an unreachable endpoint doesn't spam the run), so the stub
+# below has to record its args to a file rather than stderr.
+CURL_ARGS_LOG="$(mktemp /tmp/tardi-h3-curlargs-XXXX.log)"
+bash -c "
+set -euo pipefail
+SCHEME=https; TARGET_HOST=127.0.0.1; TARGET_PORT=9443; QUIC_METRICS_PATH=/status/metrics; INSECURE=true; HOST_HEADER=tardigrade.test
+curl() { printf '%s\n' \"\$*\" >> '${CURL_ARGS_LOG}'; echo 'tardigrade_quic_packets_sent_total 1'; }
+${QUIC_FNS}
+capture_quic_transport_state >/dev/null
+"
+check "capture_quic_transport_state: metrics scrape sends Host header matching \$HOST_HEADER, not just the load pass" \
+    "Host: tardigrade.test" "$(cat "$CURL_ARGS_LOG")"
+rm -f "$CURL_ARGS_LOG"
+
+echo ""
+echo "==> Test 22: the H3 matrix sends Host/:authority matching the benchmark config's server_name end-to-end, not the 127.0.0.1 literal in the URL (#256-G review)"
+MATRIX_SRC="$(sed -n '/^run_tardigrade_http3_matrix/,/^}/p' "$COMPETITIVE_RUN_SH")"
+# shellcheck disable=SC2016 # single-quoted on purpose: matching the literal source text, not expanding a shell variable
+check "readiness checks (wait_for_https) pass the configured Host header" \
+    'wait_for_https "https://127.0.0.1:${port}/health" 60 0.2 "$H3_TLS_SERVER_NAME"' "$MATRIX_SRC"
+# shellcheck disable=SC2016 # single-quoted on purpose: matching the literal source text, not expanding a shell variable
+check "payload preflight checks (assert_payload_size) pass the configured Host header" \
+    'assert_payload_size "https://127.0.0.1:${port}/tiny.txt" 3 "$H3_TLS_SERVER_NAME"' "$MATRIX_SRC"
+VERIFY_H3_SRC="$(sed -n '/^verify_h3_listener/,/^}/p' "$COMPETITIVE_RUN_SH")"
+# shellcheck disable=SC2016 # single-quoted on purpose: matching the literal source text, not expanding a shell variable
+check "verify_h3_listener's real HTTP/3 readiness request sends the configured Host header" \
+    'h2load --h3 -n 1 -c 1 -H "Host: ${H3_TLS_SERVER_NAME}"' "$VERIFY_H3_SRC"
+PASS_H3_SRC="$(sed -n '/^run_benchmark_pass_h3/,/^}/p' "$COMPETITIVE_RUN_SH")"
+# shellcheck disable=SC2016 # single-quoted on purpose: matching the literal source text, not expanding a shell variable
+check "run_benchmark_pass_h3 forwards --host-header to benchmarks/run.sh (so the h2load load pass also gets it via TOOL_HEADERS)" \
+    '--host-header "$H3_TLS_SERVER_NAME"' "$PASS_H3_SRC"
 
 echo ""
 echo "==> Test: existing HTTP/1 benchmark behavior does not regress (run.sh --help still documents http1 scenarios)"

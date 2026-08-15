@@ -259,9 +259,12 @@ wait_for_https() {
     local url="$1"
     local attempts="${2:-60}"
     local delay="${3:-0.2}"
+    local host_header="${4:-}"
+    local extra=()
+    [[ -n "$host_header" ]] && extra+=(-H "Host: ${host_header}")
     local i
     for ((i = 0; i < attempts; i += 1)); do
-        if curl -k -fsS "$url" >/dev/null 2>&1; then
+        if curl -k -fsS "${extra[@]+"${extra[@]}"}" "$url" >/dev/null 2>&1; then
             return 0
         fi
         sleep "$delay"
@@ -289,7 +292,12 @@ verify_h3_listener() {
     # TLS certificates in the first place, and passing an option it doesn't
     # recognize makes it exit immediately, which this loop would otherwise
     # misreport as "the listener didn't answer."
-    raw=$(h2load --h3 -n 1 -c 1 "$url" 2>&1) || true
+    # #256-G review: the benchmark config's `server_name` is
+    # $H3_TLS_SERVER_NAME, not the 127.0.0.1 literal in $url — H3 dispatch
+    # resolves routes off :authority, so without this header every request
+    # here 404s before reaching /health regardless of whether QUIC itself
+    # negotiated correctly.
+    raw=$(h2load --h3 -n 1 -c 1 -H "Host: ${H3_TLS_SERVER_NAME}" "$url" 2>&1) || true
     succeeded=$(printf '%s\n' "$raw" | grep -oE '[0-9]+ succeeded' | grep -oE '^[0-9]+' | head -1)
     failed=$(printf '%s\n' "$raw" | grep -oE '[0-9]+ failed' | grep -oE '^[0-9]+' | head -1)
     if [[ "${succeeded:-0}" -lt 1 || "${failed:-1}" -gt 0 ]]; then
@@ -659,11 +667,14 @@ wrk_error_count() {
 assert_payload_size() {
     local url="$1"
     local expected_bytes="$2"
+    local host_header="${3:-}"
     local tmp actual_bytes
     tmp="$(mktemp /tmp/tardigrade-competitive-payload-XXXX)"
+    local extra=()
+    [[ -n "$host_header" ]] && extra+=(-H "Host: ${host_header}")
     # -k is a no-op for plain http:// URLs; needed for the benchmark-only
     # self-signed H3 listener's https:// URLs (#256-G).
-    curl -k -fsS "$url" -o "$tmp"
+    curl -k -fsS "${extra[@]+"${extra[@]}"}" "$url" -o "$tmp"
     actual_bytes="$(wc -c < "$tmp" | tr -d '[:space:]')"
     rm -f "$tmp"
     if [[ "$actual_bytes" != "$expected_bytes" ]]; then
@@ -764,6 +775,7 @@ run_benchmark_pass_h3() {
         --tool h2load \
         --host 127.0.0.1 \
         --port "$port" \
+        --host-header "$H3_TLS_SERVER_NAME" \
         --tls \
         --insecure \
         --driver "competitive-loopback" \
@@ -820,15 +832,15 @@ run_tardigrade_http3_matrix() {
     echo "h2load supports HTTP/3 on this host — any Tardigrade H3 failure from here is a product regression, not an environment limitation, and fails this run."
 
     start_tardigrade_http3 "$port"
-    if ! wait_for_https "https://127.0.0.1:${port}/health"; then
+    if ! wait_for_https "https://127.0.0.1:${port}/health" 60 0.2 "$H3_TLS_SERVER_NAME"; then
         echo "  tardigrade did not come up with HTTP/3 enabled." >&2
         dump_h3_logs
         cleanup_edge
         return 1
     fi
-    assert_payload_size "https://127.0.0.1:${port}/tiny.txt" 3
-    assert_payload_size "https://127.0.0.1:${port}/large.bin" 1048576
-    assert_payload_size "https://127.0.0.1:${port}/proxy/payload-1m.bin" 1048576
+    assert_payload_size "https://127.0.0.1:${port}/tiny.txt" 3 "$H3_TLS_SERVER_NAME"
+    assert_payload_size "https://127.0.0.1:${port}/large.bin" 1048576 "$H3_TLS_SERVER_NAME"
+    assert_payload_size "https://127.0.0.1:${port}/proxy/payload-1m.bin" 1048576 "$H3_TLS_SERVER_NAME"
 
     if ! verify_h3_listener "$port"; then
         echo "  H3/QUIC listener did not answer a real HTTP/3 request." >&2
@@ -851,7 +863,7 @@ run_tardigrade_http3_matrix() {
         start_tardigrade_http3 "$port" \
             "TARDIGRADE_HTTP3_UDP_RECV_BUFFER_BYTES=${H3_TUNED_UDP_BUFFER_BYTES}" \
             "TARDIGRADE_HTTP3_UDP_SEND_BUFFER_BYTES=${H3_TUNED_UDP_BUFFER_BYTES}"
-        if ! wait_for_https "https://127.0.0.1:${port}/health" || ! verify_h3_listener "$port"; then
+        if ! wait_for_https "https://127.0.0.1:${port}/health" 60 0.2 "$H3_TLS_SERVER_NAME" || ! verify_h3_listener "$port"; then
             # Baseline H3 already proved the client is capable and the
             # untuned listener works — a tuned-listener failure here is the
             # same kind of product regression as the baseline checks above,
