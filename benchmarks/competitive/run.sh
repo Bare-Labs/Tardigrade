@@ -88,9 +88,9 @@ Competitive benchmark manual flow:
 4. For each server in ${SERVERS}, render its template from benchmarks/competitive/configs
    with LISTEN_PORT, UPSTREAM_PORT, STATIC_ROOT, PID_FILE, and ERROR_LOG.
 5. Start one server at a time, wait for http://127.0.0.1:<port>/health, then run:
-   benchmarks/run.sh --tool ${TOOL} --host 127.0.0.1 --port <port> \
-     --duration ${DURATION} --connections ${CONNECTIONS} --threads ${THREADS} \
-     --static-path /tiny.txt --keepalive-path /tiny.txt \
+   benchmarks/run.sh --tool ${TOOL} --host 127.0.0.1 --port <port> \\
+     --duration ${DURATION} --connections ${CONNECTIONS} --threads ${THREADS} \\
+     --static-path /tiny.txt --keepalive-path /tiny.txt \\
      --proxy-path /proxy/health --save <server>-tiny-proxy.json
 6. Repeat with --static-path /large.bin and --scenarios static-http1.
 7. Repeat with --proxy-path /proxy/payload-1m.bin and --scenarios proxy-http1.
@@ -217,6 +217,7 @@ generate_h3_certs() {
     local dir="$1"
     "${REPO_ROOT}/scripts/interop/gen-certs.sh" "${dir}/certs" >/dev/null
 }
+
 # #256-G: a second, TLS+HTTP/3-enabled Tardigrade listener alongside the
 # plaintext HTTP/1.1 config the rest of this harness uses. Extra positional
 # args after `port` are passed through as additional environment assignments
@@ -1115,7 +1116,7 @@ write_combined_outputs() {
                 ["tardigrade", ("upstream-pool/origin/" + (.origin // "unknown")), (.covered // true), (.reason // null),
                  (.rps // null), null, null, (.p99_ms // null), null, (.p99_ttfb_ms // null), null,
                  (.cpu_pct_avg // null), (.cpu_ms_per_request // null), (.rss_mb_peak // null), (.open_fds_peak // null), (.errors // null),
-                 (.value.pool_lock_wait_ns_per_request // null), (.value.pool_lock_wait_ns_per_acquire // null),
+                 (.pool_lock_wait_ns_per_request // null), (.pool_lock_wait_ns_per_acquire // null),
                  null, null, null, null, null, null, null]),
             (.upstream_pool_matrix.scenarios["pool-contention"].measurements // [] | .[] |
                 ["tardigrade", ("upstream-pool/contention/" + ((.worker_threads // 0) | tostring) + "w"), (.covered // true), (.reason // null),
