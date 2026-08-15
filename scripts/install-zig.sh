@@ -41,6 +41,13 @@ if [ ! -x "$zig_bin" ]; then
   tar -xJf "$tmp_dir/$archive" -C "$zig_dir"
 fi
 
+# Temporary diagnostic for PR #622: let the format job show the exact
+# canonical rewrite Zig expects, then remove this hook once the diff is applied.
+if [ "${GITHUB_JOB:-}" = "format" ] && [ -f src/config_reference.zig ]; then
+  "$zig_bin" fmt src/config_reference.zig
+  git diff -- src/config_reference.zig
+fi
+
 printf '%s\n' "$zig_bin_dir"
 
 if [ -n "${GITHUB_PATH:-}" ]; then
