@@ -14,8 +14,9 @@ This document is the design of record. The scaffolding it describes lives in:
   gateway HTTP/3 listener.
 
 The event models, JSON-SEQ serializers, HTTP/3 qlog bridge, QUIC qlog bridge,
-shared TLS keylog emission seam, and gateway qlog/keylog file destinations are
-implemented. #247 artifact retention remains opt-in harness work.
+shared TLS keylog emission seam, gateway qlog/keylog file destinations, and
+#247 external H3 interop artifact retention are implemented. All artifact
+capture remains opt-in.
 
 ## Goals
 
@@ -222,6 +223,37 @@ Use `.sqlog` files with qvis. Use the `.keys` file with Wireshark only together
 with packet captures from traffic you own and are authorized to decrypt. Delete
 both artifacts after the debugging session unless your incident-retention
 policy explicitly says otherwise.
+
+### External H3 interop artifacts
+
+`scripts/interop/run-interop.sh` keeps ordinary matrix runs unchanged: no qlog
+or keylog artifacts are produced by default. For local failure debugging, enable
+artifacts explicitly:
+
+```sh
+INTEROP_QLOG=1 \
+INTEROP_ARTIFACT_DIR=/tmp/tardigrade-h3-artifacts \
+NGTCP2_EXAMPLES_DIR=/path/to/ngtcp2/build/examples \
+scripts/interop/run-interop.sh
+```
+
+`INTEROP_QLOG=1` passes `--qlog-dir` to each native `h3_interop_tool` direction
+and retains the resulting per-role `.sqlog` files under one directory per
+matrix case. `INTEROP_KEYLOG=1` additionally passes `--keylog-path`, writes a
+per-role `.keys` file beside the qlog files, and creates a
+`SENSITIVE-KEYLOG.txt` marker. Keylog capture is deliberately separate from
+qlog because the `.keys` file permits decrypting packet captures.
+
+If any matrix row fails and an artifact root is active, the script prints the
+artifact directory once at the end:
+
+```text
+interop failure artifacts: /tmp/tardigrade-h3-artifacts
+```
+
+Do not enable `INTEROP_KEYLOG` in ordinary public CI, and do not upload keylogs
+without an explicitly authorized secret-safe artifact policy. qlog traces can
+be useful opt-in failure evidence; keylogs require separate handling.
 
 ### Sink error handling
 

@@ -32,8 +32,54 @@ mkdir -p "$certs" "$logs"
 pass=0
 fail=0
 skip=0
+artifact_dir=""
+qlog_enabled=0
+keylog_enabled=0
 
 say() { printf '%s\n' "$*"; }
+
+enabled() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if enabled "${INTEROP_QLOG:-}"; then
+  qlog_enabled=1
+fi
+if enabled "${INTEROP_KEYLOG:-}"; then
+  keylog_enabled=1
+fi
+if [ "$qlog_enabled" -eq 1 ] || [ "$keylog_enabled" -eq 1 ]; then
+  artifact_dir="${INTEROP_ARTIFACT_DIR:-$workdir/artifacts}"
+  mkdir -p "$artifact_dir"
+fi
+if [ "$keylog_enabled" -eq 1 ]; then
+  say "WARNING: INTEROP_KEYLOG is enabled; retained *.keys files permit decrypting captured traffic and must be treated as sensitive."
+fi
+
+native_artifact_args=() # case-id role
+prepare_native_artifacts() {
+  native_artifact_args=()
+  [ -n "$artifact_dir" ] || return 0
+  local case_id="$1"
+  local role="$2"
+  local case_dir="$artifact_dir/$case_id"
+  mkdir -p "$case_dir"
+  if [ "$qlog_enabled" -eq 1 ]; then
+    mkdir -p "$case_dir/qlog-$role"
+    native_artifact_args+=(--qlog-dir "$case_dir/qlog-$role")
+  fi
+  if [ "$keylog_enabled" -eq 1 ]; then
+    native_artifact_args+=(--keylog-path "$case_dir/$role.keys")
+    printf '%s\n' \
+      'SENSITIVE: *.keys files in this directory contain TLS traffic secrets.' \
+      'Do not upload them to public CI artifacts, logs, or issues.' \
+      >"$case_dir/SENSITIVE-KEYLOG.txt"
+    chmod 0600 "$case_dir/SENSITIVE-KEYLOG.txt" 2>/dev/null || true
+  fi
+}
 
 result() { # name status
   case "$2" in
@@ -68,8 +114,9 @@ if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsserver" ]
     -d "$workdir/docroot" --quiet >"$logs/1-gtlsserver.log" 2>&1 &
   peer=$!
   wait_udp_listen
+  prepare_native_artifacts "1-native-client-ngtcp2-server" "native-client"
   if "$tool" client --host 127.0.0.1 --port "$port" --authority tardigrade.test \
-    --path /interop.txt --insecure --timeout-ms 10000 >"$logs/1-native-client.log" 2>&1 &&
+    --path /interop.txt --insecure --timeout-ms 10000 "${native_artifact_args[@]}" >"$logs/1-native-client.log" 2>&1 &&
     grep -q "hello-from-ngtcp2" "$logs/1-native-client.log"; then
     result "native client -> ngtcp2 gtlsserver" PASS
   else
@@ -84,8 +131,9 @@ fi
 # --- 2. ngtcp2 gtlsclient -> native server --------------------------------
 next_port
 if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ]; then
+  prepare_native_artifacts "2-ngtcp2-client-native-server" "native-server"
   "$tool" server --port "$port" --cert "$certs/ed25519-cert.der" --key "$certs/ed25519-key.pkcs8.der" \
-    --timeout-ms 15000 >"$logs/2-native-server.log" 2>&1 &
+    --timeout-ms 15000 "${native_artifact_args[@]}" >"$logs/2-native-server.log" 2>&1 &
   peer=$!
   wait_udp_listen
   "$NGTCP2_EXAMPLES_DIR/gtlsclient" 127.0.0.1 "$port" "https://tardigrade.test/from-ngtcp2" \
@@ -112,9 +160,10 @@ if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsserver" ]
     -d "$workdir/hrr-docroot" --quiet >"$logs/333-1-gtlsserver-hrr.log" 2>&1 &
   peer=$!
   wait_udp_listen
+  prepare_native_artifacts "333-1-native-hrr-client-ngtcp2-server" "native-client"
   if "$tool" client --host 127.0.0.1 --port "$port" --authority tardigrade.test \
     --path /hrr.txt --insecure --empty-initial-key-share --expect-hrr --timeout-ms 10000 \
-    >"$logs/333-1-native-client-hrr.log" 2>&1 &&
+    "${native_artifact_args[@]}" >"$logs/333-1-native-client-hrr.log" 2>&1 &&
     grep -q "hello-from-ngtcp2-hrr" "$logs/333-1-native-client-hrr.log" &&
     grep -q "tls retry_state=hrr_received" "$logs/333-1-native-client-hrr.log"; then
     result "#333 native HRR client -> ngtcp2 gtlsserver" PASS
@@ -130,8 +179,9 @@ fi
 # --- 333-2. ngtcp2 HRR gtlsclient -> native server ------------------------
 next_port
 if [ -n "${NGTCP2_EXAMPLES_DIR:-}" ] && [ -x "$NGTCP2_EXAMPLES_DIR/gtlsclient" ]; then
+  prepare_native_artifacts "333-2-ngtcp2-hrr-client-native-server" "native-server"
   "$tool" server --port "$port" --cert "$certs/ed25519-cert.der" --key "$certs/ed25519-key.pkcs8.der" \
-    --expect-hrr --verbose --timeout-ms 15000 >"$logs/333-2-native-server-hrr.log" 2>&1 &
+    --expect-hrr --verbose --timeout-ms 15000 "${native_artifact_args[@]}" >"$logs/333-2-native-server-hrr.log" 2>&1 &
   peer=$!
   wait_udp_listen
   "$NGTCP2_EXAMPLES_DIR/gtlsclient" --groups=-GROUP-ALL:+GROUP-SECP256R1:+GROUP-X25519:%NO_SHUFFLE_EXTENSIONS \
@@ -160,8 +210,9 @@ if [ -n "${QUICHE_EXAMPLES_DIR:-}" ] && [ -x "$QUICHE_EXAMPLES_DIR/http3-server"
   (cd "$workdir/quiche-run" && exec "$QUICHE_EXAMPLES_DIR/http3-server") >"$logs/3-quiche-server.log" 2>&1 &
   peer=$!
   wait_udp_listen
+  prepare_native_artifacts "3-native-client-quiche-server" "native-client"
   if "$tool" client --host 127.0.0.1 --port 4433 --authority tardigrade.test \
-    --path /index.html --insecure --timeout-ms 10000 >"$logs/3-native-client.log" 2>&1 &&
+    --path /index.html --insecure --timeout-ms 10000 "${native_artifact_args[@]}" >"$logs/3-native-client.log" 2>&1 &&
     grep -q "^status: " "$logs/3-native-client.log"; then
     result "native client -> quiche http3-server" PASS
   else
@@ -176,8 +227,9 @@ fi
 # --- 4. quiche http3-client -> native server ------------------------------
 next_port
 if [ -n "${QUICHE_EXAMPLES_DIR:-}" ] && [ -x "$QUICHE_EXAMPLES_DIR/http3-client" ]; then
+  prepare_native_artifacts "4-quiche-client-native-server" "native-server"
   "$tool" server --port "$port" --cert "$certs/p256-cert.der" --key "$certs/p256-key.pkcs8.der" \
-    --timeout-ms 15000 >"$logs/4-native-server.log" 2>&1 &
+    --timeout-ms 15000 "${native_artifact_args[@]}" >"$logs/4-native-server.log" 2>&1 &
   peer=$!
   wait_udp_listen
   RUST_LOG=error "$QUICHE_EXAMPLES_DIR/http3-client" "https://127.0.0.1:$port/from-quiche" \
@@ -202,8 +254,9 @@ if [ -n "${AIOQUIC_PYTHON:-}" ]; then
     >"$logs/5-aioquic-server.log" 2>&1 &
   peer=$!
   wait_udp_listen
+  prepare_native_artifacts "5-native-client-aioquic-server" "native-client"
   if "$tool" client --host 127.0.0.1 --port "$port" --authority tardigrade.test \
-    --path /to-aioquic --insecure --timeout-ms 10000 >"$logs/5-native-client.log" 2>&1 &&
+    --path /to-aioquic --insecure --timeout-ms 10000 "${native_artifact_args[@]}" >"$logs/5-native-client.log" 2>&1 &&
     grep -q "hello from aioquic" "$logs/5-native-client.log"; then
     result "native client -> aioquic server (optional)" PASS
   else
@@ -218,8 +271,9 @@ fi
 # --- 6. aioquic client -> native server (optional) -------------------------
 next_port
 if [ -n "${AIOQUIC_PYTHON:-}" ]; then
+  prepare_native_artifacts "6-aioquic-client-native-server" "native-server"
   "$tool" server --port "$port" --cert "$certs/p256-cert.der" --key "$certs/p256-key.pkcs8.der" \
-    --timeout-ms 15000 >"$logs/6-native-server.log" 2>&1 &
+    --timeout-ms 15000 "${native_artifact_args[@]}" >"$logs/6-native-server.log" 2>&1 &
   peer=$!
   wait_udp_listen
   "$AIOQUIC_PYTHON" "$here/aioquic_client.py" 127.0.0.1 "$port" /from-aioquic \
@@ -239,4 +293,7 @@ fi
 
 say ""
 say "interop summary: $pass passed, $fail failed, $skip skipped (logs: $logs)"
+if [ "$fail" -ne 0 ] && [ -n "$artifact_dir" ]; then
+  say "interop failure artifacts: $artifact_dir"
+fi
 [ "$fail" -eq 0 ] || exit 1
