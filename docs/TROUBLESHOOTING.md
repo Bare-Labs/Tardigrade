@@ -571,6 +571,9 @@ reaches the origin over a different network path:
 curl -v http://127.0.0.1:3000/health
 ```
 
+(This is a direct-to-origin check, a different target than Tardigrade
+itself — it doesn't need Tardigrade's `Host`/vhost header.)
+
 For an HTTPS origin:
 
 ```bash
@@ -581,8 +584,14 @@ curl -v https://backend.example.com/health
 
 #### Symptoms
 
-`502` with `error_category: upstream_error` (or `internal_error` for a
-`5xx` status Tardigrade itself returns) in the access log.
+`502 Bad Gateway`. The access-log classifier (`classifyErrorCategory()`)
+currently records `502` under the generic `error_category: internal_error`
+bucket, the same as any other `5xx` it doesn't special-case — it is **not**
+labeled `upstream_error` in the access log (that string is used as an API
+error *code* in some proxy error response bodies, a different field). To
+tell a `502` apart from an unrelated internal `5xx`, use the status itself
+together with the access log's `upstream_addr`/`upstream_status` fields and
+the runtime error log, not `error_category` alone.
 
 #### Likely causes
 
@@ -610,7 +619,7 @@ presents.
 #### Verify the fix
 
 ```bash
-curl -v http://127.0.0.1:8069/<proxied-path>
+curl -v -H 'Host: <server_name>' http://127.0.0.1:8069/<proxied-path>
 ```
 
 Confirm the proxied response now matches what the origin returns directly.
@@ -650,7 +659,7 @@ complete well inside the configured timeout:
 
 ```bash
 time curl -v http://127.0.0.1:3000/health
-time curl -v http://127.0.0.1:8069/<proxied-path>
+time curl -v -H 'Host: <server_name>' http://127.0.0.1:8069/<proxied-path>
 ```
 
 ### 503 — Service Unavailable
@@ -692,19 +701,18 @@ health state alone.
 > `gateway_proxy_runtime.zig`, `gateway_control_plane_proxy.zig`,
 > `gateway_handlers.zig`) — only referenced in comments. Despite
 > `OBSERVABILITY.md`'s troubleshooting table describing a circuit-breaker-
-> open symptom, this guide does not document it as a live `503` cause
-> until that wiring is confirmed or added; treat any breaker-shaped
-> symptom you observe as one of the causes above instead, and flag the gap
-> to a maintainer if you need breaker behavior for production traffic
-> shedding.
+> open symptom, this guide does not document it as a live `503` cause.
+> Tracked by [#627](https://github.com/Bare-Systems/Tardigrade/issues/627);
+> treat any breaker-shaped symptom you observe as one of the causes above
+> instead until that issue resolves the discrepancy one way or the other.
 
 #### Concrete fixes
 
 Point 503s at capacity metrics rather than guessing:
 
 ```bash
-curl -s http://127.0.0.1:8069/status/metrics | grep -E \
-  'tardigrade_connection_rejections_total|tardigrade_queue_rejections_total'
+curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/status/metrics | \
+  grep -E 'tardigrade_connection_rejections_total|tardigrade_queue_rejections_total'
 ```
 
 Raise the relevant capacity limit only after confirming Tardigrade has
@@ -716,9 +724,9 @@ the unhealthy state was actually producing.
 #### Verify the fix
 
 ```bash
-curl -s http://127.0.0.1:8069/status/metrics | grep -E \
-  'tardigrade_connection_rejections_total|tardigrade_queue_rejections_total'
-curl -v http://127.0.0.1:8069/<proxied-path>
+curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/status/metrics | \
+  grep -E 'tardigrade_connection_rejections_total|tardigrade_queue_rejections_total'
+curl -v -H 'Host: <server_name>' http://127.0.0.1:8069/<proxied-path>
 ```
 
 Confirm the rejection counters aren't climbing and the proxied request
@@ -741,25 +749,41 @@ can't complete a TLS handshake).
 
 ### Startup validation failures
 
-`tardi check` validates two different things depending on how the binary
-was built, and conflating them leads to false confidence. **`tardi check`
-only performs the full credential-material preflight (PEM parse,
-certificate-chain shape, leaf/key match, validity-window checks) when the
-binary was built with the appliance TLS profile
-(`-Dtls-profile=appliance`).** The published/default build uses the
-`general` (OpenSSL) profile, for which `tardi check` validates config
-*shape* only — it does not parse or cross-check the certificate/key files
-themselves. Confirm which profile you're running with `tardi version`
-(it prints `tls-profile=...`) before trusting `configuration valid` as
-proof the certificate material itself is sound.
+`tardi check` and actual server startup validate different things on the
+default build, and conflating them leads to false confidence:
+
+1. **`tardi check`, general/OpenSSL profile (the default,
+   `-Dtls-profile=general`):** config-shape validation only. It does not
+   parse or cross-check the certificate/key files themselves.
+2. **`tardi run`/service startup, general/OpenSSL profile:** before the
+   gateway begins serving, the certificate chain and private key are
+   actually loaded and checked for a match (`SSL_CTX_use_certificate_chain_file`,
+   `SSL_CTX_use_PrivateKey_file`, `SSL_CTX_check_private_key` in
+   `http/tls_termination.zig`). **Malformed PEM, an unreadable/invalid key,
+   or a cert/key mismatch fail `tardi run`/service startup outright — even
+   though a prior `tardi check` may have printed `configuration valid`.**
+   This is not a "wait for a real handshake" problem; it's a "run the
+   process, not just `check`" problem.
+3. **Validity/trust/hostname, general/OpenSSL profile:** an expired,
+   not-yet-valid, untrusted, or hostname-mismatched certificate is a
+   separate class, normally observed by the *client* during handshake
+   validation, not something that blocks Tardigrade's own startup — see
+   [Runtime handshake failures](#runtime-handshake-failures) below.
+4. **Appliance TLS profile (`-Dtls-profile=appliance`):** `tardi check`
+   additionally runs the appliance credential preflight (PEM parse,
+   chain shape, leaf/key match, validity-window checks), so it catches
+   the supported material/validity failures earlier, at `check` time.
+
+Confirm which profile you're running with `tardi version` (it prints
+`tls-profile=...`) before assuming which of the above applies.
 
 #### Symptoms
 
-`tardi check`/`tardi run`/`systemctl start tardigrade` fails with a
-certificate/key-related validation error instead of `configuration valid`
-(appliance profile), or the process starts but a real handshake later
-fails despite `configuration valid` (general profile — see [Runtime
-handshake failures](#runtime-handshake-failures) below).
+`tardi check` fails with a certificate/key-related validation error instead
+of `configuration valid` (appliance profile, or a config-shape problem on
+either profile); or `tardi check` passes but `tardi run`/
+`systemctl start tardigrade` still fails at startup with a certificate-load
+or key-mismatch error (general profile).
 
 #### First checks
 
@@ -807,19 +831,20 @@ Config-shape (rejected by `tardi check` on **either** profile):
   — the appliance profile supports exactly one identity; see
   [BARE_APPLIANCE_TLS.md](BARE_APPLIANCE_TLS.md)
 
-Credential material (rejected by `tardi check` **only on appliance
-builds**; on general/default builds these surface later, at a real TLS
-handshake, not at `check`/startup time):
+Credential material — on the appliance profile these are rejected by
+`tardi check` itself; on the general/default profile `tardi check` will
+not catch them, but **`tardi run`/service startup still will**, before the
+listener starts serving:
 
-- the service account can't read the private key (see permissions fix
-  below — this one *does* fail startup on any profile, since the process
-  can't open the file at all)
+- the service account can't read the private key
 - malformed PEM, or an ambiguous/ill-formed certificate chain
 - the certificate and key don't match (`sha256sum` check above)
-- an expired or not-yet-valid certificate (`openssl x509 … -dates` above)
-  — on the general/OpenSSL profile this is normally a *client-side*
-  validation failure at handshake time, not something that blocks
-  Tardigrade from starting
+
+Genuinely separate from the above — an expired or not-yet-valid certificate
+(`openssl x509 … -dates` above) does not fail loading on the general
+profile; it's ordinarily a *client-side* handshake-validation failure (see
+[Runtime handshake failures](#runtime-handshake-failures)), not a startup
+failure.
 
 #### Concrete fixes
 
@@ -846,9 +871,22 @@ sudo -u tardigrade tardi check /etc/tardigrade/tardigrade.conf
 ```
 
 Should print `configuration valid` with `tls: enabled` in the summary. On
-the general/default profile, treat this as config-shape confirmation only
-— follow up with the [runtime handshake check](#runtime-handshake-failures)
-below to actually prove the certificate/key work.
+the general/default profile this only confirms config *shape* — it is not
+proof the credential material loads. Confirm that separately by actually
+starting the process and checking it comes up:
+
+```bash
+sudo systemctl restart tardigrade
+sudo systemctl status tardigrade
+sudo journalctl -u tardigrade -n 20 --no-pager
+```
+
+A `CertificateLoadFailed`/`PrivateKeyLoadFailed`/`CertificateKeyMismatch`-
+class failure here means `tardi check` passing did not guarantee a working
+credential; go back to the causes above. Once the service is actually
+running, follow up with the [runtime handshake
+check](#runtime-handshake-failures) below to confirm a client can complete
+a handshake against it too.
 
 ### Runtime handshake failures
 
@@ -937,7 +975,7 @@ currently marked unhealthy by the running process.
 For live aggregate health, use metrics:
 
 ```bash
-curl -s http://127.0.0.1:8069/status/metrics | \
+curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/status/metrics | \
   grep tardigrade_upstream_unhealthy_backends
 ```
 
@@ -981,7 +1019,8 @@ too aggressively. Fix the underlying origin if it's genuinely failing.
 ### Verify the fix
 
 ```bash
-curl -s http://127.0.0.1:8069/status/metrics | grep tardigrade_upstream_unhealthy_backends
+curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/status/metrics | \
+  grep tardigrade_upstream_unhealthy_backends
 ```
 
 Confirm the count returns to `0` (or the expected number) after the next
@@ -1002,14 +1041,19 @@ returns something other than metrics text.
 ### First checks
 
 ```bash
-curl -v http://127.0.0.1:8069/status/metrics
+curl -v -H 'Host: <server_name>' http://127.0.0.1:8069/status/metrics
 ```
+
+Send the `Host` your config's `server_name` expects — like every other
+route, the metrics path is resolved after virtual-host selection, so a
+`Host` that matches no server block 404s before the metrics handler is ever
+reached.
 
 ### Likely causes and how to tell them apart
 
 | Symptom | Meaning |
 | --- | --- |
-| `404 Not Found` | Wrong path, metrics disabled (`TARDIGRADE_METRICS_PATH=""`), or you're hitting the wrong listener/server block. Check `tardi print-config -c <path>` for the `metrics:` line. |
+| `404 Not Found` | Wrong path, metrics disabled (`TARDIGRADE_METRICS_PATH=""`), a `Host` header that doesn't match any configured `server_name` (see above), or you're hitting the wrong listener. Check `tardi print-config -c <path>` for the `metrics:` line and `tardi routes` for the active `server_name`s. |
 | `401 Unauthorized` | `TARDIGRADE_METRICS_REQUIRE_AUTH=true` and the request didn't authenticate. This uses the same request-auth mechanism as any other protected route — Basic auth (`TARDIGRADE_BASIC_AUTH_HASHES`), a static bearer-token hash (`TARDIGRADE_AUTH_TOKEN_HASHES`), or JWT bearer auth (`TARDIGRADE_JWT_SECRET`), whichever your config enables — not specifically a bearer token. This is expected hardening, not a bug — see [DEPLOYMENT.md's hardening checklist](DEPLOYMENT.md#production-hardening-checklist). |
 | Connection refused | The listener itself is down or unreachable — this is [§3](#3-listener-fails-to-bind--service-is-unreachable), not a metrics-specific problem. |
 | TLS handshake failure | Wrong scheme (`http://` vs `https://`) or a certificate problem — see [§7](#7-tls-certificatekey-errors). |
@@ -1027,7 +1071,7 @@ fix the scrape job's auth instead.
 ### Verify the fix
 
 ```bash
-curl -v http://127.0.0.1:8069/status/metrics | head -5
+curl -v -H 'Host: <server_name>' http://127.0.0.1:8069/status/metrics | head -5
 ```
 
 Confirm you get Prometheus text output (lines starting `# HELP`/`# TYPE`),
@@ -1127,7 +1171,7 @@ buffering entirely rather than waiting for it to flush on its own.
 ### Verify the fix
 
 ```bash
-curl -v http://127.0.0.1:8069/health
+curl -v -H 'Host: <server_name>' http://127.0.0.1:8069/health
 sudo journalctl -u tardigrade -n 5 --no-pager
 # or, when error_log is configured (runtime and access logs are interleaved):
 sudo tail -5 /var/log/tardigrade/error.log
@@ -1174,7 +1218,7 @@ you intend — they say nothing about whether the running process actually
 published it. Use the runtime reload-status endpoint instead:
 
 ```bash
-curl -s http://127.0.0.1:8069/tardigrade/reload/status
+curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/tardigrade/reload/status
 ```
 
 This returns `{"ok":<bool|null>,"at_ms":<timestamp>,"error":<string|null>}` —
@@ -1183,7 +1227,8 @@ This returns `{"ok":<bool|null>,"at_ms":<timestamp>,"error":<string|null>}` —
 
 ```bash
 sudo journalctl -u tardigrade -n 50 --no-pager | grep -i reload
-curl -s http://127.0.0.1:8069/status/metrics | grep tardigrade_reload
+curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/status/metrics | \
+  grep tardigrade_reload
 ```
 
 Expect one of `configuration hot-reload starting` /
@@ -1240,8 +1285,9 @@ will never apply it. For a `tardigrade.env` edit: restart, not reload.
 ### Verify the fix
 
 ```bash
-curl -s http://127.0.0.1:8069/tardigrade/reload/status
-curl -s http://127.0.0.1:8069/status/metrics | grep -E 'tardigrade_reload_(success|failure)_total'
+curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/tardigrade/reload/status
+curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/status/metrics | \
+  grep -E 'tardigrade_reload_(success|failure)_total'
 ```
 
 `ok: true` and a fresh `at_ms`, with `reload_success_total` incremented and
@@ -1328,13 +1374,19 @@ protocol you used for the original comparison:
 ```bash
 ./benchmarks/run.sh \
   --host 127.0.0.1 \
+  --host-header <server_name> \
   --pid-file /run/tardigrade/tardigrade.pid \
   --scenarios static-http1,proxy-http1,keepalive
 ```
 
-Compare `p50`/`p95`/`p99` and `req/s` against your actual baseline, not
-against the README's headline numbers unless your hardware and workload
-genuinely match theirs.
+`--host-header` matters here for the same reason every other Tardigrade-
+facing example in this guide sends an explicit `Host`: on a named-vhost
+config, a benchmark run without it measures the 404 vhost-mismatch path
+instead of the static/proxy routes you intended to benchmark, which is a
+silent way to get numbers for the wrong thing entirely. Compare `p50`/
+`p95`/`p99` and `req/s` against your actual baseline, not against the
+README's headline numbers unless your hardware and workload genuinely
+match theirs.
 
 ### Related documentation
 
