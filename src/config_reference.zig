@@ -1551,7 +1551,9 @@ test "worker_processes documents literal zero as CPU autodetection" {
     const entry = lookup("worker_processes").?;
     var zero_autodetect = false;
     for (entry.valid_values) |v| {
-        if (std.mem.indexOf(u8, v, "0") != null and std.mem.indexOf(u8, v, "autodetect") != null) zero_autodetect = true;
+        const mentions_zero = std.mem.indexOf(u8, v, "0") != null;
+        const mentions_autodetect = std.mem.indexOf(u8, v, "autodetect") != null;
+        if (mentions_zero and mentions_autodetect) zero_autodetect = true;
     }
     try std.testing.expect(zero_autodetect);
     try std.testing.expect(std.mem.indexOf(u8, entry.description, "`0` and `auto`") != null);
