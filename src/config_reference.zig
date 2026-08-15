@@ -66,8 +66,8 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer or \"auto\"",
         .default_value = "1",
-        .valid_values = &.{ ">= 0", "auto (autodetects CPU count)" },
-        .description = "Number of worker processes to run when the master process supervisor is enabled.",
+        .valid_values = &.{ "0 or auto = autodetect CPU count", ">= 1 = explicit worker-process count" },
+        .description = "Number of worker processes used by master-process supervision. `0` and `auto` both autodetect the CPU count.",
         .example = "worker_processes auto;",
         .env_vars = &.{"TARDIGRADE_WORKER_PROCESSES"},
         .docs = &.{"docs/CONCURRENCY.md"},
@@ -115,8 +115,8 @@ pub const entries = [_]ConfigEntry{
     .{
         .name = "include",
         .contexts = CTX_TOP,
-        .value_type = "path (supports `*` globbing)",
-        .description = "Recursively parses and merges another config file, or a glob of files, into the current config.",
+        .value_type = "path or single-`*` suffix glob",
+        .description = "Recursively parses and merges another config file, or files matched by the supported single-`*` suffix form such as `conf.d/*.conf`. General glob patterns such as `foo*.conf` are not supported.",
         .example = "include conf.d/*.conf;",
         .docs = &.{"docs/CONFIGURATION.md"},
     },
@@ -294,9 +294,9 @@ pub const entries = [_]ConfigEntry{
         .name = "location.error_page",
         .aliases = &.{"error_page"},
         .contexts = CTX_LOCATION,
-        .value_type = "status[,status...] target",
+        .value_type = "status [status ...] target",
         .default_value = "none (repeatable)",
-        .description = "Maps one or more status codes to a custom error response target for this location. Target must start with `/`, `http://`, or `https://`.",
+        .description = "Maps one or more whitespace-separated status codes to a custom error response target for this location. Target must start with `/`, `http://`, or `https://`.",
         .example = "location / {\n    error_page 404 502 503 /error.html;\n}",
     },
     .{
@@ -533,7 +533,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "5000",
-        .valid_values = &.{"0's fallback is path-dependent (see description)"},
+        .valid_values = &.{">= 0 (0's fallback is path-dependent; see description)"},
         .description = "Configured TCP connect timeout for upstream connections. The streaming proxy path uses this value directly and falls back to upstream_timeout_ms only when it is 0. Buffered proxy attempts currently use their per-attempt upstream_timeout_ms bound for connect/write whenever that bound is nonzero; this knob is the fallback there only when the per-attempt bound is 0.",
         .example = "upstream_connect_timeout_ms 3000;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_CONNECT_TIMEOUT_MS"},
@@ -544,7 +544,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "0 (falls back to upstream_timeout_ms in the common case)",
-        .valid_values = &.{"0's fallback is path-dependent when upstream_timeout_ms is itself 0 (see description)"},
+        .valid_values = &.{">= 0 (when zero, fallback is path-dependent if upstream_timeout_ms is also zero; see description)"},
         .description = "Max time to wait for an upstream to begin responding (first byte / response head) after the request has been fully sent. Enforced across the buffered, streaming, and control-plane proxy paths and the h2 actor -- not limited to Unix socket upstreams. Normally falls back to upstream_timeout_ms when 0, but if upstream_timeout_ms is itself 0 the effective behavior differs by path (buffered falls back to its connect/send-phase bound; streaming can retain no read deadline).",
         .example = "upstream_response_timeout_ms 8000;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_RESPONSE_TIMEOUT_MS"},
@@ -555,7 +555,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer",
         .default_value = "1",
-        .valid_values = &.{"0 and 1 are both clamped to 1 (no retry); N permits at most N-1 retries"},
+        .valid_values = &.{">= 0 (0 and 1 are both clamped to 1 effective attempt; N permits at most N-1 retries)"},
         .description = "Maximum total upstream attempts for an eligible proxy request, not a retry count. 1 means one initial attempt and no retry; 3 permits at most two retries.",
         .example = "upstream_retry_attempts 3;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS"},
@@ -976,7 +976,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "5000",
-        .valid_values = &.{"0 disables the idle keep-alive timeout (parked connections are never reaped)"},
+        .valid_values = &.{">= 0 (0 disables the idle keep-alive timeout; parked connections are never reaped)"},
         .description = "Idle keep-alive timeout for client connections.",
         .example = "keep_alive_timeout_ms 10000;",
         .env_vars = &.{"TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS"},
@@ -987,7 +987,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "10000",
-        .valid_values = &.{"0 falls back to the built-in default of 10000ms"},
+        .valid_values = &.{">= 0 (0 falls back to the built-in default of 10000ms)"},
         .description = "Client header read timeout.",
         .example = "header_timeout_ms 5000;",
         .env_vars = &.{"TARDIGRADE_HEADER_TIMEOUT_MS"},
@@ -998,7 +998,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "0 (falls back to the built-in default of 30000ms)",
-        .valid_values = &.{"0 falls back to the built-in default of 30000ms"},
+        .valid_values = &.{">= 0 (0 falls back to the built-in default of 30000ms)"},
         .description = "Client body read timeout.",
         .example = "body_timeout_ms 15000;",
         .env_vars = &.{"TARDIGRADE_BODY_TIMEOUT_MS"},
@@ -1009,7 +1009,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "0 (disabled)",
-        .valid_values = &.{"0 disables the timeout"},
+        .valid_values = &.{">= 0 (0 disables the timeout)"},
         .description = "Overall per-request deadline covering auth, upstream, and response streaming.",
         .example = "request_total_timeout_ms 30000;",
         .env_vars = &.{"TARDIGRADE_REQUEST_TOTAL_TIMEOUT_MS"},
@@ -1020,7 +1020,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "5000",
-        .valid_values = &.{"0 falls back to keep_alive_timeout_ms"},
+        .valid_values = &.{">= 0 (0 falls back to keep_alive_timeout_ms)"},
         .description = "TLS handshake completion timeout.",
         .example = "tls_handshake_timeout_ms 8000;",
         .env_vars = &.{"TARDIGRADE_TLS_HANDSHAKE_TIMEOUT_MS"},
@@ -1042,7 +1042,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer",
         .default_value = "100",
-        .valid_values = &.{"0 = unlimited"},
+        .valid_values = &.{">= 0 (0 = unlimited)"},
         .description = "Maximum requests served per client keep-alive connection.",
         .example = "max_requests_per_connection 1000;",
         .env_vars = &.{"TARDIGRADE_MAX_REQUESTS_PER_CONNECTION"},
@@ -1052,7 +1052,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer bytes",
         .default_value = "2097152 (2MB)",
-        .valid_values = &.{"0 = unlimited"},
+        .valid_values = &.{">= 0 (0 = unlimited)"},
         .description = "Per-connection in-memory buffer cap.",
         .example = "max_connection_memory_bytes 4194304;",
         .env_vars = &.{"TARDIGRADE_MAX_CONNECTION_MEMORY_BYTES"},
@@ -1545,6 +1545,53 @@ test "listen documents the bare-host form and the port range mapListenDirective 
         if (std.mem.indexOf(u8, v, "65535") != null) has_range = true;
     }
     try std.testing.expect(has_range);
+}
+
+test "worker_processes documents literal zero as CPU autodetection" {
+    const entry = lookup("worker_processes").?;
+    var zero_autodetect = false;
+    for (entry.valid_values) |v| {
+        if (std.mem.indexOf(u8, v, "0") != null and std.mem.indexOf(u8, v, "autodetect") != null) zero_autodetect = true;
+    }
+    try std.testing.expect(zero_autodetect);
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "`0` and `auto`") != null);
+}
+
+test "include documents only the supported single-star suffix glob contract" {
+    const entry = lookup("include").?;
+    try std.testing.expect(std.mem.indexOf(u8, entry.value_type, "single-`*` suffix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "foo*.conf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "not supported") != null);
+}
+
+test "location.error_page documents whitespace-separated status codes" {
+    const entry = lookup("error_page").?;
+    try std.testing.expect(std.mem.indexOf(u8, entry.value_type, "status [status ...]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.value_type, "status[,status") == null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "whitespace-separated") != null);
+}
+
+test "required integer timeout and resource entries retain explicit non-negative ranges" {
+    const names = [_][]const u8{
+        "upstream_connect_timeout_ms",
+        "upstream_response_timeout_ms",
+        "upstream_retry_attempts",
+        "keep_alive_timeout_ms",
+        "header_timeout_ms",
+        "body_timeout_ms",
+        "request_total_timeout_ms",
+        "tls_handshake_timeout_ms",
+        "max_requests_per_connection",
+        "max_connection_memory_bytes",
+    };
+    for (names) |name| {
+        const entry = lookup(name).?;
+        var has_non_negative_range = false;
+        for (entry.valid_values) |v| {
+            if (std.mem.indexOf(u8, v, ">= 0") != null) has_non_negative_range = true;
+        }
+        try std.testing.expect(has_non_negative_range);
+    }
 }
 
 test "location describes an action family, not a single mandatory action directive" {
