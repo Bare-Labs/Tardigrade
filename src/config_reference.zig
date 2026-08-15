@@ -511,7 +511,7 @@ pub const entries = [_]ConfigEntry{
             .{ .alias = "http/1.1", .canonical = "http1" },
             .{ .alias = "http2", .canonical = "h2" },
         },
-        .description = "Selects the application protocol used when connecting to upstreams. h2/auto negotiate via ALPN over TLS; h2c is cleartext prior-knowledge HTTP/2 to plain-HTTP upstreams only.",
+        .description = "Selects the application protocol used when connecting to upstreams. http1 requires HTTP/1.1 for HTTPS; h2 requires HTTP/2 via ALPN; auto prefers h2 while allowing HTTP/1.1 fallback; h2c behaves like h2 for HTTPS upstreams (still requires HTTP/2 via ALPN) and additionally uses prior-knowledge cleartext HTTP/2 for plain-HTTP upstreams.",
         .example = "upstream_protocol h2;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_PROTOCOL"},
         .docs = &.{"docs/UPSTREAM_POOLING.md"},
@@ -625,8 +625,8 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "10000",
-        .valid_values = &.{">= 0"},
-        .description = "Passive health timeout before a failed upstream becomes retry-eligible again.",
+        .valid_values = &.{">= 0 (0 disables the passive unhealthy hold interval)"},
+        .description = "Passive-health hold interval after a backend reaches upstream_max_fails before it becomes timer-eligible again. A value of 0 applies no passive quarantine delay; active-probe state can still keep the backend unroutable.",
         .example = "upstream_fail_timeout_ms 15000;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_FAIL_TIMEOUT_MS"},
         .docs = &.{"docs/UPSTREAM_POOLING.md"},
@@ -659,8 +659,8 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "2000",
-        .valid_values = &.{">= 0"},
-        .description = "Per-probe timeout for active health checks.",
+        .valid_values = &.{">= 0 (0 disables the explicit post-connect socket I/O timeout)"},
+        .description = "Socket read/write timeout for active health probes after the connection is established. A value of 0 applies no explicit probe I/O deadline. The TCP connect phase itself is not currently bounded by this setting.",
         .example = "# TARDIGRADE_UPSTREAM_PROBE_TIMEOUT_MS=1000",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_PROBE_TIMEOUT_MS"},
         .legacy_env_vars = &.{"TARDIGRADE_UPSTREAM_ACTIVE_PROBE_TIMEOUT_MS"},
@@ -1597,6 +1597,34 @@ test "profile-dependent TLS and HTTP/3 entries note their appliance-profile rest
     try std.testing.expect(std.mem.indexOf(u8, lookup("http3_enable_0rtt").?.description, "appliance") != null);
     try std.testing.expect(std.mem.indexOf(u8, lookup("http3_connection_migration").?.description, "appliance") != null);
     try std.testing.expect(std.mem.indexOf(u8, lookup("http3_retry_policy").?.description, "appliance") != null);
+}
+
+test "upstream_protocol's h2c explanation covers both HTTPS/ALPN behavior and plain-HTTP prior knowledge" {
+    const entry = lookup("upstream_protocol").?;
+    // h2c requires HTTP/2 via ALPN for HTTPS upstreams, same as h2 --
+    // gateway_proxy.upstreamAlpnPolicy() maps both to .require_h2. It must
+    // not read as "cleartext-only".
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "h2c behaves like h2 for HTTPS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "prior-knowledge cleartext HTTP/2 for plain-HTTP") != null);
+}
+
+test "upstream_fail_timeout_ms documents that 0 disables the passive unhealthy hold interval" {
+    const entry = lookup("upstream_fail_timeout_ms").?;
+    var documents_zero = false;
+    for (entry.valid_values) |v| {
+        if (std.mem.indexOf(u8, v, "disables the passive unhealthy hold interval") != null) documents_zero = true;
+    }
+    try std.testing.expect(documents_zero);
+}
+
+test "upstream_probe_timeout_ms describes a post-connect socket timeout, not a whole-probe timeout, and documents its zero sentinel" {
+    const entry = lookup("upstream_probe_timeout_ms").?;
+    var documents_zero = false;
+    for (entry.valid_values) |v| {
+        if (std.mem.indexOf(u8, v, "disables the explicit post-connect socket I/O timeout") != null) documents_zero = true;
+    }
+    try std.testing.expect(documents_zero);
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "connect phase") != null);
 }
 
 test "fastcgi_pass/scgi_pass/uwsgi_pass do not claim server-block support" {
