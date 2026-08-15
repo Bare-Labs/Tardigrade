@@ -163,7 +163,7 @@ Environment=TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid
 RuntimeDirectory=tardigrade
 RuntimeDirectoryMode=0750
 
-ExecStartPre=/usr/bin/tardi check /etc/tardigrade/tardigrade.conf
+ExecStartPre=/usr/bin/env TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid /usr/bin/tardi check /etc/tardigrade/tardigrade.conf
 ExecStart=/usr/bin/env TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid /usr/bin/tardi run -c /etc/tardigrade/tardigrade.conf
 ExecReload=/usr/bin/tardi reload --pid-file /run/tardigrade/tardigrade.pid
 ExecStop=/usr/bin/tardi stop --pid-file /run/tardigrade/tardigrade.pid
@@ -174,24 +174,28 @@ TimeoutStopSec=35s
 - `RuntimeDirectory=tardigrade` makes systemd create and own
   `/run/tardigrade` (mode `0750`, owned by the `tardigrade` service user) on
   every start — no manual directory setup needed.
-- The PID path is forced twice, deliberately: `Environment=TARDIGRADE_PID_FILE=...`
+- The PID path is forced three times, deliberately: `Environment=TARDIGRADE_PID_FILE=...`
   sets a default, but systemd gives `EnvironmentFile=` values **higher**
   precedence than unit-level `Environment=` values — so a stray
   `TARDIGRADE_PID_FILE=` line in `tardigrade.env` would otherwise silently
   win and desync the running process's actual PID file from what
-  `ExecReload`/`ExecStop` target. `ExecStart` wraps the command in
-  `/usr/bin/env TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid ...`,
+  `ExecReload`/`ExecStop` target. Both `ExecStartPre` and `ExecStart` wrap
+  their command in `/usr/bin/env TARDIGRADE_PID_FILE=/run/tardigrade/tardigrade.pid ...`,
   which sets that variable at exec time and always wins, regardless of
   what's in `tardigrade.env`. `tardi` still runs directly (`env` execs it),
-  so systemd tracks the same process. This exact conflicting-env-file
-  scenario is covered by a regression check in
+  so systemd tracks the same process for `ExecStart`. This exact
+  conflicting-env-file scenario is covered by a regression check in
   `scripts/test-docker-image.sh`.
 - `ExecStartPre` runs `tardi check` against the config before the listener
   binds, so a bad edit fails the start instead of taking down a working
-  process. Because `ExecStartPre` is part of the same unit, it inherits the
-  merged `EnvironmentFile=`/`Environment=` environment — unlike the
-  standalone manual `tardi check` shown in [Commands](#commands) below,
-  it's validating what the service will actually run with.
+  process. It's forced to the same PID value as `ExecStart` for the same
+  reason both commands need it: without the explicit `env` wrapper on both,
+  `ExecStartPre` would validate against whatever conflicting
+  `TARDIGRADE_PID_FILE` happens to be in `tardigrade.env` (the shipped
+  production-baseline example intentionally sets one, for its own
+  standalone-run instructions) while `ExecStart` runs with the forced
+  value — silently validating a different effective configuration than the
+  one that actually starts.
 - `TimeoutStopSec=35s` is set above the default 30s graceful-drain window
   (`TARDIGRADE_SHUTDOWN_DRAIN_TIMEOUT_MS`, see
   [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md)) so systemd doesn't escalate to
@@ -226,10 +230,11 @@ configuration the service runs with.** Run outside the unit, it doesn't load
 defines process environment as higher precedence than config-file values —
 so an invalid or changed value that only exists in `tardigrade.env` (a
 secret bootstrap reference, an overridden port, a TLS path override, etc.)
-can pass this check and still fail at start. The unit's own
-`ExecStartPre=/usr/bin/tardi check ...` is the check that sees the same
-merged environment as `ExecStart`, and is the real pre-flight gate on
-`start`/`restart`.
+can pass this check and still fail at start. The unit's own `ExecStartPre`
+is the check that sees the same merged `EnvironmentFile=`/`Environment=`
+environment as `ExecStart` (both are wrapped with the same forced
+`TARDIGRADE_PID_FILE`, per [above](#the-systemd-units-pidcontrol-path-contract)),
+and is the real pre-flight gate on `start`/`restart`.
 
 Reload vs. restart — the two are not interchangeable:
 
@@ -245,36 +250,50 @@ Reload vs. restart — the two are not interchangeable:
   environment of an already-running process, so a `tardigrade.env` edit has
   no effect until the process is restarted and re-reads it at exec time.
 
-**Master/worker mode**: every control-path example in this guide — systemd
-and Docker alike — assumes single-process mode, which is the default
-(`master_process false;`). If you run with `master_process true;`, three
-things in this guide do not behave as documented:
+**Master/worker mode**: every control-path example in this guide assumes
+single-process mode, which is the default (`master_process false;`). If you
+run with `master_process true;`, what breaks depends on the supervisor —
+systemd and Docker are **not** equivalent here:
 
-- **Reload.** The `systemctl reload`/PID-file workflow above (and the
-  equivalent `tardi reload --pid-file ...` under Docker) targets the PID
-  file's process with `SIGHUP`. Per
+- **Reload — affects both.** The `systemctl reload`/PID-file workflow above
+  (and the equivalent `tardi reload --pid-file ...` under Docker) targets
+  the PID file's process with `SIGHUP`. Per
   [`CONFIGURATION.md`](CONFIGURATION.md#field-reference)'s `master_process`
   entry, master/worker mode does not yet provide coherent PID-file/SIGHUP
-  reload control across all workers — use restart semantics instead
-  (`systemctl restart tardigrade`, or recreate the container) rather than
-  `reload`.
-- **USR1 log-reopen after rotation.** Each worker opens its own error-log
-  file descriptor independently at startup. `SIGUSR1` delivered to the
-  master (via `systemctl kill --signal=USR1`, `docker kill --signal=USR1`,
-  or the packaged logrotate policy) only reopens the *master's own*
-  descriptor today — it is not forwarded to worker processes, so workers
-  keep writing to the rotated-away inode.
-- **The 35s stop window.** The current shutdown path stops workers one at a
-  time (kill, wait for exit, then move to the next), not all at once, so
-  total shutdown time scales with worker count rather than being bounded by
-  a single drain window. A `TimeoutStopSec`/`stop_grace_period` of 35s is
-  not generally sufficient once you have more than one worker.
+  reload control across all workers, regardless of supervisor — use restart
+  semantics instead (`systemctl restart tardigrade`, or recreate the
+  container) rather than `reload`.
+- **USR1 log-reopen after rotation — main-only paths only.** Each worker
+  opens its own error-log file descriptor independently at startup, and
+  nothing forwards `SIGUSR1` to them from the master's own reopen handler.
+  This specifically affects the **packaged systemd logrotate policy**
+  (`systemctl kill --kill-who=main --signal=USR1 ...`, deliberately
+  main-only) and **Docker's `docker kill --signal=USR1 <container>`**
+  (which only ever reaches container PID 1). It does *not* affect a manual
+  `systemctl kill --signal=USR1 tardigrade.service` run without
+  `--kill-who=main` — `systemctl kill`'s default target is *all* processes
+  in the unit's cgroup, so that specific manual command reaches the workers
+  too.
+- **The 35s stop window — Docker (and other master-only-signal
+  supervisors), not the packaged systemd unit.** Tardigrade's own
+  `runMaster` shutdown loop stops workers one at a time (kill, wait for
+  exit, then the next), so under a supervisor that only signals the master
+  process directly — Docker's `docker stop`, which reaches container PID 1
+  — total shutdown time scales with worker count rather than being bounded
+  by a single drain window. The packaged systemd unit does not have this
+  problem: it leaves `KillMode=` at systemd's default `control-group`, so
+  once `ExecStop` returns, systemd delivers the stop signal to *every*
+  process in the service's cgroup concurrently — workers receive `SIGTERM`
+  directly from systemd rather than waiting on the master's serial loop. Do
+  not "fix" this by setting `KillMode=process`; systemd's docs explicitly
+  discourage that because child processes can then escape service lifecycle
+  management entirely.
 
-None of this is specific to Docker or systemd — it's the same underlying
-multi-worker supervisor either way. Until coherent multi-worker signal
-fan-out lands, keep `master_process false;` (the default) if you rely on
-any of reload, log rotation, or a bounded graceful-stop window from this
-guide.
+Until coherent multi-worker reload/log-rotation fan-out lands, keep
+`master_process false;` (the default) if you rely on reload or main-only
+USR1 log rotation from this guide. The 35s-stop-window concern is Docker
+(and other master-only-signal-path) specific — the packaged systemd unit's
+default `control-group` kill mode already avoids it.
 
 ## Docker
 
@@ -501,17 +520,21 @@ limiting values.
   item above before exposing a deployment publicly.
 - DEB/RPM remain the more deeply integrated host-native Linux install path
   (user creation, logrotate, systemd wiring all handled by the package).
-- `master_process true;` is not coherently supported by any of the control
-  paths in this guide, under either systemd or Docker: reload targets one
-  PID via `SIGHUP` (workers aren't reloaded coherently); `SIGUSR1`
-  log-reopen after rotation only reopens the master's own file descriptor,
-  not each worker's; and the documented 35s stop window assumes workers
-  stop roughly in parallel, but the current shutdown path stops them one at
-  a time, so total shutdown time scales with worker count. Keep
-  `master_process false;` (the default) if you rely on reload, log
-  rotation, or a bounded graceful-stop window — see
-  [CONFIGURATION.md](CONFIGURATION.md#field-reference) and the
-  [Commands](#commands) section above.
+- `master_process true;` is not coherently supported by every control path
+  in this guide, and the gaps differ by supervisor — see
+  [Commands](#commands) above for the full breakdown. In short: PID-file/
+  `SIGHUP` reload targets one process and isn't coherent across workers
+  under either systemd or Docker; main-only `SIGUSR1` log-reopen (the
+  packaged systemd logrotate policy and Docker's `docker kill`) doesn't
+  reach worker file descriptors, though a non-main-only manual
+  `systemctl kill --signal=USR1` does; and the 35s graceful-stop window is
+  only a real concern under Docker (or another supervisor that signals only
+  the master process) — the packaged systemd unit's default
+  `KillMode=control-group` already delivers the stop signal to every worker
+  concurrently. Keep `master_process false;` (the default) if you rely on
+  reload or main-only log rotation. See
+  [CONFIGURATION.md](CONFIGURATION.md#field-reference) for the underlying
+  `master_process` contract.
 - Every experimental protocol/feature in the [support matrix](SUPPORT_MATRIX.md)
   stays experimental regardless of deployment method — deploying via
   Docker or systemd does not change a feature's maturity level.
