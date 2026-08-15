@@ -133,9 +133,10 @@ pub const entries = [_]ConfigEntry{
     .{
         .name = "listen",
         .contexts = CTX_TOP,
-        .value_type = "[host:]port [http2]",
+        .value_type = "host[:port] | port [http2]",
         .default_value = "0.0.0.0:8069",
-        .description = "Sets the downstream address and port Tardigrade accepts connections on. A trailing `http2` flag force-enables HTTP/2.",
+        .valid_values = &.{"port: 1-65535"},
+        .description = "Sets the downstream address and/or port Tardigrade accepts connections on. A bare host (no colon, not a number) sets only the host, leaving the port at its other source/default; a trailing `http2` flag force-enables HTTP/2.",
         .example = "listen 8069;",
         .env_vars = &.{ "TARDIGRADE_LISTEN_HOST", "TARDIGRADE_LISTEN_PORT" },
         .docs = &.{"docs/CONFIGURATION.md"},
@@ -189,7 +190,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_SERVER,
         .value_type = "path",
         .default_value = "none",
-        .description = "Per-virtual-host TLS certificate path, used for SNI certificate selection inside a server {} block.",
+        .description = "Per-virtual-host TLS certificate path, used for SNI certificate selection inside a server {} block. Rejected outright by the appliance TLS profile, which supports exactly one TLS identity configured directly at the top level.",
         .example = "server {\n    tls_cert_path /etc/tls/a.pem;\n    tls_key_path /etc/tls/a.key;\n}",
         .docs = &.{"docs/BARE_APPLIANCE_TLS.md"},
     },
@@ -198,7 +199,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_SERVER,
         .value_type = "path",
         .default_value = "none",
-        .description = "Per-virtual-host TLS private key path, paired with server.tls_cert_path.",
+        .description = "Per-virtual-host TLS private key path, paired with server.tls_cert_path. Rejected outright by the appliance TLS profile, which supports exactly one TLS identity configured directly at the top level.",
         .example = "server {\n    tls_cert_path /etc/tls/a.pem;\n    tls_key_path /etc/tls/a.key;\n}",
     },
     .{
@@ -215,7 +216,7 @@ pub const entries = [_]ConfigEntry{
         .name = "location",
         .contexts = CTX_TOP_SERVER,
         .value_type = "block",
-        .description = "Route-matching block. Supports exactly one action directive: proxy_pass, fastcgi_pass, scgi_pass, uwsgi_pass, return, static serving (root/alias/index/autoindex/try_files), or rewrite.",
+        .description = "Route-matching block. Choose exactly one action family: proxy_pass, FastCGI/SCGI/uWSGI, return, rewrite, or static. Static locations may freely combine root/alias/index/autoindex/try_files with each other; modifiers such as error_page, auth, proxy_streaming, and early-data policy may coexist with any action family where applicable.",
         .example =
         \\location /path/ { ... }        # prefix match
         \\location = /exact { ... }      # exact match
@@ -408,7 +409,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "enum",
         .default_value = "1.3",
-        .valid_values = &.{ "1.2", "1.3" },
+        .valid_values = &.{"1.2, 1.3 (general profile); 1.3 only (appliance profile -- must match tls_min_version)"},
         .description = "Maximum negotiated TLS protocol version.",
         .example = "tls_max_version 1.3;",
         .env_vars = &.{"TARDIGRADE_TLS_MAX_VERSION"},
@@ -420,7 +421,8 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "false",
         .valid_values = &.{ "true", "false" },
-        .description = "Requires and verifies client certificates (mTLS).",
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
+        .description = "Requires and verifies client certificates (mTLS). Rejected by the appliance TLS profile: true is not a valid value in appliance builds.",
         .example = "tls_client_verify true;",
         .env_vars = &.{"TARDIGRADE_TLS_CLIENT_VERIFY"},
         .docs = &.{"docs/PENTEST_PLAYBOOK.md"},
@@ -441,6 +443,7 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "false",
         .valid_values = &.{ "true", "false" },
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
         .description = "Enables OCSP stapling responses. Not supported when the binary is built with the appliance TLS profile.",
         .example = "tls_ocsp_stapling true;",
         .env_vars = &.{"TARDIGRADE_TLS_OCSP_STAPLING"},
@@ -519,6 +522,7 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "true",
         .valid_values = &.{ "true", "false" },
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
         .description = "Verifies TLS certificates presented by HTTPS upstream backends.",
         .example = "upstream_tls_verify false;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_TLS_VERIFY"},
@@ -529,8 +533,8 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "5000",
-        .valid_values = &.{"0 falls back to upstream_timeout_ms"},
-        .description = "Connect timeout for upstream TCP connections. A value of 0 does not disable the deadline; the connect attempt falls back to the general upstream_timeout_ms budget instead.",
+        .valid_values = &.{"0's fallback is path-dependent (see description)"},
+        .description = "Configured TCP connect timeout for upstream connections. The streaming proxy path uses this value directly and falls back to upstream_timeout_ms only when it is 0. Buffered proxy attempts currently use their per-attempt upstream_timeout_ms bound for connect/write whenever that bound is nonzero; this knob is the fallback there only when the per-attempt bound is 0.",
         .example = "upstream_connect_timeout_ms 3000;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_CONNECT_TIMEOUT_MS"},
         .docs = &.{"docs/TIMEOUTS.md"},
@@ -539,9 +543,9 @@ pub const entries = [_]ConfigEntry{
         .name = "upstream_response_timeout_ms",
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
-        .default_value = "0 (falls back to upstream_timeout_ms)",
-        .valid_values = &.{"0 falls back to upstream_timeout_ms"},
-        .description = "Max time to wait for an upstream to begin responding (first byte / response head) after the request has been fully sent. Enforced across the buffered, streaming, and control-plane proxy paths and the h2 actor -- not limited to Unix socket upstreams.",
+        .default_value = "0 (falls back to upstream_timeout_ms in the common case)",
+        .valid_values = &.{"0's fallback is path-dependent when upstream_timeout_ms is itself 0 (see description)"},
+        .description = "Max time to wait for an upstream to begin responding (first byte / response head) after the request has been fully sent. Enforced across the buffered, streaming, and control-plane proxy paths and the h2 actor -- not limited to Unix socket upstreams. Normally falls back to upstream_timeout_ms when 0, but if upstream_timeout_ms is itself 0 the effective behavior differs by path (buffered falls back to its connect/send-phase bound; streaming can retain no read deadline).",
         .example = "upstream_response_timeout_ms 8000;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_RESPONSE_TIMEOUT_MS"},
         .docs = &.{"docs/TIMEOUTS.md"},
@@ -563,6 +567,7 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "true",
         .valid_values = &.{ "true", "false" },
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
         .description = "Restricts retries to idempotent methods (GET, HEAD, PUT, DELETE, OPTIONS, TRACE). POST and PATCH are never retried when this is enabled.",
         .example = "upstream_retry_idempotent_only false;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_RETRY_IDEMPOTENT_ONLY"},
@@ -576,6 +581,7 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "true",
         .valid_values = &.{ "true", "false" },
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
         .description = "Enables the shared HTTP/1 manual connection pool, which covers plain-HTTP, TLS, Unix-socket HTTP, streaming, control-plane, and FastCGI upstreams. HTTP/2 upstreams use a separate always-on multiplexing pool and are not affected by this setting.",
         .example = "upstream_pool_enabled false;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_POOL_ENABLED"},
@@ -586,8 +592,8 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer",
         .default_value = "32",
-        .valid_values = &.{">= 0"},
-        .description = "Maximum idle upstream connections cached per origin.",
+        .valid_values = &.{">= 0 (0 disables idle connection caching in the shared H1/FastCGI pool)"},
+        .description = "Maximum idle upstream connections cached per origin in the shared H1/FastCGI pool. A value of 0 means no connection is ever parked idle; the separate always-on H2 pool is unaffected.",
         .example = "upstream_pool_max_idle_per_host 64;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_POOL_MAX_IDLE_PER_HOST"},
         .docs = &.{"docs/UPSTREAM_POOLING.md"},
@@ -597,8 +603,8 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "90000",
-        .valid_values = &.{">= 0"},
-        .description = "Evicts an idle pooled upstream connection after this long unused.",
+        .valid_values = &.{">= 0 (0 disables idle-age eviction)"},
+        .description = "Evicts an idle pooled upstream connection after this long unused. A value of 0 disables idle-age eviction; other causes (lifetime, health) can still close a pooled connection.",
         .example = "upstream_pool_idle_timeout_ms 60000;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_POOL_IDLE_TIMEOUT_MS"},
         .docs = &.{"docs/UPSTREAM_POOLING.md"},
@@ -665,8 +671,8 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer",
         .default_value = "1",
-        .valid_values = &.{">= 1"},
-        .description = "Consecutive active-probe failures required before marking a backend unhealthy.",
+        .valid_values = &.{">= 1 effective; 0 (and malformed values) are clamped to 1"},
+        .description = "Consecutive active-probe failures required before marking a backend unhealthy. A configured 0 is coerced to the minimum effective threshold of 1.",
         .example = "# TARDIGRADE_UPSTREAM_PROBE_FAIL_THRESHOLD=2",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_PROBE_FAIL_THRESHOLD"},
         .legacy_env_vars = &.{"TARDIGRADE_UPSTREAM_ACTIVE_PROBE_FAIL_THRESHOLD"},
@@ -677,8 +683,8 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer",
         .default_value = "1",
-        .valid_values = &.{">= 1"},
-        .description = "Consecutive active-probe successes required before clearing an unhealthy backend.",
+        .valid_values = &.{">= 1 effective; 0 (and malformed values) are clamped to 1"},
+        .description = "Consecutive active-probe successes required before clearing an unhealthy backend. A configured 0 is coerced to the minimum effective threshold of 1.",
         .example = "# TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_THRESHOLD=2",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_THRESHOLD"},
         .docs = &.{"docs/UPSTREAM_POOLING.md"},
@@ -703,6 +709,7 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "true",
         .valid_values = &.{ "true", "false" },
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
         .description = "Enables HTTP/1.1 listener support.",
         .example = "http1_enabled false;",
         .env_vars = &.{"TARDIGRADE_HTTP1_ENABLED"},
@@ -714,6 +721,7 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "true",
         .valid_values = &.{ "true", "false" },
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
         .description = "Enables downstream HTTP/2 over TLS via ALPN. Also settable via the `listen ... http2;` flag. Plaintext downstream h2c is not supported; prior-knowledge h2c is only available for upstream connections via upstream_protocol.",
         .example = "http2_enabled false;",
         .env_vars = &.{"TARDIGRADE_HTTP2_ENABLED"},
@@ -725,6 +733,7 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "false",
         .valid_values = &.{ "true", "false" },
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
         .description = "Enables the HTTP/3 (QUIC) listener.",
         .example = "http3_enabled true;",
         .env_vars = &.{"TARDIGRADE_HTTP3_ENABLED"},
@@ -758,7 +767,8 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "false",
         .valid_values = &.{ "true", "false" },
-        .description = "Enables QUIC 0-RTT early data acceptance.",
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
+        .description = "Enables QUIC 0-RTT early data acceptance. Rejected by the appliance TLS profile when http3_enabled is true: true is not a valid value in appliance builds with HTTP/3 on.",
         .example = "http3_enable_0rtt true;",
         .env_vars = &.{"TARDIGRADE_HTTP3_ENABLE_0RTT"},
         .docs = &.{"docs/QUIC_TLS.md"},
@@ -769,7 +779,8 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "false",
         .valid_values = &.{ "true", "false" },
-        .description = "Enables QUIC connection migration (path change) support.",
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
+        .description = "Enables QUIC connection migration (path change) support. Rejected by the appliance TLS profile when http3_enabled is true: true is not a valid value in appliance builds with HTTP/3 on.",
         .example = "http3_connection_migration true;",
         .env_vars = &.{"TARDIGRADE_HTTP3_CONNECTION_MIGRATION"},
         .docs = &.{"docs/QUIC_TLS.md"},
@@ -783,7 +794,7 @@ pub const entries = [_]ConfigEntry{
         .value_aliases = &.{
             .{ .alias = "address-validation", .canonical = "address_validation" },
         },
-        .description = "QUIC Retry-packet issuance policy, used for address-validation DDoS/amplification mitigation.",
+        .description = "QUIC Retry-packet issuance policy, used for address-validation DDoS/amplification mitigation. address_validation is a general-profile value only; the appliance TLS profile requires off when http3_enabled is true.",
         .example = "http3_retry_policy address_validation;",
         .env_vars = &.{"TARDIGRADE_HTTP3_RETRY_POLICY"},
         .docs = &.{"docs/QUIC_TLS.md"},
@@ -794,6 +805,7 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "true",
         .valid_values = &.{ "true", "false" },
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
         .description = "Enables ECN marking on the QUIC listener. Self-disables per-path on unreliable feedback; this is an escape hatch to disable it outright.",
         .example = "http3_ecn false;",
         .env_vars = &.{"TARDIGRADE_HTTP3_ECN"},
@@ -829,6 +841,7 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "true",
         .valid_values = &.{ "true", "false" },
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
         .description = "Adds standard security response headers to every response.",
         .example = "security_headers false;",
         .env_vars = &.{"TARDIGRADE_SECURITY_HEADERS"},
@@ -840,6 +853,7 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "false",
         .valid_values = &.{ "true", "false" },
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
         .description = "Emits a Strict-Transport-Security header on HTTPS responses. Has no effect without TLS configured.",
         .example = "hsts_enabled true;",
         .env_vars = &.{"TARDIGRADE_HSTS_ENABLED"},
@@ -939,6 +953,7 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "false",
         .valid_values = &.{ "true", "false" },
+        .value_aliases = &.{.{ .alias = "1", .canonical = "true" }},
         .description = "Requires request authentication before serving the metrics endpoint.",
         .example = "metrics_require_auth true;",
         .env_vars = &.{"TARDIGRADE_METRICS_REQUIRE_AUTH"},
@@ -1521,6 +1536,69 @@ test "fastcgi_param example uses the real ${name} interpolation syntax, not ngin
     try std.testing.expect(std.mem.indexOf(u8, example, "$fastcgi_script_name") == null);
 }
 
+test "listen documents the bare-host form and the port range mapListenDirective actually accepts" {
+    const entry = lookup("listen").?;
+    try std.testing.expect(std.mem.indexOf(u8, entry.value_type, "host") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "bare host") != null);
+    var has_range = false;
+    for (entry.valid_values) |v| {
+        if (std.mem.indexOf(u8, v, "65535") != null) has_range = true;
+    }
+    try std.testing.expect(has_range);
+}
+
+test "location describes an action family, not a single mandatory action directive" {
+    const entry = lookup("location").?;
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "action family") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "combine") != null);
+    // The old wording claimed exactly one action *directive*; a valid
+    // root+index+try_files static location combines three.
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "exactly one action directive") == null);
+}
+
+test "upstream_pool_max_idle_per_host and upstream_pool_idle_timeout_ms document their zero sentinels" {
+    const max_idle = lookup("upstream_pool_max_idle_per_host").?;
+    var max_idle_documents_zero = false;
+    for (max_idle.valid_values) |v| {
+        if (std.mem.indexOf(u8, v, "disables idle connection caching") != null) max_idle_documents_zero = true;
+    }
+    try std.testing.expect(max_idle_documents_zero);
+
+    const idle_timeout = lookup("upstream_pool_idle_timeout_ms").?;
+    var idle_timeout_documents_zero = false;
+    for (idle_timeout.valid_values) |v| {
+        if (std.mem.indexOf(u8, v, "disables idle-age eviction") != null) idle_timeout_documents_zero = true;
+    }
+    try std.testing.expect(idle_timeout_documents_zero);
+}
+
+test "upstream_probe_fail_threshold and upstream_active_probe_success_threshold document that 0 clamps to 1, not rejects" {
+    for (&[_][]const u8{ "upstream_probe_fail_threshold", "upstream_active_probe_success_threshold" }) |name| {
+        const entry = lookup(name).?;
+        var documents_clamp = false;
+        for (entry.valid_values) |v| {
+            if (std.mem.indexOf(u8, v, "clamped to 1") != null) documents_clamp = true;
+        }
+        try std.testing.expect(documents_clamp);
+    }
+}
+
+test "profile-dependent TLS and HTTP/3 entries note their appliance-profile restrictions" {
+    const tls_max = lookup("tls_max_version").?;
+    var tls_max_notes_appliance = false;
+    for (tls_max.valid_values) |v| {
+        if (std.mem.indexOf(u8, v, "appliance") != null) tls_max_notes_appliance = true;
+    }
+    try std.testing.expect(tls_max_notes_appliance);
+
+    try std.testing.expect(std.mem.indexOf(u8, lookup("tls_client_verify").?.description, "appliance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lookup("server.tls_cert_path").?.description, "appliance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lookup("server.tls_key_path").?.description, "appliance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lookup("http3_enable_0rtt").?.description, "appliance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lookup("http3_connection_migration").?.description, "appliance") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lookup("http3_retry_policy").?.description, "appliance") != null);
+}
+
 test "fastcgi_pass/scgi_pass/uwsgi_pass do not claim server-block support" {
     for (&[_][]const u8{ "fastcgi_pass", "scgi_pass", "uwsgi_pass" }) |name| {
         const entry = lookup(name).?;
@@ -1565,6 +1643,16 @@ test "every generic boolean entry documents true/false and no example uses the i
             try std.testing.expect(std.mem.indexOf(u8, example, " on;") == null);
             try std.testing.expect(std.mem.indexOf(u8, example, " off;") == null);
         }
+
+        // EdgeConfig.parseBoolEnv() intentionally also accepts "1" as true
+        // (docs/CONFIGURATION.md documents true/1 for permissive boolean
+        // fields); the registry must not make that accepted compatibility
+        // spelling look unsupported.
+        var has_one_alias = false;
+        for (entry.value_aliases) |alias| {
+            if (std.mem.eql(u8, alias.alias, "1") and std.mem.eql(u8, alias.canonical, "true")) has_one_alias = true;
+        }
+        try std.testing.expect(has_one_alias);
     }
 }
 
