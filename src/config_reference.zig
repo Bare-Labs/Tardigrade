@@ -273,8 +273,9 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP_LOCATION,
         .value_type = "status [body]",
         .default_value = "none",
-        .description = "Immediately returns a fixed status code and optional body. At top level it applies globally; inside a location it applies only to the matched route.",
+        .description = "Immediately returns a fixed status code and optional body. At top level it is encoded into a global rule list (TARDIGRADE_RETURN_RULES); inside a location it applies only to the matched route.",
         .example = "location = /health {\n    return 200 ok;\n}",
+        .env_vars = &.{"TARDIGRADE_RETURN_RULES"},
         .docs = &.{"docs/CONFIGURATION.md"},
     },
     .{
@@ -283,8 +284,10 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP_LOCATION,
         .value_type = "pattern replacement [flag]",
         .default_value = "flag: last",
-        .description = "Rewrites the request URI according to pattern/replacement before continuing dispatch. Valid both at top level and inside a location.",
+        .valid_values = &.{"flags: last, break, redirect, permanent"},
+        .description = "Rewrites the request URI according to pattern/replacement before continuing dispatch. At top level it is encoded into a global rule list (TARDIGRADE_REWRITE_RULES); inside a location it applies only to the matched route.",
         .example = "location /old/ {\n    rewrite ^/old/(.*)$ /new/$1 last;\n}",
+        .env_vars = &.{"TARDIGRADE_REWRITE_RULES"},
     },
     .{
         .name = "location.error_page",
@@ -526,8 +529,8 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "5000",
-        .valid_values = &.{">= 0"},
-        .description = "Connect timeout for upstream TCP connections.",
+        .valid_values = &.{"0 falls back to upstream_timeout_ms"},
+        .description = "Connect timeout for upstream TCP connections. A value of 0 does not disable the deadline; the connect attempt falls back to the general upstream_timeout_ms budget instead.",
         .example = "upstream_connect_timeout_ms 3000;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_CONNECT_TIMEOUT_MS"},
         .docs = &.{"docs/TIMEOUTS.md"},
@@ -536,9 +539,9 @@ pub const entries = [_]ConfigEntry{
         .name = "upstream_response_timeout_ms",
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
-        .default_value = "0 (disabled, falls back to upstream_timeout_ms)",
-        .valid_values = &.{">= 0"},
-        .description = "Max time to wait for an upstream to begin responding after the request has been fully sent. Currently only enforced on Unix socket upstreams.",
+        .default_value = "0 (falls back to upstream_timeout_ms)",
+        .valid_values = &.{"0 falls back to upstream_timeout_ms"},
+        .description = "Max time to wait for an upstream to begin responding (first byte / response head) after the request has been fully sent. Enforced across the buffered, streaming, and control-plane proxy paths and the h2 actor -- not limited to Unix socket upstreams.",
         .example = "upstream_response_timeout_ms 8000;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_RESPONSE_TIMEOUT_MS"},
         .docs = &.{"docs/TIMEOUTS.md"},
@@ -548,8 +551,8 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer",
         .default_value = "1",
-        .valid_values = &.{">= 1"},
-        .description = "Number of upstream attempt retries for proxy requests.",
+        .valid_values = &.{"0 and 1 are both clamped to 1 (no retry); N permits at most N-1 retries"},
+        .description = "Maximum total upstream attempts for an eligible proxy request, not a retry count. 1 means one initial attempt and no retry; 3 permits at most two retries.",
         .example = "upstream_retry_attempts 3;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS"},
         .docs = &.{"docs/UPSTREAM_POOLING.md"},
@@ -573,7 +576,7 @@ pub const entries = [_]ConfigEntry{
         .value_type = "boolean",
         .default_value = "true",
         .valid_values = &.{ "true", "false" },
-        .description = "Enables keep-alive connection pooling to plain-HTTP upstreams. When false, every request opens a fresh Connection: close connection.",
+        .description = "Enables the shared HTTP/1 manual connection pool, which covers plain-HTTP, TLS, Unix-socket HTTP, streaming, control-plane, and FastCGI upstreams. HTTP/2 upstreams use a separate always-on multiplexing pool and are not affected by this setting.",
         .example = "upstream_pool_enabled false;",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_POOL_ENABLED"},
         .docs = &.{"docs/UPSTREAM_POOLING.md"},
@@ -683,9 +686,10 @@ pub const entries = [_]ConfigEntry{
     .{
         .name = "upstream_probe_success_status",
         .contexts = CTX_TOP,
-        .value_type = "status range \"min-max\"",
+        .value_type = "status or inclusive status range",
         .default_value = "200-299",
-        .description = "Status-code range considered a successful active health probe. Falls back to the default range if unparsable.",
+        .valid_values = &.{ "a single status, e.g. 204", "an inclusive range \"min-max\", e.g. 200-399" },
+        .description = "Status code or inclusive status-code range considered a successful active health probe. Falls back to the default range if unparsable.",
         .example = "# TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS=200-399",
         .env_vars = &.{"TARDIGRADE_UPSTREAM_PROBE_SUCCESS_STATUS"},
         .legacy_env_vars = &.{"TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_STATUS"},
@@ -957,7 +961,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "5000",
-        .valid_values = &.{">= 0"},
+        .valid_values = &.{"0 disables the idle keep-alive timeout (parked connections are never reaped)"},
         .description = "Idle keep-alive timeout for client connections.",
         .example = "keep_alive_timeout_ms 10000;",
         .env_vars = &.{"TARDIGRADE_KEEP_ALIVE_TIMEOUT_MS"},
@@ -968,7 +972,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
         .default_value = "10000",
-        .valid_values = &.{"0 disables the timeout"},
+        .valid_values = &.{"0 falls back to the built-in default of 10000ms"},
         .description = "Client header read timeout.",
         .example = "header_timeout_ms 5000;",
         .env_vars = &.{"TARDIGRADE_HEADER_TIMEOUT_MS"},
@@ -978,8 +982,8 @@ pub const entries = [_]ConfigEntry{
         .name = "body_timeout_ms",
         .contexts = CTX_TOP,
         .value_type = "integer milliseconds",
-        .default_value = "0 (no timeout)",
-        .valid_values = &.{"0 disables the timeout"},
+        .default_value = "0 (falls back to the built-in default of 30000ms)",
+        .valid_values = &.{"0 falls back to the built-in default of 30000ms"},
         .description = "Client body read timeout.",
         .example = "body_timeout_ms 15000;",
         .env_vars = &.{"TARDIGRADE_BODY_TIMEOUT_MS"},
@@ -1050,7 +1054,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP_LOCATION,
         .value_type = "endpoint (host:port or unix:/path)",
         .default_value = "none",
-        .description = "FastCGI upstream endpoint.",
+        .description = "FastCGI upstream endpoint. A location-level fastcgi_pass installs a live dispatched route; the top-level/env form is parsed and validated but does not by itself install a route.",
         .example = "location ~ \\.php$ {\n    fastcgi_pass 127.0.0.1:9000;\n}",
         .env_vars = &.{"TARDIGRADE_FASTCGI_UPSTREAM"},
     },
@@ -1059,8 +1063,8 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP,
         .value_type = "NAME value",
         .default_value = "none (repeatable)",
-        .description = "Injects a CGI variable into FastCGI requests. Value supports ${var} interpolation.",
-        .example = "fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;",
+        .description = "Injects a CGI variable into FastCGI requests. Value supports ${name} interpolation (config-parse-time variables or OS environment fallback); nginx-style bare $var expansion is not performed.",
+        .example = "fastcgi_param APP_ENV production;",
         .env_vars = &.{"TARDIGRADE_FASTCGI_PARAMS"},
     },
     .{
@@ -1077,7 +1081,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP_LOCATION,
         .value_type = "endpoint",
         .default_value = "none",
-        .description = "SCGI upstream endpoint.",
+        .description = "SCGI upstream endpoint. Parsed and lowered by the config loader, but the gateway does not currently install a live SCGI route from this setting.",
         .example = "scgi_pass 127.0.0.1:4100;",
         .env_vars = &.{"TARDIGRADE_SCGI_UPSTREAM"},
     },
@@ -1086,7 +1090,7 @@ pub const entries = [_]ConfigEntry{
         .contexts = CTX_TOP_LOCATION,
         .value_type = "endpoint",
         .default_value = "none",
-        .description = "uWSGI upstream endpoint.",
+        .description = "uWSGI upstream endpoint. Parsed and lowered by the config loader, but the gateway does not currently install a live uWSGI route from this setting.",
         .example = "uwsgi_pass 127.0.0.1:4200;",
         .env_vars = &.{"TARDIGRADE_UWSGI_UPSTREAM"},
     },
@@ -1117,6 +1121,37 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 /// Resolve `query` (a directive/field name, a qualified `context.field` name,
 /// a short unambiguous alias, or an environment variable name -- current or
 /// legacy) to its canonical reference entry, case-insensitively.
+const env_prefix = "TARDIGRADE_";
+
+/// True when `name` (a canonical entry name such as "log_level") is the
+/// same identifier as `env_suffix` (an env var name with the TARDIGRADE_
+/// prefix stripped, such as "LOG_LEVEL") modulo case. Canonical names and
+/// their directly-corresponding env vars always share underscore placement,
+/// so a case-insensitive byte comparison is sufficient here.
+fn canonicalMatchesEnvSuffix(name: []const u8, env_suffix: []const u8) bool {
+    return eqlIgnoreCase(name, env_suffix);
+}
+
+/// Some real environment variables (e.g. TARDIGRADE_LOG_LEVEL,
+/// TARDIGRADE_MAX_ACTIVE_CONNECTIONS) are legitimately listed on more than
+/// one entry: a composite/legacy directive that also happens to set them
+/// (error_log, worker_connections) alongside the entry whose canonical name
+/// directly corresponds to that variable (log_level,
+/// max_active_connections). When an env query is ambiguous like this,
+/// resolution must prefer the entry whose name the variable is actually
+/// named after, not whichever entry happens to appear first in `entries`.
+fn lookupDirectEnvMatch(query: []const u8) ?*const ConfigEntry {
+    if (!std.ascii.startsWithIgnoreCase(query, env_prefix)) return null;
+    const suffix = query[env_prefix.len..];
+    for (&entries) |*entry| {
+        if (!canonicalMatchesEnvSuffix(entry.name, suffix)) continue;
+        for (entry.env_vars) |env_var| {
+            if (eqlIgnoreCase(env_var, query)) return entry;
+        }
+    }
+    return null;
+}
+
 pub fn lookup(query: []const u8) ?*const ConfigEntry {
     for (&entries) |*entry| {
         if (eqlIgnoreCase(entry.name, query)) return entry;
@@ -1126,6 +1161,7 @@ pub fn lookup(query: []const u8) ?*const ConfigEntry {
             if (eqlIgnoreCase(alias, query)) return entry;
         }
     }
+    if (lookupDirectEnvMatch(query)) |entry| return entry;
     for (&entries) |*entry| {
         for (entry.env_vars) |env_var| {
             if (eqlIgnoreCase(env_var, query)) return entry;
@@ -1396,6 +1432,95 @@ test "lookup resolves the alternate-upstream directives by their current environ
     try std.testing.expectEqualStrings("uwsgi_pass", uwsgi.name);
 }
 
+test "lookup resolves the top-level return/rewrite rule-list environment variables" {
+    const ret = lookup("TARDIGRADE_RETURN_RULES") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("location.return", ret.name);
+
+    const rewrite = lookup("TARDIGRADE_REWRITE_RULES") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("location.rewrite", rewrite.name);
+}
+
+test "location.rewrite documents its accepted flag set" {
+    const entry = lookup("rewrite").?;
+    var found = false;
+    for (entry.valid_values) |v| {
+        if (std.mem.indexOf(u8, v, "last") != null and
+            std.mem.indexOf(u8, v, "break") != null and
+            std.mem.indexOf(u8, v, "redirect") != null and
+            std.mem.indexOf(u8, v, "permanent") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "env lookup prefers the entry whose canonical name directly matches over a composite/legacy entry sharing the same env var" {
+    // TARDIGRADE_LOG_LEVEL is also advertised on error_log (which sets it
+    // as a secondary effect of "error_log <path> <level>;"); the dedicated
+    // log_level entry must win.
+    try std.testing.expectEqualStrings("log_level", lookup("TARDIGRADE_LOG_LEVEL").?.name);
+
+    // TARDIGRADE_MAX_ACTIVE_CONNECTIONS is also advertised on the
+    // worker_connections nginx-style alias; the canonical entry must win.
+    try std.testing.expectEqualStrings("max_active_connections", lookup("TARDIGRADE_MAX_ACTIVE_CONNECTIONS").?.name);
+
+    // error_log and worker_connections must still resolve by their own
+    // canonical names and still display the shared env var -- this policy
+    // only changes which entry an *env-var* query resolves to.
+    try std.testing.expectEqualStrings("error_log", lookup("error_log").?.name);
+    try std.testing.expectEqualStrings("worker_connections", lookup("worker_connections").?.name);
+}
+
+test "upstream_probe_success_status documents the single-status form, not only a range" {
+    const entry = lookup("upstream_probe_success_status").?;
+    try std.testing.expect(std.mem.indexOf(u8, entry.value_type, "range") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.value_type, "or") != null);
+}
+
+test "header_timeout_ms and body_timeout_ms document the actual RequestLimits fallback, not disabling the timeout" {
+    for (&[_][]const u8{ "header_timeout_ms", "body_timeout_ms" }) |name| {
+        const entry = lookup(name).?;
+        var mentions_fallback = false;
+        for (entry.valid_values) |v| {
+            if (std.mem.indexOf(u8, v, "falls back") != null) mentions_fallback = true;
+        }
+        try std.testing.expect(mentions_fallback);
+        for (entry.valid_values) |v| try std.testing.expect(std.mem.indexOf(u8, v, "disable") == null);
+    }
+}
+
+test "upstream_retry_attempts describes a total-attempt budget, not a bare retry count" {
+    const entry = lookup("upstream_retry_attempts").?;
+    // The old description literally read "Number of upstream attempt
+    // retries for proxy requests" -- i.e. it presented the field itself as
+    // a retry count. The corrected description must not open that way.
+    try std.testing.expect(!std.mem.startsWith(u8, entry.description, "Number of upstream attempt retries"));
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "one initial attempt") != null);
+}
+
+test "upstream_pool_enabled describes the shared HTTP/1 pool scope and the separate always-on h2 pool" {
+    const entry = lookup("upstream_pool_enabled").?;
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "TLS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "FastCGI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, entry.description, "HTTP/2") != null);
+}
+
+test "fastcgi_pass/scgi_pass/uwsgi_pass describe their live-dispatch differences" {
+    const fastcgi = lookup("fastcgi_pass").?;
+    try std.testing.expect(std.mem.indexOf(u8, fastcgi.description, "does not by itself install a route") != null);
+
+    for (&[_][]const u8{ "scgi_pass", "uwsgi_pass" }) |name| {
+        const entry = lookup(name).?;
+        try std.testing.expect(std.mem.indexOf(u8, entry.description, "does not currently install a live") != null);
+    }
+}
+
+test "fastcgi_param example uses the real ${name} interpolation syntax, not nginx bare-dollar variables" {
+    const entry = lookup("fastcgi_param").?;
+    const example = entry.example.?;
+    try std.testing.expect(std.mem.indexOf(u8, example, "$document_root") == null);
+    try std.testing.expect(std.mem.indexOf(u8, example, "$fastcgi_script_name") == null);
+}
+
 test "fastcgi_pass/scgi_pass/uwsgi_pass do not claim server-block support" {
     for (&[_][]const u8{ "fastcgi_pass", "scgi_pass", "uwsgi_pass" }) |name| {
         const entry = lookup(name).?;
@@ -1585,19 +1710,18 @@ test "explaining a secret field never includes a live secret value present in th
     //
     // Zig unit tests share one process, so this test must not leave
     // TARDIGRADE_JWT_SECRET mutated for whatever ran before or after it:
-    // capture the prior value (if any) and restore/unset it on the way out.
+    // capture an owned copy of the prior value (if any) and restore/unset it
+    // on the way out. A fixed-size buffer would silently truncate (and then
+    // restore a truncated) secret longer than the buffer, so this holds an
+    // allocator-owned sentinel-terminated copy of arbitrary length instead.
     const env_name = "TARDIGRADE_JWT_SECRET";
-    var prev_buf: [4096]u8 = undefined;
-    var prev_len: ?usize = null;
-    if (std.c.getenv(env_name)) |existing| {
-        const existing_slice = std.mem.span(existing);
-        const len = @min(existing_slice.len, prev_buf.len - 1);
-        @memcpy(prev_buf[0..len], existing_slice[0..len]);
-        prev_buf[len] = 0;
-        prev_len = len;
-    }
-    defer if (prev_len) |len| {
-        _ = setenv(env_name, prev_buf[0..len :0], 1);
+    const previous: ?[:0]u8 = if (std.c.getenv(env_name)) |existing|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(existing))
+    else
+        null;
+    defer if (previous) |value| {
+        _ = setenv(env_name, value.ptr, 1);
+        std.testing.allocator.free(value);
     } else {
         _ = unsetenv(env_name);
     };
