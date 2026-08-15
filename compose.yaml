@@ -33,7 +33,18 @@ services:
       # PID file; a plain tmpfs mount defaults to root:root and the process
       # cannot write into it.
       - /run/tardigrade:uid=10001,gid=10001,mode=0750
+    # Optional operator environment values (secrets, upstream URLs, etc.).
+    # `tardi` reads TARDIGRADE_* from the process environment only — it does
+    # NOT parse this path as a file the way systemd's EnvironmentFile= does,
+    # so don't bind-mount an env file into the container expecting tardi to
+    # read it. env_file: injects the host file's contents as real container
+    # environment variables instead.
+    # env_file:
+    #   - ./deploy/tardigrade.env
     environment:
+      # Keep these explicit: Compose `environment:` overrides `env_file:`,
+      # so even a baseline env file setting a conflicting PID path cannot
+      # desync the runtime from the reload/stop commands in docs/DEPLOYMENT.md.
       TARDIGRADE_PID_FILE: /run/tardigrade/tardigrade.pid
       TARDIGRADE_REQUIRE_UNPRIVILEGED_USER: "true"
     restart: unless-stopped

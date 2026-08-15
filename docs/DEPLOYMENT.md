@@ -41,10 +41,14 @@ The two paths converge on the same *directory* layout, but different pieces
 of it come from different places and at different times — not everything
 below is created by the package install step. Three categories:
 
-- **Created by the package install** (DEB/RPM `postinst`/`%post`; the Docker
-  image creates the equivalent directories at build time): the binary,
-  `/etc/tardigrade/tardigrade.conf`, `/etc/tardigrade/tardigrade.env`,
-  `/var/lib/tardigrade`, `/var/log/tardigrade`.
+- **Created by the DEB/RPM package install** (`postinst`/`%post`): the
+  binary, a starter `/etc/tardigrade/tardigrade.conf`, an
+  `/etc/tardigrade/tardigrade.env` template, `/var/lib/tardigrade`,
+  `/var/log/tardigrade`. The Docker image creates only the *directories*
+  (binary, `/var/lib/tardigrade`, `/var/log/tardigrade`) at build time — it
+  does **not** create a `tardigrade.conf` or `tardigrade.env`; see
+  [Docker](#docker) below for how config and environment values reach the
+  container instead.
 - **Created at service start, not install**: `/run/tardigrade` is created by
   systemd's `RuntimeDirectory=` when the unit starts (see
   [below](#the-systemd-units-pidcontrol-path-contract)), not by the package.
@@ -67,10 +71,17 @@ Operator-created when used:   /etc/tardigrade/tls/fullchain.pem
                                /var/lib/tardigrade/public/          optional static root
 ```
 
-Under Docker, the image only creates the directories themselves — you
-supply `tardigrade.conf`, `tardigrade.env` (if you use one), and any TLS
-material as bind mounts. See [Docker](#docker) below for the exact mount
-shape.
+Under Docker, the image only creates the directories themselves. You supply
+`tardigrade.conf` and any TLS material as bind mounts, since `tardi` reads
+those from disk either way. `tardigrade.env` is different: `tardi` never
+parses that filename itself — it only reads `TARDIGRADE_*` values from its
+own **process environment**. Under systemd, `EnvironmentFile=` is what turns
+the file's contents into that process environment; Docker has no built-in
+equivalent, so bind-mounting `tardigrade.env` into the container does
+nothing — `tardi` won't read it. Use Compose's `env_file:` (which reads the
+file on the host and injects its contents as real container environment
+variables) or `environment:` instead. See [Docker](#docker) below for the
+exact shape.
 
 ### Permissions and ownership
 
@@ -234,13 +245,36 @@ Reload vs. restart — the two are not interchangeable:
   environment of an already-running process, so a `tardigrade.env` edit has
   no effect until the process is restarted and re-reads it at exec time.
 
-**Master/worker mode**: the `systemctl reload`/PID-file workflow above
-assumes single-process mode (the default). Per
-[`CONFIGURATION.md`](CONFIGURATION.md#field-reference)'s `master_process`
-entry, master/worker mode does not yet provide coherent PID-file/SIGHUP
-reload control across all workers — use restart semantics
-(`systemctl restart tardigrade`) instead of `reload` if you run with
-`master_process true;`.
+**Master/worker mode**: every control-path example in this guide — systemd
+and Docker alike — assumes single-process mode, which is the default
+(`master_process false;`). If you run with `master_process true;`, three
+things in this guide do not behave as documented:
+
+- **Reload.** The `systemctl reload`/PID-file workflow above (and the
+  equivalent `tardi reload --pid-file ...` under Docker) targets the PID
+  file's process with `SIGHUP`. Per
+  [`CONFIGURATION.md`](CONFIGURATION.md#field-reference)'s `master_process`
+  entry, master/worker mode does not yet provide coherent PID-file/SIGHUP
+  reload control across all workers — use restart semantics instead
+  (`systemctl restart tardigrade`, or recreate the container) rather than
+  `reload`.
+- **USR1 log-reopen after rotation.** Each worker opens its own error-log
+  file descriptor independently at startup. `SIGUSR1` delivered to the
+  master (via `systemctl kill --signal=USR1`, `docker kill --signal=USR1`,
+  or the packaged logrotate policy) only reopens the *master's own*
+  descriptor today — it is not forwarded to worker processes, so workers
+  keep writing to the rotated-away inode.
+- **The 35s stop window.** The current shutdown path stops workers one at a
+  time (kill, wait for exit, then move to the next), not all at once, so
+  total shutdown time scales with worker count rather than being bounded by
+  a single drain window. A `TimeoutStopSec`/`stop_grace_period` of 35s is
+  not generally sufficient once you have more than one worker.
+
+None of this is specific to Docker or systemd — it's the same underlying
+multi-worker supervisor either way. Until coherent multi-worker signal
+fan-out lands, keep `master_process false;` (the default) if you rely on
+any of reload, log rotation, or a bounded graceful-stop window from this
+guide.
 
 ## Docker
 
@@ -293,6 +327,11 @@ docker compose exec tardigrade \
   tardi reload --pid-file /run/tardigrade/tardigrade.pid
 ```
 
+> **Single-process mode only.** This targets the PID file's process with
+> `SIGHUP`, same as the systemd path. With `master_process true;`, this does
+> not reload workers coherently — see [Master/worker mode](#commands) above,
+> which applies here too.
+
 ### Graceful stop
 
 ```bash
@@ -314,6 +353,28 @@ explicit `uid=10001,gid=10001` mount options matching the image's fixed
 `tardigrade` user (see [Permissions and ownership](#permissions-and-ownership)
 above) — a plain tmpfs mount defaults to `root:root` and the process can't
 write its PID file into it.
+
+**Environment values (`tardigrade.env` equivalent)**: `tardi` reads
+`TARDIGRADE_*` values from the process environment, not from a parsed
+config file — see the note in [Host filesystem
+layout](#host-filesystem-layout) above. Under Docker, use Compose's
+`env_file:` to inject an operator env file's contents as real container
+environment variables:
+
+```yaml
+services:
+  tardigrade:
+    # Optional operator environment values, injected as real container
+    # environment variables (tardi does not read this path as a file):
+    # env_file:
+    #   - ./deploy/tardigrade.env
+    environment:
+      # Keep these explicit: Compose `environment:` overrides `env_file:`,
+      # so even a baseline env file setting a conflicting PID path cannot
+      # desync the runtime from the control commands below.
+      TARDIGRADE_PID_FILE: /run/tardigrade/tardigrade.pid
+      TARDIGRADE_REQUIRE_UNPRIVILEGED_USER: "true"
+```
 
 The bundled healthcheck runs `tardi status --pid-file ...` inside the
 container. Note its limitation: `tardi status` always exits `0` once the
@@ -368,7 +429,7 @@ Two logging surfaces, both covered in full by
      (often root-owned) host directory will make `error_log` fail with
      `EACCES`. Prepare it first:
      ```bash
-     install -d -o 10001 -g 10001 -m 0755 ./logs
+     sudo install -d -o 10001 -g 10001 -m 0755 ./logs
      ```
      or use a named volume and let the container's own directory-creation
      step own it on first start.
@@ -431,16 +492,26 @@ limiting values.
   registry unless and until a separate distribution ticket adds that.
 - This guide targets Linux containers; other container runtimes (Podman,
   etc.) aren't tested against it.
-- Operators supply their own config, certificates, static roots, and secrets
-  — none of these are baked into the image or package.
+- The Docker image bakes in no config, certificates, or secrets at all —
+  operators mount/inject everything. Native DEB/RPM packages differ: they
+  install a non-secret starter `tardigrade.conf` and an env template, which
+  operators are expected to replace or edit; certificates, static content,
+  and live secrets remain operator-supplied either way.
 - `/status/metrics` is not automatically restricted; apply the checklist
   item above before exposing a deployment publicly.
 - DEB/RPM remain the more deeply integrated host-native Linux install path
   (user creation, logrotate, systemd wiring all handled by the package).
-- The packaged `systemctl reload`/PID-file control workflow targets
-  single-process mode. `master_process true;` does not yet provide coherent
-  SIGHUP/PID-file reload control across all workers — restart instead of
-  reload in that mode (see [CONFIGURATION.md](CONFIGURATION.md#field-reference)).
+- `master_process true;` is not coherently supported by any of the control
+  paths in this guide, under either systemd or Docker: reload targets one
+  PID via `SIGHUP` (workers aren't reloaded coherently); `SIGUSR1`
+  log-reopen after rotation only reopens the master's own file descriptor,
+  not each worker's; and the documented 35s stop window assumes workers
+  stop roughly in parallel, but the current shutdown path stops them one at
+  a time, so total shutdown time scales with worker count. Keep
+  `master_process false;` (the default) if you rely on reload, log
+  rotation, or a bounded graceful-stop window — see
+  [CONFIGURATION.md](CONFIGURATION.md#field-reference) and the
+  [Commands](#commands) section above.
 - Every experimental protocol/feature in the [support matrix](SUPPORT_MATRIX.md)
   stays experimental regardless of deployment method — deploying via
   Docker or systemd does not change a feature's maturity level.
