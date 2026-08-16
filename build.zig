@@ -366,6 +366,19 @@ pub fn build(b: *std.Build) void {
     const init_profile_integration_step = b.step("test-integration-init", "Run tardi init <profile> real generated-config validation");
     init_profile_integration_step.dependOn(&run_init_profile_integration_tests.step);
 
+    // #163: `tardi explain <field>` real-binary regression tests, most
+    // importantly the secret-leak checks -- spawns the built binary against
+    // a real child environment containing a sentinel secret, so this stays
+    // runnable on its own without the full (slower) integration suite.
+    const explain_integration_tests = b.addTest(.{
+        .root_module = integration_mod,
+        .filters = &.{"explain "},
+    });
+    const run_explain_integration_tests = b.addRunArtifact(explain_integration_tests);
+    run_explain_integration_tests.step.dependOn(b.getInstallStep());
+    const explain_integration_step = b.step("test-integration-explain", "Run tardi explain <field> real-binary regression tests");
+    explain_integration_step.dependOn(&run_explain_integration_tests.step);
+
     // Resumption/0-RTT external interop, restart, and soak suite (#369, and
     // #522's `h3interop.*` QUIC/H3 cases -- `h3interop.` contains the
     // `interop.` filter substring, so they run under this same step): the

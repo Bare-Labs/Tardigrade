@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const compat = @import("zig_compat");
 const config_profiles = @import("config_profiles.zig");
+const config_reference = @import("config_reference.zig");
 const edge_config = @import("edge_config.zig");
 const edge_gateway = @import("edge_gateway.zig");
 const http = @import("http.zig");
@@ -27,6 +28,7 @@ const CliCommand = union(enum) {
     help,
     config_init: ConfigInitOptions,
     init: InitOptions,
+    explain: ExplainOptions,
 };
 
 const CommonOptions = struct {
@@ -61,6 +63,14 @@ const ConfigInitOptions = struct {
 // --profile <name>` already owns file-writing.
 const InitOptions = struct {
     profile_name: []const u8,
+};
+
+// `tardi explain <field>` (#163): a static, configuration-independent
+// reference lookup -- see config_reference.zig. Deliberately has no
+// config_path / CommonOptions: explain must not require, load, or resolve a
+// config file.
+const ExplainOptions = struct {
+    query: []const u8,
 };
 
 const ValidationMode = enum {
@@ -139,6 +149,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
         .config_init => |options| try writeStarterConfig(options),
         .init => |options| try executeInitCommand(options),
+        .explain => |options| try executeExplainCommandOrExit(options),
         .status => |options| try executeStatusCommand(control_allocator, options),
         .print_config => |options| try executePrintConfigCommand(control_allocator, options),
         .routes => |options| try executeRoutesCommand(control_allocator, options),
@@ -175,10 +186,12 @@ fn parseCliCommand(args: []const []const u8) !CliCommand {
     if (std.mem.eql(u8, first, "reload")) return try parseSignalCommand(.reload, args[1..]);
     if (std.mem.eql(u8, first, "stop")) return try parseSignalCommand(.stop, args[1..]);
     if (std.mem.eql(u8, first, "init")) return try parseInitCommand(args[1..]);
+    if (std.mem.eql(u8, first, "explain")) return try parseExplainCommand(args[1..]);
     if (std.mem.eql(u8, first, "config")) {
         if (args.len >= 2 and std.mem.eql(u8, args[1], "init")) return try parseConfigInitCommand(args[2..]);
         if (args.len >= 2 and std.mem.eql(u8, args[1], "print")) return try parsePrintConfigCommand(args[2..]);
         if (args.len >= 2 and std.mem.eql(u8, args[1], "validate")) return try parseCheckCommand(args[2..]);
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "explain")) return try parseExplainCommand(args[2..]);
         return error.InvalidCommand;
     }
 
@@ -387,6 +400,20 @@ fn parseInitCommand(args: []const []const u8) !CliCommand {
     return .{ .init = .{ .profile_name = profile_name orelse return error.MissingConfigProfile } };
 }
 
+// `explain <field>` / `config explain <field>` (#163): exactly one
+// positional query is required. No `-c`/`--config` is accepted -- explain is
+// a static reference lookup and must not touch a config file.
+fn parseExplainCommand(args: []const []const u8) !CliCommand {
+    var query: ?[]const u8 = null;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
+        if (std.mem.startsWith(u8, arg, "-")) return error.UnknownOption;
+        if (query != null) return error.TooManyArguments;
+        query = arg;
+    }
+    return .{ .explain = .{ .query = query orelse return error.MissingExplainField } };
+}
+
 fn printUsage(writer: anytype) !void {
     try writer.writeAll(
         \\Usage:
@@ -401,9 +428,11 @@ fn printUsage(writer: anytype) !void {
         \\  tardigrade stop [-c <path>] [--pid-file <path> | --pid <pid>]
         \\  tardigrade version
         \\  tardigrade init <profile>
+        \\  tardi explain <field>
         \\  tardigrade config init [<path>] [--force | --stdout] [--profile <profile>]
         \\  tardigrade config print [-c <path>]
         \\  tardigrade config validate [<config>]
+        \\  tardi config explain <field>
         \\
         \\Profiles (canonical name, descriptive alias -- aliases resolve to the
         \\same template):
@@ -430,6 +459,12 @@ fn printUsage(writer: anytype) !void {
         \\    priority, action, auth) for the effective config.
         \\  - `upstreams` lists the upstream targets referenced by the routes plus
         \\    the default upstream base URL.
+        \\  - `explain <field>` describes a supported configuration field or
+        \\    directive (type, default, valid values, env var, example, docs) from
+        \\    static reference metadata. It does not require or load a config
+        \\    file, and never reads current environment or secret values --
+        \\    unlike `print-config`, it does not report effective configuration.
+        \\    `config explain <field>` is a verbose alias for the same command.
         \\  - Runtime config discovery checks `-c/--config`, `TARDIGRADE_CONFIG_PATH`,
         \\    `./tardigrade.conf`, `./config/tardigrade.conf`,
         \\    `/etc/tardigrade/tardigrade.conf`, and
@@ -445,6 +480,7 @@ fn printCliParseError(writer: anytype, err: anyerror) !void {
         error.MissingOptionValue => "error: missing option value\n",
         error.TooManyArguments => "error: too many positional arguments\n",
         error.MissingConfigProfile => "error: missing config profile\n",
+        error.MissingExplainField => "error: missing configuration field or directive\n",
         else => "error: invalid command line\n",
     };
     try writer.writeAll(msg);
@@ -1108,6 +1144,24 @@ fn executeInitCommand(options: InitOptions) !void {
     try stdout.flush();
 }
 
+// `explain <field>` / `config explain <field>` (#163): a static reference
+// lookup over config_reference.zig. Deliberately does not resolve/load a
+// config file, inspect a running process, or touch the network -- see
+// config_reference.zig's module doc comment for the full rationale.
+fn executeExplainCommandOrExit(options: ExplainOptions) !void {
+    const entry = config_reference.lookup(options.query) orelse {
+        var stderr_buf: [2048]u8 = undefined;
+        var stderr = compat.stderrWriter(&stderr_buf);
+        config_reference.writeUnknown(&stderr, options.query) catch {};
+        stderr.flush() catch {};
+        std.process.exit(EXIT_INTERNAL_ERROR);
+    };
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = compat.stdoutWriter(&stdout_buf);
+    try config_reference.writeExplanation(&stdout, entry);
+    try stdout.flush();
+}
+
 fn writeStarterConfig(options: ConfigInitOptions) !void {
     const content: []const u8 = if (options.profile_name) |name|
         config_profiles.template(resolveConfigProfileOrExit(name))
@@ -1478,6 +1532,7 @@ test {
     _ = @import("edge_config.zig");
     _ = @import("edge_gateway.zig");
     _ = @import("gateway_protocol_policy.zig");
+    _ = @import("config_reference.zig");
 }
 
 test "rotateLogFiles shifts generations" {
@@ -1879,4 +1934,68 @@ test "check command default path is tardigrade.toml" {
 test "config command invalid input exits with config error code" {
     try std.testing.expectEqual(EXIT_CONFIG_INVALID, configCommandExitCode(error.InvalidConfigSyntax));
     try std.testing.expectEqual(EXIT_INTERNAL_ERROR, configCommandExitCode(error.OutOfMemory));
+}
+
+test "parseCliCommand explain resolves the primary command with its query" {
+    const cmd = try parseCliCommand(&.{ "explain", "listen" });
+    switch (cmd) {
+        .explain => |options| try std.testing.expectEqualStrings("listen", options.query),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliCommand config explain is an equivalent alias" {
+    const cmd = try parseCliCommand(&.{ "config", "explain", "listen" });
+    switch (cmd) {
+        .explain => |options| try std.testing.expectEqualStrings("listen", options.query),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliCommand explain accepts a dotted qualified query" {
+    const cmd = try parseCliCommand(&.{ "explain", "location.proxy_pass" });
+    switch (cmd) {
+        .explain => |options| try std.testing.expectEqualStrings("location.proxy_pass", options.query),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseCliCommand explain help flags" {
+    try std.testing.expectEqual(CliCommand.help, std.meta.activeTag(try parseCliCommand(&.{ "explain", "-h" })));
+    try std.testing.expectEqual(CliCommand.help, std.meta.activeTag(try parseCliCommand(&.{ "explain", "--help" })));
+}
+
+test "parseCliCommand explain with no query is a missing-field error" {
+    try std.testing.expectError(error.MissingExplainField, parseCliCommand(&.{"explain"}));
+}
+
+test "parseCliCommand explain with two queries is too many arguments" {
+    try std.testing.expectError(error.TooManyArguments, parseCliCommand(&.{ "explain", "listen", "server_name" }));
+}
+
+test "parseCliCommand explain with an unknown option is rejected" {
+    try std.testing.expectError(error.UnknownOption, parseCliCommand(&.{ "explain", "--bogus" }));
+}
+
+test "missing explain field error message names the field" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try printCliParseError(&out.writer, error.MissingExplainField);
+    try std.testing.expectEqualStrings("error: missing configuration field or directive\n", out.writer.buffered());
+}
+
+test "built-in usage documents the concise tardi explain form before the verbose config explain alias" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try printUsage(&out.writer);
+    const written = out.writer.buffered();
+
+    const concise_idx = std.mem.indexOf(u8, written, "tardi explain <field>") orelse return error.TestUnexpectedResult;
+    const verbose_idx = std.mem.indexOf(u8, written, "tardi config explain <field>") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(concise_idx < verbose_idx);
+
+    // #163 requires the built-in help to name the canonical `tardi` binary
+    // for these two commands, not the legacy `tardigrade` spelling.
+    try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade explain <field>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade config explain <field>") == null);
 }

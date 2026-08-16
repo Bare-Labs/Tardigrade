@@ -193,12 +193,30 @@ Common CLI commands:
 ./zig-out/bin/tardi stop -c ./tardigrade.conf
 ./zig-out/bin/tardi init <profile>
 ./zig-out/bin/tardi config init
+./zig-out/bin/tardi explain <field>
+./zig-out/bin/tardi config explain <field>
 ```
 
 `check` performs a dry parse and semantic validation without starting listeners
 or connecting to upstreams. When no path is supplied, it validates
 `./tardigrade.toml`; pass the path explicitly when using the nginx-style
 `tardigrade.conf` examples.
+
+Not sure what a directive does or which values it accepts? `tardi explain
+<field>` looks it up from a built-in reference -- no config file required:
+
+```bash
+./zig-out/bin/tardi explain listen
+./zig-out/bin/tardi explain location.proxy_pass
+./zig-out/bin/tardi explain upstream_protocol
+```
+
+`tardi config explain <field>` is a verbose alias for the same command.
+`explain` is a static documentation lookup: it describes the *supported*
+configuration contract (type, default, valid values, environment variable,
+example) and never loads a config file, inspects a running process, or
+prints current environment/secret values -- that's what `print-config`
+(effective configuration) is for.
 
 For copy/paste-runnable examples of common deployments (static file serving,
 reverse proxy, TLS termination, rate limiting, and more), see the
