@@ -1220,14 +1220,21 @@ If you configured `error_log`/`TARDIGRADE_ERROR_LOG_PATH`, check that file
 instead:
 
 ```bash
-tardi print-config -c /etc/tardigrade/tardigrade.conf   # confirm the path configured in this file
+tardi print-config -c /etc/tardigrade/tardigrade.conf   # inspect the effective path resolved by this CLI invocation
 sudo tail -f /var/log/tardigrade/error.log
 ```
 
 As with the inspection-command warning in [§1](#1-five-minute-triage),
-`print-config` here only proves what the *file* configures. Moving the
-live `error_log` destination live is possible, but only in one direction
-and one deployment shape — don't assume it always works:
+`print-config` here proves what *this CLI invocation* resolves from the
+selected file plus its own current process environment — not
+live-process introspection, and not necessarily the file's literal value
+either: an already-set `TARDIGRADE_ERROR_LOG_PATH` in your shell overrides
+the file (same env-over-file precedence as everywhere else — see
+[CONFIGURATION.md](CONFIGURATION.md#configuration-reference)), and your
+interactive shell's environment usually differs from the systemd
+service's `EnvironmentFile=`. Moving the live `error_log` destination live
+is possible, but only in one direction and one deployment shape — don't
+assume it always works:
 
 - **Config-file change to a new non-empty file path, single-process
   mode:** a successful `SIGHUP` (publishes the new path) followed by

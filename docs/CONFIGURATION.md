@@ -530,11 +530,17 @@ Reloaded settings fall into three operational categories:
 | Config may publish, but live startup-owned state changes only after restart | Bound TCP socket host/port; event-loop backend and io_uring entries; runtime identity/chroot; PID file; master/worker-process topology; worker thread/queue/recycle/affinity settings; FD soft limit; connection-pool capacity; upstream TLS client state; circuit-breaker construction; idempotency TTL; session TTL/max/store path; access-control object; approval TTL/max-pending/store/escalation state; transcript store path; native resumption mode/ticket lifetime/ticket usage; general/OpenSSL TLS context inputs including min/max version, ciphers, session cache/tickets, client verification/CA/CRL, OCSP/ACME/watcher settings, and configured SNI identity; SSE event-hub capacity; DNS-discovery construction; coherent shutdown-drain policy; upstream-pool policy. Reload may log a restart-required warning for some of these. | `TARDIGRADE_WORKER_THREADS=8` |
 
 `error_log`/`TARDIGRADE_ERROR_LOG_PATH` doesn't fit either row cleanly, and
-the live-relocation behavior is directional. `SIGHUP` alone publishes a new
-path but never reopens the fd (`configureErrorLog()`'s `dup2` runs once at
-process startup). A following `SIGUSR1` reopens against whatever
-`error_log_path` is on the *currently published* config
-(`reopenErrorLog()`) — but only when that path is non-empty:
+the live-relocation behavior is directional. Editing the config file is
+not sufficient by itself: `envOrDefault()` gives an already-present
+process-environment `TARDIGRADE_ERROR_LOG_PATH` precedence over the file
+value (with a logged conflict warning), so a reload candidate only
+resolves to a *different* effective path if no higher-precedence env value
+is already pinning it. When it does resolve to a new path, `SIGHUP`
+publishes that effective path but never reopens the fd
+(`configureErrorLog()`'s `dup2` runs once at process startup). A following
+`SIGUSR1` reopens against whatever `error_log_path` is on the *currently
+published* config (`reopenErrorLog()`) — but only when that path is
+non-empty:
 `reopenErrorLog()` returns immediately when the published path is empty or
 `stderr`, without touching the existing file-backed fd. So in the default
 single-process deployment, a **config-file** change to a new non-empty
