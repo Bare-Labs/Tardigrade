@@ -320,8 +320,11 @@ Prove local connectivity first (it isolates "Tardigrade problem" from
 "network path problem"):
 
 ```bash
-curl -v -H 'Host: <your-server-name>' http://127.0.0.1:<port>/health
+curl -v -H 'Host: localhost' http://127.0.0.1:8069/health
 ```
+
+(Substitute your own `server_name` and port; the values above match the
+starter config used throughout this guide.)
 
 Then check what address it's actually bound to:
 
@@ -490,10 +493,11 @@ default `index.html` fallback.
 #### Verify the fix
 
 ```bash
-curl -v -H 'Host: <server_name>' http://127.0.0.1:8069/<path>
+curl -v -H 'Host: localhost' http://127.0.0.1:8069/index.html
 ```
 
-Confirm `200` with the expected body.
+Substitute your own `server_name` and file path. Confirm `200` with the
+expected body.
 
 ### 403 — security-driven rejection
 
@@ -508,11 +512,19 @@ sequences.
 This is intentional: Tardigrade resolves the canonical (`realpath`) absolute
 path of both the configured document root and the requested file, and
 rejects any resolved path that doesn't have the root as a prefix — with
-`403`, not `404`. This blocks `..` segments, percent-encoded and
-double-percent-encoded traversal, backslash traversal, and symlinks that
-point outside the document root. See
+`403`, not `404`. Raw `..` segments, single-percent-encoded traversal,
+backslash traversal, and symlinks that resolve outside the document root
+are rejected this way, as `403`, when they resolve to an escaping path. See
 [PROXY_SECURITY.md §12](PROXY_SECURITY.md#12-directory-traversal--static-file-serving)
-for the full list of blocked sequences.
+for the full list.
+
+Double (or additional) percent-encoding is also prevented from ever
+escaping the root, but it is **not guaranteed to be a `403`** — decoding
+happens once, so a double-encoded sequence like `%252e%252e` can remain a
+literal, non-decoded path segment that simply fails to resolve to any
+file, surfacing as an ordinary `404` instead. Either outcome means the
+traversal didn't succeed; don't read a `404` on a double-encoded path as
+"the protection didn't trigger."
 
 #### Concrete fixes
 
@@ -526,10 +538,11 @@ directory so the request never needs to leave it.
 #### Verify the fix
 
 ```bash
-curl -v -H 'Host: <server_name>' http://127.0.0.1:8069/<legitimate-path>
+curl -v -H 'Host: localhost' http://127.0.0.1:8069/index.html
 ```
 
-Confirm you get `200` for the legitimate path. To confirm traversal is
+Substitute your own `server_name` and a real file path. Confirm you get
+`200` for the legitimate path. To confirm traversal is
 still correctly rejected, send the raw `..` sequence with `--path-as-is` —
 without it, curl normalizes dot-segments client-side before the request
 ever leaves the machine, so the server may never see the traversal attempt
@@ -619,10 +632,11 @@ presents.
 #### Verify the fix
 
 ```bash
-curl -v -H 'Host: <server_name>' http://127.0.0.1:8069/<proxied-path>
+curl -v -H 'Host: localhost' http://127.0.0.1:8069/api/users
 ```
 
-Confirm the proxied response now matches what the origin returns directly.
+Substitute your own `server_name` and a real proxied route. Confirm the
+proxied response now matches what the origin returns directly.
 
 ### 504 — Gateway Timeout
 
@@ -659,29 +673,44 @@ complete well inside the configured timeout:
 
 ```bash
 time curl -v http://127.0.0.1:3000/health
-time curl -v -H 'Host: <server_name>' http://127.0.0.1:8069/<proxied-path>
+time curl -v -H 'Host: localhost' http://127.0.0.1:8069/api/users
 ```
+
+(Substitute your own `server_name` and proxied route.)
 
 ### 503 — Service Unavailable
 
 #### Symptoms
 
-`503`, often with `Retry-After` and `Connection: close`, and
-`error_category: upstream_unavailable` (proxy-capacity path) or no
-upstream contact at all.
+`503`, sometimes with `Retry-After` and `Connection: close`, sometimes just
+`Connection: close` with no `Retry-After` — the two shapes distinguish two
+different local-capacity families (see below), and neither means
+Tardigrade itself is unhealthy.
 
 #### Likely causes
 
-`503` here is a capacity/availability signal, not a gateway or timeout
-failure — don't fold it into the 502/504 explanations above:
+`503` here is a local capacity/availability signal, not a gateway or
+timeout failure — don't fold it into the 502/504 explanations above. There
+are three independent local-capacity families that all return `503`, and
+they need different metrics to tell apart:
 
-- the per-origin connection-pool limit
-  (`TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST`) is exhausted, failing the
-  checkout fast instead of queuing without bound
-- Tardigrade's own accept-time capacity limits were hit — this is **not**
-  an upstream problem at all; see the [overload-response table in
-  OBSERVABILITY.md](OBSERVABILITY.md#configured-limits) for the connection/
-  queue/memory caps that produce the same deterministic `503`
+1. **Accept-time / worker / in-flight capacity** — the global or per-IP
+   connection cap, the connection memory budget, the worker queue, or the
+   in-flight request cap was hit. This is the one deterministic path that
+   adds `Retry-After: 1` and `Connection: close`
+   (`gateway_accept.overload_response_503`). See the [overload-response
+   table in OBSERVABILITY.md](OBSERVABILITY.md#configured-limits) for the
+   exact caps.
+2. **Per-origin upstream connection-pool cap** —
+   `TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST` is exhausted for that
+   specific origin, and the checkout fails fast (`error.UpstreamAtCapacity`)
+   instead of queuing. No `Retry-After`, but the connection is still closed.
+3. **Proxy aggregate buffer capacity** — a per-origin or global proxy
+   buffer hard limit (`TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES`/
+   `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES`) refuses a reservation
+   before any response byte is committed (`error.ProxyBufferCapacityUnavailable`,
+   response code `proxy_buffer_saturated`). No `Retry-After`, connection
+   closed.
 
 Marking backends unhealthy (passive failure tracking or active probing —
 see [§8](#8-health-checks-mark-an-upstream-down)) changes backend
@@ -708,29 +737,43 @@ health state alone.
 
 #### Concrete fixes
 
-Point 503s at capacity metrics rather than guessing:
+Point 503s at the metric family matching the `503` shape you observed,
+rather than a single generic grep:
 
 ```bash
-curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/status/metrics | \
-  grep -E 'tardigrade_connection_rejections_total|tardigrade_queue_rejections_total'
+curl -s -H 'Host: localhost' http://127.0.0.1:8069/status/metrics | grep -E \
+  'tardigrade_(connection_rejections|queue_rejections)_total|tardigrade_upstream_pool_(at_capacity_total|connections_active)|tardigrade_.*buffer.*limit_exceeded'
 ```
 
-Raise the relevant capacity limit only after confirming Tardigrade has
-headroom (CPU/memory/fds) to honor it. If backend health looks like the
-underlying issue, fix the origin(s) and use [§8](#8-health-checks-mark-an-upstream-down)
-to confirm they're marked healthy again — that resolves the `502`/`504`s
-the unhealthy state was actually producing.
+- `tardigrade_connection_rejections_total`/`tardigrade_queue_rejections_total`
+  climbing → family 1; raise the relevant cap only after confirming
+  headroom (CPU/memory/fds) to honor it.
+- `tardigrade_upstream_pool_at_capacity_total{upstream="..."}` climbing
+  against `tardigrade_upstream_pool_connections_active{upstream="..."}` →
+  family 2; raise `TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST` for that
+  origin, or reduce concurrent demand on it.
+- `tardigrade_upstream_pool_buffer_limit_exceeded_total`/the HTTP/2
+  equivalent, or `tardigrade_buffer_limit_exceeded_total` with
+  `scope="origin"`/`scope="global"`, climbing → family 3; raise the
+  relevant `TARDIGRADE_PROXY_BUFFER_*_HARD_LIMIT_BYTES` only if you've
+  confirmed the memory headroom to back it.
+
+If backend health looks like the underlying issue instead, fix the
+origin(s) and use [§8](#8-health-checks-mark-an-upstream-down) to confirm
+they're marked healthy again — that resolves the `502`/`504`s the
+unhealthy state was actually producing, a separate class from all three
+`503` families above.
 
 #### Verify the fix
 
 ```bash
-curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/status/metrics | \
-  grep -E 'tardigrade_connection_rejections_total|tardigrade_queue_rejections_total'
-curl -v -H 'Host: <server_name>' http://127.0.0.1:8069/<proxied-path>
+curl -s -H 'Host: localhost' http://127.0.0.1:8069/status/metrics | grep -E \
+  'tardigrade_(connection_rejections|queue_rejections)_total|tardigrade_upstream_pool_(at_capacity_total|connections_active)|tardigrade_.*buffer.*limit_exceeded'
+curl -v -H 'Host: localhost' http://127.0.0.1:8069/api/users
 ```
 
-Confirm the rejection counters aren't climbing and the proxied request
-succeeds with the status you expect.
+Confirm the specific counter you were chasing isn't climbing anymore and
+the proxied request succeeds with the status you expect.
 
 ### Related documentation
 
@@ -806,18 +849,30 @@ openssl x509 \
   -noout -subject -issuer -dates
 ```
 
-A profile-independent cert/key match check (compares public-key digests
-rather than relying on a Tardigrade-side match check that only runs on
-appliance builds):
+A profile-independent cert/key match check (compares extracted public
+keys rather than relying on a Tardigrade-side match check that only runs
+on appliance builds). Avoid a bare `| sha256sum` pipeline here without
+`set -o pipefail` — if an earlier `openssl` stage fails and produces no
+output, `sha256sum` still succeeds hashing an empty stream, and two
+independently-broken inputs can produce the same "matching" empty-input
+digest, which is exactly the false negative you don't want in a
+credential-mismatch check:
 
 ```bash
-openssl x509 -in /etc/tardigrade/tls/fullchain.pem -pubkey -noout \
-  | openssl pkey -pubin -outform DER | sha256sum
-openssl pkey -in /etc/tardigrade/tls/privkey.pem -pubout -outform DER \
-  | sha256sum
+cert_pub=$(mktemp)
+key_pub=$(mktemp)
+trap 'rm -f "$cert_pub" "$key_pub"' EXIT
+
+openssl x509 -in /etc/tardigrade/tls/fullchain.pem -pubkey -noout >"$cert_pub" &&
+openssl pkey -in /etc/tardigrade/tls/privkey.pem -pubout >"$key_pub" &&
+cmp -s "$cert_pub" "$key_pub" && echo "cert/key match" || echo "cert/key MISMATCH or one input is invalid"
 ```
 
-The two digests must match.
+Exit `0` from the full `&&` chain (printing `cert/key match`) means the
+public keys match. Any `openssl` failure earlier in the chain means the
+PEM material itself is invalid/unreadable and must be fixed before a
+match can even be checked; reaching `cmp` and having it fail means a
+genuine cert/key mismatch.
 
 #### Likely causes
 
@@ -838,7 +893,7 @@ listener starts serving:
 
 - the service account can't read the private key
 - malformed PEM, or an ambiguous/ill-formed certificate chain
-- the certificate and key don't match (`sha256sum` check above)
+- the certificate and key don't match (`cmp` check above)
 
 Genuinely separate from the above — an expired or not-yet-valid certificate
 (`openssl x509 … -dates` above) does not fail loading on the general
@@ -983,8 +1038,12 @@ Then probe the actual health-check endpoint from Tardigrade's own network
 context (same host/container/namespace), using the configured probe path:
 
 ```bash
-curl -v http://<upstream-host>:<upstream-port><probe-path>
+curl -v http://127.0.0.1:3000/health
 ```
+
+(Substitute your own upstream host, port, and probe path —
+`TARDIGRADE_UPSTREAM_ACTIVE_PROBE_PATH`/the origin's `-c` config — for the
+one shown above.)
 
 ### Likely causes
 
@@ -1244,20 +1303,31 @@ time you reloaded.
 - **the field you changed is not reload-eligible.** Tardigrade classifies
   every setting into one of three buckets — see the [full matrix in
   CONFIGURATION.md](CONFIGURATION.md#reload-behavior):
-  1. reloadable in place (routing, TLS credentials, rate limits, buffer
-     limits, log level, etc.) — takes effect immediately on the next
-     request after publication;
+  1. reloadable in place (routing, rate limits, proxy/TLS buffer limits,
+     response/security headers, log level, access logging, etc.) — takes
+     effect immediately on the next request after publication;
   2. **reload rejected outright**, restart required (listener-shard
      topology, HTTP/3 listener-owned settings, native early-data
-     replay/ticket-key mode, appliance TLS credential identity) — `SIGHUP`
-     refuses these and keeps the old config running rather than applying a
-     partial change;
+     replay/ticket-key mode, and **appliance-profile** TLS credential
+     configuration — `TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_SERVER_NAME`,
+     `TLS_SNI_CERTS`) — `SIGHUP` refuses these and keeps the old config
+     running rather than applying a partial change;
   3. **the reload "succeeds" and publishes the new config, but the specific
      live runtime state doesn't change until restart** (bound socket
      host/port, worker thread/queue counts, PID file, upstream-pool policy,
-     session/approval/transcript store paths, general TLS context inputs,
-     and more) — this is the easiest case to mistake for "reload is
-     broken", because there's no rejection to see.
+     session/approval/transcript store paths, and — on the
+     **general/OpenSSL profile** — TLS context inputs including protocol/
+     cipher/session/client-verify/CA/CRL/OCSP/ACME/watcher settings and the
+     configured SNI identity) — this is the easiest case to mistake for
+     "reload is broken", because there's no rejection to see.
+
+  There is no "TLS credentials are hot-reloadable" case in either profile.
+  Separately, the general/OpenSSL TLS terminator has its own file-content
+  maintenance watcher that reloads certificate/key *bytes at the
+  already-configured paths* on its own interval, keeping the existing
+  context active if a refresh fails — that's a distinct mechanism from
+  `SIGHUP` config reload and doesn't make TLS config fields themselves
+  hot-reloadable.
 - **you edited `tardigrade.env`, not `tardigrade.conf`** — `SIGHUP` reloads
   the *config*; it cannot change the *process environment* of an
   already-running process. `tardigrade.env` (and any
@@ -1354,9 +1424,10 @@ regression:
 - **comparing an ad hoc laptop/debug run against published benchmark
   numbers.** Published Tardigrade benchmark numbers are captured on a
   dedicated, idle, deployment-class target, not a shared laptop — a laptop
-  can measure 2-3x faster or slower than a real deployment target purely
-  from CPU/scheduling differences. Treat any local run as a smoke test, not
-  a regression signal, unless it's run with matched hardware, concurrency,
+  can measure materially faster or slower than the canonical deployment
+  target because CPU, frequency scaling, scheduler noise, background work,
+  and topology all differ. Treat any local run as a smoke test, not a
+  regression signal, unless it's run with matched hardware, concurrency,
   and protocol against the baseline you're comparing to.
 
 ### Concrete fixes
@@ -1374,7 +1445,7 @@ protocol you used for the original comparison:
 ```bash
 ./benchmarks/run.sh \
   --host 127.0.0.1 \
-  --host-header <server_name> \
+  --host-header localhost \
   --pid-file /run/tardigrade/tardigrade.pid \
   --scenarios static-http1,proxy-http1,keepalive
 ```
