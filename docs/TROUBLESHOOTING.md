@@ -163,10 +163,14 @@ tardi check /etc/tardigrade/tardigrade.conf
 echo "exit code: $?"
 ```
 
-Exit code `2` means the config itself is invalid (syntax or semantic
-validation rejected it); exit code `1` means something else went wrong
-(unexpected filesystem/internal error) — don't spend time re-reading the
-config file for a `1`.
+Exit code `2` is the deterministic configuration/preflight failure class —
+this covers more than syntax/semantic validation: a missing selected or
+`include`d config file, a permission error reading one, and (on the
+appliance TLS profile) credential-preflight failures all also exit `2`.
+Exit code `1` is reserved for whatever isn't classified as a
+configuration/preflight error — an unexpected internal/runtime failure —
+so don't spend time re-reading the config file for a `1`; the printed
+diagnostic text tells you which specific class occurred either way.
 
 For package deployments, also check as the service user, since file
 permissions differ between your shell and the service account:
@@ -757,33 +761,39 @@ rather than a single generic grep:
 
 ```bash
 curl -s -H 'Host: localhost' http://127.0.0.1:8069/status/metrics | grep -E \
-  'tardigrade_(connection_rejections|queue_rejections)_total|tardigrade_upstream_pool_(at_capacity_total|connections_active)|tardigrade_.*buffer.*limit_exceeded'
+  'tardigrade_(connection_rejections|queue_rejections)_total|tardigrade_error_overload_total|tardigrade_upstream_pool_(at_capacity_total|connections_active)|tardigrade_.*buffer.*limit_exceeded'
 ```
 
 - `tardigrade_connection_rejections_total`/`tardigrade_queue_rejections_total`
-  climbing → family 1; raise the relevant cap only after confirming
-  headroom (CPU/memory/fds) to honor it.
+  climbing → family 1 (accept/connection/worker-queue); raise the relevant
+  cap only after confirming headroom (CPU/memory/fds) to honor it.
+- `tardigrade_error_overload_total` climbing while the two counters above
+  stay flat → family 2 (in-flight request cap); raise
+  `TARDIGRADE_MAX_IN_FLIGHT_REQUESTS` only after confirming the gateway
+  has spare worker/upstream capacity to actually serve more concurrent
+  requests, or investigate what's holding requests in flight so long.
 - `tardigrade_upstream_pool_at_capacity_total{upstream="..."}` climbing
   against `tardigrade_upstream_pool_connections_active{upstream="..."}` →
-  family 2; raise `TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST` for that
-  origin, or reduce concurrent demand on it.
+  family 3 (per-origin pool cap); raise
+  `TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST` for that origin, or
+  reduce concurrent demand on it.
 - `tardigrade_upstream_pool_buffer_limit_exceeded_total`/the HTTP/2
   equivalent, or `tardigrade_buffer_limit_exceeded_total` with
-  `scope="origin"`/`scope="global"`, climbing → family 3; raise the
-  relevant `TARDIGRADE_PROXY_BUFFER_*_HARD_LIMIT_BYTES` only if you've
-  confirmed the memory headroom to back it.
+  `scope="origin"`/`scope="global"`, climbing → family 4 (proxy buffer
+  capacity); raise the relevant `TARDIGRADE_PROXY_BUFFER_*_HARD_LIMIT_BYTES`
+  only if you've confirmed the memory headroom to back it.
 
 If backend health looks like the underlying issue instead, fix the
 origin(s) and use [§8](#8-health-checks-mark-an-upstream-down) to confirm
 they're marked healthy again — that resolves the `502`/`504`s the
-unhealthy state was actually producing, a separate class from all three
+unhealthy state was actually producing, a separate class from all four
 `503` families above.
 
 #### Verify the fix
 
 ```bash
 curl -s -H 'Host: localhost' http://127.0.0.1:8069/status/metrics | grep -E \
-  'tardigrade_(connection_rejections|queue_rejections)_total|tardigrade_upstream_pool_(at_capacity_total|connections_active)|tardigrade_.*buffer.*limit_exceeded'
+  'tardigrade_(connection_rejections|queue_rejections)_total|tardigrade_error_overload_total|tardigrade_upstream_pool_(at_capacity_total|connections_active)|tardigrade_.*buffer.*limit_exceeded'
 curl -v -H 'Host: localhost' http://127.0.0.1:8069/api/users
 ```
 
@@ -874,27 +884,34 @@ digest, which is exactly the false negative you don't want in a
 credential-mismatch check:
 
 ```bash
-cert_pub=$(mktemp)
-key_pub=$(mktemp)
-trap 'rm -f "$cert_pub" "$key_pub"' EXIT
+(
+  cert_pub=$(mktemp) || exit 1
+  key_pub=$(mktemp) || { rm -f "$cert_pub"; exit 1; }
+  trap 'rm -f "$cert_pub" "$key_pub"' EXIT
 
-if ! openssl x509 -in /etc/tardigrade/tls/fullchain.pem -pubkey -noout >"$cert_pub"; then
-  echo "certificate PEM is invalid or unreadable" >&2
-  exit 1
-fi
+  if ! openssl x509 -in /etc/tardigrade/tls/fullchain.pem -pubkey -noout >"$cert_pub"; then
+    echo "certificate PEM is invalid or unreadable" >&2
+    exit 1
+  fi
 
-if ! openssl pkey -in /etc/tardigrade/tls/privkey.pem -pubout >"$key_pub"; then
-  echo "private key is invalid or unreadable" >&2
-  exit 1
-fi
+  if ! openssl pkey -in /etc/tardigrade/tls/privkey.pem -pubout >"$key_pub"; then
+    echo "private key is invalid or unreadable" >&2
+    exit 1
+  fi
 
-if cmp -s "$cert_pub" "$key_pub"; then
+  if ! cmp -s "$cert_pub" "$key_pub"; then
+    echo "cert/key MISMATCH" >&2
+    exit 1
+  fi
   echo "cert/key match"
-else
-  echo "cert/key MISMATCH" >&2
-  exit 1
-fi
+)
 ```
+
+Wrapped in a subshell `(...)` so `exit`/`trap` stay local to the check —
+without it, the `exit 1` branches would terminate the operator's actual
+shell/session on failure, and a successful run's `trap ... EXIT` would
+stay installed in that shell until it eventually exits, silently
+replacing any `EXIT` trap already set there.
 
 The exit status and the printed message agree: `0`/`cert/key match` means
 the public keys match; a nonzero exit from either `openssl` stage means
@@ -1208,15 +1225,24 @@ sudo tail -f /var/log/tardigrade/error.log
 ```
 
 As with the inspection-command warning in [§1](#1-five-minute-triage),
-`print-config` here only proves what the *file* configures — the live
-`error_log` destination is opened once at process startup
-(`configureErrorLog()`) and is not re-applied on `SIGHUP`. If you just
-changed `error_log`/`TARDIGRADE_ERROR_LOG_PATH` and reloaded rather than
-restarted, the running process is still writing to the *old* destination
-regardless of what `print-config` now shows — see
-[CONFIGURATION.md's reload matrix](CONFIGURATION.md#reload-behavior),
-which lists the error-log destination as startup-owned. Restart, don't
-reload, to move where logs are actually written.
+`print-config` here only proves what the *file* configures. Moving the
+live `error_log` destination is a **two-signal sequence, not a plain
+reload**: `SIGHUP` alone publishes the new path but doesn't reopen
+anything (`configureErrorLog()`'s `dup2` onto stderr runs once at process
+startup, not on reload); a following `SIGUSR1` then reopens the log file
+against whatever `error_log_path` is on the config that's currently
+published (`reopenErrorLog()`) — which, after a successful reload, is the
+new path. So:
+
+```bash
+sudo systemctl reload tardigrade   # publish the new error_log path
+sudo systemctl kill --kill-who=main --signal=USR1 tardigrade   # reopen against it
+```
+
+`SIGHUP` by itself leaves the process writing to the *old* destination
+regardless of what `print-config` now shows; a full restart also works,
+but isn't required. See [CONFIGURATION.md's reload
+matrix](CONFIGURATION.md#reload-behavior) for the full two-signal note.
 
 ### Likely causes
 
@@ -1258,10 +1284,14 @@ reload, to move where logs are actually written.
   [DEPLOYMENT.md's Logs section](DEPLOYMENT.md#logs) for the
   `install -d -o 10001 -g 10001` fix
 
-Do not expect a second log-rotation mechanism: the packaged DEB/RPM
-logrotate policy sends `SIGUSR1` after rotation, and Tardigrade's own
-`SIGUSR1` handler reopens the log file cleanly on that cadence — that's the
-one supported rotation path.
+Two rotation mechanisms are supported — don't invent a third:
+`TARDIGRADE_LOG_ROTATE_MAX_BYTES`/`TARDIGRADE_LOG_ROTATE_MAX_FILES`
+trigger a one-time size check and rotation at process **startup** only
+(not while the process stays up); the packaged DEB/RPM logrotate policy
+handles **ongoing** rotation while running, and sends `SIGUSR1` after each
+rotation so Tardigrade's `SIGUSR1` handler reopens the log file cleanly
+against the rotated-in path. Don't assume the startup size check runs
+periodically on its own — it doesn't.
 
 ### Concrete fixes
 
