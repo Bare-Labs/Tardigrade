@@ -1395,9 +1395,14 @@ time you reloaded.
   which only receives the protocol-policy update above. So on a process
   serving both, a credential-path change can publish to the native H3
   store while the stable TCP context stays on the old identity until
-  restart. Treat this as an experimental-surface caveat (see
+  restart — meaning the two protocols can transiently (or, until you
+  restart, persistently) present **different certificates for the same
+  hostname**. Treat this as an experimental-surface caveat (see
   [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md)), not evidence that stable TCP
-  TLS credentials are reloadable.
+  TLS credentials are reloadable; the mixed-protocol identity split
+  itself is tracked by
+  [#629](https://github.com/Bare-Systems/Tardigrade/issues/629), not yet
+  reconciled in `RELOAD_SHUTDOWN.md`.
 - **you edited `tardigrade.env`, not `tardigrade.conf`** — `SIGHUP` reloads
   the *config*; it cannot change the *process environment* of an
   already-running process. `tardigrade.env` (and any
