@@ -429,9 +429,12 @@ ordinary `location` matching never does.
 Reorder or tighten `location` blocks to get the precedence you want (exact
 `=` for a single path, `^~` to force priority over regex, and remember
 regex order matters). Fix the `server_name`/`Host` mismatch, or add a
-default/catch-all `server {}` block if you need one. If the config on disk
-is right but the live process disagrees, reload it (§11) instead of editing
-further.
+default/catch-all `server {}` block if you need one. If the CLI-resolved
+config is what you intend but live behavior differs, use
+[§11](#11-reload-did-not-apply-expected-changes) to distinguish a
+service-environment difference (a higher-precedence env value the service
+sees but your shell doesn't) from an unapplied or rejected reload, rather
+than assuming another edit will fix it.
 
 ### Verify the fix
 
@@ -716,9 +719,11 @@ they need different metrics/response bodies to tell apart:
    goes through the generic error path (JSON body,
    `"code":"overloaded"`), closes the connection, but does **not** add
    `Retry-After`, and does **not** move `connection_rejections_total`/
-   `queue_rejections_total` — only the overload error-code metric. A `503`
-   with no connection/queue rejection counters moving is this family, not
-   "nothing is actually saturated."
+   `queue_rejections_total` — only `tardigrade_error_overload_total` moves.
+   Flat connection/queue rejection counters alone don't identify this
+   family, though — families 3 and 4 below also leave those two flat;
+   `code:"overloaded"` plus `tardigrade_error_overload_total` rising is
+   what actually identifies family 2 specifically.
 3. **Per-origin upstream connection-pool cap** —
    `TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST` is exhausted for that
    specific origin, and the checkout fails fast (`error.UpstreamAtCapacity`)
@@ -1227,7 +1232,7 @@ instead:
 
 ```bash
 tardi print-config -c /etc/tardigrade/tardigrade.conf   # inspect the effective path resolved by this CLI invocation
-sudo tail -f /var/log/tardigrade/error.log
+sudo tail -f /var/log/tardigrade/error.log   # substitute the effective path you just resolved above
 ```
 
 As with the inspection-command warning in [§1](#1-five-minute-triage),
@@ -1243,13 +1248,17 @@ is possible, but only in one direction and one deployment shape — don't
 assume it always works:
 
 - **Config-file change to a new non-empty file path, single-process
-  mode:** a successful `SIGHUP` (publishes the new path) followed by
-  `SIGUSR1` (reopens against whatever `error_log_path` is on the
-  *currently published* config — `reopenErrorLog()`) does move the live
-  destination, whether that's stderr→file or file A→file B:
+  mode, no higher-precedence env override:** if no process-environment
+  `TARDIGRADE_ERROR_LOG_PATH` is already pinning the value (same
+  precedence rule as above — a service with that variable set in
+  `EnvironmentFile=` won't see a file-only edit at all), a successful
+  `SIGHUP` publishes the new *effective* path, and a following `SIGUSR1`
+  (reopens against whatever `error_log_path` is on the *currently
+  published* config — `reopenErrorLog()`) moves the live destination,
+  whether that's stderr→file or file A→file B:
 
   ```bash
-  sudo systemctl reload tardigrade   # publish the new error_log path
+  sudo systemctl reload tardigrade   # publish the new effective error_log path
   sudo systemctl kill --kill-who=main --signal=USR1 tardigrade   # reopen against it
   ```
 
@@ -1278,15 +1287,15 @@ the same scoped note.
 
 - **expecting a file while output is actually going to journald/stderr**:
   both runtime logs and access logs write to **stderr** by default (not
-  stdout) — that's what `journalctl`/`docker compose logs` capture. There
-  is no separate access-log file unless you set `error_log` (see below).
-- **expecting a separate access-log file**: without `error_log`/
+  stdout) — that's what `journalctl`/`docker compose logs` capture.
+- **expecting a separate access-log file**: there is no independent
+  access-log file in either case. Without `error_log`/
   `TARDIGRADE_ERROR_LOG_PATH` configured, both log types stay on stderr.
-  With it configured, Tardigrade `dup2`s that file onto its own stderr
-  file descriptor at startup, so runtime *and* access logs both end up
-  interleaved in that **one** file — there is no independent
-  `access.log`/`error.log` split; the file just takes whatever name you
-  gave `error_log`.
+  With it configured, Tardigrade `dup2`s that same shared stderr stream
+  onto one configured file at startup, so runtime *and* access logs still
+  end up interleaved together — just redirected, not split into
+  `access.log`/`error.log`; the file takes whatever name you gave
+  `error_log`.
 - **`error_log` is configured but the target directory/file isn't writable
   by the service account** — check ownership of `/var/log/tardigrade/`
 - **log level filtering**: `error_log … warn;` (or
@@ -1362,12 +1371,20 @@ printed) but nothing changed.
 
 ### First checks
 
-Validate the file first — a failed reload silently keeps the old config
-active, so if the new file is invalid you'd otherwise have no idea:
+Pre-validate what this ad-hoc CLI invocation resolves first — a failed
+reload silently keeps the old config active, so if the new file is invalid
+you'd otherwise have no idea:
 
 ```bash
 sudo -u tardigrade tardi check /etc/tardigrade/tardigrade.conf
 ```
+
+This catches parse/semantic problems before you signal the service, but
+it does not load systemd's `EnvironmentFile=` — like every other
+inspection command in this guide, it validates what *this* invocation
+resolves under its own environment, which may differ from the running
+service's actual reload candidate. The live reload status below is
+authoritative, not this precheck.
 
 Reload:
 
@@ -1500,7 +1517,8 @@ curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/status/metrics | \
 `ok: true` and a fresh `at_ms`, with `reload_success_total` incremented and
 `reload_failure_total` unchanged since your attempt, confirms the reload
 actually installed. Then re-check the specific behavior you changed against
-a live request — not just `tardi print-config` against the file.
+a live request — not just the CLI-resolved static config from
+`tardi print-config`.
 
 ### Related documentation
 
