@@ -724,6 +724,23 @@ check "run_benchmark_pass_h3 forwards --host-header to benchmarks/run.sh (so the
     '--host-header "$H3_TLS_SERVER_NAME"' "$PASS_H3_SRC"
 
 echo ""
+echo "==> Test 23: #247 validation evidence doc keeps the closeout contract wired to existing harnesses"
+VALIDATION_DOC="${SCRIPT_DIR}/../docs/HTTP3_VALIDATION_EVIDENCE.md"
+VALIDATION_TEXT="$(cat "$VALIDATION_DOC")"
+check "validation doc links the deterministic QUIC/H3 proof matrix" \
+    "QUIC_H3_FUZZ_MATRIX.md" "$VALIDATION_TEXT"
+check "validation doc points to the existing interop runner" \
+    "scripts/interop/run-interop.sh" "$VALIDATION_TEXT"
+check "validation doc requires a genuinely QUIC-capable client" \
+    "genuinely QUIC-capable" "$VALIDATION_TEXT"
+check "validation doc requires scenario-local QUIC metric deltas" \
+    "scenario-local QUIC metric deltas" "$VALIDATION_TEXT"
+check "validation doc preserves the bounded soak resource contract" \
+    "RSS and open file descriptors" "$VALIDATION_TEXT"
+check "validation doc keeps obsolete qvis issue #608 out of the #247 closeout path" \
+    "$(printf '%s' "$VALIDATION_TEXT" | grep -c '#608')" "0"
+
+echo ""
 echo "==> Test: existing HTTP/1 benchmark behavior does not regress (run.sh --help still documents http1 scenarios)"
 HELP_OUTPUT="$("$RUN_SH" --help 2>&1)"
 check "static-http1 still documented"   "static-http1" "$HELP_OUTPUT"
