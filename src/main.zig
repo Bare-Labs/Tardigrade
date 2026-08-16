@@ -10,7 +10,7 @@ const runtime_allocator = @import("runtime_allocator.zig");
 const tls_core = @import("tls_core");
 
 const ENV_CONFIG_PATH = "TARDIGRADE_CONFIG_PATH";
-const CHECK_DEFAULT_CONFIG_PATH = "./tardigrade.toml";
+const CHECK_DEFAULT_CONFIG_PATH = "./tardigrade.conf";
 const EXIT_INTERNAL_ERROR: u8 = 1;
 const EXIT_CONFIG_INVALID: u8 = 2;
 
@@ -450,7 +450,8 @@ fn printUsage(writer: anytype) !void {
         \\    `--profile <profile>` and keeps today's generic starter output
         \\    when no `--profile` is given.
         \\  - `check [<config>]` validates a config file without starting the server.
-        \\    Accepts a positional config path or defaults to `./tardigrade.toml`.
+        \\    Accepts a positional config path or defaults to `./tardigrade.conf`,
+        \\    the same local file `run` selects with no explicit path.
         \\    `config validate [<config>]` is a verbose alias for the same command.
         \\  - Legacy `validate` and `--validate-config` remain supported.
         \\  - `status` reports process state when a pid target is available.
@@ -1927,7 +1928,8 @@ test "parseCliCommand config validate with positional config path" {
     }
 }
 
-test "check command default path is tardigrade.toml" {
+test "check command default path is tardigrade.conf" {
+    try std.testing.expectEqualStrings("./tardigrade.conf", CHECK_DEFAULT_CONFIG_PATH);
     try std.testing.expectEqualStrings(CHECK_DEFAULT_CONFIG_PATH, validationTargetDescription(.{}, .check));
 }
 

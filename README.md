@@ -5,6 +5,7 @@
 </p>
 
 <p align="center">
+  <a href="docs/QUICKSTART.md"><strong>Quickstart</strong></a> |
   <a href="https://github.com/Bare-Systems/Tardigrade/releases">Releases</a> |
   <a href="docs/SUPPORT_MATRIX.md">Support Matrix</a> |
   <a href="docs/CONFIGURATION.md">Configuration</a> |
@@ -136,18 +137,18 @@ Useful build options are documented in [CONTRIBUTING.md](CONTRIBUTING.md#build-o
 
 ## Quick start
 
-Build Tardigrade, then generate a starter config for your deployment shape
-with `tardi init <profile>`:
+For the full walkthrough -- installing, generating a config, validating it,
+running it, and verifying a real request -- see the
+**[Quickstart guide](docs/QUICKSTART.md)**. The short version, once `tardi`
+is on your `PATH`:
 
 ```bash
-zig build
-
 mkdir -p public
 printf '%s\n' '<h1>Hello from Tardigrade</h1>' > public/index.html
 
-./zig-out/bin/tardi init static > tardigrade.conf
-./zig-out/bin/tardi check ./tardigrade.conf
-./zig-out/bin/tardi run -c ./tardigrade.conf
+tardi init static > tardigrade.conf
+tardi check
+tardi run
 ```
 
 Then open:
@@ -159,10 +160,10 @@ Then open:
 produces a clean file with no extra output mixed in. Other common shapes:
 
 ```bash
-./zig-out/bin/tardi init proxy > tardigrade.conf     # reverse proxy to an upstream app
-./zig-out/bin/tardi init tls > tardigrade.conf        # TLS termination + proxy
-./zig-out/bin/tardi init metrics > tardigrade.conf    # proxy starter documenting /status/metrics
-./zig-out/bin/tardi init prod > tardigrade.conf       # production-oriented TLS/proxy scaffold
+tardi init proxy > tardigrade.conf     # reverse proxy to an upstream app
+tardi init tls > tardigrade.conf        # TLS termination + proxy
+tardi init metrics > tardigrade.conf    # proxy starter documenting /status/metrics
+tardi init prod > tardigrade.conf       # production-oriented TLS/proxy scaffold
 ```
 
 Each profile also has a longer descriptive alias that resolves to the same
@@ -184,31 +185,31 @@ today's generic starter output when no `--profile` is given.
 Common CLI commands:
 
 ```bash
-./zig-out/bin/tardi check ./tardigrade.conf
-./zig-out/bin/tardi config validate ./tardigrade.conf
-./zig-out/bin/tardi validate -c ./tardigrade.conf
-./zig-out/bin/tardi print-config -c ./tardigrade.conf
-./zig-out/bin/tardi status -c ./tardigrade.conf
-./zig-out/bin/tardi reload -c ./tardigrade.conf
-./zig-out/bin/tardi stop -c ./tardigrade.conf
-./zig-out/bin/tardi init <profile>
-./zig-out/bin/tardi config init
-./zig-out/bin/tardi explain <field>
-./zig-out/bin/tardi config explain <field>
+tardi check ./tardigrade.conf
+tardi config validate ./tardigrade.conf
+tardi validate -c ./tardigrade.conf
+tardi print-config -c ./tardigrade.conf
+tardi status -c ./tardigrade.conf
+tardi reload -c ./tardigrade.conf
+tardi stop -c ./tardigrade.conf
+tardi init <profile>
+tardi config init
+tardi explain <field>
+tardi config explain <field>
 ```
 
 `check` performs a dry parse and semantic validation without starting listeners
 or connecting to upstreams. When no path is supplied, it validates
-`./tardigrade.toml`; pass the path explicitly when using the nginx-style
-`tardigrade.conf` examples.
+`./tardigrade.conf` -- the same local file `run` selects with no explicit
+path.
 
 Not sure what a directive does or which values it accepts? `tardi explain
 <field>` looks it up from a built-in reference -- no config file required:
 
 ```bash
-./zig-out/bin/tardi explain listen
-./zig-out/bin/tardi explain location.proxy_pass
-./zig-out/bin/tardi explain upstream_protocol
+tardi explain listen
+tardi explain location.proxy_pass
+tardi explain upstream_protocol
 ```
 
 `tardi config explain <field>` is a verbose alias for the same command.
@@ -245,6 +246,7 @@ operate without guessing which config file or pid file is active.
 
 | Topic | Location |
 | --- | --- |
+| Quickstart | [docs/QUICKSTART.md](docs/QUICKSTART.md) |
 | Core v1 support matrix | [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) |
 | Configuration reference | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | HTTP/3 rollout and lifecycle | [docs/HTTP3_ROLLOUT.md](docs/HTTP3_ROLLOUT.md) |

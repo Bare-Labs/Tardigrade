@@ -13,8 +13,9 @@ Runtime config-file selection, highest priority first:
 6. `$HOME/.config/tardigrade/tardigrade.conf`.
 
 `check [<config>]` and `config validate [<config>]` are validation commands.
-When no path is supplied, they validate `./tardigrade.toml` instead of using
-the runtime search path.
+When no path is supplied, they validate `./tardigrade.conf` -- the same local
+file `run` selects first when no explicit path is given -- rather than the
+full runtime search path above.
 
 Effective value precedence, highest priority first:
 
