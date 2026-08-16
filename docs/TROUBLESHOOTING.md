@@ -682,35 +682,50 @@ time curl -v -H 'Host: localhost' http://127.0.0.1:8069/api/users
 
 #### Symptoms
 
-`503`, sometimes with `Retry-After` and `Connection: close`, sometimes just
-`Connection: close` with no `Retry-After` — the two shapes distinguish two
-different local-capacity families (see below), and neither means
-Tardigrade itself is unhealthy.
+`503`, sometimes with `Retry-After: 1` and `Connection: close`, sometimes
+just `Connection: close` with no `Retry-After` — but **absence of
+`Retry-After` alone doesn't identify which family you're looking at**;
+three of the four families below omit it. Neither shape means Tardigrade
+itself is unhealthy.
 
 #### Likely causes
 
 `503` here is a local capacity/availability signal, not a gateway or
 timeout failure — don't fold it into the 502/504 explanations above. There
-are three independent local-capacity families that all return `503`, and
-they need different metrics to tell apart:
+are four independent local-capacity families that all return `503`, and
+they need different metrics/response bodies to tell apart:
 
-1. **Accept-time / worker / in-flight capacity** — the global or per-IP
-   connection cap, the connection memory budget, the worker queue, or the
-   in-flight request cap was hit. This is the one deterministic path that
-   adds `Retry-After: 1` and `Connection: close`
-   (`gateway_accept.overload_response_503`). See the [overload-response
+1. **Accept-time connection/worker-queue saturation** — the global or
+   per-IP connection cap, the connection memory budget, or the worker
+   queue was hit before request parsing. This is the one deterministic
+   path that adds `Retry-After: 1` (the fixed empty
+   `gateway_accept.overload_response_503`). See the [overload-response
    table in OBSERVABILITY.md](OBSERVABILITY.md#configured-limits) for the
    exact caps.
-2. **Per-origin upstream connection-pool cap** —
+2. **In-flight request cap** (`TARDIGRADE_MAX_IN_FLIGHT_REQUESTS`) —
+   enforced later, after request parsing, by `tryAcquireRequestSlot()`. It
+   goes through the generic error path (JSON body,
+   `"code":"overloaded"`), closes the connection, but does **not** add
+   `Retry-After`, and does **not** move `connection_rejections_total`/
+   `queue_rejections_total` — only the overload error-code metric. A `503`
+   with no connection/queue rejection counters moving is this family, not
+   "nothing is actually saturated."
+3. **Per-origin upstream connection-pool cap** —
    `TARDIGRADE_UPSTREAM_POOL_MAX_ACTIVE_PER_HOST` is exhausted for that
    specific origin, and the checkout fails fast (`error.UpstreamAtCapacity`)
-   instead of queuing. No `Retry-After`, but the connection is still closed.
-3. **Proxy aggregate buffer capacity** — a per-origin or global proxy
+   instead of queuing. JSON `"code":"upstream_saturated"`, no
+   `Retry-After`, connection closed.
+4. **Proxy aggregate buffer capacity** — a per-origin or global proxy
    buffer hard limit (`TARDIGRADE_PROXY_BUFFER_PER_ORIGIN_HARD_LIMIT_BYTES`/
    `TARDIGRADE_PROXY_BUFFER_GLOBAL_HARD_LIMIT_BYTES`) refuses a reservation
-   before any response byte is committed (`error.ProxyBufferCapacityUnavailable`,
-   response code `proxy_buffer_saturated`). No `Retry-After`, connection
+   before any response byte is committed (`error.ProxyBufferCapacityUnavailable`).
+   JSON `"code":"proxy_buffer_saturated"`, no `Retry-After`, connection
    closed.
+
+The response body's `code` field (`overloaded`/`upstream_saturated`/
+`proxy_buffer_saturated`) plus the family-specific counters below are what
+actually distinguish families 2–4 from each other — not the presence or
+absence of `Retry-After`.
 
 Marking backends unhealthy (passive failure tracking or active probing —
 see [§8](#8-health-checks-mark-an-upstream-down)) changes backend
@@ -863,15 +878,28 @@ cert_pub=$(mktemp)
 key_pub=$(mktemp)
 trap 'rm -f "$cert_pub" "$key_pub"' EXIT
 
-openssl x509 -in /etc/tardigrade/tls/fullchain.pem -pubkey -noout >"$cert_pub" &&
-openssl pkey -in /etc/tardigrade/tls/privkey.pem -pubout >"$key_pub" &&
-cmp -s "$cert_pub" "$key_pub" && echo "cert/key match" || echo "cert/key MISMATCH or one input is invalid"
+if ! openssl x509 -in /etc/tardigrade/tls/fullchain.pem -pubkey -noout >"$cert_pub"; then
+  echo "certificate PEM is invalid or unreadable" >&2
+  exit 1
+fi
+
+if ! openssl pkey -in /etc/tardigrade/tls/privkey.pem -pubout >"$key_pub"; then
+  echo "private key is invalid or unreadable" >&2
+  exit 1
+fi
+
+if cmp -s "$cert_pub" "$key_pub"; then
+  echo "cert/key match"
+else
+  echo "cert/key MISMATCH" >&2
+  exit 1
+fi
 ```
 
-Exit `0` from the full `&&` chain (printing `cert/key match`) means the
-public keys match. Any `openssl` failure earlier in the chain means the
-PEM material itself is invalid/unreadable and must be fixed before a
-match can even be checked; reaching `cmp` and having it fail means a
+The exit status and the printed message agree: `0`/`cert/key match` means
+the public keys match; a nonzero exit from either `openssl` stage means
+the PEM material itself is invalid/unreadable and must be fixed before a
+match can even be checked; a nonzero exit at the final `cmp` means a
 genuine cert/key mismatch.
 
 #### Likely causes
@@ -1082,8 +1110,15 @@ curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/status/metrics | \
   grep tardigrade_upstream_unhealthy_backends
 ```
 
-Confirm the count returns to `0` (or the expected number) after the next
-probe interval elapses, then confirm proxied requests succeed.
+Confirm the count returns to `0` (or the expected number) after the
+configured number of consecutive successful probes
+(`TARDIGRADE_UPSTREAM_ACTIVE_PROBE_SUCCESS_THRESHOLD`) have completed, then
+confirm proxied requests succeed. With a threshold greater than `1`, the
+first successful probe only moves a down backend to `half_open` — it isn't
+routable yet — so wait for the required additional successful probe
+cycles rather than expecting recovery after a single interval; otherwise a
+perfectly healthy recovery can look stuck when the threshold was
+deliberately raised above `1`.
 
 ### Related documentation
 
@@ -1168,9 +1203,20 @@ If you configured `error_log`/`TARDIGRADE_ERROR_LOG_PATH`, check that file
 instead:
 
 ```bash
-tardi print-config -c /etc/tardigrade/tardigrade.conf   # confirm the path in effect
+tardi print-config -c /etc/tardigrade/tardigrade.conf   # confirm the path configured in this file
 sudo tail -f /var/log/tardigrade/error.log
 ```
+
+As with the inspection-command warning in [§1](#1-five-minute-triage),
+`print-config` here only proves what the *file* configures — the live
+`error_log` destination is opened once at process startup
+(`configureErrorLog()`) and is not re-applied on `SIGHUP`. If you just
+changed `error_log`/`TARDIGRADE_ERROR_LOG_PATH` and reloaded rather than
+restarted, the running process is still writing to the *old* destination
+regardless of what `print-config` now shows — see
+[CONFIGURATION.md's reload matrix](CONFIGURATION.md#reload-behavior),
+which lists the error-log destination as startup-owned. Restart, don't
+reload, to move where logs are actually written.
 
 ### Likely causes
 
@@ -1281,8 +1327,15 @@ curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/tardigrade/reload/status
 ```
 
 This returns `{"ok":<bool|null>,"at_ms":<timestamp>,"error":<string|null>}` —
-`ok: false` with a non-null `error` means the reload was rejected and the
-**previous** config is still active. Cross-check with logs and metrics:
+`ok: false` with a non-null `error` means the proposed config was **not
+published**: the previous published request-routing/config lease remains
+active. That's a narrower guarantee than "everything rolled back" —
+reload-owned runtime resources are not fully transactional, and some
+runtime work (e.g. native ticket-key/credential/TLS-policy preparation)
+can happen before the later rejection, so it may not itself un-happen. If
+complete rollback of a specific runtime surface matters, don't assume it
+from `ok: false` alone — check that surface's own logs/metrics, and
+restart if you need a clean state. Cross-check with logs and metrics:
 
 ```bash
 sudo journalctl -u tardigrade -n 50 --no-pager | grep -i reload
@@ -1299,7 +1352,8 @@ time you reloaded.
 ### Likely causes
 
 - **the reload was rejected** — the `reload/status` endpoint and logs above
-  will say so explicitly; the previously published config stays active
+  will say so explicitly; the previously published request-routing/config
+  lease stays active (see the transactionality caveat above)
 - **the field you changed is not reload-eligible.** Tardigrade classifies
   every setting into one of three buckets — see the [full matrix in
   CONFIGURATION.md](CONFIGURATION.md#reload-behavior):
@@ -1321,13 +1375,29 @@ time you reloaded.
      configured SNI identity) — this is the easiest case to mistake for
      "reload is broken", because there's no rejection to see.
 
-  There is no "TLS credentials are hot-reloadable" case in either profile.
-  Separately, the general/OpenSSL TLS terminator has its own file-content
-  maintenance watcher that reloads certificate/key *bytes at the
-  already-configured paths* on its own interval, keeping the existing
-  context active if a refresh fails — that's a distinct mechanism from
-  `SIGHUP` config reload and doesn't make TLS config fields themselves
+  For the **stable TCP/OpenSSL path** specifically, TLS credential/config
+  identity is not a generic `SIGHUP`-hot-reloadable surface: appliance
+  credential-configuration changes are rejected outright (bucket 2), and
+  the general/OpenSSL TCP context is startup-owned (bucket 3) — `SIGHUP`
+  only sends it `updateProtocolPolicy(...)`, not a rebuilt certificate
+  context. Separately, that same OpenSSL terminator has its own
+  file-content maintenance watcher that reloads certificate/key *bytes at
+  the already-configured paths* on its own interval, keeping the existing
+  context active if a refresh fails — a distinct mechanism from `SIGHUP`
+  config reload, not something that makes TLS config fields themselves
   hot-reloadable.
+
+  **Native HTTP/3 is a documented exception on a general-profile build
+  that also serves H3.** When a `NativeCredentialStore` exists,
+  `SIGHUP`'s `hotReloadConfig()` does prepare and commit a credential
+  reload for the native H3 store from the *proposed* `tls_cert_path`/
+  `tls_key_path`/SNI paths — before the stable TCP/OpenSSL terminator,
+  which only receives the protocol-policy update above. So on a process
+  serving both, a credential-path change can publish to the native H3
+  store while the stable TCP context stays on the old identity until
+  restart. Treat this as an experimental-surface caveat (see
+  [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md)), not evidence that stable TCP
+  TLS credentials are reloadable.
 - **you edited `tardigrade.env`, not `tardigrade.conf`** — `SIGHUP` reloads
   the *config*; it cannot change the *process environment* of an
   already-running process. `tardigrade.env` (and any
