@@ -1226,23 +1226,40 @@ sudo tail -f /var/log/tardigrade/error.log
 
 As with the inspection-command warning in [§1](#1-five-minute-triage),
 `print-config` here only proves what the *file* configures. Moving the
-live `error_log` destination is a **two-signal sequence, not a plain
-reload**: `SIGHUP` alone publishes the new path but doesn't reopen
-anything (`configureErrorLog()`'s `dup2` onto stderr runs once at process
-startup, not on reload); a following `SIGUSR1` then reopens the log file
-against whatever `error_log_path` is on the config that's currently
-published (`reopenErrorLog()`) — which, after a successful reload, is the
-new path. So:
+live `error_log` destination live is possible, but only in one direction
+and one deployment shape — don't assume it always works:
 
-```bash
-sudo systemctl reload tardigrade   # publish the new error_log path
-sudo systemctl kill --kill-who=main --signal=USR1 tardigrade   # reopen against it
-```
+- **Config-file change to a new non-empty file path, single-process
+  mode:** a successful `SIGHUP` (publishes the new path) followed by
+  `SIGUSR1` (reopens against whatever `error_log_path` is on the
+  *currently published* config — `reopenErrorLog()`) does move the live
+  destination, whether that's stderr→file or file A→file B:
 
-`SIGHUP` by itself leaves the process writing to the *old* destination
-regardless of what `print-config` now shows; a full restart also works,
-but isn't required. See [CONFIGURATION.md's reload
-matrix](CONFIGURATION.md#reload-behavior) for the full two-signal note.
+  ```bash
+  sudo systemctl reload tardigrade   # publish the new error_log path
+  sudo systemctl kill --kill-who=main --signal=USR1 tardigrade   # reopen against it
+  ```
+
+  `SIGHUP` by itself leaves the process writing to the *old* destination
+  regardless of what `print-config` now shows.
+- **Moving a file-backed destination back to `stderr`/empty does *not*
+  work this way.** `reopenErrorLog()` returns immediately when the
+  published `error_log_path` is empty or `stderr` — it never touches the
+  file-backed fd. That direction requires a restart.
+- **`TARDIGRADE_ERROR_LOG_PATH` set via `EnvironmentFile=`/Compose
+  `env_file:`** is a process-environment change, not a config-file
+  change — `SIGHUP` can't see the edited value at all (same rule as any
+  other `tardigrade.env` edit, [§11](#11-reload-did-not-apply-expected-changes)).
+  Restart.
+- **`master_process true;`**: `SIGHUP` reload isn't coherent across
+  workers, and `--kill-who=main --signal=USR1` only reaches the main
+  process — this two-signal recipe assumes the default single-process
+  mode. Restart for a coherent destination change under master/worker.
+
+A full restart always works for any of the above; the two-signal sequence
+is only a shortcut for the one case it actually covers. See
+[CONFIGURATION.md's reload matrix](CONFIGURATION.md#reload-behavior) for
+the same scoped note.
 
 ### Likely causes
 

@@ -529,14 +529,21 @@ Reloaded settings fall into three operational categories:
 | Reload rejected; restart required | Listener-shard topology, native early-data replay mode/capacity, HTTP/3 listener-owned fields (`HTTP3_ENABLED`, `QUIC_PORT`, `HTTP3_ENABLE_0RTT`, `HTTP3_CONNECTION_MIGRATION`, `HTTP3_RETRY_POLICY`, `HTTP3_MAX_DATAGRAM_SIZE`, UDP buffer sizes, ECN, qlog/keylog artifact destinations), native ticket-key source-mode changes, and appliance TLS credential configuration (`TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_SERVER_NAME`, `TLS_SNI_CERTS`). | `TARDIGRADE_HTTP3_MAX_DATAGRAM_SIZE=1200` |
 | Config may publish, but live startup-owned state changes only after restart | Bound TCP socket host/port; event-loop backend and io_uring entries; runtime identity/chroot; PID file; master/worker-process topology; worker thread/queue/recycle/affinity settings; FD soft limit; connection-pool capacity; upstream TLS client state; circuit-breaker construction; idempotency TTL; session TTL/max/store path; access-control object; approval TTL/max-pending/store/escalation state; transcript store path; native resumption mode/ticket lifetime/ticket usage; general/OpenSSL TLS context inputs including min/max version, ciphers, session cache/tickets, client verification/CA/CRL, OCSP/ACME/watcher settings, and configured SNI identity; SSE event-hub capacity; DNS-discovery construction; coherent shutdown-drain policy; upstream-pool policy. Reload may log a restart-required warning for some of these. | `TARDIGRADE_WORKER_THREADS=8` |
 
-`error_log`/`TARDIGRADE_ERROR_LOG_PATH` doesn't fit either row cleanly: a
-`SIGHUP` reload alone publishes the new path but does not itself move the
-live stderr destination (`configureErrorLog()`'s `dup2` runs once at
-process startup). A separate `SIGUSR1` reopens the log file against
-whatever `error_log_path` is on the *currently published* config
-(`reopenErrorLog()`), which does move the live destination without a full
-restart — so the two-signal sequence `SIGHUP` then `SIGUSR1` is the
-supported way to relocate it live; `SIGHUP` alone is not enough.
+`error_log`/`TARDIGRADE_ERROR_LOG_PATH` doesn't fit either row cleanly, and
+the live-relocation behavior is directional. `SIGHUP` alone publishes a new
+path but never reopens the fd (`configureErrorLog()`'s `dup2` runs once at
+process startup). A following `SIGUSR1` reopens against whatever
+`error_log_path` is on the *currently published* config
+(`reopenErrorLog()`) — but only when that path is non-empty:
+`reopenErrorLog()` returns immediately when the published path is empty or
+`stderr`, without touching the existing file-backed fd. So in the default
+single-process deployment, a **config-file** change to a new non-empty
+file path (stderr→file, or file A→file B) can be made live with `SIGHUP`
+then `SIGUSR1`; a change *back* to empty/`stderr` cannot — that requires
+restart, as does any change delivered via `EnvironmentFile=`/container env
+(a process-environment change `SIGHUP` never sees) or any destination
+change under `master_process true;` (SIGHUP reload isn't coherent across
+workers there).
 
 ### Proxy Buffer Limits
 

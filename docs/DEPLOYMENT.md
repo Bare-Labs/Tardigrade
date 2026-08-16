@@ -435,8 +435,12 @@ Two logging surfaces, both covered in full by
   `/var/log/tardigrade` and install the same logrotate config at
   `/etc/logrotate.d/tardigrade`, which signals `SIGUSR1` after rotation;
   Tardigrade has a real SIGUSR1 log-reopen handler, so log files reopen
-  cleanly on the existing rotation cadence. Don't invent a second rotation
-  mechanism.
+  cleanly on the existing rotation cadence. That packaged logrotate +
+  `SIGUSR1` flow is the supported mechanism for **ongoing** rotation while
+  the process stays up. Separately, `TARDIGRADE_LOG_ROTATE_MAX_BYTES`/
+  `TARDIGRADE_LOG_ROTATE_MAX_FILES` perform a one-time size-triggered
+  rotation check during process **startup** only — not a periodic runtime
+  rotator. Don't invent a third mechanism beyond these two.
 
   The Docker image creates the same `tardigrade`-owned `/var/log/tardigrade`
   directory, but nothing inside the container persists or rotates it. Using
