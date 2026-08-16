@@ -104,14 +104,19 @@ for a validating check once you know the listener responds at all.
 > see [CONFIGURATION.md's Server Blocks section](CONFIGURATION.md#server-blocks).
 
 **Critical inspection-command warning: `print-config`, `routes`, and
-`upstreams` inspect the config file loaded by that CLI invocation. They do
-not talk to a running Tardigrade process, and they do not prove that a
-previous `tardi reload`/`SIGHUP` was applied successfully.** Running any of
-the three against an edited config file only tells you the *file* parses
-and would produce the routes/upstreams you expect — not that the live
-process is actually serving them. For live reload state, use the runtime
-status/log/metric surfaces in [§11](#11-reload-did-not-apply-expected-changes),
-primarily `GET /tardigrade/reload/status`.
+`upstreams` inspect the effective configuration resolved by *that CLI
+invocation* — the selected config path plus that process's own current
+environment (env values take precedence over file values, same as
+everywhere else). They do not talk to a running Tardigrade process, they
+can differ from the actual service's environment (an interactive shell
+usually doesn't inherit systemd's `EnvironmentFile=`), and they do not
+prove that a previous `tardi reload`/`SIGHUP` was applied successfully.**
+Running any of the three after editing a config file only tells you what
+*this invocation* resolves — not that the live service process resolves
+the same thing, and not that it's actually serving it. For live reload
+state, use the runtime status/log/metric surfaces in
+[§11](#11-reload-did-not-apply-expected-changes), primarily
+`GET /tardigrade/reload/status`.
 
 ### Likely causes
 
@@ -410,9 +415,9 @@ curl -v -H 'Host: api.example.com' \
   entirely** — a second Tardigrade instance, a stale process still bound
   from before a restart, or the wrong `-c`/`TARDIGRADE_CONFIG_PATH`
 - **an edited config was never successfully reloaded** — see
-  [§11](#11-reload-did-not-apply-expected-changes); `tardi routes` against
-  the file on disk proves nothing about what the running process is
-  actually serving
+  [§11](#11-reload-did-not-apply-expected-changes); `tardi routes` only
+  shows what this CLI invocation resolves, which proves nothing about
+  what the running process is actually serving
 
 Query strings and fragments are stripped before location matching — a
 `?query=string` never affects which `location` block wins. Only `if
@@ -1068,9 +1073,10 @@ tardi upstreams -c /etc/tardigrade/tardigrade.conf
 ```
 
 This shows the **configured** active-probe path/interval/timeout/thresholds
-and passive failure policy for the file you point it at — **it is not a
-live backend-health dashboard.** It cannot tell you whether a backend is
-currently marked unhealthy by the running process.
+and passive failure policy from the effective config resolved by this CLI
+invocation — **it is not a live backend-health dashboard.** It cannot tell
+you whether a backend is currently marked unhealthy by the running
+process.
 
 For live aggregate health, use metrics:
 
@@ -1371,10 +1377,12 @@ sudo systemctl reload tardigrade
 tardi reload --pid-file /run/tardigrade/tardigrade.pid
 ```
 
-**Then check the live result, not the file.** `tardi print-config`/`routes`/
-`upstreams` against the config file on disk only prove the *file* is what
-you intend — they say nothing about whether the running process actually
-published it. Use the runtime reload-status endpoint instead:
+**Then check the live result, not the CLI's own resolution.**
+`tardi print-config`/`routes`/`upstreams` show only what *this invocation*
+resolves from the selected file plus its own process environment — not
+live-process introspection, and not proof the running service process
+resolves the same thing or actually published it. Use the runtime
+reload-status endpoint instead:
 
 ```bash
 curl -s -H 'Host: <server_name>' http://127.0.0.1:8069/tardigrade/reload/status

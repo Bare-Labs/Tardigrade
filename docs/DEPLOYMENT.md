@@ -425,10 +425,12 @@ image and point it at `/health` instead.
 Two logging surfaces, both covered in full by
 [OBSERVABILITY.md](OBSERVABILITY.md):
 
-- **Container/service stdout** — under systemd, `journalctl -u tardigrade`;
-  under Docker, `docker compose logs -f tardigrade`. This is where runtime
-  and JSON access logs land unless `error_log`/`TARDIGRADE_ERROR_LOG_PATH`
-  is configured.
+- **Container/service stderr** — under systemd, `journalctl -u tardigrade`;
+  under Docker, `docker compose logs -f tardigrade`. Runtime and JSON
+  access logs are written to stderr (not stdout) unless `error_log`/
+  `TARDIGRADE_ERROR_LOG_PATH` redirects fd 2 to a configured file.
+  `journalctl`/`docker compose logs` still work as the collection surface
+  either way, since both capture stderr.
 - **Configured file logs** — set `error_log` (or
   `TARDIGRADE_ERROR_LOG_PATH`) to write to `/var/log/tardigrade/*.log`
   instead. Both the DEB and RPM packages create a `tardigrade`-owned
