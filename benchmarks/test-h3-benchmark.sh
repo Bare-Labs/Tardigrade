@@ -739,6 +739,12 @@ check "validation doc preserves the bounded soak resource contract" \
     "RSS and open file descriptors" "$VALIDATION_TEXT"
 check "validation doc keeps obsolete qvis issue #608 out of the #247 closeout path" \
     "$(printf '%s' "$VALIDATION_TEXT" | grep -c '#608')" "0"
+check "validation doc uses netem-impair.sh as the checked-in wrapper command" \
+    "-- ./benchmarks/competitive/run.sh --servers tardigrade" "$VALIDATION_TEXT"
+check "validation doc does not document nonexistent netem apply/clear subcommands" \
+    "$(printf '%s' "$VALIDATION_TEXT" | grep -Ec 'netem-impair\\.sh (apply|clear)')" "0"
+check "validation doc uses numeric netem percentages without literal percent signs" \
+    "--loss 1 --reorder 2 --delay 20" "$VALIDATION_TEXT"
 
 echo ""
 echo "==> Test: existing HTTP/1 benchmark behavior does not regress (run.sh --help still documents http1 scenarios)"

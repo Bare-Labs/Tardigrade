@@ -89,9 +89,11 @@ For impairment runs on Linux hosts with the required privileges, use
 `benchmarks/competitive/netem-impair.sh` and retain the exact command line:
 
 ```bash
-sudo ./benchmarks/competitive/netem-impair.sh apply --loss 1% --reorder 2% --delay 20ms
-./benchmarks/competitive/run.sh --servers tardigrade --out-dir benchmarks/competitive/results/h3-impairment
-sudo ./benchmarks/competitive/netem-impair.sh clear
+sudo ./benchmarks/competitive/netem-impair.sh \
+  --loss 1 --reorder 2 --delay 20 --interface lo \
+  --evidence-file benchmarks/competitive/results/h3-netem.json \
+  -- ./benchmarks/competitive/run.sh --servers tardigrade \
+     --out-dir benchmarks/competitive/results/h3-impairment
 ```
 
 Shared GitHub runners without `CAP_NET_ADMIN` are an environment exception, not
