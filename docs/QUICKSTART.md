@@ -8,21 +8,9 @@ alias, but examples on this page use `tardi`.
 
 ## Install
 
-The fastest way to install the latest release is the official install script:
-
-```bash
-curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
-tardi version
-```
-
-This installs `tardi` (with a `tardigrade` compatibility alias) into
-`$HOME/.local/bin`. Make sure that directory is on your `PATH`. Published
-release binaries link OpenSSL at runtime, so OpenSSL 1.1/3.x must already be
-present on the host. See [packaging/README.md](../packaging/README.md) for
-other install paths (DEB/RPM packages, release archives) and current
-platform coverage.
-
-If you'd rather build from source:
+Build from source for this walkthrough. The latest published release
+(`v0.5.0`) predates `tardi init <profile>` and the `./tardigrade.conf`
+default this guide relies on, so it can't run the commands below yet:
 
 ```bash
 git clone https://github.com/Bare-Systems/Tardigrade.git
@@ -34,6 +22,23 @@ tardi version
 
 Building from source requires [Zig](https://ziglang.org/) 0.16.0 and, on
 Linux, OpenSSL development libraries (`libssl-dev` on Debian/Ubuntu).
+
+Once a release that includes `tardi init` is published, the official
+install script will also work for this guide:
+
+```bash
+curl -fsSL https://github.com/Bare-Systems/Tardigrade/releases/latest/download/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+tardi version
+```
+
+This installs `tardi` (with a `tardigrade` compatibility alias) into
+`$HOME/.local/bin`; the `export` above puts that directory on `PATH` for
+the current shell. Published release binaries link OpenSSL at runtime, so
+OpenSSL 1.1/3.x must already be present on the host, and prebuilt archives
+currently cover Linux x86_64/aarch64 only. See
+[packaging/README.md](../packaging/README.md) for other install paths
+(DEB/RPM packages, release archives) and current platform coverage.
 
 ## Static-site happy path
 
@@ -122,7 +127,8 @@ tardi check ./my-site.conf
 tardi run -c ./my-site.conf
 ```
 
-Both commands consume the same file you pass to `-c`/`--config`.
+Both commands consume `./my-site.conf`: `check` accepts it as the positional
+form shown above, while `run` requires `-c`/`--config`.
 
 ## Next steps
 

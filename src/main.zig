@@ -417,21 +417,21 @@ fn parseExplainCommand(args: []const []const u8) !CliCommand {
 fn printUsage(writer: anytype) !void {
     try writer.writeAll(
         \\Usage:
-        \\  tardigrade check [<config>]
-        \\  tardigrade run [-c <path>] [--daemon]
-        \\  tardigrade validate [-c <path>]
-        \\  tardigrade status [-c <path>] [--pid-file <path> | --pid <pid>]
-        \\  tardigrade print-config [-c <path>]
-        \\  tardigrade routes [<config>] [-c <path>]
-        \\  tardigrade upstreams [<config>] [-c <path>]
-        \\  tardigrade reload [-c <path>] [--pid-file <path> | --pid <pid>]
-        \\  tardigrade stop [-c <path>] [--pid-file <path> | --pid <pid>]
-        \\  tardigrade version
-        \\  tardigrade init <profile>
+        \\  tardi check [<config>]
+        \\  tardi run [-c <path>] [--daemon]
+        \\  tardi validate [-c <path>]
+        \\  tardi status [-c <path>] [--pid-file <path> | --pid <pid>]
+        \\  tardi print-config [-c <path>]
+        \\  tardi routes [<config>] [-c <path>]
+        \\  tardi upstreams [<config>] [-c <path>]
+        \\  tardi reload [-c <path>] [--pid-file <path> | --pid <pid>]
+        \\  tardi stop [-c <path>] [--pid-file <path> | --pid <pid>]
+        \\  tardi version
+        \\  tardi init <profile>
         \\  tardi explain <field>
-        \\  tardigrade config init [<path>] [--force | --stdout] [--profile <profile>]
-        \\  tardigrade config print [-c <path>]
-        \\  tardigrade config validate [<config>]
+        \\  tardi config init [<path>] [--force | --stdout] [--profile <profile>]
+        \\  tardi config print [-c <path>]
+        \\  tardi config validate [<config>]
         \\  tardi config explain <field>
         \\
         \\Profiles (canonical name, descriptive alias -- aliases resolve to the
@@ -443,6 +443,9 @@ fn printUsage(writer: anytype) !void {
         \\  prod (production-baseline)   production-oriented TLS/proxy scaffold
         \\
         \\Notes:
+        \\  - `tardi` is the canonical command name. Some installation formats
+        \\    also provide `tardigrade` as a compatibility alias for the same
+        \\    binary.
         \\  - `init <profile>` writes the profile's config to stdout only, e.g.
         \\    `tardi init proxy > tardigrade.conf`; nothing else is printed to
         \\    stdout or stderr on success. `config init` is the verbose,
@@ -2000,4 +2003,30 @@ test "built-in usage documents the concise tardi explain form before the verbose
     // for these two commands, not the legacy `tardigrade` spelling.
     try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade explain <field>") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade config explain <field>") == null);
+}
+
+test "built-in usage presents tardi as canonical for every command" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try printUsage(&out.writer);
+    const written = out.writer.buffered();
+
+    // #157 requires the Usage block to be consistent with #163: `tardi` is
+    // canonical everywhere, not just for `explain`. `tardigrade` may still
+    // be named once as a compatibility alias, but never as a co-equal
+    // command prefix in the Usage rows themselves.
+    const usage_commands = [_][]const u8{
+        "check",        "run",          "validate",        "status",
+        "print-config", "routes",       "upstreams",       "reload",
+        "stop",         "version",      "init",            "explain",
+        "config init",  "config print", "config validate", "config explain",
+    };
+    for (usage_commands) |cmd| {
+        var buf: [64]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&buf, "tardi {s}", .{cmd});
+        try std.testing.expect(std.mem.indexOf(u8, written, needle) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade check") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade run") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade version") == null);
 }

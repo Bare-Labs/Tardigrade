@@ -92,10 +92,9 @@ runtime dependency the DEB/RPM packages declare explicitly.
 Other install paths:
 
 - Download release archives directly from [GitHub Releases](https://github.com/Bare-Systems/Tardigrade/releases).
-- Native DEB/RPM packages (published on every release), systemd/launchd
-  service files, and a Homebrew formula — see
-  [packaging/README.md](packaging/README.md) for current status and
-  install/build instructions.
+- Native DEB/RPM packages (published on every release) and systemd/launchd
+  service files — see [packaging/README.md](packaging/README.md) for
+  current status and install/build instructions.
 - Build from source (see below).
 
 For running Tardigrade as a managed service — systemd unit, filesystem
@@ -137,10 +136,9 @@ Useful build options are documented in [CONTRIBUTING.md](CONTRIBUTING.md#build-o
 
 ## Quick start
 
-For the full walkthrough -- installing, generating a config, validating it,
-running it, and verifying a real request -- see the
-**[Quickstart guide](docs/QUICKSTART.md)**. The short version, once `tardi`
-is on your `PATH`:
+`tardi init <profile>` below requires [building from source](#build-from-source)
+until a release containing it is published; the latest published release
+predates it. Once `tardi` is on your `PATH`:
 
 ```bash
 mkdir -p public
@@ -151,75 +149,13 @@ tardi check
 tardi run
 ```
 
-Then open:
+Then open `http://localhost:8080/` and `http://localhost:8080/health`.
 
-- `http://localhost:8080/`
-- `http://localhost:8080/health`
-
-`init` writes configuration bytes only to stdout, so the redirect above
-produces a clean file with no extra output mixed in. Other common shapes:
-
-```bash
-tardi init proxy > tardigrade.conf     # reverse proxy to an upstream app
-tardi init tls > tardigrade.conf        # TLS termination + proxy
-tardi init metrics > tardigrade.conf    # proxy starter documenting /status/metrics
-tardi init prod > tardigrade.conf       # production-oriented TLS/proxy scaffold
-```
-
-Each profile also has a longer descriptive alias that resolves to the same
-template, e.g. `tardi init reverse-proxy` is identical to `tardi init proxy`.
-Run `tardi init --help` for the full profile/alias list. The `tls` and `prod`
-profiles reference certificate/key paths you must provision yourself — see
-[examples/tls-termination](examples/tls-termination/README.md) and
-[examples/production-baseline](examples/production-baseline/README.md) for
-how to generate a local test certificate. The `metrics` profile documents the
-existing `/status/metrics` endpoint; protect it in production with
-`TARDIGRADE_METRICS_REQUIRE_AUTH=true` or a network-boundary restriction.
-
-`tardi config init [<path>] [--force | --stdout] [--profile <profile>]` is
-the verbose, file-writing form of the same generator: it supports the same
-profiles via `--profile`, writes to a file (creating parent directories and
-refusing to overwrite an existing file unless `--force` is given), and keeps
-today's generic starter output when no `--profile` is given.
-
-Common CLI commands:
-
-```bash
-tardi check ./tardigrade.conf
-tardi config validate ./tardigrade.conf
-tardi validate -c ./tardigrade.conf
-tardi print-config -c ./tardigrade.conf
-tardi status -c ./tardigrade.conf
-tardi reload -c ./tardigrade.conf
-tardi stop -c ./tardigrade.conf
-tardi init <profile>
-tardi config init
-tardi explain <field>
-tardi config explain <field>
-```
-
-`check` performs a dry parse and semantic validation without starting listeners
-or connecting to upstreams. When no path is supplied, it validates
-`./tardigrade.conf` -- the same local file `run` selects with no explicit
-path.
-
-Not sure what a directive does or which values it accepts? `tardi explain
-<field>` looks it up from a built-in reference -- no config file required:
-
-```bash
-tardi explain listen
-tardi explain location.proxy_pass
-tardi explain upstream_protocol
-```
-
-`tardi config explain <field>` is a verbose alias for the same command.
-`explain` is a static documentation lookup: it describes the *supported*
-configuration contract (type, default, valid values, environment variable,
-example) and never loads a config file, inspects a running process, or
-prints current environment/secret values -- that's what `print-config`
-(effective configuration) is for.
-
-For copy/paste-runnable examples of common deployments (static file serving,
+See the **[Quickstart guide](docs/QUICKSTART.md)** for the full walkthrough,
+including installing `tardi`, a reverse-proxy happy path, and explicit
+config paths. For the full `tardi init`/`config`/`explain` command
+reference, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). For
+copy/paste-runnable examples of common deployments (static file serving,
 reverse proxy, TLS termination, rate limiting, and more), see the
 [examples/](examples/README.md) directory.
 
