@@ -147,10 +147,29 @@ above; no separate invocation is required. Its pass condition:
   connections, active CID routes, and native connections return to exactly
   zero
 - open file descriptors after settle do not exceed the pre-soak baseline
-- resident memory growth in the loop's second half does not exceed first-half
-  growth by more than a fixed, deliberately generous margin (`ps`-reported
-  RSS is page-granular and noisy; the PR-safe tier's low round count makes
-  this a coarse smoke bound, and the heavy tier is the meaningful signal)
+  (measured with a short bounded retry window to absorb the probe
+  subprocess's own transient teardown noise, not the soak's own state)
+- resident memory growth in the second half of the workload -- the true
+  50%-of-requests midpoint, not "half the workers finished every round",
+  which can land much later -- does not exceed first-half growth by more
+  than a fixed, deliberately generous margin (`ps`-reported RSS is
+  page-granular and noisy; the PR-safe tier's low round count makes this a
+  coarse smoke bound, and the heavy tier is the meaningful signal). "Peak" is
+  a genuine max-of-samples across 25/50/75%-of-workload checkpoints plus the
+  end-of-workload sample, not just whatever the run looked like when the
+  workers happened to finish.
+- runtime connection/native-connection/CID-route state does not exceed a
+  fixed high-water margin in the second half of the workload versus the
+  first half (sampled every loop iteration from `runtime.snapshot()`, split
+  at the same true midpoint): the settle-to-zero check above proves state
+  eventually drains, but not that it stayed bounded while traffic was still
+  flowing, so this is the check that would catch a bug that keeps retaining
+  every prior connection/CID mid-run and only releases them once traffic
+  stops
+- both RSS/FD probe helpers fail closed: a launch failure, timeout, signal,
+  non-zero exit, or empty/malformed probe output is a hard test error, never
+  silently read back as `0` (which would let "the probe didn't run" pass as
+  "measured zero resource usage")
 
 This closes the "repeated connect/request/close", "multiple requests per
 connection", and "concurrent H3 connections" workload rows, plus the RSS/FD/
@@ -160,13 +179,39 @@ connection/CID observation rows, above. It deliberately does **not** cover:
   HTTP/3 runtime drain lets admitted work finish and rejects new work" in
   `tests/quic_h3_udp_smoke.zig`; duplicating it here would prove nothing new
   (see this document's own reuse rule).
-- **reconnect/resumption** -- this harness's `Runtime.Config` does not wire a
-  `resumption_runtime`, so every reconnect is a full fresh handshake, not a
-  resumed one. Reopen only alongside a soak that actually configures
-  resumption.
 - **controlled loss/reordering** -- needs a dedicated host with netem/
   `CAP_NET_ADMIN` (`benchmarks/competitive/netem-impair.sh`), not a portable
   unit test.
+
+### Implemented: resumption soak (`tests/http3_soak.zig`)
+
+`soak.h3.bounded_resumed_reconnects` wires a real
+`tls_core.resumption_runtime.Runtime` into the server `Config` (the same
+field `edge_gateway.zig`'s production composition uses) and runs two
+concurrent clients through repeated connect/request/close cycles (4 rounds
+PR-safe, 10 rounds with `TARDIGRADE_SOAK_HEAVY=1`), where every round after
+the first offers the ticket captured from the previous round instead of
+performing a full handshake. It runs by default under `zig build test` /
+`zig build test-quic`, alongside the primary soak above. Its pass condition:
+
+- every reconnect (every round past the first) actually resumed, proven two
+  independent ways: client-side, `psk_authenticated` is set from
+  ServerHello's `selected_identity` before EncryptedExtensions even arrives
+  (RFC 8446), not inferred from "the reconnect worked" (which would also be
+  true of a full fresh handshake); server-side, the production resumption
+  runtime's own `ResumptionDecisionObserver` -- wired automatically onto
+  every accepted connection once `resumption_runtime` is configured, the
+  same seam #247's "existing resumption observer" language asks this leg to
+  exercise -- records exactly one `.accepted` outcome per resumed round, and
+  zero `.miss`/`.incompatible`/`.fatal`/`.full_handshake` outcomes
+- every planned request completed
+- the same bounded settle/FD checks as the primary soak, folded into this leg
+  rather than proving resumption only in isolation
+
+This closes the "reconnect/resumption where the production config supports
+it" workload row above. 0-RTT is not covered by this leg; it would need its
+own early-data-specific admission assertions and is not required by this
+row's "reconnect/resumption" text.
 - **cancellation/reset traffic** -- the harness has no honest way to drive it
   yet.
 - **QPACK dynamic-table bytes/entries/blocked-streams, PTO totals, and
