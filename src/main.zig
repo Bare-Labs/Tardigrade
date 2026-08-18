@@ -453,8 +453,9 @@ fn printUsage(writer: anytype) !void {
         \\    `--profile <profile>` and keeps today's generic starter output
         \\    when no `--profile` is given.
         \\  - `check [<config>]` validates a config file without starting the server.
-        \\    Accepts a positional config path or defaults to `./tardigrade.conf`,
-        \\    the same local file `run` selects with no explicit path.
+        \\    Accepts a positional config path or defaults to `./tardigrade.conf`
+        \\    directly. `run` discovers that same local file when no
+        \\    higher-precedence `TARDIGRADE_CONFIG_PATH` override is set.
         \\    `config validate [<config>]` is a verbose alias for the same command.
         \\  - Legacy `validate` and `--validate-config` remain supported.
         \\  - `status` reports process state when a pid target is available.

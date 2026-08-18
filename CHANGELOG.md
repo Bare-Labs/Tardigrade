@@ -5,6 +5,20 @@ All notable user-facing changes to Tardigrade are documented here.
 ## [Unreleased]
 
 ### Added
+- **Operator quickstart and canonical `tardi`/`tardigrade.conf` first-run
+  contract (#157)** — `docs/QUICKSTART.md` is the canonical 5-minute
+  walkthrough: install/build, `tardi init <profile>`, `tardi check`,
+  `tardi run`, and a real request, for both the static-site and
+  reverse-proxy profiles, plus the explicit `-c <path>` form. `tardi check`
+  with no path now validates `./tardigrade.conf` directly instead of the
+  stale `./tardigrade.toml`, matching the nginx-style filename `tardi run`,
+  generated profiles, examples, and packaging already use (a
+  `TARDIGRADE_CONFIG_PATH` override still takes precedence for `run`, as
+  documented). Built-in `--help` now presents `tardi` as the canonical
+  command throughout, with `tardigrade` named only as a compatibility
+  alias. README gains a short Quickstart teaser and a prominent link
+  instead of a second onboarding surface.
+
 - **Profile-aware `tardi init <profile>` first-run config generator (#162)** —
   `tardi init static|proxy|tls|metrics|prod` writes a ready-to-check
   nginx-style `tardigrade.conf` starter to stdout only (no banner or status

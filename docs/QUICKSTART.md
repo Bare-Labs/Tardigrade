@@ -55,9 +55,11 @@ tardi run
 
 `tardi init static` writes a starter config to stdout only, so the
 redirect above produces a clean `tardigrade.conf` with no extra output mixed
-in. `tardi check` validates that same local file -- it defaults to
-`./tardigrade.conf`, the same file `tardi run` picks up with no explicit
-path. Validation performs a dry parse and never starts a listener.
+in. With no path given, `tardi check` validates `./tardigrade.conf` directly,
+and `tardi run` discovers that same local file too -- assuming, as in this
+walkthrough, that `TARDIGRADE_CONFIG_PATH` isn't set in your shell, since
+that env var takes precedence over the local file for `run` but not for
+`check`. Validation performs a dry parse and never starts a listener.
 
 `tardi run` starts listening on `http://localhost:8080`. From another
 terminal:
