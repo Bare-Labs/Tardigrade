@@ -142,6 +142,32 @@ Additional 64 KiB interleaved series:
 | base | 22641.300 | 612.007 | 22622.670 | 0.687 ms | 0.682 ms | 1.315 ms | 1.116 ms | 142.814% |
 | final | 22409.179 | 748.771 | 22663.500 | 0.713 ms | 0.697 ms | 4.424 ms | 1.668 ms | 140.214% |
 
+Because the 10-second series still showed a final p99 median shift and two large
+final p99 outliers, I ran an additional p99-focused 64 KiB control with longer
+30-second samples and ABBA ordering. Before interpreting this control, I treated
+the p99 tail as material if the final 30-second control increased p99 mean or
+median by at least 25%, or if the final p99 range no longer overlapped the base
+range. The control used the same process-sampled launch settings and an explicit
+`/proxy/payload-64k.bin` proxy route; all rows below had zero `wrk` errors.
+
+| Block | Order | Commit | req/s | p95 | p99 | p999 | wrk errors |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | base | 19517.46 | 0.805 ms | 1.210 ms | 7.951 ms | 0 |
+| 1 | 2 | final | 18962.19 | 0.855 ms | 1.994 ms | 9.533 ms | 0 |
+| 1 | 3 | final | 18910.26 | 0.854 ms | 1.501 ms | 5.121 ms | 0 |
+| 1 | 4 | base | 18516.92 | 0.859 ms | 1.354 ms | 6.137 ms | 0 |
+| 2 | 1 | final | 18361.81 | 0.869 ms | 1.608 ms | 7.234 ms | 0 |
+| 2 | 2 | base | 17291.94 | 0.938 ms | 2.055 ms | 9.777 ms | 0 |
+| 2 | 3 | base | 17543.84 | 0.912 ms | 1.650 ms | 8.428 ms | 0 |
+| 2 | 4 | final | 17568.26 | 0.920 ms | 2.044 ms | 9.765 ms | 0 |
+
+30-second p99-control aggregate:
+
+| Commit | req/s mean | req/s median | p95 mean | p95 median | p99 mean | p99 median | p99 range |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| base | 18217.540 | 18030.380 | 0.879 ms | 0.886 ms | 1.567 ms | 1.502 ms | 1.210-2.055 ms |
+| final | 18450.630 | 18636.035 | 0.875 ms | 0.862 ms | 1.787 ms | 1.801 ms | 1.501-2.044 ms |
+
 Process CPU samples from the per-run output:
 
 | Case | Commit | CPU/run samples |
@@ -160,14 +186,14 @@ Interpretation:
   throughput-neutral on this local fallback host: final mean req/s is -1.0% and
   final median req/s is +0.2%. Process CPU also does not regress; final average
   sampled CPU is lower.
-- Tail latency remains noisy on this macOS loopback fallback. The final series
-  includes two large p99 outliers, so the p99 mean is not clean. The p95
-  distribution is close (final +0.026 ms mean, +0.015 ms median), there are zero
-  `wrk` errors, zero response-write errors, and no corresponding throughput or
-  CPU regression. For this closeout, I treat a material regression as a
-  sustained >10% req/s loss or process-CPU increase, or a repeatable tail shift
-  accompanied by p95, error, CPU, or throughput movement. The retained samples
-  do not meet that threshold.
+- Tail latency on the 10-second macOS loopback fallback was not clean enough by
+  itself: final p99 was worse in 8/10 pairs and included 7.761 ms and 24.220 ms
+  outliers. The longer 30-second ABBA control does not reproduce an unexplained
+  material p99 regression under the p99-first criterion above. Final p99 mean is
+  +14.0%, final p99 median is +19.9%, and the final p99 range overlaps the base
+  range (base max 2.055 ms, final max 2.044 ms). The earlier extreme final
+  outliers therefore look like local fallback host/scheduler noise rather than a
+  repeatable response-writer tail regression.
 
 ## Final-head response-write mode evidence
 
