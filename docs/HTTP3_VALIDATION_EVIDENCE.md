@@ -131,6 +131,50 @@ tolerance. State that intentionally retains bounded high-water capacity must
 plateau inside a fixed bound; state that should drain completely must return to
 baseline. Do not describe the result only as "looked stable."
 
+### Implemented: repeated-connection soak (`tests/http3_soak.zig`)
+
+`soak.h3.bounded_repeated_connections` runs `http.http3_runtime.Runtime` -- the
+same module `edge_gateway.zig` wires into the live listener -- over real
+loopback UDP sockets with four concurrent clients, each doing repeated
+connect, two requests, clean close cycles (6 rounds PR-safe, 40 rounds with
+`TARDIGRADE_SOAK_HEAVY=1`). It runs by default under `zig build test` /
+`zig build test-quic`, so it is already part of the PR-safe evidence tier
+above; no separate invocation is required. Its pass condition:
+
+- every planned request across every worker/round completed (a stall fails
+  loudly instead of reporting fewer requests as "stable")
+- after a bounded settle window (`waitRuntimeSnapshot`, 5s), tracked
+  connections, active CID routes, and native connections return to exactly
+  zero
+- open file descriptors after settle do not exceed the pre-soak baseline
+- resident memory growth in the loop's second half does not exceed first-half
+  growth by more than a fixed, deliberately generous margin (`ps`-reported
+  RSS is page-granular and noisy; the PR-safe tier's low round count makes
+  this a coarse smoke bound, and the heavy tier is the meaningful signal)
+
+This closes the "repeated connect/request/close", "multiple requests per
+connection", and "concurrent H3 connections" workload rows, plus the RSS/FD/
+connection/CID observation rows, above. It deliberately does **not** cover:
+
+- **active drain with an in-flight request** -- already proven by "udp smoke:
+  HTTP/3 runtime drain lets admitted work finish and rejects new work" in
+  `tests/quic_h3_udp_smoke.zig`; duplicating it here would prove nothing new
+  (see this document's own reuse rule).
+- **reconnect/resumption** -- this harness's `Runtime.Config` does not wire a
+  `resumption_runtime`, so every reconnect is a full fresh handshake, not a
+  resumed one. Reopen only alongside a soak that actually configures
+  resumption.
+- **controlled loss/reordering** -- needs a dedicated host with netem/
+  `CAP_NET_ADMIN` (`benchmarks/competitive/netem-impair.sh`), not a portable
+  unit test.
+- **cancellation/reset traffic** -- the harness has no honest way to drive it
+  yet.
+- **QPACK dynamic-table bytes/entries/blocked-streams, PTO totals, and
+  worker/runtime queue depth** -- these are recorded onto `http.metrics.Metrics`
+  only by the `GatewayState` composition layer above `http3_runtime.Runtime`;
+  a bare-`Runtime` harness cannot observe them. Reopen only if `GatewayState`'s
+  own tests reveal a composition-specific gap this harness could close.
+
 ## Final Evidence Bundle
 
 Attach or link a concise report with:
