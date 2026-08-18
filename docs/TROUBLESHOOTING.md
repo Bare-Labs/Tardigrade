@@ -16,10 +16,11 @@ All examples use the canonical packaged config path,
 (`tardigrade` also works as a compatibility alias installed by the release
 script — see [README.md#install](../README.md#install)). Substitute your own
 config path throughout; **always pass it explicitly** (`-c <path>` or a
-positional argument) rather than relying on defaults — `tardi check` and
-`tardi config validate` fall back to `./tardigrade.toml` when no path is
-given, which is almost never what you want against an nginx-style
-`tardigrade.conf` deployment.
+positional argument) for packaged deployments rather than relying on
+defaults. For local first-run use, `tardi check` with no path validates
+`./tardigrade.conf` directly; `tardi run` discovers that same local file
+only when no higher-precedence `TARDIGRADE_CONFIG_PATH` override is set --
+see [Configuration](CONFIGURATION.md) for the full runtime search order.
 
 ## Contents
 

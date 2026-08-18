@@ -5,6 +5,7 @@
 </p>
 
 <p align="center">
+  <a href="docs/QUICKSTART.md"><strong>Quickstart</strong></a> |
   <a href="https://github.com/Bare-Systems/Tardigrade/releases">Releases</a> |
   <a href="docs/SUPPORT_MATRIX.md">Support Matrix</a> |
   <a href="docs/CONFIGURATION.md">Configuration</a> |
@@ -92,10 +93,9 @@ runtime dependency the DEB/RPM packages declare explicitly.
 Other install paths:
 
 - Download release archives directly from [GitHub Releases](https://github.com/Bare-Systems/Tardigrade/releases).
-- Native DEB/RPM packages (published on every release), systemd/launchd
-  service files, and a Homebrew formula — see
-  [packaging/README.md](packaging/README.md) for current status and
-  install/build instructions.
+- Native DEB/RPM packages (published on every release) and systemd/launchd
+  service files — see [packaging/README.md](packaging/README.md) for
+  current status and install/build instructions.
 - Build from source (see below).
 
 For running Tardigrade as a managed service — systemd unit, filesystem
@@ -137,89 +137,26 @@ Useful build options are documented in [CONTRIBUTING.md](CONTRIBUTING.md#build-o
 
 ## Quick start
 
-Build Tardigrade, then generate a starter config for your deployment shape
-with `tardi init <profile>`:
+`tardi init <profile>` below requires [building from source](#build-from-source)
+until a release containing it is published; the latest published release
+predates it. Once `tardi` is on your `PATH`:
 
 ```bash
-zig build
-
 mkdir -p public
 printf '%s\n' '<h1>Hello from Tardigrade</h1>' > public/index.html
 
-./zig-out/bin/tardi init static > tardigrade.conf
-./zig-out/bin/tardi check ./tardigrade.conf
-./zig-out/bin/tardi run -c ./tardigrade.conf
+tardi init static > tardigrade.conf
+tardi check
+tardi run
 ```
 
-Then open:
+Then open `http://localhost:8080/` and `http://localhost:8080/health`.
 
-- `http://localhost:8080/`
-- `http://localhost:8080/health`
-
-`init` writes configuration bytes only to stdout, so the redirect above
-produces a clean file with no extra output mixed in. Other common shapes:
-
-```bash
-./zig-out/bin/tardi init proxy > tardigrade.conf     # reverse proxy to an upstream app
-./zig-out/bin/tardi init tls > tardigrade.conf        # TLS termination + proxy
-./zig-out/bin/tardi init metrics > tardigrade.conf    # proxy starter documenting /status/metrics
-./zig-out/bin/tardi init prod > tardigrade.conf       # production-oriented TLS/proxy scaffold
-```
-
-Each profile also has a longer descriptive alias that resolves to the same
-template, e.g. `tardi init reverse-proxy` is identical to `tardi init proxy`.
-Run `tardi init --help` for the full profile/alias list. The `tls` and `prod`
-profiles reference certificate/key paths you must provision yourself — see
-[examples/tls-termination](examples/tls-termination/README.md) and
-[examples/production-baseline](examples/production-baseline/README.md) for
-how to generate a local test certificate. The `metrics` profile documents the
-existing `/status/metrics` endpoint; protect it in production with
-`TARDIGRADE_METRICS_REQUIRE_AUTH=true` or a network-boundary restriction.
-
-`tardi config init [<path>] [--force | --stdout] [--profile <profile>]` is
-the verbose, file-writing form of the same generator: it supports the same
-profiles via `--profile`, writes to a file (creating parent directories and
-refusing to overwrite an existing file unless `--force` is given), and keeps
-today's generic starter output when no `--profile` is given.
-
-Common CLI commands:
-
-```bash
-./zig-out/bin/tardi check ./tardigrade.conf
-./zig-out/bin/tardi config validate ./tardigrade.conf
-./zig-out/bin/tardi validate -c ./tardigrade.conf
-./zig-out/bin/tardi print-config -c ./tardigrade.conf
-./zig-out/bin/tardi status -c ./tardigrade.conf
-./zig-out/bin/tardi reload -c ./tardigrade.conf
-./zig-out/bin/tardi stop -c ./tardigrade.conf
-./zig-out/bin/tardi init <profile>
-./zig-out/bin/tardi config init
-./zig-out/bin/tardi explain <field>
-./zig-out/bin/tardi config explain <field>
-```
-
-`check` performs a dry parse and semantic validation without starting listeners
-or connecting to upstreams. When no path is supplied, it validates
-`./tardigrade.toml`; pass the path explicitly when using the nginx-style
-`tardigrade.conf` examples.
-
-Not sure what a directive does or which values it accepts? `tardi explain
-<field>` looks it up from a built-in reference -- no config file required:
-
-```bash
-./zig-out/bin/tardi explain listen
-./zig-out/bin/tardi explain location.proxy_pass
-./zig-out/bin/tardi explain upstream_protocol
-```
-
-`tardi config explain <field>` is a verbose alias for the same command.
-`explain` is a static documentation lookup: it describes the *supported*
-configuration contract (type, default, valid values, environment variable,
-example) and never loads a config file, inspects a running process, or
-prints current environment/secret values -- that's what `print-config`
-(effective configuration) is for.
-
-For copy/paste-runnable examples of common deployments (static file serving,
+See the **[Quickstart guide](docs/QUICKSTART.md)** for the full walkthrough,
+including installing `tardi`, a reverse-proxy happy path, and explicit
+config paths. For the full `tardi init`/`config`/`explain` command
+reference, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). For
+copy/paste-runnable examples of common deployments (static file serving,
 reverse proxy, TLS termination, rate limiting, and more), see the
 [examples/](examples/README.md) directory.
 
@@ -246,6 +183,7 @@ operate without guessing which config file or pid file is active.
 
 | Topic | Location |
 | --- | --- |
+| Quickstart | [docs/QUICKSTART.md](docs/QUICKSTART.md) |
 | Core v1 support matrix | [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) |
 | Configuration reference | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | HTTP/3 rollout and lifecycle | [docs/HTTP3_ROLLOUT.md](docs/HTTP3_ROLLOUT.md) |

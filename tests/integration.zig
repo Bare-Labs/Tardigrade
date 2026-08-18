@@ -17241,7 +17241,7 @@ test "init -h and --help print usage without generating a config" {
         defer allocator.free(res.stderr);
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
         try std.testing.expect(std.mem.indexOf(u8, res.stdout, "# Tardigrade profile:") == null);
-        try assertContains(res.stdout, "tardigrade init <profile>");
+        try assertContains(res.stdout, "tardi init <profile>");
     }
 }
 

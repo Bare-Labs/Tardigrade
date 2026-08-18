@@ -13,8 +13,10 @@ Runtime config-file selection, highest priority first:
 6. `$HOME/.config/tardigrade/tardigrade.conf`.
 
 `check [<config>]` and `config validate [<config>]` are validation commands.
-When no path is supplied, they validate `./tardigrade.toml` instead of using
-the runtime search path.
+When no path is supplied, `check` validates `./tardigrade.conf` directly
+rather than using the full runtime search path above. `run` discovers that
+same local file when no higher-precedence `TARDIGRADE_CONFIG_PATH` override
+is set.
 
 Effective value precedence, highest priority first:
 
@@ -41,6 +43,69 @@ For copy/paste-runnable configs, see [examples/](../examples/README.md):
 [Prometheus metrics](../examples/prometheus-metrics/README.md),
 [graceful reload](../examples/graceful-reload/README.md), and
 [production baseline](../examples/production-baseline/README.md).
+
+## Generating a Starter Config
+
+`tardi init <profile>` writes a ready-to-check config for a common
+deployment shape to stdout only, so `tardi init proxy > tardigrade.conf`
+produces a clean file with no extra output mixed in:
+
+```bash
+tardi init static > tardigrade.conf     # static files + SPA fallback + health
+tardi init proxy > tardigrade.conf      # reverse proxy to an upstream app
+tardi init tls > tardigrade.conf        # TLS termination + proxy
+tardi init metrics > tardigrade.conf    # proxy starter documenting /status/metrics
+tardi init prod > tardigrade.conf       # production-oriented TLS/proxy scaffold
+```
+
+Each profile also has a longer descriptive alias that resolves to the same
+template, e.g. `tardi init reverse-proxy` is identical to `tardi init proxy`.
+Run `tardi init --help` for the full profile/alias list. The `tls` and `prod`
+profiles reference certificate/key paths you must provision yourself — see
+[examples/tls-termination](../examples/tls-termination/README.md) and
+[examples/production-baseline](../examples/production-baseline/README.md)
+for how to generate a local test certificate. The `metrics` profile
+documents the existing `/status/metrics` endpoint; protect it in production
+with `TARDIGRADE_METRICS_REQUIRE_AUTH=true` or a network-boundary
+restriction.
+
+`tardi config init [<path>] [--force | --stdout] [--profile <profile>]` is
+the verbose, file-writing form of the same generator: it supports the same
+profiles via `--profile`, writes to a file (creating parent directories and
+refusing to overwrite an existing file unless `--force` is given), and keeps
+a generic starter output when no `--profile` is given.
+
+## CLI Command Reference
+
+```bash
+tardi check ./tardigrade.conf
+tardi config validate ./tardigrade.conf
+tardi validate -c ./tardigrade.conf
+tardi print-config -c ./tardigrade.conf
+tardi status -c ./tardigrade.conf
+tardi reload -c ./tardigrade.conf
+tardi stop -c ./tardigrade.conf
+tardi init <profile>
+tardi config init
+tardi explain <field>
+tardi config explain <field>
+```
+
+Not sure what a directive does or which values it accepts? `tardi explain
+<field>` looks it up from a built-in reference -- no config file required:
+
+```bash
+tardi explain listen
+tardi explain location.proxy_pass
+tardi explain upstream_protocol
+```
+
+`tardi config explain <field>` is a verbose alias for the same command.
+`explain` is a static documentation lookup: it describes the *supported*
+configuration contract (type, default, valid values, environment variable,
+example) and never loads a config file, inspects a running process, or
+prints current environment/secret values -- that's what `print-config`
+(effective configuration) is for.
 
 ## Config File Syntax
 

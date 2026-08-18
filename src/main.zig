@@ -10,7 +10,7 @@ const runtime_allocator = @import("runtime_allocator.zig");
 const tls_core = @import("tls_core");
 
 const ENV_CONFIG_PATH = "TARDIGRADE_CONFIG_PATH";
-const CHECK_DEFAULT_CONFIG_PATH = "./tardigrade.toml";
+const CHECK_DEFAULT_CONFIG_PATH = "./tardigrade.conf";
 const EXIT_INTERNAL_ERROR: u8 = 1;
 const EXIT_CONFIG_INVALID: u8 = 2;
 
@@ -417,21 +417,21 @@ fn parseExplainCommand(args: []const []const u8) !CliCommand {
 fn printUsage(writer: anytype) !void {
     try writer.writeAll(
         \\Usage:
-        \\  tardigrade check [<config>]
-        \\  tardigrade run [-c <path>] [--daemon]
-        \\  tardigrade validate [-c <path>]
-        \\  tardigrade status [-c <path>] [--pid-file <path> | --pid <pid>]
-        \\  tardigrade print-config [-c <path>]
-        \\  tardigrade routes [<config>] [-c <path>]
-        \\  tardigrade upstreams [<config>] [-c <path>]
-        \\  tardigrade reload [-c <path>] [--pid-file <path> | --pid <pid>]
-        \\  tardigrade stop [-c <path>] [--pid-file <path> | --pid <pid>]
-        \\  tardigrade version
-        \\  tardigrade init <profile>
+        \\  tardi check [<config>]
+        \\  tardi run [-c <path>] [--daemon]
+        \\  tardi validate [-c <path>]
+        \\  tardi status [-c <path>] [--pid-file <path> | --pid <pid>]
+        \\  tardi print-config [-c <path>]
+        \\  tardi routes [<config>] [-c <path>]
+        \\  tardi upstreams [<config>] [-c <path>]
+        \\  tardi reload [-c <path>] [--pid-file <path> | --pid <pid>]
+        \\  tardi stop [-c <path>] [--pid-file <path> | --pid <pid>]
+        \\  tardi version
+        \\  tardi init <profile>
         \\  tardi explain <field>
-        \\  tardigrade config init [<path>] [--force | --stdout] [--profile <profile>]
-        \\  tardigrade config print [-c <path>]
-        \\  tardigrade config validate [<config>]
+        \\  tardi config init [<path>] [--force | --stdout] [--profile <profile>]
+        \\  tardi config print [-c <path>]
+        \\  tardi config validate [<config>]
         \\  tardi config explain <field>
         \\
         \\Profiles (canonical name, descriptive alias -- aliases resolve to the
@@ -443,6 +443,9 @@ fn printUsage(writer: anytype) !void {
         \\  prod (production-baseline)   production-oriented TLS/proxy scaffold
         \\
         \\Notes:
+        \\  - `tardi` is the canonical command name. Some installation formats
+        \\    also provide `tardigrade` as a compatibility alias for the same
+        \\    binary.
         \\  - `init <profile>` writes the profile's config to stdout only, e.g.
         \\    `tardi init proxy > tardigrade.conf`; nothing else is printed to
         \\    stdout or stderr on success. `config init` is the verbose,
@@ -450,7 +453,9 @@ fn printUsage(writer: anytype) !void {
         \\    `--profile <profile>` and keeps today's generic starter output
         \\    when no `--profile` is given.
         \\  - `check [<config>]` validates a config file without starting the server.
-        \\    Accepts a positional config path or defaults to `./tardigrade.toml`.
+        \\    Accepts a positional config path or defaults to `./tardigrade.conf`
+        \\    directly. `run` discovers that same local file when no
+        \\    higher-precedence `TARDIGRADE_CONFIG_PATH` override is set.
         \\    `config validate [<config>]` is a verbose alias for the same command.
         \\  - Legacy `validate` and `--validate-config` remain supported.
         \\  - `status` reports process state when a pid target is available.
@@ -1927,7 +1932,8 @@ test "parseCliCommand config validate with positional config path" {
     }
 }
 
-test "check command default path is tardigrade.toml" {
+test "check command default path is tardigrade.conf" {
+    try std.testing.expectEqualStrings("./tardigrade.conf", CHECK_DEFAULT_CONFIG_PATH);
     try std.testing.expectEqualStrings(CHECK_DEFAULT_CONFIG_PATH, validationTargetDescription(.{}, .check));
 }
 
@@ -1998,4 +2004,30 @@ test "built-in usage documents the concise tardi explain form before the verbose
     // for these two commands, not the legacy `tardigrade` spelling.
     try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade explain <field>") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade config explain <field>") == null);
+}
+
+test "built-in usage presents tardi as canonical for every command" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try printUsage(&out.writer);
+    const written = out.writer.buffered();
+
+    // #157 requires the Usage block to be consistent with #163: `tardi` is
+    // canonical everywhere, not just for `explain`. `tardigrade` may still
+    // be named once as a compatibility alias, but never as a co-equal
+    // command prefix in the Usage rows themselves.
+    const usage_commands = [_][]const u8{
+        "check",        "run",          "validate",        "status",
+        "print-config", "routes",       "upstreams",       "reload",
+        "stop",         "version",      "init",            "explain",
+        "config init",  "config print", "config validate", "config explain",
+    };
+    for (usage_commands) |cmd| {
+        var buf: [64]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&buf, "tardi {s}", .{cmd});
+        try std.testing.expect(std.mem.indexOf(u8, written, needle) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade check") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade run") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "tardigrade version") == null);
 }
