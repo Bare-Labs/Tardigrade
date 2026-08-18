@@ -142,5 +142,7 @@ form shown above, while `run` requires `-c`/`--config`.
   and graceful-shutdown contract.
 - [Core v1 support matrix](SUPPORT_MATRIX.md) -- what's stable versus
   experimental.
+- [Troubleshooting](TROUBLESHOOTING.md) -- symptom-to-diagnosis runbook for
+  when something doesn't work as expected.
 - [packaging/README.md](../packaging/README.md) -- install/build options
   and current platform coverage in detail.
