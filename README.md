@@ -11,6 +11,7 @@
   <a href="docs/CONFIGURATION.md">Configuration</a> |
   <a href="docs/OBSERVABILITY.md">Observability</a> |
   <a href="docs/DEPLOYMENT.md">Deployment</a> |
+  <a href="docs/TROUBLESHOOTING.md">Troubleshooting</a> |
   <a href="SECURITY.md">Security</a> |
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
@@ -186,11 +187,13 @@ operate without guessing which config file or pid file is active.
 | Core v1 support matrix | [docs/SUPPORT_MATRIX.md](docs/SUPPORT_MATRIX.md) |
 | Configuration reference | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | HTTP/3 rollout and lifecycle | [docs/HTTP3_ROLLOUT.md](docs/HTTP3_ROLLOUT.md) |
+| HTTP/3 validation evidence | [docs/HTTP3_VALIDATION_EVIDENCE.md](docs/HTTP3_VALIDATION_EVIDENCE.md) |
 | Concurrency & hot-path audit | [docs/CONCURRENCY.md](docs/CONCURRENCY.md) |
 | Event-loop backend evaluation (epoll/kqueue vs libxev/std.Io/io_uring) | [docs/EVENT_LOOP_BACKENDS.md](docs/EVENT_LOOP_BACKENDS.md) |
 | Observability | [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) |
 | Reload, drain, and shutdown | [docs/RELOAD_SHUTDOWN.md](docs/RELOAD_SHUTDOWN.md) |
 | Production deployment (systemd and Docker) | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
+| Troubleshooting runbook | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
 | Proxy security | [docs/PROXY_SECURITY.md](docs/PROXY_SECURITY.md) |
 | Security test plan | [docs/SECURITY_TEST_PLAN.md](docs/SECURITY_TEST_PLAN.md) |
 | TLS interop & conformance matrix | [docs/TLS_INTEROP_MATRIX.md](docs/TLS_INTEROP_MATRIX.md) |
@@ -262,6 +265,10 @@ larger changes.
 
 ## Getting help
 
+- Start with the [troubleshooting runbook](docs/TROUBLESHOOTING.md) — it
+  covers config validation failures, listener/routing problems, static
+  404/403s, upstream 502/504/503s, TLS errors, health checks, metrics, logs,
+  reload, and performance, and ends with a copy/paste issue-report template.
 - Use [GitHub Issues](https://github.com/Bare-Systems/Tardigrade/issues) for
   actionable bug reports and feature requests.
 - Use [SECURITY.md](SECURITY.md) for vulnerability reporting instructions.

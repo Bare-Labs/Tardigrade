@@ -7,10 +7,16 @@ Use this checklist before tagging and distributing a Tardigrade release.
 - [ ] `zig fmt --check build.zig src/ tests/`
 - [ ] `zig build test --summary all --error-style verbose`
 - [ ] `zig build test-integration`
+- [ ] For any HTTP/3 support-status change, complete the closeout evidence
+      contract in [HTTP3_VALIDATION_EVIDENCE.md](HTTP3_VALIDATION_EVIDENCE.md)
 
 ## Performance
 
 - [ ] Capture the release baseline JSON with `./benchmarks/release-baseline.sh` on a stable, dedicated benchmark target, including the default `64 KiB` and `256 KiB` payload scenarios
+- [ ] For HTTP/3 release evidence, run the existing H3 matrix on a dedicated
+      host with a genuinely QUIC-capable client and retain the client
+      capability proof, scenario-local QUIC deltas, soak results, and interop
+      rerun summary
 - [ ] Compare against the previous saved baseline JSON
 - [ ] Generate the markdown report for the new baseline
 - [ ] Refresh the README benchmark report block from the saved baseline data

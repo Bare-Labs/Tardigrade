@@ -425,18 +425,24 @@ image and point it at `/health` instead.
 Two logging surfaces, both covered in full by
 [OBSERVABILITY.md](OBSERVABILITY.md):
 
-- **Container/service stdout** — under systemd, `journalctl -u tardigrade`;
-  under Docker, `docker compose logs -f tardigrade`. This is where runtime
-  and JSON access logs land unless `error_log`/`TARDIGRADE_ERROR_LOG_PATH`
-  is configured.
+- **Container/service stderr** — under systemd, `journalctl -u tardigrade`;
+  under Docker, `docker compose logs -f tardigrade`. Runtime and JSON
+  access logs are written to stderr (not stdout) unless `error_log`/
+  `TARDIGRADE_ERROR_LOG_PATH` redirects fd 2 to a configured file.
+  `journalctl`/`docker compose logs` still work as the collection surface
+  either way, since both capture stderr.
 - **Configured file logs** — set `error_log` (or
   `TARDIGRADE_ERROR_LOG_PATH`) to write to `/var/log/tardigrade/*.log`
   instead. Both the DEB and RPM packages create a `tardigrade`-owned
   `/var/log/tardigrade` and install the same logrotate config at
   `/etc/logrotate.d/tardigrade`, which signals `SIGUSR1` after rotation;
   Tardigrade has a real SIGUSR1 log-reopen handler, so log files reopen
-  cleanly on the existing rotation cadence. Don't invent a second rotation
-  mechanism.
+  cleanly on the existing rotation cadence. That packaged logrotate +
+  `SIGUSR1` flow is the supported mechanism for **ongoing** rotation while
+  the process stays up. Separately, `TARDIGRADE_LOG_ROTATE_MAX_BYTES`/
+  `TARDIGRADE_LOG_ROTATE_MAX_FILES` perform a one-time size-triggered
+  rotation check during process **startup** only — not a periodic runtime
+  rotator. Don't invent a third mechanism beyond these two.
 
   The Docker image creates the same `tardigrade`-owned `/var/log/tardigrade`
   directory, but nothing inside the container persists or rotates it. Using
