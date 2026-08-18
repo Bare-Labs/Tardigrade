@@ -240,7 +240,12 @@ const ResourceSample = struct {
     native_connections: usize,
 };
 
-fn sampleResources(allocator: std.mem.Allocator, runtime: *http3_runtime.Runtime, label: []const u8) !ResourceSample {
+// `scenario` identifies which soak produced this sample (PR review, #247
+// Lane B): `sampleResources` is shared by both `soak.h3.
+// bounded_repeated_connections` and `soak.h3.bounded_resumed_reconnects`,
+// and a hard-coded log prefix made the two tests' evidence rows
+// indistinguishable in CI output.
+fn sampleResources(allocator: std.mem.Allocator, runtime: *http3_runtime.Runtime, scenario: []const u8, label: []const u8) !ResourceSample {
     const pid = std.c.getpid();
     const snapshot = runtime.snapshot();
     const sample = ResourceSample{
@@ -252,8 +257,8 @@ fn sampleResources(allocator: std.mem.Allocator, runtime: *http3_runtime.Runtime
         .native_connections = snapshot.native_connections,
     };
     std.debug.print(
-        "soak.h3.bounded_repeated_connections: {s} rss_kb={d} open_fds={d} tracked_connections={d} active_cid_routes={d} native_connections={d}\n",
-        .{ sample.label, sample.rss_kb, sample.open_fds, sample.tracked_connections, sample.active_cid_routes, sample.native_connections },
+        "{s}: {s} rss_kb={d} open_fds={d} tracked_connections={d} active_cid_routes={d} native_connections={d}\n",
+        .{ scenario, sample.label, sample.rss_kb, sample.open_fds, sample.tracked_connections, sample.active_cid_routes, sample.native_connections },
     );
     return sample;
 }
@@ -296,6 +301,132 @@ const RuntimeHighWater = struct {
         self.tracked_connections = @max(self.tracked_connections, snapshot.tracked_connections);
         self.native_connections = @max(self.native_connections, snapshot.native_connections);
         self.active_cid_routes = @max(self.active_cid_routes, snapshot.active_cid_routes);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Shared resource/high-water monitor (PR review, #247 Lane B): both soak
+// legs -- `soak.h3.bounded_repeated_connections` and `soak.h3.
+// bounded_resumed_reconnects` -- need the same bounded-evidence treatment
+// (real intermediate RSS/FD samples, a genuine max-of-samples peak, and a
+// first-half/second-half runtime-state plateau), so this is one helper both
+// drive from their own loops rather than two near-duplicate ~80-line blocks
+// that could silently drift apart.
+// ---------------------------------------------------------------------------
+
+const RssCheckpoint = struct {
+    label: []const u8,
+    numerator: usize,
+    denominator: usize,
+    sample: ?ResourceSample = null,
+};
+
+const default_checkpoints = [3]RssCheckpoint{
+    .{ .label = "checkpoint_25pct", .numerator = 1, .denominator = 4 },
+    .{ .label = "checkpoint_50pct", .numerator = 1, .denominator = 2 },
+    .{ .label = "checkpoint_75pct", .numerator = 3, .denominator = 4 },
+};
+
+const WorkloadMonitor = struct {
+    allocator: std.mem.Allocator,
+    scenario: []const u8,
+    /// Total planned units of progress (requests, or rounds where each round
+    /// is one request) -- the denominator `tick`'s `completed` argument is
+    /// measured against to find the true 50% boundary and the 25/75%
+    /// checkpoints.
+    total: usize,
+    checkpoints: [3]RssCheckpoint = default_checkpoints,
+    first_half_high_water: RuntimeHighWater = .{},
+    second_half_high_water: RuntimeHighWater = .{},
+
+    fn init(allocator: std.mem.Allocator, scenario: []const u8, total: usize) WorkloadMonitor {
+        return .{ .allocator = allocator, .scenario = scenario, .total = total };
+    }
+
+    /// Call once per main-loop iteration with the aggregate completed work
+    /// so far. Cheap every time (one `runtime.snapshot()`, a mutex-guarded
+    /// struct copy); only spawns a probe subprocess the (at most three)
+    /// times a checkpoint threshold is newly crossed.
+    fn tick(self: *WorkloadMonitor, runtime: *http3_runtime.Runtime, completed: usize) !void {
+        const snap = runtime.snapshot();
+        if (completed * 2 >= self.total) {
+            self.second_half_high_water.observe(snap);
+        } else {
+            self.first_half_high_water.observe(snap);
+        }
+        for (&self.checkpoints) |*cp| {
+            if (cp.sample == null and completed * cp.denominator >= self.total * cp.numerator) {
+                cp.sample = try sampleResources(self.allocator, runtime, self.scenario, cp.label);
+            }
+        }
+    }
+
+    /// Final RSS-slope and runtime-state-plateau assertions. `before` and
+    /// `end_workload` are the samples the caller takes outside the loop
+    /// (before starting workers / after every worker finishes).
+    fn checkGrowthAndPlateau(
+        self: *const WorkloadMonitor,
+        before: ResourceSample,
+        end_workload: ResourceSample,
+        rss_margin_kb: u64,
+        high_water_margin: usize,
+    ) !void {
+        const mid = self.checkpoints[1].sample orelse return error.MissingMidSample;
+        const q3 = self.checkpoints[2].sample orelse return error.MissingLateSample;
+
+        // An overall peak (evidence/reporting only) versus a second-half
+        // peak (PR review P2): `overall_peak` folding in `checkpoint_25pct`
+        // would let a first-half allocation spike get misreported as
+        // second-half growth once compared against `mid`. Only observations
+        // at/after the true 50% boundary may feed the slope assertion.
+        var overall_peak_rss_kb = before.rss_kb;
+        for (self.checkpoints) |cp| {
+            if (cp.sample) |s| overall_peak_rss_kb = @max(overall_peak_rss_kb, s.rss_kb);
+        }
+        overall_peak_rss_kb = @max(overall_peak_rss_kb, end_workload.rss_kb);
+        const second_half_peak_rss_kb = @max(mid.rss_kb, @max(q3.rss_kb, end_workload.rss_kb));
+
+        const first_half_growth_kb = mid.rss_kb -| before.rss_kb;
+        const second_half_growth_kb = second_half_peak_rss_kb -| mid.rss_kb;
+        if (second_half_growth_kb > first_half_growth_kb + rss_margin_kb) {
+            std.debug.print(
+                "{s}: possible monotonic RSS growth -- before={d}KB mid={d}KB overall_peak={d}KB " ++
+                    "second_half_peak={d}KB (first_half={d}KB second_half={d}KB margin={d}KB)\n",
+                .{
+                    self.scenario,
+                    before.rss_kb,
+                    mid.rss_kb,
+                    overall_peak_rss_kb,
+                    second_half_peak_rss_kb,
+                    first_half_growth_kb,
+                    second_half_growth_kb,
+                    rss_margin_kb,
+                },
+            );
+            return error.PossibleMonotonicRssGrowth;
+        }
+
+        if (self.second_half_high_water.tracked_connections > self.first_half_high_water.tracked_connections + high_water_margin or
+            self.second_half_high_water.native_connections > self.first_half_high_water.native_connections + high_water_margin or
+            self.second_half_high_water.active_cid_routes > self.first_half_high_water.active_cid_routes + high_water_margin)
+        {
+            std.debug.print(
+                "{s}: possible sustained-traffic runtime-state growth -- " ++
+                    "first_half high-water tracked={d} native={d} cid_routes={d}; " ++
+                    "second_half high-water tracked={d} native={d} cid_routes={d} (margin={d})\n",
+                .{
+                    self.scenario,
+                    self.first_half_high_water.tracked_connections,
+                    self.first_half_high_water.native_connections,
+                    self.first_half_high_water.active_cid_routes,
+                    self.second_half_high_water.tracked_connections,
+                    self.second_half_high_water.native_connections,
+                    self.second_half_high_water.active_cid_routes,
+                    high_water_margin,
+                },
+            );
+            return error.PossibleRuntimeStateGrowth;
+        }
     }
 };
 
@@ -523,7 +654,8 @@ test "soak.h3.bounded_repeated_connections" {
     // same boundary.
     const total_planned_requests = worker_count * rounds_per_worker * requests_per_round;
 
-    const before_sample = try sampleResources(allocator, &runtime, "before");
+    const scenario = "soak.h3.bounded_repeated_connections";
+    const before_sample = try sampleResources(allocator, &runtime, scenario, "before");
 
     var workers = try allocator.alloc(Worker, worker_count);
     defer allocator.free(workers);
@@ -542,27 +674,7 @@ test "soak.h3.bounded_repeated_connections" {
     var pollfds_buf = try allocator.alloc(posix.pollfd, worker_count);
     defer allocator.free(pollfds_buf);
 
-    // Real-valued RSS/FD checkpoints at 25/50/75% of the actual workload,
-    // rather than one "mid" sample plus a terminal sample mislabeled "peak"
-    // (PR review): a bounded, small number of extra probe-subprocess spawns
-    // (three, not one per loop iteration -- that would be far too expensive
-    // over up to 400,000 iterations), enough to let `peak` below be a real
-    // max-of-samples rather than just whatever the run happened to look like
-    // at the very end.
-    const RssCheckpoint = struct {
-        label: []const u8,
-        numerator: usize,
-        denominator: usize,
-        sample: ?ResourceSample = null,
-    };
-    var checkpoints = [_]RssCheckpoint{
-        .{ .label = "checkpoint_25pct", .numerator = 1, .denominator = 4 },
-        .{ .label = "checkpoint_50pct", .numerator = 1, .denominator = 2 },
-        .{ .label = "checkpoint_75pct", .numerator = 3, .denominator = 4 },
-    };
-
-    var first_half_high_water: RuntimeHighWater = .{};
-    var second_half_high_water: RuntimeHighWater = .{};
+    var monitor = WorkloadMonitor.init(allocator, scenario, total_planned_requests);
 
     const deadline = nowUs() + 60_000_000;
     var iterations: usize = 0;
@@ -607,31 +719,20 @@ test "soak.h3.bounded_repeated_connections" {
 
         var completed: usize = 0;
         for (workers) |w| completed += w.requests_completed_total;
-
-        const snap = runtime.snapshot();
-        if (completed * 2 >= total_planned_requests) {
-            second_half_high_water.observe(snap);
-        } else {
-            first_half_high_water.observe(snap);
-        }
-
-        for (&checkpoints) |*cp| {
-            if (cp.sample == null and completed * cp.denominator >= total_planned_requests * cp.numerator) {
-                cp.sample = try sampleResources(allocator, &runtime, cp.label);
-            }
-        }
+        try monitor.tick(&runtime, completed);
     }
 
     // Renamed from the old "peak" (PR review): this is only an end-of-
     // workload sample, taken once every worker has finished. The genuine
-    // peak is computed below from `before` plus the checkpoints above.
-    const end_workload_sample = try sampleResources(allocator, &runtime, "end_workload");
+    // peak is computed by `WorkloadMonitor.checkGrowthAndPlateau` below from
+    // `before` plus the checkpoints `monitor` gathered during the loop.
+    const end_workload_sample = try sampleResources(allocator, &runtime, scenario, "end_workload");
 
     for (workers) |*w| w.deinit();
     workers_initialized = 0;
 
     _ = try waitRuntimeSnapshot(&runtime, hasNoTrackedConnections);
-    const after_settle_sample = try sampleResources(allocator, &runtime, "after_settle");
+    const after_settle_sample = try sampleResources(allocator, &runtime, scenario, "after_settle");
 
     // Every planned request across every worker/round actually completed --
     // a soak that silently stalls partway through must fail loudly, not
@@ -667,8 +768,8 @@ test "soak.h3.bounded_repeated_connections" {
             final_open_fds = try readOpenFdCount(allocator, std.c.getpid());
         }
         std.debug.print(
-            "soak.h3.bounded_repeated_connections: after_settle open_fds re-sampled to {d} (baseline {d})\n",
-            .{ final_open_fds, before_sample.open_fds },
+            "{s}: after_settle open_fds re-sampled to {d} (baseline {d})\n",
+            .{ scenario, final_open_fds, before_sample.open_fds },
         );
     }
     try testing.expect(final_open_fds <= before_sample.open_fds);
@@ -683,55 +784,13 @@ test "soak.h3.bounded_repeated_connections" {
     // under a loaded CI host, and the PR-safe tier's low round count makes
     // this a coarse smoke bound rather than a precise leak detector; the
     // heavy tier (`TARDIGRADE_SOAK_HEAVY=1`, more rounds) gives the
-    // meaningful signal.
-    const mid = checkpoints[1].sample orelse return error.MissingMidSample;
-    var peak_rss_kb = before_sample.rss_kb;
-    for (checkpoints) |cp| {
-        if (cp.sample) |s| peak_rss_kb = @max(peak_rss_kb, s.rss_kb);
-    }
-    peak_rss_kb = @max(peak_rss_kb, end_workload_sample.rss_kb);
-    const first_half_growth_kb = mid.rss_kb -| before_sample.rss_kb;
-    const second_half_growth_kb = peak_rss_kb -| mid.rss_kb;
-    const rss_margin_kb: u64 = 8192;
-    if (second_half_growth_kb > first_half_growth_kb + rss_margin_kb) {
-        std.debug.print(
-            "soak.h3.bounded_repeated_connections: possible monotonic RSS growth -- before={d}KB mid={d}KB peak={d}KB (first_half={d}KB second_half={d}KB margin={d}KB)\n",
-            .{ before_sample.rss_kb, mid.rss_kb, peak_rss_kb, first_half_growth_kb, second_half_growth_kb, rss_margin_kb },
-        );
-        return error.PossibleMonotonicRssGrowth;
-    }
-
-    // Runtime-state high-water plateau (PR review): the exact-zero settle
-    // assertion above proves state eventually drains, but not that it stayed
-    // bounded *while traffic was still flowing* -- a bug that keeps retaining
-    // every prior connection/CID during the run and only releases them once
-    // traffic stops would still pass a settle-only check. `high_water_margin`
-    // is `worker_count * 4`: the server-loop reap pass that removes closed
-    // connections is capped at 16 reclaims per pass (see `http3_runtime.zig`
-    // `serve`'s `Reap` buffer), so a burst of near-simultaneous round
-    // completions across `worker_count` workers can transiently lag by a few
-    // passes before catching up -- expected bounded slack, not growth.
-    const high_water_margin: usize = worker_count * 4;
-    if (second_half_high_water.tracked_connections > first_half_high_water.tracked_connections + high_water_margin or
-        second_half_high_water.native_connections > first_half_high_water.native_connections + high_water_margin or
-        second_half_high_water.active_cid_routes > first_half_high_water.active_cid_routes + high_water_margin)
-    {
-        std.debug.print(
-            "soak.h3.bounded_repeated_connections: possible sustained-traffic runtime-state growth -- " ++
-                "first_half high-water tracked={d} native={d} cid_routes={d}; " ++
-                "second_half high-water tracked={d} native={d} cid_routes={d} (margin={d})\n",
-            .{
-                first_half_high_water.tracked_connections,
-                first_half_high_water.native_connections,
-                first_half_high_water.active_cid_routes,
-                second_half_high_water.tracked_connections,
-                second_half_high_water.native_connections,
-                second_half_high_water.active_cid_routes,
-                high_water_margin,
-            },
-        );
-        return error.PossibleRuntimeStateGrowth;
-    }
+    // meaningful signal. `high_water_margin` is `worker_count * 4`: the
+    // server-loop reap pass that removes closed connections is capped at 16
+    // reclaims per pass (see `http3_runtime.zig` `serve`'s `Reap` buffer),
+    // so a burst of near-simultaneous round completions across
+    // `worker_count` workers can transiently lag by a few passes before
+    // catching up -- expected bounded slack, not growth.
+    try monitor.checkGrowthAndPlateau(before_sample, end_workload_sample, 8192, worker_count * 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -762,6 +821,35 @@ test "soak.h3.bounded_repeated_connections" {
 // ---------------------------------------------------------------------------
 
 const resumption_worker_count: usize = 2;
+
+// Resumption cache occupancy tracking (PR review, #247 Lane B): unlike
+// connection/CID state, `server_resumption`'s and `client_resumption`'s
+// ticket caches are *expected* to retain a high-water mark rather than
+// return to zero after settle -- that is the entire point of caching
+// tickets for future reconnects, and the fresh-connection soak above never
+// exercises this state at all. Unlike `RuntimeHighWater`, this is a single
+// running maximum, not a first-half/second-half comparison: an empty cache
+// filling steadily toward its configured capacity over the *entire* run
+// (there is nothing to evict, so nothing plateaus, until that capacity is
+// actually reached) is expected, correct behavior, not sustained-traffic
+// retention. The meaningful "bounded, not unbounded" proof for this state
+// is a hard ceiling against the cache's own configured capacity (checked
+// where this is used), not a plateau margin.
+const CacheHighWater = struct {
+    client_entries: usize = 0,
+    server_entries: usize = 0,
+
+    fn observe(
+        self: *CacheHighWater,
+        client_resumption: *tls_core.resumption_runtime.Runtime,
+        server_resumption: *tls_core.resumption_runtime.Runtime,
+    ) void {
+        const client_count = if (client_resumption.client_cache) |*c| c.count() else 0;
+        const server_count = if (server_resumption.server_cache) |*c| c.count() else 0;
+        self.client_entries = @max(self.client_entries, client_count);
+        self.server_entries = @max(self.server_entries, server_count);
+    }
+};
 
 const ResumptionOutcomeCounts = struct {
     accepted: usize = 0,
@@ -1102,8 +1190,13 @@ test "soak.h3.bounded_resumed_reconnects" {
     runtime.start();
 
     const rounds_per_worker: usize = if (soakHeavyEnabled()) 10 else 4;
+    // One request per round here (unlike the primary soak's
+    // `requests_per_round`), so rounds and requests coincide as the
+    // progress axis `WorkloadMonitor`/`CacheHighWater` split on.
+    const total_work = resumption_worker_count * rounds_per_worker;
 
-    const before_sample = try sampleResources(allocator, &runtime, "before");
+    const scenario = "soak.h3.bounded_resumed_reconnects";
+    const before_sample = try sampleResources(allocator, &runtime, scenario, "before");
 
     var workers = try allocator.alloc(ResumptionWorker, resumption_worker_count);
     defer allocator.free(workers);
@@ -1119,6 +1212,9 @@ test "soak.h3.bounded_resumed_reconnects" {
 
     var pollfds_buf = try allocator.alloc(posix.pollfd, resumption_worker_count);
     defer allocator.free(pollfds_buf);
+
+    var monitor = WorkloadMonitor.init(allocator, scenario, total_work);
+    var cache_high_water: CacheHighWater = .{};
 
     const deadline = nowUs() + 60_000_000;
     var iterations: usize = 0;
@@ -1159,13 +1255,20 @@ test "soak.h3.bounded_resumed_reconnects" {
             if (w.phase == .round_done) continue;
             try w.step();
         }
+
+        var completed: usize = 0;
+        for (workers) |w| completed += w.requests_completed_total;
+        try monitor.tick(&runtime, completed);
+        cache_high_water.observe(&client_resumption, &server_resumption);
     }
+
+    const end_workload_sample = try sampleResources(allocator, &runtime, scenario, "end_workload");
 
     for (workers) |*w| w.deinit();
     workers_initialized = 0;
 
     _ = try waitRuntimeSnapshot(&runtime, hasNoTrackedConnections);
-    const after_settle_sample = try sampleResources(allocator, &runtime, "after_settle");
+    const after_settle_sample = try sampleResources(allocator, &runtime, scenario, "after_settle");
 
     // Every planned request completed and every reconnect (every round past
     // the first) genuinely resumed -- the primary point of this leg.
@@ -1205,6 +1308,49 @@ test "soak.h3.bounded_resumed_reconnects" {
             compat.sleepNs(50 * std.time.ns_per_ms);
             final_open_fds = try readOpenFdCount(allocator, std.c.getpid());
         }
+        std.debug.print(
+            "{s}: after_settle open_fds re-sampled to {d} (baseline {d})\n",
+            .{ scenario, final_open_fds, before_sample.open_fds },
+        );
     }
     try testing.expect(final_open_fds <= before_sample.open_fds);
+
+    // RSS-slope and connection/CID-state plateau, same shape and margins as
+    // the primary soak.
+    try monitor.checkGrowthAndPlateau(before_sample, end_workload_sample, 8192, resumption_worker_count * 4);
+
+    // Bounded resumption-cache occupancy (PR review P1): resumption cache
+    // entries are *expected* to retain a high-water mark rather than return
+    // to zero -- unlike connection/CID state above, this is state the
+    // primary soak never exercises at all, and `server_resumption`/
+    // `client_resumption` are intentionally still alive when
+    // `after_settle_sample` was taken. Unlike connection/CID state, an empty
+    // cache filling steadily toward capacity over the *entire* run (nothing
+    // to evict, so nothing plateaus, until capacity is actually reached) is
+    // expected, correct behavior -- so the meaningful "bounded, not
+    // unbounded" proof is a hard ceiling against the cache's own configured
+    // per-origin capacity, not a first-half/second-half plateau margin.
+    const client_cache_limit = tls_core.session_cache.Limits.client_default.max_entries_per_origin;
+    const server_cache_limit = tls_core.session_cache.Limits.stateful_server_default.max_entries_per_origin;
+    if (cache_high_water.client_entries > client_cache_limit or cache_high_water.server_entries > server_cache_limit) {
+        std.debug.print(
+            "{s}: resumption-cache occupancy exceeded configured capacity -- " ++
+                "client={d} (limit {d}) server={d} (limit {d})\n",
+            .{ scenario, cache_high_water.client_entries, client_cache_limit, cache_high_water.server_entries, server_cache_limit },
+        );
+        return error.PossibleResumptionCacheGrowth;
+    }
+
+    // Distinct from connection/CID state, which correctly drains to zero
+    // above: the whole point of the cache is that it keeps entries after
+    // the connections that populated it have closed and settled, ready for
+    // a future reconnect this test does not itself make.
+    const client_entries_after_settle = client_resumption.client_cache.?.count();
+    const server_entries_after_settle = server_resumption.server_cache.?.count();
+    try testing.expect(client_entries_after_settle > 0);
+    try testing.expect(server_entries_after_settle > 0);
+    std.debug.print(
+        "{s}: after_settle resumption cache occupancy client={d} server={d} (client_limit={d} server_limit={d})\n",
+        .{ scenario, client_entries_after_settle, server_entries_after_settle, client_cache_limit, server_cache_limit },
+    );
 }

@@ -182,6 +182,13 @@ connection/CID observation rows, above. It deliberately does **not** cover:
 - **controlled loss/reordering** -- needs a dedicated host with netem/
   `CAP_NET_ADMIN` (`benchmarks/competitive/netem-impair.sh`), not a portable
   unit test.
+- **cancellation/reset traffic** -- the harness has no honest way to drive it
+  yet.
+- **QPACK dynamic-table bytes/entries/blocked-streams, PTO totals, and
+  worker/runtime queue depth** -- these are recorded onto `http.metrics.Metrics`
+  only by the `GatewayState` composition layer above `http3_runtime.Runtime`;
+  a bare-`Runtime` harness cannot observe them. Reopen only if `GatewayState`'s
+  own tests reveal a composition-specific gap this harness could close.
 
 ### Implemented: resumption soak (`tests/http3_soak.zig`)
 
@@ -192,7 +199,10 @@ concurrent clients through repeated connect/request/close cycles (4 rounds
 PR-safe, 10 rounds with `TARDIGRADE_SOAK_HEAVY=1`), where every round after
 the first offers the ticket captured from the previous round instead of
 performing a full handshake. It runs by default under `zig build test` /
-`zig build test-quic`, alongside the primary soak above. Its pass condition:
+`zig build test-quic`, alongside the primary soak above. Both soaks share a
+`WorkloadMonitor` helper for the checkpoint sampling, peak computation, and
+runtime-state plateau logic, so the two evidence rows below and above cannot
+silently drift apart. Its pass condition:
 
 - every reconnect (every round past the first) actually resumed, proven two
   independent ways: client-side, `psk_authenticated` is set from
@@ -205,20 +215,25 @@ performing a full handshake. It runs by default under `zig build test` /
   exercise -- records exactly one `.accepted` outcome per resumed round, and
   zero `.miss`/`.incompatible`/`.fatal`/`.full_handshake` outcomes
 - every planned request completed
-- the same bounded settle/FD checks as the primary soak, folded into this leg
-  rather than proving resumption only in isolation
+- the same RSS-slope, genuine-peak, and connection/CID-state plateau checks
+  as the primary soak above (same `WorkloadMonitor`, same margins scaled to
+  this leg's smaller two-worker workload), plus the same exact-zero
+  connection/CID settle and FD-baseline checks
+- resumption-cache occupancy (`server_resumption`'s and `client_resumption`'s
+  ticket caches, both intentionally still alive when the after-settle sample
+  is taken -- this is state the primary soak above never exercises at all)
+  never exceeds the cache's own configured per-origin capacity, and is
+  non-zero after settle -- proving retention actually happened, the opposite
+  contract from connection/CID state, which correctly drains to zero. Unlike
+  connection/CID state, this is a hard capacity ceiling rather than a
+  first-half/second-half plateau margin: an empty cache filling steadily
+  toward capacity over the *entire* run, with nothing to evict until that
+  capacity is reached, is expected, correct behavior
 
 This closes the "reconnect/resumption where the production config supports
-it" workload row above. 0-RTT is not covered by this leg; it would need its
-own early-data-specific admission assertions and is not required by this
-row's "reconnect/resumption" text.
-- **cancellation/reset traffic** -- the harness has no honest way to drive it
-  yet.
-- **QPACK dynamic-table bytes/entries/blocked-streams, PTO totals, and
-  worker/runtime queue depth** -- these are recorded onto `http.metrics.Metrics`
-  only by the `GatewayState` composition layer above `http3_runtime.Runtime`;
-  a bare-`Runtime` harness cannot observe them. Reopen only if `GatewayState`'s
-  own tests reveal a composition-specific gap this harness could close.
+it" workload row above. It deliberately does **not** cover 0-RTT: that would
+need its own early-data-specific admission assertions and is not required by
+this row's "reconnect/resumption" text.
 
 ## Final Evidence Bundle
 
