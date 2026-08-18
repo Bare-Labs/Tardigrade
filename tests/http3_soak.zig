@@ -549,7 +549,26 @@ test "soak.h3.bounded_repeated_connections" {
     // Open file descriptors are entirely test-harness-owned here (one UDP
     // socket per worker plus the runtime's own listener socket, all closed
     // by this point) -- after-settle must not exceed the pre-soak baseline.
-    try testing.expect(after_settle_sample.open_fds <= before_sample.open_fds);
+    // The measurement itself shells out to `find`/`lsof` per sample (see
+    // `readOpenFdCount`), and that child's own pipe fds can still be mid-
+    // teardown in this process's fd table for a few milliseconds after
+    // `bounded_process.run` returns -- observed as a transient +1 on some
+    // CI runners. Give that the same kind of bounded settle window already
+    // used for runtime connection state above rather than failing on a
+    // single noisy sample.
+    var final_open_fds = after_settle_sample.open_fds;
+    if (final_open_fds > before_sample.open_fds) {
+        const fd_deadline = nowUs() + 2_000_000;
+        while (final_open_fds > before_sample.open_fds and nowUs() < fd_deadline) {
+            compat.sleepNs(50 * std.time.ns_per_ms);
+            final_open_fds = try readOpenFdCount(allocator, std.c.getpid());
+        }
+        std.debug.print(
+            "soak.h3.bounded_repeated_connections: after_settle open_fds re-sampled to {d} (baseline {d})\n",
+            .{ final_open_fds, before_sample.open_fds },
+        );
+    }
+    try testing.expect(final_open_fds <= before_sample.open_fds);
 
     // Resident memory: a monotonic leak grows roughly linearly with
     // iteration count, so it shows up as second-half growth comparable to
