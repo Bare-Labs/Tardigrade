@@ -631,9 +631,20 @@ pub const StreamManager = struct {
         self.maybeClose(stream);
     }
 
-    pub fn sendResetStream(self: *StreamManager, id: StreamId, app_error_code: u64) !ResetStreamFrame {
+    /// `null` means "already in Reset Sent, nothing new to do" -- both
+    /// explicit local resets (`Connection.resetStream`) and the RFC 9000
+    /// §3.5 automatic reset a received STOP_SENDING triggers share this one
+    /// idempotent transition. QUIC retransmits a STOP_SENDING whose ACK was
+    /// lost in a new packet, so a caller seeing the same logical reset
+    /// request twice is not hypothetical; §3.5 only requires the automatic
+    /// RESET_STREAM while the stream is Ready/Send, not a second one once
+    /// it is already Reset Sent. Callers must treat `null` as success/no-op
+    /// -- never queue another frame, re-emit a local reset transition, or
+    /// re-increment `reset_streams` for it.
+    pub fn sendResetStream(self: *StreamManager, id: StreamId, app_error_code: u64) !?ResetStreamFrame {
         const stream = self.streams.get(id) orelse return error.UnknownStream;
         if (!stream.canSend()) return error.RecvOnlyStream;
+        if (stream.reset_sent) return null;
         stream.reset_sent = true;
         stream.send_closed = true;
         stream.app_error_code = app_error_code;
@@ -1014,6 +1025,34 @@ test "stream reset in both directions while connection stays alive counts closed
     try manager.receiveResetStream(.{ .id = id, .app_error_code = 42, .final_size = 3 });
     try std.testing.expectEqual(@as(u64, 0), manager.metrics.active_streams);
     try std.testing.expectEqual(@as(u64, 1), manager.metrics.closed_streams);
+}
+
+test "sendResetStream is idempotent once already Reset Sent" {
+    // QUIC retransmits a STOP_SENDING whose ACK was lost in a new packet,
+    // so `Connection`'s RFC 9000 SS3.5 automatic-reset handler can call
+    // `sendResetStream` for the same stream more than once. The first call
+    // must behave exactly as before; every call after that must be a
+    // pure no-op (`null`, no new frame, no metric/state mutation) rather
+    // than re-queuing another RESET_STREAM for a stream already in Reset
+    // Sent.
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = "abc" });
+
+    const first = try manager.sendResetStream(id, 7);
+    try std.testing.expect(first != null);
+    try std.testing.expectEqual(@as(u64, 7), first.?.app_error_code);
+    try std.testing.expectEqual(@as(u64, 1), manager.metrics.reset_streams);
+    try std.testing.expectEqual(StreamState.reset_sent, manager.get(id).?.state());
+
+    // A retransmitted STOP_SENDING driving the same automatic reset again:
+    // no second frame, no second metric increment.
+    const second = try manager.sendResetStream(id, 7);
+    try std.testing.expect(second == null);
+    try std.testing.expectEqual(@as(u64, 1), manager.metrics.reset_streams);
+    try std.testing.expectEqual(StreamState.reset_sent, manager.get(id).?.state());
 }
 
 test "reset final size consumes remaining connection credit" {

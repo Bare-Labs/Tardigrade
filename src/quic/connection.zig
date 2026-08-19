@@ -2290,9 +2290,15 @@ pub const Connection = struct {
                     return;
                 };
                 self.events.emit(.{ .stop_sending = .{ .id = ss.id, .error_code = ss.app_error_code, .local = false } });
-                // RFC 9000 §3.5: a STOP_SENDING peer expects RESET_STREAM.
+                // RFC 9000 §3.5: a STOP_SENDING peer expects RESET_STREAM,
+                // but only once -- a retransmitted STOP_SENDING (its ACK
+                // was lost, so the peer resent it) finds the stream already
+                // Reset Sent, and `sendResetStream` returns `null` rather
+                // than queuing a second RESET_STREAM. `catch null` also
+                // preserves this handler's original silent-on-error
+                // behavior (e.g. `error.RecvOnlyStream`).
                 const old = if (manager.get(ss.id)) |stream| stream.state() else null;
-                if (manager.sendResetStream(ss.id, ss.app_error_code)) |reset| {
+                if (manager.sendResetStream(ss.id, ss.app_error_code) catch null) |reset| {
                     try self.pending_resets.append(self.allocator, reset);
                     self.forgetLocalStreamFlowBlocked(ss.id);
                     self.events.emit(.{ .stream_reset = .{ .id = ss.id, .error_code = ss.app_error_code, .local = true } });
@@ -2300,7 +2306,7 @@ pub const Connection = struct {
                         if (manager.get(ss.id)) |stream| self.emitStreamStateTransition(ss.id, old_state, stream.state(), .remote);
                     }
                     if (self.send_queues.get(ss.id)) |queue| queue.reset_sent = true;
-                } else |_| {}
+                }
             },
             .max_data => |limit| {
                 if (self.streamManager()) |manager| {
@@ -3907,7 +3913,9 @@ pub const Connection = struct {
     pub fn resetStream(self: *Connection, id: StreamId, app_error_code: u64) !void {
         var manager = self.streamManager() orelse return error.NotEstablished;
         const old = if (manager.get(id)) |stream| stream.state() else return error.UnknownStream;
-        const reset = try manager.sendResetStream(id, app_error_code);
+        // `null` means this stream is already Reset Sent (e.g. a caller
+        // resetting the same stream twice); nothing new to queue or emit.
+        const reset = (try manager.sendResetStream(id, app_error_code)) orelse return;
         try self.pending_resets.append(self.allocator, reset);
         self.forgetLocalStreamFlowBlocked(id);
         self.events.emit(.{ .stream_reset = .{ .id = id, .error_code = app_error_code, .local = true } });
@@ -6934,6 +6942,63 @@ test "driver: valid peer STOP_SENDING emits the automatic local RESET_STREAM onc
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us + 1_000);
     try testing.expectEqual(@as(usize, 1), capture.remote_stop_sending);
     try testing.expectEqual(@as(usize, 1), capture.local_reset);
+}
+
+test "driver: duplicate peer STOP_SENDING does not re-emit the automatic local RESET_STREAM" {
+    // #247 soak finding: QUIC retransmits a STOP_SENDING whose ACK was
+    // lost in a new packet, so the same logical STOP_SENDING can reach
+    // `applyFrame` twice (each in its own packet, so packet-number dedup
+    // does not catch it -- this is exactly that shape, injected at the
+    // frame layer the same way a second, later packet's frame would be).
+    // The first must drive the RFC 9000 SS3.5 automatic local RESET_STREAM
+    // exactly as the single-delivery test above proves; the second must be
+    // a pure no-op: no second `stream_reset` event, no second queued
+    // RESET_STREAM frame to transmit, no second `stream_resets` metric
+    // increment.
+    const Capture = struct {
+        remote_stop_sending: usize = 0,
+        local_reset: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .stop_sending => |stop| {
+                    if (!stop.local) self.remote_stop_sending += 1;
+                },
+                .stream_reset => |reset| {
+                    if (reset.local) self.local_reset += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id = try pair.server.openStream(.bidi);
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+
+    try pair.server.applyFrame(.application, .{ .stop_sending = .{ .id = id, .app_error_code = 7 } }, TestPair.server_path, 0, pair.now_us);
+    try testing.expectEqual(@as(usize, 1), capture.remote_stop_sending);
+    try testing.expectEqual(@as(usize, 1), capture.local_reset);
+    const reset_streams_after_first = pair.server.streams.?.metrics.reset_streams;
+
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+
+    // The retransmitted duplicate: `applyFrame` operates below QUIC's own
+    // packet-number dedup, directly exercising the frame handler's own
+    // idempotency the same way a second packet carrying the identical
+    // retransmitted STOP_SENDING frame would.
+    try pair.server.applyFrame(.application, .{ .stop_sending = .{ .id = id, .app_error_code = 7 } }, TestPair.server_path, 0, pair.now_us + 1_000);
+    try testing.expectEqual(@as(usize, 2), capture.remote_stop_sending);
+    try testing.expectEqual(@as(usize, 1), capture.local_reset);
+    try testing.expectEqual(reset_streams_after_first, pair.server.streams.?.metrics.reset_streams);
+    try testing.expect(pair.server.pollTransmitOnPath(&out, pair.now_us + 1_000) == null);
 }
 
 test "driver: validated ACK reports recovery metrics after PTO backoff reset" {
