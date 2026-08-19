@@ -314,11 +314,22 @@ pub const Stream = struct {
         // never decremented `active_streams`/incremented `closed_streams`
         // for it -- an accounting leak for any stream closed via reset in
         // both directions while the connection stays alive.
-        if (self.send_closed and self.recv_closed) return .closed;
+        //
+        // A unidirectional stream has only one real direction --
+        // `canSend()`/`canReceive()` is false for the nonexistent one, and
+        // `send_closed`/`recv_closed` for that side never becomes true
+        // (nothing ever closes a direction that was never open). Treating a
+        // nonexistent direction as still-open left every uni stream
+        // permanently short of `.closed` (stuck at `.half_closed_*` or a
+        // reset state), so `maybeClose` never counted it and MAX_STREAMS_UNI
+        // credit could never replenish (#247 soak finding).
+        const send_done = !self.canSend() or self.send_closed;
+        const recv_done = !self.canReceive() or self.recv_closed;
+        if (send_done and recv_done) return .closed;
         if (self.reset_received) return .reset_received;
         if (self.reset_sent) return .reset_sent;
-        if (self.send_closed) return .half_closed_local;
-        if (self.recv_closed) return .half_closed_remote;
+        if (send_done) return .half_closed_local;
+        if (recv_done) return .half_closed_remote;
         return .open;
     }
 
@@ -466,17 +477,14 @@ pub const StreamManager = struct {
     // opposite (outbound) direction -- see that function's own comment.
     //
     // Deliberate scope boundary: `streams` entries are never removed once
-    // `close_counted`, so this replenishes the *count* ceiling without
-    // reclaiming the (small, bounded per request/response in the H3 case)
-    // memory each closed `Stream` still holds -- a genuinely unbounded
-    // connection lifetime would eventually accumulate that. Reclaiming
-    // closed-stream storage safely requires auditing every caller that
-    // reads a `*Stream`/`streamState()` result after the operation that
-    // closed it (a real, currently pervasive pattern -- e.g. tests that
-    // assert `.closed` immediately after the closing call); attempting
-    // removal here without that audit produced exactly that class of
-    // use-after-free during development of this fix. Tracked as follow-up
-    // work rather than shipped half-verified.
+    // `close_counted`, so replenishment is capped at
+    // `config.max_retained_closed_streams_per_direction` per direction (see
+    // that constant's doc comment for the full reasoning) rather than
+    // granted without bound -- once `closed_peer_X` reaches the cap,
+    // further peer-initiated closes still increment `metrics.closed_streams`
+    // but stop raising `local.initial_max_streams_X`, so `streams` for that
+    // direction cannot grow past a small, fixed, provable ceiling regardless
+    // of connection lifetime.
     closed_peer_bidi: u64 = 0,
     closed_peer_uni: u64 = 0,
     initial_max_streams_bidi_floor: u64 = 0,
@@ -764,24 +772,31 @@ pub const StreamManager = struct {
             // `_floor` fields hold the original, pre-mutation initial
             // value so growth is additive (total lifetime allowance =
             // original + closed), not compounding. `Stream` entries
-            // themselves are never removed from `streams` -- see the note
-            // on the closed-stream-retention tradeoff at the top of this
-            // struct's `_floor` fields' declaration.
+            // themselves are never removed from `streams`, so growth stops
+            // once `closed_peer_{bidi,uni}` reaches
+            // `config.max_retained_closed_streams_per_direction` -- see that
+            // constant's doc comment and the note on the closed-stream-
+            // retention tradeoff at the top of this struct's `_floor`
+            // fields' declaration.
             if (streamInitiator(stream.id) != self.role.initiator()) {
                 switch (streamType(stream.id)) {
                     .bidi => {
-                        self.closed_peer_bidi +|= 1;
-                        self.local.initial_max_streams_bidi = @min(
-                            config.max_initial_streams_transport_parameter,
-                            self.closed_peer_bidi +| self.initial_max_streams_bidi_floor,
-                        );
+                        if (self.closed_peer_bidi < config.max_retained_closed_streams_per_direction) {
+                            self.closed_peer_bidi +|= 1;
+                            self.local.initial_max_streams_bidi = @min(
+                                config.max_initial_streams_transport_parameter,
+                                self.closed_peer_bidi +| self.initial_max_streams_bidi_floor,
+                            );
+                        }
                     },
                     .uni => {
-                        self.closed_peer_uni +|= 1;
-                        self.local.initial_max_streams_uni = @min(
-                            config.max_initial_streams_transport_parameter,
-                            self.closed_peer_uni +| self.initial_max_streams_uni_floor,
-                        );
+                        if (self.closed_peer_uni < config.max_retained_closed_streams_per_direction) {
+                            self.closed_peer_uni +|= 1;
+                            self.local.initial_max_streams_uni = @min(
+                                config.max_initial_streams_transport_parameter,
+                                self.closed_peer_uni +| self.initial_max_streams_uni_floor,
+                            );
+                        }
                     },
                 }
             }
@@ -1121,6 +1136,48 @@ test "sendResetStream is idempotent once already Reset Sent" {
     try std.testing.expect(second == null);
     try std.testing.expectEqual(@as(u64, 1), manager.metrics.reset_streams);
     try std.testing.expectEqual(StreamState.reset_sent, manager.get(id).?.state());
+}
+
+test "MAX_STREAMS replenishment credit stops growing once the retained-stream cap is reached" {
+    // #247 soak finding (review round 7): closed `Stream` objects are never
+    // removed from `streams`, so replenishing credit without any bound
+    // would turn the old functional lifetime cap into unbounded
+    // per-connection memory growth. `closed_peer_bidi` -- and therefore
+    // `local.initial_max_streams_bidi` -- stops advancing once it reaches
+    // `config.max_retained_closed_streams_per_direction`, even though
+    // `metrics.closed_streams` keeps counting every close. Seeded one below
+    // the cap directly (the cap is large by design) rather than driving
+    // real cycles up to it -- this only needs to prove the boundary.
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+    manager.closed_peer_bidi = config.max_retained_closed_streams_per_direction - 1;
+    const floor = manager.initial_max_streams_bidi_floor;
+
+    const at_cap_id = try makeStreamId(.client, .bidi, 0);
+    _ = try manager.receiveStreamFrame(.{ .id = at_cap_id, .offset = 0, .data = "x" });
+    try manager.receiveResetStream(.{ .id = at_cap_id, .app_error_code = 1, .final_size = 1 });
+    _ = try manager.sendResetStream(at_cap_id, 1);
+    try std.testing.expectEqual(StreamState.closed, manager.get(at_cap_id).?.state());
+    try std.testing.expectEqual(config.max_retained_closed_streams_per_direction, manager.closed_peer_bidi);
+    try std.testing.expectEqual(
+        config.max_retained_closed_streams_per_direction + floor,
+        manager.local.initial_max_streams_bidi,
+    );
+
+    const over_cap_id = try makeStreamId(.client, .bidi, 1);
+    _ = try manager.receiveStreamFrame(.{ .id = over_cap_id, .offset = 0, .data = "x" });
+    try manager.receiveResetStream(.{ .id = over_cap_id, .app_error_code = 1, .final_size = 1 });
+    _ = try manager.sendResetStream(over_cap_id, 1);
+    try std.testing.expectEqual(StreamState.closed, manager.get(over_cap_id).?.state());
+
+    // Capped: this second close still counted in metrics, but did not push
+    // `closed_peer_bidi` (or the resulting credit) past the cap.
+    try std.testing.expectEqual(config.max_retained_closed_streams_per_direction, manager.closed_peer_bidi);
+    try std.testing.expectEqual(
+        config.max_retained_closed_streams_per_direction + floor,
+        manager.local.initial_max_streams_bidi,
+    );
+    try std.testing.expectEqual(@as(u64, 2), manager.metrics.closed_streams);
 }
 
 test "reset final size consumes remaining connection credit" {

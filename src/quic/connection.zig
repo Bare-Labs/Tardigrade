@@ -2300,28 +2300,33 @@ pub const Connection = struct {
             },
             .stop_sending => |ss| {
                 var manager = self.streamManager() orelse return;
+                // RFC 9000 §3.5: a STOP_SENDING peer expects RESET_STREAM,
+                // but only once -- a retransmitted STOP_SENDING (its ACK
+                // was lost, so the peer resent it) finds the stream already
+                // Reset Sent and this is a no-op. The queue slot must be
+                // reserved *before* logically accepting the STOP_SENDING at
+                // all (`receiveStopSending`/`sendResetStream` both commit
+                // state with no way to undo it): committing first and only
+                // then discovering the reservation can't allocate would
+                // strand the stream permanently claiming "already reset"
+                // with no RESET_STREAM ever queued for the peer. Just as
+                // important: `try` here propagates OOM out of `applyFrame`
+                // (whose error set is exactly `error{OutOfMemory}`) instead
+                // of swallowing it, so `ingest`'s `try self.applyFrame(...)`
+                // aborts before marking this packet's space `ack_needed`.
+                // A `catch return` here would report success and let this
+                // ack-eliciting packet get ACKed anyway, leaving the peer
+                // with no reason to ever retransmit the STOP_SENDING whose
+                // required response never got queued.
+                const needs_reset = if (manager.get(ss.id)) |stream| stream.canSend() and !stream.reset_sent else false;
+                if (needs_reset) try self.pending_resets.ensureUnusedCapacity(self.allocator, 1);
                 manager.receiveStopSending(ss) catch |err| {
                     self.closeOnStreamError(err, now_us);
                     return;
                 };
                 self.events.emit(.{ .stop_sending = .{ .id = ss.id, .error_code = ss.app_error_code, .local = false } });
-                // RFC 9000 §3.5: a STOP_SENDING peer expects RESET_STREAM,
-                // but only once -- a retransmitted STOP_SENDING (its ACK
-                // was lost, so the peer resent it) finds the stream already
-                // Reset Sent and this is a no-op. The queue slot for the
-                // frame must be reserved *before* the stream manager
-                // commits to Reset Sent: if capacity reservation fails,
-                // `sendResetStream` (and the state mutation it performs) is
-                // never called at all, so the stream stays retryable --
-                // committing first and only then discovering the append
-                // can't allocate would strand the stream permanently
-                // claiming "already reset" with no RESET_STREAM ever
-                // queued for the peer, and (since a retransmitted
-                // STOP_SENDING now correctly no-ops against `reset_sent`)
-                // no path left to recover it.
+                if (!needs_reset) return;
                 const stream = manager.get(ss.id) orelse return;
-                if (stream.reset_sent) return;
-                self.pending_resets.ensureUnusedCapacity(self.allocator, 1) catch return;
                 const old = stream.state();
                 const reset = (manager.sendResetStream(ss.id, ss.app_error_code) catch return) orelse return;
                 self.pending_resets.appendAssumeCapacity(reset);
@@ -6448,6 +6453,49 @@ test "driver: MAX_STREAMS replenishment lets a peer keep opening streams past th
     try testing.expectEqual(@as(?StreamId, fourth), pair.server.acceptStream());
 }
 
+test "driver: MAX_STREAMS_UNI replenishment fires when a uni stream's only real direction closes" {
+    // #247 soak finding: a unidirectional stream has only one real
+    // direction -- `canSend()`/`canReceive()` is false for the other one,
+    // which never becomes `send_closed`/`recv_closed` because nothing ever
+    // closes a direction that was never open. Before `Stream.state()`
+    // treated a nonexistent direction as trivially done, a closed
+    // peer-initiated uni stream never reported aggregate `.closed`, so
+    // `StreamManager.maybeClose` never counted it and MAX_STREAMS_UNI could
+    // never replenish. Deliberately tiny limit so one stream exhausts it.
+    const allocator = testing.allocator;
+    var pair = try TestPair.initWithConfigs(allocator, .{}, .{ .initial_max_streams_uni = 1 });
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var buf: [64]u8 = undefined;
+
+    const first = try pair.client.openStream(.uni);
+    try testing.expectError(error.StreamLimitExceeded, pair.client.openStream(.uni));
+
+    _ = try pair.client.writeStream(first, "hello", true);
+    try pair.pump();
+
+    const accepted = pair.server.acceptStream() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(first, accepted);
+    const received = try pair.server.readStream(accepted, &buf);
+    try testing.expectEqualStrings("hello", buf[0..received.len]);
+    try testing.expect(received.fin);
+    try pair.pump();
+
+    try testing.expectEqual(quic_stream.StreamState.closed, pair.client.streamState(first).?);
+    try testing.expectEqual(quic_stream.StreamState.closed, pair.server.streamState(first).?);
+
+    const server_manager = pair.server.streamManager().?;
+    try testing.expect(server_manager.local.initial_max_streams_uni > 1);
+
+    // Credit reached the client over the wire: it can open a second uni
+    // stream on the same connection without ever reconnecting.
+    const second = try pair.client.openStream(.uni);
+    _ = try pair.client.writeStream(second, "again", true);
+    try pair.pump();
+    try testing.expectEqual(@as(?StreamId, second), pair.server.acceptStream());
+}
+
 test "driver: stream scheduling hint sends lower urgency first" {
     const allocator = testing.allocator;
     var pair = try TestPair.init(allocator);
@@ -7190,13 +7238,18 @@ test "resetStream reservation failure leaves the stream retryable, not stranded"
     try testing.expectEqual(@as(u64, 1), manager.metrics.reset_streams);
 }
 
-test "STOP_SENDING automatic-reset reservation failure leaves the stream retryable" {
+test "STOP_SENDING automatic-reset reservation failure leaves the stream retryable and is never ACKed" {
     // Same transactional requirement as the explicit `resetStream` test
     // above, but for the RFC 9000 SS3.5 automatic reset a received
-    // STOP_SENDING triggers: a failed queue reservation must not commit
-    // `reset_sent`, so the next delivery of the same (retransmitted)
-    // STOP_SENDING can still complete the automatic reset instead of
-    // finding it falsely already-done.
+    // STOP_SENDING triggers -- with a sharper wire-safety requirement:
+    // reservation now happens *before* the STOP is logically accepted
+    // (`receiveStopSending`), so a failed reservation must propagate as
+    // `error.OutOfMemory` out of `applyFrame` rather than being swallowed.
+    // `ingest`'s `try self.applyFrame(...)` means that propagation aborts
+    // processing before this packet's space is marked `ack_needed` -- a
+    // real peer whose STOP_SENDING triggered this failure never receives an
+    // ACK for it and therefore has a reason to retransmit. Nothing about
+    // the stream may be committed on the failed attempt either.
     const allocator = testing.allocator;
     var pair = try TestPair.init(allocator);
     defer pair.deinit(allocator);
@@ -7207,10 +7260,14 @@ test "STOP_SENDING automatic-reset reservation failure leaves the stream retryab
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     const real_allocator = pair.server.allocator;
     pair.server.allocator = failing.allocator();
-    try pair.server.applyFrame(.application, .{ .stop_sending = .{ .id = id, .app_error_code = 7 } }, TestPair.server_path, 0, pair.now_us);
+    try testing.expectError(
+        error.OutOfMemory,
+        pair.server.applyFrame(.application, .{ .stop_sending = .{ .id = id, .app_error_code = 7 } }, TestPair.server_path, 0, pair.now_us),
+    );
     pair.server.allocator = real_allocator;
 
     const manager = pair.server.streamManager().?;
+    try testing.expect(!manager.get(id).?.stop_sending_received);
     try testing.expect(!manager.get(id).?.reset_sent);
     try testing.expectEqual(@as(usize, 0), pair.server.pending_resets.items.len);
     try testing.expectEqual(@as(u64, 0), manager.metrics.reset_streams);
@@ -7218,6 +7275,7 @@ test "STOP_SENDING automatic-reset reservation failure leaves the stream retryab
     // The retransmitted STOP_SENDING, now with a working allocator:
     // completes the automatic reset exactly once.
     try pair.server.applyFrame(.application, .{ .stop_sending = .{ .id = id, .app_error_code = 7 } }, TestPair.server_path, 0, pair.now_us + 1_000);
+    try testing.expect(manager.get(id).?.stop_sending_received);
     try testing.expect(manager.get(id).?.reset_sent);
     try testing.expectEqual(@as(usize, 1), pair.server.pending_resets.items.len);
     try testing.expectEqual(@as(u64, 1), manager.metrics.reset_streams);
