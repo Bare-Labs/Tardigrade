@@ -403,6 +403,7 @@ const WorkloadMonitor = struct {
         rss_margin_kb: u64,
         high_water_margin: usize,
     ) !void {
+        const q1 = self.checkpoints[0].sample orelse return error.MissingEarlySample;
         const mid = self.checkpoints[1].sample orelse return error.MissingMidSample;
         const q3 = self.checkpoints[2].sample orelse return error.MissingLateSample;
 
@@ -418,9 +419,18 @@ const WorkloadMonitor = struct {
         overall_peak_rss_kb = @max(overall_peak_rss_kb, end_workload.rss_kb);
         const second_half_peak_rss_kb = @max(mid.rss_kb, @max(q3.rss_kb, end_workload.rss_kb));
 
+        // Bound late-workload growth itself by the fixed tolerance (PR
+        // review P1), not growth *relative to* first-half growth: the
+        // latter only ever detects *accelerating* growth (a perfectly
+        // linear leak -- e.g. 10 MiB -> 20 MiB -> 30 MiB -- has equal
+        // first- and second-half growth and would pass no matter how far
+        // it climbs). #247 requires retained high-water state to plateau
+        // inside a fixed bound past the midpoint, which this now checks
+        // directly. `first_half_growth_kb` is retained only as printed
+        // diagnostic context, not part of the pass condition.
         const first_half_growth_kb = mid.rss_kb -| before.rss_kb;
         const second_half_growth_kb = second_half_peak_rss_kb -| mid.rss_kb;
-        if (second_half_growth_kb > first_half_growth_kb + rss_margin_kb) {
+        if (second_half_growth_kb > rss_margin_kb) {
             std.debug.print(
                 "{s}: possible monotonic RSS growth -- before={d}KB mid={d}KB overall_peak={d}KB " ++
                     "second_half_peak={d}KB (first_half={d}KB second_half={d}KB margin={d}KB)\n",
@@ -436,6 +446,26 @@ const WorkloadMonitor = struct {
                 },
             );
             return error.PossibleMonotonicRssGrowth;
+        }
+
+        // Same fixed-bound reasoning for open file descriptors (PR review
+        // P1): the only FD assertion used to be the after-settle baseline,
+        // so a bug retaining one fd/socket per unit of work while traffic
+        // is active and releasing everything only once connections close
+        // would pass undetected. `fd_margin` is deliberately small and
+        // fixed -- unlike RSS, fd counts here are small integers with a
+        // narrow, already-documented noise band (a transient +/-1 or 2 from
+        // the probe subprocess's own pipe teardown timing, not the soak's
+        // own state; see the after-settle retry loop below).
+        const first_half_fd_peak = @max(before.open_fds, @max(q1.open_fds, mid.open_fds));
+        const second_half_fd_peak = @max(mid.open_fds, @max(q3.open_fds, end_workload.open_fds));
+        const fd_margin: u64 = 3;
+        if (second_half_fd_peak > first_half_fd_peak + fd_margin) {
+            std.debug.print(
+                "{s}: possible open-fd growth -- first_half_peak={d} second_half_peak={d} (margin={d})\n",
+                .{ self.scenario, first_half_fd_peak, second_half_fd_peak, fd_margin },
+            );
+            return error.PossibleFdGrowth;
         }
 
         // `active_cid_routes` gets double the margin: every observed sample
@@ -1656,7 +1686,16 @@ test "soak.h3.bounded_cancelled_requests" {
     defer runtime.deinit();
     runtime.start();
 
-    const cycles_per_worker: usize = if (soakHeavyEnabled()) 10 else 4;
+    // Heavy tier deliberately exceeds the native transport's default
+    // `initial_max_streams_bidi = 100` (60 cycles * 2 streams/cycle = 120
+    // request streams on each persistent connection): this leg's whole
+    // point is a *persistent* connection surviving many cancel cycles, so
+    // it is the natural place to prove `StreamManager.maybeClose`'s
+    // RFC 9000 SS4.6 MAX_STREAMS replenishment holds up under a real soak
+    // rather than only the deterministic single-connection unit regression
+    // in `connection.zig`. Without replenishment this would fail outright
+    // once the 51st cycle tried to open its 101st stream.
+    const cycles_per_worker: usize = if (soakHeavyEnabled()) 60 else 4;
     const total_work = reset_worker_count * cycles_per_worker;
 
     const scenario = "soak.h3.bounded_cancelled_requests";

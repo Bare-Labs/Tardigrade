@@ -449,6 +449,38 @@ pub const StreamManager = struct {
     max_data_send: u64,
     max_data_recv: u64,
     metrics: Metrics = .{},
+    // RFC 9000 §4.6 MAX_STREAMS replenishment (#247 soak finding): without
+    // this, a long-lived connection whose peer opens and fully closes many
+    // streams (e.g. a persistent HTTP/3 connection serving many requests)
+    // would permanently exhaust `local.initial_max_streams_{bidi,uni}` and
+    // could never accept stream N+1 even though every earlier stream is
+    // long closed. `closed_peer_{bidi,uni}` counts peer-initiated streams
+    // that have reached `.closed` (both directions terminal); `maybeClose`
+    // grants one more unit of credit per closed stream by raising
+    // `local.initial_max_streams_{bidi,uni}` in place to
+    // `closed_peer_X + initial_max_streams_X_floor` -- the *floor* fields
+    // below hold the original, pre-mutation initial value so growth is
+    // additive (total lifetime allowance = original + closed), not
+    // compounding. This exactly mirrors `applyMaxStreams`'s identical
+    // in-place mutation of `peer.initial_max_streams_{bidi,uni}` for the
+    // opposite (outbound) direction -- see that function's own comment.
+    //
+    // Deliberate scope boundary: `streams` entries are never removed once
+    // `close_counted`, so this replenishes the *count* ceiling without
+    // reclaiming the (small, bounded per request/response in the H3 case)
+    // memory each closed `Stream` still holds -- a genuinely unbounded
+    // connection lifetime would eventually accumulate that. Reclaiming
+    // closed-stream storage safely requires auditing every caller that
+    // reads a `*Stream`/`streamState()` result after the operation that
+    // closed it (a real, currently pervasive pattern -- e.g. tests that
+    // assert `.closed` immediately after the closing call); attempting
+    // removal here without that audit produced exactly that class of
+    // use-after-free during development of this fix. Tracked as follow-up
+    // work rather than shipped half-verified.
+    closed_peer_bidi: u64 = 0,
+    closed_peer_uni: u64 = 0,
+    initial_max_streams_bidi_floor: u64 = 0,
+    initial_max_streams_uni_floor: u64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -464,6 +496,8 @@ pub const StreamManager = struct {
             .streams = std.AutoHashMap(StreamId, *Stream).init(allocator),
             .max_data_send = peer.initial_max_data,
             .max_data_recv = local.initial_max_data,
+            .initial_max_streams_bidi_floor = local.initial_max_streams_bidi,
+            .initial_max_streams_uni_floor = local.initial_max_streams_uni,
         };
     }
 
@@ -649,8 +683,12 @@ pub const StreamManager = struct {
         stream.send_closed = true;
         stream.app_error_code = app_error_code;
         self.metrics.reset_streams += 1;
+        // Captured before `maybeClose`: `stream` is never freed by anything
+        // in this file today, but reading it only via values captured
+        // beforehand costs nothing and stays correct if that ever changes.
+        const final_size = stream.send_offset;
         self.maybeClose(stream);
-        return .{ .id = id, .app_error_code = app_error_code, .final_size = stream.send_offset };
+        return .{ .id = id, .app_error_code = app_error_code, .final_size = final_size };
     }
 
     pub fn receiveStopSending(self: *StreamManager, frame: StopSendingFrame) !void {
@@ -717,6 +755,36 @@ pub const StreamManager = struct {
             stream.close_counted = true;
             if (self.metrics.active_streams > 0) self.metrics.active_streams -= 1;
             self.metrics.closed_streams += 1;
+            // RFC 9000 §4.6 MAX_STREAMS replenishment (#247 soak finding):
+            // grant one more unit of credit per closed peer-initiated
+            // stream by raising `local.initial_max_streams_{bidi,uni}` in
+            // place -- mirroring `applyMaxStreams`'s identical mutation of
+            // `peer.initial_max_streams_{bidi,uni}` for the opposite
+            // (outbound) direction, see that function's comment. The
+            // `_floor` fields hold the original, pre-mutation initial
+            // value so growth is additive (total lifetime allowance =
+            // original + closed), not compounding. `Stream` entries
+            // themselves are never removed from `streams` -- see the note
+            // on the closed-stream-retention tradeoff at the top of this
+            // struct's `_floor` fields' declaration.
+            if (streamInitiator(stream.id) != self.role.initiator()) {
+                switch (streamType(stream.id)) {
+                    .bidi => {
+                        self.closed_peer_bidi +|= 1;
+                        self.local.initial_max_streams_bidi = @min(
+                            config.max_initial_streams_transport_parameter,
+                            self.closed_peer_bidi +| self.initial_max_streams_bidi_floor,
+                        );
+                    },
+                    .uni => {
+                        self.closed_peer_uni +|= 1;
+                        self.local.initial_max_streams_uni = @min(
+                            config.max_initial_streams_transport_parameter,
+                            self.closed_peer_uni +| self.initial_max_streams_uni_floor,
+                        );
+                    },
+                }
+            }
         }
     }
 
