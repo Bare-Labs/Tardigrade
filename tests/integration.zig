@@ -4500,6 +4500,63 @@ test "interop.openssl.h2.tls_resume" {
     try std.testing.expect(accepted_after >= accepted_before + 1);
 }
 
+test "proxy.circuit_breaker_opens_fast_fails_and_recovers" {
+    const allocator = std.testing.allocator;
+
+    var upstream = try UpstreamServer.start(allocator, &.{
+        .{ .status_code = 500, .body = "fail-1", .connection_header = "close" },
+        .{ .status_code = 500, .body = "fail-2", .connection_header = "close" },
+        .{ .status_code = 200, .body = "recovered", .connection_header = "close" },
+    });
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /cb {{
+        \\    proxy_pass http://{s}:{d}/cb;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_CB_THRESHOLD", .value = "2" },
+            .{ .name = "TARDIGRADE_CB_TIMEOUT_MS", .value = "250" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    var first = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/cb", .body = null, .headers = &.{} });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u16, 500), first.status_code);
+
+    var second = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/cb", .body = null, .headers = &.{} });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(u16, 500), second.status_code);
+    try waitForUpstreamCount(&upstream, 2, 2_000);
+
+    var open = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/cb", .body = null, .headers = &.{} });
+    defer open.deinit();
+    try std.testing.expectEqual(@as(u16, 503), open.status_code);
+    try assertContains(open.body, "\"code\":\"upstream_circuit_open\"");
+    compat.sleepNs(50 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
+
+    compat.sleepNs(300 * std.time.ns_per_ms);
+    var recovered = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/cb", .body = null, .headers = &.{} });
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u16, 200), recovered.status_code);
+    try assertContains(recovered.body, "recovered");
+    try waitForUpstreamCount(&upstream, 3, 2_000);
+}
+
 test "interop.openssl.h2.proxy_request_translation_is_secret_safe" {
     try requireNativeTlsProfile();
     const allocator = std.testing.allocator;
@@ -6036,12 +6093,13 @@ test "interop.h2.proxy_passive_health_tracking_fails_closed" {
             .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
             .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
             .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
-            // Passive health circuit breaking is opt-in (default 0/off);
+            // Passive health and the process-wide circuit breaker are opt-in;
             // once configured, H1's handleLocationProxyPass wrapper records
-            // failure/success against it around every proxied request. The
-            // direct H2 executor has no equivalent, so it must fail closed
-            // rather than silently never participating.
+            // failure/success and gates every proxied request. The direct H2
+            // executor has no equivalent, so it must fail closed rather than
+            // silently never participating.
             .{ .name = "TARDIGRADE_UPSTREAM_MAX_FAILS", .value = "3" },
+            .{ .name = "TARDIGRADE_CB_THRESHOLD", .value = "3" },
         },
     });
     defer tardigrade.stop();

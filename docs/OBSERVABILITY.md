@@ -399,9 +399,12 @@ Notes on the two pool-style resources called out in the issue:
   least-connections balancer sheds a saturated backend to the least-loaded
   healthy one and returns no candidate when every backend is unhealthy (the
   request is shed deterministically rather than queued without bound); the
-  circuit breaker fast-fails once a backend trips its failure threshold and
-  recovers through a single half-open probe. Both paths have fault-injection
-  coverage in `src/gateway_state.zig`.
+  process-wide circuit breaker fast-fails proxied requests with HTTP `503` and
+  JSON `"code":"upstream_circuit_open"` once upstream failures trip its
+  configured threshold, then recovers through a half-open probe after
+  `TARDIGRADE_CB_TIMEOUT_MS`. The state machine has focused coverage in
+  `src/gateway_state.zig`, and live proxy gating is covered in
+  `src/gateway_proxy_runtime.zig`.
 - **Log / metrics sink slow or unavailable** — access logging is best-effort and
   never blocks the request that emitted it. In buffered mode the buffer flushes
   at its configured threshold and is cleared regardless of the write outcome, so
@@ -445,7 +448,7 @@ regression test in `src/gateway_accept.zig`.
 | `413` / `431` / `414` in access logs | Oversized body, headers, or URI | Confirm the configured request limits match legitimate client traffic before raising them |
 | Tail latency spikes under many idle keepalive clients | Parked-connection backlog or too-long idle timeout | Watch parked `timeouts_total`; tune the idle-park timeout and `max_requests_per_connection` |
 | Gaps in access logs, throughput otherwise normal | Log sink (stderr pipe / syslog) slow or unavailable | Logging is best-effort: dropped lines are counted internally and the request path is never blocked; check the downstream log collector / pipe rather than the gateway |
-| All requests to one backend failing fast with no upstream contact | Circuit breaker open for that backend | Expected protection after repeated upstream failures; confirm the upstream is healthy — the breaker recovers via a half-open probe once `upstream_fail_timeout` elapses |
+| Proxied requests fail fast with `503` / `upstream_circuit_open` and no upstream contact | Circuit breaker open | Expected protection after repeated upstream failures; confirm the upstream is healthy — the breaker recovers via a half-open probe once `TARDIGRADE_CB_TIMEOUT_MS` elapses |
 
 Tuning principle: raise a limit only after confirming the gateway has headroom
 (CPU, memory, fds) to honor it. The limits exist so that exhaustion produces a

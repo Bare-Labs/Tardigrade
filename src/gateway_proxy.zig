@@ -2737,6 +2737,11 @@ pub fn mapControlPlaneProxyExecutionError(err: anyerror) ProxyExecMappedError {
             .code = "upstream_saturated",
             .message = "Upstream connection limit reached",
         },
+        error.CircuitOpen => .{
+            .status = .service_unavailable,
+            .code = "upstream_circuit_open",
+            .message = "Upstream circuit breaker open",
+        },
         else => .{
             .status = .gateway_timeout,
             .code = "upstream_timeout",

@@ -2394,6 +2394,7 @@ pub const GatewayState = struct {
     }
 
     pub fn recordUpstreamFailure(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
+        self.circuitRecordFailure();
         if (cfg.upstream_max_fails == 0) return;
 
         self.upstream_mutex.lock();
@@ -2425,6 +2426,7 @@ pub const GatewayState = struct {
     }
 
     pub fn recordUpstreamSuccess(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
+        self.circuitRecordSuccess();
         if (cfg.upstream_max_fails == 0) return;
 
         self.upstream_mutex.lock();
@@ -3787,6 +3789,23 @@ test "gateway circuit breaker recovers through a half-open probe" {
     try std.testing.expectEqualStrings("half-open", gs.circuitStateName());
     gs.circuitRecordSuccess();
     try std.testing.expectEqualStrings("closed", gs.circuitStateName());
+}
+
+test "gateway upstream outcome accounting drives live circuit breaker" {
+    var gs: GatewayState = undefined;
+    initUpstreamTestState(&gs, std.testing.allocator);
+    defer deinitUpstreamTestState(&gs);
+    gs.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 2, .timeout_ms = 30_000 });
+
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.upstream_max_fails = 0;
+
+    gs.recordUpstreamFailure(&cfg, "http://origin.example");
+    try std.testing.expect(gs.circuitTryAcquire());
+    gs.recordUpstreamFailure(&cfg, "http://origin.example");
+
+    try std.testing.expect(!gs.circuitTryAcquire());
+    try std.testing.expectEqualStrings("open", gs.circuitStateName());
 }
 
 fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {

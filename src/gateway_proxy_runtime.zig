@@ -520,6 +520,11 @@ pub fn handleLocationProxyPass(
         .early_data_retry_semantics
     else switch (streamingEligibilityForDataPlaneProxyRequest(cfg, matched_block, max_attempts)) {
         .stream => {
+            if (!state.circuitTryAcquire()) {
+                try sendApiError(allocator, writer, .service_unavailable, "upstream_circuit_open", "Upstream circuit breaker open", correlation_id, false, state);
+                ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
+                return @intFromEnum(http.Status.service_unavailable);
+            }
             state.recordUpstreamAttemptStart(selection.base_url);
             const proxy_buffer_observer = state.proxyBufferObserver();
             const streamed = executeStreamingHttpProxyRequest(
@@ -632,7 +637,14 @@ pub fn handleLocationProxyPass(
                 "",
                 transcript_redactions,
             );
-            if (!isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"))) {
+            const absolute_proxy_target = isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"));
+            if (absolute_proxy_target) {
+                if (streamed.status_code >= 500 or streamed.upstream_aborted) {
+                    state.circuitRecordFailure();
+                } else if (!streamed.local_capacity_aborted) {
+                    state.circuitRecordSuccess();
+                }
+            } else {
                 // A relay truncated by local buffer capacity is not evidence
                 // about the origin, so it is neither a failure nor a success
                 // for health purposes (#140).
@@ -718,6 +730,11 @@ pub fn handleLocationProxyPass(
             ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
             return @intFromEnum(http.Status.service_unavailable);
         },
+        .circuit_open => {
+            try sendApiError(allocator, writer, .service_unavailable, "upstream_circuit_open", "Upstream circuit breaker open", correlation_id, keep_alive, state);
+            ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
+            return @intFromEnum(http.Status.service_unavailable);
+        },
         .request_cancelled => {
             if (ctx.lifecycle) |lc| lc.logTimeout("upstream_connect");
             try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id, keep_alive, state);
@@ -762,7 +779,13 @@ pub fn handleLocationProxyPass(
         upstream_response.transcriptBody(),
         transcript_redactions,
     );
-    if (!isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"))) {
+    if (isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"))) {
+        if (upstream_response.statusCode() >= 500) {
+            state.circuitRecordFailure();
+        } else if (upstream_response.statusCode() != @intFromEnum(http.Status.too_early)) {
+            state.circuitRecordSuccess();
+        }
+    } else {
         if (upstream_response.statusCode() >= 500) {
             state.recordUpstreamFailure(cfg, selection.base_url);
         } else if (upstream_response.statusCode() != @intFromEnum(http.Status.too_early)) {
@@ -881,6 +904,7 @@ pub const BufferedProxyAttemptsResult = union(enum) {
     response: DataPlaneProxyResponse,
     early_425_retry_parked,
     upstream_at_capacity,
+    circuit_open,
     request_cancelled,
     retry_budget_exhausted,
     terminal_error: anyerror,
@@ -913,6 +937,7 @@ pub fn runBufferedProxyAttempts(
                 try attempt_executor.onStaleConnectionRetry(stale_conn_retries, max_stale_conn_retries);
                 continue;
             }
+            if (err == error.CircuitOpen) return .circuit_open;
             retry_state.recordEarly425RetryResultOnce(attempt_executor, .failure);
             if (err == error.ProxyBudgetExhausted) return .retry_budget_exhausted;
             if (err == error.UpstreamAtCapacity) return .upstream_at_capacity;
@@ -1050,6 +1075,7 @@ const ProductionBufferedProxyAttemptExecutor = struct {
         forward_early_data: bool,
     ) !DataPlaneProxyResponse {
         _ = attempt;
+        if (!self.state.circuitTryAcquire()) return error.CircuitOpen;
         const per_attempt_timeout_ms = try self.perAttemptTimeoutMs();
         self.state.recordUpstreamAttemptStart(self.selection_base_url);
         self.last_attempt_start_ms = http.event_loop.monotonicMs();
@@ -1536,6 +1562,7 @@ fn runEarly425RetryHarness(
         },
         .early_425_retry_parked,
         .upstream_at_capacity,
+        .circuit_open,
         .request_cancelled,
         .retry_budget_exhausted,
         .terminal_error,
@@ -2164,6 +2191,26 @@ test "buffered proxy attempts stop on local retry budget exhaustion before upstr
     const result = try runBufferedProxyAttempts(&ctx, false, "GET", &block, 3, 0, true, &executor);
 
     try std.testing.expectEqual(std.meta.Tag(BufferedProxyAttemptsResult).retry_budget_exhausted, std.meta.activeTag(result));
+    try std.testing.expectEqual(@as(usize, 1), executor.execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), executor.terminal_attempt_errors);
+    try std.testing.expectEqual(@as(usize, 0), executor.configured_error_retries);
+}
+
+test "buffered proxy attempts fail fast when circuit breaker is open" {
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    };
+    var ctx = http.request_context.EarlyDataContext{};
+    var executor = ErrorBufferedAttemptExecutor{ .err = error.CircuitOpen };
+
+    const result = try runBufferedProxyAttempts(&ctx, false, "GET", &block, 3, 0, true, &executor);
+
+    try std.testing.expectEqual(std.meta.Tag(BufferedProxyAttemptsResult).circuit_open, std.meta.activeTag(result));
     try std.testing.expectEqual(@as(usize, 1), executor.execute_calls);
     try std.testing.expectEqual(@as(usize, 0), executor.terminal_attempt_errors);
     try std.testing.expectEqual(@as(usize, 0), executor.configured_error_retries);

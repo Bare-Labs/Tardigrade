@@ -311,6 +311,7 @@ pub fn executeBoundedControlPlaneJsonProxy(
         else
             null;
         defer if (sticky_set_cookie) |cookie| allocator.free(cookie);
+        if (!state.circuitTryAcquire()) return error.CircuitOpen;
         state.recordUpstreamAttemptStart(upstream_base_url);
         const exec = blk: {
             defer state.recordUpstreamAttemptEnd(upstream_base_url);

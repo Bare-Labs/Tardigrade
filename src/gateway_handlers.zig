@@ -1885,6 +1885,7 @@ const Http3BufferedProxyAttemptExecutor = struct {
         forward_early_data: bool,
     ) !gproxy_runtime.DataPlaneProxyResponse {
         _ = attempt;
+        if (!self.state.circuitTryAcquire()) return error.CircuitOpen;
         const per_attempt_timeout_ms = try self.perAttemptTimeoutMs();
         self.state.recordUpstreamAttemptStart(self.selection_base_url);
         self.last_attempt_start_ms = http.event_loop.monotonicMs();
@@ -2102,6 +2103,7 @@ const Http3Early425ProxyContinuation = struct {
         if (self.test_execute_fn) |test_execute| {
             return test_execute(self.test_execute_ctx, self, per_attempt_timeout_ms, forward_early_data);
         }
+        if (!self.state.circuitTryAcquire()) return error.CircuitOpen;
         self.state.recordUpstreamAttemptStart(self.selection_base_url);
         self.last_attempt_start_ms = http.event_loop.monotonicMs();
         const resp = executeBufferedDataPlaneProxyRequest(
@@ -2165,6 +2167,10 @@ const Http3Early425ProxyContinuation = struct {
                     try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", self.correlation_id);
                     return;
                 }
+                if (err == error.CircuitOpen) {
+                    try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .service_unavailable, "upstream_circuit_open", "Upstream circuit breaker open", self.correlation_id);
+                    return;
+                }
                 self.state.recordUpstreamFailure(&self.cfg_snapshot, self.selection_base_url);
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 const err_status: http.Status = switch (err) {
@@ -2187,6 +2193,11 @@ const Http3Early425ProxyContinuation = struct {
                 self.state.metricsRecordEarlyDataRetry(.success);
             }
             try applyHttp3ProxyResponse(allocator, response, self.state, &upstream_response, self.correlation_id);
+            if (upstream_response.statusCode() >= 500) {
+                self.state.recordUpstreamFailure(&self.cfg_snapshot, self.selection_base_url);
+            } else if (upstream_response.statusCode() != @intFromEnum(http.Status.too_early)) {
+                self.state.recordUpstreamSuccess(&self.cfg_snapshot, self.selection_base_url);
+            }
             return;
         }
     }
@@ -2246,6 +2257,10 @@ fn handleHttp3LocationProxyPass(
             try rejectHttp3ProxyError(allocator, response, ctx, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id);
             return;
         },
+        .circuit_open => {
+            try rejectHttp3ProxyError(allocator, response, ctx, .service_unavailable, "upstream_circuit_open", "Upstream circuit breaker open", correlation_id);
+            return;
+        },
         .request_cancelled, .retry_budget_exhausted => {
             try rejectHttp3ProxyError(allocator, response, ctx, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id);
             return;
@@ -2264,6 +2279,11 @@ fn handleHttp3LocationProxyPass(
     };
     defer upstream_response.deinit(allocator);
     defer ctx.state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
+    if (upstream_response.statusCode() >= 500) {
+        ctx.state.recordUpstreamFailure(ctx.cfg, ctx.cfg.upstream_base_url);
+    } else if (upstream_response.statusCode() != @intFromEnum(http.Status.too_early)) {
+        ctx.state.recordUpstreamSuccess(ctx.cfg, ctx.cfg.upstream_base_url);
+    }
     try applyHttp3ProxyResponse(allocator, response, ctx.state, &upstream_response, correlation_id);
 }
 
