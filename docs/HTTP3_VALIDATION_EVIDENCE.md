@@ -25,7 +25,7 @@ transport implementation. Use the existing owners:
 | --- | --- | --- | --- | --- |
 | Packet loss and reordering do not corrupt packet number, ACK, or retransmission state | `src/quic/packet.zig`, `src/quic/frame.zig`, `src/quic/connection.zig`; summarized in [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md) | property | mapped | Dedicated-host impairment run must show the production UDP listener reports loss/recovery progress through scenario-local QUIC metrics. |
 | PTO and retransmission progression remain bounded and attributable | `src/quic/connection.zig`; `tardigrade_quic_pto_total`; H3 benchmark `quic.pto_total` deltas | property / runtime | mapped | Controlled loss/delay run must retain before/after metrics and qlog only when diagnosis needs it. |
-| `RESET_STREAM` / `STOP_SENDING` lifecycle is idempotent and cleans stream accounting | `src/quic/stream.zig`, `src/quic/connection.zig`, `src/http3/conn.zig`; summarized in [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md) | unit / property | closed | Closed by `soak.h3.bounded_cancelled_requests` (`tests/http3_soak.zig`): real client-issued `resetStream` over real UDP, proven at the production runtime via `quic_transport_metrics_cb`'s `stream_resets` delta, plus a same-connection follow-up request proving the reset did not poison the connection. |
+| `RESET_STREAM` / `STOP_SENDING` lifecycle is idempotent and cleans stream accounting | `src/quic/stream.zig`, `src/quic/connection.zig`, `src/http3/conn.zig`; summarized in [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md) | unit / property | closed | Closed by `soak.h3.bounded_cancelled_requests` (`tests/http3_soak.zig`), full-duplex: real client-issued `resetStream` **and** `stopSending` over real UDP, proven at the production runtime via `quic_transport_metrics_cb`'s `stream_resets` delta, plus repeated same-connection follow-up requests proving the connection stays usable across multiple cancel cycles. This soak's own strengthening found and fixed a real accounting bug: `Stream.state()` checked `reset_received`/`reset_sent` before checking `send_closed && recv_closed`, so a stream closed via reset in both directions (as this leg's `stopSending` triggers via the peer's RFC 9000 SS3.5 auto-`RESET_STREAM`) never reported `.closed` and `maybeClose()` never updated `active_streams`/`closed_streams` for it. Fixed with a dedicated `stream.zig` regression asserting the counts move exactly once. |
 | QPACK blocked-stream unblock, cancellation, and malformed instruction handling stay bounded | `src/http3/qpack.zig`; summarized in [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md) | property | mapped | No production wire gap today while nonzero dynamic QPACK request settings are not exposed by the production H3 config. Reopen only when that surface is enabled. |
 | Critical stream failures preserve the required HTTP/3 close code | `src/http3/conn.zig`; duplicate/closed/reset critical-stream regressions | unit / property | mapped | Production-path protocol-error capture is useful only if it proves close-class propagation through the real runtime before teardown. |
 | Release-critical QUIC/H3/QPACK close code preservation survives malformed input | `src/quic/connection.zig`, `src/http3/conn.zig`, `src/http3/qpack.zig`; external peer failures under `scripts/interop/run-interop.sh` | unit / property / external | mapped | Final interop rerun must publish required rows or explicit environment exceptions. |
@@ -239,25 +239,36 @@ this row's "reconnect/resumption" text.
 where the client can generate it honestly" workload row: the real client
 already can drive this without test-only protocol shortcuts --
 `H3.sendRequest` returns the real request stream ID, native
-`Connection.resetStream` is public, and production `pump()`'s server-side
-request handling already handles `error.StreamReset` on a request stream by
-removing it from the tracked request map. Two concurrent clients run
-repeated cycles (4 rounds PR-safe, 10 rounds with `TARDIGRADE_SOAK_HEAVY=1`)
-of: open a request, immediately reset it with the H3 request-cancel error
-code before the next transmit flush (so the request and its `RESET_STREAM`
-leave together -- the realistic "changed my mind immediately" shape), then
-send a normal follow-up request on the *same* connection. It runs by default
-under `zig build test` / `zig build test-quic`, alongside the other two
-soaks, and shares the same `WorkloadMonitor` helper. Its pass condition:
+`Connection.resetStream`/`stopSending` are public, and production `pump()`'s
+server-side request handling already handles `error.StreamReset` on a
+request stream by removing it from the tracked request map. Two concurrent
+clients each establish **one** H3 connection and run repeated cancel cycles
+on it (4 cycles PR-safe, 10 cycles with `TARDIGRADE_SOAK_HEAVY=1`) --
+deliberately not a fresh connection per cycle like the other two soaks,
+since per-stream accounting needs to be observed while the connection stays
+alive, not erased by teardown. Each cycle: open a request, immediately
+cancel it full-duplex with the H3 request-cancel error code (`resetStream`
+for the client->server direction, `stopSending` for the server->client
+direction) before the next transmit flush (so the request and both
+cancellation frames leave together -- the realistic "changed my mind
+immediately" shape), then send a normal follow-up request on the same,
+still-open connection. It runs by default under `zig build test` /
+`zig build test-quic`, alongside the other two soaks, and shares the same
+`WorkloadMonitor` helper. Its pass condition:
 
-- every round's cancelled request was actually reset at the production
-  runtime, not merely offered by the client: `Runtime.Config`'s
-  `quic_transport_metrics_cb` is wired to a counter, and the accumulated
-  `QuicTransportDelta.stream_resets` delta equals the planned reset count
-  exactly
-- every round's follow-up request on the same (not a fresh) connection
-  completed with a normal 200 response -- proof the cancellation did not
-  poison the connection for subsequent requests
+- every cycle's cancelled request was actually reset in both directions at
+  the production runtime, not merely offered by the client:
+  `Runtime.Config`'s `quic_transport_metrics_cb` is wired to a counter, and
+  the accumulated `QuicTransportDelta.stream_resets` delta equals exactly
+  twice the planned cycle count -- once from the server receiving the
+  client's `RESET_STREAM`, once from the server's own RFC 9000 SS3.5
+  auto-`RESET_STREAM` in response to the client's `STOP_SENDING`
+- every cycle's follow-up request on the same, still-open connection
+  completed with a normal 200 response -- proof repeated cancellation does
+  not poison the connection, not just once before teardown
+- the cancelled requests never reached the application handler:
+  `handler_state.requests` equals exactly the planned follow-up count, never
+  more
 - the same RSS-slope, genuine-peak, connection/CID-state plateau, exact-zero
   settle, and FD-baseline checks as the other two soaks (same
   `WorkloadMonitor`, margins scaled to this leg's two-worker workload)
@@ -265,9 +276,14 @@ soaks, and shares the same `WorkloadMonitor` helper. Its pass condition:
 This closes the "cancellation/reset traffic where the client can generate it
 honestly" workload row above. The existing deterministic `quic_h3_e2e` reset
 test already proves QUIC-level reset propagation between two directly-pumped
-connections; this leg proves the distinct thing that test cannot -- repeated
-reset ownership/cleanup through the full `http3_runtime.Runtime` composition
-over real UDP, under the same bounded-resource contract as the other soaks.
+connections; this leg proves the distinct thing that test cannot -- repeated,
+full-duplex reset ownership/cleanup through the full `http3_runtime.Runtime`
+composition over real UDP while a connection stays alive, under the same
+bounded-resource contract as the other soaks. Strengthening this leg to
+repeated full-duplex cycles on a live connection (rather than one
+`resetStream` per fresh connection) surfaced a real accounting bug this PR
+also fixes -- see the failure matrix row above and `src/quic/stream.zig`'s
+`Stream.state()` and its regression test.
 
 ## Final Evidence Bundle
 

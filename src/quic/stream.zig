@@ -303,9 +303,20 @@ pub const Stream = struct {
     }
 
     pub fn state(self: Stream) StreamState {
+        // Terminal precedence (#247 soak finding): a stream whose send and
+        // receive sides are *both* closed is `.closed` even when one or
+        // both sides closed via reset -- e.g. a fully cancelled bidi
+        // request (client RESET_STREAM closes recv here, then the server's
+        // own RFC 9000 SS3.5 auto-RESET_STREAM in response to STOP_SENDING
+        // closes send here). Checking `reset_received`/`reset_sent` first
+        // left such a stream permanently reporting a reset state instead of
+        // `.closed`, so `StreamManager.maybeClose` never saw `.closed` and
+        // never decremented `active_streams`/incremented `closed_streams`
+        // for it -- an accounting leak for any stream closed via reset in
+        // both directions while the connection stays alive.
+        if (self.send_closed and self.recv_closed) return .closed;
         if (self.reset_received) return .reset_received;
         if (self.reset_sent) return .reset_sent;
-        if (self.send_closed and self.recv_closed) return .closed;
         if (self.send_closed) return .half_closed_local;
         if (self.recv_closed) return .half_closed_remote;
         return .open;
@@ -969,6 +980,40 @@ test "reset stream and stop sending update state and propagation" {
     const stop = try manager.sendStopSending(id, 99);
     try std.testing.expectEqual(@as(u64, 99), stop.app_error_code);
     try std.testing.expectEqual(@as(u64, 1), manager.metrics.stop_sending_events);
+}
+
+test "stream reset in both directions while connection stays alive counts closed exactly once" {
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = "abc" });
+    try std.testing.expectEqual(@as(u64, 1), manager.metrics.active_streams);
+    try std.testing.expectEqual(@as(u64, 0), manager.metrics.closed_streams);
+
+    // Client abandons its request (recv-side close here): still only
+    // half-duplex closed, so this must not count as terminally closed yet.
+    try manager.receiveResetStream(.{ .id = id, .app_error_code = 42, .final_size = 3 });
+    try std.testing.expectEqual(StreamState.reset_received, manager.get(id).?.state());
+    try std.testing.expectEqual(@as(u64, 1), manager.metrics.active_streams);
+    try std.testing.expectEqual(@as(u64, 0), manager.metrics.closed_streams);
+
+    // Server's own RFC 9000 SS3.5 auto-RESET_STREAM in response to a
+    // STOP_SENDING it received (mirrors `Connection`'s `.stop_sending`
+    // handler, which calls this same `sendResetStream` after
+    // `receiveStopSending`) closes the send side too -- both directions
+    // are now closed, so this must count as terminally closed exactly once
+    // even though closure happened entirely via reset, not FIN.
+    _ = try manager.sendResetStream(id, 42);
+    try std.testing.expectEqual(StreamState.closed, manager.get(id).?.state());
+    try std.testing.expectEqual(@as(u64, 0), manager.metrics.active_streams);
+    try std.testing.expectEqual(@as(u64, 1), manager.metrics.closed_streams);
+
+    // Idempotent: a duplicate/late-retransmitted RESET_STREAM for the same
+    // final size must not double-count the close.
+    try manager.receiveResetStream(.{ .id = id, .app_error_code = 42, .final_size = 3 });
+    try std.testing.expectEqual(@as(u64, 0), manager.metrics.active_streams);
+    try std.testing.expectEqual(@as(u64, 1), manager.metrics.closed_streams);
 }
 
 test "reset final size consumes remaining connection credit" {

@@ -1400,15 +1400,29 @@ test "soak.h3.bounded_resumed_reconnects" {
 // Cancellation soak leg (#247 Lane B, PR review): "cancellation/reset
 // activity where the existing client/harness can exercise it honestly" -- the
 // real client here already can. `H3.sendRequest` returns the actual request
-// stream ID, native `Connection.resetStream` is public, and production
-// `http3.conn.Conn.pump()`'s server-side `pumpRequests` already handles
-// `error.StreamReset` on a request stream by removing it from the tracked
-// request map (`reset_requests`/`finishRequest` in `src/http3/conn.zig`).
-// The existing deterministic `quic_h3_e2e` reset test proves QUIC-level
-// reset propagation between two directly-pumped connections; it does not
-// prove repeated reset ownership/cleanup through the full
-// `http3_runtime.Runtime` composition over real UDP -- the resource/
-// lifecycle case this soak lane exists for.
+// stream ID, native `Connection.resetStream`/`stopSending` are public, and
+// production `http3.conn.Conn.pump()`'s server-side `pumpRequests` already
+// handles `error.StreamReset` on a request stream by removing it from the
+// tracked request map (`reset_requests`/`finishRequest` in
+// `src/http3/conn.zig`). The existing deterministic `quic_h3_e2e` reset test
+// proves QUIC-level reset propagation between two directly-pumped
+// connections; it does not prove repeated reset ownership/cleanup through
+// the full `http3_runtime.Runtime` composition over real UDP -- the
+// resource/lifecycle case this soak lane exists for.
+//
+// #247's matrix row is explicitly full-duplex: "RESET_STREAM / STOP_SENDING
+// lifecycle is idempotent and cleans stream accounting". A single
+// `resetStream` only abandons the client->server (request) direction; the
+// server->client (response) direction needs `stopSending` too, and per
+// RFC 9000 SS3.5 a peer that receives STOP_SENDING must answer with its own
+// RESET_STREAM -- so both directions closing was also the concrete trigger
+// for the `Stream.state()` terminal-precedence fix in `quic/stream.zig`
+// (see that file's regression test). Proving that fix under a live
+// composition, not just the one-shot-then-teardown shape this leg started
+// with, requires *multiple* cancel+follow-up cycles on the *same*
+// established connection before it closes -- a single cycle per connection
+// can never show whether per-stream accounting keeps working correctly
+// while the connection stays alive.
 // ---------------------------------------------------------------------------
 
 const reset_worker_count: usize = 2;
@@ -1425,15 +1439,19 @@ const ResetTransportCapture = struct {
     }
 };
 
-const ResetWorkerPhase = enum { active, closing, round_done };
+const ResetWorkerPhase = enum { active, closing, done };
 
 const ResetWorker = struct {
     id: usize,
     allocator: std.mem.Allocator,
     socket: UdpSocket,
     runtime_addr: quic.udp.Address,
-    round: usize = 0,
-    rounds_target: usize,
+    // One connection, established once and reused across every cycle --
+    // deliberately not per-cycle like the primary/resumption workers, so
+    // per-stream accounting (the point of this leg) is observed while the
+    // connection stays alive rather than getting reset by teardown.
+    cycles_target: usize,
+    cycles_completed: usize = 0,
     provider_storage: test_quic_crypto.HandshakeProviderStorage = .{},
     tls_backend: tls_backend.Tls13Backend = undefined,
     client: ?*Connection = null,
@@ -1441,21 +1459,22 @@ const ResetWorker = struct {
     path: quic.path.PathKey = undefined,
     h3_started: bool = false,
     phase: ResetWorkerPhase = .active,
-    // Whether this round's cancel-a-request-immediately cycle already ran.
-    // One cancel per round, always the first thing this worker does once
-    // established -- separate from `request_id`, which tracks the *normal*
-    // follow-up request that proves the connection still works afterward.
+    // Whether this cycle's cancel-a-request-immediately step already ran.
+    // One cancel per cycle, always the first thing this worker does once
+    // established/between cycles -- separate from `request_id`, which
+    // tracks the *normal* follow-up request that proves the connection
+    // still works afterward.
     cancel_done: bool = false,
     request_id: ?u64 = null,
     requests_completed_total: usize = 0,
 
-    fn init(allocator: std.mem.Allocator, id: usize, rounds_target: usize, runtime_addr: quic.udp.Address) !ResetWorker {
+    fn init(allocator: std.mem.Allocator, id: usize, cycles_target: usize, runtime_addr: quic.udp.Address) !ResetWorker {
         return ResetWorker{
             .id = id,
             .allocator = allocator,
             .socket = try UdpSocket.open(),
             .runtime_addr = runtime_addr,
-            .rounds_target = rounds_target,
+            .cycles_target = cycles_target,
         };
     }
 
@@ -1463,22 +1482,18 @@ const ResetWorker = struct {
         var client_cid = [_]u8{0xf0} ** 8;
         var odcid = [_]u8{0xa0} ** 8;
         client_cid[4] = @intCast(self.id);
-        client_cid[5] = @intCast(self.round >> 8);
-        client_cid[6] = @intCast(self.round);
         client_cid[7] = 0xf0;
         odcid[4] = @intCast(self.id);
-        odcid[5] = @intCast(self.round >> 8);
-        odcid[6] = @intCast(self.round);
         odcid[7] = 0xa5;
         return .{ .client_cid = client_cid, .odcid = odcid };
     }
 
-    fn beginRound(self: *ResetWorker) !void {
+    fn beginConnection(self: *ResetWorker) !void {
         const ids = self.cids();
         self.provider_storage = .{};
         self.tls_backend = tls_backend.Tls13Backend.initClient(
             .{ .hello_random = [_]u8{0xd4} ** 32 },
-            self.provider_storage.init(0xa000 + self.id * 0x100 + self.round),
+            self.provider_storage.init(0xa000 + self.id * 0x100),
             .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
         );
         self.path = .{
@@ -1502,14 +1517,16 @@ const ResetWorker = struct {
         self.request_id = null;
     }
 
-    fn endRound(self: *ResetWorker) void {
-        self.h3.deinit();
-        if (self.client) |c| c.deinit();
-        self.client = null;
+    fn closeConnection(self: *ResetWorker) void {
+        if (self.client) |c| {
+            self.h3.deinit();
+            c.deinit();
+            self.client = null;
+        }
     }
 
     fn deinit(self: *ResetWorker) void {
-        if (self.client != null) self.endRound();
+        self.closeConnection();
         self.socket.close();
     }
 
@@ -1531,13 +1548,14 @@ const ResetWorker = struct {
 
     fn step(self: *ResetWorker) !void {
         if (self.phase == .closing) {
-            self.endRound();
-            self.round += 1;
-            if (self.round >= self.rounds_target) {
-                self.phase = .round_done;
-            } else {
-                try self.beginRound();
-            }
+            // `client.close(...)` was queued last iteration and already
+            // flushed by this iteration's earlier `flushTransmit` call (the
+            // outer loop's per-iteration order is flush, poll/recv, step);
+            // safe to tear down the connection now. The socket stays open
+            // -- this worker never reconnects, so the final `deinit` in the
+            // test's own cleanup closes it exactly once.
+            self.closeConnection();
+            self.phase = .done;
             return;
         }
 
@@ -1553,19 +1571,26 @@ const ResetWorker = struct {
 
         if (!self.cancel_done) {
             // Cancel a request the instant it opens, before this outer
-            // iteration's `flushTransmit` even runs: both the request and
-            // its RESET_STREAM go out together in the next flush -- the
-            // realistic "changed my mind immediately" shape, not a
-            // mid-response abort (`H3.sendRequest` here always writes a
-            // complete request with `fin=true` in one call; there is no
-            // lower-level partial-write API this harness exposes to cancel
-            // mid-body instead).
+            // iteration's `flushTransmit` even runs: the request, its
+            // RESET_STREAM, and its STOP_SENDING all go out together in the
+            // next flush -- the realistic "changed my mind immediately"
+            // shape, not a mid-response abort (`H3.sendRequest` here always
+            // writes a complete request with `fin=true` in one call; there
+            // is no lower-level partial-write API this harness exposes to
+            // cancel mid-body instead). Full-duplex: `resetStream`
+            // abandons the client->server request direction, `stopSending`
+            // abandons the server->client response direction -- per
+            // RFC 9000 SS3.5 the server answers `stopSending` with its own
+            // RESET_STREAM, which is what actually closes the *send* side
+            // of the server's stream and exercises the accounting fix in
+            // `quic/stream.zig`.
             const cancelled_id = try self.h3.sendRequest(client, .{
                 .authority = "tardigrade.test",
                 .path = "/soak",
                 .body = "cancel-me",
             });
             try client.resetStream(cancelled_id, h3_request_cancelled);
+            try client.stopSending(cancelled_id, h3_request_cancelled);
             // Drop client-side pending-response bookkeeping now: this
             // worker will never poll for it, matching the primary/
             // resumption workers' `releaseResponse` call once a request's
@@ -1577,8 +1602,8 @@ const ResetWorker = struct {
         }
 
         if (self.request_id == null) {
-            var body_buf: [48]u8 = undefined;
-            const body = try std.fmt.bufPrint(&body_buf, "reset-followup-{d}-{d}", .{ self.id, self.round });
+            var body_buf: [64]u8 = undefined;
+            const body = try std.fmt.bufPrint(&body_buf, "reset-followup-{d}-{d}", .{ self.id, self.cycles_completed });
             self.request_id = try self.h3.sendRequest(client, .{
                 .authority = "tardigrade.test",
                 .path = "/soak",
@@ -1592,8 +1617,13 @@ const ResetWorker = struct {
                 self.h3.releaseResponse(id);
                 self.request_id = null;
                 self.requests_completed_total += 1;
-                client.close(0, "soak-round-done", nowUs());
-                self.phase = .closing;
+                self.cycles_completed += 1;
+                if (self.cycles_completed >= self.cycles_target) {
+                    client.close(0, "soak-cycles-done", nowUs());
+                    self.phase = .closing;
+                } else {
+                    self.cancel_done = false;
+                }
             }
         }
     }
@@ -1626,8 +1656,8 @@ test "soak.h3.bounded_cancelled_requests" {
     defer runtime.deinit();
     runtime.start();
 
-    const rounds_per_worker: usize = if (soakHeavyEnabled()) 10 else 4;
-    const total_work = reset_worker_count * rounds_per_worker;
+    const cycles_per_worker: usize = if (soakHeavyEnabled()) 10 else 4;
+    const total_work = reset_worker_count * cycles_per_worker;
 
     const scenario = "soak.h3.bounded_cancelled_requests";
     const before_sample = try sampleResources(allocator, &runtime, scenario, "before");
@@ -1639,9 +1669,9 @@ test "soak.h3.bounded_cancelled_requests" {
         for (workers[0..workers_initialized]) |*w| w.deinit();
     }
     for (0..reset_worker_count) |i| {
-        workers[i] = try ResetWorker.init(allocator, i, rounds_per_worker, runtime.local_address);
+        workers[i] = try ResetWorker.init(allocator, i, cycles_per_worker, runtime.local_address);
         workers_initialized += 1;
-        try workers[i].beginRound();
+        try workers[i].beginConnection();
     }
 
     var pollfds_buf = try allocator.alloc(posix.pollfd, reset_worker_count);
@@ -1658,7 +1688,7 @@ test "soak.h3.bounded_cancelled_requests" {
 
         var finished: usize = 0;
         for (workers) |*w| {
-            if (w.phase == .round_done) {
+            if (w.phase == .done) {
                 finished += 1;
                 continue;
             }
@@ -1669,7 +1699,7 @@ test "soak.h3.bounded_cancelled_requests" {
         var poll_count: usize = 0;
         var next_wake: u64 = nowUs() + 20_000;
         for (workers) |*w| {
-            if (w.phase == .round_done) continue;
+            if (w.phase == .done) continue;
             pollfds_buf[poll_count] = .{ .fd = w.socket.fd, .events = posix.POLL.IN, .revents = 0 };
             poll_count += 1;
             if (w.client) |c| {
@@ -1681,11 +1711,11 @@ test "soak.h3.bounded_cancelled_requests" {
         _ = try posix.poll(pollfds_buf[0..poll_count], timeout_ms);
 
         for (workers) |*w| {
-            if (w.phase == .round_done) continue;
+            if (w.phase == .done) continue;
             try w.drainRecv();
         }
         for (workers) |*w| {
-            if (w.phase == .round_done) continue;
+            if (w.phase == .done) continue;
             try w.step();
         }
 
@@ -1702,17 +1732,27 @@ test "soak.h3.bounded_cancelled_requests" {
     _ = try waitRuntimeSnapshot(&runtime, hasNoTrackedConnections);
     const after_settle_sample = try sampleResources(allocator, &runtime, scenario, "after_settle");
 
-    // Every round's cancelled request was actually reset -- the production
-    // runtime's own transport-metrics delta moved by exactly the planned
-    // count, proving the RESET_STREAM reached and was folded by
+    // Every cycle's cancelled request was actually reset in both
+    // directions at the production runtime -- the accumulated
+    // `stream_resets` transport-metrics delta equals exactly twice the
+    // planned cycle count, proving both halves reached and were folded by
     // `http3_runtime.Runtime` itself, not only that the client invoked an
-    // API -- and every round's follow-up request on the *same* connection
-    // completed normally: proof the cancellation did not poison the
-    // connection.
+    // API: once from the server receiving the client's `RESET_STREAM`
+    // (`receiveResetStream`, closing the server's recv side), and once
+    // from the server's own RFC 9000 SS3.5 auto-`RESET_STREAM` in response
+    // to the client's `STOP_SENDING` (`sendResetStream`, closing the
+    // server's send side -- this is the half that exercises the
+    // `Stream.state()` terminal-precedence fix). Every cycle's follow-up
+    // request on the *same*, still-open connection completed normally:
+    // proof the cancellation did not poison the connection, repeatedly,
+    // not just once before teardown.
     for (workers) |w| {
-        try testing.expectEqual(rounds_per_worker, w.requests_completed_total);
+        try testing.expectEqual(cycles_per_worker, w.requests_completed_total);
     }
-    try testing.expectEqual(total_work, reset_capture.stream_resets.load(.monotonic));
+    try testing.expectEqual(total_work * 2, reset_capture.stream_resets.load(.monotonic));
+    // And the cancelled requests never escaped into the application
+    // handler -- only the normal follow-ups did.
+    try testing.expectEqual(total_work, handler_state.requests.load(.monotonic));
 
     try testing.expectEqual(@as(usize, 0), after_settle_sample.tracked_connections);
     try testing.expectEqual(@as(usize, 0), after_settle_sample.active_cid_routes);
