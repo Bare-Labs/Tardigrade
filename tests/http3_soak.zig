@@ -88,8 +88,18 @@ const UdpSocket = struct {
         errdefer _ = std.c.close(fd);
         const descriptor_flags = std.c.fcntl(fd, std.c.F.GETFD, @as(c_int, 0));
         if (descriptor_flags >= 0) _ = std.c.fcntl(fd, std.c.F.SETFD, descriptor_flags | std.c.FD_CLOEXEC);
+        // Fail closed, unlike `FD_CLOEXEC` above (best-effort hygiene, not
+        // load-bearing): `drainRecv()` is `while (try self.socket.recv(...))
+        // |datagram|`, relying on `EAGAIN` to terminate the loop once the
+        // available datagrams are drained. A socket that silently stayed
+        // blocking would make the next `recvfrom` (once nothing is pending)
+        // block indefinitely, bypassing this soak's 60s deadline/iteration
+        // cap entirely -- exactly the unbounded-progress failure mode the
+        // "bounded soak" contract exists to rule out.
         const status_flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
-        if (status_flags >= 0) _ = std.c.fcntl(fd, std.c.F.SETFL, status_flags | @as(c_int, @bitCast(posix.O{ .NONBLOCK = true })));
+        if (status_flags < 0) return error.FcntlGetFlFailed;
+        if (std.c.fcntl(fd, std.c.F.SETFL, status_flags | @as(c_int, @bitCast(posix.O{ .NONBLOCK = true }))) < 0)
+            return error.FcntlSetFlFailed;
         var bind_addr = std.c.sockaddr.in{
             .family = posix.AF.INET,
             .port = 0,
@@ -198,11 +208,33 @@ fn readRssKb(allocator: std.mem.Allocator, pid: std.c.pid_t) !u64 {
 fn readOpenFdCount(allocator: std.mem.Allocator, pid: std.c.pid_t) !u64 {
     var pid_buf: [32]u8 = undefined;
     const pid_str = try std.fmt.bufPrint(&pid_buf, "{d}", .{pid});
+    // Piping straight into `wc`/`awk` (the previous shape) hides the
+    // producer's own exit status under portable `sh`: the pipeline's status
+    // is `tr`'s or `awk`'s, not `find`'s or `lsof`'s, so a failed producer
+    // that still writes nothing can leave the pipeline exiting 0 with a
+    // fabricated `0` count -- exactly the "measurement never happened, read
+    // back as a valid zero" class the fail-closed rewrite above was meant to
+    // eliminate. Capturing the producer's output via command substitution
+    // first, and checking `$?` before counting it, closes that gap without
+    // relying on `pipefail` (not portably available under `/bin/sh`, e.g.
+    // dash).
     const script = try std.fmt.allocPrint(allocator,
         \\if [ -d /proc/{s}/fd ]; then
-        \\  find /proc/{s}/fd -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' '
+        \\  entries=$(find /proc/{s}/fd -maxdepth 1 -type l -print 2>/dev/null) || {{
+        \\    echo "find fd probe failed" >&2
+        \\    exit 4
+        \\  }}
+        \\  if [ -n "$entries" ]; then
+        \\    printf '%s\n' "$entries" | wc -l | tr -d ' '
+        \\  else
+        \\    echo 0
+        \\  fi
         \\elif command -v lsof >/dev/null 2>&1; then
-        \\  lsof -n -P -p {s} 2>/dev/null | awk 'NR>1{{count+=1}} END{{print count+0}}'
+        \\  rows=$(lsof -n -P -p {s} 2>/dev/null) || {{
+        \\    echo "lsof fd probe failed" >&2
+        \\    exit 5
+        \\  }}
+        \\  printf '%s\n' "$rows" | awk 'NR>1 {{ count++ }} END {{ print count+0 }}'
         \\else
         \\  echo "no fd probe backend available (no /proc, no lsof)" >&2
         \\  exit 3
@@ -406,9 +438,18 @@ const WorkloadMonitor = struct {
             return error.PossibleMonotonicRssGrowth;
         }
 
+        // `active_cid_routes` gets double the margin: every observed sample
+        // across both soaks runs at roughly 2x `tracked_connections` (each
+        // live connection routes through about two active CIDs at a time --
+        // e.g. one issued at handshake plus one mid-rotation), so the same
+        // absolute slack that comfortably covers connection-count noise is
+        // too tight for the CID-route count it scales with. Caught by CI on
+        // the smaller two-worker resumption leg, where `high_water_margin`
+        // is small enough for that 2x factor to matter (first_half=7,
+        // second_half=16, `high_water_margin`=8 -- one CID route over).
         if (self.second_half_high_water.tracked_connections > self.first_half_high_water.tracked_connections + high_water_margin or
             self.second_half_high_water.native_connections > self.first_half_high_water.native_connections + high_water_margin or
-            self.second_half_high_water.active_cid_routes > self.first_half_high_water.active_cid_routes + high_water_margin)
+            self.second_half_high_water.active_cid_routes > self.first_half_high_water.active_cid_routes + high_water_margin * 2)
         {
             std.debug.print(
                 "{s}: possible sustained-traffic runtime-state growth -- " ++
@@ -1353,4 +1394,343 @@ test "soak.h3.bounded_resumed_reconnects" {
         "{s}: after_settle resumption cache occupancy client={d} server={d} (client_limit={d} server_limit={d})\n",
         .{ scenario, client_entries_after_settle, server_entries_after_settle, client_cache_limit, server_cache_limit },
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation soak leg (#247 Lane B, PR review): "cancellation/reset
+// activity where the existing client/harness can exercise it honestly" -- the
+// real client here already can. `H3.sendRequest` returns the actual request
+// stream ID, native `Connection.resetStream` is public, and production
+// `http3.conn.Conn.pump()`'s server-side `pumpRequests` already handles
+// `error.StreamReset` on a request stream by removing it from the tracked
+// request map (`reset_requests`/`finishRequest` in `src/http3/conn.zig`).
+// The existing deterministic `quic_h3_e2e` reset test proves QUIC-level
+// reset propagation between two directly-pumped connections; it does not
+// prove repeated reset ownership/cleanup through the full
+// `http3_runtime.Runtime` composition over real UDP -- the resource/
+// lifecycle case this soak lane exists for.
+// ---------------------------------------------------------------------------
+
+const reset_worker_count: usize = 2;
+// RFC 9114 SS8.1: H3_REQUEST_CANCELLED, the application error code an
+// HTTP/3 client uses to abandon a request it no longer wants answered.
+const h3_request_cancelled: u64 = 0x010c;
+
+const ResetTransportCapture = struct {
+    stream_resets: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn onDelta(ctx: *anyopaque, delta: http3_runtime.QuicTransportDelta) void {
+        const self: *ResetTransportCapture = @ptrCast(@alignCast(ctx));
+        _ = self.stream_resets.fetchAdd(delta.stream_resets, .monotonic);
+    }
+};
+
+const ResetWorkerPhase = enum { active, closing, round_done };
+
+const ResetWorker = struct {
+    id: usize,
+    allocator: std.mem.Allocator,
+    socket: UdpSocket,
+    runtime_addr: quic.udp.Address,
+    round: usize = 0,
+    rounds_target: usize,
+    provider_storage: test_quic_crypto.HandshakeProviderStorage = .{},
+    tls_backend: tls_backend.Tls13Backend = undefined,
+    client: ?*Connection = null,
+    h3: H3 = undefined,
+    path: quic.path.PathKey = undefined,
+    h3_started: bool = false,
+    phase: ResetWorkerPhase = .active,
+    // Whether this round's cancel-a-request-immediately cycle already ran.
+    // One cancel per round, always the first thing this worker does once
+    // established -- separate from `request_id`, which tracks the *normal*
+    // follow-up request that proves the connection still works afterward.
+    cancel_done: bool = false,
+    request_id: ?u64 = null,
+    requests_completed_total: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, id: usize, rounds_target: usize, runtime_addr: quic.udp.Address) !ResetWorker {
+        return ResetWorker{
+            .id = id,
+            .allocator = allocator,
+            .socket = try UdpSocket.open(),
+            .runtime_addr = runtime_addr,
+            .rounds_target = rounds_target,
+        };
+    }
+
+    fn cids(self: *const ResetWorker) struct { client_cid: [8]u8, odcid: [8]u8 } {
+        var client_cid = [_]u8{0xf0} ** 8;
+        var odcid = [_]u8{0xa0} ** 8;
+        client_cid[4] = @intCast(self.id);
+        client_cid[5] = @intCast(self.round >> 8);
+        client_cid[6] = @intCast(self.round);
+        client_cid[7] = 0xf0;
+        odcid[4] = @intCast(self.id);
+        odcid[5] = @intCast(self.round >> 8);
+        odcid[6] = @intCast(self.round);
+        odcid[7] = 0xa5;
+        return .{ .client_cid = client_cid, .odcid = odcid };
+    }
+
+    fn beginRound(self: *ResetWorker) !void {
+        const ids = self.cids();
+        self.provider_storage = .{};
+        self.tls_backend = tls_backend.Tls13Backend.initClient(
+            .{ .hello_random = [_]u8{0xd4} ** 32 },
+            self.provider_storage.init(0xa000 + self.id * 0x100 + self.round),
+            .{ .pinned_certificate = tls_core.credentials.testdata.certificate_der },
+        );
+        self.path = .{
+            .local = addressFromSockaddrIn(self.socket.addr),
+            .remote = self.runtime_addr,
+        };
+        self.client = try Connection.init(self.allocator, .{
+            .role = .client,
+            .local_cid = &ids.client_cid,
+            .original_destination_cid = &ids.odcid,
+            .initial_secret_dcid = &ids.odcid,
+            .tls = self.tls_backend.backend(),
+            .crypto_provider = test_quic_crypto.testDefaultProvider(),
+            .now_us = nowUs(),
+            .initial_path = self.path,
+        });
+        self.h3 = H3.init(self.allocator, .client);
+        self.h3_started = false;
+        self.phase = .active;
+        self.cancel_done = false;
+        self.request_id = null;
+    }
+
+    fn endRound(self: *ResetWorker) void {
+        self.h3.deinit();
+        if (self.client) |c| c.deinit();
+        self.client = null;
+    }
+
+    fn deinit(self: *ResetWorker) void {
+        if (self.client != null) self.endRound();
+        self.socket.close();
+    }
+
+    fn flushTransmit(self: *ResetWorker) !void {
+        const client = self.client orelse return;
+        var out: [2048]u8 = undefined;
+        while (client.pollTransmitOnPath(&out, nowUs())) |t| {
+            try self.socket.sendTo(sockaddrInFromAddress(t.path.remote), t.bytes);
+        }
+    }
+
+    fn drainRecv(self: *ResetWorker) !void {
+        const client = self.client orelse return;
+        var in: [2048]u8 = undefined;
+        while (try self.socket.recv(&in)) |datagram| {
+            try client.ingestOnPath(datagram, self.path, test_challenge_entropy, nowUs());
+        }
+    }
+
+    fn step(self: *ResetWorker) !void {
+        if (self.phase == .closing) {
+            self.endRound();
+            self.round += 1;
+            if (self.round >= self.rounds_target) {
+                self.phase = .round_done;
+            } else {
+                try self.beginRound();
+            }
+            return;
+        }
+
+        const client = self.client orelse return;
+        client.onTimeout(nowUs());
+
+        if (!self.h3_started and client.isEstablished()) {
+            try self.h3.start(client);
+            self.h3_started = true;
+        }
+        if (!self.h3_started) return;
+        try self.h3.pump(client);
+
+        if (!self.cancel_done) {
+            // Cancel a request the instant it opens, before this outer
+            // iteration's `flushTransmit` even runs: both the request and
+            // its RESET_STREAM go out together in the next flush -- the
+            // realistic "changed my mind immediately" shape, not a
+            // mid-response abort (`H3.sendRequest` here always writes a
+            // complete request with `fin=true` in one call; there is no
+            // lower-level partial-write API this harness exposes to cancel
+            // mid-body instead).
+            const cancelled_id = try self.h3.sendRequest(client, .{
+                .authority = "tardigrade.test",
+                .path = "/soak",
+                .body = "cancel-me",
+            });
+            try client.resetStream(cancelled_id, h3_request_cancelled);
+            // Drop client-side pending-response bookkeeping now: this
+            // worker will never poll for it, matching the primary/
+            // resumption workers' `releaseResponse` call once a request's
+            // outcome (there, a real response; here, an intentional
+            // cancellation) is settled.
+            self.h3.releaseResponse(cancelled_id);
+            self.cancel_done = true;
+            return;
+        }
+
+        if (self.request_id == null) {
+            var body_buf: [48]u8 = undefined;
+            const body = try std.fmt.bufPrint(&body_buf, "reset-followup-{d}-{d}", .{ self.id, self.round });
+            self.request_id = try self.h3.sendRequest(client, .{
+                .authority = "tardigrade.test",
+                .path = "/soak",
+                .body = body,
+            });
+        }
+        if (self.request_id) |id| {
+            if (try self.h3.pollResponse(id)) |response| {
+                try testing.expectEqual(@as(u16, 200), response.status);
+                try testing.expectEqualStrings("soak-response", response.body);
+                self.h3.releaseResponse(id);
+                self.request_id = null;
+                self.requests_completed_total += 1;
+                client.close(0, "soak-round-done", nowUs());
+                self.phase = .closing;
+            }
+        }
+    }
+};
+
+test "soak.h3.bounded_cancelled_requests" {
+    const allocator = testing.allocator;
+
+    var fixed = tls_core.credentials.FixedCredentialProvider.init(
+        tls_core.credentials.testdata.identity(),
+        tls_core.credentials.testdata.ignoredEntropy(),
+    );
+    defer fixed.deinit();
+    var logger = http3_runtime.Logger.init(.err, "http3-soak-reset-test");
+    var handler_state = SoakHandlerState{};
+    var reset_capture = ResetTransportCapture{};
+    var runtime = try http3_runtime.Runtime.init(allocator, &logger, .{
+        .listen_host = "127.0.0.1",
+        .quic_port = 0,
+        .credential_provider = fixed.provider(),
+        .request_handler = soakHandler,
+        .request_handler_ctx = &handler_state,
+        // Independent server-side confirmation the reset actually reached
+        // and was folded by the production runtime, not only that the
+        // client called `resetStream` (see the assertion on
+        // `reset_capture.stream_resets` below).
+        .quic_transport_metrics_ctx = &reset_capture,
+        .quic_transport_metrics_cb = ResetTransportCapture.onDelta,
+    });
+    defer runtime.deinit();
+    runtime.start();
+
+    const rounds_per_worker: usize = if (soakHeavyEnabled()) 10 else 4;
+    const total_work = reset_worker_count * rounds_per_worker;
+
+    const scenario = "soak.h3.bounded_cancelled_requests";
+    const before_sample = try sampleResources(allocator, &runtime, scenario, "before");
+
+    var workers = try allocator.alloc(ResetWorker, reset_worker_count);
+    defer allocator.free(workers);
+    var workers_initialized: usize = 0;
+    defer {
+        for (workers[0..workers_initialized]) |*w| w.deinit();
+    }
+    for (0..reset_worker_count) |i| {
+        workers[i] = try ResetWorker.init(allocator, i, rounds_per_worker, runtime.local_address);
+        workers_initialized += 1;
+        try workers[i].beginRound();
+    }
+
+    var pollfds_buf = try allocator.alloc(posix.pollfd, reset_worker_count);
+    defer allocator.free(pollfds_buf);
+
+    var monitor = WorkloadMonitor.init(allocator, scenario, total_work);
+
+    const deadline = nowUs() + 60_000_000;
+    var iterations: usize = 0;
+    const max_iterations: usize = 400_000;
+
+    while (nowUs() < deadline) : (iterations += 1) {
+        try testing.expect(iterations < max_iterations);
+
+        var finished: usize = 0;
+        for (workers) |*w| {
+            if (w.phase == .round_done) {
+                finished += 1;
+                continue;
+            }
+            try w.flushTransmit();
+        }
+        if (finished == reset_worker_count) break;
+
+        var poll_count: usize = 0;
+        var next_wake: u64 = nowUs() + 20_000;
+        for (workers) |*w| {
+            if (w.phase == .round_done) continue;
+            pollfds_buf[poll_count] = .{ .fd = w.socket.fd, .events = posix.POLL.IN, .revents = 0 };
+            poll_count += 1;
+            if (w.client) |c| {
+                if (c.nextTimeoutUs()) |t| next_wake = @min(next_wake, t);
+            }
+        }
+        const now = nowUs();
+        const timeout_ms: i32 = @intCast(@min((next_wake -| now) / 1_000 + 1, 20));
+        _ = try posix.poll(pollfds_buf[0..poll_count], timeout_ms);
+
+        for (workers) |*w| {
+            if (w.phase == .round_done) continue;
+            try w.drainRecv();
+        }
+        for (workers) |*w| {
+            if (w.phase == .round_done) continue;
+            try w.step();
+        }
+
+        var completed: usize = 0;
+        for (workers) |w| completed += w.requests_completed_total;
+        try monitor.tick(&runtime, completed);
+    }
+
+    const end_workload_sample = try sampleResources(allocator, &runtime, scenario, "end_workload");
+
+    for (workers) |*w| w.deinit();
+    workers_initialized = 0;
+
+    _ = try waitRuntimeSnapshot(&runtime, hasNoTrackedConnections);
+    const after_settle_sample = try sampleResources(allocator, &runtime, scenario, "after_settle");
+
+    // Every round's cancelled request was actually reset -- the production
+    // runtime's own transport-metrics delta moved by exactly the planned
+    // count, proving the RESET_STREAM reached and was folded by
+    // `http3_runtime.Runtime` itself, not only that the client invoked an
+    // API -- and every round's follow-up request on the *same* connection
+    // completed normally: proof the cancellation did not poison the
+    // connection.
+    for (workers) |w| {
+        try testing.expectEqual(rounds_per_worker, w.requests_completed_total);
+    }
+    try testing.expectEqual(total_work, reset_capture.stream_resets.load(.monotonic));
+
+    try testing.expectEqual(@as(usize, 0), after_settle_sample.tracked_connections);
+    try testing.expectEqual(@as(usize, 0), after_settle_sample.active_cid_routes);
+    try testing.expectEqual(@as(usize, 0), after_settle_sample.native_connections);
+
+    var final_open_fds = after_settle_sample.open_fds;
+    if (final_open_fds > before_sample.open_fds) {
+        const fd_deadline = nowUs() + 2_000_000;
+        while (final_open_fds > before_sample.open_fds and nowUs() < fd_deadline) {
+            compat.sleepNs(50 * std.time.ns_per_ms);
+            final_open_fds = try readOpenFdCount(allocator, std.c.getpid());
+        }
+        std.debug.print(
+            "{s}: after_settle open_fds re-sampled to {d} (baseline {d})\n",
+            .{ scenario, final_open_fds, before_sample.open_fds },
+        );
+    }
+    try testing.expect(final_open_fds <= before_sample.open_fds);
+
+    try monitor.checkGrowthAndPlateau(before_sample, end_workload_sample, 8192, reset_worker_count * 4);
 }

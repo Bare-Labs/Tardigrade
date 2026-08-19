@@ -25,7 +25,7 @@ transport implementation. Use the existing owners:
 | --- | --- | --- | --- | --- |
 | Packet loss and reordering do not corrupt packet number, ACK, or retransmission state | `src/quic/packet.zig`, `src/quic/frame.zig`, `src/quic/connection.zig`; summarized in [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md) | property | mapped | Dedicated-host impairment run must show the production UDP listener reports loss/recovery progress through scenario-local QUIC metrics. |
 | PTO and retransmission progression remain bounded and attributable | `src/quic/connection.zig`; `tardigrade_quic_pto_total`; H3 benchmark `quic.pto_total` deltas | property / runtime | mapped | Controlled loss/delay run must retain before/after metrics and qlog only when diagnosis needs it. |
-| `RESET_STREAM` / `STOP_SENDING` lifecycle is idempotent and cleans stream accounting | `src/quic/stream.zig`, `src/quic/connection.zig`, `src/http3/conn.zig`; summarized in [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md) | unit / property | mapped | Soak should include honest cancellation/reset traffic when the available H3 client can generate it without test-only protocol shortcuts. |
+| `RESET_STREAM` / `STOP_SENDING` lifecycle is idempotent and cleans stream accounting | `src/quic/stream.zig`, `src/quic/connection.zig`, `src/http3/conn.zig`; summarized in [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md) | unit / property | closed | Closed by `soak.h3.bounded_cancelled_requests` (`tests/http3_soak.zig`): real client-issued `resetStream` over real UDP, proven at the production runtime via `quic_transport_metrics_cb`'s `stream_resets` delta, plus a same-connection follow-up request proving the reset did not poison the connection. |
 | QPACK blocked-stream unblock, cancellation, and malformed instruction handling stay bounded | `src/http3/qpack.zig`; summarized in [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md) | property | mapped | No production wire gap today while nonzero dynamic QPACK request settings are not exposed by the production H3 config. Reopen only when that surface is enabled. |
 | Critical stream failures preserve the required HTTP/3 close code | `src/http3/conn.zig`; duplicate/closed/reset critical-stream regressions | unit / property | mapped | Production-path protocol-error capture is useful only if it proves close-class propagation through the real runtime before teardown. |
 | Release-critical QUIC/H3/QPACK close code preservation survives malformed input | `src/quic/connection.zig`, `src/http3/conn.zig`, `src/http3/qpack.zig`; external peer failures under `scripts/interop/run-interop.sh` | unit / property / external | mapped | Final interop rerun must publish required rows or explicit environment exceptions. |
@@ -182,8 +182,6 @@ connection/CID observation rows, above. It deliberately does **not** cover:
 - **controlled loss/reordering** -- needs a dedicated host with netem/
   `CAP_NET_ADMIN` (`benchmarks/competitive/netem-impair.sh`), not a portable
   unit test.
-- **cancellation/reset traffic** -- the harness has no honest way to drive it
-  yet.
 - **QPACK dynamic-table bytes/entries/blocked-streams, PTO totals, and
   worker/runtime queue depth** -- these are recorded onto `http.metrics.Metrics`
   only by the `GatewayState` composition layer above `http3_runtime.Runtime`;
@@ -234,6 +232,42 @@ This closes the "reconnect/resumption where the production config supports
 it" workload row above. It deliberately does **not** cover 0-RTT: that would
 need its own early-data-specific admission assertions and is not required by
 this row's "reconnect/resumption" text.
+
+### Implemented: cancellation soak (`tests/http3_soak.zig`)
+
+`soak.h3.bounded_cancelled_requests` proves the "cancellation/reset traffic
+where the client can generate it honestly" workload row: the real client
+already can drive this without test-only protocol shortcuts --
+`H3.sendRequest` returns the real request stream ID, native
+`Connection.resetStream` is public, and production `pump()`'s server-side
+request handling already handles `error.StreamReset` on a request stream by
+removing it from the tracked request map. Two concurrent clients run
+repeated cycles (4 rounds PR-safe, 10 rounds with `TARDIGRADE_SOAK_HEAVY=1`)
+of: open a request, immediately reset it with the H3 request-cancel error
+code before the next transmit flush (so the request and its `RESET_STREAM`
+leave together -- the realistic "changed my mind immediately" shape), then
+send a normal follow-up request on the *same* connection. It runs by default
+under `zig build test` / `zig build test-quic`, alongside the other two
+soaks, and shares the same `WorkloadMonitor` helper. Its pass condition:
+
+- every round's cancelled request was actually reset at the production
+  runtime, not merely offered by the client: `Runtime.Config`'s
+  `quic_transport_metrics_cb` is wired to a counter, and the accumulated
+  `QuicTransportDelta.stream_resets` delta equals the planned reset count
+  exactly
+- every round's follow-up request on the same (not a fresh) connection
+  completed with a normal 200 response -- proof the cancellation did not
+  poison the connection for subsequent requests
+- the same RSS-slope, genuine-peak, connection/CID-state plateau, exact-zero
+  settle, and FD-baseline checks as the other two soaks (same
+  `WorkloadMonitor`, margins scaled to this leg's two-worker workload)
+
+This closes the "cancellation/reset traffic where the client can generate it
+honestly" workload row above. The existing deterministic `quic_h3_e2e` reset
+test already proves QUIC-level reset propagation between two directly-pumped
+connections; this leg proves the distinct thing that test cannot -- repeated
+reset ownership/cleanup through the full `http3_runtime.Runtime` composition
+over real UDP, under the same bounded-resource contract as the other soaks.
 
 ## Final Evidence Bundle
 

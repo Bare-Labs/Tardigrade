@@ -39,6 +39,11 @@ const posix = std.posix;
 pub const StreamRequest = http3_session.StreamRequest;
 pub const Response = response_mod.Response;
 pub const Logger = logger_mod.Logger;
+/// Re-exported so a caller wiring `Config`'s `quic_transport_metrics_cb`
+/// (whose signature already names this type) can spell the callback's
+/// parameter type without a second, separately declared dependency on
+/// `metrics.zig` -- the same re-export shape as `Response`/`Logger` above.
+pub const QuicTransportDelta = metrics_mod.QuicTransportDelta;
 
 pub const EffectiveAdvertisementState = enum {
     disabled,
