@@ -824,6 +824,43 @@ pub fn build(b: *std.Build) void {
     quic_step.dependOn(&run_quic_h3_udp_tests.step);
     test_step.dependOn(&run_quic_h3_udp_tests.step);
 
+    // Bounded production H3 soak (#247 Lane B): concurrent real-UDP clients
+    // driving repeated connect/request/close cycles against the same
+    // `http3_runtime.Runtime` production module, with before/peak/
+    // after-settle resource observations. PR-safe by default; scale to the
+    // heavier tier locally/in scheduled runs with `TARDIGRADE_SOAK_HEAVY=1`.
+    const http3_soak_mod = b.createModule(.{
+        .root_source_file = b.path("tests/http3_soak.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    http3_soak_mod.addImport("quic", quic_mod);
+    http3_soak_mod.addImport("http3", http3_mod);
+    http3_soak_mod.addImport("tls_core", tls_core_mod);
+    http3_soak_mod.addImport("zig_compat", compat_mod);
+    http3_soak_mod.addImport("build_options", build_options.createModule());
+    http3_soak_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
+    const soak_http3_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/http/http3_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    soak_http3_runtime_mod.addImport("zig_compat", compat_mod);
+    soak_http3_runtime_mod.addImport("stream_transport", stream_transport_mod);
+    soak_http3_runtime_mod.addImport("quic", quic_mod);
+    soak_http3_runtime_mod.addImport("http3", http3_mod);
+    soak_http3_runtime_mod.addImport("tls_core", tls_core_mod);
+    soak_http3_runtime_mod.addImport("crypto", crypto_mod);
+    soak_http3_runtime_mod.addImport("build_options", build_options.createModule());
+    soak_http3_runtime_mod.addImport("test_quic_crypto", test_quic_crypto_mod);
+    http3_soak_mod.addImport("http3_runtime", soak_http3_runtime_mod);
+    const http3_soak_tests = b.addTest(.{ .root_module = http3_soak_mod, .filters = quic_test_filters });
+    const run_http3_soak_tests = b.addRunArtifact(http3_soak_tests);
+    quic_step.dependOn(&run_http3_soak_tests.step);
+    test_step.dependOn(&run_http3_soak_tests.step);
+
     // Shared interop/conformance matrix vocabulary (#338): the single place
     // that maps a matrix row's cipher-suite/group/signature/ALPN names onto
     // an engine policy. Both interop tools import it, so a row means the

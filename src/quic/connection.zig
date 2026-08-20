@@ -809,6 +809,8 @@ const SentRecord = struct {
     /// Flow-control and lifecycle frames that must be re-armed on loss.
     carried_max_data: bool = false,
     carried_max_stream_data: ?StreamId = null,
+    carried_max_streams_bidi: bool = false,
+    carried_max_streams_uni: bool = false,
     carried_handshake_done: bool = false,
     carried_reset_stream: ?quic_stream.ResetStreamFrame = null,
     carried_stop_sending: ?quic_stream.StopSendingFrame = null,
@@ -1211,6 +1213,19 @@ pub const Connection = struct {
 
     pending_max_data: ?u64 = null,
     pending_max_stream_data: std.ArrayList(struct { id: StreamId, limit: u64 }) = .empty,
+    // RFC 9000 §4.6 MAX_STREAMS replenishment (#247 soak finding): nullable
+    // scalars, not a queue, matching `pending_max_data`'s shape -- both are
+    // monotonic latest-value-wins limits, so there is never more than one
+    // outstanding update to carry regardless of how many streams closed
+    // since the last one went out. `last_advertised_max_streams_{bidi,uni}`
+    // is what `pollMaxStreamsCredit`'s per-tick sweep compares the
+    // `StreamManager`'s current (possibly just-grown) ceiling against, so
+    // it only arms `pending_max_streams_*` when credit has genuinely grown
+    // since the last time this connection told the peer about it.
+    pending_max_streams_bidi: ?u64 = null,
+    pending_max_streams_uni: ?u64 = null,
+    last_advertised_max_streams_bidi: u64 = 0,
+    last_advertised_max_streams_uni: u64 = 0,
     pending_resets: std.ArrayList(quic_stream.ResetStreamFrame) = .empty,
     pending_stop_sending: std.ArrayList(quic_stream.StopSendingFrame) = .empty,
     pending_retires: std.ArrayList(u64) = .empty,
@@ -2170,7 +2185,33 @@ pub const Connection = struct {
                 };
                 const f = decoded orelse break;
                 if (f.isAckEliciting()) ack_eliciting = true;
-                try self.applyFrame(level, f, ingress_path, local_cid_sequence, now_us);
+                self.applyFrame(level, f, ingress_path, local_cid_sequence, now_us) catch |err| {
+                    // Post-authentication ingest OOM must be terminal for
+                    // this connection (#247 soak finding, review round 8):
+                    // `pn` was already inserted into `recovery`'s
+                    // received/ACK-range bookkeeping above, before this
+                    // frame loop ever ran (mirroring the ACK-range-overflow
+                    // failure a few lines up, which already closes rather
+                    // than tries to unwind). Several frame effects in the
+                    // switch below are allocator-fallible (STOP_SENDING's
+                    // RESET_STREAM queue reservation, `known_streams`/
+                    // `accept_queue`/`pending_retires` inserts) -- if any of
+                    // them fails partway through, a required protocol
+                    // effect can be left uncommitted with no safe way to
+                    // unwind the PN/ACK-range insertion: `AckRangeSet`
+                    // merges ranges on insert, so removing a single value
+                    // would need range-splitting logic that does not exist.
+                    // A connection left running after this could later ACK
+                    // this exact packet number for an unrelated reason and
+                    // tell the peer an effect was received when it never
+                    // actually committed. Closing here guarantees a
+                    // surviving connection can never do that --
+                    // `pollTransmitOnPath` restricts a `.closing` connection
+                    // to only ever (re)sending the CONNECTION_CLOSE
+                    // datagram, never an ordinary ACK.
+                    self.startClose(.{ .error_code = error_internal, .is_application = false, .local = true }, "frame apply", now_us);
+                    return err;
+                };
                 if (self.state_ == .closed or self.state_ == .draining) return;
                 if (self.state_ == .closing) break;
             }
@@ -2285,22 +2326,40 @@ pub const Connection = struct {
             },
             .stop_sending => |ss| {
                 var manager = self.streamManager() orelse return;
+                // RFC 9000 §3.5: a STOP_SENDING peer expects RESET_STREAM,
+                // but only once -- a retransmitted STOP_SENDING (its ACK
+                // was lost, so the peer resent it) finds the stream already
+                // Reset Sent and this is a no-op. The queue slot must be
+                // reserved *before* logically accepting the STOP_SENDING at
+                // all (`receiveStopSending`/`sendResetStream` both commit
+                // state with no way to undo it): committing first and only
+                // then discovering the reservation can't allocate would
+                // strand the stream permanently claiming "already reset"
+                // with no RESET_STREAM ever queued for the peer. Just as
+                // important: `try` here propagates OOM out of `applyFrame`
+                // (whose error set is exactly `error{OutOfMemory}`) instead
+                // of swallowing it, so `ingest`'s `try self.applyFrame(...)`
+                // aborts before marking this packet's space `ack_needed`.
+                // A `catch return` here would report success and let this
+                // ack-eliciting packet get ACKed anyway, leaving the peer
+                // with no reason to ever retransmit the STOP_SENDING whose
+                // required response never got queued.
+                const needs_reset = if (manager.get(ss.id)) |stream| stream.canSend() and !stream.reset_sent else false;
+                if (needs_reset) try self.pending_resets.ensureUnusedCapacity(self.allocator, 1);
                 manager.receiveStopSending(ss) catch |err| {
                     self.closeOnStreamError(err, now_us);
                     return;
                 };
                 self.events.emit(.{ .stop_sending = .{ .id = ss.id, .error_code = ss.app_error_code, .local = false } });
-                // RFC 9000 §3.5: a STOP_SENDING peer expects RESET_STREAM.
-                const old = if (manager.get(ss.id)) |stream| stream.state() else null;
-                if (manager.sendResetStream(ss.id, ss.app_error_code)) |reset| {
-                    try self.pending_resets.append(self.allocator, reset);
-                    self.forgetLocalStreamFlowBlocked(ss.id);
-                    self.events.emit(.{ .stream_reset = .{ .id = ss.id, .error_code = ss.app_error_code, .local = true } });
-                    if (old) |old_state| {
-                        if (manager.get(ss.id)) |stream| self.emitStreamStateTransition(ss.id, old_state, stream.state(), .remote);
-                    }
-                    if (self.send_queues.get(ss.id)) |queue| queue.reset_sent = true;
-                } else |_| {}
+                if (!needs_reset) return;
+                const stream = manager.get(ss.id) orelse return;
+                const old = stream.state();
+                const reset = (manager.sendResetStream(ss.id, ss.app_error_code) catch return) orelse return;
+                self.pending_resets.appendAssumeCapacity(reset);
+                self.forgetLocalStreamFlowBlocked(ss.id);
+                self.events.emit(.{ .stream_reset = .{ .id = ss.id, .error_code = ss.app_error_code, .local = true } });
+                self.emitStreamStateTransition(ss.id, old, stream.state(), .remote);
+                if (self.send_queues.get(ss.id)) |queue| queue.reset_sent = true;
             },
             .max_data => |limit| {
                 if (self.streamManager()) |manager| {
@@ -2997,6 +3056,8 @@ pub const Connection = struct {
         }
         if (record.carried_max_data) self.queueMaxDataUpdate();
         if (record.carried_max_stream_data) |id| self.queueMaxStreamDataUpdate(id);
+        if (record.carried_max_streams_bidi) self.queueMaxStreamsUpdate(.bidi);
+        if (record.carried_max_streams_uni) self.queueMaxStreamsUpdate(.uni);
         if (record.carried_reset_stream) |reset| {
             self.pending_resets.append(self.allocator, reset) catch {};
         }
@@ -3073,6 +3134,34 @@ pub const Connection = struct {
     fn queueMaxDataUpdate(self: *Connection) void {
         if (self.streamManager()) |manager| {
             self.pending_max_data = manager.max_data_recv;
+        }
+    }
+
+    fn queueMaxStreamsUpdate(self: *Connection, typ: quic_stream.StreamType) void {
+        const manager = self.streamManager() orelse return;
+        switch (typ) {
+            .bidi => self.pending_max_streams_bidi = manager.local.initial_max_streams_bidi,
+            .uni => self.pending_max_streams_uni = manager.local.initial_max_streams_uni,
+        }
+    }
+
+    /// RFC 9000 §4.6 MAX_STREAMS credit-growth notification (#247 soak
+    /// finding): `StreamManager.maybeClose` raises `local.
+    /// initial_max_streams_{bidi,uni}` in place as peer-initiated streams
+    /// close, but that credit is worthless to the peer until a MAX_STREAMS
+    /// frame actually tells them about it. Called once per
+    /// `pollTransmitOnPath` rather than from every individual close site,
+    /// the same "cheap per-tick check" shape already used elsewhere in this
+    /// file, so credit growth from any close path is picked up uniformly.
+    fn pollMaxStreamsCredit(self: *Connection) void {
+        const manager = self.streamManager() orelse return;
+        if (manager.local.initial_max_streams_bidi > self.last_advertised_max_streams_bidi) {
+            self.pending_max_streams_bidi = manager.local.initial_max_streams_bidi;
+            self.last_advertised_max_streams_bidi = manager.local.initial_max_streams_bidi;
+        }
+        if (manager.local.initial_max_streams_uni > self.last_advertised_max_streams_uni) {
+            self.pending_max_streams_uni = manager.local.initial_max_streams_uni;
+            self.last_advertised_max_streams_uni = manager.local.initial_max_streams_uni;
         }
     }
 
@@ -3906,9 +3995,17 @@ pub const Connection = struct {
 
     pub fn resetStream(self: *Connection, id: StreamId, app_error_code: u64) !void {
         var manager = self.streamManager() orelse return error.NotEstablished;
-        const old = if (manager.get(id)) |stream| stream.state() else return error.UnknownStream;
-        const reset = try manager.sendResetStream(id, app_error_code);
-        try self.pending_resets.append(self.allocator, reset);
+        const stream = manager.get(id) orelse return error.UnknownStream;
+        // Already Reset Sent (e.g. a caller resetting the same stream
+        // twice): nothing new to queue or emit.
+        if (stream.reset_sent) return;
+        const old = stream.state();
+        // Reserve the queue slot *before* committing the stream to Reset
+        // Sent -- see the `.stop_sending` handler's identical comment for
+        // why this ordering matters for OOM safety.
+        try self.pending_resets.ensureUnusedCapacity(self.allocator, 1);
+        const reset = (try manager.sendResetStream(id, app_error_code)) orelse return;
+        self.pending_resets.appendAssumeCapacity(reset);
         self.forgetLocalStreamFlowBlocked(id);
         self.events.emit(.{ .stream_reset = .{ .id = id, .error_code = app_error_code, .local = true } });
         self.emitStreamStateIfChanged(id, old);
@@ -4030,6 +4127,7 @@ pub const Connection = struct {
     /// tried first so a probe is never starved behind ordinary traffic.
     pub fn pollTransmitOnPath(self: *Connection, out: []u8, now_us: u64) ?Transmit {
         if (self.state_ == .closed or self.state_ == .draining) return null;
+        self.pollMaxStreamsCredit();
         if (out.len < base_datagram_size) return null;
 
         // RFC 9002 expresses every NewReno window in terms of the sender's
@@ -4803,6 +4901,8 @@ pub const Connection = struct {
         if (self.handshake_done_pending) return true;
         if (self.pending_max_data != null) return true;
         if (self.pending_max_stream_data.items.len > 0) return true;
+        if (self.pending_max_streams_bidi != null) return true;
+        if (self.pending_max_streams_uni != null) return true;
         if (self.pending_resets.items.len > 0) return true;
         if (self.pending_stop_sending.items.len > 0) return true;
         if (self.pending_retires.items.len > 0) return true;
@@ -4852,6 +4952,22 @@ pub const Connection = struct {
             record.ack_eliciting = true;
             record.carried_max_stream_data = entry.id;
             _ = self.pending_max_stream_data.orderedRemove(0);
+        }
+        if (self.pending_max_streams_bidi) |limit| {
+            if (frame.encodeMaxStreams(.bidi, limit, plain[plain_len..budget])) |n| {
+                plain_len += n;
+                record.ack_eliciting = true;
+                record.carried_max_streams_bidi = true;
+                self.pending_max_streams_bidi = null;
+            } else |_| {}
+        }
+        if (self.pending_max_streams_uni) |limit| {
+            if (frame.encodeMaxStreams(.uni, limit, plain[plain_len..budget])) |n| {
+                plain_len += n;
+                record.ack_eliciting = true;
+                record.carried_max_streams_uni = true;
+                self.pending_max_streams_uni = null;
+            } else |_| {}
         }
         // RESET_STREAM / STOP_SENDING: sent once, re-queued if the carrying
         // packet is lost. One of each per packet keeps the record small.
@@ -6288,6 +6404,124 @@ test "driver: bidirectional stream data round-trips with FIN" {
     try testing.expectEqual(quic_stream.StreamState.closed, pair.server.streamState(id).?);
 }
 
+test "driver: MAX_STREAMS replenishment lets a peer keep opening streams past the initial limit" {
+    // #247 soak finding: deliberately tiny so two ordinary request/response
+    // cycles exhaust it -- proves replenishment actually happens under
+    // normal traffic, not just that a generous production default never
+    // gets exercised in a short-lived test.
+    const allocator = testing.allocator;
+    var pair = try TestPair.initWithConfigs(allocator, .{}, .{ .initial_max_streams_bidi = 2 });
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var buf: [64]u8 = undefined;
+
+    const first = try pair.client.openStream(.bidi);
+    const second = try pair.client.openStream(.bidi);
+    // The limit is real and reached with neither stream closed yet: opening
+    // a third fails exactly as it would on an ordinary long-lived
+    // connection that has hit the wall this fix addresses. Checked before
+    // either round-trip below completes -- credit replenishment turned out
+    // to be fast enough (queued on the very next `pollTransmitOnPath` after
+    // `maybeClose` grows it, i.e. within the same `pair.pump()` that closes
+    // a stream) that checking any later would no longer observe the
+    // original, unraised limit at all.
+    try testing.expectError(error.StreamLimitExceeded, pair.client.openStream(.bidi));
+
+    _ = try pair.client.writeStream(first, "req", true);
+    _ = try pair.client.writeStream(second, "req", true);
+    try pair.pump();
+
+    // Accept-order between two streams opened in the same flight isn't
+    // this test's concern, so drain by count rather than assuming which of
+    // `first`/`second` `acceptStream` returns first.
+    var accepted: usize = 0;
+    while (pair.server.acceptStream()) |id| {
+        accepted += 1;
+        const request = try pair.server.readStream(id, &buf);
+        try testing.expectEqualStrings("req", buf[0..request.len]);
+        _ = try pair.server.writeStream(id, "res", true);
+    }
+    try testing.expectEqual(@as(usize, 2), accepted);
+    try pair.pump();
+
+    for ([_]StreamId{ first, second }) |id| {
+        const response = try pair.client.readStream(id, &buf);
+        try testing.expectEqualStrings("res", buf[0..response.len]);
+        try testing.expectEqual(quic_stream.StreamState.closed, pair.client.streamState(id).?);
+        try testing.expectEqual(quic_stream.StreamState.closed, pair.server.streamState(id).?);
+    }
+
+    // The core guarantee, independent of transmission: `StreamManager.
+    // maybeClose` already raised the *server's own* bookkeeping past the
+    // original limit as both streams above fully closed.
+    const server_manager = pair.server.streamManager().?;
+    try testing.expect(server_manager.local.initial_max_streams_bidi > 2);
+
+    // And that growth actually reached the client over the wire: it can
+    // now open a third, and a fourth, stream on the same connection
+    // without ever reconnecting.
+    const third = try pair.client.openStream(.bidi);
+    _ = try pair.client.writeStream(third, "req3", true);
+    try pair.pump();
+    var saw_third = false;
+    while (pair.server.acceptStream()) |id| {
+        if (id != third) continue;
+        saw_third = true;
+        const third_request = try pair.server.readStream(id, &buf);
+        try testing.expectEqualStrings("req3", buf[0..third_request.len]);
+    }
+    try testing.expect(saw_third);
+
+    const fourth = try pair.client.openStream(.bidi);
+    _ = try pair.client.writeStream(fourth, "req4", true);
+    try pair.pump();
+    try testing.expectEqual(@as(?StreamId, fourth), pair.server.acceptStream());
+}
+
+test "driver: MAX_STREAMS_UNI replenishment fires when a uni stream's only real direction closes" {
+    // #247 soak finding: a unidirectional stream has only one real
+    // direction -- `canSend()`/`canReceive()` is false for the other one,
+    // which never becomes `send_closed`/`recv_closed` because nothing ever
+    // closes a direction that was never open. Before `Stream.state()`
+    // treated a nonexistent direction as trivially done, a closed
+    // peer-initiated uni stream never reported aggregate `.closed`, so
+    // `StreamManager.maybeClose` never counted it and MAX_STREAMS_UNI could
+    // never replenish. Deliberately tiny limit so one stream exhausts it.
+    const allocator = testing.allocator;
+    var pair = try TestPair.initWithConfigs(allocator, .{}, .{ .initial_max_streams_uni = 1 });
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    var buf: [64]u8 = undefined;
+
+    const first = try pair.client.openStream(.uni);
+    try testing.expectError(error.StreamLimitExceeded, pair.client.openStream(.uni));
+
+    _ = try pair.client.writeStream(first, "hello", true);
+    try pair.pump();
+
+    const accepted = pair.server.acceptStream() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(first, accepted);
+    const received = try pair.server.readStream(accepted, &buf);
+    try testing.expectEqualStrings("hello", buf[0..received.len]);
+    try testing.expect(received.fin);
+    try pair.pump();
+
+    try testing.expectEqual(quic_stream.StreamState.closed, pair.client.streamState(first).?);
+    try testing.expectEqual(quic_stream.StreamState.closed, pair.server.streamState(first).?);
+
+    const server_manager = pair.server.streamManager().?;
+    try testing.expect(server_manager.local.initial_max_streams_uni > 1);
+
+    // Credit reached the client over the wire: it can open a second uni
+    // stream on the same connection without ever reconnecting.
+    const second = try pair.client.openStream(.uni);
+    _ = try pair.client.writeStream(second, "again", true);
+    try pair.pump();
+    try testing.expectEqual(@as(?StreamId, second), pair.server.acceptStream());
+}
+
 test "driver: stream scheduling hint sends lower urgency first" {
     const allocator = testing.allocator;
     var pair = try TestPair.init(allocator);
@@ -6934,6 +7168,199 @@ test "driver: valid peer STOP_SENDING emits the automatic local RESET_STREAM onc
     _ = pair.server.pollTransmitOnPath(&out, pair.now_us + 1_000);
     try testing.expectEqual(@as(usize, 1), capture.remote_stop_sending);
     try testing.expectEqual(@as(usize, 1), capture.local_reset);
+}
+
+test "driver: duplicate peer STOP_SENDING does not re-emit the automatic local RESET_STREAM" {
+    // #247 soak finding: QUIC retransmits a STOP_SENDING whose ACK was
+    // lost in a new packet, so the same logical STOP_SENDING can reach
+    // `applyFrame` twice (each in its own packet, so packet-number dedup
+    // does not catch it -- this is exactly that shape, injected at the
+    // frame layer the same way a second, later packet's frame would be).
+    // The first must drive the RFC 9000 SS3.5 automatic local RESET_STREAM
+    // exactly as the single-delivery test above proves; the second must be
+    // a pure no-op: no second `stream_reset` event, no second queued
+    // RESET_STREAM frame to transmit, no second `stream_resets` metric
+    // increment.
+    const Capture = struct {
+        remote_stop_sending: usize = 0,
+        local_reset: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            switch (event) {
+                .stop_sending => |stop| {
+                    if (!stop.local) self.remote_stop_sending += 1;
+                },
+                .stream_reset => |reset| {
+                    if (reset.local) self.local_reset += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id = try pair.server.openStream(.bidi);
+    var capture = Capture{};
+    pair.server.events = .{ .context = &capture, .emitFn = Capture.onEvent };
+
+    try pair.server.applyFrame(.application, .{ .stop_sending = .{ .id = id, .app_error_code = 7 } }, TestPair.server_path, 0, pair.now_us);
+    try testing.expectEqual(@as(usize, 1), capture.remote_stop_sending);
+    try testing.expectEqual(@as(usize, 1), capture.local_reset);
+    const reset_streams_after_first = pair.server.streams.?.metrics.reset_streams;
+
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestExpectedEqual;
+
+    // The retransmitted duplicate: `applyFrame` operates below QUIC's own
+    // packet-number dedup, directly exercising the frame handler's own
+    // idempotency the same way a second packet carrying the identical
+    // retransmitted STOP_SENDING frame would.
+    try pair.server.applyFrame(.application, .{ .stop_sending = .{ .id = id, .app_error_code = 7 } }, TestPair.server_path, 0, pair.now_us + 1_000);
+    try testing.expectEqual(@as(usize, 2), capture.remote_stop_sending);
+    try testing.expectEqual(@as(usize, 1), capture.local_reset);
+    try testing.expectEqual(reset_streams_after_first, pair.server.streams.?.metrics.reset_streams);
+    try testing.expect(pair.server.pollTransmitOnPath(&out, pair.now_us + 1_000) == null);
+}
+
+test "resetStream reservation failure leaves the stream retryable, not stranded" {
+    // #247 soak finding: `sendResetStream`'s state mutation (`reset_sent`,
+    // `reset_streams` metric) and the `pending_resets` queue append that
+    // carries it onto the wire must be one transaction. If the append's
+    // allocation failed *after* the mutation already committed, the
+    // now-idempotent `sendResetStream` would see `reset_sent == true` on
+    // any later retry and correctly, but permanently, no-op -- stranding a
+    // RESET_STREAM that was never actually queued for the peer. Reserving
+    // capacity first (`ensureUnusedCapacity`) means a failed reservation
+    // never reaches `sendResetStream` at all, so the stream stays
+    // untouched and retryable.
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id = try pair.client.openStream(.bidi);
+    _ = try pair.client.writeStream(id, "hello", true);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const real_allocator = pair.client.allocator;
+    pair.client.allocator = failing.allocator();
+    try testing.expectError(error.OutOfMemory, pair.client.resetStream(id, 42));
+    pair.client.allocator = real_allocator;
+
+    const manager = pair.client.streamManager().?;
+    try testing.expect(!manager.get(id).?.reset_sent);
+    try testing.expectEqual(@as(usize, 0), pair.client.pending_resets.items.len);
+    try testing.expectEqual(@as(u64, 0), manager.metrics.reset_streams);
+
+    // Retry with a working allocator: succeeds, queues exactly one reset.
+    try pair.client.resetStream(id, 42);
+    try testing.expect(manager.get(id).?.reset_sent);
+    try testing.expectEqual(@as(usize, 1), pair.client.pending_resets.items.len);
+    try testing.expectEqual(@as(u64, 1), manager.metrics.reset_streams);
+}
+
+test "STOP_SENDING automatic-reset reservation failure leaves the stream retryable when applied directly" {
+    // Same transactional requirement as the explicit `resetStream` test
+    // above, but for the RFC 9000 SS3.5 automatic reset a received
+    // STOP_SENDING triggers: a failed reservation must propagate as
+    // `error.OutOfMemory` out of `applyFrame` rather than being swallowed,
+    // and nothing about the stream may be committed on the failed attempt.
+    // This calls `applyFrame` directly (fast, no real packet needed) to
+    // pin down the stream-level transaction; it deliberately does not
+    // attempt to prove the packet-level "never ACKed" wire property --
+    // `applyFrame` alone bypasses `ingestPacket`'s received-PN/ACK-range
+    // bookkeeping entirely, so it cannot demonstrate that. See the
+    // packet-level regression below for that proof.
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id = try pair.server.openStream(.bidi);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const real_allocator = pair.server.allocator;
+    pair.server.allocator = failing.allocator();
+    try testing.expectError(
+        error.OutOfMemory,
+        pair.server.applyFrame(.application, .{ .stop_sending = .{ .id = id, .app_error_code = 7 } }, TestPair.server_path, 0, pair.now_us),
+    );
+    pair.server.allocator = real_allocator;
+
+    const manager = pair.server.streamManager().?;
+    try testing.expect(!manager.get(id).?.stop_sending_received);
+    try testing.expect(!manager.get(id).?.reset_sent);
+    try testing.expectEqual(@as(usize, 0), pair.server.pending_resets.items.len);
+    try testing.expectEqual(@as(u64, 0), manager.metrics.reset_streams);
+
+    // The retransmitted STOP_SENDING, now with a working allocator:
+    // completes the automatic reset exactly once.
+    try pair.server.applyFrame(.application, .{ .stop_sending = .{ .id = id, .app_error_code = 7 } }, TestPair.server_path, 0, pair.now_us + 1_000);
+    try testing.expect(manager.get(id).?.stop_sending_received);
+    try testing.expect(manager.get(id).?.reset_sent);
+    try testing.expectEqual(@as(usize, 1), pair.server.pending_resets.items.len);
+    try testing.expectEqual(@as(u64, 1), manager.metrics.reset_streams);
+}
+
+test "post-authentication ingest OOM is terminal, so a failed frame effect can never later be ACKed" {
+    // #247 soak finding (review round 8): `ingestPacket()` records this
+    // packet's number into `recovery`'s received/ACK-range bookkeeping
+    // (`onPacketReceived`) *before* it parses frames and applies their
+    // effects. The previous fix (reserve before `receiveStopSending`) makes
+    // the *stream* transaction safe, but if the reservation still fails,
+    // the packet's own number is already committed with no safe way to
+    // unwind it -- `AckRangeSet` merges ranges on insert, so removing a
+    // single value would need range-splitting logic that does not exist.
+    // Proven at the real packet-ingest layer, not by calling `applyFrame`
+    // directly (which bypasses the PN/ACK-range commit entirely and so
+    // cannot demonstrate this): deliver a genuine protected datagram
+    // carrying a STOP_SENDING frame with the reservation forced to fail,
+    // then confirm the connection is now `.closing` -- which
+    // `pollTransmitOnPath` restricts to only ever (re)sending the
+    // CONNECTION_CLOSE datagram, so a surviving connection can never build
+    // an ordinary ACK covering this packet's number, no matter what
+    // arrives afterward.
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id = try pair.server.openStream(.bidi);
+    _ = try pair.server.writeStream(id, "srv", false);
+    try pair.pump();
+
+    try pair.client.stopSending(id, 7);
+    var send_buf: [2048]u8 = undefined;
+    const t = pair.client.pollTransmitOnPath(&send_buf, pair.now_us) orelse return error.TestUnexpectedResult;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const real_allocator = pair.server.allocator;
+    pair.server.allocator = failing.allocator();
+    try testing.expectError(
+        error.OutOfMemory,
+        pair.server.ingestOnPath(t.bytes, TestPair.server_path, TestPair.test_challenge_entropy, pair.now_us),
+    );
+    pair.server.allocator = real_allocator;
+
+    // The mandatory RESET_STREAM was never queued, and the connection is
+    // now terminal for ordinary traffic.
+    try testing.expectEqual(@as(usize, 0), pair.server.pending_resets.items.len);
+    try testing.expectEqual(State.closing, pair.server.state_);
+
+    // Confirmed both immediately (armed by `startClose`) and after another
+    // round of unrelated traffic: only the CONNECTION_CLOSE datagram can
+    // ever come out from here, never an ordinary ACK that could cover the
+    // packet whose STOP_SENDING effect never committed.
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestUnexpectedResult;
+
+    try pair.pump();
+    try testing.expectEqual(State.closing, pair.server.state_);
 }
 
 test "driver: validated ACK reports recovery metrics after PTO backoff reset" {

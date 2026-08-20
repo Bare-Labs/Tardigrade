@@ -303,11 +303,33 @@ pub const Stream = struct {
     }
 
     pub fn state(self: Stream) StreamState {
+        // Terminal precedence (#247 soak finding): a stream whose send and
+        // receive sides are *both* closed is `.closed` even when one or
+        // both sides closed via reset -- e.g. a fully cancelled bidi
+        // request (client RESET_STREAM closes recv here, then the server's
+        // own RFC 9000 SS3.5 auto-RESET_STREAM in response to STOP_SENDING
+        // closes send here). Checking `reset_received`/`reset_sent` first
+        // left such a stream permanently reporting a reset state instead of
+        // `.closed`, so `StreamManager.maybeClose` never saw `.closed` and
+        // never decremented `active_streams`/incremented `closed_streams`
+        // for it -- an accounting leak for any stream closed via reset in
+        // both directions while the connection stays alive.
+        //
+        // A unidirectional stream has only one real direction --
+        // `canSend()`/`canReceive()` is false for the nonexistent one, and
+        // `send_closed`/`recv_closed` for that side never becomes true
+        // (nothing ever closes a direction that was never open). Treating a
+        // nonexistent direction as still-open left every uni stream
+        // permanently short of `.closed` (stuck at `.half_closed_*` or a
+        // reset state), so `maybeClose` never counted it and MAX_STREAMS_UNI
+        // credit could never replenish (#247 soak finding).
+        const send_done = !self.canSend() or self.send_closed;
+        const recv_done = !self.canReceive() or self.recv_closed;
+        if (send_done and recv_done) return .closed;
         if (self.reset_received) return .reset_received;
         if (self.reset_sent) return .reset_sent;
-        if (self.send_closed and self.recv_closed) return .closed;
-        if (self.send_closed) return .half_closed_local;
-        if (self.recv_closed) return .half_closed_remote;
+        if (send_done) return .half_closed_local;
+        if (recv_done) return .half_closed_remote;
         return .open;
     }
 
@@ -438,6 +460,35 @@ pub const StreamManager = struct {
     max_data_send: u64,
     max_data_recv: u64,
     metrics: Metrics = .{},
+    // RFC 9000 §4.6 MAX_STREAMS replenishment (#247 soak finding): without
+    // this, a long-lived connection whose peer opens and fully closes many
+    // streams (e.g. a persistent HTTP/3 connection serving many requests)
+    // would permanently exhaust `local.initial_max_streams_{bidi,uni}` and
+    // could never accept stream N+1 even though every earlier stream is
+    // long closed. `closed_peer_{bidi,uni}` counts peer-initiated streams
+    // that have reached `.closed` (both directions terminal); `maybeClose`
+    // grants one more unit of credit per closed stream by raising
+    // `local.initial_max_streams_{bidi,uni}` in place to
+    // `closed_peer_X + initial_max_streams_X_floor` -- the *floor* fields
+    // below hold the original, pre-mutation initial value so growth is
+    // additive (total lifetime allowance = original + closed), not
+    // compounding. This exactly mirrors `applyMaxStreams`'s identical
+    // in-place mutation of `peer.initial_max_streams_{bidi,uni}` for the
+    // opposite (outbound) direction -- see that function's own comment.
+    //
+    // Deliberate scope boundary: `streams` entries are never removed once
+    // `close_counted`, so replenishment is capped at
+    // `config.max_retained_closed_streams_per_direction` per direction (see
+    // that constant's doc comment for the full reasoning) rather than
+    // granted without bound -- once `closed_peer_X` reaches the cap,
+    // further peer-initiated closes still increment `metrics.closed_streams`
+    // but stop raising `local.initial_max_streams_X`, so `streams` for that
+    // direction cannot grow past a small, fixed, provable ceiling regardless
+    // of connection lifetime.
+    closed_peer_bidi: u64 = 0,
+    closed_peer_uni: u64 = 0,
+    initial_max_streams_bidi_floor: u64 = 0,
+    initial_max_streams_uni_floor: u64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -453,6 +504,8 @@ pub const StreamManager = struct {
             .streams = std.AutoHashMap(StreamId, *Stream).init(allocator),
             .max_data_send = peer.initial_max_data,
             .max_data_recv = local.initial_max_data,
+            .initial_max_streams_bidi_floor = local.initial_max_streams_bidi,
+            .initial_max_streams_uni_floor = local.initial_max_streams_uni,
         };
     }
 
@@ -620,15 +673,30 @@ pub const StreamManager = struct {
         self.maybeClose(stream);
     }
 
-    pub fn sendResetStream(self: *StreamManager, id: StreamId, app_error_code: u64) !ResetStreamFrame {
+    /// `null` means "already in Reset Sent, nothing new to do" -- both
+    /// explicit local resets (`Connection.resetStream`) and the RFC 9000
+    /// §3.5 automatic reset a received STOP_SENDING triggers share this one
+    /// idempotent transition. QUIC retransmits a STOP_SENDING whose ACK was
+    /// lost in a new packet, so a caller seeing the same logical reset
+    /// request twice is not hypothetical; §3.5 only requires the automatic
+    /// RESET_STREAM while the stream is Ready/Send, not a second one once
+    /// it is already Reset Sent. Callers must treat `null` as success/no-op
+    /// -- never queue another frame, re-emit a local reset transition, or
+    /// re-increment `reset_streams` for it.
+    pub fn sendResetStream(self: *StreamManager, id: StreamId, app_error_code: u64) !?ResetStreamFrame {
         const stream = self.streams.get(id) orelse return error.UnknownStream;
         if (!stream.canSend()) return error.RecvOnlyStream;
+        if (stream.reset_sent) return null;
         stream.reset_sent = true;
         stream.send_closed = true;
         stream.app_error_code = app_error_code;
         self.metrics.reset_streams += 1;
+        // Captured before `maybeClose`: `stream` is never freed by anything
+        // in this file today, but reading it only via values captured
+        // beforehand costs nothing and stays correct if that ever changes.
+        const final_size = stream.send_offset;
         self.maybeClose(stream);
-        return .{ .id = id, .app_error_code = app_error_code, .final_size = stream.send_offset };
+        return .{ .id = id, .app_error_code = app_error_code, .final_size = final_size };
     }
 
     pub fn receiveStopSending(self: *StreamManager, frame: StopSendingFrame) !void {
@@ -695,6 +763,43 @@ pub const StreamManager = struct {
             stream.close_counted = true;
             if (self.metrics.active_streams > 0) self.metrics.active_streams -= 1;
             self.metrics.closed_streams += 1;
+            // RFC 9000 §4.6 MAX_STREAMS replenishment (#247 soak finding):
+            // grant one more unit of credit per closed peer-initiated
+            // stream by raising `local.initial_max_streams_{bidi,uni}` in
+            // place -- mirroring `applyMaxStreams`'s identical mutation of
+            // `peer.initial_max_streams_{bidi,uni}` for the opposite
+            // (outbound) direction, see that function's comment. The
+            // `_floor` fields hold the original, pre-mutation initial
+            // value so growth is additive (total lifetime allowance =
+            // original + closed), not compounding. `Stream` entries
+            // themselves are never removed from `streams`, so growth stops
+            // once `closed_peer_{bidi,uni}` reaches
+            // `config.max_retained_closed_streams_per_direction` -- see that
+            // constant's doc comment and the note on the closed-stream-
+            // retention tradeoff at the top of this struct's `_floor`
+            // fields' declaration.
+            if (streamInitiator(stream.id) != self.role.initiator()) {
+                switch (streamType(stream.id)) {
+                    .bidi => {
+                        if (self.closed_peer_bidi < config.max_retained_closed_streams_per_direction) {
+                            self.closed_peer_bidi +|= 1;
+                            self.local.initial_max_streams_bidi = @min(
+                                config.max_initial_streams_transport_parameter,
+                                self.closed_peer_bidi +| self.initial_max_streams_bidi_floor,
+                            );
+                        }
+                    },
+                    .uni => {
+                        if (self.closed_peer_uni < config.max_retained_closed_streams_per_direction) {
+                            self.closed_peer_uni +|= 1;
+                            self.local.initial_max_streams_uni = @min(
+                                config.max_initial_streams_transport_parameter,
+                                self.closed_peer_uni +| self.initial_max_streams_uni_floor,
+                            );
+                        }
+                    },
+                }
+            }
         }
     }
 
@@ -969,6 +1074,110 @@ test "reset stream and stop sending update state and propagation" {
     const stop = try manager.sendStopSending(id, 99);
     try std.testing.expectEqual(@as(u64, 99), stop.app_error_code);
     try std.testing.expectEqual(@as(u64, 1), manager.metrics.stop_sending_events);
+}
+
+test "stream reset in both directions while connection stays alive counts closed exactly once" {
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = "abc" });
+    try std.testing.expectEqual(@as(u64, 1), manager.metrics.active_streams);
+    try std.testing.expectEqual(@as(u64, 0), manager.metrics.closed_streams);
+
+    // Client abandons its request (recv-side close here): still only
+    // half-duplex closed, so this must not count as terminally closed yet.
+    try manager.receiveResetStream(.{ .id = id, .app_error_code = 42, .final_size = 3 });
+    try std.testing.expectEqual(StreamState.reset_received, manager.get(id).?.state());
+    try std.testing.expectEqual(@as(u64, 1), manager.metrics.active_streams);
+    try std.testing.expectEqual(@as(u64, 0), manager.metrics.closed_streams);
+
+    // Server's own RFC 9000 SS3.5 auto-RESET_STREAM in response to a
+    // STOP_SENDING it received (mirrors `Connection`'s `.stop_sending`
+    // handler, which calls this same `sendResetStream` after
+    // `receiveStopSending`) closes the send side too -- both directions
+    // are now closed, so this must count as terminally closed exactly once
+    // even though closure happened entirely via reset, not FIN.
+    _ = try manager.sendResetStream(id, 42);
+    try std.testing.expectEqual(StreamState.closed, manager.get(id).?.state());
+    try std.testing.expectEqual(@as(u64, 0), manager.metrics.active_streams);
+    try std.testing.expectEqual(@as(u64, 1), manager.metrics.closed_streams);
+
+    // Idempotent: a duplicate/late-retransmitted RESET_STREAM for the same
+    // final size must not double-count the close.
+    try manager.receiveResetStream(.{ .id = id, .app_error_code = 42, .final_size = 3 });
+    try std.testing.expectEqual(@as(u64, 0), manager.metrics.active_streams);
+    try std.testing.expectEqual(@as(u64, 1), manager.metrics.closed_streams);
+}
+
+test "sendResetStream is idempotent once already Reset Sent" {
+    // QUIC retransmits a STOP_SENDING whose ACK was lost in a new packet,
+    // so `Connection`'s RFC 9000 SS3.5 automatic-reset handler can call
+    // `sendResetStream` for the same stream more than once. The first call
+    // must behave exactly as before; every call after that must be a
+    // pure no-op (`null`, no new frame, no metric/state mutation) rather
+    // than re-queuing another RESET_STREAM for a stream already in Reset
+    // Sent.
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+
+    const id = try makeStreamId(.client, .bidi, 0);
+    _ = try manager.receiveStreamFrame(.{ .id = id, .offset = 0, .data = "abc" });
+
+    const first = try manager.sendResetStream(id, 7);
+    try std.testing.expect(first != null);
+    try std.testing.expectEqual(@as(u64, 7), first.?.app_error_code);
+    try std.testing.expectEqual(@as(u64, 1), manager.metrics.reset_streams);
+    try std.testing.expectEqual(StreamState.reset_sent, manager.get(id).?.state());
+
+    // A retransmitted STOP_SENDING driving the same automatic reset again:
+    // no second frame, no second metric increment.
+    const second = try manager.sendResetStream(id, 7);
+    try std.testing.expect(second == null);
+    try std.testing.expectEqual(@as(u64, 1), manager.metrics.reset_streams);
+    try std.testing.expectEqual(StreamState.reset_sent, manager.get(id).?.state());
+}
+
+test "MAX_STREAMS replenishment credit stops growing once the retained-stream cap is reached" {
+    // #247 soak finding (review round 7): closed `Stream` objects are never
+    // removed from `streams`, so replenishing credit without any bound
+    // would turn the old functional lifetime cap into unbounded
+    // per-connection memory growth. `closed_peer_bidi` -- and therefore
+    // `local.initial_max_streams_bidi` -- stops advancing once it reaches
+    // `config.max_retained_closed_streams_per_direction`, even though
+    // `metrics.closed_streams` keeps counting every close. Seeded one below
+    // the cap directly (the cap is large by design) rather than driving
+    // real cycles up to it -- this only needs to prove the boundary.
+    var manager = StreamManager.init(std.testing.allocator, .server, testParams(), testParams());
+    defer manager.deinit();
+    manager.closed_peer_bidi = config.max_retained_closed_streams_per_direction - 1;
+    const floor = manager.initial_max_streams_bidi_floor;
+
+    const at_cap_id = try makeStreamId(.client, .bidi, 0);
+    _ = try manager.receiveStreamFrame(.{ .id = at_cap_id, .offset = 0, .data = "x" });
+    try manager.receiveResetStream(.{ .id = at_cap_id, .app_error_code = 1, .final_size = 1 });
+    _ = try manager.sendResetStream(at_cap_id, 1);
+    try std.testing.expectEqual(StreamState.closed, manager.get(at_cap_id).?.state());
+    try std.testing.expectEqual(config.max_retained_closed_streams_per_direction, manager.closed_peer_bidi);
+    try std.testing.expectEqual(
+        config.max_retained_closed_streams_per_direction + floor,
+        manager.local.initial_max_streams_bidi,
+    );
+
+    const over_cap_id = try makeStreamId(.client, .bidi, 1);
+    _ = try manager.receiveStreamFrame(.{ .id = over_cap_id, .offset = 0, .data = "x" });
+    try manager.receiveResetStream(.{ .id = over_cap_id, .app_error_code = 1, .final_size = 1 });
+    _ = try manager.sendResetStream(over_cap_id, 1);
+    try std.testing.expectEqual(StreamState.closed, manager.get(over_cap_id).?.state());
+
+    // Capped: this second close still counted in metrics, but did not push
+    // `closed_peer_bidi` (or the resulting credit) past the cap.
+    try std.testing.expectEqual(config.max_retained_closed_streams_per_direction, manager.closed_peer_bidi);
+    try std.testing.expectEqual(
+        config.max_retained_closed_streams_per_direction + floor,
+        manager.local.initial_max_streams_bidi,
+    );
+    try std.testing.expectEqual(@as(u64, 2), manager.metrics.closed_streams);
 }
 
 test "reset final size consumes remaining connection credit" {

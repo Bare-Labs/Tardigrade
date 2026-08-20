@@ -25,7 +25,8 @@ transport implementation. Use the existing owners:
 | --- | --- | --- | --- | --- |
 | Packet loss and reordering do not corrupt packet number, ACK, or retransmission state | `src/quic/packet.zig`, `src/quic/frame.zig`, `src/quic/connection.zig`; summarized in [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md) | property | mapped | Dedicated-host impairment run must show the production UDP listener reports loss/recovery progress through scenario-local QUIC metrics. |
 | PTO and retransmission progression remain bounded and attributable | `src/quic/connection.zig`; `tardigrade_quic_pto_total`; H3 benchmark `quic.pto_total` deltas | property / runtime | mapped | Controlled loss/delay run must retain before/after metrics and qlog only when diagnosis needs it. |
-| `RESET_STREAM` / `STOP_SENDING` lifecycle is idempotent and cleans stream accounting | `src/quic/stream.zig`, `src/quic/connection.zig`, `src/http3/conn.zig`; summarized in [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md) | unit / property | mapped | Soak should include honest cancellation/reset traffic when the available H3 client can generate it without test-only protocol shortcuts. |
+| `RESET_STREAM` / `STOP_SENDING` lifecycle is idempotent and cleans stream accounting | `src/quic/stream.zig`, `src/quic/connection.zig`, `src/http3/conn.zig`; summarized in [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md) | unit / property | closed | Closed by `soak.h3.bounded_cancelled_requests` (`tests/http3_soak.zig`), full-duplex: real client-issued `resetStream` **and** `stopSending` over real UDP, proven at the production runtime via `quic_transport_metrics_cb`'s `stream_resets` delta, plus repeated same-connection follow-up requests proving the connection stays usable across multiple cancel cycles. This soak's own strengthening found and fixed two real bugs: (1) `Stream.state()` checked `reset_received`/`reset_sent` before checking `send_closed && recv_closed`, so a stream closed via reset in both directions (as this leg's `stopSending` triggers via the peer's RFC 9000 SS3.5 auto-`RESET_STREAM`) never reported `.closed` and `maybeClose()` never updated `active_streams`/`closed_streams` for it; (2) the RFC 9000 SS3.5 automatic-reset transition `sendResetStream` drives was not itself idempotent, so a retransmitted `STOP_SENDING` (its ACK lost, redelivered in a new packet) queued and counted a second `RESET_STREAM` for a stream already in Reset Sent. Both fixed with dedicated regressions: a `stream.zig` manager-level test asserting `active_streams`/`closed_streams` move exactly once, a `stream.zig` manager-level test asserting a second `sendResetStream` call is a pure no-op, and a `connection.zig` test delivering the same `STOP_SENDING` frame twice and asserting no second local reset event, queued frame, or metric increment. |
+| Peer stream-count credit (MAX_STREAMS) replenishes as peer-initiated streams close, without unbounded per-connection growth | `src/quic/stream.zig` (`StreamManager.maybeClose`, `config.max_retained_closed_streams_per_direction`), `src/quic/connection.zig` (`pollMaxStreamsCredit`, `buildAppFrames`) | unit | closed | `soak.h3.bounded_cancelled_requests`'s own strengthening (persistent connection, repeated cancel cycles instead of one cycle per fresh connection) surfaced that the native transport never sent outbound MAX_STREAMS at all: a long-lived connection would permanently exhaust the initial `initial_max_streams_bidi` allowance (100 by default) and could never accept stream N+1, even with every earlier stream long closed. Fixed: `maybeClose` grants one unit of credit per closed peer-initiated stream (mirroring `applyMaxStreams`'s identical mutation for the opposite, outbound-credit direction), and `Connection` queues/encodes/re-arms-on-loss the resulting MAX_STREAMS frame the same way `pending_max_data` already does. A second review pass found the initial version of this fix removed the old 100-stream ceiling while leaving every closed `Stream` object retained forever, i.e. it traded a functional cap for unbounded per-connection memory growth -- exactly what this PR's own bounded-resource contract forbids. True retirement (freeing a closed stream's memory while keeping a small tombstone so late/retransmitted frames for it are recognized rather than misidentified as a new stream) is the architecturally complete answer, but an attempt at outright removal during development produced real use-after-free crashes: many existing tests (and plausibly production call sites) read a stream's state immediately after the very call that closed it, a pervasive idiom a correct removal needs to audit throughout the codebase first. Rather than rush that audit or ship unbounded growth, `closed_peer_{bidi,uni}` -- and therefore the credit `maybeClose` grants -- is capped at `config.max_retained_closed_streams_per_direction` (4096) per direction per connection: comfortably above any traffic pattern this soak or ordinary H3 usage produces, but a small, fixed, provable ceiling on retained per-connection stream state regardless of connection lifetime. A third review pass found unidirectional streams could never actually reach `.closed` at all -- `Stream.state()` only considered a stream terminal once both `send_closed` and `recv_closed` were true, but a uni stream's nonexistent direction never becomes either, so `closed_peer_uni` (and MAX_STREAMS_UNI) could never advance; fixed by treating a nonexistent direction as trivially done. The same pass found the RFC 9000 SS3.5 automatic-reset path for a received `STOP_SENDING` committed `receiveStopSending`'s state before reserving the outbound RESET_STREAM queue slot, so a reservation failure got silently swallowed and the packet still got ACKed -- leaving the peer with no reason to ever retransmit the STOP_SENDING whose required response was never queued; fixed by reserving before logically accepting the STOP_SENDING and propagating the failure out of `applyFrame`. A fourth review pass found that fix was still incomplete one layer down: `ingestPacket()` records an authenticated packet's number into `recovery`'s received/ACK-range bookkeeping (`onPacketReceived`) *before* it ever parses frames and calls `applyFrame`, so propagating `OutOfMemory` out of `applyFrame` stops that one packet from arming `ack_needed` itself but does not undo the already-recorded packet number -- a later, unrelated ack-eliciting packet could still trigger an ACK whose range covers it, since `http3_runtime.Runtime.ingest()` keeps an already-established connection alive after an `ingestOnPathWithEcn` error. Fixed by making post-authentication ingest OOM terminal for the connection (mirroring the file's own existing precedent two lines above it, where an ACK-range-overflow failure from that same `onPacketReceived` call already closes the connection rather than trying to unwind): the frame-processing loop now calls `startClose` before propagating any `OutOfMemory` from `applyFrame`, and `pollTransmitOnPath` restricts a `.closing` connection to only ever (re)sending the CONNECTION_CLOSE datagram, so a surviving connection can never build an ordinary ACK covering that packet. This generalizes past STOP_SENDING: `applyFrame`'s frame switch has several other allocator-fallible effects (`known_streams`/`accept_queue`/`pending_retires` inserts) that share the same packet-transaction hazard, and the fix covers all of them uniformly at the one call site rather than patching each frame arm individually. All five fixes have dedicated regressions: a `connection.zig` test with a tiny `initial_max_streams_bidi = 2` proving bidi replenishment reaches the wire, an analogous `initial_max_streams_uni = 1` test proving uni replenishment (previously unreachable) now works, a `stream.zig` test seeded at the cap boundary proving credit growth stops there while `metrics.closed_streams` keeps counting, a `FailingAllocator` regression proving the STOP_SENDING reservation failure is a hard `error.OutOfMemory` out of `applyFrame` when called directly, and a packet-level `FailingAllocator` regression that delivers a real protected datagram through `ingestOnPath` and proves the connection lands in `.closing` (never able to build an ordinary ACK) rather than just proving the stream-level transaction alone. At soak scale, `soak.h3.bounded_cancelled_requests`'s heavy tier still runs 60 cancel cycles (120 request streams, well under the retention cap) on one persistent connection, comfortably past the default 100-stream ceiling this fix removes. |
 | QPACK blocked-stream unblock, cancellation, and malformed instruction handling stay bounded | `src/http3/qpack.zig`; summarized in [QUIC_H3_FUZZ_MATRIX.md](QUIC_H3_FUZZ_MATRIX.md) | property | mapped | No production wire gap today while nonzero dynamic QPACK request settings are not exposed by the production H3 config. Reopen only when that surface is enabled. |
 | Critical stream failures preserve the required HTTP/3 close code | `src/http3/conn.zig`; duplicate/closed/reset critical-stream regressions | unit / property | mapped | Production-path protocol-error capture is useful only if it proves close-class propagation through the real runtime before teardown. |
 | Release-critical QUIC/H3/QPACK close code preservation survives malformed input | `src/quic/connection.zig`, `src/http3/conn.zig`, `src/http3/qpack.zig`; external peer failures under `scripts/interop/run-interop.sh` | unit / property / external | mapped | Final interop rerun must publish required rows or explicit environment exceptions. |
@@ -130,6 +131,180 @@ The pass condition must name the settle window and the expected baseline or
 tolerance. State that intentionally retains bounded high-water capacity must
 plateau inside a fixed bound; state that should drain completely must return to
 baseline. Do not describe the result only as "looked stable."
+
+### Implemented: repeated-connection soak (`tests/http3_soak.zig`)
+
+`soak.h3.bounded_repeated_connections` runs `http.http3_runtime.Runtime` -- the
+same module `edge_gateway.zig` wires into the live listener -- over real
+loopback UDP sockets with four concurrent clients, each doing repeated
+connect, two requests, clean close cycles (6 rounds PR-safe, 40 rounds with
+`TARDIGRADE_SOAK_HEAVY=1`). It runs by default under `zig build test` /
+`zig build test-quic`, so it is already part of the PR-safe evidence tier
+above; no separate invocation is required. Its pass condition:
+
+- every planned request across every worker/round completed (a stall fails
+  loudly instead of reporting fewer requests as "stable")
+- after a bounded settle window (`waitRuntimeSnapshot`, 5s), tracked
+  connections, active CID routes, and native connections return to exactly
+  zero
+- open file descriptors after settle do not exceed the pre-soak baseline
+  (measured with a short bounded retry window to absorb the probe
+  subprocess's own transient teardown noise, not the soak's own state)
+- resident memory growth from the 50%-of-requests checkpoint (the true
+  midpoint by request count, not "half the workers finished every round",
+  which can land much later) to the peak of the 50%/75%/end-of-workload
+  samples does not exceed a fixed, deliberately generous margin
+  (`rss_margin_kb`; `ps`-reported RSS is page-granular and noisy, so the
+  PR-safe tier's low round count makes this a coarse smoke bound and the
+  heavy tier is the meaningful signal). First-half growth is reported only
+  as diagnostic context and never widens this bound, so a perfectly linear
+  leak across the whole run fails the check exactly as an accelerating one
+  would.
+- open file descriptors are held to the same fixed-bound rule during the
+  workload, not just after settle: the peak of the 50%/75%/end-of-workload
+  samples must not exceed the peak of the before/25%/50% samples by more
+  than a small fixed margin covering probe noise -- this is what would catch
+  a bug that leaks one socket/fd per request while traffic is active but
+  releases everything once the workers/connections close, which the
+  after-settle check alone cannot see.
+- runtime connection/native-connection/CID-route state does not exceed a
+  fixed high-water margin in the second half of the workload versus the
+  first half (sampled every loop iteration from `runtime.snapshot()`, split
+  at the same true midpoint): the settle-to-zero check above proves state
+  eventually drains, but not that it stayed bounded while traffic was still
+  flowing, so this is the check that would catch a bug that keeps retaining
+  every prior connection/CID mid-run and only releases them once traffic
+  stops
+- both RSS/FD probe helpers fail closed: a launch failure, timeout, signal,
+  non-zero exit, or empty/malformed probe output is a hard test error, never
+  silently read back as `0` (which would let "the probe didn't run" pass as
+  "measured zero resource usage")
+
+This closes the "repeated connect/request/close", "multiple requests per
+connection", and "concurrent H3 connections" workload rows, plus the RSS/FD/
+connection/CID observation rows, above. It deliberately does **not** cover:
+
+- **active drain with an in-flight request** -- already proven by "udp smoke:
+  HTTP/3 runtime drain lets admitted work finish and rejects new work" in
+  `tests/quic_h3_udp_smoke.zig`; duplicating it here would prove nothing new
+  (see this document's own reuse rule).
+- **controlled loss/reordering** -- needs a dedicated host with netem/
+  `CAP_NET_ADMIN` (`benchmarks/competitive/netem-impair.sh`), not a portable
+  unit test.
+- **QPACK dynamic-table bytes/entries/blocked-streams, PTO totals, and
+  worker/runtime queue depth** -- these are recorded onto `http.metrics.Metrics`
+  only by the `GatewayState` composition layer above `http3_runtime.Runtime`;
+  a bare-`Runtime` harness cannot observe them. Reopen only if `GatewayState`'s
+  own tests reveal a composition-specific gap this harness could close.
+
+### Implemented: resumption soak (`tests/http3_soak.zig`)
+
+`soak.h3.bounded_resumed_reconnects` wires a real
+`tls_core.resumption_runtime.Runtime` into the server `Config` (the same
+field `edge_gateway.zig`'s production composition uses) and runs two
+concurrent clients through repeated connect/request/close cycles (4 rounds
+PR-safe, 10 rounds with `TARDIGRADE_SOAK_HEAVY=1`), where every round after
+the first offers the ticket captured from the previous round instead of
+performing a full handshake. It runs by default under `zig build test` /
+`zig build test-quic`, alongside the primary soak above. Both soaks share a
+`WorkloadMonitor` helper for the checkpoint sampling, peak computation, and
+runtime-state plateau logic, so the two evidence rows below and above cannot
+silently drift apart. Its pass condition:
+
+- every reconnect (every round past the first) actually resumed, proven two
+  independent ways: client-side, `psk_authenticated` is set from
+  ServerHello's `selected_identity` before EncryptedExtensions even arrives
+  (RFC 8446), not inferred from "the reconnect worked" (which would also be
+  true of a full fresh handshake); server-side, the production resumption
+  runtime's own `ResumptionDecisionObserver` -- wired automatically onto
+  every accepted connection once `resumption_runtime` is configured, the
+  same seam #247's "existing resumption observer" language asks this leg to
+  exercise -- records exactly one `.accepted` outcome per resumed round, and
+  zero `.miss`/`.incompatible`/`.fatal`/`.full_handshake` outcomes
+- every planned request completed
+- the same RSS-slope, genuine-peak, and connection/CID-state plateau checks
+  as the primary soak above (same `WorkloadMonitor`, same margins scaled to
+  this leg's smaller two-worker workload), plus the same exact-zero
+  connection/CID settle and FD-baseline checks
+- resumption-cache occupancy (`server_resumption`'s and `client_resumption`'s
+  ticket caches, both intentionally still alive when the after-settle sample
+  is taken -- this is state the primary soak above never exercises at all)
+  never exceeds the cache's own configured per-origin capacity, and is
+  non-zero after settle -- proving retention actually happened, the opposite
+  contract from connection/CID state, which correctly drains to zero. Unlike
+  connection/CID state, this is a hard capacity ceiling rather than a
+  first-half/second-half plateau margin: an empty cache filling steadily
+  toward capacity over the *entire* run, with nothing to evict until that
+  capacity is reached, is expected, correct behavior
+
+This closes the "reconnect/resumption where the production config supports
+it" workload row above. It deliberately does **not** cover 0-RTT: that would
+need its own early-data-specific admission assertions and is not required by
+this row's "reconnect/resumption" text.
+
+### Implemented: cancellation soak (`tests/http3_soak.zig`)
+
+`soak.h3.bounded_cancelled_requests` proves the "cancellation/reset traffic
+where the client can generate it honestly" workload row: the real client
+already can drive this without test-only protocol shortcuts --
+`H3.sendRequest` returns the real request stream ID, native
+`Connection.resetStream`/`stopSending` are public, and production `pump()`'s
+server-side request handling already handles `error.StreamReset` on a
+request stream by removing it from the tracked request map. Two concurrent
+clients each establish **one** H3 connection and run repeated cancel cycles
+on it (4 cycles PR-safe, 60 cycles -- 120 request streams on one connection,
+comfortably past the native transport's default 100-stream
+`initial_max_streams_bidi` ceiling -- with `TARDIGRADE_SOAK_HEAVY=1`) --
+deliberately not a fresh connection per cycle like the other two soaks,
+since per-stream accounting needs to be observed while the connection stays
+alive, not erased by teardown. Each cycle: open a request, immediately
+cancel it full-duplex with the H3 request-cancel error code (`resetStream`
+for the client->server direction, `stopSending` for the server->client
+direction) before the next transmit flush (so the request and both
+cancellation frames leave together -- the realistic "changed my mind
+immediately" shape), then send a normal follow-up request on the same,
+still-open connection. It runs by default under `zig build test` /
+`zig build test-quic`, alongside the other two soaks, and shares the same
+`WorkloadMonitor` helper. Its pass condition:
+
+- every cycle's cancelled request was actually reset in both directions at
+  the production runtime, not merely offered by the client:
+  `Runtime.Config`'s `quic_transport_metrics_cb` is wired to a counter, and
+  the accumulated `QuicTransportDelta.stream_resets` delta equals exactly
+  twice the planned cycle count -- once from the server receiving the
+  client's `RESET_STREAM`, once from the server's own RFC 9000 SS3.5
+  auto-`RESET_STREAM` in response to the client's `STOP_SENDING`
+- every cycle's follow-up request on the same, still-open connection
+  completed with a normal 200 response -- proof repeated cancellation does
+  not poison the connection, not just once before teardown
+- the cancelled requests never reached the application handler:
+  `handler_state.requests` equals exactly the planned follow-up count, never
+  more
+- the same RSS-slope, genuine-peak, connection/CID-state plateau, exact-zero
+  settle, and FD-baseline checks as the other two soaks (same
+  `WorkloadMonitor`, margins scaled to this leg's two-worker workload)
+- (heavy tier) the persistent connection keeps working past the native
+  transport's default 100-request-stream lifetime ceiling: every one of the
+  60 cycles' follow-up requests completes normally, proving
+  `StreamManager`'s RFC 9000 SS4.6 MAX_STREAMS replenishment (see the
+  failure matrix row above) under real soak conditions, not just the
+  deterministic single-connection `connection.zig` unit regression
+
+This closes the "cancellation/reset traffic where the client can generate it
+honestly" workload row above. The existing deterministic `quic_h3_e2e` reset
+test already proves QUIC-level reset propagation between two directly-pumped
+connections; this leg proves the distinct thing that test cannot -- repeated,
+full-duplex reset ownership/cleanup through the full `http3_runtime.Runtime`
+composition over real UDP while a connection stays alive, under the same
+bounded-resource contract as the other soaks. Strengthening this leg to
+repeated full-duplex cycles on a live connection (rather than one
+`resetStream` per fresh connection) surfaced two real bugs this PR also
+fixes -- see the failure matrix row above, `src/quic/stream.zig`'s
+`Stream.state()` and `sendResetStream`, and `src/quic/connection.zig`'s
+duplicate-`STOP_SENDING` regression. This soak does not itself simulate
+packet loss/retransmission (out of scope per the netem exclusion above); the
+retransmitted-`STOP_SENDING` idempotency case those bugs live in is proven
+at the unit level instead, directly against the frame-handling code path.
 
 ## Final Evidence Bundle
 
