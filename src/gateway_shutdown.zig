@@ -4,7 +4,9 @@
 
 const compat = @import("zig_compat");
 const std = @import("std");
+const build_options = @import("build_options");
 const http = @import("http.zig");
+const tls_core = @import("tls_core");
 const edge_config = @import("edge_config.zig");
 const gp = @import("gateway_proxy.zig");
 const gc = @import("gateway_connection.zig");
@@ -195,6 +197,35 @@ pub fn hotReloadConfig(
             return;
         }
     }
+    if (build_options.tls_openssl_adapter and worker_ctx.tls != null and worker_ctx.native_credentials != null) {
+        // #629: a general-profile build serving both stable TCP (OpenSSL
+        // `TlsTerminator`) and native HTTP/3 (`NativeCredentialStore`) has
+        // two independent TLS credential owners. Native H3 can rebuild and
+        // publish a fresh identity from the proposed cert/key/SNI paths
+        // below, but the OpenSSL terminator never rebuilds its certificate
+        // context on reload (it only receives `updateProtocolPolicy`
+        // further down). Publishing a changed identity to H3 alone would
+        // leave the two protocols serving different certificates for the
+        // same hostname until a full restart. Reject the whole reload
+        // instead, matching the appliance TLS credential contract above:
+        // both surfaces stay coherent on the previous identity, and an
+        // operator must restart to rotate credentials on this build.
+        var current_lease = worker_ctx.config_store.acquire();
+        const credential_paths_changed = nativeCredentialPathsChanged(current_lease.cfg, cfg_ptr);
+        current_lease.release();
+        if (credential_paths_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "TLS credential paths changed on a mixed OpenSSL/native-HTTP3 build; restart required", .{}) catch "TLS credential paths changed; restart required";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected: tls_cert_path/tls_key_path/SNI certificates changed on a build serving both stable TCP (OpenSSL) and native HTTP/3; restart the process so both TLS surfaces stay on the same identity (#629)", .{});
+            return;
+        }
+    }
     var prepared_native_credentials: ?http.native_tls_connection.NativeCredentialStore.PreparedReload = null;
     defer if (prepared_native_credentials) |*prepared| prepared.deinit();
     if (worker_ctx.native_credentials) |store| {
@@ -313,6 +344,31 @@ pub fn applianceCredentialConfigChanged(
     if (!std.mem.eql(u8, current.tls_cert_path, proposed.tls_cert_path)) return true;
     if (!std.mem.eql(u8, current.tls_key_path, proposed.tls_key_path)) return true;
     if (!std.mem.eql(u8, current.tls_server_name, proposed.tls_server_name)) return true;
+    if (current.tls_sni_certs.len != proposed.tls_sni_certs.len) return true;
+    for (current.tls_sni_certs, proposed.tls_sni_certs) |a, b| {
+        if (!std.mem.eql(u8, a.server_name, b.server_name)) return true;
+        if (!std.mem.eql(u8, a.cert_path, b.cert_path)) return true;
+        if (!std.mem.eql(u8, a.key_path, b.key_path)) return true;
+    }
+    return false;
+}
+
+/// True when a proposed configuration changes any input that feeds the TLS
+/// credential identity: certificate path, key path, or the SNI credential
+/// set. Used to detect a mixed OpenSSL-TCP/native-HTTP3 build (#629): on
+/// that build, `worker_ctx.tls` (the OpenSSL `TlsTerminator` serving stable
+/// TCP) never rebuilds its certificate context on reload — only
+/// `updateProtocolPolicy` below touches it — while `worker_ctx.native_credentials`
+/// (the `NativeCredentialStore` serving native HTTP/3) can rebuild and
+/// publish a fresh identity from the proposed paths. Left unchecked, a
+/// single reload could leave the two protocols presenting different
+/// certificates for the same hostname until a full restart.
+pub fn nativeCredentialPathsChanged(
+    current: *const edge_config.EdgeConfig,
+    proposed: *const edge_config.EdgeConfig,
+) bool {
+    if (!std.mem.eql(u8, current.tls_cert_path, proposed.tls_cert_path)) return true;
+    if (!std.mem.eql(u8, current.tls_key_path, proposed.tls_key_path)) return true;
     if (current.tls_sni_certs.len != proposed.tls_sni_certs.len) return true;
     for (current.tls_sni_certs, proposed.tls_sni_certs) |a, b| {
         if (!std.mem.eql(u8, a.server_name, b.server_name)) return true;
@@ -638,6 +694,166 @@ test "applianceCredentialConfigChanged rejects plaintext-to-TLS and TLS-to-plain
     with_tls.tls_cert_path = with_tls_orig_cert;
     with_tls.tls_key_path = with_tls_orig_key;
     with_tls.tls_server_name = with_tls_orig_name;
+}
+
+fn freeIdentityLoaderChain(allocator: std.mem.Allocator, chain: [][]u8) void {
+    for (chain) |entry| allocator.free(entry);
+    allocator.free(chain);
+}
+
+/// Selects the currently active default credential from `provider` and
+/// asserts its leaf certificate DER matches `expected_leaf`. Signature
+/// schemes cover both Ed25519 and P-256 so either #629 test identity
+/// resolves regardless of which is currently installed.
+fn expectSelectedLeaf(provider: tls_core.credentials.CredentialProvider, expected_leaf: []const u8) !void {
+    const selection = tls_core.credentials.SelectionContext{
+        .role = .server,
+        .server_name = null,
+        .peer_signature_schemes = &.{ 0x0807, 0x0403 },
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    };
+    const progress = try provider.selectCredential(&selection);
+    const credential = switch (progress) {
+        .complete => |credential| credential,
+        .pending => return error.TestUnexpectedPending,
+    };
+    defer credential.release();
+    const chain = credential.certificateChain();
+    try std.testing.expectEqual(@as(usize, 1), chain.count());
+    try std.testing.expectEqualSlices(u8, expected_leaf, chain.leaf().?);
+}
+
+test "hotReloadConfig rejects a native HTTP/3 credential-path change on a mixed OpenSSL-TCP/native-HTTP3 build (#629)" {
+    // Regression for the identity-split bug: on a general-profile build
+    // serving both stable TCP (OpenSSL `TlsTerminator`) and native HTTP/3
+    // (`NativeCredentialStore`), the two credential owners must never end
+    // up on different certificates after a single `SIGHUP`. This drives
+    // the real `hotReloadConfig` end to end and proves the whole reload is
+    // rejected before either owner is touched, rather than letting native
+    // H3 alone pick up the new identity while stable TCP stays behind.
+    //
+    // Skipped under the appliance TLS profile: that build never links the
+    // OpenSSL adapter (`build_options.tls_openssl_adapter` is false), so
+    // there is no mixed-owner scenario to prove here — the appliance
+    // credential contract already covers that profile fully (see the
+    // `applianceCredentialConfigChanged` tests above).
+    if (!build_options.tls_openssl_adapter) return;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Native H3's starting identity (Ed25519).
+    const cert_a = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.crt", 256 * 1024);
+    defer allocator.free(cert_a);
+    const key_a = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.key", 256 * 1024);
+    defer allocator.free(key_a);
+    const chain_a = try tls_core.identity_loader.certChainFromPemOrDer(allocator, cert_a);
+    defer freeIdentityLoaderChain(allocator, chain_a);
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "h3.crt", .data = cert_a });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "h3.key", .data = key_a });
+    const h3_cert_path_a = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "h3.crt");
+    defer allocator.free(h3_cert_path_a);
+    const h3_key_path_a = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "h3.key");
+    defer allocator.free(h3_key_path_a);
+    const h3_cert_path_a_z = try allocator.dupeZ(u8, h3_cert_path_a);
+    defer allocator.free(h3_cert_path_a_z);
+    const h3_key_path_a_z = try allocator.dupeZ(u8, h3_key_path_a);
+    defer allocator.free(h3_key_path_a_z);
+
+    // The identity the proposed reload will try (and fail) to move H3 to
+    // (P-256) — distinct key kind so a leaf-bytes comparison can never
+    // accidentally match.
+    const cert_b = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.crt", 256 * 1024);
+    defer allocator.free(cert_b);
+    const key_b = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.key", 256 * 1024);
+    defer allocator.free(key_b);
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "h3_b.crt", .data = cert_b });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "h3_b.key", .data = key_b });
+    const h3_cert_path_b = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "h3_b.crt");
+    defer allocator.free(h3_cert_path_b);
+    const h3_key_path_b = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "h3_b.key");
+    defer allocator.free(h3_key_path_b);
+    const h3_cert_path_b_z = try allocator.dupeZ(u8, h3_cert_path_b);
+    defer allocator.free(h3_cert_path_b_z);
+    const h3_key_path_b_z = try allocator.dupeZ(u8, h3_key_path_b);
+    defer allocator.free(h3_key_path_b_z);
+
+    // Stable TCP's OpenSSL terminator — a real but unrelated identity; it
+    // must never be touched by this reload, so what it serves is
+    // irrelevant beyond "a valid startup cert".
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "tcp.crt", .data = @embedFile("http/testdata/test_server.crt") });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "tcp.key", .data = @embedFile("http/testdata/test_server.key") });
+    const tcp_cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "tcp.crt");
+    defer allocator.free(tcp_cert_path);
+    const tcp_key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "tcp.key");
+    defer allocator.free(tcp_key_path);
+    var tls = try http.tls_termination.TlsTerminator.init(allocator, .{
+        .cert_path = tcp_cert_path,
+        .key_path = tcp_key_path,
+        .http1_enabled = true,
+        .http2_enabled = true,
+    });
+    defer tls.deinit();
+
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_CERT_PATH", h3_cert_path_a_z, 1));
+    defer _ = unsetenv("TARDIGRADE_TLS_CERT_PATH");
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_KEY_PATH", h3_key_path_a_z, 1));
+    defer _ = unsetenv("TARDIGRADE_TLS_KEY_PATH");
+
+    var current_cfg = try edge_config.loadFromEnv(allocator);
+    defer current_cfg.deinit(allocator);
+    try std.testing.expectEqualStrings(h3_cert_path_a, current_cfg.tls_cert_path);
+
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &current_cfg);
+    defer config_store.deinit();
+
+    var native_store = http.native_tls_connection.NativeCredentialStore.init(allocator);
+    defer native_store.deinit();
+    try native_store.reloadFromFiles(h3_cert_path_a, h3_key_path_a, &.{});
+    try expectSelectedLeaf(native_store.provider(), chain_a[0]);
+
+    var worker_ctx: WorkerContext = undefined;
+    worker_ctx.config_store = &config_store;
+    worker_ctx.tls = &tls;
+    worker_ctx.native_credentials = &native_store;
+
+    var state: GatewayState = undefined;
+    state.logger = http.logger.Logger.init(.err, "hot-reload-mixed-credential-test");
+    state.reload_mutex = .{};
+    state.last_reload_ok = false;
+    state.last_reload_at_ms = 0;
+    state.last_reload_error_len = 0;
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+
+    const DispatchCtx = struct { cfg: *const edge_config.EdgeConfig = undefined };
+    var dispatch_ctx = DispatchCtx{};
+
+    // Simulate a SIGHUP whose environment moves the TLS credential paths
+    // to identity B.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_CERT_PATH", h3_cert_path_b_z, 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_KEY_PATH", h3_key_path_b_z, 1));
+
+    hotReloadConfig(allocator, &worker_ctx, &state, &dispatch_ctx);
+
+    try std.testing.expect(!state.last_reload_ok);
+    try std.testing.expectEqualStrings(
+        "TLS credential paths changed on a mixed OpenSSL/native-HTTP3 build; restart required",
+        state.last_reload_error[0..state.last_reload_error_len],
+    );
+
+    // Native H3 must still be serving identity A — it must never have
+    // rebuilt or published identity B on its own.
+    try expectSelectedLeaf(native_store.provider(), chain_a[0]);
+
+    // The published config lease is unchanged too: still identity A.
+    var lease = config_store.acquire();
+    defer lease.release();
+    try std.testing.expectEqualStrings(h3_cert_path_a, lease.cfg.tls_cert_path);
 }
 
 pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {

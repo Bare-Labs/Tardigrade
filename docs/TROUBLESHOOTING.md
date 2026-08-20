@@ -1467,22 +1467,22 @@ time you reloaded.
   config reload, not something that makes TLS config fields themselves
   hot-reloadable.
 
-  **Native HTTP/3 is a documented exception on a general-profile build
-  that also serves H3.** When a `NativeCredentialStore` exists,
-  `SIGHUP`'s `hotReloadConfig()` does prepare and commit a credential
-  reload for the native H3 store from the *proposed* `tls_cert_path`/
-  `tls_key_path`/SNI paths — before the stable TCP/OpenSSL terminator,
-  which only receives the protocol-policy update above. So on a process
-  serving both, a credential-path change can publish to the native H3
-  store while the stable TCP context stays on the old identity until
-  restart — meaning the two protocols can transiently (or, until you
-  restart, persistently) present **different certificates for the same
-  hostname**. Treat this as an experimental-surface caveat (see
-  [SUPPORT_MATRIX.md](SUPPORT_MATRIX.md)), not evidence that stable TCP
-  TLS credentials are reloadable; the mixed-protocol identity split
-  itself is tracked by
-  [#629](https://github.com/Bare-Systems/Tardigrade/issues/629), not yet
-  reconciled in `RELOAD_SHUTDOWN.md`.
+  **On a general-profile build that also serves HTTP/3, a TLS
+  credential-path change is rejected outright, not silently split
+  ([#629](https://github.com/Bare-Systems/Tardigrade/issues/629)).** When
+  both a `TlsTerminator` (stable TCP/OpenSSL) and a `NativeCredentialStore`
+  (native H3) exist, `hotReloadConfig()` checks whether the proposed
+  `tls_cert_path`/`tls_key_path`/SNI certificates differ from what is
+  currently published *before* touching either credential owner. If they
+  differ, the whole reload is rejected — same as the appliance bucket-2
+  contract above — so native H3 is never allowed to publish a rebuilt
+  identity while stable TCP stays behind on the old one; both surfaces keep
+  serving the previous, coherent identity until a restart. See "TLS
+  Credential Identity" in
+  [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md#tls-credential-identity) for the
+  full contract, including the pure-Zig/native-only build (no OpenSSL
+  adapter linked) where native TCP and native H3 share one credential store
+  and *do* hot-reload together in place.
 - **you edited `tardigrade.env`, not `tardigrade.conf`** — `SIGHUP` reloads
   the *config*; it cannot change the *process environment* of an
   already-running process. `tardigrade.env` (and any
