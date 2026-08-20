@@ -403,8 +403,10 @@ Notes on the two pool-style resources called out in the issue:
   JSON `"code":"upstream_circuit_open"` once upstream failures trip its
   configured threshold, then recovers through a half-open probe after
   `TARDIGRADE_CB_TIMEOUT_MS`. The state machine has focused coverage in
-  `src/gateway_state.zig`, and live proxy gating is covered in
-  `src/gateway_proxy_runtime.zig`.
+  `src/gateway_state.zig` and `src/gateway_proxy_runtime.zig`; live
+  open → half-open → closed behavior is covered by
+  `proxy.circuit_breaker_opens_fast_fails_and_recovers` in
+  `tests/integration.zig`.
 - **Log / metrics sink slow or unavailable** — access logging is best-effort and
   never blocks the request that emitted it. In buffered mode the buffer flushes
   at its configured threshold and is cleared regardless of the write outcome, so

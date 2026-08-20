@@ -1399,6 +1399,12 @@ pub const GatewayState = struct {
         self.circuit_breaker.recordSuccess();
     }
 
+    pub fn circuitReleaseProbe(self: *GatewayState) void {
+        self.circuit_mutex.lock();
+        defer self.circuit_mutex.unlock();
+        self.circuit_breaker.releaseProbe();
+    }
+
     pub fn circuitStateName(self: *GatewayState) []const u8 {
         self.circuit_mutex.lock();
         defer self.circuit_mutex.unlock();
@@ -2394,7 +2400,6 @@ pub const GatewayState = struct {
     }
 
     pub fn recordUpstreamFailure(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
-        self.circuitRecordFailure();
         if (cfg.upstream_max_fails == 0) return;
 
         self.upstream_mutex.lock();
@@ -2426,7 +2431,6 @@ pub const GatewayState = struct {
     }
 
     pub fn recordUpstreamSuccess(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
-        self.circuitRecordSuccess();
         if (cfg.upstream_max_fails == 0) return;
 
         self.upstream_mutex.lock();
@@ -2437,6 +2441,16 @@ pub const GatewayState = struct {
             health.slow_start_until_ms = 0;
         }
         self.updateUpstreamHealthMetricLocked();
+    }
+
+    pub fn recordProxyUpstreamFailure(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
+        self.recordUpstreamFailure(cfg, upstream_base_url);
+        self.circuitRecordFailure();
+    }
+
+    pub fn recordProxyUpstreamSuccess(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
+        self.recordUpstreamSuccess(cfg, upstream_base_url);
+        self.circuitRecordSuccess();
     }
 
     pub fn recordActiveProbeResult(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, healthy: bool) void {
@@ -3791,7 +3805,7 @@ test "gateway circuit breaker recovers through a half-open probe" {
     try std.testing.expectEqualStrings("closed", gs.circuitStateName());
 }
 
-test "gateway upstream outcome accounting drives live circuit breaker" {
+test "gateway proxy outcome accounting drives live circuit breaker" {
     var gs: GatewayState = undefined;
     initUpstreamTestState(&gs, std.testing.allocator);
     defer deinitUpstreamTestState(&gs);
@@ -3801,8 +3815,13 @@ test "gateway upstream outcome accounting drives live circuit breaker" {
     cfg.upstream_max_fails = 0;
 
     gs.recordUpstreamFailure(&cfg, "http://origin.example");
-    try std.testing.expect(gs.circuitTryAcquire());
     gs.recordUpstreamFailure(&cfg, "http://origin.example");
+    try std.testing.expect(gs.circuitTryAcquire());
+    try std.testing.expectEqualStrings("closed", gs.circuitStateName());
+
+    gs.recordProxyUpstreamFailure(&cfg, "http://origin.example");
+    try std.testing.expect(gs.circuitTryAcquire());
+    gs.recordProxyUpstreamFailure(&cfg, "http://origin.example");
 
     try std.testing.expect(!gs.circuitTryAcquire());
     try std.testing.expectEqualStrings("open", gs.circuitStateName());

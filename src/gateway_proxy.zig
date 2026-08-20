@@ -2756,6 +2756,12 @@ test "mapUpstreamError returns stable codes" {
     try std.testing.expectEqualStrings("tool_unavailable", mapped.code);
 }
 
+test "mapControlPlaneProxyExecutionError maps open circuit distinctly" {
+    const mapped = mapControlPlaneProxyExecutionError(error.CircuitOpen);
+    try std.testing.expectEqual(http.Status.service_unavailable, mapped.status);
+    try std.testing.expectEqualStrings("upstream_circuit_open", mapped.code);
+}
+
 // --- Malformed upstream response handling tests ---
 
 test "parseBufferedUpstreamResponse handles response with no body" {

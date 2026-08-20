@@ -26,6 +26,7 @@ pub const CircuitBreaker = struct {
     state: State,
     failure_count: u32,
     success_count: u32,
+    half_open_probe_in_flight: bool,
     /// Nanosecond timestamp of the last recorded failure.
     last_failure_ns: i128,
     config: Config,
@@ -36,6 +37,7 @@ pub const CircuitBreaker = struct {
             .state = .closed,
             .failure_count = 0,
             .success_count = 0,
+            .half_open_probe_in_flight = false,
             .last_failure_ns = 0,
             .config = config,
         };
@@ -58,12 +60,24 @@ pub const CircuitBreaker = struct {
                 if (elapsed_ms >= self.config.timeout_ms) {
                     self.state = .half_open;
                     self.success_count = 0;
+                    self.half_open_probe_in_flight = true;
                     break :blk true;
                 }
                 break :blk false;
             },
-            .half_open => self.success_count < self.config.half_open_successes,
+            .half_open => blk: {
+                if (self.half_open_probe_in_flight) break :blk false;
+                self.half_open_probe_in_flight = true;
+                break :blk true;
+            },
         };
+    }
+
+    /// Release an admitted half-open probe when the request did not reach the
+    /// upstream and therefore has no success/failure outcome to record.
+    pub fn releaseProbe(self: *CircuitBreaker) void {
+        if (self.config.threshold == 0) return;
+        if (self.state == .half_open) self.half_open_probe_in_flight = false;
     }
 
     /// Record a successful upstream call.
@@ -73,11 +87,13 @@ pub const CircuitBreaker = struct {
         switch (self.state) {
             .closed => self.failure_count = 0,
             .half_open => {
+                self.half_open_probe_in_flight = false;
                 self.success_count += 1;
                 if (self.success_count >= self.config.half_open_successes) {
                     self.state = .closed;
                     self.failure_count = 0;
                     self.success_count = 0;
+                    self.half_open_probe_in_flight = false;
                 }
             },
             .open => {},
@@ -94,9 +110,13 @@ pub const CircuitBreaker = struct {
                 self.failure_count += 1;
                 if (self.failure_count >= self.config.threshold) {
                     self.state = .open;
+                    self.half_open_probe_in_flight = false;
                 }
             },
-            .half_open => self.state = .open,
+            .half_open => {
+                self.state = .open;
+                self.half_open_probe_in_flight = false;
+            },
             .open => {},
         }
     }
@@ -161,6 +181,22 @@ test "circuit breaker half-open closes on success" {
     const available = cb.tryAcquire();
     try std.testing.expectEqual(State.half_open, cb.state);
     try std.testing.expect(available);
+
+    cb.recordSuccess();
+    try std.testing.expectEqual(State.closed, cb.state);
+}
+
+test "circuit breaker permits only one half-open probe at a time" {
+    var cb = CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
+    cb.recordFailure();
+
+    try std.testing.expect(cb.tryAcquire());
+    try std.testing.expectEqual(State.half_open, cb.state);
+    try std.testing.expect(!cb.tryAcquire());
+
+    cb.releaseProbe();
+    try std.testing.expect(cb.tryAcquire());
+    try std.testing.expect(!cb.tryAcquire());
 
     cb.recordSuccess();
     try std.testing.expectEqual(State.closed, cb.state);

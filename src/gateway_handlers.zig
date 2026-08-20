@@ -1835,6 +1835,30 @@ fn applyHttp3ProxyResponse(
     state.metricsRecord(upstream_response.statusCode());
 }
 
+fn recordHttp3ProxyOutcome(
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    selection_base_url: []const u8,
+    absolute_target: bool,
+    status_code: u16,
+) void {
+    if (status_code >= 500) {
+        if (absolute_target) {
+            state.circuitRecordFailure();
+        } else {
+            state.recordProxyUpstreamFailure(cfg, selection_base_url);
+        }
+    } else if (status_code != @intFromEnum(http.Status.too_early)) {
+        if (absolute_target) {
+            state.circuitRecordSuccess();
+        } else {
+            state.recordProxyUpstreamSuccess(cfg, selection_base_url);
+        }
+    } else {
+        state.circuitReleaseProbe();
+    }
+}
+
 const Http3BufferedProxyAttemptExecutor = struct {
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
@@ -1851,6 +1875,7 @@ const Http3BufferedProxyAttemptExecutor = struct {
     forwarded_proto: []const u8,
     incoming_host: ?[]const u8,
     selection_base_url: []const u8,
+    absolute_target: bool,
     budget_start_ms: u64,
     last_attempt_start_ms: u64 = 0,
 
@@ -1934,11 +1959,23 @@ const Http3BufferedProxyAttemptExecutor = struct {
         self.state.logger.warn(self.correlation_id, "h3 proxy retrying on fresh connection after stale upstream keep-alive ({d}/{d})", .{ stale_conn_retries, max_stale_conn_retries });
     }
 
+    pub fn releaseCircuitProbe(self: *Http3BufferedProxyAttemptExecutor) void {
+        self.state.circuitReleaseProbe();
+    }
+
     pub fn onTerminalAttemptError(
         self: *Http3BufferedProxyAttemptExecutor,
-        _: anyerror,
+        err: anyerror,
     ) !void {
-        self.state.recordUpstreamFailure(self.cfg, self.selection_base_url);
+        if (gproxy_runtime.proxyAttemptErrorCountsAsUpstreamFailure(err)) {
+            if (self.absolute_target) {
+                self.state.circuitRecordFailure();
+            } else {
+                self.state.recordProxyUpstreamFailure(self.cfg, self.selection_base_url);
+            }
+        } else {
+            self.state.circuitReleaseProbe();
+        }
     }
 
     pub fn onConfiguredErrorRetry(
@@ -1991,7 +2028,11 @@ const Http3BufferedProxyAttemptExecutor = struct {
         max_attempts: usize,
         result: *gproxy_runtime.DataPlaneProxyResponse,
     ) !void {
-        self.state.recordUpstreamFailure(self.cfg, self.selection_base_url);
+        if (self.absolute_target) {
+            self.state.circuitRecordFailure();
+        } else {
+            self.state.recordProxyUpstreamFailure(self.cfg, self.selection_base_url);
+        }
         self.state.logger.warn(self.correlation_id, "h3 proxy attempt {d}/{d} got {d}, retrying", .{ configured_attempt_index + 1, max_attempts, result.statusCode() });
         self.state.metricsReleaseProxyBufferedBytes(result.bodyLen());
         result.deinit(self.allocator);
@@ -2012,6 +2053,7 @@ const Http3Early425ProxyContinuation = struct {
     forwarded_proto: []u8,
     incoming_host: ?[]u8,
     selection_base_url: []const u8,
+    absolute_target: bool,
     budget_start_ms: u64,
     last_attempt_start_ms: u64 = 0,
     transport_early: bool,
@@ -2063,6 +2105,7 @@ const Http3Early425ProxyContinuation = struct {
             .forwarded_proto = forwarded_proto,
             .incoming_host = incoming_host,
             .selection_base_url = executor.selection_base_url,
+            .absolute_target = executor.absolute_target,
             .budget_start_ms = executor.budget_start_ms,
             .transport_early = executor.request.transport_early,
         };
@@ -2160,10 +2203,19 @@ const Http3Early425ProxyContinuation = struct {
                 }
                 self.state.metricsRecordEarlyDataRetry(.failure);
                 if (err == error.ProxyBudgetExhausted or err == error.RequestCancelled) {
+                    if (err == error.ProxyBudgetExhausted) self.state.circuitReleaseProbe();
+                    if (err == error.RequestCancelled) {
+                        if (self.absolute_target) {
+                            self.state.circuitRecordFailure();
+                        } else {
+                            self.state.recordProxyUpstreamFailure(&self.cfg_snapshot, self.selection_base_url);
+                        }
+                    }
                     try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .gateway_timeout, "upstream_timeout", "Upstream request timed out", self.correlation_id);
                     return;
                 }
                 if (err == error.UpstreamAtCapacity) {
+                    self.state.circuitReleaseProbe();
                     try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", self.correlation_id);
                     return;
                 }
@@ -2171,8 +2223,19 @@ const Http3Early425ProxyContinuation = struct {
                     try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .service_unavailable, "upstream_circuit_open", "Upstream circuit breaker open", self.correlation_id);
                     return;
                 }
-                self.state.recordUpstreamFailure(&self.cfg_snapshot, self.selection_base_url);
-                if (err == error.OutOfMemory) return error.OutOfMemory;
+                if (err == error.OutOfMemory) {
+                    self.state.circuitReleaseProbe();
+                    return error.OutOfMemory;
+                }
+                if (gproxy_runtime.proxyAttemptErrorCountsAsUpstreamFailure(err)) {
+                    if (self.absolute_target) {
+                        self.state.circuitRecordFailure();
+                    } else {
+                        self.state.recordProxyUpstreamFailure(&self.cfg_snapshot, self.selection_base_url);
+                    }
+                } else {
+                    self.state.circuitReleaseProbe();
+                }
                 const err_status: http.Status = switch (err) {
                     error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
                     else => .bad_gateway,
@@ -2192,12 +2255,8 @@ const Http3Early425ProxyContinuation = struct {
             } else {
                 self.state.metricsRecordEarlyDataRetry(.success);
             }
+            recordHttp3ProxyOutcome(self.state, &self.cfg_snapshot, self.selection_base_url, self.absolute_target, upstream_response.statusCode());
             try applyHttp3ProxyResponse(allocator, response, self.state, &upstream_response, self.correlation_id);
-            if (upstream_response.statusCode() >= 500) {
-                self.state.recordUpstreamFailure(&self.cfg_snapshot, self.selection_base_url);
-            } else if (upstream_response.statusCode() != @intFromEnum(http.Status.too_early)) {
-                self.state.recordUpstreamSuccess(&self.cfg_snapshot, self.selection_base_url);
-            }
             return;
         }
     }
@@ -2220,6 +2279,7 @@ fn handleHttp3LocationProxyPass(
     defer allocator.free(resolved.url);
     var upstream_url = try appendProxyQueryString(allocator, resolved.url, request_query);
     defer upstream_url.deinit(allocator);
+    const absolute_target = gs.isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"));
 
     const max_attempts = gproxy_runtime.proxyRetryAttemptLimit(ctx.cfg.upstream_retry_attempts, ctx.cfg.upstream_retry_idempotent_only, request.method);
     var attempt_executor = Http3BufferedProxyAttemptExecutor{
@@ -2238,6 +2298,7 @@ fn handleHttp3LocationProxyPass(
         .forwarded_proto = if (edge_config.hasTlsFiles(ctx.cfg)) "https" else "http",
         .incoming_host = request.headers.get(":authority") orelse request.headers.get("host"),
         .selection_base_url = ctx.cfg.upstream_base_url,
+        .absolute_target = absolute_target,
         .budget_start_ms = http.event_loop.monotonicMs(),
     };
 
@@ -2279,11 +2340,7 @@ fn handleHttp3LocationProxyPass(
     };
     defer upstream_response.deinit(allocator);
     defer ctx.state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
-    if (upstream_response.statusCode() >= 500) {
-        ctx.state.recordUpstreamFailure(ctx.cfg, ctx.cfg.upstream_base_url);
-    } else if (upstream_response.statusCode() != @intFromEnum(http.Status.too_early)) {
-        ctx.state.recordUpstreamSuccess(ctx.cfg, ctx.cfg.upstream_base_url);
-    }
+    recordHttp3ProxyOutcome(ctx.state, ctx.cfg, ctx.cfg.upstream_base_url, absolute_target, upstream_response.statusCode());
     try applyHttp3ProxyResponse(allocator, response, ctx.state, &upstream_response, correlation_id);
 }
 
@@ -2550,6 +2607,26 @@ test "routeHttp3Location rejects auth-required locations before action execution
     try std.testing.expectEqual(@as(u64, 1), state.metrics.total_requests);
     try std.testing.expectEqual(@as(u64, 1), state.metrics.status_4xx);
     try std.testing.expectEqual(@as(u64, 1), state.metrics.err_unauthorized);
+}
+
+test "recordHttp3ProxyOutcome keeps absolute target failures out of passive health" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    initHttp3ProxyTestState(&state, allocator, &.{});
+    defer deinitHttp3ProxyTestState(&state);
+    state.circuit_mutex = .{};
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 30_000 });
+
+    var cfg = minimalHttp3ProxyConfig(&.{});
+    cfg.upstream_base_url = "http://configured.example";
+    cfg.upstream_max_fails = 1;
+    cfg.upstream_fail_timeout_ms = 60_000;
+
+    recordHttp3ProxyOutcome(&state, &cfg, cfg.upstream_base_url, true, 500);
+
+    try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
+    try std.testing.expect(!state.circuitTryAcquire());
+    try std.testing.expectEqualStrings("open", state.circuitStateName());
 }
 
 test "routeHttp3Location rejects prior-hop Early-Data on ordinary 1-RTT before auth side effects" {

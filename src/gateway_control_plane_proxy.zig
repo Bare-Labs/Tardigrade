@@ -45,6 +45,21 @@ pub fn controlPlaneBufferedResponseLimit(cfg: *const edge_config.EdgeConfig) usi
         DEFAULT_CONTROL_PLANE_BUFFERED_RESPONSE_LIMIT;
 }
 
+fn controlPlaneAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
+    return switch (err) {
+        error.OutOfMemory,
+        error.UpstreamUntrusted,
+        error.UpstreamAtCapacity,
+        error.CircuitOpen,
+        error.InvalidUri,
+        error.InvalidFormat,
+        error.UnsupportedUriScheme,
+        error.MissingUriHost,
+        => false,
+        else => true,
+    };
+}
+
 pub fn buildProxyCacheKey(
     allocator: std.mem.Allocator,
     key_template: []const u8,
@@ -338,7 +353,11 @@ pub fn executeBoundedControlPlaneJsonProxy(
                 enable_streaming_success,
                 sticky_set_cookie,
             ) catch |err| {
-                state.recordUpstreamFailure(cfg, upstream_base_url);
+                if (controlPlaneAttemptErrorCountsAsUpstreamFailure(err)) {
+                    state.recordProxyUpstreamFailure(cfg, upstream_base_url);
+                } else {
+                    state.circuitReleaseProbe();
+                }
                 last_err = err;
                 if (attempt + 1 < max_attempts) {
                     state.logger.warn(correlation_id, "upstream attempt {d}/{d} failed: {}", .{ attempt + 1, max_attempts, err });
@@ -350,15 +369,15 @@ pub fn executeBoundedControlPlaneJsonProxy(
         switch (exec) {
             .streamed_status => |streamed| {
                 if (streamed.status >= 500) {
-                    state.recordUpstreamFailure(cfg, upstream_base_url);
+                    state.recordProxyUpstreamFailure(cfg, upstream_base_url);
                 } else {
-                    state.recordUpstreamSuccess(cfg, upstream_base_url);
+                    state.recordProxyUpstreamSuccess(cfg, upstream_base_url);
                 }
                 return exec;
             },
             .buffered => |res| {
                 if (res.status >= 500) {
-                    state.recordUpstreamFailure(cfg, upstream_base_url);
+                    state.recordProxyUpstreamFailure(cfg, upstream_base_url);
                     if (attempt + 1 < max_attempts) {
                         allocator.free(res.body);
                         allocator.free(res.content_type);
@@ -368,7 +387,7 @@ pub fn executeBoundedControlPlaneJsonProxy(
                         continue;
                     }
                 } else {
-                    state.recordUpstreamSuccess(cfg, upstream_base_url);
+                    state.recordProxyUpstreamSuccess(cfg, upstream_base_url);
                 }
                 return exec;
             },

@@ -36,6 +36,22 @@ const writeBufferedUpstreamResponseWithMetrics = gp.writeBufferedUpstreamRespons
 
 pub const StreamingRequestBody = gp.StreamingRequestBody;
 
+pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
+    return switch (err) {
+        error.OutOfMemory,
+        error.ClientAborted,
+        error.ProxyBufferCapacityUnavailable,
+        error.RequestBufferLimitExceeded,
+        error.InvalidChunkedUpload,
+        error.ChunkedUploadTooLarge,
+        error.UpstreamAtCapacity,
+        error.ProxyBudgetExhausted,
+        error.CircuitOpen,
+        => false,
+        else => true,
+    };
+}
+
 /// Why a request took the bounded buffered path instead of streaming (#139).
 /// Every reason is recorded as a metric label and a debug log line so operators
 /// can tell whether a given large transfer actually streamed.
@@ -557,6 +573,7 @@ pub fn handleLocationProxyPass(
             ) catch |err| {
                 state.recordUpstreamAttemptEnd(selection.base_url);
                 if (err == error.ClientAborted) {
+                    state.circuitReleaseProbe();
                     state.metricsRecordProxyClientAbort();
                     return err;
                 }
@@ -565,6 +582,7 @@ pub fn handleLocationProxyPass(
                     // byte was committed (#140). Like the active-connection cap
                     // above this is local saturation, not an origin fault, so
                     // it must not touch upstream health / circuit-breaker state.
+                    state.circuitReleaseProbe();
                     try sendApiError(allocator, writer, .service_unavailable, "proxy_buffer_saturated", "Proxy buffer capacity exhausted", correlation_id, false, state);
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
                     return @intFromEnum(http.Status.service_unavailable);
@@ -573,6 +591,7 @@ pub fn handleLocationProxyPass(
                     // Fail-fast at the per-origin active cap (#239): a local
                     // saturation rejection, not an origin failure — do not count
                     // it against upstream health / circuit-breaker state.
+                    state.circuitReleaseProbe();
                     try sendApiError(allocator, writer, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id, false, state);
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
                     return @intFromEnum(http.Status.service_unavailable);
@@ -583,6 +602,7 @@ pub fn handleLocationProxyPass(
                 // is the client's 413 and not a 503 — and, being a client fault
                 // raised before commitment, it is not charged to the origin.
                 if (err == error.RequestBufferLimitExceeded) {
+                    state.circuitReleaseProbe();
                     try sendApiError(allocator, writer, .payload_too_large, "payload_too_large", "Request body too large", correlation_id, false, state);
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.payload_too_large), 0);
                     return @intFromEnum(http.Status.payload_too_large);
@@ -592,6 +612,7 @@ pub fn handleLocationProxyPass(
                 // faults raised before any response byte is committed, so the
                 // origin is not blamed for them.
                 if (err == error.InvalidChunkedUpload or err == error.ChunkedUploadTooLarge) {
+                    state.circuitReleaseProbe();
                     const upload_status: http.Status = if (err == error.ChunkedUploadTooLarge) .payload_too_large else .bad_request;
                     const upload_code = if (err == error.ChunkedUploadTooLarge) "payload_too_large" else "invalid_request";
                     const upload_msg = if (err == error.ChunkedUploadTooLarge) "Request body too large" else "Malformed chunked request body";
@@ -599,14 +620,18 @@ pub fn handleLocationProxyPass(
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(upload_status), 0);
                     return @intFromEnum(upload_status);
                 }
-                state.recordUpstreamFailure(cfg, selection.base_url);
                 if (err == error.RequestCancelled) {
+                    state.recordProxyUpstreamFailure(cfg, selection.base_url);
                     if (ctx.lifecycle) |lc| lc.logTimeout("upstream_connect");
                     try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id, false, state);
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.gateway_timeout), 0);
                     return @intFromEnum(http.Status.gateway_timeout);
                 }
-                if (err == error.OutOfMemory) return error.OutOfMemory;
+                if (err == error.OutOfMemory) {
+                    state.circuitReleaseProbe();
+                    return error.OutOfMemory;
+                }
+                state.recordProxyUpstreamFailure(cfg, selection.base_url);
                 const err_status: http.Status = switch (err) {
                     error.Timeout, error.WouldBlock => .gateway_timeout,
                     else => .bad_gateway,
@@ -643,17 +668,20 @@ pub fn handleLocationProxyPass(
                     state.circuitRecordFailure();
                 } else if (!streamed.local_capacity_aborted) {
                     state.circuitRecordSuccess();
+                } else {
+                    state.circuitReleaseProbe();
                 }
             } else {
                 // A relay truncated by local buffer capacity is not evidence
                 // about the origin, so it is neither a failure nor a success
                 // for health purposes (#140).
                 if (streamed.local_capacity_aborted) {
+                    state.circuitReleaseProbe();
                     state.logger.warn(correlation_id, "streaming relay truncated: local proxy buffer capacity exhausted", .{});
                 } else if (streamed.status_code >= 500 or streamed.upstream_aborted) {
-                    state.recordUpstreamFailure(cfg, selection.base_url);
+                    state.recordProxyUpstreamFailure(cfg, selection.base_url);
                 } else {
-                    state.recordUpstreamSuccess(cfg, selection.base_url);
+                    state.recordProxyUpstreamSuccess(cfg, selection.base_url);
                 }
             }
             // `tardigrade_proxy_upstream_aborts_total` means "aborted by the
@@ -784,12 +812,16 @@ pub fn handleLocationProxyPass(
             state.circuitRecordFailure();
         } else if (upstream_response.statusCode() != @intFromEnum(http.Status.too_early)) {
             state.circuitRecordSuccess();
+        } else {
+            state.circuitReleaseProbe();
         }
     } else {
         if (upstream_response.statusCode() >= 500) {
-            state.recordUpstreamFailure(cfg, selection.base_url);
+            state.recordProxyUpstreamFailure(cfg, selection.base_url);
         } else if (upstream_response.statusCode() != @intFromEnum(http.Status.too_early)) {
-            state.recordUpstreamSuccess(cfg, selection.base_url);
+            state.recordProxyUpstreamSuccess(cfg, selection.base_url);
+        } else {
+            state.circuitReleaseProbe();
         }
     }
     ctx.setUpstreamResult(resolved.upstream_host, upstream_response.statusCode(), upstream_response.bodyLen());
@@ -937,10 +969,16 @@ pub fn runBufferedProxyAttempts(
                 try attempt_executor.onStaleConnectionRetry(stale_conn_retries, max_stale_conn_retries);
                 continue;
             }
-            if (err == error.CircuitOpen) return .circuit_open;
             retry_state.recordEarly425RetryResultOnce(attempt_executor, .failure);
-            if (err == error.ProxyBudgetExhausted) return .retry_budget_exhausted;
-            if (err == error.UpstreamAtCapacity) return .upstream_at_capacity;
+            if (err == error.CircuitOpen) return .circuit_open;
+            if (err == error.ProxyBudgetExhausted) {
+                maybeReleaseCircuitProbe(attempt_executor);
+                return .retry_budget_exhausted;
+            }
+            if (err == error.UpstreamAtCapacity) {
+                maybeReleaseCircuitProbe(attempt_executor);
+                return .upstream_at_capacity;
+            }
             try attempt_executor.onTerminalAttemptError(err);
             if (err == error.RequestCancelled) return .request_cancelled;
             if (retry_state.hasConfiguredRetryRemaining(attempt, max_attempts, stale_conn_retries)) {
@@ -1014,6 +1052,12 @@ fn maybeParkEarly425Retry(attempt_executor: anytype, result: *DataPlaneProxyResp
         return true;
     }
     return false;
+}
+
+fn maybeReleaseCircuitProbe(attempt_executor: anytype) void {
+    if (comptime @hasDecl(@TypeOf(attempt_executor.*), "releaseCircuitProbe")) {
+        attempt_executor.releaseCircuitProbe();
+    }
 }
 
 const ProductionBufferedProxyAttemptExecutor = struct {
@@ -1124,11 +1168,19 @@ const ProductionBufferedProxyAttemptExecutor = struct {
         self.state.logger.warn(self.correlation_id, "proxy retrying on fresh connection after stale upstream keep-alive ({d}/{d})", .{ stale_conn_retries, max_stale_conn_retries });
     }
 
+    fn releaseCircuitProbe(self: *ProductionBufferedProxyAttemptExecutor) void {
+        self.state.circuitReleaseProbe();
+    }
+
     fn onTerminalAttemptError(
         self: *ProductionBufferedProxyAttemptExecutor,
-        _: anyerror,
+        err: anyerror,
     ) !void {
-        self.state.recordUpstreamFailure(self.cfg, self.selection_base_url);
+        if (proxyAttemptErrorCountsAsUpstreamFailure(err)) {
+            self.state.recordProxyUpstreamFailure(self.cfg, self.selection_base_url);
+        } else {
+            self.state.circuitReleaseProbe();
+        }
     }
 
     fn onConfiguredErrorRetry(
@@ -1162,7 +1214,7 @@ const ProductionBufferedProxyAttemptExecutor = struct {
         max_attempts: usize,
         result: *DataPlaneProxyResponse,
     ) !void {
-        self.state.recordUpstreamFailure(self.cfg, self.selection_base_url);
+        self.state.recordProxyUpstreamFailure(self.cfg, self.selection_base_url);
         self.state.logger.warn(self.correlation_id, "proxy attempt {d}/{d} got {d}, retrying", .{ configured_attempt_index + 1, max_attempts, result.statusCode() });
         self.state.metricsReleaseProxyBufferedBytes(result.bodyLen());
         result.deinit(self.allocator);
@@ -1816,6 +1868,39 @@ test "early upstream 425 ordinary retry transport failure records failure once" 
         .terminal_error => |err| try std.testing.expectEqual(error.TestRetryTransportFailed, err),
         else => return error.TestUnexpectedTerminalProxyResult,
     }
+    try std.testing.expectEqual(@as(usize, 1), executor.deliveries);
+    try std.testing.expectEqual(@as(usize, 1), executor.execute_failures);
+    try std.testing.expectEqual(@as(usize, 1), executor.early_425_retried);
+    try std.testing.expectEqual(@as(usize, 1), executor.early_retry_failure);
+    try std.testing.expectEqual(@as(usize, 0), executor.early_retry_success);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, header_counts.items);
+}
+
+test "early upstream 425 retry blocked by circuit records failure once" {
+    const allocator = std.testing.allocator;
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    };
+    var barrier = TestEarly425Barrier{};
+    var ctx = http.request_context.EarlyDataContext{ .transport_early = true, .downstream_handshake = barrier.barrier() };
+    var header_counts = std.array_list.Managed(usize).init(allocator);
+    defer header_counts.deinit();
+    var executor = ScriptedBufferedAttemptExecutor{
+        .allocator = allocator,
+        .upstream_statuses = &.{425},
+        .early_data_header_counts = &header_counts,
+        .fail_attempt_index = 1,
+        .fail_attempt_err = error.CircuitOpen,
+    };
+
+    const result = try runBufferedProxyAttempts(&ctx, true, "GET", &block, 1, 0, true, &executor);
+
+    try std.testing.expectEqual(std.meta.Tag(BufferedProxyAttemptsResult).circuit_open, std.meta.activeTag(result));
     try std.testing.expectEqual(@as(usize, 1), executor.deliveries);
     try std.testing.expectEqual(@as(usize, 1), executor.execute_failures);
     try std.testing.expectEqual(@as(usize, 1), executor.early_425_retried);

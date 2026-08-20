@@ -4506,7 +4506,7 @@ test "proxy.circuit_breaker_opens_fast_fails_and_recovers" {
     var upstream = try UpstreamServer.start(allocator, &.{
         .{ .status_code = 500, .body = "fail-1", .connection_header = "close" },
         .{ .status_code = 500, .body = "fail-2", .connection_header = "close" },
-        .{ .status_code = 200, .body = "recovered", .connection_header = "close" },
+        .{ .status_code = 200, .body = "recovered", .delay_ms = 3_000, .connection_header = "close" },
     });
     defer upstream.stop();
     try upstream.run();
@@ -4526,6 +4526,7 @@ test "proxy.circuit_breaker_opens_fast_fails_and_recovers" {
         .config_text = config_text,
         .ready_path = "/healthz",
         .extra_env = &.{
+            .{ .name = "TARDIGRADE_WORKER_THREADS", .value = "2" },
             .{ .name = "TARDIGRADE_CB_THRESHOLD", .value = "2" },
             .{ .name = "TARDIGRADE_CB_TIMEOUT_MS", .value = "250" },
         },
@@ -4549,12 +4550,45 @@ test "proxy.circuit_breaker_opens_fast_fails_and_recovers" {
     compat.sleepNs(50 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(u32, 2), upstream.requestCount());
 
+    const ProbeResult = struct {
+        status: u16 = 0,
+        body_matched: bool = false,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This(), port: u16) void {
+            defer self.done.store(true, .release);
+            var response = sendRequestWithTimeout(std.heap.page_allocator, port, .{ .method = "GET", .path = "/cb", .body = null, .headers = &.{} }, 8_000) catch |err| {
+                self.err = err;
+                return;
+            };
+            defer response.deinit();
+            self.status = response.status_code;
+            self.body_matched = std.mem.find(u8, response.body, "recovered") != null or std.mem.find(u8, response.body, "\"code\":\"upstream_circuit_open\"") != null;
+        }
+    };
+
     compat.sleepNs(300 * std.time.ns_per_ms);
-    var recovered = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/cb", .body = null, .headers = &.{} });
-    defer recovered.deinit();
-    try std.testing.expectEqual(@as(u16, 200), recovered.status_code);
-    try assertContains(recovered.body, "recovered");
+    var probe_a = ProbeResult{};
+    const thread_a = try std.Thread.spawn(.{}, ProbeResult.run, .{ &probe_a, tardigrade.port });
     try waitForUpstreamCount(&upstream, 3, 2_000);
+    try std.testing.expect(!probe_a.done.load(.acquire));
+
+    var probe_b = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/cb", .body = null, .headers = &.{} });
+    defer probe_b.deinit();
+    thread_a.join();
+
+    if (probe_a.err) |err| return err;
+    try std.testing.expect(probe_a.body_matched);
+    const ok_a: u8 = if (probe_a.status == 200) 1 else 0;
+    const ok_b: u8 = if (probe_b.status_code == 200) 1 else 0;
+    const open_a: u8 = if (probe_a.status == 503) 1 else 0;
+    const open_b: u8 = if (probe_b.status_code == 503) 1 else 0;
+    const ok_count: u8 = ok_a + ok_b;
+    const open_count: u8 = open_a + open_b;
+    try std.testing.expectEqual(@as(u8, 1), ok_count);
+    try std.testing.expectEqual(@as(u8, 1), open_count);
+    try std.testing.expectEqual(@as(u32, 3), upstream.requestCount());
 }
 
 test "interop.openssl.h2.proxy_request_translation_is_secret_safe" {
@@ -6093,13 +6127,11 @@ test "interop.h2.proxy_passive_health_tracking_fails_closed" {
             .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
             .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
             .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
-            // Passive health and the process-wide circuit breaker are opt-in;
-            // once configured, H1's handleLocationProxyPass wrapper records
-            // failure/success and gates every proxied request. The direct H2
-            // executor has no equivalent, so it must fail closed rather than
-            // silently never participating.
+            // Passive health is opt-in; once configured, H1's
+            // handleLocationProxyPass wrapper records failure/success around
+            // every proxied request. The direct H2 executor has no equivalent,
+            // so it must fail closed rather than silently never participating.
             .{ .name = "TARDIGRADE_UPSTREAM_MAX_FAILS", .value = "3" },
-            .{ .name = "TARDIGRADE_CB_THRESHOLD", .value = "3" },
         },
     });
     defer tardigrade.stop();
@@ -6108,6 +6140,57 @@ test "interop.h2.proxy_passive_health_tracking_fails_closed" {
     const headers = [_]hpack.HeaderField{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":path", .value = "/h2-passive-health" },
+        .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":authority", .value = "tardigrade.test" },
+    };
+    const body = try pureZigH2GetBody(allocator, tardigrade.port, headers[0..]);
+    defer allocator.free(body);
+    try assertContains(body, "\"code\":\"h2_proxy_policy_unsupported\"");
+    compat.sleepNs(200 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), upstream.requestCount());
+}
+
+test "interop.h2.proxy_circuit_breaker_fails_closed" {
+    try requireNativeTlsProfile();
+    const allocator = std.testing.allocator;
+
+    var tls_paths = try nativeTlsFixturePaths(allocator);
+    defer tls_paths.deinit();
+
+    var upstream = try UpstreamServer.start(allocator, &.{.{ .body = "must-not-run" }});
+    defer upstream.stop();
+    try upstream.run();
+
+    const config_text = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\
+        \\location = /h2-circuit-breaker {{
+        \\    proxy_pass http://{s}:{d}/h2-circuit-breaker;
+        \\}}
+    , .{ test_host, upstream.port() });
+    defer allocator.free(config_text);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = config_text,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = tls_paths.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = tls_paths.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = "tardigrade.test" },
+            .{ .name = "TARDIGRADE_HTTP2_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_UPSTREAM_MAX_FAILS", .value = "0" },
+            .{ .name = "TARDIGRADE_CB_THRESHOLD", .value = "3" },
+        },
+    });
+    defer tardigrade.stop();
+    try upstream.resetCapture();
+
+    const headers = [_]hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/h2-circuit-breaker" },
         .{ .name = ":scheme", .value = "https" },
         .{ .name = ":authority", .value = "tardigrade.test" },
     };
