@@ -1467,22 +1467,26 @@ time you reloaded.
   config reload, not something that makes TLS config fields themselves
   hot-reloadable.
 
-  **On a general-profile build that also serves HTTP/3, a TLS
-  credential-path change is rejected outright, not silently split
+  **On a general-profile build that also serves HTTP/3, TLS identity
+  rotation is entirely restart-owned, not silently split
   ([#629](https://github.com/Bare-Systems/Tardigrade/issues/629)).** When
   both a `TlsTerminator` (stable TCP/OpenSSL) and a `NativeCredentialStore`
   (native H3) exist, `hotReloadConfig()` checks whether the proposed
   `tls_cert_path`/`tls_key_path`/SNI certificates differ from what is
-  currently published *before* touching either credential owner. If they
+  currently published *before* touching either credential owner; if they
   differ, the whole reload is rejected — same as the appliance bucket-2
-  contract above — so native H3 is never allowed to publish a rebuilt
-  identity while stable TCP stays behind on the old one; both surfaces keep
-  serving the previous, coherent identity until a restart. See "TLS
-  Credential Identity" in
+  contract above. When they're unchanged, native H3's credential files are
+  never re-read on that `SIGHUP` either (so a certificate rotated in place
+  at the same configured path isn't picked up), and the OpenSSL terminator's
+  own independent file watcher is disabled for this composition at startup
+  — so neither surface can drift on its own. Native H3 is never allowed to
+  publish a rebuilt identity while stable TCP stays behind on the old one;
+  both surfaces keep serving the previous, coherent identity until a
+  restart. See "TLS Credential Identity" in
   [RELOAD_SHUTDOWN.md](RELOAD_SHUTDOWN.md#tls-credential-identity) for the
-  full contract, including the pure-Zig/native-only build (no OpenSSL
-  adapter linked) where native TCP and native H3 share one credential store
-  and *do* hot-reload together in place.
+  full contract, including why the appliance profile's `ApplianceCredentials`
+  owner — despite technically supporting reload methods — is also fully
+  startup-owned in practice, since `hotReloadConfig` never calls them.
 - **you edited `tardigrade.env`, not `tardigrade.conf`** — `SIGHUP` reloads
   the *config*; it cannot change the *process environment* of an
   already-running process. `tardigrade.env` (and any

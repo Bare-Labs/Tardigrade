@@ -197,66 +197,72 @@ pub fn hotReloadConfig(
             return;
         }
     }
-    if (build_options.tls_openssl_adapter and worker_ctx.tls != null and worker_ctx.native_credentials != null) {
-        // #629: a general-profile build serving both stable TCP (OpenSSL
-        // `TlsTerminator`) and native HTTP/3 (`NativeCredentialStore`) has
-        // two independent TLS credential owners. Native H3 can rebuild and
-        // publish a fresh identity from the proposed cert/key/SNI paths
-        // below, but the OpenSSL terminator never rebuilds its certificate
-        // context on reload (it only receives `updateProtocolPolicy`
-        // further down). Publishing a changed identity to H3 alone would
-        // leave the two protocols serving different certificates for the
-        // same hostname until a full restart. Reject the whole reload
-        // instead, matching the appliance TLS credential contract above:
-        // both surfaces stay coherent on the previous identity, and an
-        // operator must restart to rotate credentials on this build.
+    // #629: a general-profile build serving both stable TCP (OpenSSL
+    // `TlsTerminator`) and native HTTP/3 (`NativeCredentialStore`) has two
+    // independent TLS credential owners. Left unrestricted, native H3 could
+    // rebuild and publish a fresh identity from the proposed cert/key/SNI
+    // paths below while the OpenSSL terminator's identity moved separately
+    // (or not at all) — via this SIGHUP path, via its own independent
+    // maintenance-timer file watcher, or via same-path content changes that
+    // never show up as a changed configured path. Any of those could leave
+    // the two protocols serving different certificates for the same
+    // hostname. `edge_gateway.run()` already disables the OpenSSL
+    // terminator's own identity-reload watcher for this composition
+    // (`setIdentityReloadEnabled(false)`); the reload path below completes
+    // the contract by never re-reading native credential files for this
+    // composition either, so identity rotation is entirely restart-owned
+    // while both owners coexist.
+    const mixed_credential_owners = build_options.tls_openssl_adapter and worker_ctx.tls != null and worker_ctx.native_credentials != null;
+    if (mixed_credential_owners) {
         var current_lease = worker_ctx.config_store.acquire();
         const credential_paths_changed = nativeCredentialPathsChanged(current_lease.cfg, cfg_ptr);
         current_lease.release();
         if (credential_paths_changed) {
             worker_ctx.config_store.destroyVersion(prepared_version);
-            const msg = std.fmt.bufPrint(&state.last_reload_error, "TLS credential paths changed on a mixed OpenSSL/native-HTTP3 build; restart required", .{}) catch "TLS credential paths changed; restart required";
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "TLS credential paths changed on a mixed TLS-adapter/native-HTTP3 build; restart required", .{}) catch "TLS credential paths changed; restart required";
             state.reload_mutex.lock();
             state.last_reload_ok = false;
             state.last_reload_at_ms = now_ms;
             state.last_reload_error_len = msg.len;
             state.reload_mutex.unlock();
             state.metricsRecordReloadFailure();
-            state.logger.warn(null, "config reload rejected: tls_cert_path/tls_key_path/SNI certificates changed on a build serving both stable TCP (OpenSSL) and native HTTP/3; restart the process so both TLS surfaces stay on the same identity (#629)", .{});
+            state.logger.warn(null, "config reload rejected: tls_cert_path/tls_key_path/SNI certificates changed on a build serving both stable TCP and native HTTP/3 through separate credential owners; restart the process so both TLS surfaces stay on the same identity (#629)", .{});
             return;
         }
     }
     var prepared_native_credentials: ?http.native_tls_connection.NativeCredentialStore.PreparedReload = null;
     defer if (prepared_native_credentials) |*prepared| prepared.deinit();
-    if (worker_ctx.native_credentials) |store| {
-        var sni_specs = allocator.alloc(http.native_tls_connection.SniCertSpec, cfg_ptr.tls_sni_certs.len) catch {
-            worker_ctx.config_store.destroyVersion(prepared_version);
-            state.reload_mutex.lock();
-            state.last_reload_ok = false;
-            state.last_reload_at_ms = now_ms;
-            @memcpy(state.last_reload_error[0..21], "bookkeeping failed   ");
-            state.last_reload_error_len = 21;
-            state.reload_mutex.unlock();
-            state.metricsRecordReloadFailure();
-            state.logger.warn(null, "config reload native TLS SNI allocation failed", .{});
-            return;
-        };
-        defer allocator.free(sni_specs);
-        for (cfg_ptr.tls_sni_certs, 0..) |sc, i| {
-            sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
+    if (!mixed_credential_owners) {
+        if (worker_ctx.native_credentials) |store| {
+            var sni_specs = allocator.alloc(http.native_tls_connection.SniCertSpec, cfg_ptr.tls_sni_certs.len) catch {
+                worker_ctx.config_store.destroyVersion(prepared_version);
+                state.reload_mutex.lock();
+                state.last_reload_ok = false;
+                state.last_reload_at_ms = now_ms;
+                @memcpy(state.last_reload_error[0..21], "bookkeeping failed   ");
+                state.last_reload_error_len = 21;
+                state.reload_mutex.unlock();
+                state.metricsRecordReloadFailure();
+                state.logger.warn(null, "config reload native TLS SNI allocation failed", .{});
+                return;
+            };
+            defer allocator.free(sni_specs);
+            for (cfg_ptr.tls_sni_certs, 0..) |sc, i| {
+                sni_specs[i] = .{ .server_name = sc.server_name, .cert_path = sc.cert_path, .key_path = sc.key_path };
+            }
+            prepared_native_credentials = store.prepareReloadFromFiles(cfg_ptr.tls_cert_path, cfg_ptr.tls_key_path, sni_specs) catch |err| {
+                worker_ctx.config_store.destroyVersion(prepared_version);
+                const msg = std.fmt.bufPrint(&state.last_reload_error, "native TLS credential reload failed: {}", .{err}) catch "native TLS credential reload failed";
+                state.reload_mutex.lock();
+                state.last_reload_ok = false;
+                state.last_reload_at_ms = now_ms;
+                state.last_reload_error_len = msg.len;
+                state.reload_mutex.unlock();
+                state.metricsRecordReloadFailure();
+                state.logger.warn(null, "config reload rejected by native TLS credential reload: {}", .{err});
+                return;
+            };
         }
-        prepared_native_credentials = store.prepareReloadFromFiles(cfg_ptr.tls_cert_path, cfg_ptr.tls_key_path, sni_specs) catch |err| {
-            worker_ctx.config_store.destroyVersion(prepared_version);
-            const msg = std.fmt.bufPrint(&state.last_reload_error, "native TLS credential reload failed: {}", .{err}) catch "native TLS credential reload failed";
-            state.reload_mutex.lock();
-            state.last_reload_ok = false;
-            state.last_reload_at_ms = now_ms;
-            state.last_reload_error_len = msg.len;
-            state.reload_mutex.unlock();
-            state.metricsRecordReloadFailure();
-            state.logger.warn(null, "config reload rejected by native TLS credential reload: {}", .{err});
-            return;
-        };
     }
     if (worker_ctx.resumption_runtime) |runtime| {
         if (cfg_ptr.tls_native_ticket_keys_path.len > 0) {
@@ -726,134 +732,335 @@ fn expectSelectedLeaf(provider: tls_core.credentials.CredentialProvider, expecte
     try std.testing.expectEqualSlices(u8, expected_leaf, chain.leaf().?);
 }
 
-test "hotReloadConfig rejects a native HTTP/3 credential-path change on a mixed OpenSSL-TCP/native-HTTP3 build (#629)" {
-    // Regression for the identity-split bug: on a general-profile build
-    // serving both stable TCP (OpenSSL `TlsTerminator`) and native HTTP/3
-    // (`NativeCredentialStore`), the two credential owners must never end
-    // up on different certificates after a single `SIGHUP`. This drives
-    // the real `hotReloadConfig` end to end and proves the whole reload is
-    // rejected before either owner is touched, rather than letting native
-    // H3 alone pick up the new identity while stable TCP stays behind.
-    //
-    // Skipped under the appliance TLS profile: that build never links the
-    // OpenSSL adapter (`build_options.tls_openssl_adapter` is false), so
-    // there is no mixed-owner scenario to prove here — the appliance
-    // credential contract already covers that profile fully (see the
-    // `applianceCredentialConfigChanged` tests above).
+/// Asserts the OpenSSL terminator's live `SSL_CTX` is currently serving
+/// `expected_leaf`, using `TlsTerminator.currentCertificateDer` (#629).
+fn expectTcpLeaf(tls: *http.tls_termination.TlsTerminator, allocator: std.mem.Allocator, expected_leaf: []const u8) !void {
+    const der = (try tls.currentCertificateDer(allocator)) orelse return error.TestUnexpectedNull;
+    defer allocator.free(der);
+    try std.testing.expectEqualSlices(u8, expected_leaf, der);
+}
+
+/// A real, mixed OpenSSL-TCP/native-HTTP3 composition — the same shape
+/// `edge_gateway.run()` builds for a general-profile deployment that also
+/// serves HTTP/3: a `TlsTerminator` and a `NativeCredentialStore` both fed
+/// from the *same* configured cert/key path (matching production, where
+/// both owners are constructed from `cfg.tls_cert_path`/`cfg.tls_key_path`),
+/// with `setIdentityReloadEnabled(false)` already applied to mirror the
+/// startup wiring in `edge_gateway.zig`.
+const MixedFixture = struct {
+    tmp: std.testing.TmpDir,
+    allocator: std.mem.Allocator,
+    tls: http.tls_termination.TlsTerminator,
+    native_store: http.native_tls_connection.NativeCredentialStore,
+    cert_path: []u8,
+    key_path: []u8,
+    cert_path_z: [:0]u8,
+    key_path_z: [:0]u8,
+
+    fn deinit(self: *MixedFixture) void {
+        self.tls.deinit();
+        self.native_store.deinit();
+        self.allocator.free(self.cert_path);
+        self.allocator.free(self.key_path);
+        self.allocator.free(self.cert_path_z);
+        self.allocator.free(self.key_path_z);
+        self.tmp.cleanup();
+    }
+};
+
+fn setupMixedFixture(allocator: std.mem.Allocator, cert_bytes: []const u8, key_bytes: []const u8) !MixedFixture {
+    var tmp = std.testing.tmpDir(.{});
+    errdefer tmp.cleanup();
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "tls.crt", .data = cert_bytes });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "tls.key", .data = key_bytes });
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "tls.crt");
+    errdefer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "tls.key");
+    errdefer allocator.free(key_path);
+    const cert_path_z = try allocator.dupeZ(u8, cert_path);
+    errdefer allocator.free(cert_path_z);
+    const key_path_z = try allocator.dupeZ(u8, key_path);
+    errdefer allocator.free(key_path_z);
+
+    var tls = try http.tls_termination.TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .http1_enabled = true,
+        .http2_enabled = true,
+    });
+    errdefer tls.deinit();
+    tls.setIdentityReloadEnabled(false);
+
+    var native_store = http.native_tls_connection.NativeCredentialStore.init(allocator);
+    errdefer native_store.deinit();
+    try native_store.reloadFromFiles(cert_path, key_path, &.{});
+
+    return .{
+        .tmp = tmp,
+        .allocator = allocator,
+        .tls = tls,
+        .native_store = native_store,
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .cert_path_z = cert_path_z,
+        .key_path_z = key_path_z,
+    };
+}
+
+/// Loaded PEM bytes plus their parsed DER leaf, for a test identity backed
+/// by an on-disk fixture under `tests/fixtures/tls/`.
+const LoadedIdentity = struct {
+    cert_bytes: []u8,
+    key_bytes: []u8,
+    chain: [][]u8,
+
+    fn load(allocator: std.mem.Allocator, comptime cert_path: []const u8, comptime key_path: []const u8) !LoadedIdentity {
+        const cert_bytes = try compat.cwd().readFileAlloc(allocator, cert_path, 256 * 1024);
+        errdefer allocator.free(cert_bytes);
+        const key_bytes = try compat.cwd().readFileAlloc(allocator, key_path, 256 * 1024);
+        errdefer allocator.free(key_bytes);
+        const chain = try tls_core.identity_loader.certChainFromPemOrDer(allocator, cert_bytes);
+        return .{ .cert_bytes = cert_bytes, .key_bytes = key_bytes, .chain = chain };
+    }
+
+    fn leaf(self: *const LoadedIdentity) []const u8 {
+        return self.chain[0];
+    }
+
+    fn deinit(self: *LoadedIdentity, allocator: std.mem.Allocator) void {
+        allocator.free(self.cert_bytes);
+        allocator.free(self.key_bytes);
+        freeIdentityLoaderChain(allocator, self.chain);
+    }
+};
+
+/// Builds a `worker_ctx`/`state`/`dispatch_ctx` triple wired to drive the
+/// real `hotReloadConfig` against `fixture`, sharing the exact field set
+/// the pre-existing #368 ordering test relies on being safe to leave
+/// `undefined` (see that test's comment).
+const MixedReloadHarness = struct {
+    worker_ctx: WorkerContext,
+    state: GatewayState,
+    dispatch_ctx: struct { cfg: *const edge_config.EdgeConfig = undefined },
+
+    fn init(fixture: *MixedFixture, config_store: *ReloadableConfigStore, logger_name: [:0]const u8) MixedReloadHarness {
+        var self: MixedReloadHarness = undefined;
+        self.worker_ctx.config_store = config_store;
+        self.worker_ctx.tls = &fixture.tls;
+        self.worker_ctx.native_credentials = &fixture.native_store;
+        self.state.logger = http.logger.Logger.init(.err, logger_name);
+        self.state.reload_mutex = .{};
+        self.state.last_reload_ok = false;
+        self.state.last_reload_at_ms = 0;
+        self.state.last_reload_error_len = 0;
+        self.state.metrics_mutex = .{};
+        self.state.metrics = http.metrics.Metrics.init();
+        self.dispatch_ctx = .{};
+        return self;
+    }
+
+    fn reload(self: *MixedReloadHarness, allocator: std.mem.Allocator) void {
+        hotReloadConfig(allocator, &self.worker_ctx, &self.state, &self.dispatch_ctx);
+    }
+};
+
+test "hotReloadConfig rejects a default TLS identity change on a mixed TLS-adapter/native-HTTP3 build (#629)" {
+    // Core #629 invariant: TCP and H3 start coherent (both serving identity
+    // A, loaded from the same configured path — matching how
+    // `edge_gateway.run()` wires both owners), a proposed default cert/key
+    // path change is rejected atomically, and both surfaces are still on A
+    // afterward. Skipped under the appliance TLS profile: that build never
+    // links the OpenSSL adapter, so there is no mixed-owner scenario here —
+    // appliance's own contract is covered by the `applianceCredentialConfigChanged`
+    // tests above.
     if (!build_options.tls_openssl_adapter) return;
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var identity_a = try LoadedIdentity.load(allocator, "tests/fixtures/tls/native_ed25519.crt", "tests/fixtures/tls/native_ed25519.key");
+    defer identity_a.deinit(allocator);
 
-    // Native H3's starting identity (Ed25519).
-    const cert_a = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.crt", 256 * 1024);
-    defer allocator.free(cert_a);
-    const key_a = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_ed25519.key", 256 * 1024);
-    defer allocator.free(key_a);
-    const chain_a = try tls_core.identity_loader.certChainFromPemOrDer(allocator, cert_a);
-    defer freeIdentityLoaderChain(allocator, chain_a);
-    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "h3.crt", .data = cert_a });
-    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "h3.key", .data = key_a });
-    const h3_cert_path_a = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "h3.crt");
-    defer allocator.free(h3_cert_path_a);
-    const h3_key_path_a = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "h3.key");
-    defer allocator.free(h3_key_path_a);
-    const h3_cert_path_a_z = try allocator.dupeZ(u8, h3_cert_path_a);
-    defer allocator.free(h3_cert_path_a_z);
-    const h3_key_path_a_z = try allocator.dupeZ(u8, h3_key_path_a);
-    defer allocator.free(h3_key_path_a_z);
+    var fixture = try setupMixedFixture(allocator, identity_a.cert_bytes, identity_a.key_bytes);
+    defer fixture.deinit();
+    try expectSelectedLeaf(fixture.native_store.provider(), identity_a.leaf());
+    try expectTcpLeaf(&fixture.tls, allocator, identity_a.leaf());
 
-    // The identity the proposed reload will try (and fail) to move H3 to
-    // (P-256) — distinct key kind so a leaf-bytes comparison can never
-    // accidentally match.
+    var identity_b_tmp = std.testing.tmpDir(.{});
+    defer identity_b_tmp.cleanup();
     const cert_b = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.crt", 256 * 1024);
     defer allocator.free(cert_b);
     const key_b = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.key", 256 * 1024);
     defer allocator.free(key_b);
-    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "h3_b.crt", .data = cert_b });
-    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "h3_b.key", .data = key_b });
-    const h3_cert_path_b = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "h3_b.crt");
-    defer allocator.free(h3_cert_path_b);
-    const h3_key_path_b = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "h3_b.key");
-    defer allocator.free(h3_key_path_b);
-    const h3_cert_path_b_z = try allocator.dupeZ(u8, h3_cert_path_b);
-    defer allocator.free(h3_cert_path_b_z);
-    const h3_key_path_b_z = try allocator.dupeZ(u8, h3_key_path_b);
-    defer allocator.free(h3_key_path_b_z);
+    try compat.wrapDir(identity_b_tmp.dir).writeFile(.{ .sub_path = "b.crt", .data = cert_b });
+    try compat.wrapDir(identity_b_tmp.dir).writeFile(.{ .sub_path = "b.key", .data = key_b });
+    const cert_path_b = try compat.wrapDir(identity_b_tmp.dir).realpathAlloc(allocator, "b.crt");
+    defer allocator.free(cert_path_b);
+    const key_path_b = try compat.wrapDir(identity_b_tmp.dir).realpathAlloc(allocator, "b.key");
+    defer allocator.free(key_path_b);
+    const cert_path_b_z = try allocator.dupeZ(u8, cert_path_b);
+    defer allocator.free(cert_path_b_z);
+    const key_path_b_z = try allocator.dupeZ(u8, key_path_b);
+    defer allocator.free(key_path_b_z);
 
-    // Stable TCP's OpenSSL terminator — a real but unrelated identity; it
-    // must never be touched by this reload, so what it serves is
-    // irrelevant beyond "a valid startup cert".
-    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "tcp.crt", .data = @embedFile("http/testdata/test_server.crt") });
-    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "tcp.key", .data = @embedFile("http/testdata/test_server.key") });
-    const tcp_cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "tcp.crt");
-    defer allocator.free(tcp_cert_path);
-    const tcp_key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "tcp.key");
-    defer allocator.free(tcp_key_path);
-    var tls = try http.tls_termination.TlsTerminator.init(allocator, .{
-        .cert_path = tcp_cert_path,
-        .key_path = tcp_key_path,
-        .http1_enabled = true,
-        .http2_enabled = true,
-    });
-    defer tls.deinit();
-
-    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_CERT_PATH", h3_cert_path_a_z, 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_CERT_PATH", fixture.cert_path_z, 1));
     defer _ = unsetenv("TARDIGRADE_TLS_CERT_PATH");
-    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_KEY_PATH", h3_key_path_a_z, 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_KEY_PATH", fixture.key_path_z, 1));
     defer _ = unsetenv("TARDIGRADE_TLS_KEY_PATH");
 
     var current_cfg = try edge_config.loadFromEnv(allocator);
     defer current_cfg.deinit(allocator);
-    try std.testing.expectEqualStrings(h3_cert_path_a, current_cfg.tls_cert_path);
-
     var config_store = try ReloadableConfigStore.initBorrowed(allocator, &current_cfg);
     defer config_store.deinit();
 
-    var native_store = http.native_tls_connection.NativeCredentialStore.init(allocator);
-    defer native_store.deinit();
-    try native_store.reloadFromFiles(h3_cert_path_a, h3_key_path_a, &.{});
-    try expectSelectedLeaf(native_store.provider(), chain_a[0]);
+    var harness = MixedReloadHarness.init(&fixture, &config_store, "hot-reload-mixed-default-identity-test");
 
-    var worker_ctx: WorkerContext = undefined;
-    worker_ctx.config_store = &config_store;
-    worker_ctx.tls = &tls;
-    worker_ctx.native_credentials = &native_store;
+    // Simulate a SIGHUP whose environment moves the default TLS credential
+    // paths to identity B.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_CERT_PATH", cert_path_b_z, 1));
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_KEY_PATH", key_path_b_z, 1));
 
-    var state: GatewayState = undefined;
-    state.logger = http.logger.Logger.init(.err, "hot-reload-mixed-credential-test");
-    state.reload_mutex = .{};
-    state.last_reload_ok = false;
-    state.last_reload_at_ms = 0;
-    state.last_reload_error_len = 0;
-    state.metrics_mutex = .{};
-    state.metrics = http.metrics.Metrics.init();
+    harness.reload(allocator);
 
-    const DispatchCtx = struct { cfg: *const edge_config.EdgeConfig = undefined };
-    var dispatch_ctx = DispatchCtx{};
-
-    // Simulate a SIGHUP whose environment moves the TLS credential paths
-    // to identity B.
-    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_CERT_PATH", h3_cert_path_b_z, 1));
-    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_KEY_PATH", h3_key_path_b_z, 1));
-
-    hotReloadConfig(allocator, &worker_ctx, &state, &dispatch_ctx);
-
-    try std.testing.expect(!state.last_reload_ok);
+    try std.testing.expect(!harness.state.last_reload_ok);
     try std.testing.expectEqualStrings(
-        "TLS credential paths changed on a mixed OpenSSL/native-HTTP3 build; restart required",
-        state.last_reload_error[0..state.last_reload_error_len],
+        "TLS credential paths changed on a mixed TLS-adapter/native-HTTP3 build; restart required",
+        harness.state.last_reload_error[0..harness.state.last_reload_error_len],
     );
+    try expectSelectedLeaf(fixture.native_store.provider(), identity_a.leaf());
+    try expectTcpLeaf(&fixture.tls, allocator, identity_a.leaf());
 
-    // Native H3 must still be serving identity A — it must never have
-    // rebuilt or published identity B on its own.
-    try expectSelectedLeaf(native_store.provider(), chain_a[0]);
-
-    // The published config lease is unchanged too: still identity A.
     var lease = config_store.acquire();
     defer lease.release();
-    try std.testing.expectEqualStrings(h3_cert_path_a, lease.cfg.tls_cert_path);
+    try std.testing.expectEqualStrings(fixture.cert_path, lease.cfg.tls_cert_path);
+}
+
+test "hotReloadConfig rejects an SNI identity change on a mixed TLS-adapter/native-HTTP3 build (#629)" {
+    if (!build_options.tls_openssl_adapter) return;
+    const allocator = std.testing.allocator;
+
+    var identity_a = try LoadedIdentity.load(allocator, "tests/fixtures/tls/native_ed25519.crt", "tests/fixtures/tls/native_ed25519.key");
+    defer identity_a.deinit(allocator);
+
+    var fixture = try setupMixedFixture(allocator, identity_a.cert_bytes, identity_a.key_bytes);
+    defer fixture.deinit();
+
+    var sni_tmp = std.testing.tmpDir(.{});
+    defer sni_tmp.cleanup();
+    const sni_cert = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.crt", 256 * 1024);
+    defer allocator.free(sni_cert);
+    const sni_key = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.key", 256 * 1024);
+    defer allocator.free(sni_key);
+    try compat.wrapDir(sni_tmp.dir).writeFile(.{ .sub_path = "sni.crt", .data = sni_cert });
+    try compat.wrapDir(sni_tmp.dir).writeFile(.{ .sub_path = "sni.key", .data = sni_key });
+    const sni_cert_path = try compat.wrapDir(sni_tmp.dir).realpathAlloc(allocator, "sni.crt");
+    defer allocator.free(sni_cert_path);
+    const sni_key_path = try compat.wrapDir(sni_tmp.dir).realpathAlloc(allocator, "sni.key");
+    defer allocator.free(sni_key_path);
+    const sni_spec_owned = try std.fmt.allocPrint(allocator, "sni.example.test:{s}:{s}", .{ sni_cert_path, sni_key_path });
+    defer allocator.free(sni_spec_owned);
+    const sni_spec = try allocator.dupeZ(u8, sni_spec_owned);
+    defer allocator.free(sni_spec);
+
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_CERT_PATH", fixture.cert_path_z, 1));
+    defer _ = unsetenv("TARDIGRADE_TLS_CERT_PATH");
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_KEY_PATH", fixture.key_path_z, 1));
+    defer _ = unsetenv("TARDIGRADE_TLS_KEY_PATH");
+
+    var current_cfg = try edge_config.loadFromEnv(allocator);
+    defer current_cfg.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), current_cfg.tls_sni_certs.len);
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &current_cfg);
+    defer config_store.deinit();
+
+    var harness = MixedReloadHarness.init(&fixture, &config_store, "hot-reload-mixed-sni-identity-test");
+
+    // Default paths are unchanged; only the SNI set grows from empty to one
+    // entry.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_SNI_CERTS", sni_spec, 1));
+    defer _ = unsetenv("TARDIGRADE_TLS_SNI_CERTS");
+
+    harness.reload(allocator);
+
+    try std.testing.expect(!harness.state.last_reload_ok);
+    try std.testing.expectEqualStrings(
+        "TLS credential paths changed on a mixed TLS-adapter/native-HTTP3 build; restart required",
+        harness.state.last_reload_error[0..harness.state.last_reload_error_len],
+    );
+    try expectSelectedLeaf(fixture.native_store.provider(), identity_a.leaf());
+    try expectTcpLeaf(&fixture.tls, allocator, identity_a.leaf());
+
+    var lease = config_store.acquire();
+    defer lease.release();
+    try std.testing.expectEqual(@as(usize, 0), lease.cfg.tls_sni_certs.len);
+}
+
+test "TlsTerminator.runMaintenance never rebuilds TCP's identity in a mixed TLS-adapter/native-HTTP3 composition, even for a same-path content replacement (#629)" {
+    // Finding 1 from review: `TlsTerminator.runMaintenance`'s own
+    // independent mtime watcher could otherwise rebuild TCP's default
+    // certificate/key (and SNI credentials) on its own timer — with no
+    // `SIGHUP` involved at all — moving TCP to a new identity while native
+    // H3 stays on the old one. `edge_gateway.run()` calls
+    // `setIdentityReloadEnabled(false)` for this composition (replicated by
+    // `setupMixedFixture`); this proves that suppression holds even when
+    // the certificate bytes at the *same* configured path change and the
+    // watcher's interval is due (the first `runMaintenance` call is always
+    // due — see `next_reload_ms`'s zero-initialized sentinel).
+    //
+    // The complementary half of finding 1 — that `hotReloadConfig` itself
+    // never re-reads native H3 credential files for this composition on an
+    // accepted `SIGHUP`, even when the configured path is unchanged — holds
+    // by construction: `hotReloadConfig`'s `if (!mixed_credential_owners)`
+    // guard makes `store.prepareReloadFromFiles` unreachable code for this
+    // composition regardless of the reload's outcome or file content (the
+    // config-string-changed half of the same guard is exercised by the
+    // rejection tests above). It is not separately exercised here as a live
+    // `hotReloadConfig` call to success: doing so requires the reload to
+    // actually succeed, and driving a from-scratch `hotReloadConfig` call
+    // all the way to its success path currently hangs in this bare
+    // `zig test` context for reasons unrelated to #629 — every existing
+    // direct unit test of `hotReloadConfig` (this file's #368 test
+    // included) only ever exercises a rejection path for the same reason.
+    // `tests/integration.zig`'s real-process `SIGHUP` reload tests exercise
+    // the success path against the actual binary.
+    if (!build_options.tls_openssl_adapter) return;
+    const allocator = std.testing.allocator;
+
+    var identity_a = try LoadedIdentity.load(allocator, "tests/fixtures/tls/native_ed25519.crt", "tests/fixtures/tls/native_ed25519.key");
+    defer identity_a.deinit(allocator);
+
+    var fixture = try setupMixedFixture(allocator, identity_a.cert_bytes, identity_a.key_bytes);
+    defer fixture.deinit();
+    try expectTcpLeaf(&fixture.tls, allocator, identity_a.leaf());
+
+    // Same configured path, but the bytes at that path now belong to
+    // identity B.
+    const cert_b = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.crt", 256 * 1024);
+    defer allocator.free(cert_b);
+    const key_b = try compat.cwd().readFileAlloc(allocator, "tests/fixtures/tls/native_p256.key", 256 * 1024);
+    defer allocator.free(key_b);
+    try compat.wrapDir(fixture.tmp.dir).writeFile(.{ .sub_path = "tls.crt", .data = cert_b });
+    try compat.wrapDir(fixture.tmp.dir).writeFile(.{ .sub_path = "tls.key", .data = key_b });
+
+    fixture.tls.runMaintenance(1);
+    try expectTcpLeaf(&fixture.tls, allocator, identity_a.leaf());
+}
+
+test "a mixed TLS-adapter/native-HTTP3 build converges both TLS surfaces onto a new identity after restart (#629)" {
+    // Restart is how credential rotation actually happens in this
+    // composition. A fresh process building both owners straight from the
+    // rotated config (no `hotReloadConfig` involved) must land both on the
+    // same new identity — proving the restart path this ticket relies on
+    // to complete the contract actually converges.
+    if (!build_options.tls_openssl_adapter) return;
+    const allocator = std.testing.allocator;
+
+    var identity_b = try LoadedIdentity.load(allocator, "tests/fixtures/tls/native_p256.crt", "tests/fixtures/tls/native_p256.key");
+    defer identity_b.deinit(allocator);
+
+    var fixture = try setupMixedFixture(allocator, identity_b.cert_bytes, identity_b.key_bytes);
+    defer fixture.deinit();
+
+    try expectSelectedLeaf(fixture.native_store.provider(), identity_b.leaf());
+    try expectTcpLeaf(&fixture.tls, allocator, identity_b.leaf());
 }
 
 pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {

@@ -462,6 +462,14 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             native_credentials = null;
         }
     }
+    if (tls_terminator != null and native_credentials != null) {
+        // #629: this is a mixed OpenSSL-TCP/native-HTTP3 build. Native H3's
+        // credential store can be independently hot-reloaded; suppress the
+        // OpenSSL terminator's own independent identity-reload watcher so
+        // its certificate/SNI identity cannot drift away from H3's outside
+        // a coordinated restart.
+        tls_terminator.?.setIdentityReloadEnabled(false);
+    }
     defer if (native_credentials) |*store| store.deinit();
     defer if (tls_terminator) |*tls| tls.deinit();
     const native_early_data_replay_composition = nativeEarlyDataReplayComposition(

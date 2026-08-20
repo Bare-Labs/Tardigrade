@@ -166,6 +166,14 @@ const State = struct {
     sni_certs: std.ArrayList(ManagedSniCert),
     protocol_policy: negotiated_dispatch.ListenerProtocolPolicy,
     policy_ex_index: c_int,
+    /// #629: when false, `runMaintenance` never rebuilds the default
+    /// certificate/key or the SNI credential list, even if their files
+    /// changed on disk. Set by the owner (`setIdentityReloadEnabled`) when
+    /// a second, independently-reloadable TLS credential owner (native
+    /// HTTP/3) is also present, so this terminator's identity cannot drift
+    /// out from under a coordinated reload. CRL/OCSP/ACME scheduling is
+    /// unaffected — only the identity-visible outputs are suppressed.
+    identity_reload_enabled: bool = true,
 
     fn deinit(self: *State) void {
         if (self.ocsp_response) |resp| self.allocator.free(resp);
@@ -283,10 +291,12 @@ pub const TlsTerminator = struct {
         if (self.state.next_reload_ms != 0 and now_ms < self.state.next_reload_ms) return;
         self.state.next_reload_ms = now_ms + self.state.dynamic_reload_interval_ms;
 
-        const cert_mtime = fileMtime(self.state.default_cert_path) catch self.state.default_cert_mtime;
-        const key_mtime = fileMtime(self.state.default_key_path) catch self.state.default_key_mtime;
-        if (cert_mtime != self.state.default_cert_mtime or key_mtime != self.state.default_key_mtime) {
-            _ = loadDefaultCertificate(self.ctx, self.state) catch {}; // cert reload is best-effort; existing certificate remains active
+        if (self.state.identity_reload_enabled) {
+            const cert_mtime = fileMtime(self.state.default_cert_path) catch self.state.default_cert_mtime;
+            const key_mtime = fileMtime(self.state.default_key_path) catch self.state.default_key_mtime;
+            if (cert_mtime != self.state.default_cert_mtime or key_mtime != self.state.default_key_mtime) {
+                _ = loadDefaultCertificate(self.ctx, self.state) catch {}; // cert reload is best-effort; existing certificate remains active
+            }
         }
 
         if (self.state.crl_check and self.state.crl_path.len > 0) {
@@ -328,10 +338,13 @@ pub const TlsTerminator = struct {
                 error.CertNotYetDue => {},
                 else => {},
             };
-            // After a successful issuance, rebuild the SNI cert list to pick up the new cert.
+            // After a successful issuance, rebuild the SNI cert list to pick up the new cert
+            // (skipped below when identity reload is suppressed).
         }
 
-        _ = rebuildSniCertificates(self.state) catch {}; // SNI cert rebuild is best-effort; existing certificate mappings remain active
+        if (self.state.identity_reload_enabled) {
+            _ = rebuildSniCertificates(self.state) catch {}; // SNI cert rebuild is best-effort; existing certificate mappings remain active
+        }
     }
 
     pub fn protocolPolicySnapshot(self: *TlsTerminator) negotiated_dispatch.ListenerProtocolPolicy {
@@ -345,6 +358,37 @@ pub const TlsTerminator = struct {
         self.state.mutex.lock();
         defer self.state.mutex.unlock();
         self.state.protocol_policy = policy;
+    }
+
+    /// #629: controls whether `runMaintenance` may rebuild the default
+    /// certificate/key or the SNI credential list. The owner sets this to
+    /// `false` once at startup when a second, independently-reloadable TLS
+    /// credential owner (native HTTP/3) is also present, so this
+    /// terminator's identity stays coherent with the other owner's until a
+    /// coordinated restart. CRL/OCSP/ACME scheduling continues either way.
+    pub fn setIdentityReloadEnabled(self: *TlsTerminator, enabled: bool) void {
+        self.state.mutex.lock();
+        defer self.state.mutex.unlock();
+        self.state.identity_reload_enabled = enabled;
+    }
+
+    /// Returns the DER bytes of the certificate currently loaded into the
+    /// live `SSL_CTX`, allocated with `allocator`. Used to verify which
+    /// identity this terminator is actually serving, independent of the
+    /// configured path strings (#629 regression coverage). Returns `null`
+    /// if no certificate is loaded.
+    pub fn currentCertificateDer(self: *TlsTerminator, allocator: std.mem.Allocator) TlsError!?[]u8 {
+        self.state.mutex.lock();
+        defer self.state.mutex.unlock();
+        const cert = c.SSL_CTX_get0_certificate(self.ctx) orelse return null;
+        const len = c.i2d_X509(cert, null);
+        if (len <= 0) return null;
+        const buf = try allocator.alloc(u8, @intCast(len));
+        errdefer allocator.free(buf);
+        var ptr: [*c]u8 = buf.ptr;
+        const written = c.i2d_X509(cert, &ptr);
+        if (written != len) return error.CertificateLoadFailed;
+        return buf;
     }
 
     pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {
