@@ -2185,7 +2185,33 @@ pub const Connection = struct {
                 };
                 const f = decoded orelse break;
                 if (f.isAckEliciting()) ack_eliciting = true;
-                try self.applyFrame(level, f, ingress_path, local_cid_sequence, now_us);
+                self.applyFrame(level, f, ingress_path, local_cid_sequence, now_us) catch |err| {
+                    // Post-authentication ingest OOM must be terminal for
+                    // this connection (#247 soak finding, review round 8):
+                    // `pn` was already inserted into `recovery`'s
+                    // received/ACK-range bookkeeping above, before this
+                    // frame loop ever ran (mirroring the ACK-range-overflow
+                    // failure a few lines up, which already closes rather
+                    // than tries to unwind). Several frame effects in the
+                    // switch below are allocator-fallible (STOP_SENDING's
+                    // RESET_STREAM queue reservation, `known_streams`/
+                    // `accept_queue`/`pending_retires` inserts) -- if any of
+                    // them fails partway through, a required protocol
+                    // effect can be left uncommitted with no safe way to
+                    // unwind the PN/ACK-range insertion: `AckRangeSet`
+                    // merges ranges on insert, so removing a single value
+                    // would need range-splitting logic that does not exist.
+                    // A connection left running after this could later ACK
+                    // this exact packet number for an unrelated reason and
+                    // tell the peer an effect was received when it never
+                    // actually committed. Closing here guarantees a
+                    // surviving connection can never do that --
+                    // `pollTransmitOnPath` restricts a `.closing` connection
+                    // to only ever (re)sending the CONNECTION_CLOSE
+                    // datagram, never an ordinary ACK.
+                    self.startClose(.{ .error_code = error_internal, .is_application = false, .local = true }, "frame apply", now_us);
+                    return err;
+                };
                 if (self.state_ == .closed or self.state_ == .draining) return;
                 if (self.state_ == .closing) break;
             }
@@ -7238,18 +7264,18 @@ test "resetStream reservation failure leaves the stream retryable, not stranded"
     try testing.expectEqual(@as(u64, 1), manager.metrics.reset_streams);
 }
 
-test "STOP_SENDING automatic-reset reservation failure leaves the stream retryable and is never ACKed" {
+test "STOP_SENDING automatic-reset reservation failure leaves the stream retryable when applied directly" {
     // Same transactional requirement as the explicit `resetStream` test
     // above, but for the RFC 9000 SS3.5 automatic reset a received
-    // STOP_SENDING triggers -- with a sharper wire-safety requirement:
-    // reservation now happens *before* the STOP is logically accepted
-    // (`receiveStopSending`), so a failed reservation must propagate as
-    // `error.OutOfMemory` out of `applyFrame` rather than being swallowed.
-    // `ingest`'s `try self.applyFrame(...)` means that propagation aborts
-    // processing before this packet's space is marked `ack_needed` -- a
-    // real peer whose STOP_SENDING triggered this failure never receives an
-    // ACK for it and therefore has a reason to retransmit. Nothing about
-    // the stream may be committed on the failed attempt either.
+    // STOP_SENDING triggers: a failed reservation must propagate as
+    // `error.OutOfMemory` out of `applyFrame` rather than being swallowed,
+    // and nothing about the stream may be committed on the failed attempt.
+    // This calls `applyFrame` directly (fast, no real packet needed) to
+    // pin down the stream-level transaction; it deliberately does not
+    // attempt to prove the packet-level "never ACKed" wire property --
+    // `applyFrame` alone bypasses `ingestPacket`'s received-PN/ACK-range
+    // bookkeeping entirely, so it cannot demonstrate that. See the
+    // packet-level regression below for that proof.
     const allocator = testing.allocator;
     var pair = try TestPair.init(allocator);
     defer pair.deinit(allocator);
@@ -7279,6 +7305,62 @@ test "STOP_SENDING automatic-reset reservation failure leaves the stream retryab
     try testing.expect(manager.get(id).?.reset_sent);
     try testing.expectEqual(@as(usize, 1), pair.server.pending_resets.items.len);
     try testing.expectEqual(@as(u64, 1), manager.metrics.reset_streams);
+}
+
+test "post-authentication ingest OOM is terminal, so a failed frame effect can never later be ACKed" {
+    // #247 soak finding (review round 8): `ingestPacket()` records this
+    // packet's number into `recovery`'s received/ACK-range bookkeeping
+    // (`onPacketReceived`) *before* it parses frames and applies their
+    // effects. The previous fix (reserve before `receiveStopSending`) makes
+    // the *stream* transaction safe, but if the reservation still fails,
+    // the packet's own number is already committed with no safe way to
+    // unwind it -- `AckRangeSet` merges ranges on insert, so removing a
+    // single value would need range-splitting logic that does not exist.
+    // Proven at the real packet-ingest layer, not by calling `applyFrame`
+    // directly (which bypasses the PN/ACK-range commit entirely and so
+    // cannot demonstrate this): deliver a genuine protected datagram
+    // carrying a STOP_SENDING frame with the reservation forced to fail,
+    // then confirm the connection is now `.closing` -- which
+    // `pollTransmitOnPath` restricts to only ever (re)sending the
+    // CONNECTION_CLOSE datagram, so a surviving connection can never build
+    // an ordinary ACK covering this packet's number, no matter what
+    // arrives afterward.
+    const allocator = testing.allocator;
+    var pair = try TestPair.init(allocator);
+    defer pair.deinit(allocator);
+    try pair.pump();
+
+    const id = try pair.server.openStream(.bidi);
+    _ = try pair.server.writeStream(id, "srv", false);
+    try pair.pump();
+
+    try pair.client.stopSending(id, 7);
+    var send_buf: [2048]u8 = undefined;
+    const t = pair.client.pollTransmitOnPath(&send_buf, pair.now_us) orelse return error.TestUnexpectedResult;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const real_allocator = pair.server.allocator;
+    pair.server.allocator = failing.allocator();
+    try testing.expectError(
+        error.OutOfMemory,
+        pair.server.ingestOnPath(t.bytes, TestPair.server_path, TestPair.test_challenge_entropy, pair.now_us),
+    );
+    pair.server.allocator = real_allocator;
+
+    // The mandatory RESET_STREAM was never queued, and the connection is
+    // now terminal for ordinary traffic.
+    try testing.expectEqual(@as(usize, 0), pair.server.pending_resets.items.len);
+    try testing.expectEqual(State.closing, pair.server.state_);
+
+    // Confirmed both immediately (armed by `startClose`) and after another
+    // round of unrelated traffic: only the CONNECTION_CLOSE datagram can
+    // ever come out from here, never an ordinary ACK that could cover the
+    // packet whose STOP_SENDING effect never committed.
+    var out: [2048]u8 = undefined;
+    _ = pair.server.pollTransmitOnPath(&out, pair.now_us) orelse return error.TestUnexpectedResult;
+
+    try pair.pump();
+    try testing.expectEqual(State.closing, pair.server.state_);
 }
 
 test "driver: validated ACK reports recovery metrics after PTO backoff reset" {
