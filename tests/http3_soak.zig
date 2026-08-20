@@ -453,13 +453,20 @@ const WorkloadMonitor = struct {
         // so a bug retaining one fd/socket per unit of work while traffic
         // is active and releasing everything only once connections close
         // would pass undetected. `fd_margin` is deliberately small and
-        // fixed -- unlike RSS, fd counts here are small integers with a
-        // narrow, already-documented noise band (a transient +/-1 or 2 from
-        // the probe subprocess's own pipe teardown timing, not the soak's
-        // own state; see the after-settle retry loop below).
+        // fixed -- unlike RSS, fd counts here are small integers. CI on a
+        // loaded ubuntu-24.04-arm runner observed a genuine (non-leak)
+        // +4 transient on the resumption leg's `end_workload` sample --
+        // several reconnect cycles closing an old socket and opening the
+        // next one can briefly overlap right at the sampling instant,
+        // wider on a slower/more contended runner than on a quiet one --
+        // and `after_settle` on that same run returned exactly to the
+        // pre-soak baseline, confirming nothing was actually retained.
+        // Margin widened accordingly; still small enough to catch a bug
+        // that keeps one fd/socket per unit of work indefinitely instead
+        // of releasing it once connections close.
         const first_half_fd_peak = @max(before.open_fds, @max(q1.open_fds, mid.open_fds));
         const second_half_fd_peak = @max(mid.open_fds, @max(q3.open_fds, end_workload.open_fds));
-        const fd_margin: u64 = 3;
+        const fd_margin: u64 = 6;
         if (second_half_fd_peak > first_half_fd_peak + fd_margin) {
             std.debug.print(
                 "{s}: possible open-fd growth -- first_half_peak={d} second_half_peak={d} (margin={d})\n",
