@@ -263,6 +263,53 @@ fn readOpenFdCount(allocator: std.mem.Allocator, pid: std.c.pid_t) !u64 {
     };
 }
 
+// Rapid repeated reads reduce susceptibility to a single-sample transient
+// (PR review P1, round 9): `readOpenFdCount` shells out to `find`/`lsof` per
+// call, and that child's own pipe fds can still be mid-teardown in this
+// process's fd table for a few milliseconds after `bounded_process.run`
+// returns -- the same noise class the after-settle retry loop below already
+// works around, just applied here to the in-workload checkpoint samples
+// `checkGrowthAndPlateau` compares. Three rapid re-reads and taking the
+// median filters out a one-sample spike from that race; it does not weaken
+// detection of genuine sustained growth, which would show up in all three
+// reads, not just one.
+fn stableOpenFdCount(allocator: std.mem.Allocator, pid: std.c.pid_t) !u64 {
+    var samples: [3]u64 = undefined;
+    for (&samples) |*s| s.* = try readOpenFdCount(allocator, pid);
+    std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+    return samples[1];
+}
+
+// Best-effort diagnostic for a failed FD plateau check (PR review P1, round
+// 9): dumps what the extra descriptors actually are (`readlink` on each
+// `/proc/<pid>/fd/*` entry) so a future recurrence is attributable instead
+// of prompting another guess at the acceptance bound. Never fails the test
+// itself -- a probe failure here would only hide the original assertion
+// behind a probe error, which is strictly worse than printing nothing.
+fn dumpOpenFdTargets(allocator: std.mem.Allocator, scenario: []const u8, pid: std.c.pid_t) void {
+    var pid_buf: [32]u8 = undefined;
+    const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return;
+    const script = std.fmt.allocPrint(allocator,
+        \\if [ -d /proc/{s}/fd ]; then
+        \\  for f in /proc/{s}/fd/*; do
+        \\    printf '%s -> %s\n' "$f" "$(readlink "$f" 2>/dev/null)"
+        \\  done
+        \\else
+        \\  echo "no /proc fd directory available for diagnostic dump"
+        \\fi
+    , .{ pid_str, pid_str }) catch return;
+    defer allocator.free(script);
+    var result = bounded_process.run(allocator, .{
+        .argv = &.{ "sh", "-c", script },
+        .stdout_limit = 16384,
+        .stderr_limit = 4096,
+        .deadline_ms = 5_000,
+    }) catch return;
+    defer result.deinit(allocator);
+    if (result.outcome != .normal_exit) return;
+    std.debug.print("{s}: open-fd diagnostic dump:\n{s}\n", .{ scenario, result.stdout });
+}
+
 const ResourceSample = struct {
     label: []const u8,
     rss_kb: u64,
@@ -283,7 +330,7 @@ fn sampleResources(allocator: std.mem.Allocator, runtime: *http3_runtime.Runtime
     const sample = ResourceSample{
         .label = label,
         .rss_kb = try readRssKb(allocator, pid),
-        .open_fds = try readOpenFdCount(allocator, pid),
+        .open_fds = try stableOpenFdCount(allocator, pid),
         .tracked_connections = snapshot.tracked_connections,
         .active_cid_routes = snapshot.active_cid_routes,
         .native_connections = snapshot.native_connections,
@@ -398,6 +445,7 @@ const WorkloadMonitor = struct {
     /// (before starting workers / after every worker finishes).
     fn checkGrowthAndPlateau(
         self: *const WorkloadMonitor,
+        allocator: std.mem.Allocator,
         before: ResourceSample,
         end_workload: ResourceSample,
         rss_margin_kb: u64,
@@ -453,25 +501,34 @@ const WorkloadMonitor = struct {
         // so a bug retaining one fd/socket per unit of work while traffic
         // is active and releasing everything only once connections close
         // would pass undetected. `fd_margin` is deliberately small and
-        // fixed -- unlike RSS, fd counts here are small integers. CI on a
-        // loaded ubuntu-24.04-arm runner observed a genuine (non-leak)
-        // +4 transient on the resumption leg's `end_workload` sample --
-        // several reconnect cycles closing an old socket and opening the
-        // next one can briefly overlap right at the sampling instant,
-        // wider on a slower/more contended runner than on a quiet one --
-        // and `after_settle` on that same run returned exactly to the
-        // pre-soak baseline, confirming nothing was actually retained.
-        // Margin widened accordingly; still small enough to catch a bug
-        // that keeps one fd/socket per unit of work indefinitely instead
-        // of releasing it once connections close.
+        // fixed -- unlike RSS, fd counts here are small integers, so a real
+        // per-work leak is only a handful of fds even across a whole
+        // PR-safe run and must not be absorbed into a loosened bound.
+        //
+        // CI on a loaded ubuntu-24.04-arm runner once observed a +4 spike
+        // isolated to a single `end_workload` sample (three prior
+        // checkpoints held rock-steady at the same value) on the resumption
+        // leg, whose two workers each hold one persistent socket for the
+        // whole run -- ruling out genuine per-reconnect socket churn as the
+        // cause. `sampleResources` now reads each FD sample three times
+        // rapidly and keeps the median (`stableOpenFdCount`), which filters
+        // exactly this kind of single-sample transient (the probe
+        // subprocess's own pipe fds mid-teardown -- see the after-settle
+        // retry loop's identical noise class) without weakening detection
+        // of genuine sustained growth, which would show up in all three
+        // rapid reads, not just one. `fd_margin` stays at its original
+        // tight value; a real recurrence now also dumps the actual
+        // `/proc/<pid>/fd` targets so it is attributable rather than
+        // prompting another guess at the bound.
         const first_half_fd_peak = @max(before.open_fds, @max(q1.open_fds, mid.open_fds));
         const second_half_fd_peak = @max(mid.open_fds, @max(q3.open_fds, end_workload.open_fds));
-        const fd_margin: u64 = 6;
+        const fd_margin: u64 = 3;
         if (second_half_fd_peak > first_half_fd_peak + fd_margin) {
             std.debug.print(
                 "{s}: possible open-fd growth -- first_half_peak={d} second_half_peak={d} (margin={d})\n",
                 .{ self.scenario, first_half_fd_peak, second_half_fd_peak, fd_margin },
             );
+            dumpOpenFdTargets(allocator, self.scenario, std.c.getpid());
             return error.PossibleFdGrowth;
         }
 
@@ -868,7 +925,7 @@ test "soak.h3.bounded_repeated_connections" {
     // so a burst of near-simultaneous round completions across
     // `worker_count` workers can transiently lag by a few passes before
     // catching up -- expected bounded slack, not growth.
-    try monitor.checkGrowthAndPlateau(before_sample, end_workload_sample, 8192, worker_count * 4);
+    try monitor.checkGrowthAndPlateau(allocator, before_sample, end_workload_sample, 8192, worker_count * 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -1395,7 +1452,7 @@ test "soak.h3.bounded_resumed_reconnects" {
 
     // RSS-slope and connection/CID-state plateau, same shape and margins as
     // the primary soak.
-    try monitor.checkGrowthAndPlateau(before_sample, end_workload_sample, 8192, resumption_worker_count * 4);
+    try monitor.checkGrowthAndPlateau(allocator, before_sample, end_workload_sample, 8192, resumption_worker_count * 4);
 
     // Bounded resumption-cache occupancy (PR review P1): resumption cache
     // entries are *expected* to retain a high-water mark rather than return
@@ -1818,5 +1875,5 @@ test "soak.h3.bounded_cancelled_requests" {
     }
     try testing.expect(final_open_fds <= before_sample.open_fds);
 
-    try monitor.checkGrowthAndPlateau(before_sample, end_workload_sample, 8192, reset_worker_count * 4);
+    try monitor.checkGrowthAndPlateau(allocator, before_sample, end_workload_sample, 8192, reset_worker_count * 4);
 }
