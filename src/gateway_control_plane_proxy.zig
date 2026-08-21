@@ -976,7 +976,7 @@ test "control-plane downstream streaming write failure records known 500 and nev
 
 test "control-plane post-status materialization failure records known 200 and never retries" {
     const allocator = std.testing.allocator;
-    var origin = try ControlPlaneTestOrigin.start(allocator, &.{ 200, 200 });
+    var origin = try ControlPlaneTestOrigin.start(allocator, &.{200});
     defer origin.stop();
     try origin.run();
 
@@ -1024,7 +1024,7 @@ test "control-plane post-status materialization failure records known 200 and ne
 
 test "control-plane post-status materialization failure records known 500 and never retries" {
     const allocator = std.testing.allocator;
-    var origin = try ControlPlaneTestOrigin.start(allocator, &.{ 500, 500 });
+    var origin = try ControlPlaneTestOrigin.start(allocator, &.{500});
     defer origin.stop();
     try origin.run();
 
