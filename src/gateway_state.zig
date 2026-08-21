@@ -3781,10 +3781,9 @@ test "gateway circuit breaker opens under upstream failure pressure" {
     defer deinitUpstreamTestState(&gs);
     gs.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 3, .timeout_ms = 30_000 });
 
-    try std.testing.expect(gs.circuitTryAcquirePermit() != null);
-    gs.circuitRecordFailurePermit(.ordinary);
-    gs.circuitRecordFailurePermit(.ordinary);
-    gs.circuitRecordFailurePermit(.ordinary);
+    gs.circuitRecordFailurePermit(gs.circuitTryAcquirePermit().?);
+    gs.circuitRecordFailurePermit(gs.circuitTryAcquirePermit().?);
+    gs.circuitRecordFailurePermit(gs.circuitTryAcquirePermit().?);
     // Open: requests fast-fail deterministically instead of piling onto a sick
     // upstream (the recovery timeout has not elapsed).
     try std.testing.expect(gs.circuitTryAcquirePermit() == null);
@@ -3797,7 +3796,7 @@ test "gateway circuit breaker recovers through a half-open probe" {
     defer deinitUpstreamTestState(&gs);
     gs.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
 
-    gs.circuitRecordFailurePermit(.ordinary);
+    gs.circuitRecordFailurePermit(gs.circuitTryAcquirePermit().?);
     // timeout_ms = 0 → the next acquire admits one probe in half-open state.
     const permit = gs.circuitTryAcquirePermit() orelse return error.TestExpectedHalfOpenPermit;
     try std.testing.expectEqualStrings("half-open", gs.circuitStateName());
@@ -3819,9 +3818,9 @@ test "gateway proxy outcome accounting drives live circuit breaker" {
     try std.testing.expect(gs.circuitTryAcquirePermit() != null);
     try std.testing.expectEqualStrings("closed", gs.circuitStateName());
 
-    gs.recordProxyUpstreamFailure(&cfg, "http://origin.example", .ordinary);
+    gs.recordProxyUpstreamFailure(&cfg, "http://origin.example", gs.circuitTryAcquirePermit().?);
     try std.testing.expect(gs.circuitTryAcquirePermit() != null);
-    gs.recordProxyUpstreamFailure(&cfg, "http://origin.example", .ordinary);
+    gs.recordProxyUpstreamFailure(&cfg, "http://origin.example", gs.circuitTryAcquirePermit().?);
 
     try std.testing.expect(gs.circuitTryAcquirePermit() == null);
     try std.testing.expectEqualStrings("open", gs.circuitStateName());

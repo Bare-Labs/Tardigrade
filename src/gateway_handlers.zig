@@ -2676,7 +2676,7 @@ test "recordHttp3ProxyOutcome keeps absolute target failures out of passive heal
     cfg.upstream_max_fails = 1;
     cfg.upstream_fail_timeout_ms = 60_000;
 
-    recordHttp3ProxyOutcome(&state, &cfg, cfg.upstream_base_url, true, 500, .ordinary);
+    recordHttp3ProxyOutcome(&state, &cfg, cfg.upstream_base_url, true, 500, state.circuitTryAcquirePermit().?);
 
     try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
     try std.testing.expect(state.circuitTryAcquirePermit() == null);
@@ -3331,7 +3331,7 @@ test "h3 proxy parked early 425 carries half-open permit across stale retry" {
     initHttp3ProxyTestState(&state, allocator, &.{});
     defer deinitHttp3ProxyTestState(&state);
     state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
-    state.circuitRecordFailurePermit(.ordinary);
+    state.circuitRecordFailurePermit(state.circuitTryAcquirePermit().?);
     var dispatch_ctx = Http3DispatchContext{
         .config_store = &config_store,
         .cfg = &cfg,
@@ -3503,7 +3503,7 @@ test "h3 proxy parked half-open 425 releases permit when destroyed before resume
     initHttp3ProxyTestState(&state, allocator, &.{});
     defer deinitHttp3ProxyTestState(&state);
     state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
-    state.circuitRecordFailurePermit(.ordinary);
+    state.circuitRecordFailurePermit(state.circuitTryAcquirePermit().?);
     var dispatch_ctx = Http3DispatchContext{
         .config_store = &config_store,
         .cfg = &cfg,
@@ -3563,7 +3563,7 @@ test "h3 proxy parked early 425 fails without origin retry after budget expires"
     initHttp3ProxyTestState(&state, allocator, &.{});
     defer deinitHttp3ProxyTestState(&state);
     state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
-    state.circuitRecordFailurePermit(.ordinary);
+    state.circuitRecordFailurePermit(state.circuitTryAcquirePermit().?);
     var dispatch_ctx = Http3DispatchContext{
         .config_store = &config_store,
         .cfg = &cfg,
