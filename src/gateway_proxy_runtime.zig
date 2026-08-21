@@ -84,6 +84,12 @@ fn recordStreamingProxyOutcome(
     }
 }
 
+fn propagateStreamingDownstreamAbortAfterStatus(state: *GatewayState, streamed: *const gp.StreamingProxyResult) !void {
+    if (!streamed.downstream_aborted_after_status) return;
+    state.metricsRecordProxyClientAbort();
+    return error.ClientAborted;
+}
+
 /// Why a request took the bounded buffered path instead of streaming (#139).
 /// Every reason is recorded as a metric label and a debug log line so operators
 /// can tell whether a given large transfer actually streamed.
@@ -714,6 +720,7 @@ pub fn handleLocationProxyPass(
                 streamed.local_capacity_aborted,
                 correlation_id,
             );
+            try propagateStreamingDownstreamAbortAfterStatus(state, &streamed);
             // `tardigrade_proxy_upstream_aborts_total` means "aborted by the
             // origin". A truncation this proxy caused by running out of buffer
             // capacity is not that, and counting it there would misattribute
@@ -1364,6 +1371,54 @@ test "streaming absolute target local capacity abort releases circuit permit fir
     try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
     try std.testing.expectEqualStrings("closed", state.circuitStateName());
     try std.testing.expect(state.circuitTryAcquirePermit() != null);
+}
+
+test "streaming downstream abort after known 500 records outcome then propagates client abort" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.upstream_mutex = .{};
+    state.circuit_mutex = .{};
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.logger = http.logger.Logger.init(.err, "test");
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
+    state.upstream_health = std.StringHashMap(gs.UpstreamHealth).init(allocator);
+    defer {
+        var it = state.upstream_health.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        state.upstream_health.deinit();
+    }
+
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.upstream_max_fails = 1;
+    cfg.upstream_fail_timeout_ms = 60_000;
+    state.circuitRecordFailurePermit(state.circuitTryAcquirePermit().?);
+    const permit = state.circuitTryAcquirePermit() orelse return error.TestExpectedHalfOpenPermit;
+
+    const streamed = gp.StreamingProxyResult{
+        .status_code = 500,
+        .reason = "Internal Server Error",
+        .response_body_bytes = 0,
+        .upstream_ttfb_ms = 7,
+        .downstream_aborted_after_status = true,
+    };
+    recordStreamingProxyOutcome(
+        &state,
+        &cfg,
+        "http://configured.example",
+        true,
+        permit,
+        streamed.status_code,
+        streamed.upstream_aborted,
+        streamed.local_capacity_aborted,
+        "test-correlation",
+    );
+    try std.testing.expectError(error.ClientAborted, propagateStreamingDownstreamAbortAfterStatus(&state, &streamed));
+
+    try std.testing.expectEqualStrings("open", state.circuitStateName());
+    try std.testing.expect(state.circuitTryAcquirePermit() != null);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.proxy_client_aborts);
 }
 
 const Early425RetryHarnessResult = struct {
