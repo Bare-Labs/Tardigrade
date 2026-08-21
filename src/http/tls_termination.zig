@@ -1142,19 +1142,29 @@ fn rebuildSniCertificates(st: *State) TlsError!void {
         try appendSniCertTo(st.allocator, &next, spec.server_name, spec.cert_path, spec.key_path);
     }
 
-    // The ACME cert directory not existing/openable is not a rebuild
-    // failure -- it just means there are no ACME-issued SNI entries to add,
-    // and the static-entry candidate built above must still be committed
+    // Only genuine *absence* of the ACME cert directory is benign -- it just
+    // means there are no ACME-issued SNI entries to add, and the
+    // static-entry candidate built above must still be committed
     // (previously a bare `catch return` here exited *before* the commit
-    // block, silently discarding an otherwise-complete candidate -- leaving
-    // `st.sni_certs` empty at startup, or leaking `next`'s entries on a
-    // later refresh). A failure while *iterating* an opened directory,
-    // though, is a genuine rebuild failure: propagate it so the outer
-    // `errdefer` discards this partial candidate instead of silently
-    // committing whatever ACME entries were found before the error.
+    // block, silently discarding an otherwise-complete candidate). Any other
+    // `openDir` failure (not a directory, access denied, resource
+    // exhaustion, ...) is a genuine rebuild failure and must not be treated
+    // the same way: if this directory previously held a live ACME SNI
+    // identity, silently proceeding to the static-only candidate would
+    // commit an incomplete cache and drop that identity. Likewise inside
+    // the loop: only a missing key file for a given cert is benign (skip
+    // just that entry); an allocation or access failure for another reason
+    // must abort the whole candidate rather than silently omit an entry and
+    // commit anyway. A failure while *iterating* an opened directory is
+    // always a genuine rebuild failure. In every non-benign case, propagate
+    // the error so the outer `errdefer` discards this partial candidate
+    // instead of silently committing an incomplete one.
     acme_dir: {
         if (!st.acme_enabled or st.acme_cert_dir.len == 0) break :acme_dir;
-        var dir = std.Io.Dir.cwd().openDir(compat.io(), st.acme_cert_dir, .{ .iterate = true }) catch break :acme_dir;
+        var dir = std.Io.Dir.cwd().openDir(compat.io(), st.acme_cert_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => break :acme_dir,
+            else => return error.CertificateLoadFailed,
+        };
         defer dir.close(compat.io());
         var it = dir.iterate();
         while (true) {
@@ -1163,13 +1173,16 @@ fn rebuildSniCertificates(st: *State) TlsError!void {
             if (found.kind != .file) continue;
             if (!std.mem.endsWith(u8, found.name, ".crt")) continue;
             const host = found.name[0 .. found.name.len - 4];
-            const cert_path = std.fmt.allocPrint(st.allocator, "{s}/{s}", .{ st.acme_cert_dir, found.name }) catch continue;
+            const cert_path = try std.fmt.allocPrint(st.allocator, "{s}/{s}", .{ st.acme_cert_dir, found.name });
             defer st.allocator.free(cert_path);
-            const key_file = std.fmt.allocPrint(st.allocator, "{s}.key", .{host}) catch continue;
+            const key_file = try std.fmt.allocPrint(st.allocator, "{s}.key", .{host});
             defer st.allocator.free(key_file);
-            const key_path = std.fmt.allocPrint(st.allocator, "{s}/{s}", .{ st.acme_cert_dir, key_file }) catch continue;
+            const key_path = try std.fmt.allocPrint(st.allocator, "{s}/{s}", .{ st.acme_cert_dir, key_file });
             defer st.allocator.free(key_path);
-            std.Io.Dir.cwd().access(compat.io(), key_path, .{}) catch continue;
+            std.Io.Dir.cwd().access(compat.io(), key_path, .{}) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return error.CertificateLoadFailed,
+            };
             try appendSniCertTo(st.allocator, &next, host, cert_path, key_path);
         }
     }
@@ -2415,6 +2428,56 @@ test "rebuildSniCertificates commits a valid static-SNI candidate even when the 
     // Still present after a forced rebuild, not just at construction.
     tls.runMaintenance(1_000);
     const leaf_after = try sniHandshakeLeafDer(allocator, &tls, "sni.test");
+    defer allocator.free(leaf_after);
+    try std.testing.expectEqualSlices(u8, leaf_a, leaf_after);
+}
+
+test "rebuildSniCertificates keeps a live ACME SNI identity when its directory hits a genuine (non-not-found) scan failure (#629)" {
+    // Review finding: only `error.FileNotFound` from `openDir` is benign --
+    // treating every failure that way (as the previous fix's first pass
+    // did) would silently commit a static-only candidate and drop a
+    // previously-live ACME-issued SNI mapping the moment the directory
+    // becomes temporarily inaccessible for any other reason. Proves an
+    // ACME-issued identity survives a maintenance tick once its directory
+    // has been replaced by a regular file -- `openDir` now fails with
+    // `error.NotDir`, not `error.FileNotFound`, and that must abort the
+    // rebuild rather than proceed.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+
+    try compat.wrapDir(tmp.dir).makePath("acme");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "acme/acme-host.crt", .data = embedded_alt_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "acme/acme-host.key", .data = embedded_alt_server_key });
+    const acme_dir = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "acme");
+    defer allocator.free(acme_dir);
+
+    var tls = try TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .dynamic_reload_interval_ms = 1,
+        .acme_enabled = true,
+        .acme_cert_dir = acme_dir,
+    });
+    defer tls.deinit();
+
+    const leaf_a = try sniHandshakeLeafDer(allocator, &tls, "acme-host");
+    defer allocator.free(leaf_a);
+
+    // Replace the ACME directory with a regular file at the same path.
+    try compat.wrapDir(tmp.dir).deleteTree("acme");
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "acme", .data = "not a directory" });
+
+    tls.runMaintenance(1_000);
+
+    const leaf_after = try sniHandshakeLeafDer(allocator, &tls, "acme-host");
     defer allocator.free(leaf_after);
     try std.testing.expectEqualSlices(u8, leaf_a, leaf_after);
 }
