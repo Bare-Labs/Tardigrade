@@ -412,6 +412,33 @@ pub const TlsTerminator = struct {
         return buf;
     }
 
+    /// Returns the DER leaf of whichever SNI entry `sniCallback` would
+    /// select for `hostname` right now, without driving a full handshake --
+    /// a narrowly scoped test hook (#629) so composition tests in other
+    /// modules (e.g. `gateway_shutdown.zig`'s mixed-owner tests) can verify
+    /// this terminator's SNI-selected identity directly, the same way
+    /// `currentCertificateDer` does for the default identity. Returns `null`
+    /// if no entry matches `hostname`.
+    pub fn debugSniSelectedLeafDer(self: *TlsTerminator, allocator: std.mem.Allocator, hostname: []const u8) TlsError!?[]u8 {
+        self.state.mutex.lock();
+        defer self.state.mutex.unlock();
+        for (self.state.sni_certs.items) |entry| {
+            if (!std.ascii.eqlIgnoreCase(hostname, entry.host_lc)) continue;
+            const bio = c.BIO_new_mem_buf(entry.cert_pem.ptr, @intCast(entry.cert_pem.len)) orelse return error.CertificateLoadFailed;
+            defer _ = c.BIO_free(bio);
+            const leaf = c.PEM_read_bio_X509(bio, null, null, null) orelse return error.CertificateLoadFailed;
+            defer c.X509_free(leaf);
+            const len = c.i2d_X509(leaf, null);
+            if (len <= 0) return error.CertificateLoadFailed;
+            const buf = try allocator.alloc(u8, @intCast(len));
+            errdefer allocator.free(buf);
+            var ptr: [*c]u8 = buf.ptr;
+            if (c.i2d_X509(leaf, &ptr) != len) return error.CertificateLoadFailed;
+            return buf;
+        }
+        return null;
+    }
+
     pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {
         return self.acceptWithPolicy(fd, self.protocolPolicySnapshot());
     }
@@ -1115,15 +1142,28 @@ fn rebuildSniCertificates(st: *State) TlsError!void {
         try appendSniCertTo(st.allocator, &next, spec.server_name, spec.cert_path, spec.key_path);
     }
 
-    if (st.acme_enabled and st.acme_cert_dir.len > 0) {
-        var dir = std.Io.Dir.cwd().openDir(compat.io(), st.acme_cert_dir, .{ .iterate = true }) catch return;
+    // The ACME cert directory not existing/openable is not a rebuild
+    // failure -- it just means there are no ACME-issued SNI entries to add,
+    // and the static-entry candidate built above must still be committed
+    // (previously a bare `catch return` here exited *before* the commit
+    // block, silently discarding an otherwise-complete candidate -- leaving
+    // `st.sni_certs` empty at startup, or leaking `next`'s entries on a
+    // later refresh). A failure while *iterating* an opened directory,
+    // though, is a genuine rebuild failure: propagate it so the outer
+    // `errdefer` discards this partial candidate instead of silently
+    // committing whatever ACME entries were found before the error.
+    acme_dir: {
+        if (!st.acme_enabled or st.acme_cert_dir.len == 0) break :acme_dir;
+        var dir = std.Io.Dir.cwd().openDir(compat.io(), st.acme_cert_dir, .{ .iterate = true }) catch break :acme_dir;
         defer dir.close(compat.io());
         var it = dir.iterate();
-        while (it.next(compat.io()) catch null) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".crt")) continue;
-            const host = entry.name[0 .. entry.name.len - 4];
-            const cert_path = std.fmt.allocPrint(st.allocator, "{s}/{s}", .{ st.acme_cert_dir, entry.name }) catch continue;
+        while (true) {
+            const entry = it.next(compat.io()) catch return error.CertificateLoadFailed;
+            const found = entry orelse break;
+            if (found.kind != .file) continue;
+            if (!std.mem.endsWith(u8, found.name, ".crt")) continue;
+            const host = found.name[0 .. found.name.len - 4];
+            const cert_path = std.fmt.allocPrint(st.allocator, "{s}/{s}", .{ st.acme_cert_dir, found.name }) catch continue;
             defer st.allocator.free(cert_path);
             const key_file = std.fmt.allocPrint(st.allocator, "{s}.key", .{host}) catch continue;
             defer st.allocator.free(key_file);
@@ -2318,6 +2358,62 @@ test "rebuildSniCertificates keeps the last-known-good SNI identity live when a 
 
     tls.runMaintenance(1_000);
 
+    const leaf_after = try sniHandshakeLeafDer(allocator, &tls, "sni.test");
+    defer allocator.free(leaf_after);
+    try std.testing.expectEqualSlices(u8, leaf_a, leaf_after);
+}
+
+test "rebuildSniCertificates commits a valid static-SNI candidate even when the optional ACME directory cannot be opened (#629)" {
+    // Review finding: a bare `catch return` on the ACME directory open
+    // exited *before* the commit step, so a candidate containing perfectly
+    // valid static SNI entries was silently discarded whenever the optional
+    // ACME cert directory didn't exist -- emptying `st.sni_certs` on first
+    // construction (breaking SNI callback registration for the static
+    // entries) and leaking the candidate on a later refresh. Proves a
+    // static SNI entry survives both construction and a forced rebuild when
+    // ACME is enabled but its directory is missing.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "sni.crt", .data = embedded_alt_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "sni.key", .data = embedded_alt_server_key });
+
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+    const sni_cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "sni.crt");
+    defer allocator.free(sni_cert_path);
+    const sni_key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "sni.key");
+    defer allocator.free(sni_key_path);
+    const missing_acme_dir = try std.fmt.allocPrint(allocator, "{s}/does-not-exist", .{cert_path[0 .. cert_path.len - "/test_server.crt".len]});
+    defer allocator.free(missing_acme_dir);
+
+    var specs = [_]SniCertSpec{.{
+        .server_name = "sni.test",
+        .cert_path = sni_cert_path,
+        .key_path = sni_key_path,
+    }};
+
+    var tls = try TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .sni_certs = &specs,
+        .dynamic_reload_interval_ms = 1,
+        .acme_enabled = true,
+        .acme_cert_dir = missing_acme_dir,
+    });
+    defer tls.deinit();
+
+    // Committed at construction, despite the ACME directory being missing.
+    const leaf_a = try sniHandshakeLeafDer(allocator, &tls, "sni.test");
+    defer allocator.free(leaf_a);
+
+    // Still present after a forced rebuild, not just at construction.
+    tls.runMaintenance(1_000);
     const leaf_after = try sniHandshakeLeafDer(allocator, &tls, "sni.test");
     defer allocator.free(leaf_after);
     try std.testing.expectEqualSlices(u8, leaf_a, leaf_after);

@@ -750,6 +750,37 @@ fn expectTcpLeaf(tls: *http.tls_termination.TlsTerminator, allocator: std.mem.Al
     try std.testing.expectEqualSlices(u8, expected_leaf, der);
 }
 
+/// Like `expectSelectedLeaf`, but selects for a specific SNI hostname
+/// instead of the default (`server_name = null`) identity (#629).
+fn expectSelectedSniLeaf(provider: tls_core.credentials.CredentialProvider, hostname: []const u8, expected_leaf: []const u8) !void {
+    const selection = tls_core.credentials.SelectionContext{
+        .role = .server,
+        .server_name = hostname,
+        .peer_signature_schemes = &.{ 0x0807, 0x0403 },
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    };
+    const progress = try provider.selectCredential(&selection);
+    const credential = switch (progress) {
+        .complete => |credential| credential,
+        .pending => return error.TestUnexpectedPending,
+    };
+    defer credential.release();
+    const chain = credential.certificateChain();
+    try std.testing.expectEqual(@as(usize, 1), chain.count());
+    try std.testing.expectEqualSlices(u8, expected_leaf, chain.leaf().?);
+}
+
+/// Asserts the OpenSSL terminator would select `expected_leaf` for `hostname`
+/// via SNI, using `TlsTerminator.debugSniSelectedLeafDer` (#629).
+fn expectTcpSniLeaf(tls: *http.tls_termination.TlsTerminator, allocator: std.mem.Allocator, hostname: []const u8, expected_leaf: []const u8) !void {
+    const der = (try tls.debugSniSelectedLeafDer(allocator, hostname)) orelse return error.TestUnexpectedNull;
+    defer allocator.free(der);
+    try std.testing.expectEqualSlices(u8, expected_leaf, der);
+}
+
 /// A real, mixed OpenSSL-TCP/native-HTTP3 composition — the same shape
 /// `edge_gateway.run()` builds for a general-profile deployment that also
 /// serves HTTP/3: a `TlsTerminator` and a `NativeCredentialStore` both fed
@@ -778,7 +809,12 @@ const MixedFixture = struct {
     }
 };
 
-fn setupMixedFixture(allocator: std.mem.Allocator, cert_bytes: []const u8, key_bytes: []const u8) !MixedFixture {
+fn setupMixedFixture(
+    allocator: std.mem.Allocator,
+    cert_bytes: []const u8,
+    key_bytes: []const u8,
+    sni_specs: []const http.tls_termination.SniCertSpec,
+) !MixedFixture {
     var tmp = std.testing.tmpDir(.{});
     errdefer tmp.cleanup();
     try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "tls.crt", .data = cert_bytes });
@@ -797,13 +833,18 @@ fn setupMixedFixture(allocator: std.mem.Allocator, cert_bytes: []const u8, key_b
         .key_path = key_path,
         .http1_enabled = true,
         .http2_enabled = true,
+        .sni_certs = sni_specs,
     });
     errdefer tls.deinit();
     tls.setIdentityReloadEnabled(false);
 
+    var native_sni_specs = try allocator.alloc(http.native_tls_connection.SniCertSpec, sni_specs.len);
+    defer allocator.free(native_sni_specs);
+    for (sni_specs, 0..) |spec, i| native_sni_specs[i] = .{ .server_name = spec.server_name, .cert_path = spec.cert_path, .key_path = spec.key_path };
+
     var native_store = http.native_tls_connection.NativeCredentialStore.init(allocator);
     errdefer native_store.deinit();
-    try native_store.reloadFromFiles(cert_path, key_path, &.{});
+    try native_store.reloadFromFiles(cert_path, key_path, native_sni_specs);
 
     return .{
         .tmp = tmp,
@@ -906,7 +947,7 @@ test "hotReloadConfig rejects a default TLS identity change on a mixed TLS-adapt
     var identity_a = try LoadedIdentity.load(allocator, "tests/fixtures/tls/native_ed25519.crt", "tests/fixtures/tls/native_ed25519.key");
     defer identity_a.deinit(allocator);
 
-    var fixture = try setupMixedFixture(allocator, identity_a.cert_bytes, identity_a.key_bytes);
+    var fixture = try setupMixedFixture(allocator, identity_a.cert_bytes, identity_a.key_bytes, &.{});
     defer fixture.deinit();
     try expectSelectedLeaf(fixture.native_store.provider(), identity_a.leaf());
     try expectTcpLeaf(&fixture.tls, allocator, identity_a.leaf());
@@ -969,7 +1010,7 @@ test "hotReloadConfig rejects an SNI identity change on a mixed TLS-adapter/nati
     var identity_a = try LoadedIdentity.load(allocator, "tests/fixtures/tls/native_ed25519.crt", "tests/fixtures/tls/native_ed25519.key");
     defer identity_a.deinit(allocator);
 
-    var fixture = try setupMixedFixture(allocator, identity_a.cert_bytes, identity_a.key_bytes);
+    var fixture = try setupMixedFixture(allocator, identity_a.cert_bytes, identity_a.key_bytes, &.{});
     defer fixture.deinit();
 
     var sni_tmp = std.testing.tmpDir(.{});
@@ -1074,7 +1115,7 @@ test "TlsTerminator.runMaintenance never rebuilds TCP's identity in a mixed TLS-
     var identity_a = try LoadedIdentity.load(allocator, "tests/fixtures/tls/native_ed25519.crt", "tests/fixtures/tls/native_ed25519.key");
     defer identity_a.deinit(allocator);
 
-    var fixture = try setupMixedFixture(allocator, identity_a.cert_bytes, identity_a.key_bytes);
+    var fixture = try setupMixedFixture(allocator, identity_a.cert_bytes, identity_a.key_bytes, &.{});
     defer fixture.deinit();
     try expectTcpLeaf(&fixture.tls, allocator, identity_a.leaf());
 
@@ -1103,11 +1144,127 @@ test "a mixed TLS-adapter/native-HTTP3 build converges both TLS surfaces onto a 
     var identity_b = try LoadedIdentity.load(allocator, "tests/fixtures/tls/native_p256.crt", "tests/fixtures/tls/native_p256.key");
     defer identity_b.deinit(allocator);
 
-    var fixture = try setupMixedFixture(allocator, identity_b.cert_bytes, identity_b.key_bytes);
+    var fixture = try setupMixedFixture(allocator, identity_b.cert_bytes, identity_b.key_bytes, &.{});
     defer fixture.deinit();
 
     try expectSelectedLeaf(fixture.native_store.provider(), identity_b.leaf());
     try expectTcpLeaf(&fixture.tls, allocator, identity_b.leaf());
+}
+
+test "hotReloadConfig keeps an already-live SNI identity on both TLS surfaces when its configured mapping changes, and restart converges both to the replacement (#629)" {
+    // Review finding: the existing SNI regression starts from *zero* SNI
+    // entries and proves only that adding one is rejected -- it cannot prove
+    // the actual #629 SNI invariant, that an already-live hostname mapped to
+    // A on both TCP and H3 stays A when its *configured* mapping is proposed
+    // to move to B, and that only a restart converges both to B. This test
+    // covers exactly that boundary, mirroring the default-identity test's
+    // shape but for a specific SNI hostname.
+    if (!build_options.tls_openssl_adapter) return;
+    const allocator = std.testing.allocator;
+
+    var default_identity = try LoadedIdentity.load(allocator, "tests/fixtures/tls/native_ed25519.crt", "tests/fixtures/tls/native_ed25519.key");
+    defer default_identity.deinit(allocator);
+    var sni_identity_a = try LoadedIdentity.load(allocator, "tests/fixtures/tls/native_p256.crt", "tests/fixtures/tls/native_p256.key");
+    defer sni_identity_a.deinit(allocator);
+    // Reuses the default identity's bytes as the proposed SNI replacement:
+    // distinctness only needs to hold between the SNI hostname's *before*
+    // (A) and *after* (B) identities, and both fixtures here are already
+    // signature-scheme compatible with the selection contexts below (unlike
+    // the RSA fixtures elsewhere in this repo, which use a signature scheme
+    // outside the `peer_signature_schemes` offered here).
+    const sni_identity_b = &default_identity;
+
+    var sni_a_tmp = std.testing.tmpDir(.{});
+    defer sni_a_tmp.cleanup();
+    try compat.wrapDir(sni_a_tmp.dir).writeFile(.{ .sub_path = "sni.crt", .data = sni_identity_a.cert_bytes });
+    try compat.wrapDir(sni_a_tmp.dir).writeFile(.{ .sub_path = "sni.key", .data = sni_identity_a.key_bytes });
+    const sni_a_cert_path = try compat.wrapDir(sni_a_tmp.dir).realpathAlloc(allocator, "sni.crt");
+    defer allocator.free(sni_a_cert_path);
+    const sni_a_key_path = try compat.wrapDir(sni_a_tmp.dir).realpathAlloc(allocator, "sni.key");
+    defer allocator.free(sni_a_key_path);
+
+    const sni_hostname = "sni.example.test";
+    var initial_specs = [_]http.tls_termination.SniCertSpec{.{
+        .server_name = sni_hostname,
+        .cert_path = sni_a_cert_path,
+        .key_path = sni_a_key_path,
+    }};
+
+    var fixture = try setupMixedFixture(allocator, default_identity.cert_bytes, default_identity.key_bytes, &initial_specs);
+    defer fixture.deinit();
+
+    // Both surfaces already resolve the hostname to identity A.
+    try expectSelectedSniLeaf(fixture.native_store.provider(), sni_hostname, sni_identity_a.leaf());
+    try expectTcpSniLeaf(&fixture.tls, allocator, sni_hostname, sni_identity_a.leaf());
+
+    var sni_b_tmp = std.testing.tmpDir(.{});
+    defer sni_b_tmp.cleanup();
+    try compat.wrapDir(sni_b_tmp.dir).writeFile(.{ .sub_path = "sni.crt", .data = sni_identity_b.cert_bytes });
+    try compat.wrapDir(sni_b_tmp.dir).writeFile(.{ .sub_path = "sni.key", .data = sni_identity_b.key_bytes });
+    const sni_b_cert_path = try compat.wrapDir(sni_b_tmp.dir).realpathAlloc(allocator, "sni.crt");
+    defer allocator.free(sni_b_cert_path);
+    const sni_b_key_path = try compat.wrapDir(sni_b_tmp.dir).realpathAlloc(allocator, "sni.key");
+    defer allocator.free(sni_b_key_path);
+    const sni_spec_b_owned = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ sni_hostname, sni_b_cert_path, sni_b_key_path });
+    defer allocator.free(sni_spec_b_owned);
+    const sni_spec_b = try allocator.dupeZ(u8, sni_spec_b_owned);
+    defer allocator.free(sni_spec_b);
+    const sni_spec_a_owned = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ sni_hostname, sni_a_cert_path, sni_a_key_path });
+    defer allocator.free(sni_spec_a_owned);
+    const sni_spec_a = try allocator.dupeZ(u8, sni_spec_a_owned);
+    defer allocator.free(sni_spec_a);
+
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_CERT_PATH", fixture.cert_path_z, 1));
+    defer _ = unsetenv("TARDIGRADE_TLS_CERT_PATH");
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_KEY_PATH", fixture.key_path_z, 1));
+    defer _ = unsetenv("TARDIGRADE_TLS_KEY_PATH");
+    // Matches the fixture's already-installed mapping, so `edge_config`
+    // starts from the same SNI configuration the fixture above was built
+    // with, not from zero SNI entries.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_SNI_CERTS", sni_spec_a, 1));
+    defer _ = unsetenv("TARDIGRADE_TLS_SNI_CERTS");
+
+    var current_cfg = try edge_config.loadFromEnv(allocator);
+    defer current_cfg.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), current_cfg.tls_sni_certs.len);
+    var config_store = try ReloadableConfigStore.initBorrowed(allocator, &current_cfg);
+    defer config_store.deinit();
+
+    var harness: MixedReloadHarness = undefined;
+    try harness.setup(allocator, &fixture, &config_store, "hot-reload-mixed-existing-sni-change-test");
+    defer harness.deinit();
+
+    // Propose moving the *same* hostname's mapping from A to B.
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TARDIGRADE_TLS_SNI_CERTS", sni_spec_b, 1));
+
+    harness.reload(allocator);
+
+    try std.testing.expect(!harness.state.last_reload_ok);
+    try std.testing.expectEqualStrings(
+        "TLS credential paths changed on a mixed TLS-adapter/native-HTTP3 build; restart required",
+        harness.state.last_reload_error[0..harness.state.last_reload_error_len],
+    );
+
+    // Both surfaces still resolve the hostname to A, not B.
+    try expectSelectedSniLeaf(fixture.native_store.provider(), sni_hostname, sni_identity_a.leaf());
+    try expectTcpSniLeaf(&fixture.tls, allocator, sni_hostname, sni_identity_a.leaf());
+
+    var lease = config_store.acquire();
+    defer lease.release();
+    try std.testing.expectEqual(@as(usize, 1), lease.cfg.tls_sni_certs.len);
+    try std.testing.expectEqualStrings(sni_a_cert_path, lease.cfg.tls_sni_certs[0].cert_path);
+
+    // Restart: a fresh composition built straight from the rotated SNI
+    // mapping (no `hotReloadConfig` involved) converges both surfaces to B.
+    var restarted_specs = [_]http.tls_termination.SniCertSpec{.{
+        .server_name = sni_hostname,
+        .cert_path = sni_b_cert_path,
+        .key_path = sni_b_key_path,
+    }};
+    var restarted = try setupMixedFixture(allocator, default_identity.cert_bytes, default_identity.key_bytes, &restarted_specs);
+    defer restarted.deinit();
+    try expectSelectedSniLeaf(restarted.native_store.provider(), sni_hostname, sni_identity_b.leaf());
+    try expectTcpSniLeaf(&restarted.tls, allocator, sni_hostname, sni_identity_b.leaf());
 }
 
 pub fn applyReloadedRuntimeConfig(cfg: *const edge_config.EdgeConfig, state: *GatewayState) void {
