@@ -462,14 +462,6 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
             native_credentials = null;
         }
     }
-    if (tls_terminator != null and native_credentials != null) {
-        // #629: this is a mixed OpenSSL-TCP/native-HTTP3 build. Native H3's
-        // credential store can be independently hot-reloaded; suppress the
-        // OpenSSL terminator's own independent identity-reload watcher so
-        // its certificate/SNI identity cannot drift away from H3's outside
-        // a coordinated restart.
-        tls_terminator.?.setIdentityReloadEnabled(false);
-    }
     defer if (native_credentials) |*store| store.deinit();
     defer if (tls_terminator) |*tls| tls.deinit();
     const native_early_data_replay_composition = nativeEarlyDataReplayComposition(
@@ -574,6 +566,22 @@ pub fn run(cfg: *const edge_config.EdgeConfig) !void {
     }
     state.http3_runtime = if (http3_runtime) |*runtime| runtime else null;
     defer if (http3_runtime) |*runtime| runtime.deinit();
+    if (tls_terminator != null and native_credentials != null and
+        if (http3_runtime) |*runtime| runtime.snapshot().server_bootstrapped else false)
+    {
+        // #629: this is a mixed OpenSSL-TCP/native-HTTP3 composition, and
+        // native H3 is genuinely live (not just "credentials happened to
+        // load" — `server_bootstrapped` is the same signal
+        // `computeReloadedHttp3Advertisement` already uses to decide
+        // whether H3 is actually serving). Native H3's credential store can
+        // be independently hot-reloaded; suppress the OpenSSL terminator's
+        // own independent identity-reload watcher so its certificate/SNI
+        // identity cannot drift away from H3's outside a coordinated
+        // restart. Checked here (after HTTP/3 bootstrap, not right after
+        // credential load) so a QUIC bootstrap failure doesn't lock TCP's
+        // identity into restart-only for a protocol that never came up.
+        tls_terminator.?.setIdentityReloadEnabled(false);
+    }
     // NOTE (#138): defaulting worker_threads to CPU count is correct for a
     // non-blocking event loop, but Tardigrade currently uses a thread-per-
     // connection blocking model where a worker is held for a connection's whole

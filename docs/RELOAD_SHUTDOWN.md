@@ -114,10 +114,11 @@ and which protocols a deployment serves:
   that is not part of `SIGHUP` reload and does not respond to a changed
   `TLS_CERT_PATH`/`TLS_KEY_PATH` value.
 - The **native credential store** (`http.native_tls_connection.NativeCredentialStore`),
-  used for native HTTP/3 on any build. It supports a real prepare/commit
-  hot-swap of certificate, key, and SNI identity from the proposed reload
-  paths, and `hotReloadConfig` uses that capability on every accepted
-  `SIGHUP` where it applies (see below).
+  used for native HTTP/3 on the `general` build (the appliance profile uses
+  `ApplianceCredentials` for HTTP/3 too — see below). It supports a real
+  prepare/commit hot-swap of certificate, key, and SNI identity from the
+  proposed reload paths, and `hotReloadConfig` uses that capability on
+  every accepted `SIGHUP` where it applies (see below).
 - **`ApplianceCredentials`**, the strict single-identity owner used on the
   appliance profile (`tls-profile=appliance`) for *both* native TCP and
   native HTTP/3. Although the type itself exposes reload methods, no
@@ -132,19 +133,24 @@ and which protocols a deployment serves:
 
 **On the default `general` build with the OpenSSL adapter linked**, stable
 TCP owns its identity via `TlsTerminator` (startup-owned, as above) while
-native HTTP/3 — if also enabled — owns a separate `NativeCredentialStore`
-capable of live reload. Letting native HTTP/3 alone pick up a changed
-credential path (or even a same-path certificate rotation) would leave the
-two protocols presenting different certificates for the same hostname.
-[#629](https://github.com/Bare-Systems/Tardigrade/issues/629) makes TLS
-identity rotation restart-owned across this whole composition, not just for
-configured-path changes:
+native HTTP/3 — if also enabled and genuinely bootstrapped — owns a separate
+`NativeCredentialStore` capable of live reload. Letting native HTTP/3 alone
+pick up a changed credential path (or even a same-path certificate rotation)
+would leave the two protocols presenting different certificates for the same
+hostname. [#629](https://github.com/Bare-Systems/Tardigrade/issues/629)
+makes TLS identity rotation restart-owned across this whole composition, not
+just for configured-path changes, whenever both owners are genuinely live —
+checked via `http3_runtime.snapshot().server_bootstrapped` (the same signal
+the H3 `Alt-Svc` advertisement logic uses), not merely via the
+`NativeCredentialStore` existing, so a QUIC bootstrap failure (for example a
+UDP bind failure) doesn't lock stable TCP into restart-only identity
+rotation for an HTTP/3 stack that never actually came up:
 
 - `hotReloadConfig` rejects the whole reload outright when
   `TLS_CERT_PATH`/`TLS_KEY_PATH`/SNI certificates change and both a
-  `TlsTerminator` and a `NativeCredentialStore` are present — the previous
-  config stays active on both surfaces, and an operator must restart the
-  process to rotate credentials.
+  `TlsTerminator` and a bootstrapped `NativeCredentialStore` are present —
+  the previous config stays active on both surfaces, and an operator must
+  restart the process to rotate credentials.
 - When those fields are unchanged, `hotReloadConfig` also never re-reads the
   native HTTP/3 credential files on this composition, so a certificate
   rotated in place at the *same* configured path is not picked up by H3
@@ -154,9 +160,9 @@ configured-path changes:
 - The OpenSSL terminator's own independent file-content watcher
   (`TARDIGRADE_TLS_DYNAMIC_RELOAD_INTERVAL_MS`) is disabled for this same
   composition (`TlsTerminator.setIdentityReloadEnabled(false)`, applied once
-  at startup), so it cannot unilaterally rebuild TCP's certificate or SNI
-  set outside a coordinated restart either. CRL/OCSP/ACME scheduling is
-  unaffected.
+  at startup after HTTP/3 bootstrap is confirmed), so it cannot unilaterally
+  rebuild TCP's certificate or SNI set outside a coordinated restart either.
+  CRL/OCSP/ACME scheduling is unaffected.
 
 A general-profile build serving TCP only (no HTTP/3, or HTTP/3 without a
 resolvable TLS identity) is unaffected by any of this; it keeps the existing

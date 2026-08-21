@@ -212,7 +212,17 @@ pub fn hotReloadConfig(
     // the contract by never re-reading native credential files for this
     // composition either, so identity rotation is entirely restart-owned
     // while both owners coexist.
-    const mixed_credential_owners = build_options.tls_openssl_adapter and worker_ctx.tls != null and worker_ctx.native_credentials != null;
+    //
+    // Gated on `server_bootstrapped` (the same signal
+    // `computeReloadedHttp3Advertisement`/`applyReloadedRuntimeConfig` use to
+    // decide whether H3 is actually serving), not merely on
+    // `native_credentials != null`: credentials can load successfully while
+    // the QUIC listener itself never comes up (e.g. `Runtime.init` failing),
+    // and in that case there is no second live surface to diverge from —
+    // treating it as "mixed" forever would needlessly lock stable TCP into
+    // restart-only identity rotation for an HTTP/3 stack that never ran.
+    const h3_genuinely_live = if (state.http3_runtime) |runtime| runtime.snapshot().server_bootstrapped else false;
+    const mixed_credential_owners = build_options.tls_openssl_adapter and worker_ctx.tls != null and worker_ctx.native_credentials != null and h3_genuinely_live;
     if (mixed_credential_owners) {
         var current_lease = worker_ctx.config_store.acquire();
         const credential_paths_changed = nativeCredentialPathsChanged(current_lease.cfg, cfg_ptr);
@@ -838,13 +848,21 @@ const LoadedIdentity = struct {
 /// real `hotReloadConfig` against `fixture`, sharing the exact field set
 /// the pre-existing #368 ordering test relies on being safe to leave
 /// `undefined` (see that test's comment).
+/// #629: `hotReloadConfig` and `edge_gateway.run()` both gate the
+/// mixed-owner restriction on H3 being genuinely bootstrapped
+/// (`http3_runtime.snapshot().server_bootstrapped`), not merely on a
+/// `NativeCredentialStore` existing — a QUIC bootstrap failure must not
+/// lock stable TCP into restart-only identity rotation for a protocol that
+/// never came up. This harness attaches a real (never-`start()`ed, so no
+/// socket bind) `Runtime` with a valid credential provider so
+/// `server_bootstrapped` is true, matching a genuinely live composition.
 const MixedReloadHarness = struct {
     worker_ctx: WorkerContext,
     state: GatewayState,
     dispatch_ctx: struct { cfg: *const edge_config.EdgeConfig = undefined },
+    http3_runtime: http.http3_runtime.Runtime,
 
-    fn init(fixture: *MixedFixture, config_store: *ReloadableConfigStore, logger_name: [:0]const u8) MixedReloadHarness {
-        var self: MixedReloadHarness = undefined;
+    fn setup(self: *MixedReloadHarness, allocator: std.mem.Allocator, fixture: *MixedFixture, config_store: *ReloadableConfigStore, logger_name: [:0]const u8) !void {
         self.worker_ctx.config_store = config_store;
         self.worker_ctx.tls = &fixture.tls;
         self.worker_ctx.native_credentials = &fixture.native_store;
@@ -855,8 +873,17 @@ const MixedReloadHarness = struct {
         self.state.last_reload_error_len = 0;
         self.state.metrics_mutex = .{};
         self.state.metrics = http.metrics.Metrics.init();
+        self.http3_runtime = try http.http3_runtime.Runtime.init(allocator, &self.state.logger, .{
+            .listen_host = "127.0.0.1",
+            .quic_port = 0,
+            .credential_provider = fixture.native_store.provider(),
+        });
+        self.state.http3_runtime = &self.http3_runtime;
         self.dispatch_ctx = .{};
-        return self;
+    }
+
+    fn deinit(self: *MixedReloadHarness) void {
+        self.http3_runtime.deinit();
     }
 
     fn reload(self: *MixedReloadHarness, allocator: std.mem.Allocator) void {
@@ -911,7 +938,9 @@ test "hotReloadConfig rejects a default TLS identity change on a mixed TLS-adapt
     var config_store = try ReloadableConfigStore.initBorrowed(allocator, &current_cfg);
     defer config_store.deinit();
 
-    var harness = MixedReloadHarness.init(&fixture, &config_store, "hot-reload-mixed-default-identity-test");
+    var harness: MixedReloadHarness = undefined;
+    try harness.setup(allocator, &fixture, &config_store, "hot-reload-mixed-default-identity-test");
+    defer harness.deinit();
 
     // Simulate a SIGHUP whose environment moves the default TLS credential
     // paths to identity B.
@@ -971,7 +1000,9 @@ test "hotReloadConfig rejects an SNI identity change on a mixed TLS-adapter/nati
     var config_store = try ReloadableConfigStore.initBorrowed(allocator, &current_cfg);
     defer config_store.deinit();
 
-    var harness = MixedReloadHarness.init(&fixture, &config_store, "hot-reload-mixed-sni-identity-test");
+    var harness: MixedReloadHarness = undefined;
+    try harness.setup(allocator, &fixture, &config_store, "hot-reload-mixed-sni-identity-test");
+    defer harness.deinit();
 
     // Default paths are unchanged; only the SNI set grows from empty to one
     // entry.
@@ -987,6 +1018,22 @@ test "hotReloadConfig rejects an SNI identity change on a mixed TLS-adapter/nati
     );
     try expectSelectedLeaf(fixture.native_store.provider(), identity_a.leaf());
     try expectTcpLeaf(&fixture.tls, allocator, identity_a.leaf());
+
+    // The rejected SNI entry was never installed: selecting specifically
+    // for "sni.example.test" must fail exactly as it would have before this
+    // reload was attempted (the store's `unknown_sni_policy` is
+    // `fail_handshake`), not resolve to the P-256 credential the rejected
+    // config would have added.
+    const sni_selection = tls_core.credentials.SelectionContext{
+        .role = .server,
+        .server_name = "sni.example.test",
+        .peer_signature_schemes = &.{ 0x0807, 0x0403 },
+        .negotiated_version = 0x0304,
+        .cipher_suite = 0x1301,
+        .application_protocol = null,
+        .auth_policy = .{},
+    };
+    try std.testing.expectError(error.NoCredentialAvailable, fixture.native_store.provider().selectCredential(&sni_selection));
 
     var lease = config_store.acquire();
     defer lease.release();
