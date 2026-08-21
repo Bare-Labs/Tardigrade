@@ -9189,6 +9189,14 @@ test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload
     const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
     defer allocator.free(quic_port_str);
 
+    // The external H3 peer sends SNI for `quic_interop_server_name`; without
+    // registering that hostname in the native SNI provider, unknown SNI fails
+    // closed and the initial handshake never gets past `NoApplicableCredential`
+    // (see the sibling `rotation.persistent.quic_credential_reload_atomicity`
+    // fixture above, which sets this for the same reason).
+    const sni_certs = try quicSniCertsEnv(allocator, cred_a.cert_path, cred_a.key_path);
+    defer allocator.free(sni_certs);
+
     var tardigrade = try TardigradeProcess.start(allocator, .{
         .config_text = initial_config,
         .ready_https_insecure = true,
@@ -9197,6 +9205,7 @@ test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload
             .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = cred_a.cert_path },
             .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = cred_a.key_path },
             .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
             // Ephemeral (not persistent) resumption keys are enough here:
             // that state is process-owned and untouched by `hotReloadConfig`
             // regardless of #629, so a SIGHUP can't rotate it out from under

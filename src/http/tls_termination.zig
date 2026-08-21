@@ -43,6 +43,13 @@ const embedded_server_crt = @embedFile("testdata/test_server.crt");
 const embedded_server_key = @embedFile("testdata/test_server.key");
 const embedded_alt_server_crt = @embedFile("testdata/test_alt_server.crt");
 const embedded_alt_server_key = @embedFile("testdata/test_alt_server.key");
+// #629: a real two-certificate chain (leaf `tardigrade.test` issued by a test
+// CA, followed by that CA's own self-signed cert) -- shared with the
+// appliance integration fixtures at `tests/fixtures/tls/native_ed25519_*`.
+// Used to prove `useCertificateChainFromMemory` serves a full SNI-selected
+// chain, not only the leaf `SSL_get_certificate` exposes.
+const embedded_sni_chain_crt = @embedFile("testdata/sni_chain.crt");
+const embedded_sni_chain_key = @embedFile("testdata/sni_chain.key");
 
 pub const TlsError = error{
     OutOfMemory,
@@ -186,14 +193,21 @@ const State = struct {
         if (self.ocsp_response) |resp| self.allocator.free(resp);
         if (self.ocsp_responder_url.len > 0) self.allocator.free(self.ocsp_responder_url);
         self.allocator.free(self.static_sni_specs);
-        for (self.sni_certs.items) |sc| {
-            self.allocator.free(sc.host_lc);
-            self.allocator.free(sc.cert_pem);
-            self.allocator.free(sc.key_pem);
-        }
+        for (self.sni_certs.items) |*sc| deinitManagedSniCert(self.allocator, sc);
         self.sni_certs.deinit(self.allocator);
     }
 };
+
+/// #629: centralizes `ManagedSniCert` teardown so every call site -- normal
+/// teardown, a failed candidate rebuild, and a successful cache swap -- wipes
+/// the retained private-key PEM bytes before freeing them, rather than
+/// leaving plaintext key copies sitting in freed allocator memory.
+fn deinitManagedSniCert(allocator: std.mem.Allocator, cert: *ManagedSniCert) void {
+    allocator.free(cert.host_lc);
+    allocator.free(cert.cert_pem);
+    std.crypto.secureZero(u8, cert.key_pem);
+    allocator.free(cert.key_pem);
+}
 
 pub const TlsTerminator = struct {
     allocator: std.mem.Allocator,
@@ -1084,16 +1098,21 @@ fn loadOcspResponse(st: *State) TlsError!void {
     st.ocsp_mtime = fileMtime(st.ocsp_response_path) catch null;
 }
 
+/// #629: builds the replacement SNI cache off to the side and swaps it in
+/// only once every entry loaded successfully, so a transient read/allocation
+/// failure midway through a rebuild can't leave the live `st.sni_certs` empty
+/// or partially rebuilt -- `runMaintenance`'s caller already treats a failed
+/// refresh as best-effort and documents that existing mappings stay active,
+/// which requires the old list to still be there on failure.
 fn rebuildSniCertificates(st: *State) TlsError!void {
-    for (st.sni_certs.items) |sc| {
-        st.allocator.free(sc.host_lc);
-        st.allocator.free(sc.cert_pem);
-        st.allocator.free(sc.key_pem);
+    var next: std.ArrayList(ManagedSniCert) = .empty;
+    errdefer {
+        for (next.items) |*sc| deinitManagedSniCert(st.allocator, sc);
+        next.deinit(st.allocator);
     }
-    st.sni_certs.clearRetainingCapacity();
 
     for (st.static_sni_specs) |spec| {
-        try appendSniCert(st, spec.server_name, spec.cert_path, spec.key_path);
+        try appendSniCertTo(st.allocator, &next, spec.server_name, spec.cert_path, spec.key_path);
     }
 
     if (st.acme_enabled and st.acme_cert_dir.len > 0) {
@@ -1111,21 +1130,36 @@ fn rebuildSniCertificates(st: *State) TlsError!void {
             const key_path = std.fmt.allocPrint(st.allocator, "{s}/{s}", .{ st.acme_cert_dir, key_file }) catch continue;
             defer st.allocator.free(key_path);
             std.Io.Dir.cwd().access(compat.io(), key_path, .{}) catch continue;
-            try appendSniCert(st, host, cert_path, key_path);
+            try appendSniCertTo(st.allocator, &next, host, cert_path, key_path);
         }
     }
+
+    var old = st.sni_certs;
+    st.sni_certs = next;
+    for (old.items) |*sc| deinitManagedSniCert(st.allocator, sc);
+    old.deinit(st.allocator);
 }
 
-fn appendSniCert(st: *State, host: []const u8, cert_path: []const u8, key_path: []const u8) TlsError!void {
-    const host_lc = try st.allocator.dupe(u8, host);
-    errdefer st.allocator.free(host_lc);
+fn appendSniCertTo(
+    allocator: std.mem.Allocator,
+    target: *std.ArrayList(ManagedSniCert),
+    host: []const u8,
+    cert_path: []const u8,
+    key_path: []const u8,
+) TlsError!void {
+    const host_lc = try allocator.dupe(u8, host);
+    errdefer allocator.free(host_lc);
     for (host_lc) |*ch| ch.* = std.ascii.toLower(ch.*);
     // #629: read the PEM bytes once here, rather than storing the path for
     // `sniCallback` to re-read on every handshake -- see `ManagedSniCert`.
-    const cert_pem = std.Io.Dir.cwd().readFileAlloc(compat.io(), cert_path, st.allocator, .limited(1024 * 1024)) catch return error.CertificateLoadFailed;
-    errdefer st.allocator.free(cert_pem);
-    const key_pem = std.Io.Dir.cwd().readFileAlloc(compat.io(), key_path, st.allocator, .limited(1024 * 1024)) catch return error.PrivateKeyLoadFailed;
-    try st.sni_certs.append(st.allocator, .{
+    const cert_pem = std.Io.Dir.cwd().readFileAlloc(compat.io(), cert_path, allocator, .limited(1024 * 1024)) catch return error.CertificateLoadFailed;
+    errdefer allocator.free(cert_pem);
+    const key_pem = std.Io.Dir.cwd().readFileAlloc(compat.io(), key_path, allocator, .limited(1024 * 1024)) catch return error.PrivateKeyLoadFailed;
+    errdefer {
+        std.crypto.secureZero(u8, key_pem);
+        allocator.free(key_pem);
+    }
+    try target.append(allocator, .{
         .host_lc = host_lc,
         .cert_pem = cert_pem,
         .key_pem = key_pem,
@@ -1145,6 +1179,11 @@ fn useCertificateChainFromMemory(s: *c.SSL, pem: []const u8) TlsError!void {
     const leaf = c.PEM_read_bio_X509(bio, null, null, null) orelse return error.CertificateLoadFailed;
     defer c.X509_free(leaf);
     if (c.SSL_use_certificate(s, leaf) != 1) return error.CertificateLoadFailed;
+    // Mirrors `SSL_use_certificate_chain_file`: clear whatever chain this
+    // `SSL*` inherited from its default `SSL_CTX` before appending this
+    // entry's own intermediates, so an SNI-selected chain can't retain
+    // certificates from the default identity.
+    if (c.SSL_clear_chain_certs(s) != 1) return error.CertificateLoadFailed;
     while (c.PEM_read_bio_X509(bio, null, null, null)) |extra| {
         // `SSL_add0_chain_cert` takes ownership of `extra` on success; on
         // failure it does not, so this frees its own reference either way.
@@ -1153,11 +1192,25 @@ fn useCertificateChainFromMemory(s: *c.SSL, pem: []const u8) TlsError!void {
             return error.CertificateLoadFailed;
         }
     }
-    // A `PEM_read_bio_X509` call returning null because the BIO is simply
-    // exhausted (no more intermediates) leaves a benign "no start line"
-    // error on the thread-local queue; clear it so it isn't mistaken for a
-    // real failure by unrelated code that later checks the queue.
+    // A `PEM_read_bio_X509` call returning null is ambiguous: it's the
+    // benign "no more intermediates, BIO exhausted" case, or a real trailing
+    // parse error. Mirror `SSL_use_certificate_chain_file`'s own behavior
+    // (which only tolerates the former) by checking the reason code rather
+    // than unconditionally clearing the queue.
+    if (!pemBioExhausted()) return error.CertificateLoadFailed;
     c.ERR_clear_error();
+}
+
+/// True only when the last error on the thread-local queue is PEM's
+/// "no start line" reason -- i.e. `PEM_read_bio_X509` stopped because the
+/// BIO ran out of input, not because it hit a malformed certificate.
+fn pemBioExhausted() bool {
+    const err = c.ERR_peek_last_error();
+    if (err == 0) return true;
+    if (@hasDecl(c, "ERR_GET_REASON") and @hasDecl(c, "PEM_R_NO_START_LINE")) {
+        return c.ERR_GET_REASON(err) == c.PEM_R_NO_START_LINE;
+    }
+    return false;
 }
 
 /// Applies a PEM private key held entirely in memory to `s`, mirroring
@@ -2026,6 +2079,119 @@ fn sniHandshakeLeafDer(allocator: std.mem.Allocator, tls: *TlsTerminator, hostna
     return buf;
 }
 
+/// Same handshake as `sniHandshakeLeafDer`, but returns the count of extra
+/// chain certificates the server actually presented alongside its leaf
+/// (`SSL_get0_chain_certs`), to prove a served SNI chain contains exactly the
+/// SNI entry's own intermediates -- neither truncated nor carrying over
+/// certificates inherited from the default `SSL_CTX`.
+fn sniHandshakeChainLen(tls: *TlsTerminator, hostname: [:0]const u8) !usize {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds[0]);
+
+    const client_ctx = c.SSL_CTX_new(c.TLS_client_method() orelse return error.ContextInitFailed) orelse return error.ContextInitFailed;
+    defer c.SSL_CTX_free(client_ctx);
+    c.SSL_CTX_set_verify(client_ctx, c.SSL_VERIFY_NONE, null);
+    const client_ssl = c.SSL_new(client_ctx) orelse return error.ContextInitFailed;
+    defer c.SSL_free(client_ssl);
+    if (c.SSL_set_alpn_protos(client_ssl, http11_only_wire_for_tests.ptr, @intCast(http11_only_wire_for_tests.len)) != 0) return error.ProtocolConfigFailed;
+    if (c.SSL_set_fd(client_ssl, fds[0]) != 1) return error.HandshakeFailed;
+    _ = c.SSL_ctrl(client_ssl, c.SSL_CTRL_SET_TLSEXT_HOSTNAME, c.TLSEXT_NAMETYPE_host_name, @constCast(hostname.ptr));
+
+    var accept_ctx = ServerAcceptContext{ .terminator = tls, .fd = fds[1] };
+    const thread = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_ctx});
+    var thread_joined = false;
+    errdefer if (!thread_joined) {
+        _ = std.c.shutdown(fds[0], std.posix.SHUT.RDWR);
+        _ = std.c.shutdown(fds[1], std.posix.SHUT.RDWR);
+        thread.join();
+    };
+
+    if (c.SSL_connect(client_ssl) != 1) return error.HandshakeFailed;
+    thread.join();
+    thread_joined = true;
+    if (accept_ctx.err) |err| return err;
+    var server = accept_ctx.conn orelse return error.HandshakeFailed;
+    defer server.deinit();
+
+    var chain: ?*c.struct_stack_st_X509 = null;
+    _ = c.SSL_get0_chain_certs(server.ssl, @as(?*anyopaque, @ptrCast(&chain)));
+    const stack = chain orelse return 0;
+    const n = c.OPENSSL_sk_num(@ptrCast(stack));
+    return if (n < 0) 0 else @intCast(n);
+}
+
+test "SNI-selected chain served in memory carries exactly its own intermediates, not the default identity's (#629)" {
+    // Review finding: `useCertificateChainFromMemory` set the SNI leaf and
+    // appended its intermediates without first calling
+    // `SSL_clear_chain_certs`, unlike `SSL_use_certificate_chain_file`. A
+    // per-connection `SSL*` cloned from the default `SSL_CTX` can inherit
+    // that default's own extra chain certs, so an SNI selection could serve
+    // [default's intermediate(s), SNI's own intermediate(s)] instead of just
+    // the SNI entry's. Prove the served chain length matches the SNI entry
+    // alone by giving the *default* identity an unrelated extra chain
+    // certificate that must not leak into an SNI-selected response.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const default_chain_pem = try std.mem.concat(allocator, u8, &.{ embedded_server_crt[0..], embedded_alt_server_crt[0..] });
+    defer allocator.free(default_chain_pem);
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "default_with_filler.crt", .data = default_chain_pem });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "sni_chain.crt", .data = embedded_sni_chain_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "sni_chain.key", .data = embedded_sni_chain_key });
+
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "default_with_filler.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+    const sni_cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "sni_chain.crt");
+    defer allocator.free(sni_cert_path);
+    const sni_key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "sni_chain.key");
+    defer allocator.free(sni_key_path);
+
+    var specs = [_]SniCertSpec{.{
+        .server_name = "sni.test",
+        .cert_path = sni_cert_path,
+        .key_path = sni_key_path,
+    }};
+
+    var tls = try TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .sni_certs = &specs,
+    });
+    defer tls.deinit();
+
+    // The SNI entry (leaf + one CA cert) contributes exactly one extra
+    // chain certificate. If the default's `test_alt_server.crt` filler
+    // leaked through, this would be 2 instead.
+    const chain_len = try sniHandshakeChainLen(&tls, "sni.test");
+    try std.testing.expectEqual(@as(usize, 1), chain_len);
+}
+
+test "useCertificateChainFromMemory rejects a malformed trailing certificate instead of truncating the chain (#629)" {
+    // Review finding: treating any `PEM_read_bio_X509` failure as "no more
+    // intermediates" meant a malformed second certificate would be silently
+    // dropped rather than failing the load, unlike `SSL_use_certificate_chain_file`
+    // which only tolerates a genuine end-of-input.
+    const ctx = c.SSL_CTX_new(c.TLS_method() orelse return error.ContextInitFailed) orelse return error.ContextInitFailed;
+    defer c.SSL_CTX_free(ctx);
+    const ssl = c.SSL_new(ctx) orelse return error.ContextInitFailed;
+    defer c.SSL_free(ssl);
+
+    // Sanity: the real, well-formed chain still loads.
+    try useCertificateChainFromMemory(ssl, embedded_sni_chain_crt);
+
+    const malformed = try std.mem.concat(std.testing.allocator, u8, &.{
+        embedded_sni_chain_crt[0..],
+        "\n-----BEGIN CERTIFICATE-----\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END CERTIFICATE-----\n",
+    });
+    defer std.testing.allocator.free(malformed);
+    try std.testing.expectError(error.CertificateLoadFailed, useCertificateChainFromMemory(ssl, malformed));
+}
+
 test "TlsTerminator freezes SNI certificate content while identity reload is disabled, even across a maintenance tick (#629)" {
     // Review finding: `identity_reload_enabled = false` only stopped
     // `rebuildSniCertificates` from refreshing the hostname-to-path table --
@@ -2099,6 +2265,62 @@ test "TlsTerminator freezes SNI certificate content while identity reload is dis
     const leaf_restarted = try sniHandshakeLeafDer(allocator, &restarted, "sni.test");
     defer allocator.free(leaf_restarted);
     try std.testing.expect(!std.mem.eql(u8, leaf_a, leaf_restarted));
+}
+
+test "rebuildSniCertificates keeps the last-known-good SNI identity live when a refresh fails (#629)" {
+    // Review finding: the old rebuild freed the live SNI cache before
+    // reading the replacement PEM bytes, so a transient failure partway
+    // through (a missing/unreadable file, or an allocation failure) left
+    // `runMaintenance`'s "existing mappings remain active" claim false --
+    // the live map was actually empty or partially rebuilt. This proves the
+    // fix: a rebuild that fails to load a configured SNI entry leaves the
+    // previously-built cache (and a real SNI handshake against it) intact.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.crt", .data = embedded_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "test_server.key", .data = embedded_server_key });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "sni.crt", .data = embedded_alt_server_crt });
+    try compat.wrapDir(tmp.dir).writeFile(.{ .sub_path = "sni.key", .data = embedded_alt_server_key });
+
+    const cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.crt");
+    defer allocator.free(cert_path);
+    const key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "test_server.key");
+    defer allocator.free(key_path);
+    const sni_cert_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "sni.crt");
+    defer allocator.free(sni_cert_path);
+    const sni_key_path = try compat.wrapDir(tmp.dir).realpathAlloc(allocator, "sni.key");
+    defer allocator.free(sni_key_path);
+
+    var specs = [_]SniCertSpec{.{
+        .server_name = "sni.test",
+        .cert_path = sni_cert_path,
+        .key_path = sni_key_path,
+    }};
+
+    var tls = try TlsTerminator.init(allocator, .{
+        .cert_path = cert_path,
+        .key_path = key_path,
+        .sni_certs = &specs,
+        .dynamic_reload_interval_ms = 1,
+    });
+    defer tls.deinit();
+
+    const leaf_a = try sniHandshakeLeafDer(allocator, &tls, "sni.test");
+    defer allocator.free(leaf_a);
+
+    // Make the configured SNI cert unreadable so the next rebuild fails
+    // partway through -- this is deliberately *not* a mixed-mode freeze
+    // (`identity_reload_enabled` stays true); the rebuild is genuinely
+    // attempted and genuinely fails.
+    try compat.wrapDir(tmp.dir).deleteFile("sni.crt");
+
+    tls.runMaintenance(1_000);
+
+    const leaf_after = try sniHandshakeLeafDer(allocator, &tls, "sni.test");
+    defer allocator.free(leaf_after);
+    try std.testing.expectEqualSlices(u8, leaf_a, leaf_after);
 }
 
 test "tls terminator updates protocol policy for future snapshots" {
