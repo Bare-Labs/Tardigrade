@@ -160,6 +160,7 @@ pub const ControlPlaneProxyExecution = union(enum) {
     streamed_status: struct {
         status: u16,
         upstream_addr: []const u8,
+        accounted: bool = false,
     },
     buffered: ControlPlaneProxyResult,
 };
@@ -383,7 +384,10 @@ pub fn executeBoundedControlPlaneJsonProxy(
                 state,
                 enable_streaming_success,
                 sticky_set_cookie,
+                absolute_proxy_target,
+                circuit_permit,
             ) catch |err| {
+                if (err == error.DownstreamWriteFailed) return err;
                 if (controlPlaneAttemptErrorCountsAsUpstreamFailure(err)) {
                     recordControlPlaneProxyFailure(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit);
                 } else {
@@ -399,10 +403,12 @@ pub fn executeBoundedControlPlaneJsonProxy(
         };
         switch (exec) {
             .streamed_status => |streamed| {
-                if (streamed.status >= 500) {
-                    recordControlPlaneProxyFailure(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit);
-                } else {
-                    recordControlPlaneProxySuccess(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit);
+                if (!streamed.accounted) {
+                    if (streamed.status >= 500) {
+                        recordControlPlaneProxyFailure(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit);
+                    } else {
+                        recordControlPlaneProxySuccess(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit);
+                    }
                 }
                 return exec;
             },
@@ -450,6 +456,8 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
     state: *GatewayState,
     enable_streaming_success: bool,
     sticky_set_cookie: ?[]const u8,
+    absolute_proxy_target: bool,
+    circuit_permit: http.circuit_breaker.Permit,
 ) !ControlPlaneProxyExecution {
     const proxy_json_extra_header_slack = 12;
     const proxy_json_owned_header_value_slack = 3;
@@ -581,6 +589,11 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
         const cacheable = !bufferedUpstreamResponseHasNoStore(&buffered_resp);
         const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
         if (stream_status) {
+            if (status_code >= 500) {
+                recordControlPlaneProxyFailure(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit);
+            } else {
+                recordControlPlaneProxySuccess(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit);
+            }
             writeStreamedUpstreamResponse(
                 downstream_writer,
                 status_code,
@@ -596,7 +609,7 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
                 writeChunk(downstream_writer, buffered_resp.body) catch return error.DownstreamWriteFailed;
             }
             downstream_writer.writeAll("0\r\n\r\n") catch return error.DownstreamWriteFailed;
-            return .{ .streamed_status = .{ .status = status_code, .upstream_addr = upstream_host } };
+            return .{ .streamed_status = .{ .status = status_code, .upstream_addr = upstream_host, .accounted = true } };
         }
 
         if (status_code != 200) {
@@ -848,7 +861,7 @@ fn deinitControlPlaneProxyTestState(state: *GatewayState) void {
     state.h2_pool.deinit();
 }
 
-test "control-plane downstream streaming write failure stays neutral for health and circuit" {
+test "control-plane downstream streaming write failure records known 200 and never retries" {
     const allocator = std.testing.allocator;
     var origin = try ControlPlaneTestOrigin.start(allocator, &.{200});
     defer origin.stop();
@@ -858,8 +871,12 @@ test "control-plane downstream streaming write failure stays neutral for health 
     initControlPlaneProxyTestState(&state, allocator);
     defer deinitControlPlaneProxyTestState(&state);
     var cfg = initControlPlaneProxyTestConfig("http://configured.example");
+    cfg.upstream_retry_idempotent_only = false;
+    cfg.upstream_retry_attempts = 3;
     const target = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api", .{origin.port()});
     defer allocator.free(target);
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
+    state.circuitRecordFailurePermit(state.circuitTryAcquirePermit().?);
 
     try std.testing.expectError(error.DownstreamWriteFailed, executeBoundedControlPlaneJsonProxy(
         allocator,
@@ -885,8 +902,53 @@ test "control-plane downstream streaming write failure stays neutral for health 
 
     try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
     try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
-    try std.testing.expect(state.circuitTryAcquirePermit() != null);
     try std.testing.expectEqualStrings("closed", state.circuitStateName());
+}
+
+test "control-plane downstream streaming write failure records known 500 and never retries" {
+    const allocator = std.testing.allocator;
+    var origin = try ControlPlaneTestOrigin.start(allocator, &.{500});
+    defer origin.stop();
+    try origin.run();
+
+    var state: GatewayState = undefined;
+    initControlPlaneProxyTestState(&state, allocator);
+    defer deinitControlPlaneProxyTestState(&state);
+    var cfg = initControlPlaneProxyTestConfig("http://configured.example");
+    cfg.proxy_stream_all_statuses = true;
+    cfg.upstream_retry_idempotent_only = false;
+    cfg.upstream_retry_attempts = 3;
+    const target = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api", .{origin.port()});
+    defer allocator.free(target);
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
+    state.circuitRecordFailurePermit(state.circuitTryAcquirePermit().?);
+
+    try std.testing.expectError(error.DownstreamWriteFailed, executeBoundedControlPlaneJsonProxy(
+        allocator,
+        &cfg,
+        .global,
+        target,
+        null,
+        "{}",
+        "test-correlation",
+        "127.0.0.1",
+        null,
+        null,
+        null,
+        null,
+        null,
+        "localhost",
+        null,
+        FailingControlPlaneDownstreamWriter{},
+        &state,
+        true,
+        null,
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
+    try std.testing.expectEqualStrings("open", state.circuitStateName());
+    try std.testing.expect(state.circuitTryAcquirePermit() != null);
 }
 
 test "control-plane absolute target outcomes do not mutate configured passive health" {
