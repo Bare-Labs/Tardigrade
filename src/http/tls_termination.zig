@@ -2196,8 +2196,16 @@ test "acceptWithPolicy keeps leased policy when reload publishes before handshak
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds_a) != 0) return error.SocketPairFailed;
     defer _ = std.c.close(fds_a[0]);
     defer _ = std.c.close(fds_a[1]);
-    try testSetSocketTimeoutMs(fds_a[0], 1000);
-    try testSetSocketTimeoutMs(fds_a[1], 1000);
+    // #629 follow-up: this pair's handshake races a barrier-released accept
+    // thread against this thread's blocking SSL_connect (see the release
+    // handoff below) -- 1000ms was tight enough that CI scheduler jitter
+    // under load could starve the accept thread past the RCVTIMEO/SNDTIMEO
+    // deadline and fail a logically-correct handshake (observed in CI:
+    // github.com/Bare-Systems/Tardigrade/actions/runs/32477992720/job/96758226822).
+    // There's no real network latency to bound here (a local socketpair), so
+    // a much larger deadline only guards against genuine hangs.
+    try testSetSocketTimeoutMs(fds_a[0], 5000);
+    try testSetSocketTimeoutMs(fds_a[1], 5000);
 
     var client_a = try initTestClientSsl(fds_a[0], http11_only_wire_for_tests);
     defer client_a.deinit();
@@ -2232,8 +2240,9 @@ test "acceptWithPolicy keeps leased policy when reload publishes before handshak
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds_b) != 0) return error.SocketPairFailed;
     defer _ = std.c.close(fds_b[0]);
     defer _ = std.c.close(fds_b[1]);
-    try testSetSocketTimeoutMs(fds_b[0], 1000);
-    try testSetSocketTimeoutMs(fds_b[1], 1000);
+    // Same CI-jitter headroom as the fds_a pair above, for consistency.
+    try testSetSocketTimeoutMs(fds_b[0], 5000);
+    try testSetSocketTimeoutMs(fds_b[1], 5000);
 
     var client_b = try initTestClientSsl(fds_b[0], h2_only_wire_for_tests);
     defer client_b.deinit();
