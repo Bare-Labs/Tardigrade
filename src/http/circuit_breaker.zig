@@ -82,10 +82,6 @@ pub const CircuitBreaker = struct {
         };
     }
 
-    pub fn tryAcquire(self: *CircuitBreaker) bool {
-        return self.tryAcquirePermit() != null;
-    }
-
     /// Release an admitted half-open probe when the request did not reach the
     /// upstream and therefore has no success/failure outcome to record.
     pub fn releasePermit(self: *CircuitBreaker, permit: Permit) void {
@@ -98,10 +94,6 @@ pub const CircuitBreaker = struct {
                 }
             },
         }
-    }
-
-    pub fn releaseProbe(self: *CircuitBreaker) void {
-        self.releasePermit(.{ .half_open = self.half_open_generation });
     }
 
     /// Record a successful upstream call.
@@ -125,10 +117,6 @@ pub const CircuitBreaker = struct {
                 }
             },
         }
-    }
-
-    pub fn recordSuccess(self: *CircuitBreaker) void {
-        self.recordSuccessPermit(.ordinary);
     }
 
     /// Record a failed upstream call (connection error or 5xx).
@@ -155,10 +143,6 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    pub fn recordFailure(self: *CircuitBreaker) void {
-        self.recordFailurePermit(.ordinary);
-    }
-
     /// Human-readable state label for logging.
     pub fn stateName(self: *const CircuitBreaker) []const u8 {
         return switch (self.state) {
@@ -174,40 +158,40 @@ pub const CircuitBreaker = struct {
 test "circuit breaker starts closed" {
     var cb = CircuitBreaker.init(.{});
     try std.testing.expectEqual(State.closed, cb.state);
-    try std.testing.expect(cb.tryAcquire());
+    try std.testing.expect(cb.tryAcquirePermit() != null);
 }
 
 test "circuit breaker opens after threshold failures" {
     var cb = CircuitBreaker.init(.{ .threshold = 3 });
 
-    cb.recordFailure();
+    cb.recordFailurePermit(.ordinary);
     try std.testing.expectEqual(State.closed, cb.state);
-    try std.testing.expect(cb.tryAcquire());
+    try std.testing.expect(cb.tryAcquirePermit() != null);
 
-    cb.recordFailure();
+    cb.recordFailurePermit(.ordinary);
     try std.testing.expectEqual(State.closed, cb.state);
 
-    cb.recordFailure();
+    cb.recordFailurePermit(.ordinary);
     try std.testing.expectEqual(State.open, cb.state);
-    try std.testing.expect(!cb.tryAcquire());
+    try std.testing.expect(cb.tryAcquirePermit() == null);
 }
 
 test "circuit breaker success resets failure count" {
     var cb = CircuitBreaker.init(.{ .threshold = 3 });
-    cb.recordFailure();
-    cb.recordFailure();
-    cb.recordSuccess();
+    cb.recordFailurePermit(.ordinary);
+    cb.recordFailurePermit(.ordinary);
+    cb.recordSuccessPermit(.ordinary);
     try std.testing.expectEqual(@as(u32, 0), cb.failure_count);
     try std.testing.expectEqual(State.closed, cb.state);
 }
 
 test "circuit breaker disabled when threshold is 0" {
     var cb = CircuitBreaker.init(.{ .threshold = 0 });
-    cb.recordFailure();
-    cb.recordFailure();
-    cb.recordFailure();
+    cb.recordFailurePermit(.ordinary);
+    cb.recordFailurePermit(.ordinary);
+    cb.recordFailurePermit(.ordinary);
     try std.testing.expectEqual(State.closed, cb.state);
-    try std.testing.expect(cb.tryAcquire());
+    try std.testing.expect(cb.tryAcquirePermit() != null);
 }
 
 test "circuit breaker half-open closes on success" {
@@ -229,11 +213,11 @@ test "circuit breaker permits only one half-open probe at a time" {
 
     const permit = cb.tryAcquirePermit() orelse return error.TestExpectedHalfOpenPermit;
     try std.testing.expectEqual(State.half_open, cb.state);
-    try std.testing.expect(!cb.tryAcquire());
+    try std.testing.expect(cb.tryAcquirePermit() == null);
 
     cb.releasePermit(permit);
     const next_permit = cb.tryAcquirePermit() orelse return error.TestExpectedHalfOpenPermit;
-    try std.testing.expect(!cb.tryAcquire());
+    try std.testing.expect(cb.tryAcquirePermit() == null);
 
     cb.recordSuccessPermit(next_permit);
     try std.testing.expectEqual(State.closed, cb.state);
@@ -258,14 +242,14 @@ test "ordinary permit cannot complete or release a later half-open probe" {
 
     cb.recordSuccessPermit(old_request);
     try std.testing.expectEqual(State.half_open, cb.state);
-    try std.testing.expect(!cb.tryAcquire());
+    try std.testing.expect(cb.tryAcquirePermit() == null);
 
     cb.recordFailurePermit(old_request);
     try std.testing.expectEqual(State.half_open, cb.state);
-    try std.testing.expect(!cb.tryAcquire());
+    try std.testing.expect(cb.tryAcquirePermit() == null);
 
     cb.releasePermit(old_request);
-    try std.testing.expect(!cb.tryAcquire());
+    try std.testing.expect(cb.tryAcquirePermit() == null);
 
     cb.recordSuccessPermit(probe);
     try std.testing.expectEqual(State.closed, cb.state);
@@ -275,7 +259,7 @@ test "half-open permit survives neutral retry without reacquiring" {
     var cb = CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
     cb.recordFailurePermit(.ordinary);
     const probe = cb.tryAcquirePermit() orelse return error.TestExpectedHalfOpenPermit;
-    try std.testing.expect(!cb.tryAcquire());
+    try std.testing.expect(cb.tryAcquirePermit() == null);
 
     cb.recordSuccessPermit(probe);
     try std.testing.expectEqual(State.closed, cb.state);
@@ -284,6 +268,6 @@ test "half-open permit survives neutral retry without reacquiring" {
 test "stateName returns correct labels" {
     var cb = CircuitBreaker.init(.{ .threshold = 1 });
     try std.testing.expectEqualStrings("closed", cb.stateName());
-    cb.recordFailure();
+    cb.recordFailurePermit(.ordinary);
     try std.testing.expectEqualStrings("open", cb.stateName());
 }

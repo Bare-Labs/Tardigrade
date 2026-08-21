@@ -1381,18 +1381,10 @@ pub const GatewayState = struct {
         };
     }
 
-    pub fn circuitTryAcquire(self: *GatewayState) bool {
-        return self.circuitTryAcquirePermit() != null;
-    }
-
     pub fn circuitTryAcquirePermit(self: *GatewayState) ?http.circuit_breaker.Permit {
         self.circuit_mutex.lock();
         defer self.circuit_mutex.unlock();
         return self.circuit_breaker.tryAcquirePermit();
-    }
-
-    pub fn circuitRecordFailure(self: *GatewayState) void {
-        self.circuitRecordFailurePermit(.ordinary);
     }
 
     pub fn circuitRecordFailurePermit(self: *GatewayState, permit: http.circuit_breaker.Permit) void {
@@ -1401,18 +1393,10 @@ pub const GatewayState = struct {
         self.circuit_breaker.recordFailurePermit(permit);
     }
 
-    pub fn circuitRecordSuccess(self: *GatewayState) void {
-        self.circuitRecordSuccessPermit(.ordinary);
-    }
-
     pub fn circuitRecordSuccessPermit(self: *GatewayState, permit: http.circuit_breaker.Permit) void {
         self.circuit_mutex.lock();
         defer self.circuit_mutex.unlock();
         self.circuit_breaker.recordSuccessPermit(permit);
-    }
-
-    pub fn circuitReleaseProbe(self: *GatewayState) void {
-        self.circuitReleasePermit(.ordinary);
     }
 
     pub fn circuitReleasePermit(self: *GatewayState, permit: http.circuit_breaker.Permit) void {
@@ -3797,13 +3781,13 @@ test "gateway circuit breaker opens under upstream failure pressure" {
     defer deinitUpstreamTestState(&gs);
     gs.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 3, .timeout_ms = 30_000 });
 
-    try std.testing.expect(gs.circuitTryAcquire());
-    gs.circuitRecordFailure();
-    gs.circuitRecordFailure();
-    gs.circuitRecordFailure();
+    try std.testing.expect(gs.circuitTryAcquirePermit() != null);
+    gs.circuitRecordFailurePermit(.ordinary);
+    gs.circuitRecordFailurePermit(.ordinary);
+    gs.circuitRecordFailurePermit(.ordinary);
     // Open: requests fast-fail deterministically instead of piling onto a sick
     // upstream (the recovery timeout has not elapsed).
-    try std.testing.expect(!gs.circuitTryAcquire());
+    try std.testing.expect(gs.circuitTryAcquirePermit() == null);
     try std.testing.expectEqualStrings("open", gs.circuitStateName());
 }
 
@@ -3813,7 +3797,7 @@ test "gateway circuit breaker recovers through a half-open probe" {
     defer deinitUpstreamTestState(&gs);
     gs.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
 
-    gs.circuitRecordFailure();
+    gs.circuitRecordFailurePermit(.ordinary);
     // timeout_ms = 0 → the next acquire admits one probe in half-open state.
     const permit = gs.circuitTryAcquirePermit() orelse return error.TestExpectedHalfOpenPermit;
     try std.testing.expectEqualStrings("half-open", gs.circuitStateName());
@@ -3832,14 +3816,14 @@ test "gateway proxy outcome accounting drives live circuit breaker" {
 
     gs.recordUpstreamFailure(&cfg, "http://origin.example");
     gs.recordUpstreamFailure(&cfg, "http://origin.example");
-    try std.testing.expect(gs.circuitTryAcquire());
+    try std.testing.expect(gs.circuitTryAcquirePermit() != null);
     try std.testing.expectEqualStrings("closed", gs.circuitStateName());
 
     gs.recordProxyUpstreamFailure(&cfg, "http://origin.example", .ordinary);
-    try std.testing.expect(gs.circuitTryAcquire());
+    try std.testing.expect(gs.circuitTryAcquirePermit() != null);
     gs.recordProxyUpstreamFailure(&cfg, "http://origin.example", .ordinary);
 
-    try std.testing.expect(!gs.circuitTryAcquire());
+    try std.testing.expect(gs.circuitTryAcquirePermit() == null);
     try std.testing.expectEqualStrings("open", gs.circuitStateName());
 }
 

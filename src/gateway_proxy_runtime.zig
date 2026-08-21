@@ -1302,7 +1302,7 @@ test "ProductionBufferedProxyAttemptExecutor keeps absolute target failures out 
     attempt_executor.recordCircuitFailure();
 
     try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
-    try std.testing.expect(!state.circuitTryAcquire());
+    try std.testing.expect(state.circuitTryAcquirePermit() == null);
 }
 
 const Early425RetryHarnessResult = struct {
