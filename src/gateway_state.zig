@@ -1381,22 +1381,28 @@ pub const GatewayState = struct {
         };
     }
 
-    pub fn circuitTryAcquire(self: *GatewayState) bool {
+    pub fn circuitTryAcquirePermit(self: *GatewayState) ?http.circuit_breaker.Permit {
         self.circuit_mutex.lock();
         defer self.circuit_mutex.unlock();
-        return self.circuit_breaker.tryAcquire();
+        return self.circuit_breaker.tryAcquirePermit();
     }
 
-    pub fn circuitRecordFailure(self: *GatewayState) void {
+    pub fn circuitRecordFailurePermit(self: *GatewayState, permit: http.circuit_breaker.Permit) void {
         self.circuit_mutex.lock();
         defer self.circuit_mutex.unlock();
-        self.circuit_breaker.recordFailure();
+        self.circuit_breaker.recordFailurePermit(permit);
     }
 
-    pub fn circuitRecordSuccess(self: *GatewayState) void {
+    pub fn circuitRecordSuccessPermit(self: *GatewayState, permit: http.circuit_breaker.Permit) void {
         self.circuit_mutex.lock();
         defer self.circuit_mutex.unlock();
-        self.circuit_breaker.recordSuccess();
+        self.circuit_breaker.recordSuccessPermit(permit);
+    }
+
+    pub fn circuitReleasePermit(self: *GatewayState, permit: http.circuit_breaker.Permit) void {
+        self.circuit_mutex.lock();
+        defer self.circuit_mutex.unlock();
+        self.circuit_breaker.releasePermit(permit);
     }
 
     pub fn circuitStateName(self: *GatewayState) []const u8 {
@@ -2435,6 +2441,16 @@ pub const GatewayState = struct {
             health.slow_start_until_ms = 0;
         }
         self.updateUpstreamHealthMetricLocked();
+    }
+
+    pub fn recordProxyUpstreamFailure(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, permit: http.circuit_breaker.Permit) void {
+        self.recordUpstreamFailure(cfg, upstream_base_url);
+        self.circuitRecordFailurePermit(permit);
+    }
+
+    pub fn recordProxyUpstreamSuccess(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, permit: http.circuit_breaker.Permit) void {
+        self.recordUpstreamSuccess(cfg, upstream_base_url);
+        self.circuitRecordSuccessPermit(permit);
     }
 
     pub fn recordActiveProbeResult(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, healthy: bool) void {
@@ -3765,13 +3781,12 @@ test "gateway circuit breaker opens under upstream failure pressure" {
     defer deinitUpstreamTestState(&gs);
     gs.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 3, .timeout_ms = 30_000 });
 
-    try std.testing.expect(gs.circuitTryAcquire());
-    gs.circuitRecordFailure();
-    gs.circuitRecordFailure();
-    gs.circuitRecordFailure();
+    gs.circuitRecordFailurePermit(gs.circuitTryAcquirePermit().?);
+    gs.circuitRecordFailurePermit(gs.circuitTryAcquirePermit().?);
+    gs.circuitRecordFailurePermit(gs.circuitTryAcquirePermit().?);
     // Open: requests fast-fail deterministically instead of piling onto a sick
     // upstream (the recovery timeout has not elapsed).
-    try std.testing.expect(!gs.circuitTryAcquire());
+    try std.testing.expect(gs.circuitTryAcquirePermit() == null);
     try std.testing.expectEqualStrings("open", gs.circuitStateName());
 }
 
@@ -3781,12 +3796,34 @@ test "gateway circuit breaker recovers through a half-open probe" {
     defer deinitUpstreamTestState(&gs);
     gs.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
 
-    gs.circuitRecordFailure();
+    gs.circuitRecordFailurePermit(gs.circuitTryAcquirePermit().?);
     // timeout_ms = 0 → the next acquire admits one probe in half-open state.
-    try std.testing.expect(gs.circuitTryAcquire());
+    const permit = gs.circuitTryAcquirePermit() orelse return error.TestExpectedHalfOpenPermit;
     try std.testing.expectEqualStrings("half-open", gs.circuitStateName());
-    gs.circuitRecordSuccess();
+    gs.circuitRecordSuccessPermit(permit);
     try std.testing.expectEqualStrings("closed", gs.circuitStateName());
+}
+
+test "gateway proxy outcome accounting drives live circuit breaker" {
+    var gs: GatewayState = undefined;
+    initUpstreamTestState(&gs, std.testing.allocator);
+    defer deinitUpstreamTestState(&gs);
+    gs.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 2, .timeout_ms = 30_000 });
+
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.upstream_max_fails = 0;
+
+    gs.recordUpstreamFailure(&cfg, "http://origin.example");
+    gs.recordUpstreamFailure(&cfg, "http://origin.example");
+    try std.testing.expect(gs.circuitTryAcquirePermit() != null);
+    try std.testing.expectEqualStrings("closed", gs.circuitStateName());
+
+    gs.recordProxyUpstreamFailure(&cfg, "http://origin.example", gs.circuitTryAcquirePermit().?);
+    try std.testing.expect(gs.circuitTryAcquirePermit() != null);
+    gs.recordProxyUpstreamFailure(&cfg, "http://origin.example", gs.circuitTryAcquirePermit().?);
+
+    try std.testing.expect(gs.circuitTryAcquirePermit() == null);
+    try std.testing.expectEqualStrings("open", gs.circuitStateName());
 }
 
 fn initMetricsJsonTestState(gs: *GatewayState, allocator: std.mem.Allocator) void {

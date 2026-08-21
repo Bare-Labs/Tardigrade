@@ -36,6 +36,60 @@ const writeBufferedUpstreamResponseWithMetrics = gp.writeBufferedUpstreamRespons
 
 pub const StreamingRequestBody = gp.StreamingRequestBody;
 
+pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
+    return switch (err) {
+        error.OutOfMemory,
+        error.ClientAborted,
+        error.ProxyBufferCapacityUnavailable,
+        error.RequestBufferLimitExceeded,
+        error.InvalidChunkedUpload,
+        error.ChunkedUploadTooLarge,
+        error.UpstreamAtCapacity,
+        error.ProxyBudgetExhausted,
+        error.CircuitOpen,
+        => false,
+        else => true,
+    };
+}
+
+fn recordStreamingProxyOutcome(
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    selection_base_url: []const u8,
+    absolute_target: bool,
+    circuit_permit: http.circuit_breaker.Permit,
+    status_code: u16,
+    upstream_aborted: bool,
+    local_capacity_aborted: bool,
+    correlation_id: []const u8,
+) void {
+    // Local capacity exhaustion can set `upstream_aborted` too because the
+    // relay stops reading the origin after committing a response. Classify that
+    // as local first so memory pressure cannot trip a healthy origin's circuit.
+    if (local_capacity_aborted) {
+        state.circuitReleasePermit(circuit_permit);
+        state.logger.warn(correlation_id, "streaming relay truncated: local proxy buffer capacity exhausted", .{});
+    } else if (status_code >= 500 or upstream_aborted) {
+        if (absolute_target) {
+            state.circuitRecordFailurePermit(circuit_permit);
+        } else {
+            state.recordProxyUpstreamFailure(cfg, selection_base_url, circuit_permit);
+        }
+    } else {
+        if (absolute_target) {
+            state.circuitRecordSuccessPermit(circuit_permit);
+        } else {
+            state.recordProxyUpstreamSuccess(cfg, selection_base_url, circuit_permit);
+        }
+    }
+}
+
+fn propagateStreamingDownstreamAbortAfterStatus(state: *GatewayState, streamed: *const gp.StreamingProxyResult) !void {
+    if (!streamed.downstream_aborted_after_status) return;
+    state.metricsRecordProxyClientAbort();
+    return error.ClientAborted;
+}
+
 /// Why a request took the bounded buffered path instead of streaming (#139).
 /// Every reason is recorded as a metric label and a debug log line so operators
 /// can tell whether a given large transfer actually streamed.
@@ -497,6 +551,7 @@ pub fn handleLocationProxyPass(
         cfg.upstream_base_url
     else
         selection.base_url;
+    const absolute_proxy_target = isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"));
 
     const resolved = try resolveProxyTarget(temp_allocator, selected_base_url, target, suffix_path);
     const body = request.body orelse "";
@@ -520,6 +575,11 @@ pub fn handleLocationProxyPass(
         .early_data_retry_semantics
     else switch (streamingEligibilityForDataPlaneProxyRequest(cfg, matched_block, max_attempts)) {
         .stream => {
+            const circuit_permit = state.circuitTryAcquirePermit() orelse {
+                try sendApiError(allocator, writer, .service_unavailable, "upstream_circuit_open", "Upstream circuit breaker open", correlation_id, false, state);
+                ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
+                return @intFromEnum(http.Status.service_unavailable);
+            };
             state.recordUpstreamAttemptStart(selection.base_url);
             const proxy_buffer_observer = state.proxyBufferObserver();
             const streamed = executeStreamingHttpProxyRequest(
@@ -552,6 +612,7 @@ pub fn handleLocationProxyPass(
             ) catch |err| {
                 state.recordUpstreamAttemptEnd(selection.base_url);
                 if (err == error.ClientAborted) {
+                    state.circuitReleasePermit(circuit_permit);
                     state.metricsRecordProxyClientAbort();
                     return err;
                 }
@@ -560,6 +621,7 @@ pub fn handleLocationProxyPass(
                     // byte was committed (#140). Like the active-connection cap
                     // above this is local saturation, not an origin fault, so
                     // it must not touch upstream health / circuit-breaker state.
+                    state.circuitReleasePermit(circuit_permit);
                     try sendApiError(allocator, writer, .service_unavailable, "proxy_buffer_saturated", "Proxy buffer capacity exhausted", correlation_id, false, state);
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
                     return @intFromEnum(http.Status.service_unavailable);
@@ -568,6 +630,7 @@ pub fn handleLocationProxyPass(
                     // Fail-fast at the per-origin active cap (#239): a local
                     // saturation rejection, not an origin failure — do not count
                     // it against upstream health / circuit-breaker state.
+                    state.circuitReleasePermit(circuit_permit);
                     try sendApiError(allocator, writer, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id, false, state);
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
                     return @intFromEnum(http.Status.service_unavailable);
@@ -578,6 +641,7 @@ pub fn handleLocationProxyPass(
                 // is the client's 413 and not a 503 — and, being a client fault
                 // raised before commitment, it is not charged to the origin.
                 if (err == error.RequestBufferLimitExceeded) {
+                    state.circuitReleasePermit(circuit_permit);
                     try sendApiError(allocator, writer, .payload_too_large, "payload_too_large", "Request body too large", correlation_id, false, state);
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.payload_too_large), 0);
                     return @intFromEnum(http.Status.payload_too_large);
@@ -587,6 +651,7 @@ pub fn handleLocationProxyPass(
                 // faults raised before any response byte is committed, so the
                 // origin is not blamed for them.
                 if (err == error.InvalidChunkedUpload or err == error.ChunkedUploadTooLarge) {
+                    state.circuitReleasePermit(circuit_permit);
                     const upload_status: http.Status = if (err == error.ChunkedUploadTooLarge) .payload_too_large else .bad_request;
                     const upload_code = if (err == error.ChunkedUploadTooLarge) "payload_too_large" else "invalid_request";
                     const upload_msg = if (err == error.ChunkedUploadTooLarge) "Request body too large" else "Malformed chunked request body";
@@ -594,14 +659,26 @@ pub fn handleLocationProxyPass(
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(upload_status), 0);
                     return @intFromEnum(upload_status);
                 }
-                state.recordUpstreamFailure(cfg, selection.base_url);
                 if (err == error.RequestCancelled) {
+                    if (absolute_proxy_target) {
+                        state.circuitRecordFailurePermit(circuit_permit);
+                    } else {
+                        state.recordProxyUpstreamFailure(cfg, selection.base_url, circuit_permit);
+                    }
                     if (ctx.lifecycle) |lc| lc.logTimeout("upstream_connect");
                     try sendApiError(allocator, writer, .gateway_timeout, "upstream_timeout", "Upstream request timed out", correlation_id, false, state);
                     ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.gateway_timeout), 0);
                     return @intFromEnum(http.Status.gateway_timeout);
                 }
-                if (err == error.OutOfMemory) return error.OutOfMemory;
+                if (err == error.OutOfMemory) {
+                    state.circuitReleasePermit(circuit_permit);
+                    return error.OutOfMemory;
+                }
+                if (absolute_proxy_target) {
+                    state.circuitRecordFailurePermit(circuit_permit);
+                } else {
+                    state.recordProxyUpstreamFailure(cfg, selection.base_url, circuit_permit);
+                }
                 const err_status: http.Status = switch (err) {
                     error.Timeout, error.WouldBlock => .gateway_timeout,
                     else => .bad_gateway,
@@ -632,18 +709,18 @@ pub fn handleLocationProxyPass(
                 "",
                 transcript_redactions,
             );
-            if (!isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"))) {
-                // A relay truncated by local buffer capacity is not evidence
-                // about the origin, so it is neither a failure nor a success
-                // for health purposes (#140).
-                if (streamed.local_capacity_aborted) {
-                    state.logger.warn(correlation_id, "streaming relay truncated: local proxy buffer capacity exhausted", .{});
-                } else if (streamed.status_code >= 500 or streamed.upstream_aborted) {
-                    state.recordUpstreamFailure(cfg, selection.base_url);
-                } else {
-                    state.recordUpstreamSuccess(cfg, selection.base_url);
-                }
-            }
+            recordStreamingProxyOutcome(
+                state,
+                cfg,
+                selection.base_url,
+                absolute_proxy_target,
+                circuit_permit,
+                streamed.status_code,
+                streamed.upstream_aborted,
+                streamed.local_capacity_aborted,
+                correlation_id,
+            );
+            try propagateStreamingDownstreamAbortAfterStatus(state, &streamed);
             // `tardigrade_proxy_upstream_aborts_total` means "aborted by the
             // origin". A truncation this proxy caused by running out of buffer
             // capacity is not that, and counting it there would misattribute
@@ -695,6 +772,7 @@ pub fn handleLocationProxyPass(
         .auth_device_id = auth_device_id,
         .auth_scopes = auth_scopes,
         .selection_base_url = selection.base_url,
+        .absolute_target = absolute_proxy_target,
         .budget_start_ms = budget_start_ms,
     };
     var upstream_response: DataPlaneProxyResponse = switch (try runBufferedProxyAttempts(
@@ -715,6 +793,11 @@ pub fn handleLocationProxyPass(
             // it against upstream health / circuit-breaker state, and do
             // not burn retry attempts re-hitting the cap.
             try sendApiError(allocator, writer, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", correlation_id, keep_alive, state);
+            ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
+            return @intFromEnum(http.Status.service_unavailable);
+        },
+        .circuit_open => {
+            try sendApiError(allocator, writer, .service_unavailable, "upstream_circuit_open", "Upstream circuit breaker open", correlation_id, keep_alive, state);
             ctx.setUpstreamResult(resolved.upstream_host, @intFromEnum(http.Status.service_unavailable), 0);
             return @intFromEnum(http.Status.service_unavailable);
         },
@@ -762,11 +845,21 @@ pub fn handleLocationProxyPass(
         upstream_response.transcriptBody(),
         transcript_redactions,
     );
-    if (!isAbsoluteHttpUrl(std.mem.trim(u8, target, " \t\r\n"))) {
+    if (absolute_proxy_target) {
         if (upstream_response.statusCode() >= 500) {
-            state.recordUpstreamFailure(cfg, selection.base_url);
+            attempt_executor.recordCircuitFailure();
         } else if (upstream_response.statusCode() != @intFromEnum(http.Status.too_early)) {
-            state.recordUpstreamSuccess(cfg, selection.base_url);
+            attempt_executor.recordCircuitSuccess();
+        } else {
+            attempt_executor.releaseCircuitProbe();
+        }
+    } else {
+        if (upstream_response.statusCode() >= 500) {
+            attempt_executor.recordCircuitFailure();
+        } else if (upstream_response.statusCode() != @intFromEnum(http.Status.too_early)) {
+            attempt_executor.recordCircuitSuccess();
+        } else {
+            attempt_executor.releaseCircuitProbe();
         }
     }
     ctx.setUpstreamResult(resolved.upstream_host, upstream_response.statusCode(), upstream_response.bodyLen());
@@ -881,6 +974,7 @@ pub const BufferedProxyAttemptsResult = union(enum) {
     response: DataPlaneProxyResponse,
     early_425_retry_parked,
     upstream_at_capacity,
+    circuit_open,
     request_cancelled,
     retry_budget_exhausted,
     terminal_error: anyerror,
@@ -914,8 +1008,15 @@ pub fn runBufferedProxyAttempts(
                 continue;
             }
             retry_state.recordEarly425RetryResultOnce(attempt_executor, .failure);
-            if (err == error.ProxyBudgetExhausted) return .retry_budget_exhausted;
-            if (err == error.UpstreamAtCapacity) return .upstream_at_capacity;
+            if (err == error.CircuitOpen) return .circuit_open;
+            if (err == error.ProxyBudgetExhausted) {
+                maybeReleaseCircuitProbe(attempt_executor);
+                return .retry_budget_exhausted;
+            }
+            if (err == error.UpstreamAtCapacity) {
+                maybeReleaseCircuitProbe(attempt_executor);
+                return .upstream_at_capacity;
+            }
             try attempt_executor.onTerminalAttemptError(err);
             if (err == error.RequestCancelled) return .request_cancelled;
             if (retry_state.hasConfiguredRetryRemaining(attempt, max_attempts, stale_conn_retries)) {
@@ -991,6 +1092,12 @@ fn maybeParkEarly425Retry(attempt_executor: anytype, result: *DataPlaneProxyResp
     return false;
 }
 
+fn maybeReleaseCircuitProbe(attempt_executor: anytype) void {
+    if (comptime @hasDecl(@TypeOf(attempt_executor.*), "releaseCircuitProbe")) {
+        attempt_executor.releaseCircuitProbe();
+    }
+}
+
 const ProductionBufferedProxyAttemptExecutor = struct {
     allocator: std.mem.Allocator,
     cfg: *const edge_config.EdgeConfig,
@@ -1008,8 +1115,10 @@ const ProductionBufferedProxyAttemptExecutor = struct {
     auth_device_id: ?[]const u8,
     auth_scopes: ?[]const u8,
     selection_base_url: []const u8,
+    absolute_target: bool,
     budget_start_ms: u64,
     last_attempt_start_ms: u64 = 0,
+    circuit_permit: ?http.circuit_breaker.Permit = null,
 
     fn recordEarlyUpstream425Action(
         self: *ProductionBufferedProxyAttemptExecutor,
@@ -1050,6 +1159,9 @@ const ProductionBufferedProxyAttemptExecutor = struct {
         forward_early_data: bool,
     ) !DataPlaneProxyResponse {
         _ = attempt;
+        if (self.circuit_permit == null) {
+            self.circuit_permit = self.state.circuitTryAcquirePermit() orelse return error.CircuitOpen;
+        }
         const per_attempt_timeout_ms = try self.perAttemptTimeoutMs();
         self.state.recordUpstreamAttemptStart(self.selection_base_url);
         self.last_attempt_start_ms = http.event_loop.monotonicMs();
@@ -1098,11 +1210,41 @@ const ProductionBufferedProxyAttemptExecutor = struct {
         self.state.logger.warn(self.correlation_id, "proxy retrying on fresh connection after stale upstream keep-alive ({d}/{d})", .{ stale_conn_retries, max_stale_conn_retries });
     }
 
+    fn releaseCircuitProbe(self: *ProductionBufferedProxyAttemptExecutor) void {
+        const permit = self.circuit_permit orelse return;
+        self.state.circuitReleasePermit(permit);
+        self.circuit_permit = null;
+    }
+
+    fn recordCircuitFailure(self: *ProductionBufferedProxyAttemptExecutor) void {
+        const permit = self.circuit_permit orelse return;
+        if (self.absolute_target) {
+            self.state.circuitRecordFailurePermit(permit);
+        } else {
+            self.state.recordProxyUpstreamFailure(self.cfg, self.selection_base_url, permit);
+        }
+        self.circuit_permit = null;
+    }
+
+    fn recordCircuitSuccess(self: *ProductionBufferedProxyAttemptExecutor) void {
+        const permit = self.circuit_permit orelse return;
+        if (self.absolute_target) {
+            self.state.circuitRecordSuccessPermit(permit);
+        } else {
+            self.state.recordProxyUpstreamSuccess(self.cfg, self.selection_base_url, permit);
+        }
+        self.circuit_permit = null;
+    }
+
     fn onTerminalAttemptError(
         self: *ProductionBufferedProxyAttemptExecutor,
-        _: anyerror,
+        err: anyerror,
     ) !void {
-        self.state.recordUpstreamFailure(self.cfg, self.selection_base_url);
+        if (proxyAttemptErrorCountsAsUpstreamFailure(err)) {
+            self.recordCircuitFailure();
+        } else {
+            self.releaseCircuitProbe();
+        }
     }
 
     fn onConfiguredErrorRetry(
@@ -1136,12 +1278,148 @@ const ProductionBufferedProxyAttemptExecutor = struct {
         max_attempts: usize,
         result: *DataPlaneProxyResponse,
     ) !void {
-        self.state.recordUpstreamFailure(self.cfg, self.selection_base_url);
+        self.recordCircuitFailure();
         self.state.logger.warn(self.correlation_id, "proxy attempt {d}/{d} got {d}, retrying", .{ configured_attempt_index + 1, max_attempts, result.statusCode() });
         self.state.metricsReleaseProxyBufferedBytes(result.bodyLen());
         result.deinit(self.allocator);
     }
 };
+
+test "ProductionBufferedProxyAttemptExecutor keeps absolute target failures out of passive health" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.upstream_mutex = .{};
+    state.circuit_mutex = .{};
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 30_000 });
+    state.upstream_health = std.StringHashMap(gs.UpstreamHealth).init(allocator);
+    defer {
+        var it = state.upstream_health.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        state.upstream_health.deinit();
+    }
+
+    const permit = state.circuitTryAcquirePermit() orelse return error.TestExpectedOrdinaryPermit;
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.upstream_max_fails = 1;
+    cfg.upstream_fail_timeout_ms = 60_000;
+
+    var attempt_executor = ProductionBufferedProxyAttemptExecutor{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .state = &state,
+        .ctx = undefined,
+        .request = undefined,
+        .body = "",
+        .upstream_url = "http://absolute.example/resource",
+        .unix_socket_path = null,
+        .correlation_id = "test",
+        .client_ip = "127.0.0.1",
+        .forwarded_proto = "http",
+        .auth_identity = null,
+        .auth_user_id = null,
+        .auth_device_id = null,
+        .auth_scopes = null,
+        .selection_base_url = "http://configured.example",
+        .absolute_target = true,
+        .budget_start_ms = 0,
+        .circuit_permit = permit,
+    };
+
+    attempt_executor.recordCircuitFailure();
+
+    try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
+    try std.testing.expect(state.circuitTryAcquirePermit() == null);
+}
+
+test "streaming absolute target local capacity abort releases circuit permit first" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.upstream_mutex = .{};
+    state.circuit_mutex = .{};
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.logger = http.logger.Logger.init(.err, "test");
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 30_000 });
+    state.upstream_health = std.StringHashMap(gs.UpstreamHealth).init(allocator);
+    defer {
+        var it = state.upstream_health.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        state.upstream_health.deinit();
+    }
+
+    const permit = state.circuitTryAcquirePermit() orelse return error.TestExpectedOrdinaryPermit;
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.upstream_max_fails = 1;
+    cfg.upstream_fail_timeout_ms = 60_000;
+
+    recordStreamingProxyOutcome(
+        &state,
+        &cfg,
+        "http://configured.example",
+        true,
+        permit,
+        200,
+        true,
+        true,
+        "test-correlation",
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
+    try std.testing.expectEqualStrings("closed", state.circuitStateName());
+    try std.testing.expect(state.circuitTryAcquirePermit() != null);
+}
+
+test "streaming downstream abort after known 500 records outcome then propagates client abort" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.upstream_mutex = .{};
+    state.circuit_mutex = .{};
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.logger = http.logger.Logger.init(.err, "test");
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
+    state.upstream_health = std.StringHashMap(gs.UpstreamHealth).init(allocator);
+    defer {
+        var it = state.upstream_health.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        state.upstream_health.deinit();
+    }
+
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.upstream_max_fails = 1;
+    cfg.upstream_fail_timeout_ms = 60_000;
+    state.circuitRecordFailurePermit(state.circuitTryAcquirePermit().?);
+    const permit = state.circuitTryAcquirePermit() orelse return error.TestExpectedHalfOpenPermit;
+
+    const streamed = gp.StreamingProxyResult{
+        .status_code = 500,
+        .reason = "Internal Server Error",
+        .response_body_bytes = 0,
+        .upstream_ttfb_ms = 7,
+        .downstream_aborted_after_status = true,
+    };
+    recordStreamingProxyOutcome(
+        &state,
+        &cfg,
+        "http://configured.example",
+        true,
+        permit,
+        streamed.status_code,
+        streamed.upstream_aborted,
+        streamed.local_capacity_aborted,
+        "test-correlation",
+    );
+    try std.testing.expectError(error.ClientAborted, propagateStreamingDownstreamAbortAfterStatus(&state, &streamed));
+
+    try std.testing.expectEqualStrings("open", state.circuitStateName());
+    try std.testing.expect(state.circuitTryAcquirePermit() != null);
+    try std.testing.expectEqual(@as(u64, 1), state.metrics.proxy_client_aborts);
+}
 
 const Early425RetryHarnessResult = struct {
     downstream_status: u16,
@@ -1536,6 +1814,7 @@ fn runEarly425RetryHarness(
         },
         .early_425_retry_parked,
         .upstream_at_capacity,
+        .circuit_open,
         .request_cancelled,
         .retry_budget_exhausted,
         .terminal_error,
@@ -1789,6 +2068,39 @@ test "early upstream 425 ordinary retry transport failure records failure once" 
         .terminal_error => |err| try std.testing.expectEqual(error.TestRetryTransportFailed, err),
         else => return error.TestUnexpectedTerminalProxyResult,
     }
+    try std.testing.expectEqual(@as(usize, 1), executor.deliveries);
+    try std.testing.expectEqual(@as(usize, 1), executor.execute_failures);
+    try std.testing.expectEqual(@as(usize, 1), executor.early_425_retried);
+    try std.testing.expectEqual(@as(usize, 1), executor.early_retry_failure);
+    try std.testing.expectEqual(@as(usize, 0), executor.early_retry_success);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, header_counts.items);
+}
+
+test "early upstream 425 retry blocked by circuit records failure once" {
+    const allocator = std.testing.allocator;
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    };
+    var barrier = TestEarly425Barrier{};
+    var ctx = http.request_context.EarlyDataContext{ .transport_early = true, .downstream_handshake = barrier.barrier() };
+    var header_counts = std.array_list.Managed(usize).init(allocator);
+    defer header_counts.deinit();
+    var executor = ScriptedBufferedAttemptExecutor{
+        .allocator = allocator,
+        .upstream_statuses = &.{425},
+        .early_data_header_counts = &header_counts,
+        .fail_attempt_index = 1,
+        .fail_attempt_err = error.CircuitOpen,
+    };
+
+    const result = try runBufferedProxyAttempts(&ctx, true, "GET", &block, 1, 0, true, &executor);
+
+    try std.testing.expectEqual(std.meta.Tag(BufferedProxyAttemptsResult).circuit_open, std.meta.activeTag(result));
     try std.testing.expectEqual(@as(usize, 1), executor.deliveries);
     try std.testing.expectEqual(@as(usize, 1), executor.execute_failures);
     try std.testing.expectEqual(@as(usize, 1), executor.early_425_retried);
@@ -2164,6 +2476,26 @@ test "buffered proxy attempts stop on local retry budget exhaustion before upstr
     const result = try runBufferedProxyAttempts(&ctx, false, "GET", &block, 3, 0, true, &executor);
 
     try std.testing.expectEqual(std.meta.Tag(BufferedProxyAttemptsResult).retry_budget_exhausted, std.meta.activeTag(result));
+    try std.testing.expectEqual(@as(usize, 1), executor.execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), executor.terminal_attempt_errors);
+    try std.testing.expectEqual(@as(usize, 0), executor.configured_error_retries);
+}
+
+test "buffered proxy attempts fail fast when circuit breaker is open" {
+    const block = edge_config.EdgeConfig.LocationBlock{
+        .match_type = .prefix,
+        .pattern = "/",
+        .priority = 0,
+        .action = .{ .proxy_pass = "http://127.0.0.1:9001" },
+        .early_data = .replay_safe,
+        .proxy_early_data = .rfc8470,
+    };
+    var ctx = http.request_context.EarlyDataContext{};
+    var executor = ErrorBufferedAttemptExecutor{ .err = error.CircuitOpen };
+
+    const result = try runBufferedProxyAttempts(&ctx, false, "GET", &block, 3, 0, true, &executor);
+
+    try std.testing.expectEqual(std.meta.Tag(BufferedProxyAttemptsResult).circuit_open, std.meta.activeTag(result));
     try std.testing.expectEqual(@as(usize, 1), executor.execute_calls);
     try std.testing.expectEqual(@as(usize, 0), executor.terminal_attempt_errors);
     try std.testing.expectEqual(@as(usize, 0), executor.configured_error_retries);

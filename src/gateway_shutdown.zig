@@ -150,6 +150,27 @@ pub fn hotReloadConfig(
         }
     }
     {
+        // The circuit breaker is process-owned state constructed once at
+        // startup. Reloading its policy in place would require generation-safe
+        // permit migration, so reject those changes and keep config/state
+        // coherent until a restart installs the new policy.
+        var current_lease = worker_ctx.config_store.acquire();
+        const circuit_breaker_config_changed = circuitBreakerConfigChanged(current_lease.cfg, cfg_ptr);
+        current_lease.release();
+        if (circuit_breaker_config_changed) {
+            worker_ctx.config_store.destroyVersion(prepared_version);
+            const msg = std.fmt.bufPrint(&state.last_reload_error, "circuit breaker configuration changed; restart required", .{}) catch "circuit breaker configuration changed";
+            state.reload_mutex.lock();
+            state.last_reload_ok = false;
+            state.last_reload_at_ms = now_ms;
+            state.last_reload_error_len = msg.len;
+            state.reload_mutex.unlock();
+            state.metricsRecordReloadFailure();
+            state.logger.warn(null, "config reload rejected: TARDIGRADE_CB_THRESHOLD/_TIMEOUT_MS changed; restart the process to change circuit breaker policy", .{});
+            return;
+        }
+    }
+    {
         var current_lease = worker_ctx.config_store.acquire();
         const source_changed = (current_lease.cfg.tls_native_ticket_keys_path.len == 0) != (cfg_ptr.tls_native_ticket_keys_path.len == 0);
         current_lease.release();
@@ -438,6 +459,14 @@ pub fn listenerShardConfigChanged(
     return current.listener_shards != proposed.listener_shards;
 }
 
+pub fn circuitBreakerConfigChanged(
+    current: *const edge_config.EdgeConfig,
+    proposed: *const edge_config.EdgeConfig,
+) bool {
+    return current.cb_threshold != proposed.cb_threshold or
+        current.cb_timeout_ms != proposed.cb_timeout_ms;
+}
+
 test "earlyDataReplayConfigChanged detects mode and capacity changes independently" {
     const allocator = std.testing.allocator;
     var base = try edge_config.loadFromEnv(allocator);
@@ -464,6 +493,36 @@ test "earlyDataReplayConfigChanged detects mode and capacity changes independent
     try std.testing.expect(earlyDataReplayConfigChanged(&base, &proposed));
     proposed.tls_native_early_data_replay_max_entries = base.tls_native_early_data_replay_max_entries;
     try std.testing.expect(!earlyDataReplayConfigChanged(&base, &proposed));
+}
+
+test "circuitBreakerConfigChanged treats threshold and timeout as restart-only" {
+    const allocator = std.testing.allocator;
+    var base = try edge_config.loadFromEnv(allocator);
+    defer base.deinit(allocator);
+    var proposed = try edge_config.loadFromEnv(allocator);
+    defer proposed.deinit(allocator);
+
+    try std.testing.expect(!circuitBreakerConfigChanged(&base, &proposed));
+
+    proposed.cb_threshold = base.cb_threshold + 1;
+    try std.testing.expect(circuitBreakerConfigChanged(&base, &proposed));
+    proposed.cb_threshold = base.cb_threshold;
+    try std.testing.expect(!circuitBreakerConfigChanged(&base, &proposed));
+
+    base.cb_threshold = 1;
+    proposed.cb_threshold = 0;
+    try std.testing.expect(circuitBreakerConfigChanged(&base, &proposed));
+    proposed.cb_threshold = base.cb_threshold;
+    try std.testing.expect(!circuitBreakerConfigChanged(&base, &proposed));
+
+    base.cb_threshold = 0;
+    proposed.cb_threshold = 1;
+    try std.testing.expect(circuitBreakerConfigChanged(&base, &proposed));
+    proposed.cb_threshold = base.cb_threshold;
+    try std.testing.expect(!circuitBreakerConfigChanged(&base, &proposed));
+
+    proposed.cb_timeout_ms = base.cb_timeout_ms + 1;
+    try std.testing.expect(circuitBreakerConfigChanged(&base, &proposed));
 }
 
 test "http3ListenerConfigChanged permits advertisement-only reloads" {

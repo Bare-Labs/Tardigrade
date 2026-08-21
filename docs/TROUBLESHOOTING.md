@@ -705,7 +705,7 @@ itself is unhealthy.
 
 `503` here is a local capacity/availability signal, not a gateway or
 timeout failure — don't fold it into the 502/504 explanations above. There
-are four independent local-capacity families that all return `503`, and
+are five independent local-capacity/availability families that all return `503`, and
 they need different metrics/response bodies to tell apart:
 
 1. **Accept-time connection/worker-queue saturation** — the global or
@@ -722,7 +722,7 @@ they need different metrics/response bodies to tell apart:
    `Retry-After`, and does **not** move `connection_rejections_total`/
    `queue_rejections_total` — only `tardigrade_error_overload_total` moves.
    Flat connection/queue rejection counters alone don't identify this
-   family, though — families 3 and 4 below also leave those two flat;
+   family, though — families 3, 4, and 5 below also leave those two flat;
    `code:"overloaded"` plus `tardigrade_error_overload_total` rising is
    what actually identifies family 2 specifically.
 3. **Per-origin upstream connection-pool cap** —
@@ -736,11 +736,16 @@ they need different metrics/response bodies to tell apart:
    before any response byte is committed (`error.ProxyBufferCapacityUnavailable`).
    JSON `"code":"proxy_buffer_saturated"`, no `Retry-After`, connection
    closed.
+5. **Process-wide upstream circuit breaker open** —
+   `TARDIGRADE_CB_THRESHOLD` is enabled and recent confirmed upstream
+   failures opened the breaker. Requests fail before contacting the upstream
+   with JSON `"code":"upstream_circuit_open"`, no `Retry-After`, and recover
+   through a single half-open probe after `TARDIGRADE_CB_TIMEOUT_MS`.
 
 The response body's `code` field (`overloaded`/`upstream_saturated`/
-`proxy_buffer_saturated`) plus the family-specific counters below are what
-actually distinguish families 2–4 from each other — not the presence or
-absence of `Retry-After`.
+`proxy_buffer_saturated`/`upstream_circuit_open`) plus the family-specific
+counters below are what actually distinguish families 2–5 from each other —
+not the presence or absence of `Retry-After`.
 
 Marking backends unhealthy (passive failure tracking or active probing —
 see [§8](#8-health-checks-mark-an-upstream-down)) changes backend
@@ -753,17 +758,13 @@ necessarily a `503` — check the access log's `upstream_status`/
 `error_category` for the specific request rather than assuming `503` from
 health state alone.
 
-> `GatewayState`'s circuit-breaker fields
-> (`circuitTryAcquire`/`circuitRecordFailure`/`circuitRecordSuccess`) exist
-> and are unit-tested in isolation, but as of this writing they are not
-> called from the live proxy request path (`gateway_proxy.zig`,
-> `gateway_proxy_runtime.zig`, `gateway_control_plane_proxy.zig`,
-> `gateway_handlers.zig`) — only referenced in comments. Despite
-> `OBSERVABILITY.md`'s troubleshooting table describing a circuit-breaker-
-> open symptom, this guide does not document it as a live `503` cause.
-> Tracked by [#627](https://github.com/Bare-Systems/Tardigrade/issues/627);
-> treat any breaker-shaped symptom you observe as one of the causes above
-> instead until that issue resolves the discrepancy one way or the other.
+For `"code":"upstream_circuit_open"`, check whether the upstream has just
+returned repeated 5xx responses, timed out, reset streams, or failed
+protocol/connection handling. Local proxy capacity refusals, client upload
+errors, and downstream write failures do not trip the breaker. If the origin
+has recovered, wait at least `TARDIGRADE_CB_TIMEOUT_MS` for the half-open
+probe window; one probe is allowed through, and additional concurrent requests
+continue to fail fast until that probe succeeds.
 
 #### Concrete fixes
 

@@ -310,6 +310,7 @@ pub const StreamingProxyResult = struct {
     response_body_bytes: usize,
     upstream_ttfb_ms: u64,
     upstream_aborted: bool = false,
+    downstream_aborted_after_status: bool = false,
     /// The relay was truncated because *local* proxy buffer capacity ran out,
     /// not because the origin failed. The response head was already committed
     /// so the status cannot change, but the origin must not be blamed for it —
@@ -317,6 +318,16 @@ pub const StreamingProxyResult = struct {
     /// trip a healthy origin's circuit breaker.
     local_capacity_aborted: bool = false,
 };
+
+fn streamingResultAfterDownstreamAbort(status_code: u16, reason: []const u8, body_bytes: usize, ttfb_ms: u64) StreamingProxyResult {
+    return .{
+        .status_code = status_code,
+        .reason = reason,
+        .response_body_bytes = body_bytes,
+        .upstream_ttfb_ms = ttfb_ms,
+        .downstream_aborted_after_status = true,
+    };
+}
 
 pub fn uriComponentBytes(component: std.Uri.Component) []const u8 {
     return switch (component) {
@@ -1272,7 +1283,7 @@ fn streamViaH2Pool(
                 ) catch {
                     conn.finishStreaming(stream); // resets the unfinished stream
                     h2_pool.release(conn);
-                    return error.ClientAborted;
+                    return streamingResultAfterDownstreamAbort(status, reason, 0, ttfb_ms);
                 };
 
                 var body_bytes: usize = 0;
@@ -1305,7 +1316,7 @@ fn streamViaH2Pool(
                         gpres.writeChunk(downstream_writer, response_buf.?[0..n]) catch {
                             conn.finishStreaming(stream);
                             h2_pool.release(conn);
-                            return error.ClientAborted;
+                            return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
                         };
                         conn.acknowledgeStreamingBody(stream, n);
                         body_bytes += n;
@@ -1314,7 +1325,7 @@ fn streamViaH2Pool(
                         gpres.writeChunk(downstream_writer, "") catch {
                             conn.finishStreaming(stream);
                             h2_pool.release(conn);
-                            return error.ClientAborted;
+                            return streamingResultAfterDownstreamAbort(status, reason, body_bytes, ttfb_ms);
                         };
                     }
                 }
@@ -2406,18 +2417,32 @@ fn streamProxyOverTransport(
         security,
         alt_svc,
         sticky_set_cookie,
-    ) catch return error.ClientAborted;
+    ) catch return .{
+        .result = streamingResultAfterDownstreamAbort(head.status_code, reason, 0, ttfb_ms),
+        .reusable = false,
+    };
     wrote_downstream.* = true;
 
     var body_bytes: usize = 0;
     var aborted = false;
     var reusable = head.http_1_1 and !head.connection_close;
     if (body_allowed) {
-        const outcome = try relayUpstreamBody(&rb, transport, fd, read_deadline_ms, head.framing, downstream_writer, cancel_token);
+        const outcome = relayUpstreamBody(&rb, transport, fd, read_deadline_ms, head.framing, downstream_writer, cancel_token) catch |err| {
+            if (err == error.ClientAborted) {
+                return .{
+                    .result = streamingResultAfterDownstreamAbort(head.status_code, reason, body_bytes, ttfb_ms),
+                    .reusable = false,
+                };
+            }
+            return err;
+        };
         body_bytes = outcome.body_bytes;
         aborted = outcome.aborted;
         reusable = reusable and outcome.reusable;
-        if (!aborted) gpres.writeChunk(downstream_writer, "") catch return error.ClientAborted;
+        if (!aborted) gpres.writeChunk(downstream_writer, "") catch return .{
+            .result = streamingResultAfterDownstreamAbort(head.status_code, reason, body_bytes, ttfb_ms),
+            .reusable = false,
+        };
     }
     if (aborted) reusable = false;
 
@@ -2737,6 +2762,16 @@ pub fn mapControlPlaneProxyExecutionError(err: anyerror) ProxyExecMappedError {
             .code = "upstream_saturated",
             .message = "Upstream connection limit reached",
         },
+        error.CircuitOpen => .{
+            .status = .service_unavailable,
+            .code = "upstream_circuit_open",
+            .message = "Upstream circuit breaker open",
+        },
+        error.ControlPlaneResponseMaterializationFailed => .{
+            .status = .bad_gateway,
+            .code = "upstream_response_error",
+            .message = "Upstream response could not be delivered",
+        },
         else => .{
             .status = .gateway_timeout,
             .code = "upstream_timeout",
@@ -2749,6 +2784,12 @@ test "mapUpstreamError returns stable codes" {
     const mapped = mapUpstreamError(502);
     try std.testing.expectEqual(@as(u16, 503), mapped.status);
     try std.testing.expectEqualStrings("tool_unavailable", mapped.code);
+}
+
+test "mapControlPlaneProxyExecutionError maps open circuit distinctly" {
+    const mapped = mapControlPlaneProxyExecutionError(error.CircuitOpen);
+    try std.testing.expectEqual(http.Status.service_unavailable, mapped.status);
+    try std.testing.expectEqualStrings("upstream_circuit_open", mapped.code);
 }
 
 // --- Malformed upstream response handling tests ---
@@ -4510,6 +4551,7 @@ const Http1ResponseRelay = struct {
     err: ?anyerror = null,
     status: u16 = 0,
     upstream_aborted: bool = false,
+    downstream_aborted_after_status: bool = false,
 
     fn init(
         relay_bytes: usize,
@@ -4576,6 +4618,7 @@ const Http1ResponseRelay = struct {
         };
         self.status = res.result.status_code;
         self.upstream_aborted = res.result.upstream_aborted;
+        self.downstream_aborted_after_status = res.result.downstream_aborted_after_status;
     }
 
     fn runCapturing(self: *Http1ResponseRelay) void {
@@ -4704,7 +4747,30 @@ test "http1 response relay releases its origin reservation when the client abort
     // write failing means it is live at the moment the client vanishes.
     relay.run(FailingDownstreamWriter{});
 
-    try std.testing.expectEqual(@as(?anyerror, error.ClientAborted), relay.err);
+    try std.testing.expect(relay.err == null);
+    try std.testing.expectEqual(@as(u16, 200), relay.status);
+    try std.testing.expect(relay.downstream_aborted_after_status);
+    try relay.expectNothingHeld();
+}
+
+test "http1 response relay returns known 500 when downstream aborts after status" {
+    var origin = proxy_buffer_account.Aggregate.init(.origin, 64 * 1024);
+    var global = proxy_buffer_account.Aggregate.init(.global, 0);
+    const relay_bytes: usize = 16 * 1024;
+
+    var relay = try Http1ResponseRelay.init(
+        relay_bytes,
+        uploadTestLimits(1024 * 1024),
+        .{ .origin = &origin, .global = &global },
+    );
+    defer relay.deinit();
+
+    relay.originSend("HTTP/1.1 500 Oops\r\nContent-Length: 4\r\n\r\nfail");
+    relay.run(FailingDownstreamWriter{});
+
+    try std.testing.expect(relay.err == null);
+    try std.testing.expectEqual(@as(u16, 500), relay.status);
+    try std.testing.expect(relay.downstream_aborted_after_status);
     try relay.expectNothingHeld();
 }
 

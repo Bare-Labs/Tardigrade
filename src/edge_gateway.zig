@@ -3335,16 +3335,16 @@ fn h2UnsupportedProxyOrchestration(cfg: *const edge_config.EdgeConfig, matched: 
         cfg.proxy_streaming_mode.responseStreamingEnabled(),
     )) return true;
 
-    // `upstream_max_fails`/`upstream_fail_timeout_ms` drive passive
-    // upstream health accounting that `handleLocationProxyPass` records
-    // around the low-level executor this path calls directly; skipping it
-    // means a configured circuit breaker silently never opens (or closes)
+    // `upstream_max_fails`/`upstream_fail_timeout_ms` and the process-wide
+    // circuit breaker depend on health/accounting that `handleLocationProxyPass`
+    // records around the low-level executor this path calls directly; skipping
+    // it means configured upstream protection silently never opens (or closes)
     // for traffic negotiated over H2. Deliberately NOT included:
     // `upstream_pool_enabled` -- it defaults to true, and connection
     // pooling itself is already correctly threaded through via
     // `state.upstream_pool`/`state.h2_pool` below, so treating it as
     // unsupported would fail closed on every H2 proxy_pass by default.
-    if (cfg.upstream_max_fails > 0) return true;
+    if (cfg.upstream_max_fails > 0 or cfg.cb_threshold > 0) return true;
 
     const pool = gs.upstreamPoolForScope(cfg, .global);
     return cfg.upstream_retry_attempts > 1 or
