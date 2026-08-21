@@ -52,6 +52,38 @@ pub fn proxyAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
     };
 }
 
+fn recordStreamingProxyOutcome(
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    selection_base_url: []const u8,
+    absolute_target: bool,
+    circuit_permit: http.circuit_breaker.Permit,
+    status_code: u16,
+    upstream_aborted: bool,
+    local_capacity_aborted: bool,
+    correlation_id: []const u8,
+) void {
+    // Local capacity exhaustion can set `upstream_aborted` too because the
+    // relay stops reading the origin after committing a response. Classify that
+    // as local first so memory pressure cannot trip a healthy origin's circuit.
+    if (local_capacity_aborted) {
+        state.circuitReleasePermit(circuit_permit);
+        state.logger.warn(correlation_id, "streaming relay truncated: local proxy buffer capacity exhausted", .{});
+    } else if (status_code >= 500 or upstream_aborted) {
+        if (absolute_target) {
+            state.circuitRecordFailurePermit(circuit_permit);
+        } else {
+            state.recordProxyUpstreamFailure(cfg, selection_base_url, circuit_permit);
+        }
+    } else {
+        if (absolute_target) {
+            state.circuitRecordSuccessPermit(circuit_permit);
+        } else {
+            state.recordProxyUpstreamSuccess(cfg, selection_base_url, circuit_permit);
+        }
+    }
+}
+
 /// Why a request took the bounded buffered path instead of streaming (#139).
 /// Every reason is recorded as a metric label and a debug log line so operators
 /// can tell whether a given large transfer actually streamed.
@@ -671,27 +703,17 @@ pub fn handleLocationProxyPass(
                 "",
                 transcript_redactions,
             );
-            if (absolute_proxy_target) {
-                if (streamed.status_code >= 500 or streamed.upstream_aborted) {
-                    state.circuitRecordFailurePermit(circuit_permit);
-                } else if (!streamed.local_capacity_aborted) {
-                    state.circuitRecordSuccessPermit(circuit_permit);
-                } else {
-                    state.circuitReleasePermit(circuit_permit);
-                }
-            } else {
-                // A relay truncated by local buffer capacity is not evidence
-                // about the origin, so it is neither a failure nor a success
-                // for health purposes (#140).
-                if (streamed.local_capacity_aborted) {
-                    state.circuitReleasePermit(circuit_permit);
-                    state.logger.warn(correlation_id, "streaming relay truncated: local proxy buffer capacity exhausted", .{});
-                } else if (streamed.status_code >= 500 or streamed.upstream_aborted) {
-                    state.recordProxyUpstreamFailure(cfg, selection.base_url, circuit_permit);
-                } else {
-                    state.recordProxyUpstreamSuccess(cfg, selection.base_url, circuit_permit);
-                }
-            }
+            recordStreamingProxyOutcome(
+                state,
+                cfg,
+                selection.base_url,
+                absolute_proxy_target,
+                circuit_permit,
+                streamed.status_code,
+                streamed.upstream_aborted,
+                streamed.local_capacity_aborted,
+                correlation_id,
+            );
             // `tardigrade_proxy_upstream_aborts_total` means "aborted by the
             // origin". A truncation this proxy caused by running out of buffer
             // capacity is not that, and counting it there would misattribute
@@ -1303,6 +1325,45 @@ test "ProductionBufferedProxyAttemptExecutor keeps absolute target failures out 
 
     try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
     try std.testing.expect(state.circuitTryAcquirePermit() == null);
+}
+
+test "streaming absolute target local capacity abort releases circuit permit first" {
+    const allocator = std.testing.allocator;
+    var state: GatewayState = undefined;
+    state.allocator = allocator;
+    state.upstream_mutex = .{};
+    state.circuit_mutex = .{};
+    state.metrics_mutex = .{};
+    state.metrics = http.metrics.Metrics.init();
+    state.logger = http.logger.Logger.init(.err, "test");
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 30_000 });
+    state.upstream_health = std.StringHashMap(gs.UpstreamHealth).init(allocator);
+    defer {
+        var it = state.upstream_health.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        state.upstream_health.deinit();
+    }
+
+    const permit = state.circuitTryAcquirePermit() orelse return error.TestExpectedOrdinaryPermit;
+    var cfg: edge_config.EdgeConfig = undefined;
+    cfg.upstream_max_fails = 1;
+    cfg.upstream_fail_timeout_ms = 60_000;
+
+    recordStreamingProxyOutcome(
+        &state,
+        &cfg,
+        "http://configured.example",
+        true,
+        permit,
+        200,
+        true,
+        true,
+        "test-correlation",
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
+    try std.testing.expectEqualStrings("closed", state.circuitStateName());
+    try std.testing.expect(state.circuitTryAcquirePermit() != null);
 }
 
 const Early425RetryHarnessResult = struct {

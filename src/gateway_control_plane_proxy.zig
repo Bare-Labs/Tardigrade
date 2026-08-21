@@ -8,6 +8,7 @@
 //! work can replace the current bounded-buffer compatibility executor.
 
 const compat = @import("zig_compat");
+const builtin = @import("builtin");
 const std = @import("std");
 const http = @import("http.zig");
 const edge_config = @import("edge_config.zig");
@@ -48,6 +49,7 @@ pub fn controlPlaneBufferedResponseLimit(cfg: *const edge_config.EdgeConfig) usi
 
 fn controlPlaneAttemptErrorCountsAsUpstreamFailure(err: anyerror) bool {
     return switch (err) {
+        error.ControlPlaneResponseMaterializationFailed,
         error.OutOfMemory,
         error.UpstreamUntrusted,
         error.UpstreamAtCapacity,
@@ -73,6 +75,21 @@ fn recordControlPlaneProxyFailure(
         state.circuitRecordFailurePermit(permit);
     } else {
         state.recordProxyUpstreamFailure(cfg, upstream_base_url, permit);
+    }
+}
+
+fn recordControlPlaneProxyStatus(
+    state: *GatewayState,
+    cfg: *const edge_config.EdgeConfig,
+    upstream_base_url: []const u8,
+    absolute_target: bool,
+    permit: http.circuit_breaker.Permit,
+    status: u16,
+) void {
+    if (status >= 500) {
+        recordControlPlaneProxyFailure(state, cfg, upstream_base_url, absolute_target, permit);
+    } else {
+        recordControlPlaneProxySuccess(state, cfg, upstream_base_url, absolute_target, permit);
     }
 }
 
@@ -154,6 +171,7 @@ pub const ControlPlaneProxyResult = struct {
     set_cookie: ?[]u8,
     cacheable: bool,
     upstream_addr: []const u8,
+    accounted: bool = false,
 };
 
 pub const ControlPlaneProxyExecution = union(enum) {
@@ -387,7 +405,7 @@ pub fn executeBoundedControlPlaneJsonProxy(
                 absolute_proxy_target,
                 circuit_permit,
             ) catch |err| {
-                if (err == error.DownstreamWriteFailed) return err;
+                if (err == error.DownstreamWriteFailed or err == error.ControlPlaneResponseMaterializationFailed) return err;
                 if (controlPlaneAttemptErrorCountsAsUpstreamFailure(err)) {
                     recordControlPlaneProxyFailure(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit);
                 } else {
@@ -413,8 +431,10 @@ pub fn executeBoundedControlPlaneJsonProxy(
                 return exec;
             },
             .buffered => |res| {
+                if (!res.accounted) {
+                    recordControlPlaneProxyStatus(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit, res.status);
+                }
                 if (res.status >= 500) {
-                    recordControlPlaneProxyFailure(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit);
                     if (attempt + 1 < max_attempts) {
                         allocator.free(res.body);
                         allocator.free(res.content_type);
@@ -423,8 +443,6 @@ pub fn executeBoundedControlPlaneJsonProxy(
                         if (res.set_cookie) |cookie| allocator.free(cookie);
                         continue;
                     }
-                } else {
-                    recordControlPlaneProxySuccess(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit);
                 }
                 return exec;
             },
@@ -581,19 +599,16 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
         const upstream_reason = buffered_resp.reason;
         const upstream_content_type = buffered_resp.headerValue("Content-Type") orelse JSON_CONTENT_TYPE;
         const upstream_content_disposition = buffered_resp.headerValue("Content-Disposition");
+        recordControlPlaneProxyStatus(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit, status_code);
+        try maybeFailControlPlaneMaterializationAfterStatus();
         const upstream_location = if (buffered_resp.headerValue("Location")) |location|
-            try allocator.dupe(u8, location)
+            allocator.dupe(u8, location) catch return error.ControlPlaneResponseMaterializationFailed
         else
             null;
         errdefer if (upstream_location) |location| allocator.free(location);
         const cacheable = !bufferedUpstreamResponseHasNoStore(&buffered_resp);
         const stream_status = enable_streaming_success and (status_code == 200 or cfg.proxy_stream_all_statuses);
         if (stream_status) {
-            if (status_code >= 500) {
-                recordControlPlaneProxyFailure(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit);
-            } else {
-                recordControlPlaneProxySuccess(state, cfg, upstream_base_url, absolute_proxy_target, circuit_permit);
-            }
             writeStreamedUpstreamResponse(
                 downstream_writer,
                 status_code,
@@ -613,15 +628,15 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
         }
 
         if (status_code != 200) {
-            const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
+            const buffered_content_type = allocator.dupe(u8, upstream_content_type) catch return error.ControlPlaneResponseMaterializationFailed;
             errdefer allocator.free(buffered_content_type);
             const buffered_content_disposition = if (upstream_content_disposition) |cd|
-                try allocator.dupe(u8, cd)
+                allocator.dupe(u8, cd) catch return error.ControlPlaneResponseMaterializationFailed
             else
                 null;
             errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
             const buffered_set_cookie = if (sticky_set_cookie) |cookie|
-                try allocator.dupe(u8, cookie)
+                allocator.dupe(u8, cookie) catch return error.ControlPlaneResponseMaterializationFailed
             else
                 null;
             errdefer if (buffered_set_cookie) |cookie| allocator.free(cookie);
@@ -649,21 +664,22 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
                     .set_cookie = buffered_set_cookie,
                     .cacheable = false,
                     .upstream_addr = upstream_host,
+                    .accounted = true,
                 },
             };
         }
 
-        const body = try allocator.dupe(u8, buffered_resp.body);
+        const body = allocator.dupe(u8, buffered_resp.body) catch return error.ControlPlaneResponseMaterializationFailed;
         errdefer allocator.free(body);
-        const buffered_content_type = try allocator.dupe(u8, upstream_content_type);
+        const buffered_content_type = allocator.dupe(u8, upstream_content_type) catch return error.ControlPlaneResponseMaterializationFailed;
         errdefer allocator.free(buffered_content_type);
         const buffered_content_disposition = if (upstream_content_disposition) |cd|
-            try allocator.dupe(u8, cd)
+            allocator.dupe(u8, cd) catch return error.ControlPlaneResponseMaterializationFailed
         else
             null;
         errdefer if (buffered_content_disposition) |cd| allocator.free(cd);
         const buffered_set_cookie = if (sticky_set_cookie) |cookie|
-            try allocator.dupe(u8, cookie)
+            allocator.dupe(u8, cookie) catch return error.ControlPlaneResponseMaterializationFailed
         else
             null;
         errdefer if (buffered_set_cookie) |cookie| allocator.free(cookie);
@@ -690,9 +706,16 @@ fn executeBoundedControlPlaneJsonProxyAttempt(
                 .set_cookie = buffered_set_cookie,
                 .cacheable = cacheable,
                 .upstream_addr = upstream_host,
+                .accounted = true,
             },
         };
     }
+}
+
+var test_fail_control_plane_materialization_after_status: bool = false;
+
+fn maybeFailControlPlaneMaterializationAfterStatus() !void {
+    if (builtin.is_test and test_fail_control_plane_materialization_after_status) return error.ControlPlaneResponseMaterializationFailed;
 }
 
 test "control-plane buffered response limit is explicit and bounded" {
@@ -942,6 +965,103 @@ test "control-plane downstream streaming write failure records known 500 and nev
         FailingControlPlaneDownstreamWriter{},
         &state,
         true,
+        null,
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
+    try std.testing.expectEqualStrings("open", state.circuitStateName());
+    try std.testing.expect(state.circuitTryAcquirePermit() != null);
+}
+
+test "control-plane post-status materialization failure records known 200 and never retries" {
+    const allocator = std.testing.allocator;
+    var origin = try ControlPlaneTestOrigin.start(allocator, &.{ 200, 200 });
+    defer origin.stop();
+    try origin.run();
+
+    var state: GatewayState = undefined;
+    initControlPlaneProxyTestState(&state, allocator);
+    defer deinitControlPlaneProxyTestState(&state);
+    var cfg = initControlPlaneProxyTestConfig("http://configured.example");
+    cfg.upstream_retry_idempotent_only = false;
+    cfg.upstream_retry_attempts = 3;
+    const target = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api", .{origin.port()});
+    defer allocator.free(target);
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
+    state.circuitRecordFailurePermit(state.circuitTryAcquirePermit().?);
+
+    test_fail_control_plane_materialization_after_status = true;
+    defer test_fail_control_plane_materialization_after_status = false;
+    var body_buf: [1024]u8 = undefined;
+    var body_writer = compat.fixedBufferStream(&body_buf);
+    try std.testing.expectError(error.ControlPlaneResponseMaterializationFailed, executeBoundedControlPlaneJsonProxy(
+        allocator,
+        &cfg,
+        .global,
+        target,
+        null,
+        "{}",
+        "test-correlation",
+        "127.0.0.1",
+        null,
+        null,
+        null,
+        null,
+        null,
+        "localhost",
+        null,
+        body_writer.writer(),
+        &state,
+        false,
+        null,
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
+    try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
+    try std.testing.expectEqualStrings("closed", state.circuitStateName());
+}
+
+test "control-plane post-status materialization failure records known 500 and never retries" {
+    const allocator = std.testing.allocator;
+    var origin = try ControlPlaneTestOrigin.start(allocator, &.{ 500, 500 });
+    defer origin.stop();
+    try origin.run();
+
+    var state: GatewayState = undefined;
+    initControlPlaneProxyTestState(&state, allocator);
+    defer deinitControlPlaneProxyTestState(&state);
+    var cfg = initControlPlaneProxyTestConfig("http://configured.example");
+    cfg.upstream_retry_idempotent_only = false;
+    cfg.upstream_retry_attempts = 3;
+    const target = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api", .{origin.port()});
+    defer allocator.free(target);
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
+    state.circuitRecordFailurePermit(state.circuitTryAcquirePermit().?);
+
+    test_fail_control_plane_materialization_after_status = true;
+    defer test_fail_control_plane_materialization_after_status = false;
+    var body_buf: [1024]u8 = undefined;
+    var body_writer = compat.fixedBufferStream(&body_buf);
+    try std.testing.expectError(error.ControlPlaneResponseMaterializationFailed, executeBoundedControlPlaneJsonProxy(
+        allocator,
+        &cfg,
+        .global,
+        target,
+        null,
+        "{}",
+        "test-correlation",
+        "127.0.0.1",
+        null,
+        null,
+        null,
+        null,
+        null,
+        "localhost",
+        null,
+        body_writer.writer(),
+        &state,
+        false,
         null,
     ));
 
