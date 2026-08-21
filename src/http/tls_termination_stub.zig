@@ -115,6 +115,23 @@ pub const TlsTerminator = struct {
         if (!policy.http1_enabled and !policy.http2_enabled) return error.ProtocolConfigFailed;
     }
 
+    /// #629: no-op on this profile. The stub never constructs a live
+    /// terminator (`init` always fails closed), so there is nothing whose
+    /// identity-reload behavior could need suppressing; this exists only so
+    /// `edge_gateway.zig`'s unconditional mixed-owner wiring compiles
+    /// identically across profiles.
+    pub fn setIdentityReloadEnabled(self: *TlsTerminator, enabled: bool) void {
+        _ = self;
+        _ = enabled;
+    }
+
+    /// #629: no-op on this profile, matching `setIdentityReloadEnabled`.
+    pub fn currentCertificateDer(self: *TlsTerminator, allocator: std.mem.Allocator) TlsError!?[]u8 {
+        _ = self;
+        _ = allocator;
+        return null;
+    }
+
     pub fn accept(self: *TlsTerminator, fd: std.posix.fd_t) TlsError!TlsConnection {
         return self.acceptWithPolicy(fd, .{});
     }

@@ -2781,15 +2781,19 @@ fn sendHttp3CurlRequest(allocator: std.mem.Allocator, port: u16, path: []const u
 fn opensslPresentedSubject(allocator: std.mem.Allocator, port: u16, servername: []const u8) ![]u8 {
     const cmd = try std.fmt.allocPrint(
         allocator,
-        "openssl s_client -connect {s}:{d} -servername {s} -showcerts </dev/null 2>/dev/null | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | openssl x509 -noout -subject",
+        // `-nameopt compat`: forces the stable, space-free "CN=value" subject
+        // rendering across OpenSSL versions/distros, rather than whatever
+        // the locally-linked OpenSSL's default `-nameopt` (which varies
+        // between "CN=value" and "CN = value") happens to produce.
+        "openssl s_client -connect {s}:{d} -servername {s} -alpn http/1.1 -showcerts </dev/null 2>/dev/null | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | openssl x509 -noout -subject -nameopt compat",
         .{ test_host, port, servername },
     );
     defer allocator.free(cmd);
 
-    const run_res = try std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
+    const run_res = try std.process.run(std.heap.page_allocator, compat.io(), .{
         .argv = &.{ "sh", "-lc", cmd },
-        .max_output_bytes = 1024 * 1024,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
     });
     defer std.heap.page_allocator.free(run_res.stderr);
 
@@ -8972,14 +8976,21 @@ test "rotation.persistent.certificate_binding_change" {
 // above uses), not TCP.
 //
 // Bundles a credential swap with a broken ticket-key candidate in the same
-// SIGHUP: `gateway_shutdown.hotReloadConfig` calls
-// `native_credentials.prepareReloadFromFiles` (which genuinely reads and
-// validates credential B here, since the general profile has no appliance-
-// only path/name credential-change guard to reject it first) *before* the
-// ticket-key reload step, but only calls `commitPreparedReload` *after* it
-// succeeds. The ticket-key step here is made to fail, so the prepared
-// credential B is discarded (via `hotReloadConfig`'s own `defer`) and the
-// live provider never sees it.
+// SIGHUP. This composition -- TLS files configured, so `edge_gateway.zig`
+// also constructs the OpenSSL-adapter `TlsTerminator` for TCP/H1 alongside
+// `native_credentials` for H3 -- is a mixed OpenSSL-TCP/native-HTTP3 build
+// (#629): since `TARDIGRADE_TLS_CERT_PATH`/`_KEY_PATH` are unchanged (only
+// the file *content* at that path changes, from A's bytes to B's),
+// `hotReloadConfig`'s `nativeCredentialPathsChanged` comparator sees no
+// change and doesn't reject outright, but `mixed_credential_owners` being
+// true also means `native_credentials.prepareReloadFromFiles` is never
+// called at all here (skipped, not called-then-discarded) -- #629 made
+// same-path content changes inert for this composition specifically so H3
+// can never silently diverge from stable TCP. The ticket-key step, which
+// runs independently of that guard, still fails on the broken candidate and
+// rejects the whole reload, so the observable outcome (previous ticket
+// state and served credential both unchanged) matches what this test always
+// asserted; only the internal mechanism changed.
 //
 // Verifies, against the real external ngtcp2/GnuTLS peer, not merely
 // Tardigrade's own report of itself: (1) the previous ticket state is
@@ -9112,6 +9123,186 @@ test "rotation.persistent.quic_credential_reload_atomicity" {
     defer metrics.deinit();
     try expectMetricAtLeast(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"quic\"", "outcome=\"accepted\"" }, 1);
     try std.testing.expectEqual(@as(u64, 0), prometheusLabeledMetricValue(metrics.body, "tardigrade_tls_resumption_outcome_total", &.{ "transport=\"quic\"", "outcome=\"incompatible\"" }) orelse 0);
+}
+
+// #629: real-process companion to the gateway_shutdown.zig unit tests'
+// rejection coverage. Those prove the whole reload is rejected when
+// `TLS_CERT_PATH`/`TLS_KEY_PATH`/SNI *configuration* changes; this proves
+// the two remaining review-required cases the unit tests cannot reach on
+// their own (a from-scratch `hotReloadConfig` call that proceeds to success
+// hangs in a bare `zig test` context for reasons unrelated to #629 -- see
+// that file's comments): (1) an unrelated, ordinarily-reloadable field still
+// takes effect when both TLS surfaces are live and their shared configured
+// path is unchanged, and (2) an invalid same-path credential-file
+// replacement cannot partially publish to either surface -- because
+// `mixed_credential_owners` being true means `hotReloadConfig` never even
+// attempts to read the native H3 credential files here, not merely that a
+// read failed and was discarded.
+//
+// Named under the `rotation.` prefix (not a bare `hotReloadConfig ...` name)
+// so `zig build test-integration-resumption-interop` -- the required
+// general-profile CI job that already provisions the external ngtcp2/GnuTLS
+// H3 peer -- actually exercises it; the generic `test-integration` step is
+// not a required PR check. H3 identity is verified the same way
+// `rotation.persistent.quic_credential_reload_atomicity` above proves it:
+// a resumed connection's auth-binding check only succeeds if the served
+// credential is unchanged, since `gtlsclient` doesn't expose the negotiated
+// leaf certificate directly (see that test's own doc comment) -- a direct
+// external proof H3 never picked up the invalid same-path replacement, not
+// an inference from the accepted reload alone.
+test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload" {
+    try requireGeneralTlsProfile();
+    const allocator = std.testing.allocator;
+    try requireOpensslEd25519(allocator);
+    const client_path = try requireNgtcp2Client(allocator);
+    defer allocator.free(client_path);
+
+    // Both stable TCP and native HTTP/3 are constructed from this exact
+    // same configured path (matching `edge_gateway.run()`'s production
+    // wiring), so they start on the same identity by construction and this
+    // is a genuine mixed OpenSSL-TCP/native-HTTP3 composition. A throwaway
+    // generated identity, not a checked-in fixture, since this test
+    // overwrites the file content in place below.
+    var cred_a = try generateAlternateServerCert(allocator, quic_interop_server_name);
+    defer cred_a.deinit();
+
+    const first_responses = [_]UpstreamResponseSpec{.{ .body = "first-location" }};
+    const second_responses = [_]UpstreamResponseSpec{.{ .body = "second-location" }};
+    var first_upstream = try UpstreamServer.start(allocator, &first_responses);
+    defer first_upstream.stop();
+    try first_upstream.run();
+    var second_upstream = try UpstreamServer.start(allocator, &second_responses);
+    defer second_upstream.stop();
+    try second_upstream.run();
+
+    const initial_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /dynamic/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, first_upstream.port() });
+    defer allocator.free(initial_config);
+
+    const quic_port = try findFreeUdpPort();
+    const quic_port_str = try std.fmt.allocPrint(allocator, "{d}", .{quic_port});
+    defer allocator.free(quic_port_str);
+
+    // The external H3 peer sends SNI for `quic_interop_server_name`; without
+    // registering that hostname in the native SNI provider, unknown SNI fails
+    // closed and the initial handshake never gets past `NoApplicableCredential`
+    // (see the sibling `rotation.persistent.quic_credential_reload_atomicity`
+    // fixture above, which sets this for the same reason).
+    const sni_certs = try quicSniCertsEnv(allocator, cred_a.cert_path, cred_a.key_path);
+    defer allocator.free(sni_certs);
+
+    var tardigrade = try TardigradeProcess.start(allocator, .{
+        .config_text = initial_config,
+        .ready_https_insecure = true,
+        .ready_path = "/healthz",
+        .extra_env = &.{
+            .{ .name = "TARDIGRADE_TLS_CERT_PATH", .value = cred_a.cert_path },
+            .{ .name = "TARDIGRADE_TLS_KEY_PATH", .value = cred_a.key_path },
+            .{ .name = "TARDIGRADE_TLS_SERVER_NAME", .value = quic_interop_server_name },
+            .{ .name = "TARDIGRADE_TLS_SNI_CERTS", .value = sni_certs },
+            // Ephemeral (not persistent) resumption keys are enough here:
+            // that state is process-owned and untouched by `hotReloadConfig`
+            // regardless of #629, so a SIGHUP can't rotate it out from under
+            // this test either way -- only a resumable ticket is needed to
+            // prove the credential binding below.
+            .{ .name = "TARDIGRADE_TLS_NATIVE_RESUMPTION_MODE", .value = "stateless" },
+            .{ .name = "TARDIGRADE_HTTP3_ENABLED", .value = "true" },
+            .{ .name = "TARDIGRADE_QUIC_PORT", .value = quic_port_str },
+        },
+    });
+    defer tardigrade.stop();
+
+    // TCP is genuinely serving identity A over a real handshake before any
+    // reload.
+    const subject_before = try opensslPresentedSubject(allocator, tardigrade.port, quic_interop_server_name);
+    defer allocator.free(subject_before);
+    try assertContains(subject_before, quic_interop_server_name);
+
+    var first_response = try sendCurlRequest(allocator, tardigrade.port, .{ .path = "/dynamic/test", .insecure = true });
+    defer first_response.deinit();
+    try assertContains(first_response.body, "first-location");
+
+    const sess_path = try ngtcp2SessionPath(allocator, quic_port, "mixed-identity-reload");
+    defer allocator.free(sess_path);
+    defer compat.cwd().deleteFile(sess_path) catch {};
+    const tp_path = try ngtcp2TpPath(allocator, quic_port, "mixed-identity-reload");
+    defer allocator.free(tp_path);
+    defer compat.cwd().deleteFile(tp_path) catch {};
+
+    // 1: a real full QUIC/TLS 1.3 handshake under credential A, capturing a
+    // resumable ticket.
+    var first = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/healthz",
+        .session_file = sess_path,
+        .tp_file = tp_path,
+        .wait_for_ticket = true,
+    });
+    defer first.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
+    if (std.mem.indexOf(u8, first.stderr, "[:status: 200]") == null) {
+        std.debug.print("rotation.mixed_identity: first gtlsclient outcome={any} stderr={s}\n", .{ first.outcome, first.stderr });
+    }
+    try assertContains(first.stderr, "[:status: 200]");
+
+    // 2: overwrite the *same* configured cert/key path with unparsable
+    // bytes -- not even a different valid identity -- and change an
+    // unrelated, ordinarily-reloadable field, in the same SIGHUP.
+    try compat.cwd().writeFile(.{ .sub_path = cred_a.cert_path, .data = "not a certificate\n" });
+    try compat.cwd().writeFile(.{ .sub_path = cred_a.key_path, .data = "not a key\n" });
+    const updated_config = try std.fmt.allocPrint(allocator,
+        \\location = /healthz {{
+        \\    return 200 alive;
+        \\}}
+        \\location /dynamic/ {{
+        \\    proxy_pass http://{s}:{d};
+        \\}}
+    , .{ test_host, second_upstream.port() });
+    defer allocator.free(updated_config);
+    try tardigrade.rewriteConfig(updated_config);
+    tardigrade.sendSignal(std.posix.SIG.HUP);
+    compat.sleepNs(300 * std.time.ns_per_ms);
+
+    // 3: the reload as a whole succeeded -- the credential portion was
+    // never touched at all (skipped by `mixed_credential_owners`), not
+    // merely attempted and rejected -- and the unrelated field took effect.
+    var status = try sendCurlRequest(allocator, tardigrade.port, .{ .path = "/tardigrade/reload/status", .insecure = true });
+    defer status.deinit();
+    try assertContains(status.body, "\"ok\":true");
+
+    var second_response = try sendCurlRequest(allocator, tardigrade.port, .{ .path = "/dynamic/test", .insecure = true });
+    defer second_response.deinit();
+    try assertContains(second_response.body, "second-location");
+
+    // 4: TCP is still serving identity A over a real handshake.
+    const subject_after = try opensslPresentedSubject(allocator, tardigrade.port, quic_interop_server_name);
+    defer allocator.free(subject_after);
+    try assertContains(subject_after, quic_interop_server_name);
+
+    // 5: reconnect with the pre-reload session/ticket over the real H3/QUIC
+    // path. A resumed connection is only possible if the served credential
+    // is still what it was before the SIGHUP -- a direct, external proof
+    // that H3 never picked up the invalid same-path replacement either.
+    var second = try runGtlsClient(allocator, client_path, .{
+        .quic_port = quic_port,
+        .path = "/healthz",
+        .session_file = sess_path,
+        .tp_file = tp_path,
+        .disable_early_data = true,
+    });
+    defer second.deinit(allocator);
+    try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(second.outcome));
+    if (std.mem.indexOf(u8, second.stderr, "[:status: 200]") == null) {
+        std.debug.print("rotation.mixed_identity: second gtlsclient outcome={any} stderr={s}\n", .{ second.outcome, second.stderr });
+    }
+    try assertContains(second.stderr, "[:status: 200]");
+    try assertGtlsSessionReused(allocator, second.stderr);
 }
 
 /// #369: `TARDIGRADE_SOAK_HEAVY=1` scales `soak.reconnect_resumption` up
