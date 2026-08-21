@@ -544,6 +544,8 @@ fn minimalHttp3ProxyConfig(blocks: []http.location_router.LocationBlock) edge_co
 
 fn initHttp3ProxyTestState(state: *GatewayState, allocator: std.mem.Allocator, add_headers: []const edge_config.EdgeConfig.HeaderPair) void {
     initHandlerTestState(state, allocator, add_headers);
+    state.circuit_mutex = .{};
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{});
     state.upstream_mutex = .{};
     state.upstream_health = std.StringHashMap(gs.UpstreamHealth).init(allocator);
     state.upstream_active_requests = std.StringHashMap(usize).init(allocator);
@@ -1841,21 +1843,22 @@ fn recordHttp3ProxyOutcome(
     selection_base_url: []const u8,
     absolute_target: bool,
     status_code: u16,
+    permit: http.circuit_breaker.Permit,
 ) void {
     if (status_code >= 500) {
         if (absolute_target) {
-            state.circuitRecordFailure();
+            state.circuitRecordFailurePermit(permit);
         } else {
-            state.recordProxyUpstreamFailure(cfg, selection_base_url);
+            state.recordProxyUpstreamFailure(cfg, selection_base_url, permit);
         }
     } else if (status_code != @intFromEnum(http.Status.too_early)) {
         if (absolute_target) {
-            state.circuitRecordSuccess();
+            state.circuitRecordSuccessPermit(permit);
         } else {
-            state.recordProxyUpstreamSuccess(cfg, selection_base_url);
+            state.recordProxyUpstreamSuccess(cfg, selection_base_url, permit);
         }
     } else {
-        state.circuitReleaseProbe();
+        state.circuitReleasePermit(permit);
     }
 }
 
@@ -1878,6 +1881,7 @@ const Http3BufferedProxyAttemptExecutor = struct {
     absolute_target: bool,
     budget_start_ms: u64,
     last_attempt_start_ms: u64 = 0,
+    circuit_permit: ?http.circuit_breaker.Permit = null,
 
     pub fn recordEarlyUpstream425Action(
         self: *Http3BufferedProxyAttemptExecutor,
@@ -1910,7 +1914,9 @@ const Http3BufferedProxyAttemptExecutor = struct {
         forward_early_data: bool,
     ) !gproxy_runtime.DataPlaneProxyResponse {
         _ = attempt;
-        if (!self.state.circuitTryAcquire()) return error.CircuitOpen;
+        if (self.circuit_permit == null) {
+            self.circuit_permit = self.state.circuitTryAcquirePermit() orelse return error.CircuitOpen;
+        }
         const per_attempt_timeout_ms = try self.perAttemptTimeoutMs();
         self.state.recordUpstreamAttemptStart(self.selection_base_url);
         self.last_attempt_start_ms = http.event_loop.monotonicMs();
@@ -1960,7 +1966,29 @@ const Http3BufferedProxyAttemptExecutor = struct {
     }
 
     pub fn releaseCircuitProbe(self: *Http3BufferedProxyAttemptExecutor) void {
-        self.state.circuitReleaseProbe();
+        const permit = self.circuit_permit orelse return;
+        self.state.circuitReleasePermit(permit);
+        self.circuit_permit = null;
+    }
+
+    fn recordCircuitFailure(self: *Http3BufferedProxyAttemptExecutor) void {
+        const permit = self.circuit_permit orelse return;
+        if (self.absolute_target) {
+            self.state.circuitRecordFailurePermit(permit);
+        } else {
+            self.state.recordProxyUpstreamFailure(self.cfg, self.selection_base_url, permit);
+        }
+        self.circuit_permit = null;
+    }
+
+    fn recordCircuitSuccess(self: *Http3BufferedProxyAttemptExecutor) void {
+        const permit = self.circuit_permit orelse return;
+        if (self.absolute_target) {
+            self.state.circuitRecordSuccessPermit(permit);
+        } else {
+            self.state.recordProxyUpstreamSuccess(self.cfg, self.selection_base_url, permit);
+        }
+        self.circuit_permit = null;
     }
 
     pub fn onTerminalAttemptError(
@@ -1968,13 +1996,9 @@ const Http3BufferedProxyAttemptExecutor = struct {
         err: anyerror,
     ) !void {
         if (gproxy_runtime.proxyAttemptErrorCountsAsUpstreamFailure(err)) {
-            if (self.absolute_target) {
-                self.state.circuitRecordFailure();
-            } else {
-                self.state.recordProxyUpstreamFailure(self.cfg, self.selection_base_url);
-            }
+            self.recordCircuitFailure();
         } else {
-            self.state.circuitReleaseProbe();
+            self.releaseCircuitProbe();
         }
     }
 
@@ -2028,11 +2052,7 @@ const Http3BufferedProxyAttemptExecutor = struct {
         max_attempts: usize,
         result: *gproxy_runtime.DataPlaneProxyResponse,
     ) !void {
-        if (self.absolute_target) {
-            self.state.circuitRecordFailure();
-        } else {
-            self.state.recordProxyUpstreamFailure(self.cfg, self.selection_base_url);
-        }
+        self.recordCircuitFailure();
         self.state.logger.warn(self.correlation_id, "h3 proxy attempt {d}/{d} got {d}, retrying", .{ configured_attempt_index + 1, max_attempts, result.statusCode() });
         self.state.metricsReleaseProxyBufferedBytes(result.bodyLen());
         result.deinit(self.allocator);
@@ -2056,6 +2076,7 @@ const Http3Early425ProxyContinuation = struct {
     absolute_target: bool,
     budget_start_ms: u64,
     last_attempt_start_ms: u64 = 0,
+    circuit_permit: ?http.circuit_breaker.Permit = null,
     transport_early: bool,
     test_execute_ctx: ?*anyopaque = null,
     test_execute_fn: ?*const fn (?*anyopaque, *Http3Early425ProxyContinuation, u32, bool) anyerror!gproxy_runtime.DataPlaneProxyResponse = null,
@@ -2107,6 +2128,7 @@ const Http3Early425ProxyContinuation = struct {
             .selection_base_url = executor.selection_base_url,
             .absolute_target = executor.absolute_target,
             .budget_start_ms = executor.budget_start_ms,
+            .circuit_permit = executor.circuit_permit,
             .transport_early = executor.request.transport_early,
         };
         return plan;
@@ -2143,10 +2165,12 @@ const Http3Early425ProxyContinuation = struct {
     }
 
     fn execute(self: *Http3Early425ProxyContinuation, per_attempt_timeout_ms: u32, forward_early_data: bool) !gproxy_runtime.DataPlaneProxyResponse {
+        if (self.circuit_permit == null) {
+            self.circuit_permit = self.state.circuitTryAcquirePermit() orelse return error.CircuitOpen;
+        }
         if (self.test_execute_fn) |test_execute| {
             return test_execute(self.test_execute_ctx, self, per_attempt_timeout_ms, forward_early_data);
         }
-        if (!self.state.circuitTryAcquire()) return error.CircuitOpen;
         self.state.recordUpstreamAttemptStart(self.selection_base_url);
         self.last_attempt_start_ms = http.event_loop.monotonicMs();
         const resp = executeBufferedDataPlaneProxyRequest(
@@ -2203,19 +2227,27 @@ const Http3Early425ProxyContinuation = struct {
                 }
                 self.state.metricsRecordEarlyDataRetry(.failure);
                 if (err == error.ProxyBudgetExhausted or err == error.RequestCancelled) {
-                    if (err == error.ProxyBudgetExhausted) self.state.circuitReleaseProbe();
+                    const permit = self.circuit_permit;
+                    if (err == error.ProxyBudgetExhausted) {
+                        if (permit) |p| self.state.circuitReleasePermit(p);
+                        self.circuit_permit = null;
+                    }
                     if (err == error.RequestCancelled) {
-                        if (self.absolute_target) {
-                            self.state.circuitRecordFailure();
-                        } else {
-                            self.state.recordProxyUpstreamFailure(&self.cfg_snapshot, self.selection_base_url);
+                        if (permit) |p| {
+                            if (self.absolute_target) {
+                                self.state.circuitRecordFailurePermit(p);
+                            } else {
+                                self.state.recordProxyUpstreamFailure(&self.cfg_snapshot, self.selection_base_url, p);
+                            }
+                            self.circuit_permit = null;
                         }
                     }
                     try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .gateway_timeout, "upstream_timeout", "Upstream request timed out", self.correlation_id);
                     return;
                 }
                 if (err == error.UpstreamAtCapacity) {
-                    self.state.circuitReleaseProbe();
+                    if (self.circuit_permit) |p| self.state.circuitReleasePermit(p);
+                    self.circuit_permit = null;
                     try rejectHttp3ProxyErrorWithState(allocator, response, self.state, .service_unavailable, "upstream_saturated", "Upstream connection limit reached", self.correlation_id);
                     return;
                 }
@@ -2224,17 +2256,23 @@ const Http3Early425ProxyContinuation = struct {
                     return;
                 }
                 if (err == error.OutOfMemory) {
-                    self.state.circuitReleaseProbe();
+                    if (self.circuit_permit) |p| self.state.circuitReleasePermit(p);
+                    self.circuit_permit = null;
                     return error.OutOfMemory;
                 }
+                const permit = self.circuit_permit;
                 if (gproxy_runtime.proxyAttemptErrorCountsAsUpstreamFailure(err)) {
-                    if (self.absolute_target) {
-                        self.state.circuitRecordFailure();
-                    } else {
-                        self.state.recordProxyUpstreamFailure(&self.cfg_snapshot, self.selection_base_url);
+                    if (permit) |p| {
+                        if (self.absolute_target) {
+                            self.state.circuitRecordFailurePermit(p);
+                        } else {
+                            self.state.recordProxyUpstreamFailure(&self.cfg_snapshot, self.selection_base_url, p);
+                        }
+                        self.circuit_permit = null;
                     }
                 } else {
-                    self.state.circuitReleaseProbe();
+                    if (permit) |p| self.state.circuitReleasePermit(p);
+                    self.circuit_permit = null;
                 }
                 const err_status: http.Status = switch (err) {
                     error.Timeout, error.TimedOut, error.WouldBlock => .gateway_timeout,
@@ -2255,7 +2293,10 @@ const Http3Early425ProxyContinuation = struct {
             } else {
                 self.state.metricsRecordEarlyDataRetry(.success);
             }
-            recordHttp3ProxyOutcome(self.state, &self.cfg_snapshot, self.selection_base_url, self.absolute_target, upstream_response.statusCode());
+            if (self.circuit_permit) |permit| {
+                recordHttp3ProxyOutcome(self.state, &self.cfg_snapshot, self.selection_base_url, self.absolute_target, upstream_response.statusCode(), permit);
+                self.circuit_permit = null;
+            }
             try applyHttp3ProxyResponse(allocator, response, self.state, &upstream_response, self.correlation_id);
             return;
         }
@@ -2340,7 +2381,10 @@ fn handleHttp3LocationProxyPass(
     };
     defer upstream_response.deinit(allocator);
     defer ctx.state.metricsReleaseProxyBufferedBytes(upstream_response.bodyLen());
-    recordHttp3ProxyOutcome(ctx.state, ctx.cfg, ctx.cfg.upstream_base_url, absolute_target, upstream_response.statusCode());
+    if (attempt_executor.circuit_permit) |permit| {
+        recordHttp3ProxyOutcome(ctx.state, ctx.cfg, ctx.cfg.upstream_base_url, absolute_target, upstream_response.statusCode(), permit);
+        attempt_executor.circuit_permit = null;
+    }
     try applyHttp3ProxyResponse(allocator, response, ctx.state, &upstream_response, correlation_id);
 }
 
@@ -2622,7 +2666,7 @@ test "recordHttp3ProxyOutcome keeps absolute target failures out of passive heal
     cfg.upstream_max_fails = 1;
     cfg.upstream_fail_timeout_ms = 60_000;
 
-    recordHttp3ProxyOutcome(&state, &cfg, cfg.upstream_base_url, true, 500);
+    recordHttp3ProxyOutcome(&state, &cfg, cfg.upstream_base_url, true, 500, .ordinary);
 
     try std.testing.expectEqual(@as(usize, 0), state.upstreamUnhealthyCount());
     try std.testing.expect(!state.circuitTryAcquire());
@@ -3251,7 +3295,7 @@ test "h3 proxy parked early 425 forwards second 425 without third delivery" {
     try std.testing.expect(std.mem.find(u8, prom, "tardigrade_http_early_data_retry_total{result=\"too_early\"} 1") != null);
 }
 
-test "h3 proxy parked early 425 treats stale ordinary retry as transparent" {
+test "h3 proxy parked early 425 carries half-open permit across stale retry" {
     const allocator = std.testing.allocator;
     var origin = try H3ProxyOrigin.start(allocator, &.{425});
     defer origin.stop();
@@ -3276,6 +3320,8 @@ test "h3 proxy parked early 425 treats stale ordinary retry as transparent" {
     var state: GatewayState = undefined;
     initHttp3ProxyTestState(&state, allocator, &.{});
     defer deinitHttp3ProxyTestState(&state);
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 0, .half_open_successes = 1 });
+    state.circuitRecordFailurePermit(.ordinary);
     var dispatch_ctx = Http3DispatchContext{
         .config_store = &config_store,
         .cfg = &cfg,
@@ -3302,6 +3348,8 @@ test "h3 proxy parked early 425 treats stale ordinary retry as transparent" {
     try std.testing.expectError(error.Http3RequestParked, handleHttp3Request(allocator, &request, &first_response, &dispatch_ctx));
     try std.testing.expectEqual(@as(usize, 1), origin.requestCount());
     try std.testing.expect(origin.requestContains(0, "\r\nEarly-Data: 1\r\n"));
+    try std.testing.expectEqualStrings("half-open", state.circuitStateName());
+    try std.testing.expect(!state.circuitTryAcquire());
 
     var continuation = capture.take();
     defer continuation.deinit(allocator);
@@ -3331,6 +3379,7 @@ test "h3 proxy parked early 425 treats stale ordinary retry as transparent" {
     try std.testing.expect(execute_script.timeouts_ms.items[1] <= execute_script.timeouts_ms.items[0]);
     try std.testing.expectEqual(original_budget_start_ms, plan.budget_start_ms);
     try std.testing.expectEqual(@as(usize, 0), state.upstream_health.count());
+    try std.testing.expectEqualStrings("closed", state.circuitStateName());
 
     const prom = try state.metrics.toPrometheus(allocator);
     defer allocator.free(prom);
@@ -3362,6 +3411,7 @@ test "h3 proxy parked early 425 records failure after stale recovery exhausts" {
     var state: GatewayState = undefined;
     initHttp3ProxyTestState(&state, allocator, &.{});
     defer deinitHttp3ProxyTestState(&state);
+    state.circuit_breaker = http.circuit_breaker.CircuitBreaker.init(.{ .threshold = 1, .timeout_ms = 30_000 });
     var dispatch_ctx = Http3DispatchContext{
         .config_store = &config_store,
         .cfg = &cfg,
@@ -3411,7 +3461,8 @@ test "h3 proxy parked early 425 records failure after stale recovery exhausts" {
     try std.testing.expectEqual(@as(u16, 502), @intFromEnum(resumed_response.status));
     try std.testing.expectEqual(@as(usize, 3), execute_script.calls);
     try std.testing.expectEqualSlices(bool, &.{ false, false, false }, execute_script.forward_early_data.items);
-    try std.testing.expectEqual(@as(usize, 1), state.upstream_health.count());
+    try std.testing.expectEqual(@as(usize, 0), state.upstream_health.count());
+    try std.testing.expect(!state.circuitTryAcquire());
 
     const prom = try state.metrics.toPrometheus(allocator);
     defer allocator.free(prom);

@@ -326,7 +326,7 @@ pub fn executeBoundedControlPlaneJsonProxy(
         else
             null;
         defer if (sticky_set_cookie) |cookie| allocator.free(cookie);
-        if (!state.circuitTryAcquire()) return error.CircuitOpen;
+        const circuit_permit = state.circuitTryAcquirePermit() orelse return error.CircuitOpen;
         state.recordUpstreamAttemptStart(upstream_base_url);
         const exec = blk: {
             defer state.recordUpstreamAttemptEnd(upstream_base_url);
@@ -354,9 +354,9 @@ pub fn executeBoundedControlPlaneJsonProxy(
                 sticky_set_cookie,
             ) catch |err| {
                 if (controlPlaneAttemptErrorCountsAsUpstreamFailure(err)) {
-                    state.recordProxyUpstreamFailure(cfg, upstream_base_url);
+                    state.recordProxyUpstreamFailure(cfg, upstream_base_url, circuit_permit);
                 } else {
-                    state.circuitReleaseProbe();
+                    state.circuitReleasePermit(circuit_permit);
                 }
                 last_err = err;
                 if (attempt + 1 < max_attempts) {
@@ -369,15 +369,15 @@ pub fn executeBoundedControlPlaneJsonProxy(
         switch (exec) {
             .streamed_status => |streamed| {
                 if (streamed.status >= 500) {
-                    state.recordProxyUpstreamFailure(cfg, upstream_base_url);
+                    state.recordProxyUpstreamFailure(cfg, upstream_base_url, circuit_permit);
                 } else {
-                    state.recordProxyUpstreamSuccess(cfg, upstream_base_url);
+                    state.recordProxyUpstreamSuccess(cfg, upstream_base_url, circuit_permit);
                 }
                 return exec;
             },
             .buffered => |res| {
                 if (res.status >= 500) {
-                    state.recordProxyUpstreamFailure(cfg, upstream_base_url);
+                    state.recordProxyUpstreamFailure(cfg, upstream_base_url, circuit_permit);
                     if (attempt + 1 < max_attempts) {
                         allocator.free(res.body);
                         allocator.free(res.content_type);
@@ -387,7 +387,7 @@ pub fn executeBoundedControlPlaneJsonProxy(
                         continue;
                     }
                 } else {
-                    state.recordProxyUpstreamSuccess(cfg, upstream_base_url);
+                    state.recordProxyUpstreamSuccess(cfg, upstream_base_url, circuit_permit);
                 }
                 return exec;
             },

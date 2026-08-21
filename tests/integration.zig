@@ -4507,6 +4507,7 @@ test "proxy.circuit_breaker_opens_fast_fails_and_recovers" {
         .{ .status_code = 500, .body = "fail-1", .connection_header = "close" },
         .{ .status_code = 500, .body = "fail-2", .connection_header = "close" },
         .{ .status_code = 200, .body = "recovered", .delay_ms = 3_000, .connection_header = "close" },
+        .{ .status_code = 200, .body = "closed-again", .connection_header = "close" },
     });
     defer upstream.stop();
     try upstream.run();
@@ -4589,6 +4590,12 @@ test "proxy.circuit_breaker_opens_fast_fails_and_recovers" {
     try std.testing.expectEqual(@as(u8, 1), ok_count);
     try std.testing.expectEqual(@as(u8, 1), open_count);
     try std.testing.expectEqual(@as(u32, 3), upstream.requestCount());
+
+    var after_probe = try sendRequest(allocator, tardigrade.port, .{ .method = "GET", .path = "/cb", .body = null, .headers = &.{} });
+    defer after_probe.deinit();
+    try std.testing.expectEqual(@as(u16, 200), after_probe.status_code);
+    try assertContains(after_probe.body, "closed-again");
+    try std.testing.expectEqual(@as(u32, 4), upstream.requestCount());
 }
 
 test "interop.openssl.h2.proxy_request_translation_is_secret_safe" {

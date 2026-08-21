@@ -1382,27 +1382,43 @@ pub const GatewayState = struct {
     }
 
     pub fn circuitTryAcquire(self: *GatewayState) bool {
+        return self.circuitTryAcquirePermit() != null;
+    }
+
+    pub fn circuitTryAcquirePermit(self: *GatewayState) ?http.circuit_breaker.Permit {
         self.circuit_mutex.lock();
         defer self.circuit_mutex.unlock();
-        return self.circuit_breaker.tryAcquire();
+        return self.circuit_breaker.tryAcquirePermit();
     }
 
     pub fn circuitRecordFailure(self: *GatewayState) void {
+        self.circuitRecordFailurePermit(.ordinary);
+    }
+
+    pub fn circuitRecordFailurePermit(self: *GatewayState, permit: http.circuit_breaker.Permit) void {
         self.circuit_mutex.lock();
         defer self.circuit_mutex.unlock();
-        self.circuit_breaker.recordFailure();
+        self.circuit_breaker.recordFailurePermit(permit);
     }
 
     pub fn circuitRecordSuccess(self: *GatewayState) void {
+        self.circuitRecordSuccessPermit(.ordinary);
+    }
+
+    pub fn circuitRecordSuccessPermit(self: *GatewayState, permit: http.circuit_breaker.Permit) void {
         self.circuit_mutex.lock();
         defer self.circuit_mutex.unlock();
-        self.circuit_breaker.recordSuccess();
+        self.circuit_breaker.recordSuccessPermit(permit);
     }
 
     pub fn circuitReleaseProbe(self: *GatewayState) void {
+        self.circuitReleasePermit(.ordinary);
+    }
+
+    pub fn circuitReleasePermit(self: *GatewayState, permit: http.circuit_breaker.Permit) void {
         self.circuit_mutex.lock();
         defer self.circuit_mutex.unlock();
-        self.circuit_breaker.releaseProbe();
+        self.circuit_breaker.releasePermit(permit);
     }
 
     pub fn circuitStateName(self: *GatewayState) []const u8 {
@@ -2443,14 +2459,14 @@ pub const GatewayState = struct {
         self.updateUpstreamHealthMetricLocked();
     }
 
-    pub fn recordProxyUpstreamFailure(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
+    pub fn recordProxyUpstreamFailure(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, permit: http.circuit_breaker.Permit) void {
         self.recordUpstreamFailure(cfg, upstream_base_url);
-        self.circuitRecordFailure();
+        self.circuitRecordFailurePermit(permit);
     }
 
-    pub fn recordProxyUpstreamSuccess(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8) void {
+    pub fn recordProxyUpstreamSuccess(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, permit: http.circuit_breaker.Permit) void {
         self.recordUpstreamSuccess(cfg, upstream_base_url);
-        self.circuitRecordSuccess();
+        self.circuitRecordSuccessPermit(permit);
     }
 
     pub fn recordActiveProbeResult(self: *GatewayState, cfg: *const edge_config.EdgeConfig, upstream_base_url: []const u8, healthy: bool) void {
@@ -3799,9 +3815,9 @@ test "gateway circuit breaker recovers through a half-open probe" {
 
     gs.circuitRecordFailure();
     // timeout_ms = 0 → the next acquire admits one probe in half-open state.
-    try std.testing.expect(gs.circuitTryAcquire());
+    const permit = gs.circuitTryAcquirePermit() orelse return error.TestExpectedHalfOpenPermit;
     try std.testing.expectEqualStrings("half-open", gs.circuitStateName());
-    gs.circuitRecordSuccess();
+    gs.circuitRecordSuccessPermit(permit);
     try std.testing.expectEqualStrings("closed", gs.circuitStateName());
 }
 
@@ -3819,9 +3835,9 @@ test "gateway proxy outcome accounting drives live circuit breaker" {
     try std.testing.expect(gs.circuitTryAcquire());
     try std.testing.expectEqualStrings("closed", gs.circuitStateName());
 
-    gs.recordProxyUpstreamFailure(&cfg, "http://origin.example");
+    gs.recordProxyUpstreamFailure(&cfg, "http://origin.example", .ordinary);
     try std.testing.expect(gs.circuitTryAcquire());
-    gs.recordProxyUpstreamFailure(&cfg, "http://origin.example");
+    gs.recordProxyUpstreamFailure(&cfg, "http://origin.example", .ordinary);
 
     try std.testing.expect(!gs.circuitTryAcquire());
     try std.testing.expectEqualStrings("open", gs.circuitStateName());
