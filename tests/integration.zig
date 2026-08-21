@@ -9237,6 +9237,9 @@ test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload
     });
     defer first.deinit(allocator);
     try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(first.outcome));
+    if (std.mem.indexOf(u8, first.stderr, "[:status: 200]") == null) {
+        std.debug.print("rotation.mixed_identity: first gtlsclient outcome={any} stderr={s}\n", .{ first.outcome, first.stderr });
+    }
     try assertContains(first.stderr, "[:status: 200]");
 
     // 2: overwrite the *same* configured cert/key path with unparsable
@@ -9286,6 +9289,9 @@ test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload
     });
     defer second.deinit(allocator);
     try std.testing.expectEqual(std.meta.Tag(bounded_process.Outcome).normal_exit, std.meta.activeTag(second.outcome));
+    if (std.mem.indexOf(u8, second.stderr, "[:status: 200]") == null) {
+        std.debug.print("rotation.mixed_identity: second gtlsclient outcome={any} stderr={s}\n", .{ second.outcome, second.stderr });
+    }
     try assertContains(second.stderr, "[:status: 200]");
     try assertGtlsSessionReused(allocator, second.stderr);
 }
