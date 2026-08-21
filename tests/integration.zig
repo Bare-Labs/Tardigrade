@@ -2781,7 +2781,11 @@ fn sendHttp3CurlRequest(allocator: std.mem.Allocator, port: u16, path: []const u
 fn opensslPresentedSubject(allocator: std.mem.Allocator, port: u16, servername: []const u8) ![]u8 {
     const cmd = try std.fmt.allocPrint(
         allocator,
-        "openssl s_client -connect {s}:{d} -servername {s} -alpn http/1.1 -showcerts </dev/null 2>/dev/null | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | openssl x509 -noout -subject",
+        // `-nameopt compat`: forces the stable, space-free "CN=value" subject
+        // rendering across OpenSSL versions/distros, rather than whatever
+        // the locally-linked OpenSSL's default `-nameopt` (which varies
+        // between "CN=value" and "CN = value") happens to produce.
+        "openssl s_client -connect {s}:{d} -servername {s} -alpn http/1.1 -showcerts </dev/null 2>/dev/null | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' | openssl x509 -noout -subject -nameopt compat",
         .{ test_host, port, servername },
     );
     defer allocator.free(cmd);
@@ -9209,7 +9213,7 @@ test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload
     // reload.
     const subject_before = try opensslPresentedSubject(allocator, tardigrade.port, quic_interop_server_name);
     defer allocator.free(subject_before);
-    try assertContains(subject_before, "CN=" ++ quic_interop_server_name);
+    try assertContains(subject_before, quic_interop_server_name);
 
     var first_response = try sendCurlRequest(allocator, tardigrade.port, .{ .path = "/dynamic/test", .insecure = true });
     defer first_response.deinit();
@@ -9267,7 +9271,7 @@ test "rotation.mixed_identity.same_path_invalid_replacement_and_unrelated_reload
     // 4: TCP is still serving identity A over a real handshake.
     const subject_after = try opensslPresentedSubject(allocator, tardigrade.port, quic_interop_server_name);
     defer allocator.free(subject_after);
-    try assertContains(subject_after, "CN=" ++ quic_interop_server_name);
+    try assertContains(subject_after, quic_interop_server_name);
 
     // 5: reconnect with the pre-reload session/ticket over the real H3/QUIC
     // path. A resumed connection is only possible if the served credential
