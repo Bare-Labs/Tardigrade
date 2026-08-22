@@ -1590,8 +1590,11 @@ fn testUpstreamHandshakeProtocol(
     defer {
         if (server_fd_open) _ = std.c.close(fds[1]);
     }
-    try testSetSocketTimeoutMs(fds[0], 1_000);
-    try testSetSocketTimeoutMs(fds[1], 1_000);
+    // GitHub's ARM runners can stall a native OpenSSL socketpair handshake
+    // long enough for a 1s test timeout to surface as SSL_connect failure
+    // before the ALPN policy assertion is reached.
+    try testSetSocketTimeoutMs(fds[0], 5_000);
+    try testSetSocketTimeoutMs(fds[1], 5_000);
 
     var accept_ctx = ServerAcceptContext{ .terminator = &terminator, .fd = fds[1], .accept_policy = opts.server_accept_policy };
     const thread = try std.Thread.spawn(.{}, serverAcceptThread, .{&accept_ctx});
