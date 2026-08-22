@@ -17,6 +17,7 @@ const Scenario = enum {
     static_304_conditional,
     proxy_keepalive_warm,
     proxy_header_heavy_response,
+    mixed_route_selection,
     rejected_overload,
 
     fn name(self: Scenario) []const u8 {
@@ -25,6 +26,7 @@ const Scenario = enum {
             .static_304_conditional => "static-304-conditional",
             .proxy_keepalive_warm => "proxy-keepalive-warm",
             .proxy_header_heavy_response => "proxy-header-heavy-response",
+            .mixed_route_selection => "mixed-route-selection",
             .rejected_overload => "rejected-overload",
         };
     }
@@ -53,14 +55,22 @@ const Scenario = enum {
                 .max_bytes_per_request = 512,
                 .rationale = "warm keepalive proxy helper work owns resolved target strings; forwarded headers remain stack-backed",
             },
-            // Header-heavy streamed responses intentionally borrow parsed
-            // upstream header slices and format the downstream response head
-            // into caller-owned output. Retaining these slices past response
-            // serialization would be a lifetime bug, not a pooling target.
+            // Header-heavy buffered responses allocate filtered upstream
+            // metadata in the same arena-backed production parser used by the
+            // proxy path; response serialization then writes through
+            // caller-owned output.
             .proxy_header_heavy_response => .{
+                .max_allocations_per_request = 16,
+                .max_bytes_per_request = 2048,
+                .rationale = "header-heavy buffered proxy response parsing owns filtered metadata in an arena; serialization writes through caller-owned buffers",
+            },
+            // Location matching reads process/config-owned route metadata and
+            // returns borrowed slices. A request workspace would be the wrong
+            // owner for these references.
+            .mixed_route_selection => .{
                 .max_allocations_per_request = 0,
                 .max_bytes_per_request = 0,
-                .rationale = "header-heavy proxy response rewrite borrows upstream header slices and writes through caller-owned buffers",
+                .rationale = "mixed route selection borrows immutable config-owned location blocks and allocates no request memory",
             },
             // Rejections are not the steady-state success path; JSON payload and
             // response headers are intentionally allocated for clear client errors.
@@ -229,7 +239,7 @@ pub fn main() !void {
     try stdout.flush();
 }
 
-fn collectResults(allocator: std.mem.Allocator, requests: usize) ![5]ScenarioResult {
+fn collectResults(allocator: std.mem.Allocator, requests: usize) ![6]ScenarioResult {
     var fixture = try StaticFixture.init(allocator);
     defer fixture.deinit(allocator);
 
@@ -243,6 +253,7 @@ fn collectResults(allocator: std.mem.Allocator, requests: usize) ![5]ScenarioRes
         try measureScenario(allocator, requests, .static_304_conditional, &fixture),
         try measureScenario(allocator, requests, .proxy_keepalive_warm, &fixture),
         try measureScenario(allocator, requests, .proxy_header_heavy_response, &fixture),
+        try measureScenario(allocator, requests, .mixed_route_selection, &fixture),
         try measureScenario(allocator, requests, .rejected_overload, &fixture),
     };
 }
@@ -256,7 +267,8 @@ fn measureScenario(allocator: std.mem.Allocator, requests: usize, scenario: Scen
             .static_tiny_file_warm => try runStaticTiny(fixture, measured_allocator),
             .static_304_conditional => try runStaticNotModified(fixture, measured_allocator),
             .proxy_keepalive_warm => try runProxyKeepaliveWarm(measured_allocator),
-            .proxy_header_heavy_response => try runProxyHeaderHeavyResponse(),
+            .proxy_header_heavy_response => try runProxyHeaderHeavyResponse(measured_allocator),
+            .mixed_route_selection => try runMixedRouteSelection(),
             .rejected_overload => try runRejectedOverload(measured_allocator),
         }
     }
@@ -327,22 +339,100 @@ fn runProxyKeepaliveWarm(allocator: std.mem.Allocator) !void {
     if (extra_headers.items.len != 4) return error.ProxyKeepaliveHeaderAssemblyFailed;
 }
 
-fn runProxyHeaderHeavyResponse() !void {
-    const upstream_headers = [_]std.http.Header{
-        .{ .name = "Content-Type", .value = "application/json" },
-        .{ .name = "Cache-Control", .value = "private, max-age=60" },
-        .{ .name = "ETag", .value = "\"allocation-regression-143\"" },
-        .{ .name = "X-App-Version", .value = "2026.08.21" },
-        .{ .name = "X-Trace-Region", .value = "iad" },
-        .{ .name = "Connection", .value = "keep-alive" },
-        .{ .name = "Server", .value = "origin-test" },
-        .{ .name = "X-Powered-By", .value = "origin-framework" },
-        .{ .name = "Set-Cookie", .value = "sid=abc; HttpOnly; SameSite=Lax" },
-        .{ .name = "Vary", .value = "Accept-Encoding" },
-    };
+fn runProxyHeaderHeavyResponse(allocator: std.mem.Allocator) !void {
+    var parsed = try gp.parseBufferedUpstreamResponse(allocator, "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Cache-Control: private, max-age=60\r\n" ++
+        "ETag: \"allocation-regression-143\"\r\n" ++
+        "X-App-Version: 2026.08.21\r\n" ++
+        "X-Trace-Region: iad\r\n" ++
+        "Connection: keep-alive\r\n" ++
+        "Server: origin-test\r\n" ++
+        "X-Powered-By: origin-framework\r\n" ++
+        "Set-Cookie: sid=abc; HttpOnly; SameSite=Lax\r\n" ++
+        "Vary: Accept-Encoding\r\n" ++
+        "\r\n" ++
+        "{\"ok\":true}\n");
+    defer parsed.deinit(allocator);
+    if (parsed.headerValue("Connection") != null) return error.ProxyHeaderHeavyLeakedHopByHopHeader;
+    if (parsed.headerValue("Server") != null) return error.ProxyHeaderHeavyLeakedDisclosureHeader;
+    if (parsed.headerValue("X-Powered-By") != null) return error.ProxyHeaderHeavyLeakedDisclosureHeader;
 
     const security = http.security_headers.SecurityHeaders.default;
     var buf: [4096]u8 = undefined;
+    var stream = compat.fixedBufferStream(&buf);
+    try gpr.writeBufferedUpstreamResponse(
+        stream.writer(),
+        parsed,
+        true,
+        "tg-1778460305668-bfebecb410803023",
+        &security,
+        null,
+        "tg_sticky=proxy; Path=/; HttpOnly",
+    );
+    const out = stream.getWritten();
+    if (std.mem.find(u8, out, "X-App-Version: 2026.08.21\r\n") == null) return error.ProxyHeaderHeavyMissingForwardedHeader;
+    if (std.mem.find(u8, out, "X-Powered-By: origin-framework\r\n") != null) return error.ProxyHeaderHeavyLeakedDisclosureHeader;
+    if (std.mem.find(u8, out, "Set-Cookie: tg_sticky=proxy; Path=/; HttpOnly\r\n") == null) return error.ProxyHeaderHeavyMissingStickyCookie;
+    if (std.mem.find(u8, out, "{\"ok\":true}\n") == null) return error.ProxyHeaderHeavyMissingBody;
+}
+
+fn runMixedRouteSelection() !void {
+    const blocks = [_]http.location_router.LocationBlock{
+        .{
+            .match_type = .prefix,
+            .pattern = "/",
+            .priority = 10,
+            .action = .{ .static_root = .{ .root = "/srv/www", .alias = false, .autoindex = false, .index = "index.html", .try_files = "$uri" } },
+        },
+        .{
+            .match_type = .prefix,
+            .pattern = "/api/",
+            .priority = 4,
+            .action = .{ .proxy_pass = "http://127.0.0.1:3000" },
+        },
+        .{
+            .match_type = .prefix_priority,
+            .pattern = "/api/private/",
+            .priority = 1,
+            .action = .{ .return_response = .{ .status = 403, .body = "forbidden" } },
+        },
+        .{
+            .match_type = .exact,
+            .pattern = "/status/metrics",
+            .priority = 0,
+            .action = .{ .return_response = .{ .status = 200, .body = "metrics" } },
+        },
+        .{
+            .match_type = .regex,
+            .pattern = "^/assets/.+\\.css$",
+            .priority = 8,
+            .action = .{ .static_root = .{ .root = "/srv/assets", .alias = false, .autoindex = false, .index = "", .try_files = "$uri" } },
+        },
+    };
+
+    const exact = http.location_router.matchLocation("/status/metrics?format=prom", &blocks) orelse return error.MixedRouteSelectionMissedExact;
+    if (exact.index != 3) return error.MixedRouteSelectionWrongExact;
+
+    const priority = http.location_router.matchLocation("/api/private/users", &blocks) orelse return error.MixedRouteSelectionMissedPriority;
+    if (priority.index != 2) return error.MixedRouteSelectionWrongPriority;
+
+    const regex = http.location_router.matchLocation("/assets/site.css?v=1", &blocks) orelse return error.MixedRouteSelectionMissedRegex;
+    if (regex.index != 4) return error.MixedRouteSelectionWrongRegex;
+
+    const prefix = http.location_router.matchLocation("/api/users", &blocks) orelse return error.MixedRouteSelectionMissedPrefix;
+    if (prefix.index != 1) return error.MixedRouteSelectionWrongPrefix;
+}
+
+fn runProxyStreamedHeaderSerializer() !void {
+    const upstream_headers = [_]std.http.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Connection", .value = "keep-alive" },
+        .{ .name = "X-App-Version", .value = "2026.08.21" },
+    };
+
+    const security = http.security_headers.SecurityHeaders.default;
+    var buf: [2048]u8 = undefined;
     var stream = compat.fixedBufferStream(&buf);
     try gpr.writeStreamedUpstreamResponseHeadFromHeaders(
         stream.writer(),
@@ -358,8 +448,6 @@ fn runProxyHeaderHeavyResponse() !void {
     const out = stream.getWritten();
     if (std.mem.find(u8, out, "X-App-Version: 2026.08.21\r\n") == null) return error.ProxyHeaderHeavyMissingForwardedHeader;
     if (std.mem.find(u8, out, "Connection: keep-alive\r\n") != null) return error.ProxyHeaderHeavyLeakedHopByHopHeader;
-    if (std.mem.find(u8, out, "X-Powered-By: origin-framework\r\n") != null) return error.ProxyHeaderHeavyLeakedDisclosureHeader;
-    if (std.mem.find(u8, out, "Set-Cookie: tg_sticky=proxy; Path=/; HttpOnly\r\n") == null) return error.ProxyHeaderHeavyMissingStickyCookie;
 }
 
 fn runRejectedOverload(allocator: std.mem.Allocator) !void {
@@ -465,4 +553,9 @@ test "allocation benchmark report exposes per-request counters" {
     try std.testing.expect(std.mem.find(u8, out, "\"static-tiny-file-warm\"") != null);
     try std.testing.expect(std.mem.find(u8, out, "\"proxy-keepalive-warm\"") != null);
     try std.testing.expect(std.mem.find(u8, out, "\"proxy-header-heavy-response\"") != null);
+    try std.testing.expect(std.mem.find(u8, out, "\"mixed-route-selection\"") != null);
+}
+
+test "streamed proxy response header serializer filters borrowed headers without allocation" {
+    try runProxyStreamedHeaderSerializer();
 }

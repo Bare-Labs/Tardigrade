@@ -110,7 +110,8 @@ Current debug budgets:
 | `static-tiny-file-warm` | 14 | 1024 | File-backed warm static responses allocate normalized path metadata, ETag, and Last-Modified strings; file bytes stay out of heap. |
 | `static-304-conditional` | 14 | 1024 | Conditional static hits follow the same path and validator allocation shape, but avoid response-body bytes. |
 | `proxy-keepalive-warm` | 6 | 512 | Warm proxy keep-alive helper work owns resolved target strings while forwarded header assembly stays stack-backed. |
-| `proxy-header-heavy-response` | 0 | 0 | Header-heavy streamed proxy response rewriting borrows upstream header slices and formats into caller-owned output; hop-by-hop and disclosure headers are filtered without heap ownership. |
+| `proxy-header-heavy-response` | 16 | 2048 | Header-heavy buffered proxy response parsing owns filtered metadata in an arena; serialization writes through caller-owned buffers. |
+| `mixed-route-selection` | 0 | 0 | Mixed route selection borrows immutable config-owned location blocks and allocates no request memory. |
 | `rejected-overload` | 12 | 1024 | This intentionally allocating path builds a structured JSON error and response header copies before closing the request. |
 
 Large streamed proxy-response allocation checks belong with live throughput and

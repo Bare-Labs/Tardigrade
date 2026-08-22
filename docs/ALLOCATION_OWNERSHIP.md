@@ -17,25 +17,79 @@ measurements do not justify a broad request arena.
 | `proxy-keepalive-warm` | 6.00 | 410.00 | 239 |
 | `rejected-overload` | 12.00 | 716.00 | 407 |
 
-The audit adds `proxy-header-heavy-response` to cover upstream response header
-filtering and downstream response-head assembly. That path has a zero-allocation
-budget because it borrows parsed upstream header slices and writes to a
-caller-owned output buffer. The after run reported:
+The audit adds two deterministic harness rows:
+
+- `proxy-header-heavy-response` routes allocation-capable production parsing
+  through the counting allocator, then serializes the filtered response through
+  caller-owned output. This makes the arena-owned response metadata observable
+  instead of relying on an allocator-free serializer alone.
+- `mixed-route-selection` covers request-metadata-heavy location matching over
+  process/config-owned route blocks. It has a zero-allocation budget because
+  `matchLocation` returns borrowed slices into immutable config.
+
+The after run reported:
 
 | Scenario | Allocations/request | Bytes/request | Peak live bytes |
 | --- | ---: | ---: | ---: |
 | `static-tiny-file-warm` | 13.00 | 779.00 | 311 |
 | `static-304-conditional` | 13.00 | 779.00 | 311 |
 | `proxy-keepalive-warm` | 6.00 | 410.00 | 239 |
-| `proxy-header-heavy-response` | 0.00 | 0.00 | 0 |
+| `proxy-header-heavy-response` | 4.00 | 1742.00 | 1742 |
+| `mixed-route-selection` | 0.00 | 0.00 | 0 |
 | `rejected-overload` | 12.00 | 716.00 | 407 |
 
 No reusable workspace or pool was introduced, so there is no workspace
 high-water mark, fallback count, or retained capacity contract to report.
-Because runtime behavior did not change beyond a deterministic benchmark guard,
-latency, CPU/request, RSS, and p99/p999 risk is unchanged from the current
-benchmark suite; future runtime reuse changes must record those rows when they
-alter allocation ownership.
+
+## Live Evidence
+
+Base and head release binaries were built from `main` and this branch and run on
+the same local macOS loopback host with PID sampling. These are local fallback
+rows, not canonical release-baseline numbers; they are included to record the
+latency/CPU/RSS shape for the ownership audit.
+
+CI-smoke command shape:
+
+```bash
+benchmarks/ci-smoke.sh --duration 5 --connections 4 --threads 1 --save <file>
+```
+
+| Scenario | Build | req/s | p99 ms | p999 ms | CPU % | Peak RSS MiB | Errors |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `static-http1` | base | 38147.35 | 0.284 | 3.228 | 285.11 | 4.94 | 0 |
+| `static-http1` | head | 42345.02 | 0.242 | 3.068 | 303.79 | 4.91 | 0 |
+| `proxy-http1` | base | 15011.66 | 0.934 | 2.823 | 116.20 | 5.27 | 0 |
+| `proxy-http1` | head | 15423.09 | 0.782 | 2.535 | 120.00 | 5.20 | 0 |
+| `keepalive` | base | 42553.87 | 0.230 | 3.143 | 302.97 | 5.28 | 0 |
+| `keepalive` | head | 39439.34 | 0.233 | 1.872 | 293.77 | 5.20 | 0 |
+
+Large streaming proxy command shape:
+
+```bash
+TARDIGRADE_PROXY_STREAMING_MODE=response \
+TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS=1 \
+benchmarks/run.sh --duration 5 --connections 2 --threads 1 \
+  --proxy-payload-1m-path /proxy/payload-1m.bin \
+  --proxy-slow-client-path /proxy/payload-16m.bin \
+  --slow-client-connections 2 \
+  --slow-client-limit-rate 2M \
+  --scenarios proxy-payload-1m,proxy-slow-client-download \
+  --pid <tardigrade-pid>
+```
+
+| Scenario | Build | req/s | p99 ms | p999 ms | CPU % | Peak RSS MiB | Errors |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `proxy-payload-1m` | base | 3263.47 | 0.865 | 3.292 | 472341.51 | 5.89 | 2 |
+| `proxy-payload-1m` | head | 3265.22 | 0.853 | 2.997 | 395236.62 | 6.14 | 2 |
+
+The 1 MiB row exercises the response-streaming proxy path with PID/RSS
+sampling. On this local fallback run, the benchmark driver reported two errors
+in both base and head, and the very short 5s macOS CPU sample produced
+unusable CPU percentages. The comparable p99/p999, throughput, and RSS rows are
+still recorded because they show no branch-specific ownership regression. The
+`proxy-slow-client-download` row was attempted with the same config, but the
+driver reported only `errors=2` with null latency/CPU/RSS for both builds, so it
+is not used as quantitative evidence.
 
 ## Ownership Inventory
 
@@ -46,6 +100,7 @@ alter allocation ownership.
 | Proxy target URL and optional query string | Request-owned | Freed before proxy dispatch helper completion, or by the request path before retry/keepalive state is released | Direct allocation is retained. These strings may be needed across retry/error handling for a single request but must not be retained by upstream connection pools. |
 | Forwarded request header vector | Worker/request scratch | `stackFallback` storage is released when header assembly returns; heap fallback is freed by `ArrayList.deinit` | Existing bounded stack fallback is the right reuse mechanism. The warm proxy scenario confirms forwarded headers remain stack-backed. |
 | Proxy trusted-identity derived header values | Request-owned | Freed with the request's owned header value list after upstream dispatch completes | Direct allocation is retained because values include per-request timestamp/signature material and cannot be shared with connection-owned pools. |
+| Mixed route selection and server/location matching | Process/config-owned metadata; borrowed request URI path | Matching returns before dispatch and does not allocate; matched route slices remain tied to the config snapshot | No request workspace. The `mixed-route-selection` harness row enforces zero request allocator churn for exact, prefix-priority, regex, and prefix selection. |
 | Buffered proxy response body | Request-owned, with aggregate proxy-buffer accounting | Released after downstream write completion, abort cleanup, or local capacity failure handling | Existing accounting and streaming fallback rules are the safety mechanism. Reusing this memory in a request arena would risk hiding retained bytes from proxy buffer limits. |
 | Streaming proxy relay buffers | Connection/stream-owned | Released when the streaming transfer completes, aborts, or the owning H2/H3 stream/connection closes | Must not move into request-reset memory. Backpressure queues and stream state can retain buffers after response headers are generated. |
 | Upstream connection pool entries | Connection-owned | Pool eviction, stale retry cleanup, or gateway shutdown | Not a request workspace candidate. Idle keepalive connections intentionally outlive individual requests. |
@@ -86,8 +141,7 @@ mechanisms match the actual owners:
 - direct allocations for rare rejection/error payloads and small request-local
   strings.
 
-The benchmark addition in `src/allocation_regression.zig` makes the
-header-heavy proxy response path explicit and enforces that response header
-filtering stays allocation-free. Any future workspace or pool should be added
-only when a measured scenario shows material allocator churn and the owner has a
-single reset boundary.
+The benchmark additions in `src/allocation_regression.zig` make header-heavy
+proxy response metadata ownership and mixed route selection explicit. Any future
+workspace or pool should be added only when a measured scenario shows material
+allocator churn and the owner has a single reset boundary.
