@@ -9,6 +9,8 @@ on:
       - "build.zig.zon"
       - "src/**"
       - "scripts/install-zig.sh"
+      - "scripts/install.sh"
+      - "scripts/test-install.sh"
       - "scripts/audit-release-binary.sh"
       - "scripts/package-release-archive.sh"
       - "packaging/**"
@@ -91,3 +93,6 @@ jobs:
           test -x "$extract_dir/tardi"
           test "$(readlink "$extract_dir/tardigrade")" = tardi
           "$extract_dir/tardi" version
+
+      - name: Smoke test installer path
+        run: ./scripts/test-install.sh
