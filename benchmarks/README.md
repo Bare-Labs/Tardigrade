@@ -111,7 +111,11 @@ Current debug budgets:
 | `static-304-conditional` | 14 | 1024 | Conditional static hits follow the same path and validator allocation shape, but avoid response-body bytes. |
 | `proxy-keepalive-warm` | 6 | 512 | Warm proxy keep-alive helper work owns resolved target strings while forwarded header assembly stays stack-backed. |
 | `proxy-header-heavy-response` | 16 | 2048 | Header-heavy buffered proxy response parsing owns filtered metadata in an arena; serialization writes through caller-owned buffers. |
-| `mixed-route-selection` | 12 | 1024 | Mixed route selection borrows config-owned location blocks; regex scratch is request-allocator-owned while POSIX `regcomp` remains an external libc boundary. |
+| `mixed-route-exact` | 0 | 0 | Exact route selection borrows config-owned location blocks and returns before regex evaluation. |
+| `mixed-route-priority` | 0 | 0 | Priority-prefix route selection borrows config-owned location blocks and returns before regex evaluation. |
+| `mixed-route-regex` | 12 | 1024 | Regex route selection borrows config-owned location blocks; regex scratch is request-allocator-owned while POSIX `regcomp` remains an external libc boundary. |
+| `mixed-route-prefix-after-regex` | 12 | 1024 | Plain-prefix route selection after a non-matching regex pays request-owned regex scratch before returning the borrowed prefix match. |
+| `h1-regex-route-arena-reset` | 4 | 4096 | Production-shaped H1 regex route scratch is retained by the request arena until request completion, then arena deinit releases backing storage. |
 | `rejected-overload` | 12 | 1024 | This intentionally allocating path builds a structured JSON error and response header copies before closing the request. |
 
 Large streamed proxy-response allocation checks belong with live throughput and

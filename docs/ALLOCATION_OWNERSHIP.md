@@ -17,17 +17,23 @@ measurements do not justify a broad request arena.
 | `proxy-keepalive-warm` | 6.00 | 410.00 | 239 |
 | `rejected-overload` | 12.00 | 716.00 | 407 |
 
-The audit adds two deterministic harness rows:
+The audit adds deterministic harness rows for header-heavy proxy parsing and
+route matching:
 
 - `proxy-header-heavy-response` routes allocation-capable production parsing
   through the counting allocator, then serializes the filtered response through
   caller-owned output. This makes the arena-owned response metadata observable
   instead of relying on an allocator-free serializer alone.
-- `mixed-route-selection` covers request-metadata-heavy location matching over
-  process/config-owned route blocks. It returns borrowed route slices, but regex
-  locations require request-owned scratch. This audit makes that Zig scratch
+- The four `mixed-route-*` rows cover one route lookup per reported request
+  class: exact match, priority prefix, regex match, and plain-prefix return
+  after a non-matching regex scan. They return borrowed route slices, but regex
+  evaluation requires request-owned Zig scratch. This audit makes that scratch
   allocator-aware and budgeted; POSIX `regcomp` may still allocate through libc
   outside the Zig allocator interface.
+- `h1-regex-route-arena-reset` models the production HTTP/1 request arena by
+  putting the counter under an arena, performing two regex route resolutions in
+  one request lifecycle, and asserting the backing allocator returns to zero
+  live bytes only after request-arena deinit.
 
 The after run reported:
 
@@ -37,17 +43,29 @@ The after run reported:
 | `static-304-conditional` | 13.00 | 779.00 | 311 |
 | `proxy-keepalive-warm` | 6.00 | 410.00 | 239 |
 | `proxy-header-heavy-response` | 4.00 | 1742.00 | 1742 |
-| `mixed-route-selection` | 8.00 | 356.00 | 146 |
+| `mixed-route-exact` | 0.00 | 0.00 | 0 |
+| `mixed-route-priority` | 0.00 | 0.00 | 0 |
+| `mixed-route-regex` | 4.00 | 181.00 | 146 |
+| `mixed-route-prefix-after-regex` | 4.00 | 175.00 | 146 |
+| `h1-regex-route-arena-reset` | 1.00 | 256.00 | 256 |
 | `rejected-overload` | 12.00 | 716.00 | 407 |
 
-For the newly added audit rows, `proxy-header-heavy-response` is comparable to
-base when the helper is applied there because it exercises existing buffered
-proxy response parsing. `mixed-route-selection` exposed a non-comparable base
-instrumentation gap: before this fix, regex matching used
-`std.heap.page_allocator`, so the harness could not observe Zig regex scratch at
-all. The head row above is the first allocator-visible budget for that route
-class; it records the now request-allocator-owned Zig scratch while still
-documenting the external libc `regcomp` boundary.
+The measurement-only header-heavy helper was also applied to a temporary
+`main` worktree, because it exercises existing buffered proxy parsing and does
+not depend on this branch's matcher changes:
+
+| Scenario | Build | Allocations/request | Bytes/request | Peak live bytes |
+| --- | --- | ---: | ---: | ---: |
+| `proxy-header-heavy-response` | base | 4.00 | 1742.00 | 1742 |
+| `proxy-header-heavy-response` | head | 4.00 | 1742.00 | 1742 |
+
+For mixed routing, base has an instrumentation boundary: before this fix, regex
+matching used `std.heap.page_allocator`, so the harness could not observe Zig
+regex scratch through the request allocator. The head route rows above are the
+first allocator-visible budgets for those request classes. Exact and
+priority-prefix requests still avoid regex scratch entirely; regex match and
+prefix-after-regex requests record the now request-allocator-owned Zig scratch
+while still documenting the external libc `regcomp` boundary.
 
 No reusable workspace or pool was introduced, so there is no workspace
 high-water mark, fallback count, or retained capacity contract to report.
@@ -73,6 +91,62 @@ benchmarks/ci-smoke.sh --duration 5 --connections 4 --threads 1 --save <file>
 | `proxy-http1` | head | 15423.09 | 0.782 | 2.535 | 120.00 | 5.20 | 0 |
 | `keepalive` | base | 42553.87 | 0.230 | 3.143 | 302.97 | 5.28 | 0 |
 | `keepalive` | head | 39439.34 | 0.233 | 1.872 | 293.77 | 5.20 | 0 |
+
+Regex route benchmark config:
+
+```nginx
+pid /tmp/issue143-regex-live-<build>/tardi.pid;
+listen <port>;
+metrics_path /status/metrics;
+
+location = /health {
+    return 200 ok;
+}
+
+location /regex/ {
+    proxy_pass http://127.0.0.1:<upstream-port>;
+}
+
+location ~ ^/regex/health$ {
+    proxy_pass http://127.0.0.1:<upstream-port>;
+}
+
+location ~ ^/assets/.+\.css$ {
+    proxy_pass http://127.0.0.1:<upstream-port>;
+}
+
+location /prefix/ {
+    proxy_pass http://127.0.0.1:<upstream-port>;
+}
+```
+
+Regex route benchmark command shape:
+
+```bash
+TARDIGRADE_RATE_LIMIT_RPS=0 \
+TARDIGRADE_MAX_REQUESTS_PER_CONNECTION=0 \
+TARDIGRADE_UPSTREAM_RETRY_ATTEMPTS=1 \
+./zig-out/bin/tardi run -c /tmp/issue143-regex-live-<build>/tardigrade.conf &
+pid=$!
+
+benchmarks/run.sh --duration 5 --connections 4 --threads 1 --tool wrk \
+  --scenarios proxy-http1 \
+  --proxy-path <path> \
+  --pid "$pid"
+```
+
+| Scenario | Build | Path | req/s | p99 ms | p999 ms | CPU % | Peak RSS MiB | Errors |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `regex-match` | base | `/regex/health` | 18912.18 | 5.261 | 14.807 | 133.20 | 5.52 | 0 |
+| `regex-match` | head | `/regex/health` | 22493.27 | 2.849 | 10.331 | 127.82 | 5.55 | 0 |
+| `prefix-after-regex` | base | `/prefix/health` | 23162.59 | 0.594 | 6.245 | 173.15 | 5.56 | 0 |
+| `prefix-after-regex` | head | `/prefix/health` | 24765.01 | 0.749 | 7.731 | 144.61 | 5.48 | 0 |
+
+These two rows exercise the runtime matcher branch changed by this audit. The
+`regex-match` path returns from the regex location. The `prefix-after-regex`
+path evaluates a non-matching regex first, then returns the borrowed plain
+prefix location. CPU is the benchmark runner's short macOS PID sample, so it is
+recorded as local fallback evidence rather than a canonical release baseline.
 
 Large streaming proxy server config:
 
@@ -137,7 +211,9 @@ is not used as quantitative evidence.
 | Proxy target URL and optional query string | Request-owned | Freed before proxy dispatch helper completion, or by the request path before retry/keepalive state is released | Direct allocation is retained. These strings may be needed across retry/error handling for a single request but must not be retained by upstream connection pools. |
 | Forwarded request header vector | Worker/request scratch | `stackFallback` storage is released when header assembly returns; heap fallback is freed by `ArrayList.deinit` | Existing bounded stack fallback is the right reuse mechanism. The warm proxy scenario confirms forwarded headers remain stack-backed. |
 | Proxy trusted-identity derived header values | Request-owned | Freed with the request's owned header value list after upstream dispatch completes | Direct allocation is retained because values include per-request timestamp/signature material and cannot be shared with connection-owned pools. |
-| Mixed route selection and server/location matching | Process/config-owned metadata plus request-owned regex scratch | Matching returns before dispatch; matched route slices remain tied to the config snapshot, while regex pattern/input scratch is freed before match return | Direct request-allocator scratch is retained for regex routes. The `mixed-route-selection` harness row records 8 allocations/356 bytes per request for the representative exact, prefix-priority, regex, and prefix sequence. POSIX `regcomp` remains an external libc allocation boundary; precompiled config-owned regexes are a future targeted optimization if regex-heavy routing becomes material. |
+| Exact and priority-prefix server/location matching | Process/config-owned metadata plus borrowed request URI path | Matching returns before dispatch; matched route slices remain tied to the config snapshot | No request workspace is needed. The `mixed-route-exact` and `mixed-route-priority` rows enforce zero request-allocator churn for the request classes that return before regex evaluation. |
+| H1 regex server/location matching | Process/config-owned metadata plus request-arena regex scratch | Logical regex scratch frees occur before match return, but the H1 request arena retains backing capacity until `handleConnection` request-arena deinit | Direct request-arena scratch is retained. The `mixed-route-regex` and `mixed-route-prefix-after-regex` rows record logical scratch churn for one matcher invocation/request class; `h1-regex-route-arena-reset` models two route resolutions in one H1 request and proves backing storage returns to zero live bytes only after request completion. POSIX `regcomp` remains an external libc allocation boundary; precompiled config-owned regexes are a future targeted optimization if regex-heavy routing becomes material. |
+| H2/H3 regex server/location matching | Allocator supplied by the H2/H3 dispatch path plus process/config-owned metadata | Reset follows the supplied allocator's owner, not the route matcher call itself | The matcher is allocator-aware, so H2/H3 callers account scratch against their dispatch allocator. They must not assume a universal match-scoped physical release boundary. |
 | Buffered proxy response body | Request-owned, with aggregate proxy-buffer accounting | Released after downstream write completion, abort cleanup, or local capacity failure handling | Existing accounting and streaming fallback rules are the safety mechanism. Reusing this memory in a request arena would risk hiding retained bytes from proxy buffer limits. |
 | HTTP/1 streaming relay buffer and response-head arena | Request/proxy-attempt-owned | Released when `streamProxyOverTransport` returns after body relay, abort cleanup, or local capacity failure handling | A request workspace must not reset at response-head generation because the relay buffer and parsed head arena live through the full streaming attempt. They may reset after the attempt completes. |
 | HTTP/2 stream receive queues and connection backpressure state | Stream/connection-owned | Queue drain, stream close/reset, connection close, or pool teardown | Never point these structures into request-reset memory. They can outlive a request-local header-generation phase and are independently accounted. |
@@ -182,6 +258,7 @@ mechanisms match the actual owners:
   strings.
 
 The benchmark additions in `src/allocation_regression.zig` make header-heavy
-proxy response metadata ownership and mixed route selection explicit. Any future
-workspace or pool should be added only when a measured scenario shows material
-allocator churn and the owner has a single reset boundary.
+proxy response metadata ownership, per-request route matcher classes, and the
+H1 request-arena reset boundary explicit. Any future workspace or pool should
+be added only when a measured scenario shows material allocator churn and the
+owner has a single reset boundary.
