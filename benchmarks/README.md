@@ -114,7 +114,7 @@ Current debug budgets:
 | `mixed-route-exact` | 0 | 0 | Exact route selection borrows config-owned location blocks and returns before regex evaluation. |
 | `mixed-route-priority` | 0 | 0 | Priority-prefix route selection borrows config-owned location blocks and returns before regex evaluation. |
 | `mixed-route-regex` | 12 | 1024 | Regex route selection borrows config-owned location blocks; regex scratch is request-allocator-owned while POSIX `regcomp` remains an external libc boundary. |
-| `mixed-route-prefix-after-regex` | 12 | 1024 | Plain-prefix route selection after a non-matching regex pays request-owned regex scratch before returning the borrowed prefix match. |
+| `mixed-route-prefix-after-regex` | 0 | 0 | Plain-prefix route selection after an anchored literal regex miss skips regex scratch and returns borrowed config-owned locations. |
 | `h1-regex-route-arena-reset` | 4 | 4096 | Production-shaped H1 regex route scratch is retained by the request arena until request completion, then arena deinit releases backing storage. |
 | `rejected-overload` | 12 | 1024 | This intentionally allocating path builds a structured JSON error and response header copies before closing the request. |
 

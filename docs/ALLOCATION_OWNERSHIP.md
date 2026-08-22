@@ -26,10 +26,11 @@ route matching:
   instead of relying on an allocator-free serializer alone.
 - The four `mixed-route-*` rows cover one route lookup per reported request
   class: exact match, priority prefix, regex match, and plain-prefix return
-  after a non-matching regex scan. They return borrowed route slices, but regex
-  evaluation requires request-owned Zig scratch. This audit makes that scratch
-  allocator-aware and budgeted; POSIX `regcomp` may still allocate through libc
-  outside the Zig allocator interface.
+  after an anchored literal regex miss. They return borrowed route slices, but
+  regex evaluation requires request-owned Zig scratch. This audit makes that
+  scratch allocator-aware and budgeted; anchored literal misses skip full regex
+  preparation before `regcomp`, and POSIX `regcomp` may still allocate through
+  libc outside the Zig allocator interface.
 - `h1-regex-route-arena-reset` models the production HTTP/1 request arena by
   putting the counter under an arena, performing two regex route resolutions in
   one request lifecycle, and asserting the backing allocator returns to zero
@@ -46,7 +47,7 @@ The after run reported:
 | `mixed-route-exact` | 0.00 | 0.00 | 0 |
 | `mixed-route-priority` | 0.00 | 0.00 | 0 |
 | `mixed-route-regex` | 4.00 | 181.00 | 146 |
-| `mixed-route-prefix-after-regex` | 4.00 | 175.00 | 146 |
+| `mixed-route-prefix-after-regex` | 0.00 | 0.00 | 0 |
 | `h1-regex-route-arena-reset` | 1.00 | 256.00 | 256 |
 | `rejected-overload` | 12.00 | 716.00 | 407 |
 
@@ -63,9 +64,11 @@ For mixed routing, base has an instrumentation boundary: before this fix, regex
 matching used `std.heap.page_allocator`, so the harness could not observe Zig
 regex scratch through the request allocator. The head route rows above are the
 first allocator-visible budgets for those request classes. Exact and
-priority-prefix requests still avoid regex scratch entirely; regex match and
-prefix-after-regex requests record the now request-allocator-owned Zig scratch
-while still documenting the external libc `regcomp` boundary.
+priority-prefix requests still avoid regex scratch entirely; anchored literal
+regex misses now skip full regex preparation before `regcomp`, so the
+prefix-after-regex row also stays at zero allocator churn. Regex matches record
+the now request-allocator-owned Zig scratch while still documenting the external
+libc `regcomp` boundary.
 
 No reusable workspace or pool was introduced, so there is no workspace
 high-water mark, fallback count, or retained capacity contract to report.
@@ -139,14 +142,35 @@ benchmarks/run.sh --duration 5 --connections 4 --threads 1 --tool wrk \
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `regex-match` | base | `/regex/health` | 18912.18 | 5.261 | 14.807 | 133.20 | 5.52 | 0 |
 | `regex-match` | head | `/regex/health` | 22493.27 | 2.849 | 10.331 | 127.82 | 5.55 | 0 |
-| `prefix-after-regex` | base | `/prefix/health` | 23162.59 | 0.594 | 6.245 | 173.15 | 5.56 | 0 |
-| `prefix-after-regex` | head | `/prefix/health` | 24765.01 | 0.749 | 7.731 | 144.61 | 5.48 | 0 |
 
-These two rows exercise the runtime matcher branch changed by this audit. The
-`regex-match` path returns from the regex location. The `prefix-after-regex`
-path evaluates a non-matching regex first, then returns the borrowed plain
-prefix location. CPU is the benchmark runner's short macOS PID sample, so it is
-recorded as local fallback evidence rather than a canonical release baseline.
+The `regex-match` path returns from the regex location and exercises the
+request-owned regex scratch path. The initial 5s `prefix-after-regex` sample
+showed noisy tail latency after moving scratch into the request allocator, so
+the matcher now performs a conservative anchored-literal prefix check before
+full regex preparation. A repeated run then measured the affected
+plain-prefix-after-nonmatching-regex shape with 5 independent 15s samples per
+build:
+
+```bash
+benchmarks/run.sh --duration 15 --connections 4 --threads 1 --tool wrk \
+  --scenarios proxy-http1 \
+  --proxy-path /prefix/health \
+  --pid "$pid" \
+  --save prefix-<build>-<run>.json
+```
+
+| Build | req/s median (min-max) | p99 ms median (min-max) | p999 ms median (min-max) | CPU % median (min-max) | Peak RSS MiB median (min-max) | Errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| base | 24553.11 (22252.61-25018.83) | 0.386 (0.348-0.619) | 3.177 (1.201-12.082) | 169.19 (160.03-170.09) | 5.09 (5.00-5.69) | 0 |
+| head | 24937.52 (23197.48-25110.12) | 0.456 (0.387-0.497) | 2.908 (1.636-65.429) | 146.02 (141.59-147.13) | 4.69 (4.59-5.39) | 0 |
+
+After the anchored-literal miss fast path, the deterministic allocation row for
+this shape is `0.00` allocations and `0.00` bytes per request. The repeated live
+run no longer reproduces the original p999 regression by median; p99 remains in
+the same local-run band with overlapping ranges, while throughput, sampled CPU,
+and RSS are neutral-to-better on head. CPU and p999 are still short local macOS
+PID/wrk samples and are recorded as fallback evidence rather than canonical
+release-baseline numbers.
 
 Large streaming proxy server config:
 
@@ -212,7 +236,7 @@ is not used as quantitative evidence.
 | Forwarded request header vector | Worker/request scratch | `stackFallback` storage is released when header assembly returns; heap fallback is freed by `ArrayList.deinit` | Existing bounded stack fallback is the right reuse mechanism. The warm proxy scenario confirms forwarded headers remain stack-backed. |
 | Proxy trusted-identity derived header values | Request-owned | Freed with the request's owned header value list after upstream dispatch completes | Direct allocation is retained because values include per-request timestamp/signature material and cannot be shared with connection-owned pools. |
 | Exact and priority-prefix server/location matching | Process/config-owned metadata plus borrowed request URI path | Matching returns before dispatch; matched route slices remain tied to the config snapshot | No request workspace is needed. The `mixed-route-exact` and `mixed-route-priority` rows enforce zero request-allocator churn for the request classes that return before regex evaluation. |
-| H1 regex server/location matching | Process/config-owned metadata plus request-arena regex scratch | Logical regex scratch frees occur before match return, but the H1 request arena retains backing capacity until `handleConnection` request-arena deinit | Direct request-arena scratch is retained. The `mixed-route-regex` and `mixed-route-prefix-after-regex` rows record logical scratch churn for one matcher invocation/request class; `h1-regex-route-arena-reset` models two route resolutions in one H1 request and proves backing storage returns to zero live bytes only after request completion. POSIX `regcomp` remains an external libc allocation boundary; precompiled config-owned regexes are a future targeted optimization if regex-heavy routing becomes material. |
+| H1 regex server/location matching | Process/config-owned metadata plus request-arena regex scratch | Logical regex scratch frees occur before match return, but the H1 request arena retains backing capacity until `handleConnection` request-arena deinit | Direct request-arena scratch is retained for actual regex evaluation. The `mixed-route-regex` row records logical scratch churn for one matcher invocation/request class, while `mixed-route-prefix-after-regex` proves an anchored literal miss can return the borrowed prefix match without request-allocator churn. `h1-regex-route-arena-reset` models two route resolutions in one H1 request and proves backing storage returns to zero live bytes only after request completion. POSIX `regcomp` remains an external libc allocation boundary; precompiled config-owned regexes are a future targeted optimization if regex-heavy routing becomes material. |
 | H2/H3 regex server/location matching | Allocator supplied by the H2/H3 dispatch path plus process/config-owned metadata | Reset follows the supplied allocator's owner, not the route matcher call itself | The matcher is allocator-aware, so H2/H3 callers account scratch against their dispatch allocator. They must not assume a universal match-scoped physical release boundary. |
 | Buffered proxy response body | Request-owned, with aggregate proxy-buffer accounting | Released after downstream write completion, abort cleanup, or local capacity failure handling | Existing accounting and streaming fallback rules are the safety mechanism. Reusing this memory in a request arena would risk hiding retained bytes from proxy buffer limits. |
 | HTTP/1 streaming relay buffer and response-head arena | Request/proxy-attempt-owned | Released when `streamProxyOverTransport` returns after body relay, abort cleanup, or local capacity failure handling | A request workspace must not reset at response-head generation because the relay buffer and parsed head arena live through the full streaming attempt. They may reset after the attempt completes. |

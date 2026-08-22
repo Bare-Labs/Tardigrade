@@ -89,11 +89,15 @@ const Scenario = enum {
             // allocation boundary; POSIX regcomp may still allocate internally
             // through libc.
             .mixed_route_regex,
-            .mixed_route_prefix_after_regex,
             => .{
                 .max_allocations_per_request = 12,
                 .max_bytes_per_request = 1024,
                 .rationale = "route selection borrows config-owned locations; regex scratch is request-allocator-owned while libc regcomp remains external",
+            },
+            .mixed_route_prefix_after_regex => .{
+                .max_allocations_per_request = 0,
+                .max_bytes_per_request = 0,
+                .rationale = "plain-prefix route selection after an anchored literal regex miss skips regex scratch and returns borrowed config-owned locations",
             },
             .h1_regex_route_arena_reset => .{
                 .max_allocations_per_request = 4,

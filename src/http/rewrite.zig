@@ -127,6 +127,8 @@ pub fn regexMatchesOptions(pattern: []const u8, input: []const u8, case_insensit
 }
 
 pub fn regexMatchesOptionsAlloc(allocator: std.mem.Allocator, pattern: []const u8, input: []const u8, case_insensitive: bool) bool {
+    if (anchoredLiteralPrefixCannotMatch(pattern, input, case_insensitive)) return false;
+
     var prepared = preparePattern(allocator, pattern) catch return false;
     defer prepared.deinit();
 
@@ -148,6 +150,29 @@ pub fn regexMatchesOptionsAlloc(allocator: std.mem.Allocator, pattern: []const u
     if (compile_rc != 0) return false;
     defer regfree(&regex);
     return regexec(&regex, input_z_ptr, 0, null, 0) == 0;
+}
+
+fn anchoredLiteralPrefixCannotMatch(pattern: []const u8, input: []const u8, case_insensitive: bool) bool {
+    const prefix = anchoredLiteralPrefix(pattern);
+    if (prefix.len == 0) return false;
+    if (input.len < prefix.len) return true;
+    const input_prefix = input[0..prefix.len];
+    if (!case_insensitive) return !std.mem.eql(u8, input_prefix, prefix);
+    return !std.ascii.eqlIgnoreCase(input_prefix, prefix);
+}
+
+fn anchoredLiteralPrefix(pattern: []const u8) []const u8 {
+    if (pattern.len < 2 or pattern[0] != '^') return "";
+    if (std.mem.indexOfScalar(u8, pattern, '|') != null) return "";
+    var end: usize = 1;
+    while (end < pattern.len) : (end += 1) {
+        switch (pattern[end]) {
+            '*', '?', '{' => return "",
+            '.', '[', ']', '(', ')', '}', '+', '$', '^', '\\' => break,
+            else => {},
+        }
+    }
+    return pattern[1..end];
 }
 
 pub fn evaluate(
@@ -376,6 +401,16 @@ test "regexMatches supports simple pattern" {
 test "regexMatchesOptions supports case-insensitive matches" {
     try std.testing.expect(regexMatchesOptions("^example\\.com$", "Example.COM", true));
     try std.testing.expect(!regexMatchesOptions("^example\\.com$", "Example.COM", false));
+}
+
+test "regexMatchesOptions skips anchored literal prefix misses" {
+    try std.testing.expect(anchoredLiteralPrefixCannotMatch("^/assets/.+\\.css$", "/prefix/health", false));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^/assets/.+\\.css$", "/assets/site.css", false));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("/assets/.+\\.css$", "/prefix/health", false));
+    try std.testing.expect(anchoredLiteralPrefixCannotMatch("^Example", "other", true));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^Example", "example-path", true));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^/assets|/prefix", "/prefix/health", false));
+    try std.testing.expect(!anchoredLiteralPrefixCannotMatch("^/prefix/?health$", "/prefixhealth", false));
 }
 
 test "evaluate applies rewrite and return rules" {
